@@ -25,6 +25,8 @@
  *    from the schema doc's `host.health` / `tokens.snapshot` sections.
  */
 
+import type { QueueSnapshotRecord } from "./queueTypes";
+
 /** One repository in a host's `managed_repos` roster (#4976). `slug` is
  * present for a public repo, or a private one on the authenticated view; the
  * public (unauthenticated) view drops `slug` for a private entry — the
@@ -230,6 +232,9 @@ export interface Timestamped<T> {
 export interface HostEntry {
   health?: Timestamped<HostHealthRecord>;
   tokens?: Timestamped<TokensSnapshotRecord>;
+  /** The host's newest work-finder ready queue (Issue #8852) — absent when
+   * the host has never sent one (a pre-phase-2 daemon, or no work finder). */
+  queue?: Timestamped<QueueSnapshotRecord>;
 }
 
 /** One in-flight sweep. Mirrors `ActiveSweepState` in `../../src/fleetState.ts`.

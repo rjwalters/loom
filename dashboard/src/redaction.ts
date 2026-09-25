@@ -82,6 +82,7 @@ import type { RepoVisibility } from "./telemetry";
 import { decodeVisibility } from "./telemetry";
 import type { ElasticSpendSummary, HistoryQueryResult, HistoryRecord } from "./query";
 import type { ActiveSweepState, FleetSnapshot } from "./fleetState";
+import { publicQueuePayload, redactQueueSnapshot } from "./queueState";
 
 // ---------------------------------------------------------------------------
 // Per-kind field allowlist for the nested `record` payload
@@ -122,6 +123,19 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   // `account` identifiers and per-account burn, which the public view
   // summarizes instead of listing (see `PUBLIC_RECORD_DERIVATIONS`).
   "tokens.snapshot": ["kind", "captured_at"],
+  // Issue #8852: host-scoped, but its `rows`/`listing_failed` name repos and
+  // issues, each with its own `visibility`. Only the non-identifying scalars
+  // are copied; the per-row projection is a derivation (`./queueState.ts`).
+  "queue.snapshot": [
+    "kind",
+    "tick_at",
+    "max_concurrent",
+    "seen",
+    "counts",
+    "listing_failed_unresolved",
+    "unresolved_rows",
+    "rows_truncated",
+  ],
   "host.health": [
     "kind",
     "captured_at",
@@ -536,6 +550,8 @@ export function redactAdmissionBrakeRow(brake: AdmissionBrakeRow): Record<string
 const PUBLIC_RECORD_DERIVATIONS: Readonly<Record<string, (payload: Record<string, unknown>) => Record<string, unknown>>> =
   {
     "tokens.snapshot": (payload) => deriveTokenPoolAggregate(payload) as unknown as Record<string, unknown>,
+    // Issue #8852: private rows keep only rank/state/disposition/reason.
+    "queue.snapshot": publicQueuePayload,
     // `managed_repos` (#4976) and `roles` (#5022) are both deliberately ABSENT
     // from `RECORD_FIELD_ALLOWLIST` — like `tokens.snapshot`'s `accounts`,
     // each has a raw form that can identify a private repo (`managed_repos`)
@@ -744,6 +760,14 @@ export function redactFleetSnapshot(snapshot: FleetSnapshot, isAuthenticated: bo
               record: redactPayload("tokens.snapshot", entry.tokens.record),
               updatedAt: entry.tokens.updatedAt,
               freshness: entry.tokens.freshness,
+            },
+          }),
+          // Issue #8852: per-row redaction on each row's own `visibility`.
+          ...(entry.queue && {
+            queue: {
+              record: redactQueueSnapshot(entry.queue.record),
+              updatedAt: entry.queue.updatedAt,
+              freshness: entry.queue.freshness,
             },
           }),
         };

@@ -979,9 +979,19 @@ Each row:
 | `reason` | string | human-readable reason, also daemon-derived |
 | `detail` | string, optional | only for `parked` (the park label) and `open_pr` (`open PR #N`). Free-form dispatch-error text is never exported |
 
-Redaction: a phase-3 Worker must redact per row on `visibility`. Until it
-learns this kind, the existing unknown-kind rule applies (`/public/*` sees
-`kind` only).
+Redaction (phase 3, `dashboard/src/queueState.ts`): the Worker redacts per
+row on `visibility`. On `/public/*` a private row keeps only `rank`,
+`visibility`, `urgent`, `disposition`, `state` and `reason`; its `repo`,
+`issue`, `created_at`, `tier` and `detail` are withheld, and a private
+`listing_failed` entry keeps only its `visibility`. `counts`, `seen` and
+`tick_at` are aggregate and survive. A Worker older than phase 3 applies the
+unknown-kind rule instead (`/public/*` sees `kind` only).
+
+The Worker keeps the newest tick per host as live state (`hosts[<id>].queue`
+on `GET /api/fleet-state`) and ignores a redelivered or older snapshot, so a
+retried batch never makes a stalled work finder look live. The fleet
+dashboard renders it as the overview's "Work queue" section, the `#/queue`
+route and a per-host panel.
 
 ### `tokens.snapshot`
 

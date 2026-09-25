@@ -79,3 +79,11 @@ export function sweepWorkTitle(issue: number | undefined, phase: string | undefi
     ? `Branch feature/issue-${issue} on the forge`
     : `Issue #${issue} on the forge`;
 }
+
+/** The pull request page for `pr` in `repo` (Issue #8852: an `open_pr`
+ * queue row names the PR holding its issue). */
+export function pullUrl(repo: string | undefined, pr: number | undefined): string | undefined {
+  const base = repoUrl(repo);
+  if (base === undefined || pr === undefined) return undefined;
+  return `${base}/pull/${pr}`;
+}

@@ -45,6 +45,7 @@ import type { HostView } from "../fleet";
 import type { ActiveComputeJob, ActiveSweep, TokenAccount } from "../types";
 import { protectionBadge, statusBadge } from "./fleetOverview";
 import { computeSubprocessList } from "./runningCompute";
+import { hostQueuePanel } from "./workQueue";
 
 function noticeRow(message: string, testid: string): HTMLElement {
   return el("p", { class: "panel__notice", data: { testid } }, message);
@@ -450,6 +451,7 @@ export function hostDetailView(host: HostView, now: Date = new Date(), historySe
     healthPanel(host, now),
     tokensPanel(host, now),
     sweepsPanel(host, now),
+    hostQueuePanel(host, now),
     historySection ?? historyPlaceholder(),
   );
 }
