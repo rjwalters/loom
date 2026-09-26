@@ -12,7 +12,9 @@
 //! event is the delta over the previous counters (the duplicate adds zero),
 //! and one non-empty delta is one request. The token mapping is
 //! [`codex_usage`]'s: `input` excludes `cached_input_tokens`, which is
-//! `cache_read`, and `reasoning_output_tokens` is already inside `output`.
+//! `cache_read`, and `cache_write_input_tokens`, which is `cache_write`
+//! (both subsets of `input_tokens`, #8966), and `reasoning_output_tokens` is
+//! already inside `output`.
 
 use std::path::PathBuf;
 
@@ -70,13 +72,16 @@ impl Rollout {
                     return;
                 };
                 let usage = ModelBurn {
-                    input: (delta.input - delta.cached_input).max(0),
+                    input: delta.uncached_input(),
                     output: delta.output,
                     cache_read: delta.cached_input,
-                    cache_write: 0,
+                    cache_write: delta.cache_write,
                     requests: 1,
                 };
-                if emit.accepts(at) && (usage.input, usage.output, usage.cache_read) != (0, 0, 0) {
+                if emit.accepts(at)
+                    && (usage.input, usage.output, usage.cache_read, usage.cache_write)
+                        != (0, 0, 0, 0)
+                {
                     out.push(BurnEvent {
                         provider: CODEX_PROVIDER.to_string(),
                         model,

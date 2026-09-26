@@ -371,6 +371,18 @@ alert. The rule's shape has not yet been tested against a live SigNoz. Standing 
 Completed-sweep phase durations are covered by the cycle-time rollup. Worker
 idle gap and forge label-transition dwell are tracked in #8929.
 
+**Tokens, providers and pools (#8908, #8931).** Each account mark the daemon
+writes (Codex terminal feedback, API-key pool bad marks, the Claude
+insta-crash exhaustion mark) emits one `loom.pool.account_marks{provider,reason}`
+point, so exhaustion can be split by cause (a 429 versus plan exhaustion
+versus a session limit), which the snapshot-derived `loom.pool.exhaustions`
+cannot do. Each work-finder pool hold emits a `loom.pool.hold` span when it
+clears. At a sweep's terminal transition, the execution's exact token
+breakdown is journalled as a `loom.runtime.usage` span in the sweep's trace,
+and the transcript-ingest pass stamps the sweep's `session.summary` log with
+the same trace when the match is unambiguous. Details are in
+[`telemetry-schema.md`](telemetry-schema.md#metricpoints).
+
 To add a signal, add a `MetricName` or `SpanName` variant. If it needs a new
 label or attribute key, extend `OPS_METRIC_LABEL_KEYS` or
 `OPS_SPAN_ATTRIBUTE_KEYS` and the gateway collector's `keep_keys` in

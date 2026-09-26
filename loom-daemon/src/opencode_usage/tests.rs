@@ -465,6 +465,7 @@ fn time_created_is_decoded_as_epoch_milliseconds_matching_the_live_schema() {
 fn discover_opencode_dbs_finds_every_installed_version() {
     let tmp = tempfile::tempdir().unwrap();
     std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
     let opt = tmp.path().join(".loom").join("opt");
     for version in ["opencode-1.18.31", "opencode-2.0.10"] {
         let dir = opt.join(version).join("xdg").join("data").join("opencode");
@@ -488,6 +489,7 @@ fn discover_opencode_dbs_env_override_short_circuits_the_scan() {
     std::env::set_var(OPENCODE_DB_ENV, &db);
     let found = discover_opencode_dbs(Some(tmp.path()));
     std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
     assert_eq!(found, vec![db]);
 }
 
@@ -495,8 +497,89 @@ fn discover_opencode_dbs_env_override_short_circuits_the_scan() {
 #[serial_test::serial(opencode_db_env)]
 fn discover_opencode_dbs_yields_nothing_for_a_host_with_no_install() {
     std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
     assert!(discover_opencode_dbs(Some(tmp.path())).is_empty());
+}
+
+/// Issue #8965: the operator's own OpenCode store at the XDG default is
+/// discovered too — that is where live Z.ai GLM usage lands on a host with no
+/// Loom-managed install.
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn discover_opencode_dbs_includes_the_xdg_default_store() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join(".local").join("share").join("opencode");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("opencode.db"), b"").unwrap();
+    let managed = tmp
+        .path()
+        .join(".loom/opt/opencode-2.0.10/xdg/data/opencode");
+    std::fs::create_dir_all(&managed).unwrap();
+    std::fs::write(managed.join("opencode.db"), b"").unwrap();
+
+    let found = discover_opencode_dbs(Some(tmp.path()));
+    assert_eq!(found, vec![managed.join("opencode.db"), dir.join("opencode.db")]);
+}
+
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn discover_opencode_dbs_honours_xdg_data_home() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("xdg-data");
+    std::fs::create_dir_all(data.join("opencode")).unwrap();
+    std::fs::write(data.join("opencode").join("opencode.db"), b"").unwrap();
+    // A store at the home default is NOT read when XDG_DATA_HOME names another.
+    let home_default = tmp.path().join(".local/share/opencode");
+    std::fs::create_dir_all(&home_default).unwrap();
+    std::fs::write(home_default.join("opencode.db"), b"").unwrap();
+
+    std::env::set_var("XDG_DATA_HOME", &data);
+    let found = discover_opencode_dbs(Some(tmp.path()));
+    std::env::remove_var("XDG_DATA_HOME");
+    assert_eq!(found, vec![data.join("opencode").join("opencode.db")]);
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn discover_opencode_dbs_reads_a_store_reachable_two_ways_once() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    let tmp = tempfile::tempdir().unwrap();
+    let managed = tmp.path().join(".loom/opt/opencode-2.0.10/xdg/data");
+    std::fs::create_dir_all(managed.join("opencode")).unwrap();
+    std::fs::write(managed.join("opencode").join("opencode.db"), b"").unwrap();
+    // XDG_DATA_HOME points (through a symlink) at the managed store's data dir.
+    let link = tmp.path().join("data-link");
+    std::os::unix::fs::symlink(&managed, &link).unwrap();
+
+    std::env::set_var("XDG_DATA_HOME", &link);
+    let found = discover_opencode_dbs(Some(tmp.path()));
+    std::env::remove_var("XDG_DATA_HOME");
+    assert_eq!(found, vec![managed.join("opencode").join("opencode.db")]);
+}
+
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn tokens_by_model_reads_the_xdg_default_store() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join(".local").join("share").join("opencode");
+    std::fs::create_dir_all(&dir).unwrap();
+    seed_db(
+        &dir.join("opencode.db"),
+        &[Row {
+            input: 7,
+            output: 1,
+            ..row(&model_json("glm-5.3-flash", "zai-coding-plan"), "/repo/a", 1_000)
+        }],
+    );
+    let rows = tokens_by_model(&dirs(&["/repo/a"]), None, Some(tmp.path())).unwrap();
+    assert_eq!((rows[0].model.as_str(), rows[0].input), ("glm-5.3-flash", 7));
 }
 
 // --- tokens_by_model / sessions: merged across every installed version -----
@@ -505,6 +588,7 @@ fn discover_opencode_dbs_yields_nothing_for_a_host_with_no_install() {
 #[serial_test::serial(opencode_db_env)]
 fn tokens_by_model_merges_matching_rows_across_every_installed_db() {
     std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
     for (version, input) in [("opencode-1.18.31", 10), ("opencode-2.0.10", 20)] {
         let dir = tmp
@@ -537,6 +621,7 @@ fn tokens_by_model_merges_matching_rows_across_every_installed_db() {
 #[serial_test::serial(opencode_db_env)]
 fn tokens_by_model_returns_none_when_no_db_is_installed() {
     std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
     let tmp = tempfile::tempdir().unwrap();
     assert_eq!(tokens_by_model(&dirs(&["/repo/a"]), None, Some(tmp.path())), None);
     assert!(sessions(&dirs(&["/repo/a"]), None, Some(tmp.path())).is_empty());

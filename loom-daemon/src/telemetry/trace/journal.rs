@@ -270,6 +270,26 @@ impl Journal {
             },
         )
     }
+    /// Every completed span still in the journal (drained or not), oldest
+    /// first.
+    pub fn completed(&self) -> Result<Vec<SpanRecord>> {
+        let mut file = self.lock()?;
+        Ok(Self::entries(&mut file)?
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Completed(record) => Some(record),
+                _ => None,
+            })
+            .collect())
+    }
+    /// Journal an already-complete span in one write (Issue #8908: a late
+    /// `loom.runtime.usage` child whose interval is already known). An
+    /// invalid record is refused rather than journalled.
+    pub fn append_completed(&self, record: SpanRecord) -> Result<()> {
+        record.validate().map_err(anyhow::Error::msg)?;
+        let mut file = self.lock()?;
+        Self::append(&mut file, &Entry::Completed(record.bounded()))
+    }
     pub fn has_checkpoint_observations(&self) -> Result<bool> {
         let mut file = self.lock()?;
         Ok(Self::entries(&mut file)?.iter().any(|entry| matches!(entry, Entry::Completed(span) if span.attributes.get("loom.timing_source").is_some_and(|v| matches!(v.as_str(), "checkpoint_write_observed" | "owned_start_checkpoint_completion")))))

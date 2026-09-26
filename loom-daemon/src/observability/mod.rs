@@ -108,6 +108,7 @@ pub mod outcome;
 pub mod overhead;
 pub mod queue;
 pub mod queue_snapshot;
+pub mod runtime_usage;
 pub mod sender;
 pub mod session_analysis;
 pub mod session_summary;

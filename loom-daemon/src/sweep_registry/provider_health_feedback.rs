@@ -67,7 +67,7 @@ impl SweepRegistry {
         // see `tokens_pool::codex_reset` for why the text may only ever say
         // *when* a hold ends, never *whether* there is one.
         let reset_at = exhaustion_reset_horizon(&contents, &anchor, result.category);
-        if let Err(error) = tokens_pool::record_terminal_for_model_with_reset(
+        match tokens_pool::record_terminal_for_model_with_reset(
             &self.config.workspace_root,
             &id,
             result.category,
@@ -75,9 +75,11 @@ impl SweepRegistry {
             reset_at,
             "spawn-codex:v1",
         ) {
-            log::warn!(
+            // #8931: the reason-classified mark, emitted only once persisted.
+            Ok(()) => crate::observability::ops::pool_marks::record_codex(result.category),
+            Err(error) => log::warn!(
                 "sweep_registry: failed to persist Codex terminal feedback for {sweep_id}: {error}"
-            );
+            ),
         }
     }
 
@@ -104,7 +106,26 @@ impl SweepRegistry {
         ) else {
             return;
         };
+        crate::observability::ops::pool_marks::record_api_key(&feedback);
         log::warn!("sweep_registry: {sweep_id} {}", feedback.detail);
+    }
+
+    /// The Claude insta-crash seam's account mark (#4122), plus its
+    /// reason-classified `loom.pool.account_marks` point (#8931). A method
+    /// here, not in `quarantine.rs`, because that file is frozen by the
+    /// file-size ratchet.
+    pub(crate) fn mark_exhausted_account(
+        &self,
+        token_name: &str,
+        reason: &str,
+        signature: &str,
+    ) -> Result<(), String> {
+        crate::observability::ops::pool_marks::mark_claude_bad(
+            &self.config.workspace_root,
+            token_name,
+            reason,
+            signature,
+        )
     }
 }
 

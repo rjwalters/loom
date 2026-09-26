@@ -74,6 +74,33 @@ fn cumulative_counters_become_per_turn_deltas_and_duplicates_add_nothing() {
     );
 }
 
+/// Issue #8966: `cache_write_input_tokens` is a subset of `input_tokens`;
+/// its delta is cache-write burn and is taken out of `input`.
+#[test]
+fn cache_write_input_tokens_are_cache_write_burn_not_input() {
+    let now = Utc::now();
+    let with_writes = |total: (i64, i64, i64), writes: i64| {
+        let mut value: serde_json::Value = serde_json::from_str(&token_count(now, total)).unwrap();
+        value["payload"]["info"]["total_token_usage"]["cache_write_input_tokens"] = writes.into();
+        value.to_string()
+    };
+    let mut rollout = Rollout::default();
+    let mut out: Vec<BurnEvent> = Vec::new();
+    for line in [
+        turn_context(now, "gpt-5"),
+        with_writes((1_000, 400, 100), 0),
+        with_writes((3_000, 900, 150), 1_200),
+    ] {
+        rollout.add_line(&line, emit_all(now), &mut out);
+    }
+    assert_eq!(out.len(), 2, "{out:?}");
+    let second = &out[1].usage;
+    assert_eq!(
+        (second.input, second.cache_read, second.cache_write, second.output),
+        (2_000 - 500 - 1_200, 500, 1_200, 50)
+    );
+}
+
 fn append(path: &Path, lines: &[String]) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut file = std::fs::OpenOptions::new()

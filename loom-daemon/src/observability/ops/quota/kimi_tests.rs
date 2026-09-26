@@ -142,3 +142,49 @@ fn a_file_that_goes_idle_and_resumes_does_not_recount_old_records() {
     let key = ("kimi".to_string(), "kimi-k2.7-code".to_string());
     assert_eq!((window[&key].input, window[&key].requests), (7, 1));
 }
+
+/// #8966 item 4: the drop-then-re-read path, exercised directly. The file's
+/// mtime sits in `[n - 3720, n - 3660)` for the sample at `n`: older than
+/// `Emit::active_since` (`n - 3660`), so the file is DROPPED from the tail
+/// set, and when it is written again it is re-read from byte 0 with fresh
+/// state. Its old record (at the mtime) is then older than that poll's
+/// `not_before` and must not be recounted; only the new record counts.
+#[test]
+fn a_dropped_file_that_resumes_is_reread_without_recounting_old_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(".kimi-code");
+    let wire = root.join("sessions/wd_repo_1/session_a/agents/main/wire.jsonl");
+    let base = Utc::now();
+    let last = base - Duration::seconds(3690);
+    append(&wire, &llm_request("k", "kimi-k2.7-code"));
+    append(&wire, &usage(last, "k", (1000, 1000, 0, 0), "turn"));
+    let set_mtime = |at: chrono::DateTime<Utc>| {
+        std::fs::File::options()
+            .write(true)
+            .open(&wire)
+            .unwrap()
+            .set_modified(std::time::SystemTime::from(at))
+            .unwrap();
+    };
+    set_mtime(last);
+    let source = KimiSource {
+        roots: Some(vec![root]),
+        ..KimiSource::default()
+    };
+    let mut burn = Burn::new(vec![Box::new(source)]);
+    // Anchor: tracked (mtime >= active_since), its record is history.
+    assert!(burn.sample(base - Duration::seconds(600)).is_none(), "anchor");
+    // At `base` the mtime is inside [base - 3720, base - 3660): dropped.
+    assert!((base - Duration::seconds(3720)..base - Duration::seconds(3660)).contains(&last));
+    assert!(burn.sample(base).unwrap().2.is_empty());
+    // It resumes: re-read from the start, so the old record is decoded again.
+    append(&wire, &usage(base + Duration::seconds(10), "k", (7, 1, 0, 0), "turn"));
+    set_mtime(base + Duration::seconds(10));
+    let (_, _, window) = burn.sample(base + Duration::seconds(300)).unwrap();
+    let key = ("kimi".to_string(), "kimi-k2.7-code".to_string());
+    assert_eq!(
+        (window[&key].input, window[&key].requests),
+        (7, 1),
+        "only the new record counts; the re-read old one is history"
+    );
+}

@@ -44,6 +44,16 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.dispatched",
     "loom.dispatch.errors",
     "loom.dispatch.max_concurrent",
+    // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
+    // `loom.runtime.usage` (#8908): one execution's exact token breakdown.
+    "loom.tokens.input",
+    "loom.tokens.output",
+    "loom.tokens.cache_read",
+    "loom.tokens.cache_write",
+    "loom.tokens.total",
+    // `loom.pool.hold` (#8931): one pool dispatch hold, armed to cleared.
+    "loom.pool.hold.post_mortem",
+    "loom.pool.hold.accounts",
 ];
 
 /// Longest label value kept, in bytes.
@@ -146,6 +156,12 @@ pub enum MetricName {
     /// Seconds since the previous sample the pool read as exhausted.
     #[serde(rename = "loom.pool.exhausted_seconds")]
     PoolExhaustedSeconds,
+    // ---- Reason-classified account marks (Issue #8931) -------------------
+    /// Pool accounts marked out of selection since the previous point,
+    /// labelled `provider` and `reason` (a closed set — see
+    /// `observability::ops::pool_marks::MarkReason`). Never an account name.
+    #[serde(rename = "loom.pool.account_marks")]
+    PoolAccountMarks,
 }
 
 impl MetricName {
@@ -178,6 +194,7 @@ impl MetricName {
             Self::PoolExhausted => "loom.pool.exhausted",
             Self::PoolExhaustions => "loom.pool.exhaustions",
             Self::PoolExhaustedSeconds => "loom.pool.exhausted_seconds",
+            Self::PoolAccountMarks => "loom.pool.account_marks",
         }
     }
 
@@ -193,6 +210,7 @@ impl MetricName {
             | Self::LlmRequests
             | Self::PoolExhaustions
             | Self::PoolExhaustedSeconds
+            | Self::PoolAccountMarks
             | Self::QueueDispatchWait
             | Self::QueueDispatchWaitSamples => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
@@ -216,7 +234,7 @@ impl MetricName {
             | Self::LlmTokensCacheRead
             | Self::LlmTokensCacheWrite => "{token}",
             Self::LlmRequests => "{request}",
-            Self::PoolAccounts | Self::PoolExhaustions => "{account}",
+            Self::PoolAccounts | Self::PoolExhaustions | Self::PoolAccountMarks => "{account}",
             Self::PoolExhausted => "1",
             Self::PoolExhaustedSeconds => "s",
             Self::QueueOldestWait | Self::QueueDispatchWait => "s",
@@ -253,6 +271,9 @@ impl MetricName {
             Self::PoolExhausted => "1 when no account in the provider's pool is usable.",
             Self::PoolExhaustions => "Accounts that became exhausted since the last sample.",
             Self::PoolExhaustedSeconds => "Seconds the provider's pool read as exhausted.",
+            Self::PoolAccountMarks => {
+                "Pool accounts marked out of selection, by provider and reason."
+            }
         }
     }
 }

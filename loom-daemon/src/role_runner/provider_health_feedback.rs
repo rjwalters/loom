@@ -105,7 +105,7 @@ pub(super) fn apply_role_tick_provider_health_feedback(
     // the same gate the sweep path applies, from the one function that owns it.
     let reset_at =
         tokens_pool::codex_reset::exhaustion_reset_horizon(&contents, tick_anchor, result.category);
-    if let Err(error) = tokens_pool::record_terminal_for_model_with_reset(
+    match tokens_pool::record_terminal_for_model_with_reset(
         workspace_root,
         &id,
         result.category,
@@ -113,10 +113,12 @@ pub(super) fn apply_role_tick_provider_health_feedback(
         reset_at,
         "spawn-codex:v1",
     ) {
-        log::warn!(
+        // #8931: the reason-classified mark, emitted only once persisted.
+        Ok(()) => crate::observability::ops::pool_marks::record_codex(result.category),
+        Err(error) => log::warn!(
             "role_runner: failed to persist Codex terminal feedback for role={}: {error}",
             admission.role
-        );
+        ),
     }
 }
 
@@ -143,6 +145,7 @@ fn apply_role_tick_api_key_feedback(
     ) else {
         return;
     };
+    crate::observability::ops::pool_marks::record_api_key(&feedback);
     log::warn!("role_runner: role={} {}", admission.role, feedback.detail);
 }
 

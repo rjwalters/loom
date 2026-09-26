@@ -79,13 +79,12 @@
 use crate::capacity;
 use crate::event_bus::EventBus;
 use crate::peer_claims::{self, ClaimAd, PeerClaimView};
-use crate::quarantine_reconciliation;
-use crate::sweep_journal;
-use crate::sweep_outcomes;
 use crate::telemetry;
+#[cfg(test)]
 use crate::tokens_pool::bad_tokens;
 use crate::tokens_pool::{self, AccountId, AccountProvider, TerminalClassification};
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
+use crate::{quarantine_reconciliation, sweep_journal, sweep_outcomes};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};

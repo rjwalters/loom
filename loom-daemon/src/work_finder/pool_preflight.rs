@@ -384,6 +384,13 @@ impl PoolHoldState {
                     pool.total,
                     format_held_for(now - hold.since)
                 );
+                // #8931: one `loom.pool.hold` span per hold, armed → cleared.
+                crate::observability::ops::pool_marks::record_pool_hold(
+                    hold.since,
+                    now,
+                    hold.wrapper_observed,
+                    hold.total,
+                );
                 holds.remove(&pool.dir);
                 // #8001: the clearing edge. Broadcast so peers release this
                 // host's advertised hold NOW rather than sitting out the rest

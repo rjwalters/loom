@@ -702,6 +702,16 @@ On the OTLP path this maps to a log record (severity `Info`) with
 `loom.outcome` attributes — all covered by the gateway collector's
 `loom.*` privacy allowlist.
 
+**Trace join (Issue #8908).** When a traced sweep dispatches, the daemon
+writes a local join entry (`.loom/logs/trace-joins/<trace-id>.json`: issue,
+root trace context, dispatch time; closed at the terminal transition). The
+ingest pass stamps a summary's envelope `trace_context` (the OTLP log's trace
+and span id) with that execution's root context when **exactly one** entry
+names the summary's `issue` and its window covers the session's first
+timestamp. With no issue, no entry or an ambiguous match, the log stays
+unjoined. It is never guessed. The same trace carries the execution's
+`loom.runtime.usage` span (see [`metric.points`](#metricpoints)).
+
 ### `session.analysis`
 
 A derived per-session anomaly/quality rollup (Issue #8760, G3 part 2 of epic
@@ -908,7 +918,10 @@ Burn is read incrementally from every subscription store on the host: Claude
 transcripts (`provider=claude`), Codex rollouts including pooled profiles
 (`codex`), OpenCode's `opencode.db` `message` table (the pool namespace, e.g.
 `zai` for `zai-coding-plan`, else OpenCode's provider id) and Kimi
-`wire.jsonl` (`kimi`). Each sample reads only what was written since the last
+`wire.jsonl` (`kimi`). OpenCode steps are counted once by row id, reading only
+rows newer than the oldest still-running step, so a completion committed late
+still counts (#8966); Codex `cache_write_input_tokens` are cache writes, taken
+out of input. Each sample reads only what was written since the last
 one, each event counts once in the window its timestamp falls in (late writes
 count in the current window), windows end 60 s before the sample and are
 stamped at that end so they abut, and the first sample after daemon start only
@@ -933,6 +946,18 @@ that covers candidate evaluation and dispatch. Its attributes are
 `error`, `no_eligible_work`, `capacity_full`, `all_skipped`, first match
 wins), `loom.dispatch.seen`, `loom.dispatch.dispatched`,
 `loom.dispatch.errors` and `loom.dispatch.max_concurrent`.
+
+Tokens, providers and pools (Issues #8908, #8931):
+
+| Signal | Kind | Unit / attributes | Meaning |
+|---|---|---|---|
+| `loom.pool.account_marks` | delta `Sum` | `{account}`; labels `provider`, `reason` | one per account mark the daemon writes, at the seam that writes it: sweep and role-tick Codex terminal feedback (`provider=codex`), API-key pool bad marks (`provider` = the pool namespace, e.g. `zai`), and the Claude insta-crash exhaustion mark (`claude`). `reason` ∈ `rate_limited`, `exhausted`, `session_limit`, `model_credits`, `credential`, `transient`. No point when no mark is written (a native credential failure, a Codex `SUCCESS`/`TIMEOUT`, a failed write) |
+| `loom.pool.hold` span | own root trace | `loom.pool.hold.post_mortem` (`true` when a real token-selection death armed it), `loom.pool.hold.accounts` | one work-finder pool dispatch hold, from arming to clearing. A hold still armed when the daemon stops emits no span |
+| `loom.runtime.usage` span | child of the execution's `loom.runtime.run` (else its root) | `loom.tokens.input`, `.output`, `.cache_read`, `.cache_write`, `.total`, optional `loom.runtime` | one sweep execution's exact token breakdown, from the same per-runtime readers as `sweep.outcome`'s `tokens_by_model`, journalled at the terminal transition over the run span's interval. Absent when usage is unknown; a measured zero is `"0"` |
+
+`reason` is a closed enum and `provider` is a fixed literal or a pool
+namespace that must be a short `[a-z0-9_-]` token (anything else is
+`other`), so no account name, key or log text reaches a label.
 
 ### `queue.snapshot`
 
