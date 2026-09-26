@@ -1809,6 +1809,9 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
         total_pr_checked += pr_checked;
         total_pr_reclaimed += pr_reclaimed;
         verdict_stats.merge(forge::reconcile_pr_verdicts(&gh_bin, root));
+        // #8922: AFTER the verdict pass, so a verdict it just re-queued to
+        // `loom:review-requested` is checked for base conflicts on this tick.
+        review_conflict::reconcile_review_conflicts(&gh_bin, root);
     }
     if total_reclaimed > 0 {
         log::info!(
@@ -1949,6 +1952,11 @@ mod pr_label_info;
 /// posting its stale-verdict comment — a sibling file per the file-size ratchet
 /// (`.loom/docs/file-size-policy.md`) rather than more inline logic here.
 mod auto_merge_disarm;
+
+/// The #8922 base-conflict pass for `loom:review-requested` PRs — a sibling
+/// file per the file-size ratchet, run on the same tick right after
+/// [`forge::reconcile_pr_verdicts`].
+pub mod review_conflict;
 
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::work_finder::forge`] / [`crate::epic_supervisor::forge`]) — the
@@ -3095,7 +3103,11 @@ pub mod forge {
     /// per_page=30, oldest-first) comes back, and the verdict marker is always
     /// among the NEWEST comments — the same pitfall #5455 documented for the
     /// fallback-queue marker scan.
-    fn fetch_comment_bodies(gh_bin: &Path, root: &Path, pr_number: u32) -> Option<Vec<String>> {
+    pub(super) fn fetch_comment_bodies(
+        gh_bin: &Path,
+        root: &Path,
+        pr_number: u32,
+    ) -> Option<Vec<String>> {
         let mut cmd = Command::new(gh_bin);
         cmd.arg("api")
             .arg(format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/comments"))

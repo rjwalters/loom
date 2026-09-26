@@ -2670,6 +2670,24 @@ Log line on action: `claim_reconciliation: cleared stale loom:pr from PR #N in
 <root> (verdict recorded for <old>, head is now <new>) — re-queued as
 loom:review-requested (#5686)`.
 
+#### Base conflicts on review-queue PRs (`loom:merge-conflict`, #8922)
+
+The per-tree companions above were only ever *stripped* here, never applied: a
+`loom:review-requested` PR whose **base** moved into a conflict carried no
+signal, so a Judge could claim a tree that cannot land. `claim_reconciliation::
+review_conflict::reconcile_review_conflicts` runs right after
+`reconcile_pr_verdicts` on the same tick and reads GitHub's `mergeable` for
+open `loom:review-requested` and `loom:merge-conflict` PRs.
+
+| Property | Behavior |
+|----------|----------|
+| Kill switch | `LOOM_REVIEW_CONFLICT_RECONCILE` (`0`/`false`/`no`/`off` disables), nested inside `LOOM_STALE_CLAIM_RECONCILE`. Defaults **ON**. |
+| `CONFLICTING` + `loom:review-requested` | Comment, then Judge's own DIRTY transition: `loom:review-requested` → `loom:changes-requested` + `loom:merge-conflict` (routes to Doctor; Judge's review-requested find-work query no longer sees it). The comment carries `<!-- loom:base-conflict flagged -->` **and** a `verdict=changes-requested` verdict-sha marker for the head, so the stale-verdict pass reads it `Fresh` and re-queues it itself once a rebase moves the head. |
+| `MERGEABLE` + `loom:merge-conflict` (no head move) | Returned to `loom:review-requested` — **only** if the newest state-changing comment is this pass's flag. A Judge's own DIRTY fallback or any later verdict is never undone here. |
+| `mergeable=UNKNOWN` | No information (GitHub computes it lazily) — no label change in either direction; re-read next tick. |
+| `loom:blocked` / `loom:operator` / `loom:operator-only` | Never touched. |
+| `loom:reviewing` / `loom:treating` | Left to the agent in flight. |
+
 ### Startup capacity seed: adopting live survivors (#6262)
 
 The passes above answer "is this *dead* claim reclaimable?". The mirror-image
