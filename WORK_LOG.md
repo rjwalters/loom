@@ -6,7 +6,113 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-26
+- **Issue #8850** (closed): ci-telemetry: a rejected forge credential should back off the whole org, not fail 42 repos one at a time
+- **Issue #8553** (closed): worktree.sh does not consult .loom/locks/<issue> — two sessions can collide in one worktree
+- **Issue #8470** (closed): Converge the two Rust branch-landed ladders (worktree_ops::landed vs worktree_cli::branch_landed)
+- **Issue #8998** (closed): auto_update: a drain-and-restart roll re-arms indefinitely when a sweep outlives the drain deadline (21 h livelock, 2 hosts)
+- **Issue #8897** (closed): merge-pr.sh: backticked-trailer advisory (#8808) prints a false 'Refusing' error on a daemon that predates its merge-pr-refs mode
+- **PR #9020**: merge train D: #9004 #8985 #8977 #8975 #8973 #8702
+- **Issue #8957** (closed): Dashboard queue: include forge-side loom:blocked issues (not in the ready listing) with their reasons
+- **Issue #8929** (closed): Observability: worker turnaround/idle gap and forge label-transition dwell (#8856 phase 2)
+- **Issue #8907** (closed): Observability: typed dispatch-refusal reasons and lease-admission spans (#8860 phase 2)
+- **PR #9009**: Telemetry mega PR B: dispatch refusals, turnaround/stage dwell, forge-blocked queue rows (#8907 #8929 #8957)
+- **Issue #8947** (closed): dogfood: .agents/skills is a materialized copy, untracked and un-ignored — the #3565/#3682 failure mode on a fourth surface
+- **Issue #8671** (closed): Move tier-3 runtime launch shape (headless flag, prompt transport, model/effort flags) into defaults/runtimes/<name>.json so a new CLI is a manifest edit, not a new spawn-*.sh
+- **Issue #8654** (closed): fix(loom-daemon-update): name the release's age and asset count in the --fetch refusal
+- **Issue #8322** (closed): Port PR #8314's per-role tool-restriction deny-spec computation out of spawn-claude.sh/spawn-codex.sh into loom-daemon (Shell Budget Ratchet blocker)
+- **Issue #8880** (closed): Port forge_text_has_unnegated_closing_ref() to a loom-daemon subcommand (blocks PR #8823)
+- **Issue #8842** (closed): release: pin the x86_64-unknown-linux-gnu build host's glibc floor (or split the artifact matrix) — gap confirmed by #8837 AC3
+- **PR #8996**: merge train C: #8899 #8823 #8939 #8904 #8962 #8949 #8695
+- **Issue #8966** (closed): Burn sampler follow-ups from #8956 review: OpenCode query cost, late commits, Codex cache writes
+- **Issue #8965** (closed): opencode_usage: discover the XDG default opencode.db (where live GLM usage is)
+- **Issue #8931** (closed): Observability: reason-classified account marks (429 / exhausted / session limit) and pool-hold spans (#8857 phase 3)
+- **Issue #8908** (closed): Observability: exact token-usage breakdown joined to loom.runtime.run spans (#8860 phase 3)
+- **PR #9008**: telemetry mega PR A: tokens, providers and pools (#8908, #8931, #8965, #8966)
+- **Issue #8901** (closed): Fleet captain: wire a first real singleton job, and make shell-driven arms visible in host.health
+- **PR #9002**: feat(fleet-captain): wire ci-telemetry poller as first singleton job, add durable shell-arm registry (#8901)
+- **Issue #8993** (closed): CI red on main: test-forge-check-runs-pagination.sh (3a) expects rc 1, #8896's timeout path now exits 5
+- **PR #9003**: fix(tests): (3a) truncated-read timeout expects exit 5, not 1 (#8993)
+- **Issue #8900** (closed): Stale-verdict clearing does not disarm GitHub auto-merge — unreviewed heads merge (#8694)
+- **PR #8990**: fix(daemon): disarm GitHub auto-merge when a review verdict is invalidated
+- **Issue #8852** (closed): Dashboard: show fleet backlog, ready queue, in-progress work, and blocking reasons
+- **Issue #8594** (closed): Wire Pi and Codex into the usage_source seam so their completions get token numbers, not just runtime labels
+- **Issue #8826** (closed): observability: SigNoz build/CI retro surfaces — standing ci-queries.sql, six saved views, and metrics retention >=30d (phase 3 of 3; builds on #8824 + #8825)
+- **PR #8978**: merge train B: #8954 #8951 #8958
+- **Issue #8989** (closed): [Epic #8764] forge_events Phase 2 remainder: disposition for the queue-head wake and in-flight PR watch consumers
+- **Issue #8766** (closed): [Epic #8764] forge_events Phase 2: early-tick consumers (work-finder tick, queue-head wake, in-flight PR watch)
+- **PR #8994**: feat(forge-events): early-tick consumers for the `forge.event` prompt (ADR-0021 Phase 2)
+- **Issue #8898** (closed): ci-telemetry poller misses re-runs of older workflow runs (created-at watermark) — #8824 AC3 gap
+- **PR #8991**: fix(ci-telemetry): rescan a trailing 24h window so a late re-run is exported (#8898)
+- **Issue #8895** (closed): forge_get_check_runs reads only the first 30 check-runs; merge-pr --auto's settle-wait cannot see the rest
+- **PR #8986**: fix(forge-helpers): paginate check-runs and fail closed on a short read
+- **Issue #8896** (closed): merge-pr --auto (post-#8410): timeout reported as merge failure by Champion; duplicate --allow-unapproved audit comment; stale messages
+- **PR #8988**: fix(merge-pr): distinguish --auto settle-wait timeout as exit 5, de-dupe the loom:pr override audit comment, fix two stale messages (#8896)
+- **Issue #8894** (closed): docs(observability): qualify SigNoz 'registering late costs latency, not data' with the gateway queue bound
+- **PR #8983**: docs(observability): bound the SigNoz late-registration recovery claim
+
 ### 2026-09-25
+- **Issue #8851** (closed): docs: autonomous.ciTelemetry.* is missing from daemon-reference.md's canonical autonomous knob table
+- **PR #8979**: docs(daemon-reference): add autonomous.ciTelemetry.* to the canonical knob table
+- **Issue #8652** (closed): Record cumulative dispatch-paused time attributable to drain-and-restart rolls, per host per day
+- **PR #8980**: feat(observability): record cumulative dispatch-paused time per host per day (#8652)
+- **Issue #8969** (closed): docs(guides): remote-build guide — heavy cargo off-laptop + subagent fan-out conventions
+- **PR #8970**: docs(guides): remote-build guide — heavy cargo off-laptop + subagent fan-out conventions
+- **PR #8955**: feat(worktree): port the crash-debris cleanup / orphan guard to `loom-daemon worktree-cleanup` (#8195 slice 5)
+- **Issue #8941** (closed): Observability: harden #8857 quota metrics (pool read failures, burn interval overlap, re-read cost)
+- **Issue #8930** (closed): Observability: real-time token burn for Codex, OpenCode (GLM) and Kimi stores (#8857 phase 2)
+- **PR #8956**: feat(observability): real-time token burn for Codex, OpenCode (GLM) and Kimi (#8930)
+- **Issue #8427** (closed): Retire the now-callerless auto-merge arming surfaces (forge_auto_merge, forge_check_auto_merge_allowed, loom-daemon forge auto-merge)
+- **PR #8945**: refactor(forge): retire callerless shell auto-merge arm helpers; keep forge auto-merge operator-only (#8427)
+- **Issue #8711** (closed): Ship 'quick tap' model profiles (Cerebras, Gemini Flash) as bundled presets so metered backstops are zero-config
+- **PR #8948**: feat(model-profiles): bundle quick-tap presets for Cerebras and Gemini Flash
+- **Issue #8856** (closed): Observability: Pipeline stage dwell time, queue turnaround latency, and dispatch starvation metrics
+- **PR #8935**: feat(observability): ready-queue dwell, dispatch wait and starvation metrics (#8856)
+- **Issue #8857** (closed): Observability & Tuning: Fleet-wide token burn rate (TPM/RPM), account exhaustion downtime, and worker concurrency scaling
+- **PR #8938**: feat(observability): real-time token burn and pool exhaustion metrics over OTLP (#8857)
+- **Issue #8839** (closed): Protect private Codex guard code and effective policy before mutable admission
+- **PR #8937**: private sessions: prove the engine dispatches to the guard hook (#8839)
+- **PR #8936**: feat(observability): export the ready queue as SigNoz gauges and a queue.snapshot record (#8852 phase 2)
+- **PR #8933**: feat(worktree): port shared-artifact symlink provisioning to `loom-daemon worktree-link` (#8195 slice 4)
+- **PR #8926**: feat(merge-pr): port the loom:pr review-signal guard to Rust (#8191 slice)
+- **Issue #8602** (closed): Pin the chosen preference tap's modelProfile at launch (it gates but does not pin)
+- **PR #8932**: fix(runtime-preference): pin the chosen tap's modelProfile at launch (#8602)
+- **Issue #8623** (closed): bug: native_readiness package-cache key test fails on macOS hosts (platform mutation is a no-op)
+- **Issue #8914** (closed): merge: re-run stale required checks in place (grant fleet App Actions: write) so approved PRs stop losing loom:pr to re-date commits
+- **PR #8924**: feat(merge-pr): re-run stale required checks in place before the #8508 re-date push (#8914)
+- **Issue #8860** (closed): Observability: Universal OTLP export to SigNoz across all daemon loops, LLM token metrics, and host resources
+- **PR #8909**: feat(observability): shared OTLP ops-signal path, work-finder tick traces, host resource gauges (#8860)
+- **Issue #8829** (closed): fix #8692 (issue #8665 cycle-time analytics): live-proof test red on all 4 runs — telemetry-export transport never acknowledged (retry_scheduled:7)
+- **Issue #8665** (closed): observability: cycle-time analytics — standing answer to "what took long to ship and where did it go slow" in SigNoz + ClickHouse
+- **PR #8692**: observability: cycle-time analytics artifacts for ClickHouse + SigNoz
+- **PR #8641**: feat(usage): read per-model token usage from Codex's rollout session store
+- **Issue #8608** (closed): Extend sweep-outcomes summary --group-by complexity with a Curator-vs-Jev agreement column (step 3 of #8543)
+- **PR #8916**: feat(telemetry): Curator-vs-Jev agreement column on --group-by complexity (#8608)
+- **Issue #8825** (closed): observability: capture full GitHub Actions job logs into SigNoz with collector-side secret redaction (build/CI visibility, phase 2 of 3; blocked by #8824)
+- **PR #8915**: feat(observability): capture completed GitHub Actions job logs into chunked ci.job.log records, redacted at the gateway (#8825)
+- **Issue #8457** (closed): role prompts: state that shared-cargo-target-dir integration results are not verdict-bearing evidence (#8453 item 4, urgent stopgap)
+- **PR #8469**: role prompts: shared-cargo-target-dir integration results are not verdict-bearing evidence (#8457)
+- **Issue #8816** (closed): Credential discovery convention for task agents: reference-by-name from the owner environment + explicit provisioning flow
+- **PR #8819**: docs: add task-credential reference-by-name convention
+- **Issue #8514** (closed): A pending drain-and-restart roll pauses the host's dispatch for an hour or more behind long-running native sweeps, then is refused at the deadline and re-arms
+- **PR #8660**: feat(auto-update): supersede an overtaken pending roll and expose live roll state (#8514)
+- **Issue #8599** (closed): Surface the chosen runtime-preference tier in the launch record and role_tick.outcome
+- **PR #8640**: feat(runtime-preference): report the chosen tier in the launch record and role_tick.outcome
+- **PR #8906**: feat(daemon): show the work finder's ready queue in dispatch order (#8852 phase 1)
+- **Issue #8689** (closed): daemon: reaper resumes a sweep once more after a cap-exhausted PR block — one guaranteed no-op dispatch per blocked PR
+- **PR #8703**: fix(reaper): skip resume when the linked PR is parked (loom:blocked) (#8689)
+- **Issue #8410** (closed): merge-pr.sh --auto: a server-side armed auto-merge ignores later loom:pr revocation and non-required test suites
+- **PR #8426**: fix(merge-pr): --auto settles checks and re-validates in-process instead of arming a server-side merge (#8410)
+- **PR #8471**: feat(worktree): port the `remove` verb to `loom-daemon worktree-remove` (#8195 slice 3)
+- **Issue #8848** (closed): Fleet singleton jobs: first-class captain placement so fleet hosts can be identical
+- **PR #8910**: feat(daemon): fleet.captain gate so singleton jobs run on exactly one host
+- **Issue #8564** (closed): Kimi usage attribution: read per-session token usage from Kimi's session store / stream-json so completions carry runtime, provider and model (extends #8507)
+- **PR #8678**: feat(usage-attribution): read per-session Kimi token usage behind the UsageSource seam
+- **PR #8905**: docs(observability): answer the SigNoz UI view matrix via authenticated API probes
+- **Issue #8663** (closed): Native-runtime launches provision a fresh ~126 MB / 7,300-file tool-binding tree per session under ~/.local/state/loom/native-tools and never remove it (31–37 GB per host, ENOSPC on loom-worker-2 twice today)
+- **PR #8705**: Share OpenCode binding trees per workspace and reap stale native launch state
+- **Issue #8515** (closed): A release is visible before its assets are uploaded: updaters report 'no artifact for target' and an explicit --fetch hard-fails on a transient state
+- **PR #8662**: fix(release): defer the Latest pointer until every platform's assets upload
 - **Issue #8542** (closed): Journal the Curator complexity tier and fix judge_verdicts coverage in sweep.outcome (routing-evaluation prerequisite)
 - **PR #8582**: feat(telemetry): journal Curator complexity tier and add --group-by complexity (#8542)
 - **PR #8864**: private sessions: freeze the hook registration by mount, not by recheck (#8839)
