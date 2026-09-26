@@ -254,7 +254,15 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         .or_else(|| lifecycle::inherited(&root, SpanName::RuntimePreflight, Default::default()));
     let result = run_preflight(args, &root, preflight.as_ref(), attempt.as_ref());
     if let Some(span) = preflight {
-        span.finish("rejected", SpanStatus::Error);
+        // A rejected preflight is one of the two shapes an operator reports
+        // ("the attempt failed in 300 ms with no runtime span"): record the
+        // host memory state at the rejection and the fixed reason. No
+        // LaunchError text goes into span attributes — the 256-byte,
+        // allowlist-bounded surface never carries free-form error messages.
+        let mut attributes = lifecycle::attributes(&[("loom.result", "rejected")]);
+        attributes.insert("loom.admission.reason".into(), "preflight-rejected".into());
+        attributes.extend(lifecycle::host_attributes());
+        span.finish_attributes(SpanStatus::Error, attributes);
     }
     if let Some(span) = attempt {
         let outcome = if result
@@ -516,6 +524,11 @@ fn run_preflight(
     log.flush()
         .map_err(|e| LaunchError::config(e.to_string()))?;
     trace_identity.insert("loom.runtime".into(), runtime.clone());
+    // Host memory state at the runtime's launch (this span's begin boundary;
+    // the daemon stamps the end boundary when the child exits or is observed
+    // gone). Clones of this identity carry the snapshot onto the RuntimeRun
+    // start and the preflight's accepted finish.
+    trace_identity.extend(crate::observability::lifecycle::host_attributes());
     let mut runtime_span = None;
     if let Some(preflight) = preflight {
         let mut accepted = trace_identity.clone();

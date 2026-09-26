@@ -186,3 +186,61 @@ fn recycled_owner_is_recovered_without_mistaking_delayed_spawn_for_reuse() {
     assert_eq!(results[0].attributes["loom.result"], "process_lost");
     assert_eq!(results[0].status, SpanStatus::Unset);
 }
+
+#[test]
+fn host_and_admission_attributes_survive_the_span_allowlist() {
+    // The two attribute sets `role_invocation` stamps on every role attempt
+    // must pass the span journal's allowlist intact — and nothing free-form
+    // the underlying outcome carries (failure text, a role-log tail) may
+    // leak into span attributes under any key.
+    use crate::role_runner::RoleTickOutcome;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let root = TraceContext::root(true);
+    // One host sample for both the span start and the assertion, so
+    // monotonically climbing counters (swap in/out totals) cannot make the
+    // comparison self-defeating.
+    let host = host_attributes();
+    let mut start = attributes(&[("loom.role", "judge")]);
+    start.extend(host.clone());
+    let outcome = RoleTickOutcome::LoadSkipped {
+        load_per_core: 4.2,
+        detail: "FREE-FORM-ROLE-LOG-TAIL".to_string(),
+    };
+    let active = journal
+        .start(root.child(), Some(&root), SpanName::RoleAttempt, Utc::now(), start)
+        .unwrap();
+    journal
+        .finish(&active, Utc::now(), SpanStatus::Error, admission_attributes(&outcome))
+        .unwrap();
+    let mut spans = Vec::new();
+    journal
+        .drain(|record| {
+            spans.push(record);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(spans.len(), 1);
+    let attributes = &spans[0].attributes;
+    // Admission side: the fixed reason plus the measured value against the
+    // threshold — the whole point of the closed taxonomy.
+    assert_eq!(attributes.get("loom.admission.reason"), Some(&"load-ceiling".to_string()));
+    assert_eq!(attributes.get("loom.admission.load_per_core"), Some(&"4.200".to_string()));
+    assert_eq!(attributes.get("loom.admission.load_threshold"), Some(&"1.000".to_string()));
+    // The free-form detail rides the outcome for daemon/role logs only.
+    assert!(
+        attributes
+            .values()
+            .all(|value| !value.contains("FREE-FORM-ROLE-LOG-TAIL")),
+        "role-log tail leaked into span attributes: {attributes:?}"
+    );
+    // Host side: every key the probe measured on this host appears on the
+    // span unchanged — nothing silently dropped by the allowlist.
+    for (key, value) in &host {
+        assert_eq!(
+            attributes.get(key),
+            Some(value),
+            "host attribute {key} was dropped or mangled by the allowlist"
+        );
+    }
+}

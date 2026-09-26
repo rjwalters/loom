@@ -41,6 +41,7 @@ fn host_health_with_captain(
         is_captain,
         armed_singleton_jobs,
         captainless_singleton_jobs: Vec::new(),
+        memory: None,
     })
 }
 

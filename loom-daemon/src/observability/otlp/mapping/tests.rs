@@ -5,8 +5,9 @@
 
 use super::*;
 use crate::telemetry::{
-    HostHealthRecord, PhaseDuration, SweepCompletedRecord, SweepOutcomeRecord, SweepPhaseRecord,
-    SweepStartedRecord, TokenAccountState, TokenSnapshotRecord,
+    HostHealthRecord, MemoryPressureSummary, PhaseDuration, SweepCompletedRecord,
+    SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
+    TokenSnapshotRecord,
 };
 
 fn ts() -> DateTime<Utc> {
@@ -198,6 +199,19 @@ fn host_health_envelope() -> TelemetryEnvelope {
             is_captain: None,
             armed_singleton_jobs: Vec::new(),
             captainless_singleton_jobs: Vec::new(),
+            memory: Some(MemoryPressureSummary {
+                mem_total_bytes: Some(34_359_738_368),
+                mem_available_bytes: Some(4_294_967_296),
+                mem_compressed_bytes: None,
+                swap_total_bytes: Some(30_397_721_600),
+                swap_used_bytes: Some(29_201_205_253),
+                swap_in_bytes_total: Some(536_870_912_000),
+                swap_out_bytes_total: Some(644_245_094_400),
+                swap_in_bytes_per_sec: Some(51_200.5),
+                swap_out_bytes_per_sec: Some(71_680.0),
+                memory_pressure: Some(crate::host_pressure::MemoryPressure::Some),
+                oom_kill_total: Some(3),
+            }),
         }),
     )
 }
@@ -425,8 +439,53 @@ fn host_health_becomes_gauge_metrics() {
         "loom.host.roles_total_ticks",
         "loom.host.roles_ok_ticks",
         "loom.host.roles_persistent_failures",
+        // Memory-pressure gauges (deferred vs killed vs timed out): all
+        // eleven measured in `host_health_envelope`'s fixture, so all
+        // eleven must appear.
+        "loom.host.mem_total_bytes",
+        "loom.host.mem_available_bytes",
+        "loom.host.swap_total_bytes",
+        "loom.host.swap_used_bytes",
+        "loom.host.swap_in_bytes_total",
+        "loom.host.swap_out_bytes_total",
+        "loom.host.swap_in_bytes_per_sec",
+        "loom.host.swap_out_bytes_per_sec",
+        "loom.host.memory_pressure",
+        "loom.host.oom_kill_total",
     ] {
         assert!(names.contains(&expected), "missing metric {expected} in {names:?}");
+    }
+    // The fixture's `mem_compressed_bytes` is None (a macOS-shaped sample)
+    // and must NOT appear — the absence contract: unmeasured never plots
+    // as a zero gauge.
+    assert!(
+        !names.contains(&"loom.host.mem_compressed_bytes"),
+        "unmeasured mem_compressed_bytes must not become a gauge: {names:?}"
+    );
+}
+
+#[test]
+fn unmeasured_memory_summary_produces_no_memory_gauges_at_all() {
+    // A host whose platform measured nothing (or an older daemon) carries
+    // `memory: None`: none of the memory gauges may exist — not even as
+    // zeros.
+    let mut envelope_ = host_health_envelope();
+    if let TelemetryRecord::HostHealth(record) = &mut envelope_.record {
+        record.memory = None;
+    }
+    let batch = vec![envelope_];
+    let request =
+        build_metrics_request(&batch).expect("host.health must produce a metrics request");
+    let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+    let names: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
+    for forbidden in [
+        "loom.host.mem_total_bytes",
+        "loom.host.mem_available_bytes",
+        "loom.host.swap_used_bytes",
+        "loom.host.memory_pressure",
+        "loom.host.oom_kill_total",
+    ] {
+        assert!(!names.contains(&forbidden), "{forbidden} must be absent: {names:?}");
     }
 }
 
@@ -517,6 +576,7 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
+        memory: None,
     };
     let batch = vec![envelope(
         "host-c",

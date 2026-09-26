@@ -1157,6 +1157,7 @@ fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healt
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
+        memory: None,
     };
     assert_eq!(
         host_health.roles.persistent.len(),
