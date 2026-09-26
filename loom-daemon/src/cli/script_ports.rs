@@ -234,6 +234,15 @@ pub(crate) enum ScriptPortCommand {
     /// resolved, 1 no manifest reachable (soft), 78 (`EX_CONFIG`) malformed
     /// manifest or an unrecognized `launch` key.
     RuntimeLaunchEnv(super::runtime_launch_cmd::RuntimeLaunchEnvArgs),
+
+    /// `sync-labels.sh`'s duplicate-declared-name scan (#8875): a
+    /// `labels.yml` that carries two `- name:` entries for the same label
+    /// (the pre-#4187-upgrade shape `merge_labels_block` now absorbs on
+    /// install) is structural drift in the file itself, independent of
+    /// forge state. Ported out of the `contract`-category script per the
+    /// shell language policy. Prints each duplicated name once, in file
+    /// order.
+    LabelDuplicates(super::label_duplicates::LabelDuplicatesArgs),
 }
 
 impl ScriptPortCommand {
@@ -272,6 +281,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
+            ScriptPortCommand::LabelDuplicates(args) => args.run(),
         }
     }
 }

@@ -28,6 +28,7 @@ pub(crate) mod fleet_experiment;
 mod git_blob_lines;
 pub(crate) mod health;
 pub(crate) mod inflight;
+mod label_duplicates;
 pub(crate) mod lease_ensure;
 pub(crate) mod legacy_script_cmds;
 mod merge_pr_delete_branch;
