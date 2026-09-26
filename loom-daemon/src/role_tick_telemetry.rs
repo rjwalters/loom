@@ -642,10 +642,12 @@ fn emit_correlated(
     // `None` for `claude`, so a Claude tick's record stays byte-identical; the
     // record's own `runtime`/`provider`/`profile` fields are unaffected either
     // way (they stay launch-record-sourced, via `apply_runtime_attribution`).
+    let role_log =
+        crate::role_runner::role_log_path(&tick.root.join(".loom").join("logs"), &tick.role);
     let usage_runtime = tick.result.spawned().then(|| {
         crate::usage_source::role_tick_usage_runtime(
             runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
-            &crate::role_runner::role_log_path(&tick.root.join(".loom").join("logs"), &tick.role),
+            &role_log,
         )
     });
     let source = crate::usage_source::UsageSource::for_runtime(
@@ -672,6 +674,8 @@ fn emit_correlated(
             return crate::usage_source::role_tick_tokens_by_model(
                 usage_runtime.as_ref().and_then(|r| r.as_deref()),
                 &tick.root,
+                // Pi's usage is its event stream, captured in this log (#8594).
+                &role_log,
                 Some((tick.started_at, tick.ended_at)),
             )
             .map(|tokens_by_model| TranscriptScan {

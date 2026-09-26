@@ -568,6 +568,96 @@ complete trial project (including the gateway) was torn down with
 `down --volumes` / `down` at the end, and the host's unrelated containers
 were never touched.
 
+## CI retro queries, executed live (2026-09-25, #8826)
+
+**Data source: live capture, not the fixture manifest.** `loom-daemon
+ci-telemetry --once` (0.19.375) polled the real `2amlogic` org into a scratch
+workspace. Its journal went through `telemetry-export` into a scratch gateway
+container running `defaults/observability/collector/config.yaml` byte-for-byte
+(verified with `diff`), then into the running trial. The trial is the
+2026-09-22 deployment's persistent volumes, restarted 2026-09-25 17:48 UTC.
+Captured window: `ci.run`/`ci.job` completions from 2026-09-24 17:58 to
+2026-09-25 17:47 UTC, **592 runs and 2,131 jobs across 19 repositories**.
+
+`ci-queries.sql` ran in one pass through the bundled `clickhouse-client`, with
+`--param_since='2026-09-18 00:00:00' --param_repo='' --param_bucket_hours=24
+--param_window_hours=12 --param_top=10`. The 12-hour window is the largest that
+gives section 2 two full windows over about 24 hours of data. It exited 0, and
+every section returned rows:
+
+| § | Rows | Sanity check against independent data |
+|---|---|---|
+| 0 | 10 series / 2 kinds | Each histogram lands as five series (`.bucket`, `.count`, `.sum`, `.min`, `.max`): 33 run and 97 job label sets. Records: 592 `ci.run`, 2,131 `ci.job` |
+| 0b | 2 | **Metric points equal distinct records exactly: 592 = 592 runs, 2,131 = 2,131 jobs** |
+| 1 | 127 | Per-job daily P50/P95/max, e.g. `gf180-bandgap` "T1 signoff re-grade (klt)" steady at 19–21 s |
+| 2 | 10 | Top regression: `klayout-tools` "Tests (Python 3.11)", P95 294 s → 513 s (+219 s, +74.5 %), 15 prior / 20 current jobs |
+| 3 | 45 | Totals **535 success / 55 failure / 2 cancelled / 0 unreported = 592**, identical per conclusion to the `ci.run` records' own `loom.ci.conclusion` |
+| 4 | 10 | Longest job: `gf180-sar-adc` nightly "sim/selftest.sh stages 2-4 (real PDK)", 822 s, with run/job ids |
+| 5 | 60 | 55 failed runs joined to their non-successful jobs, each with its `logs_explorer_filter`. Every row shows `chunks_present`/`chunk_count` **0 of 0**, correctly, because no `ci.job.log` record reached the trial (see below) |
+| 6 | 10 | Slowest run: the same nightly, 827 s wall-clock, with that 822 s job making `longest_share` 0.99. `klayout-tools` CI runs show 17 jobs, 1.3–1.5 ks summed job time and a 0.75–0.95 share, so parallelism hides most of the job time |
+
+**Section 5's log join is not proven against live chunks.** Log capture was
+on (`logCaptureEnabled: true`), but no cycle in this session reached its
+log-download stage. Two bounded `--once` cycles, each killed by a 15-minute
+wall-clock `timeout`, spent all their time recording the org's run backlog.
+The ledger ended at 1,349 runs and 4,037 jobs, all 4,037 job logs pending, 0
+downloaded. The `job_logs` CTE's keys and map columns (`loom.ci.job_id`,
+`loom.ci.chunk_index`, `loom.ci.chunk_count`, `loom.ci.truncated`) are checked
+against the daemon's `CiJobLogRecord` rendering and the log `keep_keys` by the
+drift guard below. Its non-zero path has not been observed on real chunks.
+
+**A defect this run found and fixed before commit.** The first draft of
+sections 1–3 de-duplicated the metric samples on `(fingerprint, unix_milli,
+value)`, to absorb at-least-once redelivery. Against live data that returned
+578 runs and 2,081–2,091 jobs, not 592 and 2,131. Raw `samples_v4` rows equal
+the distinct record counts exactly, so no sample in this data was a
+redelivery. All 14 missing runs belonged to groups of records sharing
+`(repo, workflow, conclusion, completed second)`. A metric point carries no run
+identity and durations are whole seconds, so two real runs finishing in the
+same second are identical samples. The de-dup silently dropped 2.4 % of runs.
+It also moved section 2's ranking: `klayout-tools` "Tests (Python 3.12)" read
++5 s with the de-dup and +45 s without it. Sections 1–3 now count every stored
+sample, which is also what the SigNoz UI counts. Section 0b was added so a
+redelivered batch shows up as metric points exceeding records, instead of being
+either absorbed or silently corrected.
+
+**Drift guard.** `loom-daemon/tests/signoz_trial_artifacts.rs` re-derives the
+CI vocabulary from the gateway's per-context `keep_keys` (`log` and `datapoint`
+separately) and from the daemon's own record rendering, including the SigNoz
+map column each key's OTLP type lands in. It fails on any mismatch.
+
+### Retention DDL observed (2026-09-25)
+
+`retention.sql` (the 7-day logs/traces, 30-day metrics version) was re-run
+against this trial, and all 16 `ON CLUSTER` statements reported status 0. The
+effective local-table DDL from the README's check query, with Distributed
+tables excluded:
+
+| Database | Tables | Effective TTL |
+|---|---|---|
+| `signoz_metrics` | `samples_v4`, `samples_v4_agg_5m`/`_30m`, `time_series_v4`, `time_series_v4_6hrs`/`_1day`/`_1week`, `exp_hist` | `toIntervalSecond(2592000)` = **30 days** |
+| `signoz_metrics` | `metadata`, `samples_v2`, 6 × `samples_v4_reduced_*`, `time_series_v4_reduced`, `time_series_v4_reduced_1day` | `toIntervalDay(30)` = **30 days** (`retention.sql`) |
+| `signoz_metrics` | `samples_v4_buffer`, `time_series_v4_buffer` / `usage` | 25 h / 3 days — upstream buffer and accounting tables, not signal retention |
+| `signoz_logs`, `signoz_traces` | `tag_attributes_v2` (both), `signoz_spans`, `signoz_index_v2`, `durationSort`, `top_level_operations` | **7 days** (`retention.sql`) |
+| `signoz_logs` | `logs_v2`, `logs_v2_resource` | `toIntervalDay(_retention_days)`. The column default and every stored row (2,765) are **15** |
+| `signoz_traces` | `signoz_index_v3`, `trace_summary`, `signoz_error_index_v2`, `dependency_graph_minutes_v2`, `usage_explorer`, `traces_v3_resource` | `toIntervalSecond(1296000)` = **15 days** |
+| `signoz_logs`, `signoz_traces` | `logs_attribute_keys`, `logs_resource_keys`, `span_attributes_keys` | 15 days |
+
+**Metrics ≥ 30 days is verified in effective DDL.** Every metric signal table
+is at 30 days.
+
+**Logs and traces are *not* at 7 days on this trial, and this is not claimed
+as done.** The tables still at 15 days are the ones the SigNoz retention API
+owns: the API changes `_retention_days` and the active trace tables. This
+session could not apply that step. The org's only account (`trial@example.com`,
+registered 2026-09-22) has no persisted password in the private state
+directory, and the org has no API key. Resetting the password by writing to
+the metastore would mean editing an auth store to get around its login, so it
+was not done. The six CI saved views were not created for the same reason.
+Both remain open in [#8946](https://github.com/rjwalters/loom/issues/8946),
+which also asks the API step to confirm whether the three `*_keys` tables need
+a `retention.sql` statement.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -586,6 +676,10 @@ were never touched.
 | Shared fixture manifest observed in SigNoz | **Passed** — see "Shared fixture manifest, executed live" above: 37/14/3 signals, exact totals, graph, grouping, root-less detection, absence-vs-zero and privacy-sentinel queries all verified |
 | Real Loom canary / real Judge-Doctor repair trace | Open — the instrumentation slices landed (#8577/#8579), but #8525 itself stays open for its own live-run acceptance, and the run needs the trial host; see #8529 |
 | Repeated latency/footprint comparison | Open — shared evaluation #8529; neither session deployed ClickStack alongside SigNoz, so no simultaneous comparison has been attempted |
+| CI retro queries (`ci-queries.sql`, #8826) | **Passed on live capture** — every section non-empty; metric-path counts and conclusion split reconcile exactly to the records (592 runs / 2,131 jobs); see "CI retro queries, executed live". Section 5's chunk join is unobserved on real `ci.job.log` data (none reached the trial) |
+| CI metrics retention ≥ 30 days (#8826) | **Passed in effective DDL** — every metric signal table at 30 days |
+| CI logs/traces at 7 days on the current trial | **Open** — API-owned tables still at the upstream 15 days; needs the org login ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
+| Six CI saved views in the trial org | **Open** — recreation steps written in the README, not yet executed in the UI ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | UI view matrix for Loom's non-HTTP span kinds | **Answered for Service List/APM and Exceptions, via authenticated backend API probes rather than a browser** (see "UI view matrix" above) — Service List/APM populates (`loom-daemon`, correct call/error counts) because RED metrics come from unconditional root-span aggregation, not an HTTP convention; Exceptions stays empty because Loom never emits an OTel `exception` span event. Service Map returned empty but is confounded by the fixture being single-service and no service-graph connector being configured — not attributable to span kind from this evidence. No screenshot has been captured on any session |
 
 Synthetic fixture success establishes transport/schema/query behavior, not a

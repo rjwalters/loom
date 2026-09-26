@@ -103,6 +103,15 @@ pub(crate) enum TelemetryCommand {
     /// `config.toml` and `history.jsonl` are unreachable from it.
     CodexUsage(super::codex_usage_cli::CodexUsageArgs),
 
+    /// Per-model token usage from the Pi `--mode json` event stream a launch
+    /// log captured (Issue #8594).
+    ///
+    /// The Pi sibling of `opencode-usage`/`codex-usage` (backfill, and
+    /// verifying what a sweep's `tokens_by_model` carries). Read-only — the
+    /// reader opens only `.loom/logs/sweep-issue-<N>.log` / `role-<role>.log`,
+    /// never Pi's agent directory or its `auth.json`.
+    PiUsage(super::pi_usage_cli::PiUsageArgs),
+
     /// Roll raw Claude Code transcripts into a verified, incremental
     /// `.tar.zst` archive before Claude Code's `cleanupPeriodDays` fuse
     /// deletes them (#8494, split from #8477's item 5).
@@ -151,6 +160,7 @@ impl TelemetryCommand {
             TelemetryCommand::UsageReport(args) => args.run(),
             TelemetryCommand::OpencodeUsage(args) => args.run(),
             TelemetryCommand::CodexUsage(args) => args.run(),
+            TelemetryCommand::PiUsage(args) => args.run(),
             TelemetryCommand::ArchiveTranscripts(args) => args.run(),
             TelemetryCommand::CiTelemetry(args) => args.run(),
         }

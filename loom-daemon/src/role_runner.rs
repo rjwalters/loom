@@ -1070,7 +1070,7 @@ mod invocation;
 /// its log, and a second private copy of this join would be free to drift
 /// from this one.
 #[must_use]
-pub(crate) fn role_log_path(logs_dir: &Path, role: &str) -> PathBuf {
+pub fn role_log_path(logs_dir: &Path, role: &str) -> PathBuf {
     logs_dir.join(format!("role-{role}.log"))
 }
 
