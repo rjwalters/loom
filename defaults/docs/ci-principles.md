@@ -40,8 +40,12 @@ the next person to add one will have an equally good argument.
    `--partition count:k/N`, under which each test lands in exactly one leg and
    the legs' "N tests run" lines sum to the unpartitioned total. Do not use a
    filterset that picks "the tests that matter": that is path-filtering by
-   another name (rule 3). A leg builds its own binary rather than receiving a
-   hand-off artifact unless the hand-off is measured to be faster (rule 1).
+   another name (rule 3). Hand a binary between jobs only when it measurably
+   wins. The debug daemon qualifies: its consumers dropped from 100-130s of
+   compiling to 9-24s. A consumer whose producer failed must turn red rather
+   than be skipped (`if: ${{ !cancelled() }}` plus a download that fails when
+   the artifact is missing), because a skipped required check counts as
+   passing (rule 6).
 
 ## What prompted this
 
