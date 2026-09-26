@@ -237,6 +237,16 @@ branch's **required** status-check set:
   *can* block, and an unreadable protection lookup is not evidence of its
   absence.
 
+That decision — including the two knobs, their floors, and the two-source
+required-context lookup it shares with the #8248 freshness guard — is
+`loom-daemon merge-pr zero-checks-settle`
+(`loom-daemon/src/merge_pr/zero_checks.rs`). `merge-pr.sh` consults it on every
+zero-row poll and obeys the sentinel it answers with; it holds no copy of the
+rule. A daemon too old to know the verb (or missing entirely) produces no
+sentinel, and the script then falls back to #6169's full deadline-bounded wait —
+the state this narrows, so a fault there costs time and never skips a gate. It
+cannot degrade into settling on a single empty read.
+
 What exit 5 deliberately is **not**:
 
 - **Not a failed check.** A failing *required* check still exits 1 — that is

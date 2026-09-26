@@ -2009,8 +2009,8 @@ _recheck_mergeable_before_refusal() {
 #   - calls error() (exit 1) → a required status check failed, or the wait timed
 #                  out. A normal recoverable failure Champion's cron retries.
 # Requires LOOM_AUTO_MERGE_POLL_INTERVAL / LOOM_AUTO_MERGE_TIMEOUT set.
-# Self-defaults LOOM_ZERO_CHECKS_SETTLE_POLLS / LOOM_ZERO_CHECKS_SETTLE_INTERVAL
-# (#9091 — the bounded zero-row settle; see the zero-row branch in the loop).
+# LOOM_ZERO_CHECKS_SETTLE_POLLS / LOOM_ZERO_CHECKS_SETTLE_INTERVAL (#9091) are
+# read and validated by `loom-daemon merge-pr zero-checks-settle`, not here.
 _wait_for_checks_then_sync_merge() {
   local head_sha base_ref
   # Poll the SHA this run will actually MERGE, not the one the initial
@@ -2030,7 +2030,11 @@ _wait_for_checks_then_sync_merge() {
     return 0
   fi
 
-  local deadline observed_checks
+  # zero_row_* / _zcs_* are #9091's zero-row settle state; see that branch at
+  # the bottom of the loop. Declared here (rather than beside it) so the
+  # zero-row poll count and the cached required-context token survive across
+  # loop iterations for the lifetime of this call.
+  local deadline observed_checks zero_row_polls=0 zero_row_required=unknown _zcs _zcs_action _zcs_sleep _zcs_msg
   deadline=$(( $(date +%s) + LOOM_AUTO_MERGE_TIMEOUT ))
   # #6169: whether we have ever seen a nonzero check-runs total_count for this
   # head SHA. A check-runs rollup with zero rows is ambiguous on its own — it
@@ -2048,26 +2052,6 @@ _wait_for_checks_then_sync_merge() {
   # fetch result is anything other than a confirmed 404 (success, or a
   # non-404 failure).
   local not_found_streak=0
-
-  # #9091: how many zero-row polls have been taken, and what the base branch's
-  # required-context set turned out to be ("unknown" until first resolved, then
-  # "none" / "present" / "lookup-failed"). Both survive across iterations.
-  # See the zero-row branch at the bottom of the loop for why they exist.
-  local zero_row_polls=0 zero_row_required="unknown"
-  # Bounded settle for the no-required-contexts case. Deliberately declared with
-  # `:=` inside the function rather than in the caller's defaults block: the
-  # merge-pr test suites extract and source this function on its own under
-  # `set -u`, so its knobs must self-default. 3 polls x 5s ≈ 10s of grace for a
-  # check-run that is merely slow to REGISTER, while staying two orders of
-  # magnitude below the 600s ceiling this replaces. Floored at 2 polls: settling
-  # on a single empty read is the #6169 bug itself, so no operator value may
-  # re-enable it (a non-numeric value lands on the floor too).
-  : "${LOOM_ZERO_CHECKS_SETTLE_POLLS:=3}"
-  : "${LOOM_ZERO_CHECKS_SETTLE_INTERVAL:=5}"
-  [[ "$LOOM_ZERO_CHECKS_SETTLE_POLLS" =~ ^[0-9]+$ ]] && [[ "$LOOM_ZERO_CHECKS_SETTLE_POLLS" -ge 2 ]] || LOOM_ZERO_CHECKS_SETTLE_POLLS=2
-  # A garbage interval falls back to the normal poll interval (the conservative
-  # direction: longer spacing), never to an unusable `sleep` argument.
-  [[ "$LOOM_ZERO_CHECKS_SETTLE_INTERVAL" =~ ^[0-9]+$ ]] || LOOM_ZERO_CHECKS_SETTLE_INTERVAL="$LOOM_AUTO_MERGE_POLL_INTERVAL"
 
   while true; do
     # A concurrent merger may have completed the PR while we waited.
@@ -2187,52 +2171,32 @@ _wait_for_checks_then_sync_merge() {
 
     # Nothing failing, nothing pending -- but a zero-row rollup we have never
     # seen non-empty is ambiguous (#6169: could be a transient forge read, not
-    # genuine settlement). Re-poll instead of trusting it rather than settling
-    # on a single empty read.
+    # genuine settlement), so it is never trusted on a single read.
     #
-    # #9091 bounds how long that re-polling can last, because "wait out the
-    # whole deadline" was catastrophic on the case it is MOST likely to meet: a
-    # repo with no CI configured for the changed paths returns zero rows on
-    # every poll forever, so every `--auto` merge there burned the full
-    # LOOM_AUTO_MERGE_TIMEOUT (600s default) before merging — long enough that
-    # Champion's own Bash-tool cap killed the process first, leaving
-    # "Proceeding with squash merge..." on the PR and no merge, no failure, no
-    # label change (a private fleet repo, 2026-09-26; timeline in #9091).
+    # The decision — settle now, keep waiting (and for how long), or report the
+    # whole wait spent — is `loom-daemon merge-pr zero-checks-settle` (Rust,
+    # loom-daemon/src/merge_pr/zero_checks.rs, #9091). It holds #6169's rule,
+    # #9091's narrowing of it (bounded only when the base branch requires NO
+    # status-check contexts, so nothing that can gate this merge may still be
+    # registering), the LOOM_ZERO_CHECKS_SETTLE_* knobs and their floors, and
+    # the two-source required-context lookup it shares with the #8248 freshness
+    # guard. $zero_row_required is that lookup's answer, echoed back on field 3
+    # of every decision line and replayed on the next poll, which is what makes
+    # it happen ONCE per wait rather than once per poll.
     #
-    # The discriminator is the base branch's REQUIRED status-check set, read
-    # once and cached for the lifetime of this call:
-    #   - none         → nothing the forge would gate this merge on can still be
-    #                    registering, and a wrongly-empty read could at worst
-    #                    skip INFORMATIONAL checks, which this function already
-    #                    merges over by design (see the "only informational
-    #                    (non-required) check(s) failing" path above). Settle
-    #                    after LOOM_ZERO_CHECKS_SETTLE_POLLS reads (>1, so
-    #                    #6169's "never trust a single empty read" still holds),
-    #                    spaced by the short LOOM_ZERO_CHECKS_SETTLE_INTERVAL.
-    #   - present      → a required context that has not registered yet is
-    #                    exactly #6169's danger, and merging early would bypass
-    #                    a gate that CAN block. Keep polling to the deadline.
-    #   - lookup-failed → unknown, so fail closed onto the same full wait.
+    # No requires-daemon floor -- same choice `loom-pr-guard`/`redate-checks`
+    # make above. Output that does not begin with a LOOM-ZERO-CHECKS-* sentinel
+    # (missing binary, older binary, clap usage error, silence) falls back to
+    # #6169's full deadline-bounded wait: the status quo ante this narrows, so
+    # a fault can only cost time, never skip a gate. It can NOT degrade into
+    # settling on one empty read, which is #6169 itself.
     if [[ "$total_count" -eq 0 ]] && [[ "$observed_checks" != "true" ]]; then
       zero_row_polls=$(( zero_row_polls + 1 ))
-      if [[ "$zero_row_required" == "unknown" ]]; then
-        local req_rc=0 req_contexts
-        req_contexts="$(forge_get_required_status_check_contexts "$REPO_NWO" "$base_ref" "$GH" 2>/dev/null)" || req_rc=$?
-        if [[ "$req_rc" -ne 0 ]]; then zero_row_required="lookup-failed"
-        elif [[ -n "$req_contexts" ]]; then zero_row_required="present"
-        else zero_row_required="none"; fi
-      fi
-      if [[ "$zero_row_required" == "none" ]] && [[ "$zero_row_polls" -ge "$LOOM_ZERO_CHECKS_SETTLE_POLLS" ]]; then
-        info "PR #$PR_NUMBER: check-runs rollup empty (zero rows) on ${zero_row_polls} consecutive polls and $base_ref requires no status-check contexts; treating this repo as having no checks for this commit instead of waiting out the ${LOOM_AUTO_MERGE_TIMEOUT}s ceiling (#9091)"
-      elif [[ "$(date +%s)" -ge "$deadline" ]]; then
-        warning "PR #$PR_NUMBER: check-runs rollup remained empty (zero rows) for the entire ${LOOM_AUTO_MERGE_TIMEOUT}s wait; proceeding on the assumption this repo genuinely has no checks configured for this commit"
-      else
-        local zero_row_sleep="$LOOM_AUTO_MERGE_POLL_INTERVAL"
-        [[ "$zero_row_required" == "none" ]] && zero_row_sleep="$LOOM_ZERO_CHECKS_SETTLE_INTERVAL"
-        info "PR #$PR_NUMBER: check-runs rollup is empty (zero rows) -- ambiguous between 'no checks configured' and a transient forge read; re-polling in ${zero_row_sleep}s before trusting it (required contexts on $base_ref: $zero_row_required)"
-        sleep "$zero_row_sleep"
-        continue
-      fi
+      _zcs="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr zero-checks-settle --pr "$PR_NUMBER" --repo "$REPO_NWO" --base-ref "$base_ref" --polls "$zero_row_polls" --required-state "$zero_row_required" --poll-interval "$LOOM_AUTO_MERGE_POLL_INTERVAL" --timeout "$LOOM_AUTO_MERGE_TIMEOUT" --now "$(date +%s)" --deadline "$deadline" 2>/dev/null | head -1)" || true
+      [[ "$_zcs" == LOOM-ZERO-CHECKS-* ]] || _zcs="LOOM-ZERO-CHECKS-$([[ "$(date +%s)" -ge "$deadline" ]] && echo TIMEOUT || echo WAIT) $LOOM_AUTO_MERGE_POLL_INTERVAL lookup-failed PR #$PR_NUMBER: check-runs rollup is empty (zero rows) and 'loom-daemon merge-pr zero-checks-settle' returned no verdict (missing or older binary), so #9091's bounded settle is unavailable; falling back to #6169's full ${LOOM_AUTO_MERGE_TIMEOUT}s wait before trusting it"
+      read -r _zcs_action _zcs_sleep zero_row_required _zcs_msg <<<"$_zcs"
+      if [[ "$_zcs_action" == "LOOM-ZERO-CHECKS-WAIT" ]]; then info "$_zcs_msg"; sleep "$_zcs_sleep"; continue; fi
+      [[ "$_zcs_action" == "LOOM-ZERO-CHECKS-TIMEOUT" ]] && warning "$_zcs_msg" || info "$_zcs_msg"
     fi
 
     # Nothing failing (or only informational), nothing pending → effectively

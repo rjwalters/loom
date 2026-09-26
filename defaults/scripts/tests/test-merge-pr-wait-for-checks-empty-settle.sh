@@ -20,12 +20,21 @@
 # configured for the changed paths returns zero rows on every poll forever, so
 # every `--auto` merge there burned the entire LOOM_AUTO_MERGE_TIMEOUT (600s)
 # before merging, and the calling agent's own process cap killed it first
-# (a private fleet repo, 2026-09-26; timeline in #9091: "Proceeding with squash
-# merge..." then no merge, no failure, no label change). The wait is bounded to
-# LOOM_ZERO_CHECKS_SETTLE_POLLS polls WHEN the base branch requires no
-# status-check contexts -- still never one read (#6169 holds), but seconds
-# instead of ten minutes. Required contexts present, or a lookup that errors,
-# keep the full wait. Scenarios (e), (f) and (g) below cover that split.
+# (a fleet repo, 2026-09-26; timeline in #9091: "Proceeding with squash
+# merge..." then no merge, no failure, no label change).
+#
+# WHAT IS TESTED WHERE (#9091's placement, per this repo's shell-language
+# policy): the zero-row DECISION -- how many empty polls are enough, the
+# required-context discriminator, the LOOM_ZERO_CHECKS_SETTLE_* floors and
+# fallbacks -- is `loom-daemon merge-pr zero-checks-settle`
+# (loom-daemon/src/merge_pr/zero_checks.rs), and its unit tests live beside it
+# in loom-daemon/src/merge_pr/zero_checks/tests.rs. merge-pr.sh's remaining
+# share is INVOCATION: consult the subcommand on every zero-row poll, pass it
+# the poll count and the cached required-context token, obey the sentinel it
+# answers with, and fail closed onto #6169's full wait when it cannot be run at
+# all. That wiring is what scenarios (a)-(b) and (e)-(i) below drive, through a
+# stub daemon -- so a decision-rule change cannot be "covered" here by a test
+# that only ever saw a canned answer.
 #
 # Fix: track whether a nonzero total_count has EVER been observed
 # (observed_checks). A zero-row read is only trusted once observed_checks is
@@ -38,9 +47,10 @@
 # Strategy (mirrors test-merge-pr-merge-ordering-guard.sh): extract
 # _wait_for_checks_then_sync_merge from merge-pr.sh and source it, stub every
 # forge_* helper it calls plus `sleep`/`date` (both stubbed so the test runs
-# deterministically and instantly -- no real wall-clock waiting), then assert
-# on the function's return value, how many times it polled forge_get_check_runs,
-# and the info/warning narration it emits.
+# deterministically and instantly -- no real wall-clock waiting) AND the
+# loom-daemon binary the zero-row branch shells out to, then assert on the
+# function's return value, how many times it polled forge_get_check_runs, what
+# it asked the daemon, and the info/warning narration it emits.
 #
 # Usage:
 #   ./.loom/scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh
@@ -155,17 +165,61 @@ date() {
 # --- Stub forge_get_pr_nocache: never "merged concurrently" in these tests ---
 forge_get_pr_nocache() { echo '{"merged": false}'; }
 
-# --- Stub forge_get_required_status_check_contexts ---
-# The zero-row branch reads it too as of #9091 (it is the discriminator between
-# "bounded settle" and "wait out the whole deadline"), so it is now scenario
-# state: $REQUIRED_CONTEXTS is its stdout and $REQUIRED_RC its exit code.
-# Defaults to the no-required-contexts, lookup-succeeded case.
-REQUIRED_CONTEXTS=""
-REQUIRED_RC=0
-forge_get_required_status_check_contexts() {
-    [[ -n "$REQUIRED_CONTEXTS" ]] && printf '%s\n' "$REQUIRED_CONTEXTS"
-    return "$REQUIRED_RC"
-}
+# --- Stub forge_get_required_status_check_contexts: only the failing-check
+# branch reads it, which no scenario below exercises. The zero-row branch's own
+# required-context lookup lives in the daemon subcommand as of #9091 ---
+forge_get_required_status_check_contexts() { echo ""; }
+
+# --- Stub the loom-daemon binary the zero-row branch shells out to ---
+# A real binary is deliberately NOT used here: these scenarios are about the
+# WIRING (is the subcommand consulted, with what, and is its verdict obeyed),
+# and a real binary would make every case depend on live branch-protection
+# reads. The decision rule itself is unit-tested in Rust -- see the header.
+#
+# The stub records every argv it is handed, then answers either from a canned
+# queue ($ZCS_QUEUE, one decision line per call) or, when that is empty, with
+# the DEADLINE-ONLY policy -- WAIT until the caller's own --deadline has passed,
+# then TIMEOUT. That default is #6169's pre-#9091 behaviour, which keeps
+# scenarios (a) and (b) measuring exactly what they measured before.
+DAEMON_STUB="$STATE_DIR/loom-daemon"
+ZCS_ARGV="$STATE_DIR/zcs-argv"        # one line per invocation
+ZCS_QUEUE="$STATE_DIR/zcs-queue"      # canned decision lines, consumed in order
+ZCS_REQUIRED_FILE="$STATE_DIR/zcs-required"   # token the default policy echoes
+cat > "$DAEMON_STUB" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$*" >> "$ZCS_ARGV"
+# Anything but the expected verb is an old/wrong binary: exit non-zero with no
+# sentinel, which is what the caller's fail-closed fallback keys on.
+[[ "${1:-}" == "merge-pr" && "${2:-}" == "zero-checks-settle" ]] || exit 2
+now=0 deadline=0 poll_interval=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --now) now="$2"; shift 2 ;;
+        --deadline) deadline="$2"; shift 2 ;;
+        --poll-interval) poll_interval="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+if [[ -s "$ZCS_QUEUE" ]]; then
+    head -n 1 "$ZCS_QUEUE"
+    tail -n +2 "$ZCS_QUEUE" > "$ZCS_QUEUE.rest" && mv "$ZCS_QUEUE.rest" "$ZCS_QUEUE"
+    exit 0
+fi
+required="$(cat "$ZCS_REQUIRED_FILE")"
+if [[ "$now" -ge "$deadline" ]]; then
+    echo "LOOM-ZERO-CHECKS-TIMEOUT 0 $required PR #42: check-runs rollup remained empty (zero rows) for the entire wait; proceeding on the assumption this repo genuinely has no checks configured for this commit"
+else
+    echo "LOOM-ZERO-CHECKS-WAIT $poll_interval $required PR #42: check-runs rollup is empty (zero rows) -- ambiguous between 'no checks configured' and a transient forge read; re-polling before trusting it"
+fi
+STUB
+chmod +x "$DAEMON_STUB"
+export ZCS_ARGV ZCS_QUEUE ZCS_REQUIRED_FILE
+
+# Appends one canned decision line the stub will answer with, in order.
+queue_zcs_decision() { echo "$1" >> "$ZCS_QUEUE"; }
+zcs_call_count() { wc -l < "$ZCS_ARGV" | tr -d ' '; }
+zcs_argv() { cat "$ZCS_ARGV"; }
 
 forge_get_check_runs() {
     local calls
@@ -191,12 +245,10 @@ reset_test_state() {
     PR_NUMBER=42
     REPO_NWO="owner/repo"
     GH="gh"
-    REQUIRED_CONTEXTS=""
-    REQUIRED_RC=0
-    # #9091's knobs self-default inside the function (with `:=`, so the call
-    # leaves them SET in this shell). Unset them here so every scenario starts
-    # from the production defaults rather than inheriting the previous one's.
-    unset LOOM_ZERO_CHECKS_SETTLE_POLLS LOOM_ZERO_CHECKS_SETTLE_INTERVAL
+    : > "$ZCS_ARGV"
+    : > "$ZCS_QUEUE"
+    echo "none" > "$ZCS_REQUIRED_FILE"
+    LOOM_DAEMON_BIN="$DAEMON_STUB"
 }
 
 # Appends one canned JSON response line to the forge_get_check_runs queue.
@@ -234,7 +286,7 @@ assert_eq "true" "$([[ $calls -ge 2 ]] && echo true || echo false)" \
 # poll more than once before giving up, and the fallback narration must say so
 # explicitly.
 reset_test_state
-REQUIRED_CONTEXTS="Required Gate"
+echo "present" > "$ZCS_REQUIRED_FILE"
 LOOM_AUTO_MERGE_TIMEOUT=3
 LOOM_AUTO_MERGE_POLL_INTERVAL=1
 queue_fgcr_response "$EMPTY_ROLLUP"
@@ -276,104 +328,131 @@ assert_eq "0" "$rc" "(d) Function returns 0 once the pending check resolves"
 assert_eq "2" "$calls" "(d) Exactly two polls: one pending, one resolved"
 
 echo ""
-echo "Testing #9091's bounded zero-row settle (no required contexts)..."
+echo "Testing #9091's zero-row settle DELEGATION to loom-daemon..."
 
-# (e) THE #9091 bug, with production defaults: a repo with no CI configured for
-# this commit (zero rows on every poll) whose base branch requires no status
-# checks. Before the fix this polled until LOOM_AUTO_MERGE_TIMEOUT (600s)
-# elapsed -- long enough that the caller's own process cap killed it mid-wait,
-# which is how the reported PR got "Proceeding with squash merge..." and then
-# no merge at all. After the fix it settles after LOOM_ZERO_CHECKS_SETTLE_POLLS
-# polls, and the accumulated wait must be well under 30s (the issue's stated
-# regression bar).
+# (e) The subcommand is consulted on the very first zero-row poll, and is handed
+# everything the decision needs: the PR, the repo, the base branch whose
+# protection is the discriminator, the poll count, the cached required-context
+# token, both interval knobs, and the caller's own clock/deadline (passed in, so
+# the stubbed `date` above governs the daemon's view of time too).
 reset_test_state
 LOOM_AUTO_MERGE_TIMEOUT=600
 LOOM_AUTO_MERGE_POLL_INTERVAL=30
 queue_fgcr_response "$EMPTY_ROLLUP"
+queue_zcs_decision "LOOM-ZERO-CHECKS-SETTLE 0 none PR #42: settled, no required contexts"
 _wait_for_checks_then_sync_merge
 rc=$?
-calls="$(fgcr_call_count)"
-slept="$(slept_seconds)"
-assert_eq "0" "$rc" "(e) Function returns 0 (settled) on a zero-check repo with no required contexts"
-assert_eq "3" "$calls" "(e) Exactly LOOM_ZERO_CHECKS_SETTLE_POLLS polls at the production default (3) -- not one (that was #6169), not the whole deadline"
-assert_eq "true" "$([[ $slept -lt 30 ]] && echo true || echo false)" \
-  "(e) Total wait was under 30s (simulated ${slept}s), not the 600s LOOM_AUTO_MERGE_TIMEOUT ceiling"
-assert_contains "$INFO_LOG" "requires no status-check contexts" \
-  "(e) Narrates WHY the zero-row read was trusted early (no required contexts on the base branch)"
-assert_eq "" "$WARN_LOG" "(e) No timeout warning -- the deadline was never reached"
+first_argv="$(zcs_argv | head -n 1)"
+assert_eq "0" "$rc" "(e) Function returns 0 when the subcommand answers SETTLE"
+assert_eq "1" "$(zcs_call_count)" "(e) The subcommand was consulted exactly once for one zero-row poll"
+assert_eq "1" "$(fgcr_call_count)" "(e) A SETTLE verdict is obeyed immediately -- no further check-runs poll"
+assert_contains "$first_argv" "merge-pr zero-checks-settle" "(e) The zero-row decision is delegated to the daemon subcommand"
+assert_contains "$first_argv" "--pr 42" "(e) ...with the PR number"
+assert_contains "$first_argv" "--repo owner/repo" "(e) ...with the repo"
+assert_contains "$first_argv" "--base-ref main" "(e) ...with the base branch (the required-context discriminator)"
+assert_contains "$first_argv" "--polls 1" "(e) ...with the zero-row poll count"
+assert_contains "$first_argv" "--required-state unknown" "(e) ...with an UNRESOLVED cache token on the first poll"
+assert_contains "$first_argv" "--poll-interval 30" "(e) ...with LOOM_AUTO_MERGE_POLL_INTERVAL"
+assert_contains "$first_argv" "--timeout 600" "(e) ...with LOOM_AUTO_MERGE_TIMEOUT"
+assert_contains "$first_argv" "--deadline" "(e) ...and with the caller's clock and deadline, so the daemon reads no clock of its own"
+assert_contains "$INFO_LOG" "settled, no required contexts" \
+  "(e) The daemon's narration is replayed through the script's own info()"
+assert_eq "" "$WARN_LOG" "(e) A SETTLE verdict narrates as info, never as a warning"
 
-# (f) Fail-closed: the required-context lookup itself errors. Unknown protection
-# is not evidence of absent protection (the same disposition the failing-check
-# branch above takes), so the bounded settle must NOT apply -- the full #6169
-# wait stands.
+# (f) A WAIT verdict is obeyed literally: the function sleeps the number of
+# seconds the DECISION carries (not LOOM_AUTO_MERGE_POLL_INTERVAL, which the
+# bounded settle deliberately undercuts) and polls again. This is the assertion
+# that #9091's whole point -- seconds, not the 600s ceiling -- survives the
+# trip through the shell.
 reset_test_state
-REQUIRED_RC=1
-LOOM_AUTO_MERGE_TIMEOUT=6
+LOOM_AUTO_MERGE_TIMEOUT=600
+LOOM_AUTO_MERGE_POLL_INTERVAL=30
+queue_fgcr_response "$EMPTY_ROLLUP"
+queue_zcs_decision "LOOM-ZERO-CHECKS-WAIT 5 none PR #42: re-polling in 5s"
+queue_zcs_decision "LOOM-ZERO-CHECKS-WAIT 5 none PR #42: re-polling in 5s"
+queue_zcs_decision "LOOM-ZERO-CHECKS-SETTLE 0 none PR #42: settled after three polls"
+_wait_for_checks_then_sync_merge
+rc=$?
+assert_eq "0" "$rc" "(f) Function returns 0 after the bounded settle completes"
+assert_eq "3" "$(fgcr_call_count)" "(f) Each WAIT verdict produced exactly one more check-runs poll"
+assert_eq "10" "$(slept_seconds)" \
+  "(f) Slept the DECISION's 5s twice (=10s), not LOOM_AUTO_MERGE_POLL_INTERVAL's 30s -- and nowhere near the 600s ceiling"
+
+# (g) The required-context token the daemon resolves is cached BY THE CALLER and
+# replayed on every later poll. That is what makes the two-read branch-protection
+# lookup happen once per wait instead of once per poll -- the shell's whole share
+# of that property, since each invocation is a fresh process.
+reset_test_state
+LOOM_AUTO_MERGE_TIMEOUT=600
 LOOM_AUTO_MERGE_POLL_INTERVAL=1
 queue_fgcr_response "$EMPTY_ROLLUP"
+queue_zcs_decision "LOOM-ZERO-CHECKS-WAIT 1 present PR #42: required contexts present, waiting"
+queue_zcs_decision "LOOM-ZERO-CHECKS-WAIT 1 present PR #42: required contexts present, waiting"
+queue_zcs_decision "LOOM-ZERO-CHECKS-TIMEOUT 0 present PR #42: remained empty for the entire wait"
 _wait_for_checks_then_sync_merge
 rc=$?
-calls="$(fgcr_call_count)"
-assert_eq "0" "$rc" "(f) Function still terminates when the required-context lookup fails"
-assert_eq "true" "$([[ $calls -gt 2 ]] && echo true || echo false)" \
-  "(f) A failed lookup keeps the FULL bounded wait (call count=$calls > 2), not the shortened settle"
+assert_eq "0" "$rc" "(g) Function returns 0 once the daemon reports the whole wait spent"
+assert_eq "1" "$(zcs_argv | grep -c -- '--required-state unknown')" \
+  "(g) EXACTLY ONE poll asked for an unresolved lookup -- the rest replayed the cached token"
+assert_eq "2" "$(zcs_argv | grep -c -- '--required-state present')" \
+  "(g) Every later poll passed back the token the daemon resolved"
+assert_eq "1
+2
+3" "$(zcs_argv | grep -o -- '--polls [0-9]*' | awk '{print $2}')" \
+  "(g) The zero-row poll count is monotonic across iterations, not reset each time"
 assert_contains "$WARN_LOG" "remained empty" \
-  "(f) Fail-closed path still ends in the whole-wait-elapsed warning"
+  "(g) A TIMEOUT verdict narrates through warning(), not info() -- nothing was ever confirmed"
 
-# (g) The required-context lookup is made ONCE per call, not once per poll: a
-# zero-row repo polled N times must not spend N branch-protection API reads.
-reset_test_state
-REQUIRED_CONTEXTS="Required Gate"
-# Counts on DISK, not in a variable: the function calls this helper inside a
-# `$(...)` command substitution, so a shell-variable counter would be
-# incremented in a subshell and lost every time (same reason as the stubs above).
-echo 0 > "$STATE_DIR/required-lookups"
-forge_get_required_status_check_contexts() {
-    echo "$(($(cat "$STATE_DIR/required-lookups") + 1))" > "$STATE_DIR/required-lookups"
-    printf '%s\n' "$REQUIRED_CONTEXTS"
-}
-LOOM_AUTO_MERGE_TIMEOUT=6
-LOOM_AUTO_MERGE_POLL_INTERVAL=1
-queue_fgcr_response "$EMPTY_ROLLUP"
-_wait_for_checks_then_sync_merge
-rc=$?
-assert_eq "0" "$rc" "(g) Function returns 0 after the full wait with required contexts present"
-assert_eq "1" "$(cat "$STATE_DIR/required-lookups")" \
-  "(g) Required-context set resolved exactly ONCE and cached across every zero-row poll"
-# Restore the scenario-state stub for anything added after this point.
-forge_get_required_status_check_contexts() {
-    [[ -n "$REQUIRED_CONTEXTS" ]] && printf '%s\n' "$REQUIRED_CONTEXTS"
-    return "$REQUIRED_RC"
-}
+# (h) Fail closed when the subcommand cannot be run at all, or answers with
+# something that is not a decision: the bounded settle is unavailable, so
+# #6169's FULL deadline-bounded wait applies. The one thing this must never
+# degrade into is settling on a single empty read -- that IS #6169. Two shapes
+# are checked, because they fail differently: a missing/old binary exits
+# non-zero (the easy case), while garbage on stdout with a ZERO exit is the
+# shape a naive caller would accept as a verdict.
+#
+# A "garbage, exit 0" stub lives in its own file so $DAEMON_STUB stays intact
+# for the scenarios after this one.
+JUNK_STUB="$STATE_DIR/loom-daemon-junk"
+cat > "$JUNK_STUB" <<'JUNK'
+#!/usr/bin/env bash
+echo "hello, this is not a decision"
+exit 0
+JUNK
+chmod +x "$JUNK_STUB"
 
-# (h) The knob cannot be turned back into the #6169 bug: settling on a SINGLE
-# empty read is what that issue was, so LOOM_ZERO_CHECKS_SETTLE_POLLS=1 (and
-# any non-numeric value) is floored at 2 rather than honoured.
-for bad_polls in 1 0 abc; do
+for bad_bin in "$STATE_DIR/does-not-exist" "$JUNK_STUB"; do
     reset_test_state
-    LOOM_ZERO_CHECKS_SETTLE_POLLS="$bad_polls"
-    LOOM_AUTO_MERGE_TIMEOUT=600
-    LOOM_AUTO_MERGE_POLL_INTERVAL=30
+    LOOM_DAEMON_BIN="$bad_bin"
+    LOOM_AUTO_MERGE_TIMEOUT=4
+    LOOM_AUTO_MERGE_POLL_INTERVAL=1
     queue_fgcr_response "$EMPTY_ROLLUP"
     _wait_for_checks_then_sync_merge
     rc=$?
     calls="$(fgcr_call_count)"
-    assert_eq "0" "$rc" "(h) Function returns 0 with LOOM_ZERO_CHECKS_SETTLE_POLLS='$bad_polls'"
-    assert_eq "2" "$calls" "(h) LOOM_ZERO_CHECKS_SETTLE_POLLS='$bad_polls' is floored at 2 polls, never 1 (#6169 stays closed)"
+    label="$(basename "$bad_bin")"
+    assert_eq "0" "$rc" "(h) Function still terminates with an unusable loom-daemon ($label)"
+    assert_eq "true" "$([[ $calls -gt 1 ]] && echo true || echo false)" \
+      "(h/$label) Fail-closed path polled MORE THAN ONCE (call count=$calls) -- never settles on a single empty read"
+    assert_contains "$INFO_LOG" "bounded settle is unavailable" \
+      "(h/$label) Says out loud, on every degraded poll, that the bounded settle was unavailable"
+    assert_contains "$INFO_LOG" "falling back to #6169's full 4s wait" \
+      "(h/$label) ...naming the wait it fell back to"
+    assert_contains "$WARN_LOG" "bounded settle is unavailable" \
+      "(h/$label) The terminal (deadline-reached) poll narrates through warning(), not info()"
 done
 
-# (i) A non-numeric interval must not reach `sleep` as a bad argument: it falls
-# back to LOOM_AUTO_MERGE_POLL_INTERVAL (the conservative, longer spacing).
+# (i) The delegation is reachable ONLY from the zero-row branch. A healthy,
+# nonempty rollup must not spend a subprocess per poll.
 reset_test_state
-LOOM_ZERO_CHECKS_SETTLE_INTERVAL="not-a-number"
-LOOM_AUTO_MERGE_TIMEOUT=600
-LOOM_AUTO_MERGE_POLL_INTERVAL=30
-queue_fgcr_response "$EMPTY_ROLLUP"
+LOOM_AUTO_MERGE_TIMEOUT=100
+LOOM_AUTO_MERGE_POLL_INTERVAL=1
+queue_fgcr_response "$ONE_PENDING_ROLLUP"
+queue_fgcr_response "$ONE_SUCCESS_ROLLUP"
 _wait_for_checks_then_sync_merge
 rc=$?
-assert_eq "0" "$rc" "(i) Function returns 0 with a non-numeric LOOM_ZERO_CHECKS_SETTLE_INTERVAL"
-assert_eq "60" "$(slept_seconds)" \
-  "(i) Non-numeric interval fell back to LOOM_AUTO_MERGE_POLL_INTERVAL (2 x 30s), not a broken sleep"
+assert_eq "0" "$rc" "(i) Function returns 0 for the ordinary pending-then-settled path"
+assert_eq "0" "$(zcs_call_count)" "(i) The subcommand is never consulted when the rollup is non-empty"
 
 echo ""
 echo "=== Test Summary ==="

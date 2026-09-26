@@ -50,6 +50,13 @@
 //! merge commit against the current base — which is exactly what [`redate`]'s
 //! tree-identical push produces.
 //!
+//! [`zero_checks`] is not a port either — it is #9091's narrowing of the
+//! #6169 zero-row settle guard inside `_wait_for_checks_then_sync_merge`:
+//! re-polling an empty check-runs rollup until `LOOM_AUTO_MERGE_TIMEOUT`
+//! elapsed was catastrophic on the case that guard meets most often (a repo
+//! with no CI configured for the changed paths), so the wait is bounded when —
+//! and only when — the base branch requires no status-check contexts.
+//!
 //! [`loom_pr_guard`] is the pre-merge `loom:pr` review-signal guard (#7419)
 //! — the OTHER half of the verdict-label story [`labels`] tells: this one
 //! fires on `loom:pr`'s ABSENCE ("nobody reviewed this head") rather than a
@@ -63,3 +70,4 @@ pub mod loom_pr_guard;
 pub mod redate;
 pub mod refs;
 pub mod stale_checks;
+pub mod zero_checks;
