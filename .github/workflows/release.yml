@@ -386,7 +386,12 @@ jobs:
         with:
           workspaces: |
             .
-          key: ${{ matrix.target }}
+          # Include the runner image (#9036): rust-cache's automatic key has
+          # runner.os ("Linux") but not the image version, so after #8899
+          # pinned these legs to ubuntu-22.04 they restored a target dir built
+          # on ubuntu-24.04 (glibc 2.39) and failed to link its C objects
+          # against glibc 2.35 (undefined __isoc23_sscanf/__isoc23_strtol).
+          key: ${{ matrix.target }}-${{ matrix.os }}
 
       - name: Install cross-compilation toolchain
         if: matrix.cross
