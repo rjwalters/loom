@@ -381,10 +381,10 @@ done < <(sed -E 's/#.*$//' "$WIRED_MANIFEST" | awk 'NF { print $1 }')
 # LOOM_CI_SHARD=k/N (#9065): run only manifest entries whose 0-based index
 # is k-1 mod N, so N runners split the set deterministically and every suite
 # runs in exactly one of them. A malformed value is an error, never "run
-# everything" or "run nothing".
+# everything" or "run nothing". No leading zeros: bash >= 4 reads `08` as a
+# bad octal literal in $(( )), which selected zero suites and exited 0.
 if [[ -n "${LOOM_CI_SHARD:-}" ]]; then
-    if ! [[ "$LOOM_CI_SHARD" =~ ^([0-9]+)/([0-9]+)$ ]] \
-        || [[ "${BASH_REMATCH[2]}" -lt 1 ]] || [[ "${BASH_REMATCH[1]}" -lt 1 ]] \
+    if ! [[ "$LOOM_CI_SHARD" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]] \
         || [[ "${BASH_REMATCH[1]}" -gt "${BASH_REMATCH[2]}" ]]; then
         echo "::error::LOOM_CI_SHARD must be k/N with 1 <= k <= N, got '$LOOM_CI_SHARD'" >&2
         exit 2
@@ -399,6 +399,12 @@ if [[ -n "${LOOM_CI_SHARD:-}" ]]; then
         fi
     done
     printf 'Shard %s: %d of %d wired suites\n' "$LOOM_CI_SHARD" "${#suites[@]}" "${#_all[@]}"
+    # An empty shard (N larger than the manifest) would report green on
+    # nothing (ci-principles.md rule 6).
+    if [[ "${#suites[@]}" -eq 0 ]]; then
+        echo "::error::LOOM_CI_SHARD=$LOOM_CI_SHARD selects no suites; lower N" >&2
+        exit 2
+    fi
     # Consumed here, and ONLY here: the runner's own self-tests invoke this
     # script on fixture manifests, and an inherited shard would silently drop
     # fixture suites they expect to run.
