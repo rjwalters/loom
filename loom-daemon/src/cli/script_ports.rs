@@ -192,6 +192,17 @@ pub(crate) enum ScriptPortCommand {
     /// singleton's schedule wrapper used to hand-roll. Not a port: brand-new
     /// logic, native from the start per the shell-language policy.
     FleetCaptain(super::fleet_captain_cmd::FleetCaptainArgs),
+
+    /// The per-role tool-restriction allowlist (#8322, for #8256), shell-facing
+    /// half: the `--disallowedTools` spec list `spawn-claude.sh` injects, and
+    /// the "is this role restricted" predicate `spawn-codex.sh` needs to warn
+    /// that the guard hook is the ONLY enforcement on its path. Ported out of
+    /// both `contract`-category scripts because inlining it there is exactly
+    /// the portable-shell growth `shell-budget --check` refuses. Exit 0 =
+    /// a restriction applies, 1 = none does — an answer, not an error, landing
+    /// on the same no-op branch as an unavailable binary.
+    #[command(subcommand)]
+    RoleToolPolicy(super::role_tool_policy::RoleToolPolicyCommand),
 }
 
 impl ScriptPortCommand {
@@ -225,6 +236,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
+            ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
         }
     }
 }
