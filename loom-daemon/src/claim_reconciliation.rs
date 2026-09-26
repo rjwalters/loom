@@ -1884,8 +1884,21 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
 /// be redundant. Each tick's `gh` calls block, so it runs on a blocking
 /// thread (`tokio::task::spawn_blocking`), mirroring
 /// [`crate::token_ranking_refresh::spawn_multi_token_ranking_refresh_task`].
+///
+/// **Queue-head wake (#8766).** This pass is the daemon's head-mover: a
+/// `loom:building` claim whose sweep is gone is exactly what holds the
+/// dispatch queue's head, and this loop is what releases it. `event_bus` lets
+/// a `forge.event` prompt of a queue-relevant shape (a comment on a claimed
+/// issue, a PR reaching terminal state) run the *next ordinary pass now*
+/// instead of at the multi-minute cadence above — and nothing else. The pass
+/// body is untouched: it re-lists `loom:building` issues and re-decides from
+/// the same host-scoped evidence and the same lease gate it always did, so an
+/// early tick can only change *when* that happens. Disabled unless
+/// `forgeEvents.events.queueHeadWake` is on for `fallback_root`, in which case
+/// the ticker holds no bus subscription at all.
 pub fn spawn_periodic_reconciliation_task(
     fallback_root: std::path::PathBuf,
+    event_bus: std::sync::Arc<crate::event_bus::EventBus>,
 ) -> tokio::task::JoinHandle<()> {
     // Safehouse-aware cadence (#4431): with live peer-claims carrying the
     // fast in-flight signal (re-advertised each reaper tick), a
@@ -1896,7 +1909,14 @@ pub fn spawn_periodic_reconciliation_task(
         interval.as_secs()
     );
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
+        // An `Interval` a queue-relevant `forge.event` prompt may also tick
+        // early (#8766). Disarmed unless `forgeEvents.events.queueHeadWake` is
+        // on, in which case it is exactly `tokio::time::interval(interval)`.
+        let mut ticker = crate::forge_events::wake::EarlyTicker::for_queue_head(
+            interval,
+            &event_bus,
+            &fallback_root,
+        );
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Consume the immediate first fire: the startup pass already ran
         // moments ago in `main.rs`, so re-running instantly is redundant.
