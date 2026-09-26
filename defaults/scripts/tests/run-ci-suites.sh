@@ -399,6 +399,10 @@ if [[ -n "${LOOM_CI_SHARD:-}" ]]; then
         fi
     done
     printf 'Shard %s: %d of %d wired suites\n' "$LOOM_CI_SHARD" "${#suites[@]}" "${#_all[@]}"
+    # Consumed here, and ONLY here: the runner's own self-tests invoke this
+    # script on fixture manifests, and an inherited shard would silently drop
+    # fixture suites they expect to run.
+    unset LOOM_CI_SHARD
 fi
 
 passed=0
