@@ -2,7 +2,7 @@
 
 > **Reference file for [`sweep.md`](sweep.md)**, the `/loom:sweep` dispatcher.
 >
-> **Load when:** **before the first wave** (or, on the daemon path, before the first `mcp__loom__dispatch_sweep` call) for the four advisory checks, and whenever a peer `/loom:sweep` or a daemon may be sharing this repo.
+> **Load when:** **before the first wave** (or, on the daemon path, before the first `mcp__loom__dispatch_sweep` call) for the five advisory checks, and whenever a peer `/loom:sweep` or a daemon may be sharing this repo.
 >
 > **Flat, one level deep.** `sweep.md` names every file a given run needs up
 > front; nothing here requires opening a *third* file to follow its own
@@ -19,6 +19,7 @@
 - [Main Branch Freshness (#3770)](#main-branch-freshness-3770)
 - [Outstanding Quarantine Stashes (#5185)](#outstanding-quarantine-stashes-5185)
 - [Stale / Undocumented `loom:blocked` Issues (#8927)](#stale--undocumented-loomblocked-issues-8927)
+- [Silent PR Queues (#8923)](#silent-pr-queues-8923)
 - [Sweep Child Working-Set Contract (#3980)](#sweep-child-working-set-contract-3980)
 - [Coexistence (peer `/loom:sweep` and legacy daemon)](#coexistence-peer-loomsweep-and-legacy-daemon)
 
@@ -114,6 +115,29 @@ If the check warns, the operator should reconcile each listed stash into the iss
 This is advisory-only. The script always exits `0` and **must not block** the sweep — proceed regardless of what it prints. It is strictly **read-only**: it never adds, removes, or edits a label, and never comments. It enumerates every open `loom:blocked` issue (`gh issue list --label="loom:blocked" --state=open`) and re-runs `dep-recheck-fingerprint.sh`'s *existing* extraction per issue — the `## Dependencies` checklist matcher, the prose `Blocked by #N`/`Depends on #N`/`Requires #N`/`**Epic** #N` matcher over the body plus every non-bot comment, and the linked-closing-PR read — rather than adding a second parser over the same data. It reports to stderr: a **stale block** (the cited blocker has closed/merged — including a partially resolved set, per `operator-premise`'s own "any reference no longer OPEN" rule), an **undocumented block** (no parseable reference anywhere; a block whose justification cannot be checked is a defect whether or not the block is real), and **not evaluated** (a forge read that did not answer — its own category, never folded into stale or clear). Nothing found prints nothing to stderr and a one-line stdout confirmation, suppressible with `--quiet`.
 
 If it warns, the operator (or a later Curator pass on that issue) should drop the label, record a machine-checkable `Blocked by #N`, or confirm the block. Acting is deliberately not this check's job — the two follow-ups that would act rather than report (enforcing a machine-checkable reason at apply time, re-checking the instant a blocker closes) are named out of scope on #8927.
+
+## Silent PR Queues (#8923)
+
+The *unshipped* side of the pipeline has no view. `loom-daemon queue` (#8906) shows the issue ready-queue, but a PR that has already been built and reviewed can sit in a verdict queue indefinitely with nothing surfacing it — and the queue that stalls is not the one usually assumed. Measured across 80 PRs on 2026-09-26: the review queue answered in **0.2h** (p50) and Doctor answered a rejection in **0.3h**, while open approved PRs under an operator gate sat at **11.0–29.4h** of dwell against **0.2h** for the one with no gate. The hold is legitimate; nobody being told about it is not.
+
+**Before the first wave — or, on the daemon path, before the first `mcp__loom__dispatch_sweep` call** — run the PR-queue check and surface its output to the user (same timing and sibling role as the four checks above):
+
+```bash
+loom-daemon pr-latency --advise
+```
+
+This is advisory-only. It always exits `0` and **must not block** the sweep — proceed regardless of what it prints. It is strictly **read-only**: it never adds, removes, or edits a label, and never comments. It enumerates open PRs (`gh pr list --state open`) and reads each one's timeline, then reports **dwell** — time since the current queue label was applied — never PR age, which is the conflation #8923 was filed to correct (a queue reported at "median age 89.6h" had a real dwell of ~4.5h).
+
+It names four **disjoint** populations past `--threshold-hours` (default 24), so each PR appears once and the total counts PRs rather than findings:
+
+- **Waiting on a person** — operator-gated, in any queue. `loom:operator` is in `work_finder::SKIP_LABELS`, so the engine has stopped and no role will move these.
+- **Approved, nothing holding it** — `loom:pr`, no gate, no park: the strictly worse finding, because the merge lane itself stalled.
+- **Awaiting a Judge verdict** — `loom:review-requested`, ungated, unparked.
+- **Rejected, no Doctor push** — `loom:changes-requested`, ungated, unparked, not `loom:treating`.
+
+A gated PR is deliberately **excluded** from the Judge and Doctor populations: counting it there would blame a role that is correctly refusing to act on it. A PR whose dwell cannot be determined never fires the advisory — an advisory that fires on "we could not tell" is one that gets ignored. Nothing found prints nothing to stderr and a one-line stdout confirmation, suppressible with `--quiet`.
+
+If it warns, the operator should merge the PR, clear the hold, or say why it stands — `./.loom/scripts/merge-pr.sh <PR>`. Acting is deliberately not this check's job, and it must never pressure anyone out of a legitimate hold: it reports the **silence**, not the hold. For the full decomposition behind any figure, run `loom-daemon pr-latency`; the definitions live in [`pr-latency.md`](../../../.loom/docs/pr-latency.md).
 
 ## Sweep Child Working-Set Contract (#3980)
 

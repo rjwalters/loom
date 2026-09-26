@@ -262,17 +262,23 @@ fn fetch_timeline(pr: u32, repo: Option<&str>, root: &Path) -> (Vec<PrEvent>, bo
 /// entries — exactly the long-lived PRs this command exists to explain.
 fn parse_timeline(bytes: &[u8]) -> Option<Vec<PrEvent>> {
     let mut entries: Vec<TimelineEntry> = Vec::new();
+    let mut arrays = 0usize;
     let mut stream = serde_json::Deserializer::from_slice(bytes).into_iter::<Vec<TimelineEntry>>();
     for chunk in stream.by_ref() {
         entries.extend(chunk.ok()?);
+        arrays += 1;
     }
-    if entries.is_empty() && !bytes.iter().all(u8::is_ascii_whitespace) {
-        // Non-empty output that yielded no array at all is a shape this does
-        // not understand; report it as incomplete rather than as "no events".
-        let trimmed = String::from_utf8_lossy(bytes).trim().to_string();
-        if trimmed != "[]" {
-            return None;
-        }
+    // Non-empty output that yielded **no array at all** is a shape this does not
+    // understand (an error object, a truncated body); report it as incomplete
+    // rather than as "no events", so the PR is excluded from the distributions
+    // instead of being recorded as a fast one.
+    //
+    // The test is "how many arrays parsed", not "are there entries": a PR whose
+    // timeline is genuinely empty yields `[]` — possibly several of them across
+    // `--paginate` pages, which a literal `trimmed != "[]"` check would have
+    // misread as unreadable.
+    if arrays == 0 && !bytes.iter().all(u8::is_ascii_whitespace) {
+        return None;
     }
     Some(entries.iter().filter_map(to_event).collect())
 }
@@ -371,6 +377,14 @@ mod tests {
     fn empty_and_blank_outputs_are_empty_not_unreadable() {
         assert_eq!(parse_timeline(b"[]").unwrap().len(), 0);
         assert_eq!(parse_timeline(b"  \n").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn several_empty_pages_are_still_a_complete_empty_timeline() {
+        // `gh api --paginate` can emit one `[]` per page. Judging readability by
+        // the entry count rather than the number of arrays parsed would call
+        // this unreadable and drop a legitimately empty PR from the sample.
+        assert_eq!(parse_timeline(b"[]\n[]\n").unwrap().len(), 0);
     }
 
     #[test]

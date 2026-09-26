@@ -250,6 +250,10 @@ pub struct DoctorBacklogRow {
     /// for, and not the PR's age.
     pub dwell_secs: Option<i64>,
     pub treating: Treating,
+    /// An operator gate is on the PR, so it is waiting on a person rather than
+    /// on Doctor. Carried explicitly (not re-derived from [`Self::holds`]) so
+    /// the advisory cannot attribute a human's hold to Doctor's throughput.
+    pub operator_gated: bool,
     pub holds: Vec<String>,
 }
 
@@ -282,6 +286,7 @@ pub fn doctor_backlog(histories: &[PrHistory], now: DateTime<Utc>) -> Vec<Doctor
                 } else {
                     Treating::Queued
                 },
+                operator_gated: super::is_operator_gated(&h.current_labels),
                 holds: super::hold_labels(&h.current_labels),
             })
         })

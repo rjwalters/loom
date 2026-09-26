@@ -117,7 +117,7 @@ pub(crate) fn report_text(r: &LatencyReport, list_error: Option<&str>) -> String
             }
         ));
     }
-    out.push_str("\nDefinitions and what this cannot answer: defaults/docs/pr-latency.md\n");
+    out.push_str("\nDefinitions and what this cannot answer: .loom/docs/pr-latency.md\n");
     out
 }
 
@@ -143,7 +143,7 @@ fn join_numbers(ns: &[u32]) -> String {
 /// nobody re-derives "which of these is gated" with a second label query.
 pub(crate) fn report_json(r: &LatencyReport, list_error: Option<&str>) -> serde_json::Value {
     serde_json::json!({
-        "questions_doc": "defaults/docs/pr-latency.md",
+        "questions_doc": ".loom/docs/pr-latency.md",
         "list_error": list_error,
         "complete": list_error.is_none() && r.prs_incomplete.is_empty(),
         "report": r,
@@ -171,7 +171,7 @@ pub(crate) fn advise(
                 "threshold_secs": threshold_secs,
                 "clear": r.advisory_is_clear(threshold_secs),
                 "list_error": list_error,
-                "gated_approvals": r.stalled_gated_approvals(threshold_secs),
+                "operator_holds": r.stalled_operator_holds(threshold_secs),
                 "ungated_approvals": r.stalled_plain_approvals(threshold_secs),
                 "awaiting_review": r.stalled_reviews(threshold_secs),
                 "awaiting_doctor": r.stalled_doctor_backlog(threshold_secs),
@@ -191,7 +191,7 @@ pub(crate) fn advise(
         );
     }
 
-    let gated = r.stalled_gated_approvals(threshold_secs);
+    let gated = r.stalled_operator_holds(threshold_secs);
     let plain = r.stalled_plain_approvals(threshold_secs);
     let reviews = r.stalled_reviews(threshold_secs);
     let doctor = r.stalled_doctor_backlog(threshold_secs);
@@ -210,19 +210,21 @@ pub(crate) fn advise(
 
     if !gated.is_empty() {
         w.push_str(&format!(
-            "\nAPPROVED, WAITING ON A PERSON ({}) — the hold is legitimate; the silence is not:\n",
+            "\nWAITING ON A PERSON ({}) — the hold is legitimate; the silence is not:\n",
             gated.len()
         ));
         for row in &gated {
             w.push_str(&format!(
-                "  #{:<6} {:>7} under {}\n",
+                "  #{:<6} {:>7} in {} under {}\n",
                 row.pr,
                 hours(row.dwell_secs),
+                row.queue,
                 row.holds.join(", ")
             ));
         }
         w.push_str(
-            "  These are finished PRs. Merge, or clear the hold, or say why it stands:\n\
+            "  The engine has stopped on these (loom:operator is in SKIP_LABELS), so no\n  \
+             role will move them. Merge, clear the hold, or say why it stands:\n\
              \x20     ./.loom/scripts/merge-pr.sh <PR>\n",
         );
     }
@@ -238,7 +240,10 @@ pub(crate) fn advise(
     }
 
     if !reviews.is_empty() {
-        w.push_str(&format!("\nAWAITING A JUDGE VERDICT ({}):\n", reviews.len()));
+        w.push_str(&format!(
+            "\nAWAITING A JUDGE VERDICT ({}) — no gate, no park; Judge's queue:\n",
+            reviews.len()
+        ));
         for row in &reviews {
             w.push_str(&format!("  #{:<6} {:>7}\n", row.pr, hours(row.dwell_secs)));
         }
@@ -246,7 +251,7 @@ pub(crate) fn advise(
 
     if !doctor.is_empty() {
         w.push_str(&format!(
-            "\nREJECTED, NO DOCTOR PUSH ({}) — excludes loom:treating and parked rows:\n",
+            "\nREJECTED, NO DOCTOR PUSH ({}) — excludes loom:treating, parked and gated rows:\n",
             doctor.len()
         ));
         for row in &doctor {
@@ -278,7 +283,7 @@ pub(crate) fn advise(
         }
     } else {
         println!(
-            "[pr-latency] WARNING: {total} PR(s) over {t} in one queue ({} approved+gated). See stderr.",
+            "[pr-latency] WARNING: {total} PR(s) over {t} in one queue ({} waiting on a person). See stderr.",
             gated.len()
         );
     }
@@ -365,7 +370,7 @@ mod tests {
         let plain = open(2, &[APPROVED], vec![labeled(APPROVED, 0)]);
         let r = LatencyReport::build(&[gated, plain], t(90 * HOUR));
         let j = serde_json::json!({
-            "gated": r.stalled_gated_approvals(24 * HOUR).len(),
+            "gated": r.stalled_operator_holds(24 * HOUR).len(),
             "ungated": r.stalled_plain_approvals(24 * HOUR).len(),
         });
         assert_eq!(j["gated"], 1);
@@ -377,7 +382,7 @@ mod tests {
     fn report_json_carries_the_questions_doc_pointer() {
         let r = LatencyReport::build(&[], t(0));
         let j = report_json(&r, None);
-        assert_eq!(j["questions_doc"], "defaults/docs/pr-latency.md");
+        assert_eq!(j["questions_doc"], ".loom/docs/pr-latency.md");
         assert_eq!(j["complete"], true);
     }
 

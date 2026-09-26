@@ -131,14 +131,23 @@ impl LatencyReport {
         self.queues.iter().filter(|r| r.queue == label).collect()
     }
 
-    /// Open, approved, operator-gated PRs whose dwell exceeds
-    /// `threshold_secs` — the population the Phase-2 advisory exists to name.
+    /// Open, operator-gated PRs whose dwell exceeds `threshold_secs`, in **any**
+    /// queue — the population the Phase-2 advisory exists to name.
+    ///
+    /// Queue-agnostic on purpose. [`crate::work_finder::SKIP_LABELS`] includes
+    /// [`crate::work_finder::OPERATOR_HOLD_LABEL`], so the engine has stopped on
+    /// these PRs whatever queue label they happen to carry: a gated
+    /// `loom:review-requested` PR is **not** awaiting a Judge verdict in any
+    /// actionable sense, and reporting it as such blames a role that is
+    /// correctly refusing to act. Live data on 2026-09-26 contained exactly
+    /// that case — #8893 and #8613 sat at 11.1h under `loom:review-requested` +
+    /// `loom:operator`.
     ///
     /// A PR with an **unknown** dwell is deliberately excluded: an advisory
     /// that fires on "we could not tell" is an advisory that gets ignored.
-    pub fn stalled_gated_approvals(&self, threshold_secs: i64) -> Vec<&QueueRow> {
-        self.queue(APPROVED)
-            .into_iter()
+    pub fn stalled_operator_holds(&self, threshold_secs: i64) -> Vec<&QueueRow> {
+        self.queues
+            .iter()
             .filter(|r| r.operator_gated)
             .filter(|r| r.dwell_secs.is_some_and(|d| d >= threshold_secs))
             .collect()
@@ -157,28 +166,39 @@ impl LatencyReport {
             .collect()
     }
 
-    /// Open PRs awaiting a verdict whose dwell exceeds `threshold_secs`.
+    /// Open PRs genuinely awaiting a Judge verdict beyond `threshold_secs`.
+    ///
+    /// Operator-gated rows are excluded and reported by
+    /// [`Self::stalled_operator_holds`] instead — they are waiting on a person,
+    /// not on Judge, and counting them here would attribute a human's hold to a
+    /// role that is correctly refusing to act on it.
     pub fn stalled_reviews(&self, threshold_secs: i64) -> Vec<&QueueRow> {
         self.queue(REVIEW_REQUESTED)
             .into_iter()
-            .filter(|r| !r.parked)
+            .filter(|r| !r.parked && !r.operator_gated)
             .filter(|r| r.dwell_secs.is_some_and(|d| d >= threshold_secs))
             .collect()
     }
 
-    /// The Doctor backlog that is genuinely queued — neither being treated nor
-    /// parked — beyond `threshold_secs`.
+    /// The Doctor backlog that is genuinely queued — not being treated, not
+    /// parked, and not operator-gated — beyond `threshold_secs`.
     pub fn stalled_doctor_backlog(&self, threshold_secs: i64) -> Vec<&DoctorBacklogRow> {
         self.doctor_backlog
             .iter()
             .filter(|r| r.treating == super::segments::Treating::Queued)
+            .filter(|r| !r.operator_gated)
             .filter(|r| r.dwell_secs.is_some_and(|d| d >= threshold_secs))
             .collect()
     }
 
     /// True when nothing crossed any threshold — the advisory's clear answer.
+    ///
+    /// The four populations are disjoint by construction (gated / approved
+    /// ungated / awaiting-verdict ungated / Doctor-queued ungated), so a PR is
+    /// named at most once and the advisory's total is a count of PRs, not of
+    /// findings.
     pub fn advisory_is_clear(&self, threshold_secs: i64) -> bool {
-        self.stalled_gated_approvals(threshold_secs).is_empty()
+        self.stalled_operator_holds(threshold_secs).is_empty()
             && self.stalled_plain_approvals(threshold_secs).is_empty()
             && self.stalled_reviews(threshold_secs).is_empty()
             && self.stalled_doctor_backlog(threshold_secs).is_empty()
@@ -291,12 +311,54 @@ mod tests {
         );
         let r = LatencyReport::build(&[held], t(90 * HOUR));
         assert!(!r.advisory_is_clear(24 * HOUR));
-        let stalled = r.stalled_gated_approvals(24 * HOUR);
+        let stalled = r.stalled_operator_holds(24 * HOUR);
         assert_eq!(stalled.len(), 1);
         assert_eq!(stalled[0].dwell_secs, Some(90 * HOUR));
         assert!(r.stalled_plain_approvals(24 * HOUR).is_empty());
         // Under a higher threshold the same state is clear.
         assert!(r.advisory_is_clear(200 * HOUR));
+    }
+
+    #[test]
+    fn a_gated_review_request_is_a_human_hold_not_a_judge_stall() {
+        // The live case on 2026-09-26: #8893 and #8613 sat at 11.1h under
+        // `loom:review-requested` + `loom:operator`. `loom:operator` is in
+        // `SKIP_LABELS`, so the engine has stopped — reporting these as
+        // "awaiting a Judge verdict" blames a role that correctly refuses to
+        // act on them.
+        let gated =
+            open(8893, &[REVIEW_REQUESTED, "loom:operator"], vec![labeled(REVIEW_REQUESTED, 0)]);
+        let genuine = open(9046, &[REVIEW_REQUESTED], vec![labeled(REVIEW_REQUESTED, 0)]);
+        let r = LatencyReport::build(&[gated, genuine], t(12 * HOUR));
+
+        let judge = r.stalled_reviews(8 * HOUR);
+        assert_eq!(judge.len(), 1, "only the ungated PR is Judge's to answer");
+        assert_eq!(judge[0].pr, 9046);
+
+        let people = r.stalled_operator_holds(8 * HOUR);
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].pr, 8893);
+        // The hold is reported with the queue it is held in, not as an approval.
+        assert_eq!(people[0].queue, REVIEW_REQUESTED);
+        // Each PR is named exactly once across the two populations.
+        assert!(r.stalled_plain_approvals(8 * HOUR).is_empty());
+    }
+
+    #[test]
+    fn a_gated_rejection_is_not_counted_against_doctor() {
+        let gated =
+            open(1, &[CHANGES_REQUESTED, "loom:operator"], vec![labeled(CHANGES_REQUESTED, 0)]);
+        let genuine = open(2, &[CHANGES_REQUESTED], vec![labeled(CHANGES_REQUESTED, 0)]);
+        let r = LatencyReport::build(&[gated, genuine], t(50 * HOUR));
+
+        let doctor = r.stalled_doctor_backlog(24 * HOUR);
+        assert_eq!(doctor.len(), 1);
+        assert_eq!(doctor[0].pr, 2);
+        assert!(!doctor[0].operator_gated);
+        // The gated one is still visible — as a human hold, in its own queue.
+        assert_eq!(r.stalled_operator_holds(24 * HOUR).len(), 1);
+        // Both remain in the full backlog listing; only the ALARM is filtered.
+        assert_eq!(r.doctor_backlog.len(), 2);
     }
 
     #[test]
