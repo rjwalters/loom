@@ -1,14 +1,15 @@
 // Renovate configuration for rjwalters/loom
 // Docs: https://docs.renovatebot.com/configuration-options/
-// Pipeline docs: docs/ops/dependency-security-pipeline.md
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
 
-  // Extend recommended defaults, plus security-focused presets
+  // Extend recommended defaults, plus security-focused presets.
+  // No `:dependencyDashboard` — that preset opens a bot-owned issue with no
+  // `loom:` label, which Curator's unlabeled-issue intake would otherwise pick
+  // up and try to enrich as a normal issue.
   "extends": [
     "config:recommended",
-    "security:openssf-scorecard",
-    ":dependencyDashboard"
+    "security:openssf-scorecard"
   ],
 
   // Override Mend-hosted "silent" default (applied when app is installed on
@@ -31,8 +32,17 @@
   // Never auto-merge. Agents review, humans merge.
   "automerge": false,
 
-  // Create PRs as drafts — consistent with AGENTS.md PR policy
-  "draftPR": true,
+  // Open PRs ready for review, not as drafts — Judge's review queue
+  // (`loom:review-requested`, set below) expects PRs it can act on
+  // immediately; a draft signals "not ready" to both humans and automation.
+  "draftPR": false,
+
+  // Route every PR into the Judge's review queue at creation time. Without
+  // this, an unlabeled Renovate PR sits in the Judge's unlabeled-PR fallback
+  // queue, which applies no labels and therefore can never clear it from that
+  // queue (the #5455 livelock — see `.github/dependabot.yml`'s header for the
+  // Dependabot-side version of the same fix).
+  "labels": ["dependencies", "loom:review-requested"],
 
   // --- Schedule ---
 
@@ -43,13 +53,7 @@
   "schedule": ["before 10am on monday"],
   "timezone": "UTC",
 
-  // --- Python (uv) ---
-
-  // Update lockfile without widening pyproject.toml version ranges.
-  // Renovate detects uv.lock natively.
-  "rangeStrategy": "update-lockfile",
-
-  // Refresh uv.lock even when no direct dependency range changes.
+  // Refresh lockfiles even when no direct dependency range changes.
   // This is how Renovate keeps transitive dependencies current.
   // Match the repo's Monday morning schedule explicitly; Renovate otherwise
   // applies a separate lock-file-maintenance default schedule.
@@ -69,22 +73,7 @@
   // --- Package grouping ---
 
   "packageRules": [
-    // Group all non-major Python dependency updates into one PR
-    {
-      "groupName": "python minor/patch dependencies",
-      "matchManagers": ["pep621", "uv"],
-      "matchUpdateTypes": ["minor", "patch"]
-    },
-
-    // Python major updates get individual PRs (more risk, need individual review)
-    {
-      "matchManagers": ["pep621", "uv"],
-      "matchUpdateTypes": ["major"]
-    },
-
-    // Group all GitHub Actions SHA updates into one PR
-    // AGENTS.md mandates SHA pinning with inline version comments (# vX.Y.Z)
-    // Renovate preserves these comments natively when updating digests
+    // Group all GitHub Actions digest/version updates into one PR
     {
       "groupName": "github-actions",
       "matchManagers": ["github-actions"],
@@ -105,11 +94,25 @@
 
   // --- Ignored paths ---
 
-  // Don't touch vendored dependencies (submodules)
+  // A repo-level `ignorePaths` REPLACES (does not merge with) the
+  // `**/node_modules/**` etc. list that `config:recommended`'s
+  // `:ignoreModulesAndTests` preset would otherwise contribute — Renovate
+  // only concatenates array options explicitly marked `mergeable`, and
+  // `ignorePaths` is not one of them. So that list is repeated here
+  // verbatim, plus this repo's own additions: `.claude/**` (agent-local,
+  // not a dependency manifest) and `quickstarts/**` (shipped templates
+  // Dependabot never covered either; not on the update cadence).
   "ignorePaths": [
-    "vendor/**",
+    "**/node_modules/**",
+    "**/bower_components/**",
+    "**/vendor/**",
+    "**/examples/**",
+    "**/__tests__/**",
+    "**/test/**",
+    "**/tests/**",
+    "**/__fixtures__/**",
     ".claude/**",
-    "infra/pulumi/**"
+    "quickstarts/**"
   ],
 
   // --- Vulnerability alerts ---
