@@ -398,12 +398,24 @@ gitignored.
   it is rewritten atomically as key-only `seen` lines.
 - **One poller per host.** A `flock` on `poll.lock` stops the CLI and the
   daemon poller from racing each other on one host.
-- **Multiple hosts.** Running one poller per org is the normal case. There
-  is deliberately no cross-host lease: coordination is out of scope, per the
-  one-mechanism-per-behaviour rule. Every record has stable identities:
-  `run_id`/`job_id`, plus trace and span ids derived from
-  `(repo, run_id, attempt[, job_id])`. If a second host polls the same org,
-  it produces identical keys that a backend can deduplicate on.
+- **Multiple hosts: fleet-captain gated (#8901).** The daemon-integrated
+  poller (`spawn_task`, in
+  [`loom-daemon/src/ci_telemetry/mod.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/ci_telemetry/mod.rs))
+  is this repo's first real consumer of the singleton-job captain gate
+  (`fleet_captain`, [Fleet captain (#8848)](daemon-reference.md#fleet-captain-8848)):
+  every tick re-evaluates `fleet_captain::arm_singleton_job("ci-telemetry-poll",
+  …)` and skips the cycle entirely when this host is not the declared
+  `fleet.captain`. **A multi-host fleet with `autonomous.ciTelemetry.enabled`
+  must declare `fleet.captain` naming one host, or the poller runs nowhere**
+  (fail-closed, per the gate's own contract) — this replaced the earlier
+  "runs on every host, dedup by stable identity" posture, since duplicate
+  polling wastes GitHub API budget `N`×over for no benefit once exactly one
+  host can be assigned. Every record still carries stable identities
+  (`run_id`/`job_id`, plus trace/span ids derived from
+  `(repo, run_id, attempt[, job_id])`) as a second line of defense: a
+  transient window with two armed pollers (mid-`fleet.captain` edit) still
+  produces byte-identical, backend-deduplicable records rather than
+  corrupting anything.
 
 ### Local journal schema
 
@@ -455,7 +467,6 @@ and `collector_fanout::gateway_forwards_exactly_the_ci_telemetry_vocabulary`.
   this one; the rest still hold.)
 - No per-step spans. The job is the unit.
 - No re-hosting of GitHub's log UI.
-- No cross-host lease.
 - No changes to the `sweep.*` or `tokens.*` record kinds.
 
 ## Phase 2 reference: completed-job logs (#8825)

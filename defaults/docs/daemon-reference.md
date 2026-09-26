@@ -5533,19 +5533,93 @@ No `fleet.captain` declared at all leaves today's behavior fully unchanged —
 the config parse degrades gracefully (`None`) on the absent key, same as every
 other soft-fail read in `loom-daemon/src/config_resolver.rs`.
 
-**Deliberately out of scope for #8848 itself** (tracked as follow-ups, not
-half-done here): (a) **#8901** — migrating a real first singleton job onto
-this gate, and giving shell-driven arms a durable cross-process registry so
-they appear in `armed_singleton_jobs` (until then a `fleet-captain` CLI
-invocation deliberately records nothing, since its process exits immediately;
-so the "singleton armed on a non-captain host" dashboard flag can only fire
-for in-daemon jobs); and (b) **#8902** — the lease: an alert when the
-declared captain has not reported `host.health` for N hours. Note that (b) is
-an *alert*, not failover — the captain stays assigned, never elected, because
-a singleton that runs twice is the exact duplicate-alert bug this mechanism
-exists to prevent, while one that is late is merely late. #8848
-shipped the config schema, the gate library, the `fleet-captain` CLI, the
-`host.health` fields, and the dashboard flags as the base mechanism.
+#8848 shipped the config schema, the gate library, the `fleet-captain` CLI,
+the `host.health` fields, and the dashboard flags as the base mechanism.
+**Deliberately left for #8902**: the lease — an alert when the declared
+captain has not reported `host.health` for N hours. That is an *alert*, not
+failover — the captain stays assigned, never elected, because a singleton
+that runs twice is the exact duplicate-alert bug this mechanism exists to
+prevent, while one that is late is merely late.
+
+#### First real singleton job + durable shell-arm registry (#8901)
+
+#8848 shipped the mechanism with no real consumer and no durable
+cross-process arm reporting; #8901 closed both gaps.
+
+**First real job**: [`crate::ci_telemetry`]'s daemon-integrated poller
+(`autonomous.ciTelemetry.enabled`) now re-evaluates
+`fleet_captain::arm_singleton_job("ci-telemetry-poll", …)` every tick and
+skips the cycle when refused — a genuine "forge-wide queue check" (one GitHub
+Actions org, exactly one poller) in this module's own example vocabulary. A
+multi-host fleet that enables `ciTelemetry` must now also declare
+`fleet.captain`, or the poller runs nowhere; see
+`defaults/docs/ci-observability.md`'s "Multiple hosts" note for the full
+migration rationale (this replaced an earlier "runs on every host, dedup by
+stable record identity" posture — that dedup stays as a second line of
+defense, not the primary mechanism).
+
+**Durable shell-arm registry**: a `loom-daemon fleet-captain <job>`
+invocation is its own short-lived process, so it cannot use the
+process-lifetime registry `arm_singleton_job` maintains for in-daemon jobs —
+recording there would be written and lost in the same breath (`cli/fleet_captain_cmd.rs`'s
+`evaluating_does_not_touch_the_armed_registry` test still pins that `evaluate()`,
+the pure gate check, never touches either registry). Instead, `FleetCaptainArgs::run`
+calls `fleet_captain::record_shell_arm` on the **armed** path, writing
+`<root>/.loom/state/fleet-captain/armed.json` (never git-tracked — same
+per-host-runtime-state class as `.loom/state/ci-telemetry/`): job name →
+`last_armed_at`. `sample_host_health` merges this file (via
+`fleet_captain::armed_singleton_job_names_for_host`) with the in-process
+registry into one `armed_singleton_jobs` list, so a shell-driven arm now
+reaches `host.health` — and the dashboard's "singleton armed on a
+non-captain host" flag (which only ever reads that field) fires for a
+shell-driven arm exactly the same way it already did for an in-daemon one,
+with no dashboard code change needed.
+
+**Staleness policy — chosen deliberately, not guessed**: a durable arm record
+left forever would go stale the moment its wrapper is uninstalled or the host
+is retired, permanently pinning a "singleton armed on a non-captain host"
+false alarm on every peer host — strictly worse than the honest empty list
+this registry replaces. Three options were on the table (a per-job declared
+cadence, a fixed conservative TTL, an explicit disarm-on-teardown verb); the
+chosen answer is **a fixed, configurable TTL as the safety net, with an
+explicit disarm verb layered on top as an optional precision option**:
+
+- `fleet.captainArmTtlSecs` (default 21600 = 6 hours,
+  `loom_daemon::config_resolver::DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS`, env
+  override `LOOM_FLEET_CAPTAIN_ARM_TTL_SECS`) bounds how long a shell-driven
+  arm is reported after its most recent successful check-in. Every
+  successful `run()` refreshes `last_armed_at` (upsert by job name — re-arming
+  overwrites, never duplicates), so a live wrapper ticking well inside the
+  TTL never flickers stale between its own runs, and an uninstalled one ages
+  out within one TTL window with zero operator action. This alone already
+  guarantees no entry can be stuck "armed" forever, which is the property the
+  issue asked for explicitly.
+- `loom-daemon fleet-captain <job-name> --disarm` removes the durable entry
+  immediately and unconditionally (idempotent; does not evaluate the gate at
+  all) — for a well-behaved wrapper that wants to clear its own entry at
+  teardown rather than wait out the TTL. Purely additive precision: a wrapper
+  that never calls it is still bounded by the TTL above.
+- The rejected option — a per-job declared cadence — was more precise in
+  principle but requires a cadence registry that does not exist today, and a
+  wrapper's real timer definition already lives outside this repo
+  (systemd/launchd/cron); duplicating it here would be a second source of
+  truth free to drift from the first. Left as a possible future refinement,
+  not attempted here.
+
+**Config example**:
+
+```json
+{
+  "fleet": {
+    "captain": "loom-worker-1",
+    "captainArmTtlSecs": 21600
+  }
+}
+```
+
+Full module-level rationale (including why `evaluate()` stays pure while
+`run()` writes): `loom-daemon/src/fleet_captain.rs`'s "Two arm registries" /
+"Staleness policy" doc sections.
 
 ### Role-runner host roster (#6704, phases A and B)
 

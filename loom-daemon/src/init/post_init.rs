@@ -219,6 +219,12 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // Scoped to `ci-telemetry/` so a sibling hand-maintained file such as
     // `.loom/state/detect-unlabeled-epics-dismissed` stays trackable.
     ".loom/state/ci-telemetry/",
+    // Durable shell-arm registry for the fleet-captain singleton gate
+    // (#8901): `.loom/state/fleet-captain/armed.json` records when a
+    // `loom-daemon fleet-captain <job>` invocation last armed on THIS host.
+    // Same never-commit reasoning as `ci-telemetry/` just above — one host's
+    // arm timestamps are meaningless, and actively misleading, on another.
+    ".loom/state/fleet-captain/",
     // Concierge budget ledger (#7947): the per-day turn / per-tick relay
     // counters the operator-agent persona consults at the top of every turn.
     // Machine-local and disposable — deleting it costs at most one day's spent

@@ -762,9 +762,10 @@ async fn sample_host_health(
             .map(crate::disk_headroom::bytes_to_whole_gb),
     );
     // Fleet captain (#8848): `is_captain` is this host's gate outcome against
-    // `root`'s declared `fleet.captain`, and `armed_singleton_jobs` is this
-    // process's own live registry of jobs that most recently resolved
-    // `CaptainGate::Armed` here — see `crate::fleet_captain`'s module doc.
+    // `root`'s declared `fleet.captain`, and `armed_singleton_jobs` (#8901)
+    // merges this process's own in-daemon registry with the durable
+    // shell-arm registry a `loom-daemon fleet-captain <job>` invocation
+    // writes — see `crate::fleet_captain`'s module doc, "Two arm registries".
     let captain_gate = crate::fleet_captain::resolve_gate_for_root(
         workspace_root,
         &crate::sweep_registry::host_identity(),
@@ -792,7 +793,9 @@ async fn sample_host_health(
         protection: sample_host_protection().await,
         admission_brake,
         is_captain: captain_gate.is_captain_flag(),
-        armed_singleton_jobs: crate::fleet_captain::armed_singleton_job_names(),
+        armed_singleton_jobs: crate::fleet_captain::armed_singleton_job_names_for_host(
+            workspace_root,
+        ),
     }
 }
 

@@ -1195,11 +1195,15 @@ pub struct HostHealthRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_captain: Option<bool>,
     /// Declared-singleton-job names currently armed on this host (Issue
-    /// #8848) — i.e. every job whose most recent
-    /// [`crate::fleet_captain::arm_singleton_job`] call resolved
-    /// [`crate::fleet_captain::CaptainGate::Armed`] here. Empty on a host
-    /// that is not the captain, on a host with no declared singleton jobs at
-    /// all, and on a pre-#8848 daemon.
+    /// #8848), from BOTH an in-daemon job's most recent
+    /// [`crate::fleet_captain::arm_singleton_job`] call resolving
+    /// [`crate::fleet_captain::CaptainGate::Armed`] here, and a
+    /// shell-driven job's durable arm via `loom-daemon fleet-captain
+    /// <job-name>` that has not yet gone stale (Issue #8901) — see
+    /// [`crate::fleet_captain::armed_singleton_job_names_for_host`], the
+    /// merge this field is sampled from. Empty on a host that is not the
+    /// captain, on a host with no declared singleton jobs at all, and on a
+    /// pre-#8848 daemon.
     ///
     /// `#[serde(default)]` so a pre-#8848 record still decodes (as an empty
     /// list) rather than failing the whole envelope — the same

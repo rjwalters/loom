@@ -465,6 +465,59 @@ async fn host_health_sample_populates_worktree_root_free_and_total_together() {
     assert_eq!(unknown.worktree_root_total_gb, None);
 }
 
+#[tokio::test]
+async fn host_health_sample_merges_the_durable_shell_arm_registry_8901() {
+    // The daemon/CLI split #8901 exists to close: a `loom-daemon
+    // fleet-captain <job>` invocation's durable arm (never touching the
+    // in-process registry) must still surface in `host.health` once
+    // `sample_host_health` merges it in.
+    let dir = tempfile::tempdir().unwrap();
+    let pool = empty_pool();
+    crate::fleet_captain::record_shell_arm(dir.path(), "shell-driven-job", chrono::Utc::now())
+        .unwrap();
+    let record = sample_host_health(
+        dir.path(),
+        Instant::now(),
+        &pool,
+        &mut empty_slug_cache(),
+        (None, None),
+    )
+    .await;
+    assert!(
+        record
+            .armed_singleton_jobs
+            .contains(&"shell-driven-job".to_string()),
+        "{:?}",
+        record.armed_singleton_jobs
+    );
+}
+
+#[tokio::test]
+async fn host_health_sample_omits_a_stale_shell_arm() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(crate::config_resolver::LEGACY_CONFIG_REL);
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, r#"{"fleet": {"captainArmTtlSecs": 1}}"#).unwrap();
+    let pool = empty_pool();
+    let long_ago = chrono::Utc::now() - chrono::Duration::hours(1);
+    crate::fleet_captain::record_shell_arm(dir.path(), "stale-shell-job", long_ago).unwrap();
+    let record = sample_host_health(
+        dir.path(),
+        Instant::now(),
+        &pool,
+        &mut empty_slug_cache(),
+        (None, None),
+    )
+    .await;
+    assert!(
+        !record
+            .armed_singleton_jobs
+            .contains(&"stale-shell-job".to_string()),
+        "a 1-second configured TTL must age this out: {:?}",
+        record.armed_singleton_jobs
+    );
+}
+
 #[test]
 fn byte_gb_floor_matches_the_df_gb_parsers() {
     // One `df -Pk` row, read both ways: the GB parsers and the byte probe's
