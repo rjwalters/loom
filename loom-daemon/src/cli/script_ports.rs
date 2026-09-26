@@ -49,6 +49,13 @@ pub(crate) enum ScriptPortCommand {
     /// 1 when none did — data, not an error.
     ReleaseResolve(super::release_resolve::ReleaseResolveArgs),
 
+    /// Why an already-resolved release has no artifact for a target (#8654):
+    /// the #8515 age + asset-count classification, for
+    /// `loom-daemon-update.sh`'s forced `--fetch` refusal. Exit 0 + one line
+    /// = the reason, 1 = the release does carry the artifact. Optional to its
+    /// caller — an older binary lacking it degrades to the flat reason.
+    ReleaseExplain(super::release_explain::ReleaseExplainArgs),
+
     /// `merge-pr.sh`'s verdict-label mutual-exclusion guard (#8112), the
     /// second slice of the merge-pr port (#8191). Exit 1 = contradictory,
     /// 0 = clean, 2 = the guard could not run — and 2 must refuse the merge.
@@ -192,6 +199,24 @@ pub(crate) enum ScriptPortCommand {
     /// singleton's schedule wrapper used to hand-roll. Not a port: brand-new
     /// logic, native from the start per the shell-language policy.
     FleetCaptain(super::fleet_captain_cmd::FleetCaptainArgs),
+
+    /// The per-role tool-restriction allowlist (#8322, for #8256), shell-facing
+    /// half: the `--disallowedTools` spec list `spawn-claude.sh` injects, and
+    /// the "is this role restricted" predicate `spawn-codex.sh` needs to warn
+    /// that the guard hook is the ONLY enforcement on its path. Ported out of
+    /// both `contract`-category scripts because inlining it there is exactly
+    /// the portable-shell growth `shell-budget --check` refuses. Exit 0 =
+    /// a restriction applies, 1 = none does — an answer, not an error, landing
+    /// on the same no-op branch as an unavailable binary.
+    #[command(subcommand)]
+    RoleToolPolicy(super::role_tool_policy::RoleToolPolicyCommand),
+
+    /// Tier-3 "generic passthrough" launch-shape resolution (#8671): reads a
+    /// runtime capability manifest's `launch` object and renders it as
+    /// eval-ready shell defaults. Backs `spawn-generic-launch.sh`. Exit 0
+    /// resolved, 1 no manifest reachable (soft), 78 (`EX_CONFIG`) malformed
+    /// manifest or an unrecognized `launch` key.
+    RuntimeLaunchEnv(super::runtime_launch_cmd::RuntimeLaunchEnvArgs),
 }
 
 impl ScriptPortCommand {
@@ -206,6 +231,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DepRecheckFingerprint(cmd) => cmd.run(),
             ScriptPortCommand::ReleaseFetch(args) => args.run(),
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
+            ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
@@ -225,6 +251,8 @@ impl ScriptPortCommand {
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
+            ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
+            ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
         }
     }
 }

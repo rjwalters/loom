@@ -6,6 +6,66 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-25
+- **Issue #8542** (closed): Journal the Curator complexity tier and fix judge_verdicts coverage in sweep.outcome (routing-evaluation prerequisite)
+- **PR #8582**: feat(telemetry): journal Curator complexity tier and add --group-by complexity (#8542)
+- **PR #8864**: private sessions: freeze the hook registration by mount, not by recheck (#8839)
+- **Issue #8796** (closed): merge-pr.sh: warn when a partial-increment trailer is backticked (the #3667 reset silently no-ops)
+- **PR #8808**: chore(defaults): warn on backticked partial-increment trailers (#8796)
+- **Issue #8672** (closed): Provision pooled CODEX_HOME / KIMI_CODE_HOME profiles from the default account (symlink dirs, copy files, key-merge settings, ledger) so a rotated account is not a blank install
+- **PR #8694**: feat(accounts): provision pooled CODEX_HOME profiles from the default account (symlink dirs, copy files, key-merge settings, ledger)
+- **PR #8696**: docs(observability): verify the SigNoz trial on Linux/amd64 and gate ingestion on org registration
+- **Issue #8824** (closed): observability: capture all GitHub Actions runs/jobs of the 2amlogic org as OTLP telemetry via a loom-daemon ci-telemetry poller (SigNoz build/CI visibility, phase 1 of 3)
+- **PR #8847**: feat(observability): loom-daemon ci-telemetry poller — GitHub Actions runs/jobs as OTLP telemetry (#8824)
+- **Issue #8837** (closed): incident: fleet resync installed a cross-host loom-daemon prebuilt that cannot load on the glibc 2.35 worker (repo-remote-gf180-surge) - CLI + self-repair bricked at 2026-09-24 19:24Z; add a loadability gate to the install surface
+- **PR #8843**: fix: add GLIBC compatibility gate to the daemon install surface
+- **Issue #8846** (closed): Managed CLAUDE.md block: describe the session-mode PR workflow (Doctor → Judge → merge-pr.sh)
+- **PR #8892**: docs(scaffolding): describe the label/PR workflow in the managed pointer block
+- **Issue #8886** (closed): peer_coordination DEGRADED can now be a genuine one-way mesh break, not just remaining false-positive noise (robb-studio #8509, ip-172-31-74-176 #8779 — both flapped after #8026 + #8736 fixes)
+- **PR #8891**: docs(safehouse): record #8886 genuine-mesh-break finding, file capability + operator-mechanical follow-ups
+- **Issue #8878** (closed): merge-pr.sh's --merge-method probe ignores LOOM_DAEMON_BIN, so the documented remediation cannot restore validation
+- **PR #8890**: fix(merge-pr): honor LOOM_DAEMON_BIN in the --merge-method probe (#8878)
+- **Issue #8870** (closed): loom-daemon: two dispatch tests fail on every macOS host (TMPDIR symlink vs. #8830's private-export hardening), stalling the build gate
+- **PR #8885**: fix(daemon): scope private-export symlink hardening to the workspace root (#8870)
+- **Issue #8872** (closed): forge-helpers: forge_get_required_status_check_contexts still fails closed on the plan-gated 403 (follow-up to #8844)
+- **PR #8883**: forge-helpers: plan-gated 403 no longer fails required-checks lookup closed
+- **Issue #8874** (closed): install: reinstall deletes .claude/settings.json before init, bypassing the #5396 co-owned merge and destroying other tools' hooks
+- **Issue #8873** (closed): merge-pr.sh discards the daemon's fail-closed reason on exit 2, so the #8844 troubleshooting entry's symptom text never appears
+- **PR #8882**: fix(merge-pr): keep the daemon's fail-closed reason in the exit-2 refusal
+- **Issue #8504** (closed): Machine-readable logs use host-local time without a zone designator — write UTC with an explicit Z everywhere (daemon.log, role logs, events, status)
+- **PR #8538**: fix(daemon): write UTC timestamps with a trailing Z everywhere
+- **Issue #8845** (closed): merge-pr.sh: no way to choose the merge method (always squashes when squash is allowed)
+- **PR #8877**: feat(merge-pr,forge): --merge-method flag to request a non-squash merge
+- **Issue #8835** (closed): dashboard: show a sweep's live Spot compute jobs as nested subprocesses
+- **PR #8869**: dashboard: nest a sweep's live Spot compute jobs under the sweep
+- **Issue #8844** (closed): merge-pr.sh: #8248 freshness guard hard-blocks every merge when the rulesets API returns 403 (private free-plan repos)
+- **PR #8871**: fix(merge-pr): a plan-gated rulesets 403 is "no required checks", not an unknown (#8844)
+- **Issue #8859** (closed): test-loom-dispatcher.sh: LOOM_RUNTIME=codex sweep subtests fail locally (worktreeIsolation capability admission / missing role manifest fixture)
+- **PR #8866**: test: make dispatcher Test 20/21 hermetic against an ambient LOOM_ROLE
+- **Issue #8855** (closed): resync-installed.sh lands new defaults/docs entries as real files in Loom's own tree, breaking the docs/defaults parity gate
+- **PR #8854**: private sessions: image-owned, digest-sealed control boundary (#8839)
+
+### 2026-09-24
+- **Issue #8831** (closed): rework #8808 (issue #8796): port the backticked-trailer warning logic into loom-daemon (script_ports pattern) so the portable shell delta is <= 0
+- **Issue #8832** (closed): dashboard: host 'Degraded' trips on a single failed role tick or one load sample — nearly always on
+- **PR #8833**: dashboard: "Degraded" means act-on-this; self-healing states render "Throttled" (#8832)
+- **Issue #8664** (closed): observability: interactive runtime sessions (Claude Code, Codex, opencode, pi) never reach the fleet sinks — only daemon-dispatched work does
+- **Issue #8451** (closed): Native guard bridge: the 20s policy timeout refuses harmless commands on a saturated host, and the model cannot tell a timeout from a denial
+- **PR #8467**: fix(native-tools): distinguish policy timeout from denial, make the budget configurable
+- **Issue #8786** (closed): Route daemon Codex jobs into private clones with recoverable logs and checkpoints
+- **PR #8830**: feat: dispatch Codex jobs into account-private workspaces
+- **PR #8806**: feat(runtimes): tier-3 Gemini CLI passthrough adapter + claude->gemini preference fallback (part of #4167)
+- **Issue #8827** (closed): observability: standing policy — all 2amlogic build/CI logs and runs are captured in SigNoz (ci-observability policy doc + wiring; phase 4 of 4)
+- **PR #8828**: docs(observability): standing CI-observability policy — all 2amlogic CI captured in SigNoz
+- **Issue #8634** (closed): sweep-outcomes summary --group-by tap splits one tap across the #8625 profile-stamping boundary
+- **PR #8690**: fix(sweep-outcomes): flag a tap split across the #8625 profile-stamping boundary
+- **Issue #8546** (closed): dashboard: the Charts tab is unreadable — no axes, titles, legends, tooltips or table view, and the SVGs scale their text with the viewport
+- **PR #8549**: feat(dashboard): make the Charts tab readable — titles, axes, legends, tooltips and a table view (#8546)
+- **Issue #8668** (closed): observability: wire Claude Code native OTLP export for interactive sessions (#8664 item 1)
+- **PR #8682**: docs(observability): wire Claude Code native OTLP for interactive sessions
+- **Issue #8552** (closed): Champion hold-rot detector: operator-held PRs go stale against main undetected until the human merge fails (3 of 6 needed rebases, one semantic)
+- **PR #8569**: Champion: detect held-PR base staleness before merge time (#8552)
+
 ### 2026-09-24
 - **Issue #8489** (closed): Flaky test: script_helpers::fleet_experiment::tests::a_different_seed_yields_a_different_assignment can coincidentally fail
 - **PR #8500**: test(fleet_experiment): fix ~1/400 flake in a_different_seed_yields_a_different_assignment

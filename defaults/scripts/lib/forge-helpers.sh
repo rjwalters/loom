@@ -823,6 +823,10 @@ forge_get_pr_body() {
 #   closing keywords (close/closes/closed, fix/fixes/fixed, resolve/resolves/
 #   resolved). It also follows GitHub's own rule that "Updates #N", "See #N",
 #   and "References #N" do NOT close the issue.
+#   Neither branch is negation-aware: "does not fix #N" reads exactly like
+#   "fixes #N" (#1057). A caller about to ACT on a candidate re-checks it with
+#   `loom-daemon merge-pr-refs has-unnegated-closing-ref --issue N` (text on
+#   stdin), as champion-pr-merge.md Step 4 does before `gh issue close`.
 #
 # Gitea: The Gitea API does not expose an equivalent of closingIssuesReferences,
 #   so this falls back to a word-boundary regex over the PR body. The regex

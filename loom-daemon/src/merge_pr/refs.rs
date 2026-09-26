@@ -175,6 +175,84 @@ pub fn closing_refs(text: &str) -> Vec<u64> {
     set.into_iter().collect()
 }
 
+/// Tri-state result of scanning `text` for closing-keyword references to a
+/// single issue — see [`closing_ref_negation_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosingRefNegationStatus {
+    /// At least one closing-keyword reference to the issue was found, and it
+    /// (or a later one) is not negated — a genuine closing intent.
+    Unnegated,
+    /// At least one closing-keyword reference to the issue was found, and
+    /// every one of them is negated (`does not fix #N`).
+    NegatedOnly,
+    /// No closing-keyword reference to the issue appears in the text at all.
+    /// Distinct from `NegatedOnly` on purpose: a body that never mentions the
+    /// issue (e.g. it is linked only through the PR's Development sidebar,
+    /// or via `Fixes owner/repo#N` / `Closes: #N`, forms this regex cannot
+    /// see) must not be treated as a disclaimed close.
+    NoReference,
+}
+
+/// Classifies `text`'s closing-keyword references to `issue` (#1057) as
+/// [`ClosingRefNegationStatus::Unnegated`], `NegatedOnly`, or `NoReference` —
+/// backs Champion's "Verify Issue Auto-Close" cross-check.
+///
+/// GitHub's `closingIssuesReferences` parser, and [`closing_refs`] above, read
+/// `does not fix #909` exactly like `fixes #909`. A PR whose body said
+/// "**does not fix #909** — left open for its owner" auto-closed #909 anyway
+/// (example-org/tool-repo#1057). This is the re-check a caller runs on each
+/// raw candidate before treating it as a genuine close.
+///
+/// Negation words: `not`, `never`, or any `n't` contraction (`doesn't`,
+/// `won't`, …, straight or curly apostrophe). The negation must sit
+/// immediately before the closing keyword — at most two intervening words
+/// (`does not fix`, `doesn't fully fix`, `will not close`) — rather than
+/// anywhere earlier in the same clause. A whole-clause scan would read
+/// "If the lock isn't held we now return early, which fixes #42" as negated
+/// even though `isn't` has nothing to do with `fixes #42`; scoping the
+/// window to the words right before the keyword keeps that unnegated while
+/// still catching every #1057 shape. "Clause" is approximated by splitting
+/// on `.`, `!`, `?`, `;` and newlines, so a negation in one clause never
+/// suppresses a genuine close in another. Within a clause only the text up
+/// to the FIRST matching `#N` counts, so text after a genuine close cannot
+/// retroactively negate it.
+#[must_use]
+pub fn closing_ref_negation_status(text: &str, issue: u64) -> ClosingRefNegationStatus {
+    static NEG_NEAR_END: OnceLock<Regex> = OnceLock::new();
+    let neg_near_end = NEG_NEAR_END.get_or_init(|| {
+        Regex::new(r"(?i)(?:\bnot\b|\bnever\b|\w+n['’]t\b)(?:\s+\S+){0,2}\s*$")
+            .expect("static negation-window pattern")
+    });
+    let kw = Regex::new(&format!(
+        r"(?i)\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:blank:]\x0B\x0C\r]+#{issue}\b"
+    ))
+    .expect("closing-reference pattern");
+
+    let mut saw_reference = false;
+    for clause in text.split(['.', '!', '?', ';', '\n']) {
+        if let Some(m) = kw.find(clause) {
+            saw_reference = true;
+            let prefix = &clause[..m.start()];
+            if !neg_near_end.is_match(prefix) {
+                return ClosingRefNegationStatus::Unnegated;
+            }
+        }
+    }
+    if saw_reference {
+        ClosingRefNegationStatus::NegatedOnly
+    } else {
+        ClosingRefNegationStatus::NoReference
+    }
+}
+
+/// Whether `text` carries at least one closing-keyword reference to `issue`
+/// that is NOT negated. Convenience wrapper over
+/// [`closing_ref_negation_status`] for callers that only need the boolean.
+#[must_use]
+pub fn has_unnegated_closing_ref(text: &str, issue: u64) -> bool {
+    closing_ref_negation_status(text, issue) == ClosingRefNegationStatus::Unnegated
+}
+
 /// Render matched snippets the way the shell does: sorted, deduped, and joined
 /// with `", "` so the caller can drop the result straight into a quoted
 /// message.
