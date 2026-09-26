@@ -25,6 +25,7 @@
  *    from the schema doc's `host.health` / `tokens.snapshot` sections.
  */
 
+import type { LabelsSnapshotRecord } from "./labelTypes";
 import type { QueueSnapshotRecord } from "./queueTypes";
 
 /** One repository in a host's `managed_repos` roster (#4976). `slug` is
@@ -235,6 +236,9 @@ export interface HostEntry {
   /** The host's newest work-finder ready queue (Issue #8852) — absent when
    * the host has never sent one (a pre-phase-2 daemon, or no work finder). */
   queue?: Timestamped<QueueSnapshotRecord>;
+  /** The newest `labels.snapshot` of each repo this host lists (issue
+   * #9094). Absent when the host has sent none. */
+  labels?: Timestamped<LabelsSnapshotRecord>[];
 }
 
 /** One in-flight sweep. Mirrors `ActiveSweepState` in `../../src/fleetState.ts`.
@@ -385,7 +389,8 @@ export type RecordKind =
   | "sweep.completed"
   | "sweep.outcome"
   | "tokens.snapshot"
-  | "host.health";
+  | "host.health"
+  | "labels.snapshot";
 
 export interface SweepStartedRecord {
   kind: "sweep.started";
@@ -449,6 +454,7 @@ export type TelemetryRecord =
   | SweepPhaseRecord
   | SweepCompletedRecord
   | SweepOutcomeRecord
+  | LabelsSnapshotRecord
   | OtherRecord;
 
 /** The `event` object nested inside every `GET /api/events` SSE frame. */
