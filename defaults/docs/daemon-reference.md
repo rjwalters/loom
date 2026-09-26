@@ -6573,6 +6573,80 @@ re-walk `.loom/claude-config/*/tmp` every 60 seconds.
 
 See `loom-daemon/src/scratch_reclaim.rs`.
 
+#### Guarded native-harness launch state reclaim (#8650, dedup + path fix #8693)
+
+**What was leaking.** Every guarded native harness launch (pi / opencode /
+kimi) gets a fresh UUID-named state directory under
+`~/.local/state/loom/native-tools/<workspace-hash>/<launch-uuid>` (or under
+`$LOOM_NATIVE_TOOLS_DIR`), and nothing removes one on its own: `State` has no
+`Drop`, and the launch chain `exec()`s all the way into the harness binary — no
+parent process survives to clean up after a session. That directory's reclaim
+is `native_tools::provision::reap`'s job (#8663) — pid-liveness-aware, and
+already running at the start of the next launch for the same workspace, plus
+`loom-daemon clean`. This pass adds the missing periodic case: an idle
+workspace that stops launching new sessions never triggers either of those, so
+`worktreeReaper`'s 15-minute host tick also calls `reap::reap_base` directly.
+**This tick is the only extra logic for that directory shape** — an earlier
+revision of this pass reimplemented its own age-only sweep of the same
+directories, which raced `reap`'s liveness-aware one and could delete a live,
+idle session's state that `reap` deliberately keeps (#8693 review). One
+directory shape, one reaper.
+
+On top of that, a `bun --compile` harness (OpenCode) extracts its ~5.5 MB
+embedded native addon into the OS temp directory on every launch under a fresh
+`.<hash>-0000000N.{so,node}` name. One worker accumulated **7.6 GB across
+1,382 files in 40 hours** of scheduled role-runner ticks this way, contributing
+to a live ENOSPC outage. `State::configure` pins `TMPDIR` so the extract lands
+somewhere attributable instead — but **not** inside the launch's own state
+directory. `<state-base>/<64-hex-sha256>/<uuid>/tmp` runs to roughly 148 bytes
+on a typical host, past the 108-byte (Linux) / 104-byte (macOS)
+`sockaddr_un.sun_path` limit once a socket file name is appended — which broke
+anything the harness ran that bound a Unix socket under the inherited `TMPDIR`
+(`cargo test`, Python multiprocessing, Node IPC; #8693 review). `TMPDIR` is
+pinned instead at a fixed short root, `pinned_tmp_base()` (`/tmp/loom-nt` on
+Unix) joined with the launch's own uuid — constant-length regardless of
+`$HOME`.
+
+**Reclaiming the pinned `TMPDIR` companion needs no age or liveness policy of
+its own.** A pinned-`TMPDIR` entry can only exist for a launch whose session
+directory was created first, so once that session directory is gone (`reap`'s
+own liveness check having already decided so), the companion is unconditionally
+orphaned and is removed on the next tick — no separate `maxAgeHours` gate, and
+so no "`maxAgeHours: 0` deletes a live session's temp files" footgun to guard
+against either.
+
+**Cadence.** A host-level sibling pass on the 15-minute `worktree_reaper` tick,
+alongside the docker-image and tmpfs passes, with a **host-wide** (not
+per-repo) 30-minute cooldown — both directories this pass reclaims live outside
+any one repo, so a multi-repo host must not re-walk them once per repo.
+
+```json
+{
+  "autonomous": {
+    "worktreeReaper": {
+      "nativeStateReclaim": {
+        "enabled": true,
+        "minIntervalSecs": 1800
+      }
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_NATIVE_STATE_RECLAIM` | `autonomous.worktreeReaper.nativeStateReclaim.enabled` | env > config > default | `true` (on) |
+| `LOOM_NATIVE_STATE_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.nativeStateReclaim.minIntervalSecs` | env > config > default | `1800` (30 min) |
+
+`LOOM_NATIVE_TOOLS_DIR` (also honored by `native_tools::provision::state`)
+relocates the session-state base this pass sweeps with `reap::reap_base`; a
+host that sets it only in a launch's own environment — not the daemon's — gets
+the default base swept here instead, since the reclaim tick runs in the
+daemon's process. `LOOM_NATIVE_PINNED_TMPDIR_BASE` is a test-only override for
+the pinned-`TMPDIR` root; production hosts use the fixed default.
+
+See `loom-daemon/src/native_state_reclaim.rs`.
+
 #### `pr-<N>` worktrees are reaped too (#5939)
 
 Through v0.18.11 every automatic reclaim path was scoped to the `issue-<N>`
