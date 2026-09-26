@@ -14,7 +14,10 @@
 //! One value per line on stdout, exactly as the shell functions emitted, so
 //! the caller's `while read` / `$(...)` substitution is unchanged. Exit is
 //! always 0 for a well-formed invocation — "no references found" is an answer,
-//! not an error, and the caller distinguishes them by an empty result.
+//! not an error, and the caller distinguishes them by an empty result. The
+//! one exception is `has-unnegated-closing-ref`, a tri-state predicate: exit
+//! 0 (unnegated found) / 1 (negated only) / `NO_REFERENCE_EXIT` (no
+//! reference at all).
 
 use std::io::Read;
 
@@ -65,7 +68,33 @@ pub(crate) enum MergePrRefsCommand {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Tri-state read of the text's closing-keyword references to `--issue`
+    /// (#1057). Exit 0 when at least one such reference is NOT negated
+    /// (`does not fix #N` does not count, but a later unnegated `fixes #N`
+    /// does); exit 1 when every reference found is negated and there is at
+    /// least one; exit `NO_REFERENCE_EXIT` (3) when the text carries no
+    /// closing-keyword reference to `--issue` at all — this is deliberately
+    /// distinct from 1 so a caller cannot treat "never mentioned" the same as
+    /// "mentioned and disclaimed" (a body with no textual reference — e.g. an
+    /// issue linked only through the PR's Development sidebar — must not be
+    /// read as negated). Prints nothing. Backs Champion's "Verify Issue
+    /// Auto-Close" cross-check; any other exit (e.g. clap's 2 on a daemon too
+    /// old to know this verb) is "could not answer", never "negated".
+    HasUnnegatedClosingRef {
+        #[arg(long, value_name = "N")]
+        issue: u64,
+    },
 }
+
+/// Exit code for [`MergePrRefsCommand::HasUnnegatedClosingRef`] when the text
+/// carries no closing-keyword reference to `--issue` at all. Distinct from
+/// both 0 (unnegated found) and 1 (negated-only found) so a caller can tell
+/// "never mentioned" apart from "mentioned and disclaimed" — conflating them
+/// is what let `champion-pr-merge.md`'s Step 4 reopen issues GitHub had
+/// closed correctly through channels this predicate's regex cannot see (the
+/// Development sidebar, `Fixes owner/repo#N`, `Closes: #N`).
+pub(crate) const NO_REFERENCE_EXIT: i32 = 3;
 
 impl MergePrRefsCommand {
     pub(crate) fn run(self) -> Result<()> {
@@ -93,6 +122,15 @@ impl MergePrRefsCommand {
                 let s = refs::closing_ref_snippets(&body, issue);
                 if !s.is_empty() {
                     println!("{s}");
+                }
+            }
+            MergePrRefsCommand::HasUnnegatedClosingRef { issue } => {
+                match refs::closing_ref_negation_status(&body, issue) {
+                    refs::ClosingRefNegationStatus::Unnegated => {}
+                    refs::ClosingRefNegationStatus::NegatedOnly => std::process::exit(1),
+                    refs::ClosingRefNegationStatus::NoReference => {
+                        std::process::exit(NO_REFERENCE_EXIT)
+                    }
                 }
             }
             MergePrRefsCommand::PartialIncrementRefSnippets { issue } => {
