@@ -1060,6 +1060,209 @@ resolve_worktree_root() {
 }
 
 # =============================================================================
+# SESSION-OWNED SCRATCH DIRECTORY — the one rm-scope carve-out (issue #8460,
+# parent #8453 item 5). Read this whole comment before touching any of the
+# three functions below: every condition is load-bearing, and the failure mode
+# of getting one wrong is one agent deleting another agent's work.
+#
+# WHAT PROBLEM THIS SOLVES
+# A worker that needs a hermetic build — a private CARGO_TARGET_DIR, so that a
+# shared cross-worktree cargo target dir cannot cross-contaminate its test
+# binaries (#8453) — must put that directory OUTSIDE the repo: a multi-GB build
+# tree inside the worktree is exactly what the worktree-removal path is not
+# built to carry. rmScope=repo then refuses to let the worker clean up after
+# itself (`rm-scope-outside-repo`), so on 2026-09-20 three agents each
+# abandoned 3.5-11 GB of private build output on one fleet host.
+#
+# THE RULE: a session may remove ITS OWN scratch directory, and nothing else.
+# An rm target is admitted only when ALL of the following hold:
+#   1. A scratch ROOT resolves and survives the sanity screen below
+#      (LOOM_GUARD_SCRATCH_ROOT / guards.scratchRoot / $HOME/.cache default).
+#   2. The acting session has a plausible, path-segment-safe session id.
+#   3. The target is `<root>/<session-id>` itself, or a path UNDER it. The root
+#      itself is never admitted, and `<root>/<other-session-id>` can never
+#      match, because the segment is compared to THIS session's own id.
+#   4. `<root>/<session-id>` is a real directory, not a symlink.
+#   5. It carries an ownership marker naming THIS session (see below).
+#   6. The target's PHYSICAL path is still inside the session dir's physical
+#      path — so a symlink planted inside the session dir cannot be used as a
+#      tunnel to something outside it.
+# Anything unprovable — no root, no session id, no marker, unreadable marker,
+# marker naming a different session — returns failure, which leaves IN_SCOPE
+# false and lets the ordinary `rm-scope-outside-repo` deny fire. The carve-out
+# can only ever ADD an allow for a path it has positively proven; it is
+# structurally incapable of widening any other rm decision, and it is reached
+# only AFTER the unconditional catastrophic-path deny (/, $HOME, /<one-seg>)
+# has already run, so the denial floor is untouched.
+#
+# WHY THIS LIVES IN THE GUARD AT ALL. Issue #8460 asked for an explicit choice
+# between this and a `loom-daemon` subcommand that performs the removal itself.
+# The guard won on ONE decisive property: Claude Code supplies `session_id` on
+# this hook's STDIN, and the hook is spawned by the harness, not by the model,
+# so the acting session cannot influence the value. A daemon-side remover is
+# invoked as an ordinary Bash command, so the only identity available to it is
+# one the caller supplies (`CLAUDE_CODE_SESSION_ID=<victim> loom-daemon …`) —
+# i.e. exactly the spoofable ownership check #8460's acceptance criteria call
+# out — and it would add a privileged deletion surface reachable from any Bash
+# command. Full rationale, and the recipe agents follow:
+# defaults/docs/guard-hooks.md → "Session-owned scratch directories".
+# =============================================================================
+
+# Ownership marker file name. Nothing in Loom WRITES this file: the session
+# that wants a private scratch dir creates it itself (`mkdir` + one redirect,
+# both already permitted outside the repo). This guard only ever READS it.
+# Contract, documented in guard-hooks.md: a regular file whose `session=<id>`
+# line names the session that owns the directory.
+SESSION_SCRATCH_MARKER=".loom-session-scratch"
+
+# Resolve the scratch root, or return 1 when none is usable (carve-out inert).
+# Resolution order mirrors every other knob in this file: env → config →
+# default. LAZY + cached: only ever reached after a target has already failed
+# every other in-scope test, so the config read never touches the hot path.
+_SCRATCH_ROOT_DONE=""
+_SCRATCH_ROOT_CACHE=""
+resolve_scratch_root() {
+    if [[ -z "$_SCRATCH_ROOT_DONE" ]]; then
+        _SCRATCH_ROOT_DONE=yes
+        local root="" bad=0
+        if [[ -n "${LOOM_GUARD_SCRATCH_ROOT:-}" ]]; then
+            # Env wins. NOT agent-settable in practice: this hook runs as a
+            # separate process spawned by the harness, so an inline
+            # `LOOM_GUARD_SCRATCH_ROOT=… rm -rf …` prefix does NOT reach here
+            # (the same property the worktree-isolation deny messages rely on).
+            root="$LOOM_GUARD_SCRATCH_ROOT"
+        elif [[ -n "$REPO_ROOT" ]]; then
+            root=$(loom_config_get "$REPO_ROOT" "guards.scratchRoot" "" 2>/dev/null) || root=""
+        fi
+        if [[ -z "$root" && -n "${HOME:-}" ]]; then
+            root="$HOME/.cache/loom/session-scratch"
+        fi
+        # Absolute + lexically normalized, so the containment tests below are
+        # byte comparisons against a canonical form. A relative value is
+        # meaningless here and is dropped rather than cwd-joined.
+        if [[ "$root" == /* ]]; then
+            root=$(normalize_abs_path "$root")
+        else
+            root=""
+        fi
+        # ROOT SANITY SCREEN — a misconfigured root must make the carve-out
+        # inert, never broad. Each rejected shape is one where `<root>/<id>`
+        # could name something that is not a private scratch directory:
+        #   /                        — the catastrophic target itself
+        #   $HOME                    — `<root>/<id>` would be a home subdir
+        #   /<one-segment>           — /tmp, /usr, /opt … (system dirs)
+        #   the repo root, or any ancestor of it — the repo's own siblings
+        if [[ -n "$root" ]]; then
+            if [[ "$root" == "/" ]]; then
+                bad=1
+            elif [[ -n "${HOME:-}" && "$root" == "$HOME" ]]; then
+                bad=1
+            elif [[ "$root" =~ ^/[^/]+$ ]]; then
+                bad=1
+            elif [[ -n "$REPO_ROOT" ]] && \
+                 { [[ "$root" == "$REPO_ROOT" ]] || [[ "$REPO_ROOT" == "$root"/* ]]; }; then
+                bad=1
+            fi
+            if [[ "$bad" == 1 ]]; then
+                log_hook_error "scratch root rejected as unsafe; session-scratch carve-out inert: $root"
+                root=""
+            fi
+        fi
+        _SCRATCH_ROOT_CACHE="$root"
+    fi
+    [[ -n "$_SCRATCH_ROOT_CACHE" ]] || return 1
+    printf '%s' "$_SCRATCH_ROOT_CACHE"
+}
+
+# The acting session's id, straight off this hook's stdin (see the block
+# comment above for why that channel is the trustworthy one). Returns 1 —
+# carve-out inert — when absent or not a plausible path segment. The shape gate
+# is a SAFETY check, not cosmetics: an empty / `.` / `..` / slash-bearing /
+# very short id would make `<root>/<id>` name something other than one
+# session's own private directory.
+_SCRATCH_SID_DONE=""
+_SCRATCH_SID_CACHE=""
+current_session_id() {
+    if [[ -z "$_SCRATCH_SID_DONE" ]]; then
+        _SCRATCH_SID_DONE=yes
+        local sid=""
+        sid=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null) || sid=""
+        if ! [[ "$sid" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]]; then
+            sid=""
+        fi
+        _SCRATCH_SID_CACHE="$sid"
+    fi
+    [[ -n "$_SCRATCH_SID_CACHE" ]] || return 1
+    printf '%s' "$_SCRATCH_SID_CACHE"
+}
+
+# Return 0 ONLY when $1 (an already-normalized absolute rm target) is this
+# session's own scratch directory or something under it. $2 is the same
+# target's RAW absolute spelling, before normalize_abs_path() ran. Every
+# failure path returns 1 (fail CLOSED) — see the six numbered conditions above.
+rm_scope_session_scratch_admits() {
+    local abs="$1" raw="${2-}"
+    local root sid dir marker recorded pdir pabs
+    # (0) No `..` segment anywhere in the raw target (and a missing raw
+    # spelling is itself unprovable). normalize_abs_path() pops `..`
+    # LEXICALLY, but the kernel resolves it PHYSICALLY: with
+    # `<session-dir>/tunnel -> /some/dir/inner`, the target
+    # `<session-dir>/tunnel/../x` normalizes to `<session-dir>/x` — which
+    # passes (3) and (6) — while `rm` actually deletes `/some/dir/x`. Deeper
+    # nesting reaches anything the symlink's depth allows. Condition (6) can
+    # only re-check the NORMALIZED text, so the one sound fix is to never
+    # admit a target whose raw spelling needs `..` resolution at all; the
+    # documented recipe never uses one.
+    [[ -n "$raw" ]] || return 1
+    if [[ "/$raw/" == */../* ]]; then
+        return 1
+    fi
+    root=$(resolve_scratch_root) || return 1
+    sid=$(current_session_id) || return 1
+    dir="$root/$sid"
+
+    # (3) The session dir itself, or a descendant. NEVER the root (it has no
+    # owning session), and never a sibling: the segment IS this session's id.
+    if [[ "$abs" != "$dir" && "$abs" != "$dir"/* ]]; then
+        return 1
+    fi
+    # (4) A real directory. A SYMLINK named `<root>/<session-id>` would let
+    # whoever planted it choose what this carve-out admits, so it is refused
+    # outright rather than followed.
+    if [[ ! -d "$dir" ]] || [[ -L "$dir" ]]; then
+        return 1
+    fi
+    # (5) The ownership marker must exist as a regular non-symlink file and
+    # record THIS session. A missing, unreadable, malformed, or
+    # different-session marker is a refusal — which is what makes "another
+    # agent's private dir under the same root" unremovable even though its
+    # path shape is identical to ours.
+    marker="$dir/$SESSION_SCRATCH_MARKER"
+    if [[ ! -f "$marker" ]] || [[ -L "$marker" ]]; then
+        return 1
+    fi
+    recorded=$(head -c 8192 "$marker" 2>/dev/null | sed -n 's/^session=//p' | head -1) || recorded=""
+    if [[ -z "$recorded" || "$recorded" != "$sid" ]]; then
+        return 1
+    fi
+    # (6) Symlink-traversal defense. The lexical test in (3) proves the TEXT of
+    # the target is under the session dir; it cannot see that
+    # `<session-dir>/link` is a symlink to /important, which `rm -rf
+    # <session-dir>/link/x` would delete through. Re-check containment on the
+    # physical paths, using the session dir's own physical form as the base, so
+    # a symlinked ANCESTOR (the root, $HOME) is not mistaken for an escape.
+    pdir=$(physical_abs_path "$dir" 2>/dev/null) || pdir=""
+    pabs=$(physical_abs_path "$abs" 2>/dev/null) || pabs=""
+    if [[ -z "$pdir" || -z "$pabs" ]]; then
+        return 1
+    fi
+    if [[ "$pabs" != "$pdir" && "$pabs" != "$pdir"/* ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
 # worktree-isolation toggle — Bash-tool write confinement (issue #4178).
 #
 # guard-worktree-paths.sh confines the Edit/Write TOOL matcher to a builder's
@@ -8225,6 +8428,9 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
         elif [[ -n "$CWD" ]]; then
             ABS_PATH="$CWD/$_rmclassify"
         fi
+        # Pre-normalization spelling, for the session-scratch carve-out's
+        # `..`-segment refusal (#8460) — see rm_scope_session_scratch_admits().
+        _rm_abs_raw="$ABS_PATH"
 
         # Lexically normalize the absolute target BEFORE the protected-path
         # check. This collapses //, resolves . and .., and strips trailing
@@ -8349,6 +8555,7 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                     _rm_literal_resolved=$(rm_scope_literal_same_command_resolve "$target" "$COMMAND_RM_MKTEMP_SCAN") || true
                     if [[ -n "$_rm_literal_resolved" ]]; then
                         ABS_PATH="$_rm_literal_resolved"
+                        _rm_abs_raw="$ABS_PATH"
                         if [[ "$ABS_PATH" = /* ]]; then
                             ABS_PATH=$(normalize_abs_path "$ABS_PATH")
                         fi
@@ -8407,8 +8614,31 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                     esac
                 fi
 
+                # THIS SESSION'S OWN private scratch/build directory (#8460).
+                # Deliberately LAST: every cheaper, purely-lexical test above
+                # has already failed, and this one stats the filesystem and
+                # reads an ownership marker. It admits `<scratch-root>/<this
+                # session's id>` and paths under it, and nothing else — not the
+                # root, not a sibling session's directory, not a symlink out.
+                # See rm_scope_session_scratch_admits()'s own block comment.
+                if [[ "$IN_SCOPE" == false ]] && rm_scope_session_scratch_admits "$ABS_PATH" "$_rm_abs_raw"; then
+                    IN_SCOPE=true
+                fi
+
                 if [[ "$IN_SCOPE" == false ]]; then
-                    deny "BLOCKED: rm target outside repo scope (LOOM_RM_SCOPE=repo): $ABS_PATH" "rm-scope-outside-repo"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_RM_MKTEMP_SCAN
+                    # Remediation hint for the case this deny is most often
+                    # WRONGLY worked around by simply abandoning a multi-GB
+                    # build dir: the target IS under the session-scratch root,
+                    # but this session could not prove it owns it. Emitted only
+                    # for such targets, so every other out-of-repo deny keeps
+                    # its existing wording byte-for-byte.
+                    _rm_scratch_hint=""
+                    _rm_scratch_root=$(resolve_scratch_root) || _rm_scratch_root=""
+                    if [[ -n "$_rm_scratch_root" ]] && \
+                       { [[ "$ABS_PATH" == "$_rm_scratch_root" ]] || [[ "$ABS_PATH" == "$_rm_scratch_root"/* ]]; }; then
+                        _rm_scratch_hint=" This path is under the session-scratch root ($_rm_scratch_root), but this session cannot prove it owns it. The only removable path there is <root>/<this session's id> — or something under it — and that directory must be a real (non-symlink) directory holding a regular file named $SESSION_SCRATCH_MARKER whose 'session=' line names that same id. The root itself is never removable, and another session's directory never is. See defaults/docs/guard-hooks.md -> 'Session-owned scratch directories' for the create-build-remove recipe."
+                    fi
+                    deny "BLOCKED: rm target outside repo scope (LOOM_RM_SCOPE=repo): $ABS_PATH$_rm_scratch_hint" "rm-scope-outside-repo"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_RM_MKTEMP_SCAN
                 fi
             fi
         fi
