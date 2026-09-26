@@ -22,6 +22,13 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Experiment (#9065): keep line numbers in backtraces but drop full debug
+# info for dev/test builds. Most of the link time for 73 test binaries is
+# DWARF. Release builds are unaffected (they already default to no debuginfo).
+env:
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
 jobs:
   # Belt-and-suspenders cancellation (#6683): the native `cancel-in-progress`
   # above does NOT reliably cancel a superseded run that is still `queued`
