@@ -163,6 +163,36 @@ impl Out {
     }
 }
 
+/// The three message levels [`branch_delete::maybe_delete_local_branch`]
+/// (#8195 slice 3, reused by #8191) emits, abstracted from [`Out`]'s own
+/// icon/color rendering so a second caller can replay the same decision
+/// through its own logging (#8191's `merge-pr.sh` still runs its historic
+/// `info`/`warning`/`success` shell functions — un-iconned, differently
+/// colored — and the retained `test-merge-pr-local-branch-cleanup.sh` suite
+/// stubs exactly those three names, not [`Out`]'s output).
+///
+/// [`Out`] implements this by delegating to its own inherent methods, so
+/// `worktree.sh remove`'s existing behavior is unchanged; `merge-pr`'s CLI
+/// layer provides a second implementation that prints a machine-parseable
+/// `LEVEL\tmessage` line instead.
+pub trait Sink {
+    fn info(&self, msg: &str);
+    fn warning(&self, msg: &str);
+    fn success(&self, msg: &str);
+}
+
+impl Sink for Out {
+    fn info(&self, msg: &str) {
+        Out::info(self, msg);
+    }
+    fn warning(&self, msg: &str) {
+        Out::warning(self, msg);
+    }
+    fn success(&self, msg: &str) {
+        Out::success(self, msg);
+    }
+}
+
 /// Resolve the main workspace root the way every verb in this family does:
 /// from the git COMMON dir, never from cwd.
 ///
