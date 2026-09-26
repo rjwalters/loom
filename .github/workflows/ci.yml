@@ -26,7 +26,6 @@ concurrency:
 # the GitHub Actions cache, where rust-cache keys a separate target/ per job.
 env:
   SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: sccache
 
 jobs:
   # Belt-and-suspenders cancellation (#6683): the native `cancel-in-progress`
@@ -172,6 +171,7 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --package loom-daemon --package loom-api -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
       - run: cargo check --workspace --all-targets
@@ -199,6 +199,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       # Per-test process isolation (#4385). The daemon suite mutates the process
       # environment at ~774 call sites while other tests in the same binary
       # `Command::spawn` children; `Command::spawn` reads the environ
@@ -229,6 +230,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Run doctests
         run: cargo test --workspace --doc
 
@@ -245,6 +247,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       # The `otlp` feature (#4858, Epic #4702 Phase 4) is off by default, so
       # the default-feature jobs above never compile or run it — confirmed
       # during Judge review of PR #4879 that CI had zero `--features otlp` /
@@ -284,6 +287,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - uses: taiki-e/install-action@nextest
       - name: Run tests (otlp feature, partition ${{ matrix.partition }}/3)
         run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/3
@@ -392,6 +396,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       # Debug, not --release (#9065): these steps only RUN the binary, so an
       # optimised build bought nothing but ~100s on every PR (~150s release
       # vs ~45s debug on a warm cache).
@@ -695,6 +700,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       # Debug, not --release (#9065): these steps only RUN the binary, so an
       # optimised build bought nothing but ~100s on every PR (~150s release
       # vs ~45s debug on a warm cache).
@@ -772,6 +778,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       # Debug, not --release (#9065): these steps only RUN the binary, so an
       # optimised build bought nothing but ~100s on every PR (~150s release
       # vs ~45s debug on a warm cache).
@@ -1143,6 +1150,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Build loom-daemon
         run: cargo build --package loom-daemon
       - name: Check .gitignore matches the current EPHEMERAL_PATTERNS set
@@ -1194,6 +1202,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Configure git identity for suite fixtures
         # These suites create fixture commits; a fresh runner has no global
         # identity. Same step shell-suite-tests carries, for the same reason.
@@ -1467,6 +1476,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Configure git identity for suite fixtures
         # These suites create fixture commits; a fresh runner has no global
         # identity. Same step shell-suite-tests carries, for the same reason.
@@ -1525,6 +1535,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Configure git identity for suite fixtures
         # These suites create fixture commits; a fresh runner has no global
         # identity. Same step shell-suite-tests carries, for the same reason.
@@ -1568,6 +1579,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Build native worker dispatcher
         run: cargo build --package loom-daemon
       - name: Check role prompts reference only real labels (#3786)
@@ -1609,6 +1621,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Build native worker dispatcher
         run: cargo build --package loom-daemon
       - name: Syntax-check the Codex adapter and its test
@@ -1786,6 +1799,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       # Native build (the runner IS x86_64-unknown-linux-gnu) — a full
       # cross-compile matrix has no place in a per-PR smoke test; the release
       # workflow's own `build-daemon` matrix already covers every published
@@ -1830,6 +1844,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Build loom-daemon (release)
         run: cargo build --release --package loom-daemon
       - name: Package binary at the path the Dockerfile expects
@@ -1870,6 +1885,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Build loom-daemon (release)
         run: cargo build --release --package loom-daemon
       - name: Package binary at the path the Dockerfile expects
