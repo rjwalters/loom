@@ -152,6 +152,15 @@ pub(crate) enum ScriptPortCommand {
     /// cannot be fetched from must not block worktree creation.
     WorktreeUpstream(super::worktree_upstream::WorktreeUpstreamArgs),
 
+    /// `worktree.sh`'s staleness REFERENCE for the already-registered-worktree
+    /// fast path (#8287, ported in #8354): `origin/<branch>` whenever that ref
+    /// exists and has not already landed as a merged PR (the #5657 skip), else
+    /// `BASE_REF` as before — plus the ahead/behind counts measured against
+    /// whichever it chose. The decision that stops a `git reset --hard` onto
+    /// the base from discarding an open PR's only local trace (#8147/#8190).
+    /// Exit 0 always; one line, four tokens.
+    WorktreeStaleRef(super::worktree_stale_ref::WorktreeStaleRefArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -304,6 +313,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeBranchConflict(args) => args.run(),
             ScriptPortCommand::WorktreeSubmodules(args) => args.run(),
             ScriptPortCommand::WorktreeUpstream(args) => args.run(),
+            ScriptPortCommand::WorktreeStaleRef(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
