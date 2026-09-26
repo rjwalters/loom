@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PANEL_STATUS, mountPanel } from "../src/panels";
 import type { PanelRouteName } from "../src/router";
 
-const PANEL_NAMES: PanelRouteName[] = ["charts", "tokens", "spend", "feed"];
+const PANEL_NAMES: PanelRouteName[] = ["charts", "tokens", "spend", "feed", "live"];
 
 /** Panels fetch on mount. Nothing here asserts on the response — the point is
  * that mounting reaches the network at all, and never throws when it fails. */
@@ -99,6 +99,14 @@ describe("mountPanel", () => {
     // #4863: phase transitions are not emitted, so the panel says so rather
     // than silently rendering a partial view. Remove with that issue.
     expect(root.querySelector('[data-testid="feed-phase-caveat"]')?.textContent).toContain("sweep.phase");
+  });
+
+  it("mounts the live status board and releases it on teardown", () => {
+    const teardown = mountPanel("live", root);
+    expect(root.querySelector('[data-testid="live-board"]')).not.toBeNull();
+    // The board polls /api/fleet-state (or /public/fleet-state) itself.
+    expect(globalThis.fetch).toHaveBeenCalled();
+    teardown();
   });
 
   it("hits the network on mount for the data-backed panels", () => {

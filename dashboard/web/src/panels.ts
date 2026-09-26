@@ -28,6 +28,7 @@ import { el } from "./dom";
 import { isAuthenticatedViewer } from "./api";
 import { DEFAULT_WINDOW_DAYS, HistoricalChartsPanel } from "./historicalChartsPanel";
 import { LiveFeedPanel } from "./liveFeedPanel";
+import { LivePanel } from "./livePanel";
 import { SpendPanel } from "./spendPanel";
 import { currentSurface } from "./analytics/bootstrap";
 import { mountTokenAnalytics } from "./analytics/render";
@@ -40,6 +41,7 @@ export const PANEL_STATUS: Readonly<Record<PanelRouteName, string>> = {
   tokens: "Token & cost analytics",
   spend: "Elastic compute spend",
   feed: "Live event feed",
+  live: "Live status board",
 };
 
 /** A mounted panel's teardown. Panels with no live resource return a no-op. */
@@ -186,11 +188,24 @@ function mountFeed(root: HTMLElement): PanelTeardown {
   return () => panel.stop();
 }
 
+function mountLive(root: HTMLElement): PanelTeardown {
+  const panel = new LivePanel({
+    container: root,
+    feedUrl: isAuthenticatedViewer() ? "/api/events" : "/public/events",
+  });
+  panel.start();
+
+  // Three live resources — the poll timer, the one-second tick, and the SSE
+  // connection — all released here.
+  return () => panel.stop();
+}
+
 const MOUNTERS: Readonly<Record<PanelRouteName, (root: HTMLElement) => PanelTeardown>> = {
   charts: mountCharts,
   tokens: mountTokens,
   spend: mountSpend,
   feed: mountFeed,
+  live: mountLive,
 };
 
 /** Mount `name` into `root`, replacing its contents. Returns the teardown. */

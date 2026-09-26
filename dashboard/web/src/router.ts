@@ -1,6 +1,6 @@
 /**
  * Hash-based routing (`#/`, `#/hosts/<hostId>`, `#/queue`, `#/charts`,
- * `#/tokens`, `#/spend`, `#/feed`).
+ * `#/tokens`, `#/spend`, `#/feed`, `#/live`).
  *
  * Hash routing rather than the History API is a deliberate deploy-shape
  * decision, not laziness. The UI ships as Workers Assets on the *same* Worker
@@ -23,19 +23,22 @@ export type Route =
   | { name: "charts" }
   | { name: "tokens" }
   | { name: "spend" }
-  | { name: "feed" };
+  | { name: "feed" }
+  /** The perpetually-updating status board (issue #9077). */
+  | { name: "live" };
 
 export const OVERVIEW: Route = { name: "overview" };
 
 /** Routes that render a self-contained panel owning its own data fetching,
  * rather than a view over the fleet snapshot the app polls (issue #4895). */
-export type PanelRouteName = "charts" | "tokens" | "spend" | "feed";
+export type PanelRouteName = "charts" | "tokens" | "spend" | "feed" | "live";
 
 const PANEL_ROUTES: Readonly<Record<string, PanelRouteName>> = {
   "/charts": "charts",
   "/tokens": "tokens",
   "/spend": "spend",
   "/feed": "feed",
+  "/live": "live",
 };
 
 export function isPanelRoute(route: Route): route is { name: PanelRouteName } {
