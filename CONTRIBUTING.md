@@ -49,9 +49,9 @@ If you want to submit a PR directly, you're welcome to, but know that it will be
 
 Run `pnpm check:ci` before pushing. This runs the full CI suite locally (linting, formatting, type checking, tests). PRs that fail CI won't be merged.
 
-### Dependabot PRs
+### Dependency-update PRs (Renovate + Dependabot)
 
-Dependabot's version-update and security-fix PRs carry `loom:review-requested` (applied by `.github/dependabot.yml` at PR-creation time) and are routed through Judge like any other PR — this is deliberate, not an oversight: it keeps them out of the Judge's fallback queue, which is defined as "PRs with no `loom:*` label" and never removes a PR from it (a 2-line lockfile bump once accumulated 199 fallback-queue evaluations over 37 hours before this fix). Judge review does not mean auto-merge, though — Champion's safety criteria structurally refuse to auto-merge a dependency bump, so a human still makes the actual merge call, typically via Repo Skills' `/repo:deps`.
+Renovate (`renovate.json5`) opens scheduled dependency-version-update PRs, subject to a 14-day release-age quarantine. Dependabot (`.github/dependabot.yml`) is scoped to security-update PRs only — every entry sets `open-pull-requests-limit: 0` so it never duplicates Renovate's scheduled bumps. Both carry `loom:review-requested` at PR-creation time and are routed through Judge like any other PR — this is deliberate, not an oversight: it keeps them out of the Judge's fallback queue, which is defined as "PRs with no `loom:*` label" and never removes a PR from it (a 2-line lockfile bump once accumulated 199 fallback-queue evaluations over 37 hours before this fix). Judge review does not mean auto-merge, though — Champion's safety criteria structurally refuse to auto-merge a dependency bump, so a human still makes the actual merge call, typically via Repo Skills' `/repo:deps`.
 
 ## Development Setup
 
