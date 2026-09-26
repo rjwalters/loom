@@ -188,6 +188,29 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  release-build:
+    name: Release Build Check
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    # The same `cargo build --release --features otlp` the release workflow
+    # runs, on every backend PR. Until #9065 the three binary-running checks
+    # each built --release, which caught release-profile-only breakage
+    # (cfg(debug_assertions) code, optimisation-only link failures) before
+    # merge. They now use the shared debug build, so without this job such a
+    # break would first surface in the post-merge release workflow. Nothing
+    # waits on it, so it stays off the critical path.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --release --package loom-daemon --features otlp
+
   backend-lint-and-check:
     name: Rust Linting & Build Check
     needs: changes
@@ -208,7 +231,7 @@ jobs:
       - run: cargo check --workspace --all-targets
 
   backend-tests:
-    name: Rust Unit Tests (${{ matrix.partition }}/3)
+    name: Rust Unit Tests (${{ matrix.partition }}/${{ strategy.job-total }})
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     # Partitioned three ways (#9065). Running ~9,500 tests one-process-each is
@@ -223,6 +246,9 @@ jobs:
       fail-fast: false
       matrix:
         partition: [1, 2, 3]
+        # The denominator is `strategy.job-total`, never a literal: editing
+        # this list alone cannot silently drop a slice (a gap such as [1, 3]
+        # yields an out-of-range k/N, which fails loudly).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -248,8 +274,8 @@ jobs:
       - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
         with:
           tool: nextest
-      - name: Run tests (process-per-test, partition ${{ matrix.partition }}/3)
-        run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/3
+      - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
+        run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
 
   backend-doctests:
     name: Rust Doctests
@@ -308,7 +334,7 @@ jobs:
         run: cargo test --package loom-daemon --features otlp --test cycle_time_clickhouse -- --ignored --nocapture
 
   backend-otlp-tests:
-    name: Rust OTLP Feature Tests (${{ matrix.partition }}/3)
+    name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     # The whole loom-daemon suite with `--features otlp`, partitioned three
@@ -318,6 +344,9 @@ jobs:
       fail-fast: false
       matrix:
         partition: [1, 2, 3]
+        # The denominator is `strategy.job-total`, never a literal: editing
+        # this list alone cannot silently drop a slice (a gap such as [1, 3]
+        # yields an out-of-range k/N, which fails loudly).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -331,8 +360,8 @@ jobs:
       - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
         with:
           tool: nextest
-      - name: Run tests (otlp feature, partition ${{ matrix.partition }}/3)
-        run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/3
+      - name: Run tests (otlp feature, partition ${{ matrix.partition }}/${{ strategy.job-total }})
+        run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
 
   mcp-build:
     name: MCP Server Build
@@ -1288,14 +1317,14 @@ jobs:
         run: bash defaults/scripts/tests/test-merge-pr-auto-blocked-settle.sh
       # Split out of test-loom-daemon-update.sh by #7977: these assertions
       # now drive `loom-daemon release-resolve` through the stub's delegation,
-      # so they need the binary this job builds. The parent suite stays in
+      # so they need the binary this job downloads. The parent suite stays in
       # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
       - name: loom-daemon-update --resolve-json (#7609)
         run: bash defaults/scripts/tests/test-loom-daemon-update-resolve-json.sh
       # Split out of test-loom-daemon-update.sh by #8028 (epic #7810 PR 6a):
       # fetch_and_verify_artifact() now drives `loom-daemon release-fetch`
       # through the stub's delegation, so these assertions (tests A-Y) need
-      # the binary this job builds. The parent suite stays in
+      # the binary this job downloads. The parent suite stays in
       # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
       - name: loom-daemon-update artifact fetch + verify (#8028)
         run: bash defaults/scripts/tests/test-loom-daemon-update-fetch.sh
@@ -1303,7 +1332,7 @@ jobs:
       # (#8008) and V2 (#8770) assert what provisioning does to the
       # DESTINATION binary's signature, not what --fetch downloads. They reach
       # `loom-daemon release-fetch` the same way their former host does, so
-      # they need the binary this job builds.
+      # they need the binary this job downloads.
       - name: loom-daemon-update post-provision signature check (#8008, #8770)
         run: bash defaults/scripts/tests/test-loom-daemon-update-dest-signature.sh
       # #8654: the forced --fetch refusal classifies a missing artifact via
@@ -1315,13 +1344,13 @@ jobs:
       # loom-daemon from lib/daemon-update-fixtures.sh that escapes to a real
       # loom-daemon/target/release/ stalled a fleet host's auto_update for
       # hours; this suite pins the containment guard that prevents it. It
-      # sources that library, so it needs the binary this job builds.
+      # sources that library, so it needs the binary this job downloads.
       - name: daemon-update fixture containment (#8712)
         run: bash defaults/scripts/tests/test-daemon-update-fixture-containment.sh
       # Moved out of shell-suite-tests by #8037: claude-wrapper.sh's six retry
       # classifiers now delegate to `loom-daemon retry-classify`, so these 44
       # assertions — written against the pre-port shell in #8032 and unchanged
-      # since — need the binary this job builds. Without one the wrapper's
+      # since — need the binary this job downloads. Without one the wrapper's
       # documented fail-safes answer instead, and the backoff-curve assertions
       # fail loudly rather than the suite reporting green on nothing.
       - name: claude-wrapper retry classifiers (#8032, #8037)
@@ -1334,12 +1363,12 @@ jobs:
         run: bash defaults/scripts/tests/test-token-model-class.sh
       # #8697: spawn-claude.sh's contained dispatch through the credential
       # egress proxy — drives a real `loom-daemon worker proxy-exec` listener
-      # and host-side `tokens select`, so it needs the binary this job builds.
+      # and host-side `tokens select`, so it needs the binary this job downloads.
       - name: spawn-claude credential egress proxy (#8697)
         run: bash defaults/scripts/tests/test-spawn-claude-credential-proxy.sh
       # Moved out of shell-suite-tests by #8191 slice 1: merge-pr.sh's
       # closing-reference analysis now delegates to `loom-daemon`, so this
-      # suite's require-daemon-bin harness needs the binary this job builds.
+      # suite's require-daemon-bin harness needs the binary this job downloads.
       - name: merge-pr partial-increment labels (#3667, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-partial-increment.sh
       # Moved out of shell-suite-tests by #8360: check-duplicate.sh's
@@ -1349,7 +1378,7 @@ jobs:
       # backstop drives it end-to-end. Both suites' exact-percentage
       # assertions were written against the shell scorer (#4409 era) and run
       # unchanged against the port — that is the equivalence evidence for
-      # deleting the shell scan — so each needs the binary this job builds
+      # deleting the shell scan — so each needs the binary this job downloads
       # and fails rather than skips without one.
       - name: check-duplicate near-match band + scan port (#4409, #8289, #8360)
         run: bash defaults/scripts/tests/test-check-duplicate.sh
@@ -1361,7 +1390,7 @@ jobs:
       # before counting. Every `.loom/docs/*.md` has been such a link since
       # #7842, so the old `git show <rev>:<path> | wc -l` measured the link
       # target STRING and reported every in-range citation as a miss — on a
-      # script that BLOCKS FILING. The suite needs the binary this job builds
+      # script that BLOCKS FILING. The suite needs the binary this job downloads
       # and fails rather than skips without one.
       - name: verify-proposal-refs symlink-aware line ranges (#7658, #8656)
         run: bash defaults/scripts/tests/test-verify-proposal-refs.sh
@@ -1369,7 +1398,7 @@ jobs:
       # planning/execution (fetch + PIN the remote default-branch tip, worktree
       # routing, parent-ref resolution and its ancestry check, the rebase
       # itself) is now `loom-daemon reconcile-stack`, so this suite's
-      # require-daemon-bin harness needs the binary this job builds. Its
+      # require-daemon-bin harness needs the binary this job downloads. Its
       # scenarios were written against the shell implementation and run
       # unchanged against the port apart from J/K (the #8583 regression itself)
       # and the two rebase-target assertions the fix necessarily changed.
@@ -1379,14 +1408,14 @@ jobs:
         run: bash defaults/scripts/tests/test-spawn-generic.sh
       # #8671: spawn-generic-launch.sh resolves a tier-3 runtime's launch shape
       # via `loom-daemon runtime-launch-env` before reaching spawn-generic.sh,
-      # so this suite needs the binary this job builds. It pins it via
+      # so this suite needs the binary this job downloads. It pins it via
       # loom_test_require_daemon_bin and FAILS rather than skips without one.
       - name: tier-3 manifest launch shape (#8671)
         run: bash defaults/scripts/tests/test-spawn-generic-launch.sh
       # #8255: skip-labels.sh is a thin stub over `loom-daemon skip-labels`,
       # the shell-facing union of the fixed hard-exclusion list and a repo's
       # configured `autonomous.workFinder.extraSkipLabels` — needs the
-      # binary this job builds.
+      # binary this job downloads.
       - name: sweep-checkpoint (#8525)
         run: bash defaults/scripts/tests/test-sweep-checkpoint.sh
       - name: skip-labels (#8255)
@@ -1396,7 +1425,7 @@ jobs:
       # stubs over `loom-daemon worktree-wip`, so these two suites' 67
       # assertions — unchanged from the shell implementation, and the
       # equivalence evidence for deleting ~385 code lines of it — need the
-      # binary this job builds. Both pin it via loom_test_require_daemon_bin
+      # binary this job downloads. Both pin it via loom_test_require_daemon_bin
       # and FAIL rather than skip without one.
       #
       # Only these three of the 20 test-worktree-*.sh suites move. The other
@@ -1410,19 +1439,19 @@ jobs:
       # #8553: worktree.sh's new issue claim-lock cross-check delegates to
       # `loom-daemon worktree-lock check-issue` (this file is frozen by the
       # file-size ratchet, so the new guard's decision logic lives in Rust,
-      # not shell) — needs the binary this job builds.
+      # not shell) — needs the binary this job downloads.
       - name: worktree issue claim-lock cross-check (#8553)
         run: bash defaults/scripts/tests/test-worktree-issue-lock.sh
       # #8396: premise-check.sh is a thin stub over `loom-daemon
       # premise-check`, the gate Curator and the sweep orchestrator run before
-      # enrichment — needs the binary this job builds.
+      # enrichment — needs the binary this job downloads.
       - name: premise gate exit-code contract (#8396)
         run: bash defaults/scripts/tests/test-premise-check.sh
       # Moved out of shell-suite-tests by #8195 slice 3: `worktree.sh remove`
       # is now a thin stub over `loom-daemon worktree-remove`, so these three
       # suites' 80 assertions — unchanged from the shell implementation, and
       # the equivalence evidence for deleting the whole ~480-line removal
-      # section plus two sourced libs — need the binary this job builds. All
+      # section plus two sourced libs — need the binary this job downloads. All
       # three pin it via loom_test_require_daemon_bin and FAIL rather than skip
       # without one.
       #
@@ -1496,7 +1525,7 @@ jobs:
       # `loom-daemon merge-pr delete-branch` (the same branch_delete rule
       # `worktree.sh remove` uses), so every suite that drives merge-pr.sh's
       # post-merge cleanup — or, like cleanup-branches' review-branch pass,
-      # sources that function — needs the binary this job builds. All six pin
+      # sources that function — needs the binary this job downloads. All six pin
       # it via loom_test_require_daemon_bin and FAIL rather than skip without one.
       - name: merge-pr local-branch cleanup (#4100, #5015, ported in #8191)
         run: bash defaults/scripts/tests/test-merge-pr-local-branch-cleanup.sh
@@ -1541,7 +1570,7 @@ jobs:
       # Moved out of shell-suite-tests by #8087, the same move #8086 made for
       # the watchdog (now in native-port-watchdog-spawn) and for the same
       # reason: cli/loom-daemon-start.sh is now a thin stub over `loom-daemon
-      # daemon-start`, so these three suites need the binary this job builds.
+      # daemon-start`, so these three suites need the binary this job downloads.
       # Each pins it via loom_test_require_daemon_bin --self-only, which leaves
       # $LOOM_DAEMON_BIN free to keep meaning "the daemon this caller starts or
       # probes" — the fake-daemon seam every launch-path case drives — and each
@@ -1602,7 +1631,7 @@ jobs:
       # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
       # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
       # (188 + 27 assertions, unchanged from the shell implementation apart
-      # from four explicitly-retired cases) need the binary this job builds.
+      # from four explicitly-retired cases) need the binary this job downloads.
       # They pin it via loom_test_require_daemon_bin --self-only, which leaves
       # $LOOM_DAEMON_BIN free to keep meaning "the daemon this watchdog probes"
       # — the mock seam every IPC-probe case drives.
@@ -1763,7 +1792,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env --' cargo test -p loom-daemon --test private_workspace_docker -- --ignored --nocapture
 
   shell-suite-tests:
-    name: Shell Test Suites (hermetic, ${{ matrix.shard }}/2)
+    name: Shell Test Suites (hermetic, ${{ matrix.shard }}/${{ strategy.job-total }})
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true')
     # Audit-and-wire of the defaults/scripts/tests/ population (#4455). Before
@@ -1813,6 +1842,9 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2]
+        # The denominator is `strategy.job-total`, never a literal: editing
+        # this list alone cannot silently drop a slice (a gap such as [1, 3]
+        # yields an out-of-range k/N, which fails loudly).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1844,7 +1876,7 @@ jobs:
         # no reachable user manager the block still self-skips, unchanged.
         env:
           LOOM_TEST_ALLOW_SYSTEMD: "1"
-          LOOM_CI_SHARD: ${{ matrix.shard }}/2
+          LOOM_CI_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
         run: bash defaults/scripts/tests/run-ci-suites.sh
       - name: Upload CI suite retry log (#7791)
         if: always()
