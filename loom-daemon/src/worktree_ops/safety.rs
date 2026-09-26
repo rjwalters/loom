@@ -279,16 +279,91 @@ pub fn find_processes_using_directory(directory: &Path) -> Vec<u32> {
         .canonicalize()
         .unwrap_or_else(|_| directory.to_path_buf());
     let mut pids = if cfg!(target_os = "linux") {
-        find_processes_proc(&directory)
+        find_processes_proc(&directory, false)
     } else {
-        find_processes_lsof(&directory)
+        find_processes_lsof(&directory, false)
     };
     let current_pid = std::process::id();
     pids.retain(|p| *p != current_pid);
     pids
 }
 
-fn find_processes_lsof(directory: &Path) -> Vec<u32> {
+/// The answer [`find_processes_with_cwd_in_directory`] gives, which has three
+/// states rather than two: a host with neither probe available cannot say
+/// "nobody is in there", only "I could not look".
+///
+/// The shell twin this exists for — `lib/worktree-race-rescue.sh`'s
+/// `loom_worktree_has_live_process` — collapsed the third state into "no
+/// holder found" at its single call site but printed a stderr line first, so
+/// the distinction was observable and has to survive the port (#8195 slice 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CwdProbe {
+    /// The probe ran. Every PID whose cwd is `directory` or a descendant of it,
+    /// excluding this process.
+    Pids(Vec<u32>),
+    /// Neither `/proc` nor `lsof` is available, so nothing was examined. NOT
+    /// the same as `Pids(vec![])` — see the enum docs.
+    Unprobable,
+}
+
+/// Find PIDs whose **current working directory** is `directory` or a
+/// descendant of it — the narrower, pre-#7466 signal, deliberately kept
+/// distinct from [`find_processes_using_directory`]'s widened
+/// "any open file descriptor under here" scan.
+///
+/// # Why both exist, and why this one is not the wider one
+///
+/// [`find_processes_using_directory`] gates the watchdog's
+/// `git reset --hard` + `git clean -fd` mid-build recovery, where a
+/// false negative destroys a live writer's untracked build output; it takes
+/// false positives deliberately to eliminate missed detection (#7466).
+///
+/// This one is the veto in front of `worktree.sh`'s stale-worktree
+/// `git reset --hard` (#7463), which never runs `git clean`, and whose
+/// refusal costs something real: a worktree that cannot be reset is handed to
+/// the next Builder still carrying drift (the #6291 class). The shell it
+/// replaces matched cwd only, and a port is not the place to widen a guard's
+/// trigger — that is a behaviour change with its own evidence to gather, so it
+/// is filed separately rather than smuggled in here. Both probes share this
+/// module's one `/proc` walk and one `lsof` parse; the difference is a single
+/// flag, so there is no second implementation to drift.
+#[must_use]
+pub fn find_processes_with_cwd_in_directory(directory: &Path) -> CwdProbe {
+    // `worktree_real="$(cd "$worktree_path" && pwd -P)" || return 1` — an
+    // unenterable directory has nothing to protect, and the caller's own
+    // `git -C` reports the real problem.
+    let Ok(directory) = directory.canonicalize() else {
+        return CwdProbe::Pids(Vec::new());
+    };
+    // The shell's probe order, verbatim: Linux `/proc` first (so a hermetic CI
+    // runner with no `lsof` still gets a real answer), then `lsof`, then
+    // neither.
+    let mut pids = if cfg!(target_os = "linux") && Path::new("/proc/self").is_dir() {
+        find_processes_proc(&directory, true)
+    } else if lsof_is_available() {
+        find_processes_lsof(&directory, true)
+    } else {
+        return CwdProbe::Unprobable;
+    };
+    let current_pid = std::process::id();
+    pids.retain(|p| *p != current_pid);
+    CwdProbe::Pids(pids)
+}
+
+/// `command -v lsof >/dev/null 2>&1`, as the shell asked it.
+fn lsof_is_available() -> bool {
+    Command::new("lsof")
+        .arg("-v")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// `cwd_only` restricts the scan to the FD-field-`cwd` entries — the
+/// pre-#7466 signal [`find_processes_with_cwd_in_directory`] needs. The
+/// widened caller passes `false` and keeps every PID `lsof +D` reports.
+fn find_processes_lsof(directory: &Path, cwd_only: bool) -> Vec<u32> {
     let output = match Command::new("lsof")
         // `+D` (uppercase) is lsof's *recursive* directory scan — it matches
         // `<dir>` itself and any descendant at any depth. The lowercase `+d`
@@ -314,6 +389,9 @@ fn find_processes_lsof(directory: &Path) -> Vec<u32> {
     // unconditionally here is safe and matches the fail-open-to-empty
     // contract for a genuine `lsof` failure (no output to parse either way).
     let stdout = String::from_utf8_lossy(&output.stdout);
+    if cwd_only {
+        return parse_lsof_cwd_pids(&stdout);
+    }
     // The widened, issue #7466 scan: every PID `lsof +D <dir>` reports at
     // all, not just the ones whose FD field is `cwd`.
     let mut pids = parse_lsof_open_fd_pids(&stdout);
@@ -390,8 +468,11 @@ fn is_directory_or_descendant(path: &str, directory: &str) -> bool {
     path == directory || path.starts_with(&format!("{directory}/"))
 }
 
+/// `cwd_only` skips signal 2 below, restricting the walk to
+/// `/proc/<pid>/cwd` — see [`find_processes_with_cwd_in_directory`] for which
+/// caller wants which, and why the narrower one was not widened.
 #[cfg(target_os = "linux")]
-fn find_processes_proc(directory: &Path) -> Vec<u32> {
+fn find_processes_proc(directory: &Path, cwd_only: bool) -> Vec<u32> {
     let proc = Path::new("/proc");
     if !proc.is_dir() {
         return Vec::new();
@@ -424,17 +505,18 @@ fn find_processes_proc(directory: &Path) -> Vec<u32> {
         // is unreadable (another user's process, or one that exited mid-scan)
         // simply contributes no fd-based hits — consistent with this
         // function's overall fail-open-to-"not found" behavior.
-        let fd_hit = std::fs::read_dir(pid_path.join("fd"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|fd_entry| {
-                std::fs::read_link(fd_entry.path())
-                    .ok()
-                    .is_some_and(|target| {
-                        is_directory_or_descendant(&target.to_string_lossy(), &dir_str)
-                    })
-            });
+        let fd_hit = !cwd_only
+            && std::fs::read_dir(pid_path.join("fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|fd_entry| {
+                    std::fs::read_link(fd_entry.path())
+                        .ok()
+                        .is_some_and(|target| {
+                            is_directory_or_descendant(&target.to_string_lossy(), &dir_str)
+                        })
+                });
 
         if cwd_hit || fd_hit {
             pids.push(pid);
@@ -445,7 +527,7 @@ fn find_processes_proc(directory: &Path) -> Vec<u32> {
 
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
-fn find_processes_proc(_directory: &Path) -> Vec<u32> {
+fn find_processes_proc(_directory: &Path, _cwd_only: bool) -> Vec<u32> {
     Vec::new()
 }
 
@@ -952,7 +1034,7 @@ mod tests {
 
         let mut found = Vec::new();
         for _ in 0..40 {
-            found = find_processes_lsof(&canonical_worktree);
+            found = find_processes_lsof(&canonical_worktree, false);
             if found.contains(&child.id()) {
                 break;
             }

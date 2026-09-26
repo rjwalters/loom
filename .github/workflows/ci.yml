@@ -1371,16 +1371,26 @@ jobs:
       # at all; both pin it via loom_test_require_daemon_bin and FAIL rather
       # than skip.
       #
-      # Six of the 19 test-worktree-*.sh suites are now here (snapshot,
-      # stash-baseline, remove, nested-symlinks and — since slice 5 —
-      # orphan-guard-spaces and concurrency) plus the two non-`test-worktree-*`
-      # suites that drive `worktree.sh remove`. The remaining 13 exercise
-      # create-path arms these slices did not touch and stay hermetic in
-      # shell-suite-tests.
+      # Seven of the 19 test-worktree-*.sh suites are now here (snapshot,
+      # stash-baseline, remove, nested-symlinks, orphan-guard-spaces,
+      # concurrency and — since slice 6 — race-rescue) plus the two
+      # non-`test-worktree-*` suites that drive `worktree.sh remove`. The
+      # remaining 12 exercise create-path arms these slices did not touch and
+      # stay hermetic in shell-suite-tests.
       - name: worktree orphan guard, space + symlink paths (#7849, ported in #8195)
         run: bash defaults/scripts/tests/test-worktree-orphan-guard-spaces.sh
       - name: worktree concurrency lock + partial-state cleanup (#3380, #6014, ported in #8195)
         run: bash defaults/scripts/tests/test-worktree-concurrency.sh
+      # Moved out of shell-suite-tests by #8195 slice 6: lib/worktree-race-rescue.sh
+      # is now a thin wrapper over `loom-daemon worktree-reset`, so all 25 of
+      # this suite's assertions — written against the shell in #6334/#7463 and
+      # unchanged since — drive the Rust port. It pins the binary via
+      # loom_test_require_daemon_bin and FAILS rather than skips without one:
+      # every reset case it asserts SUCCEEDS would otherwise be refused by the
+      # wrapper's own no-binary fallback, which is a correct degradation but not
+      # the thing this suite exists to measure.
+      - name: worktree race rescue on a stale-worktree reset (#6334, #7463, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-race-rescue.sh
       # Moved out of shell-suite-tests by #8191's delete-branch slice:
       # merge-pr.sh's `_maybe_delete_local_branch` now delegates to
       # `loom-daemon merge-pr delete-branch` (the same branch_delete rule

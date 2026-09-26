@@ -89,6 +89,13 @@ fi
 # otherwise discard foreign work that appears in the window between the
 # staleness check and the reset itself — see the lib file for the full
 # rationale and design decision.
+#
+# Ported to `loom-daemon worktree-reset` (#8195 slice 6): the lib now keeps the
+# function name and its 0/1/2 contract and delegates the body to
+# `loom-daemon/src/worktree_cli/reset.rs`. No daemon means the wrapper returns 1
+# ("refused, nothing changed"), which lands on the "Could not reset stale
+# worktree (continuing to use as-is)" arm below — so a host without one loses a
+# reset, never data.
 # shellcheck source=lib/worktree-race-rescue.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/worktree-race-rescue.sh"
 
