@@ -1658,107 +1658,52 @@ if [[ "$JSON_OUTPUT" != "true" ]]; then
     echo ""
 fi
 
-# Helper: attempt recovery when feature branch is checked out in the main worktree.
-# This happens when a previous builder manually checked out feature/issue-N in the
-# main workspace and left it there.  Git refuses to create a new worktree for that
-# branch: "fatal: 'feature/issue-N' is already used by worktree at '<main-path>'"
+# Recovery when a feature branch is checked out in the main worktree. This
+# happens when a previous builder manually checked out feature/issue-N in the
+# main workspace and left it there: git refuses to create a new worktree for
+# that branch ("fatal: 'feature/issue-N' is already used by worktree at
+# '<main-path>'"), and this decides whether to auto-switch the main workspace
+# back to $DEFAULT_BRANCH (clean) or report why it can't (dirty, or the
+# conflict is some other worktree entirely).
 #
-# Recovery strategy:
-#   1. Detect the "already used by worktree at" pattern in stderr
-#   2. Confirm the conflicting worktree is the main workspace (not a feature worktree)
-#   3. If main workspace is clean: auto-switch it back to main and retry
-#   4. If main workspace has uncommitted changes: emit an actionable error message
-_handle_feature_branch_in_main_worktree() {
+# Ported to `loom-daemon worktree-branch-conflict` (#8195 slice 7): the string
+# parsing of git's error text and the path-comparison decision now live in
+# `loom-daemon/src/worktree_cli/branch_conflict.rs`, along with the full
+# design rationale.
+#
+# The contract this wrapper preserves, verbatim: every message (including
+# `print_error`'s, which — unlike most call sites in this script — are
+# themselves gated on `$JSON_OUTPUT`, not just routed), and the three return
+# codes `_try_worktree_add` branches on below.
+#
+# requires-daemon: worktree-branch-conflict optional  #8195 slice 7 — a daemon predating the port never attempts recovery; the caller falls through to recovery_code=1 and reports the raw git error, same as before this guard existed
+_worktree_handle_branch_conflict() {
     local error_output="$1"
     local branch="$2"
 
-    # Only act on the specific "already used by worktree at" error
-    if ! echo "$error_output" | grep -q "is already used by worktree at"; then
-        return 1  # Not this error — caller should fail normally
+    # A binary that predates the port is probed for HERE rather than left to
+    # fail on the real invocation, for the reason lib/worktree-race-rescue.sh
+    # documents at the same guard (#8195 slice 6): clap answers an unknown
+    # subcommand with exit 2, and 2 is an ANSWER in this contract — "I switched
+    # your main workspace back to $DEFAULT_BRANCH, retry the add". An un-ported
+    # daemon would therefore claim a recovery that never happened, on EVERY
+    # failing `git worktree add` and not just the branch-conflict one, replacing
+    # git's accurate error with a "Retrying worktree creation..." line and a
+    # second identical failure. 1 — "not this error, here is git's own text" —
+    # is the only truthful answer without a binary that can run the guard. The
+    # extra ~0.2s spawn is paid only after `git worktree add` has already
+    # failed, never on the success path.
+    if [[ -z "${_LEASE_DAEMON_BIN:-}" ]] \
+        || ! "$_LEASE_DAEMON_BIN" worktree-branch-conflict --help >/dev/null 2>&1; then
+        return 1
     fi
 
-    # Extract the conflicting worktree path from the error message
-    # Example: "fatal: 'feature/issue-2853' is already used by worktree at '/path/to/loom'"
-    local conflict_path
-    conflict_path=$(echo "$error_output" | grep -o "is already used by worktree at '[^']*'" | sed "s/is already used by worktree at '//;s/'$//")
-
-    if [[ -z "$conflict_path" ]]; then
-        # Could not parse path — emit a generic actionable message (human-readable only)
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_error "Cannot create worktree: branch '$branch' is already checked out in another worktree."
-            echo ""
-            echo "  The branch is in use elsewhere. To free it, find the worktree with:"
-            echo "    git worktree list"
-            echo "  Then switch that worktree to $DEFAULT_BRANCH:"
-            echo "    cd <worktree-path> && git checkout $DEFAULT_BRANCH"
-        fi
-        return 0  # Handled (with human-readable message), no retry possible
-    fi
-
-    # Determine the main workspace path
-    local main_workspace
-    main_workspace=$(git rev-parse --git-common-dir 2>/dev/null)
-    main_workspace=$(dirname "$main_workspace" 2>/dev/null)
-
-    # Resolve both paths to absolute for comparison
-    local abs_conflict abs_main
-    abs_conflict=$(cd "$conflict_path" 2>/dev/null && pwd) || abs_conflict="$conflict_path"
-    abs_main=$(cd "$main_workspace" 2>/dev/null && pwd) || abs_main="$main_workspace"
-
-    if [[ "$abs_conflict" != "$abs_main" ]]; then
-        # Conflicting worktree is not the main workspace — it's a different issue worktree.
-        # This is unusual but can happen. Emit actionable guidance without auto-recovery.
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_error "Cannot create worktree for branch '$branch':"
-            echo "  Branch is already checked out at: $conflict_path"
-            echo ""
-            echo "  To fix:"
-            echo "    cd $conflict_path && git checkout $DEFAULT_BRANCH"
-        fi
-        return 0  # Handled (with error message), no retry
-    fi
-
-    # The conflict is in the main workspace. Check for uncommitted changes.
-    local uncommitted
-    uncommitted=$(git -C "$abs_conflict" status --porcelain 2>/dev/null)
-
-    if [[ -n "$uncommitted" ]]; then
-        # Main workspace has uncommitted changes — cannot auto-recover safely
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_error "Cannot create worktree for issue #$ISSUE_NUMBER: branch '$branch'"
-            echo "  is already checked out at '$abs_conflict' (main worktree)."
-            echo ""
-            echo "  The main worktree has uncommitted changes — cannot auto-switch."
-            echo "  To fix manually:"
-            echo "    cd $abs_conflict"
-            echo "    git stash  # or commit your changes"
-            echo "    git checkout $DEFAULT_BRANCH"
-            echo "  Then rerun: ./.loom/scripts/worktree.sh $ISSUE_NUMBER"
-        fi
-        return 0  # Handled (with error message), no retry
-    fi
-
-    # Main workspace is clean — auto-switch to the default branch and signal
-    # caller to retry.
-    if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_warning "Branch '$branch' is checked out in the main worktree."
-        print_info "Main worktree is clean — auto-switching to $DEFAULT_BRANCH branch..."
-    fi
-
-    if git -C "$abs_conflict" checkout "$DEFAULT_BRANCH" 2>/dev/null; then
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_success "Main worktree switched to $DEFAULT_BRANCH branch"
-        fi
-        return 2  # Signal: auto-recovered, caller should retry
-    else
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_error "Failed to switch main worktree to $DEFAULT_BRANCH branch."
-            echo "  To fix manually:"
-            echo "    cd $abs_conflict && git checkout $DEFAULT_BRANCH"
-            echo "  Then rerun: ./.loom/scripts/worktree.sh $ISSUE_NUMBER"
-        fi
-        return 0  # Handled (with error message), no retry
-    fi
+    local flags=()
+    [[ "$JSON_OUTPUT" == "true" ]] && flags+=(--quiet)
+    printf '%s' "$error_output" | "$_LEASE_DAEMON_BIN" worktree-branch-conflict \
+        --branch "$branch" --default-branch "$DEFAULT_BRANCH" \
+        --issue "$ISSUE_NUMBER" --repo-root "$WORKTREE_REPO_ROOT" "${flags[@]}"
+    return $?
 }
 
 _try_worktree_add() {
@@ -1783,7 +1728,7 @@ _try_worktree_add() {
     # Wrap in a subshell result capture to safely handle non-zero returns
     # without triggering set -e (we use exit code 2 as a retry signal).
     local recovery_code=0
-    _handle_feature_branch_in_main_worktree "$worktree_error" "$BRANCH_NAME" && recovery_code=0 || recovery_code=$?
+    _worktree_handle_branch_conflict "$worktree_error" "$BRANCH_NAME" && recovery_code=0 || recovery_code=$?
 
     if [[ $recovery_code -eq 2 ]]; then
         # Auto-recovered: retry worktree creation once
@@ -1795,7 +1740,7 @@ _try_worktree_add() {
     fi
 
     if [[ $recovery_code -eq 1 ]]; then
-        # _handle_feature_branch_in_main_worktree returned 1 (not this error type)
+        # _worktree_handle_branch_conflict returned 1 (not this error type)
         # Print the original git error since nothing else has
         echo "$worktree_error" >&2
     fi

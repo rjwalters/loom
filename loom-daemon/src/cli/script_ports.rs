@@ -123,6 +123,14 @@ pub(crate) enum ScriptPortCommand {
     /// 1 = refused and nothing changed, 2 = the reset itself failed.
     WorktreeReset(super::worktree_reset::WorktreeResetArgs),
 
+    /// `worktree.sh`'s `_handle_feature_branch_in_main_worktree` (#8195 slice
+    /// 7): the recovery `_try_worktree_add` falls into when `git worktree
+    /// add` refuses because the target branch is already checked out in the
+    /// main workspace. The one arm of the create path that is pure string
+    /// parsing of an arbitrary git error message — #7858's class again. Exit
+    /// 0 = handled (no retry), 1 = not this error, 2 = auto-recovered, retry.
+    WorktreeBranchConflict(super::worktree_branch_conflict::WorktreeBranchConflictArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -250,6 +258,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeLink(args) => args.run(),
             ScriptPortCommand::WorktreeCleanup(args) => args.run(),
             ScriptPortCommand::WorktreeReset(args) => args.run(),
+            ScriptPortCommand::WorktreeBranchConflict(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
