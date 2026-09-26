@@ -221,8 +221,9 @@ hardest exactly where the empty read is *genuine*. On a repo with no CI on the
 changed paths every poll returns zero rows forever, so every `--auto` merge
 there spent the full `LOOM_AUTO_MERGE_TIMEOUT` before merging — long enough
 that the calling agent's own process cap killed it first, which is how
-2AMLogic/2am#1267 got a "Proceeding with squash merge…" comment and then no
-merge, no failure and no label change. The bound is conditional on the base
+a private fleet repo's PR (2026-09-26; full timeline in rjwalters/loom#9091) got
+a "Proceeding with squash merge…" comment and then no merge, no failure and no
+label change. The bound is conditional on the base
 branch's **required** status-check set:
 
 - **no required contexts** → settle after `LOOM_ZERO_CHECKS_SETTLE_POLLS`

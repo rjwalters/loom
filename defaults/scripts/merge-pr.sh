@@ -2197,7 +2197,7 @@ _wait_for_checks_then_sync_merge() {
     # LOOM_AUTO_MERGE_TIMEOUT (600s default) before merging — long enough that
     # Champion's own Bash-tool cap killed the process first, leaving
     # "Proceeding with squash merge..." on the PR and no merge, no failure, no
-    # label change (2AMLogic/2am#1267, 2026-09-26).
+    # label change (a private fleet repo, 2026-09-26; timeline in #9091).
     #
     # The discriminator is the base branch's REQUIRED status-check set, read
     # once and cached for the lifetime of this call:

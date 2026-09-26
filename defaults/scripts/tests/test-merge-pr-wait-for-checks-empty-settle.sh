@@ -20,8 +20,8 @@
 # configured for the changed paths returns zero rows on every poll forever, so
 # every `--auto` merge there burned the entire LOOM_AUTO_MERGE_TIMEOUT (600s)
 # before merging, and the calling agent's own process cap killed it first
-# (2AMLogic/2am#1267: "Proceeding with squash merge..." then no merge, no
-# failure, no label change). The zero-row wait is now bounded to
+# (a private fleet repo, 2026-09-26; timeline in #9091: "Proceeding with squash
+# merge..." then no merge, no failure, no label change). The wait is bounded to
 # LOOM_ZERO_CHECKS_SETTLE_POLLS polls WHEN the base branch requires no
 # status-check contexts -- still never one read (#6169 holds), but seconds
 # instead of ten minutes. Required contexts present, or a lookup that errors,
@@ -282,7 +282,7 @@ echo "Testing #9091's bounded zero-row settle (no required contexts)..."
 # this commit (zero rows on every poll) whose base branch requires no status
 # checks. Before the fix this polled until LOOM_AUTO_MERGE_TIMEOUT (600s)
 # elapsed -- long enough that the caller's own process cap killed it mid-wait,
-# which is how 2AMLogic/2am#1267 got "Proceeding with squash merge..." and then
+# which is how the reported PR got "Proceeding with squash merge..." and then
 # no merge at all. After the fix it settles after LOOM_ZERO_CHECKS_SETTLE_POLLS
 # polls, and the accumulated wait must be well under 30s (the issue's stated
 # regression bar).
