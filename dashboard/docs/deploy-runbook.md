@@ -269,7 +269,9 @@ One key per fleet host, so any single host can be revoked without disturbing
 the others.
 
 ```bash
-BASE="https://loom-observability-ingest.<your-subdomain>.workers.dev"
+# same BASE you set in step 6 — your custom domain, or the workers.dev URL
+# if you took the smoke-test path there
+BASE="https://loom-dashboard.example.com"
 ADMIN="<the ADMIN_TOKEN from step 7>"
 
 curl -sS -X POST "$BASE/admin/hosts" \
@@ -341,7 +343,7 @@ how to point at a non-default path. Trailing whitespace/newlines are trimmed.
 {
   "observability": {
     "enabled": true,
-    "endpoint": "https://loom-observability-ingest.<your-subdomain>.workers.dev/ingest",
+    "endpoint": "https://loom-dashboard.example.com/ingest",
     "batchSize": 50,
     "flushIntervalSecs": 30,
     "queueCapacity": 2000
