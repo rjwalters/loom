@@ -174,6 +174,7 @@ pub mod foreign_load;
 pub mod forge_cached_list;
 pub mod forge_check_open_pr;
 pub mod forge_cmd;
+pub mod forge_disable_auto_merge;
 pub mod forge_events;
 pub mod forge_listing;
 pub mod forge_merge_method;

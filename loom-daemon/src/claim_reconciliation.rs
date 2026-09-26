@@ -1945,6 +1945,11 @@ pub fn spawn_periodic_reconciliation_task(
 /// rather than growing `forge` inline.
 mod pr_label_info;
 
+/// The #8900 auto-merge disarm hook [`forge::invalidate_verdict`] calls before
+/// posting its stale-verdict comment — a sibling file per the file-size ratchet
+/// (`.loom/docs/file-size-policy.md`) rather than more inline logic here.
+mod auto_merge_disarm;
+
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::work_finder::forge`] / [`crate::epic_supervisor::forge`]) — the
 /// decision logic above is the fully-covered surface; this module is a thin,
@@ -3180,6 +3185,13 @@ pub mod forge {
     /// silently re-queued with no record of why. A failed comment aborts
     /// before touching any label, so the transition is never applied without
     /// its audit trail.
+    ///
+    /// Ahead of even the comment, any armed GitHub auto-merge is **disarmed**
+    /// (issue #8900) — see [`super::auto_merge_disarm`] for why the disarm is
+    /// first and why it is safe there. Without it the label flip below is
+    /// cosmetic: the queued server-side merge is gated only by the ruleset's
+    /// required checks and merges the unreviewed head anyway (#8694, #8847,
+    /// #8843 all merged that way on 2026-09-25).
     fn invalidate_verdict(
         gh_bin: &Path,
         root: &Path,
@@ -3188,6 +3200,12 @@ pub mod forge {
         head_sha: &str,
     ) -> Result<()> {
         let label = pr.kind.label();
+        // `None` (the common case: nothing was armed) contributes no line at
+        // all, so the comment never claims a disarm that did not happen.
+        let disarm_line =
+            super::auto_merge_disarm::disarm_before_invalidation(gh_bin, root, pr.number)
+                .map(|line| format!("\n{line}"))
+                .unwrap_or_default();
         let body = format!(
             "<!-- loom:verdict-stale from={marker_sha} to={head_sha} -->\n\
              **Stale review verdict cleared — head SHA moved**\n\n\
@@ -3195,7 +3213,8 @@ pub mod forge {
              head is `{head_sha}`. A review verdict is a statement about a specific tree, so it \
              does not survive a rebase, a force-push, or new commits.\n\n\
              - Verdict cleared: `{label}` (recorded for `{marker_sha}`)\n\
-             - Returned to the review queue: `loom:review-requested` (current head `{head_sha}`)\n\n\
+             - Returned to the review queue: `loom:review-requested` (current head `{head_sha}`)\
+             {disarm_line}\n\n\
              Judge will re-evaluate the tree that is actually here now. No judgment about the new \
              tree is implied either way — the old verdict simply no longer describes it.\n\n\
              ---\n\
@@ -3352,6 +3371,26 @@ pub mod forge {
     /// #6319) rather than silently kept: see [`decide_anchor`] /
     /// [`anchor_verdict`]. Anchoring writes no labels, so the staleness
     /// behavior of every already-marked verdict is untouched.
+    ///
+    /// # Held PRs are NOT covered by this pass (pre-existing, #8900 scope note)
+    ///
+    /// "Runs on the periodic tick regardless" is true of every PR this pass can
+    /// *see*, and a PR on an explicit hold (`loom:operator`, `loom:blocked`,
+    /// `loom:operator-only`) is deliberately not one of them: [`list_verdict_prs`]
+    /// skips the comment/marker fetch for a held PR, so [`decide_verdict`]
+    /// answers `Keep(Unverifiable)` before it can reach its own `on_hold` branch
+    /// and [`VerdictAction::Invalidate`] — and therefore
+    /// [`super::auto_merge_disarm::disarm_before_invalidation`] — is never
+    /// reached for one. That is this module's long-standing "never write to a
+    /// parked PR" design, not a #8900 regression.
+    ///
+    /// The consequence to know about: for the held+armed combination, the
+    /// auto-merge disarm (#8900) comes only from the shell path —
+    /// `verdict-staleness-guard.sh --clear`, which judge.md / doctor.md /
+    /// champion-pr-merge.md do run over held PRs and which shells out to
+    /// `loom-daemon forge disable-auto-merge --audit-comment --hold <label>`.
+    /// Do not "fix" this by making the daemon pass write to held PRs without
+    /// deciding that question on its own merits first.
     ///
     /// Returns [`VerdictReconcileStats`] summed across both verdict labels.
     pub fn reconcile_pr_verdicts(gh_bin: &Path, root: &Path) -> VerdictReconcileStats {

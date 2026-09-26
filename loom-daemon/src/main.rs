@@ -1940,6 +1940,53 @@ enum ForgeAction {
         timeout: Option<u64>,
     },
 
+    /// Disarm GitHub's server-side auto-merge on a PR. Safe to call anywhere a
+    /// review verdict is invalidated.
+    ///
+    /// The inverse of `auto-merge`, and deliberately NOT operator-only: it can
+    /// only turn a queued merge OFF, never on, so there is no state in which
+    /// calling it makes an unreviewed merge more likely.
+    ///
+    /// WHY IT EXISTS (#8900): an armed auto-merge is gated only by the branch
+    /// ruleset's REQUIRED checks. Clearing `loom:pr` for a head move does not
+    /// disarm it, so the queued merge fires as soon as required checks pass on
+    /// the NEW, unreviewed head — bypassing `loom:pr`, the non-required suites,
+    /// and the #8248 required-check-freshness guard (which lives inside
+    /// `merge-pr.sh`). #8694 merged that way on 2026-09-25, three minutes after
+    /// a rebase force-push, still labeled `loom:review-requested`.
+    ///
+    /// Prints `DISARMED=1` (an arm was disabled) or `DISARMED=0` (nothing was
+    /// armed — no mutation sent) and exits 0 for both; exits 1 when the arm
+    /// state could not be read or the mutation failed (treat as possibly still
+    /// armed, never as an all-clear); exits 3 on Gitea, which has no
+    /// server-side arm to disable.
+    ///
+    /// `--audit-comment` also records what the disarm did as a PR comment, so a
+    /// caller does not have to compose (and duplicate) that prose itself. It is
+    /// silent when nothing was armed, which is the common case — no PR ever
+    /// collects a comment saying nothing happened. This is the flag
+    /// `verdict-staleness-guard.sh --clear` uses; `--hold` tells it the PR is
+    /// parked so the comment explains why a held PR was written to at all.
+    #[command(name = "disable-auto-merge")]
+    DisableAutoMerge {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// Record what the disarm did as a comment on the PR. Silent when
+        /// nothing was armed.
+        #[arg(long)]
+        audit_comment: bool,
+
+        /// The explicit-hold label found on the PR (`loom:operator`,
+        /// `loom:blocked`, `loom:operator-only`), if any. Shapes the audit
+        /// comment's wording only — it never suppresses the disarm, which can
+        /// only prevent a merge and therefore enforces a hold rather than
+        /// undoing it. An empty value means "not held".
+        #[arg(long, value_name = "LABEL")]
+        hold: Option<String>,
+    },
+
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should use,
     /// replacing its old unconditional `forge_detect_merge_method` call.
