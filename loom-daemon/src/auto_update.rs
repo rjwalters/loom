@@ -257,6 +257,12 @@ pub struct AutoUpdateConfig {
     /// priority (#4929). A zero/invalid value is dropped to `None`; `0` is
     /// intentionally *not* "never defer" — use a small positive value.
     pub defer_deadline_secs: Option<u64>,
+    /// `autonomous.autoUpdate.rollStallDeadlines` — how many drain deadlines may
+    /// expire, summed across roll lifetimes, with the in-flight sweep count
+    /// never improving before the roll is declared unsatisfiable and abandoned
+    /// (#8998). A zero/invalid value is dropped to `None`: `0` would declare
+    /// every armed roll unsatisfiable on sight.
+    pub roll_stall_deadlines: Option<u32>,
 }
 
 /// Read `.loom/config.json → autonomous.autoUpdate` through
@@ -286,6 +292,11 @@ pub fn read_auto_update_config(repo_root: &Path) -> AutoUpdateConfig {
             .get("deferDeadlineSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
+        roll_stall_deadlines: block
+            .get("rollStallDeadlines")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n > 0),
     }
 }
 
@@ -544,6 +555,20 @@ mod drain_trigger;
 pub mod supersede;
 
 pub use drain_trigger::{DrainTrigger, IpcDrainTrigger};
+
+/// #8998's unsatisfiable-drain detector. A sibling module for the same two
+/// reasons #8513/#8514 were: this file is over
+/// `.loom/docs/file-size-policy.md`'s threshold, and a state machine whose
+/// whole value is that it terminates belongs next to the tests that prove it.
+pub mod roll_stall;
+/// The loop's resolved knob set, bundled — see the module doc for why a fourth
+/// positional `Duration` was the wrong shape.
+pub mod tuning;
+pub use roll_stall::{
+    resolve_roll_stall_deadlines, RollStallReport, AUTO_UPDATE_ROLL_STALL_DEADLINES_ENV,
+    DEFAULT_ROLL_STALL_DEADLINES,
+};
+pub use tuning::TickTuning;
 
 /// A record of the last artifact this daemon actually installed, persisted so
 /// it survives the restart the roll itself performs.
@@ -1166,6 +1191,11 @@ pub struct AutoUpdateState {
     /// surface — a persistently stale-repo host is stuck exactly as a
     /// terminal/backoff one is, just for a different reason.
     stale_repo: stale_repo::StaleRepoStreak,
+    /// #8998's episode tracker: drain deadlines counted **across** roll
+    /// lifetimes, so a roll that is abandoned and re-armed (or superseded onto a
+    /// newer release, which restarts #6007's paused-dispatch budget) cannot hide
+    /// the fact that its wait condition is unreachable.
+    roll_stall: roll_stall::RollStallTracker,
 }
 
 impl AutoUpdateState {
@@ -1188,6 +1218,32 @@ impl AutoUpdateState {
             artifact_record_path: path,
             ..Self::default()
         }
+    }
+
+    /// Set #8998's unsatisfiability threshold (the resolved
+    /// `rollStallDeadlines` knob). A builder rather than a `new` argument so
+    /// every existing construction site — and every test — keeps the default.
+    #[must_use]
+    pub fn with_roll_stall_deadlines(mut self, deadlines: u32) -> Self {
+        self.roll_stall.set_threshold(deadlines);
+        self
+    }
+
+    /// Whether #8998's episode is running, i.e. whether a tick with no armed
+    /// roll still has to read the in-flight count to advance (or clear) it.
+    fn roll_stall_active(&self) -> bool {
+        self.roll_stall.is_active()
+    }
+
+    /// Fold one tick's view of the armed roll into #8998's tracker. `Some` once
+    /// the roll's wait condition is unsatisfiable.
+    fn observe_roll_stall(
+        &mut self,
+        now: DateTime<Utc>,
+        armed: Option<&supersede::ArmedRoll>,
+        in_flight: usize,
+    ) -> Option<RollStallReport> {
+        self.roll_stall.observe(now, armed, in_flight)
     }
 
     /// Decide this tick, artifact first (Issue #7609).
@@ -1773,6 +1829,38 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
 ) {
     let now = Instant::now();
     let last_check = Utc::now();
+    // Issue #8998: before either cooperating with an armed roll or arming a new
+    // one, ask whether the condition it waits for (in-flight reaches zero) is
+    // reachable at all. The in-flight count is read only when there is an
+    // episode to advance — a roll is armed, or one was declared unsatisfiable
+    // and we are waiting for the host to go quiet — so an ordinary up-to-date
+    // tick pays nothing extra for this.
+    let armed = trigger.armed_roll();
+    if armed.is_some() || state.roll_stall_active() {
+        let stall_in_flight = probe.in_flight_sweeps();
+        if let Some(report) = state.observe_roll_stall(last_check, armed.as_ref(), stall_in_flight)
+        {
+            let note = report.note();
+            log::warn!("auto_update: {note}");
+            // Only ever a roll this loop armed and labelled with an artifact
+            // target. `observe` already refuses to advance — or to re-report — an
+            // episode while a teardown or an untargeted operator drain is armed,
+            // but this is the call that actually reaches `DrainState::abort()`,
+            // so it re-states the ownership test rather than trusting an
+            // invariant asserted one module away. Gating on `armed.is_some()`
+            // instead is what let a latched declaration cancel an operator's
+            // teardown within one tick (the defect PR #9004 shipped first).
+            if armed
+                .as_ref()
+                .is_some_and(|roll| !roll.then_exit && roll.target.is_some())
+            {
+                trigger.abandon_roll(&note);
+            }
+            let armed_artifact = probe.resolve_artifact();
+            status.publish(state.snapshot(true, last_check, note, &armed_artifact));
+            return;
+        }
+    }
     // Issue #6007: cooperate with the drain rather than racing it. A roll that is
     // already armed — including one *retained* across a refused deadline
     // (dispatch paused, restart re-arming itself at quiescence) — needs no second
@@ -1786,7 +1874,7 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
     // artifact — still skips, byte-for-byte as before.
     if trigger.roll_in_progress() {
         let armed_artifact = probe.resolve_artifact();
-        match supersede::decide_armed_roll(trigger.armed_roll().as_ref(), &armed_artifact) {
+        match supersede::decide_armed_roll(armed.as_ref(), &armed_artifact) {
             supersede::ArmedRollAction::Skip(note) => {
                 log::info!("auto_update: {note}");
                 status.publish(state.snapshot(true, last_check, note, &armed_artifact));
@@ -1964,7 +2052,7 @@ fn log_roll_outcome(outcome: &RebuildOutcome, note: &str) {
 
 /// Spawn the **single** process-global auto-update loop on the shared daemon
 /// runtime (Issue #4055). Registers `status` as the process-global so
-/// `loom-daemon status` can render it, then ticks every `interval`, moving the
+/// `loom-daemon status` can render it, then ticks every `tuning.interval`, moving the
 /// per-tick blocking work (git/cargo subprocesses, registry reads) onto
 /// `spawn_blocking` so it never parks a runtime worker.
 ///
@@ -1975,30 +2063,31 @@ pub fn spawn_auto_update_task<P, T>(
     mut probe: P,
     mut trigger: T,
     status: Arc<AutoUpdateStatus>,
-    interval: Duration,
-    settle: Duration,
-    defer_deadline: Duration,
+    tuning: TickTuning,
 ) -> tokio::task::JoinHandle<()>
 where
     P: AutoUpdateProbe + Send + 'static,
     T: DrainTrigger + Send + Sync + 'static,
 {
     register_global_status(status.clone());
-    log::info!(
-        "auto_update: starting loop (interval={}s, settle={}s, deferDeadline={}s)",
-        interval.as_secs(),
-        settle.as_secs(),
-        defer_deadline.as_secs()
-    );
+    log::info!("auto_update: starting loop ({})", tuning.describe());
     tokio::spawn(async move {
-        let mut state = AutoUpdateState::new();
-        let mut ticker = tokio::time::interval(interval);
+        let mut state =
+            AutoUpdateState::new().with_roll_stall_deadlines(tuning.roll_stall_deadlines);
+        let mut ticker = tokio::time::interval(tuning.interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             let status_task = status.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                run_tick(&mut state, &status_task, &mut probe, &trigger, settle, defer_deadline);
+                run_tick(
+                    &mut state,
+                    &status_task,
+                    &mut probe,
+                    &trigger,
+                    tuning.settle,
+                    tuning.defer_deadline,
+                );
                 (state, probe, trigger)
             })
             .await;

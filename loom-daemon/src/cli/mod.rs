@@ -30,6 +30,7 @@ pub(crate) mod health;
 pub(crate) mod inflight;
 pub(crate) mod lease_ensure;
 pub(crate) mod legacy_script_cmds;
+mod merge_pr_delete_branch;
 mod merge_pr_head_sync;
 mod merge_pr_labels;
 mod merge_pr_loom_pr_guard;

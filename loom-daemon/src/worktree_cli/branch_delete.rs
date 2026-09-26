@@ -11,14 +11,35 @@
 //! which can never delete a squash-merged branch (#4889, the exact defect the
 //! rule exists to fix).
 //!
-//! That contraption existed to avoid a *second implementation*. This module is
-//! a second implementation, for now, and that is a deliberate trade with a
-//! stated end state: `merge-pr.sh`'s own port (#8191) imports this module
-//! instead of re-deriving the rule, at which point there is exactly one copy
-//! and no `eval`. Until then the anti-drift guarantee is mechanical, not
-//! aspirational — `tests::messages_match_the_merge_pr_shell_twin` greps the
-//! live `merge-pr.sh` for every message string below and fails if either side
-//! is reworded.
+//! That contraption existed to avoid a *second implementation*. This module
+//! was a second implementation, and #8191 (epic #7810) landing its
+//! `merge-pr.sh` slice is the stated end state: `merge-pr.sh`'s
+//! `_maybe_delete_local_branch` is now a thin call into
+//! `loom-daemon merge-pr delete-branch` (`cli::merge_pr_delete_branch`), which
+//! drives this exact function — one copy, no `eval`. With no second copy
+//! left, the pre-#8191 anti-drift test (which grepped `merge-pr.sh` for every
+//! message string below) became vacuous and was replaced by
+//! `tests::shell_delegates_rather_than_reimplementing`, which guards the
+//! remaining way to drift: the shell regrowing its own copy of the rule.
+//! Operator-visible text is pinned by the retained shell suites
+//! (`test-merge-pr-local-branch-cleanup.sh`,
+//! `test-merge-pr-primary-checkout-advice.sh`) running this code through
+//! the real `merge-pr.sh` wrapper.
+//!
+//! `worktree.sh remove` and `merge-pr.sh` differ in one respect this module
+//! must still account for: `merge-pr.sh` knows the merged PR's `head.sha` and
+//! passes it as a hint to [`branch_landed::probe`]'s live-tip-match rung
+//! (skipping a forge round-trip when the tip already matches); `worktree.sh
+//! remove` never has one. Both are threaded through the same
+//! `expected_head_sha` parameter — `worktree_cli::remove` passes `""`.
+//!
+//! The two callers also log through different channels: `worktree.sh
+//! remove` was replaced wholesale by a Rust verb printing via `Out`'s own
+//! icon/color rendering, while `merge-pr.sh` still runs its own un-iconned
+//! `info`/`warning`/`success` shell functions and its retained test suite
+//! stubs exactly those names. [`maybe_delete_local_branch`] therefore takes
+//! `out: &dyn Sink` (see [`super::wip::Sink`]) rather than a concrete `Out`,
+//! so each caller can replay the same decision through its own logging.
 //!
 //! # The rule
 //!
@@ -34,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::branch_landed::{self, ForgeStatus, Verdict};
-use super::wip::Out;
+use super::wip::Sink;
 
 /// What happened, for the caller's `branchStatus` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,10 +78,18 @@ pub struct DeleteContext<'a> {
     pub cleanup_primary_checkout: bool,
 }
 
-/// `_maybe_delete_local_branch <branch>` with no caller-known merged head SHA
-/// — which is what `worktree.sh remove` always passed: it is not the process
-/// that merged the PR, so it holds no `$PR_HEAD_SHA`.
-pub fn maybe_delete_local_branch(ctx: &DeleteContext, out: &Out, branch: &str) -> BranchOutcome {
+/// `_maybe_delete_local_branch <branch> [expected_head_sha]`.
+///
+/// `expected_head_sha` is the merged PR's `head.sha`, when the caller has one
+/// (only `merge-pr.sh` does — `worktree.sh remove` is not the process that
+/// merged the PR, so it always passes `""`). A tip matching it is landed with
+/// no forge round-trip; see [`branch_landed::probe`].
+pub fn maybe_delete_local_branch(
+    ctx: &DeleteContext,
+    out: &dyn Sink,
+    branch: &str,
+    expected_head_sha: &str,
+) -> BranchOutcome {
     if branch.is_empty() {
         return BranchOutcome::Kept;
     }
@@ -83,7 +112,7 @@ pub fn maybe_delete_local_branch(ctx: &DeleteContext, out: &Out, branch: &str) -
         return BranchOutcome::Kept;
     }
 
-    let landed = branch_landed::probe(ctx.repo_root, branch, ctx.default_branch, "");
+    let landed = branch_landed::probe(ctx.repo_root, branch, ctx.default_branch, expected_head_sha);
 
     // Fail closed: ONLY a `landed` verdict force-deletes. `not-landed` and
     // `unknown` both keep `git branch -d`, which still deletes a branch git
@@ -159,7 +188,7 @@ pub fn is_checked_out_refusal(git_stderr: &str) -> bool {
 /// exist for the primary checkout.
 fn handle_checked_out(
     ctx: &DeleteContext,
-    out: &Out,
+    out: &dyn Sink,
     branch: &str,
     flag: &str,
     safety_note: &str,
