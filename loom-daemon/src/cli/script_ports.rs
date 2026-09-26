@@ -248,6 +248,15 @@ pub(crate) enum ScriptPortCommand {
     /// resolved, 1 no manifest reachable (soft), 78 (`EX_CONFIG`) malformed
     /// manifest or an unrecognized `launch` key.
     RuntimeLaunchEnv(super::runtime_launch_cmd::RuntimeLaunchEnvArgs),
+
+    /// The fleet-wide `loom:blocked` re-check (#8927): every open
+    /// `loom:blocked` issue whose cited blocker has since closed/merged (a
+    /// stale block), plus every one carrying the label with no parseable
+    /// blocker reference at all (an undocumented block). The fourth pre-wave
+    /// advisory check, backing `check-stale-blocked.sh`. Strictly read-only,
+    /// **always exit 0** — it reports, it never relabels. Not a port: brand-new
+    /// logic, native from the start per the shell-language policy.
+    CheckStaleBlocked(super::stale_blocked::StaleBlockedArgs),
 }
 
 impl ScriptPortCommand {
@@ -288,6 +297,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
+            ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
         }
     }
 }

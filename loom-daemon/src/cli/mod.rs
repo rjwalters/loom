@@ -58,6 +58,7 @@ pub(crate) mod script_ports;
 pub(crate) mod serve_cmd;
 mod shell_budget;
 mod skip_labels;
+mod stale_blocked;
 pub(crate) mod stashes;
 pub(crate) mod stats;
 pub(crate) mod status;

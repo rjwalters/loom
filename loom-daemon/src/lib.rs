@@ -249,6 +249,7 @@ pub mod self_update;
 pub mod serve;
 pub mod shell_budget;
 pub mod short_hash;
+pub mod stale_blocked;
 pub mod startup_adoption;
 pub mod stash_retirement;
 /// Root-count-aware cost model for `build_daemon_status` and the `status`/
