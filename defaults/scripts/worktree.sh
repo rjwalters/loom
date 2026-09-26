@@ -1476,13 +1476,6 @@ if [[ -d "$WORKTREE_PATH" ]]; then
 
     # Check if it's registered with git
     if git worktree list | grep -q "$WORKTREE_PATH"; then
-        # Check if worktree is stale: no commits ahead of the base and behind it.
-        # For a stacked child (--base), staleness is measured against the parent
-        # branch (BASE_REF), not the default branch (#3729).
-        local_commits_ahead=$(git -C "$WORKTREE_PATH" rev-list --count "$BASE_REF..HEAD" 2>/dev/null) || local_commits_ahead="0"
-        local_commits_behind=$(git -C "$WORKTREE_PATH" rev-list --count "HEAD..$BASE_REF" 2>/dev/null) || local_commits_behind="0"
-        local_uncommitted=$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null) || local_uncommitted=""
-
         # #6257: this "worktree directory + branch already registered with
         # git" fast path is a completely different code path from the
         # "local branch exists, no worktree dir yet" reuse path below
@@ -1491,9 +1484,26 @@ if [[ -d "$WORKTREE_PATH" ]]; then
         # tracking was silently "preserved" (below) and handed straight to a
         # Judge/Doctor session with no signal that it no longer matched the
         # branch's actual pushed tip. Correct/report drift against the
-        # branch's OWN upstream (not just BASE_REF, computed above) before
-        # deciding whether to preserve.
+        # branch's OWN upstream before deciding whether to preserve.
         git -C "$WORKTREE_PATH" fetch origin "$BRANCH_NAME" 2>/dev/null || true
+
+        # #8287: the staleness reference — and the reset target below — is
+        # origin/$BRANCH_NAME whenever it exists and has not already landed
+        # as a merged PR (#5657 skip); otherwise it's BASE_REF, exactly as
+        # before. For a stacked child (--base) with no live remote branch,
+        # that's the parent branch, not the default branch (#3729). See
+        # `_worktree_resolve_stale_reset_ref` in lib/worktree-forge-pr-check.sh
+        # for the full rationale.
+        stale_ref="$BASE_REF"
+        stale_display="$BASE_DISPLAY"
+        if _worktree_resolve_stale_reset_ref "$WORKTREE_PATH" "$BRANCH_NAME" "$DEFAULT_BRANCH"; then
+            stale_ref="$_WT_STALE_RESET_REF"
+            stale_display="$_WT_STALE_RESET_REF"
+        fi
+        local_commits_ahead=$(git -C "$WORKTREE_PATH" rev-list --count "$stale_ref..HEAD" 2>/dev/null) || local_commits_ahead="0"
+        local_commits_behind=$(git -C "$WORKTREE_PATH" rev-list --count "HEAD..$stale_ref" 2>/dev/null) || local_commits_behind="0"
+        local_uncommitted=$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null) || local_uncommitted=""
+
         if git -C "$WORKTREE_PATH" show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
             wt_current_upstream="$(git -C "$WORKTREE_PATH" rev-parse --abbrev-ref "$BRANCH_NAME@{u}" 2>/dev/null || true)"
             if [[ "$wt_current_upstream" != "origin/$BRANCH_NAME" ]]; then
@@ -1536,7 +1546,7 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             if [[ "$JSON_OUTPUT" != "true" ]]; then
                 print_info "Worktree is registered with git"
                 if [[ "$local_commits_ahead" -gt 0 ]]; then
-                    print_info "Worktree has $local_commits_ahead commit(s) ahead of main - preserving existing work"
+                    print_info "Worktree has $local_commits_ahead commit(s) ahead of $stale_display - preserving existing work"
                 elif [[ -n "$local_uncommitted" ]]; then
                     print_info "Worktree has uncommitted changes - preserving existing work"
                 fi
@@ -1548,8 +1558,8 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             # Stale worktree: no commits ahead, no uncommitted changes
             # Reset in place instead of removing (avoids CWD corruption)
             if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Stale worktree detected (0 commits ahead, $local_commits_behind behind $BASE_DISPLAY, no uncommitted changes)"
-                print_info "Resetting worktree in place to $BASE_DISPLAY..."
+                print_warning "Stale worktree detected (0 commits ahead, $local_commits_behind behind $stale_display, no uncommitted changes)"
+                print_info "Resetting worktree in place to $stale_display..."
             fi
 
             # Back-fill/refresh the Loom sentinel on both reset outcomes: the
@@ -1562,11 +1572,13 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             # process) can have landed new commits or foreign uncommitted
             # tracked changes into this worktree in the interim. Rescue/refuse
             # instead of silently discarding them (see lib/worktree-race-rescue.sh
-            # for the full design decision).
-            if git -C "$WORKTREE_PATH" fetch origin "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null && \
-               loom_worktree_reset_or_rescue "$WORKTREE_PATH" "$BASE_REF" "issue-$ISSUE_NUMBER-stale-worktree-reset"; then
+            # for the full design decision). $stale_ref's own remote was
+            # already fetched above when it's origin/$BRANCH_NAME (#8287); the
+            # BASE_REF fallback case still needs its own fetch here.
+            if { [[ "$stale_ref" != "$BASE_REF" ]] || git -C "$WORKTREE_PATH" fetch origin "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null; } && \
+               loom_worktree_reset_or_rescue "$WORKTREE_PATH" "$stale_ref" "issue-$ISSUE_NUMBER-stale-worktree-reset"; then
                 if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_success "Stale worktree reset to $BASE_DISPLAY"
+                    print_success "Stale worktree reset to $stale_display"
                     echo ""
                     print_info "To use this worktree: cd $WORKTREE_PATH"
                 fi
