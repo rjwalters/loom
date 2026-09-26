@@ -381,17 +381,6 @@ fn job_spans_parent_to_their_run_span_in_one_trace() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn derived_ci_ids_are_unchanged_by_the_shared_derivation() {
-    // Pinned from the pre-#9038 private derivation: CI trace ids must not move.
-    let run = super::records::run_context("2AMLogic/loom", 42, 1);
-    assert_eq!(run.trace_id.as_str(), "3468ca8ebf11663d1c7bc17c8cdbbe5a");
-    assert_eq!(run.span_id.as_str(), "566ba435fd9bed16");
-    let job = super::records::job_context("2AMLogic/loom", 42, 1, 7);
-    assert_eq!(job.trace_id, run.trace_id);
-    assert_eq!(job.span_id.as_str(), "47ab46a6e7148128");
-}
-
-#[test]
 fn second_once_over_the_same_fixture_emits_zero_records() {
     let dir = TempDir::new().unwrap();
     let api = FixtureApi::new();

@@ -66,6 +66,18 @@ fn story_context_is_derived_from_the_issue_alone() {
 }
 
 #[test]
+fn derived_ci_ids_are_unchanged_by_the_shared_derivation() {
+    use crate::ci_telemetry::records::{job_context, run_context};
+    // Pinned from the pre-#9038 private CI derivation: CI trace ids must not move.
+    let run = run_context("2AMLogic/loom", 42, 1);
+    assert_eq!(run.trace_id.as_str(), "3468ca8ebf11663d1c7bc17c8cdbbe5a");
+    assert_eq!(run.span_id.as_str(), "566ba435fd9bed16");
+    let job = job_context("2AMLogic/loom", 42, 1, 7);
+    assert_eq!(job.trace_id, run.trace_id);
+    assert_eq!(job.span_id.as_str(), "47ab46a6e7148128");
+}
+
+#[test]
 fn story_executions_share_the_story_trace_with_distinct_roots() {
     let dir = tempfile::tempdir().unwrap();
     let store = TraceStore::new(dir.path());
