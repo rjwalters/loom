@@ -168,6 +168,7 @@ fn host_health() -> TelemetryRecord {
         admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     })
 }
 

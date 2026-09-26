@@ -256,17 +256,28 @@ for logs, #8825) has merged and the SigNoz trial is confirmed receiving:
    entry `{ "kind": "otlp", "endpoint": "<gateway>" }` per
    [`observability.md`](observability.md) §3, confirmed healthy with
    `loom-daemon status --json | jq -e '.observability_exports.otlp.state == "healthy"'`.
-2. Enable the poller with `autonomous.ciTelemetry.enabled = true` (FLAGS-OFF
+2. **Declare the fleet captain** in the tracked `.loom/config.json`:
+   `"fleet": { "captain": "<host id>" }`, naming the one host that polls (its
+   `loom-daemon` host identity: `$LOOM_HOST_ID`, else the hostname). **This is
+   required on every deployment, a single-host setup included.** With no
+   captain declared the daemon poller is refused on every host (#8901,
+   #9014).
+3. Enable the poller with `autonomous.ciTelemetry.enabled = true` (FLAGS-OFF
    by default; `LOOM_CI_TELEMETRY_*` env overrides, **env > config >
    default**). Log capture is a separate gate (`logCaptureEnabled`, phase 2).
-3. Confirm with `loom-daemon ci-telemetry status` — it distinguishes
-   never-polled, last-ok + age, and failing + last error, so silence never
-   reads as healthy.
+4. Confirm with `loom-daemon ci-telemetry status`. It distinguishes
+   never-polled, last-ok + age, failing + last error, and **refused** + the
+   fleet-captain reason, so silence never reads as healthy. A refusal for
+   want of a captain also turns `loom-daemon health`'s `ci_telemetry` section
+   non-green and lists `ci-telemetry-poll` in `host.health`'s
+   `captainless_singleton_jobs` (#9014).
 
-**One poller is the normal case.** Records carry stable `run_id`/`job_id`
-identities so a second poller on another host is deduplicable downstream, but
-there is no per-repo lease protocol and none should be invented (one mechanism
-per behaviour). Pick one fleet host to run capture.
+**One poller is the normal case, and the captain is how it is picked.**
+Records carry stable `run_id`/`job_id` identities so a transient second
+poller is deduplicable downstream, but there is no per-repo lease protocol
+and none should be invented (one mechanism per behaviour). The host named in
+`fleet.captain` runs capture. Every other host reads `refused` (another host
+is the captain), which is routine and stays green in `health`.
 
 **Destination.** The self-hosted SigNoz trial is the destination. SigNoz Cloud
 remains optional — swapping only the gateway's exporter endpoint, per the
@@ -417,9 +428,13 @@ gitignored.
   (`fleet_captain`, [Fleet captain (#8848)](daemon-reference.md#fleet-captain-8848)):
   every tick re-evaluates `fleet_captain::arm_singleton_job("ci-telemetry-poll",
   …)` and skips the cycle entirely when this host is not the declared
-  `fleet.captain`. **A multi-host fleet with `autonomous.ciTelemetry.enabled`
-  must declare `fleet.captain` naming one host, or the poller runs nowhere**
-  (fail-closed, per the gate's own contract) — this replaced the earlier
+  `fleet.captain`. **Any host with `autonomous.ciTelemetry.enabled`, a
+  single-host setup included, needs `fleet.captain` declared naming one host,
+  or the poller runs nowhere** (fail-closed, per the gate's own contract; the
+  #8901 note said "multi-host fleet" only, corrected by #9014). The refusal is
+  recorded as `ci-telemetry status` state `refused` with the gate's reason,
+  and surfaced in `host.health` / `loom-daemon health` (see
+  [Rollout](#rollout)). This replaced the earlier
   "runs on every host, dedup by stable identity" posture, since duplicate
   polling wastes GitHub API budget `N`×over for no benefit once exactly one
   host can be assigned. Every record still carries stable identities

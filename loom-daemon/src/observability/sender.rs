@@ -206,6 +206,7 @@ mod tests {
                 admission_brake: None,
                 is_captain: None,
                 armed_singleton_jobs: Vec::new(),
+                captainless_singleton_jobs: Vec::new(),
             }),
         )
     }

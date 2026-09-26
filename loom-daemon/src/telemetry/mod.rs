@@ -1210,6 +1210,14 @@ pub struct HostHealthRecord {
     /// backward-compatibility contract `active_sweep_ids` established.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub armed_singleton_jobs: Vec<String>,
+    /// Declared-singleton-job names refused on this host because **no**
+    /// `fleet.captain` is declared at all (Issue #9014), from
+    /// [`crate::fleet_captain::captainless_singleton_job_names`]. Such a job
+    /// runs nowhere; before this field the only trace was a daemon-log WARN.
+    /// A not-this-host refusal is routine and is not listed. Omitted when
+    /// empty; a pre-#9014 record decodes as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captainless_singleton_jobs: Vec<String>,
 }
 
 /// One repository this host's daemon is currently managing (Issue #4976) —

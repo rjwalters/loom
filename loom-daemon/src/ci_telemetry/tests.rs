@@ -6,6 +6,7 @@
 //! [`job_logs`] module (named to leave `logs::` resolving to
 //! `ci_telemetry::logs`, the module under test).
 
+mod captain_gate;
 mod credential_rejection;
 mod job_logs;
 mod join_keys;
