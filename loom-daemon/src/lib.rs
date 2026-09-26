@@ -208,6 +208,7 @@ pub mod metrics_collector;
 pub mod observability;
 pub mod opencode_usage;
 pub mod orphan_process_reaper;
+pub mod park_record;
 pub mod peer_claims;
 pub mod phase_join;
 pub mod pi_usage;

@@ -1,0 +1,327 @@
+//! The **park record** — the machine-readable `loom:blocked` marker (#8925).
+//!
+//! # The defect this closes
+//!
+//! `loom:blocked` says "waiting on a dependency". Nothing said *which*
+//! dependency in a form a machine can read. Every role that applies the label
+//! writes its reasoning as prose, in a **comment**, and prose in a comment is
+//! not a declaration:
+//!
+//! - PR #8314 was parked on #8322 by a Doctor stand-down whose only record was
+//!   *"filed #8322 to track it, standing down"*. Correct reasoning, 155h parked,
+//!   invisible to every automated lane.
+//! - Issue #8852 was parked on #8860. #8860 closed; #8852 stayed parked. Every
+//!   other gate would have passed — the blocker was only ever stated in a
+//!   Curator comment as *"**Phase 2** (follow-up, after #8860 lands)"*.
+//!
+//! A park record is the fix: one line, in the **artifact body**, naming one
+//! blocker.
+//!
+//! # The grammar
+//!
+//! ```text
+//! <!-- loom:park Blocked by: #8322 by=doctor at=2026-09-19T12:09:00Z reason="needs an architecture ruling" -->
+//! ```
+//!
+//! - `<!-- loom:park ` … ` -->` — an HTML comment, so it renders invisibly, and
+//!   a **sentinel** that distinguishes a declaration from prose that merely
+//!   *mentions* a blocker. Same pattern, and same reason, as the lease record
+//!   (`<!-- loom:lease host=… sweep=… -->`, `defaults/docs/lease-record.md`) and
+//!   the verdict-SHA / `loom:ac-verified` markers.
+//! - `Blocked by: #N` — **deliberately the existing vocabulary**, not a new one.
+//!   [`crate::dep_recheck::extract::DEPENDENCY_PHRASES`] already matches
+//!   `Blocked by`, as do `guide.md`'s `parse_dependencies`,
+//!   `warn-operator-gated.sh` and `detect-dependency-cycle.sh`. So a park record
+//!   is readable by **every parser already in the fleet** the moment it is
+//!   written, and this module adds no second dependency vocabulary. The test
+//!   suite asserts that round trip rather than trusting it.
+//! - `by=<role>` / `at=<RFC3339>` — provenance, so a park can be attributed and
+//!   aged without reading the comment trail.
+//! - `reason="…"` — optional free text, quoted so it can contain spaces.
+//!
+//! # Why one record per blocker, and not a comma-separated list
+//!
+//! Not cosmetic — it is forced by the parsers this format promises to be
+//! compatible with, which do **not** agree on multi-reference lines:
+//!
+//! | Parser | `Blocked by: #1, #2` yields |
+//! |---|---|
+//! | `guide.md`'s two-stage `parse_dependencies` (#4508) | `1`, `2` |
+//! | [`crate::dep_recheck::extract`] (one regex, one capture group) | `1` only |
+//!
+//! The second is the parser `check-stale-blocked` and `curator.md`'s premise
+//! re-check actually run, so a comma-separated record would silently declare
+//! only its **first** blocker — a park that clears while a real blocker is still
+//! open. Emitting one record per blocker is readable identically by both, needs
+//! no change to either, and gives each blocker its own provenance. [`parse`]
+//! stays tolerant of a hand-written multi-reference marker by expanding it into
+//! one record per reference.
+//!
+//! # Why the reason is stripped before blockers are extracted
+//!
+//! A reason is prose written by an agent, and prose mentions issue numbers
+//! ("compounded by the #8940 dispatch bug"). Extracting `#N` from the whole
+//! marker would silently promote such a mention to a *declared blocker* — a park
+//! that never clears because one of its "blockers" was never a blocker.
+//! [`parse`] removes the quoted reason span first, then extracts.
+//!
+//! # What this module does not do
+//!
+//! It never reads the forge and never writes a label. Rendering is for the role
+//! applying a park; parsing is for whoever later asks whether the park still
+//! holds ([`crate::stale_blocked`]). The full convention, including what each
+//! role must write, is `defaults/docs/park-record.md`.
+
+use regex::Regex;
+use std::collections::BTreeSet;
+use std::sync::OnceLock;
+
+/// The opening sentinel. A body containing this substring carries a park record
+/// (or an attempt at one — [`parse`] decides).
+pub const MARKER_OPEN: &str = "<!-- loom:park ";
+
+/// The closing sentinel.
+pub const MARKER_CLOSE: &str = "-->";
+
+/// The dependency phrase a rendered record always uses, chosen because every
+/// existing parser in the fleet already matches it. Changing it is a fleet-wide
+/// compatibility break, not a formatting preference.
+pub const RENDERED_PHRASE: &str = "Blocked by:";
+
+/// What a record with no stated blocker renders in place of a reference.
+///
+/// A record is still worth writing without one: it declares "parked, blocker
+/// unstated", which is attributable and dated, unlike silence. No parser
+/// extracts a reference from it, which is correct — there is none.
+pub const UNSTATED: &str = "(unstated)";
+
+/// One park record: one declared blocker, with the provenance of the park.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParkRecord {
+    /// The declared blocker. `None` is an explicit "blocker unstated".
+    pub blocker: Option<u64>,
+    /// `by=` — the role or identity that applied the park.
+    pub by: Option<String>,
+    /// `at=` — when, as written. Never re-derived: a timestamp inside text is
+    /// evidence of intent, not a liveness signal (see `lease-record.md`).
+    pub at: Option<String>,
+    /// `reason="…"` — free text, already unescaped.
+    pub reason: Option<String>,
+}
+
+/// `<!-- loom:park …( -->)` spans, captured lazily.
+///
+/// Non-greedy up to the first `-->`, which is exact rather than approximate: an
+/// HTML comment cannot contain `--`, so the first `-->` after the sentinel is
+/// always this comment's own terminator. [`sanitize_reason`] is what keeps a
+/// rendered record inside that rule.
+fn marker_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?s)<!--\s*loom:park\s+(.*?)-->").expect("static park-marker pattern")
+    })
+}
+
+/// `reason="…"`, non-greedy so a later `"` on the same line cannot swallow the
+/// rest of the marker.
+fn reason_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"reason="([^"]*)""#).expect("static park-reason pattern"))
+}
+
+/// `key=value` for the unquoted provenance attributes.
+fn attr_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b(by|at)=([^\s]+)").expect("static park-attr pattern"))
+}
+
+/// Every `#N`.
+fn ref_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"#([0-9]+)").expect("static park-ref pattern"))
+}
+
+/// Whether `text` carries at least one park record.
+///
+/// Deliberately keyed on [`parse`] rather than on the sentinel substring: a
+/// truncated `<!-- loom:park` with no terminator is not a record, and treating
+/// it as one would report a park as documented when nothing can read it.
+#[must_use]
+pub fn has_record(text: &str) -> bool {
+    !parse(text).is_empty()
+}
+
+/// Every park record in `text`, in document order, one per declared blocker.
+///
+/// More than one is legitimate and expected: a multi-blocker park is written as
+/// several records, and a second park applied later (by a different role, for a
+/// different blocker) appends its own rather than editing someone else's.
+#[must_use]
+pub fn parse(text: &str) -> Vec<ParkRecord> {
+    marker_re()
+        .captures_iter(text)
+        .filter_map(|c| c.get(1))
+        .flat_map(|m| parse_inner(m.as_str()))
+        .collect()
+}
+
+/// Parse one marker's interior (everything between the sentinels) into one
+/// record per reference it names — or exactly one `blocker: None` record when it
+/// names none.
+fn parse_inner(inner: &str) -> Vec<ParkRecord> {
+    let reason = reason_re()
+        .captures(inner)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string());
+
+    // Strip the quoted reason span BEFORE extracting references — see the module
+    // docs: a `#N` inside prose is a mention, never a declaration.
+    let without_reason = reason_re().replace_all(inner, "");
+
+    let mut by = None;
+    let mut at = None;
+    for c in attr_re().captures_iter(&without_reason) {
+        let (Some(k), Some(v)) = (c.get(1), c.get(2)) else {
+            continue;
+        };
+        match k.as_str() {
+            "by" => by = Some(v.as_str().to_string()),
+            "at" => at = Some(v.as_str().to_string()),
+            _ => {}
+        }
+    }
+
+    let refs: Vec<u64> = ref_re()
+        .captures_iter(&without_reason)
+        .filter_map(|c| c.get(1)?.as_str().parse().ok())
+        .collect();
+
+    let template = ParkRecord {
+        blocker: None,
+        by,
+        at,
+        reason,
+    };
+
+    if refs.is_empty() {
+        return vec![template];
+    }
+
+    // Deduplicate within one marker while keeping first-seen order, so a
+    // hand-written `#9, #9` does not become two records.
+    let mut seen = BTreeSet::new();
+    refs.into_iter()
+        .filter(|n| seen.insert(*n))
+        .map(|n| ParkRecord {
+            blocker: Some(n),
+            ..template.clone()
+        })
+        .collect()
+}
+
+/// The union of every record's declared blockers, ascending and deduplicated.
+#[must_use]
+pub fn blockers(text: &str) -> Vec<u64> {
+    let set: BTreeSet<u64> = parse(text).into_iter().filter_map(|r| r.blocker).collect();
+    set.into_iter().collect()
+}
+
+/// Render one park record as the one line a role writes into the artifact body.
+#[must_use]
+pub fn render(record: &ParkRecord) -> String {
+    let reference = match record.blocker {
+        Some(n) => format!("#{n}"),
+        None => UNSTATED.to_string(),
+    };
+
+    let mut out = format!("{MARKER_OPEN}{RENDERED_PHRASE} {reference}");
+    if let Some(by) = &record.by {
+        out.push_str(&format!(" by={}", sanitize_attr(by)));
+    }
+    if let Some(at) = &record.at {
+        out.push_str(&format!(" at={}", sanitize_attr(at)));
+    }
+    if let Some(reason) = &record.reason {
+        let clean = sanitize_reason(reason);
+        if !clean.is_empty() {
+            out.push_str(&format!(" reason=\"{clean}\""));
+        }
+    }
+    out.push_str(&format!(" {MARKER_CLOSE}"));
+    out
+}
+
+/// Render a whole park — one line per blocker, newline-joined, no trailing
+/// newline. An empty `blockers` list renders the single `(unstated)` record.
+#[must_use]
+pub fn render_park(
+    blockers: &[u64],
+    by: Option<&str>,
+    at: Option<&str>,
+    reason: Option<&str>,
+) -> String {
+    let template = ParkRecord {
+        blocker: None,
+        by: by.map(str::to_string),
+        at: at.map(str::to_string),
+        reason: reason.map(str::to_string),
+    };
+    if blockers.is_empty() {
+        return render(&template);
+    }
+    let mut seen = BTreeSet::new();
+    blockers
+        .iter()
+        .filter(|n| seen.insert(**n))
+        .map(|n| {
+            render(&ParkRecord {
+                blocker: Some(*n),
+                ..template.clone()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Collapse an unquoted attribute value to a single whitespace-free token.
+///
+/// `by=` / `at=` are parsed as "up to the next space", so a value containing one
+/// would silently truncate. Whitespace becomes `_`; `"` and any `-` run that
+/// could terminate the comment are removed by [`strip_comment_hazards`].
+fn sanitize_attr(value: &str) -> String {
+    let joined = value.split_whitespace().collect::<Vec<_>>().join("_");
+    strip_comment_hazards(&joined).replace('"', "")
+}
+
+/// Make a free-text reason safe to embed: one line, no `"`, no `--`.
+///
+/// An HTML comment cannot contain `--`, so a reason quoting a CLI flag
+/// (`--force`) would terminate the marker early and leave the rest of the reason
+/// as visible body text — corrupting both the record and the artifact. Rather
+/// than escape it (there is no escape inside an HTML comment), the hazard is
+/// removed.
+fn sanitize_reason(reason: &str) -> String {
+    let one_line = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    strip_comment_hazards(&one_line).replace('"', "'")
+}
+
+/// Collapse every run of two or more `-` to a single `-`.
+fn strip_comment_hazards(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = false;
+    for ch in s.chars() {
+        if ch == '-' {
+            if prev_dash {
+                continue;
+            }
+            prev_dash = true;
+        } else {
+            prev_dash = false;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests;

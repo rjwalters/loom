@@ -286,6 +286,15 @@ pub(crate) enum ScriptPortCommand {
     /// Read-only; it never writes a label or a comment. Not a port: brand-new
     /// logic, native from the start per the shell-language policy.
     PrLatency(super::pr_latency_cmd::PrLatencyArgs),
+
+    /// Render and read the `loom:blocked` **park record** (#8925) — the
+    /// machine-readable `<!-- loom:park Blocked by: #N … -->` marker a role
+    /// writes into an artifact body when it applies the label. `render` is what
+    /// keeps the format from drifting when an LLM copies it out of prose;
+    /// `parse` is its inverse for a shell caller. Pure — no forge read, no label
+    /// write. See `defaults/docs/park-record.md`.
+    #[command(subcommand)]
+    ParkRecord(super::park_record::ParkRecordCommand),
 }
 
 impl ScriptPortCommand {
@@ -330,6 +339,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
+            ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
         }
     }
 }
