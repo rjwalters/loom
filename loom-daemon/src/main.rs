@@ -1940,6 +1940,33 @@ enum ForgeAction {
         timeout: Option<u64>,
     },
 
+    /// Disarm GitHub's server-side auto-merge on a PR. Safe to call anywhere a
+    /// review verdict is invalidated.
+    ///
+    /// The inverse of `auto-merge`, and deliberately NOT operator-only: it can
+    /// only turn a queued merge OFF, never on, so there is no state in which
+    /// calling it makes an unreviewed merge more likely.
+    ///
+    /// WHY IT EXISTS (#8900): an armed auto-merge is gated only by the branch
+    /// ruleset's REQUIRED checks. Clearing `loom:pr` for a head move does not
+    /// disarm it, so the queued merge fires as soon as required checks pass on
+    /// the NEW, unreviewed head — bypassing `loom:pr`, the non-required suites,
+    /// and the #8248 required-check-freshness guard (which lives inside
+    /// `merge-pr.sh`). #8694 merged that way on 2026-09-25, three minutes after
+    /// a rebase force-push, still labeled `loom:review-requested`.
+    ///
+    /// Prints `DISARMED=1` (an arm was disabled) or `DISARMED=0` (nothing was
+    /// armed — no mutation sent) and exits 0 for both; exits 1 when the arm
+    /// state could not be read or the mutation failed (treat as possibly still
+    /// armed, never as an all-clear); exits 3 on Gitea, which has no
+    /// server-side arm to disable.
+    #[command(name = "disable-auto-merge")]
+    DisableAutoMerge {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+    },
+
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should use,
     /// replacing its old unconditional `forge_detect_merge_method` call.

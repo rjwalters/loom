@@ -561,6 +561,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             method,
             expected_head_sha,
         },
+        ForgeAction::DisableAutoMerge { pr_number } => ForgeCmd::DisableAutoMerge { pr: pr_number },
         ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
     };
     dispatch(cmd)

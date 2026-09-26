@@ -98,6 +98,10 @@ trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 #                                              (fails if comment-fail-<N> exists)
 #   gh pr edit <N> ...                      -> append to $STUB_DIR/edit-writes.log
 #                                              (fails if edit-fail-<N> exists)
+#   gh api graphql -f query=... -F ...      -> append to $STUB_DIR/graphql-writes.log
+#                                              (fails if graphql-fail exists) — the
+#                                              #8900 disablePullRequestAutoMerge
+#                                              mutation
 cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
@@ -144,6 +148,15 @@ case "$1" in
     ;;
   api)
     path="$2"
+    if [[ "$path" == "graphql" ]]; then
+      printf 'GRAPHQL %s\n' "$*" >> "$STUB_DIR_FROM_ENV/graphql-writes.log"
+      if [[ -f "$STUB_DIR_FROM_ENV/graphql-fail" ]]; then
+        echo "stub gh: GraphQL: Resource not accessible by integration (disablePullRequestAutoMerge)" >&2
+        exit 1
+      fi
+      echo '{"data":{"disablePullRequestAutoMerge":{"pullRequest":{"number":0,"autoMergeRequest":null}}}}'
+      exit 0
+    fi
     if [[ "$path" == repos/*/issues/*/comments ]]; then
       num="${path#repos/*/issues/}"
       num="${num%/comments}"
@@ -207,6 +220,26 @@ pr_json_no_state() {
     printf '{"headRefOid":"%s","labels":[%s]}' "$sha" "$(labels_json "$@")" > "$STUB_DIR/pr-$num.json"
 }
 
+pr_json_armed() {
+    # pr_json_armed <pr-number> <head-sha> [label ...] — an OPEN, unmerged PR
+    # that ALSO has GitHub's server-side auto-merge armed (#8900): the `id`
+    # (GraphQL node id) and non-null `autoMergeRequest` shape real
+    # `gh pr view --json id,autoMergeRequest` returns. This is #8694's exact
+    # shape — auto-squash armed 2026-09-22, head moved by a later force-push.
+    local num="$1" sha="$2"; shift 2
+    printf '{"headRefOid":"%s","state":"OPEN","labels":[%s],"id":"PR_kwDOQAPbH88AAAABEp4dZw","autoMergeRequest":{"mergeMethod":"SQUASH","enabledAt":"2026-09-22T22:09:18Z","enabledBy":{"login":"app/loom-fleet-dispatch","is_bot":true}}}' \
+        "$sha" "$(labels_json "$@")" > "$STUB_DIR/pr-$num.json"
+}
+
+pr_json_unarmed() {
+    # pr_json_unarmed <pr-number> <head-sha> [label ...] — the common case real
+    # `gh` returns for a PR with nothing armed: `id` present, `autoMergeRequest`
+    # explicitly null.
+    local num="$1" sha="$2"; shift 2
+    printf '{"headRefOid":"%s","state":"OPEN","labels":[%s],"id":"PR_kwDOQAPbH88AAAABEp4dZw","autoMergeRequest":null}' \
+        "$sha" "$(labels_json "$@")" > "$STUB_DIR/pr-$num.json"
+}
+
 pr_json_state_no_merged() {
     # pr_json_state_no_merged <pr-number> <head-sha> <state> [label ...] — the
     # REAL shape `gh pr view --json headRefOid,state,labels` returns: `state` is
@@ -234,6 +267,7 @@ reset_state() {
     rm -f "$STUB_DIR"/pr-view-stderr-* "$STUB_DIR"/comments-stderr-*
     rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR"/edit-fail-*
     rm -f "$STUB_DIR"/comment-writes.log "$STUB_DIR"/edit-writes.log
+    rm -f "$STUB_DIR"/graphql-writes.log "$STUB_DIR"/graphql-fail
 }
 
 run_guard() {
@@ -242,6 +276,7 @@ run_guard() {
     ERR="$(cat "$STUB_DIR/stderr.log" 2>/dev/null || true)"
     WRITES="$(cat "$STUB_DIR/edit-writes.log" 2>/dev/null || true)"
     COMMENTS_POSTED="$(cat "$STUB_DIR/comment-writes.log" 2>/dev/null || true)"
+    GRAPHQL="$(cat "$STUB_DIR/graphql-writes.log" 2>/dev/null || true)"
 }
 
 get_field() {
@@ -782,6 +817,156 @@ run_guard 237 --clear
 assert_eq "14" "$RC" "(p11) state=CLOSED with no merged key -> exit 14"
 assert_contains "$OUT" "closed without merging" "(p11) REASON still distinguishes an abandoned PR"
 assert_eq "" "$WRITES" "(p11) No label writes on a closed PR"
+
+# --- #8900: clearing a stale verdict must DISARM the forge's auto-merge -----
+#
+# The gap this closes: clearing `loom:pr` is a label write, and GitHub's armed
+# auto-merge queue does not read labels. It is gated ONLY by the branch
+# ruleset's REQUIRED checks, so it merged the new, unreviewed head the moment
+# those went green — right past this guard's clearing, past the non-required
+# suites, and past merge-pr.sh's #8248 required-check-freshness guard (which
+# only runs inside merge-pr.sh). On 2026-09-25 #8694 merged as 528f2971 three
+# minutes after a Doctor rebase force-push, still labeled
+# `loom:review-requested`, with no approval at the merged head; #8847 and #8843
+# merged ~2 minutes after `gh pr update-branch` moved their heads.
+
+# (q) THE #8694 REGRESSION: an approving verdict at SHA_A, head force-pushed to
+#     SHA_B, and a server-side auto-merge armed. --clear must send
+#     disablePullRequestAutoMerge (addressed by the PR's node id from the SAME
+#     `gh pr view` snapshot), report AUTO_MERGE_DISARMED=1, and say so in the
+#     audit comment — on top of the label flip it already did.
+reset_state
+pr_json_armed 240 "$SHA_B" "loom:pr"
+{ echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-240.json"
+run_guard 240 --clear
+assert_eq "12" "$RC" "(q) Stale approval with auto-merge armed -> exit 12"
+assert_eq "1" "$(get_field "$OUT" CLEARED)" "(q) Verdict still cleared"
+assert_eq "1" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q) AUTO_MERGE_DISARMED=1"
+assert_contains "$GRAPHQL" "disablePullRequestAutoMerge" "(q) The disable mutation was sent"
+assert_not_contains "$GRAPHQL" "enablePullRequestAutoMerge" "(q) It is the DISABLE mutation, not the arm"
+assert_contains "$GRAPHQL" "pullRequestId=PR_kwDOQAPbH88AAAABEp4dZw" "(q) Mutation uses the node id from the same snapshot"
+assert_contains "$COMMENTS_POSTED" "auto-merge disarmed" "(q) Audit comment records the disarm"
+assert_contains "$OUT" "server-side auto-merge disarmed" "(q) REASON records the disarm"
+assert_contains "$WRITES" "--remove-label loom:pr" "(q) Stale approval still removed"
+assert_contains "$WRITES" "--add-label loom:review-requested" "(q) Still re-queued"
+
+# (q2) The COMMON case: nothing armed. No mutation may be sent (a wasted API
+#      call on every clear), and the comment must not claim a disarm that never
+#      happened.
+reset_state
+pr_json_unarmed 241 "$SHA_B" "loom:changes-requested"
+{ echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "changes-requested"; echo "]"; } > "$STUB_DIR/comments-241.json"
+run_guard 241 --clear
+assert_eq "12" "$RC" "(q2) Unarmed stale verdict -> exit 12 as before"
+assert_eq "1" "$(get_field "$OUT" CLEARED)" "(q2) Verdict cleared"
+assert_eq "0" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q2) AUTO_MERGE_DISARMED=0 when nothing was armed"
+assert_eq "" "$GRAPHQL" "(q2) No mutation sent when nothing was armed"
+assert_not_contains "$COMMENTS_POSTED" "auto-merge disarmed" "(q2) Comment does not claim a disarm that did not happen"
+assert_not_contains "$COMMENTS_POSTED" "could not be disabled" "(q2) Comment carries no spurious warning either"
+
+# (q3) A forge that does not report the fields at all (Gitea via a shim, an
+#      older `gh`): no mutation attempted, no error, clear proceeds normally.
+#      This is the acceptance criterion "Gitea repos are unaffected".
+reset_state
+pr_json 242 "$SHA_B" "loom:pr"    # pr_json emits neither `id` nor autoMergeRequest
+{ echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-242.json"
+run_guard 242 --clear
+assert_eq "12" "$RC" "(q3) Absent auto-merge fields -> exit 12, no error"
+assert_eq "1" "$(get_field "$OUT" CLEARED)" "(q3) Clear still proceeds"
+assert_eq "0" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q3) AUTO_MERGE_DISARMED=0"
+assert_eq "" "$GRAPHQL" "(q3) No mutation attempted on a forge that has no arm"
+
+# (q4) The mutation FAILS. The clear must still happen (a stale verdict is still
+#      stale), AUTO_MERGE_DISARMED must stay 0 — never "we disarmed it" — and
+#      both the comment and REASON must warn that a queued merge may still fire.
+reset_state
+pr_json_armed 243 "$SHA_B" "loom:pr"
+{ echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-243.json"
+touch "$STUB_DIR/graphql-fail"
+run_guard 243 --clear
+assert_eq "12" "$RC" "(q4) Failed disarm does not abort the clear -> exit 12"
+assert_eq "1" "$(get_field "$OUT" CLEARED)" "(q4) Stale verdict still cleared"
+assert_eq "0" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q4) A failed disarm is never reported as disarmed"
+assert_contains "$COMMENTS_POSTED" "could not be disabled" "(q4) Comment warns the queue may still fire"
+assert_contains "$OUT" "could not be disarmed" "(q4) REASON warns too"
+assert_contains "$ERR" "disablePullRequestAutoMerge" "(q4) stderr names the failed mutation"
+
+# (q5) Report-only mode (no --clear) stays genuinely read-only: an armed
+#      auto-merge is NOT disarmed, because nothing is being invalidated yet.
+reset_state
+pr_json_armed 244 "$SHA_B" "loom:pr"
+{ echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-244.json"
+run_guard 244
+assert_eq "12" "$RC" "(q5) Report-only stale verdict -> exit 12"
+assert_eq "" "$GRAPHQL" "(q5) No mutation without --clear (report-only is read-only)"
+assert_eq "0" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q5) AUTO_MERGE_DISARMED=0 without --clear"
+
+# (q6) A FRESH verdict with auto-merge armed must not be disarmed: the verdict
+#      describes the tree in front of it, so a deliberately-queued merge of an
+#      approved head is not this guard's business.
+reset_state
+pr_json_armed 245 "$SHA_A" "loom:pr"
+{ echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-245.json"
+run_guard 245 --clear
+assert_eq "0" "$RC" "(q6) Fresh verdict -> exit 0"
+assert_eq "" "$GRAPHQL" "(q6) A fresh verdict's armed auto-merge is left alone"
+
+# (q7) HELD PR with an armed auto-merge. --clear stays suppressed (the hold is
+#      respected: CLEARED=0, verdict labels untouched), but the disarm DOES fire
+#      — an armed queue would merge the held PR anyway, which is the one write
+#      that would undo the operator's hold rather than honor it. The write is
+#      recorded in its own comment.
+reset_state
+pr_json_armed 246 "$SHA_B" "loom:pr" "loom:operator"
+{ echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-246.json"
+run_guard 246 --clear
+assert_eq "12" "$RC" "(q7) Stale approval on a held PR -> exit 12"
+assert_eq "0" "$(get_field "$OUT" CLEARED)" "(q7) Hold respected: CLEARED=0"
+assert_eq "" "$WRITES" "(q7) Hold respected: no verdict label writes"
+assert_eq "1" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q7) …but the armed queue IS stood down"
+assert_contains "$GRAPHQL" "disablePullRequestAutoMerge" "(q7) The disable mutation fired on the held PR"
+assert_contains "$COMMENTS_POSTED" "stood down on a held PR" "(q7) The disarm write is recorded"
+assert_contains "$OUT" "disarmed anyway" "(q7) REASON explains the asymmetry"
+
+# (q8) HELD PR with NOTHING armed: the pre-#8900 invariant is intact — a held
+#      PR collects no automated comment and no write at all.
+reset_state
+pr_json_unarmed 247 "$SHA_B" "loom:pr" "loom:blocked"
+{ echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-247.json"
+run_guard 247 --clear
+assert_eq "12" "$RC" "(q8) Stale approval on an unarmed held PR -> exit 12"
+assert_eq "0" "$(get_field "$OUT" CLEARED)" "(q8) CLEARED=0"
+assert_eq "" "$WRITES" "(q8) No label writes"
+assert_eq "" "$COMMENTS_POSTED" "(q8) No comment on a held PR with nothing armed"
+assert_eq "" "$GRAPHQL" "(q8) No mutation either"
+
+# (q9) Idempotent re-run: the transition was already announced, so no duplicate
+#      comment — but the disarm is NOT skipped by that shortcut. An arm still
+#      standing on a retry is exactly the state that must not survive.
+reset_state
+pr_json_armed 248 "$SHA_B" "loom:changes-requested"
+{
+  echo "["
+  verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "changes-requested"
+  echo ","
+  plain_comment "2026-09-22T22:05:00Z" "<!-- loom:verdict-stale from=$SHA_A to=$SHA_B --> already announced"
+  echo "]"
+} > "$STUB_DIR/comments-248.json"
+run_guard 248 --clear
+assert_eq "12" "$RC" "(q9) Already-announced transition -> exit 12"
+assert_eq "" "$COMMENTS_POSTED" "(q9) No duplicate audit comment"
+assert_eq "1" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q9) The disarm still runs on a retry"
+assert_contains "$GRAPHQL" "disablePullRequestAutoMerge" "(q9) Mutation sent despite the comment shortcut"
+
+# (q10) A merged/closed PR is still untouched (#6781 short-circuits before the
+#       disarm too) — disarming a finished PR is pointless and the NOT_OPEN
+#       contract says nothing is written past the state read.
+reset_state
+pr_json_state 249 "$SHA_B" "MERGED" "false" "loom:pr"
+{ echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-249.json"
+run_guard 249 --clear
+assert_eq "14" "$RC" "(q10) Merged PR -> exit 14"
+assert_eq "" "$GRAPHQL" "(q10) No mutation on a finished PR"
 
 # --- Summary -------------------------------------------------------------
 echo ""

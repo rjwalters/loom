@@ -87,7 +87,31 @@
 #   - remove its per-tree companions (`loom:ci-failure`, `loom:merge-conflict`)
 #     when present — those are findings about the OLD tree too
 #   - add `loom:review-requested` so a Judge picks the PR up again
-#   - post an auditable comment naming the old and new SHAs
+#   - DISARM the forge's server-side auto-merge queue if one is armed (#8900)
+#   - post an auditable comment naming the old and new SHAs (and the disarm)
+#
+# The disarm (#8900) is not optional politeness — without it the label flip is
+# cosmetic. An armed GitHub auto-merge is gated ONLY by the branch ruleset's
+# REQUIRED checks: it never re-reads `loom:pr`, never notices this very
+# `loom:verdict-stale` clearing, never waits for a non-required suite, and never
+# runs merge-pr.sh's own merge-time gates (including the #8248 required-check
+# freshness guard, which lives inside that script). So a PR whose verdict this
+# guard had just invalidated still merged, unreviewed, the moment required
+# checks went green on the new head: #8694 merged as 528f2971 on 2026-09-25,
+# three minutes after a Doctor rebase force-push, still labeled
+# `loom:review-requested`, with no approval at the merged head; #8847 and #8843
+# merged ~2 minutes after `gh pr update-branch` moved their heads.
+#
+# The disarm runs BEFORE the comment and the label flip. That is the safest of
+# the three possible orders: disarming can only PREVENT a merge, never cause
+# one, so going first shrinks the window in which the queued merge could still
+# fire, and a later comment/label failure leaves the PR disarmed with its
+# verdict intact — strictly safer than the pre-#8900 behavior either way.
+#
+# It is a no-op unless something is actually armed: the arm state comes from the
+# step-1 `gh pr view` (one extra JSON field, no extra API call), and the
+# mutation is only sent when `autoMergeRequest` is non-null. So an ordinary
+# clear costs nothing and the comment never claims a disarm that did not happen.
 #
 # With --anchor, an UNVERIFIABLE verdict is remediated rather than merely
 # reported (#6319): the guard posts a comment carrying the marker the verdict
@@ -121,6 +145,18 @@
 # it for review would undo that decision. Callers must still treat the verdict
 # as untrustworthy: STALE is STALE whether or not it was cleared.
 #
+# The #8900 auto-merge disarm is deliberately NOT suppressed by a hold label.
+# Every other write this guard makes could undo an operator's decision; the
+# disarm is the one that ENFORCES it. A held PR with an armed auto-merge merges
+# anyway the moment required checks pass — `loom:operator` means "the engine
+# stops acting", and Champion's merge-risk hold applies it specifically to stop
+# a merge, so leaving the forge's own queue armed defeats the hold entirely.
+# Disarming can only prevent a merge, so it cannot be the write that undoes a
+# hold. When a held PR did have one armed, the disarm is recorded in a short
+# comment of its own: a write with no audit trail is worse than one more
+# comment on a parked PR, and because it only fires on an actually-armed queue
+# it cannot become comment spam.
+#
 # Output (stdout — one KEY=VALUE per line, machine-parseable):
 #   DECISION=NOT_OPEN|NO_VERDICT|UNVERIFIABLE|ANCHORED|FRESH|STALE
 #   REASON=<short human-readable reason>
@@ -129,6 +165,11 @@
 #   MARKER_SHA=<sha the verdict was recorded against, or "">
 #   CLEARED=0|1
 #   ANCHORED=0|1
+#   AUTO_MERGE_DISARMED=0|1   (#8900 — 1 only when a queued server-side
+#                              auto-merge was actually found armed AND
+#                              successfully disabled on this run. 0 covers both
+#                              "nothing was armed" and "the disarm failed"; the
+#                              failure case is named in REASON.)
 #
 # Exit codes:
 #   0  = FRESH (verdict is valid for the current head — safe to act on)
@@ -209,6 +250,11 @@ verdict_token_for_label() { # <label> -> approved|changes-requested
   esac
 }
 
+# Set to 1 by disarm_auto_merge() only on a confirmed disable. A global rather
+# than an 8th positional arg to emit(): every existing call site keeps its
+# signature, and the value is the same for whichever emit() ends up firing.
+AUTO_MERGE_DISARMED=0
+
 emit() {
   local decision="$1" reason="$2" head_sha="$3" verdict_label="$4" marker_sha="$5" cleared="$6"
   local anchored="${7:-0}"
@@ -219,6 +265,7 @@ emit() {
   echo "MARKER_SHA=$marker_sha"
   echo "CLEARED=$cleared"
   echo "ANCHORED=$anchored"
+  echo "AUTO_MERGE_DISARMED=$AUTO_MERGE_DISARMED"
 }
 
 # Keep `gh`'s stdout (the JSON we parse) and stderr SEPARATE. `gh` writes
@@ -240,8 +287,18 @@ trap 'rm -f "$GH_STDERR" 2>/dev/null || true' EXIT
 # so nothing is lost. Any `.merged` read below is defensive only, for a
 # hypothetical forge shim that emits REST-shaped JSON with a literal `merged`
 # key; on real `gh` output it is simply absent.
-PR_JSON="$(gh pr view "$PR" --json headRefOid,labels,state 2>"$GH_STDERR")" || {
-  echo "ERROR: 'gh pr view $PR --json headRefOid,labels,state' failed: $(cat "$GH_STDERR" 2>/dev/null)" >&2
+#
+# `id` and `autoMergeRequest` ride along for the #8900 disarm: `id` is the PR's
+# GraphQL node id (what `disablePullRequestAutoMerge` addresses it by) and
+# `autoMergeRequest` is null unless a server-side merge is armed. Both come from
+# the SAME snapshot as the head SHA on purpose — reading the arm state
+# separately would let it disagree with the node id it is about — and they cost
+# no extra API call, so the overwhelmingly-common "nothing armed" case pays
+# nothing at all. A forge shim that omits either field simply reads as "not
+# armed" (see disarm_auto_merge below), which is also the right answer on Gitea:
+# it has no server-side arm to disable.
+PR_JSON="$(gh pr view "$PR" --json headRefOid,labels,state,id,autoMergeRequest 2>"$GH_STDERR")" || {
+  echo "ERROR: 'gh pr view $PR --json headRefOid,labels,state,id,autoMergeRequest' failed: $(cat "$GH_STDERR" 2>/dev/null)" >&2
   exit 1
 }
 
@@ -253,6 +310,71 @@ fi
 
 LABELS="$(jq -r '[.labels[].name] | join("\n")' <<<"$PR_JSON" 2>/dev/null || true)"
 has_label() { printf '%s\n' "$LABELS" | grep -qx -- "$1"; }
+
+# --- #8900: the server-side auto-merge arm state, from the step-1 snapshot ----
+# PR_NODE_ID is "" when the field is absent; AUTO_MERGE_ARMED is 1 only when
+# `autoMergeRequest` is a non-null object AND we have a node id to address the
+# mutation to. Anything else (null, absent, no id) is "not armed" — the same
+# fail-safe direction the rest of this guard uses for missing evidence, and the
+# correct answer for Gitea and for any forge shim that does not report the field.
+PR_NODE_ID="$(jq -r '.id // empty' <<<"$PR_JSON" 2>/dev/null || true)"
+AUTO_MERGE_ARMED=0
+if [[ -n "$PR_NODE_ID" ]] \
+  && [[ "$(jq -r 'if (.autoMergeRequest // null) == null then "no" else "yes" end' <<<"$PR_JSON" 2>/dev/null || echo no)" == "yes" ]]; then
+  AUTO_MERGE_ARMED=1
+fi
+
+# The line appended to the stale-verdict comment to record what the disarm did.
+# Empty unless disarm_auto_merge() had something to say, so the comment can
+# never claim a disarm that did not happen.
+DISARM_COMMENT_LINE=""
+
+# disarm_auto_merge — stand down the forge's queued server-side merge (#8900).
+#
+# Deliberately a parallel implementation of
+# `loom-daemon/src/forge_disable_auto_merge.rs`'s mutation rather than a call to
+# `loom-daemon forge disable-auto-merge`: this guard hard-requires only `gh` and
+# `jq` (see the PATH check above) and runs on every Judge/Champion pass across a
+# mixed fleet, including hosts whose `loom-daemon` is absent or predates the
+# subcommand. Making the disarm depend on that binary would make it silently
+# skip exactly where it matters most. The shell/Rust pair mirrors what the
+# stale-verdict guard itself already is (this script + `claim_reconciliation.rs`);
+# the mutation text is kept byte-comparable with that module's
+# DISABLE_AUTO_MERGE_MUTATION const so the two can be diffed by eye.
+#
+# No-ops (returns 0, sets nothing) unless AUTO_MERGE_ARMED=1. On success sets
+# AUTO_MERGE_DISARMED=1 and DISARM_COMMENT_LINE. On failure leaves
+# AUTO_MERGE_DISARMED=0 and records a WARNING line instead — a failed disarm
+# must never read as "there was nothing armed", because the queue may still
+# fire. A failed disarm does NOT abort the verdict invalidation: clearing a
+# stale verdict is still the right thing to do, and the warning line plus REASON
+# tell the operator what is left to do by hand.
+disarm_auto_merge() {
+  [[ "$AUTO_MERGE_ARMED" -eq 1 ]] || return 0
+
+  local mutation
+  mutation='mutation($pullRequestId: ID!) { disablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId }) { pullRequest { number autoMergeRequest { enabledAt } } } }'
+
+  if gh api graphql -f "query=$mutation" -F "pullRequestId=$PR_NODE_ID" \
+      >/dev/null 2>"$GH_STDERR"; then
+    AUTO_MERGE_DISARMED=1
+    # Assigned on ONE line with `$'\n'` rather than as a literal multi-line
+    # string: a continuation line is read out of its quoting context by
+    # scripts/check-daemon-subcommand-versions.sh, which then mistakes the
+    # `loom-daemon forge disable-auto-merge` MENTION in the failure branch below
+    # for an invocation of it (this script invokes no daemon subcommand at all —
+    # see disarm_auto_merge's header). Keeping the quote open and closed on the
+    # same line lets that gate blank the prose as designed.
+    DISARM_COMMENT_LINE=$'\n'"- **GitHub auto-merge disarmed** (\`disablePullRequestAutoMerge\`): a queued server-side merge was armed on this PR. It is gated only by the ruleset's required checks — it would have merged this unreviewed head regardless of the label flip above — so it was stood down (#8900)."
+    return 0
+  fi
+
+  local why
+  why="$(cat "$GH_STDERR" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g')"
+  echo "WARNING: PR #$PR has a server-side auto-merge armed and 'disablePullRequestAutoMerge' failed: $why" >&2
+  DISARM_COMMENT_LINE=$'\n'"- ⚠️ **A server-side auto-merge is armed on this PR and could not be disabled** (\`$why\`). It may still merge this unreviewed head once required checks pass. Disarm it by hand — \`loom-daemon forge disable-auto-merge $PR\` or \`gh pr merge --disable-auto $PR\` — or apply \`loom:operator\` (#8900)."
+  return 1
+}
 
 # The explicit-hold labels: a PR an operator (or Champion's capped-PR recovery
 # pass) deliberately took out of automated flow. Echoes the first one present,
@@ -418,7 +540,44 @@ if [[ "$CLEAR" -eq 1 ]]; then
 
   if [[ -n "$HOLD_LABEL" ]]; then
     REASON="$REASON; clear suppressed — PR is on an explicit $HOLD_LABEL hold"
+    # ...but the #8900 disarm still runs. Suppression exists so this guard does
+    # not UNDO an operator's decision to park the PR; an armed server-side merge
+    # is the one thing that would undo it for them, so standing it down enforces
+    # the hold rather than overriding it. See the header note.
+    disarm_auto_merge || true
+    if [[ -n "$DISARM_COMMENT_LINE" ]]; then
+      if [[ "$AUTO_MERGE_DISARMED" -eq 1 ]]; then
+        REASON="$REASON; server-side auto-merge disarmed anyway (a queued merge would have ignored the hold)"
+      else
+        REASON="$REASON; WARNING: a server-side auto-merge is armed and could not be disarmed"
+      fi
+      # Record the write that just happened. Only reachable when something was
+      # actually armed, so a held PR never collects this comment routinely.
+      gh pr comment "$PR" --body "<!-- loom:verdict-stale-disarm pr=$PR head=$HEAD_SHA -->
+**Server-side auto-merge stood down on a held PR**
+
+This PR carries \`$HOLD_LABEL\`, so its stale \`$VERDICT_LABEL\` verdict (rendered against \`$MARKER_SHA\`; head is now \`$HEAD_SHA\`) was **not** cleared and the PR was **not** re-queued — the hold is respected.
+$DISARM_COMMENT_LINE
+
+No labels were changed by this comment. Treat the \`$VERDICT_LABEL\` verdict as untrustworthy regardless: it describes a tree that no longer exists.
+
+---
+*Automated by verdict-staleness-guard.sh (#8900)*" >/dev/null 2>"$GH_STDERR" \
+        || echo "WARNING: failed to post the auto-merge-disarm comment on held PR #$PR: $(cat "$GH_STDERR" 2>/dev/null)" >&2
+    fi
   else
+    # #8900: disarm the forge's queued server-side merge BEFORE the comment and
+    # the label flip. A no-op unless one is armed; a failure is recorded in the
+    # comment and REASON rather than aborting the clear (clearing a stale
+    # verdict is still correct even if the queue could not be stood down). See
+    # disarm_auto_merge() and the header for the ordering argument.
+    disarm_auto_merge || true
+    if [[ "$AUTO_MERGE_DISARMED" -eq 1 ]]; then
+      REASON="$REASON; server-side auto-merge disarmed"
+    elif [[ -n "$DISARM_COMMENT_LINE" ]]; then
+      REASON="$REASON; WARNING: a server-side auto-merge is armed and could not be disarmed"
+    fi
+
     # Idempotency: if this exact old->new transition was already announced,
     # don't post a second comment (a Judge pass and the daemon backstop can
     # both notice the same move). The label writes below are idempotent on
@@ -435,7 +594,7 @@ if [[ "$CLEAR" -eq 1 ]]; then
 This PR's \`$VERDICT_LABEL\` verdict was rendered against \`$MARKER_SHA\`, but the current head is \`$HEAD_SHA\`. A review verdict is a statement about a specific tree, so it does not survive a rebase, a force-push, or new commits.
 
 - Verdict cleared: \`$VERDICT_LABEL\` (recorded for \`$MARKER_SHA\`)
-- Returned to the review queue: \`loom:review-requested\` (current head \`$HEAD_SHA\`)
+- Returned to the review queue: \`loom:review-requested\` (current head \`$HEAD_SHA\`)$DISARM_COMMENT_LINE
 
 Judge will re-evaluate the tree that is actually here now. No judgment about the new tree is implied either way — the old verdict simply no longer describes it.
 

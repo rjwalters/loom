@@ -735,6 +735,12 @@ pub enum ForgeCmd {
         /// (unguarded) behavior.
         expected_head_sha: Option<String>,
     },
+    /// `forge disable-auto-merge <pr>` (#8900) — disarm GitHub's server-side
+    /// auto-merge queue. The inverse of [`ForgeCmd::AutoMerge`] and, unlike
+    /// it, **not** operator-only: it can only turn a queued merge off, never
+    /// on. Implemented in
+    /// [`crate::forge_disable_auto_merge::handle_disable_auto_merge`].
+    DisableAutoMerge { pr: u32 },
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should pass
     /// to `forge_merge_pr`. See
@@ -769,6 +775,9 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
             method,
             expected_head_sha,
         } => handle_auto_merge(pr, &method, expected_head_sha.as_deref()),
+        ForgeCmd::DisableAutoMerge { pr } => {
+            crate::forge_disable_auto_merge::handle_disable_auto_merge(pr)
+        }
         ForgeCmd::MergeMethod { repo, requested } => {
             crate::forge_merge_method::handle_merge_method(&repo, requested.as_deref())
         }
