@@ -1960,11 +1960,31 @@ enum ForgeAction {
     /// state could not be read or the mutation failed (treat as possibly still
     /// armed, never as an all-clear); exits 3 on Gitea, which has no
     /// server-side arm to disable.
+    ///
+    /// `--audit-comment` also records what the disarm did as a PR comment, so a
+    /// caller does not have to compose (and duplicate) that prose itself. It is
+    /// silent when nothing was armed, which is the common case — no PR ever
+    /// collects a comment saying nothing happened. This is the flag
+    /// `verdict-staleness-guard.sh --clear` uses; `--hold` tells it the PR is
+    /// parked so the comment explains why a held PR was written to at all.
     #[command(name = "disable-auto-merge")]
     DisableAutoMerge {
         /// Pull request number.
         #[arg(value_name = "PR")]
         pr_number: u32,
+
+        /// Record what the disarm did as a comment on the PR. Silent when
+        /// nothing was armed.
+        #[arg(long)]
+        audit_comment: bool,
+
+        /// The explicit-hold label found on the PR (`loom:operator`,
+        /// `loom:blocked`, `loom:operator-only`), if any. Shapes the audit
+        /// comment's wording only — it never suppresses the disarm, which can
+        /// only prevent a merge and therefore enforces a hold rather than
+        /// undoing it. An empty value means "not held".
+        #[arg(long, value_name = "LABEL")]
+        hold: Option<String>,
     },
 
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`

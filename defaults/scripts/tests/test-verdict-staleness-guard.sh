@@ -99,9 +99,14 @@ trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 #   gh pr edit <N> ...                      -> append to $STUB_DIR/edit-writes.log
 #                                              (fails if edit-fail-<N> exists)
 #   gh api graphql -f query=... -F ...      -> append to $STUB_DIR/graphql-writes.log
-#                                              (fails if graphql-fail exists) — the
-#                                              #8900 disablePullRequestAutoMerge
-#                                              mutation
+#                                              Retained ONLY so the #8900 cases can
+#                                              assert the guard sends NO mutation of
+#                                              its own: the disarm is delegated to
+#                                              `loom-daemon forge disable-auto-merge`
+#                                              (see the loom-daemon stub below), and a
+#                                              reintroduced inline `gh api graphql`
+#                                              mutation here is the regression PR #8990
+#                                              review rejected.
 cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
@@ -182,8 +187,54 @@ esac
 STUB
 chmod +x "$STUB_DIR/gh"
 
+# --- Stub loom-daemon on PATH (#8900) ----------------------------------------
+# The guard does NOT implement the auto-merge disarm; it shells out to
+#   loom-daemon forge disable-auto-merge <N> --audit-comment --hold <label>
+# which owns the arm-state read, the `disablePullRequestAutoMerge` mutation and
+# its own audit comment. So the shell-side contract under test here is exactly:
+# is the subcommand invoked, with the right arguments, on the right paths — and
+# is its `DISARMED=` answer threaded into the guard's output and REASON.
+#
+#   -> append the full argv to $STUB_DIR/daemon-writes.log
+#   -> prints DISARMED=1 when $STUB_DIR/armed-<N> exists, else DISARMED=0
+#   -> $STUB_DIR/disarm-fail: exit 1 with a diagnostic on stderr and NOTHING on
+#      stdout — the "armed, but the mutation failed" shape, which must never be
+#      read as "nothing was armed"
+#   -> $STUB_DIR/daemon-declined: exit 3 (EX_FORGE_DECLINED) with nothing on
+#      stdout — the Gitea shape, where there is no server-side arm at all
+cat > "$STUB_DIR/loom-daemon" <<'STUB'
+#!/usr/bin/env bash
+STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub loom-daemon: LOOM_TEST_STUB_DIR not set}"
+printf 'DAEMON %s\n' "$*" >> "$STUB_DIR_FROM_ENV/daemon-writes.log"
+if [[ "$1" == "forge" && "$2" == "disable-auto-merge" ]]; then
+  if [[ -f "$STUB_DIR_FROM_ENV/daemon-declined" ]]; then
+    echo "stub loom-daemon: gitea has no server-side auto-merge arm to disable" >&2
+    exit 3
+  fi
+  if [[ -f "$STUB_DIR_FROM_ENV/disarm-fail" ]]; then
+    echo "stub loom-daemon: Failed to disable auto-merge for PR #$3: disablePullRequestAutoMerge failed" >&2
+    exit 1
+  fi
+  if [[ -f "$STUB_DIR_FROM_ENV/armed-$3" ]]; then
+    echo "DISARMED=1"
+    echo "Disabled GitHub auto-merge on PR #$3."
+  else
+    echo "DISARMED=0"
+    echo "No auto-merge was armed on PR #$3; nothing to disable."
+  fi
+  exit 0
+fi
+echo "stub loom-daemon: unexpected invocation: $*" >&2
+exit 64
+STUB
+chmod +x "$STUB_DIR/loom-daemon"
+
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# Force the guard's $PATH resolution tier (the production shape). A sweep-
+# dispatched shell inherits LOOM_DAEMON_BIN pointing at the real installed
+# daemon, which would silently run live `gh` mutations instead of the stub.
+unset LOOM_DAEMON_BIN
 
 SHA_A="1111111111111111111111111111111111111111"
 SHA_B="2222222222222222222222222222222222222222"
@@ -222,22 +273,23 @@ pr_json_no_state() {
 
 pr_json_armed() {
     # pr_json_armed <pr-number> <head-sha> [label ...] — an OPEN, unmerged PR
-    # that ALSO has GitHub's server-side auto-merge armed (#8900): the `id`
-    # (GraphQL node id) and non-null `autoMergeRequest` shape real
-    # `gh pr view --json id,autoMergeRequest` returns. This is #8694's exact
-    # shape — auto-squash armed 2026-09-22, head moved by a later force-push.
+    # that ALSO has GitHub's server-side auto-merge armed (#8900). #8694's exact
+    # shape: auto-squash armed 2026-09-22, head moved by a later force-push.
+    #
+    # The arm state is expressed as the `armed-<N>` sentinel the stub
+    # loom-daemon reads, NOT as `gh pr view` JSON: reading the arm state is the
+    # subcommand's job now, and the guard no longer requests those fields.
     local num="$1" sha="$2"; shift 2
-    printf '{"headRefOid":"%s","state":"OPEN","labels":[%s],"id":"PR_kwDOQAPbH88AAAABEp4dZw","autoMergeRequest":{"mergeMethod":"SQUASH","enabledAt":"2026-09-22T22:09:18Z","enabledBy":{"login":"app/loom-fleet-dispatch","is_bot":true}}}' \
-        "$sha" "$(labels_json "$@")" > "$STUB_DIR/pr-$num.json"
+    pr_json_state "$num" "$sha" "OPEN" "false" "$@"
+    : > "$STUB_DIR/armed-$num"
 }
 
 pr_json_unarmed() {
-    # pr_json_unarmed <pr-number> <head-sha> [label ...] — the common case real
-    # `gh` returns for a PR with nothing armed: `id` present, `autoMergeRequest`
-    # explicitly null.
+    # pr_json_unarmed <pr-number> <head-sha> [label ...] — the common case: an
+    # open PR with nothing armed (no `armed-<N>` sentinel, so the stub
+    # loom-daemon answers DISARMED=0 and sends no mutation).
     local num="$1" sha="$2"; shift 2
-    printf '{"headRefOid":"%s","state":"OPEN","labels":[%s],"id":"PR_kwDOQAPbH88AAAABEp4dZw","autoMergeRequest":null}' \
-        "$sha" "$(labels_json "$@")" > "$STUB_DIR/pr-$num.json"
+    pr_json_state "$num" "$sha" "OPEN" "false" "$@"
 }
 
 pr_json_state_no_merged() {
@@ -268,6 +320,8 @@ reset_state() {
     rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR"/edit-fail-*
     rm -f "$STUB_DIR"/comment-writes.log "$STUB_DIR"/edit-writes.log
     rm -f "$STUB_DIR"/graphql-writes.log "$STUB_DIR"/graphql-fail
+    rm -f "$STUB_DIR"/daemon-writes.log "$STUB_DIR"/armed-*
+    rm -f "$STUB_DIR"/disarm-fail "$STUB_DIR"/daemon-declined
 }
 
 run_guard() {
@@ -277,6 +331,7 @@ run_guard() {
     WRITES="$(cat "$STUB_DIR/edit-writes.log" 2>/dev/null || true)"
     COMMENTS_POSTED="$(cat "$STUB_DIR/comment-writes.log" 2>/dev/null || true)"
     GRAPHQL="$(cat "$STUB_DIR/graphql-writes.log" 2>/dev/null || true)"
+    DAEMON="$(cat "$STUB_DIR/daemon-writes.log" 2>/dev/null || true)"
 }
 
 get_field() {
@@ -829,12 +884,19 @@ assert_eq "" "$WRITES" "(p11) No label writes on a closed PR"
 # minutes after a Doctor rebase force-push, still labeled
 # `loom:review-requested`, with no approval at the merged head; #8847 and #8843
 # merged ~2 minutes after `gh pr update-branch` moved their heads.
+#
+# WHAT IS UNDER TEST HERE IS THE DELEGATION, NOT THE MUTATION. The guard owns no
+# disarm logic: the arm-state read, the `disablePullRequestAutoMerge` mutation
+# and the audit comment all live in `loom-daemon forge disable-auto-merge`
+# (`loom-daemon/src/forge_disable_auto_merge.rs`, covered by its own unit tests
+# plus `claim_reconciliation/auto_merge_disarm.rs`). Mirroring that mutation
+# inline in this `contract`-category script is what PR #8990 review rejected, so
+# every case below ALSO asserts the guard sent no `gh api graphql` of its own.
 
 # (q) THE #8694 REGRESSION: an approving verdict at SHA_A, head force-pushed to
-#     SHA_B, and a server-side auto-merge armed. --clear must send
-#     disablePullRequestAutoMerge (addressed by the PR's node id from the SAME
-#     `gh pr view` snapshot), report AUTO_MERGE_DISARMED=1, and say so in the
-#     audit comment — on top of the label flip it already did.
+#     SHA_B, and a server-side auto-merge armed. --clear must invoke the disarm
+#     subcommand for THIS PR, thread its DISARMED=1 answer into
+#     AUTO_MERGE_DISARMED and REASON, and still do the label flip.
 reset_state
 pr_json_armed 240 "$SHA_B" "loom:pr"
 { echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-240.json"
@@ -842,17 +904,16 @@ run_guard 240 --clear
 assert_eq "12" "$RC" "(q) Stale approval with auto-merge armed -> exit 12"
 assert_eq "1" "$(get_field "$OUT" CLEARED)" "(q) Verdict still cleared"
 assert_eq "1" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q) AUTO_MERGE_DISARMED=1"
-assert_contains "$GRAPHQL" "disablePullRequestAutoMerge" "(q) The disable mutation was sent"
-assert_not_contains "$GRAPHQL" "enablePullRequestAutoMerge" "(q) It is the DISABLE mutation, not the arm"
-assert_contains "$GRAPHQL" "pullRequestId=PR_kwDOQAPbH88AAAABEp4dZw" "(q) Mutation uses the node id from the same snapshot"
-assert_contains "$COMMENTS_POSTED" "auto-merge disarmed" "(q) Audit comment records the disarm"
-assert_contains "$OUT" "server-side auto-merge disarmed" "(q) REASON records the disarm"
+assert_contains "$DAEMON" "forge disable-auto-merge 240" "(q) The disarm subcommand was invoked for this PR"
+assert_contains "$DAEMON" "--audit-comment" "(q) It is asked to record the disarm itself"
+assert_eq "" "$GRAPHQL" "(q) The guard sends no mutation of its own (no inline duplicate)"
+assert_contains "$OUT" "DISARMED=1" "(q) REASON records the disarm"
 assert_contains "$WRITES" "--remove-label loom:pr" "(q) Stale approval still removed"
 assert_contains "$WRITES" "--add-label loom:review-requested" "(q) Still re-queued"
 
-# (q2) The COMMON case: nothing armed. No mutation may be sent (a wasted API
-#      call on every clear), and the comment must not claim a disarm that never
-#      happened.
+# (q2) The COMMON case: nothing armed. The subcommand is still asked (it is what
+#      knows the arm state), answers DISARMED=0, and the guard's own comment
+#      never claims a disarm — it composes no disarm prose at all.
 reset_state
 pr_json_unarmed 241 "$SHA_B" "loom:changes-requested"
 { echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "changes-requested"; echo "]"; } > "$STUB_DIR/comments-241.json"
@@ -860,45 +921,48 @@ run_guard 241 --clear
 assert_eq "12" "$RC" "(q2) Unarmed stale verdict -> exit 12 as before"
 assert_eq "1" "$(get_field "$OUT" CLEARED)" "(q2) Verdict cleared"
 assert_eq "0" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q2) AUTO_MERGE_DISARMED=0 when nothing was armed"
-assert_eq "" "$GRAPHQL" "(q2) No mutation sent when nothing was armed"
-assert_not_contains "$COMMENTS_POSTED" "auto-merge disarmed" "(q2) Comment does not claim a disarm that did not happen"
-assert_not_contains "$COMMENTS_POSTED" "could not be disabled" "(q2) Comment carries no spurious warning either"
+assert_contains "$DAEMON" "forge disable-auto-merge 241" "(q2) The arm state is still asked about"
+assert_eq "" "$GRAPHQL" "(q2) No mutation from the guard"
+assert_not_contains "$COMMENTS_POSTED" "auto-merge" "(q2) The guard's comment claims no disarm that did not happen"
 
-# (q3) A forge that does not report the fields at all (Gitea via a shim, an
-#      older `gh`): no mutation attempted, no error, clear proceeds normally.
-#      This is the acceptance criterion "Gitea repos are unaffected".
+# (q3) The subcommand DECLINES (exit 3): Gitea, which has no server-side
+#      auto-merge arm to disable at all. Nothing on stdout, so the guard reports
+#      0 and the clear proceeds normally — the "Gitea repos are unaffected"
+#      acceptance criterion.
 reset_state
-pr_json 242 "$SHA_B" "loom:pr"    # pr_json emits neither `id` nor autoMergeRequest
+pr_json 242 "$SHA_B" "loom:pr"
+: > "$STUB_DIR/daemon-declined"
 { echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-242.json"
 run_guard 242 --clear
-assert_eq "12" "$RC" "(q3) Absent auto-merge fields -> exit 12, no error"
+assert_eq "12" "$RC" "(q3) A declined (Gitea) disarm -> exit 12, no error"
 assert_eq "1" "$(get_field "$OUT" CLEARED)" "(q3) Clear still proceeds"
 assert_eq "0" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q3) AUTO_MERGE_DISARMED=0"
-assert_eq "" "$GRAPHQL" "(q3) No mutation attempted on a forge that has no arm"
+assert_eq "" "$GRAPHQL" "(q3) No mutation on a forge that has no arm"
 
-# (q4) The mutation FAILS. The clear must still happen (a stale verdict is still
+# (q4) The disarm FAILS. The clear must still happen (a stale verdict is still
 #      stale), AUTO_MERGE_DISARMED must stay 0 — never "we disarmed it" — and
-#      both the comment and REASON must warn that a queued merge may still fire.
+#      REASON must warn that a queued merge may still fire. The subcommand's
+#      stderr must reach the caller's stderr rather than a temp file.
 reset_state
 pr_json_armed 243 "$SHA_B" "loom:pr"
 { echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-243.json"
-touch "$STUB_DIR/graphql-fail"
+: > "$STUB_DIR/disarm-fail"
 run_guard 243 --clear
 assert_eq "12" "$RC" "(q4) Failed disarm does not abort the clear -> exit 12"
 assert_eq "1" "$(get_field "$OUT" CLEARED)" "(q4) Stale verdict still cleared"
 assert_eq "0" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q4) A failed disarm is never reported as disarmed"
-assert_contains "$COMMENTS_POSTED" "could not be disabled" "(q4) Comment warns the queue may still fire"
-assert_contains "$OUT" "could not be disarmed" "(q4) REASON warns too"
-assert_contains "$ERR" "disablePullRequestAutoMerge" "(q4) stderr names the failed mutation"
+assert_contains "$OUT" "DISARMED=FAILED" "(q4) REASON warns the queue may still be armed"
+assert_contains "$OUT" "may still be armed" "(q4) REASON says what is left to do"
+assert_contains "$ERR" "Failed to disable auto-merge" "(q4) The subcommand's diagnostic reaches stderr"
 
-# (q5) Report-only mode (no --clear) stays genuinely read-only: an armed
-#      auto-merge is NOT disarmed, because nothing is being invalidated yet.
+# (q5) Report-only mode (no --clear) stays genuinely read-only: no disarm is
+#      attempted, because nothing is being invalidated yet.
 reset_state
 pr_json_armed 244 "$SHA_B" "loom:pr"
 { echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-244.json"
 run_guard 244
 assert_eq "12" "$RC" "(q5) Report-only stale verdict -> exit 12"
-assert_eq "" "$GRAPHQL" "(q5) No mutation without --clear (report-only is read-only)"
+assert_eq "" "$DAEMON" "(q5) No disarm without --clear (report-only is read-only)"
 assert_eq "0" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q5) AUTO_MERGE_DISARMED=0 without --clear"
 
 # (q6) A FRESH verdict with auto-merge armed must not be disarmed: the verdict
@@ -909,13 +973,13 @@ pr_json_armed 245 "$SHA_A" "loom:pr"
 { echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-245.json"
 run_guard 245 --clear
 assert_eq "0" "$RC" "(q6) Fresh verdict -> exit 0"
-assert_eq "" "$GRAPHQL" "(q6) A fresh verdict's armed auto-merge is left alone"
+assert_eq "" "$DAEMON" "(q6) A fresh verdict's armed auto-merge is left alone"
 
 # (q7) HELD PR with an armed auto-merge. --clear stays suppressed (the hold is
 #      respected: CLEARED=0, verdict labels untouched), but the disarm DOES fire
 #      — an armed queue would merge the held PR anyway, which is the one write
-#      that would undo the operator's hold rather than honor it. The write is
-#      recorded in its own comment.
+#      that would undo the operator's hold rather than honor it. The hold label
+#      is passed through so the subcommand's audit comment can explain the write.
 reset_state
 pr_json_armed 246 "$SHA_B" "loom:pr" "loom:operator"
 { echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-246.json"
@@ -924,12 +988,13 @@ assert_eq "12" "$RC" "(q7) Stale approval on a held PR -> exit 12"
 assert_eq "0" "$(get_field "$OUT" CLEARED)" "(q7) Hold respected: CLEARED=0"
 assert_eq "" "$WRITES" "(q7) Hold respected: no verdict label writes"
 assert_eq "1" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q7) …but the armed queue IS stood down"
-assert_contains "$GRAPHQL" "disablePullRequestAutoMerge" "(q7) The disable mutation fired on the held PR"
-assert_contains "$COMMENTS_POSTED" "stood down on a held PR" "(q7) The disarm write is recorded"
-assert_contains "$OUT" "disarmed anyway" "(q7) REASON explains the asymmetry"
+assert_contains "$DAEMON" "forge disable-auto-merge 246" "(q7) The disarm fired on the held PR"
+assert_contains "$DAEMON" "--hold loom:operator" "(q7) The hold label is passed through for the audit comment"
+assert_eq "" "$COMMENTS_POSTED" "(q7) The guard itself posts nothing on a held PR"
 
-# (q8) HELD PR with NOTHING armed: the pre-#8900 invariant is intact — a held
-#      PR collects no automated comment and no write at all.
+# (q8) HELD PR with NOTHING armed: the pre-#8900 invariant is intact — a held PR
+#      collects no comment and no label write. The subcommand is still asked
+#      (only it knows the arm state) and answers DISARMED=0, which posts nothing.
 reset_state
 pr_json_unarmed 247 "$SHA_B" "loom:pr" "loom:blocked"
 { echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-247.json"
@@ -938,11 +1003,13 @@ assert_eq "12" "$RC" "(q8) Stale approval on an unarmed held PR -> exit 12"
 assert_eq "0" "$(get_field "$OUT" CLEARED)" "(q8) CLEARED=0"
 assert_eq "" "$WRITES" "(q8) No label writes"
 assert_eq "" "$COMMENTS_POSTED" "(q8) No comment on a held PR with nothing armed"
-assert_eq "" "$GRAPHQL" "(q8) No mutation either"
+assert_eq "0" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q8) AUTO_MERGE_DISARMED=0"
+assert_contains "$DAEMON" "--hold loom:blocked" "(q8) The hold label is still passed through"
 
 # (q9) Idempotent re-run: the transition was already announced, so no duplicate
 #      comment — but the disarm is NOT skipped by that shortcut. An arm still
-#      standing on a retry is exactly the state that must not survive.
+#      standing on a retry is exactly the state that must not survive, which is
+#      why the delegation runs BEFORE the already-announced check.
 reset_state
 pr_json_armed 248 "$SHA_B" "loom:changes-requested"
 {
@@ -956,7 +1023,7 @@ run_guard 248 --clear
 assert_eq "12" "$RC" "(q9) Already-announced transition -> exit 12"
 assert_eq "" "$COMMENTS_POSTED" "(q9) No duplicate audit comment"
 assert_eq "1" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q9) The disarm still runs on a retry"
-assert_contains "$GRAPHQL" "disablePullRequestAutoMerge" "(q9) Mutation sent despite the comment shortcut"
+assert_contains "$DAEMON" "forge disable-auto-merge 248" "(q9) Disarm invoked despite the comment shortcut"
 
 # (q10) A merged/closed PR is still untouched (#6781 short-circuits before the
 #       disarm too) — disarming a finished PR is pointless and the NOT_OPEN
@@ -966,7 +1033,24 @@ pr_json_state 249 "$SHA_B" "MERGED" "false" "loom:pr"
 { echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-249.json"
 run_guard 249 --clear
 assert_eq "14" "$RC" "(q10) Merged PR -> exit 14"
-assert_eq "" "$GRAPHQL" "(q10) No mutation on a finished PR"
+assert_eq "" "$DAEMON" "(q10) No disarm on a finished PR"
+
+# (q11) No resolvable `loom-daemon` — a consumer host that never installed one,
+#       or a PATH that lost it. The gap must be LOUD but must not break the
+#       clear: AUTO_MERGE_DISARMED=0, REASON names the failure, and the verdict
+#       is still invalidated. This is the cost of delegating instead of keeping a
+#       duplicate inline mutation (PR #8990); it is reported, not hidden.
+reset_state
+pr_json_armed 250 "$SHA_B" "loom:pr"
+{ echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-250.json"
+mv "$STUB_DIR/loom-daemon" "$STUB_DIR/loom-daemon.hidden"
+run_guard 250 --clear
+mv "$STUB_DIR/loom-daemon.hidden" "$STUB_DIR/loom-daemon"
+assert_eq "12" "$RC" "(q11) Missing loom-daemon does not break the clear -> exit 12"
+assert_eq "1" "$(get_field "$OUT" CLEARED)" "(q11) Verdict still cleared"
+assert_eq "0" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q11) AUTO_MERGE_DISARMED=0, never a false 1"
+assert_contains "$OUT" "could not resolve loom-daemon" "(q11) REASON names the unresolvable binary"
+assert_eq "" "$GRAPHQL" "(q11) And no inline mutation is attempted as a fallback"
 
 # --- Summary -------------------------------------------------------------
 echo ""

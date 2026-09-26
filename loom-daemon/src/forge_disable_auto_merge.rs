@@ -35,15 +35,22 @@
 //!
 //! # Callers
 //!
-//! - `loom-daemon forge disable-auto-merge <pr>` (CLI; see
-//!   [`handle_disable_auto_merge`]).
+//! - `loom-daemon forge disable-auto-merge <pr> [--audit-comment [--hold L]]`
+//!   (CLI; see [`handle_disable_auto_merge`]).
 //! - [`crate::claim_reconciliation`]'s `invalidate_verdict()`, via
-//!   `claim_reconciliation::auto_merge_disarm`.
-//! - `defaults/scripts/verdict-staleness-guard.sh --clear`, which mirrors the
-//!   same mutation inline with `gh api graphql` (it hard-requires only `gh` +
-//!   `jq` and runs on hosts that may not have `loom-daemon` on PATH — the same
-//!   deliberate shell/Rust parallel implementation the stale-verdict guard
-//!   itself already has).
+//!   `claim_reconciliation::auto_merge_disarm` (in-process, no CLI hop).
+//! - `defaults/scripts/verdict-staleness-guard.sh --clear`, which **shells out
+//!   to the CLI verb above** with `--audit-comment` rather than mirroring the
+//!   mutation inline. The first draft of #8900 did mirror it in `gh api
+//!   graphql`, and that duplication was rejected in review (PR #8990): it is
+//!   exactly the new portable shell `.loom/docs/shell-language-policy.md`
+//!   forbids and the shell-budget ratchet refuses. The consequence to keep in
+//!   mind when changing this module: the guard's disarm is only as available as
+//!   `loom-daemon` is on that host. The guard reports `AUTO_MERGE_DISARMED=0`
+//!   and names the failure in its `REASON=` when the binary cannot be resolved,
+//!   so the gap is loud rather than silent, and the periodic
+//!   `claim_reconciliation` backstop still covers the same PRs on a host that
+//!   runs a daemon at all.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -52,9 +59,9 @@ use anyhow::Result;
 
 use crate::cmd_out::{run_command, CmdOutcome};
 
-/// The mutation, verbatim. Kept as one `const` so the `gh api graphql` mirror
-/// in `defaults/scripts/verdict-staleness-guard.sh` can be diffed against it by
-/// eye.
+/// The mutation, verbatim, and the **only** copy of it in the repo — the shell
+/// guard shells out to this module's CLI verb rather than mirroring it (see
+/// "Callers" above), so there is nothing left to keep in sync by eye.
 ///
 /// `disablePullRequestAutoMerge` takes no `expectedHeadOid` precondition (and
 /// needs none): disarming is idempotent and can never merge anything, so there
@@ -107,12 +114,22 @@ fn apply_repo_override(cmd: &mut Command) {
 ///
 /// `autoMergeRequest` and `id` come from the same snapshot on purpose: reading
 /// them separately would let the arm state and the node id disagree.
+///
+/// **Both fields are optional** (`#[serde(default)]`). The module doc above
+/// promises that absent fields — Gitea behind a shim, an older `gh` — fail safe
+/// to "not armed", and a *required* `id` broke that promise: a response with no
+/// `id` key at all failed to deserialize and surfaced as [`Disarm::Failed`]
+/// rather than [`Disarm::NotArmed`] (PR #8990 review). Missing or empty `id` is
+/// now `Ok(None)`, matching `verdict-staleness-guard.sh`'s own shell reading
+/// (empty node id ⇒ nothing to disarm). Only a `gh` invocation that actually
+/// FAILED, or JSON that will not parse at all, is `Err`.
 fn read_arm_state(gh_bin: &Path, cwd: Option<&Path>, pr: u32) -> Result<Option<String>, String> {
     #[derive(serde::Deserialize)]
     struct AutoMergeRequest {}
     #[derive(serde::Deserialize)]
     struct PrArmState {
-        id: String,
+        #[serde(default)]
+        id: Option<String>,
         #[serde(default, rename = "autoMergeRequest")]
         auto_merge_request: Option<AutoMergeRequest>,
     }
@@ -142,10 +159,11 @@ fn read_arm_state(gh_bin: &Path, cwd: Option<&Path>, pr: u32) -> Result<Option<S
             if parsed.auto_merge_request.is_none() {
                 return Ok(None);
             }
-            if parsed.id.is_empty() {
-                return Err(format!("PR #{pr} reports an armed auto-merge but no GraphQL node id"));
-            }
-            Ok(Some(parsed.id))
+            // Armed but no node id to address the mutation to: there is nothing
+            // this module can act on, and "not armed" is the fail-safe reading
+            // (see the doc above) — never `Failed`, which callers report as
+            // "assume still armed".
+            Ok(parsed.id.filter(|id| !id.is_empty()))
         }
         CmdOutcome::Ran(ref o) => Err(format!(
             "`gh pr view {pr} --json id,autoMergeRequest` failed: {}",
@@ -207,7 +225,82 @@ pub fn disarm_auto_merge(gh_bin: &Path, cwd: Option<&Path>, pr: u32) -> Disarm {
     }
 }
 
-/// Handle `loom-daemon forge disable-auto-merge <pr>`. Never returns (exits).
+/// The audit comment recording what a disarm attempt did, or `None` when there
+/// is nothing to record.
+///
+/// `None` for [`Disarm::NotArmed`] is load-bearing: the overwhelmingly common
+/// case must leave no trace at all, or every ordinary stale-verdict clear (and
+/// every *held* PR an agent merely looks at) collects a comment saying nothing
+/// happened.
+///
+/// `hold` is the explicit-hold label (`loom:operator` / `loom:blocked` /
+/// `loom:operator-only`) when the caller found the PR parked, and it only
+/// changes the *wording*, never whether the disarm ran. Disarming can only
+/// **prevent** a merge, so it is the one write that enforces a hold rather than
+/// undoing it — an armed queue would merge the parked PR the moment required
+/// checks passed. The wording says so, because a write on a held PR that looks
+/// unexplained is exactly what an operator reads as the engine ignoring them.
+#[must_use]
+pub fn audit_comment_body(pr: u32, outcome: &Disarm, hold: Option<&str>) -> Option<String> {
+    let held = hold.map(|label| {
+        format!(
+            "\n\nThis PR carries `{label}`, so **no labels were changed and no verdict was \
+             cleared** — the hold is respected. The disarm is the exception on purpose: it can \
+             only *prevent* a merge, and an armed queue would have merged this PR regardless of \
+             the hold."
+        )
+    });
+    let footer = "\n\n---\n*Automated by `loom-daemon forge disable-auto-merge` (#8900)*";
+    match outcome {
+        Disarm::NotArmed => None,
+        Disarm::Disarmed => Some(format!(
+            "<!-- loom:auto-merge-disarmed pr={pr} -->\n\
+             **GitHub auto-merge disarmed** (`disablePullRequestAutoMerge`)\n\n\
+             A queued server-side merge was armed on this PR and has been stood down, because the \
+             review verdict covering this tree was just invalidated. An armed auto-merge is gated \
+             ONLY by the branch ruleset's REQUIRED checks: it never re-reads `loom:pr`, never \
+             notices the verdict being cleared, and never runs `merge-pr.sh`'s own merge-time \
+             gates — so it would have merged this unreviewed head anyway (#8694, #8847 and #8843 \
+             all merged that way on 2026-09-25).{held}{footer}",
+            held = held.unwrap_or_default(),
+        )),
+        Disarm::Failed(reason) => Some(format!(
+            "<!-- loom:auto-merge-disarm-failed pr={pr} -->\n\
+             ⚠️ **A server-side auto-merge may still be armed on this PR and could not be \
+             disabled**\n\n\
+             `{reason}`\n\n\
+             If one is armed it may merge this unreviewed head as soon as the ruleset's required \
+             checks pass. Disarm it by hand — `loom-daemon forge disable-auto-merge {pr}` or \
+             `gh pr merge --disable-auto {pr}` — or apply `loom:operator`.{held}{footer}",
+            held = held.unwrap_or_default(),
+        )),
+    }
+}
+
+/// Post [`audit_comment_body`]'s comment, when there is one. Best effort: a
+/// failed comment is warned about on stderr and never changes the verb's exit
+/// code, because the disarm itself has already happened and reporting it is
+/// strictly less important than having done it.
+fn post_audit_comment(gh_bin: &Path, pr: u32, outcome: &Disarm, hold: Option<&str>) {
+    let Some(body) = audit_comment_body(pr, outcome, hold) else {
+        return;
+    };
+    let mut cmd = Command::new(gh_bin);
+    cmd.arg("pr")
+        .arg("comment")
+        .arg(pr.to_string())
+        .arg("--body")
+        .arg(body);
+    apply_repo_override(&mut cmd);
+    cmd.stdin(Stdio::null());
+    let out = run_command(cmd, crate::forge_cmd::FORGE_CMD_TIMEOUT);
+    if !out.succeeded() {
+        eprintln!("Warning: could not post the auto-merge audit comment on PR #{pr}: {out:?}");
+    }
+}
+
+/// Handle `loom-daemon forge disable-auto-merge <pr> [--audit-comment [--hold
+/// <label>]]`. Never returns (exits).
 ///
 /// Exit codes:
 /// - `0` — nothing needed doing (`DISARMED=0`) **or** an armed auto-merge was
@@ -220,7 +313,15 @@ pub fn disarm_auto_merge(gh_bin: &Path, cwd: Option<&Path>, pr: u32) -> Disarm {
 ///   server-side auto-merge arm to disable there (`forge auto-merge` has no
 ///   Gitea implementation either, #8427), so there is nothing this verb can
 ///   do; declining keeps that distinguishable from a genuine failure.
-pub fn handle_disable_auto_merge(pr: u32) -> Result<()> {
+///
+/// With `audit_comment`, whatever the disarm actually did is also recorded as a
+/// PR comment ([`audit_comment_body`]) — nothing is posted when nothing was
+/// armed. This is what `verdict-staleness-guard.sh --clear` uses: the guard
+/// delegates the whole disarm (mutation *and* audit trail) to this verb rather
+/// than mirroring the mutation and two comment bodies in portable shell, which
+/// is both the language policy (`.loom/docs/shell-language-policy.md`) and what
+/// the shell-budget ratchet requires.
+pub fn handle_disable_auto_merge(pr: u32, audit_comment: bool, hold: Option<&str>) -> Result<()> {
     if crate::forge_cmd::detect_forge(None) == crate::forge_cmd::ForgeType::Gitea {
         eprintln!(
             "loom-daemon forge disable-auto-merge: gitea has no server-side auto-merge arm to \
@@ -228,8 +329,16 @@ pub fn handle_disable_auto_merge(pr: u32) -> Result<()> {
         );
         std::process::exit(crate::forge_cmd::EX_FORGE_DECLINED);
     }
+    // An empty `--hold ""` means "not held": the shell caller passes its
+    // HOLD_LABEL unconditionally so the invocation needs no conditional
+    // argument assembly (see verdict-staleness-guard.sh).
+    let hold = hold.filter(|label| !label.trim().is_empty());
     let gh = crate::forge_cmd::gh_bin();
-    match disarm_auto_merge(Path::new(&gh), None, pr) {
+    let outcome = disarm_auto_merge(Path::new(&gh), None, pr);
+    if audit_comment {
+        post_audit_comment(Path::new(&gh), pr, &outcome, hold);
+    }
+    match outcome {
         Disarm::NotArmed => {
             println!("DISARMED=0");
             println!("No auto-merge was armed on PR #{pr}; nothing to disable.");
@@ -329,6 +438,87 @@ exit 0
         assert!(
             !calls.contains("graphql"),
             "an unarmed PR must not trigger a mutation: {calls:?}"
+        );
+    }
+
+    /// An armed PR whose response carries **no `id` key at all** is also "not
+    /// armed" (PR #8990 review). The module doc promises absent fields fail safe
+    /// to `NotArmed`; a required `id` field made that case `Failed`, which
+    /// callers report to operators as "assume still armed, disarm it by hand".
+    /// There is nothing to disarm without a node id, and this matches the shell
+    /// guard's own reading (empty node id ⇒ nothing armed).
+    #[test]
+    fn armed_without_a_node_id_is_not_armed_not_failed() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("gh.log");
+        let gh = fake_gh(
+            dir.path(),
+            &log,
+            r#"{"autoMergeRequest":{"enabledAt":"2026-09-22T22:09:18Z"}}"#,
+            0,
+        );
+
+        assert_eq!(disarm_auto_merge(&gh, Some(dir.path()), 46), Disarm::NotArmed);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.contains("graphql"),
+            "no node id means no addressable mutation: {calls:?}"
+        );
+
+        // An explicitly EMPTY id is the same answer, for the same reason.
+        let log2 = dir.path().join("gh2.log");
+        let gh2 = fake_gh(
+            dir.path(),
+            &log2,
+            r#"{"id":"","autoMergeRequest":{"enabledAt":"2026-09-22T22:09:18Z"}}"#,
+            0,
+        );
+        assert_eq!(disarm_auto_merge(&gh2, Some(dir.path()), 47), Disarm::NotArmed);
+    }
+
+    /// `audit_comment_body` must stay silent on the common path: an ordinary
+    /// stale-verdict clear (nothing armed) must leave no comment behind, or
+    /// every clear — and every *held* PR an agent merely looks at — collects a
+    /// comment saying nothing happened.
+    #[test]
+    fn audit_comment_is_silent_when_nothing_was_armed() {
+        assert_eq!(audit_comment_body(42, &Disarm::NotArmed, None), None);
+        assert_eq!(audit_comment_body(42, &Disarm::NotArmed, Some("loom:operator")), None);
+    }
+
+    /// The disarm comment records what happened, names the hazard, and — on a
+    /// held PR — explains why a parked PR was written to at all.
+    #[test]
+    fn audit_comment_records_the_disarm_and_explains_a_hold() {
+        let plain = audit_comment_body(8694, &Disarm::Disarmed, None).unwrap();
+        assert!(plain.contains("auto-merge disarmed"), "{plain}");
+        assert!(plain.contains("REQUIRED checks"), "{plain}");
+        assert!(plain.contains("#8694"), "{plain}");
+        assert!(!plain.contains("loom:operator"), "no hold was passed: {plain}");
+
+        let held = audit_comment_body(8694, &Disarm::Disarmed, Some("loom:operator")).unwrap();
+        assert!(held.contains("loom:operator"), "{held}");
+        assert!(
+            held.contains("no labels were changed"),
+            "the held wording must say the hold was respected: {held}"
+        );
+        assert!(
+            held.contains("only *prevent* a merge"),
+            "the held wording must explain why the disarm is the exception: {held}"
+        );
+    }
+
+    /// A FAILED disarm must never produce the "disarmed" wording — the comment
+    /// has to say the queue may still fire, with the hand-disarm command.
+    #[test]
+    fn audit_comment_for_a_failure_warns_instead_of_claiming_a_disarm() {
+        let body = audit_comment_body(8694, &Disarm::Failed("gh: boom".to_string()), None).unwrap();
+        assert!(!body.contains("auto-merge disarmed"), "{body}");
+        assert!(body.contains("could not be"), "{body}");
+        assert!(body.contains("gh: boom"), "the reason must be quoted: {body}");
+        assert!(
+            body.contains("loom-daemon forge disable-auto-merge 8694"),
+            "the hand-disarm command must be named: {body}"
         );
     }
 

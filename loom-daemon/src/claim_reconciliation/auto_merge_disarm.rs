@@ -1,6 +1,10 @@
 //! Disarm GitHub's server-side auto-merge as part of invalidating a verdict
-//! (issue #8900) — the daemon-native half of the fix, mirroring
-//! `verdict-staleness-guard.sh --clear`'s inline `gh api graphql` disarm.
+//! (issue #8900) — the in-process hook on the daemon's own periodic pass.
+//!
+//! `verdict-staleness-guard.sh --clear` (the agent-invoked fast path) reaches
+//! the same disarm through the CLI verb instead, so there is exactly one
+//! implementation of the mutation; this file is the no-CLI-hop caller, not a
+//! parallel one.
 //!
 //! Clearing `loom:pr` for a head move used to be purely a label + comment
 //! transition. That is not enough: an auto-merge armed earlier is gated ONLY by

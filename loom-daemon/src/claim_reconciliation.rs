@@ -3372,6 +3372,26 @@ pub mod forge {
     /// [`anchor_verdict`]. Anchoring writes no labels, so the staleness
     /// behavior of every already-marked verdict is untouched.
     ///
+    /// # Held PRs are NOT covered by this pass (pre-existing, #8900 scope note)
+    ///
+    /// "Runs on the periodic tick regardless" is true of every PR this pass can
+    /// *see*, and a PR on an explicit hold (`loom:operator`, `loom:blocked`,
+    /// `loom:operator-only`) is deliberately not one of them: [`list_verdict_prs`]
+    /// skips the comment/marker fetch for a held PR, so [`decide_verdict`]
+    /// answers `Keep(Unverifiable)` before it can reach its own `on_hold` branch
+    /// and [`VerdictAction::Invalidate`] — and therefore
+    /// [`super::auto_merge_disarm::disarm_before_invalidation`] — is never
+    /// reached for one. That is this module's long-standing "never write to a
+    /// parked PR" design, not a #8900 regression.
+    ///
+    /// The consequence to know about: for the held+armed combination, the
+    /// auto-merge disarm (#8900) comes only from the shell path —
+    /// `verdict-staleness-guard.sh --clear`, which judge.md / doctor.md /
+    /// champion-pr-merge.md do run over held PRs and which shells out to
+    /// `loom-daemon forge disable-auto-merge --audit-comment --hold <label>`.
+    /// Do not "fix" this by making the daemon pass write to held PRs without
+    /// deciding that question on its own merits first.
+    ///
     /// Returns [`VerdictReconcileStats`] summed across both verdict labels.
     pub fn reconcile_pr_verdicts(gh_bin: &Path, root: &Path) -> VerdictReconcileStats {
         let mut stats = VerdictReconcileStats::default();

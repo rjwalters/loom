@@ -53,6 +53,39 @@ fn long_help_explains_why_and_the_exit_codes() {
     }
 }
 
+/// `verdict-staleness-guard.sh --clear` invokes exactly
+/// `forge disable-auto-merge <pr> --audit-comment --hold "$HOLD_LABEL"`, so both
+/// flags must exist and be documented. The guard delegating instead of mirroring
+/// the mutation inline is the PR #8990 review outcome — dropping either flag
+/// silently breaks that shell call site, which no Rust test would otherwise
+/// notice.
+#[test]
+fn the_shell_guards_flags_exist_and_are_documented() {
+    let (ok, h) = run(&["forge", "disable-auto-merge", "--help"]);
+    assert!(ok, "`disable-auto-merge --help` failed");
+    for needle in ["--audit-comment", "--hold <LABEL>"] {
+        assert!(h.contains(needle), "--help lost `{needle}`:\n{h}");
+    }
+    // The flags must be accepted together on the real parser, not merely listed.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+        .args([
+            "forge",
+            "disable-auto-merge",
+            "1",
+            "--audit-comment",
+            "--hold",
+            "",
+        ])
+        .env("PATH", "/nonexistent-so-gh-cannot-be-found")
+        .output()
+        .expect("run loom-daemon");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("unrecognized"),
+        "the guard's exact invocation must parse:\n{stderr}"
+    );
+}
+
 /// The inverse of `forge auto-merge`'s own pinned property (#8427): the ARM is
 /// operator-only, the DISARM must NOT be — gating a safety-increasing verb
 /// would keep the automated verdict-invalidation paths from calling it.
