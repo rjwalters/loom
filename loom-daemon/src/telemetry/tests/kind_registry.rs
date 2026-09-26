@@ -234,15 +234,25 @@ fn the_new_kind_gate_is_above_every_frozen_gate() {
 /// `NEW_KIND_SCHEMA_VERSION` (and add a `Version history` row in
 /// `defaults/docs/telemetry-schema.md`) in the same change that bumps
 /// `CURRENT_SCHEMA_VERSION` that far.
-#[test]
-fn the_new_kind_gate_stays_above_the_shared_current_version() {
-    assert!(
-        CURRENT_SCHEMA_VERSION < NEW_KIND_SCHEMA_VERSION,
-        "CURRENT_SCHEMA_VERSION ({CURRENT_SCHEMA_VERSION}) has reached \
-         NEW_KIND_SCHEMA_VERSION ({NEW_KIND_SCHEMA_VERSION}); raise the latter so the \
-         unpinned kinds and the post-#8921 kinds stay distinguishable on the wire"
-    );
-}
+///
+/// Both operands are compile-time constants, so this is a `const` **item** and
+/// not a `#[test]`: the offending bump then fails to *compile*, which is earlier
+/// than a test failure and cannot be skipped by a filtered test run. (A runtime
+/// `assert!` on two `const`s is also what `clippy::assertions_on_constants`
+/// rejects under the OTLP job's `--all-targets -D warnings`.)
+///
+/// It has to be a `const _` item rather than an inline `const { … }` block
+/// inside a test fn: an inline block in a never-called `#[test]` body is *not*
+/// evaluated by `cargo check`/`cargo clippy --all-targets`, so that spelling
+/// would compile happily with `CURRENT_SCHEMA_VERSION = 12`. This one does not —
+/// verified by bumping the constant locally. `const` evaluation has no
+/// `format_args!`, hence the static message.
+const _: () = assert!(
+    CURRENT_SCHEMA_VERSION < NEW_KIND_SCHEMA_VERSION,
+    "CURRENT_SCHEMA_VERSION has reached NEW_KIND_SCHEMA_VERSION (12); raise the latter so \
+     the unpinned kinds and the post-#8921 kinds stay distinguishable on the wire — see \
+     NEW_KIND_SCHEMA_VERSION in telemetry/kinds.rs"
+);
 
 // ---------------------------------------------------------------------------
 // 3. A union merge cannot pass silently broken.
