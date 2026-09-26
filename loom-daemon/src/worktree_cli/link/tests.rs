@@ -334,8 +334,8 @@ fn run_provisions_every_family_through_paths_containing_spaces() {
         quiet: true,
     };
     let exclude = exclude_at(&exclude_path);
-    link_root_node_modules(&opts, &exclude, &quiet_reporter());
-    link_nested_node_modules(&opts, &exclude, &quiet_reporter());
+    link_root_node_modules(&opts, NodeModulesPolicy::Link, &exclude, &quiet_reporter());
+    link_nested_node_modules(&opts, NodeModulesPolicy::Link, &exclude, &quiet_reporter());
     link_configured_paths(&opts, &exclude, &quiet_reporter());
     link_mcp_json(&opts, &exclude, &quiet_reporter());
 
@@ -377,7 +377,12 @@ fn run_leaves_a_pre_existing_destination_alone_and_warns() {
         worktree: worktree.clone(),
         quiet: true,
     };
-    link_root_node_modules(&opts, &exclude_at(&exclude_path), &quiet_reporter());
+    link_root_node_modules(
+        &opts,
+        NodeModulesPolicy::Link,
+        &exclude_at(&exclude_path),
+        &quiet_reporter(),
+    );
 
     assert!(!fs::symlink_metadata(worktree.join("node_modules"))
         .unwrap()
@@ -405,7 +410,12 @@ fn a_dangling_destination_symlink_is_attempted_and_warned_about() {
         worktree: worktree.clone(),
         quiet: true,
     };
-    link_root_node_modules(&opts, &exclude_at(&exclude_path), &quiet_reporter());
+    link_root_node_modules(
+        &opts,
+        NodeModulesPolicy::Link,
+        &exclude_at(&exclude_path),
+        &quiet_reporter(),
+    );
 
     assert_eq!(
         fs::read_link(worktree.join("node_modules")).unwrap(),
@@ -428,6 +438,230 @@ fn run_always_reports_success() {
         }),
         0
     );
+}
+
+// ---------------------------------------------------------------------------
+// NodeModulesPolicy — the pnpm exclusion (#8944)
+// ---------------------------------------------------------------------------
+
+/// A main workspace with a root and a nested `node_modules` to share, plus a
+/// `linkPaths` entry and an `.mcp.json`, and a worktree ready to receive all
+/// four. Returns `(main, worktree)`.
+fn shareable_workspace(tree: &TempTree) -> (PathBuf, PathBuf) {
+    let main = tree.dir("main");
+    let worktree = tree.dir("wt");
+
+    fs::create_dir_all(main.join("node_modules")).unwrap();
+    fs::create_dir_all(main.join("apps/web/node_modules")).unwrap();
+    fs::write(main.join("apps/web/package.json"), "{}").unwrap();
+    fs::create_dir_all(main.join("gen/wasm")).unwrap();
+    fs::write(main.join(".mcp.json"), "{}").unwrap();
+    fs::create_dir_all(main.join(".loom")).unwrap();
+
+    fs::write(worktree.join("package.json"), "{}").unwrap();
+    fs::create_dir_all(worktree.join("apps/web")).unwrap();
+
+    (main, worktree)
+}
+
+/// `.loom/config.json` with a `linkPaths` entry plus whatever else is wanted.
+fn write_config(main: &Path, worktree_block: &str) {
+    fs::create_dir_all(main.join(".loom")).unwrap();
+    fs::write(
+        main.join(".loom/config.json"),
+        format!(r#"{{"worktree":{{"linkPaths":["gen/wasm"]{worktree_block}}}}}"#),
+    )
+    .unwrap();
+}
+
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+#[test]
+fn a_pnpm_lockfile_stops_both_node_modules_families() {
+    // The whole point of #8944: pnpm purges THROUGH the symlink, and `CI=true`
+    // ANDs away every guard pnpm offers, so the only defence is not to create
+    // the alias in the first place.
+    let tree = TempTree::new("pnpm-lock");
+    let (main, worktree) = shareable_workspace(&tree);
+    write_config(&main, "");
+    fs::write(main.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+
+    assert_eq!(
+        NodeModulesPolicy::resolve(&main),
+        NodeModulesPolicy::Skip(SkipReason::PnpmWorkspace)
+    );
+
+    run(&Options {
+        repo_root: main.clone(),
+        worktree: worktree.clone(),
+        quiet: true,
+    });
+
+    assert!(!is_symlink(&worktree.join("node_modules")), "root family must be skipped");
+    assert!(
+        !is_symlink(&worktree.join("apps/web/node_modules")),
+        "nested family must be skipped too — a pnpm monorepo is exactly where it fires"
+    );
+    // And the main workspace's tree — the thing a purge would have destroyed
+    // — is untouched, because nothing now points at it.
+    assert!(main.join("node_modules").is_dir());
+    assert!(main.join("apps/web/node_modules").is_dir());
+}
+
+#[test]
+fn the_pnpm_skip_leaves_link_paths_and_mcp_json_alone() {
+    // Narrow blast radius: only the package manager's own mutable directory
+    // is withheld. `linkPaths` is opted into path by path by the repo.
+    let tree = TempTree::new("pnpm-others");
+    let (main, worktree) = shareable_workspace(&tree);
+    write_config(&main, "");
+    fs::write(main.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+
+    run(&Options {
+        repo_root: main.clone(),
+        worktree: worktree.clone(),
+        quiet: true,
+    });
+
+    assert_eq!(link_target(&worktree.join("gen/wasm")), main.join("gen/wasm"));
+    assert_eq!(link_target(&worktree.join(".mcp.json")), main.join(".mcp.json"));
+}
+
+#[test]
+fn pnpm_workspace_yaml_and_package_manager_are_markers_too() {
+    let tree = TempTree::new("pnpm-markers");
+
+    let by_workspace_file = tree.dir("ws");
+    fs::write(by_workspace_file.join("pnpm-workspace.yaml"), "packages:\n  - 'apps/*'\n").unwrap();
+    assert!(is_pnpm_workspace(&by_workspace_file));
+
+    // The `packageManager` marker catches a fresh clone whose lockfile has not
+    // been written yet — precisely when a worktree gets created.
+    let by_field = tree.dir("pm");
+    fs::write(by_field.join("package.json"), r#"{"name":"x","packageManager":"pnpm@11.20.0"}"#)
+        .unwrap();
+    assert!(is_pnpm_workspace(&by_field));
+
+    let bare = tree.dir("bare-pm");
+    fs::write(bare.join("package.json"), r#"{"packageManager":"pnpm"}"#).unwrap();
+    assert!(is_pnpm_workspace(&bare));
+}
+
+#[test]
+fn a_non_pnpm_workspace_still_links_exactly_as_before() {
+    // The no-behaviour-change half. An npm/yarn repo sees the status quo.
+    let tree = TempTree::new("npm-unchanged");
+    let (main, worktree) = shareable_workspace(&tree);
+    write_config(&main, "");
+    fs::write(main.join("package-lock.json"), "{}").unwrap();
+    fs::write(main.join("package.json"), r#"{"packageManager":"npm@10.0.0"}"#).unwrap();
+
+    assert_eq!(NodeModulesPolicy::resolve(&main), NodeModulesPolicy::Link);
+
+    run(&Options {
+        repo_root: main.clone(),
+        worktree: worktree.clone(),
+        quiet: true,
+    });
+
+    assert_eq!(link_target(&worktree.join("node_modules")), main.join("node_modules"));
+    assert_eq!(
+        link_target(&worktree.join("apps/web/node_modules")),
+        main.join("apps/web/node_modules")
+    );
+}
+
+#[test]
+fn a_package_manager_merely_prefixed_pnpm_is_not_pnpm() {
+    let tree = TempTree::new("pnpm-prefix");
+    let root = tree.dir("root");
+    fs::write(root.join("package.json"), r#"{"packageManager":"pnpmx@1.0.0"}"#).unwrap();
+    assert!(!is_pnpm_workspace(&root));
+}
+
+#[test]
+fn an_unparseable_package_json_is_not_pnpm() {
+    // Guessing "pnpm" from a manifest that does not parse would withhold the
+    // symlink from a repo that never asked. Absent evidence, link.
+    let tree = TempTree::new("pnpm-badjson");
+    let root = tree.dir("root");
+    fs::write(root.join("package.json"), "{ not json").unwrap();
+    assert!(!is_pnpm_workspace(&root));
+    assert_eq!(NodeModulesPolicy::resolve(&root), NodeModulesPolicy::Link);
+}
+
+#[test]
+fn link_node_modules_true_re_enables_the_link_on_a_pnpm_workspace() {
+    let tree = TempTree::new("override-true");
+    let (main, worktree) = shareable_workspace(&tree);
+    fs::write(main.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    write_config(&main, r#","linkNodeModules":true"#);
+
+    assert_eq!(NodeModulesPolicy::resolve(&main), NodeModulesPolicy::Link);
+
+    run(&Options {
+        repo_root: main.clone(),
+        worktree: worktree.clone(),
+        quiet: true,
+    });
+
+    assert_eq!(link_target(&worktree.join("node_modules")), main.join("node_modules"));
+}
+
+#[test]
+fn link_node_modules_false_disables_the_link_on_a_non_pnpm_workspace() {
+    let tree = TempTree::new("override-false");
+    let (main, worktree) = shareable_workspace(&tree);
+    write_config(&main, r#","linkNodeModules":false"#);
+
+    assert_eq!(
+        NodeModulesPolicy::resolve(&main),
+        NodeModulesPolicy::Skip(SkipReason::ConfigDisabled)
+    );
+
+    run(&Options {
+        repo_root: main.clone(),
+        worktree: worktree.clone(),
+        quiet: true,
+    });
+
+    assert!(!is_symlink(&worktree.join("node_modules")));
+    assert!(!is_symlink(&worktree.join("apps/web/node_modules")));
+}
+
+#[test]
+fn the_override_accepts_the_string_spellings_of_its_booleans() {
+    // A hand-written `.loom/config.json` is as likely to say `"false"` as
+    // `false`, and reading that as "unset" would link a pnpm worktree anyway
+    // — the exact outcome this change exists to prevent.
+    let tree = TempTree::new("override-strings");
+
+    let quoted_false = tree.dir("qf");
+    write_config(&quoted_false, r#","linkNodeModules":"false""#);
+    assert_eq!(
+        NodeModulesPolicy::resolve(&quoted_false),
+        NodeModulesPolicy::Skip(SkipReason::ConfigDisabled)
+    );
+
+    let quoted_true = tree.dir("qt");
+    fs::write(quoted_true.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    write_config(&quoted_true, r#","linkNodeModules":"TRUE""#);
+    assert_eq!(NodeModulesPolicy::resolve(&quoted_true), NodeModulesPolicy::Link);
+
+    // "auto" and a typo both mean auto: safe on pnpm, status quo elsewhere.
+    let explicit_auto = tree.dir("auto");
+    fs::write(explicit_auto.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    write_config(&explicit_auto, r#","linkNodeModules":"auto""#);
+    assert_eq!(
+        NodeModulesPolicy::resolve(&explicit_auto),
+        NodeModulesPolicy::Skip(SkipReason::PnpmWorkspace)
+    );
+
+    let typo = tree.dir("typo");
+    write_config(&typo, r#","linkNodeModules":"yes please""#);
+    assert_eq!(NodeModulesPolicy::resolve(&typo), NodeModulesPolicy::Link);
 }
 
 fn quiet_reporter() -> Reporter {

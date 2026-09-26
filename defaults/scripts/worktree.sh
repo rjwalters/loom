@@ -929,8 +929,8 @@ Safety Features:
   ✓ Prevents nested worktrees
   ✓ Non-interactive (safe for AI agents)
   ✓ Reuses existing branches automatically
-  ✓ Symlinks node_modules from main (avoids pnpm install)
-  ✓ Symlinks nested per-package node_modules for pnpm/monorepo workspaces
+  ✓ Symlinks node_modules from main (avoids npm install) — NOT on pnpm repos
+  ✓ Symlinks nested per-package node_modules for monorepo workspaces
   ✓ Symlinks extra gitignored paths via .loom/config.json worktree.linkPaths
   ✓ Excludes created symlinks via .git/info/exclude (no accidental git add)
   ✓ Symlinks .mcp.json from main (MCP config visible in worktrees)
@@ -994,7 +994,13 @@ Monorepo / Generated-Artifact Symlinks:
   Each created symlink is added to the worktree's .git/info/exclude so 'git add -A'
   never stages it. All symlinking is best-effort — a failed link warns and
   continues; it never aborts worktree creation. Repos with no nested node_modules
-  and no worktree.linkPaths config see no behavior change.
+  and no worktree.linkPaths config see no behavior change. NEITHER node_modules
+  family runs on a pnpm workspace (root pnpm-lock.yaml / pnpm-workspace.yaml, or
+  packageManager: pnpm@...): pnpm purges THROUGH such a symlink into the MAIN
+  workspace and CI=true defeats every confirmation it offers, so run 'pnpm
+  install' in the worktree instead (hardlinked from pnpm's shared store, which
+  is the disk sharing the symlink was reaching for). Override either way with
+  .loom/config.json worktree.linkNodeModules: true | false | "auto" (#8944).
 
 Resuming Abandoned Work:
   If an agent abandoned work on issue #42, a new agent can resume:

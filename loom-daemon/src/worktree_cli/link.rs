@@ -9,10 +9,13 @@
 //! shell's own order (the order is observable — it is the order the lines
 //! print in):
 //!
-//! 1. Root `node_modules` (the 30–60s `pnpm install` this saves per worktree).
+//! 1. Root `node_modules` (the 30–60s `pnpm install` this saves per worktree)
+//!    — **not** on a pnpm workspace, where the aliasing is unsafe and the
+//!    family is skipped; see "Why pnpm workspaces are excluded" below (#8944).
 //! 2. Nested per-package `node_modules` for pnpm/monorepo layouts, discovered
 //!    by directory scan rather than by parsing a workspace manifest (#3528 —
-//!    no YAML parser dependency).
+//!    no YAML parser dependency). Skipped alongside family 1 on a pnpm
+//!    workspace, for the same reason.
 //! 3. `worktree.linkPaths` from the resolved config tier chain (#4062), e.g.
 //!    generated `wasm-pack` bindings.
 //! 4. `.mcp.json`, which is gitignored and therefore invisible from a worktree
@@ -22,6 +25,45 @@
 //! (#5474), because a `.gitignore` rule written as `node_modules/` matches
 //! *directories* and not the symlink this creates — so without the exclude
 //! entry, `git add -A` stages it and `git status` is never clean.
+//!
+//! # Why pnpm workspaces are excluded (#8944)
+//!
+//! A `node_modules` symlink makes the worktree's dependency tree an *alias* of
+//! the main workspace's, and pnpm writes to `node_modules` **through** that
+//! alias. Measured against pnpm 11.20.0, not inferred:
+//!
+//! - pnpm decides the modules directory must be re-provisioned whenever
+//!   `validateModules` finds a settings mismatch (store dir, virtual store
+//!   dir, layout version, hoist patterns). Without a TTY it then aborts with
+//!   `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY` — a message whose own hint
+//!   tells the reader to set `CI=true`, which is exactly what a headless
+//!   Builder already has reason to do.
+//! - The purge itself is `removeContentsOfDir(dir)`: `readdir(dir)` followed
+//!   by `rimraf(dir/item)` for each entry. Through the symlink those paths
+//!   resolve into the MAIN workspace, so the purge destroys the main clone's
+//!   `node_modules` (and every other worktree's, since they all alias it) and
+//!   leaves the symlink itself in place. Reproduced in a sandbox: a canary
+//!   file in the main tree was deleted and pnpm logged
+//!   `Recreating <main>/node_modules`.
+//! - **There is no config knob that prevents this.** pnpm computes
+//!   `confirmModulesPurge: opts.confirmModulesPurge && !opts.ci`, so `CI=true`
+//!   ANDs away any `confirmModulesPurge: true` a repo or a worktree-local
+//!   `.npmrc` sets. Guarding the destructive path from the outside (the shape
+//!   #8944 originally proposed) is therefore not implementable; removing the
+//!   alias is the only fix that holds.
+//!
+//! The aliasing is also silently wrong in the benign direction: a branch that
+//! changes dependencies is exercised against the main clone's installed tree
+//! rather than its own lockfile.
+//!
+//! So on a pnpm workspace both `node_modules` families are skipped and the
+//! reason is printed. The cost is bounded: pnpm's content-addressable store
+//! already provides the disk sharing this symlink was reaching for, so a
+//! worktree-local `pnpm install` hardlinks rather than re-downloads. Detection
+//! is a `pnpm-lock.yaml` / `pnpm-workspace.yaml` at the workspace root, or a
+//! `packageManager: "pnpm@…"` in its `package.json`. `worktree.linkNodeModules`
+//! overrides the decision either way (`true` re-enables, `false` disables it
+//! for npm/yarn repos too); the default is `"auto"`.
 //!
 //! # Why this slice, and why it is safe to take now
 //!
@@ -73,13 +115,20 @@
 //! - The membership test is byte-exact whole-line matching (`grep -qxF`), so a
 //!   non-UTF-8 exclude file still de-duplicates correctly.
 //!
-//! # The one divergence
+//! # The divergences
 //!
-//! The shell gated the whole `linkPaths` family on `command -v jq`. There is
-//! no `jq` here, so the family now runs on a host without it. That is a
-//! retirement, not a regression — see `test-worktree-nested-symlinks.sh`'s
-//! Test 5, where the retired assertion and its stronger successor are recorded
-//! in the suite itself per `verification-recipes.md` §6.
+//! 1. The shell gated the whole `linkPaths` family on `command -v jq`. There
+//!    is no `jq` here, so the family now runs on a host without it. That is a
+//!    retirement, not a regression — see `test-worktree-nested-symlinks.sh`'s
+//!    Test 5, where the retired assertion and its stronger successor are
+//!    recorded in the suite itself per `verification-recipes.md` §6.
+//! 2. The pnpm-workspace skip above (#8944). The retired shell always linked,
+//!    so this is a deliberate behaviour change rather than a port defect. It
+//!    is kept out of `tests/worktree_link_differential.rs`'s corpus on
+//!    purpose: that harness asserts the port still AGREES with the shell, and
+//!    a scenario the two are meant to disagree on would only teach it to
+//!    accept disagreement. The new behaviour is pinned by this module's own
+//!    unit tests and by Test 8 of the retained shell suite.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -127,9 +176,11 @@ pub fn run(opts: &Options) -> i32 {
         quiet: opts.quiet,
     };
     let exclude = ExcludeFile::resolve(&opts.worktree);
+    let policy = NodeModulesPolicy::resolve(&opts.repo_root);
+    announce_node_modules_skip(opts, policy, &out);
 
-    link_root_node_modules(opts, &exclude, &out);
-    link_nested_node_modules(opts, &exclude, &out);
+    link_root_node_modules(opts, policy, &exclude, &out);
+    link_nested_node_modules(opts, policy, &exclude, &out);
     link_configured_paths(opts, &exclude, &out);
     link_mcp_json(opts, &exclude, &out);
 
@@ -281,10 +332,130 @@ impl ExcludeFile {
 }
 
 // ---------------------------------------------------------------------------
+// Whether the two node_modules families may link at all (#8944)
+// ---------------------------------------------------------------------------
+
+/// The decision, made once per run and applied to families 1 and 2.
+///
+/// `linkPaths` and `.mcp.json` are deliberately NOT governed by it: neither
+/// is a package manager's mutable working directory, and `linkPaths` entries
+/// are opted into path by path by the repo that configured them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NodeModulesPolicy {
+    /// Symlink, as every non-pnpm repo always has.
+    Link,
+    Skip(SkipReason),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SkipReason {
+    /// `auto` found a pnpm workspace. See the module docs.
+    PnpmWorkspace,
+    /// `worktree.linkNodeModules: false`.
+    ConfigDisabled,
+}
+
+impl NodeModulesPolicy {
+    /// `worktree.linkNodeModules` from the same tier chain `linkPaths` uses
+    /// (#4062), falling back to the pnpm probe.
+    ///
+    /// Accepts the booleans and their string spellings, because a value
+    /// hand-written into `.loom/config.json` is as likely to be `"false"` as
+    /// `false` and silently linking anyway is the outcome this whole change
+    /// exists to prevent. Anything else — including a typo — means `auto`,
+    /// which is the safe direction on a pnpm repo and the status quo
+    /// elsewhere.
+    fn resolve(repo_root: &Path) -> Self {
+        let effective = crate::config_resolver::resolve_effective_config(repo_root);
+        let configured =
+            crate::config_resolver::get_path(&effective, "worktree.linkNodeModules").cloned();
+        match configured {
+            Some(Value::Bool(true)) => return Self::Link,
+            Some(Value::Bool(false)) => return Self::Skip(SkipReason::ConfigDisabled),
+            Some(Value::String(ref text)) if text.eq_ignore_ascii_case("true") => {
+                return Self::Link
+            }
+            Some(Value::String(ref text)) if text.eq_ignore_ascii_case("false") => {
+                return Self::Skip(SkipReason::ConfigDisabled)
+            }
+            _ => {}
+        }
+        if is_pnpm_workspace(repo_root) {
+            Self::Skip(SkipReason::PnpmWorkspace)
+        } else {
+            Self::Link
+        }
+    }
+
+    fn links(self) -> bool {
+        self == Self::Link
+    }
+}
+
+/// Is the main workspace managed by pnpm?
+///
+/// Three markers, any one of which is enough. A lockfile or a
+/// `pnpm-workspace.yaml` is conclusive; `packageManager` catches a fresh clone
+/// whose lockfile has not been written yet, which is precisely when a worktree
+/// gets created. Deliberately does NOT parse the workspace manifest — the
+/// nested scan avoided a YAML dependency for the same reason (#3528).
+fn is_pnpm_workspace(repo_root: &Path) -> bool {
+    if is_file(&repo_root.join("pnpm-lock.yaml")) || is_file(&repo_root.join("pnpm-workspace.yaml"))
+    {
+        return true;
+    }
+    let Ok(text) = fs::read_to_string(repo_root.join("package.json")) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    manifest
+        .get("packageManager")
+        .and_then(Value::as_str)
+        .is_some_and(|spec| spec == "pnpm" || spec.starts_with("pnpm@"))
+}
+
+/// Say why, once, and only when there was something to share.
+///
+/// Gated on the main workspace actually having a root `node_modules`: a repo
+/// with nothing installed would otherwise get an explanation for the absence
+/// of a symlink it was never going to receive.
+fn announce_node_modules_skip(opts: &Options, policy: NodeModulesPolicy, out: &Reporter) {
+    let NodeModulesPolicy::Skip(reason) = policy else {
+        return;
+    };
+    if !is_dir(&opts.repo_root.join("node_modules")) {
+        return;
+    }
+    match reason {
+        SkipReason::ConfigDisabled => {
+            out.info("node_modules not symlinked (worktree.linkNodeModules is false)");
+        }
+        SkipReason::PnpmWorkspace => {
+            out.warning("node_modules NOT symlinked: pnpm workspace detected (#8944)");
+            out.info("  pnpm deletes THROUGH a node_modules symlink: an install that decides to");
+            out.info("  re-provision purges the MAIN workspace's tree, and CI=true disables every");
+            out.info("  confirmation pnpm has. Run 'pnpm install' in this worktree instead — it");
+            out.info("  hardlinks from pnpm's shared store, so it is cheap and worktree-local.");
+            out.info("  Opt back in with worktree.linkNodeModules=true in .loom/config.json.");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 1. Root node_modules
 // ---------------------------------------------------------------------------
 
-fn link_root_node_modules(opts: &Options, exclude: &ExcludeFile, out: &Reporter) {
+fn link_root_node_modules(
+    opts: &Options,
+    policy: NodeModulesPolicy,
+    exclude: &ExcludeFile,
+    out: &Reporter,
+) {
+    if !policy.links() {
+        return;
+    }
     let main_node_modules = opts.repo_root.join("node_modules");
     let worktree_node_modules = opts.worktree.join("node_modules");
     let worktree_package_json = opts.worktree.join("package.json");
@@ -309,7 +480,17 @@ fn link_root_node_modules(opts: &Options, exclude: &ExcludeFile, out: &Reporter)
 // 2. Nested per-package node_modules
 // ---------------------------------------------------------------------------
 
-fn link_nested_node_modules(opts: &Options, exclude: &ExcludeFile, out: &Reporter) {
+fn link_nested_node_modules(
+    opts: &Options,
+    policy: NodeModulesPolicy,
+    exclude: &ExcludeFile,
+    out: &Reporter,
+) {
+    // Same hazard, and a pnpm monorepo is exactly where family 2 fires. No
+    // second message: `announce_node_modules_skip` already covered both.
+    if !policy.links() {
+        return;
+    }
     // The shell gated the whole scan on the ROOT node_modules existing, which
     // is not obviously necessary (a monorepo could in principle have per-
     // package installs and no root one) but is the behaviour, so it stays.
