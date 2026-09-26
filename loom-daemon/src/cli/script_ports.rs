@@ -49,6 +49,13 @@ pub(crate) enum ScriptPortCommand {
     /// 1 when none did — data, not an error.
     ReleaseResolve(super::release_resolve::ReleaseResolveArgs),
 
+    /// Why an already-resolved release has no artifact for a target (#8654):
+    /// the #8515 age + asset-count classification, for
+    /// `loom-daemon-update.sh`'s forced `--fetch` refusal. Exit 0 + one line
+    /// = the reason, 1 = the release does carry the artifact. Optional to its
+    /// caller — an older binary lacking it degrades to the flat reason.
+    ReleaseExplain(super::release_explain::ReleaseExplainArgs),
+
     /// `merge-pr.sh`'s verdict-label mutual-exclusion guard (#8112), the
     /// second slice of the merge-pr port (#8191). Exit 1 = contradictory,
     /// 0 = clean, 2 = the guard could not run — and 2 must refuse the merge.
@@ -217,6 +224,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DepRecheckFingerprint(cmd) => cmd.run(),
             ScriptPortCommand::ReleaseFetch(args) => args.run(),
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
+            ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),

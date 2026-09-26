@@ -45,6 +45,7 @@ pub(crate) mod premise_check;
 pub(crate) mod quarantine;
 pub(crate) mod ready_queue_cmd;
 pub(crate) mod reconcile_stack;
+pub(crate) mod release_explain;
 pub(crate) mod release_fetch;
 pub(crate) mod release_resolve;
 pub(crate) mod restart;
