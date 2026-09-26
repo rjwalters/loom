@@ -172,7 +172,7 @@ views" table.
 | 4 | **What took long right now?** The longest individual jobs, with `run_id` / `job_id` | `ci.job` records (7 days) |
 | 5 | **Which runs failed, and why?** Each failed run, its non-successful jobs, how much of each job's log was captured, and the exact Logs Explorer filter to read it | `ci.run` / `ci.job` / `ci.job.log` (7 days) |
 | 6 | **Where did a slow run's time go?** Run wall-clock vs its longest job, job count and summed job time | `ci.run` / `ci.job` records (7 days) |
-| 7 | **Per issue, where did the time go — Builder, CI, Judge, merge?** (#9007) Joins `loom_analytics.raw_ship_outcome` (apply `cycle-time-extract.sql` first) to the `ci.run` triggered by that issue's `feature/issue-N` branch, on the issue number recovered from `loom.ci.ref`. Reports Builder/Judge/merge-phase seconds beside the CI run's own wall-clock duration. Two things it deliberately does **not** claim: the CI segment is one wall-clock span, not queued-vs-running (GitHub's queue timestamp never reaches `CiRunRecord`), and "lead time" is the sweep's own `total_duration_sec`, not issue-filed-to-merged (no forge issue-open timestamp reaches this stream — see [`cycle-time-questions.md`](https://github.com/rjwalters/loom/blob/main/defaults/observability/cycle-time-questions.md) §"What this question set cannot answer") | `sweep.outcome` rollup + `ci.run` records (7-day CI horizon; sweep-side per the rollup's own retention) |
+| 7 | **Per issue, where did the time go — Builder, CI, Judge, merge?** (#9007) Joins `loom_analytics.raw_ship_outcome` (apply `cycle-time-extract.sql` first) to the `ci.run` triggered by that issue's `feature/issue-N` branch, on the issue number recovered from `loom.ci.ref`. Reports Builder/Judge/merge-phase seconds beside the CI run's queue time (`ci_queued_s`, from `loom.ci.queued_ms`) and its running time (`ci_wall_s`). The queue split is a #9007 follow-up; `ci_queued_s` is NULL for runs recorded before it. One thing it deliberately does **not** claim: "lead time" is the sweep's own `total_duration_sec`, not issue-filed-to-merged (no forge issue-open timestamp reaches this stream — see [`cycle-time-questions.md`](https://github.com/rjwalters/loom/blob/main/defaults/observability/cycle-time-questions.md) §"What this question set cannot answer") | `sweep.outcome` rollup + `ci.run` records (7-day CI horizon; sweep-side per the rollup's own retention) |
 
 Section 7's join key is the **issue** number, not a PR number: `ci.run`/
 `ci.job` **log** records carry no PR/issue attribute of their own (only
@@ -454,7 +454,7 @@ completed job produces three lines, and so does each completed run:
 
 | `record.kind` | Fields | OTLP signal |
 |---|---|---|
-| `ci.run` | `repo`, `visibility`, `run_id`, `run_attempt`, `workflow`, `ref`, `head_sha`, `event`, `status`, `conclusion`, `triggered_by`, `started_at`, `completed_at`, `duration_ms` | log record `ci.run`, timestamped at `completed_at` |
+| `ci.run` | `repo`, `visibility`, `run_id`, `run_attempt`, `workflow`, `ref`, `head_sha`, `event`, `status`, `conclusion`, `triggered_by`, `started_at`, `completed_at`, `duration_ms`, `queued_ms` (`run_started_at − created_at`, #9007 follow-up; absent when GitHub reported no start) | log record `ci.run`, timestamped at `completed_at` |
 | `ci.job` | `repo`, `visibility`, `run_id`, `job_id`, `workflow`, `job`, `runner` (first runner label), `attempts` (the job's run attempt), `status`, `conclusion`, `timed_out`, `started_at`, `completed_at`, `duration_ms` | log record `ci.job` |
 | `ci.duration` | `metric` (`run`\|`job`), `repo`, `visibility`, `run_id`, `run_attempt`, `job_id`, `workflow`, `job`, `runner`, `conclusion`, `started_at`, `completed_at`, `duration_ms` | one data point of the `loom.ci.run.duration_ms` / `loom.ci.job.duration_ms` delta histogram |
 | `trace.span` | `loom.ci.run` (root) or `loom.ci.job` (child of its run span) | trace: one per run attempt, one span per job |
@@ -477,9 +477,12 @@ The attribute and label vocabulary is declared once, in
 
 - `CI_LOG_ATTRIBUTE_KEYS`: the `loom.ci.*` log attributes. Log records also
   carry the shared `loom.repo` and `loom.repo.visibility`. Already includes
-  `loom.ci.head_sha` and `loom.ci.ref` (the head branch).
+  `loom.ci.head_sha` and `loom.ci.ref` (the head branch), plus
+  `loom.ci.queued_ms` on `ci.run` (the CI queue segment, #9007 follow-up).
 - `CI_SPAN_ATTRIBUTE_KEYS`: the `loom.ci.*` span attributes. Since #9007 this
-  also includes `loom.ci.head_sha` and `loom.ci.ref` — the same join keys the
+  also includes `loom.ci.queued_ms` (run span only; the span itself starts
+  at `run_started_at`, so the queue wait is otherwise invisible in the
+  waterfall), and `loom.ci.head_sha` and `loom.ci.ref` — the same join keys the
   log side already carried, added to the `loom.ci.run` / `loom.ci.job` spans
   so a sweep's trace (`loom.role_attempt` / `loom.phase` spans, which already
   carry `loom.pr_number` since #8692) can be correlated with the CI runs that

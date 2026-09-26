@@ -125,6 +125,15 @@ impl RunJson {
             .as_deref()
             .and_then(crate::claim_reconciliation::parse_issue_from_branch)
     }
+
+    /// Milliseconds the run queued before starting: `run_started_at −
+    /// created_at`, floored at zero (#9007 follow-up). `None` when GitHub
+    /// reported no start.
+    #[must_use]
+    pub fn queued_ms(&self) -> Option<i64> {
+        self.run_started_at
+            .map(|started| duration_ms(self.created_at, started))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -265,6 +274,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         started_at,
         completed_at,
         duration_ms: duration,
+        queued_ms: run.queued_ms(),
     };
     let duration_record = CiDurationRecord {
         metric: CiDurationMetric::Run,
@@ -298,6 +308,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
             ("loom.ci.head_sha", Some(run.head_sha.clone())),
             ("loom.ci.ref", run.head_branch.clone()),
             ("loom.pr_number", run.pr_number().map(|n| n.to_string())),
+            ("loom.ci.queued_ms", run.queued_ms().map(|ms| ms.to_string())),
         ]),
         events: Vec::new(),
         links: Vec::new(),
