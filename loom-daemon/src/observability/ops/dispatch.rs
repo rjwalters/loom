@@ -24,7 +24,7 @@ use crate::work_finder::TickReport;
 /// `claim_collision`, `claim_lock_held`), so their parents are reported net of
 /// them: every candidate lands in exactly one reason.
 #[must_use]
-pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 23] {
+pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 24] {
     let classified_errors =
         report.refused_token_selection + report.refused_claim_collision + report.refused_claim_lock;
     [
@@ -51,6 +51,7 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 23] {
         ("ramp_cap", report.deferred_ramp_cap),
         ("saturation", report.deferred_saturation),
         ("out_of_slice", report.deferred_out_of_slice),
+        ("repo_cap", report.deferred_repo_cap),
         ("error", report.errors.saturating_sub(classified_errors)),
         // Typed dispatch refusals (Issue #8907) — one contiguous block.
         ("lease_order_lost", report.refused_lease_order),

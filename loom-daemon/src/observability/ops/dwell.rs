@@ -77,7 +77,8 @@ pub fn wait_class(disposition: QueueDisposition) -> Option<WaitClass> {
         D::DeferredCapacity
         | D::DeferredRampCap
         | D::DeferredSaturation
-        | D::DeferredOutOfSlice => Some(WaitClass::Ready),
+        | D::DeferredOutOfSlice
+        | D::DeferredRepoCap => Some(WaitClass::Ready),
         D::WorkspaceHalted
         | D::WorkspaceCommandsMissing
         | D::Quarantined

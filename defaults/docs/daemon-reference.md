@@ -1955,7 +1955,7 @@ by `candidate_cmp`, with what the tick did with it:
 
 - **running**: `dispatched`, `in_flight`
 - **ready** (waiting on a limit): `deferred_capacity`, `deferred_ramp_cap`,
-  `deferred_saturation`, `deferred_out_of_slice`
+  `deferred_saturation`, `deferred_out_of_slice`, `deferred_repo_cap`
 - **blocked** (held by something specific to the issue or repo): `parked` (with
   the label), `open_pr` (with the PR number), `dispatch_backoff`,
   `open_pr_backoff`, `quarantined`, `noop_cooldown`, `declined`,
@@ -3054,6 +3054,57 @@ Retired as cap inputs (informational-only now — see `capacity::token_axis_limi
 | **healthy-token count** (retired from the cap, #5270) | `available` accounts in `.ranking` in the pool directory `tokens_pool::paths::resolve_tokens_dir` resolves for the workspace — per-repo `{workspace}/.loom/tokens/` when it holds `*.token` files, else the shared machine-level pool (#3938) (`capacity::read_ranking` / `token_axis_limit`, unified with the writer in #4344) | drives spawn-time account **selection** (prefer fresher/healthier accounts, skip exhausted/blocked ones, #3902) and is reported on `status`/`calibrate` for observability — no longer bounds `dynamic_cap` |
 
 **Per-token concurrency** (`LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`, #3947) was retired from the cap by #5270 and then removed entirely by #5743 — it fed only a disclaimed `healthy × per-token` status/calibrate figure with no admission effect, which caused mis-diagnosis on the fleet more than once. The knob, its env var, and the status line are gone; a config file that still sets `autonomous.perTokenConcurrency` parses fine (unknown keys are ignored, not an error) but the key does nothing.
+
+#### Per-repo dispatch cap + track affinity (#9090)
+
+`min(disk, ram, maxConcurrent)` is **one global budget**, filled in one
+globally-sorted order ([per-workspace priority tiers](#per-workspace-priority-tiers-3946)),
+so nothing stops the whole budget landing in a single repo: N sweeps in one repo
+rebase against each other's merges while sibling repos sit idle behind them.
+`autonomous.workFinder.maxConcurrentPerRepo` bounds one repo's share of it.
+
+| | |
+|---|---|
+| Config | `autonomous.workFinder.maxConcurrentPerRepo` |
+| Env | `LOOM_WORK_FINDER_MAX_CONCURRENT_PER_REPO` |
+| Default | **absent = uncapped** — opt-in, so an upgrade changes nothing |
+| Precedence | env > config > uncapped, **re-read every tick** (hot-applies, on the same #9060 path as `maxConcurrent`) |
+| Zero | treated as *absent*, never as a cap of `0` (which would deadlock every repo) |
+
+Two mechanisms, one knob (setting it enables both):
+
+1. **The cap is an admission bound.** A candidate whose own repo already holds
+   `maxConcurrentPerRepo` slots is **deferred** — counted as
+   `TickReport::deferred_repo_cap`, shown as the `deferred_repo_cap` queue
+   disposition and the `repo_cap` dispatch-decision reason — and the tick
+   continues to the next candidate in order, which by construction is another
+   repo's work. Deferral is never a drop: the issue stays ready and is
+   re-evaluated next tick. The per-repo counter is seeded from each dispatcher's
+   own occupancy — the same per-repo numbers the global seed already sums — so
+   it costs no extra forge reads, and a repo that is *already* at its cap admits
+   nothing new this tick.
+2. **Track affinity is an ordering preference.** A repo that already has a live
+   sweep sorts ahead of a cold repo (a *stable* partition of the already-sorted
+   list, so `candidate_cmp` is untouched and still decides order within each
+   group), so a repo's own backlog drains in sequence instead of
+   one-issue-per-repo round-robin. Affinity is strictly **subordinate** to the
+   cap: it decides order, the cap decides admission. A floated hot repo still
+   cannot exceed its cap.
+
+**Work conservation is structural.** A cap deferral consumes no slot and the
+tick moves straight on, so the slot is available to another repo — including the
+cold, lower-priority repo affinity had floated to the back — *in the same tick*.
+The one case where a free global slot is deliberately left unused is when every
+remaining candidate's repo is at its own cap; that is the cap doing its job, the
+same shape as `occupancy >= maxConcurrent` idling a tick.
+
+**Cross-repo interleaving while a repo waits on CI needs no mechanism** and has
+none: the #4123 open-PR dispatch guard already makes an
+issue whose linked PR is in flight a non-candidate (`open_pr`), so the tick's
+next dispatch goes to another repo, and re-engagement when the PR merges is
+automatic. It composes with [repo sharding (#6243)](dispatcher-repo-sharding.md)
+in a fixed order: the sharding slice partition runs first, affinity reorders
+within its result, and the cap gates admission last.
 
 #### Why there is no CPU term in admission (#4512)
 
@@ -4186,6 +4237,7 @@ knobs not yet audited here.
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
 | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the dynamic cap. Zero/invalid → default; resolved once at startup — a startup-capture pattern `maxConcurrent` no longer shares (it hot-applies since #9060). **Restart required** to pick up a change (#5963) |
+| `autonomous.workFinder.maxConcurrentPerRepo` | `LOOM_WORK_FINDER_MAX_CONCURRENT_PER_REPO` | *(absent = uncapped)* | How many of the shared `maxConcurrent` budget's slots ONE repo may hold (#9090). **Absent is uncapped, not a number**: this is opt-in, so an upgrade throttles nothing. Setting it also turns on **track affinity** (a repo with a live sweep sorts ahead of a cold repo — ordering only, always subordinate to the cap). A candidate whose repo is at the cap is *deferred*, never dropped (`deferred_repo_cap` / the `repo_cap` decision reason), and the slot goes to another repo's candidate in the same tick. Zero/invalid → absent (a literal cap of `0` would deadlock every repo). A value above `maxConcurrent` is harmless. **Hot-applies (#9090)** — re-read every multi-workspace tick on the same path as `maxConcurrent`, transition logged once. See [Per-repo dispatch cap + track affinity](#per-repo-dispatch-cap--track-affinity-9090) |
 | `autonomous.workFinder.saturationBrake.enabled` | `LOOM_ADMISSION_BRAKE` | `true` | Saturation admission brake on/off (#4903). A safety backstop — **defaults on**. Holds *new* admissions while the host is already saturated; never preempts a running sweep. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Restart required** — resolved once at startup and registered as a process-global handle alongside the host breaker (#5963). See [Saturation admission brake](#saturation-admission-brake-4903) below |
 | `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip. **Restart required** — same startup-resolved global as `enabled` above (#5963) |
 | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` | Seconds of continuous held+0-in-flight before the `WARN`-level `STARVING` log fires once per streak (#5715). `<= 0`/invalid → default. See [Starvation escape hatch](#starvation-escape-hatch-5715) |

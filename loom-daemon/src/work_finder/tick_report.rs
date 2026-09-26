@@ -191,6 +191,21 @@ pub struct TickReport {
     /// re-evaluated (and, if still out-of-slice with the slice non-empty,
     /// deferred again) on the next tick.
     pub deferred_out_of_slice: usize,
+    /// Candidates deferred THIS TICK because their own repo was already at
+    /// `autonomous.workFinder.maxConcurrentPerRepo` (Issue #9090,
+    /// [`repo_cap`](super::repo_cap)). Always `0` when the knob is absent (the
+    /// opt-in default) — see [`RepoCap`](super::RepoCap).
+    ///
+    /// Deliberately its own counter, not folded into
+    /// [`deferred_capacity`](Self::deferred_capacity): the *machine* cap was not
+    /// reached, one repo's share of it was, so an operator reading
+    /// `deferred_capacity` is never sent to raise a ceiling that is not binding.
+    /// Purely observational (mirrors
+    /// [`deferred_out_of_slice`](Self::deferred_out_of_slice)'s shape): these
+    /// candidates are NOT lost — they stay ready and are re-evaluated next tick,
+    /// and within THIS tick their deferral is handed straight to the next
+    /// candidate, which is another repo's work.
+    pub deferred_repo_cap: usize,
     /// Per-issue outcomes behind the counters above (Issue #8852), recorded
     /// by the multi-workspace tick only. See [`ready_queue`](super::ready_queue).
     pub queue: Vec<ready_queue::TickQueueRow>,
