@@ -34,11 +34,18 @@ compatibility_date = "2024-09-23"
 # workers.dev gives you a public URL with zero DNS setup — right for the first
 # smoke test.
 #
-# CHANGE ME to `false` once you serve from a custom domain (`[[routes]]`
-# below). Cloudflare Access can only gate hostnames inside a zone you own, so a
-# still-enabled workers.dev URL is an unauthenticated bypass straight around
-# your Access policy — see docs/cloudflare-access.md.
-workers_dev = true
+# Defaults to `false` — fail closed. Cloudflare Access can only gate hostnames
+# inside a zone you own, so an enabled workers.dev URL is an unauthenticated
+# bypass straight around your Access policy, and no zone WAF rule can cover it
+# either. Set it to `true` only for a first smoke test, before any real data
+# exists, and set it back before you put Access in front of a custom domain.
+#
+# This used to default to `true`. A deployment ran that way with its custom
+# domain configured out of band, so the workers.dev hostname stayed live and
+# served the same Worker with Access removed from `/admin/*` — the admin
+# surface was left guarded by its bearer token alone instead of identity plus
+# token. See docs/cloudflare-access.md.
+workers_dev = false
 
 # CHANGE ME — required before you can put Cloudflare Access in front of this
 # Worker, optional otherwise. The zone (`example.com`) must already be active

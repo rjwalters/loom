@@ -117,6 +117,15 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Custom domain / workers.dev interaction (the Access-bypass trap)
 # ---------------------------------------------------------------------------
+# The workers_dev test is deliberately NOT gated on $has_route. `has_route`
+# only sees an ACTIVE `pattern =` in THIS file, but a custom domain can be
+# attached out of band (Cloudflare dashboard, `wrangler deploy --name`, a
+# deploy-time overlay). In that shape the old `has_route -eq 1 && ...` guard
+# was unreachable: no route here, so no warning, while the live Worker did
+# have a custom domain and its workers.dev twin served the same admin surface
+# with Cloudflare Access stripped off. The risk is a property of the DEPLOYED
+# state, so key the check off workers_dev alone.
+# ---------------------------------------------------------------------------
 has_route=0
 if printf '%s\n' "$ACTIVE" | grep -qE '^[[:space:]]*pattern[[:space:]]*='; then
   has_route=1
@@ -129,12 +138,12 @@ workers_dev="$(printf '%s\n' "$ACTIVE" |
   grep -E '^[[:space:]]*workers_dev[[:space:]]*=' |
   head -1 |
   sed -E 's/.*=[[:space:]]*([a-z]+).*/\1/')"
-if [ "$has_route" -eq 1 ] && [ "$workers_dev" != "false" ]; then
-  warn "a custom domain route is configured but workers_dev is not false — the *.workers.dev URL stays publicly reachable and bypasses any Cloudflare Access policy on the custom domain (docs/cloudflare-access.md)"
+if [ "$workers_dev" != "false" ]; then
+  warn "workers_dev is not false — the *.workers.dev URL is publicly reachable and can NEVER be gated by Cloudflare Access or a zone WAF rule, so if this Worker has a custom domain (declared below OR attached out of band) that hostname is an unauthenticated bypass around its Access policy (docs/cloudflare-access.md)"
 elif [ "$has_route" -eq 1 ]; then
   pass "custom domain route configured with workers_dev disabled"
 else
-  pass "workers.dev-only deployment (no custom domain route yet — required before Cloudflare Access)"
+  pass "no public hostname declared here (workers_dev disabled, no custom domain route) — attach one in a zone you own before putting Access in front"
 fi
 
 # ---------------------------------------------------------------------------
