@@ -17,7 +17,9 @@ span ID are SHA-256-derived from `loom-story/v1:github:<repo_id>:<issue>`, where
 repo and cached), so every sweep of the issue, on any host and across renames,
 lands in one trace, parented to the story root and tagged `loom.issue`,
 `loom.repo`, `loom.story_id`, `loom.story` (`owner/repo#n`) and
-`loom.story.key_version` (`v1`). The story root span itself is emitted when the
+`loom.story.key_version` (`v1`). Completed CI runs of the issue join the same
+story as `loom.ci.run` / `loom.ci.job` spans (#9088; see
+[ci-observability](ci-observability.md#story-stitching-9088)). The story root span itself is emitted when the
 story ends (a later phase of #9037); until then backends show it as a missing
 parent. Executions outside an issue, in a checkout with no GitHub `origin`, or
 whose `repo_id` cannot be resolved (warned once per repo) get a random trace

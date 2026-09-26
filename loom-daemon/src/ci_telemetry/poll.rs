@@ -37,6 +37,7 @@ use super::records::{
     envelope_identity, job_envelopes, run_envelopes, JobJson, JobsPage, RepoJson, RunJson, RunsPage,
 };
 use super::state::{self, CycleLock, CycleSummary, PollStatus};
+use super::story::{self, RepoIdentityFn, RepoStories, Stitch};
 use super::{journal_path, log_capture_gate, state_dir, LogCaptureGate, ResolvedCiTelemetry};
 
 /// Everything a cycle needs, resolved up front (a seam for tests: `now`,
@@ -57,6 +58,9 @@ pub struct CycleContext<'a> {
     pub log_excluded_repos: Vec<String>,
     /// Per-job cap on captured log text (#8825).
     pub log_max_bytes: usize,
+    /// The D32 `repo_id` resolver for story stitching (#9088); `None` turns
+    /// stitching off (no identity probe, no GraphQL request).
+    pub repo_identity: Option<RepoIdentityFn>,
 }
 
 impl<'a> CycleContext<'a> {
@@ -81,6 +85,7 @@ impl<'a> CycleContext<'a> {
                 .map(|exclusion| exclusion.repo.clone())
                 .collect(),
             log_max_bytes: resolved.log_capture_max_bytes,
+            repo_identity: Some(story::resolve_repo_identity),
         }
     }
 
@@ -122,6 +127,9 @@ pub struct CycleReport {
     pub ledger_repaired: bool,
     /// At least one job log was downloaded successfully this cycle (#8825).
     pub logs_fetched: bool,
+    /// Cleared when GraphQL rate-limits a closing-reference lookup (#9088):
+    /// no further lookup is made this cycle.
+    pub graphql_suppressed: bool,
 }
 
 impl CycleReport {
@@ -141,6 +149,19 @@ impl CycleReport {
                 s.logs_truncated,
                 s.log_failures,
                 s.logs_deferred
+            ));
+        }
+        let stitched = s.story_runs_stitched
+            + s.story_runs_no_candidate
+            + s.story_runs_ambiguous
+            + s.story_runs_unresolved;
+        if stitched > 0 {
+            text.push_str(&format!(
+                "; story: {} run(s) stitched, {} without candidate, {} ambiguous, {} unresolved",
+                s.story_runs_stitched,
+                s.story_runs_no_candidate,
+                s.story_runs_ambiguous,
+                s.story_runs_unresolved
             ));
         }
         if !self.repo_errors.is_empty() {
@@ -697,6 +718,29 @@ fn poll_repo(
         })?;
     runs.sort_by_key(|r| (r.created_at, r.id));
 
+    // #9088: resolve story membership for every run this pass may emit, up
+    // front, so a repo costs at most one identity probe and one batched
+    // GraphQL request per cycle.
+    let stories = ctx.repo_identity.map(|resolve| {
+        let unseen: Vec<&RunJson> = runs
+            .iter()
+            .filter(|run| {
+                run.is_completed() && !ledger.is_seen(&UnitKey::run(full, run.id, run.run_attempt))
+            })
+            .collect();
+        let mut graphql_ok = !report.graphql_suppressed;
+        let stories = RepoStories::prepare(
+            resolve,
+            api,
+            full,
+            &unseen,
+            &mut report.summary.requests,
+            &mut graphql_ok,
+        );
+        report.graphql_suppressed = !graphql_ok;
+        stories
+    });
+
     let mut newest = watermark;
     let mut oldest_incomplete: Option<DateTime<Utc>> = None;
     for run in &runs {
@@ -717,20 +761,35 @@ fn poll_repo(
             hold(run.created_at, &mut oldest_incomplete);
             continue;
         }
+        let stitch = stories.as_ref().map(|stories| stories.decide(run));
+        let story = match &stitch {
+            Some(Stitch::Stitched(story)) => Some(story),
+            _ => None,
+        };
         // Job units first, the run unit LAST: a torn commit can then only
         // lose the run unit, leaving the run "unseen" so the next poll
         // re-lists its jobs and commits exactly the missing ones.
         let mut drafts: Vec<UnitDraft> = jobs
             .iter()
-            .map(|job| UnitDraft {
-                key: UnitKey::job(full, run.id, job.id, job.run_attempt),
-                envelopes: job_envelopes(repo, run, job, &ctx.host_id),
+            .map(|job| {
+                let mut envelopes = job_envelopes(repo, run, job, &ctx.host_id);
+                if let Some(story) = story {
+                    story::stitch_job(&mut envelopes, story, run, job);
+                }
+                UnitDraft {
+                    key: UnitKey::job(full, run.id, job.id, job.run_attempt),
+                    envelopes,
+                }
             })
             .filter(|draft| !ledger.is_seen(&draft.key))
             .collect();
+        let mut run_unit = run_envelopes(repo, run, &ctx.host_id);
+        if let Some(story) = story {
+            story::stitch_run(&mut run_unit, story, run);
+        }
         drafts.push(UnitDraft {
             key: run_key,
-            envelopes: run_envelopes(repo, run, &ctx.host_id),
+            envelopes: run_unit,
         });
         let committed = ledger.commit(drafts)?;
         emit(ledger, journal, &committed)?;
@@ -739,6 +798,9 @@ fn poll_repo(
                 report.summary.jobs_emitted += 1;
             } else {
                 report.summary.runs_emitted += 1;
+                if let Some(stitch) = &stitch {
+                    count_stitch(&mut report.summary, full, run, stitch);
+                }
             }
         }
         // #8825: record which jobs' logs are wanted, durably, right after the
@@ -776,6 +838,33 @@ fn poll_repo(
     // regressing watermark would re-walk history every cycle.
     ledger.set_watermark(full, oldest_incomplete.unwrap_or(newest).max(watermark))?;
     Ok(())
+}
+
+/// Count (and log) one emitted run's story decision (#9088). A run that is
+/// not stitched is never silently dropped from the story: it is named here.
+fn count_stitch(summary: &mut CycleSummary, repo: &str, run: &RunJson, stitch: &Stitch) {
+    let (id, attempt) = (run.id, run.run_attempt);
+    match stitch {
+        Stitch::Stitched(story) => {
+            summary.story_runs_stitched += 1;
+            log::debug!("ci_telemetry: {repo} run {id}/{attempt} stitched into {}", story.story);
+        }
+        Stitch::NoCandidate => {
+            summary.story_runs_no_candidate += 1;
+            log::debug!("ci_telemetry: {repo} run {id}/{attempt} has no story candidate");
+        }
+        Stitch::Ambiguous(issues) => {
+            summary.story_runs_ambiguous += 1;
+            log::info!(
+                "ci_telemetry: {repo} run {id}/{attempt} not stitched: several candidate issues \
+                 {issues:?} (never guessed)"
+            );
+        }
+        Stitch::Unresolved(reason) => {
+            summary.story_runs_unresolved += 1;
+            log::info!("ci_telemetry: {repo} run {id}/{attempt} not stitched: {reason}");
+        }
+    }
 }
 
 /// Emit freshly committed units to the journal, then confirm them.
