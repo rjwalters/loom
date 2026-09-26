@@ -36,6 +36,21 @@ pub struct CycleSummary {
     /// Wanted job logs left for the next cycle by the per-cycle download cap.
     #[serde(default)]
     pub logs_deferred: usize,
+    /// Emitted runs also stitched into their issue's story trace (#9088).
+    #[serde(default)]
+    pub story_runs_stitched: usize,
+    /// Emitted runs with no story candidate (no PR closing ref, no
+    /// `feature/issue-N` branch) — e.g. pushes to `main`.
+    #[serde(default)]
+    pub story_runs_no_candidate: usize,
+    /// Emitted runs NOT stitched because they had several candidate issues.
+    #[serde(default)]
+    pub story_runs_ambiguous: usize,
+    /// Emitted runs NOT stitched because a candidate could not be established
+    /// (unresolvable `repo_id`, unreadable PR closing references, a
+    /// cross-repo closing reference).
+    #[serde(default)]
+    pub story_runs_unresolved: usize,
 }
 
 /// `status.json` — every field needed to tell never-polled / ok / stale /

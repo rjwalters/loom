@@ -490,10 +490,10 @@ The attribute and label vocabulary is declared once, in
   `pull_requests[].number` (`pull_request`-triggered runs) or, as a fallback,
   from `feature/issue-N` in `head_branch` — but needs no allowlist entry of
   its own, since it is already in `bounded_attributes()`'s generic
-  always-admitted key list and the collector's span `keep_keys`. Span-link
-  generation from `loom.ci.run` back to the sweep trace is a separate,
-  not-yet-built follow-up (Issue #9007's proposal item 3); today the join is
-  attribute-only.
+  always-admitted key list and the collector's span `keep_keys`. Since #9088
+  a run that belongs to an issue is also copied into that issue's story trace
+  (see [Story stitching](#story-stitching-9088)); the per-run trace itself
+  is still joined to sweeps by attribute only.
 - `CI_METRIC_LABEL_KEYS`: the metric labels, and **only** these:
   `repo`, `workflow`, `job`, `runner`, `conclusion`. Metric labels never
   include a sha, ref, run id or issue number.
@@ -503,6 +503,43 @@ The gateway's `transform/privacy` `keep_keys` lists in
 Two tests fail if the config and the constants disagree:
 `ci_telemetry::tests::collector_allowlist_matches_the_ci_vocabulary_exactly`
 and `collector_fanout::gateway_forwards_exactly_the_ci_telemetry_vocabulary`.
+
+### Story stitching (#9088)
+
+A completed run that belongs to exactly one issue N is **also** emitted into
+N's story trace (harness-ops D32 v1, see [tracing](tracing.md)): an extra
+`loom.ci.run` span with trace ID `story_context(repo_id, N).trace_id`,
+parented to the story root span, and an extra `loom.ci.job` span per job
+under it. Code: `loom-daemon/src/ci_telemetry/story.rs`.
+
+- **Which issue.** The candidates are the union of every closing reference of
+  every PR in the run's `pull_requests[]` (GraphQL `closingIssuesReferences`)
+  and `N` from a `feature/issue-N` head branch. Exactly one same-repo issue
+  stitches. Zero or several candidates, a cross-repo or truncated reference
+  list, unreadable references, or an unresolvable `repo_id` (the #9068
+  resolver; there is no name-derived fallback) leave the run unstitched. Each
+  outcome is counted in the cycle summary (`story_runs_stitched`,
+  `story_runs_no_candidate`, `story_runs_ambiguous`, `story_runs_unresolved`)
+  and logged. Nothing is guessed.
+- **Ids.** The story run span's ID derives from `(repo_id, run_id, attempt)`
+  and a story job span's from `(repo_id, job_id)`. They ride in the same
+  ledger units as the per-run records, so they are exactly-once like
+  everything else here, and a re-poll or another host derives the same IDs.
+- **The per-run trace is unchanged.** Same IDs, same records. Each per-run
+  span and its story copy link to each other (both directions, run and job).
+- **Attributes.** The story copy adds `loom.story` (`owner/repo#N`),
+  `loom.story.key_version` (`v1`) and `loom.issue`. It carries
+  `loom.pr_number` only when GitHub associated exactly one PR with the run,
+  never the branch-derived issue number.
+- **API cost.** Nothing for a repo whose unemitted runs have no PR and no
+  `feature/issue-N` branch. Otherwise one `repo_id` probe per repo per hour,
+  cached, and at most one batched GraphQL request per repo per cycle (50 PRs
+  each), with each PR's references cached for 10 minutes. A GraphQL rate
+  limit only stops lookups for the rest of the cycle. It is not fed to the
+  org-wide REST backoff.
+- **Single emitter.** Loom's poller is the story emitter for CI. The
+  harness-ops CI poller (harness-ops#193) must not also stitch, because SigNoz
+  does not deduplicate rows.
 
 ### Non-goals (phase 1)
 
