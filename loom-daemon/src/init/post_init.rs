@@ -244,6 +244,11 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // Secret-bearing token pool + repo-local account source (#3695). These
     // hold OAuth keys and must never be committed.
     ".loom/tokens/",
+    // Sibling copies of the token pool (e.g. `tokens.shadow-disabled-<ts>/`,
+    // hand backups). Only the exact `.loom/tokens/` was ignored, so a resync
+    // `git add` swept 21 live OAuth tokens into public `main` (a9da48c2).
+    ".loom/tokens.*/",
+    ".loom/tokens-*/",
     ".loom/accounts.env",
     // Per-host API-key account pool (#8401): `<provider>/<account>.env` files
     // holding provider subscription keys (e.g. Z.ai GLM coding plans). Same
