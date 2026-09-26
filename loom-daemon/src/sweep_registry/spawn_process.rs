@@ -175,6 +175,15 @@ impl SweepRegistry {
             &self.config.workspace_root,
             sweep_id,
         );
+        // #8908: let the transcript-ingest pass join this issue's
+        // `session.summary` logs to the execution's trace.
+        if let SweepKind::Issue(issue) = kind {
+            crate::observability::runtime_usage::join::open(
+                &self.config.workspace_root,
+                sweep_id,
+                *issue,
+            );
+        }
         cmd
             // Always pin LOOM_WORKSPACE to the registry's configured root so
             // spawn-claude.sh resolves `.loom/tokens/` from the same place

@@ -737,6 +737,14 @@ impl SweepRegistry {
         if let Some(cycles) = outcome_record.doctor_cycles {
             metadata.insert("loom.doctor_cycles".into(), cycles.to_string());
         }
+        // #8908: this execution's exact token usage, joined to its trace.
+        crate::observability::runtime_usage::finish_sweep(
+            &self.config.workspace_root,
+            sweep_id,
+            started_at,
+            outcome_record.tokens_by_model.as_deref(),
+            outcome_record.runtime.as_deref(),
+        );
         let trace_context = crate::observability::lifecycle::finish_execution(
             &self.config.workspace_root,
             sweep_id,
