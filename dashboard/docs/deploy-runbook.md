@@ -200,12 +200,23 @@ npm run deploy      # builds web/ then runs wrangler deploy
 > automate deploys, pass it on every one, and assert the live endpoint echoes
 > the commit you deployed.
 
-Wrangler prints the deployed URL —
-`https://loom-observability-ingest.<your-subdomain>.workers.dev`. Smoke test
-it:
+**`workers_dev` now defaults to `false`** (fail closed — Cloudflare Access can
+never gate a `*.workers.dev` hostname, so the safe state is the default). That
+means wrangler prints no workers.dev URL, and this Worker has no public
+hostname until you give it one. Pick one before smoke testing:
+
+- **Already have a custom domain?** Set `[[routes]]` in `wrangler.toml`, deploy,
+  and use that hostname as `BASE` below. This is the end state anyway — jump to
+  [Cloudflare Access](cloudflare-access.md) when you are ready to gate it.
+- **Just want to see it work first?** Set `workers_dev = true`, deploy, and use
+  the URL wrangler prints. **Set it back to `false` before you put Access in
+  front of a custom domain** — leaving it on is an unauthenticated bypass
+  straight around the Access policy, and `npm run preflight` will warn about it
+  on every run until you do.
 
 ```bash
-BASE="https://loom-observability-ingest.<your-subdomain>.workers.dev"
+# your custom domain, or the workers.dev URL wrangler printed
+BASE="https://loom-dashboard.example.com"
 
 curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' "$BASE/"
 # 200 text/html; charset=utf-8
@@ -258,7 +269,9 @@ One key per fleet host, so any single host can be revoked without disturbing
 the others.
 
 ```bash
-BASE="https://loom-observability-ingest.<your-subdomain>.workers.dev"
+# same BASE you set in step 6 — your custom domain, or the workers.dev URL
+# if you took the smoke-test path there
+BASE="https://loom-dashboard.example.com"
 ADMIN="<the ADMIN_TOKEN from step 7>"
 
 curl -sS -X POST "$BASE/admin/hosts" \
@@ -330,7 +343,7 @@ how to point at a non-default path. Trailing whitespace/newlines are trimmed.
 {
   "observability": {
     "enabled": true,
-    "endpoint": "https://loom-observability-ingest.<your-subdomain>.workers.dev/ingest",
+    "endpoint": "https://loom-dashboard.example.com/ingest",
     "batchSize": 50,
     "flushIntervalSecs": 30,
     "queueCapacity": 2000
@@ -579,8 +592,9 @@ covers hostnames in a zone you own. To gate the authenticated view behind
 SSO, attach a custom domain (`[[routes]]` in `wrangler.toml`), set
 `workers_dev = false`, and follow
 [`cloudflare-access.md`](cloudflare-access.md). `npm run preflight` warns
-when a custom domain is configured while `workers_dev` is still enabled,
-because that leaves an unauthenticated bypass around the Access policy.
+whenever `workers_dev` is enabled at all — not only when a route is declared
+here — because the custom domain may be attached out of band, and then the
+bypass exists while this file shows no route to warn about.
 
 ### Tearing it all down
 

@@ -53,7 +53,7 @@ So, before any Access configuration:
 3. Redeploy and confirm the old URL is gone:
 
    ```bash
-   npm run preflight     # warns if a route exists while workers_dev is still true
+   npm run preflight     # warns whenever workers_dev is still true, route or not
    npm run deploy
    curl -sS -o /dev/null -w '%{http_code}\n' \
      https://loom-observability-ingest.<your-subdomain>.workers.dev/

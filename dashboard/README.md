@@ -132,7 +132,8 @@ table. To gate the authenticated view behind SSO, follow it with
 
 `npm run preflight` (`scripts/check-deploy-config.sh`) is the guard rail: it
 refuses to pass while `wrangler.toml` still holds a template placeholder,
-warns when a custom domain is configured with `workers_dev` still enabled
+warns whenever `workers_dev` is enabled at all — not only when a route is
+declared in this file, since the custom domain may be attached out of band
 (an unauthenticated bypass around any Access policy), and finishes with
 `wrangler deploy --dry-run`. `npm run preflight -- --remote` additionally
 asserts the `ADMIN_TOKEN` secret exists on the deployed Worker.
