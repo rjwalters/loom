@@ -30,10 +30,23 @@
 # so this suite moved to the "Native Port Suites" CI job, which builds the
 # binary, and FAILS rather than skips without one.
 #
-# The six lock/concurrency assertions (Tests 1, 4-8) are unaffected by the port:
-# the worktree-add lock is still shell (#8226 reverted delegating it, because it
-# sits on the always-taken path). They stay here rather than splitting into a
-# second file — they share this suite's fixture, and a split would duplicate it.
+# The six lock/concurrency assertions (Tests 1, 4-8) now exercise
+# `loom-daemon worktree-lock acquire`/`release` too (#8195 slice 7): the lock
+# primitives moved out of worktree.sh into `lib/worktree-lock.sh` whole, and
+# `acquire_worktree_lock`/`release_worktree_lock` there try the daemon FIRST,
+# falling straight through to the original mkdir-based implementation
+# UNCHANGED on anything other than a real answer from it (#8226 reverted a
+# hard, exec-style delegation on this always-taken path; this is not that —
+# see the lib file for why the fallback is load-bearing here). Every
+# assertion below is unchanged from the shell-only implementation — running
+# them against a real, built binary (which this suite already requires) is
+# the equivalence evidence. Test 7 alone stays on the shell path deliberately
+# (it sources `lib/worktree-lock.sh` standalone, without
+# `lib/locate-daemon-bin.sh`, so `loom_resolve_self_daemon_bin` resolves to
+# nothing) because it exercises the primitives directly rather than through a
+# full `worktree.sh` invocation. They stay here rather than splitting into a
+# second file — they share this suite's fixture, and a split would duplicate
+# it.
 #
 # Usage:
 #   cargo build --package loom-daemon
@@ -313,17 +326,18 @@ REPO=$(setup_repo)
     cd "$REPO"
 
     # Exercise the exact lock primitives worktree.sh uses (not a hand-rolled
-    # reimplementation): extract _worktree_locks_dir / _worktree_lock_path /
-    # acquire_worktree_lock / release_worktree_lock from the copy of
-    # worktree.sh under test and source them directly.
-    START_LINE=$(grep -n '^_worktree_locks_dir() {' .loom/scripts/worktree.sh | head -1 | cut -d: -f1)
-    END_LINE=$(awk '/^release_worktree_lock\(\) \{/{f=1} f && /^}/{print NR; exit}' .loom/scripts/worktree.sh)
-    FUNCS_FILE=$(mktemp /tmp/loom-wt-lockfns.XXXXXX)
-    sed -n "${START_LINE},${END_LINE}p" .loom/scripts/worktree.sh > "$FUNCS_FILE"
-
-    # These three are consumed only inside the extracted lock functions that
-    # get `source`d from "$FUNCS_FILE" below — a dynamic path shellcheck
-    # cannot statically follow, so it reports them as unused (SC2034).
+    # reimplementation): source lib/worktree-lock.sh directly. #8195 slice 7
+    # moved _worktree_locks_dir / _worktree_lock_path / acquire_worktree_lock /
+    # release_worktree_lock out of worktree.sh into that file whole, so this
+    # is now a plain source instead of a sed-extracted range. Deliberately NOT
+    # sourcing lib/locate-daemon-bin.sh alongside it: leaving
+    # loom_resolve_self_daemon_bin undefined keeps this test on the shell
+    # fallback path (see the header comment above for why), which is what
+    # exercises the ownership-token primitives this test is actually about.
+    #
+    # These three are read only inside the sourced lock functions — a dynamic
+    # path shellcheck cannot statically follow, so it reports them as unused
+    # (SC2034).
     # shellcheck disable=SC2034
     LOOM_WORKTREE_LOCK_TIMEOUT=5
     # shellcheck disable=SC2034
@@ -332,9 +346,8 @@ REPO=$(setup_repo)
     JSON_OUTPUT=""
     print_warning() { :; }
 
-    # shellcheck disable=SC1090
-    source "$FUNCS_FILE"
-    rm -f "$FUNCS_FILE"
+    # shellcheck disable=SC1091
+    source .loom/scripts/lib/worktree-lock.sh
 
     # --- Process A acquires the lock and remembers its own token. ---
     acquire_worktree_lock 200

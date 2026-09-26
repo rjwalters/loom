@@ -178,189 +178,22 @@ EOF
 # Concurrency lock (issue #3380)
 # --------------------------------------------------------------------------
 #
-# `git worktree add` is not safe to run concurrently against the same repo —
-# parallel invocations contend on the per-worktree administrative dir
-# (`.git/worktrees/issue-N/`) and on git's repo-global locks. The observed
-# failure mode in busy shepherd sessions is multi-minute hangs (10-20 min)
-# while a peer process holds an `index.lock` it will never release.
+# The repo-global `git worktree add` lock, its ownership-verified release
+# (#6014/#6017), and the tunables that govern both
+# (`LOOM_WORKTREE_LOCK_TIMEOUT`, `LOOM_WORKTREE_LOCK_POLL_INTERVAL` —
+# documented in show_help) now live in `lib/worktree-lock.sh`, moved out
+# whole per `.loom/docs/file-size-policy.md` ("new sibling module, small
+# dispatch arm left behind" — this file is over the ratchet threshold and
+# therefore frozen).
 #
-# We use a POSIX-atomic `mkdir`-based lock primitive — `flock` is not
-# available on stock macOS, so `mkdir` is the only portable atomic
-# file-system operation we can rely on.
-#
-# Lock scope is **repo-global** (`.loom/locks/worktree-add/`). The original
-# per-issue design was tried first but failed under concurrent invocations
-# with different issue numbers: `git worktree add` mutates the repo-global
-# `.git/config.lock` (writing the new branch's upstream configuration), and
-# concurrent processes race with the diagnostic:
-#
-#   error: could not lock config file .git/config: File exists
-#   error: unable to write upstream branch configuration
-#
-# A repo-global lock serializes the entire `git worktree add` call so this
-# race cannot happen. The cost — two builders on different issues no longer
-# parallelize through the helper for the (short) duration of `git worktree
-# add` itself — is acceptable because (a) `git worktree add` itself is short
-# relative to the rest of an issue's lifecycle, and (b) parallel hangs that
-# hold an `index.lock` for 10-20 minutes are the very problem this PR fixes.
-#
-# The lock path uses the same name (`worktree-<id>/`) the per-issue version
-# used so its layout matches `.loom/locks/issue-<N>/`. The "id"
-# here is the constant string "add"; per-issue accounting still lives in the
-# `owner.json` body for debugging visibility.
-#
-# **Critical-section scope (issue #6014):** the lock is held across the
-# `git worktree add` invocation itself (plus its short recovery retry) and
-# the repo-level git preparation that immediately precedes it and must not
-# race with a concurrent add — `git worktree prune`, the `git fetch` of
-# `origin/$DEFAULT_BRANCH` / the base branch / `origin/feature/issue-N`, and
-# base-branch resolution. It is explicitly NOT held across anything that
-# follows the add: sentinel writing, sparse-checkout setup, submodule init,
-# or the project-specific `post-worktree.sh` hook. The call site releases the
-# lock the moment `git worktree add` returns, success or failure, rather than
-# waiting for the script's EXIT trap. A repo whose post-worktree hook can run
-# for minutes (e.g. a `cargo build --release`) must not serialize every
-# *unrelated* worktree creation on the host behind it — the post-add phase
-# does not touch `.git/config.lock` at all, so it needs no repo-global
-# serialization.
-#
-# **Ownership verification (issue #6014):** each acquisition writes a random
-# one-shot `token` into `owner.json` alongside `owner_pid`, and
-# `acquire_worktree_lock` returns it via the `WORKTREE_LOCK_TOKEN` global.
-# `release_worktree_lock` requires the caller to pass that same token back
-# and refuses to remove the lock directory unless the token it finds on disk
-# still matches — so a late release from a stale/wedged holder (e.g. its
-# EXIT trap finally firing well after an operator judged it dead, manually
-# cleared the lock, and a different process legitimately re-acquired it)
-# is a safe no-op instead of deleting a live holder's lock out from under it.
-#
-# Tunables (env vars, documented in show_help):
-#   LOOM_WORKTREE_LOCK_TIMEOUT       — seconds to wait (default 600 = 10min)
-#   LOOM_WORKTREE_LOCK_POLL_INTERVAL — seconds between poll attempts (default 2)
-
-LOOM_WORKTREE_LOCK_TIMEOUT="${LOOM_WORKTREE_LOCK_TIMEOUT:-600}"
-LOOM_WORKTREE_LOCK_POLL_INTERVAL="${LOOM_WORKTREE_LOCK_POLL_INTERVAL:-2}"
-
-# Resolve the locks directory to the canonical git common dir so worktrees
-# and the main workspace all share the same lock namespace. Falls back to the
-# current dir for the rare case where we're not yet inside a repo (tests).
-_worktree_locks_dir() {
-    local common
-    common=$(git rev-parse --git-common-dir 2>/dev/null || true)
-    if [[ -n "$common" ]]; then
-        # git-common-dir may be returned as a relative path; resolve it.
-        local abs_common
-        abs_common=$(cd "$common" 2>/dev/null && pwd) || abs_common="$common"
-        echo "$(dirname "$abs_common")/.loom/locks"
-    else
-        echo ".loom/locks"
-    fi
-}
-
-_worktree_lock_path() {
-    # The argument is the issue number — accepted for owner-metadata logging
-    # only. The lock itself is repo-global; see the design note above.
-    echo "$(_worktree_locks_dir)/worktree-add"
-}
-
-# Returns 0 if lock acquired, non-zero otherwise. Sets WORKTREE_LOCK_HOLDER_PID
-# on timeout failure so the caller can include it in error output. On success,
-# sets WORKTREE_LOCK_TOKEN to the one-shot acquisition token the caller MUST
-# pass back to release_worktree_lock (see "Ownership verification" above).
-WORKTREE_LOCK_HOLDER_PID=""
-WORKTREE_LOCK_TOKEN=""
-
-acquire_worktree_lock() {
-    local issue="$1"
-    local lock
-    lock="$(_worktree_lock_path "$issue")"
-    local locks_dir
-    locks_dir="$(_worktree_locks_dir)"
-
-    mkdir -p "$locks_dir" 2>/dev/null || true
-
-    local deadline=$(( $(date +%s) + LOOM_WORKTREE_LOCK_TIMEOUT ))
-    local stale_retry_done=0
-
-    while true; do
-        if mkdir "$lock" 2>/dev/null; then
-            # Lock acquired; record owner metadata for debugging plus a
-            # one-shot token so release can verify it still owns this lock
-            # (issue #6014 — see "Ownership verification" above).
-            local token
-            token="$$-$(date -u +%s%N 2>/dev/null || date -u +%s)-$RANDOM"
-            cat > "$lock/owner.json" <<EOF
-{
-  "issue": $issue,
-  "owner_pid": $$,
-  "token": "$token",
-  "script": "worktree.sh",
-  "acquired_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-EOF
-            WORKTREE_LOCK_TOKEN="$token"
-            return 0
-        fi
-
-        # Lock exists. Check whether the owner is still alive; if not, clear
-        # it once and retry (stale-lock recovery).
-        local owner_pid=""
-        if [[ -f "$lock/owner.json" ]]; then
-            owner_pid=$(awk -F'[ ,]+' '/owner_pid/ {gsub(/[^0-9]/,"",$3); print $3; exit}' "$lock/owner.json" 2>/dev/null)
-        fi
-
-        if [[ -n "$owner_pid" ]] && [[ "$stale_retry_done" -eq 0 ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Stale worktree lock from dead PID $owner_pid — cleaning up"
-            fi
-            rm -rf "$lock" 2>/dev/null || true
-            stale_retry_done=1
-            continue
-        fi
-
-        if [[ $(date +%s) -ge $deadline ]]; then
-            WORKTREE_LOCK_HOLDER_PID="$owner_pid"
-            return 1
-        fi
-
-        sleep "$LOOM_WORKTREE_LOCK_POLL_INTERVAL"
-    done
-}
-
-# release_worktree_lock <issue> <token>
-#
-# Removes the repo-global worktree-add lock ONLY if <token> matches the
-# token currently recorded in owner.json — i.e. only if the caller is the
-# process that most recently acquired it (issue #6014). A caller with a
-# stale/empty token (already released, or never actually held the lock)
-# leaves the directory untouched: there is nothing it can safely prove it
-# owns, so removing anything would risk deleting a different, live holder's
-# lock (the exact race described in issue #6014).
-release_worktree_lock() {
-    local issue="$1"
-    local token="$2"
-    [[ -z "$issue" ]] && return 0
-    # No token means we never held the lock (or already released it) — never
-    # remove a lock directory we cannot prove is ours.
-    [[ -z "$token" ]] && return 0
-
-    local lock
-    lock="$(_worktree_lock_path "$issue")"
-    [[ -d "$lock" ]] || return 0
-
-    local current_token=""
-    if [[ -f "$lock/owner.json" ]]; then
-        current_token=$(awk -F'"' '/"token"[[:space:]]*:/ {print $4; exit}' "$lock/owner.json" 2>/dev/null)
-    fi
-
-    if [[ "$current_token" != "$token" ]]; then
-        # The lock directory belongs to a different acquisition (ours was
-        # already cleared and reassigned) — do NOT touch it.
-        return 0
-    fi
-
-    rm -rf "$lock" 2>/dev/null || true
-}
+# Ported to try `loom-daemon worktree-lock acquire`/`release` first (#8195
+# slice 7, `loom-daemon/src/worktree_cli/lock.rs` — the Rust side was written
+# in slice 1 / #8226 but never wired up here until now). It falls straight
+# through to the original mkdir-based implementation, UNCHANGED, on anything
+# other than a real 0/1 answer — see the lib file for why a hard delegation
+# (like remove/wip/cleanup/reset) is not safe on this ALWAYS-TAKEN path.
+# shellcheck source=lib/worktree-lock.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/worktree-lock.sh"
 
 # cleanup_partial_worktree_state <issue>
 #
