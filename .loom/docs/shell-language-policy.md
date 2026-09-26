@@ -239,8 +239,8 @@ admission is measured over a trailing six-month window. On a shallow clone it
 fails with an explanation rather than skipping the check — a gate that cannot
 tell "checked, fine" from "could not check" reports OK forever.
 
-CI runs the self-test and then the gate in the `Shell Allowlist` job on every
-PR, unfiltered by path — a new `.sh` in a directory nobody expected is exactly
+CI runs the self-test and then the gate as the `Shell Allowlist` component of
+the required `Structural Checks` job (#9065) on every PR, unfiltered by path — a new `.sh` in a directory nobody expected is exactly
 the case it exists to catch (the same reasoning as the conflict-marker and
 shell-syntax jobs, see [`ci-principles.md`](ci-principles.md)). The checker is
 also self-tested on the macOS leg of the `Shell Syntax` job, which asserts its
@@ -298,8 +298,8 @@ loom-daemon shell-budget --json    # the same, for scripting
 loom-daemon shell-budget --check   # report + exit 1 when over budget (what CI runs)
 ```
 
-The `Shell Budget Ratchet` job runs unconditionally, like every other
-structural ratchet. The first cut lived inside `Rust Unit Tests`, which is
+The `Shell Budget Ratchet` gate (a component of the required `Daemon Checks`
+job since #9065) runs unconditionally, like every other structural ratchet. The first cut lived inside `Rust Unit Tests`, which is
 gated on the `backend` paths filter — `loom-daemon/**` but **not**
 `scripts/**` or `defaults/**`. A PR that added a shell script skipped the job
 entirely and the ratchet first fired on the push to `main`. A gate skipped on
