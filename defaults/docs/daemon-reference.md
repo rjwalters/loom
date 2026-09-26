@@ -2768,8 +2768,9 @@ implemented via `SweepRegistry::children_of` + `block_children_of`. Auto-detach
 (rebasing an orphaned child onto the default branch) is **out of scope for v1**.
 
 **Reconciliation is triggered automatically on parent merge (v2 item 1,
-#3747).** Because the repo squash-merges, after the parent squash-merges the
-child branch still carries the parent's pre-squash commits. `merge-pr.sh` now
+#3747).** After the parent merges to the default branch (as a merge commit,
+#9105), the child branch still carries the parent's original commits in its
+history. `merge-pr.sh` now
 fires reconciliation automatically at its post-merge choke point (alongside the
 partial-increment label reset, before branch deletion): it discovers open child
 PRs via a **live forge query** (`gh pr list --base feature/issue-<parent>` — not

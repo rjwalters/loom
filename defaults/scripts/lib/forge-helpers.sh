@@ -316,15 +316,15 @@ source "$_LOOM_FORGE_HELPERS_LIB_DIR/forge-merge-method.sh"
 # GitHub: PUT /repos/{nwo}/pulls/{n}/merge with merge_method=<MERGE_METHOD>
 # Gitea: POST /repos/{owner}/{repo}/pulls/{n}/merge with Do=<MERGE_METHOD>
 #
-# MERGE_METHOD (optional, #7754): one of "squash"/"merge"/"rebase". Defaults
-# to "squash" when omitted -- preserves this function's pre-#7754 behavior
-# for any caller that has not been updated to pass a detected method (e.g.
-# via forge_detect_merge_method). Callers that need to respect a target
+# MERGE_METHOD (optional, #7754): one of "merge"/"squash"/"rebase". Defaults
+# to "merge" (merge commit, #9105) when omitted, for any caller that has
+# not been updated to pass a detected method (e.g. via
+# forge_detect_merge_method). Callers that need to respect a target
 # repo's actual allowed strategies MUST pass this explicitly.
 #
 # EXPECTED_HEAD_SHA (optional, #5579): an optimistic-concurrency precondition —
 # the SHA the PR's head branch must currently match for the merge to proceed.
-# Without it, both forges will happily squash-merge whatever the CURRENT head
+# Without it, both forges will happily merge whatever the CURRENT head
 # is at the moment the request lands, even if it has commits the caller never
 # saw approved (silently stranding them — squash-merge makes this invisible to
 # an ancestry check afterward, since the new squash commit is not a descendant
@@ -346,7 +346,7 @@ source "$_LOOM_FORGE_HELPERS_LIB_DIR/forge-merge-method.sh"
 # message "head out of date".
 forge_merge_pr() {
   local nwo="$1" pr_number="$2"
-  local expected_head_sha="${3:-}" merge_method="${4:-squash}"
+  local expected_head_sha="${3:-}" merge_method="${4:-merge}"
 
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
     forge_split_nwo "$nwo"

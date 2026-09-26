@@ -323,8 +323,8 @@ WORK_PLAN.md, README.md}` (three root-level filenames, matched exactly —
 never a substring or nested path, so `docs/README.md` and
 `mcp-loom/README.md` do NOT qualify), criterion #2 is satisfied without
 judging the axes at all: there is no "load-bearing hunk" to name, blast
-radius is provably confined to non-executing docs, and `git revert
-<squash-sha>` trivially undoes it. This is a shortcut on **this criterion
+radius is provably confined to non-executing docs, and `git revert -m 1
+<merge-sha>` undoes it. This is a shortcut on **this criterion
 only** — it never substitutes for, and is always subordinate to, the
 sticky-hold precheck (a prior hold on this PR, for whatever reason, is never
 bypassed by this fast path) and criteria #1/#3/#4/#5/#6, all of which still
@@ -587,7 +587,7 @@ four-axis judgment below.
 | **Diff composition** | The bulk of the diff is tests, docs/markdown, fixtures, or a self-contained new module not yet wired into an existing path. The load-bearing hunks are few and you can name them. | Load-bearing hunks change the *existing* behavior of a shared runtime path, and you cannot enumerate them — or the diff is dense enough that you skimmed rather than read it. |
 | **Blast radius** | Changes are confined to one crate/module/role file, or to surfaces whose failure affects a single feature. | Touches anything that mediates merging, branch/worktree deletion, credential/token selection, guard hooks, installers/updaters, CI workflows, or shared config schema — e.g. `merge-pr.sh`, `worktree.sh`, `loom-clean`, `.loom/hooks/guard-*.sh`, `spawn-claude.sh` / `spawn-worker.sh`, `install-loom.sh`, `resync-installed.sh`. Failure there damages the repo or the whole fleet, not one feature. |
 | **Judge review depth** | The Judge's verdict cites specifics from the diff — named files/functions, concrete behavior, what was run or verified. | A short generic approval ("LGTM", "looks good") with no evidence the diff was read, or a review that explicitly defers verification of some part ("did not check X"). |
-| **Revertability** | `git revert <squash-sha>` fully undoes the change: no data/schema migration, no published artifact, no state written outside the repo. | The change performs a one-way action when it runs (deletes branches/worktrees, rewrites installed files, publishes a release, migrates data, moves credentials), so reverting the commit does not undo the effect. |
+| **Revertability** | `git revert -m 1 <merge-sha>` fully undoes it: no data/schema migration, no published artifact, no state written outside the repo. | The change performs a one-way action when it runs (deletes branches/worktrees, rewrites installed files, publishes a release, migrates data, moves credentials), so reverting the commit does not undo the effect. |
 
 **Decision rule**:
 - Docs-only fast path found `ELIGIBLE` **and** no prior hold is still in force -> **PASS**, continue to criterion #3 — the axes are not judged for this PR (see "Docs-only fast path" above).
@@ -2010,8 +2010,8 @@ This PR meets all safety criteria for automatic merging:
 - $CI_STATUS
 
 $HOLD_REVERSAL_BLOCK
-**Proceeding with squash merge...** If this was merged in error, you can revert with:
-\`git revert <commit-sha>\`
+**Proceeding with merge...** If this was merged in error, you can revert with:
+\`git revert -m 1 <merge-sha>\`
 
 ---
 *Automated by Champion role*
@@ -2037,7 +2037,7 @@ fi
 
 ### Step 3: Merge the PR
 
-Execute the squash merge with comprehensive error handling.
+Execute the merge with comprehensive error handling.
 
 **Ordering invariant**: Step 2's comment is already on the PR before this runs.
 `merge-pr.sh` records no actor and posts no Champion-identifying comment, so a
@@ -2127,7 +2127,7 @@ fi
 # still readable here — it is the tree any `loom:ac-verified` marker must name.
 HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
 
-# #1057 negation-check input: PR body + (GitHub) squash commit message.
+# #1057 negation-check input: PR body + (GitHub) merge-commit message.
 NEG_SRC=$(forge_get_pr_body "$(forge_get_repo_nwo)" "$PR_NUMBER" 2>/dev/null)
 M=$(gh pr view "$PR_NUMBER" --json mergeCommit --jq '.mergeCommit.oid // empty' 2>/dev/null)
 [ -n "$NEG_SRC" ] && [ -n "$M" ] && NEG_SRC+=$'\n'$(gh api "repos/{owner}/{repo}/commits/$M" --jq .commit.message 2>/dev/null)
@@ -3346,7 +3346,7 @@ never short-circuit that by re-merging on a later tick without re-running it.
 Exit 5 moves no head and invalidates nothing.
 
 Exit 4's bound, exit 5's contract, why none of the three is commented on the
-PR, and the squash-merge ancestry trap that defeats `git merge-base
+PR, and the merge-ancestry trap that defeats `git merge-base
 --is-ancestor` here:
 [`merge-pr-exit-code-exceptions.md`](../../../.loom/docs/merge-pr-exit-code-exceptions.md).
 

@@ -662,7 +662,7 @@ EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER" --limit 500)
 
 ## Complete Auto-Merge Workflow Script
 
-**The auto-merge workflow lives in a single source of truth: [`champion-pr-merge.md`](champion-pr-merge.md)** — the Verdict-State Janitor, the 6 safety criteria, the pre-merge comment, the squash merge, linked-issue closure verification, dependent-issue unblocking, and Step 5.5 Follow-on Issue Creation. The edge cases and decision matrix above are the reference for non-standard situations; they describe *behavior* and defer to `champion-pr-merge.md` for the *script* (why there are two files rather than one, and not a duplicate copy of the script: [`.loom/docs/champion-file-split-history.md`](../../../.loom/docs/champion-file-split-history.md)).
+**The auto-merge workflow lives in a single source of truth: [`champion-pr-merge.md`](champion-pr-merge.md)** — the Verdict-State Janitor, the 6 safety criteria, the pre-merge comment, the merge, linked-issue closure verification, dependent-issue unblocking, and Step 5.5 Follow-on Issue Creation. The edge cases and decision matrix above are the reference for non-standard situations; they describe *behavior* and defer to `champion-pr-merge.md` for the *script* (why there are two files rather than one, and not a duplicate copy of the script: [`.loom/docs/champion-file-split-history.md`](../../../.loom/docs/champion-file-split-history.md)).
 
 ---
 

@@ -183,23 +183,26 @@ FORGE_TYPE="github"
 STUB_GH_FAIL=""
 
 STUB_GH_JSON='{"allow_squash_merge":true,"allow_merge_commit":true,"allow_rebase_merge":true}'
-assert_eq "GitHub: all allowed prefers squash" "squash" "$(detect_merge_method)"
+assert_eq "GitHub: all allowed prefers merge (#9105)" "merge" "$(detect_merge_method)"
 
 STUB_GH_JSON='{"allow_squash_merge":false,"allow_merge_commit":true,"allow_rebase_merge":true}'
-assert_eq "GitHub: squash disabled falls back to merge" "merge" "$(detect_merge_method)"
+assert_eq "GitHub: merge + rebase allowed prefers merge over rebase" "merge" "$(detect_merge_method)"
 
 STUB_GH_JSON='{"allow_squash_merge":false,"allow_merge_commit":false,"allow_rebase_merge":true}'
 assert_eq "GitHub: rebase-only repo uses rebase" "rebase" "$(detect_merge_method)"
 
+STUB_GH_JSON='{"allow_squash_merge":true,"allow_merge_commit":false,"allow_rebase_merge":false}'
+assert_eq "GitHub: squash-only repo still honored (no forced migration)" "squash" "$(detect_merge_method)"
+
 STUB_GH_JSON='{"allow_squash_merge":false,"allow_merge_commit":false,"allow_rebase_merge":false}'
-assert_eq "GitHub: degenerate all-false fails open to squash" "squash" "$(detect_merge_method)"
+assert_eq "GitHub: degenerate all-false fails open to merge (#9105)" "merge" "$(detect_merge_method)"
 
 STUB_GH_JSON='not json at all'
-assert_eq "GitHub: unparseable response fails open to squash" "squash" "$(detect_merge_method)"
+assert_eq "GitHub: unparseable response fails open to merge (#9105)" "merge" "$(detect_merge_method)"
 
 STUB_GH_JSON='{"allow_squash_merge":false,"allow_merge_commit":true,"allow_rebase_merge":false}'
 STUB_GH_FAIL=1
-assert_eq "GitHub: probe error fails open to squash" "squash" "$(detect_merge_method)"
+assert_eq "GitHub: probe error fails open to merge (#9105)" "merge" "$(detect_merge_method)"
 STUB_GH_FAIL=""
 
 # --- Gitea (note: the merge-commit flag is `allow_merge_commits`, plural) ---
@@ -207,23 +210,26 @@ FORGE_TYPE="gitea"
 STUB_GITEA_CODE=200
 
 STUB_GITEA_BODY='{"allow_squash_merge":true,"allow_merge_commits":true,"allow_rebase_merge":true}'
-assert_eq "Gitea: all allowed prefers squash" "squash" "$(detect_merge_method)"
+assert_eq "Gitea: all allowed prefers merge (#9105)" "merge" "$(detect_merge_method)"
 
 STUB_GITEA_BODY='{"allow_squash_merge":false,"allow_merge_commits":true,"allow_rebase_merge":true}'
-assert_eq "Gitea: squash disabled falls back to merge" "merge" "$(detect_merge_method)"
+assert_eq "Gitea: merge + rebase allowed prefers merge over rebase" "merge" "$(detect_merge_method)"
 
 STUB_GITEA_BODY='{"allow_squash_merge":false,"allow_merge_commits":false,"allow_rebase_merge":true}'
 assert_eq "Gitea: rebase-only repo uses rebase" "rebase" "$(detect_merge_method)"
 
+STUB_GITEA_BODY='{"allow_squash_merge":true,"allow_merge_commits":false,"allow_rebase_merge":false}'
+assert_eq "Gitea: squash-only repo still honored (no forced migration)" "squash" "$(detect_merge_method)"
+
 STUB_GITEA_BODY='{"allow_squash_merge":false,"allow_merge_commits":false,"allow_rebase_merge":false}'
-assert_eq "Gitea: degenerate all-false fails open to squash" "squash" "$(detect_merge_method)"
+assert_eq "Gitea: degenerate all-false fails open to merge (#9105)" "merge" "$(detect_merge_method)"
 
 STUB_GITEA_BODY='<html>not json</html>'
-assert_eq "Gitea: unparseable response fails open to squash" "squash" "$(detect_merge_method)"
+assert_eq "Gitea: unparseable response fails open to merge (#9105)" "merge" "$(detect_merge_method)"
 
 STUB_GITEA_BODY='{"allow_squash_merge":false,"allow_merge_commits":true,"allow_rebase_merge":false}'
 STUB_GITEA_CODE=401
-assert_eq "Gitea: non-200 response fails open to squash" "squash" "$(detect_merge_method)"
+assert_eq "Gitea: non-200 response fails open to merge (#9105)" "merge" "$(detect_merge_method)"
 STUB_GITEA_CODE=200
 
 # Never emit anything but the three known strategies.
