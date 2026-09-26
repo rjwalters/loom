@@ -777,6 +777,59 @@ fn resolve_for_dispatch_fails_closed_on_a_wholly_unavailable_list() {
     assert!(rejection.reason.contains("preference order: claude"), "{}", rejection.reason);
 }
 
+/// #8602: the chosen tap's `modelProfile` rides on `ResolvedRuntime::preference`
+/// out of `resolve_for_dispatch`, which is what `launch_env::apply_launch_env`
+/// reads to pin `LOOM_MODEL_PROFILE`. A profile-pinned backstop tap that is
+/// fallen through to carries its profile; the most-preferred bare-runtime tap
+/// in the very same list carries `None` — matching `Tap::model_profile` itself
+/// and extending "absent config is byte-identical" to this field.
+#[test]
+#[serial_test::serial]
+fn resolve_for_dispatch_stamps_the_chosen_taps_model_profile() {
+    let _env = ClearedRuntimeEnv::new();
+    let dir = fixture();
+    write_config(
+        dir.path(),
+        &serde_json::json!({
+            "runtimes": {
+                "preference": ["claude", {"runtime": "opencode", "modelProfile": "zai-metered"}]
+            }
+        }),
+    );
+
+    // Claude's pool is unprovisioned, so the walk falls through to the
+    // profile-pinned backstop tap.
+    provision_claude_pool(dir.path(), 0);
+    let admission = super::resolve_for_dispatch(dir.path(), "builder", None).unwrap();
+    let admitted = admission.admitted.unwrap();
+    assert_eq!(admitted.runtime, "opencode");
+    assert_eq!(
+        admitted
+            .preference
+            .as_ref()
+            .and_then(|stamp| stamp.model_profile.as_deref()),
+        Some("zai-metered"),
+        "{:?}",
+        admitted.preference
+    );
+
+    // Provision Claude: the walk now settles on the most-preferred, bare tap
+    // — `preference` is still stamped (a walk did decide), but its
+    // `model_profile` is `None`.
+    provision_claude_pool(dir.path(), 2);
+    let admission = super::resolve_for_dispatch(dir.path(), "builder", None).unwrap();
+    let admitted = admission.admitted.unwrap();
+    assert_eq!(admitted.runtime, "claude");
+    assert!(
+        admitted
+            .preference
+            .as_ref()
+            .is_some_and(|stamp| stamp.model_profile.is_none()),
+        "{:?}",
+        admitted.preference
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The shared availability mapping
 // ---------------------------------------------------------------------------

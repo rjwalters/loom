@@ -41,26 +41,21 @@
 //! Issue #8555 added the fourth piece: the per-host admission bound on the
 //! metered backstop tier ([`ceiling`]), asked during the same walk and applied
 //! at the first two of those seams — `resolve_for_dispatch` hands the sweep
-//! path a [`ceiling::Reservation`] to attach to the child it spawns. Carrying
-//! the chosen tier into the `role_tick.outcome` record / per-sweep launch
-//! record (#8599) is still tracked separately; see the follow-up issues linked
-//! from #8436.
+//! path a [`ceiling::Reservation`] to attach to the child it spawns. Issue
+//! #8599 carried the chosen tier into the `role_tick.outcome` record /
+//! per-sweep launch record, via [`PreferenceStamp`] and the shared
+//! `crate::launch_env::apply_launch_env` pin site.
 //!
-//! **Known gap: a tap's `modelProfile` gates but does not pin.** [`Tap`]'s
-//! optional profile is honoured when [`availability`] decides whether the tap
-//! can serve (it reads exactly that profile's provider + credential pool), but
-//! nothing carries it to the child: [`Decision::into_admission`] collapses to
-//! [`ResolvedRuntime`], which has no profile field, and neither `cmd.env`
-//! launch site pins `LOOM_MODEL_PROFILE`. A profile-pinned tap therefore
-//! launches on whatever profile the runtime would have resolved anyway, which
-//! for two profiles on different providers is not the tap whose pool was just
-//! checked. Bare-runtime entries — every tap in the shipped examples that is
-//! not the metered backstop — are unaffected, because their profile *is* the
-//! default resolution. Pinning it needs `LOOM_MODEL_PROFILE` set at the same
-//! two `cmd.env("LOOM_RUNTIME", …)` sites #8599 has to touch (and which the
-//! file-size ratchet says should be collapsed into one helper before either
-//! adds a field), so it is tracked in #8602 behind that, not done half-way
-//! here.
+//! **A tap's `modelProfile` gates *and* pins (#8602).** [`Tap`]'s optional
+//! profile is honoured when [`availability`] decides whether the tap can
+//! serve (it reads exactly that profile's provider + credential pool), and
+//! [`PreferenceStamp::model_profile`] carries the same value out to
+//! [`crate::launch_env::apply_launch_env`], which pins `LOOM_MODEL_PROFILE`
+//! beside `LOOM_RUNTIME` so the launched child resolves the identical profile
+//! availability just checked. Bare-runtime entries — every tap in the shipped
+//! examples that is not the metered backstop — pin nothing, matching
+//! `Tap::model_profile`'s own `None`, so "absent config is byte-identical"
+//! holds for this field too.
 //!
 //! # Invariants
 //!
@@ -114,7 +109,8 @@ pub mod resolve;
 pub use availability::{availability, Availability, CredentialSource};
 pub use ceiling::{BackstopCeiling, ComplexityTier, Intent, Reservation};
 pub use resolve::{
-    CeilingSkip, ChosenTap, Resolution, SkipReason, SkippedTap, Tap, PREFERENCE_LOG_MARKER,
+    CeilingSkip, ChosenTap, PreferenceStamp, Resolution, SkipReason, SkippedTap, Tap,
+    PREFERENCE_LOG_MARKER,
 };
 
 use crate::runtime_admission::{canonical_role, ResolvedRuntime, RuntimeRejection, RuntimeSource};
@@ -220,6 +216,32 @@ impl Decision {
                 Some(line)
             }
         }
+    }
+
+    /// The [`PreferenceStamp`] to carry on the admitted runtime (#8599), or
+    /// `None` on the static path (no tiers to report) and in the fail-closed
+    /// case (no chosen tap). Stamping the admission is what gets the chosen
+    /// tier out of the daemon log and into the per-launch records: the launch
+    /// surfaces read it off [`ResolvedRuntime::preference`] rather than
+    /// re-resolving anything.
+    ///
+    /// The stamped marker is [`Self::marker_line`] verbatim — the exact line
+    /// the daemon logs, including the `backstop=` reservation summary (#8555)
+    /// when the chosen tap holds a metered slot — so the launch record and the
+    /// daemon log can never disagree.
+    #[must_use]
+    pub fn stamp(&self) -> Option<PreferenceStamp> {
+        let Self::Preference {
+            source, resolution, ..
+        } = self
+        else {
+            return None;
+        };
+        let mut stamp = resolution.stamp(source.as_str())?;
+        if let Some(line) = self.marker_line() {
+            stamp.marker = line;
+        }
+        Some(stamp)
     }
 
     /// Collapse this decision into the ordinary admission shape every
@@ -336,9 +358,16 @@ pub fn resolve_for_dispatch(
     if let Some(marker) = decision.marker_line() {
         log::info!("runtime_preference: {role} resolved by preference list — {marker} (#8554)");
     }
+    // #8599: stamp the decision onto the admission so the launch surfaces can
+    // report the chosen tier without re-resolving it. `None` on the static
+    // path keeps "absent config is byte-identical" intact all the way to the
+    // child's environment.
+    let stamp = decision.stamp();
     let backstop = decision.take_backstop();
+    let mut admitted = decision.into_admission(role)?;
+    admitted.preference = stamp;
     Ok(DispatchAdmission {
-        admitted: Some(decision.into_admission(role)?),
+        admitted: Some(admitted),
         backstop,
     })
 }

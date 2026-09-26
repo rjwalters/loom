@@ -123,9 +123,14 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
     let mounts = state["Mounts"]
         .as_array()
         .context("missing actual mount inventory")?;
-    let expected = 2 + usize::from(config.gh_config.is_some());
+    // Workspace volume + profile bind + one read-only bind per profile control
+    // file (+ the optional forge configuration). Because every destination is
+    // required to be distinct AND to match one of those exact roles, an exact
+    // count is also a proof that none of them is MISSING — which is what makes
+    // this the host-side half of the control-file protection (issue #8839).
+    let expected = 2 + bundle::PROFILE_CONTROLS.len() + usize::from(config.gh_config.is_some());
     if mounts.len() != expected {
-        bail!("private session has unexpected mounts; no host workspace, peer volume or runtime socket may be mounted");
+        bail!("private session has unexpected mounts; no host workspace, peer volume or runtime socket may be mounted, and every account profile control file must be bound read-only");
     }
     let mut seen = std::collections::HashSet::new();
     for mount in mounts {
@@ -149,7 +154,16 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
                     && bind_source_matches(config, mount, path)
                     && mount["RW"] == false
             }),
-            _ => false,
+            // The hook registration, Codex's trust state and Loom's readiness
+            // receipt, each bound READ-ONLY over its own canonical path. The
+            // mount point is what makes them unremovable and unrenameable from
+            // inside the session while `auth.json` beside them stays writable.
+            other => bundle::PROFILE_CONTROLS.iter().any(|name| {
+                other == bundle::control_destination(name)
+                    && mount["Type"] == "bind"
+                    && bind_source_matches(config, mount, &config.profile.join(name))
+                    && mount["RW"] == false
+            }),
         };
         if !valid {
             bail!("private session mount does not match its account-owned configuration");
@@ -157,6 +171,22 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The read-only control-file binds a private session is created with. One
+/// source of truth with `validate_settings` above, so a session can never be
+/// created in a shape its own validation would accept while unprotected.
+fn control_mounts(config: &Config) -> Vec<String> {
+    bundle::PROFILE_CONTROLS
+        .iter()
+        .map(|name| {
+            format!(
+                "type=bind,src={},dst={},readonly",
+                config.profile.join(name).display(),
+                bundle::control_destination(name)
+            )
+        })
+        .collect()
 }
 
 pub(super) fn idle(state: Option<&Value>, container: &str) -> Result<bool> {
@@ -257,6 +287,13 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
         "--label".into(),
         format!("loom.repository={}", config.repository),
     ];
+    // Read-only binds over the profile's own control files. They must already
+    // exist on the host: `provision_controls` below is what guarantees that,
+    // and it runs before this in a container that does NOT carry these binds
+    // (writing them from inside a session is exactly what they prevent).
+    for mount in control_mounts(config) {
+        args.extend(["--mount".to_owned(), mount]);
+    }
     for value in [
         format!("CODEX_HOME={PROFILE}"),
         "XDG_CACHE_HOME=/workspace/cache/xdg".into(),
@@ -295,7 +332,51 @@ pub(super) fn setup(config: &Config) -> Result<()> {
         "private-workspace",
         "setup",
     ])?;
-    let report: worker_setup::SetupReport = serde_json::from_str(&output)
+    report(&output)
+}
+
+/// Materialize the account profile's control files — the managed hook
+/// registration, Codex's own trust-state file and Loom's readiness receipt —
+/// with the image-owned, sealed provisioner, **before** the session container
+/// exists.
+///
+/// This cannot happen inside the session: the session binds those three files
+/// read-only, which is the entire protection, so a write there is `EROFS` by
+/// design. It therefore runs in a throwaway container from the same image,
+/// carrying the account profile and nothing else — no workspace volume, no
+/// forge configuration, no network — so the only thing it can touch is the
+/// profile Loom already owns. `auth.json` is never read, written or copied by
+/// any of it.
+pub(super) fn provision_controls(config: &Config, image: &str) -> Result<()> {
+    let output = command(&[
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--user",
+        "1000:1000",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,size=64m",
+        "--mount",
+        &format!("type=bind,src={},dst={PROFILE}", config.profile.display()),
+        "--env",
+        &format!("CODEX_HOME={PROFILE}"),
+        "--entrypoint",
+        "loom-daemon",
+        image,
+        "private-workspace",
+        "provision-controls",
+    ]).context("private control provisioning endpoint unavailable; use a session image that ships the versioned control bundle")?;
+    report(&output)
+}
+
+fn report(output: &str) -> Result<()> {
+    let report: worker_setup::SetupReport = serde_json::from_str(output)
         .context("private setup endpoint unavailable; update the session image")?;
     if report.protocol != PROTOCOL {
         bail!("private setup protocol mismatch; update the session image");
@@ -303,6 +384,7 @@ pub(super) fn setup(config: &Config) -> Result<()> {
     match report.status {
         worker_setup::SetupStatus::Ready => Ok(()),
         worker_setup::SetupStatus::ProfileInaccessible => bail!("private account profile is not readable and writable by session UID 1000; check external profile ownership and permissions (profile was preserved)"),
+        worker_setup::SetupStatus::ControlMissing => bail!("private session image ships no {} control bundle, so the account profile's hook registration cannot be established from a sealed provisioner; guard code and effective policy would live in worker-writable paths", bundle::CONTROL_PROTOCOL),
         worker_setup::SetupStatus::Failed => bail!("private helper/configuration setup failed; inspect the owned account locally (configuration was preserved)"),
     }
 }

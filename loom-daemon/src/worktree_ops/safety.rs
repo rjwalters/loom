@@ -279,16 +279,91 @@ pub fn find_processes_using_directory(directory: &Path) -> Vec<u32> {
         .canonicalize()
         .unwrap_or_else(|_| directory.to_path_buf());
     let mut pids = if cfg!(target_os = "linux") {
-        find_processes_proc(&directory)
+        find_processes_proc(&directory, false)
     } else {
-        find_processes_lsof(&directory)
+        find_processes_lsof(&directory, false)
     };
     let current_pid = std::process::id();
     pids.retain(|p| *p != current_pid);
     pids
 }
 
-fn find_processes_lsof(directory: &Path) -> Vec<u32> {
+/// The answer [`find_processes_with_cwd_in_directory`] gives, which has three
+/// states rather than two: a host with neither probe available cannot say
+/// "nobody is in there", only "I could not look".
+///
+/// The shell twin this exists for — `lib/worktree-race-rescue.sh`'s
+/// `loom_worktree_has_live_process` — collapsed the third state into "no
+/// holder found" at its single call site but printed a stderr line first, so
+/// the distinction was observable and has to survive the port (#8195 slice 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CwdProbe {
+    /// The probe ran. Every PID whose cwd is `directory` or a descendant of it,
+    /// excluding this process.
+    Pids(Vec<u32>),
+    /// Neither `/proc` nor `lsof` is available, so nothing was examined. NOT
+    /// the same as `Pids(vec![])` — see the enum docs.
+    Unprobable,
+}
+
+/// Find PIDs whose **current working directory** is `directory` or a
+/// descendant of it — the narrower, pre-#7466 signal, deliberately kept
+/// distinct from [`find_processes_using_directory`]'s widened
+/// "any open file descriptor under here" scan.
+///
+/// # Why both exist, and why this one is not the wider one
+///
+/// [`find_processes_using_directory`] gates the watchdog's
+/// `git reset --hard` + `git clean -fd` mid-build recovery, where a
+/// false negative destroys a live writer's untracked build output; it takes
+/// false positives deliberately to eliminate missed detection (#7466).
+///
+/// This one is the veto in front of `worktree.sh`'s stale-worktree
+/// `git reset --hard` (#7463), which never runs `git clean`, and whose
+/// refusal costs something real: a worktree that cannot be reset is handed to
+/// the next Builder still carrying drift (the #6291 class). The shell it
+/// replaces matched cwd only, and a port is not the place to widen a guard's
+/// trigger — that is a behaviour change with its own evidence to gather, so it
+/// is filed separately rather than smuggled in here. Both probes share this
+/// module's one `/proc` walk and one `lsof` parse; the difference is a single
+/// flag, so there is no second implementation to drift.
+#[must_use]
+pub fn find_processes_with_cwd_in_directory(directory: &Path) -> CwdProbe {
+    // `worktree_real="$(cd "$worktree_path" && pwd -P)" || return 1` — an
+    // unenterable directory has nothing to protect, and the caller's own
+    // `git -C` reports the real problem.
+    let Ok(directory) = directory.canonicalize() else {
+        return CwdProbe::Pids(Vec::new());
+    };
+    // The shell's probe order, verbatim: Linux `/proc` first (so a hermetic CI
+    // runner with no `lsof` still gets a real answer), then `lsof`, then
+    // neither.
+    let mut pids = if cfg!(target_os = "linux") && Path::new("/proc/self").is_dir() {
+        find_processes_proc(&directory, true)
+    } else if lsof_is_available() {
+        find_processes_lsof(&directory, true)
+    } else {
+        return CwdProbe::Unprobable;
+    };
+    let current_pid = std::process::id();
+    pids.retain(|p| *p != current_pid);
+    CwdProbe::Pids(pids)
+}
+
+/// `command -v lsof >/dev/null 2>&1`, as the shell asked it.
+fn lsof_is_available() -> bool {
+    Command::new("lsof")
+        .arg("-v")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// `cwd_only` restricts the scan to the FD-field-`cwd` entries — the
+/// pre-#7466 signal [`find_processes_with_cwd_in_directory`] needs. The
+/// widened caller passes `false` and keeps every PID `lsof +D` reports.
+fn find_processes_lsof(directory: &Path, cwd_only: bool) -> Vec<u32> {
     let output = match Command::new("lsof")
         // `+D` (uppercase) is lsof's *recursive* directory scan — it matches
         // `<dir>` itself and any descendant at any depth. The lowercase `+d`
@@ -314,6 +389,9 @@ fn find_processes_lsof(directory: &Path) -> Vec<u32> {
     // unconditionally here is safe and matches the fail-open-to-empty
     // contract for a genuine `lsof` failure (no output to parse either way).
     let stdout = String::from_utf8_lossy(&output.stdout);
+    if cwd_only {
+        return parse_lsof_cwd_pids(&stdout);
+    }
     // The widened, issue #7466 scan: every PID `lsof +D <dir>` reports at
     // all, not just the ones whose FD field is `cwd`.
     let mut pids = parse_lsof_open_fd_pids(&stdout);
@@ -390,8 +468,11 @@ fn is_directory_or_descendant(path: &str, directory: &str) -> bool {
     path == directory || path.starts_with(&format!("{directory}/"))
 }
 
+/// `cwd_only` skips signal 2 below, restricting the walk to
+/// `/proc/<pid>/cwd` — see [`find_processes_with_cwd_in_directory`] for which
+/// caller wants which, and why the narrower one was not widened.
 #[cfg(target_os = "linux")]
-fn find_processes_proc(directory: &Path) -> Vec<u32> {
+fn find_processes_proc(directory: &Path, cwd_only: bool) -> Vec<u32> {
     let proc = Path::new("/proc");
     if !proc.is_dir() {
         return Vec::new();
@@ -424,17 +505,18 @@ fn find_processes_proc(directory: &Path) -> Vec<u32> {
         // is unreadable (another user's process, or one that exited mid-scan)
         // simply contributes no fd-based hits — consistent with this
         // function's overall fail-open-to-"not found" behavior.
-        let fd_hit = std::fs::read_dir(pid_path.join("fd"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|fd_entry| {
-                std::fs::read_link(fd_entry.path())
-                    .ok()
-                    .is_some_and(|target| {
-                        is_directory_or_descendant(&target.to_string_lossy(), &dir_str)
-                    })
-            });
+        let fd_hit = !cwd_only
+            && std::fs::read_dir(pid_path.join("fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|fd_entry| {
+                    std::fs::read_link(fd_entry.path())
+                        .ok()
+                        .is_some_and(|target| {
+                            is_directory_or_descendant(&target.to_string_lossy(), &dir_str)
+                        })
+                });
 
         if cwd_hit || fd_hit {
             pids.push(pid);
@@ -445,7 +527,7 @@ fn find_processes_proc(directory: &Path) -> Vec<u32> {
 
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
-fn find_processes_proc(_directory: &Path) -> Vec<u32> {
+fn find_processes_proc(_directory: &Path, _cwd_only: bool) -> Vec<u32> {
     Vec::new()
 }
 
@@ -480,14 +562,15 @@ pub fn check_uncommitted_changes(worktree_path: &Path) -> bool {
 /// block in `.gitignore`), but a repo that predates or has edited that block
 /// would otherwise see every managed worktree as permanently unreclaimable.
 ///
-/// This list has a TWIN in shell: `_worktree_dirty_lines` in
-/// `defaults/scripts/worktree.sh`, which is the same guard for the same
-/// reason on the `worktree.sh remove` path. The two disagreed (#8195): this
-/// side listed two markers and the shell listed four, so in a repo with a
-/// stale `.gitignore` the daemon saw `.loom-checkpoint` and
-/// `.no-changes-needed` as user work and declined to reclaim a worktree the
-/// shell would have removed. `dirty_marker_filter_matches_the_shell_twin`
-/// drives the real shell helper and fails if they drift apart again.
+/// This list used to have a TWIN in shell: `_worktree_dirty_lines` in
+/// `defaults/scripts/worktree.sh`, the same guard for the same reason on the
+/// `worktree.sh remove` path. The two disagreed (#8195): this side listed two
+/// markers and the shell listed four, so in a repo with a stale `.gitignore`
+/// the daemon saw `.loom-checkpoint` and `.no-changes-needed` as user work
+/// and declined to reclaim a worktree the shell would have removed. #8195
+/// slice 3 ported `worktree.sh remove` onto this predicate directly and
+/// deleted the shell twin, so `all_loom_own_markers_are_recognised_as_bookkeeping`
+/// now pins this constant on its own rather than comparing two implementations.
 pub const LOOM_OWN_UNTRACKED_FILES: [&str; 4] = [
     ".loom-managed",
     ".loom-in-use",
@@ -506,12 +589,12 @@ pub const LOOM_OWN_UNTRACKED_FILES: [&str; 4] = [
 /// gets carried away. Losing `.loom-managed` that way makes every cleanup path
 /// refuse the worktree afterwards (#3548).
 ///
-/// Anchoring matches the shell twin's `(^|/)\.loom-managed$|…` regex in
-/// `worktree.sh`'s `_worktree_dirty_lines`: the final path component decides,
-/// so a marker in a subdirectory is recognised too. That is a superset of the
-/// whole-path equality this module used before, and it can only ever filter
-/// MORE of Loom's own bookkeeping — never a user's file, since the four names
-/// are Loom's alone.
+/// Anchoring matches the now-removed shell twin's `(^|/)\.loom-managed$|…`
+/// regex that used to live in `worktree.sh`'s `_worktree_dirty_lines`: the
+/// final path component decides, so a marker in a subdirectory is recognised
+/// too. That is a superset of the whole-path equality this module used
+/// before, and it can only ever filter MORE of Loom's own bookkeeping — never
+/// a user's file, since the four names are Loom's alone.
 #[must_use]
 pub fn is_loom_own_untracked_path(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
@@ -606,33 +689,20 @@ pub fn read_in_use_marker(worktree_path: &Path) -> Option<InUseMarker> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    /// The dirty-marker filter must agree with its shell twin.
+    /// Every entry in [`LOOM_OWN_UNTRACKED_FILES`] must be recognised as
+    /// bookkeeping, not user work — and a real file must still count as dirt.
     ///
-    /// `worktree.sh`'s `_worktree_dirty_lines` is the same guard for the same
-    /// reason on the `worktree.sh remove` path, and the two had already
-    /// drifted: this side filtered two markers, the shell filtered four. In a
-    /// repo whose `.gitignore` predates the `loom-managed` block (exactly the
-    /// case both filters exist for), the daemon read `.loom-checkpoint` and
-    /// `.no-changes-needed` as user work and refused to reclaim a worktree the
-    /// shell removed without comment.
-    ///
-    /// So this drives the REAL shell helper rather than re-encoding its list:
-    /// a constant pinned against a constant would have passed while the two
-    /// predicates disagreed.
+    /// This used to drive the real `worktree.sh`'s `_worktree_dirty_lines`
+    /// shell helper to keep this Rust filter from drifting apart from its
+    /// shell twin (#8195: this side filtered two markers, the shell filtered
+    /// four). `#8195` slice 3 removed that shell helper entirely —
+    /// `worktree.sh remove` is now a thin stub over `loom-daemon
+    /// worktree-remove`, which drives this same predicate
+    /// ([`is_loom_own_untracked_path`]) directly rather than through a
+    /// separate shell-side filter — so there is no second implementation
+    /// left to compare against. Pin the full constant list directly instead.
     #[test]
-    fn dirty_marker_filter_matches_the_shell_twin() {
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let wt_sh = repo_root.join("defaults/scripts/worktree.sh");
-        let Ok(sh) = std::fs::read_to_string(&wt_sh) else {
-            return; // not a full checkout
-        };
-        let start = sh
-            .find("_worktree_dirty_lines() {")
-            .expect("worktree.sh defines _worktree_dirty_lines");
-        let body = &sh[start..];
-        let end = body.find("\n}\n").expect("function has a terminator");
-        let helper = &body[..end + 3];
-
+    fn all_loom_own_markers_are_recognised_as_bookkeeping() {
         let dir = tempfile::tempdir().expect("tempdir");
         let git = |args: &[&str]| {
             Command::new("git")
@@ -651,60 +721,19 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-qm", "init"]);
 
-        // Deliberately NO .gitignore: the drift only shows in a repo that does
-        // not ignore the markers, which is the case the filters exist for.
-        //
-        // The fixture list is a LITERAL, not `LOOM_OWN_UNTRACKED_FILES`.
-        // Generating it from the constant would make the test move with the
-        // bug — shrink the constant and the fixture shrinks with it, and the
-        // assertion passes while the two guards disagree. That is the same
-        // shape of hole as pinning a number instead of a predicate.
-        for m in [
-            ".loom-managed",
-            ".loom-in-use",
-            ".loom-checkpoint",
-            ".no-changes-needed",
-        ] {
+        // Deliberately NO .gitignore: the guard only matters in a repo whose
+        // .gitignore predates (or has edited away) the loom-managed block.
+        for m in LOOM_OWN_UNTRACKED_FILES {
             std::fs::write(dir.path().join(m), "").expect("write marker");
         }
-
-        let script = format!("{helper}\n_worktree_dirty_lines \"$1\"");
-        let out = Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .arg("bash")
-            .arg(dir.path())
-            .output()
-            .expect("bash runs");
-        let shell_sees_dirt = !String::from_utf8_lossy(&out.stdout).trim().is_empty();
-
         assert!(
-            !shell_sees_dirt,
-            "the shell treats every marker as bookkeeping; got: {}",
-            String::from_utf8_lossy(&out.stdout)
-        );
-        assert_eq!(
-            has_untracked_files(dir.path()),
-            shell_sees_dirt,
-            "markers alone: the two guards must reach the same verdict"
+            !has_untracked_files(dir.path()),
+            "every LOOM_OWN_UNTRACKED_FILES entry must be treated as bookkeeping"
         );
 
-        // And both must still see real user work.
+        // And real user work is still caught.
         std::fs::write(dir.path().join("work.txt"), "mine\n").expect("write");
-        let out2 = Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .arg("bash")
-            .arg(dir.path())
-            .output()
-            .expect("bash runs");
-        let shell_sees_dirt2 = !String::from_utf8_lossy(&out2.stdout).trim().is_empty();
-        assert!(shell_sees_dirt2, "a real untracked file is dirt");
-        assert_eq!(
-            has_untracked_files(dir.path()),
-            shell_sees_dirt2,
-            "real work: the two guards must reach the same verdict"
-        );
+        assert!(has_untracked_files(dir.path()), "a real untracked file is dirt");
     }
 
     use super::*;
@@ -1005,7 +1034,7 @@ mod tests {
 
         let mut found = Vec::new();
         for _ in 0..40 {
-            found = find_processes_lsof(&canonical_worktree);
+            found = find_processes_lsof(&canonical_worktree, false);
             if found.contains(&child.id()) {
                 break;
             }

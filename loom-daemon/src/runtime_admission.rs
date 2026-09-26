@@ -52,6 +52,18 @@ pub struct ResolvedRuntime {
     /// manifest has no such key (or it could not be read/parsed — this is a
     /// best-effort preference hint, not a validated requirement).
     pub suggested_worker_type: Option<String>,
+    /// What the ordered runtime-preference walk decided for this launch
+    /// (#8599), when a `runtimes.preference` / `rolePreference.<role>` list
+    /// decided it at all. `None` on the static path — which is every launch on
+    /// a host with no preference configured, keeping #8554's "absent config is
+    /// byte-identical" invariant true of this struct too. Stamped by
+    /// [`crate::runtime_preference::resolve_for_dispatch`] /
+    /// `role_runner::runtime_preflight`; read by
+    /// [`crate::launch_env::apply_launch_env`] and the `role_tick.outcome`
+    /// record, so the chosen tier is reportable per launch rather than only
+    /// greppable in `loom-daemon logs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preference: Option<crate::runtime_preference::PreferenceStamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,14 +412,14 @@ const BUNDLED_RUNTIME_MANIFESTS: &[(&str, &str)] = &[
 /// not built with a manifest for (e.g. an operator-defined custom runtime) —
 /// those still fail closed with no fallback, per the unchanged fail-closed
 /// contract for non-builtin runtimes with no reachable manifest anywhere.
-fn bundled_runtime_manifest(runtime: &str) -> Option<&'static str> {
+pub(crate) fn bundled_runtime_manifest(runtime: &str) -> Option<&'static str> {
     BUNDLED_RUNTIME_MANIFESTS
         .iter()
         .find(|(name, _)| *name == runtime)
         .map(|(_, contents)| *contents)
 }
 
-fn roots(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+pub(crate) fn roots(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let installed = root.join(".loom");
     let defaults = root.join("defaults");
     // Each subdirectory falls back to `defaults/` independently (#4688): a
@@ -563,6 +575,7 @@ fn resolve_and_admit_with(
                 role_manifest,
                 runtime_manifest,
                 suggested_worker_type: role_suggested,
+                preference: None,
             });
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -643,6 +656,7 @@ fn resolve_and_admit_with(
         role_manifest,
         runtime_manifest,
         suggested_worker_type: role_suggested,
+        preference: None,
     })
 }
 

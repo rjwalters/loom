@@ -15,6 +15,8 @@ import {
   isHostDistressed,
   isRosterMissingStatus,
   isTokenPoolDegraded,
+  noCaptainReporting,
+  singletonsArmedOnNonCaptain,
   sortSweeps,
   summarizeTokens,
 } from "../src/fleet";
@@ -338,6 +340,74 @@ describe("distressReason / isHostDistressed (#4975)", () => {
       NOW,
     );
     expect(reason).toBe("role tick(s) persistently failing: guide @ loom");
+  });
+});
+
+describe("singletonsArmedOnNonCaptain (#8848)", () => {
+  it("is empty with no health record at all", () => {
+    expect(singletonsArmedOnNonCaptain(undefined)).toEqual([]);
+  });
+
+  it("is empty when this host IS the captain, even with jobs armed", () => {
+    expect(singletonsArmedOnNonCaptain({ is_captain: true, armed_singleton_jobs: ["edge-queue-pull"] })).toEqual([]);
+  });
+
+  it("is empty when nothing is armed here, captain or not", () => {
+    expect(singletonsArmedOnNonCaptain({ is_captain: false })).toEqual([]);
+    expect(singletonsArmedOnNonCaptain({ is_captain: false, armed_singleton_jobs: [] })).toEqual([]);
+  });
+
+  it("flags a job armed on a non-captain host — the anomaly this exists to catch", () => {
+    expect(singletonsArmedOnNonCaptain({ is_captain: false, armed_singleton_jobs: ["edge-queue-pull"] })).toEqual([
+      "edge-queue-pull",
+    ]);
+  });
+
+  it("flags a job armed when is_captain is not even reported (undefined != true)", () => {
+    expect(singletonsArmedOnNonCaptain({ armed_singleton_jobs: ["edge-queue-pull"] })).toEqual(["edge-queue-pull"]);
+  });
+
+  it("fires identically for a shell-driven arm, not only an in-daemon one (#8901)", () => {
+    // This function only ever reads `armed_singleton_jobs` — it has no way to
+    // tell an in-daemon `arm_singleton_job` entry apart from one the backend
+    // merged in from the durable `loom-daemon fleet-captain <job>` shell-arm
+    // registry (`fleet_captain::armed_singleton_job_names_for_host`). That is
+    // the point: once the backend reports a shell-driven arm at all, this
+    // flag fires on it exactly the same way, with no dashboard-side special
+    // case required.
+    expect(
+      singletonsArmedOnNonCaptain({ is_captain: false, armed_singleton_jobs: ["ci-telemetry-poll"] }),
+    ).toEqual(["ci-telemetry-poll"]);
+  });
+});
+
+describe("noCaptainReporting (#8848)", () => {
+  const hostWith = (isCaptain: boolean | undefined) =>
+    buildHostView(
+      "h",
+      { health: { record: { kind: "host.health", is_captain: isCaptain }, updatedAt: NOW.toISOString() } },
+      [],
+      NOW,
+    );
+
+  it("is false for an empty fleet", () => {
+    expect(noCaptainReporting([])).toBe(false);
+  });
+
+  it("is false when no host reports is_captain at all — the overwhelmingly common, opted-out fleet", () => {
+    expect(noCaptainReporting([hostWith(undefined), hostWith(undefined)])).toBe(false);
+  });
+
+  it("is false once at least one host reports is_captain: true", () => {
+    expect(noCaptainReporting([hostWith(false), hostWith(true), hostWith(undefined)])).toBe(false);
+  });
+
+  it("is true when the fleet participates (some host reports is_captain) but none is true — typo'd/decommissioned captain id", () => {
+    expect(noCaptainReporting([hostWith(false), hostWith(false)])).toBe(true);
+  });
+
+  it("is true even when only one host in a larger fleet participates and it is false", () => {
+    expect(noCaptainReporting([hostWith(undefined), hostWith(false)])).toBe(true);
   });
 });
 

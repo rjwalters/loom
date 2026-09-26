@@ -14,15 +14,14 @@
 1657 defaults/scripts/claude-wrapper.sh
 1184 defaults/scripts/cli/loom-daemon-start.sh
 1589 defaults/scripts/cli/loom-daemon-update.sh
-1063 defaults/scripts/lib/forge-helpers.sh
-1460 defaults/scripts/merge-pr.sh
+1011 defaults/scripts/lib/forge-helpers.sh
+1225 defaults/scripts/merge-pr.sh
 2033 defaults/scripts/tests/test-loom-daemon-start.sh
 3205 defaults/scripts/tests/test-loom-daemon-update.sh
 1846 defaults/scripts/tests/test-loom-daemon-watchdog.sh
 2169 defaults/scripts/tests/test-resync-installed.sh
 1822 defaults/scripts/tests/test-spawn-claude.sh
 1125 defaults/scripts/tests/test-spawn-codex.sh
-1434 defaults/scripts/worktree.sh
 1365 install.sh
 1598 loom-daemon/src/agent_session/spawn.rs
 1178 loom-daemon/src/auto_update.rs
@@ -76,7 +75,7 @@
 1510 loom-daemon/src/tokens_pool/session_lifecycle.rs
 1656 loom-daemon/src/types.rs
 1050 loom-daemon/src/watch_registry.rs
-1908 loom-daemon/src/work_finder.rs
+1580 loom-daemon/src/work_finder.rs
 3455 loom-daemon/src/work_finder/tests.rs
 1225 loom-daemon/src/worktree_ops/cargo_target.rs
 2370 loom-daemon/src/worktree_ops/clean.rs

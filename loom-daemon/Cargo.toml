@@ -46,6 +46,14 @@ tempfile = "3.27"
 # nothing beyond the C toolchain `rusqlite`'s bundled build already requires.
 tar = "0.4.46"
 zstd = "0.14.0"
+# Format-preserving TOML for pooled-profile provisioning (#8672): the
+# key-merge into a profile's `config.toml` must leave every key Loom does not
+# own — comments included — byte-identical, which a parse/re-serialize round
+# trip through a value-tree crate (`toml`) cannot promise. `toml_edit` is the
+# same document model cargo itself uses. Default features only (`parse` +
+# `display`); `serde` is deliberately off — the provisioner walks the document
+# tree directly rather than deserializing a profile's config into typed structs.
+toml_edit = "0.25"
 
 [dev-dependencies]
 tokio-test = "0.4"

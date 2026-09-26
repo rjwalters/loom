@@ -292,7 +292,7 @@ fn role_runner_probe() {
     let mut runner = ScriptRoleInvocationRunner::new(root.into());
     let result = runner.invoke("curator", "/loom:curator");
     assert!(result.is_success(), "{result:?}");
-    assert_eq!(runner.resolved_model_effort().unwrap().0, "");
+    assert_eq!(runner.resolved_launch().unwrap().model, "");
 }
 #[test]
 fn native_role_runner_does_not_require_claude_tokens_or_inherit_sonnet() {
@@ -754,10 +754,16 @@ fn profile_check(root: &std::path::Path, args: &[&str]) -> std::process::Output 
         .current_dir(root)
         .env("LOOM_WORKSPACE", root)
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+        // Never let a pool report depend on the operator's real
+        // `~/.loom/api-keys` (#8401): this binary is not `cfg(test)`, so the
+        // in-crate refusal does not apply to it.
+        .env("LOOM_SHARED_API_KEYS_DIR", "")
         .env_remove("AWS_PROFILE")
         .env_remove("GOOGLE_APPLICATION_CREDENTIALS")
         .env_remove("GOOGLE_CLOUD_PROJECT")
-        .env_remove("VERTEX_LOCATION");
+        .env_remove("VERTEX_LOCATION")
+        .env_remove("CEREBRAS_API_KEY")
+        .env_remove("GEMINI_API_KEY");
     c.output().unwrap()
 }
 
@@ -788,9 +794,11 @@ fn credential_env_accepts_the_legacy_string_form_and_a_required_array() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("child_env HARNESS_ONE=first-value"), "{text}");
     assert!(text.contains("child_env HARNESS_TWO=second-value"), "{text}");
-    // The bundled examples are part of the schema surface: all four must load.
+    // The bundled examples are part of the schema surface: all of them must load.
     for name in [
         "zai-flash",
+        "quick-cerebras",
+        "quick-flash",
         "example-bedrock",
         "example-vertex",
         "example-openai-compatible",
@@ -941,6 +949,10 @@ fn profile_check_reports_resolvability_without_spawning() {
     assert_eq!(out.status.code(), Some(78));
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown model profile"));
 }
+
+// Bundled quick-tap preset coverage (`quick-cerebras`, `quick-flash`, issue
+// #8711) lives in the sibling `worker_spawn_quick_tap.rs` — this file sits at
+// the 1000-line file-size ratchet, so new cases go there, not here.
 
 #[test]
 fn malformed_profile_selection_does_not_fall_back_to_a_billable_default() {

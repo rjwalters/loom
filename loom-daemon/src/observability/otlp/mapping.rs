@@ -2,7 +2,9 @@
 //! parent module's doc comment for the mapping table this file implements;
 //! this module is the field-by-field implementation plus its unit tests.
 
+mod ci;
 mod metadata;
+mod ops;
 
 use std::collections::BTreeMap;
 
@@ -14,12 +16,14 @@ use opentelemetry_proto::tonic::common::v1::{
 };
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber};
 use opentelemetry_proto::tonic::metrics::v1::{
-    metric, number_data_point, Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+    metric, number_data_point, AggregationTemporality, Gauge, Histogram, HistogramDataPoint,
+    Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
 use crate::telemetry::{
-    AnomalyFlag, RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryRecord,
+    AnomalyFlag, RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryKindOtlp,
+    TelemetryRecord,
 };
 
 // ============================================================================
@@ -162,7 +166,11 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
 /// two host-level record kinds (`tokens.snapshot`, `host.health`) — those
 /// become metrics instead (see [`metric_samples_for`]).
 fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
-    let time_unix_nano = nanos(envelope.emitted_at);
+    let observed_time_unix_nano = nanos(envelope.emitted_at);
+    let mut time_unix_nano = observed_time_unix_nano;
+    // Only `ci.job.log` (#8825) sets this; every other kind's body stays the
+    // event name it has always been, byte-identical on the wire.
+    let mut body_override: Option<String> = None;
     let (event_name, severity, _body, attributes) = match &envelope.record {
         TelemetryRecord::SweepStarted(r) => {
             let mut attributes = vec![
@@ -515,16 +523,47 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 attributes,
             )
         }
-        TelemetryRecord::TokensSnapshot(_)
-        | TelemetryRecord::HostHealth(_)
-        | TelemetryRecord::Span(_) => return None,
+        TelemetryRecord::CiRun(_) | TelemetryRecord::CiJob(_) => {
+            // Issue #8824: CI runs/jobs are events stamped at their own
+            // `completed_at` (see `ci::log_parts`).
+            let (event_name, severity, completed_at, attributes) = ci::log_parts(&envelope.record)?;
+            time_unix_nano = completed_at;
+            (event_name, severity, String::new(), attributes)
+        }
+        TelemetryRecord::CiJobLog(r) => {
+            // Issue #8825: the one kind whose body is NOT its event name —
+            // it is the chunk's raw log text, which the gateway's
+            // `ci.job.log`-scoped scrub stage redacts before either sink.
+            let (event_name, severity, completed_at, attributes) = ci::log_parts(&envelope.record)?;
+            time_unix_nano = completed_at;
+            body_override = Some(r.text.clone());
+            (event_name, severity, String::new(), attributes)
+        }
+        // Every kind that is not declared `otlp: Logs` in `telemetry/kinds.rs`:
+        // `tokens.snapshot` / `host.health` become gauges, `ci.duration` a
+        // histogram, `metric.points` its own grouped points, `trace.span` a
+        // span, and `queue.snapshot` is native-HTTPS only (SigNoz gets the
+        // queue as `loom.queue.*` gauges through `metric.points`). This used to
+        // be an exhaustive `|` chain every new record kind had to append to —
+        // the routing *decision* is now the `otlp:` column of the kind's own
+        // registry row, so a kind that needs no log mapping does not touch this
+        // file at all (#8921).
+        other => {
+            debug_assert!(
+                other.otlp_class() != TelemetryKindOtlp::Logs,
+                "telemetry kind `{}` declares `otlp: Logs` in telemetry/kinds.rs but \
+                 log_record_for has no arm for it",
+                other.kind()
+            );
+            return None;
+        }
     };
     Some(LogRecord {
         time_unix_nano,
-        observed_time_unix_nano: time_unix_nano,
+        observed_time_unix_nano,
         severity_number: severity as i32,
         severity_text: severity_text(severity).to_string(),
-        body: Some(any_string(event_name)),
+        body: Some(any_string(body_override.unwrap_or_else(|| event_name.to_string()))),
         attributes: metadata::bounded(attributes),
         event_name: event_name.to_string(),
         trace_id: envelope
@@ -728,22 +767,47 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
             }
             samples
         }
-        // Every lifecycle-shaped kind — including `role_tick.outcome`
-        // (#8056) — becomes a log record instead (see `log_record_for`).
-        TelemetryRecord::SweepStarted(_)
-        | TelemetryRecord::SweepIdentity(_)
-        | TelemetryRecord::SweepPhase(_)
-        | TelemetryRecord::SweepCompleted(_)
-        | TelemetryRecord::SweepOutcome(_)
-        | TelemetryRecord::RoleTickOutcome(_)
-        // `session.summary` / `session.analysis` / `daemon.event` are log
-        // records (see log_record_for), not gauges — each is a per-session
-        // or per-bus-event event, not a host sample.
-        | TelemetryRecord::SessionSummary(_)
-        | TelemetryRecord::SessionAnalysis(_)
-        | TelemetryRecord::DaemonEvent(_)
-        | TelemetryRecord::Span(_) => Vec::new(),
+        // Every kind that is not declared `otlp: Gauges` in
+        // `telemetry/kinds.rs` produces no gauge here:
+        //   - every lifecycle-shaped kind — including `role_tick.outcome`
+        //     (#8056), `session.summary` / `session.analysis` / `daemon.event`
+        //     — becomes a log record instead (see `log_record_for`); each is a
+        //     per-sweep / per-session / per-bus-event event, not a host sample.
+        //   - `ci.duration` is a histogram point (see `histogram_point_for`),
+        //     never a gauge. A `ci.job.log` chunk (#8825) is a log record too —
+        //     and deliberately produces no metric at all: every number it could
+        //     offer (chunk size, byte total) is already an attribute on the
+        //     record, and a per-chunk gauge would make log volume look like a
+        //     host sample.
+        //   - `metric.points` (#8860) is grouped by `ops::points_for`.
+        //   - `trace.span` is a span; `queue.snapshot` is native-HTTPS only.
+        // Same #8921 reasoning as `log_record_for`: the declared routing class
+        // replaces an exhaustive chain every new kind had to append to.
+        other => {
+            debug_assert!(
+                other.otlp_class() != TelemetryKindOtlp::Gauges,
+                "telemetry kind `{}` declares `otlp: Gauges` in telemetry/kinds.rs but \
+                 metric_samples_for has no arm for it",
+                other.kind()
+            );
+            Vec::new()
+        }
     }
+}
+
+/// `(name, description, data point)` for a `ci.duration` envelope (Issue
+/// #8824); `None` for every other kind.
+fn histogram_point_for(
+    envelope: &TelemetryEnvelope,
+) -> Option<(&'static str, &'static str, HistogramDataPoint)> {
+    let TelemetryRecord::CiDuration(record) = &envelope.record else {
+        return None;
+    };
+    let description = match record.metric {
+        crate::telemetry::ci::CiDurationMetric::Run => "GitHub Actions workflow run duration.",
+        crate::telemetry::ci::CiDurationMetric::Job => "GitHub Actions job duration.",
+    };
+    Some((record.metric.metric_name(), description, ci::histogram_point(record)))
 }
 
 /// Groups every host-level envelope in `envelopes` into one
@@ -766,7 +830,33 @@ pub(super) fn build_metrics_request(
     type MetricsForHost =
         BTreeMap<&'static str, (&'static str, &'static str, Vec<NumberDataPoint>)>;
     let mut by_host: BTreeMap<&str, MetricsForHost> = BTreeMap::new();
+    // CI duration histograms (Issue #8824), keyed the same way.
+    type HistogramsForHost = BTreeMap<&'static str, (&'static str, Vec<HistogramDataPoint>)>;
+    let mut histograms_by_host: BTreeMap<&str, HistogramsForHost> = BTreeMap::new();
+    // Generic `metric.points` (Issue #8860), keyed the same way.
+    let mut ops_by_host: BTreeMap<&str, ops::OpsMetricsForHost> = BTreeMap::new();
     for envelope in envelopes {
+        if let Some(points) = ops::points_for(envelope) {
+            if points.is_empty() {
+                continue;
+            }
+            let host_ops = ops_by_host.entry(envelope.host_id.as_str()).or_default();
+            for (name, point) in points {
+                host_ops.entry(name).or_default().push(point);
+            }
+            continue;
+        }
+        if let Some((name, description, point)) = histogram_point_for(envelope) {
+            histograms_by_host
+                .entry(envelope.host_id.as_str())
+                .or_default()
+                .entry(name)
+                .or_insert((description, Vec::new()))
+                .1
+                .push(point);
+            by_host.entry(envelope.host_id.as_str()).or_default();
+            continue;
+        }
         let samples = metric_samples_for(envelope);
         if samples.is_empty() {
             continue;
@@ -786,35 +876,56 @@ pub(super) fn build_metrics_request(
             });
         }
     }
+    for host_id in ops_by_host.keys() {
+        by_host.entry(host_id).or_default();
+    }
     if by_host.is_empty() {
         return None;
     }
-    let resource_metrics = by_host
-        .into_iter()
-        .map(|(host_id, metrics)| {
-            let metrics = metrics
-                .into_iter()
-                .map(|(name, (description, unit, data_points))| Metric {
-                    name: name.to_string(),
-                    description: description.to_string(),
-                    unit: unit.to_string(),
-                    data: Some(metric::Data::Gauge(Gauge { data_points })),
+    let resource_metrics =
+        by_host
+            .into_iter()
+            .map(|(host_id, metrics)| {
+                let mut metrics: Vec<Metric> = metrics
+                    .into_iter()
+                    .map(|(name, (description, unit, data_points))| Metric {
+                        name: name.to_string(),
+                        description: description.to_string(),
+                        unit: unit.to_string(),
+                        data: Some(metric::Data::Gauge(Gauge { data_points })),
+                        ..Default::default()
+                    })
+                    .collect();
+                if let Some(histograms) = histograms_by_host.remove(host_id) {
+                    metrics.extend(histograms.into_iter().map(
+                        |(name, (description, data_points))| Metric {
+                            name: name.to_string(),
+                            description: description.to_string(),
+                            unit: "ms".to_string(),
+                            data: Some(metric::Data::Histogram(Histogram {
+                                data_points,
+                                aggregation_temporality: AggregationTemporality::Delta as i32,
+                            })),
+                            ..Default::default()
+                        },
+                    ));
+                }
+                if let Some(points) = ops_by_host.remove(host_id) {
+                    metrics.extend(ops::metrics(points));
+                }
+                ResourceMetrics {
+                    resource: Some(resource_for_host(
+                        host_id,
+                        daemon_version_by_host.get(host_id).copied(),
+                    )),
+                    scope_metrics: vec![ScopeMetrics {
+                        metrics,
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                })
-                .collect();
-            ResourceMetrics {
-                resource: Some(resource_for_host(
-                    host_id,
-                    daemon_version_by_host.get(host_id).copied(),
-                )),
-                scope_metrics: vec![ScopeMetrics {
-                    metrics,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }
-        })
-        .collect();
+                }
+            })
+            .collect();
     Some(ExportMetricsServiceRequest { resource_metrics })
 }
 

@@ -33,6 +33,7 @@ import type { FleetView, HostStatus, HostView, ProviderSummary } from "../fleet"
 import type { HostHealthRecord, HostProtection, ManagedRepoEntry } from "../types";
 import { emptyFleetView } from "./states";
 import { computeSubprocessList, runningComputeSection, type RunningComputeOptions } from "./runningCompute";
+import { workQueueSummarySection } from "./workQueue";
 
 const STATUS_LABEL: Record<HostStatus, string> = {
   ok: "OK",
@@ -136,6 +137,27 @@ export function protectionBadge(protection: HostProtection | undefined): HTMLEle
       data: { testid: "protection-badge" },
     },
     "Unprotected",
+  );
+}
+
+/**
+ * A dedicated warning for a singleton job reported armed on a host that is
+ * NOT the fleet captain (#8848 acceptance criterion (a)) — see
+ * `singletonsArmedOnNonCaptain`'s doc for why this should be rare. Renders
+ * only when `host.armedSingletonsOnNonCaptain` is nonempty; an ordinary host
+ * (nothing armed, or armed exactly on the captain) shows no badge at all,
+ * the same restraint `protectionBadge` applies to its own routine case.
+ */
+export function captainAnomalyBadge(host: HostView): HTMLElement | null {
+  if (host.armedSingletonsOnNonCaptain.length === 0) return null;
+  return el(
+    "span",
+    {
+      class: "badge badge--degraded",
+      title: `Singleton job(s) armed on a non-captain host (#8848): ${host.armedSingletonsOnNonCaptain.join(", ")}`,
+      data: { testid: "captain-anomaly-badge" },
+    },
+    "Singleton on non-captain",
   );
 }
 
@@ -244,6 +266,21 @@ export function healthFields(host: HostView, now: Date = new Date()): DocumentFr
       "Watchdog/crash-protection state — whether a future daemon death on this host would be detected (#5352)",
     ),
   );
+  // #8848: only shown once this fleet has actually opted into `fleet.captain`
+  // — `is_captain === undefined` means the mechanism does not apply here at
+  // all, and a "Captain: —" row on every ordinary card would be noise, not
+  // information (mirrors `tokenPoolFields`'s restraint for a provider-less
+  // host, and `protectionBadge`'s restraint for the routine "protected"
+  // case).
+  if (health.is_captain !== undefined) {
+    fragment.appendChild(
+      field(
+        "Captain",
+        health.is_captain ? "Yes" : "No",
+        "Fleet singleton-job captain (#8848) — the one host declared to run this fleet's declared singleton jobs",
+      ),
+    );
+  }
   return fragment;
 }
 
@@ -456,6 +493,7 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
         { class: "card__badges" },
         statusBadge(host.status, host.degradedReason),
         protectionBadge(host.entry.health?.record.protection),
+        captainAnomalyBadge(host),
       ),
     ),
     el(
@@ -599,6 +637,26 @@ export function fleetOverviewView(
         { class: view.needsAttention > 0 ? "overview__attention" : undefined },
         `${view.needsAttention} need${view.needsAttention === 1 ? "s" : ""} attention`,
       ),
+      // #8848 acceptance criterion (b): this fleet has opted into
+      // `fleet.captain` (some host reports `is_captain` at all) but none of
+      // them is currently `true` — a typo'd/decommissioned captain id, or one
+      // that has simply never reported `host.health`. Suppressed entirely for
+      // the overwhelmingly common fleet that never declared `fleet.captain`,
+      // since no host sends the field then (`noCaptainReporting` is
+      // participation-gated — see its doc).
+      view.noCaptainReporting
+        ? el(
+            "span",
+            {
+              class: "overview__attention",
+              title:
+                "No host currently reports is_captain: true, but this fleet declares fleet.captain — " +
+                "check for a typo'd host id or a captain that has not reported host.health (#8848)",
+              data: { testid: "fleet-captain-warning" },
+            },
+            "No fleet captain reporting",
+          )
+        : null,
       // Only when there is elastic compute to count (#8306). Most fleets run
       // none at all, and a permanent "0 compute jobs" in a headline already
       // carrying three carefully-worded counts is noise, not information —
@@ -622,6 +680,8 @@ export function fleetOverviewView(
         : null,
     ),
     compute,
+    // Issue #8852: null until some host reports a queue.
+    workQueueSummarySection(view, now),
     el(
       "div",
       { class: "overview__grid" },

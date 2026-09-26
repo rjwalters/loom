@@ -429,35 +429,71 @@ async fn host_health_sample_populates_daemon_version_and_uptime() {
     let dir = tempfile::tempdir().unwrap();
     let started = Instant::now();
     let pool = empty_pool();
-    let record = sample_host_health(dir.path(), started, &pool, &mut empty_slug_cache()).await;
+    let record =
+        sample_host_health(dir.path(), started, &pool, &mut empty_slug_cache(), (None, None)).await;
     assert_eq!(record.daemon_version, env!("CARGO_PKG_VERSION"));
     assert!(record.logical_cpus >= 1);
 }
 
 #[tokio::test]
 async fn host_health_sample_populates_worktree_root_free_and_total_together() {
-    // #5356: both readings come from the SAME df probe
-    // (`disk_headroom::worktree_root_disk_gb`), so a real sample against a
-    // real tempdir should report both, with total >= free.
+    // #5356: both readings come from the SAME df probe. Since #8857 the
+    // collector takes that probe once, in bytes, and hands it in; the GB
+    // fields are its integer floor, and unknown stays unknown.
     let dir = tempfile::tempdir().unwrap();
     let pool = empty_pool();
-    let record =
-        sample_host_health(dir.path(), Instant::now(), &pool, &mut empty_slug_cache()).await;
-    let free = record
-        .worktree_root_free_gb
-        .expect("a real df probe against a real tempdir should measure free space");
-    let total = record
-        .worktree_root_total_gb
-        .expect("a real df probe against a real tempdir should measure total capacity");
-    assert!(total >= free, "total {total} GB should be >= free {free} GB");
+    let gib = 1024 * 1024 * 1024;
+    let record = sample_host_health(
+        dir.path(),
+        Instant::now(),
+        &pool,
+        &mut empty_slug_cache(),
+        (Some(5 * gib + gib / 2), Some(10 * gib)),
+    )
+    .await;
+    assert_eq!(record.worktree_root_free_gb, Some(5));
+    assert_eq!(record.worktree_root_total_gb, Some(10));
+    let unknown = sample_host_health(
+        dir.path(),
+        Instant::now(),
+        &pool,
+        &mut empty_slug_cache(),
+        (None, None),
+    )
+    .await;
+    assert_eq!(unknown.worktree_root_free_gb, None);
+    assert_eq!(unknown.worktree_root_total_gb, None);
+}
+
+#[test]
+fn byte_gb_floor_matches_the_df_gb_parsers() {
+    // One `df -Pk` row, read both ways: the GB parsers and the byte probe's
+    // floor must agree, or host.health's fields would shift under #8857.
+    let df = "Filesystem 1024-blocks Used Available Capacity Mounted\n\
+              /dev/disk1 10485759 1 5767168 1% /\n";
+    let (avail_k, total_k) = (5_767_168_u64, 10_485_759_u64);
+    assert_eq!(
+        crate::disk_headroom::parse_df_available_gb(df),
+        Some(crate::disk_headroom::bytes_to_whole_gb(avail_k * 1024))
+    );
+    assert_eq!(
+        crate::disk_headroom::parse_df_total_gb(df),
+        Some(crate::disk_headroom::bytes_to_whole_gb(total_k * 1024))
+    );
 }
 
 #[tokio::test]
 async fn host_health_sample_stamps_the_running_binarys_build_identity() {
     let dir = tempfile::tempdir().unwrap();
     let pool = empty_pool();
-    let record =
-        sample_host_health(dir.path(), Instant::now(), &pool, &mut empty_slug_cache()).await;
+    let record = sample_host_health(
+        dir.path(),
+        Instant::now(),
+        &pool,
+        &mut empty_slug_cache(),
+        (None, None),
+    )
+    .await;
 
     // The sample must carry the SAME commit `loom-daemon --version`
     // prints — that identity is what lets the dashboard tell two
@@ -498,7 +534,8 @@ async fn host_health_sample_reports_no_active_sweeps_when_pool_is_empty() {
     let dir = tempfile::tempdir().unwrap();
     let started = Instant::now();
     let pool = empty_pool();
-    let record = sample_host_health(dir.path(), started, &pool, &mut empty_slug_cache()).await;
+    let record =
+        sample_host_health(dir.path(), started, &pool, &mut empty_slug_cache(), (None, None)).await;
     assert!(
         record.active_sweep_ids.is_empty(),
         "an empty pool has no in-flight sweeps to report"
@@ -510,7 +547,8 @@ async fn host_health_sample_reports_no_managed_repos_when_pool_is_empty() {
     let dir = tempfile::tempdir().unwrap();
     let started = Instant::now();
     let pool = empty_pool();
-    let record = sample_host_health(dir.path(), started, &pool, &mut empty_slug_cache()).await;
+    let record =
+        sample_host_health(dir.path(), started, &pool, &mut empty_slug_cache(), (None, None)).await;
     assert!(
         record.managed_repos.is_empty(),
         "an empty pool has no registered repos to report"
@@ -619,8 +657,14 @@ async fn host_health_sample_surfaces_a_persistent_role_tick_failure() {
 
     let dir = tempfile::tempdir().unwrap();
     let pool = empty_pool();
-    let record =
-        sample_host_health(dir.path(), Instant::now(), &pool, &mut empty_slug_cache()).await;
+    let record = sample_host_health(
+        dir.path(),
+        Instant::now(),
+        &pool,
+        &mut empty_slug_cache(),
+        (None, None),
+    )
+    .await;
     assert!(
         record.roles.persistent.iter().any(|f| f.root == root
             && f.role == "judge"
@@ -996,6 +1040,7 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         // added — `None` (not collected) is fine here since this fixture is
         // not about the `tmpfs_visibility` axis.
         tmpfs_visibility: None,
+        ci_telemetry: None,
     }
 }
 
@@ -1109,6 +1154,9 @@ fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healt
         roles: roles_health,
         protection: None,
         admission_brake: None,
+        is_captain: None,
+        armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     };
     assert_eq!(
         host_health.roles.persistent.len(),

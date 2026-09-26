@@ -102,9 +102,36 @@ The explicit `opamp.yaml` override is required: this pinned Foundry render
 otherwise selected PostgreSQL's hostname for the app's port 4320. Verify that
 regeneration retains the correct app endpoint, not just valid YAML.
 Inspect `docker compose ... logs` for the failing service, with credentials and
-workload content removed before sharing. Register the first local user at
-<http://localhost:18081>. Account passwords/session tokens are distinct from
-ingestion credentials. The ingester has no public host port.
+workload content removed before sharing. Account passwords/session tokens are
+distinct from ingestion credentials. The ingester has no public host port.
+
+### Register the first user *before* expecting ingestion
+
+**Compose readiness does not mean the receiver is open.** On a fresh deployment,
+`up -d --wait` reports every service healthy — the ingester included — while its
+OTLP receivers are still closed. The ingester's OpAMP client cannot register
+until an organization exists, so the app rejects it every 30s with
+`cannot create agent without orgId`, and it never applies the effective config
+that binds 4317/4318. Traffic sent in this window is refused at TCP connect
+(`connect: connection refused`), so it is **not** visible anywhere in SigNoz;
+only the neutral gateway's own `otelcol_exporter_*` series show it. Register the
+first local user at <http://localhost:18081>, or `POST /api/v1/register` with
+`{name, orgName, email, password}` (passwords must be 12+ characters with upper,
+lower, digit and symbol). Confirm, and only then send telemetry:
+
+```console
+curl --fail http://127.0.0.1:18081/api/v1/version   # expect "setupCompleted":true
+```
+
+This gate is **first-run only**: once the organization exists it survives
+restarts, and the ingester re-registers with no further errors. It is also
+recoverable rather than lossy — the gateway's sending queue holds the refused
+batches and drains them intact once the receiver opens, as long as the backlog
+fits that persistent queue (`queue_size: 1000` requests, with
+`block_on_overflow: false`, so an overflow **drops** the excess rather than
+back-pressuring the producer). Register before pointing real fleet traffic at
+the gateway. Treat `setupCompleted` as the real ingestion-readiness signal; a
+container-running or Compose-healthy result is not one.
 
 Keep deployment copies and volumes outside Loom-managed worktrees for a running
 trial: those worktrees are removed on merge. Copy the complete rendered directory
@@ -174,6 +201,27 @@ the counts quoted above and in `fixture-queries.sql` from the generated manifest
 so a later fixture version cannot leave a stale total here for an observation to
 be compared against.
 
+### CI retro queries
+
+`ci-queries.sql` is the standing build/CI retro (#8826): six numbered sections
+over what `loom-daemon ci-telemetry` captures — duration trend, regression
+spotlight, outcome mix, top slow jobs, failed run → logs, and run waterfall.
+Sections 1–3 read the `loom.ci.*.duration_ms` histograms (kept 30 days);
+4–6 read the `ci.run` / `ci.job` / `ci.job.log` records (kept 7 days). Bind
+all five parameters once:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery --param_since='2026-09-01 00:00:00' --param_repo='' --param_bucket_hours=24 --param_window_hours=168 --param_top=20 < ci-queries.sql
+```
+
+The same `signoz_trial_artifacts.rs` guards it more strictly than the fixture
+queries: every log attribute it reads must be in the gateway's **log**
+`keep_keys` *and* be read from the SigNoz map column matching the type the
+daemon sends it as (`loom.ci.run_id` is an int, so `attributes_number`), every
+metric label must be a CI histogram label the **datapoint** allowlist keeps,
+and every metric series must be a `.sum` / `.count` series of the two CI
+histograms. Policy and pipeline: [CI observability](../../docs/ci-observability.md).
+
 ### Saved views
 
 | Saved view | Procedure |
@@ -185,6 +233,27 @@ be compared against.
 | Host/token gauges | Metrics Explorer: the actual emitted names and units — the shared fixture emits `loom.tokens.usage_fraction` and `loom.tokens.exhausted` only, labelled by `account`. An absent series is not a measured zero: the fixture's `synthetic-unknown` account intentionally has no `usage_fraction` point while `synthetic-zero` has `0.0` (`fixture-queries.sql` 7) |
 | Delivery health | Scrape the neutral gateway's own Prometheus endpoint (`config.yaml` publishes `detailed` telemetry on port 8888) and read `otelcol_exporter_*` series filtered to `exporter="otlp_http/signoz"` — queue size, sent, send-failed and enqueue-failed. These series are **not** exported into SigNoz through the OTLP pipeline, so they are unavailable in the UI and must be captured beside it. Backend readiness is not delivery evidence |
 | In-progress sweep | Compare partial child spans before the root completes, then query again after completion; do not infer success from a missing root/end span (`fixture-queries.sql` 5, which lists every trace with children but no `loom.sweep` root) |
+| CI duration trend | Dashboards → New dashboard `Loom CI` → Time series panel. Metric `loom.ci.job.duration_ms`, aggregation **P50**, a second query on the same metric with **P95** and a third with **Max**; group by `repo`, `workflow`, `job`; optional filter `repo = '<owner/name>'`; time range 30 days. UI percentiles interpolate within the histogram's 1s…6h bucket bounds; the SQL is exact (`ci-queries.sql` 1) |
+| CI regression spotlight | Same dashboard → Table panel. Metric `loom.ci.job.duration_ms`, aggregation **P95**, group by `repo`, `workflow`, `job`, time range = the current window; duplicate the panel with the time shift/compare set to one window earlier and sort by the difference. The ranked delta and the ≥2-runs-in-both-windows rule live in the SQL (`ci-queries.sql` 2) |
+| CI outcome mix | Same dashboard → Stacked bar panel. Metric `loom.ci.run.duration_ms`, aggregation **Count** (one data point per run), group by `workflow`, `conclusion`; keep `cancelled` as its own series — never filter it out (`ci-queries.sql` 3) |
+| CI top slow jobs | Logs Explorer: filter `body = 'ci.job'`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.duration_ms`, `loom.ci.run_id`, `loom.ci.job_id`; sort by `loom.ci.duration_ms` descending; save as view `CI top slow jobs` (`ci-queries.sql` 4) |
+| CI failed run → logs | Logs Explorer: filter `body = 'ci.run' AND loom.ci.conclusion IN ('failure', 'timed_out', 'startup_failure')`, save as `CI failed runs`; take a `loom.ci.run_id`, filter `body = 'ci.job' AND loom.ci.run_id = <id> AND loom.ci.conclusion != 'success'` for its failing jobs, then `loom.ci.job_id = <job id> AND loom.ci.chunk_index EXISTS` sorted by `loom.ci.chunk_index` ascending for the job's log, in order (`ci-queries.sql` 5) |
+| CI run waterfall | Trace Explorer: filter `name = 'loom.ci.run'`, sort by duration descending, open a run; its `loom.ci.job` children are the waterfall, and the longest child against the root's duration is the run/longest-job comparison (`ci-queries.sql` 6) |
+
+`ci-queries.sql` 7) (#9007's per-issue Builder/CI/Judge/merge breakdown) has no
+row above: it joins `loom_analytics.raw_ship_outcome` against `ci.run` records
+across two logical sources, which is not a single SigNoz Explorer/dashboard
+panel the way sections 1–6 are — it is a `clickhouse-client`-only report, run
+the same way as the rollup's other CT queries.
+
+The six CI rows are **recreation steps, not yet observed**: no session has had
+an authenticated UI (or API) credential for the trial org since they were
+written, so none of the six has been created there yet
+([#8946](https://github.com/rjwalters/loom/issues/8946)). Their SQL
+counterparts in `ci-queries.sql` are the executed, verified form — see
+`evidence.md`'s "CI retro queries, executed live" section — and remain the
+acceptance surface until someone with the trial org's login creates the saved
+views and records it.
 
 Save these searches/dashboards through the installed UI and retain sanitized
 exports where supported. These precise steps avoid asserting that mutable
@@ -200,16 +269,46 @@ privacy-sentinel drop. See `evidence.md`'s "Shared fixture manifest, executed
 live" section for the full results. Query 0 remains a schema preflight in case
 a future SigNoz pin renames these columns.
 
+## Cycle-time analytics (Issue #8665)
+
+`cycle-time-extract.sql` is this backend's half of the shared cycle-time
+artifact set — one view, `loom_analytics.raw_ship_outcome`, mapping
+`signoz_logs.distributed_logs_v2` rows onto the normalized ship columns that
+[`../cycle-time-rollup.sql`](../cycle-time-rollup.sql) ingests and
+[`../cycle-time-queries.sql`](../cycle-time-queries.sql) answers CT1–CT8 from.
+The questions and their definitions are in
+[`../cycle-time-questions.md`](../cycle-time-questions.md); ClickStack uses the
+same three shared files with only its own extraction view swapped in, which is
+what makes the two backends comparable under #8529.
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < cycle-time-extract.sql
+```
+
+**Not yet executed live here.** The ClickStack side is verified end to end in CI
+against a real pinned ClickHouse; this view's column contract is checked by
+`loom-daemon/tests/cycle_time_artifacts.rs`, but no number produced by it has
+been compared against the ClickStack answers on the same fixture yet. Treat it
+as unproven until that comparison is recorded in `evidence.md`, exactly as the
+trial treats every other unexecuted claim.
+
 ## Retention and operation
 
-Set **seven days for logs, traces and metrics** in General Settings → Retention.
-The upstream default for metrics is 30 days, so a fresh render alone does not
-establish parity. Verify effective table DDL in ClickHouse after changing the
-setting, including derived tables; record it in `evidence.md`. The pinned API
-updates active signal tables and standard rollups, but leaves some metadata,
-reduced-metric and legacy tables at 15 or 30 days. For this isolated trial,
-apply the reviewed `retention.sql` after the API settings to shorten those
-existing TTLs, using the private bundled client:
+Set **seven days for logs and traces and 30 days for metrics** in General
+Settings → Retention (#8826). Metrics outlive raw logs/traces on purpose: the
+CI duration/outcome trends in `ci-queries.sql` 1–3 are the retro asset, and
+the standing policy and its rationale are in
+[CI observability → Retention](../../docs/ci-observability.md#retention).
+The upstream defaults are 15 days for logs and traces and 30 for metrics, so a
+fresh render alone does not establish the split. Verify effective table DDL in
+ClickHouse after changing the setting, including derived tables; record it in
+`evidence.md`. The pinned API updates active signal tables and standard
+rollups, but leaves some metadata, reduced-metric and legacy tables at 15 or
+30 days (one month for `top_level_operations`). For this isolated trial, apply
+the reviewed `retention.sql` after the API settings — it sets those existing
+TTLs to 7 days for logs/traces and 30 days for metrics, and restores 30 days
+on a trial that ran its earlier all-seven-day version — using the private
+bundled client:
 
 ```console
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < retention.sql
@@ -219,7 +318,18 @@ Re-run `queries.sql` after every upgrade or retention-setting change. Resource
 fingerprint tables retain the upstream **30-minute grace beyond seven days**;
 shorter buffer/usage TTLs remain unchanged. Schema migration records, metric
 reduction configuration and legacy metadata indexes have no signal TTL. This
-is a seven-day signal trial, not a claim that all metadata is erased at day seven.
+is a seven-day log/trace and 30-day metric trial, not a claim that all
+metadata is erased at either boundary. Confirm the split from effective DDL,
+not from the settings page:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT database, name, extract(create_table_query, 'TTL (.*?)(SETTINGS|\$)') FROM system.tables WHERE database IN ('signoz_logs', 'signoz_traces', 'signoz_metrics') AND create_table_query LIKE '%TTL%' AND engine NOT LIKE 'Distributed%' ORDER BY database, name"
+```
+
+`signoz_logs.logs_v2` keys its TTL on a per-row `_retention_days` column rather
+than a literal interval, so read that column's `default_expression` from
+`system.columns` too (a column default applies to rows as they are inserted, so
+check the stored values of older rows as well before trusting the split).
 TTL deletion uses
 background merges and is not an exact deletion deadline or a disk quota.
 Accounts, dashboards and settings in PostgreSQL persist independently.

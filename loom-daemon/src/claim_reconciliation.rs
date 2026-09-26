@@ -1809,6 +1809,9 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
         total_pr_checked += pr_checked;
         total_pr_reclaimed += pr_reclaimed;
         verdict_stats.merge(forge::reconcile_pr_verdicts(&gh_bin, root));
+        // #8922: AFTER the verdict pass, so a verdict it just re-queued to
+        // `loom:review-requested` is checked for base conflicts on this tick.
+        review_conflict::reconcile_review_conflicts(&gh_bin, root);
     }
     if total_reclaimed > 0 {
         log::info!(
@@ -1884,8 +1887,21 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
 /// be redundant. Each tick's `gh` calls block, so it runs on a blocking
 /// thread (`tokio::task::spawn_blocking`), mirroring
 /// [`crate::token_ranking_refresh::spawn_multi_token_ranking_refresh_task`].
+///
+/// **Queue-head wake (#8766).** This pass is the daemon's head-mover: a
+/// `loom:building` claim whose sweep is gone is exactly what holds the
+/// dispatch queue's head, and this loop is what releases it. `event_bus` lets
+/// a `forge.event` prompt of a queue-relevant shape (a comment on a claimed
+/// issue, a PR reaching terminal state) run the *next ordinary pass now*
+/// instead of at the multi-minute cadence above — and nothing else. The pass
+/// body is untouched: it re-lists `loom:building` issues and re-decides from
+/// the same host-scoped evidence and the same lease gate it always did, so an
+/// early tick can only change *when* that happens. Disabled unless
+/// `forgeEvents.events.queueHeadWake` is on for `fallback_root`, in which case
+/// the ticker holds no bus subscription at all.
 pub fn spawn_periodic_reconciliation_task(
     fallback_root: std::path::PathBuf,
+    event_bus: std::sync::Arc<crate::event_bus::EventBus>,
 ) -> tokio::task::JoinHandle<()> {
     // Safehouse-aware cadence (#4431): with live peer-claims carrying the
     // fast in-flight signal (re-advertised each reaper tick), a
@@ -1896,7 +1912,14 @@ pub fn spawn_periodic_reconciliation_task(
         interval.as_secs()
     );
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
+        // An `Interval` a queue-relevant `forge.event` prompt may also tick
+        // early (#8766). Disarmed unless `forgeEvents.events.queueHeadWake` is
+        // on, in which case it is exactly `tokio::time::interval(interval)`.
+        let mut ticker = crate::forge_events::wake::EarlyTicker::for_queue_head(
+            interval,
+            &event_bus,
+            &fallback_root,
+        );
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Consume the immediate first fire: the startup pass already ran
         // moments ago in `main.rs`, so re-running instantly is redundant.
@@ -1924,6 +1947,16 @@ pub fn spawn_periodic_reconciliation_task(
 /// into its own file per the file-size ratchet (`.loom/docs/file-size-policy.md`)
 /// rather than growing `forge` inline.
 mod pr_label_info;
+
+/// The #8900 auto-merge disarm hook [`forge::invalidate_verdict`] calls before
+/// posting its stale-verdict comment — a sibling file per the file-size ratchet
+/// (`.loom/docs/file-size-policy.md`) rather than more inline logic here.
+mod auto_merge_disarm;
+
+/// The #8922 base-conflict pass for `loom:review-requested` PRs — a sibling
+/// file per the file-size ratchet, run on the same tick right after
+/// [`forge::reconcile_pr_verdicts`].
+pub mod review_conflict;
 
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::work_finder::forge`] / [`crate::epic_supervisor::forge`]) — the
@@ -3070,7 +3103,11 @@ pub mod forge {
     /// per_page=30, oldest-first) comes back, and the verdict marker is always
     /// among the NEWEST comments — the same pitfall #5455 documented for the
     /// fallback-queue marker scan.
-    fn fetch_comment_bodies(gh_bin: &Path, root: &Path, pr_number: u32) -> Option<Vec<String>> {
+    pub(super) fn fetch_comment_bodies(
+        gh_bin: &Path,
+        root: &Path,
+        pr_number: u32,
+    ) -> Option<Vec<String>> {
         let mut cmd = Command::new(gh_bin);
         cmd.arg("api")
             .arg(format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/comments"))
@@ -3160,6 +3197,13 @@ pub mod forge {
     /// silently re-queued with no record of why. A failed comment aborts
     /// before touching any label, so the transition is never applied without
     /// its audit trail.
+    ///
+    /// Ahead of even the comment, any armed GitHub auto-merge is **disarmed**
+    /// (issue #8900) — see [`super::auto_merge_disarm`] for why the disarm is
+    /// first and why it is safe there. Without it the label flip below is
+    /// cosmetic: the queued server-side merge is gated only by the ruleset's
+    /// required checks and merges the unreviewed head anyway (#8694, #8847,
+    /// #8843 all merged that way on 2026-09-25).
     fn invalidate_verdict(
         gh_bin: &Path,
         root: &Path,
@@ -3168,6 +3212,12 @@ pub mod forge {
         head_sha: &str,
     ) -> Result<()> {
         let label = pr.kind.label();
+        // `None` (the common case: nothing was armed) contributes no line at
+        // all, so the comment never claims a disarm that did not happen.
+        let disarm_line =
+            super::auto_merge_disarm::disarm_before_invalidation(gh_bin, root, pr.number)
+                .map(|line| format!("\n{line}"))
+                .unwrap_or_default();
         let body = format!(
             "<!-- loom:verdict-stale from={marker_sha} to={head_sha} -->\n\
              **Stale review verdict cleared — head SHA moved**\n\n\
@@ -3175,7 +3225,8 @@ pub mod forge {
              head is `{head_sha}`. A review verdict is a statement about a specific tree, so it \
              does not survive a rebase, a force-push, or new commits.\n\n\
              - Verdict cleared: `{label}` (recorded for `{marker_sha}`)\n\
-             - Returned to the review queue: `loom:review-requested` (current head `{head_sha}`)\n\n\
+             - Returned to the review queue: `loom:review-requested` (current head `{head_sha}`)\
+             {disarm_line}\n\n\
              Judge will re-evaluate the tree that is actually here now. No judgment about the new \
              tree is implied either way — the old verdict simply no longer describes it.\n\n\
              ---\n\
@@ -3332,6 +3383,26 @@ pub mod forge {
     /// #6319) rather than silently kept: see [`decide_anchor`] /
     /// [`anchor_verdict`]. Anchoring writes no labels, so the staleness
     /// behavior of every already-marked verdict is untouched.
+    ///
+    /// # Held PRs are NOT covered by this pass (pre-existing, #8900 scope note)
+    ///
+    /// "Runs on the periodic tick regardless" is true of every PR this pass can
+    /// *see*, and a PR on an explicit hold (`loom:operator`, `loom:blocked`,
+    /// `loom:operator-only`) is deliberately not one of them: [`list_verdict_prs`]
+    /// skips the comment/marker fetch for a held PR, so [`decide_verdict`]
+    /// answers `Keep(Unverifiable)` before it can reach its own `on_hold` branch
+    /// and [`VerdictAction::Invalidate`] — and therefore
+    /// [`super::auto_merge_disarm::disarm_before_invalidation`] — is never
+    /// reached for one. That is this module's long-standing "never write to a
+    /// parked PR" design, not a #8900 regression.
+    ///
+    /// The consequence to know about: for the held+armed combination, the
+    /// auto-merge disarm (#8900) comes only from the shell path —
+    /// `verdict-staleness-guard.sh --clear`, which judge.md / doctor.md /
+    /// champion-pr-merge.md do run over held PRs and which shells out to
+    /// `loom-daemon forge disable-auto-merge --audit-comment --hold <label>`.
+    /// Do not "fix" this by making the daemon pass write to held PRs without
+    /// deciding that question on its own merits first.
     ///
     /// Returns [`VerdictReconcileStats`] summed across both verdict labels.
     pub fn reconcile_pr_verdicts(gh_bin: &Path, root: &Path) -> VerdictReconcileStats {

@@ -82,6 +82,7 @@ import type { RepoVisibility } from "./telemetry";
 import { decodeVisibility } from "./telemetry";
 import type { ElasticSpendSummary, HistoryQueryResult, HistoryRecord } from "./query";
 import type { ActiveSweepState, FleetSnapshot } from "./fleetState";
+import { publicQueuePayload, redactQueueSnapshot } from "./queueState";
 
 // ---------------------------------------------------------------------------
 // Per-kind field allowlist for the nested `record` payload
@@ -122,6 +123,19 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   // `account` identifiers and per-account burn, which the public view
   // summarizes instead of listing (see `PUBLIC_RECORD_DERIVATIONS`).
   "tokens.snapshot": ["kind", "captured_at"],
+  // Issue #8852: host-scoped, but its `rows`/`listing_failed` name repos and
+  // issues, each with its own `visibility`. Only the non-identifying scalars
+  // are copied; the per-row projection is a derivation (`./queueState.ts`).
+  "queue.snapshot": [
+    "kind",
+    "tick_at",
+    "max_concurrent",
+    "seen",
+    "counts",
+    "listing_failed_unresolved",
+    "unresolved_rows",
+    "rows_truncated",
+  ],
   "host.health": [
     "kind",
     "captured_at",
@@ -160,6 +174,16 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
     // "describes the machine, not the work" reasoning as `dispatch_halted`/
     // `halt_reason` directly above.
     "protection",
+    // Fleet captain state (#8848): whether this host is the assigned
+    // singleton-job captain, and the names of the singleton jobs currently
+    // armed here. Neither names a repo, issue, branch, or operator — a job
+    // name is an allowlisted identifier a repo declares
+    // (`crate::fleet_captain::arm_singleton_job`'s `job_name`), the same
+    // footing as a role name in `roles` above — so both are allowed through
+    // directly, unlike `managed_repos`/`roles` below which carry a
+    // repo/path and route through a dedicated redaction derivation instead.
+    "is_captain",
+    "armed_singleton_jobs",
     // Saturation admission-brake state (#8478) is deliberately ABSENT here:
     // its scalars are machine detail (same footing as `dispatch_halted`), but
     // its `top_cpu_consumers` names the executables running on the host —
@@ -526,6 +550,8 @@ export function redactAdmissionBrakeRow(brake: AdmissionBrakeRow): Record<string
 const PUBLIC_RECORD_DERIVATIONS: Readonly<Record<string, (payload: Record<string, unknown>) => Record<string, unknown>>> =
   {
     "tokens.snapshot": (payload) => deriveTokenPoolAggregate(payload) as unknown as Record<string, unknown>,
+    // Issue #8852: private rows keep only rank/state/disposition/reason.
+    "queue.snapshot": publicQueuePayload,
     // `managed_repos` (#4976) and `roles` (#5022) are both deliberately ABSENT
     // from `RECORD_FIELD_ALLOWLIST` — like `tokens.snapshot`'s `accounts`,
     // each has a raw form that can identify a private repo (`managed_repos`)
@@ -734,6 +760,14 @@ export function redactFleetSnapshot(snapshot: FleetSnapshot, isAuthenticated: bo
               record: redactPayload("tokens.snapshot", entry.tokens.record),
               updatedAt: entry.tokens.updatedAt,
               freshness: entry.tokens.freshness,
+            },
+          }),
+          // Issue #8852: per-row redaction on each row's own `visibility`.
+          ...(entry.queue && {
+            queue: {
+              record: redactQueueSnapshot(entry.queue.record),
+              updatedAt: entry.queue.updatedAt,
+              freshness: entry.queue.freshness,
             },
           }),
         };

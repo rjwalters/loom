@@ -24,14 +24,24 @@
 //!    for all of them in the Codex process's own environment. A worker can
 //!    still write `.loom/config.json` (or invent a higher tier, or a deeper
 //!    config root) and change nothing about the decision.
-//! 3. **Identity is bound and rechecked.** The manifest, the recomputed asset
+//! 3. **The hook registration and the profile's trust state are immutable from
+//!    inside the session.** Control v1 could only *detect* a mutated
+//!    `$CODEX_HOME/hooks.json` at the next recheck; v2 makes it impossible.
+//!    The host binds each of [`PROFILE_CONTROLS`] read-only over its own
+//!    canonical path, so from inside the container a write is `EROFS` and an
+//!    unlink or a rename is `EBUSY` on a mount point — while the profile
+//!    *directory* stays read-write, so the canonical atomic `auth.json`
+//!    refresh (write a sibling temp, rename over) keeps working untouched.
+//!    See [`ProfileImmutability`].
+//! 4. **Identity is bound and rechecked.** The manifest, the recomputed asset
 //!    digests, the hook registration, the readiness receipt and the profile's
 //!    control files hash to one identity string that is bound into the account
 //!    lease alongside the container ID, verified again immediately before
 //!    execution on the host, and verified a third time in-container by the
 //!    process that execs the model. A replaced image, a stale control version,
-//!    an altered policy, a removed hook or a lease mismatch is refused before
-//!    any mutable work.
+//!    an altered policy, a removed hook, a session whose profile controls are
+//!    not mount-protected, or a lease mismatch is refused before any mutable
+//!    work.
 //!
 //! Authentication is deliberately untouched: `auth.json` stays writable in the
 //! canonical profile mount, no credential byte enters the bundle, the clone, the
@@ -44,9 +54,12 @@ use std::collections::BTreeMap;
 /// not answer with exactly this string is refused, so an older or newer image
 /// cannot be silently accepted by a host that expects different semantics.
 pub const CONTROL_PROTOCOL: &str = "loom-private-control-v1";
-/// Monotonic revision inside the protocol, bumped when the asset set or the
-/// pinned policy changes in a way that invalidates an already-bound identity.
-pub const CONTROL_VERSION: u32 = 1;
+/// Monotonic revision inside the protocol, bumped when the asset set, the
+/// pinned policy, or an enforced property changes in a way that invalidates an
+/// already-bound identity. **2**: the account profile's control files must be
+/// mount-protected ([`ProfileImmutability`]); a v1 image reports v1 and is
+/// refused, because its in-container half cannot make that claim at all.
+pub const CONTROL_VERSION: u32 = 2;
 /// Image-owned bundle root. Lives on the read-only rootfs and is deliberately
 /// NOT a mount destination, so the enumerated mount inventory
 /// (`docker::validate_settings`) cannot be used to shadow it.
@@ -154,6 +167,10 @@ pub enum Status {
     /// The managed hook registration or its readiness receipt is missing,
     /// deregistered, or no longer names the image-owned bridge.
     Registration,
+    /// At least one of [`PROFILE_CONTROLS`] is not a read-only mount point, so
+    /// the worker can still replace or remove the hook registration, Codex's
+    /// own trust state, or Loom's readiness receipt mid-session.
+    ProfileMutable,
 }
 
 /// Worker-side observation of the control boundary, evaluated in-container.
@@ -182,8 +199,143 @@ pub struct Report {
 
 /// Files in the account profile that carry hook registration, Codex-owned
 /// trust state, and Loom's readiness receipt. The worker must not be able to
-/// swap any of them without the boundary noticing.
+/// swap any of them at all: the host binds each one read-only over its own
+/// canonical path, and [`ProfileImmutability`] proves that from inside.
 pub const PROFILE_CONTROLS: [&str; 3] = ["hooks.json", "config.toml", "loom-codex-hooks.json"];
+
+/// Proof that every [`PROFILE_CONTROLS`] entry is immutable to this process.
+///
+/// Control v1 kept these three files in the read-write profile bind mount and
+/// only *detected* a change, at the next recheck. That leaves a real window:
+/// `$CODEX_HOME/hooks.json` can be removed after the pre-exec recheck and
+/// before or during the model's own turn, and nothing re-reads it until the
+/// next admission — by which point the unhooked turn has already happened.
+///
+/// v2 closes it with mount topology instead of file modes. The host binds each
+/// control file **read-only over its own canonical path**, which makes the
+/// path a mount point, and on Linux that is three separate refusals:
+///
+/// | Attempt | Result | Why |
+/// |---|---|---|
+/// | `open(O_WRONLY)` / truncate / `chmod` | `EROFS` | the bind carries `ro` |
+/// | `unlink` | `EBUSY` | the path is a mount point |
+/// | `rename` (either direction) | `EBUSY` | ditto, for source and destination |
+///
+/// File modes alone cannot do this: the profile *directory* has to stay
+/// writable so the canonical atomic `auth.json` refresh (write a sibling temp,
+/// rename over) keeps working, and directory write permission is exactly what
+/// governs `unlink`/`rename`. A mount point is immune to both while leaving
+/// every non-mounted sibling, `auth.json` included, untouched.
+///
+/// This type exists so the boundary cannot be told it is protected: outside
+/// this module the only way to obtain one is [`ProfileImmutability::observe`],
+/// which measures the running system.
+#[derive(Clone, Copy, Debug)]
+pub struct ProfileImmutability(bool);
+
+impl ProfileImmutability {
+    /// Measure it. Two independent proofs are required for every control file,
+    /// because either one alone is forgeable or incomplete:
+    ///
+    /// 1. **The kernel's own mount table** lists that exact path as a mount
+    ///    point carrying `ro`. A worker cannot edit `/proc/self/mountinfo`, and
+    ///    it cannot mount anything of its own: the session runs `--cap-drop
+    ///    ALL --security-opt no-new-privileges`, and this observation is taken
+    ///    by a fresh `docker exec` in the container's own mount namespace, not
+    ///    in any namespace a worker process could have unshared for itself.
+    /// 2. **Opening the file for writing actually fails**, so `ro` is effective
+    ///    rather than merely declared. The probe opens for *append*, which
+    ///    never truncates and writes no byte, so an unprotected profile is left
+    ///    exactly as it was found.
+    #[must_use]
+    pub fn observe(profile: &Path) -> Self {
+        Self(
+            PROFILE_CONTROLS
+                .iter()
+                .all(|name| immutable(&profile.join(name))),
+        )
+    }
+
+    /// Whether every control file is protected.
+    #[must_use]
+    pub fn proven(self) -> bool {
+        self.0
+    }
+
+    /// Unmeasured value for the boundary's own unit tests, which cannot create
+    /// a real mount without privileges this test suite does not (and must not)
+    /// have. Compiled only under `cfg(test)`, so no shipped binary — and no
+    /// in-container `control` observation — can reach it.
+    #[cfg(test)]
+    fn fixture(value: bool) -> Self {
+        Self(value)
+    }
+}
+
+/// One control file is immutable when it is a regular file that cannot be
+/// opened for writing AND is a read-only mount point (see
+/// [`ProfileImmutability::observe`]). An absent file is not immutable: a
+/// missing registration is a path the worker could still create.
+fn immutable(path: &Path) -> bool {
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    if std::fs::OpenOptions::new().append(true).open(path).is_ok() {
+        return false;
+    }
+    readonly_mount_point(path)
+}
+
+/// Whether `path` appears in this process's mount table as a mount point whose
+/// own options include `ro`. The per-mount options are field 6 of a
+/// `mountinfo` line; the superblock options after the ` - ` separator are
+/// deliberately NOT consulted, because a read-only bind is expressed in the
+/// per-mount field while the underlying superblock stays read-write.
+fn readonly_mount_point(path: &Path) -> bool {
+    let Ok(target) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    table.lines().any(|line| {
+        let mut fields = line.split(' ');
+        let Some(mount_point) = fields.nth(4) else {
+            return false;
+        };
+        let Some(options) = fields.next() else {
+            return false;
+        };
+        unescape(mount_point) == target.as_os_str()
+            && options.split(',').any(|option| option == "ro")
+    })
+}
+
+/// `mountinfo` octal-escapes space, tab, newline and backslash in paths.
+fn unescape(field: &str) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let octal = (bytes[index] == b'\\')
+            .then(|| bytes.get(index + 1..index + 4))
+            .flatten()
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+        match octal {
+            Some(byte) => {
+                out.push(byte);
+                index += 4;
+            }
+            None => {
+                out.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    std::ffi::OsString::from_vec(out)
+}
 
 fn digest(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -209,6 +361,16 @@ pub fn profile_digests(profile: &Path) -> BTreeMap<String, String> {
             ((*name).to_owned(), value.unwrap_or_default())
         })
         .collect()
+}
+
+/// Container path of one [`PROFILE_CONTROLS`] entry. The host binds each of
+/// these read-only from the identically-named file in the canonical profile;
+/// `docker::create` and `docker::validate_settings` both derive their mount
+/// inventory from here, so a session can never be created in a shape its own
+/// validation would then accept while missing a protection.
+#[must_use]
+pub fn control_destination(name: &str) -> String {
+    format!("{PROFILE}/{name}")
 }
 
 /// The registration command the managed Codex hook must carry: the image-owned
@@ -310,13 +472,22 @@ pub fn manifest(root: &Path) -> Result<Option<Manifest>> {
 /// still names the image-owned bridge. Never fails — an unprovable boundary is
 /// a refusing [`Status`], so the host always gets an answer it can act on.
 pub fn observe(root: &Path, profile: &Path) -> Report {
-    observe_at(root, profile, Path::new(REPO))
+    observe_at(root, profile, Path::new(REPO), ProfileImmutability::observe(profile))
 }
 
-/// [`observe`] against an explicit clone root. The container always evaluates
-/// the one fixed private clone; the parameter exists so the boundary's own
-/// tests can stage both the managed and unmanaged repository shapes.
-pub fn observe_at(root: &Path, profile: &Path, clone: &Path) -> Report {
+/// [`observe`] against an explicit clone root and an already-measured profile
+/// immutability. The container always evaluates the one fixed private clone
+/// and always measures the live profile; the parameters exist so the
+/// boundary's own tests can stage both the managed and unmanaged repository
+/// shapes, and both the protected and unprotected profile shapes, without
+/// privileges. A caller outside this module can only obtain a
+/// [`ProfileImmutability`] by measuring one.
+pub fn observe_at(
+    root: &Path,
+    profile: &Path,
+    clone: &Path,
+    immutable: ProfileImmutability,
+) -> Report {
     let mut report = Report {
         protocol: CONTROL_PROTOCOL.into(),
         control_version: CONTROL_VERSION,
@@ -332,7 +503,7 @@ pub fn observe_at(root: &Path, profile: &Path, clone: &Path) -> Report {
         return report;
     };
     report.codex_cli.clone_from(&manifest.codex_cli);
-    report.status = evaluate(root, profile, &manifest, report.managed);
+    report.status = evaluate(root, profile, &manifest, report.managed, immutable);
     if report.status == Status::Ready {
         match identity(&manifest, &report) {
             Ok(value) => report.identity = value,
@@ -342,7 +513,13 @@ pub fn observe_at(root: &Path, profile: &Path, clone: &Path) -> Report {
     report
 }
 
-fn evaluate(root: &Path, profile: &Path, manifest: &Manifest, managed: bool) -> Status {
+fn evaluate(
+    root: &Path,
+    profile: &Path,
+    manifest: &Manifest,
+    managed: bool,
+    immutable: ProfileImmutability,
+) -> Status {
     if manifest.protocol != CONTROL_PROTOCOL
         || manifest.control_version != CONTROL_VERSION
         || manifest.policy != expected_policy()
@@ -376,6 +553,12 @@ fn evaluate(root: &Path, profile: &Path, manifest: &Manifest, managed: bool) -> 
     {
         return Status::Writable;
     }
+    // The registration and the trust state have to be unreachable, not merely
+    // currently-correct: a check that only reads them is re-read at the next
+    // admission, which is far too late for the turn that already ran unhooked.
+    if !immutable.proven() {
+        return Status::ProfileMutable;
+    }
     if managed
         && (registered(profile).as_deref() != Some(&manifest.registration)
             || !receipt_pins(profile))
@@ -383,6 +566,14 @@ fn evaluate(root: &Path, profile: &Path, manifest: &Manifest, managed: bool) -> 
         return Status::Registration;
     }
     Status::Ready
+}
+
+/// Whether a profile already carries the managed registration and a receipt
+/// pinning it. Used by the host-side provisioning step, which has to prove the
+/// files are right *before* the session container binds them read-only.
+#[must_use]
+pub fn managed_registration_ready(profile: &Path) -> bool {
+    registered(profile).as_deref() == Some(registration().as_str()) && receipt_pins(profile)
 }
 
 /// The managed hook command currently registered in a profile's `hooks.json`.
@@ -427,6 +618,7 @@ pub fn accept(report: &Report, profile: &Path) -> Result<String> {
         Status::Mutated => bail!("private session control bundle no longer matches its sealed digests; refusing admission and preserving the session for inspection"),
         Status::Writable => bail!("private session control bundle is writable by the worker; refusing admission because no guard code or policy input above it is provable"),
         Status::Registration => bail!("private session managed hook registration or readiness receipt does not name the image-owned guard bridge; refusing admission"),
+        Status::ProfileMutable => bail!("private session does not bind the account profile's hook registration, Codex trust state and readiness receipt read-only; the worker could still replace them mid-session, so stop the session and start it again on a current daemon"),
     }
     if report.identity.len() != 64 || !report.identity.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("private session control identity is malformed");
@@ -573,6 +765,17 @@ mod tests {
         (dir, root, profile, clone)
     }
 
+    /// Observe a boundary whose profile controls are mount-protected. Creating
+    /// a real read-only bind needs privileges a unit test must not take, so the
+    /// measurement is staged here; the protection itself is exercised for real
+    /// against a live session in
+    /// `loom-daemon/tests/private_workspace_docker/control.rs`, and the
+    /// measurement function itself is covered by
+    /// `an_unprotected_profile_is_never_measured_as_immutable` below.
+    fn protected(root: &Path, profile: &Path, clone: &Path) -> Report {
+        observe_at(root, profile, clone, ProfileImmutability::fixture(true))
+    }
+
     /// Restore owner-writable modes so the temporary directory can be removed.
     fn writable(root: &Path) {
         for path in bundle_dirs(root).into_iter().rev() {
@@ -583,13 +786,13 @@ mod tests {
     #[test]
     fn ready_boundary_binds_one_identity_that_both_sides_recheck() {
         let (dir, root, profile, clone) = sealed();
-        let report = observe_at(&root, &profile, &clone);
+        let report = protected(&root, &profile, &clone);
         assert_eq!(report.status, Status::Ready, "{report:?}");
         let bound = accept(&report, &profile).unwrap();
         assert_eq!(bound.len(), 64);
-        rebind(&observe_at(&root, &profile, &clone), &profile, &bound).unwrap();
+        rebind(&protected(&root, &profile, &clone), &profile, &bound).unwrap();
         // A lease from before this protocol carries no identity to recheck.
-        assert!(rebind(&observe_at(&root, &profile, &clone), &profile, "")
+        assert!(rebind(&protected(&root, &profile, &clone), &profile, "")
             .unwrap_err()
             .to_string()
             .contains("predates"));
@@ -600,7 +803,7 @@ mod tests {
     #[test]
     fn mutated_guard_code_policy_and_registration_each_refuse_before_mutable_work() {
         let (dir, root, profile, clone) = sealed();
-        let bound = accept(&observe_at(&root, &profile, &clone), &profile).unwrap();
+        let bound = accept(&protected(&root, &profile, &clone), &profile).unwrap();
 
         // 1. Guard code swapped for a permissive stub (the demonstrated
         //    `guard-codex-bridge.sh` deletion/replacement, reproduced against
@@ -608,16 +811,16 @@ mod tests {
         writable(&root);
         let bridge = root.join("hooks/guard-codex-bridge.sh");
         std::fs::write(&bridge, "#!/usr/bin/env bash\nexit 0\n").unwrap();
-        assert_eq!(observe_at(&root, &profile, &clone).status, Status::Mutated);
-        assert!(accept(&observe_at(&root, &profile, &clone), &profile).is_err());
+        assert_eq!(protected(&root, &profile, &clone).status, Status::Mutated);
+        assert!(accept(&protected(&root, &profile, &clone), &profile).is_err());
         std::fs::remove_file(&bridge).unwrap();
-        assert_eq!(observe_at(&root, &profile, &clone).status, Status::Mutated);
+        assert_eq!(protected(&root, &profile, &clone).status, Status::Mutated);
 
         // 2. A writable bundle is refused even when every digest still matches:
         //    nothing above it is provable at the moment of the decision.
         let (restored, _) = staged();
         let root = restored.path().join("bundle");
-        assert_eq!(observe_at(&root, &profile, &clone).status, Status::Writable);
+        assert_eq!(protected(&root, &profile, &clone).status, Status::Writable);
 
         // 3. A manifest that declares a weaker policy, a different protocol, or
         //    a registration pointing anywhere else is Unsupported.
@@ -637,7 +840,7 @@ mod tests {
             mutate(&mut manifest);
             save(&root.join("manifest.json"), &manifest).unwrap();
             seal_modes(&root);
-            let report = observe_at(&root, &profile, &clone);
+            let report = protected(&root, &profile, &clone);
             assert_eq!(report.status, Status::Unsupported, "{manifest:?}");
             assert!(accept(&report, &profile).is_err());
             writable(&root);
@@ -651,7 +854,7 @@ mod tests {
         for break_profile in ["hooks.json" as &str, "loom-codex-hooks.json"] {
             let broken = profile.parent().unwrap().join(break_profile);
             std::fs::rename(profile.join(break_profile), &broken).unwrap();
-            let report = observe_at(&root, &profile, &clone);
+            let report = protected(&root, &profile, &clone);
             assert_eq!(report.status, Status::Registration, "{break_profile}");
             assert!(accept(&report, &profile).is_err());
             std::fs::rename(&broken, profile.join(break_profile)).unwrap();
@@ -660,7 +863,7 @@ mod tests {
         // 5. A faithful-looking report whose profile digests disagree with the
         //    host's own read of the canonical profile is refused, and an
         //    identity that changed after admission fails the recheck.
-        let mut report = observe_at(&root, &profile, &clone);
+        let mut report = protected(&root, &profile, &clone);
         assert_eq!(report.status, Status::Ready);
         report
             .profile
@@ -671,10 +874,63 @@ mod tests {
             .to_string()
             .contains("differs from the host"));
         std::fs::write(profile.join("config.toml"), "model='changed'\n").unwrap();
-        assert!(rebind(&observe_at(&root, &profile, &clone), &profile, &bound)
+        assert!(rebind(&protected(&root, &profile, &clone), &profile, &bound)
             .unwrap_err()
             .to_string()
             .contains("identity changed"));
+        writable(&root);
+        drop(dir);
+    }
+
+    /// The measurement itself, against real files rather than a staged value.
+    /// Everything a worker could plausibly do to a profile from inside its own
+    /// container — leave the files ordinary, make them read-only, make the
+    /// whole directory read-only, remove one — must measure as NOT immutable,
+    /// because none of those stops an `unlink` or a `rename` in a directory the
+    /// worker owns. Only a read-only mount point does, and only the host can
+    /// establish one.
+    #[test]
+    fn an_unprotected_profile_is_never_measured_as_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = profile(dir.path());
+        assert!(!ProfileImmutability::observe(&profile).proven());
+        for name in PROFILE_CONTROLS {
+            assert!(!immutable(&profile.join(name)), "{name} measured as immutable");
+        }
+        // Read-only modes are not the mechanism: the file still cannot be
+        // written, but the worker owns the directory, so it can unlink or
+        // rename the file out from under Codex regardless.
+        for name in PROFILE_CONTROLS {
+            std::fs::set_permissions(profile.join(name), std::fs::Permissions::from_mode(0o400))
+                .unwrap();
+        }
+        assert!(!ProfileImmutability::observe(&profile).proven());
+        // An absent control file is not immutable either — a path the worker
+        // can still create is a path it can still control.
+        std::fs::remove_file(profile.join("hooks.json")).unwrap();
+        assert!(!immutable(&profile.join("hooks.json")));
+        // ...and a directory in its place is not a control file at all.
+        std::fs::create_dir(profile.join("hooks.json")).unwrap();
+        assert!(!immutable(&profile.join("hooks.json")));
+    }
+
+    /// An otherwise perfect boundary whose profile controls are reachable is
+    /// refused before any mutable work, and never reaches `Registration` or
+    /// `Ready`: the registration it would check is one the worker can replace.
+    #[test]
+    fn a_reachable_hook_registration_refuses_even_when_its_content_is_correct() {
+        let (dir, root, profile, clone) = sealed();
+        assert_eq!(protected(&root, &profile, &clone).status, Status::Ready);
+        let exposed = observe_at(&root, &profile, &clone, ProfileImmutability::fixture(false));
+        assert_eq!(exposed.status, Status::ProfileMutable);
+        assert!(exposed.identity.is_empty(), "a refused boundary binds nothing");
+        let refusal = accept(&exposed, &profile).unwrap_err().to_string();
+        assert!(refusal.contains("read-only"), "{refusal}");
+        // ...and a lease bound while it WAS protected cannot be rechecked
+        // against it either, so an already-running session cannot drift into
+        // the unprotected shape and keep its admission.
+        let bound = accept(&protected(&root, &profile, &clone), &profile).unwrap();
+        assert!(rebind(&exposed, &profile, &bound).is_err());
         writable(&root);
         drop(dir);
     }
@@ -688,13 +944,13 @@ mod tests {
     fn a_repository_without_loom_helpers_still_binds_a_sealed_boundary() {
         let (dir, root, profile, _) = sealed();
         let bare = clone_root(&dir.path().join("bare"), false);
-        let report = observe_at(&root, &profile, &bare);
+        let report = protected(&root, &profile, &bare);
         assert!(!report.managed);
         assert_eq!(report.status, Status::Ready, "{report:?}");
         let bare_identity = accept(&report, &profile).unwrap();
         // The managed shape is a DIFFERENT identity over the same bundle, so a
         // session cannot silently move between the two modes after admission.
-        let managed = observe_at(&root, &profile, &clone_root(dir.path(), true));
+        let managed = protected(&root, &profile, &clone_root(dir.path(), true));
         assert!(managed.managed);
         assert_ne!(accept(&managed, &profile).unwrap(), bare_identity);
         writable(&root);

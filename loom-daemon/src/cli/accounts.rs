@@ -239,7 +239,137 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
             require_codex(&provider)?;
             print_status(&service.adopt(&name)?, json)
         }
+        AccountsAction::Provision {
+            provider,
+            name,
+            all,
+            from,
+            dry_run,
+            skip_hooks,
+            json,
+        } => run_provision(
+            &provider,
+            name.as_deref(),
+            all,
+            from,
+            dry_run,
+            skip_hooks,
+            json,
+            &workspace,
+        ),
     }
+}
+
+/// `loom-daemon accounts provision [--all|<name>]` (issue #8672).
+///
+/// # Exit-code contract
+///
+/// | Exit | Meaning |
+/// |---|---|
+/// | `0` | Every selected profile was provisioned (or was already up to date). |
+/// | `1` | At least one profile could not be provisioned; each failure is named on stderr. The others were still provisioned. |
+/// | other | The ordinary CLI error path (no such provider, unresolvable default profile). |
+///
+/// Output is secret-free by construction: a profile is identified by its
+/// directory name only, and the provisioner never opens the credential file.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+fn run_provision(
+    provider: &str,
+    name: Option<&str>,
+    all: bool,
+    from: Option<std::path::PathBuf>,
+    dry_run: bool,
+    skip_hook_bridge: bool,
+    json: bool,
+    workspace: &std::path::Path,
+) -> Result<()> {
+    use loom_daemon::tokens_pool::profile_provisioning::{
+        default_profile_home, profile_dir_for, provision_all, provision_profile, ProvisionOptions,
+        ProvisionReport,
+    };
+    use loom_daemon::tokens_pool::profile_sharing::rules_for;
+
+    let rules = rules_for(provider).ok_or_else(|| {
+        anyhow!(
+            "provider {provider:?} has no profile sharing table; `accounts provision` supports: \
+             codex"
+        )
+    })?;
+    if name.is_none() && !all {
+        return Err(anyhow!("name an account, or pass --all"));
+    }
+    let source = match from {
+        Some(explicit) => explicit,
+        None => default_profile_home(rules).ok_or_else(|| {
+            anyhow!(
+                "could not locate the default {} profile; pass --from <dir> or set {}",
+                rules.provider,
+                rules.default_home_env
+            )
+        })?,
+    };
+    let options = ProvisionOptions {
+        source,
+        workspace: workspace.to_path_buf(),
+        dry_run,
+        skip_hook_bridge,
+    };
+
+    let results: Vec<(String, Result<ProvisionReport>)> = match name {
+        Some(one) => vec![(
+            one.to_string(),
+            profile_dir_for(rules, workspace, one)
+                .and_then(|profile| provision_profile(rules, &profile, &options)),
+        )],
+        None => provision_all(rules, workspace, &options),
+    };
+    if results.is_empty() {
+        println!("No {} accounts registered on this host; nothing to provision.", rules.provider);
+        return Ok(());
+    }
+
+    let mut failed = 0usize;
+    let mut reports = Vec::new();
+    for (account, result) in results {
+        match result {
+            Ok(report) => {
+                if !json {
+                    println!(
+                        "{}/{}: {}{}",
+                        rules.provider,
+                        report.profile,
+                        if report.changed {
+                            "provisioned"
+                        } else {
+                            "already up to date"
+                        },
+                        if dry_run { " (dry run)" } else { "" }
+                    );
+                    for surface in &report.surfaces {
+                        println!(
+                            "    {:<10} {:<18} {}",
+                            surface.action, surface.path, surface.detail
+                        );
+                    }
+                    if let Some(hooks) = &report.hook_bridge {
+                        println!("    hook-bridge  {}", hooks.detail);
+                    }
+                }
+                reports.push(report);
+            }
+            Err(error) => {
+                failed += 1;
+                eprintln!("error: {}/{account}: {error:#}", rules.provider);
+            }
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+    }
+    if failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// `loom-daemon accounts check [--ranking]` (issue #8407) — the Codex

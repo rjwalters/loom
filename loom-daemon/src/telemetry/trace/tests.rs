@@ -54,6 +54,71 @@ fn persistent_context_is_stable_across_reopen_and_distinct_per_execution_repo() 
 }
 
 #[test]
+fn story_context_is_derived_from_the_issue_alone() {
+    let story = story_context("rjwalters/loom", 9038);
+    // Pinned: every host and process must derive these exact ids.
+    assert_eq!(story.trace_id.as_str(), "e1e4b5921c2ac3c23233edba66f527ee");
+    assert_eq!(story.span_id.as_str(), "d41653e717749d2b");
+    assert!(story.sampled());
+    assert_eq!(story_context(" RJWalters/Loom ", 9038), story);
+    assert_ne!(story_context("rjwalters/loom", 9039).trace_id, story.trace_id);
+    assert_ne!(story_context("rjwalters/other", 9038).trace_id, story.trace_id);
+}
+
+#[test]
+fn derived_ci_ids_are_unchanged_by_the_shared_derivation() {
+    use crate::ci_telemetry::records::{job_context, run_context};
+    // Pinned from the pre-#9038 private CI derivation: CI trace ids must not move.
+    let run = run_context("2AMLogic/loom", 42, 1);
+    assert_eq!(run.trace_id.as_str(), "3468ca8ebf11663d1c7bc17c8cdbbe5a");
+    assert_eq!(run.span_id.as_str(), "566ba435fd9bed16");
+    let job = job_context("2AMLogic/loom", 42, 1, 7);
+    assert_eq!(job.trace_id, run.trace_id);
+    assert_eq!(job.span_id.as_str(), "47ab46a6e7148128");
+}
+
+#[test]
+fn story_executions_share_the_story_trace_with_distinct_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TraceStore::new(dir.path());
+    let story = story_context("rjwalters/loom", 9038);
+    let first = store
+        .load_or_create_story(dir.path(), "sweep-1", Some(&story))
+        .unwrap();
+    let retry = store
+        .load_or_create_story(dir.path(), "sweep-2", Some(&story))
+        .unwrap();
+    for saved in [&first, &retry] {
+        assert_eq!(saved.context.trace_id, story.trace_id);
+        assert_ne!(saved.context.span_id, story.span_id);
+        assert_eq!(saved.story.as_ref(), Some(&story));
+    }
+    assert_ne!(first.context.span_id, retry.context.span_id);
+    // Reopening keeps the persisted context rather than re-deriving it.
+    assert_eq!(store.load_or_create(dir.path(), "sweep-1").unwrap(), first);
+    let plain = store.load_or_create(dir.path(), "tick").unwrap();
+    assert_ne!(plain.context.trace_id, story.trace_id);
+    assert_eq!(plain.story, None);
+}
+
+#[test]
+fn context_persisted_before_stories_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.json");
+    let context = TraceContext::root(true);
+    let legacy = serde_json::json!({
+        "identity": "legacy",
+        "context": context,
+        "started_at": Utc::now(),
+    });
+    std::fs::write(&path, legacy.to_string()).unwrap();
+    let saved = TraceStore::load(&path).unwrap();
+    assert_eq!(saved.context, context);
+    assert_eq!(saved.story, None);
+    assert!(!serde_json::to_string(&saved).unwrap().contains("story"));
+}
+
+#[test]
 fn corrupt_or_oversize_store_does_not_silently_replace_identity() {
     let dir = tempfile::tempdir().unwrap();
     let store = TraceStore::new(dir.path());

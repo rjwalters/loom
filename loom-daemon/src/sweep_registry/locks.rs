@@ -53,6 +53,32 @@ impl std::fmt::Display for LiveClaimDispatchError {
 
 impl std::error::Error for LiveClaimDispatchError {}
 
+/// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
+/// local claim lock for the issue already exists (the atomic `mkdir` in
+/// `acquire_lock` found it held) — Issue #8907. Before this type the refusal
+/// was a bare `anyhow!`, so the work finder could only count it as a generic
+/// dispatch error. The Display text is unchanged byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimLockDispatchError {
+    /// The issue whose claim lock was already held.
+    pub issue: u32,
+    /// The lock directory that already existed.
+    pub lock: PathBuf,
+}
+
+impl std::fmt::Display for ClaimLockDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lock collision: issue #{} is already claimed (lock at {})",
+            self.issue,
+            self.lock.display()
+        )
+    }
+}
+
+impl std::error::Error for ClaimLockDispatchError {}
+
 /// Issue #4256: checkpoint phases at/after Builder completion. A crash whose
 /// checkpoint reads one of these means a PR was opened for the issue, so
 /// [`SweepRegistry::reap_once`]'s reaper-driven resume is eligible to
@@ -306,10 +332,9 @@ impl SweepRegistry {
                     .context("write lock owner.json")?;
                 Ok(())
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
-                "lock collision: issue #{issue} is already claimed (lock at {})",
-                lock.display()
-            )),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(ClaimLockDispatchError { issue, lock }.into())
+            }
             Err(e) => {
                 Err(anyhow!("failed to acquire lock for issue #{issue} at {}: {e}", lock.display()))
             }

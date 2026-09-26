@@ -20,6 +20,27 @@ pub enum SpanName {
     RuntimeRun,
     #[serde(rename = "loom.tool")]
     Tool,
+    /// One GitHub Actions workflow run (Issue #8824) — the root of a CI trace.
+    #[serde(rename = "loom.ci.run")]
+    CiRun,
+    /// One job of a GitHub Actions run, parented to its [`Self::CiRun`] span.
+    #[serde(rename = "loom.ci.job")]
+    CiJob,
+    /// One work-finder tick (Issue #8860) — its own root trace per tick.
+    #[serde(rename = "loom.dispatch.tick")]
+    DispatchTick,
+    /// One execution's exact token usage (Issue #8908): a late child of its
+    /// `loom.runtime.run` span, journalled once usage is known.
+    #[serde(rename = "loom.runtime.usage")]
+    RuntimeUsage,
+    /// One pool dispatch hold, from arming to clearing (Issue #8931) — its own
+    /// root trace.
+    #[serde(rename = "loom.pool.hold")]
+    PoolHold,
+    /// One work-finder `dispatch()` attempt (Issue #8907), parented to its
+    /// tick's [`Self::DispatchTick`] span.
+    #[serde(rename = "loom.dispatch.admission")]
+    DispatchAdmission,
 }
 
 impl SpanName {
@@ -32,6 +53,12 @@ impl SpanName {
             Self::RuntimePreflight => "loom.runtime.preflight",
             Self::RuntimeRun => "loom.runtime.run",
             Self::Tool => "loom.tool",
+            Self::CiRun => "loom.ci.run",
+            Self::CiJob => "loom.ci.job",
+            Self::DispatchTick => "loom.dispatch.tick",
+            Self::RuntimeUsage => "loom.runtime.usage",
+            Self::PoolHold => "loom.pool.hold",
+            Self::DispatchAdmission => "loom.dispatch.admission",
         }
     }
 }
@@ -81,11 +108,12 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
     attributes
         .iter()
         .filter(|(key, value)| {
-            matches!(
+            (matches!(
                 key.as_str(),
                 "loom.repo"
                     | "loom.repo.visibility"
                     | "loom.sweep_id"
+                    | "loom.story_id"
                     | "loom.issue"
                     | "loom.pr_number"
                     | "loom.role"
@@ -103,7 +131,9 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.recovered"
                     | "loom.timing_source"
                     | "loom.tool.name"
-            ) && value.len() <= 256
+            ) || crate::telemetry::ci::CI_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
+                || crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()))
+                && value.len() <= 256
                 && !value.chars().any(char::is_control)
         })
         .map(|(key, value)| (key.clone(), value.clone()))

@@ -11,6 +11,32 @@ use std::time::Duration;
 /// an unbounded call would wedge the loop rather than fail it.
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long after a Release is published its per-target assets may plausibly
+/// still be uploading (#8515).
+///
+/// `release.yml` publishes the Release **first** and uploads each platform's
+/// assets afterwards, from independent matrix legs, so for the whole duration
+/// of the build matrix the Release exists with no artifact for this host — a
+/// state indistinguishable, from a single snapshot, from a platform that will
+/// never have one.
+///
+/// Since #8515 that repo's own automated releases are created `--latest=false`
+/// and promoted only once every leg has uploaded, so `releases/latest` — what
+/// [`resolve`] actually reads — no longer names one mid-upload. This window
+/// still matters for every case that promotion cannot cover: a hand-cut
+/// Release (published Latest by its author before any asset exists), a
+/// consumer repo on an older workflow, or a daemon updating from a repo whose
+/// release pipeline is not this one.
+///
+/// This window only changes the WORDING of a refusal: resolution is
+/// `Unresolved` either side of it, and the tick falls back to source exactly
+/// as before. That is deliberate — an over-generous window here must never be
+/// able to mask a genuinely unbuilt platform as "still uploading forever",
+/// because nothing waits on it. 60 minutes comfortably covers a three-platform
+/// release build (observed: ~10-30 min) without pretending a day-old release
+/// is mid-upload.
+const ASSET_UPLOAD_GRACE_MINUTES: i64 = 60;
+
 /// The repo this binary was built from, compiled in via Cargo's `repository`
 /// field (`repository.workspace = true` in `loom-daemon/Cargo.toml`, #8513) —
 /// tier 3 of [`resolve`]'s priority order, populated into
@@ -58,8 +84,9 @@ pub struct Resolved {
 pub enum Resolution {
     Resolved(Box<Resolved>),
     /// No artifact for this host. **Not an error** — no Releases yet, an
-    /// unreachable or rate-limited API, an unbuilt platform, fetch disabled.
-    /// The tick falls back to the source path, exactly as before #7609.
+    /// unreachable or rate-limited API, an unbuilt platform, a release whose
+    /// per-target assets are *still uploading* (#8515), fetch disabled. The
+    /// tick falls back to the source path, exactly as before #7609.
     Unresolved(String),
 }
 
@@ -254,10 +281,15 @@ pub fn resolve(inputs: &Inputs<'_>) -> Resolution {
     // An unreadable asset list is `None` here and resolves to the same empty
     // list it always did: unresolved, fall back to source. (The fetch path
     // treats that `None` differently -- see `asset_names`.)
-    let names: Vec<String> = asset_names(root, &repo, None).unwrap_or_default();
+    let listed = asset_names(root, &repo, None);
+    let names: Vec<String> = listed.clone().unwrap_or_default();
     if !names.contains(&bin_name) || !names.contains(&sha_name) {
-        return Resolution::Unresolved(no_artifact_reason(
-            &tag, &repo, &target, &bin_name, &sha_name,
+        return Resolution::Unresolved(classify_no_artifact(
+            root,
+            &repo,
+            &tag,
+            &target,
+            listed.as_ref().map(Vec::len),
         ));
     }
 
@@ -281,25 +313,144 @@ pub fn resolve(inputs: &Inputs<'_>) -> Resolution {
     }))
 }
 
+/// Why `tag` of `repo` offers no artifact for `target` — the #8515
+/// classification (release age + asset count, "still uploading" vs "genuinely
+/// unbuilt") for a release the CALLER already resolved (#8654).
+///
+/// Backs `loom-daemon release-explain`, which `loom-daemon-update.sh`'s
+/// `fetch_resolve_latest` consults on its no-artifact path so a forced
+/// `--fetch` refusal carries the same wording the daemon's own resolver emits.
+/// Pinned to `tag` rather than re-reading `releases/latest`: the shell already
+/// decided which release it is refusing, and a Latest promoted between the two
+/// reads must not make the explanation describe a different release.
+///
+/// `None` when `tag` DOES carry both assets for `target` — nothing to explain,
+/// and the caller keeps whatever reason it already had.
+#[must_use]
+pub fn explain_no_artifact(root: &Path, repo: &str, tag: &str, target: &str) -> Option<String> {
+    let bin_name = format!("loom-daemon-{target}");
+    let sha_name = format!("{bin_name}.sha256");
+    let listed = asset_names(root, repo, Some(tag));
+    if listed
+        .as_ref()
+        .is_some_and(|n| n.contains(&bin_name) && n.contains(&sha_name))
+    {
+        return None;
+    }
+    Some(classify_no_artifact(root, repo, tag, target, listed.as_ref().map(Vec::len)))
+}
+
+/// The one place the no-artifact reason is assembled, shared by [`resolve`]
+/// and [`explain_no_artifact`] so the two can never word the same release
+/// differently.
+///
+/// Only on the failure path: one extra `gh` call (the publish time) buys the
+/// difference between "this platform is unbuilt" and "come back in three
+/// minutes" (#8515).
+fn classify_no_artifact(
+    root: &Path,
+    repo: &str,
+    tag: &str,
+    target: &str,
+    asset_count: Option<usize>,
+) -> String {
+    let bin_name = format!("loom-daemon-{target}");
+    let sha_name = format!("{bin_name}.sha256");
+    let age =
+        release_age_minutes(fetch_published_at(tag, repo, root).as_deref(), chrono::Utc::now());
+    no_artifact_reason(tag, repo, target, &bin_name, &sha_name, asset_count, age)
+}
+
+/// Minutes since `published_at` (an RFC3339 timestamp as `gh` reports it), or
+/// `None` when the field was absent (an older `gh`) or unparseable.
+///
+/// A timestamp in the future — clock skew between this host and the forge —
+/// clamps to `0` rather than going negative: "published just now" is the
+/// honest reading of it, and a negative age would sort as "ancient".
+fn release_age_minutes(
+    published_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<i64> {
+    let raw = published_at?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    Some(
+        now.signed_duration_since(parsed.with_timezone(&chrono::Utc))
+            .num_minutes()
+            .max(0),
+    )
+}
+
+/// Whether this release is young enough that its per-target assets could still
+/// be uploading (#8515).
+///
+/// An **unknown** age is deliberately NOT transient: with no timestamp there is
+/// nothing to bound the wait, and claiming "still uploading" about a release
+/// that may be a year old is exactly the mask this window must not become. The
+/// wording for that case says the publish time could not be read instead.
+fn assets_may_still_be_uploading(age_minutes: Option<i64>) -> bool {
+    age_minutes.is_some_and(|m| m < ASSET_UPLOAD_GRACE_MINUTES)
+}
+
+/// `90` -> `"1h 30m"`, `5` -> `"5m"` — a duration an operator reads at a glance.
+fn human_age(minutes: i64) -> String {
+    match minutes {
+        m if m < 1 => "less than a minute".to_string(),
+        m if m < 60 => format!("{m}m"),
+        m if m < 60 * 24 => format!("{}h {}m", m / 60, m % 60),
+        m => format!("{}d {}h", m / (60 * 24), (m % (60 * 24)) / 60),
+    }
+}
+
 /// The "this release publishes nothing for my platform" reason, which **names
-/// the repo it asked** (#8513).
+/// the repo it asked** (#8513) and **how old the release is plus how many
+/// assets it carries** (#8515).
 ///
 /// A separate function only so the wording is assertable without a forge call:
 /// this is the exact line the wrong-repo incident emitted for 20+ ticks
 /// (`release v0.11.0 has no artifact for target x86_64-unknown-linux-gnu …`),
 /// and with no repo in it, "I asked a completely different project for Loom's
 /// assets" reads identically to "Loom has not built this platform yet".
+///
+/// `asset_count` is `None` when the asset list could not be read at all (never
+/// the same as `Some(0)`, "the release publishes nothing yet"), `age_minutes`
+/// `None` when the publish timestamp could not be read. Both unknowns are
+/// stated as unknowns — the whole point of #8515 is that one message used to
+/// cover three very different situations.
+#[allow(clippy::too_many_arguments)]
 fn no_artifact_reason(
     tag: &str,
     repo: &str,
     target: &str,
     bin_name: &str,
     sha_name: &str,
+    asset_count: Option<usize>,
+    age_minutes: Option<i64>,
 ) -> String {
-    format!(
-        "release {tag} of {repo} has no artifact for target {target} \
-         (checked for {bin_name} + {sha_name})"
-    )
+    let head =
+        format!("release {tag} of {repo} has no artifact for target {target} (checked for {bin_name} + {sha_name})");
+    let assets = match asset_count {
+        Some(0) => "it publishes no assets at all yet".to_string(),
+        Some(n) => format!("it publishes {n} asset(s), none matching this target"),
+        None => "its asset list could not be read".to_string(),
+    };
+    match (assets_may_still_be_uploading(age_minutes), age_minutes) {
+        (true, Some(m)) => format!(
+            "{head}; the release was published {} ago and {assets} -- its per-target assets are most likely STILL UPLOADING \
+             (the release workflow publishes the Release before the upload matrix finishes), so a later attempt is expected to resolve it",
+            human_age(m)
+        ),
+        (false, Some(m)) => format!(
+            "{head}; the release was published {} ago and {assets}, well past the {ASSET_UPLOAD_GRACE_MINUTES}m upload window -- \
+             this platform looks genuinely unbuilt rather than mid-upload",
+            human_age(m)
+        ),
+        (_, None) => format!(
+            "{head}; {assets} and its publish time could not be read, so an in-flight upload cannot be ruled out"
+        ),
+    }
 }
 
 /// The release's publish timestamp, verbatim. `None` on an older `gh` that does

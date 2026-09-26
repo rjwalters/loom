@@ -111,8 +111,8 @@ Claude Code's own attribute names (`session.id`, `user.email`,
 still applies unmodified to this path — it keeps only the resource keys
 (`service.name`, `service.version`, `service.instance.id`, `host.id`) and the
 explicit `loom.*` log/span allowlist, plus the small non-namespaced
-`metric_statements` datapoint keys (`account`, `rank`, `pool`, `slot`,
-`model`, `window`, `state`). Anything else Claude Code sends — including
+`metric_statements` datapoint keys listed under "Privacy and remote
+deployment" below. Anything else Claude Code sends — including
 fields with real user identity like `user.email` — is dropped before either
 backend, by the same fail-closed `keep_keys` behavior documented in "Privacy
 and remote deployment" below. That is a feature, not a bug: it means this
@@ -259,6 +259,23 @@ counts/ids/allowlisted tool names — never transcript content, same as
 `epic.issue.*` event-bus payload, carried whole as one JSON string rather than
 re-typed per topic — see `crate::event_bus`'s frozen taxonomy).
 
+Issue #8825 (CI telemetry, phase 2) adds a fourth, `ci.job.log`: one ≤ 8 KiB
+chunk of a completed job's log, with `loom.ci.chunk_index`,
+`loom.ci.chunk_count`, `loom.ci.log_bytes_total`, `loom.ci.truncated` and
+`loom.ci.truncation_note` joining the log allowlist. It is the only kind whose
+**body** is free text, and the reason `transform/ci_log_redaction` exists —
+see ["Privacy and remote deployment"](#privacy-and-remote-deployment).
+
+Issue #8824 (CI telemetry, phase 1) adds three record kinds — `ci.run`,
+`ci.job` (log records) and `ci.duration` (the `loom.ci.run.duration_ms` /
+`loom.ci.job.duration_ms` delta histograms) — plus `loom.ci.run` /
+`loom.ci.job` spans. The log, span and datapoint allowlists gain exactly the
+constants in `loom-daemon/src/telemetry/ci.rs` (`CI_LOG_ATTRIBUTE_KEYS`,
+`CI_SPAN_ATTRIBUTE_KEYS`, `CI_METRIC_LABEL_KEYS`); the `ci_telemetry`
+contract test fails if this config and those constants ever disagree. Metric
+labels are the low-cardinality `repo`, `workflow`, `job`, `runner`,
+`conclusion` only. See `defaults/docs/ci-observability.md`.
+
 | Source | Path tailed (in-container) | `loom.*` fields populated |
 | --- | --- | --- |
 | Codex | `/var/lib/loom-sessions/codex/**/*.jsonl` | `runtime` (static `"codex"`), `session_id` (from a `session_meta` record), `model` (from a `turn_context` record) — both paths still unverified, no sample existed on the verifying host |
@@ -322,11 +339,58 @@ This is a trusted private operational store, not the public dashboard projection
 The gateway's shared allowlist removes unknown resource, record, span-event and
 metric attributes before both exporters. Free-text `loom.detail` is excluded.
 Only low-cardinality metric labels are permitted; trace IDs and issue numbers
-remain in logs/spans. Source-side Loom privacy rules must sanitize bodies, span
-names and nested values; this collector is **not** a general arbitrary-log
-redactor, and does not accept raw shell output, prompts or model completions.
+remain in logs/spans.
 
-The one narrow exception is the `file_log/codex`, `file_log/pi` and
+The datapoint allowlist in `config.yaml` is exactly: `account`, `rank`,
+`pool`, `slot`, `model`, `window`, `state` (token-pool and Claude Code
+metrics); `repo`, `workflow`, `job`, `runner`, `conclusion` (the
+`loom.ci.*` duration histograms, #8824); and `reason`, `provider` (the
+`metric.points` ops path, #8860 — its `OPS_METRIC_LABEL_KEYS` are `reason`,
+`provider`, `account`, `model`, `state`). A contract test in
+`loom-daemon/src/observability/ops/tests.rs` fails if `OPS_METRIC_LABEL_KEYS`
+gains a key this list lacks. `metric.points` values are additionally bounded
+at the source: at most 8 labels per point, values ≤128 bytes with no control
+characters, finite numbers only — enforced when the daemon enqueues the point
+and again when it exports it (#8857). The #8857 quota metrics
+(`loom.llm.tokens.*`, `loom.llm.requests`, `loom.pool.*`) carry only
+`provider`, `model` and `state`: per-provider aggregates, never an account
+name or credential.
+
+**The body policy, exactly** (rewritten for #8825; this used to read "does not
+accept raw shell output, prompts or model completions", which is no longer the
+whole truth): this collector is **not** a general arbitrary-log redactor.
+Source-side Loom privacy rules own bodies, span names and nested values for
+every record kind, and it accepts no prompts or model completions from any
+source. **There is exactly one kind whose body is free text the source did not
+author: `ci.job.log` (#8825)**, which carries GitHub Actions job log text.
+That one is accepted deliberately, and scrubbed *here*, because the operator
+decision for #8825 makes this gateway — not the daemon — the redaction
+boundary for build logs. Concretely:
+
+- `transform/ci_log_redaction` runs **first** in the `logs` pipeline, ahead of
+  `transform/privacy`, and rewrites the body through the ordered scrub-class
+  list in `config.yaml` (`[REDACTED:<class>]` per class: `authorization`,
+  `bearer-token`, `github-token`, `anthropic-key`, `api-key`,
+  `aws-access-key-id`, `aws-secret-access-key`, `credential`).
+- Every statement is scoped by `attributes["loom.ci.chunk_index"] != nil and
+  IsString(body)`. That attribute is emitted by, and only by, `ci.job.log`
+  chunks, so **no other kind's body is touched** — not rewritten, not
+  inspected, not newly admitted.
+- No `ci.job.log` *attribute* is derived from log text (that is why there is
+  no `step` attribute), because this stage rewrites bodies only; an attribute
+  built out of log text would bypass it entirely.
+- The class list lives in the repo in two places that are pinned to each other
+  by contract tests (`config.yaml` and `CI_LOG_SCRUB_CLASSES` in
+  `loom-daemon/src/telemetry/ci.rs`). **A new secret family is added to the
+  list, the config and the test in the same PR** — the list is reviewable, and
+  fails closed against silent drift rather than against unseen patterns.
+
+Extending this exception to a second record kind is a deliberate policy
+change, not a config tweak: it needs its own review, its own scope guard, and
+its own entry in the contract tests above.
+
+The other narrow exception — receiver-level, and about *not* forwarding free
+text rather than scrubbing it — is the `file_log/codex`, `file_log/pi` and
 `file_log/claude` receivers documented in
 ["Interactive-session filelog receivers"](#interactive-session-filelog-receivers)
 below (#8669): they tail structured JSONL session stores, but never forward
@@ -444,6 +508,18 @@ contract, run the same way:
 ```console
 CARGO_BUILD_JOBS=2 cargo test -p loom-daemon --test collector_filelog -- --ignored --nocapture
 ```
+
+The `ci.job.log` scrub stage (#8825) is contract-tested in the fan-out file:
+`ci_job_log_bodies_are_scrubbed_at_the_gateway_before_both_sinks` (Docker,
+`--ignored`) posts one synthetic sentinel per scrub class through the real
+pinned gateway and asserts, at **both** sinks, that the raw secret bytes are
+absent **and** the `[REDACTED:<class>]` marker is present — absence alone
+would also pass if the gateway simply dropped the record — while a clean
+build-log line survives byte-identical. Two no-Docker tests
+(`gateway_scrubs_exactly_the_declared_ci_log_classes` there, and
+`ci_telemetry::tests::collector_scrub_classes_match_the_declared_list` in the
+daemon) pin the config's class list, its order, and each statement's
+`ci.job.log` scope guard to `CI_LOG_SCRUB_CLASSES`.
 
 It runs the production config verbatim (only the two OTLP-HTTP exporters are
 swapped for a local `file` sink), mounts synthetic Codex/pi/Claude session

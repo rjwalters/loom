@@ -350,7 +350,14 @@ pub fn ingest(db: &ActivityDb, opts: &IngestOptions) -> Result<IngestStats> {
                     stats.session_analyses += 1;
                 }
                 if let Some(sink) = &opts.summary_sink {
-                    sink.push(summary);
+                    // #8908: join the log to its execution's trace, when
+                    // exactly one traced sweep of this issue covers it.
+                    let trace = crate::observability::runtime_usage::join::context_for_session(
+                        parsed.cwd.as_deref(),
+                        summary.issue,
+                        parsed.first_timestamp,
+                    );
+                    sink.push_traced(summary, trace);
                     stats.session_summaries += 1;
                 }
             }

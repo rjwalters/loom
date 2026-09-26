@@ -136,6 +136,11 @@
     <div id="registry-body"><p class="muted">loading&hellip;</p></div>
   </section>
 
+  <section class="panel wide" id="panel-queue">
+    <h2>Ready queue (dispatch order)</h2>
+    <div id="queue-body"><p class="muted">loading&hellip;</p></div>
+  </section>
+
   <section class="panel" id="panel-capacity">
     <h2>Dynamic concurrency cap</h2>
     <div id="capacity-body"><p class="muted">loading&hellip;</p></div>
@@ -280,6 +285,95 @@ function renderRegistry(report) {
       el("td", { text: fmtUptime(sweep.started_at) }),
       el("td", { text: sweep.latest_phase || "-" }),
       el("td", {}, [el("span", { "class": "pill " + (state === "Running" ? "green" : "muted-pill"), text: state })]),
+    ]));
+  });
+  table.appendChild(tbody);
+  body.appendChild(table);
+}
+
+// ---------------------------------------------------------------------
+// Ready queue panel (Issue #8852): the work finder's last tick, one row per
+// ready issue, ranked by the daemon's own dispatch comparator.
+// ---------------------------------------------------------------------
+
+var forgeUrlByRoot = {};
+// Stale after 5 missed ticks of the daemon's own interval, never under 300s
+// (the same rule as `loom-daemon queue`).
+function queueStaleSecs(report) {
+  var interval = report.work_finder_interval_secs > 0 ? report.work_finder_interval_secs : 60;
+  return Math.max(300, 5 * interval);
+}
+var QUEUE_STATE_PILL = { running: "green", ready: "amber", blocked: "red" };
+
+// The daemon serializes each row's `state` and `reason` (#8852 phase 2); the
+// disposition-prefix fallback only covers payloads from older daemons.
+function queueState(row) {
+  if (row.state) return row.state;
+  var d = row.disposition;
+  if (d === "dispatched" || d === "in_flight") return "running";
+  if (d && d.indexOf("deferred_") === 0) return "ready";
+  return "blocked";
+}
+
+function renderQueue(report) {
+  var body = document.getElementById("queue-body");
+  body.innerHTML = "";
+  var tick = report.last_work_finder_tick;
+  if (!tick) {
+    body.appendChild(el("p", { "class": "muted", text: report.work_finder_enabled === false
+      ? "work finder disabled on this daemon"
+      : "no work-finder tick yet in this daemon process (queue unknown, not empty)" }));
+    return;
+  }
+  var age = Math.max(0, Math.round((Date.now() - Date.parse(tick.at)) / 1000));
+  var queue = tick.queue || [];
+  var counts = { running: 0, ready: 0, blocked: 0 };
+  queue.forEach(function (r) { counts[queueState(r)] += 1; });
+  var stale = age > queueStaleSecs(report);
+  var failed = tick.listing_failed || [];
+  body.appendChild(el("p", {}, [
+    el("span", { "class": "pill " + (stale ? "red" : "green"), text: stale ? "STALE" : "fresh" }),
+    document.createTextNode(" last tick " + age + "s ago, cap " + tick.max_concurrent + " — " +
+      counts.running + " running, " + counts.ready + " ready, " + counts.blocked + " blocked"),
+  ]));
+  if (failed.length > 0) {
+    body.appendChild(el("p", {}, [
+      el("span", { "class": "pill red", text: "INCOMPLETE" }),
+      document.createTextNode(" listing ready issues failed for " + failed.join(", ") +
+        " — their backlog is missing below"),
+    ]));
+  }
+  if (queue.length === 0) {
+    if (failed.length > 0) return;
+    body.appendChild(el("p", { "class": "muted", text: tick.seen === 0
+      ? "no ready loom:issue work" : "this daemon did not record per-issue rows" }));
+    return;
+  }
+  var table = el("table", {}, [
+    el("thead", {}, [el("tr", {}, [
+      el("th", { text: "#" }), el("th", { text: "issue" }), el("th", { text: "repo" }),
+      el("th", { text: "prio" }), el("th", { text: "state" }), el("th", { text: "reason" }),
+      el("th", { text: "labels" }),
+    ])]),
+  ]);
+  var tbody = el("tbody");
+  queue.forEach(function (row) {
+    var state = queueState(row);
+    var base = forgeUrlByRoot[row.repo];
+    var issueCell = base
+      ? el("td", {}, [el("a", { href: base + "/issues/" + row.issue, target: "_blank", rel: "noopener", text: "#" + row.issue })])
+      : el("td", { text: "#" + row.issue });
+    var flags = [];
+    if (row.urgent) flags.push("loom:urgent");
+    if (row.tier) flags.push(row.tier);
+    tbody.appendChild(el("tr", {}, [
+      el("td", { text: String(row.rank) }),
+      issueCell,
+      el("td", { text: String(row.repo).split("/").pop() }),
+      el("td", { text: String(row.workspace_priority) }),
+      el("td", {}, [el("span", { "class": "pill " + QUEUE_STATE_PILL[state], text: state })]),
+      el("td", { text: (row.reason || row.disposition.replace(/_/g, " ")) + (row.detail ? " (" + row.detail + ")" : "") }),
+      el("td", { text: flags.join(", ") || "-" }),
     ]));
   });
   table.appendChild(tbody);
@@ -488,6 +582,7 @@ function renderPipeline(rows) {
   var tbody = el("tbody");
   rows.forEach(function (row) {
     var label = row.root;
+    if (row.forge_url) forgeUrlByRoot[row.root] = row.forge_url;
     var nameCell;
     if (row.forge_url) {
       nameCell = el("td", {}, [el("a", { href: row.forge_url, target: "_blank", rel: "noopener", text: label })]);
@@ -612,6 +707,7 @@ function refreshStatus() {
     document.getElementById("meta").textContent =
       "host: " + (report.hostname || "?") + " — updated " + new Date().toLocaleTimeString();
     renderRegistry(report);
+    renderQueue(report);
     renderCapacity(report);
     renderGate(report);
   }).catch(function (err) {

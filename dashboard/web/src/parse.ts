@@ -34,6 +34,7 @@ import type {
   TokensSnapshotRecord,
   Timestamped,
 } from "./types";
+import { parseQueueSnapshot } from "./queueParse";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -51,6 +52,16 @@ function num(value: unknown): number | undefined {
 
 function bool(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
+}
+
+/** An array of non-empty strings, dropping any wrong-typed/empty entry
+ * rather than failing the whole field — same best-effort narrowing as every
+ * scalar helper above. `undefined` (not `[]`) when `value` itself is not an
+ * array, so an absent field stays absent rather than becoming a fabricated
+ * empty list. */
+function strArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
 }
 
 /** A `managed_repos` entry. `slug` is dropped by `stripUndefined` when
@@ -129,6 +140,8 @@ export function parseHostHealth(value: unknown): HostHealthRecord {
       : undefined,
     roles: parseRoleTickHealth(value.roles),
     protection: parseHostProtection(value.protection),
+    is_captain: bool(value.is_captain),
+    armed_singleton_jobs: strArray(value.armed_singleton_jobs),
   });
 }
 
@@ -282,6 +295,9 @@ export function parseFleetSnapshot(value: unknown): FleetSnapshot {
       if (health) entry.health = health;
       const tokens = parseTimestamped(raw.tokens, parseTokensSnapshot);
       if (tokens) entry.tokens = tokens;
+      // Issue #8852: a queue with no parseable `tick_at` is dropped, not shown.
+      const queue = parseTimestamped(raw.queue, parseQueueSnapshot);
+      if (queue?.record) entry.queue = { record: queue.record, updatedAt: queue.updatedAt };
       snapshot.hosts[hostId] = entry;
     }
   }

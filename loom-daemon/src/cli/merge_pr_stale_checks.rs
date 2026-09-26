@@ -27,9 +27,31 @@
 //! `--from-stdin` reads the same evidence the live path gathers, as a JSON
 //! object, and assesses it offline — the deterministic seam the retained suite
 //! drives (and a debug facility: paste a real PR's inputs, see the verdict).
+//!
+//! # The input-scoped predicate (#8919)
+//!
+//! The verdict is decided by
+//! [`loom_daemon::merge_pr::stale_checks::assess_scoped`]: when the base a
+//! check actually tested (`B`), the base-move diff (`D`) and the PR delta (`P`)
+//! are all available, staleness is a question about *which files* the move
+//! touched, not about *when* the run happened. Whenever any of the three is
+//! missing for a context, that context falls back to #8248's `started_at` rule
+//! and a `Warning:` naming it goes to **stderr** — stdout still carries nothing
+//! but the sentinel or the refusal, so the exit-code contract above is
+//! unchanged.
+//!
+//! The `--from-stdin` payload accepts the new evidence as OPTIONAL fields
+//! (`pr_files`, `base_moves`); a payload without them behaves exactly as before.
 
 use anyhow::Result;
-use loom_daemon::merge_pr::stale_checks::{assess, unknown_message, Verdict, CLEAN};
+use loom_daemon::merge_pr::stale_checks::evidence::{
+    strip_validated_restamps, to_file_set, ChangedFile,
+};
+use loom_daemon::merge_pr::stale_checks::inputs::{BaseMove, ScopedEvidence};
+use loom_daemon::merge_pr::stale_checks::{
+    assess_scoped, stale_inputs_message, unknown_message, Verdict, CLEAN,
+};
+use std::collections::BTreeMap;
 use std::io::Read;
 
 #[derive(clap::Args)]
@@ -64,13 +86,21 @@ impl StaleChecksArgs {
         let (tip_sha, verdict) = if self.from_stdin {
             match self.stdin_inputs() {
                 Ok(inputs) => {
-                    (inputs.tip_sha, assess(inputs.base_tip, &inputs.required, &inputs.runs))
+                    let (verdict, warnings) = assess_scoped(
+                        inputs.base_tip,
+                        &inputs.required,
+                        &inputs.runs,
+                        inputs.scoped.as_ref(),
+                    );
+                    warn_all(&warnings);
+                    (inputs.tip_sha, verdict)
                 }
                 Err(why) => (String::new(), Verdict::Unknown(why)),
             }
         } else {
             match loom_daemon::merge_pr::stale_checks::fetch::live_inputs(
                 &self.repo,
+                &self.pr,
                 &self.base_ref,
                 &self.head_sha,
             ) {
@@ -79,13 +109,15 @@ impl StaleChecksArgs {
                     // nothing else (callers compare it for exact equality), and
                     // a degradation the operator cannot see is how a fail-open
                     // ships unnoticed (#8844).
-                    for notice in &inputs.notices {
-                        eprintln!("Warning: {notice}");
-                    }
-                    (
-                        inputs.tip_sha.clone(),
-                        assess(inputs.base_tip, &inputs.required, &inputs.runs),
-                    )
+                    warn_all(&inputs.notices);
+                    let (verdict, warnings) = assess_scoped(
+                        inputs.base_tip,
+                        &inputs.required,
+                        &inputs.runs,
+                        inputs.scoped.as_ref(),
+                    );
+                    warn_all(&warnings);
+                    (inputs.tip_sha.clone(), verdict)
                 }
                 Err(why) => (String::new(), Verdict::Unknown(why)),
             }
@@ -111,6 +143,17 @@ impl StaleChecksArgs {
                     loom_daemon::merge_pr::stale_checks::stale_message(
                         &self.pr, &check, started_at, base_tip, &tip_sha
                     )
+                );
+                std::process::exit(1);
+            }
+            Verdict::StaleInputs {
+                check,
+                tested_base,
+                reason,
+            } => {
+                println!(
+                    "{}",
+                    stale_inputs_message(&self.pr, &check, &tested_base, &reason, &tip_sha)
                 );
                 std::process::exit(1);
             }
@@ -175,6 +218,8 @@ impl StaleChecksArgs {
                         .and_then(|s| s.as_str())
                         .map(String::from),
                     started_at,
+                    actions_run_id: None,
+                    actions_job_id: None,
                 }
             })
             .collect();
@@ -188,6 +233,7 @@ impl StaleChecksArgs {
             base_tip,
             required,
             runs,
+            scoped: scoped_from_json(&v),
         })
     }
 }
@@ -198,4 +244,94 @@ struct StdinInputs {
     base_tip: chrono::DateTime<chrono::Utc>,
     required: Vec<String>,
     runs: Vec<loom_daemon::merge_pr::stale_checks::CheckRun>,
+    scoped: Option<ScopedEvidence>,
+}
+
+/// Print every degradation on stderr, so stdout keeps carrying only the
+/// sentinel or the refusal.
+fn warn_all(notices: &[String]) {
+    for notice in notices {
+        eprintln!("Warning: {notice}");
+    }
+}
+
+/// The OPTIONAL input-scoped evidence (#8919) of a `--from-stdin` payload:
+///
+/// ```json
+/// {
+///   "pr_files":  [{"filename": "a.rs", "status": "modified"}],
+///   "base_moves": {
+///     "File Size Ratchet": {
+///       "tested_base": "803f0c7d",
+///       "files": [{"filename": "scripts/file-size-baseline.txt",
+///                  "status": "modified", "patch": "@@ …"}]
+///     }
+///   },
+///   "fallbacks": {"Some Check": "why it has no evidence"}
+/// }
+/// ```
+///
+/// Absent `pr_files` AND `base_moves` ⇒ `None`, i.e. an old payload assesses by
+/// the time rule exactly as before. The same
+/// [`strip_validated_restamps`] the live path applies runs here, so a suite can
+/// drive the restamp validation end-to-end.
+fn scoped_from_json(v: &serde_json::Value) -> Option<ScopedEvidence> {
+    if v.get("pr_files").is_none() && v.get("base_moves").is_none() {
+        return None;
+    }
+    let pr_files = changed_files(v.get("pr_files"));
+    let mut base_moves: BTreeMap<String, BaseMove> = BTreeMap::new();
+    if let Some(obj) = v.get("base_moves").and_then(|m| m.as_object()) {
+        for (ctx, mv) in obj {
+            let files = changed_files(mv.get("files"));
+            base_moves.insert(
+                ctx.clone(),
+                BaseMove {
+                    tested_base: mv
+                        .get("tested_base")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("<unknown>")
+                        .to_string(),
+                    files: to_file_set(&strip_validated_restamps(&files)),
+                },
+            );
+        }
+    }
+    let mut fallbacks: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(obj) = v.get("fallbacks").and_then(|m| m.as_object()) {
+        for (ctx, why) in obj {
+            fallbacks.insert(ctx.clone(), why.as_str().unwrap_or("no reason given").to_string());
+        }
+    }
+    Some(ScopedEvidence {
+        pr_delta: to_file_set(&pr_files),
+        base_moves,
+        fallbacks,
+    })
+}
+
+fn changed_files(v: Option<&serde_json::Value>) -> Vec<ChangedFile> {
+    v.and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|f| ChangedFile {
+                    path: f
+                        .get("filename")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    status: f
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("modified")
+                        .to_string(),
+                    previous_filename: f
+                        .get("previous_filename")
+                        .and_then(|s| s.as_str())
+                        .map(String::from),
+                    patch: f.get("patch").and_then(|s| s.as_str()).map(String::from),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }

@@ -29,19 +29,31 @@ fn valid_endpoint(endpoint: &str) -> bool {
 
 /// Persist before spawn. A corrupt/busy/full store disables this execution's
 /// tracing with a diagnostic; it cannot fail the actual issue dispatch.
-pub fn prepare_child(command: &mut Command, root: &Path, execution: &str) {
+///
+/// An `issue` execution joins that issue's story trace (#9037) when the
+/// checkout's GitHub `origin` names the repo; otherwise it is its own root.
+pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue: Option<u32>) {
     command
         .env_remove(TRACEPARENT_ENV)
         .env_remove(CONTEXT_FILE_ENV);
     if !enabled(root) {
         return;
     }
+    let story = issue.and_then(|issue| {
+        // Lowercased so `loom.repo` agrees across hosts whose origins differ
+        // only in case, exactly as the story id itself does.
+        crate::release_resolve::host::repo_slug(root).map(|repo| StoryRef {
+            context: crate::telemetry::trace::story_context(&repo, issue),
+            repo: repo.to_ascii_lowercase(),
+            issue,
+        })
+    });
     let store = TraceStore::new(root);
-    match store.load_or_create(root, execution) {
+    match store.load_or_create_story(root, execution, story.as_ref().map(|s| &s.context)) {
         Ok(saved) => {
             command.env(TRACEPARENT_ENV, saved.context.traceparent());
             command.env(CONTEXT_FILE_ENV, store.path(root, execution));
-            super::lifecycle::prepare_execution(command, root, execution);
+            super::lifecycle::prepare_execution(command, root, execution, story.as_ref());
         }
         Err(error) => {
             log::warn!("observability: trace context unavailable; child is untraced: {error}")
@@ -49,14 +61,37 @@ pub fn prepare_child(command: &mut Command, root: &Path, execution: &str) {
     }
 }
 
-/// Existing native ingest accepts lifecycle records, never trace-only payloads.
-/// Also strips the additive context fields for older native backend versions.
+/// The issue an execution's story trace belongs to.
+pub struct StoryRef {
+    pub repo: String,
+    pub issue: u32,
+    pub context: crate::telemetry::trace::TraceContext,
+}
+
+/// The OTLP signal an OTLP-only record kind belongs to, or `None` for a kind
+/// the native HTTPS backend also accepts. Spans and `metric.points` (#8860)
+/// never reach native ingest.
+///
+/// Both halves are read off the kind's own registry row in
+/// `telemetry/kinds.rs` (#8921) — `native: false` makes a kind OTLP-only, and
+/// its `otlp:` class names the signal — so adding a record kind never edits
+/// this function.
+pub(super) fn otlp_only_signal(record: &crate::telemetry::TelemetryRecord) -> Option<&'static str> {
+    if record.accepted_by_native_ingest() {
+        return None;
+    }
+    record.otlp_class().signal()
+}
+
+/// Existing native ingest accepts lifecycle records, never OTLP-only payloads
+/// ([`otlp_only_signal`]). Also strips the additive context fields for older
+/// native backend versions.
 pub(super) fn native_envelopes(
     envelopes: &[crate::telemetry::TelemetryEnvelope],
 ) -> Vec<crate::telemetry::TelemetryEnvelope> {
     envelopes
         .iter()
-        .filter(|e| !matches!(e.record, crate::telemetry::TelemetryRecord::Span(_)))
+        .filter(|e| otlp_only_signal(&e.record).is_none())
         .cloned()
         .map(|mut envelope| {
             envelope.trace_context = None;

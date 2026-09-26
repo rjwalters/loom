@@ -84,6 +84,11 @@ redacts each `activeSweeps` entry per the visibility policy above and empties
         "record": { "kind": "tokens.snapshot", "...": "..." },
         "updatedAt": "2026-07-30T12:00:00Z",
         "freshness": { "status": "live", "ageSeconds": 42 }
+      },
+      "queue": {
+        "record": { "kind": "queue.snapshot", "tick_at": "2026-07-30T11:59:40Z", "seen": 3, "counts": { "running": 1, "ready": 1, "blocked": 1 }, "rows": ["..."], "...": "..." },
+        "updatedAt": "2026-07-30T12:00:00Z",
+        "freshness": { "status": "live", "ageSeconds": 42 }
       }
     }
   },
@@ -127,6 +132,15 @@ than ever appearing here — see `src/fleetState.ts`'s `classifyFreshness`/
 `PRUNE_AFTER_MS`. Both the SSR `/` fallback page (`src/publicPage.ts`) and
 any consumer of this route should treat a `stale`/`offline` sample's
 numbers as historical, never as current.
+
+**`queue`** (issue #8852, phase 3) is the host's newest `queue.snapshot` — its
+work finder's ranked ready queue — normalized to the fields
+`.loom/docs/telemetry-schema.md` documents (anything else is dropped at
+ingest). Only a strictly newer `tick_at` replaces it, so a redelivered batch
+never refreshes `updatedAt`. Absent when the host has never sent one (a daemon
+older than #8852 phase 2, or its work finder is off); present with `seen: 0`
+and a `live` freshness when the queue is genuinely empty. `/public/fleet-state`
+redacts it per row on each row's own `visibility` (see `src/queueState.ts`).
 
 **`missingHosts`** (issue #8792) is present only when the deployment sets the
 `EXPECTED_HOSTS` var (see `deploy-runbook.md` → "Declaring the expected host
@@ -450,6 +464,20 @@ cancels its reader. `/public/events` pipes the same stream through a
 `TransformStream` that redacts each `data:` frame in place before it reaches
 the client (`src/redaction.ts`'s `redactLiveTailStream`) — the underlying
 poll loop and D1 query are identical to `/api/events`.
+
+## Cycle-time analytics live in the OTLP sinks, not here
+
+"What took long to ship, and where did the time go?" is answered against the
+OTLP destinations (ClickStack / SigNoz), not against this backend. The
+canonical question set, its definitions, and the standing queries are
+[`defaults/observability/cycle-time-questions.md`](../../defaults/observability/cycle-time-questions.md)
+and the two SQL artifacts beside it (Issue #8665).
+
+Why there and not here: this backend's D1 history store keeps the ingested
+record verbatim, but the durations question is a *rollup over months* of
+`sweep.outcome`'s `phase_durations`, which the OTLP sinks already receive and
+index for exactly that shape of query. Nothing about that analysis needs a new
+route, a new table, or a second copy of the data in D1.
 
 ## Not implemented here (later issues)
 

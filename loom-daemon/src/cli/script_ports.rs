@@ -49,6 +49,13 @@ pub(crate) enum ScriptPortCommand {
     /// 1 when none did — data, not an error.
     ReleaseResolve(super::release_resolve::ReleaseResolveArgs),
 
+    /// Why an already-resolved release has no artifact for a target (#8654):
+    /// the #8515 age + asset-count classification, for
+    /// `loom-daemon-update.sh`'s forced `--fetch` refusal. Exit 0 + one line
+    /// = the reason, 1 = the release does carry the artifact. Optional to its
+    /// caller — an older binary lacking it degrades to the flat reason.
+    ReleaseExplain(super::release_explain::ReleaseExplainArgs),
+
     /// `merge-pr.sh`'s verdict-label mutual-exclusion guard (#8112), the
     /// second slice of the merge-pr port (#8191). Exit 1 = contradictory,
     /// 0 = clean, 2 = the guard could not run — and 2 must refuse the merge.
@@ -80,6 +87,49 @@ pub(crate) enum ScriptPortCommand {
     /// `git reset --hard` once a capture has succeeded.
     #[command(subcommand)]
     WorktreeWip(super::worktree_wip::WorktreeWipCommand),
+
+    /// `worktree.sh remove <N>` (#8195, slice 3): the operator-facing
+    /// single-worktree removal verb, and the destructive half of that script —
+    /// `git worktree remove --force`, the #5177 `rm -rf` fallback, the #7239
+    /// cargo-target-dir reclaim and the squash-aware `git branch -D` all hang
+    /// off it. Exit 0 = removed or an idempotent no-op, 1 = refused (nothing
+    /// deleted) or the removal failed.
+    WorktreeRemove(super::worktree_remove::WorktreeRemoveArgs),
+
+    /// `worktree.sh`'s post-`git worktree add` symlink provisioning (#8195,
+    /// slice 4): root and nested `node_modules`, `worktree.linkPaths`,
+    /// `.mcp.json`, and the `info/exclude` entry each one needs so `git add
+    /// -A` cannot stage it (#3528/#5474). The part of the create path that is
+    /// all path interpolation — four `ln -s "$src" "$dst"` pairs and a
+    /// `find | read` loop — which is #7858's class. Exit 0 always: this is
+    /// best-effort by contract and the worktree already exists.
+    WorktreeLink(super::worktree_link::WorktreeLinkArgs),
+
+    /// `worktree.sh`'s crash-debris pre-flight (#8195, slice 5): the stale
+    /// `index.lock`/`HEAD.lock`/`gitdir.lock` sweep and the **orphan guard**
+    /// that `rm -rf`s an `issue-<N>` dir `git worktree list` does not know
+    /// about. The guard whose false answer deleted a LIVE worktree twice over
+    /// (#7858/#7849 — a porcelain path split on whitespace, and a candidate
+    /// resolved logically instead of physically). Exit 0 always: both shell
+    /// call sites already discard the status with `|| true`.
+    WorktreeCleanup(super::worktree_cleanup::WorktreeCleanupArgs),
+
+    /// `lib/worktree-race-rescue.sh`'s `loom_worktree_reset_or_rescue` (#8195,
+    /// slice 6): the guard in front of `worktree.sh`'s stale-worktree
+    /// `git reset --hard` — refuse while a live process holds the worktree
+    /// (#7463), refuse when it gained commits, and capture foreign uncommitted
+    /// tracked changes to a `.snapshots/` patch before resetting rather than
+    /// discarding them (#6706/#6334, the #6320 incident). Exit 0 = reset,
+    /// 1 = refused and nothing changed, 2 = the reset itself failed.
+    WorktreeReset(super::worktree_reset::WorktreeResetArgs),
+
+    /// `worktree.sh`'s `_handle_feature_branch_in_main_worktree` (#8195 slice
+    /// 7): the recovery `_try_worktree_add` falls into when `git worktree
+    /// add` refuses because the target branch is already checked out in the
+    /// main workspace. The one arm of the create path that is pure string
+    /// parsing of an arbitrary git error message — #7858's class again. Exit
+    /// 0 = handled (no retry), 1 = not this error, 2 = auto-recovered, retry.
+    WorktreeBranchConflict(super::worktree_branch_conflict::WorktreeBranchConflictArgs),
 
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
@@ -156,6 +206,34 @@ pub(crate) enum ScriptPortCommand {
     /// citation as a miss — on a script that BLOCKS FILING. Ported out of the
     /// `contract`-category script per the shell language policy.
     GitBlobLines(super::git_blob_lines::GitBlobLinesArgs),
+
+    /// The fleet singleton-job captain gate (#8848), shell-facing half: is
+    /// THIS host the one declared to run `<job-name>`? Exit 0 arm, 3 another
+    /// host is the captain, 4 no `fleet.captain` declared at all — three
+    /// codes, not two, so a never-declared/typo'd captain is distinguishable
+    /// from a routine "not my turn" instead of silently leaving every
+    /// singleton unarmed fleet-wide. Replaces the fail-closed host gate each
+    /// singleton's schedule wrapper used to hand-roll. Not a port: brand-new
+    /// logic, native from the start per the shell-language policy.
+    FleetCaptain(super::fleet_captain_cmd::FleetCaptainArgs),
+
+    /// The per-role tool-restriction allowlist (#8322, for #8256), shell-facing
+    /// half: the `--disallowedTools` spec list `spawn-claude.sh` injects, and
+    /// the "is this role restricted" predicate `spawn-codex.sh` needs to warn
+    /// that the guard hook is the ONLY enforcement on its path. Ported out of
+    /// both `contract`-category scripts because inlining it there is exactly
+    /// the portable-shell growth `shell-budget --check` refuses. Exit 0 =
+    /// a restriction applies, 1 = none does — an answer, not an error, landing
+    /// on the same no-op branch as an unavailable binary.
+    #[command(subcommand)]
+    RoleToolPolicy(super::role_tool_policy::RoleToolPolicyCommand),
+
+    /// Tier-3 "generic passthrough" launch-shape resolution (#8671): reads a
+    /// runtime capability manifest's `launch` object and renders it as
+    /// eval-ready shell defaults. Backs `spawn-generic-launch.sh`. Exit 0
+    /// resolved, 1 no manifest reachable (soft), 78 (`EX_CONFIG`) malformed
+    /// manifest or an unrecognized `launch` key.
+    RuntimeLaunchEnv(super::runtime_launch_cmd::RuntimeLaunchEnvArgs),
 }
 
 impl ScriptPortCommand {
@@ -170,11 +248,17 @@ impl ScriptPortCommand {
             ScriptPortCommand::DepRecheckFingerprint(cmd) => cmd.run(),
             ScriptPortCommand::ReleaseFetch(args) => args.run(),
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
+            ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeWip(cmd) => cmd.run(),
+            ScriptPortCommand::WorktreeRemove(args) => args.run(),
+            ScriptPortCommand::WorktreeLink(args) => args.run(),
+            ScriptPortCommand::WorktreeCleanup(args) => args.run(),
+            ScriptPortCommand::WorktreeReset(args) => args.run(),
+            ScriptPortCommand::WorktreeBranchConflict(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
@@ -185,6 +269,9 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReconcileStack(args) => args.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
+            ScriptPortCommand::FleetCaptain(args) => args.run(),
+            ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
+            ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
         }
     }
 }
@@ -209,14 +296,30 @@ pub(crate) enum MergePrCommand {
     /// head move (re-queue), 2 = attribution undeterminable (also re-queue).
     HeadSyncRetry(super::merge_pr_head_sync::HeadSyncRetryArgs),
 
-    /// The automated remedy for a merge the #8248 freshness guard blocked
-    /// (#8508): push a tree-identical no-op commit so CI re-runs and re-dates
-    /// every check, since the merge token lacks `actions:write` to re-run the
-    /// stale one directly. Exit 0 = pushed, 3 = branch already moved (not a
-    /// failure, re-evaluate fresh), 4 = remedy already spent on this head, so
-    /// the PR was escalated to a durable `loom:operator` hold, 1 = could not
-    /// read/write forge state.
+    /// The automated remedy for a merge the #8248 freshness guard blocked:
+    /// first re-run the workflow runs holding the stale required checks IN
+    /// PLACE (#8914, needs Actions: write; no commit, verdict kept), else push
+    /// a tree-identical no-op commit so CI re-dates every check (#8508).
+    /// Exit 5 = re-ran in place and fresh (only with --allow-proceed), 0 =
+    /// re-running in place / fresh without opt-in / pushed (re-queue), 3 =
+    /// head already moved (not a failure, re-evaluate fresh), 4 = push remedy
+    /// already spent on this head, so the PR was escalated to a durable
+    /// `loom:operator` hold, 1 = could not produce fresh evidence.
     RedateChecks(super::merge_pr_redate::RedateChecksArgs),
+
+    /// The pre-merge `loom:pr` review-signal guard (#7419): refuse a merge
+    /// whose current head does not carry `loom:pr`, unless
+    /// `--allow-unapproved` asserts responsibility. Exit 0 = present or
+    /// overridden (see stdout for which), 1 = absent with no override.
+    LoomPrGuard(super::merge_pr_loom_pr_guard::LoomPrGuardArgs),
+
+    /// `_maybe_delete_local_branch` (#4100/#5015/#7812): the squash-aware
+    /// local-branch delete rule, now shared verbatim with `worktree.sh
+    /// remove` (#8195 slice 3) instead of duplicated. Always exits 0 — a
+    /// branch that could not be deleted is a `WARNING` line, not a failure —
+    /// and prints one `LEVEL<TAB>message` line per decision for the caller to
+    /// replay through its own logging (see `cli::merge_pr_delete_branch`).
+    DeleteBranch(super::merge_pr_delete_branch::DeleteBranchArgs),
 }
 
 impl MergePrCommand {
@@ -226,6 +329,8 @@ impl MergePrCommand {
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
+            MergePrCommand::LoomPrGuard(args) => args.run(),
+            MergePrCommand::DeleteBranch(args) => args.run(),
         }
     }
 }

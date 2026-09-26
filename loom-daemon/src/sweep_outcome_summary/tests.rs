@@ -42,6 +42,7 @@ fn record(
         runtime: None,
         provider: None,
         profile: None,
+        complexity: None,
     }
 }
 
@@ -97,7 +98,7 @@ impl MergeLookup for ForgeDown {
 }
 
 #[test]
-fn group_by_parses_the_six_documented_dimensions() {
+fn group_by_parses_the_eight_documented_dimensions() {
     for (spec, expected) in [
         ("arm", GroupBy::Arm),
         ("MODEL", GroupBy::Model),
@@ -105,6 +106,8 @@ fn group_by_parses_the_six_documented_dimensions() {
         ("host", GroupBy::Host),
         ("Day", GroupBy::Day),
         ("tap", GroupBy::Tap),
+        ("complexity", GroupBy::Complexity),
+        ("Model-Complexity", GroupBy::ModelComplexity),
     ] {
         assert_eq!(GroupBy::parse(spec).unwrap(), expected);
     }
@@ -1075,3 +1078,9 @@ fn rendered_text_names_the_card_and_the_relationship_to_the_old_summary() {
     assert!(text.contains("inferred"));
     assert!(text.contains("superset"));
 }
+
+#[cfg(test)]
+mod complexity_tests;
+
+#[cfg(test)]
+mod agreement_tests;

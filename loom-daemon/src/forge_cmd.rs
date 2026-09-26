@@ -9,10 +9,16 @@
 //!
 //! - `forge issue <args…>` / `forge pr <args…>` / `forge auth <args…>` — the
 //!   read/query surface (`issue list/view`, `pr list`, `auth status`).
-//! - `forge auto-merge <pr> [--method …]` — the merge path behind
-//!   `merge-pr.sh` (formerly `loom-auto-merge`).
+//! - `forge auto-merge <pr> [--method …]` — arms GitHub's server-side
+//!   auto-merge (formerly `loom-auto-merge`). **Operator-only since
+//!   #8410/#8427**: `merge-pr.sh` no longer calls it (an armed merge is gated
+//!   only by the ruleset's required checks and never re-reads `loom:pr` or the
+//!   non-required suites — PR #8220). Kept as a CLI compatibility surface for
+//!   installed pre-#8410 `merge-pr.sh` copies and as a deliberate human
+//!   escape hatch; the caveat is in its `--help`. Do NOT wire it back into a
+//!   Loom merge path.
 //! - `forge merge-method --repo <nwo> [--requested …]` — resolve/validate the
-//!   merge method `merge-pr.sh` passes to the two call sites above (#8845).
+//!   merge method `merge-pr.sh` passes to `forge_merge_pr` (#8845).
 //!
 //! # NOT a cache — the passthrough burns full GraphQL (#5056)
 //!
@@ -37,16 +43,17 @@
 //!   deliberate — the passthrough contract is that `forge issue X` behaves
 //!   identically to `gh issue X` — so it emits an advisory stderr notice
 //!   pointing at `.loom/scripts/create-issue.sh`, which does have the fallback;
-//! - `auto-merge` enables GitHub's native auto-merge via the
-//!   `enablePullRequestAutoMerge` GraphQL mutation (a pure API call with no
+//! - `auto-merge` (operator-only, see above) enables GitHub's native
+//!   auto-merge via the `enablePullRequestAutoMerge` GraphQL mutation (a pure API call with no
 //!   working-tree checkout — the reason `gh pr merge --auto` is avoided from
 //!   inside a worktree, ported verbatim from `common/github.py`).
 //!
 //! For **Gitea** the subcommands *decline* with [`EX_FORGE_DECLINED`] so the
-//! caller's existing shell fallback carries the poll-and-merge / query path:
-//! `merge-pr.sh`'s `forge_auto_merge` (in `lib/forge-helpers.sh`) already
-//! implements the identical Gitea curl poll-and-merge, and the read scripts
-//! degrade to `gh`. This keeps the daemon's zero-HTTP-client house style
+//! caller's existing shell fallback carries the query path (the read scripts
+//! degrade to `gh`). `auto-merge` has no Gitea implementation at all: the
+//! shell `forge_auto_merge` Gitea poll-and-merge it used to decline to was
+//! retired by #8427, and a pre-#8410 installed `merge-pr.sh` still carries
+//! its own copy in its own `lib/forge-helpers.sh`. This keeps the daemon's zero-HTTP-client house style
 //! intact. The #4061 config-precedence + Gitea hard-fail semantics are still
 //! ported and unit-tested here (they gate whether the Gitea path is taken).
 //!
@@ -452,7 +459,7 @@ fn gh_passthrough(entity: &str, args: &[String]) -> Result<()> {
 /// The `poll_interval` / `timeout` args are accepted for CLI compatibility but
 /// ignored on GitHub (the server queues the merge).
 ///
-/// `expected_head_sha` (optional, #5589 — mirrors the shell
+/// `expected_head_sha` (optional, #5589 — mirrors the since-retired shell
 /// `forge_auto_merge`'s `EXPECTED_HEAD_SHA` precondition added by #5579):
 /// when present, threaded into the mutation's `expectedHeadOid: GitObjectID`
 /// input field, GitHub's optimistic-concurrency guard against merging a head
@@ -671,21 +678,21 @@ pub(crate) fn parse_nwo_from_remote_url(url: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// Handle `loom-daemon forge auto-merge`. GitHub goes native (GraphQL); Gitea
-/// declines with [`EX_FORGE_DECLINED`] so the shell `forge_auto_merge` carries
-/// the poll-and-merge. `expected_head_sha` is forwarded to
-/// [`github_auto_merge`] (ignored on the Gitea decline path — Gitea always
-/// falls back to the shell `forge_auto_merge`, which already carries its own
-/// `EXPECTED_HEAD_SHA` precondition, #5579). Never returns (exits the
-/// process).
+/// Handle `loom-daemon forge auto-merge` (operator-only since #8410/#8427 —
+/// no Loom merge path calls it). GitHub goes native (GraphQL); Gitea declines
+/// with [`EX_FORGE_DECLINED`] — the exit code a pre-#8410 installed
+/// `merge-pr.sh` still keys its own shell fallback on, so it must not change.
+/// `expected_head_sha` is forwarded to [`github_auto_merge`] (ignored on the
+/// Gitea decline path). Never returns (exits the process).
 pub fn handle_auto_merge(pr: u32, method: &str, expected_head_sha: Option<&str>) -> Result<()> {
     let ft = detect_forge(None);
     match ft {
         ForgeType::GitHub => std::process::exit(github_auto_merge(pr, method, expected_head_sha)),
         ForgeType::Gitea => {
             eprintln!(
-                "loom-daemon forge auto-merge: gitea is not handled natively; falling \
-                 back to the caller's shell poll-and-merge"
+                "loom-daemon forge auto-merge: gitea is not handled natively (no \
+                 server-side arm); use merge-pr.sh --auto, which waits for checks \
+                 and merges in-process"
             );
             std::process::exit(EX_FORGE_DECLINED);
         }
@@ -717,6 +724,8 @@ pub enum ForgeCmd {
     /// contract.
     CheckOpenPr { issue: u32 },
     /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]`.
+    /// Operator-only (#8427): arms a server-side merge that bypasses Loom's
+    /// merge-time gates; never dispatched from a Loom merge path.
     AutoMerge {
         pr: u32,
         method: String,
@@ -726,9 +735,24 @@ pub enum ForgeCmd {
         /// (unguarded) behavior.
         expected_head_sha: Option<String>,
     },
+    /// `forge disable-auto-merge <pr>` (#8900) — disarm GitHub's server-side
+    /// auto-merge queue. The inverse of [`ForgeCmd::AutoMerge`] and, unlike
+    /// it, **not** operator-only: it can only turn a queued merge off, never
+    /// on. Implemented in
+    /// [`crate::forge_disable_auto_merge::handle_disable_auto_merge`].
+    ///
+    /// `audit_comment` additionally records what the disarm did as a PR comment
+    /// (nothing is posted when nothing was armed); `hold` is the explicit-hold
+    /// label the caller found on the PR, which only shapes that comment's
+    /// wording. `verdict-staleness-guard.sh --clear` passes both.
+    DisableAutoMerge {
+        pr: u32,
+        audit_comment: bool,
+        hold: Option<String>,
+    },
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should pass
-    /// to `forge_merge_pr`/`forge auto-merge`. See
+    /// to `forge_merge_pr`. See
     /// [`crate::forge_merge_method::handle_merge_method`].
     MergeMethod {
         repo: String,
@@ -760,6 +784,15 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
             method,
             expected_head_sha,
         } => handle_auto_merge(pr, &method, expected_head_sha.as_deref()),
+        ForgeCmd::DisableAutoMerge {
+            pr,
+            audit_comment,
+            hold,
+        } => crate::forge_disable_auto_merge::handle_disable_auto_merge(
+            pr,
+            audit_comment,
+            hold.as_deref(),
+        ),
         ForgeCmd::MergeMethod { repo, requested } => {
             crate::forge_merge_method::handle_merge_method(&repo, requested.as_deref())
         }

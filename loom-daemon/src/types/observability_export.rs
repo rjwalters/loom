@@ -120,6 +120,38 @@ pub struct ObservabilityExportStatus {
     /// does not false-alarm as never-exported. `None` when not running.
     #[serde(default)]
     pub flush_interval_secs: Option<u64>,
+    /// **How far down the delivery path [`Self::state`] is evidence for**
+    /// (Issue #9015). Always [`ObservabilityExportScope::FirstHop`] today: the
+    /// daemon observes exactly one thing, whether
+    /// [`Self::endpoint`] acked the batch it POSTed. Nothing past that hop is
+    /// visible from here, so `healthy` must never be read as "the data is in
+    /// the backend".
+    ///
+    /// Carried as data rather than left to the docs because the docs were
+    /// already correct and it did not help: the 2026-09-24 incident ran 30h+
+    /// with `state: healthy`, `rejected: 0`, `dropped: 0` while the local edge
+    /// collector logged ~6,755 `Exporting failed. Dropping data.` lines. A
+    /// machine consumer that never reads prose can read this.
+    ///
+    /// `#[serde(default)]` ⇒ `first_hop` for a pre-#9015 payload, which is
+    /// truthful: first-hop acknowledgement is all any Loom daemon has ever
+    /// measured.
+    #[serde(default)]
+    pub scope: ObservabilityExportScope,
+    /// Whether [`Self::endpoint`] is on this machine — see
+    /// [`crate::observability::endpoint_policy::is_loopback_endpoint`]. `true`
+    /// means the one hop this daemon verifies is a **local collector**, so
+    /// downstream delivery to the real backend is entirely unverified and an
+    /// external end-to-end check is required.
+    ///
+    /// Derived from [`Self::endpoint`], never configured: it is refreshed by
+    /// [`Self::refresh_endpoint_scope`] at every point a status cell is built
+    /// or snapshotted, so the wire value cannot drift from the endpoint beside
+    /// it. Consumers that must be right even against an older payload (the
+    /// `status` renderers) call [`Self::endpoint_is_loopback`] instead of
+    /// trusting this flag.
+    #[serde(default)]
+    pub endpoint_loopback: bool,
 }
 
 /// Floor on the never-exported grace window — a fresh exporter is never called
@@ -153,12 +185,34 @@ impl ObservabilityExportStatus {
     /// the offending path and the underlying error (never the key itself).
     #[must_use]
     pub fn misconfigured(endpoint: Option<String>, detail: String) -> Self {
-        Self {
+        let mut status = Self {
             state: ObservabilityExportState::Misconfigured,
             endpoint,
             last_failure_detail: Some(detail),
             ..Self::default()
-        }
+        };
+        status.refresh_endpoint_scope();
+        status
+    }
+
+    /// Whether [`Self::endpoint`] is a host on this machine — the derivation
+    /// rule behind [`Self::endpoint_loopback`], exposed so a consumer reading
+    /// a payload from an *older* daemon (which carries no flag) still gets the
+    /// right answer. Pure string classification; no endpoint ⇒ `false`.
+    #[must_use]
+    pub fn endpoint_is_loopback(&self) -> bool {
+        self.endpoint.as_deref().is_some_and(|endpoint| {
+            crate::observability::endpoint_policy::is_loopback_endpoint(endpoint)
+        })
+    }
+
+    /// Re-derive the #9015 scope fields from the endpoint recorded beside them.
+    /// Called wherever a status cell is constructed or snapshotted
+    /// ([`crate::observability::ExportStatus`]) so the published flag and the
+    /// published endpoint can never disagree.
+    pub fn refresh_endpoint_scope(&mut self) {
+        self.scope = ObservabilityExportScope::FirstHop;
+        self.endpoint_loopback = self.endpoint_is_loopback();
     }
 
     /// How long a freshly-started exporter is given before a still-empty
@@ -300,6 +354,33 @@ pub enum ObservabilityExportState {
     Failing,
     /// A state name this build does not know — a newer daemon reporting to an
     /// older client. Never produced by [`ObservabilityExportStatus::classify`].
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// How far along the delivery path an [`ObservabilityExportStatus::state`] is
+/// evidence for (Issue #9015).
+///
+/// One variant is produced today, and that is the point: every state this
+/// daemon publishes is a statement about the **first hop only**, so the wire
+/// payload says so rather than leaving the reader to assume otherwise. A second
+/// variant (a verified read-back from the backend) is deliberately *not*
+/// invented here — the annotation has to be honest about today's measurement
+/// before any downstream probe exists to widen it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservabilityExportScope {
+    /// The state reflects only the daemon → [`ObservabilityExportStatus::endpoint`]
+    /// hop: that endpoint accepted (or rejected) the batches this daemon POSTed.
+    /// When the endpoint is a collector that forwards onward — see
+    /// [`ObservabilityExportStatus::endpoint_loopback`] — delivery past it is
+    /// **not** measured here and needs an independent end-to-end check
+    /// (a backend read-back, or the collector's own
+    /// `otelcol_exporter_send_failed_*` counters).
+    #[default]
+    FirstHop,
+    /// A scope name this build does not know — a newer daemon reporting to an
+    /// older client. Never produced by this build.
     #[serde(other)]
     Unrecognized,
 }

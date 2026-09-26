@@ -8,6 +8,11 @@ use super::artifact_verdict::compare_versions;
 // so this file, already over `.loom/docs/file-size-policy.md`'s threshold,
 // does not grow to hold it. It reuses the fixtures below via `use super::*`.
 mod stale_repo;
+// `IpcDrainTrigger`'s test needs these directly since #8514 moved the trigger
+// itself (and with it the parent's `EventBus`/`DrainState` imports) to the
+// `drain_trigger` sibling.
+use crate::event_bus::EventBus;
+use crate::ipc::DrainState;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -80,7 +85,7 @@ fn test_config_reads_all_fields() {
     let tmp = tempfile::tempdir().unwrap();
     write_config(
         tmp.path(),
-        r#"{"autonomous": {"autoUpdate": {"enabled": true, "intervalSecs": 120, "settleSecs": 30, "deferDeadlineSecs": 7200}}}"#,
+        r#"{"autonomous": {"autoUpdate": {"enabled": true, "intervalSecs": 120, "settleSecs": 30, "deferDeadlineSecs": 7200, "rollStallDeadlines": 5}}}"#,
     );
     assert_eq!(
         read_auto_update_config(tmp.path()),
@@ -89,6 +94,7 @@ fn test_config_reads_all_fields() {
             interval_secs: Some(120),
             settle_secs: Some(30),
             defer_deadline_secs: Some(7200),
+            roll_stall_deadlines: Some(5),
         }
     );
 }
@@ -202,6 +208,7 @@ fn test_resolve_interval_and_settle_precedence() {
         interval_secs: Some(300),
         settle_secs: Some(45),
         defer_deadline_secs: None,
+        roll_stall_deadlines: None,
     };
     assert_eq!(resolve_interval(&cfg), Duration::from_secs(300));
     assert_eq!(resolve_settle(&cfg), Duration::from_secs(45));
@@ -804,58 +811,6 @@ fn test_run_tick_staleness_lag_does_not_affect_decide_gates() {
     assert_eq!(trigger_calls.load(Ordering::SeqCst), 1);
 }
 
-/// Issue #6007 — while a roll is already armed (in particular one *retained*
-/// across a refused deadline: dispatch paused, restart re-arming itself at
-/// quiescence) the loop must not rebuild or re-trigger. The binary is already
-/// provisioned, and a redundant `cargo build` would compete for CPU with the
-/// very in-flight sweeps the pending roll is waiting on.
-#[test]
-fn test_run_tick_skips_while_a_roll_is_already_armed() {
-    struct PendingRollTrigger {
-        calls: Arc<AtomicUsize>,
-    }
-    impl DrainTrigger for PendingRollTrigger {
-        fn trigger(&self) -> bool {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            true
-        }
-        fn roll_in_progress(&self) -> bool {
-            true
-        }
-    }
-
-    let rebuild_calls = Arc::new(AtomicUsize::new(0));
-    let trigger_calls = Arc::new(AtomicUsize::new(0));
-    let mut probe = FakeProbe {
-        check: stale("c1"),
-        tree_clean: Some(true),
-        dirty_paths: Vec::new(),
-        // Busy host — exactly the shape that made the roll go pending.
-        in_flight: 3,
-        rebuild_outcome: RebuildOutcome::Success,
-        rebuild_calls: rebuild_calls.clone(),
-        low_priority_calls: Arc::new(AtomicUsize::new(0)),
-    };
-    let trigger = PendingRollTrigger {
-        calls: trigger_calls.clone(),
-    };
-    let status = AutoUpdateStatus::new(true);
-    let mut state = AutoUpdateState::new();
-
-    run_tick(&mut state, &status, &mut probe, &trigger, Duration::from_secs(0), DEFER);
-
-    assert_eq!(rebuild_calls.load(Ordering::SeqCst), 0, "no redundant rebuild");
-    assert_eq!(trigger_calls.load(Ordering::SeqCst), 0, "no redundant drain trigger");
-    let snap = status.snapshot();
-    assert!(
-        snap.note
-            .as_deref()
-            .is_some_and(|n| n.contains("already armed")),
-        "the skip must be explained in status, got: {:?}",
-        snap.note
-    );
-}
-
 #[test]
 fn test_run_tick_none_never_rebuilds() {
     let rebuild_calls = Arc::new(AtomicUsize::new(0));
@@ -1127,6 +1082,12 @@ fn test_global_status_defaults_when_unset() {
 /// only. A sibling file (this one is over the file-size ratchet threshold); it
 /// reuses the fixtures below via `use super::*`.
 mod in_flight_gate;
+// Supersede-not-stack coverage (#8514) — its own child module so this file,
+// already over `.loom/docs/file-size-policy.md`'s threshold, does not grow to
+// hold it. Reuses the fixtures above via `use super::*`.
+mod supersede_tick;
+// Unsatisfiable-drain detection (#8998) — same reason, same fixtures.
+mod roll_stall;
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

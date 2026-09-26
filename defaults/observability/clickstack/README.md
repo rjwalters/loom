@@ -200,6 +200,38 @@ invocation and exporting it through the same collector. It requires a real
 #8525 itself is waiting on for its own acceptance evidence — and is a paid,
 rate-limited call; do not run it without that authorization.
 
+## Cycle-time analytics (Issue #8665)
+
+The saved views above answer "what is happening now". The standing answer to
+"what took long to ship, and where did the time go?" is a separate, committed
+artifact set rooted at [`../cycle-time-questions.md`](../cycle-time-questions.md)
+— eight canonical questions (CT1–CT8), with definitions, backed by SQL rather
+than by a UI export.
+
+Install it here once, after the sources exist:
+
+```console
+docker compose --env-file /absolute/private/clickstack.env exec -T clickstack \
+  clickhouse-client --multiquery < cycle-time-extract.sql
+docker compose --env-file /absolute/private/clickstack.env exec -T clickstack \
+  clickhouse-client --param_since='2026-09-15 00:00:00' \
+    --param_until='2026-09-22 00:00:00' --queries-file ../cycle-time-rollup.sql
+```
+
+`cycle-time-extract.sql` is the only backend-specific piece: it maps this
+deployment's `default.otel_logs` rows onto the normalized ship columns. The
+durable table, its hourly refresh and all eight questions are shared with
+SigNoz, so both backends answer from one definition.
+
+**This is also the answer to the seven-day TTL below.** Rather than raising
+`HYPERDX_OTEL_EXPORTER_TABLES_TTL` — which does not migrate existing tables and
+would apply to the trace tables too — the rollup keeps one row per shipped sweep
+for 400 days in its own `loom_analytics` database. The reasoning, the rejected
+alternative, and the drift-reconciliation query (CT8) are in the questions doc.
+`loom-daemon/tests/cycle_time_clickhouse.rs` executes the committed artifacts
+against a real pinned ClickHouse in CI, including the case where every raw row
+has expired.
+
 ## Retention, persistence and key rotation
 
 The collector table TTL defaults to `168h` through

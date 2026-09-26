@@ -94,6 +94,14 @@ jobs:
             backend:
               - 'loom-daemon/**'
               - 'loom-api/**'
+              # The observability artifacts are Rust-tested seams, not inert
+              # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs
+              # and cycle_time_artifacts.rs all `include_str!` these files and
+              # fail on drift, and cycle_time_clickhouse.rs executes the SQL
+              # verbatim against a real ClickHouse. An artifact-only PR must
+              # re-run those, or the only tests that can catch the regression
+              # are skipped on exactly the PRs that cause one (#8665).
+              - 'defaults/observability/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
@@ -214,6 +222,12 @@ jobs:
         run: cargo nextest run --package loom-daemon --features otlp --profile ci
       - name: Verify OTLP with a real pinned Collector
         run: cargo test --package loom-daemon --features otlp --test otlp_collector -- --ignored --nocapture
+      # #8665: executes the committed cycle-time SQL verbatim against a real
+      # pinned ClickHouse, on rows written by the real ClickHouse exporter.
+      # Static contract checks cannot see how a nested attribute is serialized,
+      # nor whether the rollup still answers once the raw rows expire.
+      - name: Verify the cycle-time artifacts against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test cycle_time_clickhouse -- --ignored --nocapture
 
   mcp-build:
     name: MCP Server Build
@@ -1122,6 +1136,8 @@ jobs:
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
       - name: merge-pr verdict-label contradiction guard (#8112, #8191 slice 2)
         run: bash defaults/scripts/tests/test-merge-pr-verdict-label-guard.sh
+      - name: merge-pr loom:pr review-signal guard (#7419, #8191 slice)
+        run: bash defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh
       - name: merge-pr PR-label fetch freshness (#8550)
         run: bash defaults/scripts/tests/test-merge-pr-label-freshness.sh
       - name: merge-pr stale required-checks guard (#8248, #8191 slice 3)
@@ -1130,6 +1146,8 @@ jobs:
         run: bash defaults/scripts/tests/test-merge-pr-head-sync-retry.sh
       - name: merge-pr stale-check re-date remedy (#8508)
         run: bash defaults/scripts/tests/test-merge-pr-stale-check-redate.sh
+      - name: merge-pr --auto blocked settle + re-validate (#8410)
+        run: bash defaults/scripts/tests/test-merge-pr-auto-blocked-settle.sh
       # Split out of test-loom-daemon-update.sh by #7977: these assertions
       # now drive `loom-daemon release-resolve` through the stub's delegation,
       # so they need the binary this job builds. The parent suite stays in
@@ -1150,6 +1168,11 @@ jobs:
       # they need the binary this job builds.
       - name: loom-daemon-update post-provision signature check (#8008, #8770)
         run: bash defaults/scripts/tests/test-loom-daemon-update-dest-signature.sh
+      # #8654: the forced --fetch refusal classifies a missing artifact via
+      # `loom-daemon release-explain` (still uploading vs genuinely unbuilt)
+      # and degrades to the flat reason without it, so it needs this build.
+      - name: loom-daemon-update --fetch refusal classification (#8654)
+        run: bash defaults/scripts/tests/test-loom-daemon-update-fetch-refusal.sh
       # #8712: the fixture library is the subject, not any one flow. A fake
       # loom-daemon from lib/daemon-update-fixtures.sh that escapes to a real
       # loom-daemon/target/release/ stalled a fleet host's auto_update for
@@ -1271,6 +1294,12 @@ jobs:
         run: bash defaults/scripts/tests/test-loom-daemon-update.sh
       - name: generic runtime adapter through native worker dispatcher (#8362)
         run: bash defaults/scripts/tests/test-spawn-generic.sh
+      # #8671: spawn-generic-launch.sh resolves a tier-3 runtime's launch shape
+      # via `loom-daemon runtime-launch-env` before reaching spawn-generic.sh,
+      # so this suite needs the binary this job builds. It pins it via
+      # loom_test_require_daemon_bin and FAILS rather than skips without one.
+      - name: tier-3 manifest launch shape (#8671)
+        run: bash defaults/scripts/tests/test-spawn-generic-launch.sh
       # #8255: skip-labels.sh is a thin stub over `loom-daemon skip-labels`,
       # the shell-facing union of the fixed hard-exclusion list and a repo's
       # configured `autonomous.workFinder.extraSkipLabels` — needs the
@@ -1287,18 +1316,117 @@ jobs:
       # binary this job builds. Both pin it via loom_test_require_daemon_bin
       # and FAIL rather than skip without one.
       #
-      # Only these two of the 19 test-worktree-*.sh suites move. The other 17
-      # drive paths this slice did not touch and stay hermetic in
-      # shell-suite-tests, which is the point of porting one family at a time.
+      # Only these three of the 20 test-worktree-*.sh suites move. The other
+      # 17 drive paths this slice (or #8553 below) did not touch and stay
+      # hermetic in shell-suite-tests, which is the point of porting one
+      # family at a time.
       - name: worktree snapshot verb (#4778, ported in #8195)
         run: bash defaults/scripts/tests/test-worktree-snapshot.sh
       - name: worktree stash-push/stash-pop pair (#5217, #6076, ported in #8195)
         run: bash defaults/scripts/tests/test-worktree-stash-baseline.sh
+      # #8553: worktree.sh's new issue claim-lock cross-check delegates to
+      # `loom-daemon worktree-lock check-issue` (this file is frozen by the
+      # file-size ratchet, so the new guard's decision logic lives in Rust,
+      # not shell) — needs the binary this job builds.
+      - name: worktree issue claim-lock cross-check (#8553)
+        run: bash defaults/scripts/tests/test-worktree-issue-lock.sh
       # #8396: premise-check.sh is a thin stub over `loom-daemon
       # premise-check`, the gate Curator and the sweep orchestrator run before
       # enrichment — needs the binary this job builds.
       - name: premise gate exit-code contract (#8396)
         run: bash defaults/scripts/tests/test-premise-check.sh
+      # Moved out of shell-suite-tests by #8195 slice 3: `worktree.sh remove`
+      # is now a thin stub over `loom-daemon worktree-remove`, so these three
+      # suites' 80 assertions — unchanged from the shell implementation, and
+      # the equivalence evidence for deleting the whole ~480-line removal
+      # section plus two sourced libs — need the binary this job builds. All
+      # three pin it via loom_test_require_daemon_bin and FAIL rather than skip
+      # without one.
+      #
+      # (Running tally as of slice 4: four of the 19 test-worktree-*.sh suites
+      # were here — snapshot, stash-baseline, remove, nested-symlinks — plus
+      # the two non-`test-worktree-*` suites that drive `worktree.sh remove`.
+      # Slice 5 adds two more; see its own note below for the current split.
+      # The rest exercise create-path arms these slices did not touch and stay
+      # hermetic in shell-suite-tests — which is the whole point of porting one
+      # cohesive family at a time.)
+      - name: worktree remove verb (#3769, #4449, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-remove.sh
+      - name: worktree remove squash-aware branch delete (#4889, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-remove-squash-merge.sh
+      - name: cargo target-dir reclaim on worktree removal (#7239, ported in #8195)
+        run: bash defaults/scripts/tests/test-cargo-target-dir-reclaim.sh
+      # Moved out of shell-suite-tests by #8195 slice 4: worktree.sh's
+      # shared-artifact symlinking (root + nested node_modules, linkPaths,
+      # .mcp.json) and its .git/info/exclude bookkeeping are now
+      # `loom-daemon worktree-link`. The suite pins the binary via
+      # loom_test_require_daemon_bin and FAILS rather than skips without one.
+      - name: worktree shared-artifact symlinks (#3528, #5474, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-nested-symlinks.sh
+      # Moved out of shell-suite-tests by #8195 slice 5: worktree.sh's
+      # crash-debris pre-flight — the stale index/HEAD/gitdir.lock sweep and
+      # the ORPHAN GUARD that `rm -rf`s an unregistered issue-<N> dir — is now
+      # `loom-daemon worktree-cleanup`. Both suites below assert on that
+      # recovery actually happening, so without the binary it does not happen
+      # at all; both pin it via loom_test_require_daemon_bin and FAIL rather
+      # than skip.
+      #
+      # Seven of the 19 test-worktree-*.sh suites are now here (snapshot,
+      # stash-baseline, remove, nested-symlinks, orphan-guard-spaces,
+      # concurrency and — since slice 6 — race-rescue) plus the two
+      # non-`test-worktree-*` suites that drive `worktree.sh remove`. The
+      # remaining 12 exercise create-path arms these slices did not touch and
+      # stay hermetic in shell-suite-tests.
+      - name: worktree orphan guard, space + symlink paths (#7849, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-orphan-guard-spaces.sh
+      - name: worktree concurrency lock + partial-state cleanup (#3380, #6014, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-concurrency.sh
+      # Moved out of shell-suite-tests by #8195 slice 6: lib/worktree-race-rescue.sh
+      # is now a thin wrapper over `loom-daemon worktree-reset`, so all 25 of
+      # this suite's assertions — written against the shell in #6334/#7463 and
+      # unchanged since — drive the Rust port. It pins the binary via
+      # loom_test_require_daemon_bin and FAILS rather than skips without one:
+      # every reset case it asserts SUCCEEDS would otherwise be refused by the
+      # wrapper's own no-binary fallback, which is a correct degradation but not
+      # the thing this suite exists to measure.
+      - name: worktree race rescue on a stale-worktree reset (#6334, #7463, ported in #8195)
+        run: bash defaults/scripts/tests/test-worktree-race-rescue.sh
+      # Moved out of shell-suite-tests by #8195 slice 7: `_handle_feature_branch_
+      # in_main_worktree` is now `loom-daemon worktree-branch-conflict`. Its
+      # Test 3 ("auto-recovery retry path") asserts the create path SUCCEEDS
+      # after auto-switching the main workspace back to the default branch —
+      # unlike slice 4/5's best-effort links/cleanup, that success requires the
+      # recovery to actually run. The no-binary fallback here is a correct
+      # DEGRADATION (recovery_code=1, reporting git's own raw error, exactly
+      # what happened before this guard existed) but is not the thing this test
+      # exists to measure, so the suite pins the binary via
+      # loom_test_require_daemon_bin and FAILS rather than skips without one —
+      # same reasoning as race-rescue just above. Ten of the 20
+      # test-worktree-*.sh suites now run here (nine moved by a port slice,
+      # plus test-worktree-issue-lock.sh, which was daemon-driven from the
+      # start); the remaining ten exercise create-path arms these slices did
+      # not touch and stay hermetic in shell-suite-tests.
+      - name: worktree branch-conflict auto-recovery (ported in #8195 slice 7)
+        run: bash defaults/scripts/tests/test-worktree-json-purity.sh
+      # Moved out of shell-suite-tests by #8191's delete-branch slice:
+      # merge-pr.sh's `_maybe_delete_local_branch` now delegates to
+      # `loom-daemon merge-pr delete-branch` (the same branch_delete rule
+      # `worktree.sh remove` uses), so every suite that drives merge-pr.sh's
+      # post-merge cleanup — or, like cleanup-branches' review-branch pass,
+      # sources that function — needs the binary this job builds. All six pin
+      # it via loom_test_require_daemon_bin and FAIL rather than skip without one.
+      - name: merge-pr local-branch cleanup (#4100, #5015, ported in #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-local-branch-cleanup.sh
+      - name: merge-pr dirty-worktree guard (#5031, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-dirty-worktree-guard.sh
+      - name: merge-pr primary-checkout advice (#4171, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-primary-checkout-advice.sh
+      - name: merge-pr primary-worktree guard (#3710, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-primary-worktree-guard.sh
+      - name: merge-pr worktree-remove diagnosis (#6372, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-worktree-remove-diagnosis.sh
+      - name: cleanup-branches pr-* review-branch pass (#4405, #8191)
+        run: bash defaults/scripts/tests/test-cleanup-branches-pr-review-branch.sh
 
   installer-tests:
     name: Installer Integration Tests

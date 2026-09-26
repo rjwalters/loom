@@ -40,9 +40,26 @@
 //! weakening the guard itself — bounded to one attempt per head, after which
 //! the PR is escalated to a durable `loom:operator` hold rather than pushed
 //! at forever.
+//!
+//! #8914's in-place re-run once ran before [`redate`], on the theory that
+//! re-running a workflow run keeps the head SHA and with it the Judge verdict.
+//! It was **removed in #8919**: GitHub replays a run against the ORIGINAL
+//! `GITHUB_SHA`, which for a `pull_request` run is the test merge commit built
+//! on the base already tested, so an in-place re-run re-dates the evidence
+//! without re-validating anything. Only a new `pull_request` event rebuilds the
+//! merge commit against the current base — which is exactly what [`redate`]'s
+//! tree-identical push produces.
+//!
+//! [`loom_pr_guard`] is the pre-merge `loom:pr` review-signal guard (#7419)
+//! — the OTHER half of the verdict-label story [`labels`] tells: this one
+//! fires on `loom:pr`'s ABSENCE ("nobody reviewed this head") rather than a
+//! contradiction beside a present approval, and carries the only override
+//! flag in the family (`--allow-unapproved`) because "nobody reviewed it" and
+//! "a reviewer said no" are different acts.
 
 pub mod head_sync;
 pub mod labels;
+pub mod loom_pr_guard;
 pub mod redate;
 pub mod refs;
 pub mod stale_checks;

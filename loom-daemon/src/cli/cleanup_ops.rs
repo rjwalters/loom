@@ -126,10 +126,50 @@ pub(crate) fn handle_clean_command(
         require_managed_sentinel: false,
     };
     let exit_code = clean::run_clean(&repo_root, &opts);
+    if !worktrees_only && !branches_only && !tmux_only {
+        clean_native_launch_state(dry_run, force);
+    }
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
     Ok(())
+}
+
+/// Report (and, with `--force`/`-y`, remove) stale per-launch native harness
+/// state under `~/.local/state/loom/native-tools` — issue #8663.
+///
+/// `--safe` does not narrow this and never could: a session directory has no
+/// PR to be merged, exactly like the log and tmux artifacts above. What gates
+/// removal instead is liveness — a directory whose recorded harness pid is
+/// still running on this host is never touched, whatever its age.
+///
+/// Removal requires `--force`/`-y` rather than reusing `run_clean`'s prompt:
+/// that prompt has already been consumed (and may have been *declined* — a
+/// cancelled run returns the same `0` as a completed one), so acting on it
+/// here would mean removing files after the operator said no. The fleet's
+/// scheduled `clean --deep --safe -y` passes `-y` and therefore reclaims.
+fn clean_native_launch_state(dry_run: bool, force: bool) {
+    use loom_daemon::native_tools::provision::reap;
+
+    let Some(base) = reap::default_base() else {
+        return;
+    };
+    println!();
+    println!("Cleaning Stale Native Launch State\n");
+    // Without --force this is a report: see the doc comment above.
+    let remove = force && !dry_run;
+    let report = reap::reap_base(&base, &reap::Policy::default(), !remove);
+    println!("  {}", base.display());
+    for path in report.sessions.iter().chain(&report.bindings) {
+        println!("  {} {}", if remove { "removed" } else { "stale" }, path.display());
+    }
+    for error in &report.errors {
+        println!("  error: {error}");
+    }
+    println!("  {}", reap::summary(&report, !remove));
+    if !remove && !report.is_empty() {
+        println!("  Re-run with --force/-y to reclaim this space");
+    }
 }
 
 pub(crate) fn handle_cleanup_command(action: CleanupAction) -> Result<()> {

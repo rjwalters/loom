@@ -1,0 +1,486 @@
+//! GitHub Actions CI telemetry poller (Issue #8824 phase 1, #8825 phase 2, of
+//! the build/CI observability work under epic #8522).
+//!
+//! Captures every completed GitHub Actions **run** and **job** of one forge
+//! org as first-class telemetry: `ci.run` / `ci.job` log records, the
+//! `loom.ci.{run,job}.duration_ms` histograms (via `ci.duration`), and one
+//! trace per run with one span per job. With `logCaptureEnabled` (#8825) it
+//! additionally captures each completed job's **full log** as chunked
+//! `ci.job.log` records ([`logs`]) — unfiltered apart from a per-job size
+//! cap, because the neutral OTLP gateway, not this poller, is the redaction
+//! boundary. The records land in a local journal
+//! (`.loom/logs/ci-telemetry.jsonl`) unconditionally, and the daemon's
+//! existing observability backfill pass ([`export::backfill`]) offers them to
+//! whichever exporter(s) `observability.*` configures — no new transport.
+//!
+//! # Surfaces
+//!
+//! - `loom-daemon ci-telemetry --once` — one poll cycle ([`poll::run_cycle`]).
+//! - `loom-daemon ci-telemetry status` — ledger/watermark/health summary.
+//! - A daemon-integrated periodic poller ([`spawn_task`]) when
+//!   `autonomous.ciTelemetry.enabled=true` (default **false**, FLAGS-OFF).
+//!
+//! # "Never do the same job twice"
+//!
+//! The durable ledger ([`ledger`], `.loom/state/ci-telemetry/seen.jsonl`) is
+//! the commit point: a unit's envelopes are appended and fsynced to the
+//! ledger **before** they are written to the journal, and a unit becomes
+//! "seen" only once its ledger line is durable. A crash after the commit but
+//! before (or during) the journal write is repaired on the next cycle by
+//! replaying only the envelopes the journal does not already hold — so every
+//! run/job reaches the journal exactly once across restarts, re-polls and
+//! re-runs. See `defaults/docs/ci-observability.md` for the full contract.
+//!
+//! # Multi-host posture: fleet-captain gated (#8901)
+//!
+//! One poller per org, running on exactly one host, is the goal. A per-host
+//! file lock ([`state::CycleLock`]) serialises the CLI and the daemon poller
+//! *on* one host; across hosts, [`spawn_task`]'s periodic loop is this repo's
+//! first real consumer of [`crate::fleet_captain`]'s singleton-job captain
+//! gate — a genuine "forge-wide queue check" in that module's own vocabulary,
+//! not a per-host job like the daemon watchdog. Every tick re-evaluates
+//! [`crate::fleet_captain::arm_singleton_job`] for [`SINGLETON_JOB_NAME`] and
+//! skips that cycle entirely when refused, so a `fleet.captain` edit (or a
+//! host-identity change) takes effect on the very next tick.
+//!
+//! **This changes prior behavior.** Before #8901, this poller ran on every
+//! host with `autonomous.ciTelemetry.enabled=true` unconditionally, relying
+//! on every record's stable GitHub identity (`run_id`/`job_id`, deterministic
+//! trace/span ids) for a backend to deduplicate. That safety net is still in
+//! place — it is what keeps a transient double-arm window (mid-`fleet.captain`
+//! edit) harmless rather than corrupting — but it is no longer the *primary*
+//! mechanism: **every host that enables `ciTelemetry` — a single-host setup
+//! included — must also have `fleet.captain` declared naming one host, or
+//! the poller is refused** (fail-closed, per the gate's own contract — see
+//! `defaults/docs/daemon-reference.md`'s "Fleet captain" section). The
+//! original #8901 note said only multi-host fleets were affected; that was
+//! wrong (#9014), because `NoCaptainDeclared` refuses on any host.
+//!
+//! The refusal is **not silent** (#9014): each refused tick is recorded in
+//! `status.json` ([`gate_tick`] → [`state::note_captain_gate`]), so
+//! `ci-telemetry status` reads `refused` with the gate's reason; a
+//! no-captain refusal also lands in `host.health.captainless_singleton_jobs`
+//! and turns the `loom-daemon health` `ci_telemetry` section non-green.
+
+pub mod api;
+pub mod export;
+pub mod journal;
+pub mod ledger;
+pub mod logs;
+pub mod poll;
+pub mod records;
+pub mod state;
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// The singleton-job name this poller gates itself under (#8901) — appears
+/// verbatim in `fleet_captain`'s arm/refusal messages and in
+/// `host.health.armed_singleton_jobs` once armed.
+pub const SINGLETON_JOB_NAME: &str = "ci-telemetry-poll";
+
+/// `autonomous.ciTelemetry.enabled` env override.
+pub const ENABLED_ENV: &str = "LOOM_CI_TELEMETRY_ENABLED";
+/// `autonomous.ciTelemetry.org` env override.
+pub const ORG_ENV: &str = "LOOM_CI_TELEMETRY_ORG";
+/// `autonomous.ciTelemetry.intervalSecs` env override.
+pub const INTERVAL_SECS_ENV: &str = "LOOM_CI_TELEMETRY_INTERVAL_SECS";
+// `autonomous.ciTelemetry.excludedRepos` deliberately has NO env override:
+// the ci-observability policy requires every exclusion to live in committed
+// config with a recorded reason, never in a host-local tier (env included).
+/// `autonomous.ciTelemetry.logCaptureEnabled` env override.
+pub const LOG_CAPTURE_ENABLED_ENV: &str = "LOOM_CI_TELEMETRY_LOG_CAPTURE_ENABLED";
+/// `autonomous.ciTelemetry.logCaptureMaxBytes` env override.
+pub const LOG_CAPTURE_MAX_BYTES_ENV: &str = "LOOM_CI_TELEMETRY_LOG_CAPTURE_MAX_BYTES";
+// `autonomous.ciTelemetry.logCaptureExcludedRepos` deliberately has NO env
+// override, for the same reason `excludedRepos` has none.
+
+/// Default org when no tier sets one.
+pub const DEFAULT_ORG: &str = "2amlogic";
+/// Default poll cadence.
+pub const DEFAULT_INTERVAL_SECS: u64 = 120;
+/// How far back the very first poll of a repo (no watermark yet) looks.
+pub const INITIAL_LOOKBACK_HOURS: i64 = 24;
+/// How far back **every** poll re-lists runs, regardless of the watermark
+/// (#8898). A re-run keeps its original `created_at`, so a pure
+/// `created >= watermark` floor can never list a re-attempt of a run the
+/// watermark has already passed. The trailing rescan window lists it again;
+/// the ledger's `(repo, run_id, job_id, attempt)` dedup keeps the export
+/// exactly-once. Capped by [`INITIAL_LOOKBACK_HOURS`] so the floor never
+/// reaches further back than the repo's first cycle already did.
+pub const RESCAN_WINDOW_HOURS: i64 = 24;
+
+/// Dotted path of the repo-exclusion key.
+pub const EXCLUDED_REPOS_KEY: &str = "autonomous.ciTelemetry.excludedRepos";
+
+/// Dotted path of the **log-only** repo-exclusion key (#8825).
+///
+/// The ci-observability policy makes run/job records and duration metrics
+/// unconditional and names log capture as the *only* excludable signal. That
+/// needs its own key: excluding a repo with [`EXCLUDED_REPOS_KEY`] to stop
+/// capturing its logs would also stop its metrics, which is itself a policy
+/// violation. Same discipline — committed config only, `{repo, reason}`, no
+/// env override.
+pub const LOG_CAPTURE_EXCLUDED_REPOS_KEY: &str = "autonomous.ciTelemetry.logCaptureExcludedRepos";
+
+/// One admitted `excludedRepos` entry: the repo (bare `name` or
+/// `owner/name`, matched case-insensitively) and the reason recorded with it.
+///
+/// The ci-observability policy makes run/job records and metrics
+/// unconditional; excluding a repo is a **policy exception** that must carry
+/// its reason in committed config (see `defaults/docs/ci-observability.md`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RepoExclusion {
+    pub repo: String,
+    pub reason: String,
+}
+
+/// The raw `autonomous.ciTelemetry` block, before env/default resolution.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CiTelemetryConfig {
+    pub enabled: Option<bool>,
+    pub org: Option<String>,
+    pub interval_secs: Option<u64>,
+    /// Admitted exclusions (committed tiers only, each with a reason).
+    pub excluded_repos: Option<Vec<RepoExclusion>>,
+    /// `excludedRepos` entries refused by the policy, each as a named
+    /// reason. A refused entry excludes nothing — the repo is still polled.
+    pub refused_exclusions: Vec<String>,
+    pub log_capture_enabled: Option<bool>,
+    /// Per-job cap on captured log text (#8825).
+    pub log_capture_max_bytes: Option<usize>,
+    /// Repos whose **logs** are not captured (records and metrics still are).
+    pub log_capture_excluded_repos: Option<Vec<RepoExclusion>>,
+}
+
+/// Split an `excludedRepos` value into admitted entries and named refusals.
+/// Only `{ "repo": "<non-empty>", "reason": "<non-empty>" }` is admitted.
+#[must_use]
+pub fn parse_exclusions(value: &serde_json::Value) -> (Vec<RepoExclusion>, Vec<String>) {
+    let Some(entries) = value.as_array() else {
+        return (Vec::new(), vec![format!("{EXCLUDED_REPOS_KEY} is not an array: {value}")]);
+    };
+    let mut admitted = Vec::new();
+    let mut refused = Vec::new();
+    for entry in entries {
+        let field = |name: &str| {
+            entry
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        match (field("repo"), field("reason")) {
+            (Some(repo), Some(reason)) => admitted.push(RepoExclusion { repo, reason }),
+            (Some(repo), None) => refused
+                .push(format!("{repo}: refused — an exclusion must record a non-empty \"reason\"")),
+            _ => refused.push(format!(
+                "{entry}: refused — an exclusion must be {{\"repo\": …, \"reason\": …}}"
+            )),
+        }
+    }
+    (admitted, refused)
+}
+
+/// Read an exclusion list from the **committed** tiers only
+/// (`.loom/config.json` deep-merged with `.loom-project/project.json`). A
+/// value that a host-local or shared-defaults tier adds or changes is refused
+/// by name.
+fn read_exclusions(
+    root: &Path,
+    effective: &serde_json::Value,
+    key: &str,
+) -> (Vec<RepoExclusion>, Vec<String>) {
+    use crate::config_resolver::{
+        deep_merge, get_path, soft_read_json_object, LEGACY_CONFIG_REL, PROJECT_CONFIG_REL,
+    };
+    let committed = deep_merge(
+        &soft_read_json_object(&root.join(LEGACY_CONFIG_REL)),
+        &soft_read_json_object(&root.join(PROJECT_CONFIG_REL)),
+    );
+    let committed_value = get_path(&committed, key);
+    let effective_value = get_path(effective, key);
+    let (admitted, mut refused) = committed_value.map(parse_exclusions).unwrap_or_default();
+    if effective_value.is_some() && effective_value != committed_value {
+        let source = crate::config_resolver::source_of(root, key)
+            .map_or_else(|| "a non-committed tier".to_string(), |p| p.display().to_string());
+        refused.push(format!(
+            "{key} from {source}: refused — exclusions must live in committed config"
+        ));
+    }
+    (admitted, refused)
+}
+
+/// Read `autonomous.ciTelemetry` from `root`'s effective config.
+#[must_use]
+pub fn read_config(root: &Path) -> CiTelemetryConfig {
+    let config = crate::config_resolver::resolve_effective_config(root);
+    let Some(block) = crate::config_resolver::get_path(&config, "autonomous.ciTelemetry") else {
+        return CiTelemetryConfig::default();
+    };
+    let (admitted, mut refused_exclusions) = read_exclusions(root, &config, EXCLUDED_REPOS_KEY);
+    let (log_excluded, log_refused) =
+        read_exclusions(root, &config, LOG_CAPTURE_EXCLUDED_REPOS_KEY);
+    refused_exclusions.extend(log_refused);
+    CiTelemetryConfig {
+        enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
+        org: block
+            .get("org")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        interval_secs: block
+            .get("intervalSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|v| *v > 0),
+        excluded_repos: (!admitted.is_empty()).then_some(admitted),
+        refused_exclusions,
+        log_capture_enabled: block
+            .get("logCaptureEnabled")
+            .and_then(serde_json::Value::as_bool),
+        log_capture_max_bytes: block
+            .get("logCaptureMaxBytes")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|v| *v > 0)
+            .and_then(|v| usize::try_from(v).ok()),
+        log_capture_excluded_repos: (!log_excluded.is_empty()).then_some(log_excluded),
+    }
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The fully resolved settings (**env > config > default**).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCiTelemetry {
+    pub enabled: bool,
+    pub org: String,
+    pub interval_secs: u64,
+    /// Admitted exclusions: repos (bare `name` or `owner/name`) never polled,
+    /// each with its recorded reason. Config-only — no env override.
+    pub excluded_repos: Vec<RepoExclusion>,
+    /// Refused `excludedRepos` entries (named reasons); they exclude nothing.
+    pub refused_exclusions: Vec<String>,
+    /// Whether job-log capture is on (#8825; default **false**, FLAGS-OFF).
+    pub log_capture_requested: bool,
+    /// Per-job cap on captured log text.
+    pub log_capture_max_bytes: usize,
+    /// Repos excluded from **log** capture only; their `ci.run`/`ci.job`
+    /// records and duration metrics are still captured unconditionally.
+    pub log_capture_excluded_repos: Vec<RepoExclusion>,
+}
+
+/// Resolve every knob, **env > config > default**.
+#[must_use]
+pub fn resolve(config: &CiTelemetryConfig) -> ResolvedCiTelemetry {
+    ResolvedCiTelemetry {
+        enabled: env_bool(ENABLED_ENV).or(config.enabled).unwrap_or(false),
+        org: env_nonempty(ORG_ENV)
+            .or_else(|| config.org.clone())
+            .unwrap_or_else(|| DEFAULT_ORG.to_string()),
+        interval_secs: env_nonempty(INTERVAL_SECS_ENV)
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &u64| *v > 0)
+            .or(config.interval_secs)
+            .unwrap_or(DEFAULT_INTERVAL_SECS),
+        excluded_repos: config.excluded_repos.clone().unwrap_or_default(),
+        refused_exclusions: config.refused_exclusions.clone(),
+        log_capture_requested: env_bool(LOG_CAPTURE_ENABLED_ENV)
+            .or(config.log_capture_enabled)
+            .unwrap_or(false),
+        log_capture_max_bytes: env_nonempty(LOG_CAPTURE_MAX_BYTES_ENV)
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| *v > 0)
+            .or(config.log_capture_max_bytes)
+            .unwrap_or(logs::DEFAULT_MAX_BYTES),
+        log_capture_excluded_repos: config
+            .log_capture_excluded_repos
+            .clone()
+            .unwrap_or_default(),
+    }
+}
+
+/// The job-log capture gate. Phase 1 (#8824) shipped the config key with no
+/// code behind it and refused a request by name; phase 2 (#8825) honours it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogCaptureGate {
+    /// Not requested (the default — FLAGS-OFF).
+    Off,
+    /// Requested via `logCaptureEnabled` and honoured.
+    On,
+}
+
+impl LogCaptureGate {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogCaptureGate::Off => "off",
+            LogCaptureGate::On => "on",
+        }
+    }
+
+    #[must_use]
+    pub fn is_on(self) -> bool {
+        self == LogCaptureGate::On
+    }
+}
+
+/// Evaluate the log-capture gate for `resolved`.
+#[must_use]
+pub fn log_capture_gate(resolved: &ResolvedCiTelemetry) -> LogCaptureGate {
+    if resolved.log_capture_requested {
+        LogCaptureGate::On
+    } else {
+        LogCaptureGate::Off
+    }
+}
+
+/// `<root>/.loom/state/ci-telemetry/` — the ledger, status, discovery cache,
+/// export cursor and lock all live here.
+#[must_use]
+pub fn state_dir(root: &Path) -> PathBuf {
+    root.join(".loom").join("state").join("ci-telemetry")
+}
+
+/// `<root>/.loom/logs/ci-telemetry.jsonl` — the local journal.
+#[must_use]
+pub fn journal_path(root: &Path) -> PathBuf {
+    root.join(".loom").join("logs").join("ci-telemetry.jsonl")
+}
+
+/// Spawn the daemon-integrated periodic poller, or return `None` when
+/// `autonomous.ciTelemetry.enabled` resolves false (the default — zero side
+/// effects, no task, no file I/O).
+#[must_use]
+pub fn spawn_task(root: PathBuf) -> Option<tokio::task::JoinHandle<()>> {
+    let resolved = resolve(&read_config(&root));
+    if !resolved.enabled {
+        log::debug!("ci_telemetry: disabled (set autonomous.ciTelemetry.enabled=true to opt in)");
+        return None;
+    }
+    if log_capture_gate(&resolved).is_on() {
+        log::info!(
+            "ci_telemetry: job-log capture enabled (cap {} bytes/job, excluded: {:?})",
+            resolved.log_capture_max_bytes,
+            resolved.log_capture_excluded_repos
+        );
+    }
+    for refusal in &resolved.refused_exclusions {
+        log::warn!("ci_telemetry: excludedRepos entry {refusal} (the repo is still polled)");
+    }
+    let interval = Duration::from_secs(resolved.interval_secs);
+    log::info!(
+        "ci_telemetry: enabled (org={}, interval={}s, excluded={:?})",
+        resolved.org,
+        interval.as_secs(),
+        resolved.excluded_repos
+    );
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            // Fleet-captain gate (#8901): re-evaluated every tick, so a
+            // `fleet.captain` edit or a host-identity change takes effect on
+            // the very next cycle rather than requiring a daemon restart —
+            // see this module's "Multi-host posture" doc section.
+            let host_id = crate::sweep_registry::host_identity();
+            if !gate_tick(&root, &host_id, chrono::Utc::now()) {
+                continue;
+            }
+            let root = root.clone();
+            let resolved = resolved.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let api = api::GhCliApi::from_env();
+                poll::run_cycle(&poll::CycleContext::new(&root, &resolved), &api)
+            })
+            .await;
+            match outcome {
+                Ok(Ok(report)) => log::info!("ci_telemetry: {}", report.summary()),
+                Ok(Err(error)) => log::warn!("ci_telemetry: cycle failed: {error}"),
+                Err(error) => log::warn!("ci_telemetry: cycle task panicked: {error}"),
+            }
+        }
+    }))
+}
+
+/// The CI poller's health on this host, for `loom-daemon health`'s
+/// `ci_telemetry` section (#9014). Serialized as the section's detail.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CiTelemetryHealth {
+    /// `autonomous.ciTelemetry.enabled`, resolved.
+    pub enabled: bool,
+    /// [`state::Health::label`] as of now.
+    pub state: String,
+    /// The recorded fleet-captain refusal, if the poller is refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub captain_refusal: Option<state::CaptainRefusal>,
+}
+
+/// Collect [`CiTelemetryHealth`] for `root` — filesystem-only (config +
+/// `status.json`), no forge call.
+#[must_use]
+pub fn collect_health(root: &Path) -> CiTelemetryHealth {
+    let resolved = resolve(&read_config(root));
+    let status = state::load_status(&state_dir(root));
+    let health = state::classify(&status, chrono::Utc::now(), resolved.interval_secs);
+    CiTelemetryHealth {
+        enabled: resolved.enabled,
+        state: health.label().to_string(),
+        captain_refusal: matches!(health, state::Health::Refused { .. })
+            .then(|| status.captain_refusal.clone())
+            .flatten(),
+    }
+}
+
+/// One tick's fleet-captain gate (#8901), with the refusal made visible
+/// (#9014): arms or refuses `ci-telemetry-poll` via
+/// [`crate::fleet_captain::arm_singleton_job`] and records the outcome in
+/// `status.json` ([`state::note_captain_gate`]) so `ci-telemetry status`
+/// reads `refused` with the reason instead of `stale`/`never-polled`.
+/// Returns `true` when the cycle may run.
+pub fn gate_tick(root: &Path, host_id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let dir = state_dir(root);
+    match crate::fleet_captain::arm_singleton_job(SINGLETON_JOB_NAME, root, host_id) {
+        Ok(()) => {
+            if let Err(error) = state::note_captain_gate(&dir, None, now) {
+                log::warn!("ci_telemetry: could not clear the captain refusal: {error}");
+            }
+            true
+        }
+        Err(refusal) => {
+            // `NoCaptainDeclared` is a misconfiguration worth surfacing above
+            // debug — a captain-assigned-but-not-this-host refusal is the
+            // routine, expected case on every non-captain host.
+            let no_captain = matches!(
+                crate::fleet_captain::resolve_gate_for_root(root, host_id),
+                crate::fleet_captain::CaptainGate::NoCaptainDeclared
+            );
+            if no_captain {
+                log::warn!("ci_telemetry: {refusal}");
+            } else {
+                log::debug!("ci_telemetry: {refusal}");
+            }
+            if let Err(error) = state::note_captain_gate(&dir, Some((&refusal, no_captain)), now) {
+                log::warn!("ci_telemetry: could not record the captain refusal: {error}");
+            }
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests;

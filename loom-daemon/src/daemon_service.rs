@@ -147,6 +147,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
             Commands::PeerClaims { json } => {
                 cli::peer_claims_cmd::handle_peer_claims_command(json).await
             }
+            // `queue` (#8852) reads the same `DaemonStatus` round-trip.
+            Commands::Queue { json } => cli::ready_queue_cmd::handle_queue_command(json).await,
             // `jev-merge-risk` POSTs to an external HTTP endpoint (Jev,
             // TypeSafe, issue #8545), so it needs the async runtime for the
             // same reason `status`/`health` do.
@@ -1016,8 +1018,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // invariant (#6615) intact despite the passes no longer blocking startup.
     let startup_reconciliation_ready =
         daemon_startup_reconciliation::spawn_startup_passes(sweep_workspace.clone());
-    let _claim_reconciliation_handle =
-        claim_reconciliation::spawn_periodic_reconciliation_task(sweep_workspace.clone());
+    let _claim_reconciliation_handle = claim_reconciliation::spawn_periodic_reconciliation_task(
+        sweep_workspace.clone(),
+        event_bus.clone(),
+    );
 
     // Startup-race mitigation (Issue #3887): resolve the dispatch stagger + the
     // watchdog knobs from `.loom/config.json → autonomous` with env override
@@ -1292,7 +1296,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // into all three dispatch producers AND into the IPC server (which sets/aborts
     // it and renders it in `loom-daemon status`). With no drain requested the flag
     // stays `false`, so every producer's halt check is byte-for-byte unchanged.
-    let drain_state = Arc::new(loom_daemon::ipc::DrainState::new());
+    // #8652: backed by the persisted paused-time ledger (see `DrainState::with_default_ledger`).
+    let drain_state = Arc::new(loom_daemon::ipc::DrainState::with_default_ledger());
     let drain_flag = drain_state.flag();
 
     // Shared role-runner in-progress guard (#4364): one set, cloned into both
@@ -1596,6 +1601,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
             );
             None
         };
+
+    // GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
+    // (`autonomous.ciTelemetry.enabled`); `None` and zero side effects when off.
+    let _ci_telemetry_handle = loom_daemon::ci_telemetry::spawn_task(sweep_workspace.clone());
 
     // Periodic merged-PR worktree reaper (Issue #4876). Before this loop the
     // ONLY trigger for "auto-removed when their PR merges" (CLAUDE.md's stated
@@ -1941,6 +1950,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
             watch_registry::GhWatchProbe::new(),
             interval,
             expiry,
+            event_bus.clone(),
+            sweep_workspace.clone(),
         ))
     } else {
         log::debug!(
@@ -1967,15 +1978,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `event_bus` is moved into `IpcServer::new` below.
     let auto_update_config = auto_update::read_auto_update_config(&sweep_workspace);
     let _auto_update_handle = if auto_update::resolve_enabled(&auto_update_config) {
-        let interval = auto_update::resolve_interval(&auto_update_config);
-        let settle = auto_update::resolve_settle(&auto_update_config);
-        let defer_deadline = auto_update::resolve_defer_deadline(&auto_update_config);
-        log::info!(
-            "auto_update: enabled (interval={}s, settle={}s, deferDeadline={}s)",
-            interval.as_secs(),
-            settle.as_secs(),
-            defer_deadline.as_secs()
-        );
+        let tuning = auto_update::TickTuning::resolve(&auto_update_config);
+        log::info!("auto_update: enabled ({})", tuning.describe());
         let probe = auto_update::ScriptAutoUpdateProbe::new(
             workspace_pool.clone(),
             sweep_workspace.clone(),
@@ -1988,14 +1992,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
             tokio::runtime::Handle::current(),
         );
         let status = std::sync::Arc::new(auto_update::AutoUpdateStatus::new(true));
-        Some(auto_update::spawn_auto_update_task(
-            probe,
-            trigger,
-            status,
-            interval,
-            settle,
-            defer_deadline,
-        ))
+        Some(auto_update::spawn_auto_update_task(probe, trigger, status, tuning))
     } else {
         log::debug!(
             "auto_update: disabled (set LOOM_AUTO_UPDATE=1 or autonomous.autoUpdate.enabled=true to opt in)"

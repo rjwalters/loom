@@ -9,7 +9,12 @@ use std::{
 };
 
 pub(super) struct State {
+    /// This launch's own private directory. Nothing else may read or write it.
     pub directory: PathBuf,
+    /// The per-workspace parent of [`Self::directory`], which also holds the
+    /// content-keyed binding trees every launch of this workspace shares
+    /// (#8663, [`super::shared`]).
+    pub workspace: PathBuf,
     pub auth: Option<Vec<u8>>,
 }
 
@@ -195,7 +200,9 @@ fn auth_snapshot(root: &Path, path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn create(
+/// `pub(super)` so the shared-binding tests can build two launches' state for
+/// one workspace without going through the environment [`prepare`] reads.
+pub(super) fn create(
     root: &Path,
     override_base: Option<&Path>,
     home: Option<&Path>,
@@ -219,6 +226,13 @@ fn create(
     let workspace = base.join(hex::encode(Sha256::digest(root.as_os_str().as_encoded_bytes())));
     outside_repositories(&root, &canonical_destination(&workspace)?)?;
     private_directory(&workspace)?;
+    let workspace = workspace.canonicalize()?;
+    // The only Loom process that reliably exists around a native session is the
+    // one starting the *next* one: `worker_spawn::exec` hands this process
+    // image to the harness CLI, so there is no parent left at session exit to
+    // clean up after it (#8663). Never fatal — a launch that cannot reap still
+    // launches; `loom-daemon clean` is the other pass.
+    let _ = super::reap::reap_workspace(&workspace, &super::reap::Policy::default(), false);
     let directory = workspace.join(uuid::Uuid::new_v4().to_string());
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
@@ -231,7 +245,14 @@ fn create(
         .context("cannot allocate isolated native launch state")?;
     let directory = directory.canonicalize()?;
     outside_repositories(&root, &directory)?;
-    Ok(State { directory, auth })
+    // Records the pid `execve` hands to the harness, so the next launch can
+    // tell a live 12-hour sweep from an exited one instead of guessing on age.
+    super::reap::record_session(&directory)?;
+    Ok(State {
+        directory,
+        workspace,
+        auth,
+    })
 }
 
 fn validate_auth_format(bytes: &[u8], runtime: &str) -> Result<()> {

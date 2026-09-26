@@ -76,7 +76,7 @@ them but does not decide them.
 | OpenAI Codex CLI | `defaults/scripts/spawn-codex.sh` | **2** | [`guardrail-parity-codex.md`](guardrail-parity-codex.md) | `codex-adapter-smoke` in `.github/workflows/ci.yml` (mocked; no live calls) | **Shipped** by epic #4167 Phase 2 (#4468), ported from the gpeyton fork. Requires Codex CLI ≥ 0.146.0. Capability manifest `defaults/runtimes/codex.json` declares `worktreeIsolation: partial`, so `check-runtime-capabilities.sh` fails Builder+codex closed while Judge+codex passes. |
 | Amp, oh-my-pi (omp), … | — | — | — | — | Not started (tier-2 candidates; still need a parity doc + CI leg). |
 | Pi, OpenCode, Kimi Code CLI | native Rust, `loom-daemon/src/worker_spawn/harness.rs` | **2** | [`guardrail-parity-native.md`](guardrail-parity-native.md) (Pi/OpenCode only — Kimi is not covered) | none dedicated (`worker_spawn.rs`/`worker_spawn_kimi.rs` integration tests) | Setup, model profiles and live-canary evidence live in [`runtime-model-trials.md`](runtime-model-trials.md), not here. Kimi (#8561) declares every `defaults/runtimes/kimi.json` capability `"no"` — no guarded `loom_*` tool binding exists yet (#8562) — so it is admitted only for roles with no `runtimeRequirements` (Curator, Guide, Auditor); Pi/OpenCode's `worktreeIsolation`/`loomControl` are `"yes"`. |
-| Aider ([aider.chat](https://aider.chat)) | `defaults/scripts/spawn-aider.sh` (thin wrapper over `defaults/scripts/spawn-generic.sh`) | **3** (generic passthrough, unverified) | n/a — tier-3 does not require one | none (no CI leg is required for tier-3; the checker assertion below is a plain `test-*.sh`, not an adapter-admission gate) | **Worked example** for issue #4780 — proves the tier-3 mechanism end-to-end, not a vetted integration. Capability manifest `defaults/runtimes/aider.json` declares every capability `"no"`, including `worktreeIsolation: "no"` EXPLICITLY (not `"partial"`). |
+| Aider ([aider.chat](https://aider.chat)) | `defaults/scripts/spawn-aider.sh` (exec stub → `spawn-generic-launch.sh` → `spawn-generic.sh`) | **3** (generic passthrough, unverified) | n/a — tier-3 does not require one | none (no CI leg is required for tier-3; the checker assertion below is a plain `test-*.sh`, not an adapter-admission gate) | **Worked example** for issues #4780 / #8671 — proves the tier-3 mechanism end-to-end, not a vetted integration. Capability manifest `defaults/runtimes/aider.json` declares every capability `"no"`, including `worktreeIsolation: "no"` EXPLICITLY (not `"partial"`), and now carries aider's whole launch shape in its `launch` object. |
 | Gemini CLI ([gemini-cli](https://github.com/google-gemini/gemini-cli)) | `defaults/scripts/spawn-gemini.sh` (thin wrapper over `defaults/scripts/spawn-generic.sh`) | **3** (generic passthrough, unverified) | n/a — tier-3 does not require one | none (as Aider — tier-3 requires no CI leg) | Same instantiation shape as the Aider worked example; intended as a [`runtimes.preference`](#ordered-runtime-preference-with-fall-through-issue-8436) fall-through tap (e.g. `["claude", "gemini"]`) for roles with no `runtimeRequirements`, so an exhausted Claude pool does not strand them. Manifest `defaults/runtimes/gemini.json` declares every capability `"no"`, including `worktreeIsolation: "no"` EXPLICITLY — Builder, Doctor and Judge stay refused by construction. |
 
 ### Tier 3: generic passthrough
@@ -125,9 +125,77 @@ tier-1/tier-2:
   too — the manifest is the single source of truth, not a hardcoded
   runtime-vs-role table.
 
-**The shared template.** `defaults/scripts/spawn-generic.sh` is driven
-entirely by environment variables so one implementation backs many thin
-per-CLI wrappers instead of duplicating the Spawn interface per CLI:
+**The launch shape is manifest data, not a script (issue #8671).** The
+*primary* tier-3 route is a `launch` object in the runtime's existing
+capability manifest, `defaults/runtimes/<name>.json`. Onboarding another CLI
+is a manifest edit plus a three-line exec stub — **not** a new script carrying
+that CLI's flag knowledge:
+
+```jsonc
+// defaults/runtimes/aider.json
+{
+  "runtime": "aider",
+  "capabilities": { /* unchanged — every capability "no" for tier-3 */ },
+  "launch": {
+    "cliBin": "aider",              // the underlying binary to exec
+    "promptFlag": "--message",      // headless prompt delivery
+    "extraArgs": ["--yes-always"]   // argv always prepended
+  }
+}
+```
+
+The full closed schema — every key `launch` accepts — is:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `cliBin` | string | The underlying CLI binary, looked up on `PATH`. |
+| `promptFlag` | string | The non-interactive prompt flag. Omit to deliver the prompt as the final positional argument. |
+| `extraArgs` | string[] | Argv tokens always prepended ahead of the prompt (e.g. aider's `--yes-always`). Tokens must not contain whitespace. |
+| `modelFlag` | string | Flag `LOOM_MODEL` is passed through (e.g. `--model`). |
+| `modelEnv` | string | Environment variable `LOOM_MODEL` is exported into instead of a flag (superset's Vibe passes its model in `VIBE_ACTIVE_MODEL`). |
+| `effortFlag` | string | Flag `LOOM_EFFORT` is passed through. |
+| `effortValuePrefix` | string | Text prepended to the effort value — Codex has no effort flag, it rides `-c model_reasoning_effort=<v>`, i.e. `effortFlag: "-c"` + `effortValuePrefix: "model_reasoning_effort="`. |
+
+**Declaring none of the model/effort keys emits no flag at all** — the same
+"omit, no error" behaviour `spawn-claude.sh` has for `--model`, and what
+aider's own manifest does today. The schema is **closed**: an unrecognized key
+under `launch` is a hard refusal with exit **78** (`EX_CONFIG`) naming the
+offending key, never a silently-ignored field. A typo in a launch shape is a
+config error, not a shrug.
+
+**How it is read.** `loom-daemon runtime-launch-env --runtime <name>` resolves
+the manifest (installed `.loom/runtimes/` first, then `defaults/runtimes/`,
+then the manifest the binary was built with) and prints eval-ready
+shell lines of the form:
+
+```bash
+[ -n "${LOOM_GENERIC_CLI_BIN:-}" ] || LOOM_GENERIC_CLI_BIN="aider"; export LOOM_GENERIC_CLI_BIN
+```
+
+`defaults/scripts/spawn-generic-launch.sh` evals them and `exec`s
+`spawn-generic.sh`. The "only when unset or empty" form is what makes
+precedence **env > config > default**: an already-set `LOOM_GENERIC_*`
+environment variable always wins over the manifest, so every pre-#8671
+env-var invocation keeps working unchanged.
+
+If no manifest is reachable at all, or the resolved `loom-daemon` predates the
+subcommand, resolution splits two ways. A caller that pinned
+`LOOM_GENERIC_CLI_BIN` itself proceeds on that legacy pure-env-var path, which
+is also what keeps a from-source checkout usable before the first
+`cargo build`. A caller that did **not** gets exit **78** naming the declared
+`# requires-daemon: runtime-launch-env >= …` floor and the env-var bypass —
+`spawn-generic.sh` would fail anyway a moment later, but with a bare
+"`LOOM_GENERIC_CLI_BIN` is required" that names neither the stale binary that
+caused it nor the fix. **This is a real fleet version floor**: a
+manifest-only tier-3 runtime has nothing left to fall back on, so a host whose
+`loom-daemon` predates the subcommand must be rolled before it can dispatch
+one.
+
+**The shared template underneath.** `defaults/scripts/spawn-generic.sh` is
+still driven entirely by environment variables, so one implementation backs
+many thin per-CLI wrappers instead of duplicating the Spawn interface per CLI.
+Setting them by hand remains supported (and is what the manifest resolution
+degrades to):
 
 ```bash
 #!/usr/bin/env bash
@@ -140,15 +208,19 @@ LOOM_GENERIC_PROMPT_FLAG="${LOOM_GENERIC_PROMPT_FLAG:---message}" \
 `spawn-worker.sh` needed **no change** to dispatch a tier-3 runtime: it
 already resolves `spawn-<runtime>.sh` by name off disk, so
 `LOOM_RUNTIME=aider` (or `runtimes.default: "aider"`) reaches
-`spawn-aider.sh` → `spawn-generic.sh` through the exact same seam Codex uses.
+`spawn-aider.sh` → `spawn-generic-launch.sh` → `spawn-generic.sh` through the
+exact same seam Codex uses.
 
-**Worked example (issue #4780).** `defaults/scripts/spawn-aider.sh` wires the
-[Aider](https://aider.chat) CLI as a tier-3 runtime end-to-end:
-`defaults/runtimes/aider.json` declares every capability `"no"`, so
-`check-runtime-capabilities.sh --role builder --runtime aider` exits 78 while
-`--role curator --runtime aider` exits 0. This is the *mechanism*, not a
-roster of new runtimes — onboarding any other specific CLI as tier-3 is a
-separate, per-CLI follow-up (see the issue's "Non-goals").
+**Worked example (issues #4780, #8671).** `defaults/scripts/spawn-aider.sh`
+wires the [Aider](https://aider.chat) CLI as a tier-3 runtime end-to-end. It
+is now a pure exec stub — `exec "$_SCRIPT_DIR/spawn-generic-launch.sh" aider
+"$@"` — with aider's entire launch shape living in
+`defaults/runtimes/aider.json`'s `launch` object. That manifest also declares
+every capability `"no"`, so `check-runtime-capabilities.sh --role builder
+--runtime aider` exits 78 while `--role curator --runtime aider` exits 0. This
+is the *mechanism*, not a roster of new runtimes — onboarding any other
+specific CLI as tier-3 is a separate, per-CLI follow-up (see the issue's
+"Non-goals").
 
 **Promoting a tier-3 runtime to tier-2** means writing the guardrail-parity
 document, adding a CI smoke leg, and — critically — re-declaring its
@@ -376,9 +448,22 @@ runtime's per-session **transcript** (Claude Code writes per-message `usage` +
 OpenCode's equivalent is its own SQLite session store, wired up in #8507 —
 along with first-class `runtime`/`provider`/`profile` fields on every outcome
 record, so a non-Claude completion is identifiable even with no usage numbers
-at all. See [`native-runtime-usage-attribution.md`](native-runtime-usage-attribution.md)
-for the reader, its credential-isolation contract, and the
+at all. Kimi Code CLI's is its per-agent `wire.jsonl` durable event log, wired
+up in #8564. See [`native-runtime-usage-attribution.md`](native-runtime-usage-attribution.md)
+for both readers, their secret-isolation contracts, and the
 `loom-daemon opencode-usage` backfill path.
+
+| Runtime | Store | Selected by |
+|---|---|---|
+| Claude | `~/.claude/projects/<slug>/*.jsonl` transcripts | no launch record (the default) |
+| OpenCode | `opencode.db`, table `session` | `runtime: "opencode"` |
+| Kimi | `$KIMI_CODE_HOME/session_index.jsonl` → `<sessionDir>/agents/<agentId>/wire.jsonl` (`usage.record` + `llm.request`) | `runtime: "kimi"` |
+| Pi, Codex | *(not wired)* — labels but no numbers | falls through to the Claude reader |
+
+Two rules the seam enforces on every one of these, and on any adapter that adds
+the next: **unknown is not zero** (a store with nothing to report returns "no
+totals", never a zeroed breakdown), and **never guess a model id** (an
+unresolved alias is carried verbatim rather than mapped to a plausible name).
 
 An adapter must expose the equivalent for its runtime: a way to attribute a
 session to an account, a limit/exhaustion signal (via the error categories
@@ -1155,15 +1240,13 @@ ids and with completely different economics, so `modelProfile` is what
 distinguishes them. A bare runtime name is shorthand for "that runtime with
 whatever profile it would have chosen anyway".
 
-> **A `modelProfile` currently gates but does not pin.** Availability is read
-> against exactly the named profile's provider and credential pool, but nothing
-> carries the name to the launched child — the launch resolves whatever profile
-> that runtime would have used anyway, so for two profiles on *different*
-> providers the tap that ran is not the tap whose pool was checked. Bare-runtime
-> entries are unaffected (their profile is that default resolution). Pinning it
-> needs `LOOM_MODEL_PROFILE` set at the same launch sites #8599 has to touch, so
-> it is tracked behind that in #8602; until it lands, prefer bare entries unless
-> the named profile *is* the runtime's default.
+> **A `modelProfile` gates *and* pins (#8602).** Availability is read against
+> exactly the named profile's provider and credential pool, and the chosen
+> tap's profile is pinned at launch via `LOOM_MODEL_PROFILE`, set in the shared
+> `launch_env::apply_launch_env` helper (#8599) beside `LOOM_RUNTIME` — the
+> same env var `worker_spawn`'s arg parser already falls back to when no
+> `--profile` flag is given. Bare-runtime entries pin nothing, matching their
+> own `modelProfile: None`.
 
 **Resolution, per launch**: walk the list and take the first tap that is
 **(a)** admitted for the role and **(b)** has a spawnable credential right now.
@@ -1213,11 +1296,17 @@ crash-signal reader takes the entire rest of that line as the runtime name, so
 appending to it would report a runtime called `"opencode tier=2"`. "How much work
 is going to the backstop" reduces to counting markers whose `tier` is not `0`.
 
-Today each dispatch seam emits that marker to the **daemon log**
-(`loom-daemon logs`), which is where all three resolve. Writing it into the
-per-sweep launch record, beside that record's own `# LOOM_RUNTIME_RESOLVED`
-line, additionally requires teaching `crash_signals::log_has_progress` not to
-read it as child progress — tracked in #8599 rather than done half-way.
+Each dispatch seam emits that marker to the **daemon log** (`loom-daemon logs`),
+which is where all three resolve, and (#8599) the daemon carries it to the child
+in `LOOM_RUNTIME_PREFERENCE_MARKER` so `worker_spawn::launch` writes the same
+line, verbatim, into the **per-sweep launch record** beside that record's own
+`# LOOM_RUNTIME_RESOLVED`. `crash_signals::log_has_progress` excludes it as
+preamble, so a hung preference-resolved sweep still reads as stalled. The
+variable is set **only** when a walk decided the launch, so an unconfigured host
+writes a byte-identical log. A role tick additionally records the decision
+durably in `role_tick.outcome` as `preference_tier` / `preference_tap` (absent,
+never a fabricated `0`, when no list decided it) — so "how much work is going to
+the backstop" is a query over the journal, not a grep of the daemon log.
 
 ### Bounding the metered backstop tier (issue #8555)
 
@@ -1320,11 +1409,12 @@ host fault to repair before the metered tier can be used again).
 > (`work_finder::pool_preflight`), and a role tick's runtime is chosen by the
 > list with the #6201/#8408 pre-spawn gate kept as its fail-closed reporter
 > (`role_runner::runtime_preflight`). Sweep dispatch and role ticks both attach
-> the ceiling's slot to the child they spawn. Still to come: carrying the chosen
-> tier into the `role_tick.outcome`/launch-record surfaces (#8599 — today the
-> chosen tier is logged by the daemon, not written into the per-sweep log), and
-> the `modelProfile` launch pin noted above (#8602), which shares those same
-> sites. See also the other follow-up issues on #8436.
+> the ceiling's slot to the child they spawn. The chosen tier is reported per
+> launch as well as logged (#8599): both dispatch seams pin it through the
+> shared `launch_env::apply_launch_env`, which also pins a profile-pinned tap's
+> `modelProfile` as `LOOM_MODEL_PROFILE` (#8602), so a launch always agrees
+> with the tap availability just checked. See also the other follow-up issues
+> on #8436.
 
 ### Adding a runtime adapter
 
@@ -1368,12 +1458,30 @@ time — declaring a capability `"partial"` fails role matching closed, which is
 how Codex is correctly kept out of Builder dispatch.
 
 **Want to skip both of those for now?** That is exactly what
-[tier-3 generic passthrough](#tier-3-generic-passthrough) is for: instantiate
-`spawn-generic.sh` instead of writing a full adapter, declare every capability
-`"no"` (including `worktreeIsolation: "no"`, explicitly) in the manifest, and
-the runtime is refused for Builder/Doctor with no parity doc required. Use it
-to try a CLI against a read-only role first; write the tier-2 artifacts only
-once you are ready to trust it more broadly.
+[tier-3 generic passthrough](#tier-3-generic-passthrough) is for, and it does
+**not** need a hand-written adapter at all. Since #8671 the tier-3 route is a
+manifest edit:
+
+1. Write `defaults/runtimes/<name>.json` with every capability `"no"`
+   (including `worktreeIsolation: "no"`, explicitly) — that is what refuses
+   Builder/Doctor with no parity doc required — plus a `launch` object
+   carrying the CLI's headless shape (`cliBin`, `promptFlag`, `extraArgs`,
+   and whichever of `modelFlag`/`modelEnv`/`effortFlag`/`effortValuePrefix`
+   apply). The [tier-3 section](#tier-3-generic-passthrough) has the full
+   closed schema; an unrecognized key there fails closed with exit 78.
+2. Add the three-line exec stub `defaults/scripts/spawn-<name>.sh`, whose
+   only content is `exec "$_SCRIPT_DIR/spawn-generic-launch.sh" <name> "$@"`
+   — it exists solely because `spawn-worker.sh` resolves runtimes by script
+   name. Copy `spawn-aider.sh` verbatim and change the one word.
+
+None of the four `spawn-codex.sh` lessons above need re-deriving for a tier-3
+CLI: flag translation, `nice` re-exec, and stdin neutralization all already
+live in the shared `spawn-generic.sh`, and the per-CLI differences those
+lessons produced (which flag carries the prompt, whether effort rides a `-c`
+key) are exactly what the manifest's `launch` object now encodes as data.
+
+Use tier-3 to try a CLI against a read-only role first; write the tier-2
+artifacts only once you are ready to trust it more broadly.
 
 ### Unknown-runtime failure (exit 78)
 
@@ -2055,7 +2163,7 @@ collaboration:
 | #9 | `spawn-worker.sh` spawn dispatcher | **1. Spawn** — the runtime-neutral dispatch entry point | **landed** (Phase 1) |
 | #6 | Restructured `classify-error.sh` into per-provider pattern tables | **3. Error classification** — the per-runtime pattern-table shape | **landed** (#4190) |
 | #15 | Codex runner | **1. Spawn** — Codex's `spawn-<runtime>.sh` implementation | **landed** as `defaults/scripts/spawn-codex.sh` (#4468). Ported, not cherry-picked: token-pool auth deferred to Phase 4, `--full-auto`/`-a` replaced (absent on `codex exec` 0.146.0), and the skip-permissions → sandbox mapping deliberately diverges (see the parity doc). |
-| #16 | `.codex/` config | **5. Instruction format** — Codex's config/instruction file set | not started (separate issue) |
+| #16 | `.codex/` config | **5. Instruction format** — Codex's config/instruction file set | **landed for the pooled case** (#8672) as `loom-daemon accounts provision`: a pooled `CODEX_HOME` is populated from the operator's own `~/.codex` per a per-provider sharing table (symlink capability/session trees, copy `AGENTS.md`, key-merge `config.toml` under a credential/identity denylist, never touch `auth.json` or per-project trust state), with a `<profile>/.loom-profile.json` ledger so a local edit inside a profile wins forever. See [`codex-profile-provisioning.md`](codex-profile-provisioning.md). Generating a repo's `.codex/` config from single source (the `AGENTS.md` codegen analogue) is still a separate issue. |
 | #20, #40 | `GUARDRAIL-PARITY.md` guardrail parity | **6. Permission / sandbox mapping** — the parity-doc requirement | **landed** as [`guardrail-parity-codex.md`](guardrail-parity-codex.md) (#4468), re-verified against 0.146.0 — several fork claims no longer hold and are corrected there |
 | #8 | `AGENTS.md` codegen | **5. Instruction format** — single-source instruction generation | **landed** (#4479) as a *generator* (`defaults/scripts/generate-agents-md.sh`) that extracts `agents-md:include` ranges from `defaults/.loom/CLAUDE.md` — not the fork's hand-authored static file (that would violate this repo's single-source non-goal). CI `check-agents-md-sync.sh` keeps the checked-in `defaults/.loom/AGENTS.md` in sync; scaffolding installs the root pointer + `.loom/AGENTS.md` full guide. |
 | #12, #17 | Provider-aware account pool (per-account provider, waterfall fill, `CODEX_HOME` rotation) | **4. Usage accounting** — provider-aware selection consuming the pool signals | Phase 4. #4468 ships only single-profile `CODEX_HOME` passthrough — no pool, no rotation, no bad-token marking. |
@@ -2089,6 +2197,13 @@ collaboration:
   [stablyai/orca](https://github.com/stablyai/orca)
   ([survey-orca-2026-07-31.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/survey-orca-2026-07-31.md),
   idea 5), filed from #4775.
+- **#8671** — the tier-3 launch shape (`cliBin`, `promptFlag`, `extraArgs`,
+  `modelFlag`/`modelEnv`, `effortFlag`/`effortValuePrefix`) moved out of
+  per-CLI `spawn-*.sh` scripts and into `defaults/runtimes/<name>.json`'s
+  `launch` object, read by `loom-daemon runtime-launch-env` via
+  `spawn-generic-launch.sh`. Field set seeded from
+  [superset-sh/superset](https://github.com/superset-sh/superset)'s
+  declarative registry (21 coding CLIs), used as a reference table only.
 - [ADR-0012: Multi-Runtime Worker Support via a Runtime Adapter Contract](https://github.com/rjwalters/loom/blob/main/docs/adr/0012-runtime-adapter-contract.md).
 - Fork: https://github.com/gpeyton/loom · `AGENTS.md` standard: https://agents.md
 - [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/rjwalters/loom/blob/main/docker/worker/MOUNT-CONTRACT.md) —

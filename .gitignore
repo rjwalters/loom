@@ -71,6 +71,8 @@ Thumbs.db
 .loom/exit-codes/
 .loom/sweep-checkpoint/
 .loom/sweep-run/
+.loom/state/ci-telemetry/
+.loom/state/fleet-captain/
 .loom/concierge/
 .loom/stats/
 .loom/diagnostics/
@@ -162,6 +164,8 @@ Thumbs.db
 # Consumer repos keep `.claude/commands/loom/` TRACKED (real files, not a
 # symlink), so it must NOT be added to the daemon's `update_gitignore` list in
 # loom-daemon/src/init/post_init.rs.
+# Anchored with a leading `/`: an unanchored `.agents` also matches
+# `defaults/.agents/`, silently ignoring every NEW shipped skill file.
 .claude/commands
 
 # Co-install hygiene (issue #3578, sibling of #3565):
@@ -176,6 +180,24 @@ Thumbs.db
 # If loom ever ships its own skills, materialize/dogfood them like
 # `.claude/commands/loom/` (out of scope here).
 .claude/skills
+
+# Dogfood scoped symlink (issue #8947, fourth member of the #3311 /
+# #3565+#3682 / #3578 family):
+# `.agents/skills/` is the cross-vendor skill-discovery surface (#8673 contract
+# point 5) that Codex, Kimi Code, Mistral Vibe and Grok read natively. When
+# loom is installed *on* the loom source repo, `.agents/skills` is a SYMLINK to
+# `../defaults/.agents/skills` — the shipped source of truth — so it cannot go
+# stale the way #3565's materialized copy did before #3682 replaced it.
+# Established by `link_dogfood_agent_skills` in
+# loom-daemon/src/init/scaffolding.rs.
+# IMPORTANT: this ignore lives ONLY in loom's own committed .gitignore.
+# Consumer repos keep `.agents/skills/` TRACKED (real generated files, not a
+# symlink — that is the whole point of shipping the surface), so it must NOT be
+# added to the daemon's `update_gitignore` list in
+# loom-daemon/src/init/post_init.rs.
+# Anchored with a leading `/`: an unanchored `.agents` also matches
+# `defaults/.agents/`, silently ignoring every NEW shipped skill file.
+/.agents
 
 # Skill routing local overrides (untracked, user-specific)
 .loom/config/skill-routes.local.json

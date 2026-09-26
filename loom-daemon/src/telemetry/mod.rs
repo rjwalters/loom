@@ -55,13 +55,21 @@ use std::path::PathBuf;
 
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 
+pub mod ci;
 mod envelope;
+pub mod kinds;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
+pub mod ops;
+pub mod queue_snapshot;
 pub mod trace;
 pub mod visibility;
+pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use envelope::TelemetryEnvelope;
+pub use kinds::{TelemetryKindMeta, TelemetryKindOtlp, NEW_KIND_SCHEMA_VERSION, TELEMETRY_KINDS};
+pub use ops::MetricPointsRecord;
+pub use queue_snapshot::QueueSnapshotRecord;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
 /// record shapes below so a Phase-2 backend ingesting a mixed-version fleet can
@@ -225,68 +233,81 @@ impl<'de> Visitor<'de> for RepoVisibilityVisitor {
 // Record kinds — internally tagged on `kind`
 // ============================================================================
 
-/// Every telemetry record kind, internally tagged on a `kind` discriminant. The
-/// tag values match the frozen SSE `sweep.*` topic vocabulary where they overlap
-/// (`sweep.started`/`sweep.phase`/`sweep.completed`) plus the epic's added
-/// record kinds (`sweep.outcome`, `tokens.snapshot`, `host.health`), so the
-/// Phase-2 backend pattern-matches one flat object per record.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind")]
-pub enum TelemetryRecord {
-    /// A sweep began (mirrors the dispatch moment of the frozen SSE topics).
-    #[serde(rename = "sweep.started")]
-    SweepStarted(SweepStartedRecord),
-    /// Late-resolved launch identity; enriches an existing active sweep only.
-    #[serde(rename = "sweep.identity")]
-    SweepIdentity(SweepIdentityRecord),
-    /// A sweep advanced to a new lifecycle phase (mirrors `sweep.issue.{N}.phase`).
-    #[serde(rename = "sweep.phase")]
-    SweepPhase(SweepPhaseRecord),
-    /// A sweep reached a terminal state (mirrors the exited/crashed/completed
-    /// frozen topics; the richer per-phase/config detail lives in the paired
-    /// [`SweepOutcomeRecord`]).
-    #[serde(rename = "sweep.completed")]
-    SweepCompleted(SweepCompletedRecord),
-    /// The full post-hoc outcome of a sweep: model/config/effort, per-phase
-    /// durations, terminal result, and PR number.
-    #[serde(rename = "sweep.outcome")]
-    SweepOutcome(SweepOutcomeRecord),
-    /// A snapshot of the multi-account token pool's per-account usage state.
-    #[serde(rename = "tokens.snapshot")]
-    TokensSnapshot(TokenSnapshotRecord),
-    /// Host health: CPU/disk headroom, daemon version, uptime.
-    #[serde(rename = "host.health")]
-    HostHealth(HostHealthRecord),
-    /// One role-runner tick's outcome (Issue #8056) — the per-`(root, role)`
-    /// counterpart of [`SweepOutcome`](Self::SweepOutcome). The seventh
-    /// variant, and the reason [`CURRENT_SCHEMA_VERSION`] is `2`.
-    #[serde(rename = "role_tick.outcome")]
-    RoleTickOutcome(RoleTickOutcomeRecord),
-    /// One transcript's session shape (Issue #8757, G3 of #8714) — ids,
-    /// attribution, models, token totals, and turn/tool counts, emitted by
-    /// the transcript-ingest pass. Carries **no** prompt, tool-output, key
-    /// or email content by construction (see [`SessionSummaryRecord`]).
-    #[serde(rename = "session.summary")]
-    SessionSummary(SessionSummaryRecord),
-    /// A derived per-session anomaly/quality rollup (Issue #8760, G3 part 2
-    /// of #8714) — retry-loop detection, the longest paired tool call, a USD
-    /// cost estimate, and anomaly flags, computed from a
-    /// [`SessionSummaryRecord`] plus the
-    /// [`crate::activity::transcript_parse::ParsedTranscript`] that produced
-    /// it. See [`SessionAnalysisRecord`] for the wire-safety contract (same
-    /// as `session.summary`: no prompt, tool-output, key or email content,
-    /// ever).
-    #[serde(rename = "session.analysis")]
-    SessionAnalysis(SessionAnalysisRecord),
-    /// One of the four named event-bus topics that carried no telemetry
-    /// record kind of their own (Issue #8760, G4 of #8714): `daemon.drain.*`,
-    /// `daemon.capacity.advisory`, `daemon.preflight.advisory`, and
-    /// `epic.issue.*`. See [`DaemonEventRecord`].
-    #[serde(rename = "daemon.event")]
-    DaemonEvent(DaemonEventRecord),
-    #[serde(rename = "trace.span")]
-    Span(trace::SpanRecord),
+/// Defines [`TelemetryRecord`] and its per-kind accessors from the
+/// [`crate::telemetry_kind_table!`] rows (#8921).
+///
+/// Every arm below is generated from the *same* row, so a kind cannot be in the
+/// enum but missing from `schema_version()`, or tagged one way on the wire and
+/// another in the routing class. Before #8921 each of these lived in a separate
+/// shared file and had to be edited in lockstep by hand.
+macro_rules! define_telemetry_record {
+    ($( $(#[$attr:meta])* $variant:ident = $kind:literal => $payload:ty,
+        gate: $gate:expr, otlp: $class:ident, native: $native:literal; )+) => {
+        /// Every telemetry record kind, internally tagged on a `kind` discriminant. The
+        /// tag values match the frozen SSE `sweep.*` topic vocabulary where they overlap
+        /// (`sweep.started`/`sweep.phase`/`sweep.completed`) plus the epic's added
+        /// record kinds (`sweep.outcome`, `tokens.snapshot`, `host.health`), so the
+        /// Phase-2 backend pattern-matches one flat object per record.
+        ///
+        /// **Generated** from the one-row-per-kind registry in
+        /// [`kinds`](crate::telemetry::kinds) — add a kind there, never here.
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(tag = "kind")]
+        pub enum TelemetryRecord {
+            $(
+                $(#[$attr])*
+                #[serde(rename = $kind)]
+                $variant($payload),
+            )+
+        }
+
+        impl TelemetryRecord {
+            /// This record's wire `kind` tag — the exact string the internally
+            /// tagged serialization emits, available without serializing.
+            #[must_use]
+            pub fn kind(&self) -> &'static str {
+                match self {
+                    $( Self::$variant(_) => $kind, )+
+                }
+            }
+
+            /// The envelope `schema_version` this kind's envelopes carry (the
+            /// value [`TelemetryEnvelope::new`] stamps).
+            ///
+            /// Per-kind gates `3`–`11` are frozen wire contract. Every kind
+            /// added after #8921 reports
+            /// [`NEW_KIND_SCHEMA_VERSION`](crate::telemetry::NEW_KIND_SCHEMA_VERSION)
+            /// instead of a hand-claimed next integer.
+            #[must_use]
+            pub fn schema_version(&self) -> u32 {
+                match self {
+                    $( Self::$variant(_) => $gate, )+
+                }
+            }
+
+            /// How this kind exports over OTLP. The `observability::otlp`
+            /// mapping reads this instead of carrying its own exhaustive
+            /// per-kind chains.
+            #[must_use]
+            pub fn otlp_class(&self) -> TelemetryKindOtlp {
+                match self {
+                    $( Self::$variant(_) => TelemetryKindOtlp::$class, )+
+                }
+            }
+
+            /// Whether the native HTTPS `/ingest` backend accepts this kind.
+            /// `false` for OTLP-only kinds (`trace.span`, `metric.points`).
+            #[must_use]
+            pub fn accepted_by_native_ingest(&self) -> bool {
+                match self {
+                    $( Self::$variant(_) => $native, )+
+                }
+            }
+        }
+    };
 }
+
+crate::telemetry_kind_table!(define_telemetry_record);
 
 /// A sweep's terminal result. `#[serde(default)]`-friendly variants are not
 /// needed here (unlike [`RepoVisibility`], an unknown result is not a privacy
@@ -564,6 +585,32 @@ pub struct SweepOutcomeRecord {
     /// and same omission contract as `runtime`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// The Curator's `<!-- loom:complexity=<tier> -->` marker for this sweep's
+    /// issue (Issue #8542) — `"mechanical"`, `"routine"`, or `"complex"`. This
+    /// is what makes a model-routing decision (`sweep.tierModels` /
+    /// `sweep.optimization`, or a future classifier-driven router) evaluable
+    /// against a labeled outcome: without it, `model` alone cannot separate
+    /// "sonnet chosen by an operator override" from "sonnet chosen because the
+    /// Curator marked this issue `routine`".
+    ///
+    /// Read from the same forge marker `resolve-tier-model.sh` /
+    /// [`crate::script_helpers::sweep_experiment::extract_complexity_marker`]
+    /// already parse, via one more best-effort REST read of the sweep's own
+    /// issue body at the SAME terminal transition that reads the PR label
+    /// timeline for [`doctor_cycles`](Self::doctor_cycles) — see
+    /// `sweep_registry::outcome_journal::complexity_signal` for the fetch and
+    /// its fail-open contract (breaker-gated, `skip_label_flip`-gated, never
+    /// blocks or fails the journal append).
+    ///
+    /// Omitted — never a fabricated `"routine"` — when the issue carried no
+    /// recognized marker, the fetch failed/timed out, or `skip_label_flip` is
+    /// set. Unlike `resolve-tier-model.sh`'s own dispatch-time fold (an absent
+    /// or unrecognized marker there is a **safe default** for model
+    /// selection), this field must stay honest about "unobserved": a
+    /// classifier's evaluation needs the true absence rate, not a default
+    /// masquerading as data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<String>,
 }
 
 /// One Judge verdict on a PR, as reconstructed from the forge label timeline
@@ -716,6 +763,24 @@ pub struct RoleTickOutcomeRecord {
     /// optional field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_pool: Option<String>,
+    /// Which tier of the ordered runtime-preference list this tick launched on
+    /// (Issue #8599): `0` is the most-preferred tap — nothing fell through —
+    /// and any higher value is a fall-through, so "how much work went to the
+    /// metered backstop?" is a query over this key instead of a grep of
+    /// `loom-daemon logs`. Absent whenever no preference list decided the
+    /// launch (no `runtimes.preference`/`rolePreference.<role>` configured, an
+    /// operator pin, a pre-spawn skip that never resolved a runtime) and on
+    /// every record written before #8599 — additive, no `schema_version` bump,
+    /// exactly as [`Self::gated_pool`] was in #8408.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preference_tier: Option<u32>,
+    /// The chosen tap's identity (`<runtime>[:<profile>]`) when a preference
+    /// list decided this tick (#8599) — the same rendering the
+    /// `# LOOM_RUNTIME_PREFERENCE` marker and the launch record's own `tap`
+    /// key use, so one grep finds a tap across all three. Present exactly when
+    /// [`Self::preference_tier`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preference_tap: Option<String>,
     /// Runtime adapter this tick actually launched on (Issue #8507), read off
     /// the tick's own `# LOOM_LAUNCH` record — same source and the same
     /// "absent, never a fabricated `claude` default" contract as
@@ -1103,6 +1168,46 @@ pub struct HostHealthRecord {
     /// backward-compatibility contract `protection` established.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_brake: Option<AdmissionBrakeSummary>,
+    /// Whether this host is the fleet-wide singleton-job captain (Issue
+    /// #8848) — see [`crate::fleet_captain`]. Three-valued, not a bare
+    /// `bool`: `None` when this repo declares no `fleet.captain` at all
+    /// (the overwhelmingly common case; the mechanism does not apply here),
+    /// `Some(false)` when a captain IS declared and it is not this host, and
+    /// `Some(true)` when this host is the declared captain. Collapsing
+    /// "not applicable" and "not the captain" into a single `false` would
+    /// make the dashboard's "no host reporting `is_captain: true`" check
+    /// (#8848 AC5) fire on every ordinary repo that never opts into this
+    /// mechanism — the same "unknown != zero" contract every other optional
+    /// field on this struct already follows.
+    ///
+    /// `#[serde(default)]` so a record from a pre-#8848 daemon still decodes
+    /// (as `None`) rather than failing the whole envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_captain: Option<bool>,
+    /// Declared-singleton-job names currently armed on this host (Issue
+    /// #8848), from BOTH an in-daemon job's most recent
+    /// [`crate::fleet_captain::arm_singleton_job`] call resolving
+    /// [`crate::fleet_captain::CaptainGate::Armed`] here, and a
+    /// shell-driven job's durable arm via `loom-daemon fleet-captain
+    /// <job-name>` that has not yet gone stale (Issue #8901) — see
+    /// [`crate::fleet_captain::armed_singleton_job_names_for_host`], the
+    /// merge this field is sampled from. Empty on a host that is not the
+    /// captain, on a host with no declared singleton jobs at all, and on a
+    /// pre-#8848 daemon.
+    ///
+    /// `#[serde(default)]` so a pre-#8848 record still decodes (as an empty
+    /// list) rather than failing the whole envelope — the same
+    /// backward-compatibility contract `active_sweep_ids` established.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub armed_singleton_jobs: Vec<String>,
+    /// Declared-singleton-job names refused on this host because **no**
+    /// `fleet.captain` is declared at all (Issue #9014), from
+    /// [`crate::fleet_captain::captainless_singleton_job_names`]. Such a job
+    /// runs nowhere; before this field the only trace was a daemon-log WARN.
+    /// A not-this-host refusal is routine and is not listed. Omitted when
+    /// empty; a pre-#9014 record decodes as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captainless_singleton_jobs: Vec<String>,
 }
 
 /// One repository this host's daemon is currently managing (Issue #4976) —

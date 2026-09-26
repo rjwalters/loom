@@ -192,6 +192,15 @@ enum Commands {
         json: bool,
     },
 
+    /// Show the work finder's ready queue in its real dispatch order
+    /// (workspace priority, `loom:urgent`, oldest first) with what the last
+    /// tick did with each issue and why, plus a freshness line (Issue #8852).
+    Queue {
+        /// Emit machine-readable JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// One-shot consolidated fleet vitals with an exit-code contract for watch
     /// loops (Issue #4761): trusted liveness, dispatch state, token pool,
     /// role-tick health, queue depth, and merge throughput — one structured
@@ -712,6 +721,16 @@ enum Commands {
     /// happens to be **stopped** when the clean runs gets no such
     /// protection — nothing in a process table can see it. Never point a
     /// launchd/systemd unit at a path under a build-output directory.
+    ///
+    /// **Stale native launch state** (issue #8663): unless one of the
+    /// `--*-only` flags narrows the pass, it also covers per-launch native
+    /// harness state under `~/.local/state/loom/native-tools`
+    /// (`LOOM_NATIVE_TOOLS_DIR` when set). A session directory whose recorded
+    /// harness pid is still alive on this host is never removed, whatever its
+    /// age; everything else is aged out (15 minutes once the pid has exited,
+    /// 6 hours with no usable record). `--safe` does not narrow this — a
+    /// session directory has no merged PR to check — but removal does require
+    /// `--force`/`-y`; without it the pass only reports.
     Clean {
         /// Workspace directory (repo root, or any path under it).
         #[arg(long, value_name = "PATH", default_value = ".")]
@@ -870,11 +889,11 @@ enum Commands {
     /// (`loom_tools.auto_merge`) Python CLIs (epic #4081 Phase 3, family 3).
     ///
     /// GitHub is native: `issue`/`pr`/`auth` are a byte-identical passthrough
-    /// to `gh`, and `auto-merge` enables auto-merge via the
+    /// to `gh`, and `auto-merge` (OPERATOR-ONLY since #8410/#8427 — no Loom
+    /// merge path calls it) arms GitHub's server-side auto-merge via the
     /// `enablePullRequestAutoMerge` GraphQL mutation (no working-tree
-    /// checkout). Gitea declines with exit code 3 so the caller's shell path
-    /// (`merge-pr.sh`'s `forge_auto_merge`, or the `gh` read fallback) carries
-    /// it. Forge config resolves from the canonical repo root (never a
+    /// checkout). Gitea declines with exit code 3 (the `gh` read fallback
+    /// carries reads; there is no Gitea auto-merge arm). Forge config resolves from the canonical repo root (never a
     /// worktree CWD); see `forge_cmd.rs` for the full #4061 semantics.
     ///
     /// NOTE (#5047): the byte-identical passthrough means `forge issue
@@ -1871,12 +1890,26 @@ enum ForgeAction {
         issue: u32,
     },
 
-    /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]` —
-    /// enable auto-merge for a PR (formerly `loom-auto-merge`). GitHub:
-    /// `enablePullRequestAutoMerge` GraphQL mutation. Gitea: declines (exit
-    /// 3) → shell `forge_auto_merge`. `--poll-interval` / `--timeout` are
-    /// accepted for CLI compatibility and ignored on GitHub (the server
-    /// queues the merge).
+    /// OPERATOR-ONLY: arm GitHub's server-side auto-merge for a PR. Not a
+    /// Loom merge path — use `merge-pr.sh` instead.
+    ///
+    /// SAFETY CAVEAT (#8410, #8427): once armed, GitHub merges the PR as soon
+    /// as the branch ruleset's REQUIRED checks pass. It does NOT re-read the
+    /// `loom:pr` label, a later `loom:verdict-stale` / `loom:changes-requested`
+    /// revocation, or any non-required test suite — PR #8220 merged exactly
+    /// that way over a revoked verdict with five suites still running. No Loom
+    /// merge path arms a server-side merge: `merge-pr.sh --auto` waits for the
+    /// head's check-runs to settle, re-validates, and merges in-process. Use
+    /// this verb only when a human deliberately wants a queued merge and
+    /// accepts that it bypasses Loom's merge-time gates. Kept (rather than
+    /// deleted) as a CLI compatibility surface for installed pre-#8410
+    /// `merge-pr.sh` copies.
+    ///
+    /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]`
+    /// (formerly `loom-auto-merge`). GitHub: `enablePullRequestAutoMerge`
+    /// GraphQL mutation. Gitea: declines (exit 3) — there is no Gitea arm.
+    /// `--poll-interval` / `--timeout` are accepted for CLI compatibility and
+    /// ignored (the server queues the merge).
     #[command(name = "auto-merge")]
     AutoMerge {
         /// Pull request number.
@@ -1896,15 +1929,62 @@ enum ForgeAction {
         #[arg(long, value_name = "SHA")]
         expected_head_sha: Option<String>,
 
-        /// Seconds between CI polls (Gitea shell path only). Accepted for
-        /// compatibility; unused on the GitHub native path.
+        /// Seconds between CI polls. Accepted for CLI compatibility only;
+        /// ignored (the retired Gitea shell poller was its only reader).
         #[arg(long, value_name = "SECONDS")]
         poll_interval: Option<u64>,
 
-        /// Max seconds to wait for CI (Gitea shell path only). Accepted for
-        /// compatibility; unused on the GitHub native path.
+        /// Max seconds to wait for CI. Accepted for CLI compatibility only;
+        /// ignored (the retired Gitea shell poller was its only reader).
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
+    },
+
+    /// Disarm GitHub's server-side auto-merge on a PR. Safe to call anywhere a
+    /// review verdict is invalidated.
+    ///
+    /// The inverse of `auto-merge`, and deliberately NOT operator-only: it can
+    /// only turn a queued merge OFF, never on, so there is no state in which
+    /// calling it makes an unreviewed merge more likely.
+    ///
+    /// WHY IT EXISTS (#8900): an armed auto-merge is gated only by the branch
+    /// ruleset's REQUIRED checks. Clearing `loom:pr` for a head move does not
+    /// disarm it, so the queued merge fires as soon as required checks pass on
+    /// the NEW, unreviewed head — bypassing `loom:pr`, the non-required suites,
+    /// and the #8248 required-check-freshness guard (which lives inside
+    /// `merge-pr.sh`). #8694 merged that way on 2026-09-25, three minutes after
+    /// a rebase force-push, still labeled `loom:review-requested`.
+    ///
+    /// Prints `DISARMED=1` (an arm was disabled) or `DISARMED=0` (nothing was
+    /// armed — no mutation sent) and exits 0 for both; exits 1 when the arm
+    /// state could not be read or the mutation failed (treat as possibly still
+    /// armed, never as an all-clear); exits 3 on Gitea, which has no
+    /// server-side arm to disable.
+    ///
+    /// `--audit-comment` also records what the disarm did as a PR comment, so a
+    /// caller does not have to compose (and duplicate) that prose itself. It is
+    /// silent when nothing was armed, which is the common case — no PR ever
+    /// collects a comment saying nothing happened. This is the flag
+    /// `verdict-staleness-guard.sh --clear` uses; `--hold` tells it the PR is
+    /// parked so the comment explains why a held PR was written to at all.
+    #[command(name = "disable-auto-merge")]
+    DisableAutoMerge {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// Record what the disarm did as a comment on the PR. Silent when
+        /// nothing was armed.
+        #[arg(long)]
+        audit_comment: bool,
+
+        /// The explicit-hold label found on the PR (`loom:operator`,
+        /// `loom:blocked`, `loom:operator-only`), if any. Shapes the audit
+        /// comment's wording only — it never suppresses the disarm, which can
+        /// only prevent a merge and therefore enforces a hold rather than
+        /// undoing it. An empty value means "not held".
+        #[arg(long, value_name = "LABEL")]
+        hold: Option<String>,
     },
 
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
@@ -2241,150 +2321,7 @@ enum TokensAction {
     },
 }
 
-/// Sub-actions for `loom-daemon accounts`.
-#[derive(Subcommand)]
-enum AccountsAction {
-    /// Create a named profile and run the provider's interactive login.
-    Add {
-        #[arg(value_name = "PROVIDER")]
-        provider: String,
-        #[arg(value_name = "NAME")]
-        name: String,
-        #[arg(long)]
-        device_auth: bool,
-        /// Register this account's email as an alternate lookup key (issue
-        /// #7389) -- `loom-daemon accounts session <action>`/`codex-agent`
-        /// then accept either `NAME` or this email as `<account>`. Profile
-        /// names should stay short identifiers; put the email here instead
-        /// of in `NAME`, which is never sanitized against `docker run --name`.
-        #[arg(long, value_name = "EMAIL")]
-        email: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Import an explicit opaque Codex auth file into a new named profile.
-    Import {
-        #[arg(value_name = "PROVIDER")]
-        provider: String,
-        #[arg(value_name = "NAME")]
-        name: String,
-        #[arg(long, value_name = "PATH")]
-        auth_file: PathBuf,
-        /// Register this account's email as an alternate lookup key (issue
-        /// #7389) -- see `accounts add --email`.
-        #[arg(long, value_name = "EMAIL")]
-        email: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// List registered accounts and secret-free structural diagnostics.
-    List {
-        #[arg(long, value_name = "PROVIDER", default_value = "codex")]
-        provider: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Report each account's **availability** — quota headroom and reset
-    /// horizon — the `tokens check` analogue for the Codex pool (issue
-    /// #8407). Reads each profile's own recorded rate-limit snapshot; makes
-    /// no API call and starts no `codex` process.
-    Check {
-        #[arg(long, value_name = "PROVIDER", default_value = "codex")]
-        provider: String,
-        /// Persist what the probe learned: write the provider-namespaced
-        /// ranking file and feed each conclusive reading into account health,
-        /// where selection already consults it. Without this flag the command
-        /// is a pure read.
-        #[arg(long)]
-        ranking: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Probe one account's structural and login status.
-    Status {
-        #[arg(value_name = "PROVIDER")]
-        provider: String,
-        #[arg(value_name = "NAME")]
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Make an account ineligible without changing its credential state.
-    Disable {
-        #[arg(value_name = "PROVIDER")]
-        provider: String,
-        #[arg(value_name = "NAME")]
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Restore eligibility after structural and permission validation.
-    Enable {
-        #[arg(value_name = "PROVIDER")]
-        provider: String,
-        #[arg(value_name = "NAME")]
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Reauthenticate the existing canonical profile in place.
-    Reauth {
-        #[arg(value_name = "PROVIDER")]
-        provider: String,
-        #[arg(value_name = "NAME")]
-        name: String,
-        #[arg(long)]
-        device_auth: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Retire to private quarantine, or irreversibly delete with `--purge`.
-    Remove {
-        #[arg(value_name = "PROVIDER")]
-        provider: String,
-        #[arg(value_name = "NAME")]
-        name: String,
-        /// Irreversibly delete credential state instead of quarantining it.
-        #[arg(long)]
-        purge: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Per-account session-container lifecycle (issue #6925, Epic #6896
-    /// Phase 2): a long-lived `loom-worker-session` container that owns the
-    /// account's `CODEX_HOME` volume, persisting the Codex auth-refresh
-    /// chain across daemon restarts and serializing every refresh through
-    /// one owning process.
-    Session {
-        #[command(subcommand)]
-        action: SessionAction,
-    },
-    /// Move a profile directory and its registry entry to a new name (issue
-    /// #7401). Refuses when the account is session-managed; stop its
-    /// session container first.
-    Rename {
-        #[arg(value_name = "PROVIDER")]
-        provider: String,
-        #[arg(value_name = "OLD_NAME")]
-        old_name: String,
-        #[arg(value_name = "NEW_NAME")]
-        new_name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Register an on-disk, credentialed profile directory that predates (or
-    /// was created outside of) the registry (issue #7401) — the supported
-    /// recovery path once `.loom/accounts.json` exists, since directory
-    /// discovery stops at that point.
-    Adopt {
-        #[arg(value_name = "PROVIDER")]
-        provider: String,
-        #[arg(value_name = "NAME")]
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-}
+pub(crate) use cli::accounts_args::AccountsAction;
 
 /// Sub-actions for `loom-daemon claude-config` (issue #4415).
 #[derive(Subcommand)]
@@ -2531,7 +2468,6 @@ async fn main() {
 }
 
 use cli::accounts::handle_accounts_command;
-use cli::accounts_session::SessionAction;
 use cli::api_keys::{handle_api_keys_command, ApiKeysAction};
 use cli::cleanup_ops::{
     handle_clean_command, handle_cleanup_command, handle_recover_orphans_command,
@@ -2759,10 +2695,10 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             // sync handler.
             unreachable!("Health is handled in main() before handle_cli_command")
         }
-        Commands::PeerClaims { .. } => {
+        Commands::PeerClaims { .. } | Commands::Queue { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
-            unreachable!("PeerClaims is handled in main() before handle_cli_command")
+            unreachable!("PeerClaims/Queue are handled in main() before handle_cli_command")
         }
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }
