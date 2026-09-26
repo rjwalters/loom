@@ -97,14 +97,25 @@ const SESSION_QUERY: &str = "SELECT model, tokens_input, tokens_output, tokens_r
 /// lock must surface as "no data" quickly, never stall a terminal transition.
 const SQLITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Every `opencode.db` this host has installed, one per OpenCode version —
-/// more than one version routinely coexists under `~/.loom/opt/`, and a sweep
-/// or role tick may have run against any of them, so [`tokens_by_model`]
-/// queries every match and merges the results.
+/// Every `opencode.db` on this host: the operator's own OpenCode store at the
+/// XDG default `${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db`, plus one
+/// per Loom-managed OpenCode version under
+/// `~/.loom/opt/opencode-<ver>/xdg/data/opencode/opencode.db`. More than one
+/// version routinely coexists, and a sweep or role tick may have run against
+/// any of them — including the operator's own install, which is where live
+/// Z.ai GLM usage lands on a host with no Loom-managed store (Issue #8965) —
+/// so [`tokens_by_model`] queries every match and merges the results. Per-call
+/// directory + window attribution keeps other sessions in the same store out.
+///
+/// De-duplicated by canonical path, so a store reachable two ways (an
+/// `XDG_DATA_HOME` pointing into `~/.loom/opt/…`, a symlink) is read once.
+/// Loom-managed stores come first, sorted, then the XDG default.
 ///
 /// [`OPENCODE_DB_ENV`] short-circuits the scan entirely when set (tests, and
 /// an operator pinning an exact path). `home` is injectable for tests;
-/// production passes `None` (resolves via `dirs::home_dir`).
+/// production passes `None` (resolves via `dirs::home_dir`). `XDG_DATA_HOME`,
+/// when set and non-empty, wins over `home` for the XDG default, as it does
+/// for OpenCode itself.
 #[must_use]
 pub fn discover_opencode_dbs(home: Option<&Path>) -> Vec<PathBuf> {
     if let Some(path) = std::env::var_os(OPENCODE_DB_ENV).map(PathBuf::from) {
@@ -114,14 +125,24 @@ pub fn discover_opencode_dbs(home: Option<&Path>) -> Vec<PathBuf> {
             Vec::new()
         };
     }
-    let Some(home) = home.map(Path::to_path_buf).or_else(dirs::home_dir) else {
+    let home = home.map(Path::to_path_buf).or_else(dirs::home_dir);
+    let mut found = home.as_deref().map(loom_managed_dbs).unwrap_or_default();
+    found.sort();
+    if let Some(db) = xdg_default_db(home.as_deref()).filter(|db| db.is_file()) {
+        found.push(db);
+    }
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|db| seen.insert(db.canonicalize().unwrap_or_else(|_| db.clone())));
+    found
+}
+
+/// Every `~/.loom/opt/opencode-<ver>/xdg/data/opencode/opencode.db` that
+/// exists, unsorted.
+fn loom_managed_dbs(home: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(home.join(".loom").join("opt")) else {
         return Vec::new();
     };
-    let opt_dir = home.join(".loom").join("opt");
-    let Ok(entries) = std::fs::read_dir(&opt_dir) else {
-        return Vec::new();
-    };
-    let mut found: Vec<PathBuf> = entries
+    entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
@@ -137,9 +158,18 @@ pub fn discover_opencode_dbs(home: Option<&Path>) -> Vec<PathBuf> {
                 .join("opencode.db")
         })
         .filter(|db| db.is_file())
-        .collect();
-    found.sort();
-    found
+        .collect()
+}
+
+/// `${XDG_DATA_HOME:-<home>/.local/share}/opencode/opencode.db` — the store an
+/// operator's own (non-Loom-managed) OpenCode writes to. `None` only when
+/// neither `XDG_DATA_HOME` nor a home directory is known.
+fn xdg_default_db(home: Option<&Path>) -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".local").join("share")))
+        .map(|data| data.join("opencode").join("opencode.db"))
 }
 
 /// Extract `model.id` from a `session.model` JSON value

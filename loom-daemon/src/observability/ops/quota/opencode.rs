@@ -70,28 +70,12 @@ pub fn pool_provider(opencode_provider: &str) -> String {
     }
 }
 
-/// Every OpenCode store on this host, canonical and de-duplicated.
+/// Every OpenCode store on this host, canonical and de-duplicated — exactly
+/// [`opencode_usage::discover_opencode_dbs`], which owns the XDG-default
+/// addition so the per-sweep readers see the same stores (Issue #8965).
 #[must_use]
 pub fn opencode_dbs(home: Option<&Path>) -> Vec<PathBuf> {
-    let mut dbs = opencode_usage::discover_opencode_dbs(home);
-    if std::env::var_os(opencode_usage::OPENCODE_DB_ENV).is_none() {
-        let data_home = std::env::var_os("XDG_DATA_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                home.map(Path::to_path_buf)
-                    .or_else(dirs::home_dir)
-                    .map(|h| h.join(".local").join("share"))
-            });
-        if let Some(db) = data_home.map(|d| d.join("opencode").join("opencode.db")) {
-            if db.is_file() {
-                dbs.push(db);
-            }
-        }
-    }
-    let mut seen = std::collections::HashSet::new();
-    dbs.retain(|db| seen.insert(db.canonicalize().unwrap_or_else(|_| db.clone())));
-    dbs
+    opencode_usage::discover_opencode_dbs(home)
 }
 
 /// Steps completed in `(since, until]` in one store, or `None` when it cannot
