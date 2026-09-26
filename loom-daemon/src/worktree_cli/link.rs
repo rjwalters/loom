@@ -399,6 +399,15 @@ impl NodeModulesPolicy {
 /// whose lockfile has not been written yet, which is precisely when a worktree
 /// gets created. Deliberately does NOT parse the workspace manifest — the
 /// nested scan avoided a YAML dependency for the same reason (#3528).
+///
+/// Deliberately simpler than `claude-wrapper.sh`'s
+/// `_mcp_resolve_package_manager` (#6779), which has to pick exactly ONE
+/// package manager and therefore ranks the markers (`packageManager` field
+/// first, then a git-TRACKED lockfile over an untracked one). This answers a
+/// different, one-sided question — "could pnpm write through this symlink?" —
+/// where every ambiguous case has the same safe answer, so any marker is
+/// enough and no ranking is needed. Sharing the ranked resolver would import a
+/// precedence order that only matters for the question it was written for.
 fn is_pnpm_workspace(repo_root: &Path) -> bool {
     if is_file(&repo_root.join("pnpm-lock.yaml")) || is_file(&repo_root.join("pnpm-workspace.yaml"))
     {
