@@ -45,12 +45,18 @@
 //!   leaves the symlink itself in place. Reproduced in a sandbox: a canary
 //!   file in the main tree was deleted and pnpm logged
 //!   `Recreating <main>/node_modules`.
-//! - **There is no config knob that prevents this.** pnpm computes
-//!   `confirmModulesPurge: opts.confirmModulesPurge && !opts.ci`, so `CI=true`
-//!   ANDs away any `confirmModulesPurge: true` a repo or a worktree-local
-//!   `.npmrc` sets. Guarding the destructive path from the outside (the shape
-//!   #8944 originally proposed) is therefore not implementable; removing the
-//!   alias is the only fix that holds.
+//! - **There is no config knob that prevents this**, and the abort's own hint
+//!   does not name one that works. `confirmModulesPurge` is not read from
+//!   `.npmrc` at all — pnpm derives it from CLI flags,
+//!   `!(autoConfirmAllPrompts || force)`, and then computes
+//!   `confirmModulesPurge && !ci`. So a worktree-local `.npmrc` saying
+//!   `confirmModulesPurge=false` (or `confirm-modules-purge=false`) changes
+//!   nothing — the run still aborts — while every route that *does* reach the
+//!   flag points the wrong way: `CI=true`, `--yes` and `--force` each turn the
+//!   abort into the purge. All four measured directly (see the PR for #8944).
+//!   Guarding the destructive path from the outside — the shape #8944
+//!   originally proposed — is therefore not implementable; removing the alias
+//!   is the only fix that holds.
 //!
 //! The aliasing is also silently wrong in the benign direction: a branch that
 //! changes dependencies is exercised against the main clone's installed tree
