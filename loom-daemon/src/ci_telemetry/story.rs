@@ -210,7 +210,12 @@ pub fn decide(
                 Err(error) => Stitch::Unresolved(format!("story id refused: {error}")),
             }
         }
-        (0, 1) => Stitch::Unresolved("the only closing reference is in another repository".into()),
+        // Every reference points elsewhere (or was truncated away): there is
+        // no candidate in *this* repository to be ambiguous between.
+        (0, _) => Stitch::Unresolved(format!(
+            "no candidate issue in this repository ({foreign} closing reference(s) elsewhere or \
+             unseen)"
+        )),
         _ => Stitch::Ambiguous(issues.into_iter().collect()),
     }
 }

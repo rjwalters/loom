@@ -469,7 +469,11 @@ fn decide_stitches_only_exactly_one_same_repo_issue() {
     assert_eq!(d("main", &[2]), Stitch::Ambiguous(vec![9027, 9028]));
     assert_eq!(d("feature/issue-1", &[1]), Stitch::Ambiguous(vec![1, 9027]));
     assert!(matches!(d("main", &[3]), Stitch::Unresolved(_)), "cross-repo reference");
-    assert_eq!(d("main", &[7]), Stitch::Ambiguous(vec![]), "several cross-repo references");
+    assert!(
+        matches!(d("main", &[7]), Stitch::Unresolved(_)),
+        "several cross-repo references are unresolved, not ambiguous: there is no candidate \
+         in this repository to choose between"
+    );
     assert!(matches!(d("feature/issue-9027", &[6]), Stitch::Unresolved(_)));
     assert!(matches!(
         decide(&run_with("feature/issue-9027", &[]), None, &closing),
