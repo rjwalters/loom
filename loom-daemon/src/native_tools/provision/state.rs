@@ -292,22 +292,36 @@ fn validate_auth_format(bytes: &[u8], runtime: &str) -> Result<()> {
 }
 
 impl State {
-    /// Pin `TMPDIR` to a private directory inside this launch's own state
-    /// (#8650).
+    /// Pin `TMPDIR` to a private, short-path directory keyed on this launch's
+    /// own uuid (#8650, #8693).
     ///
     /// Without this, a `bun --compile` harness (OpenCode) falls back to the OS
     /// default (`$TMPDIR`, else `/tmp`) and extracts its ~5.5 MB embedded
     /// native addon there on **every** launch, under a fresh
     /// `.<hash>-0000000N.{so,node}` name that nothing ever removes — measured
     /// at 7.6 GB across 1,382 files in 40 hours of scheduled role ticks on one
-    /// worker, which contributed to a live ENOSPC outage. Relocating the
-    /// writes into `<launch state>/tmp` makes them reclaimable by
-    /// [`crate::native_state_reclaim`], which removes the whole per-launch
-    /// directory once it is old enough; a bare `/tmp` extract is
-    /// unattributable and would have to be matched by filename pattern
-    /// instead (see that module's docs for why this direction was chosen).
+    /// worker, which contributed to a live ENOSPC outage. Pinning `TMPDIR`
+    /// makes the extract reclaimable by
+    /// [`crate::native_state_reclaim::sweep_pinned_tmp`] instead of an
+    /// unattributable `/tmp` litter that would have to be matched by filename
+    /// pattern.
+    ///
+    /// The pinned directory is deliberately **not** nested inside
+    /// `self.directory` (an earlier revision used `self.directory.join("tmp")`):
+    /// that full path can run to ~148 bytes, past the 108-byte (Linux) /
+    /// 104-byte (macOS) `sockaddr_un.sun_path` limit once a socket file name is
+    /// appended, breaking anything the harness runs that binds a Unix socket
+    /// under an inherited `TMPDIR` (`cargo test`, Python multiprocessing, Node
+    /// IPC). [`crate::native_state_reclaim::pinned_tmp_base`] is a fixed short
+    /// root instead — see that function's docs for why reclaim still works
+    /// with the directory split out this way.
     fn pin_tmpdir(&self, command: &mut Command) -> Result<()> {
-        let path = self.directory.join("tmp");
+        let uuid = self
+            .directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("launch state directory has no valid uuid name")?;
+        let path = crate::native_state_reclaim::pinned_tmp_base().join(uuid);
         private_directory(&path)?;
         command.env("TMPDIR", path);
         Ok(())

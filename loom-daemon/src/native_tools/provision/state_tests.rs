@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
+use serial_test::serial;
 
 fn workspace(parent: &Path, name: &str) -> PathBuf {
     let root = parent.join(name);
@@ -110,7 +111,10 @@ fn symlink_aliases_into_checkouts_are_rejected_but_external_aliases_work() {
 }
 
 #[test]
+#[serial(native_state_reclaim_env)]
 fn harness_auth_and_session_paths_are_private_and_auth_snapshot_never_changes_source() {
+    use crate::native_state_reclaim::NATIVE_PINNED_TMPDIR_BASE_ENV;
+
     let temp = tempfile::tempdir().unwrap();
     let root = workspace(temp.path(), "repo");
     let private = temp.path().join("credentials");
@@ -122,6 +126,12 @@ fn harness_auth_and_session_paths_are_private_and_auth_snapshot_never_changes_so
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
     }
+    // Isolated so `pin_tmpdir` never writes into the real host's
+    // `/tmp/loom-nt` default, and `#[serial]` above so a concurrently running
+    // test cannot have its own `configure()` call read this override back
+    // (`NATIVE_PINNED_TMPDIR_BASE_ENV` is process-wide, not per-test).
+    let pinned_base = temp.path().join("pinned-tmp");
+    std::env::set_var(NATIVE_PINNED_TMPDIR_BASE_ENV, &pinned_base);
     for runtime in ["pi", "opencode"] {
         let bytes = serde_json::to_vec(&serde_json::json!({"fixture": {
             "type": if runtime == "pi" { "api_key" } else { "api" },
@@ -133,8 +143,15 @@ fn harness_auth_and_session_paths_are_private_and_auth_snapshot_never_changes_so
         let mut command = Command::new("fixture-harness");
         state.configure(&mut command, runtime).unwrap();
         for (name, value) in command.get_envs() {
-            if name.to_string_lossy().ends_with("DIR") || name.to_string_lossy().starts_with("XDG_")
-            {
+            let name = name.to_string_lossy();
+            // TMPDIR is deliberately pinned OUTSIDE `state.directory` (#8693,
+            // see `every_guarded_runtime_pins_tmpdir_into_a_short_reclaimable_path`
+            // for its own placement/length assertions) — every other `*DIR` /
+            // `XDG_*` var stays scoped to the launch's own state directory.
+            if name == "TMPDIR" {
+                continue;
+            }
+            if name.ends_with("DIR") || name.starts_with("XDG_") {
                 assert!(Path::new(value.unwrap()).starts_with(&state.directory));
             }
         }
@@ -152,6 +169,7 @@ fn harness_auth_and_session_paths_are_private_and_auth_snapshot_never_changes_so
         fs::write(auth, "fixture-token-refresh").unwrap();
         assert_eq!(fs::read(&source).unwrap(), bytes);
     }
+    std::env::remove_var(NATIVE_PINNED_TMPDIR_BASE_ENV);
 }
 
 /// #8650: a `bun --compile` harness extracts its embedded native addon into
@@ -161,12 +179,19 @@ fn harness_auth_and_session_paths_are_private_and_auth_snapshot_never_changes_so
 /// only relocate the leak, since nothing ever removed a per-launch directory
 /// either.
 #[test]
-fn every_guarded_runtime_pins_tmpdir_into_launch_state_whose_extract_is_reclaimed() {
+#[serial(native_state_reclaim_env)]
+fn every_guarded_runtime_pins_tmpdir_into_a_short_reclaimable_path() {
+    use crate::native_state_reclaim::{self, NATIVE_PINNED_TMPDIR_BASE_ENV};
+
     let temp = tempfile::tempdir().unwrap();
     let root = workspace(temp.path(), "repo");
     let base = temp.path().join("native-state");
+    let pinned_base = temp.path().join("pinned-tmp");
+    std::env::set_var(NATIVE_PINNED_TMPDIR_BASE_ENV, &pinned_base);
+
     for runtime in ["pi", "opencode", "kimi"] {
         let state = create(&root, Some(&base), None, None).unwrap();
+        let uuid = state.directory.file_name().unwrap().to_owned();
         let mut command = Command::new("fixture-harness");
         state.configure(&mut command, runtime).unwrap();
 
@@ -176,8 +201,15 @@ fn every_guarded_runtime_pins_tmpdir_into_launch_state_whose_extract_is_reclaime
             .and_then(|(_, value)| value)
             .map(PathBuf::from)
             .unwrap_or_else(|| panic!("{runtime} launch must pin TMPDIR"));
-        assert_eq!(tmpdir, state.directory.join("tmp"));
+        assert_eq!(tmpdir, pinned_base.join(&uuid));
         assert!(tmpdir.is_dir());
+        // 108 bytes is the tightest sockaddr_un.sun_path limit (Linux); leave
+        // headroom for a socket file name on top of the pinned directory.
+        assert!(
+            tmpdir.as_os_str().len() < 90,
+            "{runtime} pinned TMPDIR {} is too long for a Unix socket path",
+            tmpdir.display()
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -189,18 +221,27 @@ fn every_guarded_runtime_pins_tmpdir_into_launch_state_whose_extract_is_reclaime
         let extract = tmpdir.join(".c0ffee1234567890-00000001.node");
         fs::write(&extract, vec![0u8; 2048]).unwrap();
 
-        // The reclaim pass removes the whole launch directory once it is past
-        // the age floor — proving the extracted file is actually gone, not
-        // merely written somewhere else.
-        let launch_base = state.directory.parent().unwrap().parent().unwrap();
-        let far_future = chrono::Utc::now() + chrono::Duration::hours(48);
-        let (removed, bytes) =
-            crate::native_state_reclaim::sweep(launch_base, 24 * 3600, far_future);
-        assert_eq!(removed, 1, "{runtime} launch state must be reclaimable");
+        // While the launch's own state directory still exists, the pinned
+        // TMPDIR companion is kept — no separate age/liveness policy governs
+        // it, only whether its owner is still around.
+        let session_bases = vec![base.clone()];
+        let (removed, _bytes) =
+            native_state_reclaim::sweep_pinned_tmp(&pinned_base, &session_bases);
+        assert_eq!(removed, 0, "{runtime}: a live launch's pinned tmpdir must be kept");
+        assert!(extract.exists());
+
+        // Once the launch's state directory is gone (as `reap::reap_base`
+        // would do once the session is stale), the orphaned companion is
+        // reclaimed on the next pass.
+        fs::remove_dir_all(&state.directory).unwrap();
+        let (removed, bytes) = native_state_reclaim::sweep_pinned_tmp(&pinned_base, &session_bases);
+        assert_eq!(removed, 1, "{runtime}: an orphaned pinned tmpdir must be reclaimable");
         assert!(bytes >= 2048);
         assert!(!extract.exists(), "{runtime} native extract must be removed");
-        assert!(!state.directory.exists());
+        assert!(!tmpdir.exists());
     }
+
+    std::env::remove_var(NATIVE_PINNED_TMPDIR_BASE_ENV);
 }
 
 #[test]

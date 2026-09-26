@@ -1,73 +1,75 @@
-//! Reclaim of per-launch guarded-native-harness state under
-//! `~/.local/state/loom/native-tools/<workspace-hash>/<launch-uuid>` (#8650).
+//! Reclaim of guarded-native-harness host state that nothing else removes
+//! (#8650): the periodic tick side of [`crate::native_tools::provision::reap`]
+//! plus the pinned `TMPDIR` companion directories that live outside it.
 //!
-//! # What was leaking
+//! # Two directories, two owners
 //!
-//! [`crate::native_tools::provision`] allocates a **fresh UUID-named directory
-//! per launch** for every guarded native harness (pi / opencode / kimi) and
-//! pins the harness's `XDG_*` (and, since #8650, `TMPDIR`) at it, so two
-//! concurrent launches can never share mutable state. Nothing has ever removed
-//! those directories: `State` has no `Drop`, and there is no process left to
-//! run one — `defaults/scripts/spawn-worker.sh` execs `loom-daemon
-//! spawn-worker`, which in turn `exec()`s the harness binary itself, replacing
-//! the process image. The launch chain is a continuous exec replacement with
-//! no surviving parent, so "clean up when the session ends" cannot be
-//! in-process here; it has to be a periodic pass over what the launches left
-//! behind. That is this module.
+//! Every guarded native harness launch (pi / opencode / kimi) gets a fresh
+//! UUID-named session directory under
+//! `~/.local/state/loom/native-tools/<workspace-hash>/<launch-uuid>` (or under
+//! `$LOOM_NATIVE_TOOLS_DIR`) — [`crate::native_tools::provision::state`]. That
+//! directory's own reclaim is [`crate::native_tools::provision::reap`]'s job
+//! (#8663): it knows how to tell a live launch from a dead one (same-host pid
+//! liveness, or age when that is unanswerable) and already runs at the start
+//! of the next launch for the same workspace, plus the operator-driven
+//! `loom-daemon clean`. Both of those are launch-triggered, though, so a
+//! workspace that stops launching new sessions never gets swept again. This
+//! module's first job is closing that gap: a periodic call into
+//! [`crate::native_tools::provision::reap::reap_base`] on the host-level
+//! reaper tick, so an idle workspace's stale sessions still age out. **This is
+//! deliberately the *only* extra reclaim logic for that directory shape** — an
+//! earlier revision of this module re-implemented its own age-only sweep of
+//! the same directories, which raced #8705's liveness-aware reap: it would
+//! delete a live, idle session's state that #8705 deliberately keeps, and nothing
+//! stopped both landing in the same tick (#8693 review). One directory shape,
+//! one reaper.
 //!
-//! The volume driver was the OpenCode harness: a `bun --compile` binary
-//! extracts its ~5.5 MB embedded native addon into the OS temp directory on
-//! every launch. One worker accumulated **7.6 GB across 1,382 files in 40
-//! hours** of scheduled role-runner ticks, contributing to a live ENOSPC
-//! outage (2AMLogic/2am#883).
+//! The second directory this module owns end-to-end is the pinned `TMPDIR`
+//! companion ([`pinned_tmp_base`], below) — a separate, short-path root that
+//! [`crate::native_tools::provision::state::State`] points every guarded
+//! launch's `TMPDIR` at, so a `bun --compile` harness's (OpenCode's) ~5.5 MB
+//! embedded-native-addon extract lands somewhere Loom can attribute and remove
+//! rather than in the shared OS `/tmp` under an anonymous name. One worker
+//! accumulated **7.6 GB across 1,382 files in 40 hours** of scheduled
+//! role-runner ticks this way, contributing to a live ENOSPC outage
+//! (2AMLogic/2am#883).
 //!
-//! # Why relocate-then-reclaim, not a `/tmp` pattern sweep
+//! # Why the pinned `TMPDIR` is a separate, short-path root
 //!
-//! The alternative considered in #8650 was to leave `TMPDIR` alone and have
-//! the daemon delete `$TMPDIR/.*-0000000[0-9].{so,node}` by filename pattern.
-//! That was rejected: the shared OS `/tmp` is a namespace the daemon does not
-//! own, and matching by name alone cannot distinguish a stale extract from one
-//! a *live* harness (or an unrelated tenant's bun program) is still mapping.
-//! `crate::tmpfs_reclaim`'s module docs spell out the same tension, and
-//! `crate::scratch_reclaim`'s docs state the rule this follows: the daemon
-//! reclaims what it created and can attribute, never a cache it did not.
+//! The obvious place to pin `TMPDIR` would be inside the launch's own session
+//! directory (e.g. `<session>/tmp`) — the first version of this fix did
+//! exactly that. It does not work: the full path,
+//! `<home>/.local/state/loom/native-tools/<64-hex-sha256>/<launch-uuid>/tmp`,
+//! runs to roughly 148 bytes on a typical host, and `sockaddr_un.sun_path` is
+//! limited to 108 bytes on Linux and 104 on macOS. `TMPDIR` is inherited by
+//! everything the harness runs, including `cargo test` binding a
+//! `UnixListener` under a tempdir, Python multiprocessing, and Node IPC — all
+//! of which fail to bind a socket once the inherited `TMPDIR` alone is that
+//! long (#8693 review). [`pinned_tmp_base`] fixes the length at a constant,
+//! short root (`/tmp/loom-nt` on Unix) regardless of `$HOME`'s length, leaving
+//! comfortable headroom for a socket file name under either limit.
 //!
-//! Pinning `TMPDIR` into the launch's own state directory converts the
-//! unattributable `/tmp` litter into exactly that — a directory the daemon
-//! created, named with the launch UUID it allocated — and it retires the
-//! *second*, pre-existing leak in the same move: the per-launch directories
-//! themselves, which have been accumulating (small, but unboundedly) since
-//! they were introduced.
-//!
-//! # Safety: shape + age floor, no liveness probe
-//!
-//! Two gates, both mandatory:
-//!
-//! 1. [`is_scoped_launch_state_path`] refuses anything that is not literally
-//!    `<base>/<64-hex-sha256>/<uuid-v4>` — exactly the two-level shape
-//!    `native_tools::provision::state::create` allocates. A stray file, a
-//!    hand-made directory, the workspace-hash directory itself, and anything
-//!    nested deeper are all left alone.
-//! 2. [`is_reclaimable_age`] compares an age floor (default 24h) against the
-//!    **newest** mtime found anywhere underneath the launch directory, not the
-//!    directory's own mtime — a live harness writing into `state/` or `tmp/`
-//!    keeps its whole subtree fresh, while the directory's own mtime would
-//!    have frozen at launch time.
-//!
-//! There is deliberately no process-liveness probe (unlike
-//! [`crate::tmpfs_reclaim`], whose orphans have no other evidence available):
-//! the age floor is the entire safety boundary, mirroring
-//! [`crate::scratch_reclaim`], which is why it defaults far above any
-//! plausible harness session's duration.
+//! Splitting the pinned `TMPDIR` out from the session directory means it needs
+//! its own reclaim ([`sweep_pinned_tmp`]) — but not its own liveness or age
+//! policy. A pinned `TMPDIR` entry can only exist for a launch whose session
+//! directory was created first ([`crate::native_tools::provision::state::State::configure`]
+//! runs after the session directory is provisioned), so once that session
+//! directory is gone, its `TMPDIR` companion is unconditionally orphaned: no
+//! separate age floor is needed; the companion is simply removed as soon as
+//! its owner disappears. This sidesteps the age-floor-of-zero footgun the
+//! first version of this fix had ([`crate::native_tools::provision::reap`]'s
+//! own liveness check on the *session* directory is what actually protects a
+//! live launch — an age gate on the companion could never see that liveness
+//! signal on its own).
 //!
 //! # Cadence
 //!
 //! A host-level sibling pass on [`crate::worktree_reaper::reap_repo`]'s
 //! 15-minute tick, alongside [`crate::docker_image_clean`] and
-//! [`crate::tmpfs_reclaim`] — the launch state lives outside every repo and is
-//! keyed by workspace hash, so it has no per-repo cadence to ride. Its
-//! cooldown is host-wide for the same reason: a multi-repo host must not
-//! re-walk the same base directory once per registered repo per tick.
+//! [`crate::tmpfs_reclaim`] — both directories this module reclaims live
+//! outside every repo, so there is no per-repo cadence to ride. The cooldown
+//! is host-wide for the same reason: a multi-repo host must not re-walk the
+//! same bases once per registered repo per tick.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -82,35 +84,28 @@ use chrono::{DateTime, Utc};
 /// `1`/`true`/`yes`/`on` force-enables even when config disables it.
 pub const NATIVE_STATE_RECLAIM_ENABLE_ENV: &str = "LOOM_NATIVE_STATE_RECLAIM";
 
-/// Env override for the reclaim age floor (hours).
-pub const NATIVE_STATE_RECLAIM_MAX_AGE_HOURS_ENV: &str = "LOOM_NATIVE_STATE_RECLAIM_MAX_AGE_HOURS";
-
 /// Env override for the host-wide cooldown between passes (seconds).
 pub const NATIVE_STATE_RECLAIM_MIN_INTERVAL_ENV: &str =
     "LOOM_NATIVE_STATE_RECLAIM_MIN_INTERVAL_SECS";
 
 /// The same env override `native_tools::provision::state::prepare` honors when
-/// choosing where to allocate per-launch state, read here so a host that
-/// relocates that base still gets it swept.
+/// choosing where to allocate per-launch session state, read here so a host
+/// that relocates that base still gets it swept.
 pub const NATIVE_TOOLS_DIR_ENV: &str = "LOOM_NATIVE_TOOLS_DIR";
 
-/// Default age floor: 24 hours, matching [`crate::scratch_reclaim`]. Measured
-/// against the newest mtime anywhere under a launch directory, so a harness
-/// session would have to be completely idle — writing nothing at all, not even
-/// through its pinned `TMPDIR` — for a full day before its state is a
-/// candidate.
-pub const DEFAULT_NATIVE_STATE_MAX_AGE_HOURS: u64 = 24;
+/// Env override for [`pinned_tmp_base`], test-only isolation seam (production
+/// hosts use the fixed short default).
+pub const NATIVE_PINNED_TMPDIR_BASE_ENV: &str = "LOOM_NATIVE_PINNED_TMPDIR_BASE";
 
 /// Default host-wide cooldown between passes: 30 minutes, matching
 /// [`crate::tmpfs_reclaim`] and [`crate::docker_image_clean`]. This is a local
 /// filesystem walk with no shell-out, so the cooldown only keeps a multi-repo
-/// host from re-walking the base once per repo per reaper tick.
+/// host from re-walking the bases once per repo per reaper tick.
 pub const DEFAULT_NATIVE_STATE_MIN_INTERVAL_SECS: u64 = 1_800;
 
-/// Path under a launch state directory that `State::configure` pins `TMPDIR`
-/// at. Named here so the reclaim side and the launch side cannot drift apart
-/// silently.
-pub const LAUNCH_TMPDIR_LEAF: &str = "tmp";
+/// Fixed leaf name for [`pinned_tmp_base`]'s default. Short and constant so
+/// the pinned `TMPDIR` path length never depends on `$HOME`.
+const PINNED_TMPDIR_LEAF: &str = "loom-nt";
 
 // ============================================================================
 // Config (.loom/config.json → autonomous.worktreeReaper.nativeStateReclaim)
@@ -121,13 +116,15 @@ pub const LAUNCH_TMPDIR_LEAF: &str = "tmp";
 /// field is `Option` so an absent key falls through to the env-var /
 /// built-in-default resolution — precedence **env > config > default**,
 /// matching every other `autonomous.*` surface.
+///
+/// There is deliberately no age-floor knob here (an earlier revision had
+/// `maxAgeHours`): both directories this module reclaims now derive their
+/// staleness from [`crate::native_tools::provision::reap`]'s own liveness
+/// check rather than a standalone age policy — see the module docs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NativeStateReclaimConfig {
     /// `…nativeStateReclaim.enabled` (default **true**).
     pub enabled: Option<bool>,
-    /// `…nativeStateReclaim.maxAgeHours` — reclaim launch directories at least
-    /// this old.
-    pub max_age_hours: Option<u64>,
     /// `…nativeStateReclaim.minIntervalSecs` — host-wide cooldown between
     /// passes (a zero/invalid value drops to `None`).
     pub min_interval_secs: Option<u64>,
@@ -148,7 +145,6 @@ pub fn read_native_state_reclaim_config(repo_root: &Path) -> NativeStateReclaimC
 
     NativeStateReclaimConfig {
         enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
-        max_age_hours: block.get("maxAgeHours").and_then(serde_json::Value::as_u64),
         min_interval_secs: block
             .get("minIntervalSecs")
             .and_then(serde_json::Value::as_u64)
@@ -163,16 +159,6 @@ pub fn resolve_enabled(config: &NativeStateReclaimConfig) -> bool {
         return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
     }
     config.enabled.unwrap_or(true)
-}
-
-/// Resolve the age floor (hours) — precedence **env > config > default**.
-#[must_use]
-pub fn resolve_max_age_hours(config: &NativeStateReclaimConfig) -> u64 {
-    std::env::var(NATIVE_STATE_RECLAIM_MAX_AGE_HOURS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .or(config.max_age_hours)
-        .unwrap_or(DEFAULT_NATIVE_STATE_MAX_AGE_HOURS)
 }
 
 /// Resolve the cooldown (seconds) — precedence **env > config > default**. A
@@ -192,29 +178,6 @@ pub fn resolve_min_interval_secs(config: &NativeStateReclaimConfig) -> u64 {
 // Pure gates
 // ============================================================================
 
-/// Whether an entry whose newest mtime is `age_secs` old is eligible for
-/// removal at the `max_age_secs` floor. Pure so the age gate is unit-testable
-/// in compressed time — no real 24-hour-old directory needed.
-///
-/// A negative `age_secs` (clock skew, or an mtime in the future) is never
-/// reclaimable, and `max_age_secs` is floored at `0` so a misconfigured
-/// negative floor cannot invert the comparison into "reclaim everything".
-#[must_use]
-pub fn is_reclaimable_age(age_secs: i64, max_age_secs: i64) -> bool {
-    age_secs >= 0 && age_secs >= max_age_secs.max(0)
-}
-
-/// Whether `name` is a workspace-hash directory: the lowercase hex SHA-256 of
-/// the canonical workspace root, as written by
-/// `native_tools::provision::state::create`.
-#[must_use]
-pub fn is_workspace_hash(name: &str) -> bool {
-    name.len() == 64
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
 /// Whether `name` is a per-launch directory: the lowercase hyphenated form of
 /// a v4 UUID, as written by `native_tools::provision::state::create`.
 #[must_use]
@@ -232,34 +195,11 @@ pub fn is_launch_id(name: &str) -> bool {
     })
 }
 
-/// Whether `path` is literally `<base>/<workspace-hash>/<launch-uuid>` — the
-/// *only* shape this pass is ever allowed to remove. Refuses the base itself,
-/// a workspace-hash directory (shared across launches, and cheap to keep), a
-/// path nested deeper than a launch directory, and any name that does not
-/// match what `create` allocates.
-#[must_use]
-pub fn is_scoped_launch_state_path(base: &Path, path: &Path) -> bool {
-    let Ok(rel) = path.strip_prefix(base) else {
-        return false;
-    };
-    let mut components = rel.components();
-    let Some(std::path::Component::Normal(hash)) = components.next() else {
-        return false;
-    };
-    let Some(std::path::Component::Normal(launch)) = components.next() else {
-        return false;
-    };
-    if components.next().is_some() {
-        return false;
-    }
-    hash.to_str().is_some_and(is_workspace_hash) && launch.to_str().is_some_and(is_launch_id)
-}
-
 // ============================================================================
-// I/O
+// I/O — session-directory bases (reclaimed via `reap::reap_base`)
 // ============================================================================
 
-/// Every base directory that may hold per-launch native state on this host:
+/// Every base directory that may hold per-launch session state on this host:
 /// `$LOOM_NATIVE_TOOLS_DIR` when set, **replacing** (never adding to) the
 /// default `~/.local/state/loom/native-tools` — this deliberately mirrors
 /// `native_tools::provision::state::create`'s own override resolution (an
@@ -268,11 +208,10 @@ pub fn is_scoped_launch_state_path(base: &Path, path: &Path) -> bool {
 /// it is set. It also means a test that overrides `LOOM_NATIVE_TOOLS_DIR` to
 /// a private tempdir gets **only** that tempdir swept — never the real,
 /// live `~/.local/state/loom/native-tools` on the host running the test.
-/// An earlier revision swept both unconditionally, which let a
-/// `maxAgeHours=0` test fixture make every real per-launch directory on the
-/// host "reclaimable" and delete them out from under concurrently running
-/// harness launches (#8650 — caught before merge). Non-existent candidates
-/// are dropped.
+/// An earlier revision swept both unconditionally, which let a test fixture
+/// make every real per-launch directory on the host a sweep candidate and
+/// delete them out from under concurrently running harness launches (#8650 —
+/// caught before merge). Non-existent candidates are dropped.
 #[must_use]
 pub fn base_dirs() -> Vec<PathBuf> {
     let candidate = match std::env::var_os(NATIVE_TOOLS_DIR_ENV).filter(|value| !value.is_empty()) {
@@ -290,32 +229,41 @@ pub fn base_dirs() -> Vec<PathBuf> {
     }
 }
 
-/// Total size in bytes and newest modification time under `path`, walking it
-/// recursively without following symlinks. A read failure at any level
-/// contributes nothing for that subtree rather than propagating: the size is
-/// informational (a log line), and an unreadable subtree must never make a
-/// directory look *older* than it is, which is why the newest mtime seen so
-/// far is simply carried forward.
-fn size_and_newest_mtime(path: &Path) -> (u64, Option<DateTime<Utc>>) {
-    fn bump(newest: &mut Option<DateTime<Utc>>, candidate: Option<DateTime<Utc>>) {
-        if let Some(candidate) = candidate {
-            if newest.is_none() || newest.is_some_and(|current| candidate > current) {
-                *newest = Some(candidate);
-            }
-        }
-    }
-    fn mtime(meta: &std::fs::Metadata) -> Option<DateTime<Utc>> {
-        meta.modified().ok().map(DateTime::<Utc>::from)
-    }
+// ============================================================================
+// I/O — the pinned-TMPDIR companion base (reclaimed here)
+// ============================================================================
 
-    let mut total = 0u64;
-    let mut newest: Option<DateTime<Utc>> = None;
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        bump(&mut newest, mtime(&meta));
-    }
+#[cfg(unix)]
+fn platform_tmp_root() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+#[cfg(not(unix))]
+fn platform_tmp_root() -> PathBuf {
+    std::env::temp_dir()
+}
+
+/// Base directory for every guarded launch's pinned `TMPDIR`
+/// ([`crate::native_tools::provision::state::State::configure`] joins a
+/// launch's own uuid onto this). See the module docs for why this is a fixed
+/// short root rather than a path nested inside the launch's session
+/// directory.
+#[must_use]
+pub fn pinned_tmp_base() -> PathBuf {
+    std::env::var_os(NATIVE_PINNED_TMPDIR_BASE_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| platform_tmp_root().join(PINNED_TMPDIR_LEAF))
+}
+
+/// Bytes held by everything under `path`. Best effort — an unreadable entry
+/// contributes zero rather than aborting a pass whose purpose is to free
+/// space.
+fn dir_size(path: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else {
-        return (total, newest);
+        return 0;
     };
+    let mut total = 0u64;
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else {
             continue;
@@ -323,71 +271,75 @@ fn size_and_newest_mtime(path: &Path) -> (u64, Option<DateTime<Utc>>) {
         if meta.is_symlink() {
             continue;
         }
-        if meta.is_dir() {
-            let (bytes, child_newest) = size_and_newest_mtime(&entry.path());
-            total += bytes;
-            bump(&mut newest, child_newest);
+        total += if meta.is_dir() {
+            dir_size(&entry.path())
         } else {
-            total += meta.len();
-            bump(&mut newest, mtime(&meta));
-        }
+            meta.len()
+        };
     }
-    (total, newest)
+    total
 }
 
-/// Remove every `<base>/<workspace-hash>/<launch-uuid>` directory whose newest
-/// mtime is at least `max_age_secs` old, injected with `now` so this is
-/// testable in compressed time. Returns `(directories_removed, bytes_freed)`.
+/// Whether a launch's session directory (named `uuid`) still exists under any
+/// workspace-hash directory beneath `session_base`. `reap::reap_base`'s own
+/// pid-liveness check is what actually decides whether a session directory
+/// survives a pass — this only asks whether that decision has already been
+/// made, so the pinned-`TMPDIR` companion never needs a liveness or age
+/// policy of its own.
+fn session_directory_exists(session_base: &Path, uuid: &str) -> bool {
+    let Ok(workspaces) = std::fs::read_dir(session_base) else {
+        return false;
+    };
+    workspaces
+        .flatten()
+        .any(|workspace| workspace.path().join(uuid).is_dir())
+}
+
+/// Remove every pinned-`TMPDIR` entry under `pinned_tmp_base` whose owning
+/// session directory (searched across `session_bases`) no longer exists.
+/// Returns `(directories_removed, bytes_freed)`.
 ///
-/// The [`is_scoped_launch_state_path`] check is applied to every candidate
-/// even though the enumeration below only ever produces that shape — a
-/// defensive re-assertion, so a future refactor of the walk cannot silently
-/// widen the blast radius without this also tripping.
+/// Fails safe when `session_bases` is empty: with no session base to check
+/// against, "the owner is gone" cannot be verified, so nothing is removed
+/// rather than guessing every entry is orphaned.
 #[must_use]
-pub fn sweep(base: &Path, max_age_secs: i64, now: DateTime<Utc>) -> (usize, u64) {
+pub fn sweep_pinned_tmp(pinned_tmp_base: &Path, session_bases: &[PathBuf]) -> (usize, u64) {
+    if session_bases.is_empty() {
+        return (0, 0);
+    }
+    let Ok(entries) = std::fs::read_dir(pinned_tmp_base) else {
+        return (0, 0);
+    };
     let mut removed_count = 0usize;
     let mut removed_bytes = 0u64;
-    let Ok(workspaces) = std::fs::read_dir(base) else {
-        return (removed_count, removed_bytes);
-    };
-    for workspace in workspaces.flatten() {
-        if !workspace
-            .file_name()
-            .to_str()
-            .is_some_and(is_workspace_hash)
-        {
-            continue;
-        }
-        let Ok(launches) = std::fs::read_dir(workspace.path()) else {
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        for launch in launches.flatten() {
-            let path = launch.path();
-            if !is_scoped_launch_state_path(base, &path) {
-                continue;
+        if !is_launch_id(&name) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if session_bases
+            .iter()
+            .any(|base| session_directory_exists(base, &name))
+        {
+            continue; // the launch's session directory is still present
+        }
+        let path = entry.path();
+        let bytes = dir_size(&path);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                removed_count += 1;
+                removed_bytes += bytes;
             }
-            if !launch.file_type().is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            let (bytes, newest) = size_and_newest_mtime(&path);
-            // An unreadable mtime is "not reclaimable", never "infinitely old".
-            let Some(newest) = newest else {
-                continue;
-            };
-            if !is_reclaimable_age((now - newest).num_seconds(), max_age_secs) {
-                continue;
-            }
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => {
-                    removed_count += 1;
-                    removed_bytes += bytes;
-                }
-                Err(error) => {
-                    log::debug!(
-                        "native_state_reclaim: could not remove {}: {error}",
-                        path.display()
-                    );
-                }
+            Err(error) => {
+                log::debug!(
+                    "native_state_reclaim: could not remove orphaned pinned tmpdir {}: {error}",
+                    path.display()
+                );
             }
         }
     }
@@ -399,27 +351,42 @@ pub fn sweep(base: &Path, max_age_secs: i64, now: DateTime<Utc>) -> (usize, u64)
 // ============================================================================
 
 /// One native-state-reclaim pass's outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NativeStateReclaimReport {
-    /// The base directories evaluated (empty when none exist on this host).
-    pub bases: Vec<PathBuf>,
+    /// The session-state base directories evaluated (empty when none exist).
+    pub session_bases: Vec<PathBuf>,
+    /// The pinned-tmpdir base directory evaluated.
+    pub pinned_tmp_base: PathBuf,
     /// Whether the pass was enabled for this evaluation.
     pub enabled: bool,
-    /// How many per-launch directories were removed.
-    pub removed_count: usize,
-    /// Total bytes freed.
+    /// Session directories removed by the delegated `reap::reap_base` call.
+    pub sessions_removed: usize,
+    /// Shared binding trees removed by the delegated `reap::reap_base` call.
+    pub bindings_removed: usize,
+    /// Orphaned pinned-tmpdir companions removed.
+    pub pinned_tmp_removed: usize,
+    /// Total bytes freed across every removal above.
     pub removed_bytes: u64,
     /// Present when the host-wide cooldown skipped this evaluation.
     pub deferred: Option<String>,
+    /// Diagnostics from the delegated reap pass; a reap failure never fails
+    /// the tick that triggered it.
+    pub errors: Vec<String>,
     /// When this evaluation ran.
     pub at: DateTime<Utc>,
 }
 
 impl NativeStateReclaimReport {
+    /// Total directories removed across both reclaimed locations.
+    #[must_use]
+    pub fn removed_count(&self) -> usize {
+        self.sessions_removed + self.bindings_removed + self.pinned_tmp_removed
+    }
+
     /// Human-readable freed size, e.g. `"7.6G"` or `"nothing"`.
     #[must_use]
     pub fn removed_human(&self) -> String {
-        if self.removed_count == 0 {
+        if self.removed_bytes == 0 {
             return "nothing".to_string();
         }
         crate::tmpfs_reclaim::human_size(self.removed_bytes)
@@ -442,16 +409,38 @@ pub fn log_report(report: &NativeStateReclaimReport) {
         log::debug!("native_state_reclaim: skipped: {reason}");
         return;
     }
-    if report.removed_count > 0 {
+    let total = report.removed_count();
+    if total > 0 {
         log::info!(
-            "native_state_reclaim: removed {} stale per-launch harness state director{} ({}) from {:?}",
-            report.removed_count,
-            if report.removed_count == 1 { "y" } else { "ies" },
+            "native_state_reclaim: removed {total} stale native-harness director{} ({} \
+             session{}, {} binding{}, {} pinned-tmp; {}) from {:?} / {}",
+            if total == 1 { "y" } else { "ies" },
+            report.sessions_removed,
+            if report.sessions_removed == 1 {
+                ""
+            } else {
+                "s"
+            },
+            report.bindings_removed,
+            if report.bindings_removed == 1 {
+                ""
+            } else {
+                "s"
+            },
+            report.pinned_tmp_removed,
             report.removed_human(),
-            report.bases
+            report.session_bases,
+            report.pinned_tmp_base.display(),
         );
     } else {
-        log::debug!("native_state_reclaim: nothing to reclaim from {:?}", report.bases);
+        log::debug!(
+            "native_state_reclaim: nothing to reclaim from {:?} / {}",
+            report.session_bases,
+            report.pinned_tmp_base.display(),
+        );
+    }
+    for error in &report.errors {
+        log::debug!("native_state_reclaim: {error}");
     }
 }
 
@@ -459,10 +448,10 @@ pub fn log_report(report: &NativeStateReclaimReport) {
 // Host-wide cooldown state (mirrors `tmpfs_reclaim`)
 // ============================================================================
 
-/// Process-global "when did a pass last actually walk the base directories" —
-/// host-wide (not per-repo): per-launch native state is keyed by workspace
-/// hash under one shared base, so a host with several registered repos ticking
-/// on the same reaper cadence must not re-walk it once per repo.
+/// Process-global "when did a pass last actually walk the bases" — host-wide
+/// (not per-repo): both directories this module reclaims are keyed outside
+/// any one repo, so a host with several registered repos ticking on the same
+/// reaper cadence must not re-walk them once per repo.
 static LAST_EVALUATED_AT: OnceLock<Mutex<Option<DateTime<Utc>>>> = OnceLock::new();
 
 fn last_evaluated_slot() -> &'static Mutex<Option<DateTime<Utc>>> {
@@ -507,15 +496,14 @@ pub fn run_for(repo_root: &Path) -> NativeStateReclaimReport {
     let config = read_native_state_reclaim_config(repo_root);
     let enabled = resolve_enabled(&config);
     let now = Utc::now();
+    let pinned_tmp_base = pinned_tmp_base();
 
     if !enabled {
         let report = NativeStateReclaimReport {
-            bases: Vec::new(),
+            pinned_tmp_base,
             enabled: false,
-            removed_count: 0,
-            removed_bytes: 0,
-            deferred: None,
             at: now,
+            ..Default::default()
         };
         log_report(&report);
         return report;
@@ -524,35 +512,45 @@ pub fn run_for(repo_root: &Path) -> NativeStateReclaimReport {
     let min_interval_secs = resolve_min_interval_secs(&config);
     if !cooldown_elapsed(now, min_interval_secs) {
         let report = NativeStateReclaimReport {
-            bases: Vec::new(),
+            pinned_tmp_base,
             enabled: true,
-            removed_count: 0,
-            removed_bytes: 0,
             deferred: Some(format!("a pass ran inside the {min_interval_secs}s cooldown")),
             at: now,
+            ..Default::default()
         };
         log_report(&report);
         return report;
     }
 
-    let max_age_secs =
-        i64::try_from(resolve_max_age_hours(&config).saturating_mul(3600)).unwrap_or(i64::MAX);
-    let bases = base_dirs();
-    let mut removed_count = 0usize;
+    let session_bases = base_dirs();
+    let policy = crate::native_tools::provision::reap::Policy::default();
+    let mut sessions_removed = 0usize;
+    let mut bindings_removed = 0usize;
     let mut removed_bytes = 0u64;
-    for base in &bases {
-        let (count, bytes) = sweep(base, max_age_secs, now);
-        removed_count += count;
-        removed_bytes += bytes;
+    let mut errors = Vec::new();
+    for base in &session_bases {
+        let reap_report = crate::native_tools::provision::reap::reap_base(base, &policy, false);
+        sessions_removed += reap_report.sessions.len();
+        bindings_removed += reap_report.bindings.len();
+        removed_bytes += reap_report.bytes;
+        errors.extend(reap_report.errors);
     }
+
+    let (pinned_tmp_removed, pinned_tmp_bytes) = sweep_pinned_tmp(&pinned_tmp_base, &session_bases);
+    removed_bytes += pinned_tmp_bytes;
+
     record_evaluated(now);
 
     let report = NativeStateReclaimReport {
-        bases,
+        session_bases,
+        pinned_tmp_base,
         enabled: true,
-        removed_count,
+        sessions_removed,
+        bindings_removed,
+        pinned_tmp_removed,
         removed_bytes,
         deferred: None,
+        errors,
         at: now,
     };
     log_report(&report);
@@ -565,158 +563,115 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const LAUNCH: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
-
-    /// A per-launch directory shaped exactly like `State::configure` leaves
-    /// one, including the pinned `TMPDIR` holding a bun-style native extract.
-    fn launch_dir(base: &Path, hash: &str, launch: &str) -> PathBuf {
-        let dir = base.join(hash).join(launch);
-        std::fs::create_dir_all(dir.join(LAUNCH_TMPDIR_LEAF)).unwrap();
-        std::fs::create_dir_all(dir.join("data/opencode")).unwrap();
-        std::fs::write(
-            dir.join(LAUNCH_TMPDIR_LEAF)
-                .join(".abcdef0123456789-00000001.node"),
-            vec![0u8; 4096],
-        )
-        .unwrap();
-        dir
-    }
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     // ===================================================================
     // Shape gate
     // ===================================================================
 
     #[test]
-    fn workspace_hash_and_launch_id_shapes_are_recognized() {
-        assert!(is_workspace_hash(HASH));
+    fn launch_id_shape_is_recognized() {
         assert!(is_launch_id(LAUNCH));
         assert!(is_launch_id(&uuid::Uuid::new_v4().to_string()));
     }
 
     #[test]
-    fn foreign_names_are_not_launch_state() {
-        assert!(!is_workspace_hash("short"));
-        assert!(!is_workspace_hash(&HASH.to_uppercase()));
-        assert!(!is_workspace_hash(&format!("{HASH}0")));
+    fn foreign_names_are_not_launch_ids() {
         assert!(!is_launch_id("not-a-uuid"));
         assert!(!is_launch_id(&LAUNCH.to_uppercase()));
         assert!(!is_launch_id(&LAUNCH.replace('-', "")));
     }
 
+    // ===================================================================
+    // pinned_tmp_base — short, constant-length regardless of overrides
+    // ===================================================================
+
     #[test]
-    fn only_the_two_level_launch_shape_is_in_scope() {
-        let base = Path::new("/state/native-tools");
-        assert!(is_scoped_launch_state_path(base, &base.join(HASH).join(LAUNCH)));
-        // The workspace-hash directory itself, and anything under a launch.
-        assert!(!is_scoped_launch_state_path(base, &base.join(HASH)));
-        assert!(!is_scoped_launch_state_path(base, &base.join(HASH).join(LAUNCH).join("tmp")));
-        // Foreign names at either level, and anything outside the base.
-        assert!(!is_scoped_launch_state_path(base, &base.join("scratch").join(LAUNCH)));
-        assert!(!is_scoped_launch_state_path(base, &base.join(HASH).join("credentials")));
-        assert!(!is_scoped_launch_state_path(
-            base,
-            &Path::new("/other/native-tools").join(HASH).join(LAUNCH)
-        ));
-        assert!(!is_scoped_launch_state_path(base, Path::new("/tmp/anything")));
+    #[serial(native_state_reclaim_env)]
+    fn pinned_tmp_base_default_leaves_room_for_a_socket_name() {
+        std::env::remove_var(NATIVE_PINNED_TMPDIR_BASE_ENV);
+        let path = pinned_tmp_base().join(LAUNCH);
+        // 108 bytes is the tightest sockaddr_un.sun_path limit (Linux); leave
+        // generous headroom for a socket file name on top of the launch dir.
+        assert!(
+            path.as_os_str().len() < 90,
+            "pinned tmp path {} is too long for a Unix socket path",
+            path.display()
+        );
     }
 
     // ===================================================================
-    // Age gate
+    // sweep_pinned_tmp — orphan-by-owner-absence, no age policy
     // ===================================================================
 
     #[test]
-    fn age_floor_keeps_young_entries_and_never_trusts_a_future_mtime() {
-        assert!(!is_reclaimable_age(3_600, 86_400));
-        assert!(is_reclaimable_age(86_400, 86_400));
-        assert!(is_reclaimable_age(200_000, 86_400));
-        assert!(!is_reclaimable_age(-10, 0));
-    }
-
-    // ===================================================================
-    // sweep — real filesystem, injected `now` for compressed time
-    // ===================================================================
-
-    #[test]
-    fn sweep_removes_the_whole_stale_launch_directory_including_the_native_extract() {
+    fn sweep_pinned_tmp_keeps_an_entry_whose_session_directory_still_exists() {
         let temp = tempfile::tempdir().unwrap();
-        let base = temp.path();
-        let dir = launch_dir(base, HASH, LAUNCH);
-        let extract = dir
-            .join(LAUNCH_TMPDIR_LEAF)
-            .join(".abcdef0123456789-00000001.node");
-        assert!(extract.exists());
+        let session_base = temp.path().join("native-tools");
+        let pinned_base = temp.path().join("pinned-tmp");
+        std::fs::create_dir_all(session_base.join(HASH).join(LAUNCH)).unwrap();
+        std::fs::create_dir_all(pinned_base.join(LAUNCH)).unwrap();
 
-        let far_future = Utc::now() + chrono::Duration::hours(48);
-        let (removed, bytes) = sweep(base, 24 * 3600, far_future);
+        let (removed, bytes) = sweep_pinned_tmp(&pinned_base, &[session_base]);
+
+        assert_eq!(removed, 0);
+        assert_eq!(bytes, 0);
+        assert!(pinned_base.join(LAUNCH).is_dir());
+    }
+
+    #[test]
+    fn sweep_pinned_tmp_removes_an_entry_whose_session_directory_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_base = temp.path().join("native-tools");
+        let pinned_base = temp.path().join("pinned-tmp");
+        std::fs::create_dir_all(&session_base).unwrap();
+        let entry = pinned_base.join(LAUNCH);
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("extract.node"), vec![0u8; 4096]).unwrap();
+
+        let (removed, bytes) = sweep_pinned_tmp(&pinned_base, &[session_base]);
 
         assert_eq!(removed, 1);
-        assert!(bytes >= 4096, "freed bytes must account for the extracted addon");
-        assert!(!extract.exists(), "the leaked native extract must be gone");
-        assert!(!dir.exists(), "the whole per-launch directory must be gone");
-        assert!(base.join(HASH).is_dir(), "the workspace directory itself is kept");
+        assert!(bytes >= 4096);
+        assert!(!entry.exists());
     }
 
     #[test]
-    fn sweep_keeps_a_launch_whose_subtree_was_touched_more_recently_than_its_own_mtime() {
+    fn sweep_pinned_tmp_ignores_foreign_names_and_files() {
         let temp = tempfile::tempdir().unwrap();
-        let base = temp.path();
-        let dir = launch_dir(base, HASH, LAUNCH);
+        let session_base = temp.path().join("native-tools");
+        let pinned_base = temp.path().join("pinned-tmp");
+        std::fs::create_dir_all(&session_base).unwrap();
+        std::fs::create_dir_all(pinned_base.join("not-a-uuid")).unwrap();
+        std::fs::write(pinned_base.join(LAUNCH), b"not a directory").unwrap();
+        std::fs::create_dir_all(&pinned_base).unwrap();
 
-        // A launch directory's OWN mtime freezes at launch time — a live
-        // harness only keeps writing *underneath* it (session state, and the
-        // native extract in its pinned TMPDIR). Separate the two in wall-clock
-        // time, then pick a floor that the directory's own mtime would clear
-        // but the subtree's newest write does not.
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
-        let live_write = dir.join(LAUNCH_TMPDIR_LEAF).join(".abcdef-00000002.node");
-        std::fs::write(&live_write, vec![0u8; 16]).unwrap();
+        let (removed, _bytes) = sweep_pinned_tmp(&pinned_base, &[session_base]);
 
-        let mtime = |path: &Path| -> DateTime<Utc> {
-            std::fs::metadata(path).unwrap().modified().unwrap().into()
-        };
-        let now = mtime(&live_write) + chrono::Duration::seconds(1);
-        let floor = (now - mtime(&dir)).num_seconds();
-        assert!(
-            (now - mtime(&live_write)).num_seconds() < floor,
-            "fixture must place the live write inside the floor and the dir mtime outside it"
-        );
+        assert_eq!(removed, 0, "neither a foreign name nor a plain file is a candidate");
+        assert!(pinned_base.join("not-a-uuid").exists());
+        assert!(pinned_base.join(LAUNCH).exists());
+    }
 
-        let (removed, bytes) = sweep(base, floor, now);
-        assert_eq!(removed, 0, "a launch still being written to is never reclaimed");
+    #[test]
+    fn sweep_pinned_tmp_with_no_session_bases_removes_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let pinned_base = temp.path().join("pinned-tmp");
+        std::fs::create_dir_all(pinned_base.join(LAUNCH)).unwrap();
+
+        let (removed, bytes) = sweep_pinned_tmp(&pinned_base, &[]);
+
+        assert_eq!(removed, 0, "cannot verify orphan status with no session base to check");
         assert_eq!(bytes, 0);
-        assert!(live_write.exists());
-        assert!(dir.exists());
+        assert!(pinned_base.join(LAUNCH).exists());
     }
 
     #[test]
-    fn sweep_never_touches_anything_outside_the_launch_shape() {
+    fn sweep_pinned_tmp_of_a_missing_base_is_a_noop() {
         let temp = tempfile::tempdir().unwrap();
-        let base = temp.path();
-        launch_dir(base, HASH, LAUNCH);
-        // A non-hash sibling of the workspace directory, a non-uuid sibling of
-        // the launch directory, and a stray file directly under the base.
-        let foreign_workspace = base.join("credentials");
-        std::fs::create_dir_all(foreign_workspace.join(LAUNCH)).unwrap();
-        std::fs::write(foreign_workspace.join(LAUNCH).join("auth.json"), b"{}").unwrap();
-        let foreign_launch = base.join(HASH).join("shared-cache");
-        std::fs::create_dir_all(&foreign_launch).unwrap();
-        std::fs::write(foreign_launch.join("blob"), b"x").unwrap();
-        std::fs::write(base.join("README"), b"x").unwrap();
-
-        let far_future = Utc::now() + chrono::Duration::hours(48);
-        let (removed, _bytes) = sweep(base, 24 * 3600, far_future);
-
-        assert_eq!(removed, 1, "only the launch-shaped directory is a candidate");
-        assert!(foreign_workspace.join(LAUNCH).join("auth.json").exists());
-        assert!(foreign_launch.join("blob").exists());
-        assert!(base.join("README").exists());
-    }
-
-    #[test]
-    fn sweep_of_a_missing_base_is_a_noop() {
-        let temp = tempfile::tempdir().unwrap();
-        let (removed, bytes) = sweep(&temp.path().join("absent"), 24 * 3600, Utc::now());
+        let (removed, bytes) =
+            sweep_pinned_tmp(&temp.path().join("absent"), &[temp.path().join("native-tools")]);
         assert_eq!(removed, 0);
         assert_eq!(bytes, 0);
     }
@@ -725,17 +680,6 @@ mod tests {
     // base_dirs — override REPLACES, never adds to, the real default
     // ===================================================================
 
-    /// The override must fully replace the home-derived default, not add to
-    /// it. This is the fix for a real incident during development of #8650:
-    /// an earlier revision swept both unconditionally, so a test that set
-    /// `LOOM_NATIVE_TOOLS_DIR` to an isolated tempdir with `maxAgeHours=0`
-    /// (to make its own fixture instantly reclaimable) *also* made every
-    /// real per-launch directory under the live
-    /// `~/.local/state/loom/native-tools` on the host running the test
-    /// "reclaimable", and began deleting them. Asserting exactly one base is
-    /// returned — never two — is what keeps that fixed, regardless of
-    /// whether the real default directory happens to exist on the host
-    /// running this test.
     #[test]
     #[serial(native_state_reclaim_env)]
     fn override_replaces_rather_than_adds_to_the_real_default() {
@@ -762,7 +706,6 @@ mod tests {
     fn resolve_defaults() {
         let config = NativeStateReclaimConfig::default();
         assert!(resolve_enabled(&config));
-        assert_eq!(resolve_max_age_hours(&config), DEFAULT_NATIVE_STATE_MAX_AGE_HOURS);
         assert_eq!(resolve_min_interval_secs(&config), DEFAULT_NATIVE_STATE_MIN_INTERVAL_SECS);
     }
 
@@ -770,11 +713,9 @@ mod tests {
     fn config_overrides_defaults() {
         let config = NativeStateReclaimConfig {
             enabled: Some(false),
-            max_age_hours: Some(6),
             min_interval_secs: Some(60),
         };
         assert!(!resolve_enabled(&config));
-        assert_eq!(resolve_max_age_hours(&config), 6);
         assert_eq!(resolve_min_interval_secs(&config), 60);
     }
 
@@ -790,7 +731,7 @@ mod tests {
     }
 
     // ===================================================================
-    // run_for — enable gate and host-wide cooldown
+    // run_for — enable gate, host-wide cooldown, and delegation to `reap`
     // ===================================================================
 
     #[test]
@@ -798,49 +739,78 @@ mod tests {
     fn run_for_disabled_removes_nothing() {
         reset_state_for_test();
         let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("native-tools");
-        std::fs::create_dir_all(&base).unwrap();
-        let dir = launch_dir(&base, HASH, LAUNCH);
+        let session_base = temp.path().join("native-tools");
+        let pinned_base = temp.path().join("pinned-tmp");
+        std::fs::create_dir_all(&session_base).unwrap();
+        let orphan = pinned_base.join(LAUNCH);
+        std::fs::create_dir_all(&orphan).unwrap();
 
         std::env::set_var(NATIVE_STATE_RECLAIM_ENABLE_ENV, "0");
-        std::env::set_var(NATIVE_TOOLS_DIR_ENV, &base);
-        std::env::set_var(NATIVE_STATE_RECLAIM_MAX_AGE_HOURS_ENV, "0");
+        std::env::set_var(NATIVE_TOOLS_DIR_ENV, &session_base);
+        std::env::set_var(NATIVE_PINNED_TMPDIR_BASE_ENV, &pinned_base);
         let report = run_for(temp.path());
         std::env::remove_var(NATIVE_STATE_RECLAIM_ENABLE_ENV);
         std::env::remove_var(NATIVE_TOOLS_DIR_ENV);
-        std::env::remove_var(NATIVE_STATE_RECLAIM_MAX_AGE_HOURS_ENV);
+        std::env::remove_var(NATIVE_PINNED_TMPDIR_BASE_ENV);
         reset_state_for_test();
 
         assert!(!report.enabled);
-        assert_eq!(report.removed_count, 0);
-        assert!(dir.exists());
+        assert_eq!(report.removed_count(), 0);
+        assert!(orphan.exists());
     }
 
     #[test]
     #[serial(native_state_reclaim_env)]
-    fn run_for_reclaims_then_defers_inside_the_host_wide_cooldown() {
+    fn run_for_reclaims_an_orphaned_pinned_tmpdir_then_defers_inside_the_cooldown() {
         reset_state_for_test();
         let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("native-tools");
-        std::fs::create_dir_all(&base).unwrap();
-        let first_dir = launch_dir(&base, HASH, LAUNCH);
+        let session_base = temp.path().join("native-tools");
+        let pinned_base = temp.path().join("pinned-tmp");
+        std::fs::create_dir_all(&session_base).unwrap();
+        // No matching session directory under session_base -> orphaned.
+        let first_orphan = pinned_base.join(LAUNCH);
+        std::fs::create_dir_all(&first_orphan).unwrap();
 
-        std::env::set_var(NATIVE_TOOLS_DIR_ENV, &base);
-        // A 0h floor makes every entry, however fresh, older than the floor.
-        std::env::set_var(NATIVE_STATE_RECLAIM_MAX_AGE_HOURS_ENV, "0");
+        std::env::set_var(NATIVE_TOOLS_DIR_ENV, &session_base);
+        std::env::set_var(NATIVE_PINNED_TMPDIR_BASE_ENV, &pinned_base);
 
         let first = run_for(temp.path());
-        let second_dir = launch_dir(&base, HASH, "3f2504e0-4f89-41d3-9a0c-0305e82c3302");
+        let second_orphan = pinned_base.join("3f2504e0-4f89-41d3-9a0c-0305e82c3302");
+        std::fs::create_dir_all(&second_orphan).unwrap();
         let second = run_for(temp.path());
 
         std::env::remove_var(NATIVE_TOOLS_DIR_ENV);
-        std::env::remove_var(NATIVE_STATE_RECLAIM_MAX_AGE_HOURS_ENV);
+        std::env::remove_var(NATIVE_PINNED_TMPDIR_BASE_ENV);
         reset_state_for_test();
 
-        assert_eq!(first.removed_count, 1, "the first call past cooldown reclaims");
-        assert!(!first_dir.exists());
-        assert_eq!(second.removed_count, 0, "the cooldown suppresses the second call");
+        assert_eq!(first.pinned_tmp_removed, 1, "the first call past cooldown reclaims");
+        assert!(!first_orphan.exists());
+        assert_eq!(second.removed_count(), 0, "the cooldown suppresses the second call");
         assert!(second.deferred.is_some());
-        assert!(second_dir.exists(), "a cooldown-skipped launch dir is untouched");
+        assert!(second_orphan.exists(), "a cooldown-skipped pass leaves new orphans untouched");
+    }
+
+    #[test]
+    #[serial(native_state_reclaim_env)]
+    fn run_for_keeps_a_pinned_tmpdir_whose_session_directory_is_still_present() {
+        reset_state_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let session_base = temp.path().join("native-tools");
+        let pinned_base = temp.path().join("pinned-tmp");
+        // A live-looking session directory (no liveness record -> reap::reap_base
+        // treats it as an orphan on its own age policy, but that is a 6h floor,
+        // so a freshly created directory in this test survives either way).
+        std::fs::create_dir_all(session_base.join(HASH).join(LAUNCH)).unwrap();
+        std::fs::create_dir_all(pinned_base.join(LAUNCH)).unwrap();
+
+        std::env::set_var(NATIVE_TOOLS_DIR_ENV, &session_base);
+        std::env::set_var(NATIVE_PINNED_TMPDIR_BASE_ENV, &pinned_base);
+        let report = run_for(temp.path());
+        std::env::remove_var(NATIVE_TOOLS_DIR_ENV);
+        std::env::remove_var(NATIVE_PINNED_TMPDIR_BASE_ENV);
+        reset_state_for_test();
+
+        assert_eq!(report.pinned_tmp_removed, 0);
+        assert!(pinned_base.join(LAUNCH).is_dir());
     }
 }
