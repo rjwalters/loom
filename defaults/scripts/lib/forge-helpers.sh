@@ -625,8 +625,7 @@ forge_get_check_runs() {
     # short-read check below). An empty stdout from a `gh` that exited 0 is not
     # an authoritative "this commit has no checks": treat it as a transient
     # failure, the same way a nonzero exit is treated.
-    local merged=""
-    [[ -s "$out_file" ]] && merged=$(jq -cs '{total_count: ([.[].total_count // 0] | max // 0), check_runs: [.[] | (.check_runs // [])[]]}' "$out_file" 2>/dev/null)
+    local merged=""; [[ -s "$out_file" ]] && merged=$(jq -cs '{total_count: ([.[].total_count // 0] | max // 0), check_runs: [.[] | (.check_runs // [])[]]}' "$out_file" 2>/dev/null)
     rm -f "$out_file" "$err_file"
     [[ -n "$merged" ]] || return 1
 

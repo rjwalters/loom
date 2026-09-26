@@ -2057,10 +2057,11 @@ _wait_for_checks_then_sync_merge() {
       # re-poll, then hard-fail at the deadline — is exactly the fail-closed
       # outcome wanted. Name it explicitly so the narration is not the
       # misleading "could not fetch" (the helper's own stderr detail is
-      # suppressed at the callsite above).
-      if [[ "$fetch_rc" -eq "${FORGE_CHECK_RUNS_RC_TRUNCATED:-45}" ]]; then
-        warning "PR #$PR_NUMBER: check-runs read was TRUNCATED (fewer rows than the forge's own total_count); refusing to classify a partial set, continuing to poll"
-      fi
+      # suppressed at the callsite above). Guarded one-liner rather than an
+      # `if` block: `set -e` exempts AND-lists (see the note above
+      # _wait_for_checks_then_sync_merge's reads), and this is the same idiom
+      # the two `fetch_rc`/`observed_checks` assignments in this loop use.
+      [[ "$fetch_rc" -eq "${FORGE_CHECK_RUNS_RC_TRUNCATED:-45}" ]] && warning "PR #$PR_NUMBER: check-runs read was TRUNCATED (fewer rows than the forge's own total_count); refusing to classify a partial set, continuing to poll"
       if [[ "$(date +%s)" -ge "$deadline" ]]; then
         error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for check-runs to become fetchable for PR #$PR_NUMBER. Re-run once the forge API is healthy, or raise LOOM_AUTO_MERGE_TIMEOUT."
       fi
