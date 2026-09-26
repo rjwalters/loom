@@ -144,13 +144,87 @@ fn labels_block_range(content: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
+/// Collect the `- name: <name>` entries declared inside a Loom-managed labels
+/// block (as returned by [`labels_block_range`]), i.e. Loom's own shipped
+/// label set.
+///
+/// Used by [`strip_legacy_loom_label_entries`] to recognize pre-#4187 copies
+/// of Loom's labels sitting outside the marker block (#8875) — a label
+/// declared inside the managed block can never legitimately also be a
+/// consumer's own label of the same name, since names are the sync key `gh
+/// label` operates on.
+fn extract_label_names(block: &str) -> HashSet<&str> {
+    block
+        .lines()
+        .filter_map(|line| line.strip_prefix("- name:"))
+        .map(str::trim)
+        .collect()
+}
+
+/// Remove label entries from `text` — content that lives (or will live)
+/// *outside* the Loom-managed marker block — whose `name:` matches one of
+/// `loom_names`.
+///
+/// Before #4187, Loom wrote its labels unmarked directly into
+/// `.github/labels.yml`. Installing a modern, marker-aware Loom over such a
+/// repo treated that legacy block as consumer-owned content and preserved it
+/// verbatim alongside the freshly-spliced managed block, leaving every
+/// workflow label defined twice — once stale (legacy) and once current
+/// (managed) — with `sync-labels.sh --check` permanently unable to converge
+/// (#8875). A label name declared inside Loom's shipped block is
+/// unambiguously Loom's own; stripping any same-named entry found outside the
+/// block absorbs it into the managed block instead of preserving a duplicate.
+///
+/// Entries are recognized as line-oriented blocks starting with `- name:
+/// ...` and continuing through any indented continuation lines (e.g.
+/// `description:`/`color:`) up to the next `- name:` line or the end of
+/// `text`; one immediately-following blank separator line is also swallowed
+/// so removal doesn't leave a doubled blank line. Comments, blank lines, and
+/// any entry whose name is *not* in `loom_names` (genuine consumer content)
+/// are preserved untouched.
+fn strip_legacy_loom_label_entries(text: &str, loom_names: &HashSet<&str>) -> String {
+    if loom_names.is_empty() {
+        return text.to_string();
+    }
+
+    let mut out = String::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        if let Some(name) = line.strip_prefix("- name:").map(str::trim) {
+            if loom_names.contains(name) {
+                // Skip this entry's continuation lines up to (not including)
+                // the next top-level `- name:` entry.
+                while let Some(next) = lines.peek() {
+                    if next.starts_with("- name:") {
+                        break;
+                    }
+                    lines.next();
+                }
+                // Swallow one immediately-following blank separator line.
+                if matches!(lines.peek(), Some(next) if next.trim().is_empty()) {
+                    lines.next();
+                }
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Compute the correct `.github/labels.yml` content for an install, preserving
 /// all consumer-owned entries outside the Loom-managed marker block.
 ///
 /// - **`existing` has a well-formed block** → replace only the marked range with
-///   the shipped block; everything before/after is preserved byte-for-byte.
+///   the shipped block; everything before/after is preserved byte-for-byte,
+///   except any entry whose name duplicates one of Loom's own shipped labels
+///   (see [`strip_legacy_loom_label_entries`]), which is absorbed rather than
+///   kept as a stale duplicate.
 /// - **`existing` is markerless** (a legacy install, or a consumer file Loom has
-///   never touched) → append the shipped block, preserving every existing entry.
+///   never touched) → append the shipped block, preserving every existing entry
+///   except same-named legacy Loom duplicates (as above) — this is the
+///   pre-#4187 upgrade path (#8875).
 /// - **`source` has no block** (defensive; the shipped file always does) →
 ///   return `existing` unchanged rather than risk clobbering consumer content.
 ///
@@ -162,13 +236,20 @@ fn merge_labels_block(existing: &str, source: &str) -> Option<String> {
         return None;
     };
     let source_block = &source[src_start..src_end];
+    let loom_names = extract_label_names(source_block);
 
     let merged = if let Some((dst_start, dst_end)) = labels_block_range(existing) {
-        // Splice the shipped block over the consumer's marked range.
-        format!("{}{}{}", &existing[..dst_start], source_block, &existing[dst_end..])
+        // Splice the shipped block over the consumer's marked range, absorbing
+        // any same-named legacy Loom entries found in the surrounding text.
+        let head = strip_legacy_loom_label_entries(&existing[..dst_start], &loom_names);
+        let tail = strip_legacy_loom_label_entries(&existing[dst_end..], &loom_names);
+        format!("{head}{source_block}{tail}")
     } else {
-        // Markerless consumer file: append the block, preserving all entries.
-        let head = existing.trim_end_matches('\n');
+        // Markerless consumer file: absorb same-named legacy Loom entries,
+        // then append the block, preserving all remaining (genuinely
+        // consumer-owned) entries.
+        let stripped = strip_legacy_loom_label_entries(existing, &loom_names);
+        let head = stripped.trim_end_matches('\n');
         if head.is_empty() {
             format!("{source_block}\n")
         } else {
@@ -1525,3 +1606,10 @@ mod tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod agent_skills_tests;
+
+// Same reason as `agent_skills_tests` above: `scaffolding/tests.rs` is
+// frozen at its file-size ratchet baseline, so the pre-#4187 legacy-duplicate
+// absorption tests (issue #8875) live in their own sibling module instead.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod legacy_label_duplicates_tests;
