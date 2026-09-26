@@ -75,9 +75,9 @@ pub const RETRY: &str = "LOOM-HEAD-SELF-SYNC-RETRY";
 ///
 /// A port of `merge-pr.sh`'s `_is_head_mismatch_response`, kept byte-equivalent
 /// to it by `tests/merge_pr_head_sync_differential.rs`. String provenance is
-/// documented on `forge_merge_pr` / `forge_auto_merge` in
-/// `lib/forge-helpers.sh`: the GitHub REST and Gitea forms are verified
-/// against each forge's own source, the GraphQL one is best-effort.
+/// documented on `forge_merge_pr` in `lib/forge-helpers.sh`: the GitHub REST
+/// and Gitea forms are verified against each forge's own source; the GraphQL
+/// one (from the shell arm retired by #8427) is best-effort.
 ///
 /// Deliberately NOT matched: `Base branch was modified`. That one means the
 /// PR's *base* fell behind and a sync-and-retry is correct; conflating the two

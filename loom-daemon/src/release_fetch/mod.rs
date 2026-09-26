@@ -1,8 +1,9 @@
 //! Artifact fetch + verification (epic #7810, PR 6a).
 //!
 //! The sequel to [`crate::release_resolve`]: that module answers *which*
-//! artifact is latest; this one downloads it and gates it on two checks
-//! before anything is allowed to provision or restart from it.
+//! artifact is latest; this one downloads it and gates it on three checks --
+//! checksum, signature, and (#8837) GLIBC compatibility -- before anything is
+//! allowed to provision or restart from it.
 //!
 //! Ported from `loom-daemon-update.sh`'s `fetch_and_verify_artifact` and its
 //! seven helpers (Epic #4990 Phase 3 / #5020, keyless signing #5054). The
@@ -36,6 +37,7 @@
 pub mod checksum;
 pub mod cosign;
 pub mod fetch;
+pub mod glibc;
 pub mod signature;
 
 pub use fetch::{fetch_and_verify, FetchInputs, FetchOutcome, VerifiedArtifact};

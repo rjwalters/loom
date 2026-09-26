@@ -1,5 +1,8 @@
-//! The two `Issue`-scoped environment markers a dispatched sweep child is
-//! given — and, for a `PrSet` child, explicitly denied.
+//! The environment markers a dispatched sweep child is given: the two
+//! `Issue`-scoped ones applied (and, for a `PrSet` child, explicitly denied)
+//! by [`apply_issue_scoped_markers`], plus — tested here, set in
+//! `spawn_process.rs` beside `LOOM_TERMINAL_ID` — the unconditional
+//! sweep-identity marker [`SWEEP_ID_ENV`] (#8835).
 
 use super::{SweepKind, LEASE_RENEW_STARTED_ENV};
 use std::process::Command;
@@ -8,6 +11,27 @@ use std::process::Command;
 /// `loom:building` on the forge BEFORE the child is spawned, for immediate
 /// external visibility of the claim.
 pub(super) const CLAIM_OWNED_ENV: &str = "LOOM_SWEEP_CLAIM_OWNED";
+
+/// Sweep-identity marker (issue #8835): the dispatched sweep's own id, bare
+/// and unprefixed, so anything the sweep spawns can attribute its work back to
+/// the sweep that caused it.
+///
+/// The motivating consumer is 2am's batch submitter, which stamps `sweep_id`
+/// onto the `ephemeral_compute` launch record it emits — that is what lets the
+/// fleet dashboard nest a live Spot instance under the sweep paying for it
+/// instead of listing it in a flat "running compute" pile.
+///
+/// Unlike the two markers above this is **not** `Issue`-scoped: it is plain
+/// identity, every sweep has one, and a `PrSet` sweep can burn batch compute
+/// exactly like an `Issue` sweep can. It is therefore set unconditionally by
+/// `spawn_process.rs`'s `spawn_child` rather than through
+/// [`apply_issue_scoped_markers`], immediately beside `LOOM_TERMINAL_ID`.
+///
+/// Deliberately a second variable rather than asking consumers to strip the
+/// `daemon-` prefix off `LOOM_TERMINAL_ID`: a *terminal* id names the agent
+/// slot, and coupling an unrelated cross-repo emitter to that naming
+/// convention would break it the next time the convention moves.
+pub(crate) const SWEEP_ID_ENV: &str = "LOOM_SWEEP_ID";
 
 /// Apply the `Issue`-scoped child markers to a sweep child's [`Command`].
 ///
@@ -54,7 +78,7 @@ pub(super) const CLAIM_OWNED_ENV: &str = "LOOM_SWEEP_CLAIM_OWNED";
 /// has nothing to do with — exactly the lie the `Issue`-only scoping exists to
 /// prevent. Removing makes the guarantee hold under inheritance, not merely
 /// under a clean parent environment.
-pub(super) fn apply_issue_scoped_markers(cmd: &mut Command, kind: &SweepKind) {
+pub(crate) fn apply_issue_scoped_markers(cmd: &mut Command, kind: &SweepKind) {
     match kind {
         SweepKind::Issue(issue) => {
             cmd.env(CLAIM_OWNED_ENV, issue.to_string());
@@ -173,6 +197,75 @@ mod tests {
                 && recorded.contains(&format!("{LEASE_RENEW_STARTED_ENV}=76729")),
             "an Issue child's markers must name the issue IT claims, not the parent's \
              (#7915); got: {recorded}"
+        );
+
+        let ids: Vec<String> = registry.entries.keys().cloned().collect();
+        for id in ids {
+            let _ = registry.cancel(&id, Duration::from_millis(50));
+        }
+    }
+
+    /// Issue #8835: `spawn_child` exports the sweep's own id as
+    /// [`SWEEP_ID_ENV`], alongside the pre-existing
+    /// `LOOM_TERMINAL_ID=daemon-<sweep_id>`.
+    ///
+    /// The value is the **bare** sweep id — no `daemon-` prefix — because the
+    /// downstream consumer stamps it verbatim onto an `ephemeral_compute`
+    /// launch record that the dashboard joins against `activeSweeps`'
+    /// `sweepId`. A prefix here would make every such join miss.
+    #[test]
+    #[serial]
+    fn dispatch_exports_sweep_id_marker() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(8835), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("{SWEEP_ID_ENV}={}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
+        assert!(
+            recorded.contains(&needle),
+            "expected {SWEEP_ID_ENV}={} on the child env; got: {recorded}",
+            outcome.sweep_id
+        );
+        // Additive, not a rename: the terminal id keeps its `daemon-` prefix.
+        assert!(
+            recorded.contains(&format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id)),
+            "{SWEEP_ID_ENV} must not displace LOOM_TERMINAL_ID; got: {recorded}"
+        );
+
+        let ids: Vec<String> = registry.entries.keys().cloned().collect();
+        for id in ids {
+            let _ = registry.cancel(&id, Duration::from_millis(50));
+        }
+    }
+
+    /// Issue #8835: a `PrSet` dispatch carries [`SWEEP_ID_ENV`] too.
+    ///
+    /// This is the marker's whole point of difference from the two above: they
+    /// are deliberately *cleared* for a `PrSet` run (#7915) because neither can
+    /// honestly name an issue such a run claims. A sweep id is not a claim —
+    /// every sweep has one, and a Doctor/Judge PR-set sweep can submit batch
+    /// compute exactly like an issue sweep can, so unsetting it here would
+    /// silently un-attribute that compute.
+    #[test]
+    #[serial]
+    fn pr_set_dispatch_exports_sweep_id_marker() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::PrSet(vec![8835]), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("{SWEEP_ID_ENV}={}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
+        assert!(
+            recorded.contains(&needle),
+            "expected {SWEEP_ID_ENV}={} on a PrSet child env; got: {recorded}",
+            outcome.sweep_id
         );
 
         let ids: Vec<String> = registry.entries.keys().cloned().collect();

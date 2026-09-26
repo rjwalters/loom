@@ -21,6 +21,8 @@ pub(super) fn role_tick_outcome() -> TelemetryRecord {
         effort: Some("high".to_string()),
         detail: None,
         gated_pool: None,
+        preference_tier: None,
+        preference_tap: None,
         runtime: Some("opencode".to_string()),
         provider: Some("friendli".to_string()),
         profile: Some("zai-flash".to_string()),
@@ -95,6 +97,8 @@ fn role_tick_outcome_omits_every_unobserved_field() {
         effort: None,
         detail: Some("no-token-pool".to_string()),
         gated_pool: None,
+        preference_tier: None,
+        preference_tap: None,
         runtime: None,
         provider: None,
         profile: None,
@@ -107,6 +111,8 @@ fn role_tick_outcome_omits_every_unobserved_field() {
         "model",
         "effort",
         "gated_pool",
+        "preference_tier",
+        "preference_tap",
         "runtime",
         "provider",
         "profile",
@@ -244,4 +250,37 @@ fn role_tick_outcome_gated_pool_round_trips_and_older_records_still_parse() {
     older.as_object_mut().unwrap().remove("gated_pool");
     let parsed: RoleTickOutcomeRecord = serde_json::from_value(older).unwrap();
     assert_eq!(parsed.gated_pool, None);
+}
+
+/// Issue #8599: the ordered-preference tier/tap are additive under schema `2`
+/// on exactly the terms `gated_pool` established — they round-trip when
+/// present, are OMITTED (not `null`) when absent, and a record written before
+/// they existed still parses to `None`. Tier `0` is a real, meaningful value
+/// (the top tap was chosen), so the omit rule must key on `None`, never on
+/// zero.
+#[test]
+fn role_tick_outcome_preference_tier_round_trips_and_older_records_still_parse() {
+    let mut record = match role_tick_outcome() {
+        TelemetryRecord::RoleTickOutcome(r) => r,
+        other => panic!("fixture changed: {other:?}"),
+    };
+    record.preference_tier = Some(2);
+    record.preference_tap = Some("opencode:zai-metered".to_string());
+    let value = serde_json::to_value(&record).unwrap();
+    assert_eq!(value["preference_tier"], 2);
+    assert_eq!(value["preference_tap"], "opencode:zai-metered");
+    let back: RoleTickOutcomeRecord = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(back, record);
+
+    // A top-tier launch is reported as `0`, never elided into absence.
+    record.preference_tier = Some(0);
+    let top = serde_json::to_value(&record).unwrap();
+    assert_eq!(top["preference_tier"], 0);
+
+    let mut older = value;
+    older.as_object_mut().unwrap().remove("preference_tier");
+    older.as_object_mut().unwrap().remove("preference_tap");
+    let parsed: RoleTickOutcomeRecord = serde_json::from_value(older).unwrap();
+    assert_eq!(parsed.preference_tier, None);
+    assert_eq!(parsed.preference_tap, None);
 }

@@ -95,6 +95,14 @@ const PUBLIC_PAGE_DISPLAY_FIELDS: Readonly<Record<string, readonly string[]>> = 
     // headline signal is `renderSaturationBadge` below; this keeps the raw
     // number available for anyone reading the row closely.
     "load_per_core",
+    // Fleet captain state (#8848): already public per `redaction.ts`'s
+    // `host.health` allowlist. The richer `dashboard/web` SPA surfaces the
+    // two acceptance-criterion flags (singleton armed on a non-captain host;
+    // no host reporting `is_captain: true`) as dedicated badges; this
+    // no-JS fallback page keeps the raw values available in the generic
+    // detail dump rather than duplicating that badge logic here.
+    "is_captain",
+    "armed_singleton_jobs",
   ],
 };
 

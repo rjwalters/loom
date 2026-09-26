@@ -1,0 +1,79 @@
+/* Work queue (#8852 phase 3) — `views/workQueue.ts`. Mirrors the
+   `.compute` panel's look so the overview reads as one page. */
+
+.queue {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 18px;
+}
+.queue__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.queue__title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.queue__totals,
+.queue__note {
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.queue__note {
+  margin: 0 0 8px;
+}
+.queue__more {
+  margin-left: auto;
+  font-size: 13px;
+}
+.queue__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.queue__table th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 10px 6px 0;
+}
+.queue__table td {
+  padding: 5px 10px 5px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  vertical-align: top;
+}
+/* Last-known counts from a stale host: dimmed and italic so
+   they are never read as current. The freshness badge carries the words. */
+.queue__count--stale {
+  color: var(--text-dim);
+  font-style: italic;
+}
+.queue__withheld,
+.queue__also,
+.queue__tier {
+  color: var(--text-dim);
+}
+.queue__flags {
+  display: inline-flex;
+  gap: 6px;
+  margin-left: 8px;
+}
+.queue__tier {
+  font-size: 11px;
+}
+.queue-row--blocked .queue__reason {
+  color: var(--warn);
+}
+.badge--urgent {
+  color: var(--bad);
+  border-color: color-mix(in srgb, var(--bad) 45%, transparent);
+}

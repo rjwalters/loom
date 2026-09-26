@@ -73,6 +73,7 @@ pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<bool> {
             }
             crate::claim_reconciliation::run_reconciliation_pass(&fallback_root, true);
             run_startup_quarantine_pass(&quarantine_root);
+            run_startup_profile_provisioning_pass(&quarantine_root);
         })
         .await;
         // A `send` error just means every receiver — including the one this
@@ -128,6 +129,85 @@ fn run_startup_quarantine_pass(fallback_root: &Path) {
     }
 }
 
+/// Pooled-profile provisioning (Issue #8672): re-populate every registered
+/// account's profile from the operator's default one, so a profile that was
+/// created before this shipped — or that has drifted since the operator
+/// changed their own `config.toml`, `AGENTS.md`, or prompt set — is brought
+/// back up to date without anyone having to remember to run a command.
+///
+/// Safe to run unconditionally on every start:
+///
+/// - It is a **no-op when there is nothing to do** — the ledger makes a
+///   second pass over an unchanged pair write nothing at all.
+/// - It **never overwrites an operator's own edit** inside a pooled profile,
+///   and never reads or writes a credential.
+/// - It **skips session-managed profiles**, whose container owns the
+///   directory (#6925).
+/// - A host with no default profile (no `~/.codex`) exits immediately.
+///
+/// `LOOM_PROFILE_PROVISION_ON_START=0` switches it off entirely.
+fn run_startup_profile_provisioning_pass(fallback_root: &Path) {
+    use crate::tokens_pool::profile_provisioning as provisioning;
+
+    if !provisioning::provision_on_start_enabled() {
+        log::info!(
+            "profile_provisioning: startup pass disabled ({}=0)",
+            provisioning::PROVISION_ON_START_ENV
+        );
+        return;
+    }
+    for rules in crate::tokens_pool::profile_sharing::PROVIDER_RULES {
+        let Some(source) = provisioning::default_profile_home(rules) else {
+            continue;
+        };
+        if !source.is_dir() {
+            log::debug!(
+                "profile_provisioning: no default {} profile at {} — nothing to provision from",
+                rules.provider,
+                source.display()
+            );
+            continue;
+        }
+        let options = provisioning::ProvisionOptions {
+            source,
+            // The hook bridge bakes a project root into the managed entry, so
+            // the daemon's own sweep workspace is the right one to name here.
+            workspace: fallback_root.to_path_buf(),
+            dry_run: false,
+            skip_hook_bridge: false,
+        };
+        let mut changed = 0usize;
+        let mut failed = 0usize;
+        let results = provisioning::provision_all(rules, fallback_root, &options);
+        let total = results.len();
+        for (account, result) in results {
+            match result {
+                Ok(report) if report.changed => changed += 1,
+                Ok(_) => {}
+                Err(error) => {
+                    failed += 1;
+                    log::warn!(
+                        "profile_provisioning: {}/{account} could not be provisioned: {error:#}",
+                        rules.provider
+                    );
+                }
+            }
+        }
+        if changed > 0 || failed > 0 {
+            log::info!(
+                "profile_provisioning: startup pass checked {total} {} profile(s), provisioned \
+                 {changed}, failed {failed} (#8672)",
+                rules.provider
+            );
+        } else {
+            log::debug!(
+                "profile_provisioning: startup pass checked {total} {} profile(s), all up to date",
+                rules.provider
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +215,67 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    /// Issue #8672 AC 2, daemon half: the startup pass provisions **every**
+    /// pooled profile, not just ones created after this shipped — and is a
+    /// no-op on the next start.
+    #[test]
+    #[serial]
+    fn the_startup_pass_provisions_every_pooled_profile() {
+        use crate::tokens_pool::profile_provisioning::PROVISION_ON_START_ENV;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let profiles = tmp.path().join("codex-profiles");
+        let default_home = tmp.path().join("operator").join(".codex");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(default_home.join("prompts")).unwrap();
+        std::fs::write(default_home.join("AGENTS.md"), "# shared\n").unwrap();
+        std::fs::write(default_home.join("auth.json"), "OPERATOR-CREDENTIAL").unwrap();
+        // Two profiles that predate provisioning entirely: credential only.
+        for name in ["agent-1", "agent-2"] {
+            let profile = profiles.join(name);
+            std::fs::create_dir_all(&profile).unwrap();
+            std::fs::write(profile.join("auth.json"), format!("CRED-{name}")).unwrap();
+        }
+
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", &profiles);
+        std::env::set_var("LOOM_CODEX_DEFAULT_HOME", &default_home);
+        std::env::set_var("LOOM_CODEX_HOOKS_SCRIPT", "");
+        std::env::remove_var(PROVISION_ON_START_ENV);
+
+        run_startup_profile_provisioning_pass(&workspace);
+
+        for name in ["agent-1", "agent-2"] {
+            let profile = profiles.join(name);
+            assert_eq!(
+                std::fs::read_to_string(profile.join("AGENTS.md")).unwrap(),
+                "# shared\n",
+                "{name} was not provisioned"
+            );
+            assert!(std::fs::symlink_metadata(profile.join("prompts"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            // The credential is exactly what it was.
+            assert_eq!(
+                std::fs::read_to_string(profile.join("auth.json")).unwrap(),
+                format!("CRED-{name}")
+            );
+        }
+
+        // Disabled: a run with the kill switch on must not resurrect a file
+        // the operator deleted from a pooled profile.
+        std::fs::remove_file(profiles.join("agent-1").join("AGENTS.md")).unwrap();
+        std::env::set_var(PROVISION_ON_START_ENV, "0");
+        run_startup_profile_provisioning_pass(&workspace);
+        assert!(!profiles.join("agent-1").join("AGENTS.md").exists());
+
+        std::env::remove_var(PROVISION_ON_START_ENV);
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+        std::env::remove_var("LOOM_CODEX_DEFAULT_HOME");
+        std::env::remove_var("LOOM_CODEX_HOOKS_SCRIPT");
+    }
 
     /// The completion signal must not flip to `true` before the injected
     /// delay elapses, and must flip promptly once it does — the exact

@@ -97,6 +97,35 @@ impl ModelPricing {
         }
     }
 
+    /// Build a K2-series Kimi row (Issue #8564).
+    ///
+    /// Split out from [`Self::from_base`] because the K2 table is shaped
+    /// differently from Anthropic's in two ways that matter:
+    ///
+    /// 1. **The cache-hit rate is not a fixed multiple of base input** — it is
+    ///    0.2x for K2.7 Code and ~0.168x for K2.6 — so it is passed in as a
+    ///    published number rather than derived.
+    /// 2. **The K2 table publishes no cache-WRITE price at all** (unlike the
+    ///    K3 table, which publishes both TTL tiers). Both write rates are
+    ///    therefore set to the cache-MISS input price: on this vendor a write
+    ///    is billed as ordinary input, so charging base is the reading the
+    ///    published table supports. Inventing a 1.25x/2x Anthropic-shaped
+    ///    surcharge here would be a fabricated rate, which is the one thing a
+    ///    rate card must never contain.
+    fn kimi_k2(
+        input_cost_per_1k: f64,
+        output_cost_per_1k: f64,
+        cache_read_cost_per_1k: f64,
+    ) -> Self {
+        Self {
+            input_cost_per_1k,
+            output_cost_per_1k,
+            cache_read_cost_per_1k,
+            cache_write_cost_per_1k: input_cost_per_1k,
+            cache_write_1h_cost_per_1k: input_cost_per_1k,
+        }
+    }
+
     /// Look up a model in the **compiled** rate card.
     ///
     /// Since #8177 this is the *fallback* tier, not the only one: the same
@@ -136,6 +165,29 @@ impl ModelPricing {
     /// Sonnet 5's $2/$10 is the **standard** price, not a lapsing promo: the
     /// same page records that the increase to $3/$15 scheduled for
     /// 2026-09-01 will not occur.
+    ///
+    /// # Kimi rate card (Issue #8564)
+    ///
+    /// Prices verified against <https://platform.moonshot.ai/docs/pricing/chat>
+    /// on **2026-09-22**. USD per 1k tokens (= the published $/MTok / 1000):
+    ///
+    /// | Row | Input | Output | Cache read | Cache write 5m | Cache write 1h |
+    /// |---|---|---|---|---|---|
+    /// | `kimi-k3` | 0.003 | 0.015 | 0.0003 | 0.003 | 0.006 |
+    /// | `kimi-k2.7-code-highspeed` | 0.0019 | 0.008 | 0.00038 | *(= input)* | *(= input)* |
+    /// | `kimi-k2.7-code` | 0.00095 | 0.004 | 0.00019 | *(= input)* | *(= input)* |
+    /// | `kimi-k2.6` | 0.00095 | 0.004 | 0.00016 | *(= input)* | *(= input)* |
+    ///
+    /// **These rows are an ESTIMATE, and a careful reader should treat them as
+    /// one.** They are the Moonshot *platform API list price*. A Kimi Code
+    /// subscription — the route `defaults/runtimes/kimi.json` actually
+    /// describes — is not billed per token at all, so for a subscription
+    /// launch the derived `cost_usd` is "what these tokens would have cost on
+    /// the API", never money that changed hands. That is the same
+    /// "harness report ≠ billed cost" honesty `runtime-model-trials.md`
+    /// already applies to the OpenCode/GLM trial, and it is why the K2 rows'
+    /// cache-write rates are the published cache-miss input price rather than
+    /// an invented Anthropic-shaped surcharge (see [`Self::kimi_k2`]).
     ///
     /// # Matching
     ///
@@ -239,6 +291,50 @@ impl ModelPricing {
             return Some(Self::from_base(0.001, 0.005, CACHE_READ_MULTIPLIER));
         }
 
+        // ---- Moonshot / Kimi ----------------------------------------------
+        // Issue #8564. Prices verified against
+        // https://platform.moonshot.ai/docs/pricing/chat on 2026-09-22, USD
+        // per 1M tokens / 1000. See the "Kimi rate card" section of this
+        // method's doc comment for the table, and for why these are an
+        // ESTIMATE of API list price rather than a billed cost.
+        //
+        // Ordering inside this block is load-bearing: `-highspeed` is a
+        // superstring of the base K2.7 Code id and must be tested first.
+        if m.contains("kimi-k3") {
+            // $3.00 in / $15.00 out; cached input $0.30; cache writes $3.00
+            // (5m) and $6.00 (1h) — the K3 table publishes all five, and the
+            // cache rates are NOT the Anthropic multiples, so they are given
+            // explicitly rather than derived.
+            return Some(Self {
+                input_cost_per_1k: 0.003,
+                output_cost_per_1k: 0.015,
+                cache_read_cost_per_1k: 0.000_3,
+                cache_write_cost_per_1k: 0.003,
+                cache_write_1h_cost_per_1k: 0.006,
+            });
+        }
+        if m.contains("kimi-k2.7-code-highspeed") || m.contains("kimi-k2-7-code-highspeed") {
+            return Some(Self::kimi_k2(0.001_9, 0.008, 0.000_38));
+        }
+        if m.contains("kimi-k2.7-code")
+            || m.contains("kimi-k2-7-code")
+            || m.contains("kimi-k2p7-code")
+        {
+            return Some(Self::kimi_k2(0.000_95, 0.004, 0.000_19));
+        }
+        if m.contains("kimi-k2.6") || m.contains("kimi-k2-6") || m.contains("kimi-k2p6") {
+            return Some(Self::kimi_k2(0.000_95, 0.004, 0.000_16));
+        }
+        if m.contains("kimi-k2") {
+            // Unknown K2 generation (`kimi-k2-thinking`, `kimi-k2.5`,
+            // `kimi-k2-0905`, a provider-prefixed `moonshot/kimi-k2-…`) ->
+            // the NEWEST published K2 row, never a retired one. Same rule
+            // #8060 established for the `claude-<family>-` catch-alls, and the
+            // same reason: an unrecognized id is far likelier to be newer than
+            // the card than to be a resurrected retired model.
+            return Some(Self::kimi_k2(0.000_95, 0.004, 0.000_19));
+        }
+
         // ---- OpenAI --------------------------------------------------------
         // Not generation-keyed and not re-verified by #8060; these rows are
         // unchanged and are reached only if some future caller records a GPT
@@ -333,10 +429,25 @@ impl ModelPricing {
                 || "the rate card compiled into this build".to_string(),
                 |c| format!("{} (verified {})", c.path().display(), c.verified_on()),
             );
-            log::warn!(
-                "Unknown model '{model}' is not on the pricing card in effect — {provenance}; \
-                 cost is being estimated at the newest Sonnet rate and may be badly wrong"
-            );
+            if is_moonshot_id(model) {
+                // Issue #8564: a Kimi id falling through to the Anthropic
+                // default is a specific, nameable gap, not a generic unknown —
+                // and the generic message would send whoever reads it to the
+                // wrong vendor's pricing page. Loud enough to be actionable,
+                // and it names the page the fix comes from.
+                log::warn!(
+                    "Unknown Moonshot/Kimi model '{model}' is not on the pricing card in effect \
+                     — {provenance}; it is being priced at the newest Anthropic Sonnet rate, \
+                     which is wrong for this vendor. Add its row (rates from \
+                     https://platform.moonshot.ai/docs/pricing/chat) to \
+                     resource_usage.rs::lookup AND defaults/pricing.json."
+                );
+            } else {
+                log::warn!(
+                    "Unknown model '{model}' is not on the pricing card in effect — {provenance}; \
+                     cost is being estimated at the newest Sonnet rate and may be badly wrong"
+                );
+            }
         }
         Self::from_base(0.002, 0.010, CACHE_READ_MULTIPLIER)
     }
@@ -363,6 +474,18 @@ impl ModelPricing {
     }
 }
 
+/// Whether a model id belongs to the Moonshot/Kimi family (Issue #8564).
+///
+/// Used both to route the unknown-model warning to the right vendor's pricing
+/// page and by [`detect_provider`]. Deliberately narrow: `kimi-k…`/`moonshot`
+/// rather than a bare `kimi`, so the CLI's own product strings (`kimi-code`,
+/// `kimi-code-cli`) are not mistaken for model ids.
+#[must_use]
+pub fn is_moonshot_id(model: &str) -> bool {
+    let lowered = model.to_lowercase();
+    lowered.contains("moonshot") || lowered.contains("kimi-k")
+}
+
 /// Detect provider from model name
 pub fn detect_provider(model: &str) -> &'static str {
     let model_lower = model.to_lowercase();
@@ -374,6 +497,8 @@ pub fn detect_provider(model: &str) -> &'static str {
         "google"
     } else if model_lower.contains("llama") || model_lower.contains("mistral") {
         "meta"
+    } else if is_moonshot_id(&model_lower) {
+        "moonshot"
     } else {
         "unknown"
     }
@@ -632,6 +757,127 @@ mod tests {
         "claude-3-haiku",
     ];
 
+    /// Moonshot/Kimi model IDs (Issue #8564), kept SEPARATE from
+    /// [`KNOWN_MODEL_IDS`] on purpose: that list is also fed to
+    /// `cache_rates_are_derived_from_each_row_own_base`, which asserts the
+    /// Anthropic 0.1x / 1.25x / 2x derivation. Kimi publishes its own cache
+    /// rates and they are not those multiples, so folding these ids into that
+    /// list would make the derivation test fail on rows that are *correct*.
+    ///
+    /// The ids themselves are the spellings the pinned CLI's own bundled model
+    /// catalogue uses (`@moonshot-ai/kimi-code@2.0.2`, read 2026-09-22),
+    /// including the provider-prefixed forms a `llm.request` record can carry.
+    const KIMI_MODEL_IDS: &[&str] = &[
+        "kimi-k3",
+        "kimi-k3-fast",
+        "kimi-k2.7-code",
+        "kimi-k2-7-code",
+        "kimi-k2.7-code-highspeed",
+        "kimi-k2.6",
+        "kimi-k2-6",
+        "kimi-k2.5",
+        "kimi-k2-thinking",
+        "kimi-k2-0905",
+        "kimi-k2-instruct",
+        "moonshot/kimi-k2-thinking",
+        "moonshotai/kimi-k2.5",
+        "fireworks/kimi-k3",
+    ];
+
+    /// AC3 of #8564: every Kimi id the pinned CLI can report is on the card,
+    /// so none of them silently falls through to the Anthropic Sonnet default.
+    #[test]
+    fn pricing_card_knows_every_kimi_model_id() {
+        for id in KIMI_MODEL_IDS {
+            assert!(
+                ModelPricing::is_known_model(id),
+                "'{id}' is not on the pricing card — it would be costed at the Anthropic \
+                 unknown-model default. Add its row (rates verified against \
+                 https://platform.moonshot.ai/docs/pricing/chat)."
+            );
+        }
+    }
+
+    /// The published K2/K3 rates, spot-checked against the 2026-09-22 vendor
+    /// page. A row that drifts from its published number is invisible in
+    /// production — the cost record still gets *a* number.
+    #[test]
+    fn kimi_rows_carry_their_published_rates() {
+        let k3 = ModelPricing::for_model("kimi-k3");
+        assert!((k3.input_cost_per_1k - 0.003).abs() < f64::EPSILON);
+        assert!((k3.output_cost_per_1k - 0.015).abs() < f64::EPSILON);
+        assert!((k3.cache_read_cost_per_1k - 0.000_3).abs() < f64::EPSILON);
+        assert!((k3.cache_write_cost_per_1k - 0.003).abs() < f64::EPSILON, "5m tier");
+        assert!((k3.cache_write_1h_cost_per_1k - 0.006).abs() < f64::EPSILON, "1h tier");
+
+        let code = ModelPricing::for_model("kimi-k2.7-code");
+        assert!((code.input_cost_per_1k - 0.000_95).abs() < f64::EPSILON);
+        assert!((code.output_cost_per_1k - 0.004).abs() < f64::EPSILON);
+        assert!((code.cache_read_cost_per_1k - 0.000_19).abs() < f64::EPSILON);
+        assert!(
+            (code.cache_write_cost_per_1k - code.input_cost_per_1k).abs() < f64::EPSILON,
+            "the K2 table publishes no cache-write price; a write bills as input"
+        );
+
+        let highspeed = ModelPricing::for_model("kimi-k2.7-code-highspeed");
+        assert!(
+            (highspeed.input_cost_per_1k - 0.001_9).abs() < f64::EPSILON,
+            "-highspeed must NOT be swallowed by the base K2.7 Code row — it is 2x"
+        );
+        assert!((highspeed.output_cost_per_1k - 0.008).abs() < f64::EPSILON);
+
+        let k26 = ModelPricing::for_model("kimi-k2.6");
+        assert!((k26.cache_read_cost_per_1k - 0.000_16).abs() < f64::EPSILON);
+    }
+
+    /// An unrecognized K2 generation pins to the NEWEST published K2 row, the
+    /// same rule #8060 established for the `claude-<family>-` catch-alls.
+    #[test]
+    fn an_unknown_kimi_k2_generation_pins_to_the_newest_published_row() {
+        let newest = ModelPricing::for_model("kimi-k2.7-code");
+        for id in [
+            "kimi-k2-thinking",
+            "kimi-k2.5",
+            "moonshot/kimi-k2-0905-preview",
+        ] {
+            let p = ModelPricing::for_model(id);
+            assert!(
+                (p.input_cost_per_1k - newest.input_cost_per_1k).abs() < f64::EPSILON,
+                "{id} must not inherit a retired or Anthropic rate"
+            );
+        }
+    }
+
+    /// A Kimi id must never be priced at the Anthropic Sonnet default, which
+    /// is what every one of them did before #8564.
+    #[test]
+    fn no_kimi_id_falls_through_to_the_anthropic_sonnet_default() {
+        let sonnet = ModelPricing::for_model("claude-sonnet-5");
+        for id in KIMI_MODEL_IDS {
+            let p = ModelPricing::for_model(id);
+            assert!(
+                (p.input_cost_per_1k - sonnet.input_cost_per_1k).abs() > f64::EPSILON
+                    || (p.output_cost_per_1k - sonnet.output_cost_per_1k).abs() > f64::EPSILON,
+                "'{id}' is being priced exactly like Sonnet — the #8564 fall-through is back"
+            );
+        }
+    }
+
+    /// The CLI's own product strings are not model ids and must not be
+    /// mistaken for them — `is_moonshot_id` is what routes the unknown-model
+    /// warning to the right vendor's pricing page.
+    #[test]
+    fn the_moonshot_detector_is_narrow_enough_to_exclude_the_cli_product_name() {
+        assert!(is_moonshot_id("kimi-k2.7-code"));
+        assert!(is_moonshot_id("moonshot/kimi-k2-thinking"));
+        assert!(is_moonshot_id("MOONSHOTAI/Kimi-K3"));
+        assert!(!is_moonshot_id("kimi-code"), "the CLI package, not a model");
+        assert!(!is_moonshot_id("kimi-code-cli"));
+        assert!(!is_moonshot_id("claude-sonnet-5"));
+        assert_eq!(detect_provider("kimi-k2.7-code"), "moonshot");
+        assert_eq!(detect_provider("claude-opus-5"), "anthropic");
+    }
+
     #[test]
     fn pricing_card_knows_every_dispatchable_model_id() {
         for id in KNOWN_MODEL_IDS {
@@ -817,6 +1063,7 @@ mod tests {
     /// (non-multiplier-derived) cache-rate form respectively.
     fn parity_model_ids() -> Vec<String> {
         let mut ids: Vec<String> = KNOWN_MODEL_IDS.iter().map(|s| (*s).to_string()).collect();
+        ids.extend(KIMI_MODEL_IDS.iter().map(|s| (*s).to_string()));
         for extra in [
             "OPUS",
             "claude-opus-6",

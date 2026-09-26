@@ -107,7 +107,7 @@ pub fn private_defaults_path() -> Option<PathBuf> {
 /// error, mirroring the soft-fail contract already used by
 /// `work_finder::read_work_finder_config` and
 /// `main_health_gate::read_build_gate_config`.
-fn soft_read_json_object(path: &Path) -> Value {
+pub(crate) fn soft_read_json_object(path: &Path) -> Value {
     let text = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -324,6 +324,88 @@ pub fn daemon_delegated_to(repo_root: &Path) -> Option<String> {
     get_path(&effective, DAEMON_DELEGATED_TO_KEY)
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// Dotted key read by [`fleet_captain`].
+const FLEET_CAPTAIN_KEY: &str = "fleet.captain";
+
+/// Read the `fleet.captain` config key for `repo_root` (Issue #8848): the
+/// fleet host id (compared against
+/// [`crate::sweep_registry::host_identity`]) that runs declared singleton
+/// jobs — see [`crate::fleet_captain`] for the gating logic this feeds.
+///
+/// **Belongs in the tracked `.loom/config.json`, not a host-local env var**
+/// — mirrors the `autonomous.roleRunner.shardCount`/`shardKey` "identical
+/// fleet-wide, tracked" precedent (`defaults/docs/daemon-reference.md`'s
+/// "Role-runner host sharding" section), NOT the `shardIndex` "must differ
+/// per host" pattern: every host in the fleet must agree on who the captain
+/// is, and a committed file is identical fleet-wide by construction. Read
+/// through [`resolve_effective_config`] like every other knob here, so an
+/// untracked `.loom-local/local.json` override (or the private/shared
+/// defaults tier) still layers on top in the usual precedence order — this
+/// function does not itself enforce the tracked-tier convention the way
+/// [`crate::role_shard`]'s `shardIndex` refusal does for the opposite case,
+/// because a fleet-wide value read from any tier is still fleet-wide-safe by
+/// construction; it is only a **host-local** value read from the *tracked*
+/// tier that is a fleet-breaking misconfiguration.
+///
+/// Soft-fails to `None` — "no captain declared", the default and
+/// behavior-unchanged case for every repo today — on a missing key, a
+/// missing/malformed config file, a non-string value, or a blank/
+/// whitespace-only string (trimmed before returning).
+#[must_use]
+pub fn fleet_captain(repo_root: &Path) -> Option<String> {
+    let effective = resolve_effective_config(repo_root);
+    let raw = get_path(&effective, FLEET_CAPTAIN_KEY).and_then(Value::as_str)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+const FLEET_CAPTAIN_ARM_TTL_SECS_KEY: &str = "fleet.captainArmTtlSecs";
+
+/// Env override for [`fleet_captain_arm_ttl_secs`], following the
+/// **env > config > default** precedence every other `autonomous`-adjacent
+/// numeric knob in this crate uses (e.g. `ci_telemetry::INTERVAL_SECS_ENV`).
+pub const FLEET_CAPTAIN_ARM_TTL_SECS_ENV: &str = "LOOM_FLEET_CAPTAIN_ARM_TTL_SECS";
+
+/// The staleness window (#8901) for a **durable, shell-driven** singleton
+/// arm — see [`crate::fleet_captain`]'s "Staleness policy" doc section for
+/// the full rationale. A `loom-daemon fleet-captain <job>` invocation that
+/// most recently resolved `Armed` more than this many seconds ago stops
+/// being reported in `host.health.armed_singleton_jobs`, so an uninstalled
+/// wrapper's last arm expires on its own instead of pinning a phantom
+/// "armed" entry forever.
+///
+/// Six hours: generous enough that a singleton wrapper firing hourly (or
+/// even every few hours) never flickers stale between its own ticks, but
+/// tight enough that a genuinely uninstalled wrapper clears within the same
+/// working day rather than lingering for a week. Override per-repo with
+/// `fleet.captainArmTtlSecs` for a job whose own cadence is much slower than
+/// that assumption.
+pub const DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS: u64 = 6 * 60 * 60;
+
+/// Read `fleet.captainArmTtlSecs` (env > config > default) — see
+/// [`DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS`] for the default and its rationale.
+/// A non-positive or unparsable value at any tier is ignored, falling
+/// through to the next one, same soft-fail contract as [`fleet_captain`].
+#[must_use]
+pub fn fleet_captain_arm_ttl_secs(repo_root: &Path) -> u64 {
+    if let Ok(raw) = std::env::var(FLEET_CAPTAIN_ARM_TTL_SECS_ENV) {
+        if let Ok(parsed) = raw.trim().parse::<u64>() {
+            if parsed > 0 {
+                return parsed;
+            }
+        }
+    }
+    let effective = resolve_effective_config(repo_root);
+    get_path(&effective, FLEET_CAPTAIN_ARM_TTL_SECS_KEY)
+        .and_then(Value::as_u64)
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS)
 }
 
 #[cfg(test)]
@@ -736,6 +818,129 @@ mod tests {
         let delegate = daemon_delegated_to(dir.path());
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
         assert_eq!(delegate, None);
+    }
+
+    // ===== fleet_captain (#8848) =====
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_reads_the_configured_host_id() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{"fleet": {"captain": "loom-worker-1"}}"#,
+        );
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(captain, Some("loom-worker-1".to_string()));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_default_off_when_key_absent() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"nextAgentNumber": 3}"#);
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            captain, None,
+            "no fleet.captain declared must leave today's behavior unchanged"
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_missing_config_file_is_none() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(captain, None);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_wrong_type_soft_fails_to_none() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"fleet": {"captain": 42}}"#);
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(captain, None);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_blank_string_soft_fails_to_none() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"fleet": {"captain": "   "}}"#);
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(captain, None);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_trims_whitespace() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{"fleet": {"captain": "  loom-worker-2  "}}"#,
+        );
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(captain, Some("loom-worker-2".to_string()));
+    }
+
+    // ===== fleet_captain_arm_ttl_secs (#8901) =====
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_arm_ttl_secs_default_when_unset() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        let ttl = fleet_captain_arm_ttl_secs(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(ttl, DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_arm_ttl_secs_reads_config() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"fleet": {"captainArmTtlSecs": 900}}"#);
+        let ttl = fleet_captain_arm_ttl_secs(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(ttl, 900);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_arm_ttl_secs_zero_or_missing_falls_back_to_default() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"fleet": {"captainArmTtlSecs": 0}}"#);
+        let ttl = fleet_captain_arm_ttl_secs(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(ttl, DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_arm_ttl_secs_env_override_wins() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"fleet": {"captainArmTtlSecs": 900}}"#);
+        std::env::set_var(FLEET_CAPTAIN_ARM_TTL_SECS_ENV, "60");
+        let ttl = fleet_captain_arm_ttl_secs(dir.path());
+        std::env::remove_var(FLEET_CAPTAIN_ARM_TTL_SECS_ENV);
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(ttl, 60);
     }
 
     // ===== Cross-language conformance fixture (#4039 AC) =====

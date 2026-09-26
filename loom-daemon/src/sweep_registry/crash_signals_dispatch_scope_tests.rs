@@ -206,3 +206,21 @@ fn spawned_child_that_reached_cli_start_in_the_current_dispatch_is_not_preflight
 
     assert_eq!(poll_classify_dead_child(body), None);
 }
+
+/// #8599: the `# LOOM_RUNTIME_PREFERENCE` marker `worker_spawn::launch` now
+/// writes into the CURRENT dispatch's log region is launch-record preamble, not
+/// progress. Without the exclusion in `log_has_progress`, EVERY hung
+/// preference-resolved sweep would read as alive to stall detection. (Here
+/// rather than in `crash_signals.rs`'s own `mod tests` for the same file-size
+/// reason as the rest of this module.)
+#[test]
+fn log_has_progress_ignores_the_runtime_preference_marker() {
+    let log = "==== loom-daemon dispatch: t sweep_id=s issue=7 ====\n\
+# LOOM_RUNTIME_RESOLVED runtime=opencode\n\
+# LOOM_RUNTIME_PREFERENCE order=claude,codex,opencode:zai-metered tier=2 \
+tap=opencode:zai-metered skipped=claude:unavailable(claude_tokens: 0/21 spawnable) \
+source=preference\n\
+[ts] spawn-worker: runtime=opencode\n";
+    assert!(!log_has_progress(log));
+    assert!(log_has_progress(&format!("{log}Stage 0: resolving backend...\n")));
+}

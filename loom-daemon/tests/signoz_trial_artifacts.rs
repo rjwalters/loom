@@ -18,9 +18,13 @@
 //! from the gateway config the deployment actually mounts.
 #![allow(clippy::unwrap_used)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
+use loom_daemon::telemetry::ci::{
+    CiAttr, CI_JOB_DURATION_METRIC, CI_METRIC_LABEL_KEYS, CI_RUN_DURATION_METRIC,
+};
+use loom_daemon::telemetry::{CiJobLogRecord, CiJobRecord, CiRunRecord, RepoVisibility};
 use regex::Regex;
 
 const COLLECTOR_CONFIG: &str = include_str!("../../defaults/observability/collector/config.yaml");
@@ -31,6 +35,9 @@ const FIXTURE_QUERIES: &str =
 /// manifest-equality rules that govern `fixture-queries.sql`.
 const ADHOC_QUERIES: &str = include_str!("../../defaults/observability/signoz/queries.sql");
 const SIGNOZ_README: &str = include_str!("../../defaults/observability/signoz/README.md");
+/// The standing build/CI retro queries (#8826). Governed by the CI record
+/// family's own vocabulary, not the shared fixture manifest's.
+const CI_QUERIES: &str = include_str!("../../defaults/observability/signoz/ci-queries.sql");
 
 /// Loom's own attribute namespace. Presence probes outside it are deliberate
 /// absence assertions (see [`fixture_queries_assert_the_privacy_sentinel_is_dropped`])
@@ -210,6 +217,7 @@ fn saved_queries_only_reference_forwarded_attribute_and_resource_keys() {
     for (label, sql) in [
         ("fixture-queries.sql", FIXTURE_QUERIES),
         ("queries.sql", ADHOC_QUERIES),
+        ("ci-queries.sql", CI_QUERIES),
     ] {
         for container in ["attributes_string", "attributes_number", "attributes_bool"] {
             for key in referenced_attribute_keys(sql, container) {
@@ -321,4 +329,272 @@ fn readme_documents_the_gateway_endpoint_the_collector_config_exports_to() {
         SIGNOZ_README.contains(&endpoint),
         "the SigNoz README must document the gateway's actual SigNoz exporter endpoint {endpoint}"
     );
+}
+
+// ============================================================================
+// ci-queries.sql (#8826): the standing build/CI retro queries
+// ============================================================================
+//
+// The CI record family has its own authorities, so it gets its own, stricter
+// drift guard. A CI query can go silently empty in three ways the shared
+// `allowlist()` check cannot see:
+//
+// 1. It reads a log attribute the gateway's **log** `keep_keys` strips (the
+//    shared check unions log and span keys, so a span-only key would pass).
+// 2. It reads a key from the wrong SigNoz type container — e.g.
+//    `attributes_string['loom.ci.run_id']`, when the daemon sends the run id as
+//    an OTLP int that SigNoz files under `attributes_number`. The subscript
+//    returns '' for every row and nothing errors.
+// 3. It reads a metric label or names a histogram series the daemon never
+//    emits or the gateway's **datapoint** `keep_keys` strips.
+
+/// `keep_keys` per OTTL context (`log`, `span`, `spanevent`, `datapoint`,
+/// `resource`), so a CI log query is checked against the log allowlist alone.
+fn keep_keys_by_context() -> BTreeMap<String, BTreeSet<String>> {
+    let quoted = Regex::new(r#""([^"]+)""#).unwrap();
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut context = String::new();
+    for line in COLLECTOR_CONFIG.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("- context:") {
+            context = rest.trim().to_owned();
+        }
+        if !trimmed.contains("keep_keys(") {
+            continue;
+        }
+        let keys = out.entry(context.clone()).or_default();
+        for capture in quoted.captures_iter(trimmed) {
+            keys.insert(capture[1].to_owned());
+        }
+    }
+    for context in ["log", "datapoint"] {
+        assert!(
+            out.get(context).is_some_and(|keys| !keys.is_empty()),
+            "failed to parse the `{context}` keep_keys allowlist out of the collector config"
+        );
+    }
+    out
+}
+
+/// The SigNoz map column each CI log attribute lands in, re-derived from the
+/// daemon's own record rendering (fully-populated records, so every optional
+/// key is present): an OTLP string lands in `attributes_string`, an int in
+/// `attributes_number`, a bool in `attributes_bool`. `loom.repo` and
+/// `loom.repo.visibility` are prepended to every CI log record as strings by
+/// the OTLP mapping.
+fn daemon_ci_log_attribute_containers() -> BTreeMap<String, &'static str> {
+    let at: DateTime<Utc> = "2026-09-25T12:00:00Z".parse().unwrap();
+    let run = CiRunRecord {
+        repo: "2amlogic/example".into(),
+        visibility: RepoVisibility::Private,
+        run_id: 1,
+        run_attempt: 1,
+        workflow: "CI".into(),
+        git_ref: Some("main".into()),
+        head_sha: "0".repeat(40),
+        event: "push".into(),
+        status: "completed".into(),
+        conclusion: Some("failure".into()),
+        triggered_by: Some("octocat".into()),
+        started_at: at,
+        completed_at: at,
+        duration_ms: 0,
+        queued_ms: Some(0),
+    };
+    let job = CiJobRecord {
+        repo: "2amlogic/example".into(),
+        visibility: RepoVisibility::Private,
+        run_id: 1,
+        job_id: 2,
+        workflow: "CI".into(),
+        job: "build".into(),
+        runner: Some("ubuntu-latest".into()),
+        attempts: 1,
+        status: "completed".into(),
+        conclusion: Some("failure".into()),
+        timed_out: false,
+        started_at: at,
+        completed_at: at,
+        duration_ms: 0,
+    };
+    let chunk = CiJobLogRecord {
+        repo: "2amlogic/example".into(),
+        visibility: RepoVisibility::Private,
+        run_id: 1,
+        job_id: 2,
+        workflow: "CI".into(),
+        job: "build".into(),
+        chunk_index: 0,
+        chunk_count: 1,
+        log_bytes_total: 0,
+        truncated: true,
+        truncation_note: Some("capped".into()),
+        completed_at: at,
+        text: String::new(),
+    };
+    let mut out = BTreeMap::from([
+        ("loom.repo".to_owned(), "attributes_string"),
+        ("loom.repo.visibility".to_owned(), "attributes_string"),
+    ]);
+    for (key, value) in run
+        .log_attributes()
+        .into_iter()
+        .chain(job.log_attributes())
+        .chain(chunk.log_attributes())
+    {
+        let container = match value {
+            CiAttr::Str(_) => "attributes_string",
+            CiAttr::Int(_) => "attributes_number",
+            CiAttr::Bool(_) => "attributes_bool",
+        };
+        let previous = out.insert(key.to_owned(), container);
+        assert!(
+            previous.is_none_or(|p| p == container),
+            "the daemon renders CI attribute {key} as two different OTLP types across record \
+             kinds, so no single SigNoz column can be queried for it"
+        );
+    }
+    out
+}
+
+/// Metric labels read out of a series' JSON `labels` column.
+fn metric_label_keys(sql: &str) -> BTreeSet<String> {
+    Regex::new(r"JSONExtractString\(\s*(?:\w+\.)?labels\s*,\s*'([^']+)'\s*\)")
+        .unwrap()
+        .captures_iter(sql)
+        .map(|capture| capture[1].to_owned())
+        .collect()
+}
+
+/// Every metric-name literal, whether `metric_name = '…'` or an `IN` list.
+fn all_metric_name_literals(sql: &str) -> BTreeSet<String> {
+    let mut names = metric_name_literals(sql);
+    names.extend(
+        Regex::new(r"metric_name\s*=\s*'([^']+)'")
+            .unwrap()
+            .captures_iter(sql)
+            .map(|capture| capture[1].to_owned()),
+    );
+    names
+}
+
+#[test]
+fn ci_queries_read_log_attributes_the_gateway_forwards_from_the_column_the_daemon_fills() {
+    let log_keys = &keep_keys_by_context()["log"];
+    let daemon = daemon_ci_log_attribute_containers();
+    for container in ["attributes_string", "attributes_number", "attributes_bool"] {
+        let keys = referenced_attribute_keys(CI_QUERIES, container);
+        assert!(
+            !keys.is_empty(),
+            "ci-queries.sql no longer reads anything from {container}; if that is deliberate, \
+             drop it from this loop rather than letting the guard go vacuous"
+        );
+        for key in keys {
+            assert!(
+                log_keys.contains(&key),
+                "ci-queries.sql: {container}['{key}'] is stripped by the gateway's LOG keep_keys \
+                 allowlist, so this query can only ever return zero rows"
+            );
+            match daemon.get(&key) {
+                None => panic!(
+                    "ci-queries.sql reads {container}['{key}'], which no ci.run / ci.job / \
+                     ci.job.log record ever sets; the daemon's CI log vocabulary is {:?}",
+                    daemon.keys().collect::<Vec<_>>()
+                ),
+                Some(actual) => assert_eq!(
+                    *actual, container,
+                    "ci-queries.sql reads '{key}' from {container}, but the daemon sends it as the \
+                     type SigNoz files under {actual} — the subscript returns an empty/zero value \
+                     for every row instead of an error"
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn ci_queries_read_only_metric_labels_the_daemon_emits_and_the_gateway_forwards() {
+    let datapoint_keys = &keep_keys_by_context()["datapoint"];
+    let labels = metric_label_keys(CI_QUERIES);
+    assert!(!labels.is_empty(), "ci-queries.sql no longer reads any CI metric label");
+    for label in labels {
+        assert!(
+            CI_METRIC_LABEL_KEYS.contains(&label.as_str()),
+            "ci-queries.sql reads metric label '{label}', which the CI duration histograms never \
+             carry; their labels are {CI_METRIC_LABEL_KEYS:?}"
+        );
+        assert!(
+            datapoint_keys.contains(&label),
+            "ci-queries.sql reads metric label '{label}', which the gateway's DATAPOINT \
+             keep_keys allowlist strips"
+        );
+    }
+}
+
+/// SigNoz stores one OTLP histogram as `<name>.bucket` / `.count` / `.sum`
+/// series (observed live on the pinned v0.142.1 ingester). The retro reads
+/// only `.sum` (one sample = one observed duration, since every data point has
+/// count 1) and `.count` (one sample = one run/job).
+#[test]
+fn ci_queries_name_only_the_ci_duration_histogram_series() {
+    let allowed: BTreeSet<String> = [CI_RUN_DURATION_METRIC, CI_JOB_DURATION_METRIC]
+        .iter()
+        .flat_map(|metric| [format!("{metric}.sum"), format!("{metric}.count")])
+        .collect();
+    let named = all_metric_name_literals(CI_QUERIES);
+    for name in &named {
+        assert!(
+            allowed.contains(name),
+            "ci-queries.sql queries metric series '{name}', which no CI duration histogram \
+             produces; expected one of {allowed:?}"
+        );
+    }
+    for metric in [CI_RUN_DURATION_METRIC, CI_JOB_DURATION_METRIC] {
+        assert!(
+            named.iter().any(|name| name.starts_with(metric)),
+            "ci-queries.sql no longer reads {metric} at all"
+        );
+    }
+}
+
+/// `clickhouse-client` refuses a statement with an unbound `{param:Type}`, and
+/// a documented-but-unused `--param_` is a stale instruction. The header's
+/// invocation must bind exactly the parameters the statements use.
+#[test]
+fn ci_queries_documented_invocation_binds_exactly_the_parameters_used() {
+    let used: BTreeSet<String> = Regex::new(r"\{(\w+):\w+\}")
+        .unwrap()
+        .captures_iter(CI_QUERIES)
+        .map(|capture| capture[1].to_owned())
+        .collect();
+    let bound: BTreeSet<String> = Regex::new(r"--param_(\w+)=")
+        .unwrap()
+        .captures_iter(CI_QUERIES)
+        .map(|capture| capture[1].to_owned())
+        .collect();
+    assert!(!used.is_empty(), "ci-queries.sql is no longer parameterized");
+    assert_eq!(
+        used, bound,
+        "ci-queries.sql's documented clickhouse-client invocation must bind exactly the \
+         parameters its statements reference"
+    );
+}
+
+/// The six standing views are the issue's contract (#8826): each is a numbered
+/// section of `ci-queries.sql`, and each has a reproducible row in the
+/// README's "Saved views" table that cites it.
+#[test]
+fn every_standing_ci_view_is_a_query_section_and_a_readme_saved_view() {
+    for section in 1..=6 {
+        assert!(
+            Regex::new(&format!(r"(?m)^-- {section}\. "))
+                .unwrap()
+                .is_match(CI_QUERIES),
+            "ci-queries.sql is missing standing-view section {section}"
+        );
+        assert!(
+            SIGNOZ_README.contains(&format!("`ci-queries.sql` {section})")),
+            "the SigNoz README's Saved views table has no row citing `ci-queries.sql` {section}"
+        );
+    }
 }

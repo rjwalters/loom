@@ -78,7 +78,7 @@ fn failed_spawn_completes_and_retires_the_prepared_root() {
     let root = dir.path();
     let execution = "missing-executable";
     let mut cmd = Command::new(root.join("does-not-exist"));
-    loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution);
+    loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution, None);
     assert!(TraceStore::new(root).path(root, execution).exists());
     let error = lifecycle::spawn_child(&mut cmd, root, execution).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
@@ -88,6 +88,93 @@ fn failed_spawn_completes_and_retires_the_prepared_root() {
     assert_eq!(records[0].status, SpanStatus::Error);
     assert_eq!(records[0].attributes["loom.result"], "spawn_failed");
     assert!(!TraceStore::new(root).path(root, execution).exists());
+}
+
+fn git_repo_with_origin(root: &Path, origin: &str) {
+    for args in [&["init", "-q"][..], &["remote", "add", "origin", origin]] {
+        assert!(Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+
+fn issue_sweeps(
+    root: &Path,
+    executions: &[&str],
+    issue: u32,
+) -> Vec<loom_daemon::telemetry::trace::SpanRecord> {
+    let mut sweeps = Vec::new();
+    for execution in executions {
+        let mut cmd = Command::new(root.join("does-not-exist"));
+        loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution, Some(issue));
+        lifecycle::spawn_child(&mut cmd, root, execution).unwrap_err();
+        sweeps.extend(
+            spans(root).into_iter().filter(|s| {
+                s.name == SpanName::Sweep && s.attributes["loom.sweep_id"] == *execution
+            }),
+        );
+        // The story-parented root still counts as this journal's root (#9038),
+        // so the drained execution retires instead of leaking its context.
+        assert!(!TraceStore::new(root).path(root, execution).exists());
+    }
+    sweeps
+}
+
+#[test]
+fn issue_execution_joins_the_story_trace_and_still_retires() {
+    let dir = root();
+    let root = dir.path();
+    git_repo_with_origin(root, "git@github.com:RJWalters/Loom.git");
+    // Stubbed resolver: the D32 v1 key is the repo_id, not the origin's name.
+    loom_daemon::telemetry::repo_identity::seed(
+        "RJWalters/Loom",
+        loom_daemon::telemetry::repo_identity::parse("1073994527 rjwalters/loom"),
+    );
+    let story = loom_daemon::telemetry::trace::story_context(1_073_994_527, 9038).unwrap();
+    let sweeps = issue_sweeps(root, &["story-attempt-1", "story-attempt-2"], 9038);
+    assert_eq!(sweeps.len(), 2);
+    for sweep in &sweeps {
+        assert_eq!(sweep.context.trace_id, story.trace_id);
+        assert_eq!(sweep.parent_span_id.as_ref(), Some(&story.span_id));
+        assert_eq!(sweep.attributes["loom.issue"], "9038");
+        assert_eq!(sweep.attributes["loom.repo"], "rjwalters/loom");
+        assert_eq!(sweep.attributes["loom.story_id"], story.trace_id.as_str());
+        assert_eq!(sweep.attributes["loom.story"], "rjwalters/loom#9038");
+        assert_eq!(sweep.attributes["loom.story.key_version"], "v1");
+    }
+    assert_ne!(sweeps[0].context.span_id, sweeps[1].context.span_id);
+}
+
+#[test]
+fn unresolvable_repo_id_makes_the_execution_its_own_root() {
+    let dir = root();
+    let root = dir.path();
+    git_repo_with_origin(root, "git@github.com:unresolvable-owner/no-repo-id.git");
+    loom_daemon::telemetry::repo_identity::seed("unresolvable-owner/no-repo-id", None);
+    let sweeps = issue_sweeps(root, &["orphan-attempt-1", "orphan-attempt-2"], 7);
+    assert_eq!(sweeps.len(), 2);
+    // Never a name-derived story: no shared trace, no parent, no story attrs.
+    let name_derived = loom_daemon::telemetry::trace::TraceId::derived(&[
+        "loom.story.trace",
+        "unresolvable-owner/no-repo-id",
+        "7",
+    ]);
+    for sweep in &sweeps {
+        assert_eq!(sweep.parent_span_id, None);
+        assert_ne!(sweep.context.trace_id, name_derived);
+        for key in [
+            "loom.story_id",
+            "loom.story",
+            "loom.story.key_version",
+            "loom.issue",
+        ] {
+            assert!(!sweep.attributes.contains_key(key), "{key} must be absent");
+        }
+    }
+    assert_ne!(sweeps[0].context.trace_id, sweeps[1].context.trace_id);
 }
 
 #[test]

@@ -1163,6 +1163,85 @@ assert_contains "long -dvvv listing: says it is not re-signing" "$out40" "alread
 assert_eq "long -dvvv listing: codesign -f is NEVER invoked (no SIGPIPE-driven ad-hoc downgrade)" "0" \
   "$( [[ -s "$CODESIGN_LONG_SIGNED_ARGS_FILE" ]] && echo 1 || echo 0 )"
 
+# ---------------------------------------------------------------------------
+# Post-copy loadability gate + quarantine (issue #8837 AC2)
+#
+# The 2026-09-24 incident: a cross-host prebuilt copied cleanly onto a
+# glibc-2.35 host, then failed EVERY invocation with a `GLIBC_x.y' not
+# found` error -- including the self-repair scripts, because the installer
+# never checked whether the copied binary could actually LOAD before
+# declaring success. These fixtures stand in for that binary: they copy
+# (install/cp both succeed) but fail `--version` with a realistic GLIBC
+# error on stderr, exactly like the real failure mode.
+# ---------------------------------------------------------------------------
+make_unloadable_bin() {
+  local path="$1"
+  cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+echo "loom-daemon: /lib/x86_64-linux-gnu/libc.so.6: version \`GLIBC_2.39' not found (required by loom-daemon)" >&2
+exit 1
+EOF
+  chmod +x "$path"
+}
+
+# ---------- test 41: fresh install of an unloadable binary is quarantined,
+# not left in place -- no previous binary existed to restore. ----------
+SRC41="$WORKDIR/src41/loom-daemon"
+mkdir -p "$WORKDIR/src41"
+make_unloadable_bin "$SRC41"
+DEST41="$WORKDIR/dest41"
+out41=$(LOOM_DAEMON_BIN_DIR="$DEST41" provision_machine_daemon "$SRC41" 2>&1)
+rc41=$?
+assert_eq "unloadable fresh install: provision returns 1 (soft failure)" "1" "$rc41"
+assert_eq "unloadable fresh install: nothing left at the dest path" "0" \
+  "$( [[ -e "$DEST41/loom-daemon" ]] && echo 1 || echo 0 )"
+assert_eq "unloadable fresh install: exactly one quarantined copy exists" "1" \
+  "$(find "$DEST41" -maxdepth 1 -name 'loom-daemon.badglibc-*' 2>/dev/null | wc -l | tr -d ' ')"
+assert_contains "unloadable fresh install: warns loudly with the captured GLIBC error" "$out41" "GLIBC_2.39"
+assert_contains "unloadable fresh install: names the loadability check" "$out41" "loadability check FAILED"
+assert_contains "unloadable fresh install: reports the quarantine move" "$out41" "quarantined unloadable binary"
+assert_contains "unloadable fresh install: notes no previous binary to restore" "$out41" "no previous working binary to restore"
+
+# ---------- test 42: an unloadable UPGRADE quarantines the bad binary and
+# restores the previous WORKING binary, so the host is never left with
+# nothing runnable at $dest_bin. ----------
+SRC42_GOOD="$WORKDIR/src42-good/loom-daemon"
+SRC42_BAD="$WORKDIR/src42-bad/loom-daemon"
+mkdir -p "$WORKDIR/src42-good" "$WORKDIR/src42-bad"
+make_fake_bin "$SRC42_GOOD" "0.19.330"
+make_unloadable_bin "$SRC42_BAD"
+DEST42="$WORKDIR/dest42"
+
+_out42_first=$(LOOM_DAEMON_BIN_DIR="$DEST42" provision_machine_daemon "$SRC42_GOOD" 2>&1)
+rc42_first=$?
+assert_eq "unloadable upgrade: the good first install returns 0" "0" "$rc42_first"
+
+out42=$(LOOM_DAEMON_BIN_DIR="$DEST42" provision_machine_daemon "$SRC42_BAD" 2>&1)
+rc42=$?
+assert_eq "unloadable upgrade: provision returns 1 (soft failure)" "1" "$rc42"
+assert_eq "unloadable upgrade: dest binary is restored and still executable" "1" \
+  "$( [[ -x "$DEST42/loom-daemon" ]] && echo 1 || echo 0 )"
+assert_eq "unloadable upgrade: restored binary reports the PREVIOUS working version" \
+  "loom-daemon 0.19.330" "$("$DEST42/loom-daemon" --version 2>/dev/null)"
+assert_eq "unloadable upgrade: exactly one quarantined copy exists" "1" \
+  "$(find "$DEST42" -maxdepth 1 -name 'loom-daemon.badglibc-*' 2>/dev/null | wc -l | tr -d ' ')"
+assert_contains "unloadable upgrade: reports the restore" "$out42" "restored the previous working binary"
+
+# ---------- test 43: a second same-day quarantine does not clobber the
+# first -- both failed attempts stay on disk as evidence. ----------
+SRC43_BAD2="$WORKDIR/src43-bad2/loom-daemon"
+mkdir -p "$WORKDIR/src43-bad2"
+make_unloadable_bin "$SRC43_BAD2"
+out43=$(LOOM_DAEMON_BIN_DIR="$DEST42" provision_machine_daemon "$SRC43_BAD2" 2>&1)
+rc43=$?
+assert_eq "second same-day quarantine: provision still returns 1" "1" "$rc43"
+assert_contains "second same-day quarantine: reports the quarantine move" "$out43" "quarantined unloadable binary"
+assert_contains "second same-day quarantine: reports the restore" "$out43" "restored the previous working binary"
+assert_eq "second same-day quarantine: TWO quarantined copies now exist (neither clobbered)" "2" \
+  "$(find "$DEST42" -maxdepth 1 -name 'loom-daemon.badglibc-*' 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "second same-day quarantine: restored binary still reports the working version" \
+  "loom-daemon 0.19.330" "$("$DEST42/loom-daemon" --version 2>/dev/null)"
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"

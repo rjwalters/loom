@@ -1,0 +1,63 @@
+{
+  "spec": "docs/story-trace.md (D32), derivation v1",
+  "derivation": {
+    "input": "loom-story/v1:github:<repo_id>:<number>",
+    "trace_id": "hex(sha256(input)[0:16])",
+    "root_span": "hex(sha256(input + \":root\")[0:8])",
+    "span_id": "hex(sha256(input + \":span:\" + kind + \":\" + source_event_id)[0:8])"
+  },
+  "vectors": [
+    {
+      "story": "2AMLogic/harness-ops#307",
+      "repo_id": 1377976597,
+      "number": 307,
+      "input": "loom-story/v1:github:1377976597:307",
+      "trace_id": "19d2a1429fe673430f31cff18afcc8cf",
+      "root_span": "1359dc0db2db55f8"
+    },
+    {
+      "story": "rjwalters/loom#9027",
+      "repo_id": 1073994527,
+      "number": 9027,
+      "input": "loom-story/v1:github:1073994527:9027",
+      "trace_id": "4e99cc89953fb6bd604a06896b83dc81",
+      "root_span": "9bf80a36c4f1c38f"
+    },
+    {
+      "story": "2AMLogic/harness-ops#1",
+      "repo_id": 1377976597,
+      "number": 1,
+      "input": "loom-story/v1:github:1377976597:1",
+      "trace_id": "cbf315ed8c10232ba01ff7348a4ebe01",
+      "root_span": "b35f761c7e51c69c"
+    }
+  ],
+  "span_kinds": [
+    "story.intake",
+    "story.queue_dwell",
+    "story.review_wait",
+    "story.merge",
+    "story.reopened"
+  ],
+  "source_event_id_pattern": "^[A-Za-z0-9._-]{1,256}$",
+  "span_vectors": [
+    {
+      "story": "2AMLogic/harness-ops#307",
+      "repo_id": 1377976597,
+      "number": 307,
+      "input": "loom-story/v1:github:1377976597:307",
+      "kind": "story.merge",
+      "source_event_id": "123",
+      "span_id": "ef2c60081d794535"
+    },
+    {
+      "story": "rjwalters/loom#9027",
+      "repo_id": 1073994527,
+      "number": 9027,
+      "input": "loom-story/v1:github:1073994527:9027",
+      "kind": "story.review_wait",
+      "source_event_id": "20473627891",
+      "span_id": "d028f658590dfc35"
+    }
+  ]
+}

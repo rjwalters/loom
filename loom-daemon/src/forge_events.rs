@@ -14,11 +14,11 @@
 //!
 //! This module polls that feed, journals each page durably, persists the
 //! cursor atomically, and publishes exactly one `forge.event` in-process bus
-//! prompt per non-empty page. **Nothing subscribes to that topic in this
-//! phase** — the consumers (work-finder tick, queue-head wake, in-flight PR
-//! watch) are Phase 2, issue #8766. Phase 1 is observe-only by construction,
-//! so the whole mechanism can be run against a live feed and measured before
-//! any dispatch path can be affected by it.
+//! prompt per non-empty page. Publication is unconditional and unchanged by
+//! Phase 2; **who listens** is [`wake`]'s business, and every consumer there
+//! is default-off, so a host that opts into the feed alone is still
+//! observe-only by construction — the whole mechanism can be run against a
+//! live feed and measured before any dispatch path can be affected by it.
 //!
 //! The Worker itself is **operator infrastructure, not Loom**: nothing in
 //! this repo carries an operator URL, App id, or key, exactly as
@@ -74,6 +74,8 @@ use serde::Deserialize;
 use crate::event_bus::EventBus;
 use crate::observability::endpoint_policy::{reserved_placeholder_host, valid_otlp_endpoint};
 use crate::types::{Event, ForgeEventsState, ForgeEventsStatus};
+
+pub mod wake;
 
 #[cfg(test)]
 mod tests;
@@ -1057,8 +1059,9 @@ impl FeedClient {
             log::warn!("forge_events: cursor not persisted — {detail}");
         }
         let payload = page_payload(&self.feed.host_id, &page.events);
-        // `NoSubscribers` is the *expected* result in Phase 1 — there is no
-        // subscriber yet, by design — so it is not an error and not logged
+        // `NoSubscribers` is the *expected* result whenever every Phase 2
+        // consumer ([`wake`]) is at its default-off setting — no subscriber is
+        // the normal case, by design — so it is not an error and not logged
         // above debug.
         if let Err(error) = self.bus.publish(Event::Generic {
             topic: BUS_TOPIC.to_string(),

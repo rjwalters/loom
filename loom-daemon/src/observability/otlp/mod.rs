@@ -172,6 +172,12 @@ impl Exporter for OtlpExporter {
                             Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(
                                 g,
                             )) => g.data_points.len() as u64,
+                            Some(
+                                opentelemetry_proto::tonic::metrics::v1::metric::Data::Histogram(h),
+                            ) => h.data_points.len() as u64,
+                            Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(s)) => {
+                                s.data_points.len() as u64
+                            }
                             _ => 0,
                         })
                         .sum();
@@ -240,12 +246,20 @@ impl Exporter for OtlpExporter {
     }
 }
 
+/// Which OTLP endpoint an envelope's kind is exported to, derived from the
+/// `otlp:` routing class the kind declares in `telemetry/kinds.rs` (#8921) —
+/// not from a per-kind chain maintained here. A kind OTLP does not export
+/// (`NotExported`, e.g. native-HTTPS-only `queue.snapshot`) keeps the historical
+/// `Signal::Logs` bucket: nothing ever emits it on this path, and the logs
+/// request builder drops it (`log_record_for` returns `None`).
 fn signal_for(envelope: &TelemetryEnvelope) -> Signal {
-    match envelope.record {
-        crate::telemetry::TelemetryRecord::HostHealth(_)
-        | crate::telemetry::TelemetryRecord::TokensSnapshot(_) => Signal::Metrics,
-        crate::telemetry::TelemetryRecord::Span(_) => Signal::Traces,
-        _ => Signal::Logs,
+    use crate::telemetry::TelemetryKindOtlp;
+    match envelope.record.otlp_class() {
+        TelemetryKindOtlp::Gauges
+        | TelemetryKindOtlp::Histograms
+        | TelemetryKindOtlp::OpsPoints => Signal::Metrics,
+        TelemetryKindOtlp::Spans => Signal::Traces,
+        TelemetryKindOtlp::Logs | TelemetryKindOtlp::NotExported => Signal::Logs,
     }
 }
 

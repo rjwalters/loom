@@ -3,12 +3,12 @@
 //! Port of `loom-daemon-update.sh`'s `fetch_and_verify_artifact`: download
 //! `loom-daemon-<target>` + its `.sha256` (required) + its `.sig`/`.pem`
 //! (both best-effort) for `<tag>` from `<repo>`, verify checksum
-//! (unconditional) and signature (when present), and report the verified
-//! binary.
+//! (unconditional), signature (when present), and GLIBC compatibility
+//! (#8837), and report the verified binary.
 //!
-//! A checksum or signature-verification FAILURE is reported as
-//! [`FetchOutcome::VerificationFailed`] -- a hard abort, never a soft
-//! fallback. A DOWNLOAD failure (network blip, an asset that vanished
+//! A checksum, signature-verification, or GLIBC-compatibility FAILURE is
+//! reported as [`FetchOutcome::VerificationFailed`] -- a hard abort, never a
+//! soft fallback. A DOWNLOAD failure (network blip, an asset that vanished
 //! between resolution and download) is [`FetchOutcome::DownloadFailed`] --
 //! the caller has already committed to fetch mode by the time this runs, so
 //! in practice both are fatal, but the shell wrapper (`cli/release_fetch.rs`)
@@ -39,7 +39,7 @@
 //! the next tick retries); accepting would hand an unverified binary the right
 //! to replace it.
 
-use super::{checksum, signature};
+use super::{checksum, glibc, signature};
 use crate::cmd_out::{self, CmdOutcome};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -109,6 +109,11 @@ pub enum FetchOutcome {
         /// the stdout contract entirely, so a caller had no way to tell a
         /// verified artifact from a checksum-only one.
         signature_state: signature::SignatureState,
+        /// The GLIBC compatibility module's own ok/warn-worded line (#8837).
+        /// Empty exactly where the target isn't `*-unknown-linux-gnu` --
+        /// every other path (a clean pass, a loud tool-unavailable skip)
+        /// reports something.
+        glibc_line: String,
     },
     /// A checksum mismatch or an invalid signature -- tamper evidence. `lines`
     /// are the `err()`-worded messages to print, in order, ending with the
@@ -409,6 +414,22 @@ pub fn fetch_and_verify(inputs: &FetchInputs<'_>) -> FetchOutcome {
         };
     }
 
+    // ---- GLIBC compatibility: the 2026-09-24 incident's fix (#8837) ----
+    //
+    // A checksum match and a valid signature both only answer "is this the
+    // bits the release published" -- neither says whether the binary can
+    // LOAD on this host. Checked last, after tamper-evidence is already
+    // ruled out, so a GLIBC-incompatible artifact is refused through the
+    // same hard-abort `VerificationFailed` path checksum/signature failures
+    // use (never a new exit code, never a soft fallback -- the running
+    // daemon, if any, is left untouched).
+    let glibc_result = glibc::check(&bin_path, inputs.target);
+    if glibc_result.outcome == glibc::Outcome::Incompatible {
+        return FetchOutcome::VerificationFailed {
+            lines: vec![glibc_result.message, ABORT_LINE.to_string()],
+        };
+    }
+
     let version_output = read_version_output(&bin_path);
     let commit = crate::release_resolve::semver::extract_commit(&version_output);
     let had_authority = sig_result.had_authority;
@@ -419,6 +440,7 @@ pub fn fetch_and_verify(inputs: &FetchInputs<'_>) -> FetchOutcome {
         .state
         .unwrap_or(signature::SignatureState::Unavailable);
     let signature_line = sig_result.message;
+    let glibc_line = glibc_result.message;
     let tmp_dir = scratch.persist();
 
     FetchOutcome::Verified {
@@ -432,6 +454,7 @@ pub fn fetch_and_verify(inputs: &FetchInputs<'_>) -> FetchOutcome {
         checksum_line,
         signature_line,
         signature_state,
+        glibc_line,
     }
 }
 

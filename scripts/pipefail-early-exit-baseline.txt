@@ -102,7 +102,7 @@
 13 defaults/scripts/tests/test-sweep-run-registry.sh
 1 defaults/scripts/tests/test-sync-labels-check.sh
 1 defaults/scripts/tests/test-urgent-flip-guard.sh
-2 defaults/scripts/tests/test-worktree-concurrency.sh
+1 defaults/scripts/tests/test-worktree-concurrency.sh
 1 defaults/scripts/tests/test-worktree-json-purity.sh
 2 defaults/scripts/tests/test-worktree-nested-symlinks.sh
 9 defaults/scripts/tests/test-worktree-orphan-guard-spaces.sh

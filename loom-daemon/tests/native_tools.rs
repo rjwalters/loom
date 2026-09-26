@@ -151,19 +151,22 @@ fn broken_missing_and_timed_out_policy_never_executes_the_tool() {
         bin
     });
     let d = fixture();
+    let worker_pid = "test-worker-8451";
     for mode in ["invalid", "unknown", "crash", "timeout", "missing"] {
         let guard_dir = if mode == "missing" {
             d.path().join("missing-guards")
         } else {
             std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../defaults/hooks"))
         };
-        let mut child = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+        command
             .args(["runtime-tool", "--workspace"])
             .arg(d.path())
             .arg("--cwd")
             .arg(d.path())
             .env("LOOM_NATIVE_GUARD_DIR", guard_dir)
             .env("GUARD_FIXTURE_MODE", mode)
+            .env("LOOM_NATIVE_WORKER_PID", worker_pid)
             .env(
                 "PATH",
                 format!(
@@ -171,7 +174,13 @@ fn broken_missing_and_timed_out_policy_never_executes_the_tool() {
                     binary.parent().unwrap().display(),
                     std::env::var("PATH").unwrap_or_default()
                 ),
-            )
+            );
+        if mode == "timeout" {
+            // The fixture sleeps 60s; shrink the configurable budget (#8451)
+            // instead of waiting out the 20s default on every CI run.
+            command.env("LOOM_NATIVE_POLICY_TIMEOUT_SECS", "1");
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -184,7 +193,76 @@ fn broken_missing_and_timed_out_policy_never_executes_the_tool() {
             .path()
             .join(".loom/worktrees/issue-1/SHOULD_NOT_EXIST")
             .exists());
+        // #8451: every non-timeout failure mode here is a guard/policy
+        // malfunction, never a denial and never a transient timeout — it must
+        // carry the distinct "policy error:" class, not "policy timeout:" or
+        // "policy denied:", so a model cannot mistake "the guard is broken"
+        // for "retry is reasonable" or "this command is refused".
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        if mode == "timeout" {
+            assert!(stdout.contains("policy timeout:"), "{mode}: {stdout}");
+            assert!(!stdout.contains("policy denied:"), "{mode}: {stdout}");
+            assert!(!stdout.contains("policy error:"), "{mode}: {stdout}");
+        } else {
+            assert!(stdout.contains("policy error:"), "{mode}: {stdout}");
+            assert!(!stdout.contains("policy timeout:"), "{mode}: {stdout}");
+            assert!(!stdout.contains("policy denied:"), "{mode}: {stdout}");
+        }
     }
+    // Only the "timeout" iteration above should have incremented this
+    // worker's counter (#8451 acceptance criterion 4).
+    assert_eq!(loom_daemon::native_tools::guard::policy_timeout_count(d.path(), worker_pid), 1);
+    assert_eq!(
+        loom_daemon::native_tools::guard::policy_timeout_count(d.path(), "some-other-worker"),
+        0
+    );
+}
+
+#[test]
+fn policy_denial_is_reported_distinctly_from_timeout_and_error() {
+    let d = fixture();
+    let out = call(d.path(), "bash", json!({"command":"git push --force origin main"}));
+    assert_eq!(out.status.code(), Some(78));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("policy denied:"), "{stdout}");
+    assert!(!stdout.contains("policy timeout:"), "{stdout}");
+    assert_eq!(
+        loom_daemon::native_tools::guard::policy_timeout_count(d.path(), "any-worker"),
+        0
+    );
+}
+
+#[test]
+fn native_policy_timeout_budget_is_configurable_and_bounded() {
+    let d = fixture();
+    // Env override outranks config (repo-wide env > config > default
+    // precedence) and is clamped into [5, 120] rather than honored literally.
+    assert_eq!(loom_daemon::native_tools::guard::timeout_secs(d.path()), 20);
+
+    fs::write(
+        d.path().join(".loom/config.json"),
+        r#"{"guards":{"nativePolicyTimeoutSecs":45}}"#,
+    )
+    .unwrap();
+    assert_eq!(loom_daemon::native_tools::guard::timeout_secs(d.path()), 45);
+
+    fs::write(
+        d.path().join(".loom/config.json"),
+        r#"{"guards":{"nativePolicyTimeoutSecs":1}}"#,
+    )
+    .unwrap();
+    assert_eq!(loom_daemon::native_tools::guard::timeout_secs(d.path()), 5);
+
+    fs::write(
+        d.path().join(".loom/config.json"),
+        r#"{"guards":{"nativePolicyTimeoutSecs":99999}}"#,
+    )
+    .unwrap();
+    assert_eq!(loom_daemon::native_tools::guard::timeout_secs(d.path()), 120);
+
+    std::env::set_var(loom_daemon::native_tools::guard::TIMEOUT_ENV, "7");
+    assert_eq!(loom_daemon::native_tools::guard::timeout_secs(d.path()), 7);
+    std::env::remove_var(loom_daemon::native_tools::guard::TIMEOUT_ENV);
 }
 
 #[cfg(unix)]

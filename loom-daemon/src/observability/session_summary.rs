@@ -60,10 +60,22 @@ impl SessionSummarySink {
     /// producer: a persistence failure is logged by the queue and never
     /// propagates into the ingestion pass.
     pub fn push(&self, record: SessionSummaryRecord) {
-        self.queue.offer(TelemetryEnvelope::new(
-            self.host_id.clone(),
-            TelemetryRecord::SessionSummary(record),
-        ));
+        self.push_traced(record, None);
+    }
+
+    /// [`Self::push`], joined to the trace of the execution that ran the
+    /// session when one is known (Issue #8908,
+    /// [`super::runtime_usage::join`]): the envelope's `trace_context`
+    /// becomes the OTLP log record's trace and span id.
+    pub fn push_traced(
+        &self,
+        record: SessionSummaryRecord,
+        trace_context: Option<crate::telemetry::trace::TraceContext>,
+    ) {
+        let mut envelope =
+            TelemetryEnvelope::new(self.host_id.clone(), TelemetryRecord::SessionSummary(record));
+        envelope.trace_context = trace_context;
+        self.queue.offer(envelope);
     }
 }
 

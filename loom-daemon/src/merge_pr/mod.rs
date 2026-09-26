@@ -40,9 +40,42 @@
 //! weakening the guard itself — bounded to one attempt per head, after which
 //! the PR is escalated to a durable `loom:operator` hold rather than pushed
 //! at forever.
+//!
+//! #8914's in-place re-run once ran before [`redate`], on the theory that
+//! re-running a workflow run keeps the head SHA and with it the Judge verdict.
+//! It was **removed in #8919**: GitHub replays a run against the ORIGINAL
+//! `GITHUB_SHA`, which for a `pull_request` run is the test merge commit built
+//! on the base already tested, so an in-place re-run re-dates the evidence
+//! without re-validating anything. Only a new `pull_request` event rebuilds the
+//! merge commit against the current base — which is exactly what [`redate`]'s
+//! tree-identical push produces.
+//!
+//! [`zero_checks`] is not a port either — it is #9091's narrowing of the
+//! #6169 zero-row settle guard inside `_wait_for_checks_then_sync_merge`:
+//! re-polling an empty check-runs rollup until `LOOM_AUTO_MERGE_TIMEOUT`
+//! elapsed was catastrophic on the case that guard meets most often (a repo
+//! with no CI configured for the changed paths), so the wait is bounded when —
+//! and only when — the base branch requires no status-check contexts.
+//!
+//! [`loom_pr_guard`] is the pre-merge `loom:pr` review-signal guard (#7419)
+//! — the OTHER half of the verdict-label story [`labels`] tells: this one
+//! fires on `loom:pr`'s ABSENCE ("nobody reviewed this head") rather than a
+//! contradiction beside a present approval, and carries the only override
+//! flag in the family (`--allow-unapproved`) because "nobody reviewed it" and
+//! "a reviewer said no" are different acts.
+//!
+//! [`hold_state`] completes that trio: the advisory warning [`loom_pr_guard`]
+//! deliberately left in the shell, fired only when `loom:pr` IS present and
+//! Champion's recorded merge-risk-hold head is not the head about to merge. It
+//! is the only member of the family that never refuses anything — and the port
+//! fixes two ways the retired `grep | tail -1 | sed` pipeline lost the warning
+//! silently, which for a check nothing else duplicates is the whole risk.
 
 pub mod head_sync;
+pub mod hold_state;
 pub mod labels;
+pub mod loom_pr_guard;
 pub mod redate;
 pub mod refs;
 pub mod stale_checks;
+pub mod zero_checks;

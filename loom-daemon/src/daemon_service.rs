@@ -147,6 +147,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
             Commands::PeerClaims { json } => {
                 cli::peer_claims_cmd::handle_peer_claims_command(json).await
             }
+            // `queue` (#8852) reads the same `DaemonStatus` round-trip.
+            Commands::Queue { json } => cli::ready_queue_cmd::handle_queue_command(json).await,
             // `jev-merge-risk` POSTs to an external HTTP endpoint (Jev,
             // TypeSafe, issue #8545), so it needs the async runtime for the
             // same reason `status`/`health` do.
@@ -1016,8 +1018,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // invariant (#6615) intact despite the passes no longer blocking startup.
     let startup_reconciliation_ready =
         daemon_startup_reconciliation::spawn_startup_passes(sweep_workspace.clone());
-    let _claim_reconciliation_handle =
-        claim_reconciliation::spawn_periodic_reconciliation_task(sweep_workspace.clone());
+    let _claim_reconciliation_handle = claim_reconciliation::spawn_periodic_reconciliation_task(
+        sweep_workspace.clone(),
+        event_bus.clone(),
+    );
 
     // Startup-race mitigation (Issue #3887): resolve the dispatch stagger + the
     // watchdog knobs from `.loom/config.json → autonomous` with env override
@@ -1292,7 +1296,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // into all three dispatch producers AND into the IPC server (which sets/aborts
     // it and renders it in `loom-daemon status`). With no drain requested the flag
     // stays `false`, so every producer's halt check is byte-for-byte unchanged.
-    let drain_state = Arc::new(loom_daemon::ipc::DrainState::new());
+    // #8652: backed by the persisted paused-time ledger (see `DrainState::with_default_ledger`).
+    let drain_state = Arc::new(loom_daemon::ipc::DrainState::with_default_ledger());
     let drain_flag = drain_state.flag();
 
     // Shared role-runner in-progress guard (#4364): one set, cloned into both
@@ -1387,13 +1392,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
         // #6203: also resolve *which layer* supplied `configured_max` (env /
         // config / default) so the startup log below can tell an operator
-        // whether their `.loom/config.json` edit was actually picked up —
-        // this value is captured once here and threaded into the loop as a
-        // frozen `usize` (it does not itself hot-apply; see the work_finder
-        // module docs and daemon-reference.md's "Dynamic concurrency
-        // scaling" section for the restart-required rationale).
-        let (configured_max, configured_max_source) =
-            work_finder::resolve_max_concurrent_with_source(&work_finder_config);
+        // whether their `.loom/config.json` edit was actually picked up. This
+        // is only the loop's starting value: since #9060 the loop re-reads it
+        // every tick, so a config edit hot-applies (an env override does not
+        // — the process environment is fixed at launch).
+        let configured_max = work_finder::ConfiguredMax::resolve(&work_finder_config);
         // Retired CPU-headroom knobs (#4512): `cpuUtilizationTarget` /
         // `estCoresPerSweep` (and their env twins) are accepted-but-ignored, so
         // a fleet's committed config keeps parsing across the upgrade. Warn
@@ -1460,13 +1463,15 @@ pub(crate) async fn run_daemon() -> Result<()> {
         );
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, \
-             configured_max={configured_max} (source={configured_max_source}), \
+             configured_max={} (source={}), \
              max_admissions_per_tick={max_admissions_per_tick}, build_slots={}, \
              dynamic cap = min(disk, ram, configured_max) — token axis is \
              selection-only, not a cap, since #5270, \
-             global across workspaces; configured_max is startup-read only — \
-             a config edit requires a daemon restart to take effect, #6203)",
+             global across workspaces; configured_max is re-read every tick — \
+             a config edit hot-applies, an env override needs a restart, #9060)",
             interval.as_secs(),
+            configured_max.value,
+            configured_max.source,
             loom_daemon::build_slot::resolve_slots()
         );
         // Multi-workspace fan-out (#3928): re-reads `effective_roots()` each tick
@@ -1596,6 +1601,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
             );
             None
         };
+
+    // GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
+    // (`autonomous.ciTelemetry.enabled`); `None` and zero side effects when off.
+    let _ci_telemetry_handle = loom_daemon::ci_telemetry::spawn_task(sweep_workspace.clone());
 
     // Periodic merged-PR worktree reaper (Issue #4876). Before this loop the
     // ONLY trigger for "auto-removed when their PR merges" (CLAUDE.md's stated
@@ -1941,6 +1950,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
             watch_registry::GhWatchProbe::new(),
             interval,
             expiry,
+            event_bus.clone(),
+            sweep_workspace.clone(),
         ))
     } else {
         log::debug!(
@@ -1967,15 +1978,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `event_bus` is moved into `IpcServer::new` below.
     let auto_update_config = auto_update::read_auto_update_config(&sweep_workspace);
     let _auto_update_handle = if auto_update::resolve_enabled(&auto_update_config) {
-        let interval = auto_update::resolve_interval(&auto_update_config);
-        let settle = auto_update::resolve_settle(&auto_update_config);
-        let defer_deadline = auto_update::resolve_defer_deadline(&auto_update_config);
-        log::info!(
-            "auto_update: enabled (interval={}s, settle={}s, deferDeadline={}s)",
-            interval.as_secs(),
-            settle.as_secs(),
-            defer_deadline.as_secs()
-        );
+        let tuning = auto_update::TickTuning::resolve(&auto_update_config);
+        log::info!("auto_update: enabled ({})", tuning.describe());
         let probe = auto_update::ScriptAutoUpdateProbe::new(
             workspace_pool.clone(),
             sweep_workspace.clone(),
@@ -1988,14 +1992,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
             tokio::runtime::Handle::current(),
         );
         let status = std::sync::Arc::new(auto_update::AutoUpdateStatus::new(true));
-        Some(auto_update::spawn_auto_update_task(
-            probe,
-            trigger,
-            status,
-            interval,
-            settle,
-            defer_deadline,
-        ))
+        Some(auto_update::spawn_auto_update_task(probe, trigger, status, tuning))
     } else {
         log::debug!(
             "auto_update: disabled (set LOOM_AUTO_UPDATE=1 or autonomous.autoUpdate.enabled=true to opt in)"
@@ -2222,13 +2219,20 @@ fn setup_logging() -> Result<()> {
         .append(true)
         .open(&log_path)?;
 
+    // Issue #8504: every machine-readable timestamp `loom-daemon` writes is
+    // UTC with an explicit `Z` designator, so it can never be mistaken for
+    // (or silently drift into) the host's local time — this is the daemon's
+    // own log-line prefix, read and correlated across a fleet of hosts in
+    // different timezones. `loom_daemon::health::DAEMON_LOG_STAMP_FORMAT` is
+    // the SAME constant `health::parse_log_line_stamp` reads back with, so
+    // the write and read sides cannot drift apart.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .format(|buf, record| {
             writeln!(
                 buf,
                 "[{}] [{}] {}",
-                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f"),
+                chrono::Utc::now().format(loom_daemon::health::DAEMON_LOG_STAMP_FORMAT),
                 record.level(),
                 record.args()
             )

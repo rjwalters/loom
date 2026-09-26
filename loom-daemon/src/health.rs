@@ -570,6 +570,12 @@ pub struct HealthInputs {
     /// nothing measurable (e.g. macOS, which has no `/proc` at all), the same
     /// silent-degrade contract [`crate::tmpfs_visibility`] documents.
     pub tmpfs_visibility: Option<crate::tmpfs_visibility::TmpfsVisibilitySnapshot>,
+    /// The CI-telemetry poller's health on this host (issue #9014), collected
+    /// by the `loom-daemon health` CLI via
+    /// [`crate::ci_telemetry::collect_health`] and rendered by
+    /// [`ci_telemetry_section::assess_ci_telemetry`] — no section unless the
+    /// poller is enabled here.
+    pub ci_telemetry: Option<crate::ci_telemetry::CiTelemetryHealth>,
 }
 
 // ============================================================================
@@ -2688,6 +2694,12 @@ mod tmpfs_visibility_section;
 
 pub use tmpfs_visibility_section::assess_tmpfs_visibility;
 
+/// The `ci_telemetry` section (issue #9014): whether the opted-in CI poller
+/// is polling here, or refused by the fleet-captain gate.
+mod ci_telemetry_section;
+
+pub use ci_telemetry_section::assess_ci_telemetry;
+
 // ============================================================================
 // Codex accounts (Issue #8407) — conditional
 // ============================================================================
@@ -2755,6 +2767,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
     sections.extend(assess_limit_calibration(inputs));
     sections.extend(assess_transcript_ingest(inputs));
     sections.extend(assess_tmpfs_visibility(inputs));
+    sections.extend(assess_ci_telemetry(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {
@@ -2882,10 +2895,15 @@ const WORK_FINDER_LOG_MARKER: &str = "work_finder:";
 const DAEMON_LOG_TAIL_BYTES: u64 = 256 * 1024;
 
 /// The daemon log's line-prefix timestamp format, as written by the daemon's
-/// `env_logger` format hook (`[2026-07-31T14:27:33.950] [INFO] …`) — a **local**
-/// naive stamp with no offset, which is why the comparison below is done in
-/// local time rather than UTC.
-const DAEMON_LOG_STAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f";
+/// `env_logger` format hook (`[2026-07-31T14:27:33.950Z] [INFO] …`) — a UTC
+/// stamp with an explicit `Z` designator (Issue #8504), so the comparison
+/// below is done in UTC throughout, never local time.
+///
+/// `pub` so the binary crate's `daemon_service::setup_logging` — the actual
+/// writer — formats with this SAME constant rather than a duplicated literal;
+/// one string, so the write side and the read side (this module) can never
+/// drift apart again.
+pub const DAEMON_LOG_STAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 
 /// Parse the leading `[<stamp>]` of one daemon-log line.
 fn parse_log_line_stamp(line: &str) -> Option<chrono::NaiveDateTime> {
@@ -2894,7 +2912,7 @@ fn parse_log_line_stamp(line: &str) -> Option<chrono::NaiveDateTime> {
 }
 
 /// Age in seconds of the newest `work_finder:` line in a daemon-log tail,
-/// measured against `now_local` (Issue #4824).
+/// measured against `now_utc` (Issue #4824; UTC throughout since #8504).
 ///
 /// Pure over the log text so the corroboration rule is unit-testable without a
 /// daemon or a real log file. `None` when the tail carries no parseable
@@ -2903,14 +2921,14 @@ fn parse_log_line_stamp(line: &str) -> Option<chrono::NaiveDateTime> {
 #[must_use]
 pub fn work_finder_log_tick_age_secs(
     log_tail: &str,
-    now_local: chrono::NaiveDateTime,
+    now_utc: chrono::NaiveDateTime,
 ) -> Option<u64> {
     let stamp = log_tail
         .lines()
         .rev()
         .filter(|line| line.contains(WORK_FINDER_LOG_MARKER))
         .find_map(parse_log_line_stamp)?;
-    Some(u64::try_from((now_local - stamp).num_seconds()).unwrap_or(0))
+    Some(u64::try_from((now_utc - stamp).num_seconds()).unwrap_or(0))
 }
 
 /// Resolve the daemon log path the way the daemon itself does: `LOOM_DAEMON_LOG`
@@ -2953,10 +2971,7 @@ pub fn probe_work_finder_log_tick_age() -> Option<u64> {
     file.take(DAEMON_LOG_TAIL_BYTES)
         .read_to_end(&mut buf)
         .ok()?;
-    work_finder_log_tick_age_secs(
-        &String::from_utf8_lossy(&buf),
-        chrono::Local::now().naive_local(),
-    )
+    work_finder_log_tick_age_secs(&String::from_utf8_lossy(&buf), chrono::Utc::now().naive_utc())
 }
 
 /// Render an age in seconds compactly (`43s`, `7m`, `2h`, `3d`). Negative ages
@@ -2979,3 +2994,11 @@ pub fn format_age(secs: i64) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+
+// Issue #8504's UTC-`Z` regression coverage: kept out of `tests.rs` itself
+// (already over `.loom/docs/file-size-policy.md`'s threshold and frozen) by
+// declaring it here instead, at its existing file path under `health/tests/`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "health/tests/log_format_tests.rs"]
+mod log_format_tests;

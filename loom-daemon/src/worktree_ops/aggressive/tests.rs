@@ -1,4 +1,5 @@
 use super::*;
+use crate::worktree_cli::branch_landed::{Caps, ForgeProbe, ForgeStatus};
 
 fn wt() -> WorktreeInfo {
     WorktreeInfo {
@@ -786,4 +787,193 @@ fn force_without_safe_removes_but_counts_it_as_forced() {
         "the override must be visible via a distinct counter, not folded into `removed`"
     );
     assert_eq!(stats.skipped_unreachable, 0);
+}
+
+// --- #8470: the converged ladder's tip-match rule ----------------------
+
+/// A repo whose `origin/main` holds a **squash** of `feature/issue-42`'s first
+/// commit (so the branch is never an ancestor of it), and whose branch then
+/// gained one more commit carrying new content. Returns
+/// `(repo, merged_head, moved_tip)`.
+fn repo_with_squash_merged_then_moved_branch() -> (tempfile::TempDir, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let rev = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(p)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(p, &["init", "-q", "--initial-branch=main"]);
+    git(p, &["config", "user.email", "loom@example.com"]);
+    git(p, &["config", "user.name", "Loom Test"]);
+    git(p, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+
+    git(p, &["checkout", "-q", "-b", "feature/issue-42"]);
+    std::fs::write(p.join("merged.txt"), "the work the PR merged\n").unwrap();
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-q", "-m", "work"]);
+    let merged_head = rev(&["rev-parse", "HEAD"]);
+
+    // Squash-merge: a brand-new commit on main with the same content.
+    git(p, &["checkout", "-q", "main"]);
+    git(p, &["checkout", "feature/issue-42", "--", "merged.txt"]);
+    git(p, &["commit", "-q", "-m", "work (#43)"]);
+    git(p, &["update-ref", "refs/remotes/origin/main", "main"]);
+
+    // Post-merge work on the branch: the tip moves past the merged head.
+    git(p, &["checkout", "-q", "feature/issue-42"]);
+    std::fs::write(p.join("after-merge.txt"), "work that only exists here\n").unwrap();
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-q", "-m", "more work after the merge"]);
+    let moved_tip = rev(&["rev-parse", "HEAD"]);
+    git(p, &["checkout", "-q", "main"]);
+
+    (dir, merged_head, moved_tip)
+}
+
+/// The forge as it answers for this fixture: `feature/issue-42` has a merged
+/// PR whose head is `merged_head`. Also pins that the issue number reaches the
+/// shared ladder as the branch-name key `feature/issue-<n>`.
+fn forge_merged_at(merged_head: &str) -> impl Fn(&str) -> ForgeProbe + '_ {
+    move |key: &str| {
+        assert_eq!(key, "feature/issue-42", "issue number must be keyed as feature/issue-<n>");
+        ForgeProbe {
+            status: ForgeStatus::Found,
+            head_sha: Some(merged_head.to_string()),
+            number: Some("43".to_string()),
+        }
+    }
+}
+
+const MERGE_TREE: Caps = Caps { merge_tree: true };
+
+/// #8470 strictness delta: before the convergence ANY merged PR for
+/// `feature/issue-<n>` read as `Rewritten`, so `clean --aggressive` reaped a
+/// worktree whose branch had moved past its merged head — i.e. unpushed work.
+/// Under the shared ladder's #7872 tip-match rule it is `NotLanded`, and the
+/// worktree is KEPT. Fails if the tip-match rung is dropped.
+#[test]
+fn merged_pr_with_moved_tip_is_kept_not_reaped() {
+    let (repo, merged_head, moved_tip) = repo_with_squash_merged_then_moved_branch();
+    let forge = forge_merged_at(&merged_head);
+
+    let state = landed::probe_with(repo.path(), Some(&moved_tip), Some(42), &forge, MERGE_TREE);
+    assert_eq!(state, Landed::NotLanded, "a merged PR whose head is not the tip is not landed");
+
+    let mut w = wt();
+    w.head = Some(moved_tip);
+    let (d, r) = eval_closed_issue(
+        &w,
+        false,
+        Some((false, true)),
+        false,
+        true,
+        true,
+        false,
+        state,
+        Some(999_999),
+        86400,
+        false,
+        false,
+    );
+    assert_eq!((d, r), (Decision::Keep, Reason::UnreachableHead));
+
+    // `--safe --force` stays merged-PR-only: the moved tip is not merged work.
+    let (d, _) = eval_closed_issue(
+        &w,
+        false,
+        Some((false, true)),
+        false,
+        true,
+        true,
+        false,
+        state,
+        Some(999_999),
+        86400,
+        true,
+        true,
+    );
+    assert_eq!(d, Decision::Keep);
+
+    // A partial-increment slice on an OPEN family issue: before #8470 the
+    // merged PR carved it out of the issue-open gate; now it is kept.
+    let (d, r) = evaluate_aggressive_candidate(
+        &w,
+        false,
+        Some((false, true)),
+        false,
+        true,
+        true,
+        false,
+        state,
+        Some(999_999),
+        86400,
+        false,
+        false,
+        Some(&|| "OPEN".to_string()),
+    );
+    assert_eq!((d, r), (Decision::Keep, Reason::IssueStillOpen));
+}
+
+/// Control for the test above: the same merged PR with the tip still AT the
+/// merged head is `Rewritten` and reaped under the unchanged `pr_merged`
+/// reason — the tip-match rule narrows removal, it does not disable it.
+#[test]
+fn merged_pr_with_matching_tip_is_still_reaped_as_pr_merged() {
+    let (repo, merged_head, _) = repo_with_squash_merged_then_moved_branch();
+    let forge = forge_merged_at(&merged_head);
+
+    let state = landed::probe_with(repo.path(), Some(&merged_head), Some(42), &forge, MERGE_TREE);
+    assert_eq!(state, Landed::Rewritten);
+
+    let (d, r) = eval_closed_issue(
+        &wt(),
+        false,
+        Some((false, true)),
+        false,
+        true,
+        true,
+        false,
+        state,
+        Some(999_999),
+        86400,
+        false,
+        false,
+    );
+    assert_eq!((d, r), (Decision::Remove, Reason::PrMerged));
+    assert_eq!(r.as_str(), "pr_merged");
+}
+
+/// Reachable HEAD still maps to the unchanged `reachable_from_origin_main`
+/// reason, without asking the forge.
+#[test]
+fn reachable_head_still_reaped_as_reachable_from_origin_main() {
+    let (repo, _, _) = repo_with_squash_merged_then_moved_branch();
+    let origin_main =
+        crate::worktree_cli::branch_landed::resolve_commit(repo.path(), "origin/main")
+            .expect("origin/main resolves");
+    let forge = |_: &str| -> ForgeProbe { panic!("ancestry answers before the forge") };
+
+    let state = landed::probe_with(repo.path(), Some(&origin_main), Some(42), &forge, MERGE_TREE);
+    assert_eq!(state, Landed::Reachable);
+    let (d, r) = eval_closed_issue(
+        &wt(),
+        false,
+        Some((false, true)),
+        false,
+        true,
+        true,
+        false,
+        state,
+        Some(999_999),
+        86400,
+        false,
+        false,
+    );
+    assert_eq!((d, r), (Decision::Remove, Reason::ReachableFromOriginMain));
+    assert_eq!(r.as_str(), "reachable_from_origin_main");
 }

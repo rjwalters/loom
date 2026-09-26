@@ -222,6 +222,18 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/exit-codes/",
     ".loom/sweep-checkpoint/",
     ".loom/sweep-run/",
+    // Durable per-host subsystem state (#8824: the CI telemetry dedup
+    // ledger, status and export cursor under `.loom/state/ci-telemetry/`).
+    // Committing it would hand one host's "already emitted" set to another.
+    // Scoped to `ci-telemetry/` so a sibling hand-maintained file such as
+    // `.loom/state/detect-unlabeled-epics-dismissed` stays trackable.
+    ".loom/state/ci-telemetry/",
+    // Durable shell-arm registry for the fleet-captain singleton gate
+    // (#8901): `.loom/state/fleet-captain/armed.json` records when a
+    // `loom-daemon fleet-captain <job>` invocation last armed on THIS host.
+    // Same never-commit reasoning as `ci-telemetry/` just above — one host's
+    // arm timestamps are meaningless, and actively misleading, on another.
+    ".loom/state/fleet-captain/",
     // Concierge budget ledger (#7947): the per-day turn / per-tick relay
     // counters the operator-agent persona consults at the top of every turn.
     // Machine-local and disposable — deleting it costs at most one day's spent
@@ -241,6 +253,11 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // Secret-bearing token pool + repo-local account source (#3695). These
     // hold OAuth keys and must never be committed.
     ".loom/tokens/",
+    // Sibling copies of the token pool (e.g. `tokens.shadow-disabled-<ts>/`,
+    // hand backups). Only the exact `.loom/tokens/` was ignored, so a resync
+    // `git add` swept 21 live OAuth tokens into public `main` (a9da48c2).
+    ".loom/tokens.*/",
+    ".loom/tokens-*/",
     ".loom/accounts.env",
     // Per-host API-key account pool (#8401): `<provider>/<account>.env` files
     // holding provider subscription keys (e.g. Z.ai GLM coding plans). Same

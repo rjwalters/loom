@@ -302,7 +302,12 @@ pub fn run_backfill_pass_all(
     }
     roots
         .iter()
-        .map(|root| run_backfill_pass(root, queue) + super::lifecycle::backfill(root, queue))
+        .map(|root| {
+            run_backfill_pass(root, queue)
+                + super::lifecycle::backfill(root, queue)
+                // Issue #8824: the CI telemetry journal rides the same pass.
+                + crate::ci_telemetry::export::backfill(root, queue)
+        })
         .sum()
 }
 
@@ -343,6 +348,7 @@ mod tests {
                 runtime: None,
                 provider: None,
                 profile: None,
+                complexity: None,
             }),
         )
     }
@@ -386,6 +392,7 @@ mod tests {
             runtime: None,
             provider: None,
             profile: None,
+            complexity: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));
@@ -431,6 +438,7 @@ mod tests {
             runtime: None,
             provider: None,
             profile: None,
+            complexity: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));

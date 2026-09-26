@@ -109,6 +109,13 @@ as `.loom-project/project.json`, host-scoped override" — the epic explicitly
 defers ".loom-local/ runtime-state relocation" to Phase 3+; this issue only
 defines it as a config-merge tier.
 
+Task credentials outside Loom's own config surface (cloud tokens, SSH keys,
+service API keys an agent needs for repo work) draw the same name-vs-value
+line as the `forge.*` row above: a repo may commit a names-only
+`.loom/credentials.md` manifest recording where each credential lives — never
+a value. See
+[`.loom/docs/credentials.md`](../../.loom/docs/credentials.md).
+
 ## 4. Resolvers (one per language, same precedence)
 
 **Updated 2026-08-09 (#5822).** This issue originally shipped a resolver per

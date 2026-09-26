@@ -12,7 +12,12 @@ import { describe, expect, it } from "vitest";
 
 import { buildFleetView, sortComputeJobs } from "../src/fleet";
 import { parseFleetSnapshot } from "../src/parse";
-import { instanceShapeText, runningComputeSection, runningForText } from "../src/views/runningCompute";
+import {
+  computeSubprocessList,
+  instanceShapeText,
+  runningComputeSection,
+  runningForText,
+} from "../src/views/runningCompute";
 import { fleetOverviewView } from "../src/views/fleetOverview";
 import type { ActiveComputeJob } from "../src/types";
 
@@ -109,6 +114,57 @@ describe("runningComputeSection", () => {
     expect(cells[2]).toBe("—");
     // Unknown start time is NOT "0s" — that would claim the job just started.
     expect(cells[3]).toBe("—");
+  });
+});
+
+describe("computeSubprocessList (#8835)", () => {
+  const entries = (rendered: HTMLElement) => [
+    ...rendered.querySelectorAll<HTMLElement>('[data-testid="subprocess"]'),
+  ];
+
+  it("renders instance shape, spot flag and elapsed time for each nested job", () => {
+    const rendered = computeSubprocessList([job()], NOW)!;
+    expect(rendered).not.toBeNull();
+    const [entry] = entries(rendered);
+    expect(entry!.getAttribute("data-job")).toBe("job-abc123");
+    expect(entry!.querySelector(".subprocess__shape")?.textContent).toBe("c7i.4xlarge · us-east-1 · spot");
+    // 12:00Z → 18:00Z.
+    expect(entry!.querySelector(".subprocess__age")?.textContent).toBe("6h 0m");
+  });
+
+  it("flags a leaked nested job by attribute, class and badge — never colour alone", () => {
+    const rendered = computeSubprocessList(
+      [job({ jobId: "job-ok" }), job({ jobId: "job-leaked", leaked: true })],
+      NOW,
+    )!;
+    const byJob = new Map(entries(rendered).map((entry) => [entry.getAttribute("data-job"), entry]));
+    const leaked = byJob.get("job-leaked")!;
+    const healthy = byJob.get("job-ok")!;
+
+    expect(leaked.getAttribute("data-leaked")).toBe("true");
+    expect(healthy.getAttribute("data-leaked")).toBe("false");
+    expect(leaked.className).toContain("subprocess--leaked");
+    expect(healthy.className).not.toContain("subprocess--leaked");
+    const badge = leaked.querySelector('[data-testid="leaked-badge"]');
+    expect(badge?.textContent).toBe("LEAKED");
+    expect(badge?.getAttribute("role")).toBe("status");
+    expect(healthy.querySelector('[data-testid="leaked-badge"]')).toBeNull();
+  });
+
+  it("renders nothing at all for a sweep with no jobs", () => {
+    // Nearly every sweep. No empty list, no "no subprocesses" note — the
+    // sweep's markup must be what it was before this feature.
+    expect(computeSubprocessList([], NOW)).toBeNull();
+  });
+
+  it("degrades an unknown shape or start time rather than inventing one", () => {
+    const rendered = computeSubprocessList(
+      [{ hostId: "2am-elastic", jobId: "job-bare" }],
+      NOW,
+    )!;
+    const [entry] = entries(rendered);
+    expect(entry!.querySelector(".subprocess__shape")?.textContent).toBe("—");
+    expect(entry!.querySelector(".subprocess__age")?.textContent).toBe("—");
   });
 });
 

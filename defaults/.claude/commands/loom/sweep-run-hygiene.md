@@ -2,7 +2,7 @@
 
 > **Reference file for [`sweep.md`](sweep.md)**, the `/loom:sweep` dispatcher.
 >
-> **Load when:** **before the first wave** (or, on the daemon path, before the first `mcp__loom__dispatch_sweep` call) for the three advisory checks, and whenever a peer `/loom:sweep` or a daemon may be sharing this repo.
+> **Load when:** **before the first wave** (or, on the daemon path, before the first `mcp__loom__dispatch_sweep` call) for the four advisory checks, and whenever a peer `/loom:sweep` or a daemon may be sharing this repo.
 >
 > **Flat, one level deep.** `sweep.md` names every file a given run needs up
 > front; nothing here requires opening a *third* file to follow its own
@@ -18,6 +18,7 @@
 - [Host Sleep Readiness (#3350)](#host-sleep-readiness-3350)
 - [Main Branch Freshness (#3770)](#main-branch-freshness-3770)
 - [Outstanding Quarantine Stashes (#5185)](#outstanding-quarantine-stashes-5185)
+- [Stale / Undocumented `loom:blocked` Issues (#8927)](#stale--undocumented-loomblocked-issues-8927)
 - [Sweep Child Working-Set Contract (#3980)](#sweep-child-working-set-contract-3980)
 - [Coexistence (peer `/loom:sweep` and legacy daemon)](#coexistence-peer-loomsweep-and-legacy-daemon)
 
@@ -99,6 +100,20 @@ This is advisory-only. The script always exits `0` and **must not block** the sw
 - **None outstanding:** prints nothing to stderr; a one-line stdout confirmation (suppressible with `--quiet`, matching `check-host-sleep.sh` / `check-main-freshness.sh`).
 
 If the check warns, the operator should reconcile each listed stash into the issue worktree it belongs to (or consciously drop it) — this does not block the current sweep, but stale quarantines accumulate silently otherwise.
+
+## Stale / Undocumented `loom:blocked` Issues (#8927)
+
+`loom:blocked` is applied once and never re-examined, and a blocked issue is skipped both by this sweep's candidate selection and by Champion's promotion lane — so a label that outlives its cause removes an issue from *every* queue indefinitely (three suppressed ~11 months in the incident that filed #8927). Unlike `loom:reviewing` / `loom:treating` / `loom:building` it has no staleness machinery, and Curator's re-check fires only when a pass happens to land on that issue — both its discovery queries exclude `loom:blocked`.
+
+**Before the first wave — or, on the daemon path, before the first `mcp__loom__dispatch_sweep` call** — run the stale-blocked check and surface its output to the user (same timing and sibling role as the three checks above):
+
+```bash
+./.loom/scripts/check-stale-blocked.sh
+```
+
+This is advisory-only. The script always exits `0` and **must not block** the sweep — proceed regardless of what it prints. It is strictly **read-only**: it never adds, removes, or edits a label, and never comments. It enumerates every open `loom:blocked` issue (`gh issue list --label="loom:blocked" --state=open`) and re-runs `dep-recheck-fingerprint.sh`'s *existing* extraction per issue — the `## Dependencies` checklist matcher, the prose `Blocked by #N`/`Depends on #N`/`Requires #N`/`**Epic** #N` matcher over the body plus every non-bot comment, and the linked-closing-PR read — rather than adding a second parser over the same data. It reports to stderr: a **stale block** (the cited blocker has closed/merged — including a partially resolved set, per `operator-premise`'s own "any reference no longer OPEN" rule), an **undocumented block** (no parseable reference anywhere; a block whose justification cannot be checked is a defect whether or not the block is real), and **not evaluated** (a forge read that did not answer — its own category, never folded into stale or clear). Nothing found prints nothing to stderr and a one-line stdout confirmation, suppressible with `--quiet`.
+
+If it warns, the operator (or a later Curator pass on that issue) should drop the label, record a machine-checkable `Blocked by #N`, or confirm the block. Acting is deliberately not this check's job — the two follow-ups that would act rather than report (enforcing a machine-checkable reason at apply time, re-checking the instant a blocker closes) are named out of scope on #8927.
 
 ## Sweep Child Working-Set Contract (#3980)
 

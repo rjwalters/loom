@@ -34,6 +34,12 @@ macro_rules! identifier {
             pub fn as_str(&self) -> &str {
                 &self.0
             }
+            /// Deterministic id from `parts` (see [`derived_hex`]); valid by
+            /// construction, so any process can recompute it without state.
+            #[must_use]
+            pub fn derived(parts: &[&str]) -> Self {
+                Self(derived_hex(parts, $bytes * 2))
+            }
             #[must_use]
             pub fn bytes(&self) -> Vec<u8> {
                 // Construction and deserialization validate every byte.
@@ -102,6 +108,25 @@ impl TraceContext {
             flags: u8::from_str_radix(parts[3], 16)
                 .map_err(|_| "invalid trace flags".to_string())?,
         })
+    }
+}
+
+/// SHA-256 over `parts` (each NUL-terminated), truncated to `hex_len` hex
+/// digits. An all-zero digest prefix is invalid W3C; its negligible case is
+/// replaced by a trailing `1` so the id stays valid regardless.
+#[must_use]
+pub fn derived_hex(parts: &[&str], hex_len: usize) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0_u8]);
+    }
+    let hex = hex::encode(hasher.finalize())[..hex_len].to_string();
+    if hex.bytes().all(|b| b == b'0') {
+        format!("{}1", &hex[..hex_len - 1])
+    } else {
+        hex
     }
 }
 

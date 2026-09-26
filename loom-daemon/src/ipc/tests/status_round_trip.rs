@@ -91,6 +91,8 @@ fn test_daemon_status_request_response_round_trip() {
         draining: false,
         drain_deadline: None,
         drain_note: None,
+        drain_roll: None,
+        drain_paused_by_day: std::collections::BTreeMap::new(),
         auto_update_enabled: true,
         auto_update_last_check: Some(chrono::Utc::now()),
         auto_update_last_roll: Some(chrono::Utc::now()),
@@ -166,6 +168,11 @@ fn test_daemon_status_request_response_round_trip() {
             crate::types::ObservabilityExportStatus {
                 state: crate::types::ObservabilityExportState::Healthy,
                 exporter: Some("https".to_string()),
+                // #9015: a healthy cell whose one verified hop is a LOCAL
+                // collector — the scope facts have to survive the wire, or the
+                // reading client is back to inferring them.
+                endpoint: Some("http://127.0.0.1:14318/v1/logs".to_string()),
+                endpoint_loopback: true,
                 ..Default::default()
             },
         )]
@@ -254,6 +261,19 @@ fn test_daemon_status_request_response_round_trip() {
             assert_eq!(export.host_id.as_deref(), Some("robb-studio"));
             assert_eq!(export.ingest_host_id.as_deref(), Some("robb-pro"));
             assert_eq!(export.records_exported, 128);
+            // #9015: how far the state reaches travels with it — always
+            // first-hop today, plus whether that hop is a local collector.
+            assert_eq!(export.scope, crate::types::ObservabilityExportScope::FirstHop);
+            assert!(!export.endpoint_loopback, "a remote endpoint is not a local hop");
+            let local_cell = r
+                .observability_exports
+                .get("https")
+                .expect("per-exporter cell round-trips");
+            assert_eq!(local_cell.scope, crate::types::ObservabilityExportScope::FirstHop);
+            assert!(
+                local_cell.endpoint_loopback,
+                "the per-exporter cell keeps its own local-collector flag"
+            );
             // ADR-0021 (#8765): the feed-consumer record survives the wire
             // too, including the error CLASS underneath a backoff promotion
             // — `backoff` answers "how often is it retrying", never "why".

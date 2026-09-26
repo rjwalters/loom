@@ -319,6 +319,13 @@ pub fn log_has_progress(contents: &str) -> bool {
             && !t.contains("spawn-codex:")
             && !t.contains("spawn-worker:")
             && !t.starts_with("# LOOM_RUNTIME_RESOLVED")
+            // #8599: the preference marker is a launch-record preamble line
+            // written by `worker_spawn::launch` before the child harness even
+            // starts, exactly like the two lines above it. Counting it as
+            // progress would make every preference-resolved hung sweep look
+            // alive to stall detection. Keyed off the resolver's own constant
+            // so the two cannot drift.
+            && !t.starts_with(crate::runtime_preference::PREFERENCE_LOG_MARKER.trim_end())
             && !t.starts_with("# LOOM_ACCOUNT")
     })
 }

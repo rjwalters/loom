@@ -320,3 +320,113 @@ fn provider_health_feedback_with_a_pinned_model_narrows_to_the_bare_class() {
         "a class-scoped hold must not also set the account-wide cooldown"
     );
 }
+
+// ---- #8931: reason-classified `loom.pool.account_marks` at this seam ----
+
+/// The Codex half emits exactly one mark, with the persisted category's
+/// reason, and nothing naming the account.
+#[test]
+fn a_persisted_codex_mark_emits_exactly_one_reason_classified_point() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let sweep_id = insert_codex_entry_with_log(
+        &mut registry,
+        71,
+        "profile-secret-name",
+        "# LOOM_TERMINAL_RESULT v=2 provider=codex account=profile-secret-name \
+         category=SESSION_LIMIT exit_code=1 model=none\n",
+    );
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        registry.apply_provider_health_feedback(&sweep_id, Some(1));
+    });
+    assert_eq!(captured.metrics.len(), 1, "{:?}", captured.metrics);
+    let point = &captured.metrics[0];
+    assert_eq!(point.name.as_str(), "loom.pool.account_marks");
+    assert_eq!(point.labels["provider"], "codex");
+    assert_eq!(point.labels["reason"], "session_limit");
+    assert!(!serde_json::to_string(point).unwrap().contains("secret"));
+}
+
+/// A Codex outcome that records no hold (`SUCCESS`) emits no mark.
+#[test]
+fn a_codex_success_emits_no_mark() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let sweep_id = insert_codex_entry_with_log(
+        &mut registry,
+        72,
+        "profile-a",
+        "# LOOM_TERMINAL_RESULT v=2 provider=codex account=profile-a \
+         category=SUCCESS exit_code=0 model=none\n",
+    );
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        registry.apply_provider_health_feedback(&sweep_id, Some(0));
+    });
+    assert!(captured.metrics.is_empty(), "{:?}", captured.metrics);
+}
+
+/// The native half: a pool-selected OpenCode launch whose harness reported
+/// an exhaustion is bad-marked, and emits exactly one `exhausted` point
+/// labelled with the pool namespace — never the account.
+#[test]
+fn a_native_api_key_mark_emits_exactly_one_reason_classified_point() {
+    use crate::api_keys_pool::{ingest::LAUNCH_RECORD_PREFIX, paths, registry as keys};
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let pool = paths::per_repo_api_keys_dir(&registry.config.workspace_root);
+    keys::add(&pool, "loomtest", "alpha-secret", "LOOM_TEST_KEY_8931", "fake-key", false).unwrap();
+    let launch = serde_json::json!({
+        "schema": 1, "runtime": "opencode", "provider": "zai-coding-plan",
+        "model": "glm-5.3-flash", "profile": "zai-flash", "effort": null,
+        "credentialSource": "pool", "credentialProvider": "loomtest",
+        "credentialAccount": "alpha-secret", "usage": "native-json-events",
+        "billing": "not-measured",
+    });
+    let sweep_id = insert_codex_entry_with_log(
+        &mut registry,
+        73,
+        UNKNOWN_TOKEN_NAME,
+        &format!(
+            "{LAUNCH_RECORD_PREFIX}{launch}\nspawn-worker: runtime=opencode (from config)\n\
+             # LOOM_CLI_START runtime=opencode\nError: insufficient balance for this account\n"
+        ),
+    );
+    registry.entries.get_mut(&sweep_id).unwrap().runtime = "opencode".into();
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        registry.apply_provider_health_feedback(&sweep_id, Some(1));
+    });
+    assert_eq!(captured.metrics.len(), 1, "{:?}", captured.metrics);
+    let point = &captured.metrics[0];
+    assert_eq!(point.labels["provider"], "loomtest");
+    assert_eq!(point.labels["reason"], "exhausted");
+    assert!(!serde_json::to_string(point).unwrap().contains("alpha"));
+}
+
+/// The Claude insta-crash seam (`quarantine.rs`, frozen — its mark now goes
+/// through [`SweepRegistry::mark_exhausted_account`]): one mark, classified
+/// from the matched signature, never the account name or the banner text.
+#[test]
+fn a_claude_insta_crash_mark_emits_exactly_one_reason_classified_point() {
+    use crate::sweep_registry::test_support::{insert_dead_running_with_log, seed_token_pool};
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    seed_token_pool(dir.path(), "agent-secret-3");
+    let sweep_id = insert_dead_running_with_log(
+        &mut registry,
+        74,
+        0,
+        "agent-secret-3",
+        "loom-daemon dispatch: start\nYou're out of usage credits for this model.\n",
+    );
+    let (marked, captured) = crate::observability::ops::capture::capture(|| {
+        registry.insta_crash_is_account_exhaustion(&sweep_id, 74)
+    });
+    assert!(marked);
+    assert!(crate::tokens_pool::bad_tokens::is_bad(dir.path(), "agent-secret-3"));
+    assert_eq!(captured.metrics.len(), 1, "{:?}", captured.metrics);
+    let point = &captured.metrics[0];
+    assert_eq!(point.labels["provider"], "claude");
+    assert_eq!(point.labels["reason"], "model_credits");
+    let wire = serde_json::to_string(point).unwrap();
+    assert!(!wire.contains("secret") && !wire.contains("usage credits"), "{wire}");
+}

@@ -36,9 +36,10 @@
 //! Exit codes (distinct from a plain 0/1 verdict, because the shell wrapper
 //! reacts differently to each):
 //!   0  verified. stdout carries the KEY=value lines above.
-//!   1  verification FAILED (a checksum mismatch, an invalid signature, or a
-//!      published signature asset that would not download) -- refuse the
-//!      artifact, never a soft fallback (AC2/AC3). The shell wrapper
+//!   1  verification FAILED (a checksum mismatch, an invalid signature, a
+//!      published signature asset that would not download, or a GLIBC
+//!      version the host cannot satisfy, #8837) -- refuse the artifact,
+//!      never a soft fallback (AC2/AC3). The shell wrapper
 //!      exits the whole script on this code immediately, matching the
 //!      pre-port shell calling `exit 1` directly from inside
 //!      `fetch_and_verify_artifact` rather than returning to its caller.
@@ -99,10 +100,14 @@ impl ReleaseFetchArgs {
                 checksum_line,
                 signature_line,
                 signature_state,
+                glibc_line,
             } => {
                 eprintln!("{checksum_line}");
                 if !signature_line.is_empty() {
                     eprintln!("{signature_line}");
+                }
+                if !glibc_line.is_empty() {
+                    eprintln!("{glibc_line}");
                 }
                 println!("BIN_PATH={}", artifact.bin_path.display());
                 println!("TMP_DIR={}", artifact.tmp_dir.display());

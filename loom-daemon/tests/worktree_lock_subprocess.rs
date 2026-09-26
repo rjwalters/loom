@@ -67,6 +67,45 @@ fn cli_release(repo: &Path, token: &str) {
     assert!(ok, "release always exits 0");
 }
 
+/// Write a live-shaped per-issue CLAIM lock (`sweep_registry::locks`'s
+/// `owner.json`, the DIFFERENT, longer-lived lock `check-issue` reads —
+/// see `worktree_cli::issue_lock`'s module docs) directly, bypassing
+/// `acquire`/`release` above entirely.
+fn write_issue_claim_lock(repo: &Path, issue: u32, owner_pid: u32, sweep_id: &str) {
+    let dir = repo.join(".loom/locks").join(format!("issue-{issue}"));
+    std::fs::create_dir_all(&dir).expect("mkdir issue lock dir");
+    std::fs::write(
+        dir.join("owner.json"),
+        format!(
+            r#"{{"issue": {issue}, "owner_pid": {owner_pid}, "acquired_at": "2026-01-01T00:00:00Z", "sweep_id": "{sweep_id}"}}"#
+        ),
+    )
+    .expect("write owner.json");
+}
+
+/// `check-issue`, with `LOOM_SWEEP_ID` set to `caller_sweep_id` (or unset when
+/// `None`). Returns the exit status.
+fn cli_check_issue(
+    repo: &Path,
+    issue: u32,
+    caller_sweep_id: Option<&str>,
+) -> std::process::ExitStatus {
+    let mut cmd = Command::new(bin());
+    cmd.args(["worktree-lock", "check-issue", "--issue"])
+        .arg(issue.to_string())
+        .arg("--repo")
+        .arg(repo);
+    match caller_sweep_id {
+        Some(id) => {
+            cmd.env("LOOM_SWEEP_ID", id);
+        }
+        None => {
+            cmd.env_remove("LOOM_SWEEP_ID");
+        }
+    }
+    cmd.status().expect("run check-issue")
+}
+
 #[test]
 fn a_lock_held_on_behalf_of_a_live_caller_excludes_a_second_acquisition() {
     let d = tempfile::tempdir().expect("tempdir");
@@ -127,4 +166,42 @@ fn a_stale_token_from_a_previous_holder_cannot_release_the_current_lock() {
     );
     cli_release(d.path(), &b);
     assert!(!d.path().join(".loom/locks/worktree-add").is_dir());
+}
+
+/// #8702: a dispatched sweep's own `worktree.sh` calls must not be refused
+/// by the claim lock IT holds — through the real binary and a real
+/// subprocess environment, the level at which `std::env::var("LOOM_SWEEP_ID")`
+/// actually reads.
+#[test]
+fn check_issue_exempts_the_lock_holders_own_sweep_id() {
+    let d = tempfile::tempdir().expect("tempdir");
+    git_init(d.path());
+
+    // The test process stands in for the daemon's live sweep child.
+    write_issue_claim_lock(d.path(), 42, std::process::id(), "sweep-42-self");
+
+    let status = cli_check_issue(d.path(), 42, Some("sweep-42-self"));
+    assert!(
+        status.success(),
+        "the sweep that holds the lock must not be refused by its own claim (#8702)"
+    );
+}
+
+/// The counterpart, so the fix above cannot be "never refuse anything": a
+/// caller naming a DIFFERENT sweep, or naming none at all (#8553's original
+/// incident — no env var was consulted), still gets refused.
+#[test]
+fn check_issue_still_refuses_a_foreign_or_unset_sweep_id() {
+    let d = tempfile::tempdir().expect("tempdir");
+    git_init(d.path());
+    write_issue_claim_lock(d.path(), 43, std::process::id(), "sweep-43-live");
+
+    assert!(
+        !cli_check_issue(d.path(), 43, Some("sweep-43-someone-else")).success(),
+        "a different LOOM_SWEEP_ID must not be treated as the lock's owner"
+    );
+    assert!(
+        !cli_check_issue(d.path(), 43, None).success(),
+        "an unset LOOM_SWEEP_ID must still refuse (#8553)"
+    );
 }

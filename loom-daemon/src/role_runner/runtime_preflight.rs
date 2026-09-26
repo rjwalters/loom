@@ -150,6 +150,10 @@ pub(crate) fn check(
     };
     let marker = resolution.marker_line();
     let exhausted = resolution.exhausted_diagnostic(role);
+    // #8599: the stamp the chosen admission carries to the launch surfaces —
+    // computed before `resolution.chosen` is moved out below. `None` in the
+    // fail-closed case, which has no chosen tier to report.
+    let stamp = resolution.stamp(source.as_str());
     let Some(chosen) = resolution.chosen else {
         // Every listed tap was skipped. Fail closed, reporting the
         // statically-admitted runtime's own gate outcome when it has one, so
@@ -176,7 +180,9 @@ pub(crate) fn check(
     // `Ok` by construction, so the chosen tap can be put through its OWN
     // pre-spawn gate in the shape `static_check` reads before being handed
     // back to the caller to launch.
-    let chosen_admission = Ok(chosen.admitted);
+    let mut admitted = chosen.admitted;
+    admitted.preference = stamp;
+    let chosen_admission = Ok(admitted);
     gate(Some(&chosen_admission))?;
     // Past every gate: this tick IS launching, so the metered slot (if the
     // chosen tap took one) travels back to the caller, which attaches it to

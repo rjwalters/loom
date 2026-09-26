@@ -514,7 +514,7 @@ impl SweepRegistry {
         }
 
         let reason = format!("exhausted: {signature} (daemon insta-crash, issue #{issue})");
-        match bad_tokens::mark_bad(&self.config.workspace_root, &token_name, &reason) {
+        match self.mark_exhausted_account(&token_name, &reason, signature) {
             Ok(()) => log::warn!(
                 "sweep_registry: issue #{issue} sweep {sweep_id} insta-crashed on \
                  account-exhaustion signature '{signature}' — marked account '{token_name}' bad \

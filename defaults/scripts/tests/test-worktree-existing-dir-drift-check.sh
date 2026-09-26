@@ -38,12 +38,28 @@
 # registered with git" — actually fires on the second invocation, exactly as
 # it would for a reused builder worktree), then mutated to the drift shape
 # under test before invoking worktree.sh a second time.
+#
+# SINCE #8195 SLICE 9 (epic #7810) this whole block is `loom-daemon
+# worktree-upstream --arm registered-worktree`. The duplication this suite's
+# own header describes — "that fix never ran here", of #6095/#6100 — is gone:
+# both arms are now one implementation, selected by `--arm`, so the next fix
+# to either cannot land in only one of them. Every assertion below is
+# unchanged from the shell implementation, which is what makes them the
+# equivalence evidence, so the binary is pinned via
+# loom_test_require_daemon_bin and this suite FAILS rather than skips when
+# there is none: without one the block does not run at all (a correct,
+# documented degradation to the pre-#6257 behaviour) and Tests 1 and 3 would
+# be asserting on something nothing produced.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKTREE_SH="$SCRIPTS_DIR/worktree.sh"
+
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "worktree-upstream"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

@@ -270,6 +270,26 @@ impl Journal {
             },
         )
     }
+    /// Every completed span still in the journal (drained or not), oldest
+    /// first.
+    pub fn completed(&self) -> Result<Vec<SpanRecord>> {
+        let mut file = self.lock()?;
+        Ok(Self::entries(&mut file)?
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Completed(record) => Some(record),
+                _ => None,
+            })
+            .collect())
+    }
+    /// Journal an already-complete span in one write (Issue #8908: a late
+    /// `loom.runtime.usage` child whose interval is already known). An
+    /// invalid record is refused rather than journalled.
+    pub fn append_completed(&self, record: SpanRecord) -> Result<()> {
+        record.validate().map_err(anyhow::Error::msg)?;
+        let mut file = self.lock()?;
+        Self::append(&mut file, &Entry::Completed(record.bounded()))
+    }
     pub fn has_checkpoint_observations(&self) -> Result<bool> {
         let mut file = self.lock()?;
         Ok(Self::entries(&mut file)?.iter().any(|entry| matches!(entry, Entry::Completed(span) if span.attributes.get("loom.timing_source").is_some_and(|v| matches!(v.as_str(), "checkpoint_write_observed" | "owned_start_checkpoint_completion")))))
@@ -360,19 +380,31 @@ impl Journal {
         let mut file = self.lock()?;
         let entries = Self::entries(&mut file)?;
         let mut active = std::collections::BTreeSet::new();
-        let mut completed_root = false;
+        let mut started = std::collections::BTreeSet::new();
+        let mut completed_parents = Vec::new();
         for entry in entries {
             match entry {
                 Entry::Started(span) => {
-                    active.insert(span.record.context.span_id.as_str().to_owned());
+                    let id = span.record.context.span_id.as_str().to_owned();
+                    started.insert(id.clone());
+                    active.insert(id);
                 }
                 Entry::Completed(span) => {
                     active.remove(span.context.span_id.as_str());
-                    completed_root |= span.parent_span_id.is_none();
+                    completed_parents.push(span.parent_span_id);
                 }
                 Entry::Owner { .. } | Entry::Supervisor { .. } => {}
             }
         }
+        // The execution root is the span parented outside this journal: none
+        // at all, or a story root (#9037) that no execution journals itself.
+        // An orphan whose journalled parent never started (the root's own
+        // start failed) counts too; before #9038 such a journal never retired.
+        let completed_root = completed_parents.iter().any(|parent| {
+            parent
+                .as_ref()
+                .is_none_or(|p| !started.contains(p.as_str()))
+        });
         let cursor_path = self.path.with_extension("cursor");
         let cursor = std::fs::read_to_string(&cursor_path)?.parse::<u64>()?;
         if !completed_root || !active.is_empty() || cursor != file.metadata()?.len() {

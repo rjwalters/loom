@@ -111,6 +111,7 @@ pub struct Out {
 
 const RED: &str = "\x1b[0;31m";
 const GREEN: &str = "\x1b[0;32m";
+const YELLOW: &str = "\x1b[1;33m";
 const BLUE: &str = "\x1b[0;34m";
 const NC: &str = "\x1b[0m";
 
@@ -141,6 +142,17 @@ impl Out {
         }
     }
 
+    /// Mirrors `print_warning` / the `remove` verb's `_rm_warning` (#8195
+    /// slice 3): advisory, never fatal, and stderr-routed under `--json` for
+    /// the same stdout-purity reason as [`Out::info`].
+    pub fn warning(&self, msg: &str) {
+        if self.json {
+            eprintln!("{YELLOW}⚠ {msg}{NC}");
+        } else {
+            println!("{YELLOW}⚠ {msg}{NC}");
+        }
+    }
+
     /// Emit a JSON document, but only in `--json` mode. Mirrors the shell's
     /// `_snap_json` / `_sbp_json` / `_sbo_json` guards, which return early
     /// when `json` is false.
@@ -148,6 +160,36 @@ impl Out {
         if self.json {
             println!("{doc}");
         }
+    }
+}
+
+/// The three message levels [`branch_delete::maybe_delete_local_branch`]
+/// (#8195 slice 3, reused by #8191) emits, abstracted from [`Out`]'s own
+/// icon/color rendering so a second caller can replay the same decision
+/// through its own logging (#8191's `merge-pr.sh` still runs its historic
+/// `info`/`warning`/`success` shell functions — un-iconned, differently
+/// colored — and the retained `test-merge-pr-local-branch-cleanup.sh` suite
+/// stubs exactly those three names, not [`Out`]'s output).
+///
+/// [`Out`] implements this by delegating to its own inherent methods, so
+/// `worktree.sh remove`'s existing behavior is unchanged; `merge-pr`'s CLI
+/// layer provides a second implementation that prints a machine-parseable
+/// `LEVEL\tmessage` line instead.
+pub trait Sink {
+    fn info(&self, msg: &str);
+    fn warning(&self, msg: &str);
+    fn success(&self, msg: &str);
+}
+
+impl Sink for Out {
+    fn info(&self, msg: &str) {
+        Out::info(self, msg);
+    }
+    fn warning(&self, msg: &str) {
+        Out::warning(self, msg);
+    }
+    fn success(&self, msg: &str) {
+        Out::success(self, msg);
     }
 }
 

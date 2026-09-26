@@ -349,8 +349,10 @@ fn decide_for_worktree(
     let is_under_loom = crate::worktree_root::is_worktree_path(&resolved_wt, &resolved_repo);
     let has_sentinel = resolved_wt.join(LOOM_MANAGED_SENTINEL).exists();
     let is_uncommitted = super::safety::check_uncommitted_changes(&resolved_wt);
-    // #7812: the one shared "has this branch landed?" answer — ancestry, then
-    // (only if that failed) the forge, then offline tree equality. Three-way:
+    // #7812/#8470: the one shared "has this branch landed?" ladder
+    // (`worktree_cli::branch_landed`) — ancestry, then (only if that failed)
+    // a merged PR whose head is still this HEAD, then offline tree equality.
+    // The issue number is the forge key `feature/issue-<n>`. Three-way:
     // `Unknown` reaches the decision tree as its own state, never flattened
     // into a bool here. See `worktree_ops::landed`.
     let landed_state = landed::probe(repo_root, wt.head.as_deref(), issue_num);

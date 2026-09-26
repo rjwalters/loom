@@ -83,7 +83,7 @@ fn actual_propagation_hook_handles_enabled_disabled_and_invalid_configuration() 
             .env_clear()
             .env(TRACEPARENT_ENV, "stale-context")
             .env(CONTEXT_FILE_ENV, "stale-file");
-        prepare_child(&mut command, dir.path(), "child-boundary");
+        prepare_child(&mut command, dir.path(), "child-boundary", None);
         let output = command.output().unwrap();
         let store = TraceStore::new(dir.path());
         if expect_context {

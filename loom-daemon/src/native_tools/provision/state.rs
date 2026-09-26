@@ -9,7 +9,12 @@ use std::{
 };
 
 pub(super) struct State {
+    /// This launch's own private directory. Nothing else may read or write it.
     pub directory: PathBuf,
+    /// The per-workspace parent of [`Self::directory`], which also holds the
+    /// content-keyed binding trees every launch of this workspace shares
+    /// (#8663, [`super::shared`]).
+    pub workspace: PathBuf,
     pub auth: Option<Vec<u8>>,
 }
 
@@ -195,7 +200,9 @@ fn auth_snapshot(root: &Path, path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn create(
+/// `pub(super)` so the shared-binding tests can build two launches' state for
+/// one workspace without going through the environment [`prepare`] reads.
+pub(super) fn create(
     root: &Path,
     override_base: Option<&Path>,
     home: Option<&Path>,
@@ -219,6 +226,13 @@ fn create(
     let workspace = base.join(hex::encode(Sha256::digest(root.as_os_str().as_encoded_bytes())));
     outside_repositories(&root, &canonical_destination(&workspace)?)?;
     private_directory(&workspace)?;
+    let workspace = workspace.canonicalize()?;
+    // The only Loom process that reliably exists around a native session is the
+    // one starting the *next* one: `worker_spawn::exec` hands this process
+    // image to the harness CLI, so there is no parent left at session exit to
+    // clean up after it (#8663). Never fatal — a launch that cannot reap still
+    // launches; `loom-daemon clean` is the other pass.
+    let _ = super::reap::reap_workspace(&workspace, &super::reap::Policy::default(), false);
     let directory = workspace.join(uuid::Uuid::new_v4().to_string());
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
@@ -231,7 +245,14 @@ fn create(
         .context("cannot allocate isolated native launch state")?;
     let directory = directory.canonicalize()?;
     outside_repositories(&root, &directory)?;
-    Ok(State { directory, auth })
+    // Records the pid `execve` hands to the harness, so the next launch can
+    // tell a live 12-hour sweep from an exited one instead of guessing on age.
+    super::reap::record_session(&directory)?;
+    Ok(State {
+        directory,
+        workspace,
+        auth,
+    })
 }
 
 fn validate_auth_format(bytes: &[u8], runtime: &str) -> Result<()> {
@@ -271,6 +292,41 @@ fn validate_auth_format(bytes: &[u8], runtime: &str) -> Result<()> {
 }
 
 impl State {
+    /// Pin `TMPDIR` to a private, short-path directory keyed on this launch's
+    /// own uuid (#8650, #8693).
+    ///
+    /// Without this, a `bun --compile` harness (OpenCode) falls back to the OS
+    /// default (`$TMPDIR`, else `/tmp`) and extracts its ~5.5 MB embedded
+    /// native addon there on **every** launch, under a fresh
+    /// `.<hash>-0000000N.{so,node}` name that nothing ever removes — measured
+    /// at 7.6 GB across 1,382 files in 40 hours of scheduled role ticks on one
+    /// worker, which contributed to a live ENOSPC outage. Pinning `TMPDIR`
+    /// makes the extract reclaimable by
+    /// [`crate::native_state_reclaim::sweep_pinned_tmp`] instead of an
+    /// unattributable `/tmp` litter that would have to be matched by filename
+    /// pattern.
+    ///
+    /// The pinned directory is deliberately **not** nested inside
+    /// `self.directory` (an earlier revision used `self.directory.join("tmp")`):
+    /// that full path can run to ~148 bytes, past the 108-byte (Linux) /
+    /// 104-byte (macOS) `sockaddr_un.sun_path` limit once a socket file name is
+    /// appended, breaking anything the harness runs that binds a Unix socket
+    /// under an inherited `TMPDIR` (`cargo test`, Python multiprocessing, Node
+    /// IPC). [`crate::native_state_reclaim::pinned_tmp_base`] is a fixed short
+    /// root instead — see that function's docs for why reclaim still works
+    /// with the directory split out this way.
+    fn pin_tmpdir(&self, command: &mut Command) -> Result<()> {
+        let uuid = self
+            .directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("launch state directory has no valid uuid name")?;
+        let path = crate::native_state_reclaim::pinned_tmp_base().join(uuid);
+        private_directory(&path)?;
+        command.env("TMPDIR", path);
+        Ok(())
+    }
+
     pub(super) fn configure(&self, command: &mut Command, runtime: &str) -> Result<()> {
         if runtime == "kimi" {
             // `KIMI_CODE_HOME` is relocated by `provision::write_kimi_bindings`
@@ -285,11 +341,15 @@ impl State {
                 "LOOM_NATIVE_AUTH_FILE is not supported for the kimi harness; use the model \
                  profile's credentialEnv mapping (KIMI_MODEL_API_KEY) instead"
             );
-            return Ok(());
+            // `TMPDIR` is still pinned: every guarded harness is a self-extracting
+            // single-file binary of some shape, and none of them may scatter
+            // per-launch extracts into the shared OS `/tmp`.
+            return self.pin_tmpdir(command);
         }
         if let Some(auth) = &self.auth {
             validate_auth_format(auth, runtime)?;
         }
+        self.pin_tmpdir(command)?;
         // Guarded launches own these paths; ambient harness config cannot move
         // auth/session writes back into a checkout or another worker's state.
         if runtime == "pi" {

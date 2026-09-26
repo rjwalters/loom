@@ -163,6 +163,11 @@ mod tests {
     fn session_keys_are_the_four_the_renderers_strip() {
         for k in [
             "LOOM_SWEEP_CLAIM_OWNED",
+            // #8835's sweep-identity marker is caught by the existing
+            // `LOOM_SWEEP_` prefix, not by a new arm — pinned here so a later
+            // rewrite of this predicate into an explicit match list cannot
+            // quietly bake a per-sweep id into a durable plist/unit.
+            "LOOM_SWEEP_ID",
             "LOOM_SWEEP_",
             "LOOM_TERMINAL_ID",
             "LOOM_ROLE",

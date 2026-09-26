@@ -6,6 +6,10 @@ use super::*;
 /// #8222) — the source of the record's `judge_verdicts` and `doctor_cycles`.
 pub(crate) mod label_timeline;
 
+/// The Curator complexity-tier signal read off the sweep's issue body (Issue
+/// #8542) — the source of the record's `complexity`.
+pub(crate) mod complexity_signal;
+
 /// One observed lifecycle-phase transition for a live sweep (Issue #4704):
 /// the checkpoint phase marker and the instant [`SweepRegistry::reap_once`]
 /// first observed it.
@@ -619,9 +623,23 @@ impl SweepRegistry {
         // the pre-#8507 behavior for every Claude sweep; an `opencode` launch
         // instead reads OpenCode's own session store, scoped to this sweep's
         // directories and the same wall-clock window.
+        //
+        // Issue #8594: a legacy-adapter runtime that keeps a usage store of its
+        // own (Codex) writes no `# LOOM_LAUNCH` record, so its runtime id is
+        // recovered from the `# LOOM_RUNTIME_RESOLVED` marker every runtime
+        // writes — `sweep_usage_runtime`, which deliberately yields `None` for
+        // `claude` and is therefore payload-preserving. The usage SOURCE only:
+        // this record's own `runtime`/`provider`/`profile` fields stay
+        // launch-record-sourced (`apply_runtime_attribution` below), because
+        // the marker carries no provider or profile to publish.
+        let usage_runtime = crate::usage_source::sweep_usage_runtime(
+            runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+            &self.config.workspace_root,
+            issue,
+        );
         let tokens_by_model = started_at.and_then(|started_at| {
             crate::usage_source::sweep_tokens_by_model(
-                runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+                usage_runtime.as_deref(),
                 &self.config.workspace_root,
                 issue,
                 Some((started_at, Utc::now())),
@@ -652,6 +670,12 @@ impl SweepRegistry {
             (Some(signals.doctor_cycles), Some(signals.judge_verdicts))
         });
 
+        // Curator complexity tier (Issue #8542), read off the sweep's own
+        // issue body — see `complexity_signal`'s module doc for why this is a
+        // separate forge read from the PR timeline above rather than a
+        // dispatch-time plumb, and its identical fail-open contract.
+        let complexity = self.fetch_complexity_signal(issue);
+
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
             visibility,
@@ -678,6 +702,7 @@ impl SweepRegistry {
                 .as_ref()
                 .and_then(|r| r.provider.clone()),
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
+            complexity,
         };
         let result_name = serde_json::to_value(result)
             .ok()
@@ -712,6 +737,14 @@ impl SweepRegistry {
         if let Some(cycles) = outcome_record.doctor_cycles {
             metadata.insert("loom.doctor_cycles".into(), cycles.to_string());
         }
+        // #8908: this execution's exact token usage, joined to its trace.
+        crate::observability::runtime_usage::finish_sweep(
+            &self.config.workspace_root,
+            sweep_id,
+            started_at,
+            outcome_record.tokens_by_model.as_deref(),
+            outcome_record.runtime.as_deref(),
+        );
         let trace_context = crate::observability::lifecycle::finish_execution(
             &self.config.workspace_root,
             sweep_id,
@@ -1017,3 +1050,14 @@ mod runtime_tests;
     unused_imports
 )]
 mod tap_usage_tests;
+
+// End-to-end tests for the #8542 complexity-marker sourcing, in their own
+// sibling file for the same file-size reason as `timeline_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod complexity_tests;

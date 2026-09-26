@@ -539,6 +539,20 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redacted).toEqual({ kind: "ephemeral_compute" });
   });
 
+  // Issue #8835 added `sweep_id` to this kind. The allowlist is unchanged
+  // (`["kind"]`), which must mean the new field is withheld like every other
+  // one — a new field must not leak merely by being new.
+  it("ephemeral_compute: the #8835 sweep_id field is withheld like every other field", () => {
+    const redacted = redactPayload("ephemeral_compute", {
+      kind: "ephemeral_compute",
+      job_id: "job-abc123",
+      sweep_id: "sweep-issue-8835-1",
+      instance_type: "c7i.4xlarge",
+    });
+    expect(redacted).toEqual({ kind: "ephemeral_compute" });
+    expect(JSON.stringify(redacted)).not.toContain("sweep-issue-8835-1");
+  });
+
   it("an unrecognized (forward-compatible) kind reveals only `kind`", () => {
     const redacted = redactPayload("future.kind", {
       kind: "future.kind",
@@ -704,6 +718,29 @@ describe("redactFleetSnapshot", () => {
     // project down to and even the number of running instances is withheld.
     expect(redactFleetSnapshot(snapshot, false).activeCompute).toEqual([]);
     // The authenticated dashboard still sees the whole entry.
+    expect(redactFleetSnapshot(snapshot, true).activeCompute).toEqual([computeEntry]);
+  });
+
+  it("withholds a sweep-attributed compute entry from a public viewer too (#8835)", () => {
+    // The nesting feature only ever renders for an Access-authenticated
+    // viewer, because the public snapshot has no entries to nest in the first
+    // place. That is the property this pins — including the new `sweepId`,
+    // which must not become the one field that survives.
+    const computeEntry: ActiveComputeState = {
+      hostId: "2am-elastic",
+      jobId: "job-abc123",
+      sweepId: "sweep-issue-8835-1",
+      instanceType: "c7i.4xlarge",
+      spot: true,
+      startedAt: "2026-09-19T12:00:00Z",
+      updatedAt: "2026-09-19T12:00:00Z",
+      leaked: false,
+    };
+    const snapshot: FleetSnapshot = { hosts: {}, activeSweeps: [], activeCompute: [computeEntry] };
+
+    const publicView = redactFleetSnapshot(snapshot, false);
+    expect(publicView.activeCompute).toEqual([]);
+    expect(JSON.stringify(publicView)).not.toContain("sweep-issue-8835-1");
     expect(redactFleetSnapshot(snapshot, true).activeCompute).toEqual([computeEntry]);
   });
 

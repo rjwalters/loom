@@ -177,7 +177,7 @@ const BLAST_RADIUS_RED: &str = "Touches anything that mediates merging, branch/w
 const REVIEW_DEPTH_GREEN: &str = "The Judge's verdict cites specifics from the diff — named files/functions, concrete behavior, what was run or verified.";
 const REVIEW_DEPTH_RED: &str = "A short generic approval (\"LGTM\", \"looks good\") with no evidence the diff was read, or a review that explicitly defers verification of some part (\"did not check X\").";
 
-const REVERTABILITY_GREEN: &str = "`git revert <squash-sha>` fully undoes the change: no data/schema migration, no published artifact, no state written outside the repo.";
+const REVERTABILITY_GREEN: &str = "`git revert -m 1 <merge-sha>` fully undoes it: no data/schema migration, no published artifact, no state written outside the repo.";
 const REVERTABILITY_RED: &str = "The change performs a one-way action when it runs (deletes branches/worktrees, rewrites installed files, publishes a release, migrates data, moves credentials), so reverting the commit does not undo the effect.";
 
 /// One `noul` question: Champion's axis, asked as "is this axis RED?".

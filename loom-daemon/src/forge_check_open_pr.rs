@@ -19,9 +19,10 @@
 //! [`crate::worktree_ops::gh::probe_open_linked_pr`] — the same two-transport
 //! union (GraphQL closes-graph ∪ REST issue timeline) the registry guard and
 //! orphan recovery use. The closes-graph query, its `state == "OPEN"` filter,
-//! and the `Part of #N` timeline leg are NOT reimplemented here; a divergence
-//! between "what the daemon refuses to dispatch" and "what an agent is told is
-//! safe to claim" is precisely the defect this command exists to remove.
+//! the `Part of #N` timeline leg, and that leg's #6216/#8940 bare-mention
+//! phrase filter are NOT reimplemented here; a divergence between "what the
+//! daemon refuses to dispatch" and "what an agent is told is safe to claim" is
+//! precisely the defect this command exists to remove.
 //!
 //! # Exit-code contract (the whole public surface)
 //!

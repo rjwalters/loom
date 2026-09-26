@@ -32,11 +32,13 @@ import { providerDisplayName, providerMark, sweepAgentMark } from "../providers"
 import type { FleetView, HostStatus, HostView, ProviderSummary } from "../fleet";
 import type { HostHealthRecord, HostProtection, ManagedRepoEntry } from "../types";
 import { emptyFleetView } from "./states";
-import { runningComputeSection, type RunningComputeOptions } from "./runningCompute";
+import { computeSubprocessList, runningComputeSection, type RunningComputeOptions } from "./runningCompute";
+import { workQueueSummarySection } from "./workQueue";
 
 const STATUS_LABEL: Record<HostStatus, string> = {
   ok: "OK",
   degraded: "Degraded",
+  throttled: "Throttled",
   stale: "Stale",
   unknown: "No data",
   missing: "Missing",
@@ -51,7 +53,8 @@ const STATUS_LABEL: Record<HostStatus, string> = {
  */
 const STATUS_TITLE: Record<HostStatus, string> = {
   ok: "Reporting recently; token pool has healthy capacity",
-  degraded: "Reporting recently, but showing signs of distress",
+  degraded: "Reporting recently, but something needs attention",
+  throttled: "Healthy, but holding back new work by design (load shedding or a low token pool) — clears on its own",
   stale: "No telemetry received recently — the daemon may be stopped or offline",
   unknown: "This host has not pushed host.health or tokens.snapshot yet",
   missing:
@@ -134,6 +137,27 @@ export function protectionBadge(protection: HostProtection | undefined): HTMLEle
       data: { testid: "protection-badge" },
     },
     "Unprotected",
+  );
+}
+
+/**
+ * A dedicated warning for a singleton job reported armed on a host that is
+ * NOT the fleet captain (#8848 acceptance criterion (a)) — see
+ * `singletonsArmedOnNonCaptain`'s doc for why this should be rare. Renders
+ * only when `host.armedSingletonsOnNonCaptain` is nonempty; an ordinary host
+ * (nothing armed, or armed exactly on the captain) shows no badge at all,
+ * the same restraint `protectionBadge` applies to its own routine case.
+ */
+export function captainAnomalyBadge(host: HostView): HTMLElement | null {
+  if (host.armedSingletonsOnNonCaptain.length === 0) return null;
+  return el(
+    "span",
+    {
+      class: "badge badge--degraded",
+      title: `Singleton job(s) armed on a non-captain host (#8848): ${host.armedSingletonsOnNonCaptain.join(", ")}`,
+      data: { testid: "captain-anomaly-badge" },
+    },
+    "Singleton on non-captain",
   );
 }
 
@@ -242,6 +266,21 @@ export function healthFields(host: HostView, now: Date = new Date()): DocumentFr
       "Watchdog/crash-protection state — whether a future daemon death on this host would be detected (#5352)",
     ),
   );
+  // #8848: only shown once this fleet has actually opted into `fleet.captain`
+  // — `is_captain === undefined` means the mechanism does not apply here at
+  // all, and a "Captain: —" row on every ordinary card would be noise, not
+  // information (mirrors `tokenPoolFields`'s restraint for a provider-less
+  // host, and `protectionBadge`'s restraint for the routine "protected"
+  // case).
+  if (health.is_captain !== undefined) {
+    fragment.appendChild(
+      field(
+        "Captain",
+        health.is_captain ? "Yes" : "No",
+        "Fleet singleton-job captain (#8848) — the one host declared to run this fleet's declared singleton jobs",
+      ),
+    );
+  }
   return fragment;
 }
 
@@ -309,7 +348,7 @@ function writeIdleReposOpen(hostId: string, open: boolean): void {
  * Extracted so the roster-missing card (#8804) can show them too: a host that
  * never sent `host.health` can still have pushed `sweep.started` records, and
  * dropping that list would hide live work. */
-function sweepList(host: HostView): HTMLElement | null {
+function sweepList(host: HostView, now: Date = new Date()): HTMLElement | null {
   if (host.sweeps.length === 0) return null;
   return el(
     "ul",
@@ -337,6 +376,11 @@ function sweepList(host: HostView): HTMLElement | null {
           sweepWorkTitle(sweep.issue, sweep.phase),
         ),
         sweep.repo ? forgeLink(sweep.repo, repoUrl(sweep.repo), "card__sweep-repo") : null,
+        // Issue #8835: the sweep's live Spot/batch jobs, nested beneath it.
+        // `null` for the overwhelming majority of sweeps (no compute jobs, or
+        // an emitter that does not stamp `sweepId`), so an ordinary sweep's
+        // markup is byte-identical to what it was before this feature.
+        computeSubprocessList(host.computeBySweep.get(sweep.sweepId) ?? [], now),
       ),
     ),
   );
@@ -352,7 +396,11 @@ function sweepList(host: HostView): HTMLElement | null {
  * states distinguishable from each other, and both from a host that reported
  * and went quiet (`card--stale`).
  */
-function rosterHostCard(host: HostView, state: "missing" | "unprovisioned"): HTMLElement {
+function rosterHostCard(
+  host: HostView,
+  state: "missing" | "unprovisioned",
+  now: Date = new Date(),
+): HTMLElement {
   return el(
     "article",
     {
@@ -367,13 +415,13 @@ function rosterHostCard(host: HostView, state: "missing" | "unprovisioned"): HTM
     ),
     el("p", { class: "card__subtitle" }, ROSTER_SUBTITLE[state]),
     el("p", { class: "card__notice", data: { testid: "roster-state-detail" } }, ROSTER_DETAIL[state]),
-    sweepList(host),
+    sweepList(host, now),
   );
 }
 
 export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
   if (host.status === "missing" || host.status === "unprovisioned") {
-    return rosterHostCard(host, host.status);
+    return rosterHostCard(host, host.status, now);
   }
   const sweepCount = host.sweeps.length;
   const repos = managedRepos(host);
@@ -445,6 +493,7 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
         { class: "card__badges" },
         statusBadge(host.status, host.degradedReason),
         protectionBadge(host.entry.health?.record.protection),
+        captainAnomalyBadge(host),
       ),
     ),
     el(
@@ -476,7 +525,7 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
         "Repositories this host's daemon manages (its workspace registry, whether idle or busy)",
       ),
     ),
-    sweepList(host),
+    sweepList(host, now),
     activeRepos.length > 0
       ? el(
           "ul",
@@ -537,7 +586,14 @@ export function fleetOverviewView(
   // and nothing else, so a fleet can legitimately have running instances and
   // zero reporting hosts. Short-circuiting to the "no hosts" empty state would
   // hide the one thing that *is* running — including a leak (#8306).
-  const compute = runningComputeSection(view.activeCompute, now, { authenticated });
+  //
+  // Fed `unattributedCompute`, not `activeCompute` (#8835): a job already
+  // nested under its own sweep's card entry does not also need a row here, but
+  // every job that could NOT be nested does — that is precisely the orphaned/
+  // leaked instance this panel exists to surface. The headline count below
+  // deliberately still uses `activeCompute` (the fleet-wide total), so nesting
+  // never makes the fleet look like it is running less compute than it is.
+  const compute = runningComputeSection(view.unattributedCompute, now, { authenticated });
 
   if (view.hosts.length === 0) {
     return compute
@@ -581,6 +637,26 @@ export function fleetOverviewView(
         { class: view.needsAttention > 0 ? "overview__attention" : undefined },
         `${view.needsAttention} need${view.needsAttention === 1 ? "s" : ""} attention`,
       ),
+      // #8848 acceptance criterion (b): this fleet has opted into
+      // `fleet.captain` (some host reports `is_captain` at all) but none of
+      // them is currently `true` — a typo'd/decommissioned captain id, or one
+      // that has simply never reported `host.health`. Suppressed entirely for
+      // the overwhelmingly common fleet that never declared `fleet.captain`,
+      // since no host sends the field then (`noCaptainReporting` is
+      // participation-gated — see its doc).
+      view.noCaptainReporting
+        ? el(
+            "span",
+            {
+              class: "overview__attention",
+              title:
+                "No host currently reports is_captain: true, but this fleet declares fleet.captain — " +
+                "check for a typo'd host id or a captain that has not reported host.health (#8848)",
+              data: { testid: "fleet-captain-warning" },
+            },
+            "No fleet captain reporting",
+          )
+        : null,
       // Only when there is elastic compute to count (#8306). Most fleets run
       // none at all, and a permanent "0 compute jobs" in a headline already
       // carrying three carefully-worded counts is noise, not information —
@@ -604,6 +680,8 @@ export function fleetOverviewView(
         : null,
     ),
     compute,
+    // Issue #8852: null until some host reports a queue.
+    workQueueSummarySection(view, now),
     el(
       "div",
       { class: "overview__grid" },

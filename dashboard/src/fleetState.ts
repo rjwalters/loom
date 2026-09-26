@@ -12,10 +12,12 @@
  * state" a single object lookup rather than a fan-out across N per-host
  * objects.
  *
- * Storage layout (four key prefixes, iterated via `list({ prefix })` to
+ * Storage layout (five key prefixes, iterated via `list({ prefix })` to
  * build a snapshot):
  *   `health:<hostId>`  → latest `host.health` record + when it was applied.
  *   `tokens:<hostId>`  → latest `tokens.snapshot` record + when applied.
+ *   `queue:<hostId>`   → newest `queue.snapshot` (the work finder's ranked
+ *                        ready queue, Issue #8852) — see `./queueState.ts`.
  *   `sweep:<sweepId>`  → the in-flight sweep's current known state; removed
  *                        entirely on `sweep.completed` (a finished sweep is
  *                        not "live" — its full history lives in D1).
@@ -78,6 +80,13 @@
  *    deleted, so the DO's working set still stays bounded.
  */
 
+import {
+  classifyAndPruneQueues,
+  normalizeQueueSnapshot,
+  shouldReplaceQueue,
+  type HostQueueEntry,
+} from "./queueState";
+
 export interface ActiveSweepState {
   hostId: string;
   sweepId: string;
@@ -114,6 +123,16 @@ export interface ActiveComputeState {
    * instance itself runs (that is `region`/`instanceId`). */
   hostId: string;
   jobId: string;
+  /** The sweep that submitted this job, when the emitter stamped one
+   * (Issue #8835). This — never `hostId` — is what the dashboard joins on to
+   * nest a job under the sweep paying for it: `hostId` is the *submitter's*
+   * ingest identity (one synthetic id for a whole hostless elastic fleet),
+   * which need not match the sweep's own host at all.
+   *
+   * Absent for a job submitted outside any sweep, and for one submitted by an
+   * emitter that predates this field — both of which must keep rendering in
+   * the flat "running compute" list rather than being dropped. */
+  sweepId?: string;
   instanceId?: string;
   region?: string;
   instanceType?: string;
@@ -253,6 +272,8 @@ export interface FleetSnapshot {
       // its absence never silently hides a stale sample's age.
       health?: { record: Record<string, unknown>; updatedAt: string; freshness?: FreshnessInfo };
       tokens?: { record: Record<string, unknown>; updatedAt: string; freshness?: FreshnessInfo };
+      /** The host's work-finder ready queue (Issue #8852) — see `./queueState.ts`. */
+      queue?: HostQueueEntry;
     }
   >;
   activeSweeps: ActiveSweepState[];
@@ -587,7 +608,7 @@ export class FleetState implements DurableObject {
   }
 
   /**
-   * Remove a host's live-state entries (`health:<hostId>` / `tokens:<hostId>`)
+   * Remove a host's live-state entries (`health:`/`tokens:`/`queue:<hostId>`)
    * outright — the DO-side half of retiring a host (issue #4957 AC: "fleet
    * drain removes the host's live-state entries"). Wired from
    * `src/index.ts`'s `POST /admin/hosts/:hostId/revoke`, the dashboard's
@@ -605,7 +626,7 @@ export class FleetState implements DurableObject {
    * authoritative over whatever this method did or did not manage to delete.
    */
   private async removeHost(hostId: string): Promise<void> {
-    await this.state.storage.delete([`health:${hostId}`, `tokens:${hostId}`]);
+    await this.state.storage.delete([`health:${hostId}`, `tokens:${hostId}`, `queue:${hostId}`]);
   }
 
   private async applyUpdate({ hostId, record }: FleetStateUpdate): Promise<void> {
@@ -620,6 +641,18 @@ export class FleetState implements DurableObject {
       }
       case "tokens.snapshot": {
         await this.state.storage.put(`tokens:${hostId}`, { record, updatedAt: now });
+        break;
+      }
+      case "queue.snapshot": {
+        // Issue #8852: newest tick wins; a redelivered or older snapshot must
+        // not refresh `updatedAt` (see `shouldReplaceQueue`).
+        const snapshot = normalizeQueueSnapshot(record);
+        if (!snapshot) return;
+        const key = `queue:${hostId}`;
+        const existing = await this.state.storage.get<HostQueueEntry>(key);
+        if (!shouldReplaceQueue(existing, snapshot)) return;
+        const entry: HostQueueEntry = { record: snapshot, updatedAt: now };
+        await this.state.storage.put(key, entry);
         break;
       }
       case "sweep.started": {
@@ -712,9 +745,16 @@ export class FleetState implements DurableObject {
           break;
         }
         const existing = await this.state.storage.get<ActiveComputeState>(`compute:${jobId}`);
+        const computeSweepId = record.sweep_id;
         const entry: ActiveComputeState = {
           hostId,
           jobId,
+          // Issue #8835: the submitting sweep, when the emitter stamped one.
+          // An empty string is normalized away rather than stored — it would
+          // never match a live sweep, and storing it would make "no sweep" two
+          // distinct values for every downstream reader to handle.
+          sweepId:
+            typeof computeSweepId === "string" && computeSweepId.length > 0 ? computeSweepId : undefined,
           instanceId: typeof record.instance_id === "string" ? record.instance_id : undefined,
           region: typeof record.region === "string" ? record.region : undefined,
           instanceType: typeof record.instance_type === "string" ? record.instance_type : undefined,
@@ -784,6 +824,14 @@ export class FleetState implements DurableObject {
       prefix: "tokens:",
     });
     const { hosts, pruneKeys } = classifyAndPruneHosts(healthEntries, tokenEntries, now);
+    // Issue #8852: the `queue:` prefix shares the host prune horizon.
+    const queueEntries = await this.state.storage.list<HostQueueEntry>({ prefix: "queue:" });
+    const { queues, pruneKeys: queuePruneKeys } = classifyAndPruneQueues(queueEntries, now);
+    for (const [hostId, queue] of Object.entries(queues)) {
+      hosts[hostId] ??= {};
+      hosts[hostId].queue = queue;
+    }
+    pruneKeys.push(...queuePruneKeys);
     if (pruneKeys.length > 0) {
       await this.state.storage.delete(pruneKeys);
     }

@@ -25,6 +25,7 @@ import type { FetchLike } from "./historyClient";
 import type { FleetSnapshot } from "./types";
 import { fleetOverviewView } from "./views/fleetOverview";
 import { hostDetailView } from "./views/hostDetail";
+import { workQueueView } from "./views/workQueue";
 import { errorView, loadingView, unknownHostView } from "./views/states";
 
 export const DEFAULT_POLL_INTERVAL_MS = 10_000;
@@ -279,6 +280,9 @@ export class App {
         this.clearHostHistory();
         replaceChildren(this.root, banner, unknownHostView(this.route.hostId));
       }
+    } else if (this.route.name === "queue") {
+      this.clearHostHistory();
+      replaceChildren(this.root, banner, workQueueView(view, now));
     } else {
       this.clearHostHistory();
       replaceChildren(this.root, banner, fleetOverviewView(view, now));

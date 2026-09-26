@@ -123,7 +123,8 @@ pub(crate) enum SweepOutcomesAction {
         #[arg(long, conflicts_with = "all_workspaces")]
         this_workspace: bool,
 
-        /// Grouping dimension: arm, model, repo, host, day, tap.
+        /// Grouping dimension: arm, model, repo, host, day, tap, complexity,
+        /// model-complexity.
         ///
         /// `tap` groups by `<runtime>@<credential source>` (#8556) — the cut
         /// that answers "how much went to the metered backstop vs. the

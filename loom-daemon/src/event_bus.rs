@@ -95,6 +95,14 @@
 //! "check now"). Invariant source: `docs/adr/0021-forge-event-plane.md`
 //! (ADR-0021); implementation: `loom-daemon/src/forge_events.rs`.
 //!
+//! Subscribers (#8766, Phase 2) live in [`crate::forge_events::wake`] — the
+//! work-finder tick, the queue-head wake, and the in-flight PR watch — and are
+//! each **default off** behind their own `forgeEvents.events.*` flag. A
+//! subscriber may only cause an **early tick of a loop that already exists**
+//! — it never carries a payload field into a decision — which is how the
+//! "never drive an external write without a forge-verified re-read" condition
+//! below is satisfied structurally: the early tick *is* the loop's own re-read.
+//!
 //! **`Generic`-topic rule.** A `Generic` topic is allowed only while it (a) is
 //! listed in this inventory, (b) carries a `source` field naming its producing
 //! subsystem on every payload, and (c) never triggers a write to external

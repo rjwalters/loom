@@ -1090,7 +1090,7 @@ fn test_dispatch_sweep_unregistered_explicit_workspace_root_is_structured_error(
     let unregistered = crate::workspace_registry::normalize_path(dir_unregistered.path());
 
     let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
-    pool.seed(root_a, sr_default.clone());
+    pool.seed(root_a.clone(), sr_default.clone());
 
     // Only repo A is registered; `dir_unregistered` is never added.
     let _guard = seed_temp_registry(&[dir_a.path()]);
@@ -1119,15 +1119,19 @@ fn test_dispatch_sweep_unregistered_explicit_workspace_root_is_structured_error(
                 "error must name the offending unregistered path, got: {}",
                 err.message
             );
+            // The registry stores every root normalized, so compare against
+            // `root_a`, not the raw tempdir path: where `TMPDIR` resolves
+            // through a symlink (macOS's `/var -> /private/var`, #8870) the two
+            // differ and only the normalized form can appear in the error.
             assert!(
-                err.message.contains(&dir_a.path().display().to_string())
+                err.message.contains(&root_a.display().to_string())
                     || err
                         .details
                         .as_ref()
                         .and_then(|d| d.get("registered"))
                         .map(|v| v.to_string())
                         .unwrap_or_default()
-                        .contains(&dir_a.path().display().to_string()),
+                        .contains(&root_a.display().to_string()),
                 "error must list the registered roots, got message={} details={:?}",
                 err.message,
                 err.details

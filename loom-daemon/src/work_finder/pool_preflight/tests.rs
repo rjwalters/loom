@@ -859,3 +859,36 @@ fn an_empty_pool_has_no_broadcast_identity() {
     assert!(observation.pool_key.is_none());
     assert!(observation.edge.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// #8931: one `loom.pool.hold` span per hold, armed → cleared
+// ---------------------------------------------------------------------------
+
+/// A hold that arms and later clears emits exactly one `loom.pool.hold` span
+/// starting at the arm instant and ending at the clear; the steady-state
+/// ticks in between emit none.
+#[test]
+fn an_armed_then_cleared_hold_emits_one_hold_span() {
+    let ws = workspace_with_pool(&["a", "b"]);
+    bad_mark_all(ws.path(), &["a", "b"]);
+    let state = PoolHoldState::new();
+    let armed_at = chrono::Utc::now() - chrono::Duration::seconds(600);
+    let ((), held) = crate::observability::ops::capture::capture(|| {
+        assert!(state.observe_root(ws.path(), armed_at));
+        assert!(state.observe_root(ws.path(), armed_at + chrono::Duration::seconds(60)));
+    });
+    assert!(held.spans.is_empty(), "no span while the hold is live");
+
+    readmit_all(ws.path());
+    let cleared_at = armed_at + chrono::Duration::seconds(300);
+    let ((), cleared) = crate::observability::ops::capture::capture(|| {
+        assert!(!state.observe_root(ws.path(), cleared_at));
+    });
+    assert_eq!(cleared.spans.len(), 1, "{:?}", cleared.spans);
+    let span = &cleared.spans[0];
+    assert_eq!(span.name.as_str(), "loom.pool.hold");
+    assert_eq!((span.started_at, span.ended_at), (armed_at, cleared_at));
+    assert_eq!(span.attributes["loom.pool.hold.post_mortem"], "false");
+    assert_eq!(span.attributes["loom.pool.hold.accounts"], "2");
+    assert!(cleared.metrics.is_empty());
+}

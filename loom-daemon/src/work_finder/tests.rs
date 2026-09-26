@@ -2128,7 +2128,7 @@ fn test_tick_empty_ready_is_noop() {
     let mut source = FakeSource::once(vec![]);
     let mut disp = RecordingDispatcher::default();
     let report = tick(&mut source, &mut disp, 10, false).unwrap();
-    assert_eq!(report, TickReport::default());
+    assert_eq!(report.without_occupancy(), TickReport::default());
     assert!(disp.dispatched.is_empty());
 }
 
@@ -2366,7 +2366,7 @@ fn test_tick_multi_halted_dispatches_zero_across_workspaces() {
 fn test_tick_multi_empty_workspace_set_is_noop() {
     let mut multi: Vec<(FakeSource, RecordingDispatcher)> = vec![];
     let report = tick_multi(&mut multi, &[], 10, &[]);
-    assert_eq!(report, TickReport::default());
+    assert_eq!(report.without_occupancy(), TickReport::default());
 }
 
 #[test]
@@ -3709,7 +3709,7 @@ fn test_scale_to_zero_on_empty_backlog() {
     let mut source = FakeSource::once(vec![]);
     let mut disp = RecordingDispatcher::default();
     let report = tick(&mut source, &mut disp, cap, false).unwrap();
-    assert_eq!(report, TickReport::default(), "empty backlog ⇒ zero activity");
+    assert_eq!(report.without_occupancy(), TickReport::default(), "no activity");
     assert!(disp.dispatched.is_empty());
 }
 
@@ -3786,9 +3786,13 @@ fn test_config_full_block_is_parsed() {
             interval_secs: Some(90),
             max_concurrent: Some(5),
             max_admissions_per_tick: Some(4),
-            extra_skip_labels: None,
             // Retired keys are recorded (accepted-but-ignored), not parsed.
             deprecated_cpu_keys: vec!["cpuUtilizationTarget", "estCoresPerSweep"],
+            // Keys this body does not set (`extraSkipLabels`,
+            // `maxConcurrentPerRepo`) parse to their `Default`, `None` — for
+            // the #9090 per-repo cap that means *uncapped*. Still an exact
+            // equality assertion over the whole struct.
+            ..WorkFinderConfig::default()
         }
     );
 }

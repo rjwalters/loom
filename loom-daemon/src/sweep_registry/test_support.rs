@@ -49,13 +49,27 @@ pub(crate) fn fake_gh_graphql_arm(prs: &str, exit_code: i32) -> String {
 /// Unlike `fake_gh_graphql_arm` (which emits the RAW closes-graph payload,
 /// parsed in Rust), the real `gh` invocation here carries `--jq`, so `gh`
 /// itself applies the filter before this fixture would ever see output — the
-/// fixture therefore emits the POST-filter shape directly: `pr` is either a
-/// single bare PR number (an open cross-referenced PR was found) or empty
-/// (none).
+/// fixture therefore emits the POST-filter shape directly: one compact
+/// `{number, body}` candidate object per line (#8940).
+///
+/// `pr` is either a single PR number — synthesized as a **phrase-confirmed**
+/// candidate (`Part of #<issue>`, with the issue number read out of the
+/// timeline path in `$2` so callers need not repeat it), i.e. a genuine open
+/// linked PR — or empty (verified none). Any other value is emitted verbatim,
+/// which is how the unparseable-output leg is still exercised.
+///
+/// For the bare-mention shape (#8940: a candidate that mentions `#<issue>` but
+/// carries no linking phrase, and must therefore NOT count), rewrite this arm's
+/// `Part of #` to a non-phrase prefix — see `guards_union_tests`'
+/// `bare_mention_registry`.
 pub(crate) fn fake_gh_timeline_rest_arm(pr: &str, exit_code: i32) -> String {
     format!(
         "if [[ \"$1\" == \"api\" && \"$*\" == *timeline* ]]; then\n\
-         printf '%s\\n' \"{pr}\"\n\
+         __issue=\"${{2#*/issues/}}\"; __issue=\"${{__issue%/timeline}}\"\n\
+         case \"{pr}\" in\n\
+         ''|*[!0-9]*) printf '%s\\n' \"{pr}\" ;;\n\
+         *) printf '{{\"number\":%s,\"body\":\"Part of #%s\"}}\\n' \"{pr}\" \"$__issue\" ;;\n\
+         esac\n\
          exit {exit_code}\n\
          fi\n"
     )
@@ -140,6 +154,7 @@ pub(crate) fn fixture_registry(workspace: &Path) -> (SweepRegistry, PathBuf) {
   printf 'LOOM_SWEEP_CLAIM_OWNED=%s\n' "${{LOOM_SWEEP_CLAIM_OWNED:-unset}}"
   printf 'LOOM_SWEEP_LEASE_RENEW_DISPATCHED=%s\n' "${{LOOM_SWEEP_LEASE_RENEW_DISPATCHED:-unset}}"
   printf 'LOOM_TERMINAL_ID=%s\n' "${{LOOM_TERMINAL_ID:-unset}}"
+  printf 'LOOM_SWEEP_ID=%s\n' "${{LOOM_SWEEP_ID:-unset}}"
   printf 'CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=%s\n' "${{CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}}"
   printf 'GH_CONFIG_DIR=%s\n' "${{GH_CONFIG_DIR:-unset}}"
 }} >> "{rec}" 2>&1
@@ -1887,7 +1902,7 @@ pub(crate) fn park_guard_registry(
              printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
-             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$2\" != */issues/{linked_pr} ]]; then\n\
              printf '%s\\n' {labels}\n\
              exit {rest_exit}\n\
              fi\n\
@@ -1902,6 +1917,10 @@ pub(crate) fn park_guard_registry(
         state = state_probe_json("open", false),
         labels = rest_labels,
         rest_exit = rest_exit,
+        // `rest_labels` model the ISSUE's labels; the linked open PR reports
+        // none, so the reaper's PR-side park check (#8689) does not mask the
+        // issue-side 2.7 probe these fixtures exist to exercise.
+        linked_pr = if graphql_pr.is_empty() { "none" } else { graphql_pr },
     );
     std::fs::write(&fake_gh, &script).unwrap();
     let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();

@@ -1,0 +1,39 @@
+# Pinned collector config for the cycle-time live proof. The point of routing
+# through the REAL ClickHouse exporter (rather than INSERTing hand-written rows)
+# is that the riskiest assumption in the whole artifact set — how a nested
+# `loom.phase_durations` attribute is serialized into a String-valued
+# `LogAttributes` map — is observed, not assumed.
+#
+# No batch processor: each export lands immediately, so the test never has to
+# guess a flush interval. `ttl` mirrors the ClickStack deployment's 168h default
+# so the created schema carries the same retention the artifacts reason about.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+exporters:
+  clickhouse:
+    endpoint: tcp://clickhouse:9000?dial_timeout=30s
+    database: default
+    # Generated per run by the test and passed to both containers; never a
+    # committed credential. The pinned ClickHouse image refuses an empty
+    # password for `default` from a non-local client.
+    username: default
+    password: ${env:CLICKHOUSE_PASSWORD}
+    ttl: 168h
+    create_schema: true
+    logs_table_name: otel_logs
+    timeout: 30s
+    sending_queue:
+      enabled: false
+    retry_on_failure:
+      enabled: false
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [clickhouse]

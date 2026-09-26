@@ -483,6 +483,7 @@ fn terminal_records(
             runtime: None,
             provider: None,
             profile: None,
+            complexity: None,
         }),
     ]
 }
@@ -490,7 +491,7 @@ fn terminal_records(
 /// [`fetch_repo_slug`] with a process-lifetime cache keyed by workspace root
 /// path (a repo's slug does not change while the daemon runs — same
 /// rationale as [`crate::safehouse`]'s own `slug_cache`).
-async fn resolve_repo_slug_cached(
+pub(super) async fn resolve_repo_slug_cached(
     cache: &mut HashMap<String, String>,
     workspace_root: &str,
 ) -> Option<String> {
@@ -541,7 +542,7 @@ async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
 /// it is distinguishable in the daemon log from an ordinary probe failure
 /// (which `visibility.rs` itself now logs) rather than looking identical to
 /// "repo is actually private".
-async fn resolve_visibility(slug: &str) -> RepoVisibility {
+pub(super) async fn resolve_visibility(slug: &str) -> RepoVisibility {
     let owned = slug.to_string();
     match tokio::task::spawn_blocking(move || derive_visibility(&owned)).await {
         Ok(visibility) => visibility,
@@ -577,10 +578,35 @@ async fn sample_snapshots(
     token_record
         .accounts
         .extend(sample_registry_provider_accounts(workspace_root));
+    // Token burn + per-provider pool state (Issue #8857), through the
+    // OTLP-only ops sink — a no-op (no reads at all) without an OTLP exporter.
+    super::ops::quota::record(workspace_root, &token_record.accounts).await;
     queue.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::TokensSnapshot(token_record)));
-    let health_record =
-        sample_host_health(workspace_root, daemon_started_at, workspace_pool, slug_cache).await;
+    // ONE `df -Pk` sample per tick feeds both host.health's GB fields and the
+    // ops byte gauges (#8857 — it used to run twice).
+    let root = workspace_root.to_path_buf();
+    let worktree_volume =
+        tokio::task::spawn_blocking(move || crate::disk_headroom::worktree_root_disk_bytes(&root))
+            .await
+            .unwrap_or((None, None));
+    let health_record = sample_host_health(
+        workspace_root,
+        daemon_started_at,
+        workspace_pool,
+        slug_cache,
+        worktree_volume,
+    )
+    .await;
     queue.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
+    // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
+    // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
+    super::ops::host::record(worktree_volume).await;
+    // The work finder's ranked ready queue (Issue #8852, phase 2) — native
+    // HTTPS only, and only when the work finder has ticked since last time.
+    super::queue_snapshot::record(workspace_pool, slug_cache).await;
+    // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
+    // listings plus a bounded per-item budget; a no-op without the ops sink.
+    super::ops::stage_dwell::record(workspace_pool, slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
@@ -705,6 +731,7 @@ async fn sample_host_health(
     started_at: Instant,
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
+    worktree_volume_bytes: (Option<u64>, Option<u64>),
 ) -> HostHealthRecord {
     // CPU idle refresh can block ~1s on macOS (`iostat`) — dispatched through
     // `spawn_blocking` per the exact pattern `work_finder`'s dynamic-cap tick
@@ -726,9 +753,26 @@ async fn sample_host_health(
     );
     // Free AND total (#5356) come from the SAME `df -Pk` sample — one
     // subprocess spawn, not two — so the pair can never disagree about which
-    // filesystem or point in time they describe.
-    let (worktree_root_free_gb, worktree_root_total_gb) =
-        crate::disk_headroom::worktree_root_disk_gb(workspace_root);
+    // filesystem or point in time they describe. The caller took that sample
+    // in bytes (#8857) so the ops gauges share it; GB here is the same integer
+    // floor `disk_headroom::parse_df_*_gb` applies (`kb / 1024 / 1024`).
+    let (worktree_root_free_gb, worktree_root_total_gb) = (
+        worktree_volume_bytes
+            .0
+            .map(crate::disk_headroom::bytes_to_whole_gb),
+        worktree_volume_bytes
+            .1
+            .map(crate::disk_headroom::bytes_to_whole_gb),
+    );
+    // Fleet captain (#8848): `is_captain` is this host's gate outcome against
+    // `root`'s declared `fleet.captain`, and `armed_singleton_jobs` (#8901)
+    // merges this process's own in-daemon registry with the durable
+    // shell-arm registry a `loom-daemon fleet-captain <job>` invocation
+    // writes — see `crate::fleet_captain`'s module doc, "Two arm registries".
+    let captain_gate = crate::fleet_captain::resolve_gate_for_root(
+        workspace_root,
+        &crate::sweep_registry::host_identity(),
+    );
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -751,6 +795,11 @@ async fn sample_host_health(
         roles: sample_role_tick_health(&crate::role_runner::role_tick_records()),
         protection: sample_host_protection().await,
         admission_brake,
+        is_captain: captain_gate.is_captain_flag(),
+        armed_singleton_jobs: crate::fleet_captain::armed_singleton_job_names_for_host(
+            workspace_root,
+        ),
+        captainless_singleton_jobs: crate::fleet_captain::captainless_singleton_job_names(),
     }
 }
 
@@ -1001,18 +1050,7 @@ where
     // Collect the roots first and drop every registry lock before the async
     // slug/visibility resolution below — never hold a `std::sync::Mutex`
     // guard across an `.await` point.
-    let roots: Vec<PathBuf> = workspace_pool
-        .provisioned_registries()
-        .into_iter()
-        .map(|registry| {
-            registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .config()
-                .workspace_root
-                .clone()
-        })
-        .collect();
+    let roots = provisioned_roots(workspace_pool);
 
     let mut entries = Vec::with_capacity(roots.len());
     for root in roots {
@@ -1047,6 +1085,23 @@ where
     entries
 }
 
+/// Every workspace root [`WorkspacePool::provisioned_registries`] currently
+/// tracks. Each registry lock is released before this returns.
+pub(super) fn provisioned_roots(workspace_pool: &WorkspacePool) -> Vec<PathBuf> {
+    workspace_pool
+        .provisioned_registries()
+        .into_iter()
+        .map(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .config()
+                .workspace_root
+                .clone()
+        })
+        .collect()
+}
+
 /// This host's currently in-flight (`Pending`/`Running`, i.e. non-terminal)
 /// sweep IDs, across every repo [`WorkspacePool::provisioned_registries`]
 /// currently tracks (Issue #4955). Feeds `host.health`'s `active_sweep_ids`
@@ -1077,6 +1132,9 @@ mod admission_brake_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod provider_accounts_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod shell_arm_registry_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;

@@ -235,6 +235,22 @@ fn install_labels_block(
     Ok(())
 }
 
+/// The label-workflow paragraph shared verbatim by [`LOOM_ROOT_POINTER`] and
+/// [`AGENTS_ROOT_POINTER`] (issue #8846).
+///
+/// A macro rather than a `const` because both pointers are built with `concat!`,
+/// which only accepts literals — expanding one macro into both call sites is what
+/// keeps the CLAUDE.md and AGENTS.md wording from drifting apart.
+///
+/// Deliberately generic: it names only labels, roles, and the two scripts every
+/// install ships, so it is correct in any consumer repo whether or not the daemon
+/// is ever started.
+macro_rules! loom_label_workflow_pointer {
+    () => {
+        "Work is coordinated through `loom:` labels on issues and pull requests, and the same roles run either under `loom-daemon` or by hand in an attended session — daemon mode is optional. Create the labels once with `.loom/scripts/sync-labels.sh` (an install ships `.github/labels.yml` but does not create the labels on the forge). A pull request ready for review carries `loom:review-requested`; Judge reviews it and applies `loom:pr` (approved) or `loom:changes-requested`; Doctor fixes a `loom:changes-requested` pull request and returns it to `loom:review-requested`. Only a `loom:pr` pull request gets merged, and always via this repo's merge script (`.loom/scripts/merge-pr.sh`) — never a raw forge merge command such as `gh pr merge`. Full state machine: `.loom/docs/label-state-machine.md`."
+    };
+}
+
 /// The short pointer injected into root CLAUDE.md (between section markers).
 ///
 /// This block is committed to the consumer repo, so its authoritative reference
@@ -245,7 +261,19 @@ fn install_labels_block(
 /// auto-discovers that local copy when agents work in `.loom/worktrees/issue-N/`
 /// via ancestor directory traversal, so the auto-discovery behaviour is
 /// unaffected by this wording.
-pub const LOOM_ROOT_POINTER: &str = "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.";
+///
+/// The second paragraph is the *local* cue for the label workflow (issue #8846):
+/// a repo run in session mode (roles invoked by an attended operator, no daemon
+/// and no interval terminals) has no other in-repo statement of it. Kept to one
+/// paragraph on purpose — this is a pointer block, so it links
+/// `.loom/docs/label-state-machine.md` rather than inlining the state machine.
+/// Any wording change to that paragraph belongs in
+/// `loom_label_workflow_pointer!`, which [`AGENTS_ROOT_POINTER`] shares.
+pub const LOOM_ROOT_POINTER: &str = concat!(
+    "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.",
+    "\n\n",
+    loom_label_workflow_pointer!(),
+);
 
 /// Wrap Loom content in section markers
 pub fn wrap_loom_content(content: &str) -> String {
@@ -275,7 +303,15 @@ pub const AGENTS_SECTION_END: &str = "<!-- END LOOM ORCHESTRATION (AGENTS) -->";
 /// `.loom/AGENTS.md` at install time. OpenAI Codex CLI (and other AGENTS.md-aware
 /// runtimes) auto-discover `AGENTS.md` via ancestor directory traversal, the
 /// direct analogue of Claude Code's `CLAUDE.md` discovery.
-pub const AGENTS_ROOT_POINTER: &str = "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration (dual-runtime: Claude Code reads `CLAUDE.md`; OpenAI Codex CLI and other AGENTS.md-aware runtimes read this file). See the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of the runtime-neutral guide to `.loom/AGENTS.md`.";
+///
+/// Also like [`LOOM_ROOT_POINTER`], the second paragraph is the local cue for the
+/// label workflow (issue #8846) — both pointers expand the one
+/// `loom_label_workflow_pointer!` macro, so they cannot drift apart.
+pub const AGENTS_ROOT_POINTER: &str = concat!(
+    "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration (dual-runtime: Claude Code reads `CLAUDE.md`; OpenAI Codex CLI and other AGENTS.md-aware runtimes read this file). See the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of the runtime-neutral guide to `.loom/AGENTS.md`.",
+    "\n\n",
+    loom_label_workflow_pointer!(),
+);
 
 /// Wrap AGENTS.md content in its own section markers (kept separate from
 /// [`wrap_loom_content`]/CLAUDE.md's markers — see [`AGENTS_SECTION_START`]).
@@ -1313,11 +1349,28 @@ pub fn setup_repository_scaffolding(
 /// completely alone and recorded as `preserved`, never silently overwritten
 /// or reaped — the same contract `defaults/scripts/resync-installed.sh`
 /// documents for this surface, applied here at install time.
+///
+/// **Dogfood installs are symlinked, not copied** (issue #8947). When the
+/// target *is* the Loom source repo, copying `defaults/.agents/skills/` onto
+/// `.agents/skills/` inside the same repository reproduces the materialized
+/// copy that #3565 removed and #3682 removed again after the stale copy caused
+/// a false bug report (#3665). `.claude/agents` and `.claude/commands/loom`
+/// both resolved this with a symlink into `defaults/`; this is the fourth
+/// surface in that family and gets the same treatment.
 fn install_agent_skills(
     defaults_path: &Path,
     workspace_path: &Path,
     report: &mut InitReport,
 ) -> Result<(), String> {
+    // Dogfood detection: `defaults/` sits directly under the target, i.e. this
+    // install is writing into the Loom source repo itself. Deliberately a
+    // path-shape test rather than a flag — the Rust scaffolding path has no
+    // equivalent of the shell installer's `DOGFOOD_MODE`, and inferring it
+    // here keeps daemon-driven installs consistent with `install-loom.sh`.
+    if defaults_path.parent() == Some(workspace_path) {
+        return link_dogfood_agent_skills(defaults_path, workspace_path, report);
+    }
+
     let skills = match crate::agent_skills::generate_all(defaults_path) {
         Ok(skills) => skills,
         // A defaults/ tree with no roles/ directory (or malformed role
@@ -1363,6 +1416,101 @@ fn install_agent_skills(
         }
     }
     Ok(())
+}
+
+/// Dogfood arm of [`install_agent_skills`] (issue #8947): points
+/// `.agents/skills` at `../defaults/.agents/skills` so the live tree cannot
+/// drift from the committed source of truth. Same relative depth, and the same
+/// "no copy = no drift" rationale, as `.claude/agents -> ../defaults/.claude/agents`.
+///
+/// Mirrors `link_dogfood_commands`' safety guard: an existing *real* directory
+/// is only replaced once it is known to hold nothing that `defaults/` does not
+/// already have. Local-only files mean a human put something there, so this
+/// warns and leaves the tree alone rather than discarding the work.
+fn link_dogfood_agent_skills(
+    defaults_path: &Path,
+    workspace_path: &Path,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    let link_path = workspace_path.join(".agents").join("skills");
+    let link_target = Path::new("..")
+        .join("defaults")
+        .join(".agents")
+        .join("skills");
+    let src = defaults_path.join(".agents").join("skills");
+
+    // Nothing to point at — a defaults/ tree without the surface is the same
+    // soft no-op the copy path takes when role prompts are missing.
+    if !src.is_dir() {
+        return Ok(());
+    }
+
+    // Already correct? Leave it untouched so repeat installs stay idempotent.
+    if let Ok(existing) = fs::read_link(&link_path) {
+        if existing == link_target {
+            report
+                .preserved
+                .push(".agents/skills (dogfood symlink)".to_string());
+            return Ok(());
+        }
+        fs::remove_file(&link_path)
+            .map_err(|e| format!("Failed to replace {}: {e}", link_path.display()))?;
+    } else if link_path.exists() {
+        // A real directory occupies the path: either a pre-#8947 materialized
+        // copy or a stale dogfood copy. Replacing it is only safe once we know
+        // defaults/ is a superset of what is there.
+        let local_only = files_not_in(&link_path, &src)?;
+        if !local_only.is_empty() {
+            report.preserved.push(format!(
+                ".agents/skills (left as-is: {} local-only file(s) not in defaults/)",
+                local_only.len()
+            ));
+            return Ok(());
+        }
+        fs::remove_dir_all(&link_path)
+            .map_err(|e| format!("Failed to remove {}: {e}", link_path.display()))?;
+    }
+
+    if let Some(parent) = link_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&link_target, &link_path)
+        .map_err(|e| format!("Failed to symlink {}: {e}", link_path.display()))?;
+
+    report
+        .added
+        .push(".agents/skills (dogfood symlink)".to_string());
+    Ok(())
+}
+
+/// Relative paths of files under `dir` that have no counterpart under `other`.
+/// The Rust equivalent of `link_dogfood_commands`' `comm -23` guard.
+fn files_not_in(dir: &Path, other: &Path) -> Result<Vec<String>, String> {
+    let mut missing = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = fs::read_dir(&current)
+            .map_err(|e| format!("Failed to read {}: {e}", current.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Failed to read {}: {e}", current.display()))?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(dir) else {
+                continue;
+            };
+            if !other.join(rel).exists() {
+                missing.push(rel.display().to_string());
+            }
+        }
+    }
+    missing.sort();
+    Ok(missing)
 }
 
 #[cfg(test)]

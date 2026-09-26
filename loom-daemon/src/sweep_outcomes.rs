@@ -955,6 +955,7 @@ mod tests {
                 runtime: None,
                 provider: None,
                 profile: None,
+                complexity: None,
             }),
         )
     }
@@ -1157,6 +1158,8 @@ mod tests {
                 effort: None,
                 detail: None,
                 gated_pool: None,
+                preference_tier: None,
+                preference_tap: None,
                 runtime: None,
                 provider: None,
                 profile: None,

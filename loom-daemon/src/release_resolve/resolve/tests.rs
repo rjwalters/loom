@@ -213,22 +213,258 @@ fn the_refusal_names_every_tier_that_was_consulted() {
     assert!(why.contains("workspace"), "{why}");
 }
 
+/// The #8515 reason builder under one set of inputs, with the fixed
+/// repo/target/asset names every case below shares.
+fn why_no_artifact(asset_count: Option<usize>, age_minutes: Option<i64>) -> String {
+    no_artifact_reason(
+        "v0.11.0",
+        "consumer-owner/consumer-repo",
+        "x86_64-unknown-linux-gnu",
+        "loom-daemon-x86_64-unknown-linux-gnu",
+        "loom-daemon-x86_64-unknown-linux-gnu.sha256",
+        asset_count,
+        age_minutes,
+    )
+}
+
 #[test]
 fn the_no_artifact_reason_names_the_repo_it_asked() {
     // AC2, and the exact line the incident emitted for 20+ ticks with no repo
     // in it: "release v0.11.0 has no artifact for target
     // x86_64-unknown-linux-gnu (checked for …)" reads like an unbuilt
     // platform, not like a wrong repository.
-    let why = no_artifact_reason(
-        "v0.11.0",
-        "consumer-owner/consumer-repo",
-        "x86_64-unknown-linux-gnu",
-        "loom-daemon-x86_64-unknown-linux-gnu",
-        "loom-daemon-x86_64-unknown-linux-gnu.sha256",
-    );
+    let why = why_no_artifact(Some(3), Some(60 * 24));
     assert!(why.contains("consumer-owner/consumer-repo"), "{why}");
     assert!(why.contains("v0.11.0"), "{why}");
     assert!(why.contains("x86_64-unknown-linux-gnu"), "{why}");
+}
+
+// ---- the create-before-upload race (#8515) --------------------------
+//
+// One snapshot of `gh release view` cannot tell "this platform will never
+// have an artifact" from "the upload matrix is still running", and for
+// several minutes after every release the second is what is true. These
+// assert the two read differently — and that the *transient* reading is only
+// ever reached when the release is demonstrably young.
+
+#[test]
+fn a_just_published_assetless_release_reads_as_an_upload_in_flight() {
+    // The incident itself: `releases/latest` names a Release created minutes
+    // ago whose build-daemon matrix has not uploaded anything yet.
+    let why = why_no_artifact(Some(0), Some(3));
+    assert!(why.contains("STILL UPLOADING"), "{why}");
+    assert!(why.contains("no assets at all yet"), "{why}");
+    assert!(why.contains("3m"), "must name the age: {why}");
+}
+
+#[test]
+fn a_just_published_release_with_other_platforms_assets_is_still_in_flight() {
+    // Each matrix leg uploads independently, so "some assets, none mine" is
+    // just as transient as "no assets at all" inside the window.
+    let why = why_no_artifact(Some(4), Some(7));
+    assert!(why.contains("STILL UPLOADING"), "{why}");
+    assert!(
+        why.contains("4 asset(s), none matching this target"),
+        "must name the count: {why}"
+    );
+}
+
+#[test]
+fn an_old_release_with_no_artifact_still_reads_as_genuinely_unbuilt() {
+    // The edge case the grace window must NOT swallow: a platform that will
+    // never get an artifact has to keep saying so, or #8515's fix becomes a
+    // permanent mask over a real gap.
+    let why = why_no_artifact(Some(6), Some(60 * 24 * 3));
+    assert!(!why.contains("STILL UPLOADING"), "{why}");
+    assert!(why.contains("genuinely unbuilt"), "{why}");
+    assert!(why.contains("3d 0h"), "must name the age: {why}");
+}
+
+#[test]
+fn the_grace_window_boundary_is_exclusive_on_the_transient_side() {
+    // One minute inside the window is transient; the boundary itself is not —
+    // an off-by-one here is the difference between a bounded window and one
+    // that widens every time the constant is read loosely.
+    assert!(assets_may_still_be_uploading(Some(ASSET_UPLOAD_GRACE_MINUTES - 1)));
+    assert!(!assets_may_still_be_uploading(Some(ASSET_UPLOAD_GRACE_MINUTES)));
+}
+
+#[test]
+fn an_unknown_publish_time_is_never_reported_as_an_upload_in_flight() {
+    // An older `gh` reports no `publishedAt`. With no timestamp there is
+    // nothing to bound the claim, so the message says the age is unknown
+    // rather than asserting a transient state that might be a year stale.
+    assert!(!assets_may_still_be_uploading(None));
+    let why = why_no_artifact(Some(0), None);
+    assert!(!why.contains("STILL UPLOADING"), "{why}");
+    assert!(why.contains("publish time could not be read"), "{why}");
+}
+
+#[test]
+fn an_unreadable_asset_list_is_reported_as_unreadable_not_as_zero_assets() {
+    // `None` (the query failed) and `Some(0)` (the release genuinely publishes
+    // nothing yet) are different facts; folding them together is the fail-open
+    // `asset_names`'s own doc comment exists to prevent.
+    let why = why_no_artifact(None, Some(2));
+    assert!(why.contains("asset list could not be read"), "{why}");
+    assert!(!why.contains("no assets at all yet"), "{why}");
+}
+
+#[test]
+fn release_age_is_computed_from_the_forges_own_rfc3339_timestamp() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-09-22T12:00:00Z")
+        .expect("now")
+        .with_timezone(&chrono::Utc);
+    assert_eq!(release_age_minutes(Some("2026-09-22T11:45:00Z"), now), Some(15));
+    // An offset timestamp is the same instant, not a different one.
+    assert_eq!(release_age_minutes(Some("2026-09-22T07:45:00-04:00"), now), Some(15));
+    // Clock skew: a release "published in the future" is 0 minutes old, never
+    // negative (which would sort as ancient and read as unbuilt).
+    assert_eq!(release_age_minutes(Some("2026-09-22T12:05:00Z"), now), Some(0));
+    // Absent / empty / unparseable are all "could not be determined".
+    assert_eq!(release_age_minutes(None, now), None);
+    assert_eq!(release_age_minutes(Some("  "), now), None);
+    assert_eq!(release_age_minutes(Some("not-a-timestamp"), now), None);
+}
+
+#[test]
+fn human_age_reads_as_a_duration_an_operator_can_act_on() {
+    assert_eq!(human_age(0), "less than a minute");
+    assert_eq!(human_age(3), "3m");
+    assert_eq!(human_age(90), "1h 30m");
+    assert_eq!(human_age(60 * 24 * 2 + 60 * 5), "2d 5h");
+}
+
+/// The source side of the same race (#8515 AC1): `releases/latest` — the exact
+/// thing [`resolve`] reads — must not be pointed at a Release until every
+/// platform's assets have uploaded.
+///
+/// This is the one part of the fix that cannot be exercised without cutting a
+/// real release, so what is asserted is the workflow's *invariant*: the Release
+/// is created explicitly not-latest, and a job that runs after the whole
+/// `build-daemon` matrix is what moves the pointer. Dropping either half
+/// silently restores the incident, and nothing else in CI would notice.
+#[test]
+fn the_release_workflow_does_not_point_latest_at_an_unuploaded_release() {
+    let yml = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/release.yml"),
+    );
+    let Ok(yml) = yml else {
+        return; // not a full checkout; nothing to compare against
+    };
+
+    // Every `gh release create` INVOCATION in the workflow must opt out of
+    // Latest. Shell line-continuations are folded first, so a flag on the
+    // command's second physical line still counts as part of it; a line that
+    // merely *names* the command inside a log message (`echo "::warning::gh
+    // release create for $tag failed…"`) is prose, not an invocation, and is
+    // skipped on the text before the match rather than on the match itself.
+    let folded = yml.replace("\\\n", " ");
+    let invocations = folded.lines().filter_map(|l| {
+        let (before, _) = l.split_once("gh release create ")?;
+        let prose = before.contains("echo") || before.contains("::");
+        (!prose).then_some(l)
+    });
+    let mut seen = 0;
+    for line in invocations {
+        seen += 1;
+        assert!(
+            line.contains("--latest=false"),
+            "a `gh release create` without --latest=false republishes the #8515 race: {line}"
+        );
+    }
+    assert!(
+        seen > 0,
+        "no `gh release create` invocation found — the matcher, not the workflow, is what changed"
+    );
+
+    // …and exactly one thing may opt back in, after the matrix.
+    assert!(
+        yml.contains("promote-release:"),
+        "the job that moves the Latest pointer once the uploads land is gone"
+    );
+    let promote = yml
+        .split_once("promote-release:")
+        .expect("promote-release job")
+        .1;
+    let promote = promote
+        .split_once("\n  build-worker-image:")
+        .map_or(promote, |(job, _)| job);
+    assert!(
+        promote.contains("needs: [resolve, build-daemon]"),
+        "promotion must wait for EVERY build-daemon matrix leg: {promote}"
+    );
+    assert!(
+        promote.contains("gh release edit \"$TAG\" --repo \"$REPO\" --latest"),
+        "promotion must actually mark the release Latest: {promote}"
+    );
+}
+
+/// The `promote-release` job's YAML block, or `None` outside a full checkout.
+fn promote_release_job() -> Option<String> {
+    let yml = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/release.yml"),
+    )
+    .ok()?;
+    let promote = yml.split_once("promote-release:")?.1;
+    Some(
+        promote
+            .split_once("\n  build-worker-image:")
+            .map_or(promote, |(job, _)| job)
+            .to_string(),
+    )
+}
+
+/// The other half of the promotion contract (#8515): moving the pointer
+/// imperatively (`gh release edit --latest`, i.e. `make_latest=true`) pins *that*
+/// release regardless of date, replacing GitHub's date-ordered `legacy`
+/// semantics. `concurrency:` is keyed per tag/SHA with `cancel-in-progress:
+/// false`, so runs for *different* releases overlap by design — and do in
+/// practice (v0.19.295 ran 18:37:25Z→18:52:30Z while v0.19.296 started
+/// 18:42:40Z). Without a guard, the slower run promotes last and drags Latest
+/// **backward** onto an older release until the next bump.
+///
+/// Like the test above, this is the part that cannot be exercised without
+/// cutting two overlapping real releases, so what is pinned is the invariant.
+#[test]
+fn the_promotion_job_refuses_to_move_latest_backward_onto_an_older_release() {
+    let Some(promote) = promote_release_job() else {
+        return; // not a full checkout; nothing to compare against
+    };
+
+    // (1) The current `releases/latest` — tag *and* creation date, since the
+    // race inverts date order — is read BEFORE the pointer is moved.
+    let read_at = promote
+        .find("--json tagName,createdAt")
+        .expect("promotion must read the current releases/latest (tagName + createdAt)");
+    let edit_at = promote
+        .find("gh release edit \"$TAG\" --repo \"$REPO\" --latest")
+        .expect("promotion must actually mark the release Latest");
+    assert!(
+        read_at < edit_at,
+        "the ordering check must run BEFORE the promotion, not after it: {promote}"
+    );
+
+    // (2) A newer release already holding the pointer is a deliberate no-op,
+    // never a red release run — the fleet is already on a newer complete
+    // Release, which is where it should be.
+    let guard = &promote[read_at..edit_at];
+    assert!(
+        guard.contains("exit 0"),
+        "a newer release already being Latest must skip-and-exit-0, not fail the run: {guard}"
+    );
+
+    // (3) The read-back accepts `$TAG` *or newer*. Strict equality there turns
+    // a concurrent run's legitimate promotion, landing between our write and
+    // our read, into a false red on a perfectly healthy repo state.
+    assert!(
+        !promote.contains(r#"if [ "$latest_tag" != "$TAG" ]"#),
+        "the read-back must accept `$TAG or newer`, not assert strict equality: {promote}"
+    );
+    assert!(
+        promote[edit_at..].contains("is_newer_than_tag"),
+        "the read-back must reuse the guard's newer-than comparison: {promote}"
+    );
 }
 
 #[test]

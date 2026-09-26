@@ -136,7 +136,7 @@ second copy can go missing its pre-claim guard (#8551).
 ### Merging PRs
 
 **Never use `gh pr merge`** — always use `./.loom/scripts/merge-pr.sh <PR_NUMBER>`
-instead (`--auto` to queue until checks pass, `--dry-run` to preview). `gh pr
+instead (`--auto` to wait then merge, `--dry-run` to preview). `gh pr
 merge` attempts a local checkout that fails when the PR branch is linked to a
 worktree; the script merges via the forge API directly and handles worktree
 cleanup automatically.
@@ -183,7 +183,8 @@ only Curator may be skipped.
 Slow correct job over clever fast one. **Never cancel verification of a distinct
 commit** — superseding is for PR branches; every `main` commit is distinct work.
 Path-filtering is an optimisation, not a correctness tool; one mechanism per
-behaviour. Rules + the incidents behind them: [`ci-principles`](.loom/docs/ci-principles.md).
+behaviour. Rules + incidents: [`ci-principles`](.loom/docs/ci-principles.md).
+All org CI is captured in SigNoz: [`ci-observability`](.loom/docs/ci-observability.md).
 
 ### Builder Workflow
 
@@ -261,7 +262,7 @@ missing/exhausted pool exits `78` (`EX_CONFIG`). Full reference:
 **Secrets stay outside every repository/worktree**, including ignored `.env`,
 `.loom-local`, logs and artifacts. Use owner-only user credential files or an OS
 credential store; reference them without copying values. Never print secrets.
-See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insufficient.
+See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insufficient. Task credentials (cloud tokens, SSH keys) use a reference-by-name convention — look up `.loom/credentials.md` before asking: [`.loom/docs/credentials.md`](.loom/docs/credentials.md).
 
 - **GitHub** — Loom uses the `gh` CLI (the `gh auth login` credential; scope to
   one repo with `export GH_TOKEN=…`). Fleet rate-limit protections (breaker, ETag
@@ -307,7 +308,7 @@ Completed-migration history (v0.10.0 shepherd/daemon deprecation, the Rust `loom
 
 - **Repository**: https://github.com/rjwalters/loom · **Roles**: `.loom/roles/*.md` · **Labels**: `.github/labels.yml` · **Scripts**: `.loom/scripts/`
 - **Docs**: [daemon-reference](.loom/docs/daemon-reference.md) · [token-pool](.loom/docs/token-pool.md) · [troubleshooting](.loom/docs/troubleshooting.md) ·
-  [build-gate](.loom/docs/build-gate.md) · [ci-principles](.loom/docs/ci-principles.md) · [safehouse](.loom/docs/safehouse.md) ·
+  [safehouse](.loom/docs/safehouse.md) ·
   [forge-auth](.loom/docs/forge-authentication.md) / [github-auth](.loom/docs/github-authentication.md) ·
   [blame-issue](.loom/docs/blame-issue.md) · [fleet-config-lifecycle](.loom/docs/fleet-config-lifecycle.md) · [verification-recipes](.loom/docs/verification-recipes.md)
 

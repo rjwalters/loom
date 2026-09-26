@@ -48,6 +48,15 @@ CLEANUP_SCRIPT="$SCRIPTS_DIR/cleanup-branches.sh"
 MERGE_PR_SCRIPT="$SCRIPTS_DIR/merge-pr.sh"
 DEFAULT_BRANCH_LIB="$SCRIPTS_DIR/lib/default-branch.sh"
 
+# #8191: the _maybe_delete_local_branch body cleanup-branches.sh extracts from
+# merge-pr.sh now delegates to `loom-daemon merge-pr delete-branch`. Pin the
+# binary built from this tree so a stale installed daemon cannot answer
+# instead — it would warn-and-keep every pr-* branch and fail these cases for
+# the wrong reason.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "merge-pr"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'

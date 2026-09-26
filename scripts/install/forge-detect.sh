@@ -185,31 +185,34 @@ gitea_api() {
 # the state this file already owns rather than shared.
 #
 # Usage: detect_merge_method
-# Outputs on stdout: "squash", "merge", or "rebase" — never anything else.
+# Outputs on stdout: "merge", "squash", or "rebase" — never anything else.
 #
-# Preference order when more than one strategy is allowed: squash > merge >
-# rebase. This matches forge-merge-method.sh and Loom's own installer default
-# (setup-repository-settings.sh) purely as a tie-break — it is NOT a claim that
-# squash is universally available.
+# Preference order when more than one strategy is allowed: merge > rebase >
+# squash (#9105): merge commits preserve the branch's full history — the
+# record Loom's blame/audit tooling joins on. This matches
+# forge-merge-method.sh and Loom's own installer default
+# (setup-repository-settings.sh) as a tie-break — it is NOT a claim that
+# merge commits are universally available.
 #
-# Fails OPEN to "squash" (the historical hardcoded behavior) on a network/auth
-# error, an unparseable response, or a forge reporting every allow_* flag
-# false. A transient probe failure therefore never blocks a merge outright —
-# worst case it reproduces the pre-#7844 behavior for that one call.
+# Fails OPEN to "merge" on a network/auth error, an unparseable response,
+# or a forge reporting every allow_* flag false. A transient probe failure
+# therefore never blocks a merge outright — and if the repo genuinely
+# disallows merge commits, the merge fails loudly instead of silently
+# squashing history (the pre-#9105 fail-open-to-squash behavior).
 detect_merge_method() {
   local allow_squash="" allow_merge="" allow_rebase=""
 
   if [[ "${FORGE_TYPE:-}" == "gitea" ]]; then
     local response body code parsed
     response=$(gitea_api GET "/repos/${FORGE_OWNER}/${FORGE_REPO}" 2>/dev/null) || {
-      echo "squash"
+      echo "merge"
       return 0
     }
     code=$(printf '%s\n' "$response" | tail -1)
     body=$(printf '%s\n' "$response" | sed '$d')
 
     if [[ "$code" != "200" ]]; then
-      echo "squash"
+      echo "merge"
       return 0
     fi
 
@@ -226,7 +229,7 @@ print("%s %s %s" % (
     str(data.get("allow_rebase_merge", "")).lower(),
 ))
 ' 2>/dev/null) || {
-      echo "squash"
+      echo "merge"
       return 0
     }
     read -r allow_squash allow_merge allow_rebase <<< "$parsed"
@@ -238,19 +241,19 @@ print("%s %s %s" % (
     tsv=$(gh api "repos/${FORGE_OWNER}/${FORGE_REPO}" \
       --jq '[(.allow_squash_merge // false), (.allow_merge_commit // false), (.allow_rebase_merge // false)] | @tsv' \
       2>/dev/null) || {
-      echo "squash"
+      echo "merge"
       return 0
     }
     IFS=$'\t' read -r allow_squash allow_merge allow_rebase <<< "$tsv"
   fi
 
-  if [[ "$allow_squash" == "true" ]]; then
-    echo "squash"
-  elif [[ "$allow_merge" == "true" ]]; then
+  if [[ "$allow_merge" == "true" ]]; then
     echo "merge"
   elif [[ "$allow_rebase" == "true" ]]; then
     echo "rebase"
-  else
+  elif [[ "$allow_squash" == "true" ]]; then
     echo "squash"
+  else
+    echo "merge"  # fail open to the default strategy (see header)
   fi
 }

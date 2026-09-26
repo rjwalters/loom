@@ -129,3 +129,142 @@ fn install_agent_skills_is_silent_noop_without_roles_dir() {
     assert!(result.is_ok(), "missing roles/ must not error: {result:?}");
     assert!(!workspace.join(".agents").exists());
 }
+
+// --- Dogfood arm (issue #8947) ------------------------------------------
+//
+// When the install target IS the loom source repo, `.agents/skills` must be a
+// symlink into `defaults/`, never a copy — the #3565/#3682 lesson applied to
+// the fourth surface in that family. The fixtures below put `defaults/`
+// directly under the workspace, which is exactly the path shape
+// `install_agent_skills` keys the dogfood branch off.
+
+/// Dogfood layout: `workspace/defaults/...`, so `defaults.parent() == workspace`.
+fn make_dogfood_layout(temp: &Path) -> std::path::PathBuf {
+    let defaults = temp.join("defaults");
+    make_defaults_with_one_role(&defaults);
+    // `generate_all` only writes into `defaults/.agents/skills` when something
+    // asks it to; the dogfood arm links to that directory, so it must exist.
+    fs::create_dir_all(defaults.join(".agents/skills/loom-foo")).unwrap();
+    fs::write(
+        defaults.join(".agents/skills/loom-foo/SKILL.md"),
+        format!("---\nname: loom-foo\n---\n{}\nbody\n", crate::agent_skills::MARKER),
+    )
+    .unwrap();
+    defaults
+}
+
+#[test]
+fn dogfood_install_symlinks_instead_of_copying() {
+    let temp_dir = TempDir::new().unwrap();
+    let workspace = temp_dir.path();
+    let defaults = make_dogfood_layout(workspace);
+
+    let mut report = InitReport::default();
+    install_agent_skills(&defaults, workspace, &mut report).unwrap();
+
+    let link = workspace.join(".agents/skills");
+    let target = fs::read_link(&link).expect("dogfood install must produce a symlink");
+    assert_eq!(
+        target,
+        Path::new("../defaults/.agents/skills"),
+        "symlink must point at the shipped source of truth: {report:?}"
+    );
+    // The linked content must resolve — a symlink to nowhere is worse than a copy.
+    assert!(link.join("loom-foo/SKILL.md").exists());
+}
+
+#[test]
+fn dogfood_install_is_idempotent() {
+    let temp_dir = TempDir::new().unwrap();
+    let workspace = temp_dir.path();
+    let defaults = make_dogfood_layout(workspace);
+
+    let mut report = InitReport::default();
+    install_agent_skills(&defaults, workspace, &mut report).unwrap();
+    let mut second = InitReport::default();
+    install_agent_skills(&defaults, workspace, &mut second).unwrap();
+
+    assert_eq!(
+        fs::read_link(workspace.join(".agents/skills")).unwrap(),
+        Path::new("../defaults/.agents/skills")
+    );
+    assert!(
+        second
+            .preserved
+            .iter()
+            .any(|p| p.contains(".agents/skills")),
+        "a correct symlink must be preserved, not rewritten: {second:?}"
+    );
+    assert!(second.added.is_empty(), "no re-add on second run: {second:?}");
+}
+
+#[test]
+fn dogfood_install_replaces_a_stale_materialized_copy() {
+    let temp_dir = TempDir::new().unwrap();
+    let workspace = temp_dir.path();
+    let defaults = make_dogfood_layout(workspace);
+
+    // The exact state this issue was filed about: a real directory holding a
+    // drifted copy of defaults/, untracked and un-ignored.
+    let copy = workspace.join(".agents/skills/loom-foo");
+    fs::create_dir_all(&copy).unwrap();
+    fs::write(copy.join("SKILL.md"), "stale copy").unwrap();
+
+    let mut report = InitReport::default();
+    install_agent_skills(&defaults, workspace, &mut report).unwrap();
+
+    assert_eq!(
+        fs::read_link(workspace.join(".agents/skills")).unwrap(),
+        Path::new("../defaults/.agents/skills"),
+        "a stale copy fully covered by defaults/ must be replaced: {report:?}"
+    );
+    assert!(!fs::read_to_string(workspace.join(".agents/skills/loom-foo/SKILL.md"))
+        .unwrap()
+        .contains("stale copy"));
+}
+
+#[test]
+fn dogfood_install_refuses_to_discard_local_only_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let workspace = temp_dir.path();
+    let defaults = make_dogfood_layout(workspace);
+
+    // A human-authored skill that defaults/ knows nothing about. Replacing the
+    // directory with a symlink would silently delete it, so the install must
+    // back off — same guard as `link_dogfood_commands`.
+    let local = workspace.join(".agents/skills/hand-written");
+    fs::create_dir_all(&local).unwrap();
+    fs::write(local.join("SKILL.md"), "local only").unwrap();
+
+    let mut report = InitReport::default();
+    install_agent_skills(&defaults, workspace, &mut report).unwrap();
+
+    assert!(local.join("SKILL.md").exists(), "local-only work must survive: {report:?}");
+    assert!(
+        fs::read_link(workspace.join(".agents/skills")).is_err(),
+        "must not have been replaced by a symlink: {report:?}"
+    );
+    assert!(
+        report.preserved.iter().any(|p| p.contains("local-only")),
+        "the back-off must be reported, not silent: {report:?}"
+    );
+}
+
+#[test]
+fn non_dogfood_install_still_copies() {
+    // Guard against the dogfood path-shape test over-matching: a consumer repo
+    // (defaults/ NOT directly under the workspace) must keep getting real files,
+    // because consumer repos track `.agents/skills/`.
+    let temp_dir = TempDir::new().unwrap();
+    let defaults = temp_dir.path().join("defaults");
+    let workspace = temp_dir.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    make_defaults_with_one_role(&defaults);
+
+    let mut report = InitReport::default();
+    install_agent_skills(&defaults, &workspace, &mut report).unwrap();
+
+    let dst = workspace.join(".agents/skills/loom-foo/SKILL.md");
+    assert!(dst.is_file(), "consumer install must write real files: {report:?}");
+    assert!(fs::read_link(workspace.join(".agents/skills")).is_err());
+}

@@ -967,6 +967,56 @@ describe("FleetState — ephemeral_compute live state (integration)", () => {
     });
     expect((await snapshot(stub)).activeCompute).toHaveLength(1);
   });
+
+  // Issue #8835: the emitter stamps the submitting sweep onto the launch
+  // record so the dashboard can nest a live instance under the sweep paying
+  // for it. The DO's only job is to carry it through untouched.
+  it("carries the submitting sweep_id through onto the live entry", async () => {
+    const stub = fleetStateStub("test-compute-sweep-id");
+    await update(stub, "host-abc", { ...LAUNCH, sweep_id: "sweep-issue-8835-1" });
+
+    const snap = await snapshot(stub);
+    expect(snap.activeCompute[0]).toMatchObject({
+      jobId: "job-abc123",
+      sweepId: "sweep-issue-8835-1",
+      // The submitter's ingest identity is NOT the sweep's host, and both are
+      // kept: the join is on sweepId, but hostId still says who reported it.
+      hostId: "host-abc",
+    });
+  });
+
+  it("round-trips sweep_id across a re-sent launch record", async () => {
+    const stub = fleetStateStub("test-compute-sweep-id-retry");
+    await update(stub, "host-abc", { ...LAUNCH, sweep_id: "sweep-issue-8835-1" });
+    await update(stub, "host-abc", { ...LAUNCH, sweep_id: "sweep-issue-8835-1" });
+
+    const snap = await snapshot(stub);
+    expect(snap.activeCompute).toHaveLength(1);
+    expect(snap.activeCompute[0]?.sweepId).toBe("sweep-issue-8835-1");
+  });
+
+  it("leaves sweepId absent for an unstamped, empty or wrong-typed sweep_id", async () => {
+    // A submission from outside any sweep, an emitter predating #8835, or a
+    // malformed payload. None of these may drop the job — an unattributable
+    // job is exactly the orphaned instance the flat list exists to surface.
+    const stub = fleetStateStub("test-compute-sweep-id-absent");
+    await update(stub, "host-abc", LAUNCH);
+    await update(stub, "host-abc", { ...LAUNCH, job_id: "job-empty", sweep_id: "" });
+    await update(stub, "host-abc", { ...LAUNCH, job_id: "job-typed", sweep_id: 42 });
+
+    const snap = await snapshot(stub);
+    expect(snap.activeCompute).toHaveLength(3);
+    expect(snap.activeCompute.every((entry) => entry.sweepId === undefined)).toBe(true);
+  });
+
+  it("retires a sweep-stamped job on its completion record like any other", async () => {
+    const stub = fleetStateStub("test-compute-sweep-id-complete");
+    await update(stub, "host-abc", { ...LAUNCH, sweep_id: "sweep-issue-8835-1" });
+    expect((await snapshot(stub)).activeCompute).toHaveLength(1);
+
+    await update(stub, "host-abc", { ...COMPLETION, sweep_id: "sweep-issue-8835-1" });
+    expect((await snapshot(stub)).activeCompute).toEqual([]);
+  });
 });
 
 

@@ -99,7 +99,7 @@ fn gh_bin() -> String {
 /// of a global `LOOM_GH_BIN` env var, which would race across parallel
 /// `cargo test` threads in the same process. [`gh_bin`]'s env lookup stays the
 /// CLI's own default; only tests take this path directly.
-fn gh_api_with(bin: &str, args: &[&str]) -> Result<String, String> {
+pub(crate) fn gh_api_with(bin: &str, args: &[&str]) -> Result<String, String> {
     gh_api_body(bin, args, None)
 }
 

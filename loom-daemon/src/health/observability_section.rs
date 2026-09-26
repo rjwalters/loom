@@ -62,6 +62,11 @@ pub fn assess_observability(inputs: &HealthInputs) -> Option<HealthSection> {
     let export = status.observability_export.as_ref().map(|e| {
         let mut classified = e.clone();
         classified.state = classified.classify(inputs.at);
+        // #9015: re-derive the scope fields for the same reason the state is
+        // re-stamped — a payload from an older daemon carries no
+        // `scope`/`endpoint_loopback`, and a `detail` that omits how far the
+        // state reaches is the misreading this issue is about.
+        classified.refresh_endpoint_scope();
         classified
     });
     let export = export.as_ref();

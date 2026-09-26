@@ -16,10 +16,10 @@
 //!   redirect points build output outside the worktree, where no removal path
 //!   ever looked.
 //! - [`aggressive`] — `loom-clean --aggressive`'s vestigial-worktree decision tree.
-//! - [`landed`] — the shared three-way "has this branch landed on the default
-//!   branch?" answer (#7812), the daemon-side twin of
-//!   `defaults/scripts/lib/branch-landed.sh`; `aggressive` consumes it instead
-//!   of its own raw-reachability heuristic.
+//! - [`landed`] — `aggressive`'s three-way view (#7812) of the one shared
+//!   "has this branch landed on the default branch?" ladder,
+//!   [`crate::worktree_cli::branch_landed`] (converged in #8470); `aggressive`
+//!   consumes it instead of its own raw-reachability heuristic.
 //! - [`orphan_recovery`] — `loom-recover-orphans`.
 //! - [`logs`] — `loom-cleanup logs` (the only cleanup.py functionality that
 //!   survived the daemon-brain retirement, #3396).

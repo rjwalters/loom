@@ -181,6 +181,63 @@ pub fn last_launch_runtime(contents: &str) -> Option<RuntimeAttribution> {
     parse_launch_runtime(crate::api_keys_pool::ingest::last_launch_record_body(contents)?)
 }
 
+/// The marker `worker_spawn::run` writes for EVERY runtime it dispatches —
+/// native harness and legacy `spawn-<runtime>.sh` adapter alike — immediately
+/// before handing off (Issue #8594).
+///
+/// Unlike [`LAUNCH_RECORD_MARKER`], which only a native harness writes, this
+/// one is unconditional. It carries no provider, profile or credential
+/// attribution: just the resolved runtime id. That is exactly why it is not a
+/// substitute for the launch record and is used for one narrow purpose only —
+/// see [`last_resolved_runtime`].
+///
+/// `sweep_registry::crash_signals::RUNTIME_LOG_MARKER` spells the same line.
+/// Deliberately not shared: that one is `pub(crate)` to a module whose reader
+/// is region-scoped (it answers "which runtime ran in *this* dispatch block",
+/// searching forward from a header anchor), while this one is whole-log and
+/// line-anchored. Two different questions about one line; collapsing them
+/// would hand each caller the other's scoping rule.
+pub const RUNTIME_RESOLVED_MARKER: &str = "# LOOM_RUNTIME_RESOLVED runtime=";
+
+/// The runtime id of the LAST [`RUNTIME_RESOLVED_MARKER`] line in `contents`
+/// (Issue #8594).
+///
+/// # Why this exists alongside [`last_launch_runtime`]
+///
+/// A legacy-adapter launch (`spawn-codex.sh`, `spawn-claude.sh`, …) writes no
+/// `# LOOM_LAUNCH` record at all, so [`last_launch_runtime`] answers `None`
+/// for it — correctly, since none of the *record's* fields exist. But some of
+/// those runtimes do keep an on-disk usage store of their own (Codex's rollout
+/// tree, [`crate::codex_usage`]), and reading it requires knowing which
+/// runtime ran. That single fact IS recorded, by this marker.
+///
+/// **Not a fallback for the published labels.** It names a runtime and nothing
+/// else, and #8507's omission contract is that a launch which wrote no record
+/// publishes no `runtime`/`provider`/`profile` label rather than a partly
+/// fabricated one. The one consumer is
+/// [`crate::usage_source::usage_runtime_fallback`], which additionally
+/// discards any value that would not change the store being read — so a
+/// Claude launch (whose marker says `claude`, and whose store is the Claude
+/// transcripts either way) is left byte-identical.
+///
+/// Line-anchored, matching [`parse_launch_credential_after`]'s discipline
+/// (#8611): a candidate must *start with* the marker after trimming, so a log
+/// line that merely mentions it mid-line — an agent transcript echoing this
+/// very doc comment — can never be read as a launch.
+#[must_use]
+pub fn last_resolved_runtime(contents: &str) -> Option<String> {
+    contents.lines().rev().find_map(|line| {
+        line.trim()
+            .strip_prefix(RUNTIME_RESOLVED_MARKER)
+            .map(str::trim)
+            // The marker line continues with nothing today, but a future
+            // `runtime=x foo=y` shape must still yield `x`, not `x foo=y`.
+            .and_then(|rest| rest.split_whitespace().next())
+            .filter(|runtime| !runtime.is_empty())
+            .map(str::to_string)
+    })
+}
+
 /// A sweep's per-issue log path, derived from the workspace root alone
 /// (Issue #8507).
 ///
@@ -515,6 +572,52 @@ mod tests {
         assert_eq!(attribution.source, "pool");
         assert_eq!(attribution.provider.as_deref(), Some("zai"));
         assert_eq!(attribution.account.as_deref(), Some("alpha"));
+    }
+
+    /// Issue #8594: the runtime-resolved marker earns the same line-anchoring
+    /// the launch record got in #8541/#8611. A log line that merely *mentions*
+    /// the marker — an agent transcript quoting `usage_source`'s own doc
+    /// comment, which names it — must not be read as a launch, because it
+    /// would be the LAST match and would therefore win outright.
+    #[test]
+    fn a_resolved_marker_merely_mentioned_mid_line_is_never_read_as_a_launch() {
+        let log = format!(
+            "==== dispatch sweep_id=s1 ====\n{RUNTIME_RESOLVED_MARKER}codex\nagent transcript: \
+             the daemon writes \"{RUNTIME_RESOLVED_MARKER}claude\" for a Claude spawn\n"
+        );
+        assert_eq!(last_resolved_runtime(&log).as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn the_last_resolved_marker_wins_and_a_log_without_one_is_none() {
+        let log = format!(
+            "{RUNTIME_RESOLVED_MARKER}claude\nsome output\n{RUNTIME_RESOLVED_MARKER}codex\n"
+        );
+        assert_eq!(last_resolved_runtime(&log).as_deref(), Some("codex"));
+        assert_eq!(last_resolved_runtime("no marker at all\n"), None);
+        // An indented marker is still the daemon's own write (a log prefix can
+        // indent it); an empty value is not a runtime.
+        assert_eq!(
+            last_resolved_runtime(&format!("   {RUNTIME_RESOLVED_MARKER}opencode\n")).as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(last_resolved_runtime(&format!("{RUNTIME_RESOLVED_MARKER}\n")), None);
+        // A future `runtime=x foo=y` shape yields `x`, never `x foo=y`.
+        assert_eq!(
+            last_resolved_runtime(&format!("{RUNTIME_RESOLVED_MARKER}codex profile=alpha\n"))
+                .as_deref(),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn the_resolved_marker_matches_the_line_worker_spawn_actually_writes() {
+        // Pinned against the producer's own format string
+        // (`worker_spawn::mod.rs`), so a change to either side fails here
+        // rather than silently costing every Codex sweep its token numbers.
+        let runtime = "codex";
+        let produced = format!("# LOOM_RUNTIME_RESOLVED runtime={runtime}");
+        assert_eq!(last_resolved_runtime(&produced).as_deref(), Some(runtime));
     }
 
     #[test]
