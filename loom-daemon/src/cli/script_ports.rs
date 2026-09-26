@@ -162,6 +162,15 @@ pub(crate) enum ScriptPortCommand {
     /// cannot be fetched from must not block worktree creation.
     WorktreeUpstream(super::worktree_upstream::WorktreeUpstreamArgs),
 
+    /// `worktree.sh`'s staleness REFERENCE for the already-registered-worktree
+    /// fast path (#8287, ported in #8354): `origin/<branch>` whenever that ref
+    /// exists and has not already landed as a merged PR (the #5657 skip), else
+    /// `BASE_REF` as before — plus the ahead/behind counts measured against
+    /// whichever it chose. The decision that stops a `git reset --hard` onto
+    /// the base from discarding an open PR's only local trace (#8147/#8190).
+    /// Exit 0 always; one line, four tokens.
+    WorktreeStaleRef(super::worktree_stale_ref::WorktreeStaleRefArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -278,6 +287,15 @@ pub(crate) enum ScriptPortCommand {
     /// **always exit 0** — it reports, it never relabels. Not a port: brand-new
     /// logic, native from the start per the shell-language policy.
     CheckStaleBlocked(super::stale_blocked::StaleBlockedArgs),
+
+    /// Per-segment PR latency, derived live from the forge timeline (#8923):
+    /// review-queue wait, approval path, `loom:pr`→merged **split by operator
+    /// gate**, Doctor response, and verdict invalidations — plus the live queue
+    /// view with **dwell, not PR age**. `--advise` is the pre-wave advisory
+    /// form: open PRs only, warns past `--threshold-hours`, always exit 0.
+    /// Read-only; it never writes a label or a comment. Not a port: brand-new
+    /// logic, native from the start per the shell-language policy.
+    PrLatency(super::pr_latency_cmd::PrLatencyArgs),
 }
 
 impl ScriptPortCommand {
@@ -306,6 +324,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeBranchConflict(args) => args.run(),
             ScriptPortCommand::WorktreeSubmodules(args) => args.run(),
             ScriptPortCommand::WorktreeUpstream(args) => args.run(),
+            ScriptPortCommand::WorktreeStaleRef(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
@@ -321,6 +340,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
+            ScriptPortCommand::PrLatency(args) => args.run(),
         }
     }
 }
@@ -378,6 +398,16 @@ pub(crate) enum MergePrCommand {
     /// replay through its own logging (see `cli::merge_pr_delete_branch`).
     DeleteBranch(super::merge_pr_delete_branch::DeleteBranchArgs),
 
+    /// The post-merge worktree-cleanup data-loss guard (#5031, classified by
+    /// #5658): refuse a `git worktree remove --force` on a worktree that still
+    /// holds uncommitted user work, so a colliding branch name cannot destroy a
+    /// live sibling builder's edits. Reads `git status --porcelain` on stdin.
+    /// Exit 0 + sentinel = no user work (removal may proceed), 1 = refuse (the
+    /// refusal arrives as `LEVEL<TAB>message` lines to replay), 2 = the
+    /// worktree's state could not be read, which the caller must ALSO treat as
+    /// a refusal.
+    DirtyGuard(super::merge_pr_dirty_guard::DirtyGuardArgs),
+
     /// Decide ONE zero-row check-runs poll of `--auto`'s settle wait (#9091):
     /// settle now, keep waiting, or report the whole wait spent. Bounded only
     /// when the base branch requires no status-check contexts; a lookup that
@@ -396,6 +426,7 @@ impl MergePrCommand {
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::HoldState(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
+            MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
         }
     }
