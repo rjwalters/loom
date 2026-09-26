@@ -142,14 +142,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$TITLE" ]]; then
-  echo "create-pr.sh: --title is required" >&2
-  exit 2
-fi
+[[ -n "$TITLE" ]] || { echo "create-pr.sh: --title is required" >&2; exit 2; }
 
-if [[ -n "$BODY_FILE" ]] && [[ "$HAVE_BODY" == "true" ]]; then
-  echo "create-pr.sh: --body and --body-file are mutually exclusive" >&2
-  exit 2
+if [[ -n "$BODY_FILE" && "$HAVE_BODY" == "true" ]]; then
+  echo "create-pr.sh: --body and --body-file are mutually exclusive" >&2; exit 2
 fi
 
 if [[ -n "$BODY_FILE" ]]; then
@@ -280,6 +276,17 @@ redundant." >&2
       exit 1
     fi
   fi
+fi
+
+# --- Provenance record (#9027, harness-ops D33) ------------------------------
+#
+# Append ONE hidden `<!-- loom:provenance v1 ... -->` line to the body. Its
+# fields and format are `loom-daemon provenance pr-marker`'s (no format logic
+# lives here); a body that already carries a record (a re-run) is left alone.
+# With no daemon that knows the subcommand the record is still written, every
+# field the literal `unknown` -- D33 forbids omitting it.
+if [[ "$BODY" != *"<!-- loom:provenance "* ]] && source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"; then
+  BODY+=$'\n\n'"$("$(loom_resolve_self_daemon_bin 2>/dev/null)" provenance pr-marker ${CLOSES_ISSUE:+--issue "$CLOSES_ISSUE"} ${BASE_BRANCH:+--base-ref "origin/$BASE_BRANCH"} 2>/dev/null || echo '<!-- loom:provenance v1 build=unknown prompts=unknown sweep=unknown story=unknown trace=unknown host=unknown base=unknown -->')"
 fi
 
 # --- Create -----------------------------------------------------------------

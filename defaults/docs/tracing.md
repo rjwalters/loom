@@ -11,13 +11,17 @@ as described in [observability](observability.md).
 Every new execution receives a random nonzero 64-bit root span ID. An issue
 number never identifies an execution: retries and restarts of one issue are
 distinct executions. An issue sweep's trace ID, however, is its issue's **story
-trace** (#9037): trace ID and story root span ID are SHA-256-derived from the
-lowercased `owner/repo` (the checkout's GitHub `origin`) and the issue number,
-so every sweep of the issue, on any host, lands in one trace, parented to the
-story root and tagged `loom.issue`, `loom.repo` and `loom.story_id`. The story
-root span itself is emitted when the story ends (a later phase of #9037); until
-then backends show it as a missing parent. Executions outside an issue, or in a
-checkout with no GitHub `origin`, get a random trace ID. Before an owned sweep process is
+trace** (#9037), keyed per harness-ops D32 v1 (#9068): trace ID and story root
+span ID are SHA-256-derived from `loom-story/v1:github:<repo_id>:<issue>`, where
+`repo_id` is GitHub's numeric id for the checkout's `origin` (resolved once per
+repo and cached), so every sweep of the issue, on any host and across renames,
+lands in one trace, parented to the story root and tagged `loom.issue`,
+`loom.repo`, `loom.story_id`, `loom.story` (`owner/repo#n`) and
+`loom.story.key_version` (`v1`). The story root span itself is emitted when the
+story ends (a later phase of #9037); until then backends show it as a missing
+parent. Executions outside an issue, in a checkout with no GitHub `origin`, or
+whose `repo_id` cannot be resolved (warned once per repo) get a random trace
+ID — never a name-derived one. Before an owned sweep process is
 spawned, Loom persists its root identity under `.loom/logs/trace-context/` and
 passes `LOOM_TRACEPARENT` plus `LOOM_TRACE_CONTEXT_FILE` to that child. Reopening
 the same execution after a daemon restart reuses its identity. A new attempt

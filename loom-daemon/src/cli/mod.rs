@@ -43,6 +43,7 @@ pub(crate) mod opencode_usage_cli;
 pub(crate) mod peer_claims_cmd;
 pub(crate) mod pi_usage_cli;
 pub(crate) mod premise_check;
+pub(crate) mod provenance;
 pub(crate) mod quarantine;
 pub(crate) mod ready_queue_cmd;
 pub(crate) mod reconcile_stack;

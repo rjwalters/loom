@@ -215,6 +215,7 @@ pub mod pipeline_snapshot;
 pub mod premise_check;
 pub mod primary_checkout_reaper;
 pub mod proc_exec;
+pub mod provenance;
 pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;
 pub mod ram_headroom;

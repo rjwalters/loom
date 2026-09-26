@@ -114,6 +114,8 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.repo.visibility"
                     | "loom.sweep_id"
                     | "loom.story_id"
+                    | "loom.story"
+                    | "loom.story.key_version"
                     | "loom.issue"
                     | "loom.pr_number"
                     | "loom.role"

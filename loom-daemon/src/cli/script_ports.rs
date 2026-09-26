@@ -136,6 +136,10 @@ pub(crate) enum ScriptPortCommand {
     /// the predicate holds, 1 when it does not — an answer, not an error.
     #[command(subcommand)]
     RetryClassify(super::retry_classify::RetryClassifyCommand),
+    /// Provenance stamps (#9027, D33): commit trailers, the `commit-msg`
+    /// stamper and the PR-body `loom:provenance` marker.
+    #[command(subcommand)]
+    Provenance(super::provenance::ProvenanceCommand),
     /// Host-side autonomy-loss detector (#8086), backing
     /// `loom-daemon-watchdog.sh`. Run by a launchd/systemd timer on a
     /// `StartInterval` cadence, so it owns no long-lived process.
@@ -260,6 +264,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeReset(args) => args.run(),
             ScriptPortCommand::WorktreeBranchConflict(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
+            ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),

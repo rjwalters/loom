@@ -8,7 +8,9 @@ mod story;
 
 pub use context::{derived_hex, SpanId, TraceContext, TraceId};
 pub use span::{SpanEvent, SpanLink, SpanName, SpanRecord, SpanStatus, TraceAttributes};
-pub use story::story_context;
+pub use story::{
+    story_context, story_input, story_span_id, StoryIdError, STORY_KEY_VERSION, STORY_SPAN_KINDS,
+};
 
 #[cfg(test)]
 mod tests;
