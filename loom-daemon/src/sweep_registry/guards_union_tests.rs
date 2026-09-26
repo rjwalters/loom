@@ -45,6 +45,65 @@ fn empty_graphql_consults_timeline_union() {
     }
 }
 
+/// Like [`empty_graphql_registry`], but the timeline candidate's body merely
+/// **mentions** the issue instead of claiming a slice of it — the #8940 shape:
+/// PR #8314 said "filed #8322 to track it, standing down without pushing",
+/// which GitHub recorded as a `cross-referenced` event and the pre-fix guard
+/// read as a linked PR, starving #8322 for 6.5 days.
+fn bare_mention_registry(ws: &Path, pr: &str) -> (SweepRegistry, PathBuf) {
+    let (reg, log) = empty_graphql_registry(ws, pr, 0);
+    let fake = ws.join("fake-gh.sh");
+    let script = std::fs::read_to_string(&fake).unwrap();
+    let confirmed = r#""body":"Part of #%s""#;
+    assert!(script.contains(confirmed), "{script}");
+    let bare = confirmed.replace("Part of #", "filed #");
+    std::fs::write(fake, script.replace(confirmed, &bare)).unwrap();
+    (reg, log)
+}
+
+/// AC (#8940): a bare `#N` mention from an open PR is NOT a linked PR, so the
+/// union answers a verified `NoneOpen` and dispatch proceeds. The same fixture
+/// with the `Part of #N` phrase intact still answers `Open` — the divergence
+/// between the two probes was exactly one phrase filter wide.
+#[test]
+fn a_bare_mention_does_not_count_as_an_open_linked_pr() {
+    let dir = tempdir().unwrap();
+    let (reg, _log) = bare_mention_registry(dir.path(), "8314");
+    assert_eq!(
+        reg.probe_open_linked_pr_transports(8322),
+        OpenPrProbe::NoneOpen,
+        "an open PR that merely mentions #8322 must not refuse its dispatch (#8940)"
+    );
+
+    let dir = tempdir().unwrap();
+    let (reg, _log) = empty_graphql_registry(dir.path(), "8314", 0);
+    assert_eq!(
+        reg.probe_open_linked_pr_transports(8322),
+        OpenPrProbe::Open(8314),
+        "a `Part of #8322` phase PR must still refuse dispatch (#7757/#7859/#8116)"
+    );
+}
+
+/// AC (#8940): the bare-mention verdict is a *dispatch*-level all-clear, not
+/// merely a probe-level one — `dispatch()` must run rather than raise
+/// [`OpenPrDispatchError`], which is the permanent starvation this issue fixes.
+#[test]
+#[serial]
+fn a_bare_mention_does_not_refuse_dispatch() {
+    let dir = tempdir().unwrap();
+    let (mut reg, _log) = bare_mention_registry(dir.path(), "8314");
+    let outcome = reg.dispatch(&SweepKind::Issue(8322), None, None, None, None);
+    if let Err(err) = &outcome {
+        assert!(
+            err.downcast_ref::<OpenPrDispatchError>().is_none(),
+            "a bare mention must not refuse dispatch (#8940): {err}"
+        );
+    }
+    if let Ok(out) = outcome {
+        wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS);
+    }
+}
+
 #[test]
 #[serial]
 fn nonclosing_pr_refuses_dispatch_before_label_mutation() {
