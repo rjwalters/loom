@@ -98,6 +98,7 @@ impl ArmedTrigger {
             target: target.map(str::to_string),
             pending: true,
             then_exit: false,
+            refusals: 1,
         })
     }
 }
@@ -225,6 +226,7 @@ fn test_run_tick_never_supersedes_a_first_attempt_drain() {
         target: Some("v0.19.24@aaaa".to_string()),
         pending: false,
         then_exit: false,
+        refusals: 0,
     });
     let status = AutoUpdateStatus::new(true);
     let tmp = tempfile::tempdir().unwrap();
@@ -250,6 +252,7 @@ fn test_run_tick_never_supersedes_a_teardown_drain() {
         target: Some("v0.19.24@aaaa".to_string()),
         pending: true,
         then_exit: true,
+        refusals: 1,
     });
     let status = AutoUpdateStatus::new(true);
     let tmp = tempfile::tempdir().unwrap();

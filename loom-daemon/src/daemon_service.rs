@@ -1978,15 +1978,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `event_bus` is moved into `IpcServer::new` below.
     let auto_update_config = auto_update::read_auto_update_config(&sweep_workspace);
     let _auto_update_handle = if auto_update::resolve_enabled(&auto_update_config) {
-        let interval = auto_update::resolve_interval(&auto_update_config);
-        let settle = auto_update::resolve_settle(&auto_update_config);
-        let defer_deadline = auto_update::resolve_defer_deadline(&auto_update_config);
-        log::info!(
-            "auto_update: enabled (interval={}s, settle={}s, deferDeadline={}s)",
-            interval.as_secs(),
-            settle.as_secs(),
-            defer_deadline.as_secs()
-        );
+        let tuning = auto_update::TickTuning::resolve(&auto_update_config);
+        log::info!("auto_update: enabled ({})", tuning.describe());
         let probe = auto_update::ScriptAutoUpdateProbe::new(
             workspace_pool.clone(),
             sweep_workspace.clone(),
@@ -1999,14 +1992,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
             tokio::runtime::Handle::current(),
         );
         let status = std::sync::Arc::new(auto_update::AutoUpdateStatus::new(true));
-        Some(auto_update::spawn_auto_update_task(
-            probe,
-            trigger,
-            status,
-            interval,
-            settle,
-            defer_deadline,
-        ))
+        Some(auto_update::spawn_auto_update_task(probe, trigger, status, tuning))
     } else {
         log::debug!(
             "auto_update: disabled (set LOOM_AUTO_UPDATE=1 or autonomous.autoUpdate.enabled=true to opt in)"

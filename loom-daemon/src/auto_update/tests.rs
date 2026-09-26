@@ -85,7 +85,7 @@ fn test_config_reads_all_fields() {
     let tmp = tempfile::tempdir().unwrap();
     write_config(
         tmp.path(),
-        r#"{"autonomous": {"autoUpdate": {"enabled": true, "intervalSecs": 120, "settleSecs": 30, "deferDeadlineSecs": 7200}}}"#,
+        r#"{"autonomous": {"autoUpdate": {"enabled": true, "intervalSecs": 120, "settleSecs": 30, "deferDeadlineSecs": 7200, "rollStallDeadlines": 5}}}"#,
     );
     assert_eq!(
         read_auto_update_config(tmp.path()),
@@ -94,6 +94,7 @@ fn test_config_reads_all_fields() {
             interval_secs: Some(120),
             settle_secs: Some(30),
             defer_deadline_secs: Some(7200),
+            roll_stall_deadlines: Some(5),
         }
     );
 }
@@ -207,6 +208,7 @@ fn test_resolve_interval_and_settle_precedence() {
         interval_secs: Some(300),
         settle_secs: Some(45),
         defer_deadline_secs: None,
+        roll_stall_deadlines: None,
     };
     assert_eq!(resolve_interval(&cfg), Duration::from_secs(300));
     assert_eq!(resolve_settle(&cfg), Duration::from_secs(45));
@@ -1084,6 +1086,8 @@ mod in_flight_gate;
 // already over `.loom/docs/file-size-policy.md`'s threshold, does not grow to
 // hold it. Reuses the fixtures above via `use super::*`.
 mod supersede_tick;
+// Unsatisfiable-drain detection (#8998) — same reason, same fixtures.
+mod roll_stall;
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
