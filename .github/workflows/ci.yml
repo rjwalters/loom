@@ -170,7 +170,7 @@ jobs:
       - run: cargo check --workspace --all-targets
 
   backend-tests:
-    name: Rust Unit Tests (${{ matrix.partition }}/3)
+    name: Rust Unit Tests (${{ matrix.partition }}/5)
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     # Partitioned three ways (#9065). Running ~9,500 tests one-process-each is
@@ -184,7 +184,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2, 3]
+        partition: [1, 2, 3, 4, 5]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -204,8 +204,8 @@ jobs:
       # `daemon-integration` test group in `.config/nextest.toml` -- within a
       # leg, and trivially across legs, which are separate hosts.
       - uses: taiki-e/install-action@nextest
-      - name: Run tests (process-per-test, partition ${{ matrix.partition }}/3)
-        run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/3
+      - name: Run tests (process-per-test, partition ${{ matrix.partition }}/5)
+        run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/5
 
   backend-doctests:
     name: Rust Doctests
@@ -257,7 +257,7 @@ jobs:
         run: cargo test --package loom-daemon --features otlp --test cycle_time_clickhouse -- --ignored --nocapture
 
   backend-otlp-tests:
-    name: Rust OTLP Feature Tests (${{ matrix.partition }}/3)
+    name: Rust OTLP Feature Tests (${{ matrix.partition }}/5)
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     # The whole loom-daemon suite with `--features otlp`, partitioned three
@@ -266,7 +266,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2, 3]
+        partition: [1, 2, 3, 4, 5]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -274,8 +274,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - name: Run tests (otlp feature, partition ${{ matrix.partition }}/3)
-        run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/3
+      - name: Run tests (otlp feature, partition ${{ matrix.partition }}/5)
+        run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/5
 
   mcp-build:
     name: MCP Server Build
