@@ -49,22 +49,41 @@
 //! plan calls out. A wrapper that genuinely does not care can still write
 //! `|| exit 0`.
 //!
-//! # This is a gate CHECK, not an arm
+//! `--disarm` (#8901) is a separate mode entirely — it skips gate evaluation,
+//! removes any durable shell-arm record for `job_name`, and always exits `0`
+//! (idempotent: disarming an already-absent record is not an error).
+//!
+//! # `evaluate()` is a gate CHECK, not an arm — `run()` is both (#8901)
 //!
 //! [`loom_daemon::fleet_captain::arm_singleton_job`] maintains a
 //! **process-lifetime** armed registry, sampled into
 //! `HostHealthRecord::armed_singleton_jobs`. A CLI invocation is its own
-//! process that exits immediately, so recording an arm there would be
-//! written and lost in the same breath. This subcommand therefore resolves
-//! the gate ([`loom_daemon::fleet_captain::resolve_gate_for_root`]) without
-//! touching the registry — the fail-closed decision, which is the part a
-//! wrapper needs, with no misleading telemetry side effect. Reporting
-//! shell-driven arms in `host.health` needs a durable cross-process registry
-//! and is tracked as follow-up work (#8901), not silently half-done here.
+//! process that exits immediately, so recording an arm THERE would be
+//! written and lost in the same breath — [`evaluate`] therefore stays a pure
+//! read ([`loom_daemon::fleet_captain::resolve_gate_for_root`], no registry
+//! write of any kind), and the `evaluating_does_not_touch_the_armed_registry`
+//! test below pins that.
+//!
+//! [`FleetCaptainArgs::run`] is the layer above it that closes the gap: on
+//! the **armed** path it also calls
+//! [`loom_daemon::fleet_captain::record_shell_arm`], the durable,
+//! cross-process registry under `.loom/state/fleet-captain/armed.json` that
+//! `sample_host_health` merges into `armed_singleton_jobs` alongside the
+//! in-daemon one — see [`loom_daemon::fleet_captain`]'s module doc, "Two arm
+//! registries" / "Staleness policy", for why this is durable (survives past
+//! this process's exit) rather than process-lifetime, and how a stale entry
+//! stops being reported without any action from the wrapper.
+//!
+//! `--disarm` is the optional precision companion: it removes any durable
+//! arm for `job_name` on this host immediately, for a wrapper that wants to
+//! clear its entry at its own teardown rather than waiting out the TTL. It
+//! does not evaluate the gate at all — teardown does not care who the
+//! captain is right now.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use chrono::Utc;
 
 use loom_daemon::fleet_captain::{resolve_gate_for_root, CaptainGate};
 
@@ -99,6 +118,16 @@ pub(crate) struct FleetCaptainArgs {
     /// a silent refusal is how a singleton goes missing fleet-wide unnoticed.
     #[arg(long)]
     pub quiet: bool,
+
+    /// Remove any durable shell-arm record for `job_name` on this host and
+    /// exit 0 unconditionally (idempotent — removing an absent record is not
+    /// an error), instead of evaluating the gate (#8901). The precision
+    /// companion to the TTL: a wrapper that calls this at its own teardown
+    /// clears its entry immediately rather than waiting out
+    /// `fleet.captainArmTtlSecs`. Never required for correctness — the TTL
+    /// alone already guarantees no entry survives forever.
+    #[arg(long)]
+    pub disarm: bool,
 }
 
 /// The exit code for `gate`, per the module doc's contract.
@@ -113,10 +142,29 @@ pub(crate) fn exit_code(gate: &CaptainGate) -> i32 {
 
 /// Resolve the gate for `root`/`host_id` and render it — factored out of
 /// [`FleetCaptainArgs::run`] so it is testable without `std::process::exit`.
-/// Returns `(exit_code, message)`.
+/// Returns `(exit_code, message)`. **Pure**: never touches either arm
+/// registry (see the module doc) — [`evaluate_and_record`] is the layer that
+/// does.
 pub(crate) fn evaluate(root: &Path, host_id: &str, job_name: &str) -> (i32, String) {
     let gate = resolve_gate_for_root(root, host_id);
     (exit_code(&gate), gate.message(job_name))
+}
+
+/// [`evaluate`], plus — on the **armed** path only — a durable shell-arm
+/// record via [`loom_daemon::fleet_captain::record_shell_arm`] (#8901).
+/// Factored out of [`FleetCaptainArgs::run`] so the recording behavior is
+/// testable without `std::process::exit`. A record-write failure is logged
+/// to the returned message but never changes the exit code: the gate outcome
+/// (is this host the captain) and the observability side-channel are
+/// independent facts.
+pub(crate) fn evaluate_and_record(root: &Path, host_id: &str, job_name: &str) -> (i32, String) {
+    let (code, mut message) = evaluate(root, host_id, job_name);
+    if code == 0 {
+        if let Err(e) = loom_daemon::fleet_captain::record_shell_arm(root, job_name, Utc::now()) {
+            message = format!("{message} (durable arm record failed: {e})");
+        }
+    }
+    (code, message)
 }
 
 impl FleetCaptainArgs {
@@ -131,11 +179,25 @@ impl FleetCaptainArgs {
                 }
             },
         };
+
+        if self.disarm {
+            if let Err(e) = loom_daemon::fleet_captain::forget_shell_arm(&root, &self.job_name) {
+                eprintln!("fleet-captain: failed to disarm '{}': {e}", self.job_name);
+                std::process::exit(EX_USAGE);
+            }
+            if !self.quiet {
+                eprintln!("fleet-captain: disarmed '{}' on this host (#8901).", self.job_name);
+            }
+            std::process::exit(0);
+        }
+
         let host_id = self
             .host_id
             .unwrap_or_else(loom_daemon::sweep_registry::host_identity);
 
-        let (code, message) = evaluate(&root, &host_id, &self.job_name);
+        // Durable, cross-process arm on the ARMED path (#8901) — see the
+        // module doc's "`evaluate()` is a gate CHECK, not an arm" section.
+        let (code, message) = evaluate_and_record(&root, &host_id, &self.job_name);
         if code != 0 || !self.quiet {
             eprintln!("{message}");
         }
@@ -211,6 +273,48 @@ mod tests {
             !loom_daemon::fleet_captain::armed_singleton_job_names().contains(&job),
             "a CLI gate check must not record an arm"
         );
+        // #8901: `evaluate()` must not touch the DURABLE registry either —
+        // only `evaluate_and_record` (called from `run()`) does that.
+        assert!(
+            loom_daemon::fleet_captain::shell_armed_job_names(
+                dir.path(),
+                chrono::Utc::now(),
+                std::time::Duration::from_secs(3600),
+            )
+            .is_empty(),
+            "a pure gate check must not record a durable arm either"
+        );
+    }
+
+    #[test]
+    fn evaluate_and_record_writes_a_durable_arm_on_the_armed_path_only() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"fleet": {"captain": "loom-worker-1"}}"#);
+        let job = format!("durable-arm-test-{}", std::process::id());
+
+        // Refused: no durable arm recorded.
+        let (code, _) = evaluate_and_record(dir.path(), "loom-worker-2", &job);
+        assert_eq!(code, EX_NOT_CAPTAIN);
+        assert!(loom_daemon::fleet_captain::shell_armed_job_names(
+            dir.path(),
+            chrono::Utc::now(),
+            std::time::Duration::from_secs(3600),
+        )
+        .is_empty());
+
+        // Armed: recorded, and readable back immediately (same process here,
+        // but the registry is file-backed so a separate process would see it
+        // too — see `fleet_captain::tests::shell_arm_written_by_one_call_is_read_back_by_another`).
+        let (code, _) = evaluate_and_record(dir.path(), "loom-worker-1", &job);
+        assert_eq!(code, 0);
+        assert!(loom_daemon::fleet_captain::shell_armed_job_names(
+            dir.path(),
+            chrono::Utc::now(),
+            std::time::Duration::from_secs(3600),
+        )
+        .contains(&job));
+
+        loom_daemon::fleet_captain::forget_shell_arm(dir.path(), &job).unwrap();
     }
 
     #[test]

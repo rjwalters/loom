@@ -77,10 +77,69 @@
 //! [`crate::telemetry::HostHealthRecord::is_captain`] — see
 //! [`CaptainGate::is_captain_flag`] for why that field is three-valued
 //! (`None`/`Some(false)`/`Some(true)`), not a bare `bool`.
+//!
+//! # Two arm registries (#8901)
+//!
+//! [`arm_singleton_job`]'s registry is **process-lifetime**: correct for a
+//! job ticking *inside* the daemon (see [`crate::ci_telemetry`]'s poller, the
+//! first real consumer), but a `loom-daemon fleet-captain <job>` invocation
+//! from a shell wrapper is its own short-lived process that exits
+//! immediately — recording an arm in a process-lifetime registry there would
+//! be written and lost in the same breath, which is why `cli/fleet_captain_cmd.rs`'s
+//! gate *check* deliberately never touches it.
+//!
+//! [`record_shell_arm`] is the durable, cross-process half that closes that
+//! gap: a JSON file under `<root>/.loom/state/fleet-captain/armed.json`
+//! (never git-tracked — same per-host-runtime-state class as
+//! `.loom/state/ci-telemetry/`), keyed by job name, holding only
+//! `last_armed_at`. The CLI's `run()` writes it after a successful (`Armed`)
+//! gate check; [`shell_armed_job_names`] is the read side
+//! [`armed_singleton_job_names_for_host`] merges into `host.health` alongside
+//! the in-process registry.
+//!
+//! ## Staleness policy (the "Pick one deliberately" decision, #8901)
+//!
+//! A durable arm record left forever would go stale the moment its wrapper is
+//! uninstalled or the host is retired — a permanently-stuck "armed" entry
+//! that makes the dashboard's "singleton armed on a non-captain host" flag
+//! cry wolf on every peer host from then on, which the issue that added this
+//! registry calls out as *worse* than the honest empty list this replaces.
+//! Three policies were on the table:
+//!
+//! 1. **A TTL derived from the job's own declared cadence.** Most precise,
+//!    but requires every singleton job to declare a cadence somewhere (no
+//!    such registry exists today), and a wrapper's timer definition already
+//!    lives outside this repo (systemd/launchd/cron) — duplicating it here
+//!    would be a second source of truth that drifts from the first.
+//! 2. **A fixed, conservative TTL** ([`crate::config_resolver::DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS`],
+//!    overridable via `fleet.captainArmTtlSecs`) — refreshed on every
+//!    successful arm, so a live wrapper never flickers stale between its own
+//!    ticks, and an uninstalled one self-heals within one TTL window with no
+//!    action required.
+//! 3. **An explicit `disarm` verb** the wrapper calls at its own teardown —
+//!    precise timing, but *silently wrong* the moment a host is re-imaged or
+//!    a wrapper is removed by deleting its timer unit rather than running it
+//!    one last time to disarm — exactly the permanently-stuck-entry failure
+//!    mode this exists to avoid.
+//!
+//! **Chosen: (2) as the safety net, with (3) offered as an optional
+//! precision layer on top** (`loom-daemon fleet-captain <job> --disarm`,
+//! [`forget_shell_arm`]). The TTL alone already guarantees no entry can be
+//! stuck forever — the property #8901 asks for explicitly — and needs no new
+//! per-job declaration; the disarm verb is free to add and lets a
+//! well-behaved wrapper clear its entry immediately instead of waiting out
+//! the TTL, without weakening the guarantee if it never calls it. (1) is left
+//! as a possible future refinement once a job-cadence registry exists for
+//! another reason.
 
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Outcome of gating a declared singleton job against this host's identity —
 /// see the module doc's "Fail-closed semantics" for the contract each
@@ -257,6 +316,125 @@ pub fn arm_singleton_job(job_name: &str, root: &Path, current_host_id: &str) -> 
     }
 }
 
+// ============================================================================
+// Durable shell-arm registry (cross-process, for host.health) — #8901
+// ============================================================================
+
+/// One durable shell-arm record: when a `loom-daemon fleet-captain <job>`
+/// invocation on this host most recently resolved `CaptainGate::Armed`. No
+/// other fields — the registry is deliberately minimal, since staleness is
+/// judged purely on recency (see the module doc's "Staleness policy").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ShellArmEntry {
+    last_armed_at: DateTime<Utc>,
+}
+
+/// Job name -> its most recent shell-driven arm. Never git-tracked (see
+/// [`shell_arm_registry_path`]'s doc) and per-host by construction — each
+/// host's `.loom/state/` is its own local runtime directory, not synced.
+type ShellArmRegistry = BTreeMap<String, ShellArmEntry>;
+
+/// `<root>/.loom/state/fleet-captain/armed.json` — durable, per-host, never
+/// git-tracked (added to `EPHEMERAL_PATTERNS` in `init/post_init.rs`
+/// alongside its `ci-telemetry` sibling): committing one host's arm state
+/// would hand it to every other host as a false starting fact.
+fn shell_arm_registry_path(root: &Path) -> PathBuf {
+    root.join(".loom")
+        .join("state")
+        .join("fleet-captain")
+        .join("armed.json")
+}
+
+fn load_shell_arm_registry(root: &Path) -> ShellArmRegistry {
+    std::fs::read_to_string(shell_arm_registry_path(root))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Atomic JSON write: temp file (pid-suffixed, so two concurrent writers on
+/// the same host never collide on the temp name) + fsync + rename — same
+/// pattern as `ci_telemetry::state`'s `save_json`.
+fn save_shell_arm_registry(root: &Path, registry: &ShellArmRegistry) -> io::Result<()> {
+    let path = shell_arm_registry_path(root);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text = serde_json::to_string_pretty(registry).map_err(io::Error::other)?;
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temp, &path)
+}
+
+/// Record (or refresh) a durable shell-driven arm for `job_name` on this
+/// host, called by `cli/fleet_captain_cmd.rs`'s `run()` after a successful
+/// (`Armed`) gate check — never by `evaluate()`, which stays a pure read (see
+/// its own doc and the `evaluating_does_not_touch_the_armed_registry`-style
+/// tests). Re-arming an already-armed job overwrites its `last_armed_at`
+/// rather than adding a second entry — the registry is keyed by job name, so
+/// "refresh, don't duplicate" is a property of the data shape, not extra
+/// logic.
+pub fn record_shell_arm(root: &Path, job_name: &str, now: DateTime<Utc>) -> io::Result<()> {
+    let mut registry = load_shell_arm_registry(root);
+    registry.insert(job_name.to_string(), ShellArmEntry { last_armed_at: now });
+    save_shell_arm_registry(root, &registry)
+}
+
+/// Remove any durable shell-arm record for `job_name` on this host,
+/// idempotently — the explicit-disarm precision option
+/// (`loom-daemon fleet-captain <job> --disarm`) a well-behaved wrapper may
+/// call at its own teardown. Never required for correctness: the TTL in
+/// [`shell_armed_job_names`] already guarantees no entry survives forever
+/// even if this is never called.
+pub fn forget_shell_arm(root: &Path, job_name: &str) -> io::Result<()> {
+    let mut registry = load_shell_arm_registry(root);
+    if registry.remove(job_name).is_some() {
+        save_shell_arm_registry(root, &registry)
+    } else {
+        Ok(())
+    }
+}
+
+/// Shell-driven job names armed on this host and not yet stale as of `now`,
+/// per the `ttl` window (see the module doc's "Staleness policy" for why a
+/// fixed TTL was chosen). A record whose `last_armed_at` is in the future
+/// (clock skew) is treated as fresh rather than discarded — the same
+/// "unknown/odd reads as not-yet-a-problem" posture the rest of this crate's
+/// health sampling uses for an unmeasurable signal.
+#[must_use]
+pub fn shell_armed_job_names(root: &Path, now: DateTime<Utc>, ttl: Duration) -> Vec<String> {
+    let ttl_secs = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
+    load_shell_arm_registry(root)
+        .into_iter()
+        .filter(|(_, entry)| {
+            now.signed_duration_since(entry.last_armed_at).num_seconds() <= ttl_secs
+        })
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Every singleton job name currently armed on this host, merging the
+/// in-process registry ([`armed_singleton_job_names`], in-daemon jobs like
+/// [`crate::ci_telemetry`]'s poller) with the durable shell-arm registry
+/// ([`shell_armed_job_names`], not yet stale per `root`'s
+/// `fleet.captainArmTtlSecs`) — the single source
+/// [`crate::observability::collector::sample_host_health`] samples into
+/// [`crate::telemetry::HostHealthRecord::armed_singleton_jobs`]. Sorted and
+/// deduped (a job could in principle be armed both ways, though that would be
+/// an unusual deployment).
+#[must_use]
+pub fn armed_singleton_job_names_for_host(root: &Path) -> Vec<String> {
+    let ttl = Duration::from_secs(crate::config_resolver::fleet_captain_arm_ttl_secs(root));
+    let mut names: BTreeSet<String> = armed_singleton_job_names().into_iter().collect();
+    names.extend(shell_armed_job_names(root, Utc::now(), ttl));
+    names.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +560,129 @@ mod tests {
         assert!(!armed_singleton_job_names().contains(&job));
 
         disarm_singleton_job(&job);
+    }
+
+    // ===== Durable shell-arm registry (#8901) =====
+
+    #[test]
+    fn shell_arm_written_by_one_call_is_read_back_by_another() {
+        // Simulates the daemon/CLI split this registry exists to close: two
+        // independent calls sharing only the filesystem, exactly like two
+        // separate `loom-daemon fleet-captain` process invocations would.
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        record_shell_arm(dir.path(), "forge-queue-check", now).unwrap();
+
+        let ttl = Duration::from_secs(3600);
+        assert_eq!(
+            shell_armed_job_names(dir.path(), now, ttl),
+            vec!["forge-queue-check".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_stale_shell_arm_stops_being_reported() {
+        let dir = tempdir().unwrap();
+        let armed_at = Utc::now();
+        record_shell_arm(dir.path(), "forge-queue-check", armed_at).unwrap();
+
+        let ttl = Duration::from_secs(3600);
+        let just_inside = armed_at + chrono::Duration::seconds(3599);
+        let just_outside = armed_at + chrono::Duration::seconds(3601);
+
+        assert_eq!(
+            shell_armed_job_names(dir.path(), just_inside, ttl),
+            vec!["forge-queue-check".to_string()],
+            "still within the TTL window"
+        );
+        assert!(
+            shell_armed_job_names(dir.path(), just_outside, ttl).is_empty(),
+            "past the TTL window must stop being reported, not linger forever"
+        );
+    }
+
+    #[test]
+    fn re_arming_refreshes_rather_than_duplicating() {
+        let dir = tempdir().unwrap();
+        let first = Utc::now();
+        record_shell_arm(dir.path(), "forge-queue-check", first).unwrap();
+        let second = first + chrono::Duration::seconds(30);
+        record_shell_arm(dir.path(), "forge-queue-check", second).unwrap();
+
+        // Only one entry — re-arming overwrote, it didn't add a sibling.
+        let registry = load_shell_arm_registry(dir.path());
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry["forge-queue-check"].last_armed_at, second);
+    }
+
+    #[test]
+    fn forget_shell_arm_removes_it_immediately_ahead_of_the_ttl() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        record_shell_arm(dir.path(), "forge-queue-check", now).unwrap();
+        assert!(!shell_armed_job_names(dir.path(), now, Duration::from_secs(3600)).is_empty());
+
+        forget_shell_arm(dir.path(), "forge-queue-check").unwrap();
+        assert!(shell_armed_job_names(dir.path(), now, Duration::from_secs(3600)).is_empty());
+
+        // Idempotent: forgetting an already-absent job is not an error.
+        assert!(forget_shell_arm(dir.path(), "forge-queue-check").is_ok());
+    }
+
+    #[test]
+    fn armed_singleton_job_names_for_host_merges_process_and_shell_registries() {
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(crate::config_resolver::LEGACY_CONFIG_REL),
+            r#"{"fleet": {"captain": "loom-worker-1"}}"#,
+        );
+        let in_process_job = format!("in-process-job-{}", std::process::id());
+        let shell_job = format!("shell-job-{}", std::process::id());
+
+        assert!(arm_singleton_job(&in_process_job, dir.path(), "loom-worker-1").is_ok());
+        record_shell_arm(dir.path(), &shell_job, Utc::now()).unwrap();
+
+        let names = armed_singleton_job_names_for_host(dir.path());
+        assert!(names.contains(&in_process_job), "{names:?}");
+        assert!(names.contains(&shell_job), "{names:?}");
+
+        disarm_singleton_job(&in_process_job);
+        forget_shell_arm(dir.path(), &shell_job).unwrap();
+    }
+
+    #[test]
+    fn armed_singleton_job_names_for_host_honors_the_configured_ttl() {
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(crate::config_resolver::LEGACY_CONFIG_REL),
+            r#"{"fleet": {"captainArmTtlSecs": 1}}"#,
+        );
+        let shell_job = format!("short-ttl-job-{}", std::process::id());
+        let ten_minutes_ago = Utc::now() - chrono::Duration::minutes(10);
+        record_shell_arm(dir.path(), &shell_job, ten_minutes_ago).unwrap();
+
+        assert!(
+            !armed_singleton_job_names_for_host(dir.path()).contains(&shell_job),
+            "a 1-second configured TTL must age this out immediately"
+        );
+    }
+
+    #[test]
+    fn armed_singleton_jobs_still_omits_when_nothing_is_armed() {
+        // The `#[serde(skip_serializing_if)]` contract on
+        // `HostHealthRecord::armed_singleton_jobs` depends on an empty `Vec`,
+        // never `None`-vs-populated confusion — this pins that the durable
+        // shell-arm side returns a plain empty `Vec` (not, say, a sentinel)
+        // for a root nothing has ever armed.
+        //
+        // Deliberately checks `shell_armed_job_names` here, not the merged
+        // `armed_singleton_job_names_for_host`: the latter also folds in
+        // [`armed_registry`], a **process-wide global** that other tests in
+        // this same binary legitimately arm/disarm concurrently (test
+        // binaries run tests in parallel threads) — asserting it is globally
+        // empty would be racy against unrelated tests, not a property of
+        // this root's own (fresh, unique-per-test) durable file.
+        let dir = tempdir().unwrap();
+        assert!(shell_armed_job_names(dir.path(), Utc::now(), Duration::from_secs(3600)).is_empty());
     }
 }

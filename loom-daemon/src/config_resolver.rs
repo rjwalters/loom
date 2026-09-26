@@ -365,6 +365,49 @@ pub fn fleet_captain(repo_root: &Path) -> Option<String> {
     }
 }
 
+const FLEET_CAPTAIN_ARM_TTL_SECS_KEY: &str = "fleet.captainArmTtlSecs";
+
+/// Env override for [`fleet_captain_arm_ttl_secs`], following the
+/// **env > config > default** precedence every other `autonomous`-adjacent
+/// numeric knob in this crate uses (e.g. `ci_telemetry::INTERVAL_SECS_ENV`).
+pub const FLEET_CAPTAIN_ARM_TTL_SECS_ENV: &str = "LOOM_FLEET_CAPTAIN_ARM_TTL_SECS";
+
+/// The staleness window (#8901) for a **durable, shell-driven** singleton
+/// arm — see [`crate::fleet_captain`]'s "Staleness policy" doc section for
+/// the full rationale. A `loom-daemon fleet-captain <job>` invocation that
+/// most recently resolved `Armed` more than this many seconds ago stops
+/// being reported in `host.health.armed_singleton_jobs`, so an uninstalled
+/// wrapper's last arm expires on its own instead of pinning a phantom
+/// "armed" entry forever.
+///
+/// Six hours: generous enough that a singleton wrapper firing hourly (or
+/// even every few hours) never flickers stale between its own ticks, but
+/// tight enough that a genuinely uninstalled wrapper clears within the same
+/// working day rather than lingering for a week. Override per-repo with
+/// `fleet.captainArmTtlSecs` for a job whose own cadence is much slower than
+/// that assumption.
+pub const DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS: u64 = 6 * 60 * 60;
+
+/// Read `fleet.captainArmTtlSecs` (env > config > default) — see
+/// [`DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS`] for the default and its rationale.
+/// A non-positive or unparsable value at any tier is ignored, falling
+/// through to the next one, same soft-fail contract as [`fleet_captain`].
+#[must_use]
+pub fn fleet_captain_arm_ttl_secs(repo_root: &Path) -> u64 {
+    if let Ok(raw) = std::env::var(FLEET_CAPTAIN_ARM_TTL_SECS_ENV) {
+        if let Ok(parsed) = raw.trim().parse::<u64>() {
+            if parsed > 0 {
+                return parsed;
+            }
+        }
+    }
+    let effective = resolve_effective_config(repo_root);
+    get_path(&effective, FLEET_CAPTAIN_ARM_TTL_SECS_KEY)
+        .and_then(Value::as_u64)
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -851,6 +894,53 @@ mod tests {
         let captain = fleet_captain(dir.path());
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
         assert_eq!(captain, Some("loom-worker-2".to_string()));
+    }
+
+    // ===== fleet_captain_arm_ttl_secs (#8901) =====
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_arm_ttl_secs_default_when_unset() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        let ttl = fleet_captain_arm_ttl_secs(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(ttl, DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_arm_ttl_secs_reads_config() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"fleet": {"captainArmTtlSecs": 900}}"#);
+        let ttl = fleet_captain_arm_ttl_secs(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(ttl, 900);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_arm_ttl_secs_zero_or_missing_falls_back_to_default() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"fleet": {"captainArmTtlSecs": 0}}"#);
+        let ttl = fleet_captain_arm_ttl_secs(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(ttl, DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_captain_arm_ttl_secs_env_override_wins() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"fleet": {"captainArmTtlSecs": 900}}"#);
+        std::env::set_var(FLEET_CAPTAIN_ARM_TTL_SECS_ENV, "60");
+        let ttl = fleet_captain_arm_ttl_secs(dir.path());
+        std::env::remove_var(FLEET_CAPTAIN_ARM_TTL_SECS_ENV);
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(ttl, 60);
     }
 
     // ===== Cross-language conformance fixture (#4039 AC) =====

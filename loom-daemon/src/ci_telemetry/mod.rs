@@ -31,15 +31,32 @@
 //! run/job reaches the journal exactly once across restarts, re-polls and
 //! re-runs. See `defaults/docs/ci-observability.md` for the full contract.
 //!
-//! # Multi-host posture
+//! # Multi-host posture: fleet-captain gated (#8901)
 //!
-//! One poller per org is the normal case. A per-host file lock
-//! ([`state::CycleLock`]) serialises the CLI and the daemon poller on one
-//! host; there is deliberately no cross-host lease (out of scope — one
-//! mechanism per behaviour). Every record carries its stable GitHub identity
-//! (`run_id` / `job_id`, and deterministic trace/span ids), so a second
-//! poller on another host produces byte-identical identities a backend can
-//! deduplicate on.
+//! One poller per org, running on exactly one host, is the goal. A per-host
+//! file lock ([`state::CycleLock`]) serialises the CLI and the daemon poller
+//! *on* one host; across hosts, [`spawn_task`]'s periodic loop is this repo's
+//! first real consumer of [`crate::fleet_captain`]'s singleton-job captain
+//! gate — a genuine "forge-wide queue check" in that module's own vocabulary,
+//! not a per-host job like the daemon watchdog. Every tick re-evaluates
+//! [`crate::fleet_captain::arm_singleton_job`] for [`SINGLETON_JOB_NAME`] and
+//! skips that cycle entirely when refused, so a `fleet.captain` edit (or a
+//! host-identity change) takes effect on the very next tick.
+//!
+//! **This changes prior behavior.** Before #8901, this poller ran on every
+//! host with `autonomous.ciTelemetry.enabled=true` unconditionally, relying
+//! on every record's stable GitHub identity (`run_id`/`job_id`, deterministic
+//! trace/span ids) for a backend to deduplicate. That safety net is still in
+//! place — it is what keeps a transient double-arm window (mid-`fleet.captain`
+//! edit) harmless rather than corrupting — but it is no longer the *primary*
+//! mechanism: **a multi-host fleet that enables `ciTelemetry` must also
+//! declare `fleet.captain` naming one host, or the poller is refused
+//! everywhere** (fail-closed, per the gate's own contract — see
+//! `defaults/docs/daemon-reference.md`'s "Fleet captain" section). This is a
+//! deliberate, accepted migration cost: the epic behind this poller (#8522)
+//! has no production fleet relying on the old duplicate-and-dedup posture
+//! yet, and duplicate polling wastes GitHub API budget for no benefit once
+//! exactly one host can be assigned.
 
 pub mod api;
 pub mod export;
@@ -52,6 +69,11 @@ pub mod state;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// The singleton-job name this poller gates itself under (#8901) — appears
+/// verbatim in `fleet_captain`'s arm/refusal messages and in
+/// `host.health.armed_singleton_jobs` once armed.
+pub const SINGLETON_JOB_NAME: &str = "ci-telemetry-poll";
 
 /// `autonomous.ciTelemetry.enabled` env override.
 pub const ENABLED_ENV: &str = "LOOM_CI_TELEMETRY_ENABLED";
@@ -366,6 +388,26 @@ pub fn spawn_task(root: PathBuf) -> Option<tokio::task::JoinHandle<()>> {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            // Fleet-captain gate (#8901): re-evaluated every tick, so a
+            // `fleet.captain` edit or a host-identity change takes effect on
+            // the very next cycle rather than requiring a daemon restart —
+            // see this module's "Multi-host posture" doc section.
+            let host_id = crate::sweep_registry::host_identity();
+            if let Err(refusal) =
+                crate::fleet_captain::arm_singleton_job(SINGLETON_JOB_NAME, &root, &host_id)
+            {
+                // `NoCaptainDeclared` is a misconfiguration worth surfacing
+                // above debug — a captain-assigned-but-not-this-host refusal
+                // is the routine, expected case on every non-captain host and
+                // would otherwise log every interval forever.
+                let gate = crate::fleet_captain::resolve_gate_for_root(&root, &host_id);
+                if matches!(gate, crate::fleet_captain::CaptainGate::NoCaptainDeclared) {
+                    log::warn!("ci_telemetry: {refusal}");
+                } else {
+                    log::debug!("ci_telemetry: {refusal}");
+                }
+                continue;
+            }
             let root = root.clone();
             let resolved = resolved.clone();
             let outcome = tokio::task::spawn_blocking(move || {

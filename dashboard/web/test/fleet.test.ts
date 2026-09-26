@@ -366,6 +366,19 @@ describe("singletonsArmedOnNonCaptain (#8848)", () => {
   it("flags a job armed when is_captain is not even reported (undefined != true)", () => {
     expect(singletonsArmedOnNonCaptain({ armed_singleton_jobs: ["edge-queue-pull"] })).toEqual(["edge-queue-pull"]);
   });
+
+  it("fires identically for a shell-driven arm, not only an in-daemon one (#8901)", () => {
+    // This function only ever reads `armed_singleton_jobs` — it has no way to
+    // tell an in-daemon `arm_singleton_job` entry apart from one the backend
+    // merged in from the durable `loom-daemon fleet-captain <job>` shell-arm
+    // registry (`fleet_captain::armed_singleton_job_names_for_host`). That is
+    // the point: once the backend reports a shell-driven arm at all, this
+    // flag fires on it exactly the same way, with no dashboard-side special
+    // case required.
+    expect(
+      singletonsArmedOnNonCaptain({ is_captain: false, armed_singleton_jobs: ["ci-telemetry-poll"] }),
+    ).toEqual(["ci-telemetry-poll"]);
+  });
 });
 
 describe("noCaptainReporting (#8848)", () => {
