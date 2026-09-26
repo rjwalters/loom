@@ -75,6 +75,14 @@ pub const DEFAULT_ORG: &str = "2amlogic";
 pub const DEFAULT_INTERVAL_SECS: u64 = 120;
 /// How far back the very first poll of a repo (no watermark yet) looks.
 pub const INITIAL_LOOKBACK_HOURS: i64 = 24;
+/// How far back **every** poll re-lists runs, regardless of the watermark
+/// (#8898). A re-run keeps its original `created_at`, so a pure
+/// `created >= watermark` floor can never list a re-attempt of a run the
+/// watermark has already passed. The trailing rescan window lists it again;
+/// the ledger's `(repo, run_id, job_id, attempt)` dedup keeps the export
+/// exactly-once. Capped by [`INITIAL_LOOKBACK_HOURS`] so the floor never
+/// reaches further back than the repo's first cycle already did.
+pub const RESCAN_WINDOW_HOURS: i64 = 24;
 
 /// Dotted path of the repo-exclusion key.
 pub const EXCLUDED_REPOS_KEY: &str = "autonomous.ciTelemetry.excludedRepos";

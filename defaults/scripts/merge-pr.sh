@@ -121,6 +121,14 @@
 #       head; a repeat block escalates to a loom:operator hold and returns
 #       exit 1 with the original refusal. Full rationale:
 #       defaults/docs/merge-pr-exit-code-exceptions.md.
+#   5 = --auto's bounded settle-wait expired before this head's checks
+#       finished (or before the check-runs API became readable) — #8896. CI
+#       simply outlasted LOOM_AUTO_MERGE_TIMEOUT: nothing merged, nothing
+#       failed, no required check went red. Same caller contract as exits 3
+#       and 4 — re-queue for a later pass, never a failure comment. Reachable
+#       on any repo whose suites outrun the default 600s (this one's `Shell
+#       Test Suites (hermetic)` alone takes ~10 minutes), and especially on
+#       the pass right after an exit-4 --redate-stale-checks re-run.
 
 set -euo pipefail
 
@@ -328,6 +336,7 @@ Precedence (highest wins):
 Exit codes:
   0 = merged (or --help)
   1 = failed
+  3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = --auto's bounded settle-wait expired before CI finished (#8896) — neither is a failure; retry later
   4 = stale required checks re-running in place (#8914) or re-dated by a push (#8508) under --redate-stale-checks — not a failure; retry later
 
 Examples:
@@ -918,7 +927,16 @@ _check_loom_pr_label() {
   fi
   if [[ $rc -eq 0 && "$ALLOW_UNAPPROVED" == "true" && "$msg" == "loom:pr guard:"* ]]; then
     warning "$msg"
-    if [[ "$DRY_RUN" != "true" ]]; then
+    # #8896: the audit comment is posted AT MOST ONCE per merge-pr.sh run. On
+    # the --auto path this guard runs twice against the same merge — once at
+    # queue time, once from _revalidate_merge_guards() after the settle-wait —
+    # and an --allow-unapproved run with no loom:pr posted the identical
+    # "Merge Proceeded Without loom:pr" comment both times. The warning above
+    # is unconditional (it is the log record, and the second evaluation is a
+    # real re-check worth logging); only the durable forge comment is deduped.
+    # The flag is set only once the comment actually LANDS, so a failed first
+    # post still leaves the post-wait re-check free to record the override.
+    if [[ "$DRY_RUN" != "true" && "${_LOOM_PR_OVERRIDE_COMMENTED:-false}" != "true" ]]; then
       local override_comment="## Merge Proceeded Without \`loom:pr\` (Override)
 
 PR #$PR_NUMBER was merged via \`merge-pr.sh --allow-unapproved\` while the \`loom:pr\` label was absent — no forge-visible Judge review signal existed for the head being merged.
@@ -930,7 +948,7 @@ The operator running this merge explicitly asserted responsibility for this over
 
 ---
 *Recorded by merge-pr.sh at $(date -u +%Y-%m-%dT%H:%M:%SZ)*"
-      forge_gh_comment_rl_safe "$REPO_NWO" "$PR_NUMBER" "$override_comment" 2>/dev/null || warning "Could not post loom:pr override audit comment on PR #$PR_NUMBER (merge proceeds anyway; the warning above is still the log record)"
+      if forge_gh_comment_rl_safe "$REPO_NWO" "$PR_NUMBER" "$override_comment" 2>/dev/null; then _LOOM_PR_OVERRIDE_COMMENTED=true; else warning "Could not post loom:pr override audit comment on PR #$PR_NUMBER (merge proceeds anyway; the warning above is still the log record)"; fi
     fi
     return 0
   fi
@@ -2050,8 +2068,22 @@ _wait_for_checks_then_sync_merge() {
         info "PR #$PR_NUMBER: check-runs API unavailable for this repo (no checks configured); proceeding to synchronous merge"
         return 0
       fi
+      # A SHORT read (#8895) is not a fetch failure: the rollup arrived, it was
+      # just a subset of the commit's check-runs (the forge's own total_count
+      # said so). forge_get_check_runs withholds it rather than let a subset
+      # look like settlement, and this loop's existing nonzero handling —
+      # re-poll, then hard-fail at the deadline — is exactly the fail-closed
+      # outcome wanted. Name it explicitly so the narration is not the
+      # misleading "could not fetch" (the helper's own stderr detail is
+      # suppressed at the callsite above). Guarded one-liner rather than an
+      # `if` block: `set -e` exempts AND-lists (see the note above
+      # _wait_for_checks_then_sync_merge's reads), and this is the same idiom
+      # the two `fetch_rc`/`observed_checks` assignments in this loop use.
+      [[ "$fetch_rc" -eq "${FORGE_CHECK_RUNS_RC_TRUNCATED:-45}" ]] && warning "PR #$PR_NUMBER: check-runs read was TRUNCATED (fewer rows than the forge's own total_count); refusing to classify a partial set, continuing to poll"
       if [[ "$(date +%s)" -ge "$deadline" ]]; then
-        error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for check-runs to become fetchable for PR #$PR_NUMBER. Re-run once the forge API is healthy, or raise LOOM_AUTO_MERGE_TIMEOUT."
+        # #8896: exit 5, not error()'s exit 1 — an unreadable check-runs API is
+        # a forge condition this run waited out, not a merge failure.
+        warning "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for check-runs to become fetchable for PR #$PR_NUMBER — exiting 5 (not merged, not a failure: re-queue). Re-run once the forge API is healthy, or raise LOOM_AUTO_MERGE_TIMEOUT."; exit 5
       fi
       warning "Failed to fetch check-runs for PR #$PR_NUMBER (rc=$fetch_rc); treating as still-pending and continuing to poll"
       sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
@@ -2079,7 +2111,7 @@ _wait_for_checks_then_sync_merge() {
       local required lookup_rc=0
       required="$(forge_get_required_status_check_contexts "$REPO_NWO" "$base_ref" "$GH")" || lookup_rc=$?
       if [[ "$lookup_rc" -ne 0 ]]; then
-        error "Failed to resolve required status checks for $base_ref (rc=$lookup_rc); refusing to merge PR #$PR_NUMBER with failing check(s) while auto-merge is disabled"
+        error "Failed to resolve required status checks for $base_ref (rc=$lookup_rc); refusing to merge PR #$PR_NUMBER with failing check(s) that cannot be classified as required or informational (fails closed)"
       fi
       local overlap
       overlap="$(comm -12 \
@@ -2099,11 +2131,16 @@ _wait_for_checks_then_sync_merge() {
     fi
 
     if [[ -n "$pending" ]]; then
-      if [[ "$(date +%s)" -ge "$deadline" ]]; then
-        local n; n="$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
-        error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for ${n} pending check(s) on PR #$PR_NUMBER to complete. Re-run once CI settles, or raise LOOM_AUTO_MERGE_TIMEOUT."
-      fi
+      # Hoisted out of both branches below (it was computed identically in
+      # each) so the #8896 comment can land without growing the file.
       local n; n="$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
+      if [[ "$(date +%s)" -ge "$deadline" ]]; then
+        # #8896: exit 5, not error()'s exit 1. CI outlasting the bounded wait is
+        # the re-queue signal exits 3/4 already carry — nothing merged, nothing
+        # failed, no required check went red — so it must not be
+        # indistinguishable from a genuine merge failure to Champion.
+        warning "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for ${n} pending check(s) on PR #$PR_NUMBER to complete — exiting 5 (not merged, not a failure: re-queue). Re-run once CI settles, or raise LOOM_AUTO_MERGE_TIMEOUT."; exit 5
+      fi
       info "PR #$PR_NUMBER: ${n} check(s) still running; waiting ${LOOM_AUTO_MERGE_POLL_INTERVAL}s for CI (timeout ${LOOM_AUTO_MERGE_TIMEOUT}s)..."
       sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
       continue
@@ -2207,7 +2244,14 @@ _revalidate_merge_guards() {
   # the check results this run validated describe a tree that is no longer the
   # head, so this is the #5579 "re-queue, not a failure" signal (exit 3), not a
   # merge we should complete against the new tree.
-  fresh_sha="$(echo "$fresh" | jq -r '.head.sha // empty')"
+  # #8896: an unusable re-read (the `|| echo '{}'` fallback above, or any
+  # payload with no head SHA in it) must SAY that. It used to fall through to
+  # the loom:pr guard, which reported the genuine-absence wording ("does not
+  # carry the `loom:pr` label") — failing closed, correctly, but sending the
+  # operator to re-review a PR whose approval was never actually read. Nothing
+  # about the verdict changes here: an unreadable response is evidence neither
+  # that loom:pr is present nor that it is absent, so the merge still refuses.
+  fresh_sha="$(echo "$fresh" | jq -r '.head.sha // empty')"; [[ -n "$fresh_sha" ]] || error "Merge blocked: could not re-read PR #$PR_NUMBER after --auto's settle-wait — the uncached re-read returned no usable payload (no head SHA), so neither the head nor the label set could be re-validated against current state. This is a forge read failure, NOT a missing \`loom:pr\` label: refusing to merge rather than treating an unreadable response as a verdict. Re-run once the forge API is healthy."
   if [[ -n "$fresh_sha" && -n "$MERGE_PRECONDITION_SHA" && "$fresh_sha" != "$MERGE_PRECONDITION_SHA" ]]; then
     error_head_moved "PR #$PR_NUMBER: head moved while --auto waited for this head's checks to settle (#8410)" \
       "$MERGE_PRECONDITION_SHA" "$fresh_sha"

@@ -1,12 +1,13 @@
-# `merge-pr.sh` exit codes 3 and 4 — the two "not a failure" outcomes
+# `merge-pr.sh` exit codes 3, 4 and 5 — the three "not a failure" outcomes
 
-`merge-pr.sh` reserves two exit codes for outcomes that look like failures to a
-naive `|| handle_failure` caller but are not: the merge did not happen, nothing
-is wrong, and the correct response is to re-queue the PR for a later pass.
+`merge-pr.sh` reserves three exit codes for outcomes that look like failures to
+a naive `|| handle_failure` caller but are not: the merge did not happen,
+nothing is wrong, and the correct response is to re-queue the PR for a later
+pass.
 
 Champion's operative handling lives in
 `.claude/commands/loom/champion-pr-merge.md` →
-"Exception: exit codes 3 and 4". This file holds the rationale, the design
+"Exception: exit codes 3, 4 and 5". This file holds the rationale, the design
 decisions behind it, and the forensics notes — the parts a Champion session
 does not need loaded to act correctly.
 
@@ -14,6 +15,7 @@ does not need loaded to act correctly.
 |---|---|---|
 | `3` | The PR's head branch changed between the fresh head-SHA read taken immediately before merging and the merge call itself (#5579). | someone else |
 | `4` | The #8248 required-check freshness guard blocked the merge and `--redate-stale-checks` is re-running the stale checks in place (#8914) or re-dated them with a no-op push (#8508). | nobody (in place) / this run (push) |
+| `5` | `--auto`'s bounded settle-wait expired before this head's checks finished, or before the check-runs API became readable (#8896). | nobody |
 | `1` | Everything else, including a #8248 block with no remedy left. | — |
 
 ## Exit 3 — a foreign push raced the merge (#5579)
@@ -178,7 +180,48 @@ Remove `loom:operator` once you have acted. Nothing removes it automatically:
 the label is what makes the stuck PR visible and keeps the engine from
 re-litigating a state it has already proven it cannot resolve.
 
-## Squash-merge detection trap (applies to both)
+## Exit 5 — CI outlasted `--auto`'s bounded settle-wait (#8896)
+
+Since #8410, `--auto` does not arm the forge's server-side queue: it waits, in
+this process, for the head's checks to settle (`LOOM_AUTO_MERGE_TIMEOUT`,
+default 600s, polled every `LOOM_AUTO_MERGE_POLL_INTERVAL`), re-validates the
+guards, and merges here. When the wait runs out, the run ends without merging.
+
+That is the same shape as exits 3 and 4 — nothing merged, nothing is wrong, try
+again later — but until #8896 it left through `error()`, i.e. exit **1**, which
+is indistinguishable to a caller from "the merge API refused this PR".
+Champion's "Merge Failed" path therefore posted *"a human will need to
+investigate and merge manually"* on a PR whose only problem was that CI was
+still running. On this repo `Shell Test Suites (hermetic)` alone takes about ten
+minutes against a 600s default, and the pass right after an exit-4
+`--redate-stale-checks` re-run starts CI from scratch, so the timeout is
+routinely reachable rather than exotic.
+
+Two sites exit 5, both inside `_wait_for_checks_then_sync_merge`:
+
+- **pending checks at the deadline** — one or more non-skipped check-runs on
+  this head are still `queued`/`in_progress`;
+- **an unreadable check-runs API at the deadline** — every poll's fetch failed
+  (and not with the confirmed-404 streak that means "this repo has no checks",
+  which short-circuits to the merge instead).
+
+What exit 5 deliberately is **not**:
+
+- **Not a failed check.** A failing *required* check still exits 1 — that is
+  evidence about this head, not a timing accident, and it needs a fix, not a
+  retry. Failing *informational* checks with nothing pending still merge
+  (#3486).
+- **Not a head move.** Nothing pushed, so the standing `loom:pr` verdict is
+  untouched and the next pass re-evaluates the same head with more of its CI
+  finished. Exit 3's #5686 caveat does not apply.
+- **Not a bypass.** The wait is the gate; expiring it merges nothing.
+
+The remedy, if a repo hits it every pass, is configuration rather than a PR
+action: raise `LOOM_AUTO_MERGE_TIMEOUT` past the repo's slowest suite (or
+shrink the required set — #8919). A Champion tick that ends in exit 5 should
+cost nothing but a log line.
+
+## Squash-merge detection trap (applies to all three)
 
 If you need to verify by hand whether a re-queued PR's commits actually landed
 or were silently stranded, `git merge-base --is-ancestor <commit> origin/main`

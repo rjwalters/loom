@@ -47,7 +47,7 @@ be getting better.
 
 ```
 GitHub Actions (every 2amlogic repo, auto-discovered)
-        │  REST: org repos (ETag-cached) → runs (created_after watermark) → jobs
+        │  REST: org repos (ETag-cached) → runs (created_after floor) → jobs
         │        → completed-job log text (phase 2; text/plain, not a zip)
         ▼
 loom-daemon ci-telemetry poller (per host; one poller is the normal case)
@@ -214,15 +214,18 @@ A `loom-daemon ci-telemetry` poller. Each cycle it:
    page is ETag-cached on disk, so an unchanged org costs `304 Not Modified`
    responses, which do not count against the rate limit. Archived repos and
    `excludedRepos` are skipped.
-2. Per repo, lists workflow runs created since that repo's **watermark**
-   (`GET /repos/{o}/{r}/actions/runs?created=>=<watermark>`, paginated).
+2. Per repo, lists workflow runs created since that repo's **floor**
+   (`GET /repos/{o}/{r}/actions/runs?created=>=<floor>`, paginated). The floor
+   is the repo's **watermark** or the trailing **24-hour rescan window**,
+   whichever is older — see [Re-runs](#dedup-contract-never-record-the-same-job-twice).
 3. For each **completed**, not-yet-recorded run attempt, lists its jobs
    (`GET …/runs/{id}/jobs?filter=all`, paginated). Every job it finds (all
    attempts) and the run itself are recorded **exactly once**.
 
 Runs that are still in progress are not recorded yet. The watermark stays at
 the oldest unfinished run so that a later poll lists it again once it
-completes.
+completes, and it never moves backwards: an unfinished run surfaced by the
+rescan window (below the watermark) is re-listed by that window instead.
 
 ### Surfaces
 
@@ -270,15 +273,22 @@ shipped the key with no code behind it and refused a request by name; phase 2
 `logCaptureExcludedRepos` beside it.
 
 The first poll of a repo, before it has a watermark, looks back 24 hours.
+Every later poll looks back to that repo's watermark or the same 24-hour
+window, whichever is older (#8898).
+
 Requests go through `gh api` (`$LOOM_GH_BIN` overrides the binary), with the
 same credentials as every other forge call the daemon makes.
 
 ### Rate limits
 
 Each interval makes about one discovery request per page, plus one runs
-listing per repo, plus one jobs listing per newly completed run. A `403`
-rate-limit response, a secondary limit, or a `429` **backs off the whole org**,
-never a single repo:
+listing per repo (a page per 100 runs in the trailing 24-hour window), plus
+one jobs listing per newly completed run — an already-recorded run attempt
+that the rescan window re-lists costs nothing beyond that page, because the
+ledger answers it without a jobs listing.
+
+A `403` rate-limit response, a secondary limit, or a `429` **backs off the
+whole org**, never a single repo:
 
 - The backoff lasts until `Retry-After` if the response has one, otherwise
   until the `X-RateLimit-Reset` epoch, otherwise exponentially (60s doubling,
@@ -317,11 +327,17 @@ gitignored.
   counted. Because the run unit is written last, a torn commit can only lose
   that run unit. The run therefore stays "unseen", and the next poll re-lists
   its jobs and commits only the missing ones.
-- **Re-runs.** A new attempt of a run already recorded (within the watermark
-  window) becomes a new `ci.run` for that attempt. Only its new jobs are
-  recorded, because GitHub gives them new `job_id`s. A re-run of a run
-  created before the watermark is not seen; the watermark is keyed on
-  `created_at`.
+- **Re-runs.** A new attempt of a run already recorded becomes a new `ci.run`
+  for that attempt. Only its new jobs are recorded, because GitHub gives them
+  new `job_id`s. A re-attempt keeps the **original** run's `created_at`, so a
+  `created >= watermark` floor alone would stop listing it as soon as newer
+  runs advanced the watermark past it — the common case, and it lost the
+  re-attempt entirely. Every cycle therefore also re-lists a **trailing
+  24-hour rescan window** (`RESCAN_WINDOW_HOURS`, capped by the initial
+  lookback so the floor never reaches back past a repo's first cycle), and the
+  ledger's `(repo, run_id, job_id, attempt)` dedup keeps the export exactly
+  once (#8898). A re-attempt of a run created more than 24 hours ago is still
+  not seen.
 - **Compaction.** When the ledger grows past 8 MiB and nothing is pending,
   it is rewritten atomically as key-only `seen` lines.
 - **One poller per host.** A `flock` on `poll.lock` stops the CLI and the

@@ -7,6 +7,7 @@
 //! `ci_telemetry::logs`, the module under test).
 
 mod job_logs;
+mod rerun_window;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -230,6 +231,7 @@ fn ctx(root: &Path) -> CycleContext<'_> {
         now: now(),
         host_id: "fixture-host".to_string(),
         initial_lookback: Duration::hours(24),
+        rescan_window: Duration::hours(RESCAN_WINDOW_HOURS),
         log_capture: LogCaptureGate::Off,
         log_excluded_repos: Vec::new(),
         log_max_bytes: logs::DEFAULT_MAX_BYTES,
@@ -574,13 +576,17 @@ fn created_watermark_advances_to_the_newest_run() {
     assert_eq!(ledger.watermark(&format!("{ORG}/alpha")), Some(newest));
     assert_eq!(ledger.watermark(&format!("{ORG}/beta")), Some(newest));
 
+    // The watermark advanced (above), but it is no longer the listing floor:
+    // #8898 re-lists the trailing 24h window every cycle, because a re-run
+    // keeps the original `created_at` and the watermark alone would hide it.
+    // That the watermark never regresses is asserted in [`rerun_window`].
     let api = FixtureApi::new();
     run_cycle(&ctx(dir.path()), &api).unwrap();
     assert!(api
         .requests()
         .iter()
         .any(|(p, _)| p.starts_with(&format!("repos/{ORG}/alpha/actions/runs?"))
-            && p.contains("created=%3E%3D2026-09-20T11:00:00Z")));
+            && p.contains("created=%3E%3D2026-09-19T12:00:00Z")));
 }
 
 #[test]
