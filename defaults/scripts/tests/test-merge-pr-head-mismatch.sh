@@ -397,6 +397,30 @@ else
     echo -e "  ${RED}FAIL${NC}: champion-pr-merge.md does not wire merge-pr.sh's exit 4 (#8508)"
 fi
 
+# #8896's exit 5 (--auto's settle-wait timed out) joins the same family: it must
+# be branched on in Step 3 AND carved out of the "Merge Failed" flow in the
+# Error Handling exception, or Champion posts "a human will need to investigate"
+# on a PR whose only problem was that CI outran LOOM_AUTO_MERGE_TIMEOUT.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$CHAMPION_MD" ]] && grep -q '"\$MERGE_RC" -eq 5' "$CHAMPION_MD" \
+   && grep -q 'Exception: exit codes 3, 4 and 5' "$CHAMPION_MD"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: champion-pr-merge.md branches on exit 5 and its exception section covers it (#8896)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: champion-pr-merge.md does not wire merge-pr.sh's exit 5 (#8896)"
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q '^#   5 = --auto' "$MERGE_PR_SRC" \
+   && [[ -f "$EXIT_CODE_DOC" ]] && grep -q '^| `5` |' "$EXIT_CODE_DOC"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: exit 5 is documented in merge-pr.sh's header table and the exceptions doc (#8896)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: exit 5 is missing from merge-pr.sh's 'Exit codes' comment or the exceptions doc"
+fi
+
 # ============================================================================
 # Part 5 (#5589, superseded by #8410): the native `loom-daemon forge
 # auto-merge` call site used to carry the same --expected-head-sha
