@@ -1041,10 +1041,7 @@ while [[ $# -gt 0 ]]; do
                 shift
             done
             ;;
-        --full)
-            FULL_MODE=true
-            shift
-            ;;
+        --full) FULL_MODE=true; shift ;;
         --base)
             BASE_BRANCH="$2"
             if [[ -z "$BASE_BRANCH" ]]; then
@@ -1053,6 +1050,9 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
+        # Proceed even though another session's live issue claim-lock is
+        # found below (#8553) — see the check itself for what it guards.
+        --force) FORCE_CLAIM_LOCK=true; shift ;;
         --*)
             print_error "Unknown flag: $1"
             echo ""
@@ -1343,6 +1343,25 @@ WORKTREE_PATH="$WORKTREE_ROOT_DIR/issue-$ISSUE_NUMBER"
 # ADR-0018 and because this file's `contract` category admits no growth.
 _LEASE_DAEMON_BIN="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
 [[ -z "$_LEASE_DAEMON_BIN" ]] || "$_LEASE_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --watch-pid "${CLAUDE_PID:-$PPID}" > /dev/null 2>&1 || true
+
+# --- Issue claim-lock cross-check (#8553) ------------------------------------
+# `.loom/locks/issue-<N>/owner.json` is the DAEMON's per-issue sweep-claim
+# lock (sweep_registry::locks::acquire_lock), held for a dispatched sweep's
+# ENTIRE lifetime -- a different, longer-lived lock than the repo-global
+# worktree-add mutex above. This script never acquires or releases it; it
+# only reads it here, unconditionally, before every create/reuse path below
+# (including the --sparse/--full apply-to-existing branch), so the check
+# applies regardless of whether the worktree or the lock was created first.
+# All decision logic and message formatting lives in the daemon subcommand
+# (this file is frozen by the file-size ratchet, so new logic goes there, not
+# here) -- exit 1 refuses (its message went to stderr, or to stdout/&3 per the
+# documented --json contract when the caller asked for it); exit 0 means free,
+# or a live conflict downgraded to a warning by --force. Only exit code 1 (not
+# ANY nonzero, e.g. an installed daemon too old for `check-issue`) refuses --
+# an undetermined verdict must fail OPEN, matching every other guard here.
+# shellcheck disable=SC2086  # $_ijson is intentionally unquoted: omits the flag when empty
+# requires-daemon: worktree-lock optional   #8553 fails open on a daemon predating check-issue (no lock cross-check performed)
+[[ -z "$_LEASE_DAEMON_BIN" ]] || { _ijson=""; _irc=0; [[ "$JSON_OUTPUT" == "true" ]] && _ijson="--json"; "$_LEASE_DAEMON_BIN" worktree-lock check-issue --issue "$ISSUE_NUMBER" --repo "$WORKTREE_REPO_ROOT" $_ijson ${FORCE_CLAIM_LOCK:+--force} >&3 || _irc=$?; [[ "$_irc" -eq 1 ]] && exit 1; }
 
 # Check if worktree already exists
 if [[ -d "$WORKTREE_PATH" ]]; then

@@ -58,12 +58,20 @@
 //! [`crate::worktree_ops::landed`] (`clean --aggressive`) is an adapter over
 //! [`branch_landed::ladder`] since #8470 — see [`branch_landed`]'s module doc
 //! for how the two call sites differ and the strictness change it made.
+//!
+//! [`issue_lock`] is not a port slice: it is `worktree.sh` growing a NEW
+//! guard (#8553) that stands entirely on the Rust side by construction — this
+//! file is frozen by the file-size ratchet, so the shell side stays a single
+//! delegating call. It reads a lock [`lock`] never touches: the daemon's
+//! per-issue sweep-CLAIM lock (`sweep_registry::locks`), not the repo-global
+//! worktree-add mutex.
 
 pub mod baseline;
 pub mod branch_delete;
 pub mod branch_landed;
 pub mod cleanup;
 pub mod default_branch;
+pub mod issue_lock;
 pub mod link;
 pub mod lock;
 pub mod remove;
