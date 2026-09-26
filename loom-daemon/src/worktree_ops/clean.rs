@@ -2272,8 +2272,10 @@ pub fn branch_reachable_from_remotes(repo_root: &Path, branch: &str) -> bool {
 /// separate, less-contended pool — see [`check_pr_merged_rest`]'s docs),
 /// falling back to the GraphQL-backed [`check_pr_status_for_branch`] only
 /// when REST cannot answer. Mirrors
-/// [`super::landed`]'s `pr_merged_status` for an arbitrary branch name rather
-/// than an issue-numbered one.
+/// [`super::landed`]'s `forge_probe_rest_first` for an arbitrary branch name
+/// rather than an issue-numbered one — this one answers a plain merged/not
+/// question, while `landed`'s forge rung also carries the merged head SHA the
+/// #7872 tip-match rule needs.
 fn branch_pr_merged(repo_root: &Path, branch: &str) -> bool {
     let status = match repo_owner_rest(repo_root)
         .map(|owner| check_pr_status_for_branch_rest(repo_root, &owner, branch))
