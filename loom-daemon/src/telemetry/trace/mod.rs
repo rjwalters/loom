@@ -6,7 +6,8 @@ mod span;
 pub mod store;
 mod story;
 
-pub use context::{derived_hex, SpanId, TraceContext, TraceId};
+pub use context::{derived_hex, instant, SpanId, TraceContext, TraceId};
+pub mod provenance;
 pub use span::{SpanEvent, SpanLink, SpanName, SpanRecord, SpanStatus, TraceAttributes};
 pub use story::story_context;
 

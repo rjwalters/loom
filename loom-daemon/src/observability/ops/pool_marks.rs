@@ -193,7 +193,8 @@ pub fn mark_claude_bad(
 }
 
 /// The `loom.pool.hold` span for a hold armed at `since` and cleared at
-/// `cleared`: its own sampled root trace.
+/// `cleared`: its own sampled root trace, its ID derived from `since` — a
+/// hold re-reported after a restart keeps its trace.
 #[must_use]
 pub fn hold_span(
     since: DateTime<Utc>,
@@ -208,8 +209,13 @@ pub fn hold_span(
     .into_iter()
     .map(|(key, value)| (key.to_string(), value))
     .collect();
+    let mut attributes = attributes;
+    crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
-        context: TraceContext::root(true),
+        context: TraceContext::derived(
+            SpanName::PoolHold.as_str(),
+            &[&crate::telemetry::trace::instant(since)],
+        ),
         parent_span_id: None,
         name: SpanName::PoolHold,
         started_at: since,
