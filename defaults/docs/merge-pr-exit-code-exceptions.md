@@ -211,6 +211,31 @@ Two sites exit 5, both inside `_wait_for_checks_then_sync_merge`:
   `total_count`) is this case too — it is withheld as a failed fetch, so it
   also exits 5 at the deadline, never 0 and never 1 (#8993).
 
+A third case *reaches* the same deadline without exiting 5 — a check-runs
+rollup that is readable but **empty** (zero rows, never once seen non-empty).
+It settles and merges (exit 0), because an empty rollup most often means the
+repo simply has no CI configured for this commit. #6169 made it re-poll rather
+than trust a single empty read, since a degraded forge response looks identical;
+#9091 then bounded that re-polling, because "wait out the whole deadline" hit
+hardest exactly where the empty read is *genuine*. On a repo with no CI on the
+changed paths every poll returns zero rows forever, so every `--auto` merge
+there spent the full `LOOM_AUTO_MERGE_TIMEOUT` before merging — long enough
+that the calling agent's own process cap killed it first, which is how
+2AMLogic/2am#1267 got a "Proceeding with squash merge…" comment and then no
+merge, no failure and no label change. The bound is conditional on the base
+branch's **required** status-check set:
+
+- **no required contexts** → settle after `LOOM_ZERO_CHECKS_SETTLE_POLLS`
+  (default 3, spaced `LOOM_ZERO_CHECKS_SETTLE_INTERVAL`, default 5s — about 10s
+  of grace for a check-run that is merely slow to *register*). The poll count is
+  floored at 2, so no operator value can restore the single-read settle #6169
+  fixed; and a wrongly-empty read here can at worst skip *informational*
+  checks, which this path already merges over by design (#3486).
+- **required contexts present, or the lookup errored** → the full wait stands
+  unchanged. A required context that has not registered yet is a gate that
+  *can* block, and an unreadable protection lookup is not evidence of its
+  absence.
+
 What exit 5 deliberately is **not**:
 
 - **Not a failed check.** A failing *required* check still exits 1 — that is
