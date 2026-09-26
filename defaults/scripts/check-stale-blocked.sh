@@ -47,6 +47,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." 2>/dev/null && pwd)" || REPO_ROOT="$PWD"
 # 0, not the default 1: the advisory contract is "always exit 0", so the
 # version-floor refusal below must land on 0 too. Read by
 # loom_daemon_version_preflight.
+# shellcheck disable=SC2034  # read by loom_daemon_version_preflight, sourced below
 LOOM_SCRIPT_HELPER_MISSING_RC=0
 
 # shellcheck source=lib/locate-daemon-bin.sh
