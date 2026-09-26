@@ -78,7 +78,7 @@ fn failed_spawn_completes_and_retires_the_prepared_root() {
     let root = dir.path();
     let execution = "missing-executable";
     let mut cmd = Command::new(root.join("does-not-exist"));
-    loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution);
+    loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution, None);
     assert!(TraceStore::new(root).path(root, execution).exists());
     let error = lifecycle::spawn_child(&mut cmd, root, execution).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
@@ -88,6 +88,51 @@ fn failed_spawn_completes_and_retires_the_prepared_root() {
     assert_eq!(records[0].status, SpanStatus::Error);
     assert_eq!(records[0].attributes["loom.result"], "spawn_failed");
     assert!(!TraceStore::new(root).path(root, execution).exists());
+}
+
+#[test]
+fn issue_execution_joins_the_story_trace_and_still_retires() {
+    let dir = root();
+    let root = dir.path();
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:RJWalters/Loom.git",
+        ],
+    ] {
+        assert!(Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let story = loom_daemon::telemetry::trace::story_context("rjwalters/loom", 9038);
+    let mut sweeps = Vec::new();
+    for execution in ["story-attempt-1", "story-attempt-2"] {
+        let mut cmd = Command::new(root.join("does-not-exist"));
+        loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution, Some(9038));
+        lifecycle::spawn_child(&mut cmd, root, execution).unwrap_err();
+        sweeps.extend(
+            spans(root).into_iter().filter(|s| {
+                s.name == SpanName::Sweep && s.attributes["loom.sweep_id"] == execution
+            }),
+        );
+        // The story-parented root still counts as this journal's root (#9038),
+        // so the drained execution retires instead of leaking its context.
+        assert!(!TraceStore::new(root).path(root, execution).exists());
+    }
+    assert_eq!(sweeps.len(), 2);
+    for sweep in &sweeps {
+        assert_eq!(sweep.context.trace_id, story.trace_id);
+        assert_eq!(sweep.parent_span_id.as_ref(), Some(&story.span_id));
+        assert_eq!(sweep.attributes["loom.issue"], "9038");
+        assert_eq!(sweep.attributes["loom.story_id"], story.trace_id.as_str());
+    }
+    assert_ne!(sweeps[0].context.span_id, sweeps[1].context.span_id);
 }
 
 #[test]

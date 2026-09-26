@@ -141,7 +141,7 @@ pub fn begin(
     let saved = store.load_or_create(root, execution).ok()?;
     let journal = Journal::for_context(&store.path(root, execution));
     let active = journal
-        .start(saved.context, None, name, saved.started_at, attributes)
+        .start(saved.context, saved.story.as_ref(), name, saved.started_at, attributes)
         .ok()?;
     Some(Span { journal, active })
 }
@@ -411,16 +411,22 @@ pub fn phase_transition(root: &Path, execution: &str, phase: &str, issue: u32, p
     );
 }
 
-pub fn prepare_execution(command: &mut Command, root: &Path, execution: &str) {
-    if let Some(span) = begin(
-        root,
-        execution,
-        SpanName::Sweep,
-        attributes(&[
-            ("loom.sweep_id", execution),
-            ("loom.timing_source", "dispatch_observed"),
-        ]),
-    ) {
+pub fn prepare_execution(
+    command: &mut Command,
+    root: &Path,
+    execution: &str,
+    story: Option<&super::tracing::StoryRef>,
+) {
+    let mut metadata = attributes(&[
+        ("loom.sweep_id", execution),
+        ("loom.timing_source", "dispatch_observed"),
+    ]);
+    if let Some(story) = story {
+        metadata.insert("loom.issue".into(), story.issue.to_string());
+        metadata.insert("loom.repo".into(), story.repo.clone());
+        metadata.insert("loom.story_id".into(), story.context.trace_id.as_str().to_owned());
+    }
+    if let Some(span) = begin(root, execution, SpanName::Sweep, metadata) {
         span.command(command);
     }
 }

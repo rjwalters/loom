@@ -380,19 +380,29 @@ impl Journal {
         let mut file = self.lock()?;
         let entries = Self::entries(&mut file)?;
         let mut active = std::collections::BTreeSet::new();
-        let mut completed_root = false;
+        let mut started = std::collections::BTreeSet::new();
+        let mut completed_parents = Vec::new();
         for entry in entries {
             match entry {
                 Entry::Started(span) => {
-                    active.insert(span.record.context.span_id.as_str().to_owned());
+                    let id = span.record.context.span_id.as_str().to_owned();
+                    started.insert(id.clone());
+                    active.insert(id);
                 }
                 Entry::Completed(span) => {
                     active.remove(span.context.span_id.as_str());
-                    completed_root |= span.parent_span_id.is_none();
+                    completed_parents.push(span.parent_span_id);
                 }
                 Entry::Owner { .. } | Entry::Supervisor { .. } => {}
             }
         }
+        // The execution root is the span parented outside this journal: none
+        // at all, or a story root (#9037) that no execution journals itself.
+        let completed_root = completed_parents.iter().any(|parent| {
+            parent
+                .as_ref()
+                .is_none_or(|p| !started.contains(p.as_str()))
+        });
         let cursor_path = self.path.with_extension("cursor");
         let cursor = std::fs::read_to_string(&cursor_path)?.parse::<u64>()?;
         if !completed_root || !active.is_empty() || cursor != file.metadata()?.len() {
