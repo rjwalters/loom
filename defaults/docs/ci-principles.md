@@ -34,6 +34,15 @@ the next person to add one will have an equally good argument.
    the same rule the guard and resync layers learned the hard way (#7745,
    #7761): `exit 0` has to mean "verified", never "skipped".
 
+7. **Split work across runners by moving it, never by filtering it.** When a
+   job is the long pole (#9065), divide it so every piece still runs exactly
+   once. Move whole steps into a sibling job, or use nextest's deterministic
+   `--partition count:k/N`, under which each test lands in exactly one leg and
+   the legs' "N tests run" lines sum to the unpartitioned total. Do not use a
+   filterset that picks "the tests that matter": that is path-filtering by
+   another name (rule 3). A leg builds its own binary rather than receiving a
+   hand-off artifact unless the hand-off is measured to be faster (rule 1).
+
 ## What prompted this
 
 Three failures on 2026-09-15, all from cleverness that reviewed well.

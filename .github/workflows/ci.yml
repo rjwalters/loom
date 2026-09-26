@@ -170,9 +170,21 @@ jobs:
       - run: cargo check --workspace --all-targets
 
   backend-tests:
-    name: Rust Unit Tests
+    name: Rust Unit Tests (${{ matrix.partition }}/3)
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    # Partitioned three ways (#9065). Running ~9,500 tests one-process-each is
+    # CPU-bound on a 4-vCPU runner: 222s of the job's 402s was test execution
+    # alone, on the critical path of every backend PR. `--partition count:k/3`
+    # is deterministic, so every test runs in exactly one leg: the three legs'
+    # "N tests run" lines sum to the unpartitioned total. Each leg compiles
+    # for itself rather than sharing a nextest archive: 73 debug test binaries
+    # are several GB to hand between jobs, and a local build is the dumber of
+    # the two mechanisms (ci-principles.md rule 1).
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -189,11 +201,25 @@ jobs:
       # window. nextest runs each test in its own process, which closes it by
       # construction. Tests whose shared state is genuinely cross-process (the
       # host-global `tmux -L loom` server) are serialized by the
-      # `daemon-integration` test group in `.config/nextest.toml`.
+      # `daemon-integration` test group in `.config/nextest.toml` -- within a
+      # leg, and trivially across legs, which are separate hosts.
       - uses: taiki-e/install-action@nextest
-      - name: Run tests (process-per-test)
-        run: cargo nextest run --workspace --profile ci
-      # nextest does not run doctests, so libtest still owns those (#4385).
+      - name: Run tests (process-per-test, partition ${{ matrix.partition }}/3)
+        run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/3
+
+  backend-doctests:
+    name: Rust Doctests
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    # nextest does not run doctests, so libtest still owns those (#4385). Its
+    # own job since #9065 rather than riding one partition of Rust Unit Tests,
+    # where it would make that leg the long pole.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Run doctests
         run: cargo test --workspace --doc
 
@@ -217,9 +243,10 @@ jobs:
       # own unit tests (`otlp/mod.rs`, `otlp/mapping.rs`) are linted too, not
       # just its non-test code paths.
       - run: cargo clippy --package loom-daemon --features otlp --all-targets -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
-      - uses: taiki-e/install-action@nextest
-      - name: Run tests (otlp feature)
-        run: cargo nextest run --package loom-daemon --features otlp --profile ci
+      # The feature's full nextest run lives in the partitioned
+      # backend-otlp-tests job below (#9065). It is NOT deduplicated against
+      # Rust Unit Tests: `otlp` is not purely additive -- two tests are
+      # `#[cfg(not(feature = "otlp"))]` -- so neither run subsumes the other.
       - name: Verify OTLP with a real pinned Collector
         run: cargo test --package loom-daemon --features otlp --test otlp_collector -- --ignored --nocapture
       # #8665: executes the committed cycle-time SQL verbatim against a real
@@ -228,6 +255,27 @@ jobs:
       # nor whether the rollup still answers once the raw rows expire.
       - name: Verify the cycle-time artifacts against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test cycle_time_clickhouse -- --ignored --nocapture
+
+  backend-otlp-tests:
+    name: Rust OTLP Feature Tests (${{ matrix.partition }}/3)
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    # The whole loom-daemon suite with `--features otlp`, partitioned three
+    # ways for the same reason and by the same mechanism as Rust Unit Tests
+    # (#9065): 211s of test execution on one runner was the critical path.
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Run tests (otlp feature, partition ${{ matrix.partition }}/3)
+        run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/3
 
   mcp-build:
     name: MCP Server Build
@@ -332,8 +380,11 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Debug, not --release (#9065): these steps only RUN the binary, so an
+      # optimised build bought nothing but ~100s on every PR (~150s release
+      # vs ~45s debug on a warm cache).
       - name: Build loom-daemon
-        run: cargo build --release -p loom-daemon --bin loom-daemon
+        run: cargo build -p loom-daemon --bin loom-daemon
       # Prints the report whether or not it passes. A gate that only speaks up
       # on failure teaches nobody which way the number is moving, which is how
       # the portable pool grew +317 across four merged ports unnoticed.
@@ -343,7 +394,7 @@ jobs:
       # there is nothing to regenerate. The previous design required a baseline
       # refresh on every merge and red-lined `main` when one was missed (#8073).
       - name: Shell budget
-        run: ./target/release/loom-daemon shell-budget --check
+        run: ./target/debug/loom-daemon shell-budget --check
 
   shell-allowlist:
     name: Shell Allowlist
@@ -631,10 +682,13 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Debug, not --release (#9065): these steps only RUN the binary, so an
+      # optimised build bought nothing but ~100s on every PR (~150s release
+      # vs ~45s debug on a warm cache).
       - name: Build loom-daemon
-        run: cargo build --release -p loom-daemon --bin loom-daemon
+        run: cargo build -p loom-daemon --bin loom-daemon
       - name: Check .agents/skills/ is in sync with its source
-        run: ./target/release/loom-daemon generate-agent-skills --check
+        run: ./target/debug/loom-daemon generate-agent-skills --check
 
   config-host-paths:
     name: Config Host-Path Guard
@@ -704,8 +758,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Debug, not --release (#9065): these steps only RUN the binary, so an
+      # optimised build bought nothing but ~100s on every PR (~150s release
+      # vs ~45s debug on a warm cache).
       - name: Build loom-daemon
-        run: cargo build --release -p loom-daemon --bin loom-daemon
+        run: cargo build -p loom-daemon --bin loom-daemon
       - name: Initialize Loom into an empty two-commit fixture repo
         run: |
           set -euo pipefail
@@ -718,7 +775,7 @@ jobs:
           git -C "$FIXTURE" add README.md
           git -C "$FIXTURE" commit -q -m "initial commit"
           git -C "$FIXTURE" commit -q --allow-empty -m "second commit"
-          ./target/release/loom-daemon init \
+          ./target/debug/loom-daemon init \
             --defaults "$GITHUB_WORKSPACE/defaults" "$FIXTURE" 2>&1 | tee /tmp/fresh-init.log
       - name: Manifest generation succeeded on the fresh init
         run: |
@@ -1107,6 +1164,11 @@ jobs:
     # FAILS (not SKIPs) when no binary resolves, so this job cannot report green
     # by quietly running nothing.
     #
+    # The four slowest suites run in two sibling jobs below (#9065) so that no
+    # one runner carries all ~420s of them: `native-port-daemon-lifecycle` and
+    # `native-port-watchdog-spawn`. Wiring a new suite here is still the
+    # default; move one out only when it is long enough to be the pole.
+    #
     # Triggered by `backend` as well as `scripts`: a Rust-only change to
     # loom-daemon/src/dep_classify/ or loom-daemon/src/dep_recheck/ is exactly
     # the change that can break these suites, and it touches no shell at all.
@@ -1180,13 +1242,6 @@ jobs:
       # sources that library, so it needs the binary this job builds.
       - name: daemon-update fixture containment (#8712)
         run: bash defaults/scripts/tests/test-daemon-update-fixture-containment.sh
-      # #8069: 284 assertions that had never run in ANY CI job. They were
-      # excluded on the reason "wiring it needs a cargo build step or a binary
-      # stub — follow-up"; this job is that cargo build step. The subject is
-      # spawn-claude.sh's token selection — the path behind the 228-instance
-      # crash incident (#7708).
-      - name: spawn-claude token selection (#4228, #7708)
-        run: bash defaults/scripts/tests/test-spawn-claude.sh
       # Moved out of shell-suite-tests by #8037: claude-wrapper.sh's six retry
       # classifiers now delegate to `loom-daemon retry-classify`, so these 44
       # assertions — written against the pre-port shell in #8032 and unchanged
@@ -1244,54 +1299,6 @@ jobs:
       # and the two rebase-target assertions the fix necessarily changed.
       - name: reconcile-stack rebase target + worktree routing (#3776, #7982, #8010, #8583)
         run: bash defaults/scripts/tests/test-reconcile-stack.sh
-      # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
-      # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
-      # (188 + 27 assertions, unchanged from the shell implementation apart
-      # from four explicitly-retired cases) need the binary this job builds.
-      # They pin it via loom_test_require_daemon_bin --self-only, which leaves
-      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this watchdog probes"
-      # — the mock seam every IPC-probe case drives.
-      #
-      # Running them here rather than in shell-suite-tests also means the
-      # live-daemon guard (#6386) no longer covers them. That is safe on THIS
-      # runner and only here: a GitHub runner has no daemon, no pid file and
-      # nothing to bootout. On a developer host, run them through
-      # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
-      - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
-        run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
-      # Moved out of shell-suite-tests by #8087, the same move #8086 made for
-      # the watchdog one line above and for the same reason: cli/
-      # loom-daemon-start.sh is now a thin stub over `loom-daemon
-      # daemon-start`, so these three suites need the binary this job builds.
-      # Each pins it via loom_test_require_daemon_bin --self-only, which leaves
-      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this caller starts or
-      # probes" — the fake-daemon seam every launch-path case drives — and each
-      # FAILS (never SKIPs) without a binary, so this job cannot report green
-      # while running nothing.
-      #
-      # All three, not just the start suite: test-loom-daemon-launchd-plist.sh
-      # renders every plist by invoking the real start script, and
-      # test-loom-daemon-update.sh builds its fixtures from
-      # lib/daemon-update-fixtures.sh, which copies that script in and execs it
-      # on the restart / --relaunch / full-update flows.
-      #
-      # Running them here rather than in shell-suite-tests also means the
-      # live-daemon guard (#6386) no longer covers the two that are
-      # LIVE_DAEMON_GUARDED_SUITES members. Same reasoning as the watchdog
-      # above: safe on THIS runner and only here — a GitHub runner has no
-      # daemon, no pid file and nothing to bootout. On a developer host, run
-      # them through run-ci-suites.sh, which still names both in that guard.
-      #
-      # This job's steps are sequential, so the pair also gets the isolation
-      # run-ci-suites.sh's SERIAL_LANE_SUITES pin (#6622 AC5, #6639/#7391) was
-      # giving them inside its concurrent pool — by construction rather than by
-      # quarantine list.
-      - name: loom-daemon-start (#4773, #6568, #7391, ported in #8087)
-        run: bash defaults/scripts/tests/test-loom-daemon-start.sh
-      - name: loom-daemon-start launchd plist rendering (#5343, #6387, #8087)
-        run: bash defaults/scripts/tests/test-loom-daemon-launchd-plist.sh
-      - name: loom-daemon-update (#4078, #6639, #8087)
-        run: bash defaults/scripts/tests/test-loom-daemon-update.sh
       - name: generic runtime adapter through native worker dispatcher (#8362)
         run: bash defaults/scripts/tests/test-spawn-generic.sh
       # #8671: spawn-generic-launch.sh resolves a tier-3 runtime's launch shape
@@ -1427,6 +1434,109 @@ jobs:
         run: bash defaults/scripts/tests/test-merge-pr-worktree-remove-diagnosis.sh
       - name: cleanup-branches pr-* review-branch pass (#4405, #8191)
         run: bash defaults/scripts/tests/test-cleanup-branches-pr-review-branch.sh
+
+  native-port-daemon-lifecycle:
+    name: Native Port Suites (daemon start/update)
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
+    # Split out of Native Port Suites by #9065, which see for everything else
+    # about this family: that job ran ~420s of suites back to back, the
+    # longest pole in CI. The steps are unchanged; only which runner runs
+    # them moved. Same trigger, same build, and the same FAIL-never-SKIP
+    # contract without a binary.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure git identity for suite fixtures
+        # These suites create fixture commits; a fresh runner has no global
+        # identity. Same step shell-suite-tests carries, for the same reason.
+        run: |
+          git config --global user.email "ci@loom.test"
+          git config --global user.name "Loom CI"
+      - name: Build loom-daemon
+        run: cargo build --package loom-daemon
+      # Moved out of shell-suite-tests by #8087, the same move #8086 made for
+      # the watchdog (now in native-port-watchdog-spawn) and for the same
+      # reason: cli/loom-daemon-start.sh is now a thin stub over `loom-daemon
+      # daemon-start`, so these three suites need the binary this job builds.
+      # Each pins it via loom_test_require_daemon_bin --self-only, which leaves
+      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this caller starts or
+      # probes" — the fake-daemon seam every launch-path case drives — and each
+      # FAILS (never SKIPs) without a binary, so this job cannot report green
+      # while running nothing.
+      #
+      # All three, not just the start suite: test-loom-daemon-launchd-plist.sh
+      # renders every plist by invoking the real start script, and
+      # test-loom-daemon-update.sh builds its fixtures from
+      # lib/daemon-update-fixtures.sh, which copies that script in and execs it
+      # on the restart / --relaunch / full-update flows.
+      #
+      # Running them here rather than in shell-suite-tests also means the
+      # live-daemon guard (#6386) no longer covers the two that are
+      # LIVE_DAEMON_GUARDED_SUITES members. Same reasoning as the watchdog's:
+      # safe on THIS runner and only here — a GitHub runner has no
+      # daemon, no pid file and nothing to bootout. On a developer host, run
+      # them through run-ci-suites.sh, which still names both in that guard.
+      #
+      # This job's steps are sequential, so the pair also gets the isolation
+      # run-ci-suites.sh's SERIAL_LANE_SUITES pin (#6622 AC5, #6639/#7391) was
+      # giving them inside its concurrent pool — by construction rather than by
+      # quarantine list.
+      - name: loom-daemon-start (#4773, #6568, #7391, ported in #8087)
+        run: bash defaults/scripts/tests/test-loom-daemon-start.sh
+      - name: loom-daemon-start launchd plist rendering (#5343, #6387, #8087)
+        run: bash defaults/scripts/tests/test-loom-daemon-launchd-plist.sh
+      - name: loom-daemon-update (#4078, #6639, #8087)
+        run: bash defaults/scripts/tests/test-loom-daemon-update.sh
+
+  native-port-watchdog-spawn:
+    name: Native Port Suites (watchdog, spawn-claude)
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
+    # Split out of Native Port Suites by #9065, which see for everything else
+    # about this family: that job ran ~420s of suites back to back, the
+    # longest pole in CI. The steps are unchanged; only which runner runs
+    # them moved. Same trigger, same build, and the same FAIL-never-SKIP
+    # contract without a binary.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure git identity for suite fixtures
+        # These suites create fixture commits; a fresh runner has no global
+        # identity. Same step shell-suite-tests carries, for the same reason.
+        run: |
+          git config --global user.email "ci@loom.test"
+          git config --global user.name "Loom CI"
+      - name: Build loom-daemon
+        run: cargo build --package loom-daemon
+      # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
+      # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
+      # (188 + 27 assertions, unchanged from the shell implementation apart
+      # from four explicitly-retired cases) need the binary this job builds.
+      # They pin it via loom_test_require_daemon_bin --self-only, which leaves
+      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this watchdog probes"
+      # — the mock seam every IPC-probe case drives.
+      #
+      # Running them here rather than in shell-suite-tests also means the
+      # live-daemon guard (#6386) no longer covers them. That is safe on THIS
+      # runner and only here: a GitHub runner has no daemon, no pid file and
+      # nothing to bootout. On a developer host, run them through
+      # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
+      - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
+        run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
+      # #8069: 284 assertions that had never run in ANY CI job. They were
+      # excluded on the reason "wiring it needs a cargo build step or a binary
+      # stub — follow-up"; this job is that cargo build step. The subject is
+      # spawn-claude.sh's token selection — the path behind the 228-instance
+      # crash incident (#7708).
+      - name: spawn-claude token selection (#4228, #7708)
+        run: bash defaults/scripts/tests/test-spawn-claude.sh
 
   installer-tests:
     name: Installer Integration Tests

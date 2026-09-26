@@ -511,25 +511,39 @@ for suite in "${suites[@]}"; do
         continue
     fi
     run_suite "$suite" &
+    # Freeing a slot: `wait -n` (whichever job finishes FIRST) where bash can
+    # do it reliably, else wait on the OLDEST pid.
+    #
     # `wait -n` is bash 4.3+. Stock macOS ships 3.2, where it fails with
     # "wait: -n: invalid option" -- and this script is `set -uo pipefail`
     # WITHOUT `-e`, so it did not abort: `running` decremented anyway and the
-    # parallelism bound silently stopped bounding (#7802 Class 1).
+    # parallelism bound silently stopped bounding (#7802 Class 1). The
+    # oldest-pid fallback needs no new machinery and preserves the bound
+    # exactly on 3.2.
     #
-    # Waiting on the OLDEST pid instead of any pid needs no new machinery and
-    # preserves the bound exactly, which is the contract that matters here. A
-    # slow oldest job can hold a slot a little longer than `wait -n` would; that
-    # is a scheduling nuance, not a correctness one, and it is a far better
-    # trade than hand-rolling job-polling in shell.
-    _RUN_PIDS+=($!)
+    # It is NOT the default, though (#9065): on a 4-core runner one slow oldest
+    # suite held its slot while the other three finished and sat idle. Measured
+    # on run 36241950484: 650s of suite time took 372s of wall time, an
+    # effective parallelism of ~1.75 out of 4, on the critical path of every
+    # PR. 5.1 rather than 4.3 because earlier `wait -n` did not reliably
+    # return for a child that exited before the call; CI (ubuntu-latest) has
+    # 5.2.
     running=$((running + 1))
-    if [[ "$running" -ge "$PARALLELISM" ]]; then
-        wait "${_RUN_PIDS[0]}" 2>/dev/null || true
-        # Quoted: SC2206. Safe under `set -u` on bash 3.2 because an array
-        # SLICE of an empty/exhausted array expands to nothing rather than
-        # tripping the unbound-variable error that bare "${arr[@]}" does there.
-        _RUN_PIDS=("${_RUN_PIDS[@]:1}")
-        running=$((running - 1))
+    if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+        if [[ "$running" -ge "$PARALLELISM" ]]; then
+            wait -n 2>/dev/null || true
+            running=$((running - 1))
+        fi
+    else
+        _RUN_PIDS+=($!)
+        if [[ "$running" -ge "$PARALLELISM" ]]; then
+            wait "${_RUN_PIDS[0]}" 2>/dev/null || true
+            # Quoted: SC2206. Safe under `set -u` on bash 3.2 because an array
+            # SLICE of an empty/exhausted array expands to nothing rather than
+            # tripping the unbound-variable error that bare "${arr[@]}" does there.
+            _RUN_PIDS=("${_RUN_PIDS[@]:1}")
+            running=$((running - 1))
+        fi
     fi
 done
 wait
