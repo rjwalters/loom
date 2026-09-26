@@ -170,9 +170,17 @@ timestamp; each row keeps the exact session `id` from the stream's `session`
 header. Verify or backfill with `loom-daemon pi-usage --directory <root> --issue
 <N> [--messages] [--json]` (or `--role <role>`).
 
-**Known gap:** `tap_usage` (#8556) matches Pi's `message_end` but looks for the
-counters on the event itself rather than at `message.usage`, so tap accounting
-does not yet measure a real Pi run — tracked in #8934.
+**`tap_usage` reads the same shape (#8934).** It used to look for the counters on
+the `message_end` event itself rather than at `message.usage`, so a real Pi run
+read as unmeasured; it now searches `message.usage` too (in addition to the flat
+`tokens`/`usage`/event-root scopes OpenCode uses), takes the cost estimate from
+`usage.cost.total` because Pi's `cost` is an object, and does **not** record a
+`reasoning` count read from there — it is already inside `output`, and
+`TapUsage::total_tokens` sums every counter it is given. One deliberate
+divergence: a `toolResult`'s nested `usage` **is** counted for tap accounting,
+because a tap is named by the enclosing `# LOOM_LAUNCH` record rather than by the
+message, so there is no model to guess and dropping it would be a knowable
+undercount.
 
 ## Backfill and verification: `loom-daemon opencode-usage`
 
