@@ -2851,7 +2851,14 @@ where
         interval.as_secs()
     );
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
+        // An `Interval` that a `forge.event` prompt may also tick early
+        // (#8766). Disarmed unless `forgeEvents.events.workFinderTick` is on,
+        // in which case it is exactly `tokio::time::interval(interval)`.
+        let mut ticker = crate::forge_events::wake::EarlyTicker::for_work_finder(
+            interval,
+            &event_bus,
+            &workspace_root,
+        );
         // If a tick's work (disk probe + dispatch) overruns the interval, measure
         // the next interval from when it finished rather than firing the missed
         // ticks back-to-back (#3885). Matches the main-health gate loop.
@@ -3260,7 +3267,17 @@ pub fn spawn_multi_work_finder_task(
         interval.as_secs()
     );
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
+        // An `Interval` that a `forge.event` prompt may also tick early
+        // (#8766). Disarmed unless `forgeEvents.events.workFinderTick` is on
+        // for `fallback_root` — the daemon's primary workspace, which is also
+        // where every other machine-level knob is resolved from. When
+        // disarmed this is exactly `tokio::time::interval(interval)`: no bus
+        // subscription, no bridge task, no wake path.
+        let mut ticker = crate::forge_events::wake::EarlyTicker::for_work_finder(
+            interval,
+            &event_bus,
+            &fallback_root,
+        );
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately; skip it so we don't churn at boot.
         ticker.tick().await;

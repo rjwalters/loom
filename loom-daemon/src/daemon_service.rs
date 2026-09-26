@@ -1018,8 +1018,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // invariant (#6615) intact despite the passes no longer blocking startup.
     let startup_reconciliation_ready =
         daemon_startup_reconciliation::spawn_startup_passes(sweep_workspace.clone());
-    let _claim_reconciliation_handle =
-        claim_reconciliation::spawn_periodic_reconciliation_task(sweep_workspace.clone());
+    let _claim_reconciliation_handle = claim_reconciliation::spawn_periodic_reconciliation_task(
+        sweep_workspace.clone(),
+        event_bus.clone(),
+    );
 
     // Startup-race mitigation (Issue #3887): resolve the dispatch stagger + the
     // watchdog knobs from `.loom/config.json → autonomous` with env override
@@ -1948,6 +1950,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
             watch_registry::GhWatchProbe::new(),
             interval,
             expiry,
+            event_bus.clone(),
+            sweep_workspace.clone(),
         ))
     } else {
         log::debug!(
