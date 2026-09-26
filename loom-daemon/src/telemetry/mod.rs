@@ -57,6 +57,7 @@ use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 
 pub mod ci;
 mod envelope;
+pub mod kinds;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
@@ -66,6 +67,7 @@ pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use envelope::TelemetryEnvelope;
+pub use kinds::{TelemetryKindMeta, TelemetryKindOtlp, NEW_KIND_SCHEMA_VERSION, TELEMETRY_KINDS};
 pub use ops::MetricPointsRecord;
 pub use queue_snapshot::QueueSnapshotRecord;
 
@@ -231,93 +233,81 @@ impl<'de> Visitor<'de> for RepoVisibilityVisitor {
 // Record kinds — internally tagged on `kind`
 // ============================================================================
 
-/// Every telemetry record kind, internally tagged on a `kind` discriminant. The
-/// tag values match the frozen SSE `sweep.*` topic vocabulary where they overlap
-/// (`sweep.started`/`sweep.phase`/`sweep.completed`) plus the epic's added
-/// record kinds (`sweep.outcome`, `tokens.snapshot`, `host.health`), so the
-/// Phase-2 backend pattern-matches one flat object per record.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind")]
-pub enum TelemetryRecord {
-    /// A sweep began (mirrors the dispatch moment of the frozen SSE topics).
-    #[serde(rename = "sweep.started")]
-    SweepStarted(SweepStartedRecord),
-    /// Late-resolved launch identity; enriches an existing active sweep only.
-    #[serde(rename = "sweep.identity")]
-    SweepIdentity(SweepIdentityRecord),
-    /// A sweep advanced to a new lifecycle phase (mirrors `sweep.issue.{N}.phase`).
-    #[serde(rename = "sweep.phase")]
-    SweepPhase(SweepPhaseRecord),
-    /// A sweep reached a terminal state (mirrors the exited/crashed/completed
-    /// frozen topics; the richer per-phase/config detail lives in the paired
-    /// [`SweepOutcomeRecord`]).
-    #[serde(rename = "sweep.completed")]
-    SweepCompleted(SweepCompletedRecord),
-    /// The full post-hoc outcome of a sweep: model/config/effort, per-phase
-    /// durations, terminal result, and PR number.
-    #[serde(rename = "sweep.outcome")]
-    SweepOutcome(SweepOutcomeRecord),
-    /// A snapshot of the multi-account token pool's per-account usage state.
-    #[serde(rename = "tokens.snapshot")]
-    TokensSnapshot(TokenSnapshotRecord),
-    /// Host health: CPU/disk headroom, daemon version, uptime.
-    #[serde(rename = "host.health")]
-    HostHealth(HostHealthRecord),
-    /// One role-runner tick's outcome (Issue #8056) — the per-`(root, role)`
-    /// counterpart of [`SweepOutcome`](Self::SweepOutcome). The seventh
-    /// variant, and the reason [`CURRENT_SCHEMA_VERSION`] is `2`.
-    #[serde(rename = "role_tick.outcome")]
-    RoleTickOutcome(RoleTickOutcomeRecord),
-    /// One transcript's session shape (Issue #8757, G3 of #8714) — ids,
-    /// attribution, models, token totals, and turn/tool counts, emitted by
-    /// the transcript-ingest pass. Carries **no** prompt, tool-output, key
-    /// or email content by construction (see [`SessionSummaryRecord`]).
-    #[serde(rename = "session.summary")]
-    SessionSummary(SessionSummaryRecord),
-    /// A derived per-session anomaly/quality rollup (Issue #8760, G3 part 2
-    /// of #8714) — retry-loop detection, the longest paired tool call, a USD
-    /// cost estimate, and anomaly flags, computed from a
-    /// [`SessionSummaryRecord`] plus the
-    /// [`crate::activity::transcript_parse::ParsedTranscript`] that produced
-    /// it. See [`SessionAnalysisRecord`] for the wire-safety contract (same
-    /// as `session.summary`: no prompt, tool-output, key or email content,
-    /// ever).
-    #[serde(rename = "session.analysis")]
-    SessionAnalysis(SessionAnalysisRecord),
-    /// One of the four named event-bus topics that carried no telemetry
-    /// record kind of their own (Issue #8760, G4 of #8714): `daemon.drain.*`,
-    /// `daemon.capacity.advisory`, `daemon.preflight.advisory`, and
-    /// `epic.issue.*`. See [`DaemonEventRecord`].
-    #[serde(rename = "daemon.event")]
-    DaemonEvent(DaemonEventRecord),
-    #[serde(rename = "trace.span")]
-    Span(trace::SpanRecord),
-    /// One completed GitHub Actions workflow run (Issue #8824). See
-    /// [`ci`] for the CI record family and its attribute allowlist.
-    #[serde(rename = "ci.run")]
-    CiRun(CiRunRecord),
-    /// One completed job of a GitHub Actions run (Issue #8824).
-    #[serde(rename = "ci.job")]
-    CiJob(CiJobRecord),
-    /// One CI run/job duration sample — the carrier for the
-    /// `loom.ci.{run,job}.duration_ms` histograms (Issue #8824).
-    #[serde(rename = "ci.duration")]
-    CiDuration(CiDurationRecord),
-    /// One ≤ 8 KiB chunk of a completed job's log text (Issue #8825). The
-    /// only kind carrying free text the daemon did not author — see
-    /// [`CiJobLogRecord`] for why the gateway, not the source, scrubs it.
-    #[serde(rename = "ci.job.log")]
-    CiJobLog(CiJobLogRecord),
-    /// A batch of generic operational metric points (Issue #8860) — the shared
-    /// carrier any daemon loop emits through `observability::ops`. OTLP-only;
-    /// see [`ops`] for the fixed name vocabulary and label policy.
-    #[serde(rename = "metric.points")]
-    MetricPoints(MetricPointsRecord),
-    /// The work finder's ranked ready queue as of its last tick (Issue #8852,
-    /// phase 2). Native-HTTPS only; see [`queue_snapshot`].
-    #[serde(rename = "queue.snapshot")]
-    QueueSnapshot(QueueSnapshotRecord),
+/// Defines [`TelemetryRecord`] and its per-kind accessors from the
+/// [`crate::telemetry_kind_table!`] rows (#8921).
+///
+/// Every arm below is generated from the *same* row, so a kind cannot be in the
+/// enum but missing from `schema_version()`, or tagged one way on the wire and
+/// another in the routing class. Before #8921 each of these lived in a separate
+/// shared file and had to be edited in lockstep by hand.
+macro_rules! define_telemetry_record {
+    ($( $(#[$attr:meta])* $variant:ident = $kind:literal => $payload:ty,
+        gate: $gate:expr, otlp: $class:ident, native: $native:literal; )+) => {
+        /// Every telemetry record kind, internally tagged on a `kind` discriminant. The
+        /// tag values match the frozen SSE `sweep.*` topic vocabulary where they overlap
+        /// (`sweep.started`/`sweep.phase`/`sweep.completed`) plus the epic's added
+        /// record kinds (`sweep.outcome`, `tokens.snapshot`, `host.health`), so the
+        /// Phase-2 backend pattern-matches one flat object per record.
+        ///
+        /// **Generated** from the one-row-per-kind registry in
+        /// [`kinds`](crate::telemetry::kinds) — add a kind there, never here.
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(tag = "kind")]
+        pub enum TelemetryRecord {
+            $(
+                $(#[$attr])*
+                #[serde(rename = $kind)]
+                $variant($payload),
+            )+
+        }
+
+        impl TelemetryRecord {
+            /// This record's wire `kind` tag — the exact string the internally
+            /// tagged serialization emits, available without serializing.
+            #[must_use]
+            pub fn kind(&self) -> &'static str {
+                match self {
+                    $( Self::$variant(_) => $kind, )+
+                }
+            }
+
+            /// The envelope `schema_version` this kind's envelopes carry (the
+            /// value [`TelemetryEnvelope::new`] stamps).
+            ///
+            /// Per-kind gates `3`–`11` are frozen wire contract. Every kind
+            /// added after #8921 reports
+            /// [`NEW_KIND_SCHEMA_VERSION`](crate::telemetry::NEW_KIND_SCHEMA_VERSION)
+            /// instead of a hand-claimed next integer.
+            #[must_use]
+            pub fn schema_version(&self) -> u32 {
+                match self {
+                    $( Self::$variant(_) => $gate, )+
+                }
+            }
+
+            /// How this kind exports over OTLP. The `observability::otlp`
+            /// mapping reads this instead of carrying its own exhaustive
+            /// per-kind chains.
+            #[must_use]
+            pub fn otlp_class(&self) -> TelemetryKindOtlp {
+                match self {
+                    $( Self::$variant(_) => TelemetryKindOtlp::$class, )+
+                }
+            }
+
+            /// Whether the native HTTPS `/ingest` backend accepts this kind.
+            /// `false` for OTLP-only kinds (`trace.span`, `metric.points`).
+            #[must_use]
+            pub fn accepted_by_native_ingest(&self) -> bool {
+                match self {
+                    $( Self::$variant(_) => $native, )+
+                }
+            }
+        }
+    };
 }
+
+crate::telemetry_kind_table!(define_telemetry_record);
 
 /// A sweep's terminal result. `#[serde(default)]`-friendly variants are not
 /// needed here (unlike [`RepoVisibility`], an unknown result is not a privacy

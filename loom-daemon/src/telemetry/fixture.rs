@@ -95,11 +95,12 @@ fn context(run: &str, scenario: &str, operation: &str) -> Result<TraceContext> {
 
 fn envelope(host: &str, at: DateTime<Utc>, record: TelemetryRecord) -> TelemetryEnvelope {
     TelemetryEnvelope {
-        schema_version: if matches!(record, TelemetryRecord::Span(_)) {
-            3
-        } else {
-            2
-        },
+        // The kind's own declared gate (`telemetry/kinds.rs`, #8921) — the same
+        // value `TelemetryEnvelope::new` stamps, so a fixture envelope is never
+        // a second, hand-maintained copy of the version ladder. Byte-identical
+        // for the three kinds this bundle emits (`trace.span` 3,
+        // `sweep.phase` / `tokens.snapshot` 2).
+        schema_version: record.schema_version(),
         emitted_at: at,
         host_id: host.to_owned(),
         record,

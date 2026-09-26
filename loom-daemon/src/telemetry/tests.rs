@@ -10,6 +10,7 @@ mod complexity;
 mod daemon_event;
 mod fleet_captain;
 mod host_health_omissions;
+mod kind_registry;
 mod role_tick;
 mod session_analysis;
 mod session_summary;
