@@ -21,6 +21,9 @@
 #      LOOM_GENERIC_CLI_BIN itself
 #   8. ...and refuses actionably (exit 78, naming the declared daemon version
 #      floor) when it did not
+#   9. the manifest is resolved against the SCRIPT-derived repo root, not the
+#      invoking CWD (#8700) — a custom `.loom/runtimes/<name>.json` still
+#      reaches argv when the script is invoked from outside the repository
 #
 # Usage:
 #   ./.loom/scripts/tests/test-spawn-generic-launch.sh
@@ -108,11 +111,34 @@ else
     echo -e "  ${RED}FAIL${NC}: spawn-generic-launch.sh must be executable"
 fi
 
-# A fake repo the daemon's cwd-based worktree-root resolution finds: a plain
-# `.git` entry (existence only, per `repo_root::find_worktree_root` — no real
-# git repo needed) plus `.loom/runtimes/<name>.json`.
+# A fake repo holding the manifests under test, with the scripts installed
+# into it at `.loom/scripts/` — the layout of a real consumer install.
+#
+# The copy is what makes this fixture honest since #8700: the subject resolves
+# its manifest root from its OWN location (`git -C "$SCRIPT_DIR" rev-parse
+# --show-toplevel`) and passes it to `runtime-launch-env --repo-root`, so a
+# suite that ran the in-repo copy of the script would be asking the daemon to
+# resolve `widget.json` out of the loom repository itself, never out of this
+# fixture. Running the installed copy means the script-derived root and the
+# manifests are the same tree, which is exactly the invariant #8700 restored.
+#
+# `git init` rather than a bare `mkdir .git`: `--show-toplevel` needs a real
+# repository, and the cwd-independence test below depends on that resolution
+# succeeding from outside the tree.
 FAKE_ROOT="$TMPROOT/fakerepo"
-mkdir -p "$FAKE_ROOT/.git" "$FAKE_ROOT/.loom/runtimes"
+mkdir -p "$FAKE_ROOT/.loom/runtimes" "$FAKE_ROOT/.loom/scripts"
+git init -q "$FAKE_ROOT" >/dev/null 2>&1 || {
+    echo "FATAL: could not git init the test fixture at $FAKE_ROOT" >&2
+    exit 1
+}
+cp "$SCRIPTS_DIR/spawn-generic-launch.sh" "$SCRIPTS_DIR/spawn-generic.sh" \
+    "$FAKE_ROOT/.loom/scripts/"
+cp -R "$SCRIPTS_DIR/lib" "$FAKE_ROOT/.loom/scripts/lib"
+chmod +x "$FAKE_ROOT/.loom/scripts/spawn-generic-launch.sh" \
+    "$FAKE_ROOT/.loom/scripts/spawn-generic.sh"
+# Everything below drives the INSTALLED copy; the syntax/permission checks
+# above deliberately kept asserting against the tracked source file.
+SPAWN_LAUNCH="$FAKE_ROOT/.loom/scripts/spawn-generic-launch.sh"
 
 write_manifest() {
     cat >"$FAKE_ROOT/.loom/runtimes/$1.json"
@@ -245,6 +271,59 @@ assert_contains "loom-daemon >= $DECLARED_FLOOR" "$floor_out" \
     "the refusal quotes the version floor declared in the script's own requires-daemon marker"
 assert_contains "LOOM_GENERIC_CLI_BIN" "$floor_out" \
     "the refusal names the env-var bypass"
+
+echo ""
+echo "Testing the manifest resolves from the script's repo root, not the cwd (#8700)..."
+# #8700 regression. The subject used to call `runtime-launch-env` with no
+# `--repo-root`, so the subcommand fell back to resolving `<name>.json` from
+# its own CWD while the daemon's runtime ADMISSION for the same dispatch
+# resolved it from the scripts-derived workspace root. A custom
+# `.loom/runtimes/<name>.json` therefore lost silently to the compiled-in
+# bundled manifest whenever the daemon's cwd was outside the repo — and a
+# custom runtime with no bundled fallback got the version-floor refusal,
+# blaming a stale binary for what was really a cwd mismatch.
+#
+# OUTSIDE is deliberately not under FAKE_ROOT and contains no `.git`, so the
+# cwd-based fallback resolves nothing: before the fix this case exits 78 with
+# "could not resolve a launch shape"; after it, the manifest still wins.
+OUTSIDE="$TMPROOT/outside"
+mkdir -p "$OUTSIDE"
+write_manifest widget-cwd <<'JSON'
+{
+  "runtime": "widget-cwd",
+  "capabilities": {},
+  "launch": {
+    "cliBin": "cwd-independent-cli",
+    "promptFlag": "--message"
+  }
+}
+JSON
+set +e
+cwd_out="$(cd "$OUTSIDE" && env -u LOOM_GENERIC_CLI_BIN -u LOOM_GENERIC_PROMPT_FLAG \
+    LOOM_SWEEP_NICE=0 LOOM_GENERIC_NO_EXEC=1 bash "$SPAWN_LAUNCH" widget-cwd -p "hi" 2>&1)"
+cwd_rc=$?
+set -e
+assert_eq "0" "$cwd_rc" "resolution from outside the repository is not a refusal"
+assert_contains "spawn-generic would-exec: cwd-independent-cli" "$cwd_out" \
+    "a manifest-declared cliBin reaches argv when the cwd is outside the repository"
+assert_contains "--message hi" "$cwd_out" \
+    "the same manifest's promptFlag also survives an out-of-repo cwd"
+
+echo ""
+echo "Testing a bundled compiled-in manifest is unaffected by the change..."
+# `aider` is the one shipped tier-3 runtime whose manifest the daemon carries
+# compiled in, so its resolution never depended on the cwd. Passing
+# --repo-root must not disturb that fallback: FAKE_ROOT has no aider.json of
+# its own, so this exercises `bundled_runtime_manifest` explicitly.
+set +e
+aider_out="$(cd "$OUTSIDE" && env -u LOOM_GENERIC_CLI_BIN -u LOOM_GENERIC_PROMPT_FLAG \
+    -u LOOM_GENERIC_EXTRA_ARGS LOOM_SWEEP_NICE=0 LOOM_GENERIC_NO_EXEC=1 \
+    bash "$SPAWN_LAUNCH" aider -p "hi" 2>&1)"
+aider_rc=$?
+set -e
+assert_eq "0" "$aider_rc" "the bundled aider manifest still resolves"
+assert_contains "spawn-generic would-exec: aider" "$aider_out" \
+    "aider's compiled-in launch shape is unchanged by the explicit --repo-root"
 
 echo ""
 echo "==================================="

@@ -79,6 +79,38 @@ fn host_is_under(host: &str, suffix: &str) -> bool {
             && host.as_bytes()[host.len() - suffix.len() - 1] == b'.')
 }
 
+/// `true` when this endpoint resolves to a host on **this machine** — an IP
+/// loopback address (`127.0.0.0/8`, `::1`) or `localhost`/any DNS child of it
+/// (RFC 6761 reserves the whole `localhost.` subtree for loopback).
+///
+/// Issue #9015: a loopback endpoint is almost always a local **edge collector**
+/// that forwards onward (the harness-ops otel-edge on `127.0.0.1:14318`), which
+/// makes an ack prove strictly less than it does for a remote endpoint: the
+/// first hop accepted the batch, and nothing about the hop after it is
+/// observable from here. The surfaces use this to say so out loud instead of
+/// letting `healthy` be read as "the data is in the backend" — 30h of total
+/// SigNoz loss went unseen exactly that way.
+///
+/// Shares [`endpoint_host`] with [`reserved_placeholder_host`] on purpose: the
+/// host an operator is told about must be the same normalized host the
+/// outbound client would resolve, not a second hand-rolled parse.
+#[must_use]
+pub fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let Some(host) = endpoint_host(endpoint) else {
+        return false;
+    };
+    // `Url::host_str` keeps IPv6 literals bracketed; `IpAddr` will not parse
+    // those, so unwrap one layer of brackets before classifying.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host.as_str());
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    host_is_under(&host, "localhost")
+}
+
 /// The reserved placeholder host this endpoint points at, if any — `None`
 /// means "not a placeholder", i.e. safe to export to as far as this check is
 /// concerned. The returned host is what the `misconfigured` detail names, so
@@ -188,6 +220,40 @@ mod tests {
             "https://testing.dev/ingest",
         ] {
             assert_eq!(reserved_placeholder_host(endpoint), None, "must be allowed: {endpoint}");
+        }
+    }
+
+    /// Issue #9015: the loopback classification the first-hop annotation keys
+    /// off. Same normalized-host parse as the placeholder check, so an endpoint
+    /// spelled to *look* remote cannot be reported as remote.
+    #[test]
+    fn classifies_local_collector_endpoints_as_loopback() {
+        for endpoint in [
+            "http://127.0.0.1:14318/v1/logs", // the harness-ops otel-edge
+            "http://127.0.0.1:8787/ingest",
+            "http://127.1.2.3:4318",     // all of 127.0.0.0/8
+            "http://[::1]:4318/v1/logs", // IPv6 loopback, bracketed
+            "http://localhost:4318/v1/logs",
+            "http://LOCALHOST:4318/v1/logs",   // case-insensitive
+            "http://otel-edge.localhost:4318", // RFC 6761 localhost subtree
+            "localhost:4318/v1/logs",          // scheme-less
+        ] {
+            assert!(is_loopback_endpoint(endpoint), "must be a local hop: {endpoint}");
+        }
+    }
+
+    #[test]
+    fn does_not_flag_a_remote_backend_as_loopback() {
+        for endpoint in [
+            "https://loom-observability.workers.dev/ingest",
+            "https://signoz.internal:4318/v1/logs",
+            "https://127.0.0.1.example.com/ingest", // loopback-shaped LABEL, remote host
+            "https://notlocalhost/ingest",
+            "https://localhost.example.com/ingest", // `localhost` as a child label
+            "http://10.0.0.5:4318/v1/logs",         // private, but not this machine
+            "not a URL at all",
+        ] {
+            assert!(!is_loopback_endpoint(endpoint), "must not be a local hop: {endpoint}");
         }
     }
 

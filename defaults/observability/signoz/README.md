@@ -240,6 +240,12 @@ histograms. Policy and pipeline: [CI observability](../../docs/ci-observability.
 | CI failed run → logs | Logs Explorer: filter `body = 'ci.run' AND loom.ci.conclusion IN ('failure', 'timed_out', 'startup_failure')`, save as `CI failed runs`; take a `loom.ci.run_id`, filter `body = 'ci.job' AND loom.ci.run_id = <id> AND loom.ci.conclusion != 'success'` for its failing jobs, then `loom.ci.job_id = <job id> AND loom.ci.chunk_index EXISTS` sorted by `loom.ci.chunk_index` ascending for the job's log, in order (`ci-queries.sql` 5) |
 | CI run waterfall | Trace Explorer: filter `name = 'loom.ci.run'`, sort by duration descending, open a run; its `loom.ci.job` children are the waterfall, and the longest child against the root's duration is the run/longest-job comparison (`ci-queries.sql` 6) |
 
+`ci-queries.sql` 7) (#9007's per-issue Builder/CI/Judge/merge breakdown) has no
+row above: it joins `loom_analytics.raw_ship_outcome` against `ci.run` records
+across two logical sources, which is not a single SigNoz Explorer/dashboard
+panel the way sections 1–6 are — it is a `clickhouse-client`-only report, run
+the same way as the rollup's other CT queries.
+
 The six CI rows are **recreation steps, not yet observed**: no session has had
 an authenticated UI (or API) credential for the trial org since they were
 written, so none of the six has been created there yet

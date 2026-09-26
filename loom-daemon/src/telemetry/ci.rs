@@ -114,6 +114,12 @@ pub const CI_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.ci.job",
     "loom.ci.runner",
     "loom.ci.attempts",
+    // Join keys (Issue #9007): `loom.ci.ref` reuses the log-side name for the
+    // head branch rather than inventing `loom.ci.head_branch`. `loom.pr_number`
+    // needs no entry here — it is already in `bounded_attributes()`'s generic
+    // always-admitted key list and the collector's span `keep_keys`.
+    "loom.ci.head_sha",
+    "loom.ci.ref",
 ];
 
 /// The low-cardinality metric label allowlist for the two CI duration

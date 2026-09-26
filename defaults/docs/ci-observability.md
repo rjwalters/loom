@@ -159,9 +159,10 @@ applied with the org login
 
 The retro is
 [`ci-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/ci-queries.sql):
-six numbered, parameterized sections, run in one pass from the trial's private
+numbered, parameterized sections, run in one pass from the trial's private
 bundled `clickhouse-client` (invocation in the signoz README's "CI retro
-queries"). Each has a matching saved view in the README's "Saved views" table.
+queries"). Sections 1–6 have a matching saved view in the README's "Saved
+views" table.
 
 | # | Question | Source (horizon) |
 |---|---|---|
@@ -171,6 +172,17 @@ queries"). Each has a matching saved view in the README's "Saved views" table.
 | 4 | **What took long right now?** The longest individual jobs, with `run_id` / `job_id` | `ci.job` records (7 days) |
 | 5 | **Which runs failed, and why?** Each failed run, its non-successful jobs, how much of each job's log was captured, and the exact Logs Explorer filter to read it | `ci.run` / `ci.job` / `ci.job.log` (7 days) |
 | 6 | **Where did a slow run's time go?** Run wall-clock vs its longest job, job count and summed job time | `ci.run` / `ci.job` records (7 days) |
+| 7 | **Per issue, where did the time go — Builder, CI, Judge, merge?** (#9007) Joins `loom_analytics.raw_ship_outcome` (apply `cycle-time-extract.sql` first) to the `ci.run` triggered by that issue's `feature/issue-N` branch, on the issue number recovered from `loom.ci.ref`. Reports Builder/Judge/merge-phase seconds beside the CI run's own wall-clock duration. Two things it deliberately does **not** claim: the CI segment is one wall-clock span, not queued-vs-running (GitHub's queue timestamp never reaches `CiRunRecord`), and "lead time" is the sweep's own `total_duration_sec`, not issue-filed-to-merged (no forge issue-open timestamp reaches this stream — see [`cycle-time-questions.md`](https://github.com/rjwalters/loom/blob/main/defaults/observability/cycle-time-questions.md) §"What this question set cannot answer") | `sweep.outcome` rollup + `ci.run` records (7-day CI horizon; sweep-side per the rollup's own retention) |
+
+Section 7's join key is the **issue** number, not a PR number: `ci.run`/
+`ci.job` **log** records carry no PR/issue attribute of their own (only
+`loom.ci.ref`, the branch name), so the log-side query reuses the
+`feature/issue-N` convention `claim_reconciliation::parse_issue_from_branch`
+already applies fleet-side. The **span**-side join keys added by #9007
+(`loom.ci.head_sha`, `loom.ci.ref`, `loom.pr_number` — see [Attribute
+allowlist](#attribute-allowlist)) are for a future trace-level join (e.g. a
+Trace Explorer query correlating `loom.ci.run` spans with `loom.role_attempt`
+spans by `loom.pr_number`); they are not consumed by `ci-queries.sql` today.
 
 Rules the file follows, and any new section must too:
 
@@ -449,8 +461,21 @@ The attribute and label vocabulary is declared once, in
 `loom-daemon/src/telemetry/ci.rs`:
 
 - `CI_LOG_ATTRIBUTE_KEYS`: the `loom.ci.*` log attributes. Log records also
-  carry the shared `loom.repo` and `loom.repo.visibility`.
-- `CI_SPAN_ATTRIBUTE_KEYS`: the `loom.ci.*` span attributes.
+  carry the shared `loom.repo` and `loom.repo.visibility`. Already includes
+  `loom.ci.head_sha` and `loom.ci.ref` (the head branch).
+- `CI_SPAN_ATTRIBUTE_KEYS`: the `loom.ci.*` span attributes. Since #9007 this
+  also includes `loom.ci.head_sha` and `loom.ci.ref` — the same join keys the
+  log side already carried, added to the `loom.ci.run` / `loom.ci.job` spans
+  so a sweep's trace (`loom.role_attempt` / `loom.phase` spans, which already
+  carry `loom.pr_number` since #8692) can be correlated with the CI runs that
+  gated it. `loom.pr_number` is set on these spans too, derived from the run's
+  `pull_requests[].number` (`pull_request`-triggered runs) or, as a fallback,
+  from `feature/issue-N` in `head_branch` — but needs no allowlist entry of
+  its own, since it is already in `bounded_attributes()`'s generic
+  always-admitted key list and the collector's span `keep_keys`. Span-link
+  generation from `loom.ci.run` back to the sweep trace is a separate,
+  not-yet-built follow-up (Issue #9007's proposal item 3); today the join is
+  attribute-only.
 - `CI_METRIC_LABEL_KEYS`: the metric labels, and **only** these:
   `repo`, `workflow`, `job`, `runner`, `conclusion`. Metric labels never
   include a sha, ref, run id or issue number.
