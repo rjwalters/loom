@@ -47,6 +47,15 @@ the next person to add one will have an equally good argument.
    the artifact is missing), because a skipped required check counts as
    passing (rule 6).
 
+8. **Group required gates by component, and judge each component on its own
+   inputs.** Many tiny required jobs compete for the concurrent-job cap, so
+   #9065 folded 19 of them into `Structural Checks`, `Daemon Checks` and the
+   macOS `Shell Syntax` leg. Each gate keeps a `# component: <name>` marker
+   and its own input spec. The freshness guard calls a composite stale when
+   *any* component is stale, never on the union of their inputs, so grouping
+   does not make merges go stale more often. Every step runs under
+   `!cancelled()`, so one red gate cannot hide another.
+
 ## What prompted this
 
 Three failures on 2026-09-15, all from cleverness that reviewed well.
