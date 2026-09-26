@@ -6580,7 +6580,7 @@ kimi) gets a fresh UUID-named state directory under
 `$LOOM_NATIVE_TOOLS_DIR`), and nothing removes one on its own: `State` has no
 `Drop`, and the launch chain `exec()`s all the way into the harness binary — no
 parent process survives to clean up after a session. That directory's reclaim
-is [`native_tools::provision::reap`](#8663)'s job — pid-liveness-aware, and
+is `native_tools::provision::reap`'s job (#8663) — pid-liveness-aware, and
 already running at the start of the next launch for the same workspace, plus
 `loom-daemon clean`. This pass adds the missing periodic case: an idle
 workspace that stops launching new sessions never triggers either of those, so
