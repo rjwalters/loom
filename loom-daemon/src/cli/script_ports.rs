@@ -114,6 +114,15 @@ pub(crate) enum ScriptPortCommand {
     /// call sites already discard the status with `|| true`.
     WorktreeCleanup(super::worktree_cleanup::WorktreeCleanupArgs),
 
+    /// `lib/worktree-race-rescue.sh`'s `loom_worktree_reset_or_rescue` (#8195,
+    /// slice 6): the guard in front of `worktree.sh`'s stale-worktree
+    /// `git reset --hard` — refuse while a live process holds the worktree
+    /// (#7463), refuse when it gained commits, and capture foreign uncommitted
+    /// tracked changes to a `.snapshots/` patch before resetting rather than
+    /// discarding them (#6706/#6334, the #6320 incident). Exit 0 = reset,
+    /// 1 = refused and nothing changed, 2 = the reset itself failed.
+    WorktreeReset(super::worktree_reset::WorktreeResetArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -240,6 +249,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeRemove(args) => args.run(),
             ScriptPortCommand::WorktreeLink(args) => args.run(),
             ScriptPortCommand::WorktreeCleanup(args) => args.run(),
+            ScriptPortCommand::WorktreeReset(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),

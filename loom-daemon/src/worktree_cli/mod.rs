@@ -59,6 +59,18 @@
 //! [`branch_landed::ladder`] since #8470 — see [`branch_landed`]'s module doc
 //! for how the two call sites differ and the strictness change it made.
 //!
+//! Slice 6 is [`reset`]: the rescue-or-refuse guard in front of the
+//! stale-worktree `git reset --hard`, and with it the last of the three
+//! data-loss classes the issue leads with — *"rescue foreign work instead of
+//! discarding it on a raced reset/remove"* (#6706), from the #6320 incident
+//! where an unqualified reset discarded a second builder's uncommitted work.
+//! It is also where the issue's "two implementations of *is this worktree safe
+//! to touch*" is literally true: the shell's liveness probe *claimed* to mirror
+//! [`crate::worktree_ops::safety::find_processes_using_directory`] and had
+//! drifted from it (cwd-only vs. the #7466 any-open-fd scan), so the port
+//! reaches the one `/proc` walk and one `lsof` parse in the codebase through a
+//! flag instead of keeping a bash copy alongside.
+//!
 //! [`issue_lock`] is not a port slice: it is `worktree.sh` growing a NEW
 //! guard (#8553) that stands entirely on the Rust side by construction — this
 //! file is frozen by the file-size ratchet, so the shell side stays a single
@@ -75,5 +87,6 @@ pub mod issue_lock;
 pub mod link;
 pub mod lock;
 pub mod remove;
+pub mod reset;
 pub mod snapshot;
 pub mod wip;

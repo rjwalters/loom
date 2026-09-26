@@ -9927,6 +9927,28 @@ response body for anything beyond a batch-accepted/rejected status, and
 nothing received over this channel ever mutates daemon state — steering
 (dispatch/cancel/pause) stays with MCP, per the epic's explicit scope.
 
+### Export liveness is first-hop only (#9015)
+
+`loom-daemon status`'s `Observability:` line, `.observability_export` /
+`.observability_exports.<name>` in `status --json`, and the (anomaly-only)
+`observability` section of `loom-daemon health` all measure **one hop**: did the
+configured `observability.endpoint` acknowledge the batch this daemon POSTed?
+Nothing past that endpoint is observable from here, so `state: "healthy"` must
+never be read as "the data is in the backend". Every record therefore carries
+`scope: "first_hop"`, the human line reads `OK (first hop only)`, and
+`endpoint_loopback: true` marks an endpoint that resolves to this machine
+(`127.0.0.0/8`, `::1`, `localhost`) — i.e. a local edge collector that forwards
+onward, where the acked hop proves least of all. Both fields are derived from
+`endpoint`, never configured, and the renderers re-derive them so a payload from
+a pre-#9015 daemon still reports the caveat.
+
+**With an edge collector, pair this with an external end-to-end check** — a
+backend read-back canary, or the collector's own
+`otelcol_exporter_send_failed_*` counters on its `:8888` telemetry endpoint. A
+daemon reported `healthy` for 30h+ while a local collector accepted every POST
+and dropped it; the full incident, the state table and the recommended checks
+are in [`observability.md` §3b](observability.md#3b-confirming-telemetry-is-actually-flowing).
+
 ## Fleet dashboard (`loom-daemon serve`)
 
 `loom-daemon serve` (#4329 phases 1-3: #4391 status snapshot, #4392 SSE event
