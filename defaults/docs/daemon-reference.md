@@ -3002,15 +3002,16 @@ dynamic_cap = min(disk headroom, ram headroom, configured maxConcurrent)
 ```
 
 from live inputs, so disk/RAM/backlog changes are honored without a daemon
-restart. **`configured maxConcurrent` is the one term in that `min(...)` this
-does *not* apply to (#6203):** `autonomous.workFinder.maxConcurrent` /
-`LOOM_WORK_FINDER_MAX_CONCURRENT` is resolved once at daemon bring-up and
-threaded into the loop as a frozen value — only the `disk headroom` / `ram
-headroom` terms around it are re-read live each tick. Editing the config key
-takes effect only after a daemon restart; see the `autonomous.workFinder.maxConcurrent`
-row in the config reference table (below, under "Config surface") for the
-full mechanism and the startup log line that names the resolved value and its
-source (env / config / default).
+restart. Since #9060 that includes **`configured maxConcurrent`**: the loop
+re-reads `autonomous.workFinder.maxConcurrent` from the primary workspace's
+effective config every tick, so an edit (committed `.loom/config.json`, or
+host-local `.loom-local/local.json`) takes effect on the next tick with no
+restart and no effect on in-flight sweeps. **The `LOOM_WORK_FINDER_MAX_CONCURRENT`
+env override is the exception**: it lives in the daemon's process environment,
+fixed at launch, so while it is set it shadows config until a restart (the
+daemon logs `maxConcurrent=N is IGNORED` when a config edit is shadowed). See
+the `autonomous.workFinder.maxConcurrent` row in the config reference table
+(below, under "Config surface").
 
 > **This cap bounds SWEEP dispatch only (#6102).** Role-runner agents
 > (Curator / Judge / Doctor / Champion / Guide / …) are spawned by the role
@@ -3360,7 +3361,7 @@ concurrent), admitted entirely outside `min(disk, ram, maxConcurrent)`.
 | Config | `autonomous.roleRunner.maxConcurrent` |
 | Env | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` |
 | Default | the count of interval-cadence default roles (`role_runner::default_max_concurrent`) — **7** today |
-| Precedence | env > config > default, re-read every tick (a config edit hot-applies, unlike `maxConcurrent`) |
+| Precedence | env > config > default, re-read every tick (a config edit hot-applies, as `workFinder.maxConcurrent` does since #9060) |
 | Scope | **process-wide across every managed workspace**, because the resource it protects (host CPU/RAM) is shared by all of them |
 
 Design notes:
@@ -3642,11 +3643,11 @@ therefore ramps up over several ticks instead of bursting in one — each
 subsequent tick re-samples CPU/disk/token headroom fresh, so a ramp that turns
 out to be too aggressive self-corrects within one interval (default 60s)
 rather than in one uncontrolled burst. Resolved with the standard precedence
-**env > config > default**, single-root, at daemon startup — the same
-startup-capture pattern as `maxConcurrent`: the ramp
-cap's whole purpose is to smooth admission *within* the live per-tick
-re-computation of `max_concurrent`, so the knob itself does not need to be
-live; retuning it takes effect on the next daemon restart.
+**env > config > default**, single-root, at daemon startup — a
+startup-capture pattern `maxConcurrent` no longer shares (it hot-applies
+since #9060). The ramp cap's whole purpose is to smooth admission *within*
+the live per-tick re-computation of `max_concurrent`, so the knob itself does
+not need to be live; retuning it takes effect on the next daemon restart.
 
 #### `dispatch_sweep` headroom advisory (#4234)
 
@@ -4183,8 +4184,8 @@ knobs not yet audited here.
 | `autonomous.model` | *(per-dispatch `dispatch_sweep` `model` param)* | `sonnet` | Model pinned on **every** daemon-dispatched child (work-finder, epic supervisor, and `dispatch_sweep` when its `model` param is absent). See below (#3944) |
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop. **Restart required** — read once, before the loop is spawned; flipping it in config alone does not start/stop an already-running daemon's loop (#5963) |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
-| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Restart required** — `resolve_max_concurrent_with_config` runs once during bring-up and the resulting `configured_max` is threaded into the loop as a frozen value; the per-tick `dynamic_cap` recomputes only its `disk`/`ram` headroom terms around that fixed operator ceiling, so retuning this key in config alone changes nothing until the daemon restarts (#5963). The `work_finder: enabled (multi-workspace, …)` startup log line names the resolved value and which layer supplied it — `source=env`/`config`/`default` (#6203) — so an operator can confirm a config edit will actually take effect on the next restart without waiting for a tick. See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
-| `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the dynamic cap. Zero/invalid → default; resolved once at startup, the same startup-capture pattern as `maxConcurrent`. **Restart required** to pick up a change (#5963) |
+| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
+| `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the dynamic cap. Zero/invalid → default; resolved once at startup — a startup-capture pattern `maxConcurrent` no longer shares (it hot-applies since #9060). **Restart required** to pick up a change (#5963) |
 | `autonomous.workFinder.saturationBrake.enabled` | `LOOM_ADMISSION_BRAKE` | `true` | Saturation admission brake on/off (#4903). A safety backstop — **defaults on**. Holds *new* admissions while the host is already saturated; never preempts a running sweep. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Restart required** — resolved once at startup and registered as a process-global handle alongside the host breaker (#5963). See [Saturation admission brake](#saturation-admission-brake-4903) below |
 | `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip. **Restart required** — same startup-resolved global as `enabled` above (#5963) |
 | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` | Seconds of continuous held+0-in-flight before the `WARN`-level `STARVING` log fires once per streak (#5715). `<= 0`/invalid → default. See [Starvation escape hatch](#starvation-escape-hatch-5715) |

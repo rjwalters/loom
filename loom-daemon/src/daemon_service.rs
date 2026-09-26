@@ -1392,13 +1392,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
         // #6203: also resolve *which layer* supplied `configured_max` (env /
         // config / default) so the startup log below can tell an operator
-        // whether their `.loom/config.json` edit was actually picked up —
-        // this value is captured once here and threaded into the loop as a
-        // frozen `usize` (it does not itself hot-apply; see the work_finder
-        // module docs and daemon-reference.md's "Dynamic concurrency
-        // scaling" section for the restart-required rationale).
-        let (configured_max, configured_max_source) =
-            work_finder::resolve_max_concurrent_with_source(&work_finder_config);
+        // whether their `.loom/config.json` edit was actually picked up. This
+        // is only the loop's starting value: since #9060 the loop re-reads it
+        // every tick, so a config edit hot-applies (an env override does not
+        // — the process environment is fixed at launch).
+        let configured_max = work_finder::ConfiguredMax::resolve(&work_finder_config);
         // Retired CPU-headroom knobs (#4512): `cpuUtilizationTarget` /
         // `estCoresPerSweep` (and their env twins) are accepted-but-ignored, so
         // a fleet's committed config keeps parsing across the upgrade. Warn
@@ -1465,13 +1463,15 @@ pub(crate) async fn run_daemon() -> Result<()> {
         );
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, \
-             configured_max={configured_max} (source={configured_max_source}), \
+             configured_max={} (source={}), \
              max_admissions_per_tick={max_admissions_per_tick}, build_slots={}, \
              dynamic cap = min(disk, ram, configured_max) — token axis is \
              selection-only, not a cap, since #5270, \
-             global across workspaces; configured_max is startup-read only — \
-             a config edit requires a daemon restart to take effect, #6203)",
+             global across workspaces; configured_max is re-read every tick — \
+             a config edit hot-applies, an env override needs a restart, #9060)",
             interval.as_secs(),
+            configured_max.value,
+            configured_max.source,
             loom_daemon::build_slot::resolve_slots()
         );
         // Multi-workspace fan-out (#3928): re-reads `effective_roots()` each tick
