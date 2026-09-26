@@ -107,6 +107,18 @@
 //! **silently**: their failure mode is not a wrong message but no message, and
 //! an upstream left pointing at the default branch so a later
 //! `git pull --ff-only` fast-forwards a PR branch onto `main`'s tip.
+//!
+//! [`stale_ref`] is not a port slice either: like [`issue_lock`] it is
+//! `worktree.sh` growing NEW logic (#8287) that has to stand on the Rust side
+//! because that file is frozen — and, more pointedly, because the logic's hard
+//! part is a [`branch_landed`] question, which now has exactly one
+//! implementation. Its first attempt (PR #8351) added the decision as inline
+//! bash to a `contract`-category library and the shell budget ratchet refused
+//! it; #8354 is that refusal honoured rather than argued with. It answers
+//! *which* reference the already-registered-worktree fast path may judge
+//! staleness — and therefore `git reset --hard` — against, when a live
+//! `origin/<branch>` carries the branch's real commits and the local branch
+//! does not (the #8147/#8190 incident).
 
 pub mod baseline;
 pub mod branch_conflict;
@@ -120,6 +132,7 @@ pub mod lock;
 pub mod remove;
 pub mod reset;
 pub mod snapshot;
+pub mod stale_ref;
 pub mod submodules;
 pub mod upstream;
 pub mod wip;
