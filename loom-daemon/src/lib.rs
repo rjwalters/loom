@@ -212,6 +212,7 @@ pub mod peer_claims;
 pub mod phase_join;
 pub mod pi_usage;
 pub mod pipeline_snapshot;
+pub mod pr_latency;
 pub mod premise_check;
 pub mod primary_checkout_reaper;
 pub mod proc_exec;

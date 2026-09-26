@@ -44,6 +44,8 @@ pub(crate) mod noop_cooldown;
 pub(crate) mod opencode_usage_cli;
 pub(crate) mod peer_claims_cmd;
 pub(crate) mod pi_usage_cli;
+mod pr_latency_cmd;
+mod pr_latency_render;
 pub(crate) mod premise_check;
 pub(crate) mod provenance;
 pub(crate) mod quarantine;
