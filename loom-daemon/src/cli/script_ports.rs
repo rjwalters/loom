@@ -131,6 +131,16 @@ pub(crate) enum ScriptPortCommand {
     /// 0 = handled (no retry), 1 = not this error, 2 = auto-recovered, retry.
     WorktreeBranchConflict(super::worktree_branch_conflict::WorktreeBranchConflictArgs),
 
+    /// `worktree.sh`'s post-`git worktree add` submodule initialization
+    /// (#8195 slice 8): the `git submodule status | grep '^-' | awk '{print
+    /// $2}'` work list — #7858's whitespace-split-path class, on the string
+    /// that is then used as BOTH a `--reference` directory and a git
+    /// pathspec — plus a `timeout(1)` that does not exist on a stock macOS, a
+    /// `--reference` fast path that never once fired, and a `$$`-keyed
+    /// failure flag in world-writable `/tmp`. Exit 0 always: best-effort by
+    /// contract, and the worktree already exists.
+    WorktreeSubmodules(super::worktree_submodules::WorktreeSubmodulesArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -263,6 +273,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeCleanup(args) => args.run(),
             ScriptPortCommand::WorktreeReset(args) => args.run(),
             ScriptPortCommand::WorktreeBranchConflict(args) => args.run(),
+            ScriptPortCommand::WorktreeSubmodules(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),

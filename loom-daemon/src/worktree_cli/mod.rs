@@ -86,6 +86,15 @@
 //! quoted path, then a raw string comparison — which is #7858's class again,
 //! this time in a guard that decides whether to auto-switch a workspace
 //! rather than whether to `rm -rf` one.
+//!
+//! Slice 8 is [`submodules`]: the other post-`git worktree add` provisioning
+//! step, the sibling of [`link`]. Fifty lines of shell holding four defects
+//! that never changed a printed line — an `awk '{print $2}'` work list
+//! (#7858's class again, and here the truncated string is used as both a
+//! `--reference` directory and a git pathspec), a `timeout(1)` that a stock
+//! macOS does not have, a `--reference` fast path whose `[[ -d ]]` test was
+//! evaluated from the wrong directory and therefore never once fired, and a
+//! `$$`-keyed failure flag written into world-writable `/tmp`.
 
 pub mod baseline;
 pub mod branch_conflict;
@@ -99,4 +108,5 @@ pub mod lock;
 pub mod remove;
 pub mod reset;
 pub mod snapshot;
+pub mod submodules;
 pub mod wip;

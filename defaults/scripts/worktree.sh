@@ -1851,66 +1851,67 @@ if _try_worktree_add; then
         fi
     fi
 
-    # Initialize submodules with reference to main workspace (for object sharing)
-    # This is much faster than downloading from network and saves disk space.
+    # --------------------------------------------------------------------
+    # Submodule initialization
+    # --------------------------------------------------------------------
     #
-    # In sparse mode, `git submodule status` already lists only submodules
-    # whose path lies inside the materialized cone -- so this loop naturally
-    # filters out out-of-cone submodules without extra logic.
+    # Ported to `loom-daemon worktree-submodules` (#8195 slice 8, epic #7810).
+    # The `git submodule status | grep '^-' | awk '{print $2}'` work list, the
+    # `--reference` object-sharing decision, the per-submodule deadline and
+    # the failure summary now live in
+    # `loom-daemon/src/worktree_cli/submodules.rs` with the full design
+    # rationale they used to carry inline.
     #
-    # Uses --recursive to handle nested submodules (a top-level submodule may
-    # itself declare submodules; without --recursive those remain empty and a
-    # builder sees a half-populated reference directory with no error).
-    # Timeout is generous (300s) because cold clones of large reference corpora
-    # without an object cache can legitimately exceed 30s. Override via
-    # LOOM_SUBMODULE_TIMEOUT.
-    # Stderr is preserved (not redirected to /dev/null) so the underlying git
-    # error is visible to whoever runs worktree.sh -- the previous "Some
-    # submodules failed to initialize" warning was a black box.
-    MAIN_GIT_DIR=$(git rev-parse --git-common-dir 2>/dev/null)
-    UNINIT_SUBMODULES=$(cd "$ABS_WORKTREE_PATH" && git submodule status 2>/dev/null | grep '^-' | wc -l | tr -d ' ')
-    SUBMODULE_TIMEOUT="${LOOM_SUBMODULE_TIMEOUT:-300}"
-
-    if [[ "$UNINIT_SUBMODULES" -gt 0 ]]; then
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_info "Initializing $UNINIT_SUBMODULES submodule(s) with shared objects..."
-        fi
-
-        cd "$ABS_WORKTREE_PATH"
-
-        # Process each uninitialized submodule
-        git submodule status | grep '^-' | awk '{print $2}' | while read -r submod_path; do
-            ref_path="$MAIN_GIT_DIR/modules/$submod_path"
-
-            if [[ -d "$ref_path" ]]; then
-                # Use reference to share objects with main workspace (fast, no network)
-                if ! timeout "$SUBMODULE_TIMEOUT" git submodule update --init --recursive --reference "$ref_path" -- "$submod_path"; then
-                    echo "SUBMODULE_FAILED" > /tmp/loom-submodule-status-$$
-                fi
-            else
-                # No reference available, initialize normally (may need network)
-                if ! timeout "$SUBMODULE_TIMEOUT" git submodule update --init --recursive -- "$submod_path"; then
-                    echo "SUBMODULE_FAILED" > /tmp/loom-submodule-status-$$
-                fi
-            fi
-        done
-
-        # Check if any submodule failed
-        if [[ -f "/tmp/loom-submodule-status-$$" ]]; then
-            rm -f "/tmp/loom-submodule-status-$$"
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Some submodules failed to initialize (worktree still created)"
-                print_info "See stderr above for the underlying git error."
-                print_info "You may need to run: git submodule update --init --recursive"
-            fi
-        else
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_success "Submodules initialized with shared objects"
-            fi
-        fi
-
-        # Return to original directory
-        cd - > /dev/null
+    # This family, and not another arm of the create path, because the
+    # retired fifty lines held four defects that never changed a printed
+    # line and so survived every fix commit around them: `awk '{print $2}'`
+    # truncated a submodule path at its first space and then used the
+    # truncation as BOTH a `--reference` directory and a git pathspec
+    # (#7858's class); `timeout(1)` is GNU coreutils and a stock macOS does
+    # not have it, so on those hosts every iteration failed with `command not
+    # found`; `MAIN_GIT_DIR` held git's RELATIVE `.git` answer and was tested
+    # from inside the worktree, where `.git` is a FILE, so the object-sharing
+    # fast path this block exists for never once fired; and the failure flag
+    # was `echo`d into the world-writable, PID-keyed
+    # `/tmp/loom-submodule-status-$$`.
+    #
+    # The contract this call site preserves, verbatim: the message text and
+    # ORDER, silence under --json, the child git's stderr left visible so the
+    # underlying error is not a black box, and best-effort semantics -- a
+    # failed submodule warns and worktree creation still succeeds, which is
+    # why the exit code is discarded here and `worktree-submodules` returns 0
+    # unconditionally.
+    #
+    # ONE DELIBERATE BEHAVIOUR CHANGE, argued in the module doc: `--reference`
+    # is now actually passed. Nothing observable moves (same lines, same
+    # order, same always-0 exit) but the submodules are populated from the
+    # main workspace's object store instead of over the network -- which is
+    # what this block was written to do and what its success line has always
+    # claimed it did.
+    #
+    # No daemon binary means the submodules are simply not initialized: the
+    # worktree is usable and merely missing content a `git submodule update
+    # --init --recursive` inside it restores. That is the same honest answer
+    # `worktree-link` gives for the same class of best-effort step, and it is
+    # not a new failure mode -- the retired block already degraded to exactly
+    # this (same warning, same exit 0) on every host lacking `timeout`. So it
+    # WARNS rather than exiting 2, and `worktree.sh <issue>` keeps working on
+    # a host with no loom-daemon at all.
+    #
+    # In sparse mode `git submodule status` already lists only submodules
+    # whose path lies inside the materialized cone, so out-of-cone submodules
+    # are filtered without extra logic -- true of the port as well, which runs
+    # the same command in the same directory.
+    # requires-daemon: worktree-submodules optional   #8195 slice 8 -- a daemon predating the port skips submodule init with a warning; the worktree is created either way
+    MAIN_WORKSPACE_DIR=$(git rev-parse --show-toplevel 2>/dev/null)
+    WT_QUIET_FLAGS=()
+    [[ "$JSON_OUTPUT" != "true" ]] || WT_QUIET_FLAGS=(--quiet)
+    if [[ -n "${_WT_DAEMON_BIN:-}" ]]; then
+        "$_WT_DAEMON_BIN" worktree-submodules --repo-root "$MAIN_WORKSPACE_DIR" \
+            --worktree "$ABS_WORKTREE_PATH" --timeout "${LOOM_SUBMODULE_TIMEOUT:-300}" \
+            "${WT_QUIET_FLAGS[@]}" || true
+    elif [[ "$JSON_OUTPUT" != "true" ]]; then
+        print_warning "No loom-daemon resolved - skipping submodule initialization (worktree still created)"
     fi
 
     # --------------------------------------------------------------------
@@ -1950,12 +1951,11 @@ if _try_worktree_add; then
     # it is simply "the daemon that implements this script", honouring
     # $LOOM_DAEMON_SELF_BIN (#8193).
     # requires-daemon: worktree-link optional   #8195 slice 4 — a daemon predating the port skips the symlinks with a warning; the worktree is created either way
-    MAIN_WORKSPACE_DIR=$(git rev-parse --show-toplevel 2>/dev/null)
-    WT_LINK_FLAGS=()
-    [[ "$JSON_OUTPUT" != "true" ]] || WT_LINK_FLAGS=(--quiet)
+    # $MAIN_WORKSPACE_DIR and $WT_QUIET_FLAGS are resolved by the submodule
+    # section above, which runs unconditionally and immediately before this.
     if [[ -n "${_WT_DAEMON_BIN:-}" ]]; then
         "$_WT_DAEMON_BIN" worktree-link --repo-root "$MAIN_WORKSPACE_DIR" \
-            --worktree "$ABS_WORKTREE_PATH" "${WT_LINK_FLAGS[@]}" || true
+            --worktree "$ABS_WORKTREE_PATH" "${WT_QUIET_FLAGS[@]}" || true
     elif [[ "$JSON_OUTPUT" != "true" ]]; then
         print_warning "No loom-daemon resolved - skipping node_modules/.mcp.json/linkPaths symlinks (worktree still created)"
     fi
@@ -1963,7 +1963,7 @@ if _try_worktree_add; then
     # Run project-specific post-worktree hook if it exists
     # This allows projects to add custom setup steps (e.g., pnpm install, lake exe cache get)
     # The hook is stored in .loom/hooks/ which is NOT overwritten by Loom upgrades
-    # Note: MAIN_WORKSPACE_DIR is already set by the worktree-link section above
+    # Note: MAIN_WORKSPACE_DIR is already set by the submodule section above
     POST_WORKTREE_HOOK="$MAIN_WORKSPACE_DIR/.loom/hooks/post-worktree.sh"
     if [[ -x "$POST_WORKTREE_HOOK" ]]; then
         if [[ "$JSON_OUTPUT" != "true" ]]; then
