@@ -7,6 +7,61 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-26
+- **Issue #9105** (closed): feat(merge): default Loom merges to merge commits — preserve full commit history
+- **PR #9115**: feat(merge): merge commits become Loom's default merge method
+- **Issue #9090** (closed): feat(dispatch): repository affinity and track-focused dispatch with cross-repo CI interleaving
+- **PR #9125**: feat(dispatch): per-repo concurrency cap + track affinity in the work finder (#9090)
+- **Issue #8509** (closed): peer-claim coordination is DEGRADED on robb-studio (#6157 Layer 3)
+- **PR #9120**: fix(dashboard): default workers_dev to false and make its Access-bypass check reachable
+- **PR #9023**: feat(merge-pr): port the champion:hold-state staleness warning to Rust (#8191 slice)
+- **Issue #9088** (closed): tracing phase 2: stitch CI runs into the issue's story trace (#9037)
+- **PR #9117**: feat(ci-telemetry): stitch CI runs into the issue's D32 story trace
+- **Issue #8650** (closed): opencode runtime leaks one ~5.5 MB native-library extract into /tmp per launch and never removes it (7.6 GB / 1,382 files in 40 h on one worker)
+- **PR #8693**: fix(daemon): pin native-harness TMPDIR into launch state, reclaim it periodically
+- **Issue #9091** (closed): merge-pr.sh --auto blocks ~600s on repos with allow_auto_merge=false and zero CI checks; Champion merges silently die
+- **PR #9097**: fix(merge-pr): bound --auto's zero-check-run wait instead of burning the full timeout
+- **Issue #9113** (closed): ci: path-filter Rust daemon builds and ratchets on dashboard/web-only changes
+- **PR #9116**: ci: skip the shared daemon build on dashboard-only PRs, without skipping any gate
+- **PR #9110**: feat(worktree): port the upstream-tracking correction to `loom-daemon worktree-upstream` (#8195 slice 9)
+- **Issue #9100** (closed): Daemon: emit labels.snapshot telemetry (open issues/PRs + loom:* labels per repo) for the Live board
+- **PR #9093**: ci: 43 job definitions -> 21, required gates as composite contexts (+ #9086, #9087)
+- **Issue #9060** (closed): feat(daemon): move work-finder maxConcurrent knob resolution into the tick loop for zero-downtime tuning
+- **PR #9066**: feat(daemon): hot-reload work-finder maxConcurrent every tick (#9060)
+- **Issue #8927** (closed): loom:blocked is never re-checked: stale blockers silently suppress issues indefinitely
+- **PR #9103**: feat(sweep): fourth pre-wave advisory — detect stale/undocumented loom:blocked issues (#8927)
+- **Issue #8934** (closed): tap_usage misses Pi's real message_end shape, so Pi launches read as unmeasured tap spend
+- **PR #9101**: fix(daemon): read Pi's real message_end usage shape in tap_usage
+- **Issue #9027** (closed): feat(forensics): stamp Loom git commit SHA into commit trailers, PR bodies, and lease records
+- **Issue #9068** (closed): tracing: key the story trace on repo_id per D32 v1 (harness-ops#332 vectors)
+- **PR #9084**: feat(tracing,provenance): D32 v1 repo_id story key + D33 provenance stamps
+- **PR #9086**: ci: harden LOOM_CI_SHARD, restore a per-PR release build, derive matrix N (#9069 follow-ups)
+- **PR #9069**: ci: cut PR wall time by partitioning the long poles (#9065)
+- **PR #9082**: feat(worktree): port the submodule initialization to `loom-daemon worktree-submodules` (#8195 slice 8)
+- **PR #9076**: ci: pin every third-party action to a full commit SHA
+- **PR #9053**: feat(worktree): delegate the worktree-add lock to `loom-daemon worktree-lock` (#8195 slice 7)
+- **Issue #9038** (closed): observability: deterministic story trace id per issue; parent issue-sweep spans to it (#9037 phase 1)
+- **PR #9052**: feat(tracing): deterministic story trace per issue; parent issue sweeps to it (#9038)
+- **Issue #8922** (closed): A conflicting PR in the review queue carries no signal: loom:merge-conflict is only applied alongside a Judge verdict
+- **PR #9061**: Flag base-conflicting review-queue PRs with loom:merge-conflict (#8922)
+- **Issue #9057** (closed): merge-pr freshness guard: job-log reads fail on gh's escape-sequence refusal, silently disabling #8919's input-scoped staleness
+- **PR #9059**: fix(merge-pr): read job logs with --allow-escape-sequences so #8919's input-scoped staleness applies (#9057)
+- **PR #9054**: feat(worktree): port the branch-conflict recovery to `loom-daemon worktree-branch-conflict` (#8195 slice 7)
+- **Issue #9014** (closed): ci-telemetry captain gate: the poller silently stops on any host with no fleet.captain, and a handoff leaves a stale arm (#9002 blocking findings, merged unaddressed)
+- **PR #9050**: telemetry mega PR C: CI captain-gate visibility (#9014) + CI queued/running split (#9007 follow-up)
+- **Issue #8921** (closed): Telemetry record kinds serialize through four shared registration sites, so concurrent observability PRs conflict pairwise
+- **PR #9044**: Telemetry record kinds register in one row instead of four shared sites (#8921)
+- **PR #9040**: feat(worktree): port the race-rescue reset guard to `loom-daemon worktree-reset` (#8195 slice 6)
+- **Issue #9036** (closed): release: Linux build legs fail to link (__isoc23_sscanf) since v0.19.397 — rust-cache restores ubuntu-24.04 objects onto the ubuntu-22.04 pin
+- **PR #9042**: fix(release): key rust-cache by runner image so ubuntu-22.04 legs don't restore 24.04 objects (#9036)
+- **Issue #9015** (closed): observability_export reports "healthy" when only the first hop (local edge) accepts: 30h+ total SigNoz loss went unseen
+- **PR #9035**: fix(observability): name the first-hop scope of observability_export health (#9015)
+- **PR #9033**: Add head_sha/ref/pr_number join keys to CI run/job spans
+- **Issue #9007** (closed): Observability: correlate CI run spans with sweep traces (head_sha / PR join keys) for a Builder vs CI-queue vs Judge breakdown
+- **Issue #8919** (closed): #8248 freshness guard: in-place re-runs still lose to a busy main (input-aware staleness or a fast required-checks workflow)
+- **PR #9031**: fix(merge-pr): input-scoped required-check staleness, keyed on the tested base (#8919)
+- **Issue #8700** (closed): bug(runtime): spawn-generic-launch.sh resolves the tier-3 manifest from cwd instead of the REPO_ROOT it already computed
+- **PR #9024**: fix(runtime): resolve the tier-3 launch shape from the script's repo root, not the daemon's cwd (#8700)
+- **PR #8982**: chore: resync installed Loom surfaces
 - **Issue #8850** (closed): ci-telemetry: a rejected forge credential should back off the whole org, not fail 42 repos one at a time
 - **Issue #8553** (closed): worktree.sh does not consult .loom/locks/<issue> — two sessions can collide in one worktree
 - **Issue #8470** (closed): Converge the two Rust branch-landed ladders (worktree_ops::landed vs worktree_cli::branch_landed)

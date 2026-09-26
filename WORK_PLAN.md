@@ -9,16 +9,16 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#8613**: chore: scrub private host identifiers and operator identities from HEAD
-- **#8893**: feat(install): add --mode session install-time flag
+- **#8559**: Adopt Renovate dependency security policy (14-day quarantine)
+- **#9119**: fix(role-tool-policy): one wildcard rule — fail closed on a glob-shaped capability (#8943)
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
 - **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh
 - **#8838**: rework #8486 (issue #8458): bring the per-worktree CARGO_TARGET_DIR portable-shell delta to <= 0 (declaration commit ineffective - portable pool has no declare-exit)
+- **#8841**: resync-installed.sh materialized .loom/docs/private-session-dispatch.md as a real file instead of a symlink, breaking Docs/Defaults Parity Check on main
 
 ## Ready
 
@@ -33,12 +33,13 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#8354**: Port _worktree_resolve_stale_reset_ref (#8287) to loom-daemon per shell-language-policy
 - **#8458**: cargo: per-worktree CARGO_TARGET_DIR wired to worktree lifecycle, preserving the #6013/#6014 binary-reuse fast path (#8453 item 2)
 - **#8460**: guard rmScope: allow removing a private build/target dir the current session created under a scratch root (#8453 item 5)
-- **#8650**: opencode runtime leaks one ~5.5 MB native-library extract into /tmp per launch and never removes it (7.6 GB / 1,382 files in 40 h on one worker)
+- **#8589**: Public-surface scrub: fleet EC2 private hostnames in WORK_LOG.md + a Rust doc comment, and operator-domain emails in test fixtures, are live at HEAD
 - **#8787**: Admit Codex mutable roles using verified private-clone containment
 - **#8838**: rework #8486 (issue #8458): bring the per-worktree CARGO_TARGET_DIR portable-shell delta to <= 0 (declaration commit ineffective - portable pool has no declare-exit)
-- **#8840**: Investigate daemon dispatch superseding a freshly renewed in-session sweep lease
 - **#8841**: resync-installed.sh materialized .loom/docs/private-session-dispatch.md as a real file instead of a symlink, breaking Docs/Defaults Parity Check on main
 - **#8875**: install over a pre-#4187 install duplicates 11 workflow labels, so sync-labels.sh --check can never converge
+- **#8884**: Install-time session-mode flag: empty terminals + loom.sh start refusal
+- **#8925**: Blocked PRs have no unblock path: the unblock sweep lists issues only, and a park recorded in a comment leaves no parseable dependency
 
 ## In Progress
 
@@ -46,26 +47,30 @@ Issues currently being built (`loom:building`).
 
 - **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
 - **#8195**: Port worktree.sh to a daemon subcommand (1,812 lines; 26 fixes in 6 months, three of them data-loss classes)
-- **#8700**: bug(runtime): spawn-generic-launch.sh resolves the tier-3 manifest from cwd instead of the REPO_ROOT it already computed
-- **#8919**: #8248 freshness guard: in-place re-runs still lose to a busy main (input-aware staleness or a fast required-checks workflow)
-- **#9007**: Observability: correlate CI run spans with sweep traces (head_sha / PR join keys) for a Builder vs CI-queue vs Judge breakdown
-- **#9014**: ci-telemetry captain gate: the poller silently stops on any host with no fleet.captain, and a handoff leaves a stale arm (#9002 blocking findings, merged unaddressed)
-- **#9015**: observability_export reports "healthy" when only the first hop (local edge) accepts: 30h+ total SigNoz loss went unseen
+- **#8923**: Investigate and reduce PR latency: the review queue is 4h deep, but approved-awaiting-merge is 68h and changes-requested is 90h
+- **#9123**: install.sh --full fails its own completeness check: .loom/credentials.md.example is recorded in install-metadata.json but never copied (--quick hides it)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#8531**: feat(guard): admit rm of the session's own private scratch dir under rmScope
+- **#8613**: chore: scrub private host identifiers and operator identities from HEAD
+- **#8893**: feat(install): add --mode session install-time flag
+- **#9046**: fix(security): remove leaked token-pool copy from main; ignore sibling token dirs
+- **#9080**: feat(dashboard): Live tab — perpetually-updating status board (#9077)
+- **#9099**: feat(dashboard): Live board cards never move, and show label transitions (#9094)
+- **#9137**: feat(daemon): measure PR queue latency by segment and surface silent queues pre-wave
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#8613**: chore: scrub private host identifiers and operator identities from HEAD
+- **#8559**: Adopt Renovate dependency security policy (14-day quarantine)
 - **#8680**: feat(daemon-update): port loom-daemon-update.sh to a daemon subcommand
-- **#8893**: feat(install): add --mode session install-time flag
-- **#8982**: chore: resync installed Loom surfaces
+- **#8853**: fix(dispatch): admit a renewed lease into the claim-episode comparison
+- **#9118**: ci: move spawn-claude off the critical path; #9093 review nits
+- **#9119**: fix(role-tool-policy): one wildcard rule — fail closed on a glob-shaped capability (#8943)
 
 ## Proposed
 
@@ -101,11 +106,9 @@ Issues carrying `loom:curated`.
 - **#8589**: Public-surface scrub: fleet EC2 private hostnames in WORK_LOG.md + a Rust doc comment, and operator-domain emails in test fixtures, are live at HEAD *(curated)*
 - **#8606**: Run a live Kimi Code CLI canary with a real Moonshot/Kimi credential and record a docs/experiments receipt *(curated)*
 - **#8628**: Kimi account pool C2: AccountProvider::Kimi, kimi login lifecycle CLI, per-account KIMI_CODE_HOME, availability probe *(curated)*
-- **#8650**: opencode runtime leaks one ~5.5 MB native-library extract into /tmp per launch and never removes it (7.6 GB / 1,382 files in 40 h on one worker) *(curated)*
 - **#8667**: Fleet feed: ModelLabels.tsx needs a Kimi/Moonshot label+icon mapping (marketing-site repo, follow-up to #8564/#8507) *(curated)*
 - **#8698**: Live end-to-end verification of the credential egress proxy (AC5 of #8674) *(curated)*
 - **#8699**: Per-launch usage attribution and 429 bad-marking at the credential egress proxy (follow-up to #8674) *(curated)*
-- **#8700**: bug(runtime): spawn-generic-launch.sh resolves the tier-3 manifest from cwd instead of the REPO_ROOT it already computed *(curated)*
 - **#8726**: resync-ignore pins record no fork point: 'can this pin be lifted yet?' is archaeology, not a diff *(curated)*
 - **#8730**: config: this repo pins runtimes.roles.judge = "codex" on a host with no Codex account — 157 Judge ticks skipped before spawn *(curated)*
 - **#8742**: loom:blocked is silently stripped from operator-ruled permanent blocks (unblock probe treats 'unparseable blocker' as 'no blocker') *(curated)*
@@ -125,7 +128,11 @@ Issues carrying `loom:curated`.
 - **#8902**: Fleet captain: alert when the declared captain stops reporting host.health (lease, not failover) *(curated)*
 - **#8913**: observability: live-verify ci.job.log reconstruction in SigNoz and record it in evidence.md (#8825 AC1) *(curated)*
 - **#8917**: ci-telemetry: the local journal has no rotation and is read whole on every backfill — phase-2 log capture makes it a GB/day, whole-file-read problem *(curated)*
-- **#9007**: Observability: correlate CI run spans with sweep traces (head_sha / PR join keys) for a Builder vs CI-queue vs Judge breakdown *(curated)*
+- **#8923**: Investigate and reduce PR latency: the review queue is 4h deep, but approved-awaiting-merge is 68h and changes-requested is 90h *(curated)*
+- **#8925**: Blocked PRs have no unblock path: the unblock sweep lists issues only, and a park recorded in a comment leaves no parseable dependency *(curated)*
+- **#8943**: Unify the two wildcard rules in the per-role tool restriction: spawn-claude's substring test fails open where spawn-codex's exact match fails closed *(curated)*
+- **#8944**: worktree node_modules symlinks the primary clone, so pnpm's purge prompt invites deleting it *(curated)*
+- **#9123**: install.sh --full fails its own completeness check: .loom/credentials.md.example is recorded in install-metadata.json but never copied (--quick hides it) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -149,11 +156,11 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 2 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 15 |
-| In Progress (`loom:building`) | 7 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 4 |
-| Curated | 55 |
+| Ready (`loom:issue`) | 16 |
+| In Progress (`loom:building`) | 4 |
+| PRs awaiting review | 7 |
+| Approved PRs awaiting merge | 5 |
+| Curated | 57 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 6 |
 <!-- guide:plan-body:end -->
