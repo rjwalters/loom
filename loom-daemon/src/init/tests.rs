@@ -2647,3 +2647,241 @@ fn test_deep_merge_existing_wins_unit() {
     // Arrays are replaced wholesale by the overlay (non-object value).
     assert_eq!(base["arr"], serde_json::json!([9]));
 }
+
+// ---------------------------------------------------------------------------
+// #9123: the copy enumeration and the installed-files enumeration must agree
+// ---------------------------------------------------------------------------
+
+/// Repo root (`loom-daemon/`'s parent), for tests that run against the real
+/// shipped tree. Same resolution the `test_real_defaults_*` tests above use.
+fn repo_root_for_tests() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("loom-daemon/ has a parent")
+        .to_path_buf()
+}
+
+/// Every file `defaults/.loom/` ships, as target-relative paths
+/// (`.loom/<relative path>`), discovered by walking the source tree.
+fn defaults_loom_tree_paths(defaults: &Path) -> std::collections::BTreeSet<String> {
+    fn walk(dir: &Path, prefix: &str, out: &mut std::collections::BTreeSet<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_loom_payload_artifact(&name) {
+                continue;
+            }
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => walk(&entry.path(), &rel, out),
+                Ok(_) => {
+                    out.insert(format!(".loom/{rel}"));
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk(&defaults.join(".loom"), "", &mut out);
+    out
+}
+
+/// Run `scripts/install/manifest.sh`'s `_emit_loom_ownership_set` — the
+/// enumeration that becomes `install-metadata.json`'s `installed_files` — and
+/// return it as a set of target-relative paths.
+fn installed_files_manifest(repo_root: &Path, target: &Path) -> std::collections::BTreeSet<String> {
+    let script = repo_root.join("scripts/install/manifest.sh");
+    assert!(
+        script.is_file(),
+        "manifest helper not found at {script:?} — repo layout changed?"
+    );
+
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(r#"set -euo pipefail; source "$LOOM_ROOT/scripts/install/manifest.sh"; _emit_loom_ownership_set"#)
+        .env("LOOM_ROOT", repo_root)
+        .env("TARGET_PATH", target)
+        .output()
+        .expect("failed to run bash for the installed-files manifest");
+    assert!(
+        out.status.success(),
+        "manifest.sh failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+#[test]
+fn test_defaults_loom_tree_copy_and_manifest_enumerations_agree() {
+    // Issue #9123. `install-metadata.json`'s `installed_files` comes from
+    // `scripts/install/manifest.sh`, which WALKS `defaults/` and registers
+    // every file under `defaults/.loom/` as Loom-installed. The copy side
+    // (this crate's `initialize_workspace`) used to name the members of that
+    // subtree one by one — `.loom/biome.jsonc` and `.loom/bin/` — so
+    // `defaults/.loom/credentials.md.example` was recorded as installed and
+    // never copied: `install.sh --full` failed its own completeness check and
+    // `--quick`, which does not run that check, reported success on the same
+    // incomplete install.
+    //
+    // This asserts the two enumerations produce the SAME SET for a fresh
+    // target, which is the property the fix restores. It fails for ANY future
+    // file dropped from the `defaults/.loom/` copy, not just that one.
+    let repo_root = repo_root_for_tests();
+    let defaults = repo_root.join("defaults");
+    assert!(defaults.is_dir(), "shipped defaults/ tree not found at {defaults:?}");
+
+    let temp_dir = TempDir::new().unwrap();
+    let workspace = temp_dir.path();
+    fs::create_dir(workspace.join(".git")).unwrap();
+
+    let result =
+        initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+    assert!(result.is_ok(), "init against real defaults/ failed: {:?}", result.err());
+
+    // The enumeration that feeds `installed_files`, narrowed to the entries
+    // that originate in `defaults/.loom/` (the rest of the manifest is
+    // materialized by other surfaces — `defaults/roles/`, `defaults/config/`
+    // via install-loom.sh, and so on).
+    let shipped = defaults_loom_tree_paths(&defaults);
+    assert!(
+        !shipped.is_empty(),
+        "defaults/.loom/ ships no files — the fixture for this test is gone"
+    );
+    let manifest: std::collections::BTreeSet<String> =
+        installed_files_manifest(&repo_root, workspace)
+            .into_iter()
+            .filter(|p| shipped.contains(p))
+            .collect();
+
+    // Side 1: the manifest walk lists every file the tree ships.
+    assert_eq!(
+        manifest, shipped,
+        "scripts/install/manifest.sh no longer lists every file under defaults/.loom/"
+    );
+
+    // Side 2: the copy walk put every one of them on disk.
+    let on_disk: std::collections::BTreeSet<String> = shipped
+        .iter()
+        .filter(|p| workspace.join(p).is_file())
+        .cloned()
+        .collect();
+    assert_eq!(
+        on_disk,
+        manifest,
+        "install-metadata.json's installed_files and the files loom-daemon init \
+         actually copies disagree (#9123). Recorded but never copied: {:?}",
+        manifest.difference(&on_disk).collect::<Vec<_>>()
+    );
+
+    // Sanity: the set is non-trivial and spans both shapes the walk handles —
+    // a top-level file inside `.loom/`, a file in a subdirectory of `.loom/`,
+    // and a template-substituted member written by scaffolding.
+    for expected in &[".loom/biome.jsonc", ".loom/bin/loom", ".loom/CLAUDE.md"] {
+        assert!(
+            manifest.contains(*expected),
+            "{expected} missing from the agreed set — test no longer covers what it claims"
+        );
+    }
+}
+
+#[test]
+fn test_init_copies_top_level_file_inside_defaults_loom_tree() {
+    // Issue #9123, fixture-tree form: a `defaults/.loom/` carrying a top-level
+    // file ALONGSIDE subdirectories. The pre-fix copy path enumerated that
+    // subtree by name, so a top-level file nobody had hardcoded (the real one
+    // was `credentials.md.example`) was silently skipped while subdirectories
+    // still landed. Nothing here is named in `sync_loom_payload_tree` — the
+    // file lands because the tree is walked.
+    let temp_dir = TempDir::new().unwrap();
+    let workspace = temp_dir.path();
+    let defaults = workspace.join("defaults");
+
+    fs::create_dir(workspace.join(".git")).unwrap();
+    fs::create_dir_all(defaults.join(".loom").join("bin")).unwrap();
+    fs::create_dir_all(defaults.join(".loom").join("presets")).unwrap();
+    fs::write(defaults.join("config.json"), "{}").unwrap();
+
+    // A top-level file inside `.loom/` with no dedicated call site anywhere.
+    fs::write(defaults.join(".loom").join("sample.md.example"), "# sample payload\n").unwrap();
+    // …a second one, to prove this is not a one-name carve-out.
+    fs::write(defaults.join(".loom").join("payload.json"), "{\"a\":1}\n").unwrap();
+    // …a subdirectory member, which already worked and must keep working.
+    fs::write(defaults.join(".loom").join("bin").join("loom"), "#!/bin/sh\n").unwrap();
+    fs::write(defaults.join(".loom").join("presets").join("nested.txt"), "nested\n").unwrap();
+    // …and a template-substituted member owned by scaffolding.
+    fs::write(defaults.join(".loom").join("CLAUDE.md"), "# Loom {{LOOM_VERSION}}\n").unwrap();
+
+    let result =
+        initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+    assert!(result.is_ok(), "init failed: {:?}", result.err());
+    let report = result.unwrap();
+
+    for (rel, contents) in &[
+        ("sample.md.example", "# sample payload\n"),
+        ("payload.json", "{\"a\":1}\n"),
+        ("bin/loom", "#!/bin/sh\n"),
+        ("presets/nested.txt", "nested\n"),
+    ] {
+        let installed = workspace.join(".loom").join(rel);
+        assert!(
+            installed.is_file(),
+            ".loom/{rel} should be installed from defaults/.loom/{rel} (#9123)"
+        );
+        assert_eq!(&fs::read_to_string(&installed).unwrap(), contents);
+        assert!(
+            report.added.contains(&format!(".loom/{rel}")),
+            "report should list .loom/{rel} as added, got: {:?}",
+            report.added
+        );
+    }
+
+    // Scaffolding still owns the substituted members.
+    let claude = fs::read_to_string(workspace.join(".loom").join("CLAUDE.md")).unwrap();
+    assert!(!claude.contains("{{"), ".loom/CLAUDE.md must be template-substituted: {claude}");
+}
+
+#[test]
+fn test_init_fails_when_defaults_loom_tree_file_is_not_materialized() {
+    // The post-condition that makes `LOOM_TREE_SCAFFOLDED_FILES` safe (#9123):
+    // a name on that list is skipped by the verbatim walk, so if the handler
+    // that was supposed to write it does not, the init must FAIL rather than
+    // hand back a `.loom/` that is missing a file `install-metadata.json`
+    // already claims. `AGENTS.md` is on the list and
+    // `setup_repository_scaffolding` only writes it when the workspace has a
+    // root `AGENTS.md` anchor to pair it with — here we make the source exist
+    // while blocking the destination, to prove the assertion actually fires.
+    let temp_dir = TempDir::new().unwrap();
+    let workspace = temp_dir.path();
+    let defaults = workspace.join("defaults");
+
+    fs::create_dir(workspace.join(".git")).unwrap();
+    fs::create_dir_all(defaults.join(".loom")).unwrap();
+    fs::write(defaults.join("config.json"), "{}").unwrap();
+
+    let err = assert_loom_payload_tree_complete(&defaults, &workspace.join(".loom"));
+    assert!(err.is_ok(), "an empty defaults/.loom/ has nothing to miss: {err:?}");
+
+    fs::write(defaults.join(".loom").join("orphan.md.example"), "x\n").unwrap();
+    let err = assert_loom_payload_tree_complete(&defaults, &workspace.join(".loom"))
+        .expect_err("a file shipped in defaults/.loom/ but absent on disk must fail the init");
+    assert!(
+        err.contains(".loom/orphan.md.example"),
+        "error must name the missing path, got: {err}"
+    );
+    assert!(
+        err.contains("install-metadata.json"),
+        "error must explain why it matters (the metadata-vs-disk check), got: {err}"
+    );
+}
