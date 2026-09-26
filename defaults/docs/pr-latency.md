@@ -6,7 +6,7 @@ Champion digest, or a sweep advisory means the same thing in all three (Issue
 #8923).
 
 Every question `PL<n>` below is implemented by `loom-daemon pr-latency`, and
-[`loom-daemon/tests/pr_latency_artifacts.rs`](../../loom-daemon/tests/pr_latency_artifacts.rs)
+[`loom-daemon/tests/pr_latency_artifacts.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/tests/pr_latency_artifacts.rs)
 fails if this doc and the implementation disagree about the set.
 
 ```bash
@@ -17,7 +17,7 @@ loom-daemon pr-latency --advise             # live queues only, warn past a thre
 
 ## Why this is not the cycle-time rollup
 
-[`cycle-time-questions.md`](../observability/cycle-time-questions.md) (#8665)
+[`cycle-time-questions.md`](https://github.com/rjwalters/loom/blob/main/defaults/observability/cycle-time-questions.md) (#8665)
 answers *"what took long to **ship**?"* from the telemetry stream, and its own
 "what this cannot answer" section rules out precisely this question:
 
