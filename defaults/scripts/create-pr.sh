@@ -282,10 +282,11 @@ fi
 #
 # Append ONE hidden `<!-- loom:provenance v1 ... -->` line to the body. Its
 # fields and format are `loom-daemon provenance pr-marker`'s (no format logic
-# lives here); a body that already carries a record (a re-run) is left alone.
+# lives here); a body that already carries a record at the start of a line (a
+# re-run) is left alone -- prose quoting the marker mid-line does not count.
 # With no daemon that knows the subcommand the record is still written, every
 # field the literal `unknown` -- D33 forbids omitting it.
-if [[ "$BODY" != *"<!-- loom:provenance "* ]] && source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"; then
+if [[ $'\n'"$BODY" != *$'\n<!-- loom:provenance '* ]] && source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"; then
   BODY+=$'\n\n'"$("$(loom_resolve_self_daemon_bin 2>/dev/null)" provenance pr-marker ${CLOSES_ISSUE:+--issue "$CLOSES_ISSUE"} ${BASE_BRANCH:+--base-ref "origin/$BASE_BRANCH"} 2>/dev/null || echo '<!-- loom:provenance v1 build=unknown prompts=unknown sweep=unknown story=unknown trace=unknown host=unknown base=unknown -->')"
 fi
 

@@ -108,6 +108,11 @@ $FALLBACK"
 assert_eq "1" "$(marker_count)" "T3: existing record is not duplicated"
 assert_eq "" "$(cat "$STUB_DIR/daemon-args.txt" 2>/dev/null || true)" "T3: daemon not consulted"
 
+# T4: prose that merely quotes the marker mid-line is not a record.
+LOOM_DAEMON_SELF_BIN="$STUB_DIR/daemon-ok" run_create_pr --body "Closes #42
+Appends a \`<!-- loom:provenance v1 ... -->\` line."
+assert_eq "$MARKER" "$(last_line)" "T4: a quoted marker in prose still gets a record"
+
 echo ""
 echo "Tests run: $TESTS_RUN, failed: $TESTS_FAILED"
 [[ "$TESTS_FAILED" -eq 0 ]]
