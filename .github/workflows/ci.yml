@@ -28,6 +28,15 @@ concurrency:
 # minutes, so a PR's own saves bought nothing but churn. main-only saves make
 # the cache one deterministic mechanism: every PR restores main's entry for
 # that job.
+# Test and dev builds keep line numbers in backtraces but drop the rest of
+# the DWARF debug info (#9065). Measured on 4 cores, `nextest --no-run`
+# (PR #9070): rebuild + relink of every test binary 55s -> 37s, cold build
+# 208s -> 187s, target/ 12 GB -> 6.9 GB. The smaller target/ also eases the
+# 10 GB Actions cache. Release builds are unaffected.
+env:
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
 jobs:
   # Belt-and-suspenders cancellation (#6683): the native `cancel-in-progress`
   # above does NOT reliably cancel a superseded run that is still `queued`
