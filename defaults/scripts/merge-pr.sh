@@ -886,22 +886,31 @@ _check_defaults_version_bump_collision
 # from the current head. forge_get_pr's response has no `.comments` (unlike
 # champion-pr-merge.md's own `gh pr view --json comments,...` fetch), so this
 # needs the dedicated forge_get_pr_comments() helper (lib/forge-helpers.sh).
+#
+# The marker extraction and the staleness comparison are
+# `loom-daemon merge-pr hold-state` (Rust, loom-daemon/src/merge_pr/
+# hold_state.rs -- #8191 slice). Only the forge READ stays here, so this
+# script keeps owning the GitHub/Gitea split forge_get_pr_comments encodes.
+# The retired `grep -o '...head=[0-9a-f]*' | tail -1 | sed` pipeline lost this
+# warning silently in two ways the port fixes: `[0-9a-f]*` also matched the
+# documentation line `head=<sha>` (quoted in champion-pr-merge.md and in this
+# file), and `tail -1` then let that empty capture erase a real hold's SHA;
+# and a bare substring anywhere -- prose, backticks, an example -- counted as
+# recorded state, the hazard Champion's own reader answered with `startswith`
+# (#5371). See the module docs for both, and for the fence-stripping
+# divergence deliberately NOT taken.
+#
+# Advisory, so it fails OPEN, unlike every gate around it: a binary that
+# cannot run this check has not found a reason to stop the merge, and turning
+# "could not warn" into a refusal would make an advisory note more fatal than
+# the gates. The fault is still said out loud rather than swallowed.
 _check_champion_hold_state_staleness() {
-  local comments hold_head
+  local comments msg rc=0
   comments="$(forge_get_pr_comments "$REPO_NWO" "$PR_NUMBER" 2>/dev/null || true)"
   [[ -n "$comments" ]] || return 0
-
-  # Mirrors champion-pr-merge.md's own extraction (same marker, same capture
-  # group); "last" match wins in case of multiple hold episodes on one PR.
-  hold_head="$(printf '%s\n' "$comments" \
-    | grep -o 'champion:hold-state head=[0-9a-f]*' \
-    | tail -1 \
-    | sed -n 's/.*head=\([0-9a-f]*\)/\1/p')" || true
-  [[ -n "$hold_head" ]] || return 0
-
-  if [[ "$hold_head" != "$PR_HEAD_SHA" ]]; then
-    warning "champion:hold-state marker recorded head=$hold_head, but PR #$PR_NUMBER's current head is $PR_HEAD_SHA — the hold/approval state may have been recorded against a different tree than the one about to merge. loom:pr's presence means Judge approved SOME head; verify it still covers this one before proceeding."
-  fi
+  msg="$(printf '%s\n' "$comments" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr hold-state --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" 2>/dev/null)" || rc=$?
+  [[ $rc -eq 0 ]] || { warning "The champion:hold-state staleness check (#7419) did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr hold-state' exited $rc (a loom-daemon predating #8191's slice has no such verb). Advisory only: the merge is NOT blocked by this, but nothing verified that Champion's recorded hold head matches the head being merged. Build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer) to restore it."; return 0; }
+  [[ "$msg" == "LOOM-HOLD-STATE-CLEAN" || -z "$msg" ]] || warning "$msg"
 }
 
 # The decision itself (loom:pr present? overridden? blocked, and the exact
