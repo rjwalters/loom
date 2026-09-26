@@ -149,9 +149,10 @@ fn a_hold_span_covers_arm_to_clear_with_allowlisted_attributes() {
     assert!(span.validate().is_ok());
     assert_eq!(span.attributes["loom.pool.hold.post_mortem"], "true");
     assert_eq!(span.attributes["loom.pool.hold.accounts"], "4");
-    assert!(span
-        .attributes
-        .keys()
-        .all(|k| OPS_SPAN_ATTRIBUTE_KEYS.contains(&k.as_str())));
+    assert!(span.attributes.keys().all(|k| {
+        OPS_SPAN_ATTRIBUTE_KEYS.contains(&k.as_str())
+            || crate::telemetry::trace::provenance::KEYS.contains(&k.as_str())
+    }));
+    assert_eq!(span.attributes["loom.daemon.version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(span.clone().bounded().attributes, span.attributes, "survives export policy");
 }
