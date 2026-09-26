@@ -325,9 +325,18 @@ pub fn actions_job_id(app_slug: Option<&str>, details_url: Option<&str>) -> Opti
 }
 
 /// One workflow job's log, as plain text. `gh api` follows GitHub's 302 to the
-/// log blob, so this is a single read.
+/// log blob, so this is a single read. Actions logs carry ANSI colour codes,
+/// which `gh` refuses to print without `--allow-escape-sequences`; without it
+/// every read failed and the guard silently fell back to the time rule
+/// (#9057). A `gh` predating the flag rejects it, so retry without it.
 fn fetch_job_log(gh: &str, nwo: &str, job_id: u64) -> Result<String, String> {
-    gh_api(gh, &[&format!("repos/{nwo}/actions/jobs/{job_id}/logs")])
+    let path = format!("repos/{nwo}/actions/jobs/{job_id}/logs");
+    match gh_api(gh, &[&path, "--allow-escape-sequences"]) {
+        Err(e) if crate::ci_telemetry::api::mentions_unknown_escape_flag(&e) => {
+            gh_api(gh, &[&path])
+        }
+        other => other,
+    }
 }
 
 /// `P` — the PR's own changed files, paginated, keeping removals and renames.
@@ -539,3 +548,6 @@ pub fn live_inputs_with(
         scoped,
     })
 }
+
+#[cfg(test)]
+mod tests;

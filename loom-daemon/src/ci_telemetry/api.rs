@@ -231,7 +231,7 @@ impl GhCliApi {
 /// `--allow-escape-sequences`; a `gh` that predates the flag rejects it as
 /// unknown. Either way the failure text names the flag, so the fallback is
 /// keyed on that rather than on a version probe.
-fn mentions_unknown_escape_flag(detail: &str) -> bool {
+pub(crate) fn mentions_unknown_escape_flag(detail: &str) -> bool {
     let lowered = detail.to_ascii_lowercase();
     lowered.contains("allow-escape-sequences")
         && (lowered.contains("unknown flag") || lowered.contains("unknown command"))
