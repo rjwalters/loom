@@ -29,6 +29,14 @@ pub enum SpanName {
     /// One work-finder tick (Issue #8860) — its own root trace per tick.
     #[serde(rename = "loom.dispatch.tick")]
     DispatchTick,
+    /// One execution's exact token usage (Issue #8908): a late child of its
+    /// `loom.runtime.run` span, journalled once usage is known.
+    #[serde(rename = "loom.runtime.usage")]
+    RuntimeUsage,
+    /// One pool dispatch hold, from arming to clearing (Issue #8931) — its own
+    /// root trace.
+    #[serde(rename = "loom.pool.hold")]
+    PoolHold,
 }
 
 impl SpanName {
@@ -44,6 +52,8 @@ impl SpanName {
             Self::CiRun => "loom.ci.run",
             Self::CiJob => "loom.ci.job",
             Self::DispatchTick => "loom.dispatch.tick",
+            Self::RuntimeUsage => "loom.runtime.usage",
+            Self::PoolHold => "loom.pool.hold",
         }
     }
 }

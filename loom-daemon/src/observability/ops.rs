@@ -21,12 +21,20 @@
 //! `host.health` cadence), [`queue`] (ready-queue depth per tick, #8852
 //! phase 2), [`quota`] (#8857: token burn and pool exhaustion on the
 //! `host.health` cadence) and [`dwell`] (ready-queue wait and starvation per
-//! multi-workspace tick, #8856). A new emitter adds a `MetricName`/`SpanName`
+//! multi-workspace tick, #8856). [`pool_marks`] (#8931) emits a
+//! reason-classified counter at each seam that marks a pool account, and one
+//! span per pool dispatch hold. A new emitter adds a `MetricName`/`SpanName`
 //! variant and calls the same two functions.
+//!
+//! Tests observe what a seam emitted through the global functions with
+//! [`capture::capture`], a per-thread recorder (test builds only).
 
+#[cfg(test)]
+pub mod capture;
 pub mod dispatch;
 pub mod dwell;
 pub mod host;
+pub mod pool_marks;
 pub mod queue;
 pub mod quota;
 
@@ -153,6 +161,10 @@ pub fn global_ops_sink() -> Option<&'static OpsSink> {
 
 /// Emit `points` through the global sink; a no-op when none is registered.
 pub fn emit_metrics(points: Vec<MetricPoint>) {
+    #[cfg(test)]
+    let Some(points) = capture::metrics(points) else {
+        return;
+    };
     if let Some(sink) = global_ops_sink() {
         sink.emit_metrics(points);
     }
@@ -161,6 +173,10 @@ pub fn emit_metrics(points: Vec<MetricPoint>) {
 /// Emit a completed span through the global sink; a no-op when none is
 /// registered.
 pub fn emit_span(span: SpanRecord) {
+    #[cfg(test)]
+    let Some(span) = capture::span(span) else {
+        return;
+    };
     if let Some(sink) = global_ops_sink() {
         sink.emit_span(span);
     }

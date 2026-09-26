@@ -358,3 +358,88 @@ category=TOKEN_EXHAUSTED exit_code=1 model=none'\n\
         "the hold must end at the horizon the provider's own refusal named: {health:?}"
     );
 }
+
+// ---- #8931: reason-classified `loom.pool.account_marks` at this seam ----
+
+/// The Codex half: one real role tick whose adapter reports
+/// `TOKEN_EXHAUSTED` emits exactly one `exhausted` mark for `codex`.
+#[test]
+#[serial]
+fn codex_role_tick_mark_emits_exactly_one_reason_classified_point() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    codex_judge_workspace(workspace.path());
+    write_executable(
+        &workspace.path().join(".loom/scripts/spawn-worker.sh"),
+        "#!/bin/sh\n\
+         echo '# LOOM_ACCOUNT name=alice'\n\
+         echo '# LOOM_TERMINAL_RESULT v=2 provider=codex account=alice \
+category=TOKEN_EXHAUSTED exit_code=1 model=none'\n\
+         exit 1\n",
+    );
+    let (outcome, captured) = crate::observability::ops::capture::capture(|| {
+        judge_runner(workspace.path()).invoke("judge", "/loom:judge")
+    });
+    assert!(!outcome.is_success(), "{outcome:?}");
+    let marks: Vec<_> = captured
+        .metrics
+        .iter()
+        .filter(|p| p.name.as_str() == "loom.pool.account_marks")
+        .collect();
+    assert_eq!(marks.len(), 1, "{:?}", captured.metrics);
+    assert_eq!(marks[0].labels["provider"], "codex");
+    assert_eq!(marks[0].labels["reason"], "exhausted");
+    assert!(!serde_json::to_string(marks[0]).unwrap().contains("alice"));
+}
+
+/// The native half, at the seam itself: a pool-selected launch whose harness
+/// hit a rate limit is bad-marked and emits one `rate_limited` mark.
+#[test]
+fn native_role_tick_mark_emits_exactly_one_reason_classified_point() {
+    use crate::api_keys_pool::{ingest::LAUNCH_RECORD_PREFIX, paths, registry as keys};
+    let workspace = tempfile::tempdir().unwrap();
+    let pool = paths::per_repo_api_keys_dir(workspace.path());
+    keys::add(&pool, "loomtest", "bob", "LOOM_TEST_KEY_8931", "fake-key", false).unwrap();
+    let anchor = "==== role tick 8931 ====";
+    let launch = serde_json::json!({
+        "schema": 1, "runtime": "opencode", "provider": "zai-coding-plan",
+        "model": "glm-5.3-flash", "profile": "zai-flash", "effort": null,
+        "credentialSource": "pool", "credentialProvider": "loomtest",
+        "credentialAccount": "bob", "usage": "native-json-events",
+        "billing": "not-measured",
+    });
+    let log_path = workspace.path().join("role.log");
+    fs::write(
+        &log_path,
+        format!(
+            "{anchor}\n{LAUNCH_RECORD_PREFIX}{launch}\n# LOOM_CLI_START runtime=opencode\n\
+             {}\n",
+            crate::api_keys_pool::classify::CAPTURED_KIMI_RATE_LIMIT_EXHAUSTED
+        ),
+    )
+    .unwrap();
+    let admission = crate::runtime_admission::ResolvedRuntime {
+        role: "judge".into(),
+        runtime: "opencode".into(),
+        source: crate::runtime_admission::RuntimeSource::Explicit,
+        adapter: PathBuf::new(),
+        role_manifest: PathBuf::new(),
+        runtime_manifest: PathBuf::new(),
+        suggested_worker_type: None,
+        preference: None,
+    };
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        apply_role_tick_provider_health_feedback(
+            workspace.path(),
+            &log_path,
+            Some(&admission),
+            anchor,
+            Some(1),
+        );
+    });
+    assert_eq!(captured.metrics.len(), 1, "{:?}", captured.metrics);
+    assert_eq!(captured.metrics[0].labels["provider"], "loomtest");
+    assert_eq!(captured.metrics[0].labels["reason"], "rate_limited");
+}
