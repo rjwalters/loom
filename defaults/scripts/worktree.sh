@@ -178,22 +178,232 @@ EOF
 # Concurrency lock (issue #3380)
 # --------------------------------------------------------------------------
 #
-# The repo-global `git worktree add` lock, its ownership-verified release
-# (#6014/#6017), and the tunables that govern both
-# (`LOOM_WORKTREE_LOCK_TIMEOUT`, `LOOM_WORKTREE_LOCK_POLL_INTERVAL` —
-# documented in show_help) now live in `lib/worktree-lock.sh`, moved out
-# whole per `.loom/docs/file-size-policy.md` ("new sibling module, small
-# dispatch arm left behind" — this file is over the ratchet threshold and
-# therefore frozen).
+# `git worktree add` is not safe to run concurrently against the same repo —
+# parallel invocations contend on the per-worktree administrative dir
+# (`.git/worktrees/issue-N/`) and on git's repo-global locks. The observed
+# failure mode in busy shepherd sessions is multi-minute hangs (10-20 min)
+# while a peer process holds an `index.lock` it will never release.
 #
-# Ported to try `loom-daemon worktree-lock acquire`/`release` first (#8195
-# slice 7, `loom-daemon/src/worktree_cli/lock.rs` — the Rust side was written
-# in slice 1 / #8226 but never wired up here until now). It falls straight
-# through to the original mkdir-based implementation, UNCHANGED, on anything
-# other than a real 0/1 answer — see the lib file for why a hard delegation
-# (like remove/wip/cleanup/reset) is not safe on this ALWAYS-TAKEN path.
-# shellcheck source=lib/worktree-lock.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/worktree-lock.sh"
+# We use a POSIX-atomic `mkdir`-based lock primitive — `flock` is not
+# available on stock macOS, so `mkdir` is the only portable atomic
+# file-system operation we can rely on.
+#
+# Lock scope is **repo-global** (`.loom/locks/worktree-add/`). The original
+# per-issue design was tried first but failed under concurrent invocations
+# with different issue numbers: `git worktree add` mutates the repo-global
+# `.git/config.lock` (writing the new branch's upstream configuration), and
+# concurrent processes race with the diagnostic:
+#
+#   error: could not lock config file .git/config: File exists
+#   error: unable to write upstream branch configuration
+#
+# A repo-global lock serializes the entire `git worktree add` call so this
+# race cannot happen. The cost — two builders on different issues no longer
+# parallelize through the helper for the (short) duration of `git worktree
+# add` itself — is acceptable because (a) `git worktree add` itself is short
+# relative to the rest of an issue's lifecycle, and (b) parallel hangs that
+# hold an `index.lock` for 10-20 minutes are the very problem this PR fixes.
+#
+# The lock path uses the same name (`worktree-<id>/`) the per-issue version
+# used so its layout matches `.loom/locks/issue-<N>/`. The "id"
+# here is the constant string "add"; per-issue accounting still lives in the
+# `owner.json` body for debugging visibility.
+#
+# **Critical-section scope (issue #6014):** the lock is held across the
+# `git worktree add` invocation itself (plus its short recovery retry) and
+# the repo-level git preparation that immediately precedes it and must not
+# race with a concurrent add — `git worktree prune`, the `git fetch` of
+# `origin/$DEFAULT_BRANCH` / the base branch / `origin/feature/issue-N`, and
+# base-branch resolution. It is explicitly NOT held across anything that
+# follows the add: sentinel writing, sparse-checkout setup, submodule init,
+# or the project-specific `post-worktree.sh` hook. The call site releases the
+# lock the moment `git worktree add` returns, success or failure, rather than
+# waiting for the script's EXIT trap. A repo whose post-worktree hook can run
+# for minutes (e.g. a `cargo build --release`) must not serialize every
+# *unrelated* worktree creation on the host behind it — the post-add phase
+# does not touch `.git/config.lock` at all, so it needs no repo-global
+# serialization.
+#
+# **Ownership verification (issue #6014):** each acquisition writes a random
+# one-shot `token` into `owner.json` alongside `owner_pid`, and
+# `acquire_worktree_lock` returns it via the `WORKTREE_LOCK_TOKEN` global.
+# `release_worktree_lock` requires the caller to pass that same token back
+# and refuses to remove the lock directory unless the token it finds on disk
+# still matches — so a late release from a stale/wedged holder (e.g. its
+# EXIT trap finally firing well after an operator judged it dead, manually
+# cleared the lock, and a different process legitimately re-acquired it)
+# is a safe no-op instead of deleting a live holder's lock out from under it.
+#
+# Tunables (env vars, documented in show_help):
+#   LOOM_WORKTREE_LOCK_TIMEOUT       — seconds to wait (default 600 = 10min)
+#   LOOM_WORKTREE_LOCK_POLL_INTERVAL — seconds between poll attempts (default 2)
+
+LOOM_WORKTREE_LOCK_TIMEOUT="${LOOM_WORKTREE_LOCK_TIMEOUT:-600}"
+LOOM_WORKTREE_LOCK_POLL_INTERVAL="${LOOM_WORKTREE_LOCK_POLL_INTERVAL:-2}"
+
+# Resolve the locks directory to the canonical git common dir so worktrees
+# and the main workspace all share the same lock namespace. Falls back to the
+# current dir for the rare case where we're not yet inside a repo (tests).
+_worktree_locks_dir() {
+    local common abs_common
+    common=$(git rev-parse --git-common-dir 2>/dev/null || true)
+    [[ -n "$common" ]] || { echo ".loom/locks"; return 0; }
+    # git-common-dir may be returned as a relative path; resolve it.
+    abs_common=$(cd "$common" 2>/dev/null && pwd) || abs_common="$common"
+    echo "$(dirname "$abs_common")/.loom/locks"
+}
+
+_worktree_lock_path() {
+    # The argument is the issue number — accepted for owner-metadata logging
+    # only. The lock itself is repo-global; see the design note above.
+    echo "$(_worktree_locks_dir)/worktree-add"
+}
+
+# Returns 0 if lock acquired, non-zero otherwise. Sets WORKTREE_LOCK_HOLDER_PID
+# on timeout failure so the caller can include it in error output. On success,
+# sets WORKTREE_LOCK_TOKEN to the one-shot acquisition token the caller MUST
+# pass back to release_worktree_lock (see "Ownership verification" above).
+# $_WT_LOCK_DELEGATED records which of the two implementations below minted the
+# live token, so release_worktree_lock always returns it to the same one.
+WORKTREE_LOCK_HOLDER_PID=""; WORKTREE_LOCK_TOKEN=""; _WT_LOCK_DELEGATED=false
+
+# DELEGATION (#8195 slice 7, epic #7810): `loom-daemon worktree-lock
+# acquire`/`release` (loom-daemon/src/worktree_cli/lock.rs, ported in slice 1 /
+# #8226) is the canonical implementation of everything below, and is tried
+# FIRST. The mkdir body kept underneath it is the fallback, unchanged.
+#
+# Why a fallback and not the hard `exec` delegation remove/wip/cleanup/reset
+# use: this lock sits on the ALWAYS-TAKEN create path. Slice 1 tried a hard
+# delegation here and was reverted (#8226) — every hermetic suite with no built
+# Rust binary broke, because under an `exec` contract a missing binary is
+# indistinguishable from "no lock taken". Nor is there a safe "refuse" answer
+# for a lock the way there is for a destructive verb: skipping serialization on
+# a host with no daemon reopens the #3380 race (concurrent `git worktree add`
+# hanging on `.git/config.lock`) for exactly the hosts most likely to lack a
+# build — CI.
+#
+# So a daemon answer is trusted only on POSITIVE evidence: exit 0 with a
+# non-empty `TOKEN=` (acquired) or exit 1 with `HOLDER_PID=` (refused/timed
+# out), which `worktree-lock acquire` always prints on those two paths and
+# nothing else does. A missing binary, a daemon too old to know this subcommand
+# family, its own rc-2 "locks dir unusable", or a differently-shaped
+# `loom-daemon` on PATH that reuses exit 1 for "unrecognized subcommand" all
+# read as "not an answer" and fall straight through to the shell body, getting
+# exactly today's behaviour. Nothing here can make a no-daemon host worse.
+# requires-daemon: worktree-lock optional   #8195 slice 7 — the add-lock delegation; without it the mkdir fallback below runs unchanged
+acquire_worktree_lock() {
+    local issue="$1" out; _WT_LOCK_DELEGATED=false
+    if [[ -n "${_WT_DAEMON_BIN:-}" ]]; then
+        out="$("$_WT_DAEMON_BIN" worktree-lock acquire --issue "$issue" --owner-pid "$$" \
+            --timeout "$LOOM_WORKTREE_LOCK_TIMEOUT" --poll "$LOOM_WORKTREE_LOCK_POLL_INTERVAL" \
+            2>/dev/null)" && out="0 $out" || out="$? $out"
+        case "$out" in
+            "0 TOKEN="?*)     WORKTREE_LOCK_TOKEN="${out#0 TOKEN=}"; _WT_LOCK_DELEGATED=true; return 0 ;;
+            "1 HOLDER_PID="*) WORKTREE_LOCK_HOLDER_PID="${out#1 HOLDER_PID=}"; _WT_LOCK_DELEGATED=true; return 1 ;;
+        esac
+    fi
+
+    local lock
+    lock="$(_worktree_lock_path "$issue")"
+    mkdir -p "$(_worktree_locks_dir)" 2>/dev/null || true
+
+    local deadline=$(( $(date +%s) + LOOM_WORKTREE_LOCK_TIMEOUT ))
+    local stale_retry_done=0
+
+    while true; do
+        if mkdir "$lock" 2>/dev/null; then
+            # Lock acquired; record owner metadata for debugging plus a
+            # one-shot token so release can verify it still owns this lock
+            # (issue #6014 — see "Ownership verification" above).
+            local token
+            token="$$-$(date -u +%s%N 2>/dev/null || date -u +%s)-$RANDOM"
+            cat > "$lock/owner.json" <<EOF
+{
+  "issue": $issue,
+  "owner_pid": $$,
+  "token": "$token",
+  "script": "worktree.sh",
+  "acquired_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+            WORKTREE_LOCK_TOKEN="$token"
+            return 0
+        fi
+
+        # Lock exists. Check whether the owner is still alive; if not, clear
+        # it once and retry (stale-lock recovery).
+        local owner_pid=""
+        if [[ -f "$lock/owner.json" ]]; then
+            owner_pid=$(awk -F'[ ,]+' '/owner_pid/ {gsub(/[^0-9]/,"",$3); print $3; exit}' "$lock/owner.json" 2>/dev/null)
+        fi
+
+        if [[ -n "$owner_pid" ]] && [[ "$stale_retry_done" -eq 0 ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_warning "Stale worktree lock from dead PID $owner_pid — cleaning up"
+            fi
+            rm -rf "$lock" 2>/dev/null || true
+            stale_retry_done=1
+            continue
+        fi
+
+        if [[ $(date +%s) -ge $deadline ]]; then
+            WORKTREE_LOCK_HOLDER_PID="$owner_pid"
+            return 1
+        fi
+
+        sleep "$LOOM_WORKTREE_LOCK_POLL_INTERVAL"
+    done
+}
+
+# release_worktree_lock <issue> <token>
+#
+# Removes the repo-global worktree-add lock ONLY if <token> matches the
+# token currently recorded in owner.json — i.e. only if the caller is the
+# process that most recently acquired it (issue #6014). A caller with a
+# stale/empty token (already released, or never actually held the lock)
+# leaves the directory untouched: there is nothing it can safely prove it
+# owns, so removing anything would risk deleting a different, live holder's
+# lock (the exact race described in issue #6014).
+#
+# Clears WORKTREE_LOCK_TOKEN on every path, which is what makes the EXIT trap's
+# later call a no-op after an explicit release (it expands the global when it
+# fires, not when it is installed).
+#
+# $_WT_LOCK_DELEGATED is set by acquire_worktree_lock above and read only here,
+# so a token minted by the shell body is always released by the shell body even
+# if a daemon became resolvable in between — it never does within one process,
+# but nothing here depends on that. `loom-daemon worktree-lock release` already
+# treats an empty or already-reassigned token as a safe no-op (#6014), matching
+# this function's own contract exactly.
+release_worktree_lock() {
+    local issue="$1"
+    local token="$2"
+    WORKTREE_LOCK_TOKEN=""
+    if [[ "$_WT_LOCK_DELEGATED" == "true" ]]; then
+        "$_WT_DAEMON_BIN" worktree-lock release --token "$token" >/dev/null 2>&1 || true; return 0
+    fi
+    [[ -z "$issue" ]] && return 0
+    # No token means we never held the lock (or already released it) — never
+    # remove a lock directory we cannot prove is ours.
+    [[ -z "$token" ]] && return 0
+
+    local lock
+    lock="$(_worktree_lock_path "$issue")"
+    [[ -d "$lock" ]] || return 0
+
+    local current_token=""
+    if [[ -f "$lock/owner.json" ]]; then
+        current_token=$(awk -F'"' '/"token"[[:space:]]*:/ {print $4; exit}' "$lock/owner.json" 2>/dev/null)
+    fi
+
+    if [[ "$current_token" != "$token" ]]; then
+        # The lock directory belongs to a different acquisition (ours was
+        # already cleared and reassigned) — do NOT touch it.
+        return 0
+    fi
+
+    rm -rf "$lock" 2>/dev/null || true
+}
 
 # cleanup_partial_worktree_state <issue>
 #
@@ -253,27 +463,41 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/worktree-lock.sh"
 cleanup_partial_worktree_state() {
     local issue="$1"
 
-    # Resolved once per process, not once per call: both call sites run within
-    # milliseconds of each other and the resolver probes the filesystem.
-    # $_WT_CLEANUP_BIN_RESOLVED is the sentinel rather than emptiness of the
-    # path itself, so a host with no daemon does not re-probe on the second
-    # call. Deliberately NOT $_LEASE_DAEMON_BIN: that is resolved further down,
-    # AFTER both of these call sites.
-    if [[ -z "${_WT_CLEANUP_BIN_RESOLVED:-}" ]]; then
-        _WT_CLEANUP_DAEMON_BIN="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
-        _WT_CLEANUP_BIN_RESOLVED=1
-    fi
-    [[ -n "${_WT_CLEANUP_DAEMON_BIN:-}" ]] || return 0
+    # $_WT_DAEMON_BIN is resolved ONCE per process, just above the create
+    # path's first call to this function (#8195 slice 7 folded three separate
+    # lazy resolutions — this one, the lease/claim-lock pair's, and the
+    # add-lock's — into that single assignment, so a run that creates a
+    # worktree pays one filesystem probe and a run that does not pays none).
+    [[ -n "${_WT_DAEMON_BIN:-}" ]] || return 0
 
     # Two spellings rather than an array: `"${arr[@]}"` on an EMPTY array is an
     # unbound-variable error under `set -u` in bash 3.2 (macOS), which is a
     # supported host for this script.
     if [[ "$JSON_OUTPUT" == "true" ]]; then
-        "$_WT_CLEANUP_DAEMON_BIN" worktree-cleanup "$issue" --quiet || true
+        "$_WT_DAEMON_BIN" worktree-cleanup "$issue" --quiet || true
     else
-        "$_WT_CLEANUP_DAEMON_BIN" worktree-cleanup "$issue" || true
+        "$_WT_DAEMON_BIN" worktree-cleanup "$issue" || true
     fi
     return 0
+}
+
+# Shared preamble for the two `loom_exec_script_helper` verbs below (`remove`,
+# and the WIP trio): source lib/script-helper.sh, or exit 2 naming $1. The exec
+# line itself deliberately stays in each caller with its subcommand spelled
+# literally — scripts/check-daemon-subcommand-versions.sh reads a version floor
+# off `loom_exec_script_helper <sub>` in command position, and hoisting that
+# into a shared `"$@"` here would silently retire both `requires-daemon:`
+# markers along with the fleet-floor visibility they exist for.
+_worktree_source_script_helper() {
+    local helper
+    helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/script-helper.sh"
+    if [[ ! -f "$helper" ]]; then
+        print_error "lib/script-helper.sh is missing — cannot run '$1'."
+        echo "This install is incomplete; re-run the Loom installer or resync .loom/." >&2
+        exit 2
+    fi
+    # shellcheck source=lib/script-helper.sh
+    source "$helper"
 }
 
 # --------------------------------------------------------------------------
@@ -325,15 +549,7 @@ cleanup_partial_worktree_state() {
 # your worktree and declined" rather than "this install is broken".
 # requires-daemon: worktree-remove >= 0.19.340  #8471 (#8195 slice 3) — the removal-verb port; without it the stub exits 2 and the verb refuses
 _worktree_remove_verb() {
-    local helper
-    helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/script-helper.sh"
-    if [[ ! -f "$helper" ]]; then
-        print_error "lib/script-helper.sh is missing — cannot run 'remove'."
-        echo "This install is incomplete; re-run the Loom installer or resync .loom/." >&2
-        exit 2
-    fi
-    # shellcheck source=lib/script-helper.sh
-    source "$helper"
+    _worktree_source_script_helper remove
     LOOM_SCRIPT_HELPER_MISSING_RC=2 \
         loom_exec_script_helper worktree-remove "$@"
 }
@@ -382,19 +598,9 @@ _worktree_remove_verb() {
 # never do is lie about which of those happened.
 # requires-daemon: worktree-wip >= 0.19.224  #8433 (#8195 slice 2) — the WIP-verb port; without it the stub exits 2 and the verbs refuse
 _worktree_wip_verb() {
-    local verb="$1"
-    shift
-    local helper
-    helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/script-helper.sh"
-    if [[ ! -f "$helper" ]]; then
-        print_error "lib/script-helper.sh is missing — cannot run '$verb'."
-        echo "This install is incomplete; re-run the Loom installer or resync .loom/." >&2
-        exit 2
-    fi
-    # shellcheck source=lib/script-helper.sh
-    source "$helper"
+    _worktree_source_script_helper "$1"
     LOOM_SCRIPT_HELPER_MISSING_RC=2 \
-        loom_exec_script_helper worktree-wip "$verb" "$@"
+        loom_exec_script_helper worktree-wip "$@"
 }
 
 # --------------------------------------------------------------------------
@@ -994,6 +1200,18 @@ fi
 # Pre-cleanup runs *before* the lock so a crashed prior run's debris (which
 # would otherwise prevent us from making progress under the lock) is cleared
 # regardless of whether we ultimately acquire the lock.
+#
+# The ONE daemon-binary resolution for this whole run, placed here because this
+# is the first line of the create path that needs it and nothing above it does:
+# a `--check`/`--help`/`remove`/`snapshot` invocation never pays the filesystem
+# probe, and the four consumers below (crash-debris cleanup, the add lock, the
+# lease + claim-lock pre-flight, and worktree-link) share one answer instead of
+# probing three times. A plain assignment, not a getter, so
+# scripts/check-daemon-subcommand-versions.sh can textually trace every
+# `"$_WT_DAEMON_BIN" <subcommand>` call back to a resolver entry point. Empty
+# (never an error) when nothing resolves; every consumer degrades on its own
+# terms, documented at each one.
+_WT_DAEMON_BIN="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
 cleanup_partial_worktree_state "$ISSUE_NUMBER" || true
 
 if ! acquire_worktree_lock "$ISSUE_NUMBER"; then
@@ -1181,8 +1399,9 @@ WORKTREE_PATH="$WORKTREE_ROOT_DIR/issue-$ISSUE_NUMBER"
 # no-op when the daemon already published (#7672), the refusal outside an agent
 # session, the 4h renewal cap -- lives in `loom-daemon lease ensure`, per
 # ADR-0018 and because this file's `contract` category admits no growth.
-_LEASE_DAEMON_BIN="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
-[[ -z "$_LEASE_DAEMON_BIN" ]] || "$_LEASE_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --watch-pid "${CLAUDE_PID:-$PPID}" > /dev/null 2>&1 || true
+#
+# $_WT_DAEMON_BIN is resolved at the top of the create path (above), not here.
+[[ -z "$_WT_DAEMON_BIN" ]] || "$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --watch-pid "${CLAUDE_PID:-$PPID}" > /dev/null 2>&1 || true
 
 # --- Issue claim-lock cross-check (#8553) ------------------------------------
 # `.loom/locks/issue-<N>/owner.json` is the DAEMON's per-issue sweep-claim
@@ -1201,7 +1420,7 @@ _LEASE_DAEMON_BIN="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
 # an undetermined verdict must fail OPEN, matching every other guard here.
 # shellcheck disable=SC2086  # $_ijson is intentionally unquoted: omits the flag when empty
 # requires-daemon: worktree-lock optional   #8553 fails open on a daemon predating check-issue (no lock cross-check performed)
-[[ -z "$_LEASE_DAEMON_BIN" ]] || { _ijson=""; _irc=0; [[ "$JSON_OUTPUT" == "true" ]] && _ijson="--json"; "$_LEASE_DAEMON_BIN" worktree-lock check-issue --issue "$ISSUE_NUMBER" --repo "$WORKTREE_REPO_ROOT" $_ijson ${FORCE_CLAIM_LOCK:+--force} >&3 || _irc=$?; [[ "$_irc" -eq 1 ]] && exit 1; }
+[[ -z "$_WT_DAEMON_BIN" ]] || { _ijson=""; _irc=0; [[ "$JSON_OUTPUT" == "true" ]] && _ijson="--json"; "$_WT_DAEMON_BIN" worktree-lock check-issue --issue "$ISSUE_NUMBER" --repo "$WORKTREE_REPO_ROOT" $_ijson ${FORCE_CLAIM_LOCK:+--force} >&3 || _irc=$?; [[ "$_irc" -eq 1 ]] && exit 1; }
 
 # Check if worktree already exists
 if [[ -d "$WORKTREE_PATH" ]]; then
@@ -1526,14 +1745,14 @@ _worktree_handle_branch_conflict() {
     # is the only truthful answer without a binary that can run the guard. The
     # extra ~0.2s spawn is paid only after `git worktree add` has already
     # failed, never on the success path.
-    if [[ -z "${_LEASE_DAEMON_BIN:-}" ]] \
-        || ! "$_LEASE_DAEMON_BIN" worktree-branch-conflict --help >/dev/null 2>&1; then
+    if [[ -z "${_WT_DAEMON_BIN:-}" ]] \
+        || ! "$_WT_DAEMON_BIN" worktree-branch-conflict --help >/dev/null 2>&1; then
         return 1
     fi
 
     local flags=()
     [[ "$JSON_OUTPUT" == "true" ]] && flags+=(--quiet)
-    printf '%s' "$error_output" | "$_LEASE_DAEMON_BIN" worktree-branch-conflict \
+    printf '%s' "$error_output" | "$_WT_DAEMON_BIN" worktree-branch-conflict \
         --branch "$branch" --default-branch "$DEFAULT_BRANCH" \
         --issue "$ISSUE_NUMBER" --repo-root "$WORKTREE_REPO_ROOT" "${flags[@]}"
     return $?
@@ -1588,10 +1807,9 @@ if _try_worktree_add; then
     # .git/config.lock) is complete. Everything below (sentinel writing,
     # submodule init, the project-specific post-worktree hook) does not
     # touch .git/config.lock and must not block unrelated worktree creations
-    # for other issues (issue #6014). Clearing WORKTREE_LOCK_TOKEN makes the
-    # EXIT trap's later release_worktree_lock call a no-op.
+    # for other issues (issue #6014). release_worktree_lock clears
+    # WORKTREE_LOCK_TOKEN itself, which makes the EXIT trap's later call a no-op.
     release_worktree_lock "$ISSUE_NUMBER" "$WORKTREE_LOCK_TOKEN"
-    WORKTREE_LOCK_TOKEN=""
 
     # Get absolute path to worktree
     ABS_WORKTREE_PATH=$(cd "$WORKTREE_PATH" && pwd)
@@ -1728,15 +1946,15 @@ if _try_worktree_add; then
     # slices there is no destructive operation whose silent skip could be
     # mistaken for a completed one — so it WARNS rather than exiting 2, and
     # `worktree.sh <issue>` keeps working on a host with no loom-daemon at all.
-    # $_LEASE_DAEMON_BIN is resolved at pre-flight above; the name is
-    # historical (#8193) and it is simply "the daemon that implements this
-    # script", honouring $LOOM_DAEMON_SELF_BIN.
+    # $_WT_DAEMON_BIN is the one resolution made at the top of the create path;
+    # it is simply "the daemon that implements this script", honouring
+    # $LOOM_DAEMON_SELF_BIN (#8193).
     # requires-daemon: worktree-link optional   #8195 slice 4 — a daemon predating the port skips the symlinks with a warning; the worktree is created either way
     MAIN_WORKSPACE_DIR=$(git rev-parse --show-toplevel 2>/dev/null)
     WT_LINK_FLAGS=()
     [[ "$JSON_OUTPUT" != "true" ]] || WT_LINK_FLAGS=(--quiet)
-    if [[ -n "${_LEASE_DAEMON_BIN:-}" ]]; then
-        "$_LEASE_DAEMON_BIN" worktree-link --repo-root "$MAIN_WORKSPACE_DIR" \
+    if [[ -n "${_WT_DAEMON_BIN:-}" ]]; then
+        "$_WT_DAEMON_BIN" worktree-link --repo-root "$MAIN_WORKSPACE_DIR" \
             --worktree "$ABS_WORKTREE_PATH" "${WT_LINK_FLAGS[@]}" || true
     elif [[ "$JSON_OUTPUT" != "true" ]]; then
         print_warning "No loom-daemon resolved - skipping node_modules/.mcp.json/linkPaths symlinks (worktree still created)"
@@ -1792,7 +2010,6 @@ else
     # (unsuccessfully); release it immediately rather than holding it
     # through error reporting / exit (issue #6014).
     release_worktree_lock "$ISSUE_NUMBER" "$WORKTREE_LOCK_TOKEN"
-    WORKTREE_LOCK_TOKEN=""
 
     if [[ "$JSON_OUTPUT" == "true" ]]; then
         echo '{"success": false, "error": "Failed to create worktree"}' >&3
