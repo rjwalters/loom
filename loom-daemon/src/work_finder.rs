@@ -1556,8 +1556,34 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 }
 
 /// Like [`tick_multi_with_saturation_brake`], but additionally applies the
-/// **repo-sharding slice preference** (Issue #6243, `defaults/docs/dispatcher-repo-sharding.md`):
-/// when `preferred_slice` is `Some`, it must be a mask **parallel to
+/// **repo-sharding slice preference** (Issue #6243, `defaults/docs/dispatcher-repo-sharding.md`)
+/// and the **per-repo dispatch cap + track affinity** (Issue #9090, see
+/// [`repo_cap`]).
+///
+/// # Per-repo cap + track affinity (#9090)
+///
+/// `max_concurrent_per_repo` is a bound on how many of the ONE shared
+/// `max_concurrent` budget's slots a single repo may hold. `None` (what
+/// [`tick_multi_with_sharding`] passes) is the pre-#9090 behaviour
+/// byte-for-byte: no deferral, no reordering. When `Some(n)`:
+///
+/// - a candidate whose own repo already has `n` occupied slots is **deferred**
+///   ([`TickReport::deferred_repo_cap`] / [`Qd::DeferredRepoCap`]), never
+///   dropped, and the loop continues to the next candidate — which by
+///   construction is some other repo's work, so the deferral is work-conserving
+///   within the same tick;
+/// - the already-sorted candidate list is additionally **stably partitioned**
+///   so repos that already have a live sweep sort ahead of cold repos (track
+///   affinity), which is ordering only and strictly subordinate to the cap.
+///
+/// The per-repo counter is seeded from each dispatcher's OWN
+/// [`WorkDispatcher::occupancy`] — the same per-repo value this function
+/// already sums for its global seed — so it costs no extra forge/registry
+/// reads. [`candidate_cmp`] is untouched.
+///
+/// # Repo-sharding slice preference (#6243)
+///
+/// When `preferred_slice` is `Some`, it must be a mask **parallel to
 /// `workspaces`** (`preferred_slice[i]` is whether workspace `i` is in this
 /// host's preferred slice, computed by the caller — in production, from
 /// [`crate::role_shard::decide`]'s `owned` verdict per root, see
@@ -1584,7 +1610,13 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 /// function deliberately does NOT do that: dispatch is work-conserving, so an
 /// unowned repo is only ever *deferred behind* the owned ones, and is picked
 /// up in full the moment this host's own slice runs dry.
-pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
+// Each argument is an independently-resolved admission knob (global ceiling,
+// per-tick ramp, saturation brake, repo slice, per-repo cap) that the caller
+// reads from a different source; bundling them into a struct would only move
+// the same list one indirection away. The narrower pre-#9090 arity stays
+// available as [`tick_multi_with_sharding`].
+#[allow(clippy::too_many_arguments)]
+pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
     workspaces: &mut [(S, D)],
     priorities: &[u32],
     max_concurrent: usize,
@@ -1592,6 +1624,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
     max_admissions_per_tick: usize,
     saturation_held: bool,
     preferred_slice: Option<&[bool]>,
+    max_concurrent_per_repo: Option<usize>,
 ) -> TickReport {
     use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
@@ -1606,7 +1639,11 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
     // The global occupancy seed (Issue #4003) is the sum of each dispatcher's
     // OWN occupancy count, which may discount a spawned-but-unproven sweep —
     // distinct from (and never larger than) the in-flight dedup sets above.
-    let mut occupancy: usize = workspaces.iter().map(|(_, d)| d.occupancy()).sum();
+    // #9090: the per-repo terms of that same sum ALSO seed the per-repo cap and
+    // track affinity, so neither reads any state the global seed did not.
+    let per_repo_occupancy: Vec<usize> = workspaces.iter().map(|(_, d)| d.occupancy()).collect();
+    let mut occupancy: usize = per_repo_occupancy.iter().sum();
+    let mut cap = RepoCap::new(max_concurrent_per_repo, per_repo_occupancy);
 
     // Snapshot each workspace's quarantined set (#3939) alongside its in-flight
     // set. Quarantined candidates are dropped in pass 1 *before* the global sort
@@ -1892,33 +1929,13 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
     // Global priority sort (#3946): (workspace priority, urgent, age, number).
     candidates.sort_by(candidate_cmp);
 
-    // Repo-sharding slice preference (#6243): partition the ALREADY-sorted
-    // candidate list into in-slice / out-of-slice, preserving each
-    // partition's relative (already-sorted) order — see this function's own
-    // doc comment for the full contract. `None` is a no-op: `candidates` is
-    // left byte-for-byte unchanged, so the pre-#6243 priority-ordering tests
-    // stay exactly as they were.
-    let candidates: Vec<PriorityCandidate> = match preferred_slice {
-        None => candidates,
-        Some(slice) => {
-            let (in_slice, out_of_slice): (Vec<_>, Vec<_>) = candidates
-                .into_iter()
-                .partition(|c| slice.get(c.workspace_idx).copied().unwrap_or(true));
-            if in_slice.is_empty() {
-                // Work-conservation (#6243 AC): this host's slice has zero
-                // eligible candidates this tick — fall back to the full
-                // (already globally sorted) out-of-slice queue instead of
-                // starving while other repos have ready work.
-                out_of_slice
-            } else {
-                report.deferred_out_of_slice += out_of_slice.len();
-                for c in &out_of_slice {
-                    ready_queue::resolve(&mut report.queue, c, Qd::DeferredOutOfSlice, None);
-                }
-                in_slice
-            }
-        }
-    };
+    // Candidate-list shaping (`repo_cap::shape_queue`): the #6243 repo-sharding
+    // slice partition, then #9090's track-affinity partition. Both are stable
+    // partitions of the ALREADY-sorted list, so `candidate_cmp` still decides
+    // order within each group; with `preferred_slice: None` and no per-repo cap
+    // the list is byte-for-byte unchanged, and every pre-#6243/#9090
+    // priority-ordering test stays exactly as it was.
+    let candidates = repo_cap::shape_queue(candidates, preferred_slice, &cap, &mut report);
 
     // Ramp-admission counter (#4234), shared across every workspace exactly
     // like `occupancy` — see `tick_with_admission_cap`'s single-workspace
@@ -1953,6 +1970,13 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             ready_queue::resolve(q, &cand, Qd::DeferredRampCap, None);
             continue;
         }
+        // Per-repo cap (#9090) — checked LAST of the four admission gates, so
+        // its deferral only ever names a repo that the machine-level gates
+        // above would have admitted. Work-conserving by construction: the
+        // `continue` hands this slot to the next candidate, in another repo.
+        if cap.defer(&cand, &mut report) {
+            continue;
+        }
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
         let started = chrono::Utc::now();
         let outcome = dispatcher.dispatch(cand.number, cand.complexity.as_deref());
@@ -1962,6 +1986,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
         if disposition == Qd::Dispatched {
             occupancy += 1;
             admitted_this_tick += 1;
+            cap.admit(cand.workspace_idx);
         }
     }
 
@@ -2048,6 +2073,12 @@ pub struct WorkFinderConfig {
     /// admission cap (#4234; a zero/invalid value is dropped to `None`). See
     /// [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for the full rationale.
     pub max_admissions_per_tick: Option<usize>,
+    /// `autonomous.workFinder.maxConcurrentPerRepo` — how many of the shared
+    /// `maxConcurrent` budget's slots ONE repo may hold (#9090; a zero/invalid
+    /// value is dropped to `None`). Unlike every other knob here, `None` means
+    /// **uncapped** rather than "use a built-in default": a non-`None` default
+    /// would silently throttle every fleet on upgrade. See [`repo_cap`].
+    pub max_concurrent_per_repo: Option<usize>,
     /// `autonomous.workFinder.extraSkipLabels` — additional label names
     /// (Issue #6685) beyond the hardcoded [`PARK_LABELS`] this workspace
     /// wants the work-finder to treat as a skip/park signal (e.g. a
@@ -2118,6 +2149,7 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
             .and_then(serde_json::Value::as_u64)
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
+        max_concurrent_per_repo: repo_cap::parse_config(wf),
         extra_skip_labels: wf.and_then(|w| w.get("extraSkipLabels")).and_then(|v| {
             v.as_array().map(|arr| {
                 arr.iter()
@@ -2998,6 +3030,10 @@ pub fn spawn_multi_work_finder_task(
             // scratch volume, and — since #9060 — the operator ceiling itself)
             // probed from the daemon's primary workspace.
             let configured_max = configured_max_reload.refresh();
+            // Per-repo cap (#9090): the same per-tick config read, so an edit to
+            // `maxConcurrentPerRepo` hot-applies exactly as the ceiling does.
+            // `None` (the default) leaves dispatch byte-for-byte pre-#9090.
+            let max_concurrent_per_repo = configured_max_reload.per_repo();
             // `fallback_root` (the daemon's own seeded default) may not itself
             // be a recognized Loom workspace — e.g. a machine-level daemon
             // started under systemd with a bare `$HOME` cwd — in which case
@@ -3274,6 +3310,7 @@ pub fn spawn_multi_work_finder_task(
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
                  since #5270], disk={disk}, ram={ram}, configured_max={configured_max}, \
                  max_admissions_per_tick={max_admissions_per_tick}, any_halted={any_halted}, \
+                 per_repo_cap={max_concurrent_per_repo:?} (#9090), \
                  preflight_held={preflight_held_count}, \
                  saturation_held={saturation_held}, \
                  observed_idle={}, workspaces={}, priorities={priorities:?}, \
@@ -3290,7 +3327,7 @@ pub fn spawn_multi_work_finder_task(
             }
 
             let tick_started = chrono::Utc::now();
-            let report = tick_multi_with_sharding(
+            let report = tick_multi_with_repo_cap(
                 &mut pairs,
                 &priorities,
                 max_concurrent,
@@ -3298,6 +3335,7 @@ pub fn spawn_multi_work_finder_task(
                 max_admissions_per_tick,
                 saturation_held,
                 Some(&preferred_slice),
+                max_concurrent_per_repo,
             );
 
             // Publish before any logging so `loom-daemon health` sees the same
@@ -3332,6 +3370,7 @@ pub fn spawn_multi_work_finder_task(
                 || report.deferred_ramp_cap > 0
                 || report.deferred_saturation > 0
                 || report.deferred_out_of_slice > 0
+                || report.deferred_repo_cap > 0
             {
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
@@ -3350,7 +3389,7 @@ pub fn spawn_multi_work_finder_task(
                      {} peer-claim-skip, \
                      {} deferred (capacity), {} deferred (ramp), \
                      {} deferred (host saturated), {} deferred (out-of-slice, #6243), \
-                     {} error(s), \
+                     {} deferred (repo cap, #9090), {} error(s), \
                      {} cross-host-collision(s)",
                     pairs.len(),
                     report.seen,
@@ -3372,6 +3411,7 @@ pub fn spawn_multi_work_finder_task(
                     report.deferred_ramp_cap,
                     report.deferred_saturation,
                     report.deferred_out_of_slice,
+                    report.deferred_repo_cap,
                     report.errors,
                     report.collisions
                 );
@@ -3575,6 +3615,13 @@ mod tmpfs_warning;
 /// own file for the same file-size-ratchet reason as [`registry_refresh`].
 pub mod configured_max;
 pub use configured_max::{ConfiguredMax, ConfiguredMaxReloader};
+
+/// Per-repo dispatch cap + repo-track affinity (#9090), including the
+/// candidate-list shaping (#6243's slice partition and its new affinity
+/// sibling) and the pre-#9090 [`tick_multi_with_sharding`] entry point. Its own
+/// file for the same file-size-ratchet reason as [`registry_refresh`].
+pub mod repo_cap;
+pub use repo_cap::{tick_multi_with_sharding, RepoCap};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

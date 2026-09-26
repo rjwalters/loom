@@ -33,6 +33,10 @@ pub enum QueueDisposition {
     /// Waiting: outside this host's preferred repo slice while the slice still
     /// had work (repo sharding, #6243).
     DeferredOutOfSlice,
+    /// Waiting: its own repo already held `maxConcurrentPerRepo` of the shared
+    /// concurrency budget's slots (#9090). The machine-level cap was NOT full;
+    /// the slot went to another repo's candidate in the same tick.
+    DeferredRepoCap,
     /// Blocked: the work finder is holding dispatch for its whole repo. The
     /// hold has several possible causes (verified-red `main`, a main-health
     /// gate still running, a pre-flight advisory hold, an unusable token pool,
@@ -82,13 +86,14 @@ impl QueueDisposition {
     /// ([`Self::LabelledBlocked`] and [`Self::Unknown`] excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
     /// point per entry every tick, zeros included, so an empty queue reads as
     /// `0` rather than as a missing series.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::Dispatched,
         Self::InFlight,
         Self::DeferredCapacity,
         Self::DeferredRampCap,
         Self::DeferredSaturation,
         Self::DeferredOutOfSlice,
+        Self::DeferredRepoCap,
         Self::WorkspaceHalted,
         Self::WorkspaceCommandsMissing,
         Self::HostConstraint,
@@ -117,6 +122,7 @@ impl QueueDisposition {
             Self::DeferredRampCap => "deferred_ramp_cap",
             Self::DeferredSaturation => "deferred_saturation",
             Self::DeferredOutOfSlice => "deferred_out_of_slice",
+            Self::DeferredRepoCap => "deferred_repo_cap",
             Self::WorkspaceHalted => "workspace_halted",
             Self::WorkspaceCommandsMissing => "workspace_commands_missing",
             Self::HostConstraint => "host_constraint",
@@ -147,7 +153,8 @@ impl QueueDisposition {
             Self::DeferredCapacity
             | Self::DeferredRampCap
             | Self::DeferredSaturation
-            | Self::DeferredOutOfSlice => "ready",
+            | Self::DeferredOutOfSlice
+            | Self::DeferredRepoCap => "ready",
             _ => "blocked",
         }
     }
@@ -162,6 +169,7 @@ impl QueueDisposition {
             Self::DeferredRampCap => "waiting: per-tick admission cap reached",
             Self::DeferredSaturation => "waiting: host saturated (admission brake)",
             Self::DeferredOutOfSlice => "waiting: outside this host's repo slice",
+            Self::DeferredRepoCap => "waiting: this repo is at its per-repo cap",
             Self::WorkspaceHalted => {
                 "blocked: repo dispatch held (red main, gate, token pool, drain or breaker)"
             }

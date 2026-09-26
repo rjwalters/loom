@@ -3786,9 +3786,13 @@ fn test_config_full_block_is_parsed() {
             interval_secs: Some(90),
             max_concurrent: Some(5),
             max_admissions_per_tick: Some(4),
-            extra_skip_labels: None,
             // Retired keys are recorded (accepted-but-ignored), not parsed.
             deprecated_cpu_keys: vec!["cpuUtilizationTarget", "estCoresPerSweep"],
+            // Keys this body does not set (`extraSkipLabels`,
+            // `maxConcurrentPerRepo`) parse to their `Default`, `None` — for
+            // the #9090 per-repo cap that means *uncapped*. Still an exact
+            // equality assertion over the whole struct.
+            ..WorkFinderConfig::default()
         }
     );
 }
