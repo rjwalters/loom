@@ -52,6 +52,43 @@ fn log_with(anchor: &str, body: &str) -> String {
     format!("==== loom-daemon dispatch: {anchor} issue=42 ====\nspawn-worker: go\n{body}\n")
 }
 
+/// One Pi 0.85.1 message exactly as its event stream carries it (Issue #8934):
+/// counters nested under `message.usage`, `cost` an **object** with a rollup
+/// `total`, and `reasoning` a subset of `output` (`input + output + cacheRead +
+/// cacheWrite == totalTokens`, with `reasoning` counted in neither). Shape from
+/// `pi_usage`'s "Schema provenance" section, which read it off the shipped
+/// `@earendil-works/pi-coding-agent` / `pi-ai` packages.
+fn pi_message(role: &str) -> Value {
+    serde_json::json!({
+        "role": role,
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+            "input": 1000,
+            "output": 200,
+            "cacheRead": 4000,
+            "cacheWrite": 300,
+            "reasoning": 5,
+            "totalTokens": 5500,
+            "cost": {
+                "input": 0.1,
+                "output": 0.2,
+                "cacheRead": 0.0,
+                "cacheWrite": 0.0,
+                "total": 0.3,
+            },
+        },
+        "timestamp": 1_790_330_401_000_i64,
+    })
+}
+
+/// A Pi stream event of `kind` carrying [`pi_message`] — `message_end` for the
+/// real reading, `agent_end`/`entry_appended` for the repeats that must not be
+/// counted.
+fn pi_event(kind: &str, role: &str) -> String {
+    serde_json::json!({ "type": kind, "message": pi_message(role) }).to_string()
+}
+
 // ============================================================================
 // accumulate_usage
 // ============================================================================
@@ -77,19 +114,94 @@ fn opencode_step_finish_counters_are_summed_across_steps() {
     assert!(usage.is_measured());
 }
 
+/// Pi 0.85.1's **real** `message_end` shape (Issue #8934): the counters live
+/// under `message.usage`, not on the event. Before the fix this stream read as
+/// completely unmeasured, so every Pi launch's tap spend was invisible.
+///
 /// `runtime-model-trials.md`: "Pi usage appears on assistant `message_end`
-/// events; count each once, not again inside `agent_end`." Counting the
-/// `agent_end` repeat would double every Pi run.
+/// events; count each once, not again inside `agent_end`." `entry_appended`
+/// re-emits every persisted assistant message, so it is excluded for the same
+/// reason — counting either repeat would double every Pi run.
 #[test]
-fn pi_message_end_usage_is_counted_once_and_agent_end_is_ignored() {
-    let stream = "\
-        {\"type\":\"message_end\",\"usage\":{\"input_tokens\":50,\"output_tokens\":7}}\n\
-        {\"type\":\"agent_end\",\"usage\":{\"input_tokens\":50,\"output_tokens\":7}}\n\
-    ";
-    let usage = accumulate_usage(stream);
-    assert_eq!(usage.usage_events, 1, "agent_end must not be folded in");
+fn pi_message_end_usage_is_counted_once_and_repeat_events_are_ignored() {
+    let stream = format!(
+        "{}\n{}\n{}\n",
+        pi_event("message_end", "assistant"),
+        pi_event("agent_end", "assistant"),
+        pi_event("entry_appended", "assistant"),
+    );
+    let usage = accumulate_usage(&stream);
+    assert_eq!(usage.usage_events, 1, "neither agent_end nor entry_appended may be folded in");
+    assert_eq!(usage.input, Some(1000));
+    assert_eq!(usage.output, Some(200));
+    assert_eq!(usage.cache_read, Some(4000));
+    assert_eq!(usage.cache_write, Some(300));
+    assert!(usage.is_measured());
+    // `usage.cost` is an object, so the estimate is its rollup `total`.
+    assert!((usage.cost_estimate.unwrap() - 0.3).abs() < 1e-9);
+    // Pi's `reasoning` is already inside `output`, and `total_tokens` sums every
+    // counter it is given — so it is deliberately not recorded here.
+    assert_eq!(
+        usage.reasoning, None,
+        "Pi's reasoning is a subset of output, never a counter of its own"
+    );
+    assert_eq!(
+        usage.total_tokens(),
+        Some(5500),
+        "matches Pi's own totalTokens: reasoning is not double-counted"
+    );
+}
+
+/// The `message_end` of a `toolResult` message carries the usage of LLM work
+/// done **inside** a tool. That is real spend against the tap that paid for it,
+/// so this module counts it — unlike `pi_usage`, which excludes it because such
+/// a reading names no model and that reader keys by model. Keyed by tap, there
+/// is nothing to guess, and dropping it would be a knowable undercount.
+#[test]
+fn a_tool_results_nested_usage_is_charged_to_the_tap_that_paid_for_it() {
+    let usage = accumulate_usage(&format!("{}\n", pi_event("message_end", "toolResult")));
+    assert_eq!(usage.usage_events, 1);
+    assert_eq!(usage.input, Some(1000));
+    assert_eq!(usage.output, Some(200));
+    assert!((usage.cost_estimate.unwrap() - 0.3).abs() < 1e-9);
+}
+
+/// `cost` is a bare number for OpenCode and an object for Pi, so both spellings
+/// are read — and an object with no rollup total is unmeasured, never zero.
+#[test]
+fn a_cost_object_is_read_from_its_rollup_total_and_a_bare_number_still_works() {
+    let nested = accumulate_usage(
+        "{\"type\":\"message_end\",\"message\":{\"usage\":{\"input\":1,\"cost\":{\"input\":0.1,\"total\":0.4}}}}\n",
+    );
+    assert!((nested.cost_estimate.unwrap() - 0.4).abs() < 1e-9);
+
+    let flat =
+        accumulate_usage("{\"type\":\"step_finish\",\"tokens\":{\"input\":1},\"cost\":0.02}\n");
+    assert!((flat.cost_estimate.unwrap() - 0.02).abs() < 1e-9);
+
+    let no_total = accumulate_usage(
+        "{\"type\":\"message_end\",\"message\":{\"usage\":{\"input\":1,\"cost\":{\"input\":0.1}}}}\n",
+    );
+    assert_eq!(no_total.cost_estimate, None);
+    assert_eq!(no_total.input, Some(1), "the counters are still read");
+}
+
+/// The flat `message_end` spelling other harnesses use (and Pi's `agent_end`
+/// sibling fields) keeps working: adding the `message.usage` scope widened the
+/// search rather than replacing it.
+#[test]
+fn a_flat_message_end_usage_object_is_still_read() {
+    let usage = accumulate_usage(
+        "{\"type\":\"message_end\",\"usage\":{\"input_tokens\":50,\"output_tokens\":7,\"reasoning_tokens\":3}}\n",
+    );
+    assert_eq!(usage.usage_events, 1);
     assert_eq!(usage.input, Some(50));
     assert_eq!(usage.output, Some(7));
+    assert_eq!(
+        usage.reasoning,
+        Some(3),
+        "only a reading out of Pi's message.usage suppresses reasoning"
+    );
 }
 
 /// The rule `runtime-model-trials.md` states literally: a missing counter is
@@ -188,6 +300,33 @@ fn an_attributable_launch_with_an_unreadable_stream_is_still_a_row() {
     let row = account_launch_log(&log, "sweep_id=s1").unwrap();
     assert_eq!(row.key(), "pi@env");
     assert!(!row.usage.is_measured());
+}
+
+/// Issue #8934 end-to-end: a real Pi launch's region is **measured** and
+/// attributed to the pi tap. Before the fix this was the row the test above
+/// pins — attributable but unmeasured — for a launch that had in fact reported
+/// every counter it has.
+#[test]
+fn a_real_pi_launchs_region_is_measured_and_attributed_to_the_pi_tap() {
+    let log = log_with(
+        "sweep_id=s1",
+        &format!(
+            "{}\n{}\n{}",
+            launch_line("pi", "env", None),
+            pi_event("message_end", "assistant"),
+            pi_event("agent_end", "assistant"),
+        ),
+    );
+    let row = account_launch_log(&log, "sweep_id=s1").unwrap();
+    assert_eq!(row.key(), "pi@env");
+    assert!(row.usage.is_measured(), "a real Pi launch is not unmeasured");
+    assert_eq!(row.usage.usage_events, 1);
+    assert_eq!(row.usage.input, Some(1000));
+    assert_eq!(row.usage.output, Some(200));
+    assert_eq!(row.usage.cache_read, Some(4000));
+    assert_eq!(row.usage.cache_write, Some(300));
+    assert_eq!(row.usage.total_tokens(), Some(5500));
+    assert!((row.usage.cost_estimate.unwrap() - 0.3).abs() < 1e-9);
 }
 
 #[test]

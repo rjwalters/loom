@@ -51,7 +51,39 @@
 //! `message_end` events while OpenCode reports it on `step_finish`. So event
 //! spellings and field names are matched permissively, and **`agent_end` is
 //! deliberately excluded**: Pi repeats the same usage there, and counting it
-//! would double every Pi run's tokens.
+//! would double every Pi run's tokens. `entry_appended`, which re-emits every
+//! persisted session entry (assistant messages included), is excluded for
+//! exactly that reason — [`USAGE_EVENT_TYPES`] is an allowlist, so any further
+//! repeat event is excluded by construction rather than by a rule to maintain.
+//!
+//! # Pi's real shape, and the two semantics that come with it (Issue #8934)
+//!
+//! Leniency is not a licence to guess: this module originally searched an event
+//! for its counters at `tokens`, `usage` and the event root, while Pi 0.85.1
+//! actually nests them on the **message** —
+//! `{"type":"message_end","message":{"role":"assistant","usage":{…}}}` — so a
+//! real Pi run read as *unmeasured*, the exact spend #8556 and ADR-0020 exist
+//! to see. `message.usage` is now searched **in addition to** the flat scopes,
+//! never instead of them, and two of Pi's semantics are honoured with it
+//! (`crate::pi_usage`'s "Schema provenance" section is the authority for both,
+//! read off the shipped `@earendil-works/pi-coding-agent` / `pi-ai` packages):
+//!
+//! - **`reasoning` is a subset of `output`**, not an addition to it, whereas
+//!   OpenCode's is additive. [`TapUsage::total_tokens`] sums every counter it is
+//!   given and a `TapUsage` carries no harness tag, so a `reasoning` read out of
+//!   `message.usage` is **not recorded** rather than double-counted inside
+//!   `output`. The counters then reconcile against Pi's own `totalTokens`.
+//! - **`cost` is an object**, not a number — the estimate is its rollup
+//!   `total` ([`read_cost`], which still reads OpenCode's bare number).
+//!
+//! A **`toolResult` message's `message_end` is counted**, which is where this
+//! module parts company with [`crate::pi_usage`]. That reader excludes it
+//! because such a reading names no model and it keys by model, never guessing
+//! one; this one keys by *tap*, and the tap is named by the enclosing
+//! `# LOOM_LAUNCH` record rather than by the message. LLM work done inside a
+//! tool is real spend against that tap, so dropping it would be a **knowable**
+//! undercount — different in kind from the unknowable ones this module reports
+//! as unmeasured.
 //!
 //! # One region can hold several launches, and they need not share a tap
 //!
@@ -99,12 +131,19 @@ use crate::launch_record::{parse_launch_tap, TapAttribution};
 
 /// Event types that carry a launch's usage exactly once.
 ///
-/// `agent_end` is **not** here on purpose — see the module doc.
+/// `agent_end` and `entry_appended` are **not** here on purpose — see the
+/// module doc. This is an allowlist, so any other repeat event Pi grows
+/// (`turn_end`) is excluded by construction rather than by a rule to maintain.
 const USAGE_EVENT_TYPES: &[&str] = &["step_finish", "step-finish", "message_end", "message-end"];
 
 /// Objects a usage-bearing event may nest its counters under, plus the event
 /// itself (some harnesses put the counters at the top level).
 const USAGE_OBJECT_FIELDS: &[&str] = &["tokens", "usage"];
+
+/// Where Pi nests a `message_end`'s counters: on the **message**, not the event
+/// (Issue #8934). Searched in addition to [`USAGE_OBJECT_FIELDS`], never
+/// instead of them.
+const MESSAGE_USAGE_PATH: (&str, &str) = ("message", "usage");
 
 const INPUT_FIELDS: &[&str] = &[
     "input",
@@ -134,6 +173,12 @@ const CACHE_WRITE_FIELDS: &[&str] = &[
     "cacheCreationInputTokens",
 ];
 const COST_FIELDS: &[&str] = &["cost", "cost_usd", "costUsd", "total_cost", "totalCost"];
+
+/// How a `cost` **object** spells its rollup total. Pi reports
+/// `cost: {"input":…,"output":…,"cacheRead":…,"cacheWrite":…,"total":…}` rather
+/// than a bare number (Issue #8934), so a flat numeric read finds nothing there
+/// and the whole cost estimate was silently dropped.
+const COST_TOTAL_FIELDS: &[&str] = &["total", "total_cost", "totalCost"];
 
 /// Usage counters a native harness reported for one launch, in the taxonomy
 /// `runtime-model-trials.md` fixes: input, output, reasoning, cache read and
@@ -268,20 +313,34 @@ fn line_usage(line: &str) -> Option<TapUsage> {
 /// The counters on one usage-bearing event, or `None` when it carried none —
 /// a `step_finish` with no `tokens` object at all is not a reading of zero.
 fn read_event_usage(event: &Value) -> Option<TapUsage> {
-    // The counters may sit on the event itself or under `tokens`/`usage`;
-    // search the event last so a nested object's value wins over a same-named
-    // sibling field on the envelope.
+    // The counters may sit on the event itself, under `tokens`/`usage`, or —
+    // Pi's real shape (Issue #8934) — under `message.usage`; search the event
+    // last so a nested object's value wins over a same-named sibling field on
+    // the envelope.
     let mut scopes: Vec<&Value> = USAGE_OBJECT_FIELDS
         .iter()
         .filter_map(|field| event.get(*field))
         .collect();
+    let message_scope = event
+        .get(MESSAGE_USAGE_PATH.0)
+        .and_then(|message| message.get(MESSAGE_USAGE_PATH.1))
+        .map(|usage| {
+            scopes.push(usage);
+            scopes.len() - 1
+        });
     scopes.push(event);
 
-    let counter = |fields: &[&str]| -> Option<u64> {
-        scopes
-            .iter()
-            .find_map(|scope| fields.iter().find_map(|field| read_u64(scope, field)))
+    // The winning scope's index alongside its value, because one counter's
+    // meaning depends on where it was read from — see `reasoning` below.
+    let reading = |fields: &[&str]| -> Option<(usize, u64)> {
+        scopes.iter().enumerate().find_map(|(index, scope)| {
+            fields
+                .iter()
+                .find_map(|field| read_u64(scope, field))
+                .map(|value| (index, value))
+        })
     };
+    let counter = |fields: &[&str]| -> Option<u64> { reading(fields).map(|(_, value)| value) };
     // OpenCode nests its cache counters one level deeper (`tokens.cache.read`),
     // so look inside a `cache` object before falling back to flat spellings.
     let cache = |nested: &str, fields: &[&str]| -> Option<u64> {
@@ -291,15 +350,25 @@ fn read_event_usage(event: &Value) -> Option<TapUsage> {
             .find_map(|cache| read_u64(cache, nested))
             .or_else(|| counter(fields))
     };
+    // Pi's `reasoning` is a **subset** of `output` (`pi-ai`'s `Usage`: "output
+    // already includes these tokens"), while OpenCode's is additive.
+    // `total_tokens` sums every counter it is given and `TapUsage` carries no
+    // harness tag, so a reasoning count read out of Pi's `message.usage` is
+    // dropped rather than counted a second time inside `output`.
+    let reasoning = reading(REASONING_FIELDS)
+        .filter(|(scope, _)| Some(*scope) != message_scope)
+        .map(|(_, value)| value);
     let usage = TapUsage {
         input: counter(INPUT_FIELDS),
         output: counter(OUTPUT_FIELDS),
-        reasoning: counter(REASONING_FIELDS),
+        reasoning,
         cache_read: cache("read", CACHE_READ_FIELDS),
         cache_write: cache("write", CACHE_WRITE_FIELDS),
-        cost_estimate: scopes
-            .iter()
-            .find_map(|scope| COST_FIELDS.iter().find_map(|field| read_f64(scope, field))),
+        cost_estimate: scopes.iter().find_map(|scope| {
+            COST_FIELDS
+                .iter()
+                .find_map(|field| scope.get(*field).and_then(read_cost))
+        }),
         usage_events: 1,
     };
     let reported = usage.total_tokens().is_some() || usage.cost_estimate.is_some();
@@ -315,6 +384,19 @@ fn read_u64(scope: &Value, field: &str) -> Option<u64> {
 
 fn read_f64(scope: &Value, field: &str) -> Option<f64> {
     scope.get(field)?.as_f64().filter(|v| v.is_finite())
+}
+
+/// One `cost` field's value as an estimate: a bare number (OpenCode), or a cost
+/// **object**'s rollup total (Pi — Issue #8934). An object carrying no total is
+/// no reading at all rather than a fabricated zero, the same rule every counter
+/// here follows.
+fn read_cost(value: &Value) -> Option<f64> {
+    if let Some(cost) = value.as_f64().filter(|v| v.is_finite()) {
+        return Some(cost);
+    }
+    COST_TOTAL_FIELDS
+        .iter()
+        .find_map(|field| read_f64(value, field))
 }
 
 /// The region at/after `header_anchor`, split into one block per
