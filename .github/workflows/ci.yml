@@ -22,6 +22,12 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Rust caches (#9065): every Swatinem/rust-cache step restores on any ref but
+# SAVES only on main (`save-if`). The repo's Actions cache is capped at 10 GB.
+# On 2026-09-26 it held 14.7 GB, and PR caches were evicting each other within
+# minutes, so a PR's own saves bought nothing but churn. main-only saves make
+# the cache one deterministic mechanism: every PR restores main's entry for
+# that job.
 jobs:
   # Belt-and-suspenders cancellation (#6683): the native `cancel-in-progress`
   # above does NOT reliably cancel a superseded run that is still `queued`
@@ -87,7 +93,7 @@ jobs:
       dashboard: ${{ steps.filter.outputs.dashboard }}
       docker: ${{ steps.filter.outputs.docker }}
     steps:
-      - uses: dorny/paths-filter@v4
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
@@ -153,6 +159,35 @@ jobs:
               - '**/package.json'
               - '.github/workflows/ci.yml'
 
+  build-daemon:
+    name: Build loom-daemon (debug, shared)
+    # Compiles the debug daemon ONCE per run and hands the binary to the eight
+    # jobs that only RUN it (#9065). Each of them used to compile it for
+    # itself: measured on PR #9073, their build steps took 100-130s apiece and
+    # the jobs themselves dropped to 9-24s once they downloaded the binary
+    # instead. Deliberately NOT path-filtered: required always-run checks
+    # (Shell Budget Ratchet, .gitignore Convergence Check) consume it, and
+    # they use `if: ${{ !cancelled() }}` so that a failed build turns them
+    # red. A `needs:` failure would otherwise SKIP them, and a skipped
+    # required check counts as passing (ci-principles.md rule 6).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build -p loom-daemon --bin loom-daemon
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: loom-daemon-debug
+          path: target/debug/loom-daemon
+          if-no-files-found: error
+          retention-days: 1
+
   backend-lint-and-check:
     name: Rust Linting & Build Check
     needs: changes
@@ -160,25 +195,44 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --package loom-daemon --package loom-api -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
       - run: cargo check --workspace --all-targets
 
   backend-tests:
-    name: Rust Unit Tests
+    name: Rust Unit Tests (${{ matrix.partition }}/3)
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    # Partitioned three ways (#9065). Running ~9,500 tests one-process-each is
+    # CPU-bound on a 4-vCPU runner: 222s of the job's 402s was test execution
+    # alone, on the critical path of every backend PR. `--partition count:k/3`
+    # is deterministic, so every test runs in exactly one leg: the three legs'
+    # "N tests run" lines sum to the unpartitioned total. Each leg compiles
+    # for itself rather than sharing a nextest archive: 73 debug test binaries
+    # are several GB to hand between jobs, and a local build is the dumber of
+    # the two mechanisms (ci-principles.md rule 1).
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Per-test process isolation (#4385). The daemon suite mutates the process
       # environment at ~774 call sites while other tests in the same binary
       # `Command::spawn` children; `Command::spawn` reads the environ
@@ -189,11 +243,31 @@ jobs:
       # window. nextest runs each test in its own process, which closes it by
       # construction. Tests whose shared state is genuinely cross-process (the
       # host-global `tmux -L loom` server) are serialized by the
-      # `daemon-integration` test group in `.config/nextest.toml`.
-      - uses: taiki-e/install-action@nextest
-      - name: Run tests (process-per-test)
-        run: cargo nextest run --workspace --profile ci
-      # nextest does not run doctests, so libtest still owns those (#4385).
+      # `daemon-integration` test group in `.config/nextest.toml` -- within a
+      # leg, and trivially across legs, which are separate hosts.
+      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
+        with:
+          tool: nextest
+      - name: Run tests (process-per-test, partition ${{ matrix.partition }}/3)
+        run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/3
+
+  backend-doctests:
+    name: Rust Doctests
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    # nextest does not run doctests, so libtest still owns those (#4385). Its
+    # own job since #9065 rather than riding one partition of Rust Unit Tests,
+    # where it would make that leg the long pole.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run doctests
         run: cargo test --workspace --doc
 
@@ -204,11 +278,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The `otlp` feature (#4858, Epic #4702 Phase 4) is off by default, so
       # the default-feature jobs above never compile or run it — confirmed
       # during Judge review of PR #4879 that CI had zero `--features otlp` /
@@ -217,9 +294,10 @@ jobs:
       # own unit tests (`otlp/mod.rs`, `otlp/mapping.rs`) are linted too, not
       # just its non-test code paths.
       - run: cargo clippy --package loom-daemon --features otlp --all-targets -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
-      - uses: taiki-e/install-action@nextest
-      - name: Run tests (otlp feature)
-        run: cargo nextest run --package loom-daemon --features otlp --profile ci
+      # The feature's full nextest run lives in the partitioned
+      # backend-otlp-tests job below (#9065). It is NOT deduplicated against
+      # Rust Unit Tests: `otlp` is not purely additive -- two tests are
+      # `#[cfg(not(feature = "otlp"))]` -- so neither run subsumes the other.
       - name: Verify OTLP with a real pinned Collector
         run: cargo test --package loom-daemon --features otlp --test otlp_collector -- --ignored --nocapture
       # #8665: executes the committed cycle-time SQL verbatim against a real
@@ -229,6 +307,33 @@ jobs:
       - name: Verify the cycle-time artifacts against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test cycle_time_clickhouse -- --ignored --nocapture
 
+  backend-otlp-tests:
+    name: Rust OTLP Feature Tests (${{ matrix.partition }}/3)
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    # The whole loom-daemon suite with `--features otlp`, partitioned three
+    # ways for the same reason and by the same mechanism as Rust Unit Tests
+    # (#9065): 211s of test execution on one runner was the critical path.
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
+        with:
+          tool: nextest
+      - name: Run tests (otlp feature, partition ${{ matrix.partition }}/3)
+        run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/3
+
   mcp-build:
     name: MCP Server Build
     needs: changes
@@ -236,8 +341,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
       - name: Build unified MCP server
@@ -263,8 +368,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
       - name: Install backend dependencies
@@ -284,7 +389,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check CLAUDE.md line budget
         run: bash scripts/check-claude-md-budget.sh
 
@@ -298,7 +403,7 @@ jobs:
     # size so they cannot grow further. See .loom/docs/file-size-policy.md.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Self-test first: a ratchet that silently stops measuring reports OK
       # forever while the files it guards keep growing.
       - name: Self-test the ratchet
@@ -321,19 +426,25 @@ jobs:
     # whose logic moves into the daemon behind a stub — rather than total
     # production shell, a quarter of which is `bootstrap`/`vendored` and
     # correctly permanent. See .loom/docs/shell-language-policy.md.
+    needs: build-daemon
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       # fetch-depth: 0 because the gate compares against the MERGE-BASE, and the
       # default depth-1 checkout has no history to find one in. Without this the
       # comparison degrades to "no merge-base found" and measures the wrong tree.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build loom-daemon
-        run: cargo build --release -p loom-daemon --bin loom-daemon
+      # Built once by build-daemon (#9065). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       # Prints the report whether or not it passes. A gate that only speaks up
       # on failure teaches nobody which way the number is moving, which is how
       # the portable pool grew +317 across four merged ports unnoticed.
@@ -343,7 +454,7 @@ jobs:
       # there is nothing to regenerate. The previous design required a baseline
       # refresh on every merge and red-lined `main` when one was missed (#8073).
       - name: Shell budget
-        run: ./target/release/loom-daemon shell-budget --check
+        run: ./target/debug/loom-daemon shell-budget --check
 
   shell-allowlist:
     name: Shell Allowlist
@@ -369,7 +480,7 @@ jobs:
       # shallow clone rather than reporting OK on a check it could not perform —
       # a gate that cannot tell "checked, fine" from "could not check" reports
       # OK forever. Same reason the Shell Budget job above takes full history.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       # Self-test first: a gate that silently stops checking reports OK forever
@@ -405,7 +516,7 @@ jobs:
       # gate FAILS rather than skipping when it cannot resolve a base — a gate
       # that cannot tell "checked, fine" from "could not check" reports OK
       # forever. Same reason the two jobs above take full history.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       # Self-test first, for the same reason its siblings do it: this gate's
@@ -426,7 +537,7 @@ jobs:
     # guards for CLAUDE.md — see .loom/docs/file-size-policy.md.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Self-test the ratchet
         run: bash scripts/check-markdown-token-budget.sh --self-test
       - name: Check markdown token budget
@@ -447,7 +558,7 @@ jobs:
     # `git ls-files` with no cargo step and no loom-daemon binary.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Self-test first: a ratchet that silently stops resolving a role's file
       # set reports OK forever while the prefix it guards keeps growing.
       - name: Self-test the ratchet
@@ -472,7 +583,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Self-test the conflict-marker detector
         run: bash defaults/scripts/check-conflict-markers.sh --self-test
       - name: Check no tracked file carries git conflict markers (#6499)
@@ -518,7 +629,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Report the bash under test
         run: |
           echo "PATH bash (the one 'bash -n' actually uses): $(command -v bash)"
@@ -609,7 +720,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check AGENTS.md is in sync with its source
         run: bash scripts/check-agents-md-sync.sh
 
@@ -625,16 +736,22 @@ jobs:
     # (#8673, contract point 5). This is native Rust from the start (per the
     # shell-language policy, #7762) rather than a `bash scripts/*.sh` check, so
     # it needs a build step first — same shape as the Shell Budget Ratchet job.
+    needs: build-daemon
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build loom-daemon
-        run: cargo build --release -p loom-daemon --bin loom-daemon
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Built once by build-daemon (#9065). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: Check .agents/skills/ is in sync with its source
-        run: ./target/release/loom-daemon generate-agent-skills --check
+        run: ./target/debug/loom-daemon generate-agent-skills --check
 
   config-host-paths:
     name: Config Host-Path Guard
@@ -650,7 +767,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Self-test the host-path detector
         run: bash defaults/scripts/check-config-no-host-paths.sh --self-test
       - name: Check tracked config carries no home-directory absolute paths (#6504)
@@ -668,7 +785,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Self-test the checker against a synthetic fixture
         run: bash scripts/check-docs-defaults-parity.sh --self-test
       - name: Check .loom/docs/ orphans and defaults/docs/ sibling links
@@ -698,14 +815,20 @@ jobs:
     # Materialising the install and running the installer's own check against
     # it needs no model of the destination map at all — it IS the destination
     # map. This is the exact command sequence that failed in #8270.
+    needs: build-daemon
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build loom-daemon
-        run: cargo build --release -p loom-daemon --bin loom-daemon
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Built once by build-daemon (#9065). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: Initialize Loom into an empty two-commit fixture repo
         run: |
           set -euo pipefail
@@ -718,7 +841,7 @@ jobs:
           git -C "$FIXTURE" add README.md
           git -C "$FIXTURE" commit -q -m "initial commit"
           git -C "$FIXTURE" commit -q --allow-empty -m "second commit"
-          ./target/release/loom-daemon init \
+          ./target/debug/loom-daemon init \
             --defaults "$GITHUB_WORKSPACE/defaults" "$FIXTURE" 2>&1 | tee /tmp/fresh-init.log
       - name: Manifest generation succeeded on the fresh init
         run: |
@@ -758,7 +881,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Self-test the checker against synthetic fixtures
         run: bash scripts/check-guard-scan-contracts.sh --self-test
       - name: Check guard-destructive-generic.sh's scan-string tier contracts
@@ -774,7 +897,7 @@ jobs:
     # generated-and-checked rather than hand-maintained.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check generated TOCs are current
         run: bash scripts/check-doc-tocs.sh
 
@@ -830,7 +953,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Self-test first: a gate that silently stops matching reports OK forever
       # while stale pins keep landing. Every control runs before the real scan.
       - name: Self-test the detector
@@ -915,7 +1038,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Self-test the checker against a synthetic fixture
         run: bash scripts/check-hooks-defaults-parity.sh --self-test
       - name: Check defaults/hooks/ and defaults/scripts/ match their installed .loom/ copies
@@ -941,7 +1064,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Self-test the checker against synthetic fixtures
         run: bash scripts/check-vendored-private-refs.sh --self-test
       - name: Check defaults/ and loom-daemon/src/fleet/ for private repo/host identifiers
@@ -975,7 +1098,7 @@ jobs:
       # would false-FAIL any PR cut before a sibling defaults/-touching merge
       # bumped the version. The script narrows to merge-base(base, head)
       # itself; this checkout depth is what makes that resolvable.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -999,7 +1122,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Self-test the checker against a synthetic fixture
         run: bash scripts/check-dangling-links.sh --self-test
       - name: Check for dangling internal markdown links
@@ -1047,7 +1170,7 @@ jobs:
     timeout-minutes: 30
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Self-test the drift-check extraction logic
         run: bash scripts/check-guard-destructive-drift.sh --self-test
       - name: Diff vendored guard-destructive-generic.sh against its canonical upstream
@@ -1065,20 +1188,26 @@ jobs:
     # when the block is converged, so this needs zero new Rust code: build
     # the binary, run update-gitignore against the checked-out repo, then
     # diff .gitignore against the PR's committed version.
+    needs: build-daemon
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build loom-daemon
-        run: cargo build --package loom-daemon
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Built once by build-daemon (#9065). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: Check .gitignore matches the current EPHEMERAL_PATTERNS set
         run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
 
   dep-classification-suites:
     name: Native Port Suites
-    needs: changes
+    needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
     # The equivalence evidence for epic #7810. Every suite here carries
     # assertions written against a SHELL implementation that is now a thin stub
@@ -1107,23 +1236,32 @@ jobs:
     # FAILS (not SKIPs) when no binary resolves, so this job cannot report green
     # by quietly running nothing.
     #
+    # The four slowest suites run in two sibling jobs below (#9065) so that no
+    # one runner carries all ~420s of them: `native-port-daemon-lifecycle` and
+    # `native-port-watchdog-spawn`. Wiring a new suite here is still the
+    # default; move one out only when it is long enough to be the pole.
+    #
     # Triggered by `backend` as well as `scripts`: a Rust-only change to
     # loom-daemon/src/dep_classify/ or loom-daemon/src/dep_recheck/ is exactly
     # the change that can break these suites, and it touches no shell at all.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Configure git identity for suite fixtures
         # These suites create fixture commits; a fresh runner has no global
         # identity. Same step shell-suite-tests carries, for the same reason.
         run: |
           git config --global user.email "ci@loom.test"
           git config --global user.name "Loom CI"
-      - name: Build loom-daemon
-        run: cargo build --package loom-daemon
+      # Built once by build-daemon (#9065). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: classify-dependency-block (#5664, #7650)
         run: bash defaults/scripts/tests/test-classify-dependency-block.sh
       - name: classify-dependency-block premise-false interaction (#7904)
@@ -1180,13 +1318,6 @@ jobs:
       # sources that library, so it needs the binary this job builds.
       - name: daemon-update fixture containment (#8712)
         run: bash defaults/scripts/tests/test-daemon-update-fixture-containment.sh
-      # #8069: 284 assertions that had never run in ANY CI job. They were
-      # excluded on the reason "wiring it needs a cargo build step or a binary
-      # stub — follow-up"; this job is that cargo build step. The subject is
-      # spawn-claude.sh's token selection — the path behind the 228-instance
-      # crash incident (#7708).
-      - name: spawn-claude token selection (#4228, #7708)
-        run: bash defaults/scripts/tests/test-spawn-claude.sh
       # Moved out of shell-suite-tests by #8037: claude-wrapper.sh's six retry
       # classifiers now delegate to `loom-daemon retry-classify`, so these 44
       # assertions — written against the pre-port shell in #8032 and unchanged
@@ -1244,54 +1375,6 @@ jobs:
       # and the two rebase-target assertions the fix necessarily changed.
       - name: reconcile-stack rebase target + worktree routing (#3776, #7982, #8010, #8583)
         run: bash defaults/scripts/tests/test-reconcile-stack.sh
-      # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
-      # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
-      # (188 + 27 assertions, unchanged from the shell implementation apart
-      # from four explicitly-retired cases) need the binary this job builds.
-      # They pin it via loom_test_require_daemon_bin --self-only, which leaves
-      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this watchdog probes"
-      # — the mock seam every IPC-probe case drives.
-      #
-      # Running them here rather than in shell-suite-tests also means the
-      # live-daemon guard (#6386) no longer covers them. That is safe on THIS
-      # runner and only here: a GitHub runner has no daemon, no pid file and
-      # nothing to bootout. On a developer host, run them through
-      # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
-      - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
-        run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
-      # Moved out of shell-suite-tests by #8087, the same move #8086 made for
-      # the watchdog one line above and for the same reason: cli/
-      # loom-daemon-start.sh is now a thin stub over `loom-daemon
-      # daemon-start`, so these three suites need the binary this job builds.
-      # Each pins it via loom_test_require_daemon_bin --self-only, which leaves
-      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this caller starts or
-      # probes" — the fake-daemon seam every launch-path case drives — and each
-      # FAILS (never SKIPs) without a binary, so this job cannot report green
-      # while running nothing.
-      #
-      # All three, not just the start suite: test-loom-daemon-launchd-plist.sh
-      # renders every plist by invoking the real start script, and
-      # test-loom-daemon-update.sh builds its fixtures from
-      # lib/daemon-update-fixtures.sh, which copies that script in and execs it
-      # on the restart / --relaunch / full-update flows.
-      #
-      # Running them here rather than in shell-suite-tests also means the
-      # live-daemon guard (#6386) no longer covers the two that are
-      # LIVE_DAEMON_GUARDED_SUITES members. Same reasoning as the watchdog
-      # above: safe on THIS runner and only here — a GitHub runner has no
-      # daemon, no pid file and nothing to bootout. On a developer host, run
-      # them through run-ci-suites.sh, which still names both in that guard.
-      #
-      # This job's steps are sequential, so the pair also gets the isolation
-      # run-ci-suites.sh's SERIAL_LANE_SUITES pin (#6622 AC5, #6639/#7391) was
-      # giving them inside its concurrent pool — by construction rather than by
-      # quarantine list.
-      - name: loom-daemon-start (#4773, #6568, #7391, ported in #8087)
-        run: bash defaults/scripts/tests/test-loom-daemon-start.sh
-      - name: loom-daemon-start launchd plist rendering (#5343, #6387, #8087)
-        run: bash defaults/scripts/tests/test-loom-daemon-launchd-plist.sh
-      - name: loom-daemon-update (#4078, #6639, #8087)
-        run: bash defaults/scripts/tests/test-loom-daemon-update.sh
       - name: generic runtime adapter through native worker dispatcher (#8362)
         run: bash defaults/scripts/tests/test-spawn-generic.sh
       # #8671: spawn-generic-launch.sh resolves a tier-3 runtime's launch shape
@@ -1428,19 +1511,134 @@ jobs:
       - name: cleanup-branches pr-* review-branch pass (#4405, #8191)
         run: bash defaults/scripts/tests/test-cleanup-branches-pr-review-branch.sh
 
+  native-port-daemon-lifecycle:
+    name: Native Port Suites (daemon start/update)
+    needs: [changes, build-daemon]
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
+    # Split out of Native Port Suites by #9065, which see for everything else
+    # about this family: that job ran ~420s of suites back to back, the
+    # longest pole in CI. The steps are unchanged; only which runner runs
+    # them moved. Same trigger, same build, and the same FAIL-never-SKIP
+    # contract without a binary.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Configure git identity for suite fixtures
+        # These suites create fixture commits; a fresh runner has no global
+        # identity. Same step shell-suite-tests carries, for the same reason.
+        run: |
+          git config --global user.email "ci@loom.test"
+          git config --global user.name "Loom CI"
+      # Built once by build-daemon (#9065). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
+      # Moved out of shell-suite-tests by #8087, the same move #8086 made for
+      # the watchdog (now in native-port-watchdog-spawn) and for the same
+      # reason: cli/loom-daemon-start.sh is now a thin stub over `loom-daemon
+      # daemon-start`, so these three suites need the binary this job builds.
+      # Each pins it via loom_test_require_daemon_bin --self-only, which leaves
+      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this caller starts or
+      # probes" — the fake-daemon seam every launch-path case drives — and each
+      # FAILS (never SKIPs) without a binary, so this job cannot report green
+      # while running nothing.
+      #
+      # All three, not just the start suite: test-loom-daemon-launchd-plist.sh
+      # renders every plist by invoking the real start script, and
+      # test-loom-daemon-update.sh builds its fixtures from
+      # lib/daemon-update-fixtures.sh, which copies that script in and execs it
+      # on the restart / --relaunch / full-update flows.
+      #
+      # Running them here rather than in shell-suite-tests also means the
+      # live-daemon guard (#6386) no longer covers the two that are
+      # LIVE_DAEMON_GUARDED_SUITES members. Same reasoning as the watchdog's:
+      # safe on THIS runner and only here — a GitHub runner has no
+      # daemon, no pid file and nothing to bootout. On a developer host, run
+      # them through run-ci-suites.sh, which still names both in that guard.
+      #
+      # This job's steps are sequential, so the pair also gets the isolation
+      # run-ci-suites.sh's SERIAL_LANE_SUITES pin (#6622 AC5, #6639/#7391) was
+      # giving them inside its concurrent pool — by construction rather than by
+      # quarantine list.
+      - name: loom-daemon-start (#4773, #6568, #7391, ported in #8087)
+        run: bash defaults/scripts/tests/test-loom-daemon-start.sh
+      - name: loom-daemon-start launchd plist rendering (#5343, #6387, #8087)
+        run: bash defaults/scripts/tests/test-loom-daemon-launchd-plist.sh
+      - name: loom-daemon-update (#4078, #6639, #8087)
+        run: bash defaults/scripts/tests/test-loom-daemon-update.sh
+
+  native-port-watchdog-spawn:
+    name: Native Port Suites (watchdog, spawn-claude)
+    needs: [changes, build-daemon]
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
+    # Split out of Native Port Suites by #9065, which see for everything else
+    # about this family: that job ran ~420s of suites back to back, the
+    # longest pole in CI. The steps are unchanged; only which runner runs
+    # them moved. Same trigger, same build, and the same FAIL-never-SKIP
+    # contract without a binary.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Configure git identity for suite fixtures
+        # These suites create fixture commits; a fresh runner has no global
+        # identity. Same step shell-suite-tests carries, for the same reason.
+        run: |
+          git config --global user.email "ci@loom.test"
+          git config --global user.name "Loom CI"
+      # Built once by build-daemon (#9065). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
+      # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
+      # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
+      # (188 + 27 assertions, unchanged from the shell implementation apart
+      # from four explicitly-retired cases) need the binary this job builds.
+      # They pin it via loom_test_require_daemon_bin --self-only, which leaves
+      # $LOOM_DAEMON_BIN free to keep meaning "the daemon this watchdog probes"
+      # — the mock seam every IPC-probe case drives.
+      #
+      # Running them here rather than in shell-suite-tests also means the
+      # live-daemon guard (#6386) no longer covers them. That is safe on THIS
+      # runner and only here: a GitHub runner has no daemon, no pid file and
+      # nothing to bootout. On a developer host, run them through
+      # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
+      - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
+        run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
+      # #8069: 284 assertions that had never run in ANY CI job. They were
+      # excluded on the reason "wiring it needs a cargo build step or a binary
+      # stub — follow-up"; this job is that cargo build step. The subject is
+      # spawn-claude.sh's token selection — the path behind the 228-instance
+      # crash incident (#7708).
+      - name: spawn-claude token selection (#4228, #7708)
+        run: bash defaults/scripts/tests/test-spawn-claude.sh
+
   installer-tests:
     name: Installer Integration Tests
-    needs: changes
+    needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
     # Portable across GNU/BSD sed (temp-file + mv idiom) — runs on ubuntu (#3515)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build native worker dispatcher
-        run: cargo build --package loom-daemon
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Built once by build-daemon (#9065). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: Check role prompts reference only real labels (#3786)
         run: bash defaults/scripts/check-phantom-labels.sh
       - name: Check labels.yml copies are in sync (#3896)
@@ -1476,9 +1674,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build native worker dispatcher
         run: cargo build --package loom-daemon
       - name: Syntax-check the Codex adapter and its test
@@ -1561,7 +1763,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env --' cargo test -p loom-daemon --test private_workspace_docker -- --ignored --nocapture
 
   shell-suite-tests:
-    name: Shell Test Suites (hermetic)
+    name: Shell Test Suites (hermetic, ${{ matrix.shard }}/2)
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true')
     # Audit-and-wire of the defaults/scripts/tests/ population (#4455). Before
@@ -1604,10 +1806,17 @@ jobs:
     # previously not referenced by CI at all). All 8 suites are hermetic
     # (fake/stub binaries or local python3 AST fixtures, no live network or
     # forge calls) and run in well under a second each.
+    # Two runners split ci-wired.txt round-robin via LOOM_CI_SHARD (#9065);
+    # every suite runs in exactly one leg. Measured on PR #9074: the suite step
+    # took 113s per leg vs ~230s on one runner.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Configure git identity for suite fixtures
         # Several worktree/merge-pr suites create fixture commits; a fresh
         # runner has no global identity, so set a throwaway one.
@@ -1635,12 +1844,13 @@ jobs:
         # no reachable user manager the block still self-skips, unchanged.
         env:
           LOOM_TEST_ALLOW_SYSTEMD: "1"
+          LOOM_CI_SHARD: ${{ matrix.shard }}/2
         run: bash defaults/scripts/tests/run-ci-suites.sh
       - name: Upload CI suite retry log (#7791)
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ci-suite-retry-log
+          name: ci-suite-retry-log-${{ matrix.shard }}
           path: /tmp/ci-suite-retry-log.tsv
           if-no-files-found: ignore
           retention-days: 14
@@ -1652,9 +1862,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-daemon
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Native build (the runner IS x86_64-unknown-linux-gnu) — a full
       # cross-compile matrix has no place in a per-PR smoke test; the release
       # workflow's own `build-daemon` matrix already covers every published
@@ -1695,9 +1910,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-daemon
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build loom-daemon (release)
         run: cargo build --release --package loom-daemon
       - name: Package binary at the path the Dockerfile expects
@@ -1734,9 +1954,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-daemon
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build loom-daemon (release)
         run: cargo build --release --package loom-daemon
       - name: Package binary at the path the Dockerfile expects
