@@ -938,14 +938,104 @@ jobs:
     # egress defaults baked in this fleet's ingest endpoint and scrub list, so
     # a fork provisioned a worker publishing to an unrelated operator's
     # endpoint. The script owns the default root list; this job just runs it.
+    #
+    # Since #8589 this job ALSO runs a REPO-WIDE host-identifier scrub, in the
+    # two `git grep` steps below. Two things about its placement are
+    # deliberate:
+    #
+    #   * Repo-wide, not scoped to the shipping surfaces above. The leak that
+    #     prompted it lived in a file nobody would call a shipping surface:
+    #     WORK_LOG.md carried 127 occurrences of two real EC2 private
+    #     hostnames, disclosing this fleet's subnet and host count from a
+    #     public repo. No scoped root list would ever have covered it.
+    #   * In this job, but NOT inside check-vendored-private-refs.sh. It
+    #     belongs to the same concern, so it must not become a second job or a
+    #     second script — but the script is `contract`-category portable shell,
+    #     and `loom-daemon shell-budget --check` refuses ANY net growth of that
+    #     pool (epic #7810), with no override. Adding the logic there is
+    #     therefore not available; the sanctioned alternative is the daemon,
+    #     and a ~15-line grep does not justify putting a cargo build in front
+    #     of a job that is otherwise toolchain-free and runs in seconds. If
+    #     this check ever grows past a grep, port it to a loom-daemon
+    #     subcommand rather than back into the script.
+    #
+    # Findings report file:line and a class, NEVER the matched text: this log
+    # is public, and echoing the match would re-publish exactly what the check
+    # exists to remove.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Self-test the checker against synthetic fixtures
         run: bash scripts/check-vendored-private-refs.sh --self-test
-      - name: Check defaults/ and loom-daemon/src/fleet/ for private repo/host identifiers
+      - name: Check for private repo/host identifiers and operator identities
         run: bash scripts/check-vendored-private-refs.sh
+      # A grep gate that silently stops matching passes forever while the thing
+      # it guards comes back. So: prove both patterns still work against
+      # fixtures before trusting a clean scan. Every fixture is built with
+      # printf and the octets/domain in SEPARATE arguments, so no literal in
+      # this file can match the patterns this file defines.
+      - name: Self-test the host-identifier patterns
+        run: |
+          set -euo pipefail
+          # The dashed AWS/cloud-init rendering of an RFC 1918 address:
+          # 10/8, 172.16-31/12 (172.15 and 172.32 are PUBLIC), 192.168/16.
+          host_id='\bip-(10-[0-9]{1,3}|172-(1[6-9]|2[0-9]|3[01])|192-168)-[0-9]{1,3}-[0-9]{1,3}\b'
+          tmp="$(mktemp -d)"
+          printf 'ip-%s-%s-%s-%s\nip-%s-%s-%s-%s\nip-%s-%s-%s-%s\n' \
+            10 0 0 1  172 31 76 7  192 168 1 5 >"$tmp/dirty"
+          # RFC 5737 documentation addresses (reserved for examples, outside
+          # every private range) and the two public 172 edges.
+          printf 'ip-%s-%s-%s-%s\nip-%s-%s-%s-%s\nip-%s-%s-%s-%s\n' \
+            198 51 100 23  172 15 1 1  172 32 1 1 >"$tmp/clean"
+          hits="$(grep -coE "$host_id" "$tmp/dirty" || true)"
+          [ "$hits" -eq 3 ] || { echo "::error::host-identifier pattern matched $hits/3 private ranges" >&2; exit 1; }
+          if grep -qE "$host_id" "$tmp/clean"; then
+            echo "::error::host-identifier pattern flags documentation/public addresses" >&2; exit 1
+          fi
+          # Identities are matched case-insensitively: an address is, and a
+          # case-sensitive scan let a SHOUTING fixture survive the #8589 scrub.
+          domain='denied-operator.test'
+          identity="@[A-Za-z0-9._%+:~-]*${domain//./\\.}"
+          printf 'ops@%s and @user:chat.%s\n' "$domain" "$domain" >"$tmp/ids"
+          printf 'OPS@%s\n' "$(printf '%s' "$domain" | tr '[:lower:]' '[:upper:]')" >>"$tmp/ids"
+          [ "$(grep -ciE "$identity" "$tmp/ids" || true)" -eq 2 ] \
+            || { echo "::error::identity pattern missed a fixture (case-insensitivity?)" >&2; exit 1; }
+          echo "host-identifier patterns: OK (3 private ranges caught, documentation + public edges clean, identities case-insensitive)"
+      - name: Scrub the repository for host identifiers and operator identities
+        run: |
+          set -euo pipefail
+          host_id='\bip-(10-[0-9]{1,3}|172-(1[6-9]|2[0-9]|3[01])|192-168)-[0-9]{1,3}-[0-9]{1,3}\b'
+          # The operator's own domain. Written split so this file never itself
+          # contains an identity at it, and escaped so `2amlogicXcom` is not a
+          # match. This half is a denylist by necessity: a structural "every
+          # email domain must be allowlisted" rule over the whole repo would
+          # have to enumerate every unrelated fixture domain. It matches
+          # IDENTITIES only (`user@…domain`, Matrix `@user:…domain`) — a prose
+          # mention of a public deployment hostname is not a person.
+          domain='2amlogic.com'
+          identity="@[A-Za-z0-9._%+:~-]*${domain//./\\.}"
+          rc=0
+          # `cut` keeps file:line and DROPS the matched text.
+          if hosts="$(git grep -nIE -e "$host_id" -- . | cut -d: -f1,2)" && [ -n "$hosts" ]; then
+            echo "::error::private-network host identifier (RFC 1918 dashed form) — value withheld:" >&2
+            printf '%s\n' "$hosts" | sed 's/^/  /' >&2
+            rc=1
+          fi
+          if ids="$(git grep -niIE -e "$identity" -- . | cut -d: -f1,2)" && [ -n "$ids" ]; then
+            echo "::error::identity at an operator-owned domain — value withheld:" >&2
+            printf '%s\n' "$ids" | sed 's/^/  /' >&2
+            rc=1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "" >&2
+            echo "Open the file:line above to see the value; it is not printed because this log is public." >&2
+            echo "  private host id   ->  an RFC 5737 documentation address (ip-198-51-100-23)" >&2
+            echo "  operator identity ->  operator@example.com / @user:example.com" >&2
+            echo "Reproduce locally with the two git grep commands in this step." >&2
+            exit 1
+          fi
+          echo "host-identifier scrub: OK — no private host identifier or operator identity in the tree."
 
   defaults-version-bump-check:
     name: PRs Must Not Hand-Edit Version-Bearing Files

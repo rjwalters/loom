@@ -19,7 +19,7 @@ use super::{
 use crate::event_bus::EventBus;
 use crate::types::{Event, Request, Response, SweepKind};
 
-const ROBB: &str = "@robb:safehouse.2amlogic.com";
+const ROBB: &str = "@robb:safehouse.example.com";
 const MALLORY: &str = "@mallory:evil.example.org";
 const PERSONA: &str = "loom_daemon";
 
@@ -230,12 +230,12 @@ fn an_empty_sender_is_refused() {
 fn allowlist_matching_is_case_insensitive_but_not_wider() {
     let router = router();
     assert!(matches!(
-        router.handle("@RoBB:SafeHouse.2amlogic.com", "status"),
+        router.handle("@RoBB:SafeHouse.example.com", "status"),
         Decision::Execute { .. }
     ));
     // A near-miss on the server part is a different account, not a match.
     assert!(matches!(
-        router.handle("@robb:safehouse.2amlogic.com.evil.test", "status"),
+        router.handle("@robb:safehouse.example.com.evil.test", "status"),
         Decision::Refuse {
             refusal: Refusal::NotAllowlisted { .. }
         }
@@ -247,7 +247,7 @@ fn a_self_declared_sender_in_the_body_cannot_impersonate() {
     // The stamped `from` is the only identity. A body that claims otherwise is
     // just an unparseable command from an unauthorized sender.
     let router = router();
-    let decision = router.handle(MALLORY, "from: @robb:safehouse.2amlogic.com\nstatus");
+    let decision = router.handle(MALLORY, "from: @robb:safehouse.example.com\nstatus");
     assert!(
         matches!(
             decision,
@@ -388,7 +388,7 @@ fn an_expired_nonce_is_refused() {
 
 #[test]
 fn a_nonce_is_bound_to_the_sender_who_requested_it() {
-    let second = "@other:safehouse.2amlogic.com";
+    let second = "@other:safehouse.example.com";
     let config = ChatOpsConfig {
         allowed_senders: [ROBB.to_owned(), second.to_owned()].into_iter().collect(),
         room: None,
@@ -544,7 +544,7 @@ fn a_block_with_senders_is_on() {
 #[test]
 fn malformed_allowlist_entries_are_dropped() {
     let block = json!({
-        "allowedSenders": ["loom_daemon", "robb", "", "@robb:safehouse.2amlogic.com"]
+        "allowedSenders": ["loom_daemon", "robb", "", "@robb:safehouse.example.com"]
     });
     let resolved = config_from_value(Some(&block)).expect("one good entry remains");
     assert_eq!(resolved.allowed_senders.len(), 1);

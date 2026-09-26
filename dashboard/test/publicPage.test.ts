@@ -114,7 +114,7 @@ function tokensHistoryFixture(): HistoryRecord {
     record: {
       kind: "tokens.snapshot",
       captured_at: "2026-07-31T12:06:00Z",
-      accounts: [{ account: "agent-9@2amlogic.com", rank: 0, usage_fraction: 0.42, exhausted: false }],
+      accounts: [{ account: "agent-9@example.com", rank: 0, usage_fraction: 0.42, exhausted: false }],
     },
   };
 }
@@ -173,7 +173,7 @@ function snapshotFixture(): RedactedFleetSnapshot {
           record: {
             kind: "tokens.snapshot",
             captured_at: "2026-07-31T12:00:00Z",
-            accounts: [{ account: "agent-9@2amlogic.com", rank: 0, usage_fraction: 0.9, exhausted: false }],
+            accounts: [{ account: "agent-9@example.com", rank: 0, usage_fraction: 0.9, exhausted: false }],
           },
           updatedAt: "2026-07-31T12:00:00Z",
         },
@@ -203,7 +203,7 @@ describe("renderFleetOverview — redaction", () => {
 
   it("never renders tokens.snapshot account identifiers, even though the redacted snapshot carries them unredacted", () => {
     const html = renderFleetOverview(snapshotFixture());
-    expect(html).not.toContain("agent-9@2amlogic.com");
+    expect(html).not.toContain("agent-9@example.com");
     expect(html).not.toContain("accounts");
   });
 
@@ -592,7 +592,7 @@ describe("renderHistoryTable — redaction", () => {
 
   it("never renders tokens.snapshot rows at all", () => {
     const html = renderHistoryTable(historyFixture());
-    expect(html).not.toContain("agent-9@2amlogic.com");
+    expect(html).not.toContain("agent-9@example.com");
     expect(html).not.toContain("tokens.snapshot");
   });
 
@@ -616,7 +616,7 @@ describe("renderPublicPage — full document", () => {
   });
 
   it("contains zero occurrences of token account identifiers", () => {
-    expect(html).not.toContain("agent-9@2amlogic.com");
+    expect(html).not.toContain("agent-9@example.com");
   });
 
   it("renders full detail for the public-repo record/sweep", () => {

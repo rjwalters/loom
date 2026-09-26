@@ -785,7 +785,7 @@ pub struct SweepRegistry {
 ///   machine can advertise two different identities depending on whether
 ///   its daemon was started by a service unit or from a terminal.
 /// - The `hostname` binary's output is an accident of DHCP/cloud-init/OS
-///   defaults (`ip-172-31-74-176` on an unconfigured EC2 host), not a name
+///   defaults (`ip-198-51-100-42` on an unconfigured EC2 host), not a name
 ///   any operator chose — it commonly disagrees with the host's tailnet/
 ///   fleet name and with whatever name an observability ingest key was
 ///   minted against.

@@ -474,10 +474,10 @@ fn session_lifecycle_resolves_an_account_by_registered_email() {
         workspace.path(),
         root.path(),
         "agent-1",
-        Some("agent-1@2amlogic.com"),
+        Some("agent-1@example.com"),
     );
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
-    let status = lifecycle.start("agent-1@2amlogic.com").unwrap();
+    let status = lifecycle.start("agent-1@example.com").unwrap();
     // The resolved identity -- and therefore the container name -- is
     // always the short profile name, never the raw email.
     assert_eq!(status.name, "agent-1");
@@ -493,7 +493,7 @@ fn an_unregistered_email_is_rejected_with_a_clear_error() {
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     let error = lifecycle
-        .start("nobody@2amlogic.com")
+        .start("nobody@example.com")
         .unwrap_err()
         .to_string();
     assert!(error.contains("does not exist"), "{error}");
@@ -593,13 +593,13 @@ fn shell_resolves_the_account_by_email_before_any_container_call() {
         workspace.path(),
         root.path(),
         "agent-1",
-        Some("agent-1@2amlogic.com"),
+        Some("agent-1@example.com"),
     );
     let repo = tempfile::tempdir().unwrap();
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
 
     lifecycle
-        .shell("agent-1@2amlogic.com", Some(repo.path()), &[])
+        .shell("agent-1@example.com", Some(repo.path()), &[])
         .unwrap();
 
     let creates = lifecycle.runner.creates.lock().unwrap();

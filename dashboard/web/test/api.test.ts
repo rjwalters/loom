@@ -173,10 +173,10 @@ describe("readAuthState — commit stamp", () => {
 
   it("reads the commit for an authenticated viewer, alongside email", () => {
     expect(
-      readAuthState(scopeWith({ authenticated: true, email: "operator@2amlogic.com", commit: "abc1234" })),
+      readAuthState(scopeWith({ authenticated: true, email: "operator@example.com", commit: "abc1234" })),
     ).toEqual({
       authenticated: true,
-      email: "operator@2amlogic.com",
+      email: "operator@example.com",
       commit: "abc1234",
     });
   });

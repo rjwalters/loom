@@ -1486,8 +1486,6 @@ The Guide maintains three documents at the repository root:
 | **WORK_PLAN.md** | Prioritized roadmap from current GitHub label state |
 | **README.md** | Project overview (updated only when architecture changes) |
 
-This phase supplements the existing `discover_project_goals()` function, which continues to read README.md for prioritization context.
-
 ### Where This Phase Writes (a managed worktree, never the main checkout)
 
 **This is the only role phase that writes repository files, and it cannot write
@@ -1531,11 +1529,11 @@ Derive high-water marks **from the committed documents themselves**, not from a
 side-car state file.
 
 > **Why not `.loom/guide-docs-state.json`?** The Guide runs on GitHub Actions
-> cron with a **fresh checkout every tick**, and that state file is gitignored —
-> so `last_processed_pr` / `last_processed_issue` reset to `0` on every run. That
-> made WORK_LOG.md accumulate duplicate entries and produce a docs PR every tick.
-> The committed `WORK_LOG.md` / `WORK_PLAN.md` survive the fresh checkout, so they
-> are the durable source of truth for "what has already been recorded."
+> cron with a **fresh checkout every tick**, and that state file is gitignored,
+> so `last_processed_pr` / `last_processed_issue` reset to `0` every run — which
+> made WORK_LOG.md accumulate duplicates and emit a docs PR every tick. The
+> committed `WORK_LOG.md` / `WORK_PLAN.md` survive the checkout, so they are the
+> durable source of truth for "what has already been recorded."
 
 Compute the high-water marks by scanning the existing `WORK_LOG.md` for the
 highest PR / issue number it already contains. `work_log_max_pr()` /
@@ -1714,6 +1712,9 @@ write if the pending delta has survived a batching window since the last
 WORK_LOG-writing docs-maintenance merge, **or** has grown large enough to
 write immediately regardless of the window (see "WORK_LOG debounce" in
 `update_work_log()` below, #6133).
+
+**Redact host identifiers, even quoting a title** — that is how 127 leaked
+into this public repo (#8589); the CI scrub job fails on the next one.
 
 ```bash
 # #5454 BUG, DO NOT REINTRODUCE: this phase's OWN merged PRs must never count as
