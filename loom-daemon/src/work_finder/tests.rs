@@ -2128,7 +2128,7 @@ fn test_tick_empty_ready_is_noop() {
     let mut source = FakeSource::once(vec![]);
     let mut disp = RecordingDispatcher::default();
     let report = tick(&mut source, &mut disp, 10, false).unwrap();
-    assert_eq!(report, TickReport::default());
+    assert_eq!(report.without_occupancy(), TickReport::default());
     assert!(disp.dispatched.is_empty());
 }
 
@@ -2366,7 +2366,7 @@ fn test_tick_multi_halted_dispatches_zero_across_workspaces() {
 fn test_tick_multi_empty_workspace_set_is_noop() {
     let mut multi: Vec<(FakeSource, RecordingDispatcher)> = vec![];
     let report = tick_multi(&mut multi, &[], 10, &[]);
-    assert_eq!(report, TickReport::default());
+    assert_eq!(report.without_occupancy(), TickReport::default());
 }
 
 #[test]
@@ -3709,7 +3709,7 @@ fn test_scale_to_zero_on_empty_backlog() {
     let mut source = FakeSource::once(vec![]);
     let mut disp = RecordingDispatcher::default();
     let report = tick(&mut source, &mut disp, cap, false).unwrap();
-    assert_eq!(report, TickReport::default(), "empty backlog ⇒ zero activity");
+    assert_eq!(report.without_occupancy(), TickReport::default(), "no activity");
     assert!(disp.dispatched.is_empty());
 }
 

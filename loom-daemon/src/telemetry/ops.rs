@@ -34,7 +34,8 @@ use std::collections::BTreeMap;
 /// collector's datapoint `keep_keys` must include every key (contract-tested).
 pub const OPS_METRIC_LABEL_KEYS: &[&str] = &["reason", "provider", "account", "model", "state"];
 
-/// Span attribute keys the ops span names (`loom.dispatch.tick`) may carry, in
+/// Span attribute keys the ops span names (`loom.dispatch.tick`,
+/// `loom.dispatch.admission`) may carry, in
 /// addition to the lifecycle allowlist in `trace::span::bounded_attributes`.
 /// The gateway collector's span `keep_keys` must include every key
 /// (contract-tested).
@@ -54,6 +55,9 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     // `loom.pool.hold` (#8931): one pool dispatch hold, armed to cleared.
     "loom.pool.hold.post_mortem",
     "loom.pool.hold.accounts",
+    // `loom.dispatch.admission` spans (Issue #8907).
+    "loom.dispatch.admission_result",
+    "loom.dispatch.reason",
 ];
 
 /// Longest label value kept, in bytes.
@@ -162,6 +166,28 @@ pub enum MetricName {
     /// `observability::ops::pool_marks::MarkReason`). Never an account name.
     #[serde(rename = "loom.pool.account_marks")]
     PoolAccountMarks,
+    // ---- Worker turnaround and forge stage dwell (Issue #8929) ----------
+    /// Seconds from an issue-sweep slot freeing to its refill, summed.
+    #[serde(rename = "loom.dispatch.slot_turnaround")]
+    DispatchSlotTurnaround,
+    /// Refills counted in `loom.dispatch.slot_turnaround`.
+    #[serde(rename = "loom.dispatch.slot_turnaround.samples")]
+    DispatchSlotTurnaroundSamples,
+    /// Concurrency slots left idle at the end of a work-finder tick.
+    #[serde(rename = "loom.dispatch.idle_slots")]
+    DispatchIdleSlots,
+    /// Slot-seconds left idle while dispatchable ready work waited.
+    #[serde(rename = "loom.dispatch.idle_slot_seconds")]
+    DispatchIdleSlotSeconds,
+    /// Seconds items spent in a forge label stage, summed, labelled `state`.
+    #[serde(rename = "loom.forge.stage_dwell")]
+    ForgeStageDwell,
+    /// Stage transitions counted in `loom.forge.stage_dwell`, labelled `state`.
+    #[serde(rename = "loom.forge.stage_dwell.samples")]
+    ForgeStageDwellSamples,
+    /// Open items carrying a stage label, labelled `state`.
+    #[serde(rename = "loom.forge.stage_items")]
+    ForgeStageItems,
 }
 
 impl MetricName {
@@ -195,6 +221,13 @@ impl MetricName {
             Self::PoolExhaustions => "loom.pool.exhaustions",
             Self::PoolExhaustedSeconds => "loom.pool.exhausted_seconds",
             Self::PoolAccountMarks => "loom.pool.account_marks",
+            Self::DispatchSlotTurnaround => "loom.dispatch.slot_turnaround",
+            Self::DispatchSlotTurnaroundSamples => "loom.dispatch.slot_turnaround.samples",
+            Self::DispatchIdleSlots => "loom.dispatch.idle_slots",
+            Self::DispatchIdleSlotSeconds => "loom.dispatch.idle_slot_seconds",
+            Self::ForgeStageDwell => "loom.forge.stage_dwell",
+            Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
+            Self::ForgeStageItems => "loom.forge.stage_items",
         }
     }
 
@@ -212,7 +245,12 @@ impl MetricName {
             | Self::PoolExhaustedSeconds
             | Self::PoolAccountMarks
             | Self::QueueDispatchWait
-            | Self::QueueDispatchWaitSamples => MetricKind::DeltaCounter,
+            | Self::QueueDispatchWaitSamples
+            | Self::DispatchSlotTurnaround
+            | Self::DispatchSlotTurnaroundSamples
+            | Self::DispatchIdleSlotSeconds
+            | Self::ForgeStageDwell
+            | Self::ForgeStageDwellSamples => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -238,6 +276,11 @@ impl MetricName {
             Self::PoolExhausted => "1",
             Self::PoolExhaustedSeconds => "s",
             Self::QueueOldestWait | Self::QueueDispatchWait => "s",
+            Self::DispatchSlotTurnaround
+            | Self::DispatchIdleSlotSeconds
+            | Self::ForgeStageDwell => "s",
+            Self::DispatchSlotTurnaroundSamples | Self::DispatchIdleSlots => "{slot}",
+            Self::ForgeStageDwellSamples | Self::ForgeStageItems => "{item}",
             _ => "By",
         }
     }
@@ -274,6 +317,17 @@ impl MetricName {
             Self::PoolAccountMarks => {
                 "Pool accounts marked out of selection, by provider and reason."
             }
+            Self::DispatchSlotTurnaround => {
+                "Seconds from an issue-sweep slot freeing to its refill."
+            }
+            Self::DispatchSlotTurnaroundSamples => {
+                "Refills counted in loom.dispatch.slot_turnaround."
+            }
+            Self::DispatchIdleSlots => "Concurrency slots idle at the end of a work-finder tick.",
+            Self::DispatchIdleSlotSeconds => "Slot-seconds left idle while ready work waited.",
+            Self::ForgeStageDwell => "Seconds items spent in a forge label stage, by state.",
+            Self::ForgeStageDwellSamples => "Stage transitions counted in loom.forge.stage_dwell.",
+            Self::ForgeStageItems => "Open items carrying a stage label, by state.",
         }
     }
 }

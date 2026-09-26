@@ -37,6 +37,10 @@ pub enum SpanName {
     /// root trace.
     #[serde(rename = "loom.pool.hold")]
     PoolHold,
+    /// One work-finder `dispatch()` attempt (Issue #8907), parented to its
+    /// tick's [`Self::DispatchTick`] span.
+    #[serde(rename = "loom.dispatch.admission")]
+    DispatchAdmission,
 }
 
 impl SpanName {
@@ -54,6 +58,7 @@ impl SpanName {
             Self::DispatchTick => "loom.dispatch.tick",
             Self::RuntimeUsage => "loom.runtime.usage",
             Self::PoolHold => "loom.pool.hold",
+            Self::DispatchAdmission => "loom.dispatch.admission",
         }
     }
 }
