@@ -153,6 +153,25 @@ jobs:
               - '**/package.json'
               - '.github/workflows/ci.yml'
 
+  build-daemon:
+    name: Build loom-daemon (debug, shared)
+    # Experiment (#9065): compile the daemon ONCE per run and hand the binary
+    # to every job that only needs to run it, instead of 8 separate builds.
+    # Deliberately not path-filtered: required always-run checks consume it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p loom-daemon --bin loom-daemon
+      - uses: actions/upload-artifact@v7
+        with:
+          name: loom-daemon-debug
+          path: target/debug/loom-daemon
+          if-no-files-found: error
+          retention-days: 1
+
   backend-lint-and-check:
     name: Rust Linting & Build Check
     needs: changes
@@ -369,6 +388,8 @@ jobs:
     # whose logic moves into the daemon behind a stub — rather than total
     # production shell, a quarter of which is `bootstrap`/`vendored` and
     # correctly permanent. See .loom/docs/shell-language-policy.md.
+    needs: build-daemon
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -378,13 +399,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Debug, not --release (#9065): these steps only RUN the binary, so an
-      # optimised build bought nothing but ~100s on every PR (~150s release
-      # vs ~45s debug on a warm cache).
-      - name: Build loom-daemon
-        run: cargo build -p loom-daemon --bin loom-daemon
+      # Built once by build-daemon (#9065 experiment). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@v8
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       # Prints the report whether or not it passes. A gate that only speaks up
       # on failure teaches nobody which way the number is moving, which is how
       # the portable pool grew +317 across four merged ports unnoticed.
@@ -676,17 +698,20 @@ jobs:
     # (#8673, contract point 5). This is native Rust from the start (per the
     # shell-language policy, #7762) rather than a `bash scripts/*.sh` check, so
     # it needs a build step first — same shape as the Shell Budget Ratchet job.
+    needs: build-daemon
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Debug, not --release (#9065): these steps only RUN the binary, so an
-      # optimised build bought nothing but ~100s on every PR (~150s release
-      # vs ~45s debug on a warm cache).
-      - name: Build loom-daemon
-        run: cargo build -p loom-daemon --bin loom-daemon
+      # Built once by build-daemon (#9065 experiment). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@v8
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: Check .agents/skills/ is in sync with its source
         run: ./target/debug/loom-daemon generate-agent-skills --check
 
@@ -752,17 +777,20 @@ jobs:
     # Materialising the install and running the installer's own check against
     # it needs no model of the destination map at all — it IS the destination
     # map. This is the exact command sequence that failed in #8270.
+    needs: build-daemon
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Debug, not --release (#9065): these steps only RUN the binary, so an
-      # optimised build bought nothing but ~100s on every PR (~150s release
-      # vs ~45s debug on a warm cache).
-      - name: Build loom-daemon
-        run: cargo build -p loom-daemon --bin loom-daemon
+      # Built once by build-daemon (#9065 experiment). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@v8
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: Initialize Loom into an empty two-commit fixture repo
         run: |
           set -euo pipefail
@@ -1122,20 +1150,26 @@ jobs:
     # when the block is converged, so this needs zero new Rust code: build
     # the binary, run update-gitignore against the checked-out repo, then
     # diff .gitignore against the PR's committed version.
+    needs: build-daemon
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build loom-daemon
-        run: cargo build --package loom-daemon
+      # Built once by build-daemon (#9065 experiment). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@v8
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: Check .gitignore matches the current EPHEMERAL_PATTERNS set
         run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
 
   dep-classification-suites:
     name: Native Port Suites
-    needs: changes
+    needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
     # The equivalence evidence for epic #7810. Every suite here carries
     # assertions written against a SHELL implementation that is now a thin stub
@@ -1176,16 +1210,20 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - name: Configure git identity for suite fixtures
         # These suites create fixture commits; a fresh runner has no global
         # identity. Same step shell-suite-tests carries, for the same reason.
         run: |
           git config --global user.email "ci@loom.test"
           git config --global user.name "Loom CI"
-      - name: Build loom-daemon
-        run: cargo build --package loom-daemon
+      # Built once by build-daemon (#9065 experiment). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@v8
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: classify-dependency-block (#5664, #7650)
         run: bash defaults/scripts/tests/test-classify-dependency-block.sh
       - name: classify-dependency-block premise-false interaction (#7904)
@@ -1437,7 +1475,7 @@ jobs:
 
   native-port-daemon-lifecycle:
     name: Native Port Suites (daemon start/update)
-    needs: changes
+    needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
     # Split out of Native Port Suites by #9065, which see for everything else
     # about this family: that job ran ~420s of suites back to back, the
@@ -1448,16 +1486,20 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - name: Configure git identity for suite fixtures
         # These suites create fixture commits; a fresh runner has no global
         # identity. Same step shell-suite-tests carries, for the same reason.
         run: |
           git config --global user.email "ci@loom.test"
           git config --global user.name "Loom CI"
-      - name: Build loom-daemon
-        run: cargo build --package loom-daemon
+      # Built once by build-daemon (#9065 experiment). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@v8
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       # Moved out of shell-suite-tests by #8087, the same move #8086 made for
       # the watchdog (now in native-port-watchdog-spawn) and for the same
       # reason: cli/loom-daemon-start.sh is now a thin stub over `loom-daemon
@@ -1494,7 +1536,7 @@ jobs:
 
   native-port-watchdog-spawn:
     name: Native Port Suites (watchdog, spawn-claude)
-    needs: changes
+    needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
     # Split out of Native Port Suites by #9065, which see for everything else
     # about this family: that job ran ~420s of suites back to back, the
@@ -1505,16 +1547,20 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - name: Configure git identity for suite fixtures
         # These suites create fixture commits; a fresh runner has no global
         # identity. Same step shell-suite-tests carries, for the same reason.
         run: |
           git config --global user.email "ci@loom.test"
           git config --global user.name "Loom CI"
-      - name: Build loom-daemon
-        run: cargo build --package loom-daemon
+      # Built once by build-daemon (#9065 experiment). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@v8
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
       # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
       # (188 + 27 assertions, unchanged from the shell implementation apart
@@ -1540,17 +1586,21 @@ jobs:
 
   installer-tests:
     name: Installer Integration Tests
-    needs: changes
+    needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
     # Portable across GNU/BSD sed (temp-file + mv idiom) — runs on ubuntu (#3515)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build native worker dispatcher
-        run: cargo build --package loom-daemon
+      # Built once by build-daemon (#9065 experiment). download-artifact FAILS
+      # when the artifact is missing, so a broken build turns this job red
+      # rather than letting it pass on nothing (ci-principles.md rule 6).
+      - uses: actions/download-artifact@v8
+        with:
+          name: loom-daemon-debug
+          path: target/debug
+      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: Check role prompts reference only real labels (#3786)
         run: bash defaults/scripts/check-phantom-labels.sh
       - name: Check labels.yml copies are in sync (#3896)
