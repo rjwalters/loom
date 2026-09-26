@@ -82,4 +82,5 @@ pub(crate) mod worktree_lock;
 pub(crate) mod worktree_remove;
 pub(crate) mod worktree_reset;
 mod worktree_state;
+pub(crate) mod worktree_submodules;
 pub(crate) mod worktree_wip;
