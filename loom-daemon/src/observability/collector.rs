@@ -1124,4 +1124,7 @@ mod admission_brake_tests;
 mod provider_accounts_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+mod shell_arm_registry_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests;
