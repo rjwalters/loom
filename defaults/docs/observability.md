@@ -252,10 +252,11 @@ equally consistent with "drained cleanly" and "nothing was ever enqueued", so
 confirming the healthy case meant grepping `daemon.log` for the *absence* of a
 warning.
 
-`loom-daemon status` now states the answer positively (issue #5083):
+`loom-daemon status` now states the answer positively (issue #5083) — and says
+how far that answer reaches (issue #9015):
 
 ```
-Observability: OK — last export 12s ago, 3481 record(s) as host_id=studio-host → https://…/ingest
+Observability: OK (first hop only) — last export 12s ago, 3481 record(s) as host_id=studio-host → https://…/ingest
 ```
 
 The same facts are machine-readable under `observability_export` in
@@ -272,13 +273,15 @@ loom-daemon status --json | jq -e '.observability_export.state == "healthy"'
 | `misconfigured` | `enabled: true`, but a required piece of config could not be resolved (no endpoint, no `ingestKeyFile`, or that file is missing/unreadable/empty, or `otlp` without the Cargo feature) — a config error to fix, not a benign off-by-choice state (#5337) | `Observability: MISCONFIGURED …` |
 | `starting` | Running, nothing acked yet, still inside the grace window (3 × `flushIntervalSecs`, floored at 10 min) — a just-rolled daemon, not a fault | `Observability: starting …` |
 | `never_exported` | Running well past the grace window and **no batch has ever been acked** — the silent failure mode | `Observability: NEVER EXPORTED …` |
-| `healthy` | Batches are being acked and the ids agree | `Observability: OK …` |
+| `healthy` | Batches are being acked **by the configured endpoint** and the ids agree. Says nothing about any hop past that endpoint — see "What `healthy` actually proves" below (#9015) | `Observability: OK (first hop only) …` |
 | `host_id_mismatch` | Batches are being acked, but under a different `host_id` than this daemon reports for itself (the #4830 condition, §3 above) | `Observability: HOST-ID MISMATCH …` |
 | `failing` | The most recent flush attempt errored; the queue is retrying with backoff | `Observability: FAILING …` |
 
 `observability_export` also carries `host_id`, `endpoint`, `exporter`,
 `started_at`, `last_success_at`, `last_failure_at`, `last_failure_detail`,
-`records_exported`, `consecutive_failures`, and `flush_interval_secs`. A `null`
+`records_exported`, `consecutive_failures`, `flush_interval_secs`, and the two
+#9015 scope fields `scope` / `endpoint_loopback` (see "What `healthy` actually
+proves" below). A `null`
 `observability_export` means the daemon binary predates #5083 — "cannot tell",
 never "disabled"; restart the daemon onto a current binary. Under
 `misconfigured`, `endpoint` reflects whatever piece of config *did* resolve
@@ -310,10 +313,63 @@ at all. When a section does render, its `detail` payload carries the full
 `observability_export` record, so a machine consumer of `loom-daemon health
 --json` gets the positive facts too.
 
-**Note on scope**: this is a *transport-level* signal — it answers "are batches
-being acked", not "is every record kind being enqueued". A host can report
-`healthy` while a specific record kind is silently never queued (e.g. issue
-#5084); the two checks are complementary.
+### What `healthy` actually proves — the first hop, and only the first hop (#9015)
+
+Two independent limits, both of which a `healthy` reading is silent about:
+
+1. **Record kinds.** This is a *transport-level* signal — it answers "are
+   batches being acked", not "is every record kind being enqueued". A host can
+   report `healthy` while a specific record kind is silently never queued (e.g.
+   issue #5084); the two checks are complementary.
+2. **Hops.** The daemon observes exactly one thing: whether the **configured
+   `endpoint`** accepted the batch it POSTed. Anything past that endpoint is
+   invisible from here. Every export state therefore carries
+   `scope: "first_hop"`, and the human line reads `OK (first hop only)`.
+
+Limit 2 is not theoretical. From 2026-09-24 to 2026-09-26 an operator Mac
+reported `state: healthy`, `last_failure_at: null`, 5061 metric points / 253
+spans / 326 log records accepted, `rejected: 0`, `dropped: 0` — while its local
+`otel-edge` collector logged ~6,755 `Exporting failed` lines (including
+`Exporting failed. Dropping data.`) because its egress tunnel had never been
+installed. SigNoz held **no** continuous `service.name=loom` data for those 30+
+hours. `loom-daemon health`, `serve` and every operator check keyed on `healthy`
+were falsely reassuring the whole time; it was found only by querying ClickHouse
+directly. (#4830 is the same "only the daemon can notice" pattern; this is its
+OTLP-exporter form.)
+
+**With an edge collector, `healthy` means only that the edge accepted the
+data.** Because that deployment is now the common one, the daemon flags it:
+`endpoint_loopback: true` whenever `endpoint` resolves to this machine
+(`127.0.0.0/8`, `::1`, `localhost` or any DNS child of it), and the status line
+spells the consequence out:
+
+```
+Observability: OK (first hop only) — last export 9s ago, 5061 record(s) as host_id=studio-host → http://127.0.0.1:14318/v1/logs (LOCAL collector: delivery to the backend PAST this hop is not verified here — check the backend read-back, or the collector's own otelcol_exporter_send_failed_* counters)
+```
+
+Both fields are derived, never configured: `endpoint_loopback` is re-derived
+from `endpoint` every time a status cell is published, and the `status`
+renderers re-derive it from the endpoint they were handed, so a payload from a
+pre-#9015 daemon still renders the caveat. A `scope` value this client does not
+recognize (a newer daemon) reads back as `unrecognized` rather than failing the
+parse.
+
+**Recommended end-to-end check for edge deployments.** Pair the daemon's
+first-hop signal with one of these — the daemon cannot perform either for you,
+and nothing in `status`/`health` should be read as a substitute:
+
+| Check | What it proves | Notes |
+|---|---|---|
+| **Backend read-back** (preferred) | A record written now is queryable in the backend a moment later — the only true end-to-end proof | Modelled on harness-ops `signozliveness` (harness-ops #177): write a canary, query it back over the backend's API, alert on absence |
+| **Collector exporter metrics** | The edge's own egress is succeeding | Scrape the collector's telemetry endpoint (`:8888` by default) for `otelcol_exporter_send_failed_log_records` / `_spans` / `_metric_points` and its queue size; non-zero failures mean data is being dropped after the hop the daemon verified |
+| **Collector logs** | Coarse, but immediate | `Exporting failed` / `Dropping data.` lines in the collector's log — the signal that was present and unwatched throughout the incident above |
+
+An in-daemon downstream probe (a read-back canary, or scraping a loopback
+collector's `:8888` metrics, surfaced as a distinct `degraded_downstream`
+state in `status` / `health` / `host.health`) is **not** implemented: it needs a
+new config knob, an HTTP scrape in the sender loop, and a new state wired
+through every surface. Tracked separately — until it exists, the end-to-end
+check is external and the daemon says so instead of implying otherwise.
 
 ## 3c. Operational signals from daemon loops (Issue #8860)
 
