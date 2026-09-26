@@ -130,6 +130,7 @@ fn issue_execution_joins_the_story_trace_and_still_retires() {
         assert_eq!(sweep.context.trace_id, story.trace_id);
         assert_eq!(sweep.parent_span_id.as_ref(), Some(&story.span_id));
         assert_eq!(sweep.attributes["loom.issue"], "9038");
+        assert_eq!(sweep.attributes["loom.repo"], "rjwalters/loom");
         assert_eq!(sweep.attributes["loom.story_id"], story.trace_id.as_str());
     }
     assert_ne!(sweeps[0].context.span_id, sweeps[1].context.span_id);

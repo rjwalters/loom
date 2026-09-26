@@ -398,6 +398,8 @@ impl Journal {
         }
         // The execution root is the span parented outside this journal: none
         // at all, or a story root (#9037) that no execution journals itself.
+        // An orphan whose journalled parent never started (the root's own
+        // start failed) counts too; before #9038 such a journal never retired.
         let completed_root = completed_parents.iter().any(|parent| {
             parent
                 .as_ref()

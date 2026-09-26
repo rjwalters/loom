@@ -129,15 +129,25 @@ pub fn close(root: &Path, execution: &str, ended_at: DateTime<Utc>) {
         return;
     };
     let path = entry_path(root, &context);
-    let Some(mut entry) = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<JoinEntry>(&bytes).ok())
-    else {
+    // An execution in flight across the upgrade opened its entry under the
+    // pre-#9038 `<trace-id>.json` name; close (and rename) that one instead.
+    let legacy = root
+        .join(JOIN_DIR)
+        .join(format!("{}.json", context.trace_id.as_str()));
+    let Some((found, mut entry)) = [path.clone(), legacy].into_iter().find_map(|candidate| {
+        std::fs::read(&candidate)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<JoinEntry>(&bytes).ok())
+            .filter(|entry| entry.context == context)
+            .map(|entry| (candidate, entry))
+    }) else {
         return;
     };
     entry.ended_at = Some(ended_at.max(entry.started_at));
     if let Err(error) = write(root, &entry) {
         log::warn!("observability: session trace join not closed: {error}");
+    } else if found != path {
+        let _ = std::fs::remove_file(found);
     }
 }
 

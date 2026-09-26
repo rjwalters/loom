@@ -40,9 +40,11 @@ pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue:
         return;
     }
     let story = issue.and_then(|issue| {
+        // Lowercased so `loom.repo` agrees across hosts whose origins differ
+        // only in case, exactly as the story id itself does.
         crate::release_resolve::host::repo_slug(root).map(|repo| StoryRef {
             context: crate::telemetry::trace::story_context(&repo, issue),
-            repo,
+            repo: repo.to_ascii_lowercase(),
             issue,
         })
     });
