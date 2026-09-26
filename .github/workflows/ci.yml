@@ -38,19 +38,14 @@ env:
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
-  # Belt-and-suspenders cancellation (#6683): the native `cancel-in-progress`
-  # above does NOT reliably cancel a superseded run that is still `queued`
-  # (zero jobs materialized yet) — only a run that has already reached
-  # `in_progress` is cancelled reliably. Observed 2026-08-21 on PR #6680: a
-  # force-pushed rebase created a new run that sat `pending` with zero jobs
-  # for ~20 minutes because the OLD run was `queued` (not yet `in_progress`)
-  # and kept holding the `ci-${{ github.ref }}` concurrency group; a manual
-  # `POST actions/runs/<id>/cancel` on the old run unblocked the new one
-  # immediately. This job explicitly cancels any other queued/in_progress run
-  # of THIS workflow on the SAME head branch, scoped strictly by `--branch`
-  # so it can never touch an unrelated ref's run. It has no `needs:` so it
-  # starts immediately in parallel with every other job below, and it does
-  # not gate them — its only side effect is cancelling stale runs elsewhere.
+  # Detect Changes: path groups for the filtered jobs below, plus (first step,
+  # PR events only) the belt-and-suspenders cancellation of superseded runs
+  # (#6683), folded in from its own job by #9065. The native
+  # `cancel-in-progress` above does NOT reliably cancel a superseded run that
+  # is still `queued`: observed 2026-08-21 on PR #6680, a force-pushed rebase's
+  # new run sat `pending` ~20 minutes behind the old queued one. The cancel
+  # step is scoped strictly by `--branch`, and continue-on-error keeps a cancel
+  # hiccup from failing the path filter every filtered job `needs`.
   changes:
     name: Detect Changes
     runs-on: ubuntu-latest
@@ -284,11 +279,10 @@ jobs:
       - run: cargo clippy --package loom-daemon --package loom-api -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
       - run: cargo check --workspace --all-targets
       # Folded in from the former Rust Doctests job (#9065): nextest does not
-      # run doctests, so libtest still owns them (#4385).
-      # nextest does not run doctests, so libtest still owns those (#4385). Its
-      # own job since #9065 rather than riding one partition of Rust Unit Tests,
-      # where it would make that leg the long pole.
+      # run doctests, so libtest still owns them (#4385). `!cancelled()` so a
+      # clippy failure above does not hide a doctest failure.
       - name: Run doctests
+        if: ${{ !cancelled() }}
         run: cargo test --workspace --doc
 
   backend-tests:
@@ -718,11 +712,11 @@ jobs:
       # job used to run (which required, rather than forbade, a version bump
       # alongside a defaults/ change -- #5874, superseded by #7743 after
       # nine follow-up issues about the per-PR-bump cost in 60 days).
-      # fetch-depth: 0 + an explicit head sha (instead of the default
-      # single-commit fetch of the synthetic refs/pull/<N>/merge ref) ensure
-      # both the PR's base and head commits are present locally for the
-      # script's `git show <ref>:<path>` value extraction -- and that their
-      # merge-base resolves, which --forbid-bump needs (#7823): base.sha is
+      # This job's full-history checkout (fetch-depth: 0 of the
+      # refs/pull/<N>/merge ref, whose parents are the base and the head)
+      # ensures both commits are present locally for the script's
+      # `git show <ref>:<path>` value extraction -- and that their merge-base
+      # resolves, which --forbid-bump needs (#7823): base.sha is
       # the live tip of main at trigger time, so comparing against it raw
       # would false-FAIL any PR cut before a sibling defaults/-touching merge
       # bumped the version. The script narrows to merge-base(base, head)
@@ -1388,6 +1382,13 @@ jobs:
       # sources that library, so it needs the binary this job downloads.
       - name: daemon-update fixture containment (#8712)
         run: bash defaults/scripts/tests/test-daemon-update-fixture-containment.sh
+      # #8069: 284 assertions that had never run in ANY CI job. They were
+      # excluded on the reason "wiring it needs a cargo build step or a binary
+      # stub — follow-up"; this job (with the shared build) is that step. The subject is
+      # spawn-claude.sh's token selection — the path behind the 228-instance
+      # crash incident (#7708).
+      - name: spawn-claude token selection (#4228, #7708)
+        run: bash defaults/scripts/tests/test-spawn-claude.sh
       # Moved out of shell-suite-tests by #8037: claude-wrapper.sh's six retry
       # classifiers now delegate to `loom-daemon retry-classify`, so these 44
       # assertions — written against the pre-port shell in #8032 and unchanged
@@ -1582,7 +1583,7 @@ jobs:
         run: bash defaults/scripts/tests/test-cleanup-branches-pr-review-branch.sh
 
   native-port-daemon-lifecycle:
-    name: Native Port Suites (daemon lifecycle, watchdog, spawn-claude)
+    name: Native Port Suites (daemon lifecycle, watchdog)
     needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
     # Split out of Native Port Suites by #9065, which see for everything else
@@ -1590,6 +1591,9 @@ jobs:
     # longest pole in CI. The steps are unchanged; only which runner runs
     # them moved. Same trigger, same build, and the same FAIL-never-SKIP
     # contract without a binary.
+    # The spawn-claude suite moved back to Native Port Suites (#9065 follow-up):
+    # with it, this job was the critical path (build-daemon, then 265s). Every
+    # suite runs under !cancelled(), so one red suite cannot hide the others.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1636,10 +1640,13 @@ jobs:
       # giving them inside its concurrent pool — by construction rather than by
       # quarantine list.
       - name: loom-daemon-start (#4773, #6568, #7391, ported in #8087)
+        if: ${{ !cancelled() }}
         run: bash defaults/scripts/tests/test-loom-daemon-start.sh
       - name: loom-daemon-start launchd plist rendering (#5343, #6387, #8087)
+        if: ${{ !cancelled() }}
         run: bash defaults/scripts/tests/test-loom-daemon-launchd-plist.sh
       - name: loom-daemon-update (#4078, #6639, #8087)
+        if: ${{ !cancelled() }}
         run: bash defaults/scripts/tests/test-loom-daemon-update.sh
       # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
       # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
@@ -1655,14 +1662,8 @@ jobs:
       # nothing to bootout. On a developer host, run them through
       # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
       - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
+        if: ${{ !cancelled() }}
         run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
-      # #8069: 284 assertions that had never run in ANY CI job. They were
-      # excluded on the reason "wiring it needs a cargo build step or a binary
-      # stub — follow-up"; this job is that cargo build step. The subject is
-      # spawn-claude.sh's token selection — the path behind the 228-instance
-      # crash incident (#7708).
-      - name: spawn-claude token selection (#4228, #7708)
-        run: bash defaults/scripts/tests/test-spawn-claude.sh
 
   installer-tests:
     name: Installer Integration Tests
