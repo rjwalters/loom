@@ -78,6 +78,15 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
+        /// Install-time workspace mode (#8884). `session` writes an
+        /// attended-operator config: `terminals: []` plus the daemon-tier work
+        /// generators off, persisted as `"mode": "session"` in
+        /// `.loom/config.json` so a later reinstall/resync re-asserts it.
+        /// Omitting the flag (or passing `default`) is the stock install; it
+        /// never REMOVES a marker already on disk.
+        #[arg(long, value_name = "MODE", default_value = "default")]
+        mode: loom_daemon::init::InstallMode,
+
         /// Print what would be done without making changes
         #[arg(long)]
         dry_run: bool,
@@ -2718,7 +2727,8 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             workspace,
             defaults,
             force,
+            mode,
             dry_run,
-        } => cli::misc_cmds::run_init(workspace, defaults, force, dry_run),
+        } => cli::misc_cmds::run_init(workspace, defaults, force, mode, dry_run),
     }
 }

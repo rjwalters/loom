@@ -57,6 +57,11 @@ UNTRACK=false         # --untrack: run the git rm --cached commands (#3836)
 # short-circuits below -- one ahead of the --local-mode block's mutations, one
 # ahead of the default (worktree+PR) path's first write (create-worktree.sh).
 DRY_RUN=false
+# Install-time workspace mode (--mode session, issue #8884), held as the literal
+# `loom-daemon init` argv pair so it can be spliced into the init call below
+# without re-deriving anything. Empty (the default) reproduces the pre-#8884
+# behavior exactly.
+MODE_FLAGS=()
 TARGET_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -69,14 +74,8 @@ while [[ $# -gt 0 ]]; do
       FORCE_OVERWRITE=true
       shift
       ;;
-    --clean)
-      CLEAN_FIRST=true
-      shift
-      ;;
-    --dry-run)
-      DRY_RUN=true
-      shift
-      ;;
+    --clean) CLEAN_FIRST=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
     --allow-active-session)
       ALLOW_ACTIVE_SESSION=true
       shift
@@ -105,9 +104,12 @@ while [[ $# -gt 0 ]]; do
       LOCAL_MODE=true
       shift
       ;;
-    --untrack)
-      UNTRACK=true
-      shift
+    --untrack) UNTRACK=true; shift ;;
+    --mode)
+      # `default` is accepted as an explicit no-op; it does NOT remove a
+      # `"mode": "session"` marker already on disk (defaults/docs/session-mode.md).
+      case "${2:-}" in session|default) MODE_FLAGS=(--mode "$2") ;; *) echo "Error: invalid --mode: '${2:-}' (expected 'session' or 'default')" >&2; exit 1 ;; esac
+      shift 2
       ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS] /path/to/target-repo"
@@ -142,6 +144,10 @@ while [[ $# -gt 0 ]]; do
       echo "  --untrack                  With --local: actually run the 'git rm -r --cached' untrack commands"
       echo "                             (staged as deletions; files stay on disk) instead of just printing"
       echo "                             them. No effect without --local."
+      echo "  --mode session|default     Install-time workspace mode. 'session' installs for an attended"
+      echo "                             operator: terminals: [] (no tmux agent pool) and the daemon-tier"
+      echo "                             work generators off, persisted as \"mode\": \"session\" in"
+      echo "                             .loom/config.json. See defaults/docs/session-mode.md."
       echo "  --dry-run                  Print what would be written and exit 0; creates, modifies, and"
       echo "                             removes nothing. Implies --yes (never prompts). Composes with --local."
       echo "  -h, --help                 Show this help message"
@@ -396,6 +402,13 @@ export NON_INTERACTIVE
 # untrack step acts on). Fail loudly rather than silently ignoring it.
 if [[ "$UNTRACK" == "true" ]] && [[ "$LOCAL_MODE" != "true" ]]; then
   error "--untrack requires --local (it controls the local-mode untrack step)"
+fi
+
+# --mode is applied by `loom-daemon init`, which --local deliberately never runs
+# (see the LOCAL MODE short-circuit below), so the combination would silently
+# write no config at all. A safety flag must never no-op quietly (#8884).
+if [[ ${#MODE_FLAGS[@]} -gt 0 ]] && [[ "$LOCAL_MODE" == "true" ]]; then
+  error "--mode cannot be combined with --local: local mode does not run 'loom-daemon init', so no .loom/config.json is written"
 fi
 
 # ============================================================================
@@ -1418,7 +1431,7 @@ INIT_FLAGS=""
 if [ "$FORCE_OVERWRITE" = true ] || [ "$CLEAN_FIRST" = true ]; then
   INIT_FLAGS="--force"
 fi
-"$TARGET_DIR/release/loom-daemon" init $INIT_FLAGS --defaults "$LOOM_ROOT/defaults" . || \
+"$TARGET_DIR/release/loom-daemon" init $INIT_FLAGS ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"} --defaults "$LOOM_ROOT/defaults" . || \
   error "loom-daemon init failed"
 
 echo ""

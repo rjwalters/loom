@@ -271,7 +271,7 @@ run_dry_run_preview() {
       info "Previewing via scripts/install-loom.sh --dry-run:"
       echo ""
       "$LOOM_ROOT/scripts/install-loom.sh" --dry-run --yes \
-        ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH" || \
+        ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"} "$TARGET_PATH" || \
         warning "scripts/install-loom.sh --dry-run preview reported a problem; see above"
     fi
     return 0
@@ -286,7 +286,7 @@ run_dry_run_preview() {
     info "scripts/install-loom.sh --dry-run:"
     echo ""
     "$LOOM_ROOT/scripts/install-loom.sh" --dry-run --yes \
-      ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH" || \
+      ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"} "$TARGET_PATH" || \
       warning "scripts/install-loom.sh --dry-run preview reported a problem; see above"
   elif [[ "$INSTALL_TYPE" == "1" ]] || [[ "$NON_INTERACTIVE" == true ]]; then
     info "Method: Quick Install."
@@ -1160,12 +1160,19 @@ DRY_RUN=false
 # installer), but it must accept and forward them so the flags it suggests
 # actually work. See issue #3650.
 SOURCE_OVERRIDE_FLAGS=()
+# Install-time workspace mode (--mode session, issue #8884). Held as the literal
+# `loom-daemon init` argv pair so it can be spliced into both the direct init
+# calls below and the Full-Install delegation exec without re-deriving anything.
+# Empty (the default) reproduces the pre-#8884 behavior exactly.
+MODE_FLAGS=()
+# NOTE (#8884): the arms below are deliberately written in the compact
+# single-line form (`--flag) cmd; shift ;;`) already used elsewhere in this repo
+# (e.g. scripts/check-doc-tocs.sh). install.sh sits at its file-size ratchet
+# ceiling (.loom/docs/file-size-policy.md), so adding a flag means paying for it
+# from the same case block -- option (2) of that policy's "Hitting the gate".
 while [[ "${1:-}" == -* ]]; do
   case "$1" in
-    -y|--yes)
-      NON_INTERACTIVE=true
-      shift
-      ;;
+    -y|--yes) NON_INTERACTIVE=true; shift ;;
     --quick)
       # Check for conflicting --full flag
       if [[ "$INSTALL_TYPE" == "2" ]]; then
@@ -1184,20 +1191,19 @@ while [[ "${1:-}" == -* ]]; do
       NON_INTERACTIVE=true  # --full implies non-interactive
       shift
       ;;
-    --confirm-reinstall)
-      CONFIRM_REINSTALL=true
-      shift
+    --confirm-reinstall) CONFIRM_REINSTALL=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --mode)
+      # `default` is accepted as an explicit no-op so a caller can be explicit;
+      # it does NOT remove a `"mode": "session"` marker already on disk (see
+      # defaults/docs/session-mode.md). Validated here rather than only in
+      # `loom-daemon init` so a typo fails before the build/uninstall phases.
+      case "${2:-}" in session|default) MODE_FLAGS=(--mode "$2") ;; *) error "Invalid --mode: '${2:-}' (expected 'session' or 'default')" ;; esac
+      shift 2
       ;;
-    --dry-run)
-      DRY_RUN=true
-      shift
-      ;;
-    --allow-non-main-source|--allow-stale-target)
-      # Pass-through: accepted here so the wrapper's own suggestion works, then
-      # forwarded to scripts/install-loom.sh at the Full-Install delegation execs.
-      SOURCE_OVERRIDE_FLAGS+=("$1")
-      shift
-      ;;
+    # Pass-through: accepted here so the wrapper's own suggestion works, then
+    # forwarded to scripts/install-loom.sh at the Full-Install delegation execs.
+    --allow-non-main-source|--allow-stale-target) SOURCE_OVERRIDE_FLAGS+=("$1"); shift ;;
     -h|--help)
       echo "Usage: ./install.sh [OPTIONS] [TARGET_PATH]"
       echo ""
@@ -1222,6 +1228,11 @@ while [[ "${1:-}" == -* ]]; do
       echo "                             --confirm-reinstall to preview a destructive reinstall's"
       echo "                             removal plan; forwarded to scripts/install-loom.sh for a"
       echo "                             Full Install preview."
+      echo "  --mode session|default     Install-time workspace mode. 'session' installs for an"
+      echo "                             attended operator: no tmux agent pool (terminals: []) and"
+      echo "                             the daemon-tier work generators off, persisted as"
+      echo "                             \"mode\": \"session\" in .loom/config.json so a later"
+      echo "                             reinstall/resync re-asserts it. See defaults/docs/session-mode.md."
       echo "  --allow-non-main-source    Permit installing from a non-main / detached-HEAD"
       echo "                             Loom source (forwarded to scripts/install-loom.sh)"
       echo "  --allow-stale-target       Permit installing over a newer/stale target"
@@ -1924,7 +1935,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     fi
 
     # Run loom-daemon init
-    "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
+    "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" init --force ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"} --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
       error "Installation failed"
 
     # Clean up the config snapshot now that init has merged it into place.
@@ -2286,7 +2297,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
   # the target's main checkout, see #4888), but the release must sit next to
   # the `exec` so it stays correct if that ever changes.
   release_install_lock
-  exec "$LOOM_ROOT/scripts/install-loom.sh" ${INSTALL_FLAGS[@]+"${INSTALL_FLAGS[@]}"} ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH"
+  exec "$LOOM_ROOT/scripts/install-loom.sh" ${INSTALL_FLAGS[@]+"${INSTALL_FLAGS[@]}"} ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"} "$TARGET_PATH"
 else
   FORCE_FLAG=""
 fi
@@ -2415,12 +2426,12 @@ case "$METHOD" in
       echo ""
       set_install_lock_phase "installing"
       info "Uninstall complete, proceeding with fresh install..."
-      "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
+      "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" init --force ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"} --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
         error "Installation failed"
     else
       set_install_lock_phase "installing"
       # Run loom-daemon init
-      "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" init $FORCE_FLAG --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
+      "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" init $FORCE_FLAG ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"} --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
         error "Installation failed"
     fi
 
@@ -2525,7 +2536,7 @@ case "$METHOD" in
     # process, so the EXIT trap never runs and any held lock would be stranded
     # (issue #4928).
     release_install_lock
-    exec "$LOOM_ROOT/scripts/install-loom.sh" $FORCE_FLAG ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH"
+    exec "$LOOM_ROOT/scripts/install-loom.sh" $FORCE_FLAG ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"} "$TARGET_PATH"
     ;;
 esac
 

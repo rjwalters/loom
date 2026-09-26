@@ -28,6 +28,7 @@ mod post_init;
 mod repo_owned;
 mod retired;
 mod scaffolding;
+pub mod session_mode;
 mod templates;
 
 use std::collections::HashSet;
@@ -44,6 +45,10 @@ use scaffolding::setup_repository_scaffolding;
 
 // Re-export public types and functions
 pub use git::is_loom_source_repo;
+// The install-time workspace mode (#8884). `main.rs` derives its `--mode` clap
+// value from this enum, so the CLI surface and the config writer can never
+// disagree about which modes exist.
+pub use session_mode::InstallMode;
 // Re-exported so the `loom-daemon update-gitignore` subcommand (#4280) can
 // rewrite the marker-delimited managed block on its own, without running a full
 // `init`. The pattern list stays single-sourced in `post_init::EPHEMERAL_PATTERNS`.
@@ -149,6 +154,27 @@ pub fn initialize_workspace(
     defaults_path: &str,
     force: bool,
 ) -> Result<InitReport, String> {
+    initialize_workspace_with_mode(workspace_path, defaults_path, force, InstallMode::Default)
+}
+
+/// [`initialize_workspace`], plus the install-time workspace mode (issue #8884).
+///
+/// `mode` is the operator's `loom-daemon init --mode <MODE>` selection.
+/// [`InstallMode::Default`] reproduces the pre-#8884 behaviour exactly, which is
+/// why the three-argument wrapper above is still the entry point every other
+/// caller uses. [`InstallMode::Session`] additionally asserts the session-mode
+/// key set on `.loom/config.json` — see [`session_mode`] for what that is and
+/// why the marker lives there.
+///
+/// A workspace whose existing `.loom/config.json` already carries the marker is
+/// treated as session-mode **regardless of `mode`**, so `loom update` and any
+/// other reinstall cannot silently restore the shipped `terminals` array.
+pub fn initialize_workspace_with_mode(
+    workspace_path: &str,
+    defaults_path: &str,
+    force: bool,
+    mode: InstallMode,
+) -> Result<InitReport, String> {
     let workspace = Path::new(workspace_path);
     let loom_path = workspace.join(".loom");
     let mut report = InitReport::default();
@@ -206,7 +232,7 @@ pub fn initialize_workspace(
     // committed CONSUMER configuration that may carry local overrides such as
     // `worktree.root`. A bare `fs::copy` from the template would silently drop
     // those keys — see `merge_config_file`.
-    merge_config_file(&defaults, &loom_path, &mut report)?;
+    merge_config_file(&defaults, &loom_path, mode, &mut report)?;
     copy_single_file(&defaults, &loom_path, ".loom-README.md", ".loom/README.md", &mut report)?;
 
     // `.loom/biome.jsonc` (#6031): a nested Biome configuration that takes the
@@ -410,9 +436,25 @@ fn copy_single_file(
 /// `autonomous.workFinder.maxConcurrent` was silently reverted on a fleet
 /// worker with no trace of which process rewrote the file. `warn!`/`info!` land
 /// in `daemon.log` and are greppable after the fact.
+/// # Session mode (issue #8884)
+///
+/// When `mode` is [`InstallMode::Session`] — or the existing consumer file
+/// already carries the persisted `"mode": "session"` marker — the value this
+/// function is about to write is run through
+/// [`session_mode::apply_session_mode`] first, on EVERY branch that writes at
+/// all. That re-assertion is what makes the marker survive `loom update`: the
+/// deep merge below would preserve an existing `terminals: []` on its own, but
+/// re-applying the key set means a future template change cannot hand an
+/// unattended-agent capability back to a session-mode repo either.
+///
+/// The one branch that cannot honour the request is a `defaults/config.json`
+/// that is not parseable JSON. Rather than silently install an
+/// unattended-capable config for an operator who explicitly asked for session
+/// mode, that combination is a hard error.
 fn merge_config_file(
     defaults: &Path,
     loom_path: &Path,
+    mode: InstallMode,
     report: &mut InitReport,
 ) -> Result<(), String> {
     let src = defaults.join("config.json");
@@ -437,14 +479,14 @@ fn merge_config_file(
     // feature, template key order is retained (keys are not alphabetized).
     if !dst.exists() {
         match serde_json::from_str::<Value>(&template_str) {
-            Ok(template_val) => {
-                let mut serialized = serde_json::to_string_pretty(&template_val)
-                    .map_err(|e| format!("Failed to serialize config.json: {e}"))?;
-                serialized.push('\n');
-                fs::write(&dst, serialized)
-                    .map_err(|e| format!("Failed to write config.json: {e}"))?;
+            Ok(mut template_val) => {
+                if mode.is_session() && !session_mode::apply_session_mode(&mut template_val) {
+                    return Err("--mode session requires defaults/config.json to be a JSON object"
+                        .to_string());
+                }
+                session_mode::write_pretty_json(&dst, &template_val)?;
                 log::info!(
-                    "init: config.json: fresh-write {} — no existing file; wrote {} key(s) from the shipped template",
+                    "init: config.json: fresh-write {} — no existing file; wrote {} key(s) from the shipped template (mode: {mode:?})",
                     dst.display(),
                     top_level_key_count(&template_val)
                 );
@@ -452,6 +494,13 @@ fn merge_config_file(
             Err(e) => {
                 // Template is invalid JSON — fall back to a raw copy rather than
                 // dropping the install. (The reinstall branch handles this too.)
+                // EXCEPT under --mode session: a safety flag that silently fails
+                // open is worse than an aborted install (#8884).
+                if mode.is_session() {
+                    return Err(format!(
+                        "--mode session cannot be honoured: defaults/config.json is not valid JSON ({e})"
+                    ));
+                }
                 eprintln!(
                     "Warning: defaults/config.json is not valid JSON ({e}); \
                      copying it verbatim to .loom/config.json"
@@ -526,7 +575,17 @@ fn merge_config_file(
                 dst.display()
             );
 
-            fs::copy(&src, &dst).map_err(|e| format!("Failed to copy config.json: {e}"))?;
+            // #8884: the marker (if there ever was one) is unreadable along with
+            // the rest of the file, so only an explicit `--mode session` can
+            // re-establish session mode here. When it is set, write the
+            // session-applied template instead of copying the stock one.
+            if mode.is_session() {
+                let mut fallback = template_val.clone();
+                session_mode::apply_session_mode(&mut fallback);
+                session_mode::write_pretty_json(&dst, &fallback)?;
+            } else {
+                fs::copy(&src, &dst).map_err(|e| format!("Failed to copy config.json: {e}"))?;
+            }
             report.updated.push(report_name.to_string());
             return Ok(());
         }
@@ -535,6 +594,13 @@ fn merge_config_file(
     // Deep-merge: template is the base, existing consumer values win on conflict.
     let mut merged = template_val;
     deep_merge_existing_wins(&mut merged, &existing_val);
+
+    // #8884: re-assert session mode when the operator asked for it OR the file on
+    // disk already carries the marker. This is the branch `loom update` and every
+    // other reinstall takes, so it is the one that has to hold the guarantee.
+    if session_mode::session_mode_applies(mode, Some(&existing_val)) {
+        session_mode::apply_session_mode(&mut merged);
+    }
 
     // Diff BEFORE writing, so the log describes the effective config change this
     // call is about to make. With existing-wins semantics the expected shape is
@@ -885,3 +951,11 @@ mod tests;
 
 #[cfg(test)]
 mod credential_class_tests;
+
+// Session-mode init tests live in their own file rather than in `tests.rs`:
+// that file is frozen at its current size by the file-size ratchet
+// (.loom/docs/file-size-policy.md), and a sibling module is the remedy the
+// policy names first.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod session_mode_init_tests;
