@@ -106,6 +106,7 @@ fn suggested_worker_type_mismatch_warning_fires_only_on_real_divergence() {
             runtime_manifest: PathBuf::from("/runtime.json"),
             suggested_worker_type: suggested.map(str::to_string),
             preference: None,
+            execution: None,
         };
     // No declared suggestion at all -> nothing to warn about.
     assert!(suggested_worker_type_mismatch_warning(&admitted(
@@ -823,9 +824,13 @@ fn native_adapter_admits_through_a_deleted_current_exe_mid_roll() {
     // the whole roll window.
     assert!(!deleted.is_file());
 
-    let admitted = resolve_and_admit_with(d.path(), "curator", Some("opencode"), || {
-        crate::daemon_bin_resolve::resolve_from_current_exe(&deleted, |_| None)
-    })
+    let admitted = resolve_and_admit_with(
+        d.path(),
+        "curator",
+        Some("opencode"),
+        AdmissionContext::Host,
+        || crate::daemon_bin_resolve::resolve_from_current_exe(&deleted, |_| None),
+    )
     .unwrap();
     assert_eq!(admitted.runtime, "opencode");
     assert_eq!(admitted.adapter, replacement);
@@ -840,9 +845,13 @@ fn native_adapter_ordinary_current_exe_admits_unchanged() {
     let exe = roll.path().join("loom-daemon");
     touch_executable_file(&exe);
 
-    let admitted = resolve_and_admit_with(d.path(), "curator", Some("opencode"), || {
-        crate::daemon_bin_resolve::resolve_from_current_exe(&exe, |_| None)
-    })
+    let admitted = resolve_and_admit_with(
+        d.path(),
+        "curator",
+        Some("opencode"),
+        AdmissionContext::Host,
+        || crate::daemon_bin_resolve::resolve_from_current_exe(&exe, |_| None),
+    )
     .unwrap();
     assert_eq!(admitted.runtime, "opencode");
     assert_eq!(admitted.adapter, exe);
@@ -860,9 +869,13 @@ fn native_adapter_fails_closed_naming_both_attempts_when_replacement_is_gone() {
     // nothing — the resolver's error path is the rejection reason.
     let deleted = roll.path().join("loom-daemon (deleted)");
 
-    let rejected = resolve_and_admit_with(d.path(), "curator", Some("opencode"), || {
-        crate::daemon_bin_resolve::resolve_from_current_exe(&deleted, |_| None)
-    })
+    let rejected = resolve_and_admit_with(
+        d.path(),
+        "curator",
+        Some("opencode"),
+        AdmissionContext::Host,
+        || crate::daemon_bin_resolve::resolve_from_current_exe(&deleted, |_| None),
+    )
     .unwrap_err();
     assert_eq!(rejected.role, "curator");
     assert_eq!(rejected.runtime, "opencode");
