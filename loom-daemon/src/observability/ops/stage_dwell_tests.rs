@@ -49,6 +49,7 @@ fn issue(number: u32, created: i64) -> StageItem {
         number,
         created_at: Some(at(created)),
         closes: Vec::new(),
+        is_pr: false,
     }
 }
 
@@ -57,6 +58,7 @@ fn pr(number: u32, created: i64, closes: &[u32]) -> StageItem {
         number,
         created_at: Some(at(created)),
         closes: closes.to_vec(),
+        is_pr: true,
     }
 }
 
@@ -103,7 +105,9 @@ fn created_to_curated_and_curated_to_issue() {
     let samples = sampler.sample(&[repo(&[(CURATED, vec![issue(2, 100)])])], at(600), &mut fake);
     assert_eq!(stage(&samples, "created_to_curated"), [300]);
     // Promoted to loom:issue: dwell from the curated label to the observation.
-    let samples = sampler.sample(&[repo(&[(ISSUE, vec![issue(2, 100)])])], at(1000), &mut fake);
+    // Promotion is additive: loom:curated stays on alongside loom:issue.
+    let promoted = [(CURATED, vec![issue(2, 100)]), (ISSUE, vec![issue(2, 100)])];
+    let samples = sampler.sample(&[repo(&promoted)], at(1000), &mut fake);
     assert_eq!(stage(&samples, "curated_to_issue"), [600]);
     assert_eq!(fake.reads, 1, "the events read is cached");
 }
@@ -184,7 +188,8 @@ fn a_repo_missing_from_a_sample_keeps_its_state() {
     sampler.sample(&[repo(&[(CURATED, vec![issue(6, 0)])])], at(20), &mut fake);
     // A failed listing: the repo is absent, which is not a mass exit.
     assert!(sampler.sample(&[], at(300), &mut fake).is_empty());
-    let samples = sampler.sample(&[repo(&[(ISSUE, vec![issue(6, 0)])])], at(600), &mut fake);
+    let promoted = [(CURATED, vec![issue(6, 0)]), (ISSUE, vec![issue(6, 0)])];
+    let samples = sampler.sample(&[repo(&promoted)], at(600), &mut fake);
     assert_eq!(stage(&samples, "curated_to_issue"), [590]);
 }
 
@@ -240,4 +245,70 @@ fn label_times_take_the_latest_labeled_event_per_label() {
     assert_eq!(times.len(), 1);
     assert_eq!(times["loom:curated"], Utc.with_ymd_and_hms(2026, 9, 3, 0, 0, 0).unwrap());
     assert!(parse_label_times(&serde_json::json!({"message": "Not Found"})).is_empty());
+}
+
+#[test]
+fn a_promotion_is_sampled_once_and_building_keeps_it_promoted() {
+    let mut fake = Fake::default();
+    fake.labels
+        .insert(8, BTreeMap::from([(CURATED.to_string(), at(0))]));
+    let mut sampler = Sampler::default();
+    sampler.sample(&[repo(&[(CURATED, vec![issue(8, 0)])])], at(10), &mut fake);
+    let queued = [(CURATED, vec![issue(8, 0)]), (ISSUE, vec![issue(8, 0)])];
+    let samples = sampler.sample(&[repo(&queued)], at(100), &mut fake);
+    assert_eq!(stage(&samples, "curated_to_issue"), [100]);
+    // The Builder claim swaps loom:issue for loom:building: still promoted.
+    let claimed = [(CURATED, vec![issue(8, 0)]), (BUILDING, vec![issue(8, 0)])];
+    let samples = sampler.sample(&[repo(&claimed)], at(200), &mut fake);
+    assert!(stage(&samples, "curated_to_issue").is_empty());
+}
+
+fn named(slug: &str, listings: &[(&'static str, Vec<StageItem>)]) -> RepoInput {
+    RepoInput {
+        slug: slug.into(),
+        ..repo(listings)
+    }
+}
+
+#[test]
+fn cache_warm_up_never_starves_another_repos_sampling_reads() {
+    let mut fake = Fake::default();
+    fake.labels
+        .insert(4, BTreeMap::from([(BUILDING.to_string(), at(1000))]));
+    let busy: Vec<StageItem> = (100..140).map(|n| issue(n, 0)).collect();
+    let a = |_: ()| named("acme/a", &[(CURATED, busy.clone())]);
+    let mut sampler = Sampler::default();
+    let b0 = named("acme/b", &[(BUILDING, vec![issue(4, 0)])]);
+    sampler.sample(&[a(()), b0], at(1100), &mut fake);
+    let b1 = named(
+        "acme/b",
+        &[
+            (BUILDING, vec![issue(4, 0)]),
+            (REVIEW_REQUESTED, vec![pr(40, 4600, &[4])]),
+        ],
+    );
+    let samples = sampler.sample(&[a(()), b1], at(5000), &mut fake);
+    assert_eq!(stage(&samples, "building_to_review_requested"), [3600]);
+}
+
+#[test]
+fn prs_waiting_on_budget_are_not_dropped_as_failures() {
+    let mut fake = Fake::default();
+    let n = 5 * FETCH_BUDGET;
+    let numbers: Vec<u32> = (1..=u32::try_from(n).unwrap()).collect();
+    for issue_number in &numbers {
+        fake.labels
+            .insert(*issue_number, BTreeMap::from([(BUILDING.to_string(), at(0))]));
+    }
+    let building: Vec<StageItem> = numbers.iter().map(|n| issue(*n, 0)).collect();
+    let prs: Vec<StageItem> = numbers.iter().map(|n| pr(n + 1000, 60, &[*n])).collect();
+    let mut sampler = Sampler::default();
+    sampler.sample(&[repo(&[(BUILDING, building.clone())])], at(10), &mut fake);
+    let listings = [(BUILDING, building), (REVIEW_REQUESTED, prs)];
+    let mut total = 0;
+    for step in 0..6 {
+        let samples = sampler.sample(&[repo(&listings)], at(100 + step), &mut fake);
+        total += stage(&samples, "building_to_review_requested").len();
+    }
+    assert_eq!(total, n, "every PR is sampled once the budget reaches it");
 }

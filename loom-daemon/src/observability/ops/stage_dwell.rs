@@ -14,15 +14,20 @@
 //! - one `pulls/{n}` read tells whether a PR that left review merged.
 //!
 //! Both come out of one shared budget of [`FETCH_BUDGET`] reads per sample
-//! across all repos. Work over the budget waits for the next sample, and
-//! nothing is ever read per tick or per issue per tick.
+//! across all repos; sampling reads come first, cache warm-up only spends
+//! what is left. Work over the budget waits for the next sample, and nothing
+//! is ever read per tick or per issue per tick. Only the first events page
+//! (100 events) is read, so an item whose label event is further back has no
+//! time and is not sampled. The reads run on a detached task, so a slow forge
+//! never stalls the collector; a sample still running when the next is due
+//! makes that next one a no-op.
 //!
 //! # Stages (`state` label)
 //!
 //! | `state` | sampled when | seconds |
 //! |---|---|---|
 //! | `created_to_curated` | an issue newly appears under `loom:curated` | `loom:curated` labeled − created |
-//! | `curated_to_issue` | an issue leaves `loom:curated` and is under `loom:issue` or `loom:building` | leave observed − `loom:curated` labeled |
+//! | `curated_to_issue` | a `loom:curated` issue newly appears under `loom:issue` or `loom:building` (`loom:curated` stays on) | promotion observed − `loom:curated` labeled |
 //! | `building_to_review_requested` | a PR newly under a review label closes an issue with a known `loom:building` time | PR created − `loom:building` labeled |
 //! | `review_requested_to_merged` | a PR leaves the review labels (`loom:review-requested`, `loom:changes-requested`, `loom:pr`) and merged | merged − PR created |
 //!
@@ -81,6 +86,8 @@ pub struct StageItem {
     pub created_at: Option<DateTime<Utc>>,
     /// Issues a PR's body closes (`Closes #N`, `Fixes #N`, `Resolves #N`).
     pub closes: Vec<u32>,
+    /// REST issue listings include PRs; stages are issue-only or PR-only.
+    pub is_pr: bool,
 }
 
 impl StageItem {
@@ -89,6 +96,7 @@ impl StageItem {
         StageItem {
             number: item.number,
             created_at: item.created_at.as_deref().and_then(parse_time),
+            is_pr: item.is_pull_request,
             closes: if item.is_pull_request {
                 closing_refs(item.body.as_deref().unwrap_or(""))
             } else {
@@ -144,10 +152,17 @@ pub struct RepoInput {
 }
 
 impl RepoInput {
+    /// The issues (not PRs) under `label`.
     fn numbers(&self, label: &str) -> BTreeSet<u32> {
         self.listings
             .get(label)
-            .map(|items| items.iter().map(|i| i.number).collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|i| !i.is_pr)
+                    .map(|i| i.number)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -156,6 +171,7 @@ impl RepoInput {
             .iter()
             .filter_map(|label| self.listings.get(label))
             .flatten()
+            .filter(|item| item.is_pr)
             .map(|item| (item.number, item))
             .collect()
     }
@@ -186,6 +202,11 @@ struct PendingPr {
 #[derive(Debug, Default)]
 struct RepoState {
     curated: BTreeSet<u32>,
+    /// Issues under `loom:issue` or `loom:building` last sample.
+    promoted: BTreeSet<u32>,
+    /// Curated issues promoted after the baseline, not yet sampled, with the
+    /// instant the promotion was observed.
+    new_promoted: BTreeMap<u32, DateTime<Utc>>,
     building: BTreeSet<u32>,
     review: BTreeMap<u32, DateTime<Utc>>,
     /// Issues that entered `loom:curated` after the baseline, not yet sampled.
@@ -256,6 +277,17 @@ impl Sampler {
             let mut state = self.repos.remove(&input.slug).unwrap_or_default();
             self.sample_repo(&mut state, input, baseline, now, fetcher, &mut budget, &mut samples);
             self.repos.insert(input.slug.clone(), state);
+        }
+        // Spare budget only, after every repo's sampling reads: warm the
+        // curated times of issues already present, so their promotion can
+        // be sampled without a read later.
+        for input in inputs {
+            for number in input.numbers(CURATED) {
+                if budget == 0 {
+                    break;
+                }
+                self.label_time(fetcher, &mut budget, input, number, CURATED);
+            }
         }
         self.last_at = Some(now);
         samples
@@ -351,6 +383,10 @@ impl Sampler {
                     stage: "building_to_review_requested",
                     seconds: (pending.created_at - building_at).num_seconds().max(0),
                 }),
+                // Out of budget is not a failed read: retry, uncounted.
+                None if *budget == 0 => {
+                    still_new.insert(number, pending);
+                }
                 None => {
                     pending.tries += 1;
                     if pending.tries < MAX_TRIES {
@@ -361,17 +397,26 @@ impl Sampler {
         }
         state.new_prs = still_new;
 
-        // Issues that left `loom:curated` for the ready queue or a build.
-        for number in state.curated.difference(&curated) {
-            if !promoted.contains(number) {
-                continue;
+        // Curated issues newly promoted to the ready queue or a build.
+        // `loom:curated` is additive (it stays on after promotion), so the
+        // transition is the entry into `loom:issue` ∪ `loom:building`.
+        if !baseline {
+            for number in promoted.difference(&state.promoted) {
+                if curated.contains(number) {
+                    state.new_promoted.insert(*number, now);
+                }
             }
-            let key = (input.slug.clone(), *number, CURATED.to_string());
-            if let Some(Some(curated_at)) = self.label_times.get(&key) {
-                samples.push(DwellSample {
+        }
+        for (number, observed_at) in std::mem::take(&mut state.new_promoted) {
+            match self.label_time(fetcher, budget, input, number, CURATED) {
+                Some(curated_at) => samples.push(DwellSample {
                     stage: "curated_to_issue",
-                    seconds: (now - *curated_at).num_seconds().max(0),
-                });
+                    seconds: (observed_at - curated_at).num_seconds().max(0),
+                }),
+                None if *budget == 0 => {
+                    state.new_promoted.insert(number, observed_at);
+                }
+                None => {}
             }
         }
 
@@ -401,16 +446,8 @@ impl Sampler {
             }
         }
 
-        // Warm the curated times of items already present, so their exit can
-        // be sampled later. Only spare budget is used.
-        for number in &curated {
-            if *budget == 0 {
-                break;
-            }
-            self.label_time(fetcher, budget, input, *number, CURATED);
-        }
-
         state.curated = curated;
+        state.promoted = promoted;
         state.building = building;
         state.review = review
             .iter()
@@ -570,19 +607,21 @@ pub(in crate::observability) async fn record(
             inputs.push(input);
         }
     }
-    let joined = tokio::task::spawn_blocking(move || {
-        let mut guard = SAMPLER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Detached: up to FETCH_BUDGET per-item reads (each bounded by
+    // GH_TIMEOUT) must never stall the collector's event loop.
+    drop(tokio::task::spawn_blocking(move || {
+        let mut guard = match SAMPLER.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            // The previous sample is still reading: skip this one.
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
         let sampler = guard.get_or_insert_with(Sampler::default);
         let previous = sampler.last_at();
         let samples = sampler.sample(&inputs, Utc::now(), &mut GhStageFetcher);
-        (stage_points(&samples, &inputs), previous)
-    })
-    .await;
-    if let Ok((points, previous)) = joined {
-        sink.emit_metrics_since(points, previous);
-    }
+        drop(guard);
+        sink.emit_metrics_since(stage_points(&samples, &inputs), previous);
+    }));
 }
 
 #[cfg(test)]

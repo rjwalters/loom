@@ -960,12 +960,17 @@ The stage dwell reads the stage labels' listings with the ETag-cached REST
 listing (a `304` costs no rate limit) every 5 minutes, plus at most 8 per-item
 reads per sample (`issues/{n}/events` for a label time, cached per process;
 `pulls/{n}` once when a PR leaves review). `created_to_curated` is sampled when
-an issue newly appears under `loom:curated`, `curated_to_issue` when it leaves
-it for `loom:issue` or `loom:building` (to within one 5-minute sample),
+an issue newly appears under `loom:curated`, `curated_to_issue` when a
+`loom:curated` issue newly appears under `loom:issue` or `loom:building`
+(`loom:curated` is additive and stays on; promotion time is known to within
+one 5-minute sample),
 `building_to_review_requested` when a PR that closes a `loom:building` issue
 newly appears under a review label (PR created minus the `loom:building`
 time), and `review_requested_to_merged` when a PR leaves the review labels and
-has merged (merged minus PR created). The first sample after start is a
+has merged (merged minus PR created). Sampling reads come first and cache
+warm-up only spends the remainder; work over the budget waits, uncounted, for
+the next sample. Only the first events page (100 events) is read. The reads
+run off the collector loop, so a slow forge never stalls it. The first sample after start is a
 baseline, so a restart never replays history. Every host managing a repo
 samples it: sums scale with the host count, means do not. Completed sweeps'
 own phase durations remain the cycle-time rollup's (#8692).
