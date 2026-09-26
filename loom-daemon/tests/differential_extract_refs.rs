@@ -1,5 +1,6 @@
 //! Differential test: the ported `extract-refs` against a frozen oracle of the
-//! **pre-port shell's** answers (epic #7810, filed from #8072).
+//! **pre-port shell's** answers (epic #7810, filed from #8072; corpus extended
+//! by #8094 and #8097, reconciled in #8136).
 //!
 //! # Why this exists
 //!
@@ -13,8 +14,10 @@
 //!
 //! Differential testing closes exactly that gap, because the corpus is
 //! *generated* from the grammar the implementation parses rather than
-//! hand-picked. This test replays 1050 such inputs and asserts the port differs
-//! from the shell in only the ways we have deliberately accepted.
+//! hand-picked. This test replays every case in
+//! `fixtures/extract_refs_shell_oracle.jsonl` — 2167 inputs across its three
+//! provenance blocks — and asserts the port differs from the shell in only the
+//! ways we have deliberately accepted.
 //!
 //! # Why an oracle file rather than running the shell
 //!
@@ -67,6 +70,39 @@
 //! comment). Both mutations now turn it red, and the test asserts that
 //! discriminating power directly — as a measured property of the corpus — so it
 //! cannot quietly decay back to zero.
+//!
+//! # A corpus that claims an alphabet it does not contain
+//!
+//! The first block's `_meta.corpus` said it spanned "the `[*_:space]` separator
+//! class including newlines". It contained space, `\n` and `\t` — three of the
+//! seven characters that class defines — and #8094's block added none of the
+//! others. The gap was not academic: `phrase_re()` spelled the separator run
+//! with the `regex` crate's `\s`, which is Unicode-aware and matches NBSP
+//! (U+00A0), while the shell's POSIX `[[:space:]]` under GNU grep does not.
+//! `"Requires\u{a0}#42"` therefore parsed differently on the two sides — and on
+//! BSD grep (macOS) differently again, so the disagreement was
+//! platform-dependent. Nothing in the corpus could see it.
+//!
+//! #8097 resolved that divergence rather than recording it: `phrase_re()` now
+//! uses the nested ASCII POSIX class `[*_:[[:space:]]]*`, and the third
+//! fixture block enumerates all seven characters (space, `\n`, `\t`, `\r`,
+//! `\x0b`, `\x0c`, NBSP) against every trigger phrase and reference boundary.
+//! The NBSP cases are the proof: both sides find nothing, so they land in
+//! `agreed` rather than in a class. [`corpus_separator_alphabet_is_complete`]
+//! asserts the coverage directly, because a corpus that silently stops
+//! containing a character is exactly how this hole opened the first time.
+//!
+//! # A committed generator, so the fixture is extendable
+//!
+//! The first two blocks named a seed and a rev for a generator that was never
+//! committed, which made a `frozen: Never edit` fixture unextendable without
+//! archaeology. `examples/generate_extract_refs_oracle.rs` (#8097) is that
+//! generator for the third block: `cargo run -p loom-daemon --example
+//! generate_extract_refs_oracle`. It preserves the two older blocks byte for
+//! byte — re-replaying all 1050 of their cases against the same pinned rev
+//! first, and aborting rather than rewriting one that no longer reproduces —
+//! then regenerates its own block below them. Extending a frozen oracle is
+//! additive, never a wholesale regeneration; see `verification-recipes.md` §6.
 
 use loom_daemon::dep_recheck::extract::{extract, Author, Comment, Input};
 
@@ -88,11 +124,11 @@ const OWN_MARKERS: [&str; 2] = [
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 enum Divergence {
     /// The shell matched with `grep -oE`, which is line-oriented and cannot
-    /// span a newline; the Rust regex runs over the whole text with `\s`
-    /// inside `[*_:\s]*` matching `\n`. So `"Blocked by\n#42"` matches here and
-    /// did not there. Documented and kept in `extract.rs` (#8011): missing a
-    /// genuine declared reference is the worse failure for a check whose whole
-    /// job is finding one.
+    /// span a newline; the Rust regex runs over the whole text with
+    /// `[[:space:]]` inside `[*_:[[:space:]]]*` matching `\n`. So
+    /// `"Blocked by\n#42"` matches here and did not there. Documented and kept
+    /// in `extract.rs` (#8011): missing a genuine declared reference is the
+    /// worse failure for a check whose whole job is finding one.
     NewlineSpan,
     /// `#007`. The shell's `sort -un` sorts numerically but prints the ORIGINAL
     /// token, so it emitted `007`; the Rust parses to `u64` and prints `7`.
@@ -278,9 +314,10 @@ fn parse_only(text: &str) -> String {
 /// account for, and nothing else.
 ///
 /// The shell matched with `grep -oE`, which is line-oriented and cannot span a
-/// newline; the port's regex runs over the concatenated text with `\s` (inside
-/// `[*_:\s]*`) matching `\n`. Normalised through `u64` the way the port does,
-/// so a zero-padded token compares equal to its canonical form.
+/// newline; the port's regex runs over the concatenated text with
+/// `[[:space:]]` (inside `[*_:[[:space:]]]*`) matching `\n`. Normalised
+/// through `u64` the way the port does, so a zero-padded token compares equal
+/// to its canonical form.
 ///
 /// **This regex is the ORACLE's pattern, not the port's.** It is a literal
 /// transliteration of the pre-port shell's ERE —
@@ -295,11 +332,30 @@ fn parse_only(text: &str) -> String {
 /// unclassified, the #8011 shape). If `phrase_re()` changes, this test going
 /// red is the point; update the fixture's classification reasoning, not this
 /// pattern.
+///
+/// **#8136 note on the one edit this literal has ever taken.** It used to
+/// spell the separator run `[*_:\s]*`, and #8097 changed it to
+/// `[*_:[[:space:]]]*`. That is *not* the forbidden sync-to-`phrase_re()`
+/// edit, even though `phrase_re()` changed the same way in the same PR — it
+/// is a correction to the transliteration itself, made for the oracle's own
+/// reason. The shell's `[:space:]` is a POSIX bracket expression, which GNU
+/// grep resolves to a fixed ASCII set; the `regex` crate's `\s` is
+/// Unicode-aware and additionally matches NBSP and the rest of
+/// `White_Space`. `\s` was therefore a *wrong* model of the shell for any
+/// input carrying one of those characters — no corpus case had one until
+/// #8097's block added them, which is precisely why the error survived. The
+/// nested `[[:space:]]` is the crate's own POSIX class and resolves to the
+/// same six ASCII characters GNU grep uses. The test for whether a future
+/// edit here is legitimate is unchanged: does it make this pattern a more
+/// faithful model of `b1968d2a`'s ERE (allowed), or does it make it agree
+/// with `phrase_re()` (forbidden)?
 fn newline_only_refs(text: &str) -> std::collections::BTreeSet<String> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(r"(Blocked by|Depends on|Requires|\*\*Epic\*\*)[*_:\s]*#([0-9]+)")
-            .expect("static dependency-phrase pattern (the ORACLE's, frozen — see doc comment)")
+        regex::Regex::new(
+            r"(Blocked by|Depends on|Requires|\*\*Epic\*\*)[*_:[[:space:]]]*#([0-9]+)",
+        )
+        .expect("static dependency-phrase pattern (the ORACLE's, frozen — see doc comment)")
     });
     let nums = |text: &str| -> std::collections::BTreeSet<String> {
         re.captures_iter(text)
@@ -472,7 +528,7 @@ fn describe(case: &Case, rust: &str, why: &str) -> String {
 fn ported_extract_refs_diverges_from_the_retired_shell_only_in_known_ways() {
     let cases = load_oracle();
     assert!(
-        cases.len() >= 1000,
+        cases.len() >= 2000,
         "oracle shrank to {} cases — a differential test that runs almost nothing passes for \
          the wrong reason",
         cases.len()
@@ -633,9 +689,152 @@ fn ported_extract_refs_diverges_from_the_retired_shell_only_in_known_ways() {
 
     // Characterization. Update deliberately when `extract()` changes; a shift
     // here is a real behaviour change and should be explained in the commit.
-    assert_eq!(agreed, 625, "cases where the port and the shell agree exactly");
-    assert_eq!(per_class.get("NewlineSpan").copied().unwrap_or(0), 195);
-    assert_eq!(per_class.get("LeadingZero").copied().unwrap_or(0), 137);
-    assert_eq!(per_class.get("OverflowDropped").copied().unwrap_or(0), 140);
-    assert_eq!(per_class.get("BotLoginNormalisation").copied().unwrap_or(0), 30);
+    //
+    // Re-baselined in #8136 (from 625/195/137/140/30 on the 1050-case corpus):
+    // the fixture gained #8097's 1117-case third block — the full separator
+    // alphabet crossed with every trigger and reference boundary, plus
+    // comment-bearing cases crossed with all seven `--bot-login` spellings —
+    // and `phrase_re()` narrowed its separator class from the Unicode-aware
+    // `\s` to the ASCII `[[:space:]]`. Both the corpus and `extract()` changed
+    // together here, so these counts characterize the result of both.
+    assert_eq!(agreed, 1337, "cases where the port and the shell agree exactly");
+    assert_eq!(per_class.get("NewlineSpan").copied().unwrap_or(0), 278);
+    assert_eq!(per_class.get("LeadingZero").copied().unwrap_or(0), 265);
+    assert_eq!(per_class.get("OverflowDropped").copied().unwrap_or(0), 270);
+    assert_eq!(per_class.get("BotLoginNormalisation").copied().unwrap_or(0), 97);
+}
+
+/// The corpus must contain every character the separator class defines — and
+/// NBSP, which it deliberately does not.
+///
+/// This is the size-assertion lesson (#8094) applied to the other axis. "2167
+/// cases" says nothing about which separators they use: the first two blocks
+/// total 1050 cases and between them contain exactly three of the seven
+/// characters, while their `_meta.corpus` claimed the whole class. That gap
+/// hid a live platform-dependent divergence for two PRs (#8097). A count
+/// cannot catch a corpus that quietly stops containing a character; this can.
+///
+/// Measured over the body plus EVERY comment body, including the comments the
+/// filter excludes — an excluded comment still has to be one the separator
+/// grammar produced, and its separator is still corpus coverage of the
+/// grammar even though it contributes no references.
+#[test]
+fn corpus_separator_alphabet_is_complete() {
+    let cases = load_oracle();
+    // `(character, human name, floor)`. The floors are deliberately low: this
+    // asserts presence of a class, not a distribution.
+    let alphabet: [(char, &str, usize); 7] = [
+        (' ', "space", 100),
+        ('\n', "newline", 100),
+        ('\t', "tab", 50),
+        ('\r', "carriage return", 50),
+        ('\x0b', "vertical tab", 50),
+        ('\x0c', "form feed", 50),
+        ('\u{00A0}', "NBSP (U+00A0)", 50),
+    ];
+    for (ch, name, floor) in alphabet {
+        let n = cases
+            .iter()
+            .filter(|c| c.body.contains(ch) || c.comments.iter().any(|(_, body)| body.contains(ch)))
+            .count();
+        assert!(
+            n >= floor,
+            "only {n} corpus cases contain {name} ({ch:?}) — the separator class has seven \
+             members and a corpus that covers a subset of them cannot see a divergence in the \
+             rest (#8097). Regenerate the fixture with \
+             `cargo run -p loom-daemon --example generate_extract_refs_oracle`."
+        );
+    }
+}
+
+/// Refs the Unicode-aware `\s` spelling of the separator run finds that the
+/// ASCII POSIX `[[:space:]]` spelling does not — i.e. the references that
+/// exist only because some Unicode `White_Space` character (in this corpus,
+/// NBSP) was accepted as a separator.
+///
+/// This is the MECHANISM of the divergence #8097 closed, stated as a
+/// computation rather than as "the body contains an NBSP". The two are not
+/// the same predicate and the difference matters: a third of the
+/// NBSP-bearing cases carry an NBSP that merely separates two independent
+/// references, where both spellings agree and the case diverges for an
+/// unrelated accepted reason (a zero-padded or overflowing token). Keying on
+/// mere presence would absorb those, which is exactly the trap
+/// [`newline_only_refs`]'s doc comment describes.
+fn nbsp_separated_refs(text: &str) -> std::collections::BTreeSet<String> {
+    static UNICODE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static POSIX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let nums = |re: &regex::Regex, t: &str| -> std::collections::BTreeSet<String> {
+        re.captures_iter(t)
+            .filter_map(|c| c.get(2)?.as_str().parse::<u64>().ok())
+            .map(|n| n.to_string())
+            .collect()
+    };
+    let unicode = UNICODE.get_or_init(|| {
+        regex::Regex::new(r"(Blocked by|Depends on|Requires|\*\*Epic\*\*)[*_:\s]*#([0-9]+)")
+            .expect("Unicode-`\\s` spelling of the separator run")
+    });
+    let posix = POSIX.get_or_init(|| {
+        regex::Regex::new(
+            r"(Blocked by|Depends on|Requires|\*\*Epic\*\*)[*_:[[:space:]]]*#([0-9]+)",
+        )
+        .expect("ASCII POSIX spelling of the separator run")
+    });
+    nums(unicode, text)
+        .difference(&nums(posix, text))
+        .cloned()
+        .collect()
+}
+
+/// NBSP is a separator for neither implementation, and the corpus proves it.
+///
+/// #8097 resolved this divergence rather than accepting a fifth class, so the
+/// observable consequence is that a case whose reference is reachable ONLY
+/// through an NBSP separator lands in `agreed`: the port finds nothing there,
+/// and the retired shell found nothing there either. Asserted separately from
+/// the characterization counts because it is the actual content of the fix —
+/// reverting `phrase_re()` to `\s` turns these cases red here with a message
+/// naming the reason, instead of only shifting an opaque total.
+#[test]
+fn nbsp_is_a_separator_for_neither_implementation() {
+    let cases = load_oracle();
+    let load_bearing: Vec<&Case> = cases
+        .iter()
+        .filter(|c| c.comments.is_empty() && !nbsp_separated_refs(&c.body).is_empty())
+        .collect();
+    assert!(
+        load_bearing.len() >= 50,
+        "only {} cases where a reference is reachable solely through a Unicode-only separator \
+         — too few to prove anything about the class (#8097)",
+        load_bearing.len()
+    );
+
+    let mut disagreed = Vec::new();
+    for case in &load_bearing {
+        let rust = parse_only(&case.body);
+        if rust != case.shell_refs {
+            disagreed.push(format!(
+                "  - body={:?}\n    only-via-NBSP={:?}\n    shell=[{}]  port=[{}]",
+                case.body,
+                nbsp_separated_refs(&case.body),
+                case.shell_refs,
+                rust
+            ));
+        }
+    }
+    assert!(
+        disagreed.is_empty(),
+        "{} cases where the port and the retired shell disagree about a reference that is \
+         reachable only through a Unicode-only separator. NBSP is in the Unicode `White_Space` \
+         property (so the `regex` crate's `\\s` matches it) but NOT in POSIX `[[:space:]]` \
+         under GNU grep (so the shell never did). `phrase_re()` must keep spelling its \
+         separator run `[*_:[[:space:]]]*`; spelling it `[*_:\\s]*` reopens the \
+         platform-dependent divergence #8097 closed.\n{}",
+        disagreed.len(),
+        disagreed
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
