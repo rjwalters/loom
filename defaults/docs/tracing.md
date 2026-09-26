@@ -8,8 +8,16 @@ as described in [observability](observability.md).
 
 ## Identity and process boundaries
 
-Every new execution receives random nonzero 128-bit trace and 64-bit span IDs.
-An issue number is metadata, never an identity. Before an owned sweep process is
+Every new execution receives a random nonzero 64-bit root span ID. An issue
+number never identifies an execution: retries and restarts of one issue are
+distinct executions. An issue sweep's trace ID, however, is its issue's **story
+trace** (#9037): trace ID and story root span ID are SHA-256-derived from the
+lowercased `owner/repo` (the checkout's GitHub `origin`) and the issue number,
+so every sweep of the issue, on any host, lands in one trace, parented to the
+story root and tagged `loom.issue`, `loom.repo` and `loom.story_id`. The story
+root span itself is emitted when the story ends (a later phase of #9037); until
+then backends show it as a missing parent. Executions outside an issue, or in a
+checkout with no GitHub `origin`, get a random trace ID. Before an owned sweep process is
 spawned, Loom persists its root identity under `.loom/logs/trace-context/` and
 passes `LOOM_TRACEPARENT` plus `LOOM_TRACE_CONTEXT_FILE` to that child. Reopening
 the same execution after a daemon restart reuses its identity. A new attempt

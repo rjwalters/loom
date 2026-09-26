@@ -750,7 +750,7 @@ On the OTLP path this maps to a log record (severity `Info`) with
 `loom.*` privacy allowlist.
 
 **Trace join (Issue #8908).** When a traced sweep dispatches, the daemon
-writes a local join entry (`.loom/logs/trace-joins/<trace-id>.json`: issue,
+writes a local join entry (`.loom/logs/trace-joins/<trace-id>-<span-id>.json`: issue,
 root trace context, dispatch time; closed at the terminal transition). The
 ingest pass stamps a summary's envelope `trace_context` (the OTLP log's trace
 and span id) with that execution's root context when **exactly one** entry

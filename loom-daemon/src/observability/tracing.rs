@@ -29,24 +29,43 @@ fn valid_endpoint(endpoint: &str) -> bool {
 
 /// Persist before spawn. A corrupt/busy/full store disables this execution's
 /// tracing with a diagnostic; it cannot fail the actual issue dispatch.
-pub fn prepare_child(command: &mut Command, root: &Path, execution: &str) {
+///
+/// An `issue` execution joins that issue's story trace (#9037) when the
+/// checkout's GitHub `origin` names the repo; otherwise it is its own root.
+pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue: Option<u32>) {
     command
         .env_remove(TRACEPARENT_ENV)
         .env_remove(CONTEXT_FILE_ENV);
     if !enabled(root) {
         return;
     }
+    let story = issue.and_then(|issue| {
+        // Lowercased so `loom.repo` agrees across hosts whose origins differ
+        // only in case, exactly as the story id itself does.
+        crate::release_resolve::host::repo_slug(root).map(|repo| StoryRef {
+            context: crate::telemetry::trace::story_context(&repo, issue),
+            repo: repo.to_ascii_lowercase(),
+            issue,
+        })
+    });
     let store = TraceStore::new(root);
-    match store.load_or_create(root, execution) {
+    match store.load_or_create_story(root, execution, story.as_ref().map(|s| &s.context)) {
         Ok(saved) => {
             command.env(TRACEPARENT_ENV, saved.context.traceparent());
             command.env(CONTEXT_FILE_ENV, store.path(root, execution));
-            super::lifecycle::prepare_execution(command, root, execution);
+            super::lifecycle::prepare_execution(command, root, execution, story.as_ref());
         }
         Err(error) => {
             log::warn!("observability: trace context unavailable; child is untraced: {error}")
         }
     }
+}
+
+/// The issue an execution's story trace belongs to.
+pub struct StoryRef {
+    pub repo: String,
+    pub issue: u32,
+    pub context: crate::telemetry::trace::TraceContext,
 }
 
 /// The OTLP signal an OTLP-only record kind belongs to, or `None` for a kind

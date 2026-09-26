@@ -174,6 +174,10 @@ impl SweepRegistry {
             &mut cmd,
             &self.config.workspace_root,
             sweep_id,
+            match kind {
+                SweepKind::Issue(issue) => Some(*issue),
+                SweepKind::PrSet(_) => None,
+            },
         );
         // #8908: let the transcript-ingest pass join this issue's
         // `session.summary` logs to the execution's trace.

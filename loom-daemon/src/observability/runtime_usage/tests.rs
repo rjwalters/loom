@@ -198,6 +198,37 @@ fn a_session_joins_only_when_exactly_one_entry_names_its_issue_and_covers_its_st
 }
 
 #[test]
+fn close_ends_and_renames_an_entry_opened_under_the_pre_story_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let context = TraceStore::new(root)
+        .load_or_create(root, "in-flight")
+        .unwrap()
+        .context;
+    let legacy = root
+        .join(JOIN_DIR)
+        .join(format!("{}.json", context.trace_id.as_str()));
+    let opened = JoinEntry {
+        issue: 9038,
+        context: context.clone(),
+        started_at: Utc::now() - Duration::minutes(5),
+        ended_at: None,
+    };
+    std::fs::create_dir_all(root.join(JOIN_DIR)).unwrap();
+    std::fs::write(&legacy, serde_json::to_vec(&opened).unwrap()).unwrap();
+    super::join::close(root, "in-flight", Utc::now());
+    assert!(!legacy.exists());
+    let current = root.join(JOIN_DIR).join(format!(
+        "{}-{}.json",
+        context.trace_id.as_str(),
+        context.span_id.as_str()
+    ));
+    let closed: JoinEntry = serde_json::from_slice(&std::fs::read(current).unwrap()).unwrap();
+    assert_eq!(closed.context, context);
+    assert!(closed.ended_at.is_some());
+}
+
+#[test]
 fn expired_entries_are_pruned() {
     let tmp = tempfile::tempdir().unwrap();
     let stale = entry(1, -3 * 24 * 60, Some(-2 * 24 * 60));

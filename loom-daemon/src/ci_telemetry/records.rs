@@ -9,7 +9,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::telemetry::ci::{duration_ms, CiDurationMetric};
 use crate::telemetry::trace::{
@@ -174,26 +173,6 @@ pub struct JobsPage {
     pub jobs: Vec<JobJson>,
 }
 
-fn digest_hex(parts: &[&str]) -> String {
-    let mut hasher = Sha256::new();
-    for part in parts {
-        hasher.update(part.as_bytes());
-        hasher.update([0_u8]);
-    }
-    hex::encode(hasher.finalize())
-}
-
-/// Deterministic identifier from `parts`. SHA-256 output is all-zero with
-/// negligible probability; the `1` fallback keeps the id valid regardless.
-fn derived_id(parts: &[&str], hex_len: usize) -> String {
-    let hex = digest_hex(parts)[..hex_len].to_string();
-    if hex.bytes().all(|b| b == b'0') {
-        format!("{}1", &hex[..hex_len - 1])
-    } else {
-        hex
-    }
-}
-
 /// A run attempt's trace context: trace id and root span id both derived
 /// from `(repo, run_id, attempt)` — one trace per run attempt. Always
 /// sampled.
@@ -202,10 +181,8 @@ pub fn run_context(repo: &str, run_id: u64, attempt: u32) -> TraceContext {
     let run = run_id.to_string();
     let attempt = attempt.to_string();
     TraceContext {
-        trace_id: TraceId::try_from(derived_id(&["loom.ci.trace", repo, &run, &attempt], 32))
-            .unwrap_or_else(|_| TraceContext::root(true).trace_id),
-        span_id: SpanId::try_from(derived_id(&["loom.ci.run", repo, &run, &attempt], 16))
-            .unwrap_or_else(|_| TraceContext::root(true).span_id),
+        trace_id: TraceId::derived(&["loom.ci.trace", repo, &run, &attempt]),
+        span_id: SpanId::derived(&["loom.ci.run", repo, &run, &attempt]),
         flags: 1,
     }
 }
@@ -215,8 +192,7 @@ pub fn run_context(repo: &str, run_id: u64, attempt: u32) -> TraceContext {
 pub fn job_context(repo: &str, run_id: u64, attempt: u32, job_id: u64) -> TraceContext {
     let run = run_context(repo, run_id, attempt);
     TraceContext {
-        span_id: SpanId::try_from(derived_id(&["loom.ci.job", repo, &job_id.to_string()], 16))
-            .unwrap_or_else(|_| run.child().span_id),
+        span_id: SpanId::derived(&["loom.ci.job", repo, &job_id.to_string()]),
         ..run
     }
 }
