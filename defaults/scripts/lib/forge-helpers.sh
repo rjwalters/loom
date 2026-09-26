@@ -532,14 +532,32 @@ forge_delete_branch() {
 # signal (return 1) so existing bounded-poll behavior is unchanged.
 FORGE_CHECK_RUNS_RC_NOT_FOUND=44
 
+# Distinguished exit code forge_get_check_runs returns when the read came back
+# SHORT: the forge's own `total_count` says N check-runs exist for this commit
+# and fewer than N rows were actually retrieved (#8895). This is a fail-closed
+# signal, not a fetch failure — the rollup on hand is a strict SUBSET of the
+# commit's checks, and every consumer uses it to answer "is anything still
+# pending / is a required check failing", a question a subset can only answer
+# wrongly. Callers that poll (merge-pr.sh's `_wait_for_checks_then_sync_merge`)
+# treat any nonzero rc as "not settled yet", so returning this instead of the
+# partial JSON keeps a truncated read from ever being read as settlement.
+FORGE_CHECK_RUNS_RC_TRUNCATED=45
+
 # Get CI check runs for a commit.
 # Usage: forge_get_check_runs NWO COMMIT_SHA
-# GitHub: GET /repos/{nwo}/commits/{sha}/check-runs
+# GitHub: GET /repos/{nwo}/commits/{sha}/check-runs (fully paginated)
 # Gitea: GET /repos/{owner}/{repo}/commits/{sha}/statuses (mapped to check-run shape)
 #
 # Return codes: 0 success (JSON on stdout); $FORGE_CHECK_RUNS_RC_NOT_FOUND
-# (44) on a confirmed HTTP 404 (GitHub only — see below); 1 for any other
-# failure.
+# (44) on a confirmed HTTP 404 (GitHub only — see below);
+# $FORGE_CHECK_RUNS_RC_TRUNCATED (45) on a short read (GitHub only); 1 for any
+# other failure.
+#
+# KNOWN GAP (Gitea): the Gitea branch below makes ONE unpaginated request and
+# derives `total_count` from the rows it got, so a page-capped read there is
+# undetectable by the fail-closed check the GitHub branch gets. Tracked
+# separately — the live mechanism this guards (`merge-pr.sh --auto`) runs
+# against GitHub.
 forge_get_check_runs() {
   local nwo="$1"
   local commit="$2"
@@ -575,20 +593,22 @@ forge_get_check_runs() {
     # response's HTTP status (which `gh api` reports only on stderr, as
     # "... (HTTP <code>)") can be inspected without disturbing the JSON
     # payload on success (#6389).
+    #
+    # `per_page=100` + `--paginate` (#8895): GitHub's default page size for
+    # this endpoint is 30, and one head in this repo already produces 39
+    # check-runs — so an unpaginated read silently hid 9 of them from
+    # merge-pr.sh --auto's settle-wait, both from its pending count and from
+    # its failed-required classification. Since #8410 that settle-wait is the
+    # ONLY check-settling mechanism, so the hidden rows were a live
+    # merge-on-unsettled-CI gap. `--paginate` follows the Link header, so the
+    # rows retrieved no longer depend on how many checks a repo happens to
+    # have; the count check further down fails closed if they ever do again.
     local out_file err_file rc=0
-    out_file=$(mktemp)
-    err_file=$(mktemp)
-    gh api "repos/$nwo/commits/$commit/check-runs" \
+    out_file=$(mktemp); err_file=$(mktemp)
+    gh api "repos/$nwo/commits/$commit/check-runs?per_page=100" --paginate \
       --header "Accept: application/vnd.github+json" \
-      --jq '{
-        total_count: .total_count,
-        check_runs: [.check_runs[] | {
-          name: .name,
-          status: .status,
-          conclusion: .conclusion,
-          html_url: .html_url
-        }]
-      }' >"$out_file" 2>"$err_file" || rc=$?
+      --jq '{total_count: (.total_count // 0), check_runs: [(.check_runs // [])[] | {name: .name, status: .status, conclusion: .conclusion, html_url: .html_url}]}' \
+      >"$out_file" 2>"$err_file" || rc=$?
 
     if [[ $rc -ne 0 ]]; then
       if grep -q "HTTP 404" "$err_file" 2>/dev/null; then
@@ -598,8 +618,25 @@ forge_get_check_runs() {
       rm -f "$out_file" "$err_file"
       return 1
     fi
-    cat "$out_file"
+
+    # `--jq` runs per page, so a multi-page read leaves ONE reshaped object per
+    # page on stdout — fold them into a single rollup (total_count is repeated
+    # identically on every page; `max` is the conservative pick for the
+    # short-read check below). An empty stdout from a `gh` that exited 0 is not
+    # an authoritative "this commit has no checks": treat it as a transient
+    # failure, the same way a nonzero exit is treated.
+    local merged=""; [[ -s "$out_file" ]] && merged=$(jq -cs '{total_count: ([.[].total_count // 0] | max // 0), check_runs: [.[] | (.check_runs // [])[]]}' "$out_file" 2>/dev/null)
     rm -f "$out_file" "$err_file"
+    [[ -n "$merged" ]] || return 1
+
+    # Fail closed on a short read (#8895): the forge told us how many
+    # check-runs exist for this commit and we hold fewer. Refuse to answer
+    # rather than answer from a subset — see FORGE_CHECK_RUNS_RC_TRUNCATED.
+    if [[ "$(jq -r '(.check_runs | length) < (.total_count // 0)' <<<"$merged")" == "true" ]]; then
+      echo "forge_get_check_runs: truncated read for $commit — got $(jq -r '"\(.check_runs | length) of \(.total_count)"' <<<"$merged") check-runs; failing closed" >&2
+      return "$FORGE_CHECK_RUNS_RC_TRUNCATED"
+    fi
+    printf '%s\n' "$merged"
   fi
 }
 

@@ -2068,6 +2068,18 @@ _wait_for_checks_then_sync_merge() {
         info "PR #$PR_NUMBER: check-runs API unavailable for this repo (no checks configured); proceeding to synchronous merge"
         return 0
       fi
+      # A SHORT read (#8895) is not a fetch failure: the rollup arrived, it was
+      # just a subset of the commit's check-runs (the forge's own total_count
+      # said so). forge_get_check_runs withholds it rather than let a subset
+      # look like settlement, and this loop's existing nonzero handling —
+      # re-poll, then hard-fail at the deadline — is exactly the fail-closed
+      # outcome wanted. Name it explicitly so the narration is not the
+      # misleading "could not fetch" (the helper's own stderr detail is
+      # suppressed at the callsite above). Guarded one-liner rather than an
+      # `if` block: `set -e` exempts AND-lists (see the note above
+      # _wait_for_checks_then_sync_merge's reads), and this is the same idiom
+      # the two `fetch_rc`/`observed_checks` assignments in this loop use.
+      [[ "$fetch_rc" -eq "${FORGE_CHECK_RUNS_RC_TRUNCATED:-45}" ]] && warning "PR #$PR_NUMBER: check-runs read was TRUNCATED (fewer rows than the forge's own total_count); refusing to classify a partial set, continuing to poll"
       if [[ "$(date +%s)" -ge "$deadline" ]]; then
         # #8896: exit 5, not error()'s exit 1 — an unreadable check-runs API is
         # a forge condition this run waited out, not a merge failure.
