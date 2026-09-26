@@ -51,6 +51,7 @@ pub(crate) mod release_resolve;
 pub(crate) mod restart;
 pub(crate) mod retry_classify;
 pub(crate) mod role_tool_policy;
+mod runtime_launch_cmd;
 pub(crate) mod script_ports;
 pub(crate) mod serve_cmd;
 mod shell_budget;

@@ -412,14 +412,14 @@ const BUNDLED_RUNTIME_MANIFESTS: &[(&str, &str)] = &[
 /// not built with a manifest for (e.g. an operator-defined custom runtime) —
 /// those still fail closed with no fallback, per the unchanged fail-closed
 /// contract for non-builtin runtimes with no reachable manifest anywhere.
-fn bundled_runtime_manifest(runtime: &str) -> Option<&'static str> {
+pub(crate) fn bundled_runtime_manifest(runtime: &str) -> Option<&'static str> {
     BUNDLED_RUNTIME_MANIFESTS
         .iter()
         .find(|(name, _)| *name == runtime)
         .map(|(_, contents)| *contents)
 }
 
-fn roots(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+pub(crate) fn roots(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let installed = root.join(".loom");
     let defaults = root.join("defaults");
     // Each subdirectory falls back to `defaults/` independently (#4688): a

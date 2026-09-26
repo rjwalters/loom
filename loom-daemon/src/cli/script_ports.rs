@@ -210,6 +210,13 @@ pub(crate) enum ScriptPortCommand {
     /// on the same no-op branch as an unavailable binary.
     #[command(subcommand)]
     RoleToolPolicy(super::role_tool_policy::RoleToolPolicyCommand),
+
+    /// Tier-3 "generic passthrough" launch-shape resolution (#8671): reads a
+    /// runtime capability manifest's `launch` object and renders it as
+    /// eval-ready shell defaults. Backs `spawn-generic-launch.sh`. Exit 0
+    /// resolved, 1 no manifest reachable (soft), 78 (`EX_CONFIG`) malformed
+    /// manifest or an unrecognized `launch` key.
+    RuntimeLaunchEnv(super::runtime_launch_cmd::RuntimeLaunchEnvArgs),
 }
 
 impl ScriptPortCommand {
@@ -245,6 +252,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::GitBlobLines(args) => args.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
+            ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
         }
     }
 }
