@@ -268,6 +268,15 @@ pub(crate) enum ScriptPortCommand {
     /// **always exit 0** — it reports, it never relabels. Not a port: brand-new
     /// logic, native from the start per the shell-language policy.
     CheckStaleBlocked(super::stale_blocked::StaleBlockedArgs),
+
+    /// Per-segment PR latency, derived live from the forge timeline (#8923):
+    /// review-queue wait, approval path, `loom:pr`→merged **split by operator
+    /// gate**, Doctor response, and verdict invalidations — plus the live queue
+    /// view with **dwell, not PR age**. `--advise` is the pre-wave advisory
+    /// form: open PRs only, warns past `--threshold-hours`, always exit 0.
+    /// Read-only; it never writes a label or a comment. Not a port: brand-new
+    /// logic, native from the start per the shell-language policy.
+    PrLatency(super::pr_latency_cmd::PrLatencyArgs),
 }
 
 impl ScriptPortCommand {
@@ -310,6 +319,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
+            ScriptPortCommand::PrLatency(args) => args.run(),
         }
     }
 }
