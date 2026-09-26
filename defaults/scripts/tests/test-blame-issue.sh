@@ -147,6 +147,19 @@ git -C "$REPO" commit --quiet -m "direct commit, no PR reference"
 git -C "$REPO" add file.txt
 git -C "$REPO" commit --quiet -m "Merge pull request #103 from feature/merge-style-9105"
 
+# A subject that merely *quotes* a merge subject must not resolve to the quoted
+# PR: the merge pattern is `^`-anchored, so this falls through to the online
+# commit->pulls fallback (which the stub answers empty) instead.
+{
+    echo "line one"
+    echo "line two"
+    echo "line three (no PR suffix)"
+    echo "line four (merge-commit subject)"
+    echo "line five (quoted merge subject)"
+} > "$REPO/file.txt"
+git -C "$REPO" add file.txt
+git -C "$REPO" commit --quiet -m 'Revert "Merge pull request #104 from feature/oops"'
+
 run_blame() {
     ( cd "$REPO" && PATH="$FAKE_BIN:$PATH" "$BLAME_SCRIPT" "$@" )
 }
@@ -240,6 +253,18 @@ if [[ -s "${PULLS_LOG:-$WORKDIR/pulls.log}" ]]; then
     fail "online commit->pulls fallback must not be used for a merge-commit subject"
 else
     pass "merge-commit subject resolved fully offline (no pulls fallback call)"
+fi
+
+# -------- Test 14: a quoted merge subject does NOT resolve offline (#9105) ----
+echo "Test 14: 'Revert \"Merge pull request #104 ...\"' does not resolve to PR 104"
+rm -f "$WORKDIR/pulls.log"
+# JSON form, so the assertion reads the pr field and not the echoed subject.
+out_quoted="$(PULLS_LOG="$WORKDIR/pulls.log" run_blame --format json -L 5,5 file.txt)"
+assert_not_contains '"pr":"104"' "$out_quoted" "quoted merge subject is not mistaken for PR 104"
+if [[ -s "${PULLS_LOG:-$WORKDIR/pulls.log}" ]]; then
+    pass "quoted merge subject fell through to the online commit->pulls fallback"
+else
+    fail "quoted merge subject should have fallen through to the commit->pulls fallback"
 fi
 
 # -------- Summary --------

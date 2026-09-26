@@ -23,8 +23,8 @@
 #      regexing `Closes/Fixes/Resolves/Part of #N` out of the PR body.
 #   4. Best-effort role: if `loom:changes-requested` was EVER applied to the PR
 #      (per its label timeline), the PR went through a Doctor cycle at least
-#      once -- reported as `builder+doctor` (mixed; a squash commit collapses
-#      per-commit authorship so no finer attribution is possible). Otherwise
+#      once -- reported as `builder+doctor` (mixed; attribution is at the PR
+#      level by design, never per commit). Otherwise
 #      `builder`. `unknown` if the PR can't be resolved.
 #
 # Read-only: only `git blame`/`git log` (local) and `gh api`/`gh pr view` GET
@@ -176,8 +176,12 @@ resolve_pr_from_subject() {
     local subject="$1"
     # Merge-commit subjects: "Merge[d] pull request #N from ..." (GitHub says
     # "Merge", Gitea says "Merged"); squash subjects end in "(#N)". Number is
-    # capture group 1 in both patterns.
-    if [[ "$subject" =~ Merge.?\ pull\ request\ #([0-9]+)\ from || "$subject" =~ \(#([0-9]+)\)[[:space:]]*$ ]]; then
+    # capture group 1 in both patterns. Both alternatives are anchored -- the
+    # merge form at `^` so a subject that merely quotes one (`Revert "Merge
+    # pull request #1234 from ..."`) falls through to the /pulls endpoint
+    # instead of resolving to the quoted PR, mirroring the `$` anchor the
+    # squash form already carries.
+    if [[ "$subject" =~ ^Merged?\ pull\ request\ #([0-9]+)\ from || "$subject" =~ \(#([0-9]+)\)[[:space:]]*$ ]]; then
         printf '%s' "${BASH_REMATCH[1]}"
     fi
 }
