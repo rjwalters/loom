@@ -214,7 +214,7 @@ const DEFAULT_ROLE_TIMEOUT: Duration = Duration::from_secs(1800);
 /// *at* the existing ceiling and reclassifying the outcome gets the
 /// observability fix (issue #6637: a load-timeout must not read as a role
 /// failure) without touching the kill deadline itself.
-const ROLE_TIMEOUT_LOAD_SATURATION_THRESHOLD: f64 = 1.0;
+pub(crate) const ROLE_TIMEOUT_LOAD_SATURATION_THRESHOLD: f64 = 1.0;
 
 /// Poll granularity while waiting for a role invocation to finish.
 const INVOCATION_POLL_INTERVAL: Duration = Duration::from_millis(200);
