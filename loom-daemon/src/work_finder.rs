@@ -36,18 +36,18 @@
 //! available-RAM headroom (#5270, [`crate::ram_headroom::ram_headroom_limit`])
 //! — bounded by the per-machine operator ceiling
 //! (`LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent`).
-//! **That ceiling is the one term this "every tick" framing does not cover
-//! (#6203)**: unlike disk/RAM, it is resolved once at daemon bring-up
-//! ([`resolve_max_concurrent_with_config`], captured by the caller and
-//! threaded into [`spawn_multi_work_finder_task`] as a plain `usize`) and does
-//! not itself change value tick-to-tick — an operator edit to
-//! `autonomous.workFinder.maxConcurrent` takes effect only on the next daemon
-//! restart. The effective per-tick concurrency is then
+//! Since #9060 that ceiling is re-read every multi-workspace tick too
+//! ([`configured_max::ConfiguredMaxReloader`]), so an edit to
+//! `autonomous.workFinder.maxConcurrent` hot-applies on the next tick. The
+//! `LOOM_WORK_FINDER_MAX_CONCURRENT` env override is the exception: it is the
+//! daemon's own process environment, fixed at launch, so while it is set it
+//! keeps shadowing config until a restart (#6203 documented the old
+//! startup-only behavior). The effective per-tick concurrency is then
 //! `min(dynamic_cap, backlog_depth)`: [`tick`] iterates the ready
 //! `loom:issue` rows and stops at the cap, so concurrency scales **up** as the
 //! backlog grows and drains to **zero** dispatches when the queue is empty —
-//! all without a daemon restart for the disk/RAM/backlog terms, since those
-//! are read fresh each tick (the configured ceiling is the exception, above).
+//! all without a daemon restart, since every term is read fresh each tick
+//! (only the env override of the ceiling is launch-fixed, above).
 //! Token-pool health ([`crate::tokens::token_pool_size`] /
 //! [`crate::capacity::read_ranking`]) is still read every tick but, since
 //! #5270, feeds spawn-time **selection** only (prefer fresher/healthier
@@ -2290,8 +2290,8 @@ fn env_max_admissions_per_tick() -> Option<usize> {
 /// deliberate startup-capture, not a per-tick re-read: the ramp cap's whole
 /// purpose is to smooth admission *within* the live per-tick re-computation of
 /// `max_concurrent`, so it does not itself need to be live — an operator
-/// retuning it takes effect on the next daemon restart, exactly like
-/// `configured_max` today.
+/// retuning it takes effect on the next daemon restart (unlike
+/// `configured_max`, which hot-applies since #9060).
 #[must_use]
 pub fn resolve_max_admissions_per_tick_with_config(config: &WorkFinderConfig) -> usize {
     env_max_admissions_per_tick()
@@ -2443,10 +2443,10 @@ pub fn resolve_dynamic_max_concurrent(
 /// a scratch volume that fills/frees, or a draining backlog are all honored
 /// without a daemon restart. `configured_max` — the per-machine admission
 /// knob (`LOOM_WORK_FINDER_MAX_CONCURRENT` /
-/// `autonomous.workFinder.maxConcurrent`) — is the exception (#6203): it is
-/// resolved once by the caller before this function is invoked and passed in
-/// as a plain `usize`, so it does **not** itself hot-apply — an operator edit
-/// takes effect only on the next daemon restart, unlike the two axes above.
+/// `autonomous.workFinder.maxConcurrent`) — is the exception in THIS
+/// single-workspace reference loop (#6203): it is passed in as a plain
+/// `usize` and does not hot-apply. The production multi-workspace loop
+/// ([`spawn_multi_work_finder_task`]) re-reads it every tick since #9060.
 ///
 /// Unlike the epic supervisor, no dedicated OS thread is needed:
 /// [`SweepRegistry::dispatch`] returns promptly (fire-and-forget child spawn),
@@ -2872,7 +2872,7 @@ pub fn spawn_multi_work_finder_task(
     pool: Arc<WorkspacePool>,
     fallback_root: PathBuf,
     interval: Duration,
-    configured_max: usize,
+    configured_max: ConfiguredMax,
     max_admissions_per_tick: usize,
     health_states: Arc<WorkspaceHealthStates>,
     suppress_dispatch_during_gate: bool,
@@ -2888,14 +2888,12 @@ pub fn spawn_multi_work_finder_task(
     // has landed.
     mut startup_reconciliation_ready: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
-    log::info!(
-        "work_finder: starting multi-workspace loop (interval={}s, configured_max={configured_max}, \
-         max_admissions_per_tick={max_admissions_per_tick}, \
-         dynamic cap = min(disk, ram, configured_max) — token axis is selection-only, \
-         not a cap, since #5270; global across workspaces)",
-        interval.as_secs()
-    );
+    configured_max::log_loop_start(interval, configured_max, max_admissions_per_tick);
     tokio::spawn(async move {
+        // #9060: the operator ceiling is re-resolved every tick (see the
+        // `configured_max` module) — no longer a frozen startup value.
+        let mut configured_max_reload =
+            ConfiguredMaxReloader::new(fallback_root.clone(), configured_max);
         // An `Interval` that a `forge.event` prompt may also tick early
         // (#8766). Disarmed unless `forgeEvents.events.workFinderTick` is on
         // for `fallback_root` — the daemon's primary workspace, which is also
@@ -2997,7 +2995,9 @@ pub fn spawn_multi_work_finder_task(
             }
 
             // Dynamic cap from live *machine-level* inputs (one token pool, one
-            // scratch volume) probed from the daemon's primary workspace.
+            // scratch volume, and — since #9060 — the operator ceiling itself)
+            // probed from the daemon's primary workspace.
+            let configured_max = configured_max_reload.refresh();
             // `fallback_root` (the daemon's own seeded default) may not itself
             // be a recognized Loom workspace — e.g. a machine-level daemon
             // started under systemd with a bare `$HOME` cwd — in which case
@@ -3570,6 +3570,11 @@ mod registry_refresh;
 /// #8512) — logs, never gates dispatch. Lives in its own file for the same
 /// file-size-ratchet reason as [`registry_refresh`].
 mod tmpfs_warning;
+
+/// Per-tick hot-reload of the operator ceiling `configured_max` (#9060). Its
+/// own file for the same file-size-ratchet reason as [`registry_refresh`].
+pub mod configured_max;
+pub use configured_max::{ConfiguredMax, ConfiguredMaxReloader};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
