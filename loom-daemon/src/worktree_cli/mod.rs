@@ -95,6 +95,18 @@
 //! macOS does not have, a `--reference` fast path whose `[[ -d ]]` test was
 //! evaluated from the wrong directory and therefore never once fired, and a
 //! `$$`-keyed failure flag written into world-writable `/tmp`.
+//!
+//! Slice 9 is [`upstream`]: the upstream-tracking correction and the
+//! stale-worktree drift report. It is the one slice that took **two** blocks of
+//! the script at once, because they were two hand-maintained copies of the same
+//! fix — #6095/#6100 corrected a branch's wrong upstream on the reuse arm, and
+//! #6257 discovered eighteen months later that "a completely different code
+//! path" (its own words, still in the script) needed the identical correction
+//! and re-implemented it by hand. This is the epic's *"two implementations of
+//! the same question"* in its most literal form, and both defects shipped
+//! **silently**: their failure mode is not a wrong message but no message, and
+//! an upstream left pointing at the default branch so a later
+//! `git pull --ff-only` fast-forwards a PR branch onto `main`'s tip.
 
 pub mod baseline;
 pub mod branch_conflict;
@@ -109,4 +121,5 @@ pub mod remove;
 pub mod reset;
 pub mod snapshot;
 pub mod submodules;
+pub mod upstream;
 pub mod wip;

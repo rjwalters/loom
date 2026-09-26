@@ -141,6 +141,17 @@ pub(crate) enum ScriptPortCommand {
     /// contract, and the worktree already exists.
     WorktreeSubmodules(super::worktree_submodules::WorktreeSubmodulesArgs),
 
+    /// `worktree.sh`'s upstream-tracking correction and stale-worktree drift
+    /// report (#8195 slice 9) — which the script carried as TWO hand-
+    /// maintained copies of the same fix, one per create-path arm
+    /// (#6095/#6100 on branch reuse, #6257/#6291 on the registered-worktree
+    /// fast path), differing only in a noun and in whether the
+    /// behind-the-pushed-tip report runs. Both defects shipped silently:
+    /// their failure mode is a message that is never printed and an upstream
+    /// that is never corrected. Exit 0 always — advisory repair; a repo that
+    /// cannot be fetched from must not block worktree creation.
+    WorktreeUpstream(super::worktree_upstream::WorktreeUpstreamArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -283,6 +294,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeReset(args) => args.run(),
             ScriptPortCommand::WorktreeBranchConflict(args) => args.run(),
             ScriptPortCommand::WorktreeSubmodules(args) => args.run(),
+            ScriptPortCommand::WorktreeUpstream(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
