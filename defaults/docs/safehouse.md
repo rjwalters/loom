@@ -1331,7 +1331,7 @@ heartbeats, so the genuine-break signature above is unaffected.
 above landed (#8739 2026-09-23, #8817 2026-09-24), and two independent
 per-host trackers went DEGRADED again afterward showing exactly this
 signature — `robb-studio` (#8509, flap #10, `0 received / 4373 advertised`)
-and `ip-172-31-74-176` (#8779, flap #6, `0 received / 1782 advertised`), both
+and `ip-198-51-100-42` (#8779, flap #6, `0 received / 1782 advertised`), both
 well after both merges. On both hosts the local daemon's own safehouse RPC
 socket reports `state: "connected"` — healthy — so a genuine break here, if
 one exists, lives **above** the RPC link: inside the `safehoused` sidecar's
@@ -1348,7 +1348,7 @@ one today without a protocol change on the `rjwalters/safehouse` side.
 That capability request has been filed as #8888 (external, since this repo
 does not vendor `rjwalters/safehouse` and cannot implement its side). Until
 it lands, telling "genuine mesh break" apart from "still-undiscovered local
-false positive" for `robb-studio`/`ip-172-31-74-176` needs live host SSH —
+false positive" for `robb-studio`/`ip-198-51-100-42` needs live host SSH —
 routed to #8889 (`loom:operator-mechanical`) rather than guessed at here.
 
 ### Fleet-wide completion dedup: reusing the peer-claim channel (#6352)

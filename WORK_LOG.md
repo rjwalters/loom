@@ -21,7 +21,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #8843**: fix: add GLIBC compatibility gate to the daemon install surface
 - **Issue #8846** (closed): Managed CLAUDE.md block: describe the session-mode PR workflow (Doctor → Judge → merge-pr.sh)
 - **PR #8892**: docs(scaffolding): describe the label/PR workflow in the managed pointer block
-- **Issue #8886** (closed): peer_coordination DEGRADED can now be a genuine one-way mesh break, not just remaining false-positive noise (robb-studio #8509, ip-172-31-74-176 #8779 — both flapped after #8026 + #8736 fixes)
+- **Issue #8886** (closed): peer_coordination DEGRADED can now be a genuine one-way mesh break, not just remaining false-positive noise (robb-studio #8509, ip-198-51-100-42 #8779 — both flapped after #8026 + #8736 fixes)
 - **PR #8891**: docs(safehouse): record #8886 genuine-mesh-break finding, file capability + operator-mechanical follow-ups
 - **Issue #8878** (closed): merge-pr.sh's --merge-method probe ignores LOOM_DAEMON_BIN, so the documented remediation cannot restore validation
 - **PR #8890**: fix(merge-pr): honor LOOM_DAEMON_BIN in the --merge-method probe (#8878)
@@ -79,7 +79,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #8820**: feat(containment): route Claude's contained dispatch through the credential egress proxy (#8697)
 - **Issue #8770** (closed): Auto-update: post-provision codesign check is unbounded and misreports a non-answer as a signature downgrade
 - **PR #8781**: fix(daemon): bound and disposition-correct the post-provision codesign check
-- **Issue #8779** (closed): peer-claim coordination is DEGRADED on ip-172-31-74-176 (#6157 Layer 3)
+- **Issue #8779** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-42 (#6157 Layer 3)
 - **Issue #8674** (closed): Containment: keep real credentials out of the worker container via a per-launch placeholder token swapped by a host-side egress proxy (epic #6896)
 - **Issue #8643** (closed): telemetry: two durability-neutral fsync reductions in the trace journal (measured: ~10 fsyncs/span, ~2.7ms each)
 - **PR #8679**: fix(telemetry): skip redundant directory fsyncs in the trace journal (#8643)
@@ -87,7 +87,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #8750** (closed): docs: runbook recipe — cheap fast default model (e.g. Gemini Flash) with per-role quality levels
 - **PR #8753**: docs: runbook recipe 5 — cheap fast default model (e.g. Gemini Flash) with per-role quality levels
 - **PR #8809**: docs(builder-pr): warn against backticking a partial-increment trailer
-- **Issue #8778** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #8778** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #8760** (closed): observability: session.analysis derived rollups + daemon.event record kind for untyped event-bus topics (G3 part 2 + G4 of #8714)
 - **PR #8794**: feat(observability): session.analysis rollups + daemon.event record kind (#8760)
 - **Issue #8795** (closed): champion-epic.md: the idempotency guard reads SKIP_STREAK from any marker-bearing comment, not just a rejection verdict
@@ -205,8 +205,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #8591** (closed): create-issue.sh duplicate backstop blocks at the 18% Jaccard default: #8561 was refused as a duplicate of the unrelated #8505
 - **PR #8651**: fix(duplicate-scan): require title corroboration for low-score blocks
 - **Issue #8601** (closed): Decide whether guarded launches should restore package artifacts from the keyed user-home cache
-- **Issue #8647** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
-- **Issue #8648** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #8647** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
+- **Issue #8648** (closed): peer-claim coordination is DEGRADED on ip-198-51-100-23 (#6157 Layer 3)
 - **Issue #8600** (closed): Live-verify the provider-free readiness probe against the pinned OpenCode 1.18.31 CLI
 - **PR #8645**: feat(native-readiness): prove plugin load via receipt, verify against live OpenCode 1.18.31
 - **Issue #8614** (closed): telemetry: record a release-profile, non-saturated-host instrumentation overhead figure
