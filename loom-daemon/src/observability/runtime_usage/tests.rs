@@ -60,7 +60,8 @@ fn the_usage_span_carries_only_allowlisted_counters_and_zero_stays_zero() {
         assert_eq!(span.attributes[key], "0", "a measured zero is exported: {key}");
         assert!(crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key));
     }
-    assert_eq!(span.attributes.len(), 6, "{:?}", span.attributes);
+    // Five counters, the runtime, and the two provenance keys.
+    assert_eq!(span.attributes.len(), 8, "{:?}", span.attributes);
     assert_eq!(span.clone().bounded(), span, "survives export policy unchanged");
 }
 

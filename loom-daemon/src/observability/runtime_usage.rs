@@ -100,8 +100,9 @@ pub fn usage_span(
     if let Some(runtime) = runtime.filter(|r| !r.is_empty()) {
         attributes.insert("loom.runtime".into(), runtime.to_string());
     }
+    crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
-        context: parent.child(),
+        context: parent.child_at(SpanName::RuntimeUsage.as_str(), started_at),
         parent_span_id: Some(parent.span_id.clone()),
         name: SpanName::RuntimeUsage,
         started_at,

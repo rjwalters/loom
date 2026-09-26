@@ -187,6 +187,14 @@ fn main() {
         }
     }
 
+    // Full SHA for trace provenance (`.loom/docs/trace-identity.md`): a short
+    // hash is ambiguous in forensics, and the SHA pins the exact prompts and
+    // code a span was produced by. Same value as `full` above (both are
+    // `rev-parse HEAD`), kept as a distinct env var because the two features
+    // consume it under different names/fallbacks.
+    let sha = git_output(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=LOOM_DAEMON_GIT_SHA={sha}");
+
     // Build timestamp in ISO-8601 UTC. We use `date -u +%FT%TZ` for
     // portability across macOS and Linux without pulling chrono into the
     // build-script dependency graph (build scripts compile separately and
