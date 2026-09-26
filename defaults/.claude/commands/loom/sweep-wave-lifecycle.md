@@ -185,9 +185,11 @@ For each issue `N` in the wave, before any role skill is invoked:
         # One extra call per surviving timeline candidate (bounded — see the
         # cost note below; not N×M).
         gh pr view <pr_number> --json body --jq '.body // ""' \
-          | grep -iqE "(Part of|Contributes to)[*_:[:space:]]*#N" \
+          | grep -iqE "(Part of|Contributes to)[*_:[:space:]]*#N([^0-9]|$)" \
           && echo confirmed || echo bare-mention
         ```
+        The trailing `([^0-9]|$)` keeps `Part of #1234` from reading as a reference to `#123`. `loom-daemon forge check-open-pr N` applies this same filter to its own timeline leg (#8940), so the two probes return the same verdict for the same issue — the daemon's leg additionally accepts GitHub's closing keywords there, which changes no verdict (source 1 already catches those) but keeps the guard closed when the closes-graph itself cannot answer.
+
         Discard any candidate whose body does not match — it was a bare mention, not a partial-increment linkage, and **must not** count as an open linked PR (it does not feed the union below and never produces the `skip (existing PR #X in flight)` log line). A discarded candidate may optionally get a distinct advisory log line — e.g. `note: #N is mentioned by open PR #Y but not confirmed as a partial-increment linkage` — visibly different from the confirmed-linkage skip line above; this is visibility only and never changes the routing decision.
 
      **Union, then filter at the per-PR read (#6217).** Merge the two source lists and dedupe by PR number, passing **every** source-1 PR through unfiltered at this step — `gh issue view --json closedByPullRequestsReferences` exposes only `id, number, repository, url` per entry, **not `state`**, so a `select(.state == "OPEN")` applied here matches nothing and silently drops every row (the bug #6217 fixed: the union step has no `state` field to filter on). Source 2 needs no further filtering here — its timeline read already filtered to `state == "open"` **and** the phrase filter above already discarded every bare mention (#6216), so only phrase-confirmed open PRs reach the union. For **every** candidate PR from the union (both sources), fetch its live state, labels, and draft flag — this per-PR read is the first and only point in the pipeline where `state` is actually available for a source-1 PR (`isDraft` rides along in the **same** read, so the draft/no-actionable-label row below costs no extra call, #8160):

@@ -8,8 +8,9 @@
 //! that consumes their output lives in pure, fully-tested functions elsewhere
 //! in `worktree_ops`. The exceptions are [`parse_open_linked_pr`] and
 //! [`parse_open_linked_pr_timeline`], which ARE pure decision functions (the
-//! `state == "OPEN"` closes-graph filter and the REST cross-reference union),
-//! unit-tested at the bottom of this file along with both transports' argv.
+//! `state == "OPEN"` closes-graph filter, and the REST cross-reference union
+//! plus its #6216/#8940 bare-mention phrase filter), unit-tested at the bottom
+//! of this file along with both transports' argv.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -264,16 +265,30 @@ pub const OPEN_LINKED_PR_QUERY: &str = "query($owner:String!,$repo:String!,$num:
 ///
 /// Walks `issues/{n}/timeline` for `cross-referenced` events whose source is an
 /// OPEN pull request in this same repo. GitHub emits a `cross-referenced` event
-/// for **any** PR body reference to the issue, so this is a strict superset of
-/// the closes-graph for the yes/no question the #4123 guard actually asks: it
-/// sees `Part of #N` and `Refs #N` phase PRs, which
+/// for **any** reference to the issue — body *or* comment, linking phrase or
+/// not — so this leg sees `Part of #N` phase PRs that
 /// `closedByPullRequestsReferences` structurally cannot (#7757/#7859, and the
-/// `worktree_ops` half of that in #8116).
-const OPEN_LINKED_PR_TIMELINE_JQ: &str = "[.[] | select(.event == \"cross-referenced\" \
+/// `worktree_ops` half of that in #8116), and it also sees PRs that merely
+/// *mention* `#N` in passing.
+///
+/// A bare mention is **not** a linkage, so the filter emits one compact JSON
+/// object per surviving candidate (`{number, body}`, one per line, deduped in
+/// Rust) rather than a single PR number, and
+/// [`parse_open_linked_pr_timeline`] applies the #6216 phrase filter to each
+/// body. Keeping that regex in Rust (rather than pushing a jq `test()` onto the
+/// wire) is the same call [`open_linked_pr_args`] makes about the closes-graph
+/// `state == "OPEN"` filter: the load-bearing predicate stays unit-testable
+/// without a live `gh`/`jq` (#5511).
+///
+/// `source.issue.body` is the referring PR's own body, present inline on every
+/// `cross-referenced` event, so the filter costs no extra round trip — unlike
+/// `/loom:sweep`'s shell recipe, which re-reads each candidate over
+/// `gh pr view <n> --json body`.
+const OPEN_LINKED_PR_TIMELINE_JQ: &str = ".[] | select(.event == \"cross-referenced\" \
      and .source.issue.pull_request != null \
      and .source.issue.state == \"open\" \
      and .source.issue.repository.full_name == \"{full_name}\") \
-     | .source.issue.number] | unique | .[0] // empty";
+     | {number: .source.issue.number, body: (.source.issue.body // \"\")}";
 
 /// `gh` arguments for the REST timeline (non-closing-reference) probe on
 /// `issue` — the union transport shared by
@@ -293,22 +308,93 @@ pub fn open_linked_pr_timeline_args(owner: &str, repo: &str, issue: u32) -> Vec<
     ]
 }
 
-/// Classify the raw stdout of the [`open_linked_pr_timeline_args`] query.
+/// The #6216 phrase filter: does `body` reference `issue` with a phrase that
+/// makes the referring PR a *linked* PR, rather than merely mentioning it?
 ///
-/// Empty output is a verified [`OpenPrProbe::NoneOpen`] (the filter emitted
-/// nothing, i.e. no open cross-referencing PR); a leading line that parses as a
-/// PR number is [`OpenPrProbe::Open`]; anything else is
-/// [`OpenPrProbe::ProbeFailed`] — an answer we cannot read is never a verified
+/// Two families count, and nothing else:
+///
+/// 1. **Closing keywords** — GitHub's own set (`close`/`closes`/`closed`,
+///    `fix`/`fixes`/`fixed`, `resolve`/`resolves`/`resolved`). These are
+///    normally caught by the closes-graph leg, but leg 2 must accept them too:
+///    when GraphQL cannot answer at all (#5911 quota exhaustion) the timeline is
+///    the *only* leg left, and discarding a live `Closes #N` PR there would fall
+///    the #4123 guard open — or, worse, hand
+///    [`super::orphan_recovery`] a verified `NoneOpen` that resets a live claim
+///    (#5511).
+/// 2. **Partial-increment phrases** — `Part of #N` / `Contributes to #N`, the
+///    convention phase PRs use (#7757/#7859) and the exact pair
+///    `/loom:sweep`'s existing-PR probe confirms
+///    (`sweep-wave-lifecycle.md` → "Existing-PR probe", #6216).
+///
+/// Matching is case-insensitive and tolerant of markdown emphasis/colon between
+/// the phrase and `#N` (`**Part of:** #123`), mirroring `parse_dependencies`'
+/// convention (#4508). A trailing non-digit boundary is required so `Part of
+/// #1234` is not read as a reference to `#123`, and the phrase must start at a
+/// non-alphanumeric boundary so `Prefixes #123` is not read as `fixes #123`.
+/// That leading boundary is deliberately NOT `\b` — a markdown `_`/`*` sigil
+/// immediately before the phrase (`_contributes to_ #123`) is a word character
+/// to `\b` but an emphasis marker to a human.
+///
+/// Returns `None` only if the regex itself fails to compile, which callers must
+/// treat as a probe failure rather than an absence.
+fn linkage_phrase_regex(issue: u32) -> Option<regex::Regex> {
+    regex::Regex::new(&format!(
+        r"(?i)(?:^|[^0-9A-Za-z])(?:clos(?:e|es|ed)|fix(?:es|ed)?|resolv(?:e|es|ed)|part\s+of|contributes\s+to)[*_:\s]*#{issue}(?:[^0-9]|$)"
+    ))
+    .ok()
+}
+
+/// Classify the raw stdout of the [`open_linked_pr_timeline_args`] query as a
+/// verdict about `issue`.
+///
+/// Each non-blank line is one candidate `{number, body}` object (see
+/// [`OPEN_LINKED_PR_TIMELINE_JQ`]); a candidate counts as an open linked PR only
+/// when its body passes [`linkage_phrase_regex`]. **A bare mention is
+/// discarded** — that is the whole point of #8940: PR #8314 mentioned `#8322`
+/// once in a stand-down comment, which was enough for the pre-fix query to
+/// refuse dispatch of #8322 for 6.5 days even though #8314 neither closed it nor
+/// claimed a slice of it.
+///
+/// Empty output (or output whose every candidate is a bare mention) is a
+/// verified [`OpenPrProbe::NoneOpen`]; the lowest surviving candidate number is
+/// [`OpenPrProbe::Open`] (deterministic, matching the `unique | .[0]` ordering
+/// the pre-#8940 jq produced); a line we cannot read is
+/// [`OpenPrProbe::ProbeFailed`] — an answer we cannot parse is never a verified
 /// absence, same contract as [`parse_open_linked_pr`].
 #[must_use]
-pub fn parse_open_linked_pr_timeline(stdout: &str) -> OpenPrProbe {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        return OpenPrProbe::NoneOpen;
+pub fn parse_open_linked_pr_timeline(stdout: &str, issue: u32) -> OpenPrProbe {
+    let Some(phrase) = linkage_phrase_regex(issue) else {
+        return OpenPrProbe::ProbeFailed;
+    };
+    let mut linked: Option<u32> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(candidate) = serde_json::from_str::<serde_json::Value>(line) else {
+            return OpenPrProbe::ProbeFailed;
+        };
+        let Some(number) = candidate
+            .get("number")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+        else {
+            // A candidate we cannot name is a malformed payload, not an absence.
+            return OpenPrProbe::ProbeFailed;
+        };
+        let body = candidate
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !phrase.is_match(body) {
+            continue;
+        }
+        linked = Some(linked.map_or(number, |lowest: u32| lowest.min(number)));
     }
-    match trimmed.lines().next().unwrap_or("").trim().parse::<u32>() {
-        Ok(pr) => OpenPrProbe::Open(pr),
-        Err(_) => OpenPrProbe::ProbeFailed,
+    match linked {
+        Some(pr) => OpenPrProbe::Open(pr),
+        None => OpenPrProbe::NoneOpen,
     }
 }
 
@@ -428,7 +514,7 @@ pub fn resolve_owner_repo(repo_root: &Path) -> Option<(String, String)> {
 /// 2. **REST timeline** ([`open_linked_pr_timeline_args`] /
 ///    [`parse_open_linked_pr_timeline`]), consulted on *both* `NoneOpen` and
 ///    `ProbeFailed`. The closes-graph only knows about **closing keywords**, so
-///    a phase PR saying `Part of #N` / `Refs #N` is invisible to leg 1 and the
+///    a phase PR saying `Part of #N` is invisible to leg 1 and the
 ///    probe wrongly answered "no open linked PR" — which, for
 ///    [`super::orphan_recovery`], is a verified `NoneOpen` that greenlights
 ///    resetting a live claim. That is precisely the #8116 report: phase-scoped
@@ -441,6 +527,12 @@ pub fn resolve_owner_repo(repo_root: &Path) -> Option<(String, String)> {
 /// Added for #5511, where orphan recovery reset a `loom:building` issue that
 /// had a live `Closes #N` PR open because nothing on that path ever asked the
 /// forge about linked PRs.
+///
+/// Leg 2 is a superset of leg 1, but **not** an unfiltered one: since #8940 it
+/// discards candidates whose body merely mentions `#N` without a linking phrase
+/// (see [`parse_open_linked_pr_timeline`]), matching `/loom:sweep`'s own
+/// existing-PR probe. Before that filter, one passing `#N` in an unrelated PR's
+/// comment thread refused dispatch of `#N` for as long as that PR stayed open.
 #[must_use]
 pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
     // Repo resolution failure is a PROBE FAILURE, not a verified absence.
@@ -454,7 +546,7 @@ pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
         return graphql;
     }
     let timeline = run_probe(repo_root, open_linked_pr_timeline_args(&owner, &repo, issue), &|s| {
-        parse_open_linked_pr_timeline(s)
+        parse_open_linked_pr_timeline(s, issue)
     });
     // A verified NoneOpen from leg 1 survives a leg-2 probe failure: leg 2 is a
     // superset *when it answers*, and an unanswered superset is no evidence.
@@ -752,6 +844,18 @@ mod tests {
             !filter.contains("{full_name}"),
             "the template placeholder must be substituted, got: {filter}"
         );
+        // #8940: the filter must ship each candidate's BODY, not just its
+        // number — the phrase filter has nothing to match without it.
+        assert!(
+            filter.contains("body: (.source.issue.body"),
+            "the filter must carry each candidate's body for the #8940 phrase \
+             filter, got: {filter}"
+        );
+    }
+
+    /// One `{number, body}` candidate line, exactly as `gh --jq` emits it.
+    fn timeline_candidate(number: u32, body: &str) -> String {
+        format!("{}\n", serde_json::json!({ "number": number, "body": body }))
     }
 
     /// AC (#8116): an issue whose only open PR references it with a NON-closing
@@ -760,20 +864,118 @@ mod tests {
     /// the entire reason this transport exists.
     #[test]
     fn a_non_closing_part_of_reference_reads_as_an_open_linked_pr() {
-        assert_eq!(parse_open_linked_pr_timeline("8140\n"), OpenPrProbe::Open(8140));
+        assert_eq!(
+            parse_open_linked_pr_timeline(
+                &timeline_candidate(8140, "## Summary\n\nPart of #8116 — phase 2 of the epic."),
+                8116
+            ),
+            OpenPrProbe::Open(8140)
+        );
+    }
+
+    /// AC (#8940), the core regression: a PR that merely MENTIONS `#N` — no
+    /// closing keyword, no partial-increment phrase — is not a linked PR and
+    /// must not refuse dispatch. This is the live shape that starved #8322 for
+    /// 6.5 days: PR #8314 said "filed #8322 to track it, standing down" and
+    /// nothing else.
+    #[test]
+    fn a_bare_mention_is_not_a_linked_pr() {
+        assert_eq!(
+            parse_open_linked_pr_timeline(
+                &timeline_candidate(
+                    8314,
+                    "## Summary\n\nFiled #8322 to track the remainder; standing down \
+                     without pushing.\n\nCloses #8256",
+                ),
+                8322
+            ),
+            OpenPrProbe::NoneOpen,
+            "a bare `#N` mention must not count as a linked PR (#8940)"
+        );
+    }
+
+    /// AC (#8940): the accepted phrase families, and the mention shapes that
+    /// must still be discarded alongside them.
+    #[test]
+    fn only_closing_keywords_and_partial_increment_phrases_count_as_linkage() {
+        for (body, expected) in [
+            // Closing keywords still count — the timeline is the ONLY leg left
+            // when GraphQL cannot answer (#5911), so discarding them here would
+            // fall the #4123 guard open.
+            ("Closes #8940", OpenPrProbe::Open(700)),
+            ("fixes #8940", OpenPrProbe::Open(700)),
+            ("Resolved #8940", OpenPrProbe::Open(700)),
+            // Partial-increment phrases, with markdown emphasis/colon tolerance.
+            ("Part of #8940", OpenPrProbe::Open(700)),
+            ("**Part of:** #8940", OpenPrProbe::Open(700)),
+            ("Contributes to #8940", OpenPrProbe::Open(700)),
+            ("_contributes to_ #8940", OpenPrProbe::Open(700)),
+            // Bare mentions and near-misses are not linkage.
+            ("See #8940 for context", OpenPrProbe::NoneOpen),
+            ("#8940", OpenPrProbe::NoneOpen),
+            ("Supersedes #8940", OpenPrProbe::NoneOpen),
+            // A different issue's linkage is not this issue's.
+            ("Part of #8941", OpenPrProbe::NoneOpen),
+            // Trailing-digit boundary: #89401 is not #8940.
+            ("Part of #89401", OpenPrProbe::NoneOpen),
+            // `fixes` inside a longer word is not a closing keyword.
+            ("Prefixes #8940 with a slug", OpenPrProbe::NoneOpen),
+        ] {
+            assert_eq!(
+                parse_open_linked_pr_timeline(&timeline_candidate(700, body), 8940),
+                expected,
+                "body: {body:?}"
+            );
+        }
+    }
+
+    /// Several candidates: only phrase-confirmed ones count, and the verdict is
+    /// the lowest of them (deterministic, matching the pre-#8940 `unique |
+    /// .[0]` ordering).
+    #[test]
+    fn multiple_candidates_report_the_lowest_confirmed_pr() {
+        let stdout = format!(
+            "{}{}{}",
+            timeline_candidate(9100, "mentions #8940 in passing"),
+            timeline_candidate(9050, "Part of #8940"),
+            timeline_candidate(9070, "Contributes to #8940"),
+        );
+        assert_eq!(parse_open_linked_pr_timeline(&stdout, 8940), OpenPrProbe::Open(9050));
     }
 
     #[test]
     fn empty_timeline_output_is_a_verified_none_open() {
-        assert_eq!(parse_open_linked_pr_timeline(""), OpenPrProbe::NoneOpen);
-        assert_eq!(parse_open_linked_pr_timeline("  \n"), OpenPrProbe::NoneOpen);
+        assert_eq!(parse_open_linked_pr_timeline("", 8940), OpenPrProbe::NoneOpen);
+        assert_eq!(parse_open_linked_pr_timeline("  \n", 8940), OpenPrProbe::NoneOpen);
     }
 
     #[test]
     fn unparseable_timeline_output_is_a_probe_failure_not_an_absence() {
         assert_eq!(
-            parse_open_linked_pr_timeline("gh: rate limit exceeded"),
+            parse_open_linked_pr_timeline("gh: rate limit exceeded", 8940),
             OpenPrProbe::ProbeFailed
+        );
+        // Well-formed JSON that is not a candidate object is equally unreadable
+        // — including the pre-#8940 bare-number shape.
+        assert_eq!(parse_open_linked_pr_timeline("8140\n", 8940), OpenPrProbe::ProbeFailed);
+        assert_eq!(
+            parse_open_linked_pr_timeline(r#"{"number":null,"body":"Part of #8940"}"#, 8940),
+            OpenPrProbe::ProbeFailed
+        );
+    }
+
+    /// A candidate with no `body` at all (null or absent) is a bare mention as
+    /// far as this filter can tell — discarded, not a probe failure: the
+    /// candidate IS readable, it just carries no linking phrase.
+    #[test]
+    fn a_bodyless_candidate_is_discarded_rather_than_failing_the_probe() {
+        assert_eq!(
+            parse_open_linked_pr_timeline(r#"{"number":8314,"body":null}"#, 8322),
+            OpenPrProbe::NoneOpen
+        );
+        assert_eq!(
+            parse_open_linked_pr_timeline(r#"{"number":8314}"#, 8322),
+            OpenPrProbe::NoneOpen
         );
     }
 
