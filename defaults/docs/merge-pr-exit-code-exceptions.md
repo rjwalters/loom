@@ -204,6 +204,9 @@ Two sites exit 5, both inside `_wait_for_checks_then_sync_merge`:
 - **an unreadable check-runs API at the deadline** — every poll's fetch failed
   (and not with the confirmed-404 streak that means "this repo has no checks",
   which short-circuits to the merge instead).
+  A persistently **truncated** read (#8895: fewer rows than the forge's own
+  `total_count`) is this case too — it is withheld as a failed fetch, so it
+  also exits 5 at the deadline, never 0 and never 1 (#8993).
 
 What exit 5 deliberately is **not**:
 
