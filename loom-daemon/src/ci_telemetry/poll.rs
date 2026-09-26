@@ -7,11 +7,13 @@
 //! 3. Honour the org-wide rate-limit backoff and the process-global rate
 //!    limit breaker — a backing-off cycle makes zero requests.
 //! 4. Discover repos (`GET /orgs/{org}/repos`, paginated, ETag/304-cached).
-//! 5. Per repo: list runs `created >= watermark` (paginated); for each
-//!    completed, unseen run attempt list its jobs (`filter=all`, paginated),
-//!    **commit** the unseen job units then the run unit to the ledger
-//!    (fsync), **emit** them to the journal (fsync), confirm; finally advance
-//!    the watermark.
+//! 5. Per repo: list runs `created >= floor` (paginated), where the floor is
+//!    the watermark *or* the trailing rescan window, whichever is older
+//!    (#8898 — a re-run keeps its original `created_at`, so the watermark
+//!    alone would hide it); for each completed, unseen run attempt list its
+//!    jobs (`filter=all`, paginated), **commit** the unseen job units then
+//!    the run unit to the ledger (fsync), **emit** them to the journal
+//!    (fsync), confirm; finally advance the watermark.
 //!
 //! A rate limit anywhere aborts the whole cycle (the org backs off, never a
 //! single repo). Any other per-repo failure is recorded and the cycle moves on
@@ -44,6 +46,9 @@ pub struct CycleContext<'a> {
     pub now: DateTime<Utc>,
     pub host_id: String,
     pub initial_lookback: Duration,
+    /// How far back every poll re-lists runs regardless of the watermark, so
+    /// a re-attempt of an older run is still seen (#8898).
+    pub rescan_window: Duration,
     pub log_capture: LogCaptureGate,
     /// Repos whose logs are not captured (their records/metrics still are).
     pub log_excluded_repos: Vec<String>,
@@ -65,6 +70,7 @@ impl<'a> CycleContext<'a> {
             now: Utc::now(),
             host_id: crate::sweep_registry::host_identity(),
             initial_lookback: Duration::hours(super::INITIAL_LOOKBACK_HOURS),
+            rescan_window: Duration::hours(super::RESCAN_WINDOW_HOURS),
             log_capture: log_capture_gate(resolved),
             log_excluded_repos: resolved
                 .log_capture_excluded_repos
@@ -548,15 +554,48 @@ pub fn discover(
 
 /// Hold the watermark at the oldest not-yet-finished run so a later poll
 /// still lists it once it completes.
+///
+/// A hold **older than the current watermark** (only reachable through the
+/// trailing rescan window, e.g. an in-progress re-attempt of an old run) is
+/// clamped away by [`poll_repo`] rather than moving the watermark backwards:
+/// the rescan window re-lists that run next cycle anyway, and a watermark that
+/// can regress would re-walk arbitrarily much history.
 fn hold(at: DateTime<Utc>, oldest: &mut Option<DateTime<Utc>>) {
     *oldest = Some(oldest.map_or(at, |o| o.min(at)));
 }
 
-fn runs_path(repo: &str, watermark: DateTime<Utc>) -> String {
+/// The `created >=` floor for a repo's runs listing.
+///
+/// Without a watermark (a repo's first poll) it is the initial lookback. With
+/// one it is the **older** of the watermark and the trailing rescan window
+/// (#8898): a re-run keeps the original run's `created_at`, so a pure
+/// `created >= watermark` floor stops listing a run as soon as newer runs have
+/// advanced the watermark past it — and a later re-attempt of it is then never
+/// exported at all. Re-listing the trailing window every cycle costs one more
+/// runs page or two per repo; nothing is exported twice because every
+/// re-listed attempt is already `is_seen` in the ledger, and an already-seen
+/// run is never re-listed for its jobs.
+///
+/// The window is capped by `initial_lookback` so the floor can never reach
+/// further back than the repo's very first cycle already looked.
+#[must_use]
+pub fn runs_floor(
+    watermark: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    initial_lookback: Duration,
+    rescan_window: Duration,
+) -> DateTime<Utc> {
+    let Some(watermark) = watermark else {
+        return now - initial_lookback;
+    };
+    watermark.min(now - rescan_window.min(initial_lookback))
+}
+
+fn runs_path(repo: &str, floor: DateTime<Utc>) -> String {
     // `created=>=<ts>`, percent-encoded so `gh api` passes it verbatim.
     format!(
         "repos/{repo}/actions/runs?per_page=100&created=%3E%3D{}",
-        watermark.format("%Y-%m-%dT%H:%M:%SZ")
+        floor.format("%Y-%m-%dT%H:%M:%SZ")
     )
 }
 
@@ -573,11 +612,11 @@ fn poll_repo(
     report: &mut CycleReport,
 ) -> Result<(), RepoError> {
     let full = repo.full_name.as_str();
-    let watermark = ledger
-        .watermark(full)
-        .unwrap_or(ctx.now - ctx.initial_lookback);
+    let recorded = ledger.watermark(full);
+    let watermark = recorded.unwrap_or(ctx.now - ctx.initial_lookback);
+    let floor = runs_floor(recorded, ctx.now, ctx.initial_lookback, ctx.rescan_window);
     let mut runs: Vec<RunJson> =
-        paginate(api, runs_path(full, watermark), &mut report.summary.requests, |body| {
+        paginate(api, runs_path(full, floor), &mut report.summary.requests, |body| {
             serde_json::from_str::<RunsPage>(body).map(|p| p.workflow_runs)
         })?;
     runs.sort_by_key(|r| (r.created_at, r.id));
@@ -656,7 +695,10 @@ fn poll_repo(
             ledger.want_logs(&wanted)?;
         }
     }
-    ledger.set_watermark(full, oldest_incomplete.unwrap_or(newest))?;
+    // `.max(watermark)` keeps the watermark monotonic: the rescan window can
+    // surface an unfinished run created *before* it (see [`hold`]), and a
+    // regressing watermark would re-walk history every cycle.
+    ledger.set_watermark(full, oldest_incomplete.unwrap_or(newest).max(watermark))?;
     Ok(())
 }
 
