@@ -1671,7 +1671,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env --' cargo test -p loom-daemon --test private_workspace_docker -- --ignored --nocapture
 
   shell-suite-tests:
-    name: Shell Test Suites (hermetic)
+    name: Shell Test Suites (hermetic, ${{ matrix.shard }}/2)
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true')
     # Audit-and-wire of the defaults/scripts/tests/ population (#4455). Before
@@ -1714,6 +1714,12 @@ jobs:
     # previously not referenced by CI at all). All 8 suites are hermetic
     # (fake/stub binaries or local python3 AST fixtures, no live network or
     # forge calls) and run in well under a second each.
+    # Experiment (#9065): two runners split the manifest round-robin via
+    # LOOM_CI_SHARD; every suite runs in exactly one leg.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1745,12 +1751,13 @@ jobs:
         # no reachable user manager the block still self-skips, unchanged.
         env:
           LOOM_TEST_ALLOW_SYSTEMD: "1"
+          LOOM_CI_SHARD: ${{ matrix.shard }}/2
         run: bash defaults/scripts/tests/run-ci-suites.sh
       - name: Upload CI suite retry log (#7791)
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ci-suite-retry-log
+          name: ci-suite-retry-log-${{ matrix.shard }}
           path: /tmp/ci-suite-retry-log.tsv
           if-no-files-found: ignore
           retention-days: 14
