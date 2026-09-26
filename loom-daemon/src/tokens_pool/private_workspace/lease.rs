@@ -19,6 +19,10 @@ pub struct Job {
     pub control: String,
 }
 
+/// Secret-free provenance of a containment admission (#8787), written beside
+/// the durable job it belongs to and retired with it.
+pub(super) const ADMISSION: &str = "admission.json";
+
 /// The open file owns process exclusion; the durable JSON owns uncertainty
 /// after a crash. Never unlink a lock inode: two callers must lock the same one.
 pub(super) struct Lease {
@@ -90,12 +94,28 @@ impl Lease {
     }
 
     pub fn finish(&self) -> Result<()> {
+        // Retire the containment provenance with the job it belongs to, so a
+        // finished lease can never leave a live-looking admission record.
+        match std::fs::rename(self.dir.join(ADMISSION), self.dir.join("last-admission.json")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let path = self.dir.join("job.json");
         match std::fs::rename(&path, self.dir.join("last-job.json")) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+/// The containment admission recorded for the CURRENT job, if any (#8787).
+pub(super) fn admission(dir: &Path) -> Result<Option<serde_json::Value>> {
+    match std::fs::read(dir.join(ADMISSION)) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 

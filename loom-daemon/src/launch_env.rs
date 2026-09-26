@@ -100,6 +100,7 @@ mod tests {
             runtime_manifest: PathBuf::from("/runtime.json"),
             suggested_worker_type: None,
             preference,
+            execution: None,
         }
     }
 
