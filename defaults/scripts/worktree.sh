@@ -929,8 +929,8 @@ Safety Features:
   ✓ Prevents nested worktrees
   ✓ Non-interactive (safe for AI agents)
   ✓ Reuses existing branches automatically
-  ✓ Symlinks node_modules from main (avoids pnpm install)
-  ✓ Symlinks nested per-package node_modules for pnpm/monorepo workspaces
+  ✓ Symlinks node_modules from main (avoids npm install) — NOT on pnpm repos
+  ✓ Symlinks nested per-package node_modules for monorepo workspaces
   ✓ Symlinks extra gitignored paths via .loom/config.json worktree.linkPaths
   ✓ Excludes created symlinks via .git/info/exclude (no accidental git add)
   ✓ Symlinks .mcp.json from main (MCP config visible in worktrees)
@@ -983,18 +983,18 @@ Project-Specific Hooks:
 
 Monorepo / Generated-Artifact Symlinks:
   In addition to the root node_modules symlink, worktree.sh symlinks:
-    - Nested per-package node_modules (e.g. apps/web/node_modules) discovered by
-      scanning the main workspace for node_modules dirs that sit next to a
-      package.json (pnpm/monorepo layouts). No YAML parser dependency.
+    - Nested per-package node_modules (e.g. apps/web/node_modules), found by scanning
+      the main workspace for node_modules dirs next to a package.json. No YAML parser.
     - Extra gitignored paths listed in .loom/config.json under worktree.linkPaths,
       e.g. generated wasm-pack bindings that are expensive to rebuild per worktree:
 
         { "worktree": { "linkPaths": ["apps/web/src/wasm"] } }
 
   Each created symlink is added to the worktree's .git/info/exclude so 'git add -A'
-  never stages it. All symlinking is best-effort — a failed link warns and
-  continues; it never aborts worktree creation. Repos with no nested node_modules
-  and no worktree.linkPaths config see no behavior change.
+  never stages it; linking is best-effort and never aborts worktree creation. Repos
+  with no nested node_modules and no worktree.linkPaths config see no change.
+  NEITHER node_modules family runs on a pnpm workspace — pnpm purges THROUGH the alias
+  into the main clone (#8944). Override: worktree.linkNodeModules true|false|"auto".
 
 Resuming Abandoned Work:
   If an agent abandoned work on issue #42, a new agent can resume:
