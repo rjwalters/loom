@@ -125,6 +125,17 @@ pub(crate) const LEASE_MARKER_PREFIX: &str = "<!-- loom:lease host=";
 /// Generous relative to a genuine "near-simultaneous" race (the scenario
 /// this tie-break exists for), which resolves within, at most, a handful
 /// of seconds of `gh` round-trip latency.
+///
+/// **This bound alone is not sufficient (Issue #8840).** A lease record is
+/// *renewed in place* (`defaults/scripts/sweep-lease-renew.sh` PATCHes the
+/// same comment, advancing `updated_at` and never creating a new one), so a
+/// lease whose owner is demonstrably alive keeps a `created_at` frozen at
+/// the instant its claim episode began. Any owner that has held its claim
+/// for longer than this window — a curation phase, a long Builder run, an
+/// in-session sweep that published its lease before promotion — therefore
+/// falls out of the `created_at` comparison entirely while still being the
+/// live owner. [`lease_episode::in_claim_episode`] adds the second,
+/// renewal-anchored leg that closes that hole; see its doc comment.
 pub(crate) const LEASE_ORDER_LOOKBACK_SECS: i64 = 90;
 
 /// Bounded attempt count for [`SweepRegistry::resolve_lease_order`]'s
@@ -229,11 +240,15 @@ pub(crate) struct LeaseComment {
     /// The comment's own forge-assigned `updated_at` (Issue #7612) — the
     /// liveness signal per `defaults/docs/lease-record.md`'s load-bearing
     /// design decision (renewal PATCHes this same comment, advancing
-    /// `updated_at` without ever creating a new one). [`resolve_lease_order`]
-    /// does not consult this field (it orders by `id`/`created_at` only,
-    /// within a claim episode); [`SweepRegistry::freshest_lease_owner`] is
-    /// what reads it, to find which sweep currently holds the most-recently
-    /// renewed lease on an issue.
+    /// `updated_at` without ever creating a new one).
+    /// [`SweepRegistry::freshest_lease_owner`] reads it to find which sweep
+    /// currently holds the most-recently renewed lease on an issue, and —
+    /// since Issue #8840 — [`lease_episode::in_claim_episode`] reads it to
+    /// decide MEMBERSHIP in the current claim episode for a record whose
+    /// `created_at` has aged past [`LEASE_ORDER_LOOKBACK_SECS`].
+    /// [`resolve_lease_order`] still ORDERS purely by forge-assigned `id`;
+    /// `updated_at` never breaks an order tie, it only decides which
+    /// records are compared at all.
     pub(crate) updated_at: Option<DateTime<Utc>>,
     pub(crate) host: String,
     pub(crate) sweep_id: String,
@@ -1659,10 +1674,22 @@ impl SweepRegistry {
     /// (identified by [`published_host_id`](Self::published_host_id) +
     /// `sweep_id`) is the earliest one —
     /// by forge-assigned comment `id`, never a locally-recorded timestamp —
-    /// among those written within [`LEASE_ORDER_LOOKBACK_SECS`] of
-    /// `episode_start` (the instant this dispatch attempt began its own
-    /// flip, passed by the caller so the bound is anchored to THIS
-    /// dispatch's local clock rather than re-reading `Utc::now()` here).
+    /// among those belonging to the current claim episode
+    /// ([`lease_episode::in_claim_episode`], anchored to `episode_start`:
+    /// the instant this dispatch attempt began its own flip, passed by the
+    /// caller so the bound uses THIS dispatch's local clock rather than
+    /// re-reading `Utc::now()` here).
+    ///
+    /// # Issue #8840: a renewed lease is a member of the episode
+    ///
+    /// Episode membership is NOT `created_at` alone. A lease record is
+    /// renewed in place, so the live owner of any claim older than
+    /// [`LEASE_ORDER_LOOKBACK_SECS`] has a frozen `created_at` and a fresh
+    /// `updated_at` — and pre-#8840 was filtered out of the comparison
+    /// entirely, letting this dispatcher conclude it was the sole claimant
+    /// and spawn a second owner. See [`lease_episode::in_claim_episode`] for
+    /// the observed collision and the second, renewal-anchored leg that
+    /// closes it. Ordering is unchanged: still forge-assigned `id` only.
     ///
     /// FAIL-OPEN in every ambiguous case — an unreadable forge
     /// ([`read_lease_comments`] returns `None`) that stays unreadable across
@@ -1724,7 +1751,11 @@ impl SweepRegistry {
         // silently break "recognize my own claim" for every dispatch once
         // publishing goes opaque.
         let host = self.published_host_id();
-        let cutoff = episode_start - chrono::Duration::seconds(LEASE_ORDER_LOOKBACK_SECS);
+        let cutoff = lease_episode::created_cutoff(episode_start);
+        // Issue #8840: a lease renewed in place keeps a frozen `created_at`,
+        // so `cutoff` alone cannot see the live owner of a claim older than
+        // the lookback. See `lease_episode::in_claim_episode`.
+        let renewal_cutoff = lease_episode::renewal_cutoff(episode_start);
 
         for attempt in 1..=LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS {
             let Some(comments) = self.read_lease_comments(issue) else {
@@ -1746,10 +1777,7 @@ impl SweepRegistry {
                 }
                 return LeaseOrderDecision::Proceed;
             };
-            let in_window: Vec<&LeaseComment> = comments
-                .iter()
-                .filter(|c| c.created_at.is_some_and(|ts| ts >= cutoff))
-                .collect();
+            let in_window = lease_episode::in_episode(self, &comments, cutoff, renewal_cutoff);
             let Some(own_id) = in_window
                 .iter()
                 .filter(|c| c.host == host && c.sweep_id == sweep_id)
@@ -1784,7 +1812,7 @@ impl SweepRegistry {
                 // — confirm with a few bounded re-reads before committing
                 // to Proceed, since a genuine peer's earlier comment may
                 // simply not have propagated into THIS read yet (#6951).
-                self.confirm_sole_claim(issue, sweep_id, &host, cutoff)
+                self.confirm_sole_claim(issue, sweep_id, &host, cutoff, renewal_cutoff)
             };
         }
         // Unreachable in practice (the loop above always returns within its
@@ -1823,6 +1851,7 @@ impl SweepRegistry {
         sweep_id: &str,
         host: &str,
         cutoff: DateTime<Utc>,
+        renewal_cutoff: DateTime<Utc>,
     ) -> LeaseOrderDecision {
         for attempt in 1..=LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS {
             std::thread::sleep(LEASE_ORDER_SOLE_CLAIM_CONFIRM_DELAY);
@@ -1855,10 +1884,7 @@ impl SweepRegistry {
                 }
                 return LeaseOrderDecision::Proceed;
             };
-            let in_window: Vec<&LeaseComment> = comments
-                .iter()
-                .filter(|c| c.created_at.is_some_and(|ts| ts >= cutoff))
-                .collect();
+            let in_window = lease_episode::in_episode(self, &comments, cutoff, renewal_cutoff);
             let Some(own_id) = in_window
                 .iter()
                 .filter(|c| c.host == host && c.sweep_id == sweep_id)
