@@ -603,7 +603,10 @@ async fn sample_snapshots(
     super::ops::host::record(worktree_volume).await;
     // The work finder's ranked ready queue (Issue #8852, phase 2) — native
     // HTTPS only, and only when the work finder has ticked since last time.
-    super::queue_snapshot::record(slug_cache).await;
+    super::queue_snapshot::record(workspace_pool, slug_cache).await;
+    // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
+    // listings plus a bounded per-item budget; a no-op without the ops sink.
+    super::ops::stage_dwell::record(workspace_pool, slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
@@ -1046,18 +1049,7 @@ where
     // Collect the roots first and drop every registry lock before the async
     // slug/visibility resolution below — never hold a `std::sync::Mutex`
     // guard across an `.await` point.
-    let roots: Vec<PathBuf> = workspace_pool
-        .provisioned_registries()
-        .into_iter()
-        .map(|registry| {
-            registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .config()
-                .workspace_root
-                .clone()
-        })
-        .collect();
+    let roots = provisioned_roots(workspace_pool);
 
     let mut entries = Vec::with_capacity(roots.len());
     for root in roots {
@@ -1090,6 +1082,23 @@ where
     entries.sort_by(|a, b| a.slug.cmp(&b.slug));
     entries.dedup_by(|a, b| a.slug == b.slug);
     entries
+}
+
+/// Every workspace root [`WorkspacePool::provisioned_registries`] currently
+/// tracks. Each registry lock is released before this returns.
+pub(super) fn provisioned_roots(workspace_pool: &WorkspacePool) -> Vec<PathBuf> {
+    workspace_pool
+        .provisioned_registries()
+        .into_iter()
+        .map(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .config()
+                .workspace_root
+                .clone()
+        })
+        .collect()
 }
 
 /// This host's currently in-flight (`Pending`/`Running`, i.e. non-terminal)

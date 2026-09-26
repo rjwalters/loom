@@ -872,8 +872,21 @@ Each name fixes its OTLP kind. `loom.dispatch.decisions` is a monotonic
 `workspace_commands_missing`, `pr_open`, `peer_claim`, `backoff`,
 `pr_open_backoff`, `noop_cooldown`, `declined`, `prless_retry`,
 `recheck_interval`, `host_constraint`, `capacity`, `ramp_cap`, `saturation`,
-`out_of_slice`, `error`. These are the same buckets as the `work_finder: tick`
-log line (`loom-daemon health`'s last-tick summary omits `prless_retry`).
+`out_of_slice`, `error`, plus the typed dispatch refusals (#8907):
+`lease_order_lost` (lost the lease-order tie-break), `token_selection_failed`
+(empty or fully bad-marked token pool), `claim_collision` (cross-host collision
+enforcement) and `claim_lock_held` (the local claim lock already existed).
+These are the same buckets as the `work_finder: tick` log line
+(`loom-daemon health`'s last-tick summary omits `prless_retry`), except that
+the log line and `health` still fold `lease_order_lost` into `backoff` and the
+other three into `error`. The exported `backoff` and `error` are net of them,
+so each candidate is counted under exactly one reason. There is no
+`worktree_locked` reason: the registry's dispatch path has no worktree lock
+(the sweep child creates its worktree).
+`loom.dispatch.slot_turnaround` (seconds) and `.samples`,
+`loom.dispatch.idle_slot_seconds` (slot-seconds), and
+`loom.forge.stage_dwell` (seconds) and `.samples` are also delta `Sum`s; see
+"Worker turnaround and forge stage dwell" below.
 `loom.queue.dispatch_wait` (seconds) and `loom.queue.dispatch_wait.samples`
 (issues) are also delta `Sum`s. Together they give the summed queue dwell of the
 issues dispatched in a tick, so the mean wait is `dispatch_wait / samples`.
@@ -890,6 +903,8 @@ Every other name is a **`Gauge`**:
 | `loom.host.worktree_volume.free_bytes`, `loom.host.worktree_volume.total_bytes` | bytes | `host.health` interval |
 | `loom.queue.issues` | count | every work-finder tick |
 | `loom.queue.listing_failed_repos` | count | every work-finder tick |
+| `loom.dispatch.idle_slots` | count | every work-finder tick with an occupancy reading |
+| `loom.forge.stage_items` (`state` = `curated`, `issue`, `building`, `review_requested`, `changes_requested`, `pr`) | count | `host.health` interval |
 
 `loom.queue.issues` (Issue #8852, phase 2) is the ready-queue depth. It has
 one point per queue disposition, labelled `state` (`running`, `ready`,
@@ -930,6 +945,36 @@ with no double count and no replayed history. Pool state covers the `tokens.snap
 Codex) plus every enabled API-key-pool account (Z.ai, Kimi, …), aggregated per
 provider with no `account` label; delta counters start from the second sample.
 
+Worker turnaround and forge stage dwell (Issue #8929), per host (the
+resource `host.id`), never labelled by issue or repo:
+
+| Metric | Kind | Unit | Labels | Meaning |
+|---|---|---|---|---|
+| `loom.dispatch.slot_turnaround`, `.samples` | delta `Sum` | `s`, `{slot}` | — | seconds from an issue sweep finishing (`sweep.global.completed`) to the next issue-sweep dispatch refilling the slot, FIFO; mean = ratio. Includes time with no work; the first dispatches after a restart have no freed slot to pair with and are not sampled |
+| `loom.dispatch.idle_slots` | `Gauge` | `{slot}` | — | `max_concurrent − occupancy` at the end of a tick |
+| `loom.dispatch.idle_slot_seconds` | delta `Sum` | `s` | — | `min(idle, waiting) × interval` for a tick that left ready work waiting (ramp cap, saturation brake, repo slice) with slots idle, held until the next tick and capped at 15 min |
+| `loom.forge.stage_dwell`, `.samples` | delta `Sum` | `s`, `{item}` | `state` ∈ `created_to_curated`, `curated_to_issue`, `building_to_review_requested`, `review_requested_to_merged` | time spent in a forge label stage the work finder never lists; mean = ratio |
+| `loom.forge.stage_items` | `Gauge` | `{item}` | `state` (the stage label) | open items under each stage label, over this host's repos |
+
+The stage dwell reads the stage labels' listings with the ETag-cached REST
+listing (a `304` costs no rate limit) every 5 minutes, plus at most 8 per-item
+reads per sample (`issues/{n}/events` for a label time, cached per process;
+`pulls/{n}` once when a PR leaves review). `created_to_curated` is sampled when
+an issue newly appears under `loom:curated`, `curated_to_issue` when a
+`loom:curated` issue newly appears under `loom:issue` or `loom:building`
+(`loom:curated` is additive and stays on; promotion time is known to within
+one 5-minute sample),
+`building_to_review_requested` when a PR that closes a `loom:building` issue
+newly appears under a review label (PR created minus the `loom:building`
+time), and `review_requested_to_merged` when a PR leaves the review labels and
+has merged (merged minus PR created). Sampling reads come first and cache
+warm-up only spends the remainder; work over the budget waits, uncounted, for
+the next sample. Only the first events page (100 events) is read. The reads
+run off the collector loop, so a slow forge never stalls it. The first sample after start is a
+baseline, so a restart never replays history. Every host managing a repo
+samples it: sums scale with the host count, means do not. Completed sweeps'
+own phase durations remain the cycle-time rollup's (#8692).
+
 The dwell names (#8856) are `loom.queue.oldest_wait`, `loom.queue.starved`,
 `loom.queue.starved.by_reason` and `loom.queue.dispatch_wait[.samples]`. They
 measure how long ready-queue issues have waited; for depth, use
@@ -945,7 +990,12 @@ that covers candidate evaluation and dispatch. Its attributes are
 `loom.dispatch.result` (`dispatched`, `halted_main_red`, `saturation_held`,
 `error`, `no_eligible_work`, `capacity_full`, `all_skipped`, first match
 wins), `loom.dispatch.seen`, `loom.dispatch.dispatched`,
-`loom.dispatch.errors` and `loom.dispatch.max_concurrent`.
+`loom.dispatch.errors` and `loom.dispatch.max_concurrent`. Each `dispatch()` attempt in the
+tick is one `loom.dispatch.admission` child span (#8907), with the tick's trace
+id and the tick span as its parent. Its attributes are `loom.issue`,
+`loom.dispatch.admission_result` (`dispatched`, `in_flight`, `refused`,
+`error`) and `loom.dispatch.reason` (the `loom.dispatch.decisions` reason it
+was counted under). Its status is `error` only for `error`.
 
 Tokens, providers and pools (Issues #8908, #8931):
 
@@ -980,7 +1030,7 @@ daemon process or is disabled.
 | `tick_at` | RFC 3339 | when the described tick completed — the freshness stamp |
 | `max_concurrent` | integer | the concurrency cap that tick ran under |
 | `seen` | integer | ready issues the tick listed |
-| `counts` | object | `running` / `ready` / `blocked` over **every** row, including dropped ones |
+| `counts` | object | `running` / `ready` / `blocked` over **every** row, including dropped ones; `blocked` includes the `labelled_blocked` rows |
 | `listing_failed` | array, optional | `{repo, visibility}` for each repo whose ready listing failed; its backlog is absent (incomplete, not empty) |
 | `listing_failed_unresolved` | integer | failed-listing workspaces whose slug could not be resolved |
 | `rows[]` | array | ranked rows (below), at most 200 |
@@ -991,7 +1041,7 @@ Each row:
 
 | Field | Type | Notes |
 |---|---|---|
-| `rank` | integer | 1-based dispatch position on the host. It is not renumbered after drops, so a gap means a row was dropped |
+| `rank` | integer | 1-based dispatch position on the host. It is not renumbered after drops, so a gap means a row was dropped. `0` means outside the dispatch order (a `labelled_blocked` row) |
 | `repo` | string | forge `owner/repo`, never a local path |
 | `visibility` | `public` / `private` | per row; missing or unknown decodes to `private` |
 | `issue` | integer | issue number |
@@ -999,10 +1049,20 @@ Each row:
 | `urgent` | bool | carries `loom:urgent` |
 | `created_at` | RFC 3339, optional | issue creation time (the age ordering key) |
 | `tier` | string, optional | the `tier:*` label, informational only |
-| `disposition` | string | `dispatched`, `in_flight`, `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_out_of_slice`, `workspace_halted`, `workspace_commands_missing`, `host_constraint`, `parked`, `hard_exclusion`, `recheck_interval`, `quarantined`, `dispatch_backoff`, `open_pr_backoff`, `noop_cooldown`, `declined`, `prless_retry`, `peer_claim`, `open_pr`, `dispatch_error` (unknown values are forward-compatible) |
+| `disposition` | string | `dispatched`, `in_flight`, `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_out_of_slice`, `workspace_halted`, `workspace_commands_missing`, `host_constraint`, `parked`, `hard_exclusion`, `recheck_interval`, `quarantined`, `dispatch_backoff`, `open_pr_backoff`, `noop_cooldown`, `declined`, `prless_retry`, `peer_claim`, `open_pr`, `dispatch_error`, `labelled_blocked` (unknown values are forward-compatible) |
 | `state` | string | `running` / `ready` / `blocked`, derived by the daemon so clients never keep a copy of the mapping |
 | `reason` | string | human-readable reason, also daemon-derived |
-| `detail` | string, optional | only for `parked` (the park label) and `open_pr` (`open PR #N`). Free-form dispatch-error text is never exported |
+| `detail` | string, optional | only for `parked` (the park label), `open_pr` (`open PR #N`) and `labelled_blocked` (the hold labels it also carries, from `loom:operator`, `loom:operator-only`, `loom:operator-mechanical`, `loom:needs-capability`). Free-form dispatch-error and comment text is never exported |
+
+**Forge-side blocked issues (Issue #8957).** After the ranked rows, the
+snapshot carries one `labelled_blocked` row (`state: blocked`, `rank: 0`,
+reason `blocked: labelled loom:blocked`) for each open issue in a managed repo
+that carries `loom:blocked` without `loom:issue`. The work finder never lists
+these. They come from one ETag-cached REST listing per repo, made only when a
+snapshot is emitted. They count in `counts.blocked` (so `counts` is no longer
+only the tick's rows) and are subject to the same 200-row cap. The blocking
+reason itself is usually a forge comment, and comment text is never read or
+exported. This is additive, so there is no `schema_version` bump.
 
 Redaction (phase 3, `dashboard/src/queueState.ts`): the Worker redacts per
 row on `visibility`. On `/public/*` a private row keeps only `rank`,

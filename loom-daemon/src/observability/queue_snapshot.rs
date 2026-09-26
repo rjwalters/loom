@@ -184,8 +184,13 @@ async fn resolve_repos(
 }
 
 /// Emit a snapshot of the last work-finder tick when a native sink is
-/// registered and the work finder has ticked since the previous snapshot.
-pub(super) async fn record(slug_cache: &mut HashMap<String, String>) {
+/// registered and the work finder has ticked since the previous snapshot,
+/// with the managed repos' forge-side `loom:blocked` issues appended
+/// (Issue #8957, [`super::queue_blocked`]).
+pub(super) async fn record(
+    workspace_pool: &crate::workspace_pool::WorkspacePool,
+    slug_cache: &mut HashMap<String, String>,
+) {
     let Some(sink) = GLOBAL_SINK.get() else {
         return;
     };
@@ -199,7 +204,10 @@ pub(super) async fn record(slug_cache: &mut HashMap<String, String>) {
         return;
     }
     let repos = resolve_repos(&summary, slug_cache).await;
-    sink.push(build_record(&summary, &repos));
+    let mut record = build_record(&summary, &repos);
+    let blocked = super::queue_blocked::collect(workspace_pool, slug_cache).await;
+    super::queue_blocked::append(&mut record, blocked);
+    sink.push(record);
     *LAST_EMITTED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary.at);

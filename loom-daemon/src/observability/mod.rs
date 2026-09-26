@@ -107,6 +107,7 @@ pub mod otlp;
 pub mod outcome;
 pub mod overhead;
 pub mod queue;
+pub mod queue_blocked;
 pub mod queue_snapshot;
 pub mod runtime_usage;
 pub mod sender;
@@ -1097,8 +1098,11 @@ pub fn spawn_task(
     // ops spans through `ops::emit_*`. Registered over the OTLP queues only —
     // both kinds are OTLP-only, so an HTTPS queue would just carry and drop
     // them. No OTLP exporter ⇒ nothing registered ⇒ every emit is a no-op.
+    let mut ops_handles = Vec::new();
     if let Some(sink) = ops::sink_for_otlp_queues(otlp_queues, &host_id) {
         ops::register_global_ops_sink(sink);
+        // Slot turnaround (#8929): a bus subscriber, OTLP-only like the sink.
+        ops_handles.push(ops::turnaround::spawn_task(bus));
     }
     // `queue.snapshot` (Issue #8852, phase 2): the reverse split — native
     // HTTPS queues only, sampled by the collector below.
@@ -1127,6 +1131,7 @@ pub fn spawn_task(
     let mut handles = Vec::with_capacity(sender_handles.len() + 2);
     handles.push(collector_handle);
     handles.push(daemon_event_handle);
+    handles.extend(ops_handles);
     handles.extend(sender_handles);
     Some(handles)
 }

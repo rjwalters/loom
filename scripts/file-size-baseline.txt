@@ -76,7 +76,7 @@
 1510 loom-daemon/src/tokens_pool/session_lifecycle.rs
 1656 loom-daemon/src/types.rs
 1050 loom-daemon/src/watch_registry.rs
-1908 loom-daemon/src/work_finder.rs
+1580 loom-daemon/src/work_finder.rs
 3455 loom-daemon/src/work_finder/tests.rs
 1225 loom-daemon/src/worktree_ops/cargo_target.rs
 2370 loom-daemon/src/worktree_ops/clean.rs

@@ -1,6 +1,7 @@
 //! Work-finder tick telemetry (Issue #8860): one `loom.dispatch.tick` span per
 //! tick, plus the tick's candidate outcomes as `loom.dispatch.decisions` delta
-//! counters labelled with an explicit `reason`.
+//! counters labelled with an explicit `reason`, and (Issue #8907) one
+//! `loom.dispatch.admission` child span per `dispatch()` attempt.
 //!
 //! Everything here is derived from the [`TickReport`] the tick already
 //! produces for `loom-daemon health` (#4761), so the exported reasons cannot
@@ -17,8 +18,15 @@ use crate::work_finder::TickReport;
 /// Every `reason` label value, paired with its [`TickReport`] counter. Zero
 /// counters are not emitted. `error` counts failed dispatches and failed
 /// ready-issue listings.
+///
+/// The typed-refusal counters (#8907) are subsets of `skipped_backoff`
+/// (`lease_order_lost`) and `errors` (`token_selection_failed`,
+/// `claim_collision`, `claim_lock_held`), so their parents are reported net of
+/// them: every candidate lands in exactly one reason.
 #[must_use]
-pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 19] {
+pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 23] {
+    let classified_errors =
+        report.refused_token_selection + report.refused_claim_collision + report.refused_claim_lock;
     [
         ("dispatched", report.dispatched),
         ("labeled", report.skipped_labeled),
@@ -27,7 +35,12 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 19] {
         ("workspace_commands_missing", report.skipped_workspace_commands_missing),
         ("pr_open", report.skipped_pr_open),
         ("peer_claim", report.skipped_peer_claim),
-        ("backoff", report.skipped_backoff),
+        (
+            "backoff",
+            report
+                .skipped_backoff
+                .saturating_sub(report.refused_lease_order),
+        ),
         ("pr_open_backoff", report.skipped_pr_open_backoff),
         ("noop_cooldown", report.skipped_noop_cooldown),
         ("declined", report.skipped_declined),
@@ -38,7 +51,12 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 19] {
         ("ramp_cap", report.deferred_ramp_cap),
         ("saturation", report.deferred_saturation),
         ("out_of_slice", report.deferred_out_of_slice),
-        ("error", report.errors),
+        ("error", report.errors.saturating_sub(classified_errors)),
+        // Typed dispatch refusals (Issue #8907) — one contiguous block.
+        ("lease_order_lost", report.refused_lease_order),
+        ("token_selection_failed", report.refused_token_selection),
+        ("claim_collision", report.refused_claim_collision),
+        ("claim_lock_held", report.refused_claim_lock),
     ]
 }
 
@@ -128,12 +146,55 @@ pub fn tick_span(
     }
 }
 
-/// Export one completed tick. Returns immediately when no ops sink is
+/// One `loom.dispatch.admission` child span per `dispatch()` attempt the
+/// tick made (Issue #8907), parented to `tick` (the tick's own span) and
+/// clamped inside it. Attributes: `loom.issue`, `loom.dispatch.admission_result`
+/// and `loom.dispatch.reason` (the `loom.dispatch.decisions` reason).
+#[must_use]
+pub fn admission_spans(report: &TickReport, tick: &SpanRecord) -> Vec<SpanRecord> {
+    report
+        .admissions
+        .iter()
+        .map(|admission| {
+            let started_at = admission.started_at.clamp(tick.started_at, tick.ended_at);
+            let attributes: TraceAttributes = [
+                ("loom.issue", admission.issue.to_string()),
+                ("loom.dispatch.admission_result", admission.result.to_string()),
+                ("loom.dispatch.reason", admission.reason.to_string()),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
+            SpanRecord {
+                context: tick.context.child(),
+                parent_span_id: Some(tick.context.span_id.clone()),
+                name: SpanName::DispatchAdmission,
+                started_at,
+                ended_at: admission.ended_at.clamp(started_at, tick.ended_at),
+                status: if admission.result == "error" {
+                    SpanStatus::Error
+                } else {
+                    SpanStatus::Ok
+                },
+                attributes,
+                events: Vec::new(),
+                links: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+/// Export one completed tick: its span, one admission span per dispatch
+/// attempt, and its metric points. Returns immediately when no ops sink is
 /// registered (observability off, or no OTLP exporter).
 pub fn record_tick(report: &TickReport, max_concurrent: usize, started_at: DateTime<Utc>) {
     let Some(sink) = super::global_ops_sink() else {
         return;
     };
-    sink.emit_span(tick_span(report, max_concurrent, started_at, Utc::now()));
+    let tick = tick_span(report, max_concurrent, started_at, Utc::now());
+    for span in admission_spans(report, &tick) {
+        sink.emit_span(span);
+    }
+    sink.emit_span(tick);
     sink.emit_metrics_since(tick_points(report, max_concurrent), Some(started_at));
 }

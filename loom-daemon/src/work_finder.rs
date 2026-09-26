@@ -130,9 +130,10 @@ use crate::capacity::{self, CapacityAdvisory};
 use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
+#[cfg(test)]
 use crate::sweep_registry::{
     DispatchBackoffError, LeaseOrderDispatchError, LiveClaimDispatchError, OpenPrDispatchError,
-    ParkedIssueDispatchError, TokenSelectionDispatchError, WorkspaceCommandsMissingDispatchError,
+    ParkedIssueDispatchError, WorkspaceCommandsMissingDispatchError,
 };
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::Event;
@@ -228,9 +229,12 @@ pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP
 
 mod labels;
 pub mod ready_queue;
+mod tick_report;
 mod tick_summary;
 use crate::types::QueueDisposition as Qd;
 pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
+use tick_report::record_dispatch_outcome;
+pub use tick_report::{Admission, TickReport};
 #[cfg(test)]
 use tick_summary::reset_last_tick_summary;
 pub use tick_summary::{
@@ -787,7 +791,7 @@ pub trait WorkDispatcher {
     /// Whether this dispatcher's workspace is missing
     /// `.claude/commands/loom/sweep.md` — the **structural, workspace-level**
     /// refusal the registry's step-2.4 guard (#4027) enforces via the typed
-    /// [`WorkspaceCommandsMissingDispatchError`]. Unlike
+    /// [`WorkspaceCommandsMissingDispatchError`](crate::sweep_registry::WorkspaceCommandsMissingDispatchError). Unlike
     /// [`quarantined`](Self::quarantined) / [`backed_off`](Self::backed_off),
     /// this is not a per-issue set: EVERY candidate in this workspace would
     /// be refused identically, so callers check it once per workspace per
@@ -919,190 +923,6 @@ pub trait WorkDispatcher {
 // ============================================================================
 // Tick
 // ============================================================================
-
-/// Per-tick outcome counts, for observability and test assertions.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TickReport {
-    /// Ready `loom:issue` rows returned by the source this tick.
-    pub seen: usize,
-    /// Issues for which a **new** sweep was dispatched this tick.
-    pub dispatched: usize,
-    /// Issues skipped because they carried a [`SKIP_LABELS`] entry — either in
-    /// the candidate listing this tick, or at dispatch time when the
-    /// dispatch-side [`PARK_LABELS`] guard (#4444) found a park label the
-    /// listing had not caught yet (`ParkedIssueDispatchError`). Both are the
-    /// same reason, so they share one counter rather than splitting a stale-cache
-    /// race across `labeled-skip` and `error(s)`.
-    pub skipped_labeled: usize,
-    /// Issues skipped because a live sweep already exists for them (registry
-    /// in-flight set, or an idempotency no-op from `dispatch()`).
-    pub skipped_in_flight: usize,
-    /// Issues deferred to a future tick because the concurrency cap was reached.
-    pub deferred_capacity: usize,
-    /// Issues deferred to a future tick because the **per-tick admission cap**
-    /// (#4234, `max_admissions_per_tick`) was reached, independent of
-    /// `deferred_capacity` — this fires even when `max_concurrent` computes
-    /// large enough to admit them (e.g. a token-axis jump), because the ramp
-    /// cap deliberately smooths *how fast* new sweeps are admitted rather than
-    /// how many may run concurrently. See [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`].
-    pub deferred_ramp_cap: usize,
-    /// Issues deferred to a future tick because the **saturation admission
-    /// brake** (#4903, [`crate::admission_brake`]) held new admissions: the host
-    /// is already at/over the configured load-per-core hold threshold, so adding
-    /// work would only slow the sweeps already running.
-    ///
-    /// Deliberately its own counter, not folded into
-    /// [`deferred_capacity`](Self::deferred_capacity): the concurrency cap was
-    /// *not* reached — the host was. Conflating them would report a token/disk
-    /// shortage on a machine whose only problem is that it is already full, and
-    /// send an operator to raise a knob that is not binding.
-    pub deferred_saturation: usize,
-    /// Issues skipped because they are quarantined for repeated insta-crashing
-    /// (Issue #3939). Filtered out before the concurrency budget is allocated, so
-    /// a quarantined candidate never consumes a shared dispatch slot.
-    pub skipped_quarantined: usize,
-    /// Issues skipped because their workspace is missing
-    /// `.claude/commands/loom/sweep.md` (Issue #4027 guard 2.4, quarantined at
-    /// the work-finder level by #6440). Unlike every other `skipped_*`
-    /// counter here, this is incremented **once per gated workspace per
-    /// tick**, not once per candidate — the whole point is that the finder no
-    /// longer calls `dispatch()` (and gets the same
-    /// [`WorkspaceCommandsMissingDispatchError`](crate::sweep_registry::WorkspaceCommandsMissingDispatchError)
-    /// back, and logs it) once per ready issue in a structurally broken
-    /// workspace, every tick, forever.
-    pub skipped_workspace_commands_missing: usize,
-    /// Issues skipped because they already have an **open** linked PR (Issue
-    /// #4123 open-PR dispatch guard). `dispatch()` refuses these with the typed
-    /// [`OpenPrDispatchError`]; the finder attributes that refusal here rather
-    /// than to [`errors`](Self::errors) so a duplicate-work skip is visible and
-    /// distinct from a real dispatch failure. Every in-memory dedup signal dies
-    /// with the parent sweep, so without this guard an issue whose approved PR is
-    /// still open would be re-dispatched the moment its sweep exits.
-    pub skipped_pr_open: usize,
-    /// Issues skipped because a **peer host** advertised a live soft claim over
-    /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**
-    /// distinct reason — never folded into [`collisions`](Self::collisions)
-    /// (#4085's post-hoc collision *count*) or the label/in-flight skips — so an
-    /// operator can see how many dispatches the soft claim actively prevented,
-    /// separate from the collisions it did not. Always `0` when
-    /// `safehouse.enabled` is false (the dispatcher's `peer_claimed()` is empty).
-    pub skipped_peer_claim: usize,
-    /// Issues skipped because they are inside a per-issue dispatch-backoff
-    /// window after a failed dispatch (Issue #4485) — either filtered out before
-    /// the capacity gate via [`WorkDispatcher::backed_off`], or refused by the
-    /// registry's step-2.8 guard with the typed [`DispatchBackoffError`].
-    /// Attributed here rather than to [`errors`](Self::errors) because a backoff
-    /// refusal is a deliberate skip, not a failure.
-    pub skipped_backoff: usize,
-    /// The subset of [`skipped_backoff`](Self::skipped_backoff) whose window
-    /// was armed specifically by the open-PR guard (#4123) refusing dispatch,
-    /// rather than a real dispatch failure (Issue #7606) — filtered out
-    /// before the capacity gate via [`WorkDispatcher::pr_open_backed_off`].
-    /// Mutually exclusive with `skipped_backoff`: a candidate counted here is
-    /// never also counted there. Makes the #4485 ladder's steady-state
-    /// deferral of a guarded issue visible as its own tally, distinct from
-    /// both a generic backoff skip and an active-tick [`skipped_pr_open`]
-    /// refusal.
-    pub skipped_pr_open_backoff: usize,
-    /// Issues skipped because they are inside a no-op re-dispatch cooldown
-    /// window (Issue #6670): a sweep self-reported "no actionable delta this
-    /// pass" via `RecordNoopRelease` and the cooldown it armed has not yet
-    /// elapsed. Filtered out before the capacity gate via
-    /// [`WorkDispatcher::noop_cooldown`], exactly like
-    /// [`skipped_quarantined`](Self::skipped_quarantined) /
-    /// [`skipped_backoff`](Self::skipped_backoff) — a distinct counter because
-    /// this is a **successful, empty** pass, never a crash or a failed
-    /// dispatch.
-    pub skipped_noop_cooldown: usize,
-    /// Issues skipped because a **hard-exclusion rule** applies (Issue #7528) —
-    /// one counter covering both halves of that fix:
-    ///
-    /// 1. the candidate itself carries a
-    ///    [`crate::hard_exclusion::HARD_EXCLUSION_LABELS`] entry (`external`
-    ///    today), so no role has standing to act on it at all; or
-    /// 2. a previous sweep for it already declined on such a rule and the
-    ///    reaper's decline cooldown ([`WorkDispatcher::declined`]) has not
-    ///    elapsed.
-    ///
-    /// Deliberately its own counter rather than folded into
-    /// [`skipped_labeled`](Self::skipped_labeled): a park label says "a human
-    /// took this out of the queue", a hard exclusion says "this issue is not
-    /// Loom's to work on yet". Conflating them hides an intake backlog inside
-    /// the park tally — and an operator watching `labeled-skip` climb has no
-    /// way to tell which of the two they are looking at.
-    pub skipped_declined: usize,
-    /// Issues skipped because they are inside a **PR-less retry window** (Issue
-    /// #7972): a previous dispatch claimed the issue, released it, and left no
-    /// pull request behind. Filtered out before the capacity gate via
-    /// [`WorkDispatcher::prless_retry`], exactly like
-    /// [`skipped_noop_cooldown`](Self::skipped_noop_cooldown) — and a distinct
-    /// counter because it measures a distinct pathology: not a crash
-    /// (`skipped_quarantined`), not a failed dispatch (`skipped_backoff`), not
-    /// a deliberate empty pass (`skipped_noop_cooldown`), but a **full,
-    /// apparently-healthy sweep that produced nothing** and would otherwise be
-    /// re-offered on the very next tick.
-    pub skipped_prless_retry: usize,
-    /// Issues skipped because they self-declared a `<!-- loom:recheck-interval=
-    /// <value> -->` marker (Issue #6685) and their own `updatedAt` is still
-    /// within that interval — see [`WorkItem::is_within_recheck_interval`].
-    /// Filtered out before the capacity gate, exactly like
-    /// [`skipped_noop_cooldown`](Self::skipped_noop_cooldown), but a distinct
-    /// counter: this is issue-declared policy, checked independently of and
-    /// without reading any `noop_cooldown` state.
-    pub skipped_recheck_interval: usize,
-    /// Issues skipped because their host-affinity constraint (#7456 —
-    /// `loom:host:<id>` label / `<!-- loom:requires-host=<id> -->` body
-    /// marker, see [`crate::host_affinity`]) does not name this host.
-    /// Checked before the in-flight/capacity gates, exactly like
-    /// [`skipped_recheck_interval`](Self::skipped_recheck_interval), and
-    /// carries none of a real skip label's state side effects: no claim
-    /// flip, no comment, no cooldown/backoff record — this candidate is not
-    /// actionable on this host at all, so it is never even attempted.
-    pub skipped_host_constraint: usize,
-    /// Dispatch attempts that returned an error (logged, non-fatal).
-    pub errors: usize,
-    /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
-    /// of #4028). Unlike the other counters — which are per-tick tallies — this
-    /// is a **monotonic total** read from the dispatcher(s) at tick end, so an
-    /// operator watching successive summary lines sees the baseline collision
-    /// rate accumulate. Always `0` unless collision detection is enabled
-    /// (`LOOM_DETECT_COLLISIONS` / `autonomous.collisionDetection.enabled`).
-    pub collisions: u64,
-    /// True when at least one workspace was gated this tick because the
-    /// main-health gate (Phase C, #3812) had halted its dispatch (`main` was
-    /// **verified** red — see [`crate::main_health_gate::GateOutcome`]). `seen`
-    /// still reflects the backlog depth of the halted repo(s).
-    ///
-    /// Derived directly from the shared
-    /// [`WorkspaceHealthStates`](crate::main_health_gate::WorkspaceHealthStates)
-    /// flags the gate writes (#3974 AC3), so this can never disagree with what
-    /// the gate loop reports — including when a repo's forge query fails.
-    pub halted: bool,
-    /// True when the saturation admission brake (#4903) was engaged for this
-    /// tick. Reported separately from
-    /// [`deferred_saturation`](Self::deferred_saturation) so "the host was
-    /// holding" is visible even when the backlog was empty and nothing was
-    /// deferred — otherwise a saturated host with no queued work is
-    /// indistinguishable from a healthy idle one, which is the exact reporting
-    /// gap #4903 was filed on.
-    pub saturation_held: bool,
-    /// Candidates deferred THIS TICK because they fell outside this host's
-    /// preferred repo slice while the slice still had at least one eligible
-    /// in-slice candidate (Issue #6243, [`tick_multi_with_sharding`]).
-    /// Always `0` when sharding is not configured at the call site
-    /// (`preferred_slice: None`) — see `defaults/docs/dispatcher-repo-sharding.md`.
-    /// Purely observational (mirrors [`deferred_saturation`](Self::deferred_saturation)'s
-    /// shape): these candidates are NOT lost — they remain ready and are
-    /// re-evaluated (and, if still out-of-slice with the slice non-empty,
-    /// deferred again) on the next tick.
-    pub deferred_out_of_slice: usize,
-    /// Per-issue outcomes behind the counters above (Issue #8852), recorded
-    /// by the multi-workspace tick only. See [`ready_queue`].
-    pub queue: Vec<ready_queue::TickQueueRow>,
-    /// Workspaces whose ready-issue listing failed this tick, so their
-    /// backlog is missing from [`Self::queue`] (Issue #8852).
-    pub listing_failed: Vec<usize>,
-}
 
 /// Log — at DEBUG, once per skipped candidate — that a candidate was dropped
 /// for carrying a hard-exclusion label (#7528), naming the rule.
@@ -1512,121 +1332,16 @@ pub fn tick_with_saturation_brake(
         }
         // 4. Dispatch. The registry's idempotency key + claim lock make a
         //    double-dispatch of an already-running issue a no-op / loud error.
-        match dispatcher.dispatch(item.number, item.complexity()) {
-            Ok(true) => {
-                // Issue #7482: the only place the past-tense "dispatched" line
-                // is logged — a confirmed new spawn, past every pre-spawn
-                // guard `dispatch()` runs internally.
-                log::info!("work_finder: dispatched issue #{}", item.number);
-                report.dispatched += 1;
-                occupancy += 1;
-                admitted_this_tick += 1;
-            }
-            Ok(false) => {
-                // Idempotency no-op: a sweep with the same key was already
-                // running (label-flip lag). Count as in-flight, not a new
-                // dispatch, and do not consume a capacity slot.
-                report.skipped_in_flight += 1;
-            }
-            Err(e) => {
-                // Open-PR guard refusal (#4123) is a *skip*, not a failure:
-                // attribute it to its own counter so it stays visible and
-                // distinct from a real dispatch error. Typed downcast, never a
-                // string match.
-                if let Some(open_pr) = e.downcast_ref::<OpenPrDispatchError>() {
-                    report.skipped_pr_open += 1;
-                    // #6350 AC: the log line must name the open PR, not just
-                    // gesture at "an open linked PR" — this holds regardless
-                    // of which host originally opened it, since the guard
-                    // itself is a forge (not host-local) probe.
-                    log::info!(
-                        "work_finder: skipping issue #{} — it already has an open linked PR \
-                         #{} (#4123 open-PR guard)",
-                        item.number,
-                        open_pr.pr
-                    );
-                } else if let Some(parked) = e.downcast_ref::<ParkedIssueDispatchError>() {
-                    // Park-label guard refusal (#4444). The candidate query
-                    // already filters `SKIP_LABELS`, so reaching this means the
-                    // listing was stale relative to the forge — the dispatch-time
-                    // probe is the authoritative read. Same reason as the query
-                    // filter, so it lands on the same `labeled-skip` counter
-                    // rather than on `error(s)`.
-                    report.skipped_labeled += 1;
-                    log::info!(
-                        "work_finder: skipping issue #{} — it carries `{}` on the forge \
-                         (#4444 park-label guard; the candidate listing was stale)",
-                        item.number,
-                        parked.label
-                    );
-                } else if e.downcast_ref::<DispatchBackoffError>().is_some() {
-                    // Dispatch backoff refusal (#4485) — a deliberate skip, not
-                    // a failure. Reachable even when `backed_off()` was empty at
-                    // tick start (the window can be armed mid-tick by a reap).
-                    report.skipped_backoff += 1;
-                    log::info!("work_finder: skipping issue #{} — {e}", item.number);
-                } else if e.downcast_ref::<LiveClaimDispatchError>().is_some() {
-                    // Live-claim guard refusal (#4556): a sweep process for this
-                    // issue is confirmed still running, so this candidate is
-                    // genuinely in flight — `in_flight()` just could not see it
-                    // (a reverted label, a released lock, or another daemon
-                    // instance on this host). Counted as an in-flight skip rather
-                    // than an error, but logged at WARN: reaching here means one
-                    // of those weaker signals lied, which is the #4275
-                    // duplicate-dispatch storm signature and worth an operator's
-                    // attention.
-                    report.skipped_in_flight += 1;
-                    log::warn!("work_finder: skipping issue #{} — {e}", item.number);
-                } else if e.downcast_ref::<LeaseOrderDispatchError>().is_some() {
-                    // Lease-order tie-break loss (#6287, Epic #6165 Phase 2):
-                    // this host lost a race to an earlier lease and stood
-                    // down before spawning anything. It is a deliberate
-                    // skip, not a failure — and `dispatch()` itself already
-                    // armed this issue's dispatch backoff (#6350) so the
-                    // very next tick does not immediately repeat the same
-                    // losing race, hence attributing it to the same
-                    // `skipped_backoff` counter that window governs.
-                    report.skipped_backoff += 1;
-                    log::info!("work_finder: skipping issue #{} — {e}", item.number);
-                } else if e
-                    .downcast_ref::<WorkspaceCommandsMissingDispatchError>()
-                    .is_some()
-                {
-                    // Defense in depth (#6440): the pre-loop
-                    // `workspace_commands_missing` snapshot above should have
-                    // already skipped every candidate this tick without ever
-                    // reaching `dispatch()`. Reaching here means the
-                    // condition appeared mid-tick (a race, not the steady
-                    // state) — still a deliberate skip, not a failure, so it
-                    // shares the same counter rather than inflating
-                    // `errors`.
-                    report.skipped_workspace_commands_missing += 1;
-                    log::warn!("work_finder: skipping issue #{} — {e}", item.number);
-                } else if e.downcast_ref::<TokenSelectionDispatchError>().is_some() {
-                    // Empty/unusable token pool (#4689, typed by #6614). Still a
-                    // real failure — it keeps the `errors` tally it has always
-                    // had — but named explicitly here, because the operator
-                    // remedy ("fix the pool") is completely different from any
-                    // other dispatch error, and because the registry has just
-                    // armed both brakes for it: this issue's own #4485 backoff,
-                    // and the cross-issue counter that trips the #4386/#5030
-                    // workspace hold once N DIFFERENT issues have died this way.
-                    // Without the hold this loop would re-dispatch the whole
-                    // backlog into the same dead pool every tick, forever.
-                    report.errors += 1;
-                    log::warn!(
-                        "work_finder: dispatch for issue #{} died at token selection — the token \
-                         pool is empty or every account is bad-marked (#6614): {e}",
-                        item.number
-                    );
-                } else {
-                    report.errors += 1;
-                    log::warn!("work_finder: dispatch for issue #{} failed: {e}", item.number);
-                }
-            }
+        let started = chrono::Utc::now();
+        let outcome = dispatcher.dispatch(item.number, item.complexity());
+        if record_dispatch_outcome(&mut report, item.number, started, &outcome).0 == Qd::Dispatched
+        {
+            occupancy += 1;
+            admitted_this_tick += 1;
         }
     }
 
+    report.occupancy = Some(occupancy);
     // Read the cumulative cross-host collision total AFTER the dispatch loop so
     // any collision recorded during this tick's dispatches is included (#4085).
     report.collisions = dispatcher.collisions();
@@ -2239,105 +1954,19 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             continue;
         }
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
-        match dispatcher.dispatch(cand.number, cand.complexity.as_deref()) {
-            Ok(true) => {
-                // Issue #7482 — see the single-workspace `tick` for the
-                // rationale: past-tense line only on a confirmed new spawn.
-                log::info!("work_finder: dispatched issue #{}", cand.number);
-                report.dispatched += 1;
-                ready_queue::resolve(q, &cand, Qd::Dispatched, None);
-                occupancy += 1;
-                admitted_this_tick += 1;
-            }
-            Ok(false) => {
-                report.skipped_in_flight += 1;
-                ready_queue::resolve(q, &cand, Qd::InFlight, None);
-            }
-            Err(e) => {
-                let why = Some(ready_queue::short_detail(&e.to_string()));
-                // Open-PR guard refusal (#4123) — see the single-workspace
-                // `tick` for the rationale. A skip, not a failure.
-                if let Some(open_pr) = e.downcast_ref::<OpenPrDispatchError>() {
-                    report.skipped_pr_open += 1;
-                    let pr = Some(format!("open PR #{}", open_pr.pr));
-                    ready_queue::resolve(q, &cand, Qd::OpenPr, pr);
-                    // #6350 AC: name the open PR, not just "an open linked
-                    // PR" — see the single-workspace `tick` for the rationale
-                    // (this guard is a forge probe, so it holds cross-host).
-                    log::info!(
-                        "work_finder: skipping issue #{} — it already has an open linked PR \
-                         #{} (#4123 open-PR guard)",
-                        cand.number,
-                        open_pr.pr
-                    );
-                } else if let Some(parked) = e.downcast_ref::<ParkedIssueDispatchError>() {
-                    // Park-label guard refusal (#4444) — see the single-workspace
-                    // `tick` for the rationale. A labeled-skip, not a failure.
-                    report.skipped_labeled += 1;
-                    ready_queue::resolve(q, &cand, Qd::Parked, Some(parked.label.to_string()));
-                    log::info!(
-                        "work_finder: skipping issue #{} — it carries `{}` on the forge \
-                         (#4444 park-label guard; the candidate listing was stale)",
-                        cand.number,
-                        parked.label
-                    );
-                } else if e.downcast_ref::<DispatchBackoffError>().is_some() {
-                    // Dispatch backoff refusal (#4485) — see the single-workspace
-                    // `tick` for the rationale. A skip, not a failure.
-                    report.skipped_backoff += 1;
-                    ready_queue::resolve(q, &cand, Qd::DispatchBackoff, why);
-                    log::info!("work_finder: skipping issue #{} — {e}", cand.number);
-                } else if e.downcast_ref::<LiveClaimDispatchError>().is_some() {
-                    // Live-claim guard refusal (#4556) — see the single-workspace
-                    // `tick` for the rationale. An in-flight skip, not a failure.
-                    report.skipped_in_flight += 1;
-                    ready_queue::resolve(q, &cand, Qd::InFlight, why);
-                    log::warn!("work_finder: skipping issue #{} — {e}", cand.number);
-                } else if e.downcast_ref::<LeaseOrderDispatchError>().is_some() {
-                    // Lease-order tie-break loss (#6287) — see the
-                    // single-workspace `tick` for the rationale. `dispatch()`
-                    // itself already armed this issue's dispatch backoff
-                    // (#6350), so this lands on the same `skipped_backoff`
-                    // counter that window governs.
-                    report.skipped_backoff += 1;
-                    ready_queue::resolve(q, &cand, Qd::DispatchBackoff, why);
-                    log::info!("work_finder: skipping issue #{} — {e}", cand.number);
-                } else if e
-                    .downcast_ref::<WorkspaceCommandsMissingDispatchError>()
-                    .is_some()
-                {
-                    // Defense in depth (#6440) — see the single-workspace
-                    // `tick` for the rationale. Pass 1's `commands_missing`
-                    // snapshot above should already have dropped every
-                    // candidate from this workspace; reaching here means the
-                    // condition appeared mid-tick, still a deliberate skip.
-                    report.skipped_workspace_commands_missing += 1;
-                    ready_queue::resolve(q, &cand, Qd::WorkspaceCommandsMissing, why);
-                    log::warn!("work_finder: skipping issue #{} — {e}", cand.number);
-                } else if e.downcast_ref::<TokenSelectionDispatchError>().is_some() {
-                    // Empty/unusable token pool (#6614) — see the
-                    // single-workspace `tick` for the rationale. Counted as the
-                    // real failure it is; named separately because the remedy
-                    // is the pool, not the issue, and because the registry has
-                    // just armed the per-issue backoff plus the cross-issue
-                    // counter behind the #4386/#5030 workspace hold.
-                    report.errors += 1;
-                    ready_queue::resolve(q, &cand, Qd::DispatchError, why);
-                    log::warn!(
-                        "work_finder: dispatch for issue #{} died at token selection — the token \
-                         pool is empty or every account is bad-marked (#6614): {e}",
-                        cand.number
-                    );
-                } else {
-                    report.errors += 1;
-                    ready_queue::resolve(q, &cand, Qd::DispatchError, why);
-                    log::warn!("work_finder: dispatch for issue #{} failed: {e}", cand.number);
-                }
-            }
+        let started = chrono::Utc::now();
+        let outcome = dispatcher.dispatch(cand.number, cand.complexity.as_deref());
+        let (disposition, detail) =
+            record_dispatch_outcome(&mut report, cand.number, started, &outcome);
+        ready_queue::resolve(&mut report.queue, &cand, disposition, detail);
+        if disposition == Qd::Dispatched {
+            occupancy += 1;
+            admitted_this_tick += 1;
         }
     }
 
     report.halted = any_halted;
+    report.occupancy = Some(occupancy);
     // Sum the cumulative cross-host collision totals across every workspace's
     // dispatcher (#4085), read after pass 2 so this tick's collisions count.
     report.collisions = workspaces.iter().map(|(_, d)| d.collisions()).sum();

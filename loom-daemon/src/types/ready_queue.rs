@@ -67,14 +67,19 @@ pub enum QueueDisposition {
     OpenPr,
     /// The dispatch attempt failed.
     DispatchError,
+    /// Blocked on the forge: the issue carries `loom:blocked` without
+    /// `loom:issue`, so the work finder never lists it (Issue #8957). Only in
+    /// `queue.snapshot`, added by the collector from its own cached forge
+    /// read; never a tick outcome, so it is not in [`Self::ALL`].
+    LabelledBlocked,
     /// A disposition this client does not know (forward compatibility).
     #[serde(other)]
     Unknown,
 }
 
 impl QueueDisposition {
-    /// Every known disposition, in declaration order ([`Self::Unknown`]
-    /// excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
+    /// Every disposition a work-finder tick can assign, in declaration order
+    /// ([`Self::LabelledBlocked`] and [`Self::Unknown`] excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
     /// point per entry every tick, zeros included, so an empty queue reads as
     /// `0` rather than as a missing series.
     pub const ALL: [Self; 21] = [
@@ -127,6 +132,7 @@ impl QueueDisposition {
             Self::PeerClaim => "peer_claim",
             Self::OpenPr => "open_pr",
             Self::DispatchError => "dispatch_error",
+            Self::LabelledBlocked => "labelled_blocked",
             Self::Unknown => "unknown",
         }
     }
@@ -173,6 +179,7 @@ impl QueueDisposition {
             Self::PeerClaim => "held by a peer host",
             Self::OpenPr => "blocked: open linked PR",
             Self::DispatchError => "dispatch failed",
+            Self::LabelledBlocked => "blocked: labelled loom:blocked",
             Self::Unknown => "unknown",
         }
     }
@@ -247,5 +254,10 @@ mod tests {
             assert_eq!(serde_json::to_value(d).unwrap(), serde_json::json!(d.as_str()));
         }
         assert_eq!(QueueDisposition::Unknown.as_str(), "unknown");
+        // Forge-side only (#8957): outside `ALL`, still serde-consistent.
+        let labelled = QueueDisposition::LabelledBlocked;
+        assert!(!QueueDisposition::ALL.contains(&labelled));
+        assert_eq!(serde_json::to_value(labelled).unwrap(), serde_json::json!(labelled.as_str()));
+        assert_eq!(labelled.state(), "blocked");
     }
 }

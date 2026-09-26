@@ -206,6 +206,12 @@ export function openPrNumber(row: QueueRow): number | undefined {
   return match ? Number(match[1]) : undefined;
 }
 
+/** A row's dispatch position for display. Forge-side `labelled_blocked` rows
+ * (#8957) are outside the dispatch order and carry rank 0, shown as a dash. */
+export function rankText(row: QueueRow): string {
+  return row.rank > 0 ? String(row.rank) : "–";
+}
+
 /** The reason text with its structured specifics (park label, open PR)
  * appended. */
 export function reasonText(row: QueueRow): string {
