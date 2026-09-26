@@ -77,8 +77,18 @@
 //! delegating call. It reads a lock [`lock`] never touches: the daemon's
 //! per-issue sweep-CLAIM lock (`sweep_registry::locks`), not the repo-global
 //! worktree-add mutex.
+//!
+//! Slice 7 is [`branch_conflict`]: `_handle_feature_branch_in_main_worktree`,
+//! the recovery `_try_worktree_add` falls into when `git worktree add` refuses
+//! because the target branch is already checked out in the main workspace. It
+//! is the one arm of the create path that is *pure string parsing of an
+//! arbitrary git error message* — a `grep -o … | sed 's/…//'` extraction of a
+//! quoted path, then a raw string comparison — which is #7858's class again,
+//! this time in a guard that decides whether to auto-switch a workspace
+//! rather than whether to `rm -rf` one.
 
 pub mod baseline;
+pub mod branch_conflict;
 pub mod branch_delete;
 pub mod branch_landed;
 pub mod cleanup;
