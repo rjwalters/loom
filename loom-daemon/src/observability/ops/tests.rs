@@ -251,6 +251,13 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::PoolExhaustions,
         MetricName::PoolExhaustedSeconds,
         MetricName::PoolAccountMarks,
+        MetricName::DispatchSlotTurnaround,
+        MetricName::DispatchSlotTurnaroundSamples,
+        MetricName::DispatchIdleSlots,
+        MetricName::DispatchIdleSlotSeconds,
+        MetricName::ForgeStageDwell,
+        MetricName::ForgeStageDwellSamples,
+        MetricName::ForgeStageItems,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }

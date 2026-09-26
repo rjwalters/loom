@@ -140,4 +140,6 @@ pub fn publish_tick(
     crate::observability::ops::dispatch::record_tick(report, max_concurrent, started_at);
     // #8856: queue dwell and starvation, from the same per-issue rows.
     crate::observability::ops::dwell::record_tick(report, roots, started_at);
+    // #8929: idle slots, and idle slot-seconds while ready work waited.
+    crate::observability::ops::turnaround::record_tick(report, max_concurrent);
 }
