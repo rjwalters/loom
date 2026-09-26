@@ -39,6 +39,7 @@ fn host_health_omits_built_at_when_unknown() {
         admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -82,6 +83,7 @@ fn host_health_omits_managed_repos_when_empty() {
         admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -120,6 +122,7 @@ fn host_health_omits_persistent_when_empty_but_still_carries_roles() {
         admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     });
     let value = serde_json::to_value(&record).unwrap();
     let roles = value.get("roles").unwrap();
@@ -153,6 +156,7 @@ fn host_health_omits_worktree_root_total_gb_when_unmeasurable() {
         admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -188,6 +192,7 @@ fn host_health_omits_protection_when_absent() {
         admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     });
     let value = serde_json::to_value(&record).unwrap();
     assert!(
@@ -224,6 +229,7 @@ fn host_health_free_without_total_serializes_with_no_fabricated_denominator() {
         admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     });
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(
@@ -267,6 +273,7 @@ fn host_health_omits_watchdog_provisioned_when_the_probe_could_not_answer() {
         admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     });
     let value = serde_json::to_value(&record).unwrap();
     let protection = value.get("protection").unwrap();

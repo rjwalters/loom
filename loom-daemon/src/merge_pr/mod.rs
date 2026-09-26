@@ -41,10 +41,21 @@
 //! the PR is escalated to a durable `loom:operator` hold rather than pushed
 //! at forever.
 //!
-//! [`rerun`] (#8914) runs before [`redate`]: when the merge identity has
-//! Actions: write, it re-runs the workflow runs holding the stale required
-//! checks IN PLACE, so the head SHA — and the Judge verdict — survive. It
-//! falls back to [`redate`]'s push only when the forge refuses the re-run.
+//! #8914's in-place re-run once ran before [`redate`], on the theory that
+//! re-running a workflow run keeps the head SHA and with it the Judge verdict.
+//! It was **removed in #8919**: GitHub replays a run against the ORIGINAL
+//! `GITHUB_SHA`, which for a `pull_request` run is the test merge commit built
+//! on the base already tested, so an in-place re-run re-dates the evidence
+//! without re-validating anything. Only a new `pull_request` event rebuilds the
+//! merge commit against the current base — which is exactly what [`redate`]'s
+//! tree-identical push produces.
+//!
+//! [`zero_checks`] is not a port either — it is #9091's narrowing of the
+//! #6169 zero-row settle guard inside `_wait_for_checks_then_sync_merge`:
+//! re-polling an empty check-runs rollup until `LOOM_AUTO_MERGE_TIMEOUT`
+//! elapsed was catastrophic on the case that guard meets most often (a repo
+//! with no CI configured for the changed paths), so the wait is bounded when —
+//! and only when — the base branch requires no status-check contexts.
 //!
 //! [`loom_pr_guard`] is the pre-merge `loom:pr` review-signal guard (#7419)
 //! — the OTHER half of the verdict-label story [`labels`] tells: this one
@@ -66,5 +77,5 @@ pub mod labels;
 pub mod loom_pr_guard;
 pub mod redate;
 pub mod refs;
-pub mod rerun;
 pub mod stale_checks;
+pub mod zero_checks;

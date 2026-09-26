@@ -10,6 +10,7 @@ mod complexity;
 mod daemon_event;
 mod fleet_captain;
 mod host_health_omissions;
+mod kind_registry;
 mod role_tick;
 mod session_analysis;
 mod session_summary;
@@ -168,6 +169,7 @@ fn host_health() -> TelemetryRecord {
         admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     })
 }
 

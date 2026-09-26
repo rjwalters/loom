@@ -2670,6 +2670,24 @@ Log line on action: `claim_reconciliation: cleared stale loom:pr from PR #N in
 <root> (verdict recorded for <old>, head is now <new>) — re-queued as
 loom:review-requested (#5686)`.
 
+#### Base conflicts on review-queue PRs (`loom:merge-conflict`, #8922)
+
+The per-tree companions above were only ever *stripped* here, never applied: a
+`loom:review-requested` PR whose **base** moved into a conflict carried no
+signal, so a Judge could claim a tree that cannot land. `claim_reconciliation::
+review_conflict::reconcile_review_conflicts` runs right after
+`reconcile_pr_verdicts` on the same tick and reads GitHub's `mergeable` for
+open `loom:review-requested` and `loom:merge-conflict` PRs.
+
+| Property | Behavior |
+|----------|----------|
+| Kill switch | `LOOM_REVIEW_CONFLICT_RECONCILE` (`0`/`false`/`no`/`off` disables), nested inside `LOOM_STALE_CLAIM_RECONCILE`. Defaults **ON**. |
+| `CONFLICTING` + `loom:review-requested` | Comment, then Judge's own DIRTY transition: `loom:review-requested` → `loom:changes-requested` + `loom:merge-conflict` (routes to Doctor; Judge's review-requested find-work query no longer sees it). The comment carries `<!-- loom:base-conflict flagged -->` **and** a `verdict=changes-requested` verdict-sha marker for the head, so the stale-verdict pass reads it `Fresh` and re-queues it itself once a rebase moves the head. |
+| `MERGEABLE` + `loom:merge-conflict` (no head move) | Returned to `loom:review-requested` — **only** if the newest state-changing comment is this pass's flag. A Judge's own DIRTY fallback or any later verdict is never undone here. |
+| `mergeable=UNKNOWN` | No information (GitHub computes it lazily) — no label change in either direction; re-read next tick. |
+| `loom:blocked` / `loom:operator` / `loom:operator-only` | Never touched. |
+| `loom:reviewing` / `loom:treating` | Left to the agent in flight. |
+
 ### Startup capacity seed: adopting live survivors (#6262)
 
 The passes above answer "is this *dead* claim reclaimable?". The mirror-image
@@ -2984,15 +3002,16 @@ dynamic_cap = min(disk headroom, ram headroom, configured maxConcurrent)
 ```
 
 from live inputs, so disk/RAM/backlog changes are honored without a daemon
-restart. **`configured maxConcurrent` is the one term in that `min(...)` this
-does *not* apply to (#6203):** `autonomous.workFinder.maxConcurrent` /
-`LOOM_WORK_FINDER_MAX_CONCURRENT` is resolved once at daemon bring-up and
-threaded into the loop as a frozen value — only the `disk headroom` / `ram
-headroom` terms around it are re-read live each tick. Editing the config key
-takes effect only after a daemon restart; see the `autonomous.workFinder.maxConcurrent`
-row in the config reference table (below, under "Config surface") for the
-full mechanism and the startup log line that names the resolved value and its
-source (env / config / default).
+restart. Since #9060 that includes **`configured maxConcurrent`**: the loop
+re-reads `autonomous.workFinder.maxConcurrent` from the primary workspace's
+effective config every tick, so an edit (committed `.loom/config.json`, or
+host-local `.loom-local/local.json`) takes effect on the next tick with no
+restart and no effect on in-flight sweeps. **The `LOOM_WORK_FINDER_MAX_CONCURRENT`
+env override is the exception**: it lives in the daemon's process environment,
+fixed at launch, so while it is set it shadows config until a restart (the
+daemon logs `maxConcurrent=N is IGNORED` when a config edit is shadowed). See
+the `autonomous.workFinder.maxConcurrent` row in the config reference table
+(below, under "Config surface").
 
 > **This cap bounds SWEEP dispatch only (#6102).** Role-runner agents
 > (Curator / Judge / Doctor / Champion / Guide / …) are spawned by the role
@@ -3342,7 +3361,7 @@ concurrent), admitted entirely outside `min(disk, ram, maxConcurrent)`.
 | Config | `autonomous.roleRunner.maxConcurrent` |
 | Env | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` |
 | Default | the count of interval-cadence default roles (`role_runner::default_max_concurrent`) — **7** today |
-| Precedence | env > config > default, re-read every tick (a config edit hot-applies, unlike `maxConcurrent`) |
+| Precedence | env > config > default, re-read every tick (a config edit hot-applies, as `workFinder.maxConcurrent` does since #9060) |
 | Scope | **process-wide across every managed workspace**, because the resource it protects (host CPU/RAM) is shared by all of them |
 
 Design notes:
@@ -3624,11 +3643,11 @@ therefore ramps up over several ticks instead of bursting in one — each
 subsequent tick re-samples CPU/disk/token headroom fresh, so a ramp that turns
 out to be too aggressive self-corrects within one interval (default 60s)
 rather than in one uncontrolled burst. Resolved with the standard precedence
-**env > config > default**, single-root, at daemon startup — the same
-startup-capture pattern as `maxConcurrent`: the ramp
-cap's whole purpose is to smooth admission *within* the live per-tick
-re-computation of `max_concurrent`, so the knob itself does not need to be
-live; retuning it takes effect on the next daemon restart.
+**env > config > default**, single-root, at daemon startup — a
+startup-capture pattern `maxConcurrent` no longer shares (it hot-applies
+since #9060). The ramp cap's whole purpose is to smooth admission *within*
+the live per-tick re-computation of `max_concurrent`, so the knob itself does
+not need to be live; retuning it takes effect on the next daemon restart.
 
 #### `dispatch_sweep` headroom advisory (#4234)
 
@@ -4165,8 +4184,8 @@ knobs not yet audited here.
 | `autonomous.model` | *(per-dispatch `dispatch_sweep` `model` param)* | `sonnet` | Model pinned on **every** daemon-dispatched child (work-finder, epic supervisor, and `dispatch_sweep` when its `model` param is absent). See below (#3944) |
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop. **Restart required** — read once, before the loop is spawned; flipping it in config alone does not start/stop an already-running daemon's loop (#5963) |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
-| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Restart required** — `resolve_max_concurrent_with_config` runs once during bring-up and the resulting `configured_max` is threaded into the loop as a frozen value; the per-tick `dynamic_cap` recomputes only its `disk`/`ram` headroom terms around that fixed operator ceiling, so retuning this key in config alone changes nothing until the daemon restarts (#5963). The `work_finder: enabled (multi-workspace, …)` startup log line names the resolved value and which layer supplied it — `source=env`/`config`/`default` (#6203) — so an operator can confirm a config edit will actually take effect on the next restart without waiting for a tick. See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
-| `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the dynamic cap. Zero/invalid → default; resolved once at startup, the same startup-capture pattern as `maxConcurrent`. **Restart required** to pick up a change (#5963) |
+| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
+| `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the dynamic cap. Zero/invalid → default; resolved once at startup — a startup-capture pattern `maxConcurrent` no longer shares (it hot-applies since #9060). **Restart required** to pick up a change (#5963) |
 | `autonomous.workFinder.saturationBrake.enabled` | `LOOM_ADMISSION_BRAKE` | `true` | Saturation admission brake on/off (#4903). A safety backstop — **defaults on**. Holds *new* admissions while the host is already saturated; never preempts a running sweep. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Restart required** — resolved once at startup and registered as a process-global handle alongside the host breaker (#5963). See [Saturation admission brake](#saturation-admission-brake-4903) below |
 | `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip. **Restart required** — same startup-resolved global as `enabled` above (#5963) |
 | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` | Seconds of continuous held+0-in-flight before the `WARN`-level `STARVING` log fires once per streak (#5715). `<= 0`/invalid → default. See [Starvation escape hatch](#starvation-escape-hatch-5715) |
@@ -5551,9 +5570,15 @@ cross-process arm reporting; #8901 closed both gaps.
 (`autonomous.ciTelemetry.enabled`) now re-evaluates
 `fleet_captain::arm_singleton_job("ci-telemetry-poll", …)` every tick and
 skips the cycle when refused — a genuine "forge-wide queue check" (one GitHub
-Actions org, exactly one poller) in this module's own example vocabulary. A
-multi-host fleet that enables `ciTelemetry` must now also declare
-`fleet.captain`, or the poller runs nowhere; see
+Actions org, exactly one poller) in this module's own example vocabulary.
+**Any host that enables `ciTelemetry`, single-host setups included, must now
+also declare `fleet.captain`, or the poller runs nowhere.** The original note
+here said "multi-host fleet", which was wrong: `NoCaptainDeclared` refuses on
+every host (#9014). The refusal is not silent: each refused tick is recorded
+in `.loom/state/ci-telemetry/status.json`, so `ci-telemetry status` reads
+`refused` with the reason; a no-captain refusal also appears in
+`host.health.captainless_singleton_jobs` and as a non-green `ci_telemetry`
+section in `loom-daemon health`. See
 `defaults/docs/ci-observability.md`'s "Multiple hosts" note for the full
 migration rationale (this replaced an earlier "runs on every host, dedup by
 stable record identity" posture — that dedup stays as a second line of
@@ -5565,10 +5590,14 @@ process-lifetime registry `arm_singleton_job` maintains for in-daemon jobs —
 recording there would be written and lost in the same breath (`cli/fleet_captain_cmd.rs`'s
 `evaluating_does_not_touch_the_armed_registry` test still pins that `evaluate()`,
 the pure gate check, never touches either registry). Instead, `FleetCaptainArgs::run`
-calls `fleet_captain::record_shell_arm` on the **armed** path, writing
+calls `fleet_captain::record_shell_arm` on the **armed** path (and, since
+#9014, `forget_shell_arm` on a **refused** one, so a captain handoff clears
+the old captain's record at its next check instead of leaving a false
+"armed on a non-captain host" flag for up to the TTL), writing
 `<root>/.loom/state/fleet-captain/armed.json` (never git-tracked — same
 per-host-runtime-state class as `.loom/state/ci-telemetry/`): job name →
-`last_armed_at`. `sample_host_health` merges this file (via
+`last_armed_at`. Updates to that file hold an `flock` on the sibling
+`armed.lock` (#9014), so concurrent checks on one host cannot drop an entry. `sample_host_health` merges this file (via
 `fleet_captain::armed_singleton_job_names_for_host`) with the in-process
 registry into one `armed_singleton_jobs` list, so a shell-driven arm now
 reaches `host.health` — and the dashboard's "singleton armed on a
@@ -6543,6 +6572,80 @@ re-walk `.loom/claude-config/*/tmp` every 60 seconds.
 | `LOOM_SCRATCH_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.scratchReclaim.minIntervalSecs` | env > config > default | `1800` (30 min) |
 
 See `loom-daemon/src/scratch_reclaim.rs`.
+
+#### Guarded native-harness launch state reclaim (#8650, dedup + path fix #8693)
+
+**What was leaking.** Every guarded native harness launch (pi / opencode /
+kimi) gets a fresh UUID-named state directory under
+`~/.local/state/loom/native-tools/<workspace-hash>/<launch-uuid>` (or under
+`$LOOM_NATIVE_TOOLS_DIR`), and nothing removes one on its own: `State` has no
+`Drop`, and the launch chain `exec()`s all the way into the harness binary — no
+parent process survives to clean up after a session. That directory's reclaim
+is `native_tools::provision::reap`'s job (#8663) — pid-liveness-aware, and
+already running at the start of the next launch for the same workspace, plus
+`loom-daemon clean`. This pass adds the missing periodic case: an idle
+workspace that stops launching new sessions never triggers either of those, so
+`worktreeReaper`'s 15-minute host tick also calls `reap::reap_base` directly.
+**This tick is the only extra logic for that directory shape** — an earlier
+revision of this pass reimplemented its own age-only sweep of the same
+directories, which raced `reap`'s liveness-aware one and could delete a live,
+idle session's state that `reap` deliberately keeps (#8693 review). One
+directory shape, one reaper.
+
+On top of that, a `bun --compile` harness (OpenCode) extracts its ~5.5 MB
+embedded native addon into the OS temp directory on every launch under a fresh
+`.<hash>-0000000N.{so,node}` name. One worker accumulated **7.6 GB across
+1,382 files in 40 hours** of scheduled role-runner ticks this way, contributing
+to a live ENOSPC outage. `State::configure` pins `TMPDIR` so the extract lands
+somewhere attributable instead — but **not** inside the launch's own state
+directory. `<state-base>/<64-hex-sha256>/<uuid>/tmp` runs to roughly 148 bytes
+on a typical host, past the 108-byte (Linux) / 104-byte (macOS)
+`sockaddr_un.sun_path` limit once a socket file name is appended — which broke
+anything the harness ran that bound a Unix socket under the inherited `TMPDIR`
+(`cargo test`, Python multiprocessing, Node IPC; #8693 review). `TMPDIR` is
+pinned instead at a fixed short root, `pinned_tmp_base()` (`/tmp/loom-nt` on
+Unix) joined with the launch's own uuid — constant-length regardless of
+`$HOME`.
+
+**Reclaiming the pinned `TMPDIR` companion needs no age or liveness policy of
+its own.** A pinned-`TMPDIR` entry can only exist for a launch whose session
+directory was created first, so once that session directory is gone (`reap`'s
+own liveness check having already decided so), the companion is unconditionally
+orphaned and is removed on the next tick — no separate `maxAgeHours` gate, and
+so no "`maxAgeHours: 0` deletes a live session's temp files" footgun to guard
+against either.
+
+**Cadence.** A host-level sibling pass on the 15-minute `worktree_reaper` tick,
+alongside the docker-image and tmpfs passes, with a **host-wide** (not
+per-repo) 30-minute cooldown — both directories this pass reclaims live outside
+any one repo, so a multi-repo host must not re-walk them once per repo.
+
+```json
+{
+  "autonomous": {
+    "worktreeReaper": {
+      "nativeStateReclaim": {
+        "enabled": true,
+        "minIntervalSecs": 1800
+      }
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_NATIVE_STATE_RECLAIM` | `autonomous.worktreeReaper.nativeStateReclaim.enabled` | env > config > default | `true` (on) |
+| `LOOM_NATIVE_STATE_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.nativeStateReclaim.minIntervalSecs` | env > config > default | `1800` (30 min) |
+
+`LOOM_NATIVE_TOOLS_DIR` (also honored by `native_tools::provision::state`)
+relocates the session-state base this pass sweeps with `reap::reap_base`; a
+host that sets it only in a launch's own environment — not the daemon's — gets
+the default base swept here instead, since the reclaim tick runs in the
+daemon's process. `LOOM_NATIVE_PINNED_TMPDIR_BASE` is a test-only override for
+the pinned-`TMPDIR` root; production hosts use the fixed default.
+
+See `loom-daemon/src/native_state_reclaim.rs`.
 
 #### `pr-<N>` worktrees are reaped too (#5939)
 
@@ -9926,6 +10029,28 @@ The exporter only ever originates outbound HTTP POSTs; it never parses a
 response body for anything beyond a batch-accepted/rejected status, and
 nothing received over this channel ever mutates daemon state — steering
 (dispatch/cancel/pause) stays with MCP, per the epic's explicit scope.
+
+### Export liveness is first-hop only (#9015)
+
+`loom-daemon status`'s `Observability:` line, `.observability_export` /
+`.observability_exports.<name>` in `status --json`, and the (anomaly-only)
+`observability` section of `loom-daemon health` all measure **one hop**: did the
+configured `observability.endpoint` acknowledge the batch this daemon POSTed?
+Nothing past that endpoint is observable from here, so `state: "healthy"` must
+never be read as "the data is in the backend". Every record therefore carries
+`scope: "first_hop"`, the human line reads `OK (first hop only)`, and
+`endpoint_loopback: true` marks an endpoint that resolves to this machine
+(`127.0.0.0/8`, `::1`, `localhost`) — i.e. a local edge collector that forwards
+onward, where the acked hop proves least of all. Both fields are derived from
+`endpoint`, never configured, and the renderers re-derive them so a payload from
+a pre-#9015 daemon still reports the caveat.
+
+**With an edge collector, pair this with an external end-to-end check** — a
+backend read-back canary, or the collector's own
+`otelcol_exporter_send_failed_*` counters on its `:8888` telemetry endpoint. A
+daemon reported `healthy` for 30h+ while a local collector accepted every POST
+and dropped it; the full incident, the state table and the recommended checks
+are in [`observability.md` §3b](observability.md#3b-confirming-telemetry-is-actually-flowing).
 
 ## Fleet dashboard (`loom-daemon serve`)
 

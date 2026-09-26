@@ -167,7 +167,7 @@ jobs:
       promote: ${{ steps.resolve.outputs.promote }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -334,7 +334,7 @@ jobs:
             cross: true
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.tag || github.ref }}
 
@@ -363,8 +363,9 @@ jobs:
           echo "OK: build host glibc is within the documented floor."
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       # dtolnay/rust-toolchain's `targets:` input installs the target onto
@@ -382,11 +383,16 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             .
-          key: ${{ matrix.target }}
+          # Include the runner image (#9036): rust-cache's automatic key has
+          # runner.os ("Linux") but not the image version, so after #8899
+          # pinned these legs to ubuntu-22.04 they restored a target dir built
+          # on ubuntu-24.04 (glibc 2.39) and failed to link its C objects
+          # against glibc 2.35 (undefined __isoc23_sscanf/__isoc23_strtol).
+          key: ${{ matrix.target }}-${{ matrix.os }}
 
       - name: Install cross-compilation toolchain
         if: matrix.cross
@@ -571,7 +577,7 @@ jobs:
 
       - name: Install cosign
         if: steps.signing.outputs.linux_sign == 'true'
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
 
       - name: Sign Linux artifact (cosign)
         if: steps.signing.outputs.linux_sign == 'true'
@@ -754,7 +760,7 @@ jobs:
 
       - name: Upload artifacts (for manual runs)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: loom-daemon-${{ matrix.target }}
           # Mirror the "Upload release assets" file list above, including the
@@ -960,7 +966,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.tag || github.ref }}
 
@@ -1001,14 +1007,14 @@ jobs:
 
       - name: Download loom-daemon build artifact - amd64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
           path: dist
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
           path: dist
@@ -1032,13 +1038,13 @@ jobs:
       # emulation on this amd64 runner — there is no native arm64 GitHub
       # Actions runner assumption here.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1055,7 +1061,7 @@ jobs:
       # every fork, so the Dockerfile itself is validated regardless of
       # whether this run is allowed to push.
       - name: Build loom-worker image (native amd64, for smoke test)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/worker/Dockerfile
@@ -1082,7 +1088,7 @@ jobs:
       # manual Apple-Silicon verification this still requires).
       - name: Build and push multi-arch loom-worker image
         if: needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom'
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/worker/Dockerfile
@@ -1120,7 +1126,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.tag || github.ref }}
 
@@ -1152,14 +1158,14 @@ jobs:
 
       - name: Download loom-daemon build artifact - amd64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
           path: dist
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
           path: dist
@@ -1174,13 +1180,13 @@ jobs:
           cp dist/loom-daemon-aarch64-unknown-linux-gnu dist/loom-daemon-linux-arm64
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1194,7 +1200,7 @@ jobs:
       # deliberately, same reason as that job: `buildx build --load` cannot
       # produce a multi-platform result.
       - name: Build loom-worker base image (local, for FROM)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/worker/Dockerfile
@@ -1205,7 +1211,7 @@ jobs:
             ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
 
       - name: Build loom-worker-session image (native amd64, for smoke test)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/session/Dockerfile
@@ -1233,7 +1239,7 @@ jobs:
       # has no arm64 base image to offer the arm64 leg at all).
       - name: Build and push multi-arch loom-worker-session image
         if: needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom'
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/session/Dockerfile
@@ -1273,7 +1279,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.tag || github.ref }}
 
@@ -1301,14 +1307,14 @@ jobs:
 
       - name: Download loom-daemon build artifact - amd64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
           path: dist
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
           path: dist
@@ -1323,20 +1329,20 @@ jobs:
           cp dist/loom-daemon-aarch64-unknown-linux-gnu dist/loom-daemon-linux-arm64
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build loom-worker base image (local, for FROM)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/worker/Dockerfile
@@ -1347,7 +1353,7 @@ jobs:
             ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
 
       - name: Build loom-worker-native image (native amd64, for smoke test)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/native/Dockerfile
@@ -1365,7 +1371,7 @@ jobs:
 
       - name: Build and push multi-arch loom-worker-native image
         if: needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom'
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/native/Dockerfile

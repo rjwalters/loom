@@ -399,6 +399,7 @@ fn daemon_ci_log_attribute_containers() -> BTreeMap<String, &'static str> {
         started_at: at,
         completed_at: at,
         duration_ms: 0,
+        queued_ms: Some(0),
     };
     let job = CiJobRecord {
         repo: "2amlogic/example".into(),

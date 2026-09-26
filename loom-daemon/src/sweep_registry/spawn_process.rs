@@ -174,6 +174,20 @@ impl SweepRegistry {
             &mut cmd,
             &self.config.workspace_root,
             sweep_id,
+            match kind {
+                SweepKind::Issue(issue) => Some(*issue),
+                SweepKind::PrSet(_) => None,
+            },
+        );
+        // #9027: stamp the sweep's commits with the D33 provenance trailers
+        // (a git-env hooksPath override that chains to the repo's own hooks).
+        crate::provenance::hooks::prepare_child(
+            &mut cmd,
+            &self.config.workspace_root,
+            match kind {
+                SweepKind::Issue(issue) => Some(*issue),
+                SweepKind::PrSet(_) => None,
+            },
         );
         // #8908: let the transcript-ingest pass join this issue's
         // `session.summary` logs to the execution's trace.

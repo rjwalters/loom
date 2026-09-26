@@ -2,8 +2,10 @@
 
 > Epic #4702, Phase 1 — the versioned telemetry record schema the fleet
 > observability pipeline is built on. Defined in Rust in
-> `loom-daemon/src/telemetry/` (`mod.rs` — record kinds + envelope;
-> `visibility.rs` — the repo-visibility derivation helper). This document is the
+> `loom-daemon/src/telemetry/` (`kinds.rs` — the one-row-per-kind registry that
+> generates the record enum, its wire tags, and each kind's gate version;
+> `mod.rs` — the record payload structs + envelope; `visibility.rs` — the
+> repo-visibility derivation helper). This document is the
 > **format-independent reference** so the Phase-2 Workers/TypeScript backend can
 > parse the wire format without the Rust types.
 
@@ -42,7 +44,7 @@ Every record is transmitted inside a versioned envelope:
 
 | Field            | Type              | Notes |
 |------------------|-------------------|-------|
-| `schema_version` | integer (`u32`)   | Current value: **2** (`CURRENT_SCHEMA_VERSION`) — bumped from `1` by Issue #8056's new `role_tick.outcome` record kind. |
+| `schema_version` | integer (`u32`)   | **Per record kind**, not per daemon build: the kind's declared gate (`gate:` in `loom-daemon/src/telemetry/kinds.rs`). **2** (`CURRENT_SCHEMA_VERSION`) for the eight kinds that never pinned their own — bumped from `1` by Issue #8056's new `role_tick.outcome` record kind — and the pinned value otherwise (`3`…`11`; see Version history). Every kind added after #8921 carries **12**. |
 | `emitted_at`     | RFC 3339 datetime | When the daemon produced the envelope. |
 | `host_id`        | string            | Stable identifier for the emitting host. Opaque to the schema. |
 | `record`         | object            | The record payload, internally tagged on `kind` (see below). |
@@ -75,6 +77,14 @@ only on a **breaking** wire change to the record shapes below. A backend should:
 | `9` | Adds `ci.job.log` (#8825); only job-log chunk envelopes use `9`. | Every earlier kind's version and shape is unchanged — including the phase-1 CI family at `8`, so a backend that is not ready to ingest free-text log bodies can refuse exactly this kind without losing run/job/duration telemetry. |
 | `10` | Adds `metric.points` (#8860); only those envelopes use `10`. OTLP-only — the native HTTPS exporter never sends it. The `loom.dispatch.tick` span reuses `trace.span` at `3`. | Every earlier kind's version and shape is unchanged — including `ci.job.log` at `9`. |
 | `11` | Adds `queue.snapshot` (#8852 phase 2); only those envelopes use `11`. Native-HTTPS only — the OTLP exporter never sends it (SigNoz gets the queue as `loom.queue.*` gauges in `metric.points`). | Every earlier kind's version and shape is unchanged. Workers older than phase 3 store it as an unknown kind, and `/public/*` shows it as `kind` only. |
+| `12` | **Every record kind added after #8921**, collectively — not one kind. `12` is `NEW_KIND_SCHEMA_VERSION` in `loom-daemon/src/telemetry/kinds.rs`, the value a new kind's registry row declares symbolically instead of claiming the next free integer. | Every earlier kind's version and shape is unchanged, exactly as for `3`–`11`. **A backend that must refuse one specific post-#8921 kind gates on the `kind` tag, not on `12`** — the tag is always unique (enforced by the `kind_registry` tests), while `12` is shared. Only a kind whose *content* is risky enough to deserve a version-level gate of its own (the `ci.job.log` free-text precedent at `9`) pins a fresh number, and then it adds its own row here. |
+
+**This table no longer grows per kind** (#8921). Versions `1`–`11` were allocated
+one-per-kind by hand, each PR taking "the next number" from a single `match` arm
+in `envelope.rs` — which made every pair of concurrent record-kind PRs conflict
+on that one line by construction (#8915 vs #8909, 2026-09-25). Row `12` is the
+terminal row for that practice: a new kind declares
+`gate: NEW_KIND_SCHEMA_VERSION` in its registry row and appends nothing here.
 
 ## `/ingest` response (the bound-`host_id` echo)
 
@@ -145,18 +155,55 @@ frozen SSE `sweep.*` topic vocabulary where they overlap, plus the epic's added
 kinds. Records that reference a repository carry `repo` + `visibility`; host-level
 records (`tokens.snapshot`, `host.health`) do not.
 
-| `kind` | Scope | Emitted per |
-|---|---|---|
-| `sweep.started` / `sweep.phase` / `sweep.completed` | repo | sweep lifecycle moment |
-| `sweep.outcome` | repo | terminal sweep transition |
-| `sweep.identity` | repo | active launch identity becomes known |
-| `role_tick.outcome` | repo | role-runner tick (Issue #8056) |
-| `session.summary` | repo | ingested transcript (session or subagent, Issue #8757) |
-| `tokens.snapshot` / `host.health` | host | sampling interval |
-| `ci.run` / `ci.job` / `ci.duration` | repo | completed GitHub Actions run attempt / job (Issue #8824) |
-| `ci.job.log` | repo | one ≤ 8 KiB chunk of a completed job's log (Issue #8825) |
-| `metric.points` | host | daemon-loop operational sample — work-finder tick, host resources (Issue #8860; OTLP-only) |
-| `queue.snapshot` | host (rows are repo-tagged) | work finder's ranked ready queue, on the `host.health` interval when a new tick exists (Issue #8852; native-HTTPS only) |
+**The authoritative list of kinds is the registry**,
+`loom-daemon/src/telemetry/kinds.rs` — one row per kind carrying its wire tag,
+payload type, gate version, OTLP routing class, and whether the native HTTPS
+`/ingest` backend accepts it, plus a prose description. That file *generates* the
+Rust enum and the wire tags, so it cannot drift from what a daemon emits; the
+`TELEMETRY_KINDS` constant is the same table at runtime. There is deliberately no
+second hand-maintained index of the kind set here (#8921 removed the one that
+was): each kind's own `###` section below is its reference, and two concurrent
+PRs adding two kinds no longer append to a shared table row.
+
+### Adding a record kind (the registration contract, #8921)
+
+Adding a kind used to mean editing four shared files at adjacent lines — the enum
+variant and its `#[serde(rename)]`, a `pub mod` / `pub use` pair, a hand-assigned
+`schema_version` match arm, two exhaustive OTLP routing chains, and two tables in
+this document. Any two concurrent additions were unmergeable even when both were
+correct. The contract now is:
+
+1. **One row in `loom-daemon/src/telemetry/kinds.rs`** — the only shared line.
+   That row generates the enum variant, the wire tag, the gate version, the OTLP
+   routing class, and the native-ingest scope. The file is marked `merge=union`
+   in `.gitattributes`, so two branches that each append a row merge cleanly
+   instead of conflicting (asserted against real `git` by
+   `telemetry::tests::kind_registry::two_branches_each_adding_a_record_kind_merge_cleanly`).
+2. **`gate: NEW_KIND_SCHEMA_VERSION`** — never a fresh integer. See the Version
+   history note above.
+3. **Payload struct in its own module** — a new family belongs at
+   `telemetry/kinds/<family>.rs`, declared in the registry file (not in
+   `telemetry/mod.rs`), so it costs no shared line either.
+4. **OTLP field mapping, if any, in its own sibling module**
+   (`observability/otlp/mapping/<family>.rs`). `mapping.rs` reads the declared
+   routing class; it has no per-kind bookkeeping arm to append to.
+5. **This document**: a new `### <kind>` section for the record's fields. That is
+   a new block, not a row inside a shared table — and a kind with a large field
+   reference may instead ship its own `defaults/docs/telemetry-kind-<kind>.md`
+   file (symlinked into `.loom/docs/` like every other shipped doc) and link it
+   from its section here, which costs zero shared lines.
+
+**What `merge=union` does and does not buy you.** The attribute is read by the
+`git` that performs the merge, so it applies to every merge, rebase or
+`git pull` you run locally and to the merge commit `merge-pr.sh` produces — the
+row append resolves itself, with no hand-editing. It is **not** a guarantee that
+the forge's *mergeability indicator* will stay green: a forge is free to compute
+that status with a plain three-way merge and show `CONFLICTING`. If it does, the
+fix is a `git merge origin/main` in the worktree, which under this attribute
+produces both rows and needs no conflict resolution — the cost is one push, not
+a rebase cycle spent reconstructing two hand-maintained ladders. Reducing the
+*work* a collision costs is the goal; the `kind_registry` merge test asserts
+exactly that property against real `git`.
 
 ### `sweep.started`
 
@@ -703,7 +750,7 @@ On the OTLP path this maps to a log record (severity `Info`) with
 `loom.*` privacy allowlist.
 
 **Trace join (Issue #8908).** When a traced sweep dispatches, the daemon
-writes a local join entry (`.loom/logs/trace-joins/<trace-id>.json`: issue,
+writes a local join entry (`.loom/logs/trace-joins/<trace-id>-<span-id>.json`: issue,
 root trace context, dispatch time; closed at the terminal transition). The
 ingest pass stamps a summary's envelope `trace_context` (the OTLP log's trace
 and span id) with that execution's root context when **exactly one** entry
@@ -1342,8 +1389,14 @@ in `daemon-reference.md` for the full design:
   call resolved `Armed` here). Omitted/empty on a host that is not the
   captain, on a host with no declared singleton jobs at all, and on a record
   from a pre-#8848 daemon.
+- `captainless_singleton_jobs` (#9014) — in-daemon singleton-job names whose
+  most recent gate check was refused because **no** `fleet.captain` is
+  declared at all, so the job runs on no host (e.g. `["ci-telemetry-poll"]`
+  on a host with `autonomous.ciTelemetry.enabled` and no captain). A routine
+  not-this-host refusal is not listed. Omitted when empty. It is not yet on
+  the public redaction allowlist, so the public view drops it.
 
-Both fields are additive (no `schema_version` bump) and pass through public
+`is_captain` and `armed_singleton_jobs` are additive (no `schema_version` bump) and pass through public
 redaction unchanged (`dashboard/src/redaction.ts`): `is_captain` describes
 this host's own role in an operator-assigned fleet-wide designation, and a
 singleton job name is an allowlisted identifier a repo declares — the same

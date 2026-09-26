@@ -60,6 +60,19 @@
 //! files nobody in that PR was thinking about). Both shipped; option (3)
 //! (branch ruleset requiring up-to-date branches) was rejected as forcing a
 //! rebase per merge at a cadence this fleet would pay constantly.
+//!
+//! # The time rule is the FALLBACK now (#8919)
+//!
+//! The rule above is stated in terms of *when* a check ran, and that is wrong
+//! in both directions on a busy `main`: an unrelated base move makes a correct
+//! result look stale, and a re-run makes a genuinely stale result look fresh
+//! (GitHub replays the ORIGINAL test merge commit, so a re-run re-tests the
+//! OLD base — verified 2026-09-25). [`inputs`] replaces it with an
+//! **input-scoped** predicate keyed on the base the check actually tested.
+//!
+//! [`assess`] (the time rule) remains the exact behaviour whenever that
+//! evidence is unavailable, and [`assess_scoped`] says so on stderr rather than
+//! degrading silently.
 
 use chrono::{DateTime, Utc};
 
@@ -85,9 +98,13 @@ pub struct CheckRun {
     /// When the run started; `None` until it has.
     pub started_at: Option<DateTime<Utc>>,
     /// The GitHub Actions workflow run this check belongs to, when it is an
-    /// Actions job (`None` for any other app). The freshness verdict ignores
-    /// it; it is what the in-place re-run remedy (#8914) re-runs.
+    /// Actions job (`None` for any other app).
     pub actions_run_id: Option<u64>,
+    /// The GitHub Actions **job** this check run is, when it is one — the id
+    /// whose log carries the `Merge <head> into <B>` line that gives the
+    /// input-scoped predicate its tested base (#8919). `None` for any other
+    /// app, which is one of the fallback-to-the-time-rule cases.
+    pub actions_job_id: Option<u64>,
 }
 
 impl CheckRun {
@@ -105,11 +122,22 @@ pub enum Verdict {
     /// pending, absent, or non-green — nothing stale is being trusted.
     Fresh,
     /// A required check's green run predates the base tip: merging would trust
-    /// evidence about a tree that no longer exists.
+    /// evidence about a tree that no longer exists. The **time rule** — used
+    /// only where the input-scoped evidence of [`inputs`] is unavailable.
     Stale {
         check: String,
         started_at: DateTime<Utc>,
         base_tip: DateTime<Utc>,
+    },
+    /// The input-scoped verdict (#8919): the base moved, since the base this
+    /// check actually tested, in a way that can change what the check would
+    /// say about the merged tree. Independent of when the run happened, so an
+    /// in-place re-run cannot clear it.
+    StaleInputs {
+        check: String,
+        /// `B` — the base the check's run tested.
+        tested_base: String,
+        reason: inputs::StaleReason,
     },
     /// A timestamp this decision depends on could not be determined. The
     /// caller must refuse the merge (fail closed), with the reason.
@@ -171,6 +199,137 @@ pub fn assess(base_tip: DateTime<Utc>, required: &[String], runs: &[CheckRun]) -
     }
 }
 
+/// The input-scoped assessment (#8919), with the time rule as a per-context
+/// fallback.
+///
+/// For each required context holding green evidence:
+///
+/// - **`B`, `D` and `P` all available** (an entry in `scoped.base_moves`) →
+///   [`inputs::stale_reason`] decides, and the timestamps are irrelevant. This
+///   is what makes an unrelated base move fresh AND keeps a re-run from
+///   laundering a genuinely stale result.
+/// - **otherwise** → [`assess`]'s `started_at < base_tip` rule, unchanged, plus
+///   a warning naming the context and why its evidence was unusable. The caller
+///   MUST print those warnings (`Warning:` on stderr): a relaxation nobody can
+///   see is how a fail-open ships unnoticed.
+///
+/// Returns `(verdict, warnings)`. Contexts are examined in sorted order, so the
+/// reported verdict is a function of the evidence alone.
+#[must_use]
+pub fn assess_scoped(
+    base_tip: DateTime<Utc>,
+    required: &[String],
+    runs: &[CheckRun],
+    scoped: Option<&inputs::ScopedEvidence>,
+) -> (Verdict, Vec<String>) {
+    let mut required_sorted: Vec<&String> = required.iter().collect();
+    required_sorted.sort();
+    required_sorted.dedup();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut unknown: Option<String> = None;
+    let mut stale: Option<Verdict> = None;
+
+    for ctx in required_sorted {
+        let Some(run) = latest_run(runs, ctx) else {
+            continue; // Nothing green to re-validate; the forge owns absence.
+        };
+        if !run.is_completed_success() {
+            continue; // Pending/red evidence never gets *staler* trust.
+        }
+
+        if let Some(mv) = scoped.and_then(|s| s.base_moves.get(ctx)) {
+            // A composite context (#9065) is stale iff any component is; the
+            // refusal names the component so the operator knows which gate.
+            let (check, reason) = match inputs::specs_for(ctx) {
+                Some(specs) => {
+                    match inputs::composite_stale_reason(&specs, &mv.files, &scoped_delta(scoped)) {
+                        Some((component, r)) if specs.len() > 1 => {
+                            (format!("{ctx} ({component})"), Some(r))
+                        }
+                        Some((_, r)) => ((*ctx).clone(), Some(r)),
+                        None => ((*ctx).clone(), None),
+                    }
+                }
+                // Fail closed: an unmapped required context's inputs are
+                // unknown, so any base move at all makes its verdict unknown.
+                None => ((*ctx).clone(), inputs::unknown_check_reason(&mv.files)),
+            };
+            if let Some(reason) = reason {
+                if stale.is_none() {
+                    stale = Some(Verdict::StaleInputs {
+                        check,
+                        tested_base: mv.tested_base.clone(),
+                        reason,
+                    });
+                }
+            }
+            continue;
+        }
+
+        // No usable B/D/P for this context: today's rule, said out loud.
+        let why = scoped
+            .and_then(|s| s.fallbacks.get(ctx).cloned())
+            .unwrap_or_else(|| "no input-scoped evidence was gathered for this PR".to_string());
+        warnings.push(format!(
+            "required-check freshness guard (#8919): falling back to the #8248 started_at time \
+rule for '{ctx}' — {why}. The time rule refuses any base move, related or not, and cannot tell \
+an in-place re-run from fresh evidence."
+        ));
+        let Some(started) = run.started_at else {
+            if unknown.is_none() {
+                unknown = Some(format!(
+                    "required check '{ctx}' is green on this head but reports no started_at, so \
+its freshness cannot be determined"
+                ));
+            }
+            continue;
+        };
+        if started < base_tip && stale.is_none() {
+            stale = Some(Verdict::Stale {
+                check: (*ctx).clone(),
+                started_at: started,
+                base_tip,
+            });
+        }
+    }
+
+    let verdict = match (stale, unknown) {
+        (Some(v), _) => v,
+        (None, Some(why)) => Verdict::Unknown(why),
+        (None, None) => Verdict::Fresh,
+    };
+    (verdict, warnings)
+}
+
+/// `P`, or an empty set when no evidence was gathered (unreachable from
+/// [`assess_scoped`]'s scoped branch, which only runs with `scoped` present).
+fn scoped_delta(scoped: Option<&inputs::ScopedEvidence>) -> inputs::FileSet {
+    scoped.map(|s| s.pr_delta.clone()).unwrap_or_default()
+}
+
+/// The input-scoped refusal (#8919): names the check, the base it actually
+/// tested, and which clause fired — never a timestamp, because timing is not
+/// what makes it stale.
+#[must_use]
+pub fn stale_inputs_message(
+    pr: &str,
+    check: &str,
+    tested_base: &str,
+    reason: &inputs::StaleReason,
+    tip_sha: &str,
+) -> String {
+    format!(
+        "Merge blocked: PR #{pr}'s required check `{check}` was tested against base {tested_base}, \
+and the base branch has since moved to {tip_sha} in a way that can change what this check would \
+say about the merged tree — {reason} (#8919, tightening #8248).\n\nThis is NOT a timestamp \
+complaint, so re-running the job in place will not clear it: GitHub replays a workflow run against \
+the ORIGINAL test merge commit, which is built on the base it already tested (verified 2026-09-25 \
+on run 36145858487). Only a NEW `pull_request` event rebuilds the merge commit against the current \
+base.\n\nPush any commit to the head branch (a tree-identical no-op is enough — see \
+`--redate-stale-checks`), let CI run, then re-run this merge."
+    )
+}
+
 /// The refusal text: names the check and BOTH timestamps, plus the remedy.
 #[must_use]
 pub fn stale_message(
@@ -187,9 +346,11 @@ about a tree that no longer exists (#8248).\n\nA ratchet baseline (or any repo-g
 state a check verifies) can tighten on the base branch while this PR was in flight, so a \
 green run that predates the tip may be asserting slack that has since been spent. Merging \
 on it is what red-lined main on 2026-09-18: PR #8078's File Size Ratchet was green against \
-a baseline that PR #8204 had tightened 22 hours underneath it.\n\nRe-run the check against \
-the current head (re-run the job, or push any no-op commit to re-date every check), then \
-re-run this merge. The check's result must not predate the base tip it will merge onto."
+a baseline that PR #8204 had tightened 22 hours underneath it.\n\nPush any commit to the head \
+branch (a tree-identical no-op is enough) so a new `pull_request` event rebuilds the merge commit \
+against the current base, let CI run, then re-run this merge. Re-running the job IN PLACE does not \
+help: GitHub replays the original test merge commit, so the re-run re-tests the base it already \
+tested and only the timestamp moves (#8919)."
     )
 }
 
@@ -206,7 +367,9 @@ failure (network, quota, token scope) or re-run the required checks, then re-run
     )
 }
 
+pub mod evidence;
 pub mod fetch;
+pub mod inputs;
 pub use fetch::LiveInputs;
 
 #[cfg(test)]

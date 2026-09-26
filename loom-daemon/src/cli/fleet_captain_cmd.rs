@@ -157,12 +157,24 @@ pub(crate) fn evaluate(root: &Path, host_id: &str, job_name: &str) -> (i32, Stri
 /// to the returned message but never changes the exit code: the gate outcome
 /// (is this host the captain) and the observability side-channel are
 /// independent facts.
+///
+/// On a **refusal** (exit 3 or 4) it also removes any durable arm this host
+/// previously recorded for `job_name` (#9014). Without that, a captain
+/// handoff from host A to host B left A reporting the job as armed until the
+/// TTL expired (default 6h), and the dashboard's "armed on a non-captain
+/// host" flag fired the whole time. The in-daemon registry already cleared
+/// within one tick; this makes the shell path match.
 pub(crate) fn evaluate_and_record(root: &Path, host_id: &str, job_name: &str) -> (i32, String) {
     let (code, mut message) = evaluate(root, host_id, job_name);
-    if code == 0 {
-        if let Err(e) = loom_daemon::fleet_captain::record_shell_arm(root, job_name, Utc::now()) {
-            message = format!("{message} (durable arm record failed: {e})");
-        }
+    let outcome = if code == 0 {
+        loom_daemon::fleet_captain::record_shell_arm(root, job_name, Utc::now())
+            .map_err(|e| format!("durable arm record failed: {e}"))
+    } else {
+        loom_daemon::fleet_captain::forget_shell_arm(root, job_name)
+            .map_err(|e| format!("clearing the stale durable arm failed: {e}"))
+    };
+    if let Err(e) = outcome {
+        message = format!("{message} ({e})");
     }
     (code, message)
 }
@@ -315,6 +327,40 @@ mod tests {
         .contains(&job));
 
         loom_daemon::fleet_captain::forget_shell_arm(dir.path(), &job).unwrap();
+    }
+
+    #[test]
+    fn captain_handoff_clears_the_old_captains_durable_arm_9014() {
+        // Regression for #9014: armed on A, `fleet.captain` moves to B, A's
+        // next check is refused — and must remove A's durable arm record at
+        // once rather than leaving it to age out over the 6h TTL.
+        let dir = tempdir().unwrap();
+        let job = format!("handoff-test-{}", std::process::id());
+        let armed = |root: &Path| {
+            loom_daemon::fleet_captain::shell_armed_job_names(
+                root,
+                chrono::Utc::now(),
+                std::time::Duration::from_secs(6 * 3600),
+            )
+            .contains(&job)
+        };
+
+        write_config(dir.path(), r#"{"fleet": {"captain": "host-a"}}"#);
+        assert_eq!(evaluate_and_record(dir.path(), "host-a", &job).0, 0);
+        assert!(armed(dir.path()), "host A armed while it is the captain");
+
+        write_config(dir.path(), r#"{"fleet": {"captain": "host-b"}}"#);
+        let (code, message) = evaluate_and_record(dir.path(), "host-a", &job);
+        assert_eq!(code, EX_NOT_CAPTAIN);
+        assert!(message.contains("host-b"), "{message}");
+        assert!(!armed(dir.path()), "the refused check must clear A's stale arm");
+
+        // Same for a captain that is removed outright (exit 4).
+        write_config(dir.path(), r#"{"fleet": {"captain": "host-a"}}"#);
+        assert_eq!(evaluate_and_record(dir.path(), "host-a", &job).0, 0);
+        write_config(dir.path(), r#"{}"#);
+        assert_eq!(evaluate_and_record(dir.path(), "host-a", &job).0, EX_NO_CAPTAIN);
+        assert!(!armed(dir.path()));
     }
 
     #[test]
