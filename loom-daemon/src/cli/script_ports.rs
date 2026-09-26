@@ -387,6 +387,16 @@ pub(crate) enum MergePrCommand {
     /// replay through its own logging (see `cli::merge_pr_delete_branch`).
     DeleteBranch(super::merge_pr_delete_branch::DeleteBranchArgs),
 
+    /// The post-merge worktree-cleanup data-loss guard (#5031, classified by
+    /// #5658): refuse a `git worktree remove --force` on a worktree that still
+    /// holds uncommitted user work, so a colliding branch name cannot destroy a
+    /// live sibling builder's edits. Reads `git status --porcelain` on stdin.
+    /// Exit 0 + sentinel = no user work (removal may proceed), 1 = refuse (the
+    /// refusal arrives as `LEVEL<TAB>message` lines to replay), 2 = the
+    /// worktree's state could not be read, which the caller must ALSO treat as
+    /// a refusal.
+    DirtyGuard(super::merge_pr_dirty_guard::DirtyGuardArgs),
+
     /// Decide ONE zero-row check-runs poll of `--auto`'s settle wait (#9091):
     /// settle now, keep waiting, or report the whole wait spent. Bounded only
     /// when the base branch requires no status-check contexts; a lookup that
@@ -405,6 +415,7 @@ impl MergePrCommand {
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::HoldState(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
+            MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
         }
     }

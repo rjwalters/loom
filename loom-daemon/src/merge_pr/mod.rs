@@ -64,6 +64,15 @@
 //! flag in the family (`--allow-unapproved`) because "nobody reviewed it" and
 //! "a reviewer said no" are different acts.
 //!
+//! [`dirty_guard`] leaves the merge gates behind for the post-merge cleanup:
+//! the #5031 data-loss guard that refuses `git worktree remove --force` on a
+//! worktree still holding uncommitted work. It is the only member of the family
+//! whose failure mode is destroying somebody's edits rather than merging the
+//! wrong tree, which is why it fails CLOSED even though every other step of
+//! cleanup is best-effort. The port also retires the THIRD copy of Loom's
+//! runtime-marker list — #8195 slice 3 deleted `worktree.sh`'s twin after #8279,
+//! and this was the one left standing.
+//!
 //! [`hold_state`] completes that trio: the advisory warning [`loom_pr_guard`]
 //! deliberately left in the shell, fired only when `loom:pr` IS present and
 //! Champion's recorded merge-risk-hold head is not the head about to merge. It
@@ -71,6 +80,7 @@
 //! fixes two ways the retired `grep | tail -1 | sed` pipeline lost the warning
 //! silently, which for a check nothing else duplicates is the whole risk.
 
+pub mod dirty_guard;
 pub mod head_sync;
 pub mod hold_state;
 pub mod labels;
