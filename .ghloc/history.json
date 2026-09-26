@@ -1,0 +1,193 @@
+[
+  {
+    "total_loc": 694654,
+    "total_files": 2318,
+    "languages": [
+      {
+        "language": "TOML",
+        "lines": 719,
+        "code": 232,
+        "comments": 427,
+        "blanks": 60,
+        "files": 13
+      },
+      {
+        "language": "JSON",
+        "lines": 13122,
+        "code": 13110,
+        "comments": 0,
+        "blanks": 12,
+        "files": 78
+      },
+      {
+        "language": "TypeScript",
+        "lines": 43553,
+        "code": 31308,
+        "comments": 8016,
+        "blanks": 4229,
+        "files": 206
+      },
+      {
+        "language": "CSS",
+        "lines": 1530,
+        "code": 1343,
+        "comments": 90,
+        "blanks": 97,
+        "files": 5
+      },
+      {
+        "language": "Go Template",
+        "lines": 27,
+        "code": 27,
+        "comments": 0,
+        "blanks": 0,
+        "files": 1
+      },
+      {
+        "language": "Python",
+        "lines": 91,
+        "code": 67,
+        "comments": 10,
+        "blanks": 14,
+        "files": 6
+      },
+      {
+        "language": "Shell",
+        "lines": 262711,
+        "code": 159859,
+        "comments": 83082,
+        "blanks": 19770,
+        "files": 581
+      },
+      {
+        "language": "JSONC",
+        "lines": 146,
+        "code": 36,
+        "comments": 110,
+        "blanks": 0,
+        "files": 4
+      },
+      {
+        "language": "YAML",
+        "lines": 6804,
+        "code": 4045,
+        "comments": 2393,
+        "blanks": 366,
+        "files": 40
+      },
+      {
+        "language": "License",
+        "lines": 21,
+        "code": 17,
+        "comments": 0,
+        "blanks": 4,
+        "files": 1
+      },
+      {
+        "language": "SQL",
+        "lines": 1572,
+        "code": 931,
+        "comments": 566,
+        "blanks": 75,
+        "files": 15
+      },
+      {
+        "language": "Rust",
+        "lines": 543161,
+        "code": 366045,
+        "comments": 138252,
+        "blanks": 38864,
+        "files": 1009
+      },
+      {
+        "language": "JSONL",
+        "lines": 1594,
+        "code": 1594,
+        "comments": 0,
+        "blanks": 0,
+        "files": 3
+      },
+      {
+        "language": "#!",
+        "lines": 1734,
+        "code": 1576,
+        "comments": 0,
+        "blanks": 158,
+        "files": 11
+      },
+      {
+        "language": "gitignore",
+        "lines": 372,
+        "code": 176,
+        "comments": 146,
+        "blanks": 50,
+        "files": 6
+      },
+      {
+        "language": "SVG",
+        "lines": 345,
+        "code": 208,
+        "comments": 73,
+        "blanks": 64,
+        "files": 13
+      },
+      {
+        "language": "TypeScript Typings",
+        "lines": 25,
+        "code": 8,
+        "comments": 16,
+        "blanks": 1,
+        "files": 3
+      },
+      {
+        "language": "Dockerfile",
+        "lines": 593,
+        "code": 188,
+        "comments": 363,
+        "blanks": 42,
+        "files": 4
+      },
+      {
+        "language": "JavaScript",
+        "lines": 745,
+        "code": 520,
+        "comments": 177,
+        "blanks": 48,
+        "files": 5
+      },
+      {
+        "language": "Markdown",
+        "lines": 134858,
+        "code": 110438,
+        "comments": 0,
+        "blanks": 24420,
+        "files": 297
+      },
+      {
+        "language": "Docker ignore",
+        "lines": 43,
+        "code": 17,
+        "comments": 26,
+        "blanks": 0,
+        "files": 2
+      },
+      {
+        "language": "HTML",
+        "lines": 857,
+        "code": 780,
+        "comments": 22,
+        "blanks": 55,
+        "files": 4
+      },
+      {
+        "language": "Plain Text",
+        "lines": 2174,
+        "code": 2129,
+        "comments": 0,
+        "blanks": 45,
+        "files": 11
+      }
+    ],
+    "created_at": "2026-09-26T20:59:34.691227691Z"
+  }
+]
