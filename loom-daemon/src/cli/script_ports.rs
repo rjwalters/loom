@@ -358,6 +358,13 @@ pub(crate) enum MergePrCommand {
     /// and prints one `LEVEL<TAB>message` line per decision for the caller to
     /// replay through its own logging (see `cli::merge_pr_delete_branch`).
     DeleteBranch(super::merge_pr_delete_branch::DeleteBranchArgs),
+
+    /// Decide ONE zero-row check-runs poll of `--auto`'s settle wait (#9091):
+    /// settle now, keep waiting, or report the whole wait spent. Bounded only
+    /// when the base branch requires no status-check contexts; a lookup that
+    /// errors, or a required context present, keeps #6169's full wait. Always
+    /// exits 0 with one sentinel-led line — see `cli::merge_pr_zero_checks`.
+    ZeroChecksSettle(super::merge_pr_zero_checks::ZeroChecksSettleArgs),
 }
 
 impl MergePrCommand {
@@ -369,6 +376,7 @@ impl MergePrCommand {
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
+            MergePrCommand::ZeroChecksSettle(args) => args.run(),
         }
     }
 }

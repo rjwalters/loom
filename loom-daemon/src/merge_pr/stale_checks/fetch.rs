@@ -175,6 +175,29 @@ fn fetch_base_tip(gh: &str, nwo: &str, base_ref: &str) -> Result<(String, DateTi
     Ok((sha, parse_iso("base tip commit time", &date)?))
 }
 
+/// [`fetch_required`] on its own, for a caller that needs ONLY the base
+/// branch's required-context set — #9091's zero-row settle discriminator, which
+/// has no use for the base tip, the check-runs rollup, or the scoped evidence
+/// [`live_inputs`] also gathers.
+///
+/// Shared rather than reimplemented so the two guards can never disagree about
+/// what a given base branch requires: `Ok(vec![])` means "provably requires
+/// nothing" (including the plan-gated case, per [`is_plan_gated`]) and `Err`
+/// means "could not find out", a distinction both callers fail closed on in
+/// their own way.
+pub fn required_contexts(nwo: &str, base_ref: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    fetch_required(&gh_bin(), nwo, base_ref)
+}
+
+/// [`required_contexts`], parameterized on the `gh` binary (see [`gh_api`]).
+pub fn required_contexts_with(
+    gh: &str,
+    nwo: &str,
+    base_ref: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    fetch_required(gh, nwo, base_ref)
+}
+
 /// Required status check contexts, unioned across rulesets and classic branch
 /// protection (mirroring `forge_get_required_status_check_contexts`, #8103),
 /// plus any [`plan_gated_notice`] the lookup had to record.
