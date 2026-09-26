@@ -24,7 +24,8 @@ use chrono::{DateTime, Duration, Utc};
 use crate::telemetry::ops::{MetricName, MetricPoint};
 
 /// How far behind now the burn window ends, so a message's streamed chunks
-/// (and an OpenCode row's completion commit) are on disk before it is counted.
+/// are on disk before it is counted. (OpenCode steps are counted by row
+/// identity, so a late completion commit is caught regardless — #8966.)
 pub const MESSAGE_SETTLE_LAG_SECS: i64 = 60;
 
 /// How late an event may be read and still be counted, in the current window.

@@ -244,5 +244,6 @@ fn session_json(s: &CodexSessionUsage) -> serde_json::Value {
         "input": s.input,
         "output": s.output,
         "cache_read": s.cache_read,
+        "cache_write": s.cache_write,
     })
 }

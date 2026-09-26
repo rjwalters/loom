@@ -5,13 +5,36 @@
 //! An assistant row is inserted with zero tokens when the step starts and
 //! **updated in place** when it completes: `data` (JSON) gains
 //! `tokens.{input,output,reasoning,cache.read,cache.write}` and
-//! `time.completed` (epoch ms), and the `time_updated` column moves. So the
-//! cursor is completion time, not a byte offset: each poll selects the rows
-//! completed in `(through, now - lag]` and advances `through`, which counts
-//! every step once. The `time_updated > through` predicate is implied (a row
-//! is updated when it completes) and keeps the read to recent rows. Rows
-//! with no tokens (a failed request, e.g. the 429 "limit exhausted" reply)
-//! are not usage.
+//! `time.completed` (epoch ms). Rows with no tokens (a failed request, e.g.
+//! the 429 "limit exhausted" reply) are not usage.
+//!
+//! # Cursor: row identity, not completion time (Issue #8966)
+//!
+//! A step is counted **once, by `rowid`**, the first poll that sees it
+//! completed. Per store the source keeps `high` (every row at or below it has
+//! been read) and `open` (rows at or below `high` read before they completed).
+//! A poll reads only `rowid > floor`, where `floor` is `high`, or just below
+//! the oldest open row: an indexed range on the table's own b-tree, so a poll
+//! costs the rows written since the oldest unfinished step rather than a scan
+//! of the whole table (#8956 measured ~0.7 s per poll at 37k rows for the
+//! old `time_updated`/`json_extract` predicate, which no index serves).
+//!
+//! Counting by identity also means a completion committed late is still
+//! counted once: its `time.completed` timestamp places it, and the ledger
+//! counts a late event in the current window up to
+//! [`super::burn::LATE_GRACE_SECS`] late. The only bounds:
+//!
+//! - a step still open [`OPEN_ROW_MAX_AGE_SECS`] after it was created is
+//!   forgotten (it is not counted if it ever completes), and at most
+//!   [`MAX_OPEN_ROWS`] open rows are kept (oldest forgotten first);
+//! - `rowid` is SQLite's implicit row id (`message.id` is a text key, not a
+//!   `rowid` alias). It grows with each insert; SQLite reuses one only after
+//!   the current maximum row is deleted, which OpenCode does only when a
+//!   session is deleted.
+//!
+//! The first poll of a store reads it once from the start (to learn `high`
+//! and the open rows); what completed before the emit bound is history and is
+//! not emitted.
 //!
 //! Stores: `${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db` (an
 //! operator's own OpenCode) plus every Loom-managed
@@ -23,8 +46,9 @@
 //!
 //! The same file holds `credential` and `account` tables. [`BURN_QUERY`] is
 //! the whole SQL surface of this module, pinned by a test, and it extracts
-//! only the provider/model ids, the five counters and the completion time out
-//! of `data` — never message content or error bodies. The store is opened
+//! only the row id and creation time, the provider/model ids, the five
+//! counters and the completion time out of `data` — never message content or
+//! error bodies. The store is opened
 //! read-only, as [`opencode_usage`] opens it.
 //!
 //! # Mapping
@@ -35,24 +59,29 @@
 //! pool's namespace where one is known (`zai-coding-plan` → `zai`, see
 //! [`pool_provider`]), else OpenCode's own provider id.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OpenFlags};
 
-use super::burn::{BurnEvent, BurnSource, Emit, ModelBurn, MESSAGE_SETTLE_LAG_SECS};
+use super::burn::{BurnEvent, BurnSource, Emit, ModelBurn};
 use crate::opencode_usage;
 
-/// The ONLY query this module issues. `?1`/`?2` bound the completion time.
-pub const BURN_QUERY: &str = "SELECT json_extract(data, '$.providerID'), \
+/// The ONLY query this module issues. `?1` is the row-id floor: an indexed
+/// range, never a whole-table scan once a store has been read once.
+pub const BURN_QUERY: &str = "SELECT rowid, time_created, json_extract(data, '$.providerID'), \
      json_extract(data, '$.modelID'), json_extract(data, '$.tokens.input'), \
      json_extract(data, '$.tokens.output'), json_extract(data, '$.tokens.reasoning'), \
      json_extract(data, '$.tokens.cache.read'), json_extract(data, '$.tokens.cache.write'), \
      json_extract(data, '$.time.completed') FROM message \
-     WHERE time_updated > ?1 AND json_extract(data, '$.role') = 'assistant' \
-     AND json_extract(data, '$.time.completed') > ?1 \
-     AND json_extract(data, '$.time.completed') <= ?2";
+     WHERE rowid > ?1 AND json_extract(data, '$.role') = 'assistant' ORDER BY rowid";
+
+/// A step still open this long after it was created is forgotten.
+pub const OPEN_ROW_MAX_AGE_SECS: i64 = 6 * 3600;
+
+/// Most open rows remembered per store.
+pub const MAX_OPEN_ROWS: usize = 4096;
 
 /// Bounded wait for a lock a live OpenCode process holds.
 const SQLITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -78,13 +107,21 @@ pub fn opencode_dbs(home: Option<&Path>) -> Vec<PathBuf> {
     opencode_usage::discover_opencode_dbs(home)
 }
 
-/// Steps completed in `(since, until]` in one store, or `None` when it cannot
-/// be read (the caller then keeps its cursor and retries).
-pub fn completed_steps(
-    db: &Path,
-    since: DateTime<Utc>,
-    until: DateTime<Utc>,
-) -> Option<Vec<BurnEvent>> {
+/// One assistant row as [`BURN_QUERY`] reads it.
+#[derive(Debug, Clone)]
+pub struct StepRow {
+    pub rowid: i64,
+    pub created_ms: i64,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub usage: ModelBurn,
+    /// `time.completed`, epoch ms; `None` while the step is running.
+    pub completed_ms: Option<i64>,
+}
+
+/// Assistant rows with `rowid > floor`, ascending, or `None` when the store
+/// cannot be read (the caller then keeps its state and retries).
+pub fn rows_after(db: &Path, floor: i64) -> Option<Vec<StepRow>> {
     let uri = crate::tokens_pool::monitor_db::read_only_uri(db);
     let conn = Connection::open_with_flags(
         &uri,
@@ -94,80 +131,122 @@ pub fn completed_steps(
     conn.busy_timeout(SQLITE_TIMEOUT).ok()?;
     let mut stmt = conn.prepare(BURN_QUERY).ok()?;
     let rows = stmt
-        .query_map([since.timestamp_millis(), until.timestamp_millis()], |row| {
+        .query_map([floor], |row| {
             let count = |i: usize| -> rusqlite::Result<i64> {
                 Ok(row.get::<_, Option<i64>>(i)?.unwrap_or(0).max(0))
             };
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                ModelBurn {
-                    input: count(2)?,
-                    output: count(3)?.saturating_add(count(4)?),
-                    cache_read: count(5)?,
-                    cache_write: count(6)?,
+            Ok(StepRow {
+                rowid: row.get(0)?,
+                created_ms: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                provider: row.get(2)?,
+                model: row.get(3)?,
+                usage: ModelBurn {
+                    input: count(4)?,
+                    output: count(5)?.saturating_add(count(6)?),
+                    cache_read: count(7)?,
+                    cache_write: count(8)?,
                     requests: 1,
                 },
-                row.get::<_, Option<i64>>(7)?,
-            ))
+                completed_ms: row.get(9)?,
+            })
         })
         .ok()?;
-    let mut events = Vec::new();
-    for row in rows {
-        let (provider, model, usage, completed) = row.ok()?;
-        let (Some(provider), Some(model), Some(at)) = (
-            provider.filter(|p| !p.trim().is_empty()),
-            model.filter(|m| !m.trim().is_empty()),
-            completed.and_then(DateTime::<Utc>::from_timestamp_millis),
-        ) else {
-            continue;
-        };
-        if (usage.input, usage.output, usage.cache_read, usage.cache_write) == (0, 0, 0, 0) {
-            continue;
-        }
-        events.push(BurnEvent {
-            provider: pool_provider(&provider),
-            model: model.trim().to_string(),
-            at,
-            usage,
-        });
-    }
-    Some(events)
+    rows.collect::<rusqlite::Result<Vec<_>>>().ok()
 }
 
-/// Every OpenCode store, polled by completion time.
+/// Per-store cursor: see the module doc.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StoreCursor {
+    /// Every row at or below this has been read at least once.
+    pub high: i64,
+    /// Rows at or below `high` read before they completed, with their
+    /// creation time (epoch ms).
+    pub open: BTreeMap<i64, i64>,
+}
+
+impl StoreCursor {
+    /// The row-id floor the next read starts above.
+    #[must_use]
+    pub fn floor(&self) -> i64 {
+        self.open
+            .keys()
+            .next()
+            .map_or(self.high, |oldest| (oldest - 1).min(self.high))
+    }
+
+    /// Fold one read of `rows_after(self.floor())` into the cursor, pushing
+    /// each newly completed, non-empty step `emit` accepts.
+    pub fn advance(&mut self, rows: Vec<StepRow>, emit: Emit, out: &mut Vec<BurnEvent>) {
+        for row in rows {
+            let seen_before = row.rowid <= self.high;
+            if seen_before && !self.open.contains_key(&row.rowid) {
+                continue; // already counted (or not usage)
+            }
+            self.high = self.high.max(row.rowid);
+            let Some(at) = row
+                .completed_ms
+                .and_then(DateTime::<Utc>::from_timestamp_millis)
+            else {
+                self.open.insert(row.rowid, row.created_ms);
+                continue;
+            };
+            self.open.remove(&row.rowid);
+            let (Some(provider), Some(model)) = (
+                row.provider.filter(|p| !p.trim().is_empty()),
+                row.model.filter(|m| !m.trim().is_empty()),
+            ) else {
+                continue;
+            };
+            let usage = row.usage;
+            if (usage.input, usage.output, usage.cache_read, usage.cache_write) == (0, 0, 0, 0)
+                || !emit.accepts(at)
+            {
+                continue;
+            }
+            out.push(BurnEvent {
+                provider: pool_provider(&provider),
+                model: model.trim().to_string(),
+                at,
+                usage,
+            });
+        }
+        let horizon = (emit.now - Duration::seconds(OPEN_ROW_MAX_AGE_SECS)).timestamp_millis();
+        self.open.retain(|_, created| *created >= horizon);
+        while self.open.len() > MAX_OPEN_ROWS {
+            self.open.pop_first();
+        }
+    }
+}
+
+/// Every OpenCode store, polled by row identity.
 #[derive(Debug, Default)]
 pub struct OpencodeSource {
     /// Overrides [`opencode_dbs`] (tests).
     pub dbs: Option<Vec<PathBuf>>,
-    /// Per store: every step completed at or before this has been read.
-    through: HashMap<PathBuf, DateTime<Utc>>,
+    cursors: HashMap<PathBuf, StoreCursor>,
+}
+
+impl OpencodeSource {
+    /// The cursor kept for `db` (tests).
+    #[must_use]
+    pub fn cursor(&self, db: &Path) -> Option<&StoreCursor> {
+        self.cursors.get(db)
+    }
 }
 
 impl BurnSource for OpencodeSource {
     fn poll(&mut self, emit: Emit, out: &mut Vec<BurnEvent>) {
-        let until = emit.now - Duration::seconds(MESSAGE_SETTLE_LAG_SECS);
         let dbs = self.dbs.clone().unwrap_or_else(|| opencode_dbs(None));
-        let mut through = HashMap::new();
+        let mut cursors = HashMap::new();
         for db in dbs {
-            // A store first seen now starts at the emit bound: older steps
-            // are history.
-            let since = self.through.get(&db).copied().unwrap_or(emit.not_before);
-            if until <= since {
-                through.insert(db, since);
-                continue;
+            let mut cursor = self.cursors.remove(&db).unwrap_or_default();
+            // An unreadable store keeps its cursor and is retried next poll.
+            if let Some(rows) = rows_after(&db, cursor.floor()) {
+                cursor.advance(rows, emit, out);
             }
-            match completed_steps(&db, since, until) {
-                Some(events) => {
-                    out.extend(events.into_iter().filter(|e| emit.accepts(e.at)));
-                    through.insert(db, until);
-                }
-                None => {
-                    through.insert(db, since);
-                }
-            }
+            cursors.insert(db, cursor);
         }
-        self.through = through;
+        self.cursors = cursors;
     }
 }
 

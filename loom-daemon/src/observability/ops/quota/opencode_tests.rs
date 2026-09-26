@@ -6,7 +6,7 @@ use std::path::Path;
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::Connection;
 
-use super::{pool_provider, OpencodeSource, BURN_QUERY};
+use super::{pool_provider, OpencodeSource, BURN_QUERY, OPEN_ROW_MAX_AGE_SECS};
 use crate::observability::ops::quota::burn::Burn;
 
 fn store(path: &Path) -> Connection {
@@ -60,6 +60,10 @@ fn the_only_query_names_the_message_table_and_nothing_else() {
         assert!(!sql.contains(forbidden), "BURN_QUERY must not mention {forbidden}");
     }
     assert!(!sql.contains("select data") && !sql.contains(", data "), "never the raw blob");
+    // #8966 item 1: the only range predicate is on the row id — an indexed
+    // range on the table's own b-tree, never a whole-table scan.
+    assert!(sql.contains("where rowid > ?1 and "), "{sql}");
+    assert!(!sql.contains("time_updated"), "no unindexed time predicate");
 }
 
 #[test]
@@ -144,4 +148,100 @@ fn an_unreadable_store_keeps_its_cursor_and_is_retried() {
     // The step completed while the store could not be read: it still counts.
     let (_, _, window) = burn.sample(base + Duration::seconds(600)).unwrap();
     assert_eq!(window[&("zai".to_string(), "glm-5.3-flash".to_string())].requests, 1);
+}
+
+/// #8966 item 1: once a store has been read, the next read starts above the
+/// highest settled row — or just below the oldest step still running — so a
+/// poll never re-reads the finished history.
+#[test]
+fn the_read_floor_tracks_the_oldest_open_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    let conn = store(&db);
+    let base = Utc::now() - Duration::seconds(3600);
+    for (id, at) in [("a", 10), ("b", 20), ("c", 30)] {
+        start(&conn, id, "zai", base + Duration::seconds(at));
+    }
+    complete(&conn, "a", base + Duration::seconds(11), (1, 1, 0, 0));
+    complete(&conn, "c", base + Duration::seconds(31), (1, 1, 0, 0));
+    let mut source = OpencodeSource {
+        dbs: Some(vec![db.clone()]),
+        ..OpencodeSource::default()
+    };
+    let emit = super::super::burn::Emit {
+        not_before: base,
+        now: base + Duration::seconds(60),
+    };
+    let mut out = Vec::new();
+    super::super::burn::BurnSource::poll(&mut source, emit, &mut out);
+    let cursor = source.cursor(&db).unwrap();
+    assert_eq!((cursor.high, cursor.floor()), (3, 1), "b (rowid 2) is still open");
+    assert_eq!(out.len(), 2);
+
+    complete(&conn, "b", base + Duration::seconds(40), (1, 1, 0, 0));
+    out.clear();
+    super::super::burn::BurnSource::poll(&mut source, emit, &mut out);
+    let cursor = source.cursor(&db).unwrap();
+    assert_eq!((cursor.high, cursor.floor()), (3, 3), "nothing open: read only new rows");
+    assert_eq!(out.len(), 1, "b counted once; a and c are not re-read");
+    out.clear();
+    super::super::burn::BurnSource::poll(&mut source, emit, &mut out);
+    assert!(out.is_empty());
+}
+
+/// #8966 item 2: a completion committed long after its `time.completed`
+/// (past the 60 s settle lag the old completion-time cursor relied on) is
+/// still counted — exactly once.
+#[test]
+fn a_late_committed_step_is_counted_exactly_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    let conn = store(&db);
+    let base = Utc::now() - Duration::seconds(3600);
+    let mut burn = Burn::new(vec![Box::new(OpencodeSource {
+        dbs: Some(vec![db.clone()]),
+        ..OpencodeSource::default()
+    })]);
+    assert!(burn.sample(base).is_none(), "anchor");
+    start(&conn, "late", "zai-coding-plan", base + Duration::seconds(10));
+    let (_, end1, first) = burn.sample(base + Duration::seconds(300)).unwrap();
+    assert!(first.is_empty(), "still running");
+    // Completed at base+20, but the row is only committed ~5 minutes later.
+    complete(&conn, "late", base + Duration::seconds(20), (40, 4, 0, 0));
+    assert!(end1 > base + Duration::seconds(20 + 60));
+    let (_, _, second) = burn.sample(base + Duration::seconds(600)).unwrap();
+    let key = ("zai".to_string(), "glm-5.3-flash".to_string());
+    assert_eq!((second[&key].input, second[&key].requests), (40, 1));
+    let (_, _, third) = burn.sample(base + Duration::seconds(900)).unwrap();
+    assert!(third.is_empty(), "never counted again");
+}
+
+/// A step that never completes is forgotten after the stated bound, so it
+/// cannot pin the read floor forever.
+#[test]
+fn a_step_open_past_the_bound_is_forgotten() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    let conn = store(&db);
+    let base = Utc::now() - Duration::seconds(3600);
+    start(&conn, "stuck", "zai", base);
+    start(&conn, "done", "zai", base + Duration::seconds(5));
+    complete(&conn, "done", base + Duration::seconds(6), (1, 1, 0, 0));
+    let mut source = OpencodeSource {
+        dbs: Some(vec![db.clone()]),
+        ..OpencodeSource::default()
+    };
+    let mut out = Vec::new();
+    let early = super::super::burn::Emit {
+        not_before: base,
+        now: base + Duration::seconds(60),
+    };
+    super::super::burn::BurnSource::poll(&mut source, early, &mut out);
+    assert_eq!(source.cursor(&db).unwrap().floor(), 0, "stuck (rowid 1) is open");
+    let late = super::super::burn::Emit {
+        not_before: base,
+        now: base + Duration::seconds(OPEN_ROW_MAX_AGE_SECS + 1),
+    };
+    super::super::burn::BurnSource::poll(&mut source, late, &mut out);
+    assert_eq!(source.cursor(&db).unwrap().floor(), 2, "forgotten past the bound");
 }

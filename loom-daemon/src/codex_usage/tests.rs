@@ -340,6 +340,31 @@ fn reasoning_is_not_added_to_output_and_cached_input_is_not_counted_twice() {
     assert_eq!(rows[0].input + rows[0].cache_read, 9_090);
 }
 
+/// Issue #8966: newer Codex reports `cache_write_input_tokens`, verified live
+/// (72/72 non-zero samples) as a SUBSET of `input_tokens` disjoint from
+/// `cached_input_tokens`. It becomes the cache-write counter and leaves
+/// `input`; the three disjoint parts still re-add to Codex's own input total.
+#[test]
+fn cache_write_input_tokens_move_out_of_input_into_cache_write() {
+    let with_writes = |input: i64, cached: i64, writes: i64| {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&token_count(input, cached, 100, 0)).unwrap();
+        for key in ["total_token_usage", "last_token_usage"] {
+            value["payload"]["info"][key]["cache_write_input_tokens"] = writes.into();
+        }
+        value.to_string()
+    };
+    let mut lines = rollout("/w", "2026-09-21T02:06:31Z", "aaaa", "gpt-5.6-sol", &[]);
+    lines.push(with_writes(24_000, 9_000, 14_564));
+    lines.push(with_writes(24_000, 9_000, 14_564));
+    let rows = fold_rollout(&lines, &SessionFilter::directories(&[PathBuf::from("/w")]), None);
+    assert_eq!(
+        (rows[0].input, rows[0].cache_read, rows[0].cache_write),
+        (24_000 - 9_000 - 14_564, 9_000, 14_564)
+    );
+    assert_eq!(rows[0].input + rows[0].cache_read + rows[0].cache_write, 24_000);
+}
+
 #[test]
 fn a_mid_session_model_switch_splits_usage_by_the_turn_context_in_force() {
     let cwd = "/w";
@@ -569,8 +594,7 @@ fn tokens_by_model_folds_every_attributable_rollout_in_the_store() {
     assert_eq!(totals[0].cache_read, 400 + 800);
     assert_eq!(totals[0].input, (1_000 - 400) + (2_000 - 800));
     assert_eq!(totals[0].output, 100 + 200);
-    // Codex reports no cache-write counter; a fabricated split would be
-    // priced as real spend downstream.
+    // These rollouts report no cache writes: no fabricated cache-write spend.
     assert_eq!(totals[0].cache_write_5m, 0);
     assert_eq!(totals[0].cache_write_1h, 0);
 }

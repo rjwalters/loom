@@ -89,10 +89,11 @@
 //!
 //! | `ModelUsageTotals` | from Codex |
 //! |---|---|
-//! | `input` | `input_tokens - cached_input_tokens` |
+//! | `input` | `input_tokens - cached_input_tokens - cache_write_input_tokens` |
 //! | `cache_read` | `cached_input_tokens` |
 //! | `output` | `output_tokens` (`reasoning_output_tokens` is a SUBSET — never added) |
-//! | `cache_write_5m` / `cache_write_1h` | `0` — Codex reports no cache-write counter at all |
+//! | `cache_write_5m` | `cache_write_input_tokens` (Codex reports no TTL; `0` when absent) |
+//! | `cache_write_1h` | `0` |
 //!
 //! # Schema provenance
 //!
@@ -107,6 +108,12 @@
 //!   opposite of OpenCode, whose `tokens_reasoning` IS a separate counter.)
 //! * `cached_input_tokens > input_tokens` in **0** of 11,868 samples ⇒ cached
 //!   input is a subset of input, so `input` must have it subtracted out.
+//! * `cache_write_input_tokens` (newer Codex only, Issue #8966): surveyed on
+//!   2026-09-25 across this host's `~/.codex/sessions`, **72** usage objects
+//!   carry a non-zero value, and in all 72 `cache_write_input_tokens +
+//!   cached_input_tokens <= input_tokens` and `total_tokens == input_tokens +
+//!   output_tokens` ⇒ cache writes are a SUBSET of input, disjoint from the
+//!   cached part, so they are moved out of `input` into `cache_write_5m`.
 //! * `total_tokens == input_tokens + output_tokens` in 11,840 of 11,868 ⇒
 //!   `total_tokens` is redundant with the parts, so this module never reads it
 //!   and the 28 older-format disagreements cost nothing.
@@ -450,10 +457,13 @@ pub struct CodexSessionUsage {
     pub session_id: Option<String>,
     /// `session_meta.timestamp`, the session's creation instant.
     pub created_at: DateTime<Utc>,
-    /// `input_tokens - cached_input_tokens` (see the module doc's mapping).
+    /// `input_tokens - cached_input_tokens - cache_write_input_tokens` (see
+    /// the module doc's mapping).
     pub input: i64,
     /// `cached_input_tokens`.
     pub cache_read: i64,
+    /// `cache_write_input_tokens` (#8966); `0` for a Codex that reports none.
+    pub cache_write: i64,
     /// `output_tokens` — INCLUSIVE of `reasoning_output_tokens`.
     pub output: i64,
 }
@@ -466,7 +476,7 @@ impl CodexSessionUsage {
     /// badge for a model that was never billed.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.input == 0 && self.cache_read == 0 && self.output == 0
+        self.input == 0 && self.cache_read == 0 && self.cache_write == 0 && self.output == 0
     }
 }
 
@@ -475,6 +485,8 @@ impl CodexSessionUsage {
 pub(crate) struct Counters {
     pub(crate) input: i64,
     pub(crate) cached_input: i64,
+    /// `cache_write_input_tokens`, a subset of `input` (#8966).
+    pub(crate) cache_write: i64,
     pub(crate) output: i64,
 }
 
@@ -489,6 +501,7 @@ impl Counters {
         Some(Self {
             input: count("input_tokens")?,
             cached_input: count("cached_input_tokens").unwrap_or(0),
+            cache_write: count("cache_write_input_tokens").unwrap_or(0),
             output: count("output_tokens").unwrap_or(0),
         })
     }
@@ -499,10 +512,17 @@ impl Counters {
     /// must only ever grow; a decrease (a format change, a compaction that
     /// rebases them) is unreadable, and treating it as negative usage would
     /// silently subtract real spend from a sibling model's row.
+    /// Input that was neither a cache read nor a cache write — the disjoint
+    /// `input` of Claude's vocabulary (#8966).
+    pub(crate) fn uncached_input(self) -> i64 {
+        (self.input - self.cached_input - self.cache_write).max(0)
+    }
+
     pub(crate) fn delta(self, next: Self) -> Self {
         Self {
             input: (next.input - self.input).max(0),
             cached_input: (next.cached_input - self.cached_input).max(0),
+            cache_write: (next.cache_write - self.cache_write).max(0),
             output: (next.output - self.output).max(0),
         }
     }
@@ -595,6 +615,7 @@ pub fn fold_rollout(
                 let entry = by_model.entry(model.clone()).or_default();
                 entry.input += delta.input;
                 entry.cached_input += delta.cached_input;
+                entry.cache_write += delta.cache_write;
                 entry.output += delta.output;
             }
             _ => {}
@@ -629,8 +650,9 @@ pub fn fold_rollout(
             // Keep Claude's DISJOINT vocabulary: Codex's `input_tokens`
             // includes its `cached_input_tokens`, so the cached part is moved
             // to `cache_read` rather than counted twice.
-            input: (counters.input - counters.cached_input).max(0),
+            input: counters.uncached_input(),
             cache_read: counters.cached_input,
+            cache_write: counters.cache_write,
             output: counters.output,
         })
         .filter(|row| !row.is_empty())
@@ -726,10 +748,11 @@ pub fn fold_sessions(
             });
         entry.input = entry.input.saturating_add(session.input);
         entry.cache_read = entry.cache_read.saturating_add(session.cache_read);
+        // Codex reports cache writes with no TTL (#8966): the 5-minute bucket
+        // is the TTL-less default; `cache_write_1h` stays `0`, never a
+        // fabricated split.
+        entry.cache_write_5m = entry.cache_write_5m.saturating_add(session.cache_write);
         entry.output = entry.output.saturating_add(session.output);
-        // `cache_write_5m` / `cache_write_1h` stay at their `0` default:
-        // Codex reports no cache-write counter at all, and a fabricated
-        // split would be priced as real spend downstream.
     }
     (!totals.is_empty()).then(|| totals.into_values().collect())
 }
