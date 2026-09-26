@@ -43,6 +43,7 @@ mod merge_pr_zero_checks;
 pub(crate) mod misc_cmds;
 pub(crate) mod noop_cooldown;
 pub(crate) mod opencode_usage_cli;
+mod park_record;
 pub(crate) mod peer_claims_cmd;
 pub(crate) mod pi_usage_cli;
 mod pr_latency_cmd;

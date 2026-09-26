@@ -39,6 +39,50 @@ fn repo_args(repo: Option<&str>) -> Vec<&str> {
     repo.map_or_else(Vec::new, |r| vec!["--repo", r])
 }
 
+/// `gh pr view --json labels` returns label OBJECTS. Normalised to names at this
+/// fetch boundary, once, so every consumer — and every `--stdin` fixture — sees
+/// the one shape.
+#[derive(Deserialize)]
+struct Label {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct PrView {
+    number: i64,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    labels: Vec<Label>,
+    #[serde(default)]
+    mergeable: String,
+    #[serde(default, rename = "mergeStateStatus")]
+    merge_state_status: String,
+}
+
+/// One PR's state, labels and merge state, in [`recheck::Pr`]'s shape.
+///
+/// # Errors
+///
+/// [`ReadError`] if the PR could not be read.
+pub fn fetch_pr(pr: i64, repo: Option<&str>, repo_root: &Path) -> Result<recheck::Pr, ReadError> {
+    let pn = pr.to_string();
+    let mut args = vec!["pr", "view", &pn];
+    args.extend(repo_args(repo));
+    args.extend(["--json", "number,state,labels,mergeable,mergeStateStatus"]);
+    let q: Query<PrView> = gh_query(&args, repo_root, false, |_: &PrView| false);
+    let Query::Populated(p) = q else {
+        return Err(read_failed(&format!("gh pr view {pr}")));
+    };
+    Ok(recheck::Pr {
+        number: p.number,
+        state: p.state,
+        labels: p.labels.into_iter().map(|l| l.name).collect(),
+        mergeable: p.mergeable,
+        merge_state_status: p.merge_state_status,
+    })
+}
+
 /// The PRs declared to close `issue`, with each one's state.
 ///
 /// # Errors
@@ -58,25 +102,6 @@ pub fn fetch_prs(
         #[serde(default, rename = "closedByPullRequestsReferences")]
         closed_by: Vec<ClosedBy>,
     }
-    /// `gh pr view --json labels` returns label OBJECTS. Normalised to names
-    /// here, once, so every consumer — and every `--stdin` fixture — sees the
-    /// one shape.
-    #[derive(Deserialize)]
-    struct Label {
-        name: String,
-    }
-    #[derive(Deserialize)]
-    struct PrView {
-        number: i64,
-        #[serde(default)]
-        state: String,
-        #[serde(default)]
-        labels: Vec<Label>,
-        #[serde(default)]
-        mergeable: String,
-        #[serde(default, rename = "mergeStateStatus")]
-        merge_state_status: String,
-    }
 
     let n = issue.to_string();
     let mut args = vec!["issue", "view", &n];
@@ -89,21 +114,7 @@ pub fn fetch_prs(
 
     let mut out = Vec::with_capacity(view.closed_by.len());
     for c in &view.closed_by {
-        let pn = c.number.to_string();
-        let mut args = vec!["pr", "view", &pn];
-        args.extend(repo_args(repo));
-        args.extend(["--json", "number,state,labels,mergeable,mergeStateStatus"]);
-        let q: Query<PrView> = gh_query(&args, repo_root, false, |_: &PrView| false);
-        let Query::Populated(p) = q else {
-            return Err(read_failed(&format!("gh pr view {}", c.number)));
-        };
-        out.push(recheck::Pr {
-            number: p.number,
-            state: p.state,
-            labels: p.labels.into_iter().map(|l| l.name).collect(),
-            mergeable: p.mergeable,
-            merge_state_status: p.merge_state_status,
-        });
+        out.push(fetch_pr(c.number, repo, repo_root)?);
     }
     Ok(out)
 }
@@ -248,6 +259,35 @@ pub fn fetch_body_and_comments(
         _ => Err(ReadError(format!(
             "gh issue view {issue} failed — cannot compute a fingerprint from a \
              failed read (fail safe: never guess 'no refs' on missing data)"
+        ))),
+    }
+}
+
+/// A **pull request's** body and comments, in `extract-refs`'s shape (#8925).
+///
+/// Needed as its own function rather than pointing [`fetch_body_and_comments`]
+/// at a PR number: `gh issue view <pr>` exits non-zero for a pull request, which
+/// is exactly the failure [`fetch_state`]'s issue→pr ladder relies on. A park on
+/// a PR is unreachable without this read — the whole of #8925's defect 1.
+///
+/// # Errors
+///
+/// [`ReadError`] if the pull request could not be read.
+pub fn fetch_pr_body_and_comments(
+    pr: i64,
+    repo: Option<&str>,
+    repo_root: &Path,
+) -> Result<extract::Input, ReadError> {
+    let n = pr.to_string();
+    let mut args = vec!["pr", "view", &n];
+    args.extend(repo_args(repo));
+    args.extend(["--json", "body,comments"]);
+    let q: Query<extract::Input> = gh_query(&args, repo_root, false, |_: &extract::Input| false);
+    match q {
+        Query::Populated(v) => Ok(v),
+        _ => Err(ReadError(format!(
+            "gh pr view {pr} failed — cannot assess a park from a failed read \
+             (fail safe: never guess 'no refs' on missing data)"
         ))),
     }
 }

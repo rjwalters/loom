@@ -176,7 +176,7 @@ fn two_independent_signals_produce_two_reasons() {
     let e = Evidence {
         named: vec![dep(176, false, Some("CLOSED"))],
         prose: vec![prose_ref(7, "MERGED")],
-        closing: Vec::new(),
+        ..Evidence::default()
     };
     match classify(&e) {
         Verdict::Stale(reasons) => assert_eq!(reasons.len(), 2, "{reasons:?}"),
@@ -222,4 +222,158 @@ fn an_unrecognised_state_is_treated_as_open() {
     assert!(!resolved("DRAFT"));
     assert!(resolved("MERGED"));
     assert!(resolved("CLOSED"));
+}
+
+// --- The PR population and the park record (#8925) ---------------------------
+
+/// A parked PR whose blocker has closed and which nothing else holds back. The
+/// #8314 shape once its blocker #8322 lands: ready to unpark.
+#[test]
+fn a_parked_pr_whose_blocker_closed_is_stale() {
+    let e = Evidence {
+        prose: vec![prose_ref(8322, "CLOSED")],
+        declared: vec![8322],
+        self_block: None,
+        ..Evidence::default()
+    };
+    assert!(matches!(classify(&e), Verdict::Stale(_)));
+    assert!(!undeclared(&e), "a declared park is not prose-only");
+}
+
+/// The #4634/#7267 gate, transposed. Cleared dependency, but a human decision is
+/// pending on the PR itself — reported, never reported as ready to unpark.
+#[test]
+fn a_parked_pr_with_a_cleared_blocker_but_an_operator_hold_is_superseded() {
+    let e = Evidence {
+        prose: vec![prose_ref(8322, "CLOSED")],
+        declared: vec![8322],
+        self_block: park_self_block(&{
+            let mut p = pr(8314, "OPEN");
+            p.labels = vec!["loom:operator".to_string()];
+            p
+        }),
+        ..Evidence::default()
+    };
+    match classify(&e) {
+        Verdict::Superseded { cleared, block } => {
+            assert_eq!(cleared.len(), 1, "{cleared:?}");
+            assert!(block.contains("loom:operator"), "{block}");
+        }
+        other => panic!("expected Superseded, got {other:?}"),
+    }
+}
+
+/// A conflicting PR cannot land, so the cleared dependency is not sufficient
+/// (#7267's rule, same direction).
+#[test]
+fn a_parked_pr_that_cannot_land_is_superseded() {
+    let mut p = pr(8314, "OPEN");
+    p.mergeable = "CONFLICTING".to_string();
+    p.merge_state_status = "DIRTY".to_string();
+    let e = Evidence {
+        prose: vec![prose_ref(8322, "MERGED")],
+        declared: vec![8322],
+        self_block: park_self_block(&p),
+        ..Evidence::default()
+    };
+    assert!(matches!(classify(&e), Verdict::Superseded { .. }));
+}
+
+/// The labels that are a PR's **normal lane** must not act as a self-block —
+/// this is the exact label set PR #8314 carries, and folding any of it in would
+/// re-create the stall this check exists to surface.
+#[test]
+fn a_prs_own_review_state_labels_are_not_a_self_block() {
+    let mut p = pr(8314, "OPEN");
+    p.labels = vec![
+        "loom:blocked".to_string(),
+        "loom:changes-requested".to_string(),
+        "loom:ci-failure".to_string(),
+        "loom:review-requested".to_string(),
+        "loom:pr".to_string(),
+    ];
+    assert_eq!(park_self_block(&p), None);
+
+    let e = Evidence {
+        prose: vec![prose_ref(8322, "CLOSED")],
+        declared: vec![8322],
+        self_block: park_self_block(&p),
+        ..Evidence::default()
+    };
+    assert!(
+        matches!(classify(&e), Verdict::Stale(_)),
+        "removing loom:blocked must hand #8314 back to its loom:changes-requested lane"
+    );
+}
+
+/// A merged or closed PR has no self-block: GitHub stops computing mergeability,
+/// so reading it would be the meaningless-flicker signal #8253 already removed
+/// from `recheck::blocker_line`.
+#[test]
+fn a_non_open_pr_has_no_self_block() {
+    let mut p = pr(8314, "MERGED");
+    p.mergeable = "UNKNOWN".to_string();
+    p.merge_state_status = "UNKNOWN".to_string();
+    p.labels = vec!["loom:operator".to_string()];
+    assert_eq!(park_self_block(&p), None);
+}
+
+/// The superseding gate can only downgrade, never invent. A still-blocked
+/// artifact stays quiet even when it also carries a self-block.
+#[test]
+fn a_self_block_alone_never_manufactures_a_finding() {
+    let mut p = pr(8314, "OPEN");
+    p.labels = vec!["loom:operator".to_string()];
+    let e = Evidence {
+        prose: vec![prose_ref(8322, "OPEN")],
+        declared: vec![8322],
+        self_block: park_self_block(&p),
+        ..Evidence::default()
+    };
+    assert_eq!(classify(&e), Verdict::StillBlocked);
+}
+
+/// #8852's live instance: a real, correctly-reasoned dependency stated only in a
+/// comment. `undeclared` is what makes it visible BEFORE the blocker closes.
+#[test]
+fn a_blocker_cited_only_in_prose_is_undeclared() {
+    let e = Evidence {
+        prose: vec![prose_ref(8860, "OPEN")],
+        ..Evidence::default()
+    };
+    assert_eq!(classify(&e), Verdict::StillBlocked);
+    assert!(undeclared(&e), "prose-only park must be flagged");
+}
+
+/// A checklist or closing-PR reference with no park record counts as prose-only
+/// too: the park record is the declaration, not the reference shape.
+#[test]
+fn a_checklist_or_closing_pr_reference_without_a_record_is_undeclared() {
+    for e in [
+        Evidence {
+            named: vec![dep(1, false, Some("OPEN"))],
+            ..Evidence::default()
+        },
+        Evidence {
+            closing: vec![pr(1, "OPEN")],
+            ..Evidence::default()
+        },
+    ] {
+        assert!(undeclared(&e));
+    }
+}
+
+/// An artifact with nothing cited at all is `Undocumented`, the louder finding —
+/// and deliberately NOT also counted as prose-only, which would double-report it.
+#[test]
+fn an_undocumented_block_is_not_also_undeclared() {
+    let e = Evidence::default();
+    assert_eq!(classify(&e), Verdict::Undocumented);
+    assert!(!undeclared(&e));
+}
+
+#[test]
+fn artifact_labels_name_both_populations() {
+    assert_eq!(Artifact::Issue.label(), "issue");
+    assert_eq!(Artifact::Pr.label(), "PR");
 }

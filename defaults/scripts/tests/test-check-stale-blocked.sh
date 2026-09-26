@@ -147,8 +147,15 @@ D="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
 kind="${1:-}"; sub="${2:-}"
 shift 2 2>/dev/null || true
 
-if [[ "$kind" == "issue" && "$sub" == "list" ]]; then
-  cat "$D/issue-list.json"
+# The check enumerates BOTH populations (#8925): `gh issue list --label
+# loom:blocked` and `gh pr list --label loom:blocked`. Both must be answerable
+# or the PR arm's read failure is reported as "could not enumerate", masking the
+# issue arm's real verdict — the shape that made 5 cases here fail once the PR
+# enumeration landed. An absent fixture file answers `[]` (the empty
+# population), which is what every issue-only case below wants.
+if [[ ( "$kind" == "issue" || "$kind" == "pr" ) && "$sub" == "list" ]]; then
+  f="$D/$kind-list.json"
+  if [[ -f "$f" ]]; then cat "$f"; else printf '[]'; fi
   exit 0
 fi
 
@@ -190,6 +197,9 @@ run_check() {
 
 # set_population <jq-array-json> — what `gh issue list` answers.
 set_population() { printf '%s' "$1" >"$STUB_DIR/issue-list.json"; }
+
+# set_pr_population <jq-array-json> — what `gh pr list` answers (#8925's PR arm).
+set_pr_population() { printf '%s' "$1" >"$STUB_DIR/pr-list.json"; }
 
 # issue_fixture <number> <body> [comments-json] [closing-prs-json]
 issue_fixture() {
@@ -277,8 +287,10 @@ assert_contains "$LAST_STDERR" "UNDOCUMENTED BLOCK" \
 assert_contains "$LAST_STDERR" "#180" "T2c: names the undocumented issue"
 assert_not_contains "$LAST_STDERR" "STALE BLOCK" \
     "T2d: an undocumented block is not also reported as stale"
-assert_contains "$LAST_STDERR" "Blocked by #N" \
+assert_contains "$LAST_STDERR" "Blocked by: #N" \
     "T2e: the remedy names the machine-checkable form to record"
+assert_contains "$LAST_STDERR" "park-record render --blocked-by" \
+    "T2e2: the remedy names the command that renders that form (#8925)"
 
 # A bot's own re-check comment must not count as documentation — that is the
 # #4507 self-perpetuating loop extract-refs already closes, inherited here.
@@ -292,15 +304,21 @@ assert_contains "$LAST_STDERR" "UNDOCUMENTED BLOCK" \
 # --- Group 3: genuinely still blocked — reports nothing ---------------------
 echo "Group 3: genuinely still blocked"
 
+# The blocker is DECLARED in a park record, not merely mentioned in prose: since
+# #8925 a prose-only park is reported regardless of its verdict, so "reports
+# nothing" is only reachable for a block whose reference a parser can read. The
+# prose-only half of that contract is T3i-T3k below.
 set_population '[{"number":200,"title":"Waiting on a live dependency"}]'
-issue_fixture 200 "Blocked by #9 (still in flight)."
+issue_fixture 200 "Blocked by #9 (still in flight).
+
+<!-- loom:park Blocked by: #9 by=curator at=2026-09-20T00:00:00Z -->"
 state_fixture issue 9 "OPEN"
 run_check
 assert_eq "0" "$LAST_RC" "T3a: a genuine block exits 0"
 assert_not_contains "$LAST_STDERR" "STALE BLOCK" "T3b: an open blocker is not reported as stale"
 assert_not_contains "$LAST_STDERR" "UNDOCUMENTED BLOCK" "T3c: an open blocker is not reported as undocumented"
 assert_not_contains "$LAST_STDERR" "WARNING" "T3d: nothing at all is written to stderr for a genuine block"
-assert_contains "$LAST_STDOUT" "no stale or undocumented" \
+assert_contains "$LAST_STDOUT" "no stale, superseded, undocumented or prose-only" \
     "T3e: the clear case prints the one-line stdout confirmation"
 
 run_check --quiet
@@ -319,12 +337,26 @@ run_check
 assert_not_contains "$LAST_STDERR" "STALE BLOCK" \
     "T3h: an open (even conflicting, even block-labelled) closing PR is not a stale block"
 
+# The same live dependency, cited only in prose: reported REGARDLESS of the
+# still-blocked verdict (#8925). A correct park whose blocker no parser can read
+# is the #8314/#8852 shape — waiting for it to go stale is what kept #8852 parked.
+set_population '[{"number":202,"title":"Parked in prose only"}]'
+issue_fixture 202 "Blocked by #9 — noted here, never declared."
+state_fixture issue 9 "OPEN"
+run_check
+assert_eq "0" "$LAST_RC" "T3i: a prose-only park still exits 0"
+assert_contains "$LAST_STDERR" "PROSE-ONLY PARK" \
+    "T3j: a cited blocker with no park record is reported as prose-only"
+assert_not_contains "$LAST_STDERR" "STALE BLOCK" \
+    "T3k: a prose-only park whose blocker is still open is not also stale"
+
 # An empty population — the healthy repo.
 echo "Group 4: empty population and failed reads"
 set_population '[]'
 run_check
 assert_eq "0" "$LAST_RC" "T4a: no open loom:blocked issues exits 0"
-assert_contains "$LAST_STDOUT" "no stale or undocumented" "T4b: an empty population is the clear case"
+assert_contains "$LAST_STDOUT" "no stale, superseded, undocumented or prose-only" \
+    "T4b: an empty population is the clear case"
 assert_eq "" "$LAST_STDERR" "T4c: an empty population writes nothing to stderr"
 
 # --- Group 4: a forge read that does not answer -----------------------------
@@ -356,6 +388,63 @@ assert_eq "0" "$LAST_RC" "T5a: --json exits 0"
 assert_eq "178" "$(jq -r '.stale[0].number' <<<"$LAST_STDOUT")" "T5b: --json lists the stale issue"
 assert_eq "180" "$(jq -r '.undocumented[0].number' <<<"$LAST_STDOUT")" "T5c: --json lists the undocumented issue"
 assert_eq "0" "$(jq -r '.unevaluated | length' <<<"$LAST_STDOUT")" "T5d: --json reports nothing unevaluated here"
+
+# --- Group 6: the PR population (#8925) ------------------------------------
+# The enumeration this suite had no stub case for at all, which is how the
+# missing `gh pr list` case above surfaced as five unrelated failures rather
+# than as absent coverage.
+echo "Group 6: the PR population"
+
+# pr_fixture <number> <body> <state> [labels-json] [mergeable] [mergeStateStatus]
+# One file answers every `gh pr view` the check makes for a PR: `body,comments`
+# for the reference read, and `number,state,labels,mergeable,mergeStateStatus`
+# for the PR's own superseding-block gate.
+pr_fixture() {
+    jq -n --argjson n "$1" --arg body "$2" --arg state "$3" \
+          --argjson labels "${4:-[]}" \
+          --arg mergeable "${5:-MERGEABLE}" \
+          --arg mss "${6:-CLEAN}" \
+          '{number: $n, body: $body, comments: [], state: $state, labels: $labels,
+            mergeable: $mergeable, mergeStateStatus: $mss}' \
+        >"$STUB_DIR/pr-$1.json"
+}
+
+# A parked PR whose declared blocker has closed, and which can otherwise land:
+# the unblock path #8925 adds. #8314's own shape.
+set_population '[]'
+set_pr_population '[{"number":8314,"title":"Parked PR with a cleared blocker"}]'
+pr_fixture 8314 "<!-- loom:park Blocked by: #8322 by=doctor at=2026-09-19T12:09:00Z -->" "OPEN"
+state_fixture issue 8322 "CLOSED"
+run_check
+assert_eq "0" "$LAST_RC" "T6a: the PR population is enumerated and exits 0"
+assert_contains "$LAST_STDERR" "STALE BLOCK" \
+    "T6b: a parked PR whose declared blocker closed is reported as a stale block"
+assert_contains "$LAST_STDERR" "PR #8314" \
+    "T6c: the finding names the artifact kind, not a bare number ambiguous across both populations"
+assert_not_contains "$LAST_STDERR" "PROSE-ONLY PARK" \
+    "T6d: a park record in the PR body is a declaration, not a prose-only park"
+
+# The same PR, now carrying `loom:operator-only`: the #4634/#7267 superseding
+# gate downgrades the unblock to held rather than clearing it.
+pr_fixture 8314 "<!-- loom:park Blocked by: #8322 by=doctor at=2026-09-19T12:09:00Z -->" "OPEN" \
+    '[{"id":"x","name":"loom:operator-only","color":"ABCDEF"}]'
+run_check
+assert_contains "$LAST_STDERR" "SUPERSEDED BLOCK" \
+    "T6e: a PR held by its own label is superseded, not ready to unpark"
+assert_not_contains "$LAST_STDERR" "STALE BLOCK" \
+    "T6f: a superseded PR is not also reported as a plain stale block"
+
+# `loom:changes-requested` is deliberately NOT in the self-block set: it is the
+# ordinary review cycle, not a pending human decision.
+pr_fixture 8314 "<!-- loom:park Blocked by: #8322 by=doctor at=2026-09-19T12:09:00Z -->" "OPEN" \
+    '[{"id":"x","name":"loom:changes-requested","color":"ABCDEF"}]'
+run_check
+assert_contains "$LAST_STDERR" "STALE BLOCK" \
+    "T6g: a review-cycle label does not supersede the PR's cleared blocker"
+
+# --no-prs skips the PR enumeration entirely.
+run_check --no-prs
+assert_eq "" "$LAST_STDERR" "T6h: --no-prs does not enumerate the PR population"
 
 # --- summary ---------------------------------------------------------------
 echo ""
