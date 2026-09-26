@@ -2682,7 +2682,7 @@ open `loom:review-requested` and `loom:merge-conflict` PRs.
 | Property | Behavior |
 |----------|----------|
 | Kill switch | `LOOM_REVIEW_CONFLICT_RECONCILE` (`0`/`false`/`no`/`off` disables), nested inside `LOOM_STALE_CLAIM_RECONCILE`. Defaults **ON**. |
-| `CONFLICTING` + `loom:review-requested` | Comment, then Judge's own DIRTY transition: `loom:review-requested` → `loom:changes-requested` + `loom:merge-conflict` (routes to Doctor; Judge's `--label loom:review-requested` query no longer sees it). The comment carries `<!-- loom:base-conflict flagged -->` **and** a `verdict=changes-requested` verdict-sha marker for the head, so the stale-verdict pass reads it `Fresh` and re-queues it itself once a rebase moves the head. |
+| `CONFLICTING` + `loom:review-requested` | Comment, then Judge's own DIRTY transition: `loom:review-requested` → `loom:changes-requested` + `loom:merge-conflict` (routes to Doctor; Judge's review-requested find-work query no longer sees it). The comment carries `<!-- loom:base-conflict flagged -->` **and** a `verdict=changes-requested` verdict-sha marker for the head, so the stale-verdict pass reads it `Fresh` and re-queues it itself once a rebase moves the head. |
 | `MERGEABLE` + `loom:merge-conflict` (no head move) | Returned to `loom:review-requested` — **only** if the newest state-changing comment is this pass's flag. A Judge's own DIRTY fallback or any later verdict is never undone here. |
 | `mergeable=UNKNOWN` | No information (GitHub computes it lazily) — no label change in either direction; re-read next tick. |
 | `loom:blocked` / `loom:operator` / `loom:operator-only` | Never touched. |
