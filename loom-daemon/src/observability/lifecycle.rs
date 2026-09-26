@@ -425,6 +425,11 @@ pub fn prepare_execution(
         metadata.insert("loom.issue".into(), story.issue.to_string());
         metadata.insert("loom.repo".into(), story.repo.clone());
         metadata.insert("loom.story_id".into(), story.context.trace_id.as_str().to_owned());
+        metadata.insert("loom.story".into(), story.story.clone());
+        metadata.insert(
+            "loom.story.key_version".into(),
+            crate::telemetry::trace::STORY_KEY_VERSION.into(),
+        );
     }
     if let Some(span) = begin(root, execution, SpanName::Sweep, metadata) {
         span.command(command);

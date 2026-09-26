@@ -63,6 +63,7 @@ pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
 pub mod ops;
 pub mod queue_snapshot;
+pub mod repo_identity;
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};

@@ -87,8 +87,28 @@ pub fn built_at() -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+/// The FULL 40-hex commit this binary was built from (#9027, D33 "full SHAs
+/// only"), or `"unknown"`. Display and self-update keep [`BUILT_COMMIT`].
+pub const BUILT_COMMIT_FULL: &str = env!("LOOM_DAEMON_GIT_COMMIT_FULL");
+
+/// Whether tracked files differed from [`BUILT_COMMIT_FULL`] at build time:
+/// `"clean"`, `"dirty"` or `"unknown"`.
+pub const BUILT_TREE_STATE: &str = env!("LOOM_DAEMON_GIT_DIRTY");
+
+/// `<version> <40-hex> clean|dirty|unknown` — the D33 `build` field, as
+/// written into `Loom-Build:` trailers and `loom:provenance` markers.
+pub const BUILD_STAMP: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " ",
+    env!("LOOM_DAEMON_GIT_COMMIT_FULL"),
+    " ",
+    env!("LOOM_DAEMON_GIT_DIRTY")
+);
+
 /// The full build identity of this binary — `"<version> (commit <sha>, built
-/// <ts>)"` — as shown by `loom-daemon --version`.
+/// <ts>, source <40-hex> <tree-state>)"` — as shown by `loom-daemon --version`.
+/// The leading `(commit <sha>, built <ts>` shape is what
+/// `loom-daemon-update.sh`'s `extract_commit` parses; keep it first.
 ///
 /// Lives here (the lib crate) rather than inline in `main.rs` so library code
 /// can stamp it into operator-facing failures too: the empty-token-pool error
@@ -101,6 +121,10 @@ pub const BUILD_IDENTITY: &str = concat!(
     env!("LOOM_DAEMON_GIT_COMMIT"),
     ", built ",
     env!("LOOM_DAEMON_BUILD_TIME"),
+    ", source ",
+    env!("LOOM_DAEMON_GIT_COMMIT_FULL"),
+    " ",
+    env!("LOOM_DAEMON_GIT_DIRTY"),
     ")"
 );
 
