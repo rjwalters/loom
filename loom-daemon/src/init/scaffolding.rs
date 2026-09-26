@@ -1636,3 +1636,9 @@ mod agent_skills_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod legacy_permissions_tests;
+// Same reason as `agent_skills_tests` above: `scaffolding/tests.rs` is
+// frozen at its file-size ratchet baseline, so the pre-#4187 legacy-duplicate
+// absorption tests (issue #8875) live in their own sibling module instead.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod legacy_label_duplicates_tests;

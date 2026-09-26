@@ -456,23 +456,10 @@ DECL_NAMES=()
 DECL_COLORS=()
 DECL_DESCS=()
 
-# Names declared more than once in $LABELS_FILE (one entry per distinct
-# duplicated name). Populated by read_declared_labels, independent of any
-# forge state (#8875): a repo upgraded across the #4187 marker-block boundary
-# without absorbing its pre-#4187 legacy labels ends up with two `- name:`
-# entries for the same label, which sync-labels.sh applies in file order (the
-# managed copy always wins on the forge) but --check then flags as permanent,
-# unconverging drift because it's comparing the live state against both
-# declared copies. That's a structural problem with labels.yml itself, not
-# forge drift, so it gets its own diagnostic rather than showing up as
-# confusing/inconsistent MISSING/STALE noise.
-DUPLICATE_LABELS=()
-
 read_declared_labels() {
   DECL_NAMES=()
   DECL_COLORS=()
   DECL_DESCS=()
-  DUPLICATE_LABELS=()
   local line name desc_line color_line description color
   while IFS= read -u 3 -r line; do
     if [[ "$line" =~ ^-\ name:\ (.+)$ ]]; then
@@ -497,25 +484,6 @@ read_declared_labels() {
       DECL_DESCS+=("$description")
     fi
   done 3< "$LABELS_FILE"
-
-  # O(n^2) name-collision scan: labels.yml is dozens of entries, so this costs
-  # nothing. `is_declared_label`-style linear search rather than an
-  # associative array for the same bash-3.2 reason documented on
-  # diff_declared_against_live_tsv below.
-  local i j already n
-  for ((i = 0; i < ${#DECL_NAMES[@]}; i++)); do
-    already=""
-    for n in ${DUPLICATE_LABELS[@]+"${DUPLICATE_LABELS[@]}"}; do
-      [[ "$n" == "${DECL_NAMES[$i]}" ]] && already=1 && break
-    done
-    [[ -n "$already" ]] && continue
-    for ((j = i + 1; j < ${#DECL_NAMES[@]}; j++)); do
-      if [[ "${DECL_NAMES[$j]}" == "${DECL_NAMES[$i]}" ]]; then
-        DUPLICATE_LABELS+=("${DECL_NAMES[$i]}")
-        break
-      fi
-    done
-  done
 }
 
 # is_declared_label <name> -> 0 if $name is in DECL_NAMES, else 1.
@@ -552,17 +520,26 @@ EXTRA_LABELS=()
 # reachable at all since #7717 -- this function previously crashed before
 # these lines ran.
 print_label_check_report() {
-  local n s
+  # Structural check, independent of live forge state (#8875): ported to
+  # `loom-daemon label-duplicates` per the shell language policy rather than
+  # growing this `contract`-category script's own portable-shell line count.
+  # The subcommand prints the count on stdout (captured below) and, when
+  # nonzero, the human-readable per-name report plus a de-duplication
+  # advisory on stderr (passed straight through to the terminal, not
+  # captured) — so this stub needs no formatting or looping of its own. No
+  # binary resolved is inconclusive, not a false negative: dup_count stays 0
+  # and this diagnostic is silently skipped, same as git-blob-lines'
+  # handling in verify-proposal-refs.sh. Resolved here, in the one function
+  # that needs it, rather than at top level; declared alongside the other
+  # locals below to add no further line to this `contract`-category file.
+  local n s dup_count=0 dup_bin; dup_bin="$(source "${SCRIPT_DIR}/lib/locate-daemon-bin.sh" && loom_resolve_self_daemon_bin)"; [[ -n "$dup_bin" ]] && dup_count="$("$dup_bin" label-duplicates "$LABELS_FILE")"
 
-  if [[ "${#MISSING_LABELS[@]}" -eq 0 && "${#STALE_LABELS[@]}" -eq 0 && "${#EXTRA_LABELS[@]}" -eq 0 && "${#DUPLICATE_LABELS[@]}" -eq 0 ]]; then
+  if [[ "${#MISSING_LABELS[@]}" -eq 0 && "${#STALE_LABELS[@]}" -eq 0 && "${#EXTRA_LABELS[@]}" -eq 0 && "$dup_count" -eq 0 ]]; then
     success "Label check: ${#DECL_NAMES[@]} declared label(s), all in sync with $REPO. No unknown loom:-prefixed extras."
     return 0
   fi
 
-  warning "Label drift detected on $REPO (${#DECL_NAMES[@]} declared, ${#MISSING_LABELS[@]} missing, ${#STALE_LABELS[@]} stale, ${#EXTRA_LABELS[@]} unknown extra, ${#DUPLICATE_LABELS[@]} duplicate name(s) in $LABELS_FILE):"
-  for n in ${DUPLICATE_LABELS[@]+"${DUPLICATE_LABELS[@]}"}; do
-    echo "  DUPLICATE     $n (declared more than once in $LABELS_FILE — structural drift in the file itself, independent of forge state; likely a pre-#4187-upgrade artifact, see #8875)" >&2
-  done
+  warning "Label drift detected on $REPO (${#DECL_NAMES[@]} declared, ${#MISSING_LABELS[@]} missing, ${#STALE_LABELS[@]} stale, ${#EXTRA_LABELS[@]} unknown extra, $dup_count duplicate name(s) in $LABELS_FILE):"
   for n in ${MISSING_LABELS[@]+"${MISSING_LABELS[@]}"}; do
     echo "  MISSING       $n (declared in labels.yml, absent on $REPO)" >&2
   done
@@ -574,9 +551,6 @@ print_label_check_report() {
   done
   if [[ "${#MISSING_LABELS[@]}" -gt 0 || "${#STALE_LABELS[@]}" -gt 0 ]]; then
     warning "Run without --check (still additive-only, never deletes/renames) to create the missing labels and refresh the stale ones."
-  fi
-  if [[ "${#DUPLICATE_LABELS[@]}" -gt 0 ]]; then
-    warning "$LABELS_FILE declares one or more labels more than once — de-duplicate the file by hand (or reinstall Loom, which now absorbs pre-#4187 duplicates automatically) before --check can converge."
   fi
   # 3 (not 1) so callers can distinguish "drift found" from a forge/lookup
   # error, which error() reports separately via exit 1 before this ever runs.
