@@ -343,7 +343,7 @@ fn execution_root_is_derived_from_repo_and_sweep_id() {
 #[test]
 fn story_execution_span_is_derived_from_the_story_and_sweep_id() {
     let dir = tempfile::tempdir().unwrap();
-    let story = story_context("rjwalters/loom", 42);
+    let story = story_context(1_073_994_527, 42).unwrap();
     let store = TraceStore::new(dir.path());
     let saved = store
         .load_or_create_story(dir.path(), "sweep-issue-42-1", Some(&story))
