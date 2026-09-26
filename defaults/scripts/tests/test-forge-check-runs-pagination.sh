@@ -389,8 +389,8 @@ reset_loop_state() {
 queue_poll() { printf '%s\n' "$1" >> "$QUEUE_FILE"; }
 
 # (3a) Every poll comes back truncated. The loop must NEVER settle: it polls to
-# the bounded deadline and then hard-fails, which is what keeps the merge from
-# happening. A truncated read is also NOT a 404, so it must not trip the
+# the bounded deadline and then exits without merging, which is what keeps the
+# merge from happening. A truncated read is also NOT a 404, so it must not trip the
 # persistent-404 short-circuit that proceeds straight to the merge.
 reset_loop_state
 LOOM_AUTO_MERGE_TIMEOUT=5
@@ -399,7 +399,12 @@ queue_poll "$FORGE_CHECK_RUNS_RC_TRUNCATED -"
 rc=$?
 log="$(cat "$LOG_FILE")"
 calls="$(cat "$CALLS_FILE")"
-assert_eq "1" "$rc" "(3a) persistently truncated read: function fails (never returns 0 = 'safe to merge')"
+# Exit 5, not 1 (#8896/#8993): a check-runs read still unreadable at the
+# deadline -- truncated included -- is merge-pr.sh's "not merged, re-queue"
+# code (defaults/docs/merge-pr-exit-code-exceptions.md, "Exit 5"). The safety
+# property is that it is never 0 = "safe to merge"; the asserts below pin the
+# rest of it (never settles, never short-circuits to the merge).
+assert_eq "5" "$rc" "(3a) persistently truncated read: exits 5 = not merged, re-queue (never returns 0 = 'safe to merge')"
 assert_not_contains "$log" "checks settled" "(3a) persistently truncated read: never declares checks settled"
 assert_not_contains "$log" "proceeding to synchronous merge" \
   "(3a) persistently truncated read: never short-circuits to the synchronous merge"
