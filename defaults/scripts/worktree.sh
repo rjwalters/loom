@@ -481,6 +481,56 @@ cleanup_partial_worktree_state() {
     return 0
 }
 
+# --------------------------------------------------------------------------
+# Upstream-tracking correction + stale-worktree drift report (#6095/#6100,
+# #6257/#6291)
+# --------------------------------------------------------------------------
+#
+# Ported to `loom-daemon worktree-upstream` (#8195 slice 9, epic #7810). ONE
+# delegation with two arms, because this script carried TWO hand-maintained
+# copies of the same fix and they drifted:
+#
+#   local-branch         the "local branch already exists - reusing it" arm
+#                        (#6095/#6100, the #6086/PR #6093 incident: a branch
+#                        left tracking origin/$DEFAULT_BRANCH turns a later
+#                        `git pull --ff-only` into a silent fast-forward onto
+#                        main's tip)
+#   registered-worktree  the "worktree dir exists and git knows it" fast path
+#                        (#6257/#6291) — the same correction, re-implemented by
+#                        hand eighteen months later because, as that arm's own
+#                        comment said, it is "a completely different code path"
+#                        — plus the behind-the-pushed-tip drift report
+#
+# $3 is the caller's own `git status --porcelain` reading, taken BEFORE the
+# fetch; only its emptiness matters. It is passed rather than re-read inside
+# the subcommand so the hint block it selects agrees with the preserve/reset
+# decision the caller has already made from that same reading.
+#
+# A daemon that predates the port is NOT probed for with `--help` first, and
+# its clap usage error is NOT sent to /dev/null — deliberately, unlike the
+# `worktree-branch-conflict` guard below. There, clap's exit 2 collides with a
+# meaningful answer, so the probe buys correctness; here the exit code is
+# discarded outright, so the only thing a probe or a redirect would buy is
+# quiet. During a rolling fleet upgrade that one stderr line naming the missing
+# subcommand is the best signal available that this check was skipped — and the
+# port itself writes nothing to stderr (pinned by the differential harness), so
+# nothing else can appear there to be confused with it.
+#
+# requires-daemon: worktree-upstream optional  #8195 slice 9 — without it neither arm runs: a branch keeps whatever upstream it had and a stale worktree is preserved unannounced, which is the pre-#6095 / pre-#6257 behaviour. A lost diagnosis, not a lost file — nothing on this path creates, deletes or resets anything.
+_worktree_upstream_check() {
+    [[ -n "${_WT_DAEMON_BIN:-}" ]] || return 0
+
+    # Literal-or-empty strings rather than an array, for the bash 3.2 reason
+    # spelled out in cleanup_partial_worktree_state above.
+    local _q="" _u=""
+    [[ "$JSON_OUTPUT" == "true" ]] && _q="--quiet"
+    [[ -n "${3:-}" ]] && _u="--uncommitted"
+    # shellcheck disable=SC2086  # $_q/$_u are fixed literal flags or empty
+    "$_WT_DAEMON_BIN" worktree-upstream --arm "$1" --repo "$2" \
+        --branch "$BRANCH_NAME" --issue "$ISSUE_NUMBER" $_q $_u || true
+    return 0
+}
+
 # Shared preamble for the two `loom_exec_script_helper` verbs below (`remove`,
 # and the WIP trio): source lib/script-helper.sh, or exit 2 naming $1. The exec
 # line itself deliberately stays in each caller with its subcommand spelled
@@ -1486,47 +1536,19 @@ if [[ -d "$WORKTREE_PATH" ]]; then
         # #6257: this "worktree directory + branch already registered with
         # git" fast path is a completely different code path from the
         # "local branch exists, no worktree dir yet" reuse path below
-        # (#6095/#6100) — that fix's upstream-tracking correction never runs
+        # (#6095/#6100) — that fix's upstream-tracking correction never ran
         # here, so a worktree left with stale HEAD and/or wrong upstream
         # tracking was silently "preserved" (below) and handed straight to a
         # Judge/Doctor session with no signal that it no longer matched the
         # branch's actual pushed tip. Correct/report drift against the
         # branch's OWN upstream (not just BASE_REF, computed above) before
         # deciding whether to preserve.
-        git -C "$WORKTREE_PATH" fetch origin "$BRANCH_NAME" 2>/dev/null || true
-        if git -C "$WORKTREE_PATH" show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
-            wt_current_upstream="$(git -C "$WORKTREE_PATH" rev-parse --abbrev-ref "$BRANCH_NAME@{u}" 2>/dev/null || true)"
-            if [[ "$wt_current_upstream" != "origin/$BRANCH_NAME" ]]; then
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    if [[ -n "$wt_current_upstream" ]]; then
-                        print_warning "Worktree branch '$BRANCH_NAME' was tracking '$wt_current_upstream' - correcting to 'origin/$BRANCH_NAME'"
-                    else
-                        print_info "Worktree branch '$BRANCH_NAME' has no upstream - setting it to 'origin/$BRANCH_NAME'"
-                    fi
-                fi
-                git -C "$WORKTREE_PATH" branch --set-upstream-to="origin/$BRANCH_NAME" "$BRANCH_NAME" 2>/dev/null || true
-            fi
-
-            wt_head_sha="$(git -C "$WORKTREE_PATH" rev-parse HEAD 2>/dev/null || true)"
-            wt_origin_tip="$(git -C "$WORKTREE_PATH" rev-parse "origin/$BRANCH_NAME" 2>/dev/null || true)"
-            if [[ -n "$wt_head_sha" && -n "$wt_origin_tip" && "$wt_head_sha" != "$wt_origin_tip" ]] && \
-               git -C "$WORKTREE_PATH" merge-base --is-ancestor "$wt_head_sha" "$wt_origin_tip" 2>/dev/null; then
-                # Local HEAD is a strict ancestor of the branch's pushed tip -
-                # i.e. genuinely behind (not just diverged/ahead with unpushed
-                # local commits, which is expected and not drift).
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_warning "Worktree HEAD ($wt_head_sha) is behind the pushed tip of branch '$BRANCH_NAME' ($wt_origin_tip) - this worktree may be stale"
-                    if [[ -n "$local_uncommitted" ]]; then
-                        print_warning "Worktree also has uncommitted changes - resolve before evaluating/building on it:"
-                        print_info "  ./.loom/scripts/worktree.sh snapshot $ISSUE_NUMBER --include-untracked   # save WIP"
-                        print_info "  git -C $WORKTREE_PATH checkout -- .                                       # clear tracked working-tree drift"
-                        print_info "  git -C $WORKTREE_PATH pull --ff-only                                      # resync to origin/$BRANCH_NAME"
-                    else
-                        print_info "  git -C $WORKTREE_PATH pull --ff-only   # resync to origin/$BRANCH_NAME"
-                    fi
-                fi
-            fi
-        fi
+        #
+        # The two code paths now share ONE implementation (#8195 slice 9) —
+        # see _worktree_upstream_check above. $local_uncommitted is the
+        # reading taken a few lines up, passed rather than re-read so the
+        # remediation hint agrees with the preserve/reset decision below.
+        _worktree_upstream_check registered-worktree "$WORKTREE_PATH" "$local_uncommitted"
 
         if [[ "$local_commits_ahead" -gt 0 || -n "$local_uncommitted" ]]; then
             # Worktree has real work - preserve it
@@ -1610,18 +1632,11 @@ if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
     # local branch's upstream at it before handing the branch to `git
     # worktree add`. If origin has no branch of this name (never pushed),
     # leave tracking as-is — do not fabricate an upstream that doesn't exist.
-    # (The two-deep message dispatch below is one physical line, not two
-    # separate `if`s, to keep this reuse arm's net line count in the shell
-    # budget ratchet's portable pool flat — see the #8280 comment below for
-    # why that budget was worth spending on.)
-    git fetch origin "$BRANCH_NAME" 2>/dev/null || true
-    if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
-        current_upstream="$(git rev-parse --abbrev-ref "$BRANCH_NAME@{u}" 2>/dev/null || true)"
-        if [[ "$current_upstream" != "origin/$BRANCH_NAME" ]]; then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then if [[ -n "$current_upstream" ]]; then print_warning "Branch '$BRANCH_NAME' was tracking '$current_upstream' - correcting to 'origin/$BRANCH_NAME'"; else print_info "Branch '$BRANCH_NAME' has no upstream - setting it to 'origin/$BRANCH_NAME'"; fi; fi
-            git branch --set-upstream-to="origin/$BRANCH_NAME" "$BRANCH_NAME" 2>/dev/null || true
-        fi
-    fi
+    #
+    # Shares its implementation with the registered-worktree fast path above
+    # since #8195 slice 9 — see _worktree_upstream_check. cwd is the main
+    # workspace here, which is what $WORKTREE_REPO_ROOT holds.
+    _worktree_upstream_check local-branch "$WORKTREE_REPO_ROOT"
 
     # #8280: the sibling arm below refuses an already-LANDED branch via the
     # shared `branch_landed` primitive (#5657/#7812) before reusing it, and

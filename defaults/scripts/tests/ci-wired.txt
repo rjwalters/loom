@@ -217,10 +217,8 @@ test-version-check-gate.sh
 test-warn-operator-gated.sh
 test-warn-out-of-set-deps.sh
 test-worktree-base-override.sh
-test-worktree-existing-dir-drift-check.sh
 test-worktree-forge-pr-check.sh
 test-worktree-hookspath.sh
-test-worktree-local-branch-upstream-tracking.sh
 test-worktree-remote-branch-tracking.sh
 test-worktree-root-override.sh
 test-worktree-sentinel-reinvoke.sh

@@ -1554,13 +1554,28 @@ jobs:
       # what happened before this guard existed) but is not the thing this test
       # exists to measure, so the suite pins the binary via
       # loom_test_require_daemon_bin and FAILS rather than skips without one —
-      # same reasoning as race-rescue just above. Ten of the 20
-      # test-worktree-*.sh suites now run here (nine moved by a port slice,
-      # plus test-worktree-issue-lock.sh, which was daemon-driven from the
-      # start); the remaining ten exercise create-path arms these slices did
-      # not touch and stay hermetic in shell-suite-tests.
+      # same reasoning as race-rescue just above.
       - name: worktree branch-conflict auto-recovery (ported in #8195 slice 7)
         run: bash defaults/scripts/tests/test-worktree-json-purity.sh
+      # Moved out of shell-suite-tests by #8195 slice 9: worktree.sh's TWO
+      # hand-maintained copies of the upstream-tracking correction — the
+      # branch-reuse arm (#6095/#6100) and the registered-worktree fast path
+      # (#6257/#6291, which re-implemented it because, in that arm's own words,
+      # it is "a completely different code path") — are now one
+      # `loom-daemon worktree-upstream`, selected by `--arm`. Both suites
+      # assert that the correction (and, for the second, the drift report)
+      # ACTUALLY HAPPENS; without a binary neither runs at all, which is a
+      # correct documented degradation to the pre-#6095/pre-#6257 behaviour but
+      # would leave the assertions measuring nothing. Both pin the binary via
+      # loom_test_require_daemon_bin and FAIL rather than skip. Twelve of the 20
+      # test-worktree-*.sh suites now run here (eleven moved by a port slice,
+      # plus test-worktree-issue-lock.sh, which was daemon-driven from the
+      # start); the remaining eight exercise create-path arms these slices did
+      # not touch and stay hermetic in shell-suite-tests.
+      - name: worktree local-branch upstream correction (#6095, #6100, ported in #8195 slice 9)
+        run: bash defaults/scripts/tests/test-worktree-local-branch-upstream-tracking.sh
+      - name: worktree existing-dir upstream + drift check (#6257, #6291, ported in #8195 slice 9)
+        run: bash defaults/scripts/tests/test-worktree-existing-dir-drift-check.sh
       # Moved out of shell-suite-tests by #8191's delete-branch slice:
       # merge-pr.sh's `_maybe_delete_local_branch` now delegates to
       # `loom-daemon merge-pr delete-branch` (the same branch_delete rule
