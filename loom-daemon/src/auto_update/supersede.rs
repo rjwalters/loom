@@ -44,6 +44,12 @@ pub struct ArmedRoll {
     /// `true` when the armed drain's terminal action is "stop and stay down"
     /// (a `fleet drain` teardown), which is never superseded.
     pub then_exit: bool,
+    /// How many drain deadlines this roll has already refused
+    /// ([`crate::ipc::DrainDescriptor::refusals`]). Read by #8998's
+    /// unsatisfiability tracker, which sums it *across* roll lifetimes — the
+    /// field restarts at `0` on every fresh drain, which is exactly why
+    /// counting only the live roll's refusals could never conclude anything.
+    pub refusals: u32,
 }
 
 /// What a tick should do about a roll that is already armed (#8514).
@@ -176,6 +182,7 @@ mod tests {
             target: Some(target.to_string()),
             pending: true,
             then_exit: false,
+            refusals: 1,
         }
     }
 
@@ -203,6 +210,7 @@ mod tests {
             target: Some("v0.19.24@aaaa".to_string()),
             pending: false,
             then_exit: false,
+            refusals: 0,
         };
         let action = decide_armed_roll(Some(&armed), &newer());
         assert!(
@@ -217,6 +225,7 @@ mod tests {
             target: Some("v0.19.24@aaaa".to_string()),
             pending: true,
             then_exit: true,
+            refusals: 1,
         };
         let action = decide_armed_roll(Some(&armed), &newer());
         assert!(
@@ -231,6 +240,7 @@ mod tests {
             target: None,
             pending: true,
             then_exit: false,
+            refusals: 1,
         };
         let action = decide_armed_roll(Some(&armed), &newer());
         assert!(

@@ -69,6 +69,24 @@ pub trait DrainTrigger: Send {
         let _ = (from, to);
         false
     }
+
+    /// Abandon the armed roll because its drain condition is **unsatisfiable**
+    /// (Issue #8998): discard the roll intent, resume normal dispatch, and
+    /// record `reason` as the drain note.
+    ///
+    /// Distinct from [`Self::supersede_roll`] in intent, not in mechanism — both
+    /// go through the operator `--abort-drain` primitive. A supersede discards a
+    /// roll because a *better* one is available and arms that one in its place;
+    /// this discards a roll because no roll can complete on this host right now
+    /// and arms nothing. Neither cancels a sweep.
+    ///
+    /// Returns `true` when a roll was actually abandoned. Defaults to `false`
+    /// so a trigger with no drain state (tests, alternative triggers) behaves
+    /// exactly as before.
+    fn abandon_roll(&self, reason: &str) -> bool {
+        let _ = reason;
+        false
+    }
 }
 
 /// The production [`DrainTrigger`]: calls [`crate::ipc::handle_drain_request`]
@@ -172,6 +190,7 @@ impl DrainTrigger for IpcDrainTrigger {
             target: snap.roll_target,
             pending: snap.roll_pending,
             then_exit: snap.then_exit,
+            refusals: snap.refusals,
         })
     }
 
@@ -196,5 +215,26 @@ impl DrainTrigger for IpcDrainTrigger {
             );
         }
         superseded
+    }
+
+    fn abandon_roll(&self, reason: &str) -> bool {
+        // Same primitive as `supersede_roll` above, for the same reason: it
+        // clears the pause flag, bumps the generation so the live supervisor
+        // stands down without exiting the process, and resets every piece of
+        // #6007's pending-roll bookkeeping. Re-deriving that reset by hand is
+        // how the pre-#6007 drain/work-finder livelock would come back.
+        let abandoned = self.drain.abort();
+        if abandoned {
+            // `abort()`'s own note says "aborted by operator", which is not what
+            // happened — the daemon gave up on its own roll. Overwrite it so
+            // `status --json`'s `drain_note` names the real reason dispatch
+            // resumed, alongside `auto_update_note`.
+            self.drain.set_note(reason.to_string());
+            let _ = self.event_bus.publish_generic(
+                "daemon.drain.roll_unsatisfiable",
+                serde_json::json!({ "reason": reason }),
+            );
+        }
+        abandoned
     }
 }
