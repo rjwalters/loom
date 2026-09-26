@@ -65,6 +65,9 @@ jobs:
       scripts: ${{ steps.filter.outputs.scripts }}
       dashboard: ${{ steps.filter.outputs.dashboard }}
       docker: ${{ steps.filter.outputs.docker }}
+      # Whether anything in this PR can be measured by a gate that runs the
+      # shared debug daemon. Computed below, not a raw paths-filter output.
+      daemon: ${{ steps.daemon.outputs.needed }}
     steps:
       # Folded in from the former Cancel Superseded Runs job (#9065). It still
       # runs first and only on pull_request (this job's own `if`), and
@@ -103,6 +106,13 @@ jobs:
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
+          # `non_dashboard` below is the only filter here with a negated
+          # pattern, and a negation needs a quantifier that knows what `!`
+          # means. `some-with-excludes` is "at least one non-negated pattern
+          # matches AND no negated pattern matches", so for a filter with no
+          # `!` pattern it is byte-for-byte the default `some` — every filter
+          # below keeps the exact semantics it had before #9113.
+          predicate-quantifier: some-with-excludes
           filters: |
             backend:
               - 'loom-daemon/**'
@@ -126,6 +136,32 @@ jobs:
             dashboard:
               - 'dashboard/**'
               - '.github/workflows/ci.yml'
+            # Does the PR touch anything OUTSIDE dashboard/? (#9113)
+            #
+            # Not `dashboard == 'true'` inverted: a PR touching BOTH the
+            # dashboard and the daemon must still build the daemon, and
+            # `dashboard` is true for both. This asks the question that
+            # actually matters -- "is there any non-dashboard file here" --
+            # so a mixed PR answers true on its non-dashboard half.
+            #
+            # An exclusion is final in `some-with-excludes` (a file excluded
+            # by `!dashboard/**` cannot be re-included by a later pattern),
+            # which is why dashboard shell has its own filter rather than a
+            # re-inclusion here.
+            non_dashboard:
+              - '**'
+              - '!dashboard/**'
+            # The Shell Budget Ratchet measures EVERY tracked `.sh`, including
+            # dashboard/scripts/check-deploy-config.sh (category `contract`,
+            # inside the portable budget) and dashboard/scripts/ensure-web-dist.sh
+            # (`settled`), and it FAILS on any `.sh` with no allowlist entry.
+            # So a dashboard-only PR that adds, deletes or grows a shell script
+            # is a PR that gate can fail on -- ci-principles.md rule 3: a check
+            # that can fail because of a file outside its path group must not
+            # be filtered by path.
+            dashboard_shell:
+              - 'dashboard/*.sh'
+              - 'dashboard/**/*.sh'
             docker:
               - 'docker/**'
               - '.dockerignore'
@@ -166,17 +202,67 @@ jobs:
               - '**/package.json'
               - '.github/workflows/ci.yml'
 
+      # Does this run need the shared debug daemon built at all? (#9113)
+      #
+      # One output, computed once, so the ten places that consume the
+      # `loom-daemon-debug` artifact all ask the same question and cannot
+      # drift apart. It is false ONLY for a PR that is entirely inside
+      # dashboard/ and carries no shell script -- i.e. a PR on which no gate
+      # that runs the daemon could fail.
+      #
+      # `backend` and `scripts` are OR'd in to keep one invariant absolute:
+      # every job that downloads the artifact must have had it produced.
+      # `scripts` matches `**/package.json`, which DOES match
+      # dashboard/package.json -- without this term a PR touching only
+      # dashboard/package.json would run Installer Integration Tests and both
+      # Native Port Suites jobs against an artifact nobody built.
+      #
+      # Consumers read `!= 'false'`, never `== 'true'`, so every ambiguous
+      # state fails CLOSED: on a push this job does not run at all and the
+      # output is empty, and if the filter above errors it is empty too --
+      # both build the daemon and run every gate.
+      - name: Decide whether the shared debug daemon is needed
+        id: daemon
+        env:
+          NON_DASHBOARD: ${{ steps.filter.outputs.non_dashboard }}
+          DASHBOARD_SHELL: ${{ steps.filter.outputs.dashboard_shell }}
+          BACKEND: ${{ steps.filter.outputs.backend }}
+          SCRIPTS: ${{ steps.filter.outputs.scripts }}
+        run: |
+          set -euo pipefail
+          needed=false
+          if [[ "$NON_DASHBOARD" == 'true' || "$DASHBOARD_SHELL" == 'true' \
+             || "$BACKEND" == 'true' || "$SCRIPTS" == 'true' ]]; then
+            needed=true
+          fi
+          echo "daemon needed=$needed (non_dashboard=$NON_DASHBOARD dashboard_shell=$DASHBOARD_SHELL backend=$BACKEND scripts=$SCRIPTS)"
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+
   build-daemon:
     name: Build loom-daemon (debug, shared)
     # Compiles the debug daemon ONCE per run and hands the binary to the eight
     # jobs that only RUN it (#9065). Each of them used to compile it for
     # itself: measured on PR #9073, their build steps took 100-130s apiece and
     # the jobs themselves dropped to 9-24s once they downloaded the binary
-    # instead. Deliberately NOT path-filtered: required always-run checks
-    # (Shell Budget Ratchet, .gitignore Convergence Check) consume it, and
-    # they use `if: ${{ !cancelled() }}` so that a failed build turns them
-    # red. A `needs:` failure would otherwise SKIP them, and a skipped
-    # required check counts as passing (ci-principles.md rule 6).
+    # instead.
+    #
+    # Skipped on a dashboard-only PR (#9113) -- and ONLY there. `changes.daemon`
+    # is false exactly when no gate that runs this binary could fail on the
+    # PR's files; see its comment above for why that is a stricter question
+    # than `dashboard == 'true'`.
+    #
+    # This does NOT make the gates it feeds skippable, which is the trap
+    # #9113's original proposal walked into. Daemon Checks is a REQUIRED
+    # context and keeps `if: ${{ !cancelled() }}`, so it runs and reports on
+    # every PR; a `needs:` failure would SKIP it instead, and a skipped
+    # required check counts as passing (ci-principles.md rule 6). What is
+    # gated is its daemon-dependent STEPS, under the SAME `daemon != 'false'`
+    # predicate as this job -- so the artifact exists whenever a step wants
+    # it, and the job reports success having honestly run nothing.
+    needs: changes
+    # `!cancelled()` (not `success()`): `changes` does not run on push, and a
+    # skipped `needs:` would otherwise skip this job on every merge to main.
+    if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -821,7 +907,10 @@ jobs:
     # ONE required context for the two required gates that run the shared debug
     # daemon (#9065): Shell Budget Ratchet and .gitignore Convergence Check,
     # each marked `# component:` exactly like Structural Checks.
-    needs: build-daemon
+    # `changes` is here only so the steps can read `changes.daemon` (#9113).
+    # It does NOT gate the job: the `if:` below is unchanged, so this required
+    # context still runs and reports on every single PR.
+    needs: [build-daemon, changes]
     # Runs (and goes RED) when build-daemon failed: a needs-failure would
     # otherwise SKIP this job, and GitHub counts a skipped required check as
     # passing (ci-principles.md rule 6).
@@ -834,21 +923,37 @@ jobs:
           fetch-depth: 0
       # download-artifact FAILS when the artifact is missing, so a broken build
       # turns this job red rather than letting it pass on nothing.
+      #
+      # `daemon != 'false'` is build-daemon's OWN predicate (#9113), so the
+      # artifact exists whenever this step runs. On a dashboard-only PR both
+      # are false: nothing is downloaded, the gates below do not run, and this
+      # required context reports success having honestly measured nothing it
+      # could have failed on. It is never SKIPPED -- a skipped required check
+      # counts as passing (ci-principles.md rule 6) and would void the gate.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         with:
           name: loom-daemon-debug
           path: target/debug
-      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
+      - if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+        run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
 
       # component: Shell Budget Ratchet
-      # Always runs, like every other structural ratchet here — deliberately NOT
-      # behind `needs: changes`. The first cut of this gate lived inside `Rust
-      # Unit Tests`, which is gated on the `backend` paths filter; that filter
-      # covers `loom-daemon/**` but not `scripts/**` or `defaults/**`, so a PR
-      # that ADDED a shell script skipped the job entirely and the ratchet first
-      # fired on the push to `main`. A gate skipped on exactly the changes it
-      # targets is not a gate. See .loom/docs/ci-principles.md: path-filtering is
-      # an optimisation, not a correctness tool.
+      # NOT behind the `backend` paths filter, and #9113 did not put it there.
+      # The first cut of this gate lived inside `Rust Unit Tests`, which is
+      # gated on `backend`; that filter covers `loom-daemon/**` but not
+      # `scripts/**` or `defaults/**`, so a PR that ADDED a shell script
+      # skipped the job entirely and the ratchet first fired on the push to
+      # `main`. A gate skipped on exactly the changes it targets is not a gate.
+      # See .loom/docs/ci-principles.md: path-filtering is an optimisation, not
+      # a correctness tool.
+      #
+      # `daemon != 'false'` is the one predicate it is allowed to sit behind,
+      # because that predicate is built from this gate's own reach rather than
+      # from a file group: it is false only when every changed file is under
+      # `dashboard/` AND none of them is a `.sh`. This gate measures every
+      # tracked `.sh` including dashboard's two, so dashboard shell is exactly
+      # what `changes.dashboard_shell` exists to keep out of the skip.
       #
       # It measures the pool epic #7810 is retiring — `contract` + `hook-entry`,
       # whose logic moves into the daemon behind a stub — rather than total
@@ -858,12 +963,15 @@ jobs:
       # default depth-1 checkout has no history to find one in. Without this the
       # comparison degrades to "no merge-base found" and measures the wrong tree.
       - name: Shell budget
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: ./target/debug/loom-daemon shell-budget --check
 
       # component: .gitignore Convergence Check
-      # Always runs (not gated on backend changes — a drifted .gitignore is
-      # detectable regardless of what a PR touches). Generalizes #5014 (the
+      # Not gated on backend changes — a drifted .gitignore is detectable
+      # regardless of which file group a PR touches. It runs under
+      # `daemon != 'false'` (#9113), which is false only for a PR entirely
+      # inside `dashboard/`; `.gitignore` and the EPHEMERAL_PATTERNS source
+      # both sit outside it, so such a PR cannot make this gate fail. Generalizes #5014 (the
       # managed gitignore block was missing .loom/account-health.json, found by
       # hand well after the pattern was added to EPHEMERAL_PATTERNS) into a
       # pre-merge gate. `loom-daemon update-gitignore` is already idempotent
@@ -871,16 +979,20 @@ jobs:
       # the binary, run update-gitignore against the checked-out repo, then
       # diff .gitignore against the PR's committed version.
       - name: Check .gitignore matches the current EPHEMERAL_PATTERNS set
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
 
   install-surface-checks:
     name: Install Surface Checks
     # Agent Skills Sync Check and Fresh Install Link Check on the shared debug
     # daemon (#9065). NOT required: they were not required as separate jobs
-    # either. Always runs, like both did (path filtering is an optimisation,
-    # ci-principles.md rule 3).
-    needs: build-daemon
+    # either. The job itself runs on every PR; its two gates are behind
+    # `daemon != 'false'` (#9113), never behind a file-group filter (path
+    # filtering is an optimisation, ci-principles.md rule 3). Both read only
+    # `defaults/`, which a dashboard-only PR cannot touch.
+    # `changes` is here only so the steps can read `changes.daemon` (#9113);
+    # the `if:` below is unchanged, so the job still runs on every PR.
+    needs: [build-daemon, changes]
     # Runs (and goes RED) when build-daemon failed: a needs-failure would
     # otherwise SKIP this job, and GitHub counts a skipped required check as
     # passing (ci-principles.md rule 6).
@@ -893,16 +1005,22 @@ jobs:
           fetch-depth: 0
       # download-artifact FAILS when the artifact is missing, so a broken build
       # turns this job red rather than letting it pass on nothing.
+      #
+      # Same `daemon != 'false'` predicate build-daemon uses (#9113): on a
+      # dashboard-only PR the binary is never built, so the two gates below --
+      # both of which read only defaults/ -- have nothing they could fail on.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         with:
           name: loom-daemon-debug
           path: target/debug
-      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
+      - if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+        run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
 
       # component: Agent Skills Sync Check
-      # Always runs, like every other structural ratchet (see
-      # ci-principles.md — path-filtering is an optimisation, not a correctness
-      # tool). Every defaults/.agents/skills/loom-<name>/SKILL.md is generated by
+      # Not behind a file-group filter (see ci-principles.md — path-filtering
+      # is an optimisation, not a correctness tool); only behind
+      # `daemon != 'false'` (#9113), and its inputs are all under `defaults/`. Every defaults/.agents/skills/loom-<name>/SKILL.md is generated by
       # `loom-daemon generate-agent-skills` from defaults/roles/<name>.md — this
       # fails if a checked-in SKILL.md is stale, keeping the cross-vendor
       # skill-discovery surface (Codex, Kimi Code, Mistral Vibe, Grok)
@@ -911,13 +1029,15 @@ jobs:
       # shell-language policy, #7762) rather than a `bash scripts/*.sh` check, so
       # it needs a build step first — same shape as the Shell Budget Ratchet job.
       - name: Check .agents/skills/ is in sync with its source
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: ./target/debug/loom-daemon generate-agent-skills --check
 
       # component: Fresh Install Link Check
-      # Always runs; deliberately NOT behind `needs: changes` (see
+      # Deliberately NOT behind a file-group filter (see
       # .loom/docs/ci-principles.md — path-filtering is an optimisation, not a
-      # correctness tool).
+      # correctness tool); only behind `daemon != 'false'` (#9113). It
+      # materialises an install of `defaults/`, so a PR confined to
+      # `dashboard/` changes nothing it reads.
       #
       # Why a REAL install instead of another static checker (#8270): every
       # existing link gate reasons about ONE destination for each source file.
@@ -938,7 +1058,7 @@ jobs:
       # it needs no model of the destination map at all — it IS the destination
       # map. This is the exact command sequence that failed in #8270.
       - name: Initialize Loom into an empty two-commit fixture repo
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: |
           set -euo pipefail
           FIXTURE="$(mktemp -d)"
@@ -953,7 +1073,7 @@ jobs:
           ./target/debug/loom-daemon init \
             --defaults "$GITHUB_WORKSPACE/defaults" "$FIXTURE" 2>&1 | tee /tmp/fresh-init.log
       - name: Manifest generation succeeded on the fresh init
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: |
           set -euo pipefail
           if grep -q 'Manifest generation failed\|Could not run verify-install.sh' /tmp/fresh-init.log; then
@@ -965,7 +1085,7 @@ jobs:
       # The installer treats a dangling link as fatal (install-loom.sh Step 3),
       # so reproduce it verbatim rather than paraphrasing the check.
       - name: Check intra-repo links in the freshly installed tree
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: cd "$FIXTURE" && bash .loom/scripts/verify-install.sh check-links
 
   repo-hygiene:
@@ -1277,6 +1397,10 @@ jobs:
     name: Native Port Suites
     needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
+    # Already path-filtered, so it SKIPS whole on a dashboard-only PR and never
+    # reaches the download (#9113). `changes.daemon` OR-s `backend` and
+    # `scripts` in precisely so this stays true: whenever this job runs,
+    # build-daemon ran too and the artifact exists.
     # The equivalence evidence for epic #7810. Every suite here carries
     # assertions written against a SHELL implementation that is now a thin stub
     # over a `loom-daemon` subcommand, so each needs a BUILT binary — which
@@ -1585,6 +1709,10 @@ jobs:
     name: Native Port Suites (daemon lifecycle, watchdog, spawn-claude)
     needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
+    # Already path-filtered, so it SKIPS whole on a dashboard-only PR and never
+    # reaches the download (#9113). `changes.daemon` OR-s `backend` and
+    # `scripts` in precisely so this stays true: whenever this job runs,
+    # build-daemon ran too and the artifact exists.
     # Split out of Native Port Suites by #9065, which see for everything else
     # about this family: that job ran ~420s of suites back to back, the
     # longest pole in CI. The steps are unchanged; only which runner runs
@@ -1668,6 +1796,10 @@ jobs:
     name: Installer Integration Tests
     needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
+    # Already path-filtered, so it SKIPS whole on a dashboard-only PR and never
+    # reaches the download (#9113). `changes.daemon` OR-s `backend` and
+    # `scripts` in precisely so this stays true: whenever this job runs,
+    # build-daemon ran too and the artifact exists.
     # Portable across GNU/BSD sed (temp-file + mv idiom) — runs on ubuntu (#3515)
     runs-on: ubuntu-latest
     timeout-minutes: 30
