@@ -40,6 +40,7 @@ fn host_health_with_captain(
         admission_brake: None,
         is_captain,
         armed_singleton_jobs,
+        captainless_singleton_jobs: Vec::new(),
     })
 }
 
@@ -110,4 +111,19 @@ fn host_health_decodes_a_pre_8848_record_as_no_captain() {
     };
     assert_eq!(health.is_captain, None);
     assert!(health.armed_singleton_jobs.is_empty());
+}
+
+#[test]
+fn host_health_carries_captainless_singleton_jobs_only_when_present_9014() {
+    let TelemetryRecord::HostHealth(mut health) = host_health_with_captain(None, Vec::new()) else {
+        unreachable!()
+    };
+    let empty = serde_json::to_value(&health).unwrap();
+    assert!(empty.get("captainless_singleton_jobs").is_none());
+
+    health.captainless_singleton_jobs = vec!["ci-telemetry-poll".to_string()];
+    let value = serde_json::to_value(&health).unwrap();
+    assert_eq!(value["captainless_singleton_jobs"], serde_json::json!(["ci-telemetry-poll"]));
+    let back: HostHealthRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(back.captainless_singleton_jobs, vec!["ci-telemetry-poll".to_string()]);
 }

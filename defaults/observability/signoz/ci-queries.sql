@@ -396,12 +396,13 @@ LIMIT {top:UInt32};
 --
 --    Two claims this section deliberately does NOT make, rather than
 --    overclaiming a split the data cannot support:
---    - "CI" below is ONE wall-clock segment (`ci.run`'s own `started_at` to
---      `completed_at`), not queued-vs-running: GitHub's queue timestamp
---      (`run.created_at`) never reaches `CiRunRecord` today, only the
---      effective `started_at` (`run_started_at`, falling back to
---      `created_at`). Splitting the two needs a `CiRunRecord` field addition
---      — a follow-up, not this issue's scope.
+--    - CI is split into two segments: `ci_queued_s` (`loom.ci.queued_ms`,
+--      GitHub's `created_at` to `run_started_at`: waiting for a runner) and
+--      `ci_wall_s` (`started_at` to `completed_at`: on a runner). The queue
+--      segment was added as a #9007 follow-up. It is NULL for a run recorded
+--      before that, or one GitHub reported no start for. It is never 0 by
+--      default. Both overlap the sweep phase columns (CI runs while Builder or
+--      Judge waits on it), so they are not additive with them.
 --    - "Lead time" is the SWEEP's own `total_duration_sec` (sweep start to
 --      terminal state), not issue-filed-to-merged: no forge issue-open
 --      timestamp reaches this telemetry stream — see
@@ -413,7 +414,9 @@ WITH ci_runs AS (
            toUInt64(attributes_number['loom.ci.run_id']) AS run_id,
            toUInt32(attributes_number['loom.ci.run_attempt']) AS run_attempt,
            attributes_string['loom.ci.conclusion'] AS ci_conclusion,
-           attributes_number['loom.ci.duration_ms'] AS ci_ms
+           attributes_number['loom.ci.duration_ms'] AS ci_ms,
+           if(mapContains(attributes_number, 'loom.ci.queued_ms'),
+              attributes_number['loom.ci.queued_ms'], NULL) AS ci_queued_ms
     FROM signoz_logs.logs_v2
     WHERE body = 'ci.run'
       AND mapContains(attributes_string, 'loom.ci.ref')
@@ -436,6 +439,7 @@ SELECT ro.repo AS repo,
           ro.phase_durations_sec[indexOf(ro.phases, 'merge')], NULL) AS merge_wait_s,
        c.run_id AS ci_run_id,
        c.ci_conclusion AS ci_conclusion,
+       round(c.ci_queued_ms / 1000, 1) AS ci_queued_s,
        round(c.ci_ms / 1000, 1) AS ci_wall_s
 FROM loom_analytics.raw_ship_outcome AS ro
 LEFT JOIN ci_runs AS c

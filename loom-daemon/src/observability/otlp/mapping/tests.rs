@@ -197,6 +197,7 @@ fn host_health_envelope() -> TelemetryEnvelope {
             admission_brake: None,
             is_captain: None,
             armed_singleton_jobs: Vec::new(),
+            captainless_singleton_jobs: Vec::new(),
         }),
     )
 }
@@ -515,6 +516,7 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     };
     let batch = vec![envelope(
         "host-c",

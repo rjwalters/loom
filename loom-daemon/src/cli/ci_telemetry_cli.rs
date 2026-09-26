@@ -182,6 +182,16 @@ fn status(root: &Path, json: bool) -> Result<()> {
             "consecutive_failures": consecutive_failures,
             "backoff_until": backoff_until,
         }),
+        state::Health::Refused {
+            reason,
+            no_captain_declared,
+            since,
+        } => serde_json::json!({
+            "state": "refused",
+            "reason": reason,
+            "no_captain_declared": no_captain_declared,
+            "since": since,
+        }),
     };
     if json {
         let value = serde_json::json!({
@@ -258,6 +268,19 @@ fn status(root: &Path, json: bool) -> Result<()> {
             }
             line
         }
+        state::Health::Refused {
+            reason,
+            no_captain_declared,
+            since,
+        } => format!(
+            "{} since {} — {reason}",
+            if *no_captain_declared {
+                "REFUSED (no fleet.captain declared: the daemon poller runs on no host)"
+            } else {
+                "refused (another host is the fleet captain)"
+            },
+            since.to_rfc3339()
+        ),
     };
     println!("  health:         {health_line}");
     println!(

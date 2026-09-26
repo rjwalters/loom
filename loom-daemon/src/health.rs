@@ -570,6 +570,12 @@ pub struct HealthInputs {
     /// nothing measurable (e.g. macOS, which has no `/proc` at all), the same
     /// silent-degrade contract [`crate::tmpfs_visibility`] documents.
     pub tmpfs_visibility: Option<crate::tmpfs_visibility::TmpfsVisibilitySnapshot>,
+    /// The CI-telemetry poller's health on this host (issue #9014), collected
+    /// by the `loom-daemon health` CLI via
+    /// [`crate::ci_telemetry::collect_health`] and rendered by
+    /// [`ci_telemetry_section::assess_ci_telemetry`] — no section unless the
+    /// poller is enabled here.
+    pub ci_telemetry: Option<crate::ci_telemetry::CiTelemetryHealth>,
 }
 
 // ============================================================================
@@ -2688,6 +2694,12 @@ mod tmpfs_visibility_section;
 
 pub use tmpfs_visibility_section::assess_tmpfs_visibility;
 
+/// The `ci_telemetry` section (issue #9014): whether the opted-in CI poller
+/// is polling here, or refused by the fleet-captain gate.
+mod ci_telemetry_section;
+
+pub use ci_telemetry_section::assess_ci_telemetry;
+
 // ============================================================================
 // Codex accounts (Issue #8407) — conditional
 // ============================================================================
@@ -2755,6 +2767,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
     sections.extend(assess_limit_calibration(inputs));
     sections.extend(assess_transcript_ingest(inputs));
     sections.extend(assess_tmpfs_visibility(inputs));
+    sections.extend(assess_ci_telemetry(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {
