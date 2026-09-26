@@ -15,6 +15,12 @@
 --     (signoz_logs), which carry run_id/job_id. Logs are kept 7 days, so these
 --     are the "read a recent run" views. A `since` older than 7 days returns
 --     only what retention has not yet deleted.
+--   * Section 7 (#9007) reads BOTH: `ci.run` log records here, joined against
+--     `loom_analytics.raw_ship_outcome` — the sweep-side view `../cycle-time-
+--     extract.sql` defines. That statement must be applied at least once
+--     first (its `CREATE DATABASE IF NOT EXISTS` / `CREATE OR REPLACE VIEW`
+--     are idempotent, so re-running it changes nothing); section 7 then joins
+--     to it read-only.
 --
 -- Vocabulary is pinned to what the daemon exports and the gateway forwards:
 -- `loom-daemon/tests/signoz_trial_artifacts.rs` fails if any attribute key,
@@ -372,4 +378,69 @@ FROM runs AS r
 INNER JOIN jobs AS j
   ON j.repo = r.repo AND j.run_id = r.run_id AND j.run_attempt = r.run_attempt
 ORDER BY r.run_ms DESC, r.run_id
+LIMIT {top:UInt32};
+
+-- 7. Per-issue ship breakdown (#9007 join keys). For each sweep recorded in
+--    `loom_analytics.raw_ship_outcome` (populated by
+--    `../cycle-time-extract.sql` — apply that file first; `CREATE DATABASE`/
+--    `CREATE OR REPLACE VIEW` are idempotent, so re-running it here is safe),
+--    joins the `ci.run` triggered by that issue's `feature/issue-N` branch and
+--    reports Builder / Judge / merge-phase seconds beside the CI run's own
+--    wall-clock duration. The join key is the **issue** number recovered from
+--    `loom.ci.ref` with the same `feature/issue-N` convention
+--    `claim_reconciliation::parse_issue_from_branch` applies fleet-side — CI
+--    LOG records (unlike the `loom.ci.run`/`loom.ci.job` SPANS this issue also
+--    adds `loom.ci.head_sha`/`loom.ci.ref`/`loom.pr_number` to) carry no PR/
+--    issue attribute of their own to join on directly. Logs-backed for the CI
+--    side: 7 days; the sweep side is the rollup's own (much longer) window.
+--
+--    Two claims this section deliberately does NOT make, rather than
+--    overclaiming a split the data cannot support:
+--    - "CI" below is ONE wall-clock segment (`ci.run`'s own `started_at` to
+--      `completed_at`), not queued-vs-running: GitHub's queue timestamp
+--      (`run.created_at`) never reaches `CiRunRecord` today, only the
+--      effective `started_at` (`run_started_at`, falling back to
+--      `created_at`). Splitting the two needs a `CiRunRecord` field addition
+--      — a follow-up, not this issue's scope.
+--    - "Lead time" is the SWEEP's own `total_duration_sec` (sweep start to
+--      terminal state), not issue-filed-to-merged: no forge issue-open
+--      timestamp reaches this telemetry stream — see
+--      `../cycle-time-questions.md` "What this question set cannot answer".
+WITH ci_runs AS (
+    SELECT attributes_string['loom.repo'] AS repo,
+           extractGroups(attributes_string['loom.ci.ref'], '^feature/issue-([0-9]+)$')[1]
+                                                            AS issue_str,
+           toUInt64(attributes_number['loom.ci.run_id']) AS run_id,
+           toUInt32(attributes_number['loom.ci.run_attempt']) AS run_attempt,
+           attributes_string['loom.ci.conclusion'] AS ci_conclusion,
+           attributes_number['loom.ci.duration_ms'] AS ci_ms
+    FROM signoz_logs.logs_v2
+    WHERE body = 'ci.run'
+      AND mapContains(attributes_string, 'loom.ci.ref')
+      AND match(attributes_string['loom.ci.ref'], '^feature/issue-[0-9]+$')
+      AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    LIMIT 1 BY repo, run_id, run_attempt
+)
+SELECT ro.repo AS repo,
+       ro.issue AS issue,
+       ro.pr_number AS pr_number,
+       ro.result AS sweep_result,
+       ro.finished_at AS ship_finished_at,
+       round(ro.total_duration_sec, 1) AS lead_time_s_sweep_proxy,
+       if(has(ro.phases, 'builder'),
+          ro.phase_durations_sec[indexOf(ro.phases, 'builder')], NULL) AS builder_s,
+       if(has(ro.phases, 'judge'),
+          ro.phase_durations_sec[indexOf(ro.phases, 'judge')], NULL) AS judge_s,
+       if(has(ro.phases, 'merge'),
+          ro.phase_durations_sec[indexOf(ro.phases, 'merge')], NULL) AS merge_wait_s,
+       c.run_id AS ci_run_id,
+       c.ci_conclusion AS ci_conclusion,
+       round(c.ci_ms / 1000, 1) AS ci_wall_s
+FROM loom_analytics.raw_ship_outcome AS ro
+LEFT JOIN ci_runs AS c
+  ON c.repo = ro.repo AND toUInt32OrZero(c.issue_str) = ro.issue
+WHERE ro.finished_at >= {since:DateTime}
+  AND ({repo:String} = '' OR ro.repo = {repo:String})
+ORDER BY ro.finished_at DESC
 LIMIT {top:UInt32};
