@@ -24,7 +24,7 @@ concierge      14435        -
 curator        47166    30000
 doctor         33789    30000
 driver         10763        -
-guide          50847        -
+guide          50845        -
 hermit         16489        -
 judge          56195    30000
 loom           19231        -

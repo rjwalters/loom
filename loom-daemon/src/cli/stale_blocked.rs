@@ -415,8 +415,19 @@ fn report(s: &Sections<'_>, quiet: bool) {
         }
         let _ =
             writeln!(w, "  A block with no stated reason cannot be verified or cleared by anyone");
-        let _ =
-            writeln!(w, "  who was not present when it was applied. Record a park record (below),");
+        let _ = writeln!(
+            w,
+            "  who was not present when it was applied. Record a park record — its rendered"
+        );
+        // Named inline rather than deferred to the PROSE-ONLY section's remedy:
+        // that section is only printed when something is prose-only, so an
+        // undocumented-only report used to end on a "(below)" with nothing below.
+        let _ = writeln!(
+            w,
+            "  `{} #N` line is what every existing fleet parser reads:",
+            park_record::RENDERED_PHRASE
+        );
+        let _ = writeln!(w, "      loom-daemon park-record render --blocked-by <N> --by <role>");
         let _ = writeln!(w, "  or a `## Dependencies` checklist item, or drop the label.");
     }
 

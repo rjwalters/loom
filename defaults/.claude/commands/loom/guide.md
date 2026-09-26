@@ -748,8 +748,8 @@ For each `loom:blocked` issue, check if all dependencies have resolved:
 **A dependency stated only in a comment cannot be read here (#8925's other
 defect)** — this routine reads the BODY only. A role applying `loom:blocked`
 must record the blocker in the body as a **park record**
-(`loom-daemon park-record render`; see [`park-record.md`](../../../docs/park-record.md)
-for the grammar), not as prose in a comment — its rendered `Blocked by: #N`
+(`loom-daemon park-record render`; grammar: [`park-record.md`](../../../.loom/docs/park-record.md)),
+not as prose in a comment — its rendered `Blocked by: #N`
 line already matches `parse_dependencies` below, so no parser change is
 needed once a role writes one.
 
@@ -955,8 +955,8 @@ A parked PR clears to a review-lane label, never `loom:issue` (a PR was never
 curated), and its superseding check reads the PR's OWN state, not a linked
 PR's. `check_and_unblock_prs`, `pr_has_superseding_block` and
 `previous_review_label` are defined in full, with a worked example, in
-[`park-record.md`](../../../docs/park-record.md#the-unblock-sweeps-pr-side-functions)
-— read on demand rather than inlined here.
+[`park-record.md`](../../../.loom/docs/park-record.md#the-unblock-sweeps-pr-side-functions)
+— read on demand, not inlined here.
 
 ### Example Unblocking Flow
 
