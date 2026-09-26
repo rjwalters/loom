@@ -110,7 +110,8 @@ pub fn tick_points(report: &TickReport, max_concurrent: usize) -> Vec<MetricPoin
     points
 }
 
-/// The tick's span: a fresh sampled root trace covering `started_at..ended_at`.
+/// The tick's span: its own sampled root trace covering `started_at..ended_at`,
+/// its ID derived from the tick's start instant.
 #[must_use]
 pub fn tick_span(
     report: &TickReport,
@@ -129,8 +130,13 @@ pub fn tick_span(
     .into_iter()
     .map(|(key, value)| (key.to_string(), value))
     .collect();
+    let mut attributes = attributes;
+    crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
-        context: TraceContext::root(true),
+        context: TraceContext::derived(
+            SpanName::DispatchTick.as_str(),
+            &[&crate::telemetry::trace::instant(started_at)],
+        ),
         parent_span_id: None,
         name: SpanName::DispatchTick,
         started_at,
@@ -165,8 +171,14 @@ pub fn admission_spans(report: &TickReport, tick: &SpanRecord) -> Vec<SpanRecord
             .into_iter()
             .map(|(key, value)| (key.to_string(), value))
             .collect();
+            let mut attributes = attributes;
+            crate::telemetry::trace::provenance::stamp(&mut attributes);
             SpanRecord {
-                context: tick.context.child(),
+                context: tick.context.derived_child(&[
+                    SpanName::DispatchAdmission.as_str(),
+                    &admission.issue.to_string(),
+                    &crate::telemetry::trace::instant(started_at),
+                ]),
                 parent_span_id: Some(tick.context.span_id.clone()),
                 name: SpanName::DispatchAdmission,
                 started_at,

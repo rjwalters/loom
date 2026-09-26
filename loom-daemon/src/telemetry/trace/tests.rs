@@ -235,3 +235,68 @@ fn terminal_context_is_retained_when_durable_queue_offer_fails() {
     );
     assert!(!store.path(dir.path(), "pending").exists());
 }
+
+#[test]
+fn derived_ids_are_deterministic_keyed_and_valid() {
+    let a = TraceContext::derived("execution", &["rjwalters/loom", "sweep-issue-42-1790000000"]);
+    assert_eq!(
+        a,
+        TraceContext::derived("execution", &["rjwalters/loom", "sweep-issue-42-1790000000"])
+    );
+    assert!(a.sampled());
+    assert_eq!(TraceContext::parse(&a.traceparent()).unwrap(), a);
+    // Any key part, and the part boundaries themselves, change the identity.
+    for other in [
+        TraceContext::derived("execution", &["rjwalters/loom", "sweep-issue-42-1790000001"]),
+        TraceContext::derived("execution", &["other/loom", "sweep-issue-42-1790000000"]),
+        TraceContext::derived("execution", &["rjwalters/loomsweep-issue-42-1790000000"]),
+        TraceContext::derived("dispatch", &["rjwalters/loom", "sweep-issue-42-1790000000"]),
+    ] {
+        assert_ne!(other.trace_id, a.trace_id);
+    }
+
+    let at = Utc::now();
+    let child = a.child_at("loom.phase", at);
+    assert_eq!(child.trace_id, a.trace_id);
+    assert_ne!(child.span_id, a.span_id);
+    assert_eq!(child, a.child_at("loom.phase", at));
+    assert_ne!(child, a.child_at("loom.role.attempt", at));
+    assert_ne!(child, a.child_at("loom.phase", at + chrono::Duration::nanoseconds(1)));
+}
+
+#[test]
+fn execution_root_is_derived_from_repo_and_sweep_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TraceStore::new(dir.path());
+    let saved = store.load_or_create(dir.path(), "sweep-issue-7-1").unwrap();
+    assert_eq!(saved.context, TraceStore::root_context(dir.path(), "sweep-issue-7-1", None));
+    store.complete(dir.path(), "sweep-issue-7-1").unwrap();
+    assert_eq!(
+        store
+            .load_or_create(dir.path(), "sweep-issue-7-1")
+            .unwrap()
+            .context,
+        saved.context,
+        "recreating the execution recomputes the same trace"
+    );
+}
+
+#[test]
+fn story_execution_span_is_derived_from_the_story_and_sweep_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let story = story_context("rjwalters/loom", 42);
+    let store = TraceStore::new(dir.path());
+    let saved = store
+        .load_or_create_story(dir.path(), "sweep-issue-42-1", Some(&story))
+        .unwrap();
+    assert_eq!(saved.context.trace_id, story.trace_id);
+    assert_eq!(
+        saved.context,
+        TraceStore::root_context(dir.path(), "sweep-issue-42-1", Some(&story))
+    );
+    assert_ne!(
+        saved.context,
+        TraceStore::root_context(dir.path(), "sweep-issue-42-2", Some(&story)),
+        "a retry is a distinct sibling in the same story"
+    );
+}

@@ -457,6 +457,14 @@ fn gateway_collector_keeps_every_ops_label_and_span_attribute() {
     }
 }
 
+#[test]
+fn gateway_collector_keeps_every_provenance_attribute() {
+    let span = keep_keys("span");
+    for key in crate::telemetry::trace::provenance::KEYS {
+        assert!(span.contains(*key), "collector span keep_keys lacks {key}");
+    }
+}
+
 // Ready-queue depth gauges (Issue #8852, phase 2).
 
 fn queue_summary(

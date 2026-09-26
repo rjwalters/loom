@@ -49,6 +49,31 @@ impl TraceStore {
         hex::encode(hash.finalize())
     }
 
+    /// An execution's root context. Inside an issue story it is the story's
+    /// child keyed by the execution (sweep) id; outside one it is its own
+    /// trace keyed by repo + execution id. Either way `sweep-issue-42-…` in
+    /// `owner/repo` always maps to the same IDs, on any host.
+    #[must_use]
+    pub fn root_context(
+        workspace: &Path,
+        execution: &str,
+        story: Option<&TraceContext>,
+    ) -> TraceContext {
+        match story {
+            Some(story) => story.derived_child(&["loom.sweep", execution]),
+            None => {
+                TraceContext::derived("execution", &[&Self::fallback_repo(workspace), execution])
+            }
+        }
+    }
+
+    /// The repo key for an execution outside a story: `$LOOM_REPO`, else the
+    /// workspace basename ([`crate::peer_claims::repo_slug`]), lowercased.
+    #[must_use]
+    pub fn fallback_repo(workspace: &Path) -> String {
+        crate::peer_claims::repo_slug(workspace).to_ascii_lowercase()
+    }
+
     #[must_use]
     pub fn path(&self, workspace: &Path, execution: &str) -> PathBuf {
         self.directory
@@ -101,7 +126,7 @@ impl TraceStore {
         anyhow::ensure!(count < MAX_ACTIVE_CONTEXTS, "active trace context limit reached");
         let context = ExecutionContext {
             identity: Self::identity(workspace, execution),
-            context: story.map_or_else(|| TraceContext::root(true), TraceContext::child),
+            context: Self::root_context(workspace, execution, story),
             started_at: Utc::now(),
             story: story.cloned(),
         };

@@ -19,12 +19,13 @@ pub struct Span {
 }
 impl Span {
     pub fn child(&self, name: SpanName, attributes: TraceAttributes) -> Option<Self> {
+        let at = Utc::now();
         self.journal
             .start(
-                self.active.record.context.child(),
+                child_context(&self.active.record.context, name, at, &attributes),
                 Some(&self.active.record.context),
                 name,
-                Utc::now(),
+                at,
                 attributes,
             )
             .ok()
@@ -121,6 +122,19 @@ impl Span {
     }
 }
 
+/// A child's deterministic context: derived from its parent span, its name,
+/// its role (so concurrent roles cannot share an instant-keyed ID), and its
+/// start instant — all of which the exported child span itself carries.
+fn child_context(
+    parent: &TraceContext,
+    name: SpanName,
+    at: chrono::DateTime<Utc>,
+    attributes: &TraceAttributes,
+) -> TraceContext {
+    let role = attributes.get("loom.role").map_or("", String::as_str);
+    parent.derived_child(&[name.as_str(), role, &crate::telemetry::trace::instant(at)])
+}
+
 pub fn attributes(values: &[(&str, &str)]) -> TraceAttributes {
     values
         .iter()
@@ -153,8 +167,15 @@ pub fn inherited(root: &Path, name: SpanName, attributes: TraceAttributes) -> Op
         return None;
     }
     let (journal, _, parent) = inherited_context(root)?;
+    let at = Utc::now();
     let active = journal
-        .start(parent.child(), Some(&parent), name, Utc::now(), attributes)
+        .start(
+            child_context(&parent, name, at, &attributes),
+            Some(&parent),
+            name,
+            at,
+            attributes,
+        )
         .ok()?;
     Some(Span { journal, active })
 }
@@ -197,12 +218,13 @@ pub fn worker_attempt(root: &Path, role: &str) -> Option<Span> {
         ("loom.phase", role),
         ("loom.timing_source", "owned_boundary"),
     ]);
+    let at = Utc::now();
     let phase = journal
         .start_linked(
-            root_context.child(),
+            child_context(&root_context, SpanName::Phase, at, &metadata),
             Some(&root_context),
             SpanName::Phase,
-            Utc::now(),
+            at,
             metadata.clone(),
             vec![crate::telemetry::trace::SpanLink { context: launcher }],
         )
@@ -363,7 +385,7 @@ fn checkpoint_observation(
         .into_iter()
         .collect();
     let Ok(phase) = journal.start_linked(
-        root.child(),
+        child_context(root, SpanName::Phase, at, &metadata),
         Some(root),
         SpanName::Phase,
         at,
@@ -373,7 +395,7 @@ fn checkpoint_observation(
         return;
     };
     if let Ok(role) = journal.start(
-        phase.record.context.child(),
+        child_context(&phase.record.context, SpanName::RoleAttempt, at, &metadata),
         Some(&phase.record.context),
         SpanName::RoleAttempt,
         at,
@@ -417,14 +439,19 @@ pub fn prepare_execution(
     execution: &str,
     story: Option<&super::tracing::StoryRef>,
 ) {
-    let mut metadata = attributes(&[
+    // The root carries its own ID-derivation inputs (repo + sweep id) and the
+    // installed prompt surface the child is about to run.
+    let mut metadata = crate::telemetry::trace::provenance::workspace(root);
+    metadata.extend(attributes(&[
         ("loom.sweep_id", execution),
         ("loom.timing_source", "dispatch_observed"),
-    ]);
+    ]));
     if let Some(story) = story {
         metadata.insert("loom.issue".into(), story.issue.to_string());
         metadata.insert("loom.repo".into(), story.repo.clone());
         metadata.insert("loom.story_id".into(), story.context.trace_id.as_str().to_owned());
+    } else {
+        metadata.insert("loom.repo".into(), TraceStore::fallback_repo(root));
     }
     if let Some(span) = begin(root, execution, SpanName::Sweep, metadata) {
         span.command(command);
