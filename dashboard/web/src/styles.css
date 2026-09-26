@@ -1,5 +1,6 @@
 @import "./analytics/analytics.css";
 @import "./views/workQueue.css";
+@import "./views/liveBoard.css";
 /* Fleet dashboard styling — one plain stylesheet, no preprocessor and no
    CSS-in-JS. The palette follows `loom-daemon/src/dashboard.html`'s dark
    scheme so the two surfaces do not look like different products during the

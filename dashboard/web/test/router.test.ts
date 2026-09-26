@@ -35,12 +35,13 @@ describe("panel routes", () => {
     ["#/tokens", "tokens"],
     ["#/spend", "spend"],
     ["#/feed", "feed"],
+    ["#/live", "live"],
   ])("parses %s", (hash, name) => {
     expect(parseRoute(hash)).toEqual({ name });
   });
 
   it("round-trips through routeToHash", () => {
-    for (const name of ["charts", "tokens", "spend", "feed"] as const) {
+    for (const name of ["charts", "tokens", "spend", "feed", "live"] as const) {
       expect(routeToHash({ name })).toBe(`#/${name}`);
       expect(parseRoute(routeToHash({ name }))).toEqual({ name });
     }
@@ -51,6 +52,7 @@ describe("panel routes", () => {
     expect(isPanelRoute({ name: "tokens" })).toBe(true);
     expect(isPanelRoute({ name: "spend" })).toBe(true);
     expect(isPanelRoute({ name: "feed" })).toBe(true);
+    expect(isPanelRoute({ name: "live" })).toBe(true);
     expect(isPanelRoute(OVERVIEW)).toBe(false);
     expect(isPanelRoute({ name: "host", hostId: "h" })).toBe(false);
   });
