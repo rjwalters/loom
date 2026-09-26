@@ -81,6 +81,7 @@ if [[ -f "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/cargo-target-dir.sh"
 else
     loom_resolve_worktree_target_dir() { printf '%s\n' "$1/target"; }
     loom_reclaim_worktree_target_dir() { printf 'inside\t%s\tcargo-target-dir.sh lib unavailable\n' "$3"; }
+    loom_render_target_dir_record() { :; }
 fi
 
 # Shared "has this branch landed?" primitive (#7812): forge PR state first,
@@ -695,26 +696,18 @@ remove_worktree_command() {
     # `status<TAB>path<TAB>detail`) as a human line, and stash it for --json.
     # Never writes to stdout directly — stdout purity in --json mode is the
     # whole reason `_rm_info`/`_rm_warning` exist.
+    #
+    # The `case` that turns a record into a line is `lib/cargo-target-dir.sh`'s
+    # `loom_render_target_dir_record` (#8458) — merge-pr.sh had a second, already
+    # drifted copy of it, and one record grammar gets one renderer. What stays
+    # here is the part that is genuinely this script's: WHICH logging functions
+    # the line goes through, and the two `--json` fields. The `read` writes
+    # straight into the enclosing function's locals (bash dynamic scope), so
+    # `--json` reports the status even for the `inside`/`absent` records the
+    # renderer deliberately prints nothing for.
     _rm_report_target_dir() {
-        local record="$1" status path detail
-        # Size-ratchet-neutral offset for this issue's added lines
-        # (#8458 / file-size-policy.md): one tab-split read replaces three `cut`
-        # subshells (`detail` is last, so it absorbs any trailing tabs), and the
-        # case arms are one line each. Behaviour is byte-identical.
-        IFS=$'\t' read -r status path detail <<<"$record"
-        target_dir_status="$status"
-        target_dir_path="$path"
-        case "$status" in
-            reclaimed)     _rm_success "Reclaimed redirected cargo target dir: $path ($detail)" ;;
-            would-reclaim) _rm_info "Would reclaim redirected cargo target dir: $path ($detail)" ;;
-            shared)        _rm_info "Keeping redirected cargo target dir $path — still used by $detail" ;;
-            protected)     _rm_warning "Keeping redirected cargo target dir $path — $detail still using it" ;;
-            refused)       _rm_warning "Refusing to reclaim cargo target dir $path — $detail" ;;
-            failed)        _rm_warning "Could not reclaim redirected cargo target dir $path — $detail" ;;
-            # `inside` / `absent`: the overwhelmingly common, uninteresting
-            # cases (no redirect configured). Silent by design.
-            *)             : ;;
-        esac
+        IFS=$'\t' read -r target_dir_status target_dir_path _ <<<"$1"
+        loom_render_target_dir_record "$1" _rm_success _rm_info _rm_warning
     }
 
     # Resolve the repo root even when invoked from inside a worktree: the git
@@ -806,8 +799,7 @@ remove_worktree_command() {
         elif [[ -n "$attached_branch" ]]; then
             _rm_info "Would delete local branch '$attached_branch'"
         fi
-        _rm_report_target_dir \
-            "$(loom_reclaim_worktree_target_dir "$repo_root" "$worktree_path" "$target_dir_resolved" true)"
+        _rm_report_target_dir "$(loom_reclaim_worktree_target_dir "$repo_root" "$worktree_path" "$target_dir_resolved" true)"
         _rm_json true false "dry-run"
         return 0
     fi
@@ -863,8 +855,7 @@ remove_worktree_command() {
     #     open by no running process. A failed removal leaves it alone: the
     #     worktree that owns it is still there.
     if [[ "$removed" == true ]]; then
-        _rm_report_target_dir \
-            "$(loom_reclaim_worktree_target_dir "$repo_root" "$worktree_path" "$target_dir_resolved" false)"
+        _rm_report_target_dir "$(loom_reclaim_worktree_target_dir "$repo_root" "$worktree_path" "$target_dir_resolved" false)"
     fi
 
     # 7. Branch cleanup (unless --keep-branch). Deferred until after removal so

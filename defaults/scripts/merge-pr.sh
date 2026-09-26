@@ -422,6 +422,7 @@ if [[ -f "$SCRIPT_DIR/lib/cargo-target-dir.sh" ]]; then
 else
   loom_resolve_worktree_target_dir() { printf '%s\n' "$1/target"; }
   loom_reclaim_worktree_target_dir() { printf 'inside\t%s\tcargo-target-dir.sh lib unavailable\n' "$3"; }
+  loom_render_target_dir_record() { :; }
 fi
 # Shared "has this branch landed?" primitive (#7812) — the one implementation
 # of the question the branch-delete and worktree-preserve guards below ask.
@@ -3127,22 +3128,19 @@ _maybe_delete_local_branch() {
 # _mp_report_target_dir_reclaim <record>
 #
 # Render one `status<TAB>path<TAB>detail` record from
-# loom_reclaim_worktree_target_dir (#7239). Silent for `inside`/`absent` — the
-# un-redirected layout, i.e. almost every repo — so post-merge output is
-# unchanged unless something was actually reclaimed or deliberately kept.
+# loom_reclaim_worktree_target_dir (#7239) through THIS script's logging
+# functions. Silent for `inside`/`absent` — the un-redirected layout, i.e.
+# almost every repo — so post-merge output is unchanged unless something was
+# actually reclaimed or deliberately kept.
+#
+# The `case` itself is `lib/cargo-target-dir.sh`'s
+# `loom_render_target_dir_record` (#8458): this copy and worktree.sh's had
+# already drifted apart (this one never grew a `would-reclaim` arm), and one
+# record grammar gets one renderer. The no-lib degraded path defines a no-op
+# twin beside the other target-dir fallbacks above, where every record is
+# `inside` anyway.
 _mp_report_target_dir_reclaim() {
-  local record="$1" status path detail
-  status="$(printf '%s' "$record" | cut -f1)"
-  path="$(printf '%s' "$record" | cut -f2)"
-  detail="$(printf '%s' "$record" | cut -f3)"
-  case "$status" in
-    reclaimed) success "Reclaimed redirected cargo target dir: $path ($detail)" ;;
-    shared)    info "Keeping redirected cargo target dir $path — still used by $detail" ;;
-    protected) warning "Keeping redirected cargo target dir $path — $detail still using it" ;;
-    refused)   warning "Refusing to reclaim cargo target dir $path — $detail" ;;
-    failed)    warning "Could not reclaim redirected cargo target dir $path — $detail" ;;
-    *)         : ;;
-  esac
+  loom_render_target_dir_record "$1" success info warning
 }
 
 # _remove_loom_worktree <path> [allow_unmanaged]
@@ -3334,8 +3332,7 @@ _remove_loom_worktree() {
     if [[ -n "$target_dir_resolved" ]] \
        && command -v loom_reclaim_worktree_target_dir >/dev/null 2>&1 \
        && command -v _mp_report_target_dir_reclaim >/dev/null 2>&1; then
-      _mp_report_target_dir_reclaim \
-        "$(loom_reclaim_worktree_target_dir "$REPO_ROOT" "$worktree_path" "$target_dir_resolved" false)"
+      _mp_report_target_dir_reclaim "$(loom_reclaim_worktree_target_dir "$REPO_ROOT" "$worktree_path" "$target_dir_resolved" false)"
     fi
   else
     # Best-effort by design (#6372): the merge itself already succeeded and is

@@ -217,3 +217,82 @@ fn report_lines_are_silent_for_the_outcomes_that_describe_an_uninvolved_host() {
         .is_some());
     assert!(Provision::Failed("nope".into()).report_line().is_some());
 }
+
+// ---------------------------------------------------------------------------
+// spawn_target_dir — the delivery half, called from `worker_spawn::run`
+// ---------------------------------------------------------------------------
+//
+// Every case goes through `spawn_target_dir_with` + `shared()`, never the
+// process-global `CARGO_TARGET_DIR`: the happy path needs a REDIRECTED host
+// (`planned_dir` refuses when cargo's output would already land inside the
+// worktree, so an un-redirected tempdir answers `None` for the right reason and
+// proves nothing about the wiring), and setting that env var to arrange one is
+// the global-env race this module's header warns about.
+
+#[test]
+fn a_claim_owning_spawn_on_an_opted_in_redirected_host_gets_its_own_target_dir() {
+    let (tmp, repo, _wt) = fixture(741);
+    let root = tmp.path().join("shared");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let dir =
+        with_opt_in(Some("1"), || spawn_target_dir_with(&repo, Some("741"), false, &shared(&root)))
+            .expect("a claim-owning spawn on a redirected host gets a directory");
+
+    assert_eq!(dir, root.join("wt").join("issue-741"));
+    // Created, not merely named: a CARGO_TARGET_DIR cargo cannot write to would
+    // fail every build in the sweep.
+    assert!(dir.is_dir(), "{} was named but not created", dir.display());
+}
+
+#[test]
+fn a_spawn_that_owns_no_claim_keeps_the_hosts_own_cargo_resolution() {
+    // A role-runner tick or an operator's interactive spawn: no single worktree
+    // to attribute a target dir to, so the host's resolution is left alone even
+    // with the feature on and a redirected host.
+    let (tmp, repo, _wt) = fixture(742);
+    let root = tmp.path().join("shared");
+    std::fs::create_dir_all(&root).unwrap();
+
+    assert_eq!(
+        with_opt_in(Some("1"), || spawn_target_dir_with(&repo, None, false, &shared(&root))),
+        None
+    );
+}
+
+#[test]
+fn the_copy_re_executed_inside_a_containment_container_does_not_re_derive() {
+    // It already received the outer spawn's answer as an explicit
+    // `-e CARGO_TARGET_DIR=…`; re-deriving would resolve against a cargo
+    // configuration the container may not have been given.
+    let (tmp, repo, _wt) = fixture(743);
+    let root = tmp.path().join("shared");
+    std::fs::create_dir_all(&root).unwrap();
+
+    assert_eq!(
+        with_opt_in(Some("1"), || spawn_target_dir_with(&repo, Some("743"), true, &shared(&root))),
+        None
+    );
+}
+
+#[test]
+fn the_spawn_seam_is_off_by_default_and_a_no_op_outside_a_cargo_repo() {
+    let (tmp, repo, _wt) = fixture(744);
+    let root = tmp.path().join("shared");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // Feature off (the default) — nothing, however redirected the host is.
+    assert_eq!(
+        with_opt_in(None, || spawn_target_dir_with(&repo, Some("744"), false, &shared(&root))),
+        None
+    );
+
+    // Opted in, but the workspace carries no manifest: nothing here ever builds
+    // with cargo, so there is nothing to isolate.
+    let bare = tmp.path().join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    assert_eq!(
+        with_opt_in(Some("1"), || spawn_target_dir_with(&bare, Some("744"), false, &shared(&root))),
+        None
+    );
+}

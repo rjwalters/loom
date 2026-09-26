@@ -195,6 +195,20 @@ pub fn provision_with(
 /// exporting anything would relocate a build cache for no benefit).
 #[must_use]
 pub fn planned_dir(repo_root: &Path, worktree_path: &Path) -> Option<PathBuf> {
+    planned_dir_with(repo_root, worktree_path, &resolve_root)
+}
+
+/// [`planned_dir`] with the target-dir resolution injected, so the decision is
+/// testable without a real `cargo metadata` — the same seam [`provision_with`]
+/// opens for the creation half, and for the same reason: the alternative is a
+/// test that mutates the process-global `CARGO_TARGET_DIR` and races every
+/// other test that reads it.
+#[must_use]
+pub fn planned_dir_with(
+    repo_root: &Path,
+    worktree_path: &Path,
+    resolve_root: &dyn Fn(&Path) -> PathBuf,
+) -> Option<PathBuf> {
     if !enabled(repo_root) {
         return None;
     }
@@ -207,6 +221,72 @@ pub fn planned_dir(repo_root: &Path, worktree_path: &Path) -> Option<PathBuf> {
     let name = worktree_path.file_name().and_then(|n| n.to_str())?;
     let dir = per_worktree::dir_for(&root, name);
     per_worktree::is_attributable(worktree_path, &dir).then_some(dir)
+}
+
+/// The per-worktree `CARGO_TARGET_DIR` a **worker spawn** should run under, or
+/// `None` when it should leave the host's own cargo resolution alone.
+///
+/// This is the delivery half of the scheme: the agent a sweep spawns runs
+/// `cargo test` itself, as an ordinary subprocess, and the only place Loom can
+/// put a variable all of them inherit is the spawned worker's environment —
+/// which is where #8453's 257 false test verdicts came from (a Judge run
+/// reporting 12 failures that passed 194/194 in isolation, because cargo
+/// uplifts every worktree's binary to one un-hashed `<target>/debug/loom-daemon`).
+///
+/// Called from [`crate::worker_spawn`], beside the `CARGO_INCREMENTAL=0` that
+/// same seam already injects for the sibling half of #8453. It was briefly four
+/// lines of `spawn-claude.sh` instead; the seam covers every dispatch surface
+/// (sweep registry, role runner, manual `spawn-worker.sh`) and every runtime
+/// adapter at once, which the one adapter script did not.
+///
+/// The arguments are passed rather than read from the environment so the
+/// decision is testable without mutating process-global state:
+///
+/// * `claim_owned` — `LOOM_SWEEP_CLAIM_OWNED`, the issue whose sweep this spawn
+///   owns. `None` for a role-runner tick or an operator's interactive spawn,
+///   which have no single worktree to attribute a target dir to.
+/// * `containerized` — whether `LOOM_SPAWN_CONTAINERIZED` is set, i.e. this is
+///   the copy re-executed *inside* a containment container. That copy already
+///   received the outer spawn's answer as an explicit `-e CARGO_TARGET_DIR=…`,
+///   and re-deriving it in there would resolve against a cargo configuration the
+///   container may not have been given.
+///
+/// The directory is created, because a `CARGO_TARGET_DIR` cargo cannot write to
+/// fails every build in the sweep; a failed `create_dir_all` yields `None`
+/// rather than a name.
+#[must_use]
+pub fn spawn_target_dir(
+    repo_root: &Path,
+    claim_owned: Option<&str>,
+    containerized: bool,
+) -> Option<PathBuf> {
+    spawn_target_dir_with(repo_root, claim_owned, containerized, &resolve_root)
+}
+
+/// [`spawn_target_dir`] with the target-dir resolution injected; see
+/// [`planned_dir_with`].
+#[must_use]
+pub fn spawn_target_dir_with(
+    repo_root: &Path,
+    claim_owned: Option<&str>,
+    containerized: bool,
+    resolve_root: &dyn Fn(&Path) -> PathBuf,
+) -> Option<PathBuf> {
+    if containerized {
+        return None;
+    }
+    let issue = claim_owned?;
+    if !repo_root.join("Cargo.toml").is_file() {
+        return None;
+    }
+    // The worktree does not exist yet — the sweep creates it later — so the
+    // path is DERIVED, not read from a marker. `planned_dir` is idempotent, so
+    // the marker `provision` writes at creation names this same directory
+    // rather than nesting a second `wt/issue-N` level inside it.
+    let worktree = crate::worktree_root::worktree_root(repo_root).join(format!("issue-{issue}"));
+    let dir = planned_dir_with(repo_root, &worktree, resolve_root)?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
 }
 
 /// Cargo's own answer for `root`, with this process's `CARGO_TARGET_DIR` and a

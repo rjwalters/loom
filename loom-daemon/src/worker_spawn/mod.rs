@@ -433,6 +433,22 @@ fn run_preflight(
     // Docker boundaries that bypass it (spawn-claude.sh's containment,
     // spawn-codex.sh's session-exec) export it explicitly on their own.
     command.env("CARGO_INCREMENTAL", "0");
+    // The other half of #8453, on the same seam and for the same reason
+    // (#8458): when the repo opts in (`cargo.perWorktreeTargetDir`), a spawn
+    // that OWNS a sweep's claim runs under that issue worktree's own
+    // CARGO_TARGET_DIR, so the `cargo test` the agent runs itself cannot execute
+    // a sibling worktree's uplifted binary. Off by default, `None` for a
+    // role-runner tick or an interactive spawn (no single worktree to attribute
+    // a target dir to), and a no-op on a host whose cargo output is not
+    // redirected outside the worktree in the first place.
+    if let Some(dir) = crate::worktree_ops::cargo_target::provision::spawn_target_dir(
+        root,
+        nonempty_env("LOOM_SWEEP_CLAIM_OWNED").as_deref(),
+        nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_some(),
+    ) {
+        command.env("CARGO_TARGET_DIR", &dir);
+        let _ = writeln!(log, "# LOOM_CARGO_TARGET_DIR {} (#8458)", dir.display());
+    }
     // Preserve #8077 isolation defaults without repointing live IPC/token paths.
     if nonempty_env("LOOM_DAEMON_LOG").is_none() {
         command.env(
