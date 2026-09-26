@@ -742,7 +742,8 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
             .expect("fully configured ⇒ spawn_task must return Some");
     // Issue #8760: `daemon_event::spawn_task` adds one more handle alongside
     // `collector`'s and one sender per exporter.
-    assert_eq!(handles.len(), 4, "collector + daemon_event collector + one sender per exporter");
+    // Issue #8929: the OTLP ops sink adds the slot-turnaround subscriber.
+    assert_eq!(handles.len(), 5, "collector + daemon_event + turnaround + two senders");
     let statuses = global_export_statuses();
     assert_eq!(
         statuses.keys().collect::<Vec<_>>(),
@@ -888,7 +889,7 @@ async fn spawn_task_otlp_exporter_spawns_three_tasks() {
     let handles =
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
     let handles = handles.expect("fully configured otlp exporter ⇒ spawn_task must return Some");
-    assert_eq!(handles.len(), 3, "collector + daemon_event collector + sender");
+    assert_eq!(handles.len(), 4, "collector + daemon_event + turnaround (#8929) + sender");
     for handle in handles {
         handle.abort();
     }
