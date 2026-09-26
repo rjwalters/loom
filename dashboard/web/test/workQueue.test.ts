@@ -21,6 +21,8 @@ import {
   mergeFleetQueue,
   openPrNumber,
   queueHealth,
+  rankText,
+  reasonText,
   summarizeHostQueue,
   QUEUE_STALE_AFTER_SEC,
 } from "../src/workQueue";
@@ -270,5 +272,19 @@ describe("hostQueuePanel", () => {
     const detail = hostDetailView(host, NOW);
     const ranks = [...detail.querySelectorAll<HTMLElement>('[data-testid="host-queue-row"]')].map((tr) => tr.dataset.rank);
     expect(ranks).toEqual(["1", "2", "3"]);
+  });
+});
+
+describe("rankText — forge-side labelled_blocked rows (#8957)", () => {
+  it("shows an unranked row as a dash and keeps its reason and hold labels", () => {
+    const parsed = parseQueueSnapshot({
+      tick_at: minutesAgo(1),
+      rows: [row({ rank: 0, disposition: "labelled_blocked", state: "blocked", reason: "blocked: labelled loom:blocked", detail: "loom:operator" })],
+    })!;
+    const blocked = parsed.rows[0]!;
+    expect(blocked.rank).toBe(0);
+    expect(rankText(blocked)).toBe("–");
+    expect(rankText({ ...blocked, rank: 3 })).toBe("3");
+    expect(reasonText(blocked)).toBe("blocked: labelled loom:blocked (loom:operator)");
   });
 });

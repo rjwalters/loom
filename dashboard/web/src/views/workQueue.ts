@@ -29,6 +29,7 @@ import {
   mergeFleetQueue,
   QUEUE_STALE_AFTER_SEC,
   openPrNumber,
+  rankText,
   reasonText,
   summarizeHostQueue,
   type FleetQueueItem,
@@ -325,7 +326,7 @@ function hostRow(row: QueueRow, sweeps: readonly ActiveSweep[], now: Date): HTML
   return el(
     "tr",
     { class: `queue-row queue-row--${row.state}`, data: { testid: "host-queue-row", state: row.state, rank: row.rank } },
-    el("td", {}, String(row.rank)),
+    el("td", {}, rankText(row)),
     el("td", {}, issueCell(row.repo, row.issue, row.visibility), flags(row)),
     el("td", {}, repoCell(row.repo)),
     el("td", {}, row.state),

@@ -171,6 +171,43 @@ describe("redactQueueSnapshot", () => {
   });
 });
 
+describe("forge-side labelled_blocked rows (#8957)", () => {
+  const blockedRow = (repo: string, visibility: string) => ({
+    rank: 0,
+    repo,
+    visibility,
+    issue: 4242,
+    workspace_priority: 100,
+    urgent: false,
+    created_at: "2026-09-01T00:00:00Z",
+    tier: "tier:secret-tier",
+    disposition: "labelled_blocked",
+    state: "blocked",
+    reason: "blocked: labelled loom:blocked",
+    detail: "loom:operator",
+  });
+
+  it("keeps an unranked (rank 0) row with its new disposition", () => {
+    const record = normalizeQueueSnapshot(queueRecord({ rows: [blockedRow("rjwalters/loom", "public")] }))!;
+    expect(record.rows).toHaveLength(1);
+    expect(record.rows[0]).toMatchObject({ rank: 0, disposition: "labelled_blocked", state: "blocked", detail: "loom:operator" });
+  });
+
+  it("redacts a private labelled_blocked row like any other private row", () => {
+    const record = normalizeQueueSnapshot(queueRecord({ rows: [blockedRow("acme/secret-app", "private")] }))!;
+    const redacted = redactQueueSnapshot(record);
+    expect(redacted.rows[0]).toEqual({
+      rank: 0,
+      visibility: "private",
+      urgent: false,
+      disposition: "labelled_blocked",
+      state: "blocked",
+      reason: "blocked: labelled loom:blocked",
+    });
+    expect(JSON.stringify(redacted.rows)).not.toContain("4242");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------

@@ -110,11 +110,15 @@ pub struct QueueSnapshotRecord {
     pub rows_truncated: usize,
 }
 
-/// `detail` survives only for dispositions whose detail is structured.
+/// `detail` survives only for dispositions whose detail is structured: the
+/// park label, the open PR, and a `labelled_blocked` row's allowlisted hold
+/// labels (#8957).
 #[must_use]
 pub fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
     match disposition {
-        QueueDisposition::Parked | QueueDisposition::OpenPr => detail.map(str::to_string),
+        QueueDisposition::Parked | QueueDisposition::OpenPr | QueueDisposition::LabelledBlocked => {
+            detail.map(str::to_string)
+        }
         _ => None,
     }
 }
