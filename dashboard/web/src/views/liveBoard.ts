@@ -3,22 +3,47 @@
  *
  * **This is the one view that is not a pure `(viewModel) => HTMLElement`.**
  * The board updates every second (timers) and every few seconds (snapshots),
- * and it animates: cards slide in, a finished sweep's card fades out, the
- * current phase pulses, a tile flashes when its number changes. Rebuilding the
- * tree on every update, as the other views do, would restart every one of
- * those animations on every poll. So the board keeps a small map of keyed
- * nodes — sweep cards by `sweepId`, host pills by `hostId` — and patches them
- * in place. That is the "durable local state across re-renders" case
+ * and it animates: cards slide in, the current phase pulses, a card flashes
+ * when its phase or labels change, a tile flashes when its number changes.
+ * Rebuilding the tree on every update, as the other views do, would restart
+ * every one of those animations on every poll. So the board keeps a small map
+ * of keyed nodes — cards by work item, host pills by `hostId` — and patches
+ * them in place. That is the "durable local state across re-renders" case
  * `../../README.md` §"When to overturn this" anticipates. It is contained to
  * this file on purpose, so it does not need a framework.
+ *
+ * **Cards never move (issue #9094).** A card is keyed by its work item
+ * (`owner/repo#123`, so a re-dispatched sweep on the same issue lands on the
+ * same card), placed once — the first paint in longest-running order, every
+ * later card after the last — and from then on only patched. A sweep that
+ * finishes leaves its card where it is, marked done; a card is removed only
+ * by "Clear finished", or when the board is over [`MAX_CARDS`] and it is the
+ * oldest card with nothing in flight. Watching one card means its position is
+ * something you can rely on.
+ *
+ * Label state comes from `labels.snapshot` records (`../labelTracker.ts`),
+ * off both the snapshot poll and the live tail. An issue whose labels change
+ * while you watch gets a card even with no sweep on it.
  *
  * Text still goes in only through `textContent` (`el()`), never `innerHTML`.
  */
 
 import { el } from "../dom";
 import type { FleetView, HostView } from "../fleet";
-import { issueUrl } from "../forgeLinks";
+import { issueUrl, pullUrl } from "../forgeLinks";
 import { formatClock, formatPercent, secondsSince } from "../format";
+import {
+  LabelTracker,
+  describeTransition,
+  labelTone,
+  shortLabel,
+  workItemKey,
+  type ItemLabels,
+  type KeyedTransition,
+  type LabelTransition,
+} from "../labelTracker";
+import { parseLabelsSnapshot } from "../labelParse";
+import type { LabelsSnapshotRecord } from "../labelTypes";
 import {
   LIVE_PHASES,
   allSweeps,
@@ -38,15 +63,28 @@ import type { ActiveSweep, LiveTailFrame } from "../types";
 
 /** How many ticker lines to keep. The board is a glance, not a log. */
 export const TICKER_MAX_ROWS = 40;
-/** How long a finished sweep's card stays on screen fading out. Matches the
- * `live-card-leave` animation in `styles.css`. */
-export const CARD_LEAVE_MS = 700;
+/** Cards kept on the board. Past this, the oldest card with nothing in flight
+ * is dropped — an active sweep's card never is. */
+export const MAX_CARDS = 48;
 const HOST_BEAT_MS = 1200;
 
 export type Schedule = (handler: () => void, ms: number) => void;
 
+type CardState = "active" | "done" | "watching";
+
 interface CardRefs {
+  key: string;
+  repo: string | undefined;
+  /** The issue, for an issue key; `undefined` for a PR-only or sweep key. */
+  issue: number | undefined;
   root: HTMLElement;
+  state: CardState;
+  labels: HTMLElement;
+  history: HTMLOListElement;
+  labelsKey: string;
+  /** The newest transition rendered — identity changes with every new one,
+   * even once the history is full and its length stops changing. */
+  historyTop: LabelTransition | undefined;
   title: HTMLElement;
   host: HTMLAnchorElement;
   steps: HTMLElement[];
@@ -120,8 +158,15 @@ export class LiveBoard {
   private readonly ticker: HTMLOListElement;
   private readonly tickerEmpty: HTMLElement;
 
+  private readonly clearButton: HTMLButtonElement;
+
+  /** Insertion-ordered, which is also DOM order: a card is appended once and
+   * never moved. */
   private readonly cards = new Map<string, CardRefs>();
   private readonly hosts = new Map<string, HostRefs>();
+  private readonly labels = new LabelTracker();
+  /** Latest `sweep.completed` result per work item key. */
+  private readonly results = new Map<string, string>();
   private hasSnapshot = false;
 
   constructor(schedule: Schedule = (handler, ms) => void globalThis.setTimeout(handler, ms)) {
@@ -168,11 +213,18 @@ export class LiveBoard {
       this.idleText,
     );
     this.sweepCount = el("span", { class: "live__section-count" });
+    this.clearButton = el(
+      "button",
+      { class: "live__clear", type: "button", data: { testid: "live-clear-finished" } },
+      "Clear finished",
+    );
+    this.clearButton.hidden = true;
+    this.clearButton.addEventListener("click", () => this.clearFinished());
     this.ticker = el("ol", { class: "live__ticker", data: { testid: "live-ticker" } });
     this.tickerEmpty = el(
       "p",
       { class: "live__ticker-empty" },
-      "Events show up here as they happen: sweeps starting, changing phase, and finishing.",
+      "Events show up here as they happen: sweeps starting, changing phase and finishing, and labels changing.",
     );
 
     this.root = el(
@@ -193,7 +245,12 @@ export class LiveBoard {
         el(
           "section",
           { class: "live__panel live__panel--sweeps" },
-          el("h3", { class: "live__section-title" }, "In flight ", this.sweepCount),
+          el(
+            "div",
+            { class: "live__section-head" },
+            el("h3", { class: "live__section-title" }, "In flight ", this.sweepCount),
+            this.clearButton,
+          ),
           this.grid,
           this.idle,
         ),
@@ -217,8 +274,24 @@ export class LiveBoard {
 
     this.updateTiles(view, now, firstSnapshot);
     this.updateHosts(view);
+    // Oldest first, so two hosts' snapshots of one repo diff in order.
+    const snapshots = view.hosts
+      .flatMap((host) => (host.entry.labels ?? []).map((entry) => ({ hostId: host.hostId, record: entry.record })))
+      .sort((a, b) => Date.parse(a.record.taken_at) - Date.parse(b.record.taken_at));
+    for (const { hostId, record } of snapshots) this.applyLabels(record, hostId, firstSnapshot);
     this.updateSweeps(allSweeps(view), firstSnapshot);
     this.tick(now);
+  }
+
+  /** Remove every card with nothing in flight. The only way a card leaves the
+   * board short of [`MAX_CARDS`]. */
+  clearFinished(): void {
+    for (const [key, refs] of this.cards) {
+      if (refs.state === "active") continue;
+      refs.root.remove();
+      this.cards.delete(key);
+    }
+    this.syncChrome();
   }
 
   /** Advance every clock-driven text on the board. Only text changes, so
@@ -253,7 +326,9 @@ export class LiveBoard {
   }
 
   /** One live-tail frame: a ticker line if it is news, and a heartbeat on
-   * the host's pill either way. */
+   * the host's pill either way. A `labels.snapshot` updates card labels and
+   * puts each transition it reveals on the ticker; a `sweep.completed`
+   * records how the item's sweep ended, for its card once it goes done. */
   pushEvent(frame: LiveTailFrame, now: Date): void {
     const host = this.hosts.get(frame.event.hostId);
     if (host) {
@@ -261,13 +336,108 @@ export class LiveBoard {
       this.schedule(() => host.root.classList.remove("is-beat"), HOST_BEAT_MS);
     }
 
+    const record = frame.event.record as Record<string, unknown>;
+    if (record.kind === "labels.snapshot") {
+      const snapshot = parseLabelsSnapshot(record);
+      if (snapshot) this.applyLabels(snapshot, frame.event.hostId, !this.hasSnapshot);
+    }
+    if (record.kind === "sweep.completed" && typeof record.result === "string") {
+      const key = itemKey(stringField(record.repo), numberField(record.issue), stringField(record.sweep_id));
+      if (key !== undefined) {
+        this.results.set(key, record.result);
+        const refs = this.cards.get(key);
+        if (refs) patchStatus(refs, this.results.get(key));
+      }
+    }
+
     const event = describeEvent(frame);
-    if (!event) return;
-    this.tickerEmpty.hidden = true;
-    const row = tickerRow(event);
-    this.ticker.insertBefore(row, this.ticker.firstChild);
-    while (this.ticker.childElementCount > TICKER_MAX_ROWS) this.ticker.lastElementChild?.remove();
+    if (event) this.addTickerRow(event);
     this.tick(now);
+  }
+
+  private addTickerRow(event: BoardEvent): void {
+    this.tickerEmpty.hidden = true;
+    this.ticker.insertBefore(tickerRow(event), this.ticker.firstChild);
+    while (this.ticker.childElementCount > TICKER_MAX_ROWS) this.ticker.lastElementChild?.remove();
+  }
+
+  private applyLabels(record: LabelsSnapshotRecord, hostId: string, firstSnapshot: boolean): void {
+    const transitions = this.labels.ingest(record);
+    for (const transition of transitions) {
+      let refs = this.cards.get(transition.key);
+      if (!refs) {
+        refs = this.addCard(labelCard(transition.key, record.repo), firstSnapshot);
+        patchStatus(refs, undefined);
+      }
+      this.addTickerRow(labelEvent(transition, hostId));
+    }
+    // Every card of this repo, not only the changed ones: the first snapshot
+    // of a repo is when the cards already on screen learn their labels.
+    for (const refs of this.cards.values()) {
+      if (refs.repo === record.repo) this.patchLabels(refs);
+    }
+    this.syncChrome();
+  }
+
+  private addCard(refs: CardRefs, firstSnapshot: boolean): CardRefs {
+    // Cards on the first paint just appear; only one that arrives while you
+    // are watching slides in.
+    if (!firstSnapshot) refs.root.classList.add("is-entering");
+    this.cards.set(refs.key, refs);
+    this.grid.appendChild(refs.root);
+    this.evictOverflow();
+    return refs;
+  }
+
+  private evictOverflow(): void {
+    for (const [key, refs] of this.cards) {
+      if (this.cards.size <= MAX_CARDS) return;
+      if (refs.state === "active") continue;
+      refs.root.remove();
+      this.cards.delete(key);
+    }
+  }
+
+  private patchLabels(refs: CardRefs): void {
+    const current = refs.repo === undefined ? undefined : this.labels.labelsFor(refs.repo, refs.key);
+    const labelsKey = current === undefined ? "" : JSON.stringify(current);
+    if (labelsKey !== refs.labelsKey) {
+      const changed = refs.labelsKey !== "";
+      refs.labels.replaceChildren(...labelChips(refs.repo, current));
+      refs.labels.hidden = refs.labels.childElementCount === 0;
+      refs.labelsKey = labelsKey;
+      if (changed) retrigger(refs.root, "is-relabeled");
+    }
+    const history = this.labels.historyFor(refs.key);
+    const top = history[history.length - 1];
+    if (top !== refs.historyTop) {
+      refs.history.replaceChildren(
+        ...[...history].reverse().map((transition) =>
+          el(
+            "li",
+            { class: "live-card__change", data: { testid: "live-card-change" } },
+            el("span", { class: "live-card__change-text" }, describeTransition(transition)),
+            el("span", { class: "live-card__change-time", data: { since: transition.at, format: "ago" } }),
+          ),
+        ),
+      );
+      refs.history.hidden = history.length === 0;
+      refs.historyTop = top;
+    }
+  }
+
+  /** The header count and the empty-state text, from the card map. */
+  private syncChrome(): void {
+    let active = 0;
+    let finished = 0;
+    for (const refs of this.cards.values()) {
+      if (refs.state === "active") active += 1;
+      else finished += 1;
+    }
+    setText(this.sweepCount, String(active));
+    this.clearButton.hidden = finished === 0;
+    this.idle.hidden = this.cards.size > 0;
+    if (this.hasSnapshot) setText(this.idleText, "All quiet. Nothing is in flight right now.");
   }
 
   private updateTiles(view: FleetView, now: Date, firstSnapshot: boolean): void {
@@ -334,40 +504,53 @@ export class LiveBoard {
   }
 
   private updateSweeps(sweeps: ActiveSweep[], firstSnapshot: boolean): void {
-    const seen = new Set<string>();
-    let cursor = this.grid.firstElementChild;
-    const skipLeaving = (): void => {
-      while (cursor?.classList.contains("is-leaving")) cursor = cursor.nextElementSibling;
-    };
-
+    const live = new Set<string>();
     for (const sweep of sweeps) {
-      seen.add(sweep.sweepId);
-      let refs = this.cards.get(sweep.sweepId);
+      const key = sweepKey(sweep);
+      // Two hosts on one issue share a card; the longest-running one shows.
+      if (live.has(key)) continue;
+      live.add(key);
+      let refs = this.cards.get(key);
       if (!refs) {
-        refs = sweepCard(sweep);
-        // Cards on the first paint just appear; only a sweep that starts
-        // while you are watching slides in.
-        if (!firstSnapshot) refs.root.classList.add("is-entering");
-        this.cards.set(sweep.sweepId, refs);
+        refs = this.addCard(sweepCard(key, sweep), firstSnapshot);
+        this.patchLabels(refs);
+      }
+      if (refs.state !== "active") {
+        // A new sweep on an item already on the board: same card, same place.
+        retrigger(refs.root, "is-advanced");
+        refs.state = "active";
+        refs.phase = undefined;
+        refs.patched = false;
+        this.results.delete(key);
       }
       patchSweepCard(refs, sweep);
-      skipLeaving();
-      if (cursor === refs.root) cursor = cursor.nextElementSibling;
-      else this.grid.insertBefore(refs.root, cursor);
     }
 
-    for (const [sweepId, refs] of this.cards) {
-      if (seen.has(sweepId)) continue;
-      this.cards.delete(sweepId);
-      refs.root.classList.remove("is-entering");
-      refs.root.classList.add("is-leaving");
-      this.schedule(() => refs.root.remove(), CARD_LEAVE_MS);
+    for (const [key, refs] of this.cards) {
+      if (refs.state !== "active" || live.has(key)) continue;
+      refs.state = "done";
+      patchStatus(refs, this.results.get(key));
     }
-
-    setText(this.sweepCount, String(sweeps.length));
-    this.idle.hidden = sweeps.length > 0;
-    setText(this.idleText, "All quiet. Nothing is in flight right now.");
+    this.syncChrome();
   }
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function numberField(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** A card's key: the work item when the sweep names one, else the sweep. */
+function itemKey(repo: string | undefined, issue: number | undefined, sweepId: string | undefined): string | undefined {
+  if (repo !== undefined && issue !== undefined) return workItemKey(repo, issue);
+  return sweepId === undefined ? undefined : `sweep:${sweepId}`;
+}
+
+function sweepKey(sweep: ActiveSweep): string {
+  return itemKey(sweep.repo, sweep.issue, sweep.sweepId)!;
 }
 
 function hostPill(host: HostView): HostRefs {
@@ -402,13 +585,33 @@ function patchHostPill(refs: HostRefs, host: HostView): void {
   setText(refs.count, host.sweeps.length > 0 ? String(host.sweeps.length) : "");
 }
 
-function sweepCard(sweep: ActiveSweep): CardRefs {
-  const url = issueUrl(sweep.repo, sweep.issue);
+function sweepCard(key: string, sweep: ActiveSweep): CardRefs {
+  const refs = card(key, sweep.repo, sweep.issue, undefined, sweep.sweepId);
+  refs.state = "active";
+  return refs;
+}
+
+/** A card for an item whose labels changed while nobody was sweeping it.
+ * `key` is `owner/repo#123` or `owner/repo#pr456`. */
+function labelCard(key: string, repo: string): CardRefs {
+  const match = /#(pr)?(\d+)$/.exec(key);
+  const number = match ? Number(match[2]) : undefined;
+  return match?.[1] ? card(key, repo, undefined, number, undefined) : card(key, repo, number, undefined, undefined);
+}
+
+function card(
+  key: string,
+  repo: string | undefined,
+  issue: number | undefined,
+  pr: number | undefined,
+  sweepId: string | undefined,
+): CardRefs {
+  const url = pr === undefined ? issueUrl(repo, issue) : pullUrl(repo, pr);
   const title =
     url === undefined
       ? el("span", { class: "live-card__title" })
       : el("a", { class: "live-card__title", href: url, target: "_blank", rel: "noopener noreferrer" });
-  const host = el("a", { class: "live-card__host", href: routeToHash({ name: "host", hostId: sweep.hostId }) });
+  const host = el("a", { class: "live-card__host" });
   const steps = LIVE_PHASES.map((phase) =>
     el("span", { class: "live-step", data: { step: phase }, title: phase }, el("span", { class: "live-step__label" }, phase)),
   );
@@ -417,10 +620,14 @@ function sweepCard(sweep: ActiveSweep): CardRefs {
   const phaseTimer = el("span", { class: "live-card__phase-timer" });
   const meta = el("span", { class: "live-card__meta" });
   const agent = el("span", { class: "live-card__agent" });
+  const labels = el("div", { class: "live-card__labels", data: { testid: "live-card-labels" } });
+  labels.hidden = true;
+  const history = el("ol", { class: "live-card__history", data: { testid: "live-card-history" } });
+  history.hidden = true;
 
   const root = el(
     "article",
-    { class: "live-card", data: { testid: "live-card", sweep: sweep.sweepId } },
+    { class: "live-card", data: { testid: "live-card", key, ...(sweepId === undefined ? {} : { sweep: sweepId }) } },
     el("header", { class: "live-card__head" }, title, host),
     el("div", { class: "live-card__stepper" }, steps),
     el(
@@ -429,15 +636,102 @@ function sweepCard(sweep: ActiveSweep): CardRefs {
       timer,
       el("div", { class: "live-card__now" }, phaseLabel, phaseTimer),
     ),
+    labels,
+    history,
     el("footer", { class: "live-card__foot" }, agent, meta),
   );
-  setText(title, sweepTitle(sweep.repo, sweep.issue));
-  if (sweep.repo === undefined) title.title = "Private repository";
+  setText(title, pr === undefined ? sweepTitle(repo, issue) : `${sweepTitle(repo, undefined)} PR #${pr}`);
+  if (repo === undefined) title.title = "Private repository";
 
-  return { root, title, host, steps, phaseLabel, timer, phaseTimer, meta, agent, patched: false, phase: undefined, metaText: "", agentKey: "" };
+  return {
+    key,
+    repo,
+    issue,
+    root,
+    state: "watching",
+    labels,
+    history,
+    labelsKey: "",
+    historyTop: undefined,
+    title,
+    host,
+    steps,
+    phaseLabel,
+    timer,
+    phaseTimer,
+    meta,
+    agent,
+    patched: false,
+    phase: undefined,
+    metaText: "",
+    agentKey: "",
+  };
+}
+
+/** The card's state for a sweep that is not running: `done` stops its
+ * clocks where they stood and says how it ended; `watching` (labels only)
+ * has no clocks at all. */
+function patchStatus(refs: CardRefs, result: string | undefined): void {
+  refs.root.dataset.state = refs.state;
+  if (refs.state === "active") return;
+  delete refs.timer.dataset.since;
+  delete refs.phaseTimer.dataset.since;
+  setText(refs.phaseTimer, "");
+  if (refs.state === "watching") {
+    setText(refs.timer, "");
+    setText(refs.phaseLabel, "labels changed");
+    return;
+  }
+  refs.root.dataset.result = result ?? "unknown";
+  setText(refs.phaseLabel, result ? `finished · ${result}` : "finished");
+}
+
+function labelChip(label: string): HTMLElement {
+  return el(
+    "span",
+    { class: "live-label", title: label, data: { tone: labelTone(label), testid: "live-label" } },
+    shortLabel(label),
+  );
+}
+
+/** Issue chips, then one group per PR: `PR #40 [review-requested]`. */
+function labelChips(repo: string | undefined, current: ItemLabels | undefined): HTMLElement[] {
+  if (!current) return [];
+  const nodes: HTMLElement[] = [];
+  if (current.issue && current.issue.length > 0) {
+    nodes.push(el("span", { class: "live-card__label-group" }, ...current.issue.map(labelChip)));
+  }
+  for (const pr of current.prs) {
+    const url = pullUrl(repo, pr.number);
+    const name =
+      url === undefined
+        ? el("span", { class: "live-card__pr" }, `PR #${pr.number}`)
+        : el("a", { class: "live-card__pr", href: url, target: "_blank", rel: "noopener noreferrer" }, `PR #${pr.number}`);
+    nodes.push(el("span", { class: "live-card__label-group", data: { pr: String(pr.number) } }, name, ...pr.labels.map(labelChip)));
+  }
+  return nodes;
+}
+
+/** A label transition as a ticker line. */
+function labelEvent(transition: KeyedTransition, hostId: string): BoardEvent {
+  const issue = /#(\d+)$/.exec(transition.key);
+  const number = issue ? Number(issue[1]) : undefined;
+  return {
+    tone: transition.closed ? "info" : "phase",
+    subject: number === undefined ? `${sweepTitle(transition.repo, undefined)} PR #${transition.number}` : sweepTitle(transition.repo, number),
+    text: describeTransition(transition),
+    hostId,
+    at: transition.at,
+    repo: transition.repo,
+    issue: number,
+  };
 }
 
 function patchSweepCard(refs: CardRefs, sweep: ActiveSweep): void {
+  refs.root.dataset.state = "active";
+  delete refs.root.dataset.result;
+  refs.root.dataset.sweep = sweep.sweepId;
+  refs.host.href = routeToHash({ name: "host", hostId: sweep.hostId });
   setText(refs.host, sweep.hostId);
 
   if (sweep.startedAt) refs.timer.dataset.since = sweep.startedAt;
