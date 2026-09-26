@@ -51,6 +51,13 @@ fn first_attempt() -> u32 {
     1
 }
 
+/// One entry of a run's `pull_requests` array — the direct PR-number source
+/// for a `pull_request`-triggered run, without needing a second API call.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequestRefJson {
+    pub number: u64,
+}
+
 /// One `GET /repos/{o}/{r}/actions/runs` row.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RunJson {
@@ -77,6 +84,10 @@ pub struct RunJson {
     pub triggering_actor: Option<ActorJson>,
     #[serde(default)]
     pub actor: Option<ActorJson>,
+    /// The PR(s) GitHub associates with this run — populated for
+    /// `pull_request`-triggered runs, empty otherwise (Issue #9007).
+    #[serde(default)]
+    pub pull_requests: Vec<PullRequestRefJson>,
 }
 
 impl RunJson {
@@ -88,6 +99,31 @@ impl RunJson {
     #[must_use]
     pub fn workflow(&self) -> String {
         self.name.clone().unwrap_or_else(|| "unnamed".to_string())
+    }
+
+    /// The join-key PR/issue number for this run, when derivable (Issue
+    /// #9007). Two independent sources, tried in order:
+    ///
+    /// 1. `pull_requests[].number` — the true PR number, present only when
+    ///    GitHub associates a PR with the run (typically `event ==
+    ///    "pull_request"`).
+    /// 2. [`crate::claim_reconciliation::parse_issue_from_branch`] on
+    ///    `head_branch` — a `feature/issue-N` branch's **issue** number, used
+    ///    as a fallback for `push`-triggered runs where no PR association is
+    ///    reported. This is a different number space than (1) (issue vs. PR),
+    ///    but both serve the same purpose here: joining this CI run back to
+    ///    the sweep that produced it, following the sweep side's own
+    ///    `loom.pr_number` convention.
+    ///
+    /// `None` when neither source resolves — never `0`.
+    #[must_use]
+    pub fn pr_number(&self) -> Option<u32> {
+        if let Some(pr) = self.pull_requests.first() {
+            return u32::try_from(pr.number).ok();
+        }
+        self.head_branch
+            .as_deref()
+            .and_then(crate::claim_reconciliation::parse_issue_from_branch)
     }
 }
 
@@ -259,6 +295,9 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
             ("loom.ci.workflow", Some(workflow)),
             ("loom.ci.event", Some(run.event.clone())),
             ("loom.ci.conclusion", run.conclusion.clone()),
+            ("loom.ci.head_sha", Some(run.head_sha.clone())),
+            ("loom.ci.ref", run.head_branch.clone()),
+            ("loom.pr_number", run.pr_number().map(|n| n.to_string())),
         ]),
         events: Vec::new(),
         links: Vec::new(),
@@ -341,6 +380,9 @@ pub fn job_envelopes(
             ("loom.ci.runner", runner),
             ("loom.ci.attempts", Some(job.run_attempt.to_string())),
             ("loom.ci.conclusion", job.conclusion.clone()),
+            ("loom.ci.head_sha", Some(run.head_sha.clone())),
+            ("loom.ci.ref", run.head_branch.clone()),
+            ("loom.pr_number", run.pr_number().map(|n| n.to_string())),
         ]),
         events: Vec::new(),
         links: Vec::new(),

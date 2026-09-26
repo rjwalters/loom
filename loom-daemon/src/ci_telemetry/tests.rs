@@ -8,6 +8,7 @@
 
 mod credential_rejection;
 mod job_logs;
+mod join_keys;
 mod rerun_window;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
