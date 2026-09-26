@@ -42,6 +42,20 @@
 //! running) would re-arm the roll for another budget with the same outcome,
 //! which is the cycling being stopped.
 //!
+//! **That clearing condition is harder to meet than "self-clearing" suggests**,
+//! and the honest framing matters: it is an auto-update tick *sampling*
+//! `in_flight == 0` on the `intervalSecs` cadence
+//! ([`super::DEFAULT_AUTO_UPDATE_INTERVAL_SECS`], 900s) **with dispatch
+//! running** — strictly harder than the drain's own quiescence watch, which is
+//! continuous *and* observes a paused dispatcher where in-flight can only fall.
+//! Once dispatch resumes, a cap-12 dispatcher refills the in-flight set as soon
+//! as the long sweep ends, so a 900s sample can miss every lull and the host can
+//! stay un-updated indefinitely. There is no time-based retry here: this module
+//! trades *unbounded paused dispatch* for *unbounded staleness on a
+//! permanently-busy host*, which is the better of the two (dispatch and role
+//! spawns come back, and the reason is named) but is not a state that fixes
+//! itself promptly. A bounded cooldown retry is tracked as #9010.
+//!
 //! # What it deliberately does not change
 //!
 //! - **The #6007 fail-safe.** No sweep is ever cancelled. Abandoning a roll
@@ -50,12 +64,18 @@
 //! - **Anyone else's drain.** Only a roll this daemon's auto-updater armed and
 //!   labelled with an artifact target advances an episode or is abandoned — the
 //!   same conservatism [`super::supersede`] applies. An operator `restart
-//!   --drain` and a `fleet drain` teardown (`then_exit`) are untouched.
+//!   --drain` and a `fleet drain` teardown (`then_exit`) are untouched — while a
+//!   declaration is standing, too: [`RollStallTracker::observe`] applies that
+//!   ownership test *ahead* of the sticky flag, and `run_tick` re-tests it before
+//!   reaching `DrainState::abort()`. Both halves are needed, because `fleet
+//!   drain` detects a remote refusal by observing `drain.draining == false`, so
+//!   aborting an operator's teardown would leave the host running and be read as
+//!   a refusal nobody is told about.
 //! - **Directions 2 and 3 of #8998** (age-excluding a long sweep from the drain
 //!   condition; dropping the full-drain requirement for artifact rolls). Both
 //!   change safety-relevant semantics and are the work that would let such a
 //!   host actually update; this module only converts a silent indefinite
-//!   livelock into one loud, actionable, self-clearing state.
+//!   livelock into one loud, actionable state.
 
 use super::supersede::ArmedRoll;
 use super::AutoUpdateConfig;
@@ -68,12 +88,27 @@ pub const AUTO_UPDATE_ROLL_STALL_DEADLINES_ENV: &str = "LOOM_AUTO_UPDATE_ROLL_ST
 /// lifetimes — with the in-flight count never improving before the roll's wait
 /// condition is declared unsatisfiable (Issue #8998).
 ///
-/// `3` is chosen against #6007's own geometry rather than picked round. With the
-/// default 1800s drain timeout the retry windows widen `1800 → 3600 → …` under a
-/// 7200s total budget, so a *single* roll reaches roughly this many refusals
-/// before it abandons itself anyway. A lower value would fire inside the first
-/// roll's own fail-safe (pre-empting a wait that is still working); a much
-/// higher one is what the fleet already had, since each new release reset the
+/// `3` is chosen against #6007's own geometry rather than picked round, and the
+/// property it buys is stronger than "about one roll's worth": at this default
+/// the detector **cannot** fire inside a single drain's own fail-safe, so it
+/// always requires crossing a roll boundary — exactly the boundary the livelock
+/// hid behind.
+///
+/// Walk [`crate::ipc::drain_roll::drain_refusal_decision`] with the default 1800s
+/// drain timeout (`DRAIN_PENDING_BUDGET_MULTIPLIER = 4` → a 7200s budget;
+/// windows `base·2^(n+1)`, capped at `MAX_DRAIN_RETRY_WINDOW_SECS` and at the
+/// remaining budget; `Abandon` once under `MIN_DRAIN_RETRY_WINDOW_SECS = 60`):
+///
+/// | refusal | elapsed | remaining | decision |
+/// |---|---|---|---|
+/// | 1 | 1800 | 5400 | `Defer` 3600 → `refusals = 1` |
+/// | 2 | 5400 | 1800 | `Defer` `min(7200, 1800)` = 1800 → `refusals = 2` |
+/// | — | 7200 | 0 | `0 < 60` → `Abandon` |
+///
+/// `DrainDescriptor::refusals` is incremented only on `Defer`, so **the maximum
+/// a single drain reaches is 2, not 3**. A lower value would fire inside that
+/// still-working fail-safe (pre-empting a wait that is bounded already); a much
+/// higher one is what the fleet effectively had, since each new release reset the
 /// count to zero.
 pub const DEFAULT_ROLL_STALL_DEADLINES: u32 = 3;
 
@@ -105,8 +140,12 @@ pub struct RollStallReport {
     /// The lowest in-flight count seen anywhere in the episode — the number that
     /// makes "it is not emptying" concrete rather than asserted.
     pub floor: usize,
-    /// How long the episode has run, in seconds.
-    pub armed_secs: u64,
+    /// How long the **episode** has run, in seconds — measured from its first
+    /// observation, not from any one roll's arming. An episode deliberately spans
+    /// ticks with nothing armed (that gap is where the 21h cycle reset itself),
+    /// so this is longer than the live roll has been armed and is named for what
+    /// it measures.
+    pub episode_secs: u64,
     /// The artifact identity the abandoned roll was targeting, when known.
     pub target: Option<String>,
 }
@@ -120,7 +159,7 @@ impl RollStallReport {
             deadlines,
             in_flight,
             floor,
-            armed_secs,
+            episode_secs,
             target,
         } = self;
         let target = target
@@ -128,14 +167,17 @@ impl RollStallReport {
             .map_or_else(String::new, |t| format!(" (target {t})"));
         format!(
             "ABANDONING the drain-and-restart roll{target}: its wait condition is UNSATISFIABLE. \
-             {deadlines} drain deadline(s) have expired across {armed_secs}s of armed roll and the \
+             {deadlines} drain deadline(s) have expired across {episode_secs}s of stalled episode \
+             (since the first refusal) and the \
              in-flight sweep count has never improved on {floor} ({in_flight} in flight now) — \
              re-arming would pause dispatch for another budget and reach the same refusal, which \
              is the loop that cost two fleet hosts 21h of paused dispatch (#8998). The roll intent \
              is DISCARDED and NORMAL DISPATCH RESUMES, including role spawns. No sweep was \
              cancelled and the pre-update binary keeps running (the #6007 fail-safe is unchanged). \
-             THIS HOST WILL NOT AUTO-UPDATE until in-flight reaches zero, at which point the roll \
-             re-arms and completes on its own. To act now: find the long-running sweep with \
+             THIS HOST WILL NOT AUTO-UPDATE until an auto-update tick SAMPLES in-flight at zero \
+             (checked once per interval, with dispatch running), at which point the roll re-arms and \
+             completes on its own — on a continuously-busy host that sample may not land for a long \
+             time, so do not wait for it. To act now: find the long-running sweep with \
              `loom-daemon list`, then either let it finish, cancel it with `loom-daemon cancel \
              --sweep <id>`, or force the roll through with `loom-daemon restart --drain \
              --force-after-timeout` (which DOES cancel it)."
@@ -221,15 +263,29 @@ impl RollStallTracker {
             };
             return None;
         }
+        // Not ours to reason about: a `fleet drain` teardown, or an untargeted
+        // drain (an operator `restart --drain`, or a source-path roll this daemon
+        // cannot key an artifact identity on). Freeze the episode rather than
+        // counting someone else's deadlines.
+        //
+        // This guard is deliberately **above** the sticky check below, and that
+        // ordering is load-bearing: `run_tick` abandons whatever drain is armed
+        // on the tick this returns `Some`, so reporting a standing declaration
+        // while a foreign drain is armed cancels *that* drain — the host an
+        // operator asked to tear down never stops, and `fleet drain` reads the
+        // cleared `draining` flag as a refusal it never reports. Returning `None`
+        // here instead leaves the tick to #6007's pre-existing teardown /
+        // untargeted skip, which publishes its own note and touches nothing. The
+        // declaration itself is retained, not discarded, so the suppression
+        // resumes the moment the foreign drain ends. Pinned by
+        // `a_latched_declaration_does_not_report_a_teardown_drain_armed_afterwards`.
+        if matches!(armed, Some(roll) if roll.then_exit || roll.target.is_none()) {
+            return None;
+        }
         if self.unsatisfiable {
             return Some(self.report(now, in_flight));
         }
         match armed {
-            // Not ours to reason about: a `fleet drain` teardown, or an
-            // untargeted drain (an operator `restart --drain`, or a source-path
-            // roll this daemon cannot key an artifact identity on). Freeze the
-            // episode rather than counting someone else's deadlines.
-            Some(roll) if roll.then_exit || roll.target.is_none() => return None,
             Some(roll) => {
                 // `refusals` is monotonic *within* a drain and restarts at 0 on
                 // the next one, so a decrease means a roll ended and another
@@ -290,7 +346,7 @@ impl RollStallTracker {
             deadlines: self.deadlines(),
             in_flight,
             floor: self.floor.unwrap_or(in_flight),
-            armed_secs: self
+            episode_secs: self
                 .since
                 .map_or(0, |since| u64::try_from((now - since).num_seconds()).unwrap_or(0)),
             target: self.target.clone(),
@@ -412,7 +468,7 @@ mod tests {
         let report = tracker.observe(at(2700), Some(&roll(1)), 2).unwrap();
         assert_eq!(report.deadlines, 3, "2 banked from roll A + 1 from roll B");
         assert_eq!(report.in_flight, 2);
-        assert_eq!(report.armed_secs, 2700);
+        assert_eq!(report.episode_secs, 2700, "the EPISODE's span, including the unarmed tick");
         assert_eq!(report.target.as_deref(), Some("v0.19.390@aaaa"));
     }
 
@@ -476,6 +532,64 @@ mod tests {
         assert!(!tracker.is_active());
     }
 
+    /// The case the two tests above cannot reach, because they arm the foreign
+    /// drain from the first observation and so never start an episode: a
+    /// declaration already **latched**, and a teardown armed afterwards. The
+    /// sticky flag must not turn a foreign drain into a reportable episode —
+    /// `run_tick` abandons whatever `observe` reports on, so a `Some` here is a
+    /// cancelled operator teardown (PR #9004's first pass shipped exactly that).
+    #[test]
+    fn a_latched_declaration_does_not_report_a_teardown_drain_armed_afterwards() {
+        let mut tracker = RollStallTracker::default();
+        for deadline in 1..=3 {
+            tracker.observe(at(i64::from(deadline) * 900), Some(&roll(deadline)), 4);
+        }
+        assert!(
+            tracker.observe(at(3600), Some(&roll(4)), 4).is_some(),
+            "our own roll is declared unsatisfiable"
+        );
+        // The host is still busy (the 9h sweep runs on) and an operator tears it
+        // down. `fleet drain` reads a cleared `draining` flag as a *refusal*, so
+        // an abandonment here is silently destructive.
+        let mut teardown = roll(0);
+        teardown.then_exit = true;
+        for tick in 5..10 {
+            assert_eq!(
+                tracker.observe(at(tick * 900), Some(&teardown), 4),
+                None,
+                "tick {tick}: a teardown must not be reported even while latched"
+            );
+        }
+        // And the suppression itself survives: it is the roll that is given up
+        // on, not the detection.
+        assert!(tracker.is_active(), "the episode is frozen, not discarded");
+        assert!(
+            tracker.observe(at(9000), None, 4).is_some(),
+            "once the foreign drain is gone the declaration is re-reported"
+        );
+    }
+
+    /// The same blind spot for an operator `restart --drain`, which carries no
+    /// artifact target.
+    #[test]
+    fn a_latched_declaration_does_not_report_an_untargeted_drain_armed_afterwards() {
+        let mut tracker = RollStallTracker::default();
+        for deadline in 1..=3 {
+            tracker.observe(at(i64::from(deadline) * 900), Some(&roll(deadline)), 4);
+        }
+        assert!(tracker.observe(at(3600), Some(&roll(4)), 4).is_some());
+        let mut operator = roll(0);
+        operator.target = None;
+        for tick in 5..10 {
+            assert_eq!(
+                tracker.observe(at(tick * 900), Some(&operator), 4),
+                None,
+                "tick {tick}: an operator drain must not be reported even while latched"
+            );
+        }
+        assert!(tracker.is_active());
+    }
+
     #[test]
     fn a_busy_host_with_no_roll_armed_is_not_an_episode() {
         let mut tracker = RollStallTracker::default();
@@ -493,15 +607,19 @@ mod tests {
             deadlines: 4,
             in_flight: 7,
             floor: 2,
-            armed_secs: 75_600,
+            episode_secs: 75_600,
             target: Some("v0.19.390@aaaa".to_string()),
         }
         .note();
         for needle in [
             "UNSATISFIABLE",
             "4 drain deadline(s)",
-            "75600s",
+            "75600s of stalled episode",
             "7 in flight now",
+            // The suppression's end condition, stated precisely rather than as
+            // "self-clearing": it is a SAMPLE, and on a busy host it may not land.
+            "SAMPLES in-flight at zero",
+            "do not wait for it",
             "never improved on 2",
             "v0.19.390@aaaa",
             "NORMAL DISPATCH RESUMES",
@@ -520,7 +638,7 @@ mod tests {
             deadlines: 3,
             in_flight: 1,
             floor: 1,
-            armed_secs: 60,
+            episode_secs: 60,
             target: None,
         }
         .note();

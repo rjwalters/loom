@@ -4258,7 +4258,7 @@ knobs not yet audited here.
 | `autonomous.transcriptArchive.archiveDir` | `LOOM_TRANSCRIPT_ARCHIVE_DIR` | `~/.loom/transcript-archives` | Where the scheduled pass writes its `.tar.zst` + `.manifest.json` pairs (same default as the CLI's `--archive-dir`). **Restart required** |
 | `autonomous.transcriptArchive.sinks` | *(config only)* | `["local"]` | Destination identities to ledger under. `local` is the only sink implemented (#8758's scope); unknown names are warned about and dropped, and an enabled pass whose list retains no recognized sink does not start — a future remote sink (#8759) listing must never silently disable `local`. **Restart required** |
 | `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. **Bounds the rebuild/source path only (#8252)** — a resolved release artifact is fetched immediately regardless of in-flight sweeps (niced, not deferred), so this deadline never delays an artifact roll. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
-| `autonomous.autoUpdate.rollStallDeadlines` | `LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES` | `3` | Unsatisfiable-drain detector (#8998): how many drain deadlines may expire — summed **across roll lifetimes**, not per drain — with the in-flight sweep count never improving before the roll is declared unsatisfiable, abandoned, and *not re-armed* until in-flight reaches zero. Bounds the arm → refuse → retain → abandon → re-arm *sequence*, which #6007's per-drain paused-dispatch budget does not: each new release (or a #8514 supersede) restarted that budget, so two fleet dispatchers sat paused for 21h behind a legitimate 9h32m analog-simulation sweep and never rolled. Zero/invalid → default; there is deliberately no "never give up" value, since that is the bug. Set it high to make the detector effectively unreachable |
+| `autonomous.autoUpdate.rollStallDeadlines` | `LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES` | `3` | Unsatisfiable-drain detector (#8998): how many drain deadlines may expire — summed **across roll lifetimes**, not per drain — with the in-flight sweep count never improving before the roll is declared unsatisfiable, abandoned, and *not re-armed* until an auto-update tick samples in-flight at zero (a sample on this cadence, not a continuous watch — see the mechanism entry below, and #9010 for the bounded-retry follow-up). Bounds the arm → refuse → retain → abandon → re-arm *sequence*, which #6007's per-drain paused-dispatch budget does not: each new release (or a #8514 supersede) restarted that budget, so two fleet dispatchers sat paused for 21h behind a legitimate 9h32m analog-simulation sweep and never rolled. Zero/invalid → default; there is deliberately no "never give up" value, since that is the bug. Set it high to make the detector effectively unreachable |
 | `autonomous.ciTelemetry.enabled` | `LOOM_CI_TELEMETRY_ENABLED` | `false` | Periodic GitHub Actions run/job capture (#8824, phase 2 #8825). Read-only observer: it can never change a dispatch, claim, or merge decision. **Restart required** — `spawn_task` resolves the whole block once, before the poller task is spawned; it is never re-read inside the poll loop. See [`ci-observability.md`](ci-observability.md) |
 | `autonomous.ciTelemetry`.`org` | `LOOM_CI_TELEMETRY_ORG` | `2amlogic` | The org whose repos are auto-discovered and polled. Empty → default. **Restart required** — same one-time `spawn_task` resolution as `enabled` |
 | `autonomous.ciTelemetry.intervalSecs` | `LOOM_CI_TELEMETRY_INTERVAL_SECS` | `120` | Poll cadence. Zero/invalid → default. **Restart required** — the resolved `Duration` is baked into the `tokio::time::interval` ticker at spawn time |
@@ -9068,20 +9068,39 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   improving, the roll is **abandoned** — through the same `--abort-drain`
   primitive a supersede uses, so dispatch (and role spawns) resume and #6007's
   bookkeeping is fully reset — and **no new roll is armed** until in-flight is
-  observed at zero, at which point the suppression clears by itself and the roll
-  lands normally. The finding is logged at WARN, published as
-  `auto_update_note`, recorded as `drain_note`, and emitted on the bus as
-  `daemon.drain.roll_unsatisfiable`; it names the deadline count, the in-flight
-  floor, how long the roll had been armed, and the three operator actions
-  (`loom-daemon list` to find the sweep, `loom-daemon cancel --sweep <id>`, or
-  `restart --drain --force-after-timeout` to force through). **The fail-safe is
-  untouched: no sweep is ever cancelled**, and the pre-update binary keeps
-  running — the change trades a silent indefinite livelock for one loud,
-  actionable, self-clearing state, not for a cancelled sweep. Deliberately
-  narrow in the same way #8514 is: an episode only advances for a **relaunch**
-  roll this daemon armed and **labelled with an artifact target**, so a
-  `fleet drain` teardown and an operator's untargeted `restart --drain` are never
-  abandoned by the loop. What this does **not** do is let such a host update:
+  observed at zero. **Be precise about what clears it**, because "self-clearing"
+  is easy to over-read: the declaration is dropped only by an auto-update tick
+  that *samples* `in_flight == 0`, i.e. on the `autoUpdate.intervalSecs` cadence
+  (default 900s) and **with dispatch running**. That is strictly harder to hit
+  than the drain's own quiescence watch, which is continuous *and* observes a
+  paused dispatcher where in-flight can only fall: once dispatch resumes, a
+  cap-12 dispatcher refills the in-flight set as soon as the long sweep ends, so
+  a 900s sample can miss every lull and the host can stay un-updated
+  indefinitely. There is no time-based retry — the trade this makes is
+  *unbounded paused dispatch* for *unbounded staleness on a permanently-busy
+  host*, which is the better of the two (dispatch and role spawns come back, and
+  the reason is named), but it is not "it fixes itself shortly". A bounded
+  cooldown retry is tracked separately in #9010. The finding is logged at WARN,
+  published as `auto_update_note`, recorded as `drain_note`, and emitted on the
+  bus as `daemon.drain.roll_unsatisfiable`; it names the deadline count, the
+  in-flight floor, how long the **stalled episode** has run (which spans ticks
+  with nothing armed — it is not the live roll's armed duration), and the three
+  operator actions (`loom-daemon list` to find the sweep, `loom-daemon cancel
+  --sweep <id>`, or `restart --drain --force-after-timeout` to force through).
+  **The fail-safe is untouched: no sweep is ever cancelled**, and the pre-update
+  binary keeps running — the change trades a silent indefinite livelock for one
+  loud, actionable state, not for a cancelled sweep. Deliberately narrow in the
+  same way #8514 is: an episode only advances for a **relaunch** roll this daemon
+  armed and **labelled with an artifact target**, so a `fleet drain` teardown and
+  an operator's untargeted `restart --drain` are never abandoned by the loop.
+  That holds **while a declaration is standing, too** — the ownership test runs
+  ahead of the sticky flag in `RollStallTracker::observe`, and the abandonment in
+  `run_tick` re-tests it before calling `abort()`, so a drain armed *after* the
+  declaration latches is left alone rather than cancelled on the next tick. Both
+  halves are needed: `fleet drain` detects a remote refusal by observing
+  `drain.draining == false`, so aborting an operator's teardown would leave the
+  host running and be read as a refusal nobody is told about. What this does
+  **not** do is let such a host update:
   #8998's other two directions (age-excluding a long sweep from the drain
   condition; dropping the full-drain requirement for artifact rolls) are the
   work that would, and both change safety-relevant semantics.

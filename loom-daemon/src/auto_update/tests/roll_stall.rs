@@ -245,6 +245,45 @@ fn test_run_tick_never_abandons_a_teardown_drain() {
     assert!(trigger.armed_roll().is_some(), "the teardown stays armed");
     let note = status.snapshot().note.unwrap_or_default();
     assert!(note.contains("teardown"), "the pre-#8998 skip wording is preserved: {note}");
+
+    // The state the five ticks above cannot reach, and the one that matters: a
+    // teardown armed *after* the declaration has latched. Arming the foreign
+    // drain from tick 1 means no episode ever starts, so the sticky branch is
+    // never exercised — the blind spot PR #9004's first pass shipped through.
+    // First latch on a roll of our own …
+    *trigger.armed.lock().unwrap() = Some(ArmedRoll {
+        target: Some(format!("v0.19.390@{SHA_B}")),
+        pending: true,
+        then_exit: false,
+        refusals: 3,
+    });
+    tick(&mut state, &status, &mut probe, &trigger);
+    assert_eq!(trigger.abandon_count(), 1, "our OWN roll is abandoned, as designed");
+
+    // … then the operator tears the host down while the host is still busy and
+    // the declaration still stands. `fleet drain` detects a remote refusal by
+    // observing `drain.draining == false`, so aborting this drain would read as
+    // a refusal nobody is told about — and the host would never stop.
+    *trigger.armed.lock().unwrap() = Some(ArmedRoll {
+        target: Some("v0.19.391@cccc".to_string()),
+        pending: true,
+        then_exit: true,
+        refusals: 0,
+    });
+    for _ in 0..3 {
+        tick(&mut state, &status, &mut probe, &trigger);
+    }
+    assert_eq!(
+        trigger.abandon_count(),
+        1,
+        "a latched declaration must not abandon the operator's teardown"
+    );
+    assert!(trigger.armed_roll().is_some(), "the teardown is still armed");
+    let note = status.snapshot().note.unwrap_or_default();
+    assert!(
+        note.contains("teardown"),
+        "and the tick reports the teardown skip, not our suppression: {note}"
+    );
 }
 
 /// An operator `restart --drain` carries no artifact target. The auto-updater
@@ -270,6 +309,34 @@ fn test_run_tick_never_abandons_an_untargeted_operator_drain() {
     }
     assert_eq!(trigger.abandon_count(), 0);
     assert!(trigger.armed_roll().is_some(), "the operator's drain stays armed");
+
+    // The latched case, for the same reason as the teardown test above: latch on
+    // a roll of our own, then let the operator arm an untargeted `restart
+    // --drain` while the host is still busy.
+    *trigger.armed.lock().unwrap() = Some(ArmedRoll {
+        target: Some(format!("v0.19.390@{SHA_B}")),
+        pending: true,
+        then_exit: false,
+        refusals: 3,
+    });
+    tick(&mut state, &status, &mut probe, &trigger);
+    assert_eq!(trigger.abandon_count(), 1, "our OWN roll is abandoned, as designed");
+
+    *trigger.armed.lock().unwrap() = Some(ArmedRoll {
+        target: None,
+        pending: true,
+        then_exit: false,
+        refusals: 0,
+    });
+    for _ in 0..3 {
+        tick(&mut state, &status, &mut probe, &trigger);
+    }
+    assert_eq!(
+        trigger.abandon_count(),
+        1,
+        "a latched declaration must not abandon the operator's drain"
+    );
+    assert!(trigger.armed_roll().is_some(), "the operator's drain is still armed");
 }
 
 /// The threshold is a knob, not a constant baked into the tick.

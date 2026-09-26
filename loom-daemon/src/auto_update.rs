@@ -1842,10 +1842,18 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
         {
             let note = report.note();
             log::warn!("auto_update: {note}");
-            // Only ever a roll this loop armed and labelled: `observe` refuses to
-            // advance an episode for a teardown or an untargeted operator drain,
-            // so neither can reach this abandonment.
-            if armed.is_some() {
+            // Only ever a roll this loop armed and labelled with an artifact
+            // target. `observe` already refuses to advance — or to re-report — an
+            // episode while a teardown or an untargeted operator drain is armed,
+            // but this is the call that actually reaches `DrainState::abort()`,
+            // so it re-states the ownership test rather than trusting an
+            // invariant asserted one module away. Gating on `armed.is_some()`
+            // instead is what let a latched declaration cancel an operator's
+            // teardown within one tick (the defect PR #9004 shipped first).
+            if armed
+                .as_ref()
+                .is_some_and(|roll| !roll.then_exit && roll.target.is_some())
+            {
                 trigger.abandon_roll(&note);
             }
             let armed_artifact = probe.resolve_artifact();
