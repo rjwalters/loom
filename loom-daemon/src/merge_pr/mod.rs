@@ -52,8 +52,16 @@
 //! contradiction beside a present approval, and carries the only override
 //! flag in the family (`--allow-unapproved`) because "nobody reviewed it" and
 //! "a reviewer said no" are different acts.
+//!
+//! [`hold_state`] completes that trio: the advisory warning [`loom_pr_guard`]
+//! deliberately left in the shell, fired only when `loom:pr` IS present and
+//! Champion's recorded merge-risk-hold head is not the head about to merge. It
+//! is the only member of the family that never refuses anything — and the port
+//! fixes two ways the retired `grep | tail -1 | sed` pipeline lost the warning
+//! silently, which for a check nothing else duplicates is the whole risk.
 
 pub mod head_sync;
+pub mod hold_state;
 pub mod labels;
 pub mod loom_pr_guard;
 pub mod redate;

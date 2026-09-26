@@ -294,6 +294,14 @@ pub(crate) enum MergePrCommand {
     /// overridden (see stdout for which), 1 = absent with no override.
     LoomPrGuard(super::merge_pr_loom_pr_guard::LoomPrGuardArgs),
 
+    /// The `champion:hold-state` staleness WARNING (#7419 AC #3): the other
+    /// half of `loom-pr-guard`'s story, fired only when `loom:pr` IS present
+    /// and Champion's recorded hold head is not the head about to merge.
+    /// Advisory, never a gate — always exits 0 (stdout is either the
+    /// `LOOM-HOLD-STATE-CLEAN` sentinel or the warning), except exit 2 when
+    /// the comment stream could not be read at all.
+    HoldState(super::merge_pr_hold_state::HoldStateArgs),
+
     /// `_maybe_delete_local_branch` (#4100/#5015/#7812): the squash-aware
     /// local-branch delete rule, now shared verbatim with `worktree.sh
     /// remove` (#8195 slice 3) instead of duplicated. Always exits 0 — a
@@ -311,6 +319,7 @@ impl MergePrCommand {
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
+            MergePrCommand::HoldState(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
         }
     }
