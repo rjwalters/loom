@@ -983,24 +983,18 @@ Project-Specific Hooks:
 
 Monorepo / Generated-Artifact Symlinks:
   In addition to the root node_modules symlink, worktree.sh symlinks:
-    - Nested per-package node_modules (e.g. apps/web/node_modules) discovered by
-      scanning the main workspace for node_modules dirs that sit next to a
-      package.json (pnpm/monorepo layouts). No YAML parser dependency.
+    - Nested per-package node_modules (e.g. apps/web/node_modules), found by scanning
+      the main workspace for node_modules dirs next to a package.json. No YAML parser.
     - Extra gitignored paths listed in .loom/config.json under worktree.linkPaths,
       e.g. generated wasm-pack bindings that are expensive to rebuild per worktree:
 
         { "worktree": { "linkPaths": ["apps/web/src/wasm"] } }
 
   Each created symlink is added to the worktree's .git/info/exclude so 'git add -A'
-  never stages it. All symlinking is best-effort — a failed link warns and
-  continues; it never aborts worktree creation. Repos with no nested node_modules
-  and no worktree.linkPaths config see no behavior change. NEITHER node_modules
-  family runs on a pnpm workspace (root pnpm-lock.yaml / pnpm-workspace.yaml, or
-  packageManager: pnpm@...): pnpm purges THROUGH such a symlink into the MAIN
-  workspace and CI=true defeats every confirmation it offers, so run 'pnpm
-  install' in the worktree instead (hardlinked from pnpm's shared store, which
-  is the disk sharing the symlink was reaching for). Override either way with
-  .loom/config.json worktree.linkNodeModules: true | false | "auto" (#8944).
+  never stages it; linking is best-effort and never aborts worktree creation. Repos
+  with no nested node_modules and no worktree.linkPaths config see no change.
+  NEITHER node_modules family runs on a pnpm workspace — pnpm purges THROUGH the alias
+  into the main clone (#8944). Override: worktree.linkNodeModules true|false|"auto".
 
 Resuming Abandoned Work:
   If an agent abandoned work on issue #42, a new agent can resume:
