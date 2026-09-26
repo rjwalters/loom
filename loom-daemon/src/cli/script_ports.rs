@@ -114,11 +114,53 @@ pub(crate) enum ScriptPortCommand {
     /// call sites already discard the status with `|| true`.
     WorktreeCleanup(super::worktree_cleanup::WorktreeCleanupArgs),
 
+    /// `lib/worktree-race-rescue.sh`'s `loom_worktree_reset_or_rescue` (#8195,
+    /// slice 6): the guard in front of `worktree.sh`'s stale-worktree
+    /// `git reset --hard` — refuse while a live process holds the worktree
+    /// (#7463), refuse when it gained commits, and capture foreign uncommitted
+    /// tracked changes to a `.snapshots/` patch before resetting rather than
+    /// discarding them (#6706/#6334, the #6320 incident). Exit 0 = reset,
+    /// 1 = refused and nothing changed, 2 = the reset itself failed.
+    WorktreeReset(super::worktree_reset::WorktreeResetArgs),
+
+    /// `worktree.sh`'s `_handle_feature_branch_in_main_worktree` (#8195 slice
+    /// 7): the recovery `_try_worktree_add` falls into when `git worktree
+    /// add` refuses because the target branch is already checked out in the
+    /// main workspace. The one arm of the create path that is pure string
+    /// parsing of an arbitrary git error message — #7858's class again. Exit
+    /// 0 = handled (no retry), 1 = not this error, 2 = auto-recovered, retry.
+    WorktreeBranchConflict(super::worktree_branch_conflict::WorktreeBranchConflictArgs),
+
+    /// `worktree.sh`'s post-`git worktree add` submodule initialization
+    /// (#8195 slice 8): the `git submodule status | grep '^-' | awk '{print
+    /// $2}'` work list — #7858's whitespace-split-path class, on the string
+    /// that is then used as BOTH a `--reference` directory and a git
+    /// pathspec — plus a `timeout(1)` that does not exist on a stock macOS, a
+    /// `--reference` fast path that never once fired, and a `$$`-keyed
+    /// failure flag in world-writable `/tmp`. Exit 0 always: best-effort by
+    /// contract, and the worktree already exists.
+    WorktreeSubmodules(super::worktree_submodules::WorktreeSubmodulesArgs),
+
+    /// `worktree.sh`'s upstream-tracking correction and stale-worktree drift
+    /// report (#8195 slice 9) — which the script carried as TWO hand-
+    /// maintained copies of the same fix, one per create-path arm
+    /// (#6095/#6100 on branch reuse, #6257/#6291 on the registered-worktree
+    /// fast path), differing only in a noun and in whether the
+    /// behind-the-pushed-tip report runs. Both defects shipped silently:
+    /// their failure mode is a message that is never printed and an upstream
+    /// that is never corrected. Exit 0 always — advisory repair; a repo that
+    /// cannot be fetched from must not block worktree creation.
+    WorktreeUpstream(super::worktree_upstream::WorktreeUpstreamArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
     #[command(subcommand)]
     RetryClassify(super::retry_classify::RetryClassifyCommand),
+    /// Provenance stamps (#9027, D33): commit trailers, the `commit-msg`
+    /// stamper and the PR-body `loom:provenance` marker.
+    #[command(subcommand)]
+    Provenance(super::provenance::ProvenanceCommand),
     /// Host-side autonomy-loss detector (#8086), backing
     /// `loom-daemon-watchdog.sh`. Run by a launchd/systemd timer on a
     /// `StartInterval` cadence, so it owns no long-lived process.
@@ -217,6 +259,15 @@ pub(crate) enum ScriptPortCommand {
     /// resolved, 1 no manifest reachable (soft), 78 (`EX_CONFIG`) malformed
     /// manifest or an unrecognized `launch` key.
     RuntimeLaunchEnv(super::runtime_launch_cmd::RuntimeLaunchEnvArgs),
+
+    /// The fleet-wide `loom:blocked` re-check (#8927): every open
+    /// `loom:blocked` issue whose cited blocker has since closed/merged (a
+    /// stale block), plus every one carrying the label with no parseable
+    /// blocker reference at all (an undocumented block). The fourth pre-wave
+    /// advisory check, backing `check-stale-blocked.sh`. Strictly read-only,
+    /// **always exit 0** — it reports, it never relabels. Not a port: brand-new
+    /// logic, native from the start per the shell-language policy.
+    CheckStaleBlocked(super::stale_blocked::StaleBlockedArgs),
 }
 
 impl ScriptPortCommand {
@@ -240,7 +291,12 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeRemove(args) => args.run(),
             ScriptPortCommand::WorktreeLink(args) => args.run(),
             ScriptPortCommand::WorktreeCleanup(args) => args.run(),
+            ScriptPortCommand::WorktreeReset(args) => args.run(),
+            ScriptPortCommand::WorktreeBranchConflict(args) => args.run(),
+            ScriptPortCommand::WorktreeSubmodules(args) => args.run(),
+            ScriptPortCommand::WorktreeUpstream(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
+            ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
@@ -253,6 +309,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
+            ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
         }
     }
 }
@@ -301,6 +358,13 @@ pub(crate) enum MergePrCommand {
     /// and prints one `LEVEL<TAB>message` line per decision for the caller to
     /// replay through its own logging (see `cli::merge_pr_delete_branch`).
     DeleteBranch(super::merge_pr_delete_branch::DeleteBranchArgs),
+
+    /// Decide ONE zero-row check-runs poll of `--auto`'s settle wait (#9091):
+    /// settle now, keep waiting, or report the whole wait spent. Bounded only
+    /// when the base branch requires no status-check contexts; a lookup that
+    /// errors, or a required context present, keeps #6169's full wait. Always
+    /// exits 0 with one sentinel-led line — see `cli::merge_pr_zero_checks`.
+    ZeroChecksSettle(super::merge_pr_zero_checks::ZeroChecksSettleArgs),
 }
 
 impl MergePrCommand {
@@ -312,6 +376,7 @@ impl MergePrCommand {
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
+            MergePrCommand::ZeroChecksSettle(args) => args.run(),
         }
     }
 }

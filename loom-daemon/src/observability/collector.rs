@@ -799,6 +799,7 @@ async fn sample_host_health(
         armed_singleton_jobs: crate::fleet_captain::armed_singleton_job_names_for_host(
             workspace_root,
         ),
+        captainless_singleton_jobs: crate::fleet_captain::captainless_singleton_job_names(),
     }
 }
 

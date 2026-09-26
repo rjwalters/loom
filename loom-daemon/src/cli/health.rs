@@ -437,6 +437,8 @@ async fn collect(window: Duration) -> HealthReport {
         codex_accounts: probe_codex_accounts(),
         transcript_ingest: transcript_ingest_status,
         tmpfs_visibility: tmpfs_visibility_status,
+        // 11. CI-telemetry poller health (#9014) — local status.json read.
+        ci_telemetry: Some(loom_daemon::ci_telemetry::collect_health(&transcript_ingest_repo_root)),
     })
 }
 

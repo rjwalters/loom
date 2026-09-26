@@ -49,14 +49,18 @@
 //! trace/span ids) for a backend to deduplicate. That safety net is still in
 //! place — it is what keeps a transient double-arm window (mid-`fleet.captain`
 //! edit) harmless rather than corrupting — but it is no longer the *primary*
-//! mechanism: **a multi-host fleet that enables `ciTelemetry` must also
-//! declare `fleet.captain` naming one host, or the poller is refused
-//! everywhere** (fail-closed, per the gate's own contract — see
-//! `defaults/docs/daemon-reference.md`'s "Fleet captain" section). This is a
-//! deliberate, accepted migration cost: the epic behind this poller (#8522)
-//! has no production fleet relying on the old duplicate-and-dedup posture
-//! yet, and duplicate polling wastes GitHub API budget for no benefit once
-//! exactly one host can be assigned.
+//! mechanism: **every host that enables `ciTelemetry` — a single-host setup
+//! included — must also have `fleet.captain` declared naming one host, or
+//! the poller is refused** (fail-closed, per the gate's own contract — see
+//! `defaults/docs/daemon-reference.md`'s "Fleet captain" section). The
+//! original #8901 note said only multi-host fleets were affected; that was
+//! wrong (#9014), because `NoCaptainDeclared` refuses on any host.
+//!
+//! The refusal is **not silent** (#9014): each refused tick is recorded in
+//! `status.json` ([`gate_tick`] → [`state::note_captain_gate`]), so
+//! `ci-telemetry status` reads `refused` with the gate's reason; a
+//! no-captain refusal also lands in `host.health.captainless_singleton_jobs`
+//! and turns the `loom-daemon health` `ci_telemetry` section non-green.
 
 pub mod api;
 pub mod export;
@@ -66,6 +70,7 @@ pub mod logs;
 pub mod poll;
 pub mod records;
 pub mod state;
+pub mod story;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -393,19 +398,7 @@ pub fn spawn_task(root: PathBuf) -> Option<tokio::task::JoinHandle<()>> {
             // the very next cycle rather than requiring a daemon restart —
             // see this module's "Multi-host posture" doc section.
             let host_id = crate::sweep_registry::host_identity();
-            if let Err(refusal) =
-                crate::fleet_captain::arm_singleton_job(SINGLETON_JOB_NAME, &root, &host_id)
-            {
-                // `NoCaptainDeclared` is a misconfiguration worth surfacing
-                // above debug — a captain-assigned-but-not-this-host refusal
-                // is the routine, expected case on every non-captain host and
-                // would otherwise log every interval forever.
-                let gate = crate::fleet_captain::resolve_gate_for_root(&root, &host_id);
-                if matches!(gate, crate::fleet_captain::CaptainGate::NoCaptainDeclared) {
-                    log::warn!("ci_telemetry: {refusal}");
-                } else {
-                    log::debug!("ci_telemetry: {refusal}");
-                }
+            if !gate_tick(&root, &host_id, chrono::Utc::now()) {
                 continue;
             }
             let root = root.clone();
@@ -422,6 +415,71 @@ pub fn spawn_task(root: PathBuf) -> Option<tokio::task::JoinHandle<()>> {
             }
         }
     }))
+}
+
+/// The CI poller's health on this host, for `loom-daemon health`'s
+/// `ci_telemetry` section (#9014). Serialized as the section's detail.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CiTelemetryHealth {
+    /// `autonomous.ciTelemetry.enabled`, resolved.
+    pub enabled: bool,
+    /// [`state::Health::label`] as of now.
+    pub state: String,
+    /// The recorded fleet-captain refusal, if the poller is refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub captain_refusal: Option<state::CaptainRefusal>,
+}
+
+/// Collect [`CiTelemetryHealth`] for `root` — filesystem-only (config +
+/// `status.json`), no forge call.
+#[must_use]
+pub fn collect_health(root: &Path) -> CiTelemetryHealth {
+    let resolved = resolve(&read_config(root));
+    let status = state::load_status(&state_dir(root));
+    let health = state::classify(&status, chrono::Utc::now(), resolved.interval_secs);
+    CiTelemetryHealth {
+        enabled: resolved.enabled,
+        state: health.label().to_string(),
+        captain_refusal: matches!(health, state::Health::Refused { .. })
+            .then(|| status.captain_refusal.clone())
+            .flatten(),
+    }
+}
+
+/// One tick's fleet-captain gate (#8901), with the refusal made visible
+/// (#9014): arms or refuses `ci-telemetry-poll` via
+/// [`crate::fleet_captain::arm_singleton_job`] and records the outcome in
+/// `status.json` ([`state::note_captain_gate`]) so `ci-telemetry status`
+/// reads `refused` with the reason instead of `stale`/`never-polled`.
+/// Returns `true` when the cycle may run.
+pub fn gate_tick(root: &Path, host_id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let dir = state_dir(root);
+    match crate::fleet_captain::arm_singleton_job(SINGLETON_JOB_NAME, root, host_id) {
+        Ok(()) => {
+            if let Err(error) = state::note_captain_gate(&dir, None, now) {
+                log::warn!("ci_telemetry: could not clear the captain refusal: {error}");
+            }
+            true
+        }
+        Err(refusal) => {
+            // `NoCaptainDeclared` is a misconfiguration worth surfacing above
+            // debug — a captain-assigned-but-not-this-host refusal is the
+            // routine, expected case on every non-captain host.
+            let no_captain = matches!(
+                crate::fleet_captain::resolve_gate_for_root(root, host_id),
+                crate::fleet_captain::CaptainGate::NoCaptainDeclared
+            );
+            if no_captain {
+                log::warn!("ci_telemetry: {refusal}");
+            } else {
+                log::debug!("ci_telemetry: {refusal}");
+            }
+            if let Err(error) = state::note_captain_gate(&dir, Some((&refusal, no_captain)), now) {
+                log::warn!("ci_telemetry: could not record the captain refusal: {error}");
+            }
+            false
+        }
+    }
 }
 
 #[cfg(test)]

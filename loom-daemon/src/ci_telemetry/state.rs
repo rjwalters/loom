@@ -36,6 +36,21 @@ pub struct CycleSummary {
     /// Wanted job logs left for the next cycle by the per-cycle download cap.
     #[serde(default)]
     pub logs_deferred: usize,
+    /// Emitted runs also stitched into their issue's story trace (#9088).
+    #[serde(default)]
+    pub story_runs_stitched: usize,
+    /// Emitted runs with no story candidate (no PR closing ref, no
+    /// `feature/issue-N` branch) — e.g. pushes to `main`.
+    #[serde(default)]
+    pub story_runs_no_candidate: usize,
+    /// Emitted runs NOT stitched because they had several candidate issues.
+    #[serde(default)]
+    pub story_runs_ambiguous: usize,
+    /// Emitted runs NOT stitched because a candidate could not be established
+    /// (unresolvable `repo_id`, unreadable PR closing references, a
+    /// cross-repo closing reference).
+    #[serde(default)]
+    pub story_runs_unresolved: usize,
 }
 
 /// `status.json` — every field needed to tell never-polled / ok / stale /
@@ -65,6 +80,28 @@ pub struct PollStatus {
     /// either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_log_fetch_at: Option<DateTime<Utc>>,
+    /// The daemon poller's most recent fleet-captain refusal (#9014), cleared
+    /// on the first armed tick. Without it a refused poller left this file
+    /// untouched, so `status` read `never-polled`/`stale` with no reason and
+    /// the refusal was visible only as a per-tick WARN in the daemon log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captain_refusal: Option<CaptainRefusal>,
+}
+
+/// Why the daemon poller is not polling on this host: the
+/// [`crate::fleet_captain`] gate refused `ci-telemetry-poll` (#9014).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptainRefusal {
+    /// The gate's own refusal message (names the captain, or the missing key).
+    pub reason: String,
+    /// `true` when no `fleet.captain` is declared at all — the
+    /// misconfiguration case, as opposed to the routine "another host is the
+    /// captain" refusal.
+    pub no_captain_declared: bool,
+    /// When this refusal (same `reason`) was first recorded.
+    pub since: DateTime<Utc>,
+    /// The most recent tick that was refused.
+    pub last_at: DateTime<Utc>,
 }
 
 fn status_path(dir: &Path) -> PathBuf {
@@ -120,6 +157,13 @@ pub enum Health {
         consecutive_failures: u32,
         backoff_until: Option<DateTime<Utc>>,
     },
+    /// The daemon poller is refused by the fleet-captain gate (#9014): no
+    /// cycle has been attempted since the most recent refused tick.
+    Refused {
+        reason: String,
+        no_captain_declared: bool,
+        since: DateTime<Utc>,
+    },
 }
 
 impl Health {
@@ -130,6 +174,7 @@ impl Health {
             Health::Ok { .. } => "ok",
             Health::Stale { .. } => "stale",
             Health::Failing { .. } => "failing",
+            Health::Refused { .. } => "refused",
         }
     }
 }
@@ -137,6 +182,21 @@ impl Health {
 /// Classify `status` as of `now` against the poll `interval_secs`.
 #[must_use]
 pub fn classify(status: &PollStatus, now: DateTime<Utc>, interval_secs: u64) -> Health {
+    // A refusal newer than the last attempted cycle outranks every other
+    // reading (#9014): the poller is not stale or failing, it is gated off,
+    // and the reason is the actionable part.
+    if let Some(refusal) = &status.captain_refusal {
+        if status
+            .last_attempt_at
+            .is_none_or(|attempt| refusal.last_at >= attempt)
+        {
+            return Health::Refused {
+                reason: refusal.reason.clone(),
+                no_captain_declared: refusal.no_captain_declared,
+                since: refusal.since,
+            };
+        }
+    }
     if status.last_attempt_at.is_none() {
         return Health::NeverPolled;
     }
@@ -163,6 +223,37 @@ pub fn classify(status: &PollStatus, now: DateTime<Utc>, interval_secs: u64) -> 
     } else {
         Health::Ok { age_secs }
     }
+}
+
+/// Record (`Some((reason, no_captain_declared))`) or clear (`None`) the
+/// daemon poller's fleet-captain refusal in `status.json` (#9014). Runs under
+/// [`CycleLock`] so it never races a cycle's own status write; when a cycle
+/// holds the lock the update is skipped and the next tick retries. Writes
+/// only on change (plus `last_at` refreshes while refused).
+pub fn note_captain_gate(
+    dir: &Path,
+    refusal: Option<(&str, bool)>,
+    now: DateTime<Utc>,
+) -> io::Result<()> {
+    let Some(_lock) = CycleLock::try_acquire(dir)? else {
+        return Ok(());
+    };
+    let mut status = load_status(dir);
+    let next = refusal.map(|(reason, no_captain_declared)| CaptainRefusal {
+        reason: reason.to_string(),
+        no_captain_declared,
+        since: status
+            .captain_refusal
+            .as_ref()
+            .filter(|prev| prev.reason == reason)
+            .map_or(now, |prev| prev.since),
+        last_at: now,
+    });
+    if next.is_none() && status.captain_refusal.is_none() {
+        return Ok(());
+    }
+    status.captain_refusal = next;
+    save_status(dir, &status)
 }
 
 /// One cached discovery page: the validator ETag, the body it validated,

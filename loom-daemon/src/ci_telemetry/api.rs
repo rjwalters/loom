@@ -87,6 +87,14 @@ pub trait GithubApi: Send + Sync {
     /// the body routinely contains terminal escape sequences, which `gh api`
     /// refuses to emit unless told otherwise.
     fn get_document(&self, path: &str) -> Result<ApiResponse, ApiError>;
+
+    /// One GraphQL `query` (Issue #9088): a PR's closing-issue references
+    /// have no REST endpoint. The default refuses, so a client that never
+    /// needs it (every test fake predating story stitching) is unchanged and
+    /// a caller treats the refusal as "could not resolve", never as an answer.
+    fn graphql(&self, _query: &str) -> Result<ApiResponse, ApiError> {
+        Err(ApiError::Transport("this GitHub client does not support GraphQL".to_string()))
+    }
 }
 
 /// Bound a detail string so an HTML error page never floods a status file.
@@ -231,7 +239,7 @@ impl GhCliApi {
 /// `--allow-escape-sequences`; a `gh` that predates the flag rejects it as
 /// unknown. Either way the failure text names the flag, so the fallback is
 /// keyed on that rather than on a version probe.
-fn mentions_unknown_escape_flag(detail: &str) -> bool {
+pub(crate) fn mentions_unknown_escape_flag(detail: &str) -> bool {
     let lowered = detail.to_ascii_lowercase();
     lowered.contains("allow-escape-sequences")
         && (lowered.contains("unknown flag") || lowered.contains("unknown command"))
@@ -258,5 +266,10 @@ terminal escapes will be refused by gh rather than captured (upgrade gh to captu
             }
             other => other,
         }
+    }
+
+    fn graphql(&self, query: &str) -> Result<ApiResponse, ApiError> {
+        let field = format!("query={query}");
+        self.run("graphql", &["-f", field.as_str()])
     }
 }

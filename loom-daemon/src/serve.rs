@@ -698,6 +698,7 @@ async fn handle_health(
         // tmpfs mount) this daemon-authoritative route does not gather, so no
         // `tmpfs_visibility` section renders here.
         tmpfs_visibility: None,
+        ci_telemetry: None,
     });
 
     let mut body = serde_json::to_value(&health)?;

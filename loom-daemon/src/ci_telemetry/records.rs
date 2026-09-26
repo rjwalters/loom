@@ -9,7 +9,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::telemetry::ci::{duration_ms, CiDurationMetric};
 use crate::telemetry::trace::{
@@ -51,6 +50,13 @@ fn first_attempt() -> u32 {
     1
 }
 
+/// One entry of a run's `pull_requests` array — the direct PR-number source
+/// for a `pull_request`-triggered run, without needing a second API call.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequestRefJson {
+    pub number: u64,
+}
+
 /// One `GET /repos/{o}/{r}/actions/runs` row.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RunJson {
@@ -77,6 +83,10 @@ pub struct RunJson {
     pub triggering_actor: Option<ActorJson>,
     #[serde(default)]
     pub actor: Option<ActorJson>,
+    /// The PR(s) GitHub associates with this run — populated for
+    /// `pull_request`-triggered runs, empty otherwise (Issue #9007).
+    #[serde(default)]
+    pub pull_requests: Vec<PullRequestRefJson>,
 }
 
 impl RunJson {
@@ -88,6 +98,40 @@ impl RunJson {
     #[must_use]
     pub fn workflow(&self) -> String {
         self.name.clone().unwrap_or_else(|| "unnamed".to_string())
+    }
+
+    /// The join-key PR/issue number for this run, when derivable (Issue
+    /// #9007). Two independent sources, tried in order:
+    ///
+    /// 1. `pull_requests[].number` — the true PR number, present only when
+    ///    GitHub associates a PR with the run (typically `event ==
+    ///    "pull_request"`).
+    /// 2. [`crate::claim_reconciliation::parse_issue_from_branch`] on
+    ///    `head_branch` — a `feature/issue-N` branch's **issue** number, used
+    ///    as a fallback for `push`-triggered runs where no PR association is
+    ///    reported. This is a different number space than (1) (issue vs. PR),
+    ///    but both serve the same purpose here: joining this CI run back to
+    ///    the sweep that produced it, following the sweep side's own
+    ///    `loom.pr_number` convention.
+    ///
+    /// `None` when neither source resolves — never `0`.
+    #[must_use]
+    pub fn pr_number(&self) -> Option<u32> {
+        if let Some(pr) = self.pull_requests.first() {
+            return u32::try_from(pr.number).ok();
+        }
+        self.head_branch
+            .as_deref()
+            .and_then(crate::claim_reconciliation::parse_issue_from_branch)
+    }
+
+    /// Milliseconds the run queued before starting: `run_started_at −
+    /// created_at`, floored at zero (#9007 follow-up). `None` when GitHub
+    /// reported no start.
+    #[must_use]
+    pub fn queued_ms(&self) -> Option<i64> {
+        self.run_started_at
+            .map(|started| duration_ms(self.created_at, started))
     }
 }
 
@@ -129,26 +173,6 @@ pub struct JobsPage {
     pub jobs: Vec<JobJson>,
 }
 
-fn digest_hex(parts: &[&str]) -> String {
-    let mut hasher = Sha256::new();
-    for part in parts {
-        hasher.update(part.as_bytes());
-        hasher.update([0_u8]);
-    }
-    hex::encode(hasher.finalize())
-}
-
-/// Deterministic identifier from `parts`. SHA-256 output is all-zero with
-/// negligible probability; the `1` fallback keeps the id valid regardless.
-fn derived_id(parts: &[&str], hex_len: usize) -> String {
-    let hex = digest_hex(parts)[..hex_len].to_string();
-    if hex.bytes().all(|b| b == b'0') {
-        format!("{}1", &hex[..hex_len - 1])
-    } else {
-        hex
-    }
-}
-
 /// A run attempt's trace context: trace id and root span id both derived
 /// from `(repo, run_id, attempt)` — one trace per run attempt. Always
 /// sampled.
@@ -157,10 +181,8 @@ pub fn run_context(repo: &str, run_id: u64, attempt: u32) -> TraceContext {
     let run = run_id.to_string();
     let attempt = attempt.to_string();
     TraceContext {
-        trace_id: TraceId::try_from(derived_id(&["loom.ci.trace", repo, &run, &attempt], 32))
-            .unwrap_or_else(|_| TraceContext::root(true).trace_id),
-        span_id: SpanId::try_from(derived_id(&["loom.ci.run", repo, &run, &attempt], 16))
-            .unwrap_or_else(|_| TraceContext::root(true).span_id),
+        trace_id: TraceId::derived(&["loom.ci.trace", repo, &run, &attempt]),
+        span_id: SpanId::derived(&["loom.ci.run", repo, &run, &attempt]),
         flags: 1,
     }
 }
@@ -170,8 +192,7 @@ pub fn run_context(repo: &str, run_id: u64, attempt: u32) -> TraceContext {
 pub fn job_context(repo: &str, run_id: u64, attempt: u32, job_id: u64) -> TraceContext {
     let run = run_context(repo, run_id, attempt);
     TraceContext {
-        span_id: SpanId::try_from(derived_id(&["loom.ci.job", repo, &job_id.to_string()], 16))
-            .unwrap_or_else(|_| run.child().span_id),
+        span_id: SpanId::derived(&["loom.ci.job", repo, &job_id.to_string()]),
         ..run
     }
 }
@@ -229,6 +250,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         started_at,
         completed_at,
         duration_ms: duration,
+        queued_ms: run.queued_ms(),
     };
     let duration_record = CiDurationRecord {
         metric: CiDurationMetric::Run,
@@ -259,6 +281,10 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
             ("loom.ci.workflow", Some(workflow)),
             ("loom.ci.event", Some(run.event.clone())),
             ("loom.ci.conclusion", run.conclusion.clone()),
+            ("loom.ci.head_sha", Some(run.head_sha.clone())),
+            ("loom.ci.ref", run.head_branch.clone()),
+            ("loom.pr_number", run.pr_number().map(|n| n.to_string())),
+            ("loom.ci.queued_ms", run.queued_ms().map(|ms| ms.to_string())),
         ]),
         events: Vec::new(),
         links: Vec::new(),
@@ -341,6 +367,9 @@ pub fn job_envelopes(
             ("loom.ci.runner", runner),
             ("loom.ci.attempts", Some(job.run_attempt.to_string())),
             ("loom.ci.conclusion", job.conclusion.clone()),
+            ("loom.ci.head_sha", Some(run.head_sha.clone())),
+            ("loom.ci.ref", run.head_branch.clone()),
+            ("loom.pr_number", run.pr_number().map(|n| n.to_string())),
         ]),
         events: Vec::new(),
         links: Vec::new(),

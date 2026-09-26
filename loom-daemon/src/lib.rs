@@ -215,6 +215,7 @@ pub mod pipeline_snapshot;
 pub mod premise_check;
 pub mod primary_checkout_reaper;
 pub mod proc_exec;
+pub mod provenance;
 pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;
 pub mod ram_headroom;
@@ -248,6 +249,7 @@ pub mod self_update;
 pub mod serve;
 pub mod shell_budget;
 pub mod short_hash;
+pub mod stale_blocked;
 pub mod startup_adoption;
 pub mod stash_retirement;
 /// Root-count-aware cost model for `build_daemon_status` and the `status`/
@@ -585,5 +587,6 @@ mod tests {
 }
 
 pub mod native_readiness;
+pub mod native_state_reclaim;
 pub mod native_tools;
 pub mod session_exec;

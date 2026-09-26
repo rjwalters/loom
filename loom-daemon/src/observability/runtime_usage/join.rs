@@ -7,7 +7,7 @@
 //! local-only index to join on.
 //!
 //! **Write side.** When a traced sweep is dispatched, [`open`] writes
-//! `.loom/logs/trace-joins/<trace-id>.json` = `{issue, context, started_at}`
+//! `.loom/logs/trace-joins/<trace-id>-<span-id>.json` = `{issue, context, started_at}`
 //! (the execution's persisted root context). At the terminal transition,
 //! [`close`] stamps `ended_at`. Entries are pruned [`RETAIN_CLOSED_HOURS`]
 //! after they close, or [`RETAIN_OPEN_HOURS`] after they open.
@@ -67,9 +67,15 @@ impl JoinEntry {
     }
 }
 
+/// Keyed by span as well as trace: every sweep of one issue shares its story
+/// trace id (#9037), so a trace id alone would let a retry overwrite, and the
+/// earlier sweep's [`close`] then end, the retry's entry.
 fn entry_path(root: &Path, context: &TraceContext) -> PathBuf {
-    root.join(JOIN_DIR)
-        .join(format!("{}.json", context.trace_id.as_str()))
+    root.join(JOIN_DIR).join(format!(
+        "{}-{}.json",
+        context.trace_id.as_str(),
+        context.span_id.as_str()
+    ))
 }
 
 fn write(root: &Path, entry: &JoinEntry) -> anyhow::Result<()> {
@@ -123,15 +129,25 @@ pub fn close(root: &Path, execution: &str, ended_at: DateTime<Utc>) {
         return;
     };
     let path = entry_path(root, &context);
-    let Some(mut entry) = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<JoinEntry>(&bytes).ok())
-    else {
+    // An execution in flight across the upgrade opened its entry under the
+    // pre-#9038 `<trace-id>.json` name; close (and rename) that one instead.
+    let legacy = root
+        .join(JOIN_DIR)
+        .join(format!("{}.json", context.trace_id.as_str()));
+    let Some((found, mut entry)) = [path.clone(), legacy].into_iter().find_map(|candidate| {
+        std::fs::read(&candidate)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<JoinEntry>(&bytes).ok())
+            .filter(|entry| entry.context == context)
+            .map(|entry| (candidate, entry))
+    }) else {
         return;
     };
     entry.ended_at = Some(ended_at.max(entry.started_at));
     if let Err(error) = write(root, &entry) {
         log::warn!("observability: session trace join not closed: {error}");
+    } else if found != path {
+        let _ = std::fs::remove_file(found);
     }
 }
 

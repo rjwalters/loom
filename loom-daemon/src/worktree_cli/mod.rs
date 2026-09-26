@@ -59,14 +59,57 @@
 //! [`branch_landed::ladder`] since #8470 — see [`branch_landed`]'s module doc
 //! for how the two call sites differ and the strictness change it made.
 //!
+//! Slice 6 is [`reset`]: the rescue-or-refuse guard in front of the
+//! stale-worktree `git reset --hard`, and with it the last of the three
+//! data-loss classes the issue leads with — *"rescue foreign work instead of
+//! discarding it on a raced reset/remove"* (#6706), from the #6320 incident
+//! where an unqualified reset discarded a second builder's uncommitted work.
+//! It is also where the issue's "two implementations of *is this worktree safe
+//! to touch*" is literally true: the shell's liveness probe *claimed* to mirror
+//! [`crate::worktree_ops::safety::find_processes_using_directory`] and had
+//! drifted from it (cwd-only vs. the #7466 any-open-fd scan), so the port
+//! reaches the one `/proc` walk and one `lsof` parse in the codebase through a
+//! flag instead of keeping a bash copy alongside.
+//!
 //! [`issue_lock`] is not a port slice: it is `worktree.sh` growing a NEW
 //! guard (#8553) that stands entirely on the Rust side by construction — this
 //! file is frozen by the file-size ratchet, so the shell side stays a single
 //! delegating call. It reads a lock [`lock`] never touches: the daemon's
 //! per-issue sweep-CLAIM lock (`sweep_registry::locks`), not the repo-global
 //! worktree-add mutex.
+//!
+//! Slice 7 is [`branch_conflict`]: `_handle_feature_branch_in_main_worktree`,
+//! the recovery `_try_worktree_add` falls into when `git worktree add` refuses
+//! because the target branch is already checked out in the main workspace. It
+//! is the one arm of the create path that is *pure string parsing of an
+//! arbitrary git error message* — a `grep -o … | sed 's/…//'` extraction of a
+//! quoted path, then a raw string comparison — which is #7858's class again,
+//! this time in a guard that decides whether to auto-switch a workspace
+//! rather than whether to `rm -rf` one.
+//!
+//! Slice 8 is [`submodules`]: the other post-`git worktree add` provisioning
+//! step, the sibling of [`link`]. Fifty lines of shell holding four defects
+//! that never changed a printed line — an `awk '{print $2}'` work list
+//! (#7858's class again, and here the truncated string is used as both a
+//! `--reference` directory and a git pathspec), a `timeout(1)` that a stock
+//! macOS does not have, a `--reference` fast path whose `[[ -d ]]` test was
+//! evaluated from the wrong directory and therefore never once fired, and a
+//! `$$`-keyed failure flag written into world-writable `/tmp`.
+//!
+//! Slice 9 is [`upstream`]: the upstream-tracking correction and the
+//! stale-worktree drift report. It is the one slice that took **two** blocks of
+//! the script at once, because they were two hand-maintained copies of the same
+//! fix — #6095/#6100 corrected a branch's wrong upstream on the reuse arm, and
+//! #6257 discovered eighteen months later that "a completely different code
+//! path" (its own words, still in the script) needed the identical correction
+//! and re-implemented it by hand. This is the epic's *"two implementations of
+//! the same question"* in its most literal form, and both defects shipped
+//! **silently**: their failure mode is not a wrong message but no message, and
+//! an upstream left pointing at the default branch so a later
+//! `git pull --ff-only` fast-forwards a PR branch onto `main`'s tip.
 
 pub mod baseline;
+pub mod branch_conflict;
 pub mod branch_delete;
 pub mod branch_landed;
 pub mod cleanup;
@@ -75,5 +118,8 @@ pub mod issue_lock;
 pub mod link;
 pub mod lock;
 pub mod remove;
+pub mod reset;
 pub mod snapshot;
+pub mod submodules;
+pub mod upstream;
 pub mod wip;
