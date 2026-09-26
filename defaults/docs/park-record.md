@@ -123,7 +123,8 @@ parked PR could appear on at all (#8925's first defect). `check_and_unblock`
 calls `check_and_unblock_prs` once, after its own issue loop, to cover the PR
 population; the three functions below are its full definition, read on demand
 from `guide.md`'s "Unblocking Pull Requests (#8925)" section rather than
-inlined there (`.loom/docs/file-size-policy.md`'s ratchet).
+inlined there (the role-prompt size ratchet: guide.md is installed at two
+depths and its whole prompt prefix is frozen at its current size).
 
 A parked PR's "restore to the queue" differs from an issue's in two ways:
 there is no `loom:issue` to restore (a PR was never curated), and the
