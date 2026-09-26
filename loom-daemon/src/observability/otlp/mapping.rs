@@ -634,6 +634,25 @@ struct MetricSample {
     time_unix_nano: u64,
 }
 
+/// One host-level gauge with no per-account attributes (the host.health
+/// memory gauges); the host identity rides the Resource, not the series.
+fn memory_gauge(
+    name: &'static str,
+    description: &'static str,
+    unit: &'static str,
+    value: number_data_point::Value,
+    time_unix_nano: u64,
+) -> MetricSample {
+    MetricSample {
+        name,
+        description,
+        unit,
+        attributes: Vec::new(),
+        value,
+        time_unix_nano,
+    }
+}
+
 /// Maps one host-level envelope to zero or more [`MetricSample`]s. Returns an
 /// empty `Vec` for the four lifecycle-kind records (those become log
 /// records instead — see [`log_record_for`]) and for any optional field left
@@ -733,6 +752,112 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     ),
                     time_unix_nano,
                 });
+            }
+            // Memory-pressure gauges (the deferred-vs-killed-vs-timed-out
+            // metric surface). Each is emitted **only** when its field was
+            // measured — the "unknown != zero" contract holds here too: an
+            // absent source (no PSI on macOS, no `oom_kill` counter on some
+            // kernels) must not plot as a flat zero line in the dashboard.
+            if let Some(memory) = &r.memory {
+                if let Some(bytes) = memory.mem_total_bytes {
+                    samples.push(memory_gauge(
+                        "loom.host.mem_total_bytes",
+                        "Total physical memory installed.",
+                        "By",
+                        number_data_point::Value::AsInt(i64::try_from(bytes).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
+                if let Some(bytes) = memory.mem_available_bytes {
+                    samples.push(memory_gauge(
+                        "loom.host.mem_available_bytes",
+                        "Memory available for a new allocation without reclaim.",
+                        "By",
+                        number_data_point::Value::AsInt(i64::try_from(bytes).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
+                if let Some(bytes) = memory.mem_compressed_bytes {
+                    samples.push(memory_gauge(
+                        "loom.host.mem_compressed_bytes",
+                        "Memory compressed rather than paged to swap.",
+                        "By",
+                        number_data_point::Value::AsInt(i64::try_from(bytes).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
+                if let Some(bytes) = memory.swap_total_bytes {
+                    samples.push(memory_gauge(
+                        "loom.host.swap_total_bytes",
+                        "Total swap capacity, when the platform exposes one.",
+                        "By",
+                        number_data_point::Value::AsInt(i64::try_from(bytes).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
+                if let Some(bytes) = memory.swap_used_bytes {
+                    samples.push(memory_gauge(
+                        "loom.host.swap_used_bytes",
+                        "Swap currently in use.",
+                        "By",
+                        number_data_point::Value::AsInt(i64::try_from(bytes).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
+                if let Some(bytes) = memory.swap_in_bytes_total {
+                    samples.push(memory_gauge(
+                        "loom.host.swap_in_bytes_total",
+                        "Cumulative host-lifetime swap-in volume.",
+                        "By",
+                        number_data_point::Value::AsInt(i64::try_from(bytes).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
+                if let Some(bytes) = memory.swap_out_bytes_total {
+                    samples.push(memory_gauge(
+                        "loom.host.swap_out_bytes_total",
+                        "Cumulative host-lifetime swap-out volume.",
+                        "By",
+                        number_data_point::Value::AsInt(i64::try_from(bytes).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
+                if let Some(rate) = memory.swap_in_bytes_per_sec.filter(|v| v.is_finite()) {
+                    samples.push(memory_gauge(
+                        "loom.host.swap_in_bytes_per_sec",
+                        "Swap-in rate between successive samples.",
+                        "By/s",
+                        number_data_point::Value::AsDouble(rate),
+                        time_unix_nano,
+                    ));
+                }
+                if let Some(rate) = memory.swap_out_bytes_per_sec.filter(|v| v.is_finite()) {
+                    samples.push(memory_gauge(
+                        "loom.host.swap_out_bytes_per_sec",
+                        "Swap-out rate between successive samples.",
+                        "By/s",
+                        number_data_point::Value::AsDouble(rate),
+                        time_unix_nano,
+                    ));
+                }
+                if let Some(pressure) = memory.memory_pressure {
+                    samples.push(memory_gauge(
+                        "loom.host.memory_pressure",
+                        "PSI memory-pressure class over the last 10s (0 none, 1 some, 2 full).",
+                        "1",
+                        number_data_point::Value::AsInt(pressure.grade() as i64),
+                        time_unix_nano,
+                    ));
+                }
+                if let Some(kills) = memory.oom_kill_total {
+                    samples.push(memory_gauge(
+                        "loom.host.oom_kill_total",
+                        "Cumulative kernel OOM kills for the host's lifetime.",
+                        "1",
+                        number_data_point::Value::AsInt(i64::try_from(kills).unwrap_or(i64::MAX)),
+                        time_unix_nano,
+                    ));
+                }
             }
             samples
         }

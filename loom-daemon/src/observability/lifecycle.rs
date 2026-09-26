@@ -50,6 +50,7 @@ impl Span {
             return;
         };
         let mut closed = std::collections::BTreeSet::new();
+        let host = host_attributes();
         for span in &active {
             if span
                 .record
@@ -80,15 +81,14 @@ impl Span {
             if closed.contains(span.record.context.span_id.as_str())
                 && !matches!(span.record.name, SpanName::Phase | SpanName::RoleAttempt)
             {
-                let _ = self.journal.finish(
-                    &span,
-                    Utc::now(),
-                    SpanStatus::Unset,
-                    attributes(&[
-                        ("loom.result", "exit_unobserved"),
-                        ("loom.timing_source", "launcher_return_observed"),
-                    ]),
-                );
+                let mut close = attributes(&[
+                    ("loom.result", "exit_unobserved"),
+                    ("loom.timing_source", "launcher_return_observed"),
+                ]);
+                close.extend(host.clone());
+                let _ = self
+                    .journal
+                    .finish(&span, Utc::now(), SpanStatus::Unset, close);
             }
         }
     }
@@ -126,6 +126,118 @@ pub fn attributes(values: &[(&str, &str)]) -> TraceAttributes {
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
         .collect()
+}
+
+/// Instantaneous host memory-pressure state as bounded span attributes — the
+/// "what was the host doing when this boundary happened" half of the
+/// deferred-vs-killed-vs-timed-out distinction.
+///
+/// The host health gauge (`host.health`) runs on a ~30 s cadence; spans need
+/// the host state **at the boundary itself**, so each Loom-owned span
+/// begin/finish carries its own sample. Every key is a fixed `loom.host.*`
+/// name on the span allowlist, every value a measurement; a probe that cannot
+/// measure on this platform leaves its key **absent** — the "unknown != zero"
+/// contract at the span boundary, exactly as `host.health` holds it on the
+/// wire (absent `loom.host.oom_kill_total` on macOS is "no such counter", not
+/// "zero kills").
+#[must_use]
+pub fn host_attributes() -> TraceAttributes {
+    let pressure = crate::host_pressure::sample();
+    let mut attrs = TraceAttributes::new();
+    insert_u64(&mut attrs, "loom.host.mem_total_bytes", pressure.mem_total_bytes);
+    insert_u64(&mut attrs, "loom.host.mem_available_bytes", pressure.mem_available_bytes);
+    insert_u64(&mut attrs, "loom.host.mem_compressed_bytes", pressure.mem_compressed_bytes);
+    insert_u64(&mut attrs, "loom.host.swap_total_bytes", pressure.swap_total_bytes);
+    insert_u64(&mut attrs, "loom.host.swap_used_bytes", pressure.swap_used_bytes);
+    insert_u64(&mut attrs, "loom.host.swap_in_bytes_total", pressure.swap_in_bytes_total);
+    insert_u64(&mut attrs, "loom.host.swap_out_bytes_total", pressure.swap_out_bytes_total);
+    insert_u64(&mut attrs, "loom.host.oom_kill_total", pressure.oom_kill_total);
+    if let Some(pressure) = pressure.memory_pressure {
+        attrs.insert("loom.host.pressure".into(), pressure.as_str().to_string());
+    }
+    insert_f64(&mut attrs, "loom.host.load_per_core", crate::cpu_headroom::load_per_core());
+    attrs
+}
+
+/// Fixed-reason admission attributes for one role tick outcome.
+///
+/// The reason set is a **closed taxonomy of literals**
+/// (`failure` / `runtime-rejected` / `no-token-pool` / `pool-exhausted` /
+/// `model-runtime-mismatch` / `load-ceiling`); the free-form detail text that
+/// the daemon and role logs carry (`Failure(String)`'s message, the
+/// `ModelRuntimeMismatch` diagnostic, a `RuntimeRejection`'s reason) is
+/// deliberately never placed here — span attributes are allowlisted, 256-byte
+/// bounded, and consumed by dashboards that assume no untrusted content.
+/// What rides alongside the reason is exactly what distinguishes the shapes
+/// an operator reports about: the measured load against the timeout ceiling,
+/// which pool gated and how large it was, and which capabilities the runtime
+/// lacked — all finite, machine-derived values.
+#[must_use]
+pub fn admission_attributes(outcome: &crate::role_runner::RoleTickOutcome) -> TraceAttributes {
+    use crate::role_runner::RoleTickOutcome;
+    let mut attrs = TraceAttributes::new();
+    match outcome {
+        RoleTickOutcome::Success => {}
+        RoleTickOutcome::Failure(_) => {
+            attrs.insert("loom.admission.reason".into(), "failure".into());
+        }
+        RoleTickOutcome::RuntimeRejected(rejection) => {
+            attrs.insert("loom.admission.reason".into(), "runtime-rejected".into());
+            insert_nonempty_bounded(&mut attrs, "loom.runtime", &rejection.runtime);
+            let capabilities = rejection.unmet_capabilities.join(",");
+            insert_nonempty_bounded(&mut attrs, "loom.admission.unmet_capabilities", &capabilities);
+        }
+        RoleTickOutcome::NoTokenPool => {
+            attrs.insert("loom.admission.reason".into(), "no-token-pool".into());
+            attrs.insert(
+                "loom.admission.pool".into(),
+                crate::role_runner::CredentialPool::ClaudeTokens
+                    .as_str()
+                    .into(),
+            );
+        }
+        RoleTickOutcome::PoolExhausted { total, pool, .. } => {
+            attrs.insert("loom.admission.reason".into(), "pool-exhausted".into());
+            attrs.insert("loom.admission.pool".into(), pool.as_str().into());
+            attrs.insert("loom.admission.pool_total".into(), total.to_string());
+        }
+        RoleTickOutcome::ModelRuntimeMismatch(mismatch) => {
+            attrs.insert("loom.admission.reason".into(), "model-runtime-mismatch".into());
+            insert_nonempty_bounded(&mut attrs, "loom.runtime", &mismatch.runtime);
+            insert_nonempty_bounded(&mut attrs, "loom.model", &mismatch.model);
+        }
+        RoleTickOutcome::LoadSkipped { load_per_core, .. } => {
+            attrs.insert("loom.admission.reason".into(), "load-ceiling".into());
+            insert_f64(&mut attrs, "loom.admission.load_per_core", Some(*load_per_core));
+            insert_f64(
+                &mut attrs,
+                "loom.admission.load_threshold",
+                Some(crate::role_runner::ROLE_TIMEOUT_LOAD_SATURATION_THRESHOLD),
+            );
+        }
+    }
+    attrs
+}
+
+fn insert_u64(attrs: &mut TraceAttributes, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        attrs.insert(key.to_owned(), value.to_string());
+    }
+}
+
+fn insert_f64(attrs: &mut TraceAttributes, key: &str, value: Option<f64>) {
+    if let Some(value) = value.filter(|v| v.is_finite()) {
+        attrs.insert(key.to_owned(), format!("{value:.3}"));
+    }
+}
+
+/// Insert `value` trimmed to the span attribute bound, leaving the key absent
+/// when nothing safe remains.
+fn insert_nonempty_bounded(attrs: &mut TraceAttributes, key: &str, value: &str) {
+    let truncated: String = value.chars().take(256).collect();
+    if !truncated.trim().is_empty() {
+        attrs.insert(key.to_owned(), truncated);
+    }
 }
 
 pub fn begin(
@@ -450,6 +562,13 @@ pub fn finish_execution(
     let store = TraceStore::new(root);
     let saved = TraceStore::load(&store.path(root, execution)).ok()?;
     let journal = Journal::for_context(&store.path(root, execution));
+    // Host memory state at the moment this call records the terminal close,
+    // attached to every span the call actually closes — the observed root and
+    // any child runtime span whose exit Loom did not observe separately
+    // (`exit_unobserved`). This is what lets a backend tell a kill-by-memory
+    // at the timeout ceiling from a normal completion without having to align
+    // the separate ~30 s `host.health` sample against the span's end time.
+    let host = host_attributes();
     for active in journal.active().ok()? {
         let root_span = active.record.context == saved.context;
         let observed = root_span;
@@ -458,6 +577,7 @@ pub fn finish_execution(
         } else {
             TraceAttributes::new()
         };
+        attrs.extend(host.clone());
         attrs
             .insert("loom.result".into(), if observed { result } else { "exit_unobserved" }.into());
         if !observed {
@@ -534,6 +654,11 @@ fn finish_owned_runtime(journal: &Journal, root: &TraceContext, result: &str) {
         .iter()
         .find(|s| s.record.context == *root)
         .map(|s| s.owner_pid);
+    // Host memory state at the owned child's observed exit — the span's end
+    // boundary (its begin boundary is the spawn-time attributes the worker
+    // stamped). Lets a kill-by-memory at the 30-minute ceiling show its host
+    // state without waiting for the next `host.health` gauge.
+    let host = host_attributes();
     for span in active {
         if span.record.name == SpanName::RuntimeRun
             && owner.is_some_and(|pid| pid > 0 && pid == span.owner_pid)
@@ -543,15 +668,12 @@ fn finish_owned_runtime(journal: &Journal, root: &TraceContext, result: &str) {
             } else {
                 SpanStatus::Error
             };
-            let _ = journal.finish(
-                &span,
-                Utc::now(),
-                status,
-                attributes(&[
-                    ("loom.result", result),
-                    ("loom.timing_source", "child_exit_observed"),
-                ]),
-            );
+            let mut finish = attributes(&[
+                ("loom.result", result),
+                ("loom.timing_source", "child_exit_observed"),
+            ]);
+            finish.extend(host.clone());
+            let _ = journal.finish(&span, Utc::now(), status, finish);
         }
     }
 }
@@ -679,15 +801,18 @@ pub fn role_invocation(
     invoke: impl FnOnce() -> crate::role_runner::RoleTickOutcome,
 ) -> (crate::role_runner::RoleTickOutcome, Option<TraceContext>) {
     let execution = format!("role-{}", uuid::Uuid::new_v4());
-    let span = begin(
-        root,
-        &execution,
-        SpanName::RoleAttempt,
-        attributes(&[
+    let span = begin(root, &execution, SpanName::RoleAttempt, {
+        // Host memory state at the attempt's BEGIN — the other end of this
+        // span's host snapshot pair (the end lands in `finish_execution`),
+        // so a deferred/killed/timed-out attempt carries the host state at
+        // both moments instead of a bare 30 s-cadence gauge.
+        let mut start = attributes(&[
             ("loom.role", role),
             ("loom.timing_source", "owned_boundary"),
-        ]),
-    );
+        ]);
+        start.extend(host_attributes());
+        start
+    });
     let context = span.as_ref().map(|s| s.context().clone());
     ROLE_CONTEXT.with(|slot| *slot.borrow_mut() = span);
     let outcome = invoke();
@@ -699,7 +824,9 @@ pub fn role_invocation(
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unknown".into());
-    finish_execution(root, &execution, &result, Default::default());
+    // The fixed-reason admission attributes (deferred-for-load vs rejected vs
+    // pool-gated vs mismatch) ride the finish alongside the host state there.
+    finish_execution(root, &execution, &result, admission_attributes(&outcome));
     (outcome, context)
 }
 

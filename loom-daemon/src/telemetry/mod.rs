@@ -1209,6 +1209,85 @@ pub struct HostHealthRecord {
     /// empty; a pre-#9014 record decodes as empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captainless_singleton_jobs: Vec<String>,
+    /// This host's memory/pressure readings at the sampling moment — the
+    /// "deferred vs killed vs timed out" slice (RAM, compressed memory,
+    /// swap and its rates, PSI class, kernel OOM counter) — see
+    /// [`MemoryPressureSummary`]. `None` when the platform measured nothing
+    /// at all (older daemons predating this field decode as `None` too).
+    ///
+    /// `#[serde(default)]` so a pre-memory-field record still decodes
+    /// rather than failing the whole envelope — the same
+    /// backward-compatibility contract `protection` established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryPressureSummary>,
+}
+
+/// Memory/pressure readings at one host.health sampling moment: physical
+/// RAM total/available, the compressed page store, swap capacity/usage,
+/// the cumulative swap in/out counters and per-sample rates, the PSI
+/// pressure class, and the kernel OOM-kill counter. This is the host state
+/// an operator needs to read off a ~30-minute role attempt that ended in a
+/// load deferral *without* any runtime span: with these beside the span's
+/// bound, "deferred for memory" (PSI some/full, swapping, attempt never
+/// reached a runtime), "killed" (`oom_kill_total` grew, exit unobserved),
+/// and "timed out" (no pressure, nothing measured) are distinguishable.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryPressureSummary {
+    /// Total physical memory installed, in bytes
+    /// (`/proc/meminfo` on Linux, `hw.memsize` on macOS) — the denominator
+    /// for a readable availability percentage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_total_bytes: Option<u64>,
+    /// Memory available to meet a new allocation without reclaim, in bytes
+    /// (`MemAvailable` on Linux; free + inactive on macOS). The single most
+    /// direct "is this host about to run out of memory" gauge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_available_bytes: Option<u64>,
+    /// Memory the kernel has compressed rather than paged to disk (macOS
+    /// `vm_stat` "occupied by compressor") — a leading pressure indicator
+    /// before swapping starts. Unmeasurable through the Linux sources this
+    /// daemon reads, so absent there, never a fake `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_compressed_bytes: Option<u64>,
+    /// Total swap capacity in bytes, when the platform exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_total_bytes: Option<u64>,
+    /// Swap currently in use, in bytes; absent where the platform exposes
+    /// no counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_used_bytes: Option<u64>,
+    /// Cumulative swap-in volume for the host's lifetime, normalized to
+    /// **bytes** (macOS counts pages, Linux 512-byte units) so one gauge
+    /// means one thing fleet-wide. Counters reset only across a reboot; a
+    /// rollback reads as unknown, never negative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_in_bytes_total: Option<u64>,
+    /// Cumulative swap-out volume, normalized to bytes; same absence and
+    /// rollback contract as `swap_in_bytes_total`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_out_bytes_total: Option<u64>,
+    /// Swap-in rate in bytes/second, computed by the daemon between
+    /// successive samples (`None` on the first sample after daemon start,
+    /// on a counter reset, or when the counters are unmeasurable — never a
+    /// fabricated `0.0`). Persistent nonzero values are the host's loudest
+    /// "out of physical memory" signal in metric form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_in_bytes_per_sec: Option<f64>,
+    /// Swap-out rate in bytes/second; same measurement and absence
+    /// contract as `swap_in_bytes_per_sec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_out_bytes_per_sec: Option<f64>,
+    /// PSI memory-pressure class over the last 10 s (`"none"` / `"some"` /
+    /// `"full"`, from Linux `/proc/pressure/memory`); macOS has no PSI file,
+    /// and the compression/swap fields carry the pressure signal instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_pressure: Option<crate::host_pressure::MemoryPressure>,
+    /// Cumulative kernel OOM kills for the host's lifetime (Linux
+    /// `/proc/vmstat` `oom_kill`), when the kernel exposes the counter —
+    /// the span-level signal that an unobserved exit was *killed* rather
+    /// than *deferred*. Absent on kernels without the counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_kill_total: Option<u64>,
 }
 
 /// One repository this host's daemon is currently managing (Issue #4976) —

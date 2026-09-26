@@ -45,7 +45,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -53,9 +53,9 @@ use chrono::{DateTime, Utc};
 use crate::event_bus::{EventBus, RecvError};
 use crate::telemetry::{
     visibility::derive_visibility, AdmissionBrakeSummary, HostHealthRecord, HostProtectionSummary,
-    ManagedRepoEntry, PhaseDuration, RepoVisibility, RoleTickFailureEntry, RoleTickHealth,
-    SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord, TokenAccountState,
-    TokenSnapshotRecord,
+    ManagedRepoEntry, MemoryPressureSummary, PhaseDuration, RepoVisibility, RoleTickFailureEntry,
+    RoleTickHealth, SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord,
+    TokenAccountState, TokenSnapshotRecord,
 };
 use crate::tokens_pool::{account_inventory, health_snapshot, AccountProvider};
 use crate::types::{Event, RoleTickRecord, SweepKind};
@@ -773,6 +773,15 @@ async fn sample_host_health(
         workspace_root,
         &crate::sweep_registry::host_identity(),
     );
+    // Host memory-pressure state (the "what was the host doing when a role
+    // tick died" slice). The probe shells to `vm_stat`/`sysctl` or reads
+    // `/proc`, so it runs off the async runtime exactly like the disk probe
+    // above; a failed sample degrades to all-`None` (host_pressure::sample
+    // never panics), which the wire fields then omit — unknown != zero.
+    let pressure = tokio::task::spawn_blocking(crate::host_pressure::sample)
+        .await
+        .unwrap_or_default();
+    let (swap_in_bytes_per_sec, swap_out_bytes_per_sec) = swap_sample_rates(&pressure);
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -800,7 +809,74 @@ async fn sample_host_health(
             workspace_root,
         ),
         captainless_singleton_jobs: crate::fleet_captain::captainless_singleton_job_names(),
+        // Memory/pressure slice ("deferred vs killed vs timed out"): the
+        // whole object is omitted when nothing was measured — never a flat
+        // zero — the same absence contract `protection`/`admission_brake`
+        // follow. Swap rates come from the process-global sample history.
+        memory: memory_summary(pressure, swap_in_bytes_per_sec, swap_out_bytes_per_sec),
     }
+}
+
+/// Process-global previous swap-counter sample, kept so successive
+/// `host.health` samples can turn the two cumulative totals into rates. A plain
+/// `Mutex` (not async): the critical section is a few nanoseconds and the
+/// collector is the only writer. Poison is recovered rather than propagated —
+/// the daemon must keep sampling if a past holder ever panicked (a dead rate
+/// is a `None`, never a wedged health loop).
+static SWAP_RATE_HISTORY: Mutex<Option<crate::host_pressure::SwapCounterSample>> = Mutex::new(None);
+
+/// Fold one fresh sample and its computed rates into the wire
+/// [`MemoryPressureSummary`], returning `None` when nothing at all was
+/// measured (the wire field's absence contract — an all-`None` summary must
+/// not be serialized as an empty-looking object).
+fn memory_summary(
+    pressure: crate::host_pressure::HostPressure,
+    swap_in_bytes_per_sec: Option<f64>,
+    swap_out_bytes_per_sec: Option<f64>,
+) -> Option<MemoryPressureSummary> {
+    let summary = MemoryPressureSummary {
+        mem_total_bytes: pressure.mem_total_bytes,
+        mem_available_bytes: pressure.mem_available_bytes,
+        mem_compressed_bytes: pressure.mem_compressed_bytes,
+        swap_total_bytes: pressure.swap_total_bytes,
+        swap_used_bytes: pressure.swap_used_bytes,
+        swap_in_bytes_total: pressure.swap_in_bytes_total,
+        swap_out_bytes_total: pressure.swap_out_bytes_total,
+        swap_in_bytes_per_sec,
+        swap_out_bytes_per_sec,
+        memory_pressure: pressure.memory_pressure,
+        oom_kill_total: pressure.oom_kill_total,
+    };
+    (summary != MemoryPressureSummary::default()).then_some(summary)
+}
+
+/// Turn one fresh [`crate::host_pressure::HostPressure`] sample into the
+/// `swap_*_bytes_per_sec` wire pair, remembering the counters for the next
+/// cycle.
+///
+/// The rate is only honest when **both** cumulative totals were measured on
+/// this side and the last — a partially-measured sample (e.g. `vm_stat` read
+/// but the headers were malformed) is dropped for rate purposes rather than
+/// blended, and the history keeps the last fully-measured pair. The pure
+/// per-side rules (first sample, counter rollback, zero elapsed) live in
+/// [`crate::host_pressure::swap_rates`].
+fn swap_sample_rates(pressure: &crate::host_pressure::HostPressure) -> (Option<f64>, Option<f64>) {
+    let mut history = SWAP_RATE_HISTORY.lock().unwrap_or_else(|p| p.into_inner());
+    let rates = crate::host_pressure::swap_rates(
+        *history,
+        pressure.swap_in_bytes_total,
+        pressure.swap_out_bytes_total,
+    );
+    if let (Some(in_now), Some(out_now)) =
+        (pressure.swap_in_bytes_total, pressure.swap_out_bytes_total)
+    {
+        *history = Some(crate::host_pressure::SwapCounterSample {
+            at: std::time::Instant::now(),
+            swap_in_bytes_total: in_now,
+            swap_out_bytes_total: out_now,
+        });
+    }
+    rates
 }
 
 /// Project this host's [`crate::admission_brake::BrakeSnapshot`] onto the wire
