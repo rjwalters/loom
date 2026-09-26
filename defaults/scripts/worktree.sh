@@ -31,17 +31,9 @@
 
 set -e
 
-# Always-included safety set for sparse-mode checkouts. Even with --sparse,
-# these paths must materialize or the worktree is unusable by an agent:
-#   .claude/**         - agent skill graph + methodology hooks
-#   .loom/**           - Loom orchestration lifecycle (scripts, roles, hooks)
-#   .githooks/**       - repo hook config (core.hooksPath is set post-create)
-#   scripts/**         - sibling helpers the agent may invoke
-# Top-level tracked files are always included implicitly by cone mode.
-#
-# Downstream repos can extend this via LOOM_WORKTREE_ALWAYS_INCLUDE (space-
-# separated paths).
-LOOM_WORKTREE_ALWAYS_INCLUDE_DEFAULT=(.claude .loom .githooks scripts)
+# The --sparse always-included safety set (.claude .loom .githooks scripts, plus
+# $LOOM_WORKTREE_ALWAYS_INCLUDE) lives with the rest of sparse mode in
+# `loom-daemon worktree-sparse` since #8195 slice 10 - see _worktree_sparse.
 
 # Shared worktree-root resolver (env var / config key / default). Sourced so
 # the worktree base can be redirected to an external volume (#3530). With no
@@ -660,77 +652,52 @@ _worktree_wip_verb() {
 }
 
 # --------------------------------------------------------------------------
-# Sparse-checkout helpers
+# Sparse-checkout: --sparse <paths...> / --full
 # --------------------------------------------------------------------------
 #
-# IMPORTANT: `git sparse-checkout init` writes core.sparseCheckout and
-# core.sparseCheckoutCone to the per-worktree config
-# (.git/worktrees/<name>/config.worktree), NOT to the shared .git/config.
-# This avoids the regression where a stale shared core.sparseCheckout=true
-# silently breaks later actions/checkout runs.
-
-# Apply the sparse-checkout cone to an existing worktree.
-# Args: $1 = worktree path; remaining args = cone paths (already including the
-# always-included safety set).
-apply_sparse_cone() {
-    local wt_path="$1"
-    shift
-    local paths=("$@")
-
-    if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Configuring sparse-checkout cone..."
-    fi
-
-    git -C "$wt_path" sparse-checkout init --cone >/dev/null 2>&1
-    # `sparse-checkout set` replaces the cone (idempotent: same paths = no-op).
-    git -C "$wt_path" sparse-checkout set "${paths[@]}" >/dev/null 2>&1
-}
-
-# Materialize files for the configured cone.
-materialize_sparse_cone() {
-    local wt_path="$1"
-    git -C "$wt_path" checkout >/dev/null 2>&1 || true
-}
-
-# Convert a sparse worktree back to a full checkout. Safe on already-full
-# worktrees (sparse-checkout disable is a no-op).
-disable_sparse_checkout() {
-    local wt_path="$1"
-
-    if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Disabling sparse-checkout (full mode)..."
-    fi
-
-    if git -C "$wt_path" sparse-checkout disable >/dev/null 2>&1; then
-        :
+# Ported to `loom-daemon worktree-sparse` (#8195 slice 10, epic #7810). The cone
+# setup after `git worktree add --no-checkout`, the "worktree already exists"
+# re-configure early exit, the always-included safety set, the size line and
+# the cone-to-JSON builder now live in `loom-daemon/src/worktree_cli/sparse.rs`
+# with the full design rationale (per-worktree config, idempotent `set`, ...).
+#
+# WHY THIS FAMILY. It is the one opt-in part of the create path, so it can
+# leave the shell outright without putting the ordinary `worktree.sh <N>` on a
+# built binary. And it carried three defects, each reproduced before the port:
+# a cone git rejects (`src/*`, `/src`) killed the script mid-create with git's
+# exit 128 in total silence (both streams /dev/null'd under `set -e`), leaving
+# an empty --no-checkout worktree; the `awk` cone builder did not escape, so a
+# `"` in a path broke the --json document; and the re-configure arm's "is this
+# registered?" was `git worktree list | grep -q` - an unanchored substring
+# match against symlink-RESOLVED paths, which refused a live worktree in a repo
+# reached through a symlink and accepted an unregistered issue-4 beside a
+# registered issue-44 (then ran git against the main workspace and wrote a
+# sentinel into the unregistered dir). The port asks the orphan guard's own
+# canonicalizing predicate (slice 5) instead.
+#
+# THE CONTRACT PRESERVED: every message and its order, silence under --json,
+# the JSON documents' fields (now validly escaped), the git commands and the
+# per-worktree config they write, and the #3548 sentinel back-fill - which the
+# re-configure arm writes only once the directory is proven registered.
+#
+# NO DAEMON: --sparse/--full refuse with exit 2 before anything is touched (the
+# gate right after argument parsing) - the code every epic-#7810 stub reserves
+# for "could not run", as the `remove`/WIP verbs do. A best-effort skip is not
+# available here: without the cone step, --sparse would report success over an
+# empty --no-checkout worktree. A plain `worktree.sh <N>` never reaches this.
+#
+# $1 = arm (create|reconfigure), $2 = worktree path; the mode comes from the
+# globals. Under --json the create arm's stdout is the cone array, captured into
+# $CONE_JSON for the final document; the re-configure arm's is its own final
+# document, so that caller points it at fd 3.
+_worktree_sparse() {
+    local args=(--arm "$1" --worktree "$2" --issue "$ISSUE_NUMBER" --branch "$BRANCH_NAME")
+    [[ "$JSON_OUTPUT" != "true" ]] || args+=(--json)
+    if [[ "$FULL_MODE" == "true" ]]; then args+=(--full); else args+=(-- "${SPARSE_PATHS[@]}"); fi
+    if [[ "$1" == "create" && "$JSON_OUTPUT" == "true" ]]; then
+        CONE_JSON="$("$_WT_DAEMON_BIN" worktree-sparse "${args[@]}")"
     else
-        # Fallback: manually unset per-worktree config keys.
-        git -C "$wt_path" config --unset core.sparseCheckout 2>/dev/null || true
-        git -C "$wt_path" config --unset core.sparseCheckoutCone 2>/dev/null || true
-    fi
-    # Re-materialize the full working tree.
-    git -C "$wt_path" checkout >/dev/null 2>&1 || true
-}
-
-# (`is_sparse_enabled` lived here and had no caller anywhere in the tree — not
-# in this script, not in any sibling, not in any test. Removed in #8193 to pay
-# for the lease call site below: `defaults/scripts/` is the shell budget's
-# `contract` (portable) pool, whose growth `check_against_rev` refuses with no
-# `Shell-Budget-Growth:` override available, so new reach into loom-daemon here
-# has to be funded by retiring portable lines. `git log -S is_sparse_enabled`
-# has it if it is ever wanted back.)
-
-# Log the realized disk footprint of a worktree (human-readable only).
-log_worktree_size() {
-    local wt_path="$1"
-    local label="${2:-Worktree size}"
-    if [[ "$JSON_OUTPUT" == "true" ]]; then
-        return 0
-    fi
-    local size
-    size=$(du -sh "$wt_path" 2>/dev/null | awk '{print $1}')
-    if [[ -n "$size" ]]; then
-        print_info "$label: $size"
+        "$_WT_DAEMON_BIN" worktree-sparse "${args[@]}"
     fi
 }
 
@@ -926,6 +893,7 @@ Sparse-Mode Notes:
   - Re-running --sparse with the same cone is a clean no-op (idempotent)
   - Re-running --sparse with a different cone replaces the cone
   - Set LOOM_WORKTREE_ALWAYS_INCLUDE to add repo-specific safety paths
+  - Needs loom-daemon (worktree-sparse); without it these flags exit 2, changing nothing
 
 Safety Features:
   ✓ Detects if already in a worktree
@@ -1125,6 +1093,7 @@ fi
 SPARSE_MODE=false
 FULL_MODE=false
 SPARSE_PATHS=()
+CONE_JSON="[]"
 CUSTOM_BRANCH=""
 # Base-branch override (#3729, stacked-PR v1). When set via `--base <branch>`,
 # the new feature branch is created from (and stale worktrees reset to) that
@@ -1194,13 +1163,34 @@ if [[ "$SPARSE_MODE" == "true" && ${#SPARSE_PATHS[@]} -eq 0 ]]; then
     exit 1
 fi
 
-# Build the always-included safety set, allowing repo override via env var.
-ALWAYS_INCLUDE=("${LOOM_WORKTREE_ALWAYS_INCLUDE_DEFAULT[@]}")
-if [[ -n "${LOOM_WORKTREE_ALWAYS_INCLUDE:-}" ]]; then
-    # Split on whitespace
-    # shellcheck disable=SC2206
-    EXTRA_INCLUDE=(${LOOM_WORKTREE_ALWAYS_INCLUDE})
-    ALWAYS_INCLUDE+=("${EXTRA_INCLUDE[@]}")
+# The ONE daemon-binary resolution for this whole run. It sits here, after the
+# verb dispatch and argument parsing, so a `--check`/`--help`/`remove`/`snapshot`
+# invocation never pays the filesystem probe, while every consumer below shares
+# one answer: the --sparse/--full gate immediately after it, then crash-debris
+# cleanup, the add lock, the lease + claim-lock pre-flight, submodules and
+# worktree-link. A plain assignment, not a getter, so
+# scripts/check-daemon-subcommand-versions.sh can textually trace every
+# `"$_WT_DAEMON_BIN" <subcommand>` call back to a resolver entry point. Empty
+# (never an error) when nothing resolves; each consumer degrades on its own
+# terms, documented at each one. Script-relative, so the `cd` below cannot
+# change its answer.
+_WT_DAEMON_BIN="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
+
+# --sparse/--full need `loom-daemon worktree-sparse` (#8195 slice 10): refuse
+# HERE, before the cleanup, lock, lease or fetch below, so a host without one is
+# told why and left exactly as it was. The --help probe also catches a daemon
+# that predates the subcommand, whose clap error would otherwise surface
+# mid-create. Exit 2 = could not run; see _worktree_sparse for why a skip is not
+# an option.
+# requires-daemon: worktree-sparse >= 0.19.426  #8195 slice 10 - without it --sparse/--full refuse with exit 2 before touching anything; a plain `worktree.sh <N>` is unaffected
+if [[ "$SPARSE_MODE" == "true" || "$FULL_MODE" == "true" ]] \
+    && { [[ -z "$_WT_DAEMON_BIN" ]] || ! "$_WT_DAEMON_BIN" worktree-sparse --help >/dev/null 2>&1; }; then
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        echo '{"success": false, "error": "sparse-requires-loom-daemon"}' >&3
+    else
+        print_error "--sparse/--full need 'loom-daemon worktree-sparse' (#8195 slice 10), and ${_WT_DAEMON_BIN:-no resolvable loom-daemon} cannot run it. Install or update loom-daemon, or re-run without --sparse/--full."
+    fi
+    exit 2
 fi
 
 # Check if already in a worktree and automatically handle it
@@ -1257,17 +1247,7 @@ fi
 # would otherwise prevent us from making progress under the lock) is cleared
 # regardless of whether we ultimately acquire the lock.
 #
-# The ONE daemon-binary resolution for this whole run, placed here because this
-# is the first line of the create path that needs it and nothing above it does:
-# a `--check`/`--help`/`remove`/`snapshot` invocation never pays the filesystem
-# probe, and the four consumers below (crash-debris cleanup, the add lock, the
-# lease + claim-lock pre-flight, and worktree-link) share one answer instead of
-# probing three times. A plain assignment, not a getter, so
-# scripts/check-daemon-subcommand-versions.sh can textually trace every
-# `"$_WT_DAEMON_BIN" <subcommand>` call back to a resolver entry point. Empty
-# (never an error) when nothing resolves; every consumer degrades on its own
-# terms, documented at each one.
-_WT_DAEMON_BIN="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
+# $_WT_DAEMON_BIN was resolved once, just after argument parsing (above).
 cleanup_partial_worktree_state "$ISSUE_NUMBER" || true
 
 if ! acquire_worktree_lock "$ISSUE_NUMBER"; then
@@ -1482,49 +1462,13 @@ WORKTREE_PATH="$WORKTREE_ROOT_DIR/issue-$ISSUE_NUMBER"
 if [[ -d "$WORKTREE_PATH" ]]; then
     # If caller passed --sparse / --full, apply the mode to the existing
     # worktree and exit. This is the idempotent path: same cone is a no-op,
-    # different cone replaces the cone, --full disables sparse-checkout.
+    # different cone replaces the cone, --full disables sparse-checkout. The
+    # registration check, the #3548 sentinel back-fill and the final lines /
+    # JSON document are all `loom-daemon worktree-sparse --arm reconfigure`
+    # (#8195 slice 10); a refusal or failure exits non-zero, which `set -e`
+    # propagates with its code intact.
     if [[ "$SPARSE_MODE" == "true" || "$FULL_MODE" == "true" ]]; then
-        if ! git worktree list | grep -q "$WORKTREE_PATH"; then
-            if [[ "$JSON_OUTPUT" == "true" ]]; then
-                echo '{"success": false, "error": "Directory exists but is not a registered worktree"}' >&3
-            else
-                print_error "Directory exists but is not a registered worktree: $WORKTREE_PATH"
-            fi
-            exit 1
-        fi
-
-        if [[ "$FULL_MODE" == "true" ]]; then
-            disable_sparse_checkout "$WORKTREE_PATH"
-            log_worktree_size "$WORKTREE_PATH" "Worktree size (full)"
-            # Back-fill/refresh the Loom sentinel so re-config of an existing
-            # (possibly sentinel-less) worktree stays cleanup-eligible (#3548).
-            write_loom_sentinel "$WORKTREE_PATH"
-            if [[ "$JSON_OUTPUT" == "true" ]]; then
-                ABS_WT=$(cd "$WORKTREE_PATH" && pwd)
-                echo '{"success": true, "worktreePath": "'"$ABS_WT"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": false, "cone": []}' >&3
-            else
-                print_success "Worktree converted to full checkout"
-                print_info "To use this worktree: cd $WORKTREE_PATH"
-            fi
-            exit 0
-        fi
-
-        # SPARSE_MODE
-        CONE_PATHS=("${SPARSE_PATHS[@]}" "${ALWAYS_INCLUDE[@]}")
-        apply_sparse_cone "$WORKTREE_PATH" "${CONE_PATHS[@]}"
-        materialize_sparse_cone "$WORKTREE_PATH"
-        log_worktree_size "$WORKTREE_PATH" "Worktree size (sparse)"
-        # Back-fill/refresh the Loom sentinel so re-config of an existing
-        # (possibly sentinel-less) worktree stays cleanup-eligible (#3548).
-        write_loom_sentinel "$WORKTREE_PATH"
-        if [[ "$JSON_OUTPUT" == "true" ]]; then
-            ABS_WT=$(cd "$WORKTREE_PATH" && pwd)
-            CONE_JSON=$(printf '%s\n' "${CONE_PATHS[@]}" | awk 'BEGIN{printf "["} {if(NR>1)printf ","; printf "\"%s\"", $0} END{printf "]"}')
-            echo '{"success": true, "worktreePath": "'"$ABS_WT"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": true, "cone": '"$CONE_JSON"'}' >&3
-        else
-            print_success "Sparse-checkout cone applied"
-            print_info "To use this worktree: cd $WORKTREE_PATH"
-        fi
+        _worktree_sparse reconfigure "$WORKTREE_PATH" >&3
         exit 0
     fi
 
@@ -1875,13 +1819,10 @@ if _try_worktree_add; then
 
     # Sparse-mode: configure cone and materialize tracked files.
     # This must run before submodule init / symlinking so the working tree
-    # exists and helpers see the same file layout as full mode.
-    SPARSE_CONE_PATHS=()
+    # exists and helpers see the same file layout as full mode. Under --json
+    # it also fills $CONE_JSON for the final document (#8195 slice 10).
     if [[ "$SPARSE_MODE" == "true" ]]; then
-        SPARSE_CONE_PATHS=("${SPARSE_PATHS[@]}" "${ALWAYS_INCLUDE[@]}")
-        apply_sparse_cone "$ABS_WORKTREE_PATH" "${SPARSE_CONE_PATHS[@]}"
-        materialize_sparse_cone "$ABS_WORKTREE_PATH"
-        log_worktree_size "$ABS_WORKTREE_PATH" "Sparse worktree size"
+        _worktree_sparse create "$ABS_WORKTREE_PATH"
     fi
 
     # Set git hooks path so .githooks/ works in worktrees (no npx/husky needed).
@@ -2059,14 +2000,10 @@ if _try_worktree_add; then
 
     # Output results
     if [[ "$JSON_OUTPUT" == "true" ]]; then
-        # Machine-readable JSON output. Sparse mode adds "sparse": true and
-        # "cone": [...] fields; full mode keeps "sparse": false with an empty cone.
-        if [[ "$SPARSE_MODE" == "true" ]]; then
-            CONE_JSON=$(printf '%s\n' "${SPARSE_CONE_PATHS[@]}" | awk 'BEGIN{printf "["} {if(NR>1)printf ","; printf "\"%s\"", $0} END{printf "]"}')
-            echo '{"success": true, "worktreePath": "'"$ABS_WORKTREE_PATH"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "returnTo": "'"${ABS_RETURN_TO:-}"'", "sparse": true, "cone": '"$CONE_JSON"'}' >&3
-        else
-            echo '{"success": true, "worktreePath": "'"$ABS_WORKTREE_PATH"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "returnTo": "'"${ABS_RETURN_TO:-}"'", "sparse": false, "cone": []}' >&3
-        fi
+        # Machine-readable JSON output. Sparse mode sets "sparse": true and the
+        # "cone": [...] worktree-sparse returned; full mode keeps "sparse":
+        # false with the empty cone $CONE_JSON is initialized to.
+        echo '{"success": true, "worktreePath": "'"$ABS_WORKTREE_PATH"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "returnTo": "'"${ABS_RETURN_TO:-}"'", "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
     else
         # Human-readable output
         print_success "Worktree created successfully!"

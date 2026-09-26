@@ -185,6 +185,14 @@ pub(crate) enum ScriptPortCommand {
     /// inability to decide is 0, because a forge outage must never block
     /// worktree creation.
     WorktreeClosedPrBranch(super::worktree_closed_pr_branch::WorktreeClosedPrBranchArgs),
+    /// `worktree.sh`'s `--sparse <paths...>` / `--full` family (#8195 slice
+    /// 10), on both arms it reaches: after `git worktree add --no-checkout`,
+    /// and the "worktree already exists" re-configure early exit. Retires a
+    /// silent exit 128 on any cone git rejects, an unescaped cone-to-JSON
+    /// builder, and a `git worktree list | grep -q` substring registration
+    /// check that could disagree with the orphan guard about the same
+    /// directory. Exit 0 applied, 1 refused/failed, 2 could not run.
+    WorktreeSparse(super::worktree_sparse::WorktreeSparseArgs),
 
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
@@ -368,6 +376,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeUpstream(args) => args.run(),
             ScriptPortCommand::WorktreeStaleRef(args) => args.run(),
             ScriptPortCommand::WorktreeClosedPrBranch(args) => args.run(),
+            ScriptPortCommand::WorktreeSparse(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),

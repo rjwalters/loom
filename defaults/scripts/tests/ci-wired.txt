@@ -212,7 +212,6 @@ test-worktree-forge-pr-check.sh
 test-worktree-hookspath.sh
 test-worktree-remote-branch-tracking.sh
 test-worktree-root-override.sh
-test-worktree-sentinel-reinvoke.sh
 test-worktree-sentinel.sh
 test-worktree-stale-merged-branch.sh
 

@@ -125,6 +125,19 @@
 //! `origin/feature/issue-N` whose tip is the head of a PR CLOSED WITHOUT
 //! MERGING. It is deliberately NOT a fourth [`branch_landed`] verdict; see its
 //! module doc for why that primitive's three-way answer stays three-way.
+//!
+//! Slice 10 is [`sparse`]: `--sparse <paths...>` and `--full`, on both arms
+//! they reach. It is the one part of the create path that is opt-in, so it
+//! could leave the shell outright without moving the ordinary
+//! `worktree.sh <N>` onto a built binary. It carried a silent exit 128 on any
+//! cone git rejects, a cone-to-JSON builder that did not escape, and a
+//! re-configure arm whose "is this a registered worktree?" was an unanchored
+//! `grep` substring match — which could disagree with [`cleanup`]'s orphan
+//! guard about the same directory, and on its false-positive side wrote a
+//! [`sentinel`] into a directory git did not know about. The port asks
+//! [`cleanup::is_registered`]. [`sentinel`] is the first Rust writer of the
+//! `.loom-managed` marker, pinned byte-for-byte to the shell's until the
+//! remaining writers move.
 
 pub mod baseline;
 pub mod branch_conflict;
@@ -138,7 +151,9 @@ pub mod link;
 pub mod lock;
 pub mod remove;
 pub mod reset;
+pub mod sentinel;
 pub mod snapshot;
+pub mod sparse;
 pub mod stale_ref;
 pub mod submodules;
 pub mod upstream;
