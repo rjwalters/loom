@@ -115,7 +115,15 @@ fn emit_git_rerun_paths() {
 /// as D33 specifies), or `unknown` when git cannot answer.
 fn tree_state() -> &'static str {
     let Ok(out) = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=no"])
+        // `--no-optional-locks`: never take `index.lock` to write back
+        // refreshed stat data, which would race an agent's concurrent
+        // `git commit` and touch the `index` this script watches.
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+        ])
         .output()
     else {
         return "unknown";

@@ -16,8 +16,12 @@ use std::path::Path;
 pub mod hooks;
 pub mod marker;
 
-/// The explicit placeholder for an undeterminable field.
+/// The explicit placeholder for a field that exists but could not be determined.
 pub const UNKNOWN: &str = "unknown";
+
+/// A field that does not exist by design (no story behind the action, not a
+/// sweep, not an Actions run). D33 keeps it distinct from [`UNKNOWN`].
+pub const NONE: &str = "none";
 
 /// The three trailer keys, in the order they are written.
 pub const TRAILER_KEYS: [&str; 3] = ["Loom-Story", "Loom-Trace-Id", "Loom-Build"];
@@ -25,7 +29,7 @@ pub const TRAILER_KEYS: [&str; 3] = ["Loom-Story", "Loom-Trace-Id", "Loom-Build"
 /// A commit's provenance trailers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trailers {
-    /// `owner/repo#n`.
+    /// `owner/repo#n`, or [`NONE`] — never `unknown`.
     pub story: String,
     /// The D32 v1 trace id (32 hex), or [`UNKNOWN`] when `repo_id` is unresolvable.
     pub trace_id: String,
@@ -56,9 +60,11 @@ impl Trailers {
     }
 }
 
-/// `(owner/repo#n, trace_id)` for `issue`. The story text falls back to the
-/// origin's own spelling when the `repo_id` is unresolvable, but the trace id
-/// then stays [`UNKNOWN`] — a name-derived id would be a wrong one (#9068).
+/// `(owner/repo#n | none, trace_id)` for `issue`. D33: there is no `unknown`
+/// story. A checkout with no GitHub `origin` has no story key at all
+/// (`none`, trace `unknown`). A GitHub story whose `repo_id` is unresolvable
+/// keeps the origin's spelling with trace `unknown` — the only case a real
+/// story carries an unknown trace; a name-derived id would be wrong (#9068).
 #[must_use]
 pub fn story_and_trace(root: &Path, issue: u32) -> (String, String) {
     if let Some(story) = crate::observability::tracing::resolve_story(root, issue) {
@@ -66,7 +72,7 @@ pub fn story_and_trace(root: &Path, issue: u32) -> (String, String) {
     }
     match crate::release_resolve::host::repo_slug(root) {
         Some(slug) => (format!("{slug}#{issue}"), UNKNOWN.to_string()),
-        None => (UNKNOWN.to_string(), UNKNOWN.to_string()),
+        None => (NONE.to_string(), UNKNOWN.to_string()),
     }
 }
 

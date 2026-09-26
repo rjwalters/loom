@@ -25,6 +25,19 @@
 //!   through `commit-msg`. `--no-verify` skips it, as it skips every hook.
 //! - **Cannot block a commit.** A stamping failure is reported on stderr and
 //!   the commit proceeds unstamped.
+//! - **Other env-scoped config passes through.** The shim's lookup of the
+//!   repo's own hooks rebuilds the `GIT_CONFIG_*` entries without loom's
+//!   `core.hooksPath` entry (matched by [`HOOKS_DIR_ENV`]) and keeps every
+//!   other one — e.g. a container's `safe.directory`.
+//!
+//! **Inside a sweep, the effective `core.hooksPath` is the shim directory.**
+//! Anything that means "what did the repo configure" must read the config
+//! files (`git config --local --get core.hooksPath`), not the effective value.
+//!
+//! Known gaps (#9079): if the shim directory is deleted mid-sweep (e.g.
+//! `rm -rf .loom/logs`), git runs no hooks at all for the rest of that sweep,
+//! the repo's included; containerized sweeps (`spawn-claude.sh` forwards only
+//! `LOOM_*`/`CLAUDE_*` into `docker run`) are left unarmed, not broken.
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,6 +53,9 @@ pub const TRACE_ENV: &str = "LOOM_PROVENANCE_TRACE_ID";
 pub const BUILD_ENV: &str = "LOOM_PROVENANCE_BUILD";
 /// Absolute path of the `loom-daemon` the `commit-msg` shim execs.
 pub const BIN_ENV: &str = "LOOM_PROVENANCE_BIN";
+/// The shim directory exactly as written into `GIT_CONFIG_VALUE_n`, so the
+/// shim can drop loom's own entry and keep the rest.
+pub const HOOKS_DIR_ENV: &str = "LOOM_PROVENANCE_HOOKS_DIR";
 /// `0` turns trailer injection off for a dispatch.
 pub const ENABLE_ENV: &str = "LOOM_PROVENANCE_TRAILERS";
 
@@ -82,8 +98,27 @@ const SHIM: &str = r#"#!/bin/sh
 # the Loom provenance trailers.
 hook=${0##*/}
 self=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-orig=$(env -u GIT_CONFIG_COUNT git config --type=path --get core.hooksPath 2>/dev/null)
-[ -n "$orig" ] || orig="$(env -u GIT_CONFIG_COUNT git rev-parse --git-common-dir 2>/dev/null)/hooks"
+# git as the repository sees it: every env-scoped config entry except loom's
+# own core.hooksPath one, passed on as -c (the same command scope).
+repo_git() {
+    _argc=$# _i=0 _n=${GIT_CONFIG_COUNT:-0}
+    case $_n in '' | *[!0-9]*) _n=0 ;; esac
+    while [ "$_i" -lt "$_n" ]; do
+        eval "_k=\${GIT_CONFIG_KEY_$_i-} _v=\${GIT_CONFIG_VALUE_$_i-}"
+        if [ "$_k" != core.hooksPath ] || [ "$_v" != "${LOOM_PROVENANCE_HOOKS_DIR-}" ]; then
+            set -- "$@" -c "$_k=$_v"
+        fi
+        _i=$((_i + 1))
+    done
+    while [ "$_argc" -gt 0 ]; do
+        set -- "$@" "$1"
+        shift
+        _argc=$((_argc - 1))
+    done
+    env -u GIT_CONFIG_COUNT git "$@"
+}
+orig=$(repo_git config --type=path --get core.hooksPath 2>/dev/null)
+[ -n "$orig" ] || orig="$(repo_git rev-parse --git-common-dir 2>/dev/null)/hooks"
 target=$(CDPATH= cd -- "$orig" 2>/dev/null && pwd -P) || target=
 if [ -n "$target" ] && [ "$target" != "$self" ] && [ -f "$target/$hook" ] && [ -x "$target/$hook" ]; then
     if [ "$hook" != commit-msg ]; then
@@ -156,12 +191,23 @@ pub fn prepare_child(command: &mut Command, root: &Path, issue: Option<u32>) {
         log::warn!("provenance: cannot locate this binary; commits will not carry trailers");
         return;
     };
-    prepare_child_with(command, root, issue, &bin);
+    prepare_child_with(command, root, issue, &live_path(bin));
+}
+
+/// On Linux, `current_exe()` of a binary replaced in place (self-update)
+/// reads `<path> (deleted)`; the replacement lives at `<path>`, so stamp with
+/// that rather than a path that no longer exists.
+fn live_path(bin: PathBuf) -> PathBuf {
+    let text = bin.to_string_lossy();
+    match text.strip_suffix(" (deleted)") {
+        Some(live) if !bin.exists() => PathBuf::from(live),
+        _ => bin,
+    }
 }
 
 /// [`prepare_child`] with the stamping binary named explicitly (tests).
 pub fn prepare_child_with(command: &mut Command, root: &Path, issue: Option<u32>, bin: &Path) {
-    for key in [STORY_ENV, TRACE_ENV, BUILD_ENV, BIN_ENV] {
+    for key in [STORY_ENV, TRACE_ENV, BUILD_ENV, BIN_ENV, HOOKS_DIR_ENV] {
         command.env_remove(key);
     }
     let Some(issue) = issue else { return };
@@ -181,7 +227,8 @@ pub fn prepare_child_with(command: &mut Command, root: &Path, issue: Option<u32>
         .env(STORY_ENV, &trailers.story)
         .env(TRACE_ENV, &trailers.trace_id)
         .env(BUILD_ENV, &trailers.build)
-        .env(BIN_ENV, bin);
+        .env(BIN_ENV, bin)
+        .env(HOOKS_DIR_ENV, &dir);
     append_git_config_env(command, "core.hooksPath", dir.as_os_str());
 }
 
@@ -210,16 +257,18 @@ pub fn trailers_from_env() -> Option<Trailers> {
     let story = std::env::var(STORY_ENV)
         .ok()
         .filter(|s| !s.trim().is_empty())?;
-    let var = |key| {
+    let var = |key, fallback: &str| {
         std::env::var(key)
             .ok()
             .filter(|s: &String| !s.trim().is_empty())
-            .unwrap_or_else(|| super::UNKNOWN.to_string())
+            .unwrap_or_else(|| fallback.to_string())
     };
+    let unknown = super::UNKNOWN;
     Some(Trailers {
         story,
-        trace_id: var(TRACE_ENV),
-        build: var(BUILD_ENV),
+        trace_id: var(TRACE_ENV, unknown),
+        // `Loom-Build` keeps its three-part shape even when unknown.
+        build: var(BUILD_ENV, &format!("{unknown} {unknown} {unknown}")),
     })
 }
 
@@ -276,6 +325,16 @@ mod tests {
         for name in HOOK_NAMES {
             assert!(is_executable(&dir.path().join(name)), "{name}");
         }
+    }
+
+    #[test]
+    fn a_self_updated_binary_is_stamped_by_its_live_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("loom-daemon");
+        std::fs::write(&live, "").unwrap();
+        let deleted = PathBuf::from(format!("{} (deleted)", live.display()));
+        assert_eq!(live_path(deleted), live);
+        assert_eq!(live_path(live.clone()), live);
     }
 
     #[test]

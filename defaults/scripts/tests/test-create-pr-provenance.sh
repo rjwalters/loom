@@ -54,12 +54,13 @@ exit 3
 STUB
 chmod +x "$STUB_DIR/gh"
 
-MARKER='<!-- loom:provenance v1 build=0.0.1 abc clean prompts=unknown sweep=s-1 story=o/r#42 trace=unknown host=h base=unknown -->'
-FALLBACK='<!-- loom:provenance v1 build=unknown prompts=unknown sweep=unknown story=unknown trace=unknown host=unknown base=unknown -->'
+MARKER='<!-- loom:provenance v1 build=0.0.1 abc clean prompts=unknown unknown sweep=s-1 story=o/r#42 trace=unknown host=h base=unknown run=none -->'
+FALLBACK='<!-- loom:provenance v1 build=unknown unknown unknown prompts=unknown unknown sweep=unknown story=unknown trace=unknown host=unknown base=unknown run=unknown -->'
 
 cat > "$STUB_DIR/daemon-ok" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" > "\$LOOM_TEST_STUB_DIR/daemon-args.txt"
+cat > "\$LOOM_TEST_STUB_DIR/daemon-stdin.txt"
 echo '$MARKER'
 STUB
 cat > "$STUB_DIR/daemon-old" <<'STUB'
@@ -93,8 +94,10 @@ LOOM_DAEMON_SELF_BIN="$STUB_DIR/daemon-ok" run_create_pr --body "Closes #42" --b
 assert_eq "$MARKER" "$(last_line)" "T1: daemon marker is the body's last line"
 assert_eq "1" "$(marker_count)" "T1: exactly one marker"
 assert_eq "Closes #42" "$(head -n1 "$STUB_DIR/body.txt")" "T1: original body preserved"
-assert_eq "provenance pr-marker --issue 42 --base-ref origin/main" \
-  "$(cat "$STUB_DIR/daemon-args.txt")" "T1: closing issue and base ref are passed through"
+assert_eq "provenance pr-marker --body-file - --base-ref origin/main" \
+  "$(cat "$STUB_DIR/daemon-args.txt")" "T1: base ref is passed through"
+assert_eq "Closes #42" "$(cat "$STUB_DIR/daemon-stdin.txt")" \
+  "T1: the body goes to the daemon, which derives the D32 story from it"
 
 # T2: a daemon without the subcommand -> the explicit all-unknown record.
 LOOM_DAEMON_SELF_BIN="$STUB_DIR/daemon-old" run_create_pr --body "Closes #42"

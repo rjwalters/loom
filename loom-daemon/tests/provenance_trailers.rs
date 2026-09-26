@@ -62,10 +62,22 @@ fn repo(hooks_path: Option<&str>) -> tempfile::TempDir {
 
 /// `git <args>` as the dispatched sweep would run it.
 fn sweep_git(root: &Path, args: &[&str]) {
+    sweep_git_with(root, args, &[]);
+}
+
+/// [`sweep_git`] in an environment that already carries env-scoped config.
+fn sweep_git_with(root: &Path, args: &[&str], ambient: &[(&str, &str)]) {
     let mut cmd = Command::new("git");
     cmd.current_dir(root)
         .args(args)
         .env_remove("GIT_CONFIG_COUNT");
+    if !ambient.is_empty() {
+        for (i, (key, value)) in ambient.iter().enumerate() {
+            cmd.env(format!("GIT_CONFIG_KEY_{i}"), key)
+                .env(format!("GIT_CONFIG_VALUE_{i}"), value);
+        }
+        cmd.env("GIT_CONFIG_COUNT", ambient.len().to_string());
+    }
     hooks::prepare_child_with(
         &mut cmd,
         root,
@@ -184,26 +196,126 @@ fn trailers_subcommand_never_derives_a_trace_from_the_name() {
     assert_eq!(lines[2], format!("Loom-Build: {}", loom_daemon::self_update::BUILD_STAMP));
 }
 
-#[test]
-fn pr_marker_subcommand_emits_one_parseable_line() {
-    let dir = repo(None);
-    let out = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
-        .args([
-            "provenance",
-            "pr-marker",
-            "--sweep",
-            "sweep-issue-9027-1",
-            "--repo-root",
-        ])
-        .arg(dir.path())
-        .output()
-        .unwrap();
+/// `loom-daemon provenance pr-marker` outside Actions, with `gh` off PATH.
+fn pr_marker(root: &Path, extra: &[&str], body: Option<&str>) -> Marker {
+    let bin = tempfile::tempdir().unwrap();
+    let real_git = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(real_git.trim(), bin.path().join("git")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+    cmd.args(["provenance", "pr-marker", "--repo-root"])
+        .arg(root)
+        .args(extra)
+        .env("PATH", bin.path())
+        .env_remove("LOOM_SWEEP_ID")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    for key in [
+        "GITHUB_ACTIONS",
+        "GITHUB_REPOSITORY",
+        "GITHUB_RUN_ID",
+        "GITHUB_RUN_ATTEMPT",
+    ] {
+        cmd.env_remove(key);
+    }
+    if body.is_some() {
+        cmd.args(["--body-file", "-"]);
+    }
+    let mut child = cmd.spawn().unwrap();
+    {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(body.unwrap_or("").as_bytes()).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8(out.stdout).unwrap();
     assert_eq!(text.lines().count(), 1);
-    let marker = Marker::parse(text.trim()).unwrap();
+    Marker::parse(text.trim()).unwrap()
+}
+
+#[test]
+fn pr_marker_subcommand_emits_one_parseable_line() {
+    let dir = repo(None);
+    let marker = pr_marker(dir.path(), &["--sweep", "sweep-issue-9027-1"], None);
     assert_eq!(marker.sweep, "sweep-issue-9027-1");
-    assert_eq!(marker.story, "unknown");
+    assert_eq!(marker.story, "none", "no closing issue → no story");
     assert_eq!(marker.base, "unknown");
+    assert_eq!(marker.run, "none", "not an Actions run");
     assert_eq!(marker.build, loom_daemon::self_update::BUILD_STAMP);
+    assert_eq!(marker.prompts, "unknown unknown");
+}
+
+#[test]
+fn pr_marker_story_follows_d32_from_the_body() {
+    let dir = repo(None);
+    let root = dir.path();
+    // Outside a sweep: sweep=none, not unknown.
+    assert_eq!(pr_marker(root, &[], Some("Docs only.")).sweep, "none");
+    // Exactly one closing issue joins that issue's story (repo_id unresolvable
+    // out of process, so the trace is an explicit unknown).
+    let one = pr_marker(root, &[], Some("Closes #9027"));
+    assert_eq!((one.story.as_str(), one.trace.as_str()), ("rjwalters/loom#9027", "unknown"));
+    // Several: the PR is its own story (not yet numbered), never the first issue's.
+    let two = pr_marker(root, &[], Some("Closes #9068\nCloses #9027"));
+    assert_eq!((two.story.as_str(), two.trace.as_str()), ("unknown", "unknown"));
+    let none = pr_marker(root, &[], Some("Relates to #9027"));
+    assert_eq!(none.story, "none");
+}
+
+#[test]
+fn env_scoped_config_passes_through_to_the_repo_hook_lookup() {
+    // A container-style ambient `safe.directory`, plus an ambient
+    // `core.hooksPath` the repo's effective hooks come from: the shim must drop
+    // only loom's own entry, so it chains to the ambient dir, and the hook it
+    // runs still sees `safe.directory`.
+    let dir = repo(None);
+    let root = dir.path();
+    let ambient_hooks = root.join("ambient-hooks");
+    hook(
+        &ambient_hooks,
+        "pre-commit",
+        "git config --get safe.directory > \"$(git rev-parse --git-dir)/ambient-safe-directory\"",
+    );
+    let ambient_hooks = ambient_hooks.to_str().unwrap().to_string();
+    std::fs::write(root.join("c.txt"), "c").unwrap();
+    git(root, &["add", "c.txt"]);
+    sweep_git_with(
+        root,
+        &["commit", "-q", "-m", "chore: c"],
+        &[("safe.directory", "*"), ("core.hooksPath", &ambient_hooks)],
+    );
+    let seen = std::fs::read_to_string(root.join(".git/ambient-safe-directory")).unwrap();
+    assert_eq!(seen.trim(), "*");
+    assert!(
+        !root.join(".git/repo-pre-commit-ran").exists(),
+        "the ambient hooksPath, not .git/hooks, is the repo's effective one"
+    );
+    assert_stamped(root);
+}
+
+#[test]
+fn a_non_github_origin_stamps_story_none() {
+    let dir = repo(None);
+    let root = dir.path();
+    git(
+        root,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://gitlab.example.invalid/a/b.git",
+        ],
+    );
+    std::fs::write(root.join("d.txt"), "d").unwrap();
+    git(root, &["add", "d.txt"]);
+    sweep_git(root, &["commit", "-q", "-m", "chore: d"]);
+    assert_eq!(trailer(root, "Loom-Story"), ["none"]);
+    assert_eq!(trailer(root, "Loom-Trace-Id"), ["unknown"]);
 }
