@@ -188,6 +188,29 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  release-build:
+    name: Release Build Check
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    # The same `cargo build --release --features otlp` the release workflow
+    # runs, on every backend PR. Until #9065 the three binary-running checks
+    # each built --release, which caught release-profile-only breakage
+    # (cfg(debug_assertions) code, optimisation-only link failures) before
+    # merge. They now use the shared debug build, so without this job such a
+    # break would first surface in the post-merge release workflow. Nothing
+    # waits on it, so it stays off the critical path.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --release --package loom-daemon --features otlp
+
   backend-lint-and-check:
     name: Rust Linting & Build Check
     needs: changes
@@ -208,7 +231,7 @@ jobs:
       - run: cargo check --workspace --all-targets
 
   backend-tests:
-    name: Rust Unit Tests (${{ matrix.partition }}/3)
+    name: Rust Unit Tests (${{ matrix.partition }}/${{ strategy.job-total }})
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     # Partitioned three ways (#9065). Running ~9,500 tests one-process-each is
@@ -223,6 +246,9 @@ jobs:
       fail-fast: false
       matrix:
         partition: [1, 2, 3]
+        # The denominator is `strategy.job-total`, never a literal: editing
+        # this list alone cannot silently drop a slice (a gap such as [1, 3]
+        # yields an out-of-range k/N, which fails loudly).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -248,8 +274,8 @@ jobs:
       - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
         with:
           tool: nextest
-      - name: Run tests (process-per-test, partition ${{ matrix.partition }}/3)
-        run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/3
+      - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
+        run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
 
   backend-doctests:
     name: Rust Doctests
@@ -308,7 +334,7 @@ jobs:
         run: cargo test --package loom-daemon --features otlp --test cycle_time_clickhouse -- --ignored --nocapture
 
   backend-otlp-tests:
-    name: Rust OTLP Feature Tests (${{ matrix.partition }}/3)
+    name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     # The whole loom-daemon suite with `--features otlp`, partitioned three
@@ -318,6 +344,9 @@ jobs:
       fail-fast: false
       matrix:
         partition: [1, 2, 3]
+        # The denominator is `strategy.job-total`, never a literal: editing
+        # this list alone cannot silently drop a slice (a gap such as [1, 3]
+        # yields an out-of-range k/N, which fails loudly).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -331,8 +360,8 @@ jobs:
       - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
         with:
           tool: nextest
-      - name: Run tests (otlp feature, partition ${{ matrix.partition }}/3)
-        run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/3
+      - name: Run tests (otlp feature, partition ${{ matrix.partition }}/${{ strategy.job-total }})
+        run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
 
   mcp-build:
     name: MCP Server Build
@@ -1763,7 +1792,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo --non-interactive setpriv --reuid=1000 --regid=1000 --groups=docker --reset-env --' cargo test -p loom-daemon --test private_workspace_docker -- --ignored --nocapture
 
   shell-suite-tests:
-    name: Shell Test Suites (hermetic, ${{ matrix.shard }}/2)
+    name: Shell Test Suites (hermetic, ${{ matrix.shard }}/${{ strategy.job-total }})
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true')
     # Audit-and-wire of the defaults/scripts/tests/ population (#4455). Before
@@ -1813,6 +1842,9 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2]
+        # The denominator is `strategy.job-total`, never a literal: editing
+        # this list alone cannot silently drop a slice (a gap such as [1, 3]
+        # yields an out-of-range k/N, which fails loudly).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1844,7 +1876,7 @@ jobs:
         # no reachable user manager the block still self-skips, unchanged.
         env:
           LOOM_TEST_ALLOW_SYSTEMD: "1"
-          LOOM_CI_SHARD: ${{ matrix.shard }}/2
+          LOOM_CI_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
         run: bash defaults/scripts/tests/run-ci-suites.sh
       - name: Upload CI suite retry log (#7791)
         if: always()
