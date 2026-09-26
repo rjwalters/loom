@@ -253,6 +253,8 @@ pub mod safehouse;
 pub mod safehouse_chatops;
 pub mod scratch_reclaim;
 pub mod script_helpers;
+/// Content scan for credential-shaped values before commit/push (#9133).
+pub mod secret_scan;
 pub mod self_update;
 pub mod serve;
 pub mod shell_budget;

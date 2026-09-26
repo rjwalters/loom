@@ -75,6 +75,7 @@ pub(crate) mod retry_classify;
 pub(crate) mod role_tool_policy;
 mod runtime_launch_cmd;
 pub(crate) mod script_ports;
+mod secret_scan_cmd;
 pub(crate) mod serve_cmd;
 mod shell_budget;
 mod skip_labels;

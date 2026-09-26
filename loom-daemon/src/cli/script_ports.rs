@@ -338,6 +338,14 @@ pub(crate) enum ScriptPortCommand {
     /// new points check moved here, to keep the #7810 `shell-budget` gate a
     /// non-event for this addition.
     CheckPointsMarker(super::points_marker_check::CheckPointsMarkerArgs),
+
+    /// Refuse content carrying a credential shape — a Claude OAuth/API key,
+    /// GitHub/Tailscale/Slack token, AWS key id, private key — whatever its
+    /// path (#9133). Backs the `guard-loom-workflow.sh` commit/push check,
+    /// `.githooks/pre-commit`/`pre-push`, and the CI scan. Never prints a
+    /// value, only path, class and sha256[:8]. Exit 0 clean, 1 found, 2 could
+    /// not scan. Not a port: new logic, native per the shell-language policy.
+    SecretScan(super::secret_scan_cmd::SecretScanArgs),
 }
 
 impl ScriptPortCommand {
@@ -387,6 +395,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
+            ScriptPortCommand::SecretScan(args) => args.run(),
         }
     }
 }
