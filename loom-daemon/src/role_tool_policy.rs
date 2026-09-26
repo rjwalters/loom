@@ -38,22 +38,54 @@
 //! — mirrors the shell it replaces exactly, and the unit tests assert the
 //! strings literally rather than deriving them.
 //!
-//! # The one deliberate asymmetry: two wildcard rules
+//! **One deliberate deviation** from that parity requirement, decided in
+//! Issue #8943 and described in the next section: the wildcard rule. Nothing
+//! else below departs from the shell.
 //!
-//! The two consumers do **not** agree on what counts as a wildcard, and this
-//! module preserves that rather than quietly unifying it:
+//! # One wildcard rule: an exact `"*"` element
 //!
-//! - `spawn-claude.sh` space-joins the declared capabilities and tests
+//! `"*"` is the only wildcard, and it is matched as a **whole element** —
+//! [`RoleToolPolicy::has_wildcard`], which is the single definition **both**
+//! consumer paths go through:
+//!
+//! - [`RoleToolPolicy::is_restricted`] (the Codex predicate) is
+//!   `is_declared() && !has_wildcard()`.
+//! - [`RoleToolPolicy::denied_capabilities`] / [`RoleToolPolicy::deny_specs`]
+//!   (the `--disallowedTools` path) emit nothing unless `is_restricted()`.
+//!
+//! So a declared capability that merely *contains* `*` without *being* `*`
+//! (say `"cloud-*"`) is **inert**, exactly like any other unrecognized string:
+//! it grants nothing and it disarms nothing. `cloud-*` is not a capability
+//! name — the namespace is the four literals in [`CAPABILITY_NAMESPACE`] —
+//! and glob semantics are deliberately **not** supported.
+//!
+//! ## Why this is a behaviour change, and a deliberate one (#8943)
+//!
+//! The port (#8322) inherited **two** wildcard rules from the two shell
+//! consumers and preserved both rather than unify them mid-port:
+//!
+//! - `spawn-claude.sh` space-joined the declared capabilities and tested
 //!   `[[ "$caps" != *"*"* ]]` — a **substring** test, so any element
-//!   *containing* `*` disables the restriction. [`RoleToolPolicy::deny_specs`]
-//!   follows this.
-//! - `spawn-codex.sh` asks jq for `index("*")` — an **exact element** match.
-//!   [`RoleToolPolicy::is_restricted`] follows this.
+//!   *containing* `*` disabled the restriction entirely.
+//! - `spawn-codex.sh` asked jq for `index("*")` — an **exact element** match,
+//!   so only a literal `"*"` disabled it.
 //!
-//! They differ only for a declared capability that contains `*` without being
-//! `*` (say `"cloud-*"`), which is inert in the namespace either way. Changing
-//! either rule here would be a behaviour change to a security control smuggled
-//! into a port, so the port keeps both and names the difference instead.
+//! They disagreed on exactly one input shape, `["cloud-*"]`: **0 deny specs**
+//! (a full disarm) on the Claude path, **restricted** on the Codex path. The
+//! substring rule fails **open** — a role author who writes `"cloud-*"`
+//! expecting glob semantics, or who typos a name containing `*`, silently
+//! turns off every restriction for that role — the inverse of the posture
+//! "Fails open on identity, closed on capability" below states. #8943 resolved
+//! it by adopting the exact-element rule for both paths: the fail-**closed**
+//! answer, and the one that keeps an unrecognized name inert rather than
+//! load-bearing.
+//!
+//! Blast radius at the time of the change was zero: no shipped
+//! `defaults/roles/*.json` declared a `toolPolicy` at all, so neither rule was
+//! reachable in production. Neither shell script has ever carried either rule
+//! on a merged commit — they call `loom-daemon role-tool-policy` instead — so
+//! this module is the only place the rule has ever lived, and unifying it here
+//! unifies it everywhere.
 //!
 //! # Fails open on identity, closed on capability
 //!
@@ -71,13 +103,21 @@ use std::path::{Path, PathBuf};
 /// specs are emitted in.
 ///
 /// A name outside this list can never be granted by a role JSON: an unknown
-/// string in `allowedCapabilities` is inert, never a wildcard.
+/// string in `allowedCapabilities` is inert, never a wildcard — including one
+/// that *contains* [`CAPABILITY_WILDCARD`] without being it (#8943).
 pub const CAPABILITY_NAMESPACE: [&str; 4] = [
     "remote-shell",
     "cloud-cli",
     "forge-secrets",
     "credential-store",
 ];
+
+/// The only wildcard: a declared capability equal to this string — matched as a
+/// **whole element**, never as a substring — waives the restriction entirely.
+///
+/// See the module doc's "One wildcard rule" section. It is a constant so the one
+/// rule has one spelling, and so a reader of either consumer path lands here.
+pub const CAPABILITY_WILDCARD: &str = "*";
 
 /// The three daemon dispatch aliases, resolved identically by
 /// `spawn-claude.sh`'s `_loom_role_policy_name()`, `spawn-codex.sh`'s
@@ -333,37 +373,48 @@ impl RoleToolPolicy {
         out
     }
 
-    /// `true` when any declared capability *contains* a `*`.
+    /// `true` when the declaration names the wildcard capability — a declared
+    /// element that **is** [`CAPABILITY_WILDCARD`], not merely one containing
+    /// it.
     ///
-    /// `spawn-claude.sh`'s rule — a substring test against the space-joined
-    /// allowlist. See the module doc for why this differs from
-    /// [`Self::is_restricted`]'s.
+    /// **This is the one wildcard rule** (#8943): every consumer path reaches
+    /// it through [`Self::is_restricted`], so the `--disallowedTools` spec list
+    /// and the Codex restriction predicate can never disagree about what
+    /// counts as a wildcard. `"cloud-*"` is not one — it is an unrecognized
+    /// capability name, and unrecognized names are inert. See the module doc
+    /// for why the substring rule it replaced was the wrong (fail-open) answer.
     #[must_use]
-    pub fn has_spawn_claude_wildcard(&self) -> bool {
+    pub fn has_wildcard(&self) -> bool {
         self.allowlist
             .capabilities()
             .iter()
-            .any(|c| c.contains('*'))
+            .any(|c| c == CAPABILITY_WILDCARD)
     }
 
-    /// `true` when the role's declaration is restrictive on the Codex path:
-    /// an `allowedCapabilities` array is present and no element *is* `"*"`.
+    /// `true` when the role's declaration is restrictive: an
+    /// `allowedCapabilities` array is present and it does not name the
+    /// wildcard.
     ///
     /// This is the predicate `spawn-codex.sh` needs to decide whether to emit
     /// its "enforcement NOT active on this path" warning: a restrictive
     /// declaration that only the guard-hook backstop can enforce, on a runtime
     /// with no `--disallowedTools` equivalent, means a session without that
     /// hook has no per-role restriction at all.
+    ///
+    /// It is also the gate [`Self::denied_capabilities`] consults, so the two
+    /// paths share one answer by construction rather than by agreement.
     #[must_use]
     pub fn is_restricted(&self) -> bool {
-        self.allowlist.is_declared() && !self.allowlist.capabilities().iter().any(|c| c == "*")
+        self.allowlist.is_declared() && !self.has_wildcard()
     }
 
     /// The capabilities in [`CAPABILITY_NAMESPACE`] this role does **not**
     /// declare, in namespace order — or empty when no restriction applies.
     #[must_use]
     pub fn denied_capabilities(&self) -> Vec<&'static str> {
-        if !self.allowlist.is_declared() || self.has_spawn_claude_wildcard() {
+        // The SAME predicate the Codex path uses — one wildcard rule, one
+        // "does a restriction apply at all" verdict (#8943).
+        if !self.is_restricted() {
             return Vec::new();
         }
         let declared = self.allowlist.capabilities();
