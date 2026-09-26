@@ -88,6 +88,10 @@ pub(crate) enum ScriptPortCommand {
     /// verbs exit 0 always — "the feature is off" is an answer, not an error,
     /// and must never abort a worktree creation over a build-cache
     /// optimisation. The two predicates use their exit code as the answer.
+    /// `resolve` + `reclaim` (#9153) are `merge-pr.sh`'s post-merge #7239
+    /// reclaim — the last bash copy of that call sequence — split at the point
+    /// the removal has to happen: `cargo metadata` needs the manifest that is
+    /// about to disappear. Both exit 0 always; the merge already succeeded.
     #[command(subcommand)]
     CargoTargetDir(super::cargo_target_dir::CargoTargetDirCommand),
 

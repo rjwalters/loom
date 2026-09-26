@@ -3,7 +3,7 @@
 //! `spawn-claude.sh` can use it without growing the shell budget's portable
 //! pool (epic #7810, `.loom/docs/shell-language-policy.md`).
 //!
-//! Four verbs, deliberately narrow. Two write (the creation half):
+//! Six verbs, deliberately narrow. Two write (the creation half):
 //!
 //! * `provision <worktree>` — decide, create the directory, write the marker.
 //!   Prints the directory on stdout when there is one, so the caller can
@@ -36,12 +36,31 @@
 //! one resolution path (issue #8458's fourth acceptance criterion). Their exit
 //! codes are **data, not errors** (the `retry-classify` convention), which is why
 //! they are the two verbs here that may exit non-zero.
+//!
+//! And two that are the removal half itself (issue #9153, a slice of #8191 /
+//! epic #7810):
+//!
+//! * `resolve <worktree>` — the marker-first resolution for a worktree that is
+//!   still on disk, i.e. the pre-removal half of #7239's reclaim.
+//! * `reclaim <worktree> --resolved <dir>` — decide and act on that directory
+//!   once the worktree is gone, printing at most one `LEVEL<TAB>message` record.
+//!
+//! `merge-pr.sh` removes worktrees with its own `git worktree remove --force`
+//! rather than through `worktree.sh remove`, so it could not inherit the Rust
+//! reclaim that [`loom_daemon::worktree_ops::clean`], `worktree-remove` and the
+//! reaper already share; it carried the last bash copy of the resolve/reclaim
+//! *call sequence* instead. These two verbs are that sequence, split exactly
+//! where the removal has to happen: `cargo metadata` needs the manifest that is
+//! about to disappear, so resolution runs before and the decision after. Both
+//! exit 0 always — the merge has already succeeded by the time either runs, so
+//! "there is nothing to reclaim" and "the reclaim was refused" are answers, and
+//! a non-zero status would only give the caller something to suppress.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_ops::cargo_target::{per_worktree, provision};
+use loom_daemon::worktree_ops::cargo_target::{self, per_worktree, provision};
 use loom_daemon::worktree_root::worktree_root;
 
 #[derive(clap::Subcommand)]
@@ -64,6 +83,16 @@ pub(crate) enum CargoTargetDirCommand {
     /// Print WORKTREE's recorded per-worktree target dir and exit 0, or exit 1
     /// when there is no usable marker. The worktree MUST still be on disk.
     Marker(MarkerArgs),
+
+    /// Print the cargo target dir WORKTREE actually builds into — its marker
+    /// first, then `CARGO_TARGET_DIR`, then `cargo metadata`, degrading to
+    /// `<worktree>/target`. The worktree MUST still be on disk.
+    Resolve(ResolveArgs),
+
+    /// Reclaim WORKTREE's already-resolved target dir now that the worktree
+    /// itself is gone. Prints at most one `LEVEL<TAB>message` record; silent
+    /// for the un-redirected layout. Always exits 0.
+    Reclaim(ReclaimArgs),
 }
 
 #[derive(clap::Args)]
@@ -127,6 +156,37 @@ pub(crate) struct MarkerArgs {
     pub worktree: PathBuf,
 }
 
+#[derive(clap::Args)]
+pub(crate) struct ResolveArgs {
+    /// The worktree to resolve for. Must still be on disk — `cargo metadata`
+    /// needs its manifest, which is exactly why the caller runs this BEFORE
+    /// removing it.
+    #[arg(value_name = "WORKTREE")]
+    pub worktree: PathBuf,
+}
+
+#[derive(clap::Args)]
+pub(crate) struct ReclaimArgs {
+    /// The worktree that was removed. Excluded from the sharing scan by path,
+    /// so this is correct whether or not it is still on disk.
+    #[arg(value_name = "WORKTREE")]
+    pub worktree: PathBuf,
+
+    /// What `resolve` said this worktree built into, captured before the
+    /// removal.
+    #[arg(long, value_name = "PATH")]
+    pub resolved: PathBuf,
+
+    /// Repo root the sharing scan enumerates live worktrees from, and whose own
+    /// `target/` the refusal gates protect. Defaults to the current directory.
+    #[arg(long, value_name = "PATH")]
+    pub repo_root: Option<PathBuf>,
+
+    /// Report what a real pass would remove without removing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 impl CargoTargetDirCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
@@ -134,6 +194,8 @@ impl CargoTargetDirCommand {
             Self::Path(a) => a.run(),
             Self::IsAttributable(a) => a.run(),
             Self::Marker(a) => a.run(),
+            Self::Resolve(a) => a.run(),
+            Self::Reclaim(a) => a.run(),
         }
     }
 }
@@ -210,5 +272,32 @@ impl MarkerArgs {
             // tree. Exit 1 is the answer the bash caller branches on.
             None => std::process::exit(1),
         }
+    }
+}
+
+impl ResolveArgs {
+    fn run(self) -> Result<()> {
+        // `resolve_for_worktree`, not `..._checked`: this answer is about the
+        // worktree BEING removed, whose unreadable-redirect fallback is
+        // `<worktree>/target` — an `Inside` outcome, i.e. a silent no-op. A
+        // resolution failure must cost a missed reclaim, never a wrong
+        // deletion; the sharing scan inside `reclaim` is where the checked form
+        // (which fails closed) is used, and it stays there.
+        println!("{}", cargo_target::resolve_for_worktree(&self.worktree).display());
+        Ok(())
+    }
+}
+
+impl ReclaimArgs {
+    fn run(self) -> Result<()> {
+        let root = repo_root_or_cwd(self.repo_root);
+        let outcome = cargo_target::reclaim(&root, &self.worktree, &self.resolved, self.dry_run);
+        // At most one record, and none at all for `Inside`/`Absent` — the
+        // un-redirected layout, i.e. almost every repo — so post-merge output is
+        // unchanged unless something was actually reclaimed or deliberately kept.
+        if let Some((level, message)) = outcome.report_record() {
+            println!("{level}\t{message}");
+        }
+        Ok(())
     }
 }

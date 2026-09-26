@@ -600,12 +600,21 @@ or `LOOM_PER_WORKTREE_TARGET_DIR=1` in the daemon's environment. Then:
   (`provision` / `path`), declared `requires-daemon: cargo-target-dir optional`
   in each script: a host whose binary predates the subcommand — or has none
   built yet — simply gets no per-worktree dir, which is the pre-#8458 behaviour.
-  The removal side consults the same binary (`is-attributable` / `marker`), so
+  The removal side consults the same binary (`is-attributable` / `marker` for the
+  predicates, `resolve` / `reclaim` for merge-pr.sh's own cleanup — #9153), so
   every rule in the scheme is stated once, in the daemon; the shell scripts hold
   only the call sites.
 - Every removal path reclaims it: `worktree.sh remove`, `merge-pr.sh`'s
   post-merge cleanup, `loom-daemon clean`, and the daemon's periodic reaper (so a
-  worktree whose PR merged on another host is cleaned up here too).
+  worktree whose PR merged on another host is cleaned up here too). All four now
+  run the **same** Rust decision (`worktree_ops::cargo_target::plan_reclaim`):
+  `merge-pr.sh` removes worktrees with its own `git worktree remove --force`
+  rather than through `worktree.sh remove`, so it could not inherit that reclaim
+  by delegation and carried the last bash copy of the resolve/reclaim call
+  sequence until #9153 split it into `cargo-target-dir resolve` (before the
+  removal, while `cargo metadata` can still see the manifest) plus
+  `cargo-target-dir reclaim` (after). Without either verb the reclaim is simply
+  not attempted — a missed disk reclaim, never a failed merge.
 
 **Why it is OFF by default, and when NOT to turn it on.** Per-worktree dirs stop
 sharing third-party `deps/` as well. That is nearly free when the host runs a

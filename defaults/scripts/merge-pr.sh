@@ -424,16 +424,15 @@ fi
 # Cargo target-dir reclaim (#7239). Post-merge cleanup is the removal path most
 # worktrees actually take, so a redirected CARGO_TARGET_DIR/build.target-dir
 # would leak its per-worktree build output here more than anywhere else.
-# Sourced defensively with no-op fallbacks, same rationale as the ledger above:
-# a partially-resynced .loom/ must degrade to "no reclaim", never break a merge.
-if [[ -f "$SCRIPT_DIR/lib/cargo-target-dir.sh" ]]; then
-  # shellcheck source=lib/cargo-target-dir.sh
-  source "$SCRIPT_DIR/lib/cargo-target-dir.sh"
-else
-  loom_resolve_worktree_target_dir() { printf '%s\n' "$1/target"; }
-  loom_reclaim_worktree_target_dir() { printf 'inside\t%s\tcargo-target-dir.sh lib unavailable\n' "$3"; }
-  loom_render_target_dir_record() { :; }
-fi
+#
+# No lib is sourced for it any more (#9153): the resolve/reclaim pair is
+# `loom-daemon cargo-target-dir resolve|reclaim`, called inline from
+# `_remove_loom_worktree` below. That is the same Rust decision `worktree.sh
+# remove`, `loom-daemon clean` and the reaper already share, so the fourth copy
+# of the rules is gone rather than merely deduped — and the degraded path needs
+# no no-op twins: both calls are `2>/dev/null || true`, so a host with no
+# resolvable daemon (or one predating the verbs) simply performs no reclaim,
+# which is the pre-#7239 behaviour. See the `requires-daemon:` block below.
 # Shared "has this branch landed?" primitive (#7812) — the one implementation
 # of the question the branch-delete and worktree-preserve guards below ask.
 # Required, like forge-helpers.sh above: every branch-delete decision in this
@@ -1038,6 +1037,7 @@ _check_loom_pr_label
 # requires-daemon: merge-pr >= 0.19.172   verdict-contradiction guard (#8112, landed in #8124)
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
 # requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
+# requires-daemon: cargo-target-dir optional   #9153 — the post-merge #7239 target-dir reclaim; without the resolve|reclaim verbs a daemon prints nothing, `$target_dir_resolved` stays empty and no reclaim is attempted, which is the pre-#7239 behaviour. A missed disk reclaim, never a failed merge: post-merge cleanup is best-effort by design and `loom-clean`, the daemon's reaper and `worktree.sh remove` all reclaim the same directory on their own schedule.
 #
 # _mp_daemon_roll_hint <subcommand> [resolved-bin] -- the concrete, host-local
 # remediation for "your loom-daemon is too old for <subcommand>": the declared
@@ -2724,24 +2724,6 @@ _maybe_delete_local_branch() {
   return 0
 }
 
-# _mp_report_target_dir_reclaim <record>
-#
-# Render one `status<TAB>path<TAB>detail` record from
-# loom_reclaim_worktree_target_dir (#7239) through THIS script's logging
-# functions. Silent for `inside`/`absent` — the un-redirected layout, i.e.
-# almost every repo — so post-merge output is unchanged unless something was
-# actually reclaimed or deliberately kept.
-#
-# The `case` itself is `lib/cargo-target-dir.sh`'s
-# `loom_render_target_dir_record` (#8458): this copy and worktree.sh's had
-# already drifted apart (this one never grew a `would-reclaim` arm), and one
-# record grammar gets one renderer. The no-lib degraded path defines a no-op
-# twin beside the other target-dir fallbacks above, where every record is
-# `inside` anyway.
-_mp_report_target_dir_reclaim() {
-  loom_render_target_dir_record "$1" success info warning
-}
-
 # _remove_loom_worktree <path> [allow_unmanaged]
 #
 # When allow_unmanaged is "true" (only set by the --worktree-path code path),
@@ -2881,14 +2863,12 @@ _remove_loom_worktree() {
   fi
   # #7239: resolve the worktree's cargo target dir BEFORE removing it —
   # `cargo metadata` needs the manifest that is about to disappear. Acted on
-  # only after a successful removal, below. `command -v`-guarded so this
-  # function body stays self-contained: the test suites that eval it in
-  # isolation (the no-drift extraction pattern) degrade to "no reclaim"
-  # instead of erroring on a helper they never sourced.
-  local target_dir_resolved=""
-  if command -v loom_resolve_worktree_target_dir >/dev/null 2>&1; then
-    target_dir_resolved="$(loom_resolve_worktree_target_dir "$worktree_path" 2>/dev/null)" || target_dir_resolved=""
-  fi
+  # only after a successful removal, below. `loom-daemon cargo-target-dir
+  # resolve` since #9153, so this body stays self-contained with no lib to
+  # source: `2>/dev/null || true` means a missing/stale daemon leaves this empty
+  # and the reclaim below is skipped, which is the pre-#7239 behaviour (declared
+  # as `requires-daemon: cargo-target-dir optional` above).
+  local target_dir_resolved="$("${LOOM_DAEMON_BIN:-loom-daemon}" cargo-target-dir resolve "$worktree_path" 2>/dev/null || true)"
   info "Removing worktree: $worktree_path"
   # #6372: capture the actual git error (was silently discarded via 2>/dev/null)
   # and, on first failure, try one `git worktree prune` + retry cycle before
@@ -2935,13 +2915,22 @@ _remove_loom_worktree() {
     fi
     # #7239: reclaim a REDIRECTED cargo target dir now that the worktree is
     # gone — only when it is outside the worktree, unshared with every other
-    # live worktree, and held open by no running process. Best-effort and
-    # silent for the default (un-redirected) layout, like every other cleanup
+    # live worktree, and held open by no running process. Those gates are
+    # `worktree_ops::cargo_target::plan_reclaim` (#9153), the same decision
+    # `worktree.sh remove`, `loom-daemon clean` and the reaper make; at most one
+    # `LEVEL<TAB>message` record comes back, replayed through this script's own
+    # logging exactly as `merge-pr delete-branch` and `dirty-guard` do. Silent
+    # for the default (un-redirected) layout, and best-effort like every other
     # step here: the merge already succeeded and is unaffected either way.
-    if [[ -n "$target_dir_resolved" ]] \
-       && command -v loom_reclaim_worktree_target_dir >/dev/null 2>&1 \
-       && command -v _mp_report_target_dir_reclaim >/dev/null 2>&1; then
-      _mp_report_target_dir_reclaim "$(loom_reclaim_worktree_target_dir "$REPO_ROOT" "$worktree_path" "$target_dir_resolved" false)"
+    if [[ -n "$target_dir_resolved" ]]; then
+      # `read` clears both names even on empty input, so a daemon that printed
+      # nothing (or none at all) falls through every `case` arm and says nothing.
+      IFS=$'\t' read -r level text < <("${LOOM_DAEMON_BIN:-loom-daemon}" cargo-target-dir reclaim "$worktree_path" --resolved "$target_dir_resolved" --repo-root "$REPO_ROOT" 2>/dev/null || true) || true
+      case "$level" in
+        SUCCESS) success "$text" ;;
+        WARNING) warning "$text" ;;
+        ?*) info "$text" ;;
+      esac
     fi
   else
     # Best-effort by design (#6372): the merge itself already succeeded and is

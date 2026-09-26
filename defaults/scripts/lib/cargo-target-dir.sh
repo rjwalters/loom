@@ -645,36 +645,17 @@ loom_reclaim_worktree_target_dir() {
     return 0
 }
 
-# loom_render_target_dir_record <record> <ok_fn> <info_fn> <warn_fn>
-#
-# Render ONE `status<TAB>path<TAB>detail` record from
-# `loom_reclaim_worktree_target_dir` as the operator-facing line for that
-# outcome, emitted through the caller's own logging functions (worktree.sh's
-# `_rm_success`/`_rm_info`/`_rm_warning`, merge-pr.sh's `success`/`info`/
-# `warning`) — which is the only thing the two removal surfaces ever disagreed
-# about.
-#
-# Before #8458 each of them carried its own copy of this `case`, and they had
-# already drifted (merge-pr.sh's copy has no `would-reclaim` arm because it has
-# no dry run). One record grammar deserves one renderer: this is the shell twin
-# of `TargetDirOutcome::report_line` (`cargo_target/report.rs`), which renders
-# the same outcomes for `loom-daemon clean` and the reaper, and the three are
-# now two implementations instead of three.
-#
-# `inside` / `absent` — the un-redirected layout, i.e. almost every repo — match
-# no arm and print nothing, so post-merge and post-remove output is unchanged
-# unless something was actually reclaimed or deliberately kept.
-loom_render_target_dir_record() {
-    local status path detail; IFS=$'\t' read -r status path detail <<<"$1"
-    case "$status" in
-        reclaimed)     "$2" "Reclaimed redirected cargo target dir: $path ($detail)" ;;
-        would-reclaim) "$3" "Would reclaim redirected cargo target dir: $path ($detail)" ;;
-        shared)        "$3" "Keeping redirected cargo target dir $path — still used by $detail" ;;
-        protected)     "$4" "Keeping redirected cargo target dir $path — $detail still using it" ;;
-        refused)       "$4" "Refusing to reclaim cargo target dir $path — $detail" ;;
-        failed)        "$4" "Could not reclaim redirected cargo target dir $path — $detail" ;;
-    esac
-}
+# There is deliberately NO shell renderer for a `status<TAB>path<TAB>detail`
+# record here any more (#9153). Both removal surfaces that had one are gone:
+# `worktree.sh remove`'s `_rm_report_target_dir` went with the verb in #8471
+# (#8195 slice 3), and `merge-pr.sh`'s `_mp_report_target_dir_reclaim` went with
+# its reclaim call site, which is now `loom-daemon cargo-target-dir reclaim` —
+# emitting the already-rendered line as `LEVEL<TAB>message` from
+# `TargetDirOutcome::report_record` (`cargo_target/report.rs`). One record
+# grammar, one renderer, and it is the Rust one that `loom-daemon clean` and the
+# reaper already printed through. Anything reading the records this file's
+# `loom_reclaim_worktree_target_dir` still returns (its own test suite) renders
+# them itself.
 
 
 # --------------------------------------------------------------------------

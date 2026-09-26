@@ -486,8 +486,10 @@ else
 
     # Run the real function body in a subshell: it needs merge-pr.sh's logging
     # helpers and REPO_ROOT, and `eval`ing it here would leak those into the
-    # remaining assertions. The lib is sourced (not stubbed) so resolution and
-    # reclaim are the production ones.
+    # remaining assertions. Nothing is stubbed on the target-dir path: since
+    # #9153 the resolve and the reclaim are both `loom-daemon cargo-target-dir`
+    # (the binary $LOOM_DAEMON_BIN pins, above), so what runs here is the
+    # production decision rather than a shell stand-in for it.
     mp_out="$(
         set +e
         info() { echo "INFO: $*"; }
@@ -498,9 +500,6 @@ else
             return 1
         }
         loom_record_worktree_removal() { :; }
-        _mp_report_target_dir_reclaim() { echo "$1"; }
-        # shellcheck source=../lib/cargo-target-dir.sh
-        source "$LIB_SH"
         # Consumed by the extracted merge-pr.sh function bodies below.
         # shellcheck disable=SC2034
         REPO_ROOT="$R11"
@@ -535,6 +534,15 @@ else
     else
         fail "merge-pr cleanup deleted the shared root — data-loss regression"
     fi
+    # #9153: the reclaim's `LEVEL<TAB>message` record must be replayed through
+    # merge-pr.sh's own `success`, not swallowed or reported as a warning. The
+    # `OK:` prefix is this suite's `success` stub, so this pins both halves of
+    # the record — the SUCCESS level and the shared message grammar.
+    if [[ "$mp_out" == *"OK: Reclaimed redirected cargo target dir"* ]]; then
+        pass "merge-pr cleanup replays the reclaim record through success()"
+    else
+        fail "the reclaim record was not replayed as a success: $mp_out"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -545,9 +553,15 @@ fi
 # derives its export through `path --issue <N>`. Pin the CLI contract all three
 # depend on directly, so a change to the exit codes or the worktree-root
 # resolution fails here rather than silently disabling a reclaim.
+#
+# `resolve` / `reclaim` (#9153) are pinned here too: they are merge-pr.sh's
+# post-merge removal pair, and their contract is what makes that call site
+# degradable — BOTH must exit 0 for every not-applicable case, and `reclaim`
+# must stay silent for the un-redirected layout rather than emitting a record
+# the shell would replay as a bogus INFO line.
 # ---------------------------------------------------------------------------
 echo ""
-echo "Test 12: the daemon query verbs (is-attributable / marker / path --issue)"
+echo "Test 12: the daemon query verbs (is-attributable / marker / path --issue / resolve / reclaim)"
 (
     D12="$TMP/verbs"
     WT12="$D12/.loom/worktrees/issue-312"
@@ -599,6 +613,40 @@ echo "Test 12: the daemon query verbs (is-attributable / marker / path --issue)"
     [[ "$got" == "$SHARED12/wt/issue-312" ]] || { echo "  got: $got"; exit 1; }
 ) && pass "path --issue: derives <shared root>/wt/issue-N with the root resolved in Rust" \
   || fail "path --issue: did not derive the expected directory"
+(
+    # `resolve` is marker-first, and answers for a worktree that is still on
+    # disk — merge-pr.sh's pre-removal call.
+    WT12R="$TMP/verbs-resolve/.loom/worktrees/issue-313"
+    mkdir -p "$WT12R"
+    printf '[workspace]\n' >"$WT12R/Cargo.toml"
+    printf '/big/cargo-target/wt/issue-313\n' >"$WT12R/.loom-cargo-target-dir"
+    got="$("$LOOM_DAEMON_BIN" cargo-target-dir resolve "$WT12R")" || exit 1
+    [[ "$got" == "/big/cargo-target/wt/issue-313" ]] || { echo "  got: $got"; exit 1; }
+    # No marker and no redirect ⇒ the in-worktree default, still exit 0. That
+    # value is what makes the reclaim below a silent no-op rather than a refusal.
+    rm -f "$WT12R/.loom-cargo-target-dir"
+    got="$("$LOOM_DAEMON_BIN" cargo-target-dir resolve "$WT12R")" || exit 1
+    [[ "$got" == "$WT12R/target" ]] || { echo "  got: $got"; exit 1; }
+) && pass "resolve: the marker wins, and an unredirected worktree still exits 0" \
+  || fail "resolve: wrong value or non-zero exit"
+(
+    # `reclaim` must exit 0 and print NOTHING for the in-worktree default (the
+    # `Inside` outcome): merge-pr.sh replays any line it gets, so a record here
+    # would add spurious output to every un-redirected merge.
+    R12C="$TMP/verbs-reclaim"
+    WT12C="$R12C/.loom/worktrees/issue-314"
+    mkdir -p "$WT12C/target/debug"
+    printf '[workspace]\n' >"$R12C/Cargo.toml"
+    out="$("$LOOM_DAEMON_BIN" cargo-target-dir reclaim "$WT12C" \
+        --resolved "$WT12C/target" --repo-root "$R12C")" || exit 1
+    [[ -z "$out" ]] || { echo "  unexpected record: $out"; exit 1; }
+    # A path nothing may ever delete comes back as a WARNING record, tab-separated
+    # — the shape merge-pr.sh's `IFS=$'\t' read` splits on.
+    out="$("$LOOM_DAEMON_BIN" cargo-target-dir reclaim "$WT12C" \
+        --resolved / --repo-root "$R12C")" || exit 1
+    [[ "$out" == "WARNING"$'\t'* ]] || { echo "  got: $out"; exit 1; }
+) && pass "reclaim: silent + exit 0 for the in-worktree default; a refusal is a WARNING record" \
+  || fail "reclaim: wrong record shape or non-zero exit"
 
 echo ""
 echo "Tests run: $TESTS_RUN, Passed: $TESTS_PASSED, Failed: $TESTS_FAILED"
