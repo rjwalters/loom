@@ -620,8 +620,9 @@ fi
 # POST-merge _auto_reconcile_stacked_children at the bottom of the merge flow).
 #
 # The race it closes: when a stacked PARENT PR (branch feature/issue-<N>)
-# squash-merges, item 1's post-merge _auto_reconcile_stacked_children rebases any
-# open CHILD PRs off the now-squashed parent branch onto the default branch. That
+# merges, item 1's post-merge _auto_reconcile_stacked_children rebases any
+# open CHILD PRs off the parent branch onto the default branch (the
+# rebase --onto re-root is merge-method-agnostic). That
 # rebase (reconcile-stack.sh's `git rebase --onto <default> <parent-branch>
 # <child-branch>`) needs <parent-branch> to still resolve as a ref. But Loom's own
 # recommended repo setting — delete_branch_on_merge:true, applied by

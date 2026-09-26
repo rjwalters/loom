@@ -375,13 +375,13 @@ else
 fi
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if [[ -f "$EXIT_CODE_DOC" ]] && grep -qi 'squash-merge detection trap' "$EXIT_CODE_DOC" \
+if [[ -f "$EXIT_CODE_DOC" ]] && grep -qi 'merge-ancestry detection trap' "$EXIT_CODE_DOC" \
    && [[ -f "$CHAMPION_MD" ]] && grep -q 'merge-pr-exit-code-exceptions.md' "$CHAMPION_MD"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: the squash-merge detection trap is documented and linked from champion-pr-merge.md"
+    echo -e "  ${GREEN}PASS${NC}: the merge-ancestry detection trap is documented and linked from champion-pr-merge.md"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: the squash-merge detection trap note or its link from champion-pr-merge.md is missing"
+    echo -e "  ${RED}FAIL${NC}: the merge-ancestry detection trap note or its link from champion-pr-merge.md is missing"
 fi
 
 # #8508's exit 4 shares exit 3's caller contract, so the same wiring must be

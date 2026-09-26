@@ -48,6 +48,11 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Records why Curator's dep-recheck posting sequence keeps a plain (non-atomic) `loom:curating` label claim rather than the POSIX-atomic `mkdir` lock plus under-lock re-decide of the retired `premise-recheck.sh` — the duplicate-comment incidents that motivated the lock were hours-to-weeks apart and were fully explained by hash non-determinism (since fixed by #7281/#7362/#8254), not by any claim race
   - **Key Decision**: Accept the non-atomic forge-side claim, with a falsifiable revisit trigger (duplicate same-hash re-check comments less than ~1 minute apart), over an emulated CAS that would add forge calls on a hot path under live quota pressure to prevent one self-suppressing duplicate comment
 
+- [ADR-0022: Merge by Default — Merge Commits Over Squash, With Rebase Second](0022-merge-commit-default.md)
+  - **Status**: Accepted
+  - **Summary**: Records the #9105 decision that merge commits are Loom's default merge method across every Loom-managed repo — the `merge > rebase > squash` preference inversion, fail-open-to-merge (a repo that disallows merge commits then fails loudly instead of silently squashing history), the installer's degenerate fallback enabling merge-commit-only, and the `blame-issue.sh` merge-commit-subject join key — with squash-only repos still respected and migration an explicit operator action
+  - **Key Decision**: Merge commits first (full commit/author/timestamp history preserved for blame and audit), rebase second, squash only when it is a repo's sole allowed strategy; the stacked-PR machinery (`reconcile-stack.sh`, the #3747 pre-merge ordering guard, the #3752 amend rebase) is merge-method-agnostic and unchanged
+
 ### Orchestration Architecture
 
 - [ADR-0009: Deprecate and Delete Shepherd Brain and Python Daemon (Phase 3)](0009-shepherd-deprecation.md)

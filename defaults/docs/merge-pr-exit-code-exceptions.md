@@ -263,13 +263,16 @@ action: raise `LOOM_AUTO_MERGE_TIMEOUT` past the repo's slowest suite (or
 shrink the required set). A Champion tick that ends in exit 5 should
 cost nothing but a log line.
 
-## Squash-merge detection trap (applies to all three)
+## Merge-ancestry detection trap (applies to all three)
 
 If you need to verify by hand whether a re-queued PR's commits actually landed
 or were silently stranded, `git merge-base --is-ancestor <commit> origin/main`
-is **not reliable evidence either way**: a squash merge produces a brand-new
-commit SHA on `main` that is not a git-ancestry descendant of any commit on the
-original PR branch, regardless of whether that commit's content made it into
-the squash. There is no cheap ancestry check for "squashed-and-landed" vs.
+is **not reliable evidence for a squashed merge**: a squash merge produces a
+brand-new commit SHA on `main` that is not a git-ancestry descendant of any
+commit on the original PR branch, regardless of whether that commit's content
+made it into the squash. Loom's default is now merge commit (#9105), under
+which the PR branch's commits ARE ancestors of `main` — there the ancestry
+check works as expected. For a squashed PR (or on any repo configured
+squash-only), there is no cheap ancestry check for "squashed-and-landed" vs.
 "stranded" — verification requires diffing the actual file content on `main`
 against the branch or commit in question.

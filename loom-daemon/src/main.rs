@@ -1916,8 +1916,9 @@ enum ForgeAction {
         #[arg(value_name = "PR")]
         pr_number: u32,
 
-        /// Merge method (squash | merge | rebase). Default squash.
-        #[arg(long, default_value = "squash")]
+        /// Merge method (merge | squash | rebase). Default merge (#9105: merge
+        /// commits preserve the branch's full history).
+        #[arg(long, default_value = "merge")]
         method: String,
 
         /// Optimistic-concurrency precondition (#5589, mirrors #5579's shell

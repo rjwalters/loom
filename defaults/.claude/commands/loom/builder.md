@@ -1274,7 +1274,7 @@ Decide whether this PR **fully** resolves the issue (`Closes #N`) or is only a
 **partial increment** of a larger tracked body of work that must stay open
 (`Part of #N` / `Contributes to #N`). The full decision rule — when to use the
 non-closing reference, and the requirement to carry the **same** reference in both
-the PR body and the squash commit message — is the canonical guidance in
+the PR body and the commit messages — is the canonical guidance in
 **builder-pr.md § "Partial increments (family/epic issues)"**. Do not restate it
 here; follow it there.
 
