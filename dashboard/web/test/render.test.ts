@@ -123,6 +123,24 @@ describe("renderTokenAnalytics (authenticated surface)", () => {
     expect(container.querySelector('[data-testid="attribution"]')).not.toBeNull();
   });
 
+  it("renders a token-pool burn-rate chart synthesized from per-account samples (issue #9029)", () => {
+    const container = mount();
+    renderTokenAnalytics(container, computeTokenAnalytics(fixturePage(), { now: NOW }), {
+      surface: "authenticated",
+      now: NOW,
+    });
+
+    const block = container.querySelector('[data-testid="pool-burn-rate"]');
+    expect(block).not.toBeNull();
+    expect(block?.textContent).not.toContain("Not enough tokens.snapshot history");
+
+    const chart = block?.querySelector('.burn-rate-chart-container[data-host="host-a"] svg');
+    expect(chart?.getAttribute("aria-label")).toBe("Token-pool burn rate");
+    // No account name or repo ever appears in this block — pool-level only.
+    expect(block?.textContent).not.toContain("agent-1");
+    expect(block?.textContent).not.toContain("agent-2");
+  });
+
   it("draws one sparkline polyline per burn segment", () => {
     const container = mount();
     const records = newestFirst([
@@ -226,6 +244,9 @@ describe("renderTokenAnalytics (authenticated surface)", () => {
       "No tokens.snapshot history in range.",
     );
     expect(container.querySelector('[data-testid="attribution"]')?.textContent).toContain("No usage observed");
+    expect(container.querySelector('[data-testid="pool-burn-rate"]')?.textContent).toContain(
+      "Not enough tokens.snapshot history yet to compute a burn rate.",
+    );
   });
 });
 
@@ -251,12 +272,49 @@ describe("renderTokenAnalytics (public surface)", () => {
 
     expect(rendered).toBe(true);
     expect(container.querySelector('[data-testid="pool-burn"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="pool-burn-rate"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="pool-health"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="analytics-operator-only-notice"]')).not.toBeNull();
 
     expect(container.querySelector('[data-testid="burn-curves"]')).toBeNull();
     expect(container.querySelector('[data-testid="forecasts"]')).toBeNull();
     expect(container.querySelector('[data-testid="attribution"]')).toBeNull();
+  });
+
+  it("renders a token-pool burn-rate chart directly from the server's own pool aggregate (issue #9029)", () => {
+    const container = mount();
+    renderTokenAnalytics(container, computeTokenAnalytics(publicFixturePage(), { now: NOW }), {
+      surface: "public",
+      now: NOW,
+    });
+
+    const block = container.querySelector('[data-testid="pool-burn-rate"]');
+    expect(block).not.toBeNull();
+    expect(block?.textContent).not.toContain("Not enough tokens.snapshot history");
+
+    const chart = block?.querySelector('.burn-rate-chart-container[data-host="host-a"] svg');
+    expect(chart?.getAttribute("aria-label")).toBe("Token-pool burn rate");
+    expect(block?.querySelector(".chart-legend")).not.toBeNull();
+  });
+
+  it("renders one chart per host, titled by host, for a multi-host pool (issue #9029)", () => {
+    const container = mount();
+    const records = newestFirst([
+      poolTokensSnapshot(T0, { accountCount: 2, maxUsage: 0.3 }, "host-a"),
+      poolTokensSnapshot(T0 + 10 * MINUTE, { accountCount: 2, maxUsage: 0.5 }, "host-a"),
+      poolTokensSnapshot(T0, { accountCount: 3, maxUsage: 0.6 }, "host-b"),
+      poolTokensSnapshot(T0 + 10 * MINUTE, { accountCount: 3, maxUsage: 0.9 }, "host-b"),
+    ]);
+    renderTokenAnalytics(container, computeTokenAnalytics(records, { now: NOW }), { surface: "public", now: NOW });
+
+    const block = container.querySelector('[data-testid="pool-burn-rate"]');
+    expect(block?.querySelectorAll(".burn-rate-chart-container")).toHaveLength(2);
+    expect(block?.querySelector('.burn-rate-chart-container[data-host="host-a"] .chart-title')?.textContent).toBe(
+      "Token-pool burn rate — host-a",
+    );
+    expect(block?.querySelector('.burn-rate-chart-container[data-host="host-b"] .chart-title')?.textContent).toBe(
+      "Token-pool burn rate — host-b",
+    );
   });
 
   it("draws one host card with peak and mean lines from the pool aggregate", () => {
@@ -326,6 +384,9 @@ describe("renderTokenAnalytics (public surface)", () => {
       "No tokens.snapshot history in range.",
     );
     expect(container.querySelector('[data-testid="pool-health"]')?.textContent).toContain("No accounts observed");
+    expect(container.querySelector('[data-testid="pool-burn-rate"]')?.textContent).toContain(
+      "Not enough tokens.snapshot history yet to compute a burn rate.",
+    );
   });
 
   // Mirrors `redaction.test.ts`'s "no account identifier survives, at any

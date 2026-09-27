@@ -164,3 +164,75 @@ blocks are the purpose-built, non-identifying aggregate the original
 carrying no account names, no repo names, no per-account timing). It should
 **not** embed per-repo attribution or per-account forecasts; those remain
 authenticated-only per the decision above.
+
+## 3. Token-pool burn-rate ("throughput") chart (issue #9029)
+
+**Only a burn *rate*, never "tokens/min" or a token count.** No absolute
+token count or price exists anywhere in the telemetry
+(`.loom/docs/telemetry-schema.md`), so none is synthesized here either — the
+one representable unit is `usage_fraction`, a fraction of a rolling
+rate-limit window. This chart plots its rate of change: **% of pool capacity
+consumed per hour**, formatted by
+[`web/src/analytics/format.ts`](../web/src/analytics/format.ts)'s
+`formatRatePerHour` (`"12.3%/h"`) — the same formatter `forecast.ts`'s
+`slopePerHour` already uses, just now plotted as its own time series instead
+of only feeding an exhaustion ETA.
+
+### Bounded rolling window, not a whole-segment fit
+
+`forecast.ts`'s `slopePerHour` fits the *entire* live burn segment with
+ordinary least squares — a good input to an ETA, but an ever-widening window
+as the segment ages, and not something previously drawn as a series in its
+own right.
+[`web/src/analytics/burnRate.ts`](../web/src/analytics/burnRate.ts)'s
+`buildPoolBurnRateSeries` answers a narrower, complementary question — "how
+fast is the pool burning *right now*" — from a small **bounded** trailing
+window (`DEFAULT_BURN_RATE_WINDOW_HOURS`, 1 hour) instead: for each point it
+looks back at most the window, within the *same burn segment* only, and
+reports `(current − reference) / hoursElapsed`. The window's left edge only
+ever advances forward across a curve's points, so the whole series is O(n)
+with no unbounded in-memory accumulation — the same bounding discipline
+`historicalChartsPanel.ts`'s `DEFAULT_WINDOW_DAYS` / `CHART_PAGE_SIZE`
+already apply to the three historical charts.
+
+Processing each `PoolBurnCurve` segment independently — never sliding across
+a segment boundary — means a limit-window rollover or a telemetry gap
+(`burn.ts`'s segmentation) can never become a reference point for a rate
+computed after it: the first point of every segment reports `null` (no rate —
+unmeasured, not a fabricated `0` or, worse, a huge negative cliff reading a
+rollover as an instantaneous plunge).
+
+### Rendering: a first-class chart, on both surfaces, from one shared shape
+
+[`web/src/analytics/burnRateChartView.ts`](../web/src/analytics/burnRateChartView.ts)
+renders the series using the shared
+[`web/src/charts/chartChrome.ts`](../web/src/charts/chartChrome.ts) chrome —
+a dated x-axis, a zero-centered `%/h` y-axis, a two-series legend (mean,
+peak), a hover/focus tooltip, and a `renderTableView` fallback — matching
+[`web/src/charts/successRateChartView.ts`](../web/src/charts/successRateChartView.ts)'s
+pattern. This is deliberately a step up from the existing pool-load
+sparkline (`render.ts`'s `renderPoolSparkline`, a bare inline SVG with no
+axis, tooltip or table view); upgrading that sparkline to the same chrome is
+a separate, out-of-scope follow-up (see the issue).
+
+Mounted via `render.ts`'s `renderPoolBurnRate`, wired into `renderTokenAnalytics`
+(itself already reached through `panels.ts`'s `mountTokenAnalytics` under the
+existing `#/tokens` route — no router or nav change needed) on **both**
+surfaces, from the **same** `PoolBurnCurve[]` shape either way:
+
+- **Public** (`/public/history`) — the real, server-computed pool aggregate:
+  `analytics.poolCurves`, exactly what §2's `renderPoolBurn` already draws
+  sparklines from. Zero redaction change: pool-level fields were already
+  public-safe before this issue.
+- **Authenticated** (`/api/history`) — this route never serves the aggregate
+  shape (only `/public/history` does; `parsePoolSample` recognizes it by its
+  `account_count` field, which an authenticated per-account payload never
+  has), so `analytics.poolCurves` is empty there. `burn.ts`'s
+  `deriveAccountPoolSamples` synthesizes an equivalent `PoolSample[]` from
+  the per-account samples already fetched — same mean/peak-usage-fraction,
+  exhausted-count and earliest-reset semantics as the backend's own
+  `deriveTokenPoolAggregate` ([`../src/redaction.ts`](../src/redaction.ts)),
+  computed client-side instead. The result feeds the unmodified
+  `buildPoolBurnCurves`, so segmentation is identical either way. **No
+  backend, ingest, or redaction change** — this is purely a browser-side
+  view of data the authenticated surface already has.
