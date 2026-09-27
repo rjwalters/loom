@@ -93,12 +93,13 @@ describe("mountPanel", () => {
     expect(root.querySelector('[data-testid="spend-period"]')).not.toBeNull();
   });
 
-  it("mounts the live feed and states the sweep.phase gap", () => {
+  it("mounts the live feed and points at the Live board", () => {
     mountPanel("feed", root);
     expect(root.querySelector('[data-testid="live-feed"]')).not.toBeNull();
-    // #4863: phase transitions are not emitted, so the panel says so rather
-    // than silently rendering a partial view. Remove with that issue.
-    expect(root.querySelector('[data-testid="feed-phase-caveat"]')?.textContent).toContain("sweep.phase");
+    // #4863 is fixed (sweep.phase is emitted), so the stale caveat is gone
+    // and the note points at the Live board instead (#9094).
+    expect(root.querySelector('[data-testid="feed-phase-caveat"]')).toBeNull();
+    expect(root.querySelector('[data-testid="feed-note"]')?.textContent).toContain("Live");
   });
 
   it("mounts the live status board and releases it on teardown", () => {

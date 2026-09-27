@@ -1,6 +1,7 @@
 /* The `#/live` status board (issue #9077). Built to be left open on a
-   second screen: big numbers, a card per sweep, and motion that means
-   something (a sweep arrives, advances, finishes). Every animation stops
+   second screen: big numbers, a card per work item, and motion that means
+   something (a sweep arrives, advances, finishes, a label changes). Cards
+   never move once placed (issue #9094); a finished one stays, dimmed. Every animation stops
    under `prefers-reduced-motion`; state then reads from colour and text
    alone. */
 
@@ -314,6 +315,26 @@
 .live__section-count:empty {
   display: none;
 }
+.live__section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.live__clear {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.live__clear:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
 
 .live__grid {
   display: grid;
@@ -471,9 +492,83 @@ a.live-card__title:hover {
 .live-card.is-advanced {
   animation: live-card-advance 1.2s ease-out;
 }
-.live-card.is-leaving {
-  pointer-events: none;
-  animation: live-card-leave 0.7s ease-in forwards;
+.live-card.is-relabeled {
+  animation: live-card-relabel 1.2s ease-out;
+}
+
+/* A sweep that ended keeps its place and its last phase, dimmed. */
+.live-card[data-state="done"] {
+  --phase: var(--phase-unknown);
+  opacity: 0.62;
+  box-shadow: none;
+}
+.live-card[data-state="done"][data-result="success"] { --phase: var(--phase-merge); }
+.live-card[data-state="done"][data-result="failure"] { --phase: var(--bad); }
+.live-card[data-state="done"] .live-step[data-state="current"]::after {
+  animation: none;
+}
+/* An item on the board only for its labels has no sweep clocks. */
+.live-card[data-state="watching"] .live-card__stepper,
+.live-card[data-state="watching"] .live-card__timer {
+  display: none;
+}
+
+.live-card__labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+.live-card__label-group {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.live-card__pr {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+a.live-card__pr:hover {
+  color: var(--accent);
+}
+.live-label {
+  --tone: var(--text-dim);
+  padding: 1px 7px;
+  border: 1px solid color-mix(in srgb, var(--tone) 45%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--tone) 14%, transparent);
+  color: var(--tone);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.live-label[data-tone="active"] { --tone: var(--phase-builder); }
+.live-label[data-tone="review"] { --tone: var(--phase-judge); }
+.live-label[data-tone="changes"] { --tone: var(--phase-doctor); }
+.live-label[data-tone="approved"] { --tone: var(--ok); }
+.live-label[data-tone="attention"] { --tone: var(--bad); }
+
+.live-card__history {
+  display: grid;
+  gap: 1px;
+  margin: 0;
+  padding: 6px 0 0;
+  border-top: 1px solid var(--border);
+  list-style: none;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.live-card__change {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.live-card__change:first-child {
+  color: var(--text);
+}
+.live-card__change-time {
+  flex: none;
+  font-variant-numeric: tabular-nums;
 }
 
 /* --- ticker ---------------------------------------------------------------- */
@@ -578,8 +673,9 @@ a.live-card__title:hover {
   0% { box-shadow: 0 0 0 1px var(--phase), 0 0 36px -8px var(--phase); }
   100% { box-shadow: var(--glow); }
 }
-@keyframes live-card-leave {
-  to { transform: scale(0.94); opacity: 0; filter: saturate(0); }
+@keyframes live-card-relabel {
+  0% { box-shadow: 0 0 0 1px var(--accent), 0 0 36px -8px var(--accent); }
+  100% { box-shadow: var(--glow); }
 }
 @keyframes live-event-in {
   0% { transform: translateX(-10px); opacity: 0; background: color-mix(in srgb, var(--tone) 22%, transparent); }
@@ -594,7 +690,7 @@ a.live-card__title:hover {
   .live-tile.is-changed,
   .live-card.is-entering,
   .live-card.is-advanced,
-  .live-card.is-leaving,
+  .live-card.is-relabeled,
   .live-host.is-beat,
   .live-event.is-new {
     animation: none !important;

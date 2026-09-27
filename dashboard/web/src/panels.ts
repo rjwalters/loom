@@ -161,16 +161,12 @@ function mountFeed(root: HTMLElement): PanelTeardown {
   root.replaceChildren(
     section(
       "Live event feed",
-      // Honest about the gap rather than rendering a silently-partial view:
-      // sweep.started/completed/outcome all flow today, but sweep.phase is
-      // never emitted (#4863), so phase transitions are missing and the
-      // per-sweep timeline has nothing to draw. Drop this note when #4863
-      // lands.
+      // The raw stream. The `#/live` board is the readable view of the same
+      // events; this one is for when you want every frame.
       el(
         "p",
-        { class: "panel-route__note", data: { testid: "feed-phase-caveat" } },
-        "Sweep lifecycle events as they arrive. Phase transitions are not shown yet — " +
-          "the daemon does not emit sweep.phase telemetry (see issue #4863).",
+        { class: "panel-route__note", data: { testid: "feed-note" } },
+        "Every telemetry event as it arrives, newest first. For a per-issue view with phases and labels, see Live.",
       ),
       feed,
     ),

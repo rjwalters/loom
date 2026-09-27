@@ -16,7 +16,7 @@ import {
   sweepTitle,
 } from "../src/liveBoard";
 import type { ActiveSweep, FleetSnapshot, LiveTailFrame } from "../src/types";
-import { CARD_LEAVE_MS, LiveBoard, TICKER_MAX_ROWS } from "../src/views/liveBoard";
+import { LiveBoard, MAX_CARDS, TICKER_MAX_ROWS } from "../src/views/liveBoard";
 
 const NOW = new Date("2026-09-26T12:00:00Z");
 
@@ -79,6 +79,16 @@ function manualSchedule(): { schedule: (handler: () => void, ms: number) => void
     },
     delays,
   };
+}
+
+function cardKeys(board: LiveBoard): string[] {
+  return [...board.root.querySelectorAll<HTMLElement>('[data-testid="live-card"]')].map((node) => node.dataset.key ?? "");
+}
+
+function card(board: LiveBoard, key: string): HTMLElement {
+  const found = board.root.querySelector<HTMLElement>(`[data-testid="live-card"][data-key="${key}"]`);
+  if (!found) throw new Error(`no card ${key}`);
+  return found;
 }
 
 describe("live board model", () => {
@@ -207,35 +217,108 @@ describe("LiveBoard view", () => {
     expect(board.root.querySelector(".live-card.is-entering")).toBeNull();
 
     board.update(
-      buildFleetView(snapshot([sweep({ sweepId: "s1" }), sweep({ sweepId: "s2", startedAt: "2026-09-26T11:59:00Z" })]), NOW),
+      buildFleetView(
+        snapshot([sweep({ sweepId: "s1" }), sweep({ sweepId: "s2", issue: 101, startedAt: "2026-09-26T11:59:00Z" })]),
+        NOW,
+      ),
       NOW,
     );
     expect(board.root.querySelector('[data-sweep="s2"]')?.classList.contains("is-entering")).toBe(true);
   });
 
-  it("fades out a finished sweep's card, then removes it", () => {
-    const timers = manualSchedule();
-    const board = new LiveBoard(timers.schedule);
-    board.update(buildFleetView(snapshot([sweep({ sweepId: "s1" })]), NOW), NOW);
+  it("keeps a finished sweep's card in place, dimmed, with how it ended", () => {
+    const board = new LiveBoard(manualSchedule().schedule);
+    board.update(
+      buildFleetView(snapshot([sweep({ sweepId: "s1", issue: 1 }), sweep({ sweepId: "s2", issue: 2 })]), NOW),
+      NOW,
+    );
+    board.pushEvent(frame("sweep.completed", { repo: "rjwalters/loom", issue: 1, sweep_id: "s1", result: "success" }), NOW);
+    board.update(buildFleetView(snapshot([sweep({ sweepId: "s2", issue: 2 })]), NOW), NOW);
 
-    board.update(buildFleetView(snapshot([]), NOW), NOW);
-    const leaving = board.root.querySelector<HTMLElement>('[data-sweep="s1"]');
-    expect(leaving?.classList.contains("is-leaving")).toBe(true);
-    expect(timers.delays).toContain(CARD_LEAVE_MS);
-    expect(board.root.querySelector<HTMLElement>('[data-testid="live-idle"]')!.hidden).toBe(false);
-
-    timers.flush();
-    expect(board.root.querySelector('[data-sweep="s1"]')).toBeNull();
+    const cards = cardKeys(board);
+    expect(cards).toEqual(["rjwalters/loom#1", "rjwalters/loom#2"]);
+    const done = card(board, "rjwalters/loom#1");
+    expect(done.dataset.state).toBe("done");
+    expect(done.dataset.result).toBe("success");
+    expect(done.querySelector(".live-card__phase")?.textContent).toBe("finished · success");
+    // Its clock stops where it stood.
+    expect(done.querySelector<HTMLElement>('[data-testid="live-card-timer"]')!.dataset.since).toBeUndefined();
+    // Only the running sweep counts as in flight.
+    expect(board.root.querySelector(".live__section-count")?.textContent).toBe("1");
   });
 
-  it("brings back a sweep that reappears while its old card is fading", () => {
+  it("never reorders cards: new ones go last, a re-dispatch reuses its card", () => {
     const board = new LiveBoard(manualSchedule().schedule);
-    board.update(buildFleetView(snapshot([sweep({ sweepId: "s1" })]), NOW), NOW);
-    board.update(buildFleetView(snapshot([]), NOW), NOW);
-    board.update(buildFleetView(snapshot([sweep({ sweepId: "s1" })]), NOW), NOW);
+    board.update(
+      buildFleetView(
+        snapshot([
+          sweep({ sweepId: "s1", issue: 1, startedAt: "2026-09-26T11:50:00Z" }),
+          sweep({ sweepId: "s2", issue: 2, startedAt: "2026-09-26T11:55:00Z" }),
+        ]),
+        NOW,
+      ),
+      NOW,
+    );
+    const first = card(board, "rjwalters/loom#1");
 
-    const live = board.root.querySelectorAll('[data-sweep="s1"]:not(.is-leaving)');
-    expect(live).toHaveLength(1);
+    // A sweep that started earlier than both arrives late: it still goes last.
+    board.update(
+      buildFleetView(
+        snapshot([
+          sweep({ sweepId: "s0", issue: 3, startedAt: "2026-09-26T11:00:00Z" }),
+          sweep({ sweepId: "s1", issue: 1, startedAt: "2026-09-26T11:50:00Z" }),
+          sweep({ sweepId: "s2", issue: 2, startedAt: "2026-09-26T11:55:00Z" }),
+        ]),
+        NOW,
+      ),
+      NOW,
+    );
+    expect(cardKeys(board)).toEqual(["rjwalters/loom#1", "rjwalters/loom#2", "rjwalters/loom#3"]);
+
+    // Issue 1 finishes, then a new sweep picks it up again.
+    board.update(buildFleetView(snapshot([sweep({ sweepId: "s2", issue: 2 })]), NOW), NOW);
+    board.update(
+      buildFleetView(snapshot([sweep({ sweepId: "s2", issue: 2 }), sweep({ sweepId: "s9", issue: 1, phase: "judge" })]), NOW),
+      NOW,
+    );
+    expect(card(board, "rjwalters/loom#1")).toBe(first);
+    expect(first.dataset.state).toBe("active");
+    expect(first.dataset.sweep).toBe("s9");
+    expect(first.dataset.phase).toBe("judge");
+    expect(cardKeys(board)).toEqual(["rjwalters/loom#1", "rjwalters/loom#2", "rjwalters/loom#3"]);
+  });
+
+  it("removes finished cards only on Clear finished", () => {
+    const board = new LiveBoard(manualSchedule().schedule);
+    board.update(
+      buildFleetView(snapshot([sweep({ sweepId: "s1", issue: 1 }), sweep({ sweepId: "s2", issue: 2 })]), NOW),
+      NOW,
+    );
+    const clear = board.root.querySelector<HTMLButtonElement>('[data-testid="live-clear-finished"]')!;
+    expect(clear.hidden).toBe(true);
+
+    board.update(buildFleetView(snapshot([sweep({ sweepId: "s2", issue: 2 })]), NOW), NOW);
+    expect(clear.hidden).toBe(false);
+    expect(cardKeys(board)).toHaveLength(2);
+
+    clear.click();
+    expect(cardKeys(board)).toEqual(["rjwalters/loom#2"]);
+    expect(clear.hidden).toBe(true);
+  });
+
+  it("drops the oldest finished card past MAX_CARDS, never an active one", () => {
+    const board = new LiveBoard(manualSchedule().schedule);
+    const many = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) => sweep({ sweepId: `s${from + i}`, issue: from + i }));
+    board.update(buildFleetView(snapshot(many(1, MAX_CARDS)), NOW), NOW);
+    // Issue 1 stays running; every other one finishes.
+    board.update(buildFleetView(snapshot(many(1, 1)), NOW), NOW);
+    const before = cardKeys(board);
+    board.update(buildFleetView(snapshot([...many(1, 1), ...many(1000, 1)]), NOW), NOW);
+
+    // The oldest card is still running, so the next-oldest goes.
+    expect(cardKeys(board)).toEqual([before[0], ...before.slice(2), "rjwalters/loom#1000"]);
+    expect(before[0]).toBe("rjwalters/loom#1");
   });
 
   it("flashes a tile only when its value changes after the first paint", () => {
