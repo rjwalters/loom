@@ -719,11 +719,23 @@ pub fn role_execution_id(role: &str, started_at: chrono::DateTime<Utc>) -> Strin
     format!("role-{role}-{}", crate::telemetry::trace::instant(started_at))
 }
 
+/// A traced role tick's identity, handed back to the role runner so the
+/// after-the-fact story join (#9168) can key and link its per-target spans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleTrace {
+    /// The tick's own `loom.role_attempt` root span.
+    pub context: TraceContext,
+    /// [`role_execution_id`] — the root's `loom.sweep_id`.
+    pub execution: String,
+    /// When the root span started.
+    pub started_at: chrono::DateTime<Utc>,
+}
+
 pub fn role_invocation(
     root: &Path,
     role: &str,
     invoke: impl FnOnce() -> crate::role_runner::RoleTickOutcome,
-) -> (crate::role_runner::RoleTickOutcome, Option<TraceContext>) {
+) -> (crate::role_runner::RoleTickOutcome, Option<RoleTrace>) {
     let execution = role_execution_id(role, Utc::now());
     let repo = TraceStore::fallback_repo(root);
     let span = begin(
@@ -737,19 +749,20 @@ pub fn role_invocation(
             ("loom.timing_source", "owned_boundary"),
         ]),
     );
-    let context = span.as_ref().map(|s| s.context().clone());
+    let trace = span.as_ref().map(|s| RoleTrace {
+        context: s.context().clone(),
+        execution: execution.clone(),
+        started_at: s.active.record.started_at,
+    });
     ROLE_CONTEXT.with(|slot| *slot.borrow_mut() = span);
     let outcome = invoke();
     ROLE_CONTEXT.with(|slot| {
         slot.borrow_mut().take();
     });
     let (result, _) = crate::role_tick_telemetry::classify(&outcome);
-    let result = serde_json::to_value(result)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "unknown".into());
+    let result = crate::role_tick_telemetry::result_label(result);
     finish_execution(root, &execution, &result, Default::default());
-    (outcome, context)
+    (outcome, trace)
 }
 
 #[cfg(test)]

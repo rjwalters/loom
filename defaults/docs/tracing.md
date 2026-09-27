@@ -76,7 +76,8 @@ transport behavior; live lifecycle acceptance requires the native workload too.
 ## Owned lifecycle instrumentation
 
 Sweep dispatch persists the root before spawning, including the failed-spawn
-path. Independent scheduled roles receive independent roots. Rust worker launches
+path. Independent scheduled roles receive independent roots, and join stories
+after the fact (below). Rust worker launches
 record preflight and runtime spans; a rejected preflight does not create a runtime
 span. Pi and OpenCode receive the validated context through their environment,
 and the shared native read/write/edit/bash bridge records tool name and outcome.
@@ -99,6 +100,37 @@ zero. Outcome logs include existing grouped usage, failure classification, order
 Judge verdicts and Doctor counts. Grouped usage inherits the source journal's
 attribution window and is not a measured provider bill. Free-form role error text,
 configuration blobs, prompts and account contents are not exported.
+
+## Role-runner ticks join stories after the fact (#9168)
+
+A role-runner tick (Judge, Curator, Champion, Doctor, …) is spawned without a
+target, so its `loom.role_attempt` root is its own trace. Once the tick ends,
+the same transcript pass that tallies `role_tick.outcome` `actions` also
+collects the issues and PRs the tick **wrote** to: `gh issue|pr
+comment/edit/close/reopen/…`, `gh pr merge|review|ready`, `merge-pr.sh <N>`
+(not `--dry-run`), and `gh api` `POST`/`PATCH`/`PUT`/`DELETE` on
+`repos/<o>/<r>/{issues,pulls}/<N>/…`. Reads (`view`, `list`, `diff`,
+`checks`, `GET`) never count; a command naming another repository (`-R`,
+URL, explicit API path) is refused; a branch name or `$VAR` names nothing.
+
+Each distinct target gets one additional `loom.role_attempt` span in its story
+trace, parented to the story root (`story_context(repo_id, N)`). One batched,
+cached (10 min), time-bounded GraphQL `issueOrPullRequest` lookup says whether
+the number is an issue — its own story — or a PR, which joins a story by the
+CI stitcher's rule: exactly one same-repo closing issue, counting the
+`feature/issue-N` head branch. Zero or several candidates, a foreign closing
+reference, a failed lookup, or an unresolvable `repo_id` → no story span. The
+span id is derived from the story root, `loom.role_tick`, the tick's execution
+id (`loom.sweep_id`) and the target (`pr:<M>` / `issue:<N>`), so a re-emit
+yields the same id. It carries `loom.role`, `loom.issue`, `loom.pr_number`
+(PR targets), `loom.story`, `loom.story.key_version`, `loom.repo`,
+`loom.result`, `loom.runtime`/`loom.model` when known, and
+`loom.timing_source=tick` — its start and end are the whole tick's, not the
+individual action's — plus a link to the tick's own root. The spans are
+appended to the tick's trace journal and drained like every lifecycle span.
+All of this is best-effort after the tick's child has exited; it never fails
+the tick. Non-Claude runtimes record no transcript actions, so their ticks
+join no story yet.
 
 ## Journals and recovery
 
