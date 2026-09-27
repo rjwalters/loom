@@ -2930,19 +2930,30 @@ _remove_loom_worktree() {
 # recoverable later (loom-clean, or a future merge that actually closes the
 # issue).
 #
+# The decision — close-target membership, then (only if needed) the live
+# state comparison — is `loom-daemon merge-pr issue-close-gate` (Rust,
+# loom-daemon/src/merge_pr/issue_close_gate.rs — #8191 slice), fed
+# $close_targets on stdin. The fast-path call (no --state) answers from
+# membership alone for the overwhelming common case (`Closes #N`); only when
+# it answers NEED-STATE (exit 3) does this wrapper pay for the extra
+# forge_get_issue_state round trip and call again with --state. Both forge
+# reads stay here.
+#
+# A daemon that cannot decide (missing, older than this slice, or answering
+# off-protocol) is warned about and resolves to PRESERVE — the same fail
+# direction the original in-shell comparison already had for any lookup
+# failure, now also covering "the decision could not be delegated at all".
+#
 # Returns 0 (true — safe to clean up) or 1 (false — preserve the worktree).
 _issue_is_closed_for_cleanup() {
-  local issue_number="$1"
-
-  local close_targets
+  local issue_number="$1" close_targets out rc=0 state
   close_targets="$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
-  if echo "$close_targets" | grep -qx "$issue_number"; then
-    return 0
-  fi
-
-  local state
-  state="$(forge_get_issue_state "$REPO_NWO" "$issue_number" "$GH" 2>/dev/null || true)"
-  [[ "$state" == "CLOSED" ]]
+  out="$(printf '%s\n' "$close_targets" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr issue-close-gate --issue "$issue_number" 2>/dev/null)" || rc=$?
+  [[ $rc -eq 3 && "$out" == "LOOM-ISSUE-CLEANUP NEED-STATE" ]] && { state="$(forge_get_issue_state "$REPO_NWO" "$issue_number" "$GH" 2>/dev/null || true)"; rc=0; out="$(printf '%s\n' "$close_targets" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr issue-close-gate --issue "$issue_number" --state "$state" 2>/dev/null)" || rc=$?; }
+  [[ $rc -eq 0 ]] && return 0
+  [[ $rc -eq 1 ]] && return 1
+  warning "The async-close-race cleanup gate for issue #$issue_number (#4186) did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr issue-close-gate' exited $rc rather than 0/1 (a loom-daemon predating #8191's slice has no such verb). Preserving the worktree rather than guessing (fail-unsafe-to-preserve) — if #$issue_number is actually closed, a future check will clean it up, or remove it by hand once confirmed. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+  return 1
 }
 
 if [[ "$CLEANUP_WORKTREE" == "true" ]]; then

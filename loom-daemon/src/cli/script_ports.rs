@@ -432,6 +432,16 @@ pub(crate) enum MergePrCommand {
     /// the comment stream could not be read at all.
     HoldState(super::merge_pr_hold_state::HoldStateArgs),
 
+    /// The async-close-race worktree-cleanup gate (#4186): whether a merged
+    /// PR's issue is actually finished, so a partial-increment worktree the
+    /// next Builder increment still needs is not removed out from under it.
+    /// Reads `forge_pr_close_targets`'s output on stdin; `--state` is
+    /// OPTIONAL and supplied only on the shell's second call. Exit 0 =
+    /// cleanup authorized (`CLOSE-TARGET`/`STATE-CLOSED`), 1 = preserve, 3 =
+    /// the shell must fetch `forge_get_issue_state` and call again with
+    /// `--state` — see `cli::merge_pr_issue_close_gate`.
+    IssueCloseGate(super::merge_pr_issue_close_gate::IssueCloseGateArgs),
+
     /// `_maybe_delete_local_branch` (#4100/#5015/#7812): the squash-aware
     /// local-branch delete rule, now shared verbatim with `worktree.sh
     /// remove` (#8195 slice 3) instead of duplicated. Always exits 0 — a
@@ -539,6 +549,7 @@ impl MergePrCommand {
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::HoldState(args) => args.run(),
+            MergePrCommand::IssueCloseGate(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),

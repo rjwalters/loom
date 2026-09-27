@@ -122,6 +122,20 @@
 //! irreversible steps (`git worktree remove --force`, `git branch -D`). The
 //! `git` invocation itself stays in the shell; only the parse moved.
 //!
+//! [`issue_close_gate`] is [`worktrees`]'s neighbour at the same post-merge
+//! choke point, one level up: whether the issue a worktree/branch belongs to
+//! is actually finished, so the async-close-race guard (#4186) does not
+//! remove a partial-increment worktree the NEXT Builder increment still
+//! needs. GitHub closes `Closes #N` issues asynchronously, after the merge
+//! webhook fires, so a naive live re-read right here would see "open" for
+//! essentially every ordinary merge; the fix is to trust this PR's OWN
+//! closing-reference list first (no race there) and only fall back to a live
+//! read — kept lazy, so the common case pays for no extra forge call — when
+//! it is not. It fails toward [`issue_close_gate::Decision::Preserve`] on
+//! anything it cannot corroborate, because the step it gates is destructive
+//! and a skipped cleanup is always recoverable later while a wrongly-removed
+//! worktree is not.
+//!
 //! [`closed_building`] is [`partial_reset`]'s twin at the same post-merge
 //! choke point, and runs immediately after it: the #6199 cleanup that strips
 //! `loom:building` from each issue THIS merge closed. Where `partial_reset`
@@ -164,6 +178,7 @@ pub mod closed_building;
 pub mod dirty_guard;
 pub mod head_sync;
 pub mod hold_state;
+pub mod issue_close_gate;
 pub mod labels;
 pub mod loom_pr_guard;
 pub mod mergeable_recheck;

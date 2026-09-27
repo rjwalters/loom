@@ -37,6 +37,7 @@ mod merge_pr_delete_branch;
 mod merge_pr_dirty_guard;
 mod merge_pr_head_sync;
 mod merge_pr_hold_state;
+mod merge_pr_issue_close_gate;
 mod merge_pr_labels;
 mod merge_pr_loom_pr_guard;
 mod merge_pr_mergeable_recheck;
