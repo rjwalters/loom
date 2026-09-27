@@ -2185,7 +2185,7 @@ pub(crate) fn print_status_human(
     // Forge event-feed consumer (ADR-0021, #8765). Same block, same reason:
     // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
     // are five different answers that would otherwise all render as nothing.
-    println!("{}", forge_events_line::render(report.forge_events.as_ref(), Utc::now()));
+    println!("{}", forge_events_line::render_block(report.forge_events.as_ref(), Utc::now()));
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
     // alive — but is anything positioned to notice when it *stops* being? Before
