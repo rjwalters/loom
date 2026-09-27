@@ -111,15 +111,21 @@ comment/edit/close/reopen/…`, `gh pr merge|review|ready`, `merge-pr.sh <N>`
 (not `--dry-run`), and `gh api` `POST`/`PATCH`/`PUT`/`DELETE` on
 `repos/<o>/<r>/{issues,pulls}/<N>/…`. Reads (`view`, `list`, `diff`,
 `checks`, `GET`) never count; a command naming another repository (`-R`,
-URL, explicit API path) is refused; a branch name or `$VAR` names nothing.
+URL, explicit API path, `GH_REPO`) or run after a `cd` out of the tick's
+checkout is refused, and one whose repository cannot be told (`cd $DIR`,
+`GH_HOST`, `GIT_DIR`) yields nothing (#9180); a branch name or `$VAR` names
+nothing. Here-document bodies — also `cat<<EOF` and the
+`--body "$(cat <<'EOF' … EOF)"` form — are never parsed as commands.
 
 Each distinct target gets one additional `loom.role_attempt` span in its story
 trace, parented to the story root (`story_context(repo_id, N)`). One batched,
-cached (10 min), time-bounded GraphQL `issueOrPullRequest` lookup says whether
+cached (10 min) GraphQL `issueOrPullRequest` lookup says whether
 the number is an issue — its own story — or a PR, which joins a story by the
 CI stitcher's rule: exactly one same-repo closing issue, counting the
 `feature/issue-N` head branch. Zero or several candidates, a foreign closing
-reference, a failed lookup, or an unresolvable `repo_id` → no story span. The
+reference, a failed lookup, or an unresolvable `repo_id` → no story span.
+The whole lookup — `repo_id` included — shares one 20 s deadline per tick, and
+a failed or rate-limited lookup is not retried for that repository for 60 s. The
 span id is derived from the story root, `loom.role_tick`, the tick's execution
 id (`loom.sweep_id`) and the target (`pr:<M>` / `issue:<N>`), so a re-emit
 yields the same id. It carries `loom.role`, `loom.issue`, `loom.pr_number`
