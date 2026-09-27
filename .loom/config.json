@@ -30,7 +30,8 @@
       "owners": [
         "2amlogic",
         "rjwalters"
-      ]
+      ],
+      "intervalSecs": 600
     }
   },
   "buildGate": {
