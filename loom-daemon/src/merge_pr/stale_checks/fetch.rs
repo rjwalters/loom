@@ -20,8 +20,11 @@
 //!    [`is_plan_gated`]: a source GitHub refuses to serve because the
 //!    repository's plan does not include it cannot be holding rules.
 //! 3. **check runs** — `GET /repos/{nwo}/commits/{sha}/check-runs`
-//!    (`per_page=100`, which covers this repo's largest rollup), projecting
-//!    `name`/`status`/`conclusion`/`started_at` plus the Actions run/job ids.
+//!    (`per_page=100` **and** `--paginate`, so the rows retrieved do not depend
+//!    on how many checks a repo happens to have), projecting
+//!    `name`/`status`/`conclusion`/`started_at` plus the Actions run/job ids —
+//!    and `total_count`, so a read short of the forge's own count fails closed
+//!    instead of yielding a subset (#8987, matching #8895's shell fix).
 //!
 //! Plus, for the input-scoped predicate (#8919), three more:
 //!
@@ -265,23 +268,66 @@ fn fetch_required(
     Ok((seen, notices))
 }
 
-/// The check-runs rollup for the PR head, projected to the guard's fields.
+/// The check-runs rollup for the PR head, projected to the guard's fields —
+/// fully paginated, and failing closed on a short read (#8987).
+///
+/// This mirrors `forge_get_check_runs`' GitHub branch (#8895) rather than
+/// inventing its own contract, because the two answer the same question about
+/// the same endpoint. Both halves matter:
+///
+/// - **`per_page=100` + `--paginate`**: `per_page` alone only moves the cap, so
+///   a repo whose head grows past 100 check-runs would hand the freshness guard
+///   a silent subset. `--paginate` follows the Link header instead.
+/// - **keep `total_count`**: the projection used to drop it, leaving nothing to
+///   compare the row count against. With it, a read short of the forge's own
+///   count is an `Err` — which every caller turns into "refuse the merge" — and
+///   never a partial `Vec<CheckRun>` the guard would evaluate as if complete.
+///
+/// `--jq` runs once per page, so a multi-page read arrives as a stream of
+/// concatenated per-page objects that must be folded here. `total_count` repeats
+/// identically on every page; `max` is the conservative pick for the comparison.
 fn fetch_check_runs(gh: &str, nwo: &str, head_sha: &str) -> Result<Vec<CheckRun>, String> {
     let out = gh_api(gh, &[
-        &format!("repos/{nwo}/commits/{head_sha}/check-runs"),
-        "--method",
-        "GET",
-        "-f",
-        "per_page=100",
+        &format!("repos/{nwo}/commits/{head_sha}/check-runs?per_page=100"),
+        "--paginate",
         "--jq",
-        "[.check_runs[]? | {name: .name, status: .status, conclusion: .conclusion, started_at: .started_at, app: .app.slug, details_url: .details_url, id: .id}]",
+        "{total_count: (.total_count // 0), check_runs: [(.check_runs // [])[] | {name: .name, status: .status, conclusion: .conclusion, started_at: .started_at, app: .app.slug, details_url: .details_url, id: .id}]}",
     ])?;
-    let arr: serde_json::Value =
-        serde_json::from_str(&out).map_err(|e| format!("check-runs response was not JSON: {e}"))?;
-    let arr = arr
-        .as_array()
-        .ok_or_else(|| "check-runs response was not an array".to_string())?;
-    arr.iter()
+
+    let mut total: u64 = 0;
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut pages = 0usize;
+    for page in serde_json::Deserializer::from_str(&out).into_iter::<serde_json::Value>() {
+        let page = page.map_err(|e| format!("check-runs response was not JSON: {e}"))?;
+        pages += 1;
+        total = total.max(
+            page.get("total_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        );
+        let page_rows = page
+            .get("check_runs")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "check-runs page had no check_runs array".to_string())?;
+        rows.extend(page_rows.iter().cloned());
+    }
+    // A `gh` that exited 0 having printed nothing is a degraded read, not an
+    // authoritative "this commit has no checks" — same treatment the shell
+    // helper gives it, for the same reason.
+    if pages == 0 {
+        return Err(format!(
+            "check-runs read for {head_sha} returned no pages (gh exited 0 with empty output)"
+        ));
+    }
+    if (rows.len() as u64) < total {
+        return Err(format!(
+            "check-runs read for {head_sha} was SHORT: got {} of {total} check-runs; \
+failing closed rather than evaluating the freshness guard on a subset (#8987)",
+            rows.len()
+        ));
+    }
+
+    rows.iter()
         .map(|v| {
             let started_at = match v.get("started_at").and_then(|s| s.as_str()) {
                 Some(s) if !s.is_empty() => Some(parse_iso("check run started_at", s)?),
