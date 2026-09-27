@@ -59,6 +59,13 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     // `loom.dispatch.admission` spans (Issue #8907).
     "loom.dispatch.admission_result",
     "loom.dispatch.reason",
+    // `loom.dispatch.disposition` spans (Issue #9222).
+    "loom.queue.disposition",
+    "loom.queue.state",
+    "loom.queue.rank",
+    "loom.queue.transition",
+    "loom.queue.previous_disposition",
+    "loom.queue.park_label",
 ];
 
 /// Longest label value kept, in bytes.
@@ -189,6 +196,11 @@ pub enum MetricName {
     /// Open items carrying a stage label, labelled `state`.
     #[serde(rename = "loom.forge.stage_items")]
     ForgeStageItems,
+    /// Ready-queue rows dropped from a `loom.dispatch.disposition` export
+    /// pass, labelled `reason` = `unresolved` (no forge slug) or `truncated`
+    /// (over the per-call row cap) — Issue #9222.
+    #[serde(rename = "loom.queue.disposition_rows_dropped")]
+    QueueDispositionRowsDropped,
 }
 
 impl MetricName {
@@ -229,6 +241,7 @@ impl MetricName {
             Self::ForgeStageDwell => "loom.forge.stage_dwell",
             Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
             Self::ForgeStageItems => "loom.forge.stage_items",
+            Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
         }
     }
 
@@ -251,7 +264,8 @@ impl MetricName {
             | Self::DispatchSlotTurnaroundSamples
             | Self::DispatchIdleSlotSeconds
             | Self::ForgeStageDwell
-            | Self::ForgeStageDwellSamples => MetricKind::DeltaCounter,
+            | Self::ForgeStageDwellSamples
+            | Self::QueueDispositionRowsDropped => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -282,6 +296,7 @@ impl MetricName {
             | Self::ForgeStageDwell => "s",
             Self::DispatchSlotTurnaroundSamples | Self::DispatchIdleSlots => "{slot}",
             Self::ForgeStageDwellSamples | Self::ForgeStageItems => "{item}",
+            Self::QueueDispositionRowsDropped => "{issue}",
             _ => "By",
         }
     }
@@ -329,6 +344,9 @@ impl MetricName {
             Self::ForgeStageDwell => "Seconds items spent in a forge label stage, by state.",
             Self::ForgeStageDwellSamples => "Stage transitions counted in loom.forge.stage_dwell.",
             Self::ForgeStageItems => "Open items carrying a stage label, by state.",
+            Self::QueueDispositionRowsDropped => {
+                "Ready-queue rows dropped from a disposition export pass, by reason."
+            }
         }
     }
 }

@@ -134,10 +134,23 @@ pub fn publish_tick(
     started_at: chrono::DateTime<chrono::Utc>,
     roots: &[PathBuf],
 ) {
-    let summary = tick_summary(report, max_concurrent, chrono::Utc::now(), roots);
+    // Captured once and threaded through both the summary and the tick span
+    // (Issue #9222): `ops::disposition` matches a later sample's
+    // `WorkFinderTickSummary::at` against `dispatch::last_tick_context()` to
+    // decide whether to parent its spans to this tick, which only works if
+    // the two "this tick completed at" instants are bit-identical rather than
+    // two separate `Utc::now()` reads a few lines apart.
+    let completed_at = chrono::Utc::now();
+    let summary = tick_summary(report, max_concurrent, completed_at, roots);
     crate::observability::ops::queue::record_queue(&summary);
     store_tick_summary(summary);
-    crate::observability::ops::dispatch::record_tick(report, max_concurrent, started_at);
+    crate::observability::ops::dispatch::record_tick(
+        report,
+        max_concurrent,
+        started_at,
+        completed_at,
+        roots,
+    );
     // #8856: queue dwell and starvation, from the same per-issue rows.
     crate::observability::ops::dwell::record_tick(report, roots, started_at);
     // #8929: idle slots, and idle slot-seconds while ready work waited.

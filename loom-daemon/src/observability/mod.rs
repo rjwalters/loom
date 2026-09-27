@@ -115,6 +115,7 @@ pub mod overhead;
 pub mod queue;
 pub mod queue_blocked;
 pub mod queue_snapshot;
+pub mod repo_ref;
 pub mod runtime_usage;
 pub mod sender;
 pub mod session_analysis;

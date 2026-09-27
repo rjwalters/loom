@@ -1353,7 +1353,8 @@ pub fn tick_with_saturation_brake(
         //    double-dispatch of an already-running issue a no-op / loud error.
         let started = chrono::Utc::now();
         let outcome = dispatcher.dispatch(item.number, item.complexity());
-        if record_dispatch_outcome(&mut report, item.number, started, &outcome).0 == Qd::Dispatched
+        if record_dispatch_outcome(&mut report, item.number, 0, started, &outcome).0
+            == Qd::Dispatched
         {
             occupancy += 1;
             admitted_this_tick += 1;
@@ -2016,8 +2017,13 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
         let started = chrono::Utc::now();
         let outcome = dispatcher.dispatch(cand.number, cand.complexity.as_deref());
-        let (disposition, detail) =
-            record_dispatch_outcome(&mut report, cand.number, started, &outcome);
+        let (disposition, detail) = record_dispatch_outcome(
+            &mut report,
+            cand.number,
+            cand.workspace_idx,
+            started,
+            &outcome,
+        );
         ready_queue::resolve(&mut report.queue, &cand, disposition, detail);
         if disposition == Qd::Dispatched {
             occupancy += 1;

@@ -267,6 +267,10 @@ pub struct Admission {
     /// The issue the attempt was for. A span attribute only, never a metric
     /// label.
     pub issue: u32,
+    /// The workspace the issue belongs to, so the exporter (Issue #9222) can
+    /// resolve `loom.repo` from the same `roots` slice every other per-tick
+    /// export already indexes by. A span attribute only, never a metric label.
+    pub workspace_idx: usize,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     /// `dispatched`, `in_flight` (idempotency no-op), `refused` (a deliberate,
@@ -278,7 +282,8 @@ pub struct Admission {
 
 impl PartialEq for Admission {
     fn eq(&self, other: &Self) -> bool {
-        (self.issue, self.result, self.reason) == (other.issue, other.result, other.reason)
+        (self.issue, self.workspace_idx, self.result, self.reason)
+            == (other.issue, other.workspace_idx, other.result, other.reason)
     }
 }
 
@@ -321,12 +326,14 @@ impl Outcome {
 pub fn record_dispatch_outcome(
     report: &mut TickReport,
     issue: u32,
+    workspace_idx: usize,
     started_at: DateTime<Utc>,
     outcome: &Result<bool>,
 ) -> (Qd, Option<String>) {
     let counted = classify(report, issue, outcome);
     report.admissions.push(Admission {
         issue,
+        workspace_idx,
         started_at,
         ended_at: Utc::now().max(started_at),
         result: counted.result,
