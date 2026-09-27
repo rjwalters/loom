@@ -80,6 +80,16 @@
 //! fixes two ways the retired `grep | tail -1 | sed` pipeline lost the warning
 //! silently, which for a check nothing else duplicates is the whole risk.
 //!
+//! [`stacked_children`] is the LAST pre-merge gate `merge-pr.sh` still ran
+//! inline: the merge-ordering guard (#3747 item 2, reshaped by #7982). It is
+//! the only member of the family that does not merely decide — it *establishes*
+//! the postcondition a later step needs, pinning the parent tip to
+//! `refs/loom/parent/<branch>` so `reconcile-stack.sh` can still resolve a
+//! branch the merge API deletes synchronously underneath it. That is also why it
+//! is the only gate here that fails OPEN: it protects a best-effort cleanup
+//! step, not the question of whether this tree may merge, and the fail-closed
+//! [`labels`] gate runs on the same binary later in the same script.
+//!
 //! [`version_policy`] is the pre-merge no-hand-bump guard (#7827) and its
 //! oracle choice (#8284): everything `merge-pr.sh` wrapped around the
 //! canonical `check-defaults-version-bump.sh` — fetch, ancestry, which ref's
@@ -93,6 +103,7 @@ pub mod labels;
 pub mod loom_pr_guard;
 pub mod redate;
 pub mod refs;
+pub mod stacked_children;
 pub mod stale_checks;
 pub mod version_policy;
 pub mod zero_checks;

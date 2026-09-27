@@ -613,130 +613,67 @@ if [[ "$PR_STATE" == "closed" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Pre-merge merge-ordering guard (#3747, stacked-PR v2 item 2).
+# Pre-merge merge-ordering guard (#3747, stacked-PR v2 item 2; reshaped by
+# #7982 into pin-and-warn).
 #
 # Runs BEFORE both the auto-merge and synchronous-merge paths (that is why it is
-# defined and invoked here, above the "Merging PR" line — not next to item 1's
-# POST-merge _auto_reconcile_stacked_children at the bottom of the merge flow).
+# invoked here, above the "Merging PR" line — not next to item 1's POST-merge
+# _auto_reconcile_stacked_children at the bottom of the merge flow).
 #
-# The race it closes: when a stacked PARENT PR (branch feature/issue-<N>)
-# merges, item 1's post-merge _auto_reconcile_stacked_children rebases any
-# open CHILD PRs off the parent branch onto the default branch (the
-# rebase --onto re-root is merge-method-agnostic). That
-# rebase (reconcile-stack.sh's `git rebase --onto <default> <parent-branch>
-# <child-branch>`) needs <parent-branch> to still resolve as a ref. But Loom's own
-# recommended repo setting — delete_branch_on_merge:true, applied by
-# setup-repository-settings.sh — makes GitHub delete feature/issue-<parent>
-# SYNCHRONOUSLY as part of the merge API call itself, before merge-pr.sh even
-# reaches the "merged successfully" log line, let alone the post-merge reconcile
-# step. Once the ref is gone a fresh fetch won't see it and the rebase's <upstream>
-# fails to resolve. Item 1's post-merge pass can therefore race and LOSE against
-# the repo's own settings. This guard refuses to let the parent merge happen at
-# all while that race exists.
+# The decision is `loom-daemon merge-pr stacked-children` (Rust,
+# loom-daemon/src/merge_pr/stacked_children.rs — #8191 slice): discover open
+# CHILD PRs still targeting this parent branch via a LIVE forge query (never the
+# daemon registry), then ESTABLISH the postcondition reconcile-stack.sh needs by
+# pinning the parent tip to refs/loom/parent/<branch> rather than merely
+# asserting it — GitHub deletes the branch synchronously inside the merge call,
+# so item 1's post-merge rebase would otherwise race the repo's own
+# delete_branch_on_merge setting and lose. It hard-blocks on exactly one case:
+# the tip could not be pinned at all. --allow-stacked-children skips past that
+# block; --dry-run reports the would-be outcome and writes no ref.
 #
-# This is orthogonal to item 1's loom:building safe/unsafe split: a "safe" child
-# is just as exposed to branch deletion as an "unsafe" one, so the guard keys
-# PURELY on "does an open child PR still target this branch", never on the child's
-# label. Discovery reuses item 1's live-forge-query shape (`gh pr list --base
-# <parent> --state open`), NOT the ephemeral daemon registry.
+# It emits `CHILDREN`/`PIN-WRITTEN`/`WARNING`/`BLOCK<TAB>line` records, replayed
+# below through this script's own warning/error so the operator-visible text is
+# unchanged from before the port. `CHILDREN` carries the pre-merge snapshot the
+# post-merge reconcile prefers (#8010 item 2); `PIN-WRITTEN` fires only where a
+# ref was actually written, which is what the item-3 re-pin must gate on (a
+# bypass finds children without pinning). The two globals are plain (non-local)
+# assignments so they survive this function returning, and are read as
+# `${VAR:-}` everywhere else so a standalone invocation still behaves as before.
 #
-# #7982: the guard used to hard-block unconditionally here. The failure it
-# protects against is narrow and concrete — reconcile-stack.sh's rebase needs
-# `<parent-branch>` to still resolve as a ref AFTER the forge deletes it — and
-# the parent's tip is already known at merge time (PR_HEAD_SHA), so the guard
-# can ESTABLISH that postcondition itself instead of just asserting it. Default
-# behavior is now: pin the parent tip to refs/loom/parent/<branch> (a plain,
-# non-per-worktree ref, so every worktree of this repo can see it) and proceed
-# with a loud WARNING naming each child PR and the exact reconcile-stack.sh
-# invocation. reconcile-stack.sh falls back to that ref when the branch name no
-# longer resolves. The guard hard-blocks (error, exit 1) ONLY when the tip could
-# not be pinned (a detached/unreadable parent) — that is when the original
-# failure is genuinely still reachable. --allow-stacked-children skips straight
-# past that remaining block (operator asserts the children are reconciled).
-# --dry-run never mutates local refs; it reports the would-be outcome without
-# pinning or exiting 1.
+# Exit 1 WITH a BLOCK record refuses; any other non-zero is a guard FAULT and
+# warns-and-proceeds. Unlike every gate below this one, that is fail-OPEN, and
+# deliberately: this guard protects a best-effort POST-merge cleanup step, not
+# the question of whether this tree may merge, so a skip costs one manual
+# reconcile against a SHA the warning prints — while failing closed would stop
+# every merge on a host whose daemon lags one release, nearly all of which have
+# no stacked children at all. It is also safe by construction: the fail-CLOSED
+# `verdict-contradiction` gate runs on this same binary further down, so a
+# daemon too old for this verb cannot reach the merge anyway. Full argument:
+# the module docs on loom-daemon/src/merge_pr/stacked_children.rs.
 #
-# This file is over the file-size threshold and ratcheted
-# (.loom/docs/file-size-policy.md), and a sibling shell lib is not available as
-# a remedy here — `contract` is baseline-only in scripts/shell-allowlist.txt,
-# so a NEW `.sh` cannot be justified by "merge-pr.sh sources it"
-# (.loom/docs/shell-language-policy.md). #7982 therefore takes the policy's
-# other remedy — "remove at least as much as you added from the same file" —
-# and the block below is written densely on purpose: it replaces the old
-# unconditional-block tail at a net code-line saving, keeping the ratchet
-# intact without inventing an unjustifiable file.
+# _mp_daemon_roll_hint is not yet defined this early in the script (it lands
+# with the version-floor block below), hence the `declare -F` probe and the
+# inline roll command — a best-effort diagnostic must never be able to abort
+# the warning it decorates.
 _check_no_open_stacked_children() {
-  # Only GitHub, and only a parent PR on a feature/issue-<N> branch, can have
-  # stacked children — identical guard conditions to
-  # _auto_reconcile_stacked_children. No-op (byte-for-byte unchanged behavior)
-  # otherwise.
+  # Only GitHub can have Loom-style stacked children; the parent-branch shape
+  # gate is the Rust side's (it returns before any forge call).
   [[ "$FORGE_TYPE" == "github" ]] || return 0
-  [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]] || return 0
-
-  # Live forge discovery — NEVER the daemon registry. Same call/shape item 1
-  # already makes; plain `gh` (uncached) so we see child PRs as of right now.
-  local children_json count child_list
-  children_json="$(gh pr list --repo "$REPO_NWO" --base "$PR_BRANCH" --state open \
-    --json number,headRefName 2>/dev/null || echo '[]')"
-  [[ -n "$children_json" ]] || return 0
-  count="$(echo "$children_json" | jq 'length' 2>/dev/null || echo 0)"
-  [[ "$count" -gt 0 ]] || return 0
-
-  # Captured for the POST-merge reconcile pass (#8010 item 2) —
-  # _auto_reconcile_stacked_children below prefers this pre-merge snapshot
-  # over a fresh post-merge query: GitHub retargets an open child PR the
-  # instant delete_branch_on_merge removes this parent branch, so a query run
-  # AFTER the merge can return zero rows even though children existed seconds
-  # earlier. A plain (non-local) assignment so it survives this function
-  # returning — read via `${STACKED_CHILDREN_JSON:-}` everywhere else so a
-  # standalone invocation of either function (e.g. from a test) without this
-  # guard having run first still behaves exactly as before.
-  STACKED_CHILDREN_JSON="$children_json"
-
-  # Comma-separated "#N" list for the operator-facing message.
-  child_list="$(echo "$children_json" \
-    | jq -r '[.[].number | "#" + tostring] | join(", ")' 2>/dev/null || echo '')"
-
-  # Operator opt-in bypass (mirrors the --worktree-path sentinel-bypass precedent):
-  # the operator asserts responsibility for having reconciled/verified the children.
-  if [[ "$ALLOW_STACKED_CHILDREN" == "true" ]]; then
-    warning "Merge-ordering guard: --allow-stacked-children set; proceeding despite $count open stacked child PR(s) ($child_list) targeting '$PR_BRANCH' (operator asserts they are reconciled)"
-    return 0
-  fi
-
-  # One ready-to-paste reconcile-stack.sh invocation per child, reused verbatim
-  # by both the warn and the block message below, so the operator never has to
-  # assemble the command themselves.
-  local pin="refs/loom/parent/$PR_BRANCH" cmds
-  cmds="$(echo "$children_json" | jq -r --arg p "$PR_BRANCH" '.[] | "  ./.loom/scripts/reconcile-stack.sh " + (.number|tostring) + " " + $p' 2>/dev/null || echo "  ./.loom/scripts/reconcile-stack.sh <child-pr> $PR_BRANCH")"
-
-  # --dry-run reports the predicted outcome and mutates NOTHING (no ref is
-  # written), honoring the dry-run contract (dry-run always exits 0).
-  if [[ "$DRY_RUN" == "true" ]]; then
-    warning "[dry-run] $count open stacked child PR(s) ($child_list) still target '$PR_BRANCH'. A real run would pin the parent tip to $pin and proceed with a warning naming each child, or hard-block if the tip could not be pinned. No ref was written."
-    return 0
-  fi
-
-  # Pin the parent's tip so the postcondition reconcile-stack.sh needs is
-  # ESTABLISHED rather than asserted. The ref must point at an object this repo
-  # actually has — a ref to a missing object is useless to a later rebase — so
-  # verify the object locally, fetch the branch once if it is absent, and
-  # re-verify. All three failing means a detached/unreadable parent.
-  if { git -C "$REPO_ROOT" cat-file -e "${PR_HEAD_SHA}^{commit}" 2>/dev/null || git -C "$REPO_ROOT" fetch --quiet origin "$PR_BRANCH" 2>/dev/null; } && git -C "$REPO_ROOT" cat-file -e "${PR_HEAD_SHA}^{commit}" 2>/dev/null && git -C "$REPO_ROOT" update-ref "$pin" "$PR_HEAD_SHA" 2>/dev/null; then
-    # Non-local global, mirroring STACKED_CHILDREN_JSON above: unlike that
-    # var (set as soon as an open child is FOUND), this one is set only once
-    # a pin is actually WRITTEN — the item-3 re-pin below must gate on this,
-    # not on STACKED_CHILDREN_JSON, or the --allow-stacked-children bypass
-    # path (which returns above without ever reaching this line) would still
-    # trip the re-pin and write a ref the guard itself chose not to create.
-    STACKED_CHILDREN_PIN_WRITTEN=true; warning "Merge-ordering guard: PR #$PR_NUMBER's branch '$PR_BRANCH' still has $count open stacked child PR(s) ($child_list) targeting it. Pinned the parent tip to $pin ($PR_HEAD_SHA) so reconcile-stack.sh can still resolve '$PR_BRANCH' after the merge deletes it (#3747 item 2, #7982). Proceeding with the merge — reconcile each child once this has landed:"$'\n'"$cmds"
-    return 0
-  fi
-
-  # Pin failed: this is the one case where the original #3747 race is genuinely
-  # still reachable, so the guard still hard-blocks (a normal, recoverable
-  # failure Champion's cron retries next tick).
-  error "Merge blocked: PR #$PR_NUMBER's branch '$PR_BRANCH' still has $count open stacked child PR(s) ($child_list) targeting it, and its tip ($PR_HEAD_SHA) could not be pinned to $pin — a detached or unreadable parent. Merging now would race the repo's delete_branch_on_merge setting: GitHub deletes '$PR_BRANCH' synchronously during the merge, before the child PR(s) can be rebased/retargeted onto the default branch — leaving reconcile-stack.sh's rebase unable to resolve the parent branch ref (#3747 item 2). Reconcile each child first (from a clean checkout), then re-run this merge:"$'\n'"$cmds"$'\n'"Or, if you have already verified/reconciled them, re-run with --allow-stacked-children to bypass this guard."
+  local out rc=0 level text children_json="" warn="" blk="" flags=()
+  [[ "${DRY_RUN:-false}" != "true" ]] || flags+=(--dry-run)
+  [[ "${ALLOW_STACKED_CHILDREN:-false}" != "true" ]] || flags+=(--allow-stacked-children)
+  out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr stacked-children --repo "$REPO_NWO" --repo-root "$REPO_ROOT" --branch "$PR_BRANCH" --head-sha "$PR_HEAD_SHA" --pr "$PR_NUMBER" ${flags[@]+"${flags[@]}"})" || rc=$?
+  while IFS=$'\t' read -r level text; do case "$level" in
+    CHILDREN) children_json="$text" ;;
+    PIN-WRITTEN) STACKED_CHILDREN_PIN_WRITTEN=true ;;
+    WARNING) warn+="${warn:+$'\n'}$text" ;;
+    BLOCK) blk+="${blk:+$'\n'}$text" ;;
+  esac; done <<< "$out"
+  [[ -z "$children_json" ]] || STACKED_CHILDREN_JSON="$children_json"
+  [[ -z "$warn" ]] || warning "$warn"
+  [[ $rc -ne 1 || -z "$blk" ]] || error "$blk"
+  [[ $rc -eq 0 ]] || warning "The merge-ordering guard (#3747 item 2) did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr stacked-children' exited $rc (a loom-daemon predating #8191's slice has no such verb). Proceeding, because this guard establishes a postcondition for the POST-merge stacked reconcile rather than judging this tree: a skip costs at most one manual './.loom/scripts/reconcile-stack.sh <child-pr> $PR_BRANCH' against tip $PR_HEAD_SHA, never a wrong merge. Restore it by rolling this host: ${SCRIPT_DIR:-.loom/scripts}/cli/loom-daemon-update.sh --fetch. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+  return 0
 }
 
 # Invoke the guard before either merge path attempts the actual merge API call.
