@@ -98,6 +98,12 @@
 //! could not be corroborated", not "this branch genuinely conflicts"). The
 //! I/O loop stays in the shell so the retained suite's stubs keep driving
 //! the real code path; only the terminal classification moved.
+//!
+//! [`partial_reset`] is the post-merge partial-increment label reset
+//! (#3667, with #4569's premature-auto-close revert): given a fresh read of a
+//! `Part of #N` issue and what the pre-merge conflict guard recorded about it,
+//! the ordered log / reopen / swap steps. The `jq` reads it replaces are
+//! modelled filter-by-filter, and the mutations stay in the shell.
 
 //! [`version_policy`] is the pre-merge no-hand-bump guard (#7827) and its
 //! oracle choice (#8284): everything `merge-pr.sh` wrapped around the
@@ -122,6 +128,7 @@ pub mod hold_state;
 pub mod labels;
 pub mod loom_pr_guard;
 pub mod mergeable_recheck;
+pub mod partial_reset;
 pub mod redate;
 pub mod refs;
 pub mod stacked_children;

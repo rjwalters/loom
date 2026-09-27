@@ -475,6 +475,14 @@ pub(crate) enum MergePrCommand {
     /// The worktree path with `--branch` checked out, from porcelain on stdin.
     /// Empty at exit 0 when no worktree holds it.
     WorktreeFindByBranch(super::merge_pr_worktrees::WorktreeFindByBranchArgs),
+
+    /// The post-merge partial-increment label reset decision (#3667/#4569):
+    /// from the referenced issue's fresh body on stdin plus the pre-merge
+    /// guard's `--conflicted` / `--open-before-merge` facts, the ordered
+    /// `INFO`/`WARNING<TAB>text`, `REOPEN` and `SWAP` steps the shell
+    /// performs. Exit 0 with the plan (empty = silent skip, a PR), 2 = stdin
+    /// unreadable — see `cli::merge_pr_partial_reset`.
+    PartialReset(super::merge_pr_partial_reset::PartialResetArgs),
 }
 
 impl MergePrCommand {
@@ -495,6 +503,7 @@ impl MergePrCommand {
             MergePrCommand::WorktreePrimary(args) => args.run(),
             MergePrCommand::WorktreeBranchFor(args) => args.run(),
             MergePrCommand::WorktreeFindByBranch(args) => args.run(),
+            MergePrCommand::PartialReset(args) => args.run(),
         }
     }
 }
