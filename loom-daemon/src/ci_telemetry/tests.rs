@@ -921,8 +921,19 @@ fn records_emit_exactly_the_declared_vocabulary() {
 // ---------------------------------------------------------------------------
 // Config, the log-capture gate, and export
 // ---------------------------------------------------------------------------
+//
+// Isolation rule (#8976): `resolve()` reads process-wide env (`ENABLED_ENV`,
+// `ORG_ENV`, `INTERVAL_SECS_ENV`, `LOG_CAPTURE_ENABLED_ENV`,
+// `LOG_CAPTURE_MAX_BYTES_ENV`) and `env_overrides_config` *mutates* it, so
+// EVERY test below that reaches `resolve()` — or reads one of those vars
+// directly — carries `#[serial_test::serial]`. `#[serial]` only serializes
+// against other `#[serial]` tests; one unmarked reader is enough to observe
+// the setter's vars mid-flight (the original symptom was
+// `interval_secs: left: 45, right: 120`). Mark new tests here the same way
+// rather than auditing which fields a given assertion happens to touch.
 
 #[test]
+#[serial_test::serial]
 fn config_defaults_are_flags_off_and_config_values_resolve() {
     let resolved = resolve(&CiTelemetryConfig::default());
     assert!(!resolved.enabled);
@@ -1022,6 +1033,7 @@ fn env_overrides_config() {
 /// signal — so it needs its own key rather than reusing the coarse one that
 /// would also drop the repo's unconditional metrics).
 #[test]
+#[serial_test::serial]
 fn log_capture_exclusions_need_a_reason_and_committed_config() {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
@@ -1067,6 +1079,7 @@ fn log_capture_exclusions_need_a_reason_and_committed_config() {
 /// committed config. Anything else is refused by name and the repo stays
 /// polled — the failure direction is "capture", never "silently drop".
 #[test]
+#[serial_test::serial]
 fn exclusions_without_a_reason_or_outside_committed_config_are_refused() {
     let (admitted, refused) = parse_exclusions(&serde_json::json!([
         {"repo": "kept-out", "reason": "vendored mirror"},
@@ -1113,6 +1126,7 @@ fn exclusions_without_a_reason_or_outside_committed_config_are_refused() {
 }
 
 #[test]
+#[serial_test::serial]
 fn spawn_task_is_inert_when_disabled() {
     if std::env::var(ENABLED_ENV).is_ok() {
         return;
