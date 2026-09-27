@@ -255,7 +255,26 @@ pub fn discover(
 ) -> Result<Vec<RepoJson>, ApiError> {
     let mut cache = state::load_discovery_cache(dir);
     let first = kind.discovery_path(login);
-    let base = first.split('?').next().unwrap_or_default().to_string();
+    // The owner's previously cached chain (page 1 plus however many pages
+    // followed it last time), walked from `cache` as it stood before this
+    // call. Needed because GitHub's page-2+ `Link` targets do NOT reuse the
+    // login-based first-page path — an org's next page is
+    // `organizations/{id}/repos?...`, a user's is `user/{id}/repos?...` —
+    // so a page-2+ entry can only be identified by following the chain, never
+    // by string-matching the first page's path (#9197 item 2). Without this,
+    // a page that stops appearing (the owner's repo count crosses back below
+    // a page boundary) is never pruned and lingers in the shared cache file
+    // forever.
+    let mut previous_chain = HashSet::new();
+    {
+        let mut cursor = Some(first.clone());
+        while let Some(path) = cursor.take() {
+            if !previous_chain.insert(path.clone()) {
+                break;
+            }
+            cursor = cache.get(&path).and_then(|page| page.next.clone());
+        }
+    }
     let mut refreshed = state::DiscoveryCache::new();
     let mut repos = Vec::new();
     let mut visited = HashSet::new();
@@ -289,7 +308,7 @@ pub fn discover(
             refreshed.insert(path, page);
         }
     }
-    cache.retain(|path, _| path.split('?').next() != Some(base.as_str()));
+    cache.retain(|path, _| !previous_chain.contains(path));
     cache.extend(refreshed);
     if let Err(error) = state::save_discovery_cache(dir, &cache) {
         log::warn!("ci_telemetry: could not persist the discovery ETag cache: {error}");

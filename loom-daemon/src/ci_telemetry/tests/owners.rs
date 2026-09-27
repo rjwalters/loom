@@ -268,6 +268,94 @@ fn a_failed_kind_probe_skips_only_that_owner_names_it_and_retries_next_cycle() {
 }
 
 #[test]
+fn a_rate_limit_on_the_second_owners_kind_lookup_aborts_the_whole_cycle() {
+    // #9197 item 4: a rate limit is org-wide, so it must abort the cycle even
+    // when it surfaces on the *second* owner's `resolve_kind` probe, not on
+    // discovery or a per-repo request.
+    let dir = TempDir::new().unwrap();
+    let api = two_owner_api();
+    api.set_override(
+        &format!("users/{USER}"),
+        ApiResponse {
+            status: 429,
+            retry_after_secs: Some(60),
+            ..ApiResponse::default()
+        },
+    );
+    let before = super::poll::BREAKER_NOTIFICATIONS.with(std::cell::Cell::get);
+    let result = run_cycle(&two_owners(dir.path(), Arc::default()), &api);
+    let Err(error @ CycleError::RateLimited { .. }) = result else {
+        panic!("a rate limit on the second owner's kind lookup must abort the cycle: {result:?}");
+    };
+    assert!(!matches!(error, CycleError::CredentialRejected { .. }));
+    assert_eq!(super::poll::BREAKER_NOTIFICATIONS.with(std::cell::Cell::get), before + 1);
+    // Nothing after the first owner's discovery ran: no repo request at all.
+    let paths = requested(&api);
+    assert!(
+        !paths.iter().any(|p| p.contains("/actions/runs")),
+        "the cycle aborted before any repo was polled: {paths:?}"
+    );
+}
+
+#[test]
+fn a_401_on_the_second_owners_kind_lookup_aborts_the_cycle_as_credential_rejected() {
+    // #9197 item 4: a rejected credential aborts the cycle exactly as it does
+    // during discovery or a repo request (#8850) — including when the 401
+    // lands on the second owner's `GET /users/{owner}` kind probe.
+    let dir = TempDir::new().unwrap();
+    let api = two_owner_api();
+    api.set_override(
+        &format!("users/{USER}"),
+        ApiResponse {
+            status: 401,
+            body: "{\"message\":\"Bad credentials\"}".into(),
+            ..ApiResponse::default()
+        },
+    );
+    let result = run_cycle(&two_owners(dir.path(), Arc::default()), &api);
+    let Err(CycleError::CredentialRejected { .. }) = result else {
+        panic!(
+            "a 401 on the second owner's kind lookup must abort as CredentialRejected: {result:?}"
+        );
+    };
+    let paths = requested(&api);
+    assert!(
+        !paths.iter().any(|p| p.contains("/actions/runs")),
+        "the cycle aborted before any repo was polled: {paths:?}"
+    );
+}
+
+#[test]
+fn a_resolved_kind_is_still_reported_when_discovery_itself_fails() {
+    // #9197 item 3: `resolve_kind` can succeed (the owner IS a User/Org) while
+    // the follow-on `discover()` call fails — a transient 404/5xx on the
+    // listing endpoint, not on `GET /users/{owner}`. `status` must still
+    // report the resolved kind, not `null`, for that owner.
+    let dir = TempDir::new().unwrap();
+    let api = two_owner_api();
+    api.set_override(
+        USER_REPOS,
+        ApiResponse {
+            status: 404,
+            body: "{\"message\":\"Not Found\"}".into(),
+            ..ApiResponse::default()
+        },
+    );
+    let report = run_cycle(&two_owners(dir.path(), Arc::default()), &api).unwrap();
+    let user_row = report
+        .owners
+        .iter()
+        .find(|row| row.owner == USER)
+        .expect("the user owner is still reported, just as failed");
+    assert_eq!(user_row.kind, Some(OwnerKind::User), "the kind probe succeeded");
+    assert!(user_row.error.is_some(), "{user_row:?}");
+
+    let status = state::load_status(&state_dir(dir.path()));
+    let persisted = status.owners.iter().find(|row| row.owner == USER).unwrap();
+    assert_eq!(persisted.kind, Some(OwnerKind::User), "{persisted:?}");
+}
+
+#[test]
 fn only_when_every_owner_fails_is_the_cycle_discovery_failed() {
     let dir = TempDir::new().unwrap();
     let ctx = CycleContext {
@@ -308,6 +396,77 @@ fn a_declared_org_makes_exactly_the_pre_owners_requests() {
             format!("orgs/{ORG}/repos?per_page=100&type=all"),
             format!("orgs/{ORG}/repos?per_page=100&type=all&page=2"),
         ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #9197 item 2: page-2+ links use GitHub's real `organizations/{id}/…` /
+// `user/{id}/…` shape, not the owner's login — a stale one must still prune.
+// ---------------------------------------------------------------------------
+
+/// A repo listing page whose body is exactly `names`.
+fn repo_page(names: &[&str], next: Option<&str>) -> ApiResponse {
+    let body = serde_json::to_string(
+        &names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "full_name": format!("{ORG}/{name}"),
+                    "private": false,
+                    "archived": false,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    ApiResponse {
+        status: 200,
+        etag: Some(format!("W/\"{}\"", names.join("-"))),
+        next: next.map(str::to_string),
+        body,
+        ..ApiResponse::default()
+    }
+}
+
+#[test]
+fn a_stale_page_2_in_githubs_real_organizations_id_shape_is_pruned_once_it_stops_appearing() {
+    // GitHub answers `GET /orgs/{org}/repos`'s page 2 at
+    // `organizations/{id}/repos?...`, never at `orgs/{org}/repos?...&page=2`
+    // (the shape every other fixture in this file happens to use, which
+    // never exercised the bug: its page-2 path shares the first page's
+    // login-based prefix, so the old base-string-match pruning accidentally
+    // matched anyway).
+    let dir = TempDir::new().unwrap();
+    let first = format!("orgs/{ORG}/repos?per_page=100&type=all");
+    let real_page_2 = "organizations/987654/repos?per_page=100&type=all&page=2".to_string();
+
+    // Cycle 1: two pages, the second in the real `organizations/{id}` shape.
+    let api = FixtureApi::new();
+    api.set_override(&first, repo_page(&["alpha"], Some(&real_page_2)));
+    api.set_override(&real_page_2, repo_page(&["beta"], None));
+    let report = run_cycle(&ctx(dir.path()), &api).unwrap();
+    assert_eq!(report.summary.repos_polled, 2, "{:?}", report.repo_errors);
+    let cache = state::load_discovery_cache(&state_dir(dir.path()));
+    let mut keys: Vec<_> = cache.keys().cloned().collect();
+    keys.sort();
+    let mut expected = vec![first.clone(), real_page_2.clone()];
+    expected.sort();
+    assert_eq!(keys, expected, "both pages, including the real-shape page 2, are cached");
+
+    // Cycle 2: the owner now fits on one page — `beta` merged away, no
+    // `next` at all. The stale `organizations/987654/...` entry must be
+    // pruned, not left to rot in the shared cache file forever.
+    let api = FixtureApi::new();
+    api.set_override(&first, repo_page(&["alpha"], None));
+    let report = run_cycle(&ctx(dir.path()), &api).unwrap();
+    assert_eq!(report.summary.repos_polled, 1, "{:?}", report.repo_errors);
+    let cache = state::load_discovery_cache(&state_dir(dir.path()));
+    let keys: Vec<_> = cache.keys().cloned().collect();
+    assert_eq!(
+        keys,
+        vec![first],
+        "the stale real-shape page-2 entry was pruned, not left behind"
     );
 }
 

@@ -218,6 +218,10 @@ fn status(root: &Path, json: bool) -> Result<()> {
     };
     if json {
         let value = serde_json::json!({
+            // Deprecated alias of `owners` (#9188): the comma-joined logins,
+            // exactly as `status.json` (`PollStatus::org`) already writes —
+            // #9197 item 1, dropped when `owners`/`owners_source` replaced it.
+            "org": poll_status.org,
             "owners": owners,
             "owners_source": resolved.owners_source,
             "daemon_poller_enabled": resolved.enabled,
