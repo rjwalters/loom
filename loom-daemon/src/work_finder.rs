@@ -2388,8 +2388,8 @@ where
     );
     tokio::spawn(async move {
         // An `Interval` that a `forge.event` prompt may also tick early
-        // (#8766). Disarmed unless `forgeEvents.events.workFinderTick` is on,
-        // in which case it is exactly `tokio::time::interval(interval)`.
+        // (#8766). Disarmed unless `forgeEvents.events.workFinderTick` is on;
+        // otherwise it is exactly `tokio::time::interval(interval)`.
         let mut ticker = crate::forge_events::wake::EarlyTicker::for_work_finder(
             interval,
             &event_bus,

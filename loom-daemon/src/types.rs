@@ -1826,7 +1826,7 @@ pub use observability_export::{
 };
 
 mod forge_events;
-pub use forge_events::{ForgeEventsState, ForgeEventsStatus};
+pub use forge_events::{ForgeEventsState, ForgeEventsStatus, ForgeEventsWakeStatus};
 
 /// One work-finder tick's dispatch/skip tally, stamped with the wall-clock
 /// time it completed and the dynamic cap it ran under (Issue #4761).

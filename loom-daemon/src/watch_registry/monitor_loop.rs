@@ -36,7 +36,7 @@ use super::{run_one_tick, WatchProbe};
 /// empty-registry short-circuit means an early tick on a host with no watches
 /// costs one file read and zero forge calls. Disarmed — holding no bus
 /// subscription at all — unless `forgeEvents.events.inFlightPrWatch` is on for
-/// `root`, in which case [`EarlyTicker`] is exactly the
+/// `root`; otherwise [`EarlyTicker`] is exactly the
 /// `tokio::time::interval(interval)` this loop used before.
 pub fn spawn_watch_monitor_task<P>(
     probe: P,
