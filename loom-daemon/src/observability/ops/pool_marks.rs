@@ -192,24 +192,45 @@ pub fn mark_claude_bad(
     Ok(())
 }
 
-/// The `loom.pool.hold` span for a hold armed at `since` and cleared at
-/// `cleared`: its own sampled root trace.
+/// A pool's stable, non-reversible identity: the first 16 hex of SHA-256 over
+/// its resolved directory path. Holds are keyed by pool directory, so this is
+/// what distinguishes two pools whose holds armed in the same tick; hashing
+/// keeps the path (and the home directory in it) on the host.
+#[must_use]
+pub fn pool_id(dir: &Path) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(dir.as_os_str().as_encoded_bytes());
+    hex::encode(digest)[..16].to_owned()
+}
+
+/// The `loom.pool.hold` span for pool `pool` (a [`pool_id`]) holding from
+/// `since` to `cleared`: its own sampled root trace, its ID derived from the
+/// pool and `since` — a hold re-reported after a restart keeps its trace, and
+/// two pools armed in the same tick (one shared `since`) stay distinct. The
+/// span carries both inputs (`loom.pool.hold.pool`, its start time).
 #[must_use]
 pub fn hold_span(
+    pool: &str,
     since: DateTime<Utc>,
     cleared: DateTime<Utc>,
     post_mortem: bool,
     accounts: usize,
 ) -> SpanRecord {
     let attributes: TraceAttributes = [
+        ("loom.pool.hold.pool", pool.to_owned()),
         ("loom.pool.hold.post_mortem", post_mortem.to_string()),
         ("loom.pool.hold.accounts", accounts.to_string()),
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value))
     .collect();
+    let mut attributes = attributes;
+    crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
-        context: TraceContext::root(true),
+        context: TraceContext::derived(
+            SpanName::PoolHold.as_str(),
+            &[pool, &crate::telemetry::trace::instant(since)],
+        ),
         parent_span_id: None,
         name: SpanName::PoolHold,
         started_at: since,
@@ -221,14 +242,16 @@ pub fn hold_span(
     }
 }
 
-/// Export one cleared pool hold. A no-op when no ops sink is registered.
+/// Export one cleared hold of the pool at `dir`. A no-op when no ops sink is
+/// registered.
 pub fn record_pool_hold(
+    dir: &Path,
     since: DateTime<Utc>,
     cleared: DateTime<Utc>,
     post_mortem: bool,
     accounts: usize,
 ) {
-    super::emit_span(hold_span(since, cleared, post_mortem, accounts));
+    super::emit_span(hold_span(&pool_id(dir), since, cleared, post_mortem, accounts));
 }
 
 #[cfg(test)]

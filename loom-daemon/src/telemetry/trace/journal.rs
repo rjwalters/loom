@@ -188,6 +188,7 @@ impl Journal {
             return Ok(active.clone());
         }
         let mut attributes = attributes;
+        super::provenance::stamp(&mut attributes);
         if name == SpanName::RoleAttempt {
             let role = attributes.get("loom.role");
             let attempt = entries.iter().filter(|e| matches!(e, Entry::Started(s) if s.record.name == name && s.record.attributes.get("loom.role") == role)).count() + 1;
