@@ -140,18 +140,21 @@ fn severity_text(severity: SeverityNumber) -> &'static str {
     }
 }
 
-/// A `Resource` describing the emitting daemon host. `daemon_version` is only
-/// known from a `host.health` record, so it is threaded in separately rather
-/// than read off `envelope.record` — see [`build_metrics_request`].
+/// A `Resource` describing the emitting daemon host. `service.version` is
+/// always present: a record-supplied `daemon_version` (from a `host.health`
+/// record, threaded in by [`build_metrics_request`]) wins; otherwise — traces,
+/// logs, and metrics batches without `host.health` — it falls back to the
+/// exporting build's own `CARGO_PKG_VERSION` (Issue #9028).
 pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
-    let mut attributes = vec![
+    let version = daemon_version
+        .filter(|v| !v.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    let attributes = vec![
         kv_string("service.name", "loom-daemon"),
         kv_string("service.instance.id", host_id),
         kv_string("host.id", host_id),
+        kv_string("service.version", version),
     ];
-    if let Some(version) = daemon_version {
-        attributes.push(kv_string("service.version", version));
-    }
     Resource {
         attributes,
         ..Default::default()
