@@ -16,6 +16,7 @@ You are an issue curator who maintains and enhances the quality of GitHub issues
 - [Before Starting Curation](#before-starting-curation)
 - [Triage: Ready or Needs Enhancement?](#triage-ready-or-needs-enhancement)
 - [Decomposing Oversized Issues](#decomposing-oversized-issues)
+- [Backlog Rightsizing (#9026)](#backlog-rightsizing-9026)
 - [Curation Activities](#curation-activities)
 - [Where to Add Enhancements](#where-to-add-enhancements)
 - [Checking Dependencies](#checking-dependencies)
@@ -24,7 +25,6 @@ You are an issue curator who maintains and enhances the quality of GitHub issues
 - [Issue Quality Checklist](#issue-quality-checklist)
 - [Working Style](#working-style)
 - [Curation Patterns](#curation-patterns)
-- [Advanced Curation](#advanced-curation)
 - [Terminal Probe Protocol](#terminal-probe-protocol)
 - [Completion](#completion)
 <!-- toc:end -->
@@ -619,6 +619,8 @@ When you find an unlabeled issue, **first assess if it's already implementation-
 
 ### Decision Tree
 
+**Either way**, run the consolidation gate ("Backlog Rightsizing" below) before `loom:curated`.
+
 **If ALL checkboxes pass:**
 ✅ **Mark it `loom:curated` immediately** - the issue is already well-formed:
 
@@ -649,7 +651,7 @@ Issue #84: "Expand frontend unit test coverage"
 - ✅ No dependencies mentioned
 
 → Action: `gh issue edit 84 --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"`
-→ Result: Awaits `loom:issue` promotion (human, Champion, or a `/loom:sweep` orchestrator) before Worker can start
+→ Result: Awaits `loom:issue` promotion before Worker can start
 ```
 
 **Needs Enhancement** (improve first):
@@ -667,7 +669,7 @@ Issue #99: "fix the crash bug"
 
 ## Decomposing Oversized Issues
 
-If, during curation, you determine an issue is too large to be a single Builder PR (>6 hours, >8 files, or >400 LOC) and must be split into sub-issues:
+If, during curation, you determine an issue is too large to be a single Builder PR (>6 hours, >8 files, or >400 LOC) and must be split into sub-issues (size each child per "Backlog Rightsizing" below):
 
 1. **Create each sub-issue with `loom:triage` only.** Do NOT apply `loom:curated`, even if your decomposition includes curator-quality detail (acceptance criteria, file references, scope guards).
 2. **Do NOT apply `loom:issue`** — a sub-issue is never starred (the star is human-only), so the starred exception never covers it (see "Who promotes `loom:curated` → `loom:issue`" above).
@@ -677,15 +679,7 @@ If, during curation, you determine an issue is too large to be a single Builder 
 6. **Serialize this `gh issue create` burst against any other issue-creating agent (#3707).** Do not run your sub-issue creation concurrently with another issue-creating agent (Architect / another Curator-decomposition / Champion epic-phase) in the same repo — concurrent `gh issue create` bursts race on server-assigned issue numbers and cross-contaminate bodies. One filer finishes its full burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize" for the invariant.
 7. **File each sub-issue with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).** `gh issue create` is GraphQL-backed and dies outright once the shared GraphQL pool exhausts — while the independent REST pool sits ~99% unused. The script takes the same flags (`--title`, `--body`/`--body-file`, repeatable `--label`, `--repo`) and prints the same issue URL, but falls back to a single REST POST that applies labels **atomically with creation**. A decomposition burst files several issues in a row, so it is the likeliest place in a Curator run to meet an exhausted pool mid-sequence. Recipe and rationale: `.loom/docs/gh-issue-create-rest-fallback.md`. (`loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.)
 
-### Why this matters
-
-A dedicated Curator pass after decomposition catches:
-- Acceptance-criteria gaps the decomposer didn't surface
-- file:line citations that drift between decomposer-read time and builder-run time
-- Sub-issue dependencies the decomposer missed
-- Scope-guard sharpening (LOC limits, out-of-scope footnotes)
-
-When skipped, the Builder hits these issues at implementation time — usually as a scope-guard trigger or a Doctor cycle — which is far more expensive than catching at curate time.
+**Why a separate pass**: it catches AC gaps, drifted file:line citations, missed sub-issue dependencies, and loose scope guards at curate time, not as a Builder scope-guard trigger or Doctor cycle.
 
 **Scope note**: This two-pass rule applies *only* to sub-issues created during decomposition. Single-issue curation remains one pass — enhance and mark `loom:curated` in the same session as today.
 
@@ -700,6 +694,36 @@ When skipped, the Builder hits these issues at implementation time — usually a
 ```
 
 The Builder's decomposition path (`builder-complexity.md`) follows the same `loom:triage`-only rule.
+
+## Backlog Rightsizing (#9026)
+
+Every issue pays the full Curator → Builder → CI → Judge tax, so a 2-line fix
+filed alone costs nearly what a 40-minute one does. Heuristics, not a gate:
+
+- **Target**: ~20–45 min of Builder work touching 2–8 related files — the high
+  end when the repo's CI is slow (`gh run list` durations), narrower if fast.
+- **Batch siblings**: when decomposing or triaging, file sibling tool bugs (one
+  defect across sibling scripts), a multi-file doc pass, or related test fixes
+  as ONE issue with one AC checklist — not one issue per site.
+- **Floor, not ceiling**: whether to split is still decided by "Decomposing
+  Oversized Issues" above (>6 h, >8 files, >400 LOC) and `builder-complexity.md`
+  ("do not decompose under 4 h"); work between the band and those stays one
+  issue. A child goes below the band only if genuinely independent (own
+  dependency, risk, or owner).
+
+**Consolidation gate — before `loom:curated`**: look for open
+`loom:triage`/unlabeled siblings (`check-duplicate.sh` output, a title/path
+search). If several micro-issues together make one right-sized issue, absorb
+them into the one you are curating — only siblings with no
+`loom:curating`/`loom:building`/`loom:issue`/`loom:blocked`/`loom:operator-only`
+or hard-exclusion label and no open PR (`loom-daemon forge check-open-pr <N>`
+exit 0 ⇒ skip):
+
+1. Survivor body gains `## Consolidated from`: per sibling, its `#N` link and
+   original body quoted verbatim; merge AC and Affected Files. Lose nothing.
+2. Each sibling: comment `Consolidated into #<survivor>; scope and AC carried
+   over verbatim.`, then `gh issue close <N> --reason "not planned"`.
+3. Not sure they are siblings? Cross-link ("Related: #N") instead.
 
 ## Curation Activities
 
@@ -2102,6 +2126,8 @@ Before marking an issue as `loom:curated`, ensure it has:
 - ✅ **Affected Files section** (see Required Sections below)
 - ✅ **Dependencies verified**: All task list items checked (or no Dependencies section)
 - ✅ **Not a duplicate**: Verified no similar open issues exist (use `check-duplicate.sh`)
+- ✅ **Right-sized**: sibling micro-issues consolidated (see "Backlog Rightsizing")
+- ✅ Priority label (`loom:urgent` if critical, otherwise none)
 - ✅ Labeled as `loom:curated` when complete (NOT `loom:issue`, unless starred — Priority 0)
 
 ### Required Sections
@@ -2210,16 +2236,10 @@ gh issue edit 100 --remove-label "loom:curating" --remove-label "loom:triage" --
 ## Working Style
 
 - **Find work**: See "Finding Work" section above for commands
-- **Claim the issue**: Before starting enhancement work
-  ```bash
-  gh issue edit <number> --add-label "loom:curating"
-  ```
+- **Claim the issue** (`loom:curating`) before starting enhancement work
 - **Review issue**: Read description, check code references, understand context
 - **Enhance issue**: Add missing details, implementation options, test plans
-- **Mark curated and unclaim** (NOT approved for work):
-  ```bash
-  gh issue edit <number> --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"
-  ```
+- **Mark curated and unclaim** (NOT approved for work) — the label edit in "Decision Tree" above
 - **NEVER add `loom:issue`** to an unstarred issue — see "Who promotes `loom:curated` → `loom:issue`" near the top of this file
 - **Monitor workflow**: Check for `loom:blocked` issues that need help, and
   `loom:operator-only` issues whose stated blocker/parent epic may have closed
@@ -2289,10 +2309,6 @@ MAX_LINES, the truncation logic has an off-by-one error.
 - [ ] Edge cases: Test with MAX_LINES-1, MAX_LINES, MAX_LINES+1 line counts
 ---
 
-Why this pattern matters:
-- Builder knows exactly which files to modify
-- Test plan provides clear verification steps
-- Builder quality validation passes without warnings
 ```
 
 ### Blocked Issue Re-check → Silent Skip vs. Real Comment
@@ -2407,17 +2423,6 @@ Why this pattern matters:
   a habit into a script a Curator (or its CI) can actually run
 - A disagreement is data, not noise — the dated counter-finding in the
   "RIGHT" variant tells a Builder both what was true and when it changed
-
-## Advanced Curation
-
-As you gain familiarity with the codebase, you can:
-- Proactively research implementation approaches
-- Prototype solutions to validate feasibility
-- Create spike issues for technical unknowns
-- Document architectural decisions in issues
-- Connect issues to broader roadmap themes
-
-By keeping issues well-organized, informative, and actionable, you help the team make better decisions and stay aligned on priorities.
 
 ## Terminal Probe Protocol
 
