@@ -72,7 +72,7 @@ pub fn resolve_repo_identity(owner_repo: &str) -> Option<RepoIdentity> {
 pub const GRAPHQL_BATCH: usize = 50;
 /// Closing references read per PR. More than one same-repo issue is already
 /// ambiguous, so a small page suffices; `totalCount` catches the rest.
-const CLOSING_REFS_PAGE: usize = 10;
+pub const CLOSING_REFS_PAGE: usize = 10;
 /// How long a PR's closing references are reused across cycles.
 pub const CLOSING_REFS_TTL: Duration = Duration::from_secs(600);
 const CACHE_CAP: usize = 4096;
@@ -168,10 +168,32 @@ pub fn decide(
     let Some(identity) = identity else {
         return Stitch::Unresolved("repo_id unresolvable (no name-derived fallback)".into());
     };
-    let prs = distinct_prs(run);
+    let branch_issue = run
+        .head_branch
+        .as_deref()
+        .and_then(crate::claim_reconciliation::parse_issue_from_branch);
+    decide_candidates(identity, &distinct_prs(run), closing, branch_issue)
+}
+
+/// The exactly-one-same-repo-issue rule over explicit candidate sources:
+/// the closing references of every PR in `prs` (looked up in `closing`,
+/// `None` = unreadable) plus an optional `feature/issue-N` branch issue.
+///
+/// Shared by [`decide`] (a CI run) and the role-tick story join (#9168: a
+/// PR a tick acted on is one PR plus its head branch; an issue it acted on
+/// is `prs = []` with `branch_issue = Some(n)`), so both answer "which
+/// story" identically. The returned [`StoryRef::pr_number`] is the PR when
+/// `prs` names exactly one.
+#[must_use]
+pub fn decide_candidates(
+    identity: &RepoIdentity,
+    prs: &[u64],
+    closing: &HashMap<u64, Option<ClosingRefs>>,
+    branch_issue: Option<u32>,
+) -> Stitch {
     let mut issues = BTreeSet::new();
     let mut foreign = 0_usize;
-    for pr in &prs {
+    for pr in prs {
         let Some(Some(refs)) = closing.get(pr) else {
             return Stitch::Unresolved(format!("closing references of PR #{pr} unreadable"));
         };
@@ -188,11 +210,7 @@ pub fn decide(
             }
         }
     }
-    if let Some(n) = run
-        .head_branch
-        .as_deref()
-        .and_then(crate::claim_reconciliation::parse_issue_from_branch)
-    {
+    if let Some(n) = branch_issue {
         issues.insert(n);
     }
     match (issues.len(), foreign) {
@@ -301,14 +319,7 @@ pub fn closing_refs(
             }
         }
     }
-    let Some((owner, name)) = full_name.split_once('/').filter(|(o, n)| {
-        [*o, *n].iter().all(|part| {
-            !part.is_empty()
-                && part
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-        })
-    }) else {
+    let Some((owner, name)) = owner_name(full_name) else {
         out.extend(missing.into_iter().map(|pr| (pr, None)));
         return out;
     };
@@ -390,25 +401,45 @@ pub fn parse_closing_refs(body: &str, prs: &[u64]) -> HashMap<u64, ClosingRefs> 
     };
     let repository = &json["data"]["repository"];
     for pr in prs {
-        let refs = &repository[format!("p{pr}")]["closingIssuesReferences"];
-        let (Some(total), Some(nodes)) = (refs["totalCount"].as_u64(), refs["nodes"].as_array())
-        else {
-            continue;
-        };
-        let parsed: Option<Vec<(u64, u32)>> = nodes
-            .iter()
-            .map(|node| {
-                Some((
-                    node["repository"]["databaseId"].as_u64()?,
-                    u32::try_from(node["number"].as_u64()?).ok()?,
-                ))
-            })
-            .collect();
-        if let (Some(refs), Ok(total)) = (parsed, usize::try_from(total)) {
-            out.insert(*pr, ClosingRefs { refs, total });
+        if let Some(refs) =
+            parse_refs_field(&repository[format!("p{pr}")]["closingIssuesReferences"])
+        {
+            out.insert(*pr, refs);
         }
     }
     out
+}
+
+/// One `closingIssuesReferences { totalCount nodes { number repository {
+/// databaseId } } }` field, or `None` unless it parsed completely.
+#[must_use]
+pub fn parse_refs_field(refs: &Value) -> Option<ClosingRefs> {
+    let total = usize::try_from(refs["totalCount"].as_u64()?).ok()?;
+    let refs = refs["nodes"]
+        .as_array()?
+        .iter()
+        .map(|node| {
+            Some((
+                node["repository"]["databaseId"].as_u64()?,
+                u32::try_from(node["number"].as_u64()?).ok()?,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(ClosingRefs { refs, total })
+}
+
+/// `owner/name` split, each part validated to `[A-Za-z0-9._-]+` so it can be
+/// interpolated into a GraphQL string literal.
+#[must_use]
+pub fn owner_name(full_name: &str) -> Option<(&str, &str)> {
+    full_name.split_once('/').filter(|(o, n)| {
+        [*o, *n].iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        })
+    })
 }
 
 fn story_attributes(span: &mut crate::telemetry::trace::SpanRecord, story: &StoryRef) {

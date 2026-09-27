@@ -1,0 +1,13 @@
+{"type": "user", "message": {"role": "user", "content": "<command-message>loom:guide</command-message>\n<command-name>/loom:guide</command-name>\n<command-args></command-args>"}, "sessionId": "00000000-0000-4000-8000-000000009168"}
+{"type": "assistant", "message": {"model": "claude-sonnet-5", "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_0000", "name": "Bash", "input": {"command": "gh issue list --state open --json number,labels --limit 200", "description": "x"}}], "usage": {"input_tokens": 10, "output_tokens": 2}}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_0000", "content": "ok"}]}}
+{"type": "assistant", "message": {"model": "claude-sonnet-5", "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_0001", "name": "Bash", "input": {"command": "gh issue view 9168 --comments", "description": "x"}}], "usage": {"input_tokens": 10, "output_tokens": 2}}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_0001", "content": "ok"}]}}
+{"type": "assistant", "message": {"model": "claude-sonnet-5", "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_0002", "name": "Bash", "input": {"command": "gh pr view 9201", "description": "x"}}], "usage": {"input_tokens": 10, "output_tokens": 2}}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_0002", "content": "ok"}]}}
+{"type": "assistant", "message": {"model": "claude-sonnet-5", "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_0003", "name": "Bash", "input": {"command": "gh api repos/{owner}/{repo}/issues/9168/comments", "description": "x"}}], "usage": {"input_tokens": 10, "output_tokens": 2}}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_0003", "content": "ok"}]}}
+{"type": "assistant", "message": {"model": "claude-sonnet-5", "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_0004", "name": "Bash", "input": {"command": "gh api graphql -f query=\"query { viewer { login } }\"", "description": "x"}}], "usage": {"input_tokens": 10, "output_tokens": 2}}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_0004", "content": "ok"}]}}
+{"type": "assistant", "message": {"model": "claude-sonnet-5", "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_0005", "name": "Bash", "input": {"command": "git log --oneline -5", "description": "x"}}], "usage": {"input_tokens": 10, "output_tokens": 2}}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_0005", "content": "ok"}]}}
