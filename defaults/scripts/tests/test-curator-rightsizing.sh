@@ -10,8 +10,9 @@
 #      explicitly reconciled with the existing decomposition thresholds
 #      (>6 h / >8 files / >400 LOC, builder-complexity.md's "under 4 h"),
 #   3. a consolidation gate before `loom:curated` that never absorbs a
-#      claimed/building/promoted issue or one with an open PR, and preserves
-#      the absorbed issues' original content and links.
+#      claimed/building/promoted/epic issue, a child of a parent, or one not
+#      verified PR-free (check-open-pr exit 1 only), and preserves the
+#      absorbed issues' original content and links.
 #
 # These rules live in prose that a later trim (the markdown token ratchet
 # pushes every prompt edit to remove as much as it adds) could silently drop,
@@ -90,7 +91,21 @@ for label in 'loom:curating' 'loom:building' 'loom:issue' 'loom:blocked' 'loom:o
     expect "never absorbs a $label issue"             "$RS" "$label"
 done
 expect "never absorbs a hard-excluded issue"          "$RS" "hard-exclusion label"
-expect "never absorbs an issue with an open PR"       "$RS" "check-open-pr"
+for label in 'loom:epic' 'loom:epic-phase'; do
+    expect "never absorbs a $label issue"             "$RS" "/\`$label\`"
+done
+expect "never absorbs a child of a parent issue"      "$RS" "a parent (sub-issue, \`Part of #N\`, \`[Parent #N]\`, or in a parent's task list)"
+# check-open-pr's contract (loom-daemon/src/forge_check_open_pr.rs): ONLY
+# exit 1 is a verified absence; 0 = open PR, 3 = forge declined, 5 = probe
+# failed. The gate closes issues, so it must fold only on exit 1 and fail
+# closed on everything else — pin the clause, not just the command name.
+expect "open-PR probe: fold only on exit 1"           "$RS" "(\`loom-daemon forge check-open-pr <N>\`): fold only on exit 1;"
+expect "open-PR probe: every other exit fails closed" "$RS" "any other exit (0 = open PR, 3, 5, …) ⇒ skip (fail closed)"
+if grep -qE 'exit 0 ⇒ skip' <<< "$RS"; then
+    fail "open-PR probe: no fail-open 'exit 0 ⇒ skip' wording"
+else
+    pass "open-PR probe: no fail-open 'exit 0 ⇒ skip' wording"
+fi
 expect "preserves original content verbatim"          "$RS" "quoted verbatim"
 expect "preserves links (Consolidated from)"          "$RS" "## Consolidated from"
 expect "cross-links the closed sibling"               "$RS" "Consolidated into #<survivor>"
@@ -101,6 +116,11 @@ echo ""
 echo "Test group 3: the gate is reachable from the curation flow"
 TRIAGE="$(section "$CURATOR_MD" '^## Triage: Ready or Needs Enhancement')"
 expect "Decision Tree routes to the consolidation gate" "$TRIAGE" "run the consolidation gate (\"Backlog Rightsizing\" below)"
+if grep -qF 'Mark it `loom:curated` immediately' <<< "$TRIAGE"; then
+    fail "Decision Tree does not say 'mark immediately' ahead of the gate"
+else
+    pass "Decision Tree does not say 'mark immediately' ahead of the gate"
+fi
 CHECK="$(section "$CURATOR_MD" '^## Issue Quality Checklist')"
 expect "Quality Checklist has a Right-sized item"     "$CHECK" "**Right-sized**"
 DECOMP="$(section "$CURATOR_MD" '^## Decomposing Oversized Issues')"

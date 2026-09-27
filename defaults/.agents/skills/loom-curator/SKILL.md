@@ -178,12 +178,6 @@ gh issue edit 342 --remove-label "loom:curating" --remove-label "loom:triage" --
 gh issue comment 342 --body "✅ Curation complete. Added implementation guidance, acceptance criteria, and test plan."
 ```
 
-**Why This Matters**:
-- Users may want to prioritize specific issue enhancements
-- Users may want to test curation workflows with specific issues
-- Users may want to expedite important issues
-- Flexibility is important for manual orchestration mode
-
 **When NOT to Override**:
 - When user says "find issues" or "look for work" → Use label-based workflow
 - When running autonomously → Always use label-based workflow
@@ -637,7 +631,7 @@ When you find an unlabeled issue, **first assess if it's already implementation-
 **Either way**, run the consolidation gate ("Backlog Rightsizing" below) before `loom:curated`.
 
 **If ALL checkboxes pass:**
-✅ **Mark it `loom:curated` immediately** - the issue is already well-formed:
+✅ **Mark it `loom:curated`** (after the gate) - the issue is already well-formed:
 
 ```bash
 # Signal completion by removing curating and adding curated
@@ -657,7 +651,7 @@ gh issue edit <number> --remove-label "loom:curating" --remove-label "loom:triag
 
 ### Examples
 
-**Already Ready** (mark immediately):
+**Already Ready** (gate, then mark):
 ```markdown
 Issue #84: "Expand frontend unit test coverage"
 - ✅ Detailed problem statement (low coverage creates risk)
@@ -729,10 +723,12 @@ filed alone costs nearly what a 40-minute one does. Heuristics, not a gate:
 **Consolidation gate — before `loom:curated`**: look for open
 `loom:triage`/unlabeled siblings (`check-duplicate.sh` output, a title/path
 search). If several micro-issues together make one right-sized issue, absorb
-them into the one you are curating — only siblings with no
-`loom:curating`/`loom:building`/`loom:issue`/`loom:blocked`/`loom:operator-only`
-or hard-exclusion label and no open PR (`loom-daemon forge check-open-pr <N>`
-exit 0 ⇒ skip):
+them into the one you are curating. Never absorb a sibling that has:
+- a `loom:curating`/`loom:building`/`loom:issue`/`loom:blocked`/`loom:operator-only`/`loom:epic`/`loom:epic-phase`
+  or hard-exclusion label;
+- a parent (sub-issue, `Part of #N`, `[Parent #N]`, or in a parent's task list);
+- no verified PR absence (`loom-daemon forge check-open-pr <N>`): fold only on exit 1;
+  any other exit (0 = open PR, 3, 5, …) ⇒ skip (fail closed).
 
 1. Survivor body gains `## Consolidated from`: per sibling, its `#N` link and
    original body quoted verbatim; merge AC and Affected Files. Lose nothing.
