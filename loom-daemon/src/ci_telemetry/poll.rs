@@ -1,4 +1,4 @@
-//! One poll cycle over the configured org.
+//! One poll cycle over the configured owners (orgs and users, #9188).
 //!
 //! 1. Take the per-host cycle lock; open (and repair) the ledger + journal.
 //! 2. **Recover**: replay any committed-but-unconfirmed unit, skipping every
@@ -6,7 +6,11 @@
 //!    case — this is what makes emission exactly-once, not at-most-once).
 //! 3. Honour the org-wide rate-limit backoff and the process-global rate
 //!    limit breaker — a backing-off cycle makes zero requests.
-//! 4. Discover repos (`GET /orgs/{org}/repos`, paginated, ETag/304-cached).
+//! 4. Per owner: resolve its kind (declared, cached, or `GET /users/{owner}`)
+//!    and discover its repos (`orgs/{o}/repos` or `users/{u}/repos`,
+//!    paginated, ETag/304-cached) — see [`super::owners`]. An owner whose
+//!    kind or discovery fails is skipped this cycle and named; only when every
+//!    owner fails does the cycle fail as `discovery-failed`.
 //! 5. Per repo: list runs `created >= floor` (paginated), where the floor is
 //!    the watermark *or* the trailing rescan window, whichever is older
 //!    (#8898 — a re-run keeps its original `created_at`, so the watermark
@@ -26,6 +30,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -33,6 +38,7 @@ use super::api::{ApiError, GithubApi};
 use super::journal::Journal;
 use super::ledger::{Ledger, PendingUnit, UnitDraft, UnitKey, COMPACT_THRESHOLD_BYTES};
 use super::logs::{self, LogTarget};
+use super::owners::{discover, resolve_kind, KindCache, Owner, OwnerStatus};
 use super::records::{
     envelope_identity, job_envelopes, run_envelopes, JobJson, JobsPage, RepoJson, RunJson, RunsPage,
 };
@@ -45,7 +51,10 @@ use super::{journal_path, log_capture_gate, state_dir, LogCaptureGate, ResolvedC
 #[derive(Debug, Clone)]
 pub struct CycleContext<'a> {
     pub root: &'a Path,
-    pub org: String,
+    /// The owners polled, in order (#9188).
+    pub owners: Vec<Owner>,
+    /// Resolved owner kinds; the process-wide cache in production.
+    pub owner_kinds: Arc<KindCache>,
     pub excluded_repos: Vec<String>,
     pub now: DateTime<Utc>,
     pub host_id: String,
@@ -68,7 +77,8 @@ impl<'a> CycleContext<'a> {
     pub fn new(root: &'a Path, resolved: &ResolvedCiTelemetry) -> Self {
         CycleContext {
             root,
-            org: resolved.org.clone(),
+            owners: resolved.owners.clone(),
+            owner_kinds: super::owners::global_kind_cache(),
             excluded_repos: resolved
                 .excluded_repos
                 .iter()
@@ -130,6 +140,8 @@ pub struct CycleReport {
     /// Cleared when GraphQL rate-limits a closing-reference lookup (#9088):
     /// no further lookup is made this cycle.
     pub graphql_suppressed: bool,
+    /// Each owner's kind / eligible repo count / skip reason (#9188).
+    pub owners: Vec<OwnerStatus>,
 }
 
 impl CycleReport {
@@ -339,10 +351,13 @@ fn record_outcome(
     ctx: &CycleContext<'_>,
     result: &Result<CycleReport, CycleError>,
 ) {
-    status.org = Some(ctx.org.clone());
+    // `org` keeps its pre-#9188 meaning for one owner; several are joined.
+    let logins: Vec<&str> = ctx.owners.iter().map(|o| o.login.as_str()).collect();
+    status.org = Some(logins.join(","));
     status.last_attempt_at = Some(ctx.now);
     match result {
         Ok(report) => {
+            status.owners = report.owners.clone();
             status.last_cycle = Some(CycleSummary {
                 repo_errors: report.repo_errors.len(),
                 ..report.summary.clone()
@@ -435,11 +450,54 @@ fn run_locked(
         None
     };
 
-    let repos = match discover(api, &ctx.org, dir, &mut report.summary.requests) {
-        Ok(repos) => repos,
-        Err(error) => return Err(org_wide(&error, &report).unwrap_or(CycleError::Discovery(error))),
-    };
-    for repo in repos.iter().filter(|r| !r.archived && !ctx.is_excluded(r)) {
+    // #9188: owners one after another. A rate limit or a rejected credential
+    // still aborts the whole cycle; any other kind-probe or discovery failure
+    // skips that owner (named) and moves on. Only when no owner could be
+    // discovered at all is it the cycle's `discovery-failed` — with a single
+    // owner, exactly the pre-#9188 behaviour.
+    let mut repos = Vec::new();
+    let mut first_failure = None;
+    for owner in &ctx.owners {
+        let requests = &mut report.summary.requests;
+        let discovered = resolve_kind(api, owner, &ctx.owner_kinds, requests)
+            .and_then(|kind| Ok((kind, discover(api, &owner.login, kind, dir, requests)?)));
+        match discovered {
+            Ok((kind, found)) => {
+                let eligible: Vec<_> = found
+                    .into_iter()
+                    .filter(|r| !r.archived && !ctx.is_excluded(r))
+                    .collect();
+                report.owners.push(OwnerStatus {
+                    owner: owner.login.clone(),
+                    kind: Some(kind),
+                    repos: Some(eligible.len()),
+                    error: None,
+                });
+                repos.extend(eligible);
+            }
+            Err(error) => {
+                if let Some(abort) = org_wide(&error, &report) {
+                    return Err(abort);
+                }
+                let reason = format!("discovery-failed: {error}");
+                report.owners.push(OwnerStatus {
+                    owner: owner.login.clone(),
+                    error: Some(reason.clone()),
+                    ..OwnerStatus::default()
+                });
+                report
+                    .repo_errors
+                    .push(format!("owner {}: {reason}", owner.login));
+                first_failure.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = first_failure.filter(|_| report.owners.iter().all(|o| o.error.is_some())) {
+        return Err(CycleError::Discovery(error));
+    }
+    let mut polled = HashSet::new();
+    repos.retain(|repo| polled.insert(repo.full_name.to_ascii_lowercase()));
+    for repo in &repos {
         match poll_repo(ctx, api, &mut ledger, &journal, repo, &mut report) {
             Ok(()) => report.summary.repos_polled += 1,
             Err(RepoError::Io(error)) => return Err(CycleError::Io(error)),
@@ -589,64 +647,6 @@ fn paginate<T>(
         next = response.next;
     }
     Ok(items)
-}
-
-/// Discover the org's repos, paginated, with a persisted per-page ETag
-/// cache: a `304` serves the cached page (and its cached `next`) at zero
-/// rate-limit cost — the `forge_listing` ETag mechanism, never a raw
-/// re-listing.
-pub fn discover(
-    api: &dyn GithubApi,
-    org: &str,
-    dir: &Path,
-    requests: &mut usize,
-) -> Result<Vec<RepoJson>, ApiError> {
-    let mut cache = state::load_discovery_cache(dir);
-    let mut refreshed = state::DiscoveryCache::new();
-    let mut repos = Vec::new();
-    let mut visited = HashSet::new();
-    let mut next = Some(format!("orgs/{org}/repos?per_page=100&type=all"));
-    while let Some(path) = next.take() {
-        if !visited.insert(path.clone()) {
-            break;
-        }
-        let cached = cache.remove(&path);
-        *requests += 1;
-        let mut response = api.get(&path, cached.as_ref().map(|c| c.etag.as_str()))?;
-        let page = match (response.status, cached) {
-            (304, Some(page)) => page,
-            (304, None) => {
-                // Unreachable in practice (a 304 only answers our ETag);
-                // re-fetch unconditionally rather than trust an empty body.
-                *requests += 1;
-                response = api.get(&path, None)?;
-                state::CachedPage {
-                    etag: response.etag.clone().unwrap_or_default(),
-                    body: response.body.clone(),
-                    next: response.next.clone(),
-                }
-            }
-            _ => state::CachedPage {
-                etag: response.etag.clone().unwrap_or_default(),
-                body: response.body.clone(),
-                next: response.next.clone(),
-            },
-        };
-        let rows: Vec<RepoJson> =
-            serde_json::from_str(&page.body).map_err(|e| ApiError::Parse {
-                path: path.clone(),
-                detail: e.to_string(),
-            })?;
-        repos.extend(rows);
-        next = page.next.clone();
-        if !page.etag.is_empty() {
-            refreshed.insert(path, page);
-        }
-    }
-    if let Err(error) = state::save_discovery_cache(dir, &refreshed) {
-        log::warn!("ci_telemetry: could not persist the discovery ETag cache: {error}");
-    }
-    Ok(repos)
 }
 
 /// Hold the watermark at the oldest not-yet-finished run so a later poll
