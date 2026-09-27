@@ -307,7 +307,14 @@ A `loom-daemon ci-telemetry` poller. Each cycle it:
 Runs that are still in progress are not recorded yet. The watermark stays at
 the oldest unfinished run so that a later poll lists it again once it
 completes, and it never moves backwards: an unfinished run surfaced by the
-rescan window (below the watermark) is re-listed by that window instead.
+rescan window (below the watermark) is re-listed by that window instead. This
+hold is bounded: a run that is still unfinished once it is older than the
+rescan window (capped by the initial lookback) stops holding the watermark —
+nothing could ever re-list it past that age anyway, so the alternative is
+pinning the watermark, and every cycle's listing floor with it, forever
+(#8992). Past that bound the run is treated as abandoned: the watermark
+advances to the newest run seen, and the stuck run drops out of every later
+listing for good.
 
 ### Surfaces
 
@@ -450,7 +457,13 @@ gitignored.
   lookback so the floor never reaches back past a repo's first cycle), and the
   ledger's `(repo, run_id, job_id, attempt)` dedup keeps the export exactly
   once (#8898). A re-attempt of a run created more than 24 hours ago is still
-  not seen.
+  not seen. The same 24-hour window (capped the same way) bounds how long an
+  unfinished run can hold the watermark back: past it, the run stops being
+  held and the watermark is free to advance, because nothing older than the
+  window can ever be re-listed by it either (#8992) — without this bound, a
+  run that never reaches a completed state (a stuck cancellation, an abandoned
+  workflow, a `queued` run whose runner never arrives) would pin the watermark,
+  and the ever-growing listing window it implies, indefinitely.
 - **Compaction.** When the ledger grows past 8 MiB and nothing is pending,
   it is rewritten atomically as key-only `seen` lines.
 - **One poller per host.** A `flock` on `poll.lock` stops the CLI and the
