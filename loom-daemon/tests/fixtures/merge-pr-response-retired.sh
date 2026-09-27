@@ -54,14 +54,23 @@
 # part of the retired behaviour; the corpus includes those three inputs so the
 # port is checked against it rather than assumed equivalent.
 
+# VERBATIM from merge-pr.sh's `_is_head_mismatch_response`, as it stood
+# immediately before #8191's classify-response slice deleted it.
+#
+# Defined at TOP LEVEL, not nested inside the ladder below, because two
+# differentials need it independently: `merge_pr_response_differential.rs` calls
+# the ladder, and `merge_pr_head_sync_differential.rs` calls this predicate
+# alone. That second one used to extract this function from the LIVE
+# `merge-pr.sh` and says so in its own header ("the slice that finally deletes
+# it inherits that obligation, and this header is where to look") — this file
+# is where that obligation was discharged.
+_is_head_mismatch_response() {
+  echo "$1" | grep -Eiq 'Head branch was modified\.|head out of date|expectedHeadOid'
+}
+
 # retired_classify_merge_response <response-text>
 # Prints one of: merge-in-progress | head-mismatch | base-modified | other
 retired_classify_merge_response() {
-  # VERBATIM from merge-pr.sh's `_is_head_mismatch_response`.
-  _is_head_mismatch_response() {
-    echo "$1" | grep -Eiq 'Head branch was modified\.|head out of date|expectedHeadOid'
-  }
-
   local MERGE_RESPONSE="$1"
 
   # VERBATIM matcher, RECONSTRUCTED position: first of the three.

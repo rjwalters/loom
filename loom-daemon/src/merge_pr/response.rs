@@ -164,16 +164,44 @@ pub fn classify(response: &[u8]) -> MergeResponseKind {
     if contains(response, MERGE_IN_PROGRESS) {
         return MergeResponseKind::MergeInProgress;
     }
-    if HEAD_MISMATCH
-        .iter()
-        .any(|needle| ascii_icontains(response, needle))
-    {
+    if is_head_mismatch(response) {
         return MergeResponseKind::HeadMismatch;
     }
     if contains(response, BASE_MODIFIED) {
         return MergeResponseKind::BaseModified;
     }
     MergeResponseKind::Other
+}
+
+/// Does this merge-API response say "your head-SHA precondition is stale"?
+///
+/// **The single definition of the head-mismatch predicate.** It has two
+/// callers that must never disagree:
+///
+/// 1. [`classify`] above, choosing the retry loop's route.
+/// 2. [`super::head_sync::is_head_mismatch`], gating #8164's self-sync retry
+///    authorization — which must not let a caller authorize a retry by
+///    mislabelling an arbitrary error as a head mismatch.
+///
+/// Until this slice those were three separate copies of the same three
+/// literals — one in `merge-pr.sh`, one in `head_sync`, one here — policed by
+/// a drift test (`tests/merge_pr_head_sync_differential.rs`) rather than
+/// prevented. The shell copy is now gone and `head_sync` delegates here, so
+/// there is one copy and the drift is unrepresentable. The differential
+/// survives, re-pointed at the FROZEN retired shell as its oracle, which is
+/// what it was really proving all along.
+///
+/// **Not the same question as `classify(x) == HeadMismatch`**, and the
+/// difference is load-bearing: a response naming both a 405 and a head
+/// mismatch is `MergeInProgress` by the ladder's precedence, but IS still a
+/// head mismatch as far as #8164's authorization is concerned. Delegating
+/// `head_sync` to the ladder rather than to this predicate would have
+/// narrowed that authorization silently.
+#[must_use]
+pub fn is_head_mismatch(response: &[u8]) -> bool {
+    HEAD_MISMATCH
+        .iter()
+        .any(|needle| ascii_icontains(response, needle))
 }
 
 /// Case-sensitive byte substring search — a bare `grep -q <literal>`.
