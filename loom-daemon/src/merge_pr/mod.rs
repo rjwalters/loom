@@ -90,6 +90,15 @@
 //! step, not the question of whether this tree may merge, and the fail-closed
 //! [`labels`] gate runs on the same binary later in the same script.
 //!
+//! [`mergeable_recheck`] is the stale-cached-mergeable recheck decision
+//! (#6104): once REST `.mergeable` has read `false`, which
+//! `<action>:<reason>` the backoff re-reads and the local `git merge-tree`
+//! corroboration add up to — `merge`, `refuse-conflict`, or the
+//! deliberately distinct `refuse-stale` ("the forge's cache is stale and
+//! could not be corroborated", not "this branch genuinely conflicts"). The
+//! I/O loop stays in the shell so the retained suite's stubs keep driving
+//! the real code path; only the terminal classification moved.
+
 //! [`version_policy`] is the pre-merge no-hand-bump guard (#7827) and its
 //! oracle choice (#8284): everything `merge-pr.sh` wrapped around the
 //! canonical `check-defaults-version-bump.sh` — fetch, ancestry, which ref's
@@ -112,6 +121,7 @@ pub mod head_sync;
 pub mod hold_state;
 pub mod labels;
 pub mod loom_pr_guard;
+pub mod mergeable_recheck;
 pub mod redate;
 pub mod refs;
 pub mod stacked_children;

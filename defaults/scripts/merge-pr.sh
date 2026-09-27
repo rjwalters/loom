@@ -1803,39 +1803,41 @@ _auto_reconcile_stacked_children() {
 #                                resolved to true, and local corroboration was
 #                                unavailable (missing refs, fetch failure) —
 #                                NOT a confirmed conflict, just unresolved.
+#
+# The terminal classification — which <action>:<reason> these observations
+# add up to — is `loom-daemon merge-pr mergeable-recheck` (Rust,
+# loom-daemon/src/merge_pr/mergeable_recheck.rs — #8191 slice): the reason
+# strings are byte-frozen there and held by a differential test. The I/O loop
+# below (backoff, uncached re-reads, fetch, merge-tree) stays here so the
+# retained suite's stubs keep driving the real code path unchanged. A daemon
+# that cannot answer is a POSITIVE refuse-stale, never a silent pass: an
+# unanswered corroboration must not read as "confirmed clean".
 _recheck_mergeable_before_refusal() {
-  local nwo="$1" pr_number="$2" gh_cmd="$3" base_ref="$4" head_ref="$5" repo_root="$6"
-  local retries="${7:-3}" delay="${8:-3}"
-  local attempt recheck_json recheck_mergeable
+  local nwo="$1" pr_number="$2" gh_cmd="$3" base_ref="$4" head_ref="$5" repo_root="$6" retries="${7:-3}" delay="${8:-3}"
+  local attempt recheck_json recheck_mergeable resolved_attempt="" _MPR_BIN _MPR_OUT _MPR_RC=0
+  local _MPR_FLAGS=(--retries "$retries" --base-ref "$base_ref" --head-ref "$head_ref")
 
   for attempt in $(seq 1 "$retries"); do
     sleep "$delay"
     recheck_json="$(forge_get_pr_nocache "$nwo" "$pr_number" "$gh_cmd" 2>/dev/null || echo '{}')"
     recheck_mergeable="$(echo "$recheck_json" | jq -r '.mergeable // empty')"
-    if [[ "$recheck_mergeable" == "true" ]]; then
-      echo "merge:cached mergeable=false was stale; recheck #$attempt (post-backoff, uncached) now reports mergeable=true"
-      return 0
-    fi
+    if [[ "$recheck_mergeable" == "true" ]]; then resolved_attempt="$attempt"; break; fi
   done
 
   # Still false/unknown after the backoff retries — corroborate with a local
   # git merge-tree check before conceding this is a genuine conflict.
-  if [[ -z "$base_ref" ]] || [[ -z "$head_ref" ]]; then
-    echo "refuse-stale:forge reports mergeable=false after $retries recheck(s); base/head ref unavailable for local corroboration"
-    return 0
+  [[ -n "$resolved_attempt" ]] && _MPR_FLAGS+=(--resolved-attempt "$resolved_attempt")
+  if [[ -z "$resolved_attempt" ]]; then
+    if [[ -z "$base_ref" || -z "$head_ref" ]]; then _MPR_FLAGS+=(--refs-missing)
+    elif git -C "$repo_root" fetch -q origin "$base_ref" "$head_ref" 2>/dev/null; then
+      if git -C "$repo_root" merge-tree --write-tree "origin/$base_ref" "origin/$head_ref" >/dev/null 2>&1; then _MPR_FLAGS+=(--tree clean); else _MPR_FLAGS+=(--tree conflict); fi
+    else _MPR_FLAGS+=(--fetch-failed); fi
   fi
 
-  if ! git -C "$repo_root" fetch -q origin "$base_ref" "$head_ref" 2>/dev/null; then
-    echo "refuse-stale:forge reports mergeable=false after $retries recheck(s); could not fetch origin/$base_ref and origin/$head_ref for local corroboration"
-    return 0
-  fi
-
-  if git -C "$repo_root" merge-tree --write-tree "origin/$base_ref" "origin/$head_ref" >/dev/null 2>&1; then
-    echo "merge:forge reports mergeable=false after $retries recheck(s), but local 'git merge-tree' against origin/$base_ref is clean — proceeding (stale/false-negative cached state)"
-    return 0
-  fi
-
-  echo "refuse-conflict:forge reports mergeable=false after $retries recheck(s), confirmed by local 'git merge-tree' against origin/$base_ref — this branch genuinely conflicts"
+  _MPR_BIN="${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-$(command -v loom-daemon 2>/dev/null || printf '%s' "$HOME/.local/bin/loom-daemon")}}"
+  _MPR_OUT="$("$_MPR_BIN" merge-pr mergeable-recheck "${_MPR_FLAGS[@]}" 2>/dev/null)" || _MPR_RC=$?
+  if [[ "$_MPR_RC" -eq 0 ]] && [[ "$_MPR_OUT" == merge:* || "$_MPR_OUT" == refuse-stale:* || "$_MPR_OUT" == refuse-conflict:* ]]; then echo "$_MPR_OUT"; return 0; fi
+  echo "refuse-stale:mergeability corroboration could not be classified — 'merge-pr mergeable-recheck' exited $_MPR_RC without a recognized action (missing or older binary). Refusing rather than treating an unanswered corroboration as clean; build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer), then re-run this merge."
   return 0
 }
 

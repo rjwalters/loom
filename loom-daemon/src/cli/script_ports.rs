@@ -382,6 +382,14 @@ pub(crate) enum MergePrCommand {
     /// could not determine (must also refuse).
     StaleChecks(super::merge_pr_stale_checks::StaleChecksArgs),
 
+    /// The stale-cached-mergeable recheck decision (#6104): once REST
+    /// `.mergeable` has read `false`, classify the backoff re-reads plus the
+    /// local `git merge-tree` corroboration into `merge:` / `refuse-stale:` /
+    /// `refuse-conflict:` — distinguishing "genuinely conflicts" from "the
+    /// forge's cached state is stale/unknown". Always exits 0 with exactly
+    /// one `<action>:<reason>` line; the I/O loop stays in the shell.
+    MergeableRecheck(super::merge_pr_mergeable_recheck::MergeableRecheckArgs),
+
     /// Decide whether a head-SHA-mismatch refusal was caused by THIS merge
     /// run's own base-sync push (#8164) and may be retried once against a
     /// freshly-read head. Exit 0 + sentinel = retry authorized, 1 = foreign
@@ -473,6 +481,7 @@ impl MergePrCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
+            MergePrCommand::MergeableRecheck(args) => args.run(),
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
