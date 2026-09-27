@@ -198,6 +198,43 @@ function compareItems(a: FleetQueueItem, b: FleetQueueItem): number {
   return (a.issue ?? Infinity) - (b.issue ?? Infinity);
 }
 
+/** A client-side filter over the already-merged fleet items (Issue #9032):
+ * `repo` and `tier` are ANDed, and an unset field matches everything. Pure
+ * and DOM-free, like the rest of this module, so the predicate is
+ * unit-testable without a browser — filtering never re-fetches, it only
+ * narrows the `FleetQueueItem[]` `mergeFleetQueue` already produced. */
+export interface QueueFilter {
+  repo?: string;
+  tier?: string;
+}
+
+/** The distinct repo and tier values across `items`, each sorted for a
+ * stable dropdown order. An item with no repo (a withheld private row) or no
+ * `tier` label contributes to the unfiltered lists but not to these option
+ * sets — there is no "no repo" or "no tier" filter value to select. */
+export interface QueueFilterOptions {
+  repos: string[];
+  tiers: string[];
+}
+
+export function queueFilterOptions(items: readonly FleetQueueItem[]): QueueFilterOptions {
+  const repos = new Set<string>();
+  const tiers = new Set<string>();
+  for (const item of items) {
+    if (item.repo) repos.add(item.repo);
+    if (item.primary.row.tier) tiers.add(item.primary.row.tier);
+  }
+  return { repos: [...repos].sort(), tiers: [...tiers].sort() };
+}
+
+export function filterQueueItems(items: readonly FleetQueueItem[], filter: QueueFilter): FleetQueueItem[] {
+  return items.filter((item) => {
+    if (filter.repo && item.repo !== filter.repo) return false;
+    if (filter.tier && item.primary.row.tier !== filter.tier) return false;
+    return true;
+  });
+}
+
 /** The PR an `open_pr` row's `detail` names. The daemon writes it as
  * `"open PR #8906"`; a bare `"8906"` is accepted too. */
 export function openPrNumber(row: QueueRow): number | undefined {

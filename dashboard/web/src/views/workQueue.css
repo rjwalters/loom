@@ -77,3 +77,32 @@
   color: var(--bad);
   border-color: color-mix(in srgb, var(--bad) 45%, transparent);
 }
+.queue__rank {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* `#/queue` repo/tier filter bar (#9032) — client-side only, narrows the
+   three lists below it without a new fetch. */
+.queue-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+.queue-filters__label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.queue-filters__select {
+  background: var(--bg-raised);
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 3px 6px;
+  font-size: 13px;
+}
