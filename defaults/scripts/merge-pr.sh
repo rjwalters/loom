@@ -894,6 +894,18 @@ _check_loom_pr_label
 # requires-daemon: merge-pr >= 0.19.172   verdict-contradiction guard (#8112, landed in #8124)
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
 # requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
+# The `merge-pr >=` floor above covers the whole subcommand group, including
+# #8191's post-merge porcelain lookups (`merge-pr worktree-primary` /
+# `worktree-branch-for` / `worktree-find-by-branch`, see _mp_worktree), and it is
+# deliberately NOT raised to their landing version. Raising it refuses the MERGE
+# on every host one release behind — the 2026-09-18 incident above — whereas a
+# daemon missing only those leaf verbs declines post-merge CLEANUP: the two
+# branch lookups degrade to "delete nothing" and the #3710 primary-worktree guard
+# refuses the removal rather than force-removing on no evidence. Skipped cleanup
+# is recoverable (`loom-clean`, the daemon's reaper, `worktree.sh remove`);
+# removing the primary checkout is not. Leaving the floor where it is also keeps
+# _mp_daemon_roll_hint's `${sub} >= ` lookup resolving to the merge-gate version,
+# which is the one a refused MERGE should name.
 # requires-daemon: cargo-target-dir optional   #9153 — the post-merge #7239 target-dir reclaim; without the resolve|reclaim verbs a daemon prints nothing, `$target_dir_resolved` stays empty and no reclaim is attempted, which is the pre-#7239 behaviour. A missed disk reclaim, never a failed merge: post-merge cleanup is best-effort by design and `loom-clean`, the daemon's reaper and `worktree.sh remove` all reclaim the same directory on their own schedule.
 #
 # _mp_daemon_roll_hint <subcommand> [resolved-bin] -- the concrete, host-local
@@ -2459,37 +2471,63 @@ fi
 # Branch-to-issue regex is the strict `^feature/issue-([0-9]+)$` pattern so
 # branches like `release-1` or `fix-bug-42` correctly classify as PR-style
 # (not issue-style) and clean up the right worktree.
+# Porcelain parsing for post-merge cleanup, ported to Rust (#8191 slice).
+#
+# The `git worktree list --porcelain` calls stay HERE; only the parse moved
+# (loom-daemon/src/merge_pr/worktrees.rs). Every one of this family's shipped
+# defects was in the awk — #3671 (the `exit`-triggers-`END` double-print, which
+# handed callers a `/path\n/path` that exists nowhere), #3717 ($2 truncating a
+# space-containing path, so the primary-worktree guard compared a prefix and
+# never fired), #4171 — and every consumer is an irreversible step: `git
+# worktree remove --force`, `git branch -D`. The newline-in-path caveat (#3717)
+# is unchanged: `--porcelain -z` is still the real fix and is still this
+# script's to make, since the `git` invocation never left.
+#
+# Contract: exit 0 + the answer, exit 0 + EMPTY for "parsed, no match", and
+# non-zero for "the parse could not run at all". The last two must stay
+# distinguishable — _remove_loom_worktree's #3710 guard reads an empty primary
+# path as "the target is not the primary checkout" and proceeds to remove it.
+#
+# Resolved inline, not via lib/locate-daemon-bin.sh, for the same reason
+# _mp_refs is (above): the retained suites extract these functions and source
+# them alone, with no libs present. LOOM_DAEMON_SELF_BIN first per #8134; a
+# PINNED path that is unusable refuses rather than silently resolving a
+# different binary off PATH. Unlike _mp_refs this NEVER calls `error` — it is
+# on the post-merge cleanup path, where aborting mid-way through state the
+# merge already committed is worse than declining to clean up — so an
+# unresolvable binary is reported as rc 3 for each caller to interpret.
+_mp_worktree() {
+  local bin out; bin="${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-}}"
+  [[ -n "$bin" ]] || bin="$(command -v loom-daemon 2>/dev/null || printf '%s' "$HOME/.local/bin/loom-daemon")"
+  [[ -x "$bin" ]] || return 3
+  out="$("$bin" merge-pr "$@" 2>/dev/null)" || return 3
+  printf '%s' "$out"
+}
+
 # Look up the branch attached to a worktree via porcelain. Prints the branch
 # short-name (without refs/heads/ prefix) on stdout. Returns 0 with empty
-# output for detached / bare worktrees (no branch line in the stanza).
+# output for detached / bare worktrees (no branch line in the stanza) — and,
+# per the `|| true`, for a failed `git`/parse too: the only thing a caller does
+# with this answer is decide whether to DELETE a branch, so no answer must read
+# as "delete nothing", never as an abort part-way through cleanup of state the
+# merge already committed.
 _worktree_branch_for() {
   local target="$1" target_abs
   target_abs="$(cd "$target" 2>/dev/null && pwd -P)" || target_abs="$target"
-  # The `worktree ` path line (prefix = 9 chars) may contain spaces, so parse
-  # it with substr($0, 10) rather than $2 (which truncates at the first space).
-  # The `branch ` line is safe with $2 — git ref names cannot contain spaces.
-  # Caveat: a path with a literal newline would still break this line-oriented
-  # parse; `--porcelain -z` would be needed for full robustness (#3717).
-  git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
-    awk -v p="$target_abs" '
-      /^worktree / { wt=substr($0, 10); br=""; next }
-      /^branch /   { br=$2 }
-      /^$/         { if (wt == p && br != "" && !found) { sub(/^refs\/heads\//, "", br); print br; found=1; exit } }
-      END          { if (wt == p && br != "" && !found) { sub(/^refs\/heads\//, "", br); print br } }
-    '
+  git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null \
+    | _mp_worktree worktree-branch-for --path "$target_abs" || true
 }
 
 # Print the absolute path of the PRIMARY (main) worktree — the FIRST `worktree`
 # entry of `git worktree list --porcelain`. Git always lists the main working
-# tree first, so `exit` after the first match is correct. Prints nothing on
-# error (e.g. not a git repo). Used by _remove_loom_worktree to hard-refuse
-# removing the primary checkout (#3710).
+# tree first, which is the whole definition. Used by _remove_loom_worktree to
+# hard-refuse removing the primary checkout (#3710), which is why this one does
+# NOT swallow its failures like the two neighbours: an empty answer here is read
+# as "not the primary" and authorises a removal, so "could not look it up" must
+# reach the caller as a non-zero return instead of as an empty string.
 _primary_worktree_path() {
-  # Parse the path via substr($0, 10) (strip the literal `worktree ` prefix, 9
-  # chars) so a primary checkout under a space-containing path is not truncated
-  # at the first space. Newline-in-path caveat: see _worktree_branch_for (#3717).
-  git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
-    awk '/^worktree / { print substr($0, 10); exit }'
+  local out; out="$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | _mp_worktree worktree-primary)" || return 3
+  printf '%s' "$out"
 }
 
 # _is_primary_worktree_path <path>
@@ -2500,28 +2538,24 @@ _primary_worktree_path() {
 # a removable worktree at all" from "this is a genuine linked worktree" so
 # callers never suggest `git worktree remove` / `--worktree-path` against the
 # primary checkout (#4171). Returns 1 (false) if either path fails to resolve.
+# Both its call sites only choose which REMEDIATION TEXT to print, so a lookup
+# failure degrades to false here; the removal decision itself is guarded in
+# _remove_loom_worktree, which fails closed instead.
 _is_primary_worktree_path() {
   local check_path="$1" check_real primary_real
   check_real="$(cd "$check_path" 2>/dev/null && pwd -P)" || check_real="$check_path"
-  primary_real="$(_primary_worktree_path)"
+  primary_real="$(_primary_worktree_path)" || primary_real=""
   [[ -n "$primary_real" ]] && [[ "$check_real" == "$primary_real" ]]
 }
 
 # Walk porcelain output for a worktree whose branch matches the given branch
 # short-name. Prints the worktree absolute path or nothing. Skips detached /
-# bare entries (they have no `branch refs/heads/...` line).
+# bare entries (they have no `branch refs/heads/...` line). Swallows failure to
+# "nothing found" for the same reason _worktree_branch_for does: the caller
+# either preserves the worktree or prints advice, never destroys on an absence.
 _find_worktree_by_branch() {
-  local want_branch="$1"
-  # `worktree ` path parsed via substr($0, 10) (space-safe); `branch ` via $2
-  # (ref names cannot contain spaces). Newline-in-path caveat: see
-  # _worktree_branch_for (#3717).
-  git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
-    awk -v want="refs/heads/${want_branch}" '
-      /^worktree / { wt=substr($0, 10); br=""; next }
-      /^branch /   { br=$2 }
-      /^$/         { if (br == want && !found) { print wt; found=1; exit } }
-      END          { if (br == want && !found) { print wt } }
-    '
+  git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null \
+    | _mp_worktree worktree-find-by-branch --branch "$1" || true
 }
 
 # The worktree-preserve decisions below (#6694) and the branch-delete safety
@@ -2613,8 +2647,18 @@ _remove_loom_worktree() {
   # tree: git fails safe ("Could not remove worktree"), but the attempt is a
   # logic error and emits a misleading Removing/Could-not-remove pair. Refuse
   # here, before any sentinel or CWD handling.
+  #
+  # #8191 slice: the lookup itself can now FAIL (the parse moved into
+  # loom-daemon, which can be missing, unreadable, or predate the subcommand) as
+  # distinct from returning nothing. Those must not be conflated — an empty
+  # answer means "git reported no worktrees", while a failed lookup means this
+  # guard did not run, and a guard that did not run must refuse the removal
+  # rather than wave it through. Skipped cleanup is always recoverable
+  # (loom-clean, the daemon's reaper); removing the primary checkout is not.
   local primary_real
-  primary_real="$(_primary_worktree_path)"
+  if ! primary_real="$(_primary_worktree_path)"; then
+    warning "Refusing to remove worktree at $worktree_real — the primary-worktree guard (#3710) could not run: 'loom-daemon merge-pr worktree-primary' failed, so whether this path IS the primary checkout is unknown. Best-effort cleanup only; the merge itself already succeeded and is unaffected. Remove it by hand once loom-daemon is available, if it really is a worktree: git -C \"$REPO_ROOT\" worktree remove \"$worktree_real\" --force $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" 2>/dev/null || true)")"; return 0
+  fi
   if [[ -n "$primary_real" ]] && [[ "$worktree_real" == "$primary_real" ]]; then
     warning "Refusing to remove the primary/main worktree at $worktree_real (never removable regardless of .loom-managed sentinel, branch, or worktree.root)"
     return 0
