@@ -216,6 +216,54 @@ fn a_late_committed_step_is_counted_exactly_once() {
     assert!(third.is_empty(), "never counted again");
 }
 
+/// #9013 item 1: an open row whose backing `message` row is deleted (e.g. a
+/// session deletion) is dropped from `open` on the very next poll — it does
+/// not linger until `OPEN_ROW_MAX_AGE_SECS`, and does not keep pinning the
+/// read floor low for rows that were never deleted.
+#[test]
+fn a_deleted_open_row_is_dropped_immediately_not_after_the_age_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    let conn = store(&db);
+    let base = Utc::now() - Duration::seconds(3600);
+    start(&conn, "stuck", "zai", base);
+    start(&conn, "keeper", "zai", base + Duration::seconds(5));
+    complete(&conn, "keeper", base + Duration::seconds(6), (1, 1, 0, 0));
+    let mut source = OpencodeSource {
+        dbs: Some(vec![db.clone()]),
+        ..OpencodeSource::default()
+    };
+    let mut out = Vec::new();
+    let emit = super::super::burn::Emit {
+        not_before: base,
+        now: base + Duration::seconds(60),
+    };
+    super::super::burn::BurnSource::poll(&mut source, emit, &mut out);
+    assert_eq!(
+        source.cursor(&db).unwrap().floor(),
+        0,
+        "stuck (rowid 1) is open, pinning the floor"
+    );
+
+    // The session behind "stuck" is deleted (OpenCode's session-delete path).
+    conn.execute("DELETE FROM message WHERE id = 'stuck'", [])
+        .unwrap();
+    out.clear();
+    // Well before OPEN_ROW_MAX_AGE_SECS: the age bound alone would not have
+    // released it yet.
+    let soon = super::super::burn::Emit {
+        not_before: base,
+        now: base + Duration::seconds(120),
+    };
+    super::super::burn::BurnSource::poll(&mut source, soon, &mut out);
+    assert_eq!(
+        source.cursor(&db).unwrap().floor(),
+        2,
+        "the deleted row is confirmed gone and dropped right away, not held for the 6h age bound"
+    );
+    assert!(out.is_empty(), "a deleted row was never usage");
+}
+
 /// A step that never completes is forgotten after the stated bound, so it
 /// cannot pin the read floor forever.
 #[test]

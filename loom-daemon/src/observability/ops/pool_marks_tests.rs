@@ -131,11 +131,35 @@ fn an_api_key_credential_failure_writes_no_mark_and_emits_nothing() {
 
 #[test]
 fn a_codex_outcome_with_no_hold_emits_nothing() {
-    let ((), captured) = capture(|| record_codex(TerminalClassification::Success));
+    let ((), captured) = capture(|| record_codex(TerminalClassification::Success, false));
     assert!(captured.metrics.is_empty());
-    let ((), captured) = capture(|| record_codex(TerminalClassification::TokenExhausted));
+    let ((), captured) = capture(|| record_codex(TerminalClassification::TokenExhausted, false));
     assert_eq!(captured.metrics[0].labels["reason"], "exhausted");
     assert_eq!(captured.metrics[0].labels["provider"], "codex");
+}
+
+/// #9013 item 4: once an account is already `ReauthRequired`, `health.rs`
+/// writes no new hold for any later classification — so a mark for one
+/// (e.g. `Recoverable`, which would otherwise report `transient`) is an
+/// over-count and must be suppressed.
+#[test]
+fn a_classification_recorded_while_already_reauth_required_emits_no_mark() {
+    let ((), captured) = capture(|| record_codex(TerminalClassification::Recoverable, true));
+    assert!(captured.metrics.is_empty(), "no new hold was written — no mark");
+
+    // The same classification with no prior ReauthRequired hold still marks
+    // normally: suppression is scoped to the sticky-hold case, not global.
+    let ((), captured) = capture(|| record_codex(TerminalClassification::Recoverable, false));
+    assert_eq!(captured.metrics[0].labels["reason"], "transient");
+
+    // `TokenExpired` freshly setting ReauthRequired (prior reason was NOT
+    // already ReauthRequired) is the one legitimate new hold and still marks.
+    let ((), captured) = capture(|| record_codex(TerminalClassification::TokenExpired, false));
+    assert_eq!(captured.metrics[0].labels["reason"], "credential");
+    // But a repeat TokenExpired while already ReauthRequired is another
+    // over-count case and is suppressed the same way.
+    let ((), captured) = capture(|| record_codex(TerminalClassification::TokenExpired, true));
+    assert!(captured.metrics.is_empty());
 }
 
 #[test]

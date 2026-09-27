@@ -74,6 +74,7 @@ pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<bool> {
             crate::claim_reconciliation::run_reconciliation_pass(&fallback_root, true);
             run_startup_quarantine_pass(&quarantine_root);
             run_startup_profile_provisioning_pass(&quarantine_root);
+            run_startup_trace_join_reconciliation_pass(&quarantine_root);
         })
         .await;
         // A `send` error just means every receiver — including the one this
@@ -208,6 +209,37 @@ fn run_startup_profile_provisioning_pass(fallback_root: &Path) {
     }
 }
 
+/// The trace-join half of the startup pass (Issue #9013 item 3): a
+/// `session.summary` ↔ execution trace join entry
+/// (`observability::runtime_usage::join`) left open with no live process
+/// since the last restart can only be orphaned — the daemon exited (crash or
+/// otherwise) before the terminal transition that would have closed it. Left
+/// alone it keeps matching every session of its issue, turning re-dispatches
+/// ambiguous, for up to the entry's full 7-day open-retention window; closing
+/// it here bounds that to the ordinary closed-entry retention instead. Scans
+/// every registered workspace; a workspace with no join directory is a no-op.
+fn run_startup_trace_join_reconciliation_pass(fallback_root: &Path) {
+    let workspace_registry =
+        crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+    let roots = workspace_registry.effective_roots(fallback_root);
+    let mut total_closed = 0usize;
+    for root in &roots {
+        total_closed += crate::observability::runtime_usage::join::close_orphaned_entries(root);
+    }
+    if total_closed > 0 {
+        log::info!(
+            "runtime_usage::join: startup pass closed {total_closed} orphaned trace-join \
+             entries across {} workspace(s) (#9013)",
+            roots.len()
+        );
+    } else {
+        log::debug!(
+            "runtime_usage::join: startup pass checked {} workspace(s), nothing orphaned",
+            roots.len()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +307,60 @@ mod tests {
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
         std::env::remove_var("LOOM_CODEX_DEFAULT_HOME");
         std::env::remove_var("LOOM_CODEX_HOOKS_SCRIPT");
+    }
+
+    /// Issue #9013 item 3, daemon half: the wired startup pass closes an
+    /// entry left open under a registered workspace, exactly like the
+    /// underlying `join::close_orphaned_entries` unit tests already pin,
+    /// proving the two are actually connected end to end.
+    #[test]
+    #[serial]
+    fn the_startup_pass_closes_orphaned_trace_join_entries_in_every_registered_workspace() {
+        use crate::observability::runtime_usage::join::{
+            context_for_session_at, JoinEntry, JOIN_DIR,
+        };
+        use crate::telemetry::trace::TraceContext;
+        use crate::workspace_registry::{WorkspaceRegistry, REGISTRY_PATH_ENV};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let dir = workspace.join(JOIN_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let context = TraceContext::root(true);
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(30);
+        let orphan = JoinEntry {
+            issue: 9013,
+            context: context.clone(),
+            started_at,
+            ended_at: None,
+        };
+        std::fs::write(
+            dir.join(format!("{}.json", context.trace_id.as_str())),
+            serde_json::to_vec(&orphan).unwrap(),
+        )
+        .unwrap();
+
+        let registry_path = tmp.path().join("workspaces.json");
+        let mut registry = WorkspaceRegistry::default();
+        registry.add(&workspace, None).unwrap();
+        registry.save(&registry_path).unwrap();
+        std::env::set_var(REGISTRY_PATH_ENV, &registry_path);
+
+        run_startup_trace_join_reconciliation_pass(&workspace);
+
+        std::env::remove_var(REGISTRY_PATH_ENV);
+
+        // Closed, so a session starting well after it no longer matches —
+        // the whole point of bounding retention down from the pass.
+        let cwd = workspace.to_string_lossy().into_owned();
+        let now = chrono::Utc::now();
+        let far_after = Some(now + chrono::Duration::minutes(5));
+        assert_eq!(context_for_session_at(Some(&cwd), Some(9013), far_after, now), None);
+        // But one starting inside its original window still joins — proving
+        // the pass closed it (bounded retention) rather than deleting it.
+        let inside = Some(started_at + chrono::Duration::minutes(1));
+        assert_eq!(context_for_session_at(Some(&cwd), Some(9013), inside, now), Some(context));
     }
 
     /// The completion signal must not flip to `true` before the injected
