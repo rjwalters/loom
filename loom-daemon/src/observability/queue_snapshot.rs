@@ -21,7 +21,6 @@
 //! registered and [`record`] returns before doing any work.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -150,9 +149,11 @@ pub fn build_record(
     }
 }
 
-/// Resolve every workspace root `summary` names to its slug and visibility.
-/// Only absolute paths are probed. The single-workspace loop's
-/// `workspace #N` placeholders stay unresolved.
+/// Resolve every workspace root `summary` names to its slug and visibility,
+/// through the shared [`super::repo_ref::resolve_repo_refs`] (also used by
+/// `ops::disposition` since Issue #9222) so the two callers cannot drift onto
+/// different resolution rules. Only absolute paths are probed; the
+/// single-workspace loop's `workspace #N` placeholders stay unresolved.
 async fn resolve_repos(
     summary: &WorkFinderTickSummary,
     slug_cache: &mut HashMap<String, String>,
@@ -163,24 +164,7 @@ async fn resolve_repos(
         .map(|r| r.repo.as_str())
         .chain(summary.listing_failed.iter().map(String::as_str))
         .collect();
-    let mut repos = HashMap::new();
-    for root in roots {
-        if !Path::new(root).is_absolute() {
-            continue;
-        }
-        let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, root).await else {
-            continue;
-        };
-        let visibility = super::collector::resolve_visibility(&slug).await;
-        repos.insert(
-            root.to_string(),
-            QueueRepoRef {
-                repo: slug,
-                visibility,
-            },
-        );
-    }
-    repos
+    super::repo_ref::resolve_repo_refs(roots, slug_cache).await
 }
 
 /// Emit a snapshot of the last work-finder tick when a native sink is

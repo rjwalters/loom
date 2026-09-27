@@ -5,6 +5,17 @@ use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 use chrono::Utc;
 
 #[test]
+fn dispatch_disposition_span_name_round_trips_next_to_admission() {
+    for name in [SpanName::DispatchAdmission, SpanName::DispatchDisposition] {
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, format!("\"{}\"", name.as_str()));
+        let back: SpanName = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.as_str(), name.as_str());
+    }
+    assert_eq!(SpanName::DispatchDisposition.as_str(), "loom.dispatch.disposition");
+}
+
+#[test]
 fn context_roundtrip_rejects_zero_uppercase_and_future_versions() {
     let context = TraceContext::root(true);
     assert_eq!(TraceContext::parse(&context.traceparent()).unwrap(), context);

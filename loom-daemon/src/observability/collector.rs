@@ -607,6 +607,10 @@ async fn sample_snapshots(
     // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
     // listings plus a bounded per-item budget; a no-op without the ops sink.
     super::ops::stage_dwell::record(workspace_pool, slug_cache).await;
+    // Per-issue dispatch disposition spans (Issue #9222), OTLP-only: a no-op
+    // without the ops sink, and without a new work-finder tick since the last
+    // export pass.
+    super::ops::disposition::record(slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant

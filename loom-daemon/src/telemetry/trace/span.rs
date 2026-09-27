@@ -41,6 +41,11 @@ pub enum SpanName {
     /// tick's [`Self::DispatchTick`] span.
     #[serde(rename = "loom.dispatch.admission")]
     DispatchAdmission,
+    /// One ready-queue row's disposition, emitted on a transition, a periodic
+    /// refresh, or the row leaving the queue (Issue #9222), parented to its
+    /// tick's [`Self::DispatchTick`] span when the tick is still known.
+    #[serde(rename = "loom.dispatch.disposition")]
+    DispatchDisposition,
 }
 
 impl SpanName {
@@ -59,6 +64,7 @@ impl SpanName {
             Self::RuntimeUsage => "loom.runtime.usage",
             Self::PoolHold => "loom.pool.hold",
             Self::DispatchAdmission => "loom.dispatch.admission",
+            Self::DispatchDisposition => "loom.dispatch.disposition",
         }
     }
 }
