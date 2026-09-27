@@ -39,6 +39,7 @@ mod merge_pr_labels;
 mod merge_pr_loom_pr_guard;
 mod merge_pr_redate;
 mod merge_pr_refs;
+mod merge_pr_stacked_children;
 mod merge_pr_stale_checks;
 mod merge_pr_version_policy;
 mod merge_pr_zero_checks;

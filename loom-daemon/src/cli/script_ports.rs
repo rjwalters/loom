@@ -435,6 +435,16 @@ pub(crate) enum MergePrCommand {
     /// forbidden version edit; output is `WARNING`/`BLOCK<TAB>line` records
     /// — see `cli::merge_pr_version_policy`.
     VersionPolicy(super::merge_pr_version_policy::VersionPolicyArgs),
+
+    /// The pre-merge merge-ordering guard (#3747 item 2, reshaped by #7982):
+    /// discover open CHILD PRs still targeting this parent branch and
+    /// ESTABLISH the postcondition `reconcile-stack.sh` needs by pinning the
+    /// parent tip to `refs/loom/parent/<branch>`. Exit 0 = proceed (skip,
+    /// bypass, dry-run report, or pin written), 1 = the tip could not be
+    /// pinned, which is the one case still refused. Output is
+    /// `CHILDREN`/`PIN-WRITTEN`/`WARNING`/`BLOCK` records — see
+    /// `cli::merge_pr_stacked_children`.
+    StackedChildren(super::merge_pr_stacked_children::StackedChildrenArgs),
 }
 
 impl MergePrCommand {
@@ -450,6 +460,7 @@ impl MergePrCommand {
             MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
+            MergePrCommand::StackedChildren(args) => args.run(),
         }
     }
 }
