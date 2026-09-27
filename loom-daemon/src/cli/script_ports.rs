@@ -81,6 +81,20 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     WorktreeLock(super::worktree_lock::WorktreeLockCommand),
 
+    /// `worktree.sh`/`spawn-claude.sh`/`lib/cargo-target-dir.sh`'s per-worktree
+    /// cargo target dir (#8458): provision one and record its marker, derive
+    /// the path a not-yet-created worktree would get, or answer the two
+    /// removal-side predicates (`is-attributable`, `marker`). The two creation
+    /// verbs exit 0 always — "the feature is off" is an answer, not an error,
+    /// and must never abort a worktree creation over a build-cache
+    /// optimisation. The two predicates use their exit code as the answer.
+    /// `resolve` + `reclaim` (#9153) are `merge-pr.sh`'s post-merge #7239
+    /// reclaim — the last bash copy of that call sequence — split at the point
+    /// the removal has to happen: `cargo metadata` needs the manifest that is
+    /// about to disappear. Both exit 0 always; the merge already succeeded.
+    #[command(subcommand)]
+    CargoTargetDir(super::cargo_target_dir::CargoTargetDirCommand),
+
     /// `worktree.sh`'s WIP-shelving verbs (#8195, slice 2): `snapshot`,
     /// `stash-push`, `stash-pop`. The part of that script whose entire purpose
     /// is not losing somebody's uncommitted work — and whose `stash-push` runs
@@ -314,6 +328,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
+            ScriptPortCommand::CargoTargetDir(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeWip(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeRemove(args) => args.run(),
             ScriptPortCommand::WorktreeLink(args) => args.run(),

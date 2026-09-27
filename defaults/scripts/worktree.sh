@@ -63,6 +63,11 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/default-branch.sh"
 # `worktree_ops/cargo_target.rs`), so the port calls those directly rather than
 # keeping a second bash implementation alive. The ledger's line format is
 # unchanged, so one grep/jq still reads every removal path's entries together.
+#
+# #8458's per-worktree CARGO_TARGET_DIR needs nothing sourced here either: the
+# create path below drives `loom-daemon cargo-target-dir provision` straight
+# off the located binary, and every removal path reads the marker through the
+# same daemon (`cargo-target-dir is-attributable|marker`).
 
 # Shared "has this branch landed?" primitive (#7812): forge PR state first,
 # then `git merge-tree --write-tree` tree equality, answering landed /
@@ -646,6 +651,7 @@ _worktree_remove_verb() {
 # considered your tree and declined" rather than "this install is broken". The
 # explicit check below reports 2 instead — the one thing the exit codes must
 # never do is lie about which of those happened.
+# requires-daemon: cargo-target-dir optional  #8458 — per-worktree CARGO_TARGET_DIR; a host whose binary predates it (or has none) simply gets no per-worktree dir, which is the pre-#8458 behaviour
 # requires-daemon: worktree-wip >= 0.19.224  #8433 (#8195 slice 2) — the WIP-verb port; without it the stub exits 2 and the verbs refuse
 _worktree_wip_verb() {
     _worktree_source_script_helper "$1"
@@ -2004,6 +2010,29 @@ if _try_worktree_add; then
     elif [[ "$JSON_OUTPUT" != "true" ]]; then
         print_warning "No loom-daemon resolved - skipping node_modules/.mcp.json/linkPaths symlinks (worktree still created)"
     fi
+
+    # #8458: give this worktree its own Cargo target dir under the otherwise
+    # shared root and record it in the `.loom-cargo-target-dir` marker, so the
+    # removal paths (`loom-daemon worktree-remove`, merge-pr.sh, `loom-daemon
+    # clean`, the reaper) can attribute and reclaim it. Off unless the repo opts
+    # in; a pure no-op on
+    # a host whose Cargo output is not redirected outside the worktree.
+    #
+    # Sets LOOM_WORKTREE_CARGO_TARGET_DIR for the post-worktree hook below —
+    # NOT CARGO_TARGET_DIR, which would make the hook's main-workspace binary
+    # lookup miss and reintroduce #6013/#6014's rebuild storm.
+    #
+    # Always `|| true`: the daemon binary may not be built yet (this runs at
+    # worktree creation, before the hook that seeds one), and a build-cache
+    # optimisation must never fail a worktree creation. Empty stdout means
+    # "no directory" — the subcommand exits 0 for every not-applicable case.
+    # `--report`'s stderr is deliberately NOT swallowed (stdout is the directory,
+    # which `--json` mode needs clean): it is the one operator-visible sign the
+    # scheme is on. Exporting an empty value is harmless — every consumer tests
+    # `-n` — so no second statement is needed to unset it.
+    _pwt_bin="$(loom_locate_daemon_bin "$MAIN_WORKSPACE_DIR" 2>/dev/null || true)"
+    [[ -z "${_pwt_bin:-}" ]] || export LOOM_WORKTREE_CARGO_TARGET_DIR="$("$_pwt_bin" cargo-target-dir \
+        provision --repo-root "$MAIN_WORKSPACE_DIR" --report "$ABS_WORKTREE_PATH" || true)"
 
     # Run project-specific post-worktree hook if it exists
     # This allows projects to add custom setup steps (e.g., pnpm install, lake exe cache get)

@@ -1468,6 +1468,14 @@ jobs:
         run: bash defaults/scripts/tests/test-check-stale-blocked.sh
       - name: merge-pr verdict-label contradiction guard (#8112, #8191 slice 2)
         run: bash defaults/scripts/tests/test-merge-pr-verdict-label-guard.sh
+      # #8458: the per-worktree cargo target dir. Its creation half
+      # (`cargo-target-dir provision|path`) and both removal-side predicates
+      # (`is-attributable`, `marker`) are loom-daemon subcommands, and the suite
+      # pins the working-tree binary via lib/require-daemon-bin.sh — so it needs
+      # the shared build this job downloads, not shell-suite-tests'
+      # toolchain-free runner.
+      - name: per-worktree cargo target dir (#8458)
+        run: bash defaults/scripts/tests/test-per-worktree-target-dir.sh
       - name: merge-pr loom:pr review-signal guard (#7419, #8191 slice)
         run: bash defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh
       - name: merge-pr PR-label fetch freshness (#8550)

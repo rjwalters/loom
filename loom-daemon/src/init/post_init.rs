@@ -154,6 +154,15 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // Worktree sentinel dropped by worktree.sh into each issue worktree; must be
     // ignored so a builder's `git add -A` doesn't sweep it into a commit (#3778).
     ".loom-managed",
+    // Per-worktree cargo target dir marker (#8458): written into each issue
+    // worktree by `loom-daemon cargo-target-dir provision`, recording the
+    // `<root>/wt/<worktree name>` directory that worktree builds into so every
+    // removal path can attribute and reclaim it. Same family as `.loom-managed`
+    // — Loom-owned runtime state, must never be swept into a commit by `git add
+    // -A`, and must stay untracked so it is born absent in a fresh worktree
+    // (a tracked copy on main would claim a target dir for every worktree at
+    // once, which the shape check would then reject in all but one of them).
+    ".loom-cargo-target-dir",
     // Builder "no changes needed" marker (builder.md § "Signaling No Changes
     // Needed"). Must stay untracked/gitignored so it is born absent in every
     // fresh worktree and a deliberate write doesn't get swept into a commit by
