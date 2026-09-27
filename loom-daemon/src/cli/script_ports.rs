@@ -428,6 +428,13 @@ pub(crate) enum MergePrCommand {
     /// errors, or a required context present, keeps #6169's full wait. Always
     /// exits 0 with one sentinel-led line — see `cli::merge_pr_zero_checks`.
     ZeroChecksSettle(super::merge_pr_zero_checks::ZeroChecksSettleArgs),
+
+    /// The pre-merge no-hand-bump guard (#7827) and its oracle choice
+    /// (#8284): run the canonical version checker from the right ref against
+    /// the merge base. Exit 0 = pass/skip/dry-run report, 1 = confirmed
+    /// forbidden version edit; output is `WARNING`/`BLOCK<TAB>line` records
+    /// — see `cli::merge_pr_version_policy`.
+    VersionPolicy(super::merge_pr_version_policy::VersionPolicyArgs),
 }
 
 impl MergePrCommand {
@@ -442,6 +449,7 @@ impl MergePrCommand {
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
+            MergePrCommand::VersionPolicy(args) => args.run(),
         }
     }
 }

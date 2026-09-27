@@ -743,105 +743,25 @@ _check_no_open_stacked_children() {
 _check_no_open_stacked_children
 
 # ---------------------------------------------------------------------------
-# Pre-merge version policy guard (#7827, replacing #7302's collision policy).
-# Feature PRs must not hand-edit versions: the merge workflow owns bumps.
-# Reuse the canonical checker in the same --forbid-bump mode as CI. It
-# compares against the merge base, so concurrent changes on main cannot be
-# mistaken for edits authored by this PR. Keep legacy checker mode intact
-# for downstream consumers that still require explicit surface bumps.
-# Guard faults retain the existing best-effort behavior; only a confirmed
-# forbidden version edit blocks. Dry-run reports without attempting a merge.
-#
-# WHICH REF'S CHECKER IS THE ORACLE (#8284): normally the operator checkout's
-# copy — i.e. the default branch's — which is the right oracle for every PR
-# that does not change the version policy itself. It is the WRONG oracle for a
-# PR whose whole purpose is to change the version-bearing SET, because the
-# default branch's copy still encodes the OLD set: such a PR can never pass a
-# guard that runs it. Not hypothetical — PR #8190 (#8147, dropping CLAUDE.md
-# from the set) was blocked here by main's checker reporting
-# `CLAUDE.md: '0.19.168' -> ''`, while CI's `defaults-version-bump-check` job
-# — which checks out `pull_request.head.sha` and runs the checker from THAT
-# tree — passed on the same commit. The operator merged it with a hand-patched
-# scratch copy of this script.
-#
-# So when this PR's OWN commits (merge-base..head, so base-branch drift never
-# counts) touch the version-policy machinery — the checker itself,
-# version-check-gate.sh, or scripts/version.sh, the three files that define
-# what "version-bearing" means — extract the checker from the PR HEAD and
-# evaluate that instead, exactly as CI does, and name the ref used in the
-# guard's output. A head lookup that fails falls BACK to the default branch's
-# copy (saying so) rather than skipping the comparison: a lookup error must
-# never become a free pass.
+# Pre-merge version policy guard (#7827): feature PRs must not hand-edit a
+# version-bearing value — the merge workflow owns bumps (#7743). The guard is
+# `loom-daemon merge-pr version-policy` (Rust, loom-daemon/src/merge_pr/
+# version_policy.rs — #8191 slice): it runs the canonical
+# check-defaults-version-bump.sh --forbid-bump against the merge base, from the
+# PR head's copy when the PR's own commits change the version-policy machinery
+# (#8284), and classifies pass / skip / block. It prints `WARNING`/`BLOCK<TAB>
+# line` records, replayed here through warning/error; exit 1 = confirmed edit.
+# Any other exit (a missing or older daemon) is a guard fault, and guard faults
+# have always skipped with a warning here, never blocked: CI's
+# defaults-version-bump-check job is the policy's primary enforcement (see the
+# CLI module docs for why this gate alone does not fail closed).
 _check_defaults_version_bump_collision() {
-  local checker_rel="defaults/scripts/check-defaults-version-bump.sh" check_script="$REPO_ROOT/defaults/scripts/check-defaults-version-bump.sh" current_main_sha="" merge_base="" head_checker=""
-  [[ -x "$check_script" ]] || return 0
-  [[ -n "${DEFAULT_BRANCH_NAME:-}" ]] || return 0
-  [[ -n "${PR_HEAD_SHA:-}" ]] || return 0
-  [[ -n "${PR_BRANCH:-}" ]] || return 0
-
-  # Best-effort fetch of the default branch's current tip and this PR's own
-  # branch. A failure here (offline, transient forge issue) means the guard
-  # cannot see anything fresher than what's already local — skip rather than
-  # block on stale/missing data. `|| return 0` (not `|| true`) keeps this a
-  # single early-exit instead of proceeding with a possibly-stale fetch.
-  git -C "$REPO_ROOT" fetch --quiet origin "$DEFAULT_BRANCH_NAME" "$PR_BRANCH" 2>/dev/null || return 0
-
-  current_main_sha="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "origin/$DEFAULT_BRANCH_NAME" 2>/dev/null || true)"
-  [[ -n "$current_main_sha" ]] || return 0
-
-  # The PR head commit must be reachable locally post-fetch (it will be,
-  # having just fetched PR_BRANCH above) — guards a fork-PR or
-  # already-deleted-branch edge case where it might not resolve.
-  git -C "$REPO_ROOT" rev-parse --verify --quiet "${PR_HEAD_SHA}^{commit}" >/dev/null 2>&1 || return 0
-
-  # The checker's shallow-history fallback compares raw tips. That cannot
-  # establish who changed a version; refuse to label it a confirmed edit.
-  # The merge base is also what scopes the machinery-touch test below to this
-  # PR's own commits, so it is captured rather than discarded.
-  if ! merge_base="$(git -C "$REPO_ROOT" merge-base "$current_main_sha" "$PR_HEAD_SHA" 2>/dev/null)"; then
-    warning "Version policy guard: PR ancestry unavailable; skipping unverified comparison."
-    return 0
-  fi
-
-  local check_output check_rc=0 checker_ref="'$DEFAULT_BRANCH_NAME' ($current_main_sha)"
-
-  # Does this PR's own diff change the version-policy machinery? If so the
-  # PR head's checker is the oracle, matching CI (see the header above).
-  if [[ -n "$(git -C "$REPO_ROOT" diff --name-only "$merge_base" "$PR_HEAD_SHA" -- "$checker_rel" defaults/scripts/version-check-gate.sh scripts/version.sh 2>/dev/null)" ]]; then
-    head_checker="$(mktemp "${TMPDIR:-/tmp}/loom-version-policy-checker.XXXXXX")"
-    if git -C "$REPO_ROOT" show "$PR_HEAD_SHA:$checker_rel" >"$head_checker" 2>/dev/null && [[ -s "$head_checker" ]] && chmod +x "$head_checker"; then
-      check_script="$head_checker"; checker_ref="the PR head ($PR_HEAD_SHA)"
-    else rm -f "$head_checker"; head_checker=""; fi
-    warning "Version policy guard: this PR's own commits change the version-policy machinery, so the guard evaluates the checker from $checker_ref — the ref CI's defaults-version-bump-check job evaluates (#8284). A head lookup that fails falls back to '$DEFAULT_BRANCH_NAME''s copy, never to skipping the check."
-  fi
-
-  check_output=$(cd "$REPO_ROOT" && "$check_script" --forbid-bump --base "$current_main_sha" --head "$PR_HEAD_SHA" 2>&1) || check_rc=$?
-  [[ -z "$head_checker" ]] || rm -f "$head_checker"
-
-  [[ "$check_rc" -ne 0 ]] || return 0
-
-  # A non-zero, non-1 exit (bad usage, unresolved ref) is a guard-internal
-  # problem, not a confirmed version edit — report and skip rather than block a
-  # merge on a guard fault.
-  if [[ "$check_rc" -ne 1 ]]; then
-    warning "Version policy guard: check-defaults-version-bump.sh (from $checker_ref) exited $check_rc against current '$DEFAULT_BRANCH_NAME' ($current_main_sha) — skipping (not a confirmed version edit):"$'\n'"$check_output"; return 0
-  fi
-
-  local msg="Merge blocked: PR #$PR_NUMBER hand-edits a version-bearing value (#7827).
-
-$check_output
-
-Revert the version-value changes authored by this PR, preserving its other changes,
-then rerun CI and review. Version bumps are applied automatically by the merge workflow
-(#7743); a no-surface-change marker cannot waive this policy. (Checker from $checker_ref.)"
-
-  # --dry-run still runs the guard and REPORTS the would-be block, but honors
-  # the dry-run contract (never exits 1) — same shape as the guard above.
-  if [[ "$DRY_RUN" == "true" ]]; then
-    warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: forbidden version edit relative to '$DEFAULT_BRANCH_NAME' ($current_main_sha), per the checker from $checker_ref."; return 0
-  fi
-
-  error "$msg"
+  local out rc=0 level text blk="" dry=(); [[ "${DRY_RUN:-false}" != "true" ]] || dry=(--dry-run)
+  out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr version-policy --repo-root "$REPO_ROOT" --default-branch "${DEFAULT_BRANCH_NAME:-}" --branch "${PR_BRANCH:-}" --head-sha "${PR_HEAD_SHA:-}" --pr "${PR_NUMBER:-}" ${dry[@]+"${dry[@]}"})" || rc=$?
+  while IFS=$'\t' read -r level text; do case "$level" in WARNING) warning "$text" ;; BLOCK) blk+="${blk:+$'\n'}$text" ;; esac; done <<< "$out"
+  [[ $rc -ne 1 || -z "$blk" ]] || error "$blk"
+  [[ $rc -eq 0 ]] || warning "Version policy guard (#7827) did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr version-policy' exited $rc (a loom-daemon predating #8191's slice has no such verb). Skipping, as for any guard fault: CI's defaults-version-bump-check job still enforces the policy. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+  return 0
 }
 
 # Invoke this guard too, before either merge path attempts the actual merge

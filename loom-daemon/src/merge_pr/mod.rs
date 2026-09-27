@@ -79,6 +79,12 @@
 //! is the only member of the family that never refuses anything — and the port
 //! fixes two ways the retired `grep | tail -1 | sed` pipeline lost the warning
 //! silently, which for a check nothing else duplicates is the whole risk.
+//!
+//! [`version_policy`] is the pre-merge no-hand-bump guard (#7827) and its
+//! oracle choice (#8284): everything `merge-pr.sh` wrapped around the
+//! canonical `check-defaults-version-bump.sh` — fetch, ancestry, which ref's
+//! checker to trust, and the pass / skip / block classification. The checker
+//! itself stays shell, because it is CI's contract too.
 
 pub mod dirty_guard;
 pub mod head_sync;
@@ -88,4 +94,5 @@ pub mod loom_pr_guard;
 pub mod redate;
 pub mod refs;
 pub mod stale_checks;
+pub mod version_policy;
 pub mod zero_checks;
