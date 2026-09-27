@@ -54,6 +54,7 @@ pub(crate) mod opencode_usage_cli;
 mod park_record;
 pub(crate) mod peer_claims_cmd;
 pub(crate) mod pi_usage_cli;
+mod points_marker_check;
 mod pr_latency_cmd;
 mod pr_latency_render;
 pub(crate) mod premise_check;

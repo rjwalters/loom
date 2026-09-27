@@ -4206,6 +4206,9 @@ concurrency ceiling 5" and share it with the team:
       "logCaptureEnabled": false,
       "logCaptureMaxBytes": 5242880,
       "logCaptureExcludedRepos": []
+    },
+    "sweepOutcomeWriteback": {
+      "enabled": false
     }
   }
 }
@@ -4341,6 +4344,50 @@ knobs not yet audited here.
 | `autonomous.ciTelemetry.logCaptureEnabled` | `LOOM_CI_TELEMETRY_LOG_CAPTURE_ENABLED` | `false` | Phase 2 (#8825) gate. **Restart required** — resolved once by `spawn_task` before the poll loop starts |
 | `autonomous.ciTelemetry.logCaptureMaxBytes` | `LOOM_CI_TELEMETRY_LOG_CAPTURE_MAX_BYTES` | `5242880` (5 MiB) | Per-job cap on captured log text. Zero/invalid → default. **Restart required** |
 | `autonomous.ciTelemetry.logCaptureExcludedRepos` | *(config only)* | `[]` | Repos excluded from **log capture only** — their `ci.run`/`ci.job` records and duration metrics are still captured unconditionally, same admission rule (`repo` + non-empty `reason`) as `excludedRepos`. Distinct key from `excludedRepos` deliberately: excluding a repo there would also drop its metrics, which the ci-observability policy forbids. **Restart required** |
+| `autonomous.sweepOutcomeWriteback.enabled` | `LOOM_SWEEP_OUTCOME_WRITEBACK` | `false` | Post-`Success` issue write-back comment (#9056). Opt-in, unlike the safety backstops above — it posts a forge-visible comment, not a dispatch decision. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. Resolved fresh at each terminal `Success` transition (not cached at startup), so a config edit takes effect on the very next sweep to finish with no daemon restart. See "Sweep-outcome issue write-back (#9056)" below |
+
+### Sweep-outcome issue write-back (#9056)
+
+At a sweep's terminal **`Success`** transition — never on failure, cancellation,
+or a `loom:blocked` stop, to avoid comment spam on every dead-end attempt — the
+daemon can post ONE Markdown comment onto the sweep's **issue** (not just its
+PR) summarizing the already-assembled `sweep.outcome` telemetry record
+(`loom-daemon/src/telemetry/mod.rs`): the Curator's `loom:complexity` /
+`loom:points` estimate (see "Points estimate marker" in `curator.md`), actual
+token burn, wall-clock duration (total and per phase), Doctor cycle count, and
+the first-pass Judge verdict. This is the write-back half of #9056; the
+matching estimate-side marker (`<!-- loom:points=<N> -->`) is documented in
+`defaults/roles/curator.md`.
+
+**Off by default.** Flip `autonomous.sweepOutcomeWriteback.enabled` (or
+`LOOM_SWEEP_OUTCOME_WRITEBACK=1`) to turn it on for a workspace.
+
+**Idempotent per sweep.** The comment carries a hidden
+`<!-- loom:sweep-outcome-writeback sweep=<sweep_id> -->` marker, and the daemon
+searches the issue's existing comments for THIS sweep's marker before posting —
+a hit skips the post entirely, while a different sweep on the same issue (a
+partial-increment slice, a re-opened issue, a re-dispatch) still posts its own
+actuals. So a terminal transition observed more than once (a defensive
+scenario, not a normal one: `append_outcome_journal` already fires exactly once
+per terminal transition by contract) can never double-post. An unreadable
+existing-comments check fails **closed** (skips posting that pass) rather than
+risking a duplicate — the comment is best-effort telemetry, so a rare missed
+post costs less than a rare duplicate.
+
+**Never blocks or fails the terminal transition.** Every forge call this
+feature makes — the points-marker read, the idempotency check, the comment
+post itself — runs only AFTER the durable `sweep.outcome` telemetry append, is
+bounded by `LOOM_REAP_GH_TIMEOUT_SECS`, and is best-effort: a `gh` failure,
+timeout, or missing repo context
+is logged and swallowed, exactly like the neighboring `complexity` marker read
+this rides alongside (`sweep_registry::outcome_journal::complexity_signal`).
+
+**Deliberately excludes CI minutes.** `loom-daemon ci-telemetry`'s `ci.run`/
+`ci.job` records (see [`ci-observability.md`](ci-observability.md)) are keyed
+by repo + run id with no existing join to a `sweep_id`/issue/PR — building that
+join is real, separate follow-up work, not yet implemented. The write-back
+comment says so explicitly rather than fabricating or omitting the field
+silently.
 
 ### Idle exit for remote hosts (#4467)
 

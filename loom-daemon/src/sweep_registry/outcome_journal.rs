@@ -10,6 +10,17 @@ pub(crate) mod label_timeline;
 /// #8542) — the source of the record's `complexity`.
 pub(crate) mod complexity_signal;
 
+/// The Curator points-estimate signal read off the sweep's issue body (Issue
+/// #9056), consumed only by [`writeback`] — see its own module doc for why
+/// this is a separate, conditionally-fetched read rather than a permanent
+/// `SweepOutcomeRecord` field like `complexity`.
+pub(crate) mod points_signal;
+
+/// The opt-in, post-`Success` issue write-back comment (Issue #9056): renders
+/// [`telemetry::SweepOutcomeRecord`] + [`points_signal`]'s estimate to
+/// Markdown and posts it, once, to the sweep's originating issue.
+pub(crate) mod writeback;
+
 /// One observed lifecycle-phase transition for a live sweep (Issue #4704):
 /// the checkpoint phase marker and the instant [`SweepRegistry::reap_once`]
 /// first observed it.
@@ -704,6 +715,16 @@ impl SweepRegistry {
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
             complexity,
         };
+        // Issue #9056: opt-in, post-`Success`-only issue write-back comment.
+        // Only a clone of the assembled record is taken HERE (`outcome_record`
+        // itself moves into the telemetry envelope below); every forge call —
+        // the idempotency read, the points read, and the post — runs strictly
+        // AFTER the durable local writes at the end of this function, so a
+        // slow or hung `gh` can never delay (or, via a daemon restart in that
+        // window, lose) the `sweep.outcome` record. See `writeback`'s module
+        // doc for the full fail-open contract.
+        let writeback_record =
+            (result == telemetry::SweepResult::Success).then(|| outcome_record.clone());
         let result_name = serde_json::to_value(result)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -763,6 +784,10 @@ impl SweepRegistry {
                  #{issue} ({sweep_id}) at {}: {e} — best-effort, not blocking reap (#4704)",
                 path.display()
             );
+        }
+        // Issue #9056: forge work only after every durable write above.
+        if let Some(record) = writeback_record {
+            self.maybe_post_sweep_outcome_writeback(issue, &record);
         }
     }
 
@@ -1061,3 +1086,16 @@ mod tap_usage_tests;
     unused_imports
 )]
 mod complexity_tests;
+
+// End-to-end tests for the #9056 issue write-back (posting, idempotency, the
+// `Success`-only gate), in their own sibling file for the same file-size
+// reason as `timeline_tests` above. `points_signal` and `writeback`'s own
+// pure/unit tests live inline in those modules instead.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod writeback_tests;
