@@ -40,6 +40,11 @@
 //!   transcript-ingest thread pushes the derived `session.analysis` rollup
 //!   (retry loops, longest tool call, USD cost, anomaly flags) alongside
 //!   each `session.summary` it emits.
+//! - [`claude_code_telemetry`] (Issue #9215) — the one member of this module
+//!   tree that exports nothing itself: an opt-in, default-off resolver for the
+//!   OTel environment a *spawned worker's own* Claude Code session needs in
+//!   order to emit `claude_code.llm_request` / `claude_code.tool` sub-spans
+//!   into the trace [`tracing::prepare_child`] already propagates.
 //! - [`daemon_event`] (Issue #8760, G4 of #8714) — a second, narrower
 //!   [`crate::event_bus::EventBus`] subscriber alongside [`collector`],
 //!   covering the four named topics that carried no telemetry record kind
@@ -96,6 +101,7 @@
 //! host (#5336).
 
 pub mod backfill;
+pub mod claude_code_telemetry;
 pub mod collector;
 pub mod daemon_event;
 pub mod endpoint_policy;

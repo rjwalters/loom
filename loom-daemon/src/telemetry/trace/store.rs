@@ -9,6 +9,14 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const TRACEPARENT_ENV: &str = "LOOM_TRACEPARENT";
+/// The standard W3C `traceparent` env var (#9215), mirrored from
+/// [`TRACEPARENT_ENV`] whenever a child is given a context. Loom's own
+/// propagation reads the namespaced variable; third-party harnesses that know
+/// nothing about Loom — Claude Code's `-p`/Agent-SDK sessions among them —
+/// parent their spans on this one, so exporting both makes a spawned worker's
+/// native spans land inside the execution's trace rather than as orphan roots.
+/// Same value, same lifetime, never set alone.
+pub const W3C_TRACEPARENT_ENV: &str = "TRACEPARENT";
 pub const CONTEXT_FILE_ENV: &str = "LOOM_TRACE_CONTEXT_FILE";
 const MAX_CONTEXT_BYTES: u64 = 4096;
 const MAX_ACTIVE_CONTEXTS: usize = 1024;
