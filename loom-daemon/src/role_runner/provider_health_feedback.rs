@@ -105,6 +105,13 @@ pub(super) fn apply_role_tick_provider_health_feedback(
     // the same gate the sweep path applies, from the one function that owns it.
     let reset_at =
         tokens_pool::codex_reset::exhaustion_reset_horizon(&contents, tick_anchor, result.category);
+    // #9013 item 4: captured *before* the persist call — see
+    // `pool_marks::record_codex` for why the sticky `ReauthRequired` hold
+    // makes this ordering matter.
+    let already_reauth_required = tokens_pool::account_health(workspace_root, &id)
+        .ok()
+        .flatten()
+        .is_some_and(|health| health.reason == tokens_pool::HealthReason::ReauthRequired);
     match tokens_pool::record_terminal_for_model_with_reset(
         workspace_root,
         &id,
@@ -114,7 +121,10 @@ pub(super) fn apply_role_tick_provider_health_feedback(
         "spawn-codex:v1",
     ) {
         // #8931: the reason-classified mark, emitted only once persisted.
-        Ok(()) => crate::observability::ops::pool_marks::record_codex(result.category),
+        Ok(()) => crate::observability::ops::pool_marks::record_codex(
+            result.category,
+            already_reauth_required,
+        ),
         Err(error) => log::warn!(
             "role_runner: failed to persist Codex terminal feedback for role={}: {error}",
             admission.role
