@@ -148,6 +148,7 @@ fn tokens_snapshot_envelope() -> TelemetryEnvelope {
                     provider: "claude".to_string(),
                     rank: Some(0),
                     usage_fraction: Some(0.42),
+                    usage_fraction_weekly: Some(0.37),
                     limit_window_reset_at: Some(ts()),
                     exhausted: false,
                 },
@@ -156,6 +157,7 @@ fn tokens_snapshot_envelope() -> TelemetryEnvelope {
                     provider: "codex".to_string(),
                     rank: None,
                     usage_fraction: None,
+                    usage_fraction_weekly: None,
                     limit_window_reset_at: None,
                     exhausted: true,
                 },
@@ -616,6 +618,34 @@ fn tokens_snapshot_becomes_per_account_gauge_metrics() {
     assert_eq!(exhausted_points.len(), 2);
 }
 
+/// Issue #9005: the weekly axis is its own gauge, emitted only where known —
+/// the codex account (no utilization source) gets no weekly point, not `0`.
+#[test]
+fn tokens_snapshot_weekly_axis_is_a_separate_gauge_absent_when_unknown() {
+    let request = build_metrics_request(&[tokens_snapshot_envelope()]).unwrap();
+    let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+    let weekly = metrics
+        .iter()
+        .find(|m| m.name == "loom.tokens.usage_fraction_weekly")
+        .expect("usage_fraction_weekly metric must exist");
+    let points = match &weekly.data {
+        Some(metric::Data::Gauge(gauge)) => &gauge.data_points,
+        other => panic!("expected Gauge, got {other:?}"),
+    };
+    assert_eq!(points.len(), 1, "only the account with a known weekly value");
+    let attr = |key: &str| {
+        points[0]
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    assert_eq!(attr("account"), Some(any_value::Value::StringValue("agent-1".into())));
+    assert_eq!(attr("provider"), Some(any_value::Value::StringValue("claude".into())));
+    assert_eq!(points[0].value, Some(number_data_point::Value::AsDouble(0.37)));
+}
+
 #[test]
 fn metrics_are_grouped_by_host_id() {
     let batch = vec![host_health_envelope(), sweep_started_envelope()];
@@ -760,4 +790,25 @@ fn active_identity_maps_distinct_runtime_provider_and_model_without_profile() {
         .attributes
         .iter()
         .any(|kv| kv.key.contains("profile") || kv.key.contains("credential")));
+}
+
+/// The standing quota-utilization queries (#9005) must name metrics this
+/// mapping actually emits — a rename here would silently empty the panel.
+#[test]
+fn quota_utilization_queries_name_emitted_token_gauges() {
+    let sql = include_str!("../../../../../defaults/observability/signoz/quota-utilization.sql");
+    let request = build_metrics_request(&[tokens_snapshot_envelope()]).unwrap();
+    let emitted: Vec<&str> = request.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    for name in [
+        "loom.tokens.usage_fraction",
+        "loom.tokens.usage_fraction_weekly",
+        "loom.tokens.exhausted",
+    ] {
+        assert!(sql.contains(&format!("'{name}'")), "{name} missing from the SQL");
+        assert!(emitted.contains(&name), "{name} is not emitted by the mapping");
+    }
 }

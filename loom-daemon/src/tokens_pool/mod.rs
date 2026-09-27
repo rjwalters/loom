@@ -84,6 +84,7 @@ pub mod profile_ledger;
 pub mod profile_merge;
 pub mod profile_provisioning;
 pub mod profile_sharing;
+pub mod ranking_weekly;
 pub mod rng;
 pub mod rotation;
 pub mod select;
