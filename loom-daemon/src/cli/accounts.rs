@@ -162,10 +162,11 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
         AccountsAction::Check {
             provider,
             ranking,
+            live,
             json,
         } => {
             require_codex(&provider)?;
-            run_availability_check(&workspace, ranking, json)
+            run_availability_check(&workspace, ranking, live, json)
         }
         AccountsAction::Status {
             provider,
@@ -391,7 +392,12 @@ fn run_provision(
 /// Output is secret-free by construction: every field comes from the account
 /// registry, `account-health.json`, or the numeric `rate_limits` snapshot —
 /// `auth.json` is never opened.
-fn run_availability_check(workspace: &std::path::Path, ranking: bool, json: bool) -> Result<()> {
+fn run_availability_check(
+    workspace: &std::path::Path,
+    ranking: bool,
+    live: bool,
+    json: bool,
+) -> Result<()> {
     use loom_daemon::tokens_pool::codex_check::{self, CheckOptions};
 
     eprintln!("Resolved workspace: {}", workspace.display());
@@ -399,6 +405,7 @@ fn run_availability_check(workspace: &std::path::Path, ranking: bool, json: bool
         workspace,
         CheckOptions {
             write_ranking: ranking,
+            live,
         },
         chrono::Utc::now(),
     )?;
@@ -437,7 +444,7 @@ fn run_availability_check(workspace: &std::path::Path, ranking: bool, json: bool
             }))?
         );
     } else {
-        println!("{}", codex_check::format_table(&report));
+        println!("{}", codex_check::format_table_for(&report, live));
         if let Some(path) = &effects.ranking_written {
             println!("Ranking written to {}", path.display());
         }
