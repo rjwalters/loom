@@ -511,6 +511,22 @@ pub(crate) enum MergePrCommand {
     /// Exit 0 with the decision, 2 = stdin unreadable. Silence is never a
     /// decision — see `cli::merge_pr_closed_building`.
     ClosedBuilding(super::merge_pr_closed_building::ClosedBuildingArgs),
+
+    /// The post-merge stacked-child reconcile PLAN (#3747 item 1): the
+    /// parent-branch gate, the `[{number, headRefName}]` children-rollup parse
+    /// (on stdin) and each child's derived issue number. Prints
+    /// `NOT-STACKED`, `UNREADABLE <detail>`, or `COUNT` + one `CHILD`/`MALFORMED`
+    /// line per element. Exit 0 with the plan, 2 = stdin unreadable; the seam
+    /// fails OPEN (skip the pass) — see `cli::merge_pr_reconcile`.
+    ReconcilePlan(super::merge_pr_reconcile::ReconcilePlanArgs),
+
+    /// Which route ONE stacked child takes (#3747 item 1): `defer` when its
+    /// issue's label list (on stdin) still carries `loom:building` — a Builder
+    /// probably has that branch checked out, and rebasing it would race live
+    /// work — otherwise `reconcile`. The defer answer carries the comment body
+    /// to post. Exit 0 with the route, 2 = stdin unreadable — see
+    /// `cli::merge_pr_reconcile`.
+    ReconcileChild(super::merge_pr_reconcile::ReconcileChildArgs),
 }
 
 impl MergePrCommand {
@@ -534,6 +550,8 @@ impl MergePrCommand {
             MergePrCommand::PartialReset(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),
             MergePrCommand::ClosedBuilding(args) => args.run(),
+            MergePrCommand::ReconcilePlan(args) => args.run(),
+            MergePrCommand::ReconcileChild(args) => args.run(),
         }
     }
 }

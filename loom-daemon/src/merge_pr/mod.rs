@@ -147,6 +147,18 @@
 //! literals under two DIFFERENT `grep` invocations — one `-Ei`, two bare — so
 //! the asymmetric case-sensitivity is upstream behaviour the port preserves
 //! verbatim rather than an oversight it tidies.
+//!
+//! [`reconcile`] is [`stacked_children`]'s POST-merge other half (#3747 item 1):
+//! once the parent has merged, which of its still-open children may be handed to
+//! `reconcile-stack.sh` and which must be DEFERRED because a Builder still holds
+//! a `loom:building` claim on it. It is the only member of the family whose
+//! wrong answer force-pushes over somebody's uncommitted work, and the retired
+//! shell reached the force-push answer through three stacked `|| true` layers
+//! that each turn a failed lookup into the empty string — indistinguishable from
+//! "this issue carries no claim". It also retires the second copy of the
+//! `feature/issue-<N>` predicate, which the shell wrote out twice 90 lines apart
+//! against two different variables, and owns the deferral comment's byte-frozen
+//! text.
 
 pub mod closed_building;
 pub mod dirty_guard;
@@ -156,6 +168,7 @@ pub mod labels;
 pub mod loom_pr_guard;
 pub mod mergeable_recheck;
 pub mod partial_reset;
+pub mod reconcile;
 pub mod redate;
 pub mod refs;
 pub mod response;
