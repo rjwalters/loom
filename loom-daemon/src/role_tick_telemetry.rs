@@ -399,10 +399,12 @@ fn tally_command(command: &str, actions: &mut RoleTickActions) {
 }
 
 /// Fold one transcript record's `tool_use` blocks into `actions`, and the
-/// issues/PRs they wrote to into `targets` (#9168).
+/// issues/PRs they wrote to into `targets` (#9168); `session` carries the
+/// transcript's shell state (`cd`, `GH_REPO`) between commands (#9180).
 fn tally_record_actions(
     obj: &Value,
     actions: &mut RoleTickActions,
+    session: &mut targets::Session,
     targets: &mut BTreeSet<targets::Target>,
 ) {
     let container = obj.get("message").filter(|m| m.is_object()).unwrap_or(obj);
@@ -421,7 +423,7 @@ fn tally_record_actions(
             continue;
         };
         tally_command(command, actions);
-        targets::collect(command, targets);
+        targets::collect(command, session, targets);
     }
 }
 
@@ -463,6 +465,7 @@ pub fn scan_transcripts_with_targets(
             continue;
         };
         read_any = true;
+        let mut session = targets::Session::default();
         for raw in text.lines() {
             let raw = raw.trim();
             if raw.is_empty() {
@@ -471,7 +474,7 @@ pub fn scan_transcripts_with_targets(
             let Ok(obj) = serde_json::from_str::<Value>(raw) else {
                 continue;
             };
-            tally_record_actions(&obj, &mut actions, &mut targets);
+            tally_record_actions(&obj, &mut actions, &mut session, &mut targets);
             let Some(rec) = crate::script_helpers::transcript_usage::usage_from_record(&obj) else {
                 continue;
             };

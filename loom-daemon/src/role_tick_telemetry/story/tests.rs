@@ -4,8 +4,8 @@
 use super::*;
 use crate::telemetry::trace::{story_context, TraceContext};
 use chrono::TimeZone as _;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const REPO_ID: u64 = 1_073_994_527; // rjwalters/loom in the D32 vectors
 const FOREIGN_REPO_ID: u64 = 1_377_976_597;
@@ -191,10 +191,10 @@ fn a_judge_tick_labelling_a_pr_joins_the_closing_issues_story() {
     let (_, targets) =
         crate::role_tick_telemetry::scan_transcripts_with_targets(&[fixture]).unwrap();
     let id = identity("judge-accept");
-    let (numbers, _) = own_repo_numbers(&targets, &id.full_name);
+    let (numbers, _) = own_repo_numbers(&targets, &id.full_name, Path::new("/work/loom"));
     assert_eq!(numbers, vec![9201]);
     let forge = Forge::new(&[(9201, pr_node(&[(REPO_ID, 9168)], "feature/issue-9168"))]);
-    let resolved = resolve(&forge, &id, &numbers);
+    let resolved = resolve(&forge, &id, &numbers, Instant::now());
     let facts = facts("judge");
     let spans = plan(&facts, &id, &id.full_name, &numbers, &resolved);
     assert_eq!(spans.len(), 1);
@@ -259,14 +259,15 @@ fn span_ids_are_deterministic_and_recomputable_from_the_span() {
 fn resolve_batches_once_and_caches_answers() {
     let id = identity("cache");
     let forge = Forge::new(&[(1, issue_node()), (2, pr_node(&[(REPO_ID, 1)], "x"))]);
-    let first = resolve(&forge, &id, &[1, 2, 3]);
+    let now = Instant::now();
+    let first = resolve(&forge, &id, &[1, 2, 3], now);
     assert_eq!(forge.calls.load(Ordering::SeqCst), 1, "one request for all three");
     assert_eq!(first.len(), 2, "#3 is unknown to the forge");
-    let second = resolve(&forge, &id, &[1, 2]);
+    let second = resolve(&forge, &id, &[1, 2], now);
     assert_eq!(forge.calls.load(Ordering::SeqCst), 1, "cached answers need no request");
     assert_eq!(first.get(&1), second.get(&1));
     // An unreadable number is not cached: asking again asks the forge.
-    let _ = resolve(&forge, &id, &[3]);
+    let _ = resolve(&forge, &id, &[3], now);
     assert_eq!(forge.calls.load(Ordering::SeqCst), 2);
 }
 
@@ -282,7 +283,7 @@ fn a_forge_failure_emits_nothing() {
         }
     }
     let id = identity("down");
-    let resolved = resolve(&Down, &id, &[1]);
+    let resolved = resolve(&Down, &id, &[1], Instant::now());
     assert!(resolved.is_empty());
     assert!(plan(&facts("judge"), &id, &id.full_name, &[1], &resolved).is_empty());
 }
@@ -322,4 +323,176 @@ fn every_story_attribute_survives_the_daemon_allowlist() {
     for key in STORY_SPAN_ATTRIBUTE_KEYS {
         assert!(span.attributes.contains_key(*key), "allowlist drops {key}");
     }
+}
+
+// ------------------------------------------------------------------------
+// #9180: one deadline for the whole step, and a negative cache.
+// ------------------------------------------------------------------------
+
+/// A clock that only moves when a test (or a fake forge) advances it.
+fn fake_clock() -> (Clock, Arc<AtomicU64>) {
+    let base = Instant::now();
+    let offset_ms = Arc::new(AtomicU64::new(0));
+    let reading = Arc::clone(&offset_ms);
+    let clock: Clock =
+        Arc::new(move || base + Duration::from_millis(reading.load(Ordering::SeqCst)));
+    (clock, offset_ms)
+}
+
+/// A forge that answers every number as an issue, each request taking
+/// `cost_ms` of the fake clock, counting requests.
+struct Slow {
+    clock: Arc<AtomicU64>,
+    cost_ms: u64,
+    calls: AtomicUsize,
+}
+
+impl GithubApi for Slow {
+    fn get(&self, path: &str, _: Option<&str>) -> Result<ApiResponse, ApiError> {
+        Err(ApiError::Transport(format!("unexpected GET {path}")))
+    }
+    fn get_document(&self, path: &str) -> Result<ApiResponse, ApiError> {
+        self.get(path, None)
+    }
+    fn graphql(&self, query: &str) -> Result<ApiResponse, ApiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.clock.fetch_add(self.cost_ms, Ordering::SeqCst);
+        let mut repository = serde_json::Map::new();
+        for alias in query
+            .split(": issueOrPullRequest")
+            .filter_map(|p| p.rsplit(' ').next())
+        {
+            if alias.starts_with('t') {
+                repository.insert(alias.to_owned(), issue_node());
+            }
+        }
+        Ok(ApiResponse {
+            status: 200,
+            body: serde_json::json!({"data": {"repository": repository}}).to_string(),
+            ..ApiResponse::default()
+        })
+    }
+}
+
+#[test]
+fn the_deadline_bounds_the_whole_step_not_each_request() {
+    let (clock, offset) = fake_clock();
+    // Each request costs 12s of the 20s budget — each within it on its own —
+    // so two batches are answered and the third is never sent.
+    let forge = Arc::new(Slow {
+        clock: Arc::clone(&offset),
+        cost_ms: 12_000,
+        calls: AtomicUsize::new(0),
+    });
+    let deadline = Deadline::after(RESOLVE_DEADLINE, clock);
+    let numbers: Vec<u32> = (1..=2 * u32::try_from(GRAPHQL_BATCH).unwrap() + 1).collect();
+    let id = identity("deadline-batches");
+    let seeded = id.clone();
+    let (got, resolved) = resolve_step(
+        "rjwalters/deadline-batches",
+        &numbers,
+        &deadline,
+        move |_| Some(seeded),
+        Arc::clone(&forge) as Arc<dyn GithubApi>,
+    )
+    .unwrap();
+    assert_eq!(got, id);
+    assert_eq!(forge.calls.load(Ordering::SeqCst), 2, "the third batch is past the deadline");
+    assert_eq!(resolved.len(), 2 * GRAPHQL_BATCH);
+    assert!(!resolved.contains_key(&numbers[2 * GRAPHQL_BATCH]));
+}
+
+#[test]
+fn a_slow_identity_lookup_consumes_the_budget_and_nothing_is_requested() {
+    // The identity lookup "takes" 21s of the fake clock: no GraphQL request.
+    let (clock, offset) = fake_clock();
+    let forge = Arc::new(Forge::new(&[(1, issue_node())]));
+    let deadline = Deadline::after(RESOLVE_DEADLINE, clock);
+    let id = identity("deadline-identity");
+    let seeded = id.clone();
+    let slow_identity = move |_: String| {
+        offset.fetch_add(21_000, Ordering::SeqCst);
+        Some(seeded)
+    };
+    let (_, resolved) = resolve_step(
+        "rjwalters/deadline-identity",
+        &[1],
+        &deadline,
+        slow_identity,
+        Arc::clone(&forge) as Arc<dyn GithubApi>,
+    )
+    .unwrap();
+    assert!(resolved.is_empty());
+    assert_eq!(forge.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_hung_identity_lookup_is_cut_off_at_the_deadline() {
+    // Real time, kept short: a 40ms budget against an 90ms lookup.
+    let deadline = Deadline::after(Duration::from_millis(40), Arc::new(Instant::now));
+    let forge = Arc::new(Forge::new(&[]));
+    let started = Instant::now();
+    let step = resolve_step(
+        "rjwalters/deadline-hung",
+        &[1],
+        &deadline,
+        |_| {
+            std::thread::sleep(Duration::from_millis(90));
+            Some(identity("deadline-hung"))
+        },
+        Arc::clone(&forge) as Arc<dyn GithubApi>,
+    );
+    assert!(step.is_none());
+    assert!(started.elapsed() < Duration::from_millis(85), "{:?}", started.elapsed());
+    assert_eq!(forge.calls.load(Ordering::SeqCst), 0);
+    // An already-expired deadline starts nothing at all.
+    let (clock, offset) = fake_clock();
+    let expired = Deadline::after(Duration::from_secs(1), clock);
+    offset.store(1_000, Ordering::SeqCst);
+    assert_eq!(expired.run(|| 1), None);
+}
+
+#[test]
+fn a_failed_lookup_is_negatively_cached_for_the_backoff() {
+    struct Down(AtomicUsize);
+    impl GithubApi for Down {
+        fn get(&self, p: &str, _: Option<&str>) -> Result<ApiResponse, ApiError> {
+            Err(ApiError::Transport(p.into()))
+        }
+        fn get_document(&self, p: &str) -> Result<ApiResponse, ApiError> {
+            Err(ApiError::Transport(p.into()))
+        }
+        fn graphql(&self, _: &str) -> Result<ApiResponse, ApiError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ApiResponse {
+                status: 200,
+                body: r#"{"errors":[{"type":"RATE_LIMITED"}]}"#.into(),
+                ..ApiResponse::default()
+            })
+        }
+    }
+    let down = Down(AtomicUsize::new(0));
+    let id = identity("negative-cache");
+    let now = Instant::now();
+    assert!(resolve(&down, &id, &[1], now).is_empty());
+    assert_eq!(down.0.load(Ordering::SeqCst), 1);
+    // Every tick inside the backoff asks nothing.
+    for later in [1, 30, 59] {
+        assert!(resolve(&down, &id, &[1, 2], now + Duration::from_secs(later)).is_empty());
+    }
+    assert_eq!(down.0.load(Ordering::SeqCst), 1, "no request while backed off");
+    // Past it, the forge is asked again; a success clears the backoff.
+    let _ = resolve(&down, &id, &[1], now + FAILURE_BACKOFF + Duration::from_secs(1));
+    assert_eq!(down.0.load(Ordering::SeqCst), 2);
+    let forge = Forge::new(&[(1, issue_node())]);
+    let after = now + 2 * FAILURE_BACKOFF + Duration::from_secs(2);
+    assert_eq!(resolve(&forge, &id, &[1], after).len(), 1);
+    assert_eq!(resolve(&forge, &id, &[2], after).len(), 0);
+    assert_eq!(forge.calls.load(Ordering::SeqCst), 2, "a success does not back off");
+    // Cached answers still answer during a backoff; the rest waits.
+    let _ = resolve(&down, &id, &[3], after);
+    assert_eq!(down.0.load(Ordering::SeqCst), 3);
+    let during = resolve(&down, &id, &[1, 3], after + Duration::from_secs(1));
+    assert_eq!(during.keys().copied().collect::<Vec<_>>(), vec![1]);
+    assert_eq!(down.0.load(Ordering::SeqCst), 3);
 }
