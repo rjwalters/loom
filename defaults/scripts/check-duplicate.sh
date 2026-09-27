@@ -528,18 +528,17 @@ search_cross_references() {
         return 0
     fi
 
-    # The owner/repo comparison is CASE-INSENSITIVE (2AMLogic/2am#1296):
+    # The owner/repo comparison is CASE-INSENSITIVE (example-org/tool-repo#202):
     # GitHub owner and repo names are case-insensitive, and the local remote
-    # URL's casing is whatever the clone was made with (e.g. "2amlogic/2am"),
-    # while the timeline API reports the canonical casing ("2AMLogic/2am").
-    # An exact `==` silently matched nothing for such clones. Downcasing both
+    # URL's casing is whatever the clone was made with (e.g. "example-org"),
+    # while the timeline API reports the canonical casing ("Example-Org"). An
+    # exact `==` silently matched nothing for such clones. Downcasing both
     # sides keeps the #4659 no-extra-round-trip property -- no `gh repo view`
     # call to fetch the canonical casing.
     echo "$timeline" | jq -c --arg repo "$repo_nwo" --argjson self "$issue_num" '
-        ($repo | ascii_downcase) as $repo_lc
-        | [.[] | select(.event == "cross-referenced"
+        [.[] | select(.event == "cross-referenced"
                        and .source.issue != null
-                       and ((.source.issue.repository.full_name // "") | ascii_downcase) == $repo_lc
+                       and ((.source.issue.repository.full_name // "") | ascii_downcase) == ($repo | ascii_downcase)
                        and .source.issue.number != $self
                        and .source.issue.state == "open")
          | {number: .source.issue.number,

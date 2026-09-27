@@ -424,20 +424,21 @@ assert_not_contains "$OUT" "RELATED_OPEN_WORK" "(g) git remote resolution failur
 assert_contains "$ERR" "Failed to resolve repository" "(g) git remote resolution failure -> stderr warning emitted"
 
 # (h) Remote URL casing differs from GitHub's canonical casing
-# (2AMLogic/2am#1296): a clone made as "2amlogic/2am" must still match the
-# timeline's canonical "2AMLogic/2am" full_name. Before the fix, the exact
-# `==` comparison silently returned [] for every issue in such a clone.
+# (example-org/tool-repo#202): a clone made as "example-org/tool-repo" must
+# still match the timeline's canonical "Example-Org/tool-repo" full_name.
+# Before the fix, the exact `==` comparison silently returned [] for every
+# issue in such a clone.
 reset_state
-echo "git@github.com:2amlogic/2am.git" > "$STUB_DIR/git-remote-url"
+echo "git@github.com:example-org/tool-repo.git" > "$STUB_DIR/git-remote-url"
 cat > "$STUB_DIR/timeline-294.json" <<'EOF'
 [
   {"event": "cross-referenced", "source": {"type": "issue", "issue": {
       "number": 299, "title": "Cap ClickHouse memory", "state": "open",
-      "pull_request": {"url": "https://api.github.com/repos/2AMLogic/2am/pulls/299"},
-      "repository": {"full_name": "2AMLogic/2am"}}}},
+      "pull_request": {"url": "https://api.github.com/repos/Example-Org/tool-repo/pulls/299"},
+      "repository": {"full_name": "Example-Org/tool-repo"}}}},
   {"event": "cross-referenced", "source": {"type": "issue", "issue": {
       "number": 300, "title": "Unrelated work in another repo", "state": "open",
-      "repository": {"full_name": "2AMLogic/other"}}}}
+      "repository": {"full_name": "Example-Org/other"}}}}
 ]
 EOF
 run_cds --issue 294 --title "Some issue title"
