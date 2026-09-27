@@ -428,8 +428,9 @@ fn a_slow_identity_lookup_consumes_the_budget_and_nothing_is_requested() {
 
 #[test]
 fn a_hung_identity_lookup_is_cut_off_at_the_deadline() {
-    // Real time, kept short: a 40ms budget against an 90ms lookup.
-    let deadline = Deadline::after(Duration::from_millis(40), Arc::new(Instant::now));
+    // Real time with wide slack: a 50ms budget against a 500ms lookup (the
+    // abandoned worker finishes on its own; the test does not wait for it).
+    let deadline = Deadline::after(Duration::from_millis(50), Arc::new(Instant::now));
     let forge = Arc::new(Forge::new(&[]));
     let started = Instant::now();
     let step = resolve_step(
@@ -437,13 +438,13 @@ fn a_hung_identity_lookup_is_cut_off_at_the_deadline() {
         &[1],
         &deadline,
         |_| {
-            std::thread::sleep(Duration::from_millis(90));
+            std::thread::sleep(Duration::from_millis(500));
             Some(identity("deadline-hung"))
         },
         Arc::clone(&forge) as Arc<dyn GithubApi>,
     );
     assert!(step.is_none());
-    assert!(started.elapsed() < Duration::from_millis(85), "{:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_millis(400), "{:?}", started.elapsed());
     assert_eq!(forge.calls.load(Ordering::SeqCst), 0);
     // An already-expired deadline starts nothing at all.
     let (clock, offset) = fake_clock();
@@ -495,4 +496,45 @@ fn a_failed_lookup_is_negatively_cached_for_the_backoff() {
     let during = resolve(&down, &id, &[1, 3], after + Duration::from_secs(1));
     assert_eq!(during.keys().copied().collect::<Vec<_>>(), vec![1]);
     assert_eq!(down.0.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn a_failure_backs_off_from_when_it_was_observed() {
+    // The only request fails 20s into the step: the backoff runs 60s from
+    // there, not from the step's start.
+    struct LateFailure(Arc<AtomicU64>, AtomicUsize);
+    impl GithubApi for LateFailure {
+        fn get(&self, p: &str, _: Option<&str>) -> Result<ApiResponse, ApiError> {
+            Err(ApiError::Transport(p.into()))
+        }
+        fn get_document(&self, p: &str) -> Result<ApiResponse, ApiError> {
+            Err(ApiError::Transport(p.into()))
+        }
+        fn graphql(&self, _: &str) -> Result<ApiResponse, ApiError> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.fetch_add(20_000, Ordering::SeqCst);
+            Err(ApiError::Transport("gateway timeout".into()))
+        }
+    }
+    let (clock, offset) = fake_clock();
+    let start = clock();
+    let api = Arc::new(LateFailure(Arc::clone(&offset), AtomicUsize::new(0)));
+    let deadline = Deadline::after(Duration::from_secs(30), clock);
+    let id = identity("late-failure");
+    let seeded = id.clone();
+    let (_, resolved) = resolve_step(
+        "rjwalters/late-failure",
+        &[1],
+        &deadline,
+        move |_| Some(seeded),
+        Arc::clone(&api) as Arc<dyn GithubApi>,
+    )
+    .unwrap();
+    assert!(resolved.is_empty());
+    assert_eq!(api.1.load(Ordering::SeqCst), 1);
+    // 79s after the start is 59s after the failure: still backed off.
+    let _ = resolve(api.as_ref(), &id, &[1], start + Duration::from_secs(79));
+    assert_eq!(api.1.load(Ordering::SeqCst), 1);
+    let _ = resolve(api.as_ref(), &id, &[1], start + Duration::from_secs(81));
+    assert_eq!(api.1.load(Ordering::SeqCst), 2);
 }

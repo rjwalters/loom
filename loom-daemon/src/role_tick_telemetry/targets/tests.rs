@@ -354,3 +354,94 @@ fn a_directory_is_in_the_root_only_below_it_and_outside_other_checkouts() {
         assert_eq!(in_dir(1, dir).in_repo(OWN, root), inside, "{dir}");
     }
 }
+
+// ------------------------------------------------------------------------
+// #9181 review: bounded nesting, `cd` behind keywords, `$'…'` quoting.
+// ------------------------------------------------------------------------
+
+/// Parse `script` on a thread with the 2 MiB stack a tokio blocking task
+/// gets, returning its targets and how long it took.
+fn on_small_stack(script: String) -> (Vec<Target>, std::time::Duration) {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            let targets = targets_of(&script);
+            (targets, started.elapsed())
+        })
+        .unwrap()
+        .join()
+        .expect("the parser must not overflow the stack")
+}
+
+#[test]
+fn deep_substitution_nesting_is_bounded_and_hides_the_rest() {
+    const LEVELS: usize = 100_000;
+    // The innermost substitution is a real write; past the cap it is hidden.
+    let quoted = format!(
+        "gh pr comment 5 --body {}\"$(gh pr edit 6)\"{}\ngh pr edit 7",
+        "\"$(echo ".repeat(LEVELS),
+        ")\"".repeat(LEVELS)
+    );
+    let plain = format!(
+        "x={}$(gh pr edit 6){}; gh pr edit 7",
+        "$(echo ".repeat(LEVELS),
+        ")".repeat(LEVELS)
+    );
+    for (name, script) in [("quoted", quoted), ("plain", plain)] {
+        let (targets, took) = on_small_stack(script);
+        // Past the cap nothing more is split: the innermost command (and,
+        // for the quoted form, everything after it) is hidden, never exposed.
+        assert!(!targets.contains(&own(6)), "{name}: {targets:?}");
+        assert!(targets.iter().all(|t| [own(5), own(7)].contains(t)), "{name}: {targets:?}");
+        assert!(took < std::time::Duration::from_secs(10), "{name}: {took:?}");
+    }
+    // Within the cap, nesting still works.
+    let shallow = format!("echo \"{}$(gh pr edit 6){}\"", "$(echo ".repeat(8), ")".repeat(8));
+    assert_eq!(targets_of(&shallow), vec![own(6)]);
+}
+
+#[test]
+fn cd_behind_a_keyword_or_builtin_is_followed_or_makes_the_directory_unknown() {
+    for (setup, number) in [
+        ("if cd ../other; then true; fi", 5),
+        ("{ cd ../other; }", 6),
+        ("builtin cd ../other", 7),
+        ("command cd ../other && gh pr edit 8", 8),
+        ("while cd ../other; do break; done", 9),
+        ("! cd ../other", 10),
+        ("( cd ../other; gh pr edit 11 )", 11),
+    ] {
+        let edit = format!("gh pr edit {number}");
+        let targets = session_targets(&[setup, &edit]);
+        assert_eq!(targets, vec![in_dir(number, "../other")], "{setup}");
+        assert!(!targets[0].in_repo(OWN, Path::new(ROOT)), "{setup}");
+    }
+    // A `cd` we cannot place at all: every later unqualified target drops.
+    for setup in [
+        "command -p cd ../other",
+        "sudo cd /x",
+        "time -p cd ../other",
+    ] {
+        assert_eq!(session_targets(&[setup, "gh pr edit 5"]), vec![], "{setup}");
+    }
+    // Keywords in front of a write still name it.
+    assert_eq!(targets_of("if gh pr edit 5 --add-label x; then echo ok; fi"), vec![own(5)]);
+}
+
+#[test]
+fn ansi_c_quoted_words_hide_their_contents() {
+    assert_eq!(
+        targets_of("gh pr comment 5 --body $'it\\'s done; gh pr edit 77 --add-label x'"),
+        vec![own(5)]
+    );
+    assert_eq!(targets_of("x=$(printf $'a\\')\\'; gh pr edit 77'); gh pr edit 6"), vec![own(6)]);
+    // Inside double quotes `$'` is literal text.
+    assert_eq!(targets_of("gh pr comment 5 --body \"$'x\"; gh pr edit 6"), vec![own(5), own(6)]);
+}
+
+#[test]
+fn a_substitution_closing_over_an_open_heredoc_hides_the_rest() {
+    let script = "x=$(cat <<EOF; case a in a) true;; esac\ngh pr edit 9 --add-label x\nEOF\n)";
+    assert_eq!(targets_of(script), vec![]);
+}

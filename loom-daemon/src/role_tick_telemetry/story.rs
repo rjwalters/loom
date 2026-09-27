@@ -316,6 +316,19 @@ pub fn resolve(
     numbers: &[u32],
     now: Instant,
 ) -> HashMap<u32, Resolved> {
+    resolve_on(api, identity, numbers, &move || now)
+}
+
+/// [`resolve`] reading `clock` as it goes: cache freshness at the start, a
+/// failure at the moment it is observed — so a request the deadline cut off
+/// late in the step still backs off for the full [`FAILURE_BACKOFF`].
+fn resolve_on(
+    api: &dyn GithubApi,
+    identity: &RepoIdentity,
+    numbers: &[u32],
+    clock: &dyn Fn() -> Instant,
+) -> HashMap<u32, Resolved> {
+    let now = clock();
     let repo_key = identity.full_name.to_ascii_lowercase();
     let fresh = |at: &Instant, ttl: Duration| now.saturating_duration_since(*at) < ttl;
     let mut out = HashMap::new();
@@ -351,7 +364,7 @@ pub fn resolve(
         let fetched = match api.graphql(&classify_query(owner, name, batch)) {
             Ok(response) if response.body.contains("\"RATE_LIMITED\"") => {
                 log::warn!("role_tick_telemetry: GraphQL rate-limited; tick joins no story");
-                lock(failures()).insert(repo_key.clone(), now);
+                lock(failures()).insert(repo_key.clone(), clock());
                 break;
             }
             Ok(response) => parse_classified(&response.body, batch),
@@ -360,7 +373,7 @@ pub fn resolve(
                     "role_tick_telemetry: could not classify {} targets {batch:?}: {error}",
                     identity.full_name
                 );
-                lock(failures()).insert(repo_key.clone(), now);
+                lock(failures()).insert(repo_key.clone(), clock());
                 break;
             }
         };
@@ -457,8 +470,10 @@ impl Deadline {
 
     /// `work`'s result if it finishes before the deadline; `None` — without
     /// starting it — once the deadline has passed. A call still running at
-    /// the deadline is abandoned on its worker thread, which exits when the
-    /// call does (every call made here has its own, longer, bound).
+    /// the deadline is abandoned on its worker thread, which lives until the
+    /// call returns: `repo_identity`'s probe has its own 10 s bound, but
+    /// `GhCliApi::graphql` has none, so a hung `gh` keeps its thread (as the
+    /// per-request bound before #9180 did) — the tick itself is not held.
     pub fn run<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
         let remaining = self
             .at
@@ -490,7 +505,7 @@ pub fn resolve_step(
         inner: api,
         deadline: deadline.clone(),
     };
-    let resolved = resolve(&bounded, &identity, numbers, deadline.now());
+    let resolved = resolve_on(&bounded, &identity, numbers, &|| deadline.now());
     Some((identity, resolved))
 }
 

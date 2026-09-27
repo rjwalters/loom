@@ -204,9 +204,28 @@ impl Session {
     /// The target of one simple command, given as its words, after folding
     /// any state it changes into `self`.
     fn command_target(&mut self, words: &[String]) -> Option<Target> {
-        // Leading `VAR=value` assignments and an `env` wrapper do not change
-        // which program runs, but a scope variable among them changes what
-        // it acts on.
+        let target = self.fold(words);
+        // A directory change anywhere but the program position (`sudo cd`,
+        // `command -p cd`, `xargs cd`, …) is one we cannot follow: from here
+        // on the directory is unknowable.
+        let program = words.iter().position(|w| !is_prefix(w));
+        if words
+            .iter()
+            .enumerate()
+            .any(|(i, w)| Some(i) != program && matches!(w.as_str(), "cd" | "pushd" | "popd"))
+        {
+            self.cwd = Cwd::Unknown;
+        }
+        target
+    }
+
+    /// [`Self::command_target`] for a command whose program word is taken
+    /// at face value.
+    fn fold(&mut self, words: &[String]) -> Option<Target> {
+        // Leading `VAR=value` assignments, an `env` wrapper, and keywords or
+        // builtins that run the next word (`if`, `{`, `!`, `builtin`,
+        // `command`, …) do not change which program runs, but a scope
+        // variable among them changes what it acts on.
         let mut vars = self.vars.clone();
         let mut wrapped = false;
         let mut start = 0;
@@ -217,7 +236,7 @@ impl Session {
                 if SCOPE_VARS.contains(&name) {
                     vars.insert(name.to_owned(), value.to_owned());
                 }
-            } else {
+            } else if !PREFIX_WORDS.contains(&word.as_str()) {
                 break;
             }
             start += 1;
@@ -273,6 +292,19 @@ impl Session {
             }),
         }
     }
+}
+
+/// Words that run the word after them as the program: shell keywords,
+/// grouping, and the `builtin`/`command`/`exec`/`time` wrappers.
+const PREFIX_WORDS: &[&str] = &[
+    "if", "then", "elif", "else", "do", "while", "until", "!", "{", "time", "builtin", "command",
+    "exec",
+];
+
+/// A word before the program: a [`PREFIX_WORDS`] entry, `env`, or an
+/// assignment.
+fn is_prefix(word: &str) -> bool {
+    word == "env" || PREFIX_WORDS.contains(&word) || assignment(word).is_some()
 }
 
 /// What `vars` say an unqualified command acts on.
