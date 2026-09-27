@@ -454,6 +454,19 @@ pub(crate) enum MergePrCommand {
     /// `CHILDREN`/`PIN-WRITTEN`/`WARNING`/`BLOCK` records — see
     /// `cli::merge_pr_stacked_children`.
     StackedChildren(super::merge_pr_stacked_children::StackedChildrenArgs),
+    /// The PRIMARY (main) worktree's path, parsed from `git worktree list
+    /// --porcelain` on stdin (#8191 slice: the #3710 guard's input). Empty
+    /// output at exit 0 means the input held no `worktree` record — which the
+    /// caller must NOT read as "the target is not the primary checkout".
+    WorktreePrimary(super::merge_pr_worktrees::WorktreePrimaryArgs),
+
+    /// The branch short-name checked out at `--path`, from porcelain on stdin.
+    /// Empty at exit 0 for a detached/bare entry or a path in no stanza.
+    WorktreeBranchFor(super::merge_pr_worktrees::WorktreeBranchForArgs),
+
+    /// The worktree path with `--branch` checked out, from porcelain on stdin.
+    /// Empty at exit 0 when no worktree holds it.
+    WorktreeFindByBranch(super::merge_pr_worktrees::WorktreeFindByBranchArgs),
 }
 
 impl MergePrCommand {
@@ -470,6 +483,9 @@ impl MergePrCommand {
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
             MergePrCommand::StackedChildren(args) => args.run(),
+            MergePrCommand::WorktreePrimary(args) => args.run(),
+            MergePrCommand::WorktreeBranchFor(args) => args.run(),
+            MergePrCommand::WorktreeFindByBranch(args) => args.run(),
         }
     }
 }

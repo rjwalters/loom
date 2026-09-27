@@ -43,6 +43,7 @@ mod merge_pr_refs;
 mod merge_pr_stacked_children;
 mod merge_pr_stale_checks;
 mod merge_pr_version_policy;
+mod merge_pr_worktrees;
 mod merge_pr_zero_checks;
 pub(crate) mod misc_cmds;
 pub(crate) mod noop_cooldown;

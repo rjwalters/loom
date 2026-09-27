@@ -95,6 +95,17 @@
 //! canonical `check-defaults-version-bump.sh` — fetch, ancestry, which ref's
 //! checker to trust, and the pass / skip / block classification. The checker
 //! itself stays shell, because it is CI's contract too.
+//!
+//! [`worktrees`] is the `git worktree list --porcelain` parsing behind the
+//! post-merge cleanup: which worktree is the primary (never removable, #3710),
+//! which branch a given worktree has checked out, and which worktree holds a
+//! given branch. Three `awk` bodies whose entire defect history — #3671 (the
+//! `exit`-triggers-`END` double-print, which handed callers a `/path\n/path`
+//! that exists nowhere), #3717 (`$2` truncating a space-containing path, so the
+//! primary-worktree guard compared a prefix and never fired), #4171 — is about
+//! what a record-oriented parse saw, and whose every consumer is one of the
+//! irreversible steps (`git worktree remove --force`, `git branch -D`). The
+//! `git` invocation itself stays in the shell; only the parse moved.
 
 pub mod dirty_guard;
 pub mod head_sync;
@@ -106,4 +117,5 @@ pub mod refs;
 pub mod stacked_children;
 pub mod stale_checks;
 pub mod version_policy;
+pub mod worktrees;
 pub mod zero_checks;
