@@ -974,21 +974,21 @@ fi
 #     someone to infer from the absence of one.
 if [[ -n "${LOOM_ROLE:-}" ]]; then
     export LOOM_ROLE
-    if [[ "$_hook_status" != "ready" ]] && command -v jq >/dev/null 2>&1; then
-        _policy_role="$_hook_role"
-        [[ -n "$_policy_role" ]] || _policy_role="$(printf '%s' "$LOOM_ROLE" | tr '[:upper:]_' '[:lower:]-')"
-        _policy_json=""
-        for _policy_cand in "${WORKSPACE}/.loom/roles/${_policy_role}.json" \
-                            "${_SCRIPT_DIR}/../roles/${_policy_role}.json"; do
-            if [[ -r "$_policy_cand" ]]; then _policy_json="$_policy_cand"; break; fi
-        done
-        if [[ -n "$_policy_json" ]] \
-            && jq -e '(.toolPolicy.allowedCapabilities | type) == "array"
-                      and ((.toolPolicy.allowedCapabilities | index("*")) | not)' \
-                 "$_policy_json" >/dev/null 2>&1; then
-            log_warn "spawn-codex: per-role tool restriction (#8256) is NOT ENFORCED for role '$_policy_role' in this session — $_policy_json declares a restrictive toolPolicy.allowedCapabilities, but that policy is enforced only by the managed pre_tool_use hook (guard-codex-bridge.sh -> guard-destructive.sh), and hooks=$_hook_status. This session can reach ssh / aws / 'gh secret' / credential-store writes. Provision and trust the profile to restore enforcement: .loom/scripts/provision-codex-hooks.sh install --all-profiles --workspace $WORKSPACE"
+    if [[ "$_hook_status" != "ready" ]]; then
+        # Role-name/alias resolution and the "does this role declare a
+        # restrictive toolPolicy" predicate both live in `loom-daemon
+        # role-tool-policy restricted` (issue #8322) now — ported out of this
+        # `contract`-category script for the same reason spawn-claude.sh's
+        # deny-specs call-out was: inlining them here is exactly the portable
+        # shell growth `shell-budget --check` refuses.
+        _policy_daemon_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null)"
+        if [[ -n "$_policy_daemon_bin" ]] \
+            && _policy_json="$("$_policy_daemon_bin" role-tool-policy restricted "${_hook_role:-$LOOM_ROLE}" \
+                --workspace "$WORKSPACE" --roles-dir "${_SCRIPT_DIR}/../roles" 2>/dev/null)" \
+            && [[ -n "$_policy_json" ]]; then
+            log_warn "spawn-codex: per-role tool restriction (#8256) is NOT ENFORCED for role '${_hook_role:-$LOOM_ROLE}' in this session — $_policy_json declares a restrictive toolPolicy.allowedCapabilities, but that policy is enforced only by the managed pre_tool_use hook (guard-codex-bridge.sh -> guard-destructive.sh), and hooks=$_hook_status. This session can reach ssh / aws / 'gh secret' / credential-store writes. Provision and trust the profile to restore enforcement: .loom/scripts/provision-codex-hooks.sh install --all-profiles --workspace $WORKSPACE"
         fi
-        unset _policy_role _policy_json _policy_cand
+        unset _policy_daemon_bin _policy_json
     fi
 fi
 

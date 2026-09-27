@@ -234,12 +234,14 @@ assert_contains "provision-codex-hooks.sh install" "$CODEX_SRC" \
     "spawn-codex: the warning names the remediation"
 assert_contains 'export LOOM_ROLE' "$CODEX_SRC" \
     "spawn-codex: LOOM_ROLE is exported so the bridge's sub-guards see it"
-# Conditional on BOTH a declared array AND the absence of a wildcard — a role
-# with no policy, or one granting "*", must never produce this warning.
-assert_contains 'allowedCapabilities | type) == "array"' "$CODEX_SRC" \
-    "spawn-codex: the warning requires a declared allowlist"
-assert_contains 'index("*")) | not' "$CODEX_SRC" \
-    "spawn-codex: the warning excludes a wildcard grant"
+# The "declared array AND no wildcard" predicate itself is delegated to
+# `loom-daemon role-tool-policy restricted` (#8322) rather than computed
+# locally via jq — a role with no policy, or one granting "*", must never
+# produce this warning, and that is now unit-tested on the Rust side.
+assert_contains "role-tool-policy restricted" "$CODEX_SRC" \
+    "spawn-codex: delegates the restricted-policy predicate to loom-daemon role-tool-policy"
+assert_not_contains 'allowedCapabilities | type) == "array"' "$CODEX_SRC" \
+    "spawn-codex: no longer computes the restricted predicate locally via jq"
 
 # --- 7. One source: the two halves read the same declaration --------------
 #
@@ -257,9 +259,16 @@ assert_contains "toolPolicy.allowedCapabilities" "$CLAUDE_SRC" \
 assert_contains "toolPolicy.allowedCapabilities" "$GUARD_SRC" \
     "guard-destructive-generic reads toolPolicy.allowedCapabilities"
 
-# The three daemon dispatch aliases must be resolved identically in all three
-# places, or one dispatch shape lands on a different policy than another.
-for _place in "$SCRIPTS_DIR/spawn-claude.sh" "$SCRIPTS_DIR/spawn-codex.sh" \
+# The three daemon dispatch aliases must be resolved identically in both
+# remaining local copies, or one dispatch shape lands on a different policy
+# than another. spawn-claude.sh is deliberately NOT in this loop any more: it
+# no longer keeps a local alias table at all (see below) — the CLI it calls is
+# unit-tested for alias resolution directly
+# (loom-daemon/src/cli/role_tool_policy.rs). spawn-codex.sh still needs its own
+# copy for $_hook_role (used beyond just the tool-policy check), and
+# guard-destructive-generic.sh is a hook the runtime execs directly as shell
+# with no daemon subcommand form (#8211/#8035) — those two must still agree.
+for _place in "$SCRIPTS_DIR/spawn-codex.sh" \
               "$SCRIPTS_DIR/../hooks/guard-destructive-generic.sh"; do
     SRC="$(cat "$_place")"
     ok=true
@@ -273,6 +282,11 @@ for _place in "$SCRIPTS_DIR/spawn-claude.sh" "$SCRIPTS_DIR/spawn-codex.sh" \
             "one of development-worker / pr-fixer / sweep-lifecycle is missing"
     fi
 done
+
+assert_contains "role-tool-policy deny-specs" "$CLAUDE_SRC" \
+    "spawn-claude delegates deny-spec computation (incl. alias resolution) to loom-daemon role-tool-policy"
+assert_not_contains "development-worker" "$CLAUDE_SRC" \
+    "spawn-claude no longer keeps its own copy of the dispatch-alias table"
 
 echo ""
 echo "========================================="
