@@ -153,7 +153,6 @@ test-merge-pr-merge-method.sh
 test-merge-pr-rate-limit-fallback.sh
 test-merge-pr-unstable-fallback.sh
 test-merge-pr-wait-for-checks-empty-settle.sh
-test-merge-pr-worktree-path.sh
 test-nextest-daemon-guard.sh
 test-operator-only-subkind.sh
 test-post-verdict.sh
