@@ -981,6 +981,7 @@ if [[ -n "${LOOM_ROLE:-}" ]]; then
         # `contract`-category script for the same reason spawn-claude.sh's
         # deny-specs call-out was: inlining them here is exactly the portable
         # shell growth `shell-budget --check` refuses.
+        # requires-daemon: role-tool-policy optional   #8322/#8939 — merged when VERSION read 0.19.396, first shipped in the 0.19.397 post-merge bump; no binary, no subcommand, or a resolution error all degrade to no warning (silent, matching the pre-existing "hooks unavailable" no-op).
         _policy_daemon_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null)"
         if [[ -n "$_policy_daemon_bin" ]] \
             && _policy_json="$("$_policy_daemon_bin" role-tool-policy restricted "${_hook_role:-$LOOM_ROLE}" \

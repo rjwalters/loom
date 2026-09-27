@@ -1232,6 +1232,7 @@ unset _loom_print_mode
 # deny-specs` (issue #8322) now — ported out of this `contract`-category script
 # because inlining them here is exactly the portable-shell growth
 # `shell-budget --check` refuses. This block is just the call-out.
+# requires-daemon: role-tool-policy optional   #8322/#8939 — merged when VERSION read 0.19.396, first shipped in the 0.19.397 post-merge bump; no binary, no subcommand, or a resolution error all degrade to the byte-for-byte no-op the DEGRADATION CONTRACT above already documents.
 if [[ -n "${LOOM_ROLE:-}" ]]; then
     # Re-export the role so every child — the `claude` session, and through it
     # every PreToolUse hook subprocess — sees the identity the guard backstop
