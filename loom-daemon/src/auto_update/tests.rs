@@ -85,7 +85,7 @@ fn test_config_reads_all_fields() {
     let tmp = tempfile::tempdir().unwrap();
     write_config(
         tmp.path(),
-        r#"{"autonomous": {"autoUpdate": {"enabled": true, "intervalSecs": 120, "settleSecs": 30, "deferDeadlineSecs": 7200, "rollStallDeadlines": 5}}}"#,
+        r#"{"autonomous": {"autoUpdate": {"enabled": true, "intervalSecs": 120, "settleSecs": 30, "deferDeadlineSecs": 7200, "rollStallDeadlines": 5, "rollStallCooldownSecs": 10800}}}"#,
     );
     assert_eq!(
         read_auto_update_config(tmp.path()),
@@ -95,6 +95,7 @@ fn test_config_reads_all_fields() {
             settle_secs: Some(30),
             defer_deadline_secs: Some(7200),
             roll_stall_deadlines: Some(5),
+            roll_stall_cooldown_secs: Some(10_800),
         }
     );
 }
@@ -104,12 +105,16 @@ fn test_config_zero_values_dropped_to_none() {
     let tmp = tempfile::tempdir().unwrap();
     write_config(
         tmp.path(),
-        r#"{"autonomous": {"autoUpdate": {"intervalSecs": 0, "settleSecs": 0, "deferDeadlineSecs": 0}}}"#,
+        r#"{"autonomous": {"autoUpdate": {"intervalSecs": 0, "settleSecs": 0, "deferDeadlineSecs": 0, "rollStallDeadlines": 0, "rollStallCooldownSecs": 0}}}"#,
     );
     let cfg = read_auto_update_config(tmp.path());
     assert_eq!(cfg.interval_secs, None);
     assert_eq!(cfg.settle_secs, None);
     assert_eq!(cfg.defer_deadline_secs, None);
+    assert_eq!(cfg.roll_stall_deadlines, None);
+    // #9010: a `0` cooldown would clear a declaration on the tick it was made,
+    // which is #8998's livelock re-entered through the knob.
+    assert_eq!(cfg.roll_stall_cooldown_secs, None);
 }
 
 // ===================================================================
@@ -209,6 +214,7 @@ fn test_resolve_interval_and_settle_precedence() {
         settle_secs: Some(45),
         defer_deadline_secs: None,
         roll_stall_deadlines: None,
+        roll_stall_cooldown_secs: None,
     };
     assert_eq!(resolve_interval(&cfg), Duration::from_secs(300));
     assert_eq!(resolve_settle(&cfg), Duration::from_secs(45));

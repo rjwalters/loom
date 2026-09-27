@@ -269,6 +269,12 @@ pub struct AutoUpdateConfig {
     /// (#8998). A zero/invalid value is dropped to `None`: `0` would declare
     /// every armed roll unsatisfiable on sight.
     pub roll_stall_deadlines: Option<u32>,
+    /// `autonomous.autoUpdate.rollStallCooldownSecs` — how long a standing
+    /// unsatisfiability declaration may stand before it expires and one more
+    /// bounded roll attempt is released (#9010). A zero/invalid value is dropped
+    /// to `None`: `0` would clear a declaration on the tick it was made, which is
+    /// #8998's livelock re-entered through the knob.
+    pub roll_stall_cooldown_secs: Option<u64>,
 }
 
 /// Read `.loom/config.json → autonomous.autoUpdate` through
@@ -303,6 +309,10 @@ pub fn read_auto_update_config(repo_root: &Path) -> AutoUpdateConfig {
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
             .filter(|&n| n > 0),
+        roll_stall_cooldown_secs: block
+            .get("rollStallCooldownSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
     }
 }
 
@@ -571,8 +581,9 @@ pub mod roll_stall;
 /// positional `Duration` was the wrong shape.
 pub mod tuning;
 pub use roll_stall::{
-    resolve_roll_stall_deadlines, RollStallReport, AUTO_UPDATE_ROLL_STALL_DEADLINES_ENV,
-    DEFAULT_ROLL_STALL_DEADLINES,
+    resolve_roll_stall_cooldown, resolve_roll_stall_deadlines, RollStallReport,
+    AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS_ENV, AUTO_UPDATE_ROLL_STALL_DEADLINES_ENV,
+    DEFAULT_ROLL_STALL_COOLDOWN_SECS, DEFAULT_ROLL_STALL_DEADLINES,
 };
 pub use tuning::TickTuning;
 
@@ -1844,8 +1855,17 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
     let armed = trigger.armed_roll();
     if armed.is_some() || state.roll_stall_active() {
         let stall_in_flight = probe.in_flight_sweeps();
-        if let Some(report) = state.observe_roll_stall(last_check, armed.as_ref(), stall_in_flight)
-        {
+        let stall = state.observe_roll_stall(last_check, armed.as_ref(), stall_in_flight);
+        // Issue #9010: a standing declaration that has stood for its full cooldown
+        // is dropped inside `observe` (returning `None`, so this tick falls through
+        // and arms a roll normally). Surface that as its own WARN rather than
+        // letting the suppression end silently — an operator watching a host that
+        // stopped updating needs to see the retry being spent as well as the
+        // declaration that preceded it.
+        if let Some(retry) = state.take_roll_stall_retry_note() {
+            log::warn!("auto_update: {retry}");
+        }
+        if let Some(report) = stall {
             let note = report.note();
             log::warn!("auto_update: {note}");
             // Only ever a roll this loop armed and labelled with an artifact
@@ -2078,8 +2098,9 @@ where
     register_global_status(status.clone());
     log::info!("auto_update: starting loop ({})", tuning.describe());
     tokio::spawn(async move {
-        let mut state =
-            AutoUpdateState::new().with_roll_stall_deadlines(tuning.roll_stall_deadlines);
+        let mut state = AutoUpdateState::new()
+            .with_roll_stall_deadlines(tuning.roll_stall_deadlines)
+            .with_roll_stall_cooldown(tuning.roll_stall_cooldown);
         let mut ticker = tokio::time::interval(tuning.interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
