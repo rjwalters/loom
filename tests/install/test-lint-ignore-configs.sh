@@ -165,10 +165,16 @@ echo ""
 echo "=== install, reinstall, and resync paths all carry the configs ==="
 
 # Fresh install + reinstall: loom-daemon init copies defaults/.loom/biome.jsonc.
+# Since #9130 no member of defaults/.loom/ is named: sync_loom_payload_tree
+# walks the tree and copies every top-level file except the
+# LOOM_TREE_SCAFFOLDED_FILES handled elsewhere. So assert the walk is wired
+# and biome.jsonc is not diverted from it.
 # (`.claude/biome.jsonc` needs no dedicated call — setup_repository_scaffolding
 # copies the whole defaults/.claude/ tree.)
-assert_true "loom-daemon init copies .loom/biome.jsonc" \
-  "$(grep -qF '".loom/biome.jsonc"' "$INIT_RS" && echo true || echo false)"
+assert_true "loom-daemon init walks defaults/.loom/ (copies .loom/biome.jsonc)" \
+  "$(grep -qE '^[[:space:]]*sync_loom_payload_tree\(&defaults' "$INIT_RS" && echo true || echo false)"
+assert_true "biome.jsonc is not diverted from the defaults/.loom/ walk" \
+  "$(grep -E '^const LOOM_TREE_SCAFFOLDED_FILES' "$INIT_RS" | grep -qvF 'biome.jsonc' && echo true || echo false)"
 
 # Already-installed repos: resync must BACKFILL both (unconditional sync, not
 # gated on the destination pre-existing — no repo installed before #6031 has
