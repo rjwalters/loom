@@ -1548,6 +1548,12 @@ jobs:
       # suite's require-daemon-bin harness needs the binary this job downloads.
       - name: merge-pr partial-increment labels (#3667, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-partial-increment.sh
+      # Moved out of shell-suite-tests by #8191's closed-issue slice: the
+      # #6199 `loom:building` strip for an issue the merge itself closes now
+      # delegates to `loom-daemon merge-pr closed-building`, so this suite's
+      # require-daemon-bin harness needs the binary this job downloads.
+      - name: merge-pr closed-issue loom:building cleanup (#6199, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-closed-issue-cleanup.sh
       # Moved out of shell-suite-tests by the #8191 mergeable-recheck slice:
       # the stale-mergeable recheck's terminal classification now delegates to
       # `loom-daemon merge-pr mergeable-recheck`, so this suite's

@@ -1550,33 +1550,28 @@ _reset_partial_increment_labels() {
 # present. Idempotent: a no-op when the issue isn't actually closed (a
 # transient PR-close-target false positive, or #4569 reopened it above),
 # already lacks the label, or is actually a PR.
+#
+# The decision — which of those cases this is — is `loom-daemon merge-pr
+# closed-building` (Rust, loom-daemon/src/merge_pr/closed_building.rs — #8191
+# slice), fed the fresh issue body on stdin. It prints exactly one line:
+# `STRIP`, or `SKIP<TAB><reason>` which this pass deliberately discards (the
+# retired function's skips were silent and stdout stays byte-identical). Only
+# the mutation stays here. The fresh read uses plain `gh api` (uncached; not
+# $GH, which may be gh-cached) so a stale cached view cannot mask a fresh
+# re-claim — the same freshness discipline _reset_one_partial_issue keeps.
+# Best-effort like the rest of this pass: a daemon that cannot decide, or that
+# answers with anything but the two known lines, is a warning naming the manual
+# removal, never a guessed mutation. Silence is NOT read as `SKIP`.
 _strip_one_closed_issue_building_label() {
-  local issue_num="$1"
-  local issue_json issue_state issue_labels
+  local issue_num="$1" issue_json out rc=0
 
-  # Fresh (uncached) read, mirroring _reset_one_partial_issue's freshness
-  # discipline: we need the label/state AS OF right now, not as of PR
-  # creation or the GraphQL closingIssuesReferences snapshot.
   issue_json="$(gh api "repos/$REPO_NWO/issues/$issue_num" 2>/dev/null || echo '{}')"
-
-  # A PR is also an "issue" on this endpoint (has a .pull_request member).
-  if [[ "$(echo "$issue_json" | jq -r 'has("pull_request")')" == "true" ]]; then
+  out="$(printf '%s\n' "$issue_json" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr closed-building 2>/dev/null)" || rc=$?
+  if [[ $rc -ne 0 || ( "$out" != "STRIP" && "$out" != "SKIP"$'\t'* ) ]]; then
+    warning "Closed-issue loom:building cleanup for issue #$issue_num did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr closed-building' exited $rc and printed '${out//$'\n'/ }' rather than STRIP or SKIP (a loom-daemon predating #8191's slice has no such verb). Advisory only — the merge already happened and #$issue_num was left untouched; if it is closed and still loom:building, drop the stale claim by hand: gh issue edit $issue_num --repo $REPO_NWO --remove-label loom:building $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
     return 0
   fi
-
-  issue_state="$(echo "$issue_json" | jq -r '.state // ""')"
-  if [[ "$issue_state" != "closed" ]]; then
-    # Not (or no longer) closed — either a #4569 revert just reopened it, the
-    # forge's close hadn't landed yet when we read it, or it was never
-    # actually closed. Leave the label; a later merge or the standalone
-    # cleanup script will catch it once it genuinely closes.
-    return 0
-  fi
-
-  issue_labels="$(echo "$issue_json" | jq -r '.labels[]?.name' 2>/dev/null || true)"
-  if ! printf '%s\n' "$issue_labels" | grep -qx 'loom:building'; then
-    return 0
-  fi
+  [[ "$out" == "STRIP" ]] || return 0
 
   if forge_gh_remove_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" 2>/dev/null; then
     success "Issue #$issue_num: removed stale loom:building label (closed by this merge, #6199)"

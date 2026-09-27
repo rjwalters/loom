@@ -121,7 +121,19 @@
 //! what a record-oriented parse saw, and whose every consumer is one of the
 //! irreversible steps (`git worktree remove --force`, `git branch -D`). The
 //! `git` invocation itself stays in the shell; only the parse moved.
+//!
+//! [`closed_building`] is [`partial_reset`]'s twin at the same post-merge
+//! choke point, and runs immediately after it: the #6199 cleanup that strips
+//! `loom:building` from each issue THIS merge closed. Where `partial_reset`
+//! handles the issues a `Part of #N` reference deliberately left OPEN, this
+//! one handles the issues a `Closes #N` reference closed — the one label
+//! #2838's "no cleanup on close" rule had to make an exception for, because
+//! `loom:building` names a liveness claim and a closed issue holds none. It
+//! reads its input through the same three `jq` filters, so it reuses
+//! `partial_reset`'s [`partial_reset::IssueView`] rather than re-deriving a
+//! second model of the same endpoint.
 
+pub mod closed_building;
 pub mod dirty_guard;
 pub mod head_sync;
 pub mod hold_state;

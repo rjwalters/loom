@@ -483,6 +483,13 @@ pub(crate) enum MergePrCommand {
     /// performs. Exit 0 with the plan (empty = silent skip, a PR), 2 = stdin
     /// unreadable — see `cli::merge_pr_partial_reset`.
     PartialReset(super::merge_pr_partial_reset::PartialResetArgs),
+
+    /// The post-merge closed-issue `loom:building` cleanup decision (#6199):
+    /// from the fresh body of an issue THIS merge closed, on stdin, either
+    /// `STRIP` (the claim label is stale — remove it) or `SKIP<TAB><reason>`.
+    /// Exit 0 with the decision, 2 = stdin unreadable. Silence is never a
+    /// decision — see `cli::merge_pr_closed_building`.
+    ClosedBuilding(super::merge_pr_closed_building::ClosedBuildingArgs),
 }
 
 impl MergePrCommand {
@@ -504,6 +511,7 @@ impl MergePrCommand {
             MergePrCommand::WorktreeBranchFor(args) => args.run(),
             MergePrCommand::WorktreeFindByBranch(args) => args.run(),
             MergePrCommand::PartialReset(args) => args.run(),
+            MergePrCommand::ClosedBuilding(args) => args.run(),
         }
     }
 }
