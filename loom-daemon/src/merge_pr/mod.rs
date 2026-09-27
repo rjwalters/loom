@@ -104,6 +104,14 @@
 //! `Part of #N` issue and what the pre-merge conflict guard recorded about it,
 //! the ordered log / reopen / swap steps. The `jq` reads it replaces are
 //! modelled filter-by-filter, and the mutations stay in the shell.
+//!
+//! [`partial_conflict`] is that pre-merge guard itself (#4569/#4595): from
+//! the body, the commit messages, the sidebar close targets and each declared
+//! issue's fresh read, which issues were open and which a closing reference
+//! will close anyway — the two sets [`partial_reset`] consumes — plus the
+//! source-attributed warning. It never blocks on a conflict, but a plan it
+//! cannot produce refuses the merge: read as empty, it would leave a partial
+//! increment closed with nothing recorded to revert it.
 
 //! [`version_policy`] is the pre-merge no-hand-bump guard (#7827) and its
 //! oracle choice (#8284): everything `merge-pr.sh` wrapped around the
@@ -182,6 +190,7 @@ pub mod issue_close_gate;
 pub mod labels;
 pub mod loom_pr_guard;
 pub mod mergeable_recheck;
+pub mod partial_conflict;
 pub mod partial_reset;
 pub mod reconcile;
 pub mod redate;

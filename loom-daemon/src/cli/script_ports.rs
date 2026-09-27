@@ -505,6 +505,15 @@ pub(crate) enum MergePrCommand {
     /// unreadable — see `cli::merge_pr_partial_reset`.
     PartialReset(super::merge_pr_partial_reset::PartialResetArgs),
 
+    /// The pre-merge partial-increment close-conflict decision (#4569/#4595):
+    /// from a NUL-framed body / commit messages / sidebar close targets /
+    /// `(issue, fresh body)` record on stdin, the `OPEN`/`CONFLICT<TAB>n` set
+    /// entries and `WARNING<TAB>text` lines the shell replays, terminated by
+    /// `LOOM-PARTIAL-CONFLICT-DONE`. Exit 2 = malformed frame; the shell
+    /// refuses the merge without the terminator — see
+    /// `cli::merge_pr_partial_conflict`.
+    PartialConflict(super::merge_pr_partial_conflict::PartialConflictArgs),
+
     /// Which route a FAILED merge's forge error text sends the retry ladder
     /// down (#8191 slice): `merge-in-progress` (405, wait and retry),
     /// `head-mismatch` (#5579 — never retry-and-merge), `base-modified` (sync
@@ -559,6 +568,7 @@ impl MergePrCommand {
             MergePrCommand::WorktreeBranchFor(args) => args.run(),
             MergePrCommand::WorktreeFindByBranch(args) => args.run(),
             MergePrCommand::PartialReset(args) => args.run(),
+            MergePrCommand::PartialConflict(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),
             MergePrCommand::ClosedBuilding(args) => args.run(),
             MergePrCommand::ReconcilePlan(args) => args.run(),
