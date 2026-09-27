@@ -74,7 +74,7 @@ impl Frame {
     pub fn parse(raw: &str) -> Option<Self> {
         let mut fields: Vec<&str> = raw.split('\0').collect();
         // Every field is NUL-terminated, so the split leaves one empty tail.
-        if fields.pop() != Some("") || fields.len() < 3 || (fields.len() - 3) % 2 != 0 {
+        if fields.pop() != Some("") || fields.len() < 3 || !(fields.len() - 3).is_multiple_of(2) {
             return None;
         }
         let issues = fields[3..]

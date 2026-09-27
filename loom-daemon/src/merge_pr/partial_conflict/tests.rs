@@ -184,11 +184,14 @@ fn several_declarations_are_decided_independently_in_ascending_order() {
 
 #[test]
 fn frame_parse_requires_nul_termination_and_paired_issues() {
-    assert_eq!(Frame::parse("b\0c\0g\0123\0{}\0"), Some(frame("b", "c", "g", &[("123", "{}")])));
+    assert_eq!(
+        Frame::parse("b\0c\0g\x00123\0{}\0"),
+        Some(frame("b", "c", "g", &[("123", "{}")]))
+    );
     assert_eq!(Frame::parse("b\0c\0\0"), Some(frame("b", "c", "", &[])));
     assert_eq!(Frame::parse(""), None);
     assert_eq!(Frame::parse("b\0c\0g"), None, "unterminated");
-    assert_eq!(Frame::parse("b\0c\0g\0123\0"), None, "unpaired issue");
+    assert_eq!(Frame::parse("b\0c\0g\x00123\0"), None, "unpaired issue");
 }
 
 #[test]
