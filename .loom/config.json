@@ -1,5 +1,8 @@
 {
   "version": "2",
+  "fleet": {
+    "captain": "robb-studio"
+  },
   "offlineMode": false,
   "autonomous": {
     "roleRunner": {
