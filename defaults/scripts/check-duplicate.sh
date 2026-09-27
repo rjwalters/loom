@@ -530,9 +530,9 @@ search_cross_references() {
 
     # The same-repo compare is case-insensitive: GitHub owner/repo names are,
     # and $repo_nwo carries whatever casing the local remote URL was cloned
-    # with (e.g. "2amlogic/x") while full_name carries GitHub's canonical
-    # casing ("2AMLogic/x"). A case-sensitive compare silently dropped every
-    # cross-reference for such clones (2AMLogic/2am#1296).
+    # with (e.g. "example-org/x") while full_name carries GitHub's canonical
+    # casing ("Example-Org/x"). A case-sensitive compare silently dropped every
+    # cross-reference for such clones (example-org/tool-repo#202).
     echo "$timeline" | jq -c --arg repo "$repo_nwo" --argjson self "$issue_num" '
         [.[] | select(.event == "cross-referenced"
                        and .source.issue != null

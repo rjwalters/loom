@@ -424,11 +424,12 @@ assert_not_contains "$OUT" "RELATED_OPEN_WORK" "(g) git remote resolution failur
 assert_contains "$ERR" "Failed to resolve repository" "(g) git remote resolution failure -> stderr warning emitted"
 
 # (cs) Remote-URL casing differs from GitHub's canonical full_name
-# (2AMLogic/2am#1296). Owner/repo names are case-insensitive on GitHub, but
-# get_repo_nwo() returns the remote URL's casing verbatim -- a clone of
-# "https://github.com/2amlogic/harness-ops.git" yields "2amlogic/harness-ops"
-# while the timeline reports "2AMLogic/harness-ops". The same-repo filter must
-# still match, or RELATED_OPEN_WORK is silently [] for every issue.
+# (example-org/tool-repo#202). Owner/repo names are case-insensitive on
+# GitHub, but get_repo_nwo() returns the remote URL's casing verbatim -- a
+# clone of "https://github.com/example-org/harness-ops.git" yields
+# "example-org/harness-ops" while the timeline reports
+# "Example-Org/harness-ops". The same-repo filter must still match, or
+# RELATED_OPEN_WORK is silently [] for every issue.
 case_timeline() {
     # $1 = issue number, $2 = cross-referencing issue number, $3 = full_name
     cat > "$STUB_DIR/timeline-$1.json" <<EOF
