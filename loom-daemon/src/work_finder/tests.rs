@@ -3717,7 +3717,7 @@ fn test_scale_to_zero_on_empty_backlog() {
 // Config-file surface — read_work_finder_config soft-fail (#3813)
 // ===================================================================
 
-fn write_config(dir: &Path, body: &str) {
+fn write_config(dir: &std::path::Path, body: &str) {
     let loom_dir = dir.join(".loom");
     std::fs::create_dir_all(&loom_dir).unwrap();
     std::fs::write(loom_dir.join("config.json"), body).unwrap();
@@ -3983,13 +3983,13 @@ fn test_config_zero_interval_and_max_drop_to_none() {
 // config_resolver migration (#4058) — tier precedence
 // ===================================================================
 
-fn write_project_config(dir: &Path, body: &str) {
+fn write_project_config(dir: &std::path::Path, body: &str) {
     let full = dir.join(crate::config_resolver::PROJECT_CONFIG_REL);
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
     std::fs::write(full, body).unwrap();
 }
 
-fn write_local_config(dir: &Path, body: &str) {
+fn write_local_config(dir: &std::path::Path, body: &str) {
     let full = dir.join(crate::config_resolver::LOCAL_CONFIG_REL);
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
     std::fs::write(full, body).unwrap();
