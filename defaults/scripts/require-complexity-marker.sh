@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # require-complexity-marker.sh - Check that an issue carries a complexity tier
-# before it is marked curated (#4238).
+# AND a points estimate before it is marked curated (#4238, #9056).
 #
 # The tier drives the downstream Builder model choice, so an unclassified issue
 # silently costs either quality (cheap model on money/security work) or money
-# (frontier model on a file split). This turns "please remember to classify"
-# into a command the Curator can run that fails loudly.
+# (frontier model on a file split). The points marker is a coarse, uncalibrated
+# holistic estimate of expected total sweep cost, laying the groundwork for
+# comparing it against the actual token/duration/cycle burn a successful sweep
+# already assembles (Issue #9056). This turns "please remember to classify" into
+# a command the Curator can run that fails loudly on either marker.
 #
-#   require-complexity-marker.sh <issue> [repo]   # exit 0 = has a valid tier
-#                                                 # exit 1 = missing/invalid
+#   require-complexity-marker.sh <issue> [repo]   # exit 0 = both markers valid
+#                                                 # exit 1 = missing/invalid marker
+#                                                 # exit 2 = could not fetch (retry/check quota)
 set -uo pipefail
 
 ISSUE="${1:-}"
@@ -37,7 +41,8 @@ fi
 # to REST (which draws on a separate quota), and only if BOTH fail exit 2
 # ("could not evaluate", already this script's semantics for repo-resolution
 # failures) rather than 1 (missing marker). An empty body from a *successful*
-# fetch remains exit 1.
+# fetch remains exit 1. Fetched ONCE and reused for both the tier and points
+# checks below (#9056) — no second round trip.
 if body="$(gh issue view "$ISSUE" -R "$REPO" --json body -q .body 2>/dev/null)"; then
   :
 elif body="$(gh api "repos/$REPO/issues/$ISSUE" --jq .body 2>/dev/null)"; then
@@ -46,6 +51,11 @@ else
   echo "BLOCKED: could not fetch issue $REPO#$ISSUE body (both GraphQL and REST failed — likely GitHub API quota exhaustion). Retry or check quota; this is not a curation defect." >&2
   exit 2
 fi
+
+STATUS=0
+
+# ---- Complexity tier ---------------------------------------------------
+#
 # Anchor to the canonical HTML-comment marker form (`<!-- loom:complexity=<tier>
 # -->`) rather than a bare `loom:complexity=[a-z]*` substring, and take the LAST
 # such match (#4840). A bare substring match also fires on prose that merely
@@ -75,10 +85,42 @@ Add exactly one of these to the issue body before applying loom:curated:
 
 Torn between two? Take the higher one.
 EOF
-    exit 1
+    STATUS=1
     ;;
   *)
     echo "BLOCKED: issue $ISSUE has an invalid tier '$tier' (expected mechanical|routine|complex)" >&2
-    exit 1
+    STATUS=1
     ;;
 esac
+
+# ---- Points estimate marker (Issue #9056) ------------------------------
+#
+# Same anchored-HTML-comment discipline as the tier above (closed vocabulary,
+# last match wins, a bare substring never matches placeholder prose), applied
+# to the second, independent `<!-- loom:points=<N> -->` marker.
+points="$(printf '%s' "$body" | grep -oE '<!--[[:space:]]*loom:points=[0-9]*[[:space:]]*-->' | tail -1 | sed -E 's/.*points=([0-9]*).*/\1/')"
+
+case "$points" in
+  1|2|3|5|8|13)
+    echo "ok: $REPO#$ISSUE is pointed $points"
+    ;;
+  "")
+    cat >&2 <<'EOF'
+BLOCKED: issue has no points estimate marker.
+
+Add exactly one of these to the issue body before applying loom:curated:
+
+  <!-- loom:points=1 -->    <!-- loom:points=2 -->    <!-- loom:points=3 -->
+  <!-- loom:points=5 -->    <!-- loom:points=8 -->    <!-- loom:points=13 -->
+
+Loose guidance: mechanical -> 1-2, routine -> 3-5, complex -> 8-13.
+EOF
+    STATUS=1
+    ;;
+  *)
+    echo "BLOCKED: issue $ISSUE has an invalid points value '$points' (expected one of 1, 2, 3, 5, 8, 13)" >&2
+    STATUS=1
+    ;;
+esac
+
+exit "$STATUS"

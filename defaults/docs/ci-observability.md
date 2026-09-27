@@ -96,6 +96,15 @@ journal schema, chunking contract, standing queries) to this page when it
 lands. Phase 1's poller ships **off by default** (FLAGS-OFF): the policy is
 enforced only on a host where [Rollout](#rollout) has enabled it.
 
+**Not yet: a sweep-outcome join.** `ci.run`/`ci.job` records are keyed by repo +
+run id, with no existing join to a `sweep_id`, PR number, or issue — so CI
+minutes are **not** part of the opt-in sweep-outcome issue write-back comment
+(`autonomous.sweepOutcomeWriteback`, Issue #9056; see
+[`daemon-reference.md`](daemon-reference.md) → "Sweep-outcome issue
+write-back"). Correlating a run to the sweep/issue that triggered it (by PR
+head SHA or branch name) is real, separate follow-up work, named but not
+scheduled.
+
 ## Capture scope & exclusions
 
 - **Scope is a list of owners, not a repo list.** The `owners` key of the

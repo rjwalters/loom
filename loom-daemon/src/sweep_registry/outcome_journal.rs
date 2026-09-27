@@ -10,6 +10,17 @@ pub(crate) mod label_timeline;
 /// #8542) — the source of the record's `complexity`.
 pub(crate) mod complexity_signal;
 
+/// The Curator points-estimate signal read off the sweep's issue body (Issue
+/// #9056), consumed only by [`writeback`] — see its own module doc for why
+/// this is a separate, conditionally-fetched read rather than a permanent
+/// `SweepOutcomeRecord` field like `complexity`.
+pub(crate) mod points_signal;
+
+/// The opt-in, post-`Success` issue write-back comment (Issue #9056): renders
+/// [`telemetry::SweepOutcomeRecord`] + [`points_signal`]'s estimate to
+/// Markdown and posts it, once, to the sweep's originating issue.
+pub(crate) mod writeback;
+
 /// One observed lifecycle-phase transition for a live sweep (Issue #4704):
 /// the checkpoint phase marker and the instant [`SweepRegistry::reap_once`]
 /// first observed it.
@@ -704,6 +715,17 @@ impl SweepRegistry {
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
             complexity,
         };
+        // Issue #9056: opt-in, post-`Success`-only issue write-back comment.
+        // Deliberately AFTER the record above is fully assembled (so the
+        // formatter has every field to work with) and gated inside
+        // `maybe_post_sweep_outcome_writeback` itself (flag resolution,
+        // breaker, idempotency) rather than with an `if` here, so every other
+        // terminal result short-circuits on the very first check with zero
+        // extra forge cost. Never blocks or fails this journal append: see
+        // `writeback`'s own module doc for the full fail-open contract.
+        if result == telemetry::SweepResult::Success {
+            self.maybe_post_sweep_outcome_writeback(issue, &outcome_record);
+        }
         let result_name = serde_json::to_value(result)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -1061,3 +1083,16 @@ mod tap_usage_tests;
     unused_imports
 )]
 mod complexity_tests;
+
+// End-to-end tests for the #9056 issue write-back (posting, idempotency, the
+// `Success`-only gate), in their own sibling file for the same file-size
+// reason as `timeline_tests` above. `points_signal` and `writeback`'s own
+// pure/unit tests live inline in those modules instead.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod writeback_tests;
