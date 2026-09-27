@@ -24,6 +24,13 @@
     },
     "autoUpdate": {
       "enabled": true
+    },
+    "ciTelemetry": {
+      "enabled": true,
+      "owners": [
+        "2amlogic",
+        "rjwalters"
+      ]
     }
   },
   "buildGate": {
@@ -149,5 +156,8 @@
     "batchSize": 50,
     "flushIntervalSecs": 30,
     "queueCapacity": 2000
+  },
+  "fleet": {
+    "captain": "loom-worker-1"
   }
 }
