@@ -494,6 +494,35 @@ fn daemon_version_becomes_a_resource_attribute_not_a_metric() {
     );
 }
 
+fn resource_service_version(resource: Option<&Resource>) -> Option<String> {
+    resource?
+        .attributes
+        .iter()
+        .find(|kv| kv.key == "service.version")
+        .and_then(|kv| kv.value.as_ref())
+        .and_then(|v| match &v.value {
+            Some(any_value::Value::StringValue(s)) => Some(s.clone()),
+            _ => None,
+        })
+}
+
+#[test]
+fn logs_resource_carries_the_build_service_version() {
+    let request = build_logs_request(&[sweep_started_envelope()]).unwrap();
+    assert_eq!(
+        resource_service_version(request.resource_logs[0].resource.as_ref()).as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn metrics_without_host_health_still_carry_a_service_version() {
+    let request = build_metrics_request(&[tokens_snapshot_envelope()]).unwrap();
+    let version = resource_service_version(request.resource_metrics[0].resource.as_ref());
+    assert!(version.as_deref().is_some_and(|v| !v.is_empty()));
+    assert_eq!(version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+}
+
 #[test]
 fn unmeasured_optional_fields_produce_no_data_point() {
     let mut record = HostHealthRecord {
