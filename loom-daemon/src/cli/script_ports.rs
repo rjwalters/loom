@@ -317,6 +317,16 @@ pub(crate) enum ScriptPortCommand {
     /// write. See `defaults/docs/park-record.md`.
     #[command(subcommand)]
     ParkRecord(super::park_record::ParkRecordCommand),
+
+    /// Curator's `<!-- loom:points=<N> -->` estimate-marker validation
+    /// (#9056), backing `require-complexity-marker.sh`'s points-marker gate.
+    /// Reads the issue body on stdin — the same body the shell script's own
+    /// complexity-tier check already fetched, no second `gh` call. Not a
+    /// port of a whole script: the complexity-tier half of
+    /// `require-complexity-marker.sh` stays inline shell, unchanged; only the
+    /// new points check moved here, to keep the #7810 `shell-budget` gate a
+    /// non-event for this addition.
+    CheckPointsMarker(super::points_marker_check::CheckPointsMarkerArgs),
 }
 
 impl ScriptPortCommand {
@@ -364,6 +374,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
+            ScriptPortCommand::CheckPointsMarker(args) => args.run(),
         }
     }
 }

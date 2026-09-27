@@ -14,11 +14,17 @@
 #
 # #9056 extends the same script to ALSO require a valid `<!-- loom:points=<N>
 # -->` marker (closed vocabulary 1/2/3/5/8/13), read off the SAME fetched body —
-# no second `gh` round trip. Both markers are checked and both failure messages
-# are printed when both are missing/invalid; the script exits 1 if EITHER is
-# bad, 0 only when both are valid. Every pre-#9056 success fixture (9001, 9004,
-# 9007) therefore now carries a valid `loom:points` marker too, alongside its
-# `loom:complexity` marker, so those scenarios keep exiting 0.
+# no second `gh` round trip. The tier check runs FIRST and exits immediately on
+# a bad tier (unchanged, early-exit style); the points check is reached only
+# once a valid tier is confirmed, and its validation moved into a
+# `loom-daemon check-points-marker` subcommand rather than more inline shell
+# (epic #7810's `shell-budget` gate ratchets `contract`-category shell lines
+# down, never up — see the script's own comment at that call site). Every
+# pre-#9056 success fixture (9001, 9004, 9007) therefore now carries a valid
+# `loom:points` marker too, alongside its `loom:complexity` marker, so those
+# scenarios keep exiting 0. A fake `loom-daemon` stub (below, alongside the
+# fake `gh`) stands in for the real subcommand so this suite stays a fast,
+# hermetic shell test with no `cargo build` dependency.
 #
 # Style matches test-resolve-tier-model.sh: a fake `gh` stub on PATH answers both
 # the `gh issue view ... -q .body` (GraphQL) and `gh api repos/.../issues/... --jq
@@ -181,6 +187,54 @@ exit 1
 FAKEGH
 chmod +x "$FAKE_BIN/gh"
 
+# ---- Fake `loom-daemon` stub -------------------------------------------
+# The real points-marker validation now lives in
+# `loom-daemon check-points-marker` (Issue #9056, moved out of inline shell
+# to keep epic #7810's `shell-budget` gate a non-event — see
+# require-complexity-marker.sh's own comment at the call site). This fake
+# reimplements just that one subcommand's contract (stdin body in, `--issue`/
+# `--repo` for the message label, exit 0/1, matching message text) so this
+# suite stays a fast, hermetic shell test with no `cargo build` dependency —
+# the real Rust logic has its own unit tests in
+# `loom-daemon/src/points_marker.rs`, run via cargo. Placed on `$PATH` ahead
+# of any real installed `loom-daemon` by `run_marker` below, exactly like the
+# fake `gh`.
+cat > "$FAKE_BIN/loom-daemon" <<'FAKEDAEMON'
+#!/usr/bin/env bash
+if [[ "$1" == "check-points-marker" ]]; then
+    shift
+    issue=""
+    repo=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --issue) issue="$2"; shift 2 ;;
+            --repo) repo="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    body="$(cat)"
+    raw="$(printf '%s' "$body" | grep -oE '<!--[[:space:]]*loom:points=[0-9]*[[:space:]]*-->' | tail -1 | sed -E 's/.*points=([0-9]*).*/\1/')"
+    label="$issue"
+    [[ -n "$repo" ]] && label="$repo#$issue"
+    case "$raw" in
+        1|2|3|5|8|13)
+            echo "ok: $label is pointed $raw"
+            exit 0
+            ;;
+        "")
+            echo "BLOCKED: issue has no points estimate marker." >&2
+            exit 1
+            ;;
+        *)
+            echo "BLOCKED: issue $issue has an invalid points value '$raw' (expected one of 1, 2, 3, 5, 8, 13)" >&2
+            exit 1
+            ;;
+    esac
+fi
+exit 1
+FAKEDAEMON
+chmod +x "$FAKE_BIN/loom-daemon"
+
 REPO="owner/repo"
 
 run_marker() {
@@ -284,12 +338,17 @@ out="$(run_marker 9013 2>&1)"; rc=$?
 assert_eq "0" "$rc" "a corrected later points marker still exits 0"
 assert_contains "is pointed 8" "$out" "the LAST points marker (8) is used, not the drifted first one (1)"
 
-# -------- Test 13: neither marker present -- both BLOCKED texts appear -----
-echo "Test 13: neither marker present -> exit 1 with BOTH BLOCKED texts"
+# -------- Test 13: neither marker present -- the tier check short-circuits -
+# The tier check runs (and exits) FIRST; the points check is only reached once
+# a valid tier is already confirmed (early-exit style, mirroring the
+# pre-#9056 script's own immediate `exit 1` on a bad tier). So a body with
+# NEITHER marker reports only the complexity BLOCKED text, never reaching the
+# points check at all -- not a combined report of both.
+echo "Test 13: neither marker present -> exit 1, complexity BLOCKED text only (tier check short-circuits)"
 out="$(run_marker 9014 2>&1)"; rc=$?
 assert_eq "1" "$rc" "missing both markers exits 1"
 assert_contains "BLOCKED: issue has no complexity marker" "$out" "complexity BLOCKED text is present"
-assert_contains "BLOCKED: issue has no points estimate marker" "$out" "points BLOCKED text is present"
+assert_not_contains "BLOCKED: issue has no points estimate marker" "$out" "the points check never ran -- the tier check already exited"
 
 # -------- Summary --------
 echo ""

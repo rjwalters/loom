@@ -43,16 +43,11 @@ fi
 # failures) rather than 1 (missing marker). An empty body from a *successful*
 # fetch remains exit 1. Fetched ONCE and reused for both the tier and points
 # checks below (#9056) — no second round trip.
-if body="$(gh issue view "$ISSUE" -R "$REPO" --json body -q .body 2>/dev/null)"; then
-  :
-elif body="$(gh api "repos/$REPO/issues/$ISSUE" --jq .body 2>/dev/null)"; then
-  :
-else
-  echo "BLOCKED: could not fetch issue $REPO#$ISSUE body (both GraphQL and REST failed — likely GitHub API quota exhaustion). Retry or check quota; this is not a curation defect." >&2
-  exit 2
-fi
-
-STATUS=0
+body="$(gh issue view "$ISSUE" -R "$REPO" --json body -q .body 2>/dev/null)" ||
+  body="$(gh api "repos/$REPO/issues/$ISSUE" --jq .body 2>/dev/null)" || {
+    echo "BLOCKED: could not fetch issue $REPO#$ISSUE body (both GraphQL and REST failed — likely GitHub API quota exhaustion). Retry or check quota; this is not a curation defect." >&2
+    exit 2
+  }
 
 # ---- Complexity tier ---------------------------------------------------
 #
@@ -85,42 +80,31 @@ Add exactly one of these to the issue body before applying loom:curated:
 
 Torn between two? Take the higher one.
 EOF
-    STATUS=1
+    exit 1
     ;;
   *)
     echo "BLOCKED: issue $ISSUE has an invalid tier '$tier' (expected mechanical|routine|complex)" >&2
-    STATUS=1
+    exit 1
     ;;
 esac
 
 # ---- Points estimate marker (Issue #9056) ------------------------------
 #
-# Same anchored-HTML-comment discipline as the tier above (closed vocabulary,
-# last match wins, a bare substring never matches placeholder prose), applied
-# to the second, independent `<!-- loom:points=<N> -->` marker.
-points="$(printf '%s' "$body" | grep -oE '<!--[[:space:]]*loom:points=[0-9]*[[:space:]]*-->' | tail -1 | sed -E 's/.*points=([0-9]*).*/\1/')"
-
-case "$points" in
-  1|2|3|5|8|13)
-    echo "ok: $REPO#$ISSUE is pointed $points"
-    ;;
-  "")
-    cat >&2 <<'EOF'
-BLOCKED: issue has no points estimate marker.
-
-Add exactly one of these to the issue body before applying loom:curated:
-
-  <!-- loom:points=1 -->    <!-- loom:points=2 -->    <!-- loom:points=3 -->
-  <!-- loom:points=5 -->    <!-- loom:points=8 -->    <!-- loom:points=13 -->
-
-Loose guidance: mechanical -> 1-2, routine -> 3-5, complex -> 8-13.
-EOF
-    STATUS=1
-    ;;
-  *)
-    echo "BLOCKED: issue $ISSUE has an invalid points value '$points' (expected one of 1, 2, 3, 5, 8, 13)" >&2
-    STATUS=1
-    ;;
-esac
-
-exit "$STATUS"
+# Validated by `loom-daemon check-points-marker`, not inline shell: epic
+# #7810's `shell-budget` CI gate ratchets `contract`-category portable shell
+# DOWN, never up, and .loom/docs/shell-language-policy.md's answer is new
+# executable logic is a daemon subcommand, not more portable shell. The body
+# is piped on stdin -- already fetched above for the tier check, so this
+# costs no second `gh` call. `loom_exec_script_helper` (lib/script-helper.sh)
+# resolves the binary and `exec`s the subcommand -- never returns -- so this
+# is deliberately this script's LAST statement; its own exit code (0 valid,
+# 1 missing/invalid marker) becomes this script's exit code unmodified.
+# LOOM_SCRIPT_HELPER_MISSING_RC=2 overrides the library's default missing-
+# binary code (1): a missing daemon is an environment problem here, the same
+# bucket as a body-fetch failure above, never a curation defect. No
+# `# requires-daemon:` marker is declared -- this call site is new, so no
+# floor predates it (see lib/script-helper.sh's own doc for when one is
+# needed).
+# shellcheck source=lib/script-helper.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/script-helper.sh"
+printf '%s' "$body" | LOOM_SCRIPT_HELPER_MISSING_RC=2 loom_exec_script_helper check-points-marker --issue "$ISSUE" --repo "$REPO"
