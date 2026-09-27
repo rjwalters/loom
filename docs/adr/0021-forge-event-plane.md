@@ -58,6 +58,8 @@ operator's per-host cursor feed and turns each non-empty page into one
 in-process `forge.event` bus prompt. The feed is additive prompt pressure over
 an unchanged polling floor. The Worker is operator infrastructure and lives
 outside this repository.**
+_(Amended 2026-09-27: the feed is no longer purely additive. While `healthy`
+it may also gate polls under a bounded staleness cap. See the Amendment.)_
 
 Four invariants bound everything built under this ADR. They are inherited from
 ADR-0014, restated here because they are what make the decision safe:
@@ -118,6 +120,14 @@ It also means a hostile or broken Worker can, at worst, make this daemon
 re-query GitHub more often than necessary — it cannot steer a decision,
 because no decision reads it.
 
+_(Amended 2026-09-27: with opt-in poll gating (`forgeEvents.pollGating`), the
+payload may also carry **invalidation keys**: `repo`, and optionally kind and
+number. They are still never state; they only choose what to re-query. With
+gating on, the worst case also changes. A hostile or broken Worker that
+stays `healthy` while under-reporting can now **delay discovery** by up to
+the hard staleness cap, not only cause extra re-queries. It still cannot
+steer a decision. See the Amendment.)_
+
 ## Consequences
 
 **Good.**
@@ -126,6 +136,8 @@ because no decision reads it.
   the feed cadence, without touching any existing loop.
 - A dead feed is a *latency* regression and nothing else — the property that
   makes this deployable to a fleet incrementally, one host at a time.
+  _(Still true after the 2026-09-27 amendment. A lossy-but-`healthy` feed is
+  now a bounded latency cost as well; see the Amendment.)_
 - Provisioning is a key mint, not a Worker or Loom change: the Worker treats
   every daemon as "a bearer key with a feed".
 - "Why is my cursor not advancing?" has a first-class answer on
@@ -222,9 +234,17 @@ The fleet is exhausting GitHub rate limits. It is not a latency problem
   through REST + ETag (#4428), where an unchanged answer is a free `304`. But
   ~6,990 REST calls/hr against ~232 workspace-polls per tick looks like a
   poor `304` hit rate. Candidate causes:
-  - the in-process ETag map is lost on every daemon restart;
-  - the cache key is `cwd|url`, so worktree paths fragment it;
+  - **the daemon's in-process ETag map is lost on every restart** (the
+    prime suspect, given self-update and supervised restarts across ~58
+    workspaces);
+  - the daemon does not share ETags with `serve`, the CLI tools or agents,
+    although the on-disk store from #5056 / #7275 already keys by resolved
+    `owner/repo` and survives restarts;
   - on active repos the ETag really does change most ticks.
+
+  The in-process key is `cwd|url`, but `cwd` is always the registered
+  workspace root, so it fragments only if one repo is registered twice. That
+  is not a meaningful cause.
 - **Some callers skip the cache entirely.**
   - `pipeline_snapshot::GhPipelineSource::fetch` fires 9 GraphQL
     `issue`/`pr list --limit 500` queries per repo root, fanned out over every
@@ -256,8 +276,15 @@ them for correctness.
 
 1. **Make unchanged answers free, and make the existing cache hit.** This is
    pool-agnostic: a `304` costs nothing in either pool.
-   - Persist ETags across restarts.
-   - Key them by repo + query, not by `cwd`.
+   - Move the daemon's ETag cache onto the existing on-disk store
+     (#5056 / #7275), which already keys by resolved `owner/repo` and
+     survives restarts. Keep the daemon's own entry-point semantics
+     (e.g. the #6171 404 retry).
+   - **Any shared or persisted cache is keyed or partitioned by credential
+     identity**, so one identity's cached answer is never served to
+     another. Since #5401 a daemon may hold several per-owner credentials,
+     and agents on a user `gh` credential share the same on-disk store, so
+     "one gh credential per process" can no longer be assumed.
    - Route `pipeline_snapshot` through the cached listing path and bound its
      fan-out.
    - Extend the #5056 conditional-request path to `issue view N` /
@@ -287,6 +314,13 @@ them for correctness.
    When the feed is in any state other than `healthy`, every workspace
    returns to its base cadence and base TTLs on the next tick, with no grace
    period.
+
+   Short-lived readers such as `gh-cached` in agent processes cannot see the
+   daemon's in-memory feed status. They may hold entries past their base TTL
+   only on a daemon-published, freshness-stamped health signal. If that
+   signal is absent or stale, they behave as though the feed were not
+   `healthy`. How the signal is published is decided in the implementing
+   issue.
 
 3. **Cross-host dedup** (one host polls a repo and publishes the result for
    the others) remains the strongest lever for *active* repos, where step 2
