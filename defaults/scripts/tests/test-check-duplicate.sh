@@ -142,7 +142,9 @@ STUB
 chmod +x "$STUB_DIR/loom-daemon"
 
 # --- Stub git on PATH ---
-#   git remote get-url origin -> "https://github.com/owner/repo.git" (or fail
+#   git remote get-url origin -> "https://github.com/owner/repo.git" (or the
+#                                 contents of $STUB_DIR/git-remote-url if that
+#                                 exists, or fail
 #                                 if $STUB_DIR/git-remote-fail exists). check-
 #                                 duplicate.sh's get_repo_nwo() (#4659) resolves
 #                                 "owner/repo" from this LOCAL read -- no `gh
@@ -160,7 +162,11 @@ if [[ "$1" == "remote" && "$2" == "get-url" && "$3" == "origin" ]]; then
     echo "stub git: No such remote 'origin'" >&2
     exit 1
   fi
-  echo "https://github.com/owner/repo.git"
+  if [[ -f "$STUB_DIR_FROM_ENV/git-remote-url" ]]; then
+    cat "$STUB_DIR_FROM_ENV/git-remote-url"
+  else
+    echo "https://github.com/owner/repo.git"
+  fi
   exit 0
 fi
 exec "$REAL_GIT_BIN" "$@"
@@ -298,7 +304,7 @@ export PATH="$STUB_DIR:$PATH"
 reset_state() {
     rm -f "$STUB_DIR"/issues-*.json "$STUB_DIR"/prs-merged.json "$STUB_DIR"/timeline-*.json
     rm -f "$STUB_DIR"/rest-issues-*.json "$STUB_DIR/rest-prs.json"
-    rm -f "$STUB_DIR/timeline-fail" "$STUB_DIR/git-remote-fail"
+    rm -f "$STUB_DIR/timeline-fail" "$STUB_DIR/git-remote-fail" "$STUB_DIR/git-remote-url"
     rm -f "$STUB_DIR"/issue-list-rate-limit-* "$STUB_DIR/pr-list-rate-limit"
     rm -f "$STUB_DIR/rest-issues-fail" "$STUB_DIR/rest-prs-fail"
     rm -f "$STUB_DIR/rate-limit-message"
@@ -416,6 +422,30 @@ run_cds --issue 80 --title "Some issue title"
 assert_eq "0" "$RC" "(g) git remote resolution failure -> exit code driven by similarity check alone"
 assert_not_contains "$OUT" "RELATED_OPEN_WORK" "(g) git remote resolution failure -> probe result skipped"
 assert_contains "$ERR" "Failed to resolve repository" "(g) git remote resolution failure -> stderr warning emitted"
+
+# (h) Remote URL casing differs from GitHub's canonical casing
+# (2AMLogic/2am#1296): a clone made as "2amlogic/2am" must still match the
+# timeline's canonical "2AMLogic/2am" full_name. Before the fix, the exact
+# `==` comparison silently returned [] for every issue in such a clone.
+reset_state
+echo "git@github.com:2amlogic/2am.git" > "$STUB_DIR/git-remote-url"
+cat > "$STUB_DIR/timeline-294.json" <<'EOF'
+[
+  {"event": "cross-referenced", "source": {"type": "issue", "issue": {
+      "number": 299, "title": "Cap ClickHouse memory", "state": "open",
+      "pull_request": {"url": "https://api.github.com/repos/2AMLogic/2am/pulls/299"},
+      "repository": {"full_name": "2AMLogic/2am"}}}},
+  {"event": "cross-referenced", "source": {"type": "issue", "issue": {
+      "number": 300, "title": "Unrelated work in another repo", "state": "open",
+      "repository": {"full_name": "2AMLogic/other"}}}}
+]
+EOF
+run_cds --issue 294 --title "Some issue title"
+assert_eq "1" "$RC" "(h) Case-mismatched remote -> cross-reference still found, exit 1"
+assert_contains "$OUT" "RELATED_OPEN_WORK" "(h) Case-mismatched remote -> RELATED_OPEN_WORK header present"
+assert_contains "$OUT" "PR #299: Cap ClickHouse memory (open PR, cross-references #294)" \
+  "(h) Mixed-case full_name matched against lowercase remote"
+assert_not_contains "$OUT" "#300" "(h) Case-insensitive match does not widen to other repos"
 
 echo ""
 echo "Testing check-duplicate.sh keyword-similarity scoring (issue #4409)..."
