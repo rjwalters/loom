@@ -59,6 +59,22 @@ pub const DEFAULT_QUARANTINE_TTL_SECS: u64 = 3600;
 /// never counts here.
 pub const DEFAULT_QUARANTINE_INSTA_CRASH_SECS: i64 = 60;
 
+/// Env var overriding the quarantine-*release* retry ceiling (Issue #8953): the
+/// number of consecutive failed `loom:blocked` -> `loom:issue` label-restore
+/// attempts [`SweepRegistry::attempt_quarantine_release`] will make for one
+/// issue before giving up and surfacing a single `error` log line instead of
+/// retrying forever at full reaper-tick cadence. A zero/invalid value falls
+/// through to config/default.
+pub const QUARANTINE_MAX_RELEASE_ATTEMPTS_ENV: &str =
+    "LOOM_WORK_FINDER_QUARANTINE_MAX_RELEASE_ATTEMPTS";
+
+/// Default quarantine-release retry ceiling (Issue #8953). At the default 30s
+/// reaper interval this bounds one permanently-failing label edit to ~10
+/// minutes of retries — well short of the 68-retry/~34-minute `#127` incident
+/// this issue is named for — while still giving an ordinary transient `gh`
+/// hiccup (the common case #4110 exists for) many chances to clear on its own.
+pub const DEFAULT_QUARANTINE_MAX_RELEASE_ATTEMPTS: u32 = 20;
+
 /// Marker substring embedded in every quarantine comment body posted by
 /// [`SweepRegistry::apply_quarantine_label`] (Issue #3939). Used by
 /// [`crate::quarantine_reconciliation`] (Issue #4110) to distinguish a
@@ -82,6 +98,11 @@ pub struct QuarantineConfig {
     /// The insta-crash wall-clock window: a checkpoint-less terminal transition
     /// within this many seconds of dispatch counts as an insta-crash.
     pub insta_crash_secs: i64,
+    /// Consecutive failed `loom:blocked` -> `loom:issue` release attempts
+    /// before [`SweepRegistry::attempt_quarantine_release`] gives up retrying
+    /// one issue (Issue #8953). Distinct from `threshold` (insta-crash
+    /// accrual into quarantine) — this bounds the *release* retry instead.
+    pub max_release_attempts: u32,
 }
 
 impl Default for QuarantineConfig {
@@ -91,6 +112,7 @@ impl Default for QuarantineConfig {
             threshold: DEFAULT_QUARANTINE_THRESHOLD,
             ttl: Duration::from_secs(DEFAULT_QUARANTINE_TTL_SECS),
             insta_crash_secs: DEFAULT_QUARANTINE_INSTA_CRASH_SECS,
+            max_release_attempts: DEFAULT_QUARANTINE_MAX_RELEASE_ATTEMPTS,
         }
     }
 }
@@ -241,6 +263,9 @@ pub struct QuarantineFileConfig {
     /// `autonomous.workFinder.quarantine.instaCrashSecs` — insta-crash window, in
     /// seconds (zero/invalid dropped to `None`).
     pub insta_crash_secs: Option<u64>,
+    /// `autonomous.workFinder.quarantine.maxReleaseAttempts` — the release-retry
+    /// ceiling (Issue #8953; zero/invalid dropped to `None`).
+    pub max_release_attempts: Option<u32>,
 }
 
 /// Read `.loom/config.json → autonomous.workFinder.quarantine` (Issue #3939),
@@ -269,6 +294,11 @@ pub fn read_quarantine_file_config(repo_root: &Path) -> QuarantineFileConfig {
             .get("instaCrashSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
+        max_release_attempts: q
+            .get("maxReleaseAttempts")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&n| n > 0)
+            .and_then(|n| u32::try_from(n).ok()),
     }
 }
 
@@ -308,11 +338,19 @@ pub fn resolve_quarantine_config(repo_root: &Path) -> QuarantineConfig {
         .and_then(|s| i64::try_from(s).ok())
         .unwrap_or(DEFAULT_QUARANTINE_INSTA_CRASH_SECS);
 
+    let max_release_attempts = std::env::var(QUARANTINE_MAX_RELEASE_ATTEMPTS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .or(file.max_release_attempts)
+        .unwrap_or(DEFAULT_QUARANTINE_MAX_RELEASE_ATTEMPTS);
+
     QuarantineConfig {
         enabled,
         threshold,
         ttl: Duration::from_secs(ttl_secs),
         insta_crash_secs,
+        max_release_attempts,
     }
 }
 
@@ -959,6 +997,26 @@ impl SweepRegistry {
         )
     }
 
+    /// Whether the quarantine-release retry path should treat the shared
+    /// GitHub API rate limit as currently exhausted (Issue #8953). Production
+    /// consults the real process-global breaker
+    /// ([`crate::rate_limit_breaker::global_is_suppressed`]); the `#[cfg(test)]`
+    /// build additionally honors `test_force_rate_limited` so tests can
+    /// exercise the suppression path without registering the real breaker's
+    /// `GLOBAL` handle (a `OnceLock` shared by the whole test binary — see
+    /// that field's doc comment for why that would leak into other tests).
+    #[cfg(test)]
+    fn quarantine_release_rate_limited(&self) -> bool {
+        self.test_force_rate_limited || crate::rate_limit_breaker::global_is_suppressed()
+    }
+
+    /// Non-test build of [`Self::quarantine_release_rate_limited`] above —
+    /// same contract, minus the test-only override.
+    #[cfg(not(test))]
+    fn quarantine_release_rate_limited(&self) -> bool {
+        crate::rate_limit_breaker::global_is_suppressed()
+    }
+
     /// Retry every issue in [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
     /// (Issue #4110). Called every [`reap_once`](Self::reap_once) tick, right
     /// after [`expire_quarantine`](Self::expire_quarantine): a previously
@@ -967,8 +1025,27 @@ impl SweepRegistry {
     /// the issue permanently stranded. Cheap early-return when nothing is
     /// pending. Idempotent — re-running the flip on an issue that a human
     /// already restored by hand is a harmless no-op `gh` call.
+    ///
+    /// Consults the shared rate-limit breaker BEFORE looping (Issue #8953):
+    /// while suppressed, every entry here would be a doomed `gh` call against
+    /// an already-exhausted quota — and, worse, this path retrying every 30s
+    /// reaper tick regardless is exactly what let one permanently-failing
+    /// entry (the `#127` case) keep re-burning that same quota tick after
+    /// tick, all the way through what should have been a cooldown window.
+    /// [`Self::attempt_quarantine_release`] carries the identical check as a
+    /// backstop for its other caller ([`Self::clear_quarantine`]'s immediate,
+    /// operator-driven release attempt), so this outer check is purely a
+    /// per-tick fast path, not the only enforcement point.
     pub(crate) fn retry_pending_quarantine_releases(&mut self) {
         if self.pending_quarantine_release.is_empty() {
+            return;
+        }
+        if self.quarantine_release_rate_limited() {
+            log::debug!(
+                "sweep_registry: quarantine-release retry pass skipped — shared GitHub API rate \
+                 limit exhausted (#8953); {} issue(s) remain pending",
+                self.pending_quarantine_release.len()
+            );
             return;
         }
         let pending: Vec<u32> = self.pending_quarantine_release.iter().copied().collect();
@@ -978,25 +1055,65 @@ impl SweepRegistry {
     }
 
     /// Attempt the `loom:blocked` -> `loom:issue` label restore for `issue`
-    /// (Issue #4110). On success, clears any pending-retry record. On
-    /// failure, records `issue` in [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
-    /// (if not already there) and logs at `warn` — a silent strand is the
-    /// defect this exists to prevent, so the failure must be visible above
-    /// the default log level.
+    /// (Issue #4110). On success, clears any pending-retry record and its
+    /// attempt tally. On failure, records `issue` in
+    /// [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
+    /// (if not already there), increments its consecutive-failure tally, and
+    /// logs at `warn` — a silent strand is the defect this exists to prevent,
+    /// so the failure must be visible above the default log level.
+    ///
+    /// Two backstops added by Issue #8953, both ahead of the `gh` call:
+    /// - **Rate-limit awareness**: while
+    ///   [`Self::quarantine_release_rate_limited`] reports suppressed, this
+    ///   skips the attempt entirely — no `gh` call, no tally increment, no
+    ///   ceiling consumed — leaving `issue` pending exactly as it was, for a
+    ///   clean retry once the shared quota's cooldown window clears.
+    /// - **Retry ceiling**: once the tally reaches
+    ///   [`QuarantineConfig::max_release_attempts`], this stops retrying the
+    ///   issue (removed from both the pending set and the tally) and logs a
+    ///   single `error` instead — a permanently-failing label edit (the
+    ///   `#127` case) no longer retries forever at full reaper-tick cadence.
     pub(crate) fn attempt_quarantine_release(&mut self, issue: u32) {
+        if self.quarantine_release_rate_limited() {
+            log::debug!(
+                "sweep_registry: quarantine release for #{issue} skipped — shared GitHub API \
+                 rate limit exhausted (#8953); remains pending"
+            );
+            self.pending_quarantine_release.insert(issue);
+            return;
+        }
         if self.release_quarantine_label(issue) {
             self.pending_quarantine_release.remove(&issue);
+            self.quarantine_release_attempts.remove(&issue);
         } else {
             let first_attempt = self.pending_quarantine_release.insert(issue);
-            log::warn!(
-                "sweep_registry: quarantine release for #{issue} failed — `loom:blocked` may \
-                 remain stranded on the forge; retrying on the next reaper tick (#4110){}",
-                if first_attempt {
-                    ""
-                } else {
-                    " (repeated failure)"
-                }
-            );
+            let attempts = {
+                let counter = self.quarantine_release_attempts.entry(issue).or_insert(0);
+                *counter += 1;
+                *counter
+            };
+            let ceiling = self.quarantine_config.max_release_attempts;
+            if attempts >= ceiling {
+                self.pending_quarantine_release.remove(&issue);
+                self.quarantine_release_attempts.remove(&issue);
+                log::error!(
+                    "sweep_registry: quarantine release for #{issue} failed {attempts} \
+                     consecutive time(s) (ceiling {ceiling}) — giving up automatic retry; \
+                     `loom:blocked` may remain stranded on the forge until a human intervenes \
+                     (#8953)"
+                );
+            } else {
+                log::warn!(
+                    "sweep_registry: quarantine release for #{issue} failed (attempt \
+                     {attempts}/{ceiling}) — `loom:blocked` may remain stranded on the forge; \
+                     retrying on the next reaper tick (#4110){}",
+                    if first_attempt {
+                        ""
+                    } else {
+                        " (repeated failure)"
+                    }
+                );
+            }
         }
     }
 
@@ -2367,6 +2484,130 @@ exit 0
         );
     }
 
+    // ------------------------------------------------------------------------
+    // Quarantine-release retry ceiling + breaker awareness (Issue #8953)
+    // ------------------------------------------------------------------------
+
+    /// AC: `attempt_quarantine_release` stops retrying an issue once its
+    /// consecutive-failure tally reaches `QuarantineConfig::max_release_attempts`
+    /// — the `#127` case this issue is named for (68 retries over ~34 minutes
+    /// with no ceiling at all). Once the ceiling is hit the issue leaves BOTH
+    /// `pending_quarantine_release` and the attempt tally, so no further tick
+    /// makes any further `gh` call for it.
+    #[test]
+    fn attempt_quarantine_release_stops_retrying_after_ceiling() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, "", 1); // always fails
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let mut registry = SweepRegistry::new(config);
+        registry.set_quarantine_config(QuarantineConfig {
+            max_release_attempts: 3,
+            ..QuarantineConfig::default()
+        });
+        registry.pending_quarantine_release.insert(127);
+
+        registry.retry_pending_quarantine_releases();
+        assert!(registry.pending_quarantine_release_issues().contains(&127));
+        assert_eq!(registry.quarantine_release_attempts.get(&127).copied(), Some(1));
+
+        registry.retry_pending_quarantine_releases();
+        assert!(registry.pending_quarantine_release_issues().contains(&127));
+        assert_eq!(registry.quarantine_release_attempts.get(&127).copied(), Some(2));
+
+        // Third failure hits the ceiling (3): give up, clear both records.
+        registry.retry_pending_quarantine_releases();
+        assert!(
+            !registry.pending_quarantine_release_issues().contains(&127),
+            "issue must stop being retried once the ceiling is reached"
+        );
+        assert!(!registry.quarantine_release_attempts.contains_key(&127));
+
+        // A further tick makes no additional gh call at all: nothing pending.
+        let calls_before = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        registry.retry_pending_quarantine_releases();
+        let calls_after = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert_eq!(
+            calls_before, calls_after,
+            "no further gh calls once the ceiling has been hit and the issue dropped"
+        );
+    }
+
+    /// AC: while the (injected, test-only) rate-limit breaker reports
+    /// suppressed, `retry_pending_quarantine_releases`' pass-level check skips
+    /// the ENTIRE pending set with zero `gh` calls and zero attempt-tally
+    /// consumption — a suppressed skip must never count against the ceiling,
+    /// so a genuinely stuck issue gets its full N attempts only against real
+    /// (non-suppressed) tries.
+    #[test]
+    fn retry_pending_quarantine_releases_skips_without_counting_while_rate_limited() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, "", 1); // would fail if ever called
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let mut registry = SweepRegistry::new(config);
+        registry.pending_quarantine_release.insert(999);
+        registry.test_force_rate_limited = true;
+
+        for _ in 0..5 {
+            registry.retry_pending_quarantine_releases();
+        }
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.is_empty(),
+            "no gh call should be made while suppressed; got: {gh_calls:?}"
+        );
+        assert!(registry.pending_quarantine_release_issues().contains(&999));
+        assert!(
+            !registry.quarantine_release_attempts.contains_key(&999),
+            "a suppressed skip must not consume any of the retry ceiling"
+        );
+
+        // Once suppression clears, the retry resumes normally (and DOES count).
+        registry.test_force_rate_limited = false;
+        registry.retry_pending_quarantine_releases();
+        let gh_calls_after = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls_after.is_empty(),
+            "the retry should resume once suppression clears; got: {gh_calls_after:?}"
+        );
+        assert_eq!(registry.quarantine_release_attempts.get(&999).copied(), Some(1));
+    }
+
+    /// Same guarantee as above, but proves the backstop lives INSIDE
+    /// `attempt_quarantine_release` itself, not only in
+    /// `retry_pending_quarantine_releases`'s pass-level check — calls it
+    /// directly, mirroring `clear_quarantine`'s immediate, operator-driven
+    /// release attempt (the other production call site).
+    #[test]
+    fn attempt_quarantine_release_direct_call_skips_while_rate_limited() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, "", 1);
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let mut registry = SweepRegistry::new(config);
+        registry.test_force_rate_limited = true;
+
+        registry.attempt_quarantine_release(555);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.is_empty(),
+            "no gh call should be made while suppressed; got: {gh_calls:?}"
+        );
+        assert!(registry.pending_quarantine_release_issues().contains(&555));
+        assert!(!registry.quarantine_release_attempts.contains_key(&555));
+    }
+
     /// Eviction (Issue #4110): a workspace's live quarantines are released
     /// before the pool drops the registry, instead of silently vanishing with
     /// the reaper that would otherwise have retried them.
@@ -2490,6 +2731,7 @@ exit 0
                 threshold: Some(4),
                 ttl_secs: Some(900),
                 insta_crash_secs: Some(45),
+                max_release_attempts: None,
             }
         );
     }
