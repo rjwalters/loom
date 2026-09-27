@@ -1141,11 +1141,11 @@ There are **three, and only three**, cost-of-being-wrong strata (issue #4238 add
 **Required before applying `loom:curated`**: run the validator below and confirm exit 0. This is not optional — do not apply `loom:curated` if it fails:
 
 ```bash
-./.loom/scripts/require-complexity-marker.sh <issue>   # exit 0 = has a valid tier; exit 1 = missing or out-of-vocabulary
-                                                       # exit 2 = could not fetch (retry/check quota, NOT a curation defect)
+./.loom/scripts/require-complexity-marker.sh <issue>   # 0 = BOTH markers valid; 1 = either missing/invalid
+                                                       # 2 = could not evaluate (NOT a curation defect)
 ```
 
-Exit 2 means the fetch failed (GraphQL+REST, usually quota) — not an absent marker. Retry after quota recovers; don't re-edit the body on an exit-2.
+Exit 2 is not an absent marker: fetch failed (usually quota; retry later) or `loom-daemon` is missing/below its `requires-daemon` floor (`loom update`; waiting won't help). Don't edit the body.
 
 ### Points estimate marker (`<!-- loom:points=<N> -->`, #9056)
 

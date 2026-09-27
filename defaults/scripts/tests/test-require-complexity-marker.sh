@@ -111,7 +111,8 @@ trap cleanup EXIT
 #   9012 = valid complexity + prose mentioning the POINTS marker syntax BEFORE
 #          the real points marker (#9056, mirrors the #4840 fix for points)
 #   9013 = valid complexity + TWO points markers -- the LAST must win (#9056)
-#   9014 = NEITHER marker present -- both BLOCKED messages must appear (#9056)
+#   9014 = NEITHER marker present -- ONLY the complexity BLOCKED message: the
+#          tier check exits 1 first, so the points check never runs (#9056)
 FAKE_BIN="$WORKDIR/bin"
 mkdir -p "$FAKE_BIN"
 cat > "$FAKE_BIN/gh" <<'FAKEGH'

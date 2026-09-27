@@ -63,39 +63,93 @@ fn enable_writeback(ws: &Path) {
 }
 
 /// A fake `gh` covering every call this module makes:
-///   - `gh api repos/.../issues/<n>/comments --paginate --jq ...` (idempotency
-///     check) — non-empty output (`already-existing`) when `POSTED_MARKER`
-///     exists on disk, empty otherwise. Checked FIRST since its argv also
-///     matches the plainer issue-body pattern below.
+///   - `gh api repos/.../issues/<n>/comments --paginate --jq <filter>`
+///     (idempotency check) — prints a comment id for every marker line in
+///     `posted_marker` that appears in `<filter>` (`$5`), so a hit is keyed
+///     on the SWEEP id embedded in the marker, exactly like the real
+///     server-side `startswith` filter; exits `comments_rc` (non-zero models
+///     an unreadable check). Checked FIRST since its argv also matches the
+///     plainer issue-body pattern below.
 ///   - `gh api repos/.../issues/<n> --jq .body` (the complexity AND points
 ///     fetches — same endpoint, same response) — echoes `body`.
-///   - `gh issue comment <n> --body <text>` — appends one line to `gh_log`
-///     and touches `posted_marker`, so a SECOND idempotency check in the same
-///     test run observes a real prior post.
-fn fake_gh_script(body: &str, gh_log: &Path, posted_marker: &Path) -> String {
+///   - `gh issue comment <n> --body <text>` — logs `issue comment <n>` plus
+///     whether the `sweep.outcome` telemetry journal was ALREADY non-empty
+///     at post time to `gh_log`, appends the full body (`$5`) to
+///     `<gh_log>.bodies`, appends its first (marker) line to `posted_marker`
+///     so a SECOND idempotency check observes a real prior post, then exits
+///     `post_rc` (or hangs when `post_rc` is `-1`).
+fn fake_gh_script_with(
+    body: &str,
+    gh_log: &Path,
+    posted_marker: &Path,
+    comments_rc: i32,
+    post_rc: i32,
+) -> String {
+    let telemetry = gh_log
+        .parent()
+        .unwrap()
+        .join("test-sweep-outcome-telemetry.jsonl");
+    let post_exit = if post_rc < 0 {
+        "exec sleep 30".to_string()
+    } else {
+        format!("exit {post_rc}")
+    };
     format!(
         "#!/usr/bin/env bash\n\
          if [[ \"$1\" == \"issue\" && \"$2\" == \"comment\" ]]; then\n\
-         printf 'issue comment %s\\n' \"$3\" >> \"{gh_log}\"\n\
-         touch \"{posted_marker}\"\n\
-         exit 0\n\
+         if [[ -s \"{telemetry}\" ]]; then durable=telemetry-durable-before-post; \
+         else durable=telemetry-missing-at-post; fi\n\
+         printf 'issue comment %s %s\\n' \"$3\" \"$durable\" >> \"{gh_log}\"\n\
+         printf '%s\\n' \"$5\" >> \"{gh_log}.bodies\"\n\
+         printf '%s\\n' \"${{5%%$'\\n'*}}\" >> \"{posted_marker}\"\n\
+         {post_exit}\n\
          fi\n\
          if [[ \"$1\" == \"api\" && \"$2\" == repos/*/issues/*/comments ]]; then\n\
          if [[ -f \"{posted_marker}\" ]]; then\n\
-         printf '111\\n'\n\
+         while IFS= read -r m; do [[ -n \"$m\" && \"$5\" == *\"$m\"* ]] && printf '111\\n'; \
+         done < \"{posted_marker}\"\n\
          fi\n\
-         exit 0\n\
+         exit {comments_rc}\n\
          fi\n\
          if [[ \"$1\" == \"api\" && \"$2\" == repos/*/issues/* ]]; then\n\
          printf '%s' '{body}'\n\
          exit 0\n\
          fi\n\
          exit 0\n",
+        telemetry = telemetry.display(),
         gh_log = gh_log.display(),
         posted_marker = posted_marker.display(),
         body = body.replace('\'', "'\\''"),
     )
 }
+
+/// [`fake_gh_script_with`] with every call succeeding.
+fn fake_gh_script(body: &str, gh_log: &Path, posted_marker: &Path) -> String {
+    fake_gh_script_with(body, gh_log, posted_marker, 0, 0)
+}
+
+fn posted_bodies(gh_log: &Path) -> String {
+    std::fs::read_to_string(format!("{}.bodies", gh_log.display())).unwrap_or_default()
+}
+
+fn telemetry_journal(ws: &Path) -> String {
+    std::fs::read_to_string(ws.join("test-sweep-outcome-telemetry.jsonl")).unwrap_or_default()
+}
+
+fn run_success(registry: &mut SweepRegistry, issue: u32, sweep_id: &str) {
+    registry.append_outcome_telemetry_journal(
+        issue,
+        sweep_id,
+        4000,
+        telemetry::SweepResult::Success,
+        None,
+        None,
+        crate::tap_usage::RegionAccounting::default(),
+    );
+}
+
+const MARKED_BODY: &str =
+    "Some issue.\n\n<!-- loom:complexity=complex -->\n<!-- loom:points=8 -->\n";
 
 fn count_comment_posts(gh_log: &Path) -> usize {
     std::fs::read_to_string(gh_log)
@@ -133,6 +187,16 @@ fn success_with_writeback_enabled_posts_one_marked_comment() {
     assert!(
         log_contents.contains(&issue.to_string()),
         "the comment targets the right issue: {log_contents}"
+    );
+    let bodies = posted_bodies(&gh_log);
+    assert!(
+        bodies.starts_with(&format!("<!-- loom:sweep-outcome-writeback sweep={sweep_id} -->\n")),
+        "the posted body opens with THIS sweep's marker: {bodies}"
+    );
+    assert!(bodies.contains("points `8`"), "the points read reaches the comment: {bodies}");
+    assert!(
+        bodies.contains("complexity `complex`"),
+        "the complexity read reaches the comment: {bodies}"
     );
 }
 
@@ -205,13 +269,17 @@ fn a_prior_comment_prevents_a_duplicate_post() {
     enable_writeback(ws);
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
-    // Pre-seed the marker file, simulating a write-back that already landed
-    // from an earlier terminal observation (or a prior daemon run).
-    std::fs::write(&posted_marker, "already posted").unwrap();
     let body = "Some issue.\n\n<!-- loom:complexity=complex -->\n<!-- loom:points=8 -->\n";
     let mut registry = writeback_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
     let issue = 90564;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-4", "log\n");
+    // Pre-seed THIS sweep's marker, simulating a write-back that already
+    // landed from an earlier terminal observation (or a prior daemon run).
+    std::fs::write(
+        &posted_marker,
+        format!("{}\n", writeback::sweep_outcome_writeback_marker(&sweep_id)),
+    )
+    .unwrap();
 
     registry.append_outcome_telemetry_journal(
         issue,
@@ -275,4 +343,134 @@ fn a_terminal_transition_observed_twice_posts_only_once() {
         1,
         "a repeated terminal observation must not double-post"
     );
+}
+
+/// Judge #9216 item 2: idempotency is per SWEEP. A write-back already left on
+/// the issue by a DIFFERENT sweep (a partial-increment slice reusing the issue
+/// number, a re-opened issue, a re-dispatch) must not suppress this sweep's
+/// own post — it has its own actuals.
+#[test]
+#[serial]
+fn a_different_sweeps_prior_comment_does_not_suppress_this_sweeps_post() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    enable_writeback(ws);
+    let gh_log = ws.join("gh-invocations.log");
+    let posted_marker = ws.join("posted.marker");
+    std::fs::write(
+        &posted_marker,
+        format!(
+            "{}\n",
+            writeback::sweep_outcome_writeback_marker("sweep-issue-90566-earlier-slice")
+        ),
+    )
+    .unwrap();
+    let mut registry =
+        writeback_registry(ws, &fake_gh_script(MARKED_BODY, &gh_log, &posted_marker));
+    let issue = 90566;
+    let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-6", "log\n");
+    assert_ne!(sweep_id, "sweep-issue-90566-earlier-slice");
+
+    run_success(&mut registry, issue, &sweep_id);
+
+    assert_eq!(
+        count_comment_posts(&gh_log),
+        1,
+        "another sweep's write-back on the same issue must not suppress this one"
+    );
+    assert!(
+        posted_bodies(&gh_log).contains(&format!("sweep={sweep_id} -->")),
+        "{}",
+        posted_bodies(&gh_log)
+    );
+}
+
+/// Fail CLOSED: when the idempotency read itself fails (non-zero exit), the
+/// write-back skips this pass rather than risk a duplicate.
+#[test]
+#[serial]
+fn an_unreadable_comments_check_fails_closed_and_never_posts() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    enable_writeback(ws);
+    let gh_log = ws.join("gh-invocations.log");
+    let posted_marker = ws.join("posted.marker");
+    let mut registry =
+        writeback_registry(ws, &fake_gh_script_with(MARKED_BODY, &gh_log, &posted_marker, 1, 0));
+    let issue = 90567;
+    let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-7", "log\n");
+
+    run_success(&mut registry, issue, &sweep_id);
+
+    assert_eq!(
+        count_comment_posts(&gh_log),
+        0,
+        "an unverifiable comments read must fail closed (no post)"
+    );
+    assert!(
+        telemetry_journal(ws).contains(&sweep_id),
+        "the durable sweep.outcome record is written regardless"
+    );
+}
+
+/// Judge #9216 item 1: the forge post runs strictly AFTER the durable
+/// `sweep.outcome` telemetry append, and a failing post never loses it.
+#[test]
+#[serial]
+fn telemetry_is_durable_before_the_post_and_survives_a_failed_post() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    enable_writeback(ws);
+    let gh_log = ws.join("gh-invocations.log");
+    let posted_marker = ws.join("posted.marker");
+    let mut registry =
+        writeback_registry(ws, &fake_gh_script_with(MARKED_BODY, &gh_log, &posted_marker, 0, 1));
+    let issue = 90568;
+    let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-8", "log\n");
+
+    run_success(&mut registry, issue, &sweep_id);
+
+    let log_contents = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        log_contents.contains("telemetry-durable-before-post"),
+        "the telemetry record must already be on disk when gh posts: {log_contents}"
+    );
+    assert!(
+        telemetry_journal(ws).contains(&sweep_id),
+        "a failed post must not lose the durable sweep.outcome record"
+    );
+}
+
+/// A HUNG post is bounded by `reap_gh_timeout()` and — because it runs after
+/// the append — cannot delay or lose the durable record.
+#[test]
+#[serial]
+fn a_hung_post_is_bounded_and_the_record_is_already_durable() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    enable_writeback(ws);
+    let gh_log = ws.join("gh-invocations.log");
+    let posted_marker = ws.join("posted.marker");
+    let mut registry =
+        writeback_registry(ws, &fake_gh_script_with(MARKED_BODY, &gh_log, &posted_marker, 0, -1));
+    let issue = 90569;
+    let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-9", "log\n");
+
+    std::env::set_var(REAP_GH_TIMEOUT_ENV, "1");
+    let started = std::time::Instant::now();
+    run_success(&mut registry, issue, &sweep_id);
+    let elapsed = started.elapsed();
+    std::env::remove_var(REAP_GH_TIMEOUT_ENV);
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the hung post must be killed at the gh timeout, took {elapsed:?}"
+    );
+    assert!(
+        std::fs::read_to_string(&gh_log)
+            .unwrap_or_default()
+            .contains("telemetry-durable-before-post"),
+        "the record was durable before the (hung) post started"
+    );
+    assert!(telemetry_journal(ws).contains(&sweep_id));
 }

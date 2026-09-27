@@ -4,8 +4,8 @@
 //!
 //! At a sweep's terminal `Success` transition — the SAME call site as
 //! [`super::append_outcome_journal`]/[`super::append_outcome_telemetry_journal`],
-//! immediately after the [`telemetry::SweepOutcomeRecord`] is assembled —
-//! post ONE best-effort Markdown comment onto the sweep's originating GitHub
+//! once the [`telemetry::SweepOutcomeRecord`] has been assembled AND durably
+//! appended — post ONE best-effort Markdown comment onto the sweep's originating GitHub
 //! **issue** (not just the PR) summarizing that record: the Curator's
 //! `loom:complexity` / `loom:points` estimate, actual token burn, wall-clock
 //! duration (total and per-phase), Doctor cycle count, and the first-pass
@@ -27,12 +27,18 @@
 //! `.loom/docs/file-size-policy.md`), which every sibling brake's cached-field
 //! approach would otherwise require growing.
 //!
-//! # Idempotency (no double-post)
+//! # Idempotency (no double-post) — keyed per SWEEP, not per issue
 //!
+//! Every comment opens with [`sweep_outcome_writeback_marker`] — the
+//! [`SWEEP_OUTCOME_WRITEBACK_COMMENT_MARKER`] prefix plus `sweep=<sweep_id>`.
 //! Before posting, the issue's existing comments are searched (one paginated
-//! REST read, `--jq`-filtered server-side to bodies starting with
-//! [`SWEEP_OUTCOME_WRITEBACK_COMMENT_MARKER`]) for a prior write-back. A hit
-//! skips the post entirely — the defensive property this journal's normal-path
+//! REST read, `--jq`-filtered server-side to bodies starting with THIS
+//! sweep's full marker) for a prior write-back. A hit skips the post
+//! entirely. Keying on the sweep id rather than the issue matters: a later
+//! sweep on the same issue (a partial-increment slice reusing the issue
+//! number, #3599/#3667; a re-opened issue; a re-dispatch) has its own
+//! actuals and still posts, while the same terminal transition observed
+//! twice (same `sweep_id`) does not — the defensive property this journal's normal-path
 //! callers do not otherwise need, since `append_outcome_journal` itself fires
 //! once per terminal transition by contract, but this is new forge-WRITE
 //! behavior riding alongside a local-journal append, so it earns its own
@@ -47,9 +53,11 @@
 //! [`super::complexity_signal::fetch_complexity_signal`] and
 //! [`super::super::prless_retry`]'s comment helpers: a `gh` failure, timeout,
 //! or missing repo context is logged and swallowed, never propagated. Called
-//! AFTER the durable local-journal appends in
-//! [`super::append_outcome_journal`], so even a hung `gh` process cannot delay
-//! those writes.
+//! AFTER every durable local write in
+//! [`super::append_outcome_telemetry_journal`] (`runtime_usage::finish_sweep`,
+//! `lifecycle::finish_execution`, and the `sweep.outcome` telemetry append),
+//! so even a hung `gh` process cannot delay those writes. Each of the (at
+//! most three) `gh` calls is individually bounded by `reap_gh_timeout()`.
 
 use super::*;
 
@@ -60,11 +68,19 @@ use super::*;
 /// human-facing comment, so it opts IN rather than opting out.
 pub const SWEEP_OUTCOME_WRITEBACK_ENABLE_ENV: &str = "LOOM_SWEEP_OUTCOME_WRITEBACK";
 
-/// Hidden marker prefixing every write-back comment (Issue #9056), mirroring
-/// `prless_retry::PRLESS_RETRY_COMMENT_MARKER`'s convention — machine
-/// identifiable, and what the idempotency check searches for.
-pub(crate) const SWEEP_OUTCOME_WRITEBACK_COMMENT_MARKER: &str =
-    "<!-- loom:sweep-outcome-writeback (#9056) -->";
+/// Hidden-marker PREFIX shared by every write-back comment (Issue #9056),
+/// mirroring `prless_retry::PRLESS_RETRY_COMMENT_MARKER`'s convention. The
+/// full marker is [`sweep_outcome_writeback_marker`], which appends the
+/// sweep id so idempotency is per sweep, not per issue.
+pub(crate) const SWEEP_OUTCOME_WRITEBACK_COMMENT_MARKER: &str = "<!-- loom:sweep-outcome-writeback";
+
+/// The full hidden marker for `sweep_id`'s write-back comment:
+/// `<!-- loom:sweep-outcome-writeback sweep=<sweep_id> -->`. The closing
+/// ` -->` terminates the id, so `sweep=a` never prefix-matches `sweep=ab`.
+#[must_use]
+pub(crate) fn sweep_outcome_writeback_marker(sweep_id: &str) -> String {
+    format!("{SWEEP_OUTCOME_WRITEBACK_COMMENT_MARKER} sweep={sweep_id} -->")
+}
 
 /// Resolved sweep-outcome-writeback parameters (Issue #9056).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -192,7 +208,7 @@ pub(crate) fn format_sweep_outcome_comment(
          _Sweep `{sweep_id}` · best-effort telemetry write-back, opt-in via \
          `autonomous.sweepOutcomeWriteback.enabled` (#9056). CI minutes are not \
          yet joined to sweep outcomes — see `defaults/docs/ci-observability.md`._",
-        marker = SWEEP_OUTCOME_WRITEBACK_COMMENT_MARKER,
+        marker = sweep_outcome_writeback_marker(&record.sweep_id),
         sweep_id = record.sweep_id,
     )
 }
@@ -202,7 +218,7 @@ impl SweepRegistry {
     /// #9056). No-op when: forge writes are disabled (`skip_label_flip`), the
     /// flag resolves off (the default), the fleet rate-limit breaker is
     /// suppressing forge polling, or a prior write-back comment is already
-    /// present (or its presence could not be verified — see the module doc's
+    /// present for THIS sweep (or its presence could not be verified — see the module doc's
     /// "Idempotency" section for why an unreadable check fails closed). Never
     /// blocks or fails the caller's terminal transition.
     pub(crate) fn maybe_post_sweep_outcome_writeback(
@@ -223,11 +239,12 @@ impl SweepRegistry {
             );
             return;
         }
-        match self.sweep_outcome_writeback_comment_exists(issue) {
+        match self.sweep_outcome_writeback_comment_exists(issue, &record.sweep_id) {
             Some(true) => {
                 log::debug!(
-                    "sweep_outcomes: issue #{issue} already carries a sweep-outcome write-back \
-                     comment — not double-posting (#9056)"
+                    "sweep_outcomes: issue #{issue} already carries sweep {}'s outcome \
+                     write-back comment — not double-posting (#9056)",
+                    record.sweep_id
                 );
             }
             None => {
@@ -244,13 +261,13 @@ impl SweepRegistry {
         }
     }
 
-    /// Whether `issue` already carries a
-    /// [`SWEEP_OUTCOME_WRITEBACK_COMMENT_MARKER`] comment (Issue #9056) —
+    /// Whether `issue` already carries `sweep_id`'s
+    /// [`sweep_outcome_writeback_marker`] comment (Issue #9056) —
     /// `Some(true)`/`Some(false)` on a successful read, `None` on any
     /// transport failure (unresolved repo, timeout, non-zero exit), mirroring
     /// `guards::read_lease_comments`'s `--jq`-filtered, `--paginate` REST read
     /// but reporting only presence, never the comment bodies themselves.
-    fn sweep_outcome_writeback_comment_exists(&self, issue: u32) -> Option<bool> {
+    fn sweep_outcome_writeback_comment_exists(&self, issue: u32, sweep_id: &str) -> Option<bool> {
         let gh = self
             .config
             .gh_bin
@@ -262,8 +279,8 @@ impl SweepRegistry {
             .arg("--paginate")
             .arg("--jq")
             .arg(format!(
-                r#".[] | select(.body | startswith("{}")) | .id"#,
-                SWEEP_OUTCOME_WRITEBACK_COMMENT_MARKER
+                r#".[] | select(.body | startswith({})) | .id"#,
+                serde_json::Value::String(sweep_outcome_writeback_marker(sweep_id))
             ));
         cmd.current_dir(&self.config.workspace_root);
         crate::credential_preflight::apply_gh_config_for_root(
@@ -385,7 +402,19 @@ mod tests {
     #[test]
     fn comment_carries_the_hidden_marker_first() {
         let body = format_sweep_outcome_comment(&fixture_record(), Some("8"));
-        assert!(body.starts_with(SWEEP_OUTCOME_WRITEBACK_COMMENT_MARKER));
+        assert!(
+            body.starts_with("<!-- loom:sweep-outcome-writeback sweep=sweep-issue-9056-0 -->\n"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn marker_is_keyed_per_sweep_and_terminated() {
+        let a = sweep_outcome_writeback_marker("sweep-a");
+        let ab = sweep_outcome_writeback_marker("sweep-ab");
+        assert!(a.starts_with(SWEEP_OUTCOME_WRITEBACK_COMMENT_MARKER));
+        assert_ne!(a, ab);
+        assert!(!ab.starts_with(&a), "one sweep id must never prefix-match another");
     }
 
     #[test]

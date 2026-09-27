@@ -4360,10 +4360,12 @@ matching estimate-side marker (`<!-- loom:points=<N> -->`) is documented in
 **Off by default.** Flip `autonomous.sweepOutcomeWriteback.enabled` (or
 `LOOM_SWEEP_OUTCOME_WRITEBACK=1`) to turn it on for a workspace.
 
-**Idempotent by construction.** The comment carries a hidden
-`<!-- loom:sweep-outcome-writeback (#9056) -->` marker, and the daemon searches
-the issue's existing comments for that marker before posting — a hit skips the
-post entirely, so a terminal transition observed more than once (a defensive
+**Idempotent per sweep.** The comment carries a hidden
+`<!-- loom:sweep-outcome-writeback sweep=<sweep_id> -->` marker, and the daemon
+searches the issue's existing comments for THIS sweep's marker before posting —
+a hit skips the post entirely, while a different sweep on the same issue (a
+partial-increment slice, a re-opened issue, a re-dispatch) still posts its own
+actuals. So a terminal transition observed more than once (a defensive
 scenario, not a normal one: `append_outcome_journal` already fires exactly once
 per terminal transition by contract) can never double-post. An unreadable
 existing-comments check fails **closed** (skips posting that pass) rather than
@@ -4372,7 +4374,9 @@ post costs less than a rare duplicate.
 
 **Never blocks or fails the terminal transition.** Every forge call this
 feature makes — the points-marker read, the idempotency check, the comment
-post itself — is best-effort: a `gh` failure, timeout, or missing repo context
+post itself — runs only AFTER the durable `sweep.outcome` telemetry append, is
+bounded by `LOOM_REAP_GH_TIMEOUT_SECS`, and is best-effort: a `gh` failure,
+timeout, or missing repo context
 is logged and swallowed, exactly like the neighboring `complexity` marker read
 this rides alongside (`sweep_registry::outcome_journal::complexity_signal`).
 

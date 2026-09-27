@@ -716,16 +716,15 @@ impl SweepRegistry {
             complexity,
         };
         // Issue #9056: opt-in, post-`Success`-only issue write-back comment.
-        // Deliberately AFTER the record above is fully assembled (so the
-        // formatter has every field to work with) and gated inside
-        // `maybe_post_sweep_outcome_writeback` itself (flag resolution,
-        // breaker, idempotency) rather than with an `if` here, so every other
-        // terminal result short-circuits on the very first check with zero
-        // extra forge cost. Never blocks or fails this journal append: see
-        // `writeback`'s own module doc for the full fail-open contract.
-        if result == telemetry::SweepResult::Success {
-            self.maybe_post_sweep_outcome_writeback(issue, &outcome_record);
-        }
+        // Only a clone of the assembled record is taken HERE (`outcome_record`
+        // itself moves into the telemetry envelope below); every forge call —
+        // the idempotency read, the points read, and the post — runs strictly
+        // AFTER the durable local writes at the end of this function, so a
+        // slow or hung `gh` can never delay (or, via a daemon restart in that
+        // window, lose) the `sweep.outcome` record. See `writeback`'s module
+        // doc for the full fail-open contract.
+        let writeback_record =
+            (result == telemetry::SweepResult::Success).then(|| outcome_record.clone());
         let result_name = serde_json::to_value(result)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -785,6 +784,10 @@ impl SweepRegistry {
                  #{issue} ({sweep_id}) at {}: {e} — best-effort, not blocking reap (#4704)",
                 path.display()
             );
+        }
+        // Issue #9056: forge work only after every durable write above.
+        if let Some(record) = writeback_record {
+            self.maybe_post_sweep_outcome_writeback(issue, &record);
         }
     }
 
