@@ -145,7 +145,7 @@ MODEL="$(./.loom/scripts/resolve-tier-model.sh <issue> <runtime>)"   # e.g. mech
 
 Hard bounds, all enforced here (apply identically to both `sweep.tierModels` and the `sweep.optimization` preset — the profile is just an alternate source for the same tier-2.5 resolution, not a separate mechanism with separate rules):
 
-> **Experiment-mode suppression (issue #3725).** When `sweep.modelExperiment` resolves to `experiment` (see "Model-cost experiment mode" below), the forced arm **overrides and SUPPRESSES this tier-2.5 resolution** for the Builder: the marker is still *read* (same grep) and used **only as the stratification key**, never as a model override (the experiment strata `complex` vs. the rest, so `mechanical` collapses with `routine` there). This is load-bearing — without it, a `complex`-marked issue on Arm B (sonnet-first) would silently jump models and confound the A/B. The tier map (and the `sweep.optimization` preset behind it) applies normally whenever the experiment is `off`/`observe`.
+> **Experiment-mode suppression (issue #3725).** When `sweep.modelExperiment` resolves to `experiment` (see "Model-cost experiment mode" below), the forced arm **overrides and SUPPRESSES this tier-2.5 resolution** for the Builder: the marker is still *read* (same grep) and used **only as the stratification key**, never as a model override (the experiment strata `complex` vs. the rest, so `mechanical` collapses with `routine` there). This is load-bearing — without it, a `complex`-marked issue on Arm B (sonnet-first) would silently jump models and confound the A/B. The tier map (and the `sweep.optimization` preset behind it) applies normally whenever the experiment is `off`/`observe` — and, since #9122, also for any individual issue the `sweep.modelExperimentBudgetFraction` cap samples **out** of the experiment (it carries no arm, so there is nothing to suppress for).
 
 - **Never resolves to `fable`.** `resolve-tier-model.sh` refuses a tier map or optimization preset that names (or resolves to) `fable` and falls through instead. Fable is reached only via the escalation ladder (objective Judge-rejection evidence) or an explicit operator param, never on a Curator's speculation or an operator's cost/speed profile.
 - **It is not a label** and creates no label — it lives only in the issue body.
@@ -369,7 +369,7 @@ The three states:
 |------|----------|
 | `off` | No instrumentation. Zero behavior change. No `.loom/stats/` file is created. |
 | `observe` | Passive measurement. No model forcing, no arm. One JSONL record appended per phase (`arm` null). Safe to run anywhere. |
-| `experiment` | Active A/B. Builder is forced to the assigned arm's model; records are tagged with the `arm`. **Canary-only** (see Guardrails). |
+| `experiment` | Active A/B (or N-arm, #9122). Builder is forced to the assigned arm's model; records are tagged with the `arm`. An issue the budget fraction samples out behaves like `observe` (null arm, no forcing). **Canary-only** (see Guardrails). |
 
 **Two arms map onto #3718's inequality.** `resolve-mode` in `experiment` picks a per-issue arm via `./.loom/scripts/sweep-experiment.sh assign-arm --issue N --complexity <routine|complex>` → prints `<arm> <model>`:
 
@@ -378,13 +378,28 @@ The three states:
 
 **Deterministic, resume-safe, stratified assignment.** The arm is a pure function of the issue number and the #3702 complexity stratum, so a killed-and-resumed sweep re-running the same issue **lands on the same arm**. The complexity marker is read once (the same grep at the tier-2.5 site) and serves two purposes: the **stratification key** (so both arms see a comparable difficulty mix) and — **only when the experiment is off/observe** — the tier-2.5 tier-map resolution. In `experiment` mode that resolution is suppressed (see the "Experiment-mode suppression" note under tier 2.5).
 
+**Two arms is the default, not the limit (`sweep.modelExperimentArms`, #9122).** `.loom/config.json` may declare 2+ named, weighted, **Claude-only** arms, and `assign-arm` then samples from those instead of the built-in A/B pair — nothing else in this section changes (determinism, stratification, forced-arm precedence, records, harvest are all arm-name-agnostic already):
+
+```json
+{"sweep": {"modelExperimentArms": [
+  {"id": "OPUS", "model": "opus", "weight": 1},
+  {"id": "SONNET", "model": "sonnet", "weight": 1},
+  {"id": "HAIKU", "model": "haiku", "weight": 8}]}}
+```
+
+`id` is the reporting identity (upper-cased, matching the stats store), `model` an alias or pinned ID resolved through the same `resolve-model.sh` path, `weight` a relative weight (> 0, default `1`). **Absent or rejected, behavior is byte-for-byte the A/B pair above.** A roster is rejected **whole** — loud stderr warning naming the offending arm, then **fall through** to A/B, never a hard sweep failure (mirroring `resolve-tier-model.sh`'s No-Fable refusal) — when it is not an array, has fewer than 2 arms, repeats an `id`, has a blank `id`/`model`, has a non-positive/non-finite `weight`, names **or resolves to** `fable` (the No-Fable bound, checked on both sides of alias resolution), or names a **non-`claude` `runtime`** (Phase 1 is Claude-only; non-Claude runtime arms are refused rather than silently ignored or dispatched). **You do not implement any of this** — `assign-arm`/`banner` read the config themselves.
+
+**Budget-fraction cap (`sweep.modelExperimentBudgetFraction` / `LOOM_MODEL_EXPERIMENT_BUDGET_FRACTION`, #9122).** By default `experiment` forces an arm on **every** eligible issue. This bounds what fraction do, so a canary can spend only part of its budget on the experiment. Precedence is the usual **env > config > default `1.0`**; a malformed or out-of-`[0.0, 1.0]` value warns and falls back to `1.0`, never aborting the sweep. **`1.0` is byte-for-byte today's always-forced behavior.**
+
+An issue sampled **out** of the experiment is the `observe`-mode null-arm case, not a new state: `assign-arm` prints `none -`, `banner` prints a loud `NOT IN EXPERIMENT` banner naming the fraction, `record --arm ""` writes a null `arm`, and — load-bearing — **normal tier-2.5/tier-3 resolution proceeds for it**, exactly as if the experiment were off for that issue (the "Experiment-mode suppression" note does *not* apply to it). The in/out decision uses a hash **domain-separated from** the arm-selection hash, so widening or narrowing the fraction mid-canary never reshuffles the arm of an issue that is still in the experiment.
+
 **Forced-arm precedence.** The forced arm slots into the Builder model-resolution chain **above tier 2.5 / tier 3** but **below tier 1 / tier 2 operator pins**: an explicit dispatch param (tier 1) or a `roleConfig.model` workspace pin (tier 2) still wins — a pinned canary is intentionally opted out of the experiment. The forced arm only ever replaces what tier 2.5 / tier 3 would have resolved for the Builder.
 
 **Durable stats store.** Instrumentation appends one JSONL record per role phase invocation to `.loom/stats/sweep-model-stats.jsonl` (gitignored; survives the merge that deletes the transient checkpoint). Immediately after each phase's `sweep-checkpoint.sh write`, also run:
 
 ```bash
 ./.loom/scripts/sweep-experiment.sh record --mode <mode> --issue N --phase <curator|builder|judge|doctor|merge> \
-  --role <role> --model <resolved-model> --arm <A|B|"" > --attempt <k> --complexity <routine|complex> \
+  --role <role> --model <resolved-model> --arm <arm-id|"" > --attempt <k> --complexity <routine|complex> \
   --verdict <pass|changes|""> --agent-id <agent-id> --stats-file .loom/stats/sweep-model-stats.jsonl
 ```
 
