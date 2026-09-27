@@ -459,10 +459,16 @@ fn run_locked(
     let mut first_failure = None;
     for owner in &ctx.owners {
         let requests = &mut report.summary.requests;
-        let discovered = resolve_kind(api, owner, &ctx.owner_kinds, requests)
-            .and_then(|kind| Ok((kind, discover(api, &owner.login, kind, dir, requests)?)));
+        // Resolve the kind first so a discovery failure can still report it
+        // (issue #9197 item 3) — only a failed *kind* probe leaves it `None`.
+        let kind_result = resolve_kind(api, owner, &ctx.owner_kinds, requests);
+        let (resolved_kind, discovered) = match kind_result {
+            Ok(kind) => (Some(kind), discover(api, &owner.login, kind, dir, requests)),
+            Err(error) => (None, Err(error)),
+        };
         match discovered {
-            Ok((kind, found)) => {
+            Ok(found) => {
+                let kind = resolved_kind.expect("kind is resolved whenever discovery ran");
                 let eligible: Vec<_> = found
                     .into_iter()
                     .filter(|r| !r.archived && !ctx.is_excluded(r))
@@ -482,6 +488,7 @@ fn run_locked(
                 let reason = format!("discovery-failed: {error}");
                 report.owners.push(OwnerStatus {
                     owner: owner.login.clone(),
+                    kind: resolved_kind,
                     error: Some(reason.clone()),
                     ..OwnerStatus::default()
                 });
