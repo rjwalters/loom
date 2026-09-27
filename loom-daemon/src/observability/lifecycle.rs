@@ -123,8 +123,9 @@ impl Span {
 }
 
 /// A child's deterministic context: derived from its parent span, its name,
-/// its role (so concurrent roles cannot share an instant-keyed ID), and its
-/// start instant — all of which the exported child span itself carries.
+/// its role (so concurrent roles cannot share an instant-keyed ID), its
+/// `loom.tool.name` when present, and its start instant — all of which the
+/// exported child span itself carries.
 fn child_context(
     parent: &TraceContext,
     name: SpanName,
@@ -132,7 +133,16 @@ fn child_context(
     attributes: &TraceAttributes,
 ) -> TraceContext {
     let role = attributes.get("loom.role").map_or("", String::as_str);
-    parent.derived_child(&[name.as_str(), role, &crate::telemetry::trace::instant(at)])
+    let tool = attributes.get("loom.tool.name").map_or("", String::as_str);
+    let instant = crate::telemetry::trace::instant(at);
+    // A tool span (no role) keys on its tool name so two concurrent hook
+    // processes opening the same span name in one clock tick stay distinct.
+    // Spans without a tool name keep their original key.
+    if tool.is_empty() {
+        parent.derived_child(&[name.as_str(), role, &instant])
+    } else {
+        parent.derived_child(&[name.as_str(), role, tool, &instant])
+    }
 }
 
 pub fn attributes(values: &[(&str, &str)]) -> TraceAttributes {
@@ -700,18 +710,30 @@ pub fn role_command(command: &mut Command) {
     });
 }
 
+/// A role tick's execution id: the role plus the tick's start instant. With the
+/// repo key [`TraceStore::root_context`] adds, it is the natural key of one
+/// role-runner invocation — two roles starting in the same instant differ by
+/// role, and the span carries all three inputs (`loom.repo`, `loom.sweep_id`).
+#[must_use]
+pub fn role_execution_id(role: &str, started_at: chrono::DateTime<Utc>) -> String {
+    format!("role-{role}-{}", crate::telemetry::trace::instant(started_at))
+}
+
 pub fn role_invocation(
     root: &Path,
     role: &str,
     invoke: impl FnOnce() -> crate::role_runner::RoleTickOutcome,
 ) -> (crate::role_runner::RoleTickOutcome, Option<TraceContext>) {
-    let execution = format!("role-{}", uuid::Uuid::new_v4());
+    let execution = role_execution_id(role, Utc::now());
+    let repo = TraceStore::fallback_repo(root);
     let span = begin(
         root,
         &execution,
         SpanName::RoleAttempt,
         attributes(&[
             ("loom.role", role),
+            ("loom.repo", &repo),
+            ("loom.sweep_id", &execution),
             ("loom.timing_source", "owned_boundary"),
         ]),
     );

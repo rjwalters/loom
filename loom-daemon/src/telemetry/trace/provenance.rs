@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 pub const DAEMON_VERSION: &str = "loom.daemon.version";
 /// Full git SHA the binary was built from (`unknown` for a tarball build).
 pub const DAEMON_REVISION: &str = "loom.daemon.revision";
+/// Whether the binary's tracked files matched [`DAEMON_REVISION`] at build
+/// time: `clean`, `dirty`, or `unknown` — a dirty build is not pinned by its SHA.
+pub const DAEMON_TREE_STATE: &str = "loom.daemon.tree_state";
 /// `loom_version` from the workspace's `.loom/install-metadata.json`.
 pub const INSTALL_VERSION: &str = "loom.install.version";
 /// `loom_commit` from the workspace's `.loom/install-metadata.json`.
@@ -27,6 +30,7 @@ pub const PROMPTS_DIGEST: &str = "loom.prompts.digest";
 pub const KEYS: &[&str] = &[
     DAEMON_VERSION,
     DAEMON_REVISION,
+    DAEMON_TREE_STATE,
     INSTALL_VERSION,
     INSTALL_REVISION,
     PROMPTS_DIGEST,
@@ -44,7 +48,10 @@ pub fn stamp(attributes: &mut TraceAttributes) {
         .or_insert_with(|| env!("CARGO_PKG_VERSION").into());
     attributes
         .entry(DAEMON_REVISION.into())
-        .or_insert_with(|| env!("LOOM_DAEMON_GIT_SHA").into());
+        .or_insert_with(|| crate::self_update::BUILT_COMMIT_FULL.into());
+    attributes
+        .entry(DAEMON_TREE_STATE.into())
+        .or_insert_with(|| crate::self_update::BUILT_TREE_STATE.into());
 }
 
 /// The installed Loom surface and prompt digest for `root`. Best-effort: an
@@ -117,6 +124,14 @@ fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) {
         match entry.file_type() {
             Ok(kind) if kind.is_dir() => collect_files(&path, files),
             Ok(kind) if kind.is_file() => files.push(path),
+            // A symlinked prompt FILE counts (its target's bytes are what
+            // runs); a symlinked directory is not descended, so a link cycle
+            // cannot recurse.
+            Ok(kind)
+                if kind.is_symlink() && std::fs::metadata(&path).is_ok_and(|m| m.is_file()) =>
+            {
+                files.push(path);
+            }
             _ => {}
         }
     }
@@ -131,7 +146,8 @@ mod tests {
         let mut attributes = TraceAttributes::new();
         stamp(&mut attributes);
         assert_eq!(attributes[DAEMON_VERSION], env!("CARGO_PKG_VERSION"));
-        assert_eq!(attributes[DAEMON_REVISION], env!("LOOM_DAEMON_GIT_SHA"));
+        assert_eq!(attributes[DAEMON_REVISION], crate::self_update::BUILT_COMMIT_FULL);
+        assert_eq!(attributes[DAEMON_TREE_STATE], crate::self_update::BUILT_TREE_STATE);
 
         let mut restored = TraceAttributes::new();
         restored.insert(DAEMON_REVISION.into(), "older".into());

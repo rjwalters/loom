@@ -20,10 +20,11 @@ inside a key use RFC 3339 UTC with nanosecond precision.
 
 | Trace | Trace ID is derived from |
 |-------|--------------------------|
-| Issue story (`loom.story.trace`) | lowercased `owner/repo` (from the checkout's GitHub `origin`), issue number — see [`tracing.md`](tracing.md) (#9037) |
-| Sweep outside a story (`loom.execution.trace`) | lowercased repo key (`$LOOM_REPO`, else the workspace basename), sweep id — used for PR-set sweeps and checkouts with no GitHub origin |
+| Issue story (`loom.story.trace`) | the repo's GitHub numeric `repo_id` and the issue number: `loom-story/v1:github:<repo_id>:<issue>` (key version D32 v1, #9068) — stable across repo renames and transfers; see [`tracing.md`](tracing.md) |
+| Sweep outside a story (`loom.execution.trace`) | lowercased repo key (`$LOOM_REPO`, else the checkout's GitHub `owner/repo`, else the workspace basename), sweep id — used for PR-set sweeps and checkouts with no GitHub origin |
+| Role-runner invocation (`loom.execution.trace`) | the same repo key, and the execution id `role-<role>-<start instant>` — carried as `loom.repo` and `loom.sweep_id` on the `loom.role_attempt` root. The role is in the key so two roles starting in the same instant differ; the repo key (not a host id) scopes it, because the span carries the repo but no host attribute, and one repo's role runner ticks each role serially |
 | Dispatch tick (`loom.dispatch.tick`) | tick start instant |
-| Pool hold (`loom.pool.hold`) | hold start instant (`since`) |
+| Pool hold (`loom.pool.hold`) | pool identity (`loom.pool.hold.pool`, a hash of the pool directory) and hold start instant (`since`) — every hold armed in one work-finder tick shares `since`, so the pool is what tells them apart |
 | CI run/job (`loom.ci.*`) | repo, run id, attempt (job: job id) — [`ci-observability.md`](ci-observability.md) |
 
 Every sweep of an issue is a `loom.sweep` span in that issue's story trace.
@@ -31,7 +32,8 @@ Its span ID is derived from the story root and the sweep id
 (`sweep-issue-42-1790000000`).
 
 A child span's ID is derived from its trace ID, its parent span ID, its span
-name, its `loom.role` (if any), and its start instant. Every one of those inputs
+name, its `loom.role` (if any), its `loom.tool.name` (if any), and its start
+instant. Every one of those inputs
 is carried on the exported span, so each ID can be checked against its own data.
 Dispatch admissions also key on `loom.issue`.
 
@@ -59,6 +61,7 @@ new IDs cannot collide.
 |-----------|----|-------|
 | `loom.daemon.version` | every span | `CARGO_PKG_VERSION` of the binary that created the span |
 | `loom.daemon.revision` | every span | full git SHA that binary was built from (`build.rs`), `unknown` for a tarball build |
+| `loom.daemon.tree_state` | every span | `clean`, `dirty` or `unknown`: whether tracked files matched that SHA at build time — the SHA pins the code only for a `clean` build |
 | `loom.install.version` | sweep span | `loom_version` from the workspace's `.loom/install-metadata.json` |
 | `loom.install.revision` | sweep span | `loom_commit` from the same file |
 | `loom.prompts.digest` | sweep span | `sha256:` over every file under `.claude/commands/loom/` and `.loom/roles/` (sorted path, length, bytes), taken at dispatch |

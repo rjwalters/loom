@@ -53,6 +53,7 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.tokens.cache_write",
     "loom.tokens.total",
     // `loom.pool.hold` (#8931): one pool dispatch hold, armed to cleared.
+    "loom.pool.hold.pool",
     "loom.pool.hold.post_mortem",
     "loom.pool.hold.accounts",
     // `loom.dispatch.admission` spans (Issue #8907).

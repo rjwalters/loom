@@ -67,11 +67,18 @@ impl TraceStore {
         }
     }
 
-    /// The repo key for an execution outside a story: `$LOOM_REPO`, else the
-    /// workspace basename ([`crate::peer_claims::repo_slug`]), lowercased.
+    /// The repo key for an execution outside a story, lowercased:
+    /// `$LOOM_REPO`, else the checkout's GitHub `owner/repo` (so a PR-set
+    /// sweep groups with the same repo's issue sweeps), else the workspace
+    /// basename ([`crate::peer_claims::repo_slug`]).
     #[must_use]
     pub fn fallback_repo(workspace: &Path) -> String {
-        crate::peer_claims::repo_slug(workspace).to_ascii_lowercase()
+        let explicit = std::env::var("LOOM_REPO").is_ok_and(|v| !v.trim().is_empty());
+        (!explicit)
+            .then(|| crate::release_resolve::host::repo_slug(workspace))
+            .flatten()
+            .unwrap_or_else(|| crate::peer_claims::repo_slug(workspace))
+            .to_ascii_lowercase()
     }
 
     #[must_use]

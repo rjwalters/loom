@@ -27,7 +27,10 @@ fn context_roundtrip_rejects_zero_uppercase_and_future_versions() {
     assert!(!TraceContext::root(false).child().sampled());
 }
 
+// `#[serial]`: the repo key reads the process-global `LOOM_REPO`, which
+// other `#[serial]` tests set.
 #[test]
+#[serial_test::serial]
 fn persistent_context_is_stable_across_reopen_and_distinct_per_execution_repo() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();

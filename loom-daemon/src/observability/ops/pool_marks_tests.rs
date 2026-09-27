@@ -142,17 +142,37 @@ fn a_codex_outcome_with_no_hold_emits_nothing() {
 fn a_hold_span_covers_arm_to_clear_with_allowlisted_attributes() {
     let since = Utc::now() - Duration::seconds(600);
     let cleared = since + Duration::seconds(540);
-    let span = hold_span(since, cleared, true, 4);
+    let span = hold_span("0123456789abcdef", since, cleared, true, 4);
     assert_eq!(span.name.as_str(), "loom.pool.hold");
     assert_eq!((span.started_at, span.ended_at), (since, cleared));
     assert!(span.parent_span_id.is_none() && span.context.sampled());
     assert!(span.validate().is_ok());
     assert_eq!(span.attributes["loom.pool.hold.post_mortem"], "true");
     assert_eq!(span.attributes["loom.pool.hold.accounts"], "4");
+    assert_eq!(span.attributes["loom.pool.hold.pool"], "0123456789abcdef");
     assert!(span.attributes.keys().all(|k| {
         OPS_SPAN_ATTRIBUTE_KEYS.contains(&k.as_str())
             || crate::telemetry::trace::provenance::KEYS.contains(&k.as_str())
     }));
     assert_eq!(span.attributes["loom.daemon.version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(span.clone().bounded().attributes, span.attributes, "survives export policy");
+}
+
+/// Holds are per pool directory but share the work-finder tick's `since`:
+/// two pools exhausted in one tick must still get distinct trace and span
+/// IDs, while re-reporting one hold reproduces its IDs.
+#[test]
+fn two_pools_holding_from_the_same_instant_get_distinct_ids() {
+    let since = Utc::now() - Duration::seconds(600);
+    let cleared = since + Duration::seconds(60);
+    let a = pool_id(Path::new("/home/a/.loom/tokens"));
+    let b = pool_id(Path::new("/home/b/.loom/tokens"));
+    assert_ne!(a, b);
+    assert_eq!(a.len(), 16);
+    assert_eq!(a, pool_id(Path::new("/home/a/.loom/tokens")), "stable per pool");
+    let (x, y) = (hold_span(&a, since, cleared, false, 2), hold_span(&b, since, cleared, false, 2));
+    assert_ne!(x.context.trace_id, y.context.trace_id);
+    assert_ne!(x.context.span_id, y.context.span_id);
+    let again = hold_span(&a, since, cleared + Duration::seconds(5), true, 3);
+    assert_eq!(again.context, x.context, "a re-reported hold keeps its IDs");
 }
