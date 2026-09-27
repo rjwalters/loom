@@ -14,8 +14,8 @@
 //! inside it, is unchanged.
 
 use super::{
-    read_work_finder_config, resolve_extra_skip_labels_with_config, WorkDispatcher, WorkItem,
-    WorkSource,
+    host_class, read_work_finder_config, resolve_extra_skip_labels_with_config, WorkDispatcher,
+    WorkItem, WorkSource,
 };
 use crate::sweep_registry::SweepRegistry;
 use crate::types::{SweepKind, SweepState};
@@ -115,13 +115,28 @@ impl WorkSource for GhWorkSource {
 /// guard. `in_flight()` reads the registry's `Running` / `Pending` entries.
 pub struct RegistryDispatcher {
     registry: Arc<Mutex<SweepRegistry>>,
+    /// This host's `host_class` (#9034), resolved ONCE here at construction —
+    /// a startup-capture, deliberately never re-read per tick. See
+    /// `host_class`'s module doc for why (reclassifying a machine is a rare,
+    /// deliberate operator action; a restart to pick up a change is fine).
+    host_class: host_class::HostClass,
 }
 
 impl RegistryDispatcher {
     /// Construct a dispatcher over the shared registry.
     #[must_use]
     pub fn new(registry: Arc<Mutex<SweepRegistry>>) -> Self {
-        Self { registry }
+        let host_class = match registry.lock() {
+            Ok(reg) => host_class::resolve(&read_work_finder_config(&reg.config().workspace_root)),
+            Err(poisoned) => {
+                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                host_class::HostClass::Unclassified
+            }
+        };
+        Self {
+            registry,
+            host_class,
+        }
     }
 
     /// The shared registry behind this dispatcher. Test-only seam so a
@@ -331,6 +346,29 @@ impl WorkDispatcher for RegistryDispatcher {
     /// it. See [`crate::capability`].
     fn declared_capabilities(&self) -> std::collections::BTreeSet<String> {
         crate::capability::held_capabilities()
+    }
+
+    /// This host's cached `host_class` plus a fresh-each-call read of
+    /// `allowHeavyLocal` (#9034). The class is captured once in [`Self::new`]
+    /// (never hot-reloaded); the override is re-read from
+    /// `<workspace_root>/.loom/config.json` every call, mirroring
+    /// [`extra_skip_labels`](Self::extra_skip_labels) — a cheap JSON read, so
+    /// an operator's `autonomous.workFinder.allowHeavyLocal` edit takes
+    /// effect on the very next tick with no daemon restart required.
+    fn heavy_local_policy(&self) -> host_class::HeavyLocalPolicy {
+        let allow_heavy_local = match self.registry.lock() {
+            Ok(reg) => host_class::resolve_allow_heavy_local(&read_work_finder_config(
+                &reg.config().workspace_root,
+            )),
+            Err(poisoned) => {
+                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                false
+            }
+        };
+        host_class::HeavyLocalPolicy {
+            class: self.host_class,
+            allow_heavy_local,
+        }
     }
 
     fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {

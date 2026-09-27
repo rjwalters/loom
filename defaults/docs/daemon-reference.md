@@ -4239,6 +4239,8 @@ knobs not yet audited here.
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
 | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the dynamic cap. Zero/invalid → default; resolved once at startup — a startup-capture pattern `maxConcurrent` no longer shares (it hot-applies since #9060). **Restart required** to pick up a change (#5963) |
 | `autonomous.workFinder.maxConcurrentPerRepo` | `LOOM_WORK_FINDER_MAX_CONCURRENT_PER_REPO` | *(absent = uncapped)* | How many of the shared `maxConcurrent` budget's slots ONE repo may hold (#9090). **Absent is uncapped, not a number**: this is opt-in, so an upgrade throttles nothing. Setting it also turns on **track affinity** (a repo with a live sweep sorts ahead of a cold repo — ordering only, always subordinate to the cap). A candidate whose repo is at the cap is *deferred*, never dropped (`deferred_repo_cap` / the `repo_cap` decision reason), and the slot goes to another repo's candidate in the same tick. Zero/invalid → absent (a literal cap of `0` would deadlock every repo). A value above `maxConcurrent` is harmless. **Hot-applies (#9090)** — re-read every multi-workspace tick on the same path as `maxConcurrent`, transition logged once. See [Per-repo dispatch cap + track affinity](#per-repo-dispatch-cap--track-affinity-9090) |
+| `autonomous.workFinder.hostClass` | `LOOM_HOST_CLASS` | *(absent = unclassified)* | This host's operator-declared class (#9034): `"local-dev"` \| `"remote-worker"`. Any other value, or the key absent, is **unclassified** — for which the `loom:heavy` gate below never fires. **Do not** default an unset host to `local-dev`: that would silently start refusing heavy sweeps fleet-wide the moment this ships. **Restart required** — a startup-capture, resolved once at daemon bring-up (or `RegistryDispatcher` construction) and never hot-reloaded per tick, unlike `maxConcurrent`/`maxConcurrentPerRepo` above; reclassifying a machine is a rare, deliberate operator action. See [Host-class gate](#host-class-gate-9034) below |
+| `autonomous.workFinder.allowHeavyLocal` | `LOOM_ALLOW_HEAVY_LOCAL` | `false` | Suppresses the `loom:heavy`/`host_class` gate for this workspace's **autonomous** loop entirely (#9034) — the explicit opt-in override. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Hot-applies** — re-read fresh every tick (like `extraSkipLabels`), so no daemon restart is needed. The other, independent override path is `loom-daemon dispatch <issue> --allow-local` for a one-off explicit dispatch. See [Host-class gate](#host-class-gate-9034) below |
 | `autonomous.workFinder.saturationBrake.enabled` | `LOOM_ADMISSION_BRAKE` | `true` | Saturation admission brake on/off (#4903). A safety backstop — **defaults on**. Holds *new* admissions while the host is already saturated; never preempts a running sweep. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Restart required** — resolved once at startup and registered as a process-global handle alongside the host breaker (#5963). See [Saturation admission brake](#saturation-admission-brake-4903) below |
 | `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip. **Restart required** — same startup-resolved global as `enabled` above (#5963) |
 | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` | Seconds of continuous held+0-in-flight before the `WARN`-level `STARVING` log fires once per streak (#5715). `<= 0`/invalid → default. See [Starvation escape hatch](#starvation-escape-hatch-5715) |
@@ -5031,6 +5033,68 @@ The Builder-side "landed on the wrong host, no changes made" bail-out this
 feature exists to make rare is unchanged and stays the backstop for a
 mislabelled issue — this is a `work_finder`/`dispatch`-level *filter*, not a
 replacement for the sweep's own toolchain check.
+
+### Host-class gate (#9034)
+
+The admission brake and host breaker above are **reactive**: they hold new
+admissions once a host is *already* saturated, measured by load-per-core. They
+cannot refuse a *known-heavy* sweep *before* it starts on a machine that was
+never meant to run it — the gap behind a real incident: an 8-vCPU developer
+laptop observed at load-average 95 (12x overcommit) from three in-flight
+heavy simulation sweeps a work-finder loop dispatched to it directly. This gate
+is the missing preventive half.
+
+A daemon instance declares what kind of machine it is via
+`autonomous.workFinder.hostClass` / `LOOM_HOST_CLASS`: `"local-dev"` or
+`"remote-worker"`. Any other value, or the key absent, is **unclassified** —
+the default for every existing install, for which this gate never fires (zero
+behavior change until an operator opts a specific machine in). Unlike
+`maxConcurrent`/`maxConcurrentPerRepo`, `hostClass` is a startup-capture,
+resolved once at daemon bring-up (or `RegistryDispatcher` construction) and
+never hot-reloaded per tick — reclassifying a machine is a rare, deliberate
+operator action, so a restart to pick it up is fine.
+
+The mechanical "heavy" signal is a new label, `loom:heavy` — a
+human/Architect/Curator-applied marker for a CPU/RAM-intensive build (e.g. a
+sustained simulation/EDA sweep). Deliberately **not** `tier:goal-advancing` /
+`tier:goal-supporting` / `tier:maintenance`: those are a *priority* axis, and
+reusing one as the "heavy" signal would refuse ordinary prioritized work (a
+one-line config fix) on every `local-dev` laptop the instant it is
+prioritized.
+
+The gate itself sits at the same checkpoint as the host-affinity constraint
+above — checked immediately after it, in both `work_finder`'s autonomous tick
+(single- and multi-workspace) and `loom-daemon dispatch` — and refuses with the
+same **zero-side-effect** contract: no claim flip, no comment, no
+cooldown/backoff record, since a `local-dev` host will never build a refused
+candidate without an operator action. It fires exactly when **all** of: this
+host's `hostClass` resolves to `local-dev`, the candidate carries
+`loom:heavy`, and neither override below is set.
+
+Two independent override paths (either is sufficient):
+
+- **Autonomous work-finder loop**: `autonomous.workFinder.allowHeavyLocal` /
+  `LOOM_ALLOW_HEAVY_LOCAL` (env > config > default `false`) — un-gates one
+  `local-dev` box's autonomous loop entirely. Unlike `hostClass`, this is
+  read fresh every tick (like `extraSkipLabels`), so it hot-applies without a
+  daemon restart.
+- **Explicit CLI dispatch**: `loom-daemon dispatch <issue> --allow-local`,
+  mirroring `--ignore-host-constraint` above exactly (same best-effort
+  `gh issue view` label fetch, same fail-open contract on a fetch failure). An
+  operator hand-dispatching a known-heavy issue on their own laptop on purpose
+  is not the case this gate exists to stop.
+
+A refused candidate shows up as `host_class_refused` (`QueueDisposition`) in
+`loom-daemon queue` / the ready-queue rows, with reason "blocked: heavy sweep
+refused on local-dev host_class" — never tracked for starvation, the same
+treatment `host_constraint` gets, since this refusal never self-resolves by
+waiting.
+
+**Out of scope (deliberately, see #9034's curation):** a `/dashboard/hosts`
+panel showing live sweep distribution by `host_class`, and restricting
+`local-dev` hosts to lightweight *roles* (Curator, triage, lint) — the latter
+is a `autonomous.roleRunner` concern, a different subsystem from the
+work-finder sweep-dispatch path this gate lives in.
 
 ### Host-distress circuit breaker (#4235)
 

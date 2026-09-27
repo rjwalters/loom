@@ -47,6 +47,9 @@ pub enum QueueDisposition {
     WorkspaceCommandsMissing,
     /// Not for this host: a host-affinity constraint names another host.
     HostConstraint,
+    /// Not for this host: it carries `loom:heavy` and this host is
+    /// classified `local-dev`, with no override set (Issue #9034).
+    HostClassRefused,
     /// Blocked: it carries a skip/park label (or lacks a required capability).
     Parked,
     /// Blocked: a hard-exclusion rule applies (e.g. the `external` label).
@@ -86,7 +89,7 @@ impl QueueDisposition {
     /// ([`Self::LabelledBlocked`] and [`Self::Unknown`] excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
     /// point per entry every tick, zeros included, so an empty queue reads as
     /// `0` rather than as a missing series.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Dispatched,
         Self::InFlight,
         Self::DeferredCapacity,
@@ -97,6 +100,7 @@ impl QueueDisposition {
         Self::WorkspaceHalted,
         Self::WorkspaceCommandsMissing,
         Self::HostConstraint,
+        Self::HostClassRefused,
         Self::Parked,
         Self::HardExclusion,
         Self::RecheckInterval,
@@ -126,6 +130,7 @@ impl QueueDisposition {
             Self::WorkspaceHalted => "workspace_halted",
             Self::WorkspaceCommandsMissing => "workspace_commands_missing",
             Self::HostConstraint => "host_constraint",
+            Self::HostClassRefused => "host_class_refused",
             Self::Parked => "parked",
             Self::HardExclusion => "hard_exclusion",
             Self::RecheckInterval => "recheck_interval",
@@ -175,6 +180,7 @@ impl QueueDisposition {
             }
             Self::WorkspaceCommandsMissing => "blocked: workspace missing sweep command",
             Self::HostConstraint => "not for this host (host affinity)",
+            Self::HostClassRefused => "blocked: heavy sweep refused on local-dev host_class",
             Self::Parked => "blocked: skip/park label",
             Self::HardExclusion => "blocked: hard-exclusion rule",
             Self::RecheckInterval => "waiting: issue's recheck interval",
@@ -254,6 +260,11 @@ mod tests {
         assert_eq!(QueueDisposition::Dispatched.state(), "running");
         assert_eq!(QueueDisposition::DeferredCapacity.state(), "ready");
         assert_eq!(QueueDisposition::OpenPr.state(), "blocked");
+        // #9034: a host-class refusal is `blocked`, not `ready` — it never
+        // self-resolves by waiting, the way a capacity/ramp/saturation defer
+        // does.
+        assert_eq!(QueueDisposition::HostClassRefused.state(), "blocked");
+        assert_eq!(QueueDisposition::HostClassRefused.as_str(), "host_class_refused");
     }
 
     #[test]

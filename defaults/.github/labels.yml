@@ -256,6 +256,14 @@
   description: Cleanup, refactoring, or improvements not tied to current goals
   color: "D4C5F9"  # purple - lower priority
 
+# loom:heavy (#9034): the mechanical "heavy" signal the host-class gate refuses
+# on a host_class: local-dev machine (autonomous.workFinder.hostClass) unless
+# explicitly overridden (--allow-local / allowHeavyLocal). A resource-weight
+# axis, deliberately NOT the same thing as the tier:* priority axis above.
+- name: loom:heavy
+  description: "CPU/RAM-intensive sweep; refused on local-dev host_class. Applied by: humans/Curator/Architect."
+  color: "B60205"  # red - resource-intensive caution signal
+
 # External Contribution Gate
 # Not part of the loom: workflow. A non-collaborator submission needs maintainer
 # approval before Curator/Builder process it.
