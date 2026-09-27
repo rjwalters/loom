@@ -36,25 +36,34 @@
 //! every fresh drain — and once `threshold` deadlines have expired without the
 //! in-flight count ever improving, declares the wait condition **unsatisfiable**.
 //!
-//! The declaration is sticky: it clears only on an observation of `in_flight ==
-//! 0`, i.e. on proof that the condition the roll waits for is reachable after
-//! all. Anything weaker (a decrease from 7 to 2 while a 9-hour sweep keeps
-//! running) would re-arm the roll for another budget with the same outcome,
-//! which is the cycling being stopped.
+//! The declaration is sticky, and it clears on exactly two things.
 //!
-//! **That clearing condition is harder to meet than "self-clearing" suggests**,
-//! and the honest framing matters: it is an auto-update tick *sampling*
-//! `in_flight == 0` on the `intervalSecs` cadence
+//! **The fast path is an observation of `in_flight == 0`** — proof that the
+//! condition the roll waits for is reachable after all. Anything weaker (a
+//! decrease from 7 to 2 while a 9-hour sweep keeps running) does not clear it,
+//! because re-arming there buys another budget with the same outcome, which is
+//! the cycling being stopped.
+//!
+//! **That fast path is harder to hit than "self-clearing" suggests**, which is
+//! why it is not the only one. It is an auto-update tick *sampling* `in_flight
+//! == 0` on the `intervalSecs` cadence
 //! ([`super::DEFAULT_AUTO_UPDATE_INTERVAL_SECS`], 900s) **with dispatch
 //! running** — strictly harder than the drain's own quiescence watch, which is
 //! continuous *and* observes a paused dispatcher where in-flight can only fall.
 //! Once dispatch resumes, a cap-12 dispatcher refills the in-flight set as soon
-//! as the long sweep ends, so a 900s sample can miss every lull and the host can
-//! stay un-updated indefinitely. There is no time-based retry here: this module
-//! trades *unbounded paused dispatch* for *unbounded staleness on a
-//! permanently-busy host*, which is the better of the two (dispatch and role
-//! spawns come back, and the reason is named) but is not a state that fixes
-//! itself promptly. A bounded cooldown retry is tracked as #9010.
+//! as the long sweep ends, so a 900s sample can miss every lull.
+//!
+//! **So the declaration also expires on time (#9010).** Once it has stood for
+//! [`resolve_roll_stall_cooldown`] seconds ([`DEFAULT_ROLL_STALL_COOLDOWN_SECS`],
+//! 6h) the whole episode is dropped and the next tick arms a roll normally. If
+//! the host still cannot drain, the detector re-declares after `threshold` more
+//! deadlines — so the cost is **one** bounded paused-dispatch budget per cooldown
+//! period, not a continuous one, and staleness is bounded rather than indefinite.
+//! That is the property worth having: #8998 was *unbounded*; a retry every N
+//! hours is not. The cooldown alone is deliberately the whole mechanism — no
+//! "was in-flight ever seen at zero between ticks" bookkeeping — because a period
+//! is the simpler thing to reason about and to state in a WARN line an operator
+//! has to act on.
 //!
 //! # What it deliberately does not change
 //!
@@ -80,9 +89,14 @@
 use super::supersede::ArmedRoll;
 use super::AutoUpdateConfig;
 use chrono::{DateTime, Utc};
+use std::time::Duration;
 
 /// Env override for the unsatisfiability threshold (Issue #8998).
 pub const AUTO_UPDATE_ROLL_STALL_DEADLINES_ENV: &str = "LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES";
+
+/// Env override for the suppression cooldown (Issue #9010).
+pub const AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS_ENV: &str =
+    "LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS";
 
 /// Default threshold: how many drain deadlines may expire — across roll
 /// lifetimes — with the in-flight count never improving before the roll's wait
@@ -129,6 +143,44 @@ pub fn resolve_roll_stall_deadlines(config: &AutoUpdateConfig) -> u32 {
         .unwrap_or(DEFAULT_ROLL_STALL_DEADLINES)
 }
 
+/// Default cooldown: how long a standing unsatisfiability declaration may stand
+/// before it expires and one more bounded roll attempt is released (Issue #9010).
+///
+/// `21600` (6h) is chosen against the incident's own geometry rather than picked
+/// round. Two numbers bracket it:
+///
+/// - **The paused-dispatch cost of one retry.** A released retry re-arms a roll
+///   that this host still cannot satisfy, so it spends one #6007 paused-dispatch
+///   budget — 2h at the default 1800s drain timeout — plus the further deadlines
+///   it takes the detector to re-declare from a clean slate, about 3h in total.
+///   A 6h cooldown therefore leaves dispatch paused for roughly 3h of every ~9h
+///   cycle: about a third of this host's ticks, against the ~100% the #8998
+///   livelock paused. Raise the knob to trade staleness for dispatch throughput;
+///   a 1h cooldown would be barely distinguishable from the livelock it replaces.
+/// - **The length of the sweep that caused it.** The blocker on 2026-09-25 was a
+///   genuinely-working 9h32m analog-simulation sweep. At 6h such a sweep costs
+///   *one* retry, which is the worst case worth paying for the chance that the
+///   host has gone quiet since.
+///
+/// There is deliberately no "never retry" value — that is #8998's bug. Set it very
+/// large to make the retry effectively unreachable.
+pub const DEFAULT_ROLL_STALL_COOLDOWN_SECS: u64 = 21_600;
+
+/// Resolve the suppression cooldown with precedence **env > config > default**
+/// (Issue #9010), filtered exactly like [`resolve_roll_stall_deadlines`]: a zero
+/// or unparseable value falls through on **both** sides rather than being taken
+/// literally, since `0` would clear a declaration on the very tick it was made —
+/// i.e. restore the #8998 livelock through the knob.
+#[must_use]
+pub fn resolve_roll_stall_cooldown(config: &AutoUpdateConfig) -> Duration {
+    std::env::var(AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(config.roll_stall_cooldown_secs.filter(|&s| s > 0))
+        .map_or_else(|| Duration::from_secs(DEFAULT_ROLL_STALL_COOLDOWN_SECS), Duration::from_secs)
+}
+
 /// The operator-facing finding: this host's roll cannot complete, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollStallReport {
@@ -148,6 +200,14 @@ pub struct RollStallReport {
     pub episode_secs: u64,
     /// The artifact identity the abandoned roll was targeting, when known.
     pub target: Option<String>,
+    /// #9010: how long this declaration may stand before it expires on its own
+    /// and one more bounded roll attempt is released, in seconds.
+    pub cooldown_secs: u64,
+    /// #9010: how many cooldown-released retries this host has already spent
+    /// since the last time an auto-update tick saw it idle (0 on a first
+    /// declaration). Names the difference between "stalled once" and "stalled all
+    /// week", which the deadline count cannot: a retry resets that count.
+    pub retries: u32,
 }
 
 impl RollStallReport {
@@ -161,23 +221,39 @@ impl RollStallReport {
             floor,
             episode_secs,
             target,
+            cooldown_secs,
+            retries,
         } = self;
         let target = target
             .as_deref()
             .map_or_else(String::new, |t| format!(" (target {t})"));
+        // Named only when it has happened, so a first declaration does not carry a
+        // "0 retries spent" clause nobody needs to read.
+        let spent = if *retries > 0 {
+            format!(
+                " This host has already spent {retries} cooldown retry(ies) since an auto-update \
+                 tick last saw it idle, so it is persistently — not momentarily — unable to drain."
+            )
+        } else {
+            String::new()
+        };
         format!(
             "ABANDONING the drain-and-restart roll{target}: its wait condition is UNSATISFIABLE. \
              {deadlines} drain deadline(s) have expired across {episode_secs}s of stalled episode \
              (since the first refusal) and the \
              in-flight sweep count has never improved on {floor} ({in_flight} in flight now) — \
-             re-arming would pause dispatch for another budget and reach the same refusal, which \
-             is the loop that cost two fleet hosts 21h of paused dispatch (#8998). The roll intent \
-             is DISCARDED and NORMAL DISPATCH RESUMES, including role spawns. No sweep was \
-             cancelled and the pre-update binary keeps running (the #6007 fail-safe is unchanged). \
-             THIS HOST WILL NOT AUTO-UPDATE until an auto-update tick SAMPLES in-flight at zero \
-             (checked once per interval, with dispatch running), at which point the roll re-arms and \
-             completes on its own — on a continuously-busy host that sample may not land for a long \
-             time, so do not wait for it. To act now: find the long-running sweep with \
+             re-arming right now would pause dispatch for another budget and reach the same \
+             refusal, which is the loop that cost two fleet hosts 21h of paused dispatch (#8998). \
+             The roll intent is DISCARDED and NORMAL DISPATCH RESUMES, including role spawns. No \
+             sweep was cancelled and the pre-update binary keeps running (the #6007 fail-safe is \
+             unchanged).{spent} THIS HOST WILL NOT AUTO-UPDATE until whichever comes first of: an \
+             auto-update tick SAMPLES in-flight at zero (the fast path — checked once per interval, \
+             with dispatch running, so on a continuously-busy host that sample may not land), or \
+             this suppression's {cooldown_secs}s COOLDOWN EXPIRES, at which point the roll re-arms \
+             for ONE more bounded attempt and is declared again if the host still cannot drain \
+             (#9010). Staleness is therefore BOUNDED, not indefinite — but a host that stays this \
+             busy will keep paying about one paused-dispatch budget per cooldown, so ACT rather \
+             than wait if you want it updated sooner: find the long-running sweep with \
              `loom-daemon list`, then either let it finish, cancel it with `loom-daemon cancel \
              --sweep <id>`, or force the roll through with `loom-daemon restart --drain \
              --force-after-timeout` (which DOES cancel it)."
@@ -193,6 +269,10 @@ impl RollStallReport {
 pub(super) struct RollStallTracker {
     /// How many non-improving deadlines end the episode.
     threshold: u32,
+    /// #9010: how long a declaration may stand before it expires on time,
+    /// releasing one more bounded roll attempt. Seconds rather than a `Duration`
+    /// because every comparison here is against a `chrono` wall-clock delta.
+    cooldown_secs: u64,
     /// Deadline expiries inherited from rolls that have already ended
     /// (budget-abandoned, superseded, or replaced by a newer release).
     carried_deadlines: u32,
@@ -208,14 +288,27 @@ pub(super) struct RollStallTracker {
     since: Option<DateTime<Utc>>,
     /// The most recent roll target seen, for the report.
     target: Option<String>,
-    /// Sticky once set: cleared only by an `in_flight == 0` observation.
+    /// Sticky once set: cleared by an `in_flight == 0` observation (the fast
+    /// path) or by `cooldown_secs` elapsing since `declared_at` (#9010).
     unsatisfiable: bool,
+    /// When the standing declaration was made — the cooldown's origin. `None`
+    /// exactly when `unsatisfiable` is `false`.
+    declared_at: Option<DateTime<Utc>>,
+    /// #9010: cooldown-released retries spent since the last idle observation.
+    /// Survives a cooldown clear (that is the count's whole point) and is zeroed
+    /// by an idle observation, which is proof the host is no longer stuck.
+    retries: u32,
+    /// One-shot, drained by [`Self::take_retry_note`]: the WARN line owed to the
+    /// operator on the tick a cooldown released a retry. Held here rather than
+    /// logged inline so this module stays pure.
+    retry_note: Option<String>,
 }
 
 impl Default for RollStallTracker {
     fn default() -> Self {
         Self {
             threshold: DEFAULT_ROLL_STALL_DEADLINES,
+            cooldown_secs: DEFAULT_ROLL_STALL_COOLDOWN_SECS,
             carried_deadlines: 0,
             live_refusals: None,
             floor: None,
@@ -223,6 +316,9 @@ impl Default for RollStallTracker {
             since: None,
             target: None,
             unsatisfiable: false,
+            declared_at: None,
+            retries: 0,
+            retry_note: None,
         }
     }
 }
@@ -233,9 +329,49 @@ impl RollStallTracker {
         self.threshold = threshold.max(1);
     }
 
+    /// Override the suppression cooldown (the resolved `rollStallCooldownSecs`
+    /// knob, #9010). Floored at one second for the same reason `set_threshold`
+    /// floors at one: a zero cooldown would clear a declaration on the tick it was
+    /// made, restoring the very livelock this module exists to stop. The resolver
+    /// already drops a zero on both tiers; this is the second line of defence for
+    /// a directly-constructed value.
+    pub(super) fn set_cooldown(&mut self, cooldown: Duration) {
+        self.cooldown_secs = cooldown.as_secs().max(1);
+    }
+
+    /// Drop the whole episode, keeping only the resolved knobs and the retry
+    /// count the caller decides on (`0` from the idle fast path — the host is
+    /// demonstrably not stuck; `retries + 1` from a cooldown expiry).
+    fn clear_episode(&mut self, retries: u32) {
+        *self = Self {
+            threshold: self.threshold,
+            cooldown_secs: self.cooldown_secs,
+            retries,
+            ..Self::default()
+        };
+    }
+
+    /// Whether a standing declaration has stood for its full cooldown. False when
+    /// nothing is declared, and false if the wall clock ran backwards between
+    /// ticks (`num_seconds()` goes negative) rather than treating that as an
+    /// expiry.
+    fn cooldown_expired(&self, now: DateTime<Utc>) -> bool {
+        self.declared_at.is_some_and(|declared| {
+            (now - declared).num_seconds() >= i64::try_from(self.cooldown_secs).unwrap_or(i64::MAX)
+        })
+    }
+
+    /// Take the WARN line owed for a cooldown-released retry, if the most recent
+    /// [`Self::observe`] released one. One-shot.
+    pub(super) fn take_retry_note(&mut self) -> Option<String> {
+        self.retry_note.take()
+    }
+
     /// Whether an episode is running — i.e. whether a tick with no armed roll
     /// still needs to read the in-flight count. `true` while a declaration is
-    /// standing, which is what makes the suppression self-clearing.
+    /// standing, which is what lets the suppression clear itself: an idle sample
+    /// (fast path) or its cooldown expiring (#9010) are both observed on those
+    /// otherwise-idle ticks.
     pub(super) fn is_active(&self) -> bool {
         self.since.is_some()
     }
@@ -254,13 +390,11 @@ impl RollStallTracker {
         in_flight: usize,
     ) -> Option<RollStallReport> {
         // The condition the roll waits for is satisfied right now: whatever the
-        // episode believed, it is over. This is the only way a declaration
-        // clears, and the reason the suppression cannot outlive the blockage.
+        // episode believed, it is over. The *fast* way a declaration clears (#9010
+        // adds the slow one), and proof the host is not stuck, so the retry count
+        // goes back to zero with everything else.
         if in_flight == 0 {
-            *self = Self {
-                threshold: self.threshold,
-                ..Self::default()
-            };
+            self.clear_episode(0);
             return None;
         }
         // Not ours to reason about: a `fleet drain` teardown, or an untargeted
@@ -283,6 +417,40 @@ impl RollStallTracker {
             return None;
         }
         if self.unsatisfiable {
+            // Issue #9010: the declaration expires on TIME as well as on an idle
+            // sample. Deliberately *below* the foreign-drain guard above, so a
+            // cooldown can never release a retry while an operator's teardown or
+            // untargeted drain is armed — the episode stays frozen for the same
+            // reason it does not advance there, and the cooldown is re-checked (and
+            // by then long expired) on the first tick after that drain ends.
+            //
+            // Clearing the episode outright, rather than just the flag, is what
+            // makes the retry bounded instead of a return to #8998: the next tick
+            // arms a roll normally and the detector has to earn `threshold` fresh
+            // non-improving deadlines — one #6007 paused-dispatch budget — before it
+            // declares again. So the host pays one budget per cooldown period, and
+            // the worst case is a duty cycle, not a livelock.
+            if self.cooldown_expired(now) {
+                let stood_secs = self.report(now, in_flight).episode_secs;
+                let retries = self.retries.saturating_add(1);
+                let cooldown_secs = self.cooldown_secs;
+                let target = self
+                    .target
+                    .as_deref()
+                    .map_or_else(String::new, |t| format!(" (last target {t})"));
+                self.clear_episode(retries);
+                self.retry_note = Some(format!(
+                    "the unsatisfiable-roll suppression{target} has stood for its full \
+                     {cooldown_secs}s cooldown ({stood_secs}s of stalled episode, {in_flight} \
+                     sweep(s) still in flight) — RELEASING ONE BOUNDED RETRY (#9010): the next \
+                     tick arms a drain-and-restart roll again, and if this host still cannot \
+                     drain it is declared unsatisfiable once more after \
+                     {threshold} further deadline(s) rather than cycling. Retry {retries} since \
+                     an auto-update tick last saw this host idle.",
+                    threshold = self.threshold
+                ));
+                return None;
+            }
             return Some(self.report(now, in_flight));
         }
         match armed {
@@ -329,6 +497,10 @@ impl RollStallTracker {
         }
         if deadlines.saturating_sub(self.deadlines_at_floor) >= self.threshold {
             self.unsatisfiable = true;
+            // #9010's cooldown runs from the declaration, not from the episode's
+            // first observation, so a re-declaration always buys a full cooldown
+            // before the next retry.
+            self.declared_at = Some(now);
             return Some(self.report(now, in_flight));
         }
         None
@@ -350,7 +522,33 @@ impl RollStallTracker {
                 .since
                 .map_or(0, |since| u64::try_from((now - since).num_seconds()).unwrap_or(0)),
             target: self.target.clone(),
+            cooldown_secs: self.cooldown_secs,
+            retries: self.retries,
         }
+    }
+}
+
+// Issue #9010: these two live here, rather than beside
+// [`super::AutoUpdateState::with_roll_stall_deadlines`] in `auto_update.rs`, because
+// that file is already over `.loom/docs/file-size-policy.md`'s ratchet threshold —
+// this module is the sanctioned sibling to grow instead. Both reach the private
+// `roll_stall` field, which Rust's privacy rules permit from any descendant of the
+// defining module (`auto_update::roll_stall` is one).
+impl super::AutoUpdateState {
+    /// Set #9010's suppression cooldown (the resolved `rollStallCooldownSecs`
+    /// knob) — how long a standing declaration may stand before it expires and
+    /// releases one more bounded roll attempt. A builder for the same reason
+    /// [`super::AutoUpdateState::with_roll_stall_deadlines`] is.
+    #[must_use]
+    pub fn with_roll_stall_cooldown(mut self, cooldown: Duration) -> Self {
+        self.roll_stall.set_cooldown(cooldown);
+        self
+    }
+
+    /// Take the WARN line owed when #9010's cooldown just released a bounded
+    /// retry on the most recent `observe_roll_stall`. One-shot.
+    pub(super) fn take_roll_stall_retry_note(&mut self) -> Option<String> {
+        self.roll_stall.take_retry_note()
     }
 }
 
@@ -406,10 +604,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_cooldown_falls_back_from_config_to_the_default() {
+        let empty = AutoUpdateConfig::default();
+        assert_eq!(
+            resolve_roll_stall_cooldown(&empty),
+            Duration::from_secs(DEFAULT_ROLL_STALL_COOLDOWN_SECS)
+        );
+        let configured = AutoUpdateConfig {
+            roll_stall_cooldown_secs: Some(3600),
+            ..AutoUpdateConfig::default()
+        };
+        assert_eq!(resolve_roll_stall_cooldown(&configured), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn a_zero_cooldown_never_collapses_the_suppression_to_nothing() {
+        // `0` would clear a declaration on the tick it was made — #8998's livelock
+        // re-entered through the knob — so it is dropped on both tiers, exactly
+        // like a zero `rollStallDeadlines`.
+        let configured = AutoUpdateConfig {
+            roll_stall_cooldown_secs: Some(0),
+            ..AutoUpdateConfig::default()
+        };
+        assert_eq!(
+            resolve_roll_stall_cooldown(&configured),
+            Duration::from_secs(DEFAULT_ROLL_STALL_COOLDOWN_SECS),
+            "a 0 is filtered at read time AND in the resolver"
+        );
+        let mut tracker = RollStallTracker::default();
+        tracker.set_cooldown(Duration::from_secs(0));
+        for deadline in 1..=3 {
+            tracker.observe(at(i64::from(deadline) * 900), Some(&roll(deadline)), 2);
+        }
+        assert!(
+            tracker.observe(at(2700), None, 2).is_some(),
+            "a 0 cooldown is floored at 1s, so the declaration cannot expire on the \
+             very tick that made it"
+        );
+        assert!(tracker.take_retry_note().is_none());
+    }
+
     // ---- the happy path: a busy host that is actually draining ---------------
 
     #[test]
-    fn an_idle_observation_is_the_only_thing_that_clears_the_episode() {
+    fn an_idle_observation_clears_the_episode_immediately() {
         let mut tracker = RollStallTracker::default();
         for deadline in 1..=3 {
             tracker.observe(at(i64::from(deadline) * 900), Some(&roll(deadline)), 2);
@@ -506,6 +745,231 @@ mod tests {
         let and_again = tracker.observe(at(5400), None, 5).unwrap();
         assert_eq!(and_again.in_flight, 5);
         assert_eq!(and_again.floor, 2, "the floor is the episode's best, not this tick's");
+    }
+
+    // ---- the bounded cooldown retry (#9010) ---------------------------------
+
+    /// The headline of #9010: the declaration expires on TIME, so a host whose
+    /// `in_flight == 0` sample never lands is stale for a bounded period rather
+    /// than indefinitely.
+    #[test]
+    fn a_standing_declaration_expires_on_its_cooldown_with_no_idle_sample_ever() {
+        let mut tracker = RollStallTracker::default();
+        tracker.set_cooldown(Duration::from_secs(7200));
+        for deadline in 1..=3 {
+            tracker.observe(at(i64::from(deadline) * 900), Some(&roll(deadline)), 2);
+        }
+        let declared = tracker.observe(at(3600), Some(&roll(3)), 2).unwrap();
+        assert_eq!(declared.cooldown_secs, 7200, "the note must name the bound it promises");
+        assert_eq!(declared.retries, 0, "no retry has been spent yet");
+
+        // Still standing one second short of the cooldown — in-flight never once
+        // sampled at zero along the way.
+        assert!(
+            tracker.observe(at(2700 + 7199), None, 2).is_some(),
+            "the suppression holds for the whole cooldown"
+        );
+        assert!(tracker.take_retry_note().is_none(), "and nothing is claimed yet");
+
+        // …and expires on the tick that reaches it.
+        assert_eq!(
+            tracker.observe(at(2700 + 7200), None, 2),
+            None,
+            "the cooldown releases the suppression without any idle observation"
+        );
+        assert!(!tracker.is_active(), "the episode is gone, so the next tick arms a roll");
+        let retry = tracker.take_retry_note().unwrap();
+        assert!(retry.contains("RELEASING ONE BOUNDED RETRY"), "{retry}");
+        assert!(retry.contains("7200s cooldown"), "{retry}");
+        assert!(retry.contains("Retry 1"), "{retry}");
+        assert!(tracker.take_retry_note().is_none(), "the note is one-shot");
+    }
+
+    /// The retry is a *bounded* attempt, not a return to #8998: a host that still
+    /// cannot drain must earn `threshold` fresh deadlines and be declared again —
+    /// and the second declaration must say it is the second.
+    #[test]
+    fn a_host_that_still_cannot_drain_re_declares_after_a_full_threshold_again() {
+        let mut tracker = RollStallTracker::default();
+        tracker.set_cooldown(Duration::from_secs(7200));
+        for deadline in 1..=3 {
+            tracker.observe(at(i64::from(deadline) * 900), Some(&roll(deadline)), 2);
+        }
+        assert!(tracker.observe(at(3600), None, 2).is_some(), "declared");
+        assert_eq!(tracker.observe(at(2700 + 7200), None, 2), None, "cooldown expired");
+        tracker.take_retry_note();
+
+        // The retry arms a roll that refuses its first two deadlines: NOT enough,
+        // because the slate was wiped — the cost is one bounded budget, not a
+        // declaration on sight.
+        let base = 2700 + 7200;
+        assert_eq!(tracker.observe(at(base + 900), Some(&roll(1)), 2), None);
+        assert_eq!(tracker.observe(at(base + 1800), Some(&roll(2)), 2), None);
+        let again = tracker.observe(at(base + 2700), Some(&roll(3)), 2).unwrap();
+        assert_eq!(again.deadlines, 3, "a full fresh threshold, not a carried-over one");
+        assert_eq!(again.retries, 1, "and the note says one retry has already been spent");
+        assert!(again.note().contains("already spent 1 cooldown retry(ies)"), "{}", again.note());
+        // The new declaration re-arms the cooldown from scratch rather than
+        // inheriting the first one's (already-expired) clock.
+        assert!(
+            tracker.observe(at(base + 2700 + 7199), None, 2).is_some(),
+            "a re-declaration buys a full cooldown of its own"
+        );
+    }
+
+    /// The acceptance property, stated as a budget count. Run a host that never
+    /// drains and never samples idle across several cooldown periods and count
+    /// what it spends: #8998's livelock paused dispatch essentially continuously,
+    /// and the pre-#9010 suppression spent one budget and then never updated
+    /// again. This must spend **one budget per cooldown period** — a bounded duty
+    /// cycle, in both directions.
+    #[test]
+    fn several_cooldown_periods_spend_one_paused_dispatch_budget_each() {
+        // Production geometry at the defaults: a 900s tick, a drain that refuses
+        // at 1800s and 5400s and is budget-abandoned at 7200s (#6007's
+        // `4 × --timeout`), and a host stuck at 3 in flight forever.
+        const TICK: i64 = 900;
+        const BUDGET: i64 = 7200;
+        const COOLDOWN: i64 = DEFAULT_ROLL_STALL_COOLDOWN_SECS as i64;
+        const HORIZON: i64 = 3 * 86_400; // three days
+
+        let mut tracker = RollStallTracker::default();
+        let mut armed_since: Option<i64> = None;
+        let mut arms = 0_u32;
+        let mut declarations = 0_u32;
+        let mut paused_ticks = 0_u32;
+        let mut total_ticks = 0_u32;
+        let mut retries_at_last_declaration = 0_u32;
+        // What `run_tick` does with the tracker's verdict: a `Some` returns early,
+        // so no roll is armed on the ticks a declaration is standing.
+        let mut suppressed = false;
+
+        let mut t = 0;
+        while t < HORIZON {
+            // An auto-update tick with nothing armed and no suppression standing
+            // arms a roll for the (always newer) release — the step that made
+            // #8998 a loop. Dispatch pauses for as long as it stays armed.
+            if armed_since.is_none() && !suppressed {
+                armed_since = Some(t);
+                arms += 1;
+            }
+            let live = armed_since.map(|since| {
+                let elapsed = t - since;
+                roll(match elapsed {
+                    e if e >= 5400 => 2,
+                    e if e >= 1800 => 1,
+                    _ => 0,
+                })
+            });
+            if live.is_some() {
+                paused_ticks += 1;
+            }
+            total_ticks += 1;
+
+            let was_suppressed = suppressed;
+            let report = tracker.observe(at(t), live.as_ref(), 3);
+            suppressed = report.is_some();
+            if let Some(report) = report {
+                // A standing declaration is re-reported every tick, so only the
+                // transition into one is a fresh give-up.
+                if !was_suppressed {
+                    declarations += 1;
+                    retries_at_last_declaration = report.retries;
+                }
+                armed_since = None; // `run_tick` abandons it; dispatch resumes.
+            } else if armed_since.is_some_and(|since| t - since >= BUDGET) {
+                armed_since = None; // #6007 spent the budget on its own.
+            }
+            t += TICK;
+        }
+
+        // Three days at a 6h cooldown: one declaration per ~9h cycle (one 2h
+        // budget + the deadlines to re-declare + the cooldown), so single digits —
+        // NOT one per roll, and emphatically not "1, then never again".
+        let cycles = u32::try_from(HORIZON / (COOLDOWN + BUDGET + 2 * 1800)).unwrap();
+        assert_eq!(declarations, 8, "one declaration per cooldown period, no more");
+        assert!(
+            (cycles..=cycles + 1).contains(&declarations),
+            "{declarations} declarations is not ~{cycles} cooldown periods"
+        );
+        assert_eq!(
+            arms,
+            declarations * 2,
+            "each period arms exactly two rolls: one that spends #6007's budget, one that \
+             reaches the deadline that re-declares"
+        );
+        // The property the issue names: a bounded duty cycle. #8998's host was
+        // paused essentially always; this one pays one budget's worth per
+        // cooldown — 12 of every 36 ticks, i.e. ~3h of every ~9h.
+        assert_eq!(paused_ticks, 96, "12 paused ticks per cooldown period, eight times");
+        assert!(
+            paused_ticks * 100 / total_ticks <= 34,
+            "dispatch paused for {paused_ticks}/{total_ticks} ticks — not a bounded duty cycle"
+        );
+        // And each period is a *retry*, not a reset: the count keeps rising, so the
+        // WARN line always says how long this host has really been stuck rather
+        // than reporting eight indistinguishable "first" declarations.
+        assert_eq!(
+            retries_at_last_declaration,
+            declarations - 1,
+            "every declaration after the first must name the retries already spent"
+        );
+    }
+
+    /// An idle sample is proof the host is no longer stuck, so it clears the retry
+    /// count along with everything else — a host that stalls again next month
+    /// starts from "retry 1", not "retry 9".
+    #[test]
+    fn an_idle_observation_zeroes_the_retry_count() {
+        let mut tracker = RollStallTracker::default();
+        tracker.set_cooldown(Duration::from_secs(7200));
+        for deadline in 1..=3 {
+            tracker.observe(at(i64::from(deadline) * 900), Some(&roll(deadline)), 2);
+        }
+        assert_eq!(tracker.observe(at(2700 + 7200), None, 2), None, "cooldown expired");
+        tracker.take_retry_note();
+        assert_eq!(tracker.observe(at(20_000), None, 0), None, "the host goes quiet");
+        let mut report = None;
+        for deadline in 1..=3 {
+            report =
+                tracker.observe(at(30_000 + i64::from(deadline) * 900), Some(&roll(deadline)), 2);
+        }
+        let report = report.unwrap();
+        assert_eq!(report.retries, 0, "the earlier retry belongs to a finished stall");
+        assert!(!report.note().contains("cooldown retry(ies)"), "{}", report.note());
+    }
+
+    /// The cooldown must not release a retry while someone else's drain is armed:
+    /// the episode is frozen there for the same reason it does not advance, and
+    /// re-arming a roll of ours mid-teardown is exactly the destructive behaviour
+    /// the ownership test exists to prevent.
+    #[test]
+    fn a_cooldown_cannot_release_a_retry_while_a_foreign_drain_is_armed() {
+        let mut tracker = RollStallTracker::default();
+        tracker.set_cooldown(Duration::from_secs(7200));
+        for deadline in 1..=3 {
+            tracker.observe(at(i64::from(deadline) * 900), Some(&roll(deadline)), 4);
+        }
+        assert!(tracker.observe(at(3600), None, 4).is_some(), "declared");
+
+        let mut teardown = roll(0);
+        teardown.then_exit = true;
+        for tick in 10..30 {
+            assert_eq!(
+                tracker.observe(at(tick * 900), Some(&teardown), 4),
+                None,
+                "tick {tick}: a teardown is never reported…"
+            );
+            assert!(
+                tracker.take_retry_note().is_none(),
+                "tick {tick}: …and never releases a retry either"
+            );
+            assert!(tracker.is_active(), "tick {tick}: the declaration is retained");
+        }
+        // The moment the operator's drain is gone the (long-expired) cooldown is
+        // honoured on the very next tick.
+        assert_eq!(tracker.observe(at(27_000), None, 4), None);
+        assert!(tracker.take_retry_note().is_some(), "the retry is released once it can be");
     }
 
     // ---- what it must never touch -------------------------------------------
@@ -609,17 +1073,28 @@ mod tests {
             floor: 2,
             episode_secs: 75_600,
             target: Some("v0.19.390@aaaa".to_string()),
+            cooldown_secs: 21_600,
+            retries: 0,
         }
         .note();
+        assert!(
+            !note.contains("cooldown retry(ies)"),
+            "a first declaration must not claim spent retries: {note}"
+        );
         for needle in [
             "UNSATISFIABLE",
             "4 drain deadline(s)",
             "75600s of stalled episode",
             "7 in flight now",
-            // The suppression's end condition, stated precisely rather than as
-            // "self-clearing": it is a SAMPLE, and on a busy host it may not land.
+            // Both end conditions, stated precisely rather than as
+            // "self-clearing": the idle fast path is a SAMPLE that may not land on
+            // a busy host, and the cooldown is what makes the staleness bounded
+            // anyway (#9010).
             "SAMPLES in-flight at zero",
-            "do not wait for it",
+            "21600s COOLDOWN EXPIRES",
+            "ONE more bounded attempt",
+            "BOUNDED, not indefinite",
+            "ACT rather than wait",
             "never improved on 2",
             "v0.19.390@aaaa",
             "NORMAL DISPATCH RESUMES",
@@ -640,6 +1115,8 @@ mod tests {
             floor: 1,
             episode_secs: 60,
             target: None,
+            cooldown_secs: 21_600,
+            retries: 0,
         }
         .note();
         assert!(!note.contains("(target "), "{note}");
