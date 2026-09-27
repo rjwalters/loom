@@ -42,7 +42,9 @@
  */
 
 import type { AccountBurnCurve, BurnSegment, PoolBurnCurve, PoolBurnPoint, PoolBurnSegment } from "./burn.js";
-import { buildBurnCurves, buildPoolBurnCurves } from "./burn.js";
+import { buildBurnCurves, buildPoolBurnCurves, deriveAccountPoolSamples } from "./burn.js";
+import { buildPoolBurnRateSeries } from "./burnRate.js";
+import { renderBurnRateChart } from "./burnRateChartView.js";
 import type { AccountForecast, ForecastStatus, PoolHealthSummary } from "./forecast.js";
 import { forecastAccounts, summarizePoolHealths } from "./forecast.js";
 import type { AttributionResult } from "./attribution.js";
@@ -172,6 +174,7 @@ export function renderTokenAnalytics(
 
   if (surface === "public") {
     section.appendChild(renderPoolBurn(analytics.poolCurves));
+    section.appendChild(renderPoolBurnRate(analytics.poolCurves));
     section.appendChild(renderPoolHealth(analytics.poolHealth));
     section.appendChild(renderOperatorOnlyNotice());
     container.appendChild(section);
@@ -179,6 +182,12 @@ export function renderTokenAnalytics(
   }
 
   section.appendChild(renderBurnCurves(analytics.curves));
+  // No native pool aggregate exists on this surface (`/api/history` never
+  // serves the `/public/history` aggregate shape `analytics.poolCurves` is
+  // built from) — synthesize an equivalent one from the per-account samples
+  // already fetched, client-side, with no backend/redaction change. See
+  // `burn.ts`'s `deriveAccountPoolSamples` doc.
+  section.appendChild(renderPoolBurnRate(buildPoolBurnCurves(deriveAccountPoolSamples(analytics.samples))));
   section.appendChild(renderForecasts(analytics.forecasts, now));
   section.appendChild(renderAttribution(analytics.attribution));
   container.appendChild(section);
@@ -400,6 +409,48 @@ function renderPoolBurn(curves: readonly PoolBurnCurve[]): HTMLElement {
         "Peak usage is the solid line, mean usage the dashed one.",
     ),
   );
+  return block;
+}
+
+// --- Token-pool burn rate (issue #9029) -------------------------------------
+
+/**
+ * "How fast is the pool burning right now": a first-class interactive chart
+ * per host, built from the same `PoolBurnCurve[]` `renderPoolBurn` draws
+ * sparklines from — see `burnRate.ts` for the bounded rolling-window
+ * derivation and `burnRateChartView.ts` for the chart chrome.
+ *
+ * On the public surface `curves` is `analytics.poolCurves` (the server's own
+ * pool aggregate); on the authenticated surface the caller passes an
+ * equivalent curve set synthesized client-side from per-account samples
+ * (`burn.ts`'s `deriveAccountPoolSamples`) — either way this function draws
+ * the identical chart from the identical `PoolBurnCurve` shape, so the panel
+ * itself never has to know which surface it is on.
+ */
+function renderPoolBurnRate(curves: readonly PoolBurnCurve[]): HTMLElement {
+  const block = el("div", "analytics__block");
+  block.setAttribute("data-testid", "pool-burn-rate");
+  block.appendChild(el("h3", "analytics__heading", "Token-pool burn rate"));
+
+  const withRate = curves
+    .map((curve) => ({ curve, series: buildPoolBurnRateSeries(curve) }))
+    .filter(({ series }) => series.some((point) => point.meanRatePerHour !== null || point.maxRatePerHour !== null));
+
+  if (withRate.length === 0) {
+    block.appendChild(
+      el("p", "analytics__note", "Not enough tokens.snapshot history yet to compute a burn rate."),
+    );
+    return block;
+  }
+
+  for (const { curve, series } of withRate) {
+    const chartContainer = el("div", "burn-rate-chart-container");
+    chartContainer.setAttribute("data-host", curve.hostId);
+    renderBurnRateChart(chartContainer, series, {
+      title: curves.length > 1 ? `Token-pool burn rate — ${curve.hostId}` : "Token-pool burn rate",
+    });
+    block.appendChild(chartContainer);
+  }
   return block;
 }
 

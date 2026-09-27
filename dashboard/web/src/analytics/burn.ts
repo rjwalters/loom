@@ -393,6 +393,41 @@ export interface PoolBurnCurve {
   exhaustedCount: number;
 }
 
+/**
+ * Synthesize one {@link PoolSample} per per-account `TokenSample` — the
+ * `/api/history` (authenticated) counterpart of what the backend's
+ * `deriveTokenPoolAggregate` computes server-side for `/public/history`
+ * (`../../src/redaction.ts`). `/api/history` never serves the aggregate
+ * shape (`parsePoolSample` only recognizes `/public/history`'s
+ * `account_count` field), so an authenticated caller that wants a
+ * pool-level view — e.g. the burn-rate chart, `burnRate.ts` — has nothing to
+ * parse. This produces an equivalent sample from data already on hand,
+ * client-side, with no backend/ingest/redaction change: same
+ * mean/peak-usage-fraction, exhausted-count and earliest-reset semantics as
+ * the server's aggregate, computed here instead of there.
+ *
+ * A `TokenSample` is already scoped to one `(hostId, at)` instant, so this is
+ * a 1:1 map, not a fold — feed the result straight to {@link buildPoolBurnCurves}
+ * for the same segmentation every other pool view gets.
+ */
+export function deriveAccountPoolSamples(samples: readonly TokenSample[]): PoolSample[] {
+  return samples.map((sample) => {
+    const usages = sample.accounts.map((account) => account.usageFraction).filter((u): u is number => u !== undefined);
+    const resets = sample.accounts
+      .map((account) => account.limitWindowResetAt)
+      .filter((r): r is number => r !== undefined);
+    return {
+      hostId: sample.hostId,
+      at: sample.at,
+      accountCount: sample.accounts.length,
+      exhaustedCount: sample.accounts.filter((account) => account.exhausted).length,
+      meanUsageFraction: usages.length > 0 ? usages.reduce((sum, u) => sum + u, 0) / usages.length : undefined,
+      maxUsageFraction: usages.length > 0 ? Math.max(...usages) : undefined,
+      nextLimitWindowResetAt: resets.length > 0 ? Math.min(...resets) : undefined,
+    };
+  });
+}
+
 interface PoolSeries {
   hostId: string;
   samples: PoolSample[];
