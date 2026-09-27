@@ -2703,8 +2703,10 @@ _find_worktree_by_branch() {
 # replayed before a non-zero exit is reported, so a crash after a delete cannot
 # hide the delete. Only stdout is parsed — stderr (clap errors, logs) passes
 # through untouched, never replayed as a bogus INFO line. `${a[@]+…}` is bash
-# 3.2's `set -u` empty-array guard; cleanup-branches.sh evals this body without
-# `_mp_daemon_roll_hint`, hence the `declare -F` probe.
+# 3.2's `set -u` empty-array guard; test-merge-pr-local-branch-cleanup.sh evals
+# this body without `_mp_daemon_roll_hint`, hence the `declare -F` probe.
+# (cleanup-branches.sh used to eval it too — since #8968 it calls the same
+# subcommand itself, so this body has exactly one caller: merge-pr.sh.)
 _maybe_delete_local_branch() {
   local branch="$1" expected_head_sha="${2:-}"
   [[ -n "$branch" ]] || return 0
