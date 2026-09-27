@@ -316,9 +316,10 @@ fn tick_result_precedence() {
 #[test]
 fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
     let report = TickReport {
-        seen: 5,
+        seen: 6,
         dispatched: 2,
         skipped_peer_claim: 1,
+        skipped_host_class: 1,
         deferred_capacity: 2,
         ..TickReport::default()
     };
@@ -333,12 +334,13 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
         [
             ("capacity".to_string(), MetricValue::Int(2)),
             ("dispatched".to_string(), MetricValue::Int(2)),
+            ("host_class".to_string(), MetricValue::Int(1)),
             ("peer_claim".to_string(), MetricValue::Int(1)),
         ]
         .into_iter()
         .collect()
     );
-    assert!(points.contains(&MetricPoint::int(MetricName::DispatchCandidates, 5)));
+    assert!(points.contains(&MetricPoint::int(MetricName::DispatchCandidates, 6)));
     assert!(points.contains(&MetricPoint::int(MetricName::DispatchMaxConcurrent, 4)));
 }
 

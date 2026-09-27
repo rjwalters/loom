@@ -25,20 +25,35 @@
 //!
 //! # Default: unclassified, inert
 //!
-//! `host_class` absent (no `.loom/config.json` key, no env var) resolves to
+//! `host_class` absent (no `hostClass` key in any config tier, no env var) resolves to
 //! [`HostClass::Unclassified`], for which [`gate`] never fires — this is the
 //! only default that produces zero behavior change for every existing
 //! install. Do **not** default an unset host to `local-dev`: that would
 //! silently start refusing heavy sweeps on every unconfigured host in the
-//! fleet the moment this ships. Reclassifying a machine is a rare, deliberate
-//! operator action, so [`resolve`] is a **startup-capture** — env > config >
-//! default, resolved ONCE (at daemon startup / dispatcher construction) and
-//! never hot-reloaded per tick, unlike [`super::repo_cap`]'s
-//! `maxConcurrentPerRepo` (#9090) or `maxConcurrent` (#9060). The closer
-//! precedent is `resolve_max_admissions_per_tick_with_config`'s deliberate
-//! startup-capture design: an operator retuning `host_class` takes effect on
-//! the next daemon restart. [`resolve_allow_heavy_local`] (the override below)
-//! is the opposite: read fresh every tick, like `extra_skip_labels`.
+//! fleet the moment this ships.
+//!
+//! # A fact about the HOST, resolved once at work-finder startup
+//!
+//! Reclassifying a machine is a rare, deliberate operator action, so the
+//! class is a **startup-capture**: [`resolve_at_startup`] runs exactly once,
+//! in `spawn_multi_work_finder_task` *before* the tick loop, against the
+//! daemon's primary workspace (`fallback_root`), and the resulting value is
+//! threaded into every per-tick `RegistryDispatcher` via
+//! [`super::forge::dispatcher_pairs`]. A config edit mid-run changes nothing
+//! until the next daemon restart (pinned by
+//! `host_class_gate_tests::host_class_is_pinned_at_startup_across_a_mid_run_config_change`).
+//! Because it is one value per daemon process, every workspace that daemon
+//! serves shares it — a per-repo class would be meaningless.
+//!
+//! Set it with `LOOM_HOST_CLASS` or a **machine-local** config tier
+//! (`~/.local/share/loom/config/defaults.json`, or the ignored
+//! `.loom-local/local.json`) — never a repo's committed `.loom/config.json`,
+//! which every clone shares and would misclassify each remote worker running
+//! that repo as `local-dev`. An unrecognized value (e.g. `"local_dev"`) logs
+//! a one-time `WARN` and resolves to unclassified (gate off).
+//!
+//! [`resolve_allow_heavy_local`] (the override below) is the opposite: read
+//! fresh every tick per workspace, like `extra_skip_labels`.
 //!
 //! # Two independent override paths
 //!
@@ -59,9 +74,12 @@
 //! refused candidate without an operator action, so there is nothing to
 //! "retry" here the way a capacity/ramp/saturation defer means.
 
+use std::path::Path;
+use std::sync::Once;
+
 use serde_json::Value;
 
-use super::{WorkFinderConfig, WorkItem};
+use super::{read_work_finder_config, WorkFinderConfig, WorkItem};
 
 /// The label naming a CPU/RAM-intensive sweep (Issue #9034) — e.g. a
 /// sustained simulation/EDA build — that should not run on a `local-dev`
@@ -148,11 +166,61 @@ pub fn parse_config(wf: Option<&Value>) -> Option<HostClass> {
 
 /// Resolve this host's declared class with precedence **env
 /// ([`HOST_CLASS_ENV`]) > config (`autonomous.workFinder.hostClass`) >
-/// unclassified**. Resolved ONCE — see the module doc's "Default:
-/// unclassified, inert" — never hot-reloaded per tick.
+/// unclassified**. Production callers go through [`resolve_at_startup`],
+/// which runs once — never hot-reloaded per tick.
 #[must_use]
 pub fn resolve(config: &WorkFinderConfig) -> HostClass {
     env_host_class().or(config.host_class).unwrap_or_default()
+}
+
+/// Every raw `hostClass` / `LOOM_HOST_CLASS` value that is set but not
+/// recognized, labelled by source — pure, so the warn path is testable.
+fn unrecognized_values(env: Option<&str>, config: Option<&Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(raw) = env.map(str::trim).filter(|v| !v.is_empty()) {
+        if HostClass::parse(raw).is_none() {
+            out.push(format!("{HOST_CLASS_ENV}={raw:?}"));
+        }
+    }
+    if let Some(v) = config.filter(|v| !v.is_null()) {
+        if v.as_str().and_then(HostClass::parse).is_none() {
+            out.push(format!("autonomous.workFinder.hostClass={v}"));
+        }
+    }
+    out
+}
+
+/// One-time `WARN` for an unrecognized class value: a typo such as
+/// `"local_dev"` would otherwise silently leave the gate off while the
+/// operator believes the machine is protected. Soft-fail semantics are
+/// unchanged — the value still resolves to unclassified.
+fn warn_unrecognized_once(root: &Path) {
+    static WARNED: Once = Once::new();
+    let effective = crate::config_resolver::resolve_effective_config(root);
+    let bad = unrecognized_values(
+        std::env::var(HOST_CLASS_ENV).ok().as_deref(),
+        crate::config_resolver::get_path(&effective, "autonomous.workFinder.hostClass"),
+    );
+    if !bad.is_empty() {
+        WARNED.call_once(|| {
+            log::warn!(
+                "work_finder: unrecognized host class {} — expected `local-dev` or \
+                 `remote-worker`; treating this host as unclassified, so the `{LOOM_HEAVY_LABEL}` \
+                 gate is OFF (Issue #9034)",
+                bad.join(", ")
+            );
+        });
+    }
+}
+
+/// Resolve this host's class ONCE, at startup, from `root`'s effective config
+/// (env > config > unclassified) — see the module doc's "A fact about the
+/// HOST". Called once by the multi-workspace work-finder before its tick loop
+/// and once per (one-shot) `loom-daemon dispatch` CLI process; never per tick.
+#[must_use]
+pub fn resolve_at_startup(root: &Path) -> HostClass {
+    warn_unrecognized_once(root);
+    resolve(&read_work_finder_config(root))
 }
 
 fn env_allow_heavy_local() -> Option<bool> {
@@ -278,6 +346,18 @@ mod tests {
         };
         assert_eq!(resolve(&cfg), HostClass::RemoteWorker, "invalid env falls through to config");
         std::env::remove_var(HOST_CLASS_ENV);
+    }
+
+    #[test]
+    fn unrecognized_values_flags_typos_from_either_source() {
+        assert!(unrecognized_values(None, None).is_empty());
+        assert!(unrecognized_values(Some("local-dev"), None).is_empty());
+        assert!(unrecognized_values(Some("  "), None).is_empty(), "blank env is unset");
+        assert!(unrecognized_values(None, Some(&serde_json::json!("remote-worker"))).is_empty());
+        let bad = unrecognized_values(Some("laptop"), Some(&serde_json::json!("local_dev")));
+        assert_eq!(bad.len(), 2, "{bad:?}");
+        assert!(bad[0].contains("laptop") && bad[1].contains("local_dev"), "{bad:?}");
+        assert_eq!(unrecognized_values(None, Some(&serde_json::json!(true))).len(), 1);
     }
 
     // ---- allowHeavyLocal precedence -------------------------------------

@@ -1157,6 +1157,8 @@ pub fn tick_with_saturation_brake(
     // tick, like `extra_skip_labels` above. Empty on every host that has not
     // opted in, which makes the check below byte-for-byte the pre-#6893 one.
     let held_capabilities = dispatcher.declared_capabilities();
+    // Host-class gate policy (#9034) — once per tick, like the sets above.
+    let heavy_local_policy = dispatcher.heavy_local_policy();
     // This host's identity (#7456) — resolved once per tick, like
     // `held_capabilities` above, so an issue's host-affinity constraint can
     // be checked per candidate without a repeated env/hostname resolution.
@@ -1214,8 +1216,7 @@ pub fn tick_with_saturation_brake(
         //     a `local-dev`-classified host, unless the workspace's
         //     `allowHeavyLocal` override is set — see `host_class` module doc.
         //     Same zero-side-effect contract as 0b above.
-        if host_class::gate(&item, dispatcher.heavy_local_policy(), &mut report.skipped_host_class)
-        {
+        if host_class::gate(&item, heavy_local_policy, &mut report.skipped_host_class) {
             continue;
         }
         // 1. Defensive skip-label filter (stale forge cache), extended with
@@ -2654,7 +2655,7 @@ where
                              {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
                              {} declined-skip, {} prless-retry-skip, \
                              {} recheck-interval-skip, \
-                             {} host-constraint-skip, \
+                             {} host-constraint-skip, {} host-class-skip, \
                              {} pr-open-skip, \
                              {} peer-claim-skip, \
                              {} deferred (capacity), {} deferred (ramp), \
@@ -2673,6 +2674,7 @@ where
                             report.skipped_prless_retry,
                             report.skipped_recheck_interval,
                             report.skipped_host_constraint,
+                            report.skipped_host_class,
                             report.skipped_pr_open,
                             report.skipped_peer_claim,
                             report.deferred_capacity,
@@ -2789,6 +2791,9 @@ pub fn spawn_multi_work_finder_task(
     mut startup_reconciliation_ready: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     configured_max::log_loop_start(interval, configured_max, max_admissions_per_tick);
+    // #9034: a fact about the host, resolved ONCE here — never per tick.
+    let host_class = host_class::resolve_at_startup(&fallback_root);
+    log::info!("work_finder: host_class={} (startup-captured, #9034)", host_class.as_str());
     tokio::spawn(async move {
         // #9060: the operator ceiling is re-resolved every tick (see the
         // `configured_max` module) — no longer a frozen startup value.
@@ -3136,13 +3141,7 @@ pub fn spawn_multi_work_finder_task(
             }
             let any_halted = halted.iter().any(|&h| h);
 
-            let mut pairs: Vec<(GhWorkSource, RegistryDispatcher)> = roots
-                .iter()
-                .map(|root| {
-                    let registry = pool.get_or_provision(root);
-                    (GhWorkSource::for_root(root), RegistryDispatcher::new(registry))
-                })
-                .collect();
+            let mut pairs = forge::dispatcher_pairs(&pool, &roots, host_class);
 
             // Workspace-commands-missing tripwire (#6440): a loud, ONE-TIME
             // WARN per root on the transition into (and recovery from) the
@@ -3252,7 +3251,7 @@ pub fn spawn_multi_work_finder_task(
                      {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
                      {} declined-skip, {} prless-retry-skip, \
                      {} recheck-interval-skip, \
-                     {} host-constraint-skip, \
+                     {} host-constraint-skip, {} host-class-skip, \
                      {} pr-open-skip, \
                      {} peer-claim-skip, \
                      {} deferred (capacity), {} deferred (ramp), \
@@ -3273,6 +3272,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_prless_retry,
                     report.skipped_recheck_interval,
                     report.skipped_host_constraint,
+                    report.skipped_host_class,
                     report.skipped_pr_open,
                     report.skipped_peer_claim,
                     report.deferred_capacity,

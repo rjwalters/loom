@@ -172,11 +172,12 @@ fn tick_multi_never_dispatches_a_heavy_issue_on_a_local_dev_host() {
     assert!(multi[0].1.dispatched.is_empty(), "dispatch() must never be called");
 }
 
-/// Mirrors the #7972/#3939 cross-workspace property: a `local-dev` workspace
-/// held on its own heavy candidate does not starve a `remote-worker`
-/// sibling's identical candidate.
+/// Mirrors the #7972/#3939 cross-workspace property: on one `local-dev`
+/// host (the class is host-wide, resolved once at startup), a workspace held
+/// on its own heavy candidate does not starve a sibling whose per-workspace
+/// `allowHeavyLocal` override is set.
 #[test]
-fn tick_multi_a_local_dev_workspace_does_not_starve_a_remote_worker_sibling() {
+fn tick_multi_a_refused_workspace_does_not_starve_an_overridden_sibling() {
     let mut multi = vec![
         (
             OneShotSource::of(vec![heavy(1)]),
@@ -188,7 +189,7 @@ fn tick_multi_a_local_dev_workspace_does_not_starve_a_remote_worker_sibling() {
         (
             OneShotSource::of(vec![heavy(10)]),
             PolicyDispatcher {
-                policy: policy(host_class::HostClass::RemoteWorker, false),
+                policy: policy(host_class::HostClass::LocalDev, true),
                 ..Default::default()
             },
         ),
@@ -198,5 +199,52 @@ fn tick_multi_a_local_dev_workspace_does_not_starve_a_remote_worker_sibling() {
     assert_eq!(report.skipped_host_class, 1, "workspace A's #1 is refused");
     assert_eq!(report.dispatched, 1);
     assert!(multi[0].1.dispatched.is_empty());
-    assert_eq!(multi[1].1.dispatched, vec![10], "the remote-worker sibling still dispatches");
+    assert_eq!(multi[1].1.dispatched, vec![10], "the overridden sibling still dispatches");
+}
+
+// ===================================================================
+// Startup capture (Judge fix on PR #9214)
+// ===================================================================
+
+fn write_host_class(root: &std::path::Path, class: &str) {
+    let loom = root.join(".loom");
+    std::fs::create_dir_all(&loom).unwrap();
+    let body = serde_json::json!({"autonomous": {"workFinder": {"hostClass": class}}});
+    std::fs::write(loom.join("config.json"), body.to_string()).unwrap();
+}
+
+/// The class is resolved ONCE at work-finder startup and threaded into the
+/// dispatchers the multi-workspace loop rebuilds EVERY tick — so a config
+/// edit mid-run does not reclassify the host until a restart.
+#[tokio::test]
+#[serial_test::serial]
+async fn host_class_is_pinned_at_startup_across_a_mid_run_config_change() {
+    std::env::remove_var(host_class::HOST_CLASS_ENV);
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write_host_class(&root, "local-dev");
+
+    // Daemon start: resolve once.
+    let startup = host_class::resolve_at_startup(&root);
+    assert_eq!(startup, host_class::HostClass::LocalDev);
+
+    // Mid-run: the operator edits the config.
+    write_host_class(&root, "remote-worker");
+    assert_eq!(
+        host_class::resolve_at_startup(&root),
+        host_class::HostClass::RemoteWorker,
+        "precondition: the config on disk really did change"
+    );
+
+    // The next tick's per-root rebuild still carries the startup class.
+    let pool = WorkspacePool::new(Arc::new(EventBus::new()), tokio::runtime::Handle::current());
+    let pairs = forge::dispatcher_pairs(&pool, std::slice::from_ref(&root), startup);
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(
+        pairs[0].1.heavy_local_policy().class,
+        host_class::HostClass::LocalDev,
+        "a mid-run config change must not reclassify the host"
+    );
+    std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
 }

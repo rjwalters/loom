@@ -234,9 +234,7 @@ pub(crate) async fn handle_dispatch_command(
                 }
             }
             if !allow_local {
-                let host_class = loom_daemon::work_finder::host_class::resolve(
-                    &loom_daemon::work_finder::read_work_finder_config(&root),
-                );
+                let host_class = loom_daemon::work_finder::host_class::resolve_at_startup(&root);
                 if let Some(refusal) = heavy_local_refusal(issue, &labels, host_class) {
                     eprintln!("{refusal}");
                     std::process::exit(1);
