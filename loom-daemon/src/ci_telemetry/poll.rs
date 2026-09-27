@@ -657,14 +657,37 @@ fn paginate<T>(
 }
 
 /// Hold the watermark at the oldest not-yet-finished run so a later poll
-/// still lists it once it completes.
+/// still lists it once it completes — **unless** it is already older than the
+/// bound that would ever surface it again (#8992).
 ///
 /// A hold **older than the current watermark** (only reachable through the
 /// trailing rescan window, e.g. an in-progress re-attempt of an old run) is
 /// clamped away by [`poll_repo`] rather than moving the watermark backwards:
 /// the rescan window re-lists that run next cycle anyway, and a watermark that
 /// can regress would re-walk arbitrarily much history.
-fn hold(at: DateTime<Utc>, oldest: &mut Option<DateTime<Utc>>) {
+///
+/// A run that never reaches a completed state (cancelled-but-stuck, an
+/// abandoned workflow, a `queued` run whose runner never arrives) is held
+/// every cycle. Without a bound `oldest_incomplete` would stay pinned at that
+/// run's `created_at` forever, so [`runs_floor`] would too — every cycle
+/// re-listing a window that grows without bound. The bound is the same
+/// effective window [`runs_floor`] uses (the rescan window, capped by the
+/// initial lookback): once a run is older than that, it can never be
+/// re-surfaced by the rescan window either, so continuing to hold it buys
+/// nothing but a pinned watermark. Past the bound the run is treated as
+/// abandoned — it stops being held, the watermark is free to advance past it,
+/// and (once the watermark has advanced) it drops out of future listings
+/// too.
+fn hold(
+    at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    rescan_window: Duration,
+    initial_lookback: Duration,
+    oldest: &mut Option<DateTime<Utc>>,
+) {
+    if now - at > rescan_window.min(initial_lookback) {
+        return;
+    }
     *oldest = Some(oldest.map_or(at, |o| o.min(at)));
 }
 
@@ -753,7 +776,13 @@ fn poll_repo(
     for run in &runs {
         newest = newest.max(run.created_at);
         if !run.is_completed() {
-            hold(run.created_at, &mut oldest_incomplete);
+            hold(
+                run.created_at,
+                ctx.now,
+                ctx.rescan_window,
+                ctx.initial_lookback,
+                &mut oldest_incomplete,
+            );
             continue;
         }
         let run_key = UnitKey::run(full, run.id, run.run_attempt);
@@ -765,7 +794,13 @@ fn poll_repo(
                 serde_json::from_str::<JobsPage>(body).map(|p| p.jobs)
             })?;
         if jobs.iter().any(|job| !job.is_completed()) {
-            hold(run.created_at, &mut oldest_incomplete);
+            hold(
+                run.created_at,
+                ctx.now,
+                ctx.rescan_window,
+                ctx.initial_lookback,
+                &mut oldest_incomplete,
+            );
             continue;
         }
         let stitch = stories.as_ref().map(|stories| stories.decide(run));
@@ -885,4 +920,72 @@ fn emit(ledger: &mut Ledger, journal: &Journal, committed: &[PendingUnit]) -> io
         ledger.mark_emitted(through)?;
     }
     Ok(())
+}
+
+/// Unit coverage for [`hold`]'s bound, isolated from the fixture-driven
+/// end-to-end coverage in [`super::tests::rerun_window`] (#8992).
+#[cfg(test)]
+mod hold_bound_tests {
+    use super::*;
+
+    #[test]
+    fn a_run_exactly_at_the_bound_is_still_held() {
+        let now: DateTime<Utc> = "2026-09-20T12:00:00Z".parse().unwrap();
+        let rescan_window = Duration::hours(24);
+        let initial_lookback = Duration::hours(24);
+        let mut oldest = None;
+        hold(now - rescan_window, now, rescan_window, initial_lookback, &mut oldest);
+        assert_eq!(oldest, Some(now - rescan_window));
+    }
+
+    #[test]
+    fn a_run_one_second_past_the_bound_is_not_held() {
+        let now: DateTime<Utc> = "2026-09-20T12:00:00Z".parse().unwrap();
+        let rescan_window = Duration::hours(24);
+        let initial_lookback = Duration::hours(24);
+        let mut oldest = None;
+        hold(
+            now - rescan_window - Duration::seconds(1),
+            now,
+            rescan_window,
+            initial_lookback,
+            &mut oldest,
+        );
+        assert_eq!(oldest, None);
+    }
+
+    /// The bound is the *smaller* of the two windows — same cap [`runs_floor`]
+    /// applies — so a rescan window wider than the initial lookback does not
+    /// widen the hold past what the listing floor could ever re-list anyway.
+    #[test]
+    fn the_bound_is_capped_by_the_smaller_of_the_two_windows() {
+        let now: DateTime<Utc> = "2026-09-20T12:00:00Z".parse().unwrap();
+        let mut oldest = None;
+        hold(
+            now - Duration::hours(7),
+            now,
+            Duration::hours(240),
+            Duration::hours(6),
+            &mut oldest,
+        );
+        assert_eq!(oldest, None, "7h old is past the 6h initial-lookback cap");
+    }
+
+    /// Several holds still track the *oldest* incomplete run within the
+    /// bound — an already-tracked older run is never overwritten by a newer
+    /// one, and a too-old run never displaces a within-bound one either.
+    #[test]
+    fn several_holds_track_the_oldest_within_bound_run() {
+        let now: DateTime<Utc> = "2026-09-20T12:00:00Z".parse().unwrap();
+        let rescan_window = Duration::hours(24);
+        let initial_lookback = Duration::hours(24);
+        let mut oldest = None;
+        let newer = now - Duration::hours(1);
+        let older = now - Duration::hours(2);
+        let too_old = now - Duration::hours(25);
+        hold(newer, now, rescan_window, initial_lookback, &mut oldest);
+        hold(older, now, rescan_window, initial_lookback, &mut oldest);
+        hold(too_old, now, rescan_window, initial_lookback, &mut oldest);
+        assert_eq!(oldest, Some(older));
+    }
 }
