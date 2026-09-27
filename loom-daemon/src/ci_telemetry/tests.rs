@@ -11,6 +11,7 @@ mod captain_gate;
 mod credential_rejection;
 mod job_logs;
 mod join_keys;
+mod owners;
 mod queue_time;
 mod rerun_window;
 mod story_stitch;
@@ -230,7 +231,8 @@ fn now() -> DateTime<Utc> {
 fn ctx(root: &Path) -> CycleContext<'_> {
     CycleContext {
         root,
-        org: ORG.to_string(),
+        owners: vec![super::owners::Owner::org(ORG)],
+        owner_kinds: std::sync::Arc::default(),
         excluded_repos: Vec::new(),
         now: now(),
         host_id: "fixture-host".to_string(),
@@ -937,7 +939,7 @@ fn records_emit_exactly_the_declared_vocabulary() {
 fn config_defaults_are_flags_off_and_config_values_resolve() {
     let resolved = resolve(&CiTelemetryConfig::default());
     assert!(!resolved.enabled);
-    assert_eq!(resolved.org, DEFAULT_ORG);
+    assert_eq!(resolved.owners, vec![super::owners::Owner::org(DEFAULT_ORG)]);
     assert_eq!(resolved.interval_secs, DEFAULT_INTERVAL_SECS);
     assert!(resolved.excluded_repos.is_empty());
     assert_eq!(log_capture_gate(&resolved), LogCaptureGate::Off);
@@ -989,6 +991,7 @@ fn env_overrides_config() {
     };
     let config = CiTelemetryConfig {
         enabled: Some(false),
+        owners: None,
         org: Some("from-config".into()),
         interval_secs: Some(300),
         excluded_repos: Some(vec![exclusion.clone()]),
@@ -1019,7 +1022,7 @@ fn env_overrides_config() {
         std::env::remove_var(name);
     }
     assert!(resolved.enabled);
-    assert_eq!(resolved.org, "from-env");
+    assert_eq!(resolved.owners, vec![super::owners::Owner::org("from-env")]);
     assert_eq!(resolved.interval_secs, 45);
     assert_eq!(resolved.excluded_repos, vec![exclusion.clone()]);
     assert!(resolved.log_capture_requested);
