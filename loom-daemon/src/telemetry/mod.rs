@@ -844,6 +844,14 @@ pub struct TokenAccountState {
     /// Fraction of the 5h limit window consumed (`0.0..=1.0`), when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_fraction: Option<f64>,
+    /// Fraction of the rolling 7-day ("weekly") limit window consumed
+    /// (`0.0..=1.0`), when known (issue #9005). Claude rows read it from the
+    /// pool's `.ranking.weekly.json` sidecar
+    /// ([`crate::tokens_pool::ranking_weekly`]); providers with no
+    /// utilization source leave it absent — never `0`. Additive: a record
+    /// from an older daemon simply lacks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_fraction_weekly: Option<f64>,
     /// When the window **currently gating this account** resets, when known —
     /// the 7d window for an `exhausted` account (the instant it regains
     /// capacity), the 5h window otherwise (the rollover `usage_fraction` is

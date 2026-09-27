@@ -201,6 +201,23 @@ the counts quoted above and in `fixture-queries.sql` from the generated manifest
 so a later fixture version cannot leave a stale total here for an observation to
 be compared against.
 
+### Quota utilization queries
+
+`quota-utilization.sql` (#9005) answers "are our subscriptions saturated or
+idle?" from the per-account `tokens.snapshot` gauges: (1) per-account 5-hour
+and weekly utilization, hourly peak; (2) idle headroom at each detected weekly
+reset (the final utilization before the window rolled over, and `1 -` that);
+(3) the fraction of subscription capacity each provider used over the last
+week, with `coverage = 'unknown'` and NULL fractions for a provider that has
+no utilization source. Run it the same way as the queue-dwell queries:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < quota-utilization.sql
+```
+
+Verified against a local `clickhouse-local` with a mock `samples_v4` /
+`time_series_v4` shape, not yet against a live SigNoz.
+
 ### CI retro queries
 
 `ci-queries.sql` is the standing build/CI retro (#8826): six numbered sections
@@ -231,6 +248,7 @@ histograms. Policy and pipeline: [CI observability](../../docs/ci-observability.
 | Phase duration | Trace Explorer: duration of the observed `loom.phase` / `loom.role_attempt` spans, grouped by role/runtime/model, with the same time range as ClickStack (`fixture-queries.sql` 3) |
 | Correlated logs | Logs Explorer: exact trace ID and span ID; follow the trace link and inspect related logs from the selected span (`fixture-queries.sql` 6) |
 | Host/token gauges | Metrics Explorer: the actual emitted names and units — the shared fixture emits `loom.tokens.usage_fraction` and `loom.tokens.exhausted` only, labelled by `account`. An absent series is not a measured zero: the fixture's `synthetic-unknown` account intentionally has no `usage_fraction` point while `synthetic-zero` has `0.0` (`fixture-queries.sql` 7) |
+| Subscription quota utilization | Dashboards → New dashboard `Loom quota` → Time series panel. Metric `loom.tokens.usage_fraction` (5-hour window) and a second query on `loom.tokens.usage_fraction_weekly` (rolling 7-day window, #9005), aggregation **Max**, group by `provider`, `account`; time range 7 days. Providers with no utilization source (Codex, OpenCode/Z.ai, Kimi) have no series at all — a gap, never a `0`. Last week's used fraction per provider and the idle headroom thrown away at each weekly reset need window functions, so they live in SQL only (`quota-utilization.sql` 1–3) |
 | Delivery health | Scrape the neutral gateway's own Prometheus endpoint (`config.yaml` publishes `detailed` telemetry on port 8888) and read `otelcol_exporter_*` series filtered to `exporter="otlp_http/signoz"` — queue size, sent, send-failed and enqueue-failed. These series are **not** exported into SigNoz through the OTLP pipeline, so they are unavailable in the UI and must be captured beside it. Backend readiness is not delivery evidence |
 | In-progress sweep | Compare partial child spans before the root completes, then query again after completion; do not infer success from a missing root/end span (`fixture-queries.sql` 5, which lists every trace with children but no `loom.sweep` root) |
 | CI duration trend | Dashboards → New dashboard `Loom CI` → Time series panel. Metric `loom.ci.job.duration_ms`, aggregation **P50**, a second query on the same metric with **P95** and a third with **Max**; group by `repo`, `workflow`, `job`; optional filter `repo = '<owner/name>'`; time range 30 days. UI percentiles interpolate within the histogram's 1s…6h bucket bounds; the SQL is exact (`ci-queries.sql` 1) |

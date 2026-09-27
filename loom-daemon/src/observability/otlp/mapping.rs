@@ -759,6 +759,18 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                         time_unix_nano,
                     });
                 }
+                // Issue #9005: the rolling 7-day axis beside the 5h one. Same
+                // absent-not-zero rule — no source, no series.
+                if let Some(weekly) = account.usage_fraction_weekly {
+                    samples.push(MetricSample {
+                        name: "loom.tokens.usage_fraction_weekly",
+                        description: "Fraction of the rolling 7-day limit window consumed (0..1).",
+                        unit: "1",
+                        attributes: attributes.clone(),
+                        value: number_data_point::Value::AsDouble(weekly),
+                        time_unix_nano,
+                    });
+                }
                 samples.push(MetricSample {
                     name: "loom.tokens.exhausted",
                     description: "Whether the account is currently excluded from the usable pool (1 = exhausted).",
