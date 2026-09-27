@@ -179,6 +179,17 @@ impl SweepRegistry {
                 SweepKind::PrSet(_) => None,
             },
         );
+        // #9215: opt-in, default-off — hand the child's OWN Claude Code session
+        // the OTel env it needs to emit `claude_code.llm_request` /
+        // `claude_code.tool` sub-spans under the context `prepare_child` just
+        // exported as the standard `TRACEPARENT`. Must come after it: the
+        // parent context is what turns those spans into an LLM-vs-tool
+        // breakdown of this sweep instead of an orphan trace. With the opt-in
+        // off this only clears the variables it owns.
+        crate::observability::claude_code_telemetry::prepare_child(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
         // #9027: stamp the sweep's commits with the D33 provenance trailers
         // (a git-env hooksPath override that chains to the repo's own hooks).
         crate::provenance::hooks::prepare_child(
