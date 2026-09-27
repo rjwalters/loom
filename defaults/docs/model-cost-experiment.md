@@ -173,3 +173,16 @@ run harvest periodically (cron) so usage is extracted before `~/.claude/projects
 is pruned — or rely on the #3726 archive as the durable backstop. Each record
 carries a `token_fidelity` tag (`transcript` | `sweep-aggregate-log` | `none`) so
 you know exactly what a cost figure came from.
+
+**Daemon detached-child path (verified against on-disk transcripts).** The
+role-subagent transcripts of a daemon-dispatched `claude -p "/loom:sweep N"`
+child land under that child's own
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<cwd-slug>/<child-session-uuid>/subagents/agent-<id>.jsonl`
+tree — the **durable** location, not the ephemeral `/tmp/.../tasks/` scratch —
+and each carries the full per-message `usage` (input/output + cache split) and
+`model`. Confirmed present on disk for real detached-child sessions, so they are
+archivable/harvestable via the same #3726 periodic sync. What the daemon reaper
+does **not** yet know is the child's session-uuid, so it cannot trigger a precise
+single-session archive on exit — the cron periodic sync is the backstop, exactly
+as for the completion hook (see "Session Transcript Archival" in
+`sweep-execution-model.md`).
