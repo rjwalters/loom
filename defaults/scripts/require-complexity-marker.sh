@@ -101,10 +101,8 @@ esac
 # 1 missing/invalid marker) becomes this script's exit code unmodified.
 # LOOM_SCRIPT_HELPER_MISSING_RC=2 overrides the library's default missing-
 # binary code (1): a missing daemon is an environment problem here, the same
-# bucket as a body-fetch failure above, never a curation defect. No
-# `# requires-daemon:` marker is declared -- this call site is new, so no
-# floor predates it (see lib/script-helper.sh's own doc for when one is
-# needed).
+# bucket as a body-fetch failure above, never a curation defect.
+# requires-daemon: check-points-marker >= 0.19.446   #9056 -- brand-new subcommand landing in this same PR; the exact shipping version is set by the next post-merge auto-bump and cannot be known at authoring time, so this pins to the current VERSION as the best available floor (scripts/check-daemon-subcommand-versions.sh's own doc: a declared floor is not asserted as the historically-exact first release, only bounded to not exceed VERSION).
 # shellcheck source=lib/script-helper.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/script-helper.sh"
 printf '%s' "$body" | LOOM_SCRIPT_HELPER_MISSING_RC=2 loom_exec_script_helper check-points-marker --issue "$ISSUE" --repo "$REPO"
