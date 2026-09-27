@@ -883,6 +883,10 @@ struct ArmRollup {
     n_first_pass: i64,
     doctor_cycles_total: i64,
     n_merged: i64,
+    /// First observed Builder model for this arm. Only consulted for an arm id
+    /// [`ARM_MODEL`] does not name — i.e. a configured `sweep.modelExperimentArms`
+    /// arm (#9122), whose alias this reader has no config to look up.
+    observed_model: Option<String>,
 }
 
 fn round6(v: f64) -> f64 {
@@ -1012,6 +1016,9 @@ pub fn harvest(stats_file: Option<&str>, archive_dir: Option<&Path>) -> Value {
         if state.merged {
             a.n_merged += 1;
         }
+        if a.observed_model.is_none() {
+            a.observed_model = state.builder_model.clone();
+        }
     }
 
     let report_arms: Vec<Value> = arms
@@ -1020,10 +1027,19 @@ pub fn harvest(stats_file: Option<&str>, archive_dir: Option<&Path>) -> Value {
             let n = a.n_issues;
             let judged = a.n_judged;
             let total_cost = arm_cost.get(arm).copied().unwrap_or(0.0);
-            let model = ARM_MODEL
-                .iter()
-                .find(|(k, _)| k == arm)
-                .map_or(Value::Null, |(_, m)| json!(m));
+            // A built-in arm reports its logical alias (stable for reporting);
+            // a configured arm id (#9122) reports the Builder model actually
+            // observed, since this reader has no config to resolve its alias.
+            // The `"?"` bucket keeps a NULL model by design — it is the
+            // unattributed bucket, and naming one of its many models would be a
+            // claim the data does not support.
+            let model = ARM_MODEL.iter().find(|(k, _)| k == arm).map_or_else(
+                || match a.observed_model.as_deref().filter(|_| arm != "?") {
+                    Some(m) => json!(m),
+                    None => Value::Null,
+                },
+                |(_, m)| json!(m),
+            );
             let mut out = Map::new();
             out.insert("arm".into(), json!(arm));
             out.insert("model".into(), model);
@@ -1079,25 +1095,6 @@ pub fn harvest(stats_file: Option<&str>, archive_dir: Option<&Path>) -> Value {
 
 fn fmt_pct(v: Option<f64>) -> String {
     v.map_or_else(|| "-".to_string(), |x| format!("{:.0}%", x * 100.0))
-}
-
-/// Render a JSON number the way Python's `str()` does for the harvest summary
-/// lines — `None` for null, `1.0` for an integral float.
-fn fmt_py_number(v: &Value) -> String {
-    match v {
-        Value::Null => "None".to_string(),
-        Value::Number(n) => n.as_f64().map_or_else(
-            || n.to_string(),
-            |f| {
-                if f.fract().abs() < f64::EPSILON {
-                    format!("{f:.1}")
-                } else {
-                    format!("{f}")
-                }
-            },
-        ),
-        other => other.to_string(),
-    }
 }
 
 #[must_use]
@@ -1161,25 +1158,11 @@ pub fn format_harvest_text(report: &Value) -> String {
         ));
     }
 
-    // Inequality inputs the retune (#3718) consumes.
-    let find_arm = |name: &str| {
-        arms.iter()
-            .find(|a| a.get("arm").and_then(Value::as_str) == Some(name))
-    };
-    if let (Some(a), Some(b)) = (find_arm("A"), find_arm("B")) {
-        lines.push(String::new());
-        lines.push("  Inequality inputs for #3718 (cost + merge-rate floor):".to_string());
-        lines.push(format!(
-            "    opus-first  (A): mean ${} / issue, merge-rate {}",
-            fmt_py_number(&a["mean_cost_per_issue_usd"]),
-            fmt_py_number(&a["merge_rate"])
-        ));
-        lines.push(format!(
-            "    sonnet-first(B): mean ${} / issue, merge-rate {}",
-            fmt_py_number(&b["mean_cost_per_issue_usd"]),
-            fmt_py_number(&b["merge_rate"])
-        ));
-    }
+    // The per-arm comparison tail — #3718's fixed A-vs-B inequality inputs, or
+    // the generalized per-arm table for an N-arm roster (#9122). Byte-for-byte
+    // unchanged for the legacy pair; it lives in the sibling arms module so the
+    // N-arm generalization did not grow this file (file-size ratchet).
+    lines.extend(super::sweep_experiment_arms::arm_comparison_lines(arms));
     lines.join("\n")
 }
 
