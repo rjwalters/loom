@@ -181,14 +181,15 @@ pub fn fetch_resolve_latest(repo_root: &Path) -> Resolution {
         // all — otherwise it always degrades to *some* reason, so the flat
         // fallback below is a belt-and-suspenders default, not the common
         // case.
-        r.reason = crate::release_resolve::explain_no_artifact(repo_root, &r.repo_slug, &tag, &r.target)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                format!(
-                    "release {tag} has no artifact for target {} (checked for {bin_name} + {sha_name})",
-                    r.target
-                )
-            });
+        r.reason =
+            crate::release_resolve::explain_no_artifact(repo_root, &r.repo_slug, &tag, &r.target)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    format!(
+                "release {tag} has no artifact for target {} (checked for {bin_name} + {sha_name})",
+                r.target
+            )
+                });
         return r;
     }
 
