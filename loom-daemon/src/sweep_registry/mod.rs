@@ -507,6 +507,29 @@ pub struct SweepRegistry {
     /// operator fixes the forge state by hand, at which point the retried
     /// `gh issue edit` is a harmless idempotent no-op).
     pending_quarantine_release: HashSet<u32>,
+    /// Consecutive-failure tally for each entry in `pending_quarantine_release`
+    /// (Issue #8953): incremented on every failed `release_quarantine_label`
+    /// attempt, reset (entry removed) on success. Once an issue's count
+    /// reaches [`QuarantineConfig::max_release_attempts`],
+    /// [`attempt_quarantine_release`](Self::attempt_quarantine_release) stops
+    /// retrying it and logs a single `error` instead of retrying forever at
+    /// full reaper-tick cadence — the `#127` case this issue is named for. A
+    /// breaker-suppressed skip (see `test_force_rate_limited` below) does NOT
+    /// increment this counter.
+    quarantine_release_attempts: HashMap<u32, u32>,
+    /// Test-only override (Issue #8953) forcing
+    /// [`attempt_quarantine_release`](Self::attempt_quarantine_release) to
+    /// behave as though the process-global rate-limit breaker
+    /// ([`crate::rate_limit_breaker`]) is suppressing forge polling, without
+    /// touching that breaker's actual `GLOBAL` handle — a process-wide
+    /// `OnceLock` that, once registered from a test, would leak into every
+    /// other test in the same binary (see
+    /// `observability/collector/tests.rs`'s `dispatch_halt_from_breaker`
+    /// tests for the sibling `host_breaker` hazard this avoids). Always
+    /// `false` outside `#[cfg(test)]` construction paths; production code
+    /// never sets it.
+    #[cfg(test)]
+    test_force_rate_limited: bool,
     /// Whether cross-host dispatch-collision detection AND enforcement is
     /// enabled (Issue #4085, Phase 0 of #4028; upgraded from detection-only
     /// into enforcement by #5789). When `true`, [`dispatch`](Self::dispatch)
@@ -1086,6 +1109,9 @@ impl SweepRegistry {
             resume_attempt_counts: HashMap::new(),
             quarantined: HashMap::new(),
             pending_quarantine_release: HashSet::new(),
+            quarantine_release_attempts: HashMap::new(),
+            #[cfg(test)]
+            test_force_rate_limited: false,
             detect_collisions: false,
             collision_count: 0,
             peer_claim_publisher: None,

@@ -1795,24 +1795,20 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
         crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
     let gh_bin = std::path::PathBuf::from("gh");
-    let mut total_checked = 0usize;
-    let mut total_reclaimed = 0usize;
-    let mut total_pr_checked = 0usize;
-    let mut total_pr_reclaimed = 0usize;
-    let mut verdict_stats = VerdictReconcileStats::default();
     let pass_kind = if is_startup { "startup" } else { "periodic" };
-    for root in &roots {
-        let (checked, reclaimed) = forge::reconcile_workspace(&gh_bin, root, is_startup);
-        total_checked += checked;
-        total_reclaimed += reclaimed;
-        let (pr_checked, pr_reclaimed) = forge::reconcile_pr_claims(&gh_bin, root);
-        total_pr_checked += pr_checked;
-        total_pr_reclaimed += pr_reclaimed;
-        verdict_stats.merge(forge::reconcile_pr_verdicts(&gh_bin, root));
-        // #8922: AFTER the verdict pass, so a verdict it just re-queued to
-        // `loom:review-requested` is checked for base conflicts on this tick.
-        review_conflict::reconcile_review_conflicts(&gh_bin, root);
-    }
+    let pass_loop::ReconciliationPassStats {
+        total_checked,
+        total_reclaimed,
+        total_pr_checked,
+        total_pr_reclaimed,
+        verdict_stats,
+        roots_processed: _,
+    } = pass_loop::run_reconciliation_pass_over_roots(
+        &roots,
+        &gh_bin,
+        is_startup,
+        crate::rate_limit_breaker::global_is_suppressed,
+    );
     if total_reclaimed > 0 {
         log::info!(
             "claim_reconciliation: {pass_kind} pass checked {total_checked} loom:building \
@@ -1961,6 +1957,11 @@ mod auto_merge_disarm;
 /// file per the file-size ratchet, run on the same tick right after
 /// [`forge::reconcile_pr_verdicts`].
 pub mod review_conflict;
+
+/// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
+/// rate-limit-breaker re-check that stops it early — a sibling file per the
+/// file-size ratchet rather than more inline logic here.
+mod pass_loop;
 
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::work_finder::forge`] / [`crate::epic_supervisor::forge`]) — the
@@ -3425,6 +3426,23 @@ pub mod forge {
                         &e.to_string(),
                         "claim_reconciliation",
                     );
+                    // #8953: if THAT failure was the rate-limit signature that
+                    // just tripped the shared breaker, the next `VerdictKind`'s
+                    // `gh pr list` in this same loop is a doomed call against an
+                    // already-exhausted quota. Stop the remaining verdict labels
+                    // for this root rather than `continue`-ing into them — the
+                    // same "protect the rest of the current pass, not just the
+                    // next one" shape `run_reconciliation_pass_over_roots`
+                    // applies one level up, at per-root granularity.
+                    if crate::rate_limit_breaker::global_is_suppressed() {
+                        log::info!(
+                            "claim_reconciliation (verdicts): {}: stopping remaining verdict \
+                             labels for this root — shared GitHub API rate limit exhausted \
+                             (#8953)",
+                            root.display()
+                        );
+                        break;
+                    }
                     continue;
                 }
             };
