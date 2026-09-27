@@ -1548,6 +1548,12 @@ jobs:
       # suite's require-daemon-bin harness needs the binary this job downloads.
       - name: merge-pr partial-increment labels (#3667, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-partial-increment.sh
+      # Moved out of shell-suite-tests by the #8191 mergeable-recheck slice:
+      # the stale-mergeable recheck's terminal classification now delegates to
+      # `loom-daemon merge-pr mergeable-recheck`, so this suite's
+      # require-daemon-bin harness needs the binary this job downloads.
+      - name: merge-pr stale-mergeable recheck (#6104, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-stale-mergeable.sh
       # Moved out of shell-suite-tests by #8360: check-duplicate.sh's
       # similarity scan (keyword extraction, Jaccard scoring, threshold
       # banding, the #8289 near-match band, degenerate detection) now
