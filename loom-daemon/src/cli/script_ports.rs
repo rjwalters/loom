@@ -495,6 +495,16 @@ pub(crate) enum MergePrCommand {
     /// unreadable — see `cli::merge_pr_partial_reset`.
     PartialReset(super::merge_pr_partial_reset::PartialResetArgs),
 
+    /// Which route a FAILED merge's forge error text sends the retry ladder
+    /// down (#8191 slice): `merge-in-progress` (405, wait and retry),
+    /// `head-mismatch` (#5579 — never retry-and-merge), `base-modified` (sync
+    /// the head and retry) or `other` (stop). Reads the response on stdin and
+    /// always exits 0 with one `LOOM-MERGE-RESPONSE <token>` line; `other` is
+    /// an answer, not a failure. Exit 2 = stdin unreadable. The precedence
+    /// between the two SHA-shaped routes is the safety property — see
+    /// `cli::merge_pr_response`.
+    ClassifyResponse(super::merge_pr_response::ClassifyResponseArgs),
+
     /// The post-merge closed-issue `loom:building` cleanup decision (#6199):
     /// from the fresh body of an issue THIS merge closed, on stdin, either
     /// `STRIP` (the claim label is stale — remove it) or `SKIP<TAB><reason>`.
@@ -522,6 +532,7 @@ impl MergePrCommand {
             MergePrCommand::WorktreeBranchFor(args) => args.run(),
             MergePrCommand::WorktreeFindByBranch(args) => args.run(),
             MergePrCommand::PartialReset(args) => args.run(),
+            MergePrCommand::ClassifyResponse(args) => args.run(),
             MergePrCommand::ClosedBuilding(args) => args.run(),
         }
     }

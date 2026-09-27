@@ -43,6 +43,7 @@ mod merge_pr_mergeable_recheck;
 mod merge_pr_partial_reset;
 mod merge_pr_redate;
 mod merge_pr_refs;
+mod merge_pr_response;
 mod merge_pr_stacked_children;
 mod merge_pr_stale_checks;
 mod merge_pr_version_policy;

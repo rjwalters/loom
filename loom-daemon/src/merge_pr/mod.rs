@@ -132,6 +132,21 @@
 //! reads its input through the same three `jq` filters, so it reuses
 //! `partial_reset`'s [`partial_reset::IssueView`] rather than re-deriving a
 //! second model of the same endpoint.
+//!
+//! [`response`] leaves the gates and the cleanup alike for the retry ladder
+//! BETWEEN them: which route a failed merge's forge error TEXT sends the loop
+//! down. It is the smallest slice in the family and the one with the sharpest
+//! cost of being wrong, because two of its four routes are opposites over
+//! near-identical English — "Base branch was modified" is retryable, "Head
+//! branch was modified." is #5579's hard stop — and the precedence that kept
+//! them apart was previously *emergent*, two `if` blocks five lines apart in a
+//! 70-line loop, asserted only by an `awk` scan over `merge-pr.sh`'s own source
+//! text for which `grep` appeared first. Porting it makes the order a single
+//! ordered `match` in one place; that retirement, and its successor, are
+//! recorded in `test-merge-pr-head-mismatch.sh`. All five patterns were pure
+//! literals under two DIFFERENT `grep` invocations — one `-Ei`, two bare — so
+//! the asymmetric case-sensitivity is upstream behaviour the port preserves
+//! verbatim rather than an oversight it tidies.
 
 pub mod closed_building;
 pub mod dirty_guard;
@@ -143,6 +158,7 @@ pub mod mergeable_recheck;
 pub mod partial_reset;
 pub mod redate;
 pub mod refs;
+pub mod response;
 pub mod stacked_children;
 pub mod stale_checks;
 pub mod version_policy;
