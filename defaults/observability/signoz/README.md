@@ -360,9 +360,120 @@ Restart with the same rendered files and `up -d --wait --wait-timeout 1800`;
 verify an old trace, gauge and saved view before accepting restart persistence.
 For backup, stop this project and snapshot its four named volumes together:
 PostgreSQL data, Keeper coordination, ClickHouse data and histogram user scripts.
-Retain the casting, lock and rendered configuration. Test restoration into a
-separate project/network before relying on the backup. Never stop or remove
-another deployment's containers/volumes.
+Retain the casting, lock and rendered configuration — **and the private
+`--env-file`**: the snapshot replays a metastore whose database role and
+session-signing secret are already set, so a restore with a fresh secret file
+cannot read it. Never stop or remove another deployment's
+containers/volumes. Then rehearse the restore as below before relying on the
+backup.
+
+## Backup-restore rehearsal
+
+A snapshot you have never restored is a guess. Rehearse it with
+`restore-override.yaml`, which layers onto the same rendered compose and turns
+it into an isolated `loom-signoz-restore` project. **Do not improvise this with
+`docker compose -p` alone**: every volume in the render carries an explicit
+top-level `name:`, so a bare project rename produces a second stack that mounts
+the *live* volumes read-write. The overlay re-points all four volumes, every
+pinned container name, both networks and the published port; it also re-points
+the external `loom-observability` network at an egress-less bridge and scales
+the ingester to zero, so the rehearsal cannot register the
+`signoz-otel-collector` alias a second time and take a share of live OTLP
+traffic. `loom-daemon/tests/signoz_restore_contract.rs` re-derives each of
+those from the rendered compose, so a later re-render that adds a volume or a
+port cannot silently escape the overlay.
+
+Run every command below **from this directory**, like the rest of this README:
+`-f` paths are resolved against the working directory, not against the first
+compose file. The overlay replaces the published-port list with the Compose
+`!override` tag, so Compose **v2.24.4 or newer** is required here (the trial's
+baseline of Compose v2 alone is not enough); an older Compose appends instead,
+keeps the live `18081` binding and the rehearsal cannot start.
+
+Snapshot (the live project must be stopped for a consistent copy). The helper
+that tars each volume is the deployment's **own** pinned PostgreSQL image, so
+the procedure introduces no unpinned image and pulls nothing new on the trial
+host; it runs as root with `--numeric-owner` so the restored data directories
+keep the uids PostgreSQL and ClickHouse expect:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml stop
+TARBALLER=postgres:16@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6
+for v in loom-signoz-metastore-postgres-0-data loom-signoz-telemetrykeeper-0-data \
+         loom-signoz-telemetrystore-0-0-data loom-signoz-telemetrystore-user-scripts; do
+  docker run --rm --entrypoint sh -v "$v":/src:ro -v /absolute/private/signoz-backup:/bk "$TARBALLER" \
+    -c "tar -C /src --numeric-owner -czf /bk/$v.tar.gz ."
+done
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml up -d --wait --wait-timeout 1800
+```
+
+Restore into the rehearsal project — note the `loom-signoz-restore-` volume
+names, and that the source tarball keeps the *live* name so the mapping stays
+readable:
+
+```console
+docker volume create loom-signoz-restore-telemetrystore-0-0-data
+docker run --rm --entrypoint sh -v loom-signoz-restore-telemetrystore-0-0-data:/dst \
+  -v /absolute/private/signoz-backup:/bk:ro "$TARBALLER" \
+  -c 'cd /dst && tar --numeric-owner -xzf /bk/loom-signoz-telemetrystore-0-0-data.tar.gz'
+# ...repeat for the metastore, keeper and user-scripts volumes...
+
+docker compose --env-file /absolute/private/signoz.env \
+  -f pours/deployment/compose.yaml -f restore-override.yaml \
+  up -d --wait --wait-timeout 1800 loom-signoz-signoz-0
+```
+
+Naming only `loom-signoz-signoz-0` starts its dependency chain (metastore,
+keeper, ClickHouse, migrator, user-scripts) and leaves the ingester out. Use
+the **same** `--env-file` as the backup, for the reason above.
+
+Verify against the live deployment rather than by eye — run the same
+`fixture-queries.sql` on both and diff the output:
+
+```console
+docker compose --env-file /absolute/private/signoz.env \
+  -f pours/deployment/compose.yaml -f restore-override.yaml exec -T \
+  loom-signoz-telemetrystore-clickhouse-0-0 \
+  clickhouse-client --multiquery --param_run='loom-synthetic-<run-id>' < fixture-queries.sql
+```
+
+`exec` addresses a **service**, and the overlay renames containers rather than
+services — so this is the same service name the live commands above use, and the
+`-f restore-override.yaml` argument is the only thing that decides which of the
+two projects it lands in. Never drop it from a rehearsal command: without it the
+identical line reads the **live** ClickHouse.
+
+Signal rows, the trace graph and the effective TTL DDL must match exactly.
+Expect the raw per-table inventory to differ for `signoz_metrics`: SigNoz's own
+self-monitoring metrics keep accruing, so a copy taken later than the baseline
+read legitimately holds more of them. Confirm that is what you are seeing by
+re-reading the **live** side now — it should have caught up to the restored
+count — rather than accepting the delta. Also check the restored app on its own
+port (`127.0.0.1:18091`), log in with the same credential, and confirm a
+dashboard you created before the snapshot is listed.
+
+Tear down with the project's own arguments, and **dry-run it first** so you can
+read the object list before anything is removed:
+
+```console
+docker compose --env-file /absolute/private/signoz.env \
+  -f pours/deployment/compose.yaml -f restore-override.yaml down --volumes --dry-run
+```
+
+Every line must name a `loom-signoz-restore-` object. If any live volume,
+container or network appears, stop: the overlay is out of step with the render.
+Re-run without `--dry-run` to finish, then `docker volume ls --filter
+name=loom-signoz-restore-` to confirm nothing survived — `down --volumes` removes
+only volumes the project declares, so a volume you created by hand for a
+tarball it turned out not to need is left behind.
+
+**Status of this procedure: the overlay renders and is contract-tested, but the
+rehearsal has not been executed against real backup tarballs yet** — see
+"Backup-restore rehearsal overlay" in `evidence.md` for exactly what was and was
+not verified. [#9279](https://github.com/rjwalters/loom/issues/9279) owns the
+live run; until it lands, treat this backup as untested.
+
+## Upgrade, wipe and Cloud
 
 Upgrade by changing explicit pins, rendering, inspecting the diff and testing
 schema migration/restore against a copy of trial data. Database migrations may
