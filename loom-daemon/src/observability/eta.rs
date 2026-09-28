@@ -1,0 +1,625 @@
+//! ETA wiring (#9289): feeds the [`crate::eta::tracker::Tracker`] from the
+//! event bus and the forge, writes the stage-sample journal, and emits
+//! `eta.estimate` / `eta.outcome`.
+//!
+//! Two triggers, per the operator decisions on #9289:
+//!
+//! - **Bus** ([`spawn_task`]): sweep dispatch, phase and terminal events.
+//!   Each transition is journaled the moment it is seen and the item is
+//!   re-estimated immediately.
+//! - **Pass** ([`record`], on the collector's 5-minute snapshot cadence):
+//!   each managed repo's review-label listings (the ETag-cached REST
+//!   listing, where an unchanged listing is a free `304`), at most
+//!   [`PR_READ_BUDGET`] `pulls/{n}` reads for PRs that left review, history
+//!   reloaded, and every live item re-estimated. An unchanged estimate is
+//!   refreshed every `refreshSecs`.
+//!
+//! Enabled by default (`autonomous.eta.enabled`). The records are OTLP-only
+//! and go through the OTLP exporters' queues registered by
+//! [`super::spawn_task`]. Without an OTLP exporter the tracker still runs and
+//! journals, and emits nothing. With `LOOM_ETA_DRY_RUN=1` every would-be
+//! record is logged at `info` and none is enqueued.
+//!
+//! Every record's trace context is the issue's D32 story
+//! (`story_context(repo_id, issue)`), so estimates and outcomes land in the
+//! issue's story trace. A repo with no resolvable GitHub `repo_id` gets no
+//! trace context; one is never derived from the name.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use crate::event_bus::RecvError;
+use chrono::{DateTime, Utc};
+
+use super::queue::{DurableQueue, FanoutQueue, QueueSink};
+use crate::eta::config::EtaConfig;
+use crate::eta::journal::{self, JournalEntry};
+use crate::eta::score::EstimateSummary;
+use crate::eta::tracker::{
+    Effects, Emission, EstimateContext, ItemKey, PrState, PrView, Resolved, Tracker,
+};
+use crate::eta::{Provenance, Registry, StageSamples};
+use crate::event_bus::EventBus;
+use crate::forge_listing::RestIssue;
+use crate::telemetry::kinds::eta::{EtaEstimateRecord, EtaOutcomeRecord};
+use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
+use crate::types::{Event, SweepKind};
+use crate::workspace_pool::WorkspacePool;
+
+/// `pulls/{n}` reads allowed per pass, across all repos.
+pub const PR_READ_BUDGET: usize = 8;
+
+/// The review labels whose listings drive post-sweep stages.
+pub const REVIEW_LABELS: [&str; 3] = [
+    crate::eta::labels::REVIEW_REQUESTED,
+    crate::eta::labels::CHANGES_REQUESTED,
+    crate::eta::labels::APPROVED,
+];
+
+const GH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Where pending estimates persist across restarts.
+#[must_use]
+pub fn pending_path(workspace_root: &Path) -> PathBuf {
+    workspace_root
+        .join(".loom")
+        .join("state")
+        .join("eta")
+        .join("pending.jsonl")
+}
+
+/// The OTLP queues ETA records are offered to.
+static SINK: OnceLock<(Arc<dyn QueueSink>, String)> = OnceLock::new();
+
+/// Register the OTLP queues (called once from [`super::spawn_task`]). No
+/// OTLP exporter ⇒ nothing registered ⇒ records are computed, journaled and
+/// logged, never enqueued.
+pub fn register_sink(otlp_queues: Vec<Arc<DurableQueue>>, host_id: &str) {
+    if otlp_queues.is_empty() {
+        return;
+    }
+    let queue: Arc<dyn QueueSink> = Arc::new(FanoutQueue::new(otlp_queues));
+    let _ = SINK.set((queue, host_id.to_string()));
+}
+
+struct State {
+    tracker: Tracker,
+    config: EtaConfig,
+    registry: Registry,
+    history: StageSamples,
+    repo_ids: BTreeMap<String, u64>,
+    workspace_root: PathBuf,
+    host_id: String,
+}
+
+static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+fn lock() -> std::sync::MutexGuard<'static, Option<State>> {
+    STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What one delivery produced, for the pass log line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Delivered {
+    /// Estimates with a result.
+    pub emitted: usize,
+    /// Estimates that were refusals.
+    pub refused: usize,
+    /// Outcomes.
+    pub outcomes: usize,
+    /// Records dropped for invalid provenance.
+    pub invalid: usize,
+}
+
+/// The envelope for `record`, in the issue's story trace when `repo_id` is
+/// known.
+fn envelope(
+    host_id: &str,
+    record: TelemetryRecord,
+    repo_id: Option<u64>,
+    issue: u32,
+) -> TelemetryEnvelope {
+    let mut envelope = TelemetryEnvelope::new(host_id, record);
+    envelope.trace_context =
+        repo_id.and_then(|id| crate::telemetry::trace::story_context(id, issue).ok());
+    envelope
+}
+
+fn describe_estimate(e: &crate::eta::Explanation) -> String {
+    match (e.quantiles(), e.no_estimate_reason) {
+        (Some((p25, p50, p75)), _) => format!("p50={p50}s p25={p25}s p75={p75}s"),
+        (None, Some(reason)) => format!("no_estimate reason={reason}"),
+        (None, None) => "no_estimate".to_string(),
+    }
+}
+
+/// Turn emissions and outcomes into records and offer them to `sink`
+/// (`None`: no OTLP exporter). Dry run logs each would-be record and offers
+/// none. A record whose provenance does not validate is never offered.
+pub fn deliver(
+    emissions: Vec<Emission>,
+    outcomes: Vec<Resolved>,
+    loom: &Provenance,
+    host_id: &str,
+    dry_run: bool,
+    sink: Option<&dyn QueueSink>,
+) -> Delivered {
+    let mut delivered = Delivered::default();
+    for emission in emissions {
+        let e = &emission.explanation;
+        let line = format!(
+            "eta.estimate kind={} heuristic={} repo={} issue={} {}",
+            e.kind,
+            e.heuristic,
+            e.subject.repo,
+            e.subject.issue,
+            describe_estimate(e)
+        );
+        let (repo_id, issue) = (e.subject.repo_id, e.subject.issue);
+        let refused = e.result.is_none();
+        let record = EtaEstimateRecord {
+            trigger: emission.trigger,
+            explanation: Box::new(emission.explanation),
+        };
+        if !record.has_provenance() {
+            log::warn!("eta: dropped {line}: invalid provenance");
+            delivered.invalid += 1;
+            continue;
+        }
+        if refused {
+            delivered.refused += 1;
+        } else {
+            delivered.emitted += 1;
+        }
+        if dry_run {
+            log::info!("eta: would emit {line}");
+        } else if let Some(sink) = sink {
+            log::debug!("eta: emit {line}");
+            sink.offer(envelope(host_id, TelemetryRecord::EtaEstimate(record), repo_id, issue));
+        }
+    }
+    for resolved in outcomes {
+        let line = format!(
+            "eta.outcome kind={} heuristic={} repo={} issue={} outcome={:?} error_sec={:?}",
+            resolved.estimate.kind,
+            resolved.estimate.heuristic,
+            resolved.estimate.repo,
+            resolved.estimate.issue,
+            resolved.score.outcome,
+            resolved.score.error_sec
+        );
+        let (repo_id, issue) = (resolved.estimate.repo_id, resolved.estimate.issue);
+        let record = EtaOutcomeRecord {
+            estimate: resolved.estimate,
+            loom: loom.clone(),
+            score: resolved.score,
+            outcome_source: resolved.outcome_source,
+            outcome_resolution_sec: resolved.outcome_resolution_sec,
+            result: resolved.result,
+        };
+        if !record.has_provenance() {
+            log::warn!("eta: dropped {line}: invalid provenance");
+            delivered.invalid += 1;
+            continue;
+        }
+        delivered.outcomes += 1;
+        if dry_run {
+            log::info!("eta: would emit {line}");
+        } else if let Some(sink) = sink {
+            log::debug!("eta: emit {line}");
+            sink.offer(envelope(host_id, TelemetryRecord::EtaOutcome(record), repo_id, issue));
+        }
+    }
+    delivered
+}
+
+fn append_journal(workspace_root: &Path, rows: &[JournalEntry]) {
+    if let Err(error) = journal::append(&journal::journal_path(workspace_root), rows) {
+        log::warn!("eta: stage journal append failed: {error}");
+    }
+}
+
+fn read_pending(path: &Path) -> Vec<EstimateSummary> {
+    std::fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn write_pending(path: &Path, pending: &[EstimateSummary]) {
+    let mut text = String::new();
+    for estimate in pending {
+        if let Ok(line) = serde_json::to_string(estimate) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    let result = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            let tmp = path.with_extension("jsonl.tmp");
+            std::fs::write(&tmp, text)?;
+            std::fs::rename(&tmp, path)
+        });
+    if let Err(error) = result {
+        log::warn!("eta: persisting pending estimates failed: {error}");
+    }
+}
+
+/// Estimate `keys` (all when `None`) under the lock, returning the
+/// emissions plus what delivery needs.
+fn estimate_locked(
+    state: &mut State,
+    keys: Option<&[ItemKey]>,
+    now: DateTime<Utc>,
+) -> Vec<Emission> {
+    let ctx = EstimateContext {
+        registry: &state.registry,
+        current_finish: state.config.current_finish.as_deref(),
+        current_land: state.config.current_land.as_deref(),
+        history: &state.history,
+        refresh_secs: state.config.refresh_secs,
+        host_id: Some(state.host_id.as_str()),
+        repo_ids: &state.repo_ids,
+    };
+    state.tracker.estimate(keys, &ctx, now)
+}
+
+fn sink() -> Option<&'static dyn QueueSink> {
+    SINK.get().map(|(queue, _)| queue.as_ref())
+}
+
+/// Journal, estimate and deliver the aftermath of one bus event.
+fn apply_event(effects: Effects, now: DateTime<Utc>) {
+    let (rows, emissions, outcomes, dry_run, root, host_id) = {
+        let mut guard = lock();
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        let mut dirty = effects.dirty.clone();
+        dirty.sort();
+        dirty.dedup();
+        let emissions = estimate_locked(state, Some(&dirty), now);
+        (
+            effects.journal,
+            emissions,
+            effects.outcomes,
+            state.config.dry_run,
+            state.workspace_root.clone(),
+            state.host_id.clone(),
+        )
+    };
+    append_journal(&root, &rows);
+    let loom = Provenance::current();
+    deliver(emissions, outcomes, &loom, &host_id, dry_run, sink());
+}
+
+/// The workspace root → slug, resolving and caching on first sight.
+async fn slug_for(cache: &mut HashMap<String, String>, root: &str) -> Option<String> {
+    super::collector::resolve_repo_slug_cached(cache, root).await
+}
+
+/// Start the tracker and its bus subscriber. `None` when ETA is disabled.
+pub fn spawn_task(
+    bus: &EventBus,
+    workspace_root: PathBuf,
+    host_id: String,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let config = crate::eta::config::read(&workspace_root);
+    if !config.enabled {
+        log::info!("eta: disabled (autonomous.eta.enabled=false)");
+        return None;
+    }
+    let loom = Provenance::current();
+    if !loom.complete {
+        // Once per process: records still go out, marked incomplete, and the
+        // accuracy queries leave them out.
+        log::warn!(
+            "eta: this build's provenance is incomplete (revision={}, tree_state={}); \
+             ETA records are emitted with complete=false and excluded from accuracy queries",
+            loom.revision,
+            loom.tree_state
+        );
+    }
+    let mut tracker = Tracker::new(loom);
+    tracker.restore_pending(read_pending(&pending_path(&workspace_root)));
+    log::info!(
+        "eta: enabled (dry_run={}, refresh={}s, {} pending restored)",
+        config.dry_run,
+        config.refresh_secs,
+        tracker.pending().len()
+    );
+    *lock() = Some(State {
+        tracker,
+        config,
+        registry: Registry::builtin(),
+        history: StageSamples::default(),
+        repo_ids: BTreeMap::new(),
+        workspace_root: workspace_root.clone(),
+        host_id,
+    });
+    let default_root = workspace_root.to_string_lossy().to_string();
+    let mut subscription = bus.subscribe(["sweep.global.dispatch", "sweep.issue"]);
+    Some(tokio::spawn(async move {
+        let mut slugs: HashMap<String, String> = HashMap::new();
+        loop {
+            let event = match subscription.recv().await {
+                Ok(event) => event,
+                Err(RecvError::Closed) => break,
+                // A lagged receiver lost events; the next pass's listings
+                // re-anchor post-sweep stages.
+                Err(_) => continue,
+            };
+            let now = Utc::now();
+            let root = match &event {
+                Event::SweepGlobalDispatch { repo, .. }
+                | Event::SweepPhase { repo, .. }
+                | Event::SweepExited { repo, .. }
+                | Event::SweepCrashed { repo, .. } => {
+                    repo.clone().unwrap_or_else(|| default_root.clone())
+                }
+                _ => continue,
+            };
+            let Some(slug) = slug_for(&mut slugs, &root).await else {
+                continue;
+            };
+            let effects = {
+                let mut guard = lock();
+                let Some(state) = guard.as_mut() else {
+                    break;
+                };
+                match &event {
+                    Event::SweepGlobalDispatch {
+                        sweep_id,
+                        kind: SweepKind::Issue(issue),
+                        ..
+                    } => state.tracker.on_dispatch(&slug, *issue, sweep_id, now),
+                    Event::SweepPhase {
+                        issue,
+                        phase,
+                        pr_number,
+                        ..
+                    } => state.tracker.on_phase(
+                        &slug,
+                        *issue,
+                        phase,
+                        pr_number.and_then(|n| u32::try_from(n).ok()),
+                        now,
+                    ),
+                    Event::SweepExited {
+                        issue, exit_code, ..
+                    } => state
+                        .tracker
+                        .on_terminal(&slug, *issue, "exited", *exit_code, now),
+                    Event::SweepCrashed { issue, .. } => state
+                        .tracker
+                        .on_terminal(&slug, *issue, "crashed", None, now),
+                    _ => continue,
+                }
+            };
+            apply_event(effects, now);
+        }
+    }))
+}
+
+fn parse_time(raw: Option<&str>) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw?)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// The PR rows of a repo's review listings, each keyed to the issue it
+/// closes. A PR that closes no issue is not tracked.
+#[must_use]
+pub fn pr_views(listings: &[Vec<RestIssue>]) -> Vec<PrView> {
+    let mut seen = BTreeSet::new();
+    let mut views = Vec::new();
+    for item in listings.iter().flatten() {
+        if !item.is_pull_request || !seen.insert(item.number) {
+            continue;
+        }
+        let Some(issue) =
+            super::ops::stage_dwell::closing_refs(item.body.as_deref().unwrap_or_default())
+                .first()
+                .copied()
+        else {
+            continue;
+        };
+        views.push(PrView {
+            number: item.number,
+            issue,
+            labels: item.labels.clone(),
+            created_at: parse_time(item.created_at.as_deref()),
+            updated_at: parse_time(item.updated_at.as_deref()),
+        });
+    }
+    views
+}
+
+fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
+    let mut cmd = Command::new("gh");
+    cmd.arg("api").arg(path).current_dir(root);
+    crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, Some(root));
+    let output = crate::sweep_registry::output_with_timeout(cmd, GH_TIMEOUT).ok()??;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+/// How PR `number` ended, from one `pulls/{n}` read. `None` when the read
+/// failed.
+fn read_pr_state(root: &Path, slug: &str, number: u32) -> Option<PrState> {
+    let pull = gh_json(root, &format!("repos/{slug}/pulls/{number}"))?;
+    if let Some(at) = parse_time(pull["merged_at"].as_str()) {
+        return Some(PrState::Merged(at));
+    }
+    Some(if pull["state"] == "closed" {
+        PrState::Closed
+    } else {
+        PrState::Open
+    })
+}
+
+/// This host's history: the `sweep.outcome` journal of every managed root
+/// plus the ETA stage journal. Host-local (`explanation.history.scope =
+/// "local"`); see `eta::history` for why that is a limitation.
+fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> StageSamples {
+    // TODO(#9343): replace with a fleet-wide snapshot (forge / D32 story data
+    // plus the fleet's `sweep.outcome` records in SigNoz), fetched here, never
+    // inside the estimator, and filtered to before `as_of` like this one.
+    let mut history = StageSamples::default();
+    let mut seen = BTreeSet::new();
+    for root in roots {
+        let path = crate::sweep_outcomes::default_outcome_telemetry_path(root);
+        if seen.insert(path.clone()) {
+            let samples = StageSamples::load_outcome_journal(&path);
+            history.stages.extend(samples.stages);
+            history.verdicts.extend(samples.verdicts);
+            history.paths.extend(samples.paths);
+        }
+    }
+    history.push_journal(&journal::read(&journal::journal_path(journal_root)), host_id);
+    history
+}
+
+/// One ETA pass: list, resolve, reload history, estimate, deliver. A no-op
+/// when ETA is disabled.
+pub(super) async fn record(
+    workspace_root: &Path,
+    workspace_pool: &WorkspacePool,
+    slug_cache: &mut HashMap<String, String>,
+) {
+    let resolution_sec = super::SNAPSHOT_INTERVAL.as_secs() as i64;
+    if lock().is_none() {
+        return;
+    }
+    let mut roots = super::collector::provisioned_roots(workspace_pool);
+    if !roots.iter().any(|r| r == workspace_root) {
+        roots.push(workspace_root.to_path_buf());
+    }
+    let mut repos: Vec<(PathBuf, String, Vec<PrView>)> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for root in &roots {
+        let Some(slug) =
+            super::collector::resolve_repo_slug_cached(slug_cache, &root.to_string_lossy()).await
+        else {
+            continue;
+        };
+        if !seen.insert(slug.to_ascii_lowercase()) {
+            continue;
+        }
+        let mut listings = Vec::new();
+        for label in REVIEW_LABELS {
+            match super::queue_blocked::list_open(root.clone(), label).await {
+                Some(listing) => listings.push(listing),
+                None => break,
+            }
+        }
+        // A partial listing would read as PRs leaving review; skip the repo.
+        if listings.len() == REVIEW_LABELS.len() {
+            repos.push((root.clone(), slug, pr_views(&listings)));
+        }
+    }
+
+    let slugs: Vec<String> = repos.iter().map(|(_, slug, _)| slug.clone()).collect();
+    let journal_root = workspace_root.to_path_buf();
+    let history_roots = roots.clone();
+    let host = lock()
+        .as_ref()
+        .map(|state| state.host_id.clone())
+        .unwrap_or_default();
+    let (history, repo_ids) = tokio::task::spawn_blocking(move || {
+        let ids: BTreeMap<String, u64> = slugs
+            .iter()
+            .filter_map(|slug| {
+                crate::telemetry::repo_identity::resolve(slug)
+                    .map(|id| (slug.to_ascii_lowercase(), id.id))
+            })
+            .collect();
+        (load_history(&history_roots, &journal_root, &host), ids)
+    })
+    .await
+    .unwrap_or_default();
+
+    let now = Utc::now();
+    let mut effects = Vec::new();
+    let mut checks = Vec::new();
+    {
+        let mut guard = lock();
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        state.history = history;
+        state.repo_ids.extend(repo_ids);
+        for (root, slug, prs) in &repos {
+            let e = state.tracker.on_listing(slug, prs, now, resolution_sec);
+            for (key, pr) in &e.pr_checks {
+                if checks.len() < PR_READ_BUDGET {
+                    checks.push((root.clone(), slug.clone(), key.clone(), *pr));
+                }
+            }
+            effects.push(e);
+        }
+    }
+
+    let reads = tokio::task::spawn_blocking(move || {
+        checks
+            .into_iter()
+            .filter_map(|(root, slug, key, pr)| {
+                read_pr_state(&root, &slug, pr).map(|state| (key, state))
+            })
+            .collect::<Vec<(ItemKey, PrState)>>()
+    })
+    .await
+    .unwrap_or_default();
+
+    let (rows, emissions, outcomes, dry_run, host_id, expired, pending) = {
+        let mut guard = lock();
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        for (key, pr_state) in reads {
+            effects.push(state.tracker.on_pr_resolved(&key, pr_state, now));
+        }
+        let expired = state.tracker.expire(now);
+        let all = crate::eta::tracker::merged(effects);
+        let emissions = estimate_locked(state, None, now);
+        (
+            all.journal,
+            emissions,
+            all.outcomes,
+            state.config.dry_run,
+            state.host_id.clone(),
+            expired,
+            state.tracker.pending().to_vec(),
+        )
+    };
+    append_journal(workspace_root, &rows);
+    let delivered = deliver(emissions, outcomes, &Provenance::current(), &host_id, dry_run, sink());
+    write_pending(&pending_path(workspace_root), &pending);
+    log::info!(
+        "eta: pass emitted={} refused={} outcomes={} journaled={} pending={} expired={} invalid={}",
+        delivered.emitted,
+        delivered.refused,
+        delivered.outcomes,
+        rows.len(),
+        pending.len(),
+        expired,
+        delivered.invalid
+    );
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "eta_tests.rs"]
+mod tests;

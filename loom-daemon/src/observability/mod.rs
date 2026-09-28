@@ -105,6 +105,7 @@ pub mod claude_code_telemetry;
 pub mod collector;
 pub mod daemon_event;
 pub mod endpoint_policy;
+pub mod eta;
 pub mod exporter;
 pub mod lifecycle;
 pub mod ops;
@@ -1112,6 +1113,10 @@ pub fn spawn_task(
     // both kinds are OTLP-only, so an HTTPS queue would just carry and drop
     // them. No OTLP exporter ⇒ nothing registered ⇒ every emit is a no-op.
     let mut ops_handles = Vec::new();
+    // ETA (#9289): `eta.estimate` / `eta.outcome` are OTLP-only too; the
+    // tracker and its bus subscriber run (and journal) even without them.
+    eta::register_sink(otlp_queues.clone(), &host_id);
+    ops_handles.extend(eta::spawn_task(bus, workspace_root.clone(), host_id.clone()));
     if let Some(sink) = ops::sink_for_otlp_queues(otlp_queues, &host_id) {
         ops::register_global_ops_sink(sink);
         // Slot turnaround (#8929): a bus subscriber, OTLP-only like the sink.

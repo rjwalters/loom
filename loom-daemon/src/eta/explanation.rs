@@ -25,6 +25,11 @@ pub const TRUNCATED_FEATURES: &str = "features";
 /// `truncated[]` entry when the stage grids were dropped.
 pub const TRUNCATED_GRIDS: &str = "stages.distribution.grid";
 
+/// `truncated[]` entry when every remaining list was dropped (stages,
+/// branches, contributions, history detail) — the last resort that
+/// guarantees the cap.
+pub const TRUNCATED_DETAIL: &str = "detail";
+
 /// One estimate, explained.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Explanation {
@@ -46,6 +51,9 @@ pub struct Explanation {
     pub current_stage: Option<CurrentStageRecord>,
     /// The history the distributions came from.
     pub history_window: Option<HistoryWindow>,
+    /// Whose history it was, and how many samples each source and host
+    /// contributed (#9343: `local` until fleet history exists).
+    pub history: Option<HistoryRecord>,
     /// The path the simulation walks.
     pub path: Option<PathRecord>,
     /// One entry per stage on the path, in path order.
@@ -92,6 +100,30 @@ pub struct HistoryWindow {
     pub to: DateTime<Utc>,
     /// Which journals samples may come from.
     pub sources: Vec<String>,
+}
+
+/// Whose history an estimate read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryScope {
+    /// This host's own journals only (every v1 estimate).
+    #[default]
+    Local,
+    /// A fleet-wide snapshot. Reserved for #9343; never produced yet.
+    Fleet,
+}
+
+/// The history an estimate read, and where its samples came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryRecord {
+    /// `local` (this host's journals) or, later, `fleet`.
+    pub scope: HistoryScope,
+    /// Journals the distributions may read.
+    pub sources: Vec<String>,
+    /// Stage samples used by the path's distributions, per journal.
+    pub samples_by_source: std::collections::BTreeMap<String, usize>,
+    /// Stage samples used by the path's distributions, per recording host.
+    pub samples_by_host: std::collections::BTreeMap<String, usize>,
 }
 
 /// The simulated path's shape.
@@ -401,8 +433,9 @@ impl Explanation {
             .unwrap_or(usize::MAX)
     }
 
-    /// Enforce [`MAX_BYTES`]: drop `features`, then the stage grids, until
-    /// the record fits, recording each drop in `truncated`.
+    /// Enforce [`MAX_BYTES`]: drop `features`, then the stage grids, then
+    /// every remaining list, stopping as soon as the record fits, and
+    /// recording each drop in `truncated`.
     pub fn enforce_cap(&mut self) {
         if self.size_bytes() <= MAX_BYTES {
             return;
@@ -418,5 +451,22 @@ impl Explanation {
             entry.distribution.grid_sec.clear();
         }
         self.truncated.push(TRUNCATED_GRIDS.to_string());
+        if self.size_bytes() <= MAX_BYTES {
+            return;
+        }
+        // Last resort: keep the identity, provenance, subject and result;
+        // drop every list. Nothing unbounded is left after this.
+        self.stages.clear();
+        self.branches = None;
+        self.contributions = None;
+        if let Some(window) = &mut self.history_window {
+            window.sources.clear();
+        }
+        if let Some(history) = &mut self.history {
+            history.sources.clear();
+            history.samples_by_source.clear();
+            history.samples_by_host.clear();
+        }
+        self.truncated.push(TRUNCATED_DETAIL.to_string());
     }
 }

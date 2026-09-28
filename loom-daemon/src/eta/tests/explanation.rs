@@ -2,7 +2,7 @@
 
 use super::{history_a, input_at, EXPLANATION_GOLDEN};
 use crate::eta::explanation::{
-    Explanation, MAX_BYTES, TARGET_BYTES, TRUNCATED_FEATURES, TRUNCATED_GRIDS,
+    Explanation, MAX_BYTES, TARGET_BYTES, TRUNCATED_DETAIL, TRUNCATED_FEATURES, TRUNCATED_GRIDS,
 };
 use crate::eta::heuristics::LandV1;
 use crate::eta::simulate::run_explanation;
@@ -112,7 +112,7 @@ fn explanation_size_within_cap() {
 #[test]
 fn explanation_without_provenance_does_not_parse() {
     let golden: serde_json::Value = serde_json::from_str(EXPLANATION_GOLDEN).unwrap();
-    for field in ["version", "revision", "tree_state"] {
+    for field in ["version", "revision", "tree_state", "complete"] {
         let mut value = golden.clone();
         value["loom"].as_object_mut().unwrap().remove(field);
         assert!(
@@ -142,4 +142,29 @@ fn every_null_feature_has_a_reason() {
         crate::eta::explanation::Features::NAMES.len(),
         "NAMES lists every feature"
     );
+}
+
+#[test]
+fn explanation_cap_holds_even_when_grids_are_not_enough() {
+    let mut huge = golden_explanation();
+    huge.history_window
+        .as_mut()
+        .unwrap()
+        .sources
+        .push("x".repeat(MAX_BYTES + 2048));
+    huge.enforce_cap();
+    assert!(huge.size_bytes() <= MAX_BYTES, "{} bytes", huge.size_bytes());
+    assert_eq!(
+        huge.truncated,
+        vec![
+            TRUNCATED_FEATURES.to_string(),
+            TRUNCATED_GRIDS.to_string(),
+            TRUNCATED_DETAIL.to_string()
+        ]
+    );
+    // Identity, provenance and the numbers survive the last resort.
+    let golden = golden_explanation();
+    assert_eq!(huge.estimate_id, golden.estimate_id);
+    assert_eq!(huge.loom, golden.loom);
+    assert_eq!(huge.quantiles(), golden.quantiles());
 }

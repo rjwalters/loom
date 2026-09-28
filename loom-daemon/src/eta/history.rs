@@ -1,14 +1,43 @@
 //! Stage-duration history: every observed stage duration, Judge verdict and
-//! sweep path, each stamped with the instant it was observed.
+//! sweep path, each stamped with the instant it was observed and the host
+//! that recorded it.
 //!
-//! Sources in this slice: the `sweep.outcome` telemetry journal
-//! (`.loom/logs/sweep-outcome-telemetry.jsonl` and its `.1` rotation). Each
-//! record contributes its per-phase durations, its Judge verdicts, and
-//! whether it merged in-sweep, all observed at the envelope's `emitted_at`.
+//! Sources: the `sweep.outcome` telemetry journal
+//! (`.loom/logs/sweep-outcome-telemetry.jsonl` and its `.1` rotation), whose
+//! records contribute per-phase durations, Judge verdicts and whether the
+//! sweep merged in-sweep, all observed at the envelope's `emitted_at`; and
+//! the ETA tracker's own stage-sample journal (`eta::journal`), which adds
+//! the post-sweep stages and external verdicts.
 //!
 //! [`StageSamples::select`] is the only read the estimators make, and it
 //! refuses every sample observed at or after `as_of`, so an estimate never
 //! sees its own future.
+//!
+//! # Limitation: history is host-local (#9343)
+//!
+//! Every v1 estimate reads only **this host's** journals
+//! (`explanation.history.scope = "local"`). Consequences:
+//!
+//! - **Empty** on most hosts. A host that has not run sweeps for a repo (an
+//!   operator's laptop, a freshly added worker) has no samples for it, and
+//!   every estimate there is `insufficient_samples`.
+//! - **Biased** where history exists. A host sees only the sweeps it ran and
+//!   the review transitions it happened to observe, so its distributions
+//!   describe its own slots, models and hours, not the repo's.
+//! - **Inconsistent** across hosts. Two hosts estimating the same issue at
+//!   the same instant read different histories and disagree.
+//! - The **human-gated stages** (review waits, approvals, merges by a person)
+//!   happen on the forge, not on any host. A host learns about them only by
+//!   watching listings; the forge's own record (label events, the D32 story
+//!   spans) is where that history actually lives.
+//!
+//! The intended direction (#9343) is a **fleet-wide history snapshot**: built
+//! from forge / D32 story data plus the fleet's `sweep.outcome` records in
+//! SigNoz, fetched **outside** the estimator, and handed to it as a
+//! [`StageSamples`] value exactly like the local one (`scope = "fleet"`).
+//! The estimator stays a pure function of `(history snapshot, input)`, and a
+//! snapshot built only from data observed before `t` keeps a backtest
+//! leak-free. Nothing in this module fetches anything.
 
 use super::{Stage, MAX_SAMPLES, MIN_SAMPLES, WINDOW_DAYS};
 use crate::telemetry::{SweepOutcomeRecord, SweepResult, TelemetryEnvelope, TelemetryRecord};
@@ -50,6 +79,9 @@ pub struct StageSample {
     pub observed_at: DateTime<Utc>,
     /// Where it came from.
     pub source: SampleSource,
+    /// The host that recorded it (the envelope's `host_id`, or the local
+    /// host for its own stage journal).
+    pub host: String,
 }
 
 /// One Judge verdict.
@@ -85,6 +117,9 @@ pub struct StageSamples {
     pub verdicts: Vec<VerdictSample>,
     /// Successful sweep paths.
     pub paths: Vec<SweepPathSample>,
+    /// Whose history this is: `Local` for every snapshot built today
+    /// (#9343).
+    pub scope: super::explanation::HistoryScope,
 }
 
 /// Which level a selection was made at.
@@ -114,6 +149,10 @@ pub struct Selection {
     pub level: Level,
     /// Durations, ascending.
     pub sorted: Vec<i64>,
+    /// How many of them each journal contributed.
+    pub by_source: std::collections::BTreeMap<String, usize>,
+    /// How many of them each recording host contributed.
+    pub by_host: std::collections::BTreeMap<String, usize>,
 }
 
 /// The oldest instant a sample may be observed at for an estimate at `as_of`.
@@ -139,7 +178,12 @@ impl StageSamples {
     /// entry spans the whole sweep is the journal's fallback when no phase
     /// was ever sampled; its label is the latest phase but its duration is
     /// the whole sweep, so it is skipped.
-    pub fn push_outcome(&mut self, record: &SweepOutcomeRecord, observed_at: DateTime<Utc>) {
+    pub fn push_outcome(
+        &mut self,
+        record: &SweepOutcomeRecord,
+        observed_at: DateTime<Utc>,
+        host: &str,
+    ) {
         let fallback = record.phase_durations.len() == 1
             && record.phase_durations[0].duration_sec == record.total_duration_sec
             && record.total_duration_sec > 0;
@@ -153,6 +197,7 @@ impl StageSamples {
                             duration_sec: phase.duration_sec,
                             observed_at,
                             source: SampleSource::SweepOutcome,
+                            host: host.to_string(),
                         });
                     }
                 }
@@ -187,12 +232,14 @@ impl StageSamples {
     ) {
         for envelope in envelopes {
             if let TelemetryRecord::SweepOutcome(record) = &envelope.record {
-                self.push_outcome(record, envelope.emitted_at);
+                self.push_outcome(record, envelope.emitted_at, &envelope.host_id);
             }
         }
     }
 
     /// Load the `sweep.outcome` journal at `path` and its `.1` rotation.
+    ///
+    /// Host-local by construction: this reads one host's file (#9343).
     #[must_use]
     pub fn load_outcome_journal(path: &Path) -> Self {
         let mut samples = StageSamples::default();
@@ -257,7 +304,20 @@ impl StageSamples {
             picked.truncate(MAX_SAMPLES);
             let mut sorted: Vec<i64> = picked.iter().map(|s| s.duration_sec).collect();
             sorted.sort_unstable();
-            return Some(Selection { level, sorted });
+            let mut by_source = std::collections::BTreeMap::new();
+            let mut by_host = std::collections::BTreeMap::new();
+            for sample in &picked {
+                *by_source
+                    .entry(sample.source.journal().to_string())
+                    .or_insert(0) += 1;
+                *by_host.entry(sample.host.clone()).or_insert(0) += 1;
+            }
+            return Some(Selection {
+                level,
+                sorted,
+                by_source,
+                by_host,
+            });
         }
         None
     }

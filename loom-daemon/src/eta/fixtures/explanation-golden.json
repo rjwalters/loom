@@ -6,7 +6,8 @@
   "loom": {
     "version": "0.19.475",
     "revision": "bf2fb67c3a1d4e5f60718293a4b5c6d7e8f90123",
-    "tree_state": "clean"
+    "tree_state": "clean",
+    "complete": true
   },
   "as_of": "2026-09-20T12:00:00Z",
   "subject": {
@@ -31,6 +32,19 @@
       "sweep-outcome-telemetry.jsonl",
       "eta-stage-samples.jsonl"
     ]
+  },
+  "history": {
+    "scope": "local",
+    "sources": [
+      "sweep-outcome-telemetry.jsonl",
+      "eta-stage-samples.jsonl"
+    ],
+    "samples_by_source": {
+      "sweep-outcome-telemetry.jsonl": 115
+    },
+    "samples_by_host": {
+      "host-fixture-a": 115
+    }
   },
   "path": {
     "start": "review_wait",
