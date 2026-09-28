@@ -521,6 +521,7 @@ fn plan_order_is_the_dispatch_order_under_slice_and_cap() {
         &[10, 20, 30],
         10.into(),
         &[false; 3],
+        None,
         usize::MAX,
         false,
         Some(&slice),

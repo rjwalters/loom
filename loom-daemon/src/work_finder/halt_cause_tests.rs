@@ -194,13 +194,14 @@ fn halted_row(halt_causes: Option<&[Option<HaltCause>]>) -> crate::types::ReadyQ
     let report = tick_multi_with_repo_cap(
         &mut multi,
         &[],
-        10,
+        10.into(),
         &[true],
         halt_causes,
         usize::MAX,
         false,
         None,
         None,
+        &[],
     );
     assert_eq!(report.queue.len(), 1);
     let rows = super::super::ready_queue::finish(&report.queue, &[]);
@@ -241,13 +242,14 @@ fn a_cause_at_a_not_held_index_never_halts_the_workspace() {
     let report = tick_multi_with_repo_cap(
         &mut multi,
         &[],
-        10,
+        10.into(),
         &[false],
         Some(&[Some(HaltCause::MainRed)]),
         usize::MAX,
         false,
         None,
         None,
+        &[],
     );
     assert_eq!(report.dispatched, 1);
     assert_eq!(multi[0].1.dispatched, vec![9]);
