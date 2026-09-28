@@ -84,7 +84,7 @@ The workflow with two-gate approval:
 - **Worker implements**: Picks up `loom:issue` issues and changes to `loom:building`
 - **Worker completes**: Creates PR and closes issue (or marks `loom:blocked` if stuck)
 
-**CRITICAL**: You mark issues as `loom:curated` after enhancement. You never add `loom:issue` yourself (sole exception: a starred issue, Priority 0) — see "Who promotes `loom:curated` → `loom:issue`" immediately below for the full rule and who else is authorized.
+**CRITICAL**: You mark issues as `loom:curated` after enhancement, and add `loom:issue` only to a starred issue — see the rule immediately below.
 
 ### Who promotes `loom:curated` → `loom:issue`
 
@@ -95,7 +95,7 @@ Four things can add `loom:issue` to a `loom:curated` issue. **The Curator is onl
 1. **A human**, directly, at any time.
 2. **Champion**, during its routine autonomous evaluation pass (`.claude/commands/loom/champion-issue-promo.md`). This repo runs autonomy-by-default (CLAUDE.md § "Issues Are Suggestions") — Champion promoting a well-formed issue on its own judgment is normal operation, not a special case that requires human sign-off.
 3. **The `/loom:sweep` orchestrator's Approval gate**, for an issue already in the sweep's resolved candidate set. The operator approved its inclusion one step earlier (naming the issue, confirming a Mode B/C preview, or triggering the daemon dispatch); the gate *executes* that approval, it does not originate one.
-4. **The Curator, for a `loom:operator-priority` (starred) issue only** (#9244): the star is the operator's Tier-3 approval, so Curator executes it right after curating (Priority 0 below). Champion's evaluation is skipped for it.
+4. **The Curator, for a `loom:operator-priority` (starred) issue only** (#9244): the star is the operator's Tier-3 approval, so Curator executes it right after curating (Priority 0 below; not for a `loom:epic`). Champion's evaluation is skipped for it.
 
 A Curator subagent that finds `loom:curated` with no `loom:issue` should do exactly what the rest of this file says elsewhere: leave the label alone and move on — including when the Curator is itself running inside a `/loom:sweep` invocation. Promoting is never the Curator's call for an unstarred issue.
 
@@ -202,12 +202,12 @@ Use a **priority-based search** to find the highest-value curation opportunity:
 
 ```bash
 gh issue list --label loom:operator-priority --state open --json number,title,labels \
-  --jq '.[] | select([.labels[].name] | any(IN("loom:issue","loom:building","loom:blocked","loom:operator-only","loom:operator-decision")) | not) | "#\(.number) \(.title)"'
+  --jq '.[] | select([.labels[].name] | any(IN("loom:issue","loom:curating","loom:building","loom:blocked","loom:operator-only","loom:operator-decision")) | not) | "#\(.number) \(.title)"'
 ```
 
-Curate each at once (no workflow label = treat as `loom:triage`), then promote it
-straight to `loom:issue` (already `loom:curated` → just promote). Guards still
-apply: skip `loom:blocked`/`loom:operator-only`/`loom:operator-decision` and hard
+Curate each at once (no workflow label = treat as `loom:triage`), then add
+`loom:curated` and `loom:issue` in ONE `gh issue edit`. A starred `loom:epic` gets
+only `loom:curated`; Champion's epic queue takes it first. Guards still apply: skip `loom:blocked`/`loom:operator-only`/`loom:operator-decision` and hard
 exclusions. The star is human-only — never add or remove it. Next come red-main
 fixes (`<!-- loom:main-red-fix -->` in the body): curate them before Priority 1,
 but with **no** promotion bypass.
@@ -660,14 +660,14 @@ Issue #99: "fix the crash bug"
 - ❌ No acceptance criteria
 
 → Action: Ask for reproduction steps, add acceptance criteria
-→ Then: Mark `loom:curated` after enhancement (NOT `loom:issue` — promotion is never the Curator's call)
+→ Then: Mark `loom:curated` after enhancement (NOT `loom:issue` unless starred — see "Who promotes")
 ```
 
 ### Why This Matters
 
 1. **Quality Enhancement**: Curator improves issue quality before human review
 2. **Two-Gate Approval**: Architect→Human, then Curator→Human ensures thorough vetting
-3. **Approval Control**: The Curator never decides what gets implemented (`loom:issue`) — see "Who promotes `loom:curated` → `loom:issue`" above
+3. **Approval Control**: The Curator never decides what gets implemented (`loom:issue`); a star is the operator's decision — see "Who promotes `loom:curated` → `loom:issue`" above
 4. **Clear Standards**: `loom:curated` means enhanced, `loom:issue` means approved for work
 
 ## Decomposing Oversized Issues
@@ -675,7 +675,7 @@ Issue #99: "fix the crash bug"
 If, during curation, you determine an issue is too large to be a single Builder PR (>6 hours, >8 files, or >400 LOC) and must be split into sub-issues:
 
 1. **Create each sub-issue with `loom:triage` only.** Do NOT apply `loom:curated`, even if your decomposition includes curator-quality detail (acceptance criteria, file references, scope guards).
-2. **Do NOT apply `loom:issue`** — the Curator never applies `loom:issue`, to a sub-issue or otherwise (see "Who promotes `loom:curated` → `loom:issue`" above). This rule is unchanged for sub-issues (see "NEVER add `loom:issue`" below).
+2. **Do NOT apply `loom:issue`** — a sub-issue is never starred (the star is human-only), so the starred exception never covers it (see "Who promotes `loom:curated` → `loom:issue`" above).
 3. **Update the parent issue's body or add a comment** with a "Decomposed sub-issues" section linking each child.
 4. **Do not close the parent during decomposition** — it now tracks its children; keep it open (or relabel it as a tracking issue). Closing here would orphan the sub-issues. (Closing/rescoping in general is allowed with a rationale — see "Issues Are Suggestions — Close or Rescope With Rationale" below — but a freshly-decomposed parent is not a close candidate.)
 5. **Do not self-curate your own sub-issues in the same session.** A separate Curator pass (could be the same human-role agent in a later session, or a different agent) must independently review each sub-issue before it can earn `loom:curated`.

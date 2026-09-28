@@ -83,8 +83,8 @@ says so, and no role applies it).
   it opens.
 - **Starred first, every stage.** Curator curates starred issues first (a
   starred issue with no workflow label counts as `loom:triage`) and promotes
-  them straight to `loom:issue`, because the star is the Tier-3 approval.
-  Judge, Doctor and Champion drain starred PRs before their oldest-first pass.
+  them straight to `loom:issue`, because the star is the Tier-3 approval. A
+  starred `loom:epic` instead leads Champion's epic queue. Judge, Doctor and Champion drain starred PRs before their oldest-first pass.
   Builder takes starred `loom:issue` work first.
 - **Guards unchanged.** `loom:blocked`, `loom:operator-only`,
   `loom:operator-decision`, Champion's merge-risk and critical-file holds, the

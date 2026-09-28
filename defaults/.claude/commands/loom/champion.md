@@ -166,13 +166,13 @@ If found, **read and follow instructions in `.claude/commands/loom/champion-issu
 If no individual proposals need promotion, check for epic proposals:
 
 ```bash
-# Check for Epic proposals
+# Check for Epic proposals — starred (loom:operator-priority, #9244) first
 gh issue list \
   --label="loom:epic" \
   --state=open \
   --limit=500 \
   --json number,title,body,labels,comments \
-  --jq '.[] | "#\(.number) \(.title) [epic]"'
+  --jq 'sort_by([.labels[].name] | index("loom:operator-priority") == null) | .[] | "#\(.number) \(.title) [epic]"'
 ```
 
 If found, **read and follow instructions in `.claude/commands/loom/champion-epic.md`**. Epics have their own evaluation criteria focused on structure and phase decomposition.
