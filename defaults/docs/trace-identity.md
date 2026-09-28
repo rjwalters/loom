@@ -34,6 +34,20 @@ adds a `loom.role_attempt` span to that story (#9168) whose ID is derived from
 the story root, `loom.role_tick`, the tick's execution id (`loom.sweep_id`)
 and the target (`pr:<loom.pr_number>`, else `issue:<loom.issue>`).
 
+Repeating lifecycle spans carry `loom.attempt`: the 1-indexed ordinal of this
+span among spans of the same name — and, when present, the same `loom.role` —
+under the same parent, ordered by start (ties by source event id). Loom
+stamps it on `loom.role_attempt` (the journal counts earlier started entries
+of that role; an explicitly supplied value always wins) and propagates it
+onto the matching `loom.phase` and `loom.runtime.usage` spans. The same
+definition, parented to the story root, marks the Nth dwell or review round
+of a story on the repeating story-phase kinds (`story.queue_dwell`,
+per-round `story.review_wait`, `story.reopened`), which the harness-ops
+storyline reconciler emits — see [`tracing.md`](tracing.md). Ordinals count
+only emitted spans of the kind, so re-deriving the timeline is idempotent
+and a retention gap (visible ordinals starting above 1) is honest, not a
+defect.
+
 A child span's ID is derived from its trace ID, its parent span ID, its span
 name, its `loom.role` (if any), its `loom.tool.name` (if any), and its start
 instant. Every one of those inputs

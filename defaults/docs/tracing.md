@@ -34,6 +34,15 @@ the same execution after a daemon restart reuses its identity. A new attempt
 gets a new execution identity. The parser accepts strict W3C version-00 context;
 it rejects malformed, uppercase, and zero IDs.
 
+Repeating lifecycle spans carry `loom.attempt`, the 1-indexed ordinal of the
+span among same-named spans under the same parent (definition:
+[trace identity](trace-identity.md#1-deterministic-ids)): Loom stamps it on
+`loom.role_attempt` and propagates it onto `loom.phase` and
+`loom.runtime.usage`, and the harness-ops storyline reconciler stamps it on
+the repeating story-phase kinds (`story.queue_dwell`, per-round
+`story.review_wait`, `story.reopened`), so a story waterfall delineates each
+dwell/review cycle of a multi-attempt story.
+
 The context directory is private and files are written atomically with fsync.
 An exclusive file lock serializes creators. A corrupt, busy, or full context
 store disables tracing for that launch with a diagnostic instead of delaying
