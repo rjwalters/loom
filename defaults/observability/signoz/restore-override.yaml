@@ -2,10 +2,17 @@
 #
 # The README's backup procedure ends with "Test restoration into a separate
 # project/network before relying on the backup." This overlay is that separate
-# project. Layer it on top of the rendered `pours/deployment/compose.yaml`:
+# project. The procedure of record — snapshot, restore, cross-project
+# verification and `--dry-run` teardown — is README.md's "Backup-restore
+# rehearsal" section; follow it there rather than from this header. Layer this
+# file onto the rendered `pours/deployment/compose.yaml`, running from THIS
+# directory (`-f` paths resolve against the working directory, not against the
+# first compose file's directory) and with the SAME private `--env-file` the
+# snapshot was taken with — a restore under a fresh session-signing secret
+# cannot read the metastore it replays:
 #
-#   docker compose --env-file /absolute/private/signoz-restore.env \
-#     -f pours/deployment/compose.yaml -f ../../restore-override.yaml \
+#   docker compose --env-file /absolute/private/signoz.env \
+#     -f pours/deployment/compose.yaml -f restore-override.yaml \
 #     up -d --wait --wait-timeout 1800 loom-signoz-signoz-0
 #
 # It is NOT part of the trial deployment and must never be used to start the
@@ -16,7 +23,7 @@
 # alone: every volume in the rendered file carries an explicit top-level
 # `name:`, so volume names are NOT project-prefixed. A bare `-p` rename
 # therefore produces a second project that mounts the LIVE volumes read-write —
-# exactly the accident a rehearsal exists to avoid. Five services likewise pin
+# exactly the accident a rehearsal exists to avoid. Six services likewise pin
 # `container_name:`, the app publishes a fixed host port, and the ingester joins
 # the external `loom-observability` network under the alias the shared gateway
 # exports to. Each of those is re-pointed below.
