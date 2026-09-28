@@ -123,6 +123,33 @@ Both directions are safe:
   by the exporter as "no identity to verify" and is **silently** skipped — it
   never produces a recurring "cannot verify" warning.
 
+**Star intents (#9244 C).** The response may also carry
+`operator_priority_intents`, the stars and unstars loom-ui recorded (loom-ui
+has no GitHub write access, so the daemon applies them):
+
+```json
+{ "accepted": 50, "host_id": "fleet-host-abc",
+  "operator_priority_intents": [
+    { "id": "…", "repo": "owner/repo", "number": 281, "action": "star",
+      "label": "loom:operator-priority",
+      "requested_at": "2026-09-28T08:15:00Z", "requested_by": "operator" } ] }
+```
+
+The actor field is `requested_by`. A missing field is an older backend and a
+no-op; `[]` is a supporting backend with nothing pending. Each entry parses on
+its own, so one malformed intent costs only itself. The daemon applies an
+intent only when `label` is exactly `loom:operator-priority`, `action` is
+`star` or `unstar`, `repo` is in this host's workspace registry, and
+`requested_by` is non-empty; anything else is dropped and logged (visible as
+`dropped_intents` in `loom-daemon status --json`). Applying adds or removes the
+label, then posts one audit comment carrying
+`<!-- loom:operator-priority-intent=<id> action=<a> requested_at=<ts> -->`,
+unless a comment with that intent id already exists, so resending an intent,
+or several hosts managing the repo, is harmless. `requested_at` becomes the
+issue's starred-at for dispatch order. The exporter reads at most 64 KiB of
+the response (4 KiB before #9244 C, which truncated a ~12 KiB 50-intent ack
+and lost the `host_id` check along with the intents).
+
 ## `RepoVisibility` contract — private by default
 
 Every record that references a repository carries a `visibility` tag, either
@@ -1164,6 +1191,7 @@ daemon process or is disabled.
 | `unresolved_rows` | integer | rows dropped because their workspace's forge slug could not be resolved |
 | `rows_truncated` | integer | rows dropped by the 200-row cap |
 | `plan` | object, optional | the tick's dispatch plan block (Issue #9288, below). Absent from older daemons |
+| `operator_priority_landing[]` | array, optional | the landing state of every starred issue this host watches, and of every blocker inheriting a star (#9244 C; below). Omitted when nothing is starred and on older daemons |
 
 Each row:
 
@@ -1238,6 +1266,40 @@ snapshot is emitted. They count in `counts.blocked` (so `counts` is no longer
 only the tick's rows) and are subject to the same 200-row cap. The blocking
 reason itself is usually a forge comment, and comment text is never read or
 exported. This is additive, so there is no `schema_version` bump.
+
+**Starred landing states (#9244 C).** `rows` is what the work finder did
+with its ready listing this tick, and most starred issues are not in it (they
+are being built, reviewed, or are parked). `operator_priority_landing` covers
+all of them, in starred-at order, each inheriting blocker right after the
+issue it blocks. Join it to `rows` on `(repo, issue)`. It is the last pass of
+the daemon's liveness check (`loom-daemon/src/star_liveness/`), which runs
+every `autonomous.operatorPriority.intervalSecs` while the work finder is on.
+Each entry:
+
+| Field | Type | Notes |
+|---|---|---|
+| `repo` | string | forge `owner/repo` |
+| `visibility` | `public` / `private` | per entry; missing or unknown decodes to `private` |
+| `issue` | integer | issue number |
+| `stage` | string | `curating`, `ready`, `building`, `in-review`, `changes-requested`, `mergeable`, `merging`, `blocked-by`, `needs-operator`, `no-capacity` (unknown values are forward-compatible) |
+| `next_actor` | string | `curator`, `builder`, `judge`, `doctor`, `champion`, `work-finder`, `operator`, or `blocker #N` |
+| `stage_since` | RFC 3339, optional | when this host first saw it in `stage` |
+| `time_in_stage_secs` | integer | seconds in `stage` |
+| `pr` | integer, optional | its open PR |
+| `blocked_by` | string, optional | `blocked-by`: `#N`, or `owner/repo#N` across repos |
+| `no_capacity` | string, optional | `no-capacity`: the work finder's fixed reason text |
+| `ask` | object, optional | set when the operator has been asked: `{kind, key, text}`. `kind` is `operator-only`, `operator-decision`, `merge-risk-hold`, `merge-refused`, `pools-exhausted`, `unmanaged-repo`, `blocked-unnamed` or `no-progress`. `key` is the dedupe key (`<kind>:<specifics>`), identical on every host for the same cause. `text` is the one concrete ask, templated by the daemon (never forge free text). A `no-progress` ask keeps the agent-owned `stage` |
+| `inherited_from` | integer, optional | this entry is a blocker inheriting the star of that issue |
+| `operator_priority_at` | RFC 3339, optional | the starred-at it sorts by (its own, the inheriting star's, or `created_at`) |
+| `last_progress_at` | RFC 3339, optional | when forward progress was last seen |
+
+A star made in loom-ui for a repo this host does not manage appears here as
+`needs-operator` with an `unmanaged-repo` ask. Only that host knows it does
+not manage the repo, so the fleet view should treat the ask as real when
+**every** reporting host carries it. Additive, so there is no
+`schema_version` bump. The fleet Worker in this repo
+(`dashboard/src/queueState.ts`) whitelists row fields and does not store it
+yet.
 
 Redaction (phase 3, `dashboard/src/queueState.ts`): the Worker redacts per
 row on `visibility`. On `/public/*` a private row keeps only `rank`,
