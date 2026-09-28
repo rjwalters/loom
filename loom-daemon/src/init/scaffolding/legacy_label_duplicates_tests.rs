@@ -18,7 +18,8 @@ fn test_merge_labels_block_absorbs_legacy_duplicates_in_markerless_file() {
     // collide by name with the shipped managed block) while preserving the
     // consumer's own `team:frontend` label untouched.
     let existing = "- name: loom:issue\n  description: \"legacy description\"\n  color: \"1d76db\"\n\n- name: team:frontend\n  color: \"00ff00\"\n  description: consumer label\n\n- name: loom:building\n  description: \"legacy building\"\n  color: \"1d76db\"\n";
-    let merged = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
+    let (merged, absorbed) = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
+    assert_eq!(absorbed, vec!["loom:issue", "loom:building"]);
 
     // Legacy duplicate content (stale color/description) must be gone.
     assert!(!merged.contains("1d76db"), "legacy duplicate colors must be absorbed");
@@ -42,20 +43,51 @@ fn test_merge_labels_block_absorbs_legacy_duplicates_outside_existing_marked_ran
     // previous migration) is also absorbed rather than preserved as a
     // duplicate.
     let existing = "- name: loom:issue\n  color: \"1d76db\"\n\n# BEGIN LOOM LABELS\n- name: loom:issue\n  color: \"000000\"\n# END LOOM LABELS\n\n- name: team:below\n  color: \"222222\"\n";
-    let merged = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
+    let (merged, absorbed) = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
 
     assert!(!merged.contains("1d76db"));
     assert!(merged.contains("- name: team:below"));
     assert!(merged.contains("color: \"3B82F6\""));
     assert_eq!(merged.matches("- name: loom:issue").count(), 1);
+    assert_eq!(absorbed, vec!["loom:issue"]);
 }
 
 #[test]
 fn test_strip_legacy_loom_label_entries_preserves_non_colliding_content() {
     let loom_names: std::collections::HashSet<&str> = ["loom:issue"].into_iter().collect();
     let text = "# a comment\n- name: team:only\n  color: \"abcdef\"\n\n- name: loom:issue\n  color: \"1d76db\"\n";
-    let stripped = strip_legacy_loom_label_entries(text, &loom_names);
+    let (stripped, absorbed) = strip_legacy_loom_label_entries(text, &loom_names);
     assert!(stripped.contains("# a comment"));
     assert!(stripped.contains("- name: team:only"));
     assert!(!stripped.contains("loom:issue"));
+    assert_eq!(absorbed, vec!["loom:issue"]);
+}
+
+/// #8887 adversarial-review regressions: a matched legacy entry's continuation
+/// scan must never swallow content that doesn't unambiguously belong to it.
+
+#[test]
+fn judge_probe_comment_after_legacy_entry() {
+    let existing = "- name: loom:issue\n  color: \"1d76db\"\n\n# --- Team labels (owned by platform team) ---\n- name: team:frontend\n  color: \"00ff00\"\n";
+    let (merged, absorbed) = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
+    assert!(merged.contains("# --- Team labels"), "consumer comment deleted");
+    assert!(merged.contains("- name: team:frontend"), "consumer label deleted");
+    assert_eq!(absorbed, vec!["loom:issue"]);
+}
+
+#[test]
+fn judge_probe_name_not_first_key() {
+    let existing = "- name: loom:building\n  color: \"1d76db\"\n- color: \"ff0000\"\n  name: priority:high\n  description: consumer\n";
+    let (merged, absorbed) = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
+    assert!(merged.contains("priority:high"), "consumer label deleted");
+    assert_eq!(absorbed, vec!["loom:building"]);
+}
+
+#[test]
+fn judge_probe_flow_style_and_indented() {
+    let existing = "- name: loom:issue\n  color: \"1d76db\"\n- {name: team:x, color: \"00ff00\"}\n  - name: team:y\n";
+    let (merged, absorbed) = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
+    assert!(merged.contains("team:x"), "flow-style consumer label deleted");
+    assert!(merged.contains("team:y"), "nested-indent consumer label deleted");
+    assert_eq!(absorbed, vec!["loom:issue"]);
 }
