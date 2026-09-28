@@ -144,6 +144,7 @@ fn summary_row(
         detail: detail.map(str::to_string),
         state: disposition.state().to_string(),
         reason: disposition.reason().to_string(),
+        plan: Default::default(),
     }
 }
 

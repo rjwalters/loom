@@ -204,7 +204,7 @@ fn summary_carries_named_rows_and_old_payloads_parse() {
         Disp::default(),
     )];
     let report = tick_multi(&mut multi, &[], 10, &[false]);
-    let summary = tick_summary(&report, 10, chrono::Utc::now(), &[PathBuf::from("/r")]);
+    let summary = tick_summary(&report, 10, chrono::Utc::now(), &[PathBuf::from("/r")], None);
     assert_eq!(summary.queue.len(), 1);
     assert_eq!(summary.queue[0].repo, "/r");
 
@@ -309,8 +309,139 @@ fn a_failed_listing_is_named_not_shown_as_empty() {
     ];
     let report = tick_multi(&mut multi, &[], 10, &[false, false]);
     let roots = [PathBuf::from("/repo/broken"), PathBuf::from("/repo/ok")];
-    let summary = tick_summary(&report, 10, chrono::Utc::now(), &roots);
+    let summary = tick_summary(&report, 10, chrono::Utc::now(), &roots, None);
     assert_eq!(summary.errors, 1);
     assert_eq!(summary.listing_failed, vec!["/repo/broken".to_string()]);
     assert_eq!(order(&summary.queue), vec![(2, QueueDisposition::Dispatched)]);
+}
+
+// ===================================================================
+// candidate_keys — the single dispatch-order seam (Issue #9288)
+// ===================================================================
+
+fn oldest_first(a: Option<&String>, b: Option<&String>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(x), Some(y)) => x.cmp(y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// The documented #3946/#9244 order, written out independently of
+/// `candidate_keys`: starred first; among starred, starred-at (else
+/// `createdAt`) oldest first; red-main fixes first; workspace priority asc;
+/// `createdAt` oldest first; number asc. A change to dispatch order must
+/// update both this and `candidate_keys` — which is the point.
+fn reference_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let starred_at =
+        |c: &PriorityCandidate| c.operator_priority_at.clone().or(c.created_at.clone());
+    let lane = b.operator_priority.cmp(&a.operator_priority).then(
+        if a.operator_priority && b.operator_priority {
+            oldest_first(starred_at(a).as_ref(), starred_at(b).as_ref())
+        } else {
+            Ordering::Equal
+        },
+    );
+    lane.then(b.main_red_fix.cmp(&a.main_red_fix))
+        .then(a.workspace_priority.cmp(&b.workspace_priority))
+        .then(oldest_first(a.created_at.as_ref(), b.created_at.as_ref()))
+        .then(a.number.cmp(&b.number))
+}
+
+/// Every candidate over a small domain that exercises every key's tie and
+/// both directions of every key, including the starred-at fallback.
+fn candidate_domain() -> Vec<PriorityCandidate> {
+    let times = [
+        None,
+        Some("2026-01-01T00:00:00Z"),
+        Some("2026-02-01T00:00:00Z"),
+    ];
+    let mut out = Vec::new();
+    for workspace_priority in [0, 100] {
+        for operator_priority in [false, true] {
+            for starred_at in times {
+                for main_red_fix in [false, true] {
+                    for created_at in times {
+                        for number in [1, 2] {
+                            out.push(PriorityCandidate {
+                                workspace_priority,
+                                operator_priority,
+                                operator_priority_at: starred_at.map(str::to_string),
+                                main_red_fix,
+                                created_at: created_at.map(str::to_string),
+                                number,
+                                ..PriorityCandidate::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The property, exhaustively over every pair in the domain: the
+/// lexicographic compare of `candidate_keys` IS `candidate_cmp`, and both
+/// match the documented order; the first three keys are `lane_cmp`.
+#[test]
+fn candidate_keys_lexicographic_compare_is_candidate_cmp() {
+    let domain = candidate_domain();
+    for a in &domain {
+        for b in &domain {
+            let by_keys = ready_queue::candidate_keys(a).cmp(&ready_queue::candidate_keys(b));
+            assert_eq!(by_keys, candidate_cmp(a, b), "{a:?} vs {b:?}");
+            assert_eq!(by_keys, reference_cmp(a, b), "{a:?} vs {b:?}");
+        }
+    }
+}
+
+/// The wire projection names the keys in comparator order, carries each
+/// row's own values, and distinguishes every pair the comparator does.
+#[test]
+fn candidate_keys_project_to_named_wire_keys() {
+    assert_eq!(
+        ready_queue::ordering_names(),
+        vec![
+            "operator_priority",
+            "operator_priority_at",
+            "main_red_fix",
+            "workspace_priority",
+            "created_at",
+            "number"
+        ]
+    );
+    let c = PriorityCandidate {
+        workspace_priority: 7,
+        operator_priority: true,
+        created_at: Some("2026-01-01T00:00:00Z".into()),
+        number: 42,
+        ..PriorityCandidate::default()
+    };
+    let values: Vec<serde_json::Value> = ready_queue::plan_keys(&c)
+        .into_iter()
+        .map(|k| k.value)
+        .collect();
+    // A starred candidate with no starred-at orders by its createdAt.
+    assert_eq!(
+        values,
+        vec![
+            serde_json::json!(true),
+            serde_json::json!("2026-01-01T00:00:00Z"),
+            serde_json::json!(false),
+            serde_json::json!(7),
+            serde_json::json!("2026-01-01T00:00:00Z"),
+            serde_json::json!(42),
+        ]
+    );
+    let domain = candidate_domain();
+    for a in &domain {
+        for b in &domain {
+            let equal_keys = ready_queue::plan_keys(a) == ready_queue::plan_keys(b);
+            assert_eq!(equal_keys, candidate_cmp(a, b).is_eq(), "{a:?} vs {b:?}");
+        }
+    }
 }

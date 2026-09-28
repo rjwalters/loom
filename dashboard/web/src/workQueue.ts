@@ -251,6 +251,16 @@ export function rankText(row: QueueRow): string {
   return row.rank > 0 ? String(row.rank) : "–";
 }
 
+/** A row's place in its own host's dispatch plan (Issue #9288), verbatim:
+ * `#3 next`, `#5 queued (repo cap)`, or `running` / `blocked` with no
+ * position. A pre-#9288 row falls back to its coarse state. */
+export function planText(row: QueueRow): string {
+  if (row.plan_state === undefined) return row.state;
+  const position = row.position === undefined ? "" : `#${row.position} `;
+  const gate = row.gate === undefined ? "" : ` (${row.gate.replace(/_/g, " ")})`;
+  return `${position}${row.plan_state}${gate}`;
+}
+
 /** The reason text with its structured specifics (park label, open PR)
  * appended. */
 export function reasonText(row: QueueRow): string {

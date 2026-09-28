@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::RepoVisibility;
-use crate::types::QueueDisposition;
+use crate::types::{DispatchPlanContext, QueueDisposition, RowPlan};
 
 /// Most rows one record carries. Rows past this are counted in
 /// [`QueueSnapshotRecord::rows_truncated`].
@@ -88,6 +88,13 @@ pub struct QueueSnapshotRow {
     /// number (`open_pr`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The dispatch-plan fields (Issue #9288), flattened beside `rank`:
+    /// `position`, `plan_state`, `keys`, `gate`, `in_slice`, `hot`,
+    /// `owning_shard`, `repo_cap`. The `keys` values are the row's own
+    /// `workspace_priority` / `urgent` / `created_at` / `issue`, so they add
+    /// nothing the row does not already carry.
+    #[serde(flatten, default)]
+    pub plan: RowPlan,
 }
 
 /// `queue.snapshot`: one host's ready queue as of its last work-finder tick.
@@ -118,6 +125,10 @@ pub struct QueueSnapshotRecord {
     /// Rows dropped by the [`MAX_ROWS`] cap.
     #[serde(default)]
     pub rows_truncated: usize,
+    /// The tick's dispatch plan block (Issue #9288): slots, tick interval,
+    /// shard posture, scope and key ordering. Absent from a pre-#9288 daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<DispatchPlanContext>,
 }
 
 /// `detail` survives only for dispositions whose detail is structured: the

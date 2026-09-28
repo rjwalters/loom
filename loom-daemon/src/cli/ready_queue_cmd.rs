@@ -10,7 +10,9 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use loom_daemon::types::{DaemonStatusReport, ReadyQueueRow};
+use loom_daemon::types::{
+    DaemonStatusReport, DispatchPlanContext, PlanState, ReadyQueueRow, WorkFinderTickSummary,
+};
 
 use super::common::resolve_socket_path;
 use super::status::{query_daemon_status, resolve_status_timeout};
@@ -82,7 +84,22 @@ fn freshness(report: &DaemonStatusReport, now: DateTime<Utc>) -> (&'static str, 
     }
 }
 
-/// The `--json` document: the tick timestamp, freshness, and the rows.
+/// The comparator key names the queue is ordered by (Issue #9288): the
+/// daemon's own `plan.ordering`, else the key names on its rows. `None` when
+/// the daemon published neither (a pre-#9288 daemon) — never a local copy of
+/// the comparator.
+fn ordering(tick: &WorkFinderTickSummary) -> Option<Vec<String>> {
+    if let Some(plan) = tick.plan.as_ref().filter(|p| !p.ordering.is_empty()) {
+        return Some(plan.ordering.clone());
+    }
+    tick.queue
+        .iter()
+        .find(|r| !r.plan.keys.is_empty())
+        .map(|r| r.plan.keys.iter().map(|k| k.name.clone()).collect())
+}
+
+/// The `--json` document: the tick timestamp, freshness, the plan block and
+/// the rows.
 pub(crate) fn queue_json(report: &DaemonStatusReport, now: DateTime<Utc>) -> serde_json::Value {
     let (state, age) = freshness(report, now);
     let tick = report.last_work_finder_tick.as_ref();
@@ -97,7 +114,8 @@ pub(crate) fn queue_json(report: &DaemonStatusReport, now: DateTime<Utc>) -> ser
         // Non-empty => the queue is incomplete: these repos' backlogs are missing.
         "listing_failed": tick.map(|t| t.listing_failed.as_slice()).unwrap_or_default(),
         "complete": tick.is_some_and(|t| t.listing_failed.is_empty()),
-        "ordering": "loom:operator-priority first (by starred-at, else created_at), red-main fix first (only while main is verified red), workspace_priority asc, created_at oldest first, issue number",
+        "ordering": tick.and_then(ordering),
+        "plan": tick.and_then(|t| t.plan.as_ref()),
         "queue": tick.map(|t| t.queue.as_slice()).unwrap_or_default(),
     })
 }
@@ -121,9 +139,15 @@ pub(crate) fn render_queue(report: &DaemonStatusReport, now: DateTime<Utc>) -> S
         tick.max_concurrent,
         tick.reason_summary()
     ));
-    out.push_str(
-        "Order: starred (loom:operator-priority, by starred-at) first, then red-main fixes while main is red, then workspace priority, then oldest first (loom:urgent and tier:* labels do not affect order)\n",
-    );
+    if let Some(keys) = ordering(tick) {
+        out.push_str(&format!(
+            "Order: {} (tier:* labels do not affect order)\n",
+            keys.join(", then ")
+        ));
+    }
+    if let Some(plan) = &tick.plan {
+        out.push_str(&render_plan(plan));
+    }
     if !tick.listing_failed.is_empty() {
         out.push_str(&format!(
             "  INCOMPLETE: listing ready issues failed for {} — their backlog is missing below\n",
@@ -145,6 +169,53 @@ pub(crate) fn render_queue(report: &DaemonStatusReport, now: DateTime<Utc>) -> S
         out.push_str(&render_row(row));
     }
     out
+}
+
+/// The plan's one-line slot summary.
+fn render_plan(plan: &DispatchPlanContext) -> String {
+    let s = &plan.slots;
+    let opt = |v: Option<usize>| v.map_or_else(|| "?".to_string(), |n| n.to_string());
+    let mut line = format!(
+        "Plan: {} free of {} slot(s), {} admission(s)/tick",
+        opt(s.free),
+        s.max_concurrent,
+        opt(s.max_admissions_per_tick)
+    );
+    if let Some(secs) = plan.tick_interval_secs {
+        line.push_str(&format!(", every {secs}s"));
+    }
+    if let (true, Some(host), Some(count)) =
+        (plan.shard.configured, plan.shard.host_shard, plan.shard.shard_count)
+    {
+        line.push_str(&format!(", shard {host}/{count}"));
+    }
+    if s.saturation_held {
+        line.push_str(", SATURATION-HELD");
+    }
+    line.push('\n');
+    line
+}
+
+/// A row's plan column: `#<position> <plan_state>[/<gate>]`, or the bare
+/// coarse state for a pre-#9288 row.
+fn plan_column(row: &ReadyQueueRow) -> String {
+    let p = &row.plan;
+    if p.plan_state == PlanState::Unknown {
+        return row.disposition.state().to_string();
+    }
+    let state = serde_json::to_value(p.plan_state)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let gate = p
+        .gate
+        .and_then(|g| serde_json::to_value(g).ok())
+        .and_then(|v| v.as_str().map(|g| format!("/{g}")))
+        .unwrap_or_default();
+    let pos = p
+        .position
+        .map_or_else(|| "-".to_string(), |n| format!("#{n}"));
+    format!("{pos} {state}{gate}")
 }
 
 fn render_row(row: &ReadyQueueRow) -> String {
@@ -172,11 +243,11 @@ fn render_row(row: &ReadyQueueRow) -> String {
         .map(|d| format!(" ({d})"))
         .unwrap_or_default();
     format!(
-        "  {:>3}. {repo}#{:<6} p{:<3} {:<7} {}{detail}{flags}\n",
+        "  {:>3}. {repo}#{:<6} p{:<3} {:<20} {}{detail}{flags}\n",
         row.rank,
         row.issue,
         row.workspace_priority,
-        row.disposition.state(),
+        plan_column(row),
         row.disposition.reason(),
     )
 }
@@ -185,7 +256,7 @@ fn render_row(row: &ReadyQueueRow) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use loom_daemon::types::{QueueDisposition, WorkFinderTickSummary};
+    use loom_daemon::types::{PlanGate, PlanKey, PlanSlots, QueueDisposition, RowPlan};
 
     fn report_with(queue: Vec<ReadyQueueRow>, at: DateTime<Utc>) -> DaemonStatusReport {
         DaemonStatusReport {
@@ -217,6 +288,7 @@ mod tests {
             detail: None,
             state: d.state().into(),
             reason: d.reason().into(),
+            plan: Default::default(),
         }
     }
 
@@ -282,5 +354,67 @@ mod tests {
         assert_eq!(j["complete"], false);
         assert_eq!(j["listing_failed"][0], "/src/loom");
         assert_eq!(j["errors"], 1);
+    }
+
+    #[test]
+    fn plan_fields_render_and_ordering_comes_from_the_daemon() {
+        let now = Utc::now();
+        let mut r = report_with(
+            vec![
+                row(1, 10, QueueDisposition::Dispatched),
+                row(2, 11, QueueDisposition::DeferredRampCap),
+            ],
+            now,
+        );
+        // A pre-#9288 daemon: no plan, no keys => no ordering, no invented copy.
+        assert!(queue_json(&r, now)["ordering"].is_null());
+        assert!(!render_queue(&r, now).contains("Order:"));
+
+        let tick = r.last_work_finder_tick.as_mut().unwrap();
+        tick.queue[0].plan = RowPlan {
+            position: Some(1),
+            plan_state: PlanState::Running,
+            keys: vec![PlanKey {
+                name: "workspace_priority".into(),
+                value: serde_json::json!(100),
+            }],
+            ..RowPlan::default()
+        };
+        tick.queue[1].plan = RowPlan {
+            position: Some(2),
+            plan_state: PlanState::Next,
+            gate: Some(PlanGate::Ramp),
+            ..RowPlan::default()
+        };
+        // Row keys alone are enough to name the ordering.
+        assert_eq!(queue_json(&r, now)["ordering"], serde_json::json!(["workspace_priority"]));
+
+        let tick = r.last_work_finder_tick.as_mut().unwrap();
+        tick.plan = Some(DispatchPlanContext {
+            slots: PlanSlots {
+                max_concurrent: 2,
+                occupancy: Some(2),
+                free: Some(0),
+                max_admissions_per_tick: Some(1),
+                ..PlanSlots::default()
+            },
+            tick_interval_secs: Some(60),
+            ordering: vec!["workspace_priority".into(), "operator_priority".into()],
+            ..DispatchPlanContext::default()
+        });
+        let j = queue_json(&r, now);
+        assert_eq!(j["ordering"], serde_json::json!(["workspace_priority", "operator_priority"]));
+        assert_eq!(j["plan"]["slots"]["max_concurrent"], 2);
+        assert_eq!(j["queue"][1]["plan_state"], "next");
+        assert_eq!(j["queue"][1]["gate"], "ramp");
+        assert_eq!(j["queue"][1]["position"], 2);
+        let text = render_queue(&r, now);
+        assert!(text.contains("Order: workspace_priority, then operator_priority"), "{text}");
+        assert!(
+            text.contains("Plan: 0 free of 2 slot(s), 1 admission(s)/tick, every 60s"),
+            "{text}"
+        );
+        assert!(text.contains("#2 next/ramp"), "{text}");
+        assert!(text.contains("#1 running"), "{text}");
     }
 }

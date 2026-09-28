@@ -1163,6 +1163,7 @@ daemon process or is disabled.
 | `rows[]` | array | ranked rows (below), at most 200 |
 | `unresolved_rows` | integer | rows dropped because their workspace's forge slug could not be resolved |
 | `rows_truncated` | integer | rows dropped by the 200-row cap |
+| `plan` | object, optional | the tick's dispatch plan block (Issue #9288, below). Absent from older daemons |
 
 Each row:
 
@@ -1182,6 +1183,51 @@ Each row:
 | `state` | string | `running` / `ready` / `blocked`, derived by the daemon so clients never keep a copy of the mapping |
 | `reason` | string | human-readable reason, also daemon-derived |
 | `detail` | string, optional | only for `parked` (the park label), `open_pr` (`open PR #N`) and `labelled_blocked` (the hold labels it also carries, from `loom:operator`, `loom:operator-only`, `loom:operator-mechanical`, `loom:needs-capability`). Free-form dispatch-error and comment text is never exported |
+| `position` | integer, optional | 1-based place in the host's **shaped** dispatch order (#9288, below). `null` when the row is not dispatchable on this host this tick |
+| `plan_state` | string | `running` / `next` / `queued` / `blocked` (#9288); `unknown` when absent |
+| `keys` | array, optional | `{name, value}` comparator keys that placed the row, in comparator order |
+| `gate` | string, optional | the admission gate holding a deferred row: `capacity`, `ramp`, `saturation`, `repo_cap`, `out_of_slice` |
+| `in_slice` | bool, optional | the row's workspace is in this host's preferred repo slice (#6243); `true` on every row when unsharded |
+| `hot` | bool, optional | the workspace had a live sweep at the top of the tick (the #9090 track-affinity input) |
+| `owning_shard` | integer, optional | the shard that owns the workspace when sharding is configured. A host can only name the shard; mapping it to a host is the fleet merge's job |
+| `repo_cap` | object, optional | `{cap, occupancy}`: the workspace's `maxConcurrentPerRepo` (`null` when uncapped) and its top-of-tick live sweeps |
+
+**Dispatch plan (Issue #9288).** `rank` is the bare comparator rank over every
+row, so it is also where a blocked row re-enters. It is not the order pass 2
+offers candidates in when a repo slice or per-repo cap reshapes the list.
+`position` is: the tick records the shaped candidate order it iterated
+(`TickReport::plan_order`), and the plan is a pure projection of it, never a
+second ranking. Out-of-slice rows follow the shaped order, in comparator order.
+`plan_state` is:
+
+- `running`: `dispatched` / `in_flight`;
+- `next`: the first `slots.max_admissions_per_tick` rows, in `position` order,
+  among rows deferred by the concurrency or ramp cap. These are what the next
+  tick admits once slots free. Saturation-held, repo-capped and out-of-slice
+  rows are never `next`, so a saturated host has no `next` rows;
+- `queued`: every other deferred row;
+- `blocked`: everything else, with `position: null`.
+
+The comparator keys come from one seam (`ready_queue::candidate_keys`), which
+is also what `candidate_cmp` compares, so `keys` and `plan.ordering` can never
+describe a different order from the one the tick ran. The `plan` block:
+
+| Field | Type | Notes |
+|---|---|---|
+| `slots` | object | `max_concurrent`, `occupancy` (after the tick), `free` (`max_concurrent − occupancy`), `max_admissions_per_tick`, `saturation_held`, `any_halted` |
+| `tick_interval_secs` | integer, optional | the work finder's tick interval |
+| `shard` | object | `configured` (`false` when unsharded), `host_shard`, `shard_count` |
+| `scope` | array | the labels the plan covers: `["loom:issue", "loom:blocked"]` |
+| `ordering` | array | comparator key names, in order |
+| `complete` | bool | `false` when some repo's listing failed (like `listing_failed`) |
+
+**Pre-ready tiers are unordered.** `loom:curated` and `loom:triage` issues have
+no dispatcher order and never appear in the plan; Champion's promotion order is
+a role-prompt convention, not daemon code. `scope` names what the plan covers.
+Positions are per host. Hosts do not share `workspace_priority`, so two hosts'
+positions cannot be compared directly. A fleet order is a merge of per-host
+plans (follow-up #9310). All of this is additive, so there is no
+`schema_version` bump.
 
 **Forge-side blocked issues (Issue #8957).** After the ranked rows, the
 snapshot carries one `labelled_blocked` row (`state: blocked`, `rank: 0`,
@@ -1195,10 +1241,12 @@ exported. This is additive, so there is no `schema_version` bump.
 
 Redaction (phase 3, `dashboard/src/queueState.ts`): the Worker redacts per
 row on `visibility`. On `/public/*` a private row keeps only `rank`,
-`visibility`, `urgent`, `operator_priority`, `disposition`, `state` and `reason`; its `repo`,
-`issue`, `created_at`, `tier` and `detail` are withheld, and a private
-`listing_failed` entry keeps only its `visibility`. `counts`, `seen` and
-`tick_at` are aggregate and survive. A Worker older than phase 3 applies the
+`visibility`, `urgent`, `operator_priority`, `disposition`, `state` and
+`reason` (plus the #9288 `position`, `plan_state` and `gate`); its `repo`,
+`issue`, `created_at`, `tier`, `detail`, `keys`, `repo_cap`, `owning_shard`,
+`in_slice` and `hot` are withheld, and a private `listing_failed` entry keeps
+only its `visibility`. `counts`, `seen`, `tick_at` and the `plan` block are
+aggregate and survive. A Worker older than phase 3 applies the
 unknown-kind rule instead (`/public/*` sees `kind` only).
 
 The Worker keeps the newest tick per host as live state (`hosts[<id>].queue`

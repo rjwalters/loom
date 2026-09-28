@@ -491,6 +491,7 @@ fn queue_summary(
                 detail: None,
                 state: d.state().into(),
                 reason: d.reason().into(),
+                plan: Default::default(),
             })
             .collect(),
         ..Default::default()

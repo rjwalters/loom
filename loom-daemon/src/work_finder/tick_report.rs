@@ -248,16 +248,54 @@ pub struct TickReport {
     /// `None` when the tick returned before measuring it (a halted
     /// single-workspace tick). Feeds `loom.dispatch.idle_slots`.
     pub occupancy: Option<usize>,
+    /// The shaped candidate order pass 2 iterated, as `(workspace_idx,
+    /// issue)` (Issue #9288): the global sort after `repo_cap::shape_queue`'s
+    /// slice and affinity partitions. Recorded before pass 2 runs, so it is
+    /// the order `dispatch()` was offered candidates in, including those a
+    /// gate then deferred. The published plan's `position` is read from here
+    /// and never re-derived. Empty for the single-workspace tick.
+    pub plan_order: Vec<(usize, u32)>,
+    /// The preferred repo slice the tick shaped with (#6243), or `None` when
+    /// sharding was not configured at the call site.
+    pub in_slice: Option<Vec<bool>>,
+    /// The per-repo cap and top-of-tick per-workspace occupancy (#9090) the
+    /// tick shaped with. `None` for the single-workspace tick.
+    pub repo_cap: Option<super::repo_cap::RepoCapSnapshot>,
+    /// The per-tick admission ramp cap (#4234) the tick ran under, or `None`
+    /// when the caller did not record it.
+    pub max_admissions_per_tick: Option<usize>,
+    /// Whether the host's single `loom:operator-priority` overflow slot
+    /// (#9244) was still unused when the tick finished, or `None` when the
+    /// tick did not record it (Issue #9288).
+    pub overflow_free: Option<bool>,
 }
 
 impl TickReport {
-    /// This report with no occupancy reading, for comparing an idle tick
-    /// against [`TickReport::default`] in tests.
+    /// An empty report for a multi-workspace tick run under these admission
+    /// knobs.
+    #[must_use]
+    pub fn for_tick(saturation_held: bool, max_admissions_per_tick: usize) -> Self {
+        TickReport {
+            saturation_held,
+            max_admissions_per_tick: Some(max_admissions_per_tick),
+            ..TickReport::default()
+        }
+    }
+
+    /// This report with no occupancy reading and none of the admission
+    /// context a multi-workspace tick records for its dispatch plan (#9288:
+    /// ramp cap, slice mask, per-repo cap snapshot, overflow slot), for comparing an idle
+    /// tick against [`TickReport::default`] in tests. The shaped order itself
+    /// (`plan_order`) is kept: an idle tick has none.
     #[cfg(test)]
     #[must_use]
     pub fn without_occupancy(self) -> Self {
         TickReport {
             occupancy: None,
+            max_admissions_per_tick: None,
+            in_slice: None,
+            repo_cap: None,
+            overflow_free: None,
             ..self
         }
     }

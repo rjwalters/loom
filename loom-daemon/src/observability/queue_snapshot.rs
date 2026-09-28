@@ -131,6 +131,7 @@ pub fn build_record(
             state: row.disposition.state().to_string(),
             reason: row.disposition.reason().to_string(),
             detail: exportable_detail(row.disposition, row.detail.as_deref()),
+            plan: row.plan.clone(),
         });
     }
     let listing_failed: Vec<QueueRepoRef> = summary
@@ -148,6 +149,7 @@ pub fn build_record(
         rows,
         unresolved_rows,
         rows_truncated,
+        plan: summary.plan.clone(),
     }
 }
 

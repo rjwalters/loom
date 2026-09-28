@@ -108,6 +108,7 @@ fn queue_gauges_map_to_otlp_gauges_and_queue_snapshot_maps_to_nothing() {
             rows: Vec::new(),
             unresolved_rows: 0,
             rows_truncated: 0,
+            plan: None,
         }),
     )];
     assert!(build_logs_request(&snapshot).is_none());

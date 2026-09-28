@@ -528,7 +528,11 @@ cardinality:
   `queue.snapshot` record, sampled on the `host.health` interval whenever the
   work finder has ticked since the last snapshot. Each row carries its forge
   `owner/repo` and its own `visibility` tag. The OTLP exporter never receives
-  this record.
+  this record. Since #9288 each row also carries its dispatch-plan fields
+  (`position`, `plan_state`, `gate`, …) and the record carries a `plan` block.
+  That block holds the host's slots, tick interval, shard posture, `scope` and
+  key `ordering`. These are per-host plan data only: no gauge or label is
+  added on the OTLP side, and `loom:curated` / `loom:triage` stay unordered.
 
 Both are derived from the same rows as `loom-daemon queue`. See
 [`telemetry-schema.md` → `queue.snapshot`](telemetry-schema.md#queuesnapshot).
