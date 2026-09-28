@@ -234,17 +234,44 @@ fn the_only_file_open_in_this_module_is_the_guarded_log_reader() {
     // Behavioural tests prove what the rows contain; this proves the module
     // never grows a second file-open. A future edit that reads Pi's agent dir
     // (which holds `auth.json`) fails here with the reason.
+    //
+    // The idiom list below is written to catch a read however it is spelled:
+    // the free function (`fs::read_dir(`), the method on a `Path`
+    // (`p.read_dir()`), the imported-bare form (`use std::fs::read_dir`), the
+    // builder (`File::options()`), a directory-walking crate (`walkdir`,
+    // `glob`), and delegation to a sibling `*_usage` reader that resolves its
+    // own provider home. What a lexical scan still cannot see: a read reached
+    // through a trait object, a re-export under a different name, a macro, or
+    // FFI. Those are covered behaviourally by
+    // `a_refused_path_is_never_opened_even_when_it_holds_a_valid_stream` — the
+    // gate in `read_log`, not this scan, is the guarantee; the scan only makes
+    // a second reader loud in review.
     let code = reader_code();
     for (idiom, allowed) in [
+        // The one guarded open, and the one read off its handle.
         ("File::open(", 1),
         ("read_to_string(", 1),
+        // Every other route to bytes on disk, or to something that can fetch
+        // them on this module's behalf.
         ("File::create(", 0),
-        ("fs::read(", 0),
-        ("fs::read_dir(", 0),
-        ("fs::write(", 0),
+        ("File::options", 0),
         ("OpenOptions", 0),
+        ("fs::read(", 0),
+        ("read_to_end(", 0),
+        // Free, method and imported-bare forms alike.
+        ("read_dir(", 0),
+        ("fs::copy(", 0),
+        ("fs::write(", 0),
+        ("WalkDir", 0),
+        ("walkdir", 0),
+        ("glob(", 0),
         ("include_str!", 0),
+        ("include_bytes!", 0),
         ("Command::new(", 0),
+        // Reading Pi's agent dir by proxy: every sibling `*_usage` reader
+        // resolves its own provider home, so a `crate::…_usage::` call from
+        // here is a read of a credential-bearing tree at one remove.
+        ("_usage::", 0),
     ] {
         assert_eq!(
             code.matches(idiom).count(),
@@ -264,6 +291,8 @@ fn the_only_file_open_in_this_module_is_the_guarded_log_reader() {
     let open = body.find("File::open(").expect("the one open lives here");
     assert!(gate < open, "the authorization gate must precede the open");
     // No credential-bearing name, and no Pi state location, may appear in CODE.
+    // Both spellings of the state directory are forbidden: the path fragment
+    // `.pi/` and the quoted segment `".pi"` a `Path::join` would take.
     let lowered = code.to_ascii_lowercase();
     for forbidden in [
         "auth.json",
@@ -271,6 +300,7 @@ fn the_only_file_open_in_this_module_is_the_guarded_log_reader() {
         "models.json",
         "settings.json",
         ".pi/",
+        "\".pi\"",
         "pi_coding_agent",
         "pi-agent",
         "pi-sessions",

@@ -70,6 +70,7 @@ pub mod bad_tokens;
 pub mod bootstrap;
 pub mod check;
 pub mod codex_check;
+pub mod codex_probe;
 pub mod codex_reset;
 pub mod failure_counts;
 pub mod health;
