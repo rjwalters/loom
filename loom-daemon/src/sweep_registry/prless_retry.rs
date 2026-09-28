@@ -48,12 +48,43 @@
 //!    minute as the last one.
 //! 3. On the **second** consecutive PR-less release the reason is posted to the
 //!    issue, so the next claimer (or a human) can see why it keeps failing
-//!    instead of rediscovering it.
+//!    instead of rediscovering it. This note is **not** a hold and applies no
+//!    label; it carries [`PRLESS_ATTEMPT_COMMENT_MARKER`] so nothing has to
+//!    infer that from prose (#9239).
 //! 4. On the [`PrlessRetryConfig::threshold`]-th consecutive PR-less release the
 //!    issue is **held**: `loom:blocked` on, `loom:issue` off, plus a comment
 //!    naming the failure and the count. The work finder's own skip-label filter
 //!    takes it from there, and the hold is released the way every other
 //!    `loom:blocked` park is — by a human or a Doctor who fixed the cause.
+//!
+//! # The label write is the hold (Issue #9239)
+//!
+//! Step 4 has one deliverable and it is not the comment. `loom:blocked` is what
+//! `PARK_LABELS` consults and therefore what actually removes the issue from
+//! dispatch; the notice only explains a park that has already happened. The
+//! first implementation wrote the label fire-and-forget — `output_with_timeout`
+//! returns `Ok(Some(output))` for a child that *completed*, at any exit status,
+//! and the match arm was `Ok(Some(_)) => {}` — and then posted the notice
+//! unconditionally. A rejected write therefore left behind a comment asserting
+//! a park that had not occurred, on an issue dispatch immediately re-claimed:
+//! `2AMLogic/sky130-sar-adc#121` collected **seven** hold notices across four
+//! days and two bot accounts with **zero** `loom:blocked` label events.
+//!
+//! So [`SweepRegistry::write_prless_hold_label`] now checks the exit status,
+//! retries the add half alone when the combined flip is rejected, reads the
+//! label back before giving up, and returns
+//! [`PrlessHoldOutcome::LabelWriteFailed`] when the park cannot be confirmed —
+//! in which case no "held" notice is posted, the tally does **not** record the
+//! issue as held, and the failure is raised both in the log and (once per
+//! streak) on the issue itself.
+//!
+//! One measurement note, since it is what #9239 was originally filed on: the
+//! attempt notes of step 3 and the hold notice of step 4 shared a single
+//! comment marker, so an audit grepping `prless-retry` counted both as holds.
+//! On `rjwalters/loom#8812` four of five "holds" were `Attempt 2 of 3` notes —
+//! one per dispatch host, since the tally is per-host — and the one real hold
+//! labelled the issue in the same second it commented. The kind markers exist
+//! so that reading is no longer available to anyone.
 //!
 //! # Non-interference
 //!
@@ -76,6 +107,14 @@
 //! explicit clear), never by this module second-guessing the classification.
 
 use super::*;
+
+/// The forge-visible half of the hold — the `loom:blocked` write and the
+/// comments (Issues #7972, #9239). Split out as a child module both because
+/// the two halves answer different questions and because #9239 showed what
+/// happens when they drift: see [`hold`]'s own header.
+mod hold;
+#[allow(unused_imports)]
+pub use hold::*;
 
 /// Env var toggling the PR-less retry bound (Issue #7972). `0`/`false`/`no`/
 /// `off` disables; `1`/`true`/`yes`/`on` forces on. Overrides config. Defaults
@@ -124,11 +163,6 @@ pub const DEFAULT_PRLESS_RETRY_BACKOFF_SECS: u64 = 300;
 /// ceiling matters mostly as the streak-cold window and the hold's in-memory
 /// TTL.
 pub const DEFAULT_PRLESS_RETRY_MAX_BACKOFF_SECS: u64 = 3600;
-
-/// Marker prefix on every comment this module posts, so the per-attempt notes
-/// and the hold notice are machine-identifiable (and greppable) the way
-/// [`QUARANTINE_COMMENT_MARKER`] is for #3939.
-pub const PRLESS_RETRY_COMMENT_MARKER: &str = "<!-- loom:prless-retry (#7972) -->";
 
 /// Resolved PR-less-retry parameters (Issue #7972), set on the registry at
 /// construction so the reaper and work finder can enforce them without a
@@ -180,21 +214,6 @@ pub(crate) struct PrlessRetryState {
     /// The failure context supplied by the recording caller — logged verbatim
     /// and posted to the issue, so the next claimer sees it.
     pub(crate) reason: String,
-}
-
-/// What [`SweepRegistry::apply_prless_hold_label`] actually did (Issue #7972).
-/// Only [`Self::VetoedOpenPr`] is positive evidence that the tally itself was
-/// wrong; the other two vetoes leave it standing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PrlessHoldOutcome {
-    /// `loom:blocked` applied, `loom:issue` removed, hold notice posted.
-    Applied,
-    /// The issue is already closed — nothing to hold, tally kept.
-    VetoedClosed,
-    /// Re-verification found an open linked PR: this was never a PR-less loop.
-    VetoedOpenPr,
-    /// Label flips are disabled (hermetic fixture) — no forge state to touch.
-    VetoedNoForge,
 }
 
 /// The subset of `.loom/config.json → autonomous.workFinder.prlessRetry` this
@@ -542,10 +561,25 @@ impl SweepRegistry {
             // keep the issue out of dispatch on a false premise. The other two
             // vetoes (already-closed, hermetic fixture) leave the record
             // standing — neither contradicts the tally.
-            if self.apply_prless_hold_label(issue, consecutive, reason)
-                == PrlessHoldOutcome::VetoedOpenPr
-            {
-                self.clear_prless_retry(issue);
+            match self.apply_prless_hold_label(issue, consecutive, reason) {
+                PrlessHoldOutcome::VetoedOpenPr => {
+                    self.clear_prless_retry(issue);
+                }
+                // The park did not happen (Issue #9239). `held` is the claim
+                // "this issue is out of the pool", and the only thing that
+                // makes it true is `loom:blocked` on the forge — so record the
+                // truth instead, and let the next PR-less release re-attempt
+                // the hold. The backoff window stays armed either way, so this
+                // costs at most one further spaced-out dispatch rather than
+                // the unbounded re-claim loop a false `held` produced.
+                PrlessHoldOutcome::LabelWriteFailed => {
+                    if let Some(state) = self.prless_retry.get_mut(&issue) {
+                        state.held = false;
+                    }
+                }
+                PrlessHoldOutcome::Applied
+                | PrlessHoldOutcome::VetoedClosed
+                | PrlessHoldOutcome::VetoedNoForge => {}
             }
         } else {
             log::warn!(
@@ -638,293 +672,26 @@ impl SweepRegistry {
             .map(|(issue, _)| *issue)
             .collect()
     }
-
-    /// Best-effort comment naming the failure behind a sub-threshold PR-less
-    /// release (Issue #7972 AC3) — so the next claimer, human or agent, starts
-    /// from "the last attempt died like *this*" instead of from nothing.
-    ///
-    /// Skipped entirely when label flips are disabled (test fixtures /
-    /// `skip_label_flip`). Best-effort: a `gh` failure is logged at debug and
-    /// never affects the load-bearing in-memory tally.
-    fn post_prless_attempt_comment(
-        &self,
-        issue: u32,
-        consecutive: u32,
-        threshold: u32,
-        reason: &str,
-    ) {
-        let body = format!(
-            "{PRLESS_RETRY_COMMENT_MARKER}\n\
-             **Attempt {consecutive} of {threshold} ended without a pull request.** This issue's \
-             `loom:building` claim has now been taken and released {consecutive} times in a row \
-             with no PR to show for it.\n\n\
-             Last failure: {reason}\n\n\
-             Re-dispatch is spaced out while this streak continues; after {threshold} consecutive \
-             PR-less releases the issue is held with `loom:blocked` rather than re-claimed again \
-             (Issue #7972). If you are the next claimer, read the failure above before repeating \
-             it — if the issue's scope no longer exists on `main`, say so and rescope or close it \
-             rather than retrying."
-        );
-        self.post_prless_comment(issue, &body, "attempt note");
-    }
-
-    /// Best-effort forge mutation on a PR-less hold (Issue #7972): add
-    /// `loom:blocked`, remove `loom:issue`, and post a comment naming the
-    /// failure and the count — so the pause is visible to a human on the forge,
-    /// not just in the daemon log. Modeled directly on
-    /// [`Self::apply_quarantine_label`].
-    ///
-    /// `loom:blocked` (not `loom:operator`) on purpose: `loom:blocked` is the
-    /// established automated-hold state that the work finder's skip-label filter
-    /// and `quarantine_reconciliation` already understand, and #7972's own
-    /// acceptance criterion names it first. Skipped entirely when label flips
-    /// are disabled; every step is best-effort.
-    fn apply_prless_hold_label(
-        &self,
-        issue: u32,
-        consecutive: u32,
-        reason: &str,
-    ) -> PrlessHoldOutcome {
-        if self.config.skip_label_flip {
-            return PrlessHoldOutcome::VetoedNoForge;
-        }
-        // A closed issue (or a PR number that slipped through) needs no hold:
-        // it is already out of the candidate pool, and parking it would add a
-        // `loom:blocked` label and a comment to settled work. Fail-open — an
-        // unverifiable read (`None`) proceeds with the hold, since a stranded
-        // re-claim loop is the failure this exists to stop.
-        if self.issue_is_closed_or_pr(issue) == Some(true) {
-            log::info!(
-                "sweep_registry: issue #{issue} reached {consecutive} consecutive PR-less \
-                 releases but is already closed — recording the tally without applying a \
-                 `loom:blocked` hold (#7972)"
-            );
-            return PrlessHoldOutcome::VetoedClosed;
-        }
-        // Last-chance re-verification, and the ONLY forge probe this mechanism
-        // adds anywhere. `note_prless_terminal_outcome`'s classification is
-        // deliberately forge-free (see its doc comment), which leaves one
-        // residual false-positive shape: an issue whose open PR was never
-        // sampled by any of these sweeps and whose #6788 memo had expired. A
-        // hold is the one irreversible-ish step here (a `loom:blocked` label a
-        // human has to clear), so it is worth exactly one closes-graph query
-        // to rule that out. `Open` means the issue is waiting on Judge, not
-        // stuck in a PR-less loop; `ProbeFailed`/`NoneOpen` proceed, because a
-        // forge outage must not be able to strand the loop either.
-        if let OpenPrProbe::Open(pr) = self.probe_open_linked_pr(issue) {
-            log::info!(
-                "sweep_registry: issue #{issue} reached {consecutive} consecutive PR-less \
-                 releases, but re-verification found open linked PR #{pr} — NOT holding; the \
-                 issue is waiting on review, not looping (#7972)"
-            );
-            return PrlessHoldOutcome::VetoedOpenPr;
-        }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut edit = Command::new(&gh);
-        edit.arg("issue")
-            .arg("edit")
-            .arg(issue.to_string())
-            .arg("--add-label")
-            .arg("loom:blocked")
-            .arg("--remove-label")
-            .arg("loom:issue");
-        edit.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut edit,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            edit.arg("--repo").arg(repo);
-        }
-        // Bounded (Issue #3973): this runs from `reap_once`, which is on the
-        // `ListSweeps` / `GetSweepStatus` read path.
-        let timeout = reap_gh_timeout();
-        match output_with_timeout(edit, timeout) {
-            Ok(Some(_)) => {}
-            Ok(None) => log::warn!(
-                "sweep_registry: PR-less hold label edit for #{issue} exceeded {}s, killed (#3973)",
-                timeout.as_secs()
-            ),
-            Err(e) => {
-                log::warn!("sweep_registry: PR-less hold label edit for #{issue} failed: {e}");
-            }
-        }
-
-        let body = format!(
-            "{PRLESS_RETRY_COMMENT_MARKER}\n\
-             **Held after {consecutive} consecutive claims that produced no pull request.** This \
-             issue's `loom:building` claim was taken and released {consecutive} times in a row \
-             without a PR and without a `.no-changes-needed` marker — the dispatch loop is \
-             retrying something that keeps failing the same way, so it is now held with \
-             `loom:blocked` instead of being re-claimed a {next} time (Issue #7972).\n\n\
-             Last failure: {reason}\n\n\
-             **What to do**: read the failure above and fix its cause — the common ones are a \
-             scope that no longer exists on `main` (rescope or close the issue), a build/test \
-             failure the Builder cannot get past, and a missing dependency or credential. Then \
-             flip `loom:blocked` back to `loom:issue` to return the issue to the queue; the tally \
-             resets, so it gets a full runway of {consecutive} fresh attempts. Nothing here says \
-             the issue is invalid — only that repeating the same dispatch unchanged will not \
-             produce a different result.",
-            next = consecutive + 1,
-        );
-        self.post_prless_comment(issue, &body, "hold notice");
-        PrlessHoldOutcome::Applied
-    }
-
-    /// Shared best-effort `gh issue comment` behind
-    /// [`Self::post_prless_attempt_comment`] and
-    /// [`Self::apply_prless_hold_label`] (Issue #7972) — identical transport,
-    /// timeout, and credential handling; only the body and the log label differ.
-    fn post_prless_comment(&self, issue: u32, body: &str, what: &str) {
-        if self.config.skip_label_flip {
-            return;
-        }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut comment = Command::new(&gh);
-        comment
-            .arg("issue")
-            .arg("comment")
-            .arg(issue.to_string())
-            .arg("--body")
-            .arg(body);
-        comment.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut comment,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            comment.arg("--repo").arg(repo);
-        }
-        let timeout = reap_gh_timeout();
-        match output_with_timeout(comment, timeout) {
-            Ok(Some(_)) => {}
-            Ok(None) => log::debug!(
-                "sweep_registry: PR-less retry {what} for #{issue} exceeded {}s, killed (#3973)",
-                timeout.as_secs()
-            ),
-            Err(e) => {
-                log::debug!("sweep_registry: PR-less retry {what} for #{issue} failed: {e}");
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::sweep_registry::test_support::{
-        fake_gh_graphql_arm, fake_gh_timeline_rest_arm, state_probe_json,
-    };
     use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
     use serial_test::serial;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
-    /// A registry with forge writes disabled — the tests below that use it
-    /// drive the in-memory tally directly, which is the load-bearing half.
-    /// The forge-visible half (the label flip and the comments) is covered
-    /// separately, against a fake `gh`, by [`forge_registry`] (#8728).
+    /// A registry with forge writes disabled — the tests here drive the
+    /// in-memory tally directly, which is the load-bearing half. The
+    /// forge-visible half (the label flip and the comments) is covered
+    /// separately, against a fake `gh`, in [`super::hold`]'s own test module
+    /// (#8728, #9239).
     fn test_registry() -> SweepRegistry {
         let dir = tempdir().unwrap();
         let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
         config.skip_label_flip = true;
         SweepRegistry::new(config)
-    }
-
-    /// A registry whose forge writes are **enabled** (`skip_label_flip =
-    /// false`), driven by a fake `gh` that appends every invocation's argv to
-    /// the returned log path (Issue #8728).
-    ///
-    /// Three answering arms. Their order in the script is **bash arm-matching
-    /// precedence, not call order**: the #5911 REST timeline (`timeline_pr`,
-    /// empty for "no open PR") is spliced first because its endpoint also
-    /// matches the state probe's `repos/*` glob — the ordering note
-    /// [`fake_gh_timeline_rest_arm`] carries — then the GraphQL closes-graph
-    /// (`graphql_prs`, whitespace-separated open PR numbers), then the #4504
-    /// issue-state probe (`issue_state`, `"open"` / `"closed"`). The *call*
-    /// order is the reverse: the hold consults the state probe first and only
-    /// then `probe_open_linked_pr`, which tries GraphQL and falls back to the
-    /// REST timeline. `repo view` resolves the owner/repo the two `gh api`
-    /// probes cannot infer from the working directory. Everything else — in
-    /// particular the `issue edit` and `issue comment` mutations these tests
-    /// exist to observe — is logged and exits 0.
-    fn forge_registry(
-        ws: &Path,
-        issue_state: &str,
-        graphql_prs: &str,
-        timeline_pr: &str,
-    ) -> (SweepRegistry, PathBuf) {
-        let gh_log = ws.join("gh-invocations.log");
-        let fake_gh = ws.join("fake-gh-prless.sh");
-        let script = format!(
-            "#!/usr/bin/env bash\n\
-             printf '%s\\n' \"$*\" >> \"{log}\"\n\
-             {timeline}\
-             {gql}\
-             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
-             printf '%s\\n' '{state}'\n\
-             exit 0\n\
-             fi\n\
-             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
-             printf 'rjwalters/loom\\n'\n\
-             exit 0\n\
-             fi\n\
-             exit 0\n",
-            log = gh_log.display(),
-            timeline = fake_gh_timeline_rest_arm(timeline_pr, 0),
-            gql = fake_gh_graphql_arm(graphql_prs, 0),
-            state = state_probe_json(issue_state, false),
-        );
-        std::fs::write(&fake_gh, &script).unwrap();
-        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&fake_gh, perms).unwrap();
-        if let Ok(f) = std::fs::File::open(&fake_gh) {
-            let _ = f.sync_all();
-        }
-
-        let mut config = SweepRegistryConfig::new(ws.to_path_buf());
-        config.gh_bin = Some(fake_gh);
-        config.skip_label_flip = false;
-        config.journal_path = Some(ws.join("test-sweeps-journal.json"));
-        (SweepRegistry::new(config), gh_log)
-    }
-
-    /// Set `threshold` and drive `issue` straight to its hold with that many
-    /// consecutive PR-less releases (#8728).
-    fn hold_at_threshold(reg: &mut SweepRegistry, issue: u32, threshold: u32, reason: &str) {
-        reg.set_prless_retry_config(PrlessRetryConfig {
-            threshold,
-            ..PrlessRetryConfig::default()
-        });
-        for _ in 0..threshold {
-            reg.record_prless_release(issue, reason);
-        }
-    }
-
-    /// Every logged `gh` invocation whose argv begins with `prefix` — the
-    /// fake `gh` logs `"$*"`, so a multi-line `--body` spans several lines and
-    /// only the first one carries the subcommand (#8728).
-    fn gh_calls_starting_with(gh_log: &Path, prefix: &str) -> Vec<String> {
-        std::fs::read_to_string(gh_log)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| l.starts_with(prefix))
-            .map(std::string::ToString::to_string)
-            .collect()
     }
 
     #[test]
@@ -1222,180 +989,6 @@ mod tests {
     // tests assert on is process-global-env-dependent (`resolve_owner_repo`
     // reads `LOOM_REPO`, and a set value appends `--repo <slug>` to the hold's
     // edit), so pinning exact argv requires pinning that env.
-
-    /// #8728 AC1: at the threshold the hold flips the forge labels — exactly
-    /// one `gh issue edit`, naming the RIGHT issue, adding `loom:blocked` and
-    /// removing `loom:issue`. The work finder's skip-label filter reads that
-    /// label, not this process's memory, so the flip is the durable half of
-    /// the hold.
-    #[test]
-    #[serial]
-    fn the_hold_flips_loom_blocked_on_and_loom_issue_off_for_the_right_issue() {
-        let dir = tempdir().unwrap();
-        std::env::remove_var("LOOM_REPO");
-        // Open issue, no open linked PR on either transport: neither veto fires.
-        let (mut reg, gh_log) = forge_registry(dir.path(), "open", "", "");
-
-        hold_at_threshold(&mut reg, 7893, 2, "builder crashed without opening a PR");
-
-        assert!(reg.prless_retry_held(7893), "the threshold must hold the issue");
-        let edits = gh_calls_starting_with(&gh_log, "issue edit ");
-        assert_eq!(edits.len(), 1, "exactly one label flip at the threshold, got: {edits:?}");
-        assert_eq!(
-            edits[0], "issue edit 7893 --add-label loom:blocked --remove-label loom:issue",
-            "the hold's argv must name the held issue and flip both labels"
-        );
-    }
-
-    /// #8728 AC2: the hold posts its notice to the issue, marked with
-    /// [`PRLESS_RETRY_COMMENT_MARKER`] so it is machine-identifiable, and the
-    /// body names both the count and the failure — the whole point of the
-    /// comment is that the next reader does not have to rediscover why.
-    #[test]
-    #[serial]
-    fn the_hold_notice_comment_is_posted_and_carries_the_marker() {
-        let dir = tempdir().unwrap();
-        std::env::remove_var("LOOM_REPO");
-        let (mut reg, gh_log) = forge_registry(dir.path(), "open", "", "");
-
-        hold_at_threshold(&mut reg, 7893, 2, "scope `safehouse_chatops/` does not exist on main");
-
-        let comments = gh_calls_starting_with(&gh_log, "issue comment ");
-        assert_eq!(comments.len(), 1, "the hold posts exactly one notice, got: {comments:?}");
-        assert!(
-            comments[0]
-                .starts_with(&format!("issue comment 7893 --body {PRLESS_RETRY_COMMENT_MARKER}")),
-            "the notice must go to the held issue and lead with the marker: {}",
-            comments[0]
-        );
-        let body = std::fs::read_to_string(&gh_log).unwrap();
-        assert!(
-            body.contains("**Held after 2 consecutive claims that produced no pull request.**"),
-            "the notice names the count: {body}"
-        );
-        assert!(
-            body.contains("scope `safehouse_chatops/` does not exist on main"),
-            "the notice names the failure: {body}"
-        );
-    }
-
-    /// #8728 AC3: the last-chance re-verification is the one forge probe this
-    /// mechanism adds, and an OPEN linked PR is positive evidence the tally was
-    /// wrong — the issue is waiting on Judge, not looping. No label flip, no
-    /// comment, and (via `record_prless_release`'s `VetoedOpenPr` arm) the
-    /// whole tally is dropped rather than left standing on a false premise.
-    #[test]
-    #[serial]
-    fn re_verification_finding_an_open_linked_pr_vetoes_the_hold_and_clears_the_tally() {
-        let dir = tempdir().unwrap();
-        std::env::remove_var("LOOM_REPO");
-        // The closes-graph answers with an open PR #8123.
-        let (mut reg, gh_log) = forge_registry(dir.path(), "open", "8123", "");
-
-        hold_at_threshold(&mut reg, 7893, 2, "looked PR-less from in-memory state");
-
-        assert_eq!(
-            reg.prless_release_count(7893),
-            0,
-            "an open linked PR is positive evidence the tally was wrong — drop it"
-        );
-        assert!(!reg.prless_retry_held(7893));
-        assert!(
-            reg.prless_retry_remaining(7893, Utc::now()).is_none(),
-            "a cleared tally must not keep the issue out of dispatch"
-        );
-        assert!(
-            gh_calls_starting_with(&gh_log, "issue edit ").is_empty(),
-            "a vetoed hold must not flip any label"
-        );
-        assert!(
-            gh_calls_starting_with(&gh_log, "issue comment ").is_empty(),
-            "a vetoed hold must not post a hold notice either"
-        );
-    }
-
-    /// #8728 AC4: a closed issue is already out of the candidate pool, so
-    /// holding it would only add a `loom:blocked` label and a comment to
-    /// settled work. The veto fires BEFORE the closes-graph re-verification —
-    /// no point spending that query — and, unlike the open-PR veto, leaves the
-    /// tally standing: being closed does not contradict the count.
-    #[test]
-    #[serial]
-    fn the_closed_issue_veto_does_not_flip_labels() {
-        let dir = tempdir().unwrap();
-        std::env::remove_var("LOOM_REPO");
-        let (mut reg, gh_log) = forge_registry(dir.path(), "closed", "", "");
-
-        hold_at_threshold(&mut reg, 7893, 2, "crashed without opening a PR");
-
-        assert!(
-            gh_calls_starting_with(&gh_log, "issue edit ").is_empty(),
-            "a closed issue must not be labeled `loom:blocked`"
-        );
-        assert!(
-            gh_calls_starting_with(&gh_log, "issue comment ").is_empty(),
-            "a closed issue must not get a hold notice"
-        );
-        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-        assert!(
-            calls
-                .lines()
-                .any(|l| l.starts_with("api repos/") && l.contains("/issues/7893 --jq")),
-            "the closed-issue state probe is what vetoed the hold: {calls}"
-        );
-        assert!(
-            !calls.contains("api graphql"),
-            "the closed veto short-circuits before the closes-graph re-verification: {calls}"
-        );
-        assert!(
-            reg.prless_retry_held(7893),
-            "a closed issue does not contradict the tally — the record stands"
-        );
-        assert_eq!(reg.prless_release_count(7893), 2);
-    }
-
-    /// #7972 AC3 on the forge side (#8728): the second consecutive PR-less
-    /// release — one short of the default threshold — posts the attempt note,
-    /// marked like the hold notice, and flips nothing. Commenting from the
-    /// second onward is what bounds the comment count by the threshold rather
-    /// than by the length of the loop.
-    #[test]
-    #[serial]
-    fn the_second_consecutive_release_posts_a_marked_attempt_note_without_flipping_labels() {
-        let dir = tempdir().unwrap();
-        std::env::remove_var("LOOM_REPO");
-        let (mut reg, gh_log) = forge_registry(dir.path(), "open", "", "");
-        assert_eq!(reg.prless_retry_config().threshold, DEFAULT_PRLESS_RETRY_THRESHOLD);
-
-        reg.record_prless_release(7893, "first failure");
-        assert!(
-            gh_calls_starting_with(&gh_log, "issue comment ").is_empty(),
-            "a single PR-less release is plausibly a one-off — no comment yet"
-        );
-
-        reg.record_prless_release(7893, "second failure: build error the Builder cannot pass");
-
-        assert!(!reg.prless_retry_held(7893), "still one short of the threshold");
-        let comments = gh_calls_starting_with(&gh_log, "issue comment ");
-        assert_eq!(comments.len(), 1, "one attempt note, got: {comments:?}");
-        assert!(
-            comments[0]
-                .starts_with(&format!("issue comment 7893 --body {PRLESS_RETRY_COMMENT_MARKER}")),
-            "the attempt note must go to the right issue and carry the marker: {}",
-            comments[0]
-        );
-        let calls = std::fs::read_to_string(&gh_log).unwrap();
-        assert!(
-            calls.contains(&format!(
-                "**Attempt 2 of {DEFAULT_PRLESS_RETRY_THRESHOLD} ended without a pull request.**"
-            )),
-            "the note names where in the runway this attempt sits: {calls}"
-        );
-        assert!(
-            gh_calls_starting_with(&gh_log, "issue edit ").is_empty(),
-            "below the threshold nothing is held, so no label may be flipped"
-        );
-    }
 
     // --- Config resolution precedence (env > config > default) -------------
 
