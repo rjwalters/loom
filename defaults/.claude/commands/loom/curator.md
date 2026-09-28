@@ -2123,7 +2123,7 @@ Before marking an issue as `loom:curated`, ensure it has:
 - ✅ **Dependencies verified**: All task list items checked (or no Dependencies section)
 - ✅ **Not a duplicate**: Verified no similar open issues exist (use `check-duplicate.sh`)
 - ✅ **Right-sized**: sibling micro-issues consolidated (see "Backlog Rightsizing")
-- ✅ Priority label (`loom:urgent` if critical, otherwise none)
+- ✅ Priority label (`loom:urgent` if critical)
 - ✅ Labeled as `loom:curated` when complete (NOT `loom:issue`, unless starred — Priority 0)
 
 ### Required Sections
