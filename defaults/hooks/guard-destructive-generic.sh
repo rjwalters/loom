@@ -4358,13 +4358,26 @@ parse_force_ops() {
     # extract_realpath_path() ever saw the full value. Returns 0 (never
     # matches) for every other shape, including the already-handled
     # double-quoted form (match_assignword() already spans that correctly).
-    function match_realpath_assignword(seg,   n, rest, closeidx, spanlen) {
+    function match_realpath_assignword(seg,   n, rest, closeidx, spanlen, nxt) {
         if (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=\$\(realpath[ \t]+/)) {
             n = RSTART + RLENGTH
             rest = substr(seg, n)
             closeidx = index(rest, ")")
             if (closeidx == 0) return 0
             spanlen = (n - 1) + closeidx
+            # #9317: a non-whitespace byte AFTER the close means the real
+            # assignment value is LONGER than this span (e.g.
+            # `W=$(realpath <path>)/../../..`, which the shell sets to a
+            # DIFFERENT directory than the substitution alone yields). The
+            # measured span is what the value-extractor downstream sees, so
+            # matching here would hand it a PREFIX of the true value and let
+            # the guard judge safety against the wrong directory. Refuse the
+            # match entirely (fail closed) -- the same discipline the cdpwd
+            # close-test already applies by requiring an empty/`"` remainder.
+            if (spanlen < length(seg)) {
+                nxt = substr(seg, spanlen + 1, 1)
+                if (nxt != " " && nxt != "\t") return 0
+            }
             while (spanlen < length(seg) && (substr(seg, spanlen + 1, 1) == " " || substr(seg, spanlen + 1, 1) == "\t")) spanlen++
             return spanlen
         }
@@ -4374,6 +4387,19 @@ parse_force_ops() {
             closeidx = index(rest, "`")
             if (closeidx == 0) return 0
             spanlen = (n - 1) + closeidx
+            # #9317: a non-whitespace byte AFTER the close means the real
+            # assignment value is LONGER than this span (e.g.
+            # `W=$(realpath <path>)/../../..`, which the shell sets to a
+            # DIFFERENT directory than the substitution alone yields). The
+            # measured span is what the value-extractor downstream sees, so
+            # matching here would hand it a PREFIX of the true value and let
+            # the guard judge safety against the wrong directory. Refuse the
+            # match entirely (fail closed) -- the same discipline the cdpwd
+            # close-test already applies by requiring an empty/`"` remainder.
+            if (spanlen < length(seg)) {
+                nxt = substr(seg, spanlen + 1, 1)
+                if (nxt != " " && nxt != "\t") return 0
+            }
             while (spanlen < length(seg) && (substr(seg, spanlen + 1, 1) == " " || substr(seg, spanlen + 1, 1) == "\t")) spanlen++
             return spanlen
         }

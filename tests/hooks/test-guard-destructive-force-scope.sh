@@ -690,6 +690,103 @@ assert_ask "force-op:detached + \$(cd <path> && pwd) capture (#9312): push sibli
     "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd)\"
 git -C \"\$WORKTREE_ABS\" push --force-with-lease" "$FORCE_DETACHED_WT_REPO"
 
+# ---- #9317: the assignment span must not TRUNCATE a trailing suffix. ----
+#
+# match_realpath_assignword() measures the assignment as "up to the first
+# `)`/backtick, plus trailing whitespace". Without a bounds check on what
+# FOLLOWS that close, an unquoted `NAME=$(realpath <path>)<suffix>` had its
+# suffix silently dropped: the guard judged safety against
+# `<repo>/.loom/worktrees/issue-2` (managed, detached, own branch -> the
+# #5772 recovery-target safe-list allows `origin/main`) while the shell
+# actually sets the variable to `<repo>/.loom/worktrees/issue-2/../../..`
+# = the REPO ROOT, so the real operation hard-resets the PRIMARY checkout and
+# destroys uncommitted work. That is an ASK -> ALLOW regression on exactly the
+# shape this carve-out exists to widen, and the trigger is ordinary idiomatic
+# unquoted shell, not an injection. These cases pin it closed: a
+# non-whitespace byte after the close now refuses the match outright, so the
+# value falls through unresolved and the force op stays fail-closed at ASK.
+#
+# NOTE these are `..`-traversal ESCAPES, not the safe shapes above: each one
+# resolves in a real shell to a directory OUTSIDE the managed worktree.
+assert_ask "force-op:detached + \$(realpath <path>) capture (#9317): trailing /../../.. suffix after the close is NOT truncated -- resolves to the repo root in a real shell, so reset --hard origin/main still asks" \
+    "W=\$(realpath .loom/worktrees/issue-2)/../../..
+git -C \"\$W\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached + \$(realpath <path>) capture (#9317): same suffix escape with an own-branch target (origin/feature/issue-2) still asks -- the cwd is the repo root, not the worktree" \
+    "W=\$(realpath .loom/worktrees/issue-2)/../../..
+git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached + \$(realpath <path>) capture (#9317): a SINGLE /.. level of suffix is enough to leave the worktree -- still asks" \
+    "W=\$(realpath .loom/worktrees/issue-2)/..
+git -C \"\$W\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached + \$(realpath <path>) capture (#9317): backtick spelling of the suffix escape (\`realpath <path>\`/../../..) also stays fail-closed" \
+    "W=\`realpath .loom/worktrees/issue-2\`/../../..
+git -C \"\$W\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+# Non-traversal suffix: the value is still not what the guard measured, so it
+# must refuse the match regardless of whether the suffix happens to escape.
+assert_ask "force-op:detached + \$(realpath <path>) capture (#9317): a non-traversal /<subdir> suffix is also refused (the measured span is a PREFIX of the real value, traversal or not)" \
+    "W=\$(realpath .loom/worktrees/issue-2)/nested
+git -C \"\$W\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+# The cd&&pwd sibling never had this bug (its close-test already required an
+# empty/`\"` remainder) -- pin that so a future refactor that unifies the two
+# recognizers cannot regress the half that was always correct.
+assert_ask "force-op:detached + \$(cd <path> && pwd) capture (#9317 regression pin): the cd&&pwd close-test already rejected a trailing suffix -- \$(cd <path> && pwd)/../../.. still asks" \
+    "W=\$(cd .loom/worktrees/issue-2 && pwd)/../../..
+git -C \"\$W\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+# Non-regression: the fix refuses a MATCH, it does not change the force-push
+# path -- the push sibling of the escape stays ASK for its own, unrelated
+# reason (the exemption is reset-only).
+assert_ask "force-op:detached + \$(realpath <path>) capture (#9317): push sibling of the suffix escape still asks (exemption remains reset-only)" \
+    "W=\$(realpath .loom/worktrees/issue-2)/../../..
+git -C \"\$W\" push --force-with-lease" "$FORCE_DETACHED_WT_REPO"
+
+# ---- #9317: the intended #9312 fixes are UNAFFECTED by the bounds check. ----
+# Re-asserted here rather than relying on the block above: the bounds check
+# fires on the same code path those cases take, so a too-strict version of it
+# would silently re-break the issue this PR exists to fix.
+assert_allow "force-op:detached + \$(realpath <path>) capture (#9317 non-regression): unquoted \$(realpath <path>) with NOTHING after the close still resolves and allows" \
+    "WORKTREE_ABS=\$(realpath .loom/worktrees/issue-2)
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(realpath <path>) capture (#9317 non-regression): unquoted backtick \`realpath <path>\` with nothing after the close still resolves and allows" \
+    "WORKTREE_ABS=\`realpath .loom/worktrees/issue-2\`
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(realpath <path>) capture (#9317 non-regression): a space+\`;\`+command AFTER the close is whitespace-separated, not a suffix -- still resolves and allows" \
+    "WORKTREE_ABS=\$(realpath .loom/worktrees/issue-2) ; git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(cd <path> && pwd) capture (#9317 non-regression): the issue's exact reproduction is untouched by the bounds check" \
+    "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd)\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+
+# ---- #9317: state-leak regression pins for the cross-segment pending machinery. ----
+# These already passed before the fix; they are pinned here because they are
+# the highest-value regression guards in the whole #9312 change. The single
+# most dangerous failure mode of the pending_cdpwd_name/_path carry-forward
+# would be leaking the captured path into the tracked `curcwd` / setting
+# `cd_proven` -- which would make a LATER, unrelated force op in the same
+# command inherit the worktree as its cwd. It does not, and must not.
+assert_ask "force-op:detached (#9317 state-leak pin): a \$(cd <path> && pwd) CAPTURE does not set curcwd -- a following BARE 'git reset --hard' (no -C) still asks, because the shell cwd really is still the repo root" \
+    "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd)\"
+git reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached (#9317 state-leak pin): a \$(cd <path> && pwd) capture does not set cd_proven -- a following X=\$(pwd) captures the REPO ROOT, so git -C \"\$X\" reset --hard still asks" \
+    "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd)\"
+X=\$(pwd)
+git -C \"\$X\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached (#9317 state-leak pin): an ABANDONED pending capture (close is \`echo\`, not \`pwd)\`) leaves no state behind -- a following bare reset still asks" \
+    "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && echo hi)\"
+git reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached (#9317 abandon-path pin): an UNBALANCED \$( with no close at all never resolves -- still asks" \
+    "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached (#9317 close-token pin): \`pwd -P)\` is NOT the recognized close token -- the capture is abandoned and still asks" \
+    "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd -P)\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+
+# NOTE (#9317): the non-`&&` separators inside the substitution -- `|`, `&`,
+# `||` -- are deliberately NOT asserted here. extract_cdpwd_open() does not
+# know which operator qsplit() split at, so it treats them like `&&` and
+# currently resolves shapes whose real shell value is the repo root (`|`, `&`)
+# or empty (`||`). That is a pre-existing modelling gap in qsplit()'s
+# separator handling rather than something this change introduced -- filed
+# separately as #9405; pinning the current (wrong) verdicts here would
+# cement them, so #9405 owns adding them as assert_ask cases alongside its fix.
+
 rm -rf "$FORCE_DETACHED_WT_REPO"
 
 # ---- #6077: guard-decision telemetry audit — reproduce the EXACT real-world ----
