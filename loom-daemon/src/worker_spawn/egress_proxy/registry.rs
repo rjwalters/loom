@@ -21,6 +21,8 @@
 //!    the pinned host.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// How a provider expects the real credential to be presented upstream.
@@ -203,6 +205,27 @@ fn split_authority(authority: &str) -> Result<(String, Option<u16>), &'static st
     }
 }
 
+/// One launch's per-request usage tally (issue #8699): request/response byte
+/// counts and the provider's own rate-limit/usage response headers.
+///
+/// Holds nothing secret by construction: [`super::server`] only ever feeds
+/// this an **allowlisted** set of header names
+/// (`anthropic-ratelimit-*`, `x-ratelimit-*`, `retry-after`), never anything
+/// from [`CREDENTIAL_HEADERS`], so `#[derive(Debug)]` here is safe — unlike
+/// [`Record`], which still hand-writes its `Debug` because it also carries the
+/// credential.
+#[derive(Clone, Debug, Default)]
+pub struct Usage {
+    /// Total bytes of every request body forwarded upstream for this launch.
+    pub request_bytes: u64,
+    /// Total bytes of every response body streamed back for this launch.
+    pub response_bytes: u64,
+    /// The most recently observed rate-limit/usage response headers —
+    /// replaced (not accumulated) on every response, so this always reflects
+    /// the provider's current window rather than a stale first reading.
+    pub headers: Vec<(String, String)>,
+}
+
 /// A live launch's credential substitution. `Debug` redacts the secret and
 /// there is deliberately no `Serialize`, mirroring
 /// [`super::super::credential::Resolved`].
@@ -217,10 +240,33 @@ pub struct Record {
     pub header: HeaderStyle,
     credential: String,
     open: bool,
+    /// This launch's pool account name, and the workspace root its pool lives
+    /// under — set only when [`super::credential::Source::Pool`] selected the
+    /// credential (#8699). `None` for an env-sourced credential (a one-off
+    /// export, #8363) or a non-pool-capable caller such as `exec::build`'s
+    /// Claude path (#8697): the proxy bad-marks nothing in either case,
+    /// mirroring `ingest::LaunchRecord::is_pool_selected`'s guard.
+    pool_account: Option<String>,
+    workspace_root: Option<Arc<PathBuf>>,
+    /// Model class a mark is scoped to (#8424 item 3), normalized the same
+    /// way `ingest::ingest_launch_log` does — so a proxy-side mark and a later
+    /// exit-code-driven mark land on the very same `(account, class)` pair and
+    /// the latter's already-marked check (see `api_keys_pool::ingest`) finds
+    /// it instead of writing a second one.
+    model_class: Option<String>,
+    /// Set once this launch has been bad-marked at the proxy. Shared across
+    /// every clone of this record (one per request), so a second 429 on the
+    /// same launch — however many requests race it — bad-marks at most once
+    /// (#8699 AC2).
+    bad_marked: Arc<AtomicBool>,
+    /// Shared with every clone of this record so a per-request tally lands in
+    /// the one instance the launch owns.
+    usage: Arc<Mutex<Usage>>,
 }
 
 impl std::fmt::Debug for Record {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let usage = self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone();
         f.debug_struct("Record")
             .field("launch_id", &self.launch_id)
             .field("provider", &self.provider)
@@ -228,6 +274,10 @@ impl std::fmt::Debug for Record {
             .field("header", &self.header)
             .field("credential", &"<redacted>")
             .field("open", &self.open)
+            .field("pool_account", &self.pool_account)
+            .field("model_class", &self.model_class)
+            .field("bad_marked", &self.bad_marked.load(Ordering::Relaxed))
+            .field("usage", &usage)
             .finish()
     }
 }
@@ -248,7 +298,28 @@ impl Record {
             header,
             credential: credential.into(),
             open: true,
+            pool_account: None,
+            workspace_root: None,
+            model_class: None,
+            bad_marked: Arc::new(AtomicBool::new(false)),
+            usage: Arc::new(Mutex::new(Usage::default())),
         }
+    }
+
+    /// Attach the pool attribution the proxy needs to bad-mark this launch's
+    /// account (#8699). Builder method, kept separate from [`Self::new`] so
+    /// every existing caller — and every non-pool launch — is unaffected.
+    #[must_use]
+    pub fn with_pool_account(
+        mut self,
+        workspace_root: PathBuf,
+        account: impl Into<String>,
+        model_class: Option<String>,
+    ) -> Self {
+        self.pool_account = Some(account.into());
+        self.workspace_root = Some(Arc::new(workspace_root));
+        self.model_class = model_class;
+        self
     }
 
     /// `(header, value)` to send upstream in place of whatever the container
@@ -256,6 +327,114 @@ impl Record {
     #[must_use]
     pub fn upstream_header(&self) -> (&'static str, String) {
         self.header.render(&self.credential)
+    }
+
+    /// This launch's pool account name, when its credential was pool-selected.
+    #[must_use]
+    pub fn pool_account(&self) -> Option<&str> {
+        self.pool_account.as_deref()
+    }
+
+    /// The workspace root whose pool [`Self::pool_account`] belongs to.
+    #[must_use]
+    pub fn workspace_root(&self) -> Option<&std::path::Path> {
+        self.workspace_root.as_deref().map(PathBuf::as_path)
+    }
+
+    /// The model class a mark should be scoped to, when the launch named one.
+    #[must_use]
+    pub fn model_class(&self) -> Option<&str> {
+        self.model_class.as_deref()
+    }
+
+    /// Atomically flips this launch's bad-mark flag from unset to set,
+    /// returning `true` only for the caller that won the race. Every other
+    /// 429 on the same launch — concurrent or sequential — sees `false` and
+    /// does nothing, which is what makes "exactly one bad-mark per launch"
+    /// (#8699 AC2) true even under a racing pair of requests.
+    pub fn begin_bad_mark(&self) -> bool {
+        self.bad_marked
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Add one request/response pair's byte counts to this launch's running
+    /// total, and replace the captured usage headers with the ones just
+    /// observed.
+    pub fn record_usage(
+        &self,
+        request_bytes: u64,
+        response_bytes: u64,
+        headers: Vec<(String, String)>,
+    ) {
+        let mut usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        usage.request_bytes += request_bytes;
+        usage.response_bytes += response_bytes;
+        usage.headers = headers;
+    }
+
+    /// A snapshot of this launch's usage so far.
+    #[must_use]
+    pub fn usage(&self) -> Usage {
+        self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The one-line, secret-free usage summary written to the launch log when
+    /// the launch ends (#8699 AC1's durable surface), keyed by `launch_id`:
+    ///
+    /// `# LOOM_EGRESS_USAGE launch=<id> provider=<p> account=<name|none>
+    /// request_bytes=<n> response_bytes=<n> bad_marked=<bool> [<header>=<value>]...`
+    ///
+    /// Built only from fields that are non-secret by construction — never the
+    /// credential, never the placeholder (which is the registry's map key and
+    /// not reachable from a `Record` at all). Header values are provider
+    /// telemetry from [`Usage::headers`]' allowlist, with whitespace and
+    /// control characters replaced so a value can never split the line.
+    #[must_use]
+    pub fn usage_marker(&self) -> String {
+        let usage = self.usage();
+        let mut line = format!(
+            "{USAGE_MARKER_PREFIX}launch={} provider={} account={} request_bytes={} \
+             response_bytes={} bad_marked={}",
+            marker_value(&self.launch_id),
+            marker_value(&self.provider),
+            self.pool_account
+                .as_deref()
+                .map_or_else(|| "none".to_string(), marker_value),
+            usage.request_bytes,
+            usage.response_bytes,
+            self.bad_marked.load(Ordering::SeqCst),
+        );
+        for (name, value) in &usage.headers {
+            line.push_str(&format!(" {}={}", marker_value(name), marker_value(value)));
+        }
+        line
+    }
+}
+
+/// Prefix of the per-launch usage line [`Record::usage_marker`] renders.
+/// `api_keys_pool::classify` drops lines carrying it before classifying a
+/// retained launch log, so a captured header value (a `retry-after` next to a
+/// rate-limit header name) can never itself read as an exhaustion signal.
+pub const USAGE_MARKER_PREFIX: &str = "# LOOM_EGRESS_USAGE ";
+
+/// `raw` with whitespace, control characters and `=` replaced by `_`, so one
+/// value is always exactly one `key=value` token on one line.
+fn marker_value(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_whitespace() || c.is_control() || c == '=' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "_".to_string()
+    } else {
+        cleaned
     }
 }
 
@@ -327,6 +506,16 @@ impl Registry {
         for record in self.lock().values_mut() {
             record.open = false;
         }
+    }
+
+    /// [`Record::usage_marker`] for every launch this registry holds, sorted
+    /// by `launch_id` so the output is deterministic. One launch per registry
+    /// in practice (see `mod::arm`).
+    #[must_use]
+    pub fn usage_markers(&self) -> Vec<String> {
+        let mut records: Vec<Record> = self.lock().values().cloned().collect();
+        records.sort_by(|a, b| a.launch_id.cmp(&b.launch_id));
+        records.iter().map(Record::usage_marker).collect()
     }
 
     /// Authorize one request.

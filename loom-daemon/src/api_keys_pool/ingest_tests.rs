@@ -98,6 +98,49 @@ fn an_exhaustion_in_a_launch_log_bad_marks_the_pool_account_automatically() {
     assert_eq!(chosen.name, "beta");
 }
 
+/// #8699 AC2's double-mark guard: the egress proxy may already have
+/// bad-marked this exact `(account, class)` pair — immediately, at request
+/// time, well before this launch's process even exited — so the exit-code-
+/// driven pass over the retained log must find that mark already active and
+/// leave it alone rather than writing a second, redundant one.
+#[test]
+fn an_already_active_mark_is_not_overwritten_by_the_exit_code_path() {
+    let tmp = workspace(&["alpha", "beta"]);
+    // Simulate the proxy's own immediate mark: same account, same class,
+    // written with the proxy's own reason text and a short cooldown.
+    let proxy_mark = bad_marks::mark_bad_for_class(
+        &pool_root(tmp.path()),
+        PROVIDER,
+        "alpha",
+        "rate-limited (classified at the egress proxy)",
+        Some(3600),
+        Some("glm-5.3-flash"),
+    )
+    .unwrap();
+
+    let contents = log(
+        "pool",
+        Some("alpha"),
+        "glm-5.3-flash",
+        "Error: insufficient balance for this account",
+    );
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+
+    // No second write happened: the returned mark is byte-for-byte the
+    // proxy's own (same `marked_at`, same reason) — not a fresh exhaustion
+    // mark with today's "classified from the launch log" wording.
+    assert_eq!(feedback.mark, Some(proxy_mark.clone()));
+    assert!(feedback.detail.contains("already bad-marked"), "{}", feedback.detail);
+    let still_active = active(tmp.path(), "alpha", Some("glm-5.3-flash")).unwrap();
+    assert_eq!(
+        still_active, proxy_mark,
+        "the exit-code path must not overwrite the proxy's mark"
+    );
+
+    // The unmarked sibling account is unaffected and still selectable.
+    assert!(active(tmp.path(), "beta", Some("glm-5.3-flash")).is_none());
+}
+
 /// #8424 item 5 / AC 5, end to end: the real captured `provider.auth` 401
 /// event is surfaced as a credential failure and the account is **not**
 /// marked, so no exhaustion reset horizon is applied to a healthy key.

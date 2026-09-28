@@ -461,6 +461,15 @@ fn without_transcript(region: &str) -> String {
     region
         .lines()
         .filter(|line| !is_transcript_event(line))
+        // #8699: the egress proxy's own per-launch usage line carries
+        // provider rate-limit header names and values verbatim; it is Loom's
+        // telemetry, not the provider's error output, and must never be read
+        // as an exhaustion signal on its own.
+        .filter(|line| {
+            !line
+                .trim_start()
+                .starts_with(crate::worker_spawn::egress_proxy::registry::USAGE_MARKER_PREFIX)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -504,6 +513,21 @@ pub fn classify_launch_region(region: &str, exit_code: i32) -> Option<Classifica
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #8699: the egress proxy's per-launch usage line names rate-limit
+    /// headers verbatim; the automatic path must not read it as the
+    /// provider's own rate-limit error and bad-mark a healthy account.
+    #[test]
+    fn the_egress_usage_marker_line_is_never_an_exhaustion_signal() {
+        let usage_line = "# LOOM_EGRESS_USAGE launch=abc provider=anthropic account=alpha \
+                          request_bytes=13 response_bytes=11 bad_marked=false \
+                          x-ratelimit-error-kind=rate_limit retry-after=30";
+        // Sanity: the same text, read raw, WOULD classify — so the filter is
+        // what keeps it out, not an accident of the wording.
+        assert_eq!(classify(usage_line, 1), Some(Classification::RateLimited));
+        let region = format!("# LOOM_LAUNCH {{\"schema\":1}}\n{usage_line}\n");
+        assert_eq!(classify_launch_region(&region, 1), None);
+    }
 
     #[test]
     fn recognises_the_documented_exhaustion_and_rate_limit_shapes() {

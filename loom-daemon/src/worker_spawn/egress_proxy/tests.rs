@@ -255,6 +255,71 @@ pub(super) async fn fake_upstream(reply: &'static str) -> (String, Arc<Mutex<Vec
     (format!("127.0.0.1:{}", addr.port()), seen)
 }
 
+/// [`fake_upstream`], generalized to an arbitrary status and extra response
+/// headers (#8699: rate-limit/usage header capture, and a non-200 response
+/// for the quota-exhaustion classifier).
+pub(super) async fn fake_upstream_with(
+    status: u16,
+    headers: &'static [(&'static str, &'static str)],
+    reply: &'static str,
+) -> (String, Arc<Mutex<Vec<Seen>>>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(i) = text.find("\r\n\r\n") {
+                        let len: usize = text
+                            .to_ascii_lowercase()
+                            .split("content-length:")
+                            .nth(1)
+                            .and_then(|rest| rest.split("\r\n").next())
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= i + 4 + len {
+                            sink.lock().unwrap().push(Seen {
+                                head: text[..i].to_string(),
+                                body: text[i + 4..].to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
+                let mut header_lines = String::new();
+                for (name, value) in headers {
+                    header_lines.push_str(&format!("{name}: {value}\r\n"));
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} \r\n{header_lines}content-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    (format!("127.0.0.1:{}", addr.port()), seen)
+}
+
 /// Minimal client: send `request` verbatim, read the whole reply.
 pub(super) async fn raw_request(addr: std::net::SocketAddr, request: &str) -> String {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -655,4 +720,251 @@ fn the_bundled_proxied_example_profile_parses_and_validates() {
     let upstream = proxy.validate().unwrap();
     assert_eq!(upstream.host(), "api.anthropic.com");
     assert_eq!(proxy.base_url_env, vec!["ANTHROPIC_BASE_URL".to_string()]);
+}
+
+// --------------------------------------------- usage attribution (issue #8699)
+
+/// AC1: per-launch request/response byte counts and the provider's own
+/// rate-limit/usage headers are captured, keyed by `launch_id` (via the
+/// registry's own per-placeholder record).
+#[tokio::test]
+async fn per_launch_usage_is_recorded_with_captured_rate_limit_headers() {
+    let (upstream_addr, _seen) = fake_upstream_with(
+        200,
+        &[
+            ("anthropic-ratelimit-requests-remaining", "41"),
+            ("x-ratelimit-limit-tokens", "100000"),
+            ("retry-after", "3"),
+            // Never captured: not on the usage allowlist.
+            ("x-request-id", "req-123"),
+        ],
+        "{\"ok\":true}",
+    )
+    .await;
+    let (addr, registry, placeholder) = start_proxy(&format!("http://{upstream_addr}")).await;
+
+    let response = raw_request(addr, &post(Some(placeholder.as_str()), &addr.to_string())).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let live = vec![placeholder.as_str().to_string()];
+    let record = registry
+        .authorize("POST", &live, Some(&addr.to_string()))
+        .unwrap();
+    assert_eq!(record.launch_id, "launch-1");
+    let usage = record.usage();
+    assert_eq!(usage.request_bytes, 13, "the 13-byte `{{\"model\":\"x\"}}` body");
+    assert_eq!(usage.response_bytes, "{\"ok\":true}".len() as u64);
+    assert!(
+        usage
+            .headers
+            .contains(&("anthropic-ratelimit-requests-remaining".to_string(), "41".to_string())),
+        "{:?}",
+        usage.headers
+    );
+    assert!(
+        usage
+            .headers
+            .contains(&("x-ratelimit-limit-tokens".to_string(), "100000".to_string())),
+        "{:?}",
+        usage.headers
+    );
+    assert!(
+        usage
+            .headers
+            .contains(&("retry-after".to_string(), "3".to_string())),
+        "{:?}",
+        usage.headers
+    );
+    assert!(
+        !usage.headers.iter().any(|(k, _)| k == "x-request-id"),
+        "only the allowlisted usage headers may be captured: {:?}",
+        usage.headers
+    );
+}
+
+/// AC4: unproxied dispatch never sees any of this — [`Record::usage`] on a
+/// record nobody ever routed a request through stays at its default, zeroed
+/// state.
+#[test]
+fn a_record_with_no_traffic_has_empty_usage() {
+    let record = Record::new(
+        "launch-idle",
+        "anthropic",
+        Upstream::parse("https://api.anthropic.com").unwrap(),
+        HeaderStyle::AuthorizationBearer,
+        "sk-fake-real-credential",
+    );
+    let usage = record.usage();
+    assert_eq!(usage.request_bytes, 0);
+    assert_eq!(usage.response_bytes, 0);
+    assert!(usage.headers.is_empty());
+}
+
+/// A workspace with one pool-registered account, wired the way
+/// `mod::prepare` wires a pool-selected `Record` via `with_pool_account`.
+fn pool_attributed_record(tmp: &std::path::Path, upstream: &str, account: &str) -> Record {
+    crate::api_keys_pool::registry::add(
+        &tmp.join(".loom/api-keys"),
+        "anthropic",
+        account,
+        "ANTHROPIC_API_KEY",
+        "fake-key-not-a-real-credential",
+        false,
+    )
+    .unwrap();
+    Record::new(
+        "launch-429",
+        "anthropic",
+        Upstream::parse(upstream).unwrap(),
+        HeaderStyle::AuthorizationBearer,
+        "sk-fake-real-credential",
+    )
+    .with_pool_account(tmp.to_path_buf(), account, None)
+}
+
+fn active_mark(tmp: &std::path::Path, account: &str) -> Option<crate::api_keys_pool::BadMark> {
+    crate::api_keys_pool::bad_marks::active_mark(
+        &tmp.join(".loom/api-keys"),
+        "anthropic",
+        account,
+        crate::api_keys_pool::bad_marks::epoch_now(),
+    )
+    .unwrap()
+}
+
+/// AC2: a 429 on a pool-selected launch bad-marks the account at the proxy
+/// immediately — no waiting for the child to exit — and a second 429 on the
+/// SAME launch does not mark it a second time.
+#[tokio::test]
+async fn a_429_bad_marks_the_pool_account_at_the_proxy_exactly_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (upstream_addr, _seen) = fake_upstream_with(
+        429,
+        &[],
+        "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"rate limited\"}}",
+    )
+    .await;
+
+    let registry = Registry::new();
+    let placeholder = Placeholder::generate();
+    let record = pool_attributed_record(tmp.path(), &format!("http://{upstream_addr}"), "acct-1");
+    registry.insert(&placeholder, record);
+    let bound = server::Bound::bind(std::net::Ipv4Addr::LOCALHOST.into()).unwrap();
+    let addr = bound.addr();
+    let listener = bound.into_tokio().unwrap();
+    tokio::spawn(server::serve(listener, registry.clone()));
+
+    let response = raw_request(addr, &post(Some(placeholder.as_str()), &addr.to_string())).await;
+    assert!(response.starts_with("HTTP/1.1 429"), "{response}");
+
+    // The mark lands on a `spawn_blocking` task; poll briefly for it.
+    let mut mark = None;
+    for _ in 0..100 {
+        mark = active_mark(tmp.path(), "acct-1");
+        if mark.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mark = mark.expect("a 429 must bad-mark the pool account");
+    assert!(mark.reason.contains("egress proxy"), "{}", mark.reason);
+
+    // A second 429 on the very same launch must not mark it again.
+    let response = raw_request(addr, &post(Some(placeholder.as_str()), &addr.to_string())).await;
+    assert!(response.starts_with("HTTP/1.1 429"), "{response}");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mark_again = active_mark(tmp.path(), "acct-1").expect("still marked");
+    assert_eq!(mark, mark_again, "a second 429 on the same launch must not re-mark");
+}
+
+/// AC2's flip side: a launch whose credential was NOT pool-selected (no
+/// [`Record::with_pool_account`] call, exactly `exec::build`'s Claude path)
+/// never bad-marks anything, however many 429s it sees.
+#[tokio::test]
+async fn a_429_on_a_non_pool_launch_never_bad_marks_anything() {
+    let (upstream_addr, _seen) = fake_upstream_with(429, &[], "{\"error\":\"rate limited\"}").await;
+    let (addr, _registry, placeholder) = start_proxy(&format!("http://{upstream_addr}")).await;
+
+    let response = raw_request(addr, &post(Some(placeholder.as_str()), &addr.to_string())).await;
+    assert!(response.starts_with("HTTP/1.1 429"), "{response}");
+    // Nothing to assert against a pool file that was never created — the
+    // absence of a panic/paniced `unwrap` inside the proxy IS the assertion:
+    // `Record::pool_account()` is `None` for `registry_with`'s plain record,
+    // so `bad_mark_at_proxy` must return before touching any filesystem path.
+}
+
+/// #8699 AC3, extending the #8674 redaction test: the new usage counters and
+/// pool attribution never render the real credential or the placeholder,
+/// even once populated with real-looking (but fake) values.
+#[tokio::test]
+async fn usage_and_pool_attribution_never_render_the_credential_or_placeholder() {
+    let placeholder = Placeholder::generate();
+    let tmp = tempfile::tempdir().unwrap();
+    let record =
+        pool_attributed_record(tmp.path(), "https://api.anthropic.com", "acct-redaction-test");
+    record.record_usage(
+        13,
+        11,
+        vec![("anthropic-ratelimit-requests-remaining".to_string(), "41".to_string())],
+    );
+    let rendered = format!("{record:?}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+    assert!(!rendered.contains("sk-fake-real-credential"), "{rendered}");
+    assert!(!rendered.contains(placeholder.as_str()), "{rendered}");
+    // The account name and usage counters ARE expected to render — they are
+    // non-secret by construction (an account name, byte counts, and an
+    // allowlisted header name/value).
+    assert!(rendered.contains("acct-redaction-test"), "{rendered}");
+    assert!(rendered.contains("anthropic-ratelimit-requests-remaining"), "{rendered}");
+}
+
+/// AC1's durable surface: the per-launch usage line written to the retained
+/// launch log when the launch ends — keyed by `launch_id`, carrying the byte
+/// counts and every captured header, and one `key=value` token per field even
+/// when a header value holds whitespace.
+#[test]
+fn the_usage_marker_is_keyed_by_launch_id_and_written_to_the_launch_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let record = pool_attributed_record(tmp.path(), "https://api.anthropic.com", "acct-log");
+    record.record_usage(
+        13,
+        11,
+        vec![
+            ("anthropic-ratelimit-tokens-remaining".to_string(), "9000".to_string()),
+            ("x-ratelimit-reset-requests".to_string(), "1 s".to_string()),
+        ],
+    );
+    record.record_usage(7, 5, vec![("retry-after".to_string(), "3".to_string())]);
+    let registry = Registry::new();
+    let placeholder = Placeholder::generate();
+    registry.insert(&placeholder, record);
+    registry.close_all();
+
+    let mut log: Vec<u8> = Vec::new();
+    write_usage_markers(&registry, &mut log);
+    let log = String::from_utf8(log).unwrap();
+
+    assert_eq!(
+        log,
+        "# LOOM_EGRESS_USAGE launch=launch-429 provider=anthropic account=acct-log \
+         request_bytes=20 response_bytes=16 bad_marked=false retry-after=3\n",
+        "byte counts accumulate; headers reflect the latest response"
+    );
+    assert!(log.starts_with(registry::USAGE_MARKER_PREFIX));
+    assert!(!log.contains("sk-fake-real-credential"), "{log}");
+    assert!(!log.contains(placeholder.as_str()), "{log}");
+
+    // A value containing whitespace can never split the line.
+    let spaced = Record::new(
+        "launch-spaced",
+        "anthropic",
+        Upstream::parse("https://api.anthropic.com").unwrap(),
+        HeaderStyle::XApiKey,
+        "sk-fake-real-credential",
+    );
+    spaced.record_usage(1, 2, vec![("x-ratelimit-reset".to_string(), "1 s\r\nx=y".to_string())]);
+    let line = spaced.usage_marker();
+    assert!(line.ends_with(" x-ratelimit-reset=1_s__x_y"), "{line}");
+    assert!(line.contains("account=none"), "{line}");
+    assert!(!line.contains("sk-fake-real-credential"), "{line}");
 }

@@ -290,18 +290,61 @@ pub fn ingest_launch_log(
     };
 
     let reason = format!("{} (classified from the launch log)", classification.label());
-    let marked = super::paths::resolve_provider_root(workspace, &provider)
+    let root = match super::paths::resolve_provider_root(workspace, &provider)
         .map_err(|e| e.to_string())
-        .and_then(|root| {
-            bad_marks::mark_bad_for_class(
-                &root,
-                &provider,
-                &account,
-                &reason,
-                Some(cooldown),
-                model_class.as_deref(),
-            )
+    {
+        Ok(root) => root,
+        Err(error) => {
+            return Some(LaunchFeedback {
+                detail: format!(
+                    "api-keys pool: could not bad-mark {provider}/{account} ({scope}) as {}: {error}",
+                    classification.label()
+                ),
+                provider,
+                account,
+                model_class,
+                classification,
+                mark: None,
+            });
+        }
+    };
+    // #8699 AC2's double-mark guard: the egress proxy may already have
+    // bad-marked this very account (on the same class) the instant a 429/
+    // quota-exhausted response crossed it, well before this launch's process
+    // even exited. An already-active mark for the same `(account, class)`
+    // pair means this exit-code-driven pass has nothing left to do — writing
+    // one anyway would only reset a cooldown someone else already started,
+    // which is indistinguishable from a second, redundant mark.
+    let already_marked = bad_marks::active_mark_for_class(
+        &root,
+        &provider,
+        &account,
+        model_class.as_deref(),
+        bad_marks::epoch_now(),
+    );
+    if let Ok(Some(existing)) = already_marked {
+        return Some(LaunchFeedback {
+            detail: format!(
+                "api-keys pool: {provider}/{account} ({scope}) is already bad-marked ({}) — \
+                 skipping a duplicate mark from the launch log (likely already marked at the \
+                 egress proxy, #8699)",
+                existing.reason
+            ),
+            provider,
+            account,
+            model_class,
+            classification,
+            mark: Some(existing),
         });
+    }
+    let marked = bad_marks::mark_bad_for_class(
+        &root,
+        &provider,
+        &account,
+        &reason,
+        Some(cooldown),
+        model_class.as_deref(),
+    );
     let detail = match &marked {
         Ok(_) => format!(
             "api-keys pool: bad-marked {provider}/{account} ({scope}) as {} for {cooldown}s from \

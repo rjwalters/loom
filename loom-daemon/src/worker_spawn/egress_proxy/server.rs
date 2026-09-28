@@ -22,9 +22,32 @@
 //!   in another cannot smuggle the second value upstream.
 //! - It **streams the response** chunk by chunk, because the provider traffic
 //!   this carries is mostly `text/event-stream`; buffering would turn every
-//!   token into a stall.
+//!   token into a stall — **except** an error response (any non-2xx status),
+//!   which is buffered whole instead. Error bodies are small JSON, never a
+//!   token stream, and buffering them is what lets this listener read the
+//!   provider's own words to decide whether to bad-mark the account (#8699,
+//!   below).
+//!
+//! # Per-launch usage attribution and proxy-side bad-marking (issue #8699)
+//!
+//! Every forwarded request/response pair updates the launch's
+//! [`registry::Usage`] tally (byte counts, plus the provider's own
+//! rate-limit/usage response headers — an **allowlist**,
+//! [`is_usage_header`], so nothing outside that fixed set, and in particular
+//! never a [`CREDENTIAL_HEADERS`] entry, is ever captured).
+//!
+//! An error response is additionally run through
+//! [`crate::api_keys_pool::classify::classify`] — the SAME text classifier
+//! [`crate::api_keys_pool::ingest`] uses post-hoc on a whole launch log — plus
+//! a plain HTTP 429 check ([`classify_response`]). A hit bad-marks the
+//! account immediately, here, rather than waiting for the child to exit and a
+//! log to be read: [`Record::begin_bad_mark`] guards a launch from being
+//! marked twice by a racing pair of 429s, and `ingest`'s own
+//! already-active-mark check (see that module) guards against a *second*
+//! mark landing later from the exit-code-driven path for the same account.
 
 use super::registry::{Record, Refusal, Registry, CREDENTIAL_HEADERS};
+use crate::api_keys_pool::classify::{self, Classification};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -34,6 +57,10 @@ use tokio::net::{TcpListener, TcpStream};
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// Cap on a buffered request body. Prompts are large; uploads are not.
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Cap on a buffered ERROR response body (never applied to a success
+/// response, which is always streamed). Generous for a provider's JSON error
+/// shape, far below anything a provider would plausibly send on a refusal.
+const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
 
 /// Headers that are connection-scoped and must not be forwarded, plus `host`
 /// and `content-length`, which the outbound client recomputes.
@@ -335,6 +362,7 @@ async fn forward(
     record: &Record,
     client: &reqwest::Client,
 ) -> std::io::Result<()> {
+    let request_bytes = body.len() as u64;
     let url = record.upstream.url_for(&head.path_and_query());
     let method = match reqwest::Method::from_bytes(head.method.as_bytes()) {
         Ok(method) => method,
@@ -365,22 +393,59 @@ async fn forward(
             return write_status(stream, 502, "upstream request failed").await;
         }
     };
-    let mut out = format!("HTTP/1.1 {} \r\n", response.status().as_u16());
+    let status = response.status();
+    // Captured before the body is consumed either way: the allowlisted
+    // rate-limit/usage headers (#8699) and the forwarded header block, since
+    // `response.headers()` borrows and both the error and success paths below
+    // need it.
+    let usage_headers = capture_usage_headers(response.headers());
+    let mut header_lines = String::new();
     for (name, value) in response.headers() {
         let name = name.as_str();
         if HOP_BY_HOP.contains(&name) {
             continue;
         }
         if let Ok(value) = value.to_str() {
-            out.push_str(&format!("{name}: {value}\r\n"));
+            header_lines.push_str(&format!("{name}: {value}\r\n"));
         }
     }
+
+    if !status.is_success() {
+        // Buffered, not streamed: an error body is small JSON, never a token
+        // stream, and this is what lets #8699's classifier read it.
+        let error_body = match read_capped(&mut response, MAX_ERROR_BODY_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!(
+                    "egress-proxy: upstream error body failed launch={}: {error}",
+                    record.launch_id
+                );
+                record.record_usage(request_bytes, 0, usage_headers);
+                return write_status(stream, 502, "upstream response body failed").await;
+            }
+        };
+        record.record_usage(request_bytes, error_body.len() as u64, usage_headers);
+        let text = String::from_utf8_lossy(&error_body);
+        if let Some(classification) = classify_response(status.as_u16(), &text) {
+            bad_mark_at_proxy(record.clone(), classification).await;
+        }
+        let mut out = format!("HTTP/1.1 {} \r\n{header_lines}", status.as_u16());
+        out.push_str(&format!("content-length: {}\r\nconnection: close\r\n\r\n", error_body.len()));
+        stream.write_all(out.as_bytes()).await?;
+        stream.write_all(&error_body).await?;
+        stream.flush().await?;
+        return stream.shutdown().await;
+    }
+
+    let mut out = format!("HTTP/1.1 {} \r\n{header_lines}", status.as_u16());
     out.push_str("transfer-encoding: chunked\r\nconnection: close\r\n\r\n");
     stream.write_all(out.as_bytes()).await?;
     stream.flush().await?;
+    let mut response_bytes: u64 = 0;
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) if !chunk.is_empty() => {
+                response_bytes += chunk.len() as u64;
                 stream
                     .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
                     .await?;
@@ -399,9 +464,125 @@ async fn forward(
             }
         }
     }
+    record.record_usage(request_bytes, response_bytes, usage_headers);
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     stream.shutdown().await
+}
+
+/// Buffer up to `cap` bytes of `response`'s body. Only ever called on an
+/// error response (never a streamed success), so `cap` is a defensive limit
+/// on a shape that is normally a few hundred bytes of JSON, not a real
+/// truncation concern.
+async fn read_capped(response: &mut reqwest::Response, cap: usize) -> reqwest::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    while buf.len() < cap {
+        match response.chunk().await? {
+            Some(chunk) => buf.extend_from_slice(&chunk),
+            None => break,
+        }
+    }
+    buf.truncate(cap);
+    Ok(buf)
+}
+
+/// Response header names worth keeping for per-launch usage attribution
+/// (#8699): the provider's own rate-limit/quota telemetry. Deliberately an
+/// **allowlist**, not a denylist — anything not named here, and in particular
+/// every [`CREDENTIAL_HEADERS`] entry, is dropped rather than risking a future
+/// provider header that happens to carry something sensitive.
+fn is_usage_header(name: &str) -> bool {
+    name.starts_with("anthropic-ratelimit-")
+        || name.starts_with("x-ratelimit-")
+        || name == "retry-after"
+}
+
+fn capture_usage_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_str().to_ascii_lowercase();
+            if !is_usage_header(&name) {
+                return None;
+            }
+            value.to_str().ok().map(|v| (name, v.to_string()))
+        })
+        .collect()
+}
+
+/// What an error response says about the account's quota, if anything.
+///
+/// Reuses [`classify::classify`] — the SAME table
+/// [`crate::api_keys_pool::ingest`] runs post-hoc over a whole launch log —
+/// against just this one response body, so a provider's JSON error shape
+/// (Anthropic's `{"error":{"type":"rate_limit_error",...}}`, OpenAI's
+/// `insufficient_quota`, …) is recognised here exactly as it would be there. A
+/// [`Classification::CredentialFailure`] hit — even on a `429` — must NOT
+/// bad-mark (guard 4, mirrored from `ingest`'s module docs): an auth fault is
+/// not an exhaustion signal. Only when the body carries no recognisable
+/// classification at all does a bare `429` status fall back to
+/// [`Classification::RateLimited`].
+fn classify_response(status: u16, body: &str) -> Option<Classification> {
+    if let Some(found) = classify::classify(body, 1) {
+        return found.marks_bad().then_some(found);
+    }
+    (status == 429).then_some(Classification::RateLimited)
+}
+
+/// Bad-mark this launch's pool account at the proxy (#8699 AC2), the moment a
+/// 429/quota-exhausted response is seen — never waiting for the child to
+/// exit. A no-op when the launch's credential was not pool-selected
+/// ([`Record::pool_account`] is `None`), and — via
+/// [`Record::begin_bad_mark`] — for every request after the first on the same
+/// launch.
+///
+/// Runs the actual pool write on a blocking thread:
+/// [`crate::api_keys_pool::bad_marks::mark_bad_for_class`] takes a filesystem
+/// `mkdir` lock that can retry for seconds under
+/// contention, which must never stall this listener's async reactor (it runs
+/// on a two-worker-thread runtime, see [`super::run_with_proxy`]).
+async fn bad_mark_at_proxy(record: Record, classification: Classification) {
+    let (Some(root), Some(account)) = (
+        record.workspace_root().map(std::path::Path::to_path_buf),
+        record.pool_account().map(str::to_string),
+    ) else {
+        return;
+    };
+    if !record.begin_bad_mark() {
+        return;
+    }
+    let Some(cooldown) = classification.default_cooldown_secs() else {
+        return;
+    };
+    let provider = record.provider.clone();
+    let launch_id = record.launch_id.clone();
+    let model_class = record.model_class().map(str::to_string);
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::api_keys_pool::paths::resolve_provider_root(&root, &provider)
+            .map_err(|e| e.to_string())
+            .and_then(|provider_root| {
+                crate::api_keys_pool::mark_bad_for_class(
+                    &provider_root,
+                    &provider,
+                    &account,
+                    &format!("{} (classified at the egress proxy)", classification.label()),
+                    Some(cooldown),
+                    model_class.as_deref(),
+                )
+            })
+            .map(|_| (provider, account))
+    })
+    .await;
+    match outcome {
+        Ok(Ok((provider, account))) => log::warn!(
+            "egress-proxy: bad-marked {provider}/{account} as {} launch={launch_id}",
+            classification.label()
+        ),
+        Ok(Err(error)) => {
+            log::warn!("egress-proxy: could not bad-mark for launch={launch_id}: {error}")
+        }
+        Err(error) => log::warn!("egress-proxy: bad-mark task failed launch={launch_id}: {error}"),
+    }
 }
 
 async fn refuse(

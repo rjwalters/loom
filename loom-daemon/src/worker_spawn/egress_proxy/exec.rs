@@ -180,6 +180,12 @@ pub(crate) fn build(
         )));
     }
 
+    // #8699's proxy-side bad-marking applies to the `api_keys_pool` ladder
+    // `worker_spawn::credential::resolve` walks (see `mod::prepare`); this
+    // path is handed an already-selected Claude OAuth token from
+    // `tokens_pool` instead (#8697), so it never carries pool attribution and
+    // the proxy bad-marks nothing here. See #8818 for that pool's own
+    // host-side rotation.
     let prepared = arm(
         secret.clone(),
         args.provider.clone(),
@@ -187,6 +193,7 @@ pub(crate) fn build(
         upstream,
         &[args.credential_env.as_str()],
         Vec::new(),
+        None,
     )?;
 
     let mut command = Command::new(program);
@@ -291,7 +298,7 @@ pub fn cli(args: ExecArgs) -> anyhow::Result<()> {
     let outcome = build(&args, &env).and_then(|(prepared, command)| {
         // Secret-free: launch id, upstream origin, bind address, header style.
         eprintln!("{}", prepared.dispatch_marker());
-        run_with_proxy(prepared, command)
+        run_with_proxy(prepared, command, &mut std::io::stderr())
     });
     if let Err(error) = outcome {
         eprintln!("{}", error.message);
