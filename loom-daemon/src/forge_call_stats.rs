@@ -320,18 +320,22 @@ fn sink_file(dir: &Path, hour: i64) -> PathBuf {
 }
 
 fn append(dir: &Path, line: &SinkLine) -> std::io::Result<()> {
+    // Same owner-only rules as the ETag store: a 0700 dir we own, 0600 files.
+    if !crate::forge_etag_store::private_dir(dir, true) {
+        return Err(std::io::Error::other("untrusted sink dir"));
+    }
     let mut buf = serde_json::to_vec(line)?;
     buf.push(b'\n');
     let hour = line.t.div_euclid(3600);
     let path = sink_file(dir, hour);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.append(true);
-    let (mut file, fresh) = match opts.clone().create_new(true).open(&path) {
+    let mut create = std::fs::OpenOptions::new();
+    create.append(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut create, 0o600);
+    let (mut file, fresh) = match create.open(&path) {
         Ok(f) => (f, true),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (opts.open(&path)?, false),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(dir)?;
-            (opts.create(true).open(&path)?, true)
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            (std::fs::OpenOptions::new().append(true).open(&path)?, false)
         }
         Err(e) => return Err(e),
     };

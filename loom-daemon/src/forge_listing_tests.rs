@@ -3,10 +3,34 @@
 
 use super::*;
 use crate::forge_etag_store::{
-    cache_key, disk_cache_path, read_disk_entry, repo_scope as disk_cache_repo_scope,
+    cache_key, disk_cache_path, read_disk_entry, repo_scope, resolve_target,
 };
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::Command;
+
+thread_local! {
+    /// Test hook run by `list_issues_cached_once` between the request and the
+    /// response handling — lets a test mutate the cache mid-flight (#9252).
+    static AFTER_SEND_HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+}
+
+pub(super) fn run_after_send_hook() {
+    AFTER_SEND_HOOK.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f();
+        }
+    });
+}
+
+pub(super) fn set_after_send_hook(hook: Option<Box<dyn FnMut()>>) {
+    AFTER_SEND_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+/// The repo component of the shared key for a call from `cwd`.
+fn disk_cache_repo_scope(cwd: Option<&Path>, repo: Option<&str>) -> String {
+    repo_scope(cwd, &resolve_target(cwd, repo))
+}
 
 // ===== parse_http_response =====
 
@@ -339,7 +363,7 @@ fn a_transient_single_read_shrink_never_reaches_the_caller_or_the_disk() {
     // disputed gen2-flaky response must never have been persisted.
     let on_disk = read_disk_entry(&disk_cache_path(&cache_key(
         Some(dir.path()),
-        Some(&repo),
+        &resolve_target(Some(dir.path()), Some(&repo)),
         &build_issues_url(Some(&repo), "loom:epic", "open"),
     )))
     .unwrap();

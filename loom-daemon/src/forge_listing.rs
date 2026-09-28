@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -169,26 +169,33 @@ fn list_issues_cached_once(
 ) -> Result<Vec<RestIssue>> {
     let env_repo = std::env::var("LOOM_REPO").ok();
     let repo = repo_override.or(env_repo.as_deref());
-    let url = build_issues_url(repo, label, state);
-    let cache_key = store::daemon_cache_key(cwd, repo, &url);
+    // #9252: the URL names the SAME resolved repo the key does (never gh's
+    // own placeholder remote choice), so key and request cannot disagree.
+    let target = store::resolve_target(cwd, repo);
+    let url = build_issues_url(target.repo.as_deref(), label, state);
+    let cache_key = store::daemon_cache_key(cwd, &target, &url);
     let disk_path = store::daemon_store_dir().map(|d| store::entry_path_in(&d, &cache_key));
-    let cached_etag = cached_etag(&cache_key, disk_path.as_deref());
+    // Snapshot the (etag, issues) PAIR before the request: a 304 validates
+    // exactly the ETag we sent, so it may only ever serve the body stored with
+    // that ETag — never whatever a concurrent writer put under the key since.
+    let sent = cached_entry(&cache_key, disk_path.as_deref());
 
+    let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
     let (status, response, stderr) =
-        store::fetch_conditional(caller, gh_bin, cwd, &url, cached_etag.as_deref())?;
+        store::fetch_conditional(caller, gh_bin, cwd, &target, &url, sent_etag)?;
+    #[cfg(test)]
+    tests::run_after_send_hook();
 
     match response {
         Some(ref r) if r.status == 304 => {
             // Free cache hit (a 304 does not count against the rate limit).
-            if let Ok(guard) = cache().lock() {
-                if let Some(entry) = guard.get(&cache_key) {
-                    log::debug!("forge_listing: 304 cache hit for {url}");
-                    return Ok(entry.issues.clone());
-                }
+            if let Some(entry) = sent {
+                log::debug!("forge_listing: 304 cache hit for {url}");
+                return Ok(entry.issues.as_ref().clone());
             }
-            // A 304 can only happen because WE sent the etag, so the entry
-            // existing is an invariant; if it is somehow gone, drop the etag
-            // path and error so the next call re-fetches unconditionally.
+            // A 304 can only happen because WE sent an etag; without one this
+            // is anomalous — drop the key and error so the next call
+            // re-fetches unconditionally.
             if let Ok(mut guard) = cache().lock() {
                 guard.remove(&cache_key);
             }
@@ -217,7 +224,7 @@ fn list_issues_cached_once(
                     store::write_disk_entry(path, &entry);
                 }
                 if let Ok(mut guard) = cache().lock() {
-                    let issues = issues.clone();
+                    let issues = Arc::new(issues.clone());
                     guard.insert(cache_key, CacheEntry { etag, issues });
                 }
             }
@@ -231,26 +238,23 @@ fn list_issues_cached_once(
     }
 }
 
-/// The ETag to present for `key`: the in-memory hot layer, else a read-through
-/// of the disk entry at `disk` (parsed once and promoted into memory, so a
-/// steady-state `304` never re-reads or re-parses the file).
-fn cached_etag(key: &str, disk: Option<&Path>) -> Option<String> {
-    if let Some(etag) = cache().lock().ok()?.get(key).map(|e| e.etag.clone()) {
-        return Some(etag);
+/// The `(etag, issues)` pair to present for `key`: the in-memory hot layer,
+/// else a read-through of the disk entry at `disk` (parsed once and promoted
+/// into memory, so a steady-state `304` never re-reads or re-parses the file).
+/// Cheap to clone: the issues are shared behind an [`Arc`].
+fn cached_entry(key: &str, disk: Option<&Path>) -> Option<CacheEntry> {
+    if let Some(entry) = cache().lock().ok()?.get(key).cloned() {
+        return Some(entry);
     }
-    let entry = store::read_disk_entry(disk?)?;
-    let issues = parse_rest_issues(&entry.body).ok()?;
-    let etag = entry.etag;
+    let disk_entry = store::read_disk_entry(disk?)?;
+    let entry = CacheEntry {
+        issues: Arc::new(parse_rest_issues(&disk_entry.body).ok()?),
+        etag: disk_entry.etag,
+    };
     if let Ok(mut guard) = cache().lock() {
-        guard.insert(
-            key.to_string(),
-            CacheEntry {
-                etag: etag.clone(),
-                issues,
-            },
-        );
+        guard.insert(key.to_string(), entry.clone());
     }
-    Some(etag)
+    Some(entry)
 }
 
 /// Build the REST listing URL. With no explicit repo, gh's
@@ -382,7 +386,7 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
 #[derive(Debug, Clone)]
 struct CacheEntry {
     etag: String,
-    issues: Vec<RestIssue>,
+    issues: Arc<Vec<RestIssue>>,
 }
 
 /// Process-global hot layer of the ETag cache, keyed by resolved identity
@@ -473,15 +477,16 @@ pub fn list_issues_cached_persistent_as(
 ) -> Result<CachedListing> {
     let env_repo = std::env::var("LOOM_REPO").ok();
     let repo = repo_override.or(env_repo.as_deref());
-    let url = build_issues_url(repo, label, state);
-    // #9252: the same resolved-identity key the daemon's listing cache uses,
+    // #9252: the same resolved target + key the daemon's listing cache uses,
     // so the two share one on-disk entry per (repo, host, credential, query).
-    let entry_path = store::disk_cache_path(&store::cache_key(cwd, repo, &url));
+    let target = store::resolve_target(cwd, repo);
+    let url = build_issues_url(target.repo.as_deref(), label, state);
+    let entry_path = store::disk_cache_path(&store::cache_key(cwd, &target, &url));
     let prior = store::read_disk_entry(&entry_path);
     let prior_etag = prior.as_ref().map(|e| e.etag.as_str());
 
     let (status, response, stderr) =
-        store::fetch_conditional(caller, gh_bin, cwd, &url, prior_etag)?;
+        store::fetch_conditional(caller, gh_bin, cwd, &target, &url, prior_etag)?;
 
     match response {
         Some(ref r) if r.status == 304 => match prior {
@@ -513,7 +518,7 @@ pub fn list_issues_cached_persistent_as(
             {
                 if issues.len() < prior_issues.len() {
                     let confirmed = matches!(
-                        store::fetch_conditional(caller, gh_bin, cwd, &url, None),
+                        store::fetch_conditional(caller, gh_bin, cwd, &target, &url, None),
                         Ok((confirm_status, Some(ref cr), _))
                             if confirm_status.success()
                                 && cr.status == 200

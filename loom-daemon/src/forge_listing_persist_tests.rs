@@ -7,7 +7,7 @@
 //! var is touched, so these run in parallel with everything else.
 
 use super::*;
-use crate::forge_etag_store::{daemon_cache_key, set_test_daemon_store_dir};
+use crate::forge_etag_store::{daemon_cache_key, resolve_target, set_test_daemon_store_dir};
 
 /// A cwd-agnostic fake `gh` that logs its argv to `log`, answers `200` +
 /// `W/"shared"` (with free rate-limit headers) unconditionally, and `304`
@@ -109,7 +109,8 @@ fn an_etag_survives_a_simulated_restart_via_the_disk_store() {
     // "Restart": forget only this test's in-memory entry (never the whole map,
     // which parallel tests are using).
     let url = build_issues_url(Some(&repo), "loom:issue", "open");
-    let key = daemon_cache_key(Some(base.path()), Some(&repo), &url);
+    let key =
+        daemon_cache_key(Some(base.path()), &resolve_target(Some(base.path()), Some(&repo)), &url);
     cache().lock().unwrap().remove(&key);
     let after_restart =
         list_issues_cached(&gh, Some(base.path()), Some(&repo), "loom:issue", "open");
@@ -135,7 +136,97 @@ fn the_daemon_disk_layer_is_off_by_default_in_tests() {
     let repo = format!("test/default-off-{}", std::process::id());
     let url = build_issues_url(Some(&repo), "loom:issue", "open");
     assert!(crate::forge_etag_store::daemon_store_dir().is_none());
-    assert!(daemon_cache_key(Some(dir.path()), Some(&repo), &url)
-        .starts_with(&dir.path().display().to_string()));
+    assert!(daemon_cache_key(
+        Some(dir.path()),
+        &resolve_target(Some(dir.path()), Some(&repo)),
+        &url
+    )
+    .starts_with(&dir.path().display().to_string()));
     list_issues_cached(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open").unwrap();
+}
+
+/// #9252 blocking fix: a `304` validates exactly the ETag that was SENT, so it
+/// must serve the body stored with that ETag — even when a concurrent writer
+/// replaced the entry under the same key between the send and the `304`.
+#[test]
+fn a_304_serves_the_body_stored_with_the_sent_etag_not_a_swapped_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("calls.log");
+    let gh = write_logging_fake_gh(dir.path(), &log);
+    let repo = format!("test/swap-race-{}", std::process::id());
+    let first = list_issues_cached(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open");
+    let first = first.unwrap();
+
+    // Mid-flight, another writer stores a DIFFERENT (etag, body) under the key.
+    let url = build_issues_url(Some(&repo), "loom:issue", "open");
+    let key =
+        daemon_cache_key(Some(dir.path()), &resolve_target(Some(dir.path()), Some(&repo)), &url);
+    let swapped = Arc::new(vec![RestIssue {
+        number: 666,
+        ..first[0].clone()
+    }]);
+    let hook_key = key.clone();
+    super::set_after_send_hook(Some(Box::new(move || {
+        let entry = CacheEntry {
+            etag: "W/\"other\"".to_string(),
+            issues: Arc::clone(&swapped),
+        };
+        cache().lock().unwrap().insert(hook_key.clone(), entry);
+    })));
+    let second = list_issues_cached(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open");
+    super::set_after_send_hook(None);
+
+    assert!(logged_calls(&log)[1].contains("If-None-Match: W/\"shared\""));
+    assert_eq!(second.unwrap(), first, "the 304 must serve the W/\"shared\" body");
+    assert_eq!(cache().lock().unwrap().get(&key).unwrap().etag, "W/\"other\"");
+}
+
+/// #9252 blocking fix: with no explicit repo, the request URL names the
+/// `origin`-resolved repo the key uses — never gh's `{owner}/{repo}`
+/// placeholder, which prefers an `upstream` remote and would query a
+/// different repo under the same key.
+/// `#[serial]`: relies on `LOOM_REPO` being unset, which serial tests mutate.
+#[test]
+#[serial_test::serial]
+fn the_url_names_the_origin_repo_even_when_an_upstream_remote_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = format!("fork-owner/key-coherence-{}", std::process::id());
+    init_git_repo_with_remote(dir.path(), &origin);
+    assert!(Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/upstream-owner/other.git"
+        ])
+        .current_dir(dir.path())
+        .status()
+        .unwrap()
+        .success());
+    let log = dir.path().join("calls.log");
+    let gh = write_logging_fake_gh(dir.path(), &log);
+
+    list_issues_cached(&gh, Some(dir.path()), None, "loom:issue", "open").unwrap();
+    let call = &logged_calls(&log)[0];
+    assert!(call.contains(&format!("repos/{origin}/issues?")), "{call}");
+    assert!(!call.contains("{owner}") && !call.contains("upstream-owner"), "{call}");
+    assert!(call.contains("--hostname github.com"), "{call}");
+
+    let target = resolve_target(Some(dir.path()), None);
+    assert_eq!(target.repo.as_deref(), Some(origin.as_str()));
+}
+
+/// Resolution failure keeps today's behaviour: the placeholder URL, keyed by
+/// the raw `cwd`.
+/// `#[serial]`: relies on `LOOM_REPO` being unset, which serial tests mutate.
+#[test]
+#[serial_test::serial]
+fn an_unresolvable_cwd_keeps_the_placeholder_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("calls.log");
+    let gh = write_logging_fake_gh(dir.path(), &log);
+    list_issues_cached(&gh, Some(dir.path()), None, "loom:issue", "open").unwrap();
+    let call = &logged_calls(&log)[0];
+    assert!(call.contains("repos/{owner}/{repo}/issues?"), "{call}");
+    assert!(!call.contains("--hostname"), "{call}");
 }

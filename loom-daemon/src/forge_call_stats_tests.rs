@@ -111,6 +111,12 @@ fn window_counts_only_lines_inside_the_window() {
 #[test]
 fn sink_round_trips_prunes_old_hours_and_feeds_status() {
     let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let private = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(dir.path(), private).unwrap();
+    }
     let now = Utc::now().timestamp();
     let hour = now.div_euclid(3600);
     // A stale file far outside retention, and one inside the window.
