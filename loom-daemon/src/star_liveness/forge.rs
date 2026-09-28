@@ -183,7 +183,8 @@ impl GhStarForge {
 
 impl StarForge for GhStarForge {
     fn list_open(&mut self, label: &str) -> Result<Vec<RestIssue>> {
-        crate::forge_listing::list_issues_cached(
+        crate::forge_listing::list_issues_cached_as(
+            "star_liveness",
             &self.gh_bin,
             Some(&self.root),
             Some(&self.slug),
