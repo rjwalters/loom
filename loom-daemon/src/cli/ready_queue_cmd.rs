@@ -117,11 +117,25 @@ pub(crate) fn queue_json(report: &DaemonStatusReport, now: DateTime<Utc>) -> ser
         "ordering": tick.and_then(ordering),
         "plan": tick.and_then(|t| t.plan.as_ref()),
         "queue": tick.map(|t| t.queue.as_slice()).unwrap_or_default(),
+        // Every starred issue's landing state (#9244 C), including the ones
+        // not in the ready listing (building, in review, parked).
+        "operator_priority_landing": report.operator_priority_landing,
     })
 }
 
-/// The human-readable table.
+/// The human-readable table, then the starred issues' landing states
+/// (#9244 C).
 pub(crate) fn render_queue(report: &DaemonStatusReport, now: DateTime<Utc>) -> String {
+    let mut out = render_ready(report, now);
+    for line in loom_daemon::star_liveness::render::lines(report.operator_priority_landing.as_ref())
+    {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+fn render_ready(report: &DaemonStatusReport, now: DateTime<Utc>) -> String {
     let (state, age) = freshness(report, now);
     let mut out = String::new();
     let Some(tick) = &report.last_work_finder_tick else {

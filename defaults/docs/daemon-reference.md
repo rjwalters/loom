@@ -1960,7 +1960,9 @@ a key. Only the six keys below order the queue.
    work finder reads the `labeled` event for `loom:operator-priority` from the
    issue's REST timeline once per starred issue and caches it per (repo, issue); it
    never reads a timeline for an unstarred issue, and removing the star drops the
-   cache entry. A missing starred-at falls back to `createdAt`.
+   cache entry. A missing starred-at falls back to `createdAt`. A star applied
+   from loom-ui uses the intent's `requested_at` instead (#9244 C, below). A
+   blocker inheriting a star sorts at that star's position.
 3. **Red-main fixes first**: an issue whose body carries
    `<!-- loom:main-red-fix -->` at the start of a line, **only while its repo's
    `main` is verified red** (`WorkspaceHealthStates::is_halted`). A marker on a
@@ -2027,6 +2029,82 @@ hold) admits nothing, fixes included. With the main-health gate disabled for a
 repo (no enabled `buildGate`), there is no verified-red signal, so the latest
 `main` CI conclusion stands in for key 3: one cached `gh run list` per repo per
 tick, made only when the repo has a marker-bearing candidate.
+
+### Starred-issue liveness and loom-ui stars (#9244 C)
+
+A starred issue is always either being worked on or escalated to the operator
+with one concrete ask. While the work finder is on, a background pass
+(`loom-daemon/src/star_liveness/`) runs every `intervalSecs` and, for each open
+starred issue in each managed repo:
+
+- computes a **landing stage** (`curating`, `ready`, `building`, `in-review`,
+  `changes-requested`, `mergeable`, `merging`, `blocked-by`, `needs-operator`,
+  `no-capacity`), a next actor and time in stage. It is shown by
+  `loom-daemon status` and `loom-daemon queue` (both also under `--json` as
+  `operator_priority_landing`), in the `operator_attention` section of
+  `loom-daemon health` (still always Green), and on `queue.snapshot` for
+  loom-ui;
+- **escalates at once** when no agent can move it: `loom:operator-only` (or a
+  sub-kind) or `loom:operator-decision` on the issue or its PR; Champion's
+  merge-risk / critical-file hold (`loom:operator` on the PR); a forge merge
+  refusal on its approved PR (a "Merge Failed" report whose error is a 405,
+  ruleset or merge-method refusal, the #9268 shape; transient failures do not
+  count); this host's token pool exhausted with no other host having claimed
+  it, after a `poolsExhaustedGraceMinutes` grace so a peer can claim it first
+  (the row is `no-capacity` meanwhile); `loom:blocked` with no open blocker
+  named, or blocked only by an issue in another repo (stars do not cross
+  repos); a loom-ui star on a repo no workspace here manages;
+- escalates an agent-owned stage with **no forward progress** for
+  `noProgressMinutes`, with what it last saw. Progress is forge-visible only,
+  so every host managing the repo agrees: a label change, a PR update, or a
+  trusted comment on the issue, including the sweep's lease renewal (a long
+  Builder phase with a live lease is not a stall on any host). The stall key
+  hashes only those facts (never the stage, which host-local capacity can
+  change), so N hosts post one comment.
+
+An escalation is one comment on the issue, carrying
+`<!-- loom:operator-priority-escalation key=<kind>:<specifics> -->`. Each
+(issue, key) is posted once: a per-process ledger skips repeats without a
+forge call, and every host reads the issue's comments for the marker before
+posting. Only a marker from an `OWNER` / `MEMBER` / `COLLABORATOR`, the fleet
+App (`LOOM_GITHUB_APP_SLUG` > `forge.githubApp.slug`, else
+`loom-fleet-dispatch*`; only as an App login, `…[bot]` or `app/…`, which no
+user can register) or the daemon itself counts; an outside commenter cannot
+pre-post one to suppress an ask. The `pools-exhausted` key is the issue's forge state, not the
+host's hold, so every host and every re-exhaustion share it until the issue
+moves. Safehouse / Matrix delivery is not wired yet (the Safehouse sink only
+narrates the frozen event taxonomy).
+
+**Blocker inheritance.** The issue blocking a starred issue (named by
+`Blocked by #N` on a `loom:blocked` issue, the incident behind a merge refusal,
+or the repo's red-main fix while `main` is red) inherits the star: the work
+finder orders it at the star's position (and it may take the overflow slot),
+even from outside the `loom:issue` listing, and its landing row is marked
+`inherited_from`. Once it closes or stops blocking, the next pass drops it, and
+a repo unreadable for 3 passes in a row loses its inherited stars until a pass
+succeeds. A merge refusal's incident is an **open issue** named in the refusal
+comment itself, or else the newest open issue, filed by a trusted author,
+quoting one of the forge's three specific refusal phrases word-bounded ("Merge
+commits / Squash merges / Rebase merges are not allowed"; for #9276 that was
+#9268).
+A generic refusal (bare 405, merge method, ruleset) never searches, and
+nothing a later comment mentions ever inherits. With no open incident the ask
+quotes the forge's refusal text instead.
+
+**loom-ui stars.** The `/ingest` ack may carry `operator_priority_intents`
+(`defaults/docs/telemetry-schema.md`). The pass applies each valid one (the one
+label, a managed repo, a `requested_by`) idempotently with one audit comment;
+the intent's `requested_at` is the starred-at.
+
+Config (`.loom/config.json → autonomous.operatorPriority`, **env > config >
+default**):
+
+| Key | Env | Default | Meaning |
+|---|---|---|---|
+| `noProgressMinutes` | `LOOM_OPERATOR_PRIORITY_NO_PROGRESS_MINUTES` | `30` | watchdog window |
+| `escalate` | `LOOM_OPERATOR_PRIORITY_ESCALATE` | `true` | post escalations and apply loom-ui intents; `false` still computes and shows every landing state |
+| `intervalSecs` | `LOOM_OPERATOR_PRIORITY_INTERVAL_SECS` | `120` | pass interval |
+| `poolsExhaustedGraceMinutes` | `LOOM_OPERATOR_PRIORITY_POOLS_GRACE_MINUTES` | `10` | wait before a `pools-exhausted` ask; `0` asks at once |
 
 ### Ready queue view (`loom-daemon queue`, #8852)
 

@@ -1,0 +1,492 @@
+//! The liveness pass and its background thread.
+//!
+//! [`LivenessState::run_pass`] is the whole pass over already-resolved
+//! inputs and a forge factory, so the tests (and the 2026-09-28 replay) run
+//! it end to end against fakes. [`spawn`] is the thin production shell: it
+//! resolves managed repos, the last work-finder tick and this host's pool
+//! holds, runs a pass, and publishes the report.
+
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+
+use super::collect::{self, Evaluated, RefusalCache, RepoContext};
+use super::escalate::{Ledger, Outcome};
+use super::forge::{GhStarForge, StarForge};
+use super::inherit::{self, Inherited};
+use super::intents::{self, AppliedIds, StarIntent};
+use super::progress::{self, Tracker, Watched};
+use super::Settings;
+use crate::types::{
+    AskKind, DroppedStarIntent, LandingStage, OperatorAsk, ReadyQueueRow, StarLandingRow,
+    StarLivenessReport,
+};
+
+/// Most dropped intents the report keeps.
+const MAX_DROPPED: usize = 50;
+/// Most unmanaged stars remembered.
+const MAX_UNMANAGED: usize = 200;
+/// Consecutive failed passes over a repo after which its published
+/// inheritance is withdrawn: an unreadable repo must not keep stale blockers
+/// at star priority indefinitely.
+pub const MAX_FAILED_PASSES: u32 = 3;
+
+/// One managed repo, resolved.
+#[derive(Debug, Clone)]
+pub struct RepoInput {
+    pub root: PathBuf,
+    /// Forge `owner/repo`.
+    pub slug: String,
+    /// The last work-finder tick's rows for this root.
+    pub tick_rows: Vec<ReadyQueueRow>,
+    /// This host's pool exhaustion for the root's pool (its description).
+    pub pool: Option<String>,
+}
+
+/// Opens a forge for (root, slug).
+pub type ForgeFactory<'a> = dyn FnMut(&Path, &str) -> Box<dyn StarForge> + 'a;
+
+/// State that lives across passes.
+#[derive(Debug, Default)]
+pub struct LivenessState {
+    tracker: Tracker,
+    ledger: Ledger,
+    refusals: RefusalCache,
+    applied: AppliedIds,
+    /// Stars (from loom-ui) on repos no workspace here manages.
+    unmanaged: BTreeMap<(String, u32), Option<String>>,
+    dropped: VecDeque<DroppedStarIntent>,
+    /// When this host first saw each issue waiting on an exhausted pool (the
+    /// grace window's start).
+    pool_since: HashMap<(String, u32), DateTime<Utc>>,
+    /// Consecutive failed passes per workspace root.
+    failed_passes: HashMap<PathBuf, u32>,
+}
+
+impl LivenessState {
+    fn record_drop(&mut self, intent: &StarIntent, d: DroppedStarIntent) {
+        log::warn!(
+            "star_liveness: dropped loom-ui intent {} ({} #{} {}): {}",
+            d.id,
+            d.repo,
+            d.number,
+            intent.action,
+            d.reason
+        );
+        if d.reason == "unmanaged-repo" {
+            let key = (intent.repo.trim().to_string(), intent.number);
+            if intent.action == "unstar" {
+                self.unmanaged.remove(&key);
+            } else if intent.action == "star" && self.unmanaged.len() < MAX_UNMANAGED {
+                self.unmanaged.insert(key, intent.requested_at.clone());
+            }
+        }
+        if self.dropped.len() >= MAX_DROPPED {
+            self.dropped.pop_front();
+        }
+        self.dropped.push_back(d);
+    }
+
+    fn apply_intents(
+        &mut self,
+        batch: Vec<StarIntent>,
+        managed: &HashMap<String, (String, PathBuf)>,
+        write: bool,
+        forges: &mut ForgeFactory<'_>,
+    ) {
+        for intent in batch {
+            match intents::validate(&intent, managed) {
+                Err(d) => self.record_drop(&intent, d),
+                Ok(valid) => {
+                    if self.applied.contains(&valid.id) {
+                        continue;
+                    }
+                    if !write {
+                        log::debug!(
+                            "star_liveness: not applying loom-ui intent {} (escalate: false)",
+                            valid.id
+                        );
+                        continue;
+                    }
+                    let mut forge = forges(&valid.root, &valid.repo);
+                    match intents::apply(forge.as_mut(), &valid) {
+                        Ok(done) => {
+                            self.applied.insert(&valid.id);
+                            log::info!(
+                                "star_liveness: applied loom-ui intent {} on {}#{} \
+                                 (label changed: {}, commented: {})",
+                                valid.id,
+                                valid.repo,
+                                valid.number,
+                                done.label_changed,
+                                done.commented
+                            );
+                        }
+                        Err(e) => log::warn!(
+                            "star_liveness: applying loom-ui intent {} failed ({e}); the \
+                             backend resends it",
+                            valid.id
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run one pass. `intents` are this pass's drained loom-ui intents.
+    pub fn run_pass(
+        &mut self,
+        repos: &[RepoInput],
+        batch: Vec<StarIntent>,
+        settings: Settings,
+        host: &str,
+        now: DateTime<Utc>,
+        forges: &mut ForgeFactory<'_>,
+    ) -> StarLivenessReport {
+        let managed: HashMap<String, (String, PathBuf)> = repos
+            .iter()
+            .map(|r| (r.slug.to_ascii_lowercase(), (r.slug.clone(), r.root.clone())))
+            .collect();
+        self.apply_intents(batch, &managed, settings.escalate, forges);
+        // A repo registered since the star arrived is handled normally.
+        self.unmanaged
+            .retain(|(repo, _), _| !managed.contains_key(&repo.to_ascii_lowercase()));
+
+        let mut evaluated: Vec<(Option<PathBuf>, Evaluated)> = Vec::new();
+        let mut failed = Vec::new();
+        let is_managed = |slug: &str| managed.contains_key(&slug.to_ascii_lowercase());
+        for repo in repos {
+            let root = repo.root.clone();
+            let recorded = move |n: u32| intents::recorded_starred_at(&root, n);
+            let ctx = RepoContext {
+                slug: &repo.slug,
+                host,
+                tick_rows: &repo.tick_rows,
+                pool: repo.pool.clone(),
+                managed: &is_managed,
+                recorded_starred_at: &recorded,
+            };
+            let mut forge = forges(&repo.root, &repo.slug);
+            let result = collect::Evaluator::new(forge.as_mut(), ctx, &mut self.refusals).run();
+            match result {
+                Ok(rows) => {
+                    let inherited: Vec<Inherited> = rows
+                        .iter()
+                        .filter_map(|e| {
+                            e.inherited_from.map(|from| Inherited {
+                                number: e.facts.issue.number,
+                                from,
+                                starred_at: e.starred_at.clone(),
+                                item: e.item.clone(),
+                            })
+                        })
+                        .collect();
+                    inherit::publish(&repo.root, inherited);
+                    self.failed_passes.remove(&repo.root);
+                    evaluated.extend(rows.into_iter().map(|e| (Some(repo.root.clone()), e)));
+                }
+                Err(e) => {
+                    log::warn!("star_liveness: evaluating {} failed: {e}", repo.slug);
+                    failed.push(repo.slug.clone());
+                    let n = self.failed_passes.entry(repo.root.clone()).or_insert(0);
+                    *n += 1;
+                    if *n >= MAX_FAILED_PASSES && !inherit::current(&repo.root).is_empty() {
+                        log::warn!(
+                            "star_liveness: {} unreadable for {n} passes; withdrawing its \
+                             inherited stars until a pass succeeds",
+                            repo.slug
+                        );
+                        inherit::publish(&repo.root, Vec::new());
+                    }
+                }
+            }
+        }
+        for ((slug, number), at) in &self.unmanaged {
+            evaluated.push((None, collect::unmanaged(slug, *number, at.clone())));
+        }
+
+        self.ledger.host = host.to_string();
+        self.ledger.write = settings.escalate;
+        let mut rows = Vec::new();
+        let mut live = HashSet::new();
+        let mut posted = 0;
+        for (root, mut e) in evaluated {
+            let repo = e.facts.repo.clone();
+            let issue = e.facts.issue.number;
+            live.insert((repo.clone(), issue));
+            self.pool_grace(&mut e, now, settings.pools_grace);
+            let obs = self
+                .tracker
+                .observe(&repo, issue, e.landing.stage, &e.fingerprint, now);
+            let mut ask = e.landing.ask.clone();
+            let mut progress_at = obs.progress_at;
+            if let (None, Some(root)) = (&ask, &root) {
+                ask = self.watch(&e, root, now, settings.no_progress, &mut progress_at, forges);
+            }
+            if let (Some(a), Some(root)) = (&ask, &root) {
+                let mut forge = forges(root, &repo);
+                match self
+                    .ledger
+                    .escalate(forge.as_mut(), &repo, issue, a, e.inherited_from)
+                {
+                    Ok(Outcome::Posted) => {
+                        posted += 1;
+                        log::warn!(
+                            "star_liveness: escalated {repo}#{issue} to the operator: {}",
+                            a.text
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => log::warn!(
+                        "star_liveness: posting the escalation for {repo}#{issue} failed ({err}); \
+                         retrying next pass"
+                    ),
+                }
+            }
+            let secs = now.signed_duration_since(obs.stage_since).num_seconds();
+            rows.push(StarLandingRow {
+                repo,
+                issue,
+                stage: e.landing.stage,
+                next_actor: e.landing.next_actor.clone(),
+                stage_since: Some(obs.stage_since),
+                time_in_stage_secs: u64::try_from(secs).unwrap_or(0),
+                pr: e.landing.pr,
+                blocked_by: e.landing.blocked_by.clone(),
+                no_capacity: e.landing.no_capacity.clone(),
+                ask,
+                inherited_from: e.inherited_from,
+                operator_priority_at: e
+                    .starred_at
+                    .clone()
+                    .or_else(|| e.facts.issue.created_at.clone()),
+                last_progress_at: Some(progress_at),
+            });
+        }
+        self.tracker.retain(&live, &failed);
+        self.pool_since
+            .retain(|k, _| live.contains(k) || failed.contains(&k.0));
+        StarLivenessReport {
+            at: Some(now),
+            rows: order_rows(rows),
+            escalations_posted: posted,
+            dropped_intents: self.dropped.iter().cloned().collect(),
+            failed_repos: failed,
+        }
+    }
+}
+
+impl LivenessState {
+    /// Hold a `pools-exhausted` ask for `grace` after this host first sees
+    /// the issue waiting on its exhausted pool: a peer host with capacity may
+    /// simply not have ticked yet. Inside the window the row is `no-capacity`
+    /// (the work finder's peers may still take it).
+    fn pool_grace(&mut self, e: &mut Evaluated, now: DateTime<Utc>, grace: Duration) {
+        let key = (e.facts.repo.clone(), e.facts.issue.number);
+        let pooled = e
+            .landing
+            .ask
+            .as_ref()
+            .is_some_and(|a| a.kind == AskKind::PoolsExhausted);
+        if !pooled {
+            self.pool_since.remove(&key);
+            return;
+        }
+        let since = *self.pool_since.entry(key).or_insert(now);
+        let waited = now
+            .signed_duration_since(since)
+            .to_std()
+            .unwrap_or_default();
+        if waited >= grace {
+            return;
+        }
+        let left = (grace - waited).as_secs().div_ceil(60);
+        e.landing.stage = LandingStage::NoCapacity;
+        e.landing.next_actor = "work-finder".to_string();
+        e.landing.ask = None;
+        e.landing.no_capacity = Some(format!(
+            "token pool exhausted on this host; waiting ~{left} min for a peer host to claim it \
+             before asking the operator"
+        ));
+    }
+
+    /// The no-progress watchdog for one managed row. Before tripping, the
+    /// issue's comments are read once for forge-seen activity (a comment or
+    /// a lease renewal) newer than the fingerprint clock, which every host
+    /// sees alike. A key this process already escalated needs no read.
+    fn watch(
+        &mut self,
+        e: &Evaluated,
+        root: &Path,
+        now: DateTime<Utc>,
+        window: Duration,
+        progress_at: &mut DateTime<Utc>,
+        forges: &mut ForgeFactory<'_>,
+    ) -> Option<OperatorAsk> {
+        let repo = &e.facts.repo;
+        let issue = e.facts.issue.number;
+        let check = |at: DateTime<Utc>| {
+            progress::watchdog(
+                &Watched {
+                    repo,
+                    issue,
+                    stage: e.landing.stage,
+                    next_actor: &e.landing.next_actor,
+                    fingerprint: &e.fingerprint,
+                    progress_at: at,
+                },
+                now,
+                window,
+            )
+        };
+        let ask = check(*progress_at)?;
+        if self.ledger.knows(repo, issue, &ask.key) {
+            return Some(ask);
+        }
+        let mut forge = forges(root, repo);
+        let seen = match forge.comments(issue) {
+            Ok(comments) => {
+                let me = forge.self_login();
+                progress::latest_comment_activity(&comments, me.as_deref())
+            }
+            Err(err) => {
+                log::debug!("star_liveness: reading {repo}#{issue} comments failed: {err}");
+                None
+            }
+        };
+        if let Some(at) = seen.filter(|at| *at > *progress_at) {
+            if let Some(moved) = self.tracker.note_progress(repo, issue, at) {
+                *progress_at = moved;
+            }
+            return check(*progress_at);
+        }
+        Some(ask)
+    }
+}
+
+/// Starred rows by starred-at (then repo, issue); each inheriting blocker
+/// right after the issue it inherits from.
+fn order_rows(rows: Vec<StarLandingRow>) -> Vec<StarLandingRow> {
+    let (mut roots, children): (Vec<_>, Vec<_>) =
+        rows.into_iter().partition(|r| r.inherited_from.is_none());
+    roots.sort_by(|a, b| {
+        (&a.operator_priority_at, &a.repo, a.issue).cmp(&(
+            &b.operator_priority_at,
+            &b.repo,
+            b.issue,
+        ))
+    });
+    let mut out = Vec::new();
+    let mut pending = children;
+    for r in roots {
+        let key = (r.repo.clone(), r.issue);
+        out.push(r);
+        let mut stack = vec![key];
+        while let Some((repo, parent)) = stack.pop() {
+            let (mine, rest): (Vec<_>, Vec<_>) = pending
+                .into_iter()
+                .partition(|c| c.repo == repo && c.inherited_from == Some(parent));
+            pending = rest;
+            for c in mine {
+                stack.push((c.repo.clone(), c.issue));
+                out.push(c);
+            }
+        }
+    }
+    out.extend(pending);
+    out
+}
+
+/// This host's pool exhaustion for `root`, from the work finder's pool holds.
+fn pool_for(root: &Path) -> Option<String> {
+    let dir = crate::tokens_pool::paths::resolve_tokens_dir(root);
+    crate::work_finder::pool_preflight::active_hold_statuses()
+        .into_iter()
+        .find(|h| h.dir == dir)
+        .map(|h| {
+            format!(
+                "all {} token(s) exhausted since {}, next possible clear ~{}",
+                h.total,
+                h.since.format("%Y-%m-%d %H:%MZ"),
+                h.next_clear_at.format("%H:%MZ")
+            )
+        })
+}
+
+/// Resolve the managed repos for the daemon rooted at `workspace_root`.
+fn resolve_repos(workspace_root: &Path, slugs: &mut HashMap<PathBuf, String>) -> Vec<RepoInput> {
+    let registry = crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+    let summary = crate::work_finder::last_tick_summary();
+    registry
+        .effective_roots(workspace_root)
+        .into_iter()
+        .filter_map(|root| {
+            let slug = match slugs.get(&root) {
+                Some(s) => s.clone(),
+                None => {
+                    let s = crate::release_resolve::host::repo_slug(&root)?;
+                    slugs.insert(root.clone(), s.clone());
+                    s
+                }
+            };
+            let shown = root.display().to_string();
+            let tick_rows = summary
+                .as_ref()
+                .map(|s| {
+                    s.queue
+                        .iter()
+                        .filter(|r| r.repo == shown)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let pool = pool_for(&root);
+            Some(RepoInput {
+                root,
+                slug,
+                tick_rows,
+                pool,
+            })
+        })
+        .collect()
+}
+
+/// Start the liveness thread for the daemon rooted at `workspace_root`.
+/// Called once, only while the work finder is enabled.
+pub fn spawn(workspace_root: PathBuf) -> Option<std::thread::JoinHandle<()>> {
+    let spawned = std::thread::Builder::new()
+        .name("star-liveness".to_string())
+        .spawn(move || {
+            let mut state = LivenessState::default();
+            let mut slugs = HashMap::new();
+            let host = crate::sweep_registry::host_identity();
+            // Let the work finder complete a first tick before the first pass.
+            std::thread::sleep(Duration::from_secs(30));
+            loop {
+                let settings = Settings::resolve(&workspace_root);
+                let repos = resolve_repos(&workspace_root, &mut slugs);
+                let batch = intents::global_queue()
+                    .map(|q| q.drain())
+                    .unwrap_or_default();
+                let mut factory = |root: &Path, slug: &str| -> Box<dyn StarForge> {
+                    Box::new(GhStarForge::new(root, slug))
+                };
+                let report =
+                    state.run_pass(&repos, batch, settings, &host, Utc::now(), &mut factory);
+                super::publish_report(report);
+                std::thread::sleep(settings.interval);
+            }
+        });
+    match spawned {
+        Ok(handle) => {
+            log::info!("star_liveness: starred-issue liveness check running (#9244)");
+            Some(handle)
+        }
+        Err(e) => {
+            log::warn!("star_liveness: could not start the liveness thread: {e}");
+            None
+        }
+    }
+}

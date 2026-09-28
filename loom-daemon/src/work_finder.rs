@@ -303,6 +303,9 @@ pub struct WorkItem {
     /// starred one whose event is unknown (ordering then falls back to
     /// `createdAt`). See [`operator_priority`].
     pub operator_priority_at: Option<String>,
+    /// Set when this issue blocks a starred issue and inherits its star
+    /// (#9244 C): the starred issue's number. See [`crate::star_liveness::inherit`].
+    pub operator_priority_inherited_from: Option<u32>,
 }
 
 impl WorkItem {
@@ -323,6 +326,7 @@ impl WorkItem {
             body: None,
             updated_at: None,
             operator_priority_at: None,
+            operator_priority_inherited_from: None,
         }
     }
 

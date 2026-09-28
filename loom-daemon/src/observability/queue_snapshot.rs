@@ -150,6 +150,34 @@ pub fn build_record(
         unresolved_rows,
         rows_truncated,
         plan: summary.plan.clone(),
+        operator_priority_landing: Vec::new(),
+    }
+}
+
+/// Attach the last liveness pass's rows (#9244 C), each tagged with its
+/// repo's visibility. Rows whose repo is not a managed forge slug (a loom-ui
+/// star on an unmanaged repo) are tagged by the same lookup, which answers
+/// `Private` when it cannot tell.
+async fn attach_landing(record: &mut QueueSnapshotRecord) {
+    let Some(report) = crate::star_liveness::last_report() else {
+        return;
+    };
+    let mut visibility: HashMap<String, crate::telemetry::RepoVisibility> = HashMap::new();
+    for row in report.rows {
+        let tag = match visibility.get(&row.repo) {
+            Some(v) => *v,
+            None => {
+                let v = super::collector::resolve_visibility(&row.repo).await;
+                visibility.insert(row.repo.clone(), v);
+                v
+            }
+        };
+        record
+            .operator_priority_landing
+            .push(crate::telemetry::queue_snapshot::QueueLandingRow {
+                row,
+                visibility: tag,
+            });
     }
 }
 
@@ -195,6 +223,7 @@ pub(super) async fn record(
     let mut record = build_record(&summary, &repos);
     let blocked = super::queue_blocked::collect(workspace_pool, slug_cache).await;
     super::queue_blocked::append(&mut record, blocked);
+    attach_landing(&mut record).await;
     sink.push(record);
     *LAST_EMITTED
         .lock()
