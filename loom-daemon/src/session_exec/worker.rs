@@ -61,11 +61,11 @@ fn reap(root: i32, result: &mut Option<i32>) -> Result<bool> {
 /// lease, exactly like a heartbeat that arrived on time. Cancellation is
 /// decisive only via the explicit non-numeric `cancel` line, a read error, or
 /// EOF with nothing accepted in the same pass; a merely silent channel is the
-/// caller's `STALL_MS` decision, measured from the last data arrival
-/// (`received` updates on any bytes, not only accepted leases). Host and VM
-/// clocks must still agree within the lease for a heartbeat to be accepted,
-/// but transient disagreement now stalls acceptance rather than killing the
-/// dispatch.
+/// caller's decision, measured from the last data arrival (`received` updates
+/// on any bytes, not only accepted leases, so delayed-but-flowing data never
+/// looks like silence). Host and VM clocks must still agree within the lease
+/// for a heartbeat to be accepted, but transient disagreement now stalls
+/// acceptance rather than killing the dispatch.
 fn read_lease(
     input: &mut impl Read,
     pending: &mut Vec<u8>,
@@ -214,15 +214,21 @@ pub(super) fn run(args: WorkerArgs) -> Result<i32> {
             });
         }
         if stopping.is_none() {
-            // #9067: only decisive channel events (explicit `cancel`, read
-            // error, EOF) or a channel silent-and-open past STALL_MS cancel a
-            // running invocation. A delayed or clock-skewed heartbeat used to
-            // cancel here and SIGTERM healthy work under CI load.
+            // #9067: cancellation is decisive only on explicit channel
+            // events — the `cancel` line, a read error, or EOF — or on a
+            // channel that has been SILENT for a full lease horizon (the
+            // wedged-host revocation contract: a SIGSTOPped or frozen host
+            // must lose its container tree promptly; any bytes at all reset
+            // the silence clock). What no longer cancels is DATA: a
+            // heartbeat delayed past its expiry by the docker-exec transport
+            // under CI load used to SIGTERM perfectly healthy work — the
+            // exit-143 flake — and is now merely skipped by read_lease while
+            // the arriving bytes prove the host is alive.
             let signalled = SIGNAL.load(Ordering::Relaxed) != 0;
             let channel = read_lease(&mut input, &mut pending, &mut expiry, &mut received);
             cancelled = signalled
                 || matches!(channel, Some(false))
-                || received.elapsed() >= Duration::from_millis(STALL_MS);
+                || received.elapsed() >= Duration::from_millis(LEASE_MS);
             if cancelled || result.is_some() {
                 if cancelled {
                     let trigger = if signalled {

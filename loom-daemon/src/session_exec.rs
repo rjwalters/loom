@@ -13,19 +13,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const PROTOCOL: &str = "loom-session-exec-v1";
 pub const LEASE_MS: u64 = 2000;
-/// How long the worker tolerates a silent-but-open lease channel before
-/// treating it as a dead host (#9067). The docker-exec stdin transport can
-/// stall for seconds under CI runner load (buffered heartbeats, slow attach,
-/// scheduler starvation) while the dispatch is perfectly healthy; the old
-/// deadline of `LEASE_MS` SIGTERMed such dispatches — the exit-143
-/// `adapter_chain_pushes_private_branch…` flake. Real host death is signalled
-/// decisively and immediately by EOF on the channel (the docker client is the
-/// host's child and closes the stream when it dies) or by the explicit
-/// `cancel` line the host writes from its own precise liveness checks
-/// (signal, reparenting, owner pidfd). This deadline is only the backstop
-/// for a channel that neither delivers data nor closes, so it is deliberately
-/// generous; the lease VALUE horizon (`LEASE_MS`) is unchanged and still
-/// gates launch and lease acceptance.
+/// How long the worker waits for its FIRST lease before refusing launch
+/// (#9067). A docker exec attach under CI load can take longer than one lease
+/// horizon (`LEASE_MS`) to deliver the first heartbeat; refusing at `LEASE_MS`
+/// 143'd healthy dispatches before the command ever started. Nothing is at
+/// risk before launch, so patience here is free: EOF and the explicit `cancel`
+/// line still refuse instantly, and a channel silent for the whole window
+/// expires loudly. Run-time cancellation is NOT governed by this constant — a
+/// running invocation is cancelled only by decisive channel events or by a
+/// channel silent for `LEASE_MS` (the wedged-host revocation contract, kept at
+/// its original timing; any arriving bytes reset that silence clock).
 pub const STALL_MS: u64 = 30_000;
 pub const GRACE: Duration = Duration::from_millis(1000);
 pub const POLL: Duration = Duration::from_millis(20);
