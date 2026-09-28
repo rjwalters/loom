@@ -3,11 +3,11 @@
 use super::{as_of, history_a, input_at};
 use crate::eta::explanation::EstimateResult;
 use crate::eta::heuristics::LandV1;
-use crate::eta::score::{bucket, pinball, score, OutcomeKind, StageObservation};
+use crate::eta::score::{bucket, pinball, score, EstimateSummary, OutcomeKind, StageObservation};
 use crate::eta::{Heuristic, Stage};
 use chrono::Duration;
 
-fn fixed_estimate() -> crate::eta::Explanation {
+fn fixed_estimate() -> EstimateSummary {
     let mut explanation = LandV1.estimate(&input_at(Stage::ReviewWait, 0, 0), &history_a());
     explanation.result = Some(EstimateResult {
         p25_sec: 600,
@@ -16,7 +16,7 @@ fn fixed_estimate() -> crate::eta::Explanation {
         eta_p50_at: as_of() + Duration::seconds(1200),
         samples_min: 9,
     });
-    explanation
+    EstimateSummary::of(&explanation)
 }
 
 fn observed() -> Vec<StageObservation> {
@@ -63,12 +63,12 @@ fn pinball_loss_and_coverage_golden() {
     let review = &s.stages_actual[0];
     assert_eq!(review.duration_sec, 900);
     let predicted = explanation
-        .stages
+        .stage_quartiles
         .iter()
-        .find(|e| e.stage == Stage::ReviewWait)
+        .find(|q| q.stage == Stage::ReviewWait)
         .unwrap();
-    assert_eq!(review.predicted_p50, Some(predicted.distribution.p50));
-    assert_eq!(review.error_sec, Some(900 - predicted.distribution.p50));
+    assert_eq!(review.predicted_p50, Some(predicted.p50));
+    assert_eq!(review.error_sec, Some(900 - predicted.p50));
     assert_eq!(s.stages_actual[1].source, "bus");
     assert_eq!(s.rework_rounds_actual, 0);
 
@@ -100,7 +100,9 @@ fn abandoned_is_counted_not_scored() {
 #[test]
 fn a_refusal_scores_nothing() {
     let mut explanation = fixed_estimate();
-    explanation.result = None;
+    explanation.p25_sec = None;
+    explanation.p50_sec = None;
+    explanation.p75_sec = None;
     let s = score(&explanation, OutcomeKind::Landed, as_of() + Duration::seconds(60), &[]);
     assert_eq!(s.error_sec, None);
     assert_eq!(s.horizon_bucket, None);

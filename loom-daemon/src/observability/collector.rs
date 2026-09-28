@@ -611,6 +611,9 @@ async fn sample_snapshots(
     // without the ops sink, and without a new work-finder tick since the last
     // export pass.
     super::ops::disposition::record(slug_cache).await;
+    // ETA (Issue #9289): review listings, outcome checks and re-estimates,
+    // after `stage_dwell` so the ETag-cached listings are warm.
+    super::eta::record(workspace_root, workspace_pool, slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant

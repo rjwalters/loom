@@ -167,6 +167,10 @@ fn provenance_is_the_span_provenance_source() {
     assert_eq!(current.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(current.revision, crate::self_update::BUILT_COMMIT_FULL);
     assert!(current.is_valid(), "{current:?}");
+    assert_eq!(
+        current.complete,
+        Provenance::completeness(&current.revision, &current.tree_state)
+    );
 }
 
 #[test]
@@ -181,9 +185,25 @@ fn provenance_validation_requires_full_sha_and_known_state() {
     let mut state = provenance();
     state.tree_state = "maybe".to_string();
     assert!(!state.is_valid());
+    // A tarball build reports `unknown`, like every span: still emitted (no
+    // data is lost) but marked incomplete, so accuracy queries exclude it.
     let mut tarball = provenance();
     tarball.revision = "unknown".to_string();
-    assert!(tarball.is_valid(), "a tarball build reports `unknown`, like every span");
+    assert!(!tarball.is_valid(), "`complete` must match the fields");
+    tarball.complete = false;
+    assert!(tarball.is_valid());
+    let mut unknown_tree = provenance();
+    unknown_tree.tree_state = "unknown".to_string();
+    unknown_tree.complete = false;
+    assert!(unknown_tree.is_valid());
+    assert!(!Provenance::completeness("unknown", "clean"));
+    assert!(!Provenance::completeness(&provenance().revision, "unknown"));
+    assert!(Provenance::completeness(&provenance().revision, "dirty"));
+    // A record may not claim completeness it does not have.
+    let mut claims = provenance();
+    claims.revision = "unknown".to_string();
+    claims.complete = true;
+    assert!(!claims.is_valid());
 }
 
 #[test]

@@ -3,6 +3,7 @@
 //! this module is the field-by-field implementation plus its unit tests.
 
 mod ci;
+mod eta;
 mod metadata;
 mod ops;
 
@@ -171,8 +172,8 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
 fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
     let observed_time_unix_nano = nanos(envelope.emitted_at);
     let mut time_unix_nano = observed_time_unix_nano;
-    // Only `ci.job.log` (#8825) sets this; every other kind's body stays the
-    // event name it has always been, byte-identical on the wire.
+    // Only `ci.job.log` (#8825) and the ETA kinds (#9289) set this; every
+    // other kind's body stays the event name, byte-identical on the wire.
     let mut body_override: Option<String> = None;
     let (event_name, severity, _body, attributes) = match &envelope.record {
         TelemetryRecord::SweepStarted(r) => {
@@ -540,6 +541,14 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             let (event_name, severity, completed_at, attributes) = ci::log_parts(&envelope.record)?;
             time_unix_nano = completed_at;
             body_override = Some(r.text.clone());
+            (event_name, severity, String::new(), attributes)
+        }
+        TelemetryRecord::EtaEstimate(_) | TelemetryRecord::EtaOutcome(_) => {
+            // Issue #9289: the body is the record's JSON (an estimate's whole
+            // explanation); scalars ride as `loom.eta.*` attributes.
+            let (event_name, severity, at, attributes, body) = eta::log_parts(&envelope.record)?;
+            time_unix_nano = at;
+            body_override = Some(body);
             (event_name, severity, String::new(), attributes)
         }
         // Every kind that is not declared `otlp: Logs` in `telemetry/kinds.rs`:

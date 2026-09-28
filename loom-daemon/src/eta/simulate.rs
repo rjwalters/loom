@@ -95,6 +95,25 @@ pub enum SpecError {
     NoDraws,
 }
 
+/// `P(reject)` at the verdict after `rework` rejections; attempts past the
+/// recorded ones reuse the last rate.
+#[must_use]
+pub fn p_reject(p_by_attempt: &[f64], rework: u32) -> f64 {
+    p_by_attempt
+        .get(rework as usize)
+        .or(p_by_attempt.last())
+        .copied()
+        .unwrap_or(0.0)
+}
+
+/// Whether a path that has taken `start_rework` rejections can take another:
+/// some verdict still ahead (`start_rework..cap`) has a non-zero rate. Only
+/// the remaining attempts count — an earlier attempt's rate is history.
+#[must_use]
+pub fn may_reject(p_by_attempt: &[f64], start_rework: u32, cap: u32) -> bool {
+    (start_rework..cap).any(|rework| p_reject(p_by_attempt, rework) > 0.0)
+}
+
 /// Every stage a path from `start` can visit.
 #[must_use]
 pub fn reachable(start: Stage, include_merge: bool, may_reject: bool) -> Vec<Stage> {
@@ -138,8 +157,8 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     if spec.draws == 0 {
         return Err(SpecError::NoDraws);
     }
-    let may_reject = spec.start_rework < spec.cap && spec.p_by_attempt.iter().any(|&p| p > 0.0);
-    for stage in reachable(spec.start, spec.include_merge, may_reject) {
+    let rejectable = may_reject(&spec.p_by_attempt, spec.start_rework, spec.cap);
+    for stage in reachable(spec.start, spec.include_merge, rejectable) {
         match &spec.grids[stage.index()] {
             None => return Err(SpecError::MissingGrid(stage)),
             Some(g) if g.len() != grid::GRID_POINTS => return Err(SpecError::BadGrid(stage)),
@@ -184,14 +203,7 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
                 Stage::ReviewWait => {
                     let mut rejected = false;
                     if rework < spec.cap {
-                        let attempt = rework as usize;
-                        let p = spec
-                            .p_by_attempt
-                            .get(attempt)
-                            .or(spec.p_by_attempt.last())
-                            .copied()
-                            .unwrap_or(0.0);
-                        rejected = rng.next_f64() < p;
+                        rejected = rng.next_f64() < p_reject(&spec.p_by_attempt, rework);
                     }
                     if rejected {
                         rework += 1;

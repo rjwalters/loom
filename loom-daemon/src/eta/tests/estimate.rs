@@ -18,6 +18,7 @@ fn synthetic(n: usize, base: i64) -> StageSamples {
                 duration_sec: base * (i as i64 + 1),
                 observed_at: as_of() - Duration::hours(i as i64 + 1),
                 source: SampleSource::SweepOutcome,
+                host: "host-a".to_string(),
             });
         }
     }
@@ -194,4 +195,70 @@ fn finish_ends_at_the_verdict_when_sweeps_do_not_merge() {
         .stages
         .iter()
         .any(|e| e.stage == Stage::MergeWait));
+}
+
+#[test]
+fn doctor_always_counts_at_least_one_rework_round() {
+    let history = history_a();
+    let zero = LandV1.estimate(&input_at(Stage::Doctor, 300, 0), &history);
+    let one = LandV1.estimate(&input_at(Stage::Doctor, 300, 1), &history);
+    assert_eq!(zero.current_stage.as_ref().unwrap().rework_rounds, 1, "normalised");
+    assert_eq!(zero.quantiles(), one.quantiles());
+    assert_eq!(zero.branches, one.branches);
+    // And the normalised value is what the explanation recomputes from.
+    assert_eq!(crate::eta::simulate::run_explanation(&zero), zero.quantiles());
+}
+
+#[test]
+fn only_the_remaining_attempts_decide_whether_doctor_is_needed() {
+    // Attempt 1 rejects half the time, attempt 2 never; the Doctor stage has
+    // too few samples to be modelled.
+    let mut history = synthetic(40, 60);
+    history
+        .stages
+        .retain(|s| s.stage != Stage::Doctor || s.duration_sec <= 180);
+    history.verdicts.clear();
+    for i in 0..10 {
+        for (attempt, rejected) in [(1, i % 2 == 0), (2, false)] {
+            history.verdicts.push(VerdictSample {
+                repo: "rjwalters/loom".to_string(),
+                attempt,
+                rejected,
+                observed_at: as_of() - Duration::hours(i + 1),
+            });
+        }
+    }
+    // One rejection already taken: the only verdict ahead is attempt 2, which
+    // never rejects, so the path cannot reach `doctor` and needs no samples
+    // for it.
+    let after_rework = LandV1.estimate(&input_at(Stage::ReviewWait, 0, 1), &history);
+    assert_eq!(after_rework.no_estimate_reason, None);
+    assert!(!after_rework.stages.iter().any(|e| e.stage == Stage::Doctor));
+    // Before any rework, attempt 1 still can reject: `doctor` is needed and
+    // its thin history refuses honestly.
+    let first_pass = LandV1.estimate(&input_at(Stage::ReviewWait, 0, 0), &history);
+    assert_eq!(first_pass.no_estimate_reason, Some(NoEstimateReason::InsufficientSamples));
+
+    use crate::eta::simulate::may_reject;
+    assert!(may_reject(&[0.5, 0.0], 0, 2));
+    assert!(!may_reject(&[0.5, 0.0], 1, 2));
+    assert!(!may_reject(&[0.5, 0.2], 2, 2), "at the cap nothing is ahead");
+    assert!(may_reject(&[0.5], 1, 2), "a missing attempt reuses the last rate");
+}
+
+#[test]
+fn explanation_records_host_local_history_and_its_sample_counts() {
+    use crate::eta::explanation::HistoryScope;
+    let explanation = LandV1.estimate(&input_at(Stage::ReviewWait, 0, 0), &history_a());
+    let history = explanation.history.as_ref().unwrap();
+    assert_eq!(history.scope, HistoryScope::Local);
+    assert_eq!(serde_json::to_value(history.scope).unwrap(), "local");
+    let used: usize = explanation.stages.iter().map(|e| e.distribution.n).sum();
+    assert_eq!(history.samples_by_source.values().sum::<usize>(), used);
+    assert_eq!(history.samples_by_host.values().sum::<usize>(), used);
+    assert_eq!(
+        history.samples_by_host.keys().collect::<Vec<_>>(),
+        vec!["host-fixture-a"],
+        "every sample names the host that recorded it"
+    );
 }

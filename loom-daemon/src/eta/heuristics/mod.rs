@@ -10,15 +10,16 @@ pub use land_v1::{LandV1, LAND_V1};
 
 use super::explanation::{
     Branches, ChangesRequested, Combination, Conditioning, CurrentStageRecord, Distribution,
-    EstimateResult, Explanation, Filters, HistoryWindow, PathRecord, StageEntry,
+    EstimateResult, Explanation, Filters, HistoryRecord, HistoryWindow, PathRecord, StageEntry,
 };
 use super::history::{window_from, Level, SampleSource, StageSamples};
-use super::simulate::{reachable, run, spec_from_explanation};
+use super::simulate::{may_reject, reachable, run, spec_from_explanation};
 use super::{
     estimate_id, grid, round3, seed_for, CurrentState, EstimateInput, Kind, NoEstimateReason,
     Stage, DRAWS, EXPLANATION_SCHEMA, MAX_REWORK_ROUNDS, MIN_COND, MIN_SAMPLES,
 };
 use chrono::Duration;
+use std::collections::BTreeMap;
 
 /// Fewest verdicts at an attempt for its own rejection rate to be used;
 /// below it the previous attempt's rate is carried forward.
@@ -72,6 +73,7 @@ pub(crate) fn estimate_path(
         subject: input.subject.clone(),
         current_stage: None,
         history_window: None,
+        history: None,
         path: None,
         stages: Vec::new(),
         branches: None,
@@ -89,13 +91,30 @@ pub(crate) fn estimate_path(
         CurrentState::At(current) => current,
     };
     let start = current.stage;
+    // An item in `doctor` has taken at least one rejection, whatever the
+    // resolver counted: `doctor` is entered only through one.
+    let rework_rounds = if start == Stage::Doctor {
+        current.rework_rounds.max(1)
+    } else {
+        current.rework_rounds
+    };
     let repo = input.subject.repo.as_str();
     explanation.current_stage = Some(CurrentStageRecord {
         stage: start,
         entered_at: current.entered_at,
         age_sec: current.age_sec.max(0),
         age_source: current.age_source,
-        rework_rounds: current.rework_rounds,
+        rework_rounds,
+    });
+    explanation.history = Some(HistoryRecord {
+        scope: history.scope,
+        sources: rules
+            .sources
+            .iter()
+            .map(|s| s.journal().to_string())
+            .collect(),
+        samples_by_source: BTreeMap::new(),
+        samples_by_host: BTreeMap::new(),
     });
     explanation.history_window = Some(HistoryWindow {
         from: window_from(as_of),
@@ -129,7 +148,7 @@ pub(crate) fn estimate_path(
     });
 
     // The Judge branch, when the path still reaches a verdict.
-    let verdict_ahead = start != Stage::MergeWait && current.rework_rounds < MAX_REWORK_ROUNDS;
+    let verdict_ahead = start != Stage::MergeWait && rework_rounds < MAX_REWORK_ROUNDS;
     let mut p_by_attempt = Vec::new();
     if start != Stage::MergeWait {
         let level = [Level::Repo, Level::Host].into_iter().find(|level| {
@@ -200,13 +219,26 @@ fn finish_estimate(
     let age = current.age_sec.max(0);
     let repo = input.subject.repo.as_str();
     let as_of = input.as_of;
-    let may_reject =
-        current.rework_rounds < MAX_REWORK_ROUNDS && p_by_attempt.iter().any(|&p| p > 0.0);
+    // The rework count as recorded (normalised for `doctor`), so the
+    // simulation and this stage list agree on the rejections still ahead.
+    let rework_rounds = explanation
+        .current_stage
+        .as_ref()
+        .map_or(current.rework_rounds, |c| c.rework_rounds);
+    let rejectable = may_reject(&p_by_attempt, rework_rounds, MAX_REWORK_ROUNDS);
 
-    for stage in reachable(start, include_merge, may_reject) {
+    for stage in reachable(start, include_merge, rejectable) {
         let Some(selection) = history.select(repo, stage, as_of, rules.sources) else {
             return refuse(explanation, NoEstimateReason::InsufficientSamples);
         };
+        if let Some(record) = &mut explanation.history {
+            for (source, n) in &selection.by_source {
+                *record.samples_by_source.entry(source.clone()).or_insert(0) += n;
+            }
+            for (host, n) in &selection.by_host {
+                *record.samples_by_host.entry(host.clone()).or_insert(0) += n;
+            }
+        }
         let sorted = &selection.sorted;
         let grid_sec = grid::grid_of(sorted);
         let conditioning = if stage == start && age > 0 {

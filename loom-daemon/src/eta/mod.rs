@@ -33,23 +33,36 @@
 //! sample observed at or after `as_of`, so a replay over past instants cannot
 //! leak its own future (the backtest in #9325 depends on this).
 //!
+//! # Limitation: history is host-local (#9343)
+//!
+//! v1 history is this host's own journals only, so estimates are empty on
+//! hosts that ran no sweeps for a repo, biased where they did, and
+//! inconsistent between hosts; the human-gated stages happen on the forge,
+//! not on any host. Every explanation records `history.scope = "local"` and
+//! the samples each source and host contributed. See [`history`] for the
+//! detail and the fleet-snapshot direction.
+//!
 //! # Versioning
 //!
 //! A heuristic id (`finish-v1`, `land-v1`) is immutable once shipped: a
 //! golden test pins each id's output over a fixed fixture. A behaviour change
 //! is a new id, registered next to the old one ([`Registry`]).
 
+pub mod config;
+pub mod emit;
 pub mod explanation;
 pub mod grid;
 pub mod heuristics;
 pub mod history;
+pub mod journal;
 pub mod labels;
 pub mod score;
 pub mod simulate;
+pub mod tracker;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests;
+pub(crate) mod tests;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -232,6 +245,11 @@ impl fmt::Display for NoEstimateReason {
 /// (operator requirement on #9289). Sourced from
 /// [`crate::telemetry::trace::provenance::daemon`], the same source every
 /// span's `loom.daemon.*` attributes come from.
+///
+/// A build whose revision or tree state is `unknown` (a tarball build) still
+/// emits, so no data is lost, but with `complete: false`; accuracy queries
+/// exclude incomplete rows, because a result that cannot be pinned to a
+/// commit cannot be attributed to a heuristic's code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
     /// Loom version (`CARGO_PKG_VERSION`).
@@ -240,6 +258,18 @@ pub struct Provenance {
     pub revision: String,
     /// `clean`, `dirty` or `unknown`.
     pub tree_state: String,
+    /// `revision` is a full 40-hex SHA and `tree_state` is `clean` or
+    /// `dirty`: the build is pinned. Always [`Provenance::completeness`] of
+    /// the other two fields.
+    pub complete: bool,
+}
+
+/// Whether `revision` is a full 40-hex lowercase git SHA.
+fn is_full_sha(revision: &str) -> bool {
+    revision.len() == 40
+        && revision
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl Provenance {
@@ -251,23 +281,28 @@ impl Provenance {
             version: build.version.to_string(),
             revision: build.revision.to_string(),
             tree_state: build.tree_state.to_string(),
+            complete: Self::completeness(build.revision, build.tree_state),
         }
     }
 
+    /// Whether a build with `revision` and `tree_state` is fully pinned.
+    #[must_use]
+    pub fn completeness(revision: &str, tree_state: &str) -> bool {
+        is_full_sha(revision) && matches!(tree_state, "clean" | "dirty")
+    }
+
     /// Whether every field is well formed: a non-empty version, a full
-    /// 40-hex revision (or the build system's literal `unknown`), and a known
-    /// tree state. An ETA record whose provenance fails this is never emitted.
+    /// 40-hex revision or the build system's literal `unknown`, a known tree
+    /// state, and a `complete` flag that matches them. An ETA record whose
+    /// provenance fails this is never emitted. An `unknown` revision or tree
+    /// state is well formed (and emitted), but not [`Self::complete`].
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        let revision_ok = self.revision == "unknown"
-            || (self.revision.len() == 40
-                && self
-                    .revision
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        let revision_ok = self.revision == "unknown" || is_full_sha(&self.revision);
         !self.version.trim().is_empty()
             && revision_ok
             && matches!(self.tree_state.as_str(), "clean" | "dirty" | "unknown")
+            && self.complete == Self::completeness(&self.revision, &self.tree_state)
     }
 }
 
