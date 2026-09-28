@@ -240,6 +240,91 @@ fn a_loom_commit_line_counts_only_in_install_metadata() {
     assert_eq!(strip_validated_restamps(&files).len(), 1);
 }
 
+// --- The resync restamp (#9065) ---------------------------------------------
+
+/// What `chore: resync installed Loom surfaces` actually lands: no `VERSION`
+/// edit at all, and — for every such commit on `main` in the 24 h #9065
+/// measured — nothing but this file.
+fn resync_stamp() -> ChangedFile {
+    f(
+        ".loom/install-metadata.json",
+        "modified",
+        Some(
+            "@@ -2,2 +2,2 @@\n-  \"loom_commit\": \"fa2dba6bd\",\n\
+             +  \"loom_commit\": \"7f783396c\",\n\
+             @@ -38,2 +38,2 @@\n-  \"last_resync\": \"2026-09-27\",\n\
+             -  \"loom_source_remote\": \"git@github.com:rjwalters/loom.git\"\n\
+             +  \"last_resync\": \"2026-09-28\",\n\
+             +  \"loom_source_remote\": \"https://github.com/rjwalters/loom.git\"\n",
+        ),
+    )
+}
+
+#[test]
+fn a_resync_only_base_move_is_discounted_without_any_version_bump() {
+    // THE #9065 FINDING: ~15 of these land on `main` every day, none of them
+    // bumps VERSION, and every one of them used to make D non-empty — which
+    // the conflict-marker gate's `**` scanned set turns straight into a
+    // refusal for every open PR.
+    assert!(
+        strip_validated_restamps(&[resync_stamp()]).is_empty(),
+        "a resync stamp is a machine restamp, not a base move any gate reads"
+    );
+}
+
+#[test]
+fn a_resync_that_also_rewrote_an_installed_surface_still_counts_as_stale() {
+    // The input-scoping guarantee: the discount is per FILE, never per COMMIT.
+    // A resync that actually copied a script through leaves that script in D,
+    // where the ordinary clauses judge it exactly as before.
+    let files = vec![
+        resync_stamp(),
+        f(".loom/scripts/worktree.sh", "modified", Some("@@ -1,1 +1,1 @@\n-old\n+new\n")),
+        f(
+            ".loom/docs/troubleshooting.md",
+            "modified",
+            Some("@@ -1,1 +1,1 @@\n-old\n+new\n"),
+        ),
+    ];
+    let kept: Vec<String> = strip_validated_restamps(&files)
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    assert_eq!(kept, vec![".loom/scripts/worktree.sh", ".loom/docs/troubleshooting.md"]);
+}
+
+#[test]
+fn a_non_restamp_field_of_install_metadata_is_a_real_change() {
+    // Only the three fields `restamp_metadata()` writes are discountable, and
+    // each only in its own shape. Anything else in that file is a real edit.
+    for patch in [
+        // An installed-file list entry: a genuine surface change.
+        "@@ -5,1 +5,1 @@\n-    \".loom/scripts/worktree.sh\",\n+    \".loom/scripts/gone.sh\",\n",
+        // The right key, the wrong shape.
+        "@@ -3,1 +3,1 @@\n-  \"loom_commit\": \"aaaaaaa\",\n+  \"loom_commit\": \"not-a-sha\",\n",
+        "@@ -38,1 +38,1 @@\n-  \"last_resync\": \"2026-09-27\",\n+  \"last_resync\": \"yesterday\",\n",
+        "@@ -39,1 +39,1 @@\n-  \"loom_source_remote\": \"git@github.com:rjwalters/loom.git\"\n\
+         +  \"loom_source_remote\": \"file:///tmp/evil\"\n",
+        // The version field with NO validated pair to justify it.
+        "@@ -2,1 +2,1 @@\n-  \"loom_version\": \"0.19.398\",\n+  \"loom_version\": \"9.9.9\",\n",
+    ] {
+        let files = vec![f(".loom/install-metadata.json", "modified", Some(patch))];
+        assert_eq!(
+            strip_validated_restamps(&files).len(),
+            1,
+            "must survive as a real change: {patch}"
+        );
+    }
+}
+
+#[test]
+fn a_resync_stamp_riding_along_with_a_version_bump_is_still_discounted() {
+    // The two restamps land in the same compare all the time: `D` spans many
+    // commits, so a release bump and a resync are usually both in it.
+    let files = vec![version_bump(), resync_stamp()];
+    assert!(strip_validated_restamps(&files).is_empty(), "both are machine restamps");
+}
+
 #[test]
 fn a_non_modified_status_on_a_version_file_is_a_real_change() {
     // An ADDED or REMOVED version-bearing file is not a restamp of a value.

@@ -15,6 +15,7 @@ mod owners;
 mod queue_time;
 mod rerun_window;
 mod story_stitch;
+mod trigger_reason;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
