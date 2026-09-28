@@ -220,6 +220,10 @@ pub fn classify(outcome: &RoleTickOutcome) -> (RoleTickResult, Option<String>) {
             RoleTickResult::SkippedLoad,
             Some(format!("load-skipped[{load_per_core:.2}]: {detail}")),
         ),
+        // #9391: the queue gate found nothing to do — never spawned.
+        RoleTickOutcome::QueueEmpty => {
+            (RoleTickResult::SkippedQueueEmpty, Some("queue-empty".to_string()))
+        }
     }
 }
 
