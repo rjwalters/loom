@@ -27,7 +27,7 @@
   color: "9CA3AF"  # gray-400 - neutral initial state
 
 - name: loom:issue
-  description: "Approved for work. Applied by: humans, Champion, or sweep Approval gate — see curator.md for rule."
+  description: "Approved for work. Applied by: humans, Champion, sweep gate, Curator (starred) — see curator.md."
   color: "3B82F6"  # blue-500
 
 # DEPRECATED: loom:in-progress removed (use role-specific labels)
@@ -145,7 +145,7 @@
   color: "EF4444"  # red-500
 
 - name: loom:urgent
-  description: Critical/blocking issue requiring immediate attention
+  description: "Retired (#9244): use loom:operator-priority"
   color: "DC2626"  # red-600
 
 - name: loom:abort

@@ -96,10 +96,10 @@ label documents its own `Applied by:` owner). State transitions:
 - **Epic**: `loom:epic` → Champion creates phased `loom:architect` +
   `loom:epic-phase` issues.
 
-`loom:operator` is the first-class "a human is needed" state (engine stops
-acting, re-evaluable, unlike `loom:operator-only`) — wired at Champion's
-merge-risk hold only so far. What is currently waiting on you: the pinned
-merge-risk hold digest (#6877) and the two label queries, both in
+`loom:operator` means "a human is needed" (engine stops, re-evaluable, unlike
+`loom:operator-only`; set by Champion's merge-risk hold). `loom:operator-priority`
+is the operator's star (not a hold); every stage takes it first. Your
+queue: the pinned hold digest (#6877) and label queries in
 [`.loom/docs/label-state-machine.md`](.loom/docs/label-state-machine.md).
 
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from
