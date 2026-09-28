@@ -33,6 +33,20 @@ Its span ID is derived from the story root and the sweep id
 adds a `loom.role_attempt` span to that story (#9168) whose ID is derived from
 the story root, `loom.role_tick`, the tick's execution id (`loom.sweep_id`)
 and the target (`pr:<loom.pr_number>`, else `issue:<loom.issue>`).
+The story's `story.*` phase spans are the 2am reconciler's, with D32 IDs keyed
+by a GitHub timeline event (see [`tracing.md`](tracing.md)); Loom mints none.
+
+**`loom.attempt`** has one meaning everywhere: the 1-indexed ordinal of a span
+among the same-named spans (and the same `loom.role`, when present) under the
+same parent, ordered by start (the reconciler breaks ties by opening event,
+PR number, then `source_event_id`).
+Loom's `loom.role_attempt` / `loom.phase` value — the Nth started attempt of a
+role within a sweep (`Journal::start_linked`) — is the special case whose
+parent is the sweep. The 2am reconciler sets it on the repeating story kinds
+(`story.queue_dwell`, `story.review_wait`, `story.rework`, `story.reopened`,
+`story.operator_hold`) under the story root. An opened-but-unclosed sibling
+counts, so an exported ordinal is never reissued; ordinals are never
+renumbered, so a span aged out of retention leaves a visible gap.
 
 A child span's ID is derived from its trace ID, its parent span ID, its span
 name, its `loom.role` (if any), its `loom.tool.name` (if any), and its start
