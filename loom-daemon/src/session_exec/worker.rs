@@ -52,8 +52,20 @@ fn reap(root: i32, result: &mut Option<i32>) -> Result<bool> {
     }
 }
 
-/// Absolute expiry prevents buffered heartbeats from resurrecting a job after
-/// a delayed Docker startup. Host and VM clocks must agree within the lease.
+/// Absolute expiry still gates lease ACCEPTANCE — a buffered heartbeat that
+/// arrives already expired can neither authorize launch nor extend a lease —
+/// but an out-of-window line is skipped, never treated as cancellation
+/// (#9067): under CI load the docker-exec stdin transport buffers heartbeats
+/// for longer than `LEASE_MS`, and the arriving data itself proves the host
+/// is alive. A stale burst followed by a fresh tail therefore extends the
+/// lease, exactly like a heartbeat that arrived on time. Cancellation is
+/// decisive only via the explicit non-numeric `cancel` line, a read error, or
+/// EOF with nothing accepted in the same pass; a merely silent channel is the
+/// caller's `STALL_MS` decision, measured from the last data arrival
+/// (`received` updates on any bytes, not only accepted leases). Host and VM
+/// clocks must still agree within the lease for a heartbeat to be accepted,
+/// but transient disagreement now stalls acceptance rather than killing the
+/// dispatch.
 fn read_lease(
     input: &mut impl Read,
     pending: &mut Vec<u8>,
@@ -69,7 +81,12 @@ fn read_lease(
         }
         match input.read(&mut bytes) {
             Ok(0) => eof = true,
-            Ok(n) => pending.extend_from_slice(&bytes[..n]),
+            Ok(n) => {
+                pending.extend_from_slice(&bytes[..n]);
+                // Any data is channel liveness, even when every line in it is
+                // outside the acceptance window (#9067).
+                *received = Instant::now();
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return Some(false),
@@ -84,7 +101,7 @@ fn read_lease(
                 return Some(false);
             };
             if value <= now_ms() || value > now_ms() + LEASE_MS + 250 {
-                return Some(false);
+                continue;
             }
             *expiry = value;
             *received = Instant::now();
@@ -105,8 +122,7 @@ fn read_lease(
     if eof {
         return Some(false);
     }
-    (*expiry != 0)
-        .then(|| *expiry > now_ms() && received.elapsed() < Duration::from_millis(LEASE_MS))
+    None
 }
 
 pub(super) fn run(args: WorkerArgs) -> Result<i32> {
@@ -130,18 +146,45 @@ pub(super) fn run(args: WorkerArgs) -> Result<i32> {
     let mut received = Instant::now();
     let start = Instant::now();
     let mut lease_valid = false;
-    while start.elapsed() < Duration::from_millis(LEASE_MS) {
+    let mut startup_trigger = "";
+    // STALL_MS, not LEASE_MS: a docker exec attach under CI load can take
+    // longer than one lease horizon to deliver the first heartbeat (#9067).
+    // EOF and explicit `cancel` still refuse instantly; only a channel that
+    // stays silent-and-open for the whole window expires here.
+    while start.elapsed() < Duration::from_millis(STALL_MS) {
         if SIGNAL.load(Ordering::Relaxed) != 0 {
-            std::io::stderr().write_all(&ack(&args.id))?;
-            return Ok(143);
+            startup_trigger = "worker-signal";
+            break;
         }
         if let Some(valid) = read_lease(&mut input, &mut pending, &mut expiry, &mut received) {
             lease_valid = valid;
+            if !valid {
+                startup_trigger = "lease-channel-closed-or-corrupt";
+            }
             break;
         }
         std::thread::sleep(POLL);
     }
-    if !lease_valid || expiry <= now_ms() || SIGNAL.load(Ordering::Relaxed) != 0 {
+    if lease_valid && (expiry <= now_ms() || SIGNAL.load(Ordering::Relaxed) != 0) {
+        startup_trigger = if SIGNAL.load(Ordering::Relaxed) != 0 {
+            "worker-signal"
+        } else {
+            "lease-expired-before-launch"
+        };
+        lease_valid = false;
+    }
+    if !lease_valid {
+        if startup_trigger.is_empty() {
+            startup_trigger = "startup-window-expired";
+        }
+        eprintln!(
+            "session-exec: worker {} cancelled before launch (trigger={}, waited_ms={}, expiry={}, now={})",
+            args.id,
+            startup_trigger,
+            start.elapsed().as_millis(),
+            expiry,
+            now_ms()
+        );
         std::io::stderr().write_all(&ack(&args.id))?;
         return Ok(143);
     }
@@ -171,10 +214,33 @@ pub(super) fn run(args: WorkerArgs) -> Result<i32> {
             });
         }
         if stopping.is_none() {
-            cancelled = SIGNAL.load(Ordering::Relaxed) != 0
-                || !read_lease(&mut input, &mut pending, &mut expiry, &mut received)
-                    .unwrap_or(false);
+            // #9067: only decisive channel events (explicit `cancel`, read
+            // error, EOF) or a channel silent-and-open past STALL_MS cancel a
+            // running invocation. A delayed or clock-skewed heartbeat used to
+            // cancel here and SIGTERM healthy work under CI load.
+            let signalled = SIGNAL.load(Ordering::Relaxed) != 0;
+            let channel = read_lease(&mut input, &mut pending, &mut expiry, &mut received);
+            cancelled = signalled
+                || matches!(channel, Some(false))
+                || received.elapsed() >= Duration::from_millis(STALL_MS);
             if cancelled || result.is_some() {
+                if cancelled {
+                    let trigger = if signalled {
+                        "worker-signal"
+                    } else if matches!(channel, Some(false)) {
+                        "lease-channel-closed-or-corrupt"
+                    } else {
+                        "lease-channel-stalled"
+                    };
+                    eprintln!(
+                        "session-exec: worker {} cancelling invocation (trigger={}, expiry={}, now={}, last_data_ago_ms={})",
+                        args.id,
+                        trigger,
+                        expiry,
+                        now_ms(),
+                        received.elapsed().as_millis()
+                    );
+                }
                 stopping = Some(Instant::now());
             }
         }
@@ -193,6 +259,23 @@ pub(super) fn run(args: WorkerArgs) -> Result<i32> {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    /// Worker-stdin shape: return exactly what was written, then block
+    /// forever (the channel stays open). Models a live-but-slow docker exec
+    /// stdin transport (#9067).
+    struct BytesThenWouldBlock(Vec<u8>, bool);
+    impl Read for BytesThenWouldBlock {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.1 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            self.1 = true;
+            let n = self.0.len().min(out.len());
+            out[..n].copy_from_slice(&self.0);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
 
     /// Worker-stdin shape: return exactly what was written, then EOF (0). A
     /// single `read_lease` call over it is one read pass whose data and
@@ -267,8 +350,8 @@ mod tests {
     }
 
     #[test]
-    fn expired_or_garbage_lease_lines_cancel() {
-        for line in [b"1\n".to_vec(), b"cancel\n".to_vec()] {
+    fn garbage_lease_lines_cancel() {
+        for line in [b"cancel\n".to_vec(), b"not-a-number\n".to_vec()] {
             let mut expiry = 0;
             let mut received = Instant::now();
             assert_eq!(
@@ -276,6 +359,68 @@ mod tests {
                 Some(false)
             );
         }
+    }
+
+    #[test]
+    fn stale_lease_lines_do_not_cancel_an_open_channel() {
+        // #9067: a heartbeat buffered by the docker exec transport longer than
+        // the lease horizon arrives expired. Old behavior: immediate
+        // cancellation (Some(false)) — the exit-143 flake. The line is data,
+        // so the host is provably alive; it must be skipped, not acted on.
+        let mut expiry = 0;
+        let mut received = Instant::now() - Duration::from_secs(5);
+        assert_eq!(
+            read_lease(
+                &mut BytesThenWouldBlock(b"1\n".to_vec(), false),
+                &mut Vec::new(),
+                &mut expiry,
+                &mut received
+            ),
+            None
+        );
+        assert_eq!(expiry, 0);
+        // The stale data still proves the channel is delivering.
+        assert!(received.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn stale_burst_with_fresh_tail_extends_the_lease() {
+        // A transport backlog delivered as one burst: expired beats first, the
+        // current heartbeat last. Only the fresh tail is accepted.
+        let fresh = now_ms() + LEASE_MS;
+        let mut bytes = b"1\n".to_vec();
+        bytes.extend_from_slice(&format!("{fresh}\n").into_bytes());
+        let mut expiry = 0;
+        let mut received = Instant::now();
+        assert_eq!(
+            read_lease(
+                &mut BytesThenWouldBlock(bytes, false),
+                &mut Vec::new(),
+                &mut expiry,
+                &mut received
+            ),
+            Some(true)
+        );
+        assert_eq!(expiry, fresh);
+    }
+
+    #[test]
+    fn far_future_lease_line_is_skipped_not_cancelled() {
+        // Host/container clock skew beyond the acceptance band must not
+        // cancel a dispatch whose host is demonstrably heartbeating (#9067).
+        let skewed = format!("{}\n", now_ms() + LEASE_MS + 5_000);
+        let mut expiry = 0;
+        let mut received = Instant::now();
+        assert_eq!(
+            read_lease(
+                &mut BytesThenWouldBlock(skewed.into_bytes(), false),
+                &mut Vec::new(),
+                &mut expiry,
+                &mut received
+            ),
+            None
+        );
+        assert_eq!(expiry, 0);
     }
 
     #[test]
