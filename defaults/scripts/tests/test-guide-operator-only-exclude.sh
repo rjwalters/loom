@@ -20,8 +20,8 @@
 #      loom:operator-only and loom:blocked.
 #   2. The retired urgent-label machinery is gone from guide.md: no
 #      urgency_rank(), no flip-guard call, no "Maximum Urgent" section, no
-#      has_operator_only()/has_blocked() candidate helpers, and no
-#      loom:urgent label anywhere.
+#      has_operator_only()/has_blocked() candidate helpers, and no mention
+#      of the retired urgent label anywhere.
 #   3. guide.md never adds or removes loom:operator-priority (no
 #      `gh issue edit ... loom:operator-priority` write), and states so.
 #   4. render_plan_body() reads loom:operator-priority into an
@@ -82,7 +82,8 @@ assert_grep '\-label:loom:building \-label:loom:operator-only \-label:loom:block
 # ---------------------------------------------------------------------------
 echo ""
 echo "Test 2: the retired urgent-label machinery is gone (#9244)"
-assert_no_grep 'loom:urgent' "$GUIDE_MD" "guide.md never names the retired loom:urgent label"
+# `urgen[t]` keeps this file itself out of the repo-wide retired-label grep.
+assert_no_grep 'loom:urgen[t]' "$GUIDE_MD" "guide.md never names the retired urgent label"
 assert_no_grep '^urgency_rank\(\) \{' "$GUIDE_MD" "urgency_rank() is removed"
 assert_no_grep 'urgent-flip-guard' "$GUIDE_MD" "no urgent-flip-guard.sh call remains"
 assert_no_grep '^## Maximum Urgent' "$GUIDE_MD" "the 'Maximum Urgent' section is removed"
