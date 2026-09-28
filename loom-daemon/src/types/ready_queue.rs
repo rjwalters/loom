@@ -46,8 +46,10 @@ pub enum QueueDisposition {
     /// Blocked: the work finder is holding dispatch for its whole repo. The
     /// hold has several possible causes (verified-red `main`, a main-health
     /// gate still running, a pre-flight advisory hold, an unusable token pool,
-    /// a scheduled drain, the host-distress breaker); the row does not say
-    /// which.
+    /// a scheduled drain, the host-distress breaker); the row's `detail`
+    /// names which one, as a closed-vocabulary token from
+    /// `work_finder::halt_cause` (#9017) — absent on rows recorded by a
+    /// cause-less legacy caller.
     WorkspaceHalted,
     /// Blocked: its workspace is missing `.claude/commands/loom/sweep.md`.
     WorkspaceCommandsMissing,

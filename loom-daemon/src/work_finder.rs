@@ -230,6 +230,7 @@ pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP
 pub mod build_backoff;
 pub mod dispatch_plan;
 pub mod dispatch_plan_merge;
+pub mod halt_cause;
 mod labels;
 pub mod main_red_fix;
 pub mod operator_priority;
@@ -1573,6 +1574,13 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 /// function deliberately does NOT do that: dispatch is work-conserving, so an
 /// unowned repo is only ever *deferred behind* the owned ones, and is picked
 /// up in full the moment this host's own slice runs dry.
+/// `halt_causes` (optional, parallel to `halted`) names WHICH hold tripped
+/// workspace `i` (#9017): `halt_causes[i]` is the closed-vocabulary cause
+/// recorded in that workspace's `workspace_halted` rows (`None` for a
+/// not-held root). `None` — what [`tick_multi_with_sharding`] passes — keeps
+/// rows cause-less, byte-for-byte the pre-#9017 behaviour. `halted` stays
+/// authoritative for routing: a cause at a not-held index is ignored, and a
+/// held index without a cause records a cause-less row.
 // Each argument is an independently-resolved admission knob (global ceiling,
 // per-tick ramp, saturation brake, repo slice, per-repo cap) that the caller
 // reads from a different source; bundling them into a struct would only move
@@ -1584,6 +1592,7 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
     priorities: &[u32],
     terms: CapTerms,
     halted: &[bool],
+    halt_causes: Option<&[Option<halt_cause::HaltCause>]>,
     max_admissions_per_tick: usize,
     saturation_held: bool,
     preferred_slice: Option<&[bool]>,
@@ -1817,9 +1826,20 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         let red = lane.is_red(&ready, || dispatcher.main_red_via_ci());
         let repo_halted = halted.get(idx).copied().unwrap_or(false);
         if repo_halted && !lane.admits_fixes_while_halted() {
+            // #9017: name WHICH hold tripped, not just that one did. The
+            // cause slice is optional and parallel to `halted`; a missing
+            // entry (or a legacy no-cause caller) records a cause-less row,
+            // byte-for-byte the pre-#9017 behaviour.
+            let cause = halt_causes.and_then(|c| c.get(idx).copied()).flatten();
             for item in &ready {
                 let key = ready_queue::key_of(idx, workspace_priority, item, red);
-                ready_queue::record_skip(q, key, item, Qd::WorkspaceHalted, None);
+                ready_queue::record_skip(
+                    q,
+                    key,
+                    item,
+                    Qd::WorkspaceHalted,
+                    cause.map(|c| c.as_str().to_string()),
+                );
             }
             continue;
         }
@@ -3156,17 +3176,23 @@ pub fn spawn_multi_work_finder_task(
             // are computed together and why a pool hold outranks a #5030
             // recovery probe.
             let now_tick = chrono::Utc::now();
-            let (preflight_held, preflight_probe_roots) =
-                pool_preflight::preflight_held_per_root(&pool, &roots, now_tick);
-            let halted: Vec<bool> = dispatch_held_per_root_with_preflight(
+            let (preflight_held, preflight_causes, preflight_probe_roots) =
+                pool_preflight::preflight_held_causes_per_root(&pool, &roots, now_tick);
+            // #9017: compute the per-root CAUSE, then project the `halted`
+            // bool from it, so the slice the tick routes on and the causes
+            // its rows record are one fold and can never disagree — the same
+            // terms, same inputs, same instant as the pre-#9017 inline bool
+            // fold (`dispatch_held_per_root_with_preflight` + drain +
+            // breaker, which `causes_per_root` mirrors cause-for-cause).
+            let halt_causes = halt_cause::causes_per_root(
                 &health_states,
                 &roots,
                 suppress_dispatch_during_gate,
-                &preflight_held,
-            )
-            .into_iter()
-            .map(|h| h || draining || breaker_suppressed)
-            .collect();
+                &preflight_causes,
+                draining,
+                breaker_suppressed,
+            );
+            let halted: Vec<bool> = halt_causes.iter().map(Option::is_some).collect();
             let preflight_held_count = preflight_held.iter().filter(|&&h| h).count();
             // Distinguish a pre-flight-advisory hold from the main-health /
             // gate-in-flight holds (#5030 AC4) so an operator can tell "held
@@ -3269,6 +3295,7 @@ pub fn spawn_multi_work_finder_task(
                 &priorities,
                 CapTerms::new(configured_max, disk, ram),
                 &halted,
+                Some(&halt_causes),
                 max_admissions_per_tick,
                 saturation_held,
                 Some(&preferred_slice),

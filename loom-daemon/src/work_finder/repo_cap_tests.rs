@@ -80,6 +80,7 @@ fn tick_capped<const N: usize>(
         priorities,
         max_concurrent.into(),
         &[false; N],
+        None,
         usize::MAX,
         false,
         None,

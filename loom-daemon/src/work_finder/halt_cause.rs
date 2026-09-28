@@ -1,0 +1,127 @@
+//! Closed hold-cause vocabulary for `workspace_halted` rows (Issue #9017).
+//!
+//! The multi-workspace tick folds several independent per-root and
+//! daemon-global hold signals into one `halted: &[bool]`, so a
+//! `workspace_halted` row could previously say only "repo dispatch held
+//! (red main, gate, token pool, drain or breaker)" — never which one. This
+//! seam module owns the named-cause counterpart: a small closed vocabulary
+//! plus the per-root fold that computes it. It lives in its own file for the
+//! same file-size-ratchet reason `tick_report.rs` and `pool_preflight.rs`
+//! were split out of the frozen `work_finder.rs`.
+//!
+//! The bool fold stays authoritative for *routing* (a root is held or it is
+//! not); the cause is the *attribution* layered on top. Deriving the bool as
+//! `cause.is_some()` keeps the two in lockstep by construction.
+//!
+//! `token_pool` and `preflight_advisory` are deliberately distinct values:
+//! `pool_preflight::preflight_held_per_root` folds the #7708 token-pool
+//! exhaustion hold and the #5030 claude-wrapper pre-flight advisory into one
+//! bool, and its cause-carrying counterpart
+//! ([`crate::work_finder::pool_preflight::preflight_held_causes_per_root`])
+//! splits them back out — an operator's remedy for a dead pool (add/wait for
+//! accounts) is different from a broken `.mcp.json` (fix the workspace).
+
+use std::path::PathBuf;
+
+use crate::main_health_gate::WorkspaceHealthStates;
+
+/// Why one workspace's dispatch is held this tick. A closed vocabulary: the
+/// `detail` a `workspace_halted` row carries on public views is one of these
+/// tokens verbatim, so no free-form text ever reaches the wire from this
+/// path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HaltCause {
+    /// The root's `main` is verified-red (`is_halted`, #3930).
+    MainRed,
+    /// A build-gate run against the root is in flight and the
+    /// `suppress_dispatch_during_gate` knob is on (#4084).
+    GatePending,
+    /// The resolved token pool has no spawnable accounts (#7708), or a peer
+    /// host reported the same pool unspawnable (#8001).
+    TokenPool,
+    /// The root's claude-wrapper pre-flight advisory is tripped (broken
+    /// `.mcp.json`, repeated crash deaths — #5030).
+    PreflightAdvisory,
+    /// A daemon-global scheduled drain is in progress (#4090).
+    Drain,
+    /// The host-distress breaker is suppressing dispatch globally.
+    Breaker,
+}
+
+impl HaltCause {
+    /// The wire token carried in a `workspace_halted` row's `detail`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MainRed => "main_red",
+            Self::GatePending => "gate_pending",
+            Self::TokenPool => "token_pool",
+            Self::PreflightAdvisory => "preflight_advisory",
+            Self::Drain => "drain",
+            Self::Breaker => "breaker",
+        }
+    }
+}
+
+/// The per-root cause fold — the named-cause counterpart of
+/// [`super::dispatch_held_per_root_with_preflight`] plus the daemon-global
+/// `draining` / breaker terms the production loop OR's on top (#9017).
+///
+/// `preflight_causes` is parallel to `roots`, as computed by
+/// [`crate::work_finder::pool_preflight::preflight_held_causes_per_root`];
+/// a missing entry defaults to *not held*, mirroring the bool fold's
+/// `preflight_held.get(i).unwrap_or(false)`.
+///
+/// **Precedence** — when several causes are true at once for the same root,
+/// the first of these wins, so the row always names one cause:
+///
+/// 1. `main_red` — the most root-specific, operator-actionable cause; a red
+///    `main` is why the queue usually looks at this row at all.
+/// 2. `gate_pending` — transient and per-root; it clears on its own when the
+///    gate run finishes.
+/// 3. `token_pool` — per-root (or pool-shared); outranks the advisory below
+///    because a pool hold allows no recovery probe, mirroring the existing
+///    "a pool hold outranks a #5030 recovery probe" rule.
+/// 4. `preflight_advisory` — per-root, and already probe-driven, so it is the
+///    least urgent of the per-root holds.
+/// 5. `drain` — daemon-global operator intent.
+/// 6. `breaker` — daemon-global automatic suppression; the least specific
+///    cause names the least specific holds.
+///
+/// `None` means the root is not held. `cause.is_some()` is byte-for-byte the
+/// bool fold's `true`, which is how the production loop derives its `halted`
+/// slice from this function — one source of truth, so the slice the tick
+/// routes on and the causes its rows record can never disagree.
+#[must_use]
+pub fn causes_per_root(
+    health_states: &WorkspaceHealthStates,
+    roots: &[PathBuf],
+    suppress_dispatch_during_gate: bool,
+    preflight_causes: &[Option<HaltCause>],
+    draining: bool,
+    breaker_suppressed: bool,
+) -> Vec<Option<HaltCause>> {
+    roots
+        .iter()
+        .enumerate()
+        .map(|(i, root)| {
+            if health_states.is_halted(root) {
+                return Some(HaltCause::MainRed);
+            }
+            if suppress_dispatch_during_gate && health_states.is_gate_in_flight(root) {
+                return Some(HaltCause::GatePending);
+            }
+            if let Some(cause) = preflight_causes.get(i).copied().flatten() {
+                return Some(cause);
+            }
+            if draining {
+                return Some(HaltCause::Drain);
+            }
+            breaker_suppressed.then_some(HaltCause::Breaker)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+#[path = "halt_cause_tests.rs"]
+mod tests;
