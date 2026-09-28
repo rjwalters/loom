@@ -496,7 +496,11 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
     },
     RequiredCheck {
         context: "Daemon Checks",
-        components: &["Shell Budget Ratchet", ".gitignore Convergence Check"],
+        components: &[
+            "Shell Budget Ratchet",
+            ".gitignore Convergence Check",
+            "Secret Scan",
+        ],
     },
 ];
 
@@ -712,6 +716,22 @@ pub const SPECS: &[CheckSpec] = &[
         ],
         scanned: &[],
         coupled: &[".gitignore"],
+        removal_sensitive: false,
+    },
+    // Scans the commits in `base..head` by revision (#9133), so like the
+    // version-bump check it depends on the PR's own commits alone; `main`
+    // moving can only make it stale through the scanner or its allowlist.
+    CheckSpec {
+        context: "Secret Scan",
+        global: &[
+            "loom-daemon/**",
+            "Cargo.toml",
+            "Cargo.lock",
+            ".loom/secret-scan-allow",
+            CI_WORKFLOW,
+        ],
+        scanned: &[],
+        coupled: &[],
         removal_sensitive: false,
     },
     // Its ONLY input is its own script: it diffs `merge-base(base, head)..head`

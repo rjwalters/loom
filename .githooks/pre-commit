@@ -16,3 +16,14 @@ if [ -n "$STAGED_RS" ]; then
   echo "$STAGED_RS" | xargs cargo fmt --
   echo "$STAGED_RS" | xargs git add
 fi
+
+# Refuse staged credential-shaped content, whatever its path (#9133). Runs
+# after the formatters so it sees exactly what will be committed. Needs a
+# loom-daemon that has `secret-scan`; without one it warns and allows, and the
+# CI scan in Daemon Checks is what still catches it.
+SCAN_BIN="${LOOM_DAEMON_SELF_BIN:-loom-daemon}"
+if "$SCAN_BIN" secret-scan --help >/dev/null 2>&1; then
+  "$SCAN_BIN" secret-scan --staged || exit 1
+else
+  echo "pre-commit: loom-daemon secret-scan unavailable; staged content was NOT scanned for credentials (#9133)" >&2
+fi

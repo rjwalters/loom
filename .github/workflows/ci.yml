@@ -982,6 +982,38 @@ jobs:
         if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
 
+      # component: Secret Scan
+      # Refuses any commit that ADDS a credential-shaped value, whatever its
+      # path (#9133): the same `loom-daemon secret-scan` the PreToolUse guard
+      # and .githooks/ run, so there is one pattern list. Each commit in the
+      # event is scanned on its own, not the net diff, because a value added
+      # and then deleted on a branch is still published by the push.
+      # Runs on push to main too: a commit that reaches main through a
+      # ruleset bypass never runs PR checks (#9136), which is how the
+      # 2026-09-26 leak arrived. There it cannot prevent anything; it turns a
+      # silent disclosure into a red run. Behind `daemon != 'false'` like its
+      # siblings, so a dashboard-only PR is not scanned here; the guard and
+      # hooks still cover that path.
+      - name: Refuse commits that add a credential-shaped value (#9133)
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ -n "$PUSH_BEFORE" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            range="$PUSH_BEFORE..$PUSH_AFTER"
+          else
+            range="$PUSH_AFTER^!"
+          fi
+          echo "Scanning $range"
+          ./target/debug/loom-daemon secret-scan --range "$range"
+
   install-surface-checks:
     name: Install Surface Checks
     # Agent Skills Sync Check and Fresh Install Link Check on the shared debug

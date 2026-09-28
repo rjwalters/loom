@@ -390,8 +390,10 @@ fn every_script_a_required_job_runs_is_a_global_input() {
             let refs = script_refs(lines);
             let spec = spec(component);
             pinned += 1;
+            // These two run only the built daemon, no script; their G set
+            // carries `loom-daemon/**` instead.
             assert!(
-                !refs.is_empty() || *component == "Shell Budget Ratchet",
+                !refs.is_empty() || matches!(*component, "Shell Budget Ratchet" | "Secret Scan"),
                 "{component}: no script references found — the parser probably broke"
             );
             for script in refs {
