@@ -51,6 +51,11 @@ enum WorkerCommand {
     /// listener substitutes it back on the way to `--upstream`. Used by
     /// `spawn-claude.sh`'s contained dispatch; fails closed (exit 78).
     ProxyExec(super::egress_proxy::exec::ExecArgs),
+
+    /// From inside a proxied container (#8818): ask the host-side egress
+    /// proxy to bad-mark this launch's current account and swap in another
+    /// behind the same placeholder. Prints `export LOOM_TOKEN_NAME='…'`.
+    ProxyRotate(super::egress_proxy::rotate_client::RotateArgs),
 }
 
 fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), LaunchError> {
@@ -227,6 +232,7 @@ pub fn cli(args: WorkerArgs) -> anyhow::Result<()> {
         WorkerCommand::ProfileCheck { name, runtime } => (name, runtime),
         WorkerCommand::Readiness(args) => return args.run(),
         WorkerCommand::ProxyExec(args) => return super::egress_proxy::exec::cli(args),
+        WorkerCommand::ProxyRotate(args) => return super::egress_proxy::rotate_client::cli(args),
     };
     match report(name.as_deref(), runtime.as_deref()) {
         Ok((text, resolvable)) => {

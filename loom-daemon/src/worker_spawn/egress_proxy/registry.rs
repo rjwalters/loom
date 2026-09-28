@@ -19,6 +19,11 @@
 //!    additionally refuses a request that merely *names* another host, so an
 //!    attempt shows up as a logged 403 rather than as silent success against
 //!    the pinned host.
+//!
+//! A record's credential is not immutable: host-side account rotation
+//! ([`super::rotation`], #8818) swaps it in place behind the SAME placeholder.
+//! The per-record `account`, `generation` and `evidence` fields exist for that,
+//! and none of them is ever set from anything the container sent.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -121,6 +126,12 @@ impl Upstream {
     #[must_use]
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// Explicit port, when the URL carried one.
+    #[must_use]
+    pub fn port(&self) -> Option<u16> {
+        self.port
     }
 
     /// The absolute URL a request for `target` (an origin-form path, query
@@ -238,8 +249,23 @@ pub struct Record {
     pub provider: String,
     pub upstream: Upstream,
     pub header: HeaderStyle,
-    credential: String,
-    open: bool,
+    pub(super) credential: String,
+    pub(super) open: bool,
+    /// `tokens_pool` (Claude OAuth) account name the credential belongs to
+    /// (non-secret, host-side only). `None` disables rotation for this record
+    /// (#8818). Mutually exclusive with `pool_account` below (the
+    /// `api_keys_pool` attribution #8699 marks through): that state assumes
+    /// the credential never changes, so a record carrying it is never
+    /// rotated — see [`super::rotation`].
+    pub(super) account: Option<String>,
+    /// Bumped on every in-place credential swap, so an upstream status that
+    /// answered a request made with the OLD credential is never counted as
+    /// evidence against the new one.
+    pub(super) generation: u32,
+    /// Swaps performed so far for this launch.
+    pub(super) rotations: u32,
+    /// What the upstream said about the CURRENT credential.
+    pub(super) evidence: Evidence,
     /// This launch's pool account name, and the workspace root its pool lives
     /// under — set only when [`super::credential::Source::Pool`] selected the
     /// credential (#8699). `None` for an env-sourced credential (a one-off
@@ -266,6 +292,27 @@ pub struct Record {
     usage: Arc<Mutex<Usage>>,
 }
 
+/// Upstream refusals the proxy itself observed for a record's current
+/// credential. A rotation that bad-marks an account needs the matching kind
+/// (see [`super::rotation`]): the container's word alone is not enough.
+///
+/// Deliberately narrow, because the container chooses the method, path, body
+/// and non-credential headers of every request it sends through the proxy, so
+/// it can make the upstream refuse a HEALTHY credential on purpose (a bad path
+/// or body is a 400/404; a stripped header may be a 401/403). Only statuses
+/// that such a request cannot cheaply fake count, and even then evidence is a
+/// pre-gate, not proof: a permanent mark additionally needs the host's own
+/// re-probe (see [`super::rotation`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Evidence {
+    /// The upstream answered 401 (403 is not counted: it is a scope/permission
+    /// answer a request can provoke, not "this credential is dead").
+    pub(super) auth_failure: bool,
+    /// The upstream answered 429 (other 4xx are request-shape answers the
+    /// container controls, not exhaustion).
+    pub(super) rate_limited: bool,
+}
+
 impl std::fmt::Debug for Record {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let usage = self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -280,6 +327,9 @@ impl std::fmt::Debug for Record {
             .field("model_class", &self.model_class)
             .field("bad_marked", &(self.bad_marked.load(Ordering::Relaxed) > 0))
             .field("usage", &usage)
+            .field("account", &self.account)
+            .field("generation", &self.generation)
+            .field("rotations", &self.rotations)
             .finish()
     }
 }
@@ -305,6 +355,10 @@ impl Record {
             model_class: None,
             bad_marked: Arc::new(AtomicU64::new(0)),
             usage: Arc::new(Mutex::new(Usage::default())),
+            account: None,
+            generation: 0,
+            rotations: 0,
+            evidence: Evidence::default(),
         }
     }
 
@@ -488,6 +542,13 @@ impl Refusal {
 #[derive(Clone, Default)]
 pub struct Registry {
     inner: Arc<Mutex<HashMap<String, Record>>>,
+    /// Host-side account rotation (#8818). Unset — every native-harness
+    /// launch, and any Claude launch with no known account — refuses every
+    /// rotation request.
+    pub(super) rotation: Arc<std::sync::OnceLock<super::rotation::Control>>,
+    /// Serializes rotations so two concurrent requests cannot both bad-mark
+    /// and both swap.
+    pub(super) rotation_serial: Arc<Mutex<()>>,
 }
 
 impl Registry {
@@ -558,7 +619,22 @@ impl Registry {
         Ok(record.clone())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Record>> {
+    /// Record an upstream response status against the record that made the
+    /// request — only if its credential has not been swapped since. Only 401
+    /// and 429 are recorded (see [`Evidence`]).
+    pub fn observe(&self, launch_id: &str, generation: u32, status: u16) {
+        if !matches!(status, 401 | 429) {
+            return;
+        }
+        for record in self.lock().values_mut() {
+            if record.launch_id == launch_id && record.generation == generation {
+                record.evidence.rate_limited |= status == 429;
+                record.evidence.auth_failure |= status == 401;
+            }
+        }
+    }
+
+    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Record>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
