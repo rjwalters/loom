@@ -403,6 +403,7 @@ fn daemon_ci_log_attribute_containers() -> BTreeMap<String, &'static str> {
         completed_at: at,
         duration_ms: 0,
         queued_ms: Some(0),
+        trigger_reason: Some("new_commit".into()),
     };
     let job = CiJobRecord {
         repo: "2amlogic/example".into(),

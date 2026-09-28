@@ -54,6 +54,10 @@ pub const CI_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     // `ci.run` only (#9007 follow-up): `run_started_at − created_at`, the CI
     // queue segment, so "CI queued" and "CI running" are separable.
     "loom.ci.queued_ms",
+    // `ci.run` only (#9337): why this run attempt happened — `new_commit`,
+    // `stale_main_bump`, `flaky_retry` or `unknown`
+    // (`ci_telemetry::records::TriggerReason`).
+    "loom.ci.trigger_reason",
     "loom.ci.job_id",
     "loom.ci.job",
     "loom.ci.runner",
@@ -126,6 +130,11 @@ pub const CI_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     // Run span only (#9007 follow-up): the CI queue segment, see
     // `CiRunRecord::queued_ms`.
     "loom.ci.queued_ms",
+    // Run span only (#9337): the attempt (so `flaky_retry` is auditable from
+    // the span — the job span's equivalent is `loom.ci.attempts`) and the
+    // trigger attribution, see `CiRunRecord::trigger_reason`.
+    "loom.ci.run_attempt",
+    "loom.ci.trigger_reason",
 ];
 
 /// The low-cardinality metric label allowlist for the two CI duration
@@ -187,6 +196,12 @@ pub struct CiRunRecord {
     /// a pre-#9007 journal line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_ms: Option<i64>,
+    /// Why this run attempt happened (#9337): `new_commit`,
+    /// `stale_main_bump`, `flaky_retry` or `unknown` — see
+    /// `ci_telemetry::records::TriggerReason`. `None` only on a pre-#9337
+    /// journal line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_reason: Option<String>,
 }
 
 impl CiRunRecord {
@@ -216,6 +231,9 @@ impl CiRunRecord {
         out.push(("loom.ci.duration_ms", CiAttr::Int(self.duration_ms)));
         if let Some(queued_ms) = self.queued_ms {
             out.push(("loom.ci.queued_ms", CiAttr::Int(queued_ms)));
+        }
+        if let Some(reason) = &self.trigger_reason {
+            out.push(("loom.ci.trigger_reason", CiAttr::Str(reason.clone())));
         }
         out
     }
