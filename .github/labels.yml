@@ -325,3 +325,18 @@
   description: "Non-collaborator submission; needs maintainer approval before curation. Applied by: humans only."
   color: "E5E7EB"  # gray-200 - external/hold marker
 # END LOOM LABELS
+
+# ============================================================================
+# NOT part of the Loom-managed block above, deliberately.
+#
+# This label is meaningful only where `.github/workflows/ci-daily.yml` runs --
+# it marks the tracking issue that workflow opens for a failing daily job and
+# closes on the next green run (#9085). Keeping it BELOW the END marker means
+# install/upgrade never ships it into a consumer repo, while the byte-identical
+# parity contract with defaults/.github/labels.yml still holds (both files get
+# this same block). ci-daily.yml also creates it idempotently at run time, so a
+# checkout where sync-labels.sh has never run still reports correctly.
+# ============================================================================
+- name: ci:daily-failure
+  description: "Tracking issue for a failing ci-daily.yml job. Applied by: ci-daily.yml only; auto-closed on the next green run."
+  color: "B60205"  # red - a standing failure on main

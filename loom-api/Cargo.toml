@@ -1,6 +1,7 @@
 [package]
 name = "loom-api"
 version.workspace = true
+license.workspace = true
 edition = "2021"
 description = "External REST API for Loom analytics data access"
 
