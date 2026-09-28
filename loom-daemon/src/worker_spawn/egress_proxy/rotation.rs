@@ -12,7 +12,8 @@
 //!   ─────────                                   ───────────────────
 //!   POST /.loom-egress-proxy/v1/rotate    ──▶   placeholder -> launch record
 //!   Authorization: Bearer loom-placeholder-…    evidence check, rotation cap
-//!   {"reason":"usage-limit"}                    mark-bad(current account)
+//!   {"reason":"usage-limit"}                    [auth-dead: host re-probe]
+//!                                               mark-bad(current account)
 //!                                               select() -> swap credential
 //!                                         ◀──   {"rotated":true,"account":"b"}
 //! ```
@@ -34,15 +35,40 @@
 //!
 //! # Why the container's word is not enough to bad-mark
 //!
-//! A compromised container could otherwise walk the pool, permanently
-//! auth-dead-marking every account in it. Two bounds make that expensive:
+//! Not naming an account is not the whole boundary. The proxy forwards the
+//! container's method, path, body and non-credential headers to the pinned
+//! upstream, so a compromised container can make the upstream refuse a
+//! HEALTHY credential on purpose (a malformed body is a 400, a bogus path a
+//! 404, a stripped OAuth beta header plausibly a 401). Anything the proxy
+//! merely *observes* on those responses is therefore container-influenced,
+//! and must not on its own be enough to write a mark that never clears.
 //!
-//! - **Upstream evidence.** A marking rotation needs the proxy itself to have
-//!   seen the upstream refuse the CURRENT credential: a 401/403 for
-//!   `auth-dead` (a permanent mark), any 4xx for an exhaustion mark (a TTL
-//!   mark). `concurrent-session` writes no mark and needs no evidence.
+//! - **Permanent marks need the host's own re-probe.** `auth-dead` writes an
+//!   `Auth`-class `.bad_tokens` entry, which is permanent (operator-cleared).
+//!   Before writing it the host probes the CURRENT credential itself
+//!   ([`AccountPool::probe_auth`] — production: `tokens check`'s
+//!   [`probe_account`](crate::tokens_pool::check::probe_account), a
+//!   host-built 1-token request straight to the Anthropic API, nothing from
+//!   the container in it). Only a 401 from that probe ([`AuthProbe::Dead`])
+//!   writes the mark. A healthy or inconclusive probe (timeout, network, 5xx)
+//!   still swaps the launch onto another account — harmless, and bounded by
+//!   the cap below — but marks nothing. So no request a container can shape
+//!   can get a healthy account permanently parked.
+//! - **Upstream evidence pre-gates every marking rotation**, narrowed to what a
+//!   request cannot cheaply fake: a 401 for `auth-dead` (never 403), a 429 for
+//!   an exhaustion mark (never any other 4xx). This also keeps a container
+//!   from triggering host probes at will. `concurrent-session` writes no mark
+//!   and needs no evidence.
 //! - **A per-launch cap** on swaps ([`DEFAULT_MAX_ROTATIONS`], overridable with
 //!   `LOOM_EGRESS_PROXY_MAX_ROTATIONS` on the host).
+//!
+//! What is NOT closed: exhaustion marks are not re-probed. A container that
+//! genuinely drives an account into 429s (by really spending its quota or
+//! rate limit) can get it TTL-marked, up to the cap per launch. Those marks
+//! are `Exhaustion`-class and expire on their own; none is permanent. The
+//! 429-only gate also means a non-429 exhaustion answer (an API key's
+//! credit-balance 400) cannot drive a proxied rotation — the wrapper then
+//! ends the launch as pool-exhausted, as it did before rotation existed.
 //!
 //! # Relationship to #8699
 //!
@@ -112,7 +138,7 @@ impl Reason {
     fn has_evidence(self, evidence: super::registry::Evidence) -> bool {
         match self {
             Self::AuthDead => evidence.auth_failure,
-            Self::UsageLimit | Self::SessionWindow => evidence.refused,
+            Self::UsageLimit | Self::SessionWindow => evidence.rate_limited,
             Self::ConcurrentSession => true,
         }
     }
@@ -227,16 +253,59 @@ impl std::fmt::Debug for Selected {
     }
 }
 
+/// What the host's own probe of a credential said, for the permanent-mark
+/// gate. Only [`AuthProbe::Dead`] lets an `auth-dead` mark be written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthProbe {
+    /// The upstream answered the host's probe with 401: the credential is dead.
+    Dead,
+    /// The upstream accepted the credential (2xx, or a 429 — rate-limited is
+    /// alive, not dead).
+    Alive,
+    /// No verdict (timeout, connection failure, 5xx, other 4xx). Never marks.
+    Inconclusive,
+}
+
+impl AuthProbe {
+    /// Classify a `tokens check` probe result. Only the probe's own 401 shape
+    /// (`blocked` / `auth_401`) is `Dead`; a `blocked` without it (e.g. an
+    /// empty token) is not evidence of anything.
+    #[must_use]
+    pub fn from_result(result: &crate::tokens_pool::check::AccountResult) -> Self {
+        match result.status.as_str() {
+            "blocked" if result.error.as_deref() == Some("auth_401") => Self::Dead,
+            "available" | "rate_limited" | "exhausted" => Self::Alive,
+            _ => Self::Inconclusive,
+        }
+    }
+
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Dead => "dead",
+            Self::Alive => "alive",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+}
+
 /// The host pool a rotation marks and selects against. A trait so the
-/// trust-boundary tests can count calls without a filesystem, while the
-/// production [`HostPool`] wraps the exact primitives `tokens mark-bad` /
-/// `tokens select` use.
+/// trust-boundary tests can count calls without a filesystem or network,
+/// while the production [`HostPool`] wraps the exact primitives
+/// `tokens mark-bad` / `tokens select` / `tokens check` use.
 pub trait AccountPool: Send + Sync {
     /// Append a `.bad_tokens` entry for `account`.
     fn mark_bad(&self, account: &str, reason: &str, model_scoped: bool) -> Result<(), String>;
     /// Select an eligible account (the just-marked one is no longer eligible).
     fn select(&self) -> Result<Selected, String>;
+    /// Independently probe `credential` (the launch's CURRENT credential, held
+    /// host-side) with a request the host builds itself. Gates every
+    /// permanent mark.
+    fn probe_auth(&self, account: &str, credential: &str) -> AuthProbe;
 }
+
+/// Timeout for the host's `auth-dead` re-probe (same as `tokens check`).
+const AUTH_PROBE_TIMEOUT_SECS: f64 = 15.0;
 
 /// The real host pool: `<workspace>/.loom/tokens`, falling back to the shared
 /// pool exactly as `tokens select --workspace` does.
@@ -269,6 +338,23 @@ impl AccountPool for HostPool {
         )
         .map(|sel| Selected::new(sel.name, sel.key))
         .map_err(|e| e.to_string())
+    }
+
+    fn probe_auth(&self, account: &str, credential: &str) -> AuthProbe {
+        use crate::tokens_pool::check;
+        // The probe is fixed and host-built: its model, prompt, headers and
+        // endpoint come from `tokens check`, never from the container. An
+        // auth death is account-wide, so the (cheap) default probe model is
+        // right whatever model the launch runs.
+        let result = check::probe_account(
+            account,
+            credential,
+            check::DEFAULT_PROBE_MODEL,
+            check::DEFAULT_PROBE_PROMPT,
+            AUTH_PROBE_TIMEOUT_SECS,
+            &check::CurlTransport,
+        );
+        AuthProbe::from_result(&result)
     }
 }
 
@@ -347,7 +433,7 @@ impl Registry {
             .unwrap_or_else(|e| e.into_inner());
         // Snapshot under the map lock; pool I/O happens without it so proxied
         // traffic is never stalled behind a `.bad_tokens` lock.
-        let (key, launch_id, from, generation) = {
+        let (key, launch_id, from, generation, credential) = {
             let guard = self.lock();
             let (key, record) = presented
                 .iter()
@@ -366,10 +452,32 @@ impl Registry {
             if !request.reason.has_evidence(record.evidence) {
                 return Err(ControlRefusal::NoUpstreamEvidence);
             }
-            (key.clone(), record.launch_id.clone(), from, record.generation)
+            // The current credential leaves the map only for the host's own
+            // re-probe below; it is never logged or returned.
+            let credential =
+                (request.reason == Reason::AuthDead).then(|| record.credential.clone());
+            (key.clone(), record.launch_id.clone(), from, record.generation, credential)
         };
 
-        let marked = match request.reason.mark_text(&launch_id) {
+        // A permanent mark needs the host's independent confirmation: the
+        // evidence above was observed on container-shaped requests.
+        let confirmed = match credential {
+            Some(credential) => {
+                let probe = control.pool.probe_auth(&from, &credential);
+                drop(credential);
+                if probe != AuthProbe::Dead {
+                    eprintln!(
+                        "egress-proxy: auth-dead for '{from}' not confirmed by the host \
+                         probe ({}) (launch {launch_id}); rotating without a mark",
+                        probe.token()
+                    );
+                }
+                probe == AuthProbe::Dead
+            }
+            None => true,
+        };
+
+        let marked = match request.reason.mark_text(&launch_id).filter(|_| confirmed) {
             Some(text) => {
                 let scoped = request.model_scoped && request.reason != Reason::AuthDead;
                 match control.pool.mark_bad(&from, &text, scoped) {

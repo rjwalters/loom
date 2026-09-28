@@ -199,6 +199,7 @@ test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
 test-sync-labels-check.sh
 test-token-cache-affinity.sh
+test-claude-wrapper-proxy-rotation.sh
 test-sync-labels-repo-flag.sh
 test-urgent-flip-guard.sh
 test-verdict-staleness-guard.sh

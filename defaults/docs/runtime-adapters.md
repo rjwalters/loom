@@ -1792,8 +1792,10 @@ Three consequences of the proxied Claude path:
   `/.loom-egress-proxy/v1/rotate` path under the launch's placeholder. The host
   bad-marks the launch's own account in the host pool, selects another and
   swaps it in behind the same placeholder. The body cannot name an account,
-  credential or upstream. A marking reason needs the proxy to have seen the
-  upstream refuse the current credential. Swaps per launch are capped
+  credential or upstream. A marking reason needs the proxy to have seen a
+  429 (exhaustion, TTL mark) or 401 (`auth-dead`) for the current credential;
+  the permanent `auth-dead` mark is written only if the host's own re-probe
+  also gets a 401. Swaps per launch are capped
   (`LOOM_EGRESS_PROXY_MAX_ROTATIONS`, default 8).
 - **No survival across a hard daemon stop.** The proxy's lifetime is the
   launch's. `restart --drain` is unaffected.

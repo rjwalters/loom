@@ -291,12 +291,22 @@ pub struct Record {
 /// Upstream refusals the proxy itself observed for a record's current
 /// credential. A rotation that bad-marks an account needs the matching kind
 /// (see [`super::rotation`]): the container's word alone is not enough.
+///
+/// Deliberately narrow, because the container chooses the method, path, body
+/// and non-credential headers of every request it sends through the proxy, so
+/// it can make the upstream refuse a HEALTHY credential on purpose (a bad path
+/// or body is a 400/404; a stripped header may be a 401/403). Only statuses
+/// that such a request cannot cheaply fake count, and even then evidence is a
+/// pre-gate, not proof: a permanent mark additionally needs the host's own
+/// re-probe (see [`super::rotation`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Evidence {
-    /// The upstream answered 401 or 403.
+    /// The upstream answered 401 (403 is not counted: it is a scope/permission
+    /// answer a request can provoke, not "this credential is dead").
     pub(super) auth_failure: bool,
-    /// The upstream answered any 4xx.
-    pub(super) refused: bool,
+    /// The upstream answered 429 (other 4xx are request-shape answers the
+    /// container controls, not exhaustion).
+    pub(super) rate_limited: bool,
 }
 
 impl std::fmt::Debug for Record {
@@ -606,15 +616,16 @@ impl Registry {
     }
 
     /// Record an upstream response status against the record that made the
-    /// request — only if its credential has not been swapped since.
+    /// request — only if its credential has not been swapped since. Only 401
+    /// and 429 are recorded (see [`Evidence`]).
     pub fn observe(&self, launch_id: &str, generation: u32, status: u16) {
-        if !(400..500).contains(&status) {
+        if !matches!(status, 401 | 429) {
             return;
         }
         for record in self.lock().values_mut() {
             if record.launch_id == launch_id && record.generation == generation {
-                record.evidence.refused = true;
-                record.evidence.auth_failure |= matches!(status, 401 | 403);
+                record.evidence.rate_limited |= status == 429;
+                record.evidence.auth_failure |= status == 401;
             }
         }
     }

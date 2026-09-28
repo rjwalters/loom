@@ -27,18 +27,37 @@ const NEW: &str = "sk-ant-oat01-NEW-credential-8818";
 // ------------------------------------------------------------------ fakes
 
 /// Counts every pool call, so "refused" can be asserted as "nothing marked,
-/// nothing selected".
-#[derive(Default)]
+/// nothing selected". The host re-probe answers `verdict` (default: the host
+/// confirms the credential dead) and records what it was asked to probe.
 struct FakePool {
     marks: Mutex<Vec<(String, String, bool)>>,
     selects: Mutex<u32>,
     next: Mutex<Option<(String, String)>>,
+    verdict: Mutex<AuthProbe>,
+    probes: Mutex<Vec<(String, String)>>,
+}
+
+impl Default for FakePool {
+    fn default() -> Self {
+        Self {
+            marks: Mutex::default(),
+            selects: Mutex::default(),
+            next: Mutex::default(),
+            verdict: Mutex::new(AuthProbe::Dead),
+            probes: Mutex::default(),
+        }
+    }
 }
 
 impl FakePool {
     fn offering(name: &str, credential: &str) -> Arc<Self> {
+        Self::probing(name, credential, AuthProbe::Dead)
+    }
+
+    fn probing(name: &str, credential: &str, verdict: AuthProbe) -> Arc<Self> {
         let pool = Self::default();
         *pool.next.lock().unwrap() = Some((name.into(), credential.into()));
+        *pool.verdict.lock().unwrap() = verdict;
         Arc::new(pool)
     }
 }
@@ -60,6 +79,14 @@ impl AccountPool for FakePool {
             .clone()
             .map(|(n, c)| Selected::new(n, c))
             .ok_or_else(|| "empty".to_string())
+    }
+
+    fn probe_auth(&self, account: &str, credential: &str) -> AuthProbe {
+        self.probes
+            .lock()
+            .unwrap()
+            .push((account.into(), credential.into()));
+        *self.verdict.lock().unwrap()
     }
 }
 
@@ -160,6 +187,14 @@ fn no_mark_without_upstream_evidence_and_auth_dead_needs_a_401() {
     for reason in [Reason::UsageLimit, Reason::SessionWindow, Reason::AuthDead] {
         assert_eq!(ask(&registry, &placeholder, reason), Err(ControlRefusal::NoUpstreamEvidence));
     }
+    // Request-shape answers the container can provoke on a healthy
+    // credential are evidence of nothing (#8818 review, blocker 2).
+    for status in [400, 403, 404, 405, 413, 422] {
+        registry.observe("launch-8818", 0, status);
+    }
+    for reason in [Reason::UsageLimit, Reason::SessionWindow, Reason::AuthDead] {
+        assert_eq!(ask(&registry, &placeholder, reason), Err(ControlRefusal::NoUpstreamEvidence));
+    }
     // A 429 is evidence of exhaustion, NOT of a dead credential.
     registry.observe("launch-8818", 0, 429);
     assert_eq!(
@@ -168,6 +203,7 @@ fn no_mark_without_upstream_evidence_and_auth_dead_needs_a_401() {
     );
     assert!(pool.marks.lock().unwrap().is_empty(), "a refused rotation must mark nothing");
     assert_eq!(*pool.selects.lock().unwrap(), 0, "a refused rotation must select nothing");
+    assert!(pool.probes.lock().unwrap().is_empty(), "no evidence, no host probe");
     assert_eq!(current_credential(&registry), OLD);
 
     registry.observe("launch-8818", 0, 401);
@@ -178,6 +214,87 @@ fn no_mark_without_upstream_evidence_and_auth_dead_needs_a_401() {
     assert_eq!(marks.len(), 1);
     assert_eq!(marks[0].0, "alpha", "only the launch's OWN current account is ever marked");
     assert!(marks[0].1.starts_with("auth-dead: "), "{}", marks[0].1);
+    // The host re-probed the launch's OWN current credential before marking.
+    assert_eq!(
+        pool.probes.lock().unwrap().clone(),
+        vec![("alpha".to_string(), OLD.to_string())]
+    );
+}
+
+/// #8818 review, blocker 2: the container shapes every request the proxy
+/// forwards, so it can make the upstream 401 a HEALTHY credential and then ask
+/// for `auth-dead`. The host's own probe disagrees, so nothing permanent is
+/// written — the launch just moves on, bounded by the cap.
+#[test]
+fn an_induced_401_cannot_permanently_mark_a_credential_the_host_probe_finds_alive() {
+    for verdict in [AuthProbe::Alive, AuthProbe::Inconclusive] {
+        let pool = FakePool::probing("beta", NEW, verdict);
+        let (registry, placeholder) = armed(pool.clone(), "https://api.anthropic.com", 8);
+        registry.observe("launch-8818", 0, 401);
+        let rotated = ask(&registry, &placeholder, Reason::AuthDead).unwrap();
+        assert!(!rotated.marked, "{verdict:?}: an unconfirmed auth death must not mark");
+        assert!(pool.marks.lock().unwrap().is_empty(), "{verdict:?}");
+        assert_eq!(pool.probes.lock().unwrap().len(), 1, "{verdict:?}");
+        assert_eq!(current_credential(&registry), NEW, "{verdict:?}: the launch still moves on");
+    }
+}
+
+#[test]
+fn exhaustion_and_concurrent_session_rotations_never_probe() {
+    let pool = FakePool::offering("beta", NEW);
+    let (registry, placeholder) = armed(pool.clone(), "https://api.anthropic.com", 8);
+    registry.observe("launch-8818", 0, 429);
+    assert!(
+        ask(&registry, &placeholder, Reason::UsageLimit)
+            .unwrap()
+            .marked
+    );
+    ask(&registry, &placeholder, Reason::ConcurrentSession).unwrap();
+    assert!(pool.probes.lock().unwrap().is_empty());
+}
+
+/// The production classifier over `tokens check`'s real probe: only the
+/// probe's own 401 is `Dead`.
+#[test]
+fn the_host_probe_verdict_is_dead_only_on_the_probes_own_401() {
+    use crate::tokens_pool::check::{
+        probe_account, ProbeError, ProbeResponse, ProbeTransport, DEFAULT_PROBE_MODEL,
+    };
+    struct Answer(Result<u16, ()>);
+    impl ProbeTransport for Answer {
+        fn post(
+            &self,
+            _: &str,
+            _: &[(String, String)],
+            _: &str,
+            _: f64,
+        ) -> Result<ProbeResponse, ProbeError> {
+            self.0
+                .map(|status| ProbeResponse {
+                    status,
+                    headers: Vec::new(),
+                })
+                .map_err(|()| ProbeError::Timeout)
+        }
+    }
+    let verdict = |answer: Result<u16, ()>, token: &str| {
+        AuthProbe::from_result(&probe_account(
+            "alpha",
+            token,
+            DEFAULT_PROBE_MODEL,
+            "hi",
+            1.0,
+            &Answer(answer),
+        ))
+    };
+    assert_eq!(verdict(Ok(401), OLD), AuthProbe::Dead);
+    assert_eq!(verdict(Ok(200), OLD), AuthProbe::Alive);
+    assert_eq!(verdict(Ok(429), OLD), AuthProbe::Alive);
+    for answer in [Ok(400), Ok(403), Ok(404), Ok(500), Ok(529), Err(())] {
+        assert_eq!(verdict(answer, OLD), AuthProbe::Inconclusive, "{answer:?}");
+    }
+    // An empty token reports `blocked` without a 401: not evidence.
+    assert_eq!(verdict(Ok(401), ""), AuthProbe::Inconclusive);
 }
 
 #[test]
@@ -225,7 +342,7 @@ fn concurrent_session_swaps_without_marking_or_evidence() {
 fn model_scope_is_honored_for_exhaustion_and_ignored_for_auth_death() {
     let pool = FakePool::offering("beta", NEW);
     let (registry, placeholder) = armed(pool.clone(), "https://api.anthropic.com", 8);
-    registry.observe("launch-8818", 0, 401);
+    registry.observe("launch-8818", 0, 429);
     let scoped = RotateRequest {
         reason: Reason::UsageLimit,
         model_scoped: true,
@@ -498,6 +615,32 @@ async fn rotation_response_bodies_markers_and_renderings_never_carry_a_credentia
         assert!(!surface.contains(OLD), "old credential leaked: {surface}");
         assert!(!surface.contains(NEW), "new credential leaked: {surface}");
     }
+}
+
+/// #8818 review, blocker 2, end to end: the container drives the upstream to
+/// refuse a healthy credential with requests it shapes itself, then asks for
+/// every marking rotation. Nothing is marked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn container_induced_refusals_never_mark_a_healthy_account() {
+    let pool = FakePool::probing("beta", NEW, AuthProbe::Alive);
+    let (upstream, _) = status_upstream(vec![400, 404, 403, 401]).await;
+    let (registry, placeholder) = armed(pool.clone(), &upstream, 8);
+    let addr = serve(&registry).await;
+    let ph = placeholder.as_str();
+    for _ in 0..4 {
+        raw_request(addr, &get(ph, addr)).await;
+    }
+    for reason in ["usage-limit", "session-window"] {
+        let body = format!(r#"{{"reason":"{reason}"}}"#);
+        let response = raw_request(addr, &control(ph, addr, "POST", ROTATE_PATH, &body)).await;
+        assert!(response.starts_with("HTTP/1.1 409"), "{reason}: {response}");
+    }
+    let response =
+        raw_request(addr, &control(ph, addr, "POST", ROTATE_PATH, r#"{"reason":"auth-dead"}"#))
+            .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains(r#""marked":false"#), "{response}");
+    assert!(pool.marks.lock().unwrap().is_empty(), "a healthy account must never be marked");
 }
 
 #[tokio::test]
