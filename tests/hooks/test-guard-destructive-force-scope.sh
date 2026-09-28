@@ -614,6 +614,82 @@ assert_allow "force-op:detached (#7530 regression guard): origin/main safe-list 
 assert_allow_env "force-op:detached (#7530 regression guard): origin/<configured default branch> safe-list entry from #5772 is unchanged" \
     "LOOM_DEFAULT_BRANCH=develop" "git -C $FORCE_DETACHED_WT reset --hard origin/develop" "$FORCE_DETACHED_WT_REPO"
 
+# ---- #9312: NAME=$(cd <literal-path> && pwd) / NAME=$(realpath <literal-path>) ----
+# ---- SELF-CONTAINED cwd capture, at the -C/cd cwd-capture points.              ----
+#
+# Guard-decision telemetry (#3898) showed force-op:detached firing at ASK 31
+# times for a capture shape none of #6152/#6724/#7532 above cover: a SINGLE
+# assignment whose OWN command substitution both `cd`s and captures `pwd` in
+# one shot, e.g.:
+#   WORKTREE_ABS="$(cd .loom/worktrees/issue-N && pwd)"
+#   git -C "$WORKTREE_ABS" reset --hard origin/feature/issue-N
+# This is a genuinely distinct shape from #6724's cd_proven/$(pwd) carve-out
+# (which requires a SEPARATE, EARLIER same-command `cd` segment) -- here the
+# `cd` and `pwd` are both INSIDE the assignment's own substitution, so #6724's
+# scan never even fires. Reuses FORCE_DETACHED_WT / FORCE_DETACHED_WT_REPO
+# (still detached HEAD, `.loom-managed` sentinel present, own branch
+# `feature/issue-2`) from the block above; hook cwd is the REPO ROOT so the
+# literal `.loom/worktrees/issue-2` argument exercises the same RELATIVE-path
+# join against curcwd the issue's own reproduction uses.
+assert_allow "force-op:detached + \$(cd <path> && pwd) capture (#9312): the issue's exact reproduction -- WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd)\" then git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2 allows" \
+    "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd)\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(cd <path> && pwd) capture (#9312): backtick-substitution spelling WORKTREE_ABS=\`cd <path> && pwd\` also resolves and allows" \
+    "WORKTREE_ABS=\"\`cd .loom/worktrees/issue-2 && pwd\`\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(cd <path> && pwd) capture (#9312): unquoted WORKTREE_ABS=\$(cd <path> && pwd) also resolves and allows" \
+    "WORKTREE_ABS=\$(cd .loom/worktrees/issue-2 && pwd)
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(cd <path> && pwd) capture (#9312): braced \${WORKTREE_ABS} form in -C also resolves and allows" \
+    "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd)\"
+git -C \"\${WORKTREE_ABS}\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(cd <path> && pwd) capture (#9312): cd \"\$WORKTREE_ABS\" && git reset --hard origin/feature/issue-2 allows (cd-prefix form, hook cwd=main root)" \
+    "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd)\"
+cd \"\$WORKTREE_ABS\" && git reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+
+# realpath variant, named explicitly in the issue body -- mirrors the cd&&pwd
+# coverage above.
+assert_allow "force-op:detached + \$(realpath <path>) capture (#9312): WORKTREE_ABS=\"\$(realpath .loom/worktrees/issue-2)\" then git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2 allows" \
+    "WORKTREE_ABS=\"\$(realpath .loom/worktrees/issue-2)\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(realpath <path>) capture (#9312): backtick-substitution spelling WORKTREE_ABS=\`realpath <path>\` also resolves and allows" \
+    "WORKTREE_ABS=\"\`realpath .loom/worktrees/issue-2\`\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(realpath <path>) capture (#9312): unquoted WORKTREE_ABS=\$(realpath <path>) also resolves and allows" \
+    "WORKTREE_ABS=\$(realpath .loom/worktrees/issue-2)
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+
+# Control: resolved cwd is correct, but the reset TARGET names a DIFFERENT
+# issue's branch -- must still ask, mirrors the #7530 own-branch-only control
+# re-run through this new capture shape (proves the fix does not loosen the
+# safe-shape predicate itself, only the upstream cwd resolution feeding it).
+assert_ask "force-op:detached + \$(cd <path> && pwd) capture (#9312): resolved cwd but reset target names ANOTHER issue's branch still asks" \
+    "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd)\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-9999" "$FORCE_DETACHED_WT_REPO"
+
+# Control: a genuinely unresolvable $VAR -- the substitution is neither
+# `cd ... && pwd` nor `realpath ...` -- must NOT be guessed, stays fail-closed,
+# still asks (mirrors the #6724/#7532 "non-pwd/non-cat substitution" controls).
+assert_ask "force-op:detached + \$(cd <path> && pwd) capture (#9312): a non-cd/realpath command substitution stays unresolved, still asks" \
+    "WORKTREE_ABS=\"\$(some_dynamic_command)\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+
+# Control: the <literal-path> argument itself is NOT a true literal (it
+# embeds a further $OTHER expansion) -- fails the literal-only contract, falls
+# through unresolved, still asks (fail closed, never guessed).
+assert_ask "force-op:detached + \$(cd <path> && pwd) capture (#9312): a nested \$VAR inside the cd path is not a true literal, stays unresolved, still asks" \
+    "WORKTREE_ABS=\"\$(cd \$OTHERVARFORLOOMTEST9312/issue-2 && pwd)\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+
+# Control: the push sibling from the issue body is unaffected by this fix's
+# own-branch-RESET scope -- git -C "$VAR" push --force-with-lease still
+# resolves through the existing, unrelated force-push code path (the
+# own-branch reset-recovery exemption is reset-only), so this refinement is
+# not mistakenly read as also softening force-push handling.
+assert_ask "force-op:detached + \$(cd <path> && pwd) capture (#9312): push sibling -- git -C \"\$WORKTREE_ABS\" push --force-with-lease still asks (exemption is reset-only)" \
+    "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd)\"
+git -C \"\$WORKTREE_ABS\" push --force-with-lease" "$FORCE_DETACHED_WT_REPO"
+
 rm -rf "$FORCE_DETACHED_WT_REPO"
 
 # ---- #6077: guard-decision telemetry audit — reproduce the EXACT real-world ----
