@@ -466,6 +466,8 @@ pub fn scan_transcripts_with_targets(
         };
         read_any = true;
         let mut session = targets::Session::default();
+        // Deduped on `message.id` per transcript (#8186, #9303).
+        let mut fold = crate::script_helpers::transcript_usage::UsageFold::default();
         for raw in text.lines() {
             let raw = raw.trim();
             if raw.is_empty() {
@@ -475,22 +477,11 @@ pub fn scan_transcripts_with_targets(
                 continue;
             };
             tally_record_actions(&obj, &mut actions, &mut session, &mut targets);
-            let Some(rec) = crate::script_helpers::transcript_usage::usage_from_record(&obj) else {
-                continue;
-            };
-            let key = (rec.model.clone(), rec.speed.clone(), rec.service_tier.clone());
-            let entry = totals.entry(key).or_insert_with(|| ModelUsageTotals {
-                model: rec.model,
-                speed: rec.speed,
-                service_tier: rec.service_tier,
-                ..ModelUsageTotals::default()
-            });
-            entry.input += rec.input;
-            entry.cache_read += rec.cache_read;
-            entry.cache_write_5m += rec.cache_write_5m;
-            entry.cache_write_1h += rec.cache_write_1h;
-            entry.output += rec.output;
+            if let Some(rec) = crate::script_helpers::transcript_usage::usage_from_record(&obj) {
+                fold.add(rec);
+            }
         }
+        crate::script_helpers::transcript_usage::merge_rows(&mut totals, fold.rows());
     }
 
     // `None` — never a zeroed scan — when no transcript was readable at all.

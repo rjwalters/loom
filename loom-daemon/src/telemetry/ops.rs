@@ -52,6 +52,19 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.tokens.cache_read",
     "loom.tokens.cache_write",
     "loom.tokens.total",
+    // Per-model, per-attempt usage + USD (Issues #9204, #9303): one
+    // `loom.runtime.usage` span per model, scoped `execution` | `attempt`.
+    "loom.tokens.cache_write_5m",
+    "loom.tokens.cache_write_1h",
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.cache_read_input_tokens",
+    "gen_ai.usage.cache_creation_input_tokens",
+    "loom.cost.usd_estimate",
+    "gen_ai.cost.usd_estimate",
+    "loom.pricing.verified_on",
+    "loom.pricing.source",
+    "loom.usage.scope",
     // `loom.pool.hold` (#8931): one pool dispatch hold, armed to cleared.
     "loom.pool.hold.pool",
     "loom.pool.hold.post_mortem",

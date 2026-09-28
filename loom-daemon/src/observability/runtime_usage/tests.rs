@@ -12,6 +12,7 @@ use crate::activity::transcript_ingest::{ingest, IngestOptions};
 use crate::activity::ActivityDb;
 use crate::observability::queue::DurableQueue;
 use crate::observability::session_summary::SessionSummarySink;
+use crate::telemetry::trace::{SpanStatus, TraceContext};
 use crate::telemetry::TelemetryRecord;
 
 fn row(input: i64, output: i64, read: i64, w5: i64, w1: i64) -> ModelUsageTotals {
@@ -46,7 +47,21 @@ fn usage_sums_every_model_row_with_both_cache_write_buckets() {
 fn the_usage_span_carries_only_allowlisted_counters_and_zero_stays_zero() {
     let parent = TraceContext::root(true);
     let at = Utc::now();
-    let span = usage_span(&parent, at, at, TokenUsage::default(), Some("claude"));
+    let mut zero = row(0, 0, 0, 0, 0);
+    zero.model = "claude-sonnet-5".into();
+    let mut common = TraceAttributes::new();
+    common.insert("loom.runtime".into(), "claude".into());
+    let spans = spans::model_usage_spans(
+        &parent,
+        (at, at),
+        &[zero],
+        spans::UsageScope::Execution,
+        &common,
+        &cost::Pricing::with(None),
+    );
+    let [span] = spans.as_slice() else {
+        panic!("one model, one span: {spans:?}");
+    };
     assert_eq!(span.name.as_str(), "loom.runtime.usage");
     assert_eq!(span.context.trace_id, parent.trace_id);
     assert_eq!(span.parent_span_id.as_ref(), Some(&parent.span_id));
@@ -56,13 +71,22 @@ fn the_usage_span_carries_only_allowlisted_counters_and_zero_stays_zero() {
         "loom.tokens.cache_read",
         "loom.tokens.cache_write",
         "loom.tokens.total",
+        "loom.tokens.cache_write_5m",
+        "loom.tokens.cache_write_1h",
+        "gen_ai.usage.input_tokens",
+        "gen_ai.usage.output_tokens",
+        "gen_ai.usage.cache_read_input_tokens",
+        "gen_ai.usage.cache_creation_input_tokens",
     ] {
         assert_eq!(span.attributes[key], "0", "a measured zero is exported: {key}");
         assert!(crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key));
     }
-    // Five counters, the runtime, and the three provenance keys.
-    assert_eq!(span.attributes.len(), 9, "{:?}", span.attributes);
-    assert_eq!(span.clone().bounded(), span, "survives export policy unchanged");
+    assert_eq!(span.attributes["loom.cost.usd_estimate"], "0.000000");
+    assert_eq!(span.attributes["loom.usage.scope"], "execution");
+    assert_eq!(span.attributes["loom.model"], "claude-sonnet-5");
+    // 11 counters, 4 cost keys, runtime, model, scope, and 3 provenance keys.
+    assert_eq!(span.attributes.len(), 21, "{:?}", span.attributes);
+    assert_eq!(span.clone().bounded(), *span, "survives export policy unchanged");
 }
 
 /// A traced execution with one completed `loom.runtime.run` span.
@@ -99,7 +123,11 @@ fn unknown_usage_journals_no_span() {
     let window = (Utc::now(), Utc::now());
     assert!(journal_usage(tmp.path(), "sweep-1", window, None, None)
         .unwrap()
-        .is_none());
+        .is_empty());
+    let empty: &[ModelUsageTotals] = &[];
+    assert!(journal_usage(tmp.path(), "sweep-1", window, Some(empty), None)
+        .unwrap()
+        .is_empty());
     let store = TraceStore::new(tmp.path());
     let spans = Journal::for_context(&store.path(tmp.path(), "sweep-1"))
         .completed()
@@ -111,10 +139,10 @@ fn unknown_usage_journals_no_span() {
 fn an_untraced_execution_journals_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let window = (Utc::now(), Utc::now());
-    let usage = Some(TokenUsage::default());
-    assert!(journal_usage(tmp.path(), "never-traced", window, usage, None)
+    let rows = [row(1, 1, 1, 1, 1)];
+    assert!(journal_usage(tmp.path(), "never-traced", window, Some(&rows), None)
         .unwrap()
-        .is_none());
+        .is_empty());
     assert!(!tmp.path().join(".loom/logs/trace-context").exists());
 }
 
@@ -123,19 +151,18 @@ fn the_usage_span_is_a_child_of_the_runtime_run_span_over_its_interval() {
     let tmp = tempfile::tempdir().unwrap();
     let (root_context, run) = traced_execution(tmp.path(), "sweep-2");
     let window = (Utc::now() - Duration::hours(1), Utc::now());
-    let usage = TokenUsage {
-        input: 3,
-        output: 4,
-        cache_read: 5,
-        cache_write: 6,
+    let rows = [row(3, 4, 5, 6, 0)];
+    let spans =
+        journal_usage(tmp.path(), "sweep-2", window, Some(&rows), Some("opencode")).unwrap();
+    let [span] = spans.as_slice() else {
+        panic!("one model, one span: {spans:?}");
     };
-    let span = journal_usage(tmp.path(), "sweep-2", window, Some(usage), Some("opencode"))
-        .unwrap()
-        .unwrap();
     assert_eq!(span.context.trace_id, root_context.trace_id);
     assert_eq!(span.parent_span_id.as_ref(), Some(&run.context.span_id));
     assert_eq!((span.started_at, span.ended_at), (run.started_at, run.ended_at));
     assert_eq!(span.attributes["loom.tokens.total"], "18");
+    assert_eq!(span.attributes["loom.sweep_id"], "sweep-2");
+    assert_eq!(span.attributes["loom.usage.scope"], "execution");
     assert_eq!(span.attributes["loom.runtime"], "opencode");
 
     // It drains to the export queue like every other journalled span.
@@ -380,15 +407,15 @@ fn a_traced_sweeps_session_summary_and_usage_span_share_one_trace_id() {
     assert!(!wire.contains("PRIVATE"), "no transcript body is exported");
 
     // The terminal transition journals the usage span into the same trace.
-    let span = journal_usage(
+    let spans = journal_usage(
         &workspace,
         "sweep-issue-8908",
         (dispatched, Utc::now()),
-        Some(TokenUsage::from_models(&[row(11, 22, 33, 44, 0)])),
+        Some(&[row(11, 22, 33, 44, 0)]),
         None,
     )
-    .unwrap()
     .unwrap();
+    let span = &spans[0];
     assert_eq!(span.context.trace_id, log_trace.trace_id);
     assert_eq!(span.attributes["loom.tokens.total"], "110");
 }
