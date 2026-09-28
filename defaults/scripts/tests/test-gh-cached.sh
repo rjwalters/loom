@@ -294,8 +294,8 @@ printf '%s\n' "$*" >> "$FAKE_DAEMON_LOG"
 if [[ "$1" == "forge" && "$3" == "view" ]]; then
     # #9254 view path: --invalidate succeeds silently; a --json shape without
     # `author` is served; everything else declines (exit 3), like the real one.
-    if printf '%s\n' "$@" | grep -q -- '--invalidate'; then exit 0; fi
-    if printf '%s\n' "$@" | grep -q -- '--json' && ! printf '%s\n' "$@" | grep -q 'author'; then
+    if [[ "$*" == *--invalidate* ]]; then exit 0; fi
+    if [[ "$*" == *--json* && "$*" != *author* ]]; then
         echo '{"labels":[{"name":"from-etag-view"}],"state":"OPEN"}'
         exit 0
     fi
