@@ -203,6 +203,13 @@ pub(crate) fn in_episode<'a>(
         .collect()
 }
 
+// Whole-dispatch regressions live in their own file: this module is the
+// only place left that can declare them without growing the over-threshold
+// `sweep_registry/mod.rs` (its line-count ratchet is frozen).
+#[cfg(test)]
+#[path = "lease_episode_dispatch_tests.rs"]
+mod lease_episode_dispatch_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

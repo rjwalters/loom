@@ -3,16 +3,17 @@
 //! past [`LEASE_ORDER_LOOKBACK_SECS`], and must still NOT yield to a merely
 //! old one.
 //!
-//! [`super::lease_episode`]'s own unit tests pin the membership predicate in
-//! isolation. These drive the whole `SweepRegistry::dispatch` path against
+//! [`super`]'s own unit tests pin the membership predicate in
+//! isolation. These drive the whole
+//! [`crate::sweep_registry::SweepRegistry::dispatch`] path against
 //! the shared fake-forge harness, so they also pin the properties the
 //! predicate alone cannot express: that the yield happens **before** any
 //! builder spawn or worktree access, that the winning claimant's
 //! `loom:building` label is left intact, and that this host's own local
 //! side effects (claim lock, peer-claim advertisement) are unwound.
 
-use super::test_support::*;
-use super::*;
+use crate::sweep_registry::test_support::*;
+use crate::sweep_registry::*;
 use chrono::Utc;
 use serial_test::serial;
 use std::path::Path;
@@ -21,7 +22,7 @@ use tempfile::tempdir;
 /// Seconds between the in-session lease's creation and the racing daemon
 /// dispatch, recovered from the loom#8787 forge evidence (21:37:54Z ->
 /// 21:42:16Z). 2.9× [`LEASE_ORDER_LOOKBACK_SECS`], so leg 1 of
-/// [`super::lease_episode::in_claim_episode`] cannot be what admits it.
+/// [`super::in_claim_episode`] cannot be what admits it.
 const INCIDENT_CREATED_SECS_AGO: i64 = 262;
 
 /// Seconds between the in-session lease's last successful renewal and the
@@ -258,7 +259,7 @@ fn set_preflip_labels(ws: &Path, labels: &[&str]) {
 /// Make the harness's fake `gh` fail every lease-comment READ-back, while
 /// leaving the comment WRITE arm working — the shape a rate limit, timeout
 /// or transient forge error takes for
-/// [`SweepRegistry::read_lease_comments`](super::SweepRegistry::read_lease_comments).
+/// [`SweepRegistry::read_lease_comments`](crate::sweep_registry::SweepRegistry::read_lease_comments).
 fn break_lease_comment_reads(ws: &Path, store: &Path) {
     let fake_gh = ws.join("fake-gh.sh");
     let script = std::fs::read_to_string(&fake_gh).unwrap();
