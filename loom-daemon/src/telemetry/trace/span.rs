@@ -26,6 +26,11 @@ pub enum SpanName {
     /// One job of a GitHub Actions run, parented to its [`Self::CiRun`] span.
     #[serde(rename = "loom.ci.job")]
     CiJob,
+    /// One step of a GitHub Actions job (Issue #9089), parented to its
+    /// [`Self::CiJob`] span. Derived from the `steps[]` array of the jobs
+    /// listing the poller already fetches — no extra API call.
+    #[serde(rename = "loom.ci.step")]
+    CiStep,
     /// One work-finder tick (Issue #8860) — its own root trace per tick.
     #[serde(rename = "loom.dispatch.tick")]
     DispatchTick,
@@ -60,6 +65,7 @@ impl SpanName {
             Self::Tool => "loom.tool",
             Self::CiRun => "loom.ci.run",
             Self::CiJob => "loom.ci.job",
+            Self::CiStep => "loom.ci.step",
             Self::DispatchTick => "loom.dispatch.tick",
             Self::RuntimeUsage => "loom.runtime.usage",
             Self::PoolHold => "loom.pool.hold",

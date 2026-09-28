@@ -3,6 +3,10 @@
 //! per-PR breakdown can separate "CI queued" from "CI running". Before this
 //! only the effective `started_at` reached telemetry and the queue wait was
 //! invisible.
+//!
+//! The per-**job** analogue (`started_at − created_at`) is #9089's extension;
+//! its dedicated tests, and shard-attribute parsing, live in
+//! [`super::shard_queue`].
 
 use super::*;
 use crate::ci_telemetry::records::RunJson;
@@ -50,8 +54,27 @@ fn every_fixture_run_carries_its_queue_time_on_record_and_run_span() {
                 );
                 run_spans += 1;
             }
+            TelemetryRecord::Span(s) if s.name == crate::telemetry::trace::SpanName::CiJob => {
+                // Job 10012 is the one fixture job GitHub reports a
+                // `created_at` for (#9089); every other job span still
+                // carries none.
+                let job_id = &s.attributes["loom.ci.job_id"];
+                if job_id == "10012" {
+                    assert_eq!(
+                        s.attributes.get("loom.ci.queued_ms").map(String::as_str),
+                        Some("5000")
+                    );
+                } else {
+                    assert!(
+                        !s.attributes.contains_key("loom.ci.queued_ms"),
+                        "job {job_id} spans carry none"
+                    );
+                }
+            }
+            // A `loom.ci.step` span (#9089) carries no queue segment of its
+            // own: a step never waits for a runner, its job did.
             TelemetryRecord::Span(s) => {
-                assert!(!s.attributes.contains_key("loom.ci.queued_ms"), "job spans carry none");
+                assert!(!s.attributes.contains_key("loom.ci.queued_ms"));
             }
             _ => {}
         }

@@ -125,7 +125,7 @@ fn the_created_filtering_fixture_omits_runs_below_the_floor() {
 fn a_late_rerun_of_a_run_older_than_the_watermark_is_exported_exactly_once() {
     let dir = TempDir::new().unwrap();
     run_cycle(&ctx(dir.path()), &CreatedFiltering::new()).unwrap();
-    assert_eq!(kind_counts(dir.path()), (6, 24, 30, 30));
+    assert_eq!(kind_counts(dir.path()), (6, 24, 30, FIXTURE_SPANS));
     let watermark = Ledger::open_read_only(state_dir(dir.path()).join("seen.jsonl"))
         .unwrap()
         .watermark(&format!("{ORG}/beta"));
@@ -192,11 +192,13 @@ fn a_late_rerun_of_a_run_older_than_the_watermark_is_exported_exactly_once() {
         api.fixture.requests()
     );
     assert_no_duplicates(dir.path());
-    assert_eq!(kind_counts(dir.path()), (7, 25, 32, 32));
+    // The clean-cycle spans plus the late re-attempt's own two: its run span
+    // and its one job span (that job reports no `steps[]`, so no step span).
+    assert_eq!(kind_counts(dir.path()), (7, 25, 32, FIXTURE_SPANS + 2));
     // Exactly once: a further cycle re-lists the same window and emits nothing.
     let repeat = run_cycle(&later, &api).unwrap();
     assert_eq!((repeat.summary.runs_emitted, repeat.summary.jobs_emitted), (0, 0));
-    assert_eq!(kind_counts(dir.path()), (7, 25, 32, 32));
+    assert_eq!(kind_counts(dir.path()), (7, 25, 32, FIXTURE_SPANS + 2));
     // The watermark never regressed to the re-listed run's `created_at`.
     assert_eq!(
         Ledger::open_read_only(state_dir(dir.path()).join("seen.jsonl"))
