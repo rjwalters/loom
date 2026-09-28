@@ -57,6 +57,17 @@
 //! with no CI configured for the changed paths), so the wait is bounded when —
 //! and only when — the base branch requires no status-check contexts.
 //!
+//! [`checks_failure`] is the OTHER classification inside the same wait loop
+//! (#8191 slice): once a poll finds a FAILING check, whether it is a required
+//! status-check context (refuse — that context can never turn green on this
+//! SHA), informational with nothing else pending (proceed to the synchronous
+//! merge, the #3486 UNSTABLE fallback), or informational with something else
+//! still pending (keep waiting, unchanged). The `comm -12` overlap test
+//! becomes a set intersection; both input lists (`failing`/`pending` from the
+//! check-runs rollup, `required` from `forge_get_required_status_check_contexts`,
+//! which — unlike [`stale_checks`]'s GitHub-only lookup — also covers Gitea)
+//! stay forge reads in the shell.
+//!
 //! [`loom_pr_guard`] is the pre-merge `loom:pr` review-signal guard (#7419)
 //! — the OTHER half of the verdict-label story [`labels`] tells: this one
 //! fires on `loom:pr`'s ABSENCE ("nobody reviewed this head") rather than a
@@ -182,6 +193,7 @@
 //! against two different variables, and owns the deferral comment's byte-frozen
 //! text.
 
+pub mod checks_failure;
 pub mod closed_building;
 pub mod dirty_guard;
 pub mod head_sync;

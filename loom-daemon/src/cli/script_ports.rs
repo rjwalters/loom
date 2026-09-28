@@ -467,6 +467,15 @@ pub(crate) enum MergePrCommand {
     /// exits 0 with one sentinel-led line — see `cli::merge_pr_zero_checks`.
     ZeroChecksSettle(super::merge_pr_zero_checks::ZeroChecksSettleArgs),
 
+    /// The OTHER classification in the same wait loop (#8191 slice): once a
+    /// poll finds a FAILING check, whether it is a required status-check
+    /// context (refuse), informational with nothing pending (proceed to the
+    /// synchronous merge), or informational with something else still
+    /// pending (keep waiting, unchanged). Exit 0 = `PROCEED`/`PENDING`, 1 =
+    /// `REQUIRED` (refuse), 2 = malformed stdin frame (also refuse) — see
+    /// `cli::merge_pr_checks_failure`.
+    ChecksFailure(super::merge_pr_checks_failure::ChecksFailureArgs),
+
     /// The pre-merge no-hand-bump guard (#7827) and its oracle choice
     /// (#8284): run the canonical version checker from the right ref against
     /// the merge base. Exit 0 = pass/skip/dry-run report, 1 = confirmed
@@ -573,6 +582,7 @@ impl MergePrCommand {
             MergePrCommand::ClosedBuilding(args) => args.run(),
             MergePrCommand::ReconcilePlan(args) => args.run(),
             MergePrCommand::ReconcileChild(args) => args.run(),
+            MergePrCommand::ChecksFailure(args) => args.run(),
         }
     }
 }
