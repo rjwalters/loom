@@ -237,5 +237,6 @@ pub fn tick_row(
         detail: None,
         state: disposition.state().to_string(),
         reason: disposition.reason().to_string(),
+        plan: crate::types::RowPlan::default(),
     }
 }
