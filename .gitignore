@@ -194,6 +194,22 @@ Thumbs.db
 # `.claude/commands/loom/` (out of scope here).
 .claude/skills
 
+# Co-install hygiene, sibling of `.claude/skills` above:
+# `/repo:handoff` (Repo Skills, a co-installed foreign tool) writes
+# `.claude/handoff.md` — one-shot session state carrying in-flight work,
+# settled decisions and empirically-found traps across a CLI restart. Its
+# contract is that the NEXT session reads it and then deletes it, so it is
+# never a commit; without this entry `git add -A` can stage a note that was
+# meant to live for one session, and `git status` stays dirty until it is
+# absorbed (which is what stalls an installed-surface resync gating on a
+# clean tree).
+# IMPORTANT: this ignore lives ONLY in loom's own committed .gitignore. It
+# must NOT be added to the daemon's `update_gitignore` list in
+# loom-daemon/src/init/post_init.rs — Repo Skills' own `/repo:handoff`
+# ensures the entry in each consumer repo it is installed into, and that is
+# the tool that owns the file.
+.claude/handoff.md
+
 # Dogfood scoped symlink (issue #8947, fourth member of the #3311 /
 # #3565+#3682 / #3578 family):
 # `.agents/skills/` is the cross-vendor skill-discovery surface (#8673 contract
