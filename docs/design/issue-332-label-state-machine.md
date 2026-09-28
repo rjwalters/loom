@@ -15,7 +15,7 @@ The current label workflow has several issues:
 2. ✅ **Clear single-purpose labels**: Each label has one meaning
 3. ✅ **Consistent naming**: All suggestion types follow same pattern
 4. ✅ **Support external contributors**: Clear path for non-Architect issues
-5. ✅ **Preserve Triage autonomy**: Triage can still set `loom:urgent`
+5. ✅ **Preserve Triage autonomy**: Triage can still set the urgent label (retired by #9244)
 
 ## New Label Set
 
@@ -29,7 +29,7 @@ The current label workflow has several issues:
 | `loom:issue` | 🔵 #3B82F6 | **Human** | **Approved for work** (replaces `loom:ready`) |
 | `loom:building` | 🟡 #F59E0B | Worker | Being implemented |
 | `loom:blocked` | 🔴 #EF4444 | Anyone | Implementation blocked |
-| `loom:urgent` | 🔴 #DC2626 | Triage/Human | High priority (max 3) |
+| urgent (retired, #9244) | 🔴 #DC2626 | Triage/Human | High priority (max 3) |
 
 ### PR Labels
 
@@ -79,8 +79,8 @@ The current label workflow has several issues:
                          ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ TRIAGE: (Optional) Prioritize                                │
-│   Action: Add loom:urgent if strategic/time-sensitive       │
-│   Note:   Max 3 issues can have loom:urgent                 │
+│   Action: Add urgent label if strategic/time-sensitive      │
+│   Note:   Max 3 issues can be urgent                        │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ↓
@@ -187,18 +187,18 @@ The current label workflow has several issues:
 
 **New Behavior:**
 - Searches for `loom:issue` issues
-- Prioritizes `loom:urgent` first
+- Prioritizes urgent issues first
 - Claims by removing `loom:issue`, adding `loom:building`
 
 ### Triage
 
 **Old Behavior:**
-- Manages `loom:urgent` on `loom:ready` issues
+- Manages the urgent label on `loom:ready` issues
 
 **New Behavior:**
-- Manages `loom:urgent` on `loom:issue` issues
+- Manages the urgent label on `loom:issue` issues
 - Still maintains max 3 urgent issues
-- Can add/remove `loom:urgent` autonomously
+- Can add/remove the urgent label autonomously
 
 ### Architect
 

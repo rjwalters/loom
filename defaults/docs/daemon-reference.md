@@ -4970,7 +4970,7 @@ backoff, the quarantine tally and the resume runway — so the next tick
 re-offers the issue immediately, and the cycle repeats with nothing counting
 it. Observed on `rjwalters/loom#7893`: **14 claims in just over four hours, 55
 `loom:issue`/`loom:building` label events, several claim/release pairs inside
-the same minute, zero PRs** — plus a `loom:urgent` label that made a stuck
+the same minute, zero PRs** — plus an urgent label (since retired, #9244) that made a stuck
 dispatcher look like a priority item.
 
 The discriminator is therefore not how the child died but **whether the

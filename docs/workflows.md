@@ -30,9 +30,9 @@ In Loom, development follows an ancient pattern of archetypal forces working in 
 - 🟡 **Amber** = Work in progress
   - Issues: `loom:building` (Worker implementing)
   - PRs: `loom:changes-requested` (review feedback needed), `loom:building` (Fixer claiming PR)
-- 🔴 **Red** = Blocked or urgent
+- 🔴 **Red** = Blocked or operator-starred
   - `loom:blocked` (Blocked, needs help)
-  - `loom:urgent` (High priority)
+  - `loom:operator-priority` (Operator's star: land ASAP)
 
 See [.github/labels.yml](../.github/labels.yml) for detailed label state machine documentation.
 
@@ -52,16 +52,18 @@ USER merges PR
 
 ## Priority System
 
-**Maximum Urgent: 3 Issues**
+**One priority signal: the operator's star (#9244)**
 
-The Triage agent maintains exactly 3 issues as `loom:urgent` (🔴 red). This prevents "everything is urgent" syndrome.
+`loom:operator-priority` is applied only by a human (directly or by starring the
+issue in loom-ui). Every stage takes starred work first; no agent ever applies
+or removes it.
 
 | Priority | Label | Worker Behavior |
 |----------|-------|-----------------|
-| 🔴 **Urgent** | `loom:urgent` | Workers check first |
+| 🔴 **Starred** | `loom:operator-priority` | Every stage takes it first |
 | 🟢 **Normal** | *(no priority label)* | FIFO (oldest first) |
 
-**Managed by**: Triage agent (autonomous, 15min interval)
+**Managed by**: the human operator only
 
 ### When to Mark Urgent
 
@@ -99,7 +101,7 @@ See full dependency workflow in [.github/labels.yml](../.github/labels.yml).
 | **Architect** | 15 min | Yes | N/A (scans codebase) | `loom:architect` (blue) |
 | **Hermit** | 15 min | Yes | N/A (scans code/issues) | `loom:hermit` (blue) |
 | **Curator** | 5 min | Yes | Approved issues (no suggestion labels) | `loom:curated` (green) |
-| **Triage** | 15 min | Yes | `loom:issue` | `loom:urgent` (red) |
+| **Triage** | 15 min | Yes | `loom:issue` | tier labels |
 | **Worker** | Manual | No | `loom:issue` | `loom:building`, `loom:review-requested` |
 | **Reviewer** | 5 min | Yes | `loom:review-requested` | `loom:changes-requested`, `loom:pr` |
 | **Fixer heals → claims with `loom:treating``, `loom:review-requested` |
@@ -114,7 +116,7 @@ See full dependency workflow in [.github/labels.yml](../.github/labels.yml).
 
 **Curator**: Enhances approved issues with implementation details, test plans, multiple options. Claims issues with `loom:building` before starting, removes it and adds `loom:curated` when complete. **Does not approve for work - human must add `loom:issue`.**
 
-**Triage**: Dynamically prioritizes `loom:issue` issues, maintains top 3 as `loom:urgent` based on strategic impact and time sensitivity.
+**Triage**: Keeps the backlog healthy: tier labels, orphan recovery, unblocking, epic tracking, WORK_PLAN. Never applies priority labels.
 
 **Worker**: Implements `loom:issue` issues. Claims with `loom:building`, creates PR with `loom:review-requested`. Manages worktrees.
 
@@ -233,7 +235,7 @@ gh pr list --label="loom:pr"
 | `loom:building` | 🟡 Amber | Worker | Worker actively implementing |
 | `loom:treating` | 🟡 Amber | Doctor | Doctor actively fixing bug or addressing feedback |
 | `loom:blocked` | 🔴 Red | Any agent | Implementation blocked, needs help |
-| `loom:urgent` | 🔴 Dark Red | Triage | High priority (max 3) |
+| `loom:operator-priority` | 🔴 Red | Human only | Operator's star: land ASAP (not a hold) |
 
 ### PR Labels
 
