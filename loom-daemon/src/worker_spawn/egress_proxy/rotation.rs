@@ -409,9 +409,14 @@ impl Registry {
     }
 
     /// Set the host-side account name on every record (one per launch).
+    /// A record already carrying `api_keys_pool` attribution (#8699) is left
+    /// alone: its per-launch `pool_account` / `bad_marked` state describes a
+    /// credential that must never be swapped behind it.
     pub fn set_account(&self, account: &str) {
         for record in self.lock().values_mut() {
-            record.account = Some(account.to_string());
+            if record.pool_account().is_none() {
+                record.account = Some(account.to_string());
+            }
         }
     }
 
@@ -441,6 +446,12 @@ impl Registry {
                 .ok_or(ControlRefusal::Auth(Refusal::UnknownPlaceholder))?;
             if !record.open {
                 return Err(ControlRefusal::Auth(Refusal::ClosedLaunch));
+            }
+            // Defense in depth for the invariant `set_account` keeps: a
+            // swap would leave #8699's per-launch mark state describing the
+            // wrong credential.
+            if record.pool_account().is_some() {
+                return Err(ControlRefusal::RotationUnavailable);
             }
             let from = record
                 .account

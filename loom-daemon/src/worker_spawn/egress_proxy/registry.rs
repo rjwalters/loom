@@ -251,8 +251,12 @@ pub struct Record {
     pub header: HeaderStyle,
     pub(super) credential: String,
     pub(super) open: bool,
-    /// Pool account name the credential belongs to (non-secret, host-side
-    /// only). `None` disables rotation for this record (#8818).
+    /// `tokens_pool` (Claude OAuth) account name the credential belongs to
+    /// (non-secret, host-side only). `None` disables rotation for this record
+    /// (#8818). Mutually exclusive with `pool_account` below (the
+    /// `api_keys_pool` attribution #8699 marks through): that state assumes
+    /// the credential never changes, so a record carrying it is never
+    /// rotated — see [`super::rotation`].
     pub(super) account: Option<String>,
     /// Bumped on every in-place credential swap, so an upstream status that
     /// answered a request made with the OLD credential is never counted as

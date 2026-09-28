@@ -409,6 +409,34 @@ fn rotation_is_refused_when_not_enabled_unknown_account_closed_or_foreign_placeh
     assert_eq!(*pool.selects.lock().unwrap(), 0);
 }
 
+/// #8699's `pool_account` / `bad_marked` assume a record's credential never
+/// changes, so a record carrying that attribution is never rotated.
+#[test]
+fn a_record_with_api_keys_pool_attribution_is_never_rotated() {
+    let pool = FakePool::offering("beta", NEW);
+    let registry = Registry::new();
+    let placeholder = Placeholder::generate();
+    registry.insert(
+        &placeholder,
+        record("https://api.anthropic.com").with_pool_account(
+            std::path::PathBuf::from("/nonexistent"),
+            "keyed",
+            None,
+        ),
+    );
+    registry.set_account("alpha");
+    registry.enable_rotation(pool.clone(), 8);
+    assert!(registry.lock().values().next().unwrap().account.is_none());
+    // Even if the account were somehow set, rotate refuses.
+    registry.lock().values_mut().next().unwrap().account = Some("alpha".into());
+    assert_eq!(
+        ask(&registry, &placeholder, Reason::ConcurrentSession),
+        Err(ControlRefusal::RotationUnavailable)
+    );
+    assert_eq!(*pool.selects.lock().unwrap(), 0);
+    assert_eq!(current_credential(&registry), OLD);
+}
+
 #[test]
 fn an_empty_pool_or_a_placeholder_shaped_entry_is_never_swapped_in() {
     let empty = Arc::new(FakePool::default());
