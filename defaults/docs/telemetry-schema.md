@@ -1114,8 +1114,10 @@ namespace that must be a short `[a-z0-9_-]` token (anything else is
 The work finder's ranked ready queue as of its last tick (Issue #8852, phase
 2). The rows are the same ones `loom-daemon queue` and `status --json`'s
 `last_work_finder_tick.queue` show. They are ordered by the daemon's own
-dispatch comparator: workspace priority, then `loom:urgent`, then oldest
-`createdAt`, then issue number. `tier:*` labels do not affect the order.
+dispatch comparator (#9244): starred (`loom:operator-priority`) first, starred
+issues by starred-at, then red-main fixes while their repo's `main` is verified
+red, then workspace priority, then oldest `createdAt`, then issue number.
+`loom:urgent` and `tier:*` labels do not affect the order.
 Envelopes carry `schema_version: 11`. **Native-HTTPS only**: the OTLP
 exporter never receives it (the mirror of `metric.points`).
 
@@ -1146,7 +1148,9 @@ Each row:
 | `visibility` | `public` / `private` | per row; missing or unknown decodes to `private` |
 | `issue` | integer | issue number |
 | `workspace_priority` | integer | lower dispatches first |
-| `urgent` | bool | carries `loom:urgent` |
+| `urgent` | bool | **deprecated (#9244): always `false`**. `loom:urgent` no longer orders dispatch; the field stays on the wire for one release, then goes |
+| `operator_priority` | bool | starred: carries `loom:operator-priority`, which sorts it ahead of all other work (#9244). Absent on older daemons, which decodes as `false` |
+| `operator_priority_at` | RFC 3339, optional | when it was starred (the `labeled` timeline event), when known. Omitted for an unstarred issue, or a starred one ordered by its `created_at` fallback |
 | `created_at` | RFC 3339, optional | issue creation time (the age ordering key) |
 | `tier` | string, optional | the `tier:*` label, informational only |
 | `disposition` | string | `dispatched`, `in_flight`, `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_out_of_slice`, `deferred_repo_cap`, `workspace_halted`, `workspace_commands_missing`, `host_constraint`, `host_class_refused`, `parked`, `hard_exclusion`, `recheck_interval`, `quarantined`, `dispatch_backoff`, `open_pr_backoff`, `noop_cooldown`, `declined`, `prless_retry`, `peer_claim`, `open_pr`, `dispatch_error`, `labelled_blocked` (unknown values are forward-compatible) |
@@ -1166,7 +1170,7 @@ exported. This is additive, so there is no `schema_version` bump.
 
 Redaction (phase 3, `dashboard/src/queueState.ts`): the Worker redacts per
 row on `visibility`. On `/public/*` a private row keeps only `rank`,
-`visibility`, `urgent`, `disposition`, `state` and `reason`; its `repo`,
+`visibility`, `urgent`, `operator_priority`, `disposition`, `state` and `reason`; its `repo`,
 `issue`, `created_at`, `tier` and `detail` are withheld, and a private
 `listing_failed` entry keeps only its `visibility`. `counts`, `seen` and
 `tick_at` are aggregate and survive. A Worker older than phase 3 applies the
@@ -1319,6 +1323,14 @@ describes the machine, not any repo, issue, branch, or operator. It is a mild
 fingerprinting signal for a named host — reviewed and deliberately allowed
 through, since free-GB is already public and this is only the denominator that
 turns it into a percentage.
+
+**`managed_repos[]` (Issue #4976).** The host's managed-repo roster: one
+`{slug, visibility, priority}` entry per provisioned workspace, whether or not
+it has a sweep in flight. `priority` (#9244, loom-ui#153) is the repo's
+cross-repo dispatch tier from the workspace registry (`Workspace.priority`,
+lower dispatches first); it is omitted for a root that is not a registered
+workspace and on older daemons, never defaulted. Additive, no `schema_version`
+bump.
 
 **Binary identity (`build_commit` / `built_at`, #4956).** `daemon_version` is
 `CARGO_PKG_VERSION`, so it only moves once per release: every build between two

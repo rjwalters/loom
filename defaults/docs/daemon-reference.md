@@ -1925,9 +1925,9 @@ ordering:
   `priorities: &[u32]` slice parallel to the workspaces. Instead of dispatching
   each repo's backlog in registration order, it gathers **every** eligible
   candidate across all workspaces into one queue, sorts it by `candidate_cmp` —
-  **(workspace priority asc, `loom:urgent` first, issue age asc/oldest-first,
-  issue number asc)** — and fills the single shared concurrency budget in that
-  global order. The cap/budget mechanics (#3811/#3930) are unchanged; this only
+  **(workspace priority asc, issue age asc/oldest-first, issue number asc)**,
+  behind the two #9244 lanes below — and fills the single shared concurrency
+  budget in that global order. The cap/budget mechanics (#3811/#3930) are unchanged; this only
   orders the queue. `createdAt` is added to the `gh issue list --json` fields for
   the age key.
 
@@ -1945,15 +1945,82 @@ fairness knobs (per-tier slot reservations) and cross-repo dependency awareness 
 explicit follow-ups, deferred until observed to matter.
 
 **`tier:*` labels do not affect dispatch order.** `tier:goal-advancing` and its
-siblings are triage metadata; no daemon code reads them. Only the four keys above
-order the queue.
+siblings are triage metadata; no daemon code reads them. Neither does
+`loom:urgent` any more (#9244): the label is tolerated on an issue, but it is not
+a key. Only the six keys below order the queue.
+
+### Dispatch order, the operator-priority star and the red-main-fix lane (#9244)
+
+`candidate_cmp` orders candidates by six keys, in this order:
+
+1. **Starred first.** An issue carrying `loom:operator-priority` (the operator's
+   "land this ASAP", applied directly or through the loom-ui star) sorts ahead of
+   every other candidate, fleet-wide, whatever its repo's tier.
+2. **Starred-at**, among starred issues: the issue starred first lands first. The
+   work finder reads the `labeled` event for `loom:operator-priority` from the
+   issue's REST timeline once per starred issue and caches it per (repo, issue); it
+   never reads a timeline for an unstarred issue, and removing the star drops the
+   cache entry. A missing starred-at falls back to `createdAt`.
+3. **Red-main fixes first**: an issue whose body carries
+   `<!-- loom:main-red-fix -->` at the start of a line, **only while its repo's
+   `main` is verified red** (`WorkspaceHealthStates::is_halted`). A marker on a
+   green repo is inert.
+4. Workspace priority ascending.
+5. `createdAt`, oldest first.
+6. Issue number ascending.
+
+The single-workspace tick sorts by keys 1-3 only, so its listing order is
+unchanged when nothing is starred or red.
+
+**Starred issues outside `loom:issue`.** Besides the `loom:issue` listing, each
+tick makes a second ETag-cached listing of open `loom:operator-priority` issues
+and merges it in, deduplicated by issue number. A starred issue labelled
+`loom:triage` or `loom:curated`, or carrying no workflow label at all, therefore
+becomes a candidate; the dispatched sweep starts from Curator. Starred rows
+already claimed (`loom:building`, `loom:curating`) are dropped. Skip and park labels
+still win: a starred issue carrying `loom:blocked`, `loom:operator-only`,
+`loom:operator-decision` or `loom:operator` is never dispatched
+(`loom:operator-decision` is a skip label in its own right since #9244). If the
+second listing fails, the tick carries on with the `loom:issue` rows.
+
+`loom:operator-priority` is **not** `loom:operator` and is not a hold. Code that
+treats a `loom:operator-` prefix match as a hold must exclude it by name (see
+`pr_latency::hold_labels`).
+
+**Overflow slot (one over-limit sweep per host).** A starred candidate that only
+the global `maxConcurrent` cap and/or the per-repo cap (`maxConcurrentPerRepo`)
+refused may still be dispatched, as this host's single overflow sweep, when:
+
+- no live sweep on this host is already marked `overflow` (and no earlier
+  candidate took the slot this tick), and
+- occupancy is at most `maxConcurrent`. The dynamic cap can drop below
+  occupancy mid-flight; a host already over its limit that way adds nothing.
+
+The saturation brake, the host-class gate, token-pool and pre-flight holds, skip
+and park labels, quarantine, backoff, peer claims and the per-tick ramp cap all
+still apply. Unstarred work, including red-main fixes, never uses the slot. The
+sweep record carries `overflow: true` (shown in `list_sweeps`,
+`get_sweep_status`, and as `[overflow]` in `loom-daemon status`); the tick counts
+it in `TickReport::dispatched_overflow`, and its ready-queue row reads
+`dispatched this tick (overflow)`.
+
+**Main-health halt admits only fixes.** A repo halted because its `main` is
+verified red still admits its `<!-- loom:main-red-fix -->` candidates, and only
+those; every other ready issue in it, starred or not, keeps `workspace_halted`.
+`report.halted` is unchanged. A hold that is not a verified-red `main` (a gate
+run in flight, a drain, the host-distress breaker, a pre-flight or token-pool
+hold) admits nothing, fixes included. With the main-health gate disabled for a
+repo (no enabled `buildGate`), there is no verified-red signal, so the latest
+`main` CI conclusion stands in for key 3: one cached `gh run list` per repo per
+tick, made only when the repo has a marker-bearing candidate.
 
 ### Ready queue view (`loom-daemon queue`, #8852)
 
 Each multi-workspace tick records one row per ready `loom:issue` it listed, ranked
 by `candidate_cmp`, with what the tick did with it:
 
-- **running**: `dispatched`, `in_flight`
+- **running**: `dispatched` (detail `overflow` for the host's over-limit
+  starred sweep, #9244), `in_flight`
 - **ready** (waiting on a limit): `deferred_capacity`, `deferred_ramp_cap`,
   `deferred_saturation`, `deferred_out_of_slice`, `deferred_repo_cap`
 - **blocked** (held by something specific to the issue or repo): `parked` (with
