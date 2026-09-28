@@ -1450,6 +1450,12 @@ pub struct DaemonStatusReport {
     /// [`Self::host_breaker`].
     #[serde(default)]
     pub rate_limit_breaker: Option<Box<RateLimitBreakerStatus>>,
+    /// Per-caller forge call accounting (Issue #9251): 200/304/limited/error
+    /// counts per caller and rate-limit pool, host-wide over the last hour
+    /// plus this daemon's since-start totals, and the latest free budget
+    /// reading. `#[serde(default)]` keeps pre-#9251 wire data compatible.
+    #[serde(default)]
+    pub forge_calls: Option<Box<ForgeCallsStatus>>,
     /// Live safehouse fleet-comms connection state (Issue #4345): distinguishes
     /// `not_configured` (no `safehouse` block / disabled) from `unreachable`
     /// (enabled, socket resolved, but the daemon's own connection attempt
@@ -2220,6 +2226,61 @@ pub struct RateLimitBreakerStatus {
     /// When the cached budget snapshot was probed.
     #[serde(default)]
     pub budget_probed_at: Option<DateTime<Utc>>,
+}
+
+/// Forge call accounting snapshot for `loom-daemon status` (Issue #9251).
+/// Rendered from [`crate::forge_call_stats::status_report`]; reading it costs
+/// no forge call (a local sink file read plus in-process counters).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeCallsStatus {
+    /// Width of [`Self::host_window`] in seconds (3600).
+    pub window_secs: u64,
+    /// Host-wide counts over the window, read from the per-host append-only
+    /// sink every loom process (daemon, `serve`, `status`, agent
+    /// `forge … --cached`) writes to. `None` when the sink is disabled or
+    /// unreadable.
+    #[serde(default)]
+    pub host_window: Option<Vec<ForgeCallCounts>>,
+    /// This daemon process's own counts since [`Self::since`].
+    #[serde(default)]
+    pub since_start: Vec<ForgeCallCounts>,
+    /// When this process's counters started.
+    #[serde(default)]
+    pub since: Option<DateTime<Utc>>,
+    /// Latest budget reading per pool: free `x-ratelimit-*` response headers,
+    /// or the rate-limit breaker's probe when that is newer.
+    #[serde(default)]
+    pub budget: Vec<ForgeBudgetReading>,
+}
+
+/// One caller × pool row of [`ForgeCallsStatus`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeCallCounts {
+    /// Call-site class, e.g. `work_finder`, `claim_reconciliation`.
+    pub caller: String,
+    /// Rate-limit pool spent: `core`, `graphql`, `search`, `other`.
+    pub pool: String,
+    /// `200`-class responses (a full, budget-costing answer).
+    pub ok: u64,
+    /// `304 Not Modified` (a free ETag hit).
+    pub not_modified: u64,
+    /// Rate-limited responses.
+    pub rate_limited: u64,
+    /// Any other failure.
+    pub error: u64,
+}
+
+/// A remaining-budget reading for one pool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeBudgetReading {
+    pub pool: String,
+    pub remaining: u64,
+    /// When the pool resets, when known.
+    #[serde(default)]
+    pub reset_at: Option<DateTime<Utc>>,
+    pub observed_at: DateTime<Utc>,
+    /// `headers` (free `x-ratelimit-*` on a REST response) or `breaker_probe`.
+    pub source: String,
 }
 
 /// Live idle-exit eligibility for `loom-daemon status` (Issue #5565).

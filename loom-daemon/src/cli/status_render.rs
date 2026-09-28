@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use std::path::Path;
 
 mod drain_render;
+mod forge_calls_render;
 mod forge_events_line;
 mod holds;
 mod model_class;
@@ -670,6 +671,8 @@ pub(crate) fn build_status_json_value(
             "graphql_remaining": r.graphql_remaining,
             "budget_probed_at": r.budget_probed_at,
         })),
+        // Per-caller forge call accounting (#9251); `null` from an older daemon.
+        "forge_calls": report.forge_calls,
         // Live safehouse fleet-comms connection state (#4345) — `null` only
         // from a pre-#4345 daemon binary that never computed one. `state` is
         // one of "not_configured" / "unreachable" / "connected" /
@@ -2434,6 +2437,11 @@ pub(crate) fn print_status_human(
         } else {
             println!("GitHub rate limit: OK (breaker closed)");
         }
+    }
+
+    // Per-caller forge call accounting (#9251), right under the breaker.
+    for line in forge_calls_render::render_forge_calls_lines(report, Utc::now()) {
+        println!("{line}");
     }
 
     // Host-level role runner header (#6470): a single line naming the
