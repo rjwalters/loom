@@ -38,7 +38,8 @@ fn only_a_strict_feature_issue_branch_is_a_stackable_parent() {
 
 /// `feature/harness-ops-<N>` (2AMLogic/harness-ops's Builder convention) is a
 /// stackable parent too (2AMLogic/2am#1298, #1396) — the same two-name
-/// allow-list the bash-side `_stacked_branch_issue_num` helper recognizes.
+/// allow-list [`super::STACKABLE_PARENT_PREFIXES`] shares with
+/// `reconcile::issue_from_branch`.
 #[test]
 fn a_harness_ops_branch_is_also_a_stackable_parent() {
     assert!(is_stackable_parent_branch("feature/harness-ops-350"));
