@@ -11,10 +11,14 @@
 //! - the fleet's GitHub App, which GitHub reports as `CONTRIBUTOR` or
 //!   `NONE`: the **configured** App slug ([`APP_SLUG_ENV`] >
 //!   `forge.githubApp.slug`, see [`configured_app_slug`]), and as a fallback
-//!   the default `loom-fleet-dispatch` name and its numbered pool members,
-//!   all compared with [`crate::dep_recheck::extract::normalise_login`] so
-//!   the `app/` and `[bot]` spellings match; or
-//! - this daemon's own forge identity, when the forge could name it.
+//!   the default `loom-fleet-dispatch` name and its numbered pool members.
+//!   The raw login must carry an App spelling ([`is_app_login`]: `…[bot]`
+//!   from REST, `app/…` from GraphQL), which only a GitHub App can have: a
+//!   plain user may register `loom-fleet-dispatch-evil` or the bare slug,
+//!   never `…[bot]`. Only then is the name compared, through
+//!   [`crate::dep_recheck::extract::normalise_login`]; or
+//! - this daemon's own forge identity, when the forge could name it (an App
+//!   identity, e.g. the `<slug>[bot]` fallback, again only as an App login).
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -64,7 +68,16 @@ pub fn register_fleet_app(slug: &str) {
     }
 }
 
-/// Whether the normalised `login` is the fleet App.
+/// Whether the raw `login` is spelled as a GitHub App (`…[bot]` or `app/…`),
+/// a spelling no user account can register.
+#[must_use]
+pub fn is_app_login(login: &str) -> bool {
+    let l = login.trim().to_ascii_lowercase();
+    l.ends_with("[bot]") || l.starts_with("app/")
+}
+
+/// Whether the normalised `login` names the fleet App. Callers must first
+/// check [`is_app_login`] on the raw login.
 fn is_fleet_app(norm: &str) -> bool {
     let env = std::env::var(APP_SLUG_ENV)
         .ok()
@@ -97,11 +110,13 @@ pub fn trusted_author(
     let Some(login) = login.filter(|l| !l.trim().is_empty()) else {
         return false;
     };
+    let app = is_app_login(login);
     let norm = normalise_login(login);
-    if is_fleet_app(&norm) {
+    if app && is_fleet_app(&norm) {
         return true;
     }
-    self_login.is_some_and(|me| normalise_login(me) == norm)
+    // Same account kind and name: a user `x` is never the App `x[bot]`.
+    self_login.is_some_and(|me| is_app_login(me) == app && normalise_login(me) == norm)
 }
 
 /// Whether `comment` is believed.
@@ -122,7 +137,7 @@ pub fn only_trusted(comments: &[ForgeComment], self_login: Option<&str>) -> Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::{register_fleet_app, trusted_author};
+    use super::{is_app_login, register_fleet_app, trusted_author};
 
     #[test]
     fn insiders_the_fleet_app_and_self_are_trusted_outsiders_are_not() {
@@ -143,5 +158,46 @@ mod tests {
         register_fleet_app("app/acme-dispatch-9f3");
         assert!(trusted_author(login, Some("NONE"), None));
         assert!(!trusted_author(Some("acme-dispatch"), Some("NONE"), None), "exact, not prefix");
+    }
+
+    #[test]
+    fn the_app_rule_needs_an_app_spelled_login() {
+        assert!(is_app_login("loom-fleet-dispatch-2[BOT]") && is_app_login("app/x"));
+        assert!(!is_app_login("loom-fleet-dispatch-1"));
+        // Plain users squatting the App's names (all unregistered on GitHub).
+        for login in [
+            "loom-fleet-dispatch-evil",
+            "loom-fleet-dispatch-1",
+            "loom-fleet-dispatch",
+        ] {
+            for association in ["NONE", "CONTRIBUTOR"] {
+                assert!(
+                    !trusted_author(Some(login), Some(association), None),
+                    "{login}/{association}"
+                );
+            }
+        }
+        assert!(trusted_author(Some("loom-fleet-dispatch-2[bot]"), Some("NONE"), None));
+        assert!(trusted_author(Some("app/loom-fleet-dispatch-2"), Some("NONE"), None));
+        // A configured slug: only the App spelling.
+        register_fleet_app("zeta-dispatch");
+        assert!(trusted_author(Some("zeta-dispatch[bot]"), Some("NONE"), None));
+        assert!(!trusted_author(Some("zeta-dispatch"), Some("NONE"), None));
+        // Insiders still pass through association, whatever the login.
+        for association in ["OWNER", "MEMBER", "COLLABORATOR"] {
+            assert!(trusted_author(Some("loom-fleet-dispatch-evil"), Some(association), None));
+        }
+    }
+
+    #[test]
+    fn the_self_login_matches_only_the_same_account_kind() {
+        // The `<slug>[bot]` fallback identity: the user `<slug>` is not it.
+        let me = Some("omega-dispatch[bot]");
+        assert!(trusted_author(Some("omega-dispatch[bot]"), Some("NONE"), me));
+        assert!(trusted_author(Some("app/omega-dispatch"), Some("NONE"), me));
+        assert!(!trusted_author(Some("omega-dispatch"), Some("NONE"), me));
+        // A user-token identity: the App of the same name is not it either.
+        assert!(trusted_author(Some("Robb-Bot"), Some("NONE"), Some("robb-bot")));
+        assert!(!trusted_author(Some("robb-bot[bot]"), Some("NONE"), Some("robb-bot")));
     }
 }

@@ -149,7 +149,7 @@ label, then posts one audit comment carrying
 `<!-- loom:operator-priority-intent=<id> action=<a> requested_at=<ts> -->`,
 unless a trusted comment with that intent id already exists, so resending an
 intent, or several hosts managing the repo, is harmless. Trusted means an
-`OWNER` / `MEMBER` / `COLLABORATOR`, the fleet App (the configured slug, else `loom-fleet-dispatch*`), or
+`OWNER` / `MEMBER` / `COLLABORATOR`, the fleet App (the configured slug, else `loom-fleet-dispatch*`, as a `…[bot]` login only), or
 the daemon's own login: a marker an outside commenter posts neither suppresses
 the audit comment nor sets the starred-at. `requested_by` is shown inside a
 code span, so an email address stays whole and an `@name` pings no one. `requested_at` becomes the

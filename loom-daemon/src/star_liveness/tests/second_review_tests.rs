@@ -1,6 +1,6 @@
 //! The second #9320 review: the incident search reads only the specific
 //! forge phrases, word-bounded, from trusted authors; and the no-progress
-//! key ignores host-local stage.
+//! key ignores host-local stage. The third: the newest matching issue wins.
 
 use super::fake::{issue, issue_with_body, pr, repo_input, t, tick_row, Host, World, STAR};
 use crate::forge_listing::RestIssue;
@@ -127,4 +127,41 @@ fn two_hosts_with_different_capacity_post_one_no_progress_comment() {
     assert_eq!(ka.kind, AskKind::NoProgress);
     assert_eq!(ka.key, kb.key, "the key carries no host-local stage");
     assert_eq!(world.posted(slug).len(), 1, "one comment for one idle star");
+}
+
+/// Third #9320 review: of several trusted open issues quoting the phrase,
+/// the **newest** is the incident (an older one is likely unrelated, e.g. an
+/// install-verification issue that once quoted the same refusal).
+#[test]
+fn the_newest_trusted_matching_issue_is_the_incident() {
+    let slug = "i/newest";
+    let error = "Merge commits are not allowed on this repository. (HTTP 405)";
+    let quote = "Merges fail: merge commits are not allowed on this repository.";
+    let dated = |number: u32, created: &str| RestIssue {
+        author: Some("turian".into()),
+        created_at: Some(created.into()),
+        ..issue_with_body(number, &["loom:triage"], quote)
+    };
+    // #30 (older) and #40 (newer): the higher-numbered, newer one inherits.
+    let world = refused(slug, error, quote, "turian", "MEMBER");
+    world.add(slug, dated(30, "2026-09-02T00:00:00Z"));
+    world.add(slug, dated(40, "2026-09-27T00:00:00Z"));
+    world
+        .repo(slug)
+        .associations
+        .insert(40, "COLLABORATOR".into());
+    let r = Host::new("host-a").pass(&world, &[repo_input(slug)], Vec::new(), t(10, 0));
+    assert_eq!(inherited(&r), vec![40]);
+
+    // `created_at` decides before the number does.
+    let slug = "i/newest-by-date";
+    let world = refused(slug, error, quote, "turian", "MEMBER");
+    world.add(slug, dated(30, "2026-09-26T00:00:00Z"));
+    world.add(slug, dated(40, "2026-09-03T00:00:00Z"));
+    world
+        .repo(slug)
+        .associations
+        .insert(40, "COLLABORATOR".into());
+    let r = Host::new("host-a").pass(&world, &[repo_input(slug)], Vec::new(), t(10, 0));
+    assert_eq!(inherited(&r), vec![30]);
 }

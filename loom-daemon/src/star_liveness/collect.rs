@@ -190,8 +190,8 @@ impl<'a> Evaluator<'a> {
     }
 
     /// The open incident issue tied to `d` (see [`refusal`]): one the
-    /// refusal comment names, else a trusted-authored one quoting its
-    /// specific forge phrase. A generic refusal never searches.
+    /// refusal comment names, else the newest trusted-authored one quoting
+    /// its specific forge phrase. A generic refusal never searches.
     fn incident(&mut self, d: &Detected, pr: u32, issue: u32) -> Option<u32> {
         if let Some(n) = d.named.clone().into_iter().find(|n| self.open_issue(*n)) {
             return Some(n);
@@ -229,7 +229,7 @@ impl<'a> Evaluator<'a> {
                 let body = i.body.as_deref().unwrap_or_default();
                 refusal::quotes_phrase(&format!("{title}\n{body}"), phrase)
             })
-            .min_by_key(|i| i.number)?;
+            .max_by_key(|i| (i.created_at.clone(), i.number))?;
         let n = hit.number;
         self.issues.insert(n, Some(hit));
         self.refusals.incidents.insert(key, n);

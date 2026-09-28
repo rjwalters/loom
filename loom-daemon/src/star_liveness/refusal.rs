@@ -20,8 +20,9 @@
 //!
 //! 1. an issue named **in the refusal comment** ([`Detected::named`]), if it
 //!    is an open issue (not a PR, not closed); else
-//! 2. an **open** issue, filed by a **trusted** author ([`super::trust`]),
-//!    whose title or body quotes the forge's own refusal phrase
+//! 2. the **newest** (by `created_at`, then number) **open** issue, filed
+//!    by a **trusted** author ([`super::trust`]), whose title or body quotes
+//!    the forge's own refusal phrase
 //!    ([`Detected::signature`]), the way #9268 quotes the 405 it was filed
 //!    for. Only the three specific phrases in [`SIGNATURES`] are searched,
 //!    and a hit must carry the phrase word-bounded ([`quotes_phrase`]). A

@@ -2068,8 +2068,9 @@ An escalation is one comment on the issue, carrying
 forge call, and every host reads the issue's comments for the marker before
 posting. Only a marker from an `OWNER` / `MEMBER` / `COLLABORATOR`, the fleet
 App (`LOOM_GITHUB_APP_SLUG` > `forge.githubApp.slug`, else
-`loom-fleet-dispatch*`) or the daemon itself counts; an outside commenter cannot pre-post one to
-suppress an ask. The `pools-exhausted` key is the issue's forge state, not the
+`loom-fleet-dispatch*`; only as an App login, `…[bot]` or `app/…`, which no
+user can register) or the daemon itself counts; an outside commenter cannot
+pre-post one to suppress an ask. The `pools-exhausted` key is the issue's forge state, not the
 host's hold, so every host and every re-exhaustion share it until the issue
 moves. Safehouse / Matrix delivery is not wired yet (the Safehouse sink only
 narrates the frozen event taxonomy).
@@ -2082,9 +2083,10 @@ even from outside the `loom:issue` listing, and its landing row is marked
 `inherited_from`. Once it closes or stops blocking, the next pass drops it, and
 a repo unreadable for 3 passes in a row loses its inherited stars until a pass
 succeeds. A merge refusal's incident is an **open issue** named in the refusal
-comment itself, or else an open issue, filed by a trusted author, quoting one
-of the forge's three specific refusal phrases word-bounded ("Merge commits /
-Squash merges / Rebase merges are not allowed"; for #9276 that was #9268).
+comment itself, or else the newest open issue, filed by a trusted author,
+quoting one of the forge's three specific refusal phrases word-bounded ("Merge
+commits / Squash merges / Rebase merges are not allowed"; for #9276 that was
+#9268).
 A generic refusal (bare 405, merge method, ruleset) never searches, and
 nothing a later comment mentions ever inherits. With no open incident the ask
 quotes the forge's refusal text instead.
