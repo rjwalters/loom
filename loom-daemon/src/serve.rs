@@ -142,12 +142,19 @@ const KNOWN_PATHS: &[&str] = &[
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
 /// How long a computed `/api/pipeline` response is reused before the next
-/// request triggers a fresh `gh`-backed fetch (Issue #4393). The dashboard
-/// polls on a short interval (seconds); the underlying `gh` calls are one
-/// subprocess per metric per repo and far too slow to run on every poll, so
-/// this cache trades a bounded staleness window for not hammering `gh` (and,
-/// on a busy repo, its rate limit) from a page nobody may even have open.
-const PIPELINE_CACHE_TTL: Duration = Duration::from_secs(20);
+/// request triggers a fresh `gh`-backed fetch (Issue #4393). The underlying
+/// fetch is several forge calls per managed repo, so this cache trades a
+/// bounded staleness window for not hammering the shared rate limit from a
+/// page nobody may even be looking at.
+///
+/// Issue #9253: this was 20s — exactly the dashboard's own
+/// `setInterval(refreshPipeline, 20000)` (`dashboard.html`), so every poll
+/// from an open tab landed just past expiry and was a guaranteed miss (a full
+/// per-root fan-out every 20s, forever). 90s is several poll intervals, so an
+/// open tab now costs one fetch per ~90s instead of one per poll; queue depth
+/// and merge counts are coarse signals, so a ≤90s-stale row is fine for a
+/// dashboard (the SSE event stream carries the real-time view).
+const PIPELINE_CACHE_TTL: Duration = Duration::from_secs(90);
 
 /// Topic **prefixes** the SSE bridge subscribes to, passed verbatim as
 /// `Request::SubscribeEvents { topics }` so the daemon applies them through the
