@@ -258,21 +258,27 @@ histograms. Policy and pipeline: [CI observability](../../docs/ci-observability.
 | CI top slow jobs | Logs Explorer: filter `body = 'ci.job'`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.duration_ms`, `loom.ci.run_id`, `loom.ci.job_id`; sort by `loom.ci.duration_ms` descending; save as view `CI top slow jobs` (`ci-queries.sql` 4) |
 | CI failed run → logs | Logs Explorer: filter `body = 'ci.run' AND loom.ci.conclusion IN ('failure', 'timed_out', 'startup_failure')`, save as `CI failed runs`; take a `loom.ci.run_id`, filter `body = 'ci.job' AND loom.ci.run_id = <id> AND loom.ci.conclusion != 'success'` for its failing jobs, then `loom.ci.job_id = <job id> AND loom.ci.chunk_index EXISTS` sorted by `loom.ci.chunk_index` ascending for the job's log, in order (`ci-queries.sql` 5) |
 | CI run waterfall | Trace Explorer: filter `name = 'loom.ci.run'`, sort by duration descending, open a run; its `loom.ci.job` children are the waterfall, and the longest child against the root's duration is the run/longest-job comparison (`ci-queries.sql` 6) |
+| CI job queue wait | Logs Explorer: filter `body = 'ci.job' AND loom.ci.queued_ms EXISTS`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.queued_ms`; group by `loom.ci.job` with **P50**/**P90**, time range 7 days; **alert when p90 exceeds 60s** — a runner-queue-cap burst shows here long before it shows in the run-level queue segment. A job GitHub reported no `created_at` for contributes no sample, not a zero (`ci-queries.sql` 9) |
+| CI shard balance | Logs Explorer: filter `body = 'ci.job' AND loom.ci.shard.kind != 'none'`, add columns `loom.ci.run_id`, `loom.ci.job`, `loom.ci.shard.index`, `loom.ci.shard.total`, `loom.ci.duration_ms`; group by `loom.ci.run_id`, `loom.ci.shard.kind` — the spread between the slowest and fastest leg of one run is the rebalancing signal. The ranked spread across runs lives in the SQL (`ci-queries.sql` 10) |
+| CI step waterfall | Trace Explorer: open a run as above and expand a `loom.ci.job` child — its `loom.ci.step` children are the within-job waterfall (compile vs. test). For the cross-run view, filter `name = 'loom.ci.step'`, group by `loom.ci.job`, `loom.ci.step` with **P90**, sorted descending (`ci-queries.sql` 11) |
 
-`ci-queries.sql` 7) (#9007's per-issue Builder/CI/Judge/merge breakdown) has no
-row above: it joins `loom_analytics.raw_ship_outcome` against `ci.run` records
-across two logical sources, which is not a single SigNoz Explorer/dashboard
-panel the way sections 1–6 are — it is a `clickhouse-client`-only report, run
-the same way as the rollup's other CT queries.
+`ci-queries.sql` 7) (#9007's per-issue Builder/CI/Judge/merge breakdown) and 8)
+(#9337's CI time per trigger reason) have no row above: 7 joins
+`loom_analytics.raw_ship_outcome` against `ci.run` records across two logical
+sources, which is not a single SigNoz Explorer/dashboard panel the way sections
+1–6 are — it is a `clickhouse-client`-only report, run the same way as the
+rollup's other CT queries.
 
-The six CI rows are **recreation steps, not yet observed**: no session has had
+The nine CI rows are **recreation steps, not yet observed**: no session has had
 an authenticated UI (or API) credential for the trial org since they were
-written, so none of the six has been created there yet
+written, so none of the nine has been created there yet
 ([#8946](https://github.com/rjwalters/loom/issues/8946)). Their SQL
 counterparts in `ci-queries.sql` are the executed, verified form — see
 `evidence.md`'s "CI retro queries, executed live" section — and remain the
 acceptance surface until someone with the trial org's login creates the saved
-views and records it.
+views and records it. The three #9089 rows are additionally **unexecuted**:
+sections 9–11 read attributes and spans this change introduces, so no run
+predating it can have produced a row for them.
 
 Save these searches/dashboards through the installed UI and retain sanitized
 exports where supported. These precise steps avoid asserting that mutable

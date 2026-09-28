@@ -1,13 +1,19 @@
 //! GitHub Actions REST shapes → telemetry envelopes.
 //!
 //! Each completed **job** becomes one unit of three envelopes (`ci.job`, its
-//! `ci.duration`, its `loom.ci.job` span) and each completed **run** one unit
-//! of three (`ci.run`, its `ci.duration`, its `loom.ci.run` span). Trace and
+//! `ci.duration`, its `loom.ci.job` span) plus, since #9089, one extra
+//! span-only envelope per executed **step** (`loom.ci.step`, a child of that
+//! job's span); each completed **run** becomes one unit of three (`ci.run`,
+//! its `ci.duration`, its `loom.ci.run` span). Trace and
 //! span ids are **derived** from the GitHub identities (`repo`, `run_id`,
-//! `job_id`), never random, so a replayed or second-host emission of the same
-//! run is byte-identical in identity and a backend can deduplicate on it.
+//! `job_id`, step number), never random, so a replayed or second-host
+//! emission of the same run is byte-identical in identity and a backend can
+//! deduplicate on it.
+
+use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::Deserialize;
 
 use crate::telemetry::ci::{duration_ms, CiDurationMetric};
@@ -243,6 +249,11 @@ pub struct JobJson {
     pub status: String,
     #[serde(default)]
     pub conclusion: Option<String>,
+    /// When GitHub created the job (queued it for a runner). Absent on a
+    /// recording made before #9089 — a missing value never reads as a zero
+    /// queue, it makes [`Self::queued_ms`] `None`.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -251,6 +262,12 @@ pub struct JobJson {
     pub labels: Vec<String>,
     #[serde(default = "first_attempt")]
     pub run_attempt: u32,
+    /// The job's steps, in the order GitHub reports them (#9089). Present on
+    /// every `/actions/runs/{id}/jobs` row the poller already fetches, so
+    /// step spans cost no extra API call. Empty on a recording made before
+    /// #9089, and on a job that failed before any step ran.
+    #[serde(default)]
+    pub steps: Vec<StepJson>,
 }
 
 impl JobJson {
@@ -258,6 +275,145 @@ impl JobJson {
     pub fn is_completed(&self) -> bool {
         self.status == "completed"
     }
+
+    /// Milliseconds this job sat queued for a runner: `started_at −
+    /// created_at`, floored at zero (#9089 — the per-job analogue of
+    /// [`RunJson::queued_ms`], #9007). `None` when GitHub reported no
+    /// `created_at` (a pre-#9089 recording) or no `started_at`.
+    #[must_use]
+    pub fn queued_ms(&self) -> Option<i64> {
+        match (self.created_at, self.started_at) {
+            (Some(created), Some(started)) => Some(duration_ms(created, started)),
+            _ => None,
+        }
+    }
+}
+
+/// One entry of a job row's `steps[]` array (#9089).
+///
+/// GitHub reports `number` as the step's 1-based position within the job, and
+/// `started_at` / `completed_at` only once the step has actually run — a step
+/// the job never reached carries neither, and produces no span.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StepJson {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub number: u32,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl StepJson {
+    /// The step's `[start, end]` window, or `None` when GitHub reported no
+    /// start or no completion — a step that never ran is not a zero-length
+    /// span at the job's start, it is absent. `end` is floored at `start`, so
+    /// reported clock skew never yields a span that ends before it begins
+    /// (`SpanRecord::validate` rejects those outright).
+    #[must_use]
+    pub fn window(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        match (self.started_at, self.completed_at) {
+            (Some(started), Some(completed)) => Some((started, completed.max(started))),
+            _ => None,
+        }
+    }
+}
+
+/// Upper bound on step spans emitted for one job (#9089). GitHub's own limit
+/// on `steps:` per job is well under this, so it binds only on a pathological
+/// or hostile row; it exists so one job can never expand into unbounded span
+/// volume.
+pub const MAX_STEP_SPANS_PER_JOB: usize = 64;
+
+/// Longest step name carried on a span attribute. `bounded_attributes` DROPS
+/// a value longer than 256 chars outright, so a long step name would silently
+/// lose `loom.ci.step` — truncating here keeps the attribute present and
+/// visibly elided instead.
+const MAX_STEP_NAME_CHARS: usize = 200;
+
+/// A step name reduced to what a span attribute may carry: control characters
+/// (which `bounded_attributes` rejects the whole value for) collapsed to
+/// spaces, then truncated on a character boundary with an ellipsis.
+#[must_use]
+fn step_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if cleaned.chars().count() <= MAX_STEP_NAME_CHARS {
+        return cleaned;
+    }
+    let mut out: String = cleaned.chars().take(MAX_STEP_NAME_CHARS).collect();
+    out.push('…');
+    out
+}
+
+/// Which family a matrix leg's shard attributes describe (#9089).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShardKind {
+    /// A `cargo nextest run --partition count:k/N` leg (`Rust Unit Tests`,
+    /// `Rust OTLP Feature Tests`).
+    NextestPartition,
+    /// A `run-ci-suites.sh` / `LOOM_CI_SHARD` round-robin leg (`Shell Test
+    /// Suites`).
+    ShellSuiteShard,
+    /// Not a sharded matrix leg.
+    #[default]
+    None,
+}
+
+impl ShardKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShardKind::NextestPartition => "nextest-partition",
+            ShardKind::ShellSuiteShard => "shell-suite-shard",
+            ShardKind::None => "none",
+        }
+    }
+}
+
+/// A job's shard identity, parsed from its display name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShardInfo {
+    pub kind: ShardKind,
+    pub index: Option<u32>,
+    pub total: Option<u32>,
+}
+
+/// Parse a job's shard identity from its display name (#9089). `ci.yml`'s two
+/// sharded job families already print `(index/total)` in their `name:` —
+/// `Rust Unit Tests (1/3)`, `Rust OTLP Feature Tests (2/3)`, `Shell Test
+/// Suites (hermetic, 1/2)` — so a trailing `(…k/N)` group is a strong,
+/// no-extra-API-call signal: the jobs listing the poller already fetches
+/// carries it. The `Shell Test Suites` prefix distinguishes the round-robin
+/// shell-shard family (`LOOM_CI_SHARD`) from the nextest-partition family
+/// (`cargo nextest run --partition`); a name with no matching group is
+/// unsharded ([`ShardKind::None`], `index`/`total` both `None`).
+#[must_use]
+pub fn parse_shard(job_name: &str) -> ShardInfo {
+    static SHARD_RE: OnceLock<Regex> = OnceLock::new();
+    let re = SHARD_RE.get_or_init(|| {
+        Regex::new(r"\((?:[^()]*,\s*)?(\d+)/(\d+)\)\s*$").expect("static shard-suffix pattern")
+    });
+    let Some(caps) = re.captures(job_name) else {
+        return ShardInfo::default();
+    };
+    let index = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
+    let total = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
+    let kind = if job_name.starts_with("Shell Test Suites") {
+        ShardKind::ShellSuiteShard
+    } else {
+        ShardKind::NextestPartition
+    };
+    ShardInfo { kind, index, total }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -286,6 +442,32 @@ pub fn job_context(repo: &str, run_id: u64, attempt: u32, job_id: u64) -> TraceC
     let run = run_context(repo, run_id, attempt);
     TraceContext {
         span_id: SpanId::derived(&["loom.ci.job", repo, &job_id.to_string()]),
+        ..run
+    }
+}
+
+/// A step span's context inside its run attempt's trace (#9089). Derived from
+/// `(repo, job_id, step number)` — the same determinism rule the run and job
+/// contexts follow, so a replayed or second-host emission of the same step is
+/// byte-identical in identity. The step *number*, not its name, is the
+/// identity: renaming a step in `ci.yml` does not fork a step's span id, and
+/// two steps sharing a name (common — `run: make` twice) stay distinct.
+#[must_use]
+pub fn step_context(
+    repo: &str,
+    run_id: u64,
+    attempt: u32,
+    job_id: u64,
+    number: u32,
+) -> TraceContext {
+    let run = run_context(repo, run_id, attempt);
+    TraceContext {
+        span_id: SpanId::derived(&[
+            "loom.ci.step",
+            repo,
+            &job_id.to_string(),
+            &number.to_string(),
+        ]),
         ..run
     }
 }
@@ -420,6 +602,7 @@ pub fn job_envelopes(
     let runner = job.labels.first().cloned();
     let ctx = job_context(&repo.full_name, run.id, job.run_attempt, job.id);
     let run_span = run_context(&repo.full_name, run.id, job.run_attempt).span_id;
+    let shard = parse_shard(&job.name);
     let record = CiJobRecord {
         repo: repo.full_name.clone(),
         visibility: repo.visibility(),
@@ -435,6 +618,10 @@ pub fn job_envelopes(
         started_at,
         completed_at,
         duration_ms: duration,
+        queued_ms: job.queued_ms(),
+        shard_index: shard.index,
+        shard_total: shard.total,
+        shard_kind: shard.kind.as_str().to_string(),
     };
     let duration_record = CiDurationRecord {
         metric: CiDurationMetric::Job,
@@ -471,15 +658,81 @@ pub fn job_envelopes(
             ("loom.ci.head_sha", Some(run.head_sha.clone())),
             ("loom.ci.ref", run.head_branch.clone()),
             ("loom.pr_number", run.pr_number().map(|n| n.to_string())),
+            ("loom.ci.queued_ms", job.queued_ms().map(|ms| ms.to_string())),
+            ("loom.ci.shard.index", shard.index.map(|i| i.to_string())),
+            ("loom.ci.shard.total", shard.total.map(|t| t.to_string())),
+            ("loom.ci.shard.kind", Some(shard.kind.as_str().to_string())),
         ]),
         events: Vec::new(),
         links: Vec::new(),
     };
-    vec![
+    let mut envelopes = vec![
         envelope(host_id, TelemetryRecord::CiJob(record), Some(ctx.clone())),
         envelope(host_id, TelemetryRecord::CiDuration(duration_record), None),
-        envelope(host_id, TelemetryRecord::Span(span), Some(ctx)),
-    ]
+        envelope(host_id, TelemetryRecord::Span(span), Some(ctx.clone())),
+    ];
+    envelopes.extend(step_envelopes(repo, run, job, &shard, &ctx, host_id));
+    envelopes
+}
+
+/// The `loom.ci.step` spans of one job, each a child of that job's span
+/// (#9089).
+///
+/// Built from the `steps[]` array of the jobs listing the poller already
+/// fetched, so no extra API call: a job span alone cannot say whether a Rust
+/// leg's ~250s went to compiling or to running tests, and these can. A step
+/// GitHub reported no start or no completion for produces no span
+/// ([`StepJson::window`]); the rest are emitted in order, capped at
+/// [`MAX_STEP_SPANS_PER_JOB`].
+///
+/// Each span repeats its job's identity (`loom.ci.job`, `loom.ci.job_id`) and
+/// shard attributes so "which step of which leg is slow" is one group-by, not
+/// a trace join. Step spans are deliberately **span-only** — there is no
+/// `ci.step` log record and no duration metric — because the metric-label
+/// allowlist admits no step dimension and a per-step histogram would multiply
+/// the 30-day metric series count by the step count of every job.
+#[must_use]
+fn step_envelopes(
+    repo: &RepoJson,
+    run: &RunJson,
+    job: &JobJson,
+    shard: &ShardInfo,
+    job_ctx: &TraceContext,
+    host_id: &str,
+) -> Vec<TelemetryEnvelope> {
+    job.steps
+        .iter()
+        .filter_map(|step| Some((step, step.window()?)))
+        .take(MAX_STEP_SPANS_PER_JOB)
+        .map(|(step, (started_at, ended_at))| {
+            let ctx = step_context(&repo.full_name, run.id, job.run_attempt, job.id, step.number);
+            let span = SpanRecord {
+                context: ctx.clone(),
+                parent_span_id: Some(job_ctx.span_id.clone()),
+                name: SpanName::CiStep,
+                started_at,
+                ended_at,
+                status: span_status(step.conclusion.as_deref()),
+                attributes: attrs(vec![
+                    ("loom.repo", Some(repo.full_name.clone())),
+                    ("loom.repo.visibility", Some(visibility_str(repo.visibility()).to_string())),
+                    ("loom.ci.run_id", Some(run.id.to_string())),
+                    ("loom.ci.job_id", Some(job.id.to_string())),
+                    ("loom.ci.workflow", Some(run.workflow())),
+                    ("loom.ci.job", Some(job.name.clone())),
+                    ("loom.ci.step", Some(step_name(&step.name))),
+                    ("loom.ci.step_number", Some(step.number.to_string())),
+                    ("loom.ci.conclusion", step.conclusion.clone()),
+                    ("loom.ci.shard.index", shard.index.map(|i| i.to_string())),
+                    ("loom.ci.shard.total", shard.total.map(|t| t.to_string())),
+                    ("loom.ci.shard.kind", Some(shard.kind.as_str().to_string())),
+                ]),
+                events: Vec::new(),
+                links: Vec::new(),
+            };
+            envelope(host_id, TelemetryRecord::Span(span), Some(ctx))
+        })
+        .collect()
 }
 
 /// The journal-level identity of one CI envelope — what "already emitted"
