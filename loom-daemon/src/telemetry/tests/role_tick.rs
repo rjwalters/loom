@@ -79,6 +79,7 @@ fn role_tick_result_serializes_every_skip_class_distinctly() {
         "skipped_model_runtime_mismatch"
     );
     assert_eq!(wire(RoleTickResult::SkippedLoad), "skipped_load");
+    assert_eq!(wire(RoleTickResult::SkippedQueueEmpty), "skipped_queue_empty");
 }
 
 /// The "unknown != zero" contract, on the wire: an unobserved measurement is

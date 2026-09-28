@@ -111,6 +111,7 @@ mod decline_cooldown;
 mod dispatch;
 mod guards;
 mod heartbeat_broadcast;
+mod lease_episode;
 mod locks;
 mod model;
 mod noop_cooldown;
@@ -123,7 +124,6 @@ mod quarantine;
 pub(crate) mod reaper;
 mod spawn_process;
 mod stacking;
-// Shared test registry fixture for adoption-correlation coverage.
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) mod test_support;
@@ -151,8 +151,6 @@ pub use model::*;
 pub use noop_cooldown::*;
 #[allow(unused_imports)]
 pub use outcome_journal::*;
-#[allow(unused_imports)]
-pub use pool_hold_broadcast::*;
 #[allow(unused_imports)]
 pub use prless_retry::*;
 #[allow(unused_imports)]

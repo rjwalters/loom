@@ -5,7 +5,10 @@
 //! configured forge owners — organizations and user accounts ([`owners`],
 //! #9188) — as first-class telemetry: `ci.run` / `ci.job` log records, the
 //! `loom.ci.{run,job}.duration_ms` histograms (via `ci.duration`), and one
-//! trace per run with one span per job. With `logCaptureEnabled` (#8825) it
+//! trace per run with one span per job — and, since #9089, one
+//! `loom.ci.step` span per executed step under each job span, built from the
+//! `steps[]` array of the jobs listing this poller already fetches. With
+//! `logCaptureEnabled` (#8825) it
 //! additionally captures each completed job's **full log** as chunked
 //! `ci.job.log` records ([`logs`]) — unfiltered apart from a per-job size
 //! cap, because the neutral OTLP gateway, not this poller, is the redaction
