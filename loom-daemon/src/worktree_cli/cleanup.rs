@@ -229,27 +229,42 @@ fn remove_orphan_dir(git_common: &Path, issue: u64, out: &Reporter) -> bool {
 /// `abs_wt=""` branch: a directory whose own path cannot be canonicalized
 /// cannot be the one git reported. `is_dir()` has already established it
 /// exists, so this is a permissions/race edge, not the common case.
-fn is_registered(wt_path: &Path) -> bool {
+///
+/// Also the registration check for [`super::sparse`]'s re-configure arm
+/// (#8195 slice 10), which used to ask the same question with an unanchored
+/// `git worktree list | grep -q` substring match and could disagree with this
+/// function about the same directory.
+pub(crate) fn is_registered(wt_path: &Path) -> bool {
+    is_registered_in(None, wt_path)
+}
+
+/// [`is_registered`], asking the worktree list of the repo at `repo` (via
+/// `git -C`) instead of the process cwd's. `None` is exactly
+/// [`is_registered`]. The re-configure arm's caller passes its cwd — the main
+/// workspace, the directory the retired `git worktree list` ran in — and the
+/// tests pass their fixture, which is the reason the parameter exists.
+pub(crate) fn is_registered_in(repo: Option<&Path>, wt_path: &Path) -> bool {
     let Ok(abs_wt) = std::fs::canonicalize(wt_path) else {
         return false;
     };
-    registered_worktrees()
+    registered_worktrees(repo)
         .into_iter()
         .any(|entry| entry == abs_wt)
 }
 
 /// Every path `git worktree list --porcelain` reports, read in the process's
-/// cwd exactly as the shell invoked it (no `-C`).
+/// cwd exactly as the shell invoked it (no `-C`) unless `repo` names one.
 ///
 /// Delegates the parse to [`super::branch_delete::parse_worktree_porcelain`]
 /// — the same reader slice 3 already uses for the `remove` verb. The shell's
 /// own comment said this parse "mirrors `branch_delete::worktree_entries`";
 /// mirroring is what drifts, so now there is one function.
-fn registered_worktrees() -> Vec<PathBuf> {
-    let Ok(out) = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-    else {
+fn registered_worktrees(repo: Option<&Path>) -> Vec<PathBuf> {
+    let mut cmd = Command::new("git");
+    if let Some(repo) = repo {
+        cmd.arg("-C").arg(repo);
+    }
+    let Ok(out) = cmd.args(["worktree", "list", "--porcelain"]).output() else {
         return Vec::new();
     };
     if !out.status.success() {

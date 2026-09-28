@@ -105,6 +105,7 @@ pub(crate) mod worktree_link;
 pub(crate) mod worktree_lock;
 pub(crate) mod worktree_remove;
 pub(crate) mod worktree_reset;
+mod worktree_sparse;
 pub(crate) mod worktree_stale_ref;
 mod worktree_state;
 pub(crate) mod worktree_submodules;

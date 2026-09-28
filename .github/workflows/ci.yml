@@ -1774,15 +1774,24 @@ jobs:
       # ACTUALLY HAPPENS; without a binary neither runs at all, which is a
       # correct documented degradation to the pre-#6095/pre-#6257 behaviour but
       # would leave the assertions measuring nothing. Both pin the binary via
-      # loom_test_require_daemon_bin and FAIL rather than skip. Twelve of the 20
-      # test-worktree-*.sh suites now run here (eleven moved by a port slice,
-      # plus test-worktree-issue-lock.sh, which was daemon-driven from the
-      # start); the remaining eight exercise create-path arms these slices did
-      # not touch and stay hermetic in shell-suite-tests.
+      # loom_test_require_daemon_bin and FAIL rather than skip.
       - name: worktree local-branch upstream correction (#6095, #6100, ported in #8195 slice 9)
         run: bash defaults/scripts/tests/test-worktree-local-branch-upstream-tracking.sh
       - name: worktree existing-dir upstream + drift check (#6257, #6291, ported in #8195 slice 9)
         run: bash defaults/scripts/tests/test-worktree-existing-dir-drift-check.sh
+      # Moved out of shell-suite-tests by #8195 slice 10: worktree.sh's
+      # --sparse/--full family is now `loom-daemon worktree-sparse`, including
+      # the re-configure arm this suite's Tests 3/4 drive (its registration
+      # check and #3548 sentinel back-fill). Without a binary those flags
+      # refuse with exit 2 before touching anything, so the suite pins one via
+      # loom_test_require_daemon_bin and FAILS rather than skips. Fourteen of
+      # the 21 test-worktree-*.sh suites now run here (twelve moved by a port
+      # slice, plus test-worktree-issue-lock.sh and test-worktree-stale-
+      # closed-branch.sh, which were daemon-driven from the start); the
+      # remaining seven exercise create-path arms these slices did not touch
+      # and stay hermetic in shell-suite-tests.
+      - name: worktree sentinel back-fill on re-invoke (#3548; --sparse/--full ported in #8195 slice 10)
+        run: bash defaults/scripts/tests/test-worktree-sentinel-reinvoke.sh
       # Moved out of shell-suite-tests by #8191's delete-branch slice:
       # merge-pr.sh's `_maybe_delete_local_branch` now delegates to
       # `loom-daemon merge-pr delete-branch` (the same branch_delete rule
