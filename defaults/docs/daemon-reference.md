@@ -3695,6 +3695,33 @@ repository is now the parallelism boundary:
   and curator works unlabeled issues, so a single-label gate would starve part
   of their work; the per-role budget bounds them instead. Idle-edge roles
   (hermit, architect) keep their idle trigger.
+- **Demand-weighted width and Champion-first reservation (#9392).** Admission
+  also reads a per-host **demand ledger** of open PRs per repository on three
+  axes: `loom:review-requested` (judge), `loom:changes-requested` (doctor) and
+  `loom:pr` (champion). The ledger is fed only by listings the role runner
+  already makes — the queue-gate listing above, plus one ETag-cached `loom:pr`
+  count (`forge_call_stats` caller `role_demand`) after each **admitted**
+  champion run — so it adds no forge query per tick per repository. Only PR
+  rows count. A failed listing records nothing, and an entry older than
+  `demandWidth.staleSecs` is ignored, so an axis nobody has observed recently is
+  **unobserved** and changes nothing. For a PR role,
+  `width = clamp(ceil(debt / perRun), 1, min(max, roleMaxConcurrent budget))`
+  (the Phase 1 budget when unobserved). Judge and doctor use that width as their
+  effective budget, and a refusal at it is logged naming the width and the
+  queue depth. Champion's budget is never lowered — it also promotes issues —
+  so its width only sizes the reservation: each PR role wants
+  `min(width, repositories with debt)` slots, and admitting a role holds back
+  the unfilled wants of every PR role ranked above it (champion > judge >
+  doctor > every other role), capped at `ceiling − nonPrFloor`. Champion is
+  never refused by a reservation, and non-PR roles always keep `nonPrFloor`
+  slots. A reservation refusal is one summary line per tick naming the reserved
+  count and the roles it is held for, and the round-robin cursor still moves
+  only on an admission, so every repository with debt is still reached within a
+  bounded number of ticks. One `INFO` line is logged when a role's width or
+  reservation changes, naming the debt, `perRun`, `max` and the Phase 1 budget.
+  Idle-edge runs keep the Phase 1 budget. `demandWidth.enabled: false` restores
+  exactly the Phase 1 admission (no ledger reads, no reservation, no `loom:pr`
+  count).
 
 **Observability.** `loom-daemon status` prints the live count and its ceiling
 immediately under the in-flight sweep table, plus the total:
@@ -4546,6 +4573,12 @@ knobs not yet audited here.
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in — curator/judge/doctor 300s, champion/auditor/hermit 600s, guide 900s (5–15 min); `architect` 3600s, idle-addressable-only | Uniform override applied to every enabled role's cadence — **when either tier is set, every role logs the same interval and the per-role built-ins are entirely inert.** The boot log names which tier won: `role_runner: <role> interval=<n>s source=built-in|config:…|env:…` (#6204). Zero/invalid env → next tier |
 | `autonomous.roleRunner.maxConcurrent` | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` | the 7 interval-default roles | **The ceiling on concurrently-running role agents (#6102)** — the role-runner counterpart of `workFinder.maxConcurrent`, which bounds sweep dispatch **only**. Counted **process-wide across every managed workspace and every role** (the host is shared; a per-root ceiling would bound nothing on a 25-workspace box) but resolved from each root's own config, like `architectMaxProposals`. Since #9391 role loops dispatch repositories **concurrently** (one instance per `(repository, role)`), bounded by this ceiling plus the per-role `roleMaxConcurrent` budgets. A tick that reaches it stops admitting and logs one `WARN` summary line per role; the deferred roots retry next tick — distinct from the `debug!`-level per-`(root, role)` overlap skip (#4364). Zero/non-integer at either tier drops to the next (a `0` ceiling is `enabled: false` spelled confusingly). **Live** — re-read every tick. See [The other half of the agent budget](#the-other-half-of-the-agent-budget-role-runner-agents-6102) |
 | `autonomous.roleRunner.roleMaxConcurrent` | *(config only)* | `max(1, maxConcurrent / 2)` per role — **3** at the default ceiling | **Per-role budget under the host ceiling (#9391).** A `{"<role>": N}` object (e.g. `{"judge": 3, "champion": 3, "curator": 2}`) bounding how many runs of one role may be in flight across every workspace, so one role cannot take every slot. Keys are trimmed and lower-cased; a zero, negative or non-integer value is dropped per entry to the default; a value above the ceiling is clamped to it. Idle-edge runs count against it. Resolved from each root's own config and **live** (re-read every tick). See [Concurrent across repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391) |
+| `autonomous.roleRunner.demandWidth.enabled` | *(config only)* | `true` | **Demand-weighted role admission (#9392).** `false` restores exactly the Phase 1 (#9391) admission: no demand-ledger reads, no reservation, no champion `loom:pr` count. A non-bool value drops to the default. Resolved per root, **live**. See [Concurrent across repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391) |
+| `autonomous.roleRunner.demandWidth.perRun` | *(config only)* | `3` | `k` in the PR-role width `clamp(ceil(debt / k), 1, min(max, roleMaxConcurrent budget))`: queued PRs per role run. Zero, negative or non-integer drops to the default. **Live** |
+| `autonomous.roleRunner.demandWidth.max` | *(config only)* | `4` | Upper clamp on judge, doctor and champion width. Still capped by the role's `roleMaxConcurrent` budget, so at the default ceiling of 7 (budget 3) it binds only where the budget is 4 or more — demand never raises a role above its budget. Zero, negative or non-integer drops to the default. **Live** |
+| `autonomous.roleRunner.demandWidth.reserve` | *(config only)* | `true` | Champion-first ceiling reservation: admitting a role leaves free the unfilled `min(width, repositories with debt)` of each higher-priority PR role (champion > judge > doctor > others). `false` keeps the width but reserves nothing. **Live** |
+| `autonomous.roleRunner.demandWidth.nonPrFloor` | *(config only)* | `1` | Ceiling slots the reservation always leaves for non-PR roles: the reservation never exceeds `maxConcurrent − nonPrFloor`. Zero, negative or non-integer drops to the default. **Live** |
+| `autonomous.roleRunner.demandWidth.staleSecs` | *(config only)* | `1800` | Demand-ledger entries older than this many seconds are ignored; an axis with no fresh entry is unobserved and falls back to Phase 1 behaviour. Zero, negative or non-integer drops to the default. **Live** |
 | `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of all **8** shipped roles — the 7 above **plus `architect`**, which is reachable here and nowhere else by default (#5656) — to fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
 | `autonomous.roleRunner.onIdleMaxWait` | *(config only)* | *(unset — no promotion, today's idle-edge-only firing)* | **Per-role starvation guard for an `onIdle` role (#7511).** A `{"<role>": "<duration>"}` object (e.g. `{"hermit": "24h", "auditor": "72h"}`, duration strings `<n>s`/`<n>m`/`<n>h`/`<n>d`) naming the longest a role may go without a completed tick before it is **promoted** into the next interval-cadence pass — see [`onIdleMaxWait` — promoting a starved `onIdle` role](#onidlemaxwait--promoting-a-starved-onidle-role-7511) below |
@@ -7494,6 +7527,12 @@ leaves the daemon's behavior byte-for-byte unchanged:
 | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` | `autonomous.roleRunner.maxConcurrent` | env > config > default | the 7 interval-default roles (concurrent role-agent ceiling, #6102 — bounds the agents `workFinder.maxConcurrent` does not) |
 | — | `autonomous.roleRunner.roles` | config only | the 7 interval-default roles (`architect` excluded, #5656) |
 | — | `autonomous.roleRunner.roleMaxConcurrent` | config only | `max(1, maxConcurrent / 2)` per role (per-role budget under the host ceiling, #9391) |
+| — | `autonomous.roleRunner.demandWidth.enabled` | config only | `true` (demand-weighted width + Champion-first reservation, #9392; `false` = Phase 1 admission) |
+| — | `autonomous.roleRunner.demandWidth.perRun` | config only | `3` (queued PRs per role run in the width formula) |
+| — | `autonomous.roleRunner.demandWidth.max` | config only | `4` (width clamp, still capped by the role budget) |
+| — | `autonomous.roleRunner.demandWidth.reserve` | config only | `true` (Champion-first ceiling reservation) |
+| — | `autonomous.roleRunner.demandWidth.nonPrFloor` | config only | `1` (slots always left for non-PR roles) |
+| — | `autonomous.roleRunner.demandWidth.staleSecs` | config only | `1800` (ledger entries older than this are unobserved) |
 | — | `autonomous.roleRunner.onIdle` | config only | `[]` (none; may name any of the 8 shipped roles, `architect` included) |
 | — | `autonomous.roleRunner.model` | config only (`roleRunner.model` > `autonomous.model` > default) | `sonnet` (`DEFAULT_DISPATCH_MODEL`) |
 | — | `autonomous.roleRunner.effort` | config only (`roleRunner.roleEfforts.<role>` > `roleRunner.effort` > unset) | *(unset ⇒ **no** `--effort` argument; the runtime CLI's own session default, #8054)* |
