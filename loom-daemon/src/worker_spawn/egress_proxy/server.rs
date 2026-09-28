@@ -27,6 +27,9 @@
 //!   token stream, and buffering them is what lets this listener read the
 //!   provider's own words to decide whether to bad-mark the account (#8699,
 //!   below).
+//! - It **answers its own control path locally** ([`rotation::CONTROL_PREFIX`],
+//!   #8818): every request under it is handled here, authorized by the same
+//!   placeholder, and never forwarded — whatever method, sub-path or body.
 //!
 //! # Per-launch usage attribution and proxy-side bad-marking (issue #8699)
 //!
@@ -49,6 +52,7 @@
 //! downgrades a stronger one.
 
 use super::registry::{Record, Refusal, Registry, CREDENTIAL_HEADERS};
+use super::rotation::{self, ControlRefusal, RotateRequest};
 use crate::api_keys_pool::classify::{self, Classification};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -156,6 +160,9 @@ async fn handle(
     let Some(request) = Head::parse(&head) else {
         return refuse(&mut stream, Refusal::MethodNotAllowed, peer, None).await;
     };
+    if is_control(&request.path_and_query()) {
+        return control(&mut stream, &request, leftover, peer, registry).await;
+    }
     let record = match registry.authorize(
         &request.method,
         &request.presented,
@@ -174,7 +181,89 @@ async fn handle(
         Ok(body) => body,
         Err(status) => return write_status(&mut stream, status, "request body rejected").await,
     };
-    forward(&mut stream, &request, body, &record, client).await
+    forward(&mut stream, &request, body, &record, client, registry).await
+}
+
+/// Is this origin-form target on the proxy's own control path? Case-insensitive
+/// so no casing of the prefix reaches the upstream either.
+fn is_control(path_and_query: &str) -> bool {
+    path_and_query
+        .get(..rotation::CONTROL_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(rotation::CONTROL_PREFIX))
+}
+
+/// Handle a control request (#8818). Never forwards anything upstream.
+async fn control(
+    stream: &mut TcpStream,
+    head: &Head,
+    leftover: Vec<u8>,
+    peer: SocketAddr,
+    registry: &Registry,
+) -> std::io::Result<()> {
+    let outcome = async {
+        registry
+            .authorize(&head.method, &head.presented, head.requested_authority().as_deref())
+            .map_err(ControlRefusal::Auth)?;
+        if head.path_and_query() != rotation::ROTATE_PATH {
+            return Err(ControlRefusal::NotFound);
+        }
+        if !head.method.eq_ignore_ascii_case("POST") {
+            return Err(ControlRefusal::MethodNotAllowed);
+        }
+        let body = read_control_body(stream, head, leftover).await?;
+        let request = RotateRequest::parse(&body)?;
+        let presented = head.presented.clone();
+        let registry = registry.clone();
+        let rotated = tokio::task::spawn_blocking(move || registry.rotate(&presented, request))
+            .await
+            .map_err(|_| ControlRefusal::RotationUnavailable)??;
+        Ok((request.reason, rotated))
+    }
+    .await;
+    match outcome {
+        Ok((reason, rotated)) => {
+            // Secret-free: launch id, reason, account NAMES only.
+            eprintln!("{}", rotated.marker(reason));
+            let body = serde_json::json!({
+                "rotated": true,
+                "account": rotated.account,
+                "marked": rotated.marked,
+            })
+            .to_string();
+            write_json(stream, 200, &body).await
+        }
+        Err(refusal) => {
+            log::warn!(
+                "egress-proxy: refused control request reason={} peer={peer}",
+                refusal.token()
+            );
+            write_status(stream, refusal.status(), refusal.token()).await
+        }
+    }
+}
+
+/// A control body must declare a small `Content-Length`; chunked or oversized
+/// bodies are refused before a byte of them is buffered.
+async fn read_control_body(
+    stream: &mut TcpStream,
+    head: &Head,
+    leftover: Vec<u8>,
+) -> Result<Vec<u8>, ControlRefusal> {
+    if head.header("transfer-encoding").is_some() {
+        return Err(ControlRefusal::BadRequest);
+    }
+    let len: usize = head
+        .header("content-length")
+        .ok_or(ControlRefusal::BadRequest)?
+        .trim()
+        .parse()
+        .map_err(|_| ControlRefusal::BadRequest)?;
+    if len > rotation::MAX_CONTROL_BODY {
+        return Err(ControlRefusal::PayloadTooLarge);
+    }
+    read_body(stream, head, leftover)
+        .await
+        .map_err(|_| ControlRefusal::BadRequest)
 }
 
 /// Read up to the blank line that ends the head. Returns the head plus any
@@ -363,6 +452,7 @@ async fn forward(
     body: Vec<u8>,
     record: &Record,
     client: &reqwest::Client,
+    registry: &Registry,
 ) -> std::io::Result<()> {
     let request_bytes = body.len() as u64;
     let url = record.upstream.url_for(&head.path_and_query());
@@ -396,6 +486,10 @@ async fn forward(
         }
     };
     let status = response.status();
+    // Evidence for a later rotation request (#8818): what the upstream said
+    // about THIS credential generation, observed here, never reported by the
+    // container.
+    registry.observe(&record.launch_id, record.generation, status.as_u16());
     // Captured before the body is consumed either way: the allowlisted
     // rate-limit/usage headers (#8699) and the forwarded header block, since
     // `response.headers()` borrows and both the error and success paths below
@@ -638,6 +732,10 @@ async fn refuse(
 
 async fn write_status(stream: &mut TcpStream, status: u16, token: &str) -> std::io::Result<()> {
     let body = format!("{{\"error\":\"loom-egress-proxy\",\"reason\":\"{token}\"}}");
+    write_json(stream, status, &body).await
+}
+
+async fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
     let response = format!(
         "HTTP/1.1 {status} \r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()

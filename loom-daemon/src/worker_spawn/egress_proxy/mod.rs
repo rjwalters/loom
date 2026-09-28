@@ -46,9 +46,19 @@
 //!
 //! Both go through [`arm`] and [`run_with_proxy`], so they share one registry
 //! shape, one placeholder format and one set of refusals.
+//!
+//! # Account rotation (#8818)
+//!
+//! Only the [`exec`] path can rotate: it knows the launch's pool account and
+//! workspace, so it installs a [`rotation::HostPool`] and the container asks
+//! for a swap through [`rotation::ROTATE_PATH`] (client:
+//! `loom-daemon worker proxy-rotate`, [`rotate_client`]). The native path
+//! installs nothing, and every rotation request there is refused.
 
 pub mod exec;
 pub mod registry;
+pub mod rotate_client;
+pub mod rotation;
 pub mod server;
 #[cfg(test)]
 #[path = "tests.rs"]
