@@ -126,7 +126,7 @@ loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr"
 # the markers have to travel with it or the refusal degrades to
 # `<undeclared>` here while production names whatever version the marker
 # declares. Deliberately not quoting that version: it MOVES (#8967 raised it
-# from 0.19.172 to 0.19.375), and a number pinned in prose here just goes stale.
+# from 0.19.172 to 0.19.465), and a number pinned in prose here just goes stale.
 FUNCS_FILE="$(mktemp)"
 trap 'rm -f "$FUNCS_FILE" 2>/dev/null || true' EXIT
 awk '

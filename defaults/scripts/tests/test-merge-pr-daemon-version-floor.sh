@@ -243,7 +243,7 @@ echo "Testing the merge-pr floor covers every fail-closed sub-subcommand (#8967)
 
 # ONE marker covers the whole `merge-pr` family: check-daemon-subcommand-
 # versions.sh keys floors on the TOP-LEVEL subcommand, while merge-pr.sh calls
-# eight different `merge-pr <verb>` sub-subcommands, each added in a different
+# many different `merge-pr <verb>` sub-subcommands, each added in a different
 # release. #8967: the marker sat at 0.19.172 — verdict-contradiction, the
 # OLDEST of them — while `loom-pr-guard`, which REFUSES the merge when the
 # daemon cannot answer, had needed 0.19.375 since 2026-09-25. A host on
@@ -267,14 +267,33 @@ echo "Testing the merge-pr floor covers every fail-closed sub-subcommand (#8967)
 # without being classified; and a `closed` row above the declared marker fails
 # the floor assertion below. Together that is the AC: adding a fail-closed
 # `merge-pr <x>` call without moving the floor cannot pass CI.
+#
+# `open` is about the MERGE, not every side effect: dirty-guard refuses the
+# post-merge `git worktree remove --force` when it cannot answer (#5031), but
+# the merge itself has already happened, so it is `open` here. The rows from
+# stacked-children down were added when #8967 was rebased over the #8191
+# slices that landed after it branched; each `closed` version is
+# `git show <mainline commit that first carried it>:VERSION` + 1:
+#   classify-response  97609b86f (#9228, squash)          0.19.455 -> 0.19.456
+#   partial-conflict   2ab7630c5 (merge of #9246)          0.19.463 -> 0.19.464
+#   checks-failure     397f06feb (merge of #9272)          0.19.464 -> 0.19.465
 MERGE_PR_VERB_TABLE="verdict-contradiction closed 0.19.172
 stale-checks closed 0.19.221
 loom-pr-guard closed 0.19.375
+classify-response closed 0.19.456
+partial-conflict closed 0.19.464
+checks-failure closed 0.19.465
 head-sync-retry open -
 hold-state open -
 redate-checks open -
 delete-branch open -
-zero-checks-settle open -"
+zero-checks-settle open -
+stacked-children open -
+version-policy open -
+partial-reset open -
+closed-building open -
+issue-close-gate open -
+dirty-guard open -"
 
 # Shared comparison, so the controls below exercise the SAME logic the real
 # assertion does rather than a paraphrase of it. `sort -V` over a here-string
@@ -308,7 +327,7 @@ CALLED_VERBS="$(grep -o 'loom-daemon}" merge-pr [a-z][a-z0-9-]*' "$MERGE_PR_SRC"
 # If the invocation idiom is ever refactored, the scan above could come back
 # empty and every assertion below would vacuously pass. Pin the three verbs
 # that are fail-closed TODAY so that refactor fails loudly instead.
-for _known in verdict-contradiction stale-checks loom-pr-guard; do
+for _known in verdict-contradiction stale-checks loom-pr-guard classify-response partial-conflict checks-failure; do
     assert_contains "$CALLED_VERBS" "$_known" \
       "the invocation scan still finds 'merge-pr $_known' in merge-pr.sh"
 done
