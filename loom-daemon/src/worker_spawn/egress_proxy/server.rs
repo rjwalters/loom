@@ -42,9 +42,11 @@
 //! a plain HTTP 429 check ([`classify_response`]). A hit bad-marks the
 //! account immediately, here, rather than waiting for the child to exit and a
 //! log to be read: [`Record::begin_bad_mark`] guards a launch from being
-//! marked twice by a racing pair of 429s, and `ingest`'s own
-//! already-active-mark check (see that module) guards against a *second*
-//! mark landing later from the exit-code-driven path for the same account.
+//! marked twice at the same strength by a racing pair of 429s, and both
+//! writers go through [`crate::api_keys_pool::escalate_bad_for_class`], which
+//! skips a mark an active one already covers and never shortens a horizon —
+//! so the exit-code-driven path neither duplicates the proxy's mark nor
+//! downgrades a stronger one.
 
 use super::registry::{Record, Refusal, Registry, CREDENTIAL_HEADERS};
 use crate::api_keys_pool::classify::{self, Classification};
@@ -425,62 +427,89 @@ async fn forward(
             }
         };
         record.record_usage(request_bytes, error_body.len() as u64, usage_headers);
-        let text = String::from_utf8_lossy(&error_body);
-        if let Some(classification) = classify_response(status.as_u16(), &text) {
+        let classification =
+            classify_response(status.as_u16(), &String::from_utf8_lossy(&error_body));
+        // Reply first, mark second: the harness gets its 429 without waiting
+        // on the pool's `mkdir` lock, and a client that already hung up still
+        // gets its account marked.
+        let replied = async {
+            let mut out = format!("HTTP/1.1 {} \r\n{header_lines}", status.as_u16());
+            out.push_str(&format!(
+                "content-length: {}\r\nconnection: close\r\n\r\n",
+                error_body.len()
+            ));
+            stream.write_all(out.as_bytes()).await?;
+            stream.write_all(&error_body).await?;
+            stream.flush().await?;
+            stream.shutdown().await
+        }
+        .await;
+        if let Some(classification) = classification {
             bad_mark_at_proxy(record.clone(), classification).await;
         }
-        let mut out = format!("HTTP/1.1 {} \r\n{header_lines}", status.as_u16());
-        out.push_str(&format!("content-length: {}\r\nconnection: close\r\n\r\n", error_body.len()));
-        stream.write_all(out.as_bytes()).await?;
-        stream.write_all(&error_body).await?;
-        stream.flush().await?;
-        return stream.shutdown().await;
+        return replied;
     }
 
-    let mut out = format!("HTTP/1.1 {} \r\n{header_lines}", status.as_u16());
-    out.push_str("transfer-encoding: chunked\r\nconnection: close\r\n\r\n");
-    stream.write_all(out.as_bytes()).await?;
-    stream.flush().await?;
     let mut response_bytes: u64 = 0;
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if !chunk.is_empty() => {
-                response_bytes += chunk.len() as u64;
-                stream
-                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
-                    .await?;
-                stream.write_all(&chunk).await?;
-                stream.write_all(b"\r\n").await?;
-                stream.flush().await?;
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(error) => {
-                log::warn!(
-                    "egress-proxy: upstream stream ended early launch={}: {error}",
-                    record.launch_id
-                );
-                break;
+    // Usage is recorded after this block whether or not it succeeds, so a
+    // client that disconnects mid-stream still has its bytes counted.
+    let streamed = async {
+        let mut out = format!("HTTP/1.1 {} \r\n{header_lines}", status.as_u16());
+        out.push_str("transfer-encoding: chunked\r\nconnection: close\r\n\r\n");
+        stream.write_all(out.as_bytes()).await?;
+        stream.flush().await?;
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) if !chunk.is_empty() => {
+                    response_bytes += chunk.len() as u64;
+                    stream
+                        .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                        .await?;
+                    stream.write_all(&chunk).await?;
+                    stream.write_all(b"\r\n").await?;
+                    stream.flush().await?;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) => {
+                    log::warn!(
+                        "egress-proxy: upstream stream ended early launch={}: {error}",
+                        record.launch_id
+                    );
+                    break;
+                }
             }
         }
+        stream.write_all(b"0\r\n\r\n").await?;
+        stream.flush().await?;
+        stream.shutdown().await
     }
+    .await;
     record.record_usage(request_bytes, response_bytes, usage_headers);
-    stream.write_all(b"0\r\n\r\n").await?;
-    stream.flush().await?;
-    stream.shutdown().await
+    streamed
 }
 
 /// Buffer up to `cap` bytes of `response`'s body. Only ever called on an
 /// error response (never a streamed success), so `cap` is a defensive limit
-/// on a shape that is normally a few hundred bytes of JSON, not a real
-/// truncation concern.
+/// on a shape that is normally a few hundred bytes of JSON. A body that hits
+/// the cap is forwarded truncated (with a matching `content-length`) and
+/// logged, so the truncation is never silent.
 async fn read_capped(response: &mut reqwest::Response, cap: usize) -> reqwest::Result<Vec<u8>> {
     let mut buf = Vec::new();
+    let mut complete = false;
     while buf.len() < cap {
         match response.chunk().await? {
             Some(chunk) => buf.extend_from_slice(&chunk),
-            None => break,
+            None => {
+                complete = true;
+                break;
+            }
         }
+    }
+    if !complete || buf.len() > cap {
+        log::warn!(
+            "egress-proxy: upstream error body exceeded {cap} bytes; forwarding it truncated"
+        );
     }
     buf.truncate(cap);
     Ok(buf)
@@ -533,11 +562,11 @@ fn classify_response(status: u16, body: &str) -> Option<Classification> {
 /// 429/quota-exhausted response is seen — never waiting for the child to
 /// exit. A no-op when the launch's credential was not pool-selected
 /// ([`Record::pool_account`] is `None`), and — via
-/// [`Record::begin_bad_mark`] — for every request after the first on the same
-/// launch.
+/// [`Record::begin_bad_mark`] — for every request on the same launch that is
+/// not strictly stronger than one already marked.
 ///
 /// Runs the actual pool write on a blocking thread:
-/// [`crate::api_keys_pool::bad_marks::mark_bad_for_class`] takes a filesystem
+/// [`crate::api_keys_pool::escalate_bad_for_class`] takes a filesystem
 /// `mkdir` lock that can retry for seconds under
 /// contention, which must never stall this listener's async reactor (it runs
 /// on a two-worker-thread runtime, see [`super::run_with_proxy`]).
@@ -548,12 +577,12 @@ async fn bad_mark_at_proxy(record: Record, classification: Classification) {
     ) else {
         return;
     };
-    if !record.begin_bad_mark() {
-        return;
-    }
     let Some(cooldown) = classification.default_cooldown_secs() else {
         return;
     };
+    if !record.begin_bad_mark(Some(cooldown)) {
+        return;
+    }
     let provider = record.provider.clone();
     let launch_id = record.launch_id.clone();
     let model_class = record.model_class().map(str::to_string);
@@ -561,7 +590,7 @@ async fn bad_mark_at_proxy(record: Record, classification: Classification) {
         crate::api_keys_pool::paths::resolve_provider_root(&root, &provider)
             .map_err(|e| e.to_string())
             .and_then(|provider_root| {
-                crate::api_keys_pool::mark_bad_for_class(
+                crate::api_keys_pool::escalate_bad_for_class(
                     &provider_root,
                     &provider,
                     &account,
@@ -570,14 +599,21 @@ async fn bad_mark_at_proxy(record: Record, classification: Classification) {
                     model_class.as_deref(),
                 )
             })
-            .map(|_| (provider, account))
+            .map(|write| (provider, account, write))
     })
     .await;
     match outcome {
-        Ok(Ok((provider, account))) => log::warn!(
+        Ok(Ok((provider, account, crate::api_keys_pool::MarkWrite::Written(_)))) => log::warn!(
             "egress-proxy: bad-marked {provider}/{account} as {} launch={launch_id}",
             classification.label()
         ),
+        Ok(Ok((provider, account, crate::api_keys_pool::MarkWrite::AlreadyCovered(_)))) => {
+            log::info!(
+                "egress-proxy: {provider}/{account} already bad-marked at least as long as {} \
+                 — not re-marked launch={launch_id}",
+                classification.label()
+            );
+        }
         Ok(Err(error)) => {
             log::warn!("egress-proxy: could not bad-mark for launch={launch_id}: {error}")
         }

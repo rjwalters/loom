@@ -883,14 +883,40 @@ async fn a_429_bad_marks_the_pool_account_at_the_proxy_exactly_once() {
 #[tokio::test]
 async fn a_429_on_a_non_pool_launch_never_bad_marks_anything() {
     let (upstream_addr, _seen) = fake_upstream_with(429, &[], "{\"error\":\"rate limited\"}").await;
-    let (addr, _registry, placeholder) = start_proxy(&format!("http://{upstream_addr}")).await;
+    let (addr, registry, placeholder) = start_proxy(&format!("http://{upstream_addr}")).await;
 
     let response = raw_request(addr, &post(Some(placeholder.as_str()), &addr.to_string())).await;
     assert!(response.starts_with("HTTP/1.1 429"), "{response}");
-    // Nothing to assert against a pool file that was never created — the
-    // absence of a panic/paniced `unwrap` inside the proxy IS the assertion:
     // `Record::pool_account()` is `None` for `registry_with`'s plain record,
-    // so `bad_mark_at_proxy` must return before touching any filesystem path.
+    // so `bad_mark_at_proxy` returns before claiming the launch's mark level:
+    // the launch's own usage line must still say it was never marked.
+    let markers = registry.usage_markers();
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    assert!(markers[0].contains("bad_marked=false"), "{}", markers[0]);
+}
+
+/// #8699 Judge follow-up: the per-launch guard only lets a strictly stronger
+/// signal through — a racing repeat at the same level marks once, a weaker
+/// one never re-marks, and a bare-429 `rate-limited` (60s) still escalates to
+/// a later `exhausted` (6h) instead of being swallowed by first-error-wins.
+#[test]
+fn the_per_launch_bad_mark_guard_only_escalates() {
+    let record = Record::new(
+        "launch-escalate",
+        "anthropic",
+        Upstream::parse("https://api.anthropic.com").unwrap(),
+        HeaderStyle::AuthorizationBearer,
+        "sk-fake-real-credential",
+    );
+    let rate_limited = crate::api_keys_pool::Classification::RateLimited.default_cooldown_secs();
+    let exhausted = crate::api_keys_pool::Classification::Exhausted.default_cooldown_secs();
+    assert!(rate_limited < exhausted, "{rate_limited:?} vs {exhausted:?}");
+    assert!(record.begin_bad_mark(rate_limited));
+    assert!(!record.begin_bad_mark(rate_limited), "same level marks once");
+    assert!(record.begin_bad_mark(exhausted), "a stronger signal escalates");
+    assert!(!record.begin_bad_mark(rate_limited), "a weaker signal never re-marks");
+    assert!(!record.begin_bad_mark(exhausted));
+    assert!(record.usage_marker().contains("bad_marked=true"));
 }
 
 /// #8699 AC3, extending the #8674 redaction test: the new usage counters and

@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// How a provider expects the real credential to be presented upstream.
@@ -251,14 +251,16 @@ pub struct Record {
     /// Model class a mark is scoped to (#8424 item 3), normalized the same
     /// way `ingest::ingest_launch_log` does — so a proxy-side mark and a later
     /// exit-code-driven mark land on the very same `(account, class)` pair and
-    /// the latter's already-marked check (see `api_keys_pool::ingest`) finds
+    /// the latter's no-downgrade check (see `api_keys_pool::ingest`) finds
     /// it instead of writing a second one.
     model_class: Option<String>,
-    /// Set once this launch has been bad-marked at the proxy. Shared across
-    /// every clone of this record (one per request), so a second 429 on the
-    /// same launch — however many requests race it — bad-marks at most once
-    /// (#8699 AC2).
-    bad_marked: Arc<AtomicBool>,
+    /// The longest cooldown (seconds; `0` = never marked) this launch has
+    /// bad-marked at the proxy. Shared across every clone of this record (one
+    /// per request), so a repeat 429 on the same launch — however many
+    /// requests race it — bad-marks at most once per *strength*, and only
+    /// ever escalates (60s rate-limited → 6h exhausted), never re-marks at
+    /// the same or a weaker level (#8699 AC2).
+    bad_marked: Arc<AtomicU64>,
     /// Shared with every clone of this record so a per-request tally lands in
     /// the one instance the launch owns.
     usage: Arc<Mutex<Usage>>,
@@ -276,7 +278,7 @@ impl std::fmt::Debug for Record {
             .field("open", &self.open)
             .field("pool_account", &self.pool_account)
             .field("model_class", &self.model_class)
-            .field("bad_marked", &self.bad_marked.load(Ordering::Relaxed))
+            .field("bad_marked", &(self.bad_marked.load(Ordering::Relaxed) > 0))
             .field("usage", &usage)
             .finish()
     }
@@ -301,7 +303,7 @@ impl Record {
             pool_account: None,
             workspace_root: None,
             model_class: None,
-            bad_marked: Arc::new(AtomicBool::new(false)),
+            bad_marked: Arc::new(AtomicU64::new(0)),
             usage: Arc::new(Mutex::new(Usage::default())),
         }
     }
@@ -347,15 +349,16 @@ impl Record {
         self.model_class.as_deref()
     }
 
-    /// Atomically flips this launch's bad-mark flag from unset to set,
-    /// returning `true` only for the caller that won the race. Every other
-    /// 429 on the same launch — concurrent or sequential — sees `false` and
-    /// does nothing, which is what makes "exactly one bad-mark per launch"
-    /// (#8699 AC2) true even under a racing pair of requests.
-    pub fn begin_bad_mark(&self) -> bool {
-        self.bad_marked
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+    /// Atomically raises this launch's bad-mark level to `cooldown_secs`
+    /// (`None` = unbounded), returning `true` only when that is strictly
+    /// stronger than anything this launch has already marked. A repeat 429
+    /// at the same or a weaker level — concurrent or sequential — sees
+    /// `false` and does nothing, so a racing pair marks once (#8699 AC2);
+    /// a later, stronger signal (a quota exhaustion after a bare 429) still
+    /// escalates rather than being dropped.
+    pub fn begin_bad_mark(&self, cooldown_secs: Option<u64>) -> bool {
+        let level = cooldown_secs.unwrap_or(u64::MAX).max(1);
+        self.bad_marked.fetch_max(level, Ordering::SeqCst) < level
     }
 
     /// Add one request/response pair's byte counts to this launch's running
@@ -403,7 +406,7 @@ impl Record {
                 .map_or_else(|| "none".to_string(), marker_value),
             usage.request_bytes,
             usage.response_bytes,
-            self.bad_marked.load(Ordering::SeqCst),
+            self.bad_marked.load(Ordering::SeqCst) > 0,
         );
         for (name, value) in &usage.headers {
             line.push_str(&format!(" {}={}", marker_value(name), marker_value(value)));
