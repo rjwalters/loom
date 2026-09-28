@@ -130,8 +130,11 @@ triggers:
   is re-estimated immediately.
 - **Every 5 minutes** (the collector's snapshot pass): each managed repo's
   review-label listings (ETag-cached, so an unchanged listing is free), at
-  most 8 `pulls/{n}` reads for PRs that left review, a history reload, and a
-  refresh of every live estimate.
+  most 8 forge reads (`pulls/{n}` for PRs that left review, `issues/{n}` for
+  issues whose outcome only the issue can settle — anything over the budget is
+  retried next pass), a history reload, and a refresh of every live estimate.
+  The estimation step runs on a blocking thread behind a `catch_unwind`, so an
+  ETA failure costs only ETA and never the observability collector.
 
 An unchanged estimate is refreshed every `refreshSecs` (300); a changed stage,
 rework count or refusal reason emits at once; a series is capped at 20
@@ -152,17 +155,35 @@ days, one `.1` generation.
 | kind | resolves when | outcome |
 |---|---|---|
 | `finish` | the sweep's terminal event (exited or crashed) | `finished` |
-| `land` | the in-sweep merge phase, or the PR's merge time read when it leaves the review listings | `landed` |
-| `land` | the PR closed unmerged, or the sweep ended before any PR | `abandoned` |
+| `land` | the in-sweep merge phase, the PR's merge time read when it leaves the review listings, or the issue closing as **completed** | `landed` |
+| `land` | the issue closing as **not planned** | `abandoned` |
 
 Each outcome carries `error_sec` (`actual − p50`), `covered`
 (`p25 ≤ actual ≤ p75`), `pinball_loss_sec`
 (`Σ ρ_q(actual − q̂)` over q = .25, .5, .75), the horizon bucket of the
 predicted p50, and the per-stage actuals against each stage's predicted
 quartiles. `abandoned` outcomes and outcomes of refusals are counted but have
-no error fields: absent is never zero. An issue closed as not planned without
-a PR, and an issue closed as completed without a PR, are not detected yet;
-their pending estimates expire after 30 days.
+no error fields: absent is never zero.
+
+**Nothing else is an outcome.** A PR closed unmerged and a sweep that ended
+before any PR are *not* abandonments — a replacement PR or a later sweep
+usually lands the same issue — so each queues one `issues/{n}` read and the
+verdict comes from the issue's own `state` / `state_reason`. While the issue
+stays open the estimates stay pending: the join is on `(repo, issue, kind)`,
+so the eventual landing scores them, and only a 30-day expiry drops them.
+
+**A reopen starts a new series.** The first outcome stands: when an estimate
+resolves, every estimate of that series emitted *after* the outcome instant
+(the tail of a late `pulls_read` / `issues_read`) is dropped unscored, so a
+second landing can never score the first landing's leftovers.
+
+**No read is ever lost.** A PR that leaves review and an issue that needs a
+state read stay queued in the tracker and are re-offered every pass until they
+are answered, so a read that did not fit the per-pass budget or that failed is
+retried rather than dropped. An item with an outstanding check gets **no**
+`land` estimate meanwhile — a merge train larger than the budget resolves over
+the following passes instead of emitting phantom live ETAs for PRs that have
+already merged.
 
 ## Provenance
 

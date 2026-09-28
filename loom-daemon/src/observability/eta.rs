@@ -10,9 +10,16 @@
 //! - **Pass** ([`record`], on the collector's 5-minute snapshot cadence):
 //!   each managed repo's review-label listings (the ETag-cached REST
 //!   listing, where an unchanged listing is a free `304`), at most
-//!   [`PR_READ_BUDGET`] `pulls/{n}` reads for PRs that left review, history
-//!   reloaded, and every live item re-estimated. An unchanged estimate is
-//!   refreshed every `refreshSecs`.
+//!   [`FORGE_READ_BUDGET`] `pulls/{n}` + `issues/{n}` reads for items whose
+//!   outcome is still unknown, history reloaded, and every live item
+//!   re-estimated. An unchanged estimate is refreshed every `refreshSecs`.
+//!
+//! **Reads over the budget, and reads that fail, are not lost.** The tracker
+//! keeps every unanswered check queued and re-offers it on the next pass
+//! (`stage_dwell`'s "work over the budget waits for the next sample"), and
+//! refuses to emit a `land` estimate for an item whose check is outstanding —
+//! so a merge train landing more than [`FORGE_READ_BUDGET`] PRs in one pass
+//! resolves over the following passes instead of leaving phantom live ETAs.
 //!
 //! Enabled by default (`autonomous.eta.enabled`). The records are OTLP-only
 //! and go through the OTLP exporters' queues registered by
@@ -39,7 +46,7 @@ use crate::eta::config::EtaConfig;
 use crate::eta::journal::{self, JournalEntry};
 use crate::eta::score::EstimateSummary;
 use crate::eta::tracker::{
-    Effects, Emission, EstimateContext, ItemKey, PrState, PrView, Resolved, Tracker,
+    Effects, Emission, EstimateContext, IssueState, ItemKey, PrState, PrView, Resolved, Tracker,
 };
 use crate::eta::{Provenance, Registry, StageSamples};
 use crate::event_bus::EventBus;
@@ -49,8 +56,10 @@ use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 use crate::types::{Event, SweepKind};
 use crate::workspace_pool::WorkspacePool;
 
-/// `pulls/{n}` reads allowed per pass, across all repos.
-pub const PR_READ_BUDGET: usize = 8;
+/// Forge reads (`pulls/{n}` and `issues/{n}`) allowed per pass, across all
+/// repos. Checks that do not fit stay queued in the tracker and are retried
+/// on the next pass.
+pub const FORGE_READ_BUDGET: usize = 8;
 
 /// The review labels whose listings drive post-sweep stages.
 pub const REVIEW_LABELS: [&str; 3] = [
@@ -279,28 +288,21 @@ fn sink() -> Option<&'static dyn QueueSink> {
 }
 
 /// Journal, estimate and deliver the aftermath of one bus event.
-fn apply_event(effects: Effects, now: DateTime<Utc>) {
-    let (rows, emissions, outcomes, dry_run, root, host_id) = {
-        let mut guard = lock();
-        let Some(state) = guard.as_mut() else {
+async fn apply_event(effects: Effects, now: DateTime<Utc>) {
+    let (dry_run, root, host_id) = {
+        let guard = lock();
+        let Some(state) = guard.as_ref() else {
             return;
         };
-        let mut dirty = effects.dirty.clone();
-        dirty.sort();
-        dirty.dedup();
-        let emissions = estimate_locked(state, Some(&dirty), now);
-        (
-            effects.journal,
-            emissions,
-            effects.outcomes,
-            state.config.dry_run,
-            state.workspace_root.clone(),
-            state.host_id.clone(),
-        )
+        (state.config.dry_run, state.workspace_root.clone(), state.host_id.clone())
     };
-    append_journal(&root, &rows);
+    let mut dirty = effects.dirty;
+    dirty.sort();
+    dirty.dedup();
+    let emissions = estimate_isolated(Some(dirty), now).await;
+    append_journal(&root, &effects.journal);
     let loom = Provenance::current();
-    deliver(emissions, outcomes, &loom, &host_id, dry_run, sink());
+    deliver(emissions, effects.outcomes, &loom, &host_id, dry_run, sink());
 }
 
 /// The workspace root → slug, resolving and caching on first sight.
@@ -406,7 +408,7 @@ pub fn spawn_task(
                     _ => continue,
                 }
             };
-            apply_event(effects, now);
+            apply_event(effects, now).await;
         }
     }))
 }
@@ -457,7 +459,7 @@ fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
 }
 
 /// How PR `number` ended, from one `pulls/{n}` read. `None` when the read
-/// failed.
+/// failed: the tracker keeps the check queued and it is retried next pass.
 fn read_pr_state(root: &Path, slug: &str, number: u32) -> Option<PrState> {
     let pull = gh_json(root, &format!("repos/{slug}/pulls/{number}"))?;
     if let Some(at) = parse_time(pull["merged_at"].as_str()) {
@@ -468,6 +470,70 @@ fn read_pr_state(root: &Path, slug: &str, number: u32) -> Option<PrState> {
     } else {
         PrState::Open
     })
+}
+
+/// How issue `number` stands, from one `issues/{n}` read. A closed issue with
+/// no `state_reason` is a completion (GitHub's own default for closes made
+/// before the field existed). `None` when the read failed.
+fn read_issue_state(root: &Path, slug: &str, number: u32) -> Option<IssueState> {
+    let issue = gh_json(root, &format!("repos/{slug}/issues/{number}"))?;
+    if issue["state"] != "closed" {
+        return Some(IssueState::Open);
+    }
+    let at = parse_time(issue["closed_at"].as_str()).unwrap_or_else(Utc::now);
+    Some(match issue["state_reason"].as_str() {
+        Some("not_planned") => IssueState::ClosedNotPlanned(at),
+        _ => IssueState::ClosedCompleted(at),
+    })
+}
+
+/// One queued forge read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// `pulls/{n}`.
+    Pr(u32),
+    /// `issues/{n}`.
+    Issue(u32),
+}
+
+/// What a queued read answered.
+enum Answer {
+    /// From `pulls/{n}`.
+    Pr(PrState),
+    /// From `issues/{n}`.
+    Issue(IssueState),
+}
+
+/// Run `checks` (already inside the budget) on a blocking thread.
+fn run_checks(checks: Vec<(PathBuf, String, ItemKey, Check)>) -> Vec<(ItemKey, Answer)> {
+    checks
+        .into_iter()
+        .filter_map(|(root, slug, key, check)| match check {
+            Check::Pr(pr) => read_pr_state(&root, &slug, pr).map(|s| (key, Answer::Pr(s))),
+            Check::Issue(n) => read_issue_state(&root, &slug, n).map(|s| (key, Answer::Issue(s))),
+        })
+        .collect()
+}
+
+/// Estimate `keys` (all when `None`) off the async workers and behind a
+/// `catch_unwind`, so the Monte Carlo neither blocks a tokio worker nor can
+/// take the observability collector down with it: an ETA failure costs only
+/// ETA.
+async fn estimate_isolated(keys: Option<Vec<ItemKey>>, now: DateTime<Utc>) -> Vec<Emission> {
+    tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = lock();
+            guard
+                .as_mut()
+                .map_or_else(Vec::new, |state| estimate_locked(state, keys.as_deref(), now))
+        }))
+        .unwrap_or_else(|_| {
+            log::error!("eta: estimation panicked; no estimates this round (ETA only)");
+            Vec::new()
+        })
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// This host's history: the `sweep.outcome` journal of every managed root
@@ -554,6 +620,7 @@ pub(super) async fn record(
     let now = Utc::now();
     let mut effects = Vec::new();
     let mut checks = Vec::new();
+    let mut deferred = 0_usize;
     {
         let mut guard = lock();
         let Some(state) = guard.as_mut() else {
@@ -563,60 +630,94 @@ pub(super) async fn record(
         state.repo_ids.extend(repo_ids);
         for (root, slug, prs) in &repos {
             let e = state.tracker.on_listing(slug, prs, now, resolution_sec);
-            for (key, pr) in &e.pr_checks {
-                if checks.len() < PR_READ_BUDGET {
-                    checks.push((root.clone(), slug.clone(), key.clone(), *pr));
+            // Checks the tracker still wants answered: PRs that left review
+            // and issues whose outcome only the issue can settle. Anything
+            // past the budget is left queued in the tracker, which re-offers
+            // it next pass — never dropped.
+            let queued = e
+                .pr_checks
+                .iter()
+                .map(|(key, pr)| (key.clone(), Check::Pr(*pr)))
+                .chain(e.issue_checks.iter().map(|key| {
+                    let issue = key.issue;
+                    (key.clone(), Check::Issue(issue))
+                }));
+            for (key, check) in queued {
+                if checks.len() < FORGE_READ_BUDGET {
+                    checks.push((root.clone(), slug.clone(), key, check));
+                } else {
+                    deferred += 1;
                 }
             }
             effects.push(e);
         }
     }
 
-    let reads = tokio::task::spawn_blocking(move || {
-        checks
-            .into_iter()
-            .filter_map(|(root, slug, key, pr)| {
-                read_pr_state(&root, &slug, pr).map(|state| (key, state))
-            })
-            .collect::<Vec<(ItemKey, PrState)>>()
-    })
-    .await
-    .unwrap_or_default();
+    let answers = tokio::task::spawn_blocking(move || run_checks(checks))
+        .await
+        .unwrap_or_default();
 
-    let (rows, emissions, outcomes, dry_run, host_id, expired, pending) = {
+    let (rows, outcomes, dry_run, host_id, expired, dropped) = {
         let mut guard = lock();
         let Some(state) = guard.as_mut() else {
             return;
         };
-        for (key, pr_state) in reads {
-            effects.push(state.tracker.on_pr_resolved(&key, pr_state, now));
+        for (key, answer) in answers {
+            effects.push(match answer {
+                Answer::Pr(pr_state) => state.tracker.on_pr_resolved(&key, pr_state, now),
+                Answer::Issue(issue_state) => {
+                    state.tracker.on_issue_resolved(&key, issue_state, now)
+                }
+            });
         }
         let expired = state.tracker.expire(now);
         let all = crate::eta::tracker::merged(effects);
-        let emissions = estimate_locked(state, None, now);
         (
             all.journal,
-            emissions,
             all.outcomes,
             state.config.dry_run,
             state.host_id.clone(),
             expired,
-            state.tracker.pending().to_vec(),
+            state.tracker.drain_dropped(),
         )
     };
+    let emissions = estimate_isolated(None, now).await;
+    let pending = lock()
+        .as_ref()
+        .map(|state| state.tracker.pending().to_vec())
+        .unwrap_or_default();
     append_journal(workspace_root, &rows);
     let delivered = deliver(emissions, outcomes, &Provenance::current(), &host_id, dry_run, sink());
     write_pending(&pending_path(workspace_root), &pending);
+    if dropped.over_cap > 0 {
+        log::warn!(
+            "eta: dropped {} pending estimate(s) at the {} cap — the oldest, \
+             which are the long-horizon estimates accuracy scoring needs most",
+            dropped.over_cap,
+            crate::eta::tracker::MAX_PENDING
+        );
+    }
     log::info!(
-        "eta: pass emitted={} refused={} outcomes={} journaled={} pending={} expired={} invalid={}",
+        "eta: pass emitted={} refused={} outcomes={} journaled={} pending={} expired={} \
+         invalid={} reads={} deferred_reads={} orphaned={}",
         delivered.emitted,
         delivered.refused,
         delivered.outcomes,
         rows.len(),
         pending.len(),
         expired,
-        delivered.invalid
+        delivered.invalid,
+        reads_answered(&rows),
+        deferred,
+        dropped.orphaned
     );
+}
+
+/// How many of this pass's journal rows came from an answered forge read.
+fn reads_answered(rows: &[JournalEntry]) -> usize {
+    rows.iter()
+        .filter(|row| row.event == "pr.resolved" || row.event == "issue.resolved")
+        .count()
 }
 
 #[cfg(test)]

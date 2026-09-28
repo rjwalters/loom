@@ -5,8 +5,8 @@
 //! `ρ_q(u) = u · (q − 1[u < 0])`. Error, coverage and the buckets ride beside
 //! it for readability.
 //!
-//! An `abandoned` outcome (PR closed unmerged, issue closed not planned) is
-//! counted but never scored: its error fields are absent, not zero.
+//! An `abandoned` outcome (the issue closed as not planned) is counted but
+//! never scored: its error fields are absent, not zero.
 
 use super::explanation::Explanation;
 use super::{Kind, NoEstimateReason, Provenance, Stage};
@@ -21,7 +21,8 @@ pub enum OutcomeKind {
     Landed,
     /// `finish`: the sweep reached a terminal state (any result).
     Finished,
-    /// Closed unmerged or not planned. Counted, never scored.
+    /// `land`: the issue closed as not planned. Counted, never scored. A PR
+    /// closed unmerged is **not** this: the issue decides.
     Abandoned,
 }
 

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::eta::tests::{as_of, history_a, provenance};
-use crate::eta::tracker::EstimateContext;
+use crate::eta::tracker::{EstimateContext, IssueState};
 use crate::telemetry::trace::story_context;
 use std::sync::Mutex as StdMutex;
 
@@ -39,9 +39,20 @@ fn lifecycle(loom: Provenance) -> (Vec<Emission>, Vec<Resolved>) {
     tracker.on_dispatch(REPO, 9289, "sweep-issue-9289-1", as_of());
     let emissions = tracker.estimate(None, &ctx, as_of());
     tracker.on_phase(REPO, 9289, "curator", None, as_of() + chrono::Duration::seconds(60));
-    let outcomes = tracker
+    let mut outcomes = tracker
         .on_terminal(REPO, 9289, "exited", Some(0), as_of() + chrono::Duration::seconds(120))
         .outcomes;
+    // The sweep ended before any PR, so only the issue settles `land`: here
+    // it was closed as not planned (operator decision 4 on #9289).
+    outcomes.extend(
+        tracker
+            .on_issue_resolved(
+                &ItemKey::new(REPO, 9289),
+                IssueState::ClosedNotPlanned(as_of() + chrono::Duration::seconds(150)),
+                as_of() + chrono::Duration::seconds(180),
+            )
+            .outcomes,
+    );
     (emissions, outcomes)
 }
 

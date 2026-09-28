@@ -2,7 +2,7 @@
 
 use super::{as_of, history_a, provenance};
 use crate::eta::score::OutcomeKind;
-use crate::eta::tracker::{EstimateContext, ItemKey, PrState, PrView, Tracker};
+use crate::eta::tracker::{EstimateContext, IssueState, ItemKey, PrState, PrView, Tracker};
 use crate::eta::{Kind, NoEstimateReason, Registry, Stage};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
@@ -215,7 +215,8 @@ fn external_review_path_from_listings_to_merge() {
 }
 
 #[test]
-fn closed_unmerged_and_pre_pr_crash_are_abandoned_not_scored() {
+fn only_the_issue_closing_not_planned_is_abandoned() {
+    // Operator decision 4: abandoned means the issue closed as not planned.
     let mut h = Harness::new();
     h.tracker
         .on_listing(REPO, &[pr(601, 60, &["loom:review-requested"], -60)], t(0), 300);
@@ -224,10 +225,35 @@ fn closed_unmerged_and_pre_pr_crash_are_abandoned_not_scored() {
     let closed = h
         .tracker
         .on_pr_resolved(&ItemKey::new(REPO, 60), PrState::Closed, t(300));
-    assert_eq!(closed.outcomes.len(), 1);
-    assert_eq!(closed.outcomes[0].score.outcome, OutcomeKind::Abandoned);
-    assert_eq!(closed.outcomes[0].score.error_sec, None);
+    assert!(
+        closed.outcomes.is_empty(),
+        "a PR closed unmerged is not an outcome: the issue decides"
+    );
+    assert_eq!(closed.issue_checks, vec![ItemKey::new(REPO, 60)]);
+    let closed_row = &closed.journal[0];
+    assert_eq!(closed_row.event, "pr.resolved");
+    assert_eq!(closed_row.stage, Some(Stage::ReviewWait));
+    assert_eq!(
+        closed_row.duration_sec, None,
+        "the stage was cut short, not completed: never a history sample"
+    );
+    assert!(closed_row.history_sample("host-test").is_none());
 
+    let not_planned = h.tracker.on_issue_resolved(
+        &ItemKey::new(REPO, 60),
+        IssueState::ClosedNotPlanned(t(400)),
+        t(600),
+    );
+    assert_eq!(not_planned.outcomes.len(), 1);
+    assert_eq!(not_planned.outcomes[0].score.outcome, OutcomeKind::Abandoned);
+    assert_eq!(not_planned.outcomes[0].score.error_sec, None);
+    assert_eq!(not_planned.outcomes[0].outcome_source, "issues_read");
+    assert!(h.tracker.pending().is_empty());
+}
+
+#[test]
+fn a_pre_pr_crash_with_the_issue_open_stays_pending() {
+    let mut h = Harness::new();
     h.tracker.on_dispatch(REPO, 61, "sweep-issue-61-1", t(0));
     h.estimate(t(1));
     let crashed = h.tracker.on_terminal(REPO, 61, "crashed", None, t(900));
@@ -236,18 +262,171 @@ fn closed_unmerged_and_pre_pr_crash_are_abandoned_not_scored() {
         .iter()
         .filter(|o| o.estimate.kind == Kind::Finish)
         .collect();
-    let land: Vec<_> = crashed
-        .outcomes
-        .iter()
-        .filter(|o| o.estimate.kind == Kind::Land)
-        .collect();
     assert_eq!(finish.len(), 1);
     assert_eq!(finish[0].score.outcome, OutcomeKind::Finished);
     assert_eq!(finish[0].result.as_deref(), Some("crashed"));
     assert!(finish[0].score.error_sec.is_some(), "a crash still finished the sweep");
-    assert_eq!(land.len(), 1);
-    assert_eq!(land[0].score.outcome, OutcomeKind::Abandoned, "no fabricated land");
-    assert_eq!(land[0].score.error_sec, None);
+    assert!(
+        crashed
+            .outcomes
+            .iter()
+            .all(|o| o.estimate.kind == Kind::Finish),
+        "a sweep ending before any PR says nothing about landing"
+    );
+
+    // The check is queued and re-offered until the issue answers.
+    let pass = h.tracker.on_listing(REPO, &[], t(1200), 300);
+    assert_eq!(pass.issue_checks, vec![ItemKey::new(REPO, 61)]);
+    assert!(h.estimate(t(1200)).is_empty(), "no land estimate while unresolved");
+
+    let open = h
+        .tracker
+        .on_issue_resolved(&ItemKey::new(REPO, 61), IssueState::Open, t(1200));
+    assert!(open.outcomes.is_empty(), "still open: neither landed nor abandoned");
+    assert_eq!(h.tracker.pending().len(), 1, "the land estimate waits for the landing");
+    assert_eq!(h.tracker.pending()[0].kind, Kind::Land);
+    assert!(h.tracker.item_keys().is_empty(), "nothing left to observe");
+
+    // A later sweep lands it: `resolve` joins on repo, issue and kind.
+    h.tracker.on_dispatch(REPO, 61, "sweep-issue-61-2", t(2000));
+    h.tracker.on_phase(REPO, 61, "curator", None, t(2100));
+    h.tracker.on_phase(REPO, 61, "builder", Some(611), t(2200));
+    h.tracker.on_phase(REPO, 61, "judge", Some(611), t(2300));
+    let merged = h.tracker.on_phase(REPO, 61, "merge", Some(611), t(2400));
+    let landed: Vec<_> = merged
+        .outcomes
+        .iter()
+        .filter(|o| o.estimate.as_of == t(1))
+        .collect();
+    assert_eq!(landed.len(), 1, "the original estimate scored against the real landing");
+    assert_eq!(landed[0].score.outcome, OutcomeKind::Landed);
+}
+
+#[test]
+fn a_closed_pr_replaced_by_one_that_merges_lands() {
+    let mut h = Harness::new();
+    h.tracker
+        .on_listing(REPO, &[pr(701, 71, &["loom:review-requested"], -60)], t(0), 300);
+    h.estimate(t(0));
+    assert_eq!(h.tracker.pending().len(), 1);
+    h.tracker.on_listing(REPO, &[], t(300), 300);
+    h.tracker
+        .on_pr_resolved(&ItemKey::new(REPO, 71), PrState::Closed, t(300));
+    h.tracker
+        .on_issue_resolved(&ItemKey::new(REPO, 71), IssueState::Open, t(300));
+    assert_eq!(h.tracker.pending().len(), 1, "not abandoned: a replacement may land");
+
+    // The replacement PR for the same issue.
+    h.tracker
+        .on_listing(REPO, &[pr(702, 71, &["loom:pr"], 400)], t(600), 300);
+    h.tracker.on_listing(REPO, &[], t(900), 300);
+    let merged = h
+        .tracker
+        .on_pr_resolved(&ItemKey::new(REPO, 71), PrState::Merged(t(800)), t(900));
+    let first: Vec<_> = merged
+        .outcomes
+        .iter()
+        .filter(|o| o.estimate.as_of == t(0))
+        .collect();
+    assert_eq!(first.len(), 1, "the first PR's estimate scored against the landing");
+    assert_eq!(first[0].score.outcome, OutcomeKind::Landed);
+}
+
+#[test]
+fn an_issue_closed_as_completed_without_a_pr_lands() {
+    let mut h = Harness::new();
+    h.tracker.on_dispatch(REPO, 72, "sweep-issue-72-1", t(0));
+    h.estimate(t(1));
+    h.tracker.on_terminal(REPO, 72, "exited", Some(0), t(600));
+    let pass = h.tracker.on_listing(REPO, &[], t(900), 300);
+    assert_eq!(pass.issue_checks, vec![ItemKey::new(REPO, 72)]);
+    let completed = h.tracker.on_issue_resolved(
+        &ItemKey::new(REPO, 72),
+        IssueState::ClosedCompleted(t(700)),
+        t(900),
+    );
+    assert_eq!(completed.outcomes.len(), 1);
+    assert_eq!(completed.outcomes[0].score.outcome, OutcomeKind::Landed);
+    assert_eq!(completed.outcomes[0].score.actual_at, t(700));
+    assert_eq!(completed.outcomes[0].outcome_resolution_sec, Some(200));
+    assert!(completed.outcomes[0].score.error_sec.is_some(), "a landing is scored");
+}
+
+#[test]
+fn checks_over_the_budget_or_failing_are_retried_and_never_estimated_meanwhile() {
+    // A merge train: more simultaneous exits than one pass's read budget,
+    // plus a read that fails. Nothing may be dropped, and no item may keep
+    // receiving `land` estimates while its check is outstanding.
+    const BUDGET: usize = 8;
+    let mut h = Harness::new();
+    let listing: Vec<PrView> = (0..10)
+        .map(|i| pr(1000 + i, 100 + i, &["loom:pr"], -60))
+        .collect();
+    h.tracker.on_listing(REPO, &listing, t(0), 300);
+    assert_eq!(h.estimate(t(0)).len(), 10);
+
+    // All ten leave review in the same pass.
+    let gone = h.tracker.on_listing(REPO, &[], t(300), 300);
+    assert_eq!(gone.pr_checks.len(), 10, "every leaver is offered");
+    assert!(
+        h.estimate(t(300)).is_empty(),
+        "no estimate for an item whose check is outstanding"
+    );
+
+    // The caller's budget covers eight; the eighth read fails.
+    for (key, _) in gone.pr_checks.iter().take(BUDGET - 1) {
+        h.tracker
+            .on_pr_resolved(key, PrState::Merged(t(250)), t(300));
+    }
+    assert!(h.estimate(t(310)).is_empty());
+
+    // Next pass: the failed read and the two that did not fit come back.
+    let retry = h.tracker.on_listing(REPO, &[], t(600), 300);
+    let retried: Vec<u32> = retry.pr_checks.iter().map(|(k, _)| k.issue).collect();
+    assert_eq!(retried, vec![107, 108, 109], "failed and over-budget checks return");
+    assert!(h.estimate(t(600)).is_empty(), "still no phantom estimates");
+    for (key, _) in &retry.pr_checks {
+        h.tracker
+            .on_pr_resolved(key, PrState::Merged(t(550)), t(600));
+    }
+
+    let settled = h.tracker.on_listing(REPO, &[], t(900), 300);
+    assert!(settled.pr_checks.is_empty(), "all ten resolved over the passes");
+    assert!(h.tracker.pending().is_empty(), "every estimate got its outcome");
+    assert!(h.tracker.item_keys().is_empty());
+}
+
+#[test]
+fn estimates_emitted_after_the_landing_are_dropped_not_scored_by_a_reopen() {
+    let mut h = Harness::new();
+    h.tracker
+        .on_listing(REPO, &[pr(131, 13, &["loom:pr"], -60)], t(0), 300);
+    assert_eq!(h.estimate(t(0)).len(), 1);
+    // A refresh emitted while the PR was already merged (the read is late).
+    assert_eq!(h.estimate(t(300)).len(), 1);
+    assert_eq!(h.tracker.pending().len(), 2);
+    h.tracker.on_listing(REPO, &[], t(600), 300);
+    let merged = h
+        .tracker
+        .on_pr_resolved(&ItemKey::new(REPO, 13), PrState::Merged(t(200)), t(600));
+    assert_eq!(merged.outcomes.len(), 1, "only the estimate made before the landing");
+    assert_eq!(merged.outcomes[0].estimate.as_of, t(0));
+    assert!(
+        h.tracker.pending().is_empty(),
+        "the post-landing estimate is dropped, so a reopen cannot score it"
+    );
+    assert_eq!(h.tracker.drain_dropped().orphaned, 1);
+
+    // The reopen lands again: nothing stale is waiting for it.
+    h.tracker
+        .on_listing(REPO, &[pr(132, 13, &["loom:pr"], 700)], t(900), 300);
+    h.estimate(t(900));
+    h.tracker.on_listing(REPO, &[], t(1200), 300);
+    let again =
+        h.tracker
+            .on_pr_resolved(&ItemKey::new(REPO, 13), PrState::Merged(t(1100)), t(1200));
+    assert_eq!(again.outcomes.len(), 1, "a reopen starts a new series");
+    assert_eq!(again.outcomes[0].estimate.as_of, t(900));
 }
 
 #[test]

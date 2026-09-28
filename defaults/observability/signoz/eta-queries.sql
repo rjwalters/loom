@@ -18,8 +18,8 @@
 -- only rows where both are true, since an unpinned result cannot be
 -- attributed to a heuristic's code. Section 0 counts the excluded rows.
 --
--- Scored vs counted: `abandoned` outcomes (PR closed unmerged, sweep ended
--- with no PR) and outcomes of refusals carry no `loom.eta.error_sec`; they are
+-- Scored vs counted: `abandoned` outcomes (the issue closed as not planned)
+-- and outcomes of refusals carry no `loom.eta.error_sec`; they are
 -- counted by section 0 and excluded from every error, coverage and loss figure
 -- by `mapContains(attributes_number, 'loom.eta.error_sec')`.
 --

@@ -19,10 +19,34 @@
 //!
 //! # Outcomes
 //!
-//! `finish` resolves on the sweep's terminal bus event. `land` resolves on
-//! an in-sweep `merge`, or on the PR's merge time when it leaves the review
-//! listings; a PR closed unmerged, or a sweep that ended with no PR, is
-//! `abandoned`. Every pending estimate of the series is scored.
+//! `finish` resolves on the sweep's terminal bus event. `land` resolves on an
+//! in-sweep `merge`, or on the PR's merge time when it leaves the review
+//! listings. The three cases are the operator's (decision 4 on #9289):
+//!
+//! - **landed**: the PR merged, or the issue closed as **completed**.
+//! - **abandoned**: the issue closed as **not planned**.
+//! - Anything else — a PR closed unmerged, a sweep that ended before any PR —
+//!   is **not an outcome**. The issue usually stays open and lands later
+//!   through a replacement PR or a later sweep, so those estimates stay
+//!   pending (`resolve` joins on repo, issue and kind, so the eventual
+//!   landing scores them) until they expire after
+//!   [`PENDING_MAX_AGE_DAYS`].
+//!
+//! A reopen starts a new series: on resolution every estimate of the series
+//! emitted *after* the outcome instant is dropped unscored, so a second
+//! landing cannot score the first landing's tail.
+//!
+//! # Outstanding forge reads ([`Effects::pr_checks`], [`Effects::issue_checks`])
+//!
+//! A PR that leaves the review listings, and an issue whose sweep ended before
+//! any PR, need one forge read each to say how they ended. The tracker never
+//! assumes the caller made that read: a check stays queued on the item and is
+//! re-offered on **every** later listing pass until the answer arrives, so a
+//! read the caller dropped over its budget or that failed is simply retried
+//! (the [`crate::observability::ops::stage_dwell`] convention: work over the
+//! budget waits for the next sample). While a check is outstanding the item
+//! gets **no** `land` estimate — a merged PR must never keep receiving fresh
+//! estimates because its read did not fit in a pass.
 //!
 //! # Which items get which estimates
 //!
@@ -106,6 +130,13 @@ struct Item {
     observed: Vec<StageObservation>,
     in_review_listing: bool,
     landed: bool,
+    /// A `pulls/{n}` read is outstanding: the PR left the review listings and
+    /// nothing has said yet how it ended. Re-offered every pass until it is
+    /// answered; no `land` estimate meanwhile.
+    needs_pr_read: bool,
+    /// An `issues/{n}` read is outstanding: the sweep ended before any PR, or
+    /// the PR closed unmerged, so only the issue's own state decides.
+    needs_issue_read: bool,
     /// The last completed phase and when, to drop duplicate publications.
     last_phase: Option<(String, DateTime<Utc>)>,
     emit: BTreeMap<(Kind, String), EmitState>,
@@ -137,6 +168,19 @@ pub enum PrState {
     Open,
 }
 
+/// The state of an issue whose `land` outcome only the issue itself can
+/// settle (operator decision 4 on #9289: closed-as-completed lands, closed-as
+/// -not-planned is abandoned, open is neither).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueState {
+    /// Closed as completed, at.
+    ClosedCompleted(DateTime<Utc>),
+    /// Closed as not planned, at.
+    ClosedNotPlanned(DateTime<Utc>),
+    /// Still open: the work has not landed and was not abandoned.
+    Open,
+}
+
 /// One resolved estimate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resolved {
@@ -161,8 +205,12 @@ pub struct Effects {
     pub outcomes: Vec<Resolved>,
     /// Items whose state changed: estimate them now.
     pub dirty: Vec<ItemKey>,
-    /// PRs that left the review listings: read their state.
+    /// PRs whose state is still unknown: read `pulls/{n}`. Re-offered every
+    /// pass until [`Tracker::on_pr_resolved`] answers it.
     pub pr_checks: Vec<(ItemKey, u32)>,
+    /// Issues whose state is still unknown: read `issues/{n}`. Re-offered
+    /// every pass until [`Tracker::on_issue_resolved`] answers it.
+    pub issue_checks: Vec<ItemKey>,
 }
 
 impl Effects {
@@ -171,6 +219,7 @@ impl Effects {
         self.outcomes.extend(other.outcomes);
         self.dirty.extend(other.dirty);
         self.pr_checks.extend(other.pr_checks);
+        self.issue_checks.extend(other.issue_checks);
     }
 }
 
@@ -208,6 +257,20 @@ pub struct Tracker {
     items: BTreeMap<ItemKey, Item>,
     pending: Vec<EstimateSummary>,
     loom: Provenance,
+    /// Pending estimates dropped because they were emitted after their own
+    /// outcome (a late resolution's tail; a reopen must not score them).
+    orphaned: usize,
+    /// Pending estimates dropped by the [`MAX_PENDING`] cap.
+    cap_dropped: usize,
+}
+
+/// What [`Tracker::drain_dropped`] reports.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Dropped {
+    /// Emitted after their outcome instant, so never scored.
+    pub orphaned: usize,
+    /// Dropped by the [`MAX_PENDING`] cap.
+    pub over_cap: usize,
 }
 
 /// The stage entered when sweep phase `phase` completes, for the phases that
@@ -228,6 +291,16 @@ impl Tracker {
             items: BTreeMap::new(),
             pending: Vec::new(),
             loom,
+            orphaned: 0,
+            cap_dropped: 0,
+        }
+    }
+
+    /// Pending estimates dropped since the last call, and reset.
+    pub fn drain_dropped(&mut self) -> Dropped {
+        Dropped {
+            orphaned: std::mem::take(&mut self.orphaned),
+            over_cap: std::mem::take(&mut self.cap_dropped),
         }
     }
 
@@ -267,8 +340,9 @@ impl Tracker {
         row
     }
 
-    /// Move `key` to `next` at `at`, closing the current stage. Returns the
-    /// journal row for the boundary.
+    /// Move `key` to `next` at `at`, closing the current stage as a completed
+    /// one: an exactly-observed entry yields a `duration_sec` and a history
+    /// observation. Returns the journal row for the boundary.
     #[allow(clippy::too_many_arguments)]
     fn transition(
         &mut self,
@@ -279,6 +353,40 @@ impl Tracker {
         event: &str,
         in_sweep: bool,
         resolution_sec: i64,
+    ) -> JournalEntry {
+        self.transition_opts(key, next, at, source, event, in_sweep, resolution_sec, true)
+    }
+
+    /// [`Self::transition`], but the stage being left did **not** complete —
+    /// it ended by closure (a PR closed unmerged). The row names the stage it
+    /// leaves and carries no `entered_at`/`duration_sec`, so
+    /// [`JournalEntry::history_sample`] skips it and no truncated stage enters
+    /// the distributions.
+    #[allow(clippy::too_many_arguments)]
+    fn transition_unobserved(
+        &mut self,
+        key: &ItemKey,
+        next: Option<Stage>,
+        at: DateTime<Utc>,
+        source: AgeSource,
+        event: &str,
+        in_sweep: bool,
+        resolution_sec: i64,
+    ) -> JournalEntry {
+        self.transition_opts(key, next, at, source, event, in_sweep, resolution_sec, false)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+    fn transition_opts(
+        &mut self,
+        key: &ItemKey,
+        next: Option<Stage>,
+        at: DateTime<Utc>,
+        source: AgeSource,
+        event: &str,
+        in_sweep: bool,
+        resolution_sec: i64,
+        completed: bool,
     ) -> JournalEntry {
         let item = self.items.get(key).cloned().unwrap_or_default();
         let mut row = self.row(event, &item, at);
@@ -299,7 +407,7 @@ impl Tracker {
             .unwrap_or_else(|| unreachable!("caller created it"));
         if let Some(old) = item.stage.take() {
             row.stage = Some(old.stage);
-            if old.exact {
+            if old.exact && completed {
                 row.entered_at = Some(old.entered_at);
                 row.duration_sec = Some((at - old.entered_at).num_seconds().max(0));
                 item.observed.push(StageObservation {
@@ -523,27 +631,24 @@ impl Tracker {
             .get_mut(&key)
             .unwrap_or_else(|| unreachable!("checked above"));
         item.sweep_running = false;
-        let pre_pr = matches!(
-            item.stage.as_ref().map(|s| s.stage),
-            Some(Stage::SweepCurator | Stage::SweepBuilder)
-        ) || item.pr_number.is_none();
-        if item.landed || pre_pr {
-            if !item.landed {
-                // Ended before any PR: nothing is left to land.
-                effects.outcomes.extend(self.resolve(
-                    &key,
-                    Kind::Land,
-                    OutcomeKind::Abandoned,
-                    at,
-                    "sweep_terminal",
-                    Some(0),
-                    Some(class.to_string()),
-                ));
-            }
+        if item.landed {
             self.items.remove(&key);
-        } else {
-            effects.dirty.push(key);
+            return effects;
         }
+        // The sweep ending says nothing about whether the work lands: a
+        // crash, a budget or rate-limit exit, a hold and a Curator closing
+        // the issue all end a sweep, and all but the last usually land later
+        // (operator decision 4 on #9289). So queue the one read that can tell
+        // them apart and keep the `land` estimates pending meanwhile — never
+        // guess `abandoned` here.
+        if item.pr_number.is_none() {
+            item.needs_issue_read = true;
+        } else if !item.in_review_listing {
+            // A PR exists but no review listing covers it; one read says
+            // whether it merged, closed or is simply unlabelled.
+            item.needs_pr_read = true;
+        }
+        effects.dirty.push(key);
         effects
     }
 
@@ -568,6 +673,12 @@ impl Tracker {
             item.labels = pr.labels.clone();
             item.pr_created_at = pr.created_at;
             item.in_review_listing = true;
+            // An open PR under a review label answers both outstanding checks
+            // by itself: the PR is live, so it has neither merged nor closed,
+            // and the issue is being worked rather than settled. The PR
+            // leaving the listing later re-queues the read.
+            item.needs_pr_read = false;
+            item.needs_issue_read = false;
             let resolved = stage_from_pr_labels(&pr.labels);
             let before = (item.refused, item.stage.as_ref().map(|s| s.stage), item.rework_rounds);
             item.refused = resolved.err();
@@ -650,24 +761,49 @@ impl Tracker {
             effects.journal.push(row);
             effects.dirty.push(key);
         }
-        // Tracked PRs of this repo that left every review listing.
+        // Tracked PRs of this repo that left every review listing, plus every
+        // read still outstanding from an earlier pass. A check the caller
+        // could not make — over its read budget, timed out, non-2xx — is
+        // simply offered again here, so nothing is ever dropped permanently.
         for (key, item) in &mut self.items {
-            if key.repo == repo_key && item.in_review_listing && !seen.contains(key) {
+            if key.repo != repo_key {
+                continue;
+            }
+            if item.in_review_listing && !seen.contains(key) {
                 item.in_review_listing = false;
-                if let Some(pr) = item.pr_number {
-                    effects.pr_checks.push((key.clone(), pr));
+                if item.pr_number.is_some() {
+                    item.needs_pr_read = true;
+                } else {
+                    item.needs_issue_read = true;
                 }
+            }
+            match (item.needs_pr_read, item.pr_number) {
+                (true, Some(pr)) => effects.pr_checks.push((key.clone(), pr)),
+                // Nothing to read: fall back to the issue.
+                (true, None) => {
+                    item.needs_pr_read = false;
+                    item.needs_issue_read = true;
+                }
+                (false, _) => {}
+            }
+            if item.needs_issue_read {
+                effects.issue_checks.push(key.clone());
             }
         }
         effects
     }
 
-    /// The state of a PR that left the review listings.
+    /// The state of a PR that left the review listings. Answers the
+    /// outstanding [`Effects::pr_checks`] entry for `key`; until this is
+    /// called the check keeps being re-offered and the item gets no `land`
+    /// estimate.
     pub fn on_pr_resolved(&mut self, key: &ItemKey, state: PrState, now: DateTime<Utc>) -> Effects {
         let mut effects = Effects::default();
-        let Some(item) = self.items.get(key) else {
+        let Some(item) = self.items.get_mut(key) else {
             return effects;
         };
+        item.needs_pr_read = false;
+        let item = &*item;
         if item.landed {
             return effects;
         }
@@ -691,7 +827,10 @@ impl Tracker {
                 self.finish_item(key);
             }
             PrState::Closed => {
-                let mut row = self.transition(
+                // The stage did not complete, it was cut short by the
+                // closure: journal it raw so it never enters the stage
+                // distributions as if the stage had finished normally.
+                let mut row = self.transition_unobserved(
                     key,
                     None,
                     now,
@@ -702,16 +841,13 @@ impl Tracker {
                 );
                 row.raw = serde_json::json!({"pr": pr, "state": "closed"});
                 effects.journal.push(row);
-                effects.outcomes.extend(self.resolve(
-                    key,
-                    Kind::Land,
-                    OutcomeKind::Abandoned,
-                    now,
-                    "pulls_read",
-                    None,
-                    None,
-                ));
-                self.finish_item(key);
+                // A PR closed unmerged is not an abandonment: a replacement
+                // PR for the same issue is the common case. Only the issue's
+                // own state decides (operator decision 4 on #9289).
+                if let Some(item) = self.items.get_mut(key) {
+                    item.needs_issue_read = true;
+                }
+                effects.issue_checks.push(key.clone());
             }
             PrState::Open => {
                 if let Some(item) = self.items.get_mut(key) {
@@ -724,6 +860,87 @@ impl Tracker {
             }
         }
         effects
+    }
+
+    /// The state of an issue whose `land` outcome nothing else can settle:
+    /// the sweep ended before any PR, or the PR closed unmerged. Answers the
+    /// outstanding [`Effects::issue_checks`] entry for `key`.
+    ///
+    /// Per operator decision 4 on #9289: closed-as-completed **lands** at
+    /// `closed_at` (that is the "or the issue closed as completed" half of
+    /// `land`), closed-as-not-planned is **abandoned**, and an open issue is
+    /// neither — its estimates stay pending for the landing that is still to
+    /// come.
+    pub fn on_issue_resolved(
+        &mut self,
+        key: &ItemKey,
+        state: IssueState,
+        now: DateTime<Utc>,
+    ) -> Effects {
+        let mut effects = Effects::default();
+        let Some(item) = self.items.get_mut(key) else {
+            return effects;
+        };
+        item.needs_issue_read = false;
+        if item.landed {
+            return effects;
+        }
+        let item = item.clone();
+        let (state_name, at) = match state {
+            IssueState::ClosedCompleted(at) => ("closed_completed", Some(at)),
+            IssueState::ClosedNotPlanned(at) => ("closed_not_planned", Some(at)),
+            IssueState::Open => ("open", None),
+        };
+        let mut row = self.row("issue.resolved", &item, now);
+        row.left_at = at;
+        row.raw = serde_json::json!({"issue": key.issue, "state": state_name, "closed_at": at});
+        effects.journal.push(row);
+        match state {
+            IssueState::ClosedCompleted(at) => {
+                let late = (now - at).num_seconds().max(0);
+                effects.outcomes.extend(self.resolve(
+                    key,
+                    Kind::Land,
+                    OutcomeKind::Landed,
+                    at,
+                    "issues_read",
+                    Some(late),
+                    None,
+                ));
+                self.finish_item(key);
+            }
+            IssueState::ClosedNotPlanned(at) => {
+                let late = (now - at).num_seconds().max(0);
+                effects.outcomes.extend(self.resolve(
+                    key,
+                    Kind::Land,
+                    OutcomeKind::Abandoned,
+                    at,
+                    "issues_read",
+                    Some(late),
+                    None,
+                ));
+                self.finish_item(key);
+            }
+            // Still open and nothing is tracking it any more: forget the
+            // item, keep its estimates pending. `resolve` joins on repo,
+            // issue and kind, so the later PR or sweep that lands the work
+            // scores them.
+            IssueState::Open => self.retire_open_item(key),
+        }
+        effects
+    }
+
+    /// Drop an item that has nothing left to observe (no running sweep, no
+    /// PR under review), leaving its pending estimates in place.
+    fn retire_open_item(&mut self, key: &ItemKey) {
+        let keep = self
+            .items
+            .get(key)
+            .is_some_and(|i| i.sweep_running || i.in_review_listing);
+        if !keep {
+            self.items.remove(key);
+        }
     }
 
     fn finish_item(&mut self, key: &ItemKey) {
@@ -739,6 +956,13 @@ impl Tracker {
 
     /// Score and drop every pending `kind` estimate of `key` made at or
     /// before `actual_at`.
+    ///
+    /// Estimates of the same series made *after* `actual_at` are dropped
+    /// unscored: they describe a landing that had already happened (a late
+    /// `pulls_read`/`issues_read` resolution, up to a pass or more behind), so
+    /// scoring them against this outcome would be wrong — and leaving them
+    /// pending would let a **reopen**'s second landing score them, when the
+    /// rule is that the first outcome stands and a reopen starts a new series.
     #[allow(clippy::too_many_arguments)]
     fn resolve(
         &mut self,
@@ -755,15 +979,21 @@ impl Tracker {
             .get(key)
             .map(|i| i.observed.clone())
             .unwrap_or_default();
-        let (matching, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
-            .into_iter()
-            .partition(|p| {
-                p.kind == kind
-                    && p.issue == key.issue
-                    && p.repo.eq_ignore_ascii_case(&key.repo)
-                    && p.as_of <= actual_at
-            });
-        self.pending = rest;
+        let mut matching = Vec::new();
+        let mut keep = Vec::new();
+        for estimate in std::mem::take(&mut self.pending) {
+            let same_series = estimate.kind == kind
+                && estimate.issue == key.issue
+                && estimate.repo.eq_ignore_ascii_case(&key.repo);
+            if !same_series {
+                keep.push(estimate);
+            } else if estimate.as_of <= actual_at {
+                matching.push(estimate);
+            } else {
+                self.orphaned += 1;
+            }
+        }
+        self.pending = keep;
         matching
             .into_iter()
             .map(|estimate| {
@@ -792,6 +1022,9 @@ impl Tracker {
         if self.pending.len() > MAX_PENDING {
             let excess = self.pending.len() - MAX_PENDING;
             self.pending.drain(..excess);
+            // The oldest are the long-horizon estimates scoring needs most;
+            // the caller warns when this is non-zero.
+            self.cap_dropped += excess;
         }
         before - self.pending.len()
     }
@@ -808,6 +1041,12 @@ impl Tracker {
             return None;
         }
         if kind == Kind::Land && item.landed {
+            return None;
+        }
+        if kind == Kind::Land && (item.needs_pr_read || item.needs_issue_read) {
+            // A read is outstanding: the PR may already have merged, so a
+            // fresh `land` estimate here would be a phantom live ETA. Wait
+            // for the answer instead (it is retried every pass).
             return None;
         }
         let current = if let Some(reason) = item.refused {
