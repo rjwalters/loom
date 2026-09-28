@@ -141,8 +141,9 @@ function better(a: HostRow, b: HostRow): boolean {
 }
 
 /** Fold every non-offline host's rows into one item per issue, ordered by
- * state, then `loom:urgent`, then oldest issue first — the same tiebreaks the
- * daemon's own comparator uses after workspace priority. */
+ * state, then starred (`loom:operator-priority`, #9244) first, then oldest
+ * issue first — the daemon's own comparator puts starred work ahead of
+ * everything, and `loom:urgent` no longer orders anything. */
 export function mergeFleetQueue(
   summaries: readonly HostQueueSummary[],
   sweeps: readonly ActiveSweep[],
@@ -189,7 +190,8 @@ export function mergeFleetQueue(
 function compareItems(a: FleetQueueItem, b: FleetQueueItem): number {
   const byState = STATE_RANK[a.state] - STATE_RANK[b.state];
   if (byState !== 0) return byState;
-  if (a.primary.row.urgent !== b.primary.row.urgent) return a.primary.row.urgent ? -1 : 1;
+  const aStarred = a.primary.row.operator_priority === true;
+  if (aStarred !== (b.primary.row.operator_priority === true)) return aStarred ? -1 : 1;
   const aCreated = Date.parse(a.primary.row.created_at ?? "");
   const bCreated = Date.parse(b.primary.row.created_at ?? "");
   const aKey = Number.isFinite(aCreated) ? aCreated : Infinity;

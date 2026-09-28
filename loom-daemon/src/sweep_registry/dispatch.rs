@@ -2586,6 +2586,7 @@ impl SweepRegistry {
             // get_sweep_status responses disambiguate this repo's issue #N from
             // another managed repo's identically-numbered issue.
             repo: Some(self.config.workspace_root.display().to_string()),
+            overflow: false,
         };
         self.entries.insert(sweep_id.clone(), info);
 
@@ -2781,6 +2782,7 @@ impl SweepRegistry {
             effort: effort.filter(|e| !e.is_empty()).map(String::from),
             depends_on: None,
             repo: Some(self.config.workspace_root.display().to_string()),
+            overflow: false,
         };
         self.entries.insert(sweep_id.clone(), info);
 

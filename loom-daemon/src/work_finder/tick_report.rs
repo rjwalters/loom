@@ -213,6 +213,13 @@ pub struct TickReport {
     /// and within THIS tick their deferral is handed straight to the next
     /// candidate, which is another repo's work.
     pub deferred_repo_cap: usize,
+    /// The subset of [`dispatched`](Self::dispatched) admitted through the
+    /// `loom:operator-priority` overflow slot (#9244): a starred issue that
+    /// only the global and/or per-repo cap refused, dispatched as this host's
+    /// single over-limit sweep. At most one per tick, and none while an
+    /// earlier overflow sweep is still live. See
+    /// [`operator_priority::OverflowSlot`](super::operator_priority::OverflowSlot).
+    pub dispatched_overflow: usize,
     /// Per-issue outcomes behind the counters above (Issue #8852), recorded
     /// by the multi-workspace tick only. See [`ready_queue`](super::ready_queue).
     pub queue: Vec<ready_queue::TickQueueRow>,

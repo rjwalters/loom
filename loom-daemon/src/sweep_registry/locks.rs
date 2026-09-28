@@ -959,6 +959,7 @@ impl SweepRegistry {
                         // Owning workspace root, stamped for multi-repo
                         // disambiguation (#3929).
                         repo,
+                        overflow: false,
                     },
                 );
                 crate::observability::lifecycle::execution_adopted(
@@ -1044,6 +1045,7 @@ impl SweepRegistry {
                         // Owning workspace root, stamped for multi-repo
                         // disambiguation (#3929).
                         repo,
+                        overflow: false,
                     },
                 );
                 admitted += 1;
@@ -1150,6 +1152,7 @@ impl SweepRegistry {
                     effort: None,
                     depends_on: None,
                     repo: Some(self.config.workspace_root.display().to_string()),
+                    overflow: false,
                 },
             );
             adopted += 1;

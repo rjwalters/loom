@@ -194,6 +194,7 @@ mod tests {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         };
         registry.entries.insert(entry.sweep_id.clone(), entry);
         let registry = Arc::new(Mutex::new(registry));

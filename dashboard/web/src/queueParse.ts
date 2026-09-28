@@ -48,6 +48,9 @@ export function parseQueueRow(value: unknown): QueueRow | undefined {
   if (tier !== undefined) row.tier = tier;
   const detail = str(value.detail);
   if (detail !== undefined) row.detail = detail;
+  if (value.operator_priority === true) row.operator_priority = true;
+  const starredAt = str(value.operator_priority_at);
+  if (starredAt !== undefined) row.operator_priority_at = starredAt;
   return row;
 }
 

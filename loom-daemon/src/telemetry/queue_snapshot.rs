@@ -62,7 +62,17 @@ pub struct QueueSnapshotRow {
     pub visibility: RepoVisibility,
     pub issue: u32,
     pub workspace_priority: u32,
+    /// Deprecated (#9244): always `false`. `loom:urgent` no longer affects
+    /// dispatch order; kept on the wire for one release.
     pub urgent: bool,
+    /// Whether the issue is starred (`loom:operator-priority`, #9244), which
+    /// sorts it ahead of all other work.
+    #[serde(default)]
+    pub operator_priority: bool,
+    /// When it was starred (RFC 3339), when known. Absent for an unstarred
+    /// issue, or a starred one ordered by its `created_at` fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_priority_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     /// The `tier:*` label, which is informational only and does not affect

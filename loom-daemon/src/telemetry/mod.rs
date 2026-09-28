@@ -1242,6 +1242,12 @@ pub struct ManagedRepoEntry {
     /// `Private`, never `Public`.
     #[serde(default)]
     pub visibility: RepoVisibility,
+    /// The repo's cross-repo dispatch priority tier from the machine-level
+    /// workspace registry (`Workspace.priority`, lower dispatches first;
+    /// #9244, loom-ui#153). Absent for a root that is not a registered
+    /// workspace (the empty-registry cwd fallback) and on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
 }
 
 /// One entry of a [`SessionSummaryRecord`]'s tool-call histogram: how many

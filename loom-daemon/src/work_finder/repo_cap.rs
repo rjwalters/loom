@@ -157,7 +157,7 @@ impl RepoCap {
     /// occupancy entry counts as zero — fail open toward dispatching, never
     /// toward stranding a workspace the caller forgot to seed.
     #[must_use]
-    fn at_cap(&self, idx: usize) -> bool {
+    pub(super) fn at_cap(&self, idx: usize) -> bool {
         self.cap
             .is_some_and(|cap| self.occupancy.get(idx).copied().unwrap_or(0) >= cap)
     }
@@ -272,6 +272,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
         saturation_held,
         preferred_slice,
         None,
+        &[],
     )
 }
 

@@ -39,17 +39,39 @@ fn tier_of(item: &WorkItem) -> Option<String> {
     item.labels.iter().find(|l| l.starts_with("tier:")).cloned()
 }
 
-/// The ordering keys for `item` in workspace `idx`.
+/// The ordering keys for `item` in workspace `idx`. `repo_red` is whether
+/// that repo's `main` is verified red this tick (#9244): the red-main-fix key
+/// is set only then, so a marker on a green repo gets no boost. Every
+/// candidate key — the view's and dispatch's — is built here, so the two
+/// cannot drift.
 #[must_use]
-pub fn key_of(idx: usize, workspace_priority: u32, item: &WorkItem) -> PriorityCandidate {
+pub fn key_of(
+    idx: usize,
+    workspace_priority: u32,
+    item: &WorkItem,
+    repo_red: bool,
+) -> PriorityCandidate {
     PriorityCandidate {
         workspace_idx: idx,
         workspace_priority,
-        urgent: item.is_urgent(),
+        operator_priority: item.is_operator_priority(),
+        operator_priority_at: item.operator_priority_at.clone(),
+        main_red_fix: repo_red && item.is_main_red_fix(),
         created_at: item.created_at.clone(),
         number: item.number,
         complexity: None,
     }
+}
+
+/// Stable-sort one workspace's ready items by the #9244 lane keys alone
+/// (starred, starred-at, red-main fix): starred and fix issues move to the
+/// front, and every other item keeps its listing order. The single-workspace
+/// tick's ordering; the multi-workspace tick sorts by the full
+/// [`candidate_cmp`].
+pub fn sort_lanes(items: &mut [WorkItem], repo_red: bool) {
+    items.sort_by(|a, b| {
+        super::ordering::lane_cmp(&key_of(0, 0, a, repo_red), &key_of(0, 0, b, repo_red))
+    });
 }
 
 /// Record a ready issue the tick dropped before the global sort.
@@ -157,7 +179,12 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
                 repo: repo_name(r.key.workspace_idx, roots),
                 issue: r.key.number,
                 workspace_priority: r.key.workspace_priority,
-                urgent: r.key.urgent,
+                // Deprecated by #9244: `loom:urgent` no longer orders anything.
+                // Kept on the wire, always false, for one release.
+                urgent: false,
+                operator_priority: r.key.operator_priority,
+                operator_priority_at: r.key.operator_priority_at.clone(),
+                main_red_fix: r.key.main_red_fix,
                 created_at: r.key.created_at.clone(),
                 tier: r.tier.clone(),
                 disposition,

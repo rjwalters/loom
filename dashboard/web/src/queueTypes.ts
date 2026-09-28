@@ -6,7 +6,7 @@
  * re-declares the rest of the snapshot (no Workers types in a browser bundle).
  *
  * On `/public/fleet-state` a private row keeps only `rank`, `visibility`,
- * `urgent`, `disposition`, `state` and `reason`, so every repo-identifying
+ * `urgent`, `operator_priority`, `disposition`, `state` and `reason`, so every repo-identifying
  * field here is optional.
  */
 
@@ -21,7 +21,13 @@ export interface QueueRow {
   visibility: "public" | "private";
   issue?: number;
   workspace_priority?: number;
+  /** Deprecated (#9244): always false. `loom:urgent` no longer orders work. */
   urgent: boolean;
+  /** Starred (`loom:operator-priority`, #9244): dispatched ahead of all other
+   * work. Absent when not starred or from an older daemon. */
+  operator_priority?: boolean;
+  /** When it was starred, when the daemon knows. */
+  operator_priority_at?: string;
   /** The issue's own `createdAt` — the only age the daemon knows. */
   created_at?: string;
   /** Informational `tier:*` label; the daemon does not order by it. */

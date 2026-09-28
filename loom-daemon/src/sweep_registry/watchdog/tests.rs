@@ -906,28 +906,7 @@ fn midbuild_ignores_running_sweeps() {
     // A still-Running sweep (not terminal) is never a mid-build-death
     // candidate, even with a dirty worktree.
     make_quiet_dirty_git_worktree(&mut reg, ws, 6006);
-    reg.entries.insert(
-        "sweep-issue-6006-live".to_string(),
-        SweepInfo {
-            pgid: None,
-            sweep_id: "sweep-issue-6006-live".to_string(),
-            kind: SweepKind::Issue(6006),
-            pid: 2_147_483_640,
-            token_name: "unknown".into(),
-            runtime: "unknown".into(),
-            runtime_source: None,
-            log_path: reg.compute_log_path(6006),
-            idempotency_key: None,
-            started_at: Utc::now(),
-            state: SweepState::Running,
-            latest_phase: None,
-            pr_number: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            repo: None,
-        },
-    );
+    insert_running_with_pid_at(&mut reg, 6006, 1, 2_147_483_640, Utc::now());
 
     assert_eq!(reg.midbuild_watchdog_once(), 0, "a Running sweep is not a mid-build death");
     assert!(!reg.midbuild_retried.contains(&6006));
@@ -1505,6 +1484,7 @@ fn watchdog_latch_pruned_on_entry_gc() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     reg.watchdog_progressed.insert(sid.clone());

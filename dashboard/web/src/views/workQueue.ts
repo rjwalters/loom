@@ -134,7 +134,10 @@ function waitingCell(row: QueueRow, now: Date): HTMLElement {
 
 function flags(row: QueueRow): HTMLElement | null {
   const parts: HTMLElement[] = [];
-  if (row.urgent) parts.push(el("span", { class: "badge badge--urgent", title: "loom:urgent" }, "urgent"));
+  if (row.operator_priority) {
+    const title = row.operator_priority_at ? `loom:operator-priority since ${formatAbsolute(row.operator_priority_at)}` : "loom:operator-priority";
+    parts.push(el("span", { class: "badge badge--starred", title }, "starred"));
+  }
   if (row.tier) {
     parts.push(el("span", { class: "queue__tier", title: "Informational: the daemon does not order by tier" }, row.tier));
   }

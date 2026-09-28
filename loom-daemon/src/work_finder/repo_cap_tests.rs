@@ -84,6 +84,7 @@ fn tick_capped<const N: usize>(
         false,
         None,
         max_concurrent_per_repo,
+        &[],
     )
 }
 
@@ -354,10 +355,8 @@ fn shape_queue_never_adds_or_drops_a_candidate() {
     let cand = |idx: usize, number: u32| PriorityCandidate {
         workspace_idx: idx,
         workspace_priority: 0,
-        urgent: false,
-        created_at: None,
         number,
-        complexity: None,
+        ..PriorityCandidate::default()
     };
     let candidates = vec![cand(0, 1), cand(1, 2), cand(0, 3)];
     let mut report = TickReport::default();
@@ -476,10 +475,8 @@ fn a_missing_occupancy_entry_fails_open() {
     let cand = PriorityCandidate {
         workspace_idx: 7,
         workspace_priority: 0,
-        urgent: false,
-        created_at: None,
         number: 1,
-        complexity: None,
+        ..PriorityCandidate::default()
     };
     let mut report = TickReport::default();
     assert!(!cap.defer(&cand, &mut report), "an unseeded workspace is not at any cap");

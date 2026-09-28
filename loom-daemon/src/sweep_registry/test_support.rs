@@ -569,6 +569,7 @@ pub(crate) fn insert_clean_exit_running(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     registry.children.insert(sweep_id.clone(), child);
@@ -686,6 +687,7 @@ pub(crate) fn insert_running_at(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     sweep_id
@@ -726,6 +728,7 @@ pub(crate) fn insert_running_with_pid_at(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     sweep_id
@@ -790,6 +793,7 @@ pub(crate) fn insert_dead_running_at(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     sweep_id
@@ -1276,6 +1280,7 @@ pub(crate) fn insert_terminal_issue(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 }
@@ -2352,6 +2357,7 @@ pub(crate) fn insert_dead_running_entry(reg: &mut SweepRegistry, issue: u32, swe
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 }

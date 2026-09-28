@@ -115,6 +115,7 @@ mod locks;
 mod model;
 mod noop_cooldown;
 mod outcome_journal;
+mod overflow;
 mod pool_hold_broadcast;
 pub(crate) mod private_dispatch;
 mod prless_retry;
@@ -2013,9 +2014,7 @@ mod tests {
             runtime_source: None,
             log_path: PathBuf::from(".loom/logs/sweep-issue-42.log"),
             idempotency_key: Some("operator-key".to_string()),
-            started_at: chrono::DateTime::parse_from_rfc3339("2026-06-05T10:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            started_at: "2026-06-05T10:00:00Z".parse().unwrap(),
             state: SweepState::Running,
             latest_phase: Some("builder".to_string()),
             pr_number: Some(456),
@@ -2023,6 +2022,7 @@ mod tests {
             effort: Some("xhigh".to_string()),
             depends_on: None,
             repo: None,
+            overflow: false,
         };
         let json = serde_json::to_value(vec![info]).unwrap();
         let expected = serde_json::json!([{

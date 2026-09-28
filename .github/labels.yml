@@ -234,6 +234,22 @@
   description: "Engine stops work on this item; human is the only transition out. Sweep/shepherd do not skip it."
   color: "EA580C"  # orange-600 - operator-action signal, one shade darker than operator-only
 
+# loom:operator-priority (#9244) is the operator's "star": land this ASAP,
+# ahead of all other work, fleet-wide. It is NOT loom:operator (the hold
+# above) and it is NOT a hold of any kind -- nothing may treat a
+# `loom:operator` / `loom:operator-` prefix match as a hold without excluding
+# this label by name (see loom-daemon pr_latency::hold_labels). The daemon's
+# work finder sorts starred issues first (by when they were starred), lists
+# them even outside loom:issue (triage, curated, or unlabelled; the sweep then
+# starts from Curator), and may run one starred sweep over the concurrency
+# cap. Skip/park labels still win: a starred issue carrying loom:blocked,
+# loom:operator-only, loom:operator-decision or loom:operator is never
+# dispatched. Applied by: humans (directly or via the loom-ui star). Removed
+# by: humans.
+- name: loom:operator-priority
+  description: "Land ASAP, ahead of all other work (not a hold). Applied by: humans, directly or via loom-ui star."
+  color: "CA8A04"  # yellow-600 - matches loom-ui's star
+
 # Epic Labels
 - name: loom:epic
   description: Multi-phase epic proposal (decomposes into implementation issues)
