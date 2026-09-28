@@ -155,6 +155,7 @@ in ordinary CI, with no Docker, network or credential:
 | Every image is digest-pinned and byte-identical to the casting, and its version tag is still the one this README lists | Catches a floating tag, a hand-edited render, and a stale version table |
 | The histogram helper's SHA-256 check runs *before* `tar -xzf`, pins both architectures, refuses unknown ones, and matches the digests above | It is the one component fetched at start-up rather than pinned by digest, so ordering is the whole integrity property |
 | The documented 3.75 GiB steady-state / 768 MiB transient budget is the sum of the rendered `mem_limit`s, and every service caps logs at three 10 MiB files | Sizing figures an operator provisions a host against, and the disk claim below |
+| Every ClickHouse `system.*_log` keeps a `DELETE` TTL, and `metric_log` uses the transposed schema, set by the casting's declarative patch | The wide upstream `metric_log`'s TTL merge does not fit the 2 GiB cap, so it silently stops expiring (see "ClickHouse self-telemetry" below) |
 
 It deliberately asserts nothing about a *running* deployment: readiness, storage
 and retention stay `evidence.md`'s job.
@@ -353,6 +354,36 @@ background merges and is not an exact deletion deadline or a disk quota.
 Accounts, dashboards and settings in PostgreSQL persist independently.
 Container stdout/stderr rotate separately at three 10 MiB files per service;
 ClickHouse's own system tables and metadata also consume storage.
+
+### ClickHouse self-telemetry
+
+ClickHouse's own `system.*_log` tables, not Loom's signals, dominate this
+trial's disk: about 480 MiB against about 2.5 MiB of Loom data on a 2.5-day
+soak (`evidence.md`, 2026-09-28). Upstream renders a 1-day TTL for each of
+them, which ClickHouse applies only during merges. The casting switches
+`system.metric_log` to ClickHouse's `transposed_with_wide_view` schema
+because the default 1,552-column table's merge memory grows with input parts
+times columns. Under the 2 GiB cap, its TTL-applying merge failed thousands of
+times an hour, and parts outlived their TTL. `system.metric_log` stays
+queryable as a view with the same columns.
+
+A deployment first started from an older render keeps its wide table. The
+config is a single-file bind mount, so a plain `up -d` does not pick up a
+re-render: recreate the ClickHouse container (its volume persists). On start
+it renames the old table to `system.metric_log_0`, stuck parts included. That
+table holds ClickHouse's own diagnostics only, no Loom signal, so drop it:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml up -d --wait --wait-timeout 1800 --force-recreate --no-deps loom-signoz-telemetrystore-clickhouse-0-0
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "DROP TABLE system.metric_log_0"
+```
+
+Check for merge failures when you check retention. A non-zero count means some
+table has stopped expiring:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT table, countIf(error != 0) failed_merges, countIf(error = 0) ok FROM system.part_log WHERE event_type = 'MergeParts' GROUP BY table HAVING failed_merges > 0"
+```
 
 Use the same `--env-file` and `-f` arguments for every Compose command.
 `docker compose ... stop` preserves all data.
