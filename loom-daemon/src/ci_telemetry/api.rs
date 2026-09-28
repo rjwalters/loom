@@ -218,6 +218,10 @@ impl GhCliApi {
         })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // #9251: per-caller accounting (a local write, never a forge call).
+        let base = crate::forge_listing::parse_http_response(&stdout);
+        let exit_ok = output.status.success();
+        crate::forge_call_stats::record_gh_api("ci_telemetry", base.as_ref(), exit_ok, &stderr);
         match parse_raw(&stdout) {
             Some(response) => classify(response, path),
             None if crate::rate_limit_breaker::indicates_rate_limit(&stderr) => {

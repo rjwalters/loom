@@ -1963,6 +1963,11 @@ pub mod review_conflict;
 /// file-size ratchet rather than more inline logic here.
 mod pass_loop;
 
+/// The ETag-cached `loom:building` listing [`forge`] reconciles against — a
+/// sibling file per the file-size ratchet, attributed to `claim_reconciliation`
+/// in the #9251 forge-call accounting.
+mod building_listing;
+
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::work_finder::forge`] / [`crate::epic_supervisor::forge`]) — the
 /// decision logic above is the fully-covered surface; this module is a thin,
@@ -1972,10 +1977,10 @@ pub mod forge {
         apply_live_claim_veto, classify_lease_evidence, decide_anchor, decide_verdict,
         extract_latest_verdict_sha, most_recent_claim_activity_at, plan, plan_pr,
         resolve_lease_ttl_minutes, resolve_no_progress_grace_minutes, resolve_stale_hours,
-        verdict_anchoring_enabled, verdict_staleness_enabled, AnchorAction, BuildingIssue,
-        ClaimedPr, LeaseEvidence, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrComment,
-        PrReclaimReason, PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction,
-        VerdictKeepReason, VerdictKind, VerdictPr, VerdictReconcileStats, LEASE_MARKER_PREFIX,
+        verdict_anchoring_enabled, verdict_staleness_enabled, AnchorAction, ClaimedPr,
+        LeaseEvidence, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrComment, PrReclaimReason,
+        PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction, VerdictKeepReason,
+        VerdictKind, VerdictPr, VerdictReconcileStats, LEASE_MARKER_PREFIX,
         MAX_ISSUES_PER_WORKSPACE, VERDICT_HOLD_LABELS,
     };
     use crate::sweep_journal;
@@ -1985,30 +1990,7 @@ pub mod forge {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    fn list_building_issues(gh_bin: &Path, root: &Path) -> Result<Vec<BuildingIssue>> {
-        // ETag-cached REST listing (#4428): an unchanged claim set costs zero
-        // rate limit (304). `LOOM_REPO` precedence is handled inside; the
-        // `pull_request` filter keeps the pre-#4428 issue-only semantics.
-        let rows = crate::forge_listing::list_issues_cached(
-            gh_bin,
-            Some(root),
-            None,
-            "loom:building",
-            "open",
-        )?;
-        Ok(rows
-            .into_iter()
-            .filter(|r| !r.is_pull_request)
-            .map(|r| BuildingIssue {
-                number: r.number,
-                updated_at: r
-                    .updated_at
-                    .as_deref()
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc)),
-            })
-            .collect())
-    }
+    use super::building_listing::list_building_issues;
 
     /// Does an OPEN pull request exist for issue `issue`'s conventional branch
     /// (`feature/issue-<N>`, the name `worktree.sh` establishes)? Returns

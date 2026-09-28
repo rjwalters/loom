@@ -120,7 +120,8 @@ impl GhWorkSource {
     /// a poll where nothing changed costs zero rate limit (304). REST issue
     /// listings include PRs, so `pull_request`-marked rows are dropped.
     fn list_label(&self, label: &str) -> Result<Vec<WorkItem>> {
-        let rows = crate::forge_listing::list_issues_cached(
+        let rows = crate::forge_listing::list_issues_cached_as(
+            "work_finder",
             &self.gh_bin,
             self.cwd.as_deref(),
             self.repo.as_deref(),
