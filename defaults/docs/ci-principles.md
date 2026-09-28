@@ -71,12 +71,16 @@ the next person to add one will have an equally good argument.
      field's pinned value shape. A resync that also rewrote an installed
      surface leaves that surface in the diff.
    - *`ci.yml` block attribution* (#9065): one path covers ~25 jobs of which
-     three are required, so a base move's `ci.yml` hunks are attributed to
-     the job and `# component:` block they edit, read from the tip's own
-     workflow. A preamble edit, a structural deletion, an unparseable hunk,
-     or markers that disagree with the guard's component table all restore
-     the whole-file meaning. Nothing is skipped and no check's coverage
-     narrows — every gate still runs on every PR.
+     three are required, so a change set's `ci.yml` hunks are attributed to
+     the job and `# component:` block they edit, read from the workflow's own
+     text. **Both sides** are attributed, each against the tree its patch
+     diffs *to* — the base tip for the base move, the PR head for the PR's
+     own delta — and each independently, so one side's doubt never narrows
+     the other. A preamble edit, a structural deletion, an unparseable hunk,
+     a touched line past the file's end, or markers that disagree with the
+     guard's component table all restore the whole-file meaning on that side.
+     Nothing is skipped and no check's coverage narrows — every gate still
+     runs on every PR.
 
 ## What prompted this
 

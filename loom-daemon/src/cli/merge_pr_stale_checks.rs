@@ -269,7 +269,8 @@ fn warn_all(notices: &[String]) {
 ///     }
 ///   },
 ///   "fallbacks": {"Some Check": "why it has no evidence"},
-///   "workflow": "name: CI\non:\n…"
+///   "workflow": "name: CI\non:\n…",
+///   "pr_workflow": "name: CI\non:\n…"
 /// }
 /// ```
 ///
@@ -278,11 +279,15 @@ fn warn_all(notices: &[String]) {
 /// [`strip_validated_restamps`] the live path applies runs here, so a suite can
 /// drive the restamp validation end-to-end.
 ///
-/// `workflow` is the base tip's `.github/workflows/ci.yml` text, the one input
-/// #9065's `ci.yml` narrowing needs. Omit it and every base move gets
-/// [`CiScope::Unscoped`] — `ci.yml` as a whole-file global input, exactly as
-/// before — so the field is purely an opt-in for a suite that wants to drive
-/// the narrowing.
+/// `workflow` is the base tip's `.github/workflows/ci.yml` text and
+/// `pr_workflow` the PR head's — the two inputs #9065's `ci.yml` narrowing
+/// needs, one per side, each being the tree that side's patches diff *to*.
+/// Omit `workflow` and every base move gets [`CiScope::Unscoped`]; omit
+/// `pr_workflow` and so does `P`. Either way `ci.yml` stays a whole-file global
+/// input on that side, exactly as before, so both fields are purely an opt-in
+/// for a suite that wants to drive the narrowing. Attributing `P` also needs a
+/// `patch` on its `ci.yml` entry in `pr_files`; without one the side stays
+/// unscoped.
 fn scoped_from_json(v: &serde_json::Value) -> Option<ScopedEvidence> {
     if v.get("pr_files").is_none() && v.get("base_moves").is_none() {
         return None;
@@ -319,8 +324,15 @@ fn scoped_from_json(v: &serde_json::Value) -> Option<ScopedEvidence> {
             fallbacks.insert(ctx.clone(), why.as_str().unwrap_or("no reason given").to_string());
         }
     }
+    let pr_ci_scope = v
+        .get("pr_workflow")
+        .and_then(|s| s.as_str())
+        .map_or(CiScope::Unscoped, |text| {
+            workflow_scope::scope_for_files(&workflow_scope::parse(text), &pr_files)
+        });
     Some(ScopedEvidence {
         pr_delta: to_file_set(&pr_files),
+        pr_ci_scope,
         base_moves,
         fallbacks,
     })

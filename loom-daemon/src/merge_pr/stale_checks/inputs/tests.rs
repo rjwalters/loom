@@ -165,7 +165,7 @@ fn an_empty_base_move_is_fresh_for_every_required_check() {
     for ctx in REQUIRED_CONTEXTS {
         let specs = specs_for(ctx).unwrap_or_else(|| panic!("{ctx} must resolve"));
         assert_eq!(
-            composite_stale_reason(&specs, &FileSet::default(), &p, &CiScope::Unscoped),
+            composite_stale_reason(&specs, &FileSet::default(), &p, &CiScopes::unscoped()),
             None,
             "{ctx} must be fresh when the base did not move"
         );
@@ -417,7 +417,8 @@ fn a_composite_context_is_stale_when_any_component_is() {
     // main tightens the file-size baseline; the PR edits a Rust source file.
     let d = set(&["scripts/file-size-baseline.txt"]);
     let p = set(&["loom-daemon/src/lib.rs"]);
-    let (component, _) = composite_stale_reason(&specs, &d, &p, &CiScope::Unscoped).expect("stale");
+    let (component, _) =
+        composite_stale_reason(&specs, &d, &p, &CiScopes::unscoped()).expect("stale");
     assert_eq!(component, "File Size Ratchet");
 }
 
@@ -446,7 +447,7 @@ fn a_composite_context_is_not_stale_on_cross_component_terms() {
             .all(|pat| !glob_match(pat, "defaults/roles/curator.md")),
         "precondition: the moved gate does not read the PR's file"
     );
-    let stale = composite_stale_reason(&specs, &d, &p, &CiScope::Unscoped);
+    let stale = composite_stale_reason(&specs, &d, &p, &CiScopes::unscoped());
     assert!(stale.is_none(), "cross-component terms must not refuse: {stale:?}");
 }
 
@@ -466,4 +467,109 @@ fn every_spec_lists_the_ci_workflow_as_a_global_input() {
     for s in SPECS {
         assert!(s.global.contains(&CI_WORKFLOW), "{}: ci.yml must be a global input", s.context);
     }
+}
+
+// --- The `P`-side ci.yml narrowing (#9065) -----------------------------------
+
+/// `CiScopes` with only the named components on the `P` side and the base side
+/// left at the whole-file meaning.
+fn pr_scope(components: &[&str]) -> CiScopes {
+    CiScopes {
+        base: CiScope::Unscoped,
+        pr: CiScope::Scoped(components.iter().map(|c| (*c).to_string()).collect()),
+    }
+}
+
+#[test]
+fn a_pr_editing_an_unrelated_ci_yml_job_is_not_a_global_input_change() {
+    // The #9065 churn on the PRs that this very issue produces: `ci.yml` is in
+    // EVERY component's `G`, and `Conflict Marker Check` scans `**`, so a PR
+    // that so much as reformats the `backend-tests` block was stale against any
+    // base move at all — permanently, since `main` moves every ~11 min.
+    let d = set(&["loom-daemon/src/unrelated.rs"]);
+    let p = set(&[CI_WORKFLOW]);
+    let s = spec("Conflict Marker Check");
+
+    // Unscoped — the pre-narrowing meaning — refuses.
+    assert!(stale_reason(s, &d, &p).is_some());
+    // Attributed to a job no required context runs, it does not.
+    assert!(stale_reason_scoped(s, &d, &p, &pr_scope(&[])).is_none());
+}
+
+#[test]
+fn a_pr_editing_this_gates_own_ci_yml_block_is_still_stale() {
+    // The half that must NOT relax. The PR changed the rule this gate runs
+    // under, and `main` brought new subjects for that rule to judge — exactly
+    // clause 2, and the merged tree has never been judged that way.
+    let d = set(&["loom-daemon/src/unrelated.rs"]);
+    let p = set(&[CI_WORKFLOW]);
+    let s = spec("Conflict Marker Check");
+    assert!(stale_reason_scoped(s, &d, &p, &pr_scope(&["Conflict Marker Check"])).is_some());
+    // …and a scope naming some OTHER gate does not accidentally cover this one.
+    assert!(stale_reason_scoped(s, &d, &p, &pr_scope(&["File Size Ratchet"])).is_none());
+}
+
+#[test]
+fn the_pr_side_narrowing_does_not_rescue_a_real_global_input_change() {
+    // The narrowing removes ONE path from the `P` match. A PR that edits
+    // `ci.yml` in an unrelated block AND tightens the gate's baseline is still
+    // stale on the baseline.
+    let d = set(&["loom-daemon/src/big.rs"]);
+    let p = set(&[CI_WORKFLOW, "scripts/file-size-baseline.txt"]);
+    let reason = stale_reason_scoped(spec("File Size Ratchet"), &d, &p, &pr_scope(&[]))
+        .expect("the baseline edit is a global-input change regardless of ci.yml");
+    assert_eq!(reason.pr_path.as_deref(), Some("scripts/file-size-baseline.txt"));
+}
+
+#[test]
+fn the_two_sides_narrow_independently() {
+    // `D` and `P` are attributed against different trees, so one side's answer
+    // must never stand in for the other's.
+    let s = spec("Conflict Marker Check");
+    let d = set(&[CI_WORKFLOW]);
+    let p = set(&["loom-daemon/src/lib.rs"]);
+    let none = CiScope::Scoped(BTreeSet::new());
+
+    // Base narrowed, `P` untouched by ci.yml: clause 1 no longer fires.
+    assert!(stale_reason_scoped(
+        s,
+        &d,
+        &p,
+        &CiScopes {
+            base: none.clone(),
+            pr: CiScope::Unscoped
+        }
+    )
+    .is_none());
+    // The SAME base move with the base side unscoped still refuses — a narrow
+    // `P` scope does not cover for it.
+    assert!(stale_reason_scoped(
+        s,
+        &d,
+        &p,
+        &CiScopes {
+            base: CiScope::Unscoped,
+            pr: none
+        }
+    )
+    .is_some());
+}
+
+#[test]
+fn the_pr_side_narrowing_is_confined_to_clauses_1_and_2() {
+    // Clauses 3-5 match `P` against `scanned`/`coupled`/`removed` and are left
+    // un-narrowed on purpose: over-refusing is the safe direction, so a scope
+    // that excludes every component must not turn those clauses off.
+    let none = pr_scope(&[]);
+
+    // Clause 3: both sides touch ci.yml, which `Conflict Marker Check` scans
+    // via `**`. Only the BASE scope may silence it.
+    let both = set(&[CI_WORKFLOW]);
+    assert!(stale_reason_scoped(spec("Conflict Marker Check"), &both, &both, &none).is_some());
+
+    // Clause 5: the PR deletes a path while the base move touches the link
+    // graph. `P`'s removal set is never filtered.
+    let d = set(&["docs/some-page.md"]);
+    let p = set_with_removal(&[], &["scripts/gone.sh"]);
+    assert!(stale_reason_scoped(spec("Dangling Link Check"), &d, &p, &none).is_some());
 }

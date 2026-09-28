@@ -34,6 +34,15 @@
 //! 6. **`D`** — `GET /repos/{nwo}/compare/{B}...{tip}`, validated by
 //!    [`compare_usable`] and narrowed by [`strip_validated_restamps`].
 //!
+//! And, ONLY when the side in question touched `.github/workflows/ci.yml`, up
+//! to two more per side for #9065's block attribution: the workflow text at
+//! that side's tree (`GET /repos/{nwo}/contents/…?ref=…` — the base tip for
+//! `D`, the PR head for `P`), plus, on the `P` side, a second `pulls/{pr}/files`
+//! read for that one file's patch (which (4) deliberately does not carry). A
+//! merge that does not touch `ci.yml` pays for none of them, and every failure
+//! is [`CiScope::Unscoped`], i.e. the whole-file behaviour from before the
+//! narrowing existed.
+//!
 //! Everything in (1)–(3) is fallible I/O reporting `Err(reason)`; every caller
 //! outcome of an `Err` is "refuse the merge" (the guard's fail-closed
 //! contract), never "skip". (4)–(6) are different: a failure there is recorded
@@ -488,11 +497,68 @@ fn fetch_compare(
     Ok((status, files))
 }
 
-/// The base branch tip's `.github/workflows/ci.yml`, as raw text.
+/// The `.github/workflows/ci.yml` entry of `pulls/{n}/files`, with its patch —
+/// the `P` side of #9065's narrowing.
 ///
-/// Read only when a base move actually touched that path, so the ordinary
-/// merge pays nothing for #9065's narrowing. The raw media type returns the
-/// file body directly rather than the base64 `content` field.
+/// [`fetch_pr_files`] deliberately reads `P` by path alone (a patch per file
+/// over a large PR is a lot of payload for a set that is otherwise matched by
+/// name), so this is a second, narrower read issued **only** when `P` contains
+/// `ci.yml` at all. `--jq` emits at most one object, because a path appears at
+/// most once across the endpoint's pages; an empty answer is `Ok(None)`, which
+/// leaves the side unscoped.
+fn fetch_pr_ci_file(gh: &str, nwo: &str, pr: &str) -> Result<Option<ChangedFile>, String> {
+    let out = gh_api(
+        gh,
+        &[
+            &format!("repos/{nwo}/pulls/{pr}/files"),
+            "--paginate",
+            "--jq",
+            &format!(r#".[]? | select(.filename == "{CI_WORKFLOW}") | {{status, patch}}"#),
+        ],
+    )?;
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let v: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| format!("the PR's ci.yml file entry was not JSON: {e}"))?;
+    Ok(Some(ChangedFile {
+        path: CI_WORKFLOW.to_string(),
+        status: v
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        previous_filename: None,
+        patch: v.get("patch").and_then(|s| s.as_str()).map(String::from),
+    }))
+}
+
+/// Which components the **PR's own** `ci.yml` hunks are a global input for
+/// (#9065), attributed against the PR head's workflow — the tree
+/// `pulls/{n}/files`' patches diff *to*.
+///
+/// Costs two extra reads, and only on a PR that edits `ci.yml` at all. Every
+/// failure is [`CiScope::Unscoped`]: the whole-file `G` meaning, i.e. exactly
+/// the behaviour before this narrowing existed.
+fn pr_ci_scope(gh: &str, nwo: &str, pr: &str, head_sha: &str, pr_files: &[ChangedFile]) -> CiScope {
+    if !pr_files.iter().any(|f| f.path == CI_WORKFLOW) {
+        return CiScope::Unscoped;
+    }
+    let Ok(Some(file)) = fetch_pr_ci_file(gh, nwo, pr) else {
+        return CiScope::Unscoped;
+    };
+    let Ok(text) = fetch_workflow(gh, nwo, head_sha) else {
+        return CiScope::Unscoped;
+    };
+    workflow_scope::scope_for_files(&workflow_scope::parse(&text), &[file])
+}
+
+/// One revision's `.github/workflows/ci.yml`, as raw text.
+///
+/// Read only when that side actually touched that path, so the ordinary merge
+/// pays nothing for #9065's narrowing. The raw media type returns the file
+/// body directly rather than the base64 `content` field.
 fn fetch_workflow(gh: &str, nwo: &str, sha: &str) -> Result<String, String> {
     gh_api(
         gh,
@@ -561,6 +627,7 @@ fn scoped_evidence(
     };
     let mut ev = ScopedEvidence {
         pr_delta: to_file_set(&pr_files),
+        pr_ci_scope: pr_ci_scope(gh, nwo, pr, head_sha, &pr_files),
         ..ScopedEvidence::default()
     };
 
