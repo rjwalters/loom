@@ -2426,6 +2426,20 @@ pub enum RoleAdmission {
         /// The per-role budget this tick was resolved against.
         budget: usize,
     },
+    /// Refused: the host ceiling has room, but not once the slots held for
+    /// higher-priority PR roles are left free — the Champion-first
+    /// reservation of `autonomous.roleRunner.demandWidth` (#9392). Only
+    /// [`RoleRunGuard::admit_with_demand`] returns it.
+    ReservationHeld {
+        /// Role invocations already in flight across every managed workspace.
+        active: usize,
+        /// The ceiling this tick was resolved against.
+        ceiling: usize,
+        /// Ceiling slots held for the PR roles in `held_for`.
+        reserved: usize,
+        /// The PR roles the slots are held for.
+        held_for: demand::HeldFor,
+    },
 }
 
 impl RoleAdmission {
@@ -2435,7 +2449,10 @@ impl RoleAdmission {
     pub fn into_guard(self) -> Option<RoleRunGuard> {
         match self {
             Self::Admitted(g) => Some(g),
-            Self::InProgress | Self::CeilingReached { .. } | Self::RoleBudgetReached { .. } => None,
+            Self::InProgress
+            | Self::CeilingReached { .. }
+            | Self::RoleBudgetReached { .. }
+            | Self::ReservationHeld { .. } => None,
         }
     }
 }
@@ -2745,6 +2762,17 @@ pub fn plan_idle_runs(
                      already in flight at its budget of {budget} \
                      (autonomous.roleRunner.roleMaxConcurrent, #9391)",
                     root.display()
+                );
+                continue;
+            }
+            // Unreachable: idle-edge runs keep the Phase 1 budget and take no
+            // demand reservation (#9392).
+            RoleAdmission::ReservationHeld { .. } => {
+                log::debug!(
+                    "role_runner: idle edge for {} — {} not admitted: ceiling reservation \
+                     held (#9392)",
+                    root.display(),
+                    spec.name
                 );
                 continue;
             }
@@ -3245,8 +3273,11 @@ where
                     );
                     continue;
                 }
-                // Unreachable: `admit` applies no role budget (#9391).
-                RoleAdmission::RoleBudgetReached { .. } => continue,
+                // Unreachable: `admit` applies no role budget (#9391) and no
+                // demand reservation (#9392).
+                RoleAdmission::RoleBudgetReached { .. } | RoleAdmission::ReservationHeld { .. } => {
+                    continue
+                }
             };
             let tick_start = Instant::now();
             let probe_root = root.clone();
@@ -3919,6 +3950,10 @@ fn log_outcome_for_root_deduped(
 // Concurrent per-(repository, role) dispatch, per-role budgets and queue
 // gating (#9391) — see `role_runner/concurrent_dispatch.rs`.
 pub mod concurrent_dispatch;
+
+// Demand-weighted width and Champion-first reservation (#9392) — see
+// `role_runner/demand.rs`.
+pub mod demand;
 
 // The per-invocation result type (#8056) — see `role_runner/outcome.rs`.
 mod outcome;

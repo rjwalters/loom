@@ -41,6 +41,11 @@
 //!   ([`RoleDispatcher::resume_after_queue_empty`]). Each root is decided at
 //!   most once per tick, and a run that did real work does not trigger a
 //!   resume, so the budget still bounds agent runs per interval.
+//! - **Demand (#9392).** Admission reads the [`super::demand`] ledger: judge
+//!   and doctor run at a width that follows their queue depth, and the PR
+//!   roles get a Champion-first share of the ceiling held for them. The
+//!   ledger is fed by the queue-gate listing below and one `loom:pr` count
+//!   per admitted champion run, never by a query in this walk.
 //!
 //! Finished runs are reaped on the loop's own task ([`RoleDispatcher::handle_joined`]),
 //! so the #4349 fail/recover dedup maps and the #7607 pool-exhausted feed stay
@@ -105,15 +110,22 @@ pub fn default_role_max_concurrent(ceiling: usize) -> usize {
     (ceiling / 2).max(1)
 }
 
+/// `root`'s own resolved `autonomous.roleRunner` block (`Null` when absent),
+/// read once per admission for the knobs kept out of [`RoleRunnerConfig`].
+#[must_use]
+pub fn role_runner_block(root: &Path) -> serde_json::Value {
+    let effective = crate::config_resolver::resolve_effective_config(root);
+    crate::config_resolver::get_path(&effective, "autonomous.roleRunner")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
 /// Read `root`'s own `autonomous.roleRunner.roleMaxConcurrent` (resolved per
 /// root and hot-applied every tick, like `maxConcurrent`). Kept out of
 /// [`RoleRunnerConfig`] so its many exhaustive test literals stay untouched.
 #[must_use]
 pub fn read_role_max_concurrent(root: &Path) -> BTreeMap<String, usize> {
-    let effective = crate::config_resolver::resolve_effective_config(root);
-    crate::config_resolver::get_path(&effective, "autonomous.roleRunner")
-        .map(parse_role_max_concurrent)
-        .unwrap_or_default()
+    parse_role_max_concurrent(&role_runner_block(root))
 }
 
 /// Resolve `role`'s budget against `ceiling`: the configured value, else
@@ -149,6 +161,28 @@ pub enum LimitRefusal {
         active: usize,
         /// The budget compared against.
         budget: usize,
+    },
+    /// Judge's or doctor's demand width (#9392), below its Phase 1 budget.
+    DemandWidth {
+        /// Runs of this role in flight across every workspace.
+        active: usize,
+        /// The width compared against.
+        width: usize,
+        /// The Phase 1 budget the width is capped by.
+        budget: usize,
+        /// The queue depth the width was computed from.
+        debt: usize,
+    },
+    /// The Champion-first ceiling reservation (#9392).
+    Reservation {
+        /// Role runs in flight across every workspace.
+        active: usize,
+        /// The host ceiling.
+        ceiling: usize,
+        /// Slots held for higher-priority PR roles.
+        reserved: usize,
+        /// The PR roles they are held for.
+        held_for: demand::HeldFor,
     },
 }
 
@@ -193,15 +227,51 @@ pub fn admit_root_tick(
     in_progress: &InProgressGuard,
     config: &RoleRunnerConfig,
 ) -> RootTickDecision {
+    admit_root_tick_with(root, role, prompt, in_progress, config, demand::global())
+}
+
+/// [`admit_root_tick`] against an explicit demand `ledger` (tests inject
+/// their own). With `demandWidth.enabled` the effective budget and the
+/// Champion-first reservation come from the ledger (#9392); without it this
+/// is exactly the Phase 1 admission and the ledger is not read.
+#[must_use]
+pub fn admit_root_tick_with(
+    root: &Path,
+    role: &'static str,
+    prompt: String,
+    in_progress: &InProgressGuard,
+    config: &RoleRunnerConfig,
+    ledger: &demand::DemandLedger,
+) -> RootTickDecision {
     let ceiling = resolve_max_concurrent(config);
-    let budget = resolve_role_max_concurrent(&read_role_max_concurrent(root), role, ceiling);
-    match RoleRunGuard::admit_with_role_budget(
-        in_progress.clone(),
-        root.to_path_buf(),
-        role,
-        ceiling,
-        budget,
-    ) {
+    let block = role_runner_block(root);
+    let budgets = parse_role_max_concurrent(&block);
+    let budget = resolve_role_max_concurrent(&budgets, role, ceiling);
+    let demand_cfg = demand::parse_demand_config(&block);
+    let (admission, debt) = if demand_cfg.enabled {
+        let host = ledger.host_debt(demand_cfg.stale());
+        let decision = demand::decide(role, &budgets, ceiling, &host, &demand_cfg);
+        demand::log_if_changed(ledger, &decision, &demand_cfg);
+        let admission = RoleRunGuard::admit_with_demand(
+            in_progress.clone(),
+            root.to_path_buf(),
+            role,
+            ceiling,
+            decision.budget,
+            &decision.plan,
+        );
+        (admission, decision.debt)
+    } else {
+        let admission = RoleRunGuard::admit_with_role_budget(
+            in_progress.clone(),
+            root.to_path_buf(),
+            role,
+            ceiling,
+            budget,
+        );
+        (admission, None)
+    };
+    match admission {
         RoleAdmission::Admitted(guard) => RootTickDecision::Admit { prompt, guard },
         RoleAdmission::InProgress => {
             log::debug!(
@@ -213,9 +283,30 @@ pub fn admit_root_tick(
         RoleAdmission::CeilingReached { active, ceiling } => {
             RootTickDecision::Refused(LimitRefusal::Ceiling { active, ceiling })
         }
+        RoleAdmission::RoleBudgetReached {
+            active,
+            budget: width,
+            ..
+        } if width < budget => RootTickDecision::Refused(LimitRefusal::DemandWidth {
+            active,
+            width,
+            budget,
+            debt: debt.unwrap_or(0),
+        }),
         RoleAdmission::RoleBudgetReached { active, budget, .. } => {
             RootTickDecision::Refused(LimitRefusal::RoleBudget { active, budget })
         }
+        RoleAdmission::ReservationHeld {
+            active,
+            ceiling,
+            reserved,
+            held_for,
+        } => RootTickDecision::Refused(LimitRefusal::Reservation {
+            active,
+            ceiling,
+            reserved,
+            held_for,
+        }),
     }
 }
 
@@ -233,6 +324,28 @@ pub fn refusal_summary_line(role: &str, refusal: LimitRefusal, deferred: usize) 
             "role_runner: {role} tick stopped admitting — {active} {role} run(s) already in \
              flight at its budget of {budget} (autonomous.roleRunner.roleMaxConcurrent, #9391); \
              {deferred} root(s) deferred to the next tick"
+        ),
+        LimitRefusal::DemandWidth {
+            active,
+            width,
+            budget,
+            debt,
+        } => format!(
+            "role_runner: {role} tick stopped admitting — {active} {role} run(s) already in \
+             flight at its demand width of {width} for {debt} queued PR(s) (Phase 1 budget \
+             {budget}; autonomous.roleRunner.demandWidth, #9392); {deferred} root(s) deferred to \
+             the next tick"
+        ),
+        LimitRefusal::Reservation {
+            active,
+            ceiling,
+            reserved,
+            held_for,
+        } => format!(
+            "role_runner: {role} tick stopped admitting — {active} role agent(s) in flight and \
+             {reserved} of the host ceiling of {ceiling} reserved for {held_for} (Champion-first \
+             reservation, autonomous.roleRunner.demandWidth, #9392); {deferred} root(s) deferred \
+             to the next tick"
         ),
     }
 }
@@ -281,7 +394,8 @@ pub fn script_runner_factory() -> RunnerFactory {
 
 /// The production queue probe: the ETag-cached REST listing, so an unchanged
 /// queue costs a free `304`. REST issue listings include pull requests, which
-/// is what judge and doctor queues hold.
+/// is what judge and doctor queues hold. The PR rows it saw are recorded in
+/// the demand ledger (#9392) — the same listing, no second call.
 #[must_use]
 pub fn forge_queue_probe() -> QueueProbe {
     Arc::new(|root, labels| {
@@ -299,6 +413,7 @@ pub fn forge_queue_probe() -> QueueProbe {
                 "open",
             )
             .map_err(|e| e.to_string())?;
+            demand::record_listing(demand::global(), root, label, &rows);
             if !rows.is_empty() {
                 return Ok(true);
             }
@@ -365,6 +480,10 @@ pub struct RoleDispatcher {
     observer: Option<Arc<dyn PoolExhaustedObserver>>,
     decide: DecideFn,
     decide_state: DecideState,
+    /// The demand ledger admitted champion runs record `loom:pr` into
+    /// (#9392), and the probe that counts it.
+    ledger: &'static demand::DemandLedger,
+    merge_probe: demand::DemandProbe,
     in_flight: JoinSet<FinishedRun>,
     /// Which root each task runs, so a panicked task still names its root.
     running: HashMap<Id, PathBuf>,
@@ -407,6 +526,21 @@ impl RoleDispatcher {
             observer,
             production_decide(spec),
         )
+        .with_demand(demand::global(), demand::forge_merge_probe())
+    }
+
+    /// Use `ledger` and `merge_probe` for champion's merge-debt count (#9392).
+    /// [`Self::with_decide`] defaults to the global ledger and a probe that
+    /// never lists, so a test dispatcher never touches the forge.
+    #[must_use]
+    pub fn with_demand(
+        mut self,
+        ledger: &'static demand::DemandLedger,
+        merge_probe: demand::DemandProbe,
+    ) -> Self {
+        self.ledger = ledger;
+        self.merge_probe = merge_probe;
+        self
     }
 
     /// A dispatcher with an injected per-root decision (tests).
@@ -427,6 +561,8 @@ impl RoleDispatcher {
             observer,
             decide,
             decide_state: DecideState::default(),
+            ledger: demand::global(),
+            merge_probe: demand::no_merge_probe(),
             in_flight: JoinSet::new(),
             running: HashMap::new(),
             failing_roots: HashMap::new(),
@@ -460,6 +596,8 @@ impl RoleDispatcher {
         roots: Vec<PathBuf>,
         in_progress: &InProgressGuard,
     ) -> TickReport {
+        // A root that left the registry stops holding reserved slots (#9392).
+        self.ledger.retain_roots(&roots);
         let start = self.rotation_start(&roots);
         let mut order: VecDeque<(usize, PathBuf)> = roots.into_iter().enumerate().collect();
         order.rotate_left(start);
@@ -571,6 +709,7 @@ impl RoleDispatcher {
         let interval = self.interval;
         let factory = Arc::clone(&self.runner_factory);
         let probe = Arc::clone(&self.queue_probe);
+        let (ledger, merge_probe) = (self.ledger, Arc::clone(&self.merge_probe));
         let task_root = root.clone();
         let handle = self.in_flight.spawn_blocking(move || {
             // Held for the run's real lifetime; dropped on every exit path,
@@ -580,6 +719,10 @@ impl RoleDispatcher {
             let started_at = chrono::Utc::now();
             let mut runner = factory(task_root.clone());
             let outcome = run_gated(&mut *runner, &probe, &task_root, name, &prompt, interval);
+            if name == "champion" {
+                // Count-only, after the run: it never gates champion (#9392).
+                demand::record_merge_debt(&merge_probe, ledger, &task_root);
+            }
             // Durable `role_tick.outcome` record (#8056), best-effort.
             crate::role_tick_telemetry::emit_for_tick_correlated(
                 &task_root,
@@ -656,3 +799,8 @@ impl RoleDispatcher {
 #[allow(clippy::unwrap_used)]
 #[path = "tests/concurrent_dispatch.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "tests/demand_dispatch.rs"]
+mod demand_tests;
