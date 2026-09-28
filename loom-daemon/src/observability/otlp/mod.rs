@@ -54,7 +54,9 @@
 //!   point — the schema's "unknown != zero" contract carries through to the
 //!   OTLP mapping. `host.health`'s `daemon_version` becomes the `Resource`
 //!   attribute `service.version`, not a metric, since it describes the
-//!   emitting entity rather than a measurement.
+//!   emitting entity rather than a measurement. Every signal (traces and logs
+//!   included) carries `service.version`; without a `host.health` record it
+//!   is the exporting build's `CARGO_PKG_VERSION`.
 //!
 //! See [`mapping`] for the field-by-field implementation and its unit tests
 //! (fixture envelopes for every record kind, verifying the log/metric split
@@ -246,14 +248,20 @@ impl Exporter for OtlpExporter {
     }
 }
 
+/// Which OTLP endpoint an envelope's kind is exported to, derived from the
+/// `otlp:` routing class the kind declares in `telemetry/kinds.rs` (#8921) —
+/// not from a per-kind chain maintained here. A kind OTLP does not export
+/// (`NotExported`, e.g. native-HTTPS-only `queue.snapshot`) keeps the historical
+/// `Signal::Logs` bucket: nothing ever emits it on this path, and the logs
+/// request builder drops it (`log_record_for` returns `None`).
 fn signal_for(envelope: &TelemetryEnvelope) -> Signal {
-    match envelope.record {
-        crate::telemetry::TelemetryRecord::HostHealth(_)
-        | crate::telemetry::TelemetryRecord::TokensSnapshot(_)
-        | crate::telemetry::TelemetryRecord::CiDuration(_)
-        | crate::telemetry::TelemetryRecord::MetricPoints(_) => Signal::Metrics,
-        crate::telemetry::TelemetryRecord::Span(_) => Signal::Traces,
-        _ => Signal::Logs,
+    use crate::telemetry::TelemetryKindOtlp;
+    match envelope.record.otlp_class() {
+        TelemetryKindOtlp::Gauges
+        | TelemetryKindOtlp::Histograms
+        | TelemetryKindOtlp::OpsPoints => Signal::Metrics,
+        TelemetryKindOtlp::Spans => Signal::Traces,
+        TelemetryKindOtlp::Logs | TelemetryKindOtlp::NotExported => Signal::Logs,
     }
 }
 

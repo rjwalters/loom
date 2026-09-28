@@ -80,3 +80,10 @@ scripts/tests/test-loom-daemon-watchdog-dedup.sh
 # resync plan, so the consumer's dirt reconciliation could not explain it and
 # skipped every repo for four days. Recorded retroactively by #8675.
 scripts/tests/test-spawn-worker.sh
+
+# #9300 (#9244 B) — the urgent label retired in favour of the human-only
+# loom:operator-priority label; Guide's top-3 urgent duty and its flip guard
+# went with it.
+scripts/urgent-flip-guard.sh
+scripts/tests/test-urgent-flip-guard.sh
+scripts/tests/test-guide-urgency-rank.sh

@@ -1,6 +1,6 @@
 //! Typed dispatch-refusal reasons and admission spans (Issue #8907).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
@@ -140,9 +140,9 @@ fn collisions_and_claim_lock_contention_get_their_own_reasons() {
     let lock = lock.map_err(|e| e.context("dispatch_inner"));
     let other: Result<bool> = Err(anyhow!("spawn failed"));
     let now = Utc::now();
-    assert_eq!(record_dispatch_outcome(&mut report, 1, now, &collision).0, Qd::DispatchError);
-    record_dispatch_outcome(&mut report, 2, now, &lock);
-    record_dispatch_outcome(&mut report, 3, now, &other);
+    assert_eq!(record_dispatch_outcome(&mut report, 1, 0, now, &collision).0, Qd::DispatchError);
+    record_dispatch_outcome(&mut report, 2, 0, now, &lock);
+    record_dispatch_outcome(&mut report, 3, 0, now, &other);
     assert_eq!(report.errors, 3);
     assert_eq!(reason(&report, "claim_collision"), 1);
     assert_eq!(reason(&report, "claim_lock_held"), 1);
@@ -176,7 +176,7 @@ fn each_dispatch_attempt_is_one_admission_span_under_the_tick_span() {
     let started = Utc::now() - Duration::seconds(1);
     let report = tick_multi(&mut multi, &[], 4, &[false]);
     let tick = tick_span(&report, 4, started, Utc::now());
-    let spans = admission_spans(&report, &tick);
+    let spans = admission_spans(&report, &tick, &HashMap::new());
     assert_eq!(spans.len(), 3);
     for span in &spans {
         assert_eq!(span.name, SpanName::DispatchAdmission);
@@ -196,11 +196,44 @@ fn each_dispatch_attempt_is_one_admission_span_under_the_tick_span() {
     assert_eq!(issues, ["1", "2", "3"]);
     assert_eq!(spans[1].attributes["loom.dispatch.reason"], "lease_order_lost");
     assert_eq!(spans[0].attributes["loom.dispatch.admission_result"], "dispatched");
+    // No repo_refs entry for workspace 0: `loom.repo` is omitted, never a
+    // fabricated or local-path value (Issue #9222).
+    assert!(!spans[0].attributes.contains_key("loom.repo"));
 }
 
 #[test]
 fn a_tick_with_no_dispatch_attempt_has_no_admission_spans() {
     let report = TickReport::default();
     let tick = tick_span(&report, 1, Utc::now(), Utc::now());
-    assert!(admission_spans(&report, &tick).is_empty());
+    assert!(admission_spans(&report, &tick, &HashMap::new()).is_empty());
+}
+
+/// Issue #9222: when the caller resolves the admitting workspace's repo ref
+/// (as `record_tick` does from the synchronous collector cache), the
+/// admission span carries `loom.repo` / `loom.repo.visibility` — never a
+/// local path — and a workspace with no resolved entry stays silent on both.
+#[test]
+fn admission_span_carries_loom_repo_when_the_workspace_resolves() {
+    let mut multi = vec![(
+        Source(items(&[1])),
+        Refusing {
+            refuse: lease_order,
+            ok: HashSet::from([1]),
+        },
+    )];
+    let report = tick_multi(&mut multi, &[], 4, &[false]);
+    let tick = tick_span(&report, 4, Utc::now(), Utc::now());
+    let mut repo_refs = HashMap::new();
+    repo_refs.insert(
+        0,
+        crate::telemetry::queue_snapshot::QueueRepoRef {
+            repo: "acme/widgets".to_string(),
+            visibility: crate::telemetry::RepoVisibility::Public,
+        },
+    );
+    let spans = admission_spans(&report, &tick, &repo_refs);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].attributes["loom.repo"], "acme/widgets");
+    assert_eq!(spans[0].attributes["loom.repo.visibility"], "public");
+    assert_eq!(spans[0].clone().bounded().attributes, spans[0].attributes);
 }

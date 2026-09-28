@@ -7,7 +7,7 @@
 //! local-only index to join on.
 //!
 //! **Write side.** When a traced sweep is dispatched, [`open`] writes
-//! `.loom/logs/trace-joins/<trace-id>.json` = `{issue, context, started_at}`
+//! `.loom/logs/trace-joins/<trace-id>-<span-id>.json` = `{issue, context, started_at}`
 //! (the execution's persisted root context). At the terminal transition,
 //! [`close`] stamps `ended_at`. Entries are pruned [`RETAIN_CLOSED_HOURS`]
 //! after they close, or [`RETAIN_OPEN_HOURS`] after they open.
@@ -40,8 +40,10 @@ pub const RETAIN_CLOSED_HOURS: i64 = 24;
 pub const RETAIN_OPEN_HOURS: i64 = 7 * 24;
 /// A session may start this much before its execution's recorded start.
 pub const START_SLACK_SECS: i64 = 120;
-/// Most entries read per lookup.
-const MAX_ENTRIES: usize = 1024;
+/// Most entries read per lookup. `pub(crate)` so a test can construct the
+/// exact >[`MAX_ENTRIES`] fixture that hits the cap (issue #9013 item 2)
+/// without duplicating the constant.
+pub(crate) const MAX_ENTRIES: usize = 1024;
 
 /// One execution's join entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,9 +69,15 @@ impl JoinEntry {
     }
 }
 
+/// Keyed by span as well as trace: every sweep of one issue shares its story
+/// trace id (#9037), so a trace id alone would let a retry overwrite, and the
+/// earlier sweep's [`close`] then end, the retry's entry.
 fn entry_path(root: &Path, context: &TraceContext) -> PathBuf {
-    root.join(JOIN_DIR)
-        .join(format!("{}.json", context.trace_id.as_str()))
+    root.join(JOIN_DIR).join(format!(
+        "{}-{}.json",
+        context.trace_id.as_str(),
+        context.span_id.as_str()
+    ))
 }
 
 fn write(root: &Path, entry: &JoinEntry) -> anyhow::Result<()> {
@@ -123,16 +131,77 @@ pub fn close(root: &Path, execution: &str, ended_at: DateTime<Utc>) {
         return;
     };
     let path = entry_path(root, &context);
-    let Some(mut entry) = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<JoinEntry>(&bytes).ok())
-    else {
+    // An execution in flight across the upgrade opened its entry under the
+    // pre-#9038 `<trace-id>.json` name; close (and rename) that one instead.
+    let legacy = root
+        .join(JOIN_DIR)
+        .join(format!("{}.json", context.trace_id.as_str()));
+    let Some((found, mut entry)) = [path.clone(), legacy].into_iter().find_map(|candidate| {
+        std::fs::read(&candidate)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<JoinEntry>(&bytes).ok())
+            .filter(|entry| entry.context == context)
+            .map(|entry| (candidate, entry))
+    }) else {
         return;
     };
     entry.ended_at = Some(ended_at.max(entry.started_at));
     if let Err(error) = write(root, &entry) {
         log::warn!("observability: session trace join not closed: {error}");
+    } else if found != path {
+        let _ = std::fs::remove_file(found);
     }
+}
+
+/// Close every join entry still open under `root` (issue #9013 item 3): with
+/// no live process yet started since a restart, an entry with no `ended_at`
+/// can only be orphaned — the daemon crashed, or exited, before the
+/// terminal transition that would have called [`close`] ran. Left alone it
+/// would keep matching every session of its issue for the full
+/// [`RETAIN_OPEN_HOURS`] window, turning re-dispatches of that issue
+/// ambiguous (and therefore unjoined — the read side already fails safe)
+/// for up to 7 days. Stamping `ended_at = now` here bounds that instead to
+/// [`RETAIN_CLOSED_HOURS`] from restart, same as an execution that closed
+/// normally. Returns the number of entries closed.
+pub fn close_orphaned_entries_at(root: &Path, now: DateTime<Utc>) -> usize {
+    let Ok(dir) = std::fs::read_dir(root.join(JOIN_DIR)) else {
+        return 0;
+    };
+    let mut closed = 0usize;
+    for item in dir.flatten() {
+        let path = item.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Some(mut entry) = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<JoinEntry>(&bytes).ok())
+        else {
+            continue;
+        };
+        if entry.ended_at.is_some() {
+            continue;
+        }
+        entry.ended_at = Some(now.max(entry.started_at));
+        // Mirror `close`'s legacy-name handling: writing always lands at the
+        // current trace-id/span-id path, so a pre-#9038 file gets renamed
+        // (removed after the write succeeds) rather than left as a stale
+        // duplicate beside the freshly-closed one.
+        let canonical = entry_path(root, &entry.context);
+        if write(root, &entry).is_err() {
+            continue;
+        }
+        if canonical != path {
+            let _ = std::fs::remove_file(&path);
+        }
+        closed += 1;
+    }
+    closed
+}
+
+/// [`close_orphaned_entries_at`] at the current time (the restart pass).
+pub fn close_orphaned_entries(root: &Path) -> usize {
+    close_orphaned_entries_at(root, Utc::now())
 }
 
 /// The workspace root a transcript's `cwd` belongs to: the part before
@@ -146,13 +215,24 @@ pub fn workspace_of(cwd: &Path) -> PathBuf {
     }
 }
 
-/// Every entry under `root`, pruning expired ones as a side effect.
-fn entries(root: &Path, now: DateTime<Utc>) -> Vec<JoinEntry> {
+/// Every entry under `root`, pruning expired ones as a side effect, plus
+/// whether the [`MAX_ENTRIES`] cap was hit (issue #9013 item 2). Capped means
+/// the directory holds more candidates than were read — a second matching
+/// entry could be sitting unread past the cap — so a caller must treat the
+/// result as incomplete rather than authoritative.
+fn entries(root: &Path, now: DateTime<Utc>) -> (Vec<JoinEntry>, bool) {
     let Ok(dir) = std::fs::read_dir(root.join(JOIN_DIR)) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let mut found = Vec::new();
-    for item in dir.flatten().take(MAX_ENTRIES) {
+    let mut seen = 0usize;
+    let mut capped = false;
+    for item in dir.flatten() {
+        seen += 1;
+        if seen > MAX_ENTRIES {
+            capped = true;
+            break;
+        }
         let path = item.path();
         if path.extension().is_none_or(|e| e != "json") {
             continue;
@@ -169,7 +249,7 @@ fn entries(root: &Path, now: DateTime<Utc>) -> Vec<JoinEntry> {
         }
         found.push(entry);
     }
-    found
+    (found, capped)
 }
 
 /// The trace context a session's `session.summary` joins, or `None` (see the
@@ -193,7 +273,14 @@ pub fn context_for_session_at(
 ) -> Option<TraceContext> {
     let (cwd, issue, started_at) = (cwd?, issue?, started_at?);
     let root = workspace_of(Path::new(cwd));
-    let mut matches = entries(&root, now)
+    let (found, capped) = entries(&root, now);
+    if capped {
+        // #9013 item 2: a second matching entry could be among whatever the
+        // cap left unread. Guessing "no join" (unjoined) is safe; guessing a
+        // single match here is not — report ambiguous instead.
+        return None;
+    }
+    let mut matches = found
         .into_iter()
         .filter(|entry| entry.issue == issue && entry.covers(started_at));
     let only = matches.next()?;

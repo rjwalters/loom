@@ -996,7 +996,7 @@ pub struct ScriptRoleInvocationRunner {
     ///
     /// [`invoke`]: RoleInvocationRunner::invoke
     resolved_launch: Option<crate::role_tick_telemetry::ResolvedLaunch>,
-    trace_context: Option<crate::telemetry::trace::TraceContext>,
+    trace_context: Option<crate::observability::lifecycle::RoleTrace>,
 }
 
 impl ScriptRoleInvocationRunner {

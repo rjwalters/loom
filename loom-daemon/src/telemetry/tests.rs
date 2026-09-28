@@ -10,6 +10,7 @@ mod complexity;
 mod daemon_event;
 mod fleet_captain;
 mod host_health_omissions;
+mod kind_registry;
 mod role_tick;
 mod session_analysis;
 mod session_summary;
@@ -144,10 +145,12 @@ fn host_health() -> TelemetryRecord {
             ManagedRepoEntry {
                 slug: "rjwalters/loom".to_string(),
                 visibility: RepoVisibility::Public,
+                priority: Some(0),
             },
             ManagedRepoEntry {
                 slug: "2AMLogic/gf180-pll".to_string(),
                 visibility: RepoVisibility::Private,
+                priority: None,
             },
         ],
         roles: RoleTickHealth {
@@ -168,6 +171,7 @@ fn host_health() -> TelemetryRecord {
         admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     })
 }
 
@@ -777,6 +781,10 @@ fn host_health_serializes_managed_repos_with_slug_and_visibility() {
             .and_then(serde_json::Value::as_str),
         Some("private")
     );
+    // #9244: a registered repo's dispatch priority ships; an unknown one is
+    // omitted.
+    assert_eq!(repos[0]["priority"], 0);
+    assert!(repos[1].get("priority").is_none());
 }
 
 #[test]
@@ -808,6 +816,27 @@ fn managed_repo_entry_with_missing_visibility_defaults_to_private() {
     let decoded: ManagedRepoEntry = serde_json::from_str(json).unwrap();
     assert_eq!(decoded.visibility, RepoVisibility::Private);
     assert_eq!(decoded.slug, "owner/repo");
+    // No `priority` either (an older daemon): it decodes as absent.
+    assert_eq!(decoded.priority, None);
+}
+
+#[test]
+fn managed_repo_entry_priority_is_on_the_wire_only_when_known() {
+    // #9244 / loom-ui#153: `priority` ships for a registered workspace and is
+    // omitted (never a fabricated default) for one that is not.
+    let known = ManagedRepoEntry {
+        slug: "rjwalters/loom".to_string(),
+        visibility: RepoVisibility::Public,
+        priority: Some(0),
+    };
+    let wire = serde_json::to_value(&known).unwrap();
+    assert_eq!(wire["priority"], 0);
+    let unknown = ManagedRepoEntry {
+        priority: None,
+        ..known
+    };
+    let wire = serde_json::to_value(&unknown).unwrap();
+    assert!(wire.get("priority").is_none(), "{wire}");
 }
 
 // ------------------------------------------------------------------

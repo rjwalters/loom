@@ -63,16 +63,24 @@ pub fn blocked_rows(repo: &QueueRepoRef, listing: &[RestIssue]) -> Vec<QueueSnap
                 visibility: repo.visibility,
                 issue: item.number,
                 workspace_priority: crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY,
-                urgent: item
+                // Deprecated by #9244: always false on the wire.
+                urgent: false,
+                operator_priority: item
                     .labels
                     .iter()
-                    .any(|l| l == crate::work_finder::URGENT_LABEL),
+                    .any(|l| l == crate::work_finder::OPERATOR_PRIORITY_LABEL),
+                operator_priority_at: None,
                 created_at: item.created_at.clone(),
                 tier: item.labels.iter().find(|l| l.starts_with("tier:")).cloned(),
                 disposition,
                 state: disposition.state().to_string(),
                 reason: disposition.reason().to_string(),
                 detail: (!holds.is_empty()).then(|| holds.join(", ")),
+                // Outside the dispatch order: `blocked`, no position (#9288).
+                plan: crate::types::RowPlan {
+                    plan_state: crate::types::PlanState::Blocked,
+                    ..Default::default()
+                },
             }
         })
         .collect()
@@ -118,7 +126,7 @@ pub(super) async fn collect(
         if !listed.insert(slug.clone()) {
             continue;
         }
-        let Some(listing) = list_open(root, BLOCKED_LABEL).await else {
+        let Some(listing) = list_open(root, BLOCKED_LABEL, "queue_blocked").await else {
             continue;
         };
         let repo = QueueRepoRef {
@@ -132,10 +140,15 @@ pub(super) async fn collect(
 
 /// One ETag-cached listing of open items carrying `label` in the repo at
 /// `root`, off the async runtime. `None` on failure.
-pub(super) async fn list_open(root: PathBuf, label: &'static str) -> Option<Vec<RestIssue>> {
+pub(super) async fn list_open(
+    root: PathBuf,
+    label: &'static str,
+    caller: &'static str,
+) -> Option<Vec<RestIssue>> {
     let shown = root.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
-        crate::forge_listing::list_issues_cached(Path::new("gh"), Some(&root), None, label, "open")
+        let gh = Path::new("gh");
+        crate::forge_listing::list_issues_cached_as(caller, gh, Some(&root), None, label, "open")
     })
     .await;
     match result {

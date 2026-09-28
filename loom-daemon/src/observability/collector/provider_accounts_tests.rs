@@ -117,6 +117,8 @@ fn registry_provider_accounts_preserve_missing_health_and_report_holds() {
         assert_eq!(account.provider, "codex");
         assert_eq!(account.rank, None);
         assert_eq!(account.usage_fraction, None);
+        // Issue #9005: no weekly utilization source either — absent, never 0.
+        assert_eq!(account.usage_fraction_weekly, None);
         assert_eq!(account.exhausted, matches!(account.account.as_str(), "cooldown" | "reauth"));
         let deadline = if account.account == "cooldown" {
             DateTime::<Utc>::from_timestamp(

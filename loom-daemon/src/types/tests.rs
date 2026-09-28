@@ -368,6 +368,9 @@ fn running_exporter(uptime_secs: i64) -> ObservabilityExportStatus {
         signal_counts: Default::default(),
         consecutive_failures: 0,
         flush_interval_secs: Some(30),
+        // #9015's scope fields are derived, not configured — the tests that
+        // care call `refresh_endpoint_scope()` after setting an endpoint.
+        ..Default::default()
     }
 }
 
@@ -524,6 +527,64 @@ fn export_status_round_trips_and_tolerates_pre_5083_wire_data() {
     let minimal: ObservabilityExportStatus = serde_json::from_str("{}").unwrap();
     assert_eq!(minimal.state, ObservabilityExportState::Disabled);
     assert!(minimal.host_id.is_none());
+}
+
+// ==================================================================
+// First-hop scope of the export record (Issue #9015)
+// ==================================================================
+
+#[test]
+fn a_healthy_export_record_names_its_first_hop_scope_on_the_wire() {
+    // #9015: `healthy` answers "did the CONFIGURED ENDPOINT ack the batch",
+    // never "is the data in the backend". A consumer must be able to read
+    // that limit off the payload instead of inferring it from the docs — the
+    // 30h of total SigNoz loss behind this issue was a `healthy` daemon whose
+    // local edge collector accepted every POST and then dropped it.
+    let mut status = running_exporter(4 * 3600);
+    status.last_success_at = Some(export_now());
+    status.state = status.classify(export_now());
+    let value = serde_json::to_value(&status).unwrap();
+    assert_eq!(value["state"], "healthy");
+    assert_eq!(value["scope"], "first_hop", "the measured scope must be on the wire: {value}");
+}
+
+#[test]
+fn a_loopback_endpoint_is_flagged_as_an_unverified_downstream_hop() {
+    // The edge-collector deployment: the endpoint is a local otel collector
+    // that forwards onward, so an ack proves strictly less than usual.
+    let mut edge = running_exporter(4 * 3600);
+    edge.endpoint = Some("http://127.0.0.1:14318/v1/logs".to_string());
+    edge.refresh_endpoint_scope();
+    assert!(edge.endpoint_is_loopback(), "127.0.0.1 is a local hop");
+    assert_eq!(serde_json::to_value(&edge).unwrap()["endpoint_loopback"], true);
+
+    // A remote endpoint is the one hop AND (as far as this daemon can see)
+    // the backend, so it is not flagged.
+    let mut remote = running_exporter(4 * 3600);
+    remote.refresh_endpoint_scope();
+    assert!(!remote.endpoint_is_loopback(), "a remote endpoint is not a local hop");
+    assert_eq!(serde_json::to_value(&remote).unwrap()["endpoint_loopback"], false);
+}
+
+#[test]
+fn the_scope_fields_default_for_a_pre_9015_payload() {
+    // An older daemon omits both fields. `first_hop` is the truthful default
+    // (that is all any daemon has ever measured), and the loopback flag
+    // defaults to "not known to be a local hop" rather than inventing one.
+    let older: ObservabilityExportStatus =
+        serde_json::from_str(r#"{"state":"healthy","endpoint":"http://127.0.0.1:14318"}"#).unwrap();
+    assert_eq!(older.scope, ObservabilityExportScope::FirstHop);
+    assert!(!older.endpoint_loopback);
+    // …and the derivation is still available to the consumer, which is why
+    // the renderers derive it live instead of trusting the wire flag.
+    assert!(older.endpoint_is_loopback());
+}
+
+#[test]
+fn an_unknown_scope_from_a_newer_daemon_does_not_break_the_parse() {
+    let newer: ObservabilityExportStatus =
+        serde_json::from_str(r#"{"state":"healthy","scope":"end_to_end"}"#).unwrap();
+    assert_eq!(newer.scope, ObservabilityExportScope::Unrecognized);
 }
 
 // ==================================================================

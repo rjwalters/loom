@@ -12,13 +12,23 @@
 //! - parented to the execution's last completed `loom.runtime.run` span
 //!   (a `worker_spawn` launch journals one), else to the execution's root
 //!   span, and covering the run span's interval (else the sweep window);
-//! - carrying `loom.tokens.{input,output,cache_read,cache_write,total}`,
-//!   summed over every model the reader found. `input` is uncached input,
-//!   `cache_write` is `cache_write_5m + cache_write_1h`, and `total` is the
-//!   four added together;
+//! - **one span per model** ([`spans`], #9204/#9303), each with
+//!   `loom.usage.scope=execution`, `loom.sweep_id`, `loom.model`, that model's
+//!   `loom.tokens.{input,output,cache_read,cache_write,total}` (plus the
+//!   `cache_write_5m`/`cache_write_1h` split and the `gen_ai.usage.*`
+//!   aliases), and a USD estimate from the daemon's rate card ([`cost`]).
+//!   `input` is uncached input and `total` is the four counters added
+//!   together. Summed over the spans, the counters equal the execution's old
+//!   single-span totals;
 //! - **only when usage is known**: a reader that found nothing (`None`)
-//!   journals no span, so unknown never reads as zero, while a measured zero
-//!   is exported as `"0"`.
+//!   journals no span, so unknown never reads as zero (nor does an empty row
+//!   set: there is no model to name), while a model row's measured-zero
+//!   counter is exported as `"0"`.
+//!
+//! The same span shape records one role attempt's usage with
+//! `loom.usage.scope=attempt`: `loom-daemon usage-record` for in-session
+//! subagents ([`record`]) and single-target role-runner ticks
+//! (`role_tick_telemetry::usage`).
 //!
 //! Only counters are exported: no prompt, tool argument or transcript text.
 //! The span drains to the OTLP queue with every other journalled span.
@@ -27,7 +37,10 @@
 //! `session.summary` log with the same execution's trace context, so the log
 //! and the usage span share one trace id in SigNoz.
 
+pub mod cost;
 pub mod join;
+pub mod record;
+pub mod spans;
 
 use std::path::Path;
 
@@ -36,7 +49,7 @@ use chrono::{DateTime, Utc};
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::telemetry::trace::journal::Journal;
 use crate::telemetry::trace::store::TraceStore;
-use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
+use crate::telemetry::trace::{SpanName, SpanRecord, TraceAttributes};
 
 /// One execution's token totals, in Claude's disjoint vocabulary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -87,54 +100,28 @@ impl TokenUsage {
     }
 }
 
-/// The `loom.runtime.usage` span for `usage`, a child of `parent`.
-#[must_use]
-pub fn usage_span(
-    parent: &TraceContext,
-    started_at: DateTime<Utc>,
-    ended_at: DateTime<Utc>,
-    usage: TokenUsage,
-    runtime: Option<&str>,
-) -> SpanRecord {
-    let mut attributes = usage.attributes();
-    if let Some(runtime) = runtime.filter(|r| !r.is_empty()) {
-        attributes.insert("loom.runtime".into(), runtime.to_string());
-    }
-    SpanRecord {
-        context: parent.child(),
-        parent_span_id: Some(parent.span_id.clone()),
-        name: SpanName::RuntimeUsage,
-        started_at,
-        ended_at: ended_at.max(started_at),
-        status: SpanStatus::Ok,
-        attributes,
-        events: Vec::new(),
-        links: Vec::new(),
-    }
-    .bounded()
-}
-
-/// Journal `execution`'s usage span, when tracing is on and usage is known.
-/// Call before `lifecycle::finish_execution`, which lets the journal retire.
+/// Journal `execution`'s per-model usage spans, when tracing is on and usage
+/// is known. Call before `lifecycle::finish_execution`, which lets the journal
+/// retire.
 pub fn record_execution_usage(
     root: &Path,
     execution: &str,
     window: (DateTime<Utc>, DateTime<Utc>),
-    usage: Option<TokenUsage>,
+    tokens_by_model: Option<&[ModelUsageTotals]>,
     runtime: Option<&str>,
 ) {
     if !super::tracing::enabled(root) {
         return;
     }
-    if let Err(error) = journal_usage(root, execution, window, usage, runtime) {
+    if let Err(error) = journal_usage(root, execution, window, tokens_by_model, runtime) {
         log::warn!("observability: runtime usage span not journalled: {error}");
     }
 }
 
-/// The sweep terminal's one call (Issue #8908): journal the usage span from
-/// the per-model totals the outcome record already carries, and close the
-/// session join entry [`join::open`] wrote at dispatch. Call before
-/// `lifecycle::finish_execution`.
+/// The sweep terminal's one call (Issue #8908): journal the per-model usage
+/// spans (`scope=execution`) from the per-model totals the outcome record
+/// already carries, and close the session join entry [`join::open`] wrote at
+/// dispatch. Call before `lifecycle::finish_execution`.
 pub fn finish_sweep(
     root: &Path,
     execution: &str,
@@ -144,28 +131,27 @@ pub fn finish_sweep(
 ) {
     let now = Utc::now();
     let window = (started_at.unwrap_or(now), now);
-    let usage = tokens_by_model.map(TokenUsage::from_models);
-    record_execution_usage(root, execution, window, usage, runtime);
+    record_execution_usage(root, execution, window, tokens_by_model, runtime);
     join::close(root, execution, now);
 }
 
 /// [`record_execution_usage`] without the enablement check. Returns the
-/// journalled span, or `None` when usage is unknown or the execution has no
+/// journalled spans — none when usage is unknown or the execution has no
 /// persisted trace context.
 pub fn journal_usage(
     root: &Path,
     execution: &str,
     window: (DateTime<Utc>, DateTime<Utc>),
-    usage: Option<TokenUsage>,
+    tokens_by_model: Option<&[ModelUsageTotals]>,
     runtime: Option<&str>,
-) -> anyhow::Result<Option<SpanRecord>> {
-    let Some(usage) = usage else {
-        return Ok(None);
+) -> anyhow::Result<Vec<SpanRecord>> {
+    let Some(rows) = tokens_by_model.filter(|rows| !rows.is_empty()) else {
+        return Ok(Vec::new());
     };
     let store = TraceStore::new(root);
     let path = store.path(root, execution);
     if !path.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let saved = TraceStore::load(&path)?;
     let journal = Journal::for_context(&path);
@@ -180,12 +166,28 @@ pub fn journal_usage(
         Some(run) => (&run.context, run.started_at, run.ended_at),
         None => (&saved.context, window.0, window.1),
     };
-    let span = usage_span(parent, started_at, ended_at, usage, runtime);
-    journal.append_completed(span.clone())?;
-    Ok(Some(span))
+    let mut common = TraceAttributes::new();
+    common.insert("loom.sweep_id".into(), execution.to_string());
+    if let Some(runtime) = runtime.filter(|r| !r.is_empty()) {
+        common.insert("loom.runtime".into(), runtime.to_string());
+    }
+    let spans = spans::model_usage_spans(
+        parent,
+        (started_at, ended_at),
+        rows,
+        spans::UsageScope::Execution,
+        &common,
+        &cost::Pricing::active(),
+    );
+    spans::append_new(&journal, spans)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 #[path = "runtime_usage/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "runtime_usage/model_tests.rs"]
+mod model_tests;

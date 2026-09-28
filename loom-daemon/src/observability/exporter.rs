@@ -109,14 +109,25 @@ struct BatchPayload<'a>(&'a [TelemetryEnvelope]);
 struct IngestAck {
     #[serde(default)]
     host_id: Option<String>,
+    /// loom-ui star intents (#9244 C). Absent from an older backend (`None`,
+    /// a no-op); `[]` from a supporting backend with nothing pending. Kept as
+    /// a raw value: whatever shape the field has (object, string, number,
+    /// null, a mixed array) can never fail the ack and skip the host-id
+    /// check; `parse_ack_intents` takes `as_array()` and drops bad entries
+    /// one by one.
+    #[serde(default)]
+    operator_priority_intents: Option<serde_json::Value>,
 }
 
 /// How much of a success-response body is read before the host-identity echo
-/// is parsed out of it. The real response is a few dozen bytes
-/// (`{"accepted":50,"host_id":"…"}`); this bound exists only so a misconfigured
-/// endpoint that answers 200 with a huge body cannot be buffered into memory
-/// just to read one diagnostic field out of it.
-const MAX_ACK_BODY_BYTES: usize = 4096;
+/// and the star intents are parsed out of it. A plain ack is a few dozen
+/// bytes (`{"accepted":50,"host_id":"…"}`), but since #9244 C it may carry
+/// `operator_priority_intents` at ~250 bytes each: 4 KiB truncated a 50-intent
+/// ack (~12 KiB), which then failed to parse and lost both the intents and
+/// the #4830 host-id check. 64 KiB holds ~250 intents; the bound still exists
+/// so a misconfigured endpoint answering 200 with a huge body cannot be
+/// buffered into memory.
+const MAX_ACK_BODY_BYTES: usize = 64 * 1024;
 
 /// Read at most `limit` bytes of `response`'s body, discarding the rest.
 ///
@@ -156,6 +167,10 @@ pub struct HttpsExporter {
     /// Where a confirmed mismatch is published for `loom-daemon status` /
     /// `health` to read.
     host_id_status: Arc<HostIdStatus>,
+    /// Where ack star intents go (#9244 C): the liveness pass drains it.
+    /// `None` leaves intents unread (tests, or a daemon that never
+    /// registered one).
+    intent_queue: Option<Arc<crate::star_liveness::intents::IntentQueue>>,
 }
 
 /// Per-request timeout — generous enough for a slow mobile/tethered fleet
@@ -189,7 +204,39 @@ impl HttpsExporter {
             host_id,
             mismatch_warned: AtomicBool::new(false),
             host_id_status,
+            intent_queue: None,
         })
+    }
+
+    /// Hand ack star intents to `queue` (#9244 C).
+    #[must_use]
+    pub fn with_intent_queue(
+        mut self,
+        queue: Arc<crate::star_liveness::intents::IntentQueue>,
+    ) -> Self {
+        self.intent_queue = Some(queue);
+        self
+    }
+
+    /// Read everything this exporter uses from a success body: the host-id
+    /// echo (#4830) and the star intents (#9244 C). Never fails the export.
+    fn handle_ack(&self, body: &str) {
+        let Ok(ack) = serde_json::from_str::<IngestAck>(body) else {
+            // Not JSON at all (a proxy's HTML 200, an empty body). The batch was
+            // still acked; there is simply nothing to read.
+            return;
+        };
+        self.check_host_identity(&ack);
+        if let (Some(queue), Some(intents)) = (
+            self.intent_queue.as_ref(),
+            crate::star_liveness::intents::parse_ack_intents(
+                ack.operator_priority_intents.as_ref(),
+            ),
+        ) {
+            if !intents.is_empty() {
+                queue.push_all(intents);
+            }
+        }
     }
 
     /// Compare the `host_id` a `/ingest` success response echoed against this
@@ -199,12 +246,7 @@ impl HttpsExporter {
     /// Never returns an error and never affects the export result: a batch the
     /// backend accepted stays accepted, whatever it says the key is bound to.
     /// The only thing a mismatch changes is that the operator now finds out.
-    fn check_host_identity(&self, body: &str) {
-        let Ok(ack) = serde_json::from_str::<IngestAck>(body) else {
-            // Not JSON at all (a proxy's HTML 200, an empty body). The batch was
-            // still acked; there is simply no identity to compare.
-            return;
-        };
+    fn check_host_identity(&self, ack: &IngestAck) {
         let Some(ingest_host_id) = ack
             .host_id
             .as_deref()
@@ -278,7 +320,7 @@ impl Exporter for HttpsExporter {
             // is ignored rather than turned into a spurious export failure that
             // would re-send records the backend has already durably stored.
             let body = read_bounded_body(response, MAX_ACK_BODY_BYTES).await;
-            self.check_host_identity(&body);
+            self.handle_ack(&body);
             return Ok(());
         }
         let status = response.status().as_u16();
@@ -573,6 +615,7 @@ mod tests {
                 admission_brake: None,
                 is_captain: None,
                 armed_singleton_jobs: Vec::new(),
+                captainless_singleton_jobs: Vec::new(),
             }),
         )
     }
@@ -752,6 +795,87 @@ mod tests {
         exporter.emit_batch(&[one_envelope()]).await.unwrap();
 
         assert!(status.snapshot().is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // loom-ui star intents on the ack (#9244 C)
+    // ------------------------------------------------------------------
+
+    fn intent_json(i: usize) -> String {
+        format!(
+            r#"{{"id":"intent-{i:04}-0123456789abcdef","repo":"2AMLogic/loom-ui","number":{n},"action":"star","label":"loom:operator-priority","requested_at":"2026-09-28T10:00:00Z","requested_by":"operator-account-{i}@example.com"}}"#,
+            n = 1000 + i
+        )
+    }
+
+    async fn ack_intents(body: &str, host_id: &str) -> (Vec<StarIntentForTest>, Arc<HostIdStatus>) {
+        let sink = MockSink::start();
+        sink.set_body(body);
+        let status = Arc::new(HostIdStatus::default());
+        let queue = Arc::new(crate::star_liveness::intents::IntentQueue::default());
+        let exporter = test_exporter_with_status(sink.url(), host_id, status.clone())
+            .with_intent_queue(queue.clone());
+        exporter.emit_batch(&[one_envelope()]).await.unwrap();
+        (queue.drain(), status)
+    }
+
+    type StarIntentForTest = crate::star_liveness::intents::StarIntent;
+
+    #[tokio::test]
+    async fn an_old_backend_without_the_field_queues_nothing() {
+        let (queued, _) =
+            ack_intents(r#"{"accepted":1,"host_id":"host-test"}"#, TEST_HOST_ID).await;
+        assert!(queued.is_empty());
+        let (queued, _) = ack_intents(
+            r#"{"accepted":1,"host_id":"host-test","operator_priority_intents":[]}"#,
+            TEST_HOST_ID,
+        )
+        .await;
+        assert!(queued.is_empty(), "[] is a supporting backend with nothing to do");
+    }
+
+    #[tokio::test]
+    async fn a_50_intent_ack_past_the_old_4096_byte_bound_parses_fully() {
+        let intents: Vec<String> = (0..50).map(intent_json).collect();
+        let body = format!(
+            r#"{{"accepted":1,"host_id":"robb-pro","operator_priority_intents":[{}]}}"#,
+            intents.join(",")
+        );
+        assert!(body.len() > 4096 * 2, "the fixture must exceed the old bound: {}", body.len());
+        let (queued, status) = ack_intents(&body, "robb-studio").await;
+        assert_eq!(queued.len(), 50, "every intent survives the larger bound");
+        assert_eq!(queued[49].requested_by.as_deref(), Some("operator-account-49@example.com"));
+        assert!(status.snapshot().is_some(), "the #4830 host-id check still runs on a large ack");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_intent_costs_only_itself() {
+        let body = format!(
+            r#"{{"accepted":1,"operator_priority_intents":[{},"not-an-object",{{"number":"x"}}]}}"#,
+            intent_json(1)
+        );
+        let (queued, _) = ack_intents(&body, TEST_HOST_ID).await;
+        assert_eq!(queued.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn any_shape_of_the_intents_field_keeps_the_host_id_check() {
+        let mixed = format!(r#"[{}, "s", 3, null, [], {{"number":"x"}}]"#, intent_json(2));
+        for (field, want) in [
+            ("{}", 0),
+            (r#""a-string""#, 0),
+            ("42", 0),
+            ("null", 0),
+            ("true", 0),
+            (mixed.as_str(), 1),
+        ] {
+            let body = format!(
+                r#"{{"accepted":1,"host_id":"robb-pro","operator_priority_intents":{field}}}"#
+            );
+            let (queued, status) = ack_intents(&body, "robb-studio").await;
+            assert_eq!(queued.len(), want, "{field}");
+            assert!(status.snapshot().is_some(), "{field}: the #4830 host-id check still ran");
+        }
     }
 
     #[test]

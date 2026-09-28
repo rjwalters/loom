@@ -52,12 +52,33 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.tokens.cache_read",
     "loom.tokens.cache_write",
     "loom.tokens.total",
+    // Per-model, per-attempt usage + USD (Issues #9204, #9303): one
+    // `loom.runtime.usage` span per model, scoped `execution` | `attempt`.
+    "loom.tokens.cache_write_5m",
+    "loom.tokens.cache_write_1h",
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.cache_read_input_tokens",
+    "gen_ai.usage.cache_creation_input_tokens",
+    "loom.cost.usd_estimate",
+    "gen_ai.cost.usd_estimate",
+    "loom.pricing.verified_on",
+    "loom.pricing.source",
+    "loom.usage.scope",
     // `loom.pool.hold` (#8931): one pool dispatch hold, armed to cleared.
+    "loom.pool.hold.pool",
     "loom.pool.hold.post_mortem",
     "loom.pool.hold.accounts",
     // `loom.dispatch.admission` spans (Issue #8907).
     "loom.dispatch.admission_result",
     "loom.dispatch.reason",
+    // `loom.dispatch.disposition` spans (Issue #9222).
+    "loom.queue.disposition",
+    "loom.queue.state",
+    "loom.queue.rank",
+    "loom.queue.transition",
+    "loom.queue.previous_disposition",
+    "loom.queue.park_label",
 ];
 
 /// Longest label value kept, in bytes.
@@ -188,6 +209,11 @@ pub enum MetricName {
     /// Open items carrying a stage label, labelled `state`.
     #[serde(rename = "loom.forge.stage_items")]
     ForgeStageItems,
+    /// Ready-queue rows dropped from a `loom.dispatch.disposition` export
+    /// pass, labelled `reason` = `unresolved` (no forge slug) or `truncated`
+    /// (over the per-call row cap) — Issue #9222.
+    #[serde(rename = "loom.queue.disposition_rows_dropped")]
+    QueueDispositionRowsDropped,
 }
 
 impl MetricName {
@@ -228,6 +254,7 @@ impl MetricName {
             Self::ForgeStageDwell => "loom.forge.stage_dwell",
             Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
             Self::ForgeStageItems => "loom.forge.stage_items",
+            Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
         }
     }
 
@@ -250,7 +277,8 @@ impl MetricName {
             | Self::DispatchSlotTurnaroundSamples
             | Self::DispatchIdleSlotSeconds
             | Self::ForgeStageDwell
-            | Self::ForgeStageDwellSamples => MetricKind::DeltaCounter,
+            | Self::ForgeStageDwellSamples
+            | Self::QueueDispositionRowsDropped => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -281,6 +309,7 @@ impl MetricName {
             | Self::ForgeStageDwell => "s",
             Self::DispatchSlotTurnaroundSamples | Self::DispatchIdleSlots => "{slot}",
             Self::ForgeStageDwellSamples | Self::ForgeStageItems => "{item}",
+            Self::QueueDispositionRowsDropped => "{issue}",
             _ => "By",
         }
     }
@@ -328,6 +357,9 @@ impl MetricName {
             Self::ForgeStageDwell => "Seconds items spent in a forge label stage, by state.",
             Self::ForgeStageDwellSamples => "Stage transitions counted in loom.forge.stage_dwell.",
             Self::ForgeStageItems => "Open items carrying a stage label, by state.",
+            Self::QueueDispositionRowsDropped => {
+                "Ready-queue rows dropped from a disposition export pass, by reason."
+            }
         }
     }
 }

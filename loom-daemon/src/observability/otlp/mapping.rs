@@ -3,6 +3,7 @@
 //! this module is the field-by-field implementation plus its unit tests.
 
 mod ci;
+mod eta;
 mod metadata;
 mod ops;
 
@@ -22,7 +23,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
 use crate::telemetry::{
-    AnomalyFlag, RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryRecord,
+    AnomalyFlag, RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryKindOtlp,
+    TelemetryRecord,
 };
 
 // ============================================================================
@@ -139,18 +141,21 @@ fn severity_text(severity: SeverityNumber) -> &'static str {
     }
 }
 
-/// A `Resource` describing the emitting daemon host. `daemon_version` is only
-/// known from a `host.health` record, so it is threaded in separately rather
-/// than read off `envelope.record` — see [`build_metrics_request`].
+/// A `Resource` describing the emitting daemon host. `service.version` is
+/// always present: a record-supplied `daemon_version` (from a `host.health`
+/// record, threaded in by [`build_metrics_request`]) wins; otherwise — traces,
+/// logs, and metrics batches without `host.health` — it falls back to the
+/// exporting build's own `CARGO_PKG_VERSION` (Issue #9028).
 pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
-    let mut attributes = vec![
+    let version = daemon_version
+        .filter(|v| !v.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    let attributes = vec![
         kv_string("service.name", "loom-daemon"),
         kv_string("service.instance.id", host_id),
         kv_string("host.id", host_id),
+        kv_string("service.version", version),
     ];
-    if let Some(version) = daemon_version {
-        attributes.push(kv_string("service.version", version));
-    }
     Resource {
         attributes,
         ..Default::default()
@@ -167,8 +172,8 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
 fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
     let observed_time_unix_nano = nanos(envelope.emitted_at);
     let mut time_unix_nano = observed_time_unix_nano;
-    // Only `ci.job.log` (#8825) sets this; every other kind's body stays the
-    // event name it has always been, byte-identical on the wire.
+    // Only `ci.job.log` (#8825) and the ETA kinds (#9289) set this; every
+    // other kind's body stays the event name, byte-identical on the wire.
     let mut body_override: Option<String> = None;
     let (event_name, severity, _body, attributes) = match &envelope.record {
         TelemetryRecord::SweepStarted(r) => {
@@ -538,14 +543,32 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             body_override = Some(r.text.clone());
             (event_name, severity, String::new(), attributes)
         }
-        TelemetryRecord::TokensSnapshot(_)
-        | TelemetryRecord::HostHealth(_)
-        | TelemetryRecord::CiDuration(_)
-        | TelemetryRecord::MetricPoints(_)
-        // `queue.snapshot` (#8852) is native-HTTPS only; SigNoz gets the
-        // queue as `loom.queue.*` gauges through `metric.points`.
-        | TelemetryRecord::QueueSnapshot(_)
-        | TelemetryRecord::Span(_) => return None,
+        TelemetryRecord::EtaEstimate(_) | TelemetryRecord::EtaOutcome(_) => {
+            // Issue #9289: the body is the record's JSON (an estimate's whole
+            // explanation); scalars ride as `loom.eta.*` attributes.
+            let (event_name, severity, at, attributes, body) = eta::log_parts(&envelope.record)?;
+            time_unix_nano = at;
+            body_override = Some(body);
+            (event_name, severity, String::new(), attributes)
+        }
+        // Every kind that is not declared `otlp: Logs` in `telemetry/kinds.rs`:
+        // `tokens.snapshot` / `host.health` become gauges, `ci.duration` a
+        // histogram, `metric.points` its own grouped points, `trace.span` a
+        // span, and `queue.snapshot` is native-HTTPS only (SigNoz gets the
+        // queue as `loom.queue.*` gauges through `metric.points`). This used to
+        // be an exhaustive `|` chain every new record kind had to append to —
+        // the routing *decision* is now the `otlp:` column of the kind's own
+        // registry row, so a kind that needs no log mapping does not touch this
+        // file at all (#8921).
+        other => {
+            debug_assert!(
+                other.otlp_class() != TelemetryKindOtlp::Logs,
+                "telemetry kind `{}` declares `otlp: Logs` in telemetry/kinds.rs but \
+                 log_record_for has no arm for it",
+                other.kind()
+            );
+            return None;
+        }
     };
     Some(LogRecord {
         time_unix_nano,
@@ -745,6 +768,18 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                         time_unix_nano,
                     });
                 }
+                // Issue #9005: the rolling 7-day axis beside the 5h one. Same
+                // absent-not-zero rule — no source, no series.
+                if let Some(weekly) = account.usage_fraction_weekly {
+                    samples.push(MetricSample {
+                        name: "loom.tokens.usage_fraction_weekly",
+                        description: "Fraction of the rolling 7-day limit window consumed (0..1).",
+                        unit: "1",
+                        attributes: attributes.clone(),
+                        value: number_data_point::Value::AsDouble(weekly),
+                        time_unix_nano,
+                    });
+                }
                 samples.push(MetricSample {
                     name: "loom.tokens.exhausted",
                     description: "Whether the account is currently excluded from the usable pool (1 = exhausted).",
@@ -756,34 +791,31 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
             }
             samples
         }
-        // Every lifecycle-shaped kind — including `role_tick.outcome`
-        // (#8056) — becomes a log record instead (see `log_record_for`).
-        TelemetryRecord::SweepStarted(_)
-        | TelemetryRecord::SweepIdentity(_)
-        | TelemetryRecord::SweepPhase(_)
-        | TelemetryRecord::SweepCompleted(_)
-        | TelemetryRecord::SweepOutcome(_)
-        | TelemetryRecord::RoleTickOutcome(_)
-        // `session.summary` / `session.analysis` / `daemon.event` are log
-        // records (see log_record_for), not gauges — each is a per-session
-        // or per-bus-event event, not a host sample.
-        | TelemetryRecord::SessionSummary(_)
-        | TelemetryRecord::SessionAnalysis(_)
-        | TelemetryRecord::DaemonEvent(_)
-        // CI runs/jobs are log records; `ci.duration` is a histogram point
-        // (see `histogram_point_for`), never a gauge. A `ci.job.log` chunk
-        // (#8825) is a log record too — and deliberately produces no metric
-        // at all: every number it could offer (chunk size, byte total) is
-        // already an attribute on the record, and a per-chunk gauge would
-        // make log volume look like a host sample.
-        | TelemetryRecord::CiRun(_)
-        | TelemetryRecord::CiJob(_)
-        | TelemetryRecord::CiDuration(_)
-        | TelemetryRecord::CiJobLog(_)
-        // `metric.points` (#8860) is grouped by `ops::points_for`.
-        | TelemetryRecord::MetricPoints(_)
-        | TelemetryRecord::QueueSnapshot(_)
-        | TelemetryRecord::Span(_) => Vec::new(),
+        // Every kind that is not declared `otlp: Gauges` in
+        // `telemetry/kinds.rs` produces no gauge here:
+        //   - every lifecycle-shaped kind — including `role_tick.outcome`
+        //     (#8056), `session.summary` / `session.analysis` / `daemon.event`
+        //     — becomes a log record instead (see `log_record_for`); each is a
+        //     per-sweep / per-session / per-bus-event event, not a host sample.
+        //   - `ci.duration` is a histogram point (see `histogram_point_for`),
+        //     never a gauge. A `ci.job.log` chunk (#8825) is a log record too —
+        //     and deliberately produces no metric at all: every number it could
+        //     offer (chunk size, byte total) is already an attribute on the
+        //     record, and a per-chunk gauge would make log volume look like a
+        //     host sample.
+        //   - `metric.points` (#8860) is grouped by `ops::points_for`.
+        //   - `trace.span` is a span; `queue.snapshot` is native-HTTPS only.
+        // Same #8921 reasoning as `log_record_for`: the declared routing class
+        // replaces an exhaustive chain every new kind had to append to.
+        other => {
+            debug_assert!(
+                other.otlp_class() != TelemetryKindOtlp::Gauges,
+                "telemetry kind `{}` declares `otlp: Gauges` in telemetry/kinds.rs but \
+                 metric_samples_for has no arm for it",
+                other.kind()
+            );
+            Vec::new()
+        }
     }
 }
 

@@ -58,6 +58,7 @@ fn insert_codex_entry_with_prefixed_log(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();

@@ -75,7 +75,19 @@ BIN="$(loom_daemon_self_bin_override || loom_locate_daemon_bin "$REPO_ROOT")"
 LAUNCH_RC=127
 if [[ -n "$BIN" ]]; then
     set +e
-    LAUNCH_ENV="$("$BIN" runtime-launch-env --runtime "$RUNTIME_NAME")"  # stderr is NOT eval'd
+    # --repo-root is NOT optional here (#8700). Without it the subcommand
+    # falls back to resolving `<name>.json` from its own CWD, while the
+    # daemon's runtime ADMISSION for the very same dispatch resolves it from
+    # the scripts-derived workspace root -- so one dispatch could read two
+    # different manifests. Passing the root this script already computed
+    # makes the two agree: inside a linked worktree SCRIPT_DIR is
+    # `<worktree>/.loom/scripts`, so `--show-toplevel` yields the worktree
+    # root, matching what the CWD default produces in the case it was
+    # designed for, while also being right when the daemon's cwd is
+    # elsewhere (a custom `.loom/runtimes/<name>.json` was silently losing to
+    # the compiled-in fallback, and a custom runtime with no bundled
+    # fallback got the version-floor refusal blaming a stale binary).
+    LAUNCH_ENV="$("$BIN" runtime-launch-env --runtime "$RUNTIME_NAME" --repo-root "$REPO_ROOT")"  # stderr is NOT eval'd
     LAUNCH_RC=$?
     set -e
     if [[ "$LAUNCH_RC" -eq 78 ]]; then

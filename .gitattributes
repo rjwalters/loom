@@ -25,3 +25,23 @@
 # them.
 .loom/install-metadata.json merge=ours
 # END LOOM-MANAGED (merge drivers, #4528)
+
+# Telemetry record-kind registry (#8921). This file is an append-only table of
+# self-contained one-line-per-kind rows, and it is the ONLY shared line a new
+# telemetry record kind touches (it generates the enum variant, the serde tag,
+# the envelope gate version, and the OTLP routing class). Two concurrent PRs
+# each adding a kind append at the same point, which is a textbook git conflict
+# -- #8915 and #8909 hit it on 2026-09-25 even though both were individually
+# clean. `merge=union` (a git built-in, needing no local driver config, unlike
+# the `merge=ours` above) takes BOTH sides' added rows instead of conflicting,
+# which is exactly the right resolution for a set of independent declarations.
+#
+# Safety: union merge is only safe because of what this file is. If two sides
+# edit the SAME existing row differently, union keeps both copies and the build
+# fails loudly on the duplicate variant -- it cannot silently produce a wrong
+# wire tag or a wrong gate version. The `kind_registry` tests additionally
+# assert wire-tag/variant uniqueness and that every pre-#8921 gate value is
+# unchanged, so a bad union is caught by `cargo test`, not by a backend.
+# Do NOT add unrelated logic to this file: the attribute below assumes every
+# line is an independent declaration.
+loom-daemon/src/telemetry/kinds.rs merge=union

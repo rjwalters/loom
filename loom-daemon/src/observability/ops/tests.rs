@@ -316,9 +316,10 @@ fn tick_result_precedence() {
 #[test]
 fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
     let report = TickReport {
-        seen: 5,
+        seen: 6,
         dispatched: 2,
         skipped_peer_claim: 1,
+        skipped_host_class: 1,
         deferred_capacity: 2,
         ..TickReport::default()
     };
@@ -333,12 +334,13 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
         [
             ("capacity".to_string(), MetricValue::Int(2)),
             ("dispatched".to_string(), MetricValue::Int(2)),
+            ("host_class".to_string(), MetricValue::Int(1)),
             ("peer_claim".to_string(), MetricValue::Int(1)),
         ]
         .into_iter()
         .collect()
     );
-    assert!(points.contains(&MetricPoint::int(MetricName::DispatchCandidates, 5)));
+    assert!(points.contains(&MetricPoint::int(MetricName::DispatchCandidates, 6)));
     assert!(points.contains(&MetricPoint::int(MetricName::DispatchMaxConcurrent, 4)));
 }
 
@@ -457,6 +459,14 @@ fn gateway_collector_keeps_every_ops_label_and_span_attribute() {
     }
 }
 
+#[test]
+fn gateway_collector_keeps_every_provenance_attribute() {
+    let span = keep_keys("span");
+    for key in crate::telemetry::trace::provenance::KEYS {
+        assert!(span.contains(*key), "collector span keep_keys lacks {key}");
+    }
+}
+
 // Ready-queue depth gauges (Issue #8852, phase 2).
 
 fn queue_summary(
@@ -472,12 +482,16 @@ fn queue_summary(
                 issue: u32::try_from(i).unwrap(),
                 workspace_priority: 100,
                 urgent: false,
+                operator_priority: false,
+                operator_priority_at: None,
+                main_red_fix: false,
                 created_at: None,
                 tier: None,
                 disposition: *d,
                 detail: None,
                 state: d.state().into(),
                 reason: d.reason().into(),
+                plan: Default::default(),
             })
             .collect(),
         ..Default::default()

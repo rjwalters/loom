@@ -21,7 +21,6 @@
 //! registered and [`record`] returns before doing any work.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -123,13 +122,16 @@ pub fn build_record(
             visibility: repo.visibility,
             issue: row.issue,
             workspace_priority: row.workspace_priority,
-            urgent: row.urgent,
+            urgent: false,
+            operator_priority: row.operator_priority,
+            operator_priority_at: row.operator_priority_at.clone(),
             created_at: row.created_at.clone(),
             tier: row.tier.clone(),
             disposition: row.disposition,
             state: row.disposition.state().to_string(),
             reason: row.disposition.reason().to_string(),
             detail: exportable_detail(row.disposition, row.detail.as_deref()),
+            plan: row.plan.clone(),
         });
     }
     let listing_failed: Vec<QueueRepoRef> = summary
@@ -147,12 +149,43 @@ pub fn build_record(
         rows,
         unresolved_rows,
         rows_truncated,
+        plan: summary.plan.clone(),
+        operator_priority_landing: Vec::new(),
     }
 }
 
-/// Resolve every workspace root `summary` names to its slug and visibility.
-/// Only absolute paths are probed. The single-workspace loop's
-/// `workspace #N` placeholders stay unresolved.
+/// Attach the last liveness pass's rows (#9244 C), each tagged with its
+/// repo's visibility. Rows whose repo is not a managed forge slug (a loom-ui
+/// star on an unmanaged repo) are tagged by the same lookup, which answers
+/// `Private` when it cannot tell.
+async fn attach_landing(record: &mut QueueSnapshotRecord) {
+    let Some(report) = crate::star_liveness::last_report() else {
+        return;
+    };
+    let mut visibility: HashMap<String, crate::telemetry::RepoVisibility> = HashMap::new();
+    for row in report.rows {
+        let tag = match visibility.get(&row.repo) {
+            Some(v) => *v,
+            None => {
+                let v = super::collector::resolve_visibility(&row.repo).await;
+                visibility.insert(row.repo.clone(), v);
+                v
+            }
+        };
+        record
+            .operator_priority_landing
+            .push(crate::telemetry::queue_snapshot::QueueLandingRow {
+                row,
+                visibility: tag,
+            });
+    }
+}
+
+/// Resolve every workspace root `summary` names to its slug and visibility,
+/// through the shared [`super::repo_ref::resolve_repo_refs`] (also used by
+/// `ops::disposition` since Issue #9222) so the two callers cannot drift onto
+/// different resolution rules. Only absolute paths are probed; the
+/// single-workspace loop's `workspace #N` placeholders stay unresolved.
 async fn resolve_repos(
     summary: &WorkFinderTickSummary,
     slug_cache: &mut HashMap<String, String>,
@@ -163,24 +196,7 @@ async fn resolve_repos(
         .map(|r| r.repo.as_str())
         .chain(summary.listing_failed.iter().map(String::as_str))
         .collect();
-    let mut repos = HashMap::new();
-    for root in roots {
-        if !Path::new(root).is_absolute() {
-            continue;
-        }
-        let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, root).await else {
-            continue;
-        };
-        let visibility = super::collector::resolve_visibility(&slug).await;
-        repos.insert(
-            root.to_string(),
-            QueueRepoRef {
-                repo: slug,
-                visibility,
-            },
-        );
-    }
-    repos
+    super::repo_ref::resolve_repo_refs(roots, slug_cache).await
 }
 
 /// Emit a snapshot of the last work-finder tick when a native sink is
@@ -207,6 +223,7 @@ pub(super) async fn record(
     let mut record = build_record(&summary, &repos);
     let blocked = super::queue_blocked::collect(workspace_pool, slug_cache).await;
     super::queue_blocked::append(&mut record, blocked);
+    attach_landing(&mut record).await;
     sink.push(record);
     *LAST_EMITTED
         .lock()

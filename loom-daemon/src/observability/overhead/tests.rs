@@ -161,7 +161,8 @@ fn measured_overhead_is_recorded_with_bounded_attributes_and_events() {
     assert!(report.bounds.max_attributes_per_span > 0);
     for key in &report.bounds.attribute_keys {
         assert!(
-            ALLOWED_KEYS.contains(&key.as_str()),
+            ALLOWED_KEYS.contains(&key.as_str())
+                || crate::telemetry::trace::provenance::KEYS.contains(&key.as_str()),
             "emitted attribute key {key} is outside the allowlist"
         );
     }

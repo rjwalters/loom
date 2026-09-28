@@ -193,6 +193,7 @@ fn host_health_envelope() -> TelemetryEnvelope {
             admission_brake: None,
             is_captain: None,
             armed_singleton_jobs: Vec::new(),
+            captainless_singleton_jobs: Vec::new(),
         }),
     )
 }

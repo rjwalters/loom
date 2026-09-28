@@ -7,6 +7,12 @@
 --
 -- Dwell is a lower bound (seeded from the issue's updatedAt, never earlier),
 -- so these numbers can under-report a wait, never over-report it.
+--
+-- Query 5 (at the end of this file) is different in kind from 1-4: it reads
+-- `signoz_traces.signoz_index_v3` (per-issue `loom.dispatch.disposition` /
+-- `loom.dispatch.admission` SPANS, Issue #9222), not `signoz_metrics` (the
+-- low-cardinality `loom.queue.*` gauges below, which never carry a repo or
+-- issue number).
 
 -- 1. Starved issues per host and state, last 24 h (the alert's signal).
 SELECT JSONExtractString(t.labels, 'host.id') AS host,
@@ -61,3 +67,31 @@ WHERE s.metric_name IN ('loom.queue.dispatch_wait', 'loom.queue.dispatch_wait.sa
   AND s.unix_milli >= toUnixTimestamp(now() - INTERVAL 30 DAY) * 1000
 GROUP BY host, day
 ORDER BY day, host;
+
+-- 5. Why hasn't owner/repo#98 started? Latest disposition/admission records
+--    first, across every host. `loom.dispatch.disposition` covers every
+--    candidate the tick evaluated (including one filtered out before a
+--    dispatch() attempt); `loom.dispatch.admission` adds the outcome of an
+--    actual attempt when one was made. Reads spans, not metrics — see the
+--    header note above.
+SELECT timestamp, resources_string['host.id'] AS host,
+       name,
+       attributes_string['loom.queue.disposition'] AS disposition,
+       attributes_string['loom.queue.state']       AS state,
+       attributes_string['loom.queue.rank']        AS rank,
+       attributes_string['loom.queue.transition']  AS transition,
+       attributes_string['loom.queue.park_label']  AS park_label,
+       attributes_string['loom.dispatch.admission_result'] AS admission_result,
+       attributes_string['loom.dispatch.reason']           AS admission_reason
+FROM signoz_traces.signoz_index_v3
+WHERE name IN ('loom.dispatch.disposition', 'loom.dispatch.admission')
+  AND attributes_string['loom.repo']  = 'owner/repo'
+  AND attributes_string['loom.issue'] = '98'
+  AND timestamp > now() - INTERVAL 24 HOUR
+ORDER BY timestamp DESC LIMIT 20;
+
+-- For a `workspace_halted` row, join to the parent `loom.dispatch.tick` span
+-- (`attributes_string['loom.dispatch.result'] = 'halted_main_red'`) through
+-- `parentSpanID` — the disposition row itself does not say which of red main,
+-- a gate, the token pool, a drain or the host-distress breaker caused the
+-- halt (out of scope for #9222).

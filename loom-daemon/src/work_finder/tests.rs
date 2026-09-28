@@ -221,6 +221,12 @@ struct RecordingDispatcher {
     /// never declares a host-affinity constraint in the first place
     /// (an empty `HostConstraint` matches any host id, including `""`).
     current_host_id: String,
+    /// #9244: a live overflow sweep already holds the host's slot.
+    overflow_live: bool,
+    /// #9244: issues dispatched as the overflow sweep (a subset of `dispatched`).
+    dispatched_overflow: Vec<u32>,
+    /// #9244: the red-main-fix lane's CI-fallback verdict for this repo.
+    ci_red: bool,
 }
 
 impl WorkDispatcher for RecordingDispatcher {
@@ -259,6 +265,24 @@ impl WorkDispatcher for RecordingDispatcher {
     }
     fn current_host_id(&self) -> String {
         self.current_host_id.clone()
+    }
+    fn overflow_in_flight(&self) -> bool {
+        self.overflow_live
+    }
+    fn main_red_via_ci(&self) -> bool {
+        self.ci_red
+    }
+    fn dispatch_with(
+        &mut self,
+        issue: u32,
+        complexity: Option<&str>,
+        overflow: bool,
+    ) -> Result<bool> {
+        let started = self.dispatch(issue, complexity);
+        if overflow && matches!(started, Ok(true)) {
+            self.dispatched_overflow.push(issue);
+        }
+        started
     }
     fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
         self.dispatched_complexity
@@ -1979,10 +2003,10 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
     }
     let mut expected: Vec<&str> = vec![BUILDING_LABEL];
     expected.extend_from_slice(PARK_LABELS);
-    expected.push(OPERATOR_HOLD_LABEL);
+    expected.extend([OPERATOR_HOLD_LABEL, labels::OPERATOR_DECISION_LABEL]);
     assert_eq!(
         SKIP_LABELS, expected,
-        "SKIP_LABELS is composed as BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL"
+        "SKIP_LABELS is BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL + the decision sub-kind"
     );
 }
 
@@ -2491,161 +2515,15 @@ fn test_tick_multi_missing_halt_entry_defaults_not_halted() {
     assert_eq!(multi[1].1.dispatched, vec![10]);
 }
 
-// ===================================================================
-// tick_multi — cross-repo priority ordering (#3946)
-// ===================================================================
-
-fn issue_at(n: u32, created_at: &str) -> WorkItem {
-    WorkItem::with_created_at(n, vec!["loom:issue".into()], Some(created_at.to_string()))
-}
-
-fn urgent_issue(n: u32) -> WorkItem {
-    WorkItem::new(n, vec!["loom:issue".into(), URGENT_LABEL.into()])
-}
-
-#[test]
-fn test_tick_multi_higher_priority_repo_dispatches_first_under_cap() {
-    // ACCEPTANCE (#3946): the LOWER-priority repo (index 0, priority 100) has
-    // OLDER and MORE candidates than the HIGHER-priority repo (index 1,
-    // priority 0). Under a global cap of 2, the higher-priority repo's
-    // candidates MUST dispatch first anyway — a deep/old product backlog
-    // never starves a small high-priority tool repo.
-    let mut multi = vec![
-        (
-            // Low-priority repo: 4 candidates, all OLDER (2023 timestamps).
-            FakeSource::once(vec![
-                issue_at(1, "2023-01-01T00:00:00Z"),
-                issue_at(2, "2023-01-02T00:00:00Z"),
-                issue_at(3, "2023-01-03T00:00:00Z"),
-                issue_at(4, "2023-01-04T00:00:00Z"),
-            ]),
-            RecordingDispatcher::default(),
-        ),
-        (
-            // High-priority repo: 2 candidates, both NEWER (2025 timestamps).
-            FakeSource::once(vec![
-                issue_at(50, "2025-01-01T00:00:00Z"),
-                issue_at(51, "2025-01-02T00:00:00Z"),
-            ]),
-            RecordingDispatcher::default(),
-        ),
-    ];
-    // priorities parallel to workspaces: repo 0 = 100 (low), repo 1 = 0 (high).
-    let report = tick_multi(&mut multi, &[100, 0], 2, &[false, false]);
-
-    assert_eq!(report.dispatched, 2, "the global cap of 2 is filled");
-    assert_eq!(report.deferred_capacity, 4, "the low-priority repo's 4 are deferred");
-    assert!(
-        multi[0].1.dispatched.is_empty(),
-        "the low-priority repo dispatches NOTHING despite older/more candidates"
-    );
-    assert_eq!(
-        multi[1].1.dispatched,
-        vec![50, 51],
-        "the high-priority repo's candidates dispatch first"
-    );
-}
-
-#[test]
-fn test_tick_multi_urgent_beats_older_within_same_tier() {
-    // Within one workspace-priority tier, `loom:urgent` sorts ahead of an
-    // older / lower-numbered non-urgent sibling. Cap 1 ⇒ only the urgent one.
-    let mut multi = vec![(
-        FakeSource::once(vec![
-            issue_at(1, "2023-01-01T00:00:00Z"), // older, non-urgent
-            urgent_issue(9),                     // newer, urgent
-        ]),
-        RecordingDispatcher::default(),
-    )];
-    let report = tick_multi(&mut multi, &[100], 1, &[false]);
-    assert_eq!(report.dispatched, 1);
-    assert_eq!(
-        multi[0].1.dispatched,
-        vec![9],
-        "the urgent issue outranks the older non-urgent one in the same tier"
-    );
-}
-
-#[test]
-fn test_tick_multi_oldest_first_within_same_tier_and_urgency() {
-    // Same tier, neither urgent: oldest-first by createdAt. Cap 1 ⇒ the
-    // oldest (#7, 2022) dispatches before the newer (#2, 2024).
-    let mut multi = vec![(
-        FakeSource::once(vec![
-            issue_at(2, "2024-06-01T00:00:00Z"),
-            issue_at(7, "2022-06-01T00:00:00Z"),
-        ]),
-        RecordingDispatcher::default(),
-    )];
-    let report = tick_multi(&mut multi, &[100], 1, &[false]);
-    assert_eq!(report.dispatched, 1);
-    assert_eq!(multi[0].1.dispatched, vec![7], "the older issue dispatches first");
-}
-
-#[test]
-fn test_tick_multi_missing_priority_entry_defaults() {
-    // A short `priorities` slice (fewer entries than workspaces) treats the
-    // unspecified workspaces as the default tier rather than panicking. With
-    // both at the default, ordering reduces to age/number.
-    let mut multi = vec![
-        (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
-        (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
-    ];
-    let report = tick_multi(&mut multi, &[], 10, &[false, false]);
-    assert_eq!(report.dispatched, 2);
-    assert_eq!(multi[0].1.dispatched, vec![1]);
-    assert_eq!(multi[1].1.dispatched, vec![10]);
-}
-
-#[test]
-fn test_candidate_cmp_ordering() {
-    use std::cmp::Ordering;
-    let mk = |idx, prio, urgent, created: Option<&str>, num| PriorityCandidate {
-        workspace_idx: idx,
-        workspace_priority: prio,
-        urgent,
-        complexity: None,
-        created_at: created.map(str::to_string),
-        number: num,
-    };
-
-    // Priority dominates everything else: prio 0 (urgent=false, newer) still
-    // beats prio 100 (urgent=true, older).
-    let high = mk(0, 0, false, Some("2025-01-01T00:00:00Z"), 999);
-    let low = mk(1, 100, true, Some("2000-01-01T00:00:00Z"), 1);
-    assert_eq!(candidate_cmp(&high, &low), Ordering::Less);
-
-    // Same tier: urgent before non-urgent.
-    let u = mk(0, 100, true, Some("2025-01-01T00:00:00Z"), 50);
-    let n = mk(0, 100, false, Some("2000-01-01T00:00:00Z"), 1);
-    assert_eq!(candidate_cmp(&u, &n), Ordering::Less);
-
-    // Same tier + same urgency: oldest-first.
-    let old = mk(0, 100, false, Some("2020-01-01T00:00:00Z"), 80);
-    let new = mk(0, 100, false, Some("2024-01-01T00:00:00Z"), 2);
-    assert_eq!(candidate_cmp(&old, &new), Ordering::Less);
-
-    // A dated issue sorts before an undated one (Some < None).
-    let dated = mk(0, 100, false, Some("2024-01-01T00:00:00Z"), 5);
-    let undated = mk(0, 100, false, None, 4);
-    assert_eq!(candidate_cmp(&dated, &undated), Ordering::Less);
-
-    // Fully-tied keys fall through to the number tiebreak (lower first).
-    let a = mk(0, 100, false, None, 3);
-    let b = mk(0, 100, false, None, 8);
-    assert_eq!(candidate_cmp(&a, &b), Ordering::Less);
-}
+// Cross-repo priority ordering (#3946) and the #9244 operator-priority /
+// red-main-fix lanes live in sibling files (this one is size-frozen).
+mod main_red_fix;
+mod operator_priority;
+mod ordering;
 
 // ===================================================================
 // WorkItem
 // ===================================================================
-
-#[test]
-fn test_work_item_is_urgent() {
-    assert!(!issue(1).is_urgent());
-    assert!(urgent_issue(1).is_urgent());
-    assert!(WorkItem::new(1, vec!["loom:issue".into(), "loom:urgent".into()]).is_urgent());
-}
 
 #[test]
 fn test_work_item_is_skipped() {
@@ -3717,7 +3595,7 @@ fn test_scale_to_zero_on_empty_backlog() {
 // Config-file surface — read_work_finder_config soft-fail (#3813)
 // ===================================================================
 
-fn write_config(dir: &Path, body: &str) {
+fn write_config(dir: &std::path::Path, body: &str) {
     let loom_dir = dir.join(".loom");
     std::fs::create_dir_all(&loom_dir).unwrap();
     std::fs::write(loom_dir.join("config.json"), body).unwrap();
@@ -3786,9 +3664,13 @@ fn test_config_full_block_is_parsed() {
             interval_secs: Some(90),
             max_concurrent: Some(5),
             max_admissions_per_tick: Some(4),
-            extra_skip_labels: None,
             // Retired keys are recorded (accepted-but-ignored), not parsed.
             deprecated_cpu_keys: vec!["cpuUtilizationTarget", "estCoresPerSweep"],
+            // Keys this body does not set (`extraSkipLabels`,
+            // `maxConcurrentPerRepo`) parse to their `Default`, `None` — for
+            // the #9090 per-repo cap that means *uncapped*. Still an exact
+            // equality assertion over the whole struct.
+            ..WorkFinderConfig::default()
         }
     );
 }
@@ -3979,13 +3861,13 @@ fn test_config_zero_interval_and_max_drop_to_none() {
 // config_resolver migration (#4058) — tier precedence
 // ===================================================================
 
-fn write_project_config(dir: &Path, body: &str) {
+fn write_project_config(dir: &std::path::Path, body: &str) {
     let full = dir.join(crate::config_resolver::PROJECT_CONFIG_REL);
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
     std::fs::write(full, body).unwrap();
 }
 
-fn write_local_config(dir: &Path, body: &str) {
+fn write_local_config(dir: &std::path::Path, body: &str) {
     let full = dir.join(crate::config_resolver::LOCAL_CONFIG_REL);
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
     std::fs::write(full, body).unwrap();

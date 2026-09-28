@@ -38,6 +38,15 @@
 //! registry, the same listener, the same [`super::run_with_proxy`] lifetime
 //! (placeholder closed the moment the child exits).
 //!
+//! # Account rotation (#8818)
+//!
+//! With `--docker-workspace` and a valid `LOOM_TOKEN_NAME` (the account the
+//! adapter's host-side selection exported), the launch record remembers that
+//! account and the registry gets a [`super::rotation::HostPool`] over the
+//! workspace's pool, so the in-container wrapper can ask the HOST to bad-mark
+//! it and swap in another behind the same placeholder. Without either, the
+//! launch runs exactly as before and every rotation request is refused.
+//!
 //! # Fail closed
 //!
 //! Every problem is an exit-78 refusal, never a launch with the real value:
@@ -180,6 +189,12 @@ pub(crate) fn build(
         )));
     }
 
+    // #8699's proxy-side bad-marking applies to the `api_keys_pool` ladder
+    // `worker_spawn::credential::resolve` walks (see `mod::prepare`); this
+    // path is handed an already-selected Claude OAuth token from
+    // `tokens_pool` instead (#8697), so it never carries pool attribution and
+    // the proxy bad-marks nothing here. See #8818 for that pool's own
+    // host-side rotation.
     let prepared = arm(
         secret.clone(),
         args.provider.clone(),
@@ -187,7 +202,34 @@ pub(crate) fn build(
         upstream,
         &[args.credential_env.as_str()],
         Vec::new(),
+        None,
     )?;
+
+    if let Some(workspace) = &args.docker_workspace {
+        let var = |name: &str| {
+            env.iter()
+                .find(|(k, _)| k.to_str() == Some(name))
+                .and_then(|(_, v)| v.to_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        if let Some(account) =
+            var("LOOM_TOKEN_NAME").filter(|a| super::rotation::is_account_name(a))
+        {
+            let max = var("LOOM_EGRESS_PROXY_MAX_ROTATIONS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(super::rotation::DEFAULT_MAX_ROTATIONS);
+            prepared.registry.set_account(&account);
+            prepared.registry.enable_rotation(
+                std::sync::Arc::new(super::rotation::HostPool {
+                    workspace: workspace.clone(),
+                    model: var("LOOM_MODEL"),
+                }),
+                max,
+            );
+        }
+    }
 
     let mut command = Command::new(program);
     command.args(docker_args(args, rest, env)?);
@@ -291,7 +333,7 @@ pub fn cli(args: ExecArgs) -> anyhow::Result<()> {
     let outcome = build(&args, &env).and_then(|(prepared, command)| {
         // Secret-free: launch id, upstream origin, bind address, header style.
         eprintln!("{}", prepared.dispatch_marker());
-        run_with_proxy(prepared, command)
+        run_with_proxy(prepared, command, &mut std::io::stderr())
     });
     if let Err(error) = outcome {
         eprintln!("{}", error.message);

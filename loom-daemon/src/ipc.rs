@@ -2679,6 +2679,12 @@ pub fn build_daemon_status(
         rate_limit_breaker: crate::rate_limit_breaker::global_snapshot()
             .map(crate::rate_limit_breaker::RateLimitSnapshot::into_status)
             .map(Box::new),
+        // Forge call accounting (#9251): host-wide last-hour window from the
+        // per-host sink + this process's totals; a local read, no forge call.
+        forge_calls: Some(Box::new(crate::forge_call_stats::status_report(
+            chrono::Utc::now(),
+            crate::rate_limit_breaker::global_snapshot().as_ref(),
+        ))),
         // Observability host-identity mismatch (#4830) — same process-global
         // snapshot pattern again, registered only when the exporter actually
         // starts, so a disabled/keyless exporter always reads `None`.
@@ -2765,6 +2771,7 @@ pub fn build_daemon_status(
         // Unset globals (loop never spawned) read as `None` / empty — honestly
         // "no tick observed", never "nothing happened".
         last_work_finder_tick: crate::work_finder::last_tick_summary(),
+        operator_priority_landing: crate::star_liveness::last_report(),
         role_tick_records: crate::role_runner::role_tick_records(),
         // #6201: the never-evicted last-tick-per-pair companion to the ring
         // above — see `RoleLastTick`'s doc comment for why both are needed.

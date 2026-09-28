@@ -107,6 +107,7 @@ fn test_daemon_status_request_response_round_trip() {
         host_breaker: None,
         admission_brake: None,
         rate_limit_breaker: None,
+        forge_calls: None,
         safehouse: Some(crate::types::SafehouseStatus {
             state: "connected".to_string(),
             socket: Some(std::path::PathBuf::from("/tmp/safehoused.sock")),
@@ -120,6 +121,30 @@ fn test_daemon_status_request_response_round_trip() {
             seen: 9,
             dispatched: 1,
             skipped_in_flight: 8,
+            ..Default::default()
+        }),
+        // #9244 C: a starred issue escalated to the operator must survive the wire.
+        operator_priority_landing: Some(crate::types::StarLivenessReport {
+            at: Some(chrono::Utc::now()),
+            rows: vec![crate::types::StarLandingRow {
+                repo: "o/r".to_string(),
+                issue: 8191,
+                stage: crate::types::LandingStage::NeedsOperator,
+                next_actor: "operator".to_string(),
+                stage_since: None,
+                time_in_stage_secs: 60,
+                pr: Some(9276),
+                blocked_by: None,
+                no_capacity: None,
+                ask: Some(crate::types::OperatorAsk {
+                    kind: crate::types::AskKind::MergeRefused,
+                    key: "merge-refused:pr-9276".to_string(),
+                    text: "reconcile the merge settings".to_string(),
+                }),
+                inherited_from: None,
+                operator_priority_at: None,
+                last_progress_at: None,
+            }],
             ..Default::default()
         }),
         role_tick_records: vec![crate::types::RoleTickRecord {
@@ -168,6 +193,11 @@ fn test_daemon_status_request_response_round_trip() {
             crate::types::ObservabilityExportStatus {
                 state: crate::types::ObservabilityExportState::Healthy,
                 exporter: Some("https".to_string()),
+                // #9015: a healthy cell whose one verified hop is a LOCAL
+                // collector — the scope facts have to survive the wire, or the
+                // reading client is back to inferring them.
+                endpoint: Some("http://127.0.0.1:14318/v1/logs".to_string()),
+                endpoint_loopback: true,
                 ..Default::default()
             },
         )]
@@ -183,6 +213,18 @@ fn test_daemon_status_request_response_round_trip() {
             consecutive_failures: 5,
             poll_interval_secs: 300,
             last_error: Some("auth_failed".to_string()),
+            // #8995: the wake counters are collected in the daemon process and
+            // rendered by the CLI in another, so they only exist as an operator
+            // surface if they survive this hop.
+            wakes: vec![crate::types::ForgeEventsWakeStatus {
+                consumer: "claim-reconcile wake".to_string(),
+                config_key: "claimReconcileWake".to_string(),
+                cadence_secs: 600,
+                min_spacing_secs: 30,
+                prompts: 9,
+                early_ticks: 2,
+                throttled: 7,
+            }],
             ..Default::default()
         }),
         peer_claims: None,
@@ -210,6 +252,15 @@ fn test_daemon_status_request_response_round_trip() {
     match back {
         Response::DaemonStatus(r) => {
             assert_eq!(r.token_pool_size, 4);
+            let landing = r
+                .operator_priority_landing
+                .as_ref()
+                .expect("landing survives");
+            assert_eq!(landing.rows[0].issue, 8191);
+            assert_eq!(
+                landing.rows[0].ask.as_ref().map(|a| a.kind),
+                Some(crate::types::AskKind::MergeRefused)
+            );
             assert_eq!(r.token_pool_dir, Some(std::path::PathBuf::from("/repo/a/.loom/tokens")));
             assert_eq!(r.disk_headroom, 10);
             assert_eq!(r.logical_cpus, 8);
@@ -256,6 +307,19 @@ fn test_daemon_status_request_response_round_trip() {
             assert_eq!(export.host_id.as_deref(), Some("robb-studio"));
             assert_eq!(export.ingest_host_id.as_deref(), Some("robb-pro"));
             assert_eq!(export.records_exported, 128);
+            // #9015: how far the state reaches travels with it — always
+            // first-hop today, plus whether that hop is a local collector.
+            assert_eq!(export.scope, crate::types::ObservabilityExportScope::FirstHop);
+            assert!(!export.endpoint_loopback, "a remote endpoint is not a local hop");
+            let local_cell = r
+                .observability_exports
+                .get("https")
+                .expect("per-exporter cell round-trips");
+            assert_eq!(local_cell.scope, crate::types::ObservabilityExportScope::FirstHop);
+            assert!(
+                local_cell.endpoint_loopback,
+                "the per-exporter cell keeps its own local-collector flag"
+            );
             // ADR-0021 (#8765): the feed-consumer record survives the wire
             // too, including the error CLASS underneath a backoff promotion
             // — `backoff` answers "how often is it retrying", never "why".
@@ -269,6 +333,16 @@ fn test_daemon_status_request_response_round_trip() {
             assert_eq!(feed.events_observed, 340);
             assert_eq!(feed.last_error.as_deref(), Some("auth_failed"));
             assert_eq!(feed.poll_interval_secs, 300);
+            // #8995 item 3: one entry per ARMED consumer, keyed by the flag an
+            // operator greps their config for, with the counters intact — a
+            // truncated `wakes` would render as "armed and idle", which is a
+            // different answer from the truth.
+            let wake = feed.wakes.first().expect("an armed consumer round-trips");
+            assert_eq!(wake.config_key, "claimReconcileWake");
+            assert_eq!(wake.consumer, "claim-reconcile wake");
+            assert_eq!((wake.prompts, wake.early_ticks, wake.throttled), (9, 2, 7));
+            // Derived from the two cadence fields, so it must carry them too.
+            assert_eq!(wake.max_multiplier(), 20);
             assert_eq!(r.per_repo[0].health_gate_enabled, Some(true));
             assert!(r.per_repo[0].health_gate_verdict_at.is_some());
             assert_eq!(

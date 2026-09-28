@@ -210,10 +210,29 @@ pub(crate) fn handle_checkpoint_command(action: CheckpointAction) -> Result<()> 
 /// `loom-daemon sweep-experiment <subcommand>` — backs `sweep-experiment.sh`.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> Result<()> {
-    use script_helpers::{model_tiers, sweep_experiment as se};
+    use script_helpers::{model_tiers, sweep_experiment as se, sweep_experiment_arms as arms};
 
     let env_mode = std::env::var("LOOM_MODEL_EXPERIMENT").ok();
     let env_canary = std::env::var("LOOM_MODEL_EXPERIMENT_CANARY").ok();
+    let env_fraction = std::env::var(arms::BUDGET_FRACTION_ENV).ok();
+
+    /// Resolve the roster + budget fraction from an already-loaded config,
+    /// printing every warning on stderr (the `sweep-experiment` convention).
+    /// Absent config, this is the built-in A/B pair at fraction 1.0 — i.e.
+    /// byte-for-byte the pre-#9122 behavior.
+    fn arm_plan(
+        cfg: &serde_json::Value,
+        env_fraction: Option<&str>,
+    ) -> (script_helpers::sweep_experiment_arms::ExperimentArms, f64) {
+        use script_helpers::sweep_experiment_arms as arms;
+        let (roster, mut warnings) = arms::ExperimentArms::load(cfg);
+        let (fraction, fraction_warnings) = arms::resolve_budget_fraction(env_fraction, cfg);
+        warnings.extend(fraction_warnings);
+        for w in warnings {
+            eprintln!("[sweep-experiment] WARNING: {w}");
+        }
+        (roster, fraction)
+    }
 
     match action {
         SweepExperimentAction::ResolveMode { config } => {
@@ -237,16 +256,25 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
             resolve,
             config,
         } => {
-            let arm = se::assign_arm(issue, complexity.as_deref());
+            // The config is now loaded UNCONDITIONALLY (#9122), not only under
+            // `--resolve`: the arm roster and the budget fraction both live in
+            // it. An unconfigured repo still yields the built-in A/B pair at
+            // fraction 1.0, so the output is unchanged.
+            let cfg = model_tiers::load_config(config.as_deref().map(Path::new));
+            let (roster, fraction) = arm_plan(&cfg, env_fraction.as_deref());
+            let assigned = arms::in_experiment(issue, complexity.as_deref(), fraction)
+                .then(|| roster.assign(issue, complexity.as_deref()));
             // The default prints the logical alias (Arm A -> `opus`), which the
             // arm identity and the shell test key off. `--resolve` prints the
             // concrete ID the #3982 tier map resolves that alias to.
-            let model = if resolve {
-                let cfg = model_tiers::load_config(config.as_deref().map(Path::new));
-                se::resolved_arm_model(arm, &cfg)
-            } else {
-                se::arm_model(arm)
-            };
+            let model = assigned.map(|a| {
+                if resolve {
+                    a.resolved_model(&cfg)
+                } else {
+                    a.model.clone()
+                }
+            });
+            let arm = assigned.map(|a| a.id.as_str());
             if format == "json" {
                 println!(
                     "{}",
@@ -255,10 +283,14 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
                         "complexity": se::normalize_complexity(complexity.as_deref()),
                         "arm": arm,
                         "model": model,
+                        "in_experiment": arm.is_some(),
                     })
                 );
             } else {
-                println!("{arm} {model}");
+                // Sampled OUT of the experiment => `none -`: no arm, no forced
+                // model, caller proceeds with unmodified tier-2.5/tier-3
+                // resolution (the `observe`-mode null-arm convention).
+                println!("{} {}", arm.unwrap_or("none"), model.as_deref().unwrap_or("-"));
             }
             Ok(())
         }
@@ -278,15 +310,25 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
             for w in warnings {
                 eprintln!("[sweep-experiment] WARNING: {w}");
             }
-            let mut arm: Option<&str> = None;
+            let mut arm: Option<String> = None;
             let mut model = String::new();
             let mut canary_source: Option<String> = None;
             if mode == "experiment" {
-                let assigned = se::assign_arm(issue, complexity.as_deref());
-                arm = Some(assigned);
-                model = se::arm_model(assigned);
+                let (roster, fraction) = arm_plan(&cfg, env_fraction.as_deref());
                 let (_ok, source, _w) = se::evaluate_canary_default(env_canary.as_deref(), None);
                 canary_source = source.map(|s| s.label().to_string());
+                if !arms::in_experiment(issue, complexity.as_deref(), fraction) {
+                    // Sampled out by the budget cap (#9122): no arm, no
+                    // forcing, its own loud banner.
+                    println!(
+                        "{}",
+                        arms::format_budget_skip_banner(issue, fraction, canary_source.as_deref())
+                    );
+                    return Ok(());
+                }
+                let assigned = roster.assign(issue, complexity.as_deref());
+                arm = Some(assigned.id.clone());
+                model = assigned.model.clone();
             } else if raw_mode == "experiment" {
                 // Requested experiment but downgraded to observe — canary
                 // unconfirmed.
@@ -297,7 +339,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
                 se::format_banner(
                     &mode,
                     issue,
-                    arm,
+                    arm.as_deref(),
                     if model.is_empty() {
                         None
                     } else {

@@ -286,6 +286,29 @@ pub fn disarm_singleton_job(job_name: &str) {
         .remove(job_name);
 }
 
+/// Process-lifetime set of singleton jobs whose most recent
+/// [`arm_singleton_job`] call was refused because **no** `fleet.captain` is
+/// declared (#9014) — the misconfiguration that otherwise stops such a job
+/// on every host with only a log line to show for it. Kept separate from a
+/// not-this-host refusal, which is routine on every non-captain host.
+fn captainless_registry() -> &'static Mutex<BTreeSet<String>> {
+    static REGISTRY: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// Singleton job names currently refused on this host for want of a declared
+/// `fleet.captain` (#9014), sorted. Sampled into
+/// [`crate::telemetry::HostHealthRecord::captainless_singleton_jobs`].
+#[must_use]
+pub fn captainless_singleton_job_names() -> Vec<String> {
+    captainless_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect()
+}
+
 /// Gate `job_name` against `root`'s declared `fleet.captain` and
 /// `current_host_id`, updating the process-lifetime armed registry to match
 /// the outcome (armed ⇒ recorded; anything else ⇒ removed, so a job that
@@ -304,6 +327,16 @@ pub fn disarm_singleton_job(job_name: &str) {
 /// require a daemon restart.
 pub fn arm_singleton_job(job_name: &str, root: &Path, current_host_id: &str) -> Result<(), String> {
     let gate = resolve_gate_for_root(root, current_host_id);
+    {
+        let mut captainless = captainless_registry()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if gate == CaptainGate::NoCaptainDeclared {
+            captainless.insert(job_name.to_string());
+        } else {
+            captainless.remove(job_name);
+        }
+    }
     if gate.is_armed() {
         armed_registry()
             .lock()
@@ -371,6 +404,41 @@ fn save_shell_arm_registry(root: &Path, registry: &ShellArmRegistry) -> io::Resu
     std::fs::rename(&temp, &path)
 }
 
+/// A held, exclusive, blocking `flock` on `armed.lock` beside the registry
+/// (#9014), released on drop. Serialises the load → modify → save in
+/// [`record_shell_arm`]/[`forget_shell_arm`] so two concurrent
+/// `loom-daemon fleet-captain` invocations on one host can no longer each
+/// read the old file and have the second rename drop the first's entry.
+/// Reads stay lock-free: the save is an atomic rename, so a reader always
+/// sees one complete version.
+struct ShellArmLock {
+    _file: std::fs::File,
+}
+
+impl ShellArmLock {
+    fn acquire(root: &Path) -> io::Result<Self> {
+        let path = shell_arm_registry_path(root).with_extension("lock");
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `flock` on a descriptor we own for the duration of the
+            // call; no memory is shared with the kernel.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 /// Record (or refresh) a durable shell-driven arm for `job_name` on this
 /// host, called by `cli/fleet_captain_cmd.rs`'s `run()` after a successful
 /// (`Armed`) gate check — never by `evaluate()`, which stays a pure read (see
@@ -380,6 +448,7 @@ fn save_shell_arm_registry(root: &Path, registry: &ShellArmRegistry) -> io::Resu
 /// "refresh, don't duplicate" is a property of the data shape, not extra
 /// logic.
 pub fn record_shell_arm(root: &Path, job_name: &str, now: DateTime<Utc>) -> io::Result<()> {
+    let _lock = ShellArmLock::acquire(root)?;
     let mut registry = load_shell_arm_registry(root);
     registry.insert(job_name.to_string(), ShellArmEntry { last_armed_at: now });
     save_shell_arm_registry(root, &registry)
@@ -392,6 +461,7 @@ pub fn record_shell_arm(root: &Path, job_name: &str, now: DateTime<Utc>) -> io::
 /// [`shell_armed_job_names`] already guarantees no entry survives forever
 /// even if this is never called.
 pub fn forget_shell_arm(root: &Path, job_name: &str) -> io::Result<()> {
+    let _lock = ShellArmLock::acquire(root)?;
     let mut registry = load_shell_arm_registry(root);
     if registry.remove(job_name).is_some() {
         save_shell_arm_registry(root, &registry)
@@ -684,5 +754,48 @@ mod tests {
         // this root's own (fresh, unique-per-test) durable file.
         let dir = tempdir().unwrap();
         assert!(shell_armed_job_names(dir.path(), Utc::now(), Duration::from_secs(3600)).is_empty());
+    }
+
+    #[test]
+    fn a_no_captain_refusal_is_recorded_as_captainless_9014() {
+        let dir = tempdir().unwrap();
+        let job = format!("captainless-job-{}", std::process::id());
+        let config = dir.path().join(crate::config_resolver::LEGACY_CONFIG_REL);
+
+        write(&config, r#"{}"#);
+        assert!(arm_singleton_job(&job, dir.path(), "host-a").is_err());
+        assert!(captainless_singleton_job_names().contains(&job));
+
+        // A declared captain on another host is a routine refusal, not a
+        // misconfiguration — it must leave the captainless set.
+        write(&config, r#"{"fleet": {"captain": "host-b"}}"#);
+        assert!(arm_singleton_job(&job, dir.path(), "host-a").is_err());
+        assert!(!captainless_singleton_job_names().contains(&job));
+
+        write(&config, r#"{}"#);
+        assert!(arm_singleton_job(&job, dir.path(), "host-a").is_err());
+        write(&config, r#"{"fleet": {"captain": "host-a"}}"#);
+        assert!(arm_singleton_job(&job, dir.path(), "host-a").is_ok());
+        assert!(!captainless_singleton_job_names().contains(&job));
+        disarm_singleton_job(&job);
+    }
+
+    #[test]
+    fn concurrent_shell_arms_on_one_host_lose_no_entry_9014() {
+        // Without the registry lock, each writer read the old file and the
+        // last rename won, dropping the other writers' entries.
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let now = Utc::now();
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let root = root.clone();
+                std::thread::spawn(move || record_shell_arm(&root, &format!("job-{i}"), now))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(shell_armed_job_names(&root, now, Duration::from_secs(60)).len(), 16);
     }
 }

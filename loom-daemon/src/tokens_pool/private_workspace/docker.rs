@@ -410,9 +410,16 @@ pub(super) fn control(config: &Config, id: &str) -> Result<String> {
     bundle::accept(&observe_control(id)?, &config.profile)
 }
 
-/// Recheck a bound control identity immediately before mutable work.
-pub(super) fn recheck_control(config: &Config, id: &str, bound: &str) -> Result<()> {
-    bundle::rebind(&observe_control(id)?, &config.profile, bound)
+/// Recheck a bound control identity immediately before mutable work, and hand
+/// back the observation it was proven against. The report carries the one
+/// boundary fact identity alone cannot be read back out of — whether this
+/// clone has a managed registration at all (`Report::managed`) — which
+/// containment admission (#8787) requires; it is part of the hashed identity,
+/// so it cannot drift from what was bound.
+pub(super) fn recheck_control(config: &Config, id: &str, bound: &str) -> Result<bundle::Report> {
+    let report = observe_control(id)?;
+    bundle::rebind(&report, &config.profile, bound)?;
+    Ok(report)
 }
 
 pub(super) fn prepare(config: &Config, id: &str, branch: Option<&str>) -> Result<String> {

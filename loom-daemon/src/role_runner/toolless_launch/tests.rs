@@ -48,6 +48,7 @@ fn resolved(runtime: &str) -> ResolvedRuntime {
         runtime_manifest: PathBuf::from("/nonexistent/runtime.json"),
         suggested_worker_type: None,
         preference: None,
+        execution: None,
     }
 }
 

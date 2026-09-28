@@ -658,6 +658,197 @@ Both remain open in [#8946](https://github.com/rjwalters/loom/issues/8946),
 which also asks the API step to confirm whether the three `*_keys` tables need
 a `retention.sql` statement.
 
+## Backup-restore rehearsal overlay (2026-09-28)
+
+"Restart and recovery" above is explicit that what it verified was a normal
+stop/start, **not** a volume-loss backup restoration — so the README's closing
+instruction to *"test restoration into a separate project/network"* has been
+unrehearsed advice for the whole trial. `restore-override.yaml` and the README's
+"Backup-restore rehearsal" section are that separate project, made reviewable.
+
+**Executed here: the merged render only.** From
+`defaults/observability/signoz/`, on Docker Desktop 29.8.0 / Compose v5.5.1 with
+a throwaway placeholder env file outside the checkout:
+
+```console
+docker compose --env-file <private> -f pours/deployment/compose.yaml -f restore-override.yaml config
+```
+
+It renders, and every isolation property the procedure depends on is present in
+the output rather than merely intended: project `loom-signoz-restore`; all four
+volumes at `loom-signoz-restore-*` names; all six pinned container names at
+`loom-signoz-restore-*`; `loom-signoz-network` → `loom-signoz-restore-network`;
+the external `loom-observability` gateway network → an `internal: true` bridge
+named `loom-signoz-restore-quarantine`; the ingester at `deploy.replicas: 0`; and
+exactly one published port, `127.0.0.1:18091:8080`, the live `18081` binding
+having been replaced rather than appended (that replacement is what the
+`!override` tag buys, and it needs Compose ≥ 2.24.4).
+
+Rendering the procedure — rather than reading it — is what found three defects in
+its first draft, each of which would have surfaced on the trial host as a failed
+or dangerous rehearsal:
+
+| Defect | Consequence if it had shipped |
+| --- | --- |
+| `loom-signoz-metastore-postgres-0` kept its live `container_name` | The rehearsal collides with the running trial's PostgreSQL container by name |
+| Overlay passed as `-f ../../restore-override.yaml` | Fails outright from the documented working directory: `-f` resolves against the CWD, not the first compose file's directory |
+| `exec -T loom-signoz-restore-telemetrystore-clickhouse-0-0` | `exec` addresses a **service**; the overlay renames containers, not services. The same line minus `-f restore-override.yaml` reads the **live** ClickHouse |
+
+All three are now enforced statically by
+`loom-daemon/tests/signoz_restore_contract.rs` (13 tests, no Docker/network/
+credential), which re-derives the volume set, the pinned container names, the
+external-network key and the published-port list from the *rendered* compose — so
+a later `foundryctl forge` re-render that adds a fifth volume or a second port
+cannot silently escape the overlay. Each of the three was confirmed to fail the
+intended test and only that test, by reintroducing the defect and re-running.
+
+**Not executed: the rehearsal itself.** No backup tarball, trial-host volume or
+private env file is reachable from a worktree, and the trial project is stopped
+with volumes preserved on a host that an earlier session recorded as unable to
+hold two stacks at once. Nothing above is presented as an observation of restored
+data: the snapshot, restore, cross-project query diff, account/dashboard login and
+teardown steps are all unrun. [#9279](https://github.com/rjwalters/loom/issues/9279)
+owns that run and flips the ledger row below when it happens.
+
+## Co-resident 2.5-day soak: footprint, and a self-telemetry merge failure (2026-09-28)
+
+**What was observed.** A long-running `loom-signoz` project on the primary
+dispatch host, measured read-only: `docker stats`/`inspect`/`system df` and
+`SELECT`s against ClickHouse `system.*` tables. Nothing was restarted or
+re-rendered, and no telemetry was sent. The host is Docker Desktop 29.8.0 on a
+Linux aarch64 VM with 24 CPUs and 46.96 GiB. The project started at
+2026-09-25T17:48Z and ran all five `casting.yaml` digests exactly, with 0
+restarts and no OOM kill. It ran next to `loom-clickstack` (up since
+2026-09-24T19:06Z), the neutral gateway and a scratch CI gateway (#8826).
+
+The earlier sessions above could not keep both backends healthy on an 8 GB VM.
+Here they coexisted for more than two days. That is a statement about host
+capacity, not a product comparison.
+
+**Footprint.** These are three `docker stats` samples taken 2 s apart from
+06:41:21Z, before any probe below. `docker stats` memory includes page cache.
+
+| Service | CPU | Memory / `mem_limit` | Block I/O read / write since start |
+| --- | --- | --- | --- |
+| ClickHouse | **55–123 %** | 1.65–1.86 GiB / 2 GiB | 369 GB / 92.6 GB |
+| Ingester | 0.04 % | 234 MiB / 512 MiB | 34.9 GB / 29.4 MB |
+| SigNoz app | 0.01 % | 139 MiB / 768 MiB | 54.6 GB / 22.9 MB |
+| Keeper | 0.7–1.0 % | 74 MiB / 256 MiB | 849 GB / 6.1 GB |
+| PostgreSQL | 0.00 % | 67 MiB / 256 MiB | 5.58 GB / 40.4 MB |
+| *ClickStack, for reference* | 4–44 % | 2.49 GiB / 3 GiB | 618 GB / 150 GB |
+| *Neutral gateway* | 0.01 % | 45 MiB / 512 MiB | 3.47 GB / 2.47 MB |
+
+ClickHouse's own accounting is lower than the `docker stats` figure: cgroup
+memory used 1.02 GiB, resident 1.03 GiB, jemalloc resident 1.45 GiB, and a
+server cap (`max_server_memory_usage`) of 1.80 GiB, which is 0.9 of the 2 GiB
+cgroup. The volumes held: ClickHouse data 586.6 MB, PostgreSQL 68.35 MB, Keeper
+22.82 MB and user scripts 1.5 MB. ClickStack's volumes held 784.4 MB of
+telemetry and 340.5 MB of metadata.
+
+**Self-telemetry dominates the disk.** Inside ClickHouse, active parts in
+`system` took **482 MiB**. `trace_log` alone was 340 MiB, `metric_log` 83 MiB
+and `text_log` 29 MiB. Every Loom signal database together took about
+**2.5 MiB**: metrics 1.47 MiB, metadata 0.36 MiB, logs 0.36 MiB and traces
+0.36 MiB. ClickStack shows the same shape, with 532.6 MiB of `system` against
+6.29 MiB of `default`. For both backends, at this trial's Loom volume, disk
+sizing is a question about ClickHouse's own logs, not about Loom's.
+
+**Query and insert latency.** This comes from `system.query_log`, which keeps
+only the current day under its 1-day TTL. Between 00:00Z and 06:42Z there were
+326 initial `SELECT`s, mostly the app's own metadata queries, at p50 5 ms, p95
+101 ms and max 5,829 ms. The 2,212 inserts ran at p50 4 ms and p95 45 ms. These
+were measured under the memory pressure described next, and they are not a
+benchmark.
+
+### `system.metric_log` stopped expiring under the rendered 2 GiB cap
+
+ClickHouse spent the CPU above retrying one background merge on its own
+**`system.metric_log`**. That table is 1,552 columns wide by default, and it
+touches no Loom table. `system.part_log` recorded the retries, and the failure
+rate grew every hour:
+
+| Hour (UTC, 2026-09-28) | 00 | 01 | 02 | 03 | 04 | 05 | 06 (partial) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Failed `metric_log` merges | 3,398 | 3,583 | 4,492 | 5,112 | 5,604 | 7,723 | 7,136 |
+| Successful `metric_log` merges | 24 | 24 | 22 | 23 | 23 | 23 | 17 |
+
+Each failure is `MEMORY_LIMIT_EXCEEDED`: the merge "would use 1.41 GiB" against
+1.80 GiB of RSS. The other system tables show 1 to 4 failures in the same
+window. The cumulative `QueryMemoryLimitExceeded` event counter stood at
+570,199.
+
+The consequence is retention, not only CPU. ClickHouse applies a TTL during
+merges, and the merge that failed is the one spanning the table's roughly 54
+parts. The ClickHouse data volume predates this container: it was created
+2026-09-22T09:13Z by an earlier start of the same project, and the container
+was recreated on 2026-09-25. The oldest active `metric_log` parts hold
+2026-09-22 rows, modified at **2026-09-22 18:56** and 19:26 UTC. At 07:30Z on
+2026-09-28 they were more than 5 days into a **1-day** TTL. Memory pressure from the retry loop also killed an
+ordinary read-only diagnostic `GROUP BY` on `system.trace_log` during this
+pass (`OvercommitTracker`).
+
+ClickStack does not show the failure. Its bundled ClickHouse is 26.8.7 under a
+3 GiB cap, and in the same window its `metric_log` recorded 9,516 successful
+and 2 failed merges, 7 active parts, with the oldest part at 2026-09-27 09:54.
+This is a sizing defect of the SigNoz render, not a finding about ClickHouse
+in general.
+
+**Reproduced on the pinned image, off the live stack.** The same
+`clickhouse-server:25.12.5@sha256:cacf32d6…` image ran in throwaway,
+volume-less containers under the same 2 GiB cap. Merges were held while
+one-second flushes accumulated parts, then one `OPTIMIZE … FINAL` merged 100
+inputs:
+
+| Schema | Rows merged | Inputs | Peak merge memory |
+| --- | --- | --- | --- |
+| Upstream wide `metric_log` (1,552 columns) | 144 | 100 | **749.65 MiB** |
+| `transposed_with_wide_view` (6 columns) | 278,640 | 100 | **38.74 MiB** |
+
+Wide-table merge memory tracks inputs × columns, almost independent of rows.
+750 MiB on top of the live server's roughly 1 GiB baseline breaks the 1.80 GiB
+cap, which is the failure observed live. With few inputs (65 rows, 2 parts)
+the same wide table peaked at 52 MiB, which explains why the small merges
+succeed.
+
+**Remedy (this increment).** `casting.yaml` gains a declarative patch on the
+rendered ClickHouse config. It `test`s the upstream `metric_log` TTL and then
+adds `schema_type: transposed_with_wide_view`. The pinned Foundry v0.2.17
+darwin/arm64 archive was checksum-verified. The unmodified casting reproduced
+the committed `pours/` byte for byte before the edit. The re-render changed
+exactly one line of `config-0-0.yaml` plus the lock, and a second render was
+identical. Changing the `test` value made `forge` exit 5 with no output, so an
+upstream TTL change cannot slip past the patch unreviewed.
+
+Four checks ran on the pinned image. `docker compose … config --quiet` accepts
+the render. The rendered `config-0-0.yaml` itself starts ClickHouse. It
+produces `system.metric_log` as a `SystemMetricLogView` backed by
+`transposed_metric_log`, which keeps `TTL event_date + toIntervalDay(1)`.
+Restarting a volume that already held the wide table renamed that table to
+`metric_log_0` and kept its data. The README therefore documents a
+force-recreate of the ClickHouse service followed by `DROP TABLE
+system.metric_log_0`. The test
+`signoz_deployment_contract::clickhouse_self_telemetry_stays_expirable_under_the_rendered_memory_cap`
+enforces the override, a `DELETE` TTL on every rendered `system.*_log`, and
+that README step.
+
+**Re-verified at commit time (07:30Z).** The live stack still showed the
+failure. In the preceding hour it had 9,318 failed `metric_log` merges against
+22 successful ones, 54 active parts and 1,552 columns. On the same pinned
+Foundry archive, the committed casting still re-rendered the committed
+`pours/` and lock byte for byte, and the patched render again differed by the
+single `schema_type` line and was deterministic. A tampered `test` value
+again made `forge` exit 5. A throwaway pinned-image container, given the
+rendered `metric_log` block (TTL plus `schema_type`), created
+`system.metric_log` as a `SystemMetricLogView` over a 6-column
+`transposed_metric_log` with `TTL event_date + toIntervalDay(1)`. The
+merge-memory reproduction in the table above was not re-run.
+
+**Not done here.** The live project was **not** re-rendered or restarted. It
+is a shared deployment that is still running, and applying the change is the
+README's documented operator step. Its effect over a multi-day soak therefore
+remains unobserved on a live stack. After applying it, the README's
+`part_log` failed-merge query is the check that should return no rows.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -672,10 +863,12 @@ a `retention.sql` statement.
 | Actual Trace Explorer and correlated logs | Passed in authenticated UI; sanitized screenshots linked above |
 | Seven-day effective retention | API, overrides and actual DDL verified; metadata/grace exceptions documented |
 | Restart persistence and shared receiver recovery | Passed for signals, account and effective TTL; fresh three-signal replay indexed |
+| Backup restoration rehearsed into a separate project | **Open** — the isolated `loom-signoz-restore` overlay, its documented procedure and a 13-test static isolation contract all landed and the merged render was verified (see "Backup-restore rehearsal overlay"), but no restore has been executed against real tarballs: that needs the trial host ([#9279](https://github.com/rjwalters/loom/issues/9279)) |
 | Saved query artifacts for the shared fixture manifest | **Passed** — executed live above; matches the generated manifest exactly |
 | Shared fixture manifest observed in SigNoz | **Passed** — see "Shared fixture manifest, executed live" above: 37/14/3 signals, exact totals, graph, grouping, root-less detection, absence-vs-zero and privacy-sentinel queries all verified |
 | Real Loom canary / real Judge-Doctor repair trace | Open — the instrumentation slices landed (#8577/#8579), but #8525 itself stays open for its own live-run acceptance, and the run needs the trial host; see #8529 |
-| Repeated latency/footprint comparison | Open — shared evaluation #8529; neither session deployed ClickStack alongside SigNoz, so no simultaneous comparison has been attempted |
+| Repeated latency/footprint comparison | Open — shared evaluation #8529. A single **co-resident** point-in-time footprint (CPU, memory, volume and per-database disk for both backends) and a same-day query/insert latency distribution are now recorded (see "Co-resident 2.5-day soak"), but no controlled, repeated, same-workload comparison has been run |
+| ClickHouse self-telemetry expires under the rendered 2 GiB cap | **Fixed in the render, not yet observed on a live soak.** The wide upstream `metric_log` failed tens of thousands of TTL merges a day, and its parts outlived their 1-day TTL. The transposed schema, reproduced at about 19x lower peak merge memory on the pinned image, is CI-enforced. A live re-render plus a multi-day failed-merge check is outstanding |
 | CI retro queries (`ci-queries.sql`, #8826) | **Passed on live capture** — every section non-empty; metric-path counts and conclusion split reconcile exactly to the records (592 runs / 2,131 jobs); see "CI retro queries, executed live". Section 5's chunk join is unobserved on real `ci.job.log` data (none reached the trial) |
 | CI metrics retention ≥ 30 days (#8826) | **Passed in effective DDL** — every metric signal table at 30 days |
 | CI logs/traces at 7 days on the current trial | **Open** — API-owned tables still at the upstream 15 days; needs the org login ([#8946](https://github.com/rjwalters/loom/issues/8946)) |

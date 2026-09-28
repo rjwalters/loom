@@ -30,7 +30,7 @@ jobs:
       LOOM_BUILD_GATE_TIER: full
     steps:
       - name: Validate immutable candidate inputs
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             core.exportVariable('CARGO_TARGET_DIR', require('path').join(process.env.RUNNER_TEMP, 'loom-hosted-gate-target'));
@@ -40,13 +40,17 @@ jobs:
             if (!/^[1-9][0-9]{0,9}$/.test(process.env.LOOM_GATE_ISSUE)) {
               throw new Error('gate_issue must be a positive issue number');
             }
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.candidate_sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
+        with:
+          tool: nextest
       - name: Create exact-candidate managed worktree
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,7 +58,7 @@ jobs:
           git branch hosted-gate-base "$LOOM_GATE_SHA"
           bash .loom/scripts/worktree.sh "$LOOM_GATE_ISSUE" "hosted-gate-$GITHUB_RUN_ID" --base hosted-gate-base
       - name: Verify worktree and record gate predicates
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             const fs = require('fs');
@@ -86,7 +90,7 @@ jobs:
         shell: bash
         run: cargo nextest run --package loom-daemon --features otlp --lib --bins --profile ci 2>&1 | tee "$RUNNER_TEMP/hosted-otlp-tests.log"
       - name: Run available lifecycle and native isolation integration tests
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             const fs = require('fs');
@@ -124,7 +128,7 @@ jobs:
             }
       - name: Retain actual gate output and immutable candidate evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hosted-gate-${{ inputs.candidate_sha }}
           path: |

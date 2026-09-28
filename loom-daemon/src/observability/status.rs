@@ -33,22 +33,27 @@ impl ExportStatus {
         exporter: &str,
         flush_interval_secs: u64,
     ) -> Self {
+        let mut initial = crate::types::ObservabilityExportStatus {
+            state: crate::types::ObservabilityExportState::Starting,
+            host_id: Some(host_id.to_string()),
+            ingest_host_id: None,
+            endpoint: Some(endpoint.to_string()),
+            exporter: Some(exporter.to_string()),
+            started_at: Some(chrono::Utc::now()),
+            last_success_at: None,
+            last_failure_at: None,
+            last_failure_detail: None,
+            records_exported: 0,
+            signal_counts: Default::default(),
+            consecutive_failures: 0,
+            flush_interval_secs: Some(flush_interval_secs),
+            ..Default::default()
+        };
+        // #9015: stamp the first-hop scope and whether this endpoint is a local
+        // collector, from the endpoint just recorded above.
+        initial.refresh_endpoint_scope();
         ExportStatus {
-            inner: std::sync::Mutex::new(crate::types::ObservabilityExportStatus {
-                state: crate::types::ObservabilityExportState::Starting,
-                host_id: Some(host_id.to_string()),
-                ingest_host_id: None,
-                endpoint: Some(endpoint.to_string()),
-                exporter: Some(exporter.to_string()),
-                started_at: Some(chrono::Utc::now()),
-                last_success_at: None,
-                last_failure_at: None,
-                last_failure_detail: None,
-                records_exported: 0,
-                signal_counts: Default::default(),
-                consecutive_failures: 0,
-                flush_interval_secs: Some(flush_interval_secs),
-            }),
+            inner: std::sync::Mutex::new(initial),
         }
     }
 
@@ -113,7 +118,7 @@ impl ExportStatus {
     }
 
     /// The current record, with [`crate::types::ObservabilityExportStatus::state`]
-    /// re-derived as of now. `ingest_host_id` is folded in from
+    /// (and the #9015 scope fields) re-derived as of now. `ingest_host_id` is folded in from
     /// [`super::global_host_id_mismatch`] by [`super::global_export_status`], not here — this
     /// cell knows nothing about identity.
     #[must_use]
@@ -124,6 +129,7 @@ impl ExportStatus {
             .expect("observability export status mutex poisoned")
             .clone();
         snapshot.state = snapshot.classify(chrono::Utc::now());
+        snapshot.refresh_endpoint_scope();
         snapshot
     }
 }

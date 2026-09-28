@@ -12,6 +12,7 @@ use crate::activity::transcript_ingest::{ingest, IngestOptions};
 use crate::activity::ActivityDb;
 use crate::observability::queue::DurableQueue;
 use crate::observability::session_summary::SessionSummarySink;
+use crate::telemetry::trace::{SpanStatus, TraceContext};
 use crate::telemetry::TelemetryRecord;
 
 fn row(input: i64, output: i64, read: i64, w5: i64, w1: i64) -> ModelUsageTotals {
@@ -46,7 +47,21 @@ fn usage_sums_every_model_row_with_both_cache_write_buckets() {
 fn the_usage_span_carries_only_allowlisted_counters_and_zero_stays_zero() {
     let parent = TraceContext::root(true);
     let at = Utc::now();
-    let span = usage_span(&parent, at, at, TokenUsage::default(), Some("claude"));
+    let mut zero = row(0, 0, 0, 0, 0);
+    zero.model = "claude-sonnet-5".into();
+    let mut common = TraceAttributes::new();
+    common.insert("loom.runtime".into(), "claude".into());
+    let spans = spans::model_usage_spans(
+        &parent,
+        (at, at),
+        &[zero],
+        spans::UsageScope::Execution,
+        &common,
+        &cost::Pricing::with(None),
+    );
+    let [span] = spans.as_slice() else {
+        panic!("one model, one span: {spans:?}");
+    };
     assert_eq!(span.name.as_str(), "loom.runtime.usage");
     assert_eq!(span.context.trace_id, parent.trace_id);
     assert_eq!(span.parent_span_id.as_ref(), Some(&parent.span_id));
@@ -56,12 +71,22 @@ fn the_usage_span_carries_only_allowlisted_counters_and_zero_stays_zero() {
         "loom.tokens.cache_read",
         "loom.tokens.cache_write",
         "loom.tokens.total",
+        "loom.tokens.cache_write_5m",
+        "loom.tokens.cache_write_1h",
+        "gen_ai.usage.input_tokens",
+        "gen_ai.usage.output_tokens",
+        "gen_ai.usage.cache_read_input_tokens",
+        "gen_ai.usage.cache_creation_input_tokens",
     ] {
         assert_eq!(span.attributes[key], "0", "a measured zero is exported: {key}");
         assert!(crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key));
     }
-    assert_eq!(span.attributes.len(), 6, "{:?}", span.attributes);
-    assert_eq!(span.clone().bounded(), span, "survives export policy unchanged");
+    assert_eq!(span.attributes["loom.cost.usd_estimate"], "0.000000");
+    assert_eq!(span.attributes["loom.usage.scope"], "execution");
+    assert_eq!(span.attributes["loom.model"], "claude-sonnet-5");
+    // 11 counters, 4 cost keys, runtime, model, scope, and 3 provenance keys.
+    assert_eq!(span.attributes.len(), 21, "{:?}", span.attributes);
+    assert_eq!(span.clone().bounded(), *span, "survives export policy unchanged");
 }
 
 /// A traced execution with one completed `loom.runtime.run` span.
@@ -98,7 +123,11 @@ fn unknown_usage_journals_no_span() {
     let window = (Utc::now(), Utc::now());
     assert!(journal_usage(tmp.path(), "sweep-1", window, None, None)
         .unwrap()
-        .is_none());
+        .is_empty());
+    let empty: &[ModelUsageTotals] = &[];
+    assert!(journal_usage(tmp.path(), "sweep-1", window, Some(empty), None)
+        .unwrap()
+        .is_empty());
     let store = TraceStore::new(tmp.path());
     let spans = Journal::for_context(&store.path(tmp.path(), "sweep-1"))
         .completed()
@@ -110,10 +139,10 @@ fn unknown_usage_journals_no_span() {
 fn an_untraced_execution_journals_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let window = (Utc::now(), Utc::now());
-    let usage = Some(TokenUsage::default());
-    assert!(journal_usage(tmp.path(), "never-traced", window, usage, None)
+    let rows = [row(1, 1, 1, 1, 1)];
+    assert!(journal_usage(tmp.path(), "never-traced", window, Some(&rows), None)
         .unwrap()
-        .is_none());
+        .is_empty());
     assert!(!tmp.path().join(".loom/logs/trace-context").exists());
 }
 
@@ -122,19 +151,18 @@ fn the_usage_span_is_a_child_of_the_runtime_run_span_over_its_interval() {
     let tmp = tempfile::tempdir().unwrap();
     let (root_context, run) = traced_execution(tmp.path(), "sweep-2");
     let window = (Utc::now() - Duration::hours(1), Utc::now());
-    let usage = TokenUsage {
-        input: 3,
-        output: 4,
-        cache_read: 5,
-        cache_write: 6,
+    let rows = [row(3, 4, 5, 6, 0)];
+    let spans =
+        journal_usage(tmp.path(), "sweep-2", window, Some(&rows), Some("opencode")).unwrap();
+    let [span] = spans.as_slice() else {
+        panic!("one model, one span: {spans:?}");
     };
-    let span = journal_usage(tmp.path(), "sweep-2", window, Some(usage), Some("opencode"))
-        .unwrap()
-        .unwrap();
     assert_eq!(span.context.trace_id, root_context.trace_id);
     assert_eq!(span.parent_span_id.as_ref(), Some(&run.context.span_id));
     assert_eq!((span.started_at, span.ended_at), (run.started_at, run.ended_at));
     assert_eq!(span.attributes["loom.tokens.total"], "18");
+    assert_eq!(span.attributes["loom.sweep_id"], "sweep-2");
+    assert_eq!(span.attributes["loom.usage.scope"], "execution");
     assert_eq!(span.attributes["loom.runtime"], "opencode");
 
     // It drains to the export queue like every other journalled span.
@@ -195,6 +223,113 @@ fn a_session_joins_only_when_exactly_one_entry_names_its_issue_and_covers_its_st
     // Ambiguous (a second covering entry for the same issue): never guessed.
     plant(root, &entry(8908, -45, None));
     assert_eq!(context_for_session_at(Some(&cwd), Some(8908), at(-30), now), None);
+}
+
+/// #9013 item 2: past `MAX_ENTRIES` candidates, a second match could be
+/// sitting unread — report ambiguous (unjoined) rather than risk an
+/// incorrect single match.
+#[test]
+fn a_capped_directory_reports_ambiguous_even_with_one_real_covering_entry() {
+    use super::join::MAX_ENTRIES;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let cwd = root.to_string_lossy().into_owned();
+    let now = Utc::now();
+    let at = |m: i64| Some(now + Duration::minutes(m));
+
+    // The one entry that would otherwise join cleanly.
+    let real = entry(8908, -60, Some(-10));
+    plant(root, &real);
+    // Below the cap: still joins normally.
+    assert_eq!(
+        context_for_session_at(Some(&cwd), Some(8908), at(-30), now),
+        Some(real.context.clone())
+    );
+
+    // Push the directory past the cap with filler entries for other issues.
+    for issue in 0..(MAX_ENTRIES as u32 + 10) {
+        plant(root, &entry(90_000 + issue, -60, Some(-10)));
+    }
+    assert_eq!(
+        context_for_session_at(Some(&cwd), Some(8908), at(-30), now),
+        None,
+        "capped: never guess a single match past the read limit"
+    );
+}
+
+#[test]
+fn close_ends_and_renames_an_entry_opened_under_the_pre_story_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let context = TraceStore::new(root)
+        .load_or_create(root, "in-flight")
+        .unwrap()
+        .context;
+    let legacy = root
+        .join(JOIN_DIR)
+        .join(format!("{}.json", context.trace_id.as_str()));
+    let opened = JoinEntry {
+        issue: 9038,
+        context: context.clone(),
+        started_at: Utc::now() - Duration::minutes(5),
+        ended_at: None,
+    };
+    std::fs::create_dir_all(root.join(JOIN_DIR)).unwrap();
+    std::fs::write(&legacy, serde_json::to_vec(&opened).unwrap()).unwrap();
+    super::join::close(root, "in-flight", Utc::now());
+    assert!(!legacy.exists());
+    let current = root.join(JOIN_DIR).join(format!(
+        "{}-{}.json",
+        context.trace_id.as_str(),
+        context.span_id.as_str()
+    ));
+    let closed: JoinEntry = serde_json::from_slice(&std::fs::read(current).unwrap()).unwrap();
+    assert_eq!(closed.context, context);
+    assert!(closed.ended_at.is_some());
+}
+
+/// #9013 item 3: an entry left open across a restart (no live process wrote
+/// it since) is closed by the reconciliation pass instead of surviving the
+/// full 7-day open-retention window — bounded down to ordinary closed-entry
+/// retention, same as if the execution had exited cleanly.
+#[test]
+fn restart_reconciliation_closes_entries_still_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let cwd = root.to_string_lossy().into_owned();
+    let now = Utc::now();
+
+    // Orphaned: still open, no live process behind it.
+    let orphan = entry(9013, -60, None);
+    plant(root, &orphan);
+    // Already closed: reconciliation must leave its `ended_at` alone.
+    let already_closed = entry(1, -600, Some(-590));
+    plant(root, &already_closed);
+
+    let closed = super::join::close_orphaned_entries_at(root, now);
+    assert_eq!(closed, 1, "exactly the one still-open entry");
+
+    // The orphan is now closed at `now`, so a session starting well after it
+    // no longer matches — the whole point of bounding its retention down.
+    let at = Some(now + Duration::minutes(5));
+    assert_eq!(context_for_session_at(Some(&cwd), Some(9013), at, now), None);
+    // A session inside its (now-bounded) window still joins.
+    let inside = Some(orphan.started_at + Duration::minutes(1));
+    assert_eq!(
+        context_for_session_at(Some(&cwd), Some(9013), inside, now),
+        Some(orphan.context)
+    );
+
+    // The already-closed entry survived untouched.
+    let path = root
+        .join(JOIN_DIR)
+        .join(format!("{}.json", already_closed.context.trace_id.as_str()));
+    let unchanged: JoinEntry = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(unchanged.ended_at, already_closed.ended_at);
+
+    // Idempotent: nothing left open to close on a second pass.
+    assert_eq!(super::join::close_orphaned_entries_at(root, now), 0);
 }
 
 #[test]
@@ -272,15 +407,108 @@ fn a_traced_sweeps_session_summary_and_usage_span_share_one_trace_id() {
     assert!(!wire.contains("PRIVATE"), "no transcript body is exported");
 
     // The terminal transition journals the usage span into the same trace.
-    let span = journal_usage(
+    let spans = journal_usage(
         &workspace,
         "sweep-issue-8908",
         (dispatched, Utc::now()),
-        Some(TokenUsage::from_models(&[row(11, 22, 33, 44, 0)])),
+        Some(&[row(11, 22, 33, 44, 0)]),
         None,
     )
-    .unwrap()
     .unwrap();
+    let span = &spans[0];
     assert_eq!(span.context.trace_id, log_trace.trace_id);
     assert_eq!(span.attributes["loom.tokens.total"], "110");
+}
+
+/// #9013 item 5 (documented case): a subagent's own transcript names no
+/// issue in its head (it never restates the parent's `/loom:sweep N`
+/// command), so `context_for_session` never even reaches the trace-join
+/// lookup for it — `summary.issue` is `None`, and `issue?` short-circuits —
+/// even though the very same trace-join entry the sweep opened, covering the
+/// very same window, joins the *parent* transcript's own `session.summary`
+/// without ambiguity. The gap named by the module doc ("A subagent
+/// transcript whose head names no issue is therefore unjoined") is this
+/// module's documented, intentional fail-safe, not a bug: never guess an
+/// issue from a subagent's own prose.
+#[test]
+fn a_subagent_transcript_naming_no_issue_stays_unjoined_while_its_parent_joins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    traced_execution(&workspace, "sweep-issue-8908");
+    let dispatched = Utc::now() - Duration::minutes(40);
+    open_at(&workspace, "sweep-issue-8908", 8908, dispatched).unwrap();
+
+    let cwd = workspace.to_string_lossy().into_owned();
+    let ts = (dispatched + Duration::minutes(1)).to_rfc3339();
+    let projects = tmp.path().join("projects");
+    let project = projects.join(crate::transcript_tokens::project_slug(&workspace));
+    std::fs::create_dir_all(&project).unwrap();
+
+    // The parent session: its head names the issue.
+    let parent_lines = [
+        serde_json::json!({"type": "user", "sessionId": "uuid-parent", "cwd": cwd,
+            "timestamp": ts, "message": {"role": "user", "content":
+            "<command-name>/loom:sweep</command-name>\n<command-args>8908</command-args>"}}),
+        serde_json::json!({"type": "assistant", "sessionId": "uuid-parent", "cwd": cwd,
+            "timestamp": ts, "message": {"model": "claude-sonnet-5", "id": "msg_1",
+            "content": [{"type": "text", "text": "parent body"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+    ];
+    let parent_body: String = parent_lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(project.join("uuid-parent.jsonl"), parent_body).unwrap();
+
+    // A subagent transcript of that same session: its own first user
+    // message is ordinary task text, no `/loom:` slash command anywhere.
+    let subagents_dir = project.join("uuid-parent").join("subagents");
+    std::fs::create_dir_all(&subagents_dir).unwrap();
+    let subagent_lines = [
+        serde_json::json!({"type": "user", "sessionId": "uuid-subagent", "cwd": cwd,
+            "timestamp": ts, "message": {"role": "user", "content":
+            "Investigate the flaky test and report back."}}),
+        serde_json::json!({"type": "assistant", "sessionId": "uuid-subagent", "cwd": cwd,
+            "timestamp": ts, "message": {"model": "claude-sonnet-5", "id": "msg_2",
+            "content": [{"type": "text", "text": "subagent body"}],
+            "usage": {"input_tokens": 2, "output_tokens": 2}}}),
+    ];
+    let subagent_body: String = subagent_lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(subagents_dir.join("builder.jsonl"), subagent_body).unwrap();
+
+    let queue_path = tmp.path().join("queue.jsonl");
+    let db = ActivityDb::new(tmp.path().join("activity.db")).unwrap();
+    ingest(
+        &db,
+        &IngestOptions {
+            projects_dir: projects,
+            summary_sink: Some(SessionSummarySink::new(
+                Arc::new(DurableQueue::open(queue_path.clone(), 100)),
+                "host-test",
+            )),
+            ..IngestOptions::default()
+        },
+    )
+    .unwrap();
+    let envelopes = DurableQueue::open(queue_path, 100).peek_batch(10);
+    let summaries: Vec<_> = envelopes
+        .iter()
+        .filter_map(|e| match &e.record {
+            TelemetryRecord::SessionSummary(s) => Some((s, e.trace_context.as_ref())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries.len(), 2, "one summary per transcript");
+
+    let (parent_summary, parent_trace) = summaries
+        .iter()
+        .find(|(s, _)| s.session_id == "uuid-parent")
+        .expect("parent summary");
+    assert_eq!(parent_summary.issue, Some(8908));
+    assert!(parent_trace.is_some(), "the parent joins the sweep's trace");
+
+    let (subagent_summary, subagent_trace) = summaries
+        .iter()
+        .find(|(s, _)| s.session_id != "uuid-parent")
+        .expect("subagent summary");
+    assert_eq!(subagent_summary.issue, None, "no slash command in the subagent's own head");
+    assert!(subagent_trace.is_none(), "unattributed issue never guesses a join");
 }

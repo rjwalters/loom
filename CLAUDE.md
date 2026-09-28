@@ -96,10 +96,10 @@ label documents its own `Applied by:` owner). State transitions:
 - **Epic**: `loom:epic` → Champion creates phased `loom:architect` +
   `loom:epic-phase` issues.
 
-`loom:operator` is the first-class "a human is needed" state (engine stops
-acting, re-evaluable, unlike `loom:operator-only`) — wired at Champion's
-merge-risk hold only so far. What is currently waiting on you: the pinned
-merge-risk hold digest (#6877) and the two label queries, both in
+`loom:operator` means "a human is needed" (engine stops, re-evaluable, unlike
+`loom:operator-only`; set by Champion's merge-risk hold). `loom:operator-priority`
+is the operator's star (not a hold); every stage takes it first. Your
+queue: the pinned hold digest (#6877) and label queries in
 [`.loom/docs/label-state-machine.md`](.loom/docs/label-state-machine.md).
 
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from
@@ -245,7 +245,7 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
 - **MCP hooks** — the unified `mcp-loom` server is registered once per machine at user
   scope (`scripts/install-loom.sh`, refreshed by `loom update`); `setup-mcp.sh` is demoted to a bundle-rebuild/legacy-migration tool. See the mcp-loom README.
 - **Fleet dashboard** (`loom-daemon serve`, opt-in, read-only, loopback by default): [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Fleet dashboard.
-- **Fleet observability** (`observability` config block: daemon → Cloudflare backend → dashboard) — [`.loom/docs/observability.md`](.loom/docs/observability.md).
+- **Fleet observability** — [`observability.md`](.loom/docs/observability.md); **policy**: no random trace IDs, every span records Loom version + full SHA: [`trace-identity.md`](.loom/docs/trace-identity.md).
 
 ### Multi-Account Token Pool (operating summary)
 
@@ -306,7 +306,7 @@ Completed-migration history (v0.10.0 shepherd/daemon deprecation, the Rust `loom
 
 ## Resources
 
-- **Repository**: https://github.com/rjwalters/loom · **Roles**: `.loom/roles/*.md` · **Labels**: `.github/labels.yml` · **Scripts**: `.loom/scripts/`
+- **Roles**: `.loom/roles/*.md` · **Labels**: `.github/labels.yml` · **Scripts**: `.loom/scripts/`
 - **Docs**: [daemon-reference](.loom/docs/daemon-reference.md) · [token-pool](.loom/docs/token-pool.md) · [troubleshooting](.loom/docs/troubleshooting.md) ·
   [safehouse](.loom/docs/safehouse.md) ·
   [forge-auth](.loom/docs/forge-authentication.md) / [github-auth](.loom/docs/github-authentication.md) ·

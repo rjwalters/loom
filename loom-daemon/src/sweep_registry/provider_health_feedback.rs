@@ -67,6 +67,14 @@ impl SweepRegistry {
         // see `tokens_pool::codex_reset` for why the text may only ever say
         // *when* a hold ends, never *whether* there is one.
         let reset_at = exhaustion_reset_horizon(&contents, &anchor, result.category);
+        // #9013 item 4: captured *before* the persist call — `health.rs`'s
+        // `ReauthRequired` hold is sticky, so a classification recorded while
+        // it was already set writes no new hold, and a mark for one would
+        // over-count. See `pool_marks::record_codex` for the full rationale.
+        let already_reauth_required = tokens_pool::account_health(&self.config.workspace_root, &id)
+            .ok()
+            .flatten()
+            .is_some_and(|health| health.reason == tokens_pool::HealthReason::ReauthRequired);
         match tokens_pool::record_terminal_for_model_with_reset(
             &self.config.workspace_root,
             &id,
@@ -76,7 +84,10 @@ impl SweepRegistry {
             "spawn-codex:v1",
         ) {
             // #8931: the reason-classified mark, emitted only once persisted.
-            Ok(()) => crate::observability::ops::pool_marks::record_codex(result.category),
+            Ok(()) => crate::observability::ops::pool_marks::record_codex(
+                result.category,
+                already_reauth_required,
+            ),
             Err(error) => log::warn!(
                 "sweep_registry: failed to persist Codex terminal feedback for {sweep_id}: {error}"
             ),

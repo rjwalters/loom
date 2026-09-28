@@ -73,22 +73,40 @@ pub const RETRY: &str = "LOOM-HEAD-SELF-SYNC-RETRY";
 
 /// Does this merge-API response say "your head-SHA precondition is stale"?
 ///
-/// A port of `merge-pr.sh`'s `_is_head_mismatch_response`, kept byte-equivalent
-/// to it by `tests/merge_pr_head_sync_differential.rs`. String provenance is
-/// documented on `forge_merge_pr` in `lib/forge-helpers.sh`: the GitHub REST
-/// and Gitea forms are verified against each forge's own source; the GraphQL
-/// one (from the shell arm retired by #8427) is best-effort.
+/// Delegates to [`super::response::is_head_mismatch`], which is now the single
+/// definition of the predicate. String provenance is documented on
+/// `forge_merge_pr` in `lib/forge-helpers.sh`: the GitHub REST and Gitea forms
+/// are verified against each forge's own source; the GraphQL one (from the
+/// shell arm retired by #8427) is best-effort.
 ///
 /// Deliberately NOT matched: `Base branch was modified`. That one means the
 /// PR's *base* fell behind and a sync-and-retry is correct; conflating the two
 /// is how a head-mismatch would get eaten by the sync path and merged against
 /// a moving target.
+///
+/// # Why this became a delegation (#8191's classify-response slice)
+///
+/// This used to be its own `to_ascii_lowercase()`-and-`contains` copy of the
+/// three literals, one of THREE copies — the third being
+/// `merge-pr.sh`'s `_is_head_mismatch_response`. That slice deleted the shell
+/// copy and made the remaining two one, so the drift
+/// `tests/merge_pr_head_sync_differential.rs` existed to police can no longer
+/// occur. The wrapper is kept (rather than callers being repointed) because
+/// this module's own vocabulary is "is this refusal retryable", and because
+/// the signature difference is real: the predicate works on BYTES, since
+/// `grep` did and a forge body need not be valid UTF-8, while this module's
+/// [`Evidence`] already holds a `String`. `as_bytes()` is exact here — ASCII
+/// case folding cannot differ between the two views.
+///
+/// Note it delegates to the PREDICATE, not to
+/// [`super::response::classify`]. `classify(x) == HeadMismatch` is strictly
+/// narrower: a response naming both a 405 and a head mismatch takes the
+/// `MergeInProgress` route by the ladder's precedence, yet is still a head
+/// mismatch for the purpose of #8164's authorization. Routing this through
+/// the ladder would have narrowed that authorization silently.
 #[must_use]
 pub fn is_head_mismatch(response: &str) -> bool {
-    let hay = response.to_ascii_lowercase();
-    hay.contains("head branch was modified.")
-        || hay.contains("head out of date")
-        || hay.contains("expectedheadoid")
+    super::response::is_head_mismatch(response.as_bytes())
 }
 
 /// What the caller knows when a merge attempt has just been refused.

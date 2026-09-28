@@ -1,8 +1,9 @@
 //! GitHub Actions CI telemetry poller (Issue #8824 phase 1, #8825 phase 2, of
 //! the build/CI observability work under epic #8522).
 //!
-//! Captures every completed GitHub Actions **run** and **job** of one forge
-//! org as first-class telemetry: `ci.run` / `ci.job` log records, the
+//! Captures every completed GitHub Actions **run** and **job** of the
+//! configured forge owners — organizations and user accounts ([`owners`],
+//! #9188) — as first-class telemetry: `ci.run` / `ci.job` log records, the
 //! `loom.ci.{run,job}.duration_ms` histograms (via `ci.duration`), and one
 //! trace per run with one span per job. With `logCaptureEnabled` (#8825) it
 //! additionally captures each completed job's **full log** as chunked
@@ -49,23 +50,29 @@
 //! trace/span ids) for a backend to deduplicate. That safety net is still in
 //! place — it is what keeps a transient double-arm window (mid-`fleet.captain`
 //! edit) harmless rather than corrupting — but it is no longer the *primary*
-//! mechanism: **a multi-host fleet that enables `ciTelemetry` must also
-//! declare `fleet.captain` naming one host, or the poller is refused
-//! everywhere** (fail-closed, per the gate's own contract — see
-//! `defaults/docs/daemon-reference.md`'s "Fleet captain" section). This is a
-//! deliberate, accepted migration cost: the epic behind this poller (#8522)
-//! has no production fleet relying on the old duplicate-and-dedup posture
-//! yet, and duplicate polling wastes GitHub API budget for no benefit once
-//! exactly one host can be assigned.
+//! mechanism: **every host that enables `ciTelemetry` — a single-host setup
+//! included — must also have `fleet.captain` declared naming one host, or
+//! the poller is refused** (fail-closed, per the gate's own contract — see
+//! `defaults/docs/daemon-reference.md`'s "Fleet captain" section). The
+//! original #8901 note said only multi-host fleets were affected; that was
+//! wrong (#9014), because `NoCaptainDeclared` refuses on any host.
+//!
+//! The refusal is **not silent** (#9014): each refused tick is recorded in
+//! `status.json` ([`gate_tick`] → [`state::note_captain_gate`]), so
+//! `ci-telemetry status` reads `refused` with the gate's reason; a
+//! no-captain refusal also lands in `host.health.captainless_singleton_jobs`
+//! and turns the `loom-daemon health` `ci_telemetry` section non-green.
 
 pub mod api;
 pub mod export;
 pub mod journal;
 pub mod ledger;
 pub mod logs;
+pub mod owners;
 pub mod poll;
 pub mod records;
 pub mod state;
+pub mod story;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -77,7 +84,10 @@ pub const SINGLETON_JOB_NAME: &str = "ci-telemetry-poll";
 
 /// `autonomous.ciTelemetry.enabled` env override.
 pub const ENABLED_ENV: &str = "LOOM_CI_TELEMETRY_ENABLED";
-/// `autonomous.ciTelemetry.org` env override.
+/// `autonomous.ciTelemetry.owners` env override (comma-separated, #9188).
+pub const OWNERS_ENV: &str = "LOOM_CI_TELEMETRY_OWNERS";
+/// `autonomous.ciTelemetry.org` env override — the deprecated single-owner
+/// alias of [`OWNERS_ENV`], which wins over it (see [`owners`]).
 pub const ORG_ENV: &str = "LOOM_CI_TELEMETRY_ORG";
 /// `autonomous.ciTelemetry.intervalSecs` env override.
 pub const INTERVAL_SECS_ENV: &str = "LOOM_CI_TELEMETRY_INTERVAL_SECS";
@@ -91,7 +101,7 @@ pub const LOG_CAPTURE_MAX_BYTES_ENV: &str = "LOOM_CI_TELEMETRY_LOG_CAPTURE_MAX_B
 // `autonomous.ciTelemetry.logCaptureExcludedRepos` deliberately has NO env
 // override, for the same reason `excludedRepos` has none.
 
-/// Default org when no tier sets one.
+/// Default owner (a declared organization) when no tier sets one.
 pub const DEFAULT_ORG: &str = "2amlogic";
 /// Default poll cadence.
 pub const DEFAULT_INTERVAL_SECS: u64 = 120;
@@ -135,6 +145,9 @@ pub struct RepoExclusion {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CiTelemetryConfig {
     pub enabled: Option<bool>,
+    /// `owners` (#9188): wins over `org` at the config tier.
+    pub owners: Option<Vec<String>>,
+    /// Deprecated single-owner alias of `owners`.
     pub org: Option<String>,
     pub interval_secs: Option<u64>,
     /// Admitted exclusions (committed tiers only, each with a reason).
@@ -221,6 +234,11 @@ pub fn read_config(root: &Path) -> CiTelemetryConfig {
     refused_exclusions.extend(log_refused);
     CiTelemetryConfig {
         enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
+        owners: block
+            .get("owners")
+            .and_then(serde_json::Value::as_array)
+            .map(|list| owners::parse_logins(list.iter().filter_map(serde_json::Value::as_str)))
+            .filter(|list| !list.is_empty()),
         org: block
             .get("org")
             .and_then(serde_json::Value::as_str)
@@ -262,7 +280,10 @@ fn env_nonempty(name: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedCiTelemetry {
     pub enabled: bool,
-    pub org: String,
+    /// The owners polled each cycle (#9188), in order.
+    pub owners: Vec<owners::Owner>,
+    /// Which tier/key produced `owners` (`owners::SOURCE_*`).
+    pub owners_source: &'static str,
     pub interval_secs: u64,
     /// Admitted exclusions: repos (bare `name` or `owner/name`) never polled,
     /// each with its recorded reason. Config-only — no env override.
@@ -281,11 +302,17 @@ pub struct ResolvedCiTelemetry {
 /// Resolve every knob, **env > config > default**.
 #[must_use]
 pub fn resolve(config: &CiTelemetryConfig) -> ResolvedCiTelemetry {
+    let (owners, owners_source) = owners::resolve_owners(
+        env_nonempty(OWNERS_ENV).as_deref(),
+        env_nonempty(ORG_ENV).as_deref(),
+        config.owners.as_deref(),
+        config.org.as_deref(),
+        DEFAULT_ORG,
+    );
     ResolvedCiTelemetry {
         enabled: env_bool(ENABLED_ENV).or(config.enabled).unwrap_or(false),
-        org: env_nonempty(ORG_ENV)
-            .or_else(|| config.org.clone())
-            .unwrap_or_else(|| DEFAULT_ORG.to_string()),
+        owners,
+        owners_source,
         interval_secs: env_nonempty(INTERVAL_SECS_ENV)
             .and_then(|v| v.parse().ok())
             .filter(|v: &u64| *v > 0)
@@ -306,6 +333,16 @@ pub fn resolve(config: &CiTelemetryConfig) -> ResolvedCiTelemetry {
             .clone()
             .unwrap_or_default(),
     }
+}
+
+/// `a, b, c` — the owners' logins, for logs and status lines.
+#[must_use]
+pub fn owner_logins(owners: &[owners::Owner]) -> String {
+    owners
+        .iter()
+        .map(|owner| owner.login.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The job-log capture gate. Phase 1 (#8824) shipped the config key with no
@@ -376,10 +413,17 @@ pub fn spawn_task(root: PathBuf) -> Option<tokio::task::JoinHandle<()>> {
     for refusal in &resolved.refused_exclusions {
         log::warn!("ci_telemetry: excludedRepos entry {refusal} (the repo is still polled)");
     }
+    if matches!(resolved.owners_source, owners::SOURCE_ENV_ORG | owners::SOURCE_CONFIG_ORG) {
+        log::warn!(
+            "ci_telemetry: owners come from the deprecated `org` alias ({}); use \
+             autonomous.ciTelemetry.owners / {OWNERS_ENV}",
+            resolved.owners_source
+        );
+    }
     let interval = Duration::from_secs(resolved.interval_secs);
     log::info!(
-        "ci_telemetry: enabled (org={}, interval={}s, excluded={:?})",
-        resolved.org,
+        "ci_telemetry: enabled (owners={}, interval={}s, excluded={:?})",
+        owner_logins(&resolved.owners),
         interval.as_secs(),
         resolved.excluded_repos
     );
@@ -393,19 +437,7 @@ pub fn spawn_task(root: PathBuf) -> Option<tokio::task::JoinHandle<()>> {
             // the very next cycle rather than requiring a daemon restart —
             // see this module's "Multi-host posture" doc section.
             let host_id = crate::sweep_registry::host_identity();
-            if let Err(refusal) =
-                crate::fleet_captain::arm_singleton_job(SINGLETON_JOB_NAME, &root, &host_id)
-            {
-                // `NoCaptainDeclared` is a misconfiguration worth surfacing
-                // above debug — a captain-assigned-but-not-this-host refusal
-                // is the routine, expected case on every non-captain host and
-                // would otherwise log every interval forever.
-                let gate = crate::fleet_captain::resolve_gate_for_root(&root, &host_id);
-                if matches!(gate, crate::fleet_captain::CaptainGate::NoCaptainDeclared) {
-                    log::warn!("ci_telemetry: {refusal}");
-                } else {
-                    log::debug!("ci_telemetry: {refusal}");
-                }
+            if !gate_tick(&root, &host_id, chrono::Utc::now()) {
                 continue;
             }
             let root = root.clone();
@@ -422,6 +454,71 @@ pub fn spawn_task(root: PathBuf) -> Option<tokio::task::JoinHandle<()>> {
             }
         }
     }))
+}
+
+/// The CI poller's health on this host, for `loom-daemon health`'s
+/// `ci_telemetry` section (#9014). Serialized as the section's detail.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CiTelemetryHealth {
+    /// `autonomous.ciTelemetry.enabled`, resolved.
+    pub enabled: bool,
+    /// [`state::Health::label`] as of now.
+    pub state: String,
+    /// The recorded fleet-captain refusal, if the poller is refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub captain_refusal: Option<state::CaptainRefusal>,
+}
+
+/// Collect [`CiTelemetryHealth`] for `root` — filesystem-only (config +
+/// `status.json`), no forge call.
+#[must_use]
+pub fn collect_health(root: &Path) -> CiTelemetryHealth {
+    let resolved = resolve(&read_config(root));
+    let status = state::load_status(&state_dir(root));
+    let health = state::classify(&status, chrono::Utc::now(), resolved.interval_secs);
+    CiTelemetryHealth {
+        enabled: resolved.enabled,
+        state: health.label().to_string(),
+        captain_refusal: matches!(health, state::Health::Refused { .. })
+            .then(|| status.captain_refusal.clone())
+            .flatten(),
+    }
+}
+
+/// One tick's fleet-captain gate (#8901), with the refusal made visible
+/// (#9014): arms or refuses `ci-telemetry-poll` via
+/// [`crate::fleet_captain::arm_singleton_job`] and records the outcome in
+/// `status.json` ([`state::note_captain_gate`]) so `ci-telemetry status`
+/// reads `refused` with the reason instead of `stale`/`never-polled`.
+/// Returns `true` when the cycle may run.
+pub fn gate_tick(root: &Path, host_id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let dir = state_dir(root);
+    match crate::fleet_captain::arm_singleton_job(SINGLETON_JOB_NAME, root, host_id) {
+        Ok(()) => {
+            if let Err(error) = state::note_captain_gate(&dir, None, now) {
+                log::warn!("ci_telemetry: could not clear the captain refusal: {error}");
+            }
+            true
+        }
+        Err(refusal) => {
+            // `NoCaptainDeclared` is a misconfiguration worth surfacing above
+            // debug — a captain-assigned-but-not-this-host refusal is the
+            // routine, expected case on every non-captain host.
+            let no_captain = matches!(
+                crate::fleet_captain::resolve_gate_for_root(root, host_id),
+                crate::fleet_captain::CaptainGate::NoCaptainDeclared
+            );
+            if no_captain {
+                log::warn!("ci_telemetry: {refusal}");
+            } else {
+                log::debug!("ci_telemetry: {refusal}");
+            }
+            if let Err(error) = state::note_captain_gate(&dir, Some((&refusal, no_captain)), now) {
+                log::warn!("ci_telemetry: could not record the captain refusal: {error}");
+            }
+            false
+        }
+    }
 }
 
 #[cfg(test)]

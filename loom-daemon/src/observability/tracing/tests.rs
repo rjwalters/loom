@@ -77,19 +77,38 @@ fn actual_propagation_hook_handles_enabled_disabled_and_invalid_configuration() 
         std::env::set_var(super::super::ENDPOINT_ENV, endpoint);
         std::env::set_var(super::super::EXPORTER_ENV, "otlp");
         let dir = tempfile::tempdir().unwrap();
-        let mut command = Command::new("/usr/bin/printenv");
-        command
-            .arg(TRACEPARENT_ENV)
-            .env_clear()
-            .env(TRACEPARENT_ENV, "stale-context")
-            .env(CONTEXT_FILE_ENV, "stale-file");
-        prepare_child(&mut command, dir.path(), "child-boundary");
+        // One prepared child per queried variable: BSD `printenv` reads a
+        // single name (extra arguments are ignored), so the standard
+        // `TRACEPARENT` mirror (#9215) is observed through its own spawn
+        // rather than a second output line. Both stale values are seeded so
+        // each spawn also proves the disabled/invalid paths remove them.
+        let prepared = |queried: &str| {
+            let mut command = Command::new("/usr/bin/printenv");
+            command
+                .arg(queried)
+                .env_clear()
+                .env(TRACEPARENT_ENV, "stale-context")
+                .env(W3C_TRACEPARENT_ENV, "stale-standard-context")
+                .env(CONTEXT_FILE_ENV, "stale-file");
+            // Same execution name ⇒ the second call loads the context the
+            // first persisted, so the two spawns observe one identity.
+            prepare_child(&mut command, dir.path(), "child-boundary", None);
+            command
+        };
+        let mut command = prepared(TRACEPARENT_ENV);
         let output = command.output().unwrap();
+        let standard = prepared(W3C_TRACEPARENT_ENV).output().unwrap();
         let store = TraceStore::new(dir.path());
         if expect_context {
             assert!(output.status.success());
-            let child_context =
-                TraceContext::parse(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+            assert!(standard.status.success(), "TRACEPARENT is exported too");
+            let namespaced = String::from_utf8(output.stdout).unwrap().trim().to_string();
+            assert_eq!(
+                String::from_utf8(standard.stdout).unwrap().trim(),
+                namespaced,
+                "the standard TRACEPARENT carries exactly the namespaced value"
+            );
+            let child_context = TraceContext::parse(&namespaced).unwrap();
             assert_eq!(
                 child_context,
                 TraceStore::load(&store.path(dir.path(), "child-boundary"))
@@ -99,6 +118,8 @@ fn actual_propagation_hook_handles_enabled_disabled_and_invalid_configuration() 
         } else {
             assert!(!output.status.success());
             assert!(output.stdout.is_empty());
+            assert!(!standard.status.success(), "TRACEPARENT is removed too");
+            assert!(standard.stdout.is_empty());
             assert!(!dir.path().join(".loom/logs/trace-context").exists());
             // With env_clear(), env_remove() may erase an explicit entry
             // instead of retaining a None tombstone. Verify the child boundary.

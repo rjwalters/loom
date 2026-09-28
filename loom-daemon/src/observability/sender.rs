@@ -206,6 +206,7 @@ mod tests {
                 admission_brake: None,
                 is_captain: None,
                 armed_singleton_jobs: Vec::new(),
+                captainless_singleton_jobs: Vec::new(),
             }),
         )
     }
@@ -286,6 +287,31 @@ mod tests {
         assert!(snapshot.last_success_at.is_some());
         assert_eq!(snapshot.records_exported, 2);
         assert_eq!(snapshot.state, crate::types::ObservabilityExportState::Healthy);
+    }
+
+    #[tokio::test]
+    async fn an_acked_batch_into_a_local_edge_collector_is_healthy_but_first_hop_only() {
+        // #9015, the incident shape reproduced in-process: the exporter POSTs
+        // to a LOCAL otel-edge collector that accepts everything. `healthy` is
+        // the correct verdict for the hop the daemon can see — and the record
+        // must simultaneously say that is ALL it saw, because on 2026-09-24
+        // that edge's own egress was dead for 30h+ and nothing reached SigNoz.
+        let dir = tempfile::tempdir().unwrap();
+        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 10);
+        queue.push(envelope());
+        let status =
+            ExportStatus::started("host-test", "http://127.0.0.1:14318/v1/logs", "otlp", 30);
+        assert_eq!(
+            try_flush(&queue, &FakeExporter::new(true), 10, &status).await,
+            FlushOutcome::Sent(1)
+        );
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.state, crate::types::ObservabilityExportState::Healthy);
+        assert_eq!(snapshot.scope, crate::types::ObservabilityExportScope::FirstHop);
+        assert!(
+            snapshot.endpoint_loopback,
+            "an ack from a local collector must be published as a local hop"
+        );
     }
 
     #[tokio::test]

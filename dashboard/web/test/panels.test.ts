@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PANEL_STATUS, mountPanel } from "../src/panels";
 import type { PanelRouteName } from "../src/router";
 
-const PANEL_NAMES: PanelRouteName[] = ["charts", "tokens", "spend", "feed"];
+const PANEL_NAMES: PanelRouteName[] = ["charts", "tokens", "spend", "feed", "live"];
 
 /** Panels fetch on mount. Nothing here asserts on the response — the point is
  * that mounting reaches the network at all, and never throws when it fails. */
@@ -93,12 +93,21 @@ describe("mountPanel", () => {
     expect(root.querySelector('[data-testid="spend-period"]')).not.toBeNull();
   });
 
-  it("mounts the live feed and states the sweep.phase gap", () => {
+  it("mounts the live feed and points at the Live board", () => {
     mountPanel("feed", root);
     expect(root.querySelector('[data-testid="live-feed"]')).not.toBeNull();
-    // #4863: phase transitions are not emitted, so the panel says so rather
-    // than silently rendering a partial view. Remove with that issue.
-    expect(root.querySelector('[data-testid="feed-phase-caveat"]')?.textContent).toContain("sweep.phase");
+    // #4863 is fixed (sweep.phase is emitted), so the stale caveat is gone
+    // and the note points at the Live board instead (#9094).
+    expect(root.querySelector('[data-testid="feed-phase-caveat"]')).toBeNull();
+    expect(root.querySelector('[data-testid="feed-note"]')?.textContent).toContain("Live");
+  });
+
+  it("mounts the live status board and releases it on teardown", () => {
+    const teardown = mountPanel("live", root);
+    expect(root.querySelector('[data-testid="live-board"]')).not.toBeNull();
+    // The board polls /api/fleet-state (or /public/fleet-state) itself.
+    expect(globalThis.fetch).toHaveBeenCalled();
+    teardown();
   });
 
   it("hits the network on mount for the data-backed panels", () => {

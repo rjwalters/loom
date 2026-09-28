@@ -550,7 +550,9 @@ export function redactAdmissionBrakeRow(brake: AdmissionBrakeRow): Record<string
 const PUBLIC_RECORD_DERIVATIONS: Readonly<Record<string, (payload: Record<string, unknown>) => Record<string, unknown>>> =
   {
     "tokens.snapshot": (payload) => deriveTokenPoolAggregate(payload) as unknown as Record<string, unknown>,
-    // Issue #8852: private rows keep only rank/state/disposition/reason.
+    // Issue #8852: private rows keep only rank/state/disposition/reason (and,
+    // since #9288, their plan position/plan_state/gate). The per-tick `plan`
+    // block is carried in its normalized form — slot counts, no repo names.
     "queue.snapshot": publicQueuePayload,
     // `managed_repos` (#4976) and `roles` (#5022) are both deliberately ABSENT
     // from `RECORD_FIELD_ALLOWLIST` — like `tokens.snapshot`'s `accounts`,

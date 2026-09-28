@@ -51,6 +51,9 @@ pub const CI_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.ci.started_at",
     "loom.ci.completed_at",
     "loom.ci.duration_ms",
+    // `ci.run` only (#9007 follow-up): `run_started_at − created_at`, the CI
+    // queue segment, so "CI queued" and "CI running" are separable.
+    "loom.ci.queued_ms",
     "loom.ci.job_id",
     "loom.ci.job",
     "loom.ci.runner",
@@ -114,6 +117,15 @@ pub const CI_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.ci.job",
     "loom.ci.runner",
     "loom.ci.attempts",
+    // Join keys (Issue #9007): `loom.ci.ref` reuses the log-side name for the
+    // head branch rather than inventing `loom.ci.head_branch`. `loom.pr_number`
+    // needs no entry here — it is already in `bounded_attributes()`'s generic
+    // always-admitted key list and the collector's span `keep_keys`.
+    "loom.ci.head_sha",
+    "loom.ci.ref",
+    // Run span only (#9007 follow-up): the CI queue segment, see
+    // `CiRunRecord::queued_ms`.
+    "loom.ci.queued_ms",
 ];
 
 /// The low-cardinality metric label allowlist for the two CI duration
@@ -167,6 +179,14 @@ pub struct CiRunRecord {
     pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
     pub duration_ms: i64,
+    /// Milliseconds the run sat queued before a runner picked it up:
+    /// `run_started_at − created_at`, floored at zero (#9007 follow-up). The
+    /// span and `duration_ms` both start at `started_at`, so without this the
+    /// queue wait was invisible. `None` when GitHub reported no
+    /// `run_started_at` (a missing start never reads as a zero queue) and on
+    /// a pre-#9007 journal line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_ms: Option<i64>,
 }
 
 impl CiRunRecord {
@@ -194,6 +214,9 @@ impl CiRunRecord {
         out.push(("loom.ci.started_at", CiAttr::Str(self.started_at.to_rfc3339())));
         out.push(("loom.ci.completed_at", CiAttr::Str(self.completed_at.to_rfc3339())));
         out.push(("loom.ci.duration_ms", CiAttr::Int(self.duration_ms)));
+        if let Some(queued_ms) = self.queued_ms {
+            out.push(("loom.ci.queued_ms", CiAttr::Int(queued_ms)));
+        }
         out
     }
 }

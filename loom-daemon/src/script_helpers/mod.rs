@@ -37,6 +37,7 @@ pub mod fleet_experiment;
 pub mod log_filter;
 pub mod model_tiers;
 pub mod sweep_experiment;
+pub mod sweep_experiment_arms;
 pub mod transcript_usage;
 pub mod usage;
 pub mod validate_phase;

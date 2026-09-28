@@ -887,7 +887,11 @@ async fn collect_managed_repos_reports_every_provisioned_registrys_repo_even_whe
         }
     }
 
-    let mut repos = collect_managed_repos_with(&pool, &mut slug_cache, fake_visibility).await;
+    // #9244 (loom-ui#153): repo-a is a registered workspace at priority 0;
+    // repo-b is not registered, so it carries no priority.
+    let priorities = HashMap::from([(a_root.clone(), 0)]);
+    let mut repos =
+        collect_managed_repos_with(&pool, &mut slug_cache, fake_visibility, &priorities).await;
     repos.sort_by(|a, b| a.slug.cmp(&b.slug));
     assert_eq!(
         repos,
@@ -895,10 +899,12 @@ async fn collect_managed_repos_reports_every_provisioned_registrys_repo_even_whe
             ManagedRepoEntry {
                 slug: "loom-test-fixture/repo-a".to_string(),
                 visibility: RepoVisibility::Public,
+                priority: Some(0),
             },
             ManagedRepoEntry {
                 slug: "loom-test-fixture/repo-b".to_string(),
                 visibility: RepoVisibility::Private,
+                priority: None,
             },
         ],
         "both registered repos are in the roster, each with its derived visibility, \
@@ -1040,6 +1046,7 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         // added — `None` (not collected) is fine here since this fixture is
         // not about the `tmpfs_visibility` axis.
         tmpfs_visibility: None,
+        ci_telemetry: None,
     }
 }
 
@@ -1155,6 +1162,7 @@ fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healt
         admission_brake: None,
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
     };
     assert_eq!(
         host_health.roles.persistent.len(),

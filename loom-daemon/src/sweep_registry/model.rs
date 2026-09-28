@@ -393,13 +393,17 @@ pub struct ExperimentDispatchModel {
     /// The effective experiment mode for this dispatch, AFTER the CANARY
     /// guardrail (`"off"` | `"observe"` | `"experiment"`).
     pub mode: String,
-    /// The deterministic arm assigned to this issue — `Some("A" | "B")` only
-    /// when `mode == "experiment"`. `observe`/`off` dispatches do not force a
-    /// model, so they carry no arm at DISPATCH time; the outcome-recording
+    /// The deterministic arm assigned to this issue — `Some("A" | "B")` for
+    /// the built-in pair, or a configured `sweep.modelExperimentArms` id
+    /// (#9122), and only when `mode == "experiment"` AND the issue was sampled
+    /// INTO the experiment by `sweep.modelExperimentBudgetFraction`.
+    /// `observe`/`off` dispatches (and budget-capped-out `experiment`
+    /// dispatches) do not force a model, so they carry no arm at DISPATCH
+    /// time; the outcome-recording
     /// path (`sweep_registry::outcome_journal`) still attributes an arm to
     /// such a record after the fact via
     /// [`crate::script_helpers::sweep_experiment::infer_arm_from_model`].
-    pub arm: Option<&'static str>,
+    pub arm: Option<String>,
     /// A short label for the dispatch log line naming why `model` won:
     /// `"experiment"` when the arm-forced model won, otherwise the
     /// underlying [`ModelSource`] label (`param`/`config`/`default`) —
@@ -490,15 +494,33 @@ fn resolve_autonomous_model_for_runtime(
     }
 
     if mode == "experiment" {
+        use crate::script_helpers::sweep_experiment_arms as se_arms;
         let complexity = complexity();
-        let arm = se::assign_arm(i64::from(issue), complexity.as_deref());
-        let model = se::resolved_arm_model(arm, &config);
-        return ExperimentDispatchModel {
-            model,
-            mode,
-            arm: Some(arm),
-            source_label: "experiment",
-        };
+        let (roster, mut warnings) = se_arms::ExperimentArms::load(&config);
+        let env_fraction = std::env::var(se_arms::BUDGET_FRACTION_ENV).ok();
+        let (fraction, fraction_warnings) =
+            se_arms::resolve_budget_fraction(env_fraction.as_deref(), &config);
+        warnings.extend(fraction_warnings);
+        for w in &warnings {
+            log::warn!("sweep-experiment: {w}");
+        }
+        // The budget-fraction cap (#9122): an issue sampled OUT carries no arm
+        // and falls through to unmodified tier-2.5/tier-3 resolution below,
+        // exactly as if the experiment were off for it. Its stats records keep
+        // `mode=experiment` with a null arm — the `observe`-mode convention.
+        if se_arms::in_experiment(i64::from(issue), complexity.as_deref(), fraction) {
+            let arm = roster.assign(i64::from(issue), complexity.as_deref());
+            return ExperimentDispatchModel {
+                model: arm.resolved_model(&config),
+                mode,
+                arm: Some(arm.id.clone()),
+                source_label: "experiment",
+            };
+        }
+        log::info!(
+            "sweep-experiment: issue #{issue} sampled OUT of the experiment \
+             (budget fraction {fraction}) — normal model resolution applies"
+        );
     }
 
     let (model, source) = resolve_dispatch_model_for_runtime(repo_root, None, policy);
@@ -948,6 +970,13 @@ mod tests {
     fn clear_experiment_env() {
         std::env::remove_var("LOOM_MODEL_EXPERIMENT");
         std::env::remove_var("LOOM_MODEL_EXPERIMENT_CANARY");
+        std::env::remove_var("LOOM_MODEL_EXPERIMENT_BUDGET_FRACTION");
+    }
+
+    /// Enter a confirmed-canary `experiment` mode for the tests below.
+    fn set_canary_experiment() {
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
     }
 
     /// With no env/config/sentinel, mode resolves to `off` and the result is
@@ -999,7 +1028,7 @@ mod tests {
         clear_experiment_env();
 
         assert_eq!(resolved.mode, "experiment");
-        assert_eq!(resolved.arm, Some("A"));
+        assert_eq!(resolved.arm.as_deref(), Some("A"));
         assert_eq!(resolved.model, "claude-opus-5", "Arm A resolves through the #3982 tier map");
         assert_eq!(resolved.source_label, "experiment");
 
@@ -1010,7 +1039,7 @@ mod tests {
         std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
         let resolved_b = resolve_autonomous_dispatch_model(dir.path(), 101, None);
         clear_experiment_env();
-        assert_eq!(resolved_b.arm, Some("B"));
+        assert_eq!(resolved_b.arm.as_deref(), Some("B"));
         assert_eq!(resolved_b.model, "sonnet");
     }
 
@@ -1028,22 +1057,22 @@ mod tests {
 
         // Issue 100 with NO marker is arm A (the pre-#4827 behavior)...
         let routine = resolve_autonomous_dispatch_model(dir.path(), 100, None);
-        assert_eq!(routine.arm, Some("A"));
+        assert_eq!(routine.arm.as_deref(), Some("A"));
         assert_eq!(routine.model, "claude-opus-5");
 
         // ...but the SAME issue marked `complex` flips to arm B — proof the
         // stratum is threaded through, not discarded.
         let complex = resolve_autonomous_dispatch_model(dir.path(), 100, Some("complex"));
-        assert_eq!(complex.arm, Some("B"));
+        assert_eq!(complex.arm.as_deref(), Some("B"));
         assert_eq!(complex.model, "sonnet");
 
         // An explicit `routine` marker is identical to no marker at all.
         let explicit_routine = resolve_autonomous_dispatch_model(dir.path(), 100, Some("routine"));
-        assert_eq!(explicit_routine.arm, Some("A"));
+        assert_eq!(explicit_routine.arm.as_deref(), Some("A"));
 
         // An out-of-vocabulary tier folds to `routine` (never an error).
         let unknown = resolve_autonomous_dispatch_model(dir.path(), 100, Some("mystery"));
-        assert_eq!(unknown.arm, Some("A"));
+        assert_eq!(unknown.arm.as_deref(), Some("A"));
 
         clear_experiment_env();
     }
@@ -1090,7 +1119,7 @@ mod tests {
         clear_experiment_env();
         assert_eq!(resolved.mode, "experiment");
         assert_eq!(calls.get(), 1);
-        assert_eq!(resolved.arm, Some("B"), "the fetched stratum must reach assign_arm");
+        assert_eq!(resolved.arm.as_deref(), Some("B"), "the fetched stratum must reach assign_arm");
     }
 
     /// Deterministic assignment: repeated calls for the same issue (a
@@ -1128,7 +1157,125 @@ mod tests {
         clear_experiment_env();
 
         assert_eq!(resolved.mode, "experiment");
-        assert_eq!(resolved.arm, Some("A"));
+        assert_eq!(resolved.arm.as_deref(), Some("A"));
+    }
+
+    // --- Issue #9122: N configurable arms + the budget-fraction cap -------- //
+
+    /// A configured `sweep.modelExperimentArms` roster reaches the daemon
+    /// dispatch path: the arm id is one the operator declared, and its model
+    /// is resolved through the shared #3982 tier map.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_honors_a_configured_arm_roster() {
+        clear_experiment_env();
+        set_canary_experiment();
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"{"sweep": {"modelExperimentArms": [
+                 {"id": "OPUS", "model": "opus", "weight": 1},
+                 {"id": "SONNET", "model": "sonnet", "weight": 1},
+                 {"id": "HAIKU", "model": "haiku", "weight": 8}]}}"#,
+        );
+
+        let mut seen = std::collections::BTreeSet::new();
+        for issue in 1..=200_u32 {
+            let resolved = resolve_autonomous_dispatch_model(dir.path(), issue, None);
+            assert_eq!(resolved.mode, "experiment");
+            assert_eq!(resolved.source_label, "experiment");
+            let arm = resolved.arm.clone().unwrap();
+            assert!(["OPUS", "SONNET", "HAIKU"].contains(&arm.as_str()), "{arm}");
+            assert_eq!(
+                resolved.model,
+                match arm.as_str() {
+                    "OPUS" => "claude-opus-5",
+                    "SONNET" => "sonnet",
+                    _ => "haiku",
+                }
+            );
+            // Resume-safety: the same issue re-resolves to the same arm.
+            assert_eq!(
+                resolve_autonomous_dispatch_model(dir.path(), issue, None).arm,
+                resolved.arm
+            );
+            seen.insert(arm);
+        }
+        clear_experiment_env();
+        assert_eq!(seen.len(), 3, "every configured arm must be drawn");
+    }
+
+    /// A rejected roster (here: a non-Claude runtime arm) falls through to the
+    /// built-in A/B pair rather than failing dispatch or dispatching the
+    /// refused arm — the #3702-style warn-and-fall-through contract.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_falls_through_to_ab_on_a_rejected_roster() {
+        clear_experiment_env();
+        set_canary_experiment();
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"{"sweep": {"modelExperimentArms": [
+                 {"id": "A", "model": "opus"},
+                 {"id": "GLM", "model": "glm-5.3", "runtime": "opencode"}]}}"#,
+        );
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100, None);
+        clear_experiment_env();
+
+        assert_eq!(resolved.arm.as_deref(), Some("A"));
+        assert_eq!(resolved.model, "claude-opus-5");
+    }
+
+    /// The budget-fraction cap: `0.0` samples every issue OUT, so no arm is
+    /// forced and normal (tier-2.5/tier-3) resolution proceeds — `1.0` (the
+    /// default) keeps today's always-forced behavior.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_budget_fraction_zero_forces_no_arm() {
+        clear_experiment_env();
+        set_canary_experiment();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_BUDGET_FRACTION", "0");
+        let dir = tempdir().unwrap();
+        let out = resolve_autonomous_dispatch_model(dir.path(), 100, None);
+
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_BUDGET_FRACTION", "1.0");
+        let inside = resolve_autonomous_dispatch_model(dir.path(), 100, None);
+        clear_experiment_env();
+
+        assert_eq!(out.mode, "experiment", "the MODE is unchanged by the cap");
+        assert_eq!(out.arm, None, "a sampled-out issue carries no arm");
+        assert_eq!(out.model, DEFAULT_DISPATCH_MODEL, "no model forcing");
+        assert_eq!(out.source_label, "default");
+        assert_eq!(inside.arm.as_deref(), Some("A"), "fraction 1.0 is today's behavior");
+    }
+
+    /// A partial fraction caps the experiment without reshuffling the arm of
+    /// any issue that is still in it.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_partial_budget_fraction_caps_without_reshuffling() {
+        clear_experiment_env();
+        set_canary_experiment();
+        let dir = tempdir().unwrap();
+
+        let full: Vec<Option<String>> = (1..=120_u32)
+            .map(|i| resolve_autonomous_dispatch_model(dir.path(), i, None).arm)
+            .collect();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_BUDGET_FRACTION", "0.3");
+        let capped: Vec<Option<String>> = (1..=120_u32)
+            .map(|i| resolve_autonomous_dispatch_model(dir.path(), i, None).arm)
+            .collect();
+        clear_experiment_env();
+
+        let forced = capped.iter().filter(|a| a.is_some()).count();
+        assert!((10..=62).contains(&forced), "~30% of 120 expected, got {forced}");
+        for (before, after) in full.iter().zip(&capped) {
+            assert!(before.is_some(), "fraction 1.0 forces every issue");
+            if after.is_some() {
+                assert_eq!(before, after, "an in-experiment issue keeps its arm");
+            }
+        }
     }
 
     /// `observe` mode (explicit) never forces a model, matching #4809's "zero

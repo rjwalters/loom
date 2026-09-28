@@ -9,8 +9,17 @@
 //! the shape is safe to `read` without quoting games.
 //!
 //! - `acquire` → exit 0 with `TOKEN=<token>`, or exit 1 with `HOLDER_PID=<pid>`
-//!   when the deadline passes (the pid is omitted when the holder's metadata
-//!   was unreadable). Exit 2 when the locks directory cannot be created.
+//!   when the deadline passes (the VALUE is empty when the holder's metadata
+//!   was unreadable; the marker line itself is always printed — see below).
+//!   Exit 2 when the locks directory cannot be created.
+//!
+//! Both answers carry a mandatory stdout marker, and that is load-bearing
+//! rather than cosmetic: `worktree.sh` delegates its always-taken create-path
+//! lock here and falls back to its own shell implementation on anything that is
+//! not one of those two answers (#8195 slice 7). It therefore matches on the
+//! marker, not on the exit code alone — a differently-shaped `loom-daemon` on
+//! PATH, or one too old to know this subcommand family, exits non-zero with no
+//! marker and must not be mistaken for a considered refusal.
 //! - `release` → exit 0, always. Releasing a lock you no longer own is a
 //!   no-op by design, not an error.
 //! - `check-issue` → the DIFFERENT, per-issue sweep-claim lock cross-check
@@ -109,9 +118,18 @@ impl WorktreeLockCommand {
                         std::process::exit(0);
                     }
                     Err(lock::AcquireError::Timeout { holder_pid }) => {
-                        if let Some(p) = holder_pid {
-                            println!("HOLDER_PID={p}");
-                        }
+                        // ALWAYS printed, even with no readable holder pid
+                        // (`HOLDER_PID=` with an empty value). #8195 slice 7:
+                        // `worktree.sh` trusts a refusal only on POSITIVE
+                        // evidence — this marker — and otherwise falls back to
+                        // its own shell lock. "Exit 1 and say nothing" is what
+                        // a DIFFERENT binary on PATH looks like when clap
+                        // rejects a subcommand it has never heard of, so a real
+                        // refusal must never be spelled that way.
+                        println!(
+                            "HOLDER_PID={}",
+                            holder_pid.map(|p| p.to_string()).unwrap_or_default()
+                        );
                         std::process::exit(1);
                     }
                     Err(lock::AcquireError::Unusable(why)) => {

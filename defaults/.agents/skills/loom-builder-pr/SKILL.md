@@ -603,7 +603,7 @@ Before creating a PR, verify your title:
 
 ## Commit Messages: Same Rules as PR Titles
 
-Commit messages follow the **exact same rules** as PR titles above. Since this repo uses squash merge, the PR title becomes the final commit on main — but individual commit messages still matter for worktree history and debugging.
+Commit messages follow the **exact same rules** as PR titles above. This repo merges with merge commits (#9105), so each commit message survives onto main verbatim — write each one as durable history.
 
 ### How to Write Commit Messages
 
@@ -664,7 +664,8 @@ body. `--signoff` is harmless when not required. See
 ### PR Label Rules
 
 **When creating a NEW PR:**
-- Add `loom:review-requested` label during creation
+- Add `loom:review-requested` during creation, plus `loom:operator-priority`
+  if the issue carries it (#9244: the one label a role copies, never invents)
 - This is the ONLY time you add labels to a PR
 
 **After PR creation:**
@@ -673,7 +674,7 @@ body. `--signoff` is harmless when not required. See
 - NEVER add `loom:pr` yourself (only Judge can approve)
 - NEVER modify any labels on PRs you didn't create
 
-**Why?** PR labels are signals in the review pipeline:
+**Why?** PR labels are review-pipeline signals:
 ```
 Builder creates PR -> loom:review-requested -> Judge reviews
                                             |
@@ -682,7 +683,7 @@ Builder creates PR -> loom:review-requested -> Judge reviews
                       Judge adds loom:pr -> Champion merges
 ```
 
-If you touch these labels, you break the pipeline.
+Touching them breaks the pipeline.
 
 ### GitHub Auto-Close Requirements
 
@@ -775,7 +776,7 @@ Part of #123              <- declaration: parsed, the label reset fires on merge
 merge-pr.sh warns (non-blocking) on a whole-line backticked trailer, but that warning reaches
 only whoever runs the merge — get it right in the body.
 
-**Both the PR body and the commit message must carry the same reference.** This repo squash-merges, and GitHub harvests closing keywords from the squash commit message as well as the PR body — a stray `Closes #N` in the commit body will auto-close the family issue even when the PR body says `Part of #N`. When in doubt on a `loom:epic` issue, prefer `Part of #N`.
+**Both the PR body and the commit messages must carry the same reference.** GitHub harvests closing keywords from the PR body and the merge commit's subject (this repo merges with merge commits, #9105) — individual commit bodies are not parsed, but keep the reference consistent in them anyway. When in doubt on a `loom:epic` issue, prefer `Part of #N`.
 
 #### A stray closing keyword ANYWHERE in the body defeats `Part of #N` (#4569)
 
@@ -809,10 +810,10 @@ the cause — Loom's `feature/issue-N` convention does not create a Development-
   grep -inE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#N\b' <<<"$PR_BODY"
   ```
 
-- **The same rule applies to every commit message on the branch** (#4595). The squash message
-  GitHub composes from your commits is parsed for closing keywords too, so a stray
-  `close #N` in a commit body closes the issue even when the PR body is spotless. Scan them
-  before pushing — and amend/reword (`git commit --amend`, `git rebase -i`) if one is there:
+- **The same rule applies to every commit message on the branch** (#4595 — consistency
+  now, not an auto-close hazard): GitHub parses only the PR body and the merge commit's
+  subject, so a stray `close #N` in a commit body no longer auto-closes the issue.
+  Scan before pushing — and amend/reword if one is there:
 
   ```bash
   # Must print nothing for the tracked issue N:
@@ -978,14 +979,13 @@ things a bare `gh pr create` cannot do are load-bearing here:
   accessible by integration`. The script force-mints a fresh installation token (bypassing
   the ~1h cache) and then falls back to a personal token, instead of dying. Before this,
   that 403 killed the sweep with no PR and the next dispatch **rebuilt the identical
-  work**, leaving an orphaned `feature/issue-N` branch behind each pass.
+  work**, orphaning a `feature/issue-N` branch each pass.
 
 **If it still fails, do NOT rebuild and do NOT delete the branch** — your commits are
-already pushed. Re-run the script (it is idempotent), or report the branch name so the PR
-can be opened from it by hand. The same rule applies on an install predating this script
-(no `.loom/scripts/create-pr.sh` on disk — fall back to a plain `gh pr create` there): a
-`403 … not accessible by integration` after a successful push is a transient credential
-window, never a signal to redo the work.
+pushed. Re-run the script (idempotent), or report the branch name for a hand-opened PR.
+On an install predating this script (no `.loom/scripts/create-pr.sh` — use plain
+`gh pr create`), a `403 … not accessible by integration` after a successful push is
+still a transient credential window, never a signal to redo the work.
 
 ```bash
 # CORRECT way to create PR

@@ -373,7 +373,7 @@ fn run_preflight(
                 writeln!(log, "{}", prepared.dispatch_marker())
                     .and_then(|()| log.flush())
                     .map_err(|e| LaunchError::config(e.to_string()))?;
-                return egress_proxy::run_with_proxy(prepared, command);
+                return egress_proxy::run_with_proxy(prepared, command, &mut log);
             }
             log.flush()
                 .map_err(|e| LaunchError::config(e.to_string()))?;
@@ -448,19 +448,41 @@ fn run_preflight(
         // Codex-specific options. Read selection metadata without imposing the
         // native harness parser's mandatory prompt or restricted flag list.
         let model = codex_adapter_model(&args.args);
-        if let Some(role) = nonempty_env("LOOM_ROLE") {
-            crate::runtime_admission::resolve_and_admit(root, &role, Some("codex"))
-                .map_err(|e| LaunchError::config(e.diagnostic()))?;
+        let owner = format!("worker-{}", uuid::Uuid::new_v4());
+        let admission = nonempty_env("LOOM_ROLE")
+            .map(|role| crate::runtime_admission::resolve_and_admit(root, &role, Some("codex")));
+        match admission {
+            // #8787: a role refused ONLY for native repository isolation may
+            // run on verified private-clone containment, through the one
+            // selection that proved it. Every other rejection still fails
+            // closed with its own diagnostic.
+            Some(Err(rejection)) if rejection.containment_eligible() => {
+                let role = rejection.role.clone();
+                let (_, selection, _) =
+                    crate::tokens_pool::private_workspace::containment::admit_new(
+                        root,
+                        &role,
+                        Some("codex"),
+                        rejection,
+                        model.as_deref(),
+                        crate::tokens_pool::private_workspace::JobKind::Role,
+                        None,
+                        &owner,
+                    )
+                    .map_err(|e| LaunchError::config(e.diagnostic()))?;
+                Some(selection)
+            }
+            Some(Err(rejection)) => return Err(LaunchError::config(rejection.diagnostic())),
+            _ => crate::tokens_pool::private_workspace::dispatch::Selection::prepare(
+                root,
+                &runtime,
+                model.as_deref(),
+                crate::tokens_pool::private_workspace::JobKind::Role,
+                None,
+                &owner,
+            )
+            .map_err(|e| LaunchError::config(e.to_string()))?,
         }
-        crate::tokens_pool::private_workspace::dispatch::Selection::prepare(
-            root,
-            &runtime,
-            model.as_deref(),
-            crate::tokens_pool::private_workspace::JobKind::Role,
-            None,
-            &format!("worker-{}", uuid::Uuid::new_v4()),
-        )
-        .map_err(|e| LaunchError::config(e.to_string()))?
     } else {
         None
     };
@@ -486,6 +508,22 @@ fn run_preflight(
     // Docker boundaries that bypass it (spawn-claude.sh's containment,
     // spawn-codex.sh's session-exec) export it explicitly on their own.
     command.env("CARGO_INCREMENTAL", "0");
+    // The other half of #8453, on the same seam and for the same reason
+    // (#8458): when the repo opts in (`cargo.perWorktreeTargetDir`), a spawn
+    // that OWNS a sweep's claim runs under that issue worktree's own
+    // CARGO_TARGET_DIR, so the `cargo test` the agent runs itself cannot execute
+    // a sibling worktree's uplifted binary. Off by default, `None` for a
+    // role-runner tick or an interactive spawn (no single worktree to attribute
+    // a target dir to), and a no-op on a host whose cargo output is not
+    // redirected outside the worktree in the first place.
+    if let Some(dir) = crate::worktree_ops::cargo_target::provision::spawn_target_dir(
+        root,
+        nonempty_env("LOOM_SWEEP_CLAIM_OWNED").as_deref(),
+        nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_some(),
+    ) {
+        command.env("CARGO_TARGET_DIR", &dir);
+        let _ = writeln!(log, "# LOOM_CARGO_TARGET_DIR {} (#8458)", dir.display());
+    }
     // Preserve #8077 isolation defaults without repointing live IPC/token paths.
     if nonempty_env("LOOM_DAEMON_LOG").is_none() {
         command.env(
