@@ -27,7 +27,7 @@
 //! The same span shape records one role attempt's usage with
 //! `loom.usage.scope=attempt`: `loom-daemon usage-record` for in-session
 //! subagents ([`record`]) and single-target role-runner ticks
-//! (`role_tick_telemetry`).
+//! (`role_tick_telemetry::usage`).
 //!
 //! Only counters are exported: no prompt, tool argument or transcript text.
 //! The span drains to the OTLP queue with every other journalled span.
@@ -38,6 +38,7 @@
 
 pub mod cost;
 pub mod join;
+pub mod record;
 pub mod spans;
 
 use std::path::Path;

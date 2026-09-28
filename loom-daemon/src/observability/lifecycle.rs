@@ -190,7 +190,7 @@ pub fn inherited(root: &Path, name: SpanName, attributes: TraceAttributes) -> Op
     Some(Span { journal, active })
 }
 
-fn inherited_context(root: &Path) -> Option<(Journal, TraceContext, TraceContext)> {
+pub(crate) fn inherited_context(root: &Path) -> Option<(Journal, TraceContext, TraceContext)> {
     let path = PathBuf::from(std::env::var_os(CONTEXT_FILE_ENV)?)
         .canonicalize()
         .ok()?;
@@ -275,7 +275,7 @@ pub fn checkpoint_completed(
     );
 }
 
-fn checkpoint_workspace(root: &Path) -> PathBuf {
+pub(crate) fn checkpoint_workspace(root: &Path) -> PathBuf {
     let Some(candidate) =
         std::env::var_os("LOOM_WORKSPACE").and_then(|p| PathBuf::from(p).canonicalize().ok())
     else {
