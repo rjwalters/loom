@@ -1,7 +1,7 @@
 //! loom-ui star intents: validation, idempotent apply, unstar, the unmanaged
 //! drop, and the starred-at seam.
 
-use super::fake::{issue, repo_input, t, Host, World, STAR};
+use super::fake::{issue, outsider, repo_input, t, Host, World, STAR};
 use crate::star_liveness::intents::{
     parse_ack_intents, recorded_starred_at, starred_at_from_timeline, IntentQueue, IntentStarredAt,
     StarIntent,
@@ -148,7 +148,7 @@ fn a_star_on_an_unmanaged_repo_is_an_operator_ask_on_this_host() {
 #[test]
 fn the_queue_dedupes_by_id_and_parse_tolerates_old_backends() {
     assert!(parse_ack_intents(None).is_none());
-    assert_eq!(parse_ack_intents(Some(&[])), Some(Vec::new()));
+    assert_eq!(parse_ack_intents(Some(&serde_json::json!([]))), Some(Vec::new()));
     let q = IntentQueue::default();
     q.push_all(vec![intent("a", "o/r", 1, "star"), intent("a", "o/r", 1, "star")]);
     q.push_all(vec![intent("a", "o/r", 1, "star"), intent("b", "o/r", 2, "star")]);
@@ -159,7 +159,8 @@ fn the_queue_dedupes_by_id_and_parse_tolerates_old_backends() {
 #[test]
 fn requested_at_outranks_the_labeled_event_unless_relabeled_later() {
     // Label applied by the intent (10:00:05), comment right after: requested_at wins.
-    let out = "L 2026-09-28T10:00:05Z\nC 2026-09-28T10:00:07Z 2026-09-28T09:59:00Z\n";
+    let out =
+        "L 2026-09-28T10:00:05Z\nC 2026-09-28T10:00:07Z 2026-09-28T09:59:00Z COLLABORATOR joseph\n";
     assert_eq!(starred_at_from_timeline(out).as_deref(), Some("2026-09-28T09:59:00Z"));
     // Unstarred and restarred directly on GitHub later: the later labeling wins.
     let out2 = format!("{out}L 2026-09-28T12:00:00Z\n");
@@ -169,7 +170,7 @@ fn requested_at_outranks_the_labeled_event_unless_relabeled_later() {
         starred_at_from_timeline("L 2026-09-28T10:00:05Z\n").as_deref(),
         Some("2026-09-28T10:00:05Z")
     );
-    assert_eq!(starred_at_from_timeline("C 2026-09-28T10:00:07Z -\n"), None);
+    assert_eq!(starred_at_from_timeline("C 2026-09-28T10:00:07Z - - x\n"), None);
     assert_eq!(
         starred_at_from_timeline("2026-09-01T00:00:00Z\n").as_deref(),
         Some("2026-09-01T00:00:00Z"),
@@ -198,4 +199,59 @@ fn the_seam_answers_from_an_applied_intent_first() {
     };
     assert_eq!(seam.starred_at(3).unwrap().as_deref(), Some("2026-09-28T08:15:00Z"));
     assert_eq!(seam.starred_at(4).unwrap().as_deref(), Some("2026-09-28T10:00:05Z"));
+}
+
+#[test]
+fn every_shape_of_the_intents_field_parses_without_failing() {
+    use serde_json::json;
+    let good = json!({"id": "g-1", "repo": "o/r", "number": 3, "action": "star",
+        "label": STAR, "requested_by": "joseph"});
+    assert!(parse_ack_intents(Some(&json!(null))).is_none(), "null is an older backend");
+    for not_array in [json!({}), json!("intents"), json!(7), json!(true)] {
+        assert!(parse_ack_intents(Some(&not_array)).is_none(), "{not_array}");
+    }
+    let mixed = json!([good, "s", 4, null, [], {"number": "x"}, {"id": 5}]);
+    let parsed = parse_ack_intents(Some(&mixed)).unwrap();
+    // `{"id": 5}` fails on the id's type; `{"number": "x"}` likewise. Only the
+    // good one and nothing else survives.
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].id, "g-1");
+}
+
+#[test]
+fn a_forged_intent_marker_neither_orders_nor_suppresses() {
+    // Timeline: an outsider's comment carrying an old requested_at is ignored;
+    // the fleet App's and an insider's count.
+    let forged =
+        "L 2026-09-28T10:00:05Z\nC 2026-09-28T10:00:07Z 2020-01-01T00:00:00Z NONE drive-by\n";
+    assert_eq!(starred_at_from_timeline(forged).as_deref(), Some("2026-09-28T10:00:05Z"));
+    let app = "L 2026-09-28T10:00:05Z\nC 2026-09-28T10:00:07Z 2026-09-28T09:00:00Z CONTRIBUTOR loom-fleet-dispatch-2[bot]\n";
+    assert_eq!(starred_at_from_timeline(app).as_deref(), Some("2026-09-28T09:00:00Z"));
+
+    // Apply: an outsider pre-posting the intent's marker does not stop the
+    // real audit comment.
+    let world = World::default();
+    let slug = "ui/forged";
+    world.add(slug, issue(9, &["loom:issue"]));
+    world.comment_full(
+        slug,
+        9,
+        outsider("<!-- loom:operator-priority-intent=f-1 action=star requested_at=2020-01-01T00:00:00Z -->"),
+    );
+    let repos = vec![repo_input(slug)];
+    Host::new("host-a").pass(&world, &repos, vec![intent("f-1", slug, 9, "star")], t(10, 0));
+    assert_eq!(world.posted(slug).len(), 1, "the audit comment is still posted");
+}
+
+#[test]
+fn an_email_actor_renders_whole_inside_a_code_span() {
+    let world = World::default();
+    let slug = "ui/actor";
+    world.add(slug, issue(4, &["loom:issue"]));
+    let repos = vec![repo_input(slug)];
+    let mut i = intent("e-1", slug, 4, "star");
+    i.requested_by = Some("joseph@2amlogic.example `x` [y](z)".into());
+    Host::new("host-a").pass(&world, &repos, vec![i], t(10, 0));
+    let body = &world.posted(slug)[0].1;
+    assert!(body.contains("by `joseph@2amlogic.example x yz` via loom-ui"), "{body}");
 }

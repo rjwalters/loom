@@ -23,6 +23,8 @@ pub struct Repo {
     pub posted: Vec<(u32, String)>,
     /// Comment reads made through the fake.
     pub comment_reads: usize,
+    /// Issue searches made through the fake.
+    pub searches: usize,
     pub fail_listing: bool,
 }
 
@@ -39,15 +41,14 @@ impl World {
         self.repo(slug).items.insert(item.number, item);
     }
 
+    /// A comment by the fleet App (trusted).
     pub fn comment(&self, slug: &str, number: u32, body: &str) {
-        self.repo(slug)
-            .comments
-            .entry(number)
-            .or_default()
-            .push(ForgeComment {
-                body: body.to_string(),
-                created_at: None,
-            });
+        self.comment_full(slug, number, bot(body));
+    }
+
+    /// A comment with every field chosen by the test.
+    pub fn comment_full(&self, slug: &str, number: u32, c: ForgeComment) {
+        self.repo(slug).comments.entry(number).or_default().push(c);
     }
 
     pub fn posted(&self, slug: &str) -> Vec<(u32, String)> {
@@ -91,6 +92,27 @@ impl StarForge for FakeForge {
         Ok(repo.comments.get(&number).cloned().unwrap_or_default())
     }
 
+    fn search_open_issues(&mut self, phrase: &str) -> Result<Vec<RestIssue>> {
+        let mut repo = self.world.repo(&self.slug);
+        repo.searches += 1;
+        let wanted = phrase.to_ascii_lowercase();
+        Ok(repo
+            .items
+            .values()
+            .filter(|i| i.state == "open" && !i.is_pull_request)
+            .filter(|i| {
+                format!(
+                    "{}\n{}",
+                    i.title.as_deref().unwrap_or_default(),
+                    i.body.as_deref().unwrap_or_default()
+                )
+                .to_ascii_lowercase()
+                .contains(&wanted)
+            })
+            .cloned()
+            .collect())
+    }
+
     fn add_label(&mut self, number: u32, label: &str) -> Result<()> {
         let mut repo = self.world.repo(&self.slug);
         let item = repo
@@ -114,11 +136,28 @@ impl StarForge for FakeForge {
     fn post_comment(&mut self, number: u32, body: &str) -> Result<()> {
         let mut repo = self.world.repo(&self.slug);
         repo.posted.push((number, body.to_string()));
-        repo.comments.entry(number).or_default().push(ForgeComment {
-            body: body.to_string(),
-            created_at: None,
-        });
+        repo.comments.entry(number).or_default().push(bot(body));
         Ok(())
+    }
+}
+
+/// A comment by the fleet App, as GitHub reports it (`CONTRIBUTOR`).
+pub fn bot(body: &str) -> ForgeComment {
+    ForgeComment {
+        body: body.to_string(),
+        author: Some("loom-fleet-dispatch-1[bot]".into()),
+        author_association: Some("CONTRIBUTOR".into()),
+        ..ForgeComment::default()
+    }
+}
+
+/// A comment by an outside account (untrusted).
+pub fn outsider(body: &str) -> ForgeComment {
+    ForgeComment {
+        body: body.to_string(),
+        author: Some("drive-by".into()),
+        author_association: Some("NONE".into()),
+        ..ForgeComment::default()
     }
 }
 

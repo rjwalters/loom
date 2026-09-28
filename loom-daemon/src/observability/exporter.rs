@@ -110,11 +110,13 @@ struct IngestAck {
     #[serde(default)]
     host_id: Option<String>,
     /// loom-ui star intents (#9244 C). Absent from an older backend (`None`,
-    /// a no-op); `[]` from a supporting backend with nothing pending. Each
-    /// entry is parsed on its own, so one malformed intent never costs the
-    /// rest or the host-id check.
+    /// a no-op); `[]` from a supporting backend with nothing pending. Kept as
+    /// a raw value: whatever shape the field has (object, string, number,
+    /// null, a mixed array) can never fail the ack and skip the host-id
+    /// check; `parse_ack_intents` takes `as_array()` and drops bad entries
+    /// one by one.
     #[serde(default)]
-    operator_priority_intents: Option<Vec<serde_json::Value>>,
+    operator_priority_intents: Option<serde_json::Value>,
 }
 
 /// How much of a success-response body is read before the host-identity echo
@@ -228,7 +230,7 @@ impl HttpsExporter {
         if let (Some(queue), Some(intents)) = (
             self.intent_queue.as_ref(),
             crate::star_liveness::intents::parse_ack_intents(
-                ack.operator_priority_intents.as_deref(),
+                ack.operator_priority_intents.as_ref(),
             ),
         ) {
             if !intents.is_empty() {
@@ -854,6 +856,26 @@ mod tests {
         );
         let (queued, _) = ack_intents(&body, TEST_HOST_ID).await;
         assert_eq!(queued.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn any_shape_of_the_intents_field_keeps_the_host_id_check() {
+        let mixed = format!(r#"[{}, "s", 3, null, [], {{"number":"x"}}]"#, intent_json(2));
+        for (field, want) in [
+            ("{}", 0),
+            (r#""a-string""#, 0),
+            ("42", 0),
+            ("null", 0),
+            ("true", 0),
+            (mixed.as_str(), 1),
+        ] {
+            let body = format!(
+                r#"{{"accepted":1,"host_id":"robb-pro","operator_priority_intents":{field}}}"#
+            );
+            let (queued, status) = ack_intents(&body, "robb-studio").await;
+            assert_eq!(queued.len(), want, "{field}");
+            assert!(status.snapshot().is_some(), "{field}: the #4830 host-id check still ran");
+        }
     }
 
     #[test]

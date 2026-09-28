@@ -64,20 +64,32 @@ pub struct StarIntent {
     pub requested_by: Option<String>,
 }
 
-/// Parse the `operator_priority_intents` array out of an ack's JSON value.
-/// `None` when the field is absent (an older backend). Entries that are not
-/// objects of the right shape are skipped, never fatal to the rest.
+/// Parse the ack's `operator_priority_intents` field, taken as a raw JSON
+/// value so its shape can never fail the ack (and with it the #4830 host-id
+/// check). `None` when the field is absent or `null` (an older backend) or
+/// not an array at all (logged). Entries that are not objects of the right
+/// shape are skipped one by one, never fatal to the rest.
 #[must_use]
-pub fn parse_ack_intents(raw: Option<&[serde_json::Value]>) -> Option<Vec<StarIntent>> {
-    let raw = raw?;
+pub fn parse_ack_intents(raw: Option<&serde_json::Value>) -> Option<Vec<StarIntent>> {
+    let raw = raw.filter(|v| !v.is_null())?;
+    let Some(arr) = raw.as_array() else {
+        log::warn!("star_liveness: ignoring a non-array operator_priority_intents in the ack");
+        return None;
+    };
     Some(
-        raw.iter()
-            .filter_map(|v| match serde_json::from_value::<StarIntent>(v.clone()) {
-                Ok(i) => Some(i),
-                Err(e) => {
-                    log::warn!("star_liveness: dropping malformed loom-ui intent ({e})");
-                    None
+        arr.iter()
+            .filter_map(|v| {
+                if !v.is_object() {
+                    // serde would read `[]` as an all-default struct.
+                    log::warn!("star_liveness: dropping a non-object loom-ui intent");
+                    return None;
                 }
+                serde_json::from_value::<StarIntent>(v.clone())
+                    .ok()
+                    .or_else(|| {
+                        log::warn!("star_liveness: dropping a malformed loom-ui intent");
+                        None
+                    })
             })
             .collect(),
     )
@@ -193,13 +205,14 @@ fn safe_id(id: &str) -> bool {
 }
 
 /// `requested_by` as shown in the audit comment: printable ASCII from a
-/// small set (no markdown, no mentions), at most 64 chars. `None` when
-/// nothing is left.
+/// small set (no markdown, no backticks), at most 64 chars. `@` is kept so an
+/// email address reads as one; the comment renders the actor inside a code
+/// span, where `@name` does not ping anyone. `None` when nothing is left.
 fn sanitize_actor(raw: Option<&str>) -> Option<String> {
     let s: String = raw?
         .trim()
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '+'))
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '+' | '@'))
         .take(64)
         .collect();
     let s = s.trim().to_string();
@@ -310,7 +323,11 @@ pub fn apply(forge: &mut dyn StarForge, intent: &ValidIntent) -> anyhow::Result<
     }
     let id_marker = format!("{INTENT_MARKER_PREFIX}{} ", intent.id);
     let comments = forge.comments(intent.number)?;
-    if !comments.iter().any(|c| c.body.contains(&id_marker)) {
+    let me = forge.self_login();
+    let posted = comments
+        .iter()
+        .any(|c| c.body.contains(&id_marker) && super::trust::trusted(c, me.as_deref()));
+    if !posted {
         forge.post_comment(intent.number, &audit_comment(intent))?;
         applied.commented = true;
     }
@@ -371,7 +388,10 @@ impl StarredAtSource for IntentStarredAt<'_> {
 
 /// The starred-at from a timeline read that yields one line per relevant
 /// event: `L <created_at>` for a `labeled` event and
-/// `C <created_at> <requested_at>` for a star-intent audit comment.
+/// `C <created_at> <requested_at> <author_association> <login>` for a
+/// star-intent audit comment. An intent comment counts only from a trusted
+/// author ([`super::trust`]): anyone can comment on a public repo, and a
+/// forged marker with an old `requested_at` would jump the starred order.
 ///
 /// The latest intent comment posted at or after the latest `labeled` event
 /// decides (that labeling came from the intent, and the intent's
@@ -383,21 +403,22 @@ pub fn starred_at_from_timeline(stdout: &str) -> Option<String> {
     let mut labeled = None;
     let mut intents = Vec::new();
     for line in stdout.lines() {
-        let mut parts = line.trim().trim_matches('"').split_whitespace();
-        match (parts.next(), parts.next(), parts.next()) {
-            (Some("L"), Some(at), _) => {
+        let fields: Vec<&str> = line.trim().trim_matches('"').split_whitespace().collect();
+        match fields.as_slice() {
+            ["L", at, ..] => {
                 if let Some(t) = parse(at) {
                     labeled = labeled.max(Some(t));
                 }
             }
-            (Some("C"), Some(at), Some(req)) => {
-                if let (Some(t), Some(r)) = (parse(at), parse(req)) {
+            ["C", at, req, assoc, login, ..] => {
+                let believed = super::trust::trusted_author(Some(login), Some(assoc), None);
+                if let (true, Some(t), Some(r)) = (believed, parse(at), parse(req)) {
                     intents.push((t, r));
                 }
             }
             // A bare timestamp is a labeled event (the pre-#9244-C output
             // shape, which slice A's fakes still emit).
-            (Some(bare), None, None) if parse(bare).is_some() => {
+            [bare] if parse(bare).is_some() => {
                 labeled = labeled.max(parse(bare));
             }
             _ => {}

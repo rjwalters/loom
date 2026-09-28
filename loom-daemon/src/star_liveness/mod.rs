@@ -15,18 +15,25 @@
 //!    `queue.snapshot` (so loom-ui does).
 //! 2. **Immediate escalation** ([`escalate`]). A stage no agent can leave is
 //!    `needs-operator` with one concrete [`OperatorAsk`] on the first pass
-//!    that sees it. The ask is posted once as a comment on the issue, carrying
+//!    that sees it (`pools-exhausted` after a grace window,
+//!    `poolsExhaustedGraceMinutes`, default 10, so a peer can claim first). The ask is posted once as a comment on the issue, carrying
 //!    a `<!-- loom:operator-priority-escalation key=… -->` marker. The marker
 //!    is the dedupe: across ticks (an in-memory ledger short-circuits the
 //!    check) and across hosts (every host reads the issue's comments for the
-//!    marker before posting).
+//!    marker before posting). Only markers from trusted authors count
+//!    ([`trust`]): an insider, the fleet App, or this daemon.
 //! 3. **Watchdog** ([`progress`]). An agent-owned stage with no forward
 //!    progress for `noProgressMinutes` (default 30) escalates too, keyed by
-//!    the stalled fingerprint so the same stall is reported once.
+//!    the stalled fingerprint so the same stall is reported once. Progress
+//!    and the key use forge-visible facts only (labels, the PR, comments and
+//!    lease renewals), so every host names a stall alike.
 //! 4. **Blocker inheritance** ([`inherit`]). The issue blocking a starred
-//!    issue (named by `loom:blocked`, the incident named in a merge refusal,
-//!    or the repo's red-main fix) inherits the star's queue position in the
-//!    work finder and its escalation, and loses both once it stops blocking.
+//!    issue (named by `loom:blocked`, the open incident tied to a merge
+//!    refusal, or the repo's red-main fix) inherits the star's queue position
+//!    in the work finder and its escalation, and loses both once it stops
+//!    blocking, or once its repo has been unreadable for
+//!    [`task::MAX_FAILED_PASSES`] passes. A cross-repo blocker is an operator
+//!    ask: stars do not cross repos.
 //! 5. **loom-ui star intents** ([`intents`]). The `/ingest` ack may carry
 //!    `operator_priority_intents`; the exporter queues them and this module
 //!    validates and applies them idempotently, with one audit comment whose
@@ -66,6 +73,7 @@ pub mod progress;
 pub mod refusal;
 pub mod render;
 pub mod task;
+pub mod trust;
 
 #[cfg(test)]
 mod tests;
@@ -76,11 +84,15 @@ pub const NO_PROGRESS_MINUTES_ENV: &str = "LOOM_OPERATOR_PRIORITY_NO_PROGRESS_MI
 pub const ESCALATE_ENV: &str = "LOOM_OPERATOR_PRIORITY_ESCALATE";
 /// Env override for [`Settings::interval`] (seconds).
 pub const INTERVAL_SECS_ENV: &str = "LOOM_OPERATOR_PRIORITY_INTERVAL_SECS";
+/// Env override for [`Settings::pools_grace`] (minutes; `0` asks at once).
+pub const POOLS_GRACE_MINUTES_ENV: &str = "LOOM_OPERATOR_PRIORITY_POOLS_GRACE_MINUTES";
 
 /// Default watchdog window.
 pub const DEFAULT_NO_PROGRESS_MINUTES: u64 = 30;
 /// Default pass interval.
 pub const DEFAULT_INTERVAL_SECS: u64 = 120;
+/// Default `pools-exhausted` grace window.
+pub const DEFAULT_POOLS_GRACE_MINUTES: u64 = 10;
 
 /// Resolved `autonomous.operatorPriority` settings (**env > config >
 /// default** for each knob).
@@ -93,6 +105,10 @@ pub struct Settings {
     pub escalate: bool,
     /// `intervalSecs`: how often the pass runs.
     pub interval: Duration,
+    /// `poolsExhaustedGraceMinutes`: how long an issue waits on this host's
+    /// exhausted pool before the `pools-exhausted` ask, so a peer host with
+    /// capacity can claim it first.
+    pub pools_grace: Duration,
 }
 
 impl Default for Settings {
@@ -101,6 +117,7 @@ impl Default for Settings {
             no_progress: Duration::from_secs(DEFAULT_NO_PROGRESS_MINUTES * 60),
             escalate: true,
             interval: Duration::from_secs(DEFAULT_INTERVAL_SECS),
+            pools_grace: Duration::from_secs(DEFAULT_POOLS_GRACE_MINUTES * 60),
         }
     }
 }
@@ -110,10 +127,13 @@ fn positive_u64(v: Option<&serde_json::Value>) -> Option<u64> {
 }
 
 fn env_u64(name: &str) -> Option<u64> {
+    env_u64_or_zero(name).filter(|n| *n > 0)
+}
+
+fn env_u64_or_zero(name: &str) -> Option<u64> {
     std::env::var(name)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|n| *n > 0)
 }
 
 fn env_bool(name: &str) -> Option<bool> {
@@ -138,6 +158,9 @@ impl Settings {
         let interval = env_u64(INTERVAL_SECS_ENV)
             .or_else(|| positive_u64(cfg("intervalSecs")))
             .unwrap_or(DEFAULT_INTERVAL_SECS);
+        let grace = env_u64_or_zero(POOLS_GRACE_MINUTES_ENV)
+            .or_else(|| cfg("poolsExhaustedGraceMinutes").and_then(serde_json::Value::as_u64))
+            .unwrap_or(DEFAULT_POOLS_GRACE_MINUTES);
         let escalate = env_bool(ESCALATE_ENV)
             .or_else(|| cfg("escalate").and_then(serde_json::Value::as_bool))
             .unwrap_or(d.escalate);
@@ -145,6 +168,7 @@ impl Settings {
             no_progress: Duration::from_secs(minutes.saturating_mul(60)),
             escalate,
             interval: Duration::from_secs(interval),
+            pools_grace: Duration::from_secs(grace.saturating_mul(60)),
         }
     }
 

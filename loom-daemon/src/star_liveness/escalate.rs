@@ -9,7 +9,8 @@
 //! - **Across ticks:** [`Ledger`] remembers every key this process has posted
 //!   or found on the forge, so a repeat needs no forge read at all.
 //! - **Across hosts:** before posting, the issue's comments are read and a
-//!   comment already carrying the key's [`marker`] counts as posted. Two
+//!   trusted comment already carrying the key's [`marker`] counts as posted
+//!   (a marker forged by an outside commenter does not). Two
 //!   hosts can still race inside the read-then-post window of one pass; that
 //!   costs one duplicate comment at worst, never a missed ask.
 //! - **Across restarts:** the forge marker again; the ledger is rebuilt from
@@ -29,11 +30,14 @@ pub fn marker(key: &str) -> String {
     format!("{MARKER_PREFIX}{key} -->")
 }
 
-/// Whether any of `comments` carries the marker for `key`.
+/// Whether any **trusted** comment ([`super::trust`]) carries the marker
+/// for `key`. A marker an outside commenter pre-posted suppresses nothing.
 #[must_use]
-pub fn already_posted(comments: &[ForgeComment], key: &str) -> bool {
+pub fn already_posted(comments: &[ForgeComment], key: &str, self_login: Option<&str>) -> bool {
     let m = marker(key);
-    comments.iter().any(|c| c.body.contains(&m))
+    comments
+        .iter()
+        .any(|c| c.body.contains(&m) && super::trust::trusted(c, self_login))
 }
 
 /// The comment body for `ask` on an issue. `inherited_from` names the
@@ -108,7 +112,8 @@ impl Ledger {
             return Ok(Outcome::Disabled);
         }
         let comments = forge.comments(issue)?;
-        let outcome = if already_posted(&comments, &ask.key) {
+        let me = forge.self_login();
+        let outcome = if already_posted(&comments, &ask.key, me.as_deref()) {
             Outcome::FoundOnForge
         } else {
             forge.post_comment(issue, &comment_body(ask, &self.host, inherited_from))?;

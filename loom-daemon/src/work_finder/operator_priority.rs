@@ -215,10 +215,11 @@ pub fn resolve_starred_at(
 
 /// The `--jq` program for [`GhTimelineStarredAt`]: `L <created_at>` per
 /// `labeled` event for [`OPERATOR_PRIORITY_LABEL`], and
-/// `C <created_at> <requested_at>` per loom-ui star-intent audit comment
-/// (#9244 C), whose `requested_at` is the authoritative starred-at. Parsed by
+/// `C <created_at> <requested_at> <author_association> <login>` per loom-ui
+/// star-intent audit comment (#9244 C), whose `requested_at` is the
+/// authoritative starred-at when its author is trusted. Parsed by
 /// [`crate::star_liveness::intents::starred_at_from_timeline`].
-const STARRED_AT_JQ: &str = r#".[] | if (.event == "labeled" and .label.name == "loom:operator-priority") then "L \(.created_at)" elif (.event == "commented" and ((.body // "") | contains("loom:operator-priority-intent=") and contains("action=star"))) then "C \(.created_at) \((.body | capture("requested_at=(?<t>[^ >]+)") | .t) // "-")" else empty end"#;
+const STARRED_AT_JQ: &str = r#".[] | if (.event == "labeled" and .label.name == "loom:operator-priority") then "L \(.created_at)" elif (.event == "commented" and ((.body // "") | contains("loom:operator-priority-intent=") and contains("action=star"))) then "C \(.created_at) \((.body | capture("requested_at=(?<t>[^ >]+)") | .t) // "-") \(.author_association // "-") \(.actor.login // .user.login // "-")" else empty end"#;
 
 /// The latest RFC-3339 timestamp in `stdout` (one per line), i.e. the most
 /// recent time the label was applied. Unparseable lines are skipped.

@@ -91,6 +91,9 @@ pub enum AskKind {
     UnmanagedRepo,
     /// `loom:blocked` with no open blocking issue named anywhere.
     BlockedUnnamed,
+    /// `loom:blocked` by an issue in another repo, which a star does not
+    /// cross (#9244 C review).
+    BlockedCrossRepo,
     /// No forward progress for the watchdog window.
     NoProgress,
     /// A kind this client does not know (forward compatibility).
@@ -110,6 +113,7 @@ impl AskKind {
             Self::PoolsExhausted => "pools-exhausted",
             Self::UnmanagedRepo => "unmanaged-repo",
             Self::BlockedUnnamed => "blocked-unnamed",
+            Self::BlockedCrossRepo => "blocked-cross-repo",
             Self::NoProgress => "no-progress",
             Self::Unknown => "unknown",
         }
@@ -147,7 +151,8 @@ pub struct StarLandingRow {
     /// The open PR driving it, when there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<u32>,
-    /// `BlockedBy`: the blocking issue, as `#N`.
+    /// `BlockedBy` (or a cross-repo `NeedsOperator`): the blocking issue, as
+    /// `#N` or `owner/repo#N`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_by: Option<String>,
     /// `NoCapacity`: why there is no slot.
@@ -163,8 +168,9 @@ pub struct StarLandingRow {
     /// The starred-at this row sorts by (its own, or the inheriting star's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_priority_at: Option<String>,
-    /// When forward progress was last seen (label change, PR update,
-    /// checkpoint write).
+    /// When forward progress was last seen (label change, PR update, a
+    /// comment or lease renewal): forge-visible facts only, the same on
+    /// every host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_progress_at: Option<DateTime<Utc>>,
 }
@@ -241,6 +247,7 @@ mod tests {
             AskKind::PoolsExhausted,
             AskKind::UnmanagedRepo,
             AskKind::BlockedUnnamed,
+            AskKind::BlockedCrossRepo,
             AskKind::NoProgress,
         ] {
             assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(k.as_str()));

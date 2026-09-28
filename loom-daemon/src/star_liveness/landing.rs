@@ -15,8 +15,10 @@
 //!    → `needs-operator(merge-risk-hold)`;
 //! 4. the forge refused the merge of its approved PR →
 //!    `needs-operator(merge-refused)`;
-//! 5. `loom:blocked`: an open named blocker → `blocked-by`; none →
-//!    `needs-operator(blocked-unnamed)`;
+//! 5. `loom:blocked`: an open same-repo blocker → `blocked-by` (it inherits
+//!    the star); only a cross-repo blocker → `needs-operator(blocked-cross-repo)`
+//!    (stars are not inherited across repos, so nothing else would move it);
+//!    none → `needs-operator(blocked-unnamed)`;
 //! 6. its repo's `main` is red and it has not been dispatched → `blocked-by`
 //!    the red-main fix;
 //! 7. an open PR → `changes-requested` / `mergeable` (`merging` with a live
@@ -73,10 +75,13 @@ impl ItemFacts {
 /// A forge refusal to merge an approved PR ([`super::refusal`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeRefusal {
-    /// A fixed, templated description of the refusal class (never raw forge
-    /// text), e.g. "merge commits are not allowed (HTTP 405)".
+    /// A fixed, templated description of the refusal class, e.g. "merge
+    /// commits are not allowed (HTTP 405)".
     pub reason: &'static str,
-    /// The incident issue a later comment named, when one did.
+    /// The forge's own words, bounded and inert ([`super::refusal::raw_excerpt`]).
+    pub raw: String,
+    /// The **open** incident issue tied to the refusal (named in the refusal
+    /// comment, or carrying its failure signature), when there is one.
     pub incident: Option<u32>,
 }
 
@@ -98,6 +103,9 @@ pub struct BlockerRef {
     /// Whether it is open. `None` when it could not be read; treated as open
     /// (a blocker we cannot see is not proof the issue is free).
     pub open: Option<bool>,
+    /// For a blocker in another repo: whether a workspace on this host
+    /// manages that repo. `None` for a same-repo blocker.
+    pub cross_repo_managed: Option<bool>,
 }
 
 /// What stands between an undispatched issue and a slot on this host.
@@ -106,9 +114,11 @@ pub enum Capacity {
     /// Nothing known to be in the way.
     #[default]
     Available,
-    /// This host's token pool is exhausted (the hold's description), and the
-    /// dedupe episode (the hold's `since` date).
-    PoolExhausted { detail: String, episode: String },
+    /// This host's token pool is exhausted (the hold's description). The
+    /// ask's dedupe key comes from the issue's forge fingerprint, not from
+    /// this host's hold, so every host and every re-exhaustion of an issue
+    /// that has not moved share one key ([`super::collect`]).
+    PoolExhausted { detail: String },
     /// The work finder deferred it on a capacity-style limit.
     Deferred { reason: String },
 }
@@ -269,17 +279,17 @@ pub fn classify(f: &StarFacts) -> Landing {
             );
         }
         if let Some(refusal) = &pr.refusal {
-            let see = refusal
-                .incident
-                .map(|i| format!(" See #{i}."))
-                .unwrap_or_default();
+            let tail = refusal.incident.map_or_else(
+                || format!(" No open incident issue tracks it; the forge said: `{}`", refusal.raw),
+                |i| format!(" Tracked in #{i}, which inherits the star."),
+            );
             let mut landing = Landing::operator(
                 AskKind::MergeRefused,
                 &format!("pr-{p}"),
                 format!(
                     "{}#{n}: PR #{p} is approved but GitHub refuses the merge: {}. A repo admin \
                      must reconcile the repo's merge settings (branch ruleset vs. allowed merge \
-                     methods), then Champion can merge it.{see}",
+                     methods), then Champion can merge it.{tail}",
                     f.repo, refusal.reason
                 ),
                 Some(p),
@@ -291,11 +301,38 @@ pub fn classify(f: &StarFacts) -> Landing {
 
     // 5. Blocked.
     if f.issue.has(BLOCKED_LABEL) {
-        if let Some(b) = f.blockers.iter().find(|b| b.open != Some(false)) {
+        let open = |b: &&BlockerRef| b.open != Some(false);
+        if let Some(b) = f
+            .blockers
+            .iter()
+            .filter(open)
+            .find(|b| b.cross_repo_managed.is_none())
+        {
             let mut landing =
                 Landing::stage(LandingStage::BlockedBy, &format!("blocker {}", b.display), pr_num);
             landing.blocked_by = Some(b.display.clone());
             landing.inherits = b.number.filter(|m| *m != n);
+            return landing;
+        }
+        if let Some(b) = f.blockers.iter().find(open) {
+            let d = &b.display;
+            let text = if b.cross_repo_managed == Some(true) {
+                format!(
+                    "{}#{n} is starred but blocked by {d} in another repo. Stars are not \
+                     inherited across repos, so {d} keeps its own queue position: star {d} so \
+                     it lands first, or remove the blocker.",
+                    f.repo
+                )
+            } else {
+                format!(
+                    "{}#{n} is starred but blocked by {d} in a repo this host can't act on: get \
+                     {d} resolved (or managed by a Loom host and starred), then remove \
+                     `loom:blocked`.",
+                    f.repo
+                )
+            };
+            let mut landing = Landing::operator(AskKind::BlockedCrossRepo, d, text, pr_num);
+            landing.blocked_by = Some(d.clone());
             return landing;
         }
         return Landing::operator(
@@ -344,10 +381,10 @@ pub fn classify(f: &StarFacts) -> Landing {
 
     // 9. Capacity.
     match &f.capacity {
-        Capacity::PoolExhausted { detail, episode } => {
+        Capacity::PoolExhausted { detail } => {
             return Landing::operator(
                 AskKind::PoolsExhausted,
-                episode,
+                "",
                 format!(
                     "{}#{n} is starred and waiting, but the token pool on host `{}` is \
                      exhausted ({detail}) and no other host has claimed it: add a token or \

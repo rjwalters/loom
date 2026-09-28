@@ -1,26 +1,33 @@
 //! Detect a forge merge refusal on an approved PR from its comments (the
-//! #9268 shape). Pure.
+//! #9268 shape), and the incident issue tied to it. Pure; the forge reads
+//! the incident lookup needs happen in [`super::collect`].
 //!
 //! `merge-pr.sh` hard-stops on a merge error it cannot retry ("Failed to merge
-//! PR #N: …"), and Champion then posts its "**Champion: Merge Failed**"
-//! comment quoting that text (`champion-pr-merge.md`). A refusal is such a
-//! comment whose quoted error is a **policy** refusal: the forge will refuse
-//! every retry until a human changes a repo setting. Transient errors are not
-//! refusals: "Merge already in progress" (a 405 too), "Base branch was
-//! modified" and "Head branch was modified" are the retry ladder's own routes.
-//!
-//! The ask never quotes the forge text. [`classify_refusal`] maps it to one of
-//! a few fixed descriptions, so nothing free-form reaches `queue.snapshot`.
+//! PR #N: …"), and Champion (or the sweep) then posts a comment quoting that
+//! text. A refusal is such a comment whose quoted error is a **policy**
+//! refusal: the forge will refuse every retry until a human changes a repo
+//! setting. Transient errors are not refusals: "Merge already in progress"
+//! (a 405 too), "Base branch was modified" and "Head branch was modified" are
+//! the retry ladder's own routes. Only comments [`super::trust`] believes are
+//! read at all.
 //!
 //! # The incident
 //!
-//! Whoever files the incident for a repo-wide refusal (#9268 for #8191's PR
-//! #9276) usually says so on the PR afterwards ("blocked by #9268"). The last
-//! `#N` mentioned in the refusal comment or any later comment, other than the
-//! PR and its issue, is taken as the incident. It inherits the star.
+//! The incident is tied to the refusal itself, never to whatever a later
+//! comment happens to mention (on 2026-09-28 the later comments on PR #9276
+//! were a stale-check re-date and a verdict-stale notice naming #8508, #8248
+//! and #5686, none of them the incident):
+//!
+//! 1. an issue named **in the refusal comment** ([`Detected::named`]), if it
+//!    is an open issue (not a PR, not closed); else
+//! 2. an **open** issue whose title or body carries the refusal's failure
+//!    signature ([`Detected::signature`], e.g. "merge commits are not
+//!    allowed"), the way #9268 quotes the 405 it was filed for.
+//!
+//! With neither, nothing inherits, and the operator ask carries the raw
+//! refusal text ([`Detected::raw`]) so the escalation is never silent.
 
 use super::forge::ForgeComment;
-use super::landing::MergeRefusal;
 
 /// Markers of a failed-merge report.
 const FAILURE_MARKERS: &[&str] = &[
@@ -37,38 +44,60 @@ const TRANSIENT: &[&str] = &[
     "head out of date",
 ];
 
+/// Longest raw refusal excerpt carried into an ask.
+pub const MAX_RAW: usize = 300;
+
+/// A refusal class: a fixed description, and the phrase an incident issue
+/// filed for it would quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefusalClass {
+    pub reason: &'static str,
+    pub signature: &'static str,
+}
+
 /// The refusal class for `text`, or `None` when it is not a policy refusal.
 #[must_use]
-pub fn classify_refusal(text: &str) -> Option<&'static str> {
+pub fn classify_refusal(text: &str) -> Option<RefusalClass> {
     if TRANSIENT.iter().any(|t| text.contains(t)) {
         return None;
     }
     let lower = text.to_ascii_lowercase();
-    if lower.contains("merge commits are not allowed") {
-        return Some("merge commits are not allowed on this repository (HTTP 405)");
-    }
-    if lower.contains("squash merges are not allowed")
-        || lower.contains("rebase merges are not allowed")
-    {
-        return Some("that merge method is not allowed on this repository (HTTP 405)");
+    let class = |reason, signature| Some(RefusalClass { reason, signature });
+    for sig in [
+        "merge commits are not allowed",
+        "squash merges are not allowed",
+        "rebase merges are not allowed",
+    ] {
+        if lower.contains(sig) {
+            let reason = if sig.starts_with("merge commits") {
+                "merge commits are not allowed on this repository (HTTP 405)"
+            } else {
+                "that merge method is not allowed on this repository (HTTP 405)"
+            };
+            return class(reason, sig);
+        }
     }
     if lower.contains("allowed method")
         || lower.contains("merge method")
         || lower.contains("merge-method")
     {
-        return Some("no merge method both the ruleset and the repo settings allow");
+        return class(
+            "no merge method both the ruleset and the repo settings allow",
+            "merge method",
+        );
     }
     if lower.contains("repository rule violation") || lower.contains("ruleset") {
-        return Some("a branch ruleset refuses the merge");
+        return class("a branch ruleset refuses the merge", "repository rule violation");
     }
     if lower.contains("http 405") || lower.contains("405 method not allowed") {
-        return Some("the forge refuses the merge (HTTP 405)");
+        return class("the forge refuses the merge (HTTP 405)", "405");
     }
     None
 }
 
 /// `#N` references in `text`, in order (bare `#123`; not `owner/repo#123`).
-fn hash_refs(text: &str) -> Vec<u32> {
+#[must_use]
+pub fn hash_refs(text: &str) -> Vec<u32> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -94,24 +123,72 @@ fn hash_refs(text: &str) -> Vec<u32> {
     out
 }
 
-/// The refusal on PR `pr` (linked to `issue`), from its comments in forge
-/// order. The **latest** failed-merge report decides: a later report that is
-/// not a policy refusal (a transient failure after the admin fixed the
-/// settings) clears it.
+/// The forge's own words, bounded and made inert for a comment and the
+/// snapshot: the line quoting the failure (or the first line that classifies),
+/// with backticks, angle brackets and control characters removed, so it can
+/// sit inside a code span (which also keeps any `@` from pinging).
 #[must_use]
-pub fn detect(comments: &[ForgeComment], pr: u32, issue: u32) -> Option<MergeRefusal> {
-    let (idx, reason) = comments
+pub fn raw_excerpt(body: &str) -> String {
+    let line = body
+        .lines()
+        .find(|l| l.contains("Failed to merge PR #"))
+        .or_else(|| body.lines().find(|l| classify_refusal(l).is_some()))
+        .unwrap_or_default();
+    let clean: String = line
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '`' | '<' | '>'))
+        .collect();
+    let clean = clean.trim();
+    if clean.chars().count() > MAX_RAW {
+        let cut: String = clean.chars().take(MAX_RAW).collect();
+        format!("{cut}…")
+    } else {
+        clean.to_string()
+    }
+}
+
+/// A refusal found in a PR's comments, before its incident is looked up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detected {
+    pub class: RefusalClass,
+    /// [`raw_excerpt`] of the refusal comment.
+    pub raw: String,
+    /// Issue numbers the refusal comment itself names, in order, without the
+    /// PR and its linked issue. Candidates only: the caller keeps the first
+    /// that is an open issue.
+    pub named: Vec<u32>,
+}
+
+impl Detected {
+    /// The failure signature an incident issue would quote.
+    #[must_use]
+    pub fn signature(&self) -> &'static str {
+        self.class.signature
+    }
+}
+
+/// The refusal on PR `pr` (linked to `issue`), from its **trusted** comments
+/// in forge order. The **latest** failed-merge report decides: a later report
+/// that is not a policy refusal (a transient failure after the admin fixed
+/// the settings) clears it. Later comments never name the incident.
+#[must_use]
+pub fn detect(comments: &[ForgeComment], pr: u32, issue: u32) -> Option<Detected> {
+    let refusal = comments
         .iter()
-        .enumerate()
         .rev()
-        .find(|(_, c)| FAILURE_MARKERS.iter().any(|m| c.body.contains(m)))
-        .map(|(i, c)| (i, classify_refusal(&c.body)))?;
-    let reason = reason?;
-    let incident = comments[idx..]
-        .iter()
-        .flat_map(|c| hash_refs(&c.body))
-        .rfind(|n| *n != pr && *n != issue);
-    Some(MergeRefusal { reason, incident })
+        .find(|c| FAILURE_MARKERS.iter().any(|m| c.body.contains(m)))?;
+    let class = classify_refusal(&refusal.body)?;
+    let mut named = Vec::new();
+    for n in hash_refs(&refusal.body) {
+        if n != pr && n != issue && !named.contains(&n) {
+            named.push(n);
+        }
+    }
+    Some(Detected {
+        class,
+        raw: raw_excerpt(&refusal.body),
+        named,
+    })
 }
 
 #[cfg(test)]
@@ -121,20 +198,23 @@ mod tests {
     fn c(body: &str) -> ForgeComment {
         ForgeComment {
             body: body.to_string(),
-            created_at: None,
+            ..ForgeComment::default()
         }
     }
 
     #[test]
-    fn the_9268_shape_is_a_refusal_with_its_incident() {
+    fn a_405_refusal_names_only_what_its_own_comment_names() {
         let comments = [
             c("Judge: approved"),
-            c("**Champion: Merge Failed**\n\n```\nFailed to merge PR #9276: gh: Merge commits are not allowed on this repository. (HTTP 405)\n```"),
-            c("Also hit this. Repo-wide: see #9268 (ruleset allows squash only)."),
+            c("**Champion: Merge Failed**\n\n```\nFailed to merge PR #9276: gh: Merge commits are not allowed on this repository. (HTTP 405)\n```\nSee #9115."),
+            c("Stale-check re-date (#8508); approval invalidated (#5686)."),
         ];
-        let r = detect(&comments, 9276, 8191).unwrap();
-        assert!(r.reason.contains("405"), "{}", r.reason);
-        assert_eq!(r.incident, Some(9268));
+        let d = detect(&comments, 9276, 8191).unwrap();
+        assert!(d.class.reason.contains("405"), "{}", d.class.reason);
+        assert_eq!(d.signature(), "merge commits are not allowed");
+        assert_eq!(d.named, vec![9115], "later comments never name the incident");
+        assert!(d.raw.starts_with("Failed to merge PR #9276"), "{}", d.raw);
+        assert!(!d.raw.contains('`'));
     }
 
     #[test]
@@ -157,9 +237,9 @@ mod tests {
     }
 
     #[test]
-    fn no_failure_report_is_no_refusal_and_self_refs_are_not_incidents() {
+    fn no_failure_report_is_no_refusal_and_self_refs_are_not_candidates() {
         assert_eq!(detect(&[c("see #5")], 1, 2), None);
-        let r = detect(
+        let d = detect(
             &[c(
                 "Failed to merge PR #7: Repository rule violations found (closes #3)",
             )],
@@ -167,7 +247,15 @@ mod tests {
             3,
         )
         .unwrap();
-        assert_eq!(r.incident, None);
+        assert!(d.named.is_empty());
         assert_eq!(hash_refs("a#1 x/y#2 #3 (#44)"), vec![3, 44]);
+    }
+
+    #[test]
+    fn the_raw_excerpt_is_bounded_and_inert() {
+        let long = format!("Failed to merge PR #1: <b>`{}`</b>\u{7}", "x".repeat(400));
+        let raw = raw_excerpt(&long);
+        assert!(raw.chars().count() <= MAX_RAW + 1);
+        assert!(!raw.contains(['<', '>', '`', '\u{7}']), "{raw}");
     }
 }

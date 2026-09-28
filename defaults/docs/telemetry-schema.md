@@ -135,17 +135,24 @@ has no GitHub write access, so the daemon applies them):
       "requested_at": "2026-09-28T08:15:00Z", "requested_by": "operator" } ] }
 ```
 
-The actor field is `requested_by`. A missing field is an older backend and a
-no-op; `[]` is a supporting backend with nothing pending. Each entry parses on
-its own, so one malformed intent costs only itself. The daemon applies an
+The actor field is `requested_by`. A missing or `null` field is an older
+backend and a no-op; `[]` is a supporting backend with nothing pending. The
+daemon reads the field as a raw JSON value, so no shape of it (an object, a
+string, a number, a mixed array) can fail the ack or skip the `host_id` check;
+a non-array is ignored and logged, and each array entry that is not a
+well-formed object is dropped on its own. The daemon applies an
 intent only when `label` is exactly `loom:operator-priority`, `action` is
 `star` or `unstar`, `repo` is in this host's workspace registry, and
 `requested_by` is non-empty; anything else is dropped and logged (visible as
 `dropped_intents` in `loom-daemon status --json`). Applying adds or removes the
 label, then posts one audit comment carrying
 `<!-- loom:operator-priority-intent=<id> action=<a> requested_at=<ts> -->`,
-unless a comment with that intent id already exists, so resending an intent,
-or several hosts managing the repo, is harmless. `requested_at` becomes the
+unless a trusted comment with that intent id already exists, so resending an
+intent, or several hosts managing the repo, is harmless. Trusted means an
+`OWNER` / `MEMBER` / `COLLABORATOR`, the fleet App (`loom-fleet-dispatch*`), or
+the daemon's own login: a marker an outside commenter posts neither suppresses
+the audit comment nor sets the starred-at. `requested_by` is shown inside a
+code span, so an email address stays whole and an `@name` pings no one. `requested_at` becomes the
 issue's starred-at for dispatch order. The exporter reads at most 64 KiB of
 the response (4 KiB before #9244 C, which truncated a ~12 KiB 50-intent ack
 and lost the `host_id` check along with the intents).
@@ -1287,8 +1294,8 @@ Each entry:
 | `time_in_stage_secs` | integer | seconds in `stage` |
 | `pr` | integer, optional | its open PR |
 | `blocked_by` | string, optional | `blocked-by`: `#N`, or `owner/repo#N` across repos |
-| `no_capacity` | string, optional | `no-capacity`: the work finder's fixed reason text |
-| `ask` | object, optional | set when the operator has been asked: `{kind, key, text}`. `kind` is `operator-only`, `operator-decision`, `merge-risk-hold`, `merge-refused`, `pools-exhausted`, `unmanaged-repo`, `blocked-unnamed` or `no-progress`. `key` is the dedupe key (`<kind>:<specifics>`), identical on every host for the same cause. `text` is the one concrete ask, templated by the daemon (never forge free text). A `no-progress` ask keeps the agent-owned `stage` |
+| `no_capacity` | string, optional | `no-capacity`: the work finder's fixed reason text, or the pools-exhausted grace note |
+| `ask` | object, optional | set when the operator has been asked: `{kind, key, text}`. `kind` is `operator-only`, `operator-decision`, `merge-risk-hold`, `merge-refused`, `pools-exhausted`, `unmanaged-repo`, `blocked-unnamed`, `blocked-cross-repo` or `no-progress`. `key` is the dedupe key (`<kind>:<specifics>`), identical on every host for the same cause. `text` is the one concrete ask, templated by the daemon; the only forge text it can quote is a `merge-refused` ask with no open incident, which carries the refusal line bounded to 300 characters, stripped of backticks and angle brackets, inside a code span. A `no-progress` ask keeps the agent-owned `stage` |
 | `inherited_from` | integer, optional | this entry is a blocker inheriting the star of that issue |
 | `operator_priority_at` | RFC 3339, optional | the starred-at it sorts by (its own, the inheriting star's, or `created_at`) |
 | `last_progress_at` | RFC 3339, optional | when forward progress was last seen |

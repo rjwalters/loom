@@ -7,20 +7,32 @@
 //! Every call honors the rate-limit breaker and the per-owner credential
 //! (`credential_preflight`), like the work finder's own reads.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, Result};
 
 use crate::forge_listing::RestIssue;
 
-/// One issue comment: its body and when it was posted.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+/// One issue comment: its body, when it was posted and last edited, and who
+/// wrote it (for [`super::trust`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct ForgeComment {
     #[serde(default)]
     pub body: String,
     #[serde(default)]
     pub created_at: Option<String>,
+    /// The forge-assigned edit time (a lease renewal PATCHes its comment).
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// `user.login`.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// `author_association` (`OWNER`, `MEMBER`, `COLLABORATOR`, …).
+    #[serde(default)]
+    pub author_association: Option<String>,
 }
 
 /// What the liveness pass and the intent applier need from one repo.
@@ -42,6 +54,20 @@ pub trait StarForge {
     /// # Errors
     /// The read failed.
     fn comments(&mut self, number: u32) -> Result<Vec<ForgeComment>>;
+
+    /// Open **issues** (not PRs) whose title or body contains `phrase`, for
+    /// finding the incident behind a merge refusal. Callers re-check the
+    /// phrase: a forge search is fuzzy.
+    ///
+    /// # Errors
+    /// The search failed.
+    fn search_open_issues(&mut self, phrase: &str) -> Result<Vec<RestIssue>>;
+
+    /// This daemon's own forge login, when the forge can name it (an App
+    /// installation token cannot). Used only to trust its own markers.
+    fn self_login(&mut self) -> Option<String> {
+        None
+    }
 
     /// Add `label` (a no-op when already present).
     ///
@@ -125,12 +151,67 @@ impl StarForge for GhStarForge {
 
     fn comments(&mut self, number: u32) -> Result<Vec<ForgeComment>> {
         let path = format!("{}/comments?per_page=100", self.issue_path(number));
-        let out = self.api(&[&path, "--paginate", "--jq", ".[] | {body, created_at}"], &path)?;
+        let jq = ".[] | {body, created_at, updated_at, author: .user.login, author_association}";
+        let out = self.api(&[&path, "--paginate", "--jq", jq], &path)?;
         Ok(out
             .lines()
             .filter(|l| !l.trim().is_empty())
             .filter_map(|l| serde_json::from_str::<ForgeComment>(l).ok())
             .collect())
+    }
+
+    fn search_open_issues(&mut self, phrase: &str) -> Result<Vec<RestIssue>> {
+        let clean: String = phrase.chars().filter(|c| *c != '"').collect();
+        let q = format!("q=\"{clean}\" repo:{} is:issue is:open in:title,body", self.slug);
+        let out = self.api(
+            &[
+                "-X",
+                "GET",
+                "search/issues",
+                "-f",
+                &q,
+                "-f",
+                "per_page=20",
+                "--jq",
+                ".items",
+            ],
+            "search/issues",
+        )?;
+        let wanted = phrase.to_ascii_lowercase();
+        Ok(crate::forge_listing::parse_rest_issues(&out)?
+            .into_iter()
+            .filter(|i| !i.is_pull_request && i.state.eq_ignore_ascii_case("open"))
+            .filter(|i| {
+                let text = format!(
+                    "{}\n{}",
+                    i.title.as_deref().unwrap_or_default(),
+                    i.body.as_deref().unwrap_or_default()
+                );
+                text.to_ascii_lowercase().contains(&wanted)
+            })
+            .collect())
+    }
+
+    fn self_login(&mut self) -> Option<String> {
+        static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(hit) = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.root)
+        {
+            return hit.clone();
+        }
+        let login = self
+            .api(&["user", "--jq", ".login"], "user")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.root.clone(), login.clone());
+        login
     }
 
     fn add_label(&mut self, number: u32, label: &str) -> Result<()> {

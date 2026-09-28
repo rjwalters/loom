@@ -10,6 +10,10 @@
 //!   issue's open PR by its closing / `Part of` reference;
 //! - the comments of a starred issue's **approved** PR, only when that PR's
 //!   `updated_at` moved since the last read (merge-refusal detection);
+//! - for a detected refusal, the incident lookup: single-issue reads of the
+//!   issues the refusal comment names, and, when none is an open issue, one
+//!   issue search for the refusal's failure signature (repeated each pass
+//!   only while no open incident is known);
 //! - one single-issue read per same-repo blocker (the blocker's state, and
 //!   its labels when it inherits a star).
 
@@ -22,10 +26,10 @@ use super::landing::{
     classify, BlockerRef, Capacity, ItemFacts, Landing, MergeRefusal, PrFacts, StarFacts,
     BLOCKED_LABEL,
 };
-use super::progress::fingerprint;
-use super::refusal;
+use super::progress::{fingerprint, short_hash};
+use super::refusal::{self, Detected};
 use crate::forge_listing::RestIssue;
-use crate::types::{QueueDisposition, ReadyQueueRow};
+use crate::types::{AskKind, QueueDisposition, ReadyQueueRow};
 use crate::work_finder::{WorkItem, OPERATOR_PRIORITY_LABEL};
 
 /// PR labels listed to find a starred issue's open PR.
@@ -43,11 +47,13 @@ pub const PR_LABELS: &[&str] = &[
 /// How deep inheritance follows a chain of blockers.
 pub const MAX_INHERIT_DEPTH: usize = 3;
 
-/// Cached refusal verdicts, keyed by (repo, PR) and valid while the PR's
-/// `updated_at` is unchanged.
+/// Cached refusal detections, keyed by (repo, PR) and valid while the PR's
+/// `updated_at` is unchanged, plus the incident a signature search found
+/// (re-checked open every pass).
 #[derive(Debug, Default)]
 pub struct RefusalCache {
-    entries: HashMap<(String, u32), (Option<String>, Option<MergeRefusal>)>,
+    entries: HashMap<(String, u32), (Option<String>, Option<Detected>)>,
+    incidents: HashMap<(String, u32), u32>,
 }
 
 /// Everything about the repo that is not a forge read.
@@ -58,10 +64,11 @@ pub struct RepoContext<'a> {
     pub host: &'a str,
     /// The last work-finder tick's rows for this repo.
     pub tick_rows: &'a [ReadyQueueRow],
-    /// This host's pool exhaustion, when any: (description, episode).
-    pub pool: Option<(String, String)>,
-    /// A checkpoint's modification stamp for an issue, when one exists.
-    pub checkpoint: &'a dyn Fn(u32) -> Option<String>,
+    /// This host's pool exhaustion, when any (its description).
+    pub pool: Option<String>,
+    /// Whether a workspace on this host manages a forge slug (for a
+    /// cross-repo blocker).
+    pub managed: &'a dyn Fn(&str) -> bool,
     /// A starred-at recorded from a loom-ui intent on this host.
     pub recorded_starred_at: &'a dyn Fn(u32) -> Option<String>,
 }
@@ -148,10 +155,12 @@ impl<'a> Evaluator<'a> {
         read
     }
 
-    fn refusal_for(&mut self, pr: &RestIssue, issue: u32) -> Option<MergeRefusal> {
-        if !pr.labels.iter().any(|l| l == "loom:pr") {
-            return None;
-        }
+    fn open_issue(&mut self, n: u32) -> bool {
+        self.issue(n)
+            .is_some_and(|i| !i.is_pull_request && i.state.eq_ignore_ascii_case("open"))
+    }
+
+    fn detected(&mut self, pr: &RestIssue, issue: u32) -> Option<Detected> {
         let key = (self.ctx.slug.to_string(), pr.number);
         if let Some((at, verdict)) = self.refusals.entries.get(&key) {
             if *at == pr.updated_at {
@@ -160,7 +169,9 @@ impl<'a> Evaluator<'a> {
         }
         match self.forge.comments(pr.number) {
             Ok(comments) => {
-                let verdict = refusal::detect(&comments, pr.number, issue);
+                let me = self.forge.self_login();
+                let believed = super::trust::only_trusted(&comments, me.as_deref());
+                let verdict = refusal::detect(&believed, pr.number, issue);
                 self.refusals
                     .entries
                     .insert(key, (pr.updated_at.clone(), verdict.clone()));
@@ -175,6 +186,60 @@ impl<'a> Evaluator<'a> {
                 None
             }
         }
+    }
+
+    /// The open incident issue tied to `d` (see [`refusal`]): one the
+    /// refusal comment names, else one carrying its failure signature.
+    fn incident(&mut self, d: &Detected, pr: u32, issue: u32) -> Option<u32> {
+        if let Some(n) = d.named.clone().into_iter().find(|n| self.open_issue(*n)) {
+            return Some(n);
+        }
+        let key = (self.ctx.slug.to_string(), pr);
+        if let Some(n) = self.refusals.incidents.get(&key).copied() {
+            if self.open_issue(n) {
+                return Some(n);
+            }
+            self.refusals.incidents.remove(&key);
+        }
+        let found = match self.forge.search_open_issues(d.signature()) {
+            Ok(rows) => rows,
+            Err(e) => {
+                log::debug!("star_liveness: incident search in {} failed: {e}", self.ctx.slug);
+                return None;
+            }
+        };
+        let wanted = d.signature().to_ascii_lowercase();
+        let hit = found
+            .into_iter()
+            .filter(|i| i.number != pr && i.number != issue && !i.is_pull_request)
+            .filter(|i| i.state.eq_ignore_ascii_case("open"))
+            .filter(|i| {
+                format!(
+                    "{}\n{}",
+                    i.title.as_deref().unwrap_or_default(),
+                    i.body.as_deref().unwrap_or_default()
+                )
+                .to_ascii_lowercase()
+                .contains(&wanted)
+            })
+            .min_by_key(|i| i.number)?;
+        let n = hit.number;
+        self.issues.insert(n, Some(hit));
+        self.refusals.incidents.insert(key, n);
+        Some(n)
+    }
+
+    fn refusal_for(&mut self, pr: &RestIssue, issue: u32) -> Option<MergeRefusal> {
+        if !pr.labels.iter().any(|l| l == "loom:pr") {
+            return None;
+        }
+        let d = self.detected(pr, issue)?;
+        let incident = self.incident(&d, pr.number, issue);
+        Some(MergeRefusal {
+            reason: d.class.reason,
+            raw: d.raw,
+            incident,
+        })
     }
 
     fn blockers(&mut self, issue: &RestIssue) -> Vec<BlockerRef> {
@@ -197,28 +262,33 @@ impl<'a> Evaluator<'a> {
                             display: format!("#{n}"),
                             number: Some(n),
                             open,
+                            cross_repo_managed: None,
                         }
                     }
                     Some(_) => BlockerRef {
                         display: r,
                         number: None,
                         open: Some(false),
+                        cross_repo_managed: None,
                     },
-                    None => BlockerRef {
-                        display: r,
-                        number: None,
-                        open: None,
-                    },
+                    None => {
+                        let slug = r.split('#').next().unwrap_or_default().to_string();
+                        BlockerRef {
+                            display: r,
+                            number: None,
+                            open: None,
+                            cross_repo_managed: Some((self.ctx.managed)(&slug)),
+                        }
+                    }
                 }
             })
             .collect()
     }
 
     fn capacity(&self, n: u32) -> Capacity {
-        if let Some((detail, episode)) = &self.ctx.pool {
+        if let Some(detail) = &self.ctx.pool {
             return Capacity::PoolExhausted {
                 detail: detail.clone(),
-                episode: episode.clone(),
             };
         }
         match self.tick_row(n).map(|r| r.disposition) {
@@ -283,17 +353,25 @@ impl<'a> Evaluator<'a> {
             capacity: self.capacity(n),
             host: self.ctx.host.to_string(),
         };
-        let landing = classify(&facts);
+        let mut landing = classify(&facts);
         let starred_at = starred_at
             .or(row_starred_at)
             .or_else(|| (self.ctx.recorded_starred_at)(n));
-        let checkpoint = (self.ctx.checkpoint)(n);
         let fp = fingerprint(
             &issue.labels,
             pr.as_ref()
                 .map(|p| (p.number, p.labels.as_slice(), p.updated_at.as_deref())),
-            checkpoint.as_deref(),
         );
+        // One key per issue state, not per host or per exhaustion episode:
+        // every host and every re-exhaustion of an issue that has not moved
+        // share it, so the ask is posted once until the issue progresses.
+        if let Some(ask) = landing
+            .ask
+            .as_mut()
+            .filter(|a| a.kind == AskKind::PoolsExhausted)
+        {
+            ask.key = format!("{}:{}", AskKind::PoolsExhausted.as_str(), short_hash(&fp));
+        }
         Evaluated {
             facts,
             landing,

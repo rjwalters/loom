@@ -19,12 +19,19 @@ use super::inherit::{self, Inherited};
 use super::intents::{self, AppliedIds, StarIntent};
 use super::progress::{self, Tracker, Watched};
 use super::Settings;
-use crate::types::{DroppedStarIntent, ReadyQueueRow, StarLandingRow, StarLivenessReport};
+use crate::types::{
+    AskKind, DroppedStarIntent, LandingStage, OperatorAsk, ReadyQueueRow, StarLandingRow,
+    StarLivenessReport,
+};
 
 /// Most dropped intents the report keeps.
 const MAX_DROPPED: usize = 50;
 /// Most unmanaged stars remembered.
 const MAX_UNMANAGED: usize = 200;
+/// Consecutive failed passes over a repo after which its published
+/// inheritance is withdrawn: an unreadable repo must not keep stale blockers
+/// at star priority indefinitely.
+pub const MAX_FAILED_PASSES: u32 = 3;
 
 /// One managed repo, resolved.
 #[derive(Debug, Clone)]
@@ -34,9 +41,8 @@ pub struct RepoInput {
     pub slug: String,
     /// The last work-finder tick's rows for this root.
     pub tick_rows: Vec<ReadyQueueRow>,
-    /// This host's pool exhaustion for the root's pool: (description,
-    /// episode).
-    pub pool: Option<(String, String)>,
+    /// This host's pool exhaustion for the root's pool (its description).
+    pub pool: Option<String>,
 }
 
 /// Opens a forge for (root, slug).
@@ -52,6 +58,11 @@ pub struct LivenessState {
     /// Stars (from loom-ui) on repos no workspace here manages.
     unmanaged: BTreeMap<(String, u32), Option<String>>,
     dropped: VecDeque<DroppedStarIntent>,
+    /// When this host first saw each issue waiting on an exhausted pool (the
+    /// grace window's start).
+    pool_since: HashMap<(String, u32), DateTime<Utc>>,
+    /// Consecutive failed passes per workspace root.
+    failed_passes: HashMap<PathBuf, u32>,
 }
 
 impl LivenessState {
@@ -145,17 +156,16 @@ impl LivenessState {
 
         let mut evaluated: Vec<(Option<PathBuf>, Evaluated)> = Vec::new();
         let mut failed = Vec::new();
+        let is_managed = |slug: &str| managed.contains_key(&slug.to_ascii_lowercase());
         for repo in repos {
             let root = repo.root.clone();
-            let checkpoint = move |n: u32| checkpoint_stamp(&root, n);
-            let root2 = repo.root.clone();
-            let recorded = move |n: u32| intents::recorded_starred_at(&root2, n);
+            let recorded = move |n: u32| intents::recorded_starred_at(&root, n);
             let ctx = RepoContext {
                 slug: &repo.slug,
                 host,
                 tick_rows: &repo.tick_rows,
                 pool: repo.pool.clone(),
-                checkpoint: &checkpoint,
+                managed: &is_managed,
                 recorded_starred_at: &recorded,
             };
             let mut forge = forges(&repo.root, &repo.slug);
@@ -174,11 +184,22 @@ impl LivenessState {
                         })
                         .collect();
                     inherit::publish(&repo.root, inherited);
+                    self.failed_passes.remove(&repo.root);
                     evaluated.extend(rows.into_iter().map(|e| (Some(repo.root.clone()), e)));
                 }
                 Err(e) => {
                     log::warn!("star_liveness: evaluating {} failed: {e}", repo.slug);
                     failed.push(repo.slug.clone());
+                    let n = self.failed_passes.entry(repo.root.clone()).or_insert(0);
+                    *n += 1;
+                    if *n >= MAX_FAILED_PASSES && !inherit::current(&repo.root).is_empty() {
+                        log::warn!(
+                            "star_liveness: {} unreadable for {n} passes; withdrawing its \
+                             inherited stars until a pass succeeds",
+                            repo.slug
+                        );
+                        inherit::publish(&repo.root, Vec::new());
+                    }
                 }
             }
         }
@@ -191,27 +212,18 @@ impl LivenessState {
         let mut rows = Vec::new();
         let mut live = HashSet::new();
         let mut posted = 0;
-        for (root, e) in evaluated {
+        for (root, mut e) in evaluated {
             let repo = e.facts.repo.clone();
             let issue = e.facts.issue.number;
             live.insert((repo.clone(), issue));
+            self.pool_grace(&mut e, now, settings.pools_grace);
             let obs = self
                 .tracker
                 .observe(&repo, issue, e.landing.stage, &e.fingerprint, now);
             let mut ask = e.landing.ask.clone();
-            if ask.is_none() && root.is_some() {
-                ask = progress::watchdog(
-                    &Watched {
-                        repo: &repo,
-                        issue,
-                        stage: e.landing.stage,
-                        next_actor: &e.landing.next_actor,
-                        fingerprint: &e.fingerprint,
-                        progress_at: obs.progress_at,
-                    },
-                    now,
-                    settings.no_progress,
-                );
+            let mut progress_at = obs.progress_at;
+            if let (None, Some(root)) = (&ask, &root) {
+                ask = self.watch(&e, root, now, settings.no_progress, &mut progress_at, forges);
             }
             if let (Some(a), Some(root)) = (&ask, &root) {
                 let mut forge = forges(root, &repo);
@@ -250,10 +262,12 @@ impl LivenessState {
                     .starred_at
                     .clone()
                     .or_else(|| e.facts.issue.created_at.clone()),
-                last_progress_at: Some(obs.progress_at),
+                last_progress_at: Some(progress_at),
             });
         }
         self.tracker.retain(&live, &failed);
+        self.pool_since
+            .retain(|k, _| live.contains(k) || failed.contains(&k.0));
         StarLivenessReport {
             at: Some(now),
             rows: order_rows(rows),
@@ -261,6 +275,94 @@ impl LivenessState {
             dropped_intents: self.dropped.iter().cloned().collect(),
             failed_repos: failed,
         }
+    }
+}
+
+impl LivenessState {
+    /// Hold a `pools-exhausted` ask for `grace` after this host first sees
+    /// the issue waiting on its exhausted pool: a peer host with capacity may
+    /// simply not have ticked yet. Inside the window the row is `no-capacity`
+    /// (the work finder's peers may still take it).
+    fn pool_grace(&mut self, e: &mut Evaluated, now: DateTime<Utc>, grace: Duration) {
+        let key = (e.facts.repo.clone(), e.facts.issue.number);
+        let pooled = e
+            .landing
+            .ask
+            .as_ref()
+            .is_some_and(|a| a.kind == AskKind::PoolsExhausted);
+        if !pooled {
+            self.pool_since.remove(&key);
+            return;
+        }
+        let since = *self.pool_since.entry(key).or_insert(now);
+        let waited = now
+            .signed_duration_since(since)
+            .to_std()
+            .unwrap_or_default();
+        if waited >= grace {
+            return;
+        }
+        let left = (grace - waited).as_secs().div_ceil(60);
+        e.landing.stage = LandingStage::NoCapacity;
+        e.landing.next_actor = "work-finder".to_string();
+        e.landing.ask = None;
+        e.landing.no_capacity = Some(format!(
+            "token pool exhausted on this host; waiting ~{left} min for a peer host to claim it \
+             before asking the operator"
+        ));
+    }
+
+    /// The no-progress watchdog for one managed row. Before tripping, the
+    /// issue's comments are read once for forge-seen activity (a comment or
+    /// a lease renewal) newer than the fingerprint clock, which every host
+    /// sees alike. A key this process already escalated needs no read.
+    fn watch(
+        &mut self,
+        e: &Evaluated,
+        root: &Path,
+        now: DateTime<Utc>,
+        window: Duration,
+        progress_at: &mut DateTime<Utc>,
+        forges: &mut ForgeFactory<'_>,
+    ) -> Option<OperatorAsk> {
+        let repo = &e.facts.repo;
+        let issue = e.facts.issue.number;
+        let check = |at: DateTime<Utc>| {
+            progress::watchdog(
+                &Watched {
+                    repo,
+                    issue,
+                    stage: e.landing.stage,
+                    next_actor: &e.landing.next_actor,
+                    fingerprint: &e.fingerprint,
+                    progress_at: at,
+                },
+                now,
+                window,
+            )
+        };
+        let ask = check(*progress_at)?;
+        if self.ledger.knows(repo, issue, &ask.key) {
+            return Some(ask);
+        }
+        let mut forge = forges(root, repo);
+        let seen = match forge.comments(issue) {
+            Ok(comments) => {
+                let me = forge.self_login();
+                progress::latest_comment_activity(&comments, me.as_deref())
+            }
+            Err(err) => {
+                log::debug!("star_liveness: reading {repo}#{issue} comments failed: {err}");
+                None
+            }
+        };
+        if let Some(at) = seen.filter(|at| *at > *progress_at) {
+            if let Some(moved) = self.tracker.note_progress(repo, issue, at) {
+                *progress_at = moved;
+            }
+            return check(*progress_at);
+        }
+        Some(ask)
     }
 }
 
@@ -297,31 +399,18 @@ fn order_rows(rows: Vec<StarLandingRow>) -> Vec<StarLandingRow> {
     out
 }
 
-/// The checkpoint file's modification time, as a progress stamp.
-fn checkpoint_stamp(root: &Path, issue: u32) -> Option<String> {
-    let path = root
-        .join(".loom")
-        .join("sweep-checkpoint")
-        .join(format!("issue-{issue}.json"));
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    Some(DateTime::<Utc>::from(modified).to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-}
-
 /// This host's pool exhaustion for `root`, from the work finder's pool holds.
-fn pool_for(root: &Path) -> Option<(String, String)> {
+fn pool_for(root: &Path) -> Option<String> {
     let dir = crate::tokens_pool::paths::resolve_tokens_dir(root);
     crate::work_finder::pool_preflight::active_hold_statuses()
         .into_iter()
         .find(|h| h.dir == dir)
         .map(|h| {
-            (
-                format!(
-                    "all {} token(s) exhausted since {}, next possible clear ~{}",
-                    h.total,
-                    h.since.format("%Y-%m-%d %H:%MZ"),
-                    h.next_clear_at.format("%H:%MZ")
-                ),
-                h.since.format("%Y-%m-%dT%H:%M").to_string(),
+            format!(
+                "all {} token(s) exhausted since {}, next possible clear ~{}",
+                h.total,
+                h.since.format("%Y-%m-%d %H:%MZ"),
+                h.next_clear_at.format("%H:%MZ")
             )
         })
 }

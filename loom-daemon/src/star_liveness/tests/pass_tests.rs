@@ -28,26 +28,18 @@ fn seed_non_agent_states(world: &World) -> Vec<(&'static str, AskKind)> {
     // merge-risk hold
     world.add("p/hold", issue(1, &[STAR, "loom:building"]));
     world.add("p/hold", pr(2, 1, &["loom:pr", "loom:operator"]));
-    // all pools exhausted (only this host manages it; set on the RepoInput)
-    world.add("p/pool", issue(1, &[STAR]));
+    // (pools-exhausted waits out a grace window first: `review_fix_tests`.)
     vec![
         ("p/decision", AskKind::OperatorDecision),
         ("p/refused", AskKind::MergeRefused),
         ("p/hold", AskKind::MergeRiskHold),
-        ("p/pool", AskKind::PoolsExhausted),
     ]
 }
 
 fn inputs() -> Vec<crate::star_liveness::task::RepoInput> {
-    ["p/decision", "p/refused", "p/hold", "p/pool"]
+    ["p/decision", "p/refused", "p/hold"]
         .iter()
-        .map(|s| {
-            let mut r = repo_input(s);
-            if *s == "p/pool" {
-                r.pool = Some(("all 2 token(s) exhausted".into(), "2026-09-28T01:00".into()));
-            }
-            r
-        })
+        .map(|s| repo_input(s))
         .collect()
 }
 
@@ -104,8 +96,8 @@ fn escalate_false_computes_but_writes_nothing() {
         ..settings()
     };
     let report = a.pass_with(&world, &inputs(), Vec::new(), t(10, 0), off);
-    assert_eq!(report.needs_operator().count(), 4);
-    for s in ["p/decision", "p/refused", "p/hold", "p/pool"] {
+    assert_eq!(report.needs_operator().count(), 3);
+    for s in ["p/decision", "p/refused", "p/hold"] {
         assert!(world.posted(s).is_empty());
     }
 }

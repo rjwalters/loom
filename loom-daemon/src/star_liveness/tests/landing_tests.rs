@@ -89,23 +89,38 @@ fn every_non_agent_state_is_needs_operator_with_one_concrete_ask() {
     assert_eq!(ask_kind(&facts(&["loom:operator-only"])), Some(AskKind::OperatorOnly));
 
     let mut refused = with_pr(facts(&["loom:building"]), &["loom:pr"]);
+    let raw = r#"Error: Failed to merge PR #20: {"message":"Merge commits are not allowed on this repository.","status":"405"}"#;
     refused.pr.as_mut().unwrap().refusal = Some(MergeRefusal {
         reason: "merge commits are not allowed on this repository (HTTP 405)",
+        raw: raw.into(),
         incident: Some(30),
     });
     let l = classify(&refused);
     assert_eq!(l.ask.as_ref().map(|a| a.kind), Some(AskKind::MergeRefused));
-    assert!(l.ask.as_ref().unwrap().text.contains("See #30"));
+    assert!(l.ask.as_ref().unwrap().text.contains("Tracked in #30"));
     assert_eq!(l.inherits, Some(30), "the incident inherits the star");
+    // No open incident: still an ask, now carrying the forge's own words.
+    refused
+        .pr
+        .as_mut()
+        .unwrap()
+        .refusal
+        .as_mut()
+        .unwrap()
+        .incident = None;
+    let l = classify(&refused);
+    let text = &l.ask.as_ref().unwrap().text;
+    assert!(text.contains("No open incident issue tracks it"), "{text}");
+    assert!(text.contains(&format!("`{raw}`")), "{text}");
+    assert_eq!(l.inherits, None);
 
     let mut pool = facts(&["loom:issue"]);
     pool.capacity = Capacity::PoolExhausted {
         detail: "all 3 token(s) exhausted".into(),
-        episode: "2026-09-28T01:00".into(),
     };
     let l = classify(&pool);
     assert_eq!(l.ask.as_ref().map(|a| a.kind), Some(AskKind::PoolsExhausted));
-    assert_eq!(l.ask.unwrap().key, "pools-exhausted:2026-09-28T01:00");
+    assert!(l.ask.unwrap().text.contains("host `host-a`"));
 
     let mut unmanaged = facts(&[]);
     unmanaged.managed = false;
@@ -125,11 +140,13 @@ fn a_named_open_blocker_is_blocked_by_and_inherits() {
             display: "#5".into(),
             number: Some(5),
             open: Some(false),
+            cross_repo_managed: None,
         },
         BlockerRef {
             display: "#6".into(),
             number: Some(6),
             open: Some(true),
+            cross_repo_managed: None,
         },
     ];
     let l = classify(&f);
@@ -162,9 +179,40 @@ fn operator_states_outrank_agent_ones() {
     // A peer claim is building, never pool-exhausted.
     let mut peer = facts(&["loom:issue"]);
     peer.peer_claimed = true;
-    peer.capacity = Capacity::PoolExhausted {
-        detail: "x".into(),
-        episode: "e".into(),
-    };
+    peer.capacity = Capacity::PoolExhausted { detail: "x".into() };
     assert_eq!(classify(&peer).stage, LandingStage::Building);
+}
+
+#[test]
+fn a_cross_repo_blocker_is_an_operator_ask_never_a_silent_state() {
+    let cross = |managed: bool| BlockerRef {
+        display: "other/repo#7".into(),
+        number: None,
+        open: None,
+        cross_repo_managed: Some(managed),
+    };
+    let mut f = facts(&["loom:curated", "loom:blocked"]);
+    f.blockers = vec![cross(false)];
+    let l = classify(&f);
+    assert_eq!(l.stage, LandingStage::NeedsOperator);
+    let ask = l.ask.unwrap();
+    assert_eq!(ask.kind, AskKind::BlockedCrossRepo);
+    assert_eq!(ask.key, "blocked-cross-repo:other/repo#7");
+    assert!(ask.text.contains("in a repo this host can't act on"), "{}", ask.text);
+    assert_eq!(l.blocked_by.as_deref(), Some("other/repo#7"));
+    assert_eq!(l.inherits, None);
+
+    f.blockers = vec![cross(true)];
+    let ask = classify(&f).ask.unwrap();
+    assert!(ask.text.contains("star other/repo#7"), "{}", ask.text);
+
+    // A same-repo open blocker still wins: it inherits and agents move it.
+    f.blockers.push(BlockerRef {
+        display: "#8".into(),
+        number: Some(8),
+        open: Some(true),
+        cross_repo_managed: None,
+    });
+    let l = classify(&f);
+    assert_eq!((l.stage, l.inherits), (LandingStage::BlockedBy, Some(8)));
 }

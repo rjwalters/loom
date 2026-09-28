@@ -2050,25 +2050,40 @@ starred issue in each managed repo:
   refusal on its approved PR (a "Merge Failed" report whose error is a 405,
   ruleset or merge-method refusal, the #9268 shape; transient failures do not
   count); this host's token pool exhausted with no other host having claimed
-  it; `loom:blocked` with no open blocker named; a loom-ui star on a repo no
-  workspace here manages;
-- escalates an agent-owned stage with **no forward progress** (a label change,
-  a PR update, a checkpoint write) for `noProgressMinutes`, with what it last
-  saw.
+  it, after a `poolsExhaustedGraceMinutes` grace so a peer can claim it first
+  (the row is `no-capacity` meanwhile); `loom:blocked` with no open blocker
+  named, or blocked only by an issue in another repo (stars do not cross
+  repos); a loom-ui star on a repo no workspace here manages;
+- escalates an agent-owned stage with **no forward progress** for
+  `noProgressMinutes`, with what it last saw. Progress is forge-visible only,
+  so every host managing the repo agrees: a label change, a PR update, or a
+  trusted comment on the issue, including the sweep's lease renewal (a long
+  Builder phase with a live lease is not a stall on any host). The stall key
+  hashes the same facts, so N hosts post one comment.
 
 An escalation is one comment on the issue, carrying
 `<!-- loom:operator-priority-escalation key=<kind>:<specifics> -->`. Each
 (issue, key) is posted once: a per-process ledger skips repeats without a
 forge call, and every host reads the issue's comments for the marker before
-posting. Safehouse / Matrix delivery is not wired yet (the Safehouse sink only
+posting. Only a marker from an `OWNER` / `MEMBER` / `COLLABORATOR`, the fleet
+App or the daemon itself counts; an outside commenter cannot pre-post one to
+suppress an ask. The `pools-exhausted` key is the issue's forge state, not the
+host's hold, so every host and every re-exhaustion share it until the issue
+moves. Safehouse / Matrix delivery is not wired yet (the Safehouse sink only
 narrates the frozen event taxonomy).
 
 **Blocker inheritance.** The issue blocking a starred issue (named by
-`Blocked by #N` on a `loom:blocked` issue, the incident a merge refusal's
-thread names, or the repo's red-main fix while `main` is red) inherits the star:
-the work finder orders it at the star's position (and it may take the overflow
-slot), even from outside the `loom:issue` listing, and its landing row is marked
-`inherited_from`. Once it closes or stops blocking, the next pass drops it.
+`Blocked by #N` on a `loom:blocked` issue, the incident behind a merge refusal,
+or the repo's red-main fix while `main` is red) inherits the star: the work
+finder orders it at the star's position (and it may take the overflow slot),
+even from outside the `loom:issue` listing, and its landing row is marked
+`inherited_from`. Once it closes or stops blocking, the next pass drops it, and
+a repo unreadable for 3 passes in a row loses its inherited stars until a pass
+succeeds. A merge refusal's incident is an **open issue** named in the refusal
+comment itself, or else an open issue quoting the refusal's failure signature
+(for #9276 that was #9268, which quotes "Merge commits are not allowed");
+nothing a later comment mentions ever inherits. With no open incident the ask
+quotes the forge's refusal text instead.
 
 **loom-ui stars.** The `/ingest` ack may carry `operator_priority_intents`
 (`defaults/docs/telemetry-schema.md`). The pass applies each valid one (the one
@@ -2083,6 +2098,7 @@ default**):
 | `noProgressMinutes` | `LOOM_OPERATOR_PRIORITY_NO_PROGRESS_MINUTES` | `30` | watchdog window |
 | `escalate` | `LOOM_OPERATOR_PRIORITY_ESCALATE` | `true` | post escalations and apply loom-ui intents; `false` still computes and shows every landing state |
 | `intervalSecs` | `LOOM_OPERATOR_PRIORITY_INTERVAL_SECS` | `120` | pass interval |
+| `poolsExhaustedGraceMinutes` | `LOOM_OPERATOR_PRIORITY_POOLS_GRACE_MINUTES` | `10` | wait before a `pools-exhausted` ask; `0` asks at once |
 
 ### Ready queue view (`loom-daemon queue`, #8852)
 
