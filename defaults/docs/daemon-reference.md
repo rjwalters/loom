@@ -4939,9 +4939,9 @@ dispatch left a pull request behind** — the one thing that loop could not fake
   leaves the tally un-held so the next release re-attempts the write, and posts
   no notice claiming a park that did not happen. The first implementation did
   none of that — it discarded the `gh issue edit` result and commented
-  regardless — and `2AMLogic/sky130-sar-adc#121` collected seven hold notices
-  over four days with zero `loom:blocked` label events while dispatch kept
-  claiming it.
+  regardless — and one fleet issue collected seven hold notices over four days,
+  from two different bot accounts, with zero `loom:blocked` label events, while
+  dispatch kept claiming it throughout (the case #9239 was filed on).
 
 **Not charged for faults that are not the issue's.** A `no-usable-account` pool
 death (#7708) is host-level, a pre-flight-classified death (#4386) is
