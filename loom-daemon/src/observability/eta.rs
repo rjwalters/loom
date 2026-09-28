@@ -586,7 +586,7 @@ pub(super) async fn record(
         }
         let mut listings = Vec::new();
         for label in REVIEW_LABELS {
-            match super::queue_blocked::list_open(root.clone(), label).await {
+            match super::queue_blocked::list_open(root.clone(), label, "eta").await {
                 Some(listing) => listings.push(listing),
                 None => break,
             }
