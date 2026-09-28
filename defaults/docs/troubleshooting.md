@@ -161,7 +161,7 @@ git branch feature/issue-N origin/feature/issue-N && ./.loom/scripts/worktree.sh
 ```
 
 This arm has no shell implementation of its own — `lib/worktree-forge-pr-check.sh`
-is `contract`-category (see [`shell-language-policy.md`](shell-language-policy.md)),
+is `contract`-category (see [`shell-language-policy.md`](https://github.com/rjwalters/loom/blob/main/.loom/docs/shell-language-policy.md)),
 so the decision lives once, in `loom-daemon worktree-closed-pr-branch`. A
 daemon predating the subcommand degrades to the pre-#9083 reuse behavior
 rather than surfacing a clap usage error.
