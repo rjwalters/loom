@@ -282,13 +282,20 @@ impl TickReport {
         }
     }
 
-    /// This report with no occupancy reading, for comparing an idle tick
-    /// against [`TickReport::default`] in tests.
+    /// This report with no occupancy reading and none of the admission
+    /// context a multi-workspace tick records for its dispatch plan (#9288:
+    /// ramp cap, slice mask, per-repo cap snapshot, overflow slot), for comparing an idle
+    /// tick against [`TickReport::default`] in tests. The shaped order itself
+    /// (`plan_order`) is kept: an idle tick has none.
     #[cfg(test)]
     #[must_use]
     pub fn without_occupancy(self) -> Self {
         TickReport {
             occupancy: None,
+            max_admissions_per_tick: None,
+            in_slice: None,
+            repo_cap: None,
+            overflow_free: None,
             ..self
         }
     }

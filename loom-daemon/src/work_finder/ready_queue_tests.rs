@@ -336,7 +336,8 @@ fn oldest_first(a: Option<&String>, b: Option<&String>) -> std::cmp::Ordering {
 /// update both this and `candidate_keys` — which is the point.
 fn reference_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let starred_at = |c: &PriorityCandidate| c.operator_priority_at.clone().or(c.created_at.clone());
+    let starred_at =
+        |c: &PriorityCandidate| c.operator_priority_at.clone().or(c.created_at.clone());
     let lane = b.operator_priority.cmp(&a.operator_priority).then(
         if a.operator_priority && b.operator_priority {
             oldest_first(starred_at(a).as_ref(), starred_at(b).as_ref())
@@ -353,7 +354,11 @@ fn reference_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Orde
 /// Every candidate over a small domain that exercises every key's tie and
 /// both directions of every key, including the starred-at fallback.
 fn candidate_domain() -> Vec<PriorityCandidate> {
-    let times = [None, Some("2026-01-01T00:00:00Z"), Some("2026-02-01T00:00:00Z")];
+    let times = [
+        None,
+        Some("2026-01-01T00:00:00Z"),
+        Some("2026-02-01T00:00:00Z"),
+    ];
     let mut out = Vec::new();
     for workspace_priority in [0, 100] {
         for operator_priority in [false, true] {
@@ -416,8 +421,10 @@ fn candidate_keys_project_to_named_wire_keys() {
         number: 42,
         ..PriorityCandidate::default()
     };
-    let values: Vec<serde_json::Value> =
-        ready_queue::plan_keys(&c).into_iter().map(|k| k.value).collect();
+    let values: Vec<serde_json::Value> = ready_queue::plan_keys(&c)
+        .into_iter()
+        .map(|k| k.value)
+        .collect();
     // A starred candidate with no starred-at orders by its createdAt.
     assert_eq!(
         values,
