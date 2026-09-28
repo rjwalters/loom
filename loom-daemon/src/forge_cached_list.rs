@@ -208,7 +208,7 @@ fn project_row(it: &crate::forge_listing::RestIssue, fields: &[String]) -> Value
 
 /// Apply a `--jq` expression via the system `jq` (compact + raw, matching gh's
 /// `--jq` output). Returns `None` (decline) when `jq` is missing or errors.
-fn apply_jq(array: &Value, expr: &str) -> Option<String> {
+pub(crate) fn apply_jq(array: &Value, expr: &str) -> Option<String> {
     let input = serde_json::to_string(array).ok()?;
     let mut child = Command::new("jq")
         .arg("-c")

@@ -173,6 +173,7 @@ pub mod fleet;
 pub mod fleet_captain;
 pub mod foreign_load;
 pub mod forge_cached_list;
+pub mod forge_cached_view;
 pub mod forge_check_open_pr;
 pub mod forge_cmd;
 pub mod forge_disable_auto_merge;
