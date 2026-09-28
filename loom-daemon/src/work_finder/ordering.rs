@@ -58,13 +58,17 @@ pub struct PriorityCandidate {
 ///
 /// Keys 1-3 are [`lane_cmp`]; the single-workspace tick sorts by those alone
 /// so its listing order is untouched when nothing is starred or red.
+///
+/// The keys themselves live in [`candidate_keys`] (Issue #9288), the one seam
+/// the published dispatch plan is projected from; this is their
+/// lexicographic compare.
 #[must_use]
 pub fn candidate_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> Ordering {
-    lane_cmp(a, b)
-        .then_with(|| a.workspace_priority.cmp(&b.workspace_priority))
-        .then_with(|| cmp_created_at(&a.created_at, &b.created_at))
-        .then_with(|| a.number.cmp(&b.number))
+    candidate_keys(a).cmp(&candidate_keys(b))
 }
+
+/// How many leading [`candidate_keys`] are the #9244 lane keys.
+const LANE_KEYS: usize = 3;
 
 /// Keys 1-3 of [`candidate_cmp`]: starred first, then starred-at among
 /// starred issues, then red-main fixes. Two unstarred, non-fix candidates
@@ -72,38 +76,120 @@ pub fn candidate_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> Ordering {
 /// ordinary work in its existing order.
 #[must_use]
 pub fn lane_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> Ordering {
-    // `true` sorts first: reverse the bool compare (true > false).
-    b.operator_priority
-        .cmp(&a.operator_priority)
-        .then_with(|| {
-            if a.operator_priority && b.operator_priority {
-                cmp_created_at(starred_at(a), starred_at(b))
-            } else {
-                Ordering::Equal
-            }
-        })
-        .then_with(|| b.main_red_fix.cmp(&a.main_red_fix))
+    candidate_keys(a)[..LANE_KEYS].cmp(&candidate_keys(b)[..LANE_KEYS])
 }
 
-/// The timestamp a starred candidate orders by: its starred-at, else its
-/// `createdAt` (#9244 key 2's fallback).
-fn starred_at(c: &PriorityCandidate) -> &Option<String> {
-    if c.operator_priority_at.is_some() {
-        &c.operator_priority_at
+/// One comparator key's value, carrying its own direction so the derived
+/// [`Ord`] on `[CandidateKey; N]` is exactly [`candidate_cmp`] (Issue #9288).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyValue<'a> {
+    /// Ascending unsigned value (workspace priority, issue number).
+    Asc(u64),
+    /// A flag that sorts `true` first (starred, red-main fix).
+    TrueFirst(bool),
+    /// Oldest-first ISO-8601 timestamp: a dated issue (`Some`) sorts before
+    /// an undated one (`None`); two dated issues compare lexically (⇒
+    /// chronologically); two undated issues are equal.
+    OldestFirst(Option<&'a str>),
+}
+
+impl Ord for KeyValue<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Asc(a), Self::Asc(b)) => a.cmp(b),
+            (Self::TrueFirst(a), Self::TrueFirst(b)) => b.cmp(a),
+            (Self::OldestFirst(a), Self::OldestFirst(b)) => match (a, b) {
+                (Some(x), Some(y)) => x.cmp(y),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+            // Keys are compared position by position, so the variants always
+            // match; a mismatch still orders deterministically.
+            _ => self.kind().cmp(&other.kind()),
+        }
+    }
+}
+
+impl PartialOrd for KeyValue<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl KeyValue<'_> {
+    const fn kind(&self) -> u8 {
+        match self {
+            Self::Asc(_) => 0,
+            Self::TrueFirst(_) => 1,
+            Self::OldestFirst(_) => 2,
+        }
+    }
+
+    /// The value as it goes on the wire.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Asc(n) => serde_json::Value::from(*n),
+            Self::TrueFirst(b) => serde_json::Value::Bool(*b),
+            Self::OldestFirst(t) => t.map_or(serde_json::Value::Null, serde_json::Value::from),
+        }
+    }
+}
+
+/// A named comparator key. Ordered by value only: the names are the same at
+/// every position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CandidateKey<'a> {
+    pub value: KeyValue<'a>,
+    pub name: &'static str,
+}
+
+/// The dispatch ordering keys of `c`, in comparator order (Issue #9288).
+///
+/// **The single seam for dispatch order**: [`candidate_cmp`] and
+/// [`lane_cmp`] are lexicographic compares of these keys, and every ready-queue
+/// row's plan `keys` and the plan's `ordering` are projected from them, so the
+/// published order can never describe a different comparator from the one
+/// the tick ran. A new ordering key goes here, and nowhere else.
+///
+/// Key 2 (starred-at) only orders starred issues among themselves: for an
+/// unstarred candidate it is `None`, which ties with every other unstarred
+/// candidate, and a starred one falls back to `createdAt` when its starred-at
+/// is unknown.
+#[must_use]
+pub fn candidate_keys(c: &PriorityCandidate) -> [CandidateKey<'_>; 6] {
+    let starred_at = if !c.operator_priority {
+        None
+    } else if c.operator_priority_at.is_some() {
+        c.operator_priority_at.as_deref()
     } else {
-        &c.created_at
-    }
-}
-
-/// Oldest-first ordering over optional ISO-8601 timestamps: a dated issue
-/// (`Some`) sorts before an undated one (`None`); two dated issues compare
-/// lexically (ISO-8601 ⇒ chronological); two undated issues are equal (the
-/// caller's number tiebreak decides).
-fn cmp_created_at(a: &Option<String>, b: &Option<String>) -> Ordering {
-    match (a, b) {
-        (Some(x), Some(y)) => x.cmp(y),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
+        c.created_at.as_deref()
+    };
+    [
+        CandidateKey {
+            name: "operator_priority",
+            value: KeyValue::TrueFirst(c.operator_priority),
+        },
+        CandidateKey {
+            name: "operator_priority_at",
+            value: KeyValue::OldestFirst(starred_at),
+        },
+        CandidateKey {
+            name: "main_red_fix",
+            value: KeyValue::TrueFirst(c.main_red_fix),
+        },
+        CandidateKey {
+            name: "workspace_priority",
+            value: KeyValue::Asc(u64::from(c.workspace_priority)),
+        },
+        CandidateKey {
+            name: "created_at",
+            value: KeyValue::OldestFirst(c.created_at.as_deref()),
+        },
+        CandidateKey {
+            name: "number",
+            value: KeyValue::Asc(u64::from(c.number)),
+        },
+    ]
 }

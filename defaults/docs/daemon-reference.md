@@ -2070,6 +2070,21 @@ observability export on, the queue also reaches SigNoz as
 [`observability.md` §3c](observability.md#3c-operational-signals-from-daemon-loops-issue-8860)).
 The fleet dashboard view is phase 3.
 
+**Dispatch plan (#9288).** Each row also carries `position`, `plan_state`
+(`running` / `next` / `queued` / `blocked`), `gate`, `keys`, `in_slice`,
+`hot`, `owning_shard` and `repo_cap`. The tick summary carries a `plan` block:
+`slots` (`max_concurrent`, `occupancy`, `free`, `max_admissions_per_tick`,
+`saturation_held`, `any_halted`), `tick_interval_secs`, `shard`, `scope` and
+`ordering`. `position` is the order pass 2 actually offered candidates in,
+after the repo-slice and per-repo-cap shaping. `rank` is still the bare
+comparator rank, so the two differ whenever sharding or
+`maxConcurrentPerRepo` reshapes the list. `loom-daemon queue` shows
+`#<position> <plan_state>[/<gate>]` per row plus a `Plan:` slot line.
+`--json` adds `plan`, and its `ordering` is the daemon's own key list rather
+than a hard-coded string. `loom:curated` / `loom:triage` are unordered and never
+listed. The single-workspace tick has no plan (`plan: null`). Field reference:
+[`telemetry-schema.md` § `queue.snapshot`](telemetry-schema.md#queuesnapshot).
+
 ## Forge-side pipeline snapshot (`status --pipeline`, #3977)
 
 `loom-daemon status` shows the *dispatch*-side picture (in-flight sweeps, the

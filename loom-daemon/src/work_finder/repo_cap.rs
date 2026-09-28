@@ -178,6 +178,16 @@ impl RepoCap {
         true
     }
 
+    /// The cap and the per-workspace occupancy as they stand now — at the
+    /// top of the tick when [`shape_queue`] records it (Issue #9288).
+    #[must_use]
+    pub fn snapshot(&self) -> RepoCapSnapshot {
+        RepoCapSnapshot {
+            cap: self.cap,
+            occupancy: self.occupancy.clone(),
+        }
+    }
+
     /// Count one successful dispatch against workspace `idx`'s cap — the
     /// per-repo twin of pass 2's `occupancy += 1`.
     pub fn admit(&mut self, idx: usize) {
@@ -185,6 +195,14 @@ impl RepoCap {
             *slot += 1;
         }
     }
+}
+
+/// A [`RepoCap`] as the tick shaped with it (Issue #9288): the cap, and each
+/// workspace's live-sweep count at the top of the tick (`> 0` ⇒ a hot track).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoCapSnapshot {
+    pub cap: Option<usize>,
+    pub occupancy: Vec<usize>,
 }
 
 /// Shape the globally-sorted candidate list for pass 2: the #6243 repo-sharding
@@ -204,8 +222,25 @@ impl RepoCap {
 /// within each group and the comparator itself is untouched. With
 /// `preferred_slice: None` and a disabled `cap` this returns `candidates`
 /// unchanged.
+///
+/// Records the shaped order and both shaping inputs on `report` (Issue
+/// #9288), so the published dispatch plan reads the order pass 2 actually
+/// iterates instead of re-deriving it.
 #[must_use]
 pub fn shape_queue(
+    candidates: Vec<PriorityCandidate>,
+    preferred_slice: Option<&[bool]>,
+    cap: &RepoCap,
+    report: &mut TickReport,
+) -> Vec<PriorityCandidate> {
+    let shaped = shape(candidates, preferred_slice, cap, report);
+    report.plan_order = shaped.iter().map(|c| (c.workspace_idx, c.number)).collect();
+    report.in_slice = preferred_slice.map(<[bool]>::to_vec);
+    report.repo_cap = Some(cap.snapshot());
+    shaped
+}
+
+fn shape(
     candidates: Vec<PriorityCandidate>,
     preferred_slice: Option<&[bool]>,
     cap: &RepoCap,

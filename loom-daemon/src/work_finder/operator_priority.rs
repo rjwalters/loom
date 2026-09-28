@@ -386,6 +386,13 @@ impl OverflowSlot {
             && occupancy <= self.terms.configured
     }
 
+    /// Whether the slot is still unused: no live overflow sweep and none
+    /// taken this tick (Issue #9288's `plan.slots.overflow_free`).
+    #[must_use]
+    pub fn is_free(&self) -> bool {
+        !self.taken
+    }
+
     /// Mark the slot used by a dispatch that actually started.
     pub fn take(&mut self, report: &mut TickReport) {
         self.taken = true;

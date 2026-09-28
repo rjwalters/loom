@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use crate::types::{QueueDisposition, ReadyQueueRow};
+use crate::types::{PlanKey, QueueDisposition, ReadyQueueRow};
 
 use super::{candidate_cmp, PriorityCandidate, WorkItem};
 
@@ -72,6 +72,31 @@ pub fn sort_lanes(items: &mut [WorkItem], repo_red: bool) {
     items.sort_by(|a, b| {
         super::ordering::lane_cmp(&key_of(0, 0, a, repo_red), &key_of(0, 0, b, repo_red))
     });
+}
+
+/// The dispatch-order seam (Issue #9288), re-exported beside [`key_of`]:
+/// [`candidate_cmp`] is the lexicographic compare of [`candidate_keys`].
+pub use super::ordering::{candidate_keys, CandidateKey, KeyValue};
+
+/// The comparator's key names, in order — the plan's `ordering`.
+#[must_use]
+pub fn ordering_names() -> Vec<String> {
+    candidate_keys(&PriorityCandidate::default())
+        .iter()
+        .map(|k| k.name.to_string())
+        .collect()
+}
+
+/// `c`'s keys as wire [`PlanKey`]s.
+#[must_use]
+pub fn plan_keys(c: &PriorityCandidate) -> Vec<PlanKey> {
+    candidate_keys(c)
+        .iter()
+        .map(|k| PlanKey {
+            name: k.name.to_string(),
+            value: k.value.to_json(),
+        })
+        .collect()
 }
 
 /// Record a ready issue the tick dropped before the global sort.
@@ -166,9 +191,7 @@ pub fn repo_names(idxs: &[usize], roots: &[PathBuf]) -> Vec<String> {
 /// `workspace #i`.
 #[must_use]
 pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
-    let mut sorted: Vec<&TickQueueRow> = rows.iter().collect();
-    sorted.sort_by(|a, b| candidate_cmp(&a.key, &b.key));
-    sorted
+    ranked(rows)
         .into_iter()
         .enumerate()
         .map(|(i, r)| {
@@ -191,9 +214,19 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
                 detail: r.detail.clone(),
                 state: disposition.state().to_string(),
                 reason: disposition.reason().to_string(),
+                plan: crate::types::RowPlan::default(),
             }
         })
         .collect()
+}
+
+/// `rows` in comparator order — the order [`finish`] ranks them in, shared
+/// with `dispatch_plan::annotate` so the two index the same row.
+#[must_use]
+pub fn ranked(rows: &[TickQueueRow]) -> Vec<&TickQueueRow> {
+    let mut sorted: Vec<&TickQueueRow> = rows.iter().collect();
+    sorted.sort_by(|a, b| candidate_cmp(&a.key, &b.key));
+    sorted
 }
 
 #[cfg(test)]

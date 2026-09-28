@@ -21,6 +21,7 @@ import {
   filterQueueItems,
   mergeFleetQueue,
   openPrNumber,
+  planText,
   queueFilterOptions,
   queueHealth,
   rankText,
@@ -430,5 +431,39 @@ describe("rankText — forge-side labelled_blocked rows (#8957)", () => {
     expect(rankText(blocked)).toBe("–");
     expect(rankText({ ...blocked, rank: 3 })).toBe("3");
     expect(reasonText(blocked)).toBe("blocked: labelled loom:blocked (loom:operator)");
+  });
+});
+
+describe("planText — the host's own dispatch plan (#9288)", () => {
+  it("renders position, plan_state and gate verbatim, and falls back for an older daemon", () => {
+    const parsed = parseQueueSnapshot({
+      tick_at: minutesAgo(1),
+      rows: [
+        row({ rank: 4, disposition: "deferred_repo_cap", state: "ready", position: 2, plan_state: "queued", gate: "repo_cap" }),
+        row({ rank: 1, disposition: "parked", state: "blocked", plan_state: "blocked" }),
+        row({ rank: 2, disposition: "deferred_capacity", state: "ready" }),
+        row({ rank: 3, disposition: "deferred_capacity", state: "ready", position: 1, plan_state: "someday" }),
+      ],
+    })!;
+    const [capped, parked, legacy, future] = parsed.rows;
+    expect(planText(capped!)).toBe("#2 queued (repo cap)");
+    expect(planText(parked!)).toBe("blocked");
+    expect(planText(legacy!)).toBe("ready");
+    expect(future!.plan_state).toBe("unknown");
+    // `rank` is untouched by the plan.
+    expect(rankText(capped!)).toBe("4");
+  });
+
+  it("the host detail panel shows each row's plan", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {
+        "host-plan": {
+          health: health(),
+          queue: queue([row({ position: 1, plan_state: "next", gate: "capacity" })]),
+        },
+      },
+    });
+    const host = buildFleetView(snapshot, NOW).hosts.find((h) => h.hostId === "host-plan")!;
+    expect(hostQueuePanel(host, NOW).textContent).toContain("#1 next (capacity)");
   });
 });

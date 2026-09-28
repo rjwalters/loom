@@ -227,6 +227,7 @@ pub const DEFAULT_MAX_ADMISSIONS_PER_TICK: usize = 3;
 /// config). See [`resolve_extra_skip_labels_with_config`].
 pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP_LABELS";
 
+pub mod dispatch_plan;
 mod labels;
 pub mod main_red_fix;
 pub mod operator_priority;
@@ -1545,10 +1546,7 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
 ) -> TickReport {
     use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
-    let mut report = TickReport {
-        saturation_held,
-        ..TickReport::default()
-    };
+    let mut report = TickReport::for_tick(saturation_held, max_admissions_per_tick);
 
     // Snapshot per-workspace in-flight sets *first* (immutable borrow) so the
     // dedup filtering below always has the full in-flight view.
@@ -1952,6 +1950,7 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
 
     report.halted = any_halted;
     report.occupancy = Some(occupancy);
+    report.overflow_free = Some(overflow.is_free());
     // Sum the cumulative cross-host collision totals across every workspace's
     // dispatcher (#4085), read after pass 2 so this tick's collisions count.
     report.collisions = workspaces.iter().map(|(_, d)| d.collisions()).sum();
@@ -2525,7 +2524,7 @@ where
                 Ok(report) => {
                     // Publish before any logging so `loom-daemon health` sees the
                     // same tick the log line describes (#4761).
-                    publish_tick(&report, max_concurrent, tick_started, &[]);
+                    publish_tick(&report, max_concurrent, tick_started, &[], None);
                     if report.halted && !was_halted {
                         log::warn!(
                             "work_finder: main-health gate halted dispatch — {} ready issue(s) \
@@ -2942,10 +2941,8 @@ pub fn spawn_multi_work_finder_task(
             // both mislabel the line and suppress the role runner's own
             // edge-triggered one. The aggregate lands in the axis line below
             // instead.
-            let preferred_slice: Vec<bool> = roots
-                .iter()
-                .map(|root| crate::role_shard::decide(root).owned)
-                .collect();
+            let shard_decisions = dispatch_plan::shard_decisions(&roots);
+            let preferred_slice: Vec<bool> = shard_decisions.iter().map(|d| d.owned).collect();
 
             // Per-repo main-health halt (#3930): look up each root's own gate
             // state, parallel to `pairs`. A red repo halts only its own dispatch.
@@ -3149,7 +3146,8 @@ pub fn spawn_multi_work_finder_task(
 
             // Publish before any logging so `loom-daemon health` sees the same
             // tick the log line describes (#4761).
-            publish_tick(&report, max_concurrent, tick_started, &roots);
+            let plan = dispatch_plan::PlanInputs::new(max_concurrent, interval, &shard_decisions);
+            publish_tick(&report, max_concurrent, tick_started, &roots, Some(&plan));
 
             if report.halted && !was_halted {
                 log::warn!(

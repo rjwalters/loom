@@ -247,6 +247,12 @@ pub struct ReadyQueueRow {
     /// [`QueueDisposition::reason`], serialized for the same reason.
     #[serde(default)]
     pub reason: String,
+    /// The dispatch-plan fields (Issue #9288): `position`, `plan_state`,
+    /// `keys`, `gate`, `in_slice`, `hot`, `owning_shard`, `repo_cap`.
+    /// Flattened, so they sit beside `rank` on the wire; all default when
+    /// absent.
+    #[serde(flatten, default)]
+    pub plan: super::RowPlan,
 }
 
 #[cfg(test)]
@@ -265,6 +271,39 @@ mod tests {
         assert_eq!(row.created_at, None);
         // A pre-phase-2 payload has no `state`/`reason`: they default empty.
         assert!(row.state.is_empty() && row.reason.is_empty());
+        // A pre-#9288 payload has no plan fields: they default.
+        assert_eq!(row.plan, crate::types::RowPlan::default());
+    }
+
+    /// Issue #9288: the plan fields are flattened beside `rank`, and a tick
+    /// summary without a `plan` block still parses.
+    #[test]
+    fn plan_fields_flatten_and_old_summaries_parse() {
+        let row: ReadyQueueRow = serde_json::from_value(serde_json::json!({
+            "rank": 4, "repo": "/r", "issue": 7, "workspace_priority": 100,
+            "urgent": false, "disposition": "deferred_capacity",
+            "position": 2, "plan_state": "next", "gate": "capacity",
+            "keys": [{"name": "number", "value": 7}]
+        }))
+        .unwrap();
+        assert_eq!(row.plan.position, Some(2));
+        assert_eq!(row.plan.plan_state, crate::types::PlanState::Next);
+        let back = serde_json::to_value(&row).unwrap();
+        assert_eq!(back["position"], 2);
+        assert_eq!(back["plan_state"], "next");
+        assert!(back.get("plan").is_none(), "flattened, not nested: {back}");
+
+        let summary: crate::types::WorkFinderTickSummary =
+            serde_json::from_value(serde_json::json!({
+                "at": "2026-09-28T00:00:00Z", "max_concurrent": 2, "seen": 0,
+                "dispatched": 0, "skipped_labeled": 0, "skipped_in_flight": 0,
+                "skipped_quarantined": 0, "skipped_pr_open": 0,
+                "skipped_peer_claim": 0, "skipped_backoff": 0,
+                "deferred_capacity": 0, "deferred_ramp_cap": 0, "errors": 0,
+                "halted": false
+            }))
+            .unwrap();
+        assert!(summary.plan.is_none());
     }
 
     #[test]
