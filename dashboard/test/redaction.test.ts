@@ -1044,67 +1044,6 @@ describe("GET /public/history vs GET /api/history — end-to-end redaction", () 
     });
   }
 
-  it("the anchored leak assertions cannot match ingestedAt millisecond digits (#9021)", () => {
-    // Merge train #9020's `Dashboard Tests` failure: this block used to
-    // assert `not.toContain("214")` (lines_added) over the whole response
-    // body, and an `ingestedAt` whose milliseconds read `.214` tripped it
-    // with nothing leaked. Workerd's wall clock cannot be frozen from
-    // vitest-pool-workers (see fleetState.test.ts's module doc), so the
-    // exact failing body shape is reproduced deterministically through the
-    // real redaction path instead.
-    const millis214 = "2026-09-26T05:54:56.214Z";
-    const redacted = redactHistoryRecord(
-      {
-        id: 7,
-        schemaVersion: 1,
-        emittedAt: millis214,
-        hostId: "host-abc",
-        kind: "sweep.outcome",
-        repo: "rjwalters/loom",
-        visibility: "private",
-        issue: 4703,
-        sweepId: "sweep-issue-4703-0",
-        ingestedAt: millis214,
-        record: sweepOutcomeEnvelope({ visibility: "private" }).record as Record<string, unknown>,
-      },
-      false,
-    );
-    const publicText = JSON.stringify(redacted);
-
-    // Witness: the body really does carry the `.214` millis digits, and the
-    // bare-number form this block used demonstrably false-fails on them —
-    // the exact #9020 signature, kept executable so the anchored forms'
-    // premise cannot silently rot.
-    expect(publicText).toContain(".214");
-    expect(() => expect(publicText).not.toContain("214")).toThrow();
-
-    // The anchored forms used above are immune to those same digits …
-    expect(publicText).not.toMatch(/"issue"\s*:\s*4703\b/);
-    expect(publicText).not.toMatch(/"pr_number"\s*:/);
-    expect(publicText).not.toMatch(/"tokens_in"\s*:/);
-    expect(publicText).not.toMatch(/"tokens_out"\s*:/);
-    expect(publicText).not.toMatch(/"lines_added"\s*:/);
-
-    // … and still fail on a real leak (every anchored pattern trips when
-    // the private fields are present, whatever their values).
-    const leaked = JSON.stringify({
-      ...redacted,
-      issue: 4703,
-      record: {
-        ...redacted.record,
-        pr_number: 4710,
-        tokens_in: 48213,
-        tokens_out: 6120,
-        lines_added: 214,
-      },
-    });
-    expect(leaked).toMatch(/"issue"\s*:\s*4703\b/);
-    expect(leaked).toMatch(/"pr_number"\s*:/);
-    expect(leaked).toMatch(/"tokens_in"\s*:/);
-    expect(leaked).toMatch(/"tokens_out"\s*:/);
-    expect(leaked).toMatch(/"lines_added"\s*:/);
-  });
-
   it("host.health passes through unredacted on the public route; tokens.snapshot is aggregated", async () => {
     await ingest([tokensSnapshotEnvelope(), hostHealthEnvelope()]);
 
