@@ -302,7 +302,7 @@ fn an_empty_pool_or_a_placeholder_shaped_entry_is_never_swapped_in() {
     );
     assert_eq!(current_credential(&registry), OLD);
 
-    let nested = FakePool::offering("beta", &Placeholder::generate().as_str().to_string());
+    let nested = FakePool::offering("beta", Placeholder::generate().as_str());
     let (registry, placeholder) = armed(nested, "https://api.anthropic.com", 8);
     assert_eq!(
         ask(&registry, &placeholder, Reason::ConcurrentSession),
@@ -508,7 +508,7 @@ async fn the_control_path_is_never_forwarded_upstream() {
     let addr = serve(&registry).await;
     let ph = placeholder.as_str();
     let cases = [
-        (control(&Placeholder::generate().as_str().to_string(), addr, "POST", ROTATE_PATH, r#"{"reason":"concurrent-session"}"#), "401"),
+        (control(Placeholder::generate().as_str(), addr, "POST", ROTATE_PATH, r#"{"reason":"concurrent-session"}"#), "401"),
         (control(ph, addr, "GET", ROTATE_PATH, ""), "405"),
         (control(ph, addr, "POST", "/.loom-egress-proxy/v1/anything", "{}"), "404"),
         (control(ph, addr, "POST", "/.LOOM-Egress-Proxy/v1/rotate", "{}"), "404"),
