@@ -801,6 +801,9 @@ pub fn record_role_tick_at(
             load_per_core,
             detail,
         } => (true, Some(format!("load-skipped (load/core {load_per_core:.2}): {detail}"))),
+        // #9391: a queue-gated tick with nothing to do is healthy (ok) — it
+        // keeps the role's liveness fresh without spawning anything.
+        RoleTickOutcome::QueueEmpty => (true, Some("queue-empty".to_string())),
     };
     // #7607: distinguishes a `PoolExhausted` skip from every other not-ok
     // outcome — see `RoleTickRecord::pool_exhausted`'s doc comment. #8444:
@@ -847,7 +850,8 @@ pub fn record_role_tick_at(
     };
     // Issue #6757 AC4: sticky once true, so a failing tick never clears it —
     // see `LastRoleTickState::ever_succeeded`'s doc comment.
-    let ever_succeeded = ok || prev.as_ref().is_some_and(|p| p.ever_succeeded);
+    let ever_succeeded = (ok && *outcome != RoleTickOutcome::QueueEmpty)
+        || prev.as_ref().is_some_and(|p| p.ever_succeeded);
     last_tick.insert(
         key,
         LastRoleTickState {
@@ -961,6 +965,12 @@ pub trait RoleInvocationRunner {
     /// every one of those keys from the emitted `role_tick.outcome` record,
     /// which is the honest reading.
     fn resolved_launch(&self) -> Option<crate::role_tick_telemetry::ResolvedLaunch> {
+        None
+    }
+
+    /// The trace context of the most recent invocation, for correlating its
+    /// `role_tick.outcome` record (#9391 moved the call behind this trait).
+    fn trace_context(&self) -> Option<crate::observability::lifecycle::RoleTrace> {
         None
     }
 }
@@ -2405,6 +2415,17 @@ pub enum RoleAdmission {
         /// The ceiling this tick was resolved against.
         ceiling: usize,
     },
+    /// Refused: this role already holds its per-role budget of in-flight
+    /// runs (`autonomous.roleRunner.roleMaxConcurrent`, #9391), though the
+    /// host ceiling still has room — so one role cannot take every slot.
+    RoleBudgetReached {
+        /// The role that is at its budget.
+        role: &'static str,
+        /// In-flight runs of `role` across every managed workspace.
+        active: usize,
+        /// The per-role budget this tick was resolved against.
+        budget: usize,
+    },
 }
 
 impl RoleAdmission {
@@ -2414,7 +2435,7 @@ impl RoleAdmission {
     pub fn into_guard(self) -> Option<RoleRunGuard> {
         match self {
             Self::Admitted(g) => Some(g),
-            Self::InProgress | Self::CeilingReached { .. } => None,
+            Self::InProgress | Self::CeilingReached { .. } | Self::RoleBudgetReached { .. } => None,
         }
     }
 }
@@ -2454,6 +2475,21 @@ impl RoleRunGuard {
         role: &'static str,
         ceiling: usize,
     ) -> RoleAdmission {
+        Self::admit_with_role_budget(set, root, role, ceiling, usize::MAX)
+    }
+
+    /// [`Self::admit`] plus the per-role `role_budget` (#9391), checked under
+    /// the **same** lock in the order `InProgress`, host `CeilingReached`,
+    /// then `RoleBudgetReached` — the budget counts in-flight entries whose
+    /// role is `role`, across every workspace.
+    #[must_use]
+    pub fn admit_with_role_budget(
+        set: InProgressGuard,
+        root: PathBuf,
+        role: &'static str,
+        ceiling: usize,
+        role_budget: usize,
+    ) -> RoleAdmission {
         let key = (root, role);
         {
             let mut guard = set.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2463,6 +2499,14 @@ impl RoleRunGuard {
             let active = guard.len();
             if active >= ceiling {
                 return RoleAdmission::CeilingReached { active, ceiling };
+            }
+            let role_active = guard.iter().filter(|(_, r)| *r == role).count();
+            if role_active >= role_budget {
+                return RoleAdmission::RoleBudgetReached {
+                    role,
+                    active: role_active,
+                    budget: role_budget,
+                };
             }
             guard.insert(key.clone());
         }
@@ -2653,11 +2697,18 @@ pub fn plan_idle_runs(
             );
             continue;
         }
-        let guard = match RoleRunGuard::admit(
+        // #9391: idle-edge runs count against the same per-role budget.
+        let role_budget = concurrent_dispatch::resolve_role_max_concurrent(
+            &concurrent_dispatch::read_role_max_concurrent(root),
+            spec.name,
+            ceiling,
+        );
+        let guard = match RoleRunGuard::admit_with_role_budget(
             in_progress.clone(),
             root.to_path_buf(),
             spec.name,
             ceiling,
+            role_budget,
         ) {
             RoleAdmission::Admitted(g) => g,
             RoleAdmission::InProgress => {
@@ -2681,6 +2732,19 @@ pub fn plan_idle_runs(
                      {ROLE_RUNNER_MAX_CONCURRENT_ENV}, #6102)",
                     root.display(),
                     spec.name
+                );
+                continue;
+            }
+            RoleAdmission::RoleBudgetReached {
+                role,
+                active,
+                budget,
+            } => {
+                log::warn!(
+                    "role_runner: idle edge for {} — {role} not admitted: {active} {role} run(s) \
+                     already in flight at its budget of {budget} \
+                     (autonomous.roleRunner.roleMaxConcurrent, #9391)",
+                    root.display()
                 );
                 continue;
             }
@@ -2922,6 +2986,7 @@ fn describe_panic(payload: &(dyn std::any::Any + Send)) -> String {
 /// healthy ticks would otherwise have retried. That is precisely the
 /// "RECOVERABLE failure never retried… permanent silent benching" failure
 /// mode the filed incident describes.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn decide_root_tick(
     root: &Path,
@@ -2931,6 +2996,27 @@ fn decide_root_tick(
     resolved_roles_logged: &mut HashMap<PathBuf, String>,
     missing_defaults_logged: &mut HashMap<PathBuf, Vec<&'static str>>,
 ) -> Option<(String, RoleRunGuard)> {
+    decide_root_tick_detailed(
+        root,
+        spec,
+        in_progress,
+        disabled_roots_warned,
+        resolved_roles_logged,
+        missing_defaults_logged,
+    )
+    .into_admitted()
+}
+
+/// [`decide_root_tick`], keeping *why* a root was not admitted (#9391).
+#[allow(clippy::too_many_arguments)]
+fn decide_root_tick_detailed(
+    root: &Path,
+    spec: &RoleSpec,
+    in_progress: &InProgressGuard,
+    disabled_roots_warned: &mut HashSet<PathBuf>,
+    resolved_roles_logged: &mut HashMap<PathBuf, String>,
+    missing_defaults_logged: &mut HashMap<PathBuf, Vec<&'static str>>,
+) -> concurrent_dispatch::RootTickDecision {
     let config = read_role_runner_config(root);
     if !resolve_enabled(&config) {
         // Per-root gate (#4377): `enabled` is resolved from this root's own
@@ -2960,7 +3046,7 @@ fn decide_root_tick(
                 root.display()
             );
         }
-        return None;
+        return concurrent_dispatch::RootTickDecision::Skip;
     }
     // The root resolved enabled again — clear any stale disabled-warning so a
     // later disable re-warns (#4377).
@@ -2972,7 +3058,7 @@ fn decide_root_tick(
     // costs nothing further to decide about.
     if let Some(reason) = role_is_config_gated(spec, root) {
         log::debug!("role_runner: {} tick for {} skipped — {reason}", spec.name, root.display());
-        return None;
+        return concurrent_dispatch::RootTickDecision::Skip;
     }
     // Host sharding (#6374): on a fleet, each workspace's role rotation must
     // run on exactly ONE host per interval — otherwise N dispatchers each
@@ -2996,7 +3082,7 @@ fn decide_root_tick(
             root.display(),
             describe_shard_refusal(&shard)
         );
-        return None;
+        return concurrent_dispatch::RootTickDecision::Skip;
     }
     // Resolved-role-list diagnostic (#5654 AC1): computed once per root per
     // tick and reused below for the membership check, rather than calling
@@ -3056,7 +3142,7 @@ fn decide_root_tick(
                 spec.name,
                 root.display()
             );
-            return None;
+            return concurrent_dispatch::RootTickDecision::Skip;
         }
     }
     let name = spec.name;
@@ -3064,41 +3150,11 @@ fn decide_root_tick(
     // carries this root's own resolved per-invocation proposal cap
     // (per-root, like every other knob resolved from `config` above).
     let prompt = resolve_role_prompt(spec, &config);
-    // Shared in-progress guard (#4364): skip this root's interval tick when
-    // an idle-triggered (or overlapping) run for the same (root, role) is
-    // already active. Held across the invocation by the caller; cleared on
-    // drop (every exit path).
-    //
-    // #6102: the same call now also enforces the concurrent role-agent
-    // ceiling, resolved from this root's own config (already read above as
-    // `config`) — the bound that `autonomous.workFinder.maxConcurrent` never
-    // provided, since role agents never pass through work-finder admission.
-    match RoleRunGuard::admit(
-        in_progress.clone(),
-        root.to_path_buf(),
-        name,
-        resolve_max_concurrent(&config),
-    ) {
-        RoleAdmission::Admitted(g) => Some((prompt, g)),
-        RoleAdmission::InProgress => {
-            log::debug!(
-                "role_runner: {} tick for {} skipped — a run is already in progress (#4364)",
-                name,
-                root.display()
-            );
-            None
-        }
-        RoleAdmission::CeilingReached { active, ceiling } => {
-            log::warn!(
-                "role_runner: {} tick for {} not admitted — {active} role agent(s) already in \
-                 flight at the ceiling of {ceiling} (autonomous.roleRunner.maxConcurrent / \
-                 {ROLE_RUNNER_MAX_CONCURRENT_ENV}, #6102); retrying next tick",
-                name,
-                root.display()
-            );
-            None
-        }
-    }
+    // Shared in-progress guard (#4364), host ceiling (#6102) and per-role
+    // budget (#9391), all under one lock — see `admit_root_tick`. A ceiling or
+    // budget refusal is returned (not logged per root) so the dispatcher can
+    // stop admitting for the rest of the tick and log one summary line.
+    concurrent_dispatch::admit_root_tick(root, name, prompt, in_progress, &config)
 }
 
 /// Spawn the role-runner loop for a single role on a single workspace on the
@@ -3189,6 +3245,8 @@ where
                     );
                     continue;
                 }
+                // Unreachable: `admit` applies no role budget (#9391).
+                RoleAdmission::RoleBudgetReached { .. } => continue,
             };
             let tick_start = Instant::now();
             let probe_root = root.clone();
@@ -3229,15 +3287,17 @@ where
 /// per missing period, never auto-remove), and, for each surviving root
 /// whose own `.loom/config.json` has this role enabled (`resolve_enabled`
 /// AND the role name present in `resolve_roles` — precedence env > config >
-/// default), runs one invocation. Invocations run **sequentially** per tick
-/// (no shared mutable state to leak across repos, and it avoids bursting
-/// concurrent `claude` sessions across every registered repo at once).
+/// default), starts one invocation.
 ///
-/// A repeatedly-failing root (e.g. a broken MCP preflight, #4349) logs once
-/// on the fail edge and once on recovery — not once per tick — via a
-/// per-root failing-state map tracked across ticks (mirrors the
-/// `was_halted`/`was_pressured` state-change-dedup discipline in
-/// [`crate::work_finder`]).
+/// **Invocations run concurrently across repositories** (#9391): each admitted
+/// `(root, role)` run is spawned into a [`tokio::task::JoinSet`] holding its
+/// in-progress guard, and the tick does not wait for it. A run still going at
+/// the next tick is refused as `RoleAdmission::InProgress`, so there is at
+/// most one instance per `(repository, role)`; the host ceiling and the
+/// per-role budget bound the total. Finished runs are reaped as they complete
+/// (and at the top of every tick), where the fail/recover log dedup (#4349)
+/// and the pool-exhausted feed below run. See
+/// [`concurrent_dispatch::RoleDispatcher`].
 ///
 /// `pool_exhausted_observer` (issue #7607) is notified once per
 /// [`RoleTickOutcome::PoolExhausted`] tick so a token pool discovered
@@ -3265,63 +3325,27 @@ pub fn spawn_multi_role_task(
                              // Missing-root warn-once-per-period state (#4326), shared discipline
                              // with `work_finder` via `filter_missing_roots`.
         let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
-        // Per-root failing state (#4349), so a persistently failing tick logs
-        // only on the fail edge and on recovery, not every tick.
-        let mut failing_roots: HashMap<PathBuf, bool> = HashMap::new();
-        // Per-root no-token-pool state (#4642), tracked completely
-        // independently of `failing_roots` so a permanent missing-pool skip
-        // is never conflated with (or silences the WARN for) a genuine
-        // invocation failure — see `RootTickLogAction::is_no_token_pool`.
-        let mut no_token_pool_roots: HashMap<PathBuf, bool> = HashMap::new();
-        // Per-root pool-exhausted state (#7607), tracked completely
-        // independently of `failing_roots`/`no_token_pool_roots` so a
-        // present-but-fully-exhausted pool skip is never conflated with (or
-        // silences the WARN for) either — see
-        // `RootTickLogAction::is_pool_exhausted`.
-        let mut pool_exhausted_roots: HashMap<PathBuf, bool> = HashMap::new();
-        // Per-root model/runtime-mismatch state (#5028), tracked completely
-        // independently of `failing_roots`/`no_token_pool_roots`/
-        // `pool_exhausted_roots` so a permanent config-conflict skip is
-        // never conflated with (or silences the WARN for) any of them — see
-        // `RootTickLogAction::is_model_mismatch`.
-        let mut model_mismatch_roots: HashMap<PathBuf, bool> = HashMap::new();
-        // Disabled-root warn-once state (#4377): the per-tick disabled-skip
-        // below is otherwise only a `debug!` — invisible at the default `info`
-        // level, so a registered root left disabled gets zero diagnostics.
-        // Same warn-once-then-dedup shape as `missing_roots_warned`, but
-        // without `filter_missing_roots`'s reset-every-tick semantics: an
-        // entry here is cleared only when its root resolves enabled again
-        // (see below), so re-disabling re-warns instead of staying silent.
-        let mut disabled_roots_warned: HashSet<PathBuf> = HashSet::new();
-        // Per-root last-logged resolved-role-list line (issue #5654 AC1):
-        // every tick logs the current [`resolved_roles_log_line`] at DEBUG
-        // (satisfying "per-repo, per-tick"), but escalates to INFO whenever
-        // the line's content differs from the last one recorded for this
-        // root — first sighting, a config edit, or a daemon rebuild that
-        // changed [`DEFAULT_ROLES`] (surfaced here as a changed
-        // `default_roles=` snapshot id) all trip this edge. Same
-        // warn/info-once-then-dedup shape as `disabled_roots_warned` /
-        // `missing_roots_warned` above.
-        let mut resolved_roles_logged: HashMap<PathBuf, String> = HashMap::new();
-        // Per-root last-warned "stale pinned roles allowlist" set (#6163
-        // AC3): the [`missing_defaults_warning_line`] `log::warn!` fires only
-        // when this root's currently-missing set differs from the last one
-        // recorded here — first sighting (including this loop's own startup)
-        // or a config edit that changes which roles are missing. Only the
-        // designated reporter loop ([`is_missing_defaults_reporter`]) ever
-        // populates this map; the other DEFAULT_ROLES loops leave it empty
-        // rather than duplicating the same workspace's line N times. Cleared
-        // (not just left stale) once the root stops being missing anything,
-        // so a later regression re-warns instead of staying silent forever.
-        // Own map, deliberately not folded into `resolved_roles_logged`
-        // above: that one already has its own change-detection semantics
-        // (any content difference, including a `default_roles=` snapshot
-        // bump) and this repo's own tests pin its exact string output —
-        // keeping the two independent avoids coupling either's format to the
-        // other's dedup trigger.
-        let mut missing_defaults_logged: HashMap<PathBuf, Vec<&'static str>> = HashMap::new();
+        let mut dispatcher = concurrent_dispatch::RoleDispatcher::new(
+            spec,
+            interval,
+            concurrent_dispatch::script_runner_factory(),
+            concurrent_dispatch::forge_queue_probe(),
+            pool_exhausted_observer,
+        );
         loop {
-            ticker.tick().await;
+            // Reap runs as they finish, so their outcome is logged (and the
+            // tick ring stamped) when they end rather than a whole interval
+            // later; the tick branch reaps again before dispatching.
+            tokio::select! {
+                joined = dispatcher.join_next(), if dispatcher.in_flight_len() > 0 => {
+                    if let Some(joined) = joined {
+                        dispatcher.handle_joined(joined);
+                    }
+                    continue;
+                }
+                _ = ticker.tick() => {}
+            }
+            dispatcher.reap_finished();
 
             // Scheduled drain (#4090): stop starting new role ticks across every
             // workspace while a drain is in progress (Finding 2 — role ticks are
@@ -3358,106 +3382,7 @@ pub fn spawn_multi_role_task(
             // warn-and-skip, never auto-remove (`loom-daemon status` flags it,
             // `workspace remove` clears it).
             let roots = filter_missing_roots(roots, &mut missing_roots_warned);
-
-            for root in roots {
-                // #6201 AC2: the synchronous decision phase — config reads,
-                // the disabled/membership checks, prompt resolution, and
-                // run-guard admission — is defended with `catch_unwind`.
-                // Every step past this point (`spawn_blocking` below) is
-                // already panic-isolated by tokio; this closes the one gap
-                // that would otherwise let a panic HERE silently end this
-                // role's ENTIRE multi-workspace loop (every registered root,
-                // not just this one) with no automatic recovery short of a
-                // daemon restart. `AssertUnwindSafe` is sound here: the two
-                // captured `&mut` maps are dedup/bookkeeping state only — a
-                // panic mid-update leaves them, at worst, one tick stale
-                // (re-warning or re-logging once more than strictly
-                // necessary), never a correctness or safety issue.
-                let decision = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decide_root_tick(
-                        &root,
-                        &spec,
-                        &in_progress,
-                        &mut disabled_roots_warned,
-                        &mut resolved_roles_logged,
-                        &mut missing_defaults_logged,
-                    )
-                })) {
-                    Ok(decision) => decision,
-                    Err(panic) => {
-                        log::error!(
-                            "role_runner: {} tick decision for {} panicked ({}) — skipping only \
-                             this root's this tick; the loop continues on the next interval \
-                             (#6201)",
-                            spec.name,
-                            root.display(),
-                            describe_panic(&*panic)
-                        );
-                        None
-                    }
-                };
-                let Some((prompt, _run_guard)) = decision else {
-                    continue;
-                };
-                let name = spec.name;
-                let root_for_task = root.clone();
-                let tick_start = Instant::now();
-                let joined = tokio::task::spawn_blocking(move || {
-                    let mut runner = ScriptRoleInvocationRunner::new(root_for_task.clone());
-                    let started_at = chrono::Utc::now();
-                    // Cross-host collision detection (#4623) — detection only;
-                    // the invocation itself is unchanged.
-                    let outcome = invoke_with_collision_probe(
-                        &mut runner,
-                        &root_for_task,
-                        name,
-                        &prompt,
-                        interval,
-                    );
-                    // Durable `role_tick.outcome` record (#8056). Emitted from
-                    // inside this blocking task — it does filesystem and (at
-                    // most one memoized) subprocess work — and best-effort by
-                    // contract: it can never change whether the role keeps
-                    // ticking.
-                    crate::role_tick_telemetry::emit_for_tick_correlated(
-                        &root_for_task,
-                        name,
-                        started_at,
-                        &outcome,
-                        runner.resolved_launch(),
-                        runner.trace_context.clone(),
-                    );
-                    outcome
-                })
-                .await;
-                let elapsed = tick_start.elapsed();
-                match joined {
-                    Ok(outcome) => {
-                        feed_pool_exhausted_observer(
-                            pool_exhausted_observer.as_deref(),
-                            &outcome,
-                            &root,
-                            spec.name,
-                        );
-                        log_outcome_for_root_deduped(
-                            spec.name,
-                            &root,
-                            &outcome,
-                            elapsed,
-                            &mut failing_roots,
-                            &mut no_token_pool_roots,
-                            &mut pool_exhausted_roots,
-                            &mut model_mismatch_roots,
-                        );
-                    }
-                    Err(e) => log::error!(
-                        "role_runner: {} invocation task for {} panicked ({e}); continuing to the \
-                         next repo",
-                        spec.name,
-                        root.display()
-                    ),
-                }
-            }
+            let _report = dispatcher.dispatch_tick(roots, &in_progress);
         }
     })
 }
@@ -3561,6 +3486,9 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
                  (#6637): {detail}"
             );
         }
+        RoleTickOutcome::QueueEmpty => {
+            log::debug!("role_runner: {role} tick skipped — its work queue is empty (#9391)");
+        }
     }
 }
 
@@ -3626,6 +3554,10 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
             "role_runner: {role} tick for {} skipped after {elapsed:.1?}: skipped: host saturated \
              (load/core {load_per_core:.2}) at the tick ceiling — not counted as a failure \
              (#6637): {detail}",
+            root.display()
+        ),
+        RoleTickOutcome::QueueEmpty => log::debug!(
+            "role_runner: {role} tick for {} skipped — its work queue is empty (#9391)",
             root.display()
         ),
     }
@@ -3698,6 +3630,9 @@ enum RootTickLogAction {
     /// [`DEFAULT_ROLE_TIMEOUT`] ceiling, so repeat-tick log spam is not a
     /// realistic concern.
     LoadSkipped,
+    /// A queue-gated role found its work queue empty and spawned nothing
+    /// (#9391): `DEBUG` only, and it leaves every edge/repeat map untouched.
+    QueueEmpty,
 }
 
 impl RootTickLogAction {
@@ -3759,6 +3694,7 @@ fn classify_root_tick_log(
         }
         RoleTickOutcome::ModelRuntimeMismatch(_) => RootTickLogAction::ModelMismatchEdge,
         RoleTickOutcome::LoadSkipped { .. } => RootTickLogAction::LoadSkipped,
+        RoleTickOutcome::QueueEmpty => RootTickLogAction::QueueEmpty,
         RoleTickOutcome::Failure(_) | RoleTickOutcome::RuntimeRejected(_) if was_failing => {
             RootTickLogAction::FailureRepeat
         }
@@ -3821,7 +3757,7 @@ fn log_outcome_for_root_deduped(
         RoleTickOutcome::Success | RoleTickOutcome::NoTokenPool => "",
         RoleTickOutcome::PoolExhausted { .. } => "",
         RoleTickOutcome::ModelRuntimeMismatch(_) => "",
-        RoleTickOutcome::LoadSkipped { .. } => "",
+        RoleTickOutcome::LoadSkipped { .. } | RoleTickOutcome::QueueEmpty => "",
     };
     match action {
         RootTickLogAction::Success => {
@@ -3941,6 +3877,15 @@ fn log_outcome_for_root_deduped(
                 );
             }
         }
+        RootTickLogAction::QueueEmpty => {
+            // Never touches the fail/recover state: an empty queue says
+            // nothing about whether the role's last real run worked.
+            log::debug!(
+                "role_runner: {role} tick for {} skipped — its work queue is empty (#9391)",
+                root.display()
+            );
+            return;
+        }
         RootTickLogAction::LoadSkipped => {
             if let RoleTickOutcome::LoadSkipped {
                 load_per_core,
@@ -3961,6 +3906,10 @@ fn log_outcome_for_root_deduped(
     pool_exhausted.insert(root.to_path_buf(), action.is_pool_exhausted());
     model_mismatch.insert(root.to_path_buf(), action.is_model_mismatch());
 }
+
+// Concurrent per-(repository, role) dispatch, per-role budgets and queue
+// gating (#9391) — see `role_runner/concurrent_dispatch.rs`.
+pub mod concurrent_dispatch;
 
 // The per-invocation result type (#8056) — see `role_runner/outcome.rs`.
 mod outcome;

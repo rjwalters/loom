@@ -107,6 +107,7 @@ fn role_tick_result_str(result: RoleTickResult) -> &'static str {
         RoleTickResult::SkippedPoolExhausted => "skipped_pool_exhausted",
         RoleTickResult::SkippedModelRuntimeMismatch => "skipped_model_runtime_mismatch",
         RoleTickResult::SkippedLoad => "skipped_load",
+        RoleTickResult::SkippedQueueEmpty => "skipped_queue_empty",
     }
 }
 

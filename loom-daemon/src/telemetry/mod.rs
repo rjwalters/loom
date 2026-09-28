@@ -662,6 +662,8 @@ pub enum RoleTickResult {
     /// Terminated at the wall-clock ceiling while the host was measurably
     /// saturated — a starved tick, not a broken role.
     SkippedLoad,
+    /// Skipped pre-spawn: a queue-gated role's work queue was empty (#9391).
+    SkippedQueueEmpty,
 }
 
 impl RoleTickResult {
