@@ -1,0 +1,90 @@
+# Backup-restore rehearsal overlay for the Loom SigNoz trial (Issue #8528).
+#
+# The README's backup procedure ends with "Test restoration into a separate
+# project/network before relying on the backup." This overlay is that separate
+# project. Layer it on top of the rendered `pours/deployment/compose.yaml`:
+#
+#   docker compose --env-file /absolute/private/signoz-restore.env \
+#     -f pours/deployment/compose.yaml -f ../../restore-override.yaml \
+#     up -d --wait --wait-timeout 1800 loom-signoz-signoz-0
+#
+# It is NOT part of the trial deployment and must never be used to start the
+# live project. Its only job is to make a restore rehearsal incapable of
+# touching the running trial, so a rehearsal cannot become an outage.
+#
+# Why an overlay is required rather than `docker compose -p loom-signoz-restore`
+# alone: every volume in the rendered file carries an explicit top-level
+# `name:`, so volume names are NOT project-prefixed. A bare `-p` rename
+# therefore produces a second project that mounts the LIVE volumes read-write —
+# exactly the accident a rehearsal exists to avoid. Five services likewise pin
+# `container_name:`, the app publishes a fixed host port, and the ingester joins
+# the external `loom-observability` network under the alias the shared gateway
+# exports to. Each of those is re-pointed below.
+#
+# `loom-daemon/tests/signoz_restore_contract.rs` reads this file together with
+# the rendered compose and enforces these properties, so a later re-render or
+# hand-edit cannot silently reconnect the rehearsal to live state.
+
+name: loom-signoz-restore
+
+networks:
+  # The live render declares this as `external: true, name: loom-observability`
+  # — the shared gateway's own network (#8526). A restore rehearsal must not be
+  # reachable from the gateway, or it would register the
+  # `signoz-otel-collector` alias a second time and silently take a share of
+  # live OTLP traffic. Re-point it at a project-local, egress-less bridge so
+  # even an accidental `up` of every service cannot reach the gateway.
+  loom-observability:
+    external: false
+    internal: true
+    name: loom-signoz-restore-quarantine
+  loom-signoz-network:
+    name: loom-signoz-restore-network
+
+# Restored copies, populated from the backup tarballs before `up`. Distinct
+# names are what make `down --volumes` on this project safe: it can only ever
+# remove volumes under the `loom-signoz-restore-` prefix.
+volumes:
+  loom-signoz-metastore-postgres-0-data:
+    name: loom-signoz-restore-metastore-postgres-0-data
+  loom-signoz-telemetrykeeper-0-data:
+    name: loom-signoz-restore-telemetrykeeper-0-data
+  loom-signoz-telemetrystore-0-0-data:
+    name: loom-signoz-restore-telemetrystore-0-0-data
+  loom-signoz-telemetrystore-user-scripts:
+    name: loom-signoz-restore-telemetrystore-user-scripts
+
+services:
+  # The rehearsal verifies restored *state*, not ingestion, so the OTLP
+  # receiver is scaled to zero as well as being quarantined by the network
+  # rename above. Starting only `loom-signoz-signoz-0` (whose dependency chain
+  # excludes the ingester) is the documented invocation; this is the belt to
+  # that braces.
+  ingester:
+    container_name: loom-signoz-restore-ingester
+    restart: "no"
+    deploy:
+      replicas: 0
+
+  loom-signoz-metastore-postgres-0:
+    container_name: loom-signoz-restore-metastore-postgres-0
+
+  loom-signoz-signoz-0:
+    container_name: loom-signoz-restore-signoz-0
+    # `!override` replaces the published-port list outright. Compose merges
+    # `ports` by target port, so appending would keep the live 18081 binding
+    # and the rehearsal would fail to start against the running trial.
+    ports: !override
+      - 127.0.0.1:18091:8080
+
+  loom-signoz-telemetrykeeper-clickhousekeeper-0:
+    container_name: loom-signoz-restore-telemetrykeeper-clickhousekeeper-0
+
+  loom-signoz-telemetrystore-clickhouse-0-0:
+    container_name: loom-signoz-restore-telemetrystore-clickhouse-0-0
+
+  loom-signoz-telemetrystore-clickhouse-user-scripts:
+    container_name: loom-signoz-restore-telemetrystore-clickhouse-user-scripts
+
+  loom-signoz-telemetrystore-migrator:
+    container_name: loom-signoz-restore-telemetrystore-migrator

@@ -658,6 +658,58 @@ Both remain open in [#8946](https://github.com/rjwalters/loom/issues/8946),
 which also asks the API step to confirm whether the three `*_keys` tables need
 a `retention.sql` statement.
 
+## Backup-restore rehearsal overlay (2026-09-28)
+
+"Restart and recovery" above is explicit that what it verified was a normal
+stop/start, **not** a volume-loss backup restoration — so the README's closing
+instruction to *"test restoration into a separate project/network"* has been
+unrehearsed advice for the whole trial. `restore-override.yaml` and the README's
+"Backup-restore rehearsal" section are that separate project, made reviewable.
+
+**Executed here: the merged render only.** From
+`defaults/observability/signoz/`, on Docker Desktop 29.8.0 / Compose v5.5.1 with
+a throwaway placeholder env file outside the checkout:
+
+```console
+docker compose --env-file <private> -f pours/deployment/compose.yaml -f restore-override.yaml config
+```
+
+It renders, and every isolation property the procedure depends on is present in
+the output rather than merely intended: project `loom-signoz-restore`; all four
+volumes at `loom-signoz-restore-*` names; all six pinned container names at
+`loom-signoz-restore-*`; `loom-signoz-network` → `loom-signoz-restore-network`;
+the external `loom-observability` gateway network → an `internal: true` bridge
+named `loom-signoz-restore-quarantine`; the ingester at `deploy.replicas: 0`; and
+exactly one published port, `127.0.0.1:18091:8080`, the live `18081` binding
+having been replaced rather than appended (that replacement is what the
+`!override` tag buys, and it needs Compose ≥ 2.24.4).
+
+Rendering the procedure — rather than reading it — is what found three defects in
+its first draft, each of which would have surfaced on the trial host as a failed
+or dangerous rehearsal:
+
+| Defect | Consequence if it had shipped |
+| --- | --- |
+| `loom-signoz-metastore-postgres-0` kept its live `container_name` | The rehearsal collides with the running trial's PostgreSQL container by name |
+| Overlay passed as `-f ../../restore-override.yaml` | Fails outright from the documented working directory: `-f` resolves against the CWD, not the first compose file's directory |
+| `exec -T loom-signoz-restore-telemetrystore-clickhouse-0-0` | `exec` addresses a **service**; the overlay renames containers, not services. The same line minus `-f restore-override.yaml` reads the **live** ClickHouse |
+
+All three are now enforced statically by
+`loom-daemon/tests/signoz_restore_contract.rs` (13 tests, no Docker/network/
+credential), which re-derives the volume set, the pinned container names, the
+external-network key and the published-port list from the *rendered* compose — so
+a later `foundryctl forge` re-render that adds a fifth volume or a second port
+cannot silently escape the overlay. Each of the three was confirmed to fail the
+intended test and only that test, by reintroducing the defect and re-running.
+
+**Not executed: the rehearsal itself.** No backup tarball, trial-host volume or
+private env file is reachable from a worktree, and the trial project is stopped
+with volumes preserved on a host that an earlier session recorded as unable to
+hold two stacks at once. Nothing above is presented as an observation of restored
+data: the snapshot, restore, cross-project query diff, account/dashboard login and
+teardown steps are all unrun. [#9279](https://github.com/rjwalters/loom/issues/9279)
+owns that run and flips the ledger row below when it happens.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -672,6 +724,7 @@ a `retention.sql` statement.
 | Actual Trace Explorer and correlated logs | Passed in authenticated UI; sanitized screenshots linked above |
 | Seven-day effective retention | API, overrides and actual DDL verified; metadata/grace exceptions documented |
 | Restart persistence and shared receiver recovery | Passed for signals, account and effective TTL; fresh three-signal replay indexed |
+| Backup restoration rehearsed into a separate project | **Open** — the isolated `loom-signoz-restore` overlay, its documented procedure and a 13-test static isolation contract all landed and the merged render was verified (see "Backup-restore rehearsal overlay"), but no restore has been executed against real tarballs: that needs the trial host ([#9279](https://github.com/rjwalters/loom/issues/9279)) |
 | Saved query artifacts for the shared fixture manifest | **Passed** — executed live above; matches the generated manifest exactly |
 | Shared fixture manifest observed in SigNoz | **Passed** — see "Shared fixture manifest, executed live" above: 37/14/3 signals, exact totals, graph, grouping, root-less detection, absence-vs-zero and privacy-sentinel queries all verified |
 | Real Loom canary / real Judge-Doctor repair trace | Open — the instrumentation slices landed (#8577/#8579), but #8525 itself stays open for its own live-run acceptance, and the run needs the trial host; see #8529 |
