@@ -48,7 +48,8 @@ pub mod select;
 pub mod sync;
 
 pub use bad_marks::{
-    is_bad_for_class, mark_bad, mark_bad_for_class, unmark, unmark_for_class, BadMark,
+    escalate_bad_for_class, is_bad_for_class, mark_bad, mark_bad_for_class, unmark,
+    unmark_for_class, BadMark, MarkWrite,
 };
 pub use classify::{classify, Classification};
 pub use ingest::{ingest_launch_log, LaunchFeedback};
