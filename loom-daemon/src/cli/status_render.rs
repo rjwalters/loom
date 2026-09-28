@@ -9,10 +9,12 @@ use chrono::{DateTime, Utc};
 use std::path::Path;
 
 mod drain_render;
+mod forge_calls_render;
 mod forge_events_line;
 mod holds;
 mod model_class;
 mod observability_line;
+mod operator_priority_line;
 
 use loom_daemon::daemon_install_state;
 use loom_daemon::self_update;
@@ -387,6 +389,7 @@ pub(crate) fn build_status_json_value(
         "work_finder": {
             "enabled": report.work_finder_enabled,
         },
+        "operator_priority_landing": report.operator_priority_landing,
         // Host-wide `LOOM_ROLE_RUNNER` env override state (#6470), resolved
         // once for the whole report — `null` when unset (each root's own
         // config decides independently).
@@ -668,6 +671,8 @@ pub(crate) fn build_status_json_value(
             "graphql_remaining": r.graphql_remaining,
             "budget_probed_at": r.budget_probed_at,
         })),
+        // Per-caller forge call accounting (#9251); `null` from an older daemon.
+        "forge_calls": report.forge_calls,
         // Live safehouse fleet-comms connection state (#4345) — `null` only
         // from a pre-#4345 daemon binary that never computed one. `state` is
         // one of "not_configured" / "unreachable" / "connected" /
@@ -1398,7 +1403,11 @@ fn render_in_flight_table(report: &DaemonStatusReport) -> String {
                 SweepKind::PrSet(_) => "prs".to_string(),
             };
             let repo = format_repo_column(s.repo.as_deref());
-            let phase = s.latest_phase.as_deref().unwrap_or("-");
+            let mut phase = s.latest_phase.as_deref().unwrap_or("-").to_string();
+            if s.overflow {
+                // #9244: the host's single over-limit starred sweep.
+                phase.push_str(" [overflow]");
+            }
             let ctr = format_containment_column(s);
             let _ = writeln!(
                 out,
@@ -2185,7 +2194,9 @@ pub(crate) fn print_status_human(
     // Forge event-feed consumer (ADR-0021, #8765). Same block, same reason:
     // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
     // are five different answers that would otherwise all render as nothing.
-    println!("{}", forge_events_line::render(report.forge_events.as_ref(), Utc::now()));
+    println!("{}", forge_events_line::render_block(report.forge_events.as_ref(), Utc::now()));
+    // Starred issues' landing states (#9244 C); nothing when nothing is starred.
+    operator_priority_line::print(report.operator_priority_landing.as_ref());
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
     // alive — but is anything positioned to notice when it *stops* being? Before
@@ -2426,6 +2437,11 @@ pub(crate) fn print_status_human(
         } else {
             println!("GitHub rate limit: OK (breaker closed)");
         }
+    }
+
+    // Per-caller forge call accounting (#9251), right under the breaker.
+    for line in forge_calls_render::render_forge_calls_lines(report, Utc::now()) {
+        println!("{line}");
     }
 
     // Host-level role runner header (#6470): a single line naming the
@@ -3301,6 +3317,7 @@ mod in_flight_repo_column_tests {
             effort: None,
             depends_on: None,
             repo: repo.map(str::to_string),
+            overflow: false,
         }
     }
 
@@ -3323,6 +3340,23 @@ mod in_flight_repo_column_tests {
     #[test]
     fn format_repo_column_falls_back_to_dash_when_none() {
         assert_eq!(format_repo_column(None), "-");
+    }
+
+    #[test]
+    fn overflow_sweep_is_marked_in_the_table() {
+        // #9244: an over-limit starred sweep must be visible in `status`.
+        let mut report = sample_report();
+        let mut over = mk(5, Some("/repos/loom"));
+        over.overflow = true;
+        report.in_flight = vec![mk(3, Some("/repos/loom")), over];
+        let table = render_in_flight_table(&report);
+        assert_eq!(table.matches("[overflow]").count(), 1, "{table}");
+        assert!(
+            table
+                .lines()
+                .any(|l| l.contains("#5") && l.contains("[overflow]")),
+            "{table}"
+        );
     }
 
     #[test]
@@ -3410,6 +3444,7 @@ mod containment_column_tests {
             effort: None,
             depends_on: None,
             repo: Some("/repos/loom".to_string()),
+            overflow: false,
         }
     }
 

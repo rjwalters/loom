@@ -19,12 +19,16 @@ fn row(rank: usize, repo: &str, issue: u32, d: Qd, detail: Option<&str>) -> Read
         issue,
         workspace_priority: 100,
         urgent: false,
+        operator_priority: false,
+        operator_priority_at: None,
+        main_red_fix: false,
         created_at: Some("2026-09-01T00:00:00Z".into()),
         tier: Some("tier:goal-advancing".into()),
         disposition: d,
         detail: detail.map(str::to_string),
         state: d.state().into(),
         reason: d.reason().into(),
+        plan: Default::default(),
     }
 }
 
@@ -158,4 +162,91 @@ fn a_row_without_visibility_decodes_private() {
     }))
     .unwrap();
     assert_eq!(row.visibility, RepoVisibility::Private);
+}
+
+#[test]
+fn rows_carry_operator_priority_and_urgent_is_always_false() {
+    // #9244: starred rows ship `operator_priority` / `operator_priority_at`;
+    // `urgent` stays on the wire for one release but is always false, even if
+    // a (stale) summary row still claims it.
+    let mut starred = row(1, PUBLIC_ROOT, 10, Qd::Dispatched, None);
+    starred.urgent = true;
+    starred.operator_priority = true;
+    starred.operator_priority_at = Some("2026-09-27T08:00:00Z".into());
+    let plain = row(2, PUBLIC_ROOT, 11, Qd::DeferredCapacity, None);
+    let record = build_record(&summary(vec![starred, plain]), &repos());
+    let wire = serde_json::to_value(&record.rows).unwrap();
+    assert_eq!(wire[0]["urgent"], false);
+    assert_eq!(wire[0]["operator_priority"], true);
+    assert_eq!(wire[0]["operator_priority_at"], "2026-09-27T08:00:00Z");
+    assert_eq!(wire[1]["operator_priority"], false);
+    assert!(wire[1].get("operator_priority_at").is_none(), "{wire}");
+    // An older daemon's row (no new fields) still decodes.
+    let mut legacy = wire[1].clone();
+    legacy.as_object_mut().unwrap().remove("operator_priority");
+    let decoded: QueueSnapshotRow = serde_json::from_value(legacy).unwrap();
+    assert!(!decoded.operator_priority);
+}
+
+/// Issue #9288: the plan's row fields and the per-tick block ride
+/// `queue.snapshot` unchanged, flattened beside `rank`, without a
+/// schema-version bump.
+#[test]
+fn plan_fields_ride_the_snapshot_at_version_11() {
+    use crate::types::{
+        DispatchPlanContext, PlanGate, PlanKey, PlanSlots, PlanState, RepoCapView, RowPlan,
+    };
+    let mut r = row(1, PUBLIC_ROOT, 5, Qd::DeferredRepoCap, None);
+    r.plan = RowPlan {
+        position: Some(3),
+        plan_state: PlanState::Queued,
+        keys: vec![PlanKey {
+            name: "workspace_priority".into(),
+            value: serde_json::json!(100),
+        }],
+        gate: Some(PlanGate::RepoCap),
+        in_slice: Some(true),
+        hot: Some(true),
+        owning_shard: Some(1),
+        repo_cap: Some(RepoCapView {
+            cap: Some(1),
+            occupancy: 1,
+        }),
+    };
+    let mut s = summary(vec![r.clone()]);
+    s.plan = Some(DispatchPlanContext {
+        slots: PlanSlots {
+            max_concurrent: 4,
+            free: Some(2),
+            ..PlanSlots::default()
+        },
+        tick_interval_secs: Some(60),
+        ..DispatchPlanContext::default()
+    });
+    let record = build_record(&s, &repos());
+    assert_eq!(record.rows[0].plan, r.plan);
+    assert_eq!(record.plan, s.plan);
+    let envelope = TelemetryEnvelope::new("host-a", TelemetryRecord::QueueSnapshot(record));
+    assert_eq!(envelope.schema_version, 11, "an additive field is not a schema bump");
+    let json = serde_json::to_value(&envelope).unwrap();
+    let row0 = &json["record"]["rows"][0];
+    assert_eq!(row0["position"], 3);
+    assert_eq!(row0["plan_state"], "queued");
+    assert_eq!(row0["gate"], "repo_cap");
+    assert_eq!(row0["repo_cap"]["cap"], 1);
+    assert_eq!(json["record"]["plan"]["slots"]["free"], 2);
+    let back: TelemetryEnvelope = serde_json::from_value(json).unwrap();
+    assert_eq!(back, envelope);
+}
+
+/// A pre-#9288 row (no plan fields) still decodes, with the plan defaulted.
+#[test]
+fn a_row_without_plan_fields_decodes_with_defaults() {
+    let row: QueueSnapshotRow = serde_json::from_value(serde_json::json!({
+        "rank": 1, "repo": "o/r", "issue": 1, "workspace_priority": 100,
+        "urgent": false, "disposition": "dispatched", "state": "running",
+        "reason": "dispatched this tick"
+    }))
+    .unwrap();
+    assert_eq!(row.plan, crate::types::RowPlan::default());
 }

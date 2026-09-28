@@ -167,36 +167,74 @@ pub const RESTAMP_PATHS: &[&str] = &[
     ".loom/install-metadata.json",
 ];
 
-/// Discount the version restamp from `D`.
+/// The one path whose *install-bookkeeping* fields a resync rewrites without
+/// touching `VERSION` — see [`strip_validated_restamps`].
+pub const INSTALL_METADATA: &str = ".loom/install-metadata.json";
+
+/// Discount the two machine-written restamps from `D`: the release version
+/// bump, and the `chore: resync installed Loom surfaces` metadata stamp.
 ///
-/// `main` bumps `VERSION` on nearly every merge, so without this the base-move
-/// diff is never empty and the input-scoped predicate degenerates back to "any
-/// move is stale". The discount is deliberately narrow, because a version file
-/// is also where a real dependency bump lands:
+/// `main` bumps `VERSION` on nearly every merge and lands ~15 resync commits a
+/// day, so without this the base-move diff is never empty and the input-scoped
+/// predicate degenerates back to "any move is stale". Both discounts are
+/// deliberately narrow, because a version file is also where a real dependency
+/// bump lands:
+///
+/// **The version restamp** (#8919):
 ///
 /// - `VERSION` itself must be in the diff, and must **strictly increase**
 ///   (a decrease is not a restamp; it is somebody rewriting history).
 /// - Only the paths in [`RESTAMP_PATHS`] are candidates.
 /// - A candidate is discounted only if **every** changed line in its patch is a
 ///   version-value line: a removed line carrying `VERSION@B`, or an added line
-///   carrying `VERSION@tip`. A `loom_commit` hex line counts too, but **only**
-///   in `.loom/install-metadata.json`.
+///   carrying `VERSION@tip`.
 /// - A missing patch, a status other than `modified`, or one stray line makes
 ///   the file a real change. So a `Cargo.lock` dependency bump — whose changed
 ///   lines carry some *other* package's version — is never mistaken for one.
 ///
-/// Returns the surviving files (`D` proper). On any failure to establish the
-/// version pair, NOTHING is discounted: the fail-closed direction.
+/// **The resync restamp** (#9065): [`INSTALL_METADATA`] may additionally carry
+/// [`is_resync_field_line`] lines — the `loom_commit` / `last_resync` /
+/// `loom_source_remote` fields `resync-installed.sh`'s `restamp_metadata()`
+/// rewrites — and, unlike every other candidate, needs **no** `VERSION` pair to
+/// be discounted, because a resync commit does not bump the version. Every
+/// resync commit on `main` in the 24 h before #9065 was measured touched that
+/// file and nothing else, so this is what makes them stop staling open PRs.
+/// Each field is pinned to its own *shape* (hex sha, ISO date, git remote URL),
+/// so an arbitrary string edit to one of those keys is still a real change, and
+/// a changed `loom_version` line still needs the validated pair. None of the
+/// three is an input to any spec in [`super::inputs`] — the only required gate
+/// that reads the file at all is the conflict-marker scan over `**`, and no
+/// conflict marker has any of those shapes.
+///
+/// **Input-scoping is preserved.** The discount is per FILE, never per commit:
+/// a resync that also rewrote an installed surface (`.loom/scripts/*.sh`,
+/// `.loom/docs/*.md`, …) leaves those paths in `D`, where the ordinary clauses
+/// judge them exactly as before.
+///
+/// Returns the surviving files (`D` proper). On any failure to establish a
+/// discount, NOTHING is discounted: the fail-closed direction.
 #[must_use]
 pub fn strip_validated_restamps(files: &[ChangedFile]) -> Vec<ChangedFile> {
-    let Some((old, new)) = version_pair(files) else {
-        return files.to_vec();
-    };
+    let pair = version_pair(files);
     files
         .iter()
-        .filter(|f| !is_pure_restamp(f, &old, &new))
+        .filter(|f| !is_discountable(f, pair.as_ref()))
         .cloned()
         .collect()
+}
+
+/// Is this file a pure machine restamp — of the version, of the resync
+/// metadata, or of both at once?
+fn is_discountable(f: &ChangedFile, pair: Option<&(String, String)>) -> bool {
+    if f.path == INSTALL_METADATA {
+        return is_pure_metadata_restamp(f, pair);
+    }
+    match pair {
+        Some((old, new)) => is_pure_restamp(f, old, new),
+        // Every other candidate exists only because the release bump rewrites
+        // it; with no validated pair there is nothing to recognise it by.
+        None => false,
+    }
 }
 
 /// `(VERSION@B, VERSION@tip)` when the diff carries a single, strictly
@@ -255,39 +293,99 @@ fn changed_lines(patch: &str) -> (Vec<String>, Vec<String>) {
     (removed, added)
 }
 
+/// The `-`/`+` lines of a candidate's patch, or `None` when there is no patch
+/// to read, the change is not an in-place edit, or nothing changed.
+fn restamp_lines(f: &ChangedFile) -> Option<(Vec<String>, Vec<String>)> {
+    if f.status != "modified" {
+        return None;
+    }
+    // A suppressed patch is an unknown, and unknowns are real changes.
+    let (removed, added) = changed_lines(f.patch.as_deref()?);
+    (!removed.is_empty() || !added.is_empty()).then_some((removed, added))
+}
+
 /// Is every changed line of this file's patch a version-value line for the
 /// validated `old` → `new` pair?
 fn is_pure_restamp(f: &ChangedFile, old: &str, new: &str) -> bool {
-    if !RESTAMP_PATHS.contains(&f.path.as_str()) || f.status != "modified" {
+    if !RESTAMP_PATHS.contains(&f.path.as_str()) {
         return false;
     }
-    let Some(patch) = f.patch.as_deref() else {
-        return false; // A suppressed patch is an unknown, and unknowns are real.
+    let Some((removed, added)) = restamp_lines(f) else {
+        return false;
     };
-    let (removed, added) = changed_lines(patch);
-    if removed.is_empty() && added.is_empty() {
-        return false;
-    }
-    let commit_ok = f.path == ".loom/install-metadata.json";
-    removed
-        .iter()
-        .all(|l| l.contains(old) || (commit_ok && is_loom_commit_line(l)))
-        && added
-            .iter()
-            .all(|l| l.contains(new) || (commit_ok && is_loom_commit_line(l)))
+    removed.iter().all(|l| l.contains(old)) && added.iter().all(|l| l.contains(new))
 }
 
-/// `"loom_commit": "<hex>"` — the install-metadata field a resync rewrites
-/// alongside the version, and the only non-version line a restamp may carry.
+/// [`INSTALL_METADATA`]'s own rule (#9065): every changed line must be either a
+/// resync field line — which needs no version pair, because a resync commit
+/// does not bump the version — or, when a validated pair exists, a value line
+/// for it.
+fn is_pure_metadata_restamp(f: &ChangedFile, pair: Option<&(String, String)>) -> bool {
+    let Some((removed, added)) = restamp_lines(f) else {
+        return false;
+    };
+    let (old, new) = match pair {
+        Some((o, n)) => (o.as_str(), n.as_str()),
+        None => ("", ""),
+    };
+    let version_line = |l: &String, v: &str| !v.is_empty() && l.contains(v);
+    removed
+        .iter()
+        .all(|l| is_resync_field_line(l) || version_line(l, old))
+        && added
+            .iter()
+            .all(|l| is_resync_field_line(l) || version_line(l, new))
+}
+
+/// A line rewriting one of the install-metadata fields
+/// `resync-installed.sh`'s `restamp_metadata()` writes on every run —
+/// `loom_commit`, `last_resync`, `loom_source_remote` — and the only
+/// non-version lines a restamp may carry. Each is pinned to its VALUE SHAPE,
+/// so an arbitrary string edit to one of those keys is still a real change.
+fn is_resync_field_line(line: &str) -> bool {
+    is_loom_commit_line(line) || is_last_resync_line(line) || is_source_remote_line(line)
+}
+
+/// `"loom_commit": "<hex>"`.
 fn is_loom_commit_line(line: &str) -> bool {
-    let Some(rest) = line.split("\"loom_commit\"").nth(1) else {
+    let Some(value) = json_field_value(line, "loom_commit") else {
         return false;
     };
-    let Some(rest) = rest.split_once(':') else {
-        return false;
-    };
-    let value = rest.1.trim().trim_end_matches(',').trim_matches('"');
     value.len() >= 7 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// `"last_resync": "YYYY-MM-DD"` — the date `resync-installed.sh` stamps on
+/// every run.
+fn is_last_resync_line(line: &str) -> bool {
+    let Some(value) = json_field_value(line, "last_resync") else {
+        return false;
+    };
+    let parts: Vec<&str> = value.split('-').collect();
+    parts.len() == 3
+        && parts[0].len() == 4
+        && parts[1].len() == 2
+        && parts[2].len() == 2
+        && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// `"loom_source_remote": "<git remote URL>"` — re-read from whichever clone
+/// ran the resync, so it flips between the SSH and HTTPS spellings of the same
+/// repository as the fleet's hosts take turns. Pinned to a git remote URL
+/// shape; nothing reads this field as a check input.
+fn is_source_remote_line(line: &str) -> bool {
+    let Some(value) = json_field_value(line, "loom_source_remote") else {
+        return false;
+    };
+    (value.starts_with("https://") || value.starts_with("http://") || value.starts_with("git@"))
+        && value.ends_with(".git")
+}
+
+/// The unquoted value of `"<key>": …` on a JSON line, or `None` when the line
+/// does not carry that key.
+fn json_field_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let rest = line.split(&format!("\"{key}\"")).nth(1)?;
+    let (_, value) = rest.split_once(':')?;
+    Some(value.trim().trim_end_matches(',').trim_matches('"'))
 }
 
 #[cfg(test)]

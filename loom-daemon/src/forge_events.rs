@@ -679,11 +679,20 @@ pub fn register_global_status(status: Arc<FeedStatus>) {
 
 /// This process's feed status — **always** an answer, never silence.
 /// Unregistered ⇒ [`ForgeEventsStatus::disabled`].
+///
+/// The Phase 2 wake counters ([`wake::armed_snapshot`]) are attached here
+/// rather than stored on [`FeedStatus`] because they are owned by the consumer
+/// *loops*, which are armed independently of whether this host polls a feed at
+/// all: an operator who armed a consumer but never provisioned the feed gets a
+/// `disabled` state carrying a zero-prompt wake entry, which is the honest
+/// pairing.
 #[must_use]
 pub fn global_status() -> ForgeEventsStatus {
-    GLOBAL_STATUS
+    let mut status = GLOBAL_STATUS
         .get()
-        .map_or_else(ForgeEventsStatus::disabled, |status| status.snapshot())
+        .map_or_else(ForgeEventsStatus::disabled, |status| status.snapshot());
+    status.wakes = wake::armed_snapshot();
+    status
 }
 
 // ============================================================================

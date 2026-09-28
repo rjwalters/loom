@@ -1795,24 +1795,20 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
         crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
     let gh_bin = std::path::PathBuf::from("gh");
-    let mut total_checked = 0usize;
-    let mut total_reclaimed = 0usize;
-    let mut total_pr_checked = 0usize;
-    let mut total_pr_reclaimed = 0usize;
-    let mut verdict_stats = VerdictReconcileStats::default();
     let pass_kind = if is_startup { "startup" } else { "periodic" };
-    for root in &roots {
-        let (checked, reclaimed) = forge::reconcile_workspace(&gh_bin, root, is_startup);
-        total_checked += checked;
-        total_reclaimed += reclaimed;
-        let (pr_checked, pr_reclaimed) = forge::reconcile_pr_claims(&gh_bin, root);
-        total_pr_checked += pr_checked;
-        total_pr_reclaimed += pr_reclaimed;
-        verdict_stats.merge(forge::reconcile_pr_verdicts(&gh_bin, root));
-        // #8922: AFTER the verdict pass, so a verdict it just re-queued to
-        // `loom:review-requested` is checked for base conflicts on this tick.
-        review_conflict::reconcile_review_conflicts(&gh_bin, root);
-    }
+    let pass_loop::ReconciliationPassStats {
+        total_checked,
+        total_reclaimed,
+        total_pr_checked,
+        total_pr_reclaimed,
+        verdict_stats,
+        roots_processed: _,
+    } = pass_loop::run_reconciliation_pass_over_roots(
+        &roots,
+        &gh_bin,
+        is_startup,
+        crate::rate_limit_breaker::global_is_suppressed,
+    );
     if total_reclaimed > 0 {
         log::info!(
             "claim_reconciliation: {pass_kind} pass checked {total_checked} loom:building \
@@ -1888,17 +1884,20 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
 /// thread (`tokio::task::spawn_blocking`), mirroring
 /// [`crate::token_ranking_refresh::spawn_multi_token_ranking_refresh_task`].
 ///
-/// **Queue-head wake (#8766).** This pass is the daemon's head-mover: a
-/// `loom:building` claim whose sweep is gone is exactly what holds the
-/// dispatch queue's head, and this loop is what releases it. `event_bus` lets
-/// a `forge.event` prompt of a queue-relevant shape (a comment on a claimed
-/// issue, a PR reaching terminal state) run the *next ordinary pass now*
+/// **Claim-reconcile wake (#8766, renamed in #8995).** A `loom:building` claim
+/// whose sweep is gone is what *holds* the dispatch queue's head, and this loop
+/// is what releases it — but releasing it does not by itself move the head, so
+/// this is not the head-mover: the work finder still has to tick before the
+/// freed issue is dispatched, which is why the flag names this pass rather than
+/// that effect. `event_bus` lets a `forge.event` prompt of a claim-relevant
+/// shape (a comment on a claimed issue, a PR reaching terminal state) run the
+/// *next ordinary pass now*
 /// instead of at the multi-minute cadence above — and nothing else. The pass
 /// body is untouched: it re-lists `loom:building` issues and re-decides from
 /// the same host-scoped evidence and the same lease gate it always did, so an
 /// early tick can only change *when* that happens. Disabled unless
-/// `forgeEvents.events.queueHeadWake` is on for `fallback_root`, in which case
-/// the ticker holds no bus subscription at all.
+/// `forgeEvents.events.claimReconcileWake` is on for `fallback_root`;
+/// otherwise the ticker holds no bus subscription at all.
 pub fn spawn_periodic_reconciliation_task(
     fallback_root: std::path::PathBuf,
     event_bus: std::sync::Arc<crate::event_bus::EventBus>,
@@ -1912,10 +1911,11 @@ pub fn spawn_periodic_reconciliation_task(
         interval.as_secs()
     );
     tokio::spawn(async move {
-        // An `Interval` a queue-relevant `forge.event` prompt may also tick
-        // early (#8766). Disarmed unless `forgeEvents.events.queueHeadWake` is
-        // on, in which case it is exactly `tokio::time::interval(interval)`.
-        let mut ticker = crate::forge_events::wake::EarlyTicker::for_queue_head(
+        // An `Interval` a claim-relevant `forge.event` prompt may also tick
+        // early (#8766). Disarmed unless
+        // `forgeEvents.events.claimReconcileWake` is on; otherwise it is
+        // exactly `tokio::time::interval(interval)`.
+        let mut ticker = crate::forge_events::wake::EarlyTicker::for_claim_reconcile(
             interval,
             &event_bus,
             &fallback_root,
@@ -1958,6 +1958,16 @@ mod auto_merge_disarm;
 /// [`forge::reconcile_pr_verdicts`].
 pub mod review_conflict;
 
+/// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
+/// rate-limit-breaker re-check that stops it early — a sibling file per the
+/// file-size ratchet rather than more inline logic here.
+mod pass_loop;
+
+/// The ETag-cached `loom:building` listing [`forge`] reconciles against — a
+/// sibling file per the file-size ratchet, attributed to `claim_reconciliation`
+/// in the #9251 forge-call accounting.
+mod building_listing;
+
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::work_finder::forge`] / [`crate::epic_supervisor::forge`]) — the
 /// decision logic above is the fully-covered surface; this module is a thin,
@@ -1967,10 +1977,10 @@ pub mod forge {
         apply_live_claim_veto, classify_lease_evidence, decide_anchor, decide_verdict,
         extract_latest_verdict_sha, most_recent_claim_activity_at, plan, plan_pr,
         resolve_lease_ttl_minutes, resolve_no_progress_grace_minutes, resolve_stale_hours,
-        verdict_anchoring_enabled, verdict_staleness_enabled, AnchorAction, BuildingIssue,
-        ClaimedPr, LeaseEvidence, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrComment,
-        PrReclaimReason, PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction,
-        VerdictKeepReason, VerdictKind, VerdictPr, VerdictReconcileStats, LEASE_MARKER_PREFIX,
+        verdict_anchoring_enabled, verdict_staleness_enabled, AnchorAction, ClaimedPr,
+        LeaseEvidence, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrComment, PrReclaimReason,
+        PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction, VerdictKeepReason,
+        VerdictKind, VerdictPr, VerdictReconcileStats, LEASE_MARKER_PREFIX,
         MAX_ISSUES_PER_WORKSPACE, VERDICT_HOLD_LABELS,
     };
     use crate::sweep_journal;
@@ -1980,30 +1990,7 @@ pub mod forge {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    fn list_building_issues(gh_bin: &Path, root: &Path) -> Result<Vec<BuildingIssue>> {
-        // ETag-cached REST listing (#4428): an unchanged claim set costs zero
-        // rate limit (304). `LOOM_REPO` precedence is handled inside; the
-        // `pull_request` filter keeps the pre-#4428 issue-only semantics.
-        let rows = crate::forge_listing::list_issues_cached(
-            gh_bin,
-            Some(root),
-            None,
-            "loom:building",
-            "open",
-        )?;
-        Ok(rows
-            .into_iter()
-            .filter(|r| !r.is_pull_request)
-            .map(|r| BuildingIssue {
-                number: r.number,
-                updated_at: r
-                    .updated_at
-                    .as_deref()
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc)),
-            })
-            .collect())
-    }
+    use super::building_listing::list_building_issues;
 
     /// Does an OPEN pull request exist for issue `issue`'s conventional branch
     /// (`feature/issue-<N>`, the name `worktree.sh` establishes)? Returns
@@ -3421,6 +3408,23 @@ pub mod forge {
                         &e.to_string(),
                         "claim_reconciliation",
                     );
+                    // #8953: if THAT failure was the rate-limit signature that
+                    // just tripped the shared breaker, the next `VerdictKind`'s
+                    // `gh pr list` in this same loop is a doomed call against an
+                    // already-exhausted quota. Stop the remaining verdict labels
+                    // for this root rather than `continue`-ing into them — the
+                    // same "protect the rest of the current pass, not just the
+                    // next one" shape `run_reconciliation_pass_over_roots`
+                    // applies one level up, at per-root granularity.
+                    if crate::rate_limit_breaker::global_is_suppressed() {
+                        log::info!(
+                            "claim_reconciliation (verdicts): {}: stopping remaining verdict \
+                             labels for this root — shared GitHub API rate limit exhausted \
+                             (#8953)",
+                            root.display()
+                        );
+                        break;
+                    }
                     continue;
                 }
             };

@@ -276,16 +276,74 @@ fn parse_window(value: &serde_json::Value, observed_at: DateTime<Utc>) -> Option
         .or_else(|| {
             // Some vintages report the absolute instant instead of a
             // countdown. Accept either; never synthesize one from the other.
-            map.get("resets_at")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-                .map(|dt| dt.with_timezone(&Utc))
+            // codex-cli 0.156 writes it as an integer epoch (seconds), older
+            // ones as an RFC 3339 string (#8963).
+            map.get("resets_at").and_then(|raw| match raw {
+                serde_json::Value::String(text) => DateTime::parse_from_rfc3339(text)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc)),
+                other => other.as_i64().and_then(epoch_to_datetime),
+            })
         });
     Some(RateLimitWindow {
         used_fraction: (used_percent / 100.0).min(1.0),
         window_minutes,
         resets_at,
     })
+}
+
+/// An epoch reset instant, in seconds — or milliseconds, which some producers
+/// emit (a value past the year-5138 second boundary cannot be seconds).
+pub(crate) fn epoch_to_datetime(raw: i64) -> Option<DateTime<Utc>> {
+    let secs = if raw > 100_000_000_000 {
+        raw / 1000
+    } else {
+        raw
+    };
+    Utc.timestamp_opt(secs, 0).single()
+}
+
+/// Windows at or under this length are the short (~5h) bucket; longer ones
+/// are the long (~weekly) bucket.
+const SHORT_WINDOW_MAX_MINUTES: u64 = 6 * 60;
+
+/// File two parsed windows into the short (`primary`) and long (`secondary`)
+/// slots **by their own `window_minutes`**, not by which slot the CLI wrote
+/// them in (#8963). codex-cli 0.156 reports the *weekly* window as `primary`
+/// with `secondary: null`; reading the slot as the kind reported weekly usage
+/// as 5h usage and a weekly ceiling as `rate_limited` instead of `exhausted`.
+/// A window with no stated length keeps its slot — nothing better is known.
+#[must_use]
+pub fn slot_by_duration(
+    first: Option<RateLimitWindow>,
+    second: Option<RateLimitWindow>,
+) -> (Option<RateLimitWindow>, Option<RateLimitWindow>) {
+    let is_long = |w: &RateLimitWindow| {
+        w.window_minutes
+            .is_some_and(|m| m > SHORT_WINDOW_MAX_MINUTES)
+    };
+    let is_short = |w: &RateLimitWindow| {
+        w.window_minutes
+            .is_some_and(|m| m <= SHORT_WINDOW_MAX_MINUTES)
+    };
+    let (mut short, mut long) = (None, None);
+    for (window, positional_long) in [(first, false), (second, true)] {
+        let Some(window) = window else { continue };
+        let goes_long = if is_long(&window) {
+            true
+        } else if is_short(&window) {
+            false
+        } else {
+            positional_long
+        };
+        // Two windows of one kind: keep the more consumed, so a duplicate can
+        // never understate usage.
+        let slot = if goes_long { &mut long } else { &mut short };
+        if slot.is_none_or(|kept: RateLimitWindow| window.used_fraction > kept.used_fraction) {
+            *slot = Some(window);
+        }
+    }
+    (short, long)
 }
 
 /// A rollout line's own timestamp, when it carries one.
@@ -331,6 +389,7 @@ pub fn extract_usage_snapshot(
         if primary.is_none() && secondary.is_none() {
             continue;
         }
+        let (primary, secondary) = slot_by_duration(primary, secondary);
         return Some(UsageSnapshot {
             observed_at,
             primary,
@@ -340,13 +399,13 @@ pub fn extract_usage_snapshot(
     None
 }
 
-/// The newest `rollout-*.jsonl` under `<profile>/sessions/`, as
-/// `(path, mtime)`.
-fn newest_rollout_log(profile: &Path) -> Option<(PathBuf, DateTime<Utc>)> {
+/// Every `rollout-*.jsonl` under `<profile>/sessions/`, newest first, as
+/// `(path, mtime)`. The walk is bounded by depth and entry count, like before.
+fn rollout_logs_newest_first(profile: &Path) -> Vec<(PathBuf, DateTime<Utc>)> {
     let sessions = profile.join("sessions");
     let mut stack = vec![(sessions, 0usize)];
     let mut visited = 0usize;
-    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    let mut found: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     while let Some((dir, depth)) = stack.pop() {
         if depth > MAX_WALK_DEPTH || visited >= MAX_WALK_ENTRIES {
             continue;
@@ -375,12 +434,14 @@ fn newest_rollout_log(profile: &Path) -> Option<(PathBuf, DateTime<Utc>)> {
             let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
                 continue;
             };
-            if best.as_ref().is_none_or(|(_, best_at)| modified > *best_at) {
-                best = Some((path, modified));
-            }
+            found.push((path, modified));
         }
     }
-    best.map(|(path, modified)| (path, system_time_to_utc(modified)))
+    found.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+    found
+        .into_iter()
+        .map(|(path, modified)| (path, system_time_to_utc(modified)))
+        .collect()
 }
 
 fn system_time_to_utc(at: std::time::SystemTime) -> DateTime<Utc> {
@@ -415,10 +476,19 @@ fn read_tail(path: &Path) -> Option<String> {
 /// `None` when the profile carries no usable one.
 #[must_use]
 pub fn latest_usage_snapshot(profile: &Path) -> Option<UsageSnapshot> {
-    let (path, mtime) = newest_rollout_log(profile)?;
-    let text = read_tail(&path)?;
-    extract_usage_snapshot(&text, mtime)
+    // The newest session often carries no `rate_limits` line at all (it ended
+    // before its first model turn), which used to hide every older snapshot
+    // (#8963). Walk newest-first until a file yields a reading.
+    rollout_logs_newest_first(profile)
+        .into_iter()
+        .take(MAX_ROLLOUT_FILES_EXAMINED)
+        .find_map(|(path, mtime)| {
+            read_tail(&path).and_then(|text| extract_usage_snapshot(&text, mtime))
+        })
 }
+
+/// How many rollout files, newest first, `latest_usage_snapshot` examines.
+const MAX_ROLLOUT_FILES_EXAMINED: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Assessment
@@ -559,6 +629,9 @@ pub struct CheckOptions {
     /// selection already consults it. Off by default so a bare
     /// `accounts check` is a pure read.
     pub write_ranking: bool,
+    /// Measure live via `codex app-server` ([`super::codex_probe`]) instead of
+    /// reading rollout snapshots (`accounts check --live`, #9233).
+    pub live: bool,
 }
 
 /// Probe every Codex account in `workspace`'s inventory.
@@ -571,16 +644,44 @@ pub fn run_check(
     options: CheckOptions,
     now: DateTime<Utc>,
 ) -> Result<(ProbeReport, CheckEffects)> {
+    run_check_with(workspace, options, now, &super::codex_probe::ProcessProbeTransport)
+}
+
+/// [`run_check`] with an injectable live transport, so tests can drive the
+/// `--live` path without spawning `codex` or `docker`.
+pub fn run_check_with<T: super::codex_probe::ProbeTransport + ?Sized>(
+    workspace: &Path,
+    options: CheckOptions,
+    now: DateTime<Utc>,
+    transport: &T,
+) -> Result<(ProbeReport, CheckEffects)> {
     let inventory = super::account_registry::account_inventory(workspace, AccountProvider::Codex)?;
     let mut rows = Vec::with_capacity(inventory.len());
     let mut snapshots = Vec::with_capacity(inventory.len());
     for account in &inventory {
         let stored = health::account_health(workspace, &account.id)?;
-        let snapshot = account
-            .enabled
-            .then(|| latest_usage_snapshot(&account.credential_reference))
-            .flatten();
-        rows.push(assess_account(account, stored.as_ref(), snapshot.as_ref(), now));
+        let (snapshot, probe_detail) = if !account.enabled {
+            (None, None)
+        } else if options.live {
+            match super::codex_probe::probe_account(
+                transport,
+                account.id.name.as_str(),
+                &account.credential_reference,
+                now,
+            ) {
+                super::codex_probe::ProbeOutcome::Measured(snapshot) => (Some(snapshot), None),
+                other => (None, other.detail()),
+            }
+        } else {
+            (latest_usage_snapshot(&account.credential_reference), None)
+        };
+        let mut row = assess_account(account, stored.as_ref(), snapshot.as_ref(), now);
+        // A live probe that measured nothing says *why* (not logged in, no
+        // session container, ...) instead of the snapshot-only detail.
+        if let (Some(detail), true) = (probe_detail, row.status == STATUS_UNKNOWN) {
+            row.error = Some(detail.to_string());
+        }
+        rows.push(row);
         snapshots.push(snapshot);
     }
     let report = check::build_report(rows);
@@ -668,6 +769,14 @@ fn apply_health_feedback(
 /// labels.
 #[must_use]
 pub fn format_table(report: &ProbeReport) -> String {
+    format_table_for(report, false)
+}
+
+/// [`format_table`], with the `unknown` footnote matched to the source: a live
+/// probe's `unknown` is never "no rollout snapshot", and its row detail
+/// already names the reason (`not_logged_in`, `session_unavailable`, ...).
+#[must_use]
+pub fn format_table_for(report: &ProbeReport, live: bool) -> String {
     let mut lines = vec![
         format!("Codex account availability (probed at {})", report.ranked_at),
         "=".repeat(84),
@@ -715,7 +824,15 @@ pub fn format_table(report: &ProbeReport) -> String {
     // Issue #8539: an all-dashes row is now `unknown`, and the one question an
     // operator asks next — "why does it not know?" — is answered here rather
     // than left to be inferred from a table of dashes.
-    if counts.contains_key(STATUS_UNKNOWN) {
+    if counts.contains_key(STATUS_UNKNOWN) && live {
+        lines.push(format!(
+            "`{STATUS_UNKNOWN}` = the live probe measured nothing for that account; the detail \
+             names why. `not_logged_in` → `loom-daemon accounts reauth --device-auth codex <name>`; \
+             `session_unavailable` → its session container is not running \
+             (`loom-daemon accounts session start <name>`); it is never probed host-directly. \
+             It is NOT a health claim."
+        ));
+    } else if counts.contains_key(STATUS_UNKNOWN) {
         lines.push(format!(
             "`{STATUS_UNKNOWN}` = no live rate-limit snapshot in that profile's own \
              `sessions/rollout-*.jsonl`; it is NOT a health claim. One `codex exec` turn on the \

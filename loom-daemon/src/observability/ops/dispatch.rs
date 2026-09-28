@@ -9,11 +9,16 @@
 //! [`record_tick`] is the only side effect, and it returns before building
 //! anything when no ops sink is registered.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
 use chrono::{DateTime, Utc};
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
+use crate::telemetry::queue_snapshot::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
-use crate::work_finder::TickReport;
+use crate::work_finder::{Admission, TickReport};
 
 /// Every `reason` label value, paired with its [`TickReport`] counter. Zero
 /// counters are not emitted. `error` counts failed dispatches and failed
@@ -24,7 +29,7 @@ use crate::work_finder::TickReport;
 /// `claim_collision`, `claim_lock_held`), so their parents are reported net of
 /// them: every candidate lands in exactly one reason.
 #[must_use]
-pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 23] {
+pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 25] {
     let classified_errors =
         report.refused_token_selection + report.refused_claim_collision + report.refused_claim_lock;
     [
@@ -47,10 +52,12 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 23] {
         ("prless_retry", report.skipped_prless_retry),
         ("recheck_interval", report.skipped_recheck_interval),
         ("host_constraint", report.skipped_host_constraint),
+        ("host_class", report.skipped_host_class),
         ("capacity", report.deferred_capacity),
         ("ramp_cap", report.deferred_ramp_cap),
         ("saturation", report.deferred_saturation),
         ("out_of_slice", report.deferred_out_of_slice),
+        ("repo_cap", report.deferred_repo_cap),
         ("error", report.errors.saturating_sub(classified_errors)),
         // Typed dispatch refusals (Issue #8907) — one contiguous block.
         ("lease_order_lost", report.refused_lease_order),
@@ -110,7 +117,8 @@ pub fn tick_points(report: &TickReport, max_concurrent: usize) -> Vec<MetricPoin
     points
 }
 
-/// The tick's span: a fresh sampled root trace covering `started_at..ended_at`.
+/// The tick's span: its own sampled root trace covering `started_at..ended_at`,
+/// its ID derived from the tick's start instant.
 #[must_use]
 pub fn tick_span(
     report: &TickReport,
@@ -129,8 +137,13 @@ pub fn tick_span(
     .into_iter()
     .map(|(key, value)| (key.to_string(), value))
     .collect();
+    let mut attributes = attributes;
+    crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
-        context: TraceContext::root(true),
+        context: TraceContext::derived(
+            SpanName::DispatchTick.as_str(),
+            &[&crate::telemetry::trace::instant(started_at)],
+        ),
         parent_span_id: None,
         name: SpanName::DispatchTick,
         started_at,
@@ -149,15 +162,22 @@ pub fn tick_span(
 /// One `loom.dispatch.admission` child span per `dispatch()` attempt the
 /// tick made (Issue #8907), parented to `tick` (the tick's own span) and
 /// clamped inside it. Attributes: `loom.issue`, `loom.dispatch.admission_result`
-/// and `loom.dispatch.reason` (the `loom.dispatch.decisions` reason).
+/// and `loom.dispatch.reason` (the `loom.dispatch.decisions` reason), plus
+/// `loom.repo`/`loom.repo.visibility` (Issue #9222) when `repo_refs` has an
+/// entry for the admission's `workspace_idx` — omitted, never a local path,
+/// when it does not.
 #[must_use]
-pub fn admission_spans(report: &TickReport, tick: &SpanRecord) -> Vec<SpanRecord> {
+pub fn admission_spans(
+    report: &TickReport,
+    tick: &SpanRecord,
+    repo_refs: &HashMap<usize, QueueRepoRef>,
+) -> Vec<SpanRecord> {
     report
         .admissions
         .iter()
         .map(|admission| {
             let started_at = admission.started_at.clamp(tick.started_at, tick.ended_at);
-            let attributes: TraceAttributes = [
+            let mut attributes: TraceAttributes = [
                 ("loom.issue", admission.issue.to_string()),
                 ("loom.dispatch.admission_result", admission.result.to_string()),
                 ("loom.dispatch.reason", admission.reason.to_string()),
@@ -165,8 +185,20 @@ pub fn admission_spans(report: &TickReport, tick: &SpanRecord) -> Vec<SpanRecord
             .into_iter()
             .map(|(key, value)| (key.to_string(), value))
             .collect();
+            if let Some(repo_ref) = repo_refs.get(&admission.workspace_idx) {
+                attributes.insert("loom.repo".to_string(), repo_ref.repo.clone());
+                attributes.insert(
+                    "loom.repo.visibility".to_string(),
+                    visibility_str(repo_ref.visibility).to_string(),
+                );
+            }
+            crate::telemetry::trace::provenance::stamp(&mut attributes);
             SpanRecord {
-                context: tick.context.child(),
+                context: tick.context.derived_child(&[
+                    SpanName::DispatchAdmission.as_str(),
+                    &admission.issue.to_string(),
+                    &crate::telemetry::trace::instant(started_at),
+                ]),
                 parent_span_id: Some(tick.context.span_id.clone()),
                 name: SpanName::DispatchAdmission,
                 started_at,
@@ -184,17 +216,91 @@ pub fn admission_spans(report: &TickReport, tick: &SpanRecord) -> Vec<SpanRecord
         .collect()
 }
 
+/// UCUM-free wire text for a repo visibility tag (mirrors the private
+/// `visibility_str` helpers in `otlp::mapping` and `ci_telemetry::records` —
+/// each ops-adjacent module keeps its own copy rather than sharing one across
+/// unrelated call graphs).
+fn visibility_str(visibility: crate::telemetry::RepoVisibility) -> &'static str {
+    match visibility {
+        crate::telemetry::RepoVisibility::Public => "public",
+        crate::telemetry::RepoVisibility::Private => "private",
+    }
+}
+
+/// The workspace roots referenced by `admissions`, resolved through the
+/// synchronous [`super::super::repo_ref::cached_repo_ref`] cache the collector
+/// populates on its own cadence (Issue #9222). Never shells out itself — a
+/// root not yet resolved this process is simply absent from the map, which
+/// [`admission_spans`] reads as "omit `loom.repo`".
+fn resolved_repo_refs(admissions: &[Admission], roots: &[PathBuf]) -> HashMap<usize, QueueRepoRef> {
+    let mut resolved = HashMap::new();
+    for admission in admissions {
+        if resolved.contains_key(&admission.workspace_idx) {
+            continue;
+        }
+        let Some(root) = roots.get(admission.workspace_idx) else {
+            continue;
+        };
+        if let Some(repo_ref) = super::super::repo_ref::cached_repo_ref(&root.display().to_string())
+        {
+            resolved.insert(admission.workspace_idx, repo_ref);
+        }
+    }
+    resolved
+}
+
+/// A tick's completion instant paired with its trace context.
+type TickContext = (DateTime<Utc>, TraceContext);
+
+/// The most recently recorded tick's completion instant and trace context, so
+/// `ops::disposition` (Issue #9222) can parent its spans to the same tick when
+/// its summary's `at` matches, and emit roots otherwise (a restart, or a
+/// sample that lands between two ticks). Read via [`last_tick_context`],
+/// written only by [`record_tick`].
+static LAST_TICK: OnceLock<Mutex<Option<TickContext>>> = OnceLock::new();
+
+fn last_tick_slot() -> &'static Mutex<Option<TickContext>> {
+    LAST_TICK.get_or_init(|| Mutex::new(None))
+}
+
+/// The `(completed_at, trace_context)` of the most recent tick this process
+/// exported, or `None` before the first one.
+#[must_use]
+pub fn last_tick_context() -> Option<TickContext> {
+    last_tick_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// Export one completed tick: its span, one admission span per dispatch
 /// attempt, and its metric points. Returns immediately when no ops sink is
-/// registered (observability off, or no OTLP exporter).
-pub fn record_tick(report: &TickReport, max_concurrent: usize, started_at: DateTime<Utc>) {
+/// registered (observability off, or no OTLP exporter). `completed_at` is the
+/// same instant the work-finder's `publish_tick` stamps on the tick's
+/// [`crate::types::WorkFinderTickSummary::at`], so `ops::disposition` can tell
+/// whether a later sample's summary is this exact tick (see
+/// [`last_tick_context`]). `roots` names each admission's workspace (Issue
+/// #9222); empty for the single-workspace loop, exactly like every other
+/// `roots` parameter in this package.
+pub fn record_tick(
+    report: &TickReport,
+    max_concurrent: usize,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    roots: &[PathBuf],
+) {
     let Some(sink) = super::global_ops_sink() else {
         return;
     };
-    let tick = tick_span(report, max_concurrent, started_at, Utc::now());
-    for span in admission_spans(report, &tick) {
+    let tick = tick_span(report, max_concurrent, started_at, completed_at);
+    let repo_refs = resolved_repo_refs(&report.admissions, roots);
+    for span in admission_spans(report, &tick, &repo_refs) {
         sink.emit_span(span);
     }
+    *last_tick_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((completed_at, tick.context.clone()));
     sink.emit_span(tick);
     sink.emit_metrics_since(tick_points(report, max_concurrent), Some(started_at));
 }

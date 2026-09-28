@@ -64,7 +64,104 @@ pub struct ResolvedRuntime {
     /// greppable in `loom-daemon logs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preference: Option<crate::runtime_preference::PreferenceStamp>,
+    /// Execution-specific capability provenance (#8787). `None` for every
+    /// ordinary admission: every requirement was met by the runtime
+    /// manifest's own native values. `Some` only when a verified
+    /// private-clone containment proof satisfied the one requirement the
+    /// manifest leaves `partial` — see [`AdmissionContext::PrivateClone`]. It
+    /// is never a statement about native hook parity, and the native values
+    /// it displaces are recorded verbatim inside it so nobody can read it as
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionProvenance>,
 }
+
+/// The capability requirement that verified private-clone containment may
+/// satisfy for one launch (#8787). It is the ONLY one: repository/filesystem
+/// isolation is exactly what an account-private, container-resident clone with
+/// no host checkout, sibling or peer repository mounted provides. Every other
+/// requirement is still checked against the runtime manifest.
+pub const CONTAINMENT_SATISFIES: &str = "worktreeIsolation";
+
+/// The launch-specific context admission runs in (#8787).
+///
+/// [`Self::Host`] is the ordinary, static admission every caller used before
+/// #8787 and still uses by default — bare-host, shared-mount and ambient
+/// Codex sessions all resolve through it, unchanged.
+/// [`Self::PrivateClone`] can only be built from a [`ContainmentProof`],
+/// which has no public constructor: it is produced by
+/// `tokens_pool::private_workspace::containment` from an owned account lease
+/// plus a re-validated container, mount topology and `loom-private-control-v1`
+/// boundary identity. Configuration parsing, inventory reads, status probes,
+/// container labels and environment variables cannot manufacture one.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum AdmissionContext<'a> {
+    #[default]
+    Host,
+    PrivateClone(&'a ContainmentProof),
+}
+
+pub use crate::tokens_pool::private_workspace::containment::ContainmentProof;
+
+/// How an execution-specific context satisfied a capability (#8787). Carried
+/// on [`ResolvedRuntime::execution`] into diagnostics, daemon logs and the
+/// private workspace's durable status record. Secret-free by construction:
+/// account NAME, short container ID, short control identity, protocol and base
+/// revision only — never a profile path's contents, a credential, or raw
+/// operator configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionProvenance {
+    /// `private-clone`.
+    pub mode: String,
+    /// The requirements satisfied by containment rather than by the manifest.
+    pub satisfied: Vec<String>,
+    /// The manifest's own (native) values for the satisfied requirements and
+    /// for `hooks`, recorded so this record can never be read as a promotion
+    /// of the static Codex capability manifest.
+    pub native: BTreeMap<String, String>,
+    /// The obligations verified for this launch, named by mechanism — see the
+    /// obligation table in `defaults/docs/guardrail-parity-codex.md`.
+    pub policy: String,
+    pub account: String,
+    /// First 12 hex digits of the bound container ID.
+    pub container: String,
+    /// First 12 hex digits of the bound `loom-private-control-v1` identity
+    /// (#8839) this admission is pinned to.
+    pub control: String,
+    pub protocol: String,
+    pub base_revision: String,
+}
+
+impl ExecutionProvenance {
+    /// One-line, greppable, secret-free rendering for logs and markers.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let native = self
+            .native
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "mode={} satisfied={} native={} policy={} account={} container={} control={} \
+             protocol={} base={}",
+            self.mode,
+            self.satisfied.join(","),
+            native,
+            self.policy,
+            self.account,
+            self.container,
+            self.control,
+            self.protocol,
+            self.base_revision
+        )
+    }
+}
+
+/// Leading tag of the containment provenance log marker (#8787), so a
+/// contained admission is greppable in `loom-daemon logs` and in a worker's
+/// own stderr with one fixed string.
+pub const CONTAINMENT_LOG_MARKER: &str = "# LOOM_RUNTIME_CONTAINMENT ";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeRejection {
@@ -95,6 +192,31 @@ impl std::error::Error for RuntimeRejection {}
 pub const EX_CONFIG: i32 = 78;
 
 impl RuntimeRejection {
+    /// Whether verified private-clone containment could even be asked about
+    /// this rejection (#8787): the runtime is Codex (the only runtime Loom
+    /// hosts private clones for) and the ONLY unmet requirement is
+    /// [`CONTAINMENT_SATISFIES`]. Any additional unmet capability, and every
+    /// structural failure (missing/non-executable adapter, missing or
+    /// malformed manifest, unknown role), is ineligible — containment never
+    /// overrides them, and asking is not the same as being granted.
+    #[must_use]
+    pub fn containment_eligible(&self) -> bool {
+        self.runtime == "codex" && self.unmet_capabilities == [CONTAINMENT_SATISFIES]
+    }
+
+    /// The same rejection, with the precise obligation private-clone
+    /// containment could not prove appended to its reason. The unmet
+    /// capability list is deliberately unchanged: the requirement is still
+    /// unmet for this launch, and the caller must keep failing closed.
+    #[must_use]
+    pub fn with_containment_failure(mut self, obligation: &str) -> Self {
+        self.reason = format!(
+            "{}; verified private-clone containment could not satisfy it: {obligation}",
+            self.reason
+        );
+        self
+    }
+
     /// Operator-facing, multi-line diagnostic naming the role/lifecycle, the
     /// runtime, the precedence tier that selected it, and the unmet capability
     /// names. Shared by every real client (`loom-daemon dispatch`, the MCP
@@ -484,7 +606,34 @@ pub fn resolve_and_admit(
     role: &str,
     explicit: Option<&str>,
 ) -> Result<ResolvedRuntime, RuntimeRejection> {
-    resolve_and_admit_with(root, role, explicit, crate::daemon_bin_resolve::resolve_daemon_bin)
+    resolve_and_admit_in(root, role, explicit, AdmissionContext::Host)
+}
+
+/// [`resolve_and_admit`] in an execution-specific context (#8787).
+///
+/// With [`AdmissionContext::Host`] it is byte-identical to
+/// [`resolve_and_admit`]. With [`AdmissionContext::PrivateClone`] the single
+/// requirement [`CONTAINMENT_SATISFIES`] is satisfied by the proof — and only
+/// for the runtime the proof is bound to — and the admission records that
+/// provenance on [`ResolvedRuntime::execution`]. Every other requirement, the
+/// adapter and manifest checks, and the whole binding precedence (so an
+/// explicit operator pin stays a pin and never falls through) are unchanged.
+///
+/// # Errors
+/// As [`resolve_and_admit`].
+pub fn resolve_and_admit_in(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+    context: AdmissionContext<'_>,
+) -> Result<ResolvedRuntime, RuntimeRejection> {
+    resolve_and_admit_with(
+        root,
+        role,
+        explicit,
+        context,
+        crate::daemon_bin_resolve::resolve_daemon_bin,
+    )
 }
 
 /// Testable core of [`resolve_and_admit`]: identical except the native
@@ -495,6 +644,7 @@ fn resolve_and_admit_with(
     root: &Path,
     role: &str,
     explicit: Option<&str>,
+    context: AdmissionContext<'_>,
     resolve_native_adapter: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<ResolvedRuntime, RuntimeRejection> {
     let Some(canonical) = canonical_role(role) else {
@@ -576,6 +726,7 @@ fn resolve_and_admit_with(
                 runtime_manifest,
                 suggested_worker_type: role_suggested,
                 preference: None,
+                execution: None,
             });
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -624,7 +775,23 @@ fn resolve_and_admit_with(
             vec![],
         ));
     }
+    let native_value = |capability: &str| {
+        runtime_doc
+            .capabilities
+            .get(capability)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("absent")
+            .to_string()
+    };
+    // Containment is bound to exactly one runtime. A proof prepared for a
+    // Codex private clone can never satisfy a requirement for some other
+    // runtime the same binding happened to choose.
+    let proof = match context {
+        AdmissionContext::PrivateClone(proof) if proof.runtime() == runtime => Some(proof),
+        _ => None,
+    };
     let mut unmet = Vec::new();
+    let mut contained = Vec::new();
     for requirement in &role_doc.runtime_requirements {
         match runtime_doc
             .capabilities
@@ -632,15 +799,25 @@ fn resolve_and_admit_with(
             .and_then(serde_json::Value::as_str)
         {
             Some("yes") => {}
+            _ if proof.is_some() && requirement == CONTAINMENT_SATISFIES => {
+                contained.push(requirement.clone());
+            }
             _ => unmet.push(requirement.clone()),
         }
     }
     if !unmet.is_empty() {
         return Err(reject(format!("unmet capabilities: {}", unmet.join(", ")), unmet));
     }
+    let execution = proof.filter(|_| !contained.is_empty()).map(|proof| {
+        let mut native = BTreeMap::new();
+        for capability in contained.iter().map(String::as_str).chain(["hooks"]) {
+            native.insert(capability.to_string(), native_value(capability));
+        }
+        proof.provenance(contained.clone(), native)
+    });
     if canonical == "sweep-lifecycle" && crate::worker_spawn::is_native(&runtime) {
         for phase in ["curator", "judge", "doctor"] {
-            resolve_and_admit(root, phase, Some(&runtime)).map_err(|error| {
+            resolve_and_admit_in(root, phase, Some(&runtime), context).map_err(|error| {
                 reject(
                     format!("native sweep phase {phase}: {}", error.reason),
                     error.unmet_capabilities,
@@ -657,8 +834,11 @@ fn resolve_and_admit_with(
         runtime_manifest,
         suggested_worker_type: role_suggested,
         preference: None,
+        execution,
     })
 }
 
+#[cfg(test)]
+mod containment_tests;
 #[cfg(test)]
 mod tests;

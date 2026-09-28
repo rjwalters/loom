@@ -141,8 +141,9 @@ function better(a: HostRow, b: HostRow): boolean {
 }
 
 /** Fold every non-offline host's rows into one item per issue, ordered by
- * state, then `loom:urgent`, then oldest issue first — the same tiebreaks the
- * daemon's own comparator uses after workspace priority. */
+ * state, then starred (`loom:operator-priority`, #9244) first, then oldest
+ * issue first — the daemon's own comparator puts starred work ahead of
+ * everything, and `loom:urgent` no longer orders anything. */
 export function mergeFleetQueue(
   summaries: readonly HostQueueSummary[],
   sweeps: readonly ActiveSweep[],
@@ -189,13 +190,51 @@ export function mergeFleetQueue(
 function compareItems(a: FleetQueueItem, b: FleetQueueItem): number {
   const byState = STATE_RANK[a.state] - STATE_RANK[b.state];
   if (byState !== 0) return byState;
-  if (a.primary.row.urgent !== b.primary.row.urgent) return a.primary.row.urgent ? -1 : 1;
+  const aStarred = a.primary.row.operator_priority === true;
+  if (aStarred !== (b.primary.row.operator_priority === true)) return aStarred ? -1 : 1;
   const aCreated = Date.parse(a.primary.row.created_at ?? "");
   const bCreated = Date.parse(b.primary.row.created_at ?? "");
   const aKey = Number.isFinite(aCreated) ? aCreated : Infinity;
   const bKey = Number.isFinite(bCreated) ? bCreated : Infinity;
   if (aKey !== bKey) return aKey - bKey;
   return (a.issue ?? Infinity) - (b.issue ?? Infinity);
+}
+
+/** A client-side filter over the already-merged fleet items (Issue #9032):
+ * `repo` and `tier` are ANDed, and an unset field matches everything. Pure
+ * and DOM-free, like the rest of this module, so the predicate is
+ * unit-testable without a browser — filtering never re-fetches, it only
+ * narrows the `FleetQueueItem[]` `mergeFleetQueue` already produced. */
+export interface QueueFilter {
+  repo?: string;
+  tier?: string;
+}
+
+/** The distinct repo and tier values across `items`, each sorted for a
+ * stable dropdown order. An item with no repo (a withheld private row) or no
+ * `tier` label contributes to the unfiltered lists but not to these option
+ * sets — there is no "no repo" or "no tier" filter value to select. */
+export interface QueueFilterOptions {
+  repos: string[];
+  tiers: string[];
+}
+
+export function queueFilterOptions(items: readonly FleetQueueItem[]): QueueFilterOptions {
+  const repos = new Set<string>();
+  const tiers = new Set<string>();
+  for (const item of items) {
+    if (item.repo) repos.add(item.repo);
+    if (item.primary.row.tier) tiers.add(item.primary.row.tier);
+  }
+  return { repos: [...repos].sort(), tiers: [...tiers].sort() };
+}
+
+export function filterQueueItems(items: readonly FleetQueueItem[], filter: QueueFilter): FleetQueueItem[] {
+  return items.filter((item) => {
+    if (filter.repo && item.repo !== filter.repo) return false;
+    if (filter.tier && item.primary.row.tier !== filter.tier) return false;
+    return true;
+  });
 }
 
 /** The PR an `open_pr` row's `detail` names. The daemon writes it as
@@ -210,6 +249,16 @@ export function openPrNumber(row: QueueRow): number | undefined {
  * (#8957) are outside the dispatch order and carry rank 0, shown as a dash. */
 export function rankText(row: QueueRow): string {
   return row.rank > 0 ? String(row.rank) : "–";
+}
+
+/** A row's place in its own host's dispatch plan (Issue #9288), verbatim:
+ * `#3 next`, `#5 queued (repo cap)`, or `running` / `blocked` with no
+ * position. A pre-#9288 row falls back to its coarse state. */
+export function planText(row: QueueRow): string {
+  if (row.plan_state === undefined) return row.state;
+  const position = row.position === undefined ? "" : `#${row.position} `;
+  const gate = row.gate === undefined ? "" : ` (${row.gate.replace(/_/g, " ")})`;
+  return `${position}${row.plan_state}${gate}`;
 }
 
 /** The reason text with its structured specifics (park label, open PR)

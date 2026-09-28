@@ -54,7 +54,9 @@
 //!   point — the schema's "unknown != zero" contract carries through to the
 //!   OTLP mapping. `host.health`'s `daemon_version` becomes the `Resource`
 //!   attribute `service.version`, not a metric, since it describes the
-//!   emitting entity rather than a measurement.
+//!   emitting entity rather than a measurement. Every signal (traces and logs
+//!   included) carries `service.version`; without a `host.health` record it
+//!   is the exporting build's `CARGO_PKG_VERSION`.
 //!
 //! See [`mapping`] for the field-by-field implementation and its unit tests
 //! (fixture envelopes for every record kind, verifying the log/metric split

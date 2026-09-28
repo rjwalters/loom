@@ -38,6 +38,8 @@ const SIGNOZ_README: &str = include_str!("../../defaults/observability/signoz/RE
 /// The standing build/CI retro queries (#8826). Governed by the CI record
 /// family's own vocabulary, not the shared fixture manifest's.
 const CI_QUERIES: &str = include_str!("../../defaults/observability/signoz/ci-queries.sql");
+/// The ETA accuracy queries (#9289).
+const ETA_QUERIES: &str = include_str!("../../defaults/observability/signoz/eta-queries.sql");
 
 /// Loom's own attribute namespace. Presence probes outside it are deliberate
 /// absence assertions (see [`fixture_queries_assert_the_privacy_sentinel_is_dropped`])
@@ -218,6 +220,7 @@ fn saved_queries_only_reference_forwarded_attribute_and_resource_keys() {
         ("fixture-queries.sql", FIXTURE_QUERIES),
         ("queries.sql", ADHOC_QUERIES),
         ("ci-queries.sql", CI_QUERIES),
+        ("eta-queries.sql", ETA_QUERIES),
     ] {
         for container in ["attributes_string", "attributes_number", "attributes_bool"] {
             for key in referenced_attribute_keys(sql, container) {
@@ -400,6 +403,7 @@ fn daemon_ci_log_attribute_containers() -> BTreeMap<String, &'static str> {
         completed_at: at,
         duration_ms: 0,
         queued_ms: Some(0),
+        trigger_reason: Some("new_commit".into()),
     };
     let job = CiJobRecord {
         repo: "2amlogic/example".into(),

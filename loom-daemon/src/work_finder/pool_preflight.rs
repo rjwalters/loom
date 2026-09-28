@@ -386,6 +386,7 @@ impl PoolHoldState {
                 );
                 // #8931: one `loom.pool.hold` span per hold, armed → cleared.
                 crate::observability::ops::pool_marks::record_pool_hold(
+                    &hold.dir,
                     hold.since,
                     now,
                     hold.wrapper_observed,

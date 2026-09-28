@@ -98,16 +98,17 @@ git -C "$WORKTREE_ABS" diff --cached --name-only \
 ```
 
 **No unrelated lockfile / workspace-config hunks.** A dependency install can mutate
-files outside your scope. In particular, **pnpm's build-approval prompt persists
+files outside your scope: **pnpm's build-approval prompt persists
 `onlyBuiltDependencies` / `ignoredBuiltDependencies` into `pnpm-workspace.yaml`**
-(older pnpm: into `package.json`) the first time `pnpm install` builds a package with
-an install script — an out-of-scope hunk a careless commit will ship. Defend against it:
+(older pnpm: into `package.json`) the first time `pnpm install` builds a package
+with an install script. Defend against it:
 
-- Run installs **non-interactively** so the prompt never mutates config —
-  `CI=true pnpm install` (CI mode skips the build-approval prompt entirely). npm/yarn
-  installs can likewise touch `package-lock.json` / `yarn.lock`.
-- **After any install**, check for stray config/lockfile edits and revert unrelated hunks
-  before staging:
+- Run installs **non-interactively** — `CI=true pnpm install` skips that prompt.
+  **Never when `ls -ld node_modules` shows a symlink out of your worktree**:
+  `CI=true` then purges the MAIN clone's tree through it and no pnpm setting
+  stops it (#8944). Run the binary (`npx vitest`) instead. npm/yarn installs
+  can likewise touch `package-lock.json` / `yarn.lock`.
+- **After any install**, revert stray config/lockfile hunks before staging:
 
   ```bash
   git -C "$WORKTREE_ABS" status --short -- pnpm-workspace.yaml pnpm-lock.yaml package.json package-lock.json yarn.lock
@@ -115,8 +116,7 @@ an install script — an out-of-scope hunk a careless commit will ship. Defend a
   git -C "$WORKTREE_ABS" checkout -- pnpm-workspace.yaml   # (or the specific file)
   ```
 
-  A genuinely needed lockfile bump (you added/updated a dependency on purpose) is in
-  scope — keep it; revert only the incidental install-prompt churn.
+  A deliberate lockfile bump is in scope — keep it; revert only prompt churn.
 
 ### What To Do When You Notice Unrelated Problems
 
@@ -1091,27 +1091,27 @@ Workers use a three-level priority system to determine which issues to work on:
 
 ### Priority Order
 
-1. **Urgent** (`loom:urgent`) - Critical/blocking issues requiring immediate attention
+1. **Starred** (`loom:operator-priority`) - The operator wants it landed ASAP (#9244)
 2. **Curated** (`loom:issue` + `loom:curated`) - Approved and enhanced issues (highest quality)
 3. **Approved Only** (`loom:issue` without `loom:curated`) - Approved but not yet curated (fallback)
 
 ### How to Find Work
 
-**Step 1: Check for urgent issues first**
+**Step 1: Check for starred issues first**
 
 ```bash
-gh issue list --label="loom:issue" --label="loom:urgent" --state=open --limit=5
+gh issue list --label="loom:issue" --label="loom:operator-priority" --state=open --limit=5
 ```
 
-If urgent issues exist, **claim one immediately** - these are critical.
+If any exist, **claim one immediately**.
 
-**Step 2: If no urgent, check curated issues**
+**Step 2: If none starred, check curated issues**
 
 ```bash
 gh issue list --label="loom:issue" --label="loom:curated" --state=open --limit=10
 ```
 
-**Why prefer these**: Highest quality - human approved + Curator added context.
+**Why prefer these**: human approved + Curator context.
 
 **Step 3: If no curated, fall back to approved-only issues**
 
@@ -1125,7 +1125,7 @@ gh issue list --label="loom:issue" --state=open --json number,title,labels \
   \"#\(.number): \(.title)\""
 ```
 
-**Why allow this**: Work can proceed even if Curator hasn't run yet. Builder can implement based on human approval alone if needed.
+**Why allow this**: work can proceed on human approval alone, before Curator runs.
 
 **Step 4 (every tier): guard the claim before you flip the label**
 
@@ -1274,7 +1274,7 @@ Decide whether this PR **fully** resolves the issue (`Closes #N`) or is only a
 **partial increment** of a larger tracked body of work that must stay open
 (`Part of #N` / `Contributes to #N`). The full decision rule — when to use the
 non-closing reference, and the requirement to carry the **same** reference in both
-the PR body and the squash commit message — is the canonical guidance in
+the PR body and the commit messages — is the canonical guidance in
 **builder-pr.md § "Partial increments (family/epic issues)"**. Do not restate it
 here; follow it there.
 
@@ -1293,14 +1293,14 @@ has landed (the failure that made re-dispatched Builders rebuild identical
 work). The canonical body template (Summary / Changes / Acceptance
 Criteria Verification / Test Plan + the `Closes #N` reference) lives in
 **builder-pr.md § "Creating the PR"** — use it verbatim. Do NOT create PRs with
-just `Closes #N`; the body must include the structured sections. Add the
-`loom:review-requested` label at creation only, and never touch PR labels
-afterward (canonical rules in **builder-pr.md § "PR Label Rules"**). PRs are
+just `Closes #N`; the body must include the structured sections. Add
+`loom:review-requested` at creation only (plus `loom:operator-priority` if the
+issue carries it, #9244), and never touch PR labels afterward (canonical rules in **builder-pr.md § "PR Label Rules"**). PRs are
 merged by Champion using `./.loom/scripts/merge-pr.sh` — never use `gh pr merge`.
 
 ## Working Style
 
-- **Start**: Find work using the three-tier priority order (see "Finding Work: Priority System") — urgent → curated → approved-only; oldest-first is only the tiebreak **within** a tier, not a top-level rule
+- **Start**: Find work using the three-tier priority order (see "Finding Work: Priority System") — starred → curated → approved-only; oldest-first is only the tiebreak **within** a tier, not a top-level rule
 - **Verify before claiming**: Issue MUST have `loom:issue` label (unless explicit user override)
 - **Claim**: Remove `loom:issue`, add `loom:building` - always both labels together
 - **During work**: If you discover out-of-scope needs, PAUSE and create an issue (see builder-complexity.md)

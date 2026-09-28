@@ -8,14 +8,14 @@
 //! that one over.
 //!
 //! Previously `merge-pr.sh:461` called the shell `forge_detect_merge_method`
-//! (`defaults/scripts/lib/forge-merge-method.sh`) unconditionally — squash >
-//! merge > rebase preference order, no way to request a specific method. This
-//! subcommand adds that: with no `--requested`, it preserves the exact same
-//! auto-detect preference (including the fail-open-to-squash degenerate
-//! case); with `--requested`, it validates the request against the repo's
-//! actually allowed strategies and refuses — naming what IS allowed — rather
-//! than silently falling back to squash, which would just reproduce the bug
-//! #8845 reports with an extra ignored flag.
+//! (`defaults/scripts/lib/forge-merge-method.sh`) unconditionally — merge >
+//! rebase > squash preference order (#9105), no way to request a specific
+//! method. This subcommand adds that: with no `--requested`, it preserves the
+//! exact same auto-detect preference (including the fail-open-to-merge
+//! degenerate case); with `--requested`, it validates the request against the
+//! repo's actually allowed strategies and refuses — naming what IS allowed —
+//! rather than silently substituting a different method, which would just
+//! reproduce the bug #8845 reports with an extra ignored flag.
 //!
 //! GitHub only, natively (`gh api repos/<nwo>`, mirroring
 //! [`crate::forge_cmd::github_auto_merge`]'s house style). Gitea declines
@@ -55,12 +55,13 @@ struct RepoMergeFlags {
 ///
 /// - `requested` present and allowed -> `Ok(requested)`.
 /// - `requested` present and NOT allowed -> `Err` naming every method the
-///   repo actually allows — never a silent fallback to squash, which would
-///   reproduce the bug this subcommand exists to fix (#8845's own report).
-/// - `requested` absent -> the same squash > merge > rebase preference
-///   `forge_detect_merge_method` (the shell predecessor this augments, in
-///   `defaults/scripts/lib/forge-merge-method.sh`) has always used, including
-///   its fail-open-to-squash degenerate case (a forge reporting every allow_*
+///   repo actually allows — never a silent fallback to a different method,
+///   which would reproduce the bug this subcommand exists to fix (#8845's
+///   own report).
+/// - `requested` absent -> the same merge > rebase > squash preference
+///   (#9105) `forge_detect_merge_method` (the shell predecessor this
+///   augments, in `defaults/scripts/lib/forge-merge-method.sh`) uses, including
+///   its fail-open-to-merge degenerate case (a forge reporting every allow_*
 ///   flag false, which neither forge's UI actually permits).
 fn resolve_merge_method(requested: Option<&str>, flags: RepoMergeFlags) -> Result<String, String> {
     if let Some(req) = requested {
@@ -96,14 +97,16 @@ fn resolve_merge_method(requested: Option<&str>, flags: RepoMergeFlags) -> Resul
             "requested merge method '{req}' is not allowed by this repository; allowed method(s): {allowed_desc}"
         ));
     }
-    Ok(if flags.allow_squash_merge {
-        "squash"
-    } else if flags.allow_merge_commit {
+    Ok(if flags.allow_merge_commit {
         "merge"
     } else if flags.allow_rebase_merge {
         "rebase"
-    } else {
+    } else if flags.allow_squash_merge {
         "squash"
+    } else {
+        // Degenerate: every strategy reports disabled (a state neither forge's
+        // UI actually permits) — fail open to merge (#9105).
+        "merge"
     }
     .to_string())
 }
@@ -114,7 +117,7 @@ fn resolve_merge_method(requested: Option<&str>, flags: RepoMergeFlags) -> Resul
 /// the reason on stderr (either the vocabulary/validation error from
 /// [`resolve_merge_method`], or "could not verify" when the repo probe
 /// itself failed, which — unlike the no-`requested` case — must NOT fail
-/// open to squash: silently ignoring an explicit, unverifiable request would
+/// open to merge: silently ignoring an explicit, unverifiable request would
 /// reproduce the exact bug #8845 reports.
 fn github_merge_method(gh: &str, nwo: &str, requested: Option<&str>) -> i32 {
     let mut cmd = Command::new(gh);
@@ -133,7 +136,7 @@ fn github_merge_method(gh: &str, nwo: &str, requested: Option<&str>) -> i32 {
         crate::cmd_out::Query::Empty => RepoMergeFlags::default(),
         crate::cmd_out::Query::Malformed { error, .. } => {
             if requested.is_none() {
-                println!("squash");
+                println!("merge");
                 return 0;
             }
             eprintln!("could not verify {nwo}'s allowed merge methods: {error}");
@@ -141,7 +144,7 @@ fn github_merge_method(gh: &str, nwo: &str, requested: Option<&str>) -> i32 {
         }
         crate::cmd_out::Query::Failed { stderr, .. } => {
             if requested.is_none() {
-                println!("squash");
+                println!("merge");
                 return 0;
             }
             eprintln!("could not verify {nwo}'s allowed merge methods: {stderr}");
@@ -149,7 +152,7 @@ fn github_merge_method(gh: &str, nwo: &str, requested: Option<&str>) -> i32 {
         }
         crate::cmd_out::Query::Unavailable(u) => {
             if requested.is_none() {
-                println!("squash");
+                println!("merge");
                 return 0;
             }
             eprintln!("could not verify {nwo}'s allowed merge methods: {u}");
@@ -206,15 +209,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_merge_method_no_request_preserves_squash_first_preference() {
-        // Every combination the auto-detect preference order (squash > merge
-        // > rebase) has always used — verbatim, no request supplied.
-        assert_eq!(resolve_merge_method(None, flags(true, true, true)).unwrap(), "squash");
+    fn resolve_merge_method_no_request_uses_merge_first_preference() {
+        // Every combination the auto-detect preference order (merge > rebase
+        // > squash, #9105) resolves — verbatim, no request supplied.
+        assert_eq!(resolve_merge_method(None, flags(true, true, true)).unwrap(), "merge");
         assert_eq!(resolve_merge_method(None, flags(false, true, true)).unwrap(), "merge");
         assert_eq!(resolve_merge_method(None, flags(false, false, true)).unwrap(), "rebase");
+        // A squash-only repo is still honored (no forced migration).
+        assert_eq!(resolve_merge_method(None, flags(true, false, false)).unwrap(), "squash");
         // Degenerate case: every strategy reports disabled -- fails open to
-        // squash, exactly like the shell predecessor's fail-open branch.
-        assert_eq!(resolve_merge_method(None, flags(false, false, false)).unwrap(), "squash");
+        // merge, exactly like the shell predecessor's fail-open branch (#9105).
+        assert_eq!(resolve_merge_method(None, flags(false, false, false)).unwrap(), "merge");
     }
 
     #[test]
@@ -224,8 +229,8 @@ mod tests {
             resolve_merge_method(Some("rebase"), flags(true, false, true)).unwrap(),
             "rebase"
         );
-        // Even when squash (the auto-detect favorite) is ALSO allowed, an
-        // explicit non-squash request still wins -- the whole point of #8845.
+        // Even when merge (the auto-detect favorite, #9105) is ALSO allowed, an
+        // explicit non-merge request still wins -- the whole point of #8845.
         assert_eq!(
             resolve_merge_method(Some("rebase"), flags(true, true, true)).unwrap(),
             "rebase"
@@ -238,8 +243,8 @@ mod tests {
         assert!(err.contains("merge"), "error should name the rejected method: {err}");
         assert!(err.contains("squash"), "error should name what IS allowed: {err}");
         assert!(err.contains("rebase"), "error should name what IS allowed: {err}");
-        // Never a silent fallback to squash: the Err variant itself is the
-        // contract that no method string was resolved.
+        // Never a silent fallback to a different method: the Err variant
+        // itself is the contract that no method string was resolved.
     }
 
     #[test]
@@ -314,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn github_merge_method_probe_failure_with_no_request_fails_open_to_squash() {
+    fn github_merge_method_probe_failure_with_no_request_fails_open_to_merge() {
         let dir = tempdir().unwrap();
         let gh = write_mock_gh_repo(dir.path(), None);
         let rc = github_merge_method(gh.to_str().unwrap(), "acme/widgets", None);
@@ -323,7 +328,7 @@ mod tests {
 
     #[test]
     fn github_merge_method_probe_failure_with_request_refuses_rather_than_fail_open() {
-        // The no-request fail-open-to-squash behavior must NOT apply once a
+        // The no-request fail-open-to-merge behavior must NOT apply once a
         // caller made an explicit request that could not be verified --
         // silently ignoring it would reproduce the #8845 bug with a request
         // flag that nobody's watching.

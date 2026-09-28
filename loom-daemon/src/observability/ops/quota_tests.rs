@@ -169,6 +169,7 @@ fn token_snapshot_accounts_map_to_pool_accounts() {
         provider: "claude".into(),
         rank: Some(1),
         usage_fraction: Some(0.4),
+        usage_fraction_weekly: Some(0.6),
         limit_window_reset_at: None,
         exhausted: true,
     };

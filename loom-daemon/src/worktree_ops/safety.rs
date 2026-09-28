@@ -571,11 +571,21 @@ pub fn check_uncommitted_changes(worktree_path: &Path) -> bool {
 /// slice 3 ported `worktree.sh remove` onto this predicate directly and
 /// deleted the shell twin, so `all_loom_own_markers_are_recognised_as_bookkeeping`
 /// now pins this constant on its own rather than comparing two implementations.
-pub const LOOM_OWN_UNTRACKED_FILES: [&str; 4] = [
+///
+/// `.loom-cargo-target-dir` joined the list with #8458: `worktree.sh`'s create
+/// path writes it into every worktree that gets its own Cargo target dir, so it
+/// is Loom's own bookkeeping in exactly the sense the other four are. It is
+/// gitignored by the same `loom-managed` block (see
+/// `init::post_init::EPHEMERAL_PATTERNS`), and this predicate is what keeps a
+/// stale `.gitignore` from turning it into "user work" that pins every
+/// provisioned worktree dirty — the guard the now-deleted shell twin held for
+/// the other four.
+pub const LOOM_OWN_UNTRACKED_FILES: [&str; 5] = [
     ".loom-managed",
     ".loom-in-use",
     ".loom-checkpoint",
     ".no-changes-needed",
+    ".loom-cargo-target-dir",
 ];
 
 /// Is this `git ls-files --others` path one of Loom's own runtime markers?

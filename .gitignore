@@ -44,6 +44,7 @@ Thumbs.db
 .loom-in-use
 .loom-checkpoint
 .loom-managed
+.loom-cargo-target-dir
 .no-changes-needed
 .snapshots/
 .loom/.daemon.pid
@@ -83,10 +84,18 @@ Thumbs.db
 .loom/metrics/
 .loom/usage-cache.json
 .loom/claude-config/
+.loom/claude-config.*/
+.loom/claude-config-*/
 .loom/native-tools/
 .loom/tokens/
+.loom/tokens.*/
+.loom/tokens-*/
 .loom/accounts.env
+.loom/accounts.env.*
+.loom/accounts.env-*
 .loom/api-keys/
+.loom/api-keys.*/
+.loom/api-keys-*/
 .loom/account-health.json
 .loom/account-health.lock
 .loom/CANARY
@@ -98,7 +107,11 @@ Thumbs.db
 .loom/logs/
 .loom/.resync-in-progress
 .loom/gh-config/
+.loom/gh-config.*/
+.loom/gh-config-*/
 .loom/gh-config-by-owner/
+.loom/gh-config-by-owner.*/
+.loom/gh-config-by-owner-*/
 .loom-local/
 # <<< loom-managed <<<
 .loom-test-failure-context.json
@@ -180,6 +193,22 @@ Thumbs.db
 # If loom ever ships its own skills, materialize/dogfood them like
 # `.claude/commands/loom/` (out of scope here).
 .claude/skills
+
+# Co-install hygiene, sibling of `.claude/skills` above:
+# `/repo:handoff` (Repo Skills, a co-installed foreign tool) writes
+# `.claude/handoff.md` — one-shot session state carrying in-flight work,
+# settled decisions and empirically-found traps across a CLI restart. Its
+# contract is that the NEXT session reads it and then deletes it, so it is
+# never a commit; without this entry `git add -A` can stage a note that was
+# meant to live for one session, and `git status` stays dirty until it is
+# absorbed (which is what stalls an installed-surface resync gating on a
+# clean tree).
+# IMPORTANT: this ignore lives ONLY in loom's own committed .gitignore. It
+# must NOT be added to the daemon's `update_gitignore` list in
+# loom-daemon/src/init/post_init.rs — Repo Skills' own `/repo:handoff`
+# ensures the entry in each consumer repo it is installed into, and that is
+# the tool that owns the file.
+.claude/handoff.md
 
 # Dogfood scoped symlink (issue #8947, fourth member of the #3311 /
 # #3565+#3682 / #3578 family):

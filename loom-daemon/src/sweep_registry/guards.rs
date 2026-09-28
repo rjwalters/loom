@@ -994,10 +994,18 @@ impl SweepRegistry {
     /// signal `/loom:sweep`'s own pre-flight existing-PR probe uses for
     /// non-closing `Part of #N` references (`sweep.md` → "Existing-PR probe").
     /// GitHub emits a `cross-referenced` event for a PR that references the
-    /// issue via a **closing** keyword too, so this is a strict superset of the
+    /// issue via a **closing** keyword too, so this is a superset of the
     /// GraphQL closes-graph for the yes/no question this guard actually asks —
     /// it does not need to distinguish closing from non-closing references,
     /// only "is there an open PR against this issue at all".
+    ///
+    /// It is not an *unfiltered* superset, though: GitHub emits that event for a
+    /// PR that merely mentions `#N` in passing too, and since #8940 those
+    /// candidates are discarded by the same #6216 phrase filter the sweep skill
+    /// applies (see
+    /// [`crate::worktree_ops::gh::parse_open_linked_pr_timeline`]). Without it
+    /// one stale open PR quoting an issue number refused that issue's dispatch
+    /// indefinitely — a stand-down comment on PR #8314 starved #8322 for 6.5d.
     ///
     /// Same fail-open contract as the GraphQL probe: anything short of a
     /// verified answer (spawn/timeout error, non-zero exit, unparseable
@@ -1032,9 +1040,8 @@ impl SweepRegistry {
         if !output.status.success() {
             return OpenPrProbe::ProbeFailed;
         }
-        crate::worktree_ops::gh::parse_open_linked_pr_timeline(&String::from_utf8_lossy(
-            &output.stdout,
-        ))
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        crate::worktree_ops::gh::parse_open_linked_pr_timeline(&stdout, issue)
     }
 
     /// Best-effort probe for whether `issue` resolves to a pull request in ANY

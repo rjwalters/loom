@@ -34,6 +34,8 @@ import type {
   TokensSnapshotRecord,
   Timestamped,
 } from "./types";
+import type { LabelsSnapshotRecord } from "./labelTypes";
+import { parseLabelsSnapshot } from "./labelParse";
 import { parseQueueSnapshot } from "./queueParse";
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -298,6 +300,13 @@ export function parseFleetSnapshot(value: unknown): FleetSnapshot {
       // Issue #8852: a queue with no parseable `tick_at` is dropped, not shown.
       const queue = parseTimestamped(raw.queue, parseQueueSnapshot);
       if (queue?.record) entry.queue = { record: queue.record, updatedAt: queue.updatedAt };
+      // Issue #9094: a snapshot with no repo or `taken_at` cannot be diffed.
+      if (Array.isArray(raw.labels)) {
+        const labels = raw.labels
+          .map((item) => parseTimestamped(item, parseLabelsSnapshot))
+          .filter((item): item is Timestamped<LabelsSnapshotRecord> => item?.record !== undefined);
+        if (labels.length > 0) entry.labels = labels;
+      }
       snapshot.hosts[hostId] = entry;
     }
   }

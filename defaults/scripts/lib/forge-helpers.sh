@@ -316,15 +316,15 @@ source "$_LOOM_FORGE_HELPERS_LIB_DIR/forge-merge-method.sh"
 # GitHub: PUT /repos/{nwo}/pulls/{n}/merge with merge_method=<MERGE_METHOD>
 # Gitea: POST /repos/{owner}/{repo}/pulls/{n}/merge with Do=<MERGE_METHOD>
 #
-# MERGE_METHOD (optional, #7754): one of "squash"/"merge"/"rebase". Defaults
-# to "squash" when omitted -- preserves this function's pre-#7754 behavior
-# for any caller that has not been updated to pass a detected method (e.g.
-# via forge_detect_merge_method). Callers that need to respect a target
+# MERGE_METHOD (optional, #7754): one of "merge"/"squash"/"rebase". Defaults
+# to "merge" (merge commit, #9105) when omitted, for any caller that has
+# not been updated to pass a detected method (e.g. via
+# forge_detect_merge_method). Callers that need to respect a target
 # repo's actual allowed strategies MUST pass this explicitly.
 #
 # EXPECTED_HEAD_SHA (optional, #5579): an optimistic-concurrency precondition —
 # the SHA the PR's head branch must currently match for the merge to proceed.
-# Without it, both forges will happily squash-merge whatever the CURRENT head
+# Without it, both forges will happily merge whatever the CURRENT head
 # is at the moment the request lands, even if it has commits the caller never
 # saw approved (silently stranding them — squash-merge makes this invisible to
 # an ancestry check afterward, since the new squash commit is not a descendant
@@ -346,7 +346,7 @@ source "$_LOOM_FORGE_HELPERS_LIB_DIR/forge-merge-method.sh"
 # message "head out of date".
 forge_merge_pr() {
   local nwo="$1" pr_number="$2"
-  local expected_head_sha="${3:-}" merge_method="${4:-squash}"
+  local expected_head_sha="${3:-}" merge_method="${4:-merge}"
 
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
     forge_split_nwo "$nwo"
@@ -543,6 +543,20 @@ FORGE_CHECK_RUNS_RC_NOT_FOUND=44
 # partial JSON keeps a truncated read from ever being read as settlement.
 FORGE_CHECK_RUNS_RC_TRUNCATED=45
 
+# jq filter mapping ONE page of Gitea commit statuses to GitHub check-run rows,
+# as NDJSON — the per-page shape _forge_gitea_paginate emits (#8987).
+# Gitea status: pending, success, error, failure, warning.
+# GitHub check run: status=completed/queued/in_progress, conclusion=success/…
+_FORGE_GITEA_CHECK_RUN_JQ='.[] | {
+  name: .context,
+  status: (if .status == "pending" then "queued" else "completed" end),
+  conclusion: (if .status == "success" then "success"
+               elif .status == "failure" or .status == "error" then "failure"
+               elif .status == "warning" then "neutral"
+               else null end),
+  html_url: .target_url
+} | tojson'
+
 # Get CI check runs for a commit.
 # Usage: forge_get_check_runs NWO COMMIT_SHA
 # GitHub: GET /repos/{nwo}/commits/{sha}/check-runs (fully paginated)
@@ -550,44 +564,30 @@ FORGE_CHECK_RUNS_RC_TRUNCATED=45
 #
 # Return codes: 0 success (JSON on stdout); $FORGE_CHECK_RUNS_RC_NOT_FOUND
 # (44) on a confirmed HTTP 404 (GitHub only — see below);
-# $FORGE_CHECK_RUNS_RC_TRUNCATED (45) on a short read (GitHub only); 1 for any
-# other failure.
-#
-# KNOWN GAP (Gitea): the Gitea branch below makes ONE unpaginated request and
-# derives `total_count` from the rows it got, so a page-capped read there is
-# undetectable by the fail-closed check the GitHub branch gets. Tracked
-# separately — the live mechanism this guards (`merge-pr.sh --auto`) runs
-# against GitHub.
+# $FORGE_CHECK_RUNS_RC_TRUNCATED (45) on a short read (GitHub only — Gitea's
+# statuses endpoint publishes no independent count to compare against, so the
+# Gitea branch's equivalent guarantee is exhaustive pagination that returns
+# nonzero rather than a short list, #8987); 1 for any other failure.
 forge_get_check_runs() {
   local nwo="$1"
   local commit="$2"
 
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
     forge_split_nwo "$nwo"
-    local statuses
-    statuses=$(gitea_api GET "repos/$FORGE_OWNER/$FORGE_REPO/commits/$commit/statuses" 2>/dev/null) || {
-      echo '{"total_count":0,"check_runs":[]}'
-      return 1
-    }
-
-    # Map Gitea commit statuses to GitHub check-run shape.
-    # Gitea status field: pending, success, error, failure, warning
-    # GitHub check run: status=completed/queued/in_progress, conclusion=success/failure/...
-    echo "$statuses" | jq '{
-      total_count: (. | length),
-      check_runs: [.[] | {
-        name: .context,
-        status: (if .status == "pending" then "queued"
-                 else "completed" end),
-        conclusion: (if .status == "success" then "success"
-                     elif .status == "failure" then "failure"
-                     elif .status == "error" then "failure"
-                     elif .status == "warning" then "neutral"
-                     elif .status == "pending" then null
-                     else null end),
-        html_url: .target_url
-      }]
-    }'
+    # Page to exhaustion (#8987). This used to be ONE unpaginated request, which
+    # Gitea caps at DEFAULT_PAGING_NUM (30) / MAX_RESPONSE_ITEMS (50) — the same
+    # truncation class as #8895 — and its total_count came from `length` of the
+    # rows that arrived, so a truncated read looked self-consistent and no
+    # short-read check could ever fire. _forge_gitea_paginate returns nonzero on
+    # ANY page failure or page-cap trip instead of reporting a short list, so
+    # total_count below counts a COMPLETE read. (Gitea's own CombinedStatus
+    # total_count is itself len() of one fetched page, so it is not a usable
+    # independent cross-check the way GitHub's is.)
+    local rows
+    rows=$(_forge_gitea_paginate \
+      "repos/$FORGE_OWNER/$FORGE_REPO/commits/$commit/statuses" \
+      "$_FORGE_GITEA_CHECK_RUN_JQ") || return 1
+    printf '%s\n' "$rows" | jq -cs '{total_count: length, check_runs: .}'
   else
     # Capture stdout and stderr into separate temp files so a non-2xx
     # response's HTTP status (which `gh api` reports only on stderr, as

@@ -155,6 +155,7 @@ in ordinary CI, with no Docker, network or credential:
 | Every image is digest-pinned and byte-identical to the casting, and its version tag is still the one this README lists | Catches a floating tag, a hand-edited render, and a stale version table |
 | The histogram helper's SHA-256 check runs *before* `tar -xzf`, pins both architectures, refuses unknown ones, and matches the digests above | It is the one component fetched at start-up rather than pinned by digest, so ordering is the whole integrity property |
 | The documented 3.75 GiB steady-state / 768 MiB transient budget is the sum of the rendered `mem_limit`s, and every service caps logs at three 10 MiB files | Sizing figures an operator provisions a host against, and the disk claim below |
+| Every ClickHouse `system.*_log` keeps a `DELETE` TTL, and `metric_log` uses the transposed schema, set by the casting's declarative patch | The wide upstream `metric_log`'s TTL merge does not fit the 2 GiB cap, so it silently stops expiring (see "ClickHouse self-telemetry" below) |
 
 It deliberately asserts nothing about a *running* deployment: readiness, storage
 and retention stay `evidence.md`'s job.
@@ -201,6 +202,23 @@ the counts quoted above and in `fixture-queries.sql` from the generated manifest
 so a later fixture version cannot leave a stale total here for an observation to
 be compared against.
 
+### Quota utilization queries
+
+`quota-utilization.sql` (#9005) answers "are our subscriptions saturated or
+idle?" from the per-account `tokens.snapshot` gauges: (1) per-account 5-hour
+and weekly utilization, hourly peak; (2) idle headroom at each detected weekly
+reset (the final utilization before the window rolled over, and `1 -` that);
+(3) the fraction of subscription capacity each provider used over the last
+week, with `coverage = 'unknown'` and NULL fractions for a provider that has
+no utilization source. Run it the same way as the queue-dwell queries:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < quota-utilization.sql
+```
+
+Verified against a local `clickhouse-local` with a mock `samples_v4` /
+`time_series_v4` shape, not yet against a live SigNoz.
+
 ### CI retro queries
 
 `ci-queries.sql` is the standing build/CI retro (#8826): six numbered sections
@@ -231,6 +249,7 @@ histograms. Policy and pipeline: [CI observability](../../docs/ci-observability.
 | Phase duration | Trace Explorer: duration of the observed `loom.phase` / `loom.role_attempt` spans, grouped by role/runtime/model, with the same time range as ClickStack (`fixture-queries.sql` 3) |
 | Correlated logs | Logs Explorer: exact trace ID and span ID; follow the trace link and inspect related logs from the selected span (`fixture-queries.sql` 6) |
 | Host/token gauges | Metrics Explorer: the actual emitted names and units — the shared fixture emits `loom.tokens.usage_fraction` and `loom.tokens.exhausted` only, labelled by `account`. An absent series is not a measured zero: the fixture's `synthetic-unknown` account intentionally has no `usage_fraction` point while `synthetic-zero` has `0.0` (`fixture-queries.sql` 7) |
+| Subscription quota utilization | Dashboards → New dashboard `Loom quota` → Time series panel. Metric `loom.tokens.usage_fraction` (5-hour window) and a second query on `loom.tokens.usage_fraction_weekly` (rolling 7-day window, #9005), aggregation **Max**, group by `provider`, `account`; time range 7 days. Providers with no utilization source (Codex, OpenCode/Z.ai, Kimi) have no series at all — a gap, never a `0`. Last week's used fraction per provider and the idle headroom thrown away at each weekly reset need window functions, so they live in SQL only (`quota-utilization.sql` 1–3) |
 | Delivery health | Scrape the neutral gateway's own Prometheus endpoint (`config.yaml` publishes `detailed` telemetry on port 8888) and read `otelcol_exporter_*` series filtered to `exporter="otlp_http/signoz"` — queue size, sent, send-failed and enqueue-failed. These series are **not** exported into SigNoz through the OTLP pipeline, so they are unavailable in the UI and must be captured beside it. Backend readiness is not delivery evidence |
 | In-progress sweep | Compare partial child spans before the root completes, then query again after completion; do not infer success from a missing root/end span (`fixture-queries.sql` 5, which lists every trace with children but no `loom.sweep` root) |
 | CI duration trend | Dashboards → New dashboard `Loom CI` → Time series panel. Metric `loom.ci.job.duration_ms`, aggregation **P50**, a second query on the same metric with **P95** and a third with **Max**; group by `repo`, `workflow`, `job`; optional filter `repo = '<owner/name>'`; time range 30 days. UI percentiles interpolate within the histogram's 1s…6h bucket bounds; the SQL is exact (`ci-queries.sql` 1) |
@@ -336,15 +355,156 @@ Accounts, dashboards and settings in PostgreSQL persist independently.
 Container stdout/stderr rotate separately at three 10 MiB files per service;
 ClickHouse's own system tables and metadata also consume storage.
 
+### ClickHouse self-telemetry
+
+ClickHouse's own `system.*_log` tables, not Loom's signals, dominate this
+trial's disk: about 480 MiB against about 2.5 MiB of Loom data on a 2.5-day
+soak (`evidence.md`, 2026-09-28). Upstream renders a 1-day TTL for each of
+them, which ClickHouse applies only during merges. The casting switches
+`system.metric_log` to ClickHouse's `transposed_with_wide_view` schema
+because the default 1,552-column table's merge memory grows with input parts
+times columns. Under the 2 GiB cap, its TTL-applying merge failed thousands of
+times an hour, and parts outlived their TTL. `system.metric_log` stays
+queryable as a view with the same columns.
+
+A deployment first started from an older render keeps its wide table. The
+config is a single-file bind mount, so a plain `up -d` does not pick up a
+re-render: recreate the ClickHouse container (its volume persists). On start
+it renames the old table to `system.metric_log_0`, stuck parts included. That
+table holds ClickHouse's own diagnostics only, no Loom signal, so drop it:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml up -d --wait --wait-timeout 1800 --force-recreate --no-deps loom-signoz-telemetrystore-clickhouse-0-0
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "DROP TABLE system.metric_log_0"
+```
+
+Check for merge failures when you check retention. A non-zero count means some
+table has stopped expiring:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT table, countIf(error != 0) failed_merges, countIf(error = 0) ok FROM system.part_log WHERE event_type = 'MergeParts' GROUP BY table HAVING failed_merges > 0"
+```
+
 Use the same `--env-file` and `-f` arguments for every Compose command.
 `docker compose ... stop` preserves all data.
 Restart with the same rendered files and `up -d --wait --wait-timeout 1800`;
 verify an old trace, gauge and saved view before accepting restart persistence.
 For backup, stop this project and snapshot its four named volumes together:
 PostgreSQL data, Keeper coordination, ClickHouse data and histogram user scripts.
-Retain the casting, lock and rendered configuration. Test restoration into a
-separate project/network before relying on the backup. Never stop or remove
-another deployment's containers/volumes.
+Retain the casting, lock and rendered configuration — **and the private
+`--env-file`**: the snapshot replays a metastore whose database role and
+session-signing secret are already set, so a restore with a fresh secret file
+cannot read it. Never stop or remove another deployment's
+containers/volumes. Then rehearse the restore as below before relying on the
+backup.
+
+## Backup-restore rehearsal
+
+A snapshot you have never restored is a guess. Rehearse it with
+`restore-override.yaml`, which layers onto the same rendered compose and turns
+it into an isolated `loom-signoz-restore` project. **Do not improvise this with
+`docker compose -p` alone**: every volume in the render carries an explicit
+top-level `name:`, so a bare project rename produces a second stack that mounts
+the *live* volumes read-write. The overlay re-points all four volumes, every
+pinned container name, both networks and the published port; it also re-points
+the external `loom-observability` network at an egress-less bridge and scales
+the ingester to zero, so the rehearsal cannot register the
+`signoz-otel-collector` alias a second time and take a share of live OTLP
+traffic. `loom-daemon/tests/signoz_restore_contract.rs` re-derives each of
+those from the rendered compose, so a later re-render that adds a volume or a
+port cannot silently escape the overlay.
+
+Run every command below **from this directory**, like the rest of this README:
+`-f` paths are resolved against the working directory, not against the first
+compose file. The overlay replaces the published-port list with the Compose
+`!override` tag, so Compose **v2.24.4 or newer** is required here (the trial's
+baseline of Compose v2 alone is not enough); an older Compose appends instead,
+keeps the live `18081` binding and the rehearsal cannot start.
+
+Snapshot (the live project must be stopped for a consistent copy). The helper
+that tars each volume is the deployment's **own** pinned PostgreSQL image, so
+the procedure introduces no unpinned image and pulls nothing new on the trial
+host; it runs as root with `--numeric-owner` so the restored data directories
+keep the uids PostgreSQL and ClickHouse expect:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml stop
+TARBALLER=postgres:16@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6
+for v in loom-signoz-metastore-postgres-0-data loom-signoz-telemetrykeeper-0-data \
+         loom-signoz-telemetrystore-0-0-data loom-signoz-telemetrystore-user-scripts; do
+  docker run --rm --entrypoint sh -v "$v":/src:ro -v /absolute/private/signoz-backup:/bk "$TARBALLER" \
+    -c "tar -C /src --numeric-owner -czf /bk/$v.tar.gz ."
+done
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml up -d --wait --wait-timeout 1800
+```
+
+Restore into the rehearsal project — note the `loom-signoz-restore-` volume
+names, and that the source tarball keeps the *live* name so the mapping stays
+readable:
+
+```console
+docker volume create loom-signoz-restore-telemetrystore-0-0-data
+docker run --rm --entrypoint sh -v loom-signoz-restore-telemetrystore-0-0-data:/dst \
+  -v /absolute/private/signoz-backup:/bk:ro "$TARBALLER" \
+  -c 'cd /dst && tar --numeric-owner -xzf /bk/loom-signoz-telemetrystore-0-0-data.tar.gz'
+# ...repeat for the metastore, keeper and user-scripts volumes...
+
+docker compose --env-file /absolute/private/signoz.env \
+  -f pours/deployment/compose.yaml -f restore-override.yaml \
+  up -d --wait --wait-timeout 1800 loom-signoz-signoz-0
+```
+
+Naming only `loom-signoz-signoz-0` starts its dependency chain (metastore,
+keeper, ClickHouse, migrator, user-scripts) and leaves the ingester out. Use
+the **same** `--env-file` as the backup, for the reason above.
+
+Verify against the live deployment rather than by eye — run the same
+`fixture-queries.sql` on both and diff the output:
+
+```console
+docker compose --env-file /absolute/private/signoz.env \
+  -f pours/deployment/compose.yaml -f restore-override.yaml exec -T \
+  loom-signoz-telemetrystore-clickhouse-0-0 \
+  clickhouse-client --multiquery --param_run='loom-synthetic-<run-id>' < fixture-queries.sql
+```
+
+`exec` addresses a **service**, and the overlay renames containers rather than
+services — so this is the same service name the live commands above use, and the
+`-f restore-override.yaml` argument is the only thing that decides which of the
+two projects it lands in. Never drop it from a rehearsal command: without it the
+identical line reads the **live** ClickHouse.
+
+Signal rows, the trace graph and the effective TTL DDL must match exactly.
+Expect the raw per-table inventory to differ for `signoz_metrics`: SigNoz's own
+self-monitoring metrics keep accruing, so a copy taken later than the baseline
+read legitimately holds more of them. Confirm that is what you are seeing by
+re-reading the **live** side now — it should have caught up to the restored
+count — rather than accepting the delta. Also check the restored app on its own
+port (`127.0.0.1:18091`), log in with the same credential, and confirm a
+dashboard you created before the snapshot is listed.
+
+Tear down with the project's own arguments, and **dry-run it first** so you can
+read the object list before anything is removed:
+
+```console
+docker compose --env-file /absolute/private/signoz.env \
+  -f pours/deployment/compose.yaml -f restore-override.yaml down --volumes --dry-run
+```
+
+Every line must name a `loom-signoz-restore-` object. If any live volume,
+container or network appears, stop: the overlay is out of step with the render.
+Re-run without `--dry-run` to finish, then `docker volume ls --filter
+name=loom-signoz-restore-` to confirm nothing survived — `down --volumes` removes
+only volumes the project declares, so a volume you created by hand for a
+tarball it turned out not to need is left behind.
+
+**Status of this procedure: the overlay renders and is contract-tested, but the
+rehearsal has not been executed against real backup tarballs yet** — see
+"Backup-restore rehearsal overlay" in `evidence.md` for exactly what was and was
+not verified. [#9279](https://github.com/rjwalters/loom/issues/9279) owns the
+live run; until it lands, treat this backup as untested.
+
+## Upgrade, wipe and Cloud
 
 Upgrade by changing explicit pins, rendering, inspecting the diff and testing
 schema migration/restore against a copy of trial data. Database migrations may

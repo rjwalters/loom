@@ -1000,6 +1000,13 @@ pub struct SweepInfo {
     /// compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// Whether this sweep was admitted through the host's
+    /// `loom:operator-priority` overflow slot (#9244): a starred issue
+    /// dispatched over the global and/or per-repo concurrency cap as this
+    /// host's single over-limit sweep. `#[serde(default)]` keeps older wire
+    /// data and clients compatible (absent parses as `false`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overflow: bool,
 }
 
 fn default_sweep_runtime() -> String {
@@ -1443,6 +1450,12 @@ pub struct DaemonStatusReport {
     /// [`Self::host_breaker`].
     #[serde(default)]
     pub rate_limit_breaker: Option<Box<RateLimitBreakerStatus>>,
+    /// Per-caller forge call accounting (Issue #9251): 200/304/limited/error
+    /// counts per caller and rate-limit pool, host-wide over the last hour
+    /// plus this daemon's since-start totals, and the latest free budget
+    /// reading. `#[serde(default)]` keeps pre-#9251 wire data compatible.
+    #[serde(default)]
+    pub forge_calls: Option<Box<ForgeCallsStatus>>,
     /// Live safehouse fleet-comms connection state (Issue #4345): distinguishes
     /// `not_configured` (no `safehouse` block / disabled) from `unreachable`
     /// (enabled, socket resolved, but the daemon's own connection attempt
@@ -1483,6 +1496,11 @@ pub struct DaemonStatusReport {
     /// data / older clients compatible.
     #[serde(default)]
     pub last_work_finder_tick: Option<WorkFinderTickSummary>,
+    /// The last starred-issue liveness pass (#9244 C): each starred issue's
+    /// landing stage, next actor and any operator ask. `None` when the pass
+    /// has not run this process, and for an older daemon's payload.
+    #[serde(default)]
+    pub operator_priority_landing: Option<StarLivenessReport>,
     /// A bounded, newest-last window of per-(root, role) role-runner tick
     /// outcomes (Issue #4761), published by the role-runner loop via
     /// [`crate::role_runner::record_role_tick`]. Carried as raw records rather
@@ -1826,167 +1844,22 @@ pub use observability_export::{
 };
 
 mod forge_events;
-pub use forge_events::{ForgeEventsState, ForgeEventsStatus};
-
-/// One work-finder tick's dispatch/skip tally, stamped with the wall-clock
-/// time it completed and the dynamic cap it ran under (Issue #4761).
-///
-/// A serializable projection of [`crate::work_finder::TickReport`] — the
-/// counters an operator reads off the `work_finder: tick — …` log line, made
-/// queryable over IPC so `loom-daemon health` can render the same one-line
-/// dispatch summary without log scraping. Deliberately a *separate* type from
-/// `TickReport`: that struct is the loop's internal per-tick accumulator and
-/// is free to change shape, whereas this is a wire contract.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkFinderTickSummary {
-    /// When the tick completed.
-    pub at: DateTime<Utc>,
-    /// The dynamic concurrency cap this tick ran under.
-    pub max_concurrent: usize,
-    /// Ready `loom:issue` rows the source returned this tick.
-    pub seen: usize,
-    /// Issues for which a new sweep was dispatched this tick.
-    pub dispatched: usize,
-    /// Issues skipped for carrying a park/skip label.
-    pub skipped_labeled: usize,
-    /// Issues skipped because a live sweep already exists for them.
-    pub skipped_in_flight: usize,
-    /// Issues skipped for an insta-crash quarantine.
-    pub skipped_quarantined: usize,
-    /// Issues skipped because their workspace is missing
-    /// `.claude/commands/loom/sweep.md` (Issue #4027 guard 2.4, quarantined
-    /// at the work-finder level by #6440) — incremented once per gated
-    /// workspace per tick, not once per candidate.
-    /// `#[serde(default)]` keeps pre-#6440 wire data / older clients
-    /// compatible (an absent field parses as `0`).
-    #[serde(default)]
-    pub skipped_workspace_commands_missing: usize,
-    /// Issues skipped because they already have an open linked PR.
-    pub skipped_pr_open: usize,
-    /// Issues skipped because a peer host advertised a live soft claim.
-    pub skipped_peer_claim: usize,
-    /// Issues skipped inside a per-issue dispatch-backoff window.
-    pub skipped_backoff: usize,
-    /// The subset of [`Self::skipped_backoff`] whose window was armed
-    /// specifically by the open-PR guard (#4123) refusing dispatch, rather
-    /// than a real dispatch failure (Issue #7606). `#[serde(default)]` keeps
-    /// pre-#7606 wire data / older clients compatible (an absent field
-    /// parses as `0`).
-    #[serde(default)]
-    pub skipped_pr_open_backoff: usize,
-    /// Issues skipped inside a no-op re-dispatch cooldown window (Issue
-    /// #6670) — a sweep self-reported "no actionable delta this pass" via
-    /// `RecordNoopRelease`. `#[serde(default)]` keeps pre-#6670 wire data /
-    /// older clients compatible (an absent field parses as `0`).
-    #[serde(default)]
-    pub skipped_noop_cooldown: usize,
-    /// Issues skipped because a **hard-exclusion rule** applies (Issue #7528) —
-    /// either the candidate itself carries a hard-exclusion label (`external`
-    /// today) or a previous sweep declined on one and the reaper's decline
-    /// cooldown has not elapsed. `#[serde(default)]` keeps pre-#7528 wire data
-    /// / older clients compatible (an absent field parses as `0`).
-    #[serde(default)]
-    pub skipped_declined: usize,
-    /// Issues skipped for self-declaring a `<!-- loom:recheck-interval=<value>
-    /// -->` marker (Issue #6685) still within its window. `#[serde(default)]`
-    /// keeps pre-#6685 wire data / older clients compatible (an absent field
-    /// parses as `0`).
-    #[serde(default)]
-    pub skipped_recheck_interval: usize,
-    /// Issues skipped because their host-affinity constraint (#7456 —
-    /// `loom:host:<id>` label / `<!-- loom:requires-host=<id> -->` body
-    /// marker) does not name this host. `#[serde(default)]` keeps pre-#7456
-    /// wire data / older clients compatible (an absent field parses as `0`).
-    #[serde(default)]
-    pub skipped_host_constraint: usize,
-    /// Issues deferred because the concurrency cap was reached.
-    pub deferred_capacity: usize,
-    /// Issues deferred because the per-tick admission ramp cap was reached.
-    pub deferred_ramp_cap: usize,
-    /// Issues deferred because the saturation admission brake held new
-    /// admissions this tick (Issue #4903) — the host was already at/over the
-    /// configured load-per-core hold threshold. Distinct from
-    /// [`Self::deferred_capacity`]: the cap was not reached, the *host* was.
-    /// `#[serde(default)]` keeps pre-#4903 wire data / older clients compatible.
-    #[serde(default)]
-    pub deferred_saturation: usize,
-    /// Dispatch attempts that returned an error.
-    pub errors: usize,
-    /// Whether any workspace was gated by the main-health halt this tick.
-    pub halted: bool,
-    /// Whether the saturation admission brake was engaged for this tick (Issue
-    /// #4903). `true` even when nothing was deferred (an empty backlog on a
-    /// saturated host), so a consumer can tell "held, nothing waiting" from
-    /// "not held". `#[serde(default)]` keeps pre-#4903 wire data compatible.
-    #[serde(default)]
-    pub saturation_held: bool,
-    /// Cumulative cross-host dispatch collisions observed by this tick's
-    /// dispatcher(s) (Issue #4085, Phase 0 of #4028) — dispatches whose
-    /// pre-flip label read showed a peer host already claimed the issue.
-    /// Mirrors [`crate::work_finder::TickReport::collisions`], which was
-    /// already logged on the per-tick `work_finder: tick — …` line but never
-    /// reached this wire-carried summary, so `loom-daemon status` /
-    /// `GetDaemonStatus` could not see it without log scraping (Issue #5302).
-    /// `#[serde(default)]` keeps pre-#5302 wire data / older clients
-    /// compatible (an absent field parses as `0`).
-    #[serde(default)]
-    pub collisions: u64,
-    /// Every ready issue this tick saw, in dispatch order, with what happened
-    /// to it (Issue #8852). Empty for a single-workspace tick and for a
-    /// pre-#8852 wire payload.
-    #[serde(default)]
-    pub queue: Vec<ReadyQueueRow>,
-    /// Repos whose ready-issue listing failed on this tick: their backlog is
-    /// missing from [`Self::queue`], which is then incomplete, not empty.
-    #[serde(default)]
-    pub listing_failed: Vec<String>,
-}
+pub use forge_events::{ForgeEventsState, ForgeEventsStatus, ForgeEventsWakeStatus};
 
 mod ready_queue;
 pub use ready_queue::{QueueDisposition, ReadyQueueRow};
+mod dispatch_plan;
+pub use dispatch_plan::{
+    DispatchPlanContext, PlanGate, PlanKey, PlanShard, PlanSlots, PlanState, RepoCapView, RowPlan,
+    PLAN_SCOPE,
+};
+mod work_finder_tick;
+pub use work_finder_tick::WorkFinderTickSummary;
 
-impl WorkFinderTickSummary {
-    /// The single-line skip-reason summary `loom-daemon health` renders —
-    /// only the non-zero terms, so a clean tick reads `12 seen, 2 dispatched`
-    /// rather than a wall of zeros.
-    #[must_use]
-    pub fn reason_summary(&self) -> String {
-        let mut parts = vec![
-            format!("{} seen", self.seen),
-            format!("{} dispatched", self.dispatched),
-        ];
-        for (n, label) in [
-            (self.skipped_labeled, "labeled-skip"),
-            (self.skipped_in_flight, "in-flight-skip"),
-            (self.skipped_quarantined, "quarantine-skip"),
-            (self.skipped_workspace_commands_missing, "workspace-commands-missing-skip"),
-            (self.skipped_pr_open, "pr-open-skip"),
-            (self.skipped_peer_claim, "peer-claim-skip"),
-            (self.skipped_backoff, "backoff-skip"),
-            (self.skipped_pr_open_backoff, "pr-open-backoff"),
-            (self.skipped_declined, "declined-skip"),
-            (self.skipped_host_constraint, "host-constraint-skip"),
-            (self.deferred_capacity, "deferred-capacity"),
-            (self.deferred_ramp_cap, "deferred-ramp"),
-            (self.deferred_saturation, "deferred-saturation"),
-            (self.errors, "error"),
-        ] {
-            if n > 0 {
-                parts.push(format!("{n} {label}"));
-            }
-        }
-        if self.collisions > 0 {
-            parts.push(format!("{} cross-host-collision(s)", self.collisions));
-        }
-        if self.halted {
-            parts.push("HALTED".to_string());
-        }
-        if self.saturation_held {
-            parts.push("SATURATION-HELD".to_string());
-        }
-        parts.join(", ")
-    }
-}
+mod star_liveness;
+pub use star_liveness::{
+    AskKind, DroppedStarIntent, LandingStage, OperatorAsk, StarLandingRow, StarLivenessReport,
+};
 
 /// One role-runner tick outcome for one `(root, role)` pair (Issue #4761).
 ///
@@ -2353,6 +2226,61 @@ pub struct RateLimitBreakerStatus {
     /// When the cached budget snapshot was probed.
     #[serde(default)]
     pub budget_probed_at: Option<DateTime<Utc>>,
+}
+
+/// Forge call accounting snapshot for `loom-daemon status` (Issue #9251).
+/// Rendered from [`crate::forge_call_stats::status_report`]; reading it costs
+/// no forge call (a local sink file read plus in-process counters).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeCallsStatus {
+    /// Width of [`Self::host_window`] in seconds (3600).
+    pub window_secs: u64,
+    /// Host-wide counts over the window, read from the per-host append-only
+    /// sink every loom process (daemon, `serve`, `status`, agent
+    /// `forge … --cached`) writes to. `None` when the sink is disabled or
+    /// unreadable.
+    #[serde(default)]
+    pub host_window: Option<Vec<ForgeCallCounts>>,
+    /// This daemon process's own counts since [`Self::since`].
+    #[serde(default)]
+    pub since_start: Vec<ForgeCallCounts>,
+    /// When this process's counters started.
+    #[serde(default)]
+    pub since: Option<DateTime<Utc>>,
+    /// Latest budget reading per pool: free `x-ratelimit-*` response headers,
+    /// or the rate-limit breaker's probe when that is newer.
+    #[serde(default)]
+    pub budget: Vec<ForgeBudgetReading>,
+}
+
+/// One caller × pool row of [`ForgeCallsStatus`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeCallCounts {
+    /// Call-site class, e.g. `work_finder`, `claim_reconciliation`.
+    pub caller: String,
+    /// Rate-limit pool spent: `core`, `graphql`, `search`, `other`.
+    pub pool: String,
+    /// `200`-class responses (a full, budget-costing answer).
+    pub ok: u64,
+    /// `304 Not Modified` (a free ETag hit).
+    pub not_modified: u64,
+    /// Rate-limited responses.
+    pub rate_limited: u64,
+    /// Any other failure.
+    pub error: u64,
+}
+
+/// A remaining-budget reading for one pool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeBudgetReading {
+    pub pool: String,
+    pub remaining: u64,
+    /// When the pool resets, when known.
+    #[serde(default)]
+    pub reset_at: Option<DateTime<Utc>>,
+    pub observed_at: DateTime<Utc>,
+    /// `headers` (free `x-ratelimit-*` on a REST response) or `breaker_probe`.
+    pub source: String,
 }
 
 /// Live idle-exit eligibility for `loom-daemon status` (Issue #5565).

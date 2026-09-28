@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { buildBurnCurves, buildPoolBurnCurves } from "../src/analytics/burn.js";
+import { buildBurnCurves, buildPoolBurnCurves, deriveAccountPoolSamples } from "../src/analytics/burn.js";
 import { parsePoolSamples, parseTokenSamples } from "../src/analytics/parse.js";
 import { HOUR, MINUTE, T0, at, newestFirst, poolTokensSnapshot, resetIds, tokensSnapshot } from "./analyticsFixtures.js";
 
@@ -266,5 +266,86 @@ describe("buildPoolBurnCurves", () => {
       poolTokensSnapshot(T0 + 5 * HOUR, { accountCount: 2, maxUsage: 0.6 }),
     ]);
     expect(buildPoolBurnCurves(samples, { maxSampleGapMs: 6 * HOUR })[0]?.segments).toHaveLength(1);
+  });
+});
+
+describe("deriveAccountPoolSamples", () => {
+  it("aggregates mean/peak usage, exhausted count and earliest reset across accounts in one sample", () => {
+    const samples = parseTokenSamples(
+      newestFirst([
+        tokensSnapshot(T0, [
+          { account: "agent-1", usage: 0.2, resetAt: T0 + 8 * HOUR, exhausted: false },
+          { account: "agent-2", usage: 0.6, resetAt: T0 + 5 * HOUR, exhausted: true },
+        ]),
+      ]),
+    );
+
+    const pool = deriveAccountPoolSamples(samples);
+
+    expect(pool).toEqual([
+      {
+        hostId: "host-a",
+        at: T0,
+        accountCount: 2,
+        exhaustedCount: 1,
+        meanUsageFraction: 0.4,
+        maxUsageFraction: 0.6,
+        nextLimitWindowResetAt: T0 + 5 * HOUR,
+      },
+    ]);
+  });
+
+  it("excludes accounts with unknown usage from the mean/peak, never coercing to 0", () => {
+    const samples = parseTokenSamples(
+      newestFirst([
+        tokensSnapshot(T0, [
+          { account: "agent-1", usage: 0.5 },
+          { account: "agent-2" }, // no usage_fraction reported
+        ]),
+      ]),
+    );
+
+    const pool = deriveAccountPoolSamples(samples);
+
+    expect(pool[0]?.accountCount).toBe(2);
+    expect(pool[0]?.meanUsageFraction).toBe(0.5);
+    expect(pool[0]?.maxUsageFraction).toBe(0.5);
+  });
+
+  it("reports undefined (not 0) mean/peak/reset when no account in the sample reported one", () => {
+    const samples = parseTokenSamples(newestFirst([tokensSnapshot(T0, [{ account: "agent-1" }])]));
+
+    const pool = deriveAccountPoolSamples(samples);
+
+    expect(pool[0]?.meanUsageFraction).toBeUndefined();
+    expect(pool[0]?.maxUsageFraction).toBeUndefined();
+    expect(pool[0]?.nextLimitWindowResetAt).toBeUndefined();
+  });
+
+  it("maps one PoolSample per TokenSample, preserving chronological order", () => {
+    const samples = parseTokenSamples(
+      newestFirst([
+        tokensSnapshot(T0, [{ account: "agent-1", usage: 0.1 }]),
+        tokensSnapshot(T0 + 10 * MINUTE, [{ account: "agent-1", usage: 0.2 }]),
+      ]),
+    );
+
+    const pool = deriveAccountPoolSamples(samples);
+
+    expect(pool.map((sample) => sample.at)).toEqual([T0, T0 + 10 * MINUTE]);
+  });
+
+  it("feeds buildPoolBurnCurves the same way a native pool sample would (segmentation still applies)", () => {
+    const samples = parseTokenSamples(
+      newestFirst([
+        tokensSnapshot(T0, [{ account: "agent-1", usage: 0.9 }]),
+        // Rollover: usage falls back toward zero.
+        tokensSnapshot(T0 + 10 * MINUTE, [{ account: "agent-1", usage: 0.05 }]),
+      ]),
+    );
+
+    const curves = buildPoolBurnCurves(deriveAccountPoolSamples(samples));
+
+    expect(curves[0]?.segments.map((segment) => segment.startedBy)).toEqual(["initial", "window-reset"]);
   });
 });

@@ -142,6 +142,12 @@ fn a_merged_linked_pr_is_not_treated_as_open() {
     assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// One `{number, body}` timeline candidate line, the post-`--jq` shape the
+/// mock `gh` emits for the cross-reference leg (#8940).
+fn timeline_candidate(number: u32, body: &str) -> String {
+    format!("{}\n", serde_json::json!({ "number": number, "body": body }))
+}
+
 /// The timeline leg is consulted when the closes-graph says `NoneOpen`: a
 /// `Part of #N` phase PR uses no closing keyword and is invisible to leg 1
 /// (#7859/#8116). Reaching it here also proves the subcommand runs the real
@@ -152,12 +158,58 @@ fn a_part_of_phase_pr_is_found_through_the_timeline_leg() {
         42,
         &[
             ("MOCK_GRAPHQL_OUT", &graphql_nodes("")),
-            ("MOCK_TIMELINE_OUT", "7777\n"),
+            ("MOCK_TIMELINE_OUT", &timeline_candidate(7777, "Part of #42")),
         ],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout.trim(), "7777", "stdout: {stdout}");
+}
+
+/// AC (#8940): the timeline leg's candidate is only a *candidate*. A PR that
+/// merely mentions `#N` — no closing keyword, no `Part of`/`Contributes to`
+/// phrase — is a bare mention, so the verdict is a verified absence (exit 1,
+/// safe to claim), identical to what `/loom:sweep`'s existing-PR probe returns
+/// for the same issue. Before the phrase filter, one stand-down comment quoting
+/// an issue number refused that issue's dispatch for as long as the mentioning
+/// PR stayed open (#8322, 6.5 days).
+#[test]
+fn a_bare_mention_is_a_verified_absence_not_an_open_linked_pr() {
+    let out = run(
+        8322,
+        &[
+            ("MOCK_GRAPHQL_OUT", &graphql_nodes("")),
+            (
+                "MOCK_TIMELINE_OUT",
+                &timeline_candidate(
+                    8314,
+                    "Filed #8322 to track it, standing down without pushing.\n\nCloses #8256",
+                ),
+            ),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stdout.trim().is_empty(), "stdout: {stdout}");
+    assert!(stderr.contains("safe to claim"), "stderr: {stderr}");
+}
+
+/// AC (#8940): the phrase filter applies to the TIMELINE leg only. A `Closes
+/// #N` PR is still an open linked PR through the closes-graph leg, which is
+/// unchanged — including when the timeline leg answers nothing at all.
+#[test]
+fn a_closing_keyword_pr_still_blocks_through_the_closes_graph_leg() {
+    let out = run(
+        8322,
+        &[
+            ("MOCK_GRAPHQL_OUT", &graphql_nodes(r#"{"number":8314,"state":"OPEN"}"#)),
+            ("MOCK_TIMELINE_OUT", ""),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout.trim(), "8314", "stdout: {stdout}");
 }
 
 /// Both transports erroring is NOT a verified absence: exit 5, and the message

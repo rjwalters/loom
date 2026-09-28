@@ -1370,9 +1370,11 @@ GITIGNORE
   # sweep it into the very first commit. Exclude the class unconditionally,
   # the same way land-resync-commit.sh / resync-installed.sh do
   # (machine-checked against loom-daemon/src/init/post_init.rs
-  # CREDENTIAL_PATTERNS by credential_class_tests.rs).
+  # CREDENTIAL_PATTERNS by credential_class_tests.rs). #9134: each exclusion
+  # carries a trailing `*` so it also excludes a sibling rename/backup (e.g.
+  # `.loom/tokens.bak-<ts>/`), not just the exact credential path.
   info "Creating initial commit..."
-  git add -A -- . ':!.loom/claude-config' ':!.loom/tokens' ':!.loom/accounts.env' ':!.loom/api-keys' ':!.loom/gh-config' ':!.loom/gh-config-by-owner'
+  git add -A -- . ':!.loom/claude-config*' ':!.loom/tokens*' ':!.loom/accounts.env*' ':!.loom/api-keys*' ':!.loom/gh-config*' ':!.loom/gh-config-by-owner*'
   git commit -m "Initial commit" --quiet || error "Failed to create initial commit"
   success "Initial commit created"
   echo ""

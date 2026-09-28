@@ -13,6 +13,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const PROTOCOL: &str = "loom-session-exec-v1";
 pub const LEASE_MS: u64 = 2000;
+/// How long the worker waits for its FIRST lease before refusing launch
+/// (#9067). A docker exec attach under CI load can take longer than one lease
+/// horizon (`LEASE_MS`) to deliver the first heartbeat; refusing at `LEASE_MS`
+/// 143'd healthy dispatches before the command ever started. Nothing is at
+/// risk before launch, so patience here is free: EOF and the explicit `cancel`
+/// line still refuse instantly, and a channel silent for the whole window
+/// expires loudly. Run-time cancellation is NOT governed by this constant — a
+/// running invocation is cancelled only by decisive channel events or by a
+/// channel silent for `LEASE_MS` (the wedged-host revocation contract, kept at
+/// its original timing; any arriving bytes reset that silence clock).
+pub const STALL_MS: u64 = 30_000;
 pub const GRACE: Duration = Duration::from_millis(1000);
 pub const POLL: Duration = Duration::from_millis(20);
 static SIGNAL: AtomicI32 = AtomicI32::new(0);

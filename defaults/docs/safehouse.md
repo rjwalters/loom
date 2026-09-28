@@ -850,19 +850,16 @@ what feeds the public fleet feed. Loom is the producer:
     `LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS=0` to opt out of the transcript scan
     entirely (the key is then simply omitted on dispatch-driven hosts).
 
-    > **`tokens` is a raw block-sum, not deduped on `message.id` (#8186).** A
-    > streamed assistant message is written to the transcript once per chunk,
-    > and every chunk repeats the same `message.id` carrying that message's
-    > **cumulative** usage, not a delta — `sum_transcript_usage`/
-    > `sum_transcript_usage_by_model` (the functions behind both `tokens` and
-    > `tokens_by_model` below) sum every block without folding on that id.
-    > Measured 2026-09-18 (24h window, 2,330 transcripts): 51% of usage blocks
-    > are repeats, so both figures run roughly 2x high versus a per-message
-    > total. This is long-standing, deliberately-left-alone behaviour (existing
-    > consumers are calibrated against it) — not a bug. For a deduped total,
-    > use `activity.db`'s ingestion path (`activity::transcript_parse`, #8059,
-    > see [`transcript-token-ingest.md`](transcript-token-ingest.md)) instead
-    > of this feed.
+    > **`tokens` and `tokens_by_model` are deduped on `message.id` as of
+    > 2026-09-28 (#9303).** A streamed assistant message is written once per
+    > chunk, each chunk repeating the same `message.id` with **cumulative**
+    > usage; `sum_transcript_usage`/`sum_transcript_usage_by_model` now keep
+    > the max of each counter per id instead of summing every block. Before
+    > that date both figures were raw block-sums, roughly 2x high (51% of
+    > usage blocks were repeats, measured 2026-09-18; #8186) — so a series
+    > spanning the change steps down by about half. It supersedes #8186's
+    > "document, don't change" decision (#8203): per-attempt cost must sum to
+    > the execution total and USD must not inherit the 2x.
   - **`tokens_by_model` (#5740)** is a per-`(model, speed, service_tier)`
     breakdown of the same transcript scan, because `tokens`' single sum
     cannot be priced: it merges five quantities (`input`, `cache_read`, the
@@ -1507,6 +1504,59 @@ The fix reuses the peer-claim channel exactly as #6352 and #6714 did — two mor
   time-bounded (dispatch backoff caps at `maxSecs`, default 900s; the no-op
   cooldown defaults to one hour) — well inside the 15-minute lease TTL's own
   reclaim cadence for the backoff lane.
+
+#### "Fleet-wide" has two preconditions, and both fail silently (#8912)
+
+The publish and consume bullets above each describe a *capability*. A window is
+actually fleet-wide only when **both** hold on **every** host, and neither
+announces itself when it does not:
+
+1. **A peer-claim publisher/view is attached at all** — i.e. `safehouse.enabled`
+   is true (or `LOOM_SAFEHOUSE_ENABLED` is exported) *on that host*. Otherwise
+   `noop_cooldown_issues` / `dispatch_backoff_issues` fall back to the local set,
+   exactly as the "Read at the existing skip-set seams" bullet says, and that
+   host re-dispatches inside every peer's window as it did pre-#7477. A fleet is
+   only as fleet-wide as its *least* configured host — and because it is the
+   **unconfigured** host that does the re-claiming, the correctly-configured
+   host's own logs look clean. `.loom/config.json` ships `safehouse.enabled:
+   false`, so a fleet relying on the start wrapper's env export gets
+   coordination on the hosts that wrapper starts and nothing on any host
+   started another way.
+2. **Ads published by peers actually arrive.** Publishing is fire-and-forget by
+   design (see the publish bullet), so a host whose *receive* path is dead
+   advertises normally, logs nothing unusual, and still sees no peer window.
+   `loom-daemon status` is where this shows up, as a `Peer claims:` line whose
+   `advertised` counter climbs while `received` stays pinned at zero:
+
+   ```
+   Peer claims: none live (self_host: loom-worker-2, ttl: 120s, room: !…,
+                advertised=3765 received=0 expired=0 dispatch_skipped=0)
+   ```
+
+   Note that the cooldown lane deliberately does not touch `counters.received`
+   (see the "Consume" bullet), so `received` counts **dispatch-claim** traffic —
+   it is a proxy for "does anything at all reach me from a peer", not a direct
+   count of cooldown ads.
+
+Reported as a bug in #8912 (a peer re-claimed `example-org/tool-repo#1` 196 s
+into a 3600 s cooldown on 2026-09-25); the recording host honoured its own window
+throughout and never re-dispatched. **Do not read that incident as proving
+precondition 1 alone** — a fleet host measured while investigating #8912 had
+`LOOM_SAFEHOUSE_ENABLED=1` exported into the daemon process (so a publisher and
+view *were* attached, precondition 1 satisfied) and still reported
+`advertised=3765 received=0`. Precondition 2 is tracked separately in **#9294**;
+the #7477 mechanism itself was re-read during #8912 and no defect was found in
+it — in particular the cooldown lane's expiry is `received_at + remaining_secs`
+in its own map (see the "TTL measured against local receipt" bullet), so the
+120 s `peerClaimTtlSecs` does **not** truncate a 3600 s cooldown.
+
+Precondition 1 was previously invisible, so `record_noop_release` now logs it at
+the moment it matters — "issue #N's no-op cooldown is HOST-LOCAL only — no
+peer-claim publisher is attached on this host" — and `grep HOST-LOCAL
+~/.loom/daemon.log` answers it per host without reading any config. That line
+says nothing about precondition 2: a host that never prints it can still be
+receiving nothing, which is why the `advertised`/`received` counters above are
+the second thing to check.
 
 ### Fleet-wide token-pool exhaustion hold: the third brake lane (#8001)
 

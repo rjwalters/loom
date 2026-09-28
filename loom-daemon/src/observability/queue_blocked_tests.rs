@@ -34,7 +34,14 @@ fn repo(visibility: RepoVisibility) -> QueueRepoRef {
 #[test]
 fn a_blocked_issue_without_loom_issue_becomes_an_unranked_blocked_row() {
     let listing = vec![
-        item(5, &["loom:blocked", "tier:goal-advancing", "loom:urgent"]),
+        item(
+            5,
+            &[
+                "loom:blocked",
+                "tier:goal-advancing",
+                "loom:operator-priority",
+            ],
+        ),
         // Already in the ready listing: the work finder has its row.
         item(6, &["loom:blocked", "loom:issue"]),
         // A PR in the REST issues listing.
@@ -52,7 +59,8 @@ fn a_blocked_issue_without_loom_issue_becomes_an_unranked_blocked_row() {
     assert_eq!(row.disposition, QueueDisposition::LabelledBlocked);
     assert_eq!(row.state, "blocked");
     assert_eq!(row.reason, "blocked: labelled loom:blocked");
-    assert!(row.urgent);
+    // Starred is reported; `urgent` is always false since #9244.
+    assert!(row.operator_priority && !row.urgent);
     assert_eq!(row.tier.as_deref(), Some("tier:goal-advancing"));
     assert_eq!(row.detail, None);
     let wire = serde_json::to_value(row).unwrap();

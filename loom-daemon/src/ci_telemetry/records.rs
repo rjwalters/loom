@@ -57,6 +57,58 @@ pub struct PullRequestRefJson {
     pub number: u64,
 }
 
+/// A run row's `head_commit` — the commit the run executed against. Only the
+/// message is read: its subject is the poller-visible signal that a run was
+/// triggered by the #8508 re-date remedy (#9337).
+#[derive(Debug, Clone, Deserialize)]
+pub struct HeadCommitJson {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub tree_id: Option<String>,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// Why a workflow run attempt happened — `loom.ci.trigger_reason` on the
+/// `loom.ci.run` span and the `ci.run` record (#9337).
+///
+/// A pure function of ONE `/actions/runs` row ([`RunJson::trigger_reason`]),
+/// so a replayed or second-host emission always attributes identically. No
+/// cross-run comparison (e.g. "tree-identical to the previous head"): that
+/// would need state across polls and hosts and break replay determinism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerReason {
+    /// Fresh code on the head: a push / PR / merge-queue event whose head
+    /// commit is not the re-date remedy's. Known under-count of the other
+    /// values: a `gh pr update-branch` / `git merge main` head or a
+    /// hand-pushed `--allow-empty` commit is a freshness bump in spirit but
+    /// lands here, because a merge commit can also be real conflict work.
+    NewCommit,
+    /// The head commit is the #8508 re-date remedy's tree-identical no-op
+    /// commit, pushed because `main` moved under a green PR (#8248 guard).
+    StaleMainBump,
+    /// `run_attempt > 1`: the same run re-run in place on the same head
+    /// (`gh run rerun`, "Re-run failed jobs", …). The cause of the re-run is
+    /// not knowable from the row; the name is kept from #9337.
+    FlakyRetry,
+    /// Anything else: `workflow_dispatch`, `schedule`, `issue_comment`, …, or
+    /// a row without a head commit message to rule the re-date remedy out.
+    Unknown,
+}
+
+impl TriggerReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TriggerReason::NewCommit => "new_commit",
+            TriggerReason::StaleMainBump => "stale_main_bump",
+            TriggerReason::FlakyRetry => "flaky_retry",
+            TriggerReason::Unknown => "unknown",
+        }
+    }
+}
+
 /// One `GET /repos/{o}/{r}/actions/runs` row.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RunJson {
@@ -87,6 +139,10 @@ pub struct RunJson {
     /// `pull_request`-triggered runs, empty otherwise (Issue #9007).
     #[serde(default)]
     pub pull_requests: Vec<PullRequestRefJson>,
+    /// The commit the run executed against (#9337); absent or `null` in
+    /// older recordings — attribution then falls to `unknown`.
+    #[serde(default)]
+    pub head_commit: Option<HeadCommitJson>,
 }
 
 impl RunJson {
@@ -123,6 +179,43 @@ impl RunJson {
         self.head_branch
             .as_deref()
             .and_then(crate::claim_reconciliation::parse_issue_from_branch)
+    }
+
+    /// Why this run attempt happened (#9337). Evaluated in order:
+    ///
+    /// 1. `run_attempt > 1` → [`TriggerReason::FlakyRetry`] (a re-run of a
+    ///    re-date head is still a re-run: the in-place re-run is the more
+    ///    recent trigger);
+    /// 2. no head commit message → [`TriggerReason::Unknown`] (the re-date
+    ///    remedy cannot be ruled out);
+    /// 3. the message's first line is the #8508 re-date subject
+    ///    ([`crate::merge_pr::redate::is_redate_commit_subject`]) →
+    ///    [`TriggerReason::StaleMainBump`];
+    /// 4. `event ∈ {push, pull_request, pull_request_target, merge_group}` →
+    ///    [`TriggerReason::NewCommit`];
+    /// 5. otherwise [`TriggerReason::Unknown`].
+    #[must_use]
+    pub fn trigger_reason(&self) -> TriggerReason {
+        if self.run_attempt > 1 {
+            return TriggerReason::FlakyRetry;
+        }
+        let Some(subject) = self
+            .head_commit
+            .as_ref()
+            .and_then(|c| c.message.lines().next())
+            .filter(|s| !s.is_empty())
+        else {
+            return TriggerReason::Unknown;
+        };
+        if crate::merge_pr::redate::is_redate_commit_subject(subject) {
+            return TriggerReason::StaleMainBump;
+        }
+        match self.event.as_str() {
+            "push" | "pull_request" | "pull_request_target" | "merge_group" => {
+                TriggerReason::NewCommit
+            }
+            _ => TriggerReason::Unknown,
+        }
     }
 
     /// Milliseconds the run queued before starting: `run_started_at −
@@ -205,11 +298,15 @@ fn span_status(conclusion: Option<&str>) -> SpanStatus {
     }
 }
 
+/// Span attributes, stamped with the recording daemon's provenance. The
+/// derived IDs stay host-independent; only these attributes name the recorder.
 fn attrs(pairs: Vec<(&str, Option<String>)>) -> TraceAttributes {
-    pairs
+    let mut attributes = pairs
         .into_iter()
         .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
-        .collect()
+        .collect();
+    crate::telemetry::trace::provenance::stamp(&mut attributes);
+    attributes
 }
 
 fn envelope(
@@ -231,6 +328,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
     let duration = duration_ms(started_at, completed_at);
     let workflow = run.workflow();
     let ctx = run_context(&repo.full_name, run.id, run.run_attempt);
+    let trigger_reason = run.trigger_reason().as_str();
     let record = CiRunRecord {
         repo: repo.full_name.clone(),
         visibility: repo.visibility(),
@@ -251,6 +349,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         completed_at,
         duration_ms: duration,
         queued_ms: run.queued_ms(),
+        trigger_reason: Some(trigger_reason.to_string()),
     };
     let duration_record = CiDurationRecord {
         metric: CiDurationMetric::Run,
@@ -285,6 +384,8 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
             ("loom.ci.ref", run.head_branch.clone()),
             ("loom.pr_number", run.pr_number().map(|n| n.to_string())),
             ("loom.ci.queued_ms", run.queued_ms().map(|ms| ms.to_string())),
+            ("loom.ci.run_attempt", Some(run.run_attempt.to_string())),
+            ("loom.ci.trigger_reason", Some(trigger_reason.to_string())),
         ]),
         events: Vec::new(),
         links: Vec::new(),

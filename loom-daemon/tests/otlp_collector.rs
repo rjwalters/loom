@@ -103,22 +103,26 @@ fn real_collector_decodes_installed_binary_logs_metrics_and_correlated_traces() 
     let ack: serde_json::Value = serde_json::from_str(&ack).unwrap();
     assert_eq!(ack["exported_envelopes"], 6);
     let deadline = Instant::now() + Duration::from_secs(10);
-    let text = loop {
+    // The file exporter flushes through a buffer, so a read can end mid-line.
+    // Wait until the file ends on a newline and every line parses, not just
+    // until the three signal names first appear.
+    let (text, decoded): (String, Vec<serde_json::Value>) = loop {
         let text =
             std::fs::read_to_string(evidence.path().join("received.json")).unwrap_or_default();
         if text.contains("resourceLogs")
             && text.contains("resourceMetrics")
             && text.contains("resourceSpans")
+            && text.ends_with('\n')
         {
-            break text;
+            let parsed: Result<Vec<serde_json::Value>, _> =
+                text.lines().map(serde_json::from_str).collect();
+            if let Ok(decoded) = parsed {
+                break (text, decoded);
+            }
         }
         assert!(Instant::now() < deadline, "collector never decoded all three signals: {text}");
         std::thread::sleep(Duration::from_millis(100));
     };
-    let decoded: Vec<serde_json::Value> = text
-        .lines()
-        .map(|s| serde_json::from_str(s).unwrap())
-        .collect();
     let logs: Vec<_> = decoded
         .iter()
         .filter_map(|v| v["resourceLogs"].as_array())

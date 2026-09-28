@@ -39,7 +39,12 @@
 //!
 //! - **`G`** — global inputs: the check's own scripts, its baseline / allowlist
 //!   / budget files, and `.github/workflows/ci.yml`. A change to any of these
-//!   can flip the verdict for *every* file.
+//!   can flip the verdict for *every* file. `ci.yml` is the one entry judged
+//!   below whole-file granularity: [`super::workflow_scope`] attributes **each
+//!   side's** hunks to the job/component blocks they edit — `D`'s against the
+//!   base tip's workflow, `P`'s against the PR head's — so a change to a job no
+//!   required context runs is not a global-input move on that side (#9065). Any
+//!   unattributable edit keeps the whole-file meaning, per side.
 //! - **`S`** — per-file scanned paths: the verdict for each such file depends
 //!   only on that file's own content, plus `G`.
 //! - **`C`** — coupled paths: cross-file aggregates (a SUM over a set) or links
@@ -77,10 +82,18 @@
 //!   `G`, `S` and `C`, so a path listed too broadly can only make the guard
 //!   refuse more often.
 
+use super::workflow_scope::{CiScope, CiScopes};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// `.github/workflows/ci.yml` is a global input to every required context:
 /// it is where the job's steps, its runner and its path filters live.
+///
+/// It is the **only** `G` entry that is narrowed below the whole file: one
+/// path covers ~25 jobs of which three are required, so #9065 attributes each
+/// side's `ci.yml` hunks to the job/component blocks they edit (see
+/// [`super::workflow_scope`]) and lets clauses 1 and 2 fire only for the
+/// components whose own definition moved on that side. Every unattributable
+/// edit restores the whole-file meaning.
 pub const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 
 /// One side's changed-path set — `D` (the base move) or `P` (the PR delta).
@@ -104,8 +117,17 @@ impl FileSet {
     /// The first path (in sorted order, so the reason text is deterministic)
     /// matching any of `patterns`.
     fn first_match(&self, patterns: &[&str]) -> Option<&str> {
+        self.first_match_scoped(patterns, false)
+    }
+
+    /// [`Self::first_match`], optionally treating [`CI_WORKFLOW`] as absent —
+    /// the #9065 narrowing (see
+    /// [`stale_reason_scoped`]), applied to whichever side the caller is
+    /// matching.
+    fn first_match_scoped(&self, patterns: &[&str], skip_ci: bool) -> Option<&str> {
         self.paths
             .iter()
+            .filter(|p| !(skip_ci && p.as_str() == CI_WORKFLOW))
             .find(|p| patterns.iter().any(|pat| glob_match(pat, p)))
             .map(String::as_str)
     }
@@ -134,6 +156,11 @@ pub struct BaseMove {
     pub tested_base: String,
     /// `D` — `compare/B...tip`, with validated version restamps removed.
     pub files: FileSet,
+    /// Which components a `.github/workflows/ci.yml` entry in `files` is a
+    /// global input *for* (#9065). [`CiScope::Unscoped`] — the default, and the
+    /// answer to every unattributable `ci.yml` edit — is the pre-#9065
+    /// whole-file meaning.
+    pub ci_scope: CiScope,
 }
 
 /// The input-scoped evidence for one PR: `P`, plus `B`/`D` per required
@@ -142,6 +169,14 @@ pub struct BaseMove {
 pub struct ScopedEvidence {
     /// `P` — the PR's own delta.
     pub pr_delta: FileSet,
+    /// Which components a `.github/workflows/ci.yml` entry in [`Self::pr_delta`]
+    /// is a global input *for* (#9065), attributed against the **PR head's**
+    /// workflow. [`CiScope::Unscoped`] — the default, and the answer to every
+    /// unattributable edit — is the pre-#9065 whole-file meaning.
+    ///
+    /// One value for the whole PR, not one per context: `P` is a single file
+    /// set read once, unlike `D`, which is keyed on each context's tested base.
+    pub pr_ci_scope: CiScope,
     /// Per required context, the base it tested and the move since.
     pub base_moves: BTreeMap<String, BaseMove>,
     /// Per required context with no `base_moves` entry, why — surfaced as the
@@ -198,13 +233,45 @@ impl std::fmt::Display for StaleReason {
 
 /// Apply the input-scoped predicate: `None` = this check's tested verdict
 /// still holds on the merged tree; `Some(reason)` = it does not.
+///
+/// `ci.yml` keeps its whole-file `G` meaning; [`stale_reason_scoped`] is the
+/// form that narrows it (#9065).
 #[must_use]
 pub fn stale_reason(spec: &CheckSpec, d: &FileSet, p: &FileSet) -> Option<StaleReason> {
+    stale_reason_scoped(spec, d, p, &CiScopes::unscoped())
+}
+
+/// [`stale_reason`] with each side's `ci.yml` attribution (#9065).
+///
+/// Both sides are narrowed, each against the tree its own patch's new side
+/// belongs to (see [`CiScopes`]), and each independently: a side with no
+/// attribution to offer stays [`CiScope::Unscoped`], i.e. keeps `ci.yml`'s
+/// whole-file `G` meaning, with no effect on the other.
+///
+/// The `P`-side narrowing reaches **clauses 1 and 2 only** — the two whose
+/// patterns include `G`, and therefore the only two where `P`'s `ci.yml` entry
+/// can match at all. Clauses 3-5 match `P` against `scanned` / `coupled` /
+/// `removed` and are left un-narrowed on that side: over-refusing is the
+/// direction this guard is allowed to err in.
+#[must_use]
+pub fn stale_reason_scoped(
+    spec: &CheckSpec,
+    d: &FileSet,
+    p: &FileSet,
+    ci: &CiScopes,
+) -> Option<StaleReason> {
     if d.is_empty() {
         // The base has not moved (once validated restamps are discounted), so
         // the tree the check tested IS the tree it will merge onto.
         return None;
     }
+    // When a side's ci.yml hunks land outside this component's own job block
+    // (and outside everything that job needs), that path is not one of this
+    // check's inputs and must not read as a global-input move.
+    let skip_ci_d = !ci.base.affects(spec.context);
+    let skip_ci_p = !ci.pr.affects(spec.context);
+    let d_match = |pats: &[&str]| d.first_match_scoped(pats, skip_ci_d);
+    let p_match = |pats: &[&str]| p.first_match_scoped(pats, skip_ci_p);
     let any: Vec<&str> = spec
         .global
         .iter()
@@ -215,7 +282,7 @@ pub fn stale_reason(spec: &CheckSpec, d: &FileSet, p: &FileSet) -> Option<StaleR
 
     // Clause 1: main changed a global input, and the PR has something for that
     // input to re-judge.
-    if let (Some(b), Some(pp)) = (d.first_match(spec.global), p.first_match(&any)) {
+    if let (Some(b), Some(pp)) = (d_match(spec.global), p_match(&any)) {
         return Some(StaleReason {
             clause: "the base move changed a global input of this check",
             base_path: Some(b.to_string()),
@@ -224,7 +291,7 @@ pub fn stale_reason(spec: &CheckSpec, d: &FileSet, p: &FileSet) -> Option<StaleR
     }
     // Clause 2: the PR changed a global input, and main has something for it
     // to re-judge.
-    if let (Some(pp), Some(b)) = (p.first_match(spec.global), d.first_match(&any)) {
+    if let (Some(pp), Some(b)) = (p_match(spec.global), d_match(&any)) {
         return Some(StaleReason {
             clause: "this PR changes a global input of this check and the base moved under it",
             base_path: Some(b.to_string()),
@@ -232,9 +299,14 @@ pub fn stale_reason(spec: &CheckSpec, d: &FileSet, p: &FileSet) -> Option<StaleR
         });
     }
     // Clause 3: both sides touched the same per-file scanned path.
-    if let Some(shared) = d.paths.iter().find(|path| {
-        p.paths.contains(*path) && spec.scanned.iter().any(|pat| glob_match(pat, path))
-    }) {
+    if let Some(shared) = d
+        .paths
+        .iter()
+        .filter(|path| !(skip_ci_d && path.as_str() == CI_WORKFLOW))
+        .find(|path| {
+            p.paths.contains(*path) && spec.scanned.iter().any(|pat| glob_match(pat, path))
+        })
+    {
         return Some(StaleReason {
             clause: "the base move and this PR both touch the same scanned file",
             base_path: Some(shared.clone()),
@@ -242,7 +314,7 @@ pub fn stale_reason(spec: &CheckSpec, d: &FileSet, p: &FileSet) -> Option<StaleR
         });
     }
     // Clause 4: both sides touched the coupled (cross-file aggregate/link) set.
-    if let (Some(b), Some(pp)) = (d.first_match(spec.coupled), p.first_match(spec.coupled)) {
+    if let (Some(b), Some(pp)) = (d_match(spec.coupled), p.first_match(spec.coupled)) {
         return Some(StaleReason {
             clause: "the base move and this PR both touch this check's coupled inputs",
             base_path: Some(b.to_string()),
@@ -253,9 +325,12 @@ pub fn stale_reason(spec: &CheckSpec, d: &FileSet, p: &FileSet) -> Option<StaleR
     // touches the linking files. The vanished path need not itself be linkable
     // — a deleted script breaks a doc link naming it.
     if spec.removal_sensitive {
-        if let (Some(b), Some(pp)) =
-            (d.removed.iter().next(), p.first_match(spec.coupled).map(str::to_string))
-        {
+        if let (Some(b), Some(pp)) = (
+            d.removed
+                .iter()
+                .find(|path| !(skip_ci_d && path.as_str() == CI_WORKFLOW)),
+            p.first_match(spec.coupled).map(str::to_string),
+        ) {
             return Some(StaleReason {
                 clause: "the base move deleted or renamed a path while this PR touches the \
                          linking files",
@@ -264,7 +339,7 @@ pub fn stale_reason(spec: &CheckSpec, d: &FileSet, p: &FileSet) -> Option<StaleR
             });
         }
         if let (Some(pp), Some(b)) =
-            (p.removed.iter().next(), d.first_match(spec.coupled).map(str::to_string))
+            (p.removed.iter().next(), d_match(spec.coupled).map(str::to_string))
         {
             return Some(StaleReason {
                 clause: "this PR deletes or renames a path while the base move touches the \
@@ -307,17 +382,19 @@ pub fn specs_for(context: &str) -> Option<Vec<&'static CheckSpec>> {
     }
 }
 
-/// [`stale_reason`] for a required context made of `components`: the first
-/// stale component (in table order) and why, or `None` when none is stale.
+/// [`stale_reason_scoped`] for a required context made of `components`: the
+/// first stale component (in table order) and why, or `None` when none is
+/// stale.
 #[must_use]
 pub fn composite_stale_reason(
     components: &[&'static CheckSpec],
     d: &FileSet,
     p: &FileSet,
+    ci: &CiScopes,
 ) -> Option<(&'static str, StaleReason)> {
     components
         .iter()
-        .find_map(|spec| stale_reason(spec, d, p).map(|r| (spec.context, r)))
+        .find_map(|spec| stale_reason_scoped(spec, d, p, ci).map(|r| (spec.context, r)))
 }
 
 // --- Shared pattern groups ---------------------------------------------------

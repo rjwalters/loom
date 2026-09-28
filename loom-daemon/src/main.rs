@@ -193,7 +193,8 @@ enum Commands {
     },
 
     /// Show the work finder's ready queue in its real dispatch order
-    /// (workspace priority, `loom:urgent`, oldest first) with what the last
+    /// (starred `loom:operator-priority` first, then red-main fixes, workspace
+    /// priority, oldest first — #9244) with what the last
     /// tick did with each issue and why, plus a freshness line (Issue #8852).
     Queue {
         /// Emit machine-readable JSON instead of the human-readable table.
@@ -399,6 +400,15 @@ enum Commands {
         /// bail-out on a host that was never meant to run it.
         #[arg(long)]
         ignore_host_constraint: bool,
+
+        /// Override the host-class gate (Issue #9034): by default, dispatching a
+        /// `loom:heavy` issue on a host classified `host_class: local-dev`
+        /// (`autonomous.workFinder.hostClass` / `LOOM_HOST_CLASS`) refuses with a
+        /// clear message. Pass `--allow-local` to dispatch anyway — an operator
+        /// hand-dispatching a known-heavy issue on their own machine on purpose is
+        /// not the case this gate exists to stop.
+        #[arg(long)]
+        allow_local: bool,
     },
 
     /// Cancel a running sweep via the running daemon (Issue #4980): the `dispatch`
@@ -1916,8 +1926,9 @@ enum ForgeAction {
         #[arg(value_name = "PR")]
         pr_number: u32,
 
-        /// Merge method (squash | merge | rebase). Default squash.
-        #[arg(long, default_value = "squash")]
+        /// Merge method (merge | squash | rebase). Default merge (#9105: merge
+        /// commits preserve the branch's full history).
+        #[arg(long, default_value = "merge")]
         method: String,
 
         /// Optimistic-concurrency precondition (#5589, mirrors #5579's shell

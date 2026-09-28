@@ -95,12 +95,43 @@
 //! macOS does not have, a `--reference` fast path whose `[[ -d ]]` test was
 //! evaluated from the wrong directory and therefore never once fired, and a
 //! `$$`-keyed failure flag written into world-writable `/tmp`.
+//!
+//! Slice 9 is [`upstream`]: the upstream-tracking correction and the
+//! stale-worktree drift report. It is the one slice that took **two** blocks of
+//! the script at once, because they were two hand-maintained copies of the same
+//! fix — #6095/#6100 corrected a branch's wrong upstream on the reuse arm, and
+//! #6257 discovered eighteen months later that "a completely different code
+//! path" (its own words, still in the script) needed the identical correction
+//! and re-implemented it by hand. This is the epic's *"two implementations of
+//! the same question"* in its most literal form, and both defects shipped
+//! **silently**: their failure mode is not a wrong message but no message, and
+//! an upstream left pointing at the default branch so a later
+//! `git pull --ff-only` fast-forwards a PR branch onto `main`'s tip.
+//!
+//! [`stale_ref`] is not a port slice either: like [`issue_lock`] it is
+//! `worktree.sh` growing NEW logic (#8287) that has to stand on the Rust side
+//! because that file is frozen — and, more pointedly, because the logic's hard
+//! part is a [`branch_landed`] question, which now has exactly one
+//! implementation. Its first attempt (PR #8351) added the decision as inline
+//! bash to a `contract`-category library and the shell budget ratchet refused
+//! it; #8354 is that refusal honoured rather than argued with. It answers
+//! *which* reference the already-registered-worktree fast path may judge
+//! staleness — and therefore `git reset --hard` — against, when a live
+//! `origin/<branch>` carries the branch's real commits and the local branch
+//! does not (the #8147/#8190 incident).
+//!
+//! [`closed_pr_branch`] is the same kind of addition (#9083): the third arm of
+//! the branch-resolution contract the shell had no answer for — a pushed
+//! `origin/feature/issue-N` whose tip is the head of a PR CLOSED WITHOUT
+//! MERGING. It is deliberately NOT a fourth [`branch_landed`] verdict; see its
+//! module doc for why that primitive's three-way answer stays three-way.
 
 pub mod baseline;
 pub mod branch_conflict;
 pub mod branch_delete;
 pub mod branch_landed;
 pub mod cleanup;
+pub mod closed_pr_branch;
 pub mod default_branch;
 pub mod issue_lock;
 pub mod link;
@@ -108,5 +139,7 @@ pub mod lock;
 pub mod remove;
 pub mod reset;
 pub mod snapshot;
+pub mod stale_ref;
 pub mod submodules;
+pub mod upstream;
 pub mod wip;

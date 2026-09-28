@@ -209,21 +209,6 @@ pub fn initialize_workspace(
     merge_config_file(&defaults, &loom_path, &mut report)?;
     copy_single_file(&defaults, &loom_path, ".loom-README.md", ".loom/README.md", &mut report)?;
 
-    // `.loom/biome.jsonc` (#6031): a nested Biome configuration that takes the
-    // whole machine-managed `.loom/` tree out of a consumer's repo-wide
-    // `biome check .`. Without it the shipped Workflow-tool experiment script
-    // (`.loom/scripts/experiments/judge-fanout-workflow.js`, which legally uses
-    // top-level `return`) is a hard PARSE error and the installer-emitted JSON
-    // stamps are perpetual format diffs — in files the consumer never wrote.
-    //
-    // The manifest generator (scripts/install/manifest.sh) walks
-    // `defaults/.loom/` and registers every file under it as Loom-installed, so
-    // this copy must exist or the installer's post-install metadata-vs-disk
-    // check fails with "MISSING: .loom/biome.jsonc" and rolls the install back.
-    // Overwritten wholesale on reinstall: it is Loom payload, not consumer
-    // configuration (contrast `merge_config_file` above).
-    copy_single_file(&defaults, &loom_path, ".loom/biome.jsonc", ".loom/biome.jsonc", &mut report)?;
-
     // `.loom/pricing.json` (#8177): the model rate card
     // `activity::pricing_card` loads at runtime, so a vendor price change can
     // reach the fleet on a resync rather than on a Loom release.
@@ -264,20 +249,29 @@ pub fn initialize_workspace(
     // `defaults/runtimes/...` on every consumer dispatch.
     sync_managed_dir(&defaults, &loom_path, "runtimes", is_reinstall, &ownership, &mut report)?;
 
-    // Sync `.loom/bin/` from `defaults/.loom/bin/`. The manifest generator
-    // (scripts/install/manifest.sh) walks `defaults/.loom/` and registers
-    // every file under it as Loom-installed, so the bin/ subdirectory must
-    // be copied here or the post-install metadata-vs-disk verification
-    // fails fast on missing `.loom/bin/loom`. Pass `defaults/.loom` as the
-    // helper's `defaults` arg so src=`defaults/.loom/bin` and dst=`.loom/bin`.
-    sync_managed_dir(
-        &defaults.join(".loom"),
-        &loom_path,
-        "bin",
-        is_reinstall,
-        &ownership,
-        &mut report,
-    )?;
+    // Materialize `defaults/.loom/` -> `<workspace>/.loom/` by WALKING the
+    // source tree (#9123). Every entry is discovered, none is named here:
+    // this is the copy-side counterpart of the `find defaults/ -type f` walk
+    // in `scripts/install/manifest.sh::_emit_installed_files_manifest`, which
+    // registers everything under `defaults/.loom/` as Loom-installed. The two
+    // enumerations are now the same enumeration, so a file added to
+    // `defaults/.loom/` cannot be recorded in `install-metadata.json` while
+    // never reaching disk.
+    //
+    // Members of that tree and the issues that put them there, for grep value
+    // — none of these names appears in the walk itself: `.loom/bin/loom` (the
+    // CLI wrapper), `.loom/biome.jsonc` (#6031 — the nested Biome config that
+    // takes the whole machine-managed `.loom/` tree out of a consumer's
+    // repo-wide `biome check .`, without which the shipped Workflow-tool
+    // experiment script is a hard PARSE error and every installer-emitted JSON
+    // stamp is a perpetual format diff), `.loom/credentials.md.example`
+    // (#9123 — the file whose absence exposed this divergence), and the
+    // template-substituted `.loom/CLAUDE.md` / `.loom/AGENTS.md` that
+    // `setup_repository_scaffolding` writes instead (see
+    // `LOOM_TREE_SCAFFOLDED_FILES`). All are Loom payload, overwritten
+    // wholesale on reinstall — contrast `merge_config_file` above, which
+    // exists because `.loom/config.json` is consumer configuration.
+    sync_loom_payload_tree(&defaults, &loom_path, is_reinstall, &ownership, &mut report)?;
 
     make_shell_scripts_executable(&loom_path.join("hooks"));
     make_shell_scripts_executable(&loom_path.join("scripts"));
@@ -286,6 +280,14 @@ pub fn initialize_workspace(
     // Update .gitignore and setup scaffolding
     update_gitignore(workspace)?;
     setup_repository_scaffolding(workspace, &defaults, force, &mut report)?;
+
+    // Post-condition for the `defaults/.loom/` walk above (#9123). Run AFTER
+    // scaffolding, because the two template-substituted members of that tree
+    // (`.loom/CLAUDE.md`, `.loom/AGENTS.md`) are written by
+    // `setup_repository_scaffolding`, not by the verbatim walk. Checking here
+    // covers them too, so `LOOM_TREE_SCAFFOLDED_FILES` cannot silently become
+    // a way to drop a file from the install.
+    assert_loom_payload_tree_complete(&defaults, &loom_path)?;
 
     // Verify all copied files match their sources
     verify_all_copied_files(workspace, &defaults, &loom_path, &mut report);
@@ -733,6 +735,195 @@ pub(crate) fn deep_merge_existing_wins(base: &mut Value, overlay: &Value) {
     }
 }
 
+/// Files under `defaults/.loom/` that `setup_repository_scaffolding` writes
+/// itself, with template substitution, later in the same init run.
+///
+/// The verbatim walk in [`sync_loom_payload_tree`] must not also copy these —
+/// doing so would install the raw `{{LOOM_VERSION}}`-carrying source only for
+/// scaffolding to overwrite it moments later, and would double-report the same
+/// path as both `added` and `updated`.
+///
+/// This is an **alternate-handler** list, never an exclusion list: every name
+/// in it is still required on disk by
+/// [`assert_loom_payload_tree_complete`], which runs after scaffolding. Adding
+/// a name here therefore cannot drop a file from the install — it can only
+/// move responsibility for writing it.
+///
+/// One qualifier on "cannot drop a file": that post-condition is
+/// existence-only ([`collect_missing_files`] tests `dst.exists()`), so it is
+/// exactly true for a FRESH install. On a reinstall over a populated
+/// `.loom/`, a top-level file named here with no handler behind it is
+/// satisfied by the copy the previous install left — `sync_managed_dir`'s
+/// ownership-gated clean covers subdirectories, not top-level `.loom/` files —
+/// so the failure mode there is content frozen at the old version rather than
+/// a missing file. That is deliberate rather than a gap: this assertion
+/// mirrors the installer's own metadata-vs-disk check, which is
+/// existence-only too, and a fresh install still fails loudly.
+const LOOM_TREE_SCAFFOLDED_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
+
+/// Whether a `defaults/` entry is a transient local artifact — an editor or
+/// runtime leftover the install must SKIP — rather than shipped payload.
+///
+/// Named for what it returns `true` for (`.DS_Store`, `*.log`, `*.sock`); the
+/// callers are all `if is_transient_artifact(&name) { continue; }`.
+///
+/// Mirrors the `find -not -name ...` filters in
+/// `scripts/install/manifest.sh::_emit_installed_files_manifest`. Keeping the
+/// two in step is what lets the copy walk and the manifest walk be compared as
+/// sets (issue #9123); a name excluded here must be excluded there.
+fn is_transient_artifact(name: &str) -> bool {
+    name == ".DS_Store" || name.ends_with(".log") || name.ends_with(".sock")
+}
+
+/// Materialize `defaults/.loom/` into `<workspace>/.loom/` by walking the
+/// source tree rather than by naming its members (issue #9123).
+///
+/// Before this existed, the `defaults/.loom/` subtree was materialized by a
+/// hand-written list of call sites — one `copy_single_file` for
+/// `.loom/biome.jsonc`, one `sync_managed_dir` for `.loom/bin/`, and the
+/// template-substituted `CLAUDE.md`/`AGENTS.md` writes inside
+/// `setup_repository_scaffolding`. The manifest generator
+/// (`scripts/install/manifest.sh`) has always *walked* `defaults/.loom/` and
+/// registered every file it finds. A file added to `defaults/.loom/` was
+/// therefore recorded in `install-metadata.json` and never copied:
+/// `defaults/.loom/credentials.md.example` shipped that way, failing
+/// `install.sh --full`'s post-install metadata-vs-disk check and passing
+/// silently under `--quick`, which does not run that check.
+///
+/// Both surfaces are now plain walks of the same directory, so the set they
+/// produce is the same set by construction.
+///
+/// Subdirectories go through [`sync_managed_dir`] (ownership-gated clean on
+/// reinstall, plus its own post-copy completeness assertion); top-level files
+/// are copied verbatim, except the [`LOOM_TREE_SCAFFOLDED_FILES`] handled by
+/// `setup_repository_scaffolding`.
+fn sync_loom_payload_tree(
+    defaults: &Path,
+    loom_path: &Path,
+    is_reinstall: bool,
+    ownership: &OwnershipBoundary,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    sync_loom_payload_tree_with(
+        defaults,
+        loom_path,
+        is_reinstall,
+        ownership,
+        report,
+        LOOM_TREE_SCAFFOLDED_FILES,
+    )
+}
+
+/// [`sync_loom_payload_tree`] with the alternate-handler list injected.
+///
+/// The seam exists for one test: the safety argument for
+/// [`LOOM_TREE_SCAFFOLDED_FILES`] is that a name on it can move responsibility
+/// for writing a file but can never drop one, and demonstrating that needs a
+/// listed name that NO handler writes — a state the shipped list cannot be put
+/// in without editing the const, because both of its current members are
+/// written unconditionally by `setup_repository_scaffolding` whenever their
+/// source exists. Production has exactly one caller, immediately above.
+fn sync_loom_payload_tree_with(
+    defaults: &Path,
+    loom_path: &Path,
+    is_reinstall: bool,
+    ownership: &OwnershipBoundary,
+    report: &mut InitReport,
+    scaffolded: &[&str],
+) -> Result<(), String> {
+    let src_root = defaults.join(".loom");
+    if !src_root.is_dir() {
+        return Ok(());
+    }
+
+    // Two residual differences from the `manifest.sh` walk this one is meant to
+    // match, recorded here so the next reader does not have to re-derive that
+    // they are safe (#9130 review):
+    //
+    // 1. `manifest.sh` also consults `defaults/.loom-internal.list` and skips
+    //    exact matches; this walk does not. That list has no `.loom/*` entry
+    //    today, so the two sets agree. If one were ever added, the divergence
+    //    would be in the BENIGN direction — the copy would ship a file the
+    //    manifest never records, i.e. a leaked file that `uninstall` will not
+    //    remove, rather than a file recorded as installed that never reached
+    //    disk, which is the #9123 failure that rolls an install back. The
+    //    dangerous direction stays impossible as long as the exclusion is
+    //    one-sided like this: the manifest's set remains a subset of this one's.
+    // 2. `find -L` follows symlinks; `fs::read_dir` + `file_type()` does not.
+    //    `defaults/.loom/` contains no symlinks. A symlinked directory added
+    //    there would be descended into by the manifest and would reach
+    //    `copy_single_file` -> `fs::copy` on a directory here — a hard error
+    //    that fails the init, not a silent drop.
+    //
+    // Deterministic order so a report/diff is stable across filesystems.
+    let mut entries: Vec<fs::DirEntry> = fs::read_dir(&src_root)
+        .map_err(|e| format!("Failed to read {}: {e}", src_root.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to read {}: {e}", src_root.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    for entry in entries {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy().into_owned();
+        if is_transient_artifact(&name) {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to stat {}: {e}", entry.path().display()))?;
+
+        if file_type.is_dir() {
+            // `defaults/.loom` is passed as the helper's `defaults` arg so
+            // src=`defaults/.loom/<name>` and dst=`.loom/<name>`.
+            sync_managed_dir(&src_root, loom_path, &name, is_reinstall, ownership, report)?;
+        } else if !scaffolded.contains(&name.as_str()) {
+            let rel = format!(".loom/{name}");
+            copy_single_file(defaults, loom_path, &rel, &rel, report)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Assert every file `defaults/.loom/` ships reached `<workspace>/.loom/`.
+///
+/// The copy-side post-condition for [`sync_loom_payload_tree`], and the reason
+/// [`LOOM_TREE_SCAFFOLDED_FILES`] is safe: a name on that list is skipped by
+/// the verbatim walk but still required here, so the only way to omit a file
+/// from the install is to delete it from `defaults/.loom/` — which also drops
+/// it from `install-metadata.json`, keeping the two enumerations in agreement
+/// (issue #9123).
+///
+/// Fails the init rather than warning: an incomplete `.loom/` is exactly the
+/// state `install.sh --full` rolls back and `--quick` used to ship.
+fn assert_loom_payload_tree_complete(defaults: &Path, loom_path: &Path) -> Result<(), String> {
+    let src_root = defaults.join(".loom");
+    if !src_root.is_dir() {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    collect_missing_files(&src_root, loom_path, "", &mut missing);
+    missing.retain(|rel| !rel.rsplit('/').next().is_some_and(is_transient_artifact));
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    missing.sort();
+    Err(format!(
+        "Install incomplete: {} file(s) shipped in defaults/.loom/ never reached .loom/ \
+         (these ARE recorded in install-metadata.json, so the install would fail its own \
+         completeness check): {}",
+        missing.len(),
+        missing
+            .iter()
+            .map(|rel| format!(".loom/{rel}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 /// Sync a managed directory: clean stale **Loom-owned** files on reinstall,
 /// then copy fresh from defaults.
 ///
@@ -885,3 +1076,10 @@ mod tests;
 
 #[cfg(test)]
 mod credential_class_tests;
+
+// #9123 tests live in their own file rather than in `tests.rs`: that module is
+// over the `scripts/check-file-size-budget.sh` threshold and frozen at its
+// recorded size, so additions go to a sibling module.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod loom_payload_tree_tests;

@@ -156,6 +156,12 @@ export interface SweepInfo {
    * Absent/undefined on pre-#3929 entries.
    */
   repo?: string;
+  /**
+   * True when the work finder admitted this sweep through the host's
+   * `loom:operator-priority` overflow slot (#9244): a starred issue run as the
+   * host's single sweep over the concurrency cap. Absent means false.
+   */
+  overflow?: boolean;
 }
 
 interface DispatchResponse {
@@ -1276,13 +1282,13 @@ function formatSweepLine(info: SweepInfo): string {
     `  Started:    ${info.started_at}`,
   ];
   if (info.latest_phase) parts.push(`  Phase:      ${info.latest_phase}`);
-  if (info.pr_number !== undefined && info.pr_number !== null)
-    parts.push(`  PR:         #${info.pr_number}`);
+  if (info.pr_number != null) parts.push(`  PR:         #${info.pr_number}`);
   // Issue #3929: name the owning managed-workspace root when present so two
   // repos' identically-numbered issues are distinguishable in the listing.
   if (info.repo) parts.push(`  Repo:       ${info.repo}`);
-  if (info.idempotency_key)
-    parts.push(`  Idem. key:  ${info.idempotency_key}`);
+  if (info.idempotency_key) parts.push(`  Idem. key:  ${info.idempotency_key}`);
+  // Issue #9244: the host's single over-limit starred sweep.
+  if (info.overflow) parts.push("  Overflow:   yes (starred, over the concurrency cap)");
   return parts.join("\n");
 }
 

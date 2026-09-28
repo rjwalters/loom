@@ -189,6 +189,59 @@ impl Selection {
         }
         Ok(())
     }
+    /// Re-verify this prepared selection as containment evidence (#8787).
+    ///
+    /// Everything is re-measured, nothing is remembered: the owned lease's
+    /// durable job, the bound container re-inspected **by immutable ID** (not
+    /// by its mutable Docker name) with its settings, mounts and exclusive
+    /// volume/profile ownership re-validated, and the in-container
+    /// `loom-private-control-v1` boundary re-observed and matched against the
+    /// identity bound at preparation. Any drift since preparation — a
+    /// replaced, renamed, stopped or peer-attached container, a changed mount
+    /// topology, an altered guard bundle, registration or profile control
+    /// file — fails closed here, before admission.
+    ///
+    /// # Errors
+    /// A fixed, secret-free obligation string naming what could not be proven.
+    pub fn contain(&self, root: &Path) -> Result<containment::ContainmentProof> {
+        let prepared = self.prepared.as_ref().context(containment::UNPREPARED)?;
+        let job = lease::read(&prepared.lease.dir)?.context(containment::UNPREPARED)?;
+        let (config, dir) = lifecycle::resolve(root, &self.name)?;
+        if dir != prepared.lease.dir || job.base_revision.is_empty() {
+            bail!("{}", containment::UNPREPARED);
+        }
+        let state = docker::inspect_id(&job.container_id)?.context(containment::DRIFTED)?;
+        docker::validate(&config, &state)?;
+        if state["Id"] != job.container_id.as_str() || state["State"]["Running"] != true {
+            bail!("{}", containment::DRIFTED);
+        }
+        let report = docker::recheck_control(&config, &job.container_id, &job.control)?;
+        containment::host_proof(&config, &report, &job)
+    }
+
+    /// Persist the secret-free containment provenance beside the durable job,
+    /// so `session status` and post-session recovery can both see exactly what
+    /// this admission relied on.
+    ///
+    /// # Errors
+    /// When the selection holds no prepared lease, or the record cannot be
+    /// written durably.
+    pub fn record_admission(
+        &self,
+        admitted: &crate::runtime_admission::ResolvedRuntime,
+    ) -> Result<()> {
+        let prepared = self.prepared.as_ref().context(containment::UNPREPARED)?;
+        save(
+            &prepared.lease.dir.join(lease::ADMISSION),
+            &serde_json::json!({
+                "role": admitted.role,
+                "runtime": admitted.runtime,
+                "source": admitted.source,
+                "execution": admitted.execution,
+            }),
+        )
+    }
+
     pub(super) fn lease(&self) -> Option<&lease::Lease> {
         self.prepared.as_ref().map(|p| &p.lease)
     }

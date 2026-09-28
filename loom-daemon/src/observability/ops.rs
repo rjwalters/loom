@@ -24,9 +24,10 @@
 //! multi-workspace tick, #8856). [`pool_marks`] (#8931) emits a
 //! reason-classified counter at each seam that marks a pool account, and one
 //! span per pool dispatch hold. [`turnaround`] (#8929) covers slot turnaround
-//! and idle slots per host, and [`stage_dwell`] forge label-stage dwell. A
-//! new emitter adds a `MetricName`/`SpanName`
-//! variant and calls the same two functions.
+//! and idle slots per host, [`stage_dwell`] forge label-stage dwell, and
+//! [`disposition`] (#9222) one span per ready-queue row's disposition, on
+//! transition or periodic refresh. A new emitter adds a `MetricName`/
+//! `SpanName` variant and calls the same two functions.
 //!
 //! Tests observe what a seam emitted through the global functions with
 //! [`capture::capture`], a per-thread recorder (test builds only).
@@ -34,6 +35,7 @@
 #[cfg(test)]
 pub mod capture;
 pub mod dispatch;
+pub mod disposition;
 pub mod dwell;
 pub mod host;
 pub mod pool_marks;

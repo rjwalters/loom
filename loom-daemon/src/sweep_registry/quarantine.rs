@@ -59,6 +59,22 @@ pub const DEFAULT_QUARANTINE_TTL_SECS: u64 = 3600;
 /// never counts here.
 pub const DEFAULT_QUARANTINE_INSTA_CRASH_SECS: i64 = 60;
 
+/// Env var overriding the quarantine-*release* retry ceiling (Issue #8953): the
+/// number of consecutive failed `loom:blocked` -> `loom:issue` label-restore
+/// attempts [`SweepRegistry::attempt_quarantine_release`] will make for one
+/// issue before giving up and surfacing a single `error` log line instead of
+/// retrying forever at full reaper-tick cadence. A zero/invalid value falls
+/// through to config/default.
+pub const QUARANTINE_MAX_RELEASE_ATTEMPTS_ENV: &str =
+    "LOOM_WORK_FINDER_QUARANTINE_MAX_RELEASE_ATTEMPTS";
+
+/// Default quarantine-release retry ceiling (Issue #8953). At the default 30s
+/// reaper interval this bounds one permanently-failing label edit to ~10
+/// minutes of retries — well short of the 68-retry/~34-minute `#127` incident
+/// this issue is named for — while still giving an ordinary transient `gh`
+/// hiccup (the common case #4110 exists for) many chances to clear on its own.
+pub const DEFAULT_QUARANTINE_MAX_RELEASE_ATTEMPTS: u32 = 20;
+
 /// Marker substring embedded in every quarantine comment body posted by
 /// [`SweepRegistry::apply_quarantine_label`] (Issue #3939). Used by
 /// [`crate::quarantine_reconciliation`] (Issue #4110) to distinguish a
@@ -82,6 +98,11 @@ pub struct QuarantineConfig {
     /// The insta-crash wall-clock window: a checkpoint-less terminal transition
     /// within this many seconds of dispatch counts as an insta-crash.
     pub insta_crash_secs: i64,
+    /// Consecutive failed `loom:blocked` -> `loom:issue` release attempts
+    /// before [`SweepRegistry::attempt_quarantine_release`] gives up retrying
+    /// one issue (Issue #8953). Distinct from `threshold` (insta-crash
+    /// accrual into quarantine) — this bounds the *release* retry instead.
+    pub max_release_attempts: u32,
 }
 
 impl Default for QuarantineConfig {
@@ -91,6 +112,7 @@ impl Default for QuarantineConfig {
             threshold: DEFAULT_QUARANTINE_THRESHOLD,
             ttl: Duration::from_secs(DEFAULT_QUARANTINE_TTL_SECS),
             insta_crash_secs: DEFAULT_QUARANTINE_INSTA_CRASH_SECS,
+            max_release_attempts: DEFAULT_QUARANTINE_MAX_RELEASE_ATTEMPTS,
         }
     }
 }
@@ -241,6 +263,9 @@ pub struct QuarantineFileConfig {
     /// `autonomous.workFinder.quarantine.instaCrashSecs` — insta-crash window, in
     /// seconds (zero/invalid dropped to `None`).
     pub insta_crash_secs: Option<u64>,
+    /// `autonomous.workFinder.quarantine.maxReleaseAttempts` — the release-retry
+    /// ceiling (Issue #8953; zero/invalid dropped to `None`).
+    pub max_release_attempts: Option<u32>,
 }
 
 /// Read `.loom/config.json → autonomous.workFinder.quarantine` (Issue #3939),
@@ -269,6 +294,11 @@ pub fn read_quarantine_file_config(repo_root: &Path) -> QuarantineFileConfig {
             .get("instaCrashSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
+        max_release_attempts: q
+            .get("maxReleaseAttempts")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&n| n > 0)
+            .and_then(|n| u32::try_from(n).ok()),
     }
 }
 
@@ -308,11 +338,19 @@ pub fn resolve_quarantine_config(repo_root: &Path) -> QuarantineConfig {
         .and_then(|s| i64::try_from(s).ok())
         .unwrap_or(DEFAULT_QUARANTINE_INSTA_CRASH_SECS);
 
+    let max_release_attempts = std::env::var(QUARANTINE_MAX_RELEASE_ATTEMPTS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .or(file.max_release_attempts)
+        .unwrap_or(DEFAULT_QUARANTINE_MAX_RELEASE_ATTEMPTS);
+
     QuarantineConfig {
         enabled,
         threshold,
         ttl: Duration::from_secs(ttl_secs),
         insta_crash_secs,
+        max_release_attempts,
     }
 }
 
@@ -957,47 +995,6 @@ impl SweepRegistry {
             issue,
             quarantined_at,
         )
-    }
-
-    /// Retry every issue in [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
-    /// (Issue #4110). Called every [`reap_once`](Self::reap_once) tick, right
-    /// after [`expire_quarantine`](Self::expire_quarantine): a previously
-    /// failed `loom:blocked` -> `loom:issue` restore (transient `gh` failure or
-    /// timeout, #3973) is retried here until it succeeds, instead of leaving
-    /// the issue permanently stranded. Cheap early-return when nothing is
-    /// pending. Idempotent — re-running the flip on an issue that a human
-    /// already restored by hand is a harmless no-op `gh` call.
-    pub(crate) fn retry_pending_quarantine_releases(&mut self) {
-        if self.pending_quarantine_release.is_empty() {
-            return;
-        }
-        let pending: Vec<u32> = self.pending_quarantine_release.iter().copied().collect();
-        for issue in pending {
-            self.attempt_quarantine_release(issue);
-        }
-    }
-
-    /// Attempt the `loom:blocked` -> `loom:issue` label restore for `issue`
-    /// (Issue #4110). On success, clears any pending-retry record. On
-    /// failure, records `issue` in [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
-    /// (if not already there) and logs at `warn` — a silent strand is the
-    /// defect this exists to prevent, so the failure must be visible above
-    /// the default log level.
-    pub(crate) fn attempt_quarantine_release(&mut self, issue: u32) {
-        if self.release_quarantine_label(issue) {
-            self.pending_quarantine_release.remove(&issue);
-        } else {
-            let first_attempt = self.pending_quarantine_release.insert(issue);
-            log::warn!(
-                "sweep_registry: quarantine release for #{issue} failed — `loom:blocked` may \
-                 remain stranded on the forge; retrying on the next reaper tick (#4110){}",
-                if first_attempt {
-                    ""
-                } else {
-                    " (repeated failure)"
-                }
-            );
-        }
     }
 
     /// Best-effort release of every currently-quarantined issue's
@@ -2490,6 +2487,7 @@ exit 0
                 threshold: Some(4),
                 ttl_secs: Some(900),
                 insta_crash_secs: Some(45),
+                max_release_attempts: None,
             }
         );
     }
@@ -2584,3 +2582,9 @@ mod empty_pool_tests;
 #[cfg(test)]
 #[path = "quarantine_dispatch_scope_tests.rs"]
 mod dispatch_scope_tests;
+
+/// The quarantine-*release* retry policy (#4110 + the #8953 breaker check and
+/// attempt ceiling) — a sibling file per the file-size ratchet, same reason
+/// `provider_health_feedback.rs` was split out of this module.
+#[path = "quarantine_release.rs"]
+mod quarantine_release;

@@ -301,6 +301,8 @@ fn run_probe_against_pool(
     // `--ranking`-gated — see `super::tokens_weekly_points` for why this is
     // the call site (it rides the daemon's existing ranking-refresh cadence).
     super::tokens_weekly_points::record_probe_run(ranking, &report);
+    // Issue #9005: the per-account 7d axis, for `tokens.snapshot` telemetry.
+    super::tokens_weekly_points::write_weekly_sidecar(ranking, tokens_dir, &report);
     report
 }
 

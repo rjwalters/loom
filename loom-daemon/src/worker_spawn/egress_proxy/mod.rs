@@ -46,15 +46,26 @@
 //!
 //! Both go through [`arm`] and [`run_with_proxy`], so they share one registry
 //! shape, one placeholder format and one set of refusals.
+//!
+//! # Account rotation (#8818)
+//!
+//! Only the [`exec`] path can rotate: it knows the launch's pool account and
+//! workspace, so it installs a [`rotation::HostPool`] and the container asks
+//! for a swap through [`rotation::ROTATE_PATH`] (client:
+//! `loom-daemon worker proxy-rotate`, [`rotate_client`]). The native path
+//! installs nothing, and every rotation request there is refused.
 
 pub mod exec;
 pub mod registry;
+pub mod rotate_client;
+pub mod rotation;
 pub mod server;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
 
 use super::{containment, credential, profiles::Selection, LaunchError};
+use crate::api_keys_pool::bad_marks;
 pub use registry::{HeaderStyle, Record, Refusal, Registry, Upstream};
 
 use serde_json::Value;
@@ -261,6 +272,20 @@ pub fn prepare(
         .clone()
         .or_else(|| selection.profile.clone())
         .unwrap_or_else(|| selection.provider.clone());
+    // #8699: only a POOL-selected credential may ever be bad-marked at the
+    // proxy — an env export (#8363's one-off trial path) is never touched,
+    // mirroring `ingest::LaunchRecord::is_pool_selected`'s guard 1. When it is
+    // pool-selected, `resolved.provider` is already the pool's own provider
+    // namespace (the first arm of the `provider` fallback chain above), so no
+    // separate field is needed to carry it into the bad-mark call.
+    let pool_attribution = (resolved.source == credential::Source::Pool)
+        .then(|| resolved.account.clone())
+        .flatten()
+        .map(|account| PoolAttribution {
+            workspace_root: root.to_path_buf(),
+            account,
+            model_class: bad_marks::normalize_model_class(&selection.model),
+        });
     arm(
         secret,
         provider,
@@ -268,8 +293,20 @@ pub fn prepare(
         upstream,
         &[source.as_str(), target.as_str()],
         vec![crate::api_keys_pool::paths::per_repo_api_keys_dir(root)],
+        pool_attribution,
     )
     .map(Some)
+}
+
+/// The pool attribution [`arm`] needs so the proxy can bad-mark this launch's
+/// account on a 429/quota-exhausted response (#8699). `None` for a
+/// non-pool-selected credential (an env export, #8363) or a non-pool-capable
+/// caller (`exec::build`'s Claude path, #8697) — the proxy bad-marks nothing
+/// in either case.
+struct PoolAttribution {
+    workspace_root: std::path::PathBuf,
+    account: String,
+    model_class: Option<String>,
 }
 
 /// Bind the listener, mint the placeholder and register the launch record —
@@ -290,6 +327,7 @@ fn arm(
     upstream: Upstream,
     credential_names: &[&str],
     mask_dirs: Vec<std::path::PathBuf>,
+    pool_attribution: Option<PoolAttribution>,
 ) -> Result<Prepared, LaunchError> {
     let (bind_ip, container_host) = resolve_bind();
     let bound = server::Bound::bind(bind_ip).map_err(|e| {
@@ -300,10 +338,16 @@ fn arm(
     let launch_id = uuid::Uuid::new_v4().simple().to_string();
     let placeholder = Placeholder::generate();
     let registry = Registry::new();
-    registry.insert(
-        &placeholder,
-        Record::new(launch_id.clone(), provider, upstream.clone(), declared.header, secret),
-    );
+    let mut record =
+        Record::new(launch_id.clone(), provider, upstream.clone(), declared.header, secret);
+    if let Some(attribution) = pool_attribution {
+        record = record.with_pool_account(
+            attribution.workspace_root,
+            attribution.account,
+            attribution.model_class,
+        );
+    }
+    registry.insert(&placeholder, record);
 
     // The placeholder is assigned under EVERY credential name (for a native
     // profile: its source variable and its harness-facing target), so the
@@ -354,7 +398,16 @@ fn arm(
 /// the container's lifetime is to stay alive as its parent. The child keeps
 /// this process's process group, so the daemon's existing process-group
 /// teardown reaps both; `--rm` still removes the container.
-pub fn run_with_proxy(prepared: Prepared, mut command: Command) -> Result<(), LaunchError> {
+///
+/// Once the child has exited and the placeholder is dead, the launch's
+/// per-request usage tally (#8699) is written to `log` — the same retained
+/// launch log that carries the dispatch markers — as one
+/// [`Record::usage_marker`] line per launch, keyed by `launch_id`.
+pub fn run_with_proxy(
+    prepared: Prepared,
+    mut command: Command,
+    log: &mut dyn std::io::Write,
+) -> Result<(), LaunchError> {
     let Prepared {
         registry, bound, ..
     } = prepared;
@@ -385,8 +438,23 @@ pub fn run_with_proxy(prepared: Prepared, mut command: Command) -> Result<(), La
     // Invalidate FIRST, whatever happened: a placeholder that escaped the
     // container must be dead the moment the launch is over.
     registry.close_all();
+    write_usage_markers(&registry, log);
     let status = status?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Write every launch's usage line to `log`. Best-effort: a failed write is
+/// logged and never changes the launch's exit status.
+pub(crate) fn write_usage_markers(registry: &Registry, log: &mut dyn std::io::Write) {
+    for line in registry.usage_markers() {
+        if let Err(error) = writeln!(log, "{line}") {
+            log::warn!("egress-proxy: could not write usage marker: {error}");
+            return;
+        }
+    }
+    if let Err(error) = log.flush() {
+        log::warn!("egress-proxy: could not flush usage marker: {error}");
+    }
 }
 
 /// Where the listener binds, and the hostname the container reaches it at.

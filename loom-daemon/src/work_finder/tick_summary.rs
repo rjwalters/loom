@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use super::{ready_queue, TickReport};
+use super::{dispatch_plan, ready_queue, TickReport};
 use crate::types::WorkFinderTickSummary;
 
 /// Process-global slot holding the most recent completed tick's summary.
@@ -45,7 +45,7 @@ pub fn publish_tick_summary_with_roots_at(
     at: chrono::DateTime<chrono::Utc>,
     roots: &[PathBuf],
 ) {
-    store_tick_summary(tick_summary(report, max_concurrent, at, roots));
+    store_tick_summary(tick_summary(report, max_concurrent, at, roots, None));
 }
 
 /// Make `summary` the most recent tick's.
@@ -56,16 +56,22 @@ fn store_tick_summary(summary: WorkFinderTickSummary) {
 }
 
 /// The wire summary of `report` (pure; [`publish_tick_summary_with_roots_at`]
-/// stores it).
+/// stores it). With `plan` inputs (the multi-workspace loop), the rows are
+/// annotated with the dispatch plan and the summary carries its `plan` block
+/// (Issue #9288).
 #[must_use]
 pub fn tick_summary(
     report: &TickReport,
     max_concurrent: usize,
     at: chrono::DateTime<chrono::Utc>,
     roots: &[PathBuf],
+    plan: Option<&dispatch_plan::PlanInputs>,
 ) -> WorkFinderTickSummary {
+    let mut queue = ready_queue::finish(&report.queue, roots);
+    let plan = plan.map(|inputs| dispatch_plan::annotate(report, &mut queue, inputs));
     WorkFinderTickSummary {
-        queue: ready_queue::finish(&report.queue, roots),
+        queue,
+        plan,
         listing_failed: ready_queue::repo_names(&report.listing_failed, roots),
         at,
         max_concurrent,
@@ -127,17 +133,33 @@ pub(super) fn reset_last_tick_summary() {
 /// (#8860 — a no-op unless an OTLP exporter is running), including the
 /// ready-queue depth gauges (#8852 phase 2) and dwell signals (#8856).
 /// `started_at` is when the tick's candidate evaluation began; `roots` names
-/// each ready-queue row's repo (#8852 — empty for the single-workspace loop).
+/// each ready-queue row's repo (#8852 — empty for the single-workspace loop);
+/// `plan` is the multi-workspace loop's dispatch-plan context (#9288 — `None`
+/// for the single-workspace loop, which records no rows).
 pub fn publish_tick(
     report: &TickReport,
     max_concurrent: usize,
     started_at: chrono::DateTime<chrono::Utc>,
     roots: &[PathBuf],
+    plan: Option<&dispatch_plan::PlanInputs>,
 ) {
-    let summary = tick_summary(report, max_concurrent, chrono::Utc::now(), roots);
+    // Captured once and threaded through both the summary and the tick span
+    // (Issue #9222): `ops::disposition` matches a later sample's
+    // `WorkFinderTickSummary::at` against `dispatch::last_tick_context()` to
+    // decide whether to parent its spans to this tick, which only works if
+    // the two "this tick completed at" instants are bit-identical rather than
+    // two separate `Utc::now()` reads a few lines apart.
+    let completed_at = chrono::Utc::now();
+    let summary = tick_summary(report, max_concurrent, completed_at, roots, plan);
     crate::observability::ops::queue::record_queue(&summary);
     store_tick_summary(summary);
-    crate::observability::ops::dispatch::record_tick(report, max_concurrent, started_at);
+    crate::observability::ops::dispatch::record_tick(
+        report,
+        max_concurrent,
+        started_at,
+        completed_at,
+        roots,
+    );
     // #8856: queue dwell and starvation, from the same per-issue rows.
     crate::observability::ops::dwell::record_tick(report, roots, started_at);
     // #8929: idle slots, and idle slot-seconds while ready work waited.

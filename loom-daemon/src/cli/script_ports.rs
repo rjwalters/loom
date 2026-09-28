@@ -81,6 +81,20 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     WorktreeLock(super::worktree_lock::WorktreeLockCommand),
 
+    /// `worktree.sh`/`spawn-claude.sh`/`lib/cargo-target-dir.sh`'s per-worktree
+    /// cargo target dir (#8458): provision one and record its marker, derive
+    /// the path a not-yet-created worktree would get, or answer the two
+    /// removal-side predicates (`is-attributable`, `marker`). The two creation
+    /// verbs exit 0 always — "the feature is off" is an answer, not an error,
+    /// and must never abort a worktree creation over a build-cache
+    /// optimisation. The two predicates use their exit code as the answer.
+    /// `resolve` + `reclaim` (#9153) are `merge-pr.sh`'s post-merge #7239
+    /// reclaim — the last bash copy of that call sequence — split at the point
+    /// the removal has to happen: `cargo metadata` needs the manifest that is
+    /// about to disappear. Both exit 0 always; the merge already succeeded.
+    #[command(subcommand)]
+    CargoTargetDir(super::cargo_target_dir::CargoTargetDirCommand),
+
     /// `worktree.sh`'s WIP-shelving verbs (#8195, slice 2): `snapshot`,
     /// `stash-push`, `stash-pop`. The part of that script whose entire purpose
     /// is not losing somebody's uncommitted work — and whose `stash-push` runs
@@ -141,6 +155,37 @@ pub(crate) enum ScriptPortCommand {
     /// contract, and the worktree already exists.
     WorktreeSubmodules(super::worktree_submodules::WorktreeSubmodulesArgs),
 
+    /// `worktree.sh`'s upstream-tracking correction and stale-worktree drift
+    /// report (#8195 slice 9) — which the script carried as TWO hand-
+    /// maintained copies of the same fix, one per create-path arm
+    /// (#6095/#6100 on branch reuse, #6257/#6291 on the registered-worktree
+    /// fast path), differing only in a noun and in whether the
+    /// behind-the-pushed-tip report runs. Both defects shipped silently:
+    /// their failure mode is a message that is never printed and an upstream
+    /// that is never corrected. Exit 0 always — advisory repair; a repo that
+    /// cannot be fetched from must not block worktree creation.
+    WorktreeUpstream(super::worktree_upstream::WorktreeUpstreamArgs),
+
+    /// `worktree.sh`'s staleness REFERENCE for the already-registered-worktree
+    /// fast path (#8287, ported in #8354): `origin/<branch>` whenever that ref
+    /// exists and has not already landed as a merged PR (the #5657 skip), else
+    /// `BASE_REF` as before — plus the ahead/behind counts measured against
+    /// whichever it chose. The decision that stops a `git reset --hard` onto
+    /// the base from discarding an open PR's only local trace (#8147/#8190).
+    /// Exit 0 always; one line, four tokens.
+    WorktreeStaleRef(super::worktree_stale_ref::WorktreeStaleRefArgs),
+
+    /// `worktree.sh`'s CLOSED-UNMERGED arm (#9083): the third state a pushed
+    /// `origin/feature/issue-N` can be in, next to the open-PR (#4823/#7765)
+    /// and merged-PR (#5657) arms that already had answers. A tip that is the
+    /// head of a PR closed WITHOUT merging carries work somebody decided not
+    /// to take, and reusing it silently seeded a worktree with a reverted
+    /// slice plus a rejected follow-up, tens of commits behind `main` (the
+    /// #8195 incident). Exit 0 = proceed and reuse as before, 1 = refuse; every
+    /// inability to decide is 0, because a forge outage must never block
+    /// worktree creation.
+    WorktreeClosedPrBranch(super::worktree_closed_pr_branch::WorktreeClosedPrBranchArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -162,6 +207,14 @@ pub(crate) enum ScriptPortCommand {
     /// `daemon_start`'s module doc for why "did it start?" is not a test of
     /// that.
     DaemonStart(super::daemon_start::DaemonStartArgs),
+
+    /// Fetch-or-rebuild, provision and restart the daemon (#8088), backing
+    /// `loom-daemon-update.sh` — epic #7810's last and highest-risk port,
+    /// because the file it provisions over is very often the binary
+    /// executing right now. See `daemon_update::selfrepl` for the
+    /// self-replacement design and why `resolve_daemon_bin()` is the wrong
+    /// helper for the post-roll version check.
+    DaemonUpdate(super::daemon_update::DaemonUpdateArgs),
 
     /// The combined "not a work item" label list for a role prompt's
     /// unfiltered fallback query (#8255): the fleet-wide hard exclusions
@@ -257,6 +310,34 @@ pub(crate) enum ScriptPortCommand {
     /// **always exit 0** — it reports, it never relabels. Not a port: brand-new
     /// logic, native from the start per the shell-language policy.
     CheckStaleBlocked(super::stale_blocked::StaleBlockedArgs),
+
+    /// Per-segment PR latency, derived live from the forge timeline (#8923):
+    /// review-queue wait, approval path, `loom:pr`→merged **split by operator
+    /// gate**, Doctor response, and verdict invalidations — plus the live queue
+    /// view with **dwell, not PR age**. `--advise` is the pre-wave advisory
+    /// form: open PRs only, warns past `--threshold-hours`, always exit 0.
+    /// Read-only; it never writes a label or a comment. Not a port: brand-new
+    /// logic, native from the start per the shell-language policy.
+    PrLatency(super::pr_latency_cmd::PrLatencyArgs),
+
+    /// Render and read the `loom:blocked` **park record** (#8925) — the
+    /// machine-readable `<!-- loom:park Blocked by: #N … -->` marker a role
+    /// writes into an artifact body when it applies the label. `render` is what
+    /// keeps the format from drifting when an LLM copies it out of prose;
+    /// `parse` is its inverse for a shell caller. Pure — no forge read, no label
+    /// write. See `defaults/docs/park-record.md`.
+    #[command(subcommand)]
+    ParkRecord(super::park_record::ParkRecordCommand),
+
+    /// Curator's `<!-- loom:points=<N> -->` estimate-marker validation
+    /// (#9056), backing `require-complexity-marker.sh`'s points-marker gate.
+    /// Reads the issue body on stdin — the same body the shell script's own
+    /// complexity-tier check already fetched, no second `gh` call. Not a
+    /// port of a whole script: the complexity-tier half of
+    /// `require-complexity-marker.sh` stays inline shell, unchanged; only the
+    /// new points check moved here, to keep the #7810 `shell-budget` gate a
+    /// non-event for this addition.
+    CheckPointsMarker(super::points_marker_check::CheckPointsMarkerArgs),
 }
 
 impl ScriptPortCommand {
@@ -276,6 +357,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
+            ScriptPortCommand::CargoTargetDir(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeWip(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeRemove(args) => args.run(),
             ScriptPortCommand::WorktreeLink(args) => args.run(),
@@ -283,10 +365,14 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeReset(args) => args.run(),
             ScriptPortCommand::WorktreeBranchConflict(args) => args.run(),
             ScriptPortCommand::WorktreeSubmodules(args) => args.run(),
+            ScriptPortCommand::WorktreeUpstream(args) => args.run(),
+            ScriptPortCommand::WorktreeStaleRef(args) => args.run(),
+            ScriptPortCommand::WorktreeClosedPrBranch(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
+            ScriptPortCommand::DaemonUpdate(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
@@ -298,6 +384,9 @@ impl ScriptPortCommand {
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
+            ScriptPortCommand::PrLatency(args) => args.run(),
+            ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
+            ScriptPortCommand::CheckPointsMarker(args) => args.run(),
         }
     }
 }
@@ -315,6 +404,14 @@ pub(crate) enum MergePrCommand {
     /// tree that no longer exists. Exit 0+CLEAN = fresh, 1 = stale, 2 =
     /// could not determine (must also refuse).
     StaleChecks(super::merge_pr_stale_checks::StaleChecksArgs),
+
+    /// The stale-cached-mergeable recheck decision (#6104): once REST
+    /// `.mergeable` has read `false`, classify the backoff re-reads plus the
+    /// local `git merge-tree` corroboration into `merge:` / `refuse-stale:` /
+    /// `refuse-conflict:` — distinguishing "genuinely conflicts" from "the
+    /// forge's cached state is stale/unknown". Always exits 0 with exactly
+    /// one `<action>:<reason>` line; the I/O loop stays in the shell.
+    MergeableRecheck(super::merge_pr_mergeable_recheck::MergeableRecheckArgs),
 
     /// Decide whether a head-SHA-mismatch refusal was caused by THIS merge
     /// run's own base-sync push (#8164) and may be retried once against a
@@ -339,6 +436,24 @@ pub(crate) enum MergePrCommand {
     /// overridden (see stdout for which), 1 = absent with no override.
     LoomPrGuard(super::merge_pr_loom_pr_guard::LoomPrGuardArgs),
 
+    /// The `champion:hold-state` staleness WARNING (#7419 AC #3): the other
+    /// half of `loom-pr-guard`'s story, fired only when `loom:pr` IS present
+    /// and Champion's recorded hold head is not the head about to merge.
+    /// Advisory, never a gate — always exits 0 (stdout is either the
+    /// `LOOM-HOLD-STATE-CLEAN` sentinel or the warning), except exit 2 when
+    /// the comment stream could not be read at all.
+    HoldState(super::merge_pr_hold_state::HoldStateArgs),
+
+    /// The async-close-race worktree-cleanup gate (#4186): whether a merged
+    /// PR's issue is actually finished, so a partial-increment worktree the
+    /// next Builder increment still needs is not removed out from under it.
+    /// Reads `forge_pr_close_targets`'s output on stdin; `--state` is
+    /// OPTIONAL and supplied only on the shell's second call. Exit 0 =
+    /// cleanup authorized (`CLOSE-TARGET`/`STATE-CLOSED`), 1 = preserve, 3 =
+    /// the shell must fetch `forge_get_issue_state` and call again with
+    /// `--state` — see `cli::merge_pr_issue_close_gate`.
+    IssueCloseGate(super::merge_pr_issue_close_gate::IssueCloseGateArgs),
+
     /// `_maybe_delete_local_branch` (#4100/#5015/#7812): the squash-aware
     /// local-branch delete rule, now shared verbatim with `worktree.sh
     /// remove` (#8195 slice 3) instead of duplicated. Always exits 0 — a
@@ -346,17 +461,140 @@ pub(crate) enum MergePrCommand {
     /// and prints one `LEVEL<TAB>message` line per decision for the caller to
     /// replay through its own logging (see `cli::merge_pr_delete_branch`).
     DeleteBranch(super::merge_pr_delete_branch::DeleteBranchArgs),
+
+    /// The post-merge worktree-cleanup data-loss guard (#5031, classified by
+    /// #5658): refuse a `git worktree remove --force` on a worktree that still
+    /// holds uncommitted user work, so a colliding branch name cannot destroy a
+    /// live sibling builder's edits. Reads `git status --porcelain` on stdin.
+    /// Exit 0 + sentinel = no user work (removal may proceed), 1 = refuse (the
+    /// refusal arrives as `LEVEL<TAB>message` lines to replay), 2 = the
+    /// worktree's state could not be read, which the caller must ALSO treat as
+    /// a refusal.
+    DirtyGuard(super::merge_pr_dirty_guard::DirtyGuardArgs),
+
+    /// Decide ONE zero-row check-runs poll of `--auto`'s settle wait (#9091):
+    /// settle now, keep waiting, or report the whole wait spent. Bounded only
+    /// when the base branch requires no status-check contexts; a lookup that
+    /// errors, or a required context present, keeps #6169's full wait. Always
+    /// exits 0 with one sentinel-led line — see `cli::merge_pr_zero_checks`.
+    ZeroChecksSettle(super::merge_pr_zero_checks::ZeroChecksSettleArgs),
+
+    /// The OTHER classification in the same wait loop (#8191 slice): once a
+    /// poll finds a FAILING check, whether it is a required status-check
+    /// context (refuse), informational with nothing pending (proceed to the
+    /// synchronous merge), or informational with something else still
+    /// pending (keep waiting, unchanged). Exit 0 = `PROCEED`/`PENDING`, 1 =
+    /// `REQUIRED` (refuse), 2 = malformed stdin frame (also refuse) — see
+    /// `cli::merge_pr_checks_failure`.
+    ChecksFailure(super::merge_pr_checks_failure::ChecksFailureArgs),
+
+    /// The pre-merge no-hand-bump guard (#7827) and its oracle choice
+    /// (#8284): run the canonical version checker from the right ref against
+    /// the merge base. Exit 0 = pass/skip/dry-run report, 1 = confirmed
+    /// forbidden version edit; output is `WARNING`/`BLOCK<TAB>line` records
+    /// — see `cli::merge_pr_version_policy`.
+    VersionPolicy(super::merge_pr_version_policy::VersionPolicyArgs),
+
+    /// The pre-merge merge-ordering guard (#3747 item 2, reshaped by #7982):
+    /// discover open CHILD PRs still targeting this parent branch and
+    /// ESTABLISH the postcondition `reconcile-stack.sh` needs by pinning the
+    /// parent tip to `refs/loom/parent/<branch>`. Exit 0 = proceed (skip,
+    /// bypass, dry-run report, or pin written), 1 = the tip could not be
+    /// pinned, which is the one case still refused. Output is
+    /// `CHILDREN`/`PIN-WRITTEN`/`WARNING`/`BLOCK` records — see
+    /// `cli::merge_pr_stacked_children`.
+    StackedChildren(super::merge_pr_stacked_children::StackedChildrenArgs),
+    /// The PRIMARY (main) worktree's path, parsed from `git worktree list
+    /// --porcelain` on stdin (#8191 slice: the #3710 guard's input). Empty
+    /// output at exit 0 means the input held no `worktree` record — which the
+    /// caller must NOT read as "the target is not the primary checkout".
+    WorktreePrimary(super::merge_pr_worktrees::WorktreePrimaryArgs),
+
+    /// The branch short-name checked out at `--path`, from porcelain on stdin.
+    /// Empty at exit 0 for a detached/bare entry or a path in no stanza.
+    WorktreeBranchFor(super::merge_pr_worktrees::WorktreeBranchForArgs),
+
+    /// The worktree path with `--branch` checked out, from porcelain on stdin.
+    /// Empty at exit 0 when no worktree holds it.
+    WorktreeFindByBranch(super::merge_pr_worktrees::WorktreeFindByBranchArgs),
+
+    /// The post-merge partial-increment label reset decision (#3667/#4569):
+    /// from the referenced issue's fresh body on stdin plus the pre-merge
+    /// guard's `--conflicted` / `--open-before-merge` facts, the ordered
+    /// `INFO`/`WARNING<TAB>text`, `REOPEN` and `SWAP` steps the shell
+    /// performs. Exit 0 with the plan (empty = silent skip, a PR), 2 = stdin
+    /// unreadable — see `cli::merge_pr_partial_reset`.
+    PartialReset(super::merge_pr_partial_reset::PartialResetArgs),
+
+    /// The pre-merge partial-increment close-conflict decision (#4569/#4595):
+    /// from a NUL-framed body / commit messages / sidebar close targets /
+    /// `(issue, fresh body)` record on stdin, the `OPEN`/`CONFLICT<TAB>n` set
+    /// entries and `WARNING<TAB>text` lines the shell replays, terminated by
+    /// `LOOM-PARTIAL-CONFLICT-DONE`. Exit 2 = malformed frame; the shell
+    /// refuses the merge without the terminator — see
+    /// `cli::merge_pr_partial_conflict`.
+    PartialConflict(super::merge_pr_partial_conflict::PartialConflictArgs),
+
+    /// Which route a FAILED merge's forge error text sends the retry ladder
+    /// down (#8191 slice): `merge-in-progress` (405, wait and retry),
+    /// `head-mismatch` (#5579 — never retry-and-merge), `base-modified` (sync
+    /// the head and retry) or `other` (stop). Reads the response on stdin and
+    /// always exits 0 with one `LOOM-MERGE-RESPONSE <token>` line; `other` is
+    /// an answer, not a failure. Exit 2 = stdin unreadable. The precedence
+    /// between the two SHA-shaped routes is the safety property — see
+    /// `cli::merge_pr_response`.
+    ClassifyResponse(super::merge_pr_response::ClassifyResponseArgs),
+
+    /// The post-merge closed-issue `loom:building` cleanup decision (#6199):
+    /// from the fresh body of an issue THIS merge closed, on stdin, either
+    /// `STRIP` (the claim label is stale — remove it) or `SKIP<TAB><reason>`.
+    /// Exit 0 with the decision, 2 = stdin unreadable. Silence is never a
+    /// decision — see `cli::merge_pr_closed_building`.
+    ClosedBuilding(super::merge_pr_closed_building::ClosedBuildingArgs),
+
+    /// The post-merge stacked-child reconcile PLAN (#3747 item 1): the
+    /// parent-branch gate, the `[{number, headRefName}]` children-rollup parse
+    /// (on stdin) and each child's derived issue number. Prints
+    /// `NOT-STACKED`, `UNREADABLE <detail>`, or `COUNT` + one `CHILD`/`MALFORMED`
+    /// line per element. Exit 0 with the plan, 2 = stdin unreadable; the seam
+    /// fails OPEN (skip the pass) — see `cli::merge_pr_reconcile`.
+    ReconcilePlan(super::merge_pr_reconcile::ReconcilePlanArgs),
+
+    /// Which route ONE stacked child takes (#3747 item 1): `defer` when its
+    /// issue's label list (on stdin) still carries `loom:building` — a Builder
+    /// probably has that branch checked out, and rebasing it would race live
+    /// work — otherwise `reconcile`. The defer answer carries the comment body
+    /// to post. Exit 0 with the route, 2 = stdin unreadable — see
+    /// `cli::merge_pr_reconcile`.
+    ReconcileChild(super::merge_pr_reconcile::ReconcileChildArgs),
 }
 
 impl MergePrCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
             MergePrCommand::VerdictContradiction(args) => args.run(),
+            MergePrCommand::MergeableRecheck(args) => args.run(),
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
+            MergePrCommand::HoldState(args) => args.run(),
+            MergePrCommand::IssueCloseGate(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
+            MergePrCommand::DirtyGuard(args) => args.run(),
+            MergePrCommand::ZeroChecksSettle(args) => args.run(),
+            MergePrCommand::VersionPolicy(args) => args.run(),
+            MergePrCommand::StackedChildren(args) => args.run(),
+            MergePrCommand::WorktreePrimary(args) => args.run(),
+            MergePrCommand::WorktreeBranchFor(args) => args.run(),
+            MergePrCommand::WorktreeFindByBranch(args) => args.run(),
+            MergePrCommand::PartialReset(args) => args.run(),
+            MergePrCommand::PartialConflict(args) => args.run(),
+            MergePrCommand::ClassifyResponse(args) => args.run(),
+            MergePrCommand::ClosedBuilding(args) => args.run(),
+            MergePrCommand::ReconcilePlan(args) => args.run(),
+            MergePrCommand::ReconcileChild(args) => args.run(),
+            MergePrCommand::ChecksFailure(args) => args.run(),
         }
     }
 }

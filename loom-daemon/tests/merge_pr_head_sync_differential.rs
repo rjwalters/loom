@@ -1,15 +1,32 @@
 //! Differential test: the Rust port of `merge-pr.sh`'s head-mismatch
 //! classifier must agree with the shell on a shared corpus.
 //!
-//! # Why this exists even though the shell still has its own copy
+//! # What it proved then, and what it proves now
 //!
-//! Slice 4 of #8191 does **not** delete `_is_head_mismatch_response` — the two
-//! copies coexist, because the shell still needs a cheap local answer to
-//! decide whether to consult the daemon at all, while the daemon needs its own
-//! answer so a caller cannot authorize a retry by mislabelling an arbitrary
-//! error as a head mismatch. Two copies of one predicate is a drift hazard,
-//! and this test is what converts it into a CI failure instead: the moment
-//! either side gains a pattern the other lacks, the run goes red.
+//! Slice 4 of #8191 did **not** delete `_is_head_mismatch_response`: the shell
+//! kept a cheap local copy to decide whether to consult the daemon at all,
+//! while the daemon needed its own so a caller could not authorize a retry by
+//! mislabelling an arbitrary error as a head mismatch. Two copies of one
+//! predicate is a drift hazard, and this test converted it into a CI failure
+//! instead — the moment either side gained a pattern the other lacked, the run
+//! went red.
+//!
+//! **#8191's classify-response slice ended that arrangement.** The shell copy
+//! is gone, and the two Rust copies were converged onto one definition:
+//! `merge_pr::response::is_head_mismatch`, which
+//! `merge_pr::head_sync::is_head_mismatch` now delegates to. The drift this
+//! test policed is therefore unrepresentable rather than merely detected, and
+//! the test is NOT retired, because what survives is the stronger half of what
+//! it was always doing: pinning the surviving predicate against the **retired
+//! `grep`** it replaced.
+//!
+//! That is the obligation this header used to hand forward ("the slice that
+//! finally deletes it inherits that obligation, and this header is where to
+//! look"). It is discharged here: the shell side now sources the frozen copy
+//! at `tests/fixtures/merge-pr-response-retired.sh` instead of extracting from
+//! the live `merge-pr.sh`. Reading the live script would now compare the port
+//! against itself — a differential that measures nothing, which is exactly the
+//! failure `defaults/docs/verification-recipes.md` §6 names.
 //!
 //! # Shape (`defaults/docs/verification-recipes.md` §6)
 //!
@@ -17,11 +34,6 @@
 //! reads the same bytes. An earlier differential in this epic had each side
 //! generate its own inputs and reported a divergence in the code when the
 //! *inputs* had diverged — nothing about the code was measured.
-//!
-//! The shell side runs the REAL function, extracted from the live
-//! `merge-pr.sh` (it has not been replaced, so there is no need for a frozen
-//! fixture copy yet — the slice that finally deletes it inherits that
-//! obligation, and this header is where to look).
 //!
 //! # What the corpus is built from
 //!
@@ -102,46 +114,42 @@ const CORPUS: &[&str] = &[
     "a\\backslash head out of date",
 ];
 
-fn repo_root() -> PathBuf {
-    // CARGO_MANIFEST_DIR is <root>/loom-daemon.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("loom-daemon has a parent directory")
-        .to_path_buf()
-}
-
-/// Extract `_is_head_mismatch_response` from the live `merge-pr.sh` and run it
-/// over every corpus line, returning one `y`/`n` per line.
+/// Run the RETIRED `_is_head_mismatch_response` over every corpus line,
+/// returning one `y`/`n` per line.
+///
+/// Sourced from the frozen copy, not the live `merge-pr.sh`: since #8191's
+/// classify-response slice the live script has no such function, and reading
+/// whatever replaced it would compare the port against itself. The frozen file
+/// is the only form of this oracle that keeps saying something true now that
+/// the shell is gone.
 fn shell_answers(corpus_path: &std::path::Path) -> Vec<String> {
-    let root = repo_root();
-    let script = root.join("defaults/scripts/merge-pr.sh");
-    assert!(script.exists(), "merge-pr.sh not found at {script:?}");
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/merge-pr-response-retired.sh");
+    assert!(script.exists(), "frozen fixture not found at {script:?}");
 
-    // The extraction anchors on the same `^_is_head_mismatch_response() {` /
-    // `^}` pair test-merge-pr-head-mismatch.sh uses, so a reformat that breaks
-    // one breaks both visibly rather than silently comparing nothing.
+    // Still guarded rather than a bare `.`: a fixture whose function was
+    // renamed must fail loudly instead of silently comparing nothing.
     let program = r#"set -euo pipefail
-awk '/^_is_head_mismatch_response\(\) \{/ { capture=1 } capture { print } /^}$/ && capture { capture=0 }' "$1" > "$2/fn.sh"
-grep -q '_is_head_mismatch_response()' "$2/fn.sh" || { echo "EXTRACTION FAILED" >&2; exit 2; }
-. "$2/fn.sh"
+. "$1"
+declare -F _is_head_mismatch_response >/dev/null || { echo "FIXTURE MISSING _is_head_mismatch_response" >&2; exit 2; }
 while IFS= read -r line; do
   if _is_head_mismatch_response "$line"; then echo y; else echo n; fi
-done < "$3"
+done < "$2"
 "#;
 
-    let tmp = std::env::temp_dir().join(format!("loom-head-sync-diff-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).expect("temp dir");
-
     let out = Command::new("bash")
+        // `grep -i` folds per the locale; the port folds ASCII-only, which is
+        // what `C` means. Unpinned, this harness compares against whatever the
+        // developer's shell is set to and can differ between a Mac and CI —
+        // verification-recipes.md §6, Cause 3's last row.
+        .env("LC_ALL", "C")
         .arg("-c")
         .arg(program)
         .arg("bash")
         .arg(&script)
-        .arg(&tmp)
         .arg(corpus_path)
         .output()
         .expect("could not run bash");
-    let _ = std::fs::remove_dir_all(&tmp);
 
     assert!(
         out.status.success(),

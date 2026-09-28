@@ -1,0 +1,217 @@
+{
+ "_comment": "The 2026-09-28 stall (#9244 'Evidence'), reduced to the forge state the liveness pass reads at 08:00Z, with every issue that carried loom:urgent that day starred instead. PR #9276's comments are its REAL comments, verbatim with author and author_association, fetched from the forge; the loader keeps those posted at or before snapshot_at (the approval and the 05:32Z refusal) and replay.rs feeds the later three to the negative test. #9268's title and body are its real text; it was open (loom:triage) until 08:14Z. Nothing on the PR names #9268: the refusal comment names only #9115 (a merged PR) and 'the linked issue', so #9268 is found by the refusal's failure signature ('merge commits are not allowed'). #9268's author and author_association are its real ones (the fleet App, reported as NONE), which the incident search's trust filter checks.",
+ "snapshot_at": "2026-09-28T08:00:00Z",
+ "repos": [
+  {
+   "slug": "rjwalters/loom",
+   "pool_exhausted": false,
+   "items": [
+    {
+     "number": 8191,
+     "labels": [
+      "loom:operator-priority",
+      "loom:building"
+     ],
+     "body": "merge-pr.sh port slice."
+    },
+    {
+     "number": 9276,
+     "pr": true,
+     "labels": [
+      "loom:pr"
+     ],
+     "body": "Part of #8191 — the next slice of the `merge-pr.sh` → `loom-daemon` port, following the pattern of #8199 / #9272 and the ~20 slices between them.\n"
+    },
+    {
+     "number": 9115,
+     "pr": true,
+     "state": "closed",
+     "labels": [],
+     "title": "feat(merge): merge commits become Loom's default merge method",
+     "body": ""
+    },
+    {
+     "number": 9268,
+     "author": "loom-fleet-dispatch-2[bot]",
+     "association": "NONE",
+     "labels": [
+      "loom:triage"
+     ],
+     "title": "Repo merge-method contradiction: main ruleset allows only squash, repo flags allow only merge — API merges 405 both ways",
+     "body": "## Repo merge-method contradiction: `main` ruleset allows only squash, repo flags allow only merge — API merges 405 both ways\n\nDiscovered merging PR #9267 (approved, CI green, CLEAN): the merge policy's two authoritative sources contradict each other, deadlocking every non-bypass API merge.\n\n**Evidence (2026-09-28):**\n\n- Ruleset `main` (active, `updated_at` 2026-09-26T17:33Z): `required_linear_history` + `pull_request.allowed_merge_methods: [\"squash\"]`.\n- Repo settings: `allow_merge_commit: true`, `allow_squash_merge: false`, `allow_rebase_merge: false` (the #9105 merge-commit default; appears flipped ~2026-09-27T23:00Z, i.e. *after* the ruleset's last update — PR #9246, merged 2026-09-27T23:10Z as the only post-flip merge commit, looks like a bypass-actor merge).\n- `merge-pr.sh --auto` (resolves method `merge`) → `HTTP 405: Merge commits are not allowed on this repository`.\n- `merge-pr.sh --merge-method squash` → `loom-daemon forge merge-method` (validated against the repo-flags triad, `loom-daemon/src/forge_merge_method.rs`) refuses: `allowed method(s): merge`.\n\n**Impact:** every `merge-pr.sh`/Champion API merge on this repo fails until reconciled. PR #9267 is parked approved-but-unmergeable (handoff comment posted there).\n\n**Remedy (operator, one of):**\n\n1. Update the `main` ruleset's `pull_request.allowed_merge_methods` to `[\"merge\"]` to match the #9105 flag intent, **or**\n2. Re-enable `allow_squash_merge` in repo settings to match the ruleset.\n\nFollow-up worth considering (separately): `loom-daemon forge merge-method` validates against the repo-flags triad only and ignores ruleset `allowed_merge_methods` — worth teaching it the ruleset source so the validator and the endpoint can't disagree like this."
+    },
+    {
+     "number": 8256,
+     "labels": [
+      "loom:operator-priority",
+      "loom:building"
+     ],
+     "body": ""
+    },
+    {
+     "number": 8314,
+     "pr": true,
+     "labels": [
+      "loom:operator-decision"
+     ],
+     "body": "Closes #8256\n"
+    }
+   ],
+   "comments": {
+    "9276": [
+     {
+      "author": "loom-fleet-dispatch-1[bot]",
+      "association": "CONTRIBUTOR",
+      "created_at": "2026-09-28T05:24:24Z",
+      "body": "**Approved.** Reviewed in a checkout of the `feature/issue-8191` worktree (`.loom/worktrees/issue-8191`).\n\n**Scope check** — the diff collapses the three near-identical `#4186/#6694/#6264` remove-vs-preserve blocks in `merge-pr.sh`'s post-merge worktree cleanup into `_worktree_cleanup_decide <kind> <path>`, backed by the new pure `loom_daemon::merge_pr::worktree_preserve::decide`/`render` reached via `loom-daemon merge-pr worktree-preserve`. Confirmed both forge/git reads (`_issue_is_closed_for_cleanup`, `branch_has_landed`) stay in the shell, and the Rust side takes no stdin/network/git — it's a pure function of its `Context` args.\n\n**Fail-direction verified directly in code**: `_worktree_cleanup_decide`'s guard —\n```bash\nif [[ $rc -ne 0 || ( \"$action\" != \"REMOVE\" && \"$action\" != \"PRESERVE\" ) ]]; then\n  warning \"... Preserving rather than guessing REMOVE ...\"\n  return 0\nfi\n```\n— correctly defaults to PRESERVE on any daemon fault (missing binary, older daemon, off-protocol output). Exercised locally by Test 7's case T5 in `test-merge-pr-worktree-path.sh` (\"a daemon predating the verb preserves rather than guessing cleanup\"), which passed.\n\n**Retired assertions**: 5 `assert_grep`s (not the 2 I was initially told to expect — the PR body itself correctly says \"Five\") were retired via the established `retired()` convention (printed, counted, never silently deleted), each naming the property, why it's structural (the message text is now a Rust format literal, nothing shell-shaped to grep), and a real, specific successor (the differential test's per-kind cases plus named unit tests in `worktree_preserve::tests`). This matches the convention used elsewhere in this test family (`test-merge-pr-primary-worktree-guard.sh`, `test-merge-pr-partial-increment.sh`, etc.).\n\n**\"Part of #8191\" convention**: correct — this is a partial-increment slice in the ongoing `merge-pr.sh` port, consistent with the ~20 prior slices' pattern (verified against `defaults/roles/builder-pr.md`'s `Closes` vs `Part of` guidance).\n\n**Coherence of inherited work**: the PR is a single clean commit (`32b1ecf2c`) with no evidence of a half-integrated leftover from the interrupted prior session — history and diff are coherent.\n\n**Verified locally** (real `target/release/loom-daemon` built from this branch):\n- `defaults/scripts/tests/test-merge-pr-worktree-path.sh`: 57/57 passed.\n- `cargo test -p loom-daemon --release --lib merge_pr::worktree_preserve`: 9/9 passed.\n- `scripts/check-file-size-budget.sh --list`: `1035 defaults/scripts/merge-pr.sh` (claimed 1035, ceiling 1071) — confirmed exactly.\n- `scripts/check-shell-allowlist.sh`: OK (fixture declared, `test` category).\n- `scripts/check-daemon-subcommand-versions.sh`: OK.\n\n**CI**: all required checks (`Structural Checks`, `Shell Syntax (macos-latest)`, `Daemon Checks`) pass, and `Rust Linting & Build Check` (which runs `cargo fmt --all -- --check` and `cargo clippy -D warnings`) passed, confirming those claims. `Rust Unit Tests (1/3..3/3)` and `Native Port Suites` all green. The one red check, `Rust OTLP Feature Tests (1/3)`, is `isRequired: false` (confirmed via the GraphQL `isRequired` field — `mergeStateStatus` is `UNSTABLE`, not `BLOCKED`) and fails in `merge_pr_partial_reset_differential.rs`, a file/module this PR does not touch at all; the same commit's non-OTLP `Rust Unit Tests` partitions all pass, and the last 5 `main` CI runs were green, matching the OTLP-job-only flake pattern already tracked in (closed) #8683. Filed a follow-up for it: #9278 — not blocking this PR.\n\nFormal-review reconciliation (`check-review-feedback.sh`) reports `CLEAR` at this head SHA.\n\nNice work — this is a clean, well-tested slice with the fail-safe direction properly preserved on a data-loss-adjacent code path.\n\n<!-- loom:review-reconciliation state=clear reviews=0 blocking_current=0 blocking_older=0 inline_unresolved=0 source=graphql reconciled=n/a -->\n\n<!-- loom:verdict-sha sha=32b1ecf2c74dace1e8bd1ee1005bf0ac6ca21c65 verdict=approved -->"
+     },
+     {
+      "author": "loom-fleet-dispatch-1[bot]",
+      "association": "CONTRIBUTOR",
+      "created_at": "2026-09-28T05:32:06Z",
+      "body": "**Merge blocked — repo-wide merge-method config drift, not a PR content issue.**\n\n`./.loom/scripts/merge-pr.sh 9276 --auto` failed:\n```\nError: Failed to merge PR #9276: {\"message\":\"Merge commits are not allowed on this repository.\",\"documentation_url\":\"...\",\"status\":\"405\"}\n```\n\nRoot cause: this repo's branch ruleset for `main` requires `required_linear_history` + `allowed_merge_methods: [\"squash\"]` (set by `scripts/install/setup-branch-protection.sh`, unchanged), but the repo-level merge-strategy toggle now says `allow_merge_commit: true, allow_squash_merge: false, allow_rebase_merge: false` (flipped by #9115's `setup-repository-settings.sh` default change to prefer merge commits). The two are mutually incompatible: `forge_detect_merge_method`/`loom-daemon forge merge-method` read the repo-level toggle and resolve to `merge`, but GitHub rejects `merge` because of the ruleset's `required_linear_history` — and an explicit `--merge-method squash` retry is refused by `loom-daemon forge merge-method` itself (\"allowed method(s): merge\"), because it also only reads the repo-level toggle. **Every merge in this repo is currently blocked**, not just this PR.\n\nThis is out of scope for this sweep to fix (it's a live repository-settings change on the org's main repo). Filed as a follow-up for operator attention: see the linked issue. This PR's `judge-done` sweep checkpoint is left intact so the next sweep pass retries the merge automatically once the config is reconciled."
+     },
+     {
+      "author": "turian",
+      "association": "COLLABORATOR",
+      "created_at": "2026-09-28T08:13:37Z",
+      "body": "<!-- loom:stale-check-redate to=00e681e213bb43d42fa96fcdd52f7c96d68a9020 -->\n**Automated re-date of stale required checks (#8508)**\n\nThe #8248 required-check-freshness guard blocked the merge of PR #9276: a required check's green result predates the current base-branch tip, and this repo's merge token has no `actions:write` to re-run that check directly. Pushed a **tree-identical** no-op commit (`00e681e`) instead — the diff is byte-for-byte unchanged, but every required check now re-runs against a current timestamp.\n\nThis moves the head SHA, which invalidates the standing Judge approval (#5686). Expect this PR to cycle back through `loom:review-requested` once CI on `00e681e` completes, then merge normally once re-approved.\n\nThe #8248 guard itself is unchanged and still applies to the next merge attempt."
+     },
+     {
+      "author": "loom-fleet-dispatch-1[bot]",
+      "association": "CONTRIBUTOR",
+      "created_at": "2026-09-28T08:17:21Z",
+      "body": "<!-- loom:verdict-stale from=32b1ecf2c74dace1e8bd1ee1005bf0ac6ca21c65 to=00e681e213bb43d42fa96fcdd52f7c96d68a9020 -->\n**Stale review verdict cleared — head SHA moved**\n\nThis PR's `loom:pr` verdict was rendered against `32b1ecf2c74dace1e8bd1ee1005bf0ac6ca21c65`, but the current head is `00e681e213bb43d42fa96fcdd52f7c96d68a9020`. A review verdict is a statement about a specific tree, so it does not survive a rebase, a force-push, or new commits.\n\n- Verdict cleared: `loom:pr` (recorded for `32b1ecf2c74dace1e8bd1ee1005bf0ac6ca21c65`)\n- Returned to the review queue: `loom:review-requested` (current head `00e681e213bb43d42fa96fcdd52f7c96d68a9020`)\n\nJudge will re-evaluate the tree that is actually here now. No judgment about the new tree is implied either way — the old verdict simply no longer describes it.\n\n---\n*Automated by verdict-staleness-guard.sh (#5686)*"
+     },
+     {
+      "author": "loom-fleet-dispatch-1[bot]",
+      "association": "CONTRIBUTOR",
+      "created_at": "2026-09-28T08:18:25Z",
+      "body": "Code evaluation not yet started; CI is still running (Rust Unit Tests 3/3, Codex Adapter Smoke, Native Port Suites daemon-lifecycle pending). Releasing the claim and skipping — a later pass will re-evaluate once CI settles."
+     }
+    ]
+   }
+  },
+  {
+   "slug": "2AMLogic/loom-ui",
+   "pool_exhausted": true,
+   "items": [
+    {
+     "number": 281,
+     "labels": [
+      "loom:operator-priority"
+     ],
+     "body": "Incident: short-title backfill query exceeds D1 CPU limit."
+    }
+   ],
+   "comments": {}
+  },
+  {
+   "slug": "2AMLogic/2am",
+   "pool_exhausted": false,
+   "items": [
+    {
+     "number": 1180,
+     "labels": [
+      "loom:operator-priority",
+      "loom:operator-only",
+      "loom:operator-decision"
+     ],
+     "body": "gf180-surge (PUBLIC) has a committed .env."
+    },
+    {
+     "number": 1098,
+     "labels": [
+      "loom:operator-priority",
+      "loom:operator-only",
+      "loom:operator-mechanical"
+     ],
+     "body": "token pool: utilization spike detected"
+    },
+    {
+     "number": 897,
+     "labels": [
+      "loom:operator-priority",
+      "loom:curated",
+      "loom:operator-only",
+      "tier:goal-supporting",
+      "loom:operator-decision"
+     ],
+     "body": "Operator-gated run protocol."
+    },
+    {
+     "number": 869,
+     "labels": [
+      "loom:operator-priority",
+      "loom:curated",
+      "loom:blocked",
+      "tier:goal-supporting"
+     ],
+     "body": "sky130-modexp resync BLOCKED: four fleet-bot commits fixed Loom-managed files in place; upstream or pin them."
+    }
+   ],
+   "comments": {}
+  }
+ ],
+ "expect_escalations": [
+  {
+   "repo": "rjwalters/loom",
+   "issue": 8191,
+   "kind": "merge-refused",
+   "mentions": [
+    "PR #9276",
+    "Tracked in #9268"
+   ]
+  },
+  {
+   "repo": "rjwalters/loom",
+   "issue": 8256,
+   "kind": "operator-decision",
+   "mentions": [
+    "PR #8314"
+   ]
+  },
+  {
+   "repo": "2AMLogic/loom-ui",
+   "issue": 281,
+   "kind": "pools-exhausted",
+   "mentions": [
+    "exhausted"
+   ],
+   "after_grace": true
+  },
+  {
+   "repo": "2AMLogic/2am",
+   "issue": 1180,
+   "kind": "operator-decision",
+   "mentions": []
+  },
+  {
+   "repo": "2AMLogic/2am",
+   "issue": 1098,
+   "kind": "operator-only",
+   "mentions": [
+    "loom:operator-only"
+   ]
+  },
+  {
+   "repo": "2AMLogic/2am",
+   "issue": 897,
+   "kind": "operator-decision",
+   "mentions": []
+  },
+  {
+   "repo": "2AMLogic/2am",
+   "issue": 869,
+   "kind": "blocked-unnamed",
+   "mentions": []
+  }
+ ],
+ "expect_inherited": [
+  {
+   "repo": "rjwalters/loom",
+   "issue": 9268,
+   "from": 8191
+  }
+ ]
+}

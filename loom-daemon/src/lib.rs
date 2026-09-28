@@ -157,6 +157,7 @@ pub mod daemon_start;
 /// ratchet freezes at its current line count
 /// (`.loom/docs/file-size-policy.md`).
 pub mod daemon_startup_reconciliation;
+pub mod daemon_update;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
@@ -166,15 +167,19 @@ pub mod eager_reclaim;
 pub mod epic_state;
 pub mod epic_supervisor;
 pub mod errors;
+pub mod eta;
 pub mod event_bus;
 pub mod filing_lock;
 pub mod fleet;
 pub mod fleet_captain;
 pub mod foreign_load;
 pub mod forge_cached_list;
+pub mod forge_cached_view;
+pub mod forge_call_stats;
 pub mod forge_check_open_pr;
 pub mod forge_cmd;
 pub mod forge_disable_auto_merge;
+pub(crate) mod forge_etag_store;
 pub mod forge_events;
 pub mod forge_listing;
 pub mod forge_merge_method;
@@ -208,10 +213,13 @@ pub mod metrics_collector;
 pub mod observability;
 pub mod opencode_usage;
 pub mod orphan_process_reaper;
+pub mod park_record;
 pub mod peer_claims;
 pub mod phase_join;
 pub mod pi_usage;
 pub mod pipeline_snapshot;
+pub mod points_marker;
+pub mod pr_latency;
 pub mod premise_check;
 pub mod primary_checkout_reaper;
 pub mod proc_exec;
@@ -250,6 +258,7 @@ pub mod serve;
 pub mod shell_budget;
 pub mod short_hash;
 pub mod stale_blocked;
+pub mod star_liveness;
 pub mod startup_adoption;
 pub mod stash_retirement;
 /// Root-count-aware cost model for `build_daemon_status` and the `status`/
@@ -587,5 +596,6 @@ mod tests {
 }
 
 pub mod native_readiness;
+pub mod native_state_reclaim;
 pub mod native_tools;
 pub mod session_exec;

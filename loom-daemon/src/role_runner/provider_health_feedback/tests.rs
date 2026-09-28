@@ -429,6 +429,7 @@ fn native_role_tick_mark_emits_exactly_one_reason_classified_point() {
         runtime_manifest: PathBuf::new(),
         suggested_worker_type: None,
         preference: None,
+        execution: None,
     };
     let ((), captured) = crate::observability::ops::capture::capture(|| {
         apply_role_tick_provider_health_feedback(

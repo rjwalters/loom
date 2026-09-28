@@ -40,6 +40,11 @@
 //!   transcript-ingest thread pushes the derived `session.analysis` rollup
 //!   (retry loops, longest tool call, USD cost, anomaly flags) alongside
 //!   each `session.summary` it emits.
+//! - [`claude_code_telemetry`] (Issue #9215) — the one member of this module
+//!   tree that exports nothing itself: an opt-in, default-off resolver for the
+//!   OTel environment a *spawned worker's own* Claude Code session needs in
+//!   order to emit `claude_code.llm_request` / `claude_code.tool` sub-spans
+//!   into the trace [`tracing::prepare_child`] already propagates.
 //! - [`daemon_event`] (Issue #8760, G4 of #8714) — a second, narrower
 //!   [`crate::event_bus::EventBus`] subscriber alongside [`collector`],
 //!   covering the four named topics that carried no telemetry record kind
@@ -96,9 +101,11 @@
 //! host (#5336).
 
 pub mod backfill;
+pub mod claude_code_telemetry;
 pub mod collector;
 pub mod daemon_event;
 pub mod endpoint_policy;
+pub mod eta;
 pub mod exporter;
 pub mod lifecycle;
 pub mod ops;
@@ -109,6 +116,7 @@ pub mod overhead;
 pub mod queue;
 pub mod queue_blocked;
 pub mod queue_snapshot;
+pub mod repo_ref;
 pub mod runtime_usage;
 pub mod sender;
 pub mod session_analysis;
@@ -979,12 +987,18 @@ pub fn spawn_task(
                 // already handle.
                 let host_id_status = Arc::new(HostIdStatus::default());
                 register_global_host_id_status(host_id_status.clone());
+                // loom-ui star intents (#9244 C) ride the same native ack, so
+                // the queue is registered here too and nowhere else (the OTLP
+                // arm below has no ack to read them from).
+                let intents = crate::star_liveness::intents::register_global_queue();
                 match HttpsExporter::new(
                     endpoint.clone(),
                     ingest_key.clone(),
                     host_id.clone(),
                     host_id_status,
-                ) {
+                )
+                .map(|e| e.with_intent_queue(intents))
+                {
                     Ok(exporter) => sender::spawn_task(
                         queue.clone(),
                         exporter,
@@ -1099,6 +1113,10 @@ pub fn spawn_task(
     // both kinds are OTLP-only, so an HTTPS queue would just carry and drop
     // them. No OTLP exporter ⇒ nothing registered ⇒ every emit is a no-op.
     let mut ops_handles = Vec::new();
+    // ETA (#9289): `eta.estimate` / `eta.outcome` are OTLP-only too; the
+    // tracker and its bus subscriber run (and journal) even without them.
+    eta::register_sink(otlp_queues.clone(), &host_id);
+    ops_handles.extend(eta::spawn_task(bus, workspace_root.clone(), host_id.clone()));
     if let Some(sink) = ops::sink_for_otlp_queues(otlp_queues, &host_id) {
         ops::register_global_ops_sink(sink);
         // Slot turnaround (#8929): a bus subscriber, OTLP-only like the sink.

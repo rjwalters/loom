@@ -300,8 +300,8 @@ fn a_caller_hint_short_circuits_the_forge_in_both_directions() {
 
 /// Every verdict / evidence / forge-status token this module can emit must
 /// appear verbatim in `lib/branch-landed.sh`, which is still the definition
-/// `merge-pr.sh` and `cleanup-branches.sh` consume. A rename on either side
-/// fails here rather than silently splitting the vocabulary in two.
+/// `worktree.sh` and `merge-pr.sh` consume. A rename on either side fails here
+/// rather than silently splitting the vocabulary in two.
 #[test]
 fn tokens_match_the_shell_twin() {
     let lib =
