@@ -410,6 +410,31 @@ fn story_span_attributes_are_all_inside_the_telemetry_allowlist() {
     }
 }
 
+/// #9337: the story copy is a clone of the per-run span, so the trigger
+/// attribution (and the run attempt) reach the story trace untouched.
+#[test]
+fn the_story_copy_carries_the_runs_trigger_reason() {
+    let dir = TempDir::new().unwrap();
+    // beta 2002's fixture head commit is the #8508 re-date subject.
+    let api = StoryApi::new().run("beta", 2002, set_branch("feature/issue-9027"));
+    run_cycle(&stitching(dir.path()), &api).unwrap();
+    let copy = story_spans(dir.path())
+        .into_iter()
+        .find(|s| s.name == SpanName::CiRun)
+        .unwrap();
+    assert_eq!(copy.attributes["loom.ci.trigger_reason"], "stale_main_bump");
+    assert_eq!(copy.attributes["loom.ci.run_attempt"], "1");
+    let per_run = spans(dir.path())
+        .into_iter()
+        .find(|s| {
+            s.name == SpanName::CiRun
+                && !s.attributes.contains_key("loom.story")
+                && s.attributes["loom.ci.run_id"] == "2002"
+        })
+        .unwrap();
+    assert_eq!(per_run.attributes["loom.ci.trigger_reason"], "stale_main_bump");
+}
+
 // ---------------------------------------------------------------------------
 // The pure decision and the GraphQL shapes
 // ---------------------------------------------------------------------------
