@@ -134,12 +134,20 @@
     },
     "preference": [
       "claude",
+      {
+        "runtime": "opencode",
+        "modelProfile": "zai-flash"
+      },
       "gemini"
     ],
     "rolePreference": {
       "judge": [
         "codex",
-        "claude"
+        "claude",
+        {
+          "runtime": "opencode",
+          "modelProfile": "zai-flash"
+        }
       ]
     }
   },
