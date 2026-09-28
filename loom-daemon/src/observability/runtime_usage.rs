@@ -21,8 +21,9 @@
 //!   together. Summed over the spans, the counters equal the execution's old
 //!   single-span totals;
 //! - **only when usage is known**: a reader that found nothing (`None`)
-//!   journals no span, so unknown never reads as zero, while a measured zero
-//!   is exported as `"0"`.
+//!   journals no span, so unknown never reads as zero (nor does an empty row
+//!   set: there is no model to name), while a model row's measured-zero
+//!   counter is exported as `"0"`.
 //!
 //! The same span shape records one role attempt's usage with
 //! `loom.usage.scope=attempt`: `loom-daemon usage-record` for in-session

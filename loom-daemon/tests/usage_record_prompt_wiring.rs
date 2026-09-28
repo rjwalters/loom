@@ -105,3 +105,23 @@ fn the_prompts_usage_record_step_is_fail_open_against_an_older_daemon() {
     let out = run(&line, &bin, &workspace);
     assert!(out.status.success(), "a recorder failure must not fail the sweep step");
 }
+
+/// The step lives in the Execution Model's experiment section, which an
+/// orchestrator running with the experiment `off` (the default) may skip. Each
+/// in-session lifecycle file that writes checkpoints must point at it, or the
+/// main path records nothing.
+#[test]
+fn every_checkpoint_writing_lifecycle_points_at_the_usage_record_step() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/.claude/commands/loom");
+    for name in ["sweep-wave-lifecycle.md", "sweep-mode-c-lifecycle.md"] {
+        let text = std::fs::read_to_string(dir.join(name)).expect(name);
+        assert!(
+            text.contains("sweep-checkpoint.sh write"),
+            "{name} no longer writes checkpoints"
+        );
+        assert!(
+            text.contains("\"Usage record\""),
+            "{name} writes checkpoints but no longer points at the Execution Model \"Usage record\" step (#9303)"
+        );
+    }
+}

@@ -503,7 +503,8 @@ point, so exhaustion can be split by cause (a 429 versus plan exhaustion
 versus a session limit), which the snapshot-derived `loom.pool.exhaustions`
 cannot do. Each work-finder pool hold emits a `loom.pool.hold` span when it
 clears. At a sweep's terminal transition, the execution's exact token
-breakdown is journalled as a `loom.runtime.usage` span in the sweep's trace,
+breakdown is journalled as one `loom.runtime.usage` span per model and scope
+(execution/attempt) in the sweep's trace,
 and the transcript-ingest pass stamps the sweep's `session.summary` log with
 the same trace when the match is unambiguous. Details are in
 [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
