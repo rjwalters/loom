@@ -526,7 +526,13 @@ rm -rf "$PS_STUB3B"
 # 4. Intent present, daemon DEAD ⇒ DIVERGENCE (expected but not running).
 #    This IS the #4011 outage, reproduced.
 # ===================================================================
-dead_pid=$(sleeper); bg_proc_track "$dead_pid"; kill "$dead_pid" 2>/dev/null; wait "$dead_pid" 2>/dev/null
+# Same fixture rule as start_confirmed_down above: kill + reap OUR OWN child,
+# so the pid cannot linger as PID 1's zombie and answer `kill -0` at tick time.
+sleep 60 >/dev/null 2>&1 &
+dead_pid=$!
+bg_proc_track "$dead_pid"
+kill "$dead_pid" 2>/dev/null
+wait "$dead_pid" 2>/dev/null
 echo "$dead_pid" > "$WORKDIR/pidC"
 write_marker "$WORKDIR/pidC" 60
 printf 'x\n' > "$HEARTBEAT"
@@ -1540,7 +1546,13 @@ rm -rf "$STUB23"
 # #4774's leftover-pid shape: worse than absent, because a pid file naming a
 # dead process used to read as CONFIRMED death.
 STUB24="$(make_daemon_stub ok)"
-dead24=$(sleeper); bg_proc_track "$dead24"; kill "$dead24" 2>/dev/null; wait "$dead24" 2>/dev/null
+# Same fixture rule as start_confirmed_down above: kill + reap OUR OWN child,
+# so the pid cannot linger as PID 1's zombie and answer `kill -0` at tick time.
+sleep 60 >/dev/null 2>&1 &
+dead24=$!
+bg_proc_track "$dead24"
+kill "$dead24" 2>/dev/null
+wait "$dead24" 2>/dev/null
 echo "$dead24" > "$WORKDIR/pid24"
 write_marker "$WORKDIR/pid24" 60
 printf '%s pid=x ts=now\n' "$(date +%s)" > "$HEARTBEAT"
@@ -1705,7 +1717,26 @@ DOWN_STUB=""
 start_confirmed_down() { # <pid_file_suffix>
     local dead
     DOWN_STUB="$(make_daemon_stub unreachable)"
-    dead=$(sleeper); bg_proc_track "$dead"; kill "$dead" 2>/dev/null; wait "$dead" 2>/dev/null
+    # The sleeper must be OUR OWN child, not a $(sleeper) capture: inside a
+    # command substitution the subshell exits immediately and orphans the
+    # sleep to PID 1, whose SIGCHLD reaping the tick below can RACE. An
+    # orphan killed here stays a zombie — still answering `kill -0`, the
+    # watchdog's liveness signal, with a young etime — until PID 1 gets
+    # around to reaping it. A tick that read the pid file inside that window
+    # classified the daemon ALIVE inside the 90s startup grace, skipped the
+    # probe, saw the still-fresh heartbeat from an earlier case and exited 0:
+    # no recovery, no escalation, no create-issue.sh call. That is precisely
+    # the "#6272 branch-3 skipped when repo-scoped exists" pair of failures
+    # (expected rc=1, got rc=0 + zero filings) PR #9261's CI hit once and a
+    # re-run of the same head did not: a fixture race, not a behaviour
+    # change. As a real child, `wait` reaps the kill SYNCHRONOUSLY, so the
+    # pid is gone from the process table before the pid file is written and
+    # no tick can observe it alive.
+    sleep 60 >/dev/null 2>&1 &
+    dead=$!
+    bg_proc_track "$dead"
+    kill "$dead" 2>/dev/null
+    wait "$dead" 2>/dev/null
     echo "$dead" > "$WORKDIR/pid$1"
     write_marker "$WORKDIR/pid$1" 60
     : > "$WDLOG"
