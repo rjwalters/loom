@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::RepoVisibility;
-use crate::types::QueueDisposition;
+use crate::types::{DispatchPlanContext, QueueDisposition, RowPlan};
 
 /// Most rows one record carries. Rows past this are counted in
 /// [`QueueSnapshotRecord::rows_truncated`].
@@ -62,7 +62,17 @@ pub struct QueueSnapshotRow {
     pub visibility: RepoVisibility,
     pub issue: u32,
     pub workspace_priority: u32,
+    /// Deprecated (#9244): always `false`. `loom:urgent` no longer affects
+    /// dispatch order; kept on the wire for one release.
     pub urgent: bool,
+    /// Whether the issue is starred (`loom:operator-priority`, #9244), which
+    /// sorts it ahead of all other work.
+    #[serde(default)]
+    pub operator_priority: bool,
+    /// When it was starred (RFC 3339), when known. Absent for an unstarred
+    /// issue, or a starred one ordered by its `created_at` fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_priority_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     /// The `tier:*` label, which is informational only and does not affect
@@ -78,6 +88,13 @@ pub struct QueueSnapshotRow {
     /// number (`open_pr`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The dispatch-plan fields (Issue #9288), flattened beside `rank`:
+    /// `position`, `plan_state`, `keys`, `gate`, `in_slice`, `hot`,
+    /// `owning_shard`, `repo_cap`. The `keys` values are the row's own
+    /// `workspace_priority` / `urgent` / `created_at` / `issue`, so they add
+    /// nothing the row does not already carry.
+    #[serde(flatten, default)]
+    pub plan: RowPlan,
 }
 
 /// `queue.snapshot`: one host's ready queue as of its last work-finder tick.
@@ -108,6 +125,29 @@ pub struct QueueSnapshotRecord {
     /// Rows dropped by the [`MAX_ROWS`] cap.
     #[serde(default)]
     pub rows_truncated: usize,
+    /// The tick's dispatch plan block (Issue #9288): slots, tick interval,
+    /// shard posture, scope and key ordering. Absent from a pre-#9288 daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<DispatchPlanContext>,
+    /// The landing state of every starred issue this host watches, and of
+    /// every blocker inheriting a star (#9244 C), in starred-at order. A
+    /// separate list rather than fields on `rows`: `rows` is what the work
+    /// finder did with its ready listing this tick, and most starred issues
+    /// (building, in review, parked) are not in it. Join on `(repo, issue)`.
+    /// Absent from older daemons and when nothing is starred.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_priority_landing: Vec<QueueLandingRow>,
+}
+
+/// One starred issue's landing state, with its repo's visibility tag (the
+/// same anti-leak rule as [`QueueSnapshotRow`]). Every text field is
+/// templated by the daemon; no forge free text is carried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueLandingRow {
+    #[serde(flatten)]
+    pub row: crate::types::StarLandingRow,
+    #[serde(default)]
+    pub visibility: RepoVisibility,
 }
 
 /// `detail` survives only for dispositions whose detail is structured: the

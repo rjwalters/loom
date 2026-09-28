@@ -158,6 +158,23 @@ re-run the stale check directly."
     )
 }
 
+/// Whether `subject` (a commit message's FIRST line) is exactly the subject
+/// [`commit_message`] writes, for some PR number — i.e. matches
+/// `^chore: re-date required checks for PR #[0-9]+ \(#8248 guard, automated by #8508\)$`.
+///
+/// The CI telemetry poller uses this to attribute a workflow run to this
+/// remedy (`loom.ci.trigger_reason = stale_main_bump`, #9337): it sees the
+/// run row's `head_commit.message`, never the PR's `loom:stale-check-redate`
+/// comment. Kept next to [`commit_message`] and tested against its output so
+/// the producer and the classifier cannot drift apart.
+#[must_use]
+pub fn is_redate_commit_subject(subject: &str) -> bool {
+    subject
+        .strip_prefix("chore: re-date required checks for PR #")
+        .and_then(|rest| rest.strip_suffix(" (#8248 guard, automated by #8508)"))
+        .is_some_and(|pr| !pr.is_empty() && pr.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// The marker a successful push records, naming the sha it created.
 ///
 /// Read back on a later tick as "the remedy already ran against this head" —

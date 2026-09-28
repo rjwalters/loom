@@ -1,5 +1,12 @@
 //! Validated W3C version-00 context. IDs survive serialization and delivery retries.
+//!
+//! Trace identity policy (`.loom/docs/trace-identity.md`): production IDs are
+//! never random. Every trace ID is derived from the natural key of the work it
+//! records, and every child span ID from its parent, name and start instant, so
+//! any ID can be recomputed from facts the span itself carries. The random
+//! constructors exist only under `cfg(test)`.
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 macro_rules! identifier {
@@ -61,6 +68,43 @@ pub struct TraceContext {
 }
 
 impl TraceContext {
+    /// A sampled root context for the `kind` of work (`loom.<kind>.trace` /
+    /// `loom.<kind>.root`, the [`super::story_context`] convention) keyed by
+    /// its natural key: the same key always yields the same IDs.
+    #[must_use]
+    pub fn derived(kind: &str, key: &[&str]) -> Self {
+        let trace_tag = format!("loom.{kind}.trace");
+        let root_tag = format!("loom.{kind}.root");
+        Self {
+            trace_id: TraceId::derived(&[&[trace_tag.as_str()][..], key].concat()),
+            span_id: SpanId::derived(&[&[root_tag.as_str()][..], key].concat()),
+            flags: 1,
+        }
+    }
+
+    /// A child in this trace whose span ID is derived from this (parent) span
+    /// and `key`, which must distinguish it from its siblings.
+    #[must_use]
+    pub fn derived_child(&self, key: &[&str]) -> Self {
+        let parent = [
+            "loom.span.child",
+            self.trace_id.as_str(),
+            self.span_id.as_str(),
+        ];
+        Self {
+            trace_id: self.trace_id.clone(),
+            span_id: SpanId::derived(&[&parent[..], key].concat()),
+            flags: self.flags,
+        }
+    }
+
+    /// A child keyed by its span name and start instant.
+    #[must_use]
+    pub fn child_at(&self, name: &str, started_at: DateTime<Utc>) -> Self {
+        self.derived_child(&[name, &instant(started_at)])
+    }
+
+    #[cfg(test)]
     #[must_use]
     pub fn root(sampled: bool) -> Self {
         let trace_id = TraceId(uuid::Uuid::new_v4().simple().to_string());
@@ -71,6 +115,7 @@ impl TraceContext {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn child(&self) -> Self {
         Self {
@@ -130,6 +175,14 @@ pub fn derived_hex(parts: &[&str], hex_len: usize) -> String {
     }
 }
 
+/// The canonical text form of an instant inside a derived-ID key: RFC 3339,
+/// UTC, nanosecond precision — the same precision OTLP carries.
+#[must_use]
+pub fn instant(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+#[cfg(test)]
 fn new_span_id() -> SpanId {
     // UUID v4's version bits ensure these first eight bytes cannot all be zero.
     SpanId(uuid::Uuid::new_v4().simple().to_string()[..16].to_string())

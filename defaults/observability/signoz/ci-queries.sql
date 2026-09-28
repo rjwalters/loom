@@ -21,6 +21,8 @@
 --     first (its `CREATE DATABASE IF NOT EXISTS` / `CREATE OR REPLACE VIEW`
 --     are idempotent, so re-running it changes nothing); section 7 then joins
 --     to it read-only.
+--   * Section 8 (#9337) reads `ci.run` log records only: CI time per
+--     `loom.ci.trigger_reason` (7 days).
 --
 -- Vocabulary is pinned to what the daemon exports and the gateway forwards:
 -- `loom-daemon/tests/signoz_trial_artifacts.rs` fails if any attribute key,
@@ -56,7 +58,7 @@
 --     < ci-queries.sql
 --
 -- Parameters (all five must be bound; every one is used):
---   since         DateTime (UTC) lower bound for sections 0-1 and 3-6
+--   since         DateTime (UTC) lower bound for sections 0-1 and 3-8
 --   repo          'owner/name' to scope to one repository, '' for the whole org
 --   bucket_hours  trend bucket width for sections 1 and 3 (24 = daily, 168 = weekly)
 --   window_hours  section 2 compares [now - w, now) against [now - 2w, now - w)
@@ -448,3 +450,37 @@ WHERE ro.finished_at >= {since:DateTime}
   AND ({repo:String} = '' OR ro.repo = {repo:String})
 ORDER BY ro.finished_at DESC
 LIMIT {top:UInt32};
+
+-- 8. CI time by trigger reason (#9337). Why did each run happen, and how much
+--    running and queue time did each reason cost? `stale_main_bump` is the
+--    time lost to the #8508 re-date commit re-running CI after `main` moved;
+--    `flaky_retry` is in-place re-runs; `new_commit` is fresh code (including
+--    merge-from-main heads — the documented under-count, see
+--    ../../docs/ci-observability.md "Trigger attribution"). Runs recorded
+--    before #9337 carry no reason and report as `unrecorded`. Logs-backed:
+--    7 days.
+WITH runs AS (
+    SELECT attributes_string['loom.repo'] AS repo,
+           toUInt64(attributes_number['loom.ci.run_id']) AS run_id,
+           toUInt32(attributes_number['loom.ci.run_attempt']) AS run_attempt,
+           if(mapContains(attributes_string, 'loom.ci.trigger_reason'),
+              attributes_string['loom.ci.trigger_reason'], 'unrecorded') AS trigger_reason,
+           attributes_number['loom.ci.duration_ms'] AS run_ms,
+           if(mapContains(attributes_number, 'loom.ci.queued_ms'),
+              attributes_number['loom.ci.queued_ms'], NULL) AS queued_ms
+    FROM signoz_logs.logs_v2
+    WHERE body = 'ci.run'
+      AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    LIMIT 1 BY repo, run_id, run_attempt
+)
+SELECT repo,
+       trigger_reason,
+       count() AS runs,
+       round(sum(run_ms) / 1000 / 60, 1) AS run_minutes,
+       round(sum(queued_ms) / 1000 / 60, 1) AS queued_minutes,
+       round(100 * sum(run_ms) / sum(sum(run_ms)) OVER (PARTITION BY repo), 1)
+                                                            AS pct_of_repo_run_time
+FROM runs
+GROUP BY repo, trigger_reason
+ORDER BY repo, run_minutes DESC;

@@ -373,7 +373,7 @@ fn run_preflight(
                 writeln!(log, "{}", prepared.dispatch_marker())
                     .and_then(|()| log.flush())
                     .map_err(|e| LaunchError::config(e.to_string()))?;
-                return egress_proxy::run_with_proxy(prepared, command);
+                return egress_proxy::run_with_proxy(prepared, command, &mut log);
             }
             log.flush()
                 .map_err(|e| LaunchError::config(e.to_string()))?;

@@ -1,5 +1,7 @@
 //! Owned process-boundary trace propagation. Export remains independently opt-in.
-use crate::telemetry::trace::store::{TraceStore, CONTEXT_FILE_ENV, TRACEPARENT_ENV};
+use crate::telemetry::trace::store::{
+    TraceStore, CONTEXT_FILE_ENV, TRACEPARENT_ENV, W3C_TRACEPARENT_ENV,
+};
 use std::path::Path;
 use std::process::Command;
 
@@ -33,9 +35,19 @@ fn valid_endpoint(endpoint: &str) -> bool {
 /// An `issue` execution joins that issue's D32 v1 story trace (#9037, #9068)
 /// when the checkout's GitHub `origin` resolves to a `repo_id`; otherwise it
 /// is its own root. There is no name-derived fallback.
+///
+/// The context is exported under **both** [`TRACEPARENT_ENV`] (Loom's own
+/// namespaced variable) and [`W3C_TRACEPARENT_ENV`] (the standard `TRACEPARENT`,
+/// #9215), always with the same value and always together — a third-party
+/// harness inside the spawned process (Claude Code's `-p`/Agent-SDK sessions
+/// read `TRACEPARENT`; interactive sessions deliberately ignore it) then
+/// parents its own spans inside this execution's trace instead of emitting
+/// orphan roots. Both are `env_remove`d on the disabled and error paths, so a
+/// stale ambient value can never be mistaken for this execution's context.
 pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue: Option<u32>) {
     command
         .env_remove(TRACEPARENT_ENV)
+        .env_remove(W3C_TRACEPARENT_ENV)
         .env_remove(CONTEXT_FILE_ENV);
     if !enabled(root) {
         return;
@@ -45,6 +57,7 @@ pub fn prepare_child(command: &mut Command, root: &Path, execution: &str, issue:
     match store.load_or_create_story(root, execution, story.as_ref().map(|s| &s.context)) {
         Ok(saved) => {
             command.env(TRACEPARENT_ENV, saved.context.traceparent());
+            command.env(W3C_TRACEPARENT_ENV, saved.context.traceparent());
             command.env(CONTEXT_FILE_ENV, store.path(root, execution));
             super::lifecycle::prepare_execution(command, root, execution, story.as_ref());
         }

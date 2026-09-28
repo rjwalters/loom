@@ -205,3 +205,149 @@ fn a_late_rerun_of_a_run_older_than_the_watermark_is_exported_exactly_once() {
         watermark
     );
 }
+
+/// #8992: a run that never completes must not pin a repo's watermark forever.
+/// Held while it is within the bound (the rescan window, capped by the
+/// initial lookback), but once it ages past that bound the hold is released —
+/// the watermark advances to the newest run seen, and the stuck run then
+/// drops out of future listings too (nothing can ever re-surface it, so
+/// nothing is lost by no longer trying).
+#[test]
+fn a_never_completing_run_past_the_bound_stops_holding_the_watermark() {
+    let dir = TempDir::new().unwrap();
+    let api = CreatedFiltering::new();
+    let runs_key = format!("repos/{ORG}/beta/actions/runs?per_page=100");
+    api.fixture.edit(&runs_key, |entry| {
+        let runs = entry["body"]["workflow_runs"].as_array_mut().unwrap();
+        let stuck = runs.iter_mut().find(|run| run["id"] == 2002).unwrap();
+        stuck["status"] = Value::from("in_progress");
+        stuck["conclusion"] = Value::Null;
+    });
+    let beta = format!("{ORG}/beta");
+
+    // Cycle 1: run 2002 (created 10:00) is only two hours stale — well inside
+    // the 24-hour bound — so it holds the watermark exactly as before #8992.
+    run_cycle(&ctx(dir.path()), &api).unwrap();
+    let held: DateTime<Utc> = "2026-09-20T10:00:00Z".parse().unwrap();
+    assert_eq!(
+        Ledger::open_read_only(state_dir(dir.path()).join("seen.jsonl"))
+            .unwrap()
+            .watermark(&beta),
+        Some(held)
+    );
+
+    // Cycle 2, a day and a half later: run 2002 is now 38 hours stale, past
+    // the 24-hour bound. It is still unfinished and still listed (the floor
+    // is still older than it), but it no longer holds the watermark.
+    let mut cycle2 = ctx(dir.path());
+    cycle2.now = "2026-09-22T00:00:00Z".parse().unwrap();
+    let report = run_cycle(&cycle2, &api).unwrap();
+    assert_eq!(
+        (report.summary.runs_emitted, report.summary.jobs_emitted),
+        (0, 0),
+        "run 2002 is still unfinished, so it is never committed"
+    );
+    let advanced: DateTime<Utc> = "2026-09-20T11:00:00Z".parse().unwrap();
+    assert_eq!(
+        Ledger::open_read_only(state_dir(dir.path()).join("seen.jsonl"))
+            .unwrap()
+            .watermark(&beta),
+        Some(advanced),
+        "the watermark must advance past the stuck run, to the newest run seen"
+    );
+
+    // Cycle 3, another day later: the watermark has moved past run 2002's
+    // `created_at`, so the floor now excludes it — it has dropped out of
+    // every future listing for good.
+    let mut cycle3 = ctx(dir.path());
+    cycle3.now = "2026-09-23T00:00:00Z".parse().unwrap();
+    let report = run_cycle(&cycle3, &api).unwrap();
+    assert_eq!((report.summary.runs_emitted, report.summary.jobs_emitted), (0, 0));
+    assert!(
+        api.fixture
+            .requests()
+            .iter()
+            .any(|(p, _)| p.starts_with(&format!("repos/{beta}/actions/runs?"))
+                && p.contains("created=%3E%3D2026-09-20T11:00:00Z")),
+        "the floor must have advanced past run 2002's created_at: {:?}",
+        api.fixture.requests()
+    );
+    assert_eq!(
+        Ledger::open_read_only(state_dir(dir.path()).join("seen.jsonl"))
+            .unwrap()
+            .watermark(&beta),
+        Some(advanced),
+        "the watermark must stay put once nothing new is seen"
+    );
+}
+
+/// The flip side of the test above: a run that is merely slow — it completes
+/// before it ages past the bound — is still held across every intervening
+/// cycle and is still exported exactly once, the moment it completes.
+#[test]
+fn a_slow_run_is_still_held_across_several_cycles_and_exported_once_it_completes() {
+    let dir = TempDir::new().unwrap();
+    let api = CreatedFiltering::new();
+    let runs_key = format!("repos/{ORG}/beta/actions/runs?per_page=100");
+    api.fixture.edit(&runs_key, |entry| {
+        let runs = entry["body"]["workflow_runs"].as_array_mut().unwrap();
+        let slow = runs.iter_mut().find(|run| run["id"] == 2002).unwrap();
+        slow["status"] = Value::from("in_progress");
+        slow["conclusion"] = Value::Null;
+    });
+    let beta = format!("{ORG}/beta");
+    let held: DateTime<Utc> = "2026-09-20T10:00:00Z".parse().unwrap();
+
+    // Cycle 1: held, two hours stale.
+    run_cycle(&ctx(dir.path()), &api).unwrap();
+    assert_eq!(
+        Ledger::open_read_only(state_dir(dir.path()).join("seen.jsonl"))
+            .unwrap()
+            .watermark(&beta),
+        Some(held)
+    );
+
+    // Cycle 2, twelve hours later (14 hours stale): still inside the bound,
+    // still unfinished, so still held — the watermark does not move.
+    let mut cycle2 = ctx(dir.path());
+    cycle2.now = "2026-09-21T00:00:00Z".parse().unwrap();
+    let report = run_cycle(&cycle2, &api).unwrap();
+    assert_eq!((report.summary.runs_emitted, report.summary.jobs_emitted), (0, 0));
+    assert_eq!(
+        Ledger::open_read_only(state_dir(dir.path()).join("seen.jsonl"))
+            .unwrap()
+            .watermark(&beta),
+        Some(held)
+    );
+
+    // Cycle 3, twenty hours later still (22 hours stale — inside the bound):
+    // the run finally completes. It is exported now, not lost.
+    api.fixture.edit(&runs_key, |entry| {
+        let runs = entry["body"]["workflow_runs"].as_array_mut().unwrap();
+        let slow = runs.iter_mut().find(|run| run["id"] == 2002).unwrap();
+        slow["status"] = Value::from("completed");
+        slow["conclusion"] = Value::from("success");
+    });
+    let mut cycle3 = ctx(dir.path());
+    cycle3.now = "2026-09-21T08:00:00Z".parse().unwrap();
+    let report = run_cycle(&cycle3, &api).unwrap();
+    assert_eq!(
+        (report.summary.runs_emitted, report.summary.jobs_emitted),
+        (1, 4),
+        "run 2002 must be exported once it completes, inside the bound"
+    );
+    let advanced: DateTime<Utc> = "2026-09-20T11:00:00Z".parse().unwrap();
+    assert_eq!(
+        Ledger::open_read_only(state_dir(dir.path()).join("seen.jsonl"))
+            .unwrap()
+            .watermark(&beta),
+        Some(advanced)
+    );
+    assert_no_duplicates(dir.path());
+
+    // A further cycle at the same instant re-lists the same window and
+    // exports nothing further: exactly once.
+    let repeat = run_cycle(&cycle3, &api).unwrap();
+    assert_eq!((repeat.summary.runs_emitted, repeat.summary.jobs_emitted), (0, 0));
+    assert_no_duplicates(dir.path());
+}

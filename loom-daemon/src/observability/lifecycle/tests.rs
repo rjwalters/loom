@@ -186,3 +186,50 @@ fn recycled_owner_is_recovered_without_mistaking_delayed_spawn_for_reuse() {
     assert_eq!(results[0].attributes["loom.result"], "process_lost");
     assert_eq!(results[0].status, SpanStatus::Unset);
 }
+
+/// A role tick's trace is keyed on role + start instant (+ the repo key), never
+/// a random id: the same tick recomputes to the same root, and two roles
+/// starting in the same instant do not collide.
+#[test]
+#[serial_test::serial] // the repo key reads the process-global `LOOM_REPO`
+fn role_invocation_ids_derive_from_role_and_start_instant() {
+    let at = chrono::DateTime::parse_from_rfc3339("2026-09-26T12:00:00.123456789Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let judge = role_execution_id("judge", at);
+    assert_eq!(judge, "role-judge-2026-09-26T12:00:00.123456789Z");
+    assert_eq!(judge, role_execution_id("judge", at), "recomputable");
+    let curator = role_execution_id("curator", at);
+    let ws = std::path::Path::new("/nonexistent/loom");
+    let (a, b) = (
+        TraceStore::root_context(ws, &judge, None),
+        TraceStore::root_context(ws, &curator, None),
+    );
+    assert_eq!(a, TraceStore::root_context(ws, &judge, None));
+    assert_ne!(a.trace_id, b.trace_id);
+    assert_ne!(a.span_id, b.span_id);
+}
+
+/// Tool spans carry no role, so the tool name joins the child key: two tools
+/// opening the same span name in one clock tick stay distinct.
+#[test]
+fn tool_spans_in_the_same_instant_key_on_tool_name() {
+    let parent = TraceContext::derived("test", &["parent"]);
+    let at = Utc::now();
+    let read =
+        child_context(&parent, SpanName::Tool, at, &attributes(&[("loom.tool.name", "read")]));
+    let write =
+        child_context(&parent, SpanName::Tool, at, &attributes(&[("loom.tool.name", "write")]));
+    assert_ne!(read.span_id, write.span_id);
+    assert_eq!(read.trace_id, write.trace_id);
+    let untagged = child_context(&parent, SpanName::Tool, at, &TraceAttributes::new());
+    assert_eq!(
+        untagged,
+        parent.derived_child(&[
+            SpanName::Tool.as_str(),
+            "",
+            &crate::telemetry::trace::instant(at)
+        ]),
+        "spans without a tool name keep their original key"
+    );
+}

@@ -85,7 +85,7 @@ pub(super) fn native_resolution(root: &Path) -> ArtifactResolution {
 /// inode is gone. `None` is the fail-safe direction — `classify_artifact`
 /// turns an undetermined installed version into `Newer`, and #7609's
 /// `already_converged` guard is what stops that becoming a fetch loop.
-fn running_binary() -> Option<std::path::PathBuf> {
+pub(crate) fn running_binary() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     // The kernel appends this to /proc/self/exe once the inode is unlinked.
     if exe.to_string_lossy().ends_with(" (deleted)") {

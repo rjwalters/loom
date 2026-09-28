@@ -17,7 +17,7 @@
  * a host that never sent a queue says so rather than showing zeros.
  */
 
-import { el } from "../dom";
+import { el, replaceChildren } from "../dom";
 import type { FleetView, HostView } from "../fleet";
 import { forgeLink, issueUrl, pullUrl, repoUrl } from "../forgeLinks";
 import { UNKNOWN, formatAbsolute, formatCount, formatDuration, formatRelative, secondsSince } from "../format";
@@ -25,15 +25,19 @@ import type { QueueRow } from "../queueTypes";
 import type { ActiveSweep } from "../types";
 import {
   fleetQueueTotals,
+  filterQueueItems,
   isCurrent,
   mergeFleetQueue,
   QUEUE_STALE_AFTER_SEC,
   openPrNumber,
+  queueFilterOptions,
+  planText,
   rankText,
   reasonText,
   summarizeHostQueue,
   type FleetQueueItem,
   type HostQueueSummary,
+  type QueueFilter,
   type QueueHealth,
 } from "../workQueue";
 
@@ -131,7 +135,10 @@ function waitingCell(row: QueueRow, now: Date): HTMLElement {
 
 function flags(row: QueueRow): HTMLElement | null {
   const parts: HTMLElement[] = [];
-  if (row.urgent) parts.push(el("span", { class: "badge badge--urgent", title: "loom:urgent" }, "urgent"));
+  if (row.operator_priority) {
+    const title = row.operator_priority_at ? `loom:operator-priority since ${formatAbsolute(row.operator_priority_at)}` : "loom:operator-priority";
+    parts.push(el("span", { class: "badge badge--starred", title }, "starred"));
+  }
   if (row.tier) {
     parts.push(el("span", { class: "queue__tier", title: "Informational: the daemon does not order by tier" }, row.tier));
   }
@@ -237,8 +244,9 @@ function itemRow(item: FleetQueueItem, now: Date): HTMLElement {
     "tr",
     {
       class: `queue-row queue-row--${item.state}`,
-      data: { testid: "queue-item", state: item.state, issue: item.issue, host: item.primary.hostId },
+      data: { testid: "queue-item", state: item.state, issue: item.issue, host: item.primary.hostId, rank: row.rank },
     },
+    el("td", { class: "queue__rank" }, rankText(row)),
     el("td", {}, issueCell(item.repo, item.issue, item.visibility), flags(row)),
     el("td", {}, repoCell(item.repo)),
     el(
@@ -280,11 +288,142 @@ function itemList(state: "running" | "ready" | "blocked", items: FleetQueueItem[
           el(
             "thead",
             {},
-            el("tr", {}, ["Issue", "Repository", "Host", "Phase", "Waiting", "Reason"].map((h) => el("th", {}, h))),
+            el(
+              "tr",
+              {},
+              ["Rank", "Issue", "Repository", "Host", "Phase", "Waiting", "Reason"].map((h) => el("th", {}, h)),
+            ),
           ),
           el("tbody", {}, matching.map((item) => itemRow(item, now))),
         ),
   );
+}
+
+// ---------------------------------------------------------------------------
+// `#/queue` filter controls (Issue #9032)
+// ---------------------------------------------------------------------------
+
+/** `localStorage` key for a persisted filter field. Storage-backed (the same
+ * pattern `fleetOverview.ts` uses for the idle-roster toggle, #7662) rather
+ * than in-memory, because `workQueueView` is a pure function re-invoked from
+ * scratch on every poll tick (`App.render()`, every `pollIntervalMs`) — an
+ * in-memory variable would forget the operator's filter the moment the next
+ * snapshot arrived. */
+function queueFilterStorageKey(field: keyof QueueFilter): string {
+  return `loom-dashboard:queue-filter:${field}`;
+}
+
+/** Best-effort read, defaulting to "no filter" whenever storage is
+ * unavailable (private browsing, a test environment with no `window`) or has
+ * never recorded a value. */
+function readQueueFilterField(field: keyof QueueFilter): string {
+  try {
+    return window.localStorage.getItem(queueFilterStorageKey(field)) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** Best-effort write — a failure just means the filter won't survive the
+ * next poll tick, not an error worth surfacing. */
+function writeQueueFilterField(field: keyof QueueFilter, value: string): void {
+  try {
+    if (value) window.localStorage.setItem(queueFilterStorageKey(field), value);
+    else window.localStorage.removeItem(queueFilterStorageKey(field));
+  } catch {
+    // Storage unavailable — the control itself still worked.
+  }
+}
+
+function readQueueFilter(): QueueFilter {
+  return { repo: readQueueFilterField("repo") || undefined, tier: readQueueFilterField("tier") || undefined };
+}
+
+/** One filter `<select>`, built with `document.createElement` rather than
+ * `el()` (which has no `value` attribute — see `spendPanel.ts`'s period
+ * selector for the same pattern). Setting each `<option>`'s `selected`
+ * directly from `value` — rather than trusting the browser's default-first
+ * fallback — is what lets a persisted value that no longer appears in
+ * `options` (e.g. the operator's last-filtered repo went idle and dropped out
+ * of the merged fleet items) fall back to "All" rather than matching
+ * nothing. */
+function queueFilterSelect(
+  testid: string,
+  label: string,
+  allLabel: string,
+  options: readonly string[],
+  value: string | undefined,
+  onChange: (value: string) => void,
+): HTMLSelectElement {
+  const select = document.createElement("select");
+  select.className = "queue-filters__select";
+  select.setAttribute("data-testid", testid);
+  select.setAttribute("aria-label", label);
+
+  const allOption = document.createElement("option");
+  allOption.value = "";
+  allOption.textContent = allLabel;
+  allOption.selected = value === undefined || !options.includes(value);
+  select.appendChild(allOption);
+
+  for (const option of options) {
+    const node = document.createElement("option");
+    node.value = option;
+    node.textContent = option;
+    node.selected = option === value;
+    select.appendChild(node);
+  }
+
+  select.addEventListener("change", () => onChange(select.value));
+  return select;
+}
+
+/** The repo/tier filter bar plus the three lists it narrows — client-side
+ * only, over the `items` `mergeFleetQueue` already computed, so changing a
+ * filter never issues a new network request (Issue #9032). */
+function queueFilterSection(items: FleetQueueItem[], now: Date): DocumentFragment {
+  const options = queueFilterOptions(items);
+  // Clamp the persisted filter to values actually present in this render's
+  // items — otherwise a stale repo/tier (its last host went idle, or a
+  // filter picked on a different `#/queue` visit) would apply invisibly:
+  // the dropdown shows "All" (queueFilterSelect's own fallback) while the
+  // lists stayed narrowed to a value nothing matches.
+  const persisted = readQueueFilter();
+  const filter: QueueFilter = {
+    repo: persisted.repo && options.repos.includes(persisted.repo) ? persisted.repo : undefined,
+    tier: persisted.tier && options.tiers.includes(persisted.tier) ? persisted.tier : undefined,
+  };
+  const lists = el("div", { data: { testid: "queue-lists" } });
+
+  function renderLists(): void {
+    const filtered = filterQueueItems(items, filter);
+    replaceChildren(lists, itemList("running", filtered, now), itemList("ready", filtered, now), itemList("blocked", filtered, now));
+  }
+
+  const repoSelect = queueFilterSelect("queue-filter-repo", "Filter by repository", "All repos", options.repos, filter.repo, (value) => {
+    filter.repo = value || undefined;
+    writeQueueFilterField("repo", value);
+    renderLists();
+  });
+  const tierSelect = queueFilterSelect("queue-filter-tier", "Filter by tier", "All tiers", options.tiers, filter.tier, (value) => {
+    filter.tier = value || undefined;
+    writeQueueFilterField("tier", value);
+    renderLists();
+  });
+
+  renderLists();
+
+  const fragment = document.createDocumentFragment();
+  fragment.appendChild(
+    el(
+      "div",
+      { class: "queue-filters", data: { testid: "queue-filters" } },
+      el("label", { class: "queue-filters__label" }, "Repo", repoSelect),
+      el("label", { class: "queue-filters__label" }, "Tier", tierSelect),
+    ),
+  );
+  fragment.appendChild(lists);
+  return fragment;
 }
 
 /** The `#/queue` route. */
@@ -311,9 +450,7 @@ export function workQueueView(view: FleetView, now: Date = new Date()): HTMLElem
         "Waiting is time since the issue was created." +
         (withheld > 0 ? ` ${withheld} row${withheld === 1 ? "" : "s"} from private repositories are shown without detail.` : ""),
     ),
-    itemList("running", items, now),
-    itemList("ready", items, now),
-    itemList("blocked", items, now),
+    queueFilterSection(items, now),
   );
 }
 
@@ -329,7 +466,7 @@ function hostRow(row: QueueRow, sweeps: readonly ActiveSweep[], now: Date): HTML
     el("td", {}, rankText(row)),
     el("td", {}, issueCell(row.repo, row.issue, row.visibility), flags(row)),
     el("td", {}, repoCell(row.repo)),
-    el("td", {}, row.state),
+    el("td", {}, planText(row)),
     el("td", {}, row.state === "running" ? phaseText(sweep, now) : UNKNOWN),
     el("td", {}, waitingCell(row, now)),
     el("td", {}, reasonCell(row, row.repo)),

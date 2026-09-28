@@ -57,8 +57,13 @@ pub struct CycleSummary {
 /// failing apart, so silence can never read as healthy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollStatus {
+    /// The polled owners' logins, comma-joined (one owner = its login, as
+    /// before #9188).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org: Option<String>,
+    /// Per-owner outcome of the last completed cycle (#9188).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<super::owners::OwnerStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_attempt_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

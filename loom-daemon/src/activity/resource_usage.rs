@@ -383,7 +383,7 @@ impl ModelPricing {
 
     /// [`Self::resolve`] against an explicit card, so a test can exercise both
     /// tiers without depending on what the host checkout has installed.
-    fn resolve_with(card: Option<&PricingCard>, model: &str) -> Option<Self> {
+    pub(crate) fn resolve_with(card: Option<&PricingCard>, model: &str) -> Option<Self> {
         card.map_or_else(|| Self::lookup(model), |c| c.lookup(model))
     }
 

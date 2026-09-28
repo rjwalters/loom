@@ -184,6 +184,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 depends_on,
                 force,
                 ignore_host_constraint,
+                allow_local,
             } => {
                 handle_dispatch_command(
                     issue,
@@ -193,6 +194,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     depends_on,
                     force,
                     ignore_host_constraint,
+                    allow_local,
                 )
                 .await
             }
@@ -1500,6 +1502,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
         None
     };
+    // Starred-issue liveness + loom-ui star intents (#9244 C), alongside dispatch.
+    let _star_liveness = _work_finder_handle
+        .is_some()
+        .then(|| loom_daemon::star_liveness::task::spawn(sweep_workspace.clone()));
 
     // Idle-edge role triggering (#4364) is inert without the work-finder loop:
     // the work finder is the sole source of the per-root idle signal, so an

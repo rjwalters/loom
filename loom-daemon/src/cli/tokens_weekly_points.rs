@@ -42,6 +42,8 @@
 //! shared machine-level pool — is exact, and `account_count` travels with the
 //! row so #8063 can tell a pool-size change apart from a real step change.
 
+use std::path::Path;
+
 use loom_daemon::tokens_pool::check::ProbeReport;
 
 /// Record today's weekly-limit-point sample from a completed probe run.
@@ -72,4 +74,29 @@ pub(crate) fn record_probe_run(ranking: bool, report: &ProbeReport) {
         return;
     }
     record_daily_sample_best_effort(points, account_count);
+}
+
+/// Write the per-account weekly-utilization sidecar beside the `.ranking` this
+/// run just wrote (Issue #9005), so the telemetry collector can export each
+/// account's 7-day axis (`loom.tokens.usage_fraction_weekly`) next to the
+/// 5-hour one `.ranking` already carries.
+///
+/// Same `--ranking` gate and same call site as [`record_probe_run`], for the
+/// same reasons: only an authoritative run rewrites pool state, and this one
+/// hook sees the finished report from either the live probe or the
+/// claude-monitor short-circuit. Written even for an empty report, so a stale
+/// sidecar never outlives the `.ranking` it described. Best-effort: a failed
+/// write warns and leaves `.ranking` and the exit code alone.
+pub(crate) fn write_weekly_sidecar(ranking: bool, tokens_dir: &Path, report: &ProbeReport) {
+    use loom_daemon::tokens_pool::ranking_weekly::write_weekly_utilization_sidecar;
+
+    if !ranking {
+        return;
+    }
+    if let Err(e) = write_weekly_utilization_sidecar(report, tokens_dir, chrono::Utc::now()) {
+        eprintln!(
+            "WARNING failed to write weekly-utilization sidecar in {}: {e}",
+            tokens_dir.display()
+        );
+    }
 }

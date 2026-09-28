@@ -579,59 +579,43 @@ pub struct TranscriptUsage {
     pub cache_creation_input_tokens: i64,
 }
 
-/// Sum every `usage` block in a subagent transcript.
+/// Sum a subagent transcript's usage, deduped on `message.id`.
 ///
 /// Best-effort: unreadable lines are skipped, a missing file yields zeros.
-///
-/// **Not deduped on `message.id`** — a streamed assistant message is written
-/// to the transcript once per chunk, and every chunk repeats the same
-/// `message.id` carrying that message's **cumulative** usage, not a delta.
-/// Summing every block therefore counts a streamed message once per chunk.
-/// Measured 2026-09-18 (24h window, 2,330 transcripts): 51% of usage blocks
-/// are repeats, so this (and [`sum_transcript_usage_by_model`]) run roughly
-/// 2x high versus a per-`message.id`-deduped total. That is long-standing
-/// behaviour the existing consumers (the safehouse completion feed's
-/// `tokens`, `sweep.outcome`) are calibrated against (issue #8186), so it is
-/// left as-is here — for a deduped total use
-/// [`crate::activity::transcript_parse`], the `activity.db` ingestion path
-/// issue #8059 added.
+/// `usage_blocks` counts every usage block seen (before dedupe); the token
+/// counters count each streamed message once — see
+/// [`super::transcript_usage::UsageFold`] (issue #8186, fixed by #9303). The
+/// cache-write total is the 5-minute + 1-hour split, so it reconciles with
+/// [`sum_transcript_usage_by_model`] exactly.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)]
 pub fn sum_transcript_usage(path: &Path) -> TranscriptUsage {
     let mut out = TranscriptUsage::default();
     let Ok(text) = std::fs::read_to_string(path) else {
         return out;
     };
-    for raw in text.lines() {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
+    let mut fold = super::transcript_usage::UsageFold::default();
+    for raw in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let Ok(obj) = serde_json::from_str::<Value>(raw) else {
             continue;
         };
         let container = obj.get("message").filter(|m| m.is_object()).unwrap_or(&obj);
-        if !container.is_object() {
-            continue;
-        }
         if out.model.is_none() {
-            if let Some(mv) = container
+            out.model = container
                 .get("model")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-            {
-                out.model = Some(mv.to_string());
-            }
+                .map(ToString::to_string);
         }
-        let Some(usage) = container.get("usage").and_then(Value::as_object) else {
-            continue;
-        };
-        out.usage_blocks += 1;
-        let get = |k: &str| usage.get(k).and_then(Value::as_f64).unwrap_or(0.0) as i64;
-        out.input_tokens += get("input_tokens");
-        out.output_tokens += get("output_tokens");
-        out.cache_read_input_tokens += get("cache_read_input_tokens");
-        out.cache_creation_input_tokens += get("cache_creation_input_tokens");
+        if let Some(record) = super::transcript_usage::usage_from_record(&obj) {
+            fold.add(record);
+        }
+    }
+    out.usage_blocks = fold.blocks;
+    for row in fold.rows() {
+        out.input_tokens += row.input;
+        out.output_tokens += row.output;
+        out.cache_read_input_tokens += row.cache_read;
+        out.cache_creation_input_tokens += row.cache_write_5m + row.cache_write_1h;
     }
     out.cost_usd = calc_cost(
         out.input_tokens,
@@ -676,61 +660,26 @@ pub struct ModelUsageTotals {
     pub output: i64,
 }
 
-/// Sum every `usage` block in a subagent transcript, grouped by the
-/// `(model, speed, service_tier)` tuple instead of collapsed into one running
-/// total (issue #5740) — see the module-level rationale on
-/// [`ModelUsageTotals`]. Same best-effort semantics as
-/// [`sum_transcript_usage`]: unreadable lines are skipped, a missing file
-/// yields an empty result.
+/// A subagent transcript's usage grouped by the `(model, speed,
+/// service_tier)` tuple instead of collapsed into one running total (issue
+/// #5740) — see the rationale on [`ModelUsageTotals`]. Same best-effort
+/// semantics as [`sum_transcript_usage`]; a missing file yields an empty
+/// result.
 ///
-/// Per-record decoding (the model bucketing, the `speed`/`service_tier`
-/// defaults, the 5-minute/1-hour cache-write split and its flat-only
-/// fallback) is [`super::transcript_usage::usage_from_record`]; this function
-/// only folds those records into per-tuple totals.
+/// Deduped on `message.id` (issue #8186, fixed by #9303): a streamed message
+/// counts once, at its per-counter maximum. Decoding is
+/// [`super::transcript_usage::usage_from_record`] and the fold is
+/// [`super::transcript_usage::UsageFold`], shared with every other token path.
 ///
-/// **Not deduped on `message.id`** — a streamed message's chunks each repeat
-/// the id carrying cumulative usage, so a streamed message is counted once per
-/// chunk here. Measured 2026-09-18 (24h window, 2,330 transcripts): 51% of
-/// usage blocks are repeats, so this runs roughly 2x high versus a
-/// per-`message.id`-deduped total (issue #8186). That is long-standing
-/// behaviour the existing consumers (the safehouse completion feed,
-/// `sweep.outcome`) are calibrated against, so #8059 left it alone and
-/// deduped in its own `activity.db` ingestion fold instead — see
-/// [`crate::activity::transcript_parse`] for the deduped alternative.
-///
-/// Returned in a deterministic order (sorted by the grouping tuple), not
-/// insertion order, so callers get stable output for tests/snapshots.
+/// Returned sorted by the grouping tuple, so callers get stable output.
 #[must_use]
 pub fn sum_transcript_usage_by_model(path: &Path) -> Vec<ModelUsageTotals> {
-    let mut totals: BTreeMap<(String, String, String), ModelUsageTotals> = BTreeMap::new();
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    for raw in text.lines() {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<Value>(raw) else {
-            continue;
-        };
-        let Some(rec) = super::transcript_usage::usage_from_record(&obj) else {
-            continue;
-        };
-        let key = (rec.model.clone(), rec.speed.clone(), rec.service_tier.clone());
-        let entry = totals.entry(key).or_insert_with(|| ModelUsageTotals {
-            model: rec.model,
-            speed: rec.speed,
-            service_tier: rec.service_tier,
-            ..ModelUsageTotals::default()
-        });
-        entry.input += rec.input;
-        entry.cache_read += rec.cache_read;
-        entry.cache_write_5m += rec.cache_write_5m;
-        entry.cache_write_1h += rec.cache_write_1h;
-        entry.output += rec.output;
-    }
-    totals.into_values().collect()
+    let mut fold = super::transcript_usage::UsageFold::default();
+    fold.add_text(&text);
+    fold.rows()
 }
 
 // --------------------------------------------------------------------------
@@ -883,6 +832,10 @@ struct ArmRollup {
     n_first_pass: i64,
     doctor_cycles_total: i64,
     n_merged: i64,
+    /// First observed Builder model for this arm. Only consulted for an arm id
+    /// [`ARM_MODEL`] does not name — i.e. a configured `sweep.modelExperimentArms`
+    /// arm (#9122), whose alias this reader has no config to look up.
+    observed_model: Option<String>,
 }
 
 fn round6(v: f64) -> f64 {
@@ -1012,6 +965,9 @@ pub fn harvest(stats_file: Option<&str>, archive_dir: Option<&Path>) -> Value {
         if state.merged {
             a.n_merged += 1;
         }
+        if a.observed_model.is_none() {
+            a.observed_model = state.builder_model.clone();
+        }
     }
 
     let report_arms: Vec<Value> = arms
@@ -1020,10 +976,19 @@ pub fn harvest(stats_file: Option<&str>, archive_dir: Option<&Path>) -> Value {
             let n = a.n_issues;
             let judged = a.n_judged;
             let total_cost = arm_cost.get(arm).copied().unwrap_or(0.0);
-            let model = ARM_MODEL
-                .iter()
-                .find(|(k, _)| k == arm)
-                .map_or(Value::Null, |(_, m)| json!(m));
+            // A built-in arm reports its logical alias (stable for reporting);
+            // a configured arm id (#9122) reports the Builder model actually
+            // observed, since this reader has no config to resolve its alias.
+            // The `"?"` bucket keeps a NULL model by design — it is the
+            // unattributed bucket, and naming one of its many models would be a
+            // claim the data does not support.
+            let model = ARM_MODEL.iter().find(|(k, _)| k == arm).map_or_else(
+                || match a.observed_model.as_deref().filter(|_| arm != "?") {
+                    Some(m) => json!(m),
+                    None => Value::Null,
+                },
+                |(_, m)| json!(m),
+            );
             let mut out = Map::new();
             out.insert("arm".into(), json!(arm));
             out.insert("model".into(), model);
@@ -1079,25 +1044,6 @@ pub fn harvest(stats_file: Option<&str>, archive_dir: Option<&Path>) -> Value {
 
 fn fmt_pct(v: Option<f64>) -> String {
     v.map_or_else(|| "-".to_string(), |x| format!("{:.0}%", x * 100.0))
-}
-
-/// Render a JSON number the way Python's `str()` does for the harvest summary
-/// lines — `None` for null, `1.0` for an integral float.
-fn fmt_py_number(v: &Value) -> String {
-    match v {
-        Value::Null => "None".to_string(),
-        Value::Number(n) => n.as_f64().map_or_else(
-            || n.to_string(),
-            |f| {
-                if f.fract().abs() < f64::EPSILON {
-                    format!("{f:.1}")
-                } else {
-                    format!("{f}")
-                }
-            },
-        ),
-        other => other.to_string(),
-    }
 }
 
 #[must_use]
@@ -1161,25 +1107,11 @@ pub fn format_harvest_text(report: &Value) -> String {
         ));
     }
 
-    // Inequality inputs the retune (#3718) consumes.
-    let find_arm = |name: &str| {
-        arms.iter()
-            .find(|a| a.get("arm").and_then(Value::as_str) == Some(name))
-    };
-    if let (Some(a), Some(b)) = (find_arm("A"), find_arm("B")) {
-        lines.push(String::new());
-        lines.push("  Inequality inputs for #3718 (cost + merge-rate floor):".to_string());
-        lines.push(format!(
-            "    opus-first  (A): mean ${} / issue, merge-rate {}",
-            fmt_py_number(&a["mean_cost_per_issue_usd"]),
-            fmt_py_number(&a["merge_rate"])
-        ));
-        lines.push(format!(
-            "    sonnet-first(B): mean ${} / issue, merge-rate {}",
-            fmt_py_number(&b["mean_cost_per_issue_usd"]),
-            fmt_py_number(&b["merge_rate"])
-        ));
-    }
+    // The per-arm comparison tail — #3718's fixed A-vs-B inequality inputs, or
+    // the generalized per-arm table for an N-arm roster (#9122). Byte-for-byte
+    // unchanged for the legacy pair; it lives in the sibling arms module so the
+    // N-arm generalization did not grow this file (file-size ratchet).
+    lines.extend(super::sweep_experiment_arms::arm_comparison_lines(arms));
     lines.join("\n")
 }
 

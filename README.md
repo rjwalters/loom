@@ -357,7 +357,7 @@ gh pr create --label "loom:review-requested"
 | `/loom:hermit` | Identify simplification opportunities | Manual (cadence #3381) |
 | `/loom:doctor` | Fix PR feedback and conflicts | Manual |
 | `/loom:champion` | Evaluate proposals, auto-merge PRs | Cron via GH Actions |
-| `/loom:guide` | Triage and prioritize the issue queue (`loom:urgent`) | Cron via GH Actions |
+| `/loom:guide` | Triage the issue queue (tier labels, unblocking, WORK_PLAN) | Cron via GH Actions |
 | `/loom:auditor` | Validate main branch builds | Cron via GH Actions |
 | `/loom:driver` | Plain shell environment — no autonomous role behavior | Manual |
 

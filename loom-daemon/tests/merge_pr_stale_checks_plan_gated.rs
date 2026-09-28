@@ -39,7 +39,10 @@ use std::process::{Command, Output};
 /// - `repos/…/rules/branches/<base>` → one context per line, or the failure
 ///   named by `MOCK_RULES_RC` / `MOCK_RULES_STDERR`
 /// - `graphql` → one classic context per line
-/// - `repos/…/commits/<sha>/check-runs` → the projected JSON array
+/// - `repos/…/commits/<sha>/check-runs` → the projected `{total_count,
+///   check_runs}` rollup, one such object per page (#8987: the projection keeps
+///   `total_count` so a read short of the forge's own count fails closed, and
+///   `--paginate` makes a real read arrive as one object per page)
 fn write_mock_gh(dir: &Path) -> PathBuf {
     let path = dir.join("gh");
     std::fs::write(
@@ -56,7 +59,11 @@ case "$2" in
     printf '%s' "${MOCK_RULES_OUT:-}"
     ;;
   *check-runs*)
-    printf '%s' "${MOCK_RUNS_OUT:-[]}"
+    if [ -n "${MOCK_RUNS_OUT:-}" ]; then
+      printf '%s' "$MOCK_RUNS_OUT"
+    else
+      printf '{"total_count":0,"check_runs":[]}'
+    fi
     ;;
   *commits/*)
     printf '%s\t%s\n' "${MOCK_TIP_SHA:-abc123}" "${MOCK_TIP_DATE:-2026-09-18T11:45:21Z}"
@@ -81,7 +88,7 @@ esac
 /// payload throughout is deliberate: if the plan-gate path ever started
 /// reporting phantom required contexts, these tests would go red instead of
 /// passing for the wrong reason.
-const STALE_GREEN_RUNS: &str = r#"[{"name":"File Size Ratchet","status":"completed","conclusion":"success","started_at":"2026-09-17T22:54:20Z"}]"#;
+const STALE_GREEN_RUNS: &str = r#"{"total_count":1,"check_runs":[{"name":"File Size Ratchet","status":"completed","conclusion":"success","started_at":"2026-09-17T22:54:20Z"}]}"#;
 
 /// The exact stderr `gh` prints for the plan-gated 403.
 const PLAN_GATED: &str =

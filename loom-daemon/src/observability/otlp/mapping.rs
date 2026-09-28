@@ -3,6 +3,7 @@
 //! this module is the field-by-field implementation plus its unit tests.
 
 mod ci;
+mod eta;
 mod metadata;
 mod ops;
 
@@ -140,18 +141,21 @@ fn severity_text(severity: SeverityNumber) -> &'static str {
     }
 }
 
-/// A `Resource` describing the emitting daemon host. `daemon_version` is only
-/// known from a `host.health` record, so it is threaded in separately rather
-/// than read off `envelope.record` — see [`build_metrics_request`].
+/// A `Resource` describing the emitting daemon host. `service.version` is
+/// always present: a record-supplied `daemon_version` (from a `host.health`
+/// record, threaded in by [`build_metrics_request`]) wins; otherwise — traces,
+/// logs, and metrics batches without `host.health` — it falls back to the
+/// exporting build's own `CARGO_PKG_VERSION` (Issue #9028).
 pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
-    let mut attributes = vec![
+    let version = daemon_version
+        .filter(|v| !v.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    let attributes = vec![
         kv_string("service.name", "loom-daemon"),
         kv_string("service.instance.id", host_id),
         kv_string("host.id", host_id),
+        kv_string("service.version", version),
     ];
-    if let Some(version) = daemon_version {
-        attributes.push(kv_string("service.version", version));
-    }
     Resource {
         attributes,
         ..Default::default()
@@ -168,8 +172,8 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
 fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
     let observed_time_unix_nano = nanos(envelope.emitted_at);
     let mut time_unix_nano = observed_time_unix_nano;
-    // Only `ci.job.log` (#8825) sets this; every other kind's body stays the
-    // event name it has always been, byte-identical on the wire.
+    // Only `ci.job.log` (#8825) and the ETA kinds (#9289) set this; every
+    // other kind's body stays the event name, byte-identical on the wire.
     let mut body_override: Option<String> = None;
     let (event_name, severity, _body, attributes) = match &envelope.record {
         TelemetryRecord::SweepStarted(r) => {
@@ -539,6 +543,14 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             body_override = Some(r.text.clone());
             (event_name, severity, String::new(), attributes)
         }
+        TelemetryRecord::EtaEstimate(_) | TelemetryRecord::EtaOutcome(_) => {
+            // Issue #9289: the body is the record's JSON (an estimate's whole
+            // explanation); scalars ride as `loom.eta.*` attributes.
+            let (event_name, severity, at, attributes, body) = eta::log_parts(&envelope.record)?;
+            time_unix_nano = at;
+            body_override = Some(body);
+            (event_name, severity, String::new(), attributes)
+        }
         // Every kind that is not declared `otlp: Logs` in `telemetry/kinds.rs`:
         // `tokens.snapshot` / `host.health` become gauges, `ci.duration` a
         // histogram, `metric.points` its own grouped points, `trace.span` a
@@ -753,6 +765,18 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                         unit: "1",
                         attributes: attributes.clone(),
                         value: number_data_point::Value::AsDouble(usage_fraction),
+                        time_unix_nano,
+                    });
+                }
+                // Issue #9005: the rolling 7-day axis beside the 5h one. Same
+                // absent-not-zero rule — no source, no series.
+                if let Some(weekly) = account.usage_fraction_weekly {
+                    samples.push(MetricSample {
+                        name: "loom.tokens.usage_fraction_weekly",
+                        description: "Fraction of the rolling 7-day limit window consumed (0..1).",
+                        unit: "1",
+                        attributes: attributes.clone(),
+                        value: number_data_point::Value::AsDouble(weekly),
                         time_unix_nano,
                     });
                 }

@@ -271,7 +271,8 @@ mod tests {
 
     #[test]
     fn unrelated_labels_are_ignored() {
-        assert!(required_hosts_from_labels(&labels(&["loom:issue", "loom:urgent"])).is_empty());
+        assert!(required_hosts_from_labels(&labels(&["loom:issue", "loom:operator-priority"]))
+            .is_empty());
     }
 
     // ---- body marker convention ---------------------------------------

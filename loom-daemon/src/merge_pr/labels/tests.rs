@@ -11,7 +11,7 @@ use super::*;
 #[test]
 fn a_clean_approval_is_not_a_contradiction() {
     assert_eq!(contradiction("loom:pr"), None);
-    assert_eq!(contradiction("loom:pr\nloom:urgent\ntier:goal-advancing"), None);
+    assert_eq!(contradiction("loom:pr\nloom:operator-priority\ntier:goal-advancing"), None);
 }
 
 #[test]
@@ -40,7 +40,11 @@ fn the_verdict_does_not_depend_on_label_order() {
     // guard that read "whichever came first" could be silently defeated by
     // relabelling — which is exactly the race (#8112) that produced the
     // contradictory state in the first place.
-    let set = ["loom:pr", "loom:changes-requested", "loom:urgent"];
+    let set = [
+        "loom:pr",
+        "loom:changes-requested",
+        "loom:operator-priority",
+    ];
     // Every permutation of three elements.
     let orders = [
         [0, 1, 2],
@@ -67,6 +71,29 @@ fn several_blockers_report_the_first_in_the_fixed_order() {
     // reproducible from the label set alone.
     let labels = "loom:review-requested\nloom:pr\nloom:operator\nloom:blocked";
     assert_eq!(contradiction(labels), Some("loom:blocked"));
+}
+
+#[test]
+fn a_released_critical_file_hold_merges_while_a_real_rejection_still_blocks() {
+    // #9016. Champion's critical-file hold parks `loom:operator` beside
+    // `loom:pr`, and the documented human path out of it is "remove the label,
+    // then run merge-pr.sh". Both halves of that have to hold HERE, because
+    // this guard is what the operator's merge runs into:
+    //
+    // 1. while the label is on, the merge is refused — unchanged;
+    assert_eq!(contradiction("loom:pr\nloom:operator"), Some("loom:operator"));
+    // 2. once the operator removes it, there is nothing left to contradict, so
+    //    `merge-pr.sh <N>` proceeds with no flag and no bypass. (What #9016
+    //    fixed is Champion re-adding the label a tick later, not anything in
+    //    this function — see the module docs.)
+    assert_eq!(contradiction("loom:pr\ntier:goal-supporting"), None);
+    // 3. and the release is scoped to that ONE label: a genuine Judge
+    //    rejection or re-review racing an approval still blocks, with or
+    //    without `loom:operator` in the set. This is the #8112 property the
+    //    #9016 fix must not have weakened.
+    assert_eq!(contradiction("loom:pr\nloom:changes-requested"), Some("loom:changes-requested"));
+    assert_eq!(contradiction("loom:pr\nloom:review-requested"), Some("loom:review-requested"));
+    assert_eq!(contradiction("loom:pr\nloom:blocked"), Some("loom:blocked"));
 }
 
 #[test]

@@ -62,13 +62,25 @@ pub const OPERATOR_HOLD_LABEL: &str = "loom:operator";
 /// exclusive states in the `.github/labels.yml` state machine), but `gh`'s
 /// label cache can be briefly stale, so the finder checks defensively.
 ///
-/// Composed as [`BUILDING_LABEL`] + [`PARK_LABELS`] + [`OPERATOR_HOLD_LABEL`]
-/// rather than re-listing the label strings, so the constants can never drift
-/// apart (#4444). The operator hold sits in this list but NOT in
-/// [`PARK_LABELS`] — see [`OPERATOR_HOLD_LABEL`] for why.
+/// Composed as [`BUILDING_LABEL`], [`PARK_LABELS`], [`OPERATOR_HOLD_LABEL`]
+/// and [`OPERATOR_DECISION_LABEL`] rather than re-listing the label strings,
+/// so the constants can never drift apart (#4444). The operator hold sits in this
+/// list but NOT in [`PARK_LABELS`] — see [`OPERATOR_HOLD_LABEL`] for why.
 pub const SKIP_LABELS: &[&str] = &[
     BUILDING_LABEL,
     PARK_LABELS[0],
     PARK_LABELS[1],
     OPERATOR_HOLD_LABEL,
+    OPERATOR_DECISION_LABEL,
 ];
+
+/// The `loom:operator-only` decision sub-kind (#5671): an owner has to rule.
+///
+/// It always accompanies `loom:operator-only`, so on a `loom:issue` row it was
+/// already skipped through that base label. #9244 made it a skip label in its
+/// own right: a starred (`loom:operator-priority`) issue now reaches the
+/// candidate list from outside `loom:issue`, and starring an item that is
+/// waiting on an owner's decision must never dispatch a sweep onto it, even
+/// if the base label was dropped. Not a park ([`PARK_LABELS`]): the base
+/// label already is one wherever it matters.
+pub const OPERATOR_DECISION_LABEL: &str = "loom:operator-decision";

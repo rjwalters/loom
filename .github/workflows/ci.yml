@@ -1488,6 +1488,10 @@ jobs:
         run: bash defaults/scripts/tests/test-merge-pr-stale-check-redate.sh
       - name: merge-pr --auto blocked settle + re-validate (#8410)
         run: bash defaults/scripts/tests/test-merge-pr-auto-blocked-settle.sh
+      - name: merge-pr defaults/ version-bump collision guard (#7827, #8191 slice)
+        run: bash defaults/scripts/tests/test-merge-pr-defaults-version-bump-collision.sh
+      - name: merge-pr merge-ordering guard (#3747 item 2 / #7982, #8191 slice)
+        run: bash defaults/scripts/tests/test-merge-pr-merge-ordering-guard.sh
       # Split out of test-loom-daemon-update.sh by #7977: these assertions
       # now drive `loom-daemon release-resolve` through the stub's delegation,
       # so they need the binary this job downloads. The parent suite stays in
@@ -1544,6 +1548,33 @@ jobs:
       # suite's require-daemon-bin harness needs the binary this job downloads.
       - name: merge-pr partial-increment labels (#3667, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-partial-increment.sh
+      # Moved out of shell-suite-tests by #8191's closed-issue slice: the
+      # #6199 `loom:building` strip for an issue the merge itself closes now
+      # delegates to `loom-daemon merge-pr closed-building`, so this suite's
+      # require-daemon-bin harness needs the binary this job downloads.
+      - name: merge-pr closed-issue loom:building cleanup (#6199, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-closed-issue-cleanup.sh
+      # Moved out of shell-suite-tests by #8191's classify-response slice: the
+      # head-SHA-mismatch classifier (#5579) this suite is ABOUT, and the
+      # precedence keeping it out of the "Base branch was modified" retry arm,
+      # are now `loom-daemon merge-pr classify-response`, so this suite's
+      # require-daemon-bin harness needs the binary this job downloads.
+      - name: merge-pr head-SHA-mismatch classifier (#5579, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-head-mismatch.sh
+      # Moved out of shell-suite-tests by the #8191 mergeable-recheck slice:
+      # the stale-mergeable recheck's terminal classification now delegates to
+      # `loom-daemon merge-pr mergeable-recheck`, so this suite's
+      # require-daemon-bin harness needs the binary this job downloads.
+      - name: merge-pr stale-mergeable recheck (#6104, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-stale-mergeable.sh
+      # Moved out of shell-suite-tests by #8191's reconcile slice: the
+      # post-merge stacked-child reconcile decision (#4856) — parent-branch
+      # gate, children-rollup parse, safe/unsafe claim check — now delegates
+      # to `loom-daemon merge-pr reconcile-plan` / `merge-pr reconcile-child`,
+      # so this suite's require-daemon-bin harness needs the binary this job
+      # downloads.
+      - name: merge-pr post-merge stacked-child reconcile (#4856, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-auto-reconcile.sh
       # Moved out of shell-suite-tests by #8360: check-duplicate.sh's
       # similarity scan (keyword extraction, Jaccard scoring, threshold
       # banding, the #8289 near-match band, degenerate detection) now
@@ -1689,6 +1720,18 @@ jobs:
       # same reasoning as race-rescue just above.
       - name: worktree branch-conflict auto-recovery (ported in #8195 slice 7)
         run: bash defaults/scripts/tests/test-worktree-json-purity.sh
+      # #9083: the closed-unmerged arm of worktree.sh's branch-resolution
+      # contract. #5657 already skips reuse of an origin/feature/issue-N
+      # whose tip is a MERGED PR's head; this covers the strictly worse
+      # sibling shape it did not — a tip that is the head of a PR CLOSED
+      # WITHOUT MERGING, which carries work somebody decided not to take.
+      # `loom-daemon worktree-closed-pr-branch` is Rust-only (no shell twin;
+      # lib/worktree-forge-pr-check.sh is `contract`-category and the
+      # portable-shell ratchet gives its growth no override), so the suite
+      # pins the binary via loom_test_require_daemon_bin and FAILS rather
+      # than skips without one.
+      - name: worktree closed-unmerged-PR branch refusal (#9083)
+        run: bash defaults/scripts/tests/test-worktree-stale-closed-branch.sh
       # Moved out of shell-suite-tests by #8195 slice 9: worktree.sh's TWO
       # hand-maintained copies of the upstream-tracking correction — the
       # branch-reuse arm (#6095/#6100) and the registered-worktree fast path
@@ -1727,6 +1770,22 @@ jobs:
         run: bash defaults/scripts/tests/test-merge-pr-worktree-remove-diagnosis.sh
       - name: cleanup-branches pr-* review-branch pass (#4405, #8191)
         run: bash defaults/scripts/tests/test-cleanup-branches-pr-review-branch.sh
+      # Moved out of shell-suite-tests by #8191's worktrees slice: the three
+      # porcelain lookups this suite is ABOUT are now `loom-daemon merge-pr
+      # worktree-*`, which it drives directly, so it needs the binary this job
+      # downloads. Like its siblings above it pins one via
+      # loom_test_require_daemon_bin and FAILS rather than skips without one.
+      - name: merge-pr worktree porcelain parsing (#3671, #3717, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-worktree-awk.sh
+      # Moved out of shell-suite-tests by #8191's async-close-race slice: Test 7
+      # extracts merge-pr.sh's real `_issue_is_closed_for_cleanup` (#4186),
+      # whose decision is now `loom-daemon merge-pr issue-close-gate`, and drives
+      # it against a real binary — including the daemon-fault
+      # fail-unsafe-to-preserve path. Like its siblings above it pins one via
+      # loom_test_require_daemon_bin at file scope and FAILS rather than skips
+      # without one, so it needs the binary this job downloads.
+      - name: merge-pr async-close-race cleanup gate (#4186, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-worktree-path.sh
 
   native-port-daemon-lifecycle:
     name: Native Port Suites (daemon lifecycle, watchdog, spawn-claude)

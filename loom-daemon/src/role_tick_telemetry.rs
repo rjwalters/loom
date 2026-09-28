@@ -59,6 +59,7 @@
 //! same checkout. That is documented rather than defended against: a rare
 //! over-count is preferable to the alternative of reporting nothing.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -247,7 +248,7 @@ pub fn emit_for_tick_correlated(
     started_at: DateTime<Utc>,
     outcome: &RoleTickOutcome,
     resolved: Option<ResolvedLaunch>,
-    trace_context: Option<crate::telemetry::trace::TraceContext>,
+    trace: Option<crate::observability::lifecycle::RoleTrace>,
 ) {
     let (result, detail) = classify(outcome);
     let (model, effort) = match &resolved {
@@ -274,7 +275,7 @@ pub fn emit_for_tick_correlated(
                 .and_then(|stamp| u32::try_from(stamp.tier).ok()),
             preference_tap: preference.map(|stamp| stamp.tap),
         },
-        trace_context,
+        trace,
     );
 }
 
@@ -397,8 +398,15 @@ fn tally_command(command: &str, actions: &mut RoleTickActions) {
     }
 }
 
-/// Fold one transcript record's `tool_use` blocks into `actions`.
-fn tally_record_actions(obj: &Value, actions: &mut RoleTickActions) {
+/// Fold one transcript record's `tool_use` blocks into `actions`, and the
+/// issues/PRs they wrote to into `targets` (#9168); `session` carries the
+/// transcript's shell state (`cd`, `GH_REPO`) between commands (#9180).
+fn tally_record_actions(
+    obj: &Value,
+    actions: &mut RoleTickActions,
+    session: &mut targets::Session,
+    targets: &mut BTreeSet<targets::Target>,
+) {
     let container = obj.get("message").filter(|m| m.is_object()).unwrap_or(obj);
     let Some(content) = container.get("content").and_then(Value::as_array) else {
         return;
@@ -415,6 +423,7 @@ fn tally_record_actions(obj: &Value, actions: &mut RoleTickActions) {
             continue;
         };
         tally_command(command, actions);
+        targets::collect(command, session, targets);
     }
 }
 
@@ -429,10 +438,20 @@ fn tally_record_actions(obj: &Value, actions: &mut RoleTickActions) {
 /// token numbers here cannot drift from `sweep.outcome`'s.
 #[must_use]
 pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
+    scan_transcripts_with_targets(transcripts).map(|(scan, _)| scan)
+}
+
+/// [`scan_transcripts`], also returning every issue/PR the commands wrote
+/// to ([`targets`], #9168) — collected in the same pass, never a second read.
+#[must_use]
+pub fn scan_transcripts_with_targets(
+    transcripts: &[PathBuf],
+) -> Option<(TranscriptScan, BTreeSet<targets::Target>)> {
     use std::collections::BTreeMap;
 
     let mut totals: BTreeMap<(String, String, String), ModelUsageTotals> = BTreeMap::new();
     let mut actions = RoleTickActions::default();
+    let mut targets = BTreeSet::new();
     let mut read_any = false;
 
     for path in transcripts {
@@ -446,6 +465,9 @@ pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
             continue;
         };
         read_any = true;
+        let mut session = targets::Session::default();
+        // Deduped on `message.id` per transcript (#8186, #9303).
+        let mut fold = crate::script_helpers::transcript_usage::UsageFold::default();
         for raw in text.lines() {
             let raw = raw.trim();
             if raw.is_empty() {
@@ -454,23 +476,12 @@ pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
             let Ok(obj) = serde_json::from_str::<Value>(raw) else {
                 continue;
             };
-            tally_record_actions(&obj, &mut actions);
-            let Some(rec) = crate::script_helpers::transcript_usage::usage_from_record(&obj) else {
-                continue;
-            };
-            let key = (rec.model.clone(), rec.speed.clone(), rec.service_tier.clone());
-            let entry = totals.entry(key).or_insert_with(|| ModelUsageTotals {
-                model: rec.model,
-                speed: rec.speed,
-                service_tier: rec.service_tier,
-                ..ModelUsageTotals::default()
-            });
-            entry.input += rec.input;
-            entry.cache_read += rec.cache_read;
-            entry.cache_write_5m += rec.cache_write_5m;
-            entry.cache_write_1h += rec.cache_write_1h;
-            entry.output += rec.output;
+            tally_record_actions(&obj, &mut actions, &mut session, &mut targets);
+            if let Some(rec) = crate::script_helpers::transcript_usage::usage_from_record(&obj) {
+                fold.add(rec);
+            }
         }
+        crate::script_helpers::transcript_usage::merge_rows(&mut totals, fold.rows());
     }
 
     // `None` — never a zeroed scan — when no transcript was readable at all.
@@ -479,10 +490,13 @@ pub fn scan_transcripts(transcripts: &[PathBuf]) -> Option<TranscriptScan> {
     // fields exist to preserve.
     // `actions` is `Some` on this path by construction: reaching here means at
     // least one transcript was read, so a zero count is an *observation*.
-    read_any.then_some(TranscriptScan {
-        tokens_by_model: totals.into_values().collect(),
-        actions: Some(actions),
-    })
+    read_any.then_some((
+        TranscriptScan {
+            tokens_by_model: totals.into_values().collect(),
+            actions: Some(actions),
+        },
+        targets,
+    ))
 }
 
 /// The distinct model ids in a token breakdown, sorted and deduped — the same
@@ -623,7 +637,7 @@ pub fn emit(tick: &RoleTickTelemetry) {
 
 fn emit_correlated(
     tick: &RoleTickTelemetry,
-    trace_context: Option<crate::telemetry::trace::TraceContext>,
+    trace: Option<crate::observability::lifecycle::RoleTrace>,
 ) {
     let (repo, visibility) = resolve_repo(&tick.root);
     // Issue #8507: the tick's own runtime/provider/profile, read once and
@@ -678,9 +692,14 @@ fn emit_correlated(
                 &role_log,
                 Some((tick.started_at, tick.ended_at)),
             )
-            .map(|tokens_by_model| TranscriptScan {
-                tokens_by_model,
-                actions: None,
+            .map(|tokens_by_model| {
+                (
+                    TranscriptScan {
+                        tokens_by_model,
+                        actions: None,
+                    },
+                    BTreeSet::new(),
+                )
             });
         }
         let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
@@ -691,16 +710,25 @@ fn emit_correlated(
             tick.started_at,
             tick.ended_at,
         );
-        scan_transcripts(&transcripts)
+        scan_transcripts_with_targets(&transcripts)
     });
-    let record = build_record(tick, repo, visibility, scan.flatten());
+    let (scan, targets) = scan.flatten().unzip();
+    // The launch record's runtime, else the resolved-runtime marker (#8594);
+    // absent (unknown, never guessed) for a Claude tick with neither.
+    let story_runtime = usage_runtime.clone().flatten();
+    // #9303: the tick's per-model usage, kept for its usage spans below.
+    let tokens_by_model = scan
+        .as_ref()
+        .map(|scan| scan.tokens_by_model.clone())
+        .filter(|rows| !rows.is_empty());
+    let record = build_record(tick, repo, visibility, scan);
     let record = apply_runtime_attribution(record, runtime_attribution);
     let path = crate::sweep_outcomes::default_role_tick_telemetry_path(&tick.root);
     let mut envelope = TelemetryEnvelope::new(
         crate::sweep_registry::host_identity(),
         TelemetryRecord::RoleTickOutcome(record),
     );
-    envelope.trace_context = trace_context;
+    envelope.trace_context = trace.as_ref().map(|t| t.context.clone());
     if let Err(e) = crate::sweep_outcomes::append_role_tick_telemetry(&path, &envelope) {
         log::warn!(
             "role_tick_telemetry: failed to append {} tick record for {} at {}: {e} — \
@@ -710,7 +738,45 @@ fn emit_correlated(
             path.display()
         );
     }
+    // #9168: join the story of every issue/PR this tick wrote to — after the
+    // durable record, so a slow forge lookup can never cost the tick record.
+    if let (Some(trace), Some(rows)) = (&trace, &tokens_by_model) {
+        usage::journal_execution(
+            &tick.root,
+            trace,
+            &tick.role,
+            tick.ended_at,
+            story_runtime.as_deref(),
+            rows,
+        );
+    }
+    if let (Some(trace), Some(targets)) = (trace, targets) {
+        let facts = story::TickFacts {
+            trace,
+            role: tick.role.clone(),
+            ended_at: tick.ended_at,
+            result: result_label(tick.result),
+            runtime: story_runtime,
+            model: tick.model.clone(),
+            tokens_by_model,
+        };
+        story::emit(&tick.root, &facts, &targets);
+    }
 }
+
+/// A [`RoleTickResult`]'s serialized name (`success`, `failure`, …) — the
+/// `loom.result` the tick's own root span carries.
+#[must_use]
+pub fn result_label(result: RoleTickResult) -> String {
+    serde_json::to_value(result)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+pub mod story;
+pub mod targets;
+pub mod usage;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

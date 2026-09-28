@@ -86,6 +86,13 @@ Precedence is **env > config > default**, the same rule every other
 | `queueCapacity` | `LOOM_OBSERVABILITY_QUEUE_CAPACITY` | 2000 |
 | `exporter` | `LOOM_OBSERVABILITY_EXPORTER` | `"https"` (or `"otlp"`, §3) |
 | `exporters` | — (config only) | unset ⇒ `exporter` / `"https"` (§3) |
+| `claudeCodeTelemetry` | `LOOM_CLAUDE_CODE_TELEMETRY_*` | off — a nested, separately-resolved block (#9215) |
+
+`claudeCodeTelemetry` is the one sub-block that configures **someone else's**
+exporter: the OTel environment a spawned worker's own Claude Code session needs
+to emit LLM-vs-tool sub-spans into the sweep's trace. Default off, four keys,
+its own precedence chain, and no effect on anything above — the full reference
+is [tracing](tracing.md) → "Worker-native sub-spans".
 
 **`endpoint` resolution order is env > `.loom-local/local.json` > the committed
 `.loom/config.json`** (`config_resolver.rs`/`config-resolver.sh`), so — like
@@ -424,6 +431,14 @@ It fires when `starved{state="ready"}` stays above 0 on a host for 15 min.
 Import it with `POST /api/v1/rules` or paste its query into a new ClickHouse
 alert. The rule's shape has not yet been tested against a live SigNoz. Standing queries are in
 `defaults/observability/signoz/queue-dwell.sql`.
+
+**Subscription quota utilization (#9005).** The per-account `tokens.snapshot`
+gauges carry both Claude limit windows: `loom.tokens.usage_fraction` (5-hour)
+and `loom.tokens.usage_fraction_weekly` (rolling 7-day, from the
+`.ranking.weekly.json` sidecar `tokens check --ranking` writes). Providers with
+no utilization source emit neither — absent, not `0`. Standing queries for
+per-account utilization, idle headroom at weekly reset, and last week's used
+capacity per provider are in `defaults/observability/signoz/quota-utilization.sql`.
 Completed-sweep phase durations are covered by the cycle-time rollup.
 
 **Dispatch refusals, turnaround and stage dwell (#8907, #8929).** Typed
@@ -442,6 +457,45 @@ and review requested → merged. It reads ETag-cached stage listings every 5
 minutes plus at most 8 per-item reads per sample, never per tick. Details are
 in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
+**Per-issue dispatch disposition (#9222).** `loom.dispatch.admission` only
+covers candidates that reached a `dispatch()` attempt — a candidate filtered
+out earlier (`workspace_halted`, `parked`, `deferred_saturation`,
+`host_class_refused`, a backoff, a cooldown, …) had no per-issue SigNoz record
+at all before this. Every ready-queue row now gets a `loom.dispatch.disposition`
+span on a disposition transition (including first sight), on a periodic
+refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s = 10 min), or
+once as a terminal `left_queue` record when it leaves a repo whose listing
+succeeded. Sampled from the collector's periodic pass (the same cadence as
+`queue.snapshot`), never the tick loop, so a disposition lasting less than one
+collector interval can be missed; a 10-minute-or-longer lookback still always
+contains the current state of every queued issue. Cardinality is bounded: at
+most 256 rows become spans per sample (`loom.queue.disposition_rows_dropped{reason="truncated"}`
+counts the rest), and a row whose repo root never resolved to a forge slug is
+dropped and counted as `reason="unresolved"` rather than exported with a local
+path. `loom.dispatch.admission` also gained `loom.repo`/`loom.repo.visibility`
+in the same change, so `loom.issue` is no longer ambiguous on a multi-repo
+host. Full attribute table in
+[`telemetry-schema.md`](telemetry-schema.md#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting).
+
+Mapping an operator's plain-English question onto the `QueueDisposition`
+vocabulary (`loom.queue.disposition`'s wire values):
+
+| Operator term | Disposition(s) |
+|---|---|
+| "admission brake" | `deferred_saturation` (decisions reason `saturation`, tick result `saturation_held`) |
+| "dependency blocked" | Loom has no issue-dependency gate. Nearest: `parked` (a `PARK_LABELS`/`SKIP_LABELS` entry, e.g. `loom:blocked`, alongside `loom:issue`) or `labelled_blocked` (`loom:blocked` without `loom:issue` — forge-side only, from `queue.snapshot`, never a tick outcome so it never appears on a `loom.dispatch.disposition` span) |
+| "lower tier" (ranked behind others) | `deferred_capacity` (machine concurrency cap full), `deferred_ramp_cap` (per-tick admission cap), `deferred_repo_cap` (per-repo cap), or `deferred_out_of_slice` (repo sharding) — `tier:*` labels do not affect dispatch order, only `loom.queue.rank` does |
+
+For a `workspace_halted` row, join to the parent `loom.dispatch.tick` span
+(`loom.dispatch.result="halted_main_red"`) through `parentSpanID` — the row
+itself does not say which of red-main / gate / token pool / drain / breaker
+caused the halt (out of scope for #9222; file separately if wanted).
+
+A runnable copy of the "why hasn't `owner/repo#N` started" query is query 5 of
+`defaults/observability/signoz/queue-dwell.sql` — that file's other four
+queries are the `loom.queue.*` **metrics** above; query 5 is the only one that
+reads spans instead, over `signoz_traces.signoz_index_v3`.
+
 **Tokens, providers and pools (#8908, #8931).** Each account mark the daemon
 writes (Codex terminal feedback, API-key pool bad marks, the Claude
 insta-crash exhaustion mark) emits one `loom.pool.account_marks{provider,reason}`
@@ -449,7 +503,8 @@ point, so exhaustion can be split by cause (a 429 versus plan exhaustion
 versus a session limit), which the snapshot-derived `loom.pool.exhaustions`
 cannot do. Each work-finder pool hold emits a `loom.pool.hold` span when it
 clears. At a sweep's terminal transition, the execution's exact token
-breakdown is journalled as a `loom.runtime.usage` span in the sweep's trace,
+breakdown is journalled as one `loom.runtime.usage` span per model and scope
+(execution/attempt) in the sweep's trace,
 and the transcript-ingest pass stamps the sweep's `session.summary` log with
 the same trace when the match is unambiguous. Details are in
 [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
@@ -473,7 +528,11 @@ cardinality:
   `queue.snapshot` record, sampled on the `host.health` interval whenever the
   work finder has ticked since the last snapshot. Each row carries its forge
   `owner/repo` and its own `visibility` tag. The OTLP exporter never receives
-  this record.
+  this record. Since #9288 each row also carries its dispatch-plan fields
+  (`position`, `plan_state`, `gate`, …) and the record carries a `plan` block.
+  That block holds the host's slots, tick interval, shard posture, `scope` and
+  key `ordering`. These are per-host plan data only: no gauge or label is
+  added on the OTLP side, and `loom:curated` / `loom:triage` stay unordered.
 
 Both are derived from the same rows as `loom-daemon queue`. See
 [`telemetry-schema.md` → `queue.snapshot`](telemetry-schema.md#queuesnapshot).

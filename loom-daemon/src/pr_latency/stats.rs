@@ -37,19 +37,11 @@ impl Distribution {
         let n = samples.len();
         Self {
             n,
-            p50_secs: Some(Self::nearest_rank(&samples, 50)),
-            p90_secs: Some(Self::nearest_rank(&samples, 90)),
+            p50_secs: Some(nearest_rank(&samples, 50)),
+            p90_secs: Some(nearest_rank(&samples, 90)),
             max_secs: samples.last().copied(),
             total_secs: Some(samples.iter().sum()),
         }
-    }
-
-    /// `sorted` must be non-empty and ascending.
-    fn nearest_rank(sorted: &[i64], pct: usize) -> i64 {
-        let n = sorted.len();
-        // ceil(pct * n / 100), clamped into 1..=n, then to a 0-based index.
-        let rank = (pct * n).div_ceil(100).clamp(1, n);
-        sorted[rank - 1]
     }
 
     /// True when nothing was measured — the caller should print an absence, not
@@ -57,6 +49,20 @@ impl Distribution {
     pub fn is_empty(&self) -> bool {
         self.n == 0
     }
+}
+
+/// The nearest-rank `pct`th percentile of `sorted`: index `ceil(pct·n/100) − 1`,
+/// clamped into the sample, so the value returned is always an observed
+/// sample, never an interpolation. Shared with the ETA grid (`crate::eta::grid`,
+/// #9289), which summarises each stage as 21 of these.
+///
+/// `sorted` must be non-empty and ascending.
+#[must_use]
+pub fn nearest_rank(sorted: &[i64], pct: usize) -> i64 {
+    let n = sorted.len();
+    // ceil(pct * n / 100), clamped into 1..=n, then to a 0-based index.
+    let rank = (pct * n).div_ceil(100).clamp(1, n);
+    sorted[rank - 1]
 }
 
 /// Seconds as a compact hours string (`"68.5h"`), or `"—"` when absent.

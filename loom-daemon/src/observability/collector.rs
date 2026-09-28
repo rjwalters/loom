@@ -607,6 +607,13 @@ async fn sample_snapshots(
     // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
     // listings plus a bounded per-item budget; a no-op without the ops sink.
     super::ops::stage_dwell::record(workspace_pool, slug_cache).await;
+    // Per-issue dispatch disposition spans (Issue #9222), OTLP-only: a no-op
+    // without the ops sink, and without a new work-finder tick since the last
+    // export pass.
+    super::ops::disposition::record(slug_cache).await;
+    // ETA (Issue #9289): review listings, outcome checks and re-estimates,
+    // after `stage_dwell` so the ETag-cached listings are warm.
+    super::eta::record(workspace_root, workspace_pool, slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
@@ -639,11 +646,18 @@ fn parse_reset_instant(raw: Option<&str>) -> Option<DateTime<Utc>> {
 /// existed this was hardcoded `None`, which is why every exhausted account
 /// fleet-wide reported no reset instant and the dashboard's countdown column
 /// was permanently `—`.
+///
+/// `usage_fraction_weekly` (issue #9005) comes from the `.ranking.weekly.json`
+/// sidecar the same `tokens check --ranking` run writes beside `.ranking`
+/// ([`crate::tokens_pool::ranking_weekly`]) — `.ranking` itself has no room
+/// for a fifth column. A row the sidecar does not name, or a missing/stale
+/// sidecar, leaves the weekly axis absent rather than `0`.
 fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
     let pool_dir = crate::tokens_pool::paths::resolve_tokens_dir(workspace_root);
     let ranking_path = pool_dir.join(".ranking");
     let mut accounts = Vec::new();
     if let Ok(contents) = std::fs::read_to_string(&ranking_path) {
+        let weekly = crate::tokens_pool::ranking_weekly::read_weekly_utilization_sidecar(&pool_dir);
         for (index, line) in contents.lines().enumerate() {
             if !line.contains('|') {
                 continue;
@@ -652,11 +666,13 @@ fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
                 continue;
             };
             let exhausted = !crate::capacity::AccountHealth::parse(&row.status).is_healthy();
+            let usage_fraction_weekly = weekly.get(&row.name).copied();
             accounts.push(TokenAccountState {
                 account: row.name,
                 provider: AccountProvider::Claude.to_string(),
                 rank: Some(u32::try_from(index).unwrap_or(u32::MAX)),
                 usage_fraction: row.util_5h,
+                usage_fraction_weekly,
                 limit_window_reset_at: parse_reset_instant(row.limit_reset.as_deref()),
                 exhausted,
             });
@@ -675,10 +691,10 @@ fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
 /// These pools have no `.ranking` file: the registry knows *which* accounts
 /// exist and the provider-health state file knows whether each is currently
 /// held (`cooldown_until`, `ReauthRequired`), but neither measures a usage
-/// fraction. So `rank`/`usage_fraction` stay absent ("unknown, not zero"),
-/// `exhausted` is `!is_eligible_at(now)`, and `limit_window_reset_at` is the
-/// hold's deadline when there is one — the same "when does this account's
-/// constraint lift?" meaning the Claude rows carry. A disabled account is not
+/// fraction. So `rank`/`usage_fraction`/`usage_fraction_weekly` stay absent
+/// ("unknown, not zero"), `exhausted` is `!is_eligible_at(now)`, and
+/// `limit_window_reset_at` is the hold's deadline when there is one — the same
+/// "when does this account's constraint lift?" meaning the Claude rows carry. A disabled account is not
 /// part of the usable pool and is not reported; an unreadable registry or
 /// health file degrades to no rows for that provider rather than an error,
 /// matching the `.ranking` soft-fail above.
@@ -714,6 +730,7 @@ fn sample_registry_provider_accounts(workspace_root: &Path) -> Vec<TokenAccountS
                 provider: provider.to_string(),
                 rank: None,
                 usage_fraction: None,
+                usage_fraction_weekly: None,
                 limit_window_reset_at,
                 exhausted,
             });
@@ -1029,7 +1046,18 @@ async fn collect_managed_repos(
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
 ) -> Vec<ManagedRepoEntry> {
-    collect_managed_repos_with(workspace_pool, slug_cache, derive_visibility).await
+    // Each registered workspace's dispatch priority (#9244, loom-ui#153).
+    // Best-effort: an unreadable registry just omits `priority`.
+    let priorities: HashMap<PathBuf, u32> =
+        crate::workspace_registry::WorkspaceRegistry::load_default()
+            .map(|r| {
+                r.workspaces
+                    .into_iter()
+                    .map(|w| (w.root, w.priority))
+                    .collect()
+            })
+            .unwrap_or_default();
+    collect_managed_repos_with(workspace_pool, slug_cache, derive_visibility, &priorities).await
 }
 
 /// Testable core of [`collect_managed_repos`]: `resolve_visibility` (a plain
@@ -1043,6 +1071,7 @@ async fn collect_managed_repos_with<F>(
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
     resolve_visibility: F,
+    priorities: &HashMap<PathBuf, u32>,
 ) -> Vec<ManagedRepoEntry>
 where
     F: Fn(&str) -> RepoVisibility + Copy + Send + Sync + 'static,
@@ -1075,7 +1104,12 @@ where
                 RepoVisibility::Private
             }
         };
-        entries.push(ManagedRepoEntry { slug, visibility });
+        let priority = priorities.get(&root).copied();
+        entries.push(ManagedRepoEntry {
+            slug,
+            visibility,
+            priority,
+        });
     }
     // Deterministic order (the dashboard renders this list directly) and
     // de-duplicated in case two provisioned roots ever resolve to the same
@@ -1138,3 +1172,6 @@ mod shell_arm_registry_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod weekly_utilization_tests;
