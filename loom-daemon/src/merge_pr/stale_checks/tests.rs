@@ -326,6 +326,7 @@ fn a_plan_gated_repo_has_no_required_checks_so_a_green_run_is_fresh() {
 // --- The input-scoped predicate wired through assess_scoped (#8919) ---------
 
 use inputs::{BaseMove, FileSet, ScopedEvidence};
+use workflow_scope::CiScope;
 
 fn fset(paths: &[&str]) -> FileSet {
     inputs::file_set(paths.iter().map(|p| (*p, false)))
@@ -342,6 +343,7 @@ fn incident_evidence() -> ScopedEvidence {
             BaseMove {
                 tested_base: "803f0c7d".to_string(),
                 files: fset(&["scripts/file-size-baseline.txt"]),
+                ci_scope: CiScope::Unscoped,
             },
         )]
         .into_iter()
@@ -419,6 +421,7 @@ fn an_unrelated_base_move_is_fresh_even_though_it_postdates_the_run() {
             BaseMove {
                 tested_base: "803f0c7d".to_string(),
                 files: fset(&["loom-daemon/src/unrelated.rs"]),
+                ci_scope: CiScope::Unscoped,
             },
         )]
         .into_iter()
@@ -434,6 +437,67 @@ fn an_unrelated_base_move_is_fresh_even_though_it_postdates_the_run() {
         assess(base_tip, &ctx(&["File Size Ratchet"]), &runs),
         Verdict::Stale { .. }
     ));
+}
+
+/// One required context's evidence with an explicit `ci.yml`-only base move —
+/// the #9065 shape: `main` edited the workflow, the PR touches ordinary files.
+fn ci_yml_move(scope: CiScope) -> ScopedEvidence {
+    ScopedEvidence {
+        pr_delta: fset(&["loom-daemon/src/lib.rs"]),
+        base_moves: [(
+            "File Size Ratchet".to_string(),
+            BaseMove {
+                tested_base: "803f0c7d".to_string(),
+                files: fset(&[".github/workflows/ci.yml"]),
+                ci_scope: scope,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        fallbacks: std::collections::BTreeMap::new(),
+    }
+}
+
+#[test]
+fn a_ci_yml_move_in_a_job_this_check_does_not_run_is_fresh() {
+    // #9065: before the narrowing, `ci.yml` was ONE path in every component's
+    // `G`, so editing the `backend-tests` partition count on `main` refused
+    // every open PR that touched anything at all.
+    let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
+    let runs = vec![run(
+        "File Size Ratchet",
+        "completed",
+        Some("success"),
+        Some(INCIDENT_RUN_STARTED),
+    )];
+    let ev = ci_yml_move(CiScope::Scoped(std::collections::BTreeSet::new()));
+    let (verdict, warnings) =
+        assess_scoped(base_tip, &ctx(&["File Size Ratchet"]), &runs, Some(&ev));
+    assert_eq!(verdict, Verdict::Fresh, "{verdict:?}");
+    assert!(warnings.is_empty(), "a narrowing is not a degradation: {warnings:?}");
+}
+
+#[test]
+fn a_ci_yml_move_in_this_checks_own_block_is_still_stale() {
+    // The half that must NOT relax: the base move edited the block that
+    // defines this very gate, so its green result is about a gate that no
+    // longer exists in that form.
+    let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
+    let runs = vec![run(
+        "File Size Ratchet",
+        "completed",
+        Some("success"),
+        Some(INCIDENT_RUN_STARTED),
+    )];
+    for scope in [
+        CiScope::Scoped(["File Size Ratchet".to_string()].into_iter().collect()),
+        // …and an unattributable edit keeps the pre-#9065 whole-file meaning.
+        CiScope::Unscoped,
+    ] {
+        let ev = ci_yml_move(scope.clone());
+        let (verdict, _) = assess_scoped(base_tip, &ctx(&["File Size Ratchet"]), &runs, Some(&ev));
+        assert!(matches!(verdict, Verdict::StaleInputs { .. }), "{scope:?}: {verdict:?}");
+    }
 }
 
 #[test]
@@ -509,6 +573,7 @@ fn an_unmapped_required_context_with_a_moved_base_is_refused() {
             BaseMove {
                 tested_base: "803f0c7d".to_string(),
                 files: fset(&["some/unrelated/path.txt"]),
+                ci_scope: CiScope::Unscoped,
             },
         )]
         .into_iter()

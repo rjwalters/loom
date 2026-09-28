@@ -242,7 +242,12 @@ pub fn assess_scoped(
             // refusal names the component so the operator knows which gate.
             let (check, reason) = match inputs::specs_for(ctx) {
                 Some(specs) => {
-                    match inputs::composite_stale_reason(&specs, &mv.files, &scoped_delta(scoped)) {
+                    match inputs::composite_stale_reason(
+                        &specs,
+                        &mv.files,
+                        &scoped_delta(scoped),
+                        &mv.ci_scope,
+                    ) {
                         Some((component, r)) if specs.len() > 1 => {
                             (format!("{ctx} ({component})"), Some(r))
                         }
@@ -370,6 +375,7 @@ failure (network, quota, token scope) or re-run the required checks, then re-run
 pub mod evidence;
 pub mod fetch;
 pub mod inputs;
+pub mod workflow_scope;
 pub use fetch::LiveInputs;
 
 #[cfg(test)]
