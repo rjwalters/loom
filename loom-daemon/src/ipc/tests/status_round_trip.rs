@@ -107,6 +107,7 @@ fn test_daemon_status_request_response_round_trip() {
         host_breaker: None,
         admission_brake: None,
         rate_limit_breaker: None,
+        forge_calls: None,
         safehouse: Some(crate::types::SafehouseStatus {
             state: "connected".to_string(),
             socket: Some(std::path::PathBuf::from("/tmp/safehoused.sock")),
