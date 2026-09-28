@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
@@ -35,6 +36,58 @@ pub struct ForgeComment {
     pub author_association: Option<String>,
 }
 
+/// One issue-search hit and who filed it (for [`super::trust`]: an outsider
+/// quoting a refusal phrase must not be taken for the incident).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchHit {
+    pub issue: RestIssue,
+    /// `author_association` of the issue's author.
+    pub author_association: Option<String>,
+}
+
+/// First retry delay after a failed own-login lookup; doubles per failure.
+pub const LOGIN_RETRY_BASE: Duration = Duration::from_secs(60);
+/// Longest delay between own-login retries.
+pub const LOGIN_RETRY_MAX: Duration = Duration::from_secs(3600);
+
+/// The daemon's own forge login, looked up lazily: a success is kept for the
+/// process, a failure (transient, or an App token the forge cannot name) is
+/// retried with exponential backoff instead of being cached forever.
+#[derive(Debug, Default, Clone)]
+pub struct LoginLookup {
+    known: Option<String>,
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl LoginLookup {
+    /// The login, calling `fetch` only when none is known and no backoff is
+    /// pending.
+    pub fn get(&mut self, now: Instant, fetch: impl FnOnce() -> Option<String>) -> Option<String> {
+        if self.known.is_some() || self.retry_at.is_some_and(|at| now < at) {
+            return self.known.clone();
+        }
+        match fetch()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            Some(login) => {
+                self.known = Some(login);
+                self.failures = 0;
+                self.retry_at = None;
+            }
+            None => {
+                let delay = LOGIN_RETRY_BASE
+                    .saturating_mul(1 << self.failures.min(10))
+                    .min(LOGIN_RETRY_MAX);
+                self.failures = self.failures.saturating_add(1);
+                self.retry_at = Some(now + delay);
+            }
+        }
+        self.known.clone()
+    }
+}
+
 /// What the liveness pass and the intent applier need from one repo.
 pub trait StarForge {
     /// Open issues **and PRs** carrying `label`.
@@ -56,12 +109,13 @@ pub trait StarForge {
     fn comments(&mut self, number: u32) -> Result<Vec<ForgeComment>>;
 
     /// Open **issues** (not PRs) whose title or body contains `phrase`, for
-    /// finding the incident behind a merge refusal. Callers re-check the
-    /// phrase: a forge search is fuzzy.
+    /// finding the incident behind a merge refusal, with each author's
+    /// association. Callers re-check the phrase and the author: a forge
+    /// search is fuzzy, and anyone can file an issue.
     ///
     /// # Errors
     /// The search failed.
-    fn search_open_issues(&mut self, phrase: &str) -> Result<Vec<RestIssue>>;
+    fn search_open_issues(&mut self, phrase: &str) -> Result<Vec<SearchHit>>;
 
     /// This daemon's own forge login, when the forge can name it (an App
     /// installation token cannot). Used only to trust its own markers.
@@ -160,7 +214,7 @@ impl StarForge for GhStarForge {
             .collect())
     }
 
-    fn search_open_issues(&mut self, phrase: &str) -> Result<Vec<RestIssue>> {
+    fn search_open_issues(&mut self, phrase: &str) -> Result<Vec<SearchHit>> {
         let clean: String = phrase.chars().filter(|c| *c != '"').collect();
         let q = format!("q=\"{clean}\" repo:{} is:issue is:open in:title,body", self.slug);
         let out = self.api(
@@ -177,41 +231,38 @@ impl StarForge for GhStarForge {
             ],
             "search/issues",
         )?;
-        let wanted = phrase.to_ascii_lowercase();
+        let assoc: HashMap<u64, String> = serde_json::from_str::<Vec<serde_json::Value>>(&out)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| {
+                let n = v.get("number")?.as_u64()?;
+                Some((n, v.get("author_association")?.as_str()?.to_string()))
+            })
+            .collect();
         Ok(crate::forge_listing::parse_rest_issues(&out)?
             .into_iter()
             .filter(|i| !i.is_pull_request && i.state.eq_ignore_ascii_case("open"))
-            .filter(|i| {
-                let text = format!(
-                    "{}\n{}",
-                    i.title.as_deref().unwrap_or_default(),
-                    i.body.as_deref().unwrap_or_default()
-                );
-                text.to_ascii_lowercase().contains(&wanted)
+            .map(|issue| SearchHit {
+                author_association: assoc.get(&u64::from(issue.number)).cloned(),
+                issue,
             })
             .collect())
     }
 
     fn self_login(&mut self) -> Option<String> {
-        static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
-        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(hit) = cache
+        static CACHE: OnceLock<Mutex<HashMap<PathBuf, LoginLookup>>> = OnceLock::new();
+        // Registers the configured fleet App with `trust` for this process.
+        let app = super::trust::configured_app_slug(&self.root);
+        let mut cache = CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&self.root)
-        {
-            return hit.clone();
-        }
-        let login = self
-            .api(&["user", "--jq", ".login"], "user")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(self.root.clone(), login.clone());
-        login
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lookup = cache.entry(self.root.clone()).or_default();
+        // An App installation token cannot name itself (`GET /user` is a
+        // 403): the configured App slug is then this daemon's identity.
+        lookup
+            .get(Instant::now(), || self.api(&["user", "--jq", ".login"], "user").ok())
+            .or_else(|| app.map(|a| format!("{a}[bot]")))
     }
 
     fn add_label(&mut self, number: u32, label: &str) -> Result<()> {
@@ -234,5 +285,37 @@ impl StarForge for GhStarForge {
         let field = format!("body={body}");
         self.api(&["-X", "POST", &path, "-f", &field], &path)
             .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_login_lookup_is_retried_with_backoff_and_a_success_is_kept() {
+        let mut l = LoginLookup::default();
+        let t0 = Instant::now();
+        let mut calls = 0;
+        let mut fetch = |v: Option<&str>| {
+            calls += 1;
+            v.map(str::to_string)
+        };
+        assert_eq!(l.get(t0, || fetch(None)), None);
+        assert_eq!(l.get(t0 + Duration::from_secs(30), || fetch(None)), None);
+        l.get(t0 + LOGIN_RETRY_BASE, || fetch(None));
+        // The second failure doubled the delay: no call at +2 base.
+        l.get(t0 + LOGIN_RETRY_BASE * 2, || fetch(Some("early")));
+        let got = l.get(t0 + LOGIN_RETRY_BASE * 3, || fetch(Some(" robb-bot ")));
+        assert_eq!(got.as_deref(), Some("robb-bot"));
+        let got = l.get(t0 + LOGIN_RETRY_MAX * 9, || fetch(None));
+        assert_eq!(got.as_deref(), Some("robb-bot"), "a success is kept");
+        assert_eq!(calls, 3, "one call per elapsed backoff, never a permanent failure");
+        let mut capped = LoginLookup {
+            failures: 40,
+            ..LoginLookup::default()
+        };
+        capped.get(t0, || None);
+        assert_eq!(capped.retry_at, Some(t0 + LOGIN_RETRY_MAX));
     }
 }

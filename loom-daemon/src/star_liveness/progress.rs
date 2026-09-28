@@ -20,8 +20,10 @@
 //!   escalated.
 //!
 //! An agent-owned stage with no progress for the watchdog window escalates
-//! with what Loom last saw. The dedupe key hashes the fingerprint, so every
-//! host names one stall with one key and the forge marker lets one comment
+//! with what Loom last saw. The dedupe key hashes **only** the fingerprint,
+//! not the stage: for an undispatched row the stage can come from host-local
+//! capacity (`no-capacity` on one host, `ready` on another), so every host
+//! names one stall with one key and the forge marker lets one comment
 //! through.
 //!
 //! `blocked-by` is exempt: the blocker carries the inherited star and is
@@ -193,12 +195,7 @@ pub fn watchdog(w: &Watched<'_>, now: DateTime<Utc>, window: Duration) -> Option
     let (repo, issue, actor) = (w.repo, w.issue, w.next_actor);
     Some(OperatorAsk {
         kind: AskKind::NoProgress,
-        key: format!(
-            "{}:{}:{}",
-            AskKind::NoProgress.as_str(),
-            w.stage.as_str(),
-            short_hash(w.fingerprint)
-        ),
+        key: format!("{}:{}", AskKind::NoProgress.as_str(), short_hash(w.fingerprint)),
         text: format!(
             "{repo}#{issue} is starred but has made no forward progress for {minutes} min: it \
              has been `{}` since {} (next actor: {actor}; last seen: {}). Check why the \

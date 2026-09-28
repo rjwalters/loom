@@ -11,9 +11,10 @@
 //! - the comments of a starred issue's **approved** PR, only when that PR's
 //!   `updated_at` moved since the last read (merge-refusal detection);
 //! - for a detected refusal, the incident lookup: single-issue reads of the
-//!   issues the refusal comment names, and, when none is an open issue, one
-//!   issue search for the refusal's failure signature (repeated each pass
-//!   only while no open incident is known);
+//!   issues the refusal comment names, and, when none is an open issue and
+//!   the refusal quotes one of the specific forge phrases, one issue search
+//!   for that phrase (repeated each pass only while no open incident is
+//!   known; hits must be trusted-authored and quote it word-bounded);
 //! - one single-issue read per same-repo blocker (the blocker's state, and
 //!   its labels when it inherits a star).
 
@@ -189,7 +190,8 @@ impl<'a> Evaluator<'a> {
     }
 
     /// The open incident issue tied to `d` (see [`refusal`]): one the
-    /// refusal comment names, else one carrying its failure signature.
+    /// refusal comment names, else a trusted-authored one quoting its
+    /// specific forge phrase. A generic refusal never searches.
     fn incident(&mut self, d: &Detected, pr: u32, issue: u32) -> Option<u32> {
         if let Some(n) = d.named.clone().into_iter().find(|n| self.open_issue(*n)) {
             return Some(n);
@@ -201,26 +203,31 @@ impl<'a> Evaluator<'a> {
             }
             self.refusals.incidents.remove(&key);
         }
-        let found = match self.forge.search_open_issues(d.signature()) {
+        let phrase = d.signature()?;
+        let found = match self.forge.search_open_issues(phrase) {
             Ok(rows) => rows,
             Err(e) => {
                 log::debug!("star_liveness: incident search in {} failed: {e}", self.ctx.slug);
                 return None;
             }
         };
-        let wanted = d.signature().to_ascii_lowercase();
+        let me = self.forge.self_login();
         let hit = found
             .into_iter()
+            .filter(|h| {
+                super::trust::trusted_author(
+                    h.issue.author.as_deref(),
+                    h.author_association.as_deref(),
+                    me.as_deref(),
+                )
+            })
+            .map(|h| h.issue)
             .filter(|i| i.number != pr && i.number != issue && !i.is_pull_request)
             .filter(|i| i.state.eq_ignore_ascii_case("open"))
             .filter(|i| {
-                format!(
-                    "{}\n{}",
-                    i.title.as_deref().unwrap_or_default(),
-                    i.body.as_deref().unwrap_or_default()
-                )
-                .to_ascii_lowercase()
-                .contains(&wanted)
+                let title = i.title.as_deref().unwrap_or_default();
+                let body = i.body.as_deref().unwrap_or_default();
+                refusal::quotes_phrase(&format!("{title}\n{body}"), phrase)
             })
             .min_by_key(|i| i.number)?;
         let n = hit.number;

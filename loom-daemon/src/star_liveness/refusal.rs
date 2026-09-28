@@ -20,9 +20,14 @@
 //!
 //! 1. an issue named **in the refusal comment** ([`Detected::named`]), if it
 //!    is an open issue (not a PR, not closed); else
-//! 2. an **open** issue whose title or body carries the refusal's failure
-//!    signature ([`Detected::signature`], e.g. "merge commits are not
-//!    allowed"), the way #9268 quotes the 405 it was filed for.
+//! 2. an **open** issue, filed by a **trusted** author ([`super::trust`]),
+//!    whose title or body quotes the forge's own refusal phrase
+//!    ([`Detected::signature`]), the way #9268 quotes the 405 it was filed
+//!    for. Only the three specific phrases in [`SIGNATURES`] are searched,
+//!    and a hit must carry the phrase word-bounded ([`quotes_phrase`]). A
+//!    generic refusal (a bare 405, "merge method", a ruleset violation) has
+//!    no signature: those words are too common to name an incident (`405`
+//!    alone matches `#4050`), so it goes straight to the ask.
 //!
 //! With neither, nothing inherits, and the operator ask carries the raw
 //! refusal text ([`Detected::raw`]) so the escalation is never silent.
@@ -47,12 +52,35 @@ const TRANSIENT: &[&str] = &[
 /// Longest raw refusal excerpt carried into an ask.
 pub const MAX_RAW: usize = 300;
 
-/// A refusal class: a fixed description, and the phrase an incident issue
-/// filed for it would quote.
+/// The forge refusal phrases an incident issue is searched for: the only
+/// classes whose text is specific enough to name one.
+pub const SIGNATURES: [&str; 3] = [
+    "merge commits are not allowed",
+    "squash merges are not allowed",
+    "rebase merges are not allowed",
+];
+
+/// A refusal class: a fixed description, and the forge phrase an incident
+/// issue filed for it would quote (`None` for a generic refusal, which
+/// never searches).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefusalClass {
     pub reason: &'static str,
-    pub signature: &'static str,
+    pub signature: Option<&'static str>,
+}
+
+/// Whether `text` contains `phrase` (ASCII case-insensitive) with a non-word
+/// character, or the text edge, on both sides.
+#[must_use]
+pub fn quotes_phrase(text: &str, phrase: &str) -> bool {
+    let (hay, needle) = (text.to_ascii_lowercase(), phrase.to_ascii_lowercase());
+    if needle.is_empty() {
+        return false;
+    }
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    hay.match_indices(&needle).any(|(at, _)| {
+        !word(hay[..at].chars().next_back()) && !word(hay[at + needle.len()..].chars().next())
+    })
 }
 
 /// The refusal class for `text`, or `None` when it is not a policy refusal.
@@ -63,34 +91,27 @@ pub fn classify_refusal(text: &str) -> Option<RefusalClass> {
     }
     let lower = text.to_ascii_lowercase();
     let class = |reason, signature| Some(RefusalClass { reason, signature });
-    for sig in [
-        "merge commits are not allowed",
-        "squash merges are not allowed",
-        "rebase merges are not allowed",
-    ] {
-        if lower.contains(sig) {
+    for sig in SIGNATURES {
+        if quotes_phrase(text, sig) {
             let reason = if sig.starts_with("merge commits") {
                 "merge commits are not allowed on this repository (HTTP 405)"
             } else {
                 "that merge method is not allowed on this repository (HTTP 405)"
             };
-            return class(reason, sig);
+            return class(reason, Some(sig));
         }
     }
     if lower.contains("allowed method")
         || lower.contains("merge method")
         || lower.contains("merge-method")
     {
-        return class(
-            "no merge method both the ruleset and the repo settings allow",
-            "merge method",
-        );
+        return class("no merge method both the ruleset and the repo settings allow", None);
     }
     if lower.contains("repository rule violation") || lower.contains("ruleset") {
-        return class("a branch ruleset refuses the merge", "repository rule violation");
+        return class("a branch ruleset refuses the merge", None);
     }
     if lower.contains("http 405") || lower.contains("405 method not allowed") {
-        return class("the forge refuses the merge (HTTP 405)", "405");
+        return class("the forge refuses the merge (HTTP 405)", None);
     }
     None
 }
@@ -160,9 +181,10 @@ pub struct Detected {
 }
 
 impl Detected {
-    /// The failure signature an incident issue would quote.
+    /// The forge phrase an incident issue would quote, when the refusal is
+    /// specific enough to search for one.
     #[must_use]
-    pub fn signature(&self) -> &'static str {
+    pub fn signature(&self) -> Option<&'static str> {
         self.class.signature
     }
 }
@@ -211,7 +233,7 @@ mod tests {
         ];
         let d = detect(&comments, 9276, 8191).unwrap();
         assert!(d.class.reason.contains("405"), "{}", d.class.reason);
-        assert_eq!(d.signature(), "merge commits are not allowed");
+        assert_eq!(d.signature(), Some("merge commits are not allowed"));
         assert_eq!(d.named, vec![9115], "later comments never name the incident");
         assert!(d.raw.starts_with("Failed to merge PR #9276"), "{}", d.raw);
         assert!(!d.raw.contains('`'));
@@ -257,5 +279,37 @@ mod tests {
         let raw = raw_excerpt(&long);
         assert!(raw.chars().count() <= MAX_RAW + 1);
         assert!(!raw.contains(['<', '>', '`', '\u{7}']), "{raw}");
+    }
+
+    #[test]
+    fn only_the_specific_phrases_carry_a_signature() {
+        for (text, sig) in [
+            (
+                "Failed to merge PR #1: Squash merges are not allowed (HTTP 405)",
+                Some(SIGNATURES[1]),
+            ),
+            ("Failed to merge PR #1: rebase merges are not allowed.", Some(SIGNATURES[2])),
+            ("Failed to merge PR #1: HTTP 405 Method Not Allowed", None),
+            ("Failed to merge PR #1: no allowed merge method", None),
+            ("Failed to merge PR #1: Repository rule violations found", None),
+        ] {
+            let d = detect(&[c(text)], 1, 2).expect(text);
+            assert_eq!(d.signature(), sig, "{text}");
+        }
+    }
+
+    #[test]
+    fn the_phrase_match_is_word_bounded() {
+        let p = SIGNATURES[0];
+        assert!(quotes_phrase("gh: Merge commits are not allowed on this repository.", p));
+        assert!(quotes_phrase("`merge commits are not allowed`", p));
+        assert!(!quotes_phrase("remerge commits are not allowed", p));
+        assert!(!quotes_phrase("merge commits are not allowedly", p));
+        assert!(
+            !quotes_phrase("See #4050 and #14050, v4051", "405"),
+            "a bare number never matches inside a longer one"
+        );
+        assert!(!quotes_phrase("#4050", "405"));
+        assert!(quotes_phrase("HTTP 405.", "405"));
     }
 }

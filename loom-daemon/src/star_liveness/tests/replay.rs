@@ -54,10 +54,13 @@ fn load_with(all_comments: bool) -> (World, Vec<RepoInput>, Value) {
                     closed_at: None,
                     state: it["state"].as_str().unwrap_or("open").into(),
                     body: it["body"].as_str().map(str::to_string),
-                    author: None,
+                    author: it["author"].as_str().map(str::to_string),
                     is_pull_request: it["pr"].as_bool().unwrap_or(false),
                 },
             );
+            if let Some(a) = it["association"].as_str() {
+                world.repo(slug).associations.insert(number, a.to_string());
+            }
         }
         for (n, list) in repo["comments"].as_object().unwrap() {
             for c in list.as_array().unwrap() {

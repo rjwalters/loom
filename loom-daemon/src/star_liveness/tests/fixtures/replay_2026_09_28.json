@@ -1,5 +1,5 @@
 {
- "_comment": "The 2026-09-28 stall (#9244 'Evidence'), reduced to the forge state the liveness pass reads at 08:00Z, with every issue that carried loom:urgent that day starred instead. PR #9276's comments are its REAL comments, verbatim with author and author_association, fetched from the forge; the loader keeps those posted at or before snapshot_at (the approval and the 05:32Z refusal) and replay.rs feeds the later three to the negative test. #9268's title and body are its real text; it was open (loom:triage) until 08:14Z. Nothing on the PR names #9268: the refusal comment names only #9115 (a merged PR) and 'the linked issue', so #9268 is found by the refusal's failure signature ('merge commits are not allowed').",
+ "_comment": "The 2026-09-28 stall (#9244 'Evidence'), reduced to the forge state the liveness pass reads at 08:00Z, with every issue that carried loom:urgent that day starred instead. PR #9276's comments are its REAL comments, verbatim with author and author_association, fetched from the forge; the loader keeps those posted at or before snapshot_at (the approval and the 05:32Z refusal) and replay.rs feeds the later three to the negative test. #9268's title and body are its real text; it was open (loom:triage) until 08:14Z. Nothing on the PR names #9268: the refusal comment names only #9115 (a merged PR) and 'the linked issue', so #9268 is found by the refusal's failure signature ('merge commits are not allowed'). #9268's author and author_association are its real ones (the fleet App, reported as NONE), which the incident search's trust filter checks.",
  "snapshot_at": "2026-09-28T08:00:00Z",
  "repos": [
   {
@@ -32,6 +32,8 @@
     },
     {
      "number": 9268,
+     "author": "loom-fleet-dispatch-2[bot]",
+     "association": "NONE",
      "labels": [
       "loom:triage"
      ],

@@ -2059,14 +2059,16 @@ starred issue in each managed repo:
   so every host managing the repo agrees: a label change, a PR update, or a
   trusted comment on the issue, including the sweep's lease renewal (a long
   Builder phase with a live lease is not a stall on any host). The stall key
-  hashes the same facts, so N hosts post one comment.
+  hashes only those facts (never the stage, which host-local capacity can
+  change), so N hosts post one comment.
 
 An escalation is one comment on the issue, carrying
 `<!-- loom:operator-priority-escalation key=<kind>:<specifics> -->`. Each
 (issue, key) is posted once: a per-process ledger skips repeats without a
 forge call, and every host reads the issue's comments for the marker before
 posting. Only a marker from an `OWNER` / `MEMBER` / `COLLABORATOR`, the fleet
-App or the daemon itself counts; an outside commenter cannot pre-post one to
+App (`LOOM_GITHUB_APP_SLUG` > `forge.githubApp.slug`, else
+`loom-fleet-dispatch*`) or the daemon itself counts; an outside commenter cannot pre-post one to
 suppress an ask. The `pools-exhausted` key is the issue's forge state, not the
 host's hold, so every host and every re-exhaustion share it until the issue
 moves. Safehouse / Matrix delivery is not wired yet (the Safehouse sink only
@@ -2080,8 +2082,10 @@ even from outside the `loom:issue` listing, and its landing row is marked
 `inherited_from`. Once it closes or stops blocking, the next pass drops it, and
 a repo unreadable for 3 passes in a row loses its inherited stars until a pass
 succeeds. A merge refusal's incident is an **open issue** named in the refusal
-comment itself, or else an open issue quoting the refusal's failure signature
-(for #9276 that was #9268, which quotes "Merge commits are not allowed");
+comment itself, or else an open issue, filed by a trusted author, quoting one
+of the forge's three specific refusal phrases word-bounded ("Merge commits /
+Squash merges / Rebase merges are not allowed"; for #9276 that was #9268).
+A generic refusal (bare 405, merge method, ruleset) never searches, and
 nothing a later comment mentions ever inherits. With no open incident the ask
 quotes the forge's refusal text instead.
 

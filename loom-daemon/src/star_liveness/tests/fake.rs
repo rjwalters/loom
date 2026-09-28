@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, TimeZone, Utc};
 
 use crate::forge_listing::RestIssue;
-use crate::star_liveness::forge::{ForgeComment, StarForge};
+use crate::star_liveness::forge::{ForgeComment, SearchHit, StarForge};
 use crate::star_liveness::task::{LivenessState, RepoInput};
 use crate::star_liveness::Settings;
 use crate::types::{ReadyQueueRow, StarLivenessReport};
@@ -25,6 +25,8 @@ pub struct Repo {
     pub comment_reads: usize,
     /// Issue searches made through the fake.
     pub searches: usize,
+    /// `author_association` of each issue's author (absent: `NONE`).
+    pub associations: BTreeMap<u32, String>,
     pub fail_listing: bool,
 }
 
@@ -92,7 +94,7 @@ impl StarForge for FakeForge {
         Ok(repo.comments.get(&number).cloned().unwrap_or_default())
     }
 
-    fn search_open_issues(&mut self, phrase: &str) -> Result<Vec<RestIssue>> {
+    fn search_open_issues(&mut self, phrase: &str) -> Result<Vec<SearchHit>> {
         let mut repo = self.world.repo(&self.slug);
         repo.searches += 1;
         let wanted = phrase.to_ascii_lowercase();
@@ -109,7 +111,10 @@ impl StarForge for FakeForge {
                 .to_ascii_lowercase()
                 .contains(&wanted)
             })
-            .cloned()
+            .map(|i| SearchHit {
+                issue: i.clone(),
+                author_association: repo.associations.get(&i.number).cloned(),
+            })
             .collect())
     }
 
