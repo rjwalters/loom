@@ -68,7 +68,7 @@ If you post a comment via `gh issue comment` / `gh pr comment` / `gh api ...
 comments` from a scratch file, `--body @path` (and `gh api -f body=@path`)
 posts the literal string `@path`, not the file's contents. **Full pitfall,
 incident citation, and fixes**:
-[`comment-body-literal-path.md`](comment-body-literal-path.md).
+[`comment-body-literal-path.md`](../loom-comment-body-literal-path/SKILL.md).
 
 ## CRITICAL: Scope Discipline
 
@@ -911,7 +911,7 @@ Full background: `.loom/docs/guard-hooks.md` → "Known consequence".
 
 | File | Load when |
 |---|---|
-| [`cargo-target-isolation.md`](cargo-target-isolation.md) | Before a local cargo result counts as "tests pass": a shared target dir may hold another worktree's binary (#8457). |
+| [`cargo-target-isolation.md`](../loom-cargo-target-isolation/SKILL.md) | Before a local cargo result counts as "tests pass": a shared target dir may hold another worktree's binary (#8457). |
 
 ## Guidelines
 
@@ -1361,7 +1361,7 @@ proceed exactly as above — this is normal, not an error. Full etiquette
 
 When you receive a probe command, respond with: `AGENT:Builder:<brief-task>` — e.g. `AGENT:Builder:implementing-issue-456`.
 
-**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](probe-protocol.md).**
+**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](../loom-probe-protocol/SKILL.md).**
 
 ## Completion
 

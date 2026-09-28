@@ -62,7 +62,7 @@ If you post a comment via `gh issue comment` / `gh api ... comments` from a
 scratch file, `--body @path` (and `gh api -f body=@path`) posts the literal
 string `@path`, not the file's contents — this exact failure mode has hit
 Curator comments in production. **Full pitfall, incident citation, and
-fixes**: [`comment-body-literal-path.md`](comment-body-literal-path.md).
+fixes**: [`comment-body-literal-path.md`](../loom-comment-body-literal-path/SKILL.md).
 
 ## Argument Handling
 
@@ -2444,7 +2444,7 @@ By keeping issues well-organized, informative, and actionable, you help the team
 
 When you receive a probe command, respond with: `AGENT:Curator:<brief-task>` — e.g. `AGENT:Curator:enhancing-issue-456`.
 
-**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](probe-protocol.md).**
+**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](../loom-probe-protocol/SKILL.md).**
 
 ## Completion
 
