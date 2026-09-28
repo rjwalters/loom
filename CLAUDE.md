@@ -130,8 +130,10 @@ second copy can go missing its pre-claim guard (#8551).
   host); user-provisioned worktrees are never removed — `LOOM_PRESERVE_WORKTREE=1`.
 - `worktree.sh N` detects and skips a stale `origin/feature/issue-N` whose tip is
   already the head of a **merged** PR (e.g. a partial-increment slice's branch
-  name reused by the next slice, #3667/#3599) instead of reusing it — see
-  [`.loom/docs/troubleshooting.md`](.loom/docs/troubleshooting.md) (#5657).
+  name reused by the next slice, #3667/#3599) instead of reusing it, and
+  refuses outright (naming the PR, with an explicit resume path) when the tip
+  is instead the head of a PR **closed without merging** — see
+  [`.loom/docs/troubleshooting.md`](.loom/docs/troubleshooting.md) (#5657/#9083).
 
 ### Merging PRs
 
