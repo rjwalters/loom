@@ -250,8 +250,9 @@ fn the_claim_match_is_whole_line_not_substring() {
     }
 }
 
-/// A child branch that is not `feature/issue-<N>` short-circuits to safe with
-/// no label read at all — so whatever bytes are passed are irrelevant.
+/// A child branch that follows no recognized Builder convention short-circuits
+/// to safe with no label read at all — so whatever bytes are passed are
+/// irrelevant.
 #[test]
 fn no_issue_means_no_claim_to_race() {
     let d = child_route(None, b"loom:building\n");
@@ -260,7 +261,7 @@ fn no_issue_means_no_claim_to_race() {
         Route::Reconcile,
         "the retired shell never read labels for a non-conventional child branch"
     );
-    assert!(d.why.contains("not feature/issue-<N>"), "why was {:?}", d.why);
+    assert!(d.why.contains("not a recognized Builder branch"), "why was {:?}", d.why);
 }
 
 /// The retired shell's three `|| true` / `|| echo '{}'` layers turned a failed
