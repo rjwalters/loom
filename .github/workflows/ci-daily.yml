@@ -631,7 +631,7 @@ jobs:
           # checkout where sync-labels.sh has never run still gets a working
           # report instead of an issue create that dies on an unknown label.
           gh label create "$TRACKING_LABEL" --color B60205 \
-            --description "Tracking issue for a failing ci-daily.yml job. Opened, updated and closed by ci-daily.yml." \
+            --description "Failing ci-daily.yml job tracker; auto-closes on the next green run. Applied by: ci-daily.yml." \
             >/dev/null 2>&1 || true
 
           # This run's jobs, base64'd one per line so names containing spaces

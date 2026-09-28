@@ -338,5 +338,5 @@
 # checkout where sync-labels.sh has never run still reports correctly.
 # ============================================================================
 - name: ci:daily-failure
-  description: "Tracking issue for a failing ci-daily.yml job. Applied by: ci-daily.yml only; auto-closed on the next green run."
+  description: "Failing ci-daily.yml job tracker; auto-closes on the next green run. Applied by: ci-daily.yml."
   color: "B60205"  # red - a standing failure on main
