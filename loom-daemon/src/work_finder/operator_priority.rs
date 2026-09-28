@@ -52,10 +52,13 @@ pub const CHAMPION_PATH_LABELS: [&str; 4] =
 pub const STARRED_AT_RETRY: Duration = Duration::from_secs(600);
 
 impl WorkItem {
-    /// True when the issue carries [`OPERATOR_PRIORITY_LABEL`] (#9244).
+    /// True when the issue carries [`OPERATOR_PRIORITY_LABEL`] (#9244), or
+    /// blocks a starred issue and inherits its star (#9244 C). Dispatch
+    /// treats both alike: an inherited star must land before the star can.
     #[must_use]
     pub fn is_operator_priority(&self) -> bool {
-        self.labels.iter().any(|l| l == OPERATOR_PRIORITY_LABEL)
+        self.operator_priority_inherited_from.is_some()
+            || self.labels.iter().any(|l| l == OPERATOR_PRIORITY_LABEL)
     }
 
     /// Builder-style setter for the starred-at timestamp (#9244).
@@ -210,9 +213,12 @@ pub fn resolve_starred_at(
         .resolve(items, source, Instant::now());
 }
 
-/// The `--jq` program for [`GhTimelineStarredAt`]: one `created_at` per
-/// `labeled` event for [`OPERATOR_PRIORITY_LABEL`].
-const STARRED_AT_JQ: &str = r#".[] | select(.event == "labeled" and .label.name == "loom:operator-priority") | .created_at"#;
+/// The `--jq` program for [`GhTimelineStarredAt`]: `L <created_at>` per
+/// `labeled` event for [`OPERATOR_PRIORITY_LABEL`], and
+/// `C <created_at> <requested_at>` per loom-ui star-intent audit comment
+/// (#9244 C), whose `requested_at` is the authoritative starred-at. Parsed by
+/// [`crate::star_liveness::intents::starred_at_from_timeline`].
+const STARRED_AT_JQ: &str = r#".[] | if (.event == "labeled" and .label.name == "loom:operator-priority") then "L \(.created_at)" elif (.event == "commented" and ((.body // "") | contains("loom:operator-priority-intent=") and contains("action=star"))) then "C \(.created_at) \((.body | capture("requested_at=(?<t>[^ >]+)") | .t) // "-")" else empty end"#;
 
 /// The latest RFC-3339 timestamp in `stdout` (one per line), i.e. the most
 /// recent time the label was applied. Unparseable lines are skipped.
@@ -263,7 +269,9 @@ impl StarredAtSource for GhTimelineStarredAt {
             crate::rate_limit_breaker::global_observe_failure(&stderr, "work_finder_starred_at");
             return Err(anyhow!("gh api timeline for #{issue} failed: {stderr}"));
         }
-        Ok(latest_labeled_at(&String::from_utf8_lossy(&out.stdout)))
+        Ok(crate::star_liveness::intents::starred_at_from_timeline(
+            &String::from_utf8_lossy(&out.stdout),
+        ))
     }
 }
 

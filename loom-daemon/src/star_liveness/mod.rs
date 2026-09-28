@@ -1,0 +1,183 @@
+//! The starred-issue liveness contract and loom-ui star intents (#9244 slice
+//! C, #9301).
+//!
+//! Slice A made a starred (`loom:operator-priority`) issue sort first; slice B
+//! made every role take starred work first. Ordering alone does not land an
+//! issue: on 2026-09-28 none of the eight priority issues was moving, and
+//! none of them was waiting in a queue. They were parked on things no agent
+//! can resolve (a forge merge refusal, an operator decision, an exhausted
+//! token pool) and nobody told a human. This module closes that gap:
+//!
+//! 1. **Landing state** ([`landing`]). For every starred issue the daemon
+//!    computes one [`LandingStage`] with a next actor and time in stage, and
+//!    publishes it on `DaemonStatusReport` (so `loom-daemon status`, `queue`
+//!    and the `operator_attention` health section show it) and on
+//!    `queue.snapshot` (so loom-ui does).
+//! 2. **Immediate escalation** ([`escalate`]). A stage no agent can leave is
+//!    `needs-operator` with one concrete [`OperatorAsk`] on the first pass
+//!    that sees it. The ask is posted once as a comment on the issue, carrying
+//!    a `<!-- loom:operator-priority-escalation key=… -->` marker. The marker
+//!    is the dedupe: across ticks (an in-memory ledger short-circuits the
+//!    check) and across hosts (every host reads the issue's comments for the
+//!    marker before posting).
+//! 3. **Watchdog** ([`progress`]). An agent-owned stage with no forward
+//!    progress for `noProgressMinutes` (default 30) escalates too, keyed by
+//!    the stalled fingerprint so the same stall is reported once.
+//! 4. **Blocker inheritance** ([`inherit`]). The issue blocking a starred
+//!    issue (named by `loom:blocked`, the incident named in a merge refusal,
+//!    or the repo's red-main fix) inherits the star's queue position in the
+//!    work finder and its escalation, and loses both once it stops blocking.
+//! 5. **loom-ui star intents** ([`intents`]). The `/ingest` ack may carry
+//!    `operator_priority_intents`; the exporter queues them and this module
+//!    validates and applies them idempotently, with one audit comment whose
+//!    `requested_at` becomes the authoritative starred-at.
+//!
+//! # Channels
+//!
+//! The ask reaches the operator through the forge comment (a GitHub
+//! notification, deduped by marker), the `operator_attention` health section,
+//! `loom-daemon status` / `queue`, and loom-ui via `queue.snapshot`. Safehouse
+//! (and through it the team Matrix room) is **deferred**: the Safehouse sink
+//! only narrates the frozen event-bus taxonomy, and a second ad hoc socket
+//! client for one message kind is a new integration, not a reuse. The
+//! follow-up is recorded on the PR.
+//!
+//! # Where it runs
+//!
+//! One background thread ([`task`]) while the work finder is enabled, every
+//! `intervalSecs` (default 120). All forge reads are ETag-cached listings
+//! except the per-issue comment reads, which happen only for a new escalation
+//! key or an approved PR whose `updated_at` moved.
+
+use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+use crate::types::StarLivenessReport;
+pub use crate::types::{AskKind, LandingStage, OperatorAsk, StarLandingRow};
+
+pub mod collect;
+pub mod escalate;
+pub mod forge;
+pub mod inherit;
+pub mod intents;
+pub mod landing;
+pub mod progress;
+pub mod refusal;
+pub mod render;
+pub mod task;
+
+#[cfg(test)]
+mod tests;
+
+/// Env override for [`Settings::no_progress`] (minutes).
+pub const NO_PROGRESS_MINUTES_ENV: &str = "LOOM_OPERATOR_PRIORITY_NO_PROGRESS_MINUTES";
+/// Env override for [`Settings::escalate`] (`0`/`false` disables forge writes).
+pub const ESCALATE_ENV: &str = "LOOM_OPERATOR_PRIORITY_ESCALATE";
+/// Env override for [`Settings::interval`] (seconds).
+pub const INTERVAL_SECS_ENV: &str = "LOOM_OPERATOR_PRIORITY_INTERVAL_SECS";
+
+/// Default watchdog window.
+pub const DEFAULT_NO_PROGRESS_MINUTES: u64 = 30;
+/// Default pass interval.
+pub const DEFAULT_INTERVAL_SECS: u64 = 120;
+
+/// Resolved `autonomous.operatorPriority` settings (**env > config >
+/// default** for each knob).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Settings {
+    /// `noProgressMinutes`: the watchdog window.
+    pub no_progress: Duration,
+    /// `escalate`: whether escalations and intents are written to the forge.
+    /// Off, the pass still computes and publishes every landing state.
+    pub escalate: bool,
+    /// `intervalSecs`: how often the pass runs.
+    pub interval: Duration,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            no_progress: Duration::from_secs(DEFAULT_NO_PROGRESS_MINUTES * 60),
+            escalate: true,
+            interval: Duration::from_secs(DEFAULT_INTERVAL_SECS),
+        }
+    }
+}
+
+fn positive_u64(v: Option<&serde_json::Value>) -> Option<u64> {
+    v.and_then(serde_json::Value::as_u64).filter(|n| *n > 0)
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    let v = std::env::var(name).ok()?;
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+impl Settings {
+    /// Resolve from an `autonomous.operatorPriority` JSON block (or `None`)
+    /// plus the environment.
+    #[must_use]
+    pub fn from_block(block: Option<&serde_json::Value>) -> Self {
+        let d = Self::default();
+        let cfg = |k: &str| block.and_then(|b| b.get(k));
+        let minutes = env_u64(NO_PROGRESS_MINUTES_ENV)
+            .or_else(|| positive_u64(cfg("noProgressMinutes")))
+            .unwrap_or(DEFAULT_NO_PROGRESS_MINUTES);
+        let interval = env_u64(INTERVAL_SECS_ENV)
+            .or_else(|| positive_u64(cfg("intervalSecs")))
+            .unwrap_or(DEFAULT_INTERVAL_SECS);
+        let escalate = env_bool(ESCALATE_ENV)
+            .or_else(|| cfg("escalate").and_then(serde_json::Value::as_bool))
+            .unwrap_or(d.escalate);
+        Self {
+            no_progress: Duration::from_secs(minutes.saturating_mul(60)),
+            escalate,
+            interval: Duration::from_secs(interval),
+        }
+    }
+
+    /// Resolve for the workspace at `root` (`.loom/config.json` through the
+    /// config resolver). A missing or malformed block is all defaults.
+    #[must_use]
+    pub fn resolve(root: &Path) -> Self {
+        let effective = crate::config_resolver::resolve_effective_config(root);
+        let block = crate::config_resolver::get_path(&effective, "autonomous")
+            .and_then(|a| a.get("operatorPriority"))
+            .cloned();
+        Self::from_block(block.as_ref())
+    }
+}
+
+fn last_slot() -> &'static Mutex<Option<StarLivenessReport>> {
+    static SLOT: OnceLock<Mutex<Option<StarLivenessReport>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Publish the latest pass for `status` and `queue.snapshot`.
+pub fn publish_report(report: StarLivenessReport) {
+    *last_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
+}
+
+/// The latest pass, or `None` before the first one (or with the work finder
+/// off).
+#[must_use]
+pub fn last_report() -> Option<StarLivenessReport> {
+    last_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}

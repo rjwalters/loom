@@ -2765,6 +2765,7 @@ pub fn build_daemon_status(
         // Unset globals (loop never spawned) read as `None` / empty — honestly
         // "no tick observed", never "nothing happened".
         last_work_finder_tick: crate::work_finder::last_tick_summary(),
+        operator_priority_landing: crate::star_liveness::last_report(),
         role_tick_records: crate::role_runner::role_tick_records(),
         // #6201: the never-evicted last-tick-per-pair companion to the ring
         // above — see `RoleLastTick`'s doc comment for why both are needed.

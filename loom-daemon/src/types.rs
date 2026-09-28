@@ -1490,6 +1490,11 @@ pub struct DaemonStatusReport {
     /// data / older clients compatible.
     #[serde(default)]
     pub last_work_finder_tick: Option<WorkFinderTickSummary>,
+    /// The last starred-issue liveness pass (#9244 C): each starred issue's
+    /// landing stage, next actor and any operator ask. `None` when the pass
+    /// has not run this process, and for an older daemon's payload.
+    #[serde(default)]
+    pub operator_priority_landing: Option<StarLivenessReport>,
     /// A bounded, newest-last window of per-(root, role) role-runner tick
     /// outcomes (Issue #4761), published by the role-runner loop via
     /// [`crate::role_runner::record_role_tick`]. Carried as raw records rather
@@ -1844,6 +1849,11 @@ pub use dispatch_plan::{
 };
 mod work_finder_tick;
 pub use work_finder_tick::WorkFinderTickSummary;
+
+mod star_liveness;
+pub use star_liveness::{
+    AskKind, DroppedStarIntent, LandingStage, OperatorAsk, StarLandingRow, StarLivenessReport,
+};
 
 /// One role-runner tick outcome for one `(root, role)` pair (Issue #4761).
 ///

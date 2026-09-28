@@ -986,12 +986,18 @@ pub fn spawn_task(
                 // already handle.
                 let host_id_status = Arc::new(HostIdStatus::default());
                 register_global_host_id_status(host_id_status.clone());
+                // loom-ui star intents (#9244 C) ride the same native ack, so
+                // the queue is registered here too and nowhere else (the OTLP
+                // arm below has no ack to read them from).
+                let intents = crate::star_liveness::intents::register_global_queue();
                 match HttpsExporter::new(
                     endpoint.clone(),
                     ingest_key.clone(),
                     host_id.clone(),
                     host_id_status,
-                ) {
+                )
+                .map(|e| e.with_intent_queue(intents))
+                {
                     Ok(exporter) => sender::spawn_task(
                         queue.clone(),
                         exporter,

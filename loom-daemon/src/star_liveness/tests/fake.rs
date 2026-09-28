@@ -1,0 +1,241 @@
+//! An in-memory forge for the liveness tests.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, TimeZone, Utc};
+
+use crate::forge_listing::RestIssue;
+use crate::star_liveness::forge::{ForgeComment, StarForge};
+use crate::star_liveness::task::{LivenessState, RepoInput};
+use crate::star_liveness::Settings;
+use crate::types::{ReadyQueueRow, StarLivenessReport};
+
+/// One repo's forge state.
+#[derive(Debug, Default)]
+pub struct Repo {
+    pub items: BTreeMap<u32, RestIssue>,
+    pub comments: BTreeMap<u32, Vec<ForgeComment>>,
+    /// Every comment posted through the fake: (number, body).
+    pub posted: Vec<(u32, String)>,
+    /// Comment reads made through the fake.
+    pub comment_reads: usize,
+    pub fail_listing: bool,
+}
+
+/// A forge world: repos by slug.
+#[derive(Debug, Default, Clone)]
+pub struct World(pub Rc<RefCell<BTreeMap<String, Repo>>>);
+
+impl World {
+    pub fn repo(&self, slug: &str) -> std::cell::RefMut<'_, Repo> {
+        std::cell::RefMut::map(self.0.borrow_mut(), |m| m.entry(slug.to_string()).or_default())
+    }
+
+    pub fn add(&self, slug: &str, item: RestIssue) {
+        self.repo(slug).items.insert(item.number, item);
+    }
+
+    pub fn comment(&self, slug: &str, number: u32, body: &str) {
+        self.repo(slug)
+            .comments
+            .entry(number)
+            .or_default()
+            .push(ForgeComment {
+                body: body.to_string(),
+                created_at: None,
+            });
+    }
+
+    pub fn posted(&self, slug: &str) -> Vec<(u32, String)> {
+        self.repo(slug).posted.clone()
+    }
+
+    pub fn forge(&self, slug: &str) -> Box<dyn StarForge> {
+        Box::new(FakeForge {
+            world: self.clone(),
+            slug: slug.to_string(),
+        })
+    }
+}
+
+pub struct FakeForge {
+    world: World,
+    slug: String,
+}
+
+impl StarForge for FakeForge {
+    fn list_open(&mut self, label: &str) -> Result<Vec<RestIssue>> {
+        let repo = self.world.repo(&self.slug);
+        if repo.fail_listing {
+            return Err(anyhow!("listing failed"));
+        }
+        Ok(repo
+            .items
+            .values()
+            .filter(|i| i.state == "open" && i.labels.iter().any(|l| l == label))
+            .cloned()
+            .collect())
+    }
+
+    fn issue(&mut self, number: u32) -> Result<Option<RestIssue>> {
+        Ok(self.world.repo(&self.slug).items.get(&number).cloned())
+    }
+
+    fn comments(&mut self, number: u32) -> Result<Vec<ForgeComment>> {
+        let mut repo = self.world.repo(&self.slug);
+        repo.comment_reads += 1;
+        Ok(repo.comments.get(&number).cloned().unwrap_or_default())
+    }
+
+    fn add_label(&mut self, number: u32, label: &str) -> Result<()> {
+        let mut repo = self.world.repo(&self.slug);
+        let item = repo
+            .items
+            .get_mut(&number)
+            .ok_or_else(|| anyhow!("no #{number}"))?;
+        if !item.labels.iter().any(|l| l == label) {
+            item.labels.push(label.to_string());
+        }
+        Ok(())
+    }
+
+    fn remove_label(&mut self, number: u32, label: &str) -> Result<()> {
+        let mut repo = self.world.repo(&self.slug);
+        if let Some(item) = repo.items.get_mut(&number) {
+            item.labels.retain(|l| l != label);
+        }
+        Ok(())
+    }
+
+    fn post_comment(&mut self, number: u32, body: &str) -> Result<()> {
+        let mut repo = self.world.repo(&self.slug);
+        repo.posted.push((number, body.to_string()));
+        repo.comments.entry(number).or_default().push(ForgeComment {
+            body: body.to_string(),
+            created_at: None,
+        });
+        Ok(())
+    }
+}
+
+/// An open issue.
+pub fn issue(number: u32, labels: &[&str]) -> RestIssue {
+    RestIssue {
+        number,
+        title: Some(format!("issue {number}")),
+        labels: labels.iter().map(|l| (*l).to_string()).collect(),
+        created_at: Some(format!("2026-09-{:02}T00:00:00Z", 1 + number % 27)),
+        updated_at: Some("2026-09-28T00:00:00Z".to_string()),
+        closed_at: None,
+        state: "open".to_string(),
+        body: Some(String::new()),
+        author: None,
+        is_pull_request: false,
+    }
+}
+
+/// An issue with a body.
+pub fn issue_with_body(number: u32, labels: &[&str], body: &str) -> RestIssue {
+    RestIssue {
+        body: Some(body.to_string()),
+        ..issue(number, labels)
+    }
+}
+
+/// An open PR closing `closes`.
+pub fn pr(number: u32, closes: u32, labels: &[&str]) -> RestIssue {
+    RestIssue {
+        body: Some(format!("Summary.\n\nCloses #{closes}\n")),
+        is_pull_request: true,
+        ..issue(number, labels)
+    }
+}
+
+pub const STAR: &str = "loom:operator-priority";
+
+pub fn t(h: u32, m: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 9, 28, h, m, 0).unwrap()
+}
+
+pub fn repo_input(slug: &str) -> RepoInput {
+    RepoInput {
+        root: PathBuf::from(format!("/nonexistent/star-liveness-tests/{slug}")),
+        slug: slug.to_string(),
+        tick_rows: Vec::new(),
+        pool: None,
+    }
+}
+
+pub fn settings() -> Settings {
+    Settings {
+        escalate: true,
+        ..Settings::default()
+    }
+}
+
+/// One host.
+pub struct Host {
+    pub id: String,
+    pub state: LivenessState,
+}
+
+impl Host {
+    pub fn new(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            state: LivenessState::default(),
+        }
+    }
+
+    pub fn pass(
+        &mut self,
+        world: &World,
+        repos: &[RepoInput],
+        intents: Vec<crate::star_liveness::intents::StarIntent>,
+        now: DateTime<Utc>,
+    ) -> StarLivenessReport {
+        self.pass_with(world, repos, intents, now, settings())
+    }
+
+    pub fn pass_with(
+        &mut self,
+        world: &World,
+        repos: &[RepoInput],
+        intents: Vec<crate::star_liveness::intents::StarIntent>,
+        now: DateTime<Utc>,
+        settings: Settings,
+    ) -> StarLivenessReport {
+        let w = world.clone();
+        let mut factory = move |_root: &Path, slug: &str| w.forge(slug);
+        self.state
+            .run_pass(repos, intents, settings, &self.id, now, &mut factory)
+    }
+}
+
+/// A tick row for `issue` with `disposition`.
+pub fn tick_row(
+    root: &Path,
+    issue: u32,
+    disposition: crate::types::QueueDisposition,
+) -> ReadyQueueRow {
+    ReadyQueueRow {
+        rank: 1,
+        repo: root.display().to_string(),
+        issue,
+        workspace_priority: 100,
+        urgent: false,
+        operator_priority: true,
+        operator_priority_at: None,
+        main_red_fix: false,
+        created_at: None,
+        tier: None,
+        disposition,
+        detail: None,
+        state: disposition.state().to_string(),
+        reason: disposition.reason().to_string(),
+    }
+}

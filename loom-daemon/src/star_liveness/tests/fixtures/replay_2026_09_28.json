@@ -1,0 +1,54 @@
+{
+  "_comment": "The 2026-09-28 stall (#9244 'Evidence'), reduced to the forge state the liveness pass reads, with every issue that carried loom:urgent that day starred instead. Labels and PR links are as observed; comment text is the Champion 'Merge Failed' template and the follow-up that named the incident.",
+  "repos": [
+    {
+      "slug": "rjwalters/loom",
+      "pool_exhausted": false,
+      "items": [
+        {"number": 8191, "labels": ["loom:operator-priority", "loom:building"], "body": "merge-pr.sh port slice."},
+        {"number": 9276, "pr": true, "labels": ["loom:pr"], "body": "Part of the #8191 port.\n\nCloses #8191\n"},
+        {"number": 9268, "labels": ["loom:triage"], "body": "Repo merge-method contradiction: main ruleset allows only squash, repo flags allow only merge."},
+        {"number": 8256, "labels": ["loom:operator-priority", "loom:building"], "body": ""},
+        {"number": 8314, "pr": true, "labels": ["loom:operator-decision"], "body": "Closes #8256\n"}
+      ],
+      "comments": {
+        "9276": [
+          "Judge: approved. All checks green.",
+          "**Champion: Merge Failed**\n\nAttempted to auto-merge this PR but encountered an error:\n\n```\nFailed to merge PR #9276: gh: Merge commits are not allowed on this repository. (HTTP 405)\n```\n\nThis PR met all safety criteria but the merge operation failed. A human will need to investigate and merge manually.",
+          "Also hit this on #9267. Repo-wide: tracked in #9268."
+        ]
+      }
+    },
+    {
+      "slug": "2AMLogic/loom-ui",
+      "pool_exhausted": true,
+      "items": [
+        {"number": 281, "labels": ["loom:operator-priority"], "body": "Incident: short-title backfill query exceeds D1 CPU limit."}
+      ],
+      "comments": {}
+    },
+    {
+      "slug": "2AMLogic/2am",
+      "pool_exhausted": false,
+      "items": [
+        {"number": 1180, "labels": ["loom:operator-priority", "loom:operator-only", "loom:operator-decision"], "body": "gf180-surge (PUBLIC) has a committed .env."},
+        {"number": 1098, "labels": ["loom:operator-priority", "loom:operator-only", "loom:operator-mechanical"], "body": "token pool: utilization spike detected"},
+        {"number": 897, "labels": ["loom:operator-priority", "loom:curated", "loom:operator-only", "tier:goal-supporting", "loom:operator-decision"], "body": "Operator-gated run protocol."},
+        {"number": 869, "labels": ["loom:operator-priority", "loom:curated", "loom:blocked", "tier:goal-supporting"], "body": "sky130-modexp resync BLOCKED: four fleet-bot commits fixed Loom-managed files in place; upstream or pin them."}
+      ],
+      "comments": {}
+    }
+  ],
+  "expect_escalations": [
+    {"repo": "rjwalters/loom", "issue": 8191, "kind": "merge-refused", "mentions": ["PR #9276", "See #9268"]},
+    {"repo": "rjwalters/loom", "issue": 8256, "kind": "operator-decision", "mentions": ["PR #8314"]},
+    {"repo": "2AMLogic/loom-ui", "issue": 281, "kind": "pools-exhausted", "mentions": ["exhausted"]},
+    {"repo": "2AMLogic/2am", "issue": 1180, "kind": "operator-decision", "mentions": []},
+    {"repo": "2AMLogic/2am", "issue": 1098, "kind": "operator-only", "mentions": ["loom:operator-only"]},
+    {"repo": "2AMLogic/2am", "issue": 897, "kind": "operator-decision", "mentions": []},
+    {"repo": "2AMLogic/2am", "issue": 869, "kind": "blocked-unnamed", "mentions": []}
+  ],
+  "expect_inherited": [
+    {"repo": "rjwalters/loom", "issue": 9268, "from": 8191}
+  ]
+}

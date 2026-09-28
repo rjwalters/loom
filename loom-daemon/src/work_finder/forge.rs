@@ -103,7 +103,14 @@ impl WorkSource for GhWorkSource {
             cwd: self.cwd.clone(),
             repo: self.repo.clone(),
         };
-        operator_priority::resolve_starred_at(&key, &mut items, &mut timeline);
+        // #9244 C: a loom-ui intent's `requested_at` answers first (the seam
+        // slice A left), then blockers of starred issues inherit the star.
+        let mut source = crate::star_liveness::intents::IntentStarredAt {
+            root: self.cwd.as_deref(),
+            inner: &mut timeline,
+        };
+        operator_priority::resolve_starred_at(&key, &mut items, &mut source);
+        crate::star_liveness::inherit::apply(self.cwd.as_deref(), &mut items);
         Ok(items)
     }
 }
