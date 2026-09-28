@@ -148,7 +148,14 @@ helper can provide only the phases that the daemon actually observes.
 
 `loom.role_attempt` spans have distinct IDs for retries. Explicit checkpoint
 attempt numbers are retained. Unknown usage remains absent; measured zero stays
-zero. Outcome logs include existing grouped usage, failure classification, ordered
+zero. Each attempt's token usage is a set of per-model `loom.runtime.usage`
+children with `loom.usage.scope=attempt` (#9303): `loom-daemon usage-record`,
+run after each checkpoint write, reads the role subagent's transcript and
+journals them under the role's newest attempt, or, in an operator session with
+no inherited context, under a `loom.role_attempt` it creates in the issue's
+story trace (`loom.timing_source=transcript_window`). The whole execution's
+usage is the `scope=execution` set; see `telemetry-schema.md` for how to total
+the two without double counting. Outcome logs include existing grouped usage, failure classification, ordered
 Judge verdicts and Doctor counts. Grouped usage inherits the source journal's
 attribution window and is not a measured provider bill. Free-form role error text,
 configuration blobs, prompts and account contents are not exported.
@@ -186,6 +193,9 @@ yields the same id. It carries `loom.role`, `loom.issue`, `loom.pr_number`
 `loom.timing_source=tick` — its start and end are the whole tick's, not the
 individual action's — plus a link to the tick's own root. The spans are
 appended to the tick's trace journal and drained like every lifecycle span.
+Its token usage is journalled as per-model `loom.runtime.usage` spans:
+`scope=execution` under the tick's own root, and `scope=attempt` under the
+story span only when exactly one target is stitched (#9303).
 All of this is best-effort after the tick's child has exited; it never fails
 the tick. Non-Claude runtimes record no transcript actions, so their ticks
 join no story yet.
