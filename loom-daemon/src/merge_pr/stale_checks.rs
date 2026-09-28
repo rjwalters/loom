@@ -246,7 +246,12 @@ pub fn assess_scoped(
                         &specs,
                         &mv.files,
                         &scoped_delta(scoped),
-                        &mv.ci_scope,
+                        &workflow_scope::CiScopes {
+                            base: mv.ci_scope.clone(),
+                            pr: scoped.map_or_else(workflow_scope::CiScope::default, |s| {
+                                s.pr_ci_scope.clone()
+                            }),
+                        },
                     ) {
                         Some((component, r)) if specs.len() > 1 => {
                             (format!("{ctx} ({component})"), Some(r))

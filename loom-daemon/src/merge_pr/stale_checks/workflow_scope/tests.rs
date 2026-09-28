@@ -379,3 +379,85 @@ fn a_workflow_missing_a_required_job_is_unscoped() {
     );
     assert_eq!(scope_for_patch(&wf, "@@ -6,0 +6,1 @@\n+      - run: more\n"), CiScope::Unscoped);
 }
+
+// --- Deletions at and past the file's end (#9363 review note 2) --------------
+
+#[test]
+fn a_deletion_running_to_the_files_tail_is_attributed_not_refused() {
+    // The one legitimate off-the-end position: the removed run reached the old
+    // file's end, so the hunk's new-side cursor lands at `line_count + 1` and
+    // only the line before it exists. The edit still belongs to the last job.
+    let wf = workflow();
+    let end = wf.line_count;
+    let patch =
+        format!("@@ -{},2 +{},0 @@\n-        echo gone\n-        echo also\n", end + 1, end + 1);
+    let owner = wf
+        .jobs
+        .iter()
+        .find(|j| end >= j.start && end <= j.end)
+        .map(|j| j.key.clone());
+    assert!(owner.is_some(), "precondition: the last line belongs to a job");
+    assert!(
+        changed_new_lines(&patch, wf.line_count).is_some_and(|l| l.contains(&end)),
+        "a tail deletion is charged to the last line, not refused"
+    );
+}
+
+#[test]
+fn a_deletion_past_the_files_tail_fails_closed() {
+    // #9363's review found this the one arm that CLAMPED where every other
+    // out-of-range case fails closed. A deletion two or more lines past the
+    // end means the patch and the fetched workflow are different files, and
+    // guessing which block it belonged to is exactly the error direction this
+    // guard may not take.
+    let wf = workflow();
+    let beyond = wf.line_count + 2;
+    let patch = format!("@@ -{beyond},1 +{beyond},0 @@\n-        echo gone\n");
+    assert_eq!(changed_new_lines(&patch, wf.line_count), None);
+    assert_eq!(scope_for_patch(&wf, &patch), CiScope::Unscoped);
+}
+
+// --- CiScopes: two sides, each against its own tree --------------------------
+
+#[test]
+fn ci_scopes_default_to_the_whole_file_meaning_on_both_sides() {
+    let both = CiScopes::default();
+    assert_eq!(both, CiScopes::unscoped());
+    assert!(both.base.affects("File Size Ratchet"));
+    assert!(both.pr.affects("File Size Ratchet"));
+
+    // `from_base` narrows the base side and leaves `P` at the old meaning, the
+    // shape every caller that has no PR-side attribution to offer must get.
+    let only_base = CiScopes::from_base(CiScope::Scoped(BTreeSet::new()));
+    assert!(!only_base.base.affects("File Size Ratchet"));
+    assert!(only_base.pr.affects("File Size Ratchet"));
+}
+
+#[test]
+fn the_pr_side_is_attributed_by_the_same_machinery_as_the_base_side() {
+    // `P`'s ci.yml entry is attributed against the PR HEAD's workflow, but the
+    // parser and every fail-closed branch are shared, so a PR-shaped file list
+    // narrows exactly as a compare-shaped one does.
+    let wf = workflow();
+    let unrelated = add_at(line_of("  backend-tests:") + 3);
+    assert_eq!(
+        scope_for_files(&wf, &[ci_file("modified", Some(&unrelated))]),
+        CiScope::Scoped(BTreeSet::new()),
+        "a PR editing only an unrequired job's block is a global input for nobody"
+    );
+
+    let own_block = wf
+        .job_named("Structural Checks")
+        .expect("job")
+        .components
+        .iter()
+        .find(|c| c.name == "File Size Ratchet")
+        .expect("marker")
+        .start
+        + 2;
+    assert!(
+        scope_for_files(&wf, &[ci_file("modified", Some(&add_at(own_block)))])
+            .affects("File Size Ratchet"),
+        "a PR editing the gate's OWN block is still that gate's global input"
+    );
+}
