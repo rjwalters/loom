@@ -833,6 +833,16 @@ mod tests {
         assert!(contents.contains(".loom/account-health.lock"));
         assert!(!contents.contains(".loom/accounts.json"));
 
+        // #9046: sibling copies of the token pool must be ignored too. Only the
+        // exact `.loom/tokens/` was ignored, so a resync `git add` swept 21 live
+        // OAuth tokens out of a `tokens.shadow-disabled-<ts>/` sibling into
+        // public `main` (a9da48c2). Matching behaviour against concrete sample
+        // paths is asserted by
+        // `token_pool_sibling_patterns_ignore_concrete_sample_paths` below —
+        // these two assertions only prove the literals are emitted.
+        assert!(contents.contains(".loom/tokens.*/"));
+        assert!(contents.contains(".loom/tokens-*/"));
+
         // #7818: the daemon-owned GH_CONFIG_DIR trees (host-local GitHub App
         // installation tokens) must be ignored so a resync's `git add .loom`
         // can never sweep a live credential into the tree.
@@ -855,6 +865,76 @@ mod tests {
         // config.json must NOT be gitignored
         assert!(!contents.contains(".loom/config.json"));
         assert!(!contents.contains(".loom/*.json"));
+    }
+
+    /// #9046: the two sibling-token-pool globs must actually *match* the paths
+    /// that leaked, not merely appear in the emitted `.gitignore`. A glob-syntax
+    /// mistake (`.loom/tokens.*` missing its trailing slash, `.loom/tokens*/`
+    /// collapsing the live pool's own rule, a stray escape) leaves the literal
+    /// `contents.contains(...)` assertions above green while ignoring nothing —
+    /// which is exactly how a9da48c2 swept 21 live OAuth tokens out of a
+    /// `tokens.shadow-disabled-<ts>/` sibling into public `main`. The question is
+    /// put to real `git check-ignore`, the tool that decides it in production,
+    /// rather than to a hand-rolled matcher that could repeat the same mistake.
+    #[test]
+    fn token_pool_sibling_patterns_ignore_concrete_sample_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let git = |args: &[&str]| -> std::process::Output {
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                // Isolate from the developer's global/system git config so a
+                // personal `core.excludesFile` can never answer on behalf of
+                // the patterns under test (in either direction).
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("run git")
+        };
+
+        assert!(git(&["init", "-q"]).status.success(), "git init failed");
+        update_gitignore(root).unwrap();
+
+        // `--no-index` consults the ignore rules directly, so no sample path has
+        // to exist on disk — the same probe PR #9046 used to verify these by
+        // hand. `-v` reports which pattern matched, so a match by some *other*,
+        // overbroad rule is a failure rather than a false pass.
+        let check_ignore = |path: &str| -> Option<String> {
+            let out = git(&["check-ignore", "-v", "--no-index", path]);
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                None
+            }
+        };
+
+        for (path, expected_pattern) in [
+            (".loom/tokens.shadow-disabled-20260101T000000Z/x.token", ".loom/tokens.*/"),
+            (".loom/tokens-backup/x.token", ".loom/tokens-*/"),
+            // The original exact-path rule must keep covering the live pool —
+            // adding the globs must not have replaced it.
+            (".loom/tokens/x.token", ".loom/tokens/"),
+        ] {
+            let matched = check_ignore(path)
+                .unwrap_or_else(|| panic!("{path} is NOT ignored by the generated .gitignore"));
+            assert!(
+                matched.ends_with(&format!("{expected_pattern}\t{path}")),
+                "{path} should be ignored by `{expected_pattern}`, got: {matched}"
+            );
+        }
+
+        // Over-match guard: these globs are directory-scoped (trailing `/`) and
+        // must not swallow a sibling *file* under `.loom/`.
+        // `.loom/accounts.json` is the deliberately committable per-repo profile
+        // allowlist (#5014) — if a future widening starts ignoring it, this
+        // fails here instead of silently un-tracking a shared config.
+        assert!(
+            check_ignore(".loom/accounts.json").is_none(),
+            ".loom/accounts.json must stay trackable (#5014)"
+        );
     }
 
     #[test]
