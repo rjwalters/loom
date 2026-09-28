@@ -600,7 +600,14 @@ jobs:
             #   cosign verify-blob --certificate <target>.pem --signature <target>.sig \
             #     --certificate-identity-regexp '^https://github\.com/<slug>/\.github/workflows/[^@]+@refs/tags/<tag>$' \
             #     --certificate-oidc-issuer https://token.actions.githubusercontent.com <binary>
+            # cosign v3 (bundled by cosign-installer v4.x) defaults sign-blob to
+            # the new combined --bundle output and silently ignores
+            # --output-signature/--output-certificate; --new-bundle-format=false
+            # --use-signing-config=false restores the legacy separate .sig/.pem
+            # files that loom-daemon's release_fetch verifier expects (#9155).
             cosign sign-blob --yes \
+              --new-bundle-format=false \
+              --use-signing-config=false \
               --output-signature "$sig" \
               --output-certificate "$cert" \
               "$artifact"
@@ -611,6 +618,8 @@ jobs:
             key="$RUNNER_TEMP/cosign.key"
             printf '%s' "$COSIGN_PRIVATE_KEY" > "$key"
             cosign sign-blob --yes --key "$key" \
+              --new-bundle-format=false \
+              --use-signing-config=false \
               --output-signature "$sig" \
               "$artifact"
             rm -f "$key"
