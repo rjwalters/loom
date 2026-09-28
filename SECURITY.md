@@ -27,7 +27,8 @@ We will acknowledge your report within 48 hours and provide a timeline for a fix
 
 This repository uses several automated tools to detect security issues:
 
-- **Dependabot**: Automatic dependency updates for npm, Cargo, and GitHub Actions
+- **Renovate**: Scheduled dependency-version updates for npm, Cargo, and GitHub Actions, gated by a 14-day release-age quarantine
+- **Dependabot**: Security-fix PRs from vulnerability alerts (scheduled version updates are disabled in favor of Renovate)
 - **Cargo Audit**: Scans Rust dependencies for known security vulnerabilities
 - **NPM Audit**: Scans JavaScript dependencies for known security vulnerabilities
 - **CodeQL**: Static analysis to detect security issues in JavaScript/TypeScript code
@@ -61,7 +62,7 @@ When a security issue is reported:
 
 We strive to keep dependencies up-to-date and secure:
 
-- Automated weekly dependency updates via Dependabot
+- Automated weekly dependency updates via Renovate, with a 14-day quarantine before an update is proposed
 - Security patches are prioritized and merged quickly
 - Unmaintained or abandoned dependencies are replaced
 - Transitive dependencies are monitored for vulnerabilities
