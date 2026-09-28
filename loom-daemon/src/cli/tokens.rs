@@ -573,6 +573,17 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             hold,
         },
         ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
+        ForgeAction::MergeConfig {
+            repo,
+            branch,
+            method,
+            verbose,
+        } => ForgeCmd::MergeConfig {
+            repo,
+            branch,
+            method,
+            verbose,
+        },
     };
     dispatch(cmd)
 }

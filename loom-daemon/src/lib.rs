@@ -182,6 +182,7 @@ pub mod forge_disable_auto_merge;
 pub(crate) mod forge_etag_store;
 pub mod forge_events;
 pub mod forge_listing;
+pub mod forge_merge_config;
 pub mod forge_merge_method;
 pub mod forge_parser;
 pub mod gh_repo_env;

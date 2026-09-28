@@ -2609,6 +2609,37 @@ if [[ -x "$GUARD_CHECK_SCRIPT" ]]; then
     esac
 fi
 
+# ---------- forge merge-configuration check (#9287) ----------
+#
+# merge-pr.sh can only merge when the repository's allow_* merge flags and
+# every active branch ruleset's allowed_merge_methods / required_linear_history
+# leave it a usable method. That configuration lives on the forge, outside
+# anything this resync syncs, and when it is wrong every merge 405s several
+# phases downstream (#9287: this repo's own ruleset allowed only squash while
+# the repo allowed only merge commits). check-merge-config.sh reports it here.
+#
+# Advisory and READ-ONLY: it never writes a ruleset or a repo setting, always
+# exits 0, and prints nothing when there is nothing to report (a repo with no
+# ruleset sees no new output). Only its stdout -- findings and "could not
+# determine" notes -- is shown; its skip notes (no loom-daemon, an older one)
+# go to stderr and are dropped. It never affects this resync's exit code.
+#
+# Same resolution as the guard-hook check above: the installed copy first,
+# the defaults/ source on the first run after upgrading past #9287. Runs from
+# REPO_ROOT (not WRITE_ROOT, which --output may point at a preview directory)
+# so the forge repository is resolved from the real checkout.
+MERGE_CHECK_SCRIPT="$WRITE_ROOT/.loom/scripts/check-merge-config.sh"
+if [[ ! -x "$MERGE_CHECK_SCRIPT" && -x "$DEFAULTS_DIR/scripts/check-merge-config.sh" ]]; then
+    MERGE_CHECK_SCRIPT="$DEFAULTS_DIR/scripts/check-merge-config.sh"
+fi
+if [[ -x "$MERGE_CHECK_SCRIPT" ]]; then
+    merge_output="$(cd "$REPO_ROOT" && "$MERGE_CHECK_SCRIPT" 2>/dev/null)" || true
+    if [[ -n "$merge_output" ]]; then
+        printf '%b\n' "${YELLOW}[resync] Forge merge configuration (advisory, read-only -- nothing was changed):${NC}"
+        printf '%s\n' "$merge_output" | sed 's/^/    /'
+    fi
+fi
+
 # ---------- forge label drift check + safe auto-create (#6716) ----------
 #
 # .github/labels.yml is kept current by the scripts resync above, but nothing

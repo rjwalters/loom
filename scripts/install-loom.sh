@@ -2239,6 +2239,21 @@ fi
 echo ""
 
 # ============================================================================
+# STEP 5c: Verify Merge Configuration (#9287)
+# ============================================================================
+# Steps 5 and 5b configure a ruleset and the repo's merge settings
+# independently; their COMBINED effect (or a pre-existing ruleset's) can leave
+# merge-pr.sh no usable merge method, and that only surfaces as a 405 at the
+# end of a Builder -> Judge cycle. check-merge-config.sh reports it now.
+# Advisory and read-only: it never writes a ruleset or setting and always exits
+# 0; the `||` only guards against the step itself failing to run.
+CURRENT_STEP="Verify Merge Configuration"
+header "Step 5c: Verify Merge Configuration"
+( cd "$TARGET_PATH" && LOOM_DAEMON_BIN="$TARGET_DIR/release/loom-daemon" "$LOOM_ROOT/defaults/scripts/check-merge-config.sh" --verbose ) || \
+  warning "Step 5c (merge configuration check) could not run — continuing with installation"
+echo ""
+
+# ============================================================================
 # STEP 6: Create Pull Request
 # ============================================================================
 CURRENT_STEP="Create PR"
