@@ -27,6 +27,8 @@
 #   check-merge-config.sh [--repo OWNER/NAME] [--branch B] [--method M] [--verbose]
 #
 # Env: LOOM_DAEMON_BIN overrides the loom-daemon binary (default: PATH lookup).
+#
+# requires-daemon: forge optional   `forge merge-config --help` is probed first; a missing or older binary prints a stderr skip note and exits 0 (#9287)
 
 set -uo pipefail
 
