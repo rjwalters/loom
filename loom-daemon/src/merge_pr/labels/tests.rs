@@ -11,7 +11,7 @@ use super::*;
 #[test]
 fn a_clean_approval_is_not_a_contradiction() {
     assert_eq!(contradiction("loom:pr"), None);
-    assert_eq!(contradiction("loom:pr\nloom:urgent\ntier:goal-advancing"), None);
+    assert_eq!(contradiction("loom:pr\nloom:operator-priority\ntier:goal-advancing"), None);
 }
 
 #[test]
@@ -40,7 +40,11 @@ fn the_verdict_does_not_depend_on_label_order() {
     // guard that read "whichever came first" could be silently defeated by
     // relabelling — which is exactly the race (#8112) that produced the
     // contradictory state in the first place.
-    let set = ["loom:pr", "loom:changes-requested", "loom:urgent"];
+    let set = [
+        "loom:pr",
+        "loom:changes-requested",
+        "loom:operator-priority",
+    ];
     // Every permutation of three elements.
     let orders = [
         [0, 1, 2],
