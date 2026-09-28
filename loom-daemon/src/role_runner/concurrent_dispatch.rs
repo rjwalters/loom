@@ -28,6 +28,19 @@
 //! - **One refusal line per tick.** Once a tick hits the ceiling or the
 //!   budget it stops admitting and logs a single summary line naming the
 //!   limit and how many roots were deferred, instead of a WARN per root.
+//! - **Round-robin fairness.** Because a tick stops at the first refusal and
+//!   no run can finish mid-walk, a walk that always began at the head of the
+//!   registry would serve only the first `budget` roots forever. Each tick
+//!   therefore starts just after the last root admitted (wrapping), so every
+//!   root gets a turn within `ceil(roots / budget)` ticks.
+//! - **Empty queues do not spend the tick.** The queue probe is a blocking
+//!   forge listing, so it runs inside the admitted run rather than in the
+//!   synchronous walk. The roots a tick deferred are kept, and when a run
+//!   ends [`RoleTickOutcome::QueueEmpty`] (no agent was spent) the walk
+//!   resumes over them in the same interval
+//!   ([`RoleDispatcher::resume_after_queue_empty`]). Each root is decided at
+//!   most once per tick, and a run that did real work does not trigger a
+//!   resume, so the budget still bounds agent runs per interval.
 //!
 //! Finished runs are reaped on the loop's own task ([`RoleDispatcher::handle_joined`]),
 //! so the #4349 fail/recover dedup maps and the #7607 pool-exhausted feed stay
@@ -361,6 +374,19 @@ pub struct RoleDispatcher {
     no_token_pool_roots: HashMap<PathBuf, bool>,
     pool_exhausted_roots: HashMap<PathBuf, bool>,
     model_mismatch_roots: HashMap<PathBuf, bool>,
+    /// Round-robin cursor: the last root a walk admitted. The next tick
+    /// starts just after it.
+    last_admitted: Option<PathBuf>,
+    /// `last_admitted`'s registry index. When that root has left the list,
+    /// the root that followed it has slid into this index, so the next tick
+    /// starts here.
+    last_admitted_index: usize,
+    /// Roots the current tick has not decided yet (deferred by a limit), in
+    /// walk order with their registry index.
+    pending: VecDeque<(usize, PathBuf)>,
+    /// A run returned `QueueEmpty` since the last walk, so the `pending`
+    /// roots may be resumed.
+    resume_requested: bool,
 }
 
 impl RoleDispatcher {
@@ -407,6 +433,10 @@ impl RoleDispatcher {
             no_token_pool_roots: HashMap::new(),
             pool_exhausted_roots: HashMap::new(),
             model_mismatch_roots: HashMap::new(),
+            last_admitted: None,
+            last_admitted_index: 0,
+            pending: VecDeque::new(),
+            resume_requested: false,
         }
     }
 
@@ -422,21 +452,78 @@ impl RoleDispatcher {
         self.failing_roots.get(root).copied().unwrap_or(false)
     }
 
-    /// Decide every root and spawn each admitted run without waiting for it.
-    /// Must be called inside a tokio runtime.
+    /// Decide every root and spawn each admitted run without waiting for it,
+    /// starting just after the last root admitted (round-robin). Must be
+    /// called inside a tokio runtime.
     pub fn dispatch_tick(
         &mut self,
         roots: Vec<PathBuf>,
         in_progress: &InProgressGuard,
     ) -> TickReport {
+        let start = self.rotation_start(&roots);
+        let mut order: VecDeque<(usize, PathBuf)> = roots.into_iter().enumerate().collect();
+        order.rotate_left(start);
+        // A new tick replaces whatever the previous one left undecided.
+        self.resume_requested = false;
+        let report = self.walk(order, in_progress);
+        if let Some(refusal) = report.refusal {
+            log::warn!("{}", refusal_summary_line(self.spec.name, refusal, report.deferred));
+        }
+        report
+    }
+
+    /// Resume this tick's deferred roots after a run returned
+    /// [`RoleTickOutcome::QueueEmpty`], so an empty queue does not use up the
+    /// tick's budget. `None` when no resume is due. Must be called inside a
+    /// tokio runtime.
+    pub fn resume_after_queue_empty(
+        &mut self,
+        in_progress: &InProgressGuard,
+    ) -> Option<TickReport> {
+        if !std::mem::take(&mut self.resume_requested) || self.pending.is_empty() {
+            return None;
+        }
+        let order = std::mem::take(&mut self.pending);
+        let report = self.walk(order, in_progress);
+        if let Some(refusal) = report.refusal {
+            // The tick already logged its WARN summary; a resume that stops
+            // again is the same condition, so keep it at DEBUG.
+            log::debug!(
+                "{} (resumed after an empty queue)",
+                refusal_summary_line(self.spec.name, refusal, report.deferred)
+            );
+        }
+        Some(report)
+    }
+
+    /// Whether a finished `QueueEmpty` run has made a resume due.
+    #[must_use]
+    pub fn resume_due(&self) -> bool {
+        self.resume_requested && !self.pending.is_empty()
+    }
+
+    /// Index of the first root of this tick's walk: just after the last root
+    /// admitted, or its old index if that root left the list.
+    fn rotation_start(&self, roots: &[PathBuf]) -> usize {
+        if roots.is_empty() {
+            return 0;
+        }
+        self.last_admitted
+            .as_ref()
+            .and_then(|last| roots.iter().position(|r| r == last))
+            .map_or(self.last_admitted_index, |i| i + 1)
+            % roots.len()
+    }
+
+    /// Decide `order` front to back, stopping at the first limit refusal.
+    /// The refused root and every root after it are kept in `pending`.
+    fn walk(
+        &mut self,
+        mut order: VecDeque<(usize, PathBuf)>,
+        in_progress: &InProgressGuard,
+    ) -> TickReport {
         let mut report = TickReport::default();
-        for root in roots {
-            if report.refusal.is_some() {
-                // The limit is host-wide: every later root would be refused
-                // for the same reason, so stop deciding for this tick.
-                report.deferred += 1;
-                continue;
-            }
+        while let Some((index, root)) = order.pop_front() {
             // #6201 AC2: a panic in the synchronous decision must skip only
             // this root, never end the loop. `AssertUnwindSafe` is sound: the
             // captured state is log-dedup bookkeeping, at worst one tick stale.
@@ -458,19 +545,24 @@ impl RoleDispatcher {
             match decision {
                 RootTickDecision::Admit { prompt, guard } => {
                     self.spawn(root.clone(), prompt, guard);
+                    self.last_admitted = Some(root.clone());
+                    self.last_admitted_index = index;
                     report.spawned.push(root);
                 }
                 RootTickDecision::Skip => {}
                 RootTickDecision::InProgress => report.in_progress.push(root),
                 RootTickDecision::Refused(refusal) => {
+                    // The limit is host-wide: every later root would be
+                    // refused for the same reason, so stop deciding and keep
+                    // the rest for a resume or the next tick's rotation.
                     report.refusal = Some(refusal);
-                    report.deferred += 1;
+                    order.push_front((index, root));
+                    break;
                 }
             }
         }
-        if let Some(refusal) = report.refusal {
-            log::warn!("{}", refusal_summary_line(self.spec.name, refusal, report.deferred));
-        }
+        report.deferred = order.len();
+        self.pending = order;
         report
     }
 
@@ -523,6 +615,11 @@ impl RoleDispatcher {
         match joined {
             Ok((id, run)) => {
                 self.running.remove(&id);
+                if matches!(run.outcome, RoleTickOutcome::QueueEmpty) {
+                    // No agent was spent, so the slot it held may go to a
+                    // root this tick deferred.
+                    self.resume_requested = true;
+                }
                 feed_pool_exhausted_observer(
                     self.observer.as_deref(),
                     &run.outcome,

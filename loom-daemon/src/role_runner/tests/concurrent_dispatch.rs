@@ -743,3 +743,165 @@ fn ac8_a_role_budget_refusal_logs_one_line_per_tick() {
     assert_eq!(lines.len(), 1, "one aggregated line: {records:?}");
     assert!(lines[0].1.contains("roleMaxConcurrent"), "{}", lines[0].1);
 }
+
+// -- Fairness: round-robin cursor and empty-queue resume -----------------------
+
+/// Drive `ticks` ticks of `role` over `roots` fresh workspaces written with
+/// `config`, runs finishing instantly and joined between ticks (as the loop's
+/// `select!` would reap them). Returns how many runs each root got.
+fn spawns_per_root(config: &str, roots: usize, ticks: usize) -> Vec<usize> {
+    let rt = runtime();
+    let _enter = rt.enter();
+    let dirs: Vec<tempfile::TempDir> = (0..roots).map(|_| workspace(config)).collect();
+    let paths: Vec<PathBuf> = dirs.iter().map(|t| t.path().to_path_buf()).collect();
+    let factory: RunnerFactory = Arc::new(|_| {
+        Box::new(FixedRunner(RoleTickOutcome::Success, Arc::new(AtomicUsize::new(0))))
+    });
+    let mut d = dispatcher("judge", factory, admit_only("judge"));
+    let in_progress = new_in_progress_guard();
+    let mut counts = vec![0usize; roots];
+    for _ in 0..ticks {
+        let report = d.dispatch_tick(paths.clone(), &in_progress);
+        for root in &report.spawned {
+            counts[paths.iter().position(|p| p == root).unwrap()] += 1;
+        }
+        while d.in_flight_len() > 0 {
+            let _ = join_one(&rt, &mut d);
+        }
+    }
+    counts
+}
+
+fn assert_fair(counts: &[usize], label: &str) {
+    let (min, max) = (counts.iter().min().unwrap(), counts.iter().max().unwrap());
+    assert!(*min >= 1, "{label}: every root must get a run, got {counts:?}");
+    assert!(max - min <= 1, "{label}: runs must rotate evenly, got {counts:?}");
+}
+
+/// The Judge's repro on 98e313a7e: 4 roots, `roleMaxConcurrent.judge = 1`,
+/// instant runs, 6 ticks gave `[6, 0, 0, 0]`. With the cursor every root runs
+/// within `ceil(4 / 1) = 4` ticks and 6 ticks split `[2, 2, 1, 1]`.
+#[test]
+fn fairness_role_budget_rotates_through_every_root() {
+    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1}}}}"#;
+    assert_fair(&spawns_per_root(cfg, 4, 4), "budget 1, 4 ticks");
+    assert_eq!(spawns_per_root(cfg, 4, 6), vec![2, 2, 1, 1], "budget 1, 6 ticks");
+    // Budget 2 over 5 roots: ceil(5 / 2) = 3 ticks reach everyone.
+    let cfg2 = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":2}}}}"#;
+    assert_fair(&spawns_per_root(cfg2, 5, 3), "budget 2, 3 ticks");
+}
+
+/// The same rotation when the host ceiling (`maxConcurrent`) is what refuses.
+#[test]
+fn fairness_host_ceiling_rotates_through_every_root() {
+    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"maxConcurrent":1}}}"#;
+    assert_fair(&spawns_per_root(cfg, 4, 4), "ceiling 1, 4 ticks");
+    assert_eq!(spawns_per_root(cfg, 4, 6), vec![2, 2, 1, 1], "ceiling 1, 6 ticks");
+}
+
+/// While the admitted run is still going, the next tick's walk starts just
+/// after it, so the refusal falls on the root whose turn is next, and that
+/// root is admitted first once the slot frees. If the cursor root leaves the
+/// registry, the walk keeps its position rather than jumping to the head.
+#[test]
+fn fairness_cursor_survives_long_runs_and_registry_changes() {
+    let rt = runtime();
+    let _enter = rt.enter();
+    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1}}}}"#;
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| workspace(cfg)).collect();
+    let p: Vec<PathBuf> = dirs.iter().map(|t| t.path().to_path_buf()).collect();
+    let gate = Gate::default();
+    let mut d =
+        dispatcher("judge", gated_factory(vec![p[0].clone()], gate.clone()), admit_only("judge"));
+    let in_progress = new_in_progress_guard();
+
+    assert_eq!(d.dispatch_tick(p.clone(), &in_progress).spawned, vec![p[0].clone()]);
+    let blocked = d.dispatch_tick(p.clone(), &in_progress);
+    assert!(blocked.spawned.is_empty(), "the budget is held by root 0");
+    assert_eq!(blocked.deferred, 4, "walk began at root 1 and wrapped");
+    gate.open();
+    let _ = join_one(&rt, &mut d);
+    assert_eq!(d.dispatch_tick(p.clone(), &in_progress).spawned, vec![p[1].clone()]);
+    let _ = join_one(&rt, &mut d);
+
+    // Root 1 (the cursor) is removed: the walk goes on with the root that
+    // followed it, not back to the head.
+    let shrunk = vec![p[0].clone(), p[2].clone(), p[3].clone()];
+    assert_eq!(d.dispatch_tick(shrunk, &in_progress).spawned, vec![p[2].clone()]);
+    let _ = join_one(&rt, &mut d);
+}
+
+/// Recommended fix: a root whose queue is empty, sitting at the cursor, must
+/// not use up the tick. Its run returns `QueueEmpty` without spawning an
+/// agent, and the reap resumes the walk so the root with work is admitted in
+/// the same tick — before any second `dispatch_tick`.
+#[test]
+#[serial(role_tick_ring)]
+fn fairness_an_empty_queue_at_the_cursor_does_not_block_a_root_with_work() {
+    let rt = runtime();
+    let _enter = rt.enter();
+    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1}}}}"#;
+    let (empty, full) = (workspace(cfg), workspace(cfg));
+    let empty_path = empty.path().to_path_buf();
+    let probe: QueueProbe = {
+        let empty_path = empty_path.clone();
+        Arc::new(move |root, _| Ok(root != empty_path.as_path()))
+    };
+    let invoked = Arc::new(AtomicUsize::new(0));
+    let factory: RunnerFactory = {
+        let invoked = Arc::clone(&invoked);
+        Arc::new(move |_| Box::new(FixedRunner(RoleTickOutcome::Success, Arc::clone(&invoked))))
+    };
+    let mut d = RoleDispatcher::with_decide(
+        spec("judge"),
+        Duration::from_secs(300),
+        factory,
+        probe,
+        None,
+        admit_only("judge"),
+    );
+    let in_progress = new_in_progress_guard();
+    let roots = vec![empty_path.clone(), full.path().to_path_buf()];
+
+    let tick = d.dispatch_tick(roots, &in_progress);
+    assert_eq!(tick.spawned, vec![empty_path.clone()], "the empty root holds the cursor");
+    assert_eq!(tick.deferred, 1, "the root with work is deferred by the budget");
+    assert!(!d.resume_due(), "nothing has finished yet");
+
+    let joined = join_one(&rt, &mut d);
+    assert_eq!(joined.as_ref().unwrap().1.outcome, RoleTickOutcome::QueueEmpty);
+    d.handle_joined(joined);
+    assert!(d.resume_due(), "a QueueEmpty reap makes the deferred roots resumable");
+    let resumed = d
+        .resume_after_queue_empty(&in_progress)
+        .expect("resume ran");
+    assert_eq!(resumed.spawned, vec![full.path().to_path_buf()], "admitted in the same tick");
+    let (_, run) = join_one(&rt, &mut d).unwrap();
+    assert_eq!(run.outcome, RoleTickOutcome::Success);
+    assert_eq!(invoked.load(Ordering::SeqCst), 1, "only the root with work spawned an agent");
+    assert!(d.resume_after_queue_empty(&in_progress).is_none(), "each root once per tick");
+}
+
+/// A run that did real work does not resume the walk: the budget still bounds
+/// agent runs per interval, and a new tick discards what the last one left.
+#[test]
+#[serial(role_tick_ring)]
+fn fairness_a_real_run_does_not_resume_and_a_new_tick_replaces_pending() {
+    let rt = runtime();
+    let _enter = rt.enter();
+    let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"roleMaxConcurrent":{"judge":1}}}}"#;
+    let (a, b) = (workspace(cfg), workspace(cfg));
+    let factory: RunnerFactory = Arc::new(|_| {
+        Box::new(FixedRunner(RoleTickOutcome::Success, Arc::new(AtomicUsize::new(0))))
+    });
+    let mut d = dispatcher("judge", factory, admit_only("judge"));
+    let in_progress = new_in_progress_guard();
+    let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+    assert_eq!(d.dispatch_tick(roots.clone(), &in_progress).deferred, 1);
+    let joined = join_one(&rt, &mut d);
+    d.handle_joined(joined);
+    assert!(!d.resume_due(), "a Success run spent an agent — no resume");
+    assert!(d.resume_after_queue_empty(&in_progress).is_none());
+    assert_eq!(d.dispatch_tick(roots, &in_progress).spawned, vec![b.path().to_path_buf()]);
+    let _ = join_one(&rt, &mut d);
+}

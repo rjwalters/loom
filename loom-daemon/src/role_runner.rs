@@ -3341,6 +3341,15 @@ pub fn spawn_multi_role_task(
                     if let Some(joined) = joined {
                         dispatcher.handle_joined(joined);
                     }
+                    // A run that found its queue empty spent no agent: give
+                    // its slot to a root this tick deferred (#9391), unless
+                    // a drain or the rate-limit cooldown now holds dispatch.
+                    if dispatcher.resume_due()
+                        && !drain.load(std::sync::atomic::Ordering::Relaxed)
+                        && !crate::rate_limit_breaker::global_is_suppressed()
+                    {
+                        let _report = dispatcher.resume_after_queue_empty(&in_progress);
+                    }
                     continue;
                 }
                 _ = ticker.tick() => {}

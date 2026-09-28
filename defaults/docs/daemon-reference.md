@@ -3665,7 +3665,18 @@ repository is now the parallelism boundary:
   slot. The default is `max(1, ceiling / 2)` — **3** at the default ceiling of
   7 — clamped to the ceiling. Idle-edge runs count against the same budget. A
   budget refusal is reported the same way as a ceiling refusal: one line per
-  tick naming `roleMaxConcurrent`.
+  tick naming `roleMaxConcurrent`. Like `maxConcurrent`, `roleMaxConcurrent`
+  is read from the config of the root being admitted but counts that role's
+  runs host-wide, so if roots configure different values, each root's own
+  value governs its own admission.
+- **Round-robin across repositories.** A tick stops at the first refusal, and
+  no run can finish while the tick is walking the roots. So a walk that always
+  began at the head of the registry would serve only the first `budget` roots
+  and starve the rest. Instead, each tick starts just after the last root it
+  admitted and wraps around. With a budget of `B` over `N` roots, every root
+  gets a turn within `ceil(N / B)` ticks. If the last-admitted root is removed
+  from the registry, the walk continues from the root that followed it rather
+  than going back to the head.
 - **Queue-gated roles.** `judge` is dispatched to a repository only when its
   `loom:review-requested` queue is non-empty, and `doctor` only when its
   `loom:changes-requested` queue is. The check uses the ETag-cached forge
@@ -3673,6 +3684,13 @@ repository is now the parallelism boundary:
   before any agent is spawned, and records the non-failure outcome
   `QueueEmpty` (`skipped_queue_empty` in `role_tick.outcome`). A listing
   **error fails open**: the role is dispatched as if the queue had work.
+  **An empty queue does not use up the tick.** When a run ends `QueueEmpty`,
+  it spent no agent. On that reap, the walk resumes over the roots this tick
+  deferred, so a host where only one late repository has PRs still reviews
+  them in the same interval. Each root is decided at most once per tick. A run
+  that did real work never triggers a resume, so the budget still bounds agent
+  runs per interval. A drain or the rate-limit cooldown suppresses the resume
+  just as it suppresses a tick.
   Every other role is ungated — champion also promotes `loom:curated` issues
   and curator works unlabeled issues, so a single-label gate would starve part
   of their work; the per-role budget bounds them instead. Idle-edge roles
