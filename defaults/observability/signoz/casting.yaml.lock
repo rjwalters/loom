@@ -333,6 +333,14 @@ spec:
   patches:
   - operations:
     - op: test
+      path: /metric_log/ttl
+      value: event_date + INTERVAL 1 DAY DELETE
+    - op: add
+      path: /metric_log/schema_type
+      value: transposed_with_wide_view
+    target: deployment/telemetrystore/clickhouse/config-0-0.yaml
+  - operations:
+    - op: test
       path: /services/loom-signoz-signoz-0/environment/2
       value: SIGNOZ_SQLSTORE_POSTGRES_DSN=postgres://signoz:$%7BSIGNOZ_POSTGRES_PASSWORD%3A%3Fset%20a%20private%20database%20password%7D@loom-signoz-metastore-postgres-0:5432/signoz?sslmode=disable
     - op: replace

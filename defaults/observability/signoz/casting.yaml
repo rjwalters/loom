@@ -42,6 +42,20 @@ spec:
       env:
         POSTGRES_PASSWORD: "${SIGNOZ_POSTGRES_PASSWORD:?set a private database password}"
   patches:
+    # ClickHouse's own system.metric_log is 1,552 columns wide by default, and a
+    # merge's memory scales with input parts x columns, not rows: under the 2 GiB
+    # cap below, the merge that applies its 1-day TTL failed tens of thousands of
+    # times on a 2.5-day live soak, so the table stopped expiring. The transposed
+    # schema (6 columns, with system.metric_log kept as a compatible view) merges
+    # the same shape at a fraction of the memory. See evidence.md, 2026-09-28.
+    - target: deployment/telemetrystore/clickhouse/config-0-0.yaml
+      operations:
+        - op: test
+          path: /metric_log/ttl
+          value: event_date + INTERVAL 1 DAY DELETE
+        - op: add
+          path: /metric_log/schema_type
+          value: transposed_with_wide_view
     - target: deployment/compose.yaml
       operations:
         # Foundry URL-escapes userinfo, including Compose placeholders. Keep the
