@@ -555,6 +555,14 @@ pub(crate) enum MergePrCommand {
     /// to post. Exit 0 with the route, 2 = stdin unreadable — see
     /// `cli::merge_pr_reconcile`.
     ReconcileChild(super::merge_pr_reconcile::ReconcileChildArgs),
+
+    /// The #6694/#6264 remove-vs-preserve decision for post-merge worktree
+    /// cleanup, shared across the three call sites (the Loom-convention path,
+    /// the porcelain discovery fallback, and a co-existing Judge/Doctor review
+    /// worktree) that used to run it identically three times. Always exits 0
+    /// with `REMOVE`/`PRESERVE` plus `LEVEL<TAB>message` lines to replay — see
+    /// `cli::merge_pr_worktree_preserve`.
+    WorktreePreserve(super::merge_pr_worktree_preserve::WorktreePreserveArgs),
 }
 
 impl MergePrCommand {
@@ -583,6 +591,7 @@ impl MergePrCommand {
             MergePrCommand::ReconcilePlan(args) => args.run(),
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::ChecksFailure(args) => args.run(),
+            MergePrCommand::WorktreePreserve(args) => args.run(),
         }
     }
 }

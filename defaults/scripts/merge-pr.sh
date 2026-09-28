@@ -2935,6 +2935,44 @@ _issue_is_closed_for_cleanup() {
   return 1
 }
 
+# _worktree_cleanup_decide <kind: default|discovered|judge-pr> <path>
+#
+# The #6694/#6264 remove-vs-preserve decision, now shared verbatim across
+# worktree cleanup's three call sites (the Loom-convention path, the porcelain
+# discovery fallback, and a co-existing Judge/Doctor review worktree) instead
+# of tripled: `loom-daemon merge-pr worktree-preserve` (Rust,
+# loom-daemon/src/merge_pr/worktree_preserve.rs — #8191 slice). Only the two
+# already-run checks it needs (_issue_is_closed_for_cleanup, immediately
+# above, and the shared branch_has_landed primitive, #7812) and the
+# _remove_loom_worktree mutation stay here — the two-input decision plus its
+# message text moved. Fails toward PRESERVE on any guard fault (missing/older
+# daemon, an unrecognized first line) — the same fail-unsafe-to-preserve
+# direction _issue_is_closed_for_cleanup already takes just above, because a
+# guessed REMOVE risks the #5031 worktree data-loss class this whole pass
+# exists to avoid, while a skipped cleanup is always recoverable later.
+_worktree_cleanup_decide() {
+  local kind="$1" path="$2" flags=()
+  if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
+    flags+=(--preserve-check)
+    ! branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA" || flags+=(--landed)
+  fi
+  local out rc=0
+  out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr worktree-preserve --kind "$kind" --path "$path" --repo-root "$REPO_ROOT" --pr "$PR_NUMBER" --branch "$PR_BRANCH" --issue-num "${ISSUE_NUM:-}" "${flags[@]+"${flags[@]}"}" --landed-verdict "${BRANCH_LANDED_VERDICT:-}" --landed-evidence "${BRANCH_LANDED_EVIDENCE:-}" 2>/dev/null)" || rc=$?
+  local action="${out%%$'\n'*}"
+  if [[ $rc -ne 0 || ( "$action" != "REMOVE" && "$action" != "PRESERVE" ) ]]; then
+    warning "Worktree cleanup's #6694/#6264 remove-vs-preserve decision for $path did not run — 'loom-daemon merge-pr worktree-preserve' exited $rc without a recognized verdict (a loom-daemon predating #8191's slice has no such verb). Preserving rather than guessing REMOVE: a skipped cleanup is always recoverable (loom-clean, the daemon's reaper, or a future merge), an incorrectly removed worktree is not. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+    return 0
+  fi
+  local lines="" level text
+  [[ "$out" != *$'\n'* ]] || lines="${out#*$'\n'}"
+  while IFS=$'\t' read -r level text; do
+    [[ -n "$level" ]] || continue
+    case "$level" in WARNING) warning "$text" ;; *) info "$text" ;; esac
+  done <<< "$lines"
+  [[ "$action" == "REMOVE" ]] && _remove_loom_worktree "$path"
+  return 0
+}
+
 if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
   if [[ "${LOOM_PRESERVE_WORKTREE:-0}" == "1" ]]; then
     info "Worktree cleanup skipped (LOOM_PRESERVE_WORKTREE=1) — local branch left in place"
@@ -2972,28 +3010,9 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
       # Close-target-aware gate (#4186): ISSUE_NUM is only set when
       # PR_BRANCH matched the feature/issue-<N> convention above. When it's
       # unset (the pr-<N> path) this check is skipped entirely — unchanged
-      # behavior.
-      if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
-        # #6694: the issue-close gate above says "preserve", but that is only
-        # correct while the worktree/branch might still be needed. When the
-        # branch has already LANDED (#7812 — forge PR state, tree equality,
-        # or ancestry), every change on it made it into the default branch —
-        # the worktree holds nothing unmerged regardless of whether the ISSUE
-        # itself ever closes. Without this
-        # check, a programme issue intentionally designed to accumulate
-        # `Part of #N` increments forever (every merge non-closing by
-        # design) would preserve this worktree/branch indefinitely, since
-        # _issue_is_closed_for_cleanup never flips true for it.
-        if branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA"; then
-          info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' has already landed (${BRANCH_LANDED_EVIDENCE}) — its content is already on the default branch, so the worktree holds nothing unmerged; removing it (#6694)"
-          _remove_loom_worktree "$DEFAULT_WT_PATH"
-        else
-          warning "Preserving worktree at $DEFAULT_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' has not landed (${BRANCH_LANDED_VERDICT}/${BRANCH_LANDED_EVIDENCE}) — it carries content the default branch does not have"
-          info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$DEFAULT_WT_PATH\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
-        fi
-      else
-        _remove_loom_worktree "$DEFAULT_WT_PATH"
-      fi
+      # behavior. See _worktree_cleanup_decide above for the #6694 landed-
+      # branch override this now shares with the two call sites below.
+      _worktree_cleanup_decide default "$DEFAULT_WT_PATH"
     else
       # Discovery fallback (warn-only): the Loom-convention path is missing,
       # so walk porcelain looking for any worktree tracking $PR_BRANCH. We
@@ -3014,23 +3033,10 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
         elif [[ -f "$DISCOVERED_WT/.loom-managed" ]]; then
           # Rare case: Loom-managed worktree at a non-standard path. The
           # sentinel says it's safe to remove — unless the close-target-aware
-          # gate (#4186) says preserve.
-          if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
-            # #6694: see the matching comment at the default-path call site
-            # above — reuse the landed check so a never-closing programme
-            # issue does not preserve this non-standard-path worktree forever
-            # either.
-            if branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA"; then
-              info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' has already landed (${BRANCH_LANDED_EVIDENCE}) — its content is already on the default branch, so the discovered worktree holds nothing unmerged; removing it (#6694)"
-              _remove_loom_worktree "$DISCOVERED_WT"
-            else
-              warning "Preserving discovered worktree at $DISCOVERED_WT — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' has not landed (${BRANCH_LANDED_VERDICT}/${BRANCH_LANDED_EVIDENCE}) — it carries content the default branch does not have"
-              info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$DISCOVERED_WT\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
-            fi
-          else
-            info "Discovered Loom-managed worktree at non-standard path: $DISCOVERED_WT"
-            _remove_loom_worktree "$DISCOVERED_WT"
-          fi
+          # gate (#4186), or the #6694 landed-branch override
+          # _worktree_cleanup_decide shares with the default-path call site
+          # above, says preserve.
+          _worktree_cleanup_decide discovered "$DISCOVERED_WT"
         else
           warning "Discovered worktree for branch '$PR_BRANCH' at: $DISCOVERED_WT"
           warning "Worktree lacks .loom-managed sentinel — not removing (user-owned)."
@@ -3059,22 +3065,9 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
     # (loom-daemon's #5939 periodic backstop) own PR-number+path keyed
     # eligibility, which is likewise branch-state-independent.
     if [[ -n "$JUDGE_PR_WT_PATH" ]] && [[ -d "$JUDGE_PR_WT_PATH" ]]; then
-      if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
-        # #6694: see the matching comment at the default-path call site
-        # above — reuse the landed check so a never-closing programme issue
-        # does not preserve this Judge/Doctor review worktree forever
-        # either.
-        if branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA"; then
-          info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' has already landed (${BRANCH_LANDED_EVIDENCE}) — its content is already on the default branch, so the Judge/Doctor review worktree holds nothing unmerged; removing it (#6694)"
-          _remove_loom_worktree "$JUDGE_PR_WT_PATH"
-        else
-          warning "Preserving Judge/Doctor review worktree at $JUDGE_PR_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' has not landed (${BRANCH_LANDED_VERDICT}/${BRANCH_LANDED_EVIDENCE}) — it carries content the default branch does not have"
-          info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$JUDGE_PR_WT_PATH\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
-        fi
-      else
-        info "Found co-existing Judge/Doctor review worktree at $JUDGE_PR_WT_PATH (PR #$PR_NUMBER, alongside issue-$ISSUE_NUM handling above) — removing (#6264)"
-        _remove_loom_worktree "$JUDGE_PR_WT_PATH"
-      fi
+      # See the matching comment at the default-path call site above — the
+      # same #4186/#6694 decision, shared via _worktree_cleanup_decide.
+      _worktree_cleanup_decide judge-pr "$JUDGE_PR_WT_PATH"
     fi
     # Local-branch delete (#4100): the default-convention path, the
     # discovered-Loom-managed-non-standard-path, and the no-worktree-at-all

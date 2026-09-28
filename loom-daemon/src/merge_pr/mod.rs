@@ -192,6 +192,15 @@
 //! `feature/issue-<N>` predicate, which the shell wrote out twice 90 lines apart
 //! against two different variables, and owns the deferral comment's byte-frozen
 //! text.
+//!
+//! [`worktree_preserve`] is the #6694/#6264 remove-vs-preserve rule
+//! `merge-pr.sh`'s post-merge cleanup ran identically at THREE call sites —
+//! the Loom-convention path, the porcelain discovery fallback, and the
+//! co-existing Judge/Doctor review worktree — differing only in which noun and
+//! path variable appeared in the messages. [`issue_close_gate`]'s verdict and
+//! `branch_has_landed`'s verdict (#7812) are both already answered by the
+//! caller and passed in; this module owns only the two-input decision and its
+//! byte-frozen message text, consolidating three copies into one.
 
 pub mod checks_failure;
 pub mod closed_building;
@@ -211,5 +220,6 @@ pub mod response;
 pub mod stacked_children;
 pub mod stale_checks;
 pub mod version_policy;
+pub mod worktree_preserve;
 pub mod worktrees;
 pub mod zero_checks;
