@@ -175,6 +175,17 @@ pub(crate) enum ScriptPortCommand {
     /// Exit 0 always; one line, four tokens.
     WorktreeStaleRef(super::worktree_stale_ref::WorktreeStaleRefArgs),
 
+    /// `worktree.sh`'s CLOSED-UNMERGED arm (#9083): the third state a pushed
+    /// `origin/feature/issue-N` can be in, next to the open-PR (#4823/#7765)
+    /// and merged-PR (#5657) arms that already had answers. A tip that is the
+    /// head of a PR closed WITHOUT merging carries work somebody decided not
+    /// to take, and reusing it silently seeded a worktree with a reverted
+    /// slice plus a rejected follow-up, tens of commits behind `main` (the
+    /// #8195 incident). Exit 0 = proceed and reuse as before, 1 = refuse; every
+    /// inability to decide is 0, because a forge outage must never block
+    /// worktree creation.
+    WorktreeClosedPrBranch(super::worktree_closed_pr_branch::WorktreeClosedPrBranchArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -356,6 +367,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeSubmodules(args) => args.run(),
             ScriptPortCommand::WorktreeUpstream(args) => args.run(),
             ScriptPortCommand::WorktreeStaleRef(args) => args.run(),
+            ScriptPortCommand::WorktreeClosedPrBranch(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),

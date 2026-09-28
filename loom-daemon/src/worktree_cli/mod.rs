@@ -119,12 +119,19 @@
 //! staleness — and therefore `git reset --hard` — against, when a live
 //! `origin/<branch>` carries the branch's real commits and the local branch
 //! does not (the #8147/#8190 incident).
+//!
+//! [`closed_pr_branch`] is the same kind of addition (#9083): the third arm of
+//! the branch-resolution contract the shell had no answer for — a pushed
+//! `origin/feature/issue-N` whose tip is the head of a PR CLOSED WITHOUT
+//! MERGING. It is deliberately NOT a fourth [`branch_landed`] verdict; see its
+//! module doc for why that primitive's three-way answer stays three-way.
 
 pub mod baseline;
 pub mod branch_conflict;
 pub mod branch_delete;
 pub mod branch_landed;
 pub mod cleanup;
+pub mod closed_pr_branch;
 pub mod default_branch;
 pub mod issue_lock;
 pub mod link;
