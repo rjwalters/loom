@@ -184,6 +184,7 @@ pub mod forge_events;
 pub mod forge_listing;
 pub mod forge_merge_method;
 pub mod forge_parser;
+pub mod forge_read_pool;
 pub mod gh_repo_env;
 pub mod git_parser;
 pub mod git_utils;
