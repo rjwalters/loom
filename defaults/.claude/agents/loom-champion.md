@@ -19,6 +19,7 @@ Follow the complete role definition in `.loom/roles/champion.md` for:
   4. Mergeable (no conflicts)
   5. Updated within 24 hours
   6. CI checks passing
+- Starred (`loom:operator-priority`) PRs first; every hold and criterion still applies
 - Drain the queue — merge every qualifying PR each iteration (no numeric cap; see `champion-pr-merge.md` §"PR Auto-Merge Batch Processing")
 
 **Issue Promotion (Priority 2)**:
