@@ -4,9 +4,11 @@
 //! backoff-skip, 2 deferred-capacity"); these rows say *which* issue got
 //! *which* outcome, in the order the work finder actually ranks them. The
 //! order is the daemon's own dispatch comparator,
-//! `crate::work_finder::candidate_cmp`: workspace priority, then `loom:urgent`,
-//! then oldest `createdAt`, then issue number. `tier:*` labels are carried
-//! as information only; they do not affect dispatch order.
+//! `crate::work_finder::candidate_cmp` (#9244): `loom:operator-priority`
+//! (starred) first, starred issues by starred-at, then red-main fixes (only
+//! while that repo's `main` is verified red), then workspace priority, then
+//! oldest `createdAt`, then issue number. `loom:urgent` and `tier:*` labels
+//! do not affect dispatch order.
 
 use serde::{Deserialize, Serialize};
 
@@ -210,8 +212,20 @@ pub struct ReadyQueueRow {
     pub issue: u32,
     /// The owning workspace's priority tier (lower dispatches first).
     pub workspace_priority: u32,
-    /// Whether the issue carries `loom:urgent`.
+    /// Deprecated (#9244): always `false`. `loom:urgent` no longer affects
+    /// dispatch order; the field stays on the wire for one release.
     pub urgent: bool,
+    /// Whether the issue is starred (`loom:operator-priority`, #9244).
+    #[serde(default)]
+    pub operator_priority: bool,
+    /// When it was starred, when known (#9244). Absent for an unstarred
+    /// issue, or a starred one ordered by its `createdAt` fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_priority_at: Option<String>,
+    /// Whether it is a red-main fix boosted this tick: it carries
+    /// `<!-- loom:main-red-fix -->` and its repo's `main` is verified red.
+    #[serde(default)]
+    pub main_red_fix: bool,
     /// The issue's `createdAt`, when the listing supplied it.
     #[serde(default)]
     pub created_at: Option<String>,

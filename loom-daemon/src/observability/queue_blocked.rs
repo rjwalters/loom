@@ -63,10 +63,13 @@ pub fn blocked_rows(repo: &QueueRepoRef, listing: &[RestIssue]) -> Vec<QueueSnap
                 visibility: repo.visibility,
                 issue: item.number,
                 workspace_priority: crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY,
-                urgent: item
+                // Deprecated by #9244: always false on the wire.
+                urgent: false,
+                operator_priority: item
                     .labels
                     .iter()
-                    .any(|l| l == crate::work_finder::URGENT_LABEL),
+                    .any(|l| l == crate::work_finder::OPERATOR_PRIORITY_LABEL),
+                operator_priority_at: None,
                 created_at: item.created_at.clone(),
                 tier: item.labels.iter().find(|l| l.starts_with("tier:")).cloned(),
                 disposition,

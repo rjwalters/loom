@@ -57,7 +57,12 @@ export interface QueueRow {
   visibility: RepoVisibility;
   issue?: number;
   workspace_priority?: number;
+  /** Deprecated (#9244): always false from a current daemon. */
   urgent: boolean;
+  /** Starred (`loom:operator-priority`, #9244). Absent when not starred. */
+  operator_priority?: boolean;
+  /** When it was starred, when the daemon knows. */
+  operator_priority_at?: string;
   created_at?: string;
   tier?: string;
   disposition: string;
@@ -136,6 +141,8 @@ function normalizeRow(value: unknown): QueueRow | undefined {
     issue: optCount(value.issue),
     workspace_priority: optCount(value.workspace_priority),
     urgent: value.urgent === true,
+    operator_priority: value.operator_priority === true ? true : undefined,
+    operator_priority_at: str(value.operator_priority_at),
     created_at: str(value.created_at),
     tier: str(value.tier),
     disposition: str(value.disposition) ?? "unknown",
@@ -223,6 +230,7 @@ export function redactQueueRow(row: QueueRow): QueueRow {
     rank: row.rank,
     visibility: "private",
     urgent: row.urgent,
+    operator_priority: row.operator_priority,
     disposition: row.disposition,
     state: row.state,
     reason: row.reason,

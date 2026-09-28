@@ -97,7 +97,7 @@ pub(crate) fn queue_json(report: &DaemonStatusReport, now: DateTime<Utc>) -> ser
         // Non-empty => the queue is incomplete: these repos' backlogs are missing.
         "listing_failed": tick.map(|t| t.listing_failed.as_slice()).unwrap_or_default(),
         "complete": tick.is_some_and(|t| t.listing_failed.is_empty()),
-        "ordering": "workspace_priority asc, loom:urgent first, created_at oldest first, issue number",
+        "ordering": "loom:operator-priority first (by starred-at, else created_at), red-main fix first (only while main is verified red), workspace_priority asc, created_at oldest first, issue number",
         "queue": tick.map(|t| t.queue.as_slice()).unwrap_or_default(),
     })
 }
@@ -122,7 +122,7 @@ pub(crate) fn render_queue(report: &DaemonStatusReport, now: DateTime<Utc>) -> S
         tick.reason_summary()
     ));
     out.push_str(
-        "Order: workspace priority, then loom:urgent, then oldest first (tier:* labels do not affect order)\n",
+        "Order: starred (loom:operator-priority, by starred-at) first, then red-main fixes while main is red, then workspace priority, then oldest first (loom:urgent and tier:* labels do not affect order)\n",
     );
     if !tick.listing_failed.is_empty() {
         out.push_str(&format!(
@@ -152,8 +152,11 @@ fn render_row(row: &ReadyQueueRow) -> String {
         .file_name()
         .map_or_else(|| row.repo.clone(), |n| n.to_string_lossy().into_owned());
     let mut flags = Vec::new();
-    if row.urgent {
-        flags.push("urgent".to_string());
+    if row.operator_priority {
+        flags.push("starred".to_string());
+    }
+    if row.main_red_fix {
+        flags.push("red-main-fix".to_string());
     }
     if let Some(tier) = &row.tier {
         flags.push(tier.clone());
@@ -204,7 +207,10 @@ mod tests {
             repo: "/src/loom".into(),
             issue,
             workspace_priority: 100,
-            urgent: rank == 1,
+            urgent: false,
+            operator_priority: rank == 1,
+            operator_priority_at: None,
+            main_red_fix: false,
             created_at: None,
             tier: None,
             disposition: d,
@@ -228,7 +234,8 @@ mod tests {
         let first = text.find("loom#10").unwrap();
         assert!(first < text.find("loom#11").unwrap());
         assert!(text.contains("waiting: concurrency cap full"));
-        assert!(text.contains("[urgent]"));
+        assert!(text.contains("[starred]"));
+        assert!(!text.contains("[urgent]"), "loom:urgent is no longer a row flag");
         assert!(!text.contains("STALE"));
     }
 

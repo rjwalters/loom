@@ -98,7 +98,7 @@ function fleet() {
             reason: "blocked: open linked PR",
             detail: "open PR #201",
           }),
-          row({ rank: 3, issue: 300, urgent: true }),
+          row({ rank: 3, issue: 300, operator_priority: true }),
         ]),
       },
       "host-c": { health: health(), queue: queue([]) },
@@ -171,7 +171,7 @@ describe("mergeFleetQueue", () => {
     expect(issue100[0]?.others.map((o) => o.hostId)).toEqual(["host-b"]);
     expect(issue100[0]?.sweep?.phase).toBe("judge");
     // Stale hosts still contribute rows (flagged by their host badge);
-    // running first, then urgent ready, then by age.
+    // running first, then starred ready (#9244), then by age.
     expect(items.map((item) => item.issue)).toEqual([100, 300, 400, 200]);
   });
 

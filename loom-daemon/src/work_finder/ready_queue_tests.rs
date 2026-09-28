@@ -97,16 +97,16 @@ fn order(rows: &[ReadyQueueRow]) -> Vec<(u32, QueueDisposition)> {
     rows.iter().map(|r| (r.issue, r.disposition)).collect()
 }
 
-/// The queue follows the daemon's own comparator: workspace priority, then
-/// `loom:urgent`, then oldest first. A `tier:*` label is carried but does not
-/// move the issue.
+/// The queue follows the daemon's own comparator (#9244): starred first, then
+/// workspace priority, then oldest first. A `tier:*` label is carried but does
+/// not move the issue.
 #[test]
 fn queue_is_ranked_by_dispatch_order_not_tier() {
     let mut multi = vec![
         (
             OneShotSource(Some(vec![
                 item(5, &["loom:issue", "tier:goal-advancing"], "2026-09-03T00:00:00Z"),
-                item(6, &["loom:issue", "loom:urgent"], "2026-09-04T00:00:00Z"),
+                item(6, &["loom:issue", "loom:operator-priority"], "2026-09-04T00:00:00Z"),
                 item(7, &["loom:issue"], "2026-09-01T00:00:00Z"),
             ])),
             Disp::default(),
@@ -124,16 +124,19 @@ fn queue_is_ranked_by_dispatch_order_not_tier() {
     assert_eq!(
         order(&q),
         vec![
-            (1, QueueDisposition::Dispatched),
             (6, QueueDisposition::Dispatched),
+            (1, QueueDisposition::Dispatched),
             (7, QueueDisposition::DeferredCapacity),
             (5, QueueDisposition::DeferredCapacity),
         ]
     );
-    assert_eq!(q[0].repo, "/repo/b");
+    assert_eq!(q[1].repo, "/repo/b");
     assert_eq!(q[0].rank, 1);
     assert_eq!(q[3].tier.as_deref(), Some("tier:goal-advancing"));
-    assert!(q[1].urgent);
+    assert!(
+        q[0].operator_priority && !q[0].urgent,
+        "starred is reported, urgent is always false"
+    );
 }
 
 /// Every seen issue gets exactly one row, and the row names the same reason

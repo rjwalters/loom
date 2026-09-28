@@ -1043,7 +1043,18 @@ async fn collect_managed_repos(
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
 ) -> Vec<ManagedRepoEntry> {
-    collect_managed_repos_with(workspace_pool, slug_cache, derive_visibility).await
+    // Each registered workspace's dispatch priority (#9244, loom-ui#153).
+    // Best-effort: an unreadable registry just omits `priority`.
+    let priorities: HashMap<PathBuf, u32> =
+        crate::workspace_registry::WorkspaceRegistry::load_default()
+            .map(|r| {
+                r.workspaces
+                    .into_iter()
+                    .map(|w| (w.root, w.priority))
+                    .collect()
+            })
+            .unwrap_or_default();
+    collect_managed_repos_with(workspace_pool, slug_cache, derive_visibility, &priorities).await
 }
 
 /// Testable core of [`collect_managed_repos`]: `resolve_visibility` (a plain
@@ -1057,6 +1068,7 @@ async fn collect_managed_repos_with<F>(
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
     resolve_visibility: F,
+    priorities: &HashMap<PathBuf, u32>,
 ) -> Vec<ManagedRepoEntry>
 where
     F: Fn(&str) -> RepoVisibility + Copy + Send + Sync + 'static,
@@ -1089,7 +1101,12 @@ where
                 RepoVisibility::Private
             }
         };
-        entries.push(ManagedRepoEntry { slug, visibility });
+        let priority = priorities.get(&root).copied();
+        entries.push(ManagedRepoEntry {
+            slug,
+            visibility,
+            priority,
+        });
     }
     // Deterministic order (the dashboard renders this list directly) and
     // de-duplicated in case two provisioned roots ever resolve to the same

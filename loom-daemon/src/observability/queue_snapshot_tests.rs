@@ -19,6 +19,9 @@ fn row(rank: usize, repo: &str, issue: u32, d: Qd, detail: Option<&str>) -> Read
         issue,
         workspace_priority: 100,
         urgent: false,
+        operator_priority: false,
+        operator_priority_at: None,
+        main_red_fix: false,
         created_at: Some("2026-09-01T00:00:00Z".into()),
         tier: Some("tier:goal-advancing".into()),
         disposition: d,
@@ -158,4 +161,28 @@ fn a_row_without_visibility_decodes_private() {
     }))
     .unwrap();
     assert_eq!(row.visibility, RepoVisibility::Private);
+}
+
+#[test]
+fn rows_carry_operator_priority_and_urgent_is_always_false() {
+    // #9244: starred rows ship `operator_priority` / `operator_priority_at`;
+    // `urgent` stays on the wire for one release but is always false, even if
+    // a (stale) summary row still claims it.
+    let mut starred = row(1, PUBLIC_ROOT, 10, Qd::Dispatched, None);
+    starred.urgent = true;
+    starred.operator_priority = true;
+    starred.operator_priority_at = Some("2026-09-27T08:00:00Z".into());
+    let plain = row(2, PUBLIC_ROOT, 11, Qd::DeferredCapacity, None);
+    let record = build_record(&summary(vec![starred, plain]), &repos());
+    let wire = serde_json::to_value(&record.rows).unwrap();
+    assert_eq!(wire[0]["urgent"], false);
+    assert_eq!(wire[0]["operator_priority"], true);
+    assert_eq!(wire[0]["operator_priority_at"], "2026-09-27T08:00:00Z");
+    assert_eq!(wire[1]["operator_priority"], false);
+    assert!(wire[1].get("operator_priority_at").is_none(), "{wire}");
+    // An older daemon's row (no new fields) still decodes.
+    let mut legacy = wire[1].clone();
+    legacy.as_object_mut().unwrap().remove("operator_priority");
+    let decoded: QueueSnapshotRow = serde_json::from_value(legacy).unwrap();
+    assert!(!decoded.operator_priority);
 }

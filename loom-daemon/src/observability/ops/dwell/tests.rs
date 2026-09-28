@@ -294,7 +294,7 @@ fn rows_from_report_carry_repo_and_parsed_updated_at() {
     let mut report = crate::work_finder::TickReport::default();
     let item = WorkItem::with_created_at(7, vec![], Some("2026-09-01T00:00:00Z".into()))
         .with_updated_at(Some("2026-09-25T10:00:00Z".into()));
-    let key = ready_queue::key_of(0, 100, &item);
+    let key = ready_queue::key_of(0, 100, &item, false);
     ready_queue::record_skip(
         &mut report.queue,
         key.clone(),
