@@ -14,8 +14,8 @@
 //! inside it, is unchanged.
 
 use super::{
-    read_work_finder_config, resolve_extra_skip_labels_with_config, WorkDispatcher, WorkItem,
-    WorkSource,
+    host_class, operator_priority, read_work_finder_config, resolve_extra_skip_labels_with_config,
+    WorkDispatcher, WorkItem, WorkSource, OPERATOR_PRIORITY_LABEL,
 };
 use crate::sweep_registry::SweepRegistry;
 use crate::types::{SweepKind, SweepState};
@@ -80,15 +80,52 @@ impl Default for GhWorkSource {
 
 impl WorkSource for GhWorkSource {
     fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
-        // ETag-cached REST listing (#4428): a poll where nothing changed
-        // costs zero rate limit (304), replacing the per-tick GraphQL
-        // `gh issue list`. REST issue listings include PRs, so filter the
-        // `pull_request`-marked rows to keep the pre-#4428 issue-only set.
-        let rows = crate::forge_listing::list_issues_cached(
+        // ETag-cached REST listing (#4428), replacing the per-tick GraphQL
+        // `gh issue list`.
+        let ready = self.list_label("loom:issue")?;
+        // Second ETag-cached listing (#9244 §4): starred issues outside
+        // `loom:issue` (triage, curated, or no workflow label at all). Its
+        // failure never costs the `loom:issue` rows: log, feed the rate-limit
+        // breaker, and carry on with what the first listing returned.
+        let starred = self
+            .list_label(OPERATOR_PRIORITY_LABEL)
+            .unwrap_or_else(|e| {
+                log::warn!(
+                    "work_finder: listing starred issues failed ({e}); using loom:issue rows only"
+                );
+                crate::rate_limit_breaker::global_observe_failure(&e.to_string(), "work_finder");
+                Vec::new()
+            });
+        let mut items = operator_priority::merge_starred(ready, starred);
+        let key = operator_priority::repo_key(self.cwd.as_deref(), self.repo.as_deref());
+        let mut timeline = operator_priority::GhTimelineStarredAt {
+            gh_bin: self.gh_bin.clone(),
+            cwd: self.cwd.clone(),
+            repo: self.repo.clone(),
+        };
+        // #9244 C: a loom-ui intent's `requested_at` answers first (the seam
+        // slice A left), then blockers of starred issues inherit the star.
+        let mut source = crate::star_liveness::intents::IntentStarredAt {
+            root: self.cwd.as_deref(),
+            inner: &mut timeline,
+        };
+        operator_priority::resolve_starred_at(&key, &mut items, &mut source);
+        crate::star_liveness::inherit::apply(self.cwd.as_deref(), &mut items);
+        Ok(items)
+    }
+}
+
+impl GhWorkSource {
+    /// One ETag-cached REST listing of open issues carrying `label` (#4428):
+    /// a poll where nothing changed costs zero rate limit (304). REST issue
+    /// listings include PRs, so `pull_request`-marked rows are dropped.
+    fn list_label(&self, label: &str) -> Result<Vec<WorkItem>> {
+        let rows = crate::forge_listing::list_issues_cached_as(
+            "work_finder",
             &self.gh_bin,
             self.cwd.as_deref(),
             self.repo.as_deref(),
-            "loom:issue",
+            label,
             "open",
         )?;
         Ok(rows
@@ -115,13 +152,31 @@ impl WorkSource for GhWorkSource {
 /// guard. `in_flight()` reads the registry's `Running` / `Pending` entries.
 pub struct RegistryDispatcher {
     registry: Arc<Mutex<SweepRegistry>>,
+    /// This host's `host_class` (#9034). NOT read here: it is resolved once
+    /// at work-finder startup ([`host_class::resolve_at_startup`]) and
+    /// threaded in via [`Self::with_host_class`] / [`dispatcher_pairs`], since
+    /// the multi-workspace loop rebuilds every dispatcher each tick.
+    host_class: host_class::HostClass,
 }
 
 impl RegistryDispatcher {
-    /// Construct a dispatcher over the shared registry.
+    /// Construct a dispatcher over the shared registry, unclassified (the
+    /// host-class gate inert). Production goes through [`dispatcher_pairs`].
     #[must_use]
     pub fn new(registry: Arc<Mutex<SweepRegistry>>) -> Self {
-        Self { registry }
+        Self::with_host_class(registry, host_class::HostClass::Unclassified)
+    }
+
+    /// Construct a dispatcher carrying the startup-resolved `host_class`.
+    #[must_use]
+    pub fn with_host_class(
+        registry: Arc<Mutex<SweepRegistry>>,
+        host_class: host_class::HostClass,
+    ) -> Self {
+        Self {
+            registry,
+            host_class,
+        }
     }
 
     /// The shared registry behind this dispatcher. Test-only seam so a
@@ -333,7 +388,59 @@ impl WorkDispatcher for RegistryDispatcher {
         crate::capability::held_capabilities()
     }
 
+    /// This host's startup-resolved `host_class` plus a fresh-each-call read
+    /// of `allowHeavyLocal` (#9034). The class is never re-read here; the override is re-read from
+    /// `<workspace_root>/.loom/config.json` every call, mirroring
+    /// [`extra_skip_labels`](Self::extra_skip_labels) — a cheap JSON read, so
+    /// an operator's `autonomous.workFinder.allowHeavyLocal` edit takes
+    /// effect on the very next tick with no daemon restart required.
+    fn heavy_local_policy(&self) -> host_class::HeavyLocalPolicy {
+        let allow_heavy_local = match self.registry.lock() {
+            Ok(reg) => host_class::resolve_allow_heavy_local(&read_work_finder_config(
+                &reg.config().workspace_root,
+            )),
+            Err(poisoned) => {
+                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                false
+            }
+        };
+        host_class::HeavyLocalPolicy {
+            class: self.host_class,
+            allow_heavy_local,
+        }
+    }
+
     fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
+        self.dispatch_with(issue, complexity, false)
+    }
+
+    /// Whether a live sweep in this registry is the host's overflow sweep
+    /// (#9244). The multi-workspace tick ORs this across every root.
+    fn overflow_in_flight(&self) -> bool {
+        match self.registry.lock() {
+            Ok(reg) => reg.overflow_in_flight(),
+            Err(poisoned) => {
+                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                false
+            }
+        }
+    }
+
+    /// The red-main-fix lane's CI fallback (#9244) for this workspace's repo.
+    fn main_red_via_ci(&self) -> bool {
+        let root = match self.registry.lock() {
+            Ok(reg) => reg.config().workspace_root.clone(),
+            Err(_) => return false,
+        };
+        super::main_red_fix::ci_main_red(&root)
+    }
+
+    fn dispatch_with(
+        &mut self,
+        issue: u32,
+        complexity: Option<&str>,
+        overflow: bool,
+    ) -> Result<bool> {
         log::info!("work_finder: attempting issue #{issue}");
         // Keep the cached complexity stratum, but resolve its model only after
         // runtime admission. A Claude default must not become a native pin.
@@ -354,6 +461,43 @@ impl WorkDispatcher for RegistryDispatcher {
             None,
             None,
         )?;
+        if overflow && outcome.was_new {
+            // Record the over-limit admission on the sweep itself (#9244), so
+            // `list_sweeps` / `get_sweep_status` / `loom-daemon status` show it
+            // and the next tick sees the slot as taken while it runs.
+            if let Ok(mut reg) = self.registry.lock() {
+                reg.mark_overflow(&outcome.sweep_id);
+            }
+            log::info!(
+                "work_finder: issue #{issue} dispatched as this host's overflow sweep (#9244)"
+            );
+        }
         Ok(outcome.was_new)
     }
 }
+
+/// Build the per-tick `(source, dispatcher)` pair for every root (#3924),
+/// each dispatcher carrying the SAME `host_class` resolved once at
+/// work-finder startup (#9034) — so the per-tick rebuild never re-reads it.
+#[must_use]
+pub fn dispatcher_pairs(
+    pool: &crate::workspace_pool::WorkspacePool,
+    roots: &[PathBuf],
+    host_class: host_class::HostClass,
+) -> Vec<(GhWorkSource, RegistryDispatcher)> {
+    roots
+        .iter()
+        .map(|root| {
+            let registry = pool.get_or_provision(root);
+            (
+                GhWorkSource::for_root(root),
+                RegistryDispatcher::with_host_class(registry, host_class),
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "forge_tests.rs"]
+mod tests;

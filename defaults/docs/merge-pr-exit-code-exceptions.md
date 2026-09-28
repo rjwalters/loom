@@ -211,6 +211,42 @@ Two sites exit 5, both inside `_wait_for_checks_then_sync_merge`:
   `total_count`) is this case too — it is withheld as a failed fetch, so it
   also exits 5 at the deadline, never 0 and never 1 (#8993).
 
+A third case *reaches* the same deadline without exiting 5 — a check-runs
+rollup that is readable but **empty** (zero rows, never once seen non-empty).
+It settles and merges (exit 0), because an empty rollup most often means the
+repo simply has no CI configured for this commit. #6169 made it re-poll rather
+than trust a single empty read, since a degraded forge response looks identical;
+#9091 then bounded that re-polling, because "wait out the whole deadline" hit
+hardest exactly where the empty read is *genuine*. On a repo with no CI on the
+changed paths every poll returns zero rows forever, so every `--auto` merge
+there spent the full `LOOM_AUTO_MERGE_TIMEOUT` before merging — long enough
+that the calling agent's own process cap killed it first, which is how
+a private fleet repo's PR (2026-09-26; full timeline in rjwalters/loom#9091) got
+a "Proceeding with squash merge…" comment and then no merge, no failure and no
+label change. The bound is conditional on the base
+branch's **required** status-check set:
+
+- **no required contexts** → settle after `LOOM_ZERO_CHECKS_SETTLE_POLLS`
+  (default 3, spaced `LOOM_ZERO_CHECKS_SETTLE_INTERVAL`, default 5s — about 10s
+  of grace for a check-run that is merely slow to *register*). The poll count is
+  floored at 2, so no operator value can restore the single-read settle #6169
+  fixed; and a wrongly-empty read here can at worst skip *informational*
+  checks, which this path already merges over by design (#3486).
+- **required contexts present, or the lookup errored** → the full wait stands
+  unchanged. A required context that has not registered yet is a gate that
+  *can* block, and an unreadable protection lookup is not evidence of its
+  absence.
+
+That decision — including the two knobs, their floors, and the two-source
+required-context lookup it shares with the #8248 freshness guard — is
+`loom-daemon merge-pr zero-checks-settle`
+(`loom-daemon/src/merge_pr/zero_checks.rs`). `merge-pr.sh` consults it on every
+zero-row poll and obeys the sentinel it answers with; it holds no copy of the
+rule. A daemon too old to know the verb (or missing entirely) produces no
+sentinel, and the script then falls back to #6169's full deadline-bounded wait —
+the state this narrows, so a fault there costs time and never skips a gate. It
+cannot degrade into settling on a single empty read.
+
 What exit 5 deliberately is **not**:
 
 - **Not a failed check.** A failing *required* check still exits 1 — that is
@@ -227,13 +263,16 @@ action: raise `LOOM_AUTO_MERGE_TIMEOUT` past the repo's slowest suite (or
 shrink the required set). A Champion tick that ends in exit 5 should
 cost nothing but a log line.
 
-## Squash-merge detection trap (applies to all three)
+## Merge-ancestry detection trap (applies to all three)
 
 If you need to verify by hand whether a re-queued PR's commits actually landed
 or were silently stranded, `git merge-base --is-ancestor <commit> origin/main`
-is **not reliable evidence either way**: a squash merge produces a brand-new
-commit SHA on `main` that is not a git-ancestry descendant of any commit on the
-original PR branch, regardless of whether that commit's content made it into
-the squash. There is no cheap ancestry check for "squashed-and-landed" vs.
+is **not reliable evidence for a squashed merge**: a squash merge produces a
+brand-new commit SHA on `main` that is not a git-ancestry descendant of any
+commit on the original PR branch, regardless of whether that commit's content
+made it into the squash. Loom's default is now merge commit (#9105), under
+which the PR branch's commits ARE ancestors of `main` — there the ancestry
+check works as expected. For a squashed PR (or on any repo configured
+squash-only), there is no cheap ancestry check for "squashed-and-landed" vs.
 "stranded" — verification requires diffing the actual file content on `main`
 against the branch or commit in question.

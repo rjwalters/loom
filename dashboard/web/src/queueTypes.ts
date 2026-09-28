@@ -6,11 +6,15 @@
  * re-declares the rest of the snapshot (no Workers types in a browser bundle).
  *
  * On `/public/fleet-state` a private row keeps only `rank`, `visibility`,
- * `urgent`, `disposition`, `state` and `reason`, so every repo-identifying
- * field here is optional.
+ * `urgent`, `operator_priority`, `disposition`, `state` and `reason` (plus
+ * the #9288 plan `position`, `plan_state` and `gate`), so every
+ * repo-identifying field here is optional.
  */
 
 export type QueueRowState = "running" | "ready" | "blocked" | "unknown";
+
+/** Where a row stands in its host's dispatch plan (Issue #9288). */
+export type QueuePlanState = "running" | "next" | "queued" | "blocked" | "unknown";
 
 export interface QueueRow {
   /** 1-based dispatch order on the host. Gaps mean the daemon dropped rows
@@ -21,7 +25,13 @@ export interface QueueRow {
   visibility: "public" | "private";
   issue?: number;
   workspace_priority?: number;
+  /** Deprecated (#9244): always false. `loom:urgent` no longer orders work. */
   urgent: boolean;
+  /** Starred (`loom:operator-priority`, #9244): dispatched ahead of all other
+   * work. Absent when not starred or from an older daemon. */
+  operator_priority?: boolean;
+  /** When it was starred, when the daemon knows. */
+  operator_priority_at?: string;
   /** The issue's own `createdAt` — the only age the daemon knows. */
   created_at?: string;
   /** Informational `tier:*` label; the daemon does not order by it. */
@@ -33,6 +43,13 @@ export interface QueueRow {
   reason: string;
   /** The park label (`parked`) or the open PR number (`open_pr`). */
   detail?: string;
+  /** 1-based position in the host's shaped dispatch plan (Issue #9288).
+   * Per host: positions from two hosts are not comparable. Absent when the
+   * row is not dispatchable on that host this tick, or from older daemons. */
+  position?: number;
+  plan_state?: QueuePlanState;
+  /** Which admission gate holds a deferred row (`capacity`, `ramp`, …). */
+  gate?: string;
 }
 
 export interface QueueRepoRef {

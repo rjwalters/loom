@@ -131,7 +131,10 @@ impl LiveArgs {
             telemetry::trace::SpanName,
         };
         let root = &workspace.root;
-        let execution = format!("canary-{}", uuid::Uuid::new_v4());
+        // Keyed on the canary's start instant (trace-identity policy: no random
+        // trace keys); `loom.sweep_id` carries it, so the ID is recomputable.
+        let execution =
+            format!("canary-{}", loom_daemon::telemetry::trace::instant(chrono::Utc::now()));
         let span = lifecycle::begin(
             root,
             &execution,

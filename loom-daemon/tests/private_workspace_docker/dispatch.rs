@@ -3,9 +3,9 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 
-struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+pub(super) struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
 impl Environment {
-    fn set(values: &[(&'static str, Option<std::ffi::OsString>)]) -> Self {
+    pub(super) fn set(values: &[(&'static str, Option<std::ffi::OsString>)]) -> Self {
         let old = values
             .iter()
             .map(|(key, value)| {
@@ -105,7 +105,7 @@ sys.exit(1)
 "#;
 
 impl Fixture {
-    fn adapter(&self, name: &str, prompt: &str) -> Command {
+    pub(super) fn adapter(&self, name: &str, prompt: &str) -> Command {
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -237,8 +237,10 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         .unwrap()
         .is_none());
     }
-    // Production admission remains deliberately closed until #8787. No fixture
-    // manifest is promoted and no synthetic hook-trust receipt is installed.
+    // Production admission stays closed for this fixture: #8787 admits a mutable
+    // role on verified private-clone containment, but this profile has never had
+    // Codex hook trust established, so the containment claim is refused with that
+    // precise obligation. No fixture manifest is promoted anywhere.
     let mut config = loom_daemon::sweep_registry::SweepRegistryConfig::new(root.clone());
     config.journal_path = Some(root.join("sweeps.json"));
     let registry = std::sync::Arc::new(std::sync::Mutex::new(
@@ -254,6 +256,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     )
     .unwrap_err();
     assert!(rejected.to_string().contains("capabilit"), "{rejected}");
+    assert!(rejected.to_string().contains("hook trust"), "{rejected}");
     assert!(!root.join(".loom/locks/issue-8786").exists());
     // A read-only synthetic profile must fail before any role/model launch.
     // Restore its original owner-only mode before asserting or continuing.

@@ -1,0 +1,109 @@
+//! `autonomous.eta` configuration. Precedence: env > config > default.
+//!
+//! | key | env | default |
+//! |---|---|---|
+//! | `enabled` | `LOOM_ETA_ENABLED` | `true` (operator decision on #9289) |
+//! | `dryRun` | `LOOM_ETA_DRY_RUN` | `false`: compute and log, enqueue nothing |
+//! | `refreshSecs` | `LOOM_ETA_REFRESH_SECS` | `300` |
+//! | `current.finish` / `current.land` | — | `finish-v1` / `land-v1` |
+
+use super::Kind;
+use std::path::Path;
+
+/// Default refresh cadence for an unchanged estimate.
+pub const DEFAULT_REFRESH_SECS: u64 = 300;
+
+/// Shortest refresh accepted, so a misconfiguration cannot flood the queue.
+pub const MIN_REFRESH_SECS: u64 = 60;
+
+/// Resolved ETA settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EtaConfig {
+    /// Run the tracker at all.
+    pub enabled: bool,
+    /// Compute and log every would-be record, enqueue none.
+    pub dry_run: bool,
+    /// Refresh an unchanged estimate after this many seconds.
+    pub refresh_secs: u64,
+    /// Configured `current` heuristic for `finish`.
+    pub current_finish: Option<String>,
+    /// Configured `current` heuristic for `land`.
+    pub current_land: Option<String>,
+}
+
+impl Default for EtaConfig {
+    fn default() -> Self {
+        EtaConfig {
+            enabled: true,
+            dry_run: false,
+            refresh_secs: DEFAULT_REFRESH_SECS,
+            current_finish: None,
+            current_land: None,
+        }
+    }
+}
+
+impl EtaConfig {
+    /// The configured current heuristic id for `kind`, if any.
+    #[must_use]
+    pub fn current(&self, kind: Kind) -> Option<&str> {
+        match kind {
+            Kind::Finish => self.current_finish.as_deref(),
+            Kind::Land => self.current_land.as_deref(),
+        }
+    }
+}
+
+fn parse_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Resolve from an effective config value and an env lookup (pure).
+#[must_use]
+pub fn resolve(config: &serde_json::Value, env: impl Fn(&str) -> Option<String>) -> EtaConfig {
+    let block = crate::config_resolver::get_path(config, "autonomous.eta");
+    let get = |key: &str| block.and_then(|b| b.get(key));
+    let mut resolved = EtaConfig::default();
+    if let Some(v) = get("enabled").and_then(serde_json::Value::as_bool) {
+        resolved.enabled = v;
+    }
+    if let Some(v) = get("dryRun").and_then(serde_json::Value::as_bool) {
+        resolved.dry_run = v;
+    }
+    if let Some(v) = get("refreshSecs").and_then(serde_json::Value::as_u64) {
+        resolved.refresh_secs = v;
+    }
+    let current = get("current");
+    let id = |kind: &str| {
+        current
+            .and_then(|c| c.get(kind))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    resolved.current_finish = id("finish");
+    resolved.current_land = id("land");
+
+    if let Some(v) = env("LOOM_ETA_ENABLED").as_deref().and_then(parse_bool) {
+        resolved.enabled = v;
+    }
+    if let Some(v) = env("LOOM_ETA_DRY_RUN").as_deref().and_then(parse_bool) {
+        resolved.dry_run = v;
+    }
+    if let Some(v) = env("LOOM_ETA_REFRESH_SECS").and_then(|s| s.trim().parse::<u64>().ok()) {
+        resolved.refresh_secs = v;
+    }
+    resolved.refresh_secs = resolved.refresh_secs.max(MIN_REFRESH_SECS);
+    resolved
+}
+
+/// Read the configuration for `workspace_root` from its effective config and
+/// the process environment.
+#[must_use]
+pub fn read(workspace_root: &Path) -> EtaConfig {
+    let effective = crate::config_resolver::resolve_effective_config(workspace_root);
+    resolve(&effective, |key| std::env::var(key).ok())
+}

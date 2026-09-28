@@ -47,7 +47,7 @@ use std::process::{Command, Stdio};
 use serde_json::{json, Value};
 
 use crate::forge_cmd::{detect_forge, ForgeType};
-use crate::forge_listing::{list_issues_cached_persistent, CachedListing};
+use crate::forge_listing::{list_issues_cached_persistent_as, CachedListing};
 
 /// Exit code signalling "this shape is not cacheable; fall back to `gh`".
 /// Shares the numeric value of [`crate::forge_cmd::EX_FORGE_DECLINED`].
@@ -132,7 +132,9 @@ fn default_fetcher(labels: &str, state: &str, repo: Option<&str>) -> Option<Cach
     // this query is actually for, so two hosts/repos sharing a label
     // convention never collide on the same on-disk cache file.
     let cwd = std::env::current_dir().ok();
-    list_issues_cached_persistent(Path::new(&gh_bin), cwd.as_deref(), repo, labels, state).ok()
+    let gh = Path::new(&gh_bin);
+    list_issues_cached_persistent_as("agent_cached_list", gh, cwd.as_deref(), repo, labels, state)
+        .ok()
 }
 
 /// Core, side-effect-free (given the `fetch` closure) pipeline: parse → fetch →
@@ -208,7 +210,7 @@ fn project_row(it: &crate::forge_listing::RestIssue, fields: &[String]) -> Value
 
 /// Apply a `--jq` expression via the system `jq` (compact + raw, matching gh's
 /// `--jq` output). Returns `None` (decline) when `jq` is missing or errors.
-fn apply_jq(array: &Value, expr: &str) -> Option<String> {
+pub(crate) fn apply_jq(array: &Value, expr: &str) -> Option<String> {
     let input = serde_json::to_string(array).ok()?;
     let mut child = Command::new("jq")
         .arg("-c")

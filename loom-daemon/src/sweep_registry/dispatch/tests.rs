@@ -186,6 +186,7 @@ fn readvertise_republishes_live_issue_claims_only() {
         effort: None,
         depends_on: None,
         repo: None,
+        overflow: false,
     };
     let live_log = registry.compute_log_path(4431);
     let dead_log = registry.compute_log_path(999);
@@ -193,18 +194,13 @@ fn readvertise_republishes_live_issue_claims_only() {
         "sweep-live".to_string(),
         mk_info("sweep-live", 4431, SweepState::Running, live_log),
     );
-    registry.entries.insert(
-        "sweep-dead".to_string(),
-        mk_info(
-            "sweep-dead",
-            999,
-            SweepState::Exited {
-                code: None,
-                at: Utc::now(),
-            },
-            dead_log,
-        ),
-    );
+    let exited = SweepState::Exited {
+        code: None,
+        at: Utc::now(),
+    };
+    registry
+        .entries
+        .insert("sweep-dead".to_string(), mk_info("sweep-dead", 999, exited, dead_log));
 
     assert_eq!(registry.readvertise_peer_claims(), 1);
     let ad = rx.try_recv().expect("one re-advertisement published");

@@ -187,6 +187,55 @@ pub struct ForgeEventsStatus {
     /// backoff. `0` when the loop is not running.
     #[serde(default)]
     pub poll_interval_secs: u64,
+    /// One entry per **armed** Phase 2 early-tick consumer
+    /// (`forgeEvents.events.*`), in the order the loops spawned. Empty is the
+    /// default and the positive answer "no consumer is armed on this host" —
+    /// a disarmed consumer registers nothing, so this is never "armed but
+    /// silent". Absent on a pre-#8995 daemon, which deserializes as empty.
+    #[serde(default)]
+    pub wakes: Vec<ForgeEventsWakeStatus>,
+}
+
+/// One armed early-tick consumer's live counters (ADR-0021 Phase 2, #8995).
+///
+/// The measurement surface ADR-0021's "run it and measure before defaulting
+/// on" plan needs: an operator who arms a consumer can see whether prompts are
+/// arriving (`prompts`), whether they are moving the loop (`early_ticks`), and
+/// whether the spacing floor is absorbing them (`throttled` — under a burst a
+/// healthy number, coalescing working rather than a fault).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeEventsWakeStatus {
+    /// Human-readable consumer name, e.g. `claim-reconcile wake`.
+    #[serde(default)]
+    pub consumer: String,
+    /// The `forgeEvents.events.*` key that armed it, e.g.
+    /// `claimReconcileWake` — the token an operator greps their config for.
+    #[serde(default)]
+    pub config_key: String,
+    /// The loop's own cadence, in seconds.
+    #[serde(default)]
+    pub cadence_secs: u64,
+    /// The spacing floor in effect (`forgeEvents.events.minSpacingSecs`).
+    #[serde(default)]
+    pub min_spacing_secs: u64,
+    /// Qualifying `forge.event` prompts observed this daemon process.
+    #[serde(default)]
+    pub prompts: u64,
+    /// Ticks taken early because of one.
+    #[serde(default)]
+    pub early_ticks: u64,
+    /// Prompts dropped by the spacing floor.
+    #[serde(default)]
+    pub throttled: u64,
+}
+
+impl ForgeEventsWakeStatus {
+    /// The documented early-tick ceiling for this loop: `cadence_secs /
+    /// min_spacing_secs`, floored at `1`. Reporting arithmetic only.
+    #[must_use]
+    pub fn max_multiplier(&self) -> u64 {
+        (self.cadence_secs / self.min_spacing_secs.max(1)).max(1)
+    }
 }
 
 impl ForgeEventsStatus {

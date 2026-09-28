@@ -34,7 +34,8 @@
 //! - **`P`** — the PR's own delta, `pulls/{n}/files`, including removed and
 //!   renamed paths.
 //!
-//! Each required context carries three path sets in [`SPECS`]:
+//! Each component gate carries three path sets in [`SPECS`] (a required context
+//! is one or more components — see [`RequiredCheck`]):
 //!
 //! - **`G`** — global inputs: the check's own scripts, its baseline / allowlist
 //!   / budget files, and `.github/workflows/ci.yml`. A change to any of these
@@ -152,7 +153,8 @@ pub struct ScopedEvidence {
 /// `global` / `scanned` / `coupled` mean and why over-population is safe.
 #[derive(Debug, Clone, Copy)]
 pub struct CheckSpec {
-    /// The required status-check context, exactly as branch protection names it.
+    /// The component gate's name: its former `ci.yml` job name, and the name its
+    /// `# component:` marker uses (see [`RequiredCheck`]).
     pub context: &'static str,
     /// `G` — inputs whose change can flip the verdict for every file.
     pub global: &'static [&'static str],
@@ -287,10 +289,35 @@ pub fn unknown_check_reason(d: &FileSet) -> Option<StaleReason> {
     })
 }
 
-/// The spec for `context`, or `None` — see [`unknown_check_reason`].
+/// The spec for one component gate, or `None`.
 #[must_use]
-pub fn spec_for(context: &str) -> Option<&'static CheckSpec> {
-    SPECS.iter().find(|s| s.context == context)
+pub fn spec_for(component: &str) -> Option<&'static CheckSpec> {
+    SPECS.iter().find(|s| s.context == component)
+}
+
+/// The component specs behind a required `context`: its [`REQUIRED_CHECKS`]
+/// entry's components, or — for a name that is itself a component — just that
+/// one spec. `None` when any component is unmapped, which
+/// [`unknown_check_reason`] then turns into a refusal (fail closed).
+#[must_use]
+pub fn specs_for(context: &str) -> Option<Vec<&'static CheckSpec>> {
+    match REQUIRED_CHECKS.iter().find(|r| r.context == context) {
+        Some(req) => req.components.iter().map(|c| spec_for(c)).collect(),
+        None => spec_for(context).map(|s| vec![s]),
+    }
+}
+
+/// [`stale_reason`] for a required context made of `components`: the first
+/// stale component (in table order) and why, or `None` when none is stale.
+#[must_use]
+pub fn composite_stale_reason(
+    components: &[&'static CheckSpec],
+    d: &FileSet,
+    p: &FileSet,
+) -> Option<(&'static str, StaleReason)> {
+    components
+        .iter()
+        .find_map(|spec| stale_reason(spec, d, p).map(|r| (spec.context, r)))
 }
 
 // --- Shared pattern groups ---------------------------------------------------
@@ -331,29 +358,69 @@ const RESYNC_PAIRS: &[&str] = &[
 /// Every tracked markdown file — the link graph's nodes.
 const MARKDOWN: &[&str] = &["**/*.md"];
 
-/// `main`'s 19 required status-check contexts, as branch protection names them
-/// (`GET /repos/{nwo}/rules/branches/main`, verified 2026-09-26). The pin test
-/// asserts each has a [`CheckSpec`] and each names a real `ci.yml` job.
+/// `main`'s required status-check contexts, as branch protection names them
+/// (`.loom/config.json` `branchProtection.requiredStatusChecks`, applied by
+/// `scripts/install/setup-branch-protection.sh`). The pin test asserts each has
+/// a [`RequiredCheck`] and each names a real `ci.yml` job.
 pub const REQUIRED_CONTEXTS: &[&str] = &[
-    "CLAUDE.md Line Budget",
-    "File Size Ratchet",
-    "Shell Budget Ratchet",
-    "Shell Allowlist",
-    "Markdown Token Ratchet",
-    "Role Prompt Prefix Ratchet",
-    "Conflict Marker Check",
-    "Shell Syntax (ubuntu-latest)",
+    "Structural Checks",
     "Shell Syntax (macos-latest)",
-    "AGENTS.md Sync Check",
-    "Config Host-Path Guard",
-    "Docs/Defaults Parity Check",
-    "Guard Scan-String Tier Contracts",
-    "Doc Table-of-Contents Freshness",
-    "Hooks/Scripts Defaults Parity Check",
-    "Vendored Private-Reference Scrub",
-    "Dangling Link Check",
-    ".gitignore Convergence Check",
-    "PRs Must Not Hand-Edit Version-Bearing Files",
+    "Daemon Checks",
+];
+
+/// One required context and the component checks its job runs as steps.
+///
+/// #9065 folded 19 single-gate jobs into three, to stop ~20 five-second jobs
+/// from competing for the account's concurrent-job cap. The inputs did not
+/// change, so neither did the specs: each former job is now a *component*,
+/// keyed by its old name, and its steps sit under a `# component: <name>`
+/// marker in `ci.yml`.
+///
+/// A composite context is stale iff **any** component is stale — never the
+/// union of their input sets. The union would add cross terms (`main` changes
+/// component A's script, the PR touches only component B's files) that make
+/// the whole context stale when no gate's verdict could have moved. Taking the
+/// OR of per-component verdicts refuses exactly as often as 19 separately
+/// required contexts did.
+#[derive(Debug, Clone, Copy)]
+pub struct RequiredCheck {
+    /// The required status-check context (the `ci.yml` job `name:`).
+    pub context: &'static str,
+    /// The [`CheckSpec::context`] names of the gates this job runs.
+    pub components: &'static [&'static str],
+}
+
+/// Required context → component gates. See [`RequiredCheck`].
+pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
+    RequiredCheck {
+        context: "Structural Checks",
+        components: &[
+            "Conflict Marker Check",
+            "CLAUDE.md Line Budget",
+            "File Size Ratchet",
+            "Shell Allowlist",
+            "Markdown Token Ratchet",
+            "Role Prompt Prefix Ratchet",
+            "AGENTS.md Sync Check",
+            "Config Host-Path Guard",
+            "Docs/Defaults Parity Check",
+            "Guard Scan-String Tier Contracts",
+            "Doc Table-of-Contents Freshness",
+            "Hooks/Scripts Defaults Parity Check",
+            "Vendored Private-Reference Scrub",
+            "Dangling Link Check",
+            "PRs Must Not Hand-Edit Version-Bearing Files",
+            "Shell Syntax (ubuntu-latest)",
+        ],
+    },
+    RequiredCheck {
+        context: "Shell Syntax (macos-latest)",
+        components: &["Shell Syntax (macos-latest)"],
+    },
+    RequiredCheck {
+        context: "Daemon Checks",
+        components: &["Shell Budget Ratchet", ".gitignore Convergence Check"],
+    },
 ];
 
 /// The hand-maintained input table. **Adding a step to a required job means
@@ -570,8 +637,8 @@ pub const SPECS: &[CheckSpec] = &[
         coupled: &[".gitignore"],
         removal_sensitive: false,
     },
-    // Its ONLY input is its own script: it checks out the PR **head** and
-    // diffs `merge-base(base, head)..head`, so it depends on the PR's own
+    // Its ONLY input is its own script: it diffs `merge-base(base, head)..head`
+    // by git revision (the full-history checkout has both), so it depends on the PR's own
     // commits alone. The version-bearing files `main` restamps are NOT inputs
     // to it — which is why a restamp on `main` cannot make it stale.
     CheckSpec {

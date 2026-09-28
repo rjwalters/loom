@@ -1338,8 +1338,11 @@ impl SweepRegistry {
                                 // candidate is no longer a no-op — clear any
                                 // armed cooldown so a since-cleared window
                                 // (e.g. an operator override that dispatched
-                                // through it) does not linger stale.
-                                self.clear_noop_cooldown(issue);
+                                // through it) does not linger stale. #8912:
+                                // never when THIS dispatch self-reported the
+                                // no-op — that would clear the window it just
+                                // armed.
+                                self.clear_noop_cooldown_unless_reported(&sweep_id, issue);
                                 // #7528: same reasoning for the hard-exclusion
                                 // decline record — a run that advanced the
                                 // checkpoint plainly was NOT declined on a
@@ -1369,7 +1372,7 @@ impl SweepRegistry {
                                     ),
                                 );
                             } else if insta_crash {
-                                self.record_dispatch_failure(issue);
+                                self.charge_dispatch_failure(&sweep_id, issue);
                             }
                             if checkpoint_progress {
                                 self.record_terminal_outcome(issue, false);
@@ -1394,7 +1397,7 @@ impl SweepRegistry {
                                 // always yields a `None`/non-preflight death_class,
                                 // so exhaustion still reaches — and is handled
                                 // inside — `record_insta_crash_outcome`).
-                                self.record_insta_crash_outcome(&sweep_id, issue, insta_crash);
+                                self.charge_insta_crash(&sweep_id, issue, insta_crash);
                             }
                             // PR-less retry bound (#7972). THIS is the branch
                             // the #7893 loop lived in: a sweep that advanced
@@ -2063,7 +2066,7 @@ impl SweepRegistry {
                                     ),
                                 );
                             } else if insta_crash || no_progress || yielded_open_pr {
-                                self.record_dispatch_failure(issue);
+                                self.charge_dispatch_failure(&sweep_id, issue);
                             } else {
                                 self.clear_dispatch_backoff(issue);
                             }
@@ -2099,7 +2102,7 @@ impl SweepRegistry {
                                 // yields a `None` death_class, so exhaustion still
                                 // reaches — and is handled inside —
                                 // `record_insta_crash_outcome`).
-                                self.record_insta_crash_outcome(&sweep_id, issue, counted_failure);
+                                self.charge_insta_crash(&sweep_id, issue, counted_failure);
                             }
                             // PR-less retry bound (#7972) — the sibling call to
                             // the one in the crashed branch above. Two things

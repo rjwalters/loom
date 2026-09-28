@@ -164,26 +164,82 @@ fn the_only_file_open_in_this_module_is_the_guarded_rollout_reader() {
     // reads this module's own sibling source, so a future edit that adds a
     // read of `$CODEX_HOME`'s auth store fails here with the reason — the
     // counterpart of `opencode_usage`'s `.prepare(` scan.
+    //
+    // The list below catches a read however it is spelled: the free function,
+    // the method on a `Path` (`p.read_dir()`), the imported-bare form, the
+    // builder (`File::options()`), a directory-walking crate (`walkdir`,
+    // `glob`), and delegation to a sibling `*_usage` reader that resolves its
+    // own provider home. What a lexical scan still cannot see: a read reached
+    // through a trait object, a re-export under a different name, a macro, or
+    // FFI. Those are covered behaviourally by
+    // `read_rollout_refuses_an_unauthorized_path_even_when_handed_one_directly`
+    // — the gate in `read_rollout`, not this scan, is the guarantee; the scan
+    // only makes a second reader loud in review.
+    //
+    // Unlike `pi_usage`, this module legitimately enumerates directories (it
+    // has to walk `sessions/<YYYY>/<MM>/<DD>/` and the pooled-profile root) and
+    // legitimately names its own `$CODEX_HOME` default. Those are therefore
+    // pinned at their exact counts rather than forbidden: a fourth `read_dir`
+    // or a second `".codex"` has to be justified in review.
     let code = reader_code();
-    for idiom in [
-        "File::open(",
-        "File::create(",
-        "read_to_string(",
-        "fs::read(",
-        "OpenOptions",
-        "include_str!",
+    for (idiom, allowed) in [
+        // The one guarded open.
+        ("File::open(", 1),
+        // The three directory enumerations `codex_homes` and `rollouts_under`
+        // need — listing names only; every candidate still goes through
+        // `is_rollout_path` before `read_rollout` opens it.
+        ("fs::read_dir(", 3),
+        // …but never the method form, which would sidestep the count above.
+        (".read_dir(", 0),
+        // Every route to a file's *contents* other than the guarded open, and
+        // every way to have something else fetch them.
+        ("File::create(", 0),
+        ("File::options", 0),
+        ("OpenOptions", 0),
+        ("fs::read(", 0),
+        ("read_to_string(", 0),
+        ("read_to_end(", 0),
+        ("fs::copy(", 0),
+        ("fs::write(", 0),
+        ("WalkDir", 0),
+        ("walkdir", 0),
+        ("glob(", 0),
+        ("include_str!", 0),
+        ("include_bytes!", 0),
+        ("Command::new(", 0),
+        // Reading `$CODEX_HOME` by proxy: every sibling `*_usage` reader
+        // resolves its own provider home, so a `crate::…_usage::` call from
+        // here is a read of a credential-bearing tree at one remove.
+        ("_usage::", 0),
+        // The `$CODEX_HOME` default is named exactly once — in `codex_home`,
+        // asserted below. A second mention is a second path construction.
+        ("\".codex\"", 1),
     ] {
         let count = code.matches(idiom).count();
-        let allowed = usize::from(idiom == "File::open(");
         assert_eq!(
             count, allowed,
-            "this module's code may contain exactly {allowed} `{idiom}` call(s): every \
-             file read must go through `read_rollout`, which refuses any path \
-             `is_rollout_path` rejects — $CODEX_HOME holds an auth store, a config \
-             file, a full prompt history and several SQLite databases as siblings of \
-             the sessions/ tree"
+            "this module's code may contain exactly {allowed} occurrence(s) of \
+             `{idiom}`: every read of a file's contents must go through \
+             `read_rollout`, which refuses any path `is_rollout_path` rejects — \
+             $CODEX_HOME holds an auth store, a config file, a full prompt history \
+             and several SQLite databases as siblings of the sessions/ tree"
         );
     }
+    // The one `".codex"` must be the home default inside `codex_home` — nowhere
+    // else does this module have a reason to spell the state directory.
+    let home_fn = code
+        .split_once("fn codex_home(")
+        .expect("codex_home must exist")
+        .1;
+    let home_body = home_fn
+        .split_once("\n}\n")
+        .map_or(home_fn, |(head, _)| head);
+    assert!(
+        home_body.contains("\".codex\""),
+        "the only `\".codex\"` in this module's code must be `codex_home`'s default: \
+         any other construction of a `$CODEX_HOME`-relative path bypasses \
+         `is_rollout_path`"
+    );
     // The single open must sit inside `read_rollout`, after the authorization
     // gate — asserted as an ordered pair within one function body, so hoisting
     // the open above the gate (or into another function) fails here.
@@ -199,6 +255,9 @@ fn the_only_file_open_in_this_module_is_the_guarded_rollout_reader() {
     assert!(gate < open, "the authorization gate must precede the open");
     // No credential-bearing basename may appear in the module's CODE: the
     // reader has no legitimate reason to name one, so naming one is the tell.
+    // The state *directory* (`".codex"`) is not on this list because the module
+    // resolves its own `$CODEX_HOME` default — it is pinned and placed above
+    // instead, which is the equivalent of `pi_usage`'s outright `".pi"` ban.
     let lowered = code.to_ascii_lowercase();
     for forbidden in [
         "auth.json",

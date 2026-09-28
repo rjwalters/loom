@@ -111,6 +111,32 @@ fn emit_git_rerun_paths() {
     }
 }
 
+/// `clean` / `dirty` over TRACKED files only (untracked files are ignored,
+/// as D33 specifies), or `unknown` when git cannot answer.
+fn tree_state() -> &'static str {
+    let Ok(out) = Command::new("git")
+        // `--no-optional-locks`: never take `index.lock` to write back
+        // refreshed stat data, which would race an agent's concurrent
+        // `git commit` and touch the `index` this script watches.
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+        ])
+        .output()
+    else {
+        return "unknown";
+    };
+    if !out.status.success() {
+        "unknown"
+    } else if out.stdout.iter().all(u8::is_ascii_whitespace) {
+        "clean"
+    } else {
+        "dirty"
+    }
+}
+
 fn main() {
     // Re-run when HEAD moves (branch advance, checkout, commit) or the index
     // changes. Resolved correct-by-construction via `git rev-parse --git-path`
@@ -136,6 +162,30 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=LOOM_DAEMON_GIT_COMMIT={commit}");
+
+    // Provenance build identity (#9027, harness-ops D33): the FULL 40-hex
+    // commit and whether tracked files differed from it. `unknown` when git
+    // cannot answer — never omitted, never guessed. The short commit above is
+    // unchanged: self_update compares it and `--version` displays it.
+    let full = git_output(&["rev-parse", "HEAD"])
+        .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let dirty = if full == "unknown" {
+        "unknown"
+    } else {
+        tree_state()
+    };
+    println!("cargo:rustc-env=LOOM_DAEMON_GIT_COMMIT_FULL={full}");
+    println!("cargo:rustc-env=LOOM_DAEMON_GIT_DIRTY={dirty}");
+    // The dirty flag goes stale if an edit does not re-run this script: watch
+    // the crate's own inputs (cargo scans a directory recursively), so any
+    // edit that changes the binary also re-derives the flag. HEAD movement
+    // (commit, checkout, reset) is already watched above.
+    for input in ["src", "Cargo.toml", "../Cargo.lock", "../defaults"] {
+        if Path::new(input).exists() {
+            println!("cargo:rerun-if-changed={input}");
+        }
+    }
 
     // Build timestamp in ISO-8601 UTC. We use `date -u +%FT%TZ` for
     // portability across macOS and Linux without pulling chrono into the

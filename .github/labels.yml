@@ -27,7 +27,7 @@
   color: "9CA3AF"  # gray-400 - neutral initial state
 
 - name: loom:issue
-  description: "Approved for work. Applied by: humans, Champion, or sweep Approval gate — see curator.md for rule."
+  description: "Approved for work. Applied by: humans, Champion, sweep gate, Curator (starred) — see curator.md."
   color: "3B82F6"  # blue-500
 
 # DEPRECATED: loom:in-progress removed (use role-specific labels)
@@ -145,7 +145,7 @@
   color: "EF4444"  # red-500
 
 - name: loom:urgent
-  description: Critical/blocking issue requiring immediate attention
+  description: "Retired (#9244): use loom:operator-priority"
   color: "DC2626"  # red-600
 
 - name: loom:abort
@@ -234,6 +234,22 @@
   description: "Engine stops work on this item; human is the only transition out. Sweep/shepherd do not skip it."
   color: "EA580C"  # orange-600 - operator-action signal, one shade darker than operator-only
 
+# loom:operator-priority (#9244) is the operator's "star": land this ASAP,
+# ahead of all other work, fleet-wide. It is NOT loom:operator (the hold
+# above) and it is NOT a hold of any kind -- nothing may treat a
+# `loom:operator` / `loom:operator-` prefix match as a hold without excluding
+# this label by name (see loom-daemon pr_latency::hold_labels). The daemon's
+# work finder sorts starred issues first (by when they were starred), lists
+# them even outside loom:issue (triage, curated, or unlabelled; the sweep then
+# starts from Curator), and may run one starred sweep over the concurrency
+# cap. Skip/park labels still win: a starred issue carrying loom:blocked,
+# loom:operator-only, loom:operator-decision or loom:operator is never
+# dispatched. Applied by: humans (directly or via the loom-ui star). Removed
+# by: humans.
+- name: loom:operator-priority
+  description: "Land ASAP, ahead of all other work (not a hold). Applied by: humans, directly or via loom-ui star."
+  color: "CA8A04"  # yellow-600 - matches loom-ui's star
+
 # Epic Labels
 - name: loom:epic
   description: Multi-phase epic proposal (decomposes into implementation issues)
@@ -255,6 +271,14 @@
 - name: tier:maintenance
   description: Cleanup, refactoring, or improvements not tied to current goals
   color: "D4C5F9"  # purple - lower priority
+
+# loom:heavy (#9034): the mechanical "heavy" signal the host-class gate refuses
+# on a host_class: local-dev machine (autonomous.workFinder.hostClass) unless
+# explicitly overridden (--allow-local / allowHeavyLocal). A resource-weight
+# axis, deliberately NOT the same thing as the tier:* priority axis above.
+- name: loom:heavy
+  description: "CPU/RAM-intensive sweep; refused on local-dev host_class. Applied by: humans/Curator/Architect."
+  color: "B60205"  # red - resource-intensive caution signal
 
 # External Contribution Gate
 # Not part of the loom: workflow. A non-collaborator submission needs maintainer

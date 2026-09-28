@@ -591,7 +591,9 @@ pub(in crate::observability) async fn record(
         };
         let mut complete = true;
         for label in STAGE_LABELS {
-            match crate::observability::queue_blocked::list_open(root.clone(), label).await {
+            match crate::observability::queue_blocked::list_open(root.clone(), label, "stage_dwell")
+                .await
+            {
                 Some(listing) => {
                     let items = listing.iter().map(StageItem::from_rest).collect();
                     input.listings.insert(label, items);

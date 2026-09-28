@@ -30,10 +30,12 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
+
+use crate::forge_call_stats::RateLimitHeaders;
+use crate::forge_etag_store as store;
 
 /// One page's worth — matches GitHub's REST maximum and brackets the old
 /// `gh issue list --limit` values (100–200) used by the converted call sites.
@@ -78,7 +80,8 @@ pub struct RestIssue {
 /// - `state`: `"open"`, `"closed"`, or `"all"` (REST accepts all three).
 ///
 /// Errors carry the `gh` stderr tail so [`crate::rate_limit_breaker`]'s
-/// classifier sees rate-limit text unchanged.
+/// classifier sees rate-limit text unchanged. Calls are attributed to the
+/// generic `forge_listing` caller; daemon loops use [`list_issues_cached_as`].
 pub fn list_issues_cached(
     gh_bin: &Path,
     cwd: Option<&Path>,
@@ -86,7 +89,20 @@ pub fn list_issues_cached(
     label: &str,
     state: &str,
 ) -> Result<Vec<RestIssue>> {
-    match list_issues_cached_once(gh_bin, cwd, repo_override, label, state) {
+    list_issues_cached_as("forge_listing", gh_bin, cwd, repo_override, label, state)
+}
+
+/// [`list_issues_cached`], with every forge call recorded against `caller` in
+/// [`crate::forge_call_stats`] (#9251).
+pub fn list_issues_cached_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+) -> Result<Vec<RestIssue>> {
+    match list_issues_cached_once(caller, gh_bin, cwd, repo_override, label, state) {
         Ok(issues) => Ok(issues),
         Err(e) => {
             // #6171: a 404 from a *registered* workspace (a `Some(cwd)` — an
@@ -108,7 +124,14 @@ pub fn list_issues_cached(
                         build_issues_url(repo_override, label, state),
                         root.display()
                     );
-                    return list_issues_cached_once(gh_bin, cwd, repo_override, label, state);
+                    return list_issues_cached_once(
+                        caller,
+                        gh_bin,
+                        cwd,
+                        repo_override,
+                        label,
+                        state,
+                    );
                 }
             }
             Err(e)
@@ -130,7 +153,14 @@ fn is_404_error(error_message: &str) -> bool {
 /// One unconditional attempt at the ETag-cached REST listing — the pre-#6171
 /// body of [`list_issues_cached`], split out so the public function can retry
 /// it exactly once after a forced credential refresh.
+///
+/// Keyed by resolved identity ([`store::daemon_cache_key`], #9252) and backed
+/// by the shared disk store, so an ETag survives a daemon restart. Unlike the
+/// agent path this trusts every `200` (no #7451 shrink guard): each claim
+/// shrinks the `loom:issue` listing, and re-serving the larger prior listing
+/// could re-offer a just-claimed issue.
 fn list_issues_cached_once(
+    caller: &'static str,
     gh_bin: &Path,
     cwd: Option<&Path>,
     repo_override: Option<&str>,
@@ -139,60 +169,44 @@ fn list_issues_cached_once(
 ) -> Result<Vec<RestIssue>> {
     let env_repo = std::env::var("LOOM_REPO").ok();
     let repo = repo_override.or(env_repo.as_deref());
-    let url = build_issues_url(repo, label, state);
-    // The cache key must include the resolution context: with the
-    // `{owner}/{repo}` placeholder form, the SAME url string resolves to
-    // DIFFERENT repos depending on `cwd`.
-    let cache_key = format!(
-        "{}|{url}",
-        cwd.map(Path::display)
-            .map_or_else(String::new, |d| d.to_string())
-    );
+    // #9252: the URL names the SAME resolved repo the key does (never gh's
+    // own placeholder remote choice), so key and request cannot disagree.
+    let target = store::resolve_target(cwd, repo);
+    let url = build_issues_url(target.repo.as_deref(), label, state);
+    let cache_key = store::daemon_cache_key(cwd, &target, &url);
+    let disk_path = store::daemon_store_dir().map(|d| store::entry_path_in(&d, &cache_key));
+    // Snapshot the (etag, issues) PAIR before the request: a 304 validates
+    // exactly the ETag we sent, so it may only ever serve the body stored with
+    // that ETag — never whatever a concurrent writer put under the key since.
+    let sent = cached_entry(&cache_key, disk_path.as_deref());
 
-    let cached_etag = cache()
-        .lock()
-        .ok()
-        .and_then(|c| c.get(&cache_key).map(|e| e.etag.clone()));
-
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("api").arg("--include").arg(&url);
-    if let Some(ref etag) = cached_etag {
-        cmd.arg("-H").arg(format!("If-None-Match: {etag}"));
-    }
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    // #5401: point a cross-owner managed repo's listing at its own owner's
-    // installation-token `GH_CONFIG_DIR` (no-op for single-owner fleets / a
-    // `None` cwd).
-    crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, cwd);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let response = parse_http_response(&stdout);
+    let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
+    let (status, response, stderr) =
+        store::fetch_conditional(caller, gh_bin, cwd, &target, &url, sent_etag)?;
+    #[cfg(test)]
+    tests::run_after_send_hook();
 
     match response {
         Some(ref r) if r.status == 304 => {
             // Free cache hit (a 304 does not count against the rate limit).
-            if let Ok(guard) = cache().lock() {
-                if let Some(entry) = guard.get(&cache_key) {
-                    log::debug!("forge_listing: 304 cache hit for {url}");
-                    return Ok(entry.issues.clone());
-                }
+            if let Some(entry) = sent {
+                log::debug!("forge_listing: 304 cache hit for {url}");
+                return Ok(entry.issues.as_ref().clone());
             }
-            // A 304 can only happen because WE sent the etag, so the entry
-            // existing is an invariant; if it is somehow gone, drop the etag
-            // path and error so the next call re-fetches unconditionally.
+            // A 304 can only happen because WE sent an etag; without one this
+            // is anomalous — drop the key and error so the next call
+            // re-fetches unconditionally.
             if let Ok(mut guard) = cache().lock() {
                 guard.remove(&cache_key);
+            }
+            if let Some(path) = &disk_path {
+                let _ = std::fs::remove_file(path);
             }
             Err(anyhow!(
                 "forge_listing: 304 for {url} but the cache entry vanished; will re-fetch"
             ))
         }
-        Some(ref r) if r.status == 200 && out.status.success() => {
+        Some(ref r) if r.status == 200 && status.success() => {
             let issues = parse_rest_issues(&r.body)
                 .with_context(|| format!("parse REST issues JSON from {url}"))?;
             if issues.len() >= PER_PAGE {
@@ -201,24 +215,46 @@ fn list_issues_cached_once(
                      truncated — items beyond the first page are not seen this poll"
                 );
             }
-            if let (Some(etag), Ok(mut guard)) = (r.etag.clone(), cache().lock()) {
-                guard.insert(
-                    cache_key,
-                    CacheEntry {
-                        etag,
-                        issues: issues.clone(),
-                    },
-                );
+            if let Some(etag) = r.etag.clone() {
+                if let Some(path) = &disk_path {
+                    let entry = store::DiskEntry {
+                        etag: etag.clone(),
+                        body: r.body.clone(),
+                    };
+                    store::write_disk_entry(path, &entry);
+                }
+                if let Ok(mut guard) = cache().lock() {
+                    let issues = Arc::new(issues.clone());
+                    guard.insert(cache_key, CacheEntry { etag, issues });
+                }
             }
             Ok(issues)
         }
         _ => Err(anyhow!(
-            "gh api {url} failed{}: {}",
+            "gh api {url} failed{}: {stderr}",
             cwd.map(|d| format!(" in {}", d.display()))
                 .unwrap_or_default(),
-            String::from_utf8_lossy(&out.stderr).trim()
         )),
     }
+}
+
+/// The `(etag, issues)` pair to present for `key`: the in-memory hot layer,
+/// else a read-through of the disk entry at `disk` (parsed once and promoted
+/// into memory, so a steady-state `304` never re-reads or re-parses the file).
+/// Cheap to clone: the issues are shared behind an [`Arc`].
+fn cached_entry(key: &str, disk: Option<&Path>) -> Option<CacheEntry> {
+    if let Some(entry) = cache().lock().ok()?.get(key).cloned() {
+        return Some(entry);
+    }
+    let disk_entry = store::read_disk_entry(disk?)?;
+    let entry = CacheEntry {
+        issues: Arc::new(parse_rest_issues(&disk_entry.body).ok()?),
+        etag: disk_entry.etag,
+    };
+    if let Ok(mut guard) = cache().lock() {
+        guard.insert(key.to_string(), entry.clone());
+    }
+    Some(entry)
 }
 
 /// Build the REST listing URL. With no explicit repo, gh's
@@ -237,6 +273,8 @@ pub struct HttpResponse {
     pub status: u16,
     pub etag: Option<String>,
     pub body: String,
+    /// Free `x-ratelimit-*` headers (#9251), sent on `200`s and `304`s alike.
+    pub ratelimit: RateLimitHeaders,
 }
 
 /// Parse `gh api --include` output. Returns `None` when the first line is not
@@ -253,6 +291,7 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
     let status: u16 = parts.next()?.parse().ok()?;
 
     let mut etag = None;
+    let mut ratelimit = RateLimitHeaders::default();
     for line in lines {
         let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
@@ -261,6 +300,8 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
         if let Some((name, value)) = trimmed.split_once(':') {
             if name.eq_ignore_ascii_case("etag") {
                 etag = Some(value.trim().to_string());
+            } else {
+                ratelimit.absorb(name, value);
             }
         }
     }
@@ -278,7 +319,12 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
         .min_by_key(|&(idx, _)| idx)
         .map(|(_, body_start)| raw[body_start..].to_string())
         .unwrap_or_default();
-    Some(HttpResponse { status, etag, body })
+    Some(HttpResponse {
+        status,
+        etag,
+        body,
+        ratelimit,
+    })
 }
 
 /// Parse a REST issues-listing body into [`RestIssue`]s.
@@ -340,13 +386,13 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
 #[derive(Debug, Clone)]
 struct CacheEntry {
     etag: String,
-    issues: Vec<RestIssue>,
+    issues: Arc<Vec<RestIssue>>,
 }
 
-/// Process-global ETag cache: one entry per (cwd, url). Process-lifetime is
-/// the right scope — a daemon restart re-fetches each listing exactly once,
-/// and the cache can never serve across identities (one gh credential per
-/// daemon process).
+/// Process-global hot layer of the ETag cache, keyed by resolved identity
+/// ([`store::daemon_cache_key`]: repo + host + `gh` credential — since #5401
+/// credentials are per-root, not per-process). Backed by the shared disk
+/// store (#9252) so a daemon restart does not re-pay a `200` per listing.
 fn cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -356,12 +402,11 @@ fn cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
 // Disk-persistent cache (Issue #5056 — agent-facing cached listing surface)
 // ============================================================================
 //
-// The process-lifetime [`cache`] above serves the daemon's own long-running
-// polling loops: one process, so an in-memory `OnceLock` is the whole story.
-// Agent role prompts, by contrast, run each `gh issue list` as a **fresh,
-// short-lived process** — an in-process cache would be born empty and die
-// after one fetch, so it could never serve the "second and subsequent readers"
-// the way the daemon does. To give agents the same zero-cost-on-`304` win, the
+// The [`cache`] above serves the daemon's own long-running polling loops,
+// with an in-memory hot layer over the disk store. Agent role prompts, by
+// contrast, run each `gh issue list` as a **fresh, short-lived process** — an
+// in-process cache would be born empty and die after one fetch, so it could
+// never serve the "second and subsequent readers" the way the daemon does. To give agents the same zero-cost-on-`304` win, the
 // ETag and the last-good body are persisted to a small per-host on-disk store,
 // keyed the same way. A second CLI invocation (even in a different process, for
 // a different label) reads the prior ETag, sends `If-None-Match`, and — when
@@ -369,9 +414,10 @@ fn cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
 //
 // This is deliberately the *same* ETag/REST/304 mechanism as the in-process
 // cache, not a second cache with different semantics: it reuses
-// [`build_issues_url`], [`parse_http_response`], and [`parse_rest_issues`]. The
-// only added axis is durability across process boundaries, which is exactly
-// what the agent hot path needs and the daemon loop does not.
+// [`build_issues_url`], [`parse_http_response`], and [`parse_rest_issues`], and
+// since #9252 the same key and store ([`crate::forge_etag_store`]) as the
+// daemon's own cache, which is now durable too. The one semantic difference is
+// the #7451 shrink guard below, which only this agent path applies.
 
 /// Result of a disk-cached listing: the parsed rows plus whether the single
 /// REST page was full (so the caller can decline rather than silently serve a
@@ -381,142 +427,6 @@ pub struct CachedListing {
     pub issues: Vec<RestIssue>,
     /// `true` when the response filled a whole page and may be truncated.
     pub truncated: bool,
-}
-
-/// On-disk store directory, shared across the short-lived agent CLI processes
-/// on one host. `LOOM_LISTING_CACHE_DIR` overrides (tests point it at a
-/// tempdir); otherwise `${TMPDIR:-/tmp}/loom-forge-listing-cache`, mirroring
-/// the existing `gh-cached` `/tmp/gh-cache` convention.
-fn disk_cache_dir() -> std::path::PathBuf {
-    if let Ok(d) = std::env::var("LOOM_LISTING_CACHE_DIR") {
-        if !d.is_empty() {
-            return std::path::PathBuf::from(d);
-        }
-    }
-    let base = std::env::var("TMPDIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/tmp".to_string());
-    std::path::PathBuf::from(base).join("loom-forge-listing-cache")
-}
-
-/// Resolve the repo-identifying component folded into the disk-persistent
-/// cache key (#7275).
-///
-/// [`build_issues_url`] with no explicit `repo` embeds the **literal,
-/// unresolved** `{owner}/{repo}` placeholder text — `gh` itself resolves that
-/// correctly per invocation from its (inherited) process `cwd`'s git remote,
-/// but the placeholder string is identical across every repo that queries the
-/// same `(label, state)` pair with no explicit `--repo`. Two different repos
-/// on a multi-repo fleet host therefore hashed to the *same* on-disk cache
-/// filename, causing a wrong-repo ETag to be presented on every read
-/// (guaranteed cache miss, never a stale hit — see the "Never stale" note in
-/// `defaults/docs/gh-cached.md`).
-///
-/// Priority, mirroring `gh-cached`'s own `resolve_repo_id()` (#5224):
-/// 1. An explicit/resolved `repo` (`--repo` or `LOOM_REPO`) is already a
-///    canonical `owner/repo` string baked into `url` itself — reuse it
-///    directly so an explicit-`--repo` caller and a cwd-resolved caller for
-///    the *same* repo converge on one cache entry rather than fragmenting.
-/// 2. Otherwise, resolve `owner/repo` from `cwd`'s git remote (the same
-///    resolution `gh` performs internally for the placeholder form) via
-///    [`crate::credential_preflight::nwo_from_git_remote`] — cheap, local, no
-///    network call.
-/// 3. A `cwd` that is not a git checkout (or has no `origin` remote) falls
-///    back to the raw path, which is still per-location even if not
-///    canonically per-repo.
-/// 4. No `cwd` at all (the pre-#7275 hardcoded case) yields `""` — behavior-
-///    identical to before for any caller that truly has no cwd to resolve
-///    from.
-fn disk_cache_repo_scope(cwd: Option<&Path>, repo: Option<&str>) -> String {
-    if let Some(r) = repo {
-        return r.to_string();
-    }
-    if let Some(dir) = cwd {
-        if let Some(nwo) = crate::credential_preflight::nwo_from_git_remote(dir) {
-            return nwo;
-        }
-        return dir.display().to_string();
-    }
-    String::new()
-}
-
-/// Deterministic on-disk filename for a cache key (FNV-1a hash → hex, so no
-/// path-unsafe characters from the URL leak into the filename).
-fn disk_cache_path(cache_key: &str) -> std::path::PathBuf {
-    // FNV-1a 64-bit — dependency-free and more than adequate for a filename.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in cache_key.as_bytes() {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    disk_cache_dir().join(format!("listing-{hash:016x}.json"))
-}
-
-/// The on-disk entry shape: the validator ETag plus the raw JSON body it
-/// validated, so a `304` can reconstruct the exact prior parse.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct DiskEntry {
-    etag: String,
-    body: String,
-}
-
-fn read_disk_entry(path: &Path) -> Option<DiskEntry> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-/// Write the entry atomically (temp file + rename) so a concurrent reader on
-/// the same host never observes a half-written file.
-fn write_disk_entry(path: &Path, entry: &DiskEntry) {
-    let Some(dir) = path.parent() else { return };
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let Ok(serialized) = serde_json::to_string(entry) else {
-        return;
-    };
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("entry")
-    ));
-    if std::fs::write(&tmp, serialized).is_ok() {
-        // Best-effort: a rename failure just means the next call re-fetches.
-        let _ = std::fs::rename(&tmp, path);
-    }
-}
-
-/// One `gh api --include <url>` invocation, optionally conditional on `etag`.
-/// Factored out of [`list_issues_cached_persistent`] so the shrink-guard below
-/// can issue a second, independent request without duplicating the process
-/// plumbing.
-fn fetch_listing_once(
-    gh_bin: &Path,
-    cwd: Option<&Path>,
-    url: &str,
-    etag: Option<&str>,
-) -> Result<(std::process::ExitStatus, Option<HttpResponse>, String)> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("api").arg("--include").arg(url);
-    if let Some(e) = etag {
-        cmd.arg("-H").arg(format!("If-None-Match: {e}"));
-    }
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    // #5401: point a cross-owner managed repo's listing at its own owner's
-    // installation-token `GH_CONFIG_DIR` (no-op for single-owner fleets / a
-    // `None` cwd).
-    crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, cwd);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let response = parse_http_response(&stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    Ok((out.status, response, stderr))
 }
 
 /// List issues carrying `label` (comma-joined AND when multiple) in `state`,
@@ -552,15 +462,31 @@ pub fn list_issues_cached_persistent(
     label: &str,
     state: &str,
 ) -> Result<CachedListing> {
+    list_issues_cached_persistent_as("persistent_listing", gh_bin, cwd, repo_override, label, state)
+}
+
+/// [`list_issues_cached_persistent`], with every forge call recorded against
+/// `caller` in [`crate::forge_call_stats`] (#9251).
+pub fn list_issues_cached_persistent_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+) -> Result<CachedListing> {
     let env_repo = std::env::var("LOOM_REPO").ok();
     let repo = repo_override.or(env_repo.as_deref());
-    let url = build_issues_url(repo, label, state);
-    let cache_key = format!("{}|{url}", disk_cache_repo_scope(cwd, repo));
-    let entry_path = disk_cache_path(&cache_key);
-    let prior = read_disk_entry(&entry_path);
+    // #9252: the same resolved target + key the daemon's listing cache uses,
+    // so the two share one on-disk entry per (repo, host, credential, query).
+    let target = store::resolve_target(cwd, repo);
+    let url = build_issues_url(target.repo.as_deref(), label, state);
+    let entry_path = store::disk_cache_path(&store::cache_key(cwd, &target, &url));
+    let prior = store::read_disk_entry(&entry_path);
+    let prior_etag = prior.as_ref().map(|e| e.etag.as_str());
 
     let (status, response, stderr) =
-        fetch_listing_once(gh_bin, cwd, &url, prior.as_ref().map(|e| e.etag.as_str()))?;
+        store::fetch_conditional(caller, gh_bin, cwd, &target, &url, prior_etag)?;
 
     match response {
         Some(ref r) if r.status == 304 => match prior {
@@ -592,7 +518,7 @@ pub fn list_issues_cached_persistent(
             {
                 if issues.len() < prior_issues.len() {
                     let confirmed = matches!(
-                        fetch_listing_once(gh_bin, cwd, &url, None),
+                        store::fetch_conditional(caller, gh_bin, cwd, &target, &url, None),
                         Ok((confirm_status, Some(ref cr), _))
                             if confirm_status.success()
                                 && cr.status == 200
@@ -620,9 +546,9 @@ pub fn list_issues_cached_persistent(
             }
 
             if let Some(etag) = r.etag.clone() {
-                write_disk_entry(
+                store::write_disk_entry(
                     &entry_path,
-                    &DiskEntry {
+                    &store::DiskEntry {
                         etag,
                         body: r.body.clone(),
                     },
@@ -641,833 +567,5 @@ pub fn list_issues_cached_persistent(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    // ===== parse_http_response =====
-
-    const OK_RESPONSE: &str = "HTTP/2.0 200 OK\r\n\
-        Etag: W/\"abc123\"\r\n\
-        X-Ratelimit-Remaining: 4034\r\n\
-        \r\n\
-        [{\"number\": 7}]";
-
-    #[test]
-    fn parses_200_with_etag_and_body() {
-        let r = parse_http_response(OK_RESPONSE).unwrap();
-        assert_eq!(r.status, 200);
-        assert_eq!(r.etag.as_deref(), Some("W/\"abc123\""));
-        assert_eq!(r.body.trim(), "[{\"number\": 7}]");
-    }
-
-    #[test]
-    fn parses_304_without_body() {
-        let raw = "HTTP/2.0 304 Not Modified\r\nCache-Control: private, max-age=60\r\n\r\n";
-        let r = parse_http_response(raw).unwrap();
-        assert_eq!(r.status, 304);
-        assert!(r.body.trim().is_empty());
-    }
-
-    /// Regression for the #4443 review finding: a response with GitHub's real
-    /// ~20-header block (CRLF terminators) must split headers/body exactly.
-    /// The old line-length reconstruction undercounted each `\r\n` header by
-    /// one byte, so the "body" started inside the header block (e.g.
-    /// `"58\r\nX-Xss-Protection: 0\r\n\r\n[{…"`) and every real 200 fetch
-    /// failed to parse — masked in the small fixtures above because their
-    /// few stray bytes were pure whitespace that `trim()` swallowed.
-    #[test]
-    fn parses_realistic_multi_header_crlf_response() {
-        let headers = [
-            "HTTP/2.0 200 OK",
-            "Access-Control-Allow-Origin: *",
-            "Access-Control-Expose-Headers: ETag, Link, Location, Retry-After, X-GitHub-OTP, \
-             X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Used, X-RateLimit-Resource, \
-             X-RateLimit-Reset, X-OAuth-Scopes, X-Accepted-OAuth-Scopes, X-Poll-Interval, \
-             X-GitHub-Media-Type, X-GitHub-SSO, X-GitHub-Request-Id, Deprecation, Sunset, Warning",
-            "Cache-Control: private, max-age=60, s-maxage=60",
-            "Content-Security-Policy: default-src 'none'",
-            "Content-Type: application/json; charset=utf-8",
-            "Etag: W/\"6289abc123def\"",
-            "Referrer-Policy: origin-when-cross-origin, strict-origin-when-cross-origin",
-            "Server: github.com",
-            "Strict-Transport-Security: max-age=31536000; includeSubdomains; preload",
-            "Vary: Accept, Authorization, Cookie, X-GitHub-OTP",
-            "X-Accepted-Oauth-Scopes: repo",
-            "X-Content-Type-Options: nosniff",
-            "X-Frame-Options: deny",
-            "X-Github-Api-Version-Selected: 2022-11-28",
-            "X-Github-Media-Type: github.v3; format=json",
-            "X-Github-Request-Id: E5E5:1234:ABCDEF:FEDCBA:66A7B8C9",
-            "X-Oauth-Scopes: gist, read:org, repo, workflow",
-            "X-Ratelimit-Limit: 5000",
-            "X-Ratelimit-Remaining: 4034",
-            "X-Ratelimit-Reset: 1785356436",
-            "X-Ratelimit-Resource: core",
-            "X-Ratelimit-Used: 966",
-            "Content-Length: 58",
-            "X-Xss-Protection: 0",
-        ]
-        .join("\r\n");
-        let body_json =
-            r#"[{"number": 4441, "state": "open", "labels": [{"name": "loom:issue"}]}]"#;
-        let raw = format!("{headers}\r\n\r\n{body_json}");
-
-        let r = parse_http_response(&raw).unwrap();
-        assert_eq!(r.status, 200);
-        assert_eq!(r.etag.as_deref(), Some("W/\"6289abc123def\""));
-        assert_eq!(
-            r.body, body_json,
-            "the body must be EXACTLY the JSON payload — no header-tail bytes"
-        );
-        let issues = parse_rest_issues(&r.body).unwrap();
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].number, 4441);
-    }
-
-    /// The boundary search must not be confused by an LF-only pair occurring
-    /// AFTER the CRLF header/body boundary (e.g. inside a JSON string value).
-    #[test]
-    fn crlf_boundary_wins_over_later_lf_pair_in_body() {
-        let raw = "HTTP/2.0 200 OK\r\nEtag: \"x\"\r\n\r\n[{\"number\": 1, \"state\": \"open\", \
-                   \"labels\": [], \"body\": \"line1\\n\\nline2\"}]";
-        let r = parse_http_response(raw).unwrap();
-        assert!(r.body.starts_with("[{"));
-        assert_eq!(parse_rest_issues(&r.body).unwrap()[0].number, 1);
-    }
-
-    #[test]
-    fn rejects_non_http_output() {
-        assert!(parse_http_response("gh: command not found").is_none());
-        assert!(parse_http_response("").is_none());
-    }
-
-    #[test]
-    fn header_parse_survives_lf_only_lines() {
-        let raw = "HTTP/1.1 200 OK\nEtag: \"x\"\n\n[]";
-        let r = parse_http_response(raw).unwrap();
-        assert_eq!(r.status, 200);
-        assert_eq!(r.etag.as_deref(), Some("\"x\""));
-        assert_eq!(r.body, "[]");
-    }
-
-    // ===== parse_rest_issues =====
-
-    #[test]
-    fn parses_issues_and_marks_pull_requests() {
-        let body = r#"[
-            {"number": 42, "state": "open",
-             "labels": [{"name": "loom:issue"}, {"name": "tier:goal-supporting"}],
-             "created_at": "2026-07-29T00:00:00Z", "updated_at": "2026-07-29T01:00:00Z",
-             "body": "the body"},
-            {"number": 43, "state": "open", "labels": [],
-             "pull_request": {"url": "https://api.github.com/repos/o/r/pulls/43"}}
-        ]"#;
-        let issues = parse_rest_issues(body).unwrap();
-        assert_eq!(issues.len(), 2);
-        assert_eq!(issues[0].number, 42);
-        assert_eq!(issues[0].labels, vec!["loom:issue", "tier:goal-supporting"]);
-        assert!(!issues[0].is_pull_request);
-        assert_eq!(issues[0].state, "open");
-        assert!(issues[1].is_pull_request);
-    }
-
-    #[test]
-    fn rejects_malformed_bodies() {
-        assert!(parse_rest_issues("not json").is_err());
-        assert!(parse_rest_issues("{\"not\": \"an array\"}").is_err());
-    }
-
-    // ===== build_issues_url =====
-
-    #[test]
-    fn url_uses_placeholders_without_override_and_repo_with() {
-        assert_eq!(
-            build_issues_url(None, "loom:issue", "open"),
-            "repos/{owner}/{repo}/issues?labels=loom:issue&state=open&per_page=100"
-        );
-        assert_eq!(
-            build_issues_url(Some("rjwalters/loom"), "loom:epic-phase", "all"),
-            "repos/rjwalters/loom/issues?labels=loom:epic-phase&state=all&per_page=100"
-        );
-    }
-
-    // ===== end-to-end cache flow with a fake gh =====
-
-    /// A fake `gh` that returns 200+ETag+body on the first call and, when the
-    /// caller presents that ETag, 304 + exit 1 (mirroring real gh) after.
-    fn write_fake_gh(dir: &Path) -> PathBuf {
-        let path = dir.join("fake-gh.sh");
-        let body = r#"#!/bin/sh
-case "$*" in
-  *'If-None-Match: W/"round1"'*)
-    printf 'HTTP/2.0 304 Not Modified\r\n\r\n'
-    echo 'gh: Not Modified (HTTP 304)' 1>&2
-    exit 1
-    ;;
-  *)
-    printf 'HTTP/2.0 200 OK\r\nEtag: W/"round1"\r\n\r\n'
-    printf '[{"number": 7, "state": "open", "labels": [{"name": "loom:issue"}]}]\n'
-    ;;
-esac
-"#;
-        std::fs::write(&path, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
-        path
-    }
-
-    #[test]
-    fn caches_etag_and_serves_304_from_cache() {
-        let dir = tempfile::tempdir().unwrap();
-        let gh = write_fake_gh(dir.path());
-        // A unique repo string keys this test's cache slot so parallel tests
-        // (and reruns in one process) never collide.
-        let repo = format!("test/etag-flow-{}", std::process::id());
-
-        // Round 1: 200 → parsed + cached.
-        let first =
-            list_issues_cached(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open").unwrap();
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].number, 7);
-
-        // Round 2: fake gh sees our If-None-Match and answers 304 + exit 1;
-        // the listing must come back identical, straight from the cache.
-        let second =
-            list_issues_cached(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open").unwrap();
-        assert_eq!(second, first);
-    }
-
-    /// The disk-persistent variant must behave like the in-process one across
-    /// *separate* short-lived processes: the first call (200) writes the ETag +
-    /// body to disk; a second call — which for the persistent path has no
-    /// in-memory state, exactly as a fresh agent CLI process would — presents
-    /// that ETag, gets a free 304, and reconstructs the identical listing from
-    /// the on-disk body.
-    ///
-    /// `#[serial_test::serial]`: mutates the process-global
-    /// `LOOM_LISTING_CACHE_DIR` env var, which every disk-cache test in this
-    /// module shares — unserialized, a concurrently-running test's `set_var`
-    /// can be observed mid-test and point this one at the wrong tempdir.
-    #[test]
-    #[serial_test::serial]
-    fn disk_cache_persists_etag_and_serves_304_across_processes() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        std::env::set_var("LOOM_LISTING_CACHE_DIR", cache.path());
-        let gh = write_fake_gh(dir.path());
-        let repo = format!("test/disk-flow-{}", std::process::id());
-
-        // Round 1: 200 → parsed + written to disk (not truncated: 1 row).
-        let first =
-            list_issues_cached_persistent(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open")
-                .unwrap();
-        assert_eq!(first.issues.len(), 1);
-        assert_eq!(first.issues[0].number, 7);
-        assert!(!first.truncated);
-        // The entry file now exists on disk (durable across process exit).
-        assert!(std::fs::read_dir(cache.path()).unwrap().count() >= 1);
-
-        // Round 2: the fake gh answers 304 to the presented If-None-Match; the
-        // listing must come back identical, reconstructed from the disk body.
-        let second =
-            list_issues_cached_persistent(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open")
-                .unwrap();
-        assert_eq!(second.issues, first.issues);
-        std::env::remove_var("LOOM_LISTING_CACHE_DIR");
-    }
-
-    // ========================================================================
-    // Shrink guard against a single-read alternation (#7451)
-    // ========================================================================
-
-    /// A fake `gh` that, keyed purely on invocation ORDER (not the presented
-    /// `If-None-Match`), models exactly the #7451 repro: a correct 3-item
-    /// response, then — on the very next call — a single transient,
-    /// inconsistent `200` with ZERO items (simulating GitHub's issues-listing
-    /// endpoint occasionally disagreeing with itself on one request under
-    /// concurrent label churn, with no real state change), then a re-fetch
-    /// that reverts to the correct 3-item answer, then `304`s forever after
-    /// (steady state once the disk entry settles).
-    fn write_fake_gh_transient_shrink(dir: &Path, calls_log: &Path) -> PathBuf {
-        let path = dir.join("fake-gh-shrink.sh");
-        let body = format!(
-            r#"#!/bin/sh
-echo x >> {calls}
-n=$(wc -l < {calls} | tr -d ' ')
-three='[{{"number": 1, "state": "open", "labels": [{{"name": "loom:epic"}}]}}, {{"number": 2, "state": "open", "labels": [{{"name": "loom:epic"}}]}}, {{"number": 3, "state": "open", "labels": [{{"name": "loom:epic"}}]}}]'
-case "$n" in
-  1)
-    printf 'HTTP/2.0 200 OK\r\nEtag: W/"gen1"\r\n\r\n'
-    printf '%s\n' "$three"
-    ;;
-  2)
-    # The transient, single-request-only disagreement: fewer items, a new
-    # etag, despite no real label mutation having happened.
-    printf 'HTTP/2.0 200 OK\r\nEtag: W/"gen2-flaky"\r\n\r\n'
-    printf '[]\n'
-    ;;
-  3)
-    # The shrink guard's unconditional re-fetch: reverts to the truth.
-    printf 'HTTP/2.0 200 OK\r\nEtag: W/"gen1"\r\n\r\n'
-    printf '%s\n' "$three"
-    ;;
-  *)
-    # Steady state: whatever we hold (gen1, never overwritten by gen2-flaky)
-    # validates as unchanged.
-    printf 'HTTP/2.0 304 Not Modified\r\n\r\n'
-    echo 'gh: Not Modified (HTTP 304)' 1>&2
-    exit 1
-    ;;
-esac
-"#,
-            calls = calls_log.display()
-        );
-        std::fs::write(&path, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
-        path
-    }
-
-    /// Regression for #7451: a single transient/inconsistent empty read must
-    /// never be trusted and durably cached — repeated calls across the
-    /// alternation window (and after it settles) must all keep returning the
-    /// correct 3-item listing, never the flaky empty one, and the on-disk
-    /// entry must never be overwritten with the disputed `gen2-flaky` etag.
-    #[test]
-    #[serial_test::serial]
-    fn a_transient_single_read_shrink_never_reaches_the_caller_or_the_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        std::env::set_var("LOOM_LISTING_CACHE_DIR", cache.path());
-        let calls_log = dir.path().join("calls.log");
-        let gh = write_fake_gh_transient_shrink(dir.path(), &calls_log);
-        let repo = format!("test/shrink-guard-{}", std::process::id());
-
-        // Round 1: establishes the correct 3-item cache entry (gen1).
-        let first =
-            list_issues_cached_persistent(&gh, Some(dir.path()), Some(&repo), "loom:epic", "open")
-                .unwrap();
-        assert_eq!(first.issues.len(), 3);
-
-        // Round 2: the underlying `gh` answers with the transient empty
-        // read (invocation #2) — the guard must issue its own corroborating
-        // re-fetch (invocation #3, which reverts to gen1/3-items) and return
-        // the CORRECT listing to the caller, never the flaky `[]`.
-        let second =
-            list_issues_cached_persistent(&gh, Some(dir.path()), Some(&repo), "loom:epic", "open")
-                .unwrap();
-        assert_eq!(
-            second.issues.len(),
-            3,
-            "a single-request shrink must never reach the caller unconfirmed"
-        );
-
-        // The on-disk entry must still hold the ORIGINAL gen1 etag/body — the
-        // disputed gen2-flaky response must never have been persisted.
-        let on_disk = read_disk_entry(&disk_cache_path(&format!(
-            "{}|{}",
-            disk_cache_repo_scope(Some(dir.path()), Some(&repo)),
-            build_issues_url(Some(&repo), "loom:epic", "open")
-        )))
-        .unwrap();
-        assert_eq!(on_disk.etag, "W/\"gen1\"");
-
-        // Round 3 onward: the fake gh now only ever answers 304 (steady
-        // state) — every further call in the "alternation window" from the
-        // bug report must keep returning 3, never flip back to empty.
-        for _ in 0..4 {
-            let round = list_issues_cached_persistent(
-                &gh,
-                Some(dir.path()),
-                Some(&repo),
-                "loom:epic",
-                "open",
-            )
-            .unwrap();
-            assert_eq!(round.issues.len(), 3, "no post-settle alternation back to empty");
-        }
-
-        std::env::remove_var("LOOM_LISTING_CACHE_DIR");
-    }
-
-    /// A genuine shrink — corroborated by the re-fetch — must still go
-    /// through: the guard only filters a single-request disagreement, it
-    /// never blocks a real, confirmed content change.
-    #[test]
-    #[serial_test::serial]
-    fn a_corroborated_shrink_is_accepted_and_persisted() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        std::env::set_var("LOOM_LISTING_CACHE_DIR", cache.path());
-        let path = dir.path().join("fake-gh-real-shrink.sh");
-        let calls_log = dir.path().join("calls.log");
-        std::fs::write(
-            &path,
-            format!(
-                r#"#!/bin/sh
-echo x >> {calls}
-n=$(wc -l < {calls} | tr -d ' ')
-case "$n" in
-  1)
-    printf 'HTTP/2.0 200 OK\r\nEtag: W/"gen1"\r\n\r\n'
-    printf '[{{"number": 1, "state": "open", "labels": [{{"name": "loom:epic"}}]}}]\n'
-    ;;
-  *)
-    # Every later call (the shrink itself AND the guard's own re-fetch) sees
-    # the SAME genuinely-empty state — a real, corroborated content change.
-    printf 'HTTP/2.0 200 OK\r\nEtag: W/"gen2"\r\n\r\n'
-    printf '[]\n'
-    ;;
-esac
-"#,
-                calls = calls_log.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
-        let repo = format!("test/real-shrink-{}", std::process::id());
-
-        let first = list_issues_cached_persistent(
-            &path,
-            Some(dir.path()),
-            Some(&repo),
-            "loom:epic",
-            "open",
-        )
-        .unwrap();
-        assert_eq!(first.issues.len(), 1);
-
-        let second = list_issues_cached_persistent(
-            &path,
-            Some(dir.path()),
-            Some(&repo),
-            "loom:epic",
-            "open",
-        )
-        .unwrap();
-        assert_eq!(
-            second.issues.len(),
-            0,
-            "a re-fetch-corroborated real shrink must be accepted, not suppressed"
-        );
-
-        std::env::remove_var("LOOM_LISTING_CACHE_DIR");
-    }
-
-    // ========================================================================
-    // Disk-persistent cache key repo scoping (#7275)
-    // ========================================================================
-
-    /// `git init` + an `origin` remote pointing at `owner_repo`, so
-    /// [`crate::credential_preflight::nwo_from_git_remote`] resolves it.
-    fn init_git_repo_with_remote(dir: &Path, owner_repo: &str) {
-        assert!(Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir)
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .args([
-                "remote",
-                "add",
-                "origin",
-                &format!("https://github.com/{owner_repo}.git")
-            ])
-            .current_dir(dir)
-            .status()
-            .unwrap()
-            .success());
-    }
-
-    #[test]
-    fn disk_cache_repo_scope_prefers_explicit_repo_over_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        init_git_repo_with_remote(dir.path(), "fixture-owner/from-remote");
-        assert_eq!(
-            disk_cache_repo_scope(Some(dir.path()), Some("fixture-owner/explicit")),
-            "fixture-owner/explicit"
-        );
-    }
-
-    #[test]
-    fn disk_cache_repo_scope_resolves_distinct_git_remotes() {
-        let dir_a = tempfile::tempdir().unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
-        init_git_repo_with_remote(dir_a.path(), "fixture-owner/repo-a");
-        init_git_repo_with_remote(dir_b.path(), "fixture-owner/repo-b");
-
-        let scope_a = disk_cache_repo_scope(Some(dir_a.path()), None);
-        let scope_b = disk_cache_repo_scope(Some(dir_b.path()), None);
-        assert_eq!(scope_a, "fixture-owner/repo-a");
-        assert_eq!(scope_b, "fixture-owner/repo-b");
-        assert_ne!(scope_a, scope_b);
-    }
-
-    #[test]
-    fn disk_cache_repo_scope_falls_back_to_raw_cwd_for_a_non_git_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(disk_cache_repo_scope(Some(dir.path()), None), dir.path().display().to_string());
-    }
-
-    #[test]
-    fn disk_cache_repo_scope_is_empty_with_no_cwd_and_no_repo() {
-        // The pre-#7275 collision precondition: with neither a cwd nor a
-        // resolved repo, there is no repo-identifying signal to scope by at
-        // all — this is exactly why `default_fetcher` hardcoding `cwd: None`
-        // was the actual defect (fixed by forwarding the real process cwd).
-        assert_eq!(disk_cache_repo_scope(None, None), "");
-    }
-
-    /// A fake `gh` whose response depends on which fixture repo directory it
-    /// was invoked in (mirroring how real `gh` resolves `{owner}/{repo}`
-    /// placeholders from the inherited process cwd's git remote) — so a
-    /// single shared binary can serve two disjoint fixture repos. The first
-    /// call for a repo gets `200` + a repo-specific ETag/body; presenting that
-    /// same ETag again gets `304`.
-    fn write_fake_gh_for_repo(dir: &Path, repo_dirname: &str, etag: &str, body: &str) -> PathBuf {
-        let path = dir.join(format!("fake-gh-{repo_dirname}.sh"));
-        let script = format!(
-            r#"#!/bin/sh
-here="$(pwd)"
-case "$here" in
-  */{repo_dirname})
-    case "$*" in
-      *'If-None-Match: {etag}'*)
-        printf 'HTTP/2.0 304 Not Modified\r\n\r\n'
-        echo 'gh: Not Modified (HTTP 304)' 1>&2
-        exit 1
-        ;;
-      *)
-        printf 'HTTP/2.0 200 OK\r\nEtag: {etag}\r\n\r\n'
-        printf '%s\n' '{body}'
-        ;;
-    esac
-    ;;
-  *)
-    echo "unexpected cwd for {repo_dirname} fixture: $here" 1>&2
-    exit 1
-    ;;
-esac
-"#
-        );
-        std::fs::write(&path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
-        path
-    }
-
-    /// Regression for #7275: two different fixture repos, each with its own
-    /// `origin` remote and disjoint issue data, querying the IDENTICAL
-    /// `(label, state)` combo through [`list_issues_cached_persistent`] and
-    /// sharing ONE on-disk cache directory (exactly the "multi-repo fleet
-    /// host" scenario from the bug report) must never read or serve the
-    /// other's listing — each gets its own file, keyed by its resolved
-    /// `owner/repo`, not a placeholder-only string that collapses across
-    /// repos.
-    #[test]
-    #[serial_test::serial]
-    fn two_repos_sharing_a_disk_cache_never_cross_contaminate() {
-        let base = tempfile::tempdir().unwrap();
-        let repo_a = base.path().join("repo-a");
-        let repo_b = base.path().join("repo-b");
-        std::fs::create_dir_all(&repo_a).unwrap();
-        std::fs::create_dir_all(&repo_b).unwrap();
-        init_git_repo_with_remote(&repo_a, "fixture-owner/repo-a");
-        init_git_repo_with_remote(&repo_b, "fixture-owner/repo-b");
-
-        let gh_a = write_fake_gh_for_repo(
-            base.path(),
-            "repo-a",
-            "W/\"repo-a-etag\"",
-            r#"[{"number": 100, "state": "open", "labels": [{"name": "loom:issue"}]}]"#,
-        );
-        let gh_b = write_fake_gh_for_repo(
-            base.path(),
-            "repo-b",
-            "W/\"repo-b-etag\"",
-            r#"[{"number": 200, "state": "open", "labels": [{"name": "loom:issue"}]}]"#,
-        );
-
-        let cache = tempfile::tempdir().unwrap();
-        std::env::set_var("LOOM_LISTING_CACHE_DIR", cache.path());
-
-        // Both queries share the identical (label, state) combo AND, with no
-        // `--repo` override, the identical UNRESOLVED URL — the exact
-        // precondition the bug report describes.
-        let listing_a =
-            list_issues_cached_persistent(&gh_a, Some(&repo_a), None, "loom:issue", "open")
-                .unwrap();
-        let listing_b =
-            list_issues_cached_persistent(&gh_b, Some(&repo_b), None, "loom:issue", "open")
-                .unwrap();
-
-        assert_eq!(listing_a.issues.len(), 1);
-        assert_eq!(listing_a.issues[0].number, 100);
-        assert_eq!(listing_b.issues.len(), 1);
-        assert_eq!(listing_b.issues[0].number, 200);
-
-        // Two distinct on-disk entries — never one shared file.
-        assert_eq!(
-            std::fs::read_dir(cache.path()).unwrap().count(),
-            2,
-            "each repo must get its own disk cache entry, never a shared one"
-        );
-
-        // Re-querying each repo presents its OWN etag and gets a 304,
-        // reconstructing its OWN (never the other repo's) cached body.
-        let listing_a_again =
-            list_issues_cached_persistent(&gh_a, Some(&repo_a), None, "loom:issue", "open")
-                .unwrap();
-        let listing_b_again =
-            list_issues_cached_persistent(&gh_b, Some(&repo_b), None, "loom:issue", "open")
-                .unwrap();
-        assert_eq!(listing_a_again.issues, listing_a.issues);
-        assert_eq!(listing_b_again.issues, listing_b.issues);
-
-        std::env::remove_var("LOOM_LISTING_CACHE_DIR");
-    }
-
-    #[test]
-    fn errors_carry_stderr_for_the_rate_limit_classifier() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fake-gh.sh");
-        std::fs::write(
-            &path,
-            "#!/bin/sh\necho 'gh: API rate limit exceeded for user ID 1 (HTTP 403)' 1>&2\nexit 1\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
-        let repo = format!("test/limit-{}", std::process::id());
-        let err = list_issues_cached(&path, Some(dir.path()), Some(&repo), "loom:issue", "open")
-            .unwrap_err();
-        assert!(crate::rate_limit_breaker::indicates_rate_limit(&err.to_string()));
-    }
-
-    // ========================================================================
-    // Forced-refresh retry on a registered-workspace 404 (#6171)
-    // ========================================================================
-
-    #[test]
-    fn is_404_error_matches_only_an_http_404() {
-        assert!(is_404_error(
-            "gh api repos/x/y/issues failed in /path: gh: Not Found (HTTP 404)"
-        ));
-        assert!(!is_404_error("gh: API rate limit exceeded for user ID 1 (HTTP 403)"));
-        assert!(!is_404_error("could not invoke gh: No such file or directory"));
-        assert!(!is_404_error(""));
-    }
-
-    /// A fake `gh` that always answers a 404 (mirroring the exact repro text
-    /// from #6171: `gh: Not Found (HTTP 404)`), recording one line per
-    /// invocation to `calls_log` so a test can assert how many times it ran.
-    fn write_fake_gh_always_404(dir: &Path, calls_log: &Path) -> PathBuf {
-        let path = dir.join("fake-gh-404.sh");
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\necho x >> {}\necho 'gh: Not Found (HTTP 404)' 1>&2\nexit 1\n",
-                calls_log.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
-        path
-    }
-
-    #[test]
-    fn a_404_with_no_git_remote_never_retries_and_returns_the_original_error() {
-        // #6171's recovery path needs `nwo_from_git_remote(cwd)` to resolve an
-        // owner/repo before it can do anything — a `cwd` that isn't even a git
-        // checkout (the common case for a `LOOM_REPO`-only invocation with a
-        // scratch `cwd`) must behave byte-identically to any other failure:
-        // exactly one `gh` invocation, the original error surfaced unchanged.
-        // This holds regardless of whether some OTHER daemon process has ever
-        // registered a primary workspace root, so it carries no cross-test
-        // ordering hazard.
-        let dir = tempfile::tempdir().unwrap();
-        let calls_log = dir.path().join("calls.log");
-        let gh = write_fake_gh_always_404(dir.path(), &calls_log);
-        let repo = format!("test/404-no-remote-{}", std::process::id());
-
-        let err = list_issues_cached(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open")
-            .unwrap_err();
-        assert!(err.to_string().contains("HTTP 404"));
-        assert_eq!(
-            std::fs::read_to_string(&calls_log).unwrap().lines().count(),
-            1,
-            "no retry without a resolvable owner/repo to refresh a credential for"
-        );
-    }
-
-    #[test]
-    fn a_404_with_cwd_none_never_attempts_a_retry() {
-        // The retry path is scoped to a *registered workspace* — a `None`
-        // cwd (no checkout root to refresh a credential for) must skip it
-        // entirely, exactly like the no-remote case above.
-        let dir = tempfile::tempdir().unwrap();
-        let calls_log = dir.path().join("calls.log");
-        let gh = write_fake_gh_always_404(dir.path(), &calls_log);
-        let repo = format!("test/404-cwd-none-{}", std::process::id());
-
-        let err = list_issues_cached(&gh, None, Some(&repo), "loom:issue", "open").unwrap_err();
-        assert!(err.to_string().contains("HTTP 404"));
-        assert_eq!(std::fs::read_to_string(&calls_log).unwrap().lines().count(), 1);
-    }
-
-    #[test]
-    fn a_non_404_failure_never_attempts_a_retry() {
-        // A rate-limit 403 (or any other failure) must not trigger the #6171
-        // recovery path at all — it is scoped to 404s specifically (AC2).
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fake-gh-403.sh");
-        let calls_log = dir.path().join("calls.log");
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\necho x >> {}\necho 'gh: API rate limit exceeded for user ID 1 (HTTP \
-                 403)' 1>&2\nexit 1\n",
-                calls_log.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
-        let repo = format!("test/403-{}", std::process::id());
-        let err = list_issues_cached(&path, Some(dir.path()), Some(&repo), "loom:issue", "open")
-            .unwrap_err();
-        assert!(err.to_string().contains("HTTP 403"));
-        assert_eq!(std::fs::read_to_string(&calls_log).unwrap().lines().count(), 1);
-    }
-
-    #[test]
-    fn a_registered_workspace_404_forces_one_refresh_and_retries_successfully() {
-        // #6171 end-to-end (mirrors the reported repro): a per-owner
-        // credential minted before a workspace was registered 404s on the
-        // first scan; a forced mint + one retry recovers within the SAME
-        // call — no restart, no second tick required (AC1/AC2).
-        //
-        // `register_primary_workspace_root` is a set-once `OnceLock` with
-        // exactly one production call site (`daemon_service.rs`, never
-        // exercised by `cargo test`) and no other test in this crate ever
-        // calls it — safe to register here for the lifetime of the test
-        // binary; every OTHER test's "no retry" assertions above hold
-        // regardless of this global's state (they short-circuit earlier, on
-        // a missing git remote or a `None` cwd).
-        let workspace_root = tempfile::tempdir().unwrap();
-        let script_dir = workspace_root.path().join(".loom/scripts/lib");
-        std::fs::create_dir_all(&script_dir).unwrap();
-        let app_script = script_dir.join("github-app-token.sh");
-        std::fs::write(
-            &app_script,
-            "#!/bin/sh\necho '{\"status\":\"ok\",\"token\":\"ghs_retry\",\"installation_id\":\"1\",\"app_id\":\"2\",\"expires_at\":\"2099-01-01T00:00:00Z\"}'\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&app_script).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&app_script, perms).unwrap();
-        }
-        crate::credential_preflight::register_primary_workspace_root(workspace_root.path());
-
-        let repo_root = tempfile::tempdir().unwrap();
-        assert!(Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(repo_root.path())
-            .status()
-            .unwrap()
-            .success());
-        let owner_repo = format!("test-owner-{}/retry-repo", std::process::id());
-        assert!(Command::new("git")
-            .args([
-                "remote",
-                "add",
-                "origin",
-                &format!("https://github.com/{owner_repo}.git")
-            ])
-            .current_dir(repo_root.path())
-            .status()
-            .unwrap()
-            .success());
-
-        let calls_log = repo_root.path().join("calls.log");
-        let fake_gh = repo_root.path().join("fake-gh-then-recovers.sh");
-        std::fs::write(
-            &fake_gh,
-            format!(
-                "#!/bin/sh\necho x >> {calls}\nn=$(wc -l < {calls})\nif [ \"$n\" -eq 1 ]; then\n  \
-                 echo 'gh: Not Found (HTTP 404)' 1>&2\n  exit 1\nelse\n  printf 'HTTP/2.0 200 \
-                 OK\\r\\n\\r\\n'\n  printf '[{{\"number\": 99, \"state\": \"open\", \"labels\": \
-                 [{{\"name\": \"loom:issue\"}}]}}]\\n'\nfi\n",
-                calls = calls_log.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&fake_gh, perms).unwrap();
-        }
-
-        let issues = list_issues_cached(
-            &fake_gh,
-            Some(repo_root.path()),
-            Some(&owner_repo),
-            "loom:issue",
-            "open",
-        )
-        .expect("the second attempt, after the forced refresh, must succeed");
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].number, 99);
-
-        let calls = std::fs::read_to_string(&calls_log).unwrap();
-        assert_eq!(
-            calls.lines().count(),
-            2,
-            "exactly one retry after the forced refresh, never a loop: {calls:?}"
-        );
-    }
-}
+#[path = "forge_listing_tests.rs"]
+mod tests;

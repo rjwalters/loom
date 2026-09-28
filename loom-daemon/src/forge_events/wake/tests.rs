@@ -173,7 +173,7 @@ fn every_consumer_is_off_by_default_and_resolves_env_over_config() {
 
     let all_on = ConsumerConfig {
         work_finder_tick: Some(true),
-        queue_head_wake: Some(true),
+        claim_reconcile_wake: Some(true),
         in_flight_pr_watch: Some(true),
         min_spacing_secs: None,
     };
@@ -249,14 +249,14 @@ fn read_config_maps_every_camel_case_key() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_events_config(
         dir.path(),
-        r#"{"workFinderTick":true,"queueHeadWake":false,"inFlightPrWatch":true,
+        r#"{"workFinderTick":true,"claimReconcileWake":false,"inFlightPrWatch":true,
             "minSpacingSecs":45}"#,
     );
     assert_eq!(
         read_config(dir.path()),
         ConsumerConfig {
             work_finder_tick: Some(true),
-            queue_head_wake: Some(false),
+            claim_reconcile_wake: Some(false),
             in_flight_pr_watch: Some(true),
             min_spacing_secs: Some(45),
         }
@@ -293,14 +293,14 @@ fn only_a_claimable_shaped_page_from_the_feed_qualifies() {
 
 #[test]
 fn each_consumer_acts_on_its_own_event_shapes_only() {
-    // Queue-head wake: a claim is released by a comment on the claimed issue
+    // Claim-reconcile wake: a claim is released by a comment on the claimed issue
     // or by a PR reaching terminal state — not by a check completing, and not
     // by an issue merely being opened.
-    assert!(payload_qualifies(&payload_of(&["issue_comment"]), QUEUE_HEAD.types));
-    assert!(payload_qualifies(&payload_of(&["pull_request"]), QUEUE_HEAD.types));
+    assert!(payload_qualifies(&payload_of(&["issue_comment"]), CLAIM_RECONCILE.types));
+    assert!(payload_qualifies(&payload_of(&["pull_request"]), CLAIM_RECONCILE.types));
     assert!(!payload_qualifies(
         &payload_of(&["check_run", "check_suite", "push"]),
-        QUEUE_HEAD.types
+        CLAIM_RECONCILE.types
     ));
 
     // In-flight PR watch: the PR itself, or its checks.
@@ -406,9 +406,9 @@ async fn work_finder_flag_off_never_subscribes_and_never_wakes() {
 
 #[tokio::test(start_paused = true)]
 #[serial]
-async fn queue_head_flag_off_never_subscribes_and_never_wakes() {
-    assert_flag_off_is_zero_wakes(&QUEUE_HEAD, None).await;
-    assert_flag_off_is_zero_wakes(&QUEUE_HEAD, Some(r#"{"queueHeadWake":false}"#)).await;
+async fn claim_reconcile_flag_off_never_subscribes_and_never_wakes() {
+    assert_flag_off_is_zero_wakes(&CLAIM_RECONCILE, None).await;
+    assert_flag_off_is_zero_wakes(&CLAIM_RECONCILE, Some(r#"{"claimReconcileWake":false}"#)).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -569,8 +569,8 @@ async fn a_five_hundred_page_burst_costs_the_work_finder_exactly_one_early_tick(
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_five_hundred_page_burst_costs_the_queue_head_exactly_one_early_tick() {
-    assert_burst_costs_one_tick(&QUEUE_HEAD).await;
+async fn a_five_hundred_page_burst_costs_the_claim_reconcile_exactly_one_early_tick() {
+    assert_burst_costs_one_tick(&CLAIM_RECONCILE).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -585,25 +585,25 @@ async fn a_five_hundred_page_burst_costs_the_pr_watch_exactly_one_early_tick() {
 async fn a_shared_burst_coalesces_independently_for_each_armed_loop() {
     let bus = EventBus::new();
     let mut work_finder = armed_and_ready_for(&WORK_FINDER, &bus, FLOOR).await;
-    let mut queue_head = armed_and_ready_for(&QUEUE_HEAD, &bus, FLOOR).await;
+    let mut claim_reconcile = armed_and_ready_for(&CLAIM_RECONCILE, &bus, FLOOR).await;
     let mut pr_watch = armed_and_ready_for(&IN_FLIGHT_PR, &bus, FLOOR).await;
     assert_eq!(bus.receiver_count(), 3);
 
-    // `issue_comment` is the one type both the work finder and the queue-head
+    // `issue_comment` is the one type both the work finder and the claim-reconcile
     // consumer act on, and that the PR watch does not.
     for _ in 0..500 {
         publish_page(&bus, &["issue_comment"]);
     }
 
     assert!(ticked_soon(&mut work_finder).await);
-    assert!(ticked_soon(&mut queue_head).await);
+    assert!(ticked_soon(&mut claim_reconcile).await);
     assert!(
         !ticked_soon(&mut pr_watch).await,
         "a type the PR watch does not act on must leave it on its cadence"
     );
 
     assert_eq!(work_finder.counters().early_ticks(), 1);
-    assert_eq!(queue_head.counters().early_ticks(), 1);
+    assert_eq!(claim_reconcile.counters().early_ticks(), 1);
     assert_eq!(pr_watch.counters().early_ticks(), 0);
     assert_eq!(pr_watch.counters().prompts(), 0);
 }
@@ -784,4 +784,121 @@ async fn a_plain_ticker_carries_no_wake_state() {
     assert_eq!(ticker.counters().prompts(), 0);
     assert_eq!(ticker.counters().early_ticks(), 0);
     assert_eq!(ticker.counters().throttled(), 0);
+}
+
+// ============================================================================
+// Naming: the flag names the loop it ticks (#8995 item 1)
+// ============================================================================
+
+/// The claim-reconciliation consumer's key must name *that pass*, not the
+/// queue-head effect releasing a claim only eventually has. `queueHeadWake`
+/// shipped in #8994 and was renamed while still brand new and default-off;
+/// this asserts the retired name cannot quietly come back on any consumer.
+#[test]
+fn the_claim_reconcile_flag_is_named_for_the_loop_it_ticks() {
+    assert_eq!(CLAIM_RECONCILE.config_key, "claimReconcileWake");
+    assert_eq!(CLAIM_RECONCILE.env, "LOOM_FORGE_EVENTS_CLAIM_RECONCILE_WAKE");
+    for consumer in ALL_CONSUMERS {
+        assert_ne!(
+            consumer.config_key, "queueHeadWake",
+            "{}: the retired #8994 key names an effect no consumer produces",
+            consumer.name
+        );
+        assert_ne!(consumer.env, "LOOM_FORGE_EVENTS_QUEUE_HEAD_WAKE", "{}", consumer.name);
+    }
+}
+
+/// The other half of #8995 item 1's disposition, pinned so it is revisited
+/// deliberately: the work finder — the loop that actually moves the queue head
+/// — was **not** widened to `pull_request`. Adding it is a legitimate future
+/// change (#8989 offered it conditionally), but it raises this loop's wake
+/// volume by every PR event in the fleet, so it wants a measurement first.
+/// Editing this list should mean editing this test.
+#[test]
+fn the_work_finder_was_not_widened_to_pull_request() {
+    assert_eq!(WORK_FINDER_EVENT_TYPES, &["issues", "issue_comment"]);
+}
+
+// ============================================================================
+// The documented amplification bound (#8995 item 2)
+// ============================================================================
+
+/// The per-loop ceilings stated in [`DEFAULT_MIN_SPACING_SECS`]'s doc table and
+/// `defaults/docs/forge-events.md` § 4.1, asserted against the wired loops'
+/// **own** cadence constants — so a cadence change fails here instead of
+/// leaving the documented bound quietly wrong.
+#[test]
+fn the_documented_per_loop_multipliers_match_the_wired_cadences() {
+    let floor = Duration::from_secs(DEFAULT_MIN_SPACING_SECS);
+    let cases: &[(u64, u64)] = &[
+        (crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS, 2),
+        (crate::watch_registry::DEFAULT_WATCH_MONITOR_INTERVAL_SECS, 4),
+        (crate::claim_reconciliation::DEFAULT_RECONCILE_INTERVAL_SECS, 20),
+        (crate::claim_reconciliation::DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS, 60),
+    ];
+    for (cadence, expected) in cases {
+        assert_eq!(
+            max_early_tick_multiplier(Duration::from_secs(*cadence), floor),
+            *expected,
+            "{cadence}s cadence against the {DEFAULT_MIN_SPACING_SECS}s floor"
+        );
+    }
+    // A loop that ticks faster than the floor can gain no early tick at all.
+    assert_eq!(max_early_tick_multiplier(Duration::from_secs(10), floor), 1);
+}
+
+// ============================================================================
+// The operator-visible counter surface (#8995 item 3)
+// ============================================================================
+
+/// An armed consumer publishes its live counters to the process registry
+/// `loom-daemon status` reads, keyed by the flag an operator would grep for.
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn an_armed_consumer_publishes_its_counters_for_status() {
+    clear_env();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_events_config(dir.path(), r#"{"claimReconcileWake":true,"minSpacingSecs":30}"#);
+    let bus = EventBus::new();
+
+    let mut ticker =
+        EarlyTicker::for_consumer(&CLAIM_RECONCILE, Duration::from_secs(600), &bus, dir.path());
+    assert!(ticker.is_armed());
+    drain_first_tick(&mut ticker).await;
+    clear_floor(FLOOR).await;
+    publish_page(&bus, &["pull_request"]);
+    assert!(ticked_soon(&mut ticker).await);
+
+    let entry = armed_snapshot()
+        .into_iter()
+        .find(|w| w.config_key == CLAIM_RECONCILE.config_key)
+        .expect("an armed consumer must appear on the status surface");
+    assert_eq!(entry.consumer, CLAIM_RECONCILE.name);
+    assert_eq!(entry.cadence_secs, 600);
+    assert_eq!(entry.min_spacing_secs, DEFAULT_MIN_SPACING_SECS);
+    assert_eq!(entry.prompts, 1);
+    assert_eq!(entry.early_ticks, 1);
+    assert_eq!(entry.throttled, 0);
+    // The same 20x the docs state for this pass's default cadence.
+    assert_eq!(entry.max_multiplier(), 20);
+    clear_env();
+}
+
+/// A **disarmed** consumer must not touch the registry — so an empty surface is
+/// the positive statement "nothing is armed here", never "armed but silent".
+/// Asserted as "the snapshot did not change", because the registry is
+/// process-global and other tests legitimately populate it.
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn a_disarmed_consumer_publishes_nothing() {
+    clear_env();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bus = EventBus::new();
+    let before = armed_snapshot();
+
+    let ticker = for_consumer(&CLAIM_RECONCILE, &bus, dir.path());
+    assert!(!ticker.is_armed());
+
+    assert_eq!(before, armed_snapshot(), "a disarmed consumer must register nothing");
+    clear_env();
 }

@@ -16,6 +16,7 @@ Follow the complete role definition in `.loom/roles/builder.md` for:
 - Pre-implementation review of recent main changes
 - Checking dependencies before claiming
 - Scope management and decomposition criteria
+- Starred (`loom:operator-priority`) issues first; copy the star onto the PR you open
 - PR creation with `loom:review-requested` and `Closes #N` syntax (or `Part of #N` for a partial increment of a family/epic issue)
 - Handling pre-existing lint/build failures
 

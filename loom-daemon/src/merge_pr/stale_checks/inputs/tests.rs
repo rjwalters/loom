@@ -163,8 +163,9 @@ fn an_empty_base_move_is_fresh_for_every_required_check() {
         "AGENTS.md",
     ]);
     for ctx in REQUIRED_CONTEXTS {
+        let specs = specs_for(ctx).unwrap_or_else(|| panic!("{ctx} must resolve"));
         assert_eq!(
-            stale_reason(spec(ctx), &FileSet::default(), &p),
+            composite_stale_reason(&specs, &FileSet::default(), &p),
             None,
             "{ctx} must be fresh when the base did not move"
         );
@@ -375,25 +376,35 @@ fn is_path_byte(b: u8) -> bool {
 
 #[test]
 fn the_table_covers_exactly_mains_required_contexts() {
+    let listed: BTreeSet<&str> = REQUIRED_CONTEXTS.iter().copied().collect();
+    let checks: BTreeSet<&str> = REQUIRED_CHECKS.iter().map(|r| r.context).collect();
+    assert_eq!(listed.len(), REQUIRED_CONTEXTS.len(), "duplicate in REQUIRED_CONTEXTS");
     assert_eq!(
-        REQUIRED_CONTEXTS.len(),
-        19,
-        "main requires 19 contexts (verified 2026-09-26); update the list AND the specs together"
+        listed, checks,
+        "REQUIRED_CONTEXTS and REQUIRED_CHECKS must name the same contexts"
     );
-    for ctx in REQUIRED_CONTEXTS {
-        assert!(spec_for(ctx).is_some(), "no CheckSpec for required context {ctx:?}");
+    // Every component has a spec, and every spec is a component of exactly one
+    // required check: an orphan spec is dead weight, and a gate in two
+    // contexts would be judged twice from two different logs.
+    let mut owner: BTreeMap<&str, &str> = BTreeMap::new();
+    for req in REQUIRED_CHECKS {
+        assert!(!req.components.is_empty(), "{}: no components", req.context);
+        for c in req.components {
+            assert!(spec_for(c).is_some(), "{}: component {c:?} has no CheckSpec", req.context);
+            if let Some(prev) = owner.insert(c, req.context) {
+                panic!("component {c:?} is in both {prev:?} and {:?}", req.context);
+            }
+        }
     }
-    for s in SPECS {
+    for sp in SPECS {
         assert!(
-            REQUIRED_CONTEXTS.contains(&s.context),
-            "{:?} has a spec but is not a required context — remove it or add it to \
-REQUIRED_CONTEXTS",
-            s.context
+            owner.contains_key(sp.context),
+            "{:?} has a spec but no required check runs it — remove it or add it to REQUIRED_CHECKS",
+            sp.context
         );
     }
     let unique: BTreeSet<&str> = SPECS.iter().map(|s| s.context).collect();
-    assert_eq!(unique.len(), SPECS.len(), "duplicate context in SPECS");
-    assert_eq!(unique.len(), REQUIRED_CONTEXTS.len());
+    assert_eq!(unique.len(), SPECS.len(), "duplicate component in SPECS");
 }
 
 #[test]
@@ -403,7 +414,7 @@ fn every_required_context_names_a_real_ci_yml_job() {
         .iter()
         .flat_map(|j| j.names.iter().map(String::as_str))
         .collect();
-    assert!(names.len() > 20, "the ci.yml parser found only {names:?}");
+    assert!(names.len() > 10, "the ci.yml parser found only {names:?}");
     for ctx in REQUIRED_CONTEXTS {
         assert!(
             names.contains(ctx),
@@ -413,33 +424,131 @@ table is out of date"
     }
 }
 
+/// A composite job's lines split at its `      # component: <name>` markers.
+/// Lines before the first marker (checkout, artifact download) belong to no
+/// component and are returned under `""`.
+fn component_groups(lines: &[String]) -> Vec<(String, Vec<String>)> {
+    let mut groups: Vec<(String, Vec<String>)> = vec![(String::new(), Vec::new())];
+    for line in lines {
+        if let Some(name) = line.strip_prefix("      # component: ") {
+            groups.push((name.trim().to_string(), Vec::new()));
+        } else if let Some(last) = groups.last_mut() {
+            last.1.push(line.clone());
+        }
+    }
+    groups
+}
+
 #[test]
 fn every_script_a_required_job_runs_is_a_global_input() {
     // The pin that makes the table maintainable: adding a step to a required
     // job fails HERE, at PR time, instead of silently making the guard trust a
-    // check whose new input it cannot see.
+    // check whose new input it cannot see. Scripts are pinned to the COMPONENT
+    // whose marker they sit under, not merely to the composite context.
     let jobs = parse_jobs(CI_YML);
-    let mut checked = 0;
-    for job in &jobs {
-        for name in &job.names {
-            let Some(spec) = spec_for(name) else { continue };
-            checked += 1;
-            let refs = script_refs(&job.lines);
+    let mut pinned = 0;
+    for req in REQUIRED_CHECKS {
+        let job = jobs
+            .iter()
+            .find(|j| j.names.iter().any(|n| n == req.context))
+            .unwrap_or_else(|| panic!("{}: no ci.yml job", req.context));
+        let groups: Vec<(String, Vec<String>)> = if req.components.len() == 1 {
+            vec![(req.components[0].to_string(), job.lines.clone())]
+        } else {
+            component_groups(&job.lines)
+        };
+        let marked: BTreeSet<&str> = groups
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .filter(|n| !n.is_empty())
+            .collect();
+        let expected: BTreeSet<&str> = req.components.iter().copied().collect();
+        assert_eq!(
+            marked, expected,
+            "{}: the job's `# component:` markers must name exactly its REQUIRED_CHECKS components",
+            req.context
+        );
+        for (component, lines) in &groups {
+            let refs = script_refs(lines);
+            if component.is_empty() {
+                assert!(
+                    refs.is_empty(),
+                    "{}: {refs:?} run before the first `# component:` marker, so no spec covers \
+them",
+                    req.context
+                );
+                continue;
+            }
+            let spec = spec(component);
+            pinned += 1;
             assert!(
-                !refs.is_empty() || name == "Shell Budget Ratchet",
-                "{name}: no script references found — the parser probably broke"
+                !refs.is_empty() || component == "Shell Budget Ratchet",
+                "{component}: no script references found — the parser probably broke"
             );
             for script in refs {
                 assert!(
                     spec.global.contains(&script.as_str()),
-                    "{name} runs {script} but it is not in that spec's G set (inputs.rs). A step \
-added to a required job must be reflected in the table, or the freshness guard will not notice \
-when `main` changes that script."
+                    "{component} (in {}) runs {script} but it is not in that component's G set \
+(inputs.rs). A step added to a required job must be reflected in the table, or the freshness \
+guard will not notice when `main` changes that script.",
+                    req.context
                 );
             }
         }
     }
-    assert_eq!(checked, 19, "expected all 19 required contexts to be pinned");
+    assert_eq!(pinned, SPECS.len(), "every component must be pinned against ci.yml");
+}
+
+// --- Composite contexts (#9065) ----------------------------------------------
+
+#[test]
+fn a_composite_context_is_stale_when_any_component_is() {
+    let specs = specs_for("Structural Checks").expect("composite resolves");
+    assert_eq!(specs.len(), 16);
+    // main tightens the file-size baseline; the PR edits a Rust source file.
+    let d = set(&["scripts/file-size-baseline.txt"]);
+    let p = set(&["loom-daemon/src/lib.rs"]);
+    let (component, _) = composite_stale_reason(&specs, &d, &p).expect("stale");
+    assert_eq!(component, "File Size Ratchet");
+}
+
+#[test]
+fn a_composite_context_is_not_stale_on_cross_component_terms() {
+    // main changes the CLAUDE.md budget script (a global input of CLAUDE.md
+    // Line Budget only); the PR edits a role prompt, which CLAUDE.md Line
+    // Budget never reads. The UNION of all sixteen specs would call this stale
+    // (main moved a global input; the PR touches some input). Per-component OR
+    // does not: no single gate's verdict could have changed.
+    let specs = specs_for("Structural Checks").expect("composite resolves");
+    let d = set(&["scripts/check-claude-md-budget.sh"]);
+    let p = set(&["defaults/roles/curator.md"]);
+    let union_global: Vec<&str> = specs
+        .iter()
+        .flat_map(|s| s.global.iter().copied())
+        .collect();
+    assert!(
+        d.first_match(&union_global).is_some(),
+        "precondition: the union WOULD see a global-input move"
+    );
+    assert!(
+        spec("CLAUDE.md Line Budget")
+            .scanned
+            .iter()
+            .all(|pat| !glob_match(pat, "defaults/roles/curator.md")),
+        "precondition: the moved gate does not read the PR's file"
+    );
+    let stale = composite_stale_reason(&specs, &d, &p);
+    assert!(stale.is_none(), "cross-component terms must not refuse: {stale:?}");
+}
+
+#[test]
+fn a_component_name_still_resolves_to_its_own_spec() {
+    // Historical evidence (and the #8078 incident fixtures) name the gate, not
+    // the composite; both must resolve.
+    let one = specs_for("File Size Ratchet").expect("component resolves");
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].context, "File Size Ratchet");
+    assert!(specs_for("No Such Check").is_none());
 }
 
 #[test]

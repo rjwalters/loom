@@ -20,6 +20,7 @@ pipeline state already lives.
 
 - [Definition](#definition)
 - [Relationship to `loom:blocked`, `loom:operator-only`, and `loom:needs-capability`](#relationship-to-loomblocked-loomoperator-only-and-loomneeds-capability)
+- [`loom:operator-priority` is not a hold (#9244)](#loomoperator-priority-is-not-a-hold-9244)
 - [Entry points](#entry-points)
 - [Exit rule](#exit-rule)
 - [Current implementation](#current-implementation)
@@ -46,7 +47,7 @@ each definition, for the terse version of this same table):
 
 | Label | Question it answers | Does sweep/shepherd skip it? |
 |---|---|---|
-| `loom:blocked` | Waiting on a dependency, but still automatable once that clears | No |
+| `loom:blocked` | Waiting on a dependency, but still automatable once that clears | **Yes**, for a *fresh* work-finder candidate — `loom:blocked` is in [`PARK_LABELS`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/work_finder/labels.rs), the daemon's own authoritative park set. "Still automatable once that clears" describes what happens *after* the label is removed, not while it is present — see #8925, which found this exact row previously read "No" while the code already skipped it. The unblock sweep (`guide.md`'s `check_and_unblock`/`check_and_unblock_prs`) and `loom-daemon check-stale-blocked` are what re-evaluate it and clear it once its declared blocker resolves (`defaults/docs/park-record.md`) |
 | `loom:operator-only` | Requires human action or ruling *outside* automation entirely (credentials, infra, hardware, an owner-gated decision) | **Yes** — sweep/shepherd skip it, except the narrow capability-matched `loom:operator-mechanical` case (#6893, see "Dispatch path" below) |
 | `loom:needs-capability` | Blocked on a missing tool/agent capability — not an operator-by-right decision, but automation genuinely cannot proceed without the capability existing first (#5817) | **Yes** — sweep/shepherd skip it, identically to `loom:operator-only` today |
 | `loom:operator` | The engine has stopped on this specific artifact and a human must act, but the item stays live in its normal queue so the engine's own release conditions can still fire | **New-builder skip only** — the work finder does not *start* a fresh `--claim-owned` build on it (vibesql#6664); re-evaluation lanes (Champion/role ticks, watchdog re-dispatch, reaper resume, explicit `loom-daemon dispatch <N>`) still reach it |
@@ -69,12 +70,37 @@ already-claimed one (it will not *start* work), while every route that
 refuses dispatch by itself — it is not in the park set the dispatch-time
 guard consults.
 
+## `loom:operator-priority` is not a hold (#9244)
+
+`loom:operator-priority` (the operator's "star") shares a prefix with
+`loom:operator` but means the opposite: not "the engine stopped, a human must
+act" but "a human wants this landed ASAP, act now". It is the one "land this
+ASAP" signal; the older urgent label is retired (its `labels.yml` description
+says so, and no role applies it).
+
+- **Human-only.** No role decides to apply or remove it. The daemon only relays
+  a loom-ui star intent, and Builder copies it from a starred issue onto the PR
+  it opens.
+- **Starred first, every stage.** Curator curates starred issues first (a
+  starred issue with no workflow label counts as `loom:triage`) and promotes
+  them straight to `loom:issue`, because the star is the Tier-3 approval. A
+  starred `loom:epic` instead leads Champion's epic queue. Judge, Doctor and Champion drain starred PRs before their oldest-first pass.
+  Builder takes starred `loom:issue` work first.
+- **Guards unchanged.** `loom:blocked`, `loom:operator-only`,
+  `loom:operator-decision`, Champion's merge-risk and critical-file holds, the
+  host-class gate and Judge's bar all still apply. A starred PR on a hold stays
+  held and is listed first (marked ⭐) in the pinned hold digest (#6877).
+- **Red-main fixes** are a body marker, not a label: an issue that fixes a red
+  `main` carries `<!-- loom:main-red-fix -->` (Doctor adds it when filing a
+  pre-existing failure confirmed on `origin/main`). Curator takes these next,
+  after starred work, with no promotion bypass.
+
 ## Entry points
 
 | Role | Trigger | Status |
 |---|---|---|
 | Champion (PR merge) | Posts a merge-risk hold (`champion:merge-risk-hold`) because a safety axis is red (criterion #2) | **Wired** — `defaults/.claude/commands/loom/champion-pr-merge.md`, "Hold behavior" |
-| Champion (PR merge) | Posts a critical-file hold (`champion:critical-file-hold`) because criterion #3 matched a critical-file pattern | **Wired** (#6879) — `defaults/.claude/commands/loom/champion-pr-merge.md`, Safety Criteria → 3 → "Durable hold on FAIL" |
+| Champion (PR merge) | Posts a critical-file hold (`champion:critical-file-hold`) because criterion #3 matched a critical-file pattern | **Wired** (#6879, #9016) — `defaults/.claude/commands/loom/champion-critical-file-hold.md` |
 | Champion (issue close) | Holds a merged PR's linked **issue** open because one of its acceptance criteria needs out-of-band verification (live source, real scheduled run, observation over time) and no `loom:ac-verified` marker attests it | **Wired** (#6883) — `defaults/.claude/commands/loom/champion-pr-merge.md`, Step 4 → "Out-of-Band Acceptance-Criteria Gate" |
 | Builder / Doctor | Encounters work that needs credentials, infra, or a policy ruling outside automation (today's `loom:operator-only` use case) | Not yet wired — follow-up work |
 | Judge | A review surfaces a question only a human can answer | Not yet wired — follow-up work |
@@ -116,6 +142,48 @@ on the same four precheck outcomes:
 A human can also clear `loom:operator` directly at any time by removing the
 label — the automated exit rule above is the *default* path, not the only
 one.
+
+### Releasing a Champion hold and merging it yourself (#9016)
+
+A hand-removal is a decision, and the engine has to treat it as one. `merge-pr.sh`
+refuses any PR carrying `loom:pr` and `loom:operator` at once (the #8112
+verdict-contradiction guard, which has no override flag), so if Champion puts the
+label back on its next tick, the hold's own "a human merges it directly" advice
+becomes a race the human usually loses — observed on merge train #8996, where the
+label returned 1m42s after the operator released it.
+
+Both Champion PR holds therefore record the removal instead of overriding it, and
+the procedure is two commands in either order, with no tick to beat:
+
+```bash
+gh pr edit <N> --remove-label "loom:operator"
+./.loom/scripts/merge-pr.sh <N>
+```
+
+- **Critical-file hold** (criterion #3): the release is scoped to the head the
+  hold was written against, recorded in the hold notice's
+  `<!-- champion:hold-state head=<sha> -->` line. Champion acknowledges it once,
+  behind a `champion:critical-file-release-respected` marker, and does not
+  re-apply the label at that head. **A new push re-arms the hold** — the release
+  was a decision about a diff that no longer exists. See
+  `champion-critical-file-hold.md`.
+- **Merge-risk hold** (criterion #2): the release is scoped to the *concern* — the
+  label is not re-asserted while the freshly-derived concern reads byte-identical
+  to the one already on record (#7048). A genuinely new concern re-holds and says
+  what changed.
+
+Neither release makes Champion merge the PR itself, and neither weakens the #8112
+guard for any other label: a `loom:changes-requested` or `loom:review-requested`
+standing next to `loom:pr` still blocks the merge outright.
+
+Two consequences of a released hold, both intended and both shared with #7048's
+merge-risk case: the PR drops out of the `loom:operator`-keyed **Held-PR Census**
+count (it is a *label* census, and the point is that the label stops tracking your
+decision — the hold's marker comment is never removed, so it stays findable by
+comment search), and it becomes visible again to Doctor's Priority-1
+`CONFLICTING` queue, which excludes held PRs (#5978). If Doctor does rebase it,
+the head moves and a critical-file hold re-arms on the new head — which is the
+correct outcome, not a regression: your release was about the diff you read.
 
 ### The out-of-band AC hold on an issue (#6883)
 
@@ -204,19 +272,28 @@ Two Champion entry/exit pairs are wired today, both in the same file:
   - Reuses the release precheck at `champion-pr-merge.md` ("Sticky holds — a
     hold does NOT clear on a re-read alone") rather than re-deriving release
     state independently.
-- **Criterion #3 (critical-file hold, #6879)**:
-  - **Entry/exit** — `defaults/.claude/commands/loom/champion-pr-merge.md`,
-    Safety Criteria → 3 → "Durable hold on FAIL" block, run immediately after
-    criterion #3's check-loop. `gh pr edit ... --add-label loom:operator`
-    alongside the `champion:critical-file-hold` marker on FAIL;
+- **Criterion #3 (critical-file hold, #6879, #9016)**:
+  - **Entry/exit** — `defaults/.claude/commands/loom/champion-critical-file-hold.md`,
+    run immediately after criterion #3's check-loop.
+    `gh pr edit ... --add-label loom:operator` alongside the
+    `champion:critical-file-hold` marker on FAIL;
     `gh pr edit ... --remove-label loom:operator` alongside the
     `champion:critical-file-hold-cleared` marker the first time a later push
     no longer matches any critical-file pattern.
+  - **Operator release (#9016)** — a hand-removed `loom:operator`, while a hold
+    episode is open and the PR's head still equals the one recorded in the hold
+    notice's `champion:hold-state head=<sha>` line, is a durable release:
+    Champion acknowledges it once behind
+    `champion:critical-file-release-respected` and does not re-apply the label
+    at that head, so the operator's own `merge-pr.sh` run is not racing a tick.
+    A head that has moved (or a legacy hold that recorded none) re-arms instead
+    — fail-safe, because the release was a decision about a diff that no longer
+    exists.
   - Needs **no** sticky-hold precheck: criterion #3's check-loop is a
     deterministic file-pattern match, not a judgment call, so there is no
     "same diff scores differently on a later read" case to guard against —
-    the FAIL/PASS verdict itself, recomputed fresh every tick, is the release
-    signal.
+    the FAIL/PASS verdict itself, recomputed fresh every tick, plus the
+    head-scoped operator release above, are the release signals.
 
 **One consumer honors the hold without ever setting it (#5686)**: the
 stale-verdict machinery (`defaults/scripts/verdict-staleness-guard.sh` and
@@ -830,6 +907,13 @@ overriding a missing opinion is a call about risk tolerance for skipping
 review; overriding a stated rejection discards someone else's judgment
 outright. The remedy for a real block here is the same as layer 2's: get a
 fresh Judge verdict on the current head, not force a flag past it.
+
+**Where the blocker is `loom:operator` from a Champion hold, the remedy is the
+hold's own release path, not a fresh Judge verdict** (#9016) — the approval is
+not in doubt, a human decision is. Remove the label and merge; both PR holds
+record that removal instead of re-asserting it over you. Procedure and scoping:
+["Releasing a Champion hold and merging it yourself"](#releasing-a-champion-hold-and-merging-it-yourself-9016)
+above. Nothing about the guard changes for any other blocking label.
 
 ## Follow-up work
 

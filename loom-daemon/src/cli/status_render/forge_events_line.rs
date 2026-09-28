@@ -12,7 +12,62 @@
 
 use chrono::{DateTime, Utc};
 use loom_daemon::health::format_window;
-use loom_daemon::types::{ForgeEventsState as State, ForgeEventsStatus};
+use loom_daemon::types::{ForgeEventsState as State, ForgeEventsStatus, ForgeEventsWakeStatus};
+
+/// The feed line plus, when there is something to say about them, the Phase 2
+/// early-tick consumers (#8995 item 3).
+///
+/// One function so the caller stays one `println!` — `status_render.rs` is an
+/// over-threshold ledger entry that may not grow.
+pub fn render_block(status: Option<&ForgeEventsStatus>, now: DateTime<Utc>) -> String {
+    let mut lines = vec![render(status, now)];
+    if let Some(s) = status {
+        lines.extend(render_wakes(s));
+    }
+    lines.join("\n")
+}
+
+/// Zero or more `Forge event wakes:` lines.
+///
+/// One line per **armed** consumer. Nothing at all when nothing is armed *and*
+/// the feed is off — the feed line already said `disabled`, and a host that
+/// opted into neither half does not need a second line to say so. When the feed
+/// is on but no consumer is armed, one line says exactly that: "the feed is
+/// running and no loop is listening" is the confusing state worth naming, and
+/// it is the state every Phase-1 host is in.
+fn render_wakes(s: &ForgeEventsStatus) -> Vec<String> {
+    if s.wakes.is_empty() {
+        if s.state == State::Disabled {
+            return Vec::new();
+        }
+        return vec![
+            "Forge event wakes: none armed — every forgeEvents.events.* consumer is off, so \
+             each loop ticks on its own cadence only"
+                .to_string(),
+        ];
+    }
+    s.wakes.iter().map(wake_line).collect()
+}
+
+/// One armed consumer's line: what it is, what it saw, and what that did.
+///
+/// A zero-prompt entry is reported as such rather than omitted — "armed and
+/// nothing arrived" and "not armed" are different answers, and distinguishing
+/// them is the whole point of the surface.
+fn wake_line(w: &ForgeEventsWakeStatus) -> String {
+    format!(
+        "Forge event wakes: {} (forgeEvents.events.{}) — {} prompt(s) → {} early tick(s), {} \
+         throttled by the {}s floor; cadence {}s, ceiling {}x",
+        w.consumer,
+        w.config_key,
+        w.prompts,
+        w.early_ticks,
+        w.throttled,
+        w.min_spacing_secs,
+        w.cadence_secs,
+        w.max_multiplier()
+    )
+}
 
 /// Render the one-line feed summary. `None` means the answering daemon
 /// predates ADR-0021 — reported as such, never as `disabled`.
@@ -155,6 +210,77 @@ mod tests {
             let line = render(Some(&status(state)), now());
             assert!(line.contains("cursor stuck at 42"), "{state:?}: {line}");
         }
+    }
+
+    fn wake(config_key: &str, prompts: u64, early: u64, throttled: u64) -> ForgeEventsWakeStatus {
+        ForgeEventsWakeStatus {
+            consumer: "claim-reconcile wake".to_string(),
+            config_key: config_key.to_string(),
+            cadence_secs: 600,
+            min_spacing_secs: 30,
+            prompts,
+            early_ticks: early,
+            throttled,
+        }
+    }
+
+    #[test]
+    fn an_armed_consumer_reports_what_its_prompts_did() {
+        let mut s = status(State::Healthy);
+        s.wakes = vec![wake("claimReconcileWake", 9, 2, 7)];
+        let block = render_block(Some(&s), now());
+        let line = block
+            .lines()
+            .nth(1)
+            .expect("a wake line follows the feed line");
+        assert!(line.contains("forgeEvents.events.claimReconcileWake"), "{line}");
+        assert!(line.contains("9 prompt(s)"), "{line}");
+        assert!(line.contains("2 early tick(s)"), "{line}");
+        assert!(line.contains("7 throttled"), "{line}");
+        // The per-loop ceiling item 2 is about: 600s / 30s.
+        assert!(line.contains("ceiling 20x"), "{line}");
+    }
+
+    // "armed and nothing arrived" is a different answer from "not armed", and
+    // the surface exists to tell them apart.
+    #[test]
+    fn an_armed_consumer_with_no_prompts_still_reports() {
+        let mut s = status(State::Healthy);
+        s.wakes = vec![wake("claimReconcileWake", 0, 0, 0)];
+        let block = render_block(Some(&s), now());
+        assert_eq!(block.lines().count(), 2, "{block}");
+        assert!(block.contains("0 prompt(s)"), "{block}");
+    }
+
+    #[test]
+    fn a_running_feed_with_nothing_armed_says_so() {
+        let block = render_block(Some(&status(State::Healthy)), now());
+        assert!(block.contains("Forge event wakes: none armed"), "{block}");
+        assert!(block.contains("forgeEvents.events.*"), "{block}");
+    }
+
+    // The all-default host: the feed line already says `disabled`, and a second
+    // line to say the consumers are off too would be noise on every status.
+    #[test]
+    fn a_disabled_feed_with_nothing_armed_adds_no_wake_line() {
+        let block = render_block(Some(&ForgeEventsStatus::disabled()), now());
+        assert_eq!(block.lines().count(), 1, "{block}");
+        assert!(!block.contains("wakes"), "{block}");
+    }
+
+    // A consumer armed without the feed provisioned is exactly the mistake the
+    // surface should catch, so it renders even under `disabled`.
+    #[test]
+    fn a_consumer_armed_without_a_feed_is_still_reported() {
+        let mut s = ForgeEventsStatus::disabled();
+        s.wakes = vec![wake("claimReconcileWake", 0, 0, 0)];
+        let block = render_block(Some(&s), now());
+        assert_eq!(block.lines().count(), 2, "{block}");
+    }
+
+    #[test]
+    fn a_pre_adr_daemon_gets_no_wake_lines() {
+        assert_eq!(render_block(None, now()).lines().count(), 1);
     }
 
     // The event key must never reach an operator-visible surface, even

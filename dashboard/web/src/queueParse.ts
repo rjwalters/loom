@@ -4,7 +4,7 @@
  * the exact string `"public"` as private.
  */
 
-import type { QueueRepoRef, QueueRow, QueueRowState, QueueSnapshotRecord } from "./queueTypes";
+import type { QueuePlanState, QueueRepoRef, QueueRow, QueueRowState, QueueSnapshotRecord } from "./queueTypes";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -23,6 +23,7 @@ function visibility(value: unknown): "public" | "private" {
 }
 
 const STATES: readonly QueueRowState[] = ["running", "ready", "blocked"];
+const PLAN_STATES: readonly QueuePlanState[] = ["running", "next", "queued", "blocked"];
 
 export function parseQueueRow(value: unknown): QueueRow | undefined {
   if (!isObject(value)) return undefined;
@@ -48,6 +49,16 @@ export function parseQueueRow(value: unknown): QueueRow | undefined {
   if (tier !== undefined) row.tier = tier;
   const detail = str(value.detail);
   if (detail !== undefined) row.detail = detail;
+  if (value.operator_priority === true) row.operator_priority = true;
+  const starredAt = str(value.operator_priority_at);
+  if (starredAt !== undefined) row.operator_priority_at = starredAt;
+  const position = nat(value.position);
+  if (position !== undefined) row.position = position;
+  if (value.plan_state !== undefined) {
+    row.plan_state = PLAN_STATES.find((known) => known === value.plan_state) ?? "unknown";
+  }
+  const gate = str(value.gate);
+  if (gate !== undefined) row.gate = gate;
   return row;
 }
 

@@ -87,9 +87,13 @@ ALLOWED_HOST_SUFFIXES=(
   sf.net
 )
 
-usage() {
-  sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
-}
+# Dotted identifiers that are NOT hostnames: config-key paths whose last
+# segment happens to spell a TLD (e.g. `autonomous.ciTelemetry.org`, the
+# `org` field of a config block — #8981). Matched EXACTLY below, never as a
+# suffix, so this can never shadow a real vendored hostname.
+ALLOWED_NON_HOST_IDENTIFIERS=(autonomous.ciTelemetry.org)
+
+usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; }
 
 ROOTS=()
 SELF_TEST=0
@@ -188,7 +192,7 @@ scan_tree() {
     [[ -z "$line" ]] && continue
     file="${line%%:*}"; line="${line#*:}"
     lineno="${line%%:*}"; host="${line#*:}"
-    if ! host_allowed "$host"; then
+    if [[ ! " ${ALLOWED_NON_HOST_IDENTIFIERS[*]} " == *" $host "* ]] && ! host_allowed "$host"; then
       echo "  $file:$lineno: non-allowlisted hostname: $host"
       violations=1
     fi
@@ -209,11 +213,11 @@ if [[ "$SELF_TEST" -eq 1 ]]; then
   # Clean fixture: only allowlisted identifiers.
   mkdir -p "$tmp/clean/docs"
   cat > "$tmp/clean/docs/a.md" <<'EOF'
-See example-org/tool-repo#202 and rjwalters/loom#1, hosted at dashboard.example.com.
+See example-org/tool-repo#202 and rjwalters/loom#1, hosted at dashboard.example.com and configured via `autonomous.ciTelemetry.org` (#8981), a config key, not a host.
 A same-repo ref (#4736) and prose like scheduling/anti-#4736 must not trip this.
 EOF
   if scan_tree "$tmp/clean" >/dev/null; then
-    echo "self-test: OK — clean fixture passes"
+    echo "self-test: OK — clean fixture (incl. a config-key path ending in a TLD-shaped segment) passes"
   else
     echo "self-test: FAIL — clean fixture reported a violation" >&2
     scan_tree "$tmp/clean" >&2 || true
@@ -224,12 +228,12 @@ EOF
   mkdir -p "$tmp/dirty/docs"
   cat > "$tmp/dirty/docs/b.md" <<'EOF'
 This is exactly what happened to PrivateOrg/secret-repo#56.
-The live deployment is at dashboard.privateorg.com.
+The live deployment is at dashboard.private-org.com.
 EOF
   out="$(scan_tree "$tmp/dirty" || true)"
   if grep -q 'PrivateOrg/secret-repo#56' <<<"$out" \
-     && grep -q 'dashboard.privateorg.com' <<<"$out"; then
-    echo "self-test: OK — dirty fixture reports both the private ref and the private host"
+     && grep -q 'dashboard.private-org.com' <<<"$out"; then
+    echo "self-test: OK — dirty fixture reports both the private ref and the private host (a real hostname, unlike the config-key path above, still fails)"
   else
     echo "self-test: FAIL — dirty fixture was not fully detected. Got:" >&2
     echo "$out" >&2
@@ -279,7 +283,7 @@ EOF
     echo "self-test: FAIL — a violation in the SECOND --root did not fail the run" >&2
     echo "$multi_out" >&2
     fails=1
-  elif grep -q 'dashboard.privateorg.com' <<<"$multi_out"; then
+  elif grep -q 'dashboard.private-org.com' <<<"$multi_out"; then
     echo "self-test: OK — a violation in any scanned root fails the run"
   else
     echo "self-test: FAIL — multi-root run failed without reporting the violation. Got:" >&2

@@ -31,6 +31,16 @@
 //! transition out is to clear the label and then merge — which is a recorded
 //! decision, rather than a flag buried in a command line.
 //!
+//! That transition has to actually be available, and for one hold kind it was
+//! not: Champion's critical-file hold (criterion #3) re-applied `loom:operator`
+//! on its next tick, so clearing the label bought the operator ~90 seconds
+//! before this guard refused again (#9016, merge train #8996). The fix is on
+//! Champion's side, not this guard's — `champion-critical-file-hold.md` now
+//! reads a hand-removed `loom:operator`, at the head the hold was written
+//! against, as a durable release and stands down on the label for that head.
+//! Nothing here changed, and nothing here should: the contradiction is
+//! resolved by the label set moving, which is what this guard reads.
+//!
 //! # There is deliberately no override flag
 //!
 //! `--allow-unapproved` bypasses the *missing*-`loom:pr` guard. This one is

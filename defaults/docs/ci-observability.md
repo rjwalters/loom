@@ -24,9 +24,10 @@
 
 ## The policy
 
-**Every GitHub Actions run of every `2amlogic` repository — its runs, jobs,
+**Every GitHub Actions run of every repository of the configured owners
+(default `2amlogic`) — its runs, jobs,
 durations, outcomes, and completed-job logs — is captured in SigNoz** by the
-`loom-daemon ci-telemetry` poller. Capture is **org-scoped**: a new repo or a
+`loom-daemon ci-telemetry` poller. Capture is **owner-scoped**: a new repo or a
 new workflow is in scope on the day it appears, found by auto-discovery, with
 no per-repo enrollment step to forget. **Run/job duration and outcome metrics
 are never excludable** — not per repo, not per workflow, not temporarily. **Log
@@ -95,15 +96,25 @@ journal schema, chunking contract, standing queries) to this page when it
 lands. Phase 1's poller ships **off by default** (FLAGS-OFF): the policy is
 enforced only on a host where [Rollout](#rollout) has enabled it.
 
+**Not yet: a sweep-outcome join.** `ci.run`/`ci.job` records are keyed by repo +
+run id, with no existing join to a `sweep_id`, PR number, or issue — so CI
+minutes are **not** part of the opt-in sweep-outcome issue write-back comment
+(`autonomous.sweepOutcomeWriteback`, Issue #9056; see
+[`daemon-reference.md`](daemon-reference.md) → "Sweep-outcome issue
+write-back"). Correlating a run to the sweep/issue that triggered it (by PR
+head SHA or branch name) is real, separate follow-up work, named but not
+scheduled.
+
 ## Capture scope & exclusions
 
-- **Scope is the org, not a repo list.** The `org` key of the
-  `autonomous.ciTelemetry` config block (default `2amlogic`) names the captured org; repo
-  discovery walks it on every poll. There is no allowlist of repos to keep in
-  sync.
+- **Scope is a list of owners, not a repo list.** The `owners` key of the
+  `autonomous.ciTelemetry` config block (default `["2amlogic"]`) names the
+  captured organizations **and user accounts** (#9188 — `rjwalters/loom` is
+  user-owned); repo discovery walks each on every poll. There is no allowlist
+  of repos to keep in sync. See [Owners](#owners-orgs-and-users-9188).
 - **Metrics and run/job records are unconditional.** Durations, outcomes
   (success, failure, **cancelled** — a first-class outcome, never noise), and
-  the `ci.run`/`ci.job` records are emitted for every repo in the org. A
+  the `ci.run`/`ci.job` records are emitted for every repo of every owner. A
   config surface that would suppress them for a repo does not satisfy this
   policy. Phase 1's repo-exclusion key (`excludedRepos`) therefore carries the
   same reason requirement and every entry is a **policy exception** reviewed
@@ -289,10 +300,11 @@ signoz README — and is not a prerequisite for this policy.
 
 A `loom-daemon ci-telemetry` poller. Each cycle it:
 
-1. Lists the org's repositories (`GET /orgs/{org}/repos`, paginated). Each
-   page is ETag-cached on disk, so an unchanged org costs `304 Not Modified`
-   responses, which do not count against the rate limit. Archived repos and
-   `excludedRepos` are skipped.
+1. Lists each owner's repositories (`GET /orgs/{o}/repos?type=all` for an
+   organization, `GET /users/{u}/repos?type=owner` for a user; paginated).
+   Each page is ETag-cached on disk, so an unchanged owner costs `304 Not
+   Modified` responses, which do not count against the rate limit. Archived
+   repos and `excludedRepos` are skipped.
 2. Per repo, lists workflow runs created since that repo's **floor**
    (`GET /repos/{o}/{r}/actions/runs?created=>=<floor>`, paginated). The floor
    is the repo's **watermark** or the trailing **24-hour rescan window**,
@@ -304,21 +316,29 @@ A `loom-daemon ci-telemetry` poller. Each cycle it:
 Runs that are still in progress are not recorded yet. The watermark stays at
 the oldest unfinished run so that a later poll lists it again once it
 completes, and it never moves backwards: an unfinished run surfaced by the
-rescan window (below the watermark) is re-listed by that window instead.
+rescan window (below the watermark) is re-listed by that window instead. This
+hold is bounded: a run that is still unfinished once it is older than the
+rescan window (capped by the initial lookback) stops holding the watermark —
+nothing could ever re-list it past that age anyway, so the alternative is
+pinning the watermark, and every cycle's listing floor with it, forever
+(#8992). Past that bound the run is treated as abandoned: the watermark
+advances to the newest run seen, and the stuck run drops out of every later
+listing for good.
 
 ### Surfaces
 
 | Command | Does |
 |---|---|
-| `loom-daemon ci-telemetry --once [--org ORG] [--workspace PATH]` | One poll cycle. Runs whether or not `enabled` is set. |
-| `loom-daemon ci-telemetry status [--json]` | Health, ledger size, per-repo watermarks, records emitted/exported. |
+| `loom-daemon ci-telemetry --once [--owner OWNER]… [--org ORG] [--workspace PATH]` | One poll cycle (`--owner` repeatable; `--org` is the deprecated alias). Runs whether or not `enabled` is set. |
+| `loom-daemon ci-telemetry status [--json]` | Health, each owner (kind, repo count, skip reason), ledger size, per-repo watermarks, records emitted/exported. |
 | Daemon poller | Runs every `intervalSecs` when `autonomous.ciTelemetry.enabled=true`. |
 
 `--once` exit codes:
 
 - `0`: the cycle completed cleanly.
-- `1`: the cycle failed. The printed reason is one of `discovery-failed`,
-  `io-failed`, or `N repo(s) failed` with the first repo's reason.
+- `1`: the cycle failed. The printed reason is one of `discovery-failed`
+  (every owner failed), `io-failed`, or `N repo(s) failed` with the first
+  reason (a skipped owner counts, as `owner X: discovery-failed: …`).
 - `75`: skipped, and the caller must wait. Either another cycle holds this
   host's lock (`busy`), or the org is in a rate-limit backoff (`rate-limited` /
   `backing-off`).
@@ -341,7 +361,8 @@ never shows as healthy:
 | Key | Env override | Default |
 |---|---|---|
 | `enabled` | `LOOM_CI_TELEMETRY_ENABLED` | `false` (off by default) |
-| `org` | `LOOM_CI_TELEMETRY_ORG` | `"2amlogic"` |
+| `owners` | `LOOM_CI_TELEMETRY_OWNERS` (comma-separated) | `["2amlogic"]`. Orgs and users; see [Owners](#owners-orgs-and-users-9188). |
+| `org` (deprecated) | `LOOM_CI_TELEMETRY_ORG` | Single-owner alias of `owners`, which wins over it at the same tier. |
 | `intervalSecs` | `LOOM_CI_TELEMETRY_INTERVAL_SECS` | `120` |
 | `excludedRepos` | none (committed config only) | `[]`. Each entry is `{"repo": "<name or owner/name>", "reason": "<why>"}`, and `repo` matches case-insensitively. See [Capture scope & exclusions](#capture-scope--exclusions). |
 | `logCaptureEnabled` | `LOOM_CI_TELEMETRY_LOG_CAPTURE_ENABLED` | `false`. Honoured since phase 2 (#8825); see [Phase 2 reference](#phase-2-reference-completed-job-logs-8825). |
@@ -358,6 +379,35 @@ window, whichever is older (#8898).
 Requests go through `gh api` (`$LOOM_GH_BIN` overrides the binary), with the
 same credentials as every other forge call the daemon makes.
 
+### Owners (orgs and users, #9188)
+
+Precedence is **env > config > default** across tiers, and within one tier
+`owners` wins over `org`: `LOOM_CI_TELEMETRY_OWNERS`, then
+`LOOM_CI_TELEMETRY_ORG`, then config `owners`, then config `org`, then
+`["2amlogic"]`. The config tier is the merged effective config. An empty value
+counts as unset at its tier. Logins are trimmed and de-duplicated
+case-insensitively.
+
+- **Kind.** An owner named through `owners` is probed once per daemon
+  lifetime with `GET /users/{owner}` → `type` (`Organization` or `User`). A
+  failed probe or any other type is never guessed: the owner is skipped this
+  cycle, named in the cycle's errors and in `status`, and probed again next
+  cycle. An owner from the `org` alias (or `--org`) or the default is a
+  **declared organization** and is not probed, so an `org`-only config makes
+  exactly the requests it made before #9188.
+- **Discovery.** Organizations use `orgs/{o}/repos?type=all`, users use
+  `users/{u}/repos?type=owner`. That endpoint lists a user's **public**
+  repos only. Each owner's pages share the one ETag cache, keyed by request
+  path.
+- **Failure.** A rate limit or a rejected credential still aborts the whole
+  cycle. Any other failure skips only that owner. The cycle is
+  `discovery-failed` only when every owner failed.
+- **Unchanged.** The ledger, watermarks, and dedup keys are keyed by
+  `owner/repo` already, so existing state carries over. The rate-limit
+  backoff is still one per host (one token), and the single-captain gate is
+  unchanged. Exclusions should name `owner/repo`, because a bare name
+  matches that repo under every owner.
+
 ### Rate limits
 
 Each interval makes about one discovery request per page, plus one runs
@@ -367,7 +417,7 @@ that the rescan window re-lists costs nothing beyond that page, because the
 ledger answers it without a jobs listing.
 
 A `403` rate-limit response, a secondary limit, or a `429` **backs off the
-whole org**, never a single repo:
+whole poller** (every owner), never a single repo:
 
 - The backoff lasts until `Retry-After` if the response has one, otherwise
   until the `X-RateLimit-Reset` epoch, otherwise exponentially (60s doubling,
@@ -416,7 +466,13 @@ gitignored.
   lookback so the floor never reaches back past a repo's first cycle), and the
   ledger's `(repo, run_id, job_id, attempt)` dedup keeps the export exactly
   once (#8898). A re-attempt of a run created more than 24 hours ago is still
-  not seen.
+  not seen. The same 24-hour window (capped the same way) bounds how long an
+  unfinished run can hold the watermark back: past it, the run stops being
+  held and the watermark is free to advance, because nothing older than the
+  window can ever be re-listed by it either (#8992) — without this bound, a
+  run that never reaches a completed state (a stuck cancellation, an abandoned
+  workflow, a `queued` run whose runner never arrives) would pin the watermark,
+  and the ever-growing listing window it implies, indefinitely.
 - **Compaction.** When the ledger grows past 8 MiB and nothing is pending,
   it is rewritten atomically as key-only `seen` lines.
 - **One poller per host.** A `flock` on `poll.lock` stops the CLI and the
@@ -490,10 +546,10 @@ The attribute and label vocabulary is declared once, in
   `pull_requests[].number` (`pull_request`-triggered runs) or, as a fallback,
   from `feature/issue-N` in `head_branch` — but needs no allowlist entry of
   its own, since it is already in `bounded_attributes()`'s generic
-  always-admitted key list and the collector's span `keep_keys`. Span-link
-  generation from `loom.ci.run` back to the sweep trace is a separate,
-  not-yet-built follow-up (Issue #9007's proposal item 3); today the join is
-  attribute-only.
+  always-admitted key list and the collector's span `keep_keys`. Since #9088
+  a run that belongs to an issue is also copied into that issue's story trace
+  (see [Story stitching](#story-stitching-9088)); the per-run trace itself
+  is still joined to sweeps by attribute only.
 - `CI_METRIC_LABEL_KEYS`: the metric labels, and **only** these:
   `repo`, `workflow`, `job`, `runner`, `conclusion`. Metric labels never
   include a sha, ref, run id or issue number.
@@ -503,6 +559,43 @@ The gateway's `transform/privacy` `keep_keys` lists in
 Two tests fail if the config and the constants disagree:
 `ci_telemetry::tests::collector_allowlist_matches_the_ci_vocabulary_exactly`
 and `collector_fanout::gateway_forwards_exactly_the_ci_telemetry_vocabulary`.
+
+### Story stitching (#9088)
+
+A completed run that belongs to exactly one issue N is **also** emitted into
+N's story trace (harness-ops D32 v1, see [tracing](tracing.md)): an extra
+`loom.ci.run` span with trace ID `story_context(repo_id, N).trace_id`,
+parented to the story root span, and an extra `loom.ci.job` span per job
+under it. Code: `loom-daemon/src/ci_telemetry/story.rs`.
+
+- **Which issue.** The candidates are the union of every closing reference of
+  every PR in the run's `pull_requests[]` (GraphQL `closingIssuesReferences`)
+  and `N` from a `feature/issue-N` head branch. Exactly one same-repo issue
+  stitches. Zero or several candidates, a cross-repo or truncated reference
+  list, unreadable references, or an unresolvable `repo_id` (the #9068
+  resolver; there is no name-derived fallback) leave the run unstitched. Each
+  outcome is counted in the cycle summary (`story_runs_stitched`,
+  `story_runs_no_candidate`, `story_runs_ambiguous`, `story_runs_unresolved`)
+  and logged. Nothing is guessed.
+- **Ids.** The story run span's ID derives from `(repo_id, run_id, attempt)`
+  and a story job span's from `(repo_id, job_id)`. They ride in the same
+  ledger units as the per-run records, so they are exactly-once like
+  everything else here, and a re-poll or another host derives the same IDs.
+- **The per-run trace is unchanged.** Same IDs, same records. Each per-run
+  span and its story copy link to each other (both directions, run and job).
+- **Attributes.** The story copy adds `loom.story` (`owner/repo#N`),
+  `loom.story.key_version` (`v1`) and `loom.issue`. It carries
+  `loom.pr_number` only when GitHub associated exactly one PR with the run,
+  never the branch-derived issue number.
+- **API cost.** Nothing for a repo whose unemitted runs have no PR and no
+  `feature/issue-N` branch. Otherwise one `repo_id` probe per repo per hour,
+  cached, and at most one batched GraphQL request per repo per cycle (50 PRs
+  each), with each PR's references cached for 10 minutes. A GraphQL rate
+  limit only stops lookups for the rest of the cycle. It is not fed to the
+  org-wide REST backoff.
+- **Single emitter.** Loom's poller is the story emitter for CI. The
+  harness-ops CI poller (harness-ops#193) must not also stitch, because SigNoz
+  does not deduplicate rows.
 
 ### Non-goals (phase 1)
 

@@ -494,6 +494,7 @@ fn ranking_mode_writes_the_provider_namespaced_file_in_the_shared_format() {
         workspace.path(),
         CheckOptions {
             write_ranking: true,
+            live: false,
         },
         now,
     )
@@ -536,6 +537,7 @@ fn selection_lands_on_the_healthy_account_after_the_probe_marks_the_other() {
         workspace.path(),
         CheckOptions {
             write_ranking: true,
+            live: false,
         },
         now,
     )
@@ -574,6 +576,7 @@ fn both_accounts_exhausted_produces_the_codex_scoped_refusal() {
         workspace.path(),
         CheckOptions {
             write_ranking: true,
+            live: false,
         },
         now,
     )
@@ -740,4 +743,56 @@ fn ranking_file_state_reports_absence_then_presence() {
     let (present, age) = ranking_file_state(workspace.path());
     assert!(present);
     assert!(age.unwrap() < 60);
+}
+
+// ---------------------------------------------------------------------------
+// #8963: snapshot parsing of the codex-cli 0.156 shape
+// ---------------------------------------------------------------------------
+
+/// A real codex-cli 0.156 `token_count` line (identity removed): the weekly
+/// window as `primary`, `secondary: null`, and an integer-epoch `resets_at`.
+const CLI_0156_LINE: &str = r#"{"timestamp":"2026-09-23T16:56:22.026Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":43.0,"window_minutes":10080,"resets_at":1790713159},"secondary":null,"plan_type":"pro"}}}"#;
+
+#[test]
+fn a_weekly_primary_snapshot_is_the_long_window_with_its_integer_reset() {
+    let fallback = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let snap = extract_usage_snapshot(CLI_0156_LINE, fallback).expect("snapshot");
+    assert!(snap.primary.is_none(), "a 10080-minute window is not the 5h slot (#8963)");
+    let weekly = snap.secondary.expect("weekly window");
+    assert!((weekly.used_fraction - 0.43).abs() < 1e-9);
+    assert_eq!(
+        weekly.resets_at,
+        Utc.timestamp_opt(1_790_713_159, 0).single(),
+        "an integer-epoch resets_at is parsed, not dropped (#8963)"
+    );
+    // With a known reset the window stops being live once it passes, so a
+    // week-old 100% can no longer pin an account.
+    assert!(!weekly.is_live_at(Utc.timestamp_opt(1_790_713_160, 0).unwrap()));
+}
+
+#[test]
+fn a_newest_rollout_without_rate_limits_does_not_hide_an_older_snapshot() {
+    let profile = tempfile::tempdir().unwrap();
+    let day = profile.path().join("sessions/2026/09/23");
+    fs::create_dir_all(&day).unwrap();
+    let older = day.join("rollout-2026-09-23T16-55-50-a.jsonl");
+    fs::write(&older, format!("{CLI_0156_LINE}\n")).unwrap();
+    // A newer session that ended before its first model turn.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let newer = day.join("rollout-2026-09-23T17-00-00-b.jsonl");
+    fs::write(&newer, "{\"type\":\"session_meta\",\"payload\":{}}\n").unwrap();
+    let snap = latest_usage_snapshot(profile.path()).expect("the older snapshot is found (#8963)");
+    assert!(snap.secondary.is_some());
+}
+
+#[test]
+fn slot_by_duration_keeps_the_position_of_a_window_with_no_stated_length() {
+    let w = |fraction: f64| RateLimitWindow {
+        used_fraction: fraction,
+        window_minutes: None,
+        resets_at: None,
+    };
+    let (short, long) = slot_by_duration(Some(w(0.1)), Some(w(0.2)));
+    assert_eq!(short.map(|w| w.used_fraction), Some(0.1));
+    assert_eq!(long.map(|w| w.used_fraction), Some(0.2));
 }

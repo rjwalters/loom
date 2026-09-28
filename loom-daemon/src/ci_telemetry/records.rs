@@ -205,11 +205,15 @@ fn span_status(conclusion: Option<&str>) -> SpanStatus {
     }
 }
 
+/// Span attributes, stamped with the recording daemon's provenance. The
+/// derived IDs stay host-independent; only these attributes name the recorder.
 fn attrs(pairs: Vec<(&str, Option<String>)>) -> TraceAttributes {
-    pairs
+    let mut attributes = pairs
         .into_iter()
         .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
-        .collect()
+        .collect();
+    crate::telemetry::trace::provenance::stamp(&mut attributes);
+    attributes
 }
 
 fn envelope(

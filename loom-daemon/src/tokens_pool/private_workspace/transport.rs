@@ -16,8 +16,20 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
                 .map(|n| n.to_string_lossy().into_owned())
         })
     });
+    // An inherited private lease means the daemon prepared and admitted this
+    // launch AS a private clone — possibly on containment evidence (#8787),
+    // with the adapter's own mutable-role hook preflight relocated into the
+    // session. It must therefore never degrade into an ordinary host or
+    // shared-mount exec, where none of that enforcement exists.
+    let leased = std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_some();
+    let host = |args| {
+        if leased {
+            bail!("a private account lease was inherited but this session is not a configured private clone; refusing a non-private launch");
+        }
+        crate::session_exec::run_host(args)
+    };
     let (Some(root), Some(name)) = (root, name) else {
-        return crate::session_exec::run_host(args);
+        return host(args);
     };
     let private_profile = std::env::var_os("CODEX_HOME")
         .or_else(|| std::env::var_os("LOOM_CODEX_HOME"))
@@ -25,10 +37,10 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
     if private_profile.as_ref().is_some_and(|profile| {
         state_dir(profile).is_ok_and(|dir| !dir.join("workspace.json").exists())
     }) {
-        return crate::session_exec::run_host(args);
+        return host(args);
     }
     if !configured(&root, &name)? {
-        return crate::session_exec::run_host(args);
+        return host(args);
     }
     let (config, dir) = lifecycle::resolve(&root, &name)?;
     let selection = if std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none() {
@@ -158,6 +170,11 @@ fn child_env(input: &[String], config: &Config, job: &lease::Job) -> Result<Vec<
     // the identity its own boundary is rechecked against (issue #8839).
     env.extend(bundle::policy_env());
     env.push(format!("LOOM_PRIVATE_CONTROL={}", job.control));
+    // The base revision the host's own `prepare` resolved for this job. The
+    // worker's containment proof (#8787) cross-checks it against the clone's
+    // identity record, so a stale or replaced workspace cannot answer for the
+    // bound job.
+    env.push(format!("LOOM_PRIVATE_BASE_REVISION={}", job.base_revision));
     for name in FORGE_ENV {
         if std::env::var_os(name).is_some() {
             env.push(name.into());
@@ -207,6 +224,10 @@ mod tests {
         .unwrap();
         assert!(env.contains(&"LOOM_WORKSPACE=/workspace/repo".into()));
         assert!(env.contains(&"LOOM_ROLE=guide".into()));
+        // The bound control identity and base revision the worker re-checks
+        // come from the host lease, never from caller-supplied environment.
+        assert!(env.contains(&format!("LOOM_PRIVATE_CONTROL={}", "b".repeat(64))));
+        assert!(env.contains(&"LOOM_PRIVATE_BASE_REVISION=".to_string()));
         assert!(!env
             .iter()
             .any(|v| v.contains("/host/") || v.starts_with("LOOM_RUN_JOB")));

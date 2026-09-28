@@ -18,14 +18,14 @@
 # .loom/docs/file-size-policy.md.
 architect      15051        -
 auditor        20476        -
-builder        31066        -
+builder        31065        -
 champion       14381        -
 concierge      14435        -
 curator        47166    30000
 doctor         33789    30000
 driver         10763        -
-guide          50378        -
+guide          50832        -
 hermit         16489        -
 judge          56195    30000
 loom           19231        -
-sweep          64254    60000
+sweep          64260    60000

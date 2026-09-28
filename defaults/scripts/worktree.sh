@@ -63,6 +63,11 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/default-branch.sh"
 # `worktree_ops/cargo_target.rs`), so the port calls those directly rather than
 # keeping a second bash implementation alive. The ledger's line format is
 # unchanged, so one grep/jq still reads every removal path's entries together.
+#
+# #8458's per-worktree CARGO_TARGET_DIR needs nothing sourced here either: the
+# create path below drives `loom-daemon cargo-target-dir provision` straight
+# off the located binary, and every removal path reads the marker through the
+# same daemon (`cargo-target-dir is-attributable|marker`).
 
 # Shared "has this branch landed?" primitive (#7812): forge PR state first,
 # then `git merge-tree --write-tree` tree equality, answering landed /
@@ -481,6 +486,56 @@ cleanup_partial_worktree_state() {
     return 0
 }
 
+# --------------------------------------------------------------------------
+# Upstream-tracking correction + stale-worktree drift report (#6095/#6100,
+# #6257/#6291)
+# --------------------------------------------------------------------------
+#
+# Ported to `loom-daemon worktree-upstream` (#8195 slice 9, epic #7810). ONE
+# delegation with two arms, because this script carried TWO hand-maintained
+# copies of the same fix and they drifted:
+#
+#   local-branch         the "local branch already exists - reusing it" arm
+#                        (#6095/#6100, the #6086/PR #6093 incident: a branch
+#                        left tracking origin/$DEFAULT_BRANCH turns a later
+#                        `git pull --ff-only` into a silent fast-forward onto
+#                        main's tip)
+#   registered-worktree  the "worktree dir exists and git knows it" fast path
+#                        (#6257/#6291) — the same correction, re-implemented by
+#                        hand eighteen months later because, as that arm's own
+#                        comment said, it is "a completely different code path"
+#                        — plus the behind-the-pushed-tip drift report
+#
+# $3 is the caller's own `git status --porcelain` reading, taken BEFORE the
+# fetch; only its emptiness matters. It is passed rather than re-read inside
+# the subcommand so the hint block it selects agrees with the preserve/reset
+# decision the caller has already made from that same reading.
+#
+# A daemon that predates the port is NOT probed for with `--help` first, and
+# its clap usage error is NOT sent to /dev/null — deliberately, unlike the
+# `worktree-branch-conflict` guard below. There, clap's exit 2 collides with a
+# meaningful answer, so the probe buys correctness; here the exit code is
+# discarded outright, so the only thing a probe or a redirect would buy is
+# quiet. During a rolling fleet upgrade that one stderr line naming the missing
+# subcommand is the best signal available that this check was skipped — and the
+# port itself writes nothing to stderr (pinned by the differential harness), so
+# nothing else can appear there to be confused with it.
+#
+# requires-daemon: worktree-upstream optional  #8195 slice 9 — without it neither arm runs: a branch keeps whatever upstream it had and a stale worktree is preserved unannounced, which is the pre-#6095 / pre-#6257 behaviour. A lost diagnosis, not a lost file — nothing on this path creates, deletes or resets anything.
+_worktree_upstream_check() {
+    [[ -n "${_WT_DAEMON_BIN:-}" ]] || return 0
+
+    # Literal-or-empty strings rather than an array, for the bash 3.2 reason
+    # spelled out in cleanup_partial_worktree_state above.
+    local _q="" _u=""
+    [[ "$JSON_OUTPUT" == "true" ]] && _q="--quiet"
+    [[ -n "${3:-}" ]] && _u="--uncommitted"
+    # shellcheck disable=SC2086  # $_q/$_u are fixed literal flags or empty
+    "$_WT_DAEMON_BIN" worktree-upstream --arm "$1" --repo "$2" \
+        --branch "$BRANCH_NAME" --issue "$ISSUE_NUMBER" $_q $_u || true
+    return 0
+}
+
 # Shared preamble for the two `loom_exec_script_helper` verbs below (`remove`,
 # and the WIP trio): source lib/script-helper.sh, or exit 2 naming $1. The exec
 # line itself deliberately stays in each caller with its subcommand spelled
@@ -596,6 +651,7 @@ _worktree_remove_verb() {
 # considered your tree and declined" rather than "this install is broken". The
 # explicit check below reports 2 instead — the one thing the exit codes must
 # never do is lie about which of those happened.
+# requires-daemon: cargo-target-dir optional  #8458 — per-worktree CARGO_TARGET_DIR; a host whose binary predates it (or has none) simply gets no per-worktree dir, which is the pre-#8458 behaviour
 # requires-daemon: worktree-wip >= 0.19.224  #8433 (#8195 slice 2) — the WIP-verb port; without it the stub exits 2 and the verbs refuse
 _worktree_wip_verb() {
     _worktree_source_script_helper "$1"
@@ -879,8 +935,8 @@ Safety Features:
   ✓ Prevents nested worktrees
   ✓ Non-interactive (safe for AI agents)
   ✓ Reuses existing branches automatically
-  ✓ Symlinks node_modules from main (avoids pnpm install)
-  ✓ Symlinks nested per-package node_modules for pnpm/monorepo workspaces
+  ✓ Symlinks node_modules from main (avoids npm install) — NOT on pnpm repos
+  ✓ Symlinks nested per-package node_modules for monorepo workspaces
   ✓ Symlinks extra gitignored paths via .loom/config.json worktree.linkPaths
   ✓ Excludes created symlinks via .git/info/exclude (no accidental git add)
   ✓ Symlinks .mcp.json from main (MCP config visible in worktrees)
@@ -933,18 +989,18 @@ Project-Specific Hooks:
 
 Monorepo / Generated-Artifact Symlinks:
   In addition to the root node_modules symlink, worktree.sh symlinks:
-    - Nested per-package node_modules (e.g. apps/web/node_modules) discovered by
-      scanning the main workspace for node_modules dirs that sit next to a
-      package.json (pnpm/monorepo layouts). No YAML parser dependency.
+    - Nested per-package node_modules (e.g. apps/web/node_modules), found by scanning
+      the main workspace for node_modules dirs next to a package.json. No YAML parser.
     - Extra gitignored paths listed in .loom/config.json under worktree.linkPaths,
       e.g. generated wasm-pack bindings that are expensive to rebuild per worktree:
 
         { "worktree": { "linkPaths": ["apps/web/src/wasm"] } }
 
   Each created symlink is added to the worktree's .git/info/exclude so 'git add -A'
-  never stages it. All symlinking is best-effort — a failed link warns and
-  continues; it never aborts worktree creation. Repos with no nested node_modules
-  and no worktree.linkPaths config see no behavior change.
+  never stages it; linking is best-effort and never aborts worktree creation. Repos
+  with no nested node_modules and no worktree.linkPaths config see no change.
+  NEITHER node_modules family runs on a pnpm workspace — pnpm purges THROUGH the alias
+  into the main clone (#8944). Override: worktree.linkNodeModules true|false|"auto".
 
 Resuming Abandoned Work:
   If an agent abandoned work on issue #42, a new agent can resume:
@@ -1476,57 +1532,53 @@ if [[ -d "$WORKTREE_PATH" ]]; then
 
     # Check if it's registered with git
     if git worktree list | grep -q "$WORKTREE_PATH"; then
-        # Check if worktree is stale: no commits ahead of the base and behind it.
-        # For a stacked child (--base), staleness is measured against the parent
-        # branch (BASE_REF), not the default branch (#3729).
-        local_commits_ahead=$(git -C "$WORKTREE_PATH" rev-list --count "$BASE_REF..HEAD" 2>/dev/null) || local_commits_ahead="0"
-        local_commits_behind=$(git -C "$WORKTREE_PATH" rev-list --count "HEAD..$BASE_REF" 2>/dev/null) || local_commits_behind="0"
+        # The working-tree reading comes FIRST now (#8287): both the drift check
+        # below and the staleness reference after it consume it, and the
+        # reference also needs that check's `git fetch origin $BRANCH_NAME` to
+        # have run so `origin/$BRANCH_NAME` is the branch's real pushed tip
+        # rather than whatever this worktree last saw.
         local_uncommitted=$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null) || local_uncommitted=""
 
         # #6257: this "worktree directory + branch already registered with
         # git" fast path is a completely different code path from the
         # "local branch exists, no worktree dir yet" reuse path below
-        # (#6095/#6100) — that fix's upstream-tracking correction never runs
+        # (#6095/#6100) — that fix's upstream-tracking correction never ran
         # here, so a worktree left with stale HEAD and/or wrong upstream
         # tracking was silently "preserved" (below) and handed straight to a
         # Judge/Doctor session with no signal that it no longer matched the
         # branch's actual pushed tip. Correct/report drift against the
-        # branch's OWN upstream (not just BASE_REF, computed above) before
-        # deciding whether to preserve.
-        git -C "$WORKTREE_PATH" fetch origin "$BRANCH_NAME" 2>/dev/null || true
-        if git -C "$WORKTREE_PATH" show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
-            wt_current_upstream="$(git -C "$WORKTREE_PATH" rev-parse --abbrev-ref "$BRANCH_NAME@{u}" 2>/dev/null || true)"
-            if [[ "$wt_current_upstream" != "origin/$BRANCH_NAME" ]]; then
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    if [[ -n "$wt_current_upstream" ]]; then
-                        print_warning "Worktree branch '$BRANCH_NAME' was tracking '$wt_current_upstream' - correcting to 'origin/$BRANCH_NAME'"
-                    else
-                        print_info "Worktree branch '$BRANCH_NAME' has no upstream - setting it to 'origin/$BRANCH_NAME'"
-                    fi
-                fi
-                git -C "$WORKTREE_PATH" branch --set-upstream-to="origin/$BRANCH_NAME" "$BRANCH_NAME" 2>/dev/null || true
-            fi
+        # branch's OWN upstream (not just BASE_REF) before deciding whether to
+        # preserve.
+        #
+        # The two code paths now share ONE implementation (#8195 slice 9) —
+        # see _worktree_upstream_check above. $local_uncommitted is the
+        # reading taken just above, passed rather than re-read so the
+        # remediation hint agrees with the preserve/reset decision below.
+        _worktree_upstream_check registered-worktree "$WORKTREE_PATH" "$local_uncommitted"
 
-            wt_head_sha="$(git -C "$WORKTREE_PATH" rev-parse HEAD 2>/dev/null || true)"
-            wt_origin_tip="$(git -C "$WORKTREE_PATH" rev-parse "origin/$BRANCH_NAME" 2>/dev/null || true)"
-            if [[ -n "$wt_head_sha" && -n "$wt_origin_tip" && "$wt_head_sha" != "$wt_origin_tip" ]] && \
-               git -C "$WORKTREE_PATH" merge-base --is-ancestor "$wt_head_sha" "$wt_origin_tip" 2>/dev/null; then
-                # Local HEAD is a strict ancestor of the branch's pushed tip -
-                # i.e. genuinely behind (not just diverged/ahead with unpushed
-                # local commits, which is expected and not drift).
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_warning "Worktree HEAD ($wt_head_sha) is behind the pushed tip of branch '$BRANCH_NAME' ($wt_origin_tip) - this worktree may be stale"
-                    if [[ -n "$local_uncommitted" ]]; then
-                        print_warning "Worktree also has uncommitted changes - resolve before evaluating/building on it:"
-                        print_info "  ./.loom/scripts/worktree.sh snapshot $ISSUE_NUMBER --include-untracked   # save WIP"
-                        print_info "  git -C $WORKTREE_PATH checkout -- .                                       # clear tracked working-tree drift"
-                        print_info "  git -C $WORKTREE_PATH pull --ff-only                                      # resync to origin/$BRANCH_NAME"
-                    else
-                        print_info "  git -C $WORKTREE_PATH pull --ff-only   # resync to origin/$BRANCH_NAME"
-                    fi
-                fi
-            fi
-        fi
+        # #8287: the staleness reference — and therefore the reset target below
+        # — is origin/$BRANCH_NAME whenever that ref exists AND has not already
+        # landed as a merged PR (the #5657 skip); otherwise it is
+        # BASE_REF/BASE_DISPLAY exactly as before, which for a stacked child
+        # (--base) is the parent branch rather than the default branch (#3729).
+        # Judging staleness purely against the base resets a worktree onto main
+        # while a live origin/$BRANCH_NAME still carries the PR's only commits,
+        # handing the next session an EMPTY branch to force-push over the real
+        # PR (the #8147/#8190 incident). `loom-daemon worktree-stale-ref` owns
+        # that decision — the landed half of it is the ONE branch_landed ladder
+        # (#8470), not a second bash copy of it — and reports the ahead/behind
+        # counts measured against whichever reference it chose, so the two
+        # cannot fall out of step. See loom-daemon/src/worktree_cli/stale_ref.rs.
+        #
+        # The first two assignments are the pre-#8287 reading (BASE_REF and the
+        # counts measured against it), and the `|| echo` arm re-serves them: a
+        # host with no loom-daemon, or one predating this subcommand (clap exit
+        # 2, whose usage blob is the only thing 2>/dev/null suppresses — this
+        # port itself writes nothing to stderr), behaves exactly as before.
+        #
+        # requires-daemon: worktree-stale-ref optional  #8287/#8354 — without it the staleness reference stays BASE_REF, i.e. the pre-#8287 behaviour: a worktree whose local branch sits at the base is judged stale and reset there. A reinstated defect, not a new one, and the reset it feeds is still gated by loom_worktree_reset_or_rescue (#6334), which re-derives commits-ahead itself and refuses rather than discarding.
+        stale_ref="$BASE_REF" stale_display="$BASE_DISPLAY" local_commits_ahead=$(git -C "$WORKTREE_PATH" rev-list --count "$BASE_REF..HEAD" 2>/dev/null || echo 0) local_commits_behind=$(git -C "$WORKTREE_PATH" rev-list --count "HEAD..$BASE_REF" 2>/dev/null || echo 0)
+        [[ -z "${_WT_DAEMON_BIN:-}" ]] || read -r stale_ref stale_display local_commits_ahead local_commits_behind <<< "$("$_WT_DAEMON_BIN" worktree-stale-ref --worktree "$WORKTREE_PATH" --branch "$BRANCH_NAME" --default-branch "$DEFAULT_BRANCH" --base-ref "$BASE_REF" --base-display "$BASE_DISPLAY" 2>/dev/null || echo "$stale_ref $stale_display $local_commits_ahead $local_commits_behind")"
 
         if [[ "$local_commits_ahead" -gt 0 || -n "$local_uncommitted" ]]; then
             # Worktree has real work - preserve it
@@ -1536,7 +1588,7 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             if [[ "$JSON_OUTPUT" != "true" ]]; then
                 print_info "Worktree is registered with git"
                 if [[ "$local_commits_ahead" -gt 0 ]]; then
-                    print_info "Worktree has $local_commits_ahead commit(s) ahead of main - preserving existing work"
+                    print_info "Worktree has $local_commits_ahead commit(s) ahead of $stale_display - preserving existing work"
                 elif [[ -n "$local_uncommitted" ]]; then
                     print_info "Worktree has uncommitted changes - preserving existing work"
                 fi
@@ -1548,8 +1600,8 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             # Stale worktree: no commits ahead, no uncommitted changes
             # Reset in place instead of removing (avoids CWD corruption)
             if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Stale worktree detected (0 commits ahead, $local_commits_behind behind $BASE_DISPLAY, no uncommitted changes)"
-                print_info "Resetting worktree in place to $BASE_DISPLAY..."
+                print_warning "Stale worktree detected (0 commits ahead, $local_commits_behind behind $stale_display, no uncommitted changes)"
+                print_info "Resetting worktree in place to $stale_display..."
             fi
 
             # Back-fill/refresh the Loom sentinel on both reset outcomes: the
@@ -1563,10 +1615,16 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             # tracked changes into this worktree in the interim. Rescue/refuse
             # instead of silently discarding them (see lib/worktree-race-rescue.sh
             # for the full design decision).
+            #
+            # The target is $stale_ref, not $BASE_REF (#8287) — same reference
+            # the staleness verdict above was reached against. The fetch stays
+            # keyed on the base branch: when $stale_ref IS origin/$BRANCH_NAME
+            # its own remote was already fetched by the drift check above, and
+            # refreshing the base too is harmless.
             if git -C "$WORKTREE_PATH" fetch origin "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null && \
-               loom_worktree_reset_or_rescue "$WORKTREE_PATH" "$BASE_REF" "issue-$ISSUE_NUMBER-stale-worktree-reset"; then
+               loom_worktree_reset_or_rescue "$WORKTREE_PATH" "$stale_ref" "issue-$ISSUE_NUMBER-stale-worktree-reset"; then
                 if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_success "Stale worktree reset to $BASE_DISPLAY"
+                    print_success "Stale worktree reset to $stale_display"
                     echo ""
                     print_info "To use this worktree: cd $WORKTREE_PATH"
                 fi
@@ -1610,18 +1668,11 @@ if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
     # local branch's upstream at it before handing the branch to `git
     # worktree add`. If origin has no branch of this name (never pushed),
     # leave tracking as-is — do not fabricate an upstream that doesn't exist.
-    # (The two-deep message dispatch below is one physical line, not two
-    # separate `if`s, to keep this reuse arm's net line count in the shell
-    # budget ratchet's portable pool flat — see the #8280 comment below for
-    # why that budget was worth spending on.)
-    git fetch origin "$BRANCH_NAME" 2>/dev/null || true
-    if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
-        current_upstream="$(git rev-parse --abbrev-ref "$BRANCH_NAME@{u}" 2>/dev/null || true)"
-        if [[ "$current_upstream" != "origin/$BRANCH_NAME" ]]; then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then if [[ -n "$current_upstream" ]]; then print_warning "Branch '$BRANCH_NAME' was tracking '$current_upstream' - correcting to 'origin/$BRANCH_NAME'"; else print_info "Branch '$BRANCH_NAME' has no upstream - setting it to 'origin/$BRANCH_NAME'"; fi; fi
-            git branch --set-upstream-to="origin/$BRANCH_NAME" "$BRANCH_NAME" 2>/dev/null || true
-        fi
-    fi
+    #
+    # Shares its implementation with the registered-worktree fast path above
+    # since #8195 slice 9 — see _worktree_upstream_check. cwd is the main
+    # workspace here, which is what $WORKTREE_REPO_ROOT holds.
+    _worktree_upstream_check local-branch "$WORKTREE_REPO_ROOT"
 
     # #8280: the sibling arm below refuses an already-LANDED branch via the
     # shared `branch_landed` primitive (#5657/#7812) before reusing it, and
@@ -1959,6 +2010,29 @@ if _try_worktree_add; then
     elif [[ "$JSON_OUTPUT" != "true" ]]; then
         print_warning "No loom-daemon resolved - skipping node_modules/.mcp.json/linkPaths symlinks (worktree still created)"
     fi
+
+    # #8458: give this worktree its own Cargo target dir under the otherwise
+    # shared root and record it in the `.loom-cargo-target-dir` marker, so the
+    # removal paths (`loom-daemon worktree-remove`, merge-pr.sh, `loom-daemon
+    # clean`, the reaper) can attribute and reclaim it. Off unless the repo opts
+    # in; a pure no-op on
+    # a host whose Cargo output is not redirected outside the worktree.
+    #
+    # Sets LOOM_WORKTREE_CARGO_TARGET_DIR for the post-worktree hook below —
+    # NOT CARGO_TARGET_DIR, which would make the hook's main-workspace binary
+    # lookup miss and reintroduce #6013/#6014's rebuild storm.
+    #
+    # Always `|| true`: the daemon binary may not be built yet (this runs at
+    # worktree creation, before the hook that seeds one), and a build-cache
+    # optimisation must never fail a worktree creation. Empty stdout means
+    # "no directory" — the subcommand exits 0 for every not-applicable case.
+    # `--report`'s stderr is deliberately NOT swallowed (stdout is the directory,
+    # which `--json` mode needs clean): it is the one operator-visible sign the
+    # scheme is on. Exporting an empty value is harmless — every consumer tests
+    # `-n` — so no second statement is needed to unset it.
+    _pwt_bin="$(loom_locate_daemon_bin "$MAIN_WORKSPACE_DIR" 2>/dev/null || true)"
+    [[ -z "${_pwt_bin:-}" ]] || export LOOM_WORKTREE_CARGO_TARGET_DIR="$("$_pwt_bin" cargo-target-dir \
+        provision --repo-root "$MAIN_WORKSPACE_DIR" --report "$ABS_WORKTREE_PATH" || true)"
 
     # Run project-specific post-worktree hook if it exists
     # This allows projects to add custom setup steps (e.g., pnpm install, lake exe cache get)

@@ -98,6 +98,99 @@ fn an_exhaustion_in_a_launch_log_bad_marks_the_pool_account_automatically() {
     assert_eq!(chosen.name, "beta");
 }
 
+/// The proxy's own immediate mark for `alpha`, written with the real
+/// cooldown its classification carries (60s rate-limited, 6h exhausted).
+fn proxy_mark(workspace: &Path, classification: Classification) -> BadMark {
+    bad_marks::mark_bad_for_class(
+        &pool_root(workspace),
+        PROVIDER,
+        "alpha",
+        &format!("{} (classified at the egress proxy)", classification.label()),
+        classification.default_cooldown_secs(),
+        Some("glm-5.3-flash"),
+    )
+    .unwrap()
+}
+
+/// #8699 AC2's double-mark guard, same-strength case: the egress proxy
+/// already marked this exact `(account, class)` as exhausted (6h) at request
+/// time, so the exit-code pass over a log that also reads "exhausted" finds a
+/// mark that already covers its horizon and leaves it alone.
+#[test]
+fn an_equally_strong_proxy_mark_is_not_rewritten_by_the_exit_code_path() {
+    let tmp = workspace(&["alpha", "beta"]);
+    let proxy = proxy_mark(tmp.path(), Classification::Exhausted);
+
+    let contents = log("pool", Some("alpha"), "glm-5.3-flash", "Error: insufficient balance");
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+
+    assert_eq!(feedback.mark, Some(proxy.clone()));
+    assert!(feedback.detail.contains("already bad-marked"), "{}", feedback.detail);
+    assert_eq!(active(tmp.path(), "alpha", Some("glm-5.3-flash")).unwrap(), proxy);
+    assert!(active(tmp.path(), "beta", Some("glm-5.3-flash")).is_none());
+}
+
+/// #8699 Judge finding: a bare 429 marks `rate-limited` (the proxy's real
+/// 60s) first-error-wins; when the retained log then proves exhaustion, the
+/// exit-code pass must UPGRADE to the 6h mark — not skip because "some" mark
+/// is active, which returned an exhausted account to rotation after 60s.
+#[test]
+fn an_exhausted_log_upgrades_a_weaker_rate_limited_proxy_mark() {
+    let tmp = workspace(&["alpha", "beta"]);
+    let proxy = proxy_mark(tmp.path(), Classification::RateLimited);
+    assert_eq!(proxy.resets_at, Some(proxy.marked_at + 60));
+
+    let contents = log("pool", Some("alpha"), "glm-5.3-flash", "Error: insufficient balance");
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+
+    let upgraded = feedback.mark.expect("an exhaustion must be marked");
+    assert_ne!(upgraded, proxy);
+    assert!(upgraded.reason.contains("exhausted"), "{}", upgraded.reason);
+    assert!(upgraded.resets_at.unwrap() >= proxy.marked_at + 6 * 3600);
+    assert!(feedback.detail.contains("bad-marked"), "{}", feedback.detail);
+    assert!(!feedback.detail.contains("already"), "{}", feedback.detail);
+    assert_eq!(active(tmp.path(), "alpha", Some("glm-5.3-flash")).unwrap(), upgraded);
+}
+
+/// The other direction, which also covers two concurrent unproxied launches
+/// on one account: a weaker rate-limit signal arriving after a 6h exhaustion
+/// mark must never shorten it.
+#[test]
+fn a_rate_limited_log_never_downgrades_a_stronger_exhausted_mark() {
+    let tmp = workspace(&["alpha"]);
+    let strong = proxy_mark(tmp.path(), Classification::Exhausted);
+
+    let contents = log("pool", Some("alpha"), "glm-5.3-flash", "warning: rate limit hit");
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+
+    assert_eq!(feedback.classification, Classification::RateLimited);
+    assert_eq!(feedback.mark, Some(strong.clone()));
+    assert!(feedback.detail.contains("already bad-marked"), "{}", feedback.detail);
+    assert_eq!(active(tmp.path(), "alpha", Some("glm-5.3-flash")).unwrap(), strong);
+}
+
+/// An account-wide mark covers a class-scoped request, but a class-scoped
+/// mark never covers an account-wide one (it does not block other classes).
+#[test]
+fn escalate_respects_mark_scope() {
+    let tmp = workspace(&["alpha"]);
+    let root = pool_root(tmp.path());
+    let wide = bad_marks::mark_bad(&root, PROVIDER, "alpha", "wide", Some(6 * 3600)).unwrap();
+    let covered =
+        bad_marks::escalate_bad_for_class(&root, PROVIDER, "alpha", "x", Some(60), Some("glm-5.3"))
+            .unwrap();
+    assert_eq!(covered, bad_marks::MarkWrite::AlreadyCovered(wide));
+
+    let tmp = workspace(&["alpha"]);
+    let root = pool_root(tmp.path());
+    bad_marks::mark_bad_for_class(&root, PROVIDER, "alpha", "cls", Some(6 * 3600), Some("glm-5.3"))
+        .unwrap();
+    let written =
+        bad_marks::escalate_bad_for_class(&root, PROVIDER, "alpha", "wide", Some(60), None)
+            .unwrap();
+    assert!(matches!(written, bad_marks::MarkWrite::Written(_)), "{written:?}");
+}
+
 /// #8424 item 5 / AC 5, end to end: the real captured `provider.auth` 401
 /// event is surfaced as a credential failure and the account is **not**
 /// marked, so no exhaustion reset horizon is applied to a healthy key.

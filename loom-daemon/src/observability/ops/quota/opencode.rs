@@ -176,8 +176,22 @@ impl StoreCursor {
 
     /// Fold one read of `rows_after(self.floor())` into the cursor, pushing
     /// each newly completed, non-empty step `emit` accepts.
+    ///
+    /// # Deleted open rows (#9013 item 1)
+    ///
+    /// `rows` is every assistant row with `rowid` above the floor this read
+    /// used, and every currently-`open` rowid is, by construction of
+    /// [`Self::floor`], above that same floor — so an open rowid whose row
+    /// still exists always reappears here. One that does not is confirmed
+    /// gone (OpenCode deletes `message` rows only when a session is
+    /// deleted), and is dropped from `open` immediately rather than waiting
+    /// out [`OPEN_ROW_MAX_AGE_SECS`], during which it would otherwise keep
+    /// pinning the read floor low.
     pub fn advance(&mut self, rows: Vec<StepRow>, emit: Emit, out: &mut Vec<BurnEvent>) {
+        let previously_open: Vec<i64> = self.open.keys().copied().collect();
+        let mut seen = std::collections::HashSet::with_capacity(rows.len());
         for row in rows {
+            seen.insert(row.rowid);
             let seen_before = row.rowid <= self.high;
             if seen_before && !self.open.contains_key(&row.rowid) {
                 continue; // already counted (or not usage)
@@ -209,6 +223,11 @@ impl StoreCursor {
                 at,
                 usage,
             });
+        }
+        for rowid in previously_open {
+            if !seen.contains(&rowid) {
+                self.open.remove(&rowid);
+            }
         }
         let horizon = (emit.now - Duration::seconds(OPEN_ROW_MAX_AGE_SECS)).timestamp_millis();
         self.open.retain(|_, created| *created >= horizon);

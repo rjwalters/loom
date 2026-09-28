@@ -82,9 +82,16 @@ EOF
 }
 
 # Set up a minimal single-package "loom-daemon" crate at $1, with
-# scripts/cargo-target-dir.sh vendored alongside it (unless SKIP_HELPER=1).
+# scripts/cargo-target-dir.sh vendored alongside it (unless SKIP_HELPER=1) and
+# defaults/scripts/lib/cargo-target-dir.sh vendored too (unless SKIP_LIB=1 --
+# the hook sources the lib for the #8458 per-worktree helpers and falls back to
+# degraded twins without it; both paths are exercised below).
 make_main_workspace() {
-    local root="$1" skip_helper="${2:-0}"
+    local root="$1" skip_helper="${2:-0}" skip_lib="${3:-${2:-0}}"
+    if [[ "$skip_lib" != "1" ]]; then
+        mkdir -p "$root/defaults/scripts/lib"
+        cp "$REPO_ROOT/defaults/scripts/lib/cargo-target-dir.sh" "$root/defaults/scripts/lib/cargo-target-dir.sh"
+    fi
     mkdir -p "$root/src"
     cat > "$root/Cargo.toml" <<'EOF'
 [package]
@@ -232,7 +239,7 @@ fi
 # ==========================================================================
 MAIN4="$WORKDIR/main4"
 WT4="$WORKDIR/wt4"
-make_main_workspace "$MAIN4" 1  # skip_helper=1: no scripts/cargo-target-dir.sh
+make_main_workspace "$MAIN4" 1 1  # no scripts/cargo-target-dir.sh, no lib/
 add_worktree "$MAIN4" "$WT4" "t4"
 make_fake_bin "$MAIN4/target/release/loom-daemon" "main4-binary"
 
@@ -250,6 +257,129 @@ if [[ -x "$WT4/target/release/loom-daemon" ]]; then
 else
     fail "no helper script: no binary at $WT4/target/release/loom-daemon (fallback broken)"
 fi
+
+# ==========================================================================
+# Test 5: the per-worktree target-dir scheme (issue #8458) -- THE #6013/#6014
+# REGRESSION TEST for it.
+#
+# Under that scheme the SOURCE and the DESTINATION are resolved by different
+# rules, and the sweep's ambient CARGO_TARGET_DIR names the DESTINATION:
+#
+#   CARGO_TARGET_DIR=<shared>/wt/issue-N       (exported by spawn-claude.sh)
+#   worktree's own target dir  = that same path (the marker / the env var)
+#   main workspace's target dir = <shared>      (~/.cargo/config.toml)
+#
+# Resolving the MAIN workspace through that ambient value -- which is what env
+# beats config means -- reports the pre-built binary "missing" on EVERY worktree
+# creation and falls through to a full `cargo build --release`. That is exactly
+# #6013's rebuild storm, and it is the single most likely way #8458 goes wrong.
+# So: assert the copy happens, assert it lands in the per-worktree dir, and
+# assert the rebuild path is NOT taken.
+#
+# 5a drives it via LOOM_WORKTREE_CARGO_TARGET_DIR (what worktree.sh exports);
+# 5b drives it via the `.loom-cargo-target-dir` marker alone (the hook invoked
+# without worktree.sh in the loop).
+# ==========================================================================
+MAIN5="$WORKDIR/main5"
+WT5="$WORKDIR/wt5"
+SHARED5="$WORKDIR/shared-target-5"
+make_main_workspace "$MAIN5"
+add_worktree "$MAIN5" "$WT5" "t5"
+# The host redirects EVERY checkout to one shared root (the #8453 shape), and
+# the pre-built binary lives there, where a build in the main workspace put it.
+mkdir -p "$CARGO_HOME"
+printf '[build]\ntarget-dir = "%s"\n' "$SHARED5" > "$CARGO_HOME/config.toml"
+make_fake_bin "$SHARED5/release/loom-daemon" "main5-binary"
+PERWT5="$SHARED5/wt/wt5"
+
+OUT5="$( LOOM_WORKTREE_CARGO_TARGET_DIR="$PERWT5" CARGO_TARGET_DIR="$PERWT5" run_hook "$WT5" )"
+RC5=$?
+
+if [[ $RC5 -eq 0 ]]; then
+    pass "per-worktree (#8458): hook exits 0"
+else
+    fail "per-worktree (#8458): hook exited $RC5: $OUT5"
+fi
+
+if [[ "$OUT5" == *"copied from main workspace"* ]]; then
+    pass "per-worktree (#8458): FAST PATH taken -- copied, not rebuilt (#6013/#6014)"
+else
+    fail "per-worktree (#8458): fell through to a rebuild -- #6013/#6014 REGRESSION: $OUT5"
+fi
+
+if [[ -x "$PERWT5/release/loom-daemon" ]]; then
+    pass "per-worktree (#8458): binary copied INTO the per-worktree target dir"
+else
+    fail "per-worktree (#8458): no binary at $PERWT5/release/loom-daemon"
+fi
+
+if [[ "$("$PERWT5/release/loom-daemon" 2>/dev/null)" == "main5-binary" ]]; then
+    pass "per-worktree (#8458): the copied binary is the main workspace's"
+else
+    fail "per-worktree (#8458): copied binary content mismatch"
+fi
+
+if [[ ! -e "$WT5/target/release/loom-daemon" ]]; then
+    pass "per-worktree (#8458): the hardcoded <root>/target path was never touched"
+else
+    fail "per-worktree (#8458): unexpectedly wrote to the hardcoded default path"
+fi
+
+# 5b: the marker alone, with no LOOM_WORKTREE_CARGO_TARGET_DIR in the env.
+MAIN5B="$WORKDIR/main5b"
+WT5B="$WORKDIR/wt5b"
+make_main_workspace "$MAIN5B"
+add_worktree "$MAIN5B" "$WT5B" "t5b"
+make_fake_bin "$SHARED5/release/loom-daemon" "main5b-binary"
+PERWT5B="$SHARED5/wt/wt5b"
+printf '%s\n' "$PERWT5B" > "$WT5B/.loom-cargo-target-dir"
+
+OUT5B="$( CARGO_TARGET_DIR="$PERWT5B" run_hook "$WT5B" )"
+
+if [[ "$OUT5B" == *"copied from main workspace"* && -x "$PERWT5B/release/loom-daemon" ]]; then
+    pass "per-worktree (#8458): the marker alone drives the fast path too"
+else
+    fail "per-worktree (#8458): marker-only path did not take the fast path: $OUT5B"
+fi
+
+# 5c: a genuinely SESSION-GLOBAL CARGO_TARGET_DIR (no per-worktree shape) must
+# still be honored for the main workspace -- stripping it unconditionally would
+# be its own #6013 regression, for the operator who redirects all builds.
+MAIN5C="$WORKDIR/main5c"
+WT5C="$WORKDIR/wt5c"
+GLOBAL5C="$WORKDIR/session-global-5c"
+make_main_workspace "$MAIN5C"
+add_worktree "$MAIN5C" "$WT5C" "t5c"
+make_fake_bin "$GLOBAL5C/release/loom-daemon" "main5c-binary"
+
+OUT5C="$( CARGO_TARGET_DIR="$GLOBAL5C" run_hook "$WT5C" )"
+
+if [[ "$OUT5C" == *"already exists"* || "$OUT5C" == *"copied from main workspace"* ]]; then
+    pass "session-global CARGO_TARGET_DIR: still honored for the main workspace, no rebuild"
+else
+    fail "session-global CARGO_TARGET_DIR: fell through to a rebuild: $OUT5C"
+fi
+
+# 5d: lib/cargo-target-dir.sh ABSENT (partial checkout / pre-#8458 install) but
+# the ambient per-worktree CARGO_TARGET_DIR still present. The hook's degraded
+# twins must keep the fast path working -- skipping the strip here would
+# reintroduce #6013/#6014 for exactly the installs least able to notice.
+MAIN5D="$WORKDIR/main5d"
+WT5D="$WORKDIR/wt5d"
+make_main_workspace "$MAIN5D" 0 1   # standalone helper yes, lib no
+add_worktree "$MAIN5D" "$WT5D" "t5d"
+make_fake_bin "$SHARED5/release/loom-daemon" "main5d-binary"
+PERWT5D="$SHARED5/wt/wt5d"
+
+OUT5D="$( CARGO_TARGET_DIR="$PERWT5D" run_hook "$WT5D" )"
+
+if [[ "$OUT5D" == *"copied from main workspace"* && -x "$PERWT5D/release/loom-daemon" ]]; then
+    pass "per-worktree (#8458) without the lib: degraded twins keep the fast path"
+else
+    fail "per-worktree (#8458) without the lib: fell through to a rebuild: $OUT5D"
+fi
+
+rm -f "$CARGO_HOME/config.toml"
 
 # ==========================================================================
 # Summary

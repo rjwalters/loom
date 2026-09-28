@@ -119,11 +119,12 @@ mod locks;
 mod model;
 mod noop_cooldown;
 mod outcome_journal;
+mod overflow;
 mod pool_hold_broadcast;
 pub(crate) mod private_dispatch;
 mod prless_retry;
 mod quarantine;
-mod reaper;
+pub(crate) mod reaper;
 mod spawn_process;
 mod stacking;
 // Shared test registry fixture for adoption-correlation coverage.
@@ -511,6 +512,29 @@ pub struct SweepRegistry {
     /// operator fixes the forge state by hand, at which point the retried
     /// `gh issue edit` is a harmless idempotent no-op).
     pending_quarantine_release: HashSet<u32>,
+    /// Consecutive-failure tally for each entry in `pending_quarantine_release`
+    /// (Issue #8953): incremented on every failed `release_quarantine_label`
+    /// attempt, reset (entry removed) on success. Once an issue's count
+    /// reaches [`QuarantineConfig::max_release_attempts`],
+    /// [`attempt_quarantine_release`](Self::attempt_quarantine_release) stops
+    /// retrying it and logs a single `error` instead of retrying forever at
+    /// full reaper-tick cadence — the `#127` case this issue is named for. A
+    /// breaker-suppressed skip (see `test_force_rate_limited` below) does NOT
+    /// increment this counter.
+    quarantine_release_attempts: HashMap<u32, u32>,
+    /// Test-only override (Issue #8953) forcing
+    /// [`attempt_quarantine_release`](Self::attempt_quarantine_release) to
+    /// behave as though the process-global rate-limit breaker
+    /// ([`crate::rate_limit_breaker`]) is suppressing forge polling, without
+    /// touching that breaker's actual `GLOBAL` handle — a process-wide
+    /// `OnceLock` that, once registered from a test, would leak into every
+    /// other test in the same binary (see
+    /// `observability/collector/tests.rs`'s `dispatch_halt_from_breaker`
+    /// tests for the sibling `host_breaker` hazard this avoids). Always
+    /// `false` outside `#[cfg(test)]` construction paths; production code
+    /// never sets it.
+    #[cfg(test)]
+    test_force_rate_limited: bool,
     /// Whether cross-host dispatch-collision detection AND enforcement is
     /// enabled (Issue #4085, Phase 0 of #4028; upgraded from detection-only
     /// into enforcement by #5789). When `true`, [`dispatch`](Self::dispatch)
@@ -1090,6 +1114,9 @@ impl SweepRegistry {
             resume_attempt_counts: HashMap::new(),
             quarantined: HashMap::new(),
             pending_quarantine_release: HashSet::new(),
+            quarantine_release_attempts: HashMap::new(),
+            #[cfg(test)]
+            test_force_rate_limited: false,
             detect_collisions: false,
             collision_count: 0,
             peer_claim_publisher: None,
@@ -1991,9 +2018,7 @@ mod tests {
             runtime_source: None,
             log_path: PathBuf::from(".loom/logs/sweep-issue-42.log"),
             idempotency_key: Some("operator-key".to_string()),
-            started_at: chrono::DateTime::parse_from_rfc3339("2026-06-05T10:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            started_at: "2026-06-05T10:00:00Z".parse().unwrap(),
             state: SweepState::Running,
             latest_phase: Some("builder".to_string()),
             pr_number: Some(456),
@@ -2001,6 +2026,7 @@ mod tests {
             effort: Some("xhigh".to_string()),
             depends_on: None,
             repo: None,
+            overflow: false,
         };
         let json = serde_json::to_value(vec![info]).unwrap();
         let expected = serde_json::json!([{

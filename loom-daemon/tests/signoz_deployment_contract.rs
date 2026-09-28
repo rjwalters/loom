@@ -37,6 +37,9 @@ const CASTING: &str = include_str!("../../defaults/observability/signoz/casting.
 const LOCK: &str = include_str!("../../defaults/observability/signoz/casting.yaml.lock");
 const README: &str = include_str!("../../defaults/observability/signoz/README.md");
 const COLLECTOR_CONFIG: &str = include_str!("../../defaults/observability/collector/config.yaml");
+const CLICKHOUSE_CONFIG: &str = include_str!(
+    "../../defaults/observability/signoz/pours/deployment/telemetrystore/clickhouse/config-0-0.yaml"
+);
 
 /// Everything in this deployment is namespaced under one project prefix so a
 /// wipe cannot reach the trial host's separately-owned SigNoz installation.
@@ -675,5 +678,64 @@ fn every_service_caps_its_container_logs() {
     assert!(
         README.contains("three 10 MiB files per service"),
         "the README must keep documenting the rendered log rotation policy"
+    );
+}
+
+/// ClickHouse's own `system.*_log` tables are the trial's largest on-disk
+/// consumer (hundreds of MiB against a few MiB of Loom signals), and they are
+/// bounded only because each carries a 1-day TTL — which ClickHouse applies
+/// *during merges*. On a 2.5-day live soak under the rendered 2 GiB cap, the
+/// upstream default 1,552-column `metric_log` needed more memory for its
+/// TTL-applying merge than the server had (merge memory scales with input parts
+/// x columns, not rows), failed that merge tens of thousands of times, and kept
+/// parts well past their TTL. The casting therefore selects the transposed
+/// schema; a re-render that drops the override, or an upstream change that
+/// removes a system log's TTL, silently reintroduces unbounded growth.
+#[test]
+fn clickhouse_self_telemetry_stays_expirable_under_the_rendered_memory_cap() {
+    let top = block_children(CLICKHOUSE_CONFIG, 0);
+
+    let system_logs: Vec<(&String, &String)> = top
+        .iter()
+        .filter(|(key, _)| key.ends_with("_log"))
+        .collect();
+    assert!(
+        system_logs.len() >= 10,
+        "only found {} system log sections in the rendered ClickHouse config; the reader is out \
+         of step with Foundry's output format",
+        system_logs.len()
+    );
+    for (log, body) in &system_logs {
+        let ttl = block_children(body, 2)
+            .get("ttl")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            ttl.contains("DELETE"),
+            "system.{log} has no DELETE TTL in the rendered ClickHouse config, so it grows \
+             without bound on the trial host"
+        );
+    }
+
+    let metric_log = block_children(top.get("metric_log").expect("rendered metric_log"), 2);
+    assert_eq!(
+        metric_log.get("schema_type").map(String::as_str),
+        Some("transposed_with_wide_view"),
+        "system.metric_log must use the transposed schema: the wide default's TTL merge does not \
+         fit the rendered ClickHouse mem_limit (see evidence.md, 2026-09-28)"
+    );
+    assert!(
+        CASTING.contains("path: /metric_log/schema_type")
+            && LOCK.contains("/metric_log/schema_type"),
+        "the transposed schema must come from the casting's declarative patch (and be locked), \
+         not a hand-edit of the generated config"
+    );
+
+    // Switching an existing volume renames the old wide table to metric_log_0,
+    // stuck parts included; the README must say to drop it.
+    assert!(
+        README.contains("DROP TABLE system.metric_log_0"),
+        "the README must document dropping the pre-existing wide metric_log_0 after an \
+         in-place re-render"
     );
 }

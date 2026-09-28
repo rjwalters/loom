@@ -238,16 +238,26 @@ pub fn assess_scoped(
         }
 
         if let Some(mv) = scoped.and_then(|s| s.base_moves.get(ctx)) {
-            let reason = match inputs::spec_for(ctx) {
-                Some(spec) => inputs::stale_reason(spec, &mv.files, &scoped_delta(scoped)),
+            // A composite context (#9065) is stale iff any component is; the
+            // refusal names the component so the operator knows which gate.
+            let (check, reason) = match inputs::specs_for(ctx) {
+                Some(specs) => {
+                    match inputs::composite_stale_reason(&specs, &mv.files, &scoped_delta(scoped)) {
+                        Some((component, r)) if specs.len() > 1 => {
+                            (format!("{ctx} ({component})"), Some(r))
+                        }
+                        Some((_, r)) => ((*ctx).clone(), Some(r)),
+                        None => ((*ctx).clone(), None),
+                    }
+                }
                 // Fail closed: an unmapped required context's inputs are
                 // unknown, so any base move at all makes its verdict unknown.
-                None => inputs::unknown_check_reason(&mv.files),
+                None => ((*ctx).clone(), inputs::unknown_check_reason(&mv.files)),
             };
             if let Some(reason) = reason {
                 if stale.is_none() {
                     stale = Some(Verdict::StaleInputs {
-                        check: (*ctx).clone(),
+                        check,
                         tested_base: mv.tested_base.clone(),
                         reason,
                     });

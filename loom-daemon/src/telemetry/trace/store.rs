@@ -9,6 +9,14 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const TRACEPARENT_ENV: &str = "LOOM_TRACEPARENT";
+/// The standard W3C `traceparent` env var (#9215), mirrored from
+/// [`TRACEPARENT_ENV`] whenever a child is given a context. Loom's own
+/// propagation reads the namespaced variable; third-party harnesses that know
+/// nothing about Loom — Claude Code's `-p`/Agent-SDK sessions among them —
+/// parent their spans on this one, so exporting both makes a spawned worker's
+/// native spans land inside the execution's trace rather than as orphan roots.
+/// Same value, same lifetime, never set alone.
+pub const W3C_TRACEPARENT_ENV: &str = "TRACEPARENT";
 pub const CONTEXT_FILE_ENV: &str = "LOOM_TRACE_CONTEXT_FILE";
 const MAX_CONTEXT_BYTES: u64 = 4096;
 const MAX_ACTIVE_CONTEXTS: usize = 1024;
@@ -47,6 +55,38 @@ impl TraceStore {
         hash.update([0]);
         hash.update(execution.as_bytes());
         hex::encode(hash.finalize())
+    }
+
+    /// An execution's root context. Inside an issue story it is the story's
+    /// child keyed by the execution (sweep) id; outside one it is its own
+    /// trace keyed by repo + execution id. Either way `sweep-issue-42-…` in
+    /// `owner/repo` always maps to the same IDs, on any host.
+    #[must_use]
+    pub fn root_context(
+        workspace: &Path,
+        execution: &str,
+        story: Option<&TraceContext>,
+    ) -> TraceContext {
+        match story {
+            Some(story) => story.derived_child(&["loom.sweep", execution]),
+            None => {
+                TraceContext::derived("execution", &[&Self::fallback_repo(workspace), execution])
+            }
+        }
+    }
+
+    /// The repo key for an execution outside a story, lowercased:
+    /// `$LOOM_REPO`, else the checkout's GitHub `owner/repo` (so a PR-set
+    /// sweep groups with the same repo's issue sweeps), else the workspace
+    /// basename ([`crate::peer_claims::repo_slug`]).
+    #[must_use]
+    pub fn fallback_repo(workspace: &Path) -> String {
+        let explicit = std::env::var("LOOM_REPO").is_ok_and(|v| !v.trim().is_empty());
+        (!explicit)
+            .then(|| crate::release_resolve::host::repo_slug(workspace))
+            .flatten()
+            .unwrap_or_else(|| crate::peer_claims::repo_slug(workspace))
+            .to_ascii_lowercase()
     }
 
     #[must_use]
@@ -101,7 +141,7 @@ impl TraceStore {
         anyhow::ensure!(count < MAX_ACTIVE_CONTEXTS, "active trace context limit reached");
         let context = ExecutionContext {
             identity: Self::identity(workspace, execution),
-            context: story.map_or_else(|| TraceContext::root(true), TraceContext::child),
+            context: Self::root_context(workspace, execution, story),
             started_at: Utc::now(),
             story: story.cloned(),
         };

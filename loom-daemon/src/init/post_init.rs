@@ -154,6 +154,15 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // Worktree sentinel dropped by worktree.sh into each issue worktree; must be
     // ignored so a builder's `git add -A` doesn't sweep it into a commit (#3778).
     ".loom-managed",
+    // Per-worktree cargo target dir marker (#8458): written into each issue
+    // worktree by `loom-daemon cargo-target-dir provision`, recording the
+    // `<root>/wt/<worktree name>` directory that worktree builds into so every
+    // removal path can attribute and reclaim it. Same family as `.loom-managed`
+    // — Loom-owned runtime state, must never be swept into a commit by `git add
+    // -A`, and must stay untracked so it is born absent in a fresh worktree
+    // (a tracked copy on main would claim a target dir for every worktree at
+    // once, which the shape check would then reject in all but one of them).
+    ".loom-cargo-target-dir",
     // Builder "no changes needed" marker (builder.md § "Signaling No Changes
     // Needed"). Must stay untracked/gitignored so it is born absent in every
     // fresh worktree and a deliberate write doesn't get swept into a commit by
@@ -240,16 +249,39 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/metrics/",
     ".loom/usage-cache.json",
     ".loom/claude-config/",
+    // Sibling copies (renamed/backup) of the harness auth-store dir, e.g.
+    // `claude-config.disabled-<ts>/` or `claude-config-old/` (#9134, extending
+    // the #9046 token-pool-sibling fix to the whole credential-bearing
+    // directory class — see `.loom/tokens.*/` below for the incident that
+    // motivated the pattern).
+    ".loom/claude-config.*/",
+    ".loom/claude-config-*/",
     ".loom/native-tools/",
     // Secret-bearing token pool + repo-local account source (#3695). These
     // hold OAuth keys and must never be committed.
     ".loom/tokens/",
+    // Sibling copies of the token pool (e.g. `tokens.shadow-disabled-<ts>/`,
+    // hand backups). Only the exact `.loom/tokens/` was ignored, so a resync
+    // `git add` swept 21 live OAuth tokens into public `main` (a9da48c2).
+    ".loom/tokens.*/",
+    ".loom/tokens-*/",
     ".loom/accounts.env",
+    // Sibling backup/rename copies of the account source file, e.g.
+    // `accounts.env.bak-<ts>` or `accounts.env-old` (#9134). `.loom/*.bak`
+    // below happens to already catch the `.bak` spelling by accident of a
+    // different, unrelated rule — these two entries make the coverage
+    // deliberate and extend it to any suffix, not just `.bak`.
+    ".loom/accounts.env.*",
+    ".loom/accounts.env-*",
     // Per-host API-key account pool (#8401): `<provider>/<account>.env` files
     // holding provider subscription keys (e.g. Z.ai GLM coding plans). Same
     // never-commit contract as `.loom/tokens/` above, and per-host for the
     // same reason — a lapsed key on one machine must not poison another.
     ".loom/api-keys/",
+    // Sibling copies of the API-key pool (#9134, same shape as
+    // `.loom/tokens.*/` / `.loom/tokens-*/` above).
+    ".loom/api-keys.*/",
+    ".loom/api-keys-*/",
     // Codex/token-pool per-repo health cache + its sibling `mkdir` lock, written
     // atomically by the daemon token pool (#5014). Machine-local runtime state
     // that surfaced as untracked dirt in 0.17.0. Not secret-bearing (account
@@ -293,6 +325,10 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // installation token, rewritten atomically by the credential refresh
     // tick. Never committed (mirrors `.loom/tokens/` above).
     ".loom/gh-config/",
+    // Sibling copies of the GH_CONFIG_DIR tree (#9134, same shape as
+    // `.loom/tokens.*/` / `.loom/tokens-*/` above).
+    ".loom/gh-config.*/",
+    ".loom/gh-config-*/",
     // Per-owner GH_CONFIG_DIR subtree for cross-owner GitHub App installation
     // tokens (#5401) — same host-local, never-committed contract as
     // `.loom/gh-config/` above, one subdirectory per non-root managed-repo
@@ -300,6 +336,14 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // commit's `git add .loom` swept a live installation token into a
     // public repo.
     ".loom/gh-config-by-owner/",
+    // Sibling copies of the per-owner GH_CONFIG_DIR tree (#9134). Note
+    // `.loom/gh-config-*/` above already incidentally catches these (its `*`
+    // spans the whole remaining path component, including `-by-owner...`),
+    // but these are kept explicit so the class is self-documenting per
+    // directory and the coverage does not silently depend on a sibling
+    // entry's overlap.
+    ".loom/gh-config-by-owner.*/",
+    ".loom/gh-config-by-owner-*/",
     // Host-local config overlay tier (#4039, Epic #3835 Phase 2) — the
     // highest-precedence tier `config_resolver.rs` merges over the committed
     // config. Untracked and per-host on purpose: this is where a genuinely
@@ -339,9 +383,21 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
 /// gitignored, and neither is on any stager's allowlist, but a tracked copy of
 /// either is not a "rotate the credential" emergency.
 ///
-/// Matching contract (shared with the shell): a pattern ending in `/` is a
-/// directory and matches the directory itself and everything under it; any
-/// other pattern is an exact file path. No globs.
+/// Matching contract (shared with the shell, #9134): every entry is a
+/// *prefix* of the path it protects, once any trailing `/` is stripped. A
+/// directory pattern `<dir>/` therefore matches `<dir>` itself, everything
+/// under it, AND any sibling path that extends `<dir>`'s final path
+/// component (e.g. a rename/backup like `<dir>.bak-<ts>/` or `<dir>-old/`) —
+/// a natural operator move the repo's own `.gitignore` documents the
+/// `name.bak-$(date +%Y%m%dT%H%M%SZ)` convention for. A file pattern behaves
+/// the same way: `.loom/accounts.env` also covers `.loom/accounts.env.bak`.
+/// This is deliberately over-inclusive (it can also match an unrelated file
+/// that happens to share the prefix) rather than under-inclusive, since a
+/// false positive here costs at most "this script leaves one extra path
+/// untracked", while a false negative is a credential leak (#9046, #7818).
+/// Still no globs in the literal list itself — the widening lives entirely
+/// in how a pattern is matched, which is what keeps the Rust matcher and the
+/// shell's `[[ "$path" == "${p%/}"* ]]` byte-comparable.
 pub const CREDENTIAL_PATTERNS: &[&str] = &[
     ".loom/claude-config/",
     ".loom/tokens/",
@@ -352,14 +408,16 @@ pub const CREDENTIAL_PATTERNS: &[&str] = &[
 ];
 
 /// Whether a repo-relative path falls in the [`CREDENTIAL_PATTERNS`] class.
+///
+/// See the matching contract documented on [`CREDENTIAL_PATTERNS`] itself: a
+/// plain prefix match against each pattern with any trailing `/` stripped,
+/// covering the pattern itself, its contents, and any sibling path that
+/// extends its final component.
 #[must_use]
 pub fn is_credential_path(path: &str) -> bool {
     CREDENTIAL_PATTERNS
         .iter()
-        .any(|p| match p.strip_suffix('/') {
-            Some(dir) => path == dir || path.starts_with(p),
-            None => path == *p,
-        })
+        .any(|p| path.starts_with(p.strip_suffix('/').unwrap_or(p)))
 }
 
 /// Build the Loom-managed `.gitignore` block (marker lines + header + patterns),
@@ -819,6 +877,16 @@ mod tests {
         assert!(contents.contains(".loom/account-health.lock"));
         assert!(!contents.contains(".loom/accounts.json"));
 
+        // #9046: sibling copies of the token pool must be ignored too. Only the
+        // exact `.loom/tokens/` was ignored, so a resync `git add` swept 21 live
+        // OAuth tokens out of a `tokens.shadow-disabled-<ts>/` sibling into
+        // public `main` (a9da48c2). Matching behaviour against concrete sample
+        // paths is asserted by
+        // `token_pool_sibling_patterns_ignore_concrete_sample_paths` below —
+        // these two assertions only prove the literals are emitted.
+        assert!(contents.contains(".loom/tokens.*/"));
+        assert!(contents.contains(".loom/tokens-*/"));
+
         // #7818: the daemon-owned GH_CONFIG_DIR trees (host-local GitHub App
         // installation tokens) must be ignored so a resync's `git add .loom`
         // can never sweep a live credential into the tree.
@@ -841,6 +909,76 @@ mod tests {
         // config.json must NOT be gitignored
         assert!(!contents.contains(".loom/config.json"));
         assert!(!contents.contains(".loom/*.json"));
+    }
+
+    /// #9046: the two sibling-token-pool globs must actually *match* the paths
+    /// that leaked, not merely appear in the emitted `.gitignore`. A glob-syntax
+    /// mistake (`.loom/tokens.*` missing its trailing slash, `.loom/tokens*/`
+    /// collapsing the live pool's own rule, a stray escape) leaves the literal
+    /// `contents.contains(...)` assertions above green while ignoring nothing —
+    /// which is exactly how a9da48c2 swept 21 live OAuth tokens out of a
+    /// `tokens.shadow-disabled-<ts>/` sibling into public `main`. The question is
+    /// put to real `git check-ignore`, the tool that decides it in production,
+    /// rather than to a hand-rolled matcher that could repeat the same mistake.
+    #[test]
+    fn token_pool_sibling_patterns_ignore_concrete_sample_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let git = |args: &[&str]| -> std::process::Output {
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                // Isolate from the developer's global/system git config so a
+                // personal `core.excludesFile` can never answer on behalf of
+                // the patterns under test (in either direction).
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("run git")
+        };
+
+        assert!(git(&["init", "-q"]).status.success(), "git init failed");
+        update_gitignore(root).unwrap();
+
+        // `--no-index` consults the ignore rules directly, so no sample path has
+        // to exist on disk — the same probe PR #9046 used to verify these by
+        // hand. `-v` reports which pattern matched, so a match by some *other*,
+        // overbroad rule is a failure rather than a false pass.
+        let check_ignore = |path: &str| -> Option<String> {
+            let out = git(&["check-ignore", "-v", "--no-index", path]);
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                None
+            }
+        };
+
+        for (path, expected_pattern) in [
+            (".loom/tokens.shadow-disabled-20260101T000000Z/x.token", ".loom/tokens.*/"),
+            (".loom/tokens-backup/x.token", ".loom/tokens-*/"),
+            // The original exact-path rule must keep covering the live pool —
+            // adding the globs must not have replaced it.
+            (".loom/tokens/x.token", ".loom/tokens/"),
+        ] {
+            let matched = check_ignore(path)
+                .unwrap_or_else(|| panic!("{path} is NOT ignored by the generated .gitignore"));
+            assert!(
+                matched.ends_with(&format!("{expected_pattern}\t{path}")),
+                "{path} should be ignored by `{expected_pattern}`, got: {matched}"
+            );
+        }
+
+        // Over-match guard: these globs are directory-scoped (trailing `/`) and
+        // must not swallow a sibling *file* under `.loom/`.
+        // `.loom/accounts.json` is the deliberately committable per-repo profile
+        // allowlist (#5014) — if a future widening starts ignoring it, this
+        // fails here instead of silently un-tracking a shared config.
+        assert!(
+            check_ignore(".loom/accounts.json").is_none(),
+            ".loom/accounts.json must stay trackable (#5014)"
+        );
     }
 
     #[test]

@@ -41,8 +41,10 @@
 //!    ([`DEFAULT_MIN_SPACING_SECS`]) then bounds how soon that permit may be
 //!    spent after the previous tick of *either* kind, so the early-tick path
 //!    can never raise a loop's forge-request rate above
-//!    `interval / min_spacing` times its configured cadence — at the defaults,
-//!    2x, and never a new endpoint or a new rate-limit envelope.
+//!    `interval / min_spacing` times its configured cadence — 2x for the work
+//!    finder, up to 60x for the slowest claim-reconciliation cadence (the
+//!    per-loop table is on [`DEFAULT_MIN_SPACING_SECS`]), and never a new
+//!    endpoint or a new rate-limit envelope.
 //!
 //! # Consumers
 //!
@@ -53,7 +55,7 @@
 //! | [`Consumer`] | Loop it ticks early | Why that loop |
 //! |---|---|---|
 //! | [`WORK_FINDER`] | [`crate::work_finder`]'s dispatch tick | It is the loop that lists claimable issues, re-derives the ready queue, and dispatches its head. |
-//! | [`QUEUE_HEAD`] | [`crate::claim_reconciliation`]'s periodic pass | A `loom:building` claim whose sweep is gone is what *holds* the queue head; this pass is the loop that releases it. |
+//! | [`CLAIM_RECONCILE`] | [`crate::claim_reconciliation`]'s periodic pass | A `loom:building` claim whose sweep is gone is what *holds* the queue head; this pass is the loop that releases it. |
 //! | [`IN_FLIGHT_PR`] | [`crate::watch_registry`]'s watch monitor | It is the loop that polls a watched issue/PR for terminal state (merged / closed) and reports it. |
 //!
 //! Issue #8766 named a "dispatch queue head re-check" and an "in-flight PR
@@ -64,11 +66,28 @@
 //! tick rather than by a separate loop, so the thing that actually gates the
 //! head moving is claim reconciliation; and the daemon's only standing
 //! "is this PR done yet" poller is the watch monitor.
+//!
+//! **Why [`CLAIM_RECONCILE`] is not called `queueHeadWake` (#8995 item 1).**
+//! It shipped as `queueHeadWake` in #8994 and was renamed here, while still
+//! brand new and default-off, because the old name promised an effect the flag
+//! cannot produce: it ticks the claim-reconciliation pass, and releasing a
+//! claim does not by itself move the dispatch queue's head — the work finder
+//! still has to tick before the freed issue is dispatched. The alternative
+//! considered and **declined** was to keep the name and add `"pull_request"`
+//! to [`WORK_FINDER_EVENT_TYPES`] so a merge would wake the head-mover
+//! directly (#8989's conditional widening). That would not have made
+//! `queueHeadWake` truthful — it widens a *different* consumer, behind a
+//! *different* flag — and it would raise the work finder's wake volume by
+//! every PR event in the fleet, which ADR-0021 says to measure before
+//! choosing, not assume. Naming the flag after the loop it ticks costs
+//! nothing and leaves that widening a separately measurable decision.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use std::sync::Mutex;
 
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -88,8 +107,8 @@ mod tests;
 /// `forgeEvents.events.workFinderTick` env override.
 pub const WORK_FINDER_TICK_ENV: &str = "LOOM_FORGE_EVENTS_WORK_FINDER_TICK";
 
-/// `forgeEvents.events.queueHeadWake` env override.
-pub const QUEUE_HEAD_WAKE_ENV: &str = "LOOM_FORGE_EVENTS_QUEUE_HEAD_WAKE";
+/// `forgeEvents.events.claimReconcileWake` env override.
+pub const CLAIM_RECONCILE_WAKE_ENV: &str = "LOOM_FORGE_EVENTS_CLAIM_RECONCILE_WAKE";
 
 /// `forgeEvents.events.inFlightPrWatch` env override.
 pub const IN_FLIGHT_PR_WATCH_ENV: &str = "LOOM_FORGE_EVENTS_IN_FLIGHT_PR_WATCH";
@@ -103,10 +122,39 @@ pub const MIN_SPACING_SECS_ENV: &str = "LOOM_FORGE_EVENTS_WAKE_MIN_SPACING_SECS"
 /// This is the rate bound, not a debounce nicety. Without it a chatty feed
 /// could drive a loop at the feed's own 10-second poll cadence instead of the
 /// loop's 60-second one — a 6x increase in that loop's forge-request volume,
-/// which is exactly the "new rate-limit envelope" ADR-0021 forbids. At 30s
-/// against the work finder's 60s default, an early tick can at most double a
-/// loop's tick rate, and only while events are genuinely arriving.
+/// which is exactly the "new rate-limit envelope" ADR-0021 forbids.
+///
+/// The bound is `interval / min_spacing`, so it is **per loop**, and the floor
+/// being one shared constant means the slowest loop gets the largest
+/// multiplier. Measured against this 30s default (#8995 item 2):
+///
+/// | Loop | Default cadence | Max early-tick multiplier |
+/// |---|---|---|
+/// | work finder ([`crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS`]) | 60s | 2x |
+/// | watch monitor ([`crate::watch_registry::DEFAULT_WATCH_MONITOR_INTERVAL_SECS`]) | 120s | 4x |
+/// | claim reconciliation ([`crate::claim_reconciliation::DEFAULT_RECONCILE_INTERVAL_SECS`]) | 600s | 20x |
+/// | claim reconciliation, safehouse host ([`crate::claim_reconciliation::DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS`]) | 1800s | 60x |
+///
+/// A multiplier is a *ceiling that needs a saturated feed to reach*, not an
+/// expectation: it costs one extra pass per 30s only while qualifying pages
+/// keep arriving, over the same endpoints and the same #4429 breaker. But 20x
+/// and 60x are the numbers to hold against a measured pass cost before
+/// defaulting the claim-reconciliation consumer on — that pass is the heaviest
+/// `gh` consumer of the three (a workspace reconcile plus PR-claim and
+/// PR-verdict reconciles, per registered workspace root).
 pub const DEFAULT_MIN_SPACING_SECS: u64 = 30;
+
+/// The early-tick ceiling for one loop: `cadence / min_spacing`, floored at
+/// `1`.
+///
+/// Reporting arithmetic only — it is logged when a consumer arms and rendered
+/// on `loom-daemon status`, and no loop's decision, threshold or cadence reads
+/// it. A cadence at or under the spacing floor can gain no early tick at all,
+/// hence the floor of `1` rather than `0`.
+#[must_use]
+pub fn max_early_tick_multiplier(cadence: Duration, min_spacing: Duration) -> u64 {
+    (cadence.as_secs() / min_spacing.as_secs().max(1)).max(1)
+}
 
 /// The event-type names that make a page *claimable-shaped* for the work
 /// finder: an issue opened/labeled/closed, or a comment on one.
@@ -118,15 +166,15 @@ pub const DEFAULT_MIN_SPACING_SECS: u64 = 30;
 /// carries type names at all.
 pub const WORK_FINDER_EVENT_TYPES: &[&str] = &["issues", "issue_comment"];
 
-/// The event-type names that may have *released the head* of the dispatch
-/// queue: a comment on a claimed issue (an abandon note, a lease that stopped
-/// being renewed) or a pull request reaching a terminal state.
+/// The event-type names that may have left a `loom:building` claim dead: a
+/// comment on a claimed issue (an abandon note, a lease that stopped being
+/// renewed) or a pull request reaching a terminal state.
 ///
 /// Claim reconciliation is the loop that decides whether a `loom:building`
 /// claim is still backed by a live sweep. Both shapes above are the forge-side
 /// residue of a sweep ending — the moment it becomes worth asking that
 /// question again sooner than the pass's own multi-minute cadence.
-pub const QUEUE_HEAD_EVENT_TYPES: &[&str] = &["issue_comment", "pull_request"];
+pub const CLAIM_RECONCILE_EVENT_TYPES: &[&str] = &["issue_comment", "pull_request"];
 
 /// The event-type names that may have moved a watched PR toward terminal
 /// state: the PR itself changing (merged / closed / reopened) or its checks
@@ -153,8 +201,8 @@ pub const IN_FLIGHT_PR_EVENT_TYPES: &[&str] = &["pull_request", "check_run", "ch
 pub struct ConsumerConfig {
     /// `forgeEvents.events.workFinderTick`.
     pub work_finder_tick: Option<bool>,
-    /// `forgeEvents.events.queueHeadWake`.
-    pub queue_head_wake: Option<bool>,
+    /// `forgeEvents.events.claimReconcileWake`.
+    pub claim_reconcile_wake: Option<bool>,
     /// `forgeEvents.events.inFlightPrWatch`.
     pub in_flight_pr_watch: Option<bool>,
     /// `forgeEvents.events.minSpacingSecs` (a zero/invalid value is dropped to
@@ -204,12 +252,16 @@ pub const WORK_FINDER: Consumer = Consumer {
 
 /// Consumer (b): early tick of the periodic claim-reconciliation pass — the
 /// loop that releases a dead `loom:building` claim blocking the queue head.
-pub const QUEUE_HEAD: Consumer = Consumer {
-    name: "queue-head wake",
-    config_key: "queueHeadWake",
-    env: QUEUE_HEAD_WAKE_ENV,
-    types: QUEUE_HEAD_EVENT_TYPES,
-    flag: |c| c.queue_head_wake,
+///
+/// Named for the loop it ticks, not for the downstream effect that release
+/// eventually has; see the module doc's "Why [`CLAIM_RECONCILE`] is not called
+/// `queueHeadWake`" (#8995).
+pub const CLAIM_RECONCILE: Consumer = Consumer {
+    name: "claim-reconcile wake",
+    config_key: "claimReconcileWake",
+    env: CLAIM_RECONCILE_WAKE_ENV,
+    types: CLAIM_RECONCILE_EVENT_TYPES,
+    flag: |c| c.claim_reconcile_wake,
 };
 
 /// Consumer (c): early tick of the durable watch monitor — the loop that polls
@@ -223,7 +275,7 @@ pub const IN_FLIGHT_PR: Consumer = Consumer {
 };
 
 /// Every shipped consumer, in Phase 2's own (a)/(b)/(c) order.
-pub const ALL_CONSUMERS: &[Consumer] = &[WORK_FINDER, QUEUE_HEAD, IN_FLIGHT_PR];
+pub const ALL_CONSUMERS: &[Consumer] = &[WORK_FINDER, CLAIM_RECONCILE, IN_FLIGHT_PR];
 
 /// Read the `forgeEvents.events` block from `root`'s resolved config.
 ///
@@ -240,8 +292,8 @@ pub fn read_config(root: &Path) -> ConsumerConfig {
         work_finder_tick: block
             .get(WORK_FINDER.config_key)
             .and_then(serde_json::Value::as_bool),
-        queue_head_wake: block
-            .get(QUEUE_HEAD.config_key)
+        claim_reconcile_wake: block
+            .get(CLAIM_RECONCILE.config_key)
             .and_then(serde_json::Value::as_bool),
         in_flight_pr_watch: block
             .get(IN_FLIGHT_PR.config_key)
@@ -333,7 +385,8 @@ pub fn event_qualifies(event: &Event, wanted: &[&str]) -> bool {
 // Counters
 // ============================================================================
 
-/// What the wake seam did, for tests and for a future status surface.
+/// What the wake seam did, as reported on `loom-daemon status` (#8995 item 3)
+/// and asserted by tests.
 ///
 /// Counters only — nothing here is read back into a decision.
 #[derive(Debug, Default)]
@@ -365,6 +418,87 @@ impl WakeCounters {
     pub fn throttled(&self) -> u64 {
         self.throttled.load(Ordering::Relaxed)
     }
+}
+
+// ============================================================================
+// Operator-visible surface (#8995 item 3)
+// ============================================================================
+
+/// One armed consumer's live counters, held process-globally so the IPC status
+/// handler can read them without an `Arc` threaded through three loop spawns.
+///
+/// Mirrors [`super::register_global_status`]'s pattern for the same reason.
+struct ArmedWake {
+    consumer: &'static Consumer,
+    cadence_secs: u64,
+    min_spacing_secs: u64,
+    counters: Arc<WakeCounters>,
+}
+
+/// Every **armed** consumer in this process. A disarmed consumer registers
+/// nothing at all — so an empty registry is the positive statement "no
+/// `forgeEvents.events.*` flag resolved on here", which is what the status
+/// line reports, and the default-off guarantee stays structural.
+static ARMED_WAKES: std::sync::OnceLock<Mutex<Vec<ArmedWake>>> = std::sync::OnceLock::new();
+
+// Allow expect_used: a poisoned registry mutex means another thread panicked
+// while holding it — unrecoverable, and the same crash-on-poison policy
+// `FeedStatus` and `observability::ExportStatus` already use.
+#[allow(clippy::expect_used)]
+fn armed_registry() -> std::sync::MutexGuard<'static, Vec<ArmedWake>> {
+    ARMED_WAKES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("forge_events wake registry mutex poisoned")
+}
+
+/// Record `consumer` as armed, replacing any previous entry for the same flag.
+///
+/// Replace rather than push, so the registry is bounded by
+/// [`ALL_CONSUMERS`]`.len()` even if a loop were ever restarted — and so a
+/// second ticker for the same consumer reports *its* counters rather than the
+/// dead one's.
+fn register_armed(
+    consumer: &'static Consumer,
+    cadence: Duration,
+    min_spacing: Duration,
+    counters: Arc<WakeCounters>,
+) {
+    let entry = ArmedWake {
+        consumer,
+        cadence_secs: cadence.as_secs(),
+        min_spacing_secs: min_spacing.as_secs(),
+        counters,
+    };
+    let mut registry = armed_registry();
+    match registry
+        .iter()
+        .position(|a| a.consumer.config_key == consumer.config_key)
+    {
+        Some(at) => registry[at] = entry,
+        None => registry.push(entry),
+    }
+}
+
+/// The armed consumers' counters, for `loom-daemon status`.
+///
+/// Empty ⇒ nothing is armed in this process, which the renderer reports as
+/// such rather than as silence. Ordered by [`ALL_CONSUMERS`] registration
+/// order (the order the loops spawn), not by activity.
+#[must_use]
+pub fn armed_snapshot() -> Vec<crate::types::ForgeEventsWakeStatus> {
+    armed_registry()
+        .iter()
+        .map(|a| crate::types::ForgeEventsWakeStatus {
+            consumer: a.consumer.name.to_string(),
+            config_key: a.consumer.config_key.to_string(),
+            cadence_secs: a.cadence_secs,
+            min_spacing_secs: a.min_spacing_secs,
+            prompts: a.counters.prompts(),
+            early_ticks: a.counters.early_ticks(),
+            throttled: a.counters.throttled(),
+        })
+        .collect()
 }
 
 /// Subscribe to [`BUS_TOPIC`] and convert each qualifying prompt into a single
@@ -420,6 +554,9 @@ pub struct EarlyTicker {
     last_tick: Option<Instant>,
     counters: Arc<WakeCounters>,
     bridge: Option<tokio::task::JoinHandle<()>>,
+    /// The [`Consumer::name`] this ticker was built for, used only in the
+    /// per-tick log lines. `"unnamed"` for a ticker built directly by a test.
+    label: &'static str,
 }
 
 impl Drop for EarlyTicker {
@@ -441,6 +578,7 @@ impl EarlyTicker {
             last_tick: None,
             counters: Arc::new(WakeCounters::default()),
             bridge: None,
+            label: "unnamed",
         }
     }
 
@@ -471,13 +609,21 @@ impl EarlyTicker {
         }
         let min_spacing = resolve_min_spacing(&config);
         log::info!(
-            "forge_events::wake: {} early tick armed (types={:?}, min_spacing={}s, cadence={}s)",
+            "forge_events::wake: {} early tick armed (types={:?}, min_spacing={}s, cadence={}s, \
+             max {}x this loop's tick rate)",
             consumer.name,
             consumer.types,
             min_spacing.as_secs(),
-            interval.as_secs()
+            interval.as_secs(),
+            max_early_tick_multiplier(interval, min_spacing)
         );
-        Self::armed(interval, bus, consumer.types, min_spacing)
+        let mut ticker = Self::armed(interval, bus, consumer.types, min_spacing);
+        ticker.label = consumer.name;
+        // Publish this ticker's counters so `loom-daemon status` can answer
+        // "is the consumer I armed doing anything?" (#8995 item 3). Armed
+        // tickers only: see [`ARMED_WAKES`].
+        register_armed(consumer, interval, min_spacing, ticker.counters.clone());
+        ticker
     }
 
     /// [`Self::for_consumer`] for [`WORK_FINDER`].
@@ -486,10 +632,10 @@ impl EarlyTicker {
         Self::for_consumer(&WORK_FINDER, interval, bus, root)
     }
 
-    /// [`Self::for_consumer`] for [`QUEUE_HEAD`].
+    /// [`Self::for_consumer`] for [`CLAIM_RECONCILE`].
     #[must_use]
-    pub fn for_queue_head(interval: Duration, bus: &EventBus, root: &Path) -> Self {
-        Self::for_consumer(&QUEUE_HEAD, interval, bus, root)
+    pub fn for_claim_reconcile(interval: Duration, bus: &EventBus, root: &Path) -> Self {
+        Self::for_consumer(&CLAIM_RECONCILE, interval, bus, root)
     }
 
     /// [`Self::for_consumer`] for [`IN_FLIGHT_PR`].
@@ -519,6 +665,7 @@ impl EarlyTicker {
             last_tick: None,
             counters,
             bridge: Some(bridge),
+            label: "unnamed",
         }
     }
 
@@ -552,6 +699,29 @@ impl EarlyTicker {
     /// and dropped, and the wait continues — deliberately dropped rather than
     /// deferred, because a prompt is "check now", and a check that already
     /// happened moments ago has answered it.
+    ///
+    /// # Cancel safety
+    ///
+    /// **This method is _not_ cancel-safe, unlike the
+    /// [`tokio::time::Interval::tick`] it stands in for** (#8995 item 5). Every
+    /// current call site is a bare `.await` in a loop that does nothing else
+    /// concurrently, so nothing is wrong today — but a future caller must not
+    /// assume the `Interval` contract:
+    ///
+    /// - Armed, this future may consume a [`Notify`] permit (inside
+    ///   `notified()`) and then be dropped before it returns. The permit is
+    ///   gone and the wake is silently lost — the loop still ticks at its
+    ///   cadence (degradation stays latency-only, invariant 3), but that early
+    ///   tick never happens and no counter records it as throttled.
+    /// - Dropping it mid-poll also loses the *timer* branch's progress in the
+    ///   ordinary `Interval` way.
+    ///
+    /// So do not put a bare `ticker.tick()` in a `select!` arm alongside a
+    /// branch that can win. If a loop needs to wait on a shutdown signal too,
+    /// keep `tick()` in its own task, or pin the future once
+    /// (`let fut = ticker.tick(); tokio::pin!(fut);`) and poll *that* across
+    /// iterations so a cancelled `select!` resumes it rather than rebuilding
+    /// it.
     pub async fn tick(&mut self) {
         let Some(wake) = self.wake.clone() else {
             self.ticker.tick().await;
@@ -570,11 +740,33 @@ impl EarlyTicker {
                         .last_tick
                         .is_some_and(|last| now.duration_since(last) < self.min_spacing)
                     {
-                        self.counters.throttled.fetch_add(1, Ordering::Relaxed);
+                        let throttled =
+                            self.counters.throttled.fetch_add(1, Ordering::Relaxed) + 1;
+                        // Debug, not info: under a burst this is the expected
+                        // path and fires per prompt, where an early tick is
+                        // bounded by the spacing floor.
+                        log::debug!(
+                            "forge_events::wake: {} prompt dropped by the {}s spacing floor \
+                             (throttled={throttled} this process)",
+                            self.label,
+                            self.min_spacing.as_secs()
+                        );
                         continue;
                     }
                     self.last_tick = Some(now);
-                    self.counters.early_ticks.fetch_add(1, Ordering::Relaxed);
+                    let early = self.counters.early_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+                    // The per-tick half of #8995 item 3: `status` answers "is
+                    // it doing anything" at a glance, this answers "when, and
+                    // how often" from the log an operator already has. Bounded
+                    // by the spacing floor, so at most one line per
+                    // `min_spacing` per consumer.
+                    log::info!(
+                        "forge_events::wake: {} ticked early on a forge.event prompt \
+                         (early_ticks={early}, prompts={}, throttled={} this process)",
+                        self.label,
+                        self.counters.prompts(),
+                        self.counters.throttled(),
+                    );
                     // Re-anchor the cadence to this tick, so an early tick
                     // replaces the pending timer tick rather than being
                     // followed immediately by it.

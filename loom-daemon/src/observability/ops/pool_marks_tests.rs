@@ -131,27 +131,72 @@ fn an_api_key_credential_failure_writes_no_mark_and_emits_nothing() {
 
 #[test]
 fn a_codex_outcome_with_no_hold_emits_nothing() {
-    let ((), captured) = capture(|| record_codex(TerminalClassification::Success));
+    let ((), captured) = capture(|| record_codex(TerminalClassification::Success, false));
     assert!(captured.metrics.is_empty());
-    let ((), captured) = capture(|| record_codex(TerminalClassification::TokenExhausted));
+    let ((), captured) = capture(|| record_codex(TerminalClassification::TokenExhausted, false));
     assert_eq!(captured.metrics[0].labels["reason"], "exhausted");
     assert_eq!(captured.metrics[0].labels["provider"], "codex");
+}
+
+/// #9013 item 4: once an account is already `ReauthRequired`, `health.rs`
+/// writes no new hold for any later classification — so a mark for one
+/// (e.g. `Recoverable`, which would otherwise report `transient`) is an
+/// over-count and must be suppressed.
+#[test]
+fn a_classification_recorded_while_already_reauth_required_emits_no_mark() {
+    let ((), captured) = capture(|| record_codex(TerminalClassification::Recoverable, true));
+    assert!(captured.metrics.is_empty(), "no new hold was written — no mark");
+
+    // The same classification with no prior ReauthRequired hold still marks
+    // normally: suppression is scoped to the sticky-hold case, not global.
+    let ((), captured) = capture(|| record_codex(TerminalClassification::Recoverable, false));
+    assert_eq!(captured.metrics[0].labels["reason"], "transient");
+
+    // `TokenExpired` freshly setting ReauthRequired (prior reason was NOT
+    // already ReauthRequired) is the one legitimate new hold and still marks.
+    let ((), captured) = capture(|| record_codex(TerminalClassification::TokenExpired, false));
+    assert_eq!(captured.metrics[0].labels["reason"], "credential");
+    // But a repeat TokenExpired while already ReauthRequired is another
+    // over-count case and is suppressed the same way.
+    let ((), captured) = capture(|| record_codex(TerminalClassification::TokenExpired, true));
+    assert!(captured.metrics.is_empty());
 }
 
 #[test]
 fn a_hold_span_covers_arm_to_clear_with_allowlisted_attributes() {
     let since = Utc::now() - Duration::seconds(600);
     let cleared = since + Duration::seconds(540);
-    let span = hold_span(since, cleared, true, 4);
+    let span = hold_span("0123456789abcdef", since, cleared, true, 4);
     assert_eq!(span.name.as_str(), "loom.pool.hold");
     assert_eq!((span.started_at, span.ended_at), (since, cleared));
     assert!(span.parent_span_id.is_none() && span.context.sampled());
     assert!(span.validate().is_ok());
     assert_eq!(span.attributes["loom.pool.hold.post_mortem"], "true");
     assert_eq!(span.attributes["loom.pool.hold.accounts"], "4");
-    assert!(span
-        .attributes
-        .keys()
-        .all(|k| OPS_SPAN_ATTRIBUTE_KEYS.contains(&k.as_str())));
+    assert_eq!(span.attributes["loom.pool.hold.pool"], "0123456789abcdef");
+    assert!(span.attributes.keys().all(|k| {
+        OPS_SPAN_ATTRIBUTE_KEYS.contains(&k.as_str())
+            || crate::telemetry::trace::provenance::KEYS.contains(&k.as_str())
+    }));
+    assert_eq!(span.attributes["loom.daemon.version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(span.clone().bounded().attributes, span.attributes, "survives export policy");
+}
+
+/// Holds are per pool directory but share the work-finder tick's `since`:
+/// two pools exhausted in one tick must still get distinct trace and span
+/// IDs, while re-reporting one hold reproduces its IDs.
+#[test]
+fn two_pools_holding_from_the_same_instant_get_distinct_ids() {
+    let since = Utc::now() - Duration::seconds(600);
+    let cleared = since + Duration::seconds(60);
+    let a = pool_id(Path::new("/home/a/.loom/tokens"));
+    let b = pool_id(Path::new("/home/b/.loom/tokens"));
+    assert_ne!(a, b);
+    assert_eq!(a.len(), 16);
+    assert_eq!(a, pool_id(Path::new("/home/a/.loom/tokens")), "stable per pool");
+    let (x, y) = (hold_span(&a, since, cleared, false, 2), hold_span(&b, since, cleared, false, 2));
+    assert_ne!(x.context.trace_id, y.context.trace_id);
+    assert_ne!(x.context.span_id, y.context.span_id);
+    let again = hold_span(&a, since, cleared + Duration::seconds(5), true, 3);
+    assert_eq!(again.context, x.context, "a re-reported hold keeps its IDs");
 }

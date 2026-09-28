@@ -83,3 +83,21 @@ fn unrepresentable_timestamps_are_dropped_instead_of_rewritten_to_epoch() {
         .is_none());
     }
 }
+
+#[test]
+fn traces_resource_carries_the_build_service_version() {
+    let request = build_traces_request(&[TelemetryEnvelope::new(
+        "host",
+        TelemetryRecord::Span(span(TraceContext::root(true))),
+    )])
+    .unwrap();
+    let json = serde_json::to_value(&request).unwrap();
+    let attributes = json["resourceSpans"][0]["resource"]["attributes"]
+        .as_array()
+        .unwrap();
+    let version = attributes
+        .iter()
+        .find(|kv| kv["key"] == "service.version")
+        .map(|kv| kv["value"]["stringValue"].clone());
+    assert_eq!(version, Some(serde_json::json!(env!("CARGO_PKG_VERSION"))));
+}

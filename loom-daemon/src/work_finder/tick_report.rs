@@ -154,6 +154,13 @@ pub struct TickReport {
     /// flip, no comment, no cooldown/backoff record — this candidate is not
     /// actionable on this host at all, so it is never even attempted.
     pub skipped_host_constraint: usize,
+    /// Issues skipped because they carry `loom:heavy` and this host is
+    /// classified `local-dev` (Issue #9034), with no override set — see
+    /// [`crate::work_finder::host_class`]. Checked immediately after
+    /// [`skipped_host_constraint`](Self::skipped_host_constraint), and carries
+    /// the same zero-side-effect contract: no claim flip, no comment, no
+    /// cooldown/backoff record.
+    pub skipped_host_class: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
@@ -191,6 +198,28 @@ pub struct TickReport {
     /// re-evaluated (and, if still out-of-slice with the slice non-empty,
     /// deferred again) on the next tick.
     pub deferred_out_of_slice: usize,
+    /// Candidates deferred THIS TICK because their own repo was already at
+    /// `autonomous.workFinder.maxConcurrentPerRepo` (Issue #9090,
+    /// [`repo_cap`](super::repo_cap)). Always `0` when the knob is absent (the
+    /// opt-in default) — see [`RepoCap`](super::RepoCap).
+    ///
+    /// Deliberately its own counter, not folded into
+    /// [`deferred_capacity`](Self::deferred_capacity): the *machine* cap was not
+    /// reached, one repo's share of it was, so an operator reading
+    /// `deferred_capacity` is never sent to raise a ceiling that is not binding.
+    /// Purely observational (mirrors
+    /// [`deferred_out_of_slice`](Self::deferred_out_of_slice)'s shape): these
+    /// candidates are NOT lost — they stay ready and are re-evaluated next tick,
+    /// and within THIS tick their deferral is handed straight to the next
+    /// candidate, which is another repo's work.
+    pub deferred_repo_cap: usize,
+    /// The subset of [`dispatched`](Self::dispatched) admitted through the
+    /// `loom:operator-priority` overflow slot (#9244): a starred issue that
+    /// only the global and/or per-repo cap refused, dispatched as this host's
+    /// single over-limit sweep. At most one per tick, and none while an
+    /// earlier overflow sweep is still live. See
+    /// [`operator_priority::OverflowSlot`](super::operator_priority::OverflowSlot).
+    pub dispatched_overflow: usize,
     /// Per-issue outcomes behind the counters above (Issue #8852), recorded
     /// by the multi-workspace tick only. See [`ready_queue`](super::ready_queue).
     pub queue: Vec<ready_queue::TickQueueRow>,
@@ -219,16 +248,54 @@ pub struct TickReport {
     /// `None` when the tick returned before measuring it (a halted
     /// single-workspace tick). Feeds `loom.dispatch.idle_slots`.
     pub occupancy: Option<usize>,
+    /// The shaped candidate order pass 2 iterated, as `(workspace_idx,
+    /// issue)` (Issue #9288): the global sort after `repo_cap::shape_queue`'s
+    /// slice and affinity partitions. Recorded before pass 2 runs, so it is
+    /// the order `dispatch()` was offered candidates in, including those a
+    /// gate then deferred. The published plan's `position` is read from here
+    /// and never re-derived. Empty for the single-workspace tick.
+    pub plan_order: Vec<(usize, u32)>,
+    /// The preferred repo slice the tick shaped with (#6243), or `None` when
+    /// sharding was not configured at the call site.
+    pub in_slice: Option<Vec<bool>>,
+    /// The per-repo cap and top-of-tick per-workspace occupancy (#9090) the
+    /// tick shaped with. `None` for the single-workspace tick.
+    pub repo_cap: Option<super::repo_cap::RepoCapSnapshot>,
+    /// The per-tick admission ramp cap (#4234) the tick ran under, or `None`
+    /// when the caller did not record it.
+    pub max_admissions_per_tick: Option<usize>,
+    /// Whether the host's single `loom:operator-priority` overflow slot
+    /// (#9244) was still unused when the tick finished, or `None` when the
+    /// tick did not record it (Issue #9288).
+    pub overflow_free: Option<bool>,
 }
 
 impl TickReport {
-    /// This report with no occupancy reading, for comparing an idle tick
-    /// against [`TickReport::default`] in tests.
+    /// An empty report for a multi-workspace tick run under these admission
+    /// knobs.
+    #[must_use]
+    pub fn for_tick(saturation_held: bool, max_admissions_per_tick: usize) -> Self {
+        TickReport {
+            saturation_held,
+            max_admissions_per_tick: Some(max_admissions_per_tick),
+            ..TickReport::default()
+        }
+    }
+
+    /// This report with no occupancy reading and none of the admission
+    /// context a multi-workspace tick records for its dispatch plan (#9288:
+    /// ramp cap, slice mask, per-repo cap snapshot, overflow slot), for comparing an idle
+    /// tick against [`TickReport::default`] in tests. The shaped order itself
+    /// (`plan_order`) is kept: an idle tick has none.
     #[cfg(test)]
     #[must_use]
     pub fn without_occupancy(self) -> Self {
         TickReport {
             occupancy: None,
+            max_admissions_per_tick: None,
+            in_slice: None,
+            repo_cap: None,
+            overflow_free: None,
             ..self
         }
     }
@@ -245,6 +312,10 @@ pub struct Admission {
     /// The issue the attempt was for. A span attribute only, never a metric
     /// label.
     pub issue: u32,
+    /// The workspace the issue belongs to, so the exporter (Issue #9222) can
+    /// resolve `loom.repo` from the same `roots` slice every other per-tick
+    /// export already indexes by. A span attribute only, never a metric label.
+    pub workspace_idx: usize,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     /// `dispatched`, `in_flight` (idempotency no-op), `refused` (a deliberate,
@@ -256,7 +327,8 @@ pub struct Admission {
 
 impl PartialEq for Admission {
     fn eq(&self, other: &Self) -> bool {
-        (self.issue, self.result, self.reason) == (other.issue, other.result, other.reason)
+        (self.issue, self.workspace_idx, self.result, self.reason)
+            == (other.issue, other.workspace_idx, other.result, other.reason)
     }
 }
 
@@ -299,12 +371,14 @@ impl Outcome {
 pub fn record_dispatch_outcome(
     report: &mut TickReport,
     issue: u32,
+    workspace_idx: usize,
     started_at: DateTime<Utc>,
     outcome: &Result<bool>,
 ) -> (Qd, Option<String>) {
     let counted = classify(report, issue, outcome);
     report.admissions.push(Admission {
         issue,
+        workspace_idx,
         started_at,
         ended_at: Utc::now().max(started_at),
         result: counted.result,

@@ -1050,3 +1050,1121 @@
 {"body":"\n\néüñ Depends on*_:#107","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires \n ##5 \n\n\n**Epic***_: \n# 5"},{"author":{"login":"loom-bot[bot]"},"body":"0x1F\nsee also\n](#12)"}],"bot_login":"loom-bot","shell_refs":"107"}
 {"body":"| table |\n**Epic** #1.5","comments":[{"author":{"login":"Renovate[bot]"},"body":"<!-- curator:dep-recheck:x -->\n##5 - item\nDepends on*_: \n#201\n> quote"},{"author":{"login":""},"body":"éüñ\n\n\n"},{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:x --> \n **Epic** \n #-3\n**Epic***_:# 5"}],"bot_login":"Loom-Bot[bot]","shell_refs":"1"}
 {"body":"Requires #18446744073709551616\nRequires*_:#007\nBlocked by #abc\nDepends  on \n #00","comments":[{"author":{"login":"app/loom-botx"},"body":"0x1F > quote"}],"bot_login":"loom-bot","shell_refs":"007 18446744073709551616"}
+{"_meta":{"block_id":"8097-separator-alphabet-and-bot-login-variants","purpose":"Extension (#8097, reconciled with #8094's block in #8136): the full [[:space:]] separator alphabet including NBSP, and comment-bearing cases crossed with every --bot-login spelling. Unlike the two blocks above, this one has a COMMITTED generator -- regenerating it is one command, not archaeology.","reference_impl":"unchanged -- defaults/scripts/dep-recheck-fingerprint.sh at git rev b1968d2a (821 lines, the last commit before the port in #7969). The 1050 records above were replayed against this same rev while generating these, with 0 mismatches; the generator aborts rather than rewrite a preserved record that no longer reproduces.","subcommand":"extract-refs --stdin --bot-login <the case's own bot_login, or the default below> --json","bot_login":"loom-bot","bot_login_variants":["loom-bot","app/loom-bot","loom-bot[bot]","LOOM-BOT","app/LOOM-BOT","Loom-Bot[bot]","app/loom-bot[bot]"],"corpus":"1117 inputs (393 comment-bearing) deterministically enumerated (no RNG, no seed) from the grammar extract-refs parses, extending the two blocks above along the two axes neither of them covers. (1) The FULL seven-member separator alphabet -- space, \\n, \\t, \\r, \\x0b (VT), \\x0c (FF), and U+00A0 NBSP -- crossed with the four trigger phrases and reference-number boundaries (0, a leading-zero form, the u64 limit, one past it, deep overflow); the 1050 records above contain only space, \\n and \\t. NBSP is the one separator the port's `[[:space:]]` class and the retired shell's `[[:space:]]` deliberately do NOT match -- both sides agree by finding nothing, proving the #8097 fix rather than merely asserting it. (2) Comment-bearing cases crossed with all seven --bot-login spellings (see bot_login_variants), eight comment author logins (the five that normalise to the bot identity, a human, a DISTINCT [bot]-suffixed identity, and an absent login), and OWN_MARKERS presence -- plus near-miss phrases, multi-reference bodies, multi-comment concatenation, cross-source (body+comment) dedup, and the newline the extractor itself inserts at the body/comment seam. Each comment-bearing case names the --bot-login it was replayed with.","regenerate":"cargo run -p loom-daemon --example generate_extract_refs_oracle (loom-daemon/examples/generate_extract_refs_oracle.rs, #8097). Requires bash, jq, and a git history deep enough to contain the reference rev above; recovers the shell from git history on every run rather than vendoring it. It preserves every record ABOVE this _meta line byte for byte (re-verifying each against the shell) and regenerates everything from this line down. Do NOT hand-edit this file.","frozen":"Never edit by hand -- regenerate via the command in `regenerate` above. The shell is retired; these answers are the historical ground truth."}}
+{"body":"Blocked by #0","shell_refs":"0"}
+{"body":"Blocked by: #0","shell_refs":"0"}
+{"body":"Blocked by*_:  #0","shell_refs":"0"}
+{"body":"Blocked by #5","shell_refs":"5"}
+{"body":"Blocked by: #5","shell_refs":"5"}
+{"body":"Blocked by*_:  #5","shell_refs":"5"}
+{"body":"Blocked by #007","shell_refs":"007"}
+{"body":"Blocked by: #007","shell_refs":"007"}
+{"body":"Blocked by*_:  #007","shell_refs":"007"}
+{"body":"Blocked by #0000","shell_refs":"0000"}
+{"body":"Blocked by: #0000","shell_refs":"0000"}
+{"body":"Blocked by*_:  #0000","shell_refs":"0000"}
+{"body":"Blocked by #18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by: #18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by*_:  #18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by #18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by: #18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by*_:  #18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by #99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by: #99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by*_:  #99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by #123456789","shell_refs":"123456789"}
+{"body":"Blocked by: #123456789","shell_refs":"123456789"}
+{"body":"Blocked by*_:  #123456789","shell_refs":"123456789"}
+{"body":"Blocked by\n#0","shell_refs":""}
+{"body":"Blocked by:\n#0","shell_refs":""}
+{"body":"Blocked by*_:\n\n#0","shell_refs":""}
+{"body":"Blocked by\n#5","shell_refs":""}
+{"body":"Blocked by:\n#5","shell_refs":""}
+{"body":"Blocked by*_:\n\n#5","shell_refs":""}
+{"body":"Blocked by\n#007","shell_refs":""}
+{"body":"Blocked by:\n#007","shell_refs":""}
+{"body":"Blocked by*_:\n\n#007","shell_refs":""}
+{"body":"Blocked by\n#0000","shell_refs":""}
+{"body":"Blocked by:\n#0000","shell_refs":""}
+{"body":"Blocked by*_:\n\n#0000","shell_refs":""}
+{"body":"Blocked by\n#18446744073709551615","shell_refs":""}
+{"body":"Blocked by:\n#18446744073709551615","shell_refs":""}
+{"body":"Blocked by*_:\n\n#18446744073709551615","shell_refs":""}
+{"body":"Blocked by\n#18446744073709551616","shell_refs":""}
+{"body":"Blocked by:\n#18446744073709551616","shell_refs":""}
+{"body":"Blocked by*_:\n\n#18446744073709551616","shell_refs":""}
+{"body":"Blocked by\n#99999999999999999999999999","shell_refs":""}
+{"body":"Blocked by:\n#99999999999999999999999999","shell_refs":""}
+{"body":"Blocked by*_:\n\n#99999999999999999999999999","shell_refs":""}
+{"body":"Blocked by\n#123456789","shell_refs":""}
+{"body":"Blocked by:\n#123456789","shell_refs":""}
+{"body":"Blocked by*_:\n\n#123456789","shell_refs":""}
+{"body":"Blocked by\t#0","shell_refs":"0"}
+{"body":"Blocked by:\t#0","shell_refs":"0"}
+{"body":"Blocked by*_:\t\t#0","shell_refs":"0"}
+{"body":"Blocked by\t#5","shell_refs":"5"}
+{"body":"Blocked by:\t#5","shell_refs":"5"}
+{"body":"Blocked by*_:\t\t#5","shell_refs":"5"}
+{"body":"Blocked by\t#007","shell_refs":"007"}
+{"body":"Blocked by:\t#007","shell_refs":"007"}
+{"body":"Blocked by*_:\t\t#007","shell_refs":"007"}
+{"body":"Blocked by\t#0000","shell_refs":"0000"}
+{"body":"Blocked by:\t#0000","shell_refs":"0000"}
+{"body":"Blocked by*_:\t\t#0000","shell_refs":"0000"}
+{"body":"Blocked by\t#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by:\t#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by*_:\t\t#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by\t#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by:\t#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by*_:\t\t#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by\t#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by:\t#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by*_:\t\t#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by\t#123456789","shell_refs":"123456789"}
+{"body":"Blocked by:\t#123456789","shell_refs":"123456789"}
+{"body":"Blocked by*_:\t\t#123456789","shell_refs":"123456789"}
+{"body":"Blocked by\r#0","shell_refs":"0"}
+{"body":"Blocked by:\r#0","shell_refs":"0"}
+{"body":"Blocked by*_:\r\r#0","shell_refs":"0"}
+{"body":"Blocked by\r#5","shell_refs":"5"}
+{"body":"Blocked by:\r#5","shell_refs":"5"}
+{"body":"Blocked by*_:\r\r#5","shell_refs":"5"}
+{"body":"Blocked by\r#007","shell_refs":"007"}
+{"body":"Blocked by:\r#007","shell_refs":"007"}
+{"body":"Blocked by*_:\r\r#007","shell_refs":"007"}
+{"body":"Blocked by\r#0000","shell_refs":"0000"}
+{"body":"Blocked by:\r#0000","shell_refs":"0000"}
+{"body":"Blocked by*_:\r\r#0000","shell_refs":"0000"}
+{"body":"Blocked by\r#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by:\r#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by*_:\r\r#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by\r#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by:\r#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by*_:\r\r#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by\r#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by:\r#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by*_:\r\r#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by\r#123456789","shell_refs":"123456789"}
+{"body":"Blocked by:\r#123456789","shell_refs":"123456789"}
+{"body":"Blocked by*_:\r\r#123456789","shell_refs":"123456789"}
+{"body":"Blocked by\u000b#0","shell_refs":"0"}
+{"body":"Blocked by:\u000b#0","shell_refs":"0"}
+{"body":"Blocked by*_:\u000b\u000b#0","shell_refs":"0"}
+{"body":"Blocked by\u000b#5","shell_refs":"5"}
+{"body":"Blocked by:\u000b#5","shell_refs":"5"}
+{"body":"Blocked by*_:\u000b\u000b#5","shell_refs":"5"}
+{"body":"Blocked by\u000b#007","shell_refs":"007"}
+{"body":"Blocked by:\u000b#007","shell_refs":"007"}
+{"body":"Blocked by*_:\u000b\u000b#007","shell_refs":"007"}
+{"body":"Blocked by\u000b#0000","shell_refs":"0000"}
+{"body":"Blocked by:\u000b#0000","shell_refs":"0000"}
+{"body":"Blocked by*_:\u000b\u000b#0000","shell_refs":"0000"}
+{"body":"Blocked by\u000b#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by:\u000b#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by*_:\u000b\u000b#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by\u000b#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by:\u000b#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by*_:\u000b\u000b#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by\u000b#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by:\u000b#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by*_:\u000b\u000b#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by\u000b#123456789","shell_refs":"123456789"}
+{"body":"Blocked by:\u000b#123456789","shell_refs":"123456789"}
+{"body":"Blocked by*_:\u000b\u000b#123456789","shell_refs":"123456789"}
+{"body":"Blocked by\f#0","shell_refs":"0"}
+{"body":"Blocked by:\f#0","shell_refs":"0"}
+{"body":"Blocked by*_:\f\f#0","shell_refs":"0"}
+{"body":"Blocked by\f#5","shell_refs":"5"}
+{"body":"Blocked by:\f#5","shell_refs":"5"}
+{"body":"Blocked by*_:\f\f#5","shell_refs":"5"}
+{"body":"Blocked by\f#007","shell_refs":"007"}
+{"body":"Blocked by:\f#007","shell_refs":"007"}
+{"body":"Blocked by*_:\f\f#007","shell_refs":"007"}
+{"body":"Blocked by\f#0000","shell_refs":"0000"}
+{"body":"Blocked by:\f#0000","shell_refs":"0000"}
+{"body":"Blocked by*_:\f\f#0000","shell_refs":"0000"}
+{"body":"Blocked by\f#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by:\f#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by*_:\f\f#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Blocked by\f#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by:\f#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by*_:\f\f#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Blocked by\f#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by:\f#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by*_:\f\f#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Blocked by\f#123456789","shell_refs":"123456789"}
+{"body":"Blocked by:\f#123456789","shell_refs":"123456789"}
+{"body":"Blocked by*_:\f\f#123456789","shell_refs":"123456789"}
+{"body":"Blocked by #0","shell_refs":""}
+{"body":"Blocked by: #0","shell_refs":""}
+{"body":"Blocked by*_:  #0","shell_refs":""}
+{"body":"Blocked by #5","shell_refs":""}
+{"body":"Blocked by: #5","shell_refs":""}
+{"body":"Blocked by*_:  #5","shell_refs":""}
+{"body":"Blocked by #007","shell_refs":""}
+{"body":"Blocked by: #007","shell_refs":""}
+{"body":"Blocked by*_:  #007","shell_refs":""}
+{"body":"Blocked by #0000","shell_refs":""}
+{"body":"Blocked by: #0000","shell_refs":""}
+{"body":"Blocked by*_:  #0000","shell_refs":""}
+{"body":"Blocked by #18446744073709551615","shell_refs":""}
+{"body":"Blocked by: #18446744073709551615","shell_refs":""}
+{"body":"Blocked by*_:  #18446744073709551615","shell_refs":""}
+{"body":"Blocked by #18446744073709551616","shell_refs":""}
+{"body":"Blocked by: #18446744073709551616","shell_refs":""}
+{"body":"Blocked by*_:  #18446744073709551616","shell_refs":""}
+{"body":"Blocked by #99999999999999999999999999","shell_refs":""}
+{"body":"Blocked by: #99999999999999999999999999","shell_refs":""}
+{"body":"Blocked by*_:  #99999999999999999999999999","shell_refs":""}
+{"body":"Blocked by #123456789","shell_refs":""}
+{"body":"Blocked by: #123456789","shell_refs":""}
+{"body":"Blocked by*_:  #123456789","shell_refs":""}
+{"body":"Depends on #0","shell_refs":"0"}
+{"body":"Depends on: #0","shell_refs":"0"}
+{"body":"Depends on*_:  #0","shell_refs":"0"}
+{"body":"Depends on #5","shell_refs":"5"}
+{"body":"Depends on: #5","shell_refs":"5"}
+{"body":"Depends on*_:  #5","shell_refs":"5"}
+{"body":"Depends on #007","shell_refs":"007"}
+{"body":"Depends on: #007","shell_refs":"007"}
+{"body":"Depends on*_:  #007","shell_refs":"007"}
+{"body":"Depends on #0000","shell_refs":"0000"}
+{"body":"Depends on: #0000","shell_refs":"0000"}
+{"body":"Depends on*_:  #0000","shell_refs":"0000"}
+{"body":"Depends on #18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on: #18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on*_:  #18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on #18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on: #18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on*_:  #18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on #99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on: #99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on*_:  #99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on #123456789","shell_refs":"123456789"}
+{"body":"Depends on: #123456789","shell_refs":"123456789"}
+{"body":"Depends on*_:  #123456789","shell_refs":"123456789"}
+{"body":"Depends on\n#0","shell_refs":""}
+{"body":"Depends on:\n#0","shell_refs":""}
+{"body":"Depends on*_:\n\n#0","shell_refs":""}
+{"body":"Depends on\n#5","shell_refs":""}
+{"body":"Depends on:\n#5","shell_refs":""}
+{"body":"Depends on*_:\n\n#5","shell_refs":""}
+{"body":"Depends on\n#007","shell_refs":""}
+{"body":"Depends on:\n#007","shell_refs":""}
+{"body":"Depends on*_:\n\n#007","shell_refs":""}
+{"body":"Depends on\n#0000","shell_refs":""}
+{"body":"Depends on:\n#0000","shell_refs":""}
+{"body":"Depends on*_:\n\n#0000","shell_refs":""}
+{"body":"Depends on\n#18446744073709551615","shell_refs":""}
+{"body":"Depends on:\n#18446744073709551615","shell_refs":""}
+{"body":"Depends on*_:\n\n#18446744073709551615","shell_refs":""}
+{"body":"Depends on\n#18446744073709551616","shell_refs":""}
+{"body":"Depends on:\n#18446744073709551616","shell_refs":""}
+{"body":"Depends on*_:\n\n#18446744073709551616","shell_refs":""}
+{"body":"Depends on\n#99999999999999999999999999","shell_refs":""}
+{"body":"Depends on:\n#99999999999999999999999999","shell_refs":""}
+{"body":"Depends on*_:\n\n#99999999999999999999999999","shell_refs":""}
+{"body":"Depends on\n#123456789","shell_refs":""}
+{"body":"Depends on:\n#123456789","shell_refs":""}
+{"body":"Depends on*_:\n\n#123456789","shell_refs":""}
+{"body":"Depends on\t#0","shell_refs":"0"}
+{"body":"Depends on:\t#0","shell_refs":"0"}
+{"body":"Depends on*_:\t\t#0","shell_refs":"0"}
+{"body":"Depends on\t#5","shell_refs":"5"}
+{"body":"Depends on:\t#5","shell_refs":"5"}
+{"body":"Depends on*_:\t\t#5","shell_refs":"5"}
+{"body":"Depends on\t#007","shell_refs":"007"}
+{"body":"Depends on:\t#007","shell_refs":"007"}
+{"body":"Depends on*_:\t\t#007","shell_refs":"007"}
+{"body":"Depends on\t#0000","shell_refs":"0000"}
+{"body":"Depends on:\t#0000","shell_refs":"0000"}
+{"body":"Depends on*_:\t\t#0000","shell_refs":"0000"}
+{"body":"Depends on\t#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on:\t#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on*_:\t\t#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on\t#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on:\t#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on*_:\t\t#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on\t#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on:\t#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on*_:\t\t#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on\t#123456789","shell_refs":"123456789"}
+{"body":"Depends on:\t#123456789","shell_refs":"123456789"}
+{"body":"Depends on*_:\t\t#123456789","shell_refs":"123456789"}
+{"body":"Depends on\r#0","shell_refs":"0"}
+{"body":"Depends on:\r#0","shell_refs":"0"}
+{"body":"Depends on*_:\r\r#0","shell_refs":"0"}
+{"body":"Depends on\r#5","shell_refs":"5"}
+{"body":"Depends on:\r#5","shell_refs":"5"}
+{"body":"Depends on*_:\r\r#5","shell_refs":"5"}
+{"body":"Depends on\r#007","shell_refs":"007"}
+{"body":"Depends on:\r#007","shell_refs":"007"}
+{"body":"Depends on*_:\r\r#007","shell_refs":"007"}
+{"body":"Depends on\r#0000","shell_refs":"0000"}
+{"body":"Depends on:\r#0000","shell_refs":"0000"}
+{"body":"Depends on*_:\r\r#0000","shell_refs":"0000"}
+{"body":"Depends on\r#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on:\r#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on*_:\r\r#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on\r#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on:\r#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on*_:\r\r#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on\r#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on:\r#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on*_:\r\r#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on\r#123456789","shell_refs":"123456789"}
+{"body":"Depends on:\r#123456789","shell_refs":"123456789"}
+{"body":"Depends on*_:\r\r#123456789","shell_refs":"123456789"}
+{"body":"Depends on\u000b#0","shell_refs":"0"}
+{"body":"Depends on:\u000b#0","shell_refs":"0"}
+{"body":"Depends on*_:\u000b\u000b#0","shell_refs":"0"}
+{"body":"Depends on\u000b#5","shell_refs":"5"}
+{"body":"Depends on:\u000b#5","shell_refs":"5"}
+{"body":"Depends on*_:\u000b\u000b#5","shell_refs":"5"}
+{"body":"Depends on\u000b#007","shell_refs":"007"}
+{"body":"Depends on:\u000b#007","shell_refs":"007"}
+{"body":"Depends on*_:\u000b\u000b#007","shell_refs":"007"}
+{"body":"Depends on\u000b#0000","shell_refs":"0000"}
+{"body":"Depends on:\u000b#0000","shell_refs":"0000"}
+{"body":"Depends on*_:\u000b\u000b#0000","shell_refs":"0000"}
+{"body":"Depends on\u000b#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on:\u000b#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on*_:\u000b\u000b#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on\u000b#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on:\u000b#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on*_:\u000b\u000b#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on\u000b#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on:\u000b#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on*_:\u000b\u000b#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on\u000b#123456789","shell_refs":"123456789"}
+{"body":"Depends on:\u000b#123456789","shell_refs":"123456789"}
+{"body":"Depends on*_:\u000b\u000b#123456789","shell_refs":"123456789"}
+{"body":"Depends on\f#0","shell_refs":"0"}
+{"body":"Depends on:\f#0","shell_refs":"0"}
+{"body":"Depends on*_:\f\f#0","shell_refs":"0"}
+{"body":"Depends on\f#5","shell_refs":"5"}
+{"body":"Depends on:\f#5","shell_refs":"5"}
+{"body":"Depends on*_:\f\f#5","shell_refs":"5"}
+{"body":"Depends on\f#007","shell_refs":"007"}
+{"body":"Depends on:\f#007","shell_refs":"007"}
+{"body":"Depends on*_:\f\f#007","shell_refs":"007"}
+{"body":"Depends on\f#0000","shell_refs":"0000"}
+{"body":"Depends on:\f#0000","shell_refs":"0000"}
+{"body":"Depends on*_:\f\f#0000","shell_refs":"0000"}
+{"body":"Depends on\f#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on:\f#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on*_:\f\f#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Depends on\f#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on:\f#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on*_:\f\f#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Depends on\f#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on:\f#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on*_:\f\f#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Depends on\f#123456789","shell_refs":"123456789"}
+{"body":"Depends on:\f#123456789","shell_refs":"123456789"}
+{"body":"Depends on*_:\f\f#123456789","shell_refs":"123456789"}
+{"body":"Depends on #0","shell_refs":""}
+{"body":"Depends on: #0","shell_refs":""}
+{"body":"Depends on*_:  #0","shell_refs":""}
+{"body":"Depends on #5","shell_refs":""}
+{"body":"Depends on: #5","shell_refs":""}
+{"body":"Depends on*_:  #5","shell_refs":""}
+{"body":"Depends on #007","shell_refs":""}
+{"body":"Depends on: #007","shell_refs":""}
+{"body":"Depends on*_:  #007","shell_refs":""}
+{"body":"Depends on #0000","shell_refs":""}
+{"body":"Depends on: #0000","shell_refs":""}
+{"body":"Depends on*_:  #0000","shell_refs":""}
+{"body":"Depends on #18446744073709551615","shell_refs":""}
+{"body":"Depends on: #18446744073709551615","shell_refs":""}
+{"body":"Depends on*_:  #18446744073709551615","shell_refs":""}
+{"body":"Depends on #18446744073709551616","shell_refs":""}
+{"body":"Depends on: #18446744073709551616","shell_refs":""}
+{"body":"Depends on*_:  #18446744073709551616","shell_refs":""}
+{"body":"Depends on #99999999999999999999999999","shell_refs":""}
+{"body":"Depends on: #99999999999999999999999999","shell_refs":""}
+{"body":"Depends on*_:  #99999999999999999999999999","shell_refs":""}
+{"body":"Depends on #123456789","shell_refs":""}
+{"body":"Depends on: #123456789","shell_refs":""}
+{"body":"Depends on*_:  #123456789","shell_refs":""}
+{"body":"Requires #0","shell_refs":"0"}
+{"body":"Requires: #0","shell_refs":"0"}
+{"body":"Requires*_:  #0","shell_refs":"0"}
+{"body":"Requires #5","shell_refs":"5"}
+{"body":"Requires: #5","shell_refs":"5"}
+{"body":"Requires*_:  #5","shell_refs":"5"}
+{"body":"Requires #007","shell_refs":"007"}
+{"body":"Requires: #007","shell_refs":"007"}
+{"body":"Requires*_:  #007","shell_refs":"007"}
+{"body":"Requires #0000","shell_refs":"0000"}
+{"body":"Requires: #0000","shell_refs":"0000"}
+{"body":"Requires*_:  #0000","shell_refs":"0000"}
+{"body":"Requires #18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires: #18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires*_:  #18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires #18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires: #18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires*_:  #18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires #99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires: #99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires*_:  #99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires #123456789","shell_refs":"123456789"}
+{"body":"Requires: #123456789","shell_refs":"123456789"}
+{"body":"Requires*_:  #123456789","shell_refs":"123456789"}
+{"body":"Requires\n#0","shell_refs":""}
+{"body":"Requires:\n#0","shell_refs":""}
+{"body":"Requires*_:\n\n#0","shell_refs":""}
+{"body":"Requires\n#5","shell_refs":""}
+{"body":"Requires:\n#5","shell_refs":""}
+{"body":"Requires*_:\n\n#5","shell_refs":""}
+{"body":"Requires\n#007","shell_refs":""}
+{"body":"Requires:\n#007","shell_refs":""}
+{"body":"Requires*_:\n\n#007","shell_refs":""}
+{"body":"Requires\n#0000","shell_refs":""}
+{"body":"Requires:\n#0000","shell_refs":""}
+{"body":"Requires*_:\n\n#0000","shell_refs":""}
+{"body":"Requires\n#18446744073709551615","shell_refs":""}
+{"body":"Requires:\n#18446744073709551615","shell_refs":""}
+{"body":"Requires*_:\n\n#18446744073709551615","shell_refs":""}
+{"body":"Requires\n#18446744073709551616","shell_refs":""}
+{"body":"Requires:\n#18446744073709551616","shell_refs":""}
+{"body":"Requires*_:\n\n#18446744073709551616","shell_refs":""}
+{"body":"Requires\n#99999999999999999999999999","shell_refs":""}
+{"body":"Requires:\n#99999999999999999999999999","shell_refs":""}
+{"body":"Requires*_:\n\n#99999999999999999999999999","shell_refs":""}
+{"body":"Requires\n#123456789","shell_refs":""}
+{"body":"Requires:\n#123456789","shell_refs":""}
+{"body":"Requires*_:\n\n#123456789","shell_refs":""}
+{"body":"Requires\t#0","shell_refs":"0"}
+{"body":"Requires:\t#0","shell_refs":"0"}
+{"body":"Requires*_:\t\t#0","shell_refs":"0"}
+{"body":"Requires\t#5","shell_refs":"5"}
+{"body":"Requires:\t#5","shell_refs":"5"}
+{"body":"Requires*_:\t\t#5","shell_refs":"5"}
+{"body":"Requires\t#007","shell_refs":"007"}
+{"body":"Requires:\t#007","shell_refs":"007"}
+{"body":"Requires*_:\t\t#007","shell_refs":"007"}
+{"body":"Requires\t#0000","shell_refs":"0000"}
+{"body":"Requires:\t#0000","shell_refs":"0000"}
+{"body":"Requires*_:\t\t#0000","shell_refs":"0000"}
+{"body":"Requires\t#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires:\t#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires*_:\t\t#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires\t#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires:\t#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires*_:\t\t#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires\t#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires:\t#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires*_:\t\t#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires\t#123456789","shell_refs":"123456789"}
+{"body":"Requires:\t#123456789","shell_refs":"123456789"}
+{"body":"Requires*_:\t\t#123456789","shell_refs":"123456789"}
+{"body":"Requires\r#0","shell_refs":"0"}
+{"body":"Requires:\r#0","shell_refs":"0"}
+{"body":"Requires*_:\r\r#0","shell_refs":"0"}
+{"body":"Requires\r#5","shell_refs":"5"}
+{"body":"Requires:\r#5","shell_refs":"5"}
+{"body":"Requires*_:\r\r#5","shell_refs":"5"}
+{"body":"Requires\r#007","shell_refs":"007"}
+{"body":"Requires:\r#007","shell_refs":"007"}
+{"body":"Requires*_:\r\r#007","shell_refs":"007"}
+{"body":"Requires\r#0000","shell_refs":"0000"}
+{"body":"Requires:\r#0000","shell_refs":"0000"}
+{"body":"Requires*_:\r\r#0000","shell_refs":"0000"}
+{"body":"Requires\r#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires:\r#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires*_:\r\r#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires\r#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires:\r#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires*_:\r\r#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires\r#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires:\r#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires*_:\r\r#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires\r#123456789","shell_refs":"123456789"}
+{"body":"Requires:\r#123456789","shell_refs":"123456789"}
+{"body":"Requires*_:\r\r#123456789","shell_refs":"123456789"}
+{"body":"Requires\u000b#0","shell_refs":"0"}
+{"body":"Requires:\u000b#0","shell_refs":"0"}
+{"body":"Requires*_:\u000b\u000b#0","shell_refs":"0"}
+{"body":"Requires\u000b#5","shell_refs":"5"}
+{"body":"Requires:\u000b#5","shell_refs":"5"}
+{"body":"Requires*_:\u000b\u000b#5","shell_refs":"5"}
+{"body":"Requires\u000b#007","shell_refs":"007"}
+{"body":"Requires:\u000b#007","shell_refs":"007"}
+{"body":"Requires*_:\u000b\u000b#007","shell_refs":"007"}
+{"body":"Requires\u000b#0000","shell_refs":"0000"}
+{"body":"Requires:\u000b#0000","shell_refs":"0000"}
+{"body":"Requires*_:\u000b\u000b#0000","shell_refs":"0000"}
+{"body":"Requires\u000b#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires:\u000b#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires*_:\u000b\u000b#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires\u000b#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires:\u000b#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires*_:\u000b\u000b#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires\u000b#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires:\u000b#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires*_:\u000b\u000b#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires\u000b#123456789","shell_refs":"123456789"}
+{"body":"Requires:\u000b#123456789","shell_refs":"123456789"}
+{"body":"Requires*_:\u000b\u000b#123456789","shell_refs":"123456789"}
+{"body":"Requires\f#0","shell_refs":"0"}
+{"body":"Requires:\f#0","shell_refs":"0"}
+{"body":"Requires*_:\f\f#0","shell_refs":"0"}
+{"body":"Requires\f#5","shell_refs":"5"}
+{"body":"Requires:\f#5","shell_refs":"5"}
+{"body":"Requires*_:\f\f#5","shell_refs":"5"}
+{"body":"Requires\f#007","shell_refs":"007"}
+{"body":"Requires:\f#007","shell_refs":"007"}
+{"body":"Requires*_:\f\f#007","shell_refs":"007"}
+{"body":"Requires\f#0000","shell_refs":"0000"}
+{"body":"Requires:\f#0000","shell_refs":"0000"}
+{"body":"Requires*_:\f\f#0000","shell_refs":"0000"}
+{"body":"Requires\f#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires:\f#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires*_:\f\f#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"Requires\f#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires:\f#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires*_:\f\f#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"Requires\f#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires:\f#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires*_:\f\f#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"Requires\f#123456789","shell_refs":"123456789"}
+{"body":"Requires:\f#123456789","shell_refs":"123456789"}
+{"body":"Requires*_:\f\f#123456789","shell_refs":"123456789"}
+{"body":"Requires #0","shell_refs":""}
+{"body":"Requires: #0","shell_refs":""}
+{"body":"Requires*_:  #0","shell_refs":""}
+{"body":"Requires #5","shell_refs":""}
+{"body":"Requires: #5","shell_refs":""}
+{"body":"Requires*_:  #5","shell_refs":""}
+{"body":"Requires #007","shell_refs":""}
+{"body":"Requires: #007","shell_refs":""}
+{"body":"Requires*_:  #007","shell_refs":""}
+{"body":"Requires #0000","shell_refs":""}
+{"body":"Requires: #0000","shell_refs":""}
+{"body":"Requires*_:  #0000","shell_refs":""}
+{"body":"Requires #18446744073709551615","shell_refs":""}
+{"body":"Requires: #18446744073709551615","shell_refs":""}
+{"body":"Requires*_:  #18446744073709551615","shell_refs":""}
+{"body":"Requires #18446744073709551616","shell_refs":""}
+{"body":"Requires: #18446744073709551616","shell_refs":""}
+{"body":"Requires*_:  #18446744073709551616","shell_refs":""}
+{"body":"Requires #99999999999999999999999999","shell_refs":""}
+{"body":"Requires: #99999999999999999999999999","shell_refs":""}
+{"body":"Requires*_:  #99999999999999999999999999","shell_refs":""}
+{"body":"Requires #123456789","shell_refs":""}
+{"body":"Requires: #123456789","shell_refs":""}
+{"body":"Requires*_:  #123456789","shell_refs":""}
+{"body":"**Epic** #0","shell_refs":"0"}
+{"body":"**Epic**: #0","shell_refs":"0"}
+{"body":"**Epic***_:  #0","shell_refs":"0"}
+{"body":"**Epic** #5","shell_refs":"5"}
+{"body":"**Epic**: #5","shell_refs":"5"}
+{"body":"**Epic***_:  #5","shell_refs":"5"}
+{"body":"**Epic** #007","shell_refs":"007"}
+{"body":"**Epic**: #007","shell_refs":"007"}
+{"body":"**Epic***_:  #007","shell_refs":"007"}
+{"body":"**Epic** #0000","shell_refs":"0000"}
+{"body":"**Epic**: #0000","shell_refs":"0000"}
+{"body":"**Epic***_:  #0000","shell_refs":"0000"}
+{"body":"**Epic** #18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic**: #18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic***_:  #18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic** #18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic**: #18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic***_:  #18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic** #99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic**: #99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic***_:  #99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic** #123456789","shell_refs":"123456789"}
+{"body":"**Epic**: #123456789","shell_refs":"123456789"}
+{"body":"**Epic***_:  #123456789","shell_refs":"123456789"}
+{"body":"**Epic**\n#0","shell_refs":""}
+{"body":"**Epic**:\n#0","shell_refs":""}
+{"body":"**Epic***_:\n\n#0","shell_refs":""}
+{"body":"**Epic**\n#5","shell_refs":""}
+{"body":"**Epic**:\n#5","shell_refs":""}
+{"body":"**Epic***_:\n\n#5","shell_refs":""}
+{"body":"**Epic**\n#007","shell_refs":""}
+{"body":"**Epic**:\n#007","shell_refs":""}
+{"body":"**Epic***_:\n\n#007","shell_refs":""}
+{"body":"**Epic**\n#0000","shell_refs":""}
+{"body":"**Epic**:\n#0000","shell_refs":""}
+{"body":"**Epic***_:\n\n#0000","shell_refs":""}
+{"body":"**Epic**\n#18446744073709551615","shell_refs":""}
+{"body":"**Epic**:\n#18446744073709551615","shell_refs":""}
+{"body":"**Epic***_:\n\n#18446744073709551615","shell_refs":""}
+{"body":"**Epic**\n#18446744073709551616","shell_refs":""}
+{"body":"**Epic**:\n#18446744073709551616","shell_refs":""}
+{"body":"**Epic***_:\n\n#18446744073709551616","shell_refs":""}
+{"body":"**Epic**\n#99999999999999999999999999","shell_refs":""}
+{"body":"**Epic**:\n#99999999999999999999999999","shell_refs":""}
+{"body":"**Epic***_:\n\n#99999999999999999999999999","shell_refs":""}
+{"body":"**Epic**\n#123456789","shell_refs":""}
+{"body":"**Epic**:\n#123456789","shell_refs":""}
+{"body":"**Epic***_:\n\n#123456789","shell_refs":""}
+{"body":"**Epic**\t#0","shell_refs":"0"}
+{"body":"**Epic**:\t#0","shell_refs":"0"}
+{"body":"**Epic***_:\t\t#0","shell_refs":"0"}
+{"body":"**Epic**\t#5","shell_refs":"5"}
+{"body":"**Epic**:\t#5","shell_refs":"5"}
+{"body":"**Epic***_:\t\t#5","shell_refs":"5"}
+{"body":"**Epic**\t#007","shell_refs":"007"}
+{"body":"**Epic**:\t#007","shell_refs":"007"}
+{"body":"**Epic***_:\t\t#007","shell_refs":"007"}
+{"body":"**Epic**\t#0000","shell_refs":"0000"}
+{"body":"**Epic**:\t#0000","shell_refs":"0000"}
+{"body":"**Epic***_:\t\t#0000","shell_refs":"0000"}
+{"body":"**Epic**\t#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic**:\t#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic***_:\t\t#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic**\t#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic**:\t#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic***_:\t\t#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic**\t#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic**:\t#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic***_:\t\t#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic**\t#123456789","shell_refs":"123456789"}
+{"body":"**Epic**:\t#123456789","shell_refs":"123456789"}
+{"body":"**Epic***_:\t\t#123456789","shell_refs":"123456789"}
+{"body":"**Epic**\r#0","shell_refs":"0"}
+{"body":"**Epic**:\r#0","shell_refs":"0"}
+{"body":"**Epic***_:\r\r#0","shell_refs":"0"}
+{"body":"**Epic**\r#5","shell_refs":"5"}
+{"body":"**Epic**:\r#5","shell_refs":"5"}
+{"body":"**Epic***_:\r\r#5","shell_refs":"5"}
+{"body":"**Epic**\r#007","shell_refs":"007"}
+{"body":"**Epic**:\r#007","shell_refs":"007"}
+{"body":"**Epic***_:\r\r#007","shell_refs":"007"}
+{"body":"**Epic**\r#0000","shell_refs":"0000"}
+{"body":"**Epic**:\r#0000","shell_refs":"0000"}
+{"body":"**Epic***_:\r\r#0000","shell_refs":"0000"}
+{"body":"**Epic**\r#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic**:\r#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic***_:\r\r#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic**\r#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic**:\r#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic***_:\r\r#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic**\r#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic**:\r#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic***_:\r\r#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic**\r#123456789","shell_refs":"123456789"}
+{"body":"**Epic**:\r#123456789","shell_refs":"123456789"}
+{"body":"**Epic***_:\r\r#123456789","shell_refs":"123456789"}
+{"body":"**Epic**\u000b#0","shell_refs":"0"}
+{"body":"**Epic**:\u000b#0","shell_refs":"0"}
+{"body":"**Epic***_:\u000b\u000b#0","shell_refs":"0"}
+{"body":"**Epic**\u000b#5","shell_refs":"5"}
+{"body":"**Epic**:\u000b#5","shell_refs":"5"}
+{"body":"**Epic***_:\u000b\u000b#5","shell_refs":"5"}
+{"body":"**Epic**\u000b#007","shell_refs":"007"}
+{"body":"**Epic**:\u000b#007","shell_refs":"007"}
+{"body":"**Epic***_:\u000b\u000b#007","shell_refs":"007"}
+{"body":"**Epic**\u000b#0000","shell_refs":"0000"}
+{"body":"**Epic**:\u000b#0000","shell_refs":"0000"}
+{"body":"**Epic***_:\u000b\u000b#0000","shell_refs":"0000"}
+{"body":"**Epic**\u000b#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic**:\u000b#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic***_:\u000b\u000b#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic**\u000b#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic**:\u000b#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic***_:\u000b\u000b#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic**\u000b#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic**:\u000b#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic***_:\u000b\u000b#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic**\u000b#123456789","shell_refs":"123456789"}
+{"body":"**Epic**:\u000b#123456789","shell_refs":"123456789"}
+{"body":"**Epic***_:\u000b\u000b#123456789","shell_refs":"123456789"}
+{"body":"**Epic**\f#0","shell_refs":"0"}
+{"body":"**Epic**:\f#0","shell_refs":"0"}
+{"body":"**Epic***_:\f\f#0","shell_refs":"0"}
+{"body":"**Epic**\f#5","shell_refs":"5"}
+{"body":"**Epic**:\f#5","shell_refs":"5"}
+{"body":"**Epic***_:\f\f#5","shell_refs":"5"}
+{"body":"**Epic**\f#007","shell_refs":"007"}
+{"body":"**Epic**:\f#007","shell_refs":"007"}
+{"body":"**Epic***_:\f\f#007","shell_refs":"007"}
+{"body":"**Epic**\f#0000","shell_refs":"0000"}
+{"body":"**Epic**:\f#0000","shell_refs":"0000"}
+{"body":"**Epic***_:\f\f#0000","shell_refs":"0000"}
+{"body":"**Epic**\f#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic**:\f#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic***_:\f\f#18446744073709551615","shell_refs":"18446744073709551615"}
+{"body":"**Epic**\f#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic**:\f#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic***_:\f\f#18446744073709551616","shell_refs":"18446744073709551616"}
+{"body":"**Epic**\f#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic**:\f#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic***_:\f\f#99999999999999999999999999","shell_refs":"99999999999999999999999999"}
+{"body":"**Epic**\f#123456789","shell_refs":"123456789"}
+{"body":"**Epic**:\f#123456789","shell_refs":"123456789"}
+{"body":"**Epic***_:\f\f#123456789","shell_refs":"123456789"}
+{"body":"**Epic** #0","shell_refs":""}
+{"body":"**Epic**: #0","shell_refs":""}
+{"body":"**Epic***_:  #0","shell_refs":""}
+{"body":"**Epic** #5","shell_refs":""}
+{"body":"**Epic**: #5","shell_refs":""}
+{"body":"**Epic***_:  #5","shell_refs":""}
+{"body":"**Epic** #007","shell_refs":""}
+{"body":"**Epic**: #007","shell_refs":""}
+{"body":"**Epic***_:  #007","shell_refs":""}
+{"body":"**Epic** #0000","shell_refs":""}
+{"body":"**Epic**: #0000","shell_refs":""}
+{"body":"**Epic***_:  #0000","shell_refs":""}
+{"body":"**Epic** #18446744073709551615","shell_refs":""}
+{"body":"**Epic**: #18446744073709551615","shell_refs":""}
+{"body":"**Epic***_:  #18446744073709551615","shell_refs":""}
+{"body":"**Epic** #18446744073709551616","shell_refs":""}
+{"body":"**Epic**: #18446744073709551616","shell_refs":""}
+{"body":"**Epic***_:  #18446744073709551616","shell_refs":""}
+{"body":"**Epic** #99999999999999999999999999","shell_refs":""}
+{"body":"**Epic**: #99999999999999999999999999","shell_refs":""}
+{"body":"**Epic***_:  #99999999999999999999999999","shell_refs":""}
+{"body":"**Epic** #123456789","shell_refs":""}
+{"body":"**Epic**: #123456789","shell_refs":""}
+{"body":"**Epic***_:  #123456789","shell_refs":""}
+{"body":"Blocking #42","shell_refs":""}
+{"body":"Required #42","shell_refs":""}
+{"body":"epic #42","shell_refs":""}
+{"body":"**epic** #42","shell_refs":""}
+{"body":"Depends #42","shell_refs":""}
+{"body":"block by #42","shell_refs":""}
+{"body":"BLOCKED BY #42","shell_refs":""}
+{"body":"Depend on #42","shell_refs":""}
+{"body":"*Epic* #42","shell_refs":""}
+{"body":"Blockedby #42","shell_refs":""}
+{"body":"See dependencies below #42","shell_refs":""}
+{"body":"Epic #42","shell_refs":""}
+{"body":"Blocked #42","shell_refs":""}
+{"body":"blocked by #42","shell_refs":""}
+{"body":"requires #42","shell_refs":""}
+{"body":"DEPENDS ON #42","shell_refs":""}
+{"body":"**epic # #42","shell_refs":""}
+{"body":"Blocked-by #42","shell_refs":""}
+{"body":"Depends_on #42","shell_refs":""}
+{"body":"Requires: #42","shell_refs":"42"}
+{"body":"Blocked by #10 Depends on #9 Requires #9","shell_refs":"9 10"}
+{"body":"Blocked by #10\nDepends on #9\nRequires #9","shell_refs":"9 10"}
+{"body":"Blocked by #10\u000bDepends on #9\u000bRequires #9","shell_refs":"9 10"}
+{"body":"Blocked by #10 Depends on #9 Requires #9","shell_refs":"9 10"}
+{"body":"Requires #0 and Depends on #007 and Blocked by #7","shell_refs":"0 007"}
+{"body":"Requires #0\nand Depends on #007\nand Blocked by #7","shell_refs":"0 007"}
+{"body":"Requires #0\u000band Depends on #007\u000band Blocked by #7","shell_refs":"0 007"}
+{"body":"Requires #0 and Depends on #007 and Blocked by #7","shell_refs":"0 007"}
+{"body":"**Epic** #18446744073709551615 Blocked by #18446744073709551616","shell_refs":"18446744073709551615 18446744073709551616"}
+{"body":"**Epic**\n#18446744073709551615\nBlocked by\n#18446744073709551616","shell_refs":""}
+{"body":"**Epic**\u000b#18446744073709551615\u000bBlocked by\u000b#18446744073709551616","shell_refs":"18446744073709551615 18446744073709551616"}
+{"body":"**Epic** #18446744073709551615 Blocked by #18446744073709551616","shell_refs":""}
+{"body":"Depends on #1 Depends on #01 Depends on #001","shell_refs":"1"}
+{"body":"Depends on #1\nDepends on #01\nDepends on #001","shell_refs":"1"}
+{"body":"Depends on #1\u000bDepends on #01\u000bDepends on #001","shell_refs":"1"}
+{"body":"Depends on #1 Depends on #01 Depends on #001","shell_refs":"1"}
+{"body":"Blocked by #5 unrelated text Requires #5 Requires #6","shell_refs":"5 6"}
+{"body":"Blocked by #5\nunrelated text\nRequires #5\nRequires #6","shell_refs":"5 6"}
+{"body":"Blocked by #5\u000bunrelated text\u000bRequires #5\u000bRequires #6","shell_refs":"5 6"}
+{"body":"Blocked by #5 unrelated text Requires #5 Requires #6","shell_refs":"5 6"}
+{"body":"Requires #18446744073709551616 Requires #18446744073709551615 Requires #7","shell_refs":"7 18446744073709551615 18446744073709551616"}
+{"body":"Requires #18446744073709551616\nRequires #18446744073709551615\nRequires #7","shell_refs":"7 18446744073709551615 18446744073709551616"}
+{"body":"Requires #18446744073709551616\u000bRequires #18446744073709551615\u000bRequires #7","shell_refs":"7 18446744073709551615 18446744073709551616"}
+{"body":"Requires #18446744073709551616 Requires #18446744073709551615 Requires #7","shell_refs":"7 18446744073709551615 18446744073709551616"}
+{"body":"Blocked by #0000 Depends on #0 Requires #00","shell_refs":"0000"}
+{"body":"Blocked by #0000\nDepends on #0\nRequires #00","shell_refs":"0000"}
+{"body":"Blocked by #0000\u000bDepends on #0\u000bRequires #00","shell_refs":"0000"}
+{"body":"Blocked by #0000 Depends on #0 Requires #00","shell_refs":"0000"}
+{"body":"**Epic** #99999999999999999999999999 Blocked by #1 Depends on #1","shell_refs":"1 99999999999999999999999999"}
+{"body":"**Epic** #99999999999999999999999999\nBlocked by #1\nDepends on #1","shell_refs":"1 99999999999999999999999999"}
+{"body":"**Epic** #99999999999999999999999999\u000bBlocked by #1\u000bDepends on #1","shell_refs":"1 99999999999999999999999999"}
+{"body":"**Epic** #99999999999999999999999999 Blocked by #1 Depends on #1","shell_refs":"1 99999999999999999999999999"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"loom-bot","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"app/loom-bot","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/LOOM-BOT","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"Loom-Bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"LOOM-BOT"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"app/loom-bot"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"loom-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"APP/LOOM-BOT[BOT]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"alice"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":"some-other-bot[bot]"},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"77"}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"Requires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5 77"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:dep-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"See the discussion below.","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":""}
+{"body":"Blocked by #5","comments":[{"author":{"login":""},"body":"<!-- curator:operator-premise-recheck:abc -->\nRequires #77"}],"bot_login":"app/loom-bot[bot]","shell_refs":"5"}
+{"body":"Blocked by #3","comments":[{"author":{"login":"loom-bot"},"body":"Requires #999"},{"author":{"login":"a-human"},"body":"Depends on #12"}],"bot_login":"loom-bot","shell_refs":"3 12"}
+{"body":"**Epic** #1","comments":[{"author":{"login":"a-human"},"body":"<!-- curator:dep-recheck:x -->\nDepends on #55"},{"author":{"login":"a-human"},"body":"Requires #61"},{"author":{"login":"app/loom-bot"},"body":"Blocked by #62"}],"bot_login":"loom-bot","shell_refs":"1 61"}
+{"body":"Requires #8","comments":[{"author":{"login":"alice"},"body":"Blocked by #008"}],"bot_login":"loom-bot","shell_refs":"8"}
+{"body":"Nothing here yet. Requires","comments":[{"author":{"login":"alice"},"body":"#33"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Depends on","comments":[{"author":{"login":"loom-bot"},"body":"#999"},{"author":{"login":"a-human"},"body":"#14"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Blocked by #3","comments":[{"author":{"login":"loom-bot"},"body":"Requires #999"},{"author":{"login":"a-human"},"body":"Depends on #12"}],"bot_login":"app/loom-bot","shell_refs":"3 12 999"}
+{"body":"**Epic** #1","comments":[{"author":{"login":"a-human"},"body":"<!-- curator:dep-recheck:x -->\nDepends on #55"},{"author":{"login":"a-human"},"body":"Requires #61"},{"author":{"login":"app/loom-bot"},"body":"Blocked by #62"}],"bot_login":"app/loom-bot","shell_refs":"1 61 62"}
+{"body":"Requires #8","comments":[{"author":{"login":"alice"},"body":"Blocked by #008"}],"bot_login":"app/loom-bot","shell_refs":"8"}
+{"body":"Nothing here yet. Requires","comments":[{"author":{"login":"alice"},"body":"#33"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Depends on","comments":[{"author":{"login":"loom-bot"},"body":"#999"},{"author":{"login":"a-human"},"body":"#14"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Blocked by #3","comments":[{"author":{"login":"loom-bot"},"body":"Requires #999"},{"author":{"login":"a-human"},"body":"Depends on #12"}],"bot_login":"Loom-Bot[bot]","shell_refs":"3 12 999"}
+{"body":"**Epic** #1","comments":[{"author":{"login":"a-human"},"body":"<!-- curator:dep-recheck:x -->\nDepends on #55"},{"author":{"login":"a-human"},"body":"Requires #61"},{"author":{"login":"app/loom-bot"},"body":"Blocked by #62"}],"bot_login":"Loom-Bot[bot]","shell_refs":"1 61 62"}
+{"body":"Requires #8","comments":[{"author":{"login":"alice"},"body":"Blocked by #008"}],"bot_login":"Loom-Bot[bot]","shell_refs":"8"}
+{"body":"Nothing here yet. Requires","comments":[{"author":{"login":"alice"},"body":"#33"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"Depends on","comments":[{"author":{"login":"loom-bot"},"body":"#999"},{"author":{"login":"a-human"},"body":"#14"}],"bot_login":"Loom-Bot[bot]","shell_refs":""}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires #91"}],"bot_login":"loom-bot","shell_refs":"91"}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by #91"}],"bot_login":"loom-bot","shell_refs":"2"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires #91"},{"author":{"login":"app/loom-bot"},"body":"Depends on #92"}],"bot_login":"loom-bot","shell_refs":"91"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\n#91"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by\n#91"}],"bot_login":"loom-bot","shell_refs":"2"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\n#91"},{"author":{"login":"app/loom-bot"},"body":"Depends on\n#92"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\t#91"}],"bot_login":"loom-bot","shell_refs":"91"}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by\t#91"}],"bot_login":"loom-bot","shell_refs":"2"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\t#91"},{"author":{"login":"app/loom-bot"},"body":"Depends on\t#92"}],"bot_login":"loom-bot","shell_refs":"91"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\r#91"}],"bot_login":"loom-bot","shell_refs":"91"}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by\r#91"}],"bot_login":"loom-bot","shell_refs":"2"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\r#91"},{"author":{"login":"app/loom-bot"},"body":"Depends on\r#92"}],"bot_login":"loom-bot","shell_refs":"91"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\u000b#91"}],"bot_login":"loom-bot","shell_refs":"91"}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by\u000b#91"}],"bot_login":"loom-bot","shell_refs":"2"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\u000b#91"},{"author":{"login":"app/loom-bot"},"body":"Depends on\u000b#92"}],"bot_login":"loom-bot","shell_refs":"91"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\f#91"}],"bot_login":"loom-bot","shell_refs":"91"}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by\f#91"}],"bot_login":"loom-bot","shell_refs":"2"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\f#91"},{"author":{"login":"app/loom-bot"},"body":"Depends on\f#92"}],"bot_login":"loom-bot","shell_refs":"91"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires #91"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by #91"}],"bot_login":"loom-bot","shell_refs":"2"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires #91"},{"author":{"login":"app/loom-bot"},"body":"Depends on #92"}],"bot_login":"loom-bot","shell_refs":""}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires #91"}],"bot_login":"app/loom-bot","shell_refs":"91"}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by #91"}],"bot_login":"app/loom-bot","shell_refs":"2 91"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires #91"},{"author":{"login":"app/loom-bot"},"body":"Depends on #92"}],"bot_login":"app/loom-bot","shell_refs":"91 92"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\n#91"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by\n#91"}],"bot_login":"app/loom-bot","shell_refs":"2"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\n#91"},{"author":{"login":"app/loom-bot"},"body":"Depends on\n#92"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\t#91"}],"bot_login":"app/loom-bot","shell_refs":"91"}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by\t#91"}],"bot_login":"app/loom-bot","shell_refs":"2 91"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\t#91"},{"author":{"login":"app/loom-bot"},"body":"Depends on\t#92"}],"bot_login":"app/loom-bot","shell_refs":"91 92"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\r#91"}],"bot_login":"app/loom-bot","shell_refs":"91"}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by\r#91"}],"bot_login":"app/loom-bot","shell_refs":"2 91"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\r#91"},{"author":{"login":"app/loom-bot"},"body":"Depends on\r#92"}],"bot_login":"app/loom-bot","shell_refs":"91 92"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\u000b#91"}],"bot_login":"app/loom-bot","shell_refs":"91"}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by\u000b#91"}],"bot_login":"app/loom-bot","shell_refs":"2 91"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\u000b#91"},{"author":{"login":"app/loom-bot"},"body":"Depends on\u000b#92"}],"bot_login":"app/loom-bot","shell_refs":"91 92"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\f#91"}],"bot_login":"app/loom-bot","shell_refs":"91"}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by\f#91"}],"bot_login":"app/loom-bot","shell_refs":"2 91"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires\f#91"},{"author":{"login":"app/loom-bot"},"body":"Depends on\f#92"}],"bot_login":"app/loom-bot","shell_refs":"91 92"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires #91"}],"bot_login":"app/loom-bot","shell_refs":""}
+{"body":"Depends on #2","comments":[{"author":{"login":"loom-bot"},"body":"Blocked by #91"}],"bot_login":"app/loom-bot","shell_refs":"2"}
+{"body":"unrelated","comments":[{"author":{"login":"a-human"},"body":"Requires #91"},{"author":{"login":"app/loom-bot"},"body":"Depends on #92"}],"bot_login":"app/loom-bot","shell_refs":""}

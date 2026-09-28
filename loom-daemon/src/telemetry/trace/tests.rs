@@ -5,6 +5,17 @@ use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 use chrono::Utc;
 
 #[test]
+fn dispatch_disposition_span_name_round_trips_next_to_admission() {
+    for name in [SpanName::DispatchAdmission, SpanName::DispatchDisposition] {
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, format!("\"{}\"", name.as_str()));
+        let back: SpanName = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.as_str(), name.as_str());
+    }
+    assert_eq!(SpanName::DispatchDisposition.as_str(), "loom.dispatch.disposition");
+}
+
+#[test]
 fn context_roundtrip_rejects_zero_uppercase_and_future_versions() {
     let context = TraceContext::root(true);
     assert_eq!(TraceContext::parse(&context.traceparent()).unwrap(), context);
@@ -27,7 +38,10 @@ fn context_roundtrip_rejects_zero_uppercase_and_future_versions() {
     assert!(!TraceContext::root(false).child().sampled());
 }
 
+// `#[serial]`: the repo key reads the process-global `LOOM_REPO`, which
+// other `#[serial]` tests set.
 #[test]
+#[serial_test::serial]
 fn persistent_context_is_stable_across_reopen_and_distinct_per_execution_repo() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
@@ -53,16 +67,95 @@ fn persistent_context_is_stable_across_reopen_and_distinct_per_execution_repo() 
     assert_eq!(TraceStore::load(&store.path(a.path(), "issue-18-attempt-1")).unwrap(), first);
 }
 
+/// 2AMLogic/2am `infra/ops/internal/storyid/testdata/vectors.json`, copied
+/// verbatim: the cross-language D32 v1 conformance vectors (#9068, #9223).
+const D32_VECTORS: &str = include_str!("../../../tests/fixtures/story_vectors_d32_v1.json");
+
 #[test]
-fn story_context_is_derived_from_the_issue_alone() {
-    let story = story_context("rjwalters/loom", 9038);
-    // Pinned: every host and process must derive these exact ids.
-    assert_eq!(story.trace_id.as_str(), "e1e4b5921c2ac3c23233edba66f527ee");
-    assert_eq!(story.span_id.as_str(), "d41653e717749d2b");
+fn story_ids_match_every_d32_v1_reference_vector() {
+    let fixture: serde_json::Value = serde_json::from_str(D32_VECTORS).unwrap();
+    let number = |v: &serde_json::Value| u32::try_from(v["number"].as_u64().unwrap()).unwrap();
+    let vectors = fixture["vectors"].as_array().unwrap();
+    assert_eq!(vectors.len(), 3);
+    for v in vectors {
+        let repo_id = v["repo_id"].as_u64().unwrap();
+        assert_eq!(story_input(repo_id, number(v)), v["input"].as_str().unwrap());
+        let story = story_context(repo_id, number(v)).unwrap();
+        assert_eq!(story.trace_id.as_str(), v["trace_id"].as_str().unwrap(), "{}", v["story"]);
+        assert_eq!(story.span_id.as_str(), v["root_span"].as_str().unwrap(), "{}", v["story"]);
+        // Sampled, W3C random flag unset.
+        assert_eq!(story.flags, 1);
+    }
+    let spans = fixture["span_vectors"].as_array().unwrap();
+    assert_eq!(spans.len(), 10);
+    for v in spans {
+        let span = story_span_id(
+            v["repo_id"].as_u64().unwrap(),
+            number(v),
+            v["kind"].as_str().unwrap(),
+            v["source_event_id"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(span.as_str(), v["span_id"].as_str().unwrap(), "{}", v["story"]);
+    }
+    let kinds: Vec<&str> = fixture["span_kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, STORY_SPAN_KINDS);
+    // Every kind is pinned by at least one cross-language span vector, so a
+    // kind cannot join the allowlist with an unchecked derivation.
+    for kind in STORY_SPAN_KINDS {
+        assert!(spans.iter().any(|v| v["kind"] == kind), "no span vector for {kind}");
+    }
+    assert_eq!(fixture["source_event_id_pattern"], "^[A-Za-z0-9._-]{1,256}$");
+}
+
+#[test]
+fn story_context_is_keyed_on_repo_id_not_name() {
+    // rjwalters/loom#9027 (repo_id 1073994527), pinned from D32's table.
+    let story = story_context(1_073_994_527, 9027).unwrap();
+    assert_eq!(story.trace_id.as_str(), "4e99cc89953fb6bd604a06896b83dc81");
+    assert_eq!(story.span_id.as_str(), "9bf80a36c4f1c38f");
     assert!(story.sampled());
-    assert_eq!(story_context(" RJWalters/Loom ", 9038), story);
-    assert_ne!(story_context("rjwalters/loom", 9039).trace_id, story.trace_id);
-    assert_ne!(story_context("rjwalters/other", 9038).trace_id, story.trace_id);
+    assert_ne!(story_context(1_073_994_527, 9028).unwrap().trace_id, story.trace_id);
+    assert_ne!(story_context(1_073_994_528, 9027).unwrap().trace_id, story.trace_id);
+    // The pre-#9068 name-derived key (NUL-joined `loom.story.trace`) is gone.
+    assert_ne!(
+        story.trace_id,
+        TraceId::derived(&["loom.story.trace", "rjwalters/loom", "9027"])
+    );
+}
+
+#[test]
+fn story_span_id_refuses_what_d32_refuses() {
+    let ok = |kind: &str, event: &str| story_span_id(1, 1, kind, event);
+    assert!(ok("story.merge", "a.B_c-9").is_ok());
+    assert!(ok("story.merge", &"x".repeat(256)).is_ok());
+    for kind in STORY_SPAN_KINDS {
+        assert!(ok(kind, "1").is_ok(), "{kind:?}");
+    }
+    for kind in [
+        "loom.story",
+        "ci.run",
+        "story.Merge",
+        "story.merge ",
+        "",
+        "story.Rework",
+        "story.rework ",
+        "story.operator-hold",
+        "story.operator_hold ",
+        "story.doctor",
+        "story.ci.",
+    ] {
+        assert_eq!(ok(kind, "1"), Err(StoryIdError::UnknownKind), "{kind:?}");
+    }
+    let too_long = "x".repeat(257);
+    for event in ["", "a:b", "a b", "é", "a/b", too_long.as_str()] {
+        assert_eq!(ok("story.merge", event), Err(StoryIdError::InvalidEventId), "{event:?}");
+    }
 }
 
 #[test]
@@ -81,7 +174,7 @@ fn derived_ci_ids_are_unchanged_by_the_shared_derivation() {
 fn story_executions_share_the_story_trace_with_distinct_roots() {
     let dir = tempfile::tempdir().unwrap();
     let store = TraceStore::new(dir.path());
-    let story = story_context("rjwalters/loom", 9038);
+    let story = story_context(1_073_994_527, 9038).unwrap();
     let first = store
         .load_or_create_story(dir.path(), "sweep-1", Some(&story))
         .unwrap();
@@ -234,4 +327,69 @@ fn terminal_context_is_retained_when_durable_queue_offer_fails() {
         vec![envelope]
     );
     assert!(!store.path(dir.path(), "pending").exists());
+}
+
+#[test]
+fn derived_ids_are_deterministic_keyed_and_valid() {
+    let a = TraceContext::derived("execution", &["rjwalters/loom", "sweep-issue-42-1790000000"]);
+    assert_eq!(
+        a,
+        TraceContext::derived("execution", &["rjwalters/loom", "sweep-issue-42-1790000000"])
+    );
+    assert!(a.sampled());
+    assert_eq!(TraceContext::parse(&a.traceparent()).unwrap(), a);
+    // Any key part, and the part boundaries themselves, change the identity.
+    for other in [
+        TraceContext::derived("execution", &["rjwalters/loom", "sweep-issue-42-1790000001"]),
+        TraceContext::derived("execution", &["other/loom", "sweep-issue-42-1790000000"]),
+        TraceContext::derived("execution", &["rjwalters/loomsweep-issue-42-1790000000"]),
+        TraceContext::derived("dispatch", &["rjwalters/loom", "sweep-issue-42-1790000000"]),
+    ] {
+        assert_ne!(other.trace_id, a.trace_id);
+    }
+
+    let at = Utc::now();
+    let child = a.child_at("loom.phase", at);
+    assert_eq!(child.trace_id, a.trace_id);
+    assert_ne!(child.span_id, a.span_id);
+    assert_eq!(child, a.child_at("loom.phase", at));
+    assert_ne!(child, a.child_at("loom.role.attempt", at));
+    assert_ne!(child, a.child_at("loom.phase", at + chrono::Duration::nanoseconds(1)));
+}
+
+#[test]
+fn execution_root_is_derived_from_repo_and_sweep_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TraceStore::new(dir.path());
+    let saved = store.load_or_create(dir.path(), "sweep-issue-7-1").unwrap();
+    assert_eq!(saved.context, TraceStore::root_context(dir.path(), "sweep-issue-7-1", None));
+    store.complete(dir.path(), "sweep-issue-7-1").unwrap();
+    assert_eq!(
+        store
+            .load_or_create(dir.path(), "sweep-issue-7-1")
+            .unwrap()
+            .context,
+        saved.context,
+        "recreating the execution recomputes the same trace"
+    );
+}
+
+#[test]
+fn story_execution_span_is_derived_from_the_story_and_sweep_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let story = story_context(1_073_994_527, 42).unwrap();
+    let store = TraceStore::new(dir.path());
+    let saved = store
+        .load_or_create_story(dir.path(), "sweep-issue-42-1", Some(&story))
+        .unwrap();
+    assert_eq!(saved.context.trace_id, story.trace_id);
+    assert_eq!(
+        saved.context,
+        TraceStore::root_context(dir.path(), "sweep-issue-42-1", Some(&story))
+    );
+    assert_ne!(
+        saved.context,
+        TraceStore::root_context(dir.path(), "sweep-issue-42-2", Some(&story)),
+        "a retry is a distinct sibling in the same story"
+    );
 }

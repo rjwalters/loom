@@ -223,8 +223,7 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
     control::audit_args(&command)?;
     let role = std::env::var("LOOM_ROLE").unwrap_or_default();
     if !role.is_empty() {
-        crate::runtime_admission::resolve_and_admit(Path::new(REPO), &role, Some("codex"))
-            .map_err(|e| anyhow::anyhow!(e.diagnostic()))?;
+        admit_role(&role)?;
     }
     let (bin, args) = command.split_first().context("private command missing")?;
     let mut child = Command::new(bin);
@@ -236,6 +235,47 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
     control_boundary(&mut child)?;
     let error = child.exec();
     Err(error.into())
+}
+
+/// The worker's own, independent admission of the role it is about to exec —
+/// deliberately a repeat of the host's, taken from inside the container where
+/// the clone's real manifests live.
+///
+/// Static admission is asked first and unchanged. Only a rejection that
+/// verified private-clone containment could satisfy (#8787) — Codex, with
+/// repository isolation as the SOLE unmet requirement — is retried against a
+/// proof built here from the host-bound control identity plus the running
+/// boundary. Everything else still fails closed with its original diagnostic,
+/// and a containment refusal names the precise obligation that was not met.
+fn admit_role(role: &str) -> Result<()> {
+    let rejection =
+        match crate::runtime_admission::resolve_and_admit(Path::new(REPO), role, Some("codex")) {
+            Ok(_) => return Ok(()),
+            Err(rejection) if rejection.containment_eligible() => rejection,
+            Err(rejection) => bail!("{}", rejection.diagnostic()),
+        };
+    // The transport wrote both of these onto this container process with
+    // `docker exec --env`, from the host-owned lease, after re-validating the
+    // container by ID. A worker cannot write its own process environment
+    // before it is created, and neither value is read from the writable clone.
+    let bound = std::env::var("LOOM_PRIVATE_CONTROL").unwrap_or_default();
+    let revision = std::env::var("LOOM_PRIVATE_BASE_REVISION").unwrap_or_default();
+    let account = std::env::var("LOOM_ACCOUNT_NAME").unwrap_or_default();
+    let proof = containment::in_container(&account, &bound, &revision).map_err(|error| {
+        anyhow::anyhow!(
+            "{}",
+            rejection
+                .clone()
+                .with_containment_failure(&error.to_string())
+                .diagnostic()
+        )
+    })?;
+    let admitted = containment::admit_with(Path::new(REPO), role, Some("codex"), &proof)
+        .map_err(|e| anyhow::anyhow!(e.diagnostic()))?;
+    if let Some(execution) = &admitted.execution {
+        eprintln!("{}{}", crate::runtime_admission::CONTAINMENT_LOG_MARKER, execution.summary());
+    }
+    Ok(())
 }
 
 /// Recheck the bound control identity in-container and force the pinned policy.

@@ -1,5 +1,5 @@
 //! `loom-daemon ci-telemetry` (Issue #8824) — GitHub Actions run/job
-//! telemetry for one forge org. Reached through the flattened
+//! telemetry for the configured forge owners (orgs and users, #9188). Reached through the flattened
 //! [`super::telemetry::TelemetryCommand`], so it is top-level.
 //!
 //! The logic lives in [`loom_daemon::ci_telemetry`]; this file is argument
@@ -19,9 +19,11 @@ use loom_daemon::ci_telemetry::{
 /// (`EX_TEMPFAIL`).
 pub(crate) const EXIT_TEMPFAIL: i32 = 75;
 
-/// Capture GitHub Actions runs/jobs of an org as telemetry (phase 1, #8824).
+/// Capture GitHub Actions runs/jobs of orgs and users as telemetry (#8824).
 ///
-/// `--once` runs one poll cycle: discovers the org's repos (ETag-cached),
+/// `--once` runs one poll cycle: discovers each configured owner's repos
+/// (`autonomous.ciTelemetry.owners`; orgs and user accounts, #9188;
+/// ETag-cached),
 /// lists each repo's runs created since its watermark, and for every
 /// completed, not-yet-recorded run attempt records one `ci.run` plus one
 /// `ci.job` per job — each exactly once, ever (the ledger at
@@ -39,7 +41,7 @@ pub(crate) const EXIT_TEMPFAIL: i32 = 75;
 /// capped per job by `logCaptureMaxBytes` (default 5 MiB) and redacted at the
 /// OTLP gateway, not here.
 ///
-/// `status` reports ledger size, per-repo watermarks, records
+/// `status` reports each owner (kind, repo count), ledger size, per-repo watermarks, records
 /// emitted/exported, log capture (done/pending/failed per repo, last fetch
 /// age), and health: never-polled / ok (+age) / stale / failing (+last error).
 ///
@@ -52,12 +54,19 @@ pub(crate) struct CiTelemetryArgs {
     #[command(subcommand)]
     action: Option<CiTelemetryAction>,
 
-    /// Run exactly one poll cycle over the configured org, then exit.
+    /// Run exactly one poll cycle over the configured owners, then exit.
     #[arg(long)]
     once: bool,
 
-    /// Org to poll for this run (default: `autonomous.ciTelemetry.org`,
-    /// `$LOOM_CI_TELEMETRY_ORG`, else `2amlogic`).
+    /// Owner (org or user; kind probed via `GET /users/{owner}`) to poll for
+    /// this run; repeatable. Default: `autonomous.ciTelemetry.owners` /
+    /// `$LOOM_CI_TELEMETRY_OWNERS`, else the deprecated `org` alias, else
+    /// `2amlogic`.
+    #[arg(long = "owner", value_name = "OWNER", conflicts_with = "org")]
+    owners: Vec<String>,
+
+    /// Deprecated single-owner alias of `--owner`: an organization to poll
+    /// for this run (not probed — always discovered as an org).
     #[arg(long, value_name = "ORG")]
     org: Option<String>,
 
@@ -100,7 +109,19 @@ impl CiTelemetryArgs {
             }
             None if self.once => {
                 let root = resolve_root(self.workspace.as_deref())?;
-                std::process::exit(once(&root, self.org));
+                let owners = if let Some(org) = self.org {
+                    Some(vec![ci_telemetry::owners::Owner::org(&org)])
+                } else {
+                    let logins =
+                        ci_telemetry::owners::parse_logins(self.owners.iter().map(String::as_str));
+                    (!logins.is_empty()).then(|| {
+                        logins
+                            .iter()
+                            .map(|l| ci_telemetry::owners::Owner::probed(l))
+                            .collect()
+                    })
+                };
+                std::process::exit(once(&root, owners));
             }
             None => Err(anyhow!(
                 "nothing to do: pass --once to run one poll cycle, or `status` (see --help)"
@@ -109,11 +130,12 @@ impl CiTelemetryArgs {
     }
 }
 
-fn once(root: &Path, org: Option<String>) -> i32 {
+fn once(root: &Path, owners: Option<Vec<ci_telemetry::owners::Owner>>) -> i32 {
     let mut resolved = ci_telemetry::resolve(&ci_telemetry::read_config(root));
-    if let Some(org) = org {
-        resolved.org = org;
+    if let Some(owners) = owners {
+        resolved.owners = owners;
     }
+    let owners = ci_telemetry::owner_logins(&resolved.owners);
     for refusal in &resolved.refused_exclusions {
         eprintln!(
             "ci-telemetry: warning — excludedRepos entry {refusal} (the repo is still polled)"
@@ -122,11 +144,11 @@ fn once(root: &Path, org: Option<String>) -> i32 {
     let ctx = poll::CycleContext::new(root, &resolved);
     match poll::run_cycle(&ctx, &GhCliApi::from_env()) {
         Ok(report) if report.repo_errors.is_empty() => {
-            println!("ci-telemetry: ok — org {}: {}", resolved.org, report.summary());
+            println!("ci-telemetry: ok — owners {owners}: {}", report.summary());
             0
         }
         Ok(report) => {
-            eprintln!("ci-telemetry: failed — org {}: {}", resolved.org, report.summary());
+            eprintln!("ci-telemetry: failed — owners {owners}: {}", report.summary());
             1
         }
         Err(
@@ -158,6 +180,7 @@ fn status(root: &Path, json: bool) -> Result<()> {
     let log_counts = ledger.log_counts();
     let log_counts_by_repo = ledger.log_counts_by_repo();
     let last_log_failure = ledger.last_log_failure();
+    let owners = owner_rows(&resolved, &poll_status);
     let last_log_fetch_age = poll_status
         .last_log_fetch_at
         .map(|at| (Utc::now() - at).num_seconds().max(0));
@@ -195,7 +218,12 @@ fn status(root: &Path, json: bool) -> Result<()> {
     };
     if json {
         let value = serde_json::json!({
-            "org": resolved.org,
+            // Deprecated alias of `owners` (#9188): the comma-joined logins,
+            // exactly as `status.json` (`PollStatus::org`) already writes —
+            // #9197 item 1, dropped when `owners`/`owners_source` replaced it.
+            "org": poll_status.org,
+            "owners": owners,
+            "owners_source": resolved.owners_source,
             "daemon_poller_enabled": resolved.enabled,
             "interval_secs": resolved.interval_secs,
             "log_capture": {
@@ -245,7 +273,14 @@ fn status(root: &Path, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
-    println!("ci-telemetry — org {}", resolved.org);
+    println!(
+        "ci-telemetry — owners {} (from {})",
+        ci_telemetry::owner_logins(&resolved.owners),
+        resolved.owners_source
+    );
+    for row in &owners {
+        println!("  owner:          {}", owner_line(row));
+    }
     let health_line = match &health {
         state::Health::NeverPolled => "never polled on this host".to_string(),
         state::Health::Ok { age_secs } => format!("ok — last successful poll {age_secs}s ago"),
@@ -356,4 +391,43 @@ fn status(root: &Path, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One `status` owner row: the resolved owner joined with the last cycle's
+/// outcome for it (#9188). Kind and repo count are `null` until a cycle has
+/// resolved/discovered the owner.
+fn owner_rows(
+    resolved: &ci_telemetry::ResolvedCiTelemetry,
+    status: &state::PollStatus,
+) -> Vec<serde_json::Value> {
+    resolved
+        .owners
+        .iter()
+        .map(|owner| {
+            let last = status
+                .owners
+                .iter()
+                .find(|row| row.owner.eq_ignore_ascii_case(&owner.login));
+            serde_json::json!({
+                "owner": owner.login,
+                "kind": last.and_then(|row| row.kind).or(owner.declared).map(|k| k.as_str()),
+                "kind_declared": owner.declared.is_some(),
+                "repos": last.and_then(|row| row.repos),
+                "error": last.and_then(|row| row.error.clone()),
+            })
+        })
+        .collect()
+}
+
+/// `2amlogic — organization, 12 repo(s)` (text form of an [`owner_rows`] row).
+fn owner_line(row: &serde_json::Value) -> String {
+    let kind = row["kind"].as_str().unwrap_or("kind not yet resolved");
+    let repos = row["repos"]
+        .as_u64()
+        .map_or_else(|| "repos not yet discovered".to_string(), |n| format!("{n} repo(s)"));
+    let mut line = format!("{} — {kind}, {repos}", row["owner"].as_str().unwrap_or_default());
+    if let Some(error) = row["error"].as_str() {
+        line.push_str(&format!("; SKIPPED last cycle: {error}"));
+    }
+    line
 }

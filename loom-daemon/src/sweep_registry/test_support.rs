@@ -49,13 +49,27 @@ pub(crate) fn fake_gh_graphql_arm(prs: &str, exit_code: i32) -> String {
 /// Unlike `fake_gh_graphql_arm` (which emits the RAW closes-graph payload,
 /// parsed in Rust), the real `gh` invocation here carries `--jq`, so `gh`
 /// itself applies the filter before this fixture would ever see output — the
-/// fixture therefore emits the POST-filter shape directly: `pr` is either a
-/// single bare PR number (an open cross-referenced PR was found) or empty
-/// (none).
+/// fixture therefore emits the POST-filter shape directly: one compact
+/// `{number, body}` candidate object per line (#8940).
+///
+/// `pr` is either a single PR number — synthesized as a **phrase-confirmed**
+/// candidate (`Part of #<issue>`, with the issue number read out of the
+/// timeline path in `$2` so callers need not repeat it), i.e. a genuine open
+/// linked PR — or empty (verified none). Any other value is emitted verbatim,
+/// which is how the unparseable-output leg is still exercised.
+///
+/// For the bare-mention shape (#8940: a candidate that mentions `#<issue>` but
+/// carries no linking phrase, and must therefore NOT count), rewrite this arm's
+/// `Part of #` to a non-phrase prefix — see `guards_union_tests`'
+/// `bare_mention_registry`.
 pub(crate) fn fake_gh_timeline_rest_arm(pr: &str, exit_code: i32) -> String {
     format!(
         "if [[ \"$1\" == \"api\" && \"$*\" == *timeline* ]]; then\n\
-         printf '%s\\n' \"{pr}\"\n\
+         __issue=\"${{2#*/issues/}}\"; __issue=\"${{__issue%/timeline}}\"\n\
+         case \"{pr}\" in\n\
+         ''|*[!0-9]*) printf '%s\\n' \"{pr}\" ;;\n\
+         *) printf '{{\"number\":%s,\"body\":\"Part of #%s\"}}\\n' \"{pr}\" \"$__issue\" ;;\n\
+         esac\n\
          exit {exit_code}\n\
          fi\n"
     )
@@ -555,6 +569,7 @@ pub(crate) fn insert_clean_exit_running(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     registry.children.insert(sweep_id.clone(), child);
@@ -672,6 +687,7 @@ pub(crate) fn insert_running_at(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     sweep_id
@@ -712,6 +728,7 @@ pub(crate) fn insert_running_with_pid_at(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     sweep_id
@@ -776,6 +793,7 @@ pub(crate) fn insert_dead_running_at(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     sweep_id
@@ -1262,6 +1280,7 @@ pub(crate) fn insert_terminal_issue(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 }
@@ -2340,6 +2359,7 @@ pub(crate) fn insert_dead_running_entry(reg: &mut SweepRegistry, issue: u32, swe
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 }

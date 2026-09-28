@@ -103,10 +103,11 @@ rm -rf "$GH_REPO_DIR" "$GH_STUB_DIR"
 
 # ============================================================================
 # GitHub: repo has EVERY merge strategy disabled (degenerate) -- the
-# installer falls back to enabling squash so the repo can merge at all.
+# installer falls back to enabling merge-commit-only (#9105) so the repo
+# can merge at all, preserving full commit history by default.
 # ============================================================================
 echo ""
-echo "=== GitHub: no merge strategy enabled falls back to squash (dry-run) ==="
+echo "=== GitHub: no merge strategy enabled falls back to merge-commit-only (dry-run) ==="
 
 GH_REPO_DIR2="$(make_fake_github_repo)"
 GH_STUB_DIR2="$(mktemp -d)"
@@ -127,8 +128,14 @@ chmod +x "$GH_STUB_DIR2/gh"
 
 gh_dry_output2="$(PATH="$GH_STUB_DIR2:$PATH" bash "$SETUP_SCRIPT" "$GH_REPO_DIR2" --dry-run 2>&1)"
 
-assert_contains "GitHub dry-run proposes the squash fallback when nothing is currently enabled" \
+assert_contains "GitHub dry-run proposes the fallback when nothing is currently enabled" \
   "$gh_dry_output2" "fallback default"
+assert_contains "GitHub dry-run fallback enables merge commits (#9105)" \
+  "$gh_dry_output2" "allow_merge_commit: true"
+assert_contains "GitHub dry-run fallback disables squash" \
+  "$gh_dry_output2" "allow_squash_merge: false"
+assert_not_contains "GitHub dry-run fallback does not enable squash" \
+  "$gh_dry_output2" "allow_squash_merge: true"
 
 rm -rf "$GH_REPO_DIR2" "$GH_STUB_DIR2"
 
@@ -177,6 +184,53 @@ assert_contains "live PATCH body still applies the non-merge-strategy settings (
   "$patch_body" '"delete_branch_on_merge"'
 
 rm -rf "$GH_REPO_DIR3" "$GH_STUB_DIR3"; rm -f "$GH_PATCH_BODY_FILE"
+
+# ============================================================================
+# GitHub: degenerate repo (no strategy enabled) -- the live PATCH enables
+# merge-commit-only, the #9105 fallback (full commit history preserved),
+# instead of the old squash-only force.
+# ============================================================================
+echo ""
+echo "=== GitHub: degenerate repo gets merge-commit-only in the live PATCH payload ==="
+
+GH_REPO_DIR4="$(make_fake_github_repo)"
+GH_STUB_DIR4="$(mktemp -d)"
+GH_PATCH_BODY_FILE4="$(mktemp)"
+cat > "$GH_STUB_DIR4/gh" <<STUB
+#!/usr/bin/env bash
+if [[ "\$*" == *"--jq"*".permissions.admin"* ]]; then
+  echo "true"
+  exit 0
+fi
+if [[ "\$1" == "api" && "\$*" == *"-X PATCH"* ]]; then
+  cat - > "$GH_PATCH_BODY_FILE4"
+  echo '{}'
+  exit 0
+fi
+if [[ "\$1" == "api" ]]; then
+  printf '{"allow_squash_merge":false,"allow_merge_commit":false,"allow_rebase_merge":false}\n'
+  exit 0
+fi
+echo '{}'
+exit 0
+STUB
+chmod +x "$GH_STUB_DIR4/gh"
+
+: > "$GH_PATCH_BODY_FILE4"
+PATH="$GH_STUB_DIR4:$PATH" \
+  bash "$SETUP_SCRIPT" "$GH_REPO_DIR4" >/dev/null 2>&1 || true
+
+patch_body4="$(cat "$GH_PATCH_BODY_FILE4")"
+assert_contains "degenerate live PATCH enables merge commits (#9105 fallback)" \
+  "$patch_body4" '"allow_merge_commit": true'
+assert_not_contains "degenerate live PATCH does not allow squash merges" \
+  "$patch_body4" '"allow_squash_merge": true'
+assert_not_contains "degenerate live PATCH does not allow rebase merges" \
+  "$patch_body4" '"allow_rebase_merge": true'
+assert_contains "degenerate live PATCH still applies the non-merge-strategy settings (delete_branch_on_merge)" \
+  "$patch_body4" '"delete_branch_on_merge"'
+
+rm -rf "$GH_REPO_DIR4" "$GH_STUB_DIR4"; rm -f "$GH_PATCH_BODY_FILE4"
 
 # ============================================================================
 # Summary

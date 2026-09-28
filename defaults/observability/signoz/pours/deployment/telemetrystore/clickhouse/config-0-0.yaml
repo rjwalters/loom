@@ -24,6 +24,7 @@ macros:
   shard: "00"
 metric_log:
   flush_interval_milliseconds: 30000
+  schema_type: transposed_with_wide_view
   ttl: event_date + INTERVAL 1 DAY DELETE
 part_log:
   ttl: event_date + INTERVAL 1 DAY DELETE

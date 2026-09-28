@@ -48,26 +48,9 @@
   "branchProtection": {
     "_comment": "Read by scripts/install/setup-branch-protection.sh (#8103). These are the check-run names of every ci.yml job that ALWAYS runs and can actually fail — no job behind `needs: changes` (a skipped path-filtered job that never reports would block merges), and not the advisory drift check. Names are the job's `name:` with matrix values substituted, verified against live check-runs on main.",
     "requiredStatusChecks": [
-      "CLAUDE.md Line Budget",
-      "File Size Ratchet",
-      "Shell Budget Ratchet",
-      "Shell Allowlist",
-      "Markdown Token Ratchet",
-      "Role Prompt Prefix Ratchet",
-      "Conflict Marker Check",
-      "Shell Syntax (ubuntu-latest)",
+      "Structural Checks",
       "Shell Syntax (macos-latest)",
-      "AGENTS.md Sync Check",
-      "Config Host-Path Guard",
-      "Docs/Defaults Parity Check",
-      "Fresh Install Link Check",
-      "Guard Scan-String Tier Contracts",
-      "Doc Table-of-Contents Freshness",
-      "Hooks/Scripts Defaults Parity Check",
-      "Vendored Private-Reference Scrub",
-      "Dangling Link Check",
-      ".gitignore Convergence Check",
-      "PRs Must Not Hand-Edit Version-Bearing Files"
+      "Daemon Checks"
     ],
     "strictRequiredStatusChecks": false
   },
