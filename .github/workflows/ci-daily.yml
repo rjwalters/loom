@@ -625,11 +625,16 @@ jobs:
           REPO="$GITHUB_REPOSITORY"
           RUN_URL="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"
 
-          # The label is declared in .github/labels.yml, below the
-          # LOOM-MANAGED block so it is never shipped to a consumer repo.
-          # Creating it here too costs one idempotent call and means a
-          # checkout where sync-labels.sh has never run still gets a working
-          # report instead of an issue create that dies on an unknown label.
+          # This idempotent create is the label's ONLY declaration -- it is
+          # deliberately NOT in .github/labels.yml (rule 4, one mechanism per
+          # behaviour). That file is co-owned: Loom manages the BEGIN/END LOOM
+          # LABELS block and ships the whole file into consumer repos, so a
+          # declaration inside the block exports a label no consumer can ever
+          # apply, and one below the END marker leaves a residue that survives
+          # uninstall (which strips only the block) -- caught by installer Test
+          # 24, "After uninstall, .github/labels.yml removed". `ci:` is not the
+          # `loom:` prefix sync-labels.sh --check audits, so an undeclared
+          # `ci:daily-failure` is not drift it reports either.
           gh label create "$TRACKING_LABEL" --color B60205 \
             --description "Failing ci-daily.yml job tracker; auto-closes on the next green run. Applied by: ci-daily.yml." \
             >/dev/null 2>&1 || true

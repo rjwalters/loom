@@ -129,10 +129,15 @@ to ignore red. So the `report` job is part of the mechanism, not a nicety:
   underlying defect needs real work, file a real issue for it; do not curate
   an auto-closing tracking issue.
 
-`ci:daily-failure` is declared in `.github/labels.yml` **below** the
-`END LOOM LABELS` marker, so it keeps the byte-identical parity contract with
-`defaults/.github/labels.yml` without being installed into consumer repos,
-where nothing would ever apply it.
+`ci:daily-failure` is **not** declared in `.github/labels.yml`. The workflow's
+own idempotent `gh label create` is its only declaration — one mechanism, per
+rule 4. `labels.yml` is co-owned: Loom manages the `BEGIN`/`END LOOM LABELS`
+block and the whole file is installed into consumer repos, so a declaration
+*inside* the block exports a label no consumer can ever apply, and one *below*
+the `END` marker leaves a residue that survives uninstall, which strips only
+the block (installer Test 24 asserts the file is gone). `ci:` is also not the
+`loom:` prefix `sync-labels.sh --check` audits, so an undeclared
+`ci:daily-failure` is not drift it reports.
 
 SigNoz needs nothing workflow-side: `loom-daemon ci-telemetry` captures every
 run of every workflow of the configured owners by auto-discovery, so the daily
