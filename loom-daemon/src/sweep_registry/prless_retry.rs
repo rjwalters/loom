@@ -100,7 +100,10 @@
 //! - a pre-flight-classified death (#4386) — a workspace-level fault,
 //! - a hard-exclusion decline (#7528) — no role has standing to act yet,
 //! - a self-reported no-op release (#6670) — a deliberate conclusion, not a
-//!   failure; [`SweepRegistry::record_noop_release`] clears this tally,
+//!   failure; [`SweepRegistry::record_noop_release`] clears this tally, **and**
+//!   (Issue #8912) the reaper excludes that dispatch's terminal outcome at both
+//!   call sites, so the classification it just cleared is not re-armed a minute
+//!   later when the process is reaped,
 //! - a superseded claim — a newer sweep owns the issue.
 //!
 //! Each of those is excluded at the call site (or, for the no-op release, by an
@@ -396,6 +399,24 @@ impl SweepRegistry {
         if !self.prless_retry_config.enabled {
             return;
         }
+        // Issue #8912: a dispatch that self-reported a no-op release
+        // (`RecordNoopRelease`) had this tally CLEARED by
+        // `record_noop_release` at IPC time, on purpose — a deliberate
+        // "nothing to do this pass" conclusion is not a failed attempt, and
+        // #6670's cooldown is its brake. The reaper then classifies the same
+        // dispatch's terminal outcome minutes later, and without this check it
+        // re-armed here exactly what was just cleared, with a window an order
+        // of magnitude shorter (observed on `2AMLogic/llm-cim#1`: a 3600s
+        // no-op cooldown and a 300s PR-less window armed 59s apart for one
+        // release). Scoped to the reporting sweep id, so a later, genuinely
+        // PR-less dispatch of the same issue still counts.
+        if self.noop_release_covers_dispatch(issue, sweep_id) {
+            log::info!(
+                "sweep_registry: issue #{issue} self-reported a no-op release for sweep \
+                 {sweep_id} — not counting that outcome as a PR-less release (#8912)"
+            );
+            return;
+        }
         // Strongest productive signal first, and free: an observed merge phase
         // means the work landed, whatever the forge says about open PRs now (a
         // merged PR is not an open one).
@@ -491,9 +512,21 @@ impl SweepRegistry {
             Some(code) => format!("exited {code} after {duration_sec}s"),
             None => format!("ended after {duration_sec}s (no exit status observed)"),
         };
+        // #8912: this used to claim the sweep exited "without a
+        // `.no-changes-needed` marker" — a hardcoded literal, not the result of
+        // any filesystem probe, and nothing in this path ever looked for that
+        // file. It read as evidence while asserting an unperformed check, and
+        // it fired even on releases the orchestrator HAD self-reported as
+        // no-ops. The marker's daemon-visible consequence is the
+        // `RecordNoopRelease` call `record-noop-release.sh` makes from it, and
+        // *that* is now genuinely checked: `note_prless_terminal_outcome`
+        // below returns without recording anything when the dispatch
+        // self-reported a no-op release (`noop_release_covers_dispatch`). So
+        // the clause below is true whenever this reason string is ever read —
+        // by construction, not by assertion.
         let reason = format!(
             "sweep {ended} without opening a pull request, without a phase checkpoint, and \
-             without a `.no-changes-needed` marker"
+             without a self-reported no-op release (#6670)"
         );
         self.note_prless_terminal_outcome(issue, sweep_id, open_pr, &reason);
     }
@@ -839,9 +872,17 @@ mod tests {
         reg.note_prless_exit_outcome(7893, "sweep-stub", Some(OpenPrProbe::NoneOpen), Some(78), 41);
         let reason = reg.prless_retry_reason(7893).unwrap();
         assert!(reason.contains("exited 78"), "names the exit status: {reason}");
+        // #8912: the reason must describe a check that was ACTUALLY performed.
+        // The old wording asserted a `.no-changes-needed` filesystem probe this
+        // path never ran; the self-reported no-op release it stands in for is
+        // now genuinely checked by the caller.
         assert!(
-            reason.contains("`.no-changes-needed`"),
+            reason.contains("without a self-reported no-op release"),
             "distinguishes this from a self-reported no-op: {reason}"
+        );
+        assert!(
+            !reason.contains(".no-changes-needed"),
+            "must not assert a marker check this path never performs: {reason}"
         );
     }
 

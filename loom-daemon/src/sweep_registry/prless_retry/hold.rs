@@ -270,7 +270,7 @@ impl SweepRegistry {
              {PRLESS_HOLD_COMMENT_MARKER}\n\
              **Held after {consecutive} consecutive claims that produced no pull request.** This \
              issue's `loom:building` claim was taken and released {consecutive} times in a row \
-             without a PR and without a `.no-changes-needed` marker — the dispatch loop is \
+             without a PR and without a self-reported no-op release — the dispatch loop is \
              retrying something that keeps failing the same way, so it is now held with \
              `loom:blocked` instead of being re-claimed a {next} time (Issue #7972).\n\n\
              Last failure: {reason}\n\n\

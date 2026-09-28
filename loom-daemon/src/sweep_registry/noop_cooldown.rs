@@ -59,6 +59,30 @@
 //! peer-observed view before the work finder reads it. See
 //! `defaults/docs/safehouse.md` → "Fleet-wide no-op cooldown / dispatch
 //! backoff" for the full mechanism.
+//!
+//! That broadcast is **config-gated**: with no peer-claim publisher attached
+//! (`safehouse.enabled` false on this host) it is a byte-for-byte no-op and the
+//! window is host-local again. That is *one* of the two ways #8912's multi-host
+//! symptom arises — the other being a host whose peer-claim *receive* path is
+//! dead (#9294), which this module cannot observe. The arm path now logs the gated case
+//! rather than degrading silently; see `defaults/docs/safehouse.md` →
+//! "'Fleet-wide' has two preconditions" for the other one and how to check it.
+//!
+//! # One release, one classification (Issue #8912)
+//!
+//! [`SweepRegistry::record_noop_release`] runs synchronously when the sweep's
+//! `RecordNoopRelease` IPC call lands; the reaper classifies the same sweep's
+//! terminal outcome minutes later, and used to have no way to tell that the
+//! release it was looking at had already been self-reported as a deliberate
+//! no-op. So one release armed a 3600s no-op cooldown AND a 300s PR-less retry
+//! window AND an insta-crash strike toward quarantine — the shorter, wrongly
+//! classified windows undercutting the correct one. The record now names the
+//! dispatch it belongs to, and the three carve-out wrappers below
+//! ([`SweepRegistry::charge_insta_crash`],
+//! [`SweepRegistry::charge_dispatch_failure`],
+//! [`SweepRegistry::clear_noop_cooldown_unless_reported`]) plus
+//! `prless_retry`'s own check make that dispatch's terminal outcome exempt
+//! from every failure classifier — for that sweep id only.
 
 use super::*;
 
@@ -117,6 +141,14 @@ pub(crate) struct NoopCooldownState {
     pub(crate) consecutive: u32,
     /// Free-form context supplied by the recording caller, logged verbatim.
     pub(crate) reason: Option<String>,
+    /// The dispatch this self-report belongs to (Issue #8912): the id of the
+    /// live sweep this host had running for the issue when the report arrived.
+    /// `None` when none could be attributed — an out-of-band `loom-daemon
+    /// noop-cooldown record`, or a registry that never saw the dispatch
+    /// (another host's sweep) — in which case there is no reap of this
+    /// daemon's to carve out either. Read by
+    /// [`SweepRegistry::noop_release_covers_dispatch`].
+    pub(crate) released_by_sweep: Option<String>,
 }
 
 /// The subset of `.loom/config.json → autonomous.workFinder.noopCooldown`
@@ -228,6 +260,11 @@ impl SweepRegistry {
                 .map(|r| format!(": {r}"))
                 .unwrap_or_default()
         );
+        // Issue #8912: remember WHICH dispatch self-reported the no-op, so the
+        // reaper can recognise its own terminal outcome as the deliberate
+        // conclusion it is rather than classifying it a second time as a
+        // PR-less failure — see `noop_release_covers_dispatch`.
+        let released_by_sweep = self.live_issue_sweep_id(issue);
         self.noop_cooldown.insert(
             issue,
             NoopCooldownState {
@@ -235,6 +272,7 @@ impl SweepRegistry {
                 until,
                 consecutive,
                 reason,
+                released_by_sweep,
             },
         );
         // Issue #7972: a self-reported no-op is a *deliberate conclusion*, not
@@ -254,6 +292,133 @@ impl SweepRegistry {
             issue,
             self.noop_cooldown_config.cooldown,
         );
+        // Issue #8912: without a peer-claim publisher attached
+        // (`safehouse.enabled` false / no coordination on this host) the
+        // broadcast above is a byte-for-byte no-op and this window is
+        // HOST-LOCAL — a peer host will re-offer the same candidate inside it,
+        // which is exactly the multi-host symptom #8912 reports. Say so at the
+        // moment it matters instead of leaving the degradation invisible: the
+        // fleet-wide half of #7477 is config-gated, and nothing else in the log
+        // distinguishes "armed fleet-wide" from "armed on this host only".
+        if self.peer_claim_publisher.is_none() {
+            log::info!(
+                "sweep_registry: issue #{issue}'s no-op cooldown is HOST-LOCAL only — no \
+                 peer-claim publisher is attached on this host (safehouse peer coordination \
+                 disabled), so a peer host may re-dispatch inside the window (#7477/#8912)"
+            );
+        }
+    }
+
+    /// The id of the live (`Running`/`Pending`) sweep this host has running for
+    /// `issue`, if any (Issue #8912) — the most recently started one when more
+    /// than one entry matches (a superseded claim leaves the older entry behind
+    /// until its own reap).
+    fn live_issue_sweep_id(&self, issue: u32) -> Option<String> {
+        self.entries
+            .values()
+            .filter(|info| {
+                matches!(info.kind, SweepKind::Issue(n) if n == issue)
+                    && matches!(info.state, SweepState::Running | SweepState::Pending)
+            })
+            .max_by_key(|info| info.started_at)
+            .map(|info| info.sweep_id.clone())
+    }
+
+    /// Whether the dispatch `sweep_id` self-reported a no-op release for
+    /// `issue` (Issue #8912) — the discriminator the reaper's terminal-outcome
+    /// classifiers consult before charging this dispatch as a failure.
+    ///
+    /// # Why this is needed
+    ///
+    /// [`Self::record_noop_release`] runs **synchronously**, at the moment the
+    /// sweep's `RecordNoopRelease` IPC call lands — it arms the cooldown and
+    /// clears the PR-less retry tally there and then. The reaper's
+    /// terminal-outcome classification runs **later**, when the process is
+    /// actually reaped, and used to have no way of knowing a no-op had just
+    /// been self-reported for this very dispatch: it re-classified the same
+    /// release as a PR-less failure, an insta-crash and a failed dispatch, and
+    /// so re-armed — with windows an order of magnitude shorter — exactly what
+    /// `record_noop_release` had just cleared. The observed shape, one release
+    /// on `2AMLogic/llm-cim#1`: a 3600s no-op cooldown, a 300s PR-less retry
+    /// window and an insta-crash strike toward quarantine, all within 60
+    /// seconds of each other.
+    ///
+    /// # Why it is scoped to a sweep id rather than to the issue
+    ///
+    /// A pure read with no "consume" step, because the sweep id already scopes
+    /// it to exactly one dispatch: the record names the sweep that reported it
+    /// (`released_by_sweep`), a given sweep id is reaped at most once, and a
+    /// *later* dispatch of the same issue carries a different id and so is
+    /// classified normally. A genuinely failing re-attempt still accrues every
+    /// brake it should — the suppression covers one terminal outcome, never the
+    /// issue.
+    ///
+    /// `false` whenever the release could not be attributed to a live sweep at
+    /// record time (`released_by_sweep: None` — an out-of-band `loom-daemon
+    /// noop-cooldown record` with no dispatch of this daemon's to attach to):
+    /// there is no reap of ours to suppress in that case either.
+    #[must_use]
+    pub(crate) fn noop_release_covers_dispatch(&self, issue: u32, sweep_id: &str) -> bool {
+        self.noop_cooldown
+            .get(&issue)
+            .and_then(|s| s.released_by_sweep.as_deref())
+            .is_some_and(|id| id == sweep_id)
+    }
+
+    /// [`Self::record_insta_crash_outcome`] with the Issue #8912 carve-out
+    /// applied: a dispatch that self-reported a no-op release reached a
+    /// deliberate conclusion, so it is neither an insta-crash to tally nor a
+    /// terminal outcome to reset the tally on. Every other outcome is passed
+    /// straight through unchanged.
+    ///
+    /// These three wrappers live here, beside the discriminator, rather than
+    /// as extra conditions at `reap_once`'s call sites: the carve-out is this
+    /// mechanism's rule, both reaper branches want it applied identically, and
+    /// keeping it here means the reaper carries one call, not one call plus a
+    /// predicate it would have to keep in sync twice.
+    pub(crate) fn charge_insta_crash(&mut self, sweep_id: &SweepId, issue: u32, counted: bool) {
+        if self.log_noop_carve_out(issue, sweep_id, "the quarantine tally") {
+            return;
+        }
+        self.record_insta_crash_outcome(sweep_id, issue, counted);
+    }
+
+    /// [`Self::record_dispatch_failure`] with the same Issue #8912 carve-out:
+    /// a self-reported no-op release is a deliberate conclusion, not a failed
+    /// dispatch, and its own (far longer) cooldown is already armed — so the
+    /// #4485 retry ladder must neither escalate on it nor be cleared by it.
+    pub(crate) fn charge_dispatch_failure(&mut self, sweep_id: &str, issue: u32) {
+        if self.log_noop_carve_out(issue, sweep_id, "the dispatch-backoff ladder") {
+            return;
+        }
+        self.record_dispatch_failure(issue);
+    }
+
+    /// [`Self::clear_noop_cooldown`] unless `sweep_id` is the very dispatch
+    /// that armed the window (Issue #8912) — the inverse half of the same
+    /// carve-out. `reap_once`'s crashed branch clears the cooldown on
+    /// checkpoint progress (#6670: real progress proves the candidate is live
+    /// again), which is right for every dispatch except the one whose own
+    /// self-report armed it seconds earlier.
+    pub(crate) fn clear_noop_cooldown_unless_reported(&mut self, sweep_id: &str, issue: u32) {
+        if self.noop_release_covers_dispatch(issue, sweep_id) {
+            return;
+        }
+        self.clear_noop_cooldown(issue);
+    }
+
+    /// Shared predicate + log line behind the two `charge_*` wrappers above
+    /// (Issue #8912). Returns `true` when the classifier must be skipped.
+    fn log_noop_carve_out(&self, issue: u32, sweep_id: &str, mechanism: &str) -> bool {
+        if !self.noop_release_covers_dispatch(issue, sweep_id) {
+            return false;
+        }
+        log::info!(
+            "sweep_registry: issue #{issue} self-reported a no-op release for sweep {sweep_id} \
+             — not charging that outcome to {mechanism}; the no-op cooldown is this outcome's \
+             brake (#8912)"
+        );
+        true
     }
 
     /// Clear `issue`'s no-op-cooldown record (Issue #6670) — called on any
@@ -340,6 +505,9 @@ impl SweepRegistry {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::sweep_registry::test_support::{
+        insert_clean_exit_running, no_progress_test_registry,
+    };
     use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
     use serial_test::serial;
     use tempfile::tempdir;
@@ -427,6 +595,141 @@ mod tests {
         assert!(reg.is_quarantined(321));
         assert!(reg.dispatch_backoff_remaining(321, Utc::now()).is_some());
         assert!(reg.noop_cooldown_remaining(321, Utc::now()).is_none());
+    }
+
+    // --- One release, one classification (Issue #8912) ----------------------
+
+    /// The discriminator itself: a release is attributed to the sweep that
+    /// was live when it was reported, and to no other.
+    #[test]
+    fn a_release_covers_only_the_dispatch_that_reported_it() {
+        let dir = tempdir().unwrap();
+        let mut reg = no_progress_test_registry(dir.path(), "OPEN", "", true);
+        let sweep_id = insert_clean_exit_running(&mut reg, 89_120, 0);
+
+        reg.record_noop_release(89_120, Some("epic tracking container".into()));
+
+        assert!(reg.noop_release_covers_dispatch(89_120, &sweep_id));
+        assert!(
+            !reg.noop_release_covers_dispatch(89_120, "sweep-issue-89120-some-other-dispatch"),
+            "a different dispatch of the same issue must be classified normally"
+        );
+        assert!(
+            !reg.noop_release_covers_dispatch(99_999, &sweep_id),
+            "and it must not leak to another issue"
+        );
+    }
+
+    /// A release reported with no live sweep to attribute it to (an
+    /// out-of-band `loom-daemon noop-cooldown record`) covers no reap — there
+    /// is no dispatch of this daemon's to carve out.
+    #[test]
+    fn an_unattributable_release_covers_no_dispatch() {
+        let mut reg = test_registry();
+        reg.record_noop_release(89_120, None);
+        assert!(reg.noop_cooldown_remaining(89_120, Utc::now()).is_some());
+        assert!(!reg.noop_release_covers_dispatch(89_120, "sweep-issue-89120-x"));
+    }
+
+    /// THE regression, end to end through `reap_once`: the exact sequence
+    /// observed on `2AMLogic/llm-cim#1` (2026-09-25) — the sweep self-reports
+    /// a no-op release over IPC, then exits cleanly with no checkpoint, no PR
+    /// and the issue still open. Before #8912 that single release armed a
+    /// 3600s no-op cooldown AND a 300s PR-less retry window AND an
+    /// insta-crash strike, the reaper re-classifying, a minute later, the very
+    /// outcome `record_noop_release` had just cleared.
+    #[test]
+    fn a_self_reported_noop_release_is_not_also_a_prless_failure() {
+        let dir = tempdir().unwrap();
+        // Issue OPEN, no open linked PR, real forge probes enabled — the
+        // fixture that DOES arm every brake when nothing self-reports a no-op
+        // (asserted by the sibling test below).
+        let mut reg = no_progress_test_registry(dir.path(), "OPEN", "", false);
+
+        insert_clean_exit_running(&mut reg, 89_121, 0);
+        // The sweep's `RecordNoopRelease` IPC call, while it is still Running.
+        reg.record_noop_release(
+            89_121,
+            Some("epic tracking container, no direct buildable work".into()),
+        );
+        reg.reap_once();
+
+        assert!(
+            reg.noop_cooldown_remaining(89_121, Utc::now()).is_some(),
+            "the self-reported cooldown must survive the reap — it is this outcome's brake"
+        );
+        assert_eq!(
+            reg.prless_release_count(89_121),
+            0,
+            "a self-reported no-op must not also be counted as a PR-less release (#8912)"
+        );
+        assert!(
+            reg.prless_retry_remaining(89_121, Utc::now()).is_none(),
+            "no 300s PR-less window may undercut the 3600s no-op cooldown"
+        );
+        assert_eq!(
+            reg.insta_crash_count(89_121),
+            0,
+            "a deliberate no-op conclusion must not accrue toward quarantine"
+        );
+        assert_eq!(
+            reg.dispatch_failure_count(89_121),
+            0,
+            "a deliberate no-op conclusion is not a failed dispatch"
+        );
+    }
+
+    /// The guard on the fix above: the SAME fixture without a no-op
+    /// self-report must still arm every brake. The carve-out is scoped to a
+    /// dispatch that actually reported one — it must never become a blanket
+    /// exemption for clean, PR-less exits.
+    #[test]
+    fn a_prless_exit_without_a_noop_release_still_counts() {
+        let dir = tempdir().unwrap();
+        let mut reg = no_progress_test_registry(dir.path(), "OPEN", "", false);
+
+        insert_clean_exit_running(&mut reg, 89_122, 0);
+        reg.reap_once();
+
+        assert_eq!(
+            reg.prless_release_count(89_122),
+            1,
+            "an ordinary PR-less clean exit must still charge the #7972 tally"
+        );
+        assert_eq!(
+            reg.insta_crash_count(89_122),
+            1,
+            "an ordinary no-progress clean exit must still accrue toward quarantine"
+        );
+        assert_eq!(
+            reg.dispatch_failure_count(89_122),
+            1,
+            "an ordinary no-progress clean exit must still arm the #4485 backoff"
+        );
+    }
+
+    /// The carve-out covers ONE terminal outcome, not the issue: the next
+    /// dispatch — a genuine PR-less failure — counts normally, so the #7972
+    /// bound still converges on a genuinely failing issue.
+    #[test]
+    fn the_carve_out_does_not_carry_into_the_next_dispatch() {
+        let dir = tempdir().unwrap();
+        let mut reg = no_progress_test_registry(dir.path(), "OPEN", "", false);
+
+        insert_clean_exit_running(&mut reg, 89_123, 0);
+        reg.record_noop_release(89_123, Some("nothing to do this pass".into()));
+        reg.reap_once();
+        assert_eq!(reg.prless_release_count(89_123), 0);
+
+        // A second dispatch that self-reports nothing.
+        insert_clean_exit_running(&mut reg, 89_123, 1);
+        reg.reap_once();
+
+        assert_eq!(
+            reg.prless_release_count(89_123),
+            1,
+            "the suppression is scoped to one release, not to the issue (#8912)"
+        );
     }
 
     // --- Config resolution precedence (env > config > default) -------------
