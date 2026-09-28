@@ -413,6 +413,151 @@ assert_deny_env "rmScope repo (#6805): unassigned \$WT with a suffix still denie
 assert_allow_env "rmScope repo (#6805): single-quoted literal '\$WT/sub' is not resolved as a variable" \
     "LOOM_RM_SCOPE=repo" "WT=/etc/foo; rm -rf './\$WT/sub'" "$REPO_ROOT"
 
+# ---- Same-command FOR-LOOP literal-list resolution (#9304) — a SIBLING fast
+# ---- path to #6676/#6805 above. A `for NAME in <literal> <literal> …` header
+# ---- whose loop body runs `rm -rf "$NAME"[suffix]` resolves EVERY list member
+# ---- from the command's own source text instead of failing closed on
+# ---- `rm-scope-unresolved-var` (the #9304 telemetry false positive: 57 DENY
+# ---- events, all scratch/cache cleanup). Like #6676/#6805 and UNLIKE the
+# ---- mktemp fast path, resolution does NOT skip the scope check — every
+# ---- resolved member is judged by the same catastrophic-path +
+# ---- repo/worktree/tmp predicates any literal `rm -rf /that/path` gets, so a
+# ---- single out-of-scope member still denies the whole loop.
+# ----
+# ---- The loop body is written on its own physical line throughout, because
+# ---- that is the shape the telemetry reports AND the only shape
+# ---- extract_rm_targets() sees a loop-body `rm` in at all: a one-liner
+# ---- `…; do rm -rf "$d"; done` leaves `do` as the segment's command word, so
+# ---- the `rm` is invisible to the scanner (and therefore already allowed,
+# ---- with or without this fast path). That pre-existing extraction gap is
+# ---- deliberately NOT changed here — it is a tightening, not this
+# ---- relaxation's business, and is tracked in #9323.
+assert_allow_env "rmScope repo (#9304): for-loop over /tmp literals + body rm -rf \"\$d\" allows (telemetry repro)" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-t8460 /tmp/sccache-bench; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#9304): for-loop with \`do\` on its own line allows too" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/a /tmp/b
+do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#9304): for-loop over in-repo literal absolute paths allows" \
+    "LOOM_RM_SCOPE=repo" "for d in \"$REPO_ROOT/scratch1\" \"$REPO_ROOT/scratch2\"; do
+  rm -rf \"\$d\"
+done" "$REPO_ROOT"
+# Suffix support mirrors #6805 — a literal suffix after the loop variable
+# resolves identically.
+assert_allow_env "rmScope repo (#9304): \"\${d}/sub\" literal suffix on the loop var allows" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/x /tmp/y; do
+  rm -rf "${d}/sub"
+done' "$REPO_ROOT"
+# An `rm` AFTER the loop's `done` is still resolvable: `$d` then holds the LAST
+# list member, which is itself one of the vetted literals.
+assert_allow_env "rmScope repo (#9304): rm after the loop's done resolves to the last member" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/a /tmp/b; do :; done
+rm -rf "$d"' "$REPO_ROOT"
+# …but an `rm` BEFORE the for header reads whatever `d` was INHERITED from the
+# environment — the header proves nothing about it — so it fails closed. This
+# is the #239 hazard the whole unresolved-var deny exists for.
+assert_deny_env "rmScope repo (#9304): rm BEFORE the for header still denies (inherited binding)" \
+    "LOOM_RM_SCOPE=repo" 'rm -rf "$d"
+for d in /tmp/a /tmp/b; do :; done' "$REPO_ROOT"
+# A single non-literal (variable-expanding) member fails the WHOLE loop
+# closed — members are never partially resolved.
+assert_deny_env "rmScope repo (#9304): one \$-expanding member denies the whole loop" \
+    "LOOM_RM_SCOPE=repo" 'X=/tmp/x
+for d in /tmp/a $X; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+# A glob metacharacter member likewise fails the whole loop closed.
+assert_deny_env "rmScope repo (#9304): one glob member denies the whole loop" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/a /tmp/*; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+# Brace expansion is the subtle one: `/tmp/{a,../../etc}` is a pure literal
+# STRING whose EXPANSION escapes /tmp entirely, so its literal-ness would
+# prove the wrong thing. `{`/`}` are rejected like any other metacharacter.
+assert_deny_env "rmScope repo (#9304): a brace-expansion member denies (expansion can escape scope)" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/a /tmp/{b,../../etc}; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+# A relative (non-absolute) member is not resolvable to a path this check can
+# judge, so it fails closed rather than being cwd-guessed.
+assert_deny_env "rmScope repo (#9304): a relative member denies (not an absolute literal)" \
+    "LOOM_RM_SCOPE=repo" 'for d in build dist; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+# Every member is a provable literal, but one is out of scope — that member
+# still denies (never allow-if-any-member-is-in-scope).
+assert_deny_env "rmScope repo (#9304): an out-of-scope literal member still denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/a /etc/important; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+# The unconditional catastrophic top-level deny still fires on a resolved
+# member, so a for-loop cannot launder a system-directory target.
+assert_deny_env "rmScope repo (#9304): a top-level-dir member still denies (catastrophic floor)" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/a /etc; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+# A second, conflicting rebinding of the loop variable (any shape, including
+# the `=`-free ones #8221 taught the sibling mktemp fast path to recognize)
+# still fails closed — ambiguity, mirroring #6520/#6676/#8221's discipline.
+assert_deny_env "rmScope repo (#9304): a later bare \`d=\` rebinding denies (ambiguous)" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/a /tmp/b; do
+  rm -rf "$d"
+done
+d=/root' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9304): a later \`printf -v d\` rebinding denies (ambiguous)" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/a /tmp/b; do
+  rm -rf "$d"
+done
+printf -v d "%s" /root' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9304): a later \`read d\` rebinding denies (ambiguous)" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/a /tmp/b; do
+  rm -rf "$d"
+done
+read d < /etc/target' "$REPO_ROOT"
+# `d+=…` and `d[0]=…` are rebindings the plain `d=` prefix test cannot see (the
+# character after the name is `+` / `[`, not `=`). Both retarget the `rm` at
+# runtime — `d+=/../../etc` makes it /etc, and a bare `$d` IS `${d[0]}` — so the
+# resolver must fail closed on them too (#9324, found reviewing #9304).
+assert_deny_env "rmScope repo (#9324): a \`d+=\` append rebinding denies (runtime target escapes)" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/a /tmp/b; do
+  d+=/../../etc
+  rm -rf "$d"
+done' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9324): a \`d[0]=\` indexed rebinding denies (\$d is \${d[0]})" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/a /tmp/b; do
+  d[0]=/etc
+  rm -rf "$d"
+done' "$REPO_ROOT"
+# Two for-headers for the same name is ambiguity, not proof.
+assert_deny_env "rmScope repo (#9304): two for-headers for the same loop var deny (ambiguous)" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/a; do
+  rm -rf "$d"
+done
+for d in /etc; do :; done' "$REPO_ROOT"
+# A for-header in a SUBSHELL does not match the anchored header pattern, so the
+# binding it creates is never used as proof.
+assert_deny_env "rmScope repo (#9304): a subshell-scoped for header is not proof (fails closed)" \
+    "LOOM_RM_SCOPE=repo" '(for d in /tmp/a /tmp/b; do :; done)
+rm -rf "$d"' "$REPO_ROOT"
+# Shape 2 from #9304 (`VAR=$(cat <literal-tmp-path>)`) is deliberately NOT
+# resolved: the `cat` argument's literal-ness says nothing about the FILE
+# CONTENTS that become $VAR. Pinned here in the for-loop's own shape too, so a
+# future widening of this fast path cannot quietly pick it up.
+assert_deny_env "rmScope repo (#9304): a \$(cat …) for-loop member still denies (shape 2, #9322)" \
+    "LOOM_RM_SCOPE=repo" 'for d in $(cat /tmp/dirs.txt); do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+# Non-regression: the opt-out (guards.rmScope=off/permissive) remains
+# byte-for-byte permissive — this fast path lives entirely inside the
+# rm_scope_repo_enabled() gate, same as its #6520/#6676/#6805 siblings.
+assert_allow_env "rmScope off (#9304): the for-loop unresolved-var check does not apply" \
+    "LOOM_RM_SCOPE=off" 'for d in /tmp/a /etc/important; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+
 # ---- Decoy-heredoc mktemp-escape-hatch bypass (#6549) — rm_scope_mktemp_same_
 # ---- command_safe() used to scan the raw (heredoc-unmasked) command text one
 # ---- physical line at a time, so a NEVER-EXECUTED `NAME=$(mktemp -d)` line

@@ -7174,6 +7174,252 @@ rm_scope_literal_same_command_resolve() {
 }
 
 # =============================================================================
+# SAME-COMMAND FOR-LOOP LITERAL-LIST RESOLUTION (#9304)
+#
+# Sibling of rm_scope_literal_same_command_resolve() (above) for the shape
+#   for NAME in <literal> <literal> …
+#   do
+#     rm -rf "$NAME"[literal-suffix]
+#   done
+# — the telemetry-observed `rm-scope-unresolved-var` false positive behind
+# #9304 (57 DENY events in a 5-day window, every one of them cleanup of
+# scratch/cache/tmp paths the same command chain had just produced). The OTHER
+# shape that issue lists, `VAR=$(cat <literal-tmp-path>)`, is deliberately NOT
+# resolved here: the literal-ness of the `cat` argument proves nothing about
+# $VAR's value (that is whatever the file happens to contain at runtime), so
+# resolving it would need the guard to EXECUTE `cat` at hook-evaluation time —
+# a new class of guard behaviour with a real TOCTOU gap between the guard's
+# read and the shell's own. That is its own explicitly-reviewed design
+# decision, tracked in #9322; here it keeps failing closed exactly as today,
+# pinned by the `x=$(cat foo.txt)` deny control in
+# tests/hooks/test-guard-destructive-rm-scope.sh.
+#
+# WHAT THIS PROVES, AND WHAT IT DOES NOT. Like
+# rm_scope_literal_same_command_resolve() (and unlike
+# rm_scope_mktemp_same_command_safe(), which skips the scope check entirely
+# once mktemp's own contract has proven the root), this function proves only
+# that every value $NAME can hold is a LITERAL string present verbatim in the
+# command's own source text. It does NOT judge those paths — it resolves to
+# MULTIPLE paths (one per loop member), and the CALLER must run EVERY member
+# through the same catastrophic-path + repo/worktree/tmp scope predicates the
+# ordinary single-target flow uses (_rm_path_is_catastrophic() /
+# _rm_path_in_repo_scope() below, shared with that flow precisely so the two
+# cannot drift apart), denying on the FIRST disallowed member. Never
+# allow-if-any-member-is-in-scope.
+#
+# Fails closed (returns 1; the caller falls through to today's
+# `rm-scope-unresolved-var` deny) unless ALL of the following hold:
+#   - $target has the bare-`$NAME` / `${NAME}<literal-suffix>` shape accepted
+#     by _rm_scope_var_ref_split() — the same shape the literal
+#     single-assignment fast path accepts (#6676/#6805);
+#   - the command contains EXACTLY ONE `for NAME in <word> <word> …` header for
+#     that NAME. Two headers for one name is ambiguity, not proof, and fails
+#     closed — mirroring the "exactly one assignment" discipline of both
+#     sibling fast paths;
+#   - NAME is not rebound anywhere else in the command: no `NAME=…`
+#     (including an `export`/`declare`/`local`-prefixed one), no `NAME+=…`
+#     append, no `NAME[i]=…` / `NAME[i]+=…` indexed-element assignment (a bare
+#     `$NAME` IS `${NAME[0]}`), no `read NAME`, no `printf -v NAME`. This
+#     reuses _mktemp_strip_decl_kw() / _mktemp_is_other_rebind() from
+#     $_MKTEMP_REBIND_AWK rather than hand-rolling a second copy of that rule
+#     (#8221), plus a resolver-local `+=` / `[` test (#9324) that is
+#     deliberately NOT pushed into the shared helper — doing so would change
+#     the mktemp and literal-assignment fast paths' verdicts too, which is
+#     tracked separately as #9331;
+#   - at least one `rm` segment referencing NAME appears AFTER the `for`
+#     header, and NONE appears before it. An `rm -rf "$d"` that RUNS BEFORE
+#     the loop reads whatever `d` was inherited from the environment — the
+#     exact #239 hazard — so the header cannot be used as proof for it. (An
+#     `rm` after the loop's `done` is fine: `$NAME` then still holds the LAST
+#     list member, which is itself one of the vetted literals.);
+#   - EVERY list word, after optional whole-word quote stripping, is a pure
+#     absolute-path literal: it starts with `/` and contains no `$`, no
+#     backtick, no glob metacharacter (`*`, `?`, `[`) and no brace-expansion
+#     character (`{`, `}`). Braces are rejected because `/tmp/{a,../../etc}`
+#     is a literal STRING whose expansion escapes /tmp entirely, so its
+#     literal-ness would prove the wrong thing. A single non-literal member
+#     fails the WHOLE loop closed — members are never partially resolved.
+#
+# On success prints one resolved absolute path per line (each list member with
+# the target's own literal suffix appended, exactly as
+# rm_scope_literal_same_command_resolve() handles its suffix).
+#
+# RESIDUAL, STATED PLAINLY: like both sibling fast paths this is a lexical
+# same-command proof, not an execution model. A loop whose body runs in a
+# SUBSHELL whose binding does not survive to the `rm` (`(for d in …; done);
+# rm -rf "$d"`) is not resolved — the `(`-prefixed header does not match the
+# anchored header pattern, so it fails closed — but a `done | cat` pipeline
+# form is not separately detected. That residual is identical in kind to the
+# one the #6676 literal fast path already carries, and the value is in every
+# case a path the command's own text names.
+# =============================================================================
+_RM_SCOPE_FORLOOP_AWK='
+function _forloop_word_is_literal(w) {
+    if (index(w, "$") > 0) return 0
+    if (index(w, "`") > 0) return 0
+    if (index(w, "*") > 0) return 0
+    if (index(w, "?") > 0) return 0
+    if (index(w, "[") > 0) return 0
+    if (index(w, "{") > 0) return 0
+    if (index(w, "}") > 0) return 0
+    return 1
+}
+function _forloop_strip_quotes(w,   wl, c1, c2, sq, dq) {
+    dq = sprintf("%c", 34)
+    sq = sprintf("%c", 39)
+    wl = length(w)
+    if (wl >= 2) {
+        c1 = substr(w, 1, 1)
+        c2 = substr(w, wl, 1)
+        if ((c1 == dq && c2 == dq) || (c1 == sq && c2 == sq)) {
+            return substr(w, 2, wl - 2)
+        }
+    }
+    return w
+}
+function _forloop_refs_var(seg, varname) {
+    if (seg ~ ("[$][{]" varname "[}]")) return 1
+    if (seg ~ ("[$]" varname "([^A-Za-z0-9_]|$)")) return 1
+    return 0
+}
+'
+
+rm_scope_for_loop_literal_same_command_resolve() {
+    local target="$1" cmdtext="$2" split varname suffix resolved
+    split=$(_rm_scope_var_ref_split "$target") || return 1
+    varname="${split%%$'\t'*}"
+    suffix="${split#*$'\t'}"
+    [[ -n "$varname" ]] || return 1
+    resolved=$(printf '%s' "$cmdtext" | awk -v varname="$varname" -v suffix="$suffix" \
+        "$_QSPLIT_AWK""$_MKTEMP_REBIND_AWK""$_RM_SCOPE_FORLOOP_AWK"'
+    {
+        $0 = qsplit($0)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/[ \t]+$/, "", seg)
+            if (seg ~ ("^for[ \t]+" varname "[ \t]+in[ \t]+.+$")) {
+                forcount++
+                if (forcount == 1) {
+                    listtext = seg
+                    sub(("^for[ \t]+" varname "[ \t]+in[ \t]+"), "", listtext)
+                }
+                continue
+            }
+            # Ordering proof: an `rm` referencing NAME that runs BEFORE the
+            # single `for` header reads an inherited binding the header says
+            # nothing about, so it poisons the whole resolution.
+            rmseg = seg
+            sub(/^sudo[ \t]+/, "", rmseg)
+            if (rmseg ~ /^rm([ \t]|$)/ && _forloop_refs_var(rmseg, varname)) {
+                if (forcount == 0) rmbefore++
+                else rmafter++
+            }
+            bseg = _mktemp_strip_decl_kw(seg)
+            prefix = varname "="
+            plen = length(prefix)
+            if (length(bseg) > plen && substr(bseg, 1, plen) == prefix) {
+                otherbind++
+            } else if (bseg ~ ("^" varname "[+][=]") || bseg ~ ("^" varname "[[]")) {
+                # `NAME+=…` (append) and `NAME[i]=…` / `NAME[i]+=…` (indexed
+                # element) are rebindings the plain `NAME=` prefix test above
+                # cannot see: the character after NAME is `+` or `[`, not `=`.
+                # Both change what `$NAME` expands to at the `rm` — `d+=/../../etc`
+                # makes the runtime target /etc, and `$d` IS `${d[0]}`, so
+                # `d[0]=/etc` retargets the bare reference too (#9324). Scoped
+                # deliberately to THIS resolver: widening the shared
+                # _mktemp_is_other_rebind() would also change the verdicts of
+                # the mktemp and literal-assignment paths (tracked as #9331).
+                otherbind++
+            } else if (_mktemp_is_other_rebind(seg, varname)) {
+                otherbind++
+            }
+        }
+    }
+    END {
+        if (forcount != 1 || otherbind > 0 || rmbefore > 0 || rmafter < 1) {
+            print "UNSAFE"
+            exit
+        }
+        wn = split(listtext, words, /[ \t]+/)
+        if (wn < 1) {
+            print "UNSAFE"
+            exit
+        }
+        for (w = 1; w <= wn; w++) {
+            word = _forloop_strip_quotes(words[w])
+            if (word == "" || !_forloop_word_is_literal(word) || substr(word, 1, 1) != "/") {
+                print "UNSAFE"
+                exit
+            }
+            out = out word suffix "\n"
+        }
+        printf "%s", out
+    }')
+    [[ -n "$resolved" ]] || return 1
+    [[ "$resolved" != "UNSAFE"* ]] || return 1
+    printf '%s' "$resolved"
+}
+
+# _rm_path_is_catastrophic() / _rm_path_in_repo_scope() — the two rm-target
+# path predicates, factored out of the inline rm-scope block below (#9304) so
+# the for-loop fast path's per-member vetting and the ordinary single-target
+# flow share ONE implementation instead of two that can silently drift.
+# Behaviour is byte-for-byte what the inline code did: no new condition, no
+# reordering, and the `$_WT_ROOT` resolution stays lazy (only reached when the
+# cheaper repo-prefix tests have already failed).
+#
+# $1 is an already-normalize_abs_path()'d absolute path.
+_rm_path_is_catastrophic() {
+    local abs="$1"
+    [[ "$abs" == "/" ]] && return 0
+    [[ -n "$HOME" && "$abs" == "$HOME" ]] && return 0
+    [[ "$abs" =~ ^/[^/]+$ ]] && return 0
+    return 1
+}
+
+_rm_path_in_repo_scope() {
+    local abs="$1"
+    # Repo + worktree areas. Prefix matches carry a trailing slash (or match
+    # the dir itself) so a sibling dir sharing a name prefix — e.g.
+    # "<repo>-sibling" vs "<repo>" — is NOT admitted.
+    if [[ -n "$REPO_ROOT" ]]; then
+        if [[ "$abs" == "$REPO_ROOT" || "$abs" == "$REPO_ROOT"/* ]]; then
+            return 0
+        fi
+        # The default in-repo worktrees dir is always in scope, even when an
+        # external worktree.root / LOOM_WORKTREE_ROOT is set.
+        if [[ "$abs" == "$REPO_ROOT/.loom/worktrees" || "$abs" == "$REPO_ROOT/.loom/worktrees"/* ]]; then
+            return 0
+        fi
+        # Configured/overridden worktree root (external volumes).
+        if [[ -z "${_WT_ROOT+x}" ]]; then
+            _WT_ROOT=$(resolve_worktree_root "$REPO_ROOT")
+        fi
+        if [[ -n "$_WT_ROOT" ]] && \
+           { [[ "$abs" == "$_WT_ROOT" || "$abs" == "$_WT_ROOT"/* ]]; }; then
+            return 0
+        fi
+    fi
+    # Built-in ephemeral allowlist: system temp roots + the Claude scratchpad.
+    # normalize_abs_path() is LEXICAL — it does NOT resolve symlinks — so on
+    # macOS both the symlink form (/tmp, /var/tmp, /var/folders) AND its
+    # /private target must be listed. A bare temp root (/tmp, /private/tmp, …)
+    # is NOT matched here: those have no trailing component, so the
+    # catastrophic top-level deny already handled bare /tmp, and a bare
+    # /private/tmp falls through to the out-of-scope deny.
+    case "$abs" in
+        /tmp/*|/private/tmp/*|\
+        /var/tmp/*|/private/var/tmp/*|\
+        /var/folders/*|/private/var/folders/*|\
+        */claude-*/*/scratchpad/*)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# =============================================================================
 # extract_write_targets() — Bash-tool write-idiom target extraction (#4178).
 #
 # Emits one "<cwd>\t<target>" line (TAB-separated, US separator 0x1f — mirrors
@@ -8241,9 +8487,7 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
         # any top-level directory (^/<one-segment>$ — covers /tmp, /home, /usr,
         # /var, /etc, /opt, /bin, /lib, …). Deeper paths are allowed.
         if [[ -n "$ABS_PATH" ]]; then
-            if [[ "$ABS_PATH" == "/" ]] || \
-               [[ -n "$HOME" && "$ABS_PATH" == "$HOME" ]] || \
-               [[ "$ABS_PATH" =~ ^/[^/]+$ ]]; then
+            if _rm_path_is_catastrophic "$ABS_PATH"; then
                 deny "BLOCKED: rm on protected system path: $ABS_PATH" "rm-protected-path"  # scan-reads: COMMAND_ASK_SCAN
             fi
 
@@ -8334,6 +8578,39 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                         continue
                     fi
 
+                    # Same-command FOR-LOOP literal-list fast path (#9304):
+                    # `for NAME in <literal> <literal> …` whose body runs
+                    # `rm -rf "$NAME"[suffix]`. Unlike the mktemp fast path
+                    # above (which skips the scope check entirely) and the
+                    # single-assignment literal fast path below (which
+                    # substitutes ONE resolved path into $ABS_PATH), this
+                    # resolves to MULTIPLE paths — so every member is vetted
+                    # here, through the SAME _rm_path_is_catastrophic() /
+                    # _rm_path_in_repo_scope() predicates the ordinary flow
+                    # below calls (one shared implementation, not a mirrored
+                    # copy), denying the whole loop on the FIRST disallowed
+                    # member. See
+                    # rm_scope_for_loop_literal_same_command_resolve()'s own
+                    # doc comment for the exact resolution conditions, and for
+                    # why the #9304 `VAR=$(cat <literal-tmp-path>)` shape is
+                    # deliberately NOT resolved here.
+                    _rm_forloop_resolved=$(rm_scope_for_loop_literal_same_command_resolve "$target" "$COMMAND_RM_MKTEMP_SCAN") || true
+                    if [[ -n "$_rm_forloop_resolved" ]]; then
+                        while IFS= read -r _rm_forloop_member; do
+                            [[ -n "$_rm_forloop_member" ]] || continue
+                            if [[ "$_rm_forloop_member" = /* ]]; then
+                                _rm_forloop_member=$(normalize_abs_path "$_rm_forloop_member")
+                            fi
+                            if _rm_path_is_catastrophic "$_rm_forloop_member"; then
+                                deny "BLOCKED: rm on protected system path: $_rm_forloop_member" "rm-protected-path"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_RM_MKTEMP_SCAN
+                            fi
+                            if ! _rm_path_in_repo_scope "$_rm_forloop_member"; then
+                                deny "BLOCKED: rm target outside repo scope (LOOM_RM_SCOPE=repo): $_rm_forloop_member (resolved for-loop list member for rm target '${target}')" "rm-scope-outside-repo"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_RM_MKTEMP_SCAN
+                            fi
+                        done <<< "$_rm_forloop_resolved"
+                        continue
+                    fi
+
                     # Same-command LITERAL-path fast path (#6676, widened to
                     # `$NAME<literal-suffix>` targets by #6805): unlike the
                     # mktemp form above, a resolved literal is NOT skipped
@@ -8352,9 +8629,7 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                         if [[ "$ABS_PATH" = /* ]]; then
                             ABS_PATH=$(normalize_abs_path "$ABS_PATH")
                         fi
-                        if [[ "$ABS_PATH" == "/" ]] || \
-                           [[ -n "$HOME" && "$ABS_PATH" == "$HOME" ]] || \
-                           [[ "$ABS_PATH" =~ ^/[^/]+$ ]]; then
+                        if _rm_path_is_catastrophic "$ABS_PATH"; then
                             deny "BLOCKED: rm on protected system path: $ABS_PATH" "rm-protected-path"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_RM_MKTEMP_SCAN
                         fi
                     else
@@ -8362,49 +8637,14 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                     fi
                 fi
 
+                # Repo/worktree areas + the built-in ephemeral allowlist. Both
+                # live in _rm_path_in_repo_scope() (#9304) so the #9304
+                # for-loop fast path above vets each of its resolved members
+                # against exactly this predicate rather than a second copy of
+                # it; the rules themselves are unchanged.
                 IN_SCOPE=false
-
-                # Repo + worktree areas. Prefix matches carry a trailing slash
-                # (or match the dir itself) so a sibling dir sharing a name
-                # prefix — e.g. "<repo>-sibling" vs "<repo>" — is NOT admitted.
-                if [[ -n "$REPO_ROOT" ]]; then
-                    if [[ "$ABS_PATH" == "$REPO_ROOT" || "$ABS_PATH" == "$REPO_ROOT"/* ]]; then
-                        IN_SCOPE=true
-                    fi
-                    # The default in-repo worktrees dir is always in scope, even
-                    # when an external worktree.root / LOOM_WORKTREE_ROOT is set.
-                    if [[ "$IN_SCOPE" == false ]] && \
-                       { [[ "$ABS_PATH" == "$REPO_ROOT/.loom/worktrees" || "$ABS_PATH" == "$REPO_ROOT/.loom/worktrees"/* ]]; }; then
-                        IN_SCOPE=true
-                    fi
-                    # Configured/overridden worktree root (external volumes).
-                    if [[ "$IN_SCOPE" == false ]]; then
-                        if [[ -z "${_WT_ROOT+x}" ]]; then
-                            _WT_ROOT=$(resolve_worktree_root "$REPO_ROOT")
-                        fi
-                        if [[ -n "$_WT_ROOT" ]] && \
-                           { [[ "$ABS_PATH" == "$_WT_ROOT" || "$ABS_PATH" == "$_WT_ROOT"/* ]]; }; then
-                            IN_SCOPE=true
-                        fi
-                    fi
-                fi
-
-                # Built-in ephemeral allowlist: system temp roots + the Claude
-                # scratchpad. normalize_abs_path() is LEXICAL — it does NOT
-                # resolve symlinks — so on macOS both the symlink form (/tmp,
-                # /var/tmp, /var/folders) AND its /private target must be listed.
-                # A bare temp root (/tmp, /private/tmp, …) is NOT matched here:
-                # those have no trailing component, so the catastrophic
-                # top-level deny above already handled bare /tmp, and a bare
-                # /private/tmp falls through to the out-of-scope deny.
-                if [[ "$IN_SCOPE" == false ]]; then
-                    case "$ABS_PATH" in
-                        /tmp/*|/private/tmp/*|\
-                        /var/tmp/*|/private/var/tmp/*|\
-                        /var/folders/*|/private/var/folders/*|\
-                        */claude-*/*/scratchpad/*)
-                            IN_SCOPE=true ;;
-                    esac
+                if _rm_path_in_repo_scope "$ABS_PATH"; then
+                    IN_SCOPE=true
                 fi
 
                 if [[ "$IN_SCOPE" == false ]]; then
