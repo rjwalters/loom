@@ -38,15 +38,24 @@ by a GitHub timeline event (see [`tracing.md`](tracing.md)); Loom mints none.
 
 **`loom.attempt`** has one meaning everywhere: the 1-indexed ordinal of a span
 among the same-named spans (and the same `loom.role`, when present) under the
-same parent, ordered by start (the reconciler breaks ties by opening event,
-PR number, then `source_event_id`).
-Loom's `loom.role_attempt` / `loom.phase` value — the Nth started attempt of a
-role within a sweep (`Journal::start_linked`) — is the special case whose
-parent is the sweep. The 2am reconciler sets it on the repeating story kinds
-(`story.queue_dwell`, `story.review_wait`, `story.rework`, `story.reopened`,
-`story.operator_hold`) under the story root. An opened-but-unclosed sibling
-counts, so an exported ordinal is never reissued; ordinals are never
-renumbered, so a span aged out of retention leaves a visible gap.
+same parent, ordered by when each span **opened** — not by its start — with
+ties broken by the opening event, PR number, then `source_event_id`. Round 1
+of `story.review_wait` opens at PR-ready and later rounds at their `labeled
+loom:review-requested`; every other kind opens at its opening event. The two
+differ only for a `basis=ci` `story.review_wait`, whose start moves to CI's
+conclusion when the round closes. Loom's `loom.role_attempt` / `loom.phase`
+value — the Nth started attempt of a role within a sweep
+(`Journal::start_linked`) — is the special case whose parent is the sweep;
+there start and opening coincide. The 2am reconciler sets it on the repeating
+story kinds (`story.queue_dwell`, `story.review_wait`, `story.rework`,
+`story.reopened`, `story.operator_hold`) under the story root. Every opened
+sibling consumes an ordinal: a still-open one, and also a round or rework
+abandoned when its PR closes without closing it (closed as a duplicate or
+superseded mid-review, or human-merged with no verdict). So ordinals can have
+gaps, are never reissued, and are never renumbered (a span aged out of
+retention also leaves a gap). Source of truth: 2AMLogic/2am
+`infra/signoz/docs/story-trace.md` §"Review rounds, rework and operator holds
+(v1)" and the D32 amendment of 2026-09-28 in `infra/ops/decisions.md`.
 
 A child span's ID is derived from its trace ID, its parent span ID, its span
 name, its `loom.role` (if any), its `loom.tool.name` (if any), and its start
