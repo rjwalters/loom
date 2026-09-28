@@ -716,6 +716,11 @@ fn emit_correlated(
     // The launch record's runtime, else the resolved-runtime marker (#8594);
     // absent (unknown, never guessed) for a Claude tick with neither.
     let story_runtime = usage_runtime.clone().flatten();
+    // #9303: the tick's per-model usage, kept for its usage spans below.
+    let tokens_by_model = scan
+        .as_ref()
+        .map(|scan| scan.tokens_by_model.clone())
+        .filter(|rows| !rows.is_empty());
     let record = build_record(tick, repo, visibility, scan);
     let record = apply_runtime_attribution(record, runtime_attribution);
     let path = crate::sweep_outcomes::default_role_tick_telemetry_path(&tick.root);
@@ -735,6 +740,16 @@ fn emit_correlated(
     }
     // #9168: join the story of every issue/PR this tick wrote to — after the
     // durable record, so a slow forge lookup can never cost the tick record.
+    if let (Some(trace), Some(rows)) = (&trace, &tokens_by_model) {
+        usage::journal_execution(
+            &tick.root,
+            trace,
+            &tick.role,
+            tick.ended_at,
+            story_runtime.as_deref(),
+            rows,
+        );
+    }
     if let (Some(trace), Some(targets)) = (trace, targets) {
         let facts = story::TickFacts {
             trace,
@@ -743,6 +758,7 @@ fn emit_correlated(
             result: result_label(tick.result),
             runtime: story_runtime,
             model: tick.model.clone(),
+            tokens_by_model,
         };
         story::emit(&tick.root, &facts, &targets);
     }
@@ -760,6 +776,7 @@ pub fn result_label(result: RoleTickResult) -> String {
 
 pub mod story;
 pub mod targets;
+pub mod usage;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
