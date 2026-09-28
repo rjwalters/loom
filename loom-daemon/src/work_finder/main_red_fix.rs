@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -120,7 +121,7 @@ fn ci_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Whether `root`'s latest `main` CI conclusion is a failure — the fallback
+/// Whether `root`'s latest default-branch CI conclusion is a failure — the fallback
 /// for a repo with no enabled gate. Cached for [`CI_FALLBACK_TTL`]. Any
 /// failure to answer (breaker suppressing, `gh` missing, no runs) is "not
 /// red": the fallback can only ever grant the boost on positive evidence.
@@ -139,31 +140,37 @@ pub fn ci_main_red(root: &Path) -> bool {
     red
 }
 
+/// The branch the CI fallback reads: the repo's default branch from
+/// `origin/HEAD`, else `main` when that symbolic ref is unset.
+pub(super) fn default_branch_for(root: &Path) -> String {
+    crate::worktree_ops::clean::default_branch(root).unwrap_or_else(|| "main".to_string())
+}
+
 fn probe_ci_main_red(root: &Path) -> bool {
-    let args = [
-        "run",
-        "list",
-        "--branch",
-        "main",
-        "--limit",
-        "30",
-        "--json",
-        "headSha,status,conclusion,workflowName",
-    ];
-    match crate::main_health_gate::run_capture_with_timeout(
-        "gh",
-        &args,
-        root,
-        Duration::from_secs(30),
-    ) {
-        Ok(stdout) => latest_run_is_failure(&stdout),
-        Err(e) => {
-            log::debug!(
-                "work_finder: red-main CI fallback unavailable for {} ({e})",
-                root.display()
-            );
-            false
+    let branch = default_branch_for(root);
+    let mut cmd = Command::new("gh");
+    cmd.args(["run", "list", "--branch", &branch, "--limit", "30"])
+        .args(["--json", "headSha,status,conclusion,workflowName"])
+        .current_dir(root)
+        .stdin(Stdio::null());
+    crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, Some(root));
+    let unavailable = |why: &str| {
+        log::debug!("work_finder: red-main CI fallback unavailable for {} ({why})", root.display());
+        false
+    };
+    match crate::sweep_registry::reaper::output_with_timeout(cmd, Duration::from_secs(30)) {
+        Ok(Some(out)) if out.status.success() => {
+            latest_run_is_failure(&String::from_utf8_lossy(&out.stdout))
         }
+        Ok(Some(out)) => {
+            // Feed the rate-limit breaker like every other forge read, so an
+            // exhausted pool trips it instead of being retried every minute.
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            crate::rate_limit_breaker::global_observe_failure(&stderr, "work_finder_main_red_ci");
+            unavailable(&stderr)
+        }
+        Ok(None) => unavailable("timed out"),
+        Err(e) => unavailable(&e.to_string()),
     }
 }
 

@@ -243,7 +243,7 @@ fn overflow_covers_the_per_repo_cap_too() {
     let report = tick_multi_with_repo_cap(
         &mut multi,
         &[100],
-        4,
+        4.into(),
         &[false],
         usize::MAX,
         false,
@@ -306,6 +306,155 @@ fn overflow_still_yields_to_the_host_class_and_pool_gates() {
     };
     let mut dispatcher = full(0);
     let src = &mut FakeSource::once(vec![starred(1, &[])]);
-    let report = tick_with_lanes(src, &mut dispatcher, (2, usize::MAX), true, false, lane).unwrap();
+    let report =
+        tick_with_lanes(src, &mut dispatcher, (2.into(), usize::MAX), true, false, lane).unwrap();
     assert!(report.halted && dispatcher.dispatched.is_empty());
+}
+
+// ---- Review fixes (#9306) --------------------------------------------------
+
+#[test]
+fn starred_epics_and_proposals_are_not_starred_candidates() {
+    use crate::work_finder::operator_priority::CHAMPION_PATH_LABELS;
+    let mut listed: Vec<WorkItem> = CHAMPION_PATH_LABELS
+        .iter()
+        .zip(20..)
+        .map(|(l, n)| starred(n, &[l]))
+        .collect();
+    listed.push(starred(30, &["loom:triage"]));
+    listed.push(starred(31, &["loom:epic-phase"]));
+    let merged: Vec<u32> = merge_starred(vec![], listed)
+        .iter()
+        .map(|i| i.number)
+        .collect();
+    assert_eq!(merged, vec![30, 31], "epics and proposals keep their Champion path");
+
+    // Nothing starred-only reaches dispatch on either path.
+    let rows =
+        || merge_starred(vec![], vec![starred(20, &["loom:epic"]), starred(21, &["loom:hermit"])]);
+    let mut dispatcher = RecordingDispatcher::default();
+    tick(&mut FakeSource::once(rows()), &mut dispatcher, 10, false).unwrap();
+    assert!(dispatcher.dispatched.is_empty());
+    let mut multi = vec![(FakeSource::once(rows()), RecordingDispatcher::default())];
+    assert_eq!(tick_multi(&mut multi, &[100], 10, &[false]).dispatched, 0);
+}
+
+/// Two repos: repo 0 is hot (one live sweep, which is the live overflow
+/// sweep, so the slot is taken) with unstarred #1; repo 1 is cold with `lead`.
+fn hot_and_cold(lead: WorkItem) -> Vec<(FakeSource, RecordingDispatcher)> {
+    let hot = RecordingDispatcher {
+        overflow_live: true,
+        ..full(1)
+    };
+    vec![
+        (FakeSource::once(vec![issue(1)]), hot),
+        (FakeSource::once(vec![lead]), RecordingDispatcher::default()),
+    ]
+}
+
+#[test]
+fn the_per_repo_cap_does_not_reorder_starred_work_behind_a_hot_repo() {
+    // Global cap 2, per-repo cap 2, one slot left. Starred #5 (cold repo)
+    // must win it over unstarred #1 (hot repo), without overflow.
+    let red_fix = WorkItem::new(5, vec!["loom:issue".into()])
+        .with_body(Some("<!-- loom:main-red-fix -->".into()));
+    let red = RedMainLane {
+        verified_red: true,
+        ..RedMainLane::default()
+    };
+    for (lead, lanes) in [
+        (starred(5, &[]), vec![]),
+        (red_fix, vec![RedMainLane::default(), red]),
+    ] {
+        let mut multi = hot_and_cold(lead);
+        let report = tick_multi_with_repo_cap(
+            &mut multi,
+            &[100, 100],
+            2.into(),
+            &[false, false],
+            usize::MAX,
+            false,
+            None,
+            Some(2),
+            &lanes,
+        );
+        assert_eq!(multi[1].1.dispatched, vec![5], "{lanes:?}");
+        assert!(multi[0].1.dispatched.is_empty(), "{lanes:?}");
+        assert_eq!((report.dispatched_overflow, report.deferred_capacity), (0, 1));
+    }
+
+    // Repo sharding: a starred issue in a repo outside this host's slice is
+    // not deferred behind the slice either.
+    let mut multi = hot_and_cold(starred(5, &[]));
+    let slice = [true, false];
+    let report = tick_multi_with_repo_cap(
+        &mut multi,
+        &[100, 100],
+        2.into(),
+        &[false, false],
+        usize::MAX,
+        false,
+        Some(&slice),
+        Some(2),
+        &[],
+    );
+    assert_eq!(multi[1].1.dispatched, vec![5]);
+    assert_eq!(report.deferred_out_of_slice, 0);
+
+    // Single-workspace path: starred #5 goes ahead of #1.
+    let mut dispatcher = RecordingDispatcher {
+        overflow_live: true,
+        ..full(1)
+    };
+    let src = &mut FakeSource::once(vec![issue(1), starred(5, &[])]);
+    tick(src, &mut dispatcher, 2, false).unwrap();
+    assert_eq!(dispatcher.dispatched, vec![5]);
+}
+
+#[test]
+fn overflow_never_passes_disk_or_ram_headroom() {
+    let terms = |configured, headroom| CapTerms {
+        configured,
+        headroom,
+    };
+    // (terms, occupancy, overflow expected)
+    let cases = [
+        (terms(4, 0), 0, false), // RAM / disk headroom is 0
+        (terms(4, 2), 2, false), // headroom binds below the configured cap
+        (terms(2, 2), 2, false), // headroom reached as well as the cap
+        (terms(2, 5), 2, true),  // configured cap reached, headroom to spare
+    ];
+    for (t, occ, expect) in cases {
+        let items = || vec![starred(1, &[]), starred(2, &[])];
+        let mut multi = vec![(FakeSource::once(items()), full(occ))];
+        let report = tick_multi_with_repo_cap(
+            &mut multi,
+            &[100],
+            t,
+            &[false],
+            usize::MAX,
+            false,
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(report.dispatched_overflow, usize::from(expect), "multi {t:?}");
+        assert_eq!(report.dispatched, usize::from(expect), "multi {t:?}: exactly one");
+
+        let mut dispatcher = full(occ);
+        let src = &mut FakeSource::once(items());
+        let lane = RedMainLane::default();
+        let report = tick_with_lanes(src, &mut dispatcher, (t, usize::MAX), false, false, lane);
+        let report = report.unwrap();
+        assert_eq!(report.dispatched_overflow, usize::from(expect), "single {t:?}");
+        assert_eq!(report.dispatched, usize::from(expect), "single {t:?}: exactly one");
+    }
+
+    // The plain entry points know no headroom, but a cap of 0 can only come
+    // from headroom (a configured 0 is treated as unset), so it never overflows.
+    let mut multi = vec![(FakeSource::once(vec![starred(1, &[])]), full(0))];
+    assert_eq!(tick_multi(&mut multi, &[100], 0, &[false]).dispatched, 0);
+    let mut dispatcher = full(0);
+    let report = tick(&mut FakeSource::once(vec![starred(1, &[])]), &mut dispatcher, 0, false);
+    assert_eq!(report.unwrap().dispatched, 0);
 }

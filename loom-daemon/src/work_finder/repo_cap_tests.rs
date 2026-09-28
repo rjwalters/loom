@@ -78,7 +78,7 @@ fn tick_capped<const N: usize>(
     tick_multi_with_repo_cap(
         workspaces,
         priorities,
-        max_concurrent,
+        max_concurrent.into(),
         &[false; N],
         usize::MAX,
         false,

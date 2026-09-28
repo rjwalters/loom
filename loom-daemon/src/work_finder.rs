@@ -238,7 +238,7 @@ mod tick_summary;
 use crate::types::QueueDisposition as Qd;
 pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
 pub use main_red_fix::RedMainLane;
-pub use operator_priority::{OverflowSlot, OPERATOR_PRIORITY_LABEL};
+pub use operator_priority::{CapTerms, OverflowSlot, OPERATOR_PRIORITY_LABEL};
 pub use ordering::{candidate_cmp, PriorityCandidate};
 use tick_report::record_dispatch_outcome;
 pub use tick_report::{Admission, TickReport};
@@ -973,7 +973,7 @@ pub fn tick_with_saturation_brake(
     saturation_held: bool,
 ) -> Result<TickReport> {
     let lane = RedMainLane::default();
-    let caps = (max_concurrent, max_admissions_per_tick);
+    let caps = (max_concurrent.into(), max_admissions_per_tick);
     tick_with_lanes(source, dispatcher, caps, halted, saturation_held, lane)
 }
 
@@ -982,7 +982,8 @@ pub fn tick_with_saturation_brake(
 /// keeps its listing order), a halted repo whose `main` is verified red still
 /// admits its `<!-- loom:main-red-fix -->` issues and nothing else (`lane`),
 /// and one starred issue refused only by the concurrency cap may take the
-/// host's [`OverflowSlot`]. `caps` is `(max_concurrent, max_admissions_per_tick)`.
+/// host's [`OverflowSlot`]. `caps` is `(cap terms, max_admissions_per_tick)`;
+/// the effective cap is [`CapTerms::effective`].
 ///
 /// # Errors
 ///
@@ -990,7 +991,7 @@ pub fn tick_with_saturation_brake(
 pub fn tick_with_lanes(
     source: &mut impl WorkSource,
     dispatcher: &mut impl WorkDispatcher,
-    (max_concurrent, max_admissions_per_tick): (usize, usize),
+    (terms, max_admissions_per_tick): (CapTerms, usize),
     halted: bool,
     saturation_held: bool,
     lane: RedMainLane,
@@ -1006,7 +1007,7 @@ pub fn tick_with_lanes(
     };
     let red = lane.is_red(&ready, || dispatcher.main_red_via_ci());
     ready_queue::sort_lanes(&mut ready, red);
-    let mut overflow = OverflowSlot::new(dispatcher.overflow_in_flight());
+    let (max_concurrent, mut overflow) = OverflowSlot::open(dispatcher.overflow_in_flight(), terms);
 
     // Reactive backstop: a red `main` halts all new dispatch this tick — except
     // its verified red-main fixes (#9244), which the loop below lets through.
@@ -1226,8 +1227,8 @@ pub fn tick_with_lanes(
         }
         // 3. Fixed concurrency cap — defer the rest to a future tick, unless
         //    this starred issue can take the host's overflow slot (#9244).
-        let over = occupancy >= max_concurrent
-            && overflow.admits(item.is_operator_priority(), occupancy, max_concurrent);
+        let over =
+            occupancy >= max_concurrent && overflow.admits(item.is_operator_priority(), occupancy);
         if occupancy >= max_concurrent && !over {
             report.deferred_capacity += 1;
             continue;
@@ -1534,7 +1535,7 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
     workspaces: &mut [(S, D)],
     priorities: &[u32],
-    max_concurrent: usize,
+    terms: CapTerms,
     halted: &[bool],
     max_admissions_per_tick: usize,
     saturation_held: bool,
@@ -1562,7 +1563,7 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
     let mut cap = RepoCap::new(max_concurrent_per_repo, per_repo_occupancy);
     // The host's single `loom:operator-priority` overflow slot (#9244), taken
     // up front when any workspace already has a live overflow sweep.
-    let mut overflow = OverflowSlot::new(workspaces.iter().any(|(_, d)| d.overflow_in_flight()));
+    let (max_concurrent, mut overflow) = OverflowSlot::for_workspaces(workspaces, terms);
 
     // Snapshot each workspace's quarantined set (#3939) alongside its in-flight
     // set. Quarantined candidates are dropped in pass 1 *before* the global sort
@@ -1904,7 +1905,7 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
         // per-repo cap may take the host's single over-limit slot. The ramp cap
         // is not a queue limit, so it still applies (checked below).
         let over = (occupancy >= max_concurrent || cap.at_cap(cand.workspace_idx))
-            && overflow.admits(cand.operator_priority, occupancy, max_concurrent);
+            && overflow.admits(cand.operator_priority, occupancy);
         // Shared global cap across all workspaces — defer once the combined
         // occupancy hits the budget, regardless of which workspace still has
         // ready items.
@@ -2516,7 +2517,7 @@ where
             match tick_with_lanes(
                 &mut source,
                 &mut dispatcher,
-                (max_concurrent, max_admissions_per_tick),
+                (CapTerms::new(configured_max, disk, ram), max_admissions_per_tick),
                 halted,
                 saturation_held,
                 lane,
@@ -3137,7 +3138,7 @@ pub fn spawn_multi_work_finder_task(
             let report = tick_multi_with_repo_cap(
                 &mut pairs,
                 &priorities,
-                max_concurrent,
+                CapTerms::new(configured_max, disk, ram),
                 &halted,
                 max_admissions_per_tick,
                 saturation_held,

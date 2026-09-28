@@ -17,6 +17,7 @@
 //!    back to `createdAt` in [`super::ordering::candidate_cmp`].
 //! 3. **The overflow slot.** [`OverflowSlot`] lets one starred issue that
 //!    only the queue caps refused run as this host's single over-limit sweep.
+//!    It never goes past disk or RAM headroom ([`CapTerms`]).
 //!
 //! This label is **not** `loom:operator` (the hold) and is not a hold of any
 //! kind; nothing may prefix-match `loom:operator-` as a hold (see
@@ -30,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
-use super::{TickReport, WorkItem, BUILDING_LABEL};
+use super::{TickReport, WorkDispatcher, WorkItem, BUILDING_LABEL};
 
 /// The operator-priority ("starred") label (#9244).
 pub const OPERATOR_PRIORITY_LABEL: &str = "loom:operator-priority";
@@ -38,6 +39,12 @@ pub const OPERATOR_PRIORITY_LABEL: &str = "loom:operator-priority";
 /// The in-progress Curator claim. A starred issue carrying it is being
 /// curated right now, so the starred listing leaves it alone this tick.
 pub const CURATING_LABEL: &str = "loom:curating";
+
+/// Labels that route an issue through Champion rather than the Builder: an
+/// epic, and the three proposal kinds. A star on one of these is not a
+/// dispatch request, so the starred listing skips it.
+pub const CHAMPION_PATH_LABELS: [&str; 4] =
+    ["loom:epic", "loom:architect", "loom:hermit", "loom:auditor"];
 
 /// How long an *unknown* starred-at (the timeline read failed or found no
 /// event) is trusted before it is read again. A known starred-at is kept
@@ -68,6 +75,11 @@ impl WorkItem {
 /// showed such rows either. Every other starred row is kept and goes through
 /// the normal skip filters, so a starred issue carrying a park or skip label
 /// is still never dispatched.
+///
+/// A starred epic or proposal ([`CHAMPION_PATH_LABELS`]) is dropped from the
+/// starred rows too: the star does not make it build work. It keeps its
+/// Champion path (a starred epic is curated, then taken first by Champion's
+/// epic queue; #9244 slice B). The `loom:issue` rows are left as they are.
 #[must_use]
 pub fn merge_starred(mut ready: Vec<WorkItem>, starred: Vec<WorkItem>) -> Vec<WorkItem> {
     let listed: HashSet<u32> = ready.iter().map(|i| i.number).collect();
@@ -77,6 +89,10 @@ pub fn merge_starred(mut ready: Vec<WorkItem>, starred: Vec<WorkItem>) -> Vec<Wo
                 .labels
                 .iter()
                 .any(|l| l == BUILDING_LABEL || l == CURATING_LABEL)
+            && !i
+                .labels
+                .iter()
+                .any(|l| CHAMPION_PATH_LABELS.contains(&l.as_str()))
     }));
     ready
 }
@@ -262,8 +278,51 @@ pub fn repo_key(cwd: Option<&Path>, repo: Option<&str>) -> String {
     )
 }
 
+/// The two kinds of term in this tick's concurrency cap (#9244 §5, #5270).
+///
+/// The dynamic cap is `min(disk headroom, ram headroom, configured)`. Only the
+/// **configured** term is a queue limit an operator's star may overflow; the
+/// headroom terms say the host cannot hold another worktree, so they are hard
+/// limits that nothing overflows. The tick needs both to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapTerms {
+    /// The configured `maxConcurrent` (after env / config resolution).
+    pub configured: usize,
+    /// `min(disk headroom, ram headroom)`: how many sweeps the host can hold.
+    pub headroom: usize,
+}
+
+impl CapTerms {
+    /// The terms from this tick's configured cap and its disk / RAM probes.
+    #[must_use]
+    pub fn new(configured: usize, disk_headroom: usize, ram_headroom: usize) -> Self {
+        Self {
+            configured,
+            headroom: disk_headroom.min(ram_headroom),
+        }
+    }
+
+    /// The effective cap every non-overflow admission is held to.
+    #[must_use]
+    pub fn effective(&self) -> usize {
+        self.configured.min(self.headroom)
+    }
+}
+
+impl From<usize> for CapTerms {
+    /// A cap with no known resource headroom: every term is configured. The
+    /// plain `tick*` entry points use this; the production loops build the
+    /// real terms from their disk and RAM probes.
+    fn from(configured: usize) -> Self {
+        Self {
+            configured,
+            headroom: usize::MAX,
+        }
+    }
+}
+
 /// The per-host overflow slot (#9244 §5): **one** over-limit sweep, starred
-/// work only.
+/// work only, and only past the *configured* cap.
 ///
 /// A starred candidate that only the global `max_concurrent` cap and/or the
 /// per-repo cap refused may be dispatched anyway, as long as:
@@ -271,33 +330,60 @@ pub fn repo_key(cwd: Option<&Path>, repo: Option<&str>) -> String {
 /// - no live sweep on this host is already marked `overflow` (seeded from
 ///   [`super::WorkDispatcher::overflow_in_flight`]), and no earlier candidate
 ///   took the slot this tick;
-/// - `occupancy <= max_concurrent`. The dynamic cap can drop below occupancy
-///   mid-flight; a host already over its limit for that reason must not add
-///   another sweep, which is what keeps it to *one* over-limit sweep.
+/// - the host has resource headroom for one more sweep
+///   (`occupancy < headroom`, and the effective cap is not 0). Disk and RAM
+///   headroom are safety gates (#5270), never overflowed: when either binds
+///   the cap, the star waits like everything else;
+/// - `occupancy <= configured`. The cap can drop below occupancy mid-flight;
+///   a host already over its limit for that reason must not add another
+///   sweep, which is what keeps it to *one* over-limit sweep.
 ///
 /// Every other gate still applies before this is consulted: the saturation
 /// brake, host-class and pool gates, skip/park labels, quarantine, backoff,
 /// peer claims and the per-tick ramp cap. Unstarred work, including red-main
 /// fixes, never uses the slot.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverflowSlot {
     taken: bool,
+    terms: CapTerms,
 }
 
 impl OverflowSlot {
     /// A slot for this tick; `already_live` is whether an overflow sweep is
     /// still running from an earlier tick.
     #[must_use]
-    pub fn new(already_live: bool) -> Self {
+    pub fn new(already_live: bool, terms: CapTerms) -> Self {
         Self {
             taken: already_live,
+            terms,
         }
+    }
+
+    /// The tick's effective cap plus its slot, for the single-workspace tick.
+    #[must_use]
+    pub fn open(already_live: bool, terms: CapTerms) -> (usize, Self) {
+        (terms.effective(), Self::new(already_live, terms))
+    }
+
+    /// [`Self::open`] for the multi-workspace tick: the slot is taken when
+    /// any workspace already has a live overflow sweep.
+    #[must_use]
+    pub fn for_workspaces<S, D: WorkDispatcher>(
+        workspaces: &[(S, D)],
+        terms: CapTerms,
+    ) -> (usize, Self) {
+        let live = workspaces.iter().any(|(_, d)| d.overflow_in_flight());
+        Self::open(live, terms)
     }
 
     /// Whether a candidate refused only by a queue cap may take the slot.
     #[must_use]
-    pub fn admits(&self, starred: bool, occupancy: usize, max_concurrent: usize) -> bool {
-        starred && !self.taken && occupancy <= max_concurrent
+    pub fn admits(&self, starred: bool, occupancy: usize) -> bool {
+        starred
+            && !self.taken
+            && self.terms.effective() > 0
+            && occupancy < self.terms.headroom
+            && occupancy <= self.terms.configured
     }
 
     /// Mark the slot used by a dispatch that actually started.

@@ -1981,7 +1981,16 @@ already claimed (`loom:building`, `loom:curating`) are dropped. Skip and park la
 still win: a starred issue carrying `loom:blocked`, `loom:operator-only`,
 `loom:operator-decision` or `loom:operator` is never dispatched
 (`loom:operator-decision` is a skip label in its own right since #9244). If the
-second listing fails, the tick carries on with the `loom:issue` rows.
+second listing fails, the tick carries on with the `loom:issue` rows. A starred
+`loom:epic` or proposal (`loom:architect`, `loom:hermit`, `loom:auditor`) is
+not taken from the second listing: the star does not make it build work, and it
+keeps its Champion path.
+
+**Lane candidates are not reshaped.** Starred and red-main-fix candidates stay at
+the head of the multi-workspace queue in comparator order. The per-repo cap's
+track affinity and the repo-sharding slice (#6243) reorder and defer only the
+ordinary work behind them, so a starred issue in a cold repo, or in a repo
+another host's slice prefers, is still picked first.
 
 `loom:operator-priority` is **not** `loom:operator` and is not a hold. Code that
 treats a `loom:operator-` prefix match as a hold must exclude it by name (see
@@ -1993,8 +2002,13 @@ refused may still be dispatched, as this host's single overflow sweep, when:
 
 - no live sweep on this host is already marked `overflow` (and no earlier
   candidate took the slot this tick), and
-- occupancy is at most `maxConcurrent`. The dynamic cap can drop below
-  occupancy mid-flight; a host already over its limit that way adds nothing.
+- occupancy is at most the **configured** `maxConcurrent`. The cap can drop
+  below occupancy mid-flight; a host already over its limit that way adds
+  nothing, and
+- the host has disk and RAM headroom for one more sweep (occupancy is below
+  `min(disk headroom, ram headroom)`, and the dynamic cap is not 0). Overflow
+  goes past the configured queue limit only, never past resource headroom:
+  when disk or RAM binds the dynamic cap, a starred issue waits like any other.
 
 The saturation brake, the host-class gate, token-pool and pre-flight holds, skip
 and park labels, quarantine, backoff, peer claims and the per-tick ramp cap all
@@ -3172,7 +3186,8 @@ issue whose linked PR is in flight a non-candidate (`open_pr`), so the tick's
 next dispatch goes to another repo, and re-engagement when the PR merges is
 automatic. It composes with [repo sharding (#6243)](dispatcher-repo-sharding.md)
 in a fixed order: the sharding slice partition runs first, affinity reorders
-within its result, and the cap gates admission last.
+within its result, and the cap gates admission last. Starred and red-main-fix
+candidates are exempt from both partitions (#9244).
 
 #### Why there is no CPU term in admission (#4512)
 

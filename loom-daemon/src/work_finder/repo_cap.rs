@@ -191,11 +191,19 @@ impl RepoCap {
 /// slice partition, then (when a per-repo cap is configured) the #9090 track
 /// affinity partition.
 ///
-/// Both are **stable partitions** of an already-sorted list, so
-/// [`candidate_cmp`](super::candidate_cmp) still decides order within each
-/// group and the comparator itself is untouched — its ordering tests stay
-/// valid. With `preferred_slice: None` and a disabled `cap` this returns
-/// `candidates` unchanged.
+/// **Lane candidates are exempt** (#9244): a starred or red-main-fix candidate
+/// stays at the head of the list, in its [`candidate_cmp`](super::candidate_cmp)
+/// order, and both partitions apply only to the ordinary tail behind it.
+/// Affinity would otherwise float every hot-repo candidate ahead of a starred
+/// issue in a cold repo, and the slice would defer a starred issue whose repo
+/// another host prefers; either breaks "starred first, fleet-wide". A lane
+/// candidate's repo still counts toward the slice's "is my slice empty?"
+/// question, so the #6243 fallback behaves as before.
+///
+/// Both partitions are **stable**, so `candidate_cmp` still decides order
+/// within each group and the comparator itself is untouched. With
+/// `preferred_slice: None` and a disabled `cap` this returns `candidates`
+/// unchanged.
 #[must_use]
 pub fn shape_queue(
     candidates: Vec<PriorityCandidate>,
@@ -203,9 +211,18 @@ pub fn shape_queue(
     cap: &RepoCap,
     report: &mut TickReport,
 ) -> Vec<PriorityCandidate> {
-    let sliced = apply_slice(candidates, preferred_slice, report);
+    // `candidates` is sorted by `candidate_cmp`, whose first keys are the
+    // lanes, so this partition keeps the head exactly as sorted.
+    let (lanes, rest): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|c| c.operator_priority || c.main_red_fix);
+    let in_slice = |c: &PriorityCandidate| {
+        preferred_slice.is_none_or(|s| s.get(c.workspace_idx).copied().unwrap_or(true))
+    };
+    let lane_in_slice = lanes.iter().any(in_slice);
+    let sliced = apply_slice(rest, preferred_slice, lane_in_slice, report);
     if !cap.enabled() {
-        return sliced;
+        return lanes.into_iter().chain(sliced).collect();
     }
     // Track affinity (#9090): float repos that already have a live sweep ahead
     // of cold ones. `Iterator::partition` preserves relative order within both
@@ -216,7 +233,7 @@ pub fn shape_queue(
     let (hot, cold): (Vec<_>, Vec<_>) = sliced
         .into_iter()
         .partition(|c| cap.is_hot(c.workspace_idx));
-    hot.into_iter().chain(cold).collect()
+    lanes.into_iter().chain(hot).chain(cold).collect()
 }
 
 /// The #6243 repo-sharding slice partition, moved here verbatim from
@@ -226,10 +243,13 @@ pub fn shape_queue(
 /// `None` is a no-op. Otherwise the already-sorted list splits into in-slice /
 /// out-of-slice preserving each partition's relative order; out-of-slice
 /// candidates dispatch THIS TICK only when the slice was completely empty at
-/// the top of the tick (work-conservation, #6243's AC).
+/// the top of the tick (work-conservation, #6243's AC). `lane_in_slice` says
+/// an exempt lane candidate (see [`shape_queue`]) sits in the slice, so the
+/// slice is not empty.
 fn apply_slice(
     candidates: Vec<PriorityCandidate>,
     preferred_slice: Option<&[bool]>,
+    lane_in_slice: bool,
     report: &mut TickReport,
 ) -> Vec<PriorityCandidate> {
     let Some(slice) = preferred_slice else {
@@ -238,7 +258,7 @@ fn apply_slice(
     let (in_slice, out_of_slice): (Vec<_>, Vec<_>) = candidates
         .into_iter()
         .partition(|c| slice.get(c.workspace_idx).copied().unwrap_or(true));
-    if in_slice.is_empty() {
+    if in_slice.is_empty() && !lane_in_slice {
         // This host's slice has zero eligible candidates this tick — fall back
         // to the full out-of-slice queue rather than starving while other
         // repos have ready work.
@@ -266,7 +286,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
     super::tick_multi_with_repo_cap(
         workspaces,
         priorities,
-        max_concurrent,
+        max_concurrent.into(),
         halted,
         max_admissions_per_tick,
         saturation_held,

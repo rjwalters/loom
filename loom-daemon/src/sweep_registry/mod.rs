@@ -120,7 +120,7 @@ mod pool_hold_broadcast;
 pub(crate) mod private_dispatch;
 mod prless_retry;
 mod quarantine;
-mod reaper;
+pub(crate) mod reaper;
 mod spawn_process;
 mod stacking;
 // Shared test registry fixture for adoption-correlation coverage.

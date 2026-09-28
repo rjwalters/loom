@@ -45,7 +45,7 @@ fn a_fix_sorts_first_only_while_main_is_verified_red() {
     let report = tick_multi_with_repo_cap(
         &mut multi,
         &[100],
-        1,
+        1.into(),
         &[false],
         usize::MAX,
         false,
@@ -63,7 +63,7 @@ fn a_fix_sorts_first_only_while_main_is_verified_red() {
     // Single-workspace path.
     let mut dispatcher = RecordingDispatcher::default();
     let src = &mut FakeSource::once(items());
-    tick_with_lanes(src, &mut dispatcher, (1, usize::MAX), false, false, RED).unwrap();
+    tick_with_lanes(src, &mut dispatcher, (1.into(), usize::MAX), false, false, RED).unwrap();
     assert_eq!(dispatcher.dispatched, vec![9]);
 }
 
@@ -74,7 +74,7 @@ fn a_starred_issue_still_outranks_a_red_main_fix() {
     tick_multi_with_repo_cap(
         &mut multi,
         &[100],
-        1,
+        1.into(),
         &[false],
         usize::MAX,
         false,
@@ -94,7 +94,7 @@ fn a_halted_red_repo_admits_its_fixes_and_nothing_else() {
     let report = tick_multi_with_repo_cap(
         &mut multi,
         &[100],
-        10,
+        10.into(),
         &[true],
         usize::MAX,
         false,
@@ -115,7 +115,8 @@ fn a_halted_red_repo_admits_its_fixes_and_nothing_else() {
 
     let mut dispatcher = RecordingDispatcher::default();
     let src = &mut FakeSource::once(items());
-    let report = tick_with_lanes(src, &mut dispatcher, (10, usize::MAX), true, false, RED).unwrap();
+    let report =
+        tick_with_lanes(src, &mut dispatcher, (10.into(), usize::MAX), true, false, RED).unwrap();
     assert!(report.halted);
     assert_eq!(dispatcher.dispatched, vec![9]);
 }
@@ -135,7 +136,7 @@ fn a_hold_that_is_not_a_verified_red_main_admits_nothing() {
         let report = tick_multi_with_repo_cap(
             &mut multi,
             &[100],
-            10,
+            10.into(),
             &[true],
             usize::MAX,
             false,
@@ -148,7 +149,7 @@ fn a_hold_that_is_not_a_verified_red_main_admits_nothing() {
 
         let mut dispatcher = RecordingDispatcher::default();
         let src = &mut FakeSource::once(vec![fix(9)]);
-        tick_with_lanes(src, &mut dispatcher, (10, usize::MAX), true, false, lane).unwrap();
+        tick_with_lanes(src, &mut dispatcher, (10.into(), usize::MAX), true, false, lane).unwrap();
         assert!(dispatcher.dispatched.is_empty(), "{lane:?}");
     }
 }
@@ -165,7 +166,7 @@ fn a_red_main_fix_does_not_get_the_overflow_slot() {
     let report = tick_multi_with_repo_cap(
         &mut multi,
         &[100],
-        2,
+        2.into(),
         &[false],
         usize::MAX,
         false,
@@ -192,7 +193,7 @@ fn with_the_gate_disabled_ci_decides_red() {
         tick_multi_with_repo_cap(
             &mut multi,
             &[100],
-            1,
+            1.into(),
             &[false],
             usize::MAX,
             false,
@@ -228,4 +229,32 @@ fn the_ci_fallback_reads_the_newest_commits_runs() {
     assert!(!latest_run_is_failure(green), "an older red commit is not today's main");
     assert!(!latest_run_is_failure("[]"));
     assert!(!latest_run_is_failure("not json"));
+}
+
+#[test]
+fn the_ci_fallback_reads_the_repos_default_branch() {
+    use crate::work_finder::main_red_fix::default_branch_for;
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    // No `origin/HEAD`: fall back to `main`.
+    assert_eq!(default_branch_for(dir.path()), "main");
+    git(
+        dir.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ],
+    );
+    assert_eq!(default_branch_for(dir.path()), "trunk");
 }
