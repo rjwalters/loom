@@ -23,7 +23,20 @@ one trace, parented to the story root and tagged `loom.issue`, `loom.repo`,
 `loom.ci.job` spans (#9088; see
 [ci-observability](ci-observability.md#story-stitching-9088)). The story root
 span itself is emitted when the story ends (a later phase of #9037); until
-then backends show it as a missing parent. Executions outside an issue, in a
+then backends show it as a missing parent. The storyline reconciler — not
+loom — derives the story's phase spans from the GitHub label timeline; loom
+owns only D32's closed kind allowlist (`STORY_SPAN_KINDS`) and the
+cross-language conformance vectors. That allowlist includes
+`story.operator_hold` (#9335), an overlapping sibling — not a replacement —
+that isolates time spent on a human ruling, from any of the six hold labels
+(`loom:operator-only` and its `-blocked`/`-mechanical`/`-decision`/
+`-objective` sub-kinds, plus the engine-stop `loom:operator`; `loom:blocked`
+is a dependency wait and `loom:operator-priority` a star, so neither counts)
+until the hold clears, tagged `loom.story.operator_hold.kind`, so a reader
+can tell a parked human decision from fleet starvation instead of seeing it
+swallowed by `story.intake` / `story.queue_dwell` — whose widths are
+unchanged, since an exported span's id is fixed by its closing event.
+Executions outside an issue, in a
 checkout with no GitHub `origin`, or whose `repo_id` cannot be resolved
 (warned once per repo) get their own deterministic trace derived from the
 repo key and sweep id — never a random one. Before an owned sweep process is

@@ -35,6 +35,7 @@
   "span_kinds": [
     "story.intake",
     "story.queue_dwell",
+    "story.operator_hold",
     "story.review_wait",
     "story.merge",
     "story.reopened"
@@ -58,6 +59,15 @@
       "kind": "story.review_wait",
       "source_event_id": "20473627891",
       "span_id": "d028f658590dfc35"
+    },
+    {
+      "story": "rjwalters/loom#9027",
+      "repo_id": 1073994527,
+      "number": 9027,
+      "input": "loom-story/v1:github:1073994527:9027",
+      "kind": "story.operator_hold",
+      "source_event_id": "20604142553",
+      "span_id": "edf2afbd7868a223"
     }
   ]
 }

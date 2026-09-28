@@ -87,7 +87,7 @@ fn story_ids_match_every_d32_v1_reference_vector() {
         assert_eq!(story.flags, 1);
     }
     let spans = fixture["span_vectors"].as_array().unwrap();
-    assert_eq!(spans.len(), 2);
+    assert_eq!(spans.len(), 3);
     for v in spans {
         let span = story_span_id(
             v["repo_id"].as_u64().unwrap(),
@@ -129,7 +129,21 @@ fn story_span_id_refuses_what_d32_refuses() {
     let ok = |kind: &str, event: &str| story_span_id(1, 1, kind, event);
     assert!(ok("story.merge", "a.B_c-9").is_ok());
     assert!(ok("story.merge", &"x".repeat(256)).is_ok());
-    for kind in ["loom.story", "ci.run", "story.Merge", "story.merge ", ""] {
+    assert!(ok("story.operator_hold", "20604142553").is_ok());
+    // Near-misses of every kind are refused, not normalised (#9335).
+    for kind in [
+        "loom.story",
+        "ci.run",
+        "story.Merge",
+        "story.merge ",
+        "",
+        "story.operator-hold",
+        "story.operator_hold ",
+        " story.operator_hold",
+        "story.Operator_hold",
+        "story.operator",
+        "operator_hold",
+    ] {
         assert_eq!(ok(kind, "1"), Err(StoryIdError::UnknownKind), "{kind:?}");
     }
     let too_long = "x".repeat(257);

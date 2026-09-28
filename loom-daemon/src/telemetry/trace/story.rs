@@ -13,9 +13,22 @@ pub const STORY_KEY_VERSION: &str = "v1";
 
 /// D32's closed set of derived story-span kinds. `loom.story` is deliberately
 /// absent: the root has exactly one id, [`story_context`]'s `span_id`.
-pub const STORY_SPAN_KINDS: [&str; 5] = [
+///
+/// `story.operator_hold` (#9335) is an *overlapping sibling*, not a phase in
+/// the chain: it measures a human decision — one of the six hold labels
+/// (`loom:operator-only` and its `-blocked`/`-mechanical`/`-decision`/
+/// `-objective` sub-kinds, plus the first-class engine-stop `loom:operator`) —
+/// applied until the hold clears, which is otherwise invisible inside
+/// `story.intake` / `story.queue_dwell`. Those two are never shortened around
+/// a hold: their ids are fixed by their closing event and the reconciler never
+/// re-derives an exported span. It is listed at its earliest possible start
+/// boundary, after `story.queue_dwell`. Emission and its
+/// `loom.story.operator_hold.kind` attribute belong to the storyline
+/// reconciler; loom only owns this allowlist and the D32 conformance vectors.
+pub const STORY_SPAN_KINDS: [&str; 6] = [
     "story.intake",
     "story.queue_dwell",
+    "story.operator_hold",
     "story.review_wait",
     "story.merge",
     "story.reopened",
