@@ -101,7 +101,7 @@ q AS (
   FROM c
 )
 SELECT size_class, n,
-       max(CASE WHEN rl = (n + 1) / 2 THEN hw_lines END) AS median_hw_lines,
-       max(CASE WHEN rt = (n + 1) / 2 THEN tokens   END) AS median_tokens,
-       max(CASE WHEN rf = (n + 1) / 2 THEN hw_files END) AS median_hw_files
+       avg(CASE WHEN rl IN ((n + 1) / 2, (n + 2) / 2) THEN hw_lines END) AS median_hw_lines,
+       avg(CASE WHEN rt IN ((n + 1) / 2, (n + 2) / 2) THEN tokens END) AS median_tokens,
+       avg(CASE WHEN rf IN ((n + 1) / 2, (n + 2) / 2) THEN hw_files END) AS median_hw_files
 FROM q GROUP BY size_class, n ORDER BY size_class;

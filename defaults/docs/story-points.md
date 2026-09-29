@@ -45,7 +45,7 @@ paired n=240 test. This document defines the units; it is not tuned prose.
 ## Provenance and limits
 
 - **Source**: Cloudflare D1 `loom-fleet-telemetry`, `sweep.outcome` records
-  since 2026-08-15 (26,260 records; at its row cap and evicting, 2AMLogic/2am#1608).
+  since 2026-08-15 (26,260 records; at its row cap and evicting; tracked by the fleet-telemetry retention-cap issue).
   Live SigNoz retains ~7 days and cannot support this.
 - **Filter (relaxed)**: landed PR, exactly one `judge` phase, no `doctor`
   phase: 284 of 329 landings. The strict filter (`doctor_cycles = 0`, one
