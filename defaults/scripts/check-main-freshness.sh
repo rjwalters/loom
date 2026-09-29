@@ -105,16 +105,10 @@ if [[ -z "$BRANCH" ]]; then
     exit 0
 fi
 
-# #9106: $BRANCH becomes a bare operand of `git fetch origin -- "$BRANCH"`
-# below. loom_default_branch can source it from LOOM_DEFAULT_BRANCH or from the
-# remote's own HEAD symref, so it is validated before the fetch. This script is
-# advisory and must never exit non-zero — an unsafe name therefore SKIPS (the
-# fetch never runs) rather than erroring.
-if ! declare -F check_branch_name >/dev/null 2>&1 \
-   || ! check_branch_name "$BRANCH" "default branch" 2>/dev/null; then
-    info_oneliner "${YELLOW}[freshness-check] '${BRANCH}' is not a safe git ref operand (or the validator is unavailable); skipping without fetching (#9106).${NC}"
-    exit 0
-fi
+# (#9106: loom_default_branch refuses an unsafe name at the source and returns
+# non-zero, which leaves $BRANCH empty — so the "could not determine the default
+# branch; skipping" arm above is also the unsafe-name arm, and this advisory
+# script still never exits non-zero. The `--` below is the second mitigation.)
 
 REMOTE_REF="origin/$BRANCH"
 
@@ -124,13 +118,11 @@ REMOTE_REF="origin/$BRANCH"
 # can't stall the sweep. On any failure (offline, auth, rate-limit, no `timeout`
 # binary) we fall back to whatever refs/remotes/origin/<branch> is already known
 # locally — possibly stale, but the check stays cheap and never blocks.
-if command -v timeout >/dev/null 2>&1; then
-    timeout 5 git fetch origin --quiet -- "$BRANCH" >/dev/null 2>&1 || true
-else
-    # No `timeout` available (e.g. minimal macOS without coreutils). Still try,
-    # but git's own --quiet keeps it unobtrusive; a hung network is a rare edge.
-    git fetch origin --quiet -- "$BRANCH" >/dev/null 2>&1 || true
-fi
+# No `timeout` available (e.g. minimal macOS without coreutils)? Still fetch —
+# git's own --quiet keeps it unobtrusive and a hung network is a rare edge — so
+# the bound is a command PREFIX rather than a second copy of the same fetch.
+_CMF_BOUND=(); command -v timeout >/dev/null 2>&1 && _CMF_BOUND=(timeout 5)
+"${_CMF_BOUND[@]}" git fetch origin --quiet -- "$BRANCH" >/dev/null 2>&1 || true
 
 # ---------- verify we have both refs to compare ----------
 

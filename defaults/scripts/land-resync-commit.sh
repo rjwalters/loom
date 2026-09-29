@@ -255,11 +255,9 @@ if [[ $_DB_RC -ne 0 ]]; then
 fi
 rm -f "$DEFAULT_BRANCH_ERR_FILE"
 
-# #9106: $DEFAULT_BRANCH becomes a bare operand of `git fetch origin --
-# "$DEFAULT_BRANCH"` below. Validate before the fetch, fail closed.
-if ! check_branch_name "$DEFAULT_BRANCH" "default branch"; then
-    exit "$EXIT_ERROR"
-fi
+# (#9106: loom_default_branch refuses an unsafe name at the source, and its
+# failure is already handled above, so the `git fetch origin --
+# "$DEFAULT_BRANCH"` below can never receive one.)
 
 CURRENT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 if [[ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ]]; then

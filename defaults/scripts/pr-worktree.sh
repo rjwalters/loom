@@ -129,9 +129,8 @@ if ! DEFAULT_BRANCH="$(cd "$REPO_ROOT" && loom_default_branch)"; then
     print_error "Could not determine the default branch. Set LOOM_DEFAULT_BRANCH or run: git remote set-head origin -a"
     exit 1
 fi
-# #9106: the resolved name becomes a bare operand of `git fetch origin --
-# "$DEFAULT_BRANCH"` below. Validate before the fetch, fail closed.
-check_branch_name "$DEFAULT_BRANCH" "default branch" || exit 1
+# (#9106: loom_default_branch refuses an unsafe name at the source, so the
+# `git fetch origin -- "$DEFAULT_BRANCH"` below can never receive one.)
 
 WORKTREE_PATH="$WORKTREE_ROOT_DIR/pr-$PR_NUMBER"
 

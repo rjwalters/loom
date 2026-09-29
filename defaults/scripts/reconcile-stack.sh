@@ -143,12 +143,8 @@ fi
 # Validate BOTH once, up front, and refuse with a forge-visible explanation: a
 # PR whose headRef fails this is a hostile or broken injection, not a data
 # error. (The daemon revalidates them itself — this refusal is the shell half.)
-if ! check_branch_name "$CHILD_BRANCH" "head branch of child PR #$CHILD_PR" \
-   || ! check_branch_name "$PARENT_BRANCH" "parent branch argument" \
-   || ! check_branch_name "$DEFAULT_BRANCH" "default branch"; then
-    err "Refusing to reconcile PR #$CHILD_PR onto '$DEFAULT_BRANCH' (#9106) — see the check_branch_name refusal above. Nothing was fetched, rebased, or pushed."
-    exit 1
-fi
+check_branch_name "$CHILD_BRANCH" "head branch of child PR #$CHILD_PR" || exit 1
+check_branch_name "$PARENT_BRANCH" "parent branch argument" || exit 1
 
 info "Child branch: $CHILD_BRANCH"
 info "Parent branch: $PARENT_BRANCH"

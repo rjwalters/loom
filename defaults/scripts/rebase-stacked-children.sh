@@ -145,9 +145,8 @@ _process_one_stacked_child() {
     # letting git parse the name as a switch. $parent_branch was already
     # validated once at the top of the script.
     if ! check_branch_name "$child_branch" "head branch of child PR #$child_pr"; then
-        warn "Skipping child PR #$child_pr: its head branch is not a safe git ref operand (#9106) — see the refusal above. No git command was run on '$child_branch'."
-        RSC_FAILURE=2
-        return 0
+        warn "Skipping child PR #$child_pr (#9106) — no git command ran on its head branch."
+        RSC_FAILURE=2; return 0
     fi
 
     # Fetch the parent + child tips so the staleness check reflects the current
@@ -217,10 +216,7 @@ Parent branch \`$parent_branch\` advanced (amended/pushed) after this child bran
     info "Child PR #$child_pr ($child_branch) is stale relative to '$parent_branch' — rebasing onto origin/$parent_branch"
     if ! run git rebase -- "origin/$parent_branch" "$child_branch"; then
         err "Rebase of '$child_branch' onto 'origin/$parent_branch' hit a conflict."
-        echo "    Resolve it, then finish manually:" >&2
-        echo "    git rebase origin/$parent_branch $child_branch   # then, after resolving each conflict:" >&2
-        echo "    git rebase --continue" >&2
-        echo "    git push --force-with-lease" >&2
+        printf '    Resolve it, then finish manually:\n    git rebase origin/%s %s   # then, after resolving each conflict:\n    git rebase --continue\n    git push --force-with-lease\n' "$parent_branch" "$child_branch" >&2
         # Abort the conflicted rebase so the remaining children can still process
         # (best-effort; the whole run is not aborted by one child's conflict).
         git rebase --abort >/dev/null 2>&1 || true
@@ -316,10 +312,7 @@ fi
 # `git rebase -- origin/<parent> <child>` below; a name git would parse as a
 # switch is an injection attempt (or a broken caller), not a data error, so the
 # whole run refuses with a named reason rather than skipping quietly.
-check_branch_name "$PARENT_BRANCH" "parent branch argument" || {
-    err "Refusing to rebase stacked children of '$PARENT_BRANCH' (#9106) — see the check_branch_name refusal above. No git command was run."
-    exit 1
-}
+check_branch_name "$PARENT_BRANCH" "parent branch argument" || exit 1
 
 RSC_FAILURE=0
 _rebase_stacked_children "$PARENT_BRANCH"

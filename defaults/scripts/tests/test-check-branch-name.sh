@@ -269,29 +269,73 @@ SELFTEST_HIT="$(
 assert_contains "$SELFTEST_HIT" "offender.sh:2" "the scan detects a synthetic unguarded sink"
 rm -rf "$SELFTEST_DIR"
 
-# Every audited sink must also CALL the validator. Listed explicitly: this is
-# the inventory a future change has to keep honest, and an entry silently
-# losing its validator is exactly the #9106 regression.
+# Every audited sink must reach the validator, by one of exactly two routes.
+# Listed explicitly: this is the inventory a future change has to keep honest,
+# and an entry silently losing its validator is exactly the #9106 regression.
+#
+# Route 1 — the script calls `check_branch_name` itself. Required wherever the
+# name is FORGE-derived (a PR's headRefName / base.ref) or operator-supplied
+# (`--base`), i.e. wherever it did not come from the resolver.
 echo ""
-echo "AC2: every audited sink calls check_branch_name"
-SINKS=(
+echo "AC2 route 1: forge/operator-supplied names are validated at the sink"
+DIRECT_SINKS=(
     'defaults/scripts/merge-pr.sh'
     'defaults/scripts/rebase-stacked-children.sh'
     'defaults/scripts/reconcile-stack.sh'
     'defaults/scripts/worktree.sh'
-    'defaults/scripts/check-main-freshness.sh'
     'defaults/scripts/lib/worktree-forge-pr-check.sh'
-    'defaults/scripts/docs-worktree.sh'
-    'defaults/scripts/pr-worktree.sh'
-    'defaults/scripts/land-resync-commit.sh'
 )
-for sink in "${SINKS[@]}"; do
+for sink in "${DIRECT_SINKS[@]}"; do
     if grep -q 'check_branch_name' "$REPO_ROOT/$sink" 2>/dev/null; then
         pass "$sink calls check_branch_name"
     else
         fail "$sink hands a branch name to git but never calls check_branch_name"
     fi
 done
+
+# Route 2 — the script's only branch name comes from `loom_default_branch`,
+# which validates its OWN result before echoing it (`default-branch.sh` step 6)
+# and returns non-zero otherwise. These scripts therefore cannot receive an
+# unsafe name at all, which is strictly stronger than each of them repeating
+# the check: a future script that resolves its branch the same way is covered
+# the day it is written, with nothing to remember.
+#
+# Both halves are asserted, because either one alone is satisfiable while the
+# guard is gone: that the resolver still validates, AND that each script still
+# gets its name from the resolver rather than from somewhere new.
+echo ""
+echo "AC2 route 2: resolver-derived names are validated inside loom_default_branch"
+if awk '/^loom_default_branch\(\) \{/{f=1} f; f && /^}/{exit}' "$LIB" | grep -q 'check_branch_name'; then
+    pass "loom_default_branch validates its own result before echoing it"
+else
+    fail "loom_default_branch no longer validates its result — every route-2 sink below is unguarded"
+fi
+for sink in 'defaults/scripts/check-main-freshness.sh' \
+            'defaults/scripts/docs-worktree.sh' \
+            'defaults/scripts/pr-worktree.sh' \
+            'defaults/scripts/land-resync-commit.sh'; do
+    if grep -q 'loom_default_branch' "$REPO_ROOT/$sink" 2>/dev/null; then
+        pass "$sink takes its branch name from loom_default_branch"
+    else
+        fail "$sink no longer resolves its branch via loom_default_branch — it now needs its own check_branch_name call"
+    fi
+done
+
+# …and the behavioural half of route 2, so it is proof rather than structure.
+# LOOM_DEFAULT_BRANCH is tier 1 of the resolver and a plain environment
+# variable — the cheapest place to inject a switch-shaped name — so it is the
+# case worth driving end to end.
+if LOOM_DEFAULT_BRANCH='--upload-pack=/tmp/x' loom_default_branch >/dev/null 2>&1; then
+    fail "loom_default_branch RETURNED an unsafe LOOM_DEFAULT_BRANCH to its callers"
+else
+    pass "loom_default_branch refuses an unsafe LOOM_DEFAULT_BRANCH (non-zero, nothing echoed)"
+fi
+LDB_OUT="$(LOOM_DEFAULT_BRANCH='--upload-pack=/tmp/x' loom_default_branch 2>/dev/null || true)"
+if [[ -z "$LDB_OUT" ]]; then
+    pass "…and emits nothing on stdout, so a \$(…) caller gets an empty name, never the payload"
+else
+    fail "loom_default_branch echoed an unsafe name: '$LDB_OUT'"
+fi
 
 # The Rust half must stay wired too — `reconcile_stack::plan` is the only
 # non-shell path a forge ref reaches a git argv through.
@@ -383,8 +427,9 @@ git -C "$REPRO/work" fetch origin -- "$EVIL_REF" main >/dev/null 2>&1
 # too and a bare '#9106' match would pass whatever happened.
 WT_OUT="$(cd "$REPRO/work" && bash "$SCRIPTS_DIR/worktree.sh" 9106 --base "$EVIL_REF" 2>&1)"
 WT_RC=$?
-assert_contains "$WT_OUT" "Refusing --base '$EVIL_REF'" "worktree.sh --base <payload-ref> refuses, naming the ref"
+assert_contains "$WT_OUT" "REFUSING this --base branch" "worktree.sh --base <payload-ref> refuses, naming which operand"
 assert_contains "$WT_OUT" 'not a safe git ref operand' "…citing the validator's reason"
+assert_contains "$WT_OUT" "$REPRO/payload.sh" "…and quoting the offending ref itself"
 if [[ $WT_RC -ne 0 ]]; then
     pass "…and exits non-zero"
 else

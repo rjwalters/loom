@@ -381,22 +381,14 @@ _worktree_resolve_origin_branch_reuse() {
     # sourced rather than exec'd, so it validates its own input instead of
     # trusting the caller. Refuse — the #7765 stance: a check that cannot run
     # safely refuses rather than guessing.
-    if ! declare -F check_branch_name >/dev/null 2>&1 \
-       || ! check_branch_name "$branch" "worktree branch"; then
-        if [[ "$json_output" == "true" ]]; then
-            echo '{"success": false, "error": "unsafe-branch-name", "issueNumber": '"$issue_number"'}' >&3
-        else
-            print_error "Refusing to fetch or create '$branch' (#9106) — it is not a safe git ref operand (or lib/default-branch.sh did not load)."
-        fi
+    if ! declare -F check_branch_name >/dev/null 2>&1 || ! check_branch_name "$branch" "worktree branch"; then
+        [[ "$json_output" == "true" ]] && echo '{"success": false, "error": "unsafe-branch-name", "issueNumber": '"$issue_number"'}' >&3
         exit 1
     fi
     origin_fetch_result="ok"
     if ! origin_fetch_output="$(git fetch origin -- "$branch" 2>&1)"; then
-        if echo "$origin_fetch_output" | grep -qi "couldn't find remote ref"; then
-            origin_fetch_result="no-such-ref"
-        else
-            origin_fetch_result="fetch-failed"
-        fi
+        origin_fetch_result="fetch-failed"
+        echo "$origin_fetch_output" | grep -qi "couldn't find remote ref" && origin_fetch_result="no-such-ref"
     fi
     _WT_REUSE_REMOTE_BRANCH=false
     if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
