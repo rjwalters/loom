@@ -236,6 +236,28 @@ assert_allow_env "rmScope repo (#6520): f=\$(mktemp) same-command rm -f \"\$f\" 
 # substitution — still unresolved, must still deny.
 assert_deny_env "rmScope repo (#6520): x=\$(cat foo) same-command rm -rf \"\$x\" still denies (non-mktemp)" \
     "LOOM_RM_SCOPE=repo" 'x=$(cat foo.txt) && rm -rf "$x"' "$REPO_ROOT"
+
+# ---- #9322: `$(cat <literal-path>)` is DENIED BY DESIGN, not merely
+# ---- not-yet-implemented. The control directly above happens to use a
+# ---- RELATIVE operand, so on its own it could be read as "a literal absolute
+# ---- path would have resolved". These three close that reading for each
+# ---- spelling of the shape. Resolving any of them requires the guard to
+# ---- EXECUTE `cat` at hook-evaluation time, which no other fast path in this
+# ---- family does; see the "WHERE THE rm-scope FAST-PATH FAMILY STOPS" block
+# ---- comment in defaults/hooks/guard-destructive-generic.sh for the four
+# ---- reasons and the bar for reopening. If that decision is ever reversed,
+# ---- these are NARROWED (given contents that fail closed), never deleted.
+assert_deny_env "rmScope repo (#9322): V=\$(cat /abs/path) same-command rm -rf \"\$V\" denies by design" \
+    "LOOM_RM_SCOPE=repo" 'CARGO_TARGET_DIR=$(cat /tmp/cargo_target_dir_9322.txt); rm -rf "$CARGO_TARGET_DIR"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9322): inline rm -rf \"\$(cat /abs/path)\" denies by design" \
+    "LOOM_RM_SCOPE=repo" 'rm -rf "$(cat /tmp/loom-fixture-path-9322)"' "$REPO_ROOT"
+# The reason the resolution cannot be made safe, as an executable case: the
+# same command WRITES the file first, so a hook-time `cat` would read the
+# pre-write contents while the shell deletes what the write puts there. No
+# race is involved — it is reachable from the command's own text.
+assert_deny_env "rmScope repo (#9322): same-command write then \$(cat) denies by design (hook-time read != runtime value)" \
+    "LOOM_RM_SCOPE=repo" 'printf / > /tmp/loom-9322-p && rm -rf "$(cat /tmp/loom-9322-p)"' "$REPO_ROOT"
+
 # Control: the mktemp-assigned variable is REASSIGNED by a second, non-mktemp
 # assignment in the same command — ambiguity must fail closed, not resolve
 # through the first (safe) assignment.

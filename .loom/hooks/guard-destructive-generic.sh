@@ -7174,6 +7174,100 @@ rm_scope_literal_same_command_resolve() {
 }
 
 # =============================================================================
+# WHERE THE rm-scope FAST-PATH FAMILY STOPS: `VAR=$(cat <path>)` IS DENIED BY
+# DESIGN, NOT DEFERRED (#9322, split out of #9304 as "shape 2")
+#
+# The shape, in both its spellings:
+#     CARGO_TARGET_DIR=$(cat /tmp/cargo_target_dir.txt); rm -rf "$CARGO_TARGET_DIR"
+#     rm -rf "$(cat /tmp/loom-fixture-path)"
+# Both deny today on `rm-scope-unresolved-var`, and they are meant to. This
+# block is the record of that decision so the next telemetry pass re-proposing
+# it has something to argue WITH, rather than finding silence and reading it
+# as an oversight. There is no partial version of this that is safe; the four
+# reasons below are independent, and each one is on its own sufficient.
+#
+# 1. EVERY sibling fast path is a LEXICAL PROOF; this one would be an
+#    EXECUTION. rm_scope_mktemp_same_command_safe() leans on mktemp's contract
+#    without running mktemp; rm_scope_literal_same_command_resolve() reads a
+#    value that IS its own source text. Neither runs anything, so neither can
+#    be wrong about what the shell will do — they read the same bytes the
+#    shell will read. Resolving `$(cat P)` requires the guard to run `cat P`
+#    at hook-evaluation time, and a PreToolUse hook that executes a command
+#    named by the very text it is judging is a different KIND of program from
+#    the one this file is. That is a one-way door: once one fast path may
+#    execute, "why not `$(realpath …)`, `$(git rev-parse --show-toplevel)`,
+#    `$(jq -r .path …)`" has no principled stopping point, and each of those
+#    has a better claim to safety than `cat` does.
+#
+# 2. THE AMBIGUITY SET STOPS BEING CLOSED. The siblings' fail-closed rule is
+#    "NAME must not be bound anywhere else in this command". That is decidable
+#    because the ways to bind a shell NAME are a finite lexical set the guard
+#    already enumerates (`NAME=`, `NAME+=`, `NAME[i]=`, `read`, `printf -v`,
+#    `declare -n`, `export`, … — see _mktemp_is_other_rebind()). For
+#    `$(cat P)` the equivalent obligation is "P must not be WRITTEN anywhere
+#    else in this command", and the ways to write a file are not a set at all:
+#    `>`, `>>`, `tee`, `sed -i`, `cp`, `mv`, `install`, `truncate`, `dd`, any
+#    interpreter one-liner, any script invoked by name, any background job,
+#    any other agent on the host. This is not the ordinary TOCTOU race that a
+#    short window makes improbable — it is reachable from the command's own
+#    text with no race at all:
+#        printf / > /tmp/p && rm -rf "$(cat /tmp/p)"
+#    The guard's `cat` sees the file's PRE-WRITE contents and would resolve to
+#    whatever was there before; the shell writes `/` and then deletes it. A
+#    guard cannot fail closed on a hazard it cannot enumerate, and this one
+#    cannot be enumerated. Contrast the siblings, whose worst case is a
+#    rebinding form someone forgot to list — a gap that closes when named
+#    (#9331), not an open class.
+#
+# 3. READING AN ARBITRARY PATH IS NOT FREE ON THIS CODE PATH. This hook runs
+#    ahead of EVERY Bash tool call. `cat` on a FIFO, a `/dev/` node, or a
+#    stalled network path blocks indefinitely, and a hung guard hangs the
+#    whole session behind it — a new failure mode strictly worse than the deny
+#    it was added to avoid. A large or binary file costs memory and a process
+#    spawn on the hot path. Bolting on `timeout`/size caps/regular-file tests
+#    would mean three more ways to be unresolvable, each needing its own
+#    fail-closed branch and its own tests, to buy the yield measured next.
+#
+# 4. THE MEASURED YIELD IS ZERO. Re-derived for this decision over 283 unique
+#    `rm-scope-unresolved-var` DENY records, every guard-decisions.log on
+#    loom-worker, 2026-08-11 .. 2026-09-29 (#9304 reported 57 over a 4-day
+#    slice without a per-shape breakdown; this is that breakdown). Only 30
+#    (10.6%) mention `$(cat …)` at all, and NONE would resolve under the
+#    constraints #9304's Curator proposed (literal absolute path operand only;
+#    empty / multi-line / non-absolute contents fail closed; single binding):
+#      - 13 are `err=$(cat "$err_file"); rm -f "$err_file"` — the `cat`
+#        operand is a VARIABLE and the denied target is `$err_file`, bound
+#        outside the command. The `cat` is incidental to the deny.
+#      - 7 are `CMD=$(cat <<'EOF' … )` heredoc captures — no path operand.
+#      - 6 are this suite's own deny controls (`x=$(cat foo.txt)`,
+#        `FARM=/tmp/a; FARM=$(cat foo.txt)`) — relative operand, and the
+#        second is double-bound.
+#      - the remaining 4 each fail a stated constraint independently: a
+#        double-bound `DIR`, two whose denied target (`$h`, `$LOG`) is
+#        unrelated to the `cat`, and
+#        `rm -rf "$(cat /tmp/judge-8703-target-dir.txt 2>/dev/null)"`, whose
+#        operand list is not a bare literal AND whose file did not exist, so
+#        an empty read would fail closed anyway.
+#    Seven weeks of real fleet traffic, zero denies converted. The relaxation
+#    would buy nothing that the escape the deny message already names does not
+#    buy for free: write the literal path, or use `$(mktemp -d)` — both
+#    resolve today, in one line, losing nothing.
+#
+# REOPENING BAR. If telemetry re-proposes this, it must carry BOTH (a) a
+# nonzero count of real denies that would have resolved under the constraints
+# above — reason 4 is the only one that is a measurement and so the only one
+# that can change — and (b) a decidable answer to reason 2's same-command file
+# write. Reasons 1 and 3 are design positions and do not expire. Absent (a)
+# and (b) this stays denied, and the right response to the deny is the one the
+# message gives: use an explicit literal path.
+#
+# Pinned by deny controls in tests/hooks/test-guard-destructive-rm-scope.sh
+# (search `#9322`), which cover the assignment form, the inline form, and the
+# same-command-write shape from reason 2. If this ever ships, those are
+# NARROWED, never deleted.
+# =============================================================================
+
+# =============================================================================
 # extract_write_targets() — Bash-tool write-idiom target extraction (#4178).
 #
 # Emits one "<cwd>\t<target>" line (TAB-separated, US separator 0x1f — mirrors
@@ -8358,6 +8452,13 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                             deny "BLOCKED: rm on protected system path: $ABS_PATH" "rm-protected-path"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_RM_MKTEMP_SCAN
                         fi
                     else
+                        # No further fast path is tried here, and in
+                        # particular a `NAME=$(cat <literal-path>)` RHS (or an
+                        # inline `rm -rf "$(cat <literal-path>)"`) is denied BY
+                        # DESIGN rather than left for later — see the
+                        # "WHERE THE rm-scope FAST-PATH FAMILY STOPS" block
+                        # comment above extract_write_targets() for the four
+                        # reasons and the bar for reopening it (#9322).
                         deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime (guards.rmScope=repo). Unresolvable rm targets fail closed (mirrors rjwalters/repo#244, fixing #239). Use an explicit literal path." "rm-scope-unresolved-var"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_RM_MKTEMP_SCAN
                     fi
                 fi
