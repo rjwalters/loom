@@ -12,7 +12,7 @@ consumes. They are assigned by the Curator at curation time, before any sweep
 runs. The numbers below exist so the buckets mean something measured rather
 than something felt: they were extracted from actual landings by the
 committed question set
-[`defaults/observability/story-point-questions.md`](../observability/story-point-questions.md)
+[`defaults/observability/story-point-questions.md`](https://github.com/rjwalters/loom/blob/main/defaults/observability/story-point-questions.md)
 + `story-point-queries.sql` (SP1–SP5), not invented.
 
 **What points are not.** They are not additive (a 13 is not thirteen 1s —
@@ -165,7 +165,7 @@ share); they are cross-checks, not cuts, so interpolation is honest there in
 a way it would not be for the anchor.
 
 Full verbatim outputs, the executed SQL, and the access path are recorded in
-[`defaults/observability/signoz/evidence.md`](../observability/signoz/evidence.md)
+[`defaults/observability/signoz/evidence.md`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/evidence.md)
 § "Story-point calibration, executed live".
 
 ## The clean-landing filter (what the numbers describe)
