@@ -3026,24 +3026,11 @@ fn concurrent_issue_dispatches_do_not_serialize_on_the_account_selection_poll() 
     let registry = Arc::new(Mutex::new(lifecycle_registry(dir.path(), &script)));
 
     // Calibrate the "if this were serialized" bound against THIS host's
-    // actual cost of one full, genuinely serialized dispatch — the pre-#6592
-    // shape, exercised by the plain `dispatch()` method, which holds the
-    // registry mutex across the whole poll — instead of assuming an
-    // idle-host `poll_delay` constant. Any contention on the host (e.g. a
-    // concurrent `cargo build`) inflates this measurement exactly as it
-    // would inflate the burst below, so the ratio stays meaningful under
-    // load instead of flaking on a fixed wall-clock number (issue #9194).
-    let calibration_start = Instant::now();
-    let calibration = {
-        let mut sr = registry.lock().unwrap();
-        sr.dispatch(&SweepKind::Issue(80_999), None, None, None, None)
-            .expect("calibration dispatch should succeed")
-    };
-    let measured_serial_one = calibration_start.elapsed();
-    {
-        let mut sr = registry.lock().unwrap();
-        let _ = sr.cancel(&calibration.sweep_id, Duration::from_millis(50));
-    }
+    // actual cost of one full, genuinely serialized dispatch, rather than
+    // assuming an idle-host `poll_delay` constant (issue #9194); see
+    // `dispatch_burst_calibration::measure_one_serialized_dispatch`.
+    let measured_serial_one =
+        dispatch_burst_calibration::measure_one_serialized_dispatch(&registry, 80_999);
 
     const BURST: u32 = 10;
     let start = Instant::now();
@@ -3957,6 +3944,11 @@ fn dispatch_refuses_operator_only_issue() {
 // `guards_union_tests.rs` / `guards_preflip_tests.rs`.
 #[path = "operator_hold_tests.rs"]
 mod operator_hold_tests;
+
+// The #9194 burst-calibration helper lives in its own sibling file for the
+// same reason as `operator_hold_tests` above.
+#[path = "dispatch_burst_calibration.rs"]
+mod dispatch_burst_calibration;
 
 /// AC (the load-bearing exclusion): `loom:building` ALONE must NOT refuse.
 /// It is legitimately present on the daemon's own in-flight claim, so a guard

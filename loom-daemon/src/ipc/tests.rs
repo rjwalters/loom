@@ -1933,38 +1933,14 @@ fn timing_tolerance_from_busy_fraction_widens_near_saturation_but_is_capped() {
 #[serial_test::serial]
 async fn dispatch_sweep_nonblocking_burst_acks_well_under_the_client_deadline() {
     const BURST: u32 = 10;
-    let poll_delay = Duration::from_millis(700);
-    let (sr, dir) = slow_poll_sweep_registry_in_tempdir(poll_delay);
+    let (sr, dir) = slow_poll_sweep_registry_in_tempdir(Duration::from_millis(700));
     let _guard = seed_temp_registry(&[dir.path()]);
     let bus = Arc::new(EventBus::new());
     let pool = Arc::new(WorkspacePool::new(bus.clone(), test_runtime_handle()));
 
-    // Calibrate the "if this were serialized" bound against THIS host's
-    // actual cost of one full, genuinely serialized dispatch — the plain
-    // `SweepRegistry::dispatch` method, which holds the registry mutex across
-    // the whole account-selection poll (the pre-#6592 shape) — instead of
-    // assuming an idle-host `poll_delay` constant. Any contention on the
-    // host (e.g. a concurrent `cargo build`) inflates this measurement
-    // exactly as it would inflate the concurrent burst below, so the ratio
-    // stays meaningful under load instead of flaking on a fixed wall-clock
-    // number (issue #9194). Run via `spawn_blocking` since `dispatch` blocks
-    // synchronously for ~`poll_delay`.
-    let sr_calibration = sr.clone();
-    let calibration_start = std::time::Instant::now();
-    let calibration = tokio::task::spawn_blocking(move || {
-        sr_calibration
-            .lock()
-            .unwrap()
-            .dispatch(&SweepKind::Issue(83_999), None, None, None, None)
-    })
-    .await
-    .expect("calibration task panicked")
-    .expect("calibration dispatch should succeed");
-    let measured_serial_one = calibration_start.elapsed();
-    {
-        let mut guard = sr.lock().unwrap();
-        let _ = guard.cancel(&calibration.sweep_id, Duration::from_millis(50));
-    }
+    // Calibrate against THIS host's cost of one serialized dispatch (#9194);
+    // see `dispatch_burst_calibration::measure_serial_cost`.
+    let measured_serial_one = dispatch_burst_calibration::measure_serial_cost(&sr, 83_999).await;
 
     let start = std::time::Instant::now();
     let mut handles = Vec::new();
@@ -2000,16 +1976,15 @@ async fn dispatch_sweep_nonblocking_burst_acks_well_under_the_client_deadline() 
 
     // A deliberately-serialized burst would take roughly
     // `measured_serial_one * BURST` — measured moments ago, on this same
-    // host, under the same load, rather than assumed from `poll_delay` alone.
+    // host, under the same load, rather than assumed from a fixed constant.
     // Assert the concurrent burst completes in well under that, proving it
     // did NOT serialize behind the registry mutex, while still tolerating
     // host-load inflation that hits both measurements alike.
     let serialized_bound = measured_serial_one * BURST;
     assert!(
         elapsed < serialized_bound / 2,
-        "burst of {BURST} concurrent dispatch_sweep calls took {elapsed:?} (measured serial \
-             cost of one dispatch on this host: {measured_serial_one:?}) — looks serialized \
-             behind the registry mutex (serialized bound ~{serialized_bound:?})"
+        "burst of {BURST} concurrent dispatch_sweep calls took {elapsed:?} — looks \
+             serialized behind the registry mutex (serialized bound ~{serialized_bound:?})"
     );
     assert!(
         elapsed < Duration::from_secs(30),
@@ -2017,8 +1992,7 @@ async fn dispatch_sweep_nonblocking_burst_acks_well_under_the_client_deadline() 
     );
 
     for id in &sweep_ids {
-        let mut sr = sr.lock().unwrap();
-        let _ = sr.cancel(id, Duration::from_millis(50));
+        let _ = sr.lock().unwrap().cancel(id, Duration::from_millis(50));
     }
 }
 
@@ -5728,3 +5702,9 @@ fn test_abort_supersedes_running_supervisor_generation() {
 }
 
 mod status_round_trip;
+
+// The #9194 burst-calibration helper lives in its own sibling module rather
+// than being appended here: this module is over the 1000-line ratchet
+// threshold and frozen at its current size (`.loom/docs/file-size-policy.md`
+// — "put the new code in a NEW sibling module").
+mod dispatch_burst_calibration;
