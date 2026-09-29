@@ -2010,10 +2010,11 @@ simply **timed out** (no pressure in either bound, no OOM growth):
 - `swap_total_bytes` / `swap_used_bytes` — capacity and current use, in
   bytes, **when the platform exposes one** (macOS `vm.swapusage`).
 - `swap_in_bytes_total` / `swap_out_bytes_total` — cumulative host-lifetime
-  swap volume, normalized to **bytes**: macOS `vm_stat` counts pages, Linux
-  `pswpin`/`pswpout` count 512-byte units, and the daemon converts both so one
-  gauge means one thing fleet-wide. Counters reset only across a reboot; a
-  rollback (daemon seeing a reset) reads as *unknown*, never negative.
+  swap volume, normalized to **bytes**: both macOS `vm_stat` and Linux
+  `pswpin`/`pswpout` count pages, and the daemon converts both (using each
+  platform's actual page size) so one gauge means one thing fleet-wide.
+  Counters reset only across a reboot; a rollback (daemon seeing a reset)
+  reads as *unknown*, never negative.
 - `swap_in_bytes_per_sec` / `swap_out_bytes_per_sec` — rates computed by the
   emitting daemon **between successive samples** from the two cumulative
   totals; absent on the first sample after daemon start, after any counter

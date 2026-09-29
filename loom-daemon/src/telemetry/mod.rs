@@ -1527,9 +1527,9 @@ pub struct MemoryPressureSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swap_used_bytes: Option<u64>,
     /// Cumulative swap-in volume for the host's lifetime, normalized to
-    /// **bytes** (macOS counts pages, Linux 512-byte units) so one gauge
-    /// means one thing fleet-wide. Counters reset only across a reboot; a
-    /// rollback reads as unknown, never negative.
+    /// **bytes** (both macOS and Linux count pages) so one gauge means one
+    /// thing fleet-wide. Counters reset only across a reboot; a rollback
+    /// reads as unknown, never negative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swap_in_bytes_total: Option<u64>,
     /// Cumulative swap-out volume, normalized to bytes; same absence and

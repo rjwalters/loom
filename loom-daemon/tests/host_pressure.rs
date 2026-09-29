@@ -91,8 +91,11 @@ fn controlled_pressure_moves_a_measured_reading() {
     .filter(|growth| *growth >= bytes / 2);
     let swap_growth =
         drop_if_measured(before.swap_used_bytes, after.swap_used_bytes).or_else(|| {
-            drop_if_measured(before.swap_in_bytes_total, after.swap_in_bytes_total)
-                .filter(|delta| *delta >= bytes / 2)
+            match (before.swap_in_bytes_total, after.swap_in_bytes_total) {
+                (Some(before), Some(after)) if after > before => Some(after - before),
+                _ => None,
+            }
+            .filter(|delta| *delta >= bytes / 2)
         });
 
     println!(

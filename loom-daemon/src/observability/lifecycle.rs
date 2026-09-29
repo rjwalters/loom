@@ -185,9 +185,12 @@ pub fn host_attributes() -> TraceAttributes {
 
 /// Fixed-reason admission attributes for one role tick outcome.
 ///
-/// The reason set is a **closed taxonomy of literals**
+/// The reason set here is a **closed taxonomy of literals**
 /// (`failure` / `runtime-rejected` / `no-token-pool` / `pool-exhausted` /
-/// `model-runtime-mismatch` / `load-ceiling`); the free-form detail text that
+/// `model-runtime-mismatch` / `load-ceiling`) — plus one additional literal,
+/// `preflight-rejected`, emitted by a second site outside this function
+/// (`worker_spawn::run`'s preflight-rejection span) that does not go through
+/// a [`crate::role_runner::RoleTickOutcome`] at all. The free-form detail text that
 /// the daemon and role logs carry (`Failure(String)`'s message, the
 /// `ModelRuntimeMismatch` diagnostic, a `RuntimeRejection`'s reason) is
 /// deliberately never placed here — span attributes are allowlisted, 256-byte

@@ -23,7 +23,7 @@
 //! | `mem_available_bytes`      | `/proc/meminfo` MemAvailable | `vm_stat` (free + inactive) × page size |
 //! | `mem_compressed_bytes`     | unmeasurable → `None`     | `vm_stat` "occupied by compressor" |
 //! | `swap_total`/`swap_used`   | `/proc/meminfo` Swap*     | `sysctl vm.swapusage`           |
-//! | swap in/out cumulative     | `/proc/vmstat` pswpin/out (512-byte units) | `vm_stat` Swapins/Swapouts (pages) |
+//! | swap in/out cumulative     | `/proc/vmstat` pswpin/out (pages) | `vm_stat` Swapins/Swapouts (pages) |
 //! | `memory_pressure`          | `/proc/pressure/memory` (PSI) | no PSI equivalent → `None` |
 //! | `oom_kill_total`           | `/proc/vmstat` oom_kill   | no kernel counter → `None`      |
 //!
@@ -271,13 +271,27 @@ fn sample_linux() -> HostPressure {
     }
     if let Ok(text) = std::fs::read_to_string("/proc/vmstat") {
         let v = parse_vmstat(&text);
-        // pswpin/pswpout are 512-byte units, not page units — normalize to
+        // pswpin/pswpout are page units, not 512-byte sectors — normalize to
         // bytes so the fleet-wide field has one meaning on every platform.
-        out.swap_in_bytes_total = v.pswpin.map(|n| n.saturating_mul(512));
-        out.swap_out_bytes_total = v.pswpout.map(|n| n.saturating_mul(512));
+        let page = page_size_bytes();
+        out.swap_in_bytes_total = v.pswpin.map(|n| n.saturating_mul(page));
+        out.swap_out_bytes_total = v.pswpout.map(|n| n.saturating_mul(page));
         out.oom_kill_total = v.oom_kill;
     }
     out
+}
+
+/// `sysconf(_SC_PAGESIZE)` — the unit `pswpin`/`pswpout` count in. Falls back
+/// to the near-universal Linux value of 4096 if the query fails.
+#[cfg(target_os = "linux")]
+fn page_size_bytes() -> u64 {
+    // SAFETY: `sysconf` is a read-only query with no memory arguments.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if size > 0 {
+        size as u64
+    } else {
+        4096
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -356,9 +370,9 @@ pub fn parse_psi_memory(text: &str) -> Option<MemoryPressure> {
 /// `/proc/vmstat` counters relevant to memory pressure.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VmstatSample {
-    /// `pswpin` — pages swapped in, in 512-byte units on Linux.
+    /// `pswpin` — pages swapped in, in page units on Linux.
     pub pswpin: Option<u64>,
-    /// `pswpout` — pages swapped out, in 512-byte units on Linux.
+    /// `pswpout` — pages swapped out, in page units on Linux.
     pub pswpout: Option<u64>,
     /// `oom_kill` — kernel OOM kills since boot, when the kernel exposes it.
     pub oom_kill: Option<u64>,
