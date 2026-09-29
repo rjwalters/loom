@@ -1,4 +1,5 @@
--- SigNoz half of the sweep-facts seam (Issues #9446, #9466; pattern: #8665).
+-- SigNoz half of the sweep-facts seam (Issues #9446, #9466, #9433; pattern:
+-- #8665).
 --
 -- Mirror of `../sweep-facts-extract-clickstack.sql`: it defines exactly ONE
 -- object, `loom_analytics.raw_sweep_fact`, with the same column names, order
@@ -119,6 +120,13 @@ SELECT
         if(mapContains(attributes_number, 'loom.test_lines'),
            toInt64(attributes_number['loom.test_lines']), NULL),
         toInt64OrNull(attributes_string['loom.test_lines']))       AS test_lines,
+    -- The Curator's a-priori size estimate (#9432), the one forecast column
+    -- here. NULL when absent from BOTH maps — an unsized issue is not an issue
+    -- sized at zero — and ORDINAL, never summed as a size (SF8, #9433).
+    coalesce(
+        if(mapContains(attributes_number, 'loom.story_points'),
+           toInt64(attributes_number['loom.story_points']), NULL),
+        toInt64OrNull(attributes_string['loom.story_points']))     AS story_points,
     coalesce(
         if(mapContains(attributes_number, 'loom.doctor_cycles'),
            toInt64(attributes_number['loom.doctor_cycles']), NULL),

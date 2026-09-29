@@ -1,6 +1,6 @@
 -- Sweep facts: the durable per-sweep rollup that outlives D1's retention
 -- (Issue #9446). The questions it answers live in `sweep-facts-queries.sql`
--- (SF1..SF7); the definitions — including "absent vs. zero" — are fixed in
+-- (SF1..SF8); the definitions — including "absent vs. zero" — are fixed in
 -- `sweep-facts-questions.md`. Read that before reading a number out of any of
 -- these tables.
 --
@@ -34,9 +34,10 @@
 -- (telemetry-schema.md omits empty/unset keys and forbids coercing a missing
 -- one to 0/''/"unknown"), so every column the payload feeds is NULLable and
 -- stays NULL when the key is absent. The `disposition` (#9441),
--- `tokens_status` (#9440), `hw_*`/`generated_lines`/`test_lines` (#9466) and
--- lineage (#9444) columns are NULL in bulk until those emitters land and the
--- backfill re-runs — that is the rollup working, not failing.
+-- `tokens_status` (#9440), `hw_*`/`generated_lines`/`test_lines` (#9466),
+-- `story_points` (#9432/#9433) and lineage (#9444) columns are NULL in bulk
+-- until those emitters land and the backfill re-runs — that is the rollup
+-- working, not failing.
 CREATE TABLE IF NOT EXISTS sweep_facts (
     repo                   TEXT    NOT NULL,
     issue                  INTEGER NOT NULL,
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS sweep_facts (
     hw_files               INTEGER,
     generated_lines        INTEGER,
     test_lines             INTEGER,
+    story_points           INTEGER,
     doctor_cycles          INTEGER,
     judge_verdicts         TEXT,
     attempt_index          INTEGER,
@@ -105,6 +107,17 @@ CREATE TABLE IF NOT EXISTS sweep_facts (
 -- the emitter's plausibility guard downgraded this record's tokens to
 -- `tokens_status = 'suspect'`.
 --
+-- `story_points` (#9432, consumed by SF8/#9433): the Curator's *a priori* size
+-- estimate — the numeric value of the issue's single `points:*` label, one of
+-- 1/2/3/5/8/13. It is the only FORECAST column on this table; everything else
+-- is a measurement. It stays NULL — never 0 — in all four situations
+-- telemetry-schema.md §`story_points` enumerates (no label, an
+-- out-of-vocabulary label, more than one label, a failed/skipped label read),
+-- so "unsized" and "sized at nothing" can never be confused. SF8 counts the
+-- NULLs as an explicit data gap for exactly that reason. The values are
+-- ORDINAL, not a unit (a "13" is not thirteen "1"s): never `sum()` this column
+-- as a size — see SF8 and `landed-size.sql`'s `measured_point_values`.
+--
 -- The window lives in `params`, the only date literals in this file.
 WITH params AS (
     SELECT '2026-08-15T00:00:00Z' AS since,
@@ -117,6 +130,7 @@ INSERT OR REPLACE INTO sweep_facts
      tokens_in, tokens_out, tokens_by_model, tokens_unattributed_in, tokens_unattributed_out,
      lines_added, lines_deleted,
      hw_lines_added, hw_lines_deleted, hw_files, generated_lines, test_lines,
+     story_points,
      doctor_cycles, judge_verdicts,
      attempt_index, previous_sweep_id, trigger,
      rework_substantive, rework_environmental,
@@ -147,6 +161,7 @@ SELECT
     json_extract(r.payload, '$.hw_files')             AS hw_files,
     json_extract(r.payload, '$.generated_lines')      AS generated_lines,
     json_extract(r.payload, '$.test_lines')           AS test_lines,
+    json_extract(r.payload, '$.story_points')         AS story_points,
     json_extract(r.payload, '$.doctor_cycles')        AS doctor_cycles,
     json_extract(r.payload, '$.judge_verdicts')       AS judge_verdicts,
     json_extract(r.payload, '$.attempt_index')        AS attempt_index,
