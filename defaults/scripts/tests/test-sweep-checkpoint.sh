@@ -339,7 +339,7 @@ assert_eq "attempt command reads back 6" "6" "$out"
 STABLE_RID="sweep-20260722T231500Z-84213-a3f9c1"
 assert "write with stable RUN_ID task-id" "$CHECKPOINT" write 80 builder-done --task-id "$STABLE_RID" --pr-number 800
 out=$("$CHECKPOINT" read 80)
-if grep -q "\" <<<"$out"task_id\": \"$STABLE_RID\""; then
+if grep -q "\"task_id\": \"$STABLE_RID\"" <<<"$out"; then
     echo "PASS: stable RUN_ID persisted verbatim as task_id"
     PASS=$((PASS + 1))
 else
