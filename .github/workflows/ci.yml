@@ -1514,6 +1514,15 @@ jobs:
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
       - name: check-stale-blocked advisory (#8927)
         run: bash defaults/scripts/tests/test-check-stale-blocked.sh
+      # #9517: fleet-send.sh is a thin SILENT stub over `loom-daemon
+      # fleet-send` (its whole interface is a best-effort exit 0, so it
+      # bypasses lib/script-helper.sh's loud missing-daemon path). The suite
+      # pins the working-tree binary via lib/require-daemon-bin.sh — it needs
+      # this job's shared build, not shell-suite-tests' toolchain-free
+      # runner — and was moved out of shell-suite-tests/ci-wired.txt for
+      # exactly that reason.
+      - name: fleet-send safehouse envelope (#9517)
+        run: bash defaults/scripts/tests/test-fleet-send.sh
       - name: merge-pr close-triggered loom:blocked re-check (#9102)
         run: bash defaults/scripts/tests/test-merge-pr-notify-cleared-blockers.sh
       - name: merge-pr verdict-label contradiction guard (#8112, #8191 slice 2)

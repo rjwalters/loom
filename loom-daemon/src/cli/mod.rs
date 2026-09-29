@@ -28,6 +28,7 @@ pub(crate) mod dispatch_backoff;
 mod duplicate_scan;
 mod fleet_captain_cmd;
 pub(crate) mod fleet_experiment;
+pub(crate) mod fleet_send;
 mod git_blob_lines;
 mod guard_mcp_tools;
 pub(crate) mod health;
