@@ -441,9 +441,9 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
   "visibility": "public",
   "issue": 4703,
   "sweep_id": "sweep-issue-4703-0",
-  "model": "opus",
+  "model": "claude-opus-5",
   "effort": "high",
-  "config": { "runtime": "claude" },
+  "config": { "runtime": "claude", "arm": "B" },
   "phase_durations": [
     { "phase": "curator", "duration_sec": 12, "attempt": 1, "tokens_in": 4200, "tokens_out": 510 },
     { "phase": "builder", "duration_sec": 340, "attempt": 1, "tokens_in": 38000, "tokens_out": 4900 },
@@ -455,6 +455,7 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
   "result": "success",
   "disposition": "landed",
   "pr_number": 4710,
+  "pr_numbers": [4698, 4710],
   "tokens_in": 48213,
   "tokens_out": 6120,
   "tokens_unattributed": { "tokens_in": 1113, "tokens_out": 110 },
@@ -465,14 +466,24 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
       "model": "claude-sonnet-5",
       "speed": "standard",
       "service_tier": "standard",
-      "input": 48000,
-      "cache_read": 15000,
-      "cache_write_5m": 500,
-      "cache_write_1h": 1500,
-      "output": 6120
+      "input": 18000,
+      "cache_read": 11000,
+      "cache_write_5m": 400,
+      "cache_write_1h": 1100,
+      "output": 2120
+    },
+    {
+      "model": "claude-opus-5",
+      "speed": "standard",
+      "service_tier": "standard",
+      "input": 30000,
+      "cache_read": 4000,
+      "cache_write_5m": 100,
+      "cache_write_1h": 400,
+      "output": 4000
     }
   ],
-  "models_used": ["claude-sonnet-5"],
+  "models_used": ["claude-opus-5", "claude-sonnet-5"],
   "doctor_cycles": 0,
   "judge_verdicts": [{ "attempt": 1, "verdict": "pass" }],
   "complexity": "routine",
@@ -480,14 +491,22 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
 }
 ```
 
+This example is deliberately a **Doctor-escalated** sweep, the shape that makes
+the #9465 fields legible: it was dispatched on the `sonnet` arm
+(`config.arm: "B"`) but most of its tokens were spent by `claude-opus-5`, so
+`model` reports `claude-opus-5` (what actually ran) while `arm` keeps the
+dispatch-time assignment, and it opened two PRs (`pr_numbers`) of which #4710
+is the latest (`pr_number`). A single-model, single-PR sweep collapses to one
+`tokens_by_model` row with `model` equal to it, and `pr_numbers == [pr_number]`.
+
 `config` (free-form string map), `phase_durations`, `model`, `effort`,
-`pr_number`, `tokens_in`, `tokens_out`, `lines_added`, `lines_deleted`,
-`tokens_by_model`, `tokens_unattributed`, `failure_class`, `models_used`,
-`doctor_cycles`, `judge_verdicts`, `complexity`, `tokens_status`, and
-`tokens_status_reason` are omitted when empty/unset. `config` is a map — not
-fixed fields — so operator-tunable knobs can be captured without a schema
-bump. `disposition` (Issue #9441) is the one recent addition that is **never**
-omitted — see its own section below.
+`pr_number`, `pr_numbers`, `tokens_in`, `tokens_out`, `lines_added`,
+`lines_deleted`, `tokens_by_model`, `tokens_unattributed`, `failure_class`,
+`models_used`, `doctor_cycles`, `judge_verdicts`, `complexity`,
+`tokens_status`, and `tokens_status_reason` are omitted when empty/unset.
+`config` is a map — not fixed fields — so operator-tunable knobs can be
+captured without a schema bump. `disposition` (Issue #9441) is the one recent
+addition that is **never** omitted — see its own section below.
 
 `tokens_by_model` (Issue #6384) is the same per-model breakdown documented
 under `sweep.completed` above — the same aggregation
@@ -655,7 +674,7 @@ by `sweep_id`, or could not be answered at all.
 | Field | Type | Source | Notes |
 |---|---|---|---|
 | `failure_class` | string | The paired `sweep_outcomes::OutcomeRecord`'s own classification for the same terminal transition: `death_class` when the pre-flight classifier derived one (`preflight-token-selection-failed`, `preflight-no-cli-start`, …), otherwise `crash_classification` (`account-exhausted:model-credits-exhausted`, `no-usable-account`, …). | Copied at emit time in the same function that writes the sibling record — never a post-hoc joiner. Lets a consumer separate real build failures from sub-60s spawn deaths from this journal alone. The sibling record still carries both classifier fields separately; this is the single most canonical label, not a replacement. Omitted entirely when nothing classified the transition — including on every success. |
-| `models_used` | string array | The distinct `model` ids in `tokens_by_model`, sorted and deduped. | The top-level "did this sweep run more than one model?" signal. `model` names the **dispatched** model, so a sweep that escalated to `claude-opus-5` through the Doctor ladder still reports `model: "sonnet"`; `models_used` is what makes the escalation visible. Inherits `tokens_by_model`'s contract exactly: omitted (never `[]`) when no attributable transcript was found. |
+| `models_used` | string array | The distinct `model` ids in `tokens_by_model`, sorted and deduped. | The top-level "did this sweep run more than one model?" signal. Since #9465 `model` names the **dominant** model that actually ran (the largest input+output row in `tokens_by_model`, dispatched model as fallback), so a sweep that escalated to `claude-opus-5` through the Doctor ladder reports `model: "claude-opus-5"` with `config["arm"]` still carrying the dispatch-time arm — `models_used` is what shows that the *earlier* phases ran something else. Inherits `tokens_by_model`'s contract exactly: omitted (never `[]`) when no attributable transcript was found. |
 | `doctor_cycles` | integer | **The forge label timeline** of the PR named by this record's own `pr_number` (Issue #8222 — re-sourced; the #8056 shipment counted sampled checkpoint markers instead): one cycle per `loom:changes-requested` arrival that a later `loom:review-requested` arrival closed the loop on. | A rejection nobody handed back (the sweep hit the Doctor-cycle cap, or died) is **not** a cycle. Because the label events are durable forge state rather than a ~30s sample, a cycle that opens and closes between two reaper ticks is still counted: this is a certified count, **not** the lower-bound proxy it was under #8056. `0` means "the timeline was read and no Doctor cycle completed"; an **absent** key means the timeline was not read at all. |
 | `judge_verdicts` | array of `{ "attempt": int, "verdict": string }` | The same PR's label timeline: `loom:pr` ⇒ `"pass"`, `loom:changes-requested` ⇒ `"fail"`, in lifecycle order. | What makes **first-pass judge approval rate** computable from this journal alone: `judge_verdicts[0].verdict == "pass"` over the records that carry the field. `attempt` is **1-based per PR**, counting `loom:review-requested` arrivals — attempt 1 is the PR as first opened, attempt 2 the pass after the first Doctor hand-back. A repeat of the same verdict inside one attempt (a label removed and re-applied) is one entry, not two. `[]` means "the timeline was read and carried no verdict" (a sweep that died before Judge); an **absent** key means the timeline was not read. |
 | `complexity` | string (`mechanical` \| `routine` \| `complex`) | One more best-effort REST read at the SAME terminal transition, of the sweep's own issue body's `<!-- loom:complexity=<tier> -->` marker (Issue #8542) — the same marker `resolve-tier-model.sh` reads at dispatch time to pick a model, re-read here rather than plumbed through dispatch because there is no single dispatch-time seam shared by every entry point (`dispatch_sweep`, the epic supervisor, the work finder, the role runner). | What makes a model-routing decision (`sweep.tierModels` / `sweep.optimization`, or a future classifier-driven router) evaluable against a labeled outcome. Unlike `resolve-tier-model.sh`'s own dispatch-time fold (an absent/unrecognized marker there is a **safe default**, `routine`, for model selection), this field is never defaulted: an unmarked issue, an out-of-vocabulary value, or a failed/skipped read all omit the key. A routing-evaluation consumer needs the true absence rate, not a default masquerading as data. |
@@ -665,7 +684,9 @@ record's `pr_number` — the latest PR the sweep's own checkpoint recorded. A
 sweep that opened more than one PR (a re-dispatch after a park, a
 partial-increment slice) reports its **latest** PR and never aggregates across
 PRs, so `attempt` numbering always restarts at 1 per record and a join from
-`sweep.outcome` to a PR is exact rather than a blend.
+`sweep.outcome` to a PR is exact rather than a blend. The full set is still
+recoverable — `pr_numbers` (#9465) lists every PR the sweep carried — but the
+timeline fields deliberately describe only the one `pr_number` names.
 
 **When the timeline fields are absent.** Both are omitted together, and only
 together: the sweep opened no PR, the daemon was configured not to touch the

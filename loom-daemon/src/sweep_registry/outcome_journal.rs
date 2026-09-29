@@ -1450,3 +1450,15 @@ mod disposition_tests;
     unused_imports
 )]
 mod tokens_status_tests;
+
+// Contract tests for the #9465 PR-linkage and actually-ran-model derivation
+// (`pr_numbers`, `model` vs. `config["arm"]`), in their own sibling file for
+// the same file-size reason as `timeline_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod pr_link_tests;
