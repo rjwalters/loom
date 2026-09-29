@@ -95,6 +95,30 @@ pub trait GithubApi: Send + Sync {
     fn graphql(&self, _query: &str) -> Result<ApiResponse, ApiError> {
         Err(ApiError::Transport("this GitHub client does not support GraphQL".to_string()))
     }
+
+    /// Download one run artifact by **name**, unpacked into `dest` (Issue
+    /// #9089 — the suite-timings record `run-ci-suites.sh` uploads).
+    ///
+    /// Deliberately not expressed as a [`get`](Self::get) / [`get_document`]
+    /// call: `/actions/artifacts/{id}/zip` answers a **zip**, and every other
+    /// method here funnels its body through `String::from_utf8_lossy`, which
+    /// would corrupt it. Rather than add a zip reader (and a dependency) for
+    /// one small JSON file, this delegates the transfer *and* the unzip to
+    /// `gh run download`, staying inside the daemon's zero-HTTP-client house
+    /// style. The default refuses, so every pre-#9089 test fake compiles
+    /// unchanged and a caller reads the refusal as "no artifact data", never
+    /// as an empty artifact.
+    fn download_artifact(
+        &self,
+        _repo: &str,
+        _run_id: u64,
+        _name: &str,
+        _dest: &std::path::Path,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Transport(
+            "this GitHub client does not support artifact download".to_string(),
+        ))
+    }
 }
 
 /// Bound a detail string so an HTML error page never floods a status file.
@@ -275,5 +299,52 @@ terminal escapes will be refused by gh rather than captured (upgrade gh to captu
     fn graphql(&self, query: &str) -> Result<ApiResponse, ApiError> {
         let field = format!("query={query}");
         self.run("graphql", &["-f", field.as_str()])
+    }
+
+    /// One `gh run download` subprocess (#9089). `gh` handles the redirect to
+    /// blob storage and the unzip; a non-zero exit is a transport failure
+    /// naming `gh`'s own stderr, which [`indicates_credential_failure`] and
+    /// [`crate::rate_limit_breaker::indicates_rate_limit`] can still classify
+    /// at the call site exactly as they do for a `gh api` failure.
+    ///
+    /// [`indicates_credential_failure`]: super::poll::indicates_credential_failure
+    fn download_artifact(
+        &self,
+        repo: &str,
+        run_id: u64,
+        name: &str,
+        dest: &std::path::Path,
+    ) -> Result<(), ApiError> {
+        let output = Command::new(&self.gh_bin)
+            .arg("run")
+            .arg("download")
+            .arg(run_id.to_string())
+            .arg("--repo")
+            .arg(repo)
+            .arg("--name")
+            .arg(name)
+            .arg("--dir")
+            .arg(dest)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| {
+                ApiError::Transport(format!("could not run {}: {e}", self.gh_bin.display()))
+            })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if crate::rate_limit_breaker::indicates_rate_limit(&stderr) {
+            return Err(ApiError::RateLimited {
+                retry_after_secs: None,
+                reset_epoch: None,
+                detail: bounded(&stderr),
+            });
+        }
+        Err(ApiError::Transport(format!(
+            "gh run download {run_id} --name {name} failed: {}",
+            bounded(&stderr)
+        )))
     }
 }

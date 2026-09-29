@@ -17,6 +17,7 @@ mod rerun_window;
 mod shard_queue;
 mod step_spans;
 mod story_stitch;
+mod suite_spans;
 mod trigger_reason;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -71,6 +72,14 @@ struct FixtureApi {
     /// Paths whose next `get_document` call fails transiently (then heals) —
     /// the retry-after-failure seam.
     flaky_logs: Mutex<HashMap<String, usize>>,
+    /// Downloadable run artifacts (#9089), keyed by artifact **name**: `file`
+    /// is the name `gh run download` would unpack, `text` its contents. The
+    /// seams that read and mutate these two live in `suite_spans.rs` beside
+    /// the tests that use them (a child module sees its parent's private
+    /// fields), so the shared fixture here stays the state and not the policy.
+    artifacts: Mutex<BTreeMap<String, Value>>,
+    /// Artifact names whose next `download_artifact` call fails transiently.
+    flaky_artifacts: Mutex<HashMap<String, usize>>,
 }
 
 impl FixtureApi {
@@ -95,6 +104,8 @@ impl FixtureApi {
             panic_at: None,
             job_logs: Mutex::new(job_logs),
             flaky_logs: Mutex::new(HashMap::new()),
+            artifacts: Mutex::new(suite_spans::fixture_artifacts(&fx)),
+            flaky_artifacts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -225,6 +236,18 @@ impl GithubApi for FixtureApi {
             ..ApiResponse::default()
         })
     }
+
+    /// Delegated to `suite_spans::serve_artifact` (#9089) — see it for what
+    /// `gh run download --name X --dir dest` is being stood in for.
+    fn download_artifact(
+        &self,
+        repo: &str,
+        run_id: u64,
+        name: &str,
+        dest: &Path,
+    ) -> Result<(), ApiError> {
+        suite_spans::serve_artifact(self, repo, run_id, name, dest)
+    }
 }
 
 fn now() -> DateTime<Utc> {
@@ -276,13 +299,19 @@ fn assert_no_duplicates(root: &Path) {
 }
 
 /// Spans one clean cycle over the fixture emits: 6 run spans + 24 job spans
-/// + [`FIXTURE_STEP_SPANS`] (#9089).
-pub(super) const FIXTURE_SPANS: usize = 6 + 24 + FIXTURE_STEP_SPANS;
+/// + [`FIXTURE_STEP_SPANS`] + [`FIXTURE_SUITE_SPANS`] (#9089).
+pub(super) const FIXTURE_SPANS: usize = 6 + 24 + FIXTURE_STEP_SPANS + FIXTURE_SUITE_SPANS;
 
 /// `loom.ci.step` spans the fixture's two `steps[]`-bearing jobs produce
 /// (#9089): four from job 10012 and one from job 10034 — whose second step
 /// has neither timestamp, so it is deliberately NOT a span.
 pub(super) const FIXTURE_STEP_SPANS: usize = 5;
+
+/// `loom.ci.suite` spans the fixture's one suite-timings artifact produces
+/// (#9089), all under job 10012 (`Shell Test Suites (hermetic, 2/2)`): its
+/// record holds six entries, of which the skipped one (no window) and the
+/// repeat of an earlier suite name emit nothing.
+pub(super) const FIXTURE_SUITE_SPANS: usize = 4;
 
 fn kind_counts(root: &Path) -> (usize, usize, usize, usize) {
     let (mut runs, mut jobs, mut durations, mut spans) = (0, 0, 0, 0);

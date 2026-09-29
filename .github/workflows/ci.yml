@@ -2113,6 +2113,23 @@ jobs:
           path: /tmp/ci-suite-retry-log.tsv
           if-no-files-found: ignore
           retention-days: 14
+      - name: Upload CI suite timings (#9089)
+        # The per-suite durations run-ci-suites.sh prints are only ever read by
+        # eye, in one job's log. This artifact is the same data machine-readable
+        # so `loom-daemon ci-telemetry` can turn each entry into a
+        # `loom.ci.suite` span under THIS leg's job span — which is what makes
+        # "why was this shard slow" and "are the legs balanced" answerable in
+        # SigNoz instead of by hand. The NAME is a contract: the poller only
+        # looks at artifacts whose name starts with `ci-suite-timings` (see
+        # defaults/docs/ci-observability.md §"Suite spans (#9089)"), so renaming
+        # this silently stops suite spans.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-suite-timings-${{ matrix.shard }}
+          path: /tmp/ci-suite-timings.json
+          if-no-files-found: ignore
+          retention-days: 14
 
   worker-image-smoke:
     name: loom-worker Image Smoke Test

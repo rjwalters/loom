@@ -25,6 +25,7 @@ use loom_daemon::telemetry::ci::{
     CiAttr, CI_JOB_DURATION_METRIC, CI_METRIC_LABEL_KEYS, CI_RUN_DURATION_METRIC,
     CI_SPAN_ATTRIBUTE_KEYS,
 };
+use loom_daemon::telemetry::trace::SpanName;
 use loom_daemon::telemetry::{CiJobLogRecord, CiJobRecord, CiRunRecord, RepoVisibility};
 use regex::Regex;
 
@@ -548,8 +549,10 @@ fn ci_queries_read_log_attributes_the_gateway_forwards_from_the_column_the_daemo
     }
 }
 
-/// The trace-reading counterpart (#9089). Step timings live only on
-/// `loom.ci.step` spans, so section 11 reads `signoz_traces.signoz_index_v3`
+/// The trace-reading counterpart (#9089). Step and suite timings live only on
+/// `loom.ci.step` / `loom.ci.suite` spans (there is no log record and no metric
+/// series for either), so sections 11–13 read
+/// `signoz_traces.signoz_index_v3`
 /// — a different gateway allowlist (span `keep_keys`) and a different type
 /// rule: every span attribute is exported as an OTLP string, so SigNoz files
 /// all of them under `attributes_string` regardless of what the value looks
@@ -562,9 +565,9 @@ fn ci_queries_read_span_attributes_the_gateway_forwards_from_the_string_column()
     let trace_sql = statements_reading(CI_QUERIES, "signoz_traces.signoz_index_v3");
     assert!(
         !trace_sql.is_empty(),
-        "ci-queries.sql no longer reads signoz_traces.signoz_index_v3; if the step-span \
-         section (#9089) was deliberately removed, remove this guard with it rather than \
-         letting it go vacuous"
+        "ci-queries.sql no longer reads signoz_traces.signoz_index_v3; if the step-span and \
+         suite-span sections (#9089) were deliberately removed, remove this guard with them \
+         rather than letting it go vacuous"
     );
     let ci_span_vocabulary: BTreeSet<&str> = CI_SPAN_ATTRIBUTE_KEYS
         .iter()
@@ -593,11 +596,23 @@ fn ci_queries_read_span_attributes_the_gateway_forwards_from_the_string_column()
              CI span vocabulary is {ci_span_vocabulary:?}"
         );
     }
+    // Derived from the enum, not restated: a CI span name added to `SpanName`
+    // is admitted here automatically, while a typo or a non-CI span name in the
+    // SQL (which would silently return zero rows) still fails.
+    let ci_span_names: BTreeSet<&str> = [
+        SpanName::CiRun,
+        SpanName::CiJob,
+        SpanName::CiStep,
+        SpanName::CiSuite,
+    ]
+    .iter()
+    .map(|name| name.as_str())
+    .collect();
     for name in span_name_literals(&trace_sql) {
-        assert_eq!(
-            name, "loom.ci.step",
-            "ci-queries.sql's trace section filters span name '{name}', which is not a CI span \
-             this file's vocabulary covers"
+        assert!(
+            ci_span_names.contains(name.as_str()),
+            "ci-queries.sql's trace section filters span name '{name}', which is not one of the \
+             CI spans the daemon emits ({ci_span_names:?})"
         );
     }
 }

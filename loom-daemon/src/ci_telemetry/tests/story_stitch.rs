@@ -117,6 +117,19 @@ impl GithubApi for StoryApi {
         self.inner.get_document(path)
     }
 
+    /// Forwarded so a stitched cycle emits the same suite spans (#9089) an
+    /// unstitched one does — the "a story trace never carries suite spans"
+    /// assertion below is only meaningful if the spans exist at all.
+    fn download_artifact(
+        &self,
+        repo: &str,
+        run_id: u64,
+        name: &str,
+        dest: &std::path::Path,
+    ) -> Result<(), ApiError> {
+        self.inner.download_artifact(repo, run_id, name, dest)
+    }
+
     fn graphql(&self, query: &str) -> Result<ApiResponse, ApiError> {
         self.graphql_calls.lock().unwrap().push(query.to_string());
         if self.graphql_refuses {

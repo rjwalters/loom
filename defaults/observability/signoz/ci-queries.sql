@@ -606,3 +606,173 @@ FROM steps
 GROUP BY repo, workflow, job, step, shard_kind
 ORDER BY p90_s DESC, total_s DESC
 LIMIT {top:UInt32};
+
+-- ---------------------------------------------------------------------------
+-- 12. Top slowest shell test suites (#9089). P50/P90/max/total of the
+--     `loom.ci.suite` span durations per repo + workflow + job + suite, ranked
+--     by total time, over the trace horizon. This is the question a job span
+--     and even a step span cannot answer: a `Shell Test Suites (hermetic, 1/2)`
+--     leg's ~113s is one `run:` step, and only the suite spans say which of the
+--     leg's ~118 suites spent it. `retried_runs` is the #7791 retry count for
+--     the same suite over the same window, so a suite that is slow because it
+--     runs twice is distinguishable from one that is simply slow -- the input
+--     #7789's quarantine decision wants.
+--
+--     TRACES, 7 days, same as section 11 (suite spans have no log record and no
+--     metric series: a per-suite histogram would multiply the 30-day series
+--     count by every leg's suite count). De-duplicate on the derived span id
+--     before aggregating.
+--
+--     A suite that did NOT run in a leg (skipped by the live-daemon guard,
+--     missing from disk) has no span at all, so it never appears here as a fast
+--     suite. `outcome` is the suite's own pass/fail/skip, never its job's
+--     GitHub conclusion.
+WITH suites AS (
+    SELECT attributes_string['loom.repo']                 AS repo,
+           attributes_string['loom.ci.workflow']          AS workflow,
+           attributes_string['loom.ci.job']               AS job,
+           attributes_string['loom.ci.suite']             AS suite,
+           anyIf(1, attributes_string['loom.ci.suite.retried'] = 'true') AS retried,
+           anyIf(1, attributes_string['loom.ci.suite.outcome'] = 'fail') AS failed,
+           any(duration_nano)                             AS duration_nano
+    FROM signoz_traces.signoz_index_v3
+    WHERE name = 'loom.ci.suite'
+      AND timestamp >= {since:DateTime}
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    GROUP BY repo, workflow, job, suite, trace_id, span_id
+)
+SELECT repo, workflow, job, suite,
+       count()                                           AS runs,
+       sum(retried)                                      AS retried_runs,
+       sum(failed)                                       AS failed_runs,
+       round(quantileExact(0.5)(duration_nano) / 1e9, 1) AS p50_s,
+       round(quantileExact(0.9)(duration_nano) / 1e9, 1) AS p90_s,
+       round(max(duration_nano) / 1e9, 1)                AS max_s,
+       round(sum(duration_nano) / 1e9, 1)                AS total_s
+FROM suites
+GROUP BY repo, workflow, job, suite
+ORDER BY total_s DESC, p90_s DESC
+LIMIT {top:UInt32};
+
+-- ---------------------------------------------------------------------------
+-- 13. Suite-level shard rebalance (#9089). Section 10 says WHETHER a run's
+--     legs are imbalanced, from their job durations. This says what to MOVE:
+--     per leg, the summed suite time it carried and its slowest suite, so a
+--     `LOOM_CI_SHARD` split can be rebalanced by moving named suites rather
+--     than by re-running the matrix and hoping.
+--
+--     One row per (run attempt, leg). `leg_suite_s` is the sum of that leg's
+--     suite spans, which is LESS than the job's wall time (checkout, toolchain
+--     setup and the runner's own overhead are steps, not suites) and, because
+--     suites run concurrently within a leg, MORE than the wall time of the step
+--     that ran them. Both gaps are expected; the comparison that matters here
+--     is between legs of the same run, not between a leg and its own job span.
+--
+--     TRACES, 7 days.
+WITH suites AS (
+    SELECT attributes_string['loom.repo']               AS repo,
+           attributes_string['loom.ci.workflow']        AS workflow,
+           attributes_string['loom.ci.run_id']          AS run_id,
+           attributes_string['loom.ci.shard.kind']      AS shard_kind,
+           attributes_string['loom.ci.shard.index']     AS shard_index,
+           attributes_string['loom.ci.shard.total']     AS shard_total,
+           attributes_string['loom.ci.suite']           AS suite,
+           any(duration_nano)                           AS duration_nano
+    FROM signoz_traces.signoz_index_v3
+    WHERE name = 'loom.ci.suite'
+      AND timestamp >= {since:DateTime}
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    GROUP BY repo, workflow, run_id, shard_kind, shard_index, shard_total, suite,
+             trace_id, span_id
+)
+SELECT repo, workflow, run_id, shard_kind,
+       shard_index, shard_total,
+       count()                                  AS suites_run,
+       round(sum(duration_nano) / 1e9, 1)       AS leg_suite_s,
+       argMax(suite, duration_nano)             AS slowest_suite,
+       round(max(duration_nano) / 1e9, 1)       AS slowest_suite_s
+FROM suites
+GROUP BY repo, workflow, run_id, shard_kind, shard_index, shard_total
+ORDER BY run_id DESC, leg_suite_s DESC
+LIMIT {top:UInt32};
+
+-- ---------------------------------------------------------------------------
+-- 14. Critical path per run, queue included (#9089). Section 6 compares a run's
+--     wall time to its longest job's RUNNING time, and can only say "queueing
+--     or a serialized needs: chain dominates" without saying which. Now that
+--     every job carries its own `loom.ci.queued_ms`, this ranks each run's jobs
+--     by queue + run and names the one that actually set the floor:
+--       `critical_job` / `critical_total_s`  the job with the largest
+--                                           queued+running sum, and that sum
+--       `critical_queued_s`                 how much of it was waiting for a
+--                                           runner, never conflated with work
+--       `run_queued_s`                      the RUN's own queue segment (#9007),
+--                                           which is time before any job existed
+--       `unexplained_s`                     run wall time minus (run queue +
+--                                           critical job total)
+--
+--     `unexplained_s` is the `needs:` chain, and is the number to act on: it is
+--     large exactly when jobs ran in sequence rather than one job being slow, so
+--     `build-daemon` fan-in is the suspect rather than any single leg. It is NOT
+--     a dependency-wait measurement -- a real one needs the predecessor job's
+--     `completed_at` and is still future work (see ci-observability.md §"Suite
+--     spans"). Treat it as a residual, and expect it to be slightly negative on
+--     a run whose jobs overlap the run's own reported window.
+--
+--     A job GitHub reported no `created_at` for contributes 0 queue here rather
+--     than dropping out of its run's critical path entirely -- unlike section 9,
+--     which is a percentile over queue waits and must not be fed a fake zero.
+--     Logs-backed (`ci.run` + `ci.job` records): 7 days.
+WITH runs AS (
+    SELECT attributes_string['loom.repo'] AS repo,
+           attributes_string['loom.ci.workflow'] AS workflow,
+           toUInt64(attributes_number['loom.ci.run_id']) AS run_id,
+           toUInt32(attributes_number['loom.ci.run_attempt']) AS run_attempt,
+           attributes_string['loom.ci.conclusion'] AS conclusion,
+           attributes_number['loom.ci.duration_ms'] AS run_ms,
+           attributes_number['loom.ci.queued_ms'] AS run_queued_ms
+    FROM signoz_logs.logs_v2
+    WHERE body = 'ci.run'
+      AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    LIMIT 1 BY repo, run_id, run_attempt
+),
+jobs AS (
+    SELECT repo, run_id, run_attempt,
+           count() AS jobs,
+           argMax(job, total_ms) AS critical_job,
+           max(total_ms) AS critical_total_ms,
+           argMax(queued_ms, total_ms) AS critical_queued_ms,
+           sum(queued_ms) AS summed_queued_ms
+    FROM (
+        SELECT attributes_string['loom.repo'] AS repo,
+               toUInt64(attributes_number['loom.ci.run_id']) AS run_id,
+               toUInt32(attributes_number['loom.ci.attempts']) AS run_attempt,
+               toUInt64(attributes_number['loom.ci.job_id']) AS job_id,
+               attributes_string['loom.ci.job'] AS job,
+               attributes_number['loom.ci.queued_ms'] AS queued_ms,
+               attributes_number['loom.ci.duration_ms']
+                 + attributes_number['loom.ci.queued_ms'] AS total_ms
+        FROM signoz_logs.logs_v2
+        WHERE body = 'ci.job'
+          AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+        LIMIT 1 BY repo, job_id
+    )
+    GROUP BY repo, run_id, run_attempt
+)
+SELECT r.repo AS repo, r.workflow AS workflow, r.run_id AS run_id,
+       r.run_attempt AS run_attempt, r.conclusion AS conclusion,
+       round(r.run_ms / 1000, 1) AS run_s,
+       round(r.run_queued_ms / 1000, 1) AS run_queued_s,
+       j.jobs,
+       j.critical_job,
+       round(j.critical_total_ms / 1000, 1) AS critical_total_s,
+       round(j.critical_queued_ms / 1000, 1) AS critical_queued_s,
+       round(j.summed_queued_ms / 1000, 1) AS summed_job_queued_s,
+       round((r.run_ms - r.run_queued_ms - j.critical_total_ms) / 1000, 1)
+         AS unexplained_s
+FROM runs AS r
+INNER JOIN jobs AS j
+  ON j.repo = r.repo AND j.run_id = r.run_id AND j.run_attempt = r.run_attempt
+ORDER BY r.run_ms DESC, r.run_id
+LIMIT {top:UInt32};

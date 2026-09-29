@@ -31,6 +31,12 @@ pub enum SpanName {
     /// listing the poller already fetches — no extra API call.
     #[serde(rename = "loom.ci.step")]
     CiStep,
+    /// One shell test suite of a sharded job (Issue #9089), parented to its
+    /// [`Self::CiJob`] span. Built from the timings artifact
+    /// `run-ci-suites.sh` uploads — the only surface that carries per-suite
+    /// durations out of a finished runner.
+    #[serde(rename = "loom.ci.suite")]
+    CiSuite,
     /// One work-finder tick (Issue #8860) — its own root trace per tick.
     #[serde(rename = "loom.dispatch.tick")]
     DispatchTick,
@@ -66,6 +72,7 @@ impl SpanName {
             Self::CiRun => "loom.ci.run",
             Self::CiJob => "loom.ci.job",
             Self::CiStep => "loom.ci.step",
+            Self::CiSuite => "loom.ci.suite",
             Self::DispatchTick => "loom.dispatch.tick",
             Self::RuntimeUsage => "loom.runtime.usage",
             Self::PoolHold => "loom.pool.hold",
