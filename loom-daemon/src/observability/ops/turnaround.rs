@@ -136,6 +136,7 @@ pub fn waiting_ready(report: &TickReport) -> usize {
     report.deferred_capacity
         + report.deferred_ramp_cap
         + report.deferred_saturation
+        + report.deferred_build_backoff
         + report.deferred_out_of_slice
         + report.deferred_repo_cap
 }

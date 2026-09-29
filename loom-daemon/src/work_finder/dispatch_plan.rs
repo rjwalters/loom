@@ -88,6 +88,7 @@ pub fn gate_of(disposition: Qd) -> Option<PlanGate> {
         Qd::DeferredCapacity => Some(PlanGate::Capacity),
         Qd::DeferredRampCap => Some(PlanGate::Ramp),
         Qd::DeferredSaturation => Some(PlanGate::Saturation),
+        Qd::DeferredBuildBackoff => Some(PlanGate::BuildBackoff),
         Qd::DeferredRepoCap => Some(PlanGate::RepoCap),
         Qd::DeferredOutOfSlice => Some(PlanGate::OutOfSlice),
         _ => None,

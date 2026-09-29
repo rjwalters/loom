@@ -227,6 +227,7 @@ pub const DEFAULT_MAX_ADMISSIONS_PER_TICK: usize = 3;
 /// config). See [`resolve_extra_skip_labels_with_config`].
 pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP_LABELS";
 
+pub mod build_backoff;
 pub mod dispatch_plan;
 mod labels;
 pub mod main_red_fix;
@@ -1548,9 +1549,43 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
     max_concurrent_per_repo: Option<usize>,
     lanes: &[RedMainLane],
 ) -> TickReport {
+    tick_multi_with_build_backoff(
+        workspaces,
+        priorities,
+        terms,
+        halted,
+        max_admissions_per_tick,
+        saturation_held,
+        preferred_slice,
+        max_concurrent_per_repo,
+        lanes,
+        false,
+    )
+}
+
+/// Like [`tick_multi_with_repo_cap`], but additionally honors the **build
+/// back-off** (#9410, [`build_backoff`]): while `build_backoff_held`, pass 2
+/// defers every candidate that is neither starred (`loom:operator-priority`)
+/// nor a verified red-main fix ([`Qd::DeferredBuildBackoff`]). Checked after
+/// the saturation brake and before the overflow / cap gates; in-flight sweeps
+/// are untouched. `false` is [`tick_multi_with_repo_cap`] byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
+    workspaces: &mut [(S, D)],
+    priorities: &[u32],
+    terms: CapTerms,
+    halted: &[bool],
+    max_admissions_per_tick: usize,
+    saturation_held: bool,
+    preferred_slice: Option<&[bool]>,
+    max_concurrent_per_repo: Option<usize>,
+    lanes: &[RedMainLane],
+    build_backoff_held: bool,
+) -> TickReport {
     use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
     let mut report = TickReport::for_tick(saturation_held, max_admissions_per_tick);
+    report.build_backoff_held = build_backoff_held;
 
     // Snapshot per-workspace in-flight sets *first* (immutable borrow) so the
     // dedup filtering below always has the full in-flight view.
@@ -1901,6 +1936,13 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
         if saturation_held {
             report.deferred_saturation += 1;
             ready_queue::resolve(q, &cand, Qd::DeferredSaturation, None);
+            continue;
+        }
+        // Build back-off (#9410): a WIP policy, so a star (a human's "now")
+        // and a red-main fix (which drains merge debt) both bypass it.
+        if build_backoff_held && !(cand.operator_priority || cand.main_red_fix) {
+            report.deferred_build_backoff += 1;
+            ready_queue::resolve(q, &cand, Qd::DeferredBuildBackoff, None);
             continue;
         }
         // #9244 overflow: a starred candidate refused ONLY by the global and/or
@@ -2756,6 +2798,8 @@ pub fn spawn_multi_work_finder_task(
         let _ = startup_reconciliation_ready.wait_for(|ready| *ready).await;
         let mut was_halted = false;
         let mut was_pressured = false;
+        // #9410: the build back-off's hysteresis state, held across ticks.
+        let mut build_backoff = build_backoff::BuildBackoff::default();
         // Pre-flight-advisory hold transition state (#5030): log the distinct
         // "held because pre-flight is broken" warning once per transition rather
         // than every tick, mirroring `was_halted`.
@@ -3009,6 +3053,10 @@ pub fn spawn_multi_work_finder_task(
                 in_flight_sweeps,
                 crate::role_runner::global_active_run_count(),
             );
+            // #9410: one in-memory read of the role runner's demand ledger —
+            // no forge call; fails open when the ledger is unobserved.
+            let build_backoff_held =
+                build_backoff.step(&fallback_root, crate::role_runner::demand::global());
             // Per-root claude-wrapper pre-flight-advisory hold (#5030): consult
             // each root's own SweepRegistry breaker. A workspace that has
             // accumulated `threshold` consecutive pre-flight deaths (broken
@@ -3122,6 +3170,7 @@ pub fn spawn_multi_work_finder_task(
                  per_repo_cap={max_concurrent_per_repo:?} (#9090), \
                  preflight_held={preflight_held_count}, \
                  saturation_held={saturation_held}, \
+                 build_backoff_held={build_backoff_held} (#9410), \
                  observed_idle={}, workspaces={}, priorities={priorities:?}, \
                  shard_slice={in_slice_count}/{} preferred (#6243/#6374))",
                 format_idle(idle),
@@ -3136,7 +3185,7 @@ pub fn spawn_multi_work_finder_task(
             }
 
             let tick_started = chrono::Utc::now();
-            let report = tick_multi_with_repo_cap(
+            let report = tick_multi_with_build_backoff(
                 &mut pairs,
                 &priorities,
                 CapTerms::new(configured_max, disk, ram),
@@ -3146,6 +3195,7 @@ pub fn spawn_multi_work_finder_task(
                 Some(&preferred_slice),
                 max_concurrent_per_repo,
                 &lanes,
+                build_backoff_held,
             );
 
             // Publish before any logging so `loom-daemon health` sees the same
@@ -3200,8 +3250,8 @@ pub fn spawn_multi_work_finder_task(
                      {} peer-claim-skip, \
                      {} deferred (capacity), {} deferred (ramp), \
                      {} deferred (host saturated), {} deferred (out-of-slice, #6243), \
-                     {} deferred (repo cap, #9090), {} error(s), \
-                     {} cross-host-collision(s)",
+                     {} deferred (repo cap, #9090), {} deferred (build back-off, #9410), \
+                     {} error(s), {} cross-host-collision(s)",
                     pairs.len(),
                     report.seen,
                     report.dispatched,
@@ -3224,6 +3274,7 @@ pub fn spawn_multi_work_finder_task(
                     report.deferred_saturation,
                     report.deferred_out_of_slice,
                     report.deferred_repo_cap,
+                    report.deferred_build_backoff,
                     report.errors,
                     report.collisions
                 );
