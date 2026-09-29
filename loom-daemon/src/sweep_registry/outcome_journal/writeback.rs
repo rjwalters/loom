@@ -391,6 +391,8 @@ mod tests {
             provider: None,
             profile: None,
             complexity: Some("complex".to_string()),
+            tokens_status: None,
+            tokens_status_reason: None,
         }
     }
 

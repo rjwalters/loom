@@ -623,30 +623,28 @@ impl SweepRegistry {
             .or_else(|| self.probe_worktree_loc(issue))
             .map_or((None, None), |(added, deleted)| (Some(added), Some(deleted)));
 
-        // Tokens in/out (Issue #5357): summed straight from the sweep's own
-        // Claude Code transcripts, split into input/output axes (raw, NOT
-        // cost-weighted — see the schema doc and `tokens_in`'s own doc for
-        // why). Bounded to this run's own wall-clock window so a
-        // re-dispatched issue's earlier runs are never folded in. Best
-        // effort: any failure (no project dir, no matching session, pruned
-        // logs) degrades to `None`, never a fabricated `0`.
-        let (tokens_in, tokens_out) = started_at
-            .and_then(|started_at| {
-                let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
-                crate::transcript_tokens::sum_sweep_tokens_split(
-                    &projects_dir,
-                    &self.config.workspace_root,
-                    issue,
-                    Some((started_at, Utc::now())),
-                )
-            })
-            .map_or((None, None), |(tin, tout)| (Some(tin), Some(tout)));
-
-        // Per-model token breakdown (Issue #6384): same wall-clock window as
-        // `tokens_in`/`tokens_out` above, but grouped by
-        // `(model, speed, service_tier)` instead of flattened — see
+        // Tokens in/out (Issue #5357) and the per-model breakdown (#6384),
+        // resolved together with the `tokens_status` that explains them
+        // (Issue #9440) — see `crate::sweep_usage`, which owns the whole
+        // decision so this path and the live collector path cannot disagree
+        // about what an empty read means.
+        //
+        // Summed straight from the sweep's own transcripts, split into
+        // input/output axes (raw, NOT cost-weighted — see the schema doc and
+        // `tokens_in`'s own doc for why), and grouped by `(model, speed,
+        // service_tier)` rather than flattened for `tokens_by_model` — see
         // `ModelUsageTotals`'s own doc for why a flat sum cannot be priced.
-        // Same best-effort/never-fabricated-zero contract.
+        // Bounded to this run's own wall-clock window so a re-dispatched
+        // issue's earlier runs are never folded in; a sweep whose registry
+        // entry is already gone reconstructs that window from its measured
+        // duration rather than declining to measure at all (#9440).
+        //
+        // Issue #9440 is what makes this run for a FAILED sweep too: a
+        // pre-flight death publishes a measured zero, a cancelled or
+        // watchdog-killed sweep publishes the partial usage it really burned,
+        // and only a sweep whose usage genuinely could not be read publishes
+        // absent counters — now with a reason attached instead of looking
+        // identical to "never spawned".
         //
         // Issue #8507: the SOURCE is runtime-dispatched through
         // `crate::usage_source`. The Claude on-disk JSONL transcripts stay the
@@ -669,14 +667,20 @@ impl SweepRegistry {
             &self.config.workspace_root,
             issue,
         );
-        let tokens_by_model = started_at.and_then(|started_at| {
-            crate::usage_source::sweep_tokens_by_model(
-                usage_runtime.as_deref(),
-                &self.config.workspace_root,
-                issue,
-                Some((started_at, Utc::now())),
-            )
-        });
+        let usage = crate::sweep_usage::resolve(
+            usage_runtime.as_deref(),
+            &self.config.workspace_root,
+            issue,
+            crate::sweep_usage::window(started_at, duration_sec),
+            failure_class.as_deref(),
+        );
+        let crate::sweep_usage::SweepUsage {
+            tokens_in,
+            tokens_out,
+            tokens_by_model,
+            status: tokens_status,
+            reason: tokens_status_reason,
+        } = usage;
 
         // Distinct model ids actually observed in this sweep's transcripts
         // (Issue #8056) — see `models_used_from`.
@@ -812,6 +816,8 @@ impl SweepRegistry {
                 .and_then(|r| r.provider.clone()),
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
             complexity,
+            tokens_status: Some(tokens_status),
+            tokens_status_reason,
         };
         // Issue #9441: both disposition invariants hold on every record this
         // daemon writes. A debug assertion rather than a runtime guard — the
@@ -1312,3 +1318,15 @@ mod writeback_tests;
     unused_imports
 )]
 mod disposition_tests;
+
+// End-to-end tests for the #9440 `tokens_status` axis (a failed/cancelled
+// sweep's token counters and the absence-case discriminator), in their own
+// sibling file for the same file-size reason as `timeline_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod tokens_status_tests;

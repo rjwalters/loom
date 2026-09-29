@@ -120,6 +120,8 @@ fn sweep_outcome() -> TelemetryRecord {
         provider: Some("friendli".to_string()),
         profile: Some("zai-flash".to_string()),
         complexity: Some("routine".to_string()),
+        tokens_status: None,
+        tokens_status_reason: None,
     })
 }
 
@@ -257,6 +259,8 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         provider: None,
         profile: None,
         complexity: None,
+        tokens_status: None,
+        tokens_status_reason: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     for field in [
@@ -379,6 +383,8 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         provider: None,
         profile: None,
         complexity: Some("complex".to_string()),
+        tokens_status: None,
+        tokens_status_reason: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(value["complexity"], "complex");
@@ -430,6 +436,8 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         provider: None,
         profile: None,
         complexity: None,
+        tokens_status: None,
+        tokens_status_reason: None,
     };
 
     let unobserved = serde_json::to_value(&base).unwrap();

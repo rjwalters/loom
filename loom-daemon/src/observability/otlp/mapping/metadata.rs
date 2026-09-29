@@ -168,6 +168,23 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     if let Some(value) = usage(record.tokens_by_model.as_deref()) {
         attrs.push(value);
     }
+    // Issue #9440: the discriminator that makes an absent token pair readable.
+    // A closed vocabulary (the enum's own serde tags), so this is an exported
+    // attribute a query can group by, never free text.
+    if let Some(status) = record.tokens_status {
+        attrs.push(kv_string(
+            "loom.tokens_status",
+            match status {
+                crate::telemetry::TokensStatus::Measured => "measured",
+                crate::telemetry::TokensStatus::NotSpawned => "not_spawned",
+                crate::telemetry::TokensStatus::Unattributable => "unattributable",
+            }
+            .to_string(),
+        ));
+    }
+    if let Some(value) = record.tokens_status_reason.as_ref().filter(|v| text(v)) {
+        attrs.push(kv_string("loom.tokens_status_reason", value.clone()));
+    }
     for (key, value) in [
         ("loom.tokens_in", record.tokens_in),
         ("loom.tokens_out", record.tokens_out),

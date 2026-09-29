@@ -51,6 +51,8 @@ fn sweep_outcome_omits_complexity_when_no_marker_was_read() {
         provider: None,
         profile: None,
         complexity: None,
+        tokens_status: None,
+        tokens_status_reason: None,
     };
     let value = serde_json::to_value(&base).unwrap();
     assert!(

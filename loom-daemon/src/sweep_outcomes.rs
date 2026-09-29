@@ -959,6 +959,8 @@ mod tests {
                 provider: None,
                 profile: None,
                 complexity: None,
+                tokens_status: None,
+                tokens_status_reason: None,
             }),
         )
     }

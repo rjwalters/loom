@@ -132,6 +132,8 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             doctor_cycles: None,
             judge_verdicts: None,
             complexity: None,
+            tokens_status: None,
+            tokens_status_reason: None,
         }),
     )
 }
