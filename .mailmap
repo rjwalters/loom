@@ -1,0 +1,18 @@
+# Canonical author identities. `git` applies this to log, shortlog and blame
+# output, so it corrects attribution retroactively without rewriting history.
+# Format: Proper Name <proper@email> <commit@email>
+#
+# Deliberately NOT mapped:
+#   - Robb Walters' agent-N@2amlogic.com identities. Those are Loom's own
+#     autonomous agents committing under the operator's name; folding them into
+#     the human identity would erase the human/agent distinction, which is a
+#     policy call rather than a typo.
+#   - Joseph Perla <jperla@...>, a different person who shares a first name.
+
+# Two addresses, and one of them carried the wrong surname from a machine's
+# leftover git config.
+Joseph Turian <turian@gmail.com> <joseph@2amlogic.com>
+
+# A shell `echo` leaked into this machine's user.email, appending "echo" to the
+# address on 31 commits. Same identity, malformed address.
+Loom Worker <loom-reviewer@users.noreply.github.com> <loom-reviewer@users.noreply.github.comecho>
