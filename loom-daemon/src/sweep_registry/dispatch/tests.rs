@@ -3025,6 +3025,26 @@ fn concurrent_issue_dispatches_do_not_serialize_on_the_account_selection_poll() 
     );
     let registry = Arc::new(Mutex::new(lifecycle_registry(dir.path(), &script)));
 
+    // Calibrate the "if this were serialized" bound against THIS host's
+    // actual cost of one full, genuinely serialized dispatch — the pre-#6592
+    // shape, exercised by the plain `dispatch()` method, which holds the
+    // registry mutex across the whole poll — instead of assuming an
+    // idle-host `poll_delay` constant. Any contention on the host (e.g. a
+    // concurrent `cargo build`) inflates this measurement exactly as it
+    // would inflate the burst below, so the ratio stays meaningful under
+    // load instead of flaking on a fixed wall-clock number (issue #9194).
+    let calibration_start = Instant::now();
+    let calibration = {
+        let mut sr = registry.lock().unwrap();
+        sr.dispatch(&SweepKind::Issue(80_999), None, None, None, None)
+            .expect("calibration dispatch should succeed")
+    };
+    let measured_serial_one = calibration_start.elapsed();
+    {
+        let mut sr = registry.lock().unwrap();
+        let _ = sr.cancel(&calibration.sweep_id, Duration::from_millis(50));
+    }
+
     const BURST: u32 = 10;
     let start = Instant::now();
     let handles: Vec<std::thread::JoinHandle<DispatchOutcome>> = (0..BURST)
@@ -3079,19 +3099,20 @@ fn concurrent_issue_dispatches_do_not_serialize_on_the_account_selection_poll() 
         );
     }
 
-    // Serialized (pre-#6592: registry mutex held across the poll) would
-    // take roughly BURST * poll_delay (7s for 10x700ms). Concurrent
-    // (post-#6592) should complete close to ONE poll_delay plus
-    // guard-chain/spawn overhead. Assert well under the serialized
-    // bound — and well under the 30s client ack deadline (AC2) this
-    // issue targets.
-    let serialized_bound = poll_delay * BURST;
+    // A deliberately-serialized burst (pre-#6592: registry mutex held across
+    // the poll) would take roughly `measured_serial_one * BURST` — measured
+    // moments ago, on this same host, under the same load, rather than
+    // assumed from `poll_delay` alone (issue #9194). Concurrent (post-#6592)
+    // should complete close to ONE dispatch's cost plus guard-chain/spawn
+    // overhead. Assert well under the serialized bound — and well under the
+    // 30s client ack deadline (AC2) this issue targets.
+    let serialized_bound = measured_serial_one * BURST;
     assert!(
-            elapsed < serialized_bound / 2,
-            "burst of {BURST} concurrent dispatches took {elapsed:?} (poll_delay={poll_delay:?}) \
-             — looks serialized behind the registry mutex (serialized bound ~{serialized_bound:?}), \
-             not concurrent"
-        );
+        elapsed < serialized_bound / 2,
+        "burst of {BURST} concurrent dispatches took {elapsed:?} (measured serial cost of \
+             one dispatch on this host: {measured_serial_one:?}) — looks serialized behind the \
+             registry mutex (serialized bound ~{serialized_bound:?}), not concurrent"
+    );
     assert!(
         elapsed < Duration::from_secs(30),
         "burst took {elapsed:?}, at or over the 30s client ack deadline this issue targets"

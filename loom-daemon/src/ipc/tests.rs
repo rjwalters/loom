@@ -1939,6 +1939,33 @@ async fn dispatch_sweep_nonblocking_burst_acks_well_under_the_client_deadline() 
     let bus = Arc::new(EventBus::new());
     let pool = Arc::new(WorkspacePool::new(bus.clone(), test_runtime_handle()));
 
+    // Calibrate the "if this were serialized" bound against THIS host's
+    // actual cost of one full, genuinely serialized dispatch — the plain
+    // `SweepRegistry::dispatch` method, which holds the registry mutex across
+    // the whole account-selection poll (the pre-#6592 shape) — instead of
+    // assuming an idle-host `poll_delay` constant. Any contention on the
+    // host (e.g. a concurrent `cargo build`) inflates this measurement
+    // exactly as it would inflate the concurrent burst below, so the ratio
+    // stays meaningful under load instead of flaking on a fixed wall-clock
+    // number (issue #9194). Run via `spawn_blocking` since `dispatch` blocks
+    // synchronously for ~`poll_delay`.
+    let sr_calibration = sr.clone();
+    let calibration_start = std::time::Instant::now();
+    let calibration = tokio::task::spawn_blocking(move || {
+        sr_calibration
+            .lock()
+            .unwrap()
+            .dispatch(&SweepKind::Issue(83_999), None, None, None, None)
+    })
+    .await
+    .expect("calibration task panicked")
+    .expect("calibration dispatch should succeed");
+    let measured_serial_one = calibration_start.elapsed();
+    {
+        let mut guard = sr.lock().unwrap();
+        let _ = guard.cancel(&calibration.sweep_id, Duration::from_millis(50));
+    }
+
     let start = std::time::Instant::now();
     let mut handles = Vec::new();
     for i in 0..BURST {
@@ -1971,11 +1998,18 @@ async fn dispatch_sweep_nonblocking_burst_acks_well_under_the_client_deadline() 
     let elapsed = start.elapsed();
     assert_eq!(sweep_ids.len(), BURST as usize);
 
-    let serialized_bound = poll_delay * BURST;
+    // A deliberately-serialized burst would take roughly
+    // `measured_serial_one * BURST` — measured moments ago, on this same
+    // host, under the same load, rather than assumed from `poll_delay` alone.
+    // Assert the concurrent burst completes in well under that, proving it
+    // did NOT serialize behind the registry mutex, while still tolerating
+    // host-load inflation that hits both measurements alike.
+    let serialized_bound = measured_serial_one * BURST;
     assert!(
         elapsed < serialized_bound / 2,
-        "burst of {BURST} concurrent dispatch_sweep calls took {elapsed:?} — looks \
-             serialized behind the registry mutex (serialized bound ~{serialized_bound:?})"
+        "burst of {BURST} concurrent dispatch_sweep calls took {elapsed:?} (measured serial \
+             cost of one dispatch on this host: {measured_serial_one:?}) — looks serialized \
+             behind the registry mutex (serialized bound ~{serialized_bound:?})"
     );
     assert!(
         elapsed < Duration::from_secs(30),

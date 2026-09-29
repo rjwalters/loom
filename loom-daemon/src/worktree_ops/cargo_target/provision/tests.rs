@@ -119,6 +119,44 @@ fn an_unredirected_host_is_a_no_op_even_when_enabled() {
 }
 
 #[test]
+#[cfg(unix)]
+fn realish_resolves_a_symlinked_prefix_even_when_the_leaf_does_not_exist_yet() {
+    // The root cause behind `an_unredirected_host_is_a_no_op_even_when_enabled`
+    // flaking on macOS (issue #9194): `std::fs::canonicalize` fails outright
+    // on a path whose leaf does not exist yet, so the old `realish` fell back
+    // to the RAW path for the not-yet-created side of a comparison while the
+    // EXISTING side resolved through a symlinked prefix (macOS's `/var` ->
+    // `/private/var`) — silently breaking the `starts_with` containment check
+    // this module relies on. Exercise that geometry directly, with an
+    // explicit symlink rather than relying on the host's own tmp layout, so
+    // the regression holds on every unix host this module runs on, not just
+    // one whose ambient tmp happens to be symlinked.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let real = tmp.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    // `link/child` does not exist yet.
+    let via_link = realish(&link.join("child"));
+    let via_real = real.canonicalize().unwrap().join("child");
+    assert_eq!(
+        via_link, via_real,
+        "a not-yet-existing child of a symlinked prefix must resolve consistently with \
+         the same child under the symlink's real target"
+    );
+
+    // And the containment check this exists to protect must see it: a
+    // not-yet-existing path under the resolved worktree is still recognised
+    // as living inside it.
+    let worktree_real = realish(&link);
+    assert!(
+        via_link.starts_with(&worktree_real),
+        "{via_link:?} should be recognised as inside {worktree_real:?}"
+    );
+}
+
+#[test]
 fn an_existing_marker_is_authoritative_and_not_re_derived() {
     let (tmp, repo, wt) = fixture(706);
     let root = tmp.path().join("shared");
