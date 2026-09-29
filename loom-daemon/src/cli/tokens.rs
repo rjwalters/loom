@@ -4,7 +4,7 @@
 use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 
-use crate::{ClaudeConfigAction, ForgeAction, PinAction, TokensAction};
+use crate::{ClaudeConfigAction, PinAction, TokensAction};
 
 mod select_cmd;
 
@@ -613,41 +613,6 @@ fn print_monitor_import(result: &loom_daemon::tokens_pool::monitor_db::MonitorIm
     if !result.pruned.is_empty() {
         println!("Pruned ({}): {}", result.pruned.len(), result.pruned.join(", "));
     }
-}
-
-/// Handle `loom-daemon forge <issue|pr|auth|auto-merge>` (epic #4081 Phase 3,
-/// family 3 — the native port of `loom-forge` / `loom-auto-merge`). Handlers
-/// exec `gh` / exit the process directly, so this only returns `Err` when a
-/// child process cannot be spawned. See `loom-daemon/src/forge_cmd.rs`.
-pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
-    use loom_daemon::forge_cmd::{dispatch, ForgeCmd};
-    let cmd = match action {
-        ForgeAction::Issue { args } => ForgeCmd::Issue(args),
-        ForgeAction::Pr { args } => ForgeCmd::Pr(args),
-        ForgeAction::Auth { args } => ForgeCmd::Auth(args),
-        ForgeAction::CheckOpenPr { issue } => ForgeCmd::CheckOpenPr { issue },
-        ForgeAction::AutoMerge {
-            pr_number,
-            method,
-            expected_head_sha,
-            ..
-        } => ForgeCmd::AutoMerge {
-            pr: pr_number,
-            method,
-            expected_head_sha,
-        },
-        ForgeAction::DisableAutoMerge {
-            pr_number,
-            audit_comment,
-            hold,
-        } => ForgeCmd::DisableAutoMerge {
-            pr: pr_number,
-            audit_comment,
-            hold,
-        },
-        ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
-    };
-    dispatch(cmd)
 }
 
 /// Handle `loom-daemon tokens <select|pin|unpin|unblock|mark-bad>` (Issue
