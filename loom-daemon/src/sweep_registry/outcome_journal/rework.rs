@@ -149,12 +149,9 @@ pub(crate) fn read_reflog_rework(
             continue;
         };
         let raw_date = head[open + 6..].trim_end_matches('}').trim();
-        let Ok(at) = chrono::NaiveDateTime::parse_from_str(raw_date, "%Y-%m-%d %H:%M:%S %z")
-            .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw_date, "%Y-%m-%d %H:%M:%S"))
-        else {
+        let Some(at) = parse_reflog_date(raw_date) else {
             continue;
         };
-        let at = at.and_utc();
         if let Some(start) = window_start {
             if at < start {
                 continue;
@@ -191,6 +188,22 @@ pub(crate) fn read_reflog_rework(
         }
     }
     events
+}
+
+/// Parse a `git reflog --date=iso` timestamp (`2026-09-29 12:00:00 -0700`)
+/// into the UTC instant it names. The offset is honoured, not discarded:
+/// git renders reflog dates in the host's local zone, so reading the wall
+/// clock as if it were UTC shifts every event by the host's offset and drops
+/// real rebases out of the window on any non-UTC host (Issue #9553). An
+/// offset-less date (never emitted by `--date=iso`, kept for tolerance) is
+/// read as UTC.
+fn parse_reflog_date(raw: &str) -> Option<DateTime<Utc>> {
+    if let Ok(at) = DateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S %z") {
+        return Some(at.with_timezone(&Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|at| at.and_utc())
 }
 
 #[cfg(test)]
@@ -314,6 +327,31 @@ mod tests {
                 && event.classification.as_deref() == Some("environmental")),
             "the rebase must be observed as one environmental event: {events:?}"
         );
+    }
+
+    /// A non-UTC offset names a different instant than the same wall clock
+    /// in UTC; the parse must convert, not discard (Issue #9553).
+    #[test]
+    fn reflog_date_offset_is_converted_to_utc_not_discarded() {
+        let expect = |rfc3339: &str| {
+            DateTime::parse_from_rfc3339(rfc3339)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        assert_eq!(
+            parse_reflog_date("2026-09-29 10:00:00 -0700"),
+            Some(expect("2026-09-29T17:00:00Z"))
+        );
+        assert_eq!(
+            parse_reflog_date("2026-09-29 10:00:00 +0530"),
+            Some(expect("2026-09-29T04:30:00Z"))
+        );
+        assert_eq!(
+            parse_reflog_date("2026-09-29 10:00:00 +0000"),
+            Some(expect("2026-09-29T10:00:00Z"))
+        );
+        assert_eq!(parse_reflog_date("2026-09-29 10:00:00"), Some(expect("2026-09-29T10:00:00Z")));
+        assert_eq!(parse_reflog_date("not a date"), None);
     }
 
     #[test]

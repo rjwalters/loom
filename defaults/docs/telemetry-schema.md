@@ -732,6 +732,16 @@ time, epic #9429). With it on the record, "story points landed per day" (#9433)
 and the estimate-vs-actual calibration loop (#9434) are a `GROUP BY` over this
 journal instead of a join against the forge.
 
+The throughput question is implemented: this field becomes the `story_points`
+column of `sweep_facts`, and **SF8** in
+`defaults/observability/sweep-facts/sweep-facts-queries.sql` answers "points
+landed per day / per ISO week" from it (#9433). Two things that question set
+fixes, and that any other consumer of this field must honour too: absent is a
+reported **data gap**, never a zero (the four omission situations below), and the
+values are **ordinal, not a unit** — sum the measured point value per bucket
+(`landed-size.sql`'s `measured_point_values`), never the raw labels. See
+`sweep-facts-questions.md` for the definitions and the capacity-tuning ops note.
+
 | Field | Type | Source | Notes |
 |---|---|---|---|
 | `story_points` | integer (`1` \| `2` \| `3` \| `5` \| `8` \| `13`) | The `points:*` label in the label list the **same** REST read that sources `complexity` and the disposition end state already returns (`sweep_registry::outcome_journal::complexity_signal`), folded by `crate::story_points`. | **No extra forge round trip** — that read's `--jq` projection already includes `labels`, and using it is what makes the estimate provably about the same issue as `complexity`. The paired `sweep.started` record carries the same field resolved at *dispatch* time, from the label list the #4444 park-label guard already read. |
@@ -1676,7 +1686,7 @@ describe a different order from the one the tick ran. The `plan` block:
 
 | Field | Type | Notes |
 |---|---|---|
-| `slots` | object | `max_concurrent`, `occupancy` (after the tick), `free` (`max_concurrent − occupancy`), `max_admissions_per_tick`, `saturation_held`, `any_halted` |
+| `slots` | object | `max_concurrent`, `occupancy` (after the tick), `free` (`max_concurrent − occupancy`), `max_admissions_per_tick`, `saturation_held`, `any_halted`, `overflow_free` (bool, optional: whether the host's single `loom:operator-priority` overflow slot, #9244, is unused — a starred issue can still start past the configured cap) |
 | `tick_interval_secs` | integer, optional | the work finder's tick interval |
 | `shard` | object | `configured` (`false` when unsharded), `host_shard`, `shard_count` |
 | `scope` | array | the labels the plan covers: `["loom:issue", "loom:blocked"]` |

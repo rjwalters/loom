@@ -99,18 +99,28 @@ pub fn gate_of(disposition: Qd) -> Option<PlanGate> {
 /// with their plan fields and return the tick's plan block. Pure.
 ///
 /// A `rows` slice that does not line up with `report.queue` (which only a
-/// caller bug can produce) is left unannotated rather than mislabelled.
+/// caller bug can produce) is left unannotated rather than mislabelled. Lining
+/// up means both the same length *and* the same issue at every position —
+/// `ready_queue::finish` and `ready_queue::ranked` sort by the same
+/// comparator over the same input, so in practice this always holds; the
+/// per-pair check is what makes that a verified guarantee rather than an
+/// assumption.
 pub fn annotate(
     report: &TickReport,
     rows: &mut [ReadyQueueRow],
     inputs: &PlanInputs,
 ) -> DispatchPlanContext {
     let ranked = ready_queue::ranked(&report.queue);
-    if ranked.len() == rows.len() {
+    let aligned = ranked.len() == rows.len()
+        && ranked
+            .iter()
+            .zip(rows.iter())
+            .all(|(tick_row, row)| tick_row.key.number == row.issue);
+    if aligned {
         annotate_rows(report, &ranked, rows, inputs);
     } else {
         log::warn!(
-            "dispatch_plan: {} row(s) do not match the tick's {} queue row(s); left unannotated",
+            "dispatch_plan: {} row(s) do not line up with the tick's {} queue row(s); left unannotated",
             rows.len(),
             ranked.len()
         );

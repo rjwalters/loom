@@ -225,6 +225,7 @@ fn lock_adopted_registry(
     let lock = registry.config().locks_dir().join(format!("issue-{issue}"));
     std::fs::create_dir_all(&lock).unwrap();
     let owner = crate::sweep_registry::LockOwner {
+        overflow: false,
         issue,
         // Alive by construction, so the lock pass adopts rather than reaps it.
         owner_pid: std::process::id(),
