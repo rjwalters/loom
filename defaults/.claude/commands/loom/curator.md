@@ -1049,7 +1049,7 @@ fi
    gh issue edit <number> --add-label "loom:blocked"
    ```
 
-**Why this matters**: closing on a **clear, stated rationale** keeps the backlog healthy and — because the work-finder only polls *open* issues — removes the item from the queue without a loop. But an **unverified** guess should be flagged, not closed, and never close an issue that is being actively built (`loom:building`) by another agent (see issue #2084 where a curator closed #1981 mid-processing, requiring manual intervention — coordinate via a comment when an issue is in flight).
+**Why**: closing with a **clear, stated rationale** keeps the backlog healthy — the work-finder only polls *open* issues, so this removes the item without a loop. An **unverified** guess should be flagged, not closed; never close an issue that is being actively built (`loom:building`) by another agent (#2084: a curator closed #1981 mid-processing, requiring manual intervention — comment first if an issue is in flight).
 
 #### Batch / co-seeded duplicate audits: dispose per-issue, never per-batch (#6005)
 
@@ -2142,7 +2142,7 @@ Every curated issue MUST have a `## Test Plan` section with verification steps:
 - [ ] Edge cases: [any special scenarios to verify]
 ```
 
-**Why this matters**: Builder quality validation looks for `## Test Plan` heading. Without it, Builders receive warnings and may miss important verification steps.
+**Why**: Builder quality validation looks for `## Test Plan`; without it, Builders get warnings and may miss verification steps.
 
 #### Acceptance criteria that need out-of-band verification are close-blocking (#6883)
 
@@ -2192,7 +2192,7 @@ Every curated issue MUST have an `## Affected Files` section listing files/compo
 3. Explore the codebase structure to identify components
 4. If truly unknown: "To be determined during implementation" (but try to provide guidance)
 
-**Why this matters**: Builder quality validation looks for file path references. Without them, Builders must do additional exploration and may miss relevant code.
+**Why**: Builder quality validation looks for file path references; without them, Builders explore more and may miss relevant code.
 
 #### How to Add Missing Sections
 
@@ -2352,14 +2352,9 @@ would be 24.8h old — past the window. That pass posts **exactly one** heartbea
 ("still blocked on #4743, no change since <date>") carrying the same hash, and
 the 24h window restarts from it. The passes in between still skip.
 
-Why this pattern matters:
-- Re-verification still happens every pass; only the redundant *comment* is suppressed
-- Real state changes are never suppressed — a changed conclusion always comments
-- Long-stalled issues keep periodic visibility instead of going silent forever
-- Pass 2's skip never claims `loom:curating` at all — only Pass 1 and Pass 3
-  (both `$CLAIM=true` from `decide`) claim, act, and release (#7617). The old
-  shape claimed on every pass, including Pass 2, and released again once the
-  fingerprint came back unchanged — pure churn with no work performed.
+Why this pattern matters: only Pass 1 and Pass 3 (`$CLAIM=true` from
+`decide`) claim/act/release (#7617); Pass 2's skip claims nothing, avoiding
+the old shape's per-pass claim/release churn with no work performed.
 
 ### Verified Corrections Survive Re-Curation → Append, Never Overwrite
 
@@ -2411,14 +2406,10 @@ Pass 2 — RIGHT: re-verify against current `origin/main` first. If the finding
     addition.
 ```
 
-Why this pattern matters:
-- The failure mode is invisible at the point of consumption — a Builder
-  reading the "WRONG" Pass 2 body above sees a coherent, confident issue with
-  no marker saying three verified findings used to live there
-- `check-verified-corrections-preserved.sh` turns "diff before rewrite" from
-  a habit into a script a Curator (or its CI) can actually run
-- A disagreement is data, not noise — the dated counter-finding in the
-  "RIGHT" variant tells a Builder both what was true and when it changed
+Why this pattern matters: a rewritten body hides the failure invisibly, so
+`check-verified-corrections-preserved.sh` scripts the diff-before-rewrite
+check — Pass 2 should APPEND a dated entry, never overwrite, since a
+disagreement is data, not noise.
 
 ## Terminal Probe Protocol
 

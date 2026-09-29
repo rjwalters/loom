@@ -21,7 +21,7 @@ auditor        20472        -
 builder        31098        -
 champion       14340        -
 concierge      14431        -
-curator        47423    30000
+curator        47229    30000
 doctor         33779    30000
 driver         10759        -
 guide          44251        -
