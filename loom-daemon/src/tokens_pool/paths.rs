@@ -82,9 +82,86 @@ pub fn codex_profile_root() -> Option<PathBuf> {
 }
 
 /// Return the canonical per-repo pool dir `<workspace>/.loom/tokens`.
+///
+/// **This location is retired for credential storage (issue #9135).** It is
+/// still named here because a legacy host may have one on disk and Loom has to
+/// be able to *recognize* it in order to refuse it (see
+/// [`retired_in_worktree_pool`]) — not because anything should write one. Use
+/// [`shared_tokens_dir`] for any provisioning destination.
 #[must_use]
 pub fn per_repo_tokens_dir(workspace: &Path) -> PathBuf {
     workspace.join(".loom").join("tokens")
+}
+
+/// Basename of the sentinel [`resolve_tokens_dir`] returns in place of a
+/// retired in-worktree pool when the shared pool is *also* unavailable
+/// (issue #9135).
+///
+/// Deliberately a path no provisioning flow ever creates: every
+/// [`has_token_files`] probe against it answers `false`, so the caller reports
+/// an empty pool and fails closed instead of readmitting the credentials the
+/// refusal exists to strand. Its name is what an operator sees in that
+/// "no .token files in …" message, so it has to explain itself.
+pub const RETIRED_POOL_SENTINEL_NAME: &str = "tokens.retired-in-worktree";
+
+/// The fail-closed sentinel pool path for `workspace`. See
+/// [`RETIRED_POOL_SENTINEL_NAME`].
+#[must_use]
+pub fn retired_pool_sentinel(workspace: &Path) -> PathBuf {
+    workspace.join(".loom").join(RETIRED_POOL_SENTINEL_NAME)
+}
+
+/// `true` iff `path` lies inside a git working tree — i.e. any ancestor
+/// (starting with `path` itself) holds a `.git` entry.
+///
+/// A `.git` **directory** is an ordinary clone; a `.git` **file** is a linked
+/// worktree (what `.loom/scripts/worktree.sh` creates) or a submodule. Both are
+/// version-controlled trees whose contents can be staged, committed and pushed,
+/// so both answer `true`. Walking every ancestor — rather than probing
+/// `<path>/.git` alone — is what makes the answer right for a workspace root
+/// that is a *subdirectory* of a checkout rather than the checkout root.
+///
+/// This is the mechanical form of the credential policy: a secret that is not
+/// inside a repository cannot be committed from one
+/// (`defaults/docs/credential-storage.md`).
+#[must_use]
+pub fn is_inside_git_worktree(path: &Path) -> bool {
+    path.ancestors().any(|dir| dir.join(".git").exists())
+}
+
+/// `Some(pool)` when `workspace` holds a populated **in-worktree** token pool
+/// that Loom refuses to use (issue #9135), else `None`.
+///
+/// "Populated" is [`has_token_files`]: an empty or absent `<workspace>/.loom/
+/// tokens` is not a violation, it is simply not a pool. The refusal is reported,
+/// never repaired — Loom neither reads nor deletes these credentials, because
+/// silently relocating an OAuth token is not a decision a daemon gets to make.
+#[must_use]
+pub fn retired_in_worktree_pool(workspace: &Path) -> Option<PathBuf> {
+    let pool = per_repo_tokens_dir(workspace);
+    if has_token_files(&pool) && is_inside_git_worktree(workspace) {
+        Some(pool)
+    } else {
+        None
+    }
+}
+
+/// The operator-facing migration instruction for the refused in-worktree pool
+/// at `pool` (issue #9135). Surfaced by every path that could otherwise have
+/// used it, so "my tokens stopped being found" always arrives with its reason.
+#[must_use]
+pub fn in_worktree_pool_error(pool: &Path) -> String {
+    format!(
+        "REFUSED TOKEN POOL: {} is inside a git worktree. OAuth credentials must never live \
+         inside a repository checkout (issue #9135) — a `git add -A` or a directory rename \
+         defeats every .gitignore/stager guard protecting them. This pool is IGNORED, not \
+         deleted: migrate it once with `mkdir -p ~/.loom/tokens && mv {}/*.token \
+         ~/.loom/tokens/` (or re-provision from source with `loom-daemon tokens bootstrap`), \
+         then remove {}.",
+        pool.display(),
+        pool.display(),
+        pool.display()
+    )
 }
 
 /// Return the shared machine-level pool dir, or `None` when disabled.
@@ -160,17 +237,37 @@ pub fn has_token_files(tokens_dir: &Path) -> bool {
     })
 }
 
-/// Resolve the effective pool dir for `workspace` (issue #3938).
+/// Resolve the effective pool dir for `workspace` (issue #3938), with the
+/// in-worktree pool retired (issue #9135).
 ///
-/// Returns the per-repo pool when it holds `*.token` files, else the shared
-/// machine-level pool when *it* holds token files, else the per-repo path
-/// unchanged (so callers surface a sensible "run `loom-tokens bootstrap`"
-/// error against the repo they were invoked from).
+/// Order:
+///
+/// 1. A populated `<workspace>/.loom/tokens` that is **not** inside a git
+///    worktree — a legacy layout that is not a credential-leak vector, so it
+///    still resolves (this is also the shape every fixture pool in the test
+///    suite has).
+/// 2. A populated [`shared_tokens_dir`] — the only *supported* location.
+/// 3. Otherwise a path that holds no credentials, so the caller surfaces its
+///    ordinary "run `loom-daemon tokens bootstrap`" error.
+///
+/// A populated `<workspace>/.loom/tokens` **inside** a git worktree is never
+/// returned, not even as the last-resort path in step 3: handing it back would
+/// let the very next [`has_token_files`] probe readmit the credentials this
+/// refusal exists to strand. When the shared pool is disabled outright
+/// (`LOOM_SHARED_TOKENS_DIR=""`) that leaves nothing to point at, so step 3
+/// returns [`retired_pool_sentinel`] and the host fails closed. Callers that
+/// want to *explain* the resulting empty pool ask
+/// [`retired_in_worktree_pool`] + [`in_worktree_pool_error`].
 #[must_use]
 pub fn resolve_tokens_dir(workspace: &Path) -> PathBuf {
     let repo_dir = per_repo_tokens_dir(workspace);
     if has_token_files(&repo_dir) {
-        return repo_dir;
+        // The git-worktree probe costs a short ancestor walk, and only a host
+        // that actually has a repo-local pool ever pays for it.
+        if !is_inside_git_worktree(workspace) {
+            return repo_dir;
+        }
+        return shared_tokens_dir().unwrap_or_else(|| retired_pool_sentinel(workspace));
     }
     if let Some(shared) = shared_tokens_dir() {
         if has_token_files(&shared) {
@@ -303,6 +400,147 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         assert_eq!(resolve_tokens_dir(repo.path()), per_repo_tokens_dir(repo.path()));
         std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    // =====================================================================
+    // Retired in-worktree pool (issue #9135)
+    // =====================================================================
+
+    /// Turn `dir` into something [`is_inside_git_worktree`] recognizes. Both
+    /// shapes are exercised: `.git` as a directory (ordinary clone) and as a
+    /// file (a linked worktree, which is what `worktree.sh` creates).
+    fn make_git_worktree(dir: &Path, as_file: bool) {
+        if as_file {
+            fs::write(dir.join(".git"), "gitdir: /somewhere/.git/worktrees/issue-1\n").unwrap();
+        } else {
+            fs::create_dir_all(dir.join(".git")).unwrap();
+        }
+    }
+
+    #[test]
+    fn plain_directory_is_not_a_git_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(!is_inside_git_worktree(tmp.path()));
+        assert!(!is_inside_git_worktree(&nested));
+    }
+
+    #[test]
+    fn git_dir_and_git_file_both_count_as_a_worktree() {
+        for as_file in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            make_git_worktree(tmp.path(), as_file);
+            assert!(is_inside_git_worktree(tmp.path()), "as_file={as_file}");
+        }
+    }
+
+    /// A workspace root that is a *subdirectory* of a checkout is still inside
+    /// the worktree — probing `<workspace>/.git` alone would miss it.
+    #[test]
+    fn a_subdirectory_of_a_checkout_is_inside_the_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_git_worktree(tmp.path(), false);
+        let nested = tmp.path().join("packages").join("app");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(is_inside_git_worktree(&nested));
+    }
+
+    #[test]
+    fn retired_pool_detected_only_when_populated_and_versioned() {
+        // Populated + inside a worktree: refused.
+        let repo = tempfile::tempdir().unwrap();
+        make_git_worktree(repo.path(), true);
+        write_pool(&per_repo_tokens_dir(repo.path()), &["a.token"]);
+        assert_eq!(retired_in_worktree_pool(repo.path()), Some(per_repo_tokens_dir(repo.path())));
+
+        // Inside a worktree but EMPTY: not a pool at all, so not a violation.
+        let empty = tempfile::tempdir().unwrap();
+        make_git_worktree(empty.path(), false);
+        write_pool(&per_repo_tokens_dir(empty.path()), &["index.json"]);
+        assert_eq!(retired_in_worktree_pool(empty.path()), None);
+
+        // Populated but NOT version-controlled: nothing to leak.
+        let plain = tempfile::tempdir().unwrap();
+        write_pool(&per_repo_tokens_dir(plain.path()), &["a.token"]);
+        assert_eq!(retired_in_worktree_pool(plain.path()), None);
+    }
+
+    /// The whole point: a populated in-worktree pool loses to the shared pool
+    /// instead of shadowing it, whatever order they were provisioned in.
+    #[test]
+    #[serial]
+    fn resolve_refuses_an_in_worktree_pool_in_favor_of_shared() {
+        let repo = tempfile::tempdir().unwrap();
+        make_git_worktree(repo.path(), true);
+        write_pool(&per_repo_tokens_dir(repo.path()), &["repo.token"]);
+        let shared = tempfile::tempdir().unwrap();
+        write_pool(shared.path(), &["s.token"]);
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, shared.path().to_str().unwrap());
+        assert_eq!(resolve_tokens_dir(repo.path()), shared.path());
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    /// An in-worktree pool is refused even when the shared pool is EMPTY —
+    /// resolution lands on the (empty) shared pool so the caller reports "no
+    /// tokens" rather than quietly using credentials from inside the checkout.
+    #[test]
+    #[serial]
+    fn resolve_refuses_an_in_worktree_pool_even_with_an_empty_shared_pool() {
+        let repo = tempfile::tempdir().unwrap();
+        make_git_worktree(repo.path(), false);
+        write_pool(&per_repo_tokens_dir(repo.path()), &["repo.token"]);
+        let shared = tempfile::tempdir().unwrap();
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, shared.path().to_str().unwrap());
+        let resolved = resolve_tokens_dir(repo.path());
+        assert_eq!(resolved, shared.path());
+        assert!(!has_token_files(&resolved));
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    /// The fail-closed edge the issue's test plan calls out: the shared pool
+    /// explicitly disabled (`LOOM_SHARED_TOKENS_DIR=""`) **plus** a populated
+    /// legacy in-worktree pool must NOT readmit the in-worktree path.
+    #[test]
+    #[serial]
+    fn resolve_fails_closed_when_shared_is_disabled_and_only_a_worktree_pool_exists() {
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
+        let repo = tempfile::tempdir().unwrap();
+        make_git_worktree(repo.path(), true);
+        write_pool(&per_repo_tokens_dir(repo.path()), &["repo.token"]);
+        let resolved = resolve_tokens_dir(repo.path());
+        assert_eq!(resolved, retired_pool_sentinel(repo.path()));
+        assert_ne!(resolved, per_repo_tokens_dir(repo.path()));
+        assert!(!has_token_files(&resolved), "the sentinel must never hold credentials");
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    /// `resolve_tokens_dir_anchored` inherits the refusal — a registered
+    /// workspace whose only pool is in-worktree must not resolve to it.
+    #[test]
+    #[serial]
+    fn anchored_registered_candidate_also_refuses_an_in_worktree_pool() {
+        let repo = tempfile::tempdir().unwrap();
+        make_git_worktree(repo.path(), false);
+        write_pool(&per_repo_tokens_dir(repo.path()), &["repo.token"]);
+        let shared = tempfile::tempdir().unwrap();
+        write_pool(shared.path(), &["s.token"]);
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, shared.path().to_str().unwrap());
+        let registry = registry_with(&[repo.path()]);
+        assert_eq!(resolve_tokens_dir_anchored(repo.path(), &registry), shared.path());
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    /// The refusal message has to be actionable: it names the offending pool
+    /// and the migration, and says the pool was ignored rather than deleted.
+    #[test]
+    fn in_worktree_pool_error_is_actionable() {
+        let pool = Path::new("/repo/.loom/tokens");
+        let msg = in_worktree_pool_error(pool);
+        assert!(msg.contains("/repo/.loom/tokens"), "names the pool: {msg}");
+        assert!(msg.contains("#9135"), "cites the policy: {msg}");
+        assert!(msg.contains("~/.loom/tokens"), "names the destination: {msg}");
+        assert!(msg.contains("IGNORED, not deleted"), "says it was not deleted: {msg}");
     }
 
     #[test]

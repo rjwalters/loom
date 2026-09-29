@@ -95,14 +95,14 @@ fn count_token_files(dir: &Path) -> usize {
 /// `workspace_root` — the size of the multi-account rotation pool, and the hard
 /// ceiling on concurrent autonomous sweeps.
 ///
-/// Resolution mirrors the Python selector (`loom_tools.tokens.paths.
-/// resolve_tokens_dir`, issue #3938): the per-repo pool at
-/// `{workspace_root}/.loom/tokens/` when it holds tokens, else the shared
-/// machine-level pool (`~/.loom/tokens`, override `LOOM_SHARED_TOKENS_DIR`).
-/// Without this fallback the multi-workspace work finder measured 0 tokens for a
-/// consumer repo that had no pool of its own even though a shared pool existed —
-/// the accounting the spawn path then contradicted by succeeding via the shared
-/// pool.
+/// Resolution mirrors [`crate::tokens_pool::paths::resolve_tokens_dir`] (issue
+/// #3938): the per-repo pool at `{workspace_root}/.loom/tokens/` when it holds
+/// tokens **and does not live inside a git worktree** (issue #9135), else the
+/// shared machine-level pool (`~/.loom/tokens`, override
+/// `LOOM_SHARED_TOKENS_DIR`). Without this fallback the multi-workspace work
+/// finder measured 0 tokens for a consumer repo that had no pool of its own even
+/// though a shared pool existed — the accounting the spawn path then
+/// contradicted by succeeding via the shared pool.
 ///
 /// Returns 0 when neither pool is bootstrapped — the same condition under which
 /// `spawn-claude.sh` refuses to dispatch, so a 0 pool correctly yields a 0
@@ -129,15 +129,22 @@ pub fn token_pool_size_at_dir(tokens_dir: &Path) -> usize {
 /// to an explicit `shared` pool directory when the per-repo pool is
 /// absent/empty. Split out so it is deterministically testable without touching
 /// process env or the real home directory.
+///
+/// Kept in lock-step with [`crate::tokens_pool::paths::resolve_tokens_dir`] on
+/// the retired in-worktree pool too (issue #9135): a repo-local pool **inside a
+/// git worktree** contributes 0 here, exactly as it resolves to no usable pool
+/// there. The two have to agree — a cap sized off credentials the spawn path
+/// refuses to select would dispatch sweeps that cannot spawn.
 #[must_use]
 fn token_pool_size_resolved(workspace_root: &Path, shared: Option<&Path>) -> usize {
     let per_repo = workspace_root.join(".loom").join("tokens");
     let n = count_token_files(&per_repo);
-    if n > 0 {
+    if n > 0 && !crate::tokens_pool::paths::is_inside_git_worktree(workspace_root) {
         return n;
     }
-    // Per-repo pool absent/empty: fall back to the shared machine-level pool so
-    // the concurrency ceiling matches what the spawn path can actually pick.
+    // Per-repo pool absent, empty, or refused for living inside a git worktree:
+    // fall back to the shared machine-level pool so the concurrency ceiling
+    // matches what the spawn path can actually pick.
     shared.map_or(0, count_token_files)
 }
 
@@ -252,6 +259,31 @@ mod tests {
         let shared = tempfile::tempdir().unwrap();
         write_flat_pool(shared.path(), &["s1.token"]);
         assert_eq!(token_pool_size_resolved(repo.path(), Some(shared.path())), 3);
+    }
+
+    // ---- retired in-worktree pool (issue #9135) -----------------------------
+
+    /// A repo-local pool inside a git worktree contributes 0 to the cap and the
+    /// shared pool is counted instead — lock-step with
+    /// `tokens_pool::paths::resolve_tokens_dir`, which refuses the same pool.
+    #[test]
+    fn test_in_worktree_pool_is_not_counted_and_shared_wins() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(repo.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        write_tokens_dir(repo.path(), &["r1.token", "r2.token", "r3.token"]);
+        let shared = tempfile::tempdir().unwrap();
+        write_flat_pool(shared.path(), &["s1.token"]);
+        assert_eq!(token_pool_size_resolved(repo.path(), Some(shared.path())), 1);
+    }
+
+    /// …and with no shared pool to fall back to, the cap is 0 rather than the
+    /// refused in-worktree count: dispatch nothing that could not spawn.
+    #[test]
+    fn test_in_worktree_pool_only_yields_a_zero_cap() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".git")).unwrap();
+        write_tokens_dir(repo.path(), &["r1.token", "r2.token"]);
+        assert_eq!(token_pool_size_resolved(repo.path(), None), 0);
     }
 
     #[test]
