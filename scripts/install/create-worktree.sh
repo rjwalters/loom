@@ -75,9 +75,16 @@ if [[ -z "$DEFAULT_BRANCH" ]]; then
 fi
 
 # Ensure we're branching from the latest state
-# Fetch the branch from origin first
+# Fetch the branch from origin first.
+# `--` ends option parsing (#9106): $DEFAULT_BRANCH can come from
+# `git symbolic-ref refs/remotes/origin/HEAD`, which `git remote set-head -a`
+# populates from the REMOTE. A remote-supplied name beginning with `-` would
+# otherwise be parsed by git as a switch, not a ref — on a path/file:// origin
+# `--upload-pack=<path>` is code execution. This installer runs before
+# `.loom/scripts/lib/` exists, so it cannot source `check_branch_name`; `--` is
+# the dependency-free half of the same mitigation.
 info "Fetching latest changes from origin/${DEFAULT_BRANCH}..."
-git fetch origin "${DEFAULT_BRANCH}" 2>/dev/null || true
+git fetch origin -- "${DEFAULT_BRANCH}" 2>/dev/null || true
 
 # Verify the branch exists (locally or as remote ref)
 # Prefer origin/DEFAULT_BRANCH as the base to ensure we have the latest
