@@ -648,7 +648,7 @@ unchanged beside it, so every pre-#9441 consumer keeps working.
 | `landed` | The sweep produced a PR for its issue. |
 | `noop_already_done` | Nothing to do: the issue was already closed before dispatch, or the run exited clean and short having produced no PR, no phase and no work. |
 | `curator_closed` | The Curator closed the issue instead of building it (the "Issues Are Suggestions" path) — a correct outcome, not a failure. |
-| `curator_rescoped` | The Curator handed the issue back to `loom:triage` / `loom:curated` instead of building it. |
+| `curator_rescoped` | The Curator handed the issue back to `loom:triage` / `loom:curated` (and off `loom:issue` / `loom:building`) instead of building it. |
 | `env_failure` | The *environment* broke: spawn/pre-flight death, account or credit exhaustion, rate limit, harness execution error. |
 | `substantive_failure` | The *work* did not succeed: the Judge rejected it, the Doctor loop was exhausted, or the Builder could not finish. |
 | `cancelled` | An operator- or watchdog-initiated cancellation. |
@@ -687,10 +687,27 @@ rescoped it", three shapes the local signals cannot tell apart. It follows the
 identical fail-open contract: a skipped or failed read simply yields no forge
 opinion, and the classifier falls back to its local-signal arms.
 
-`loom:issue` is deliberately **not** a rescope signal — the reaper's own
-orphaned-claim recovery restores `loom:building` → `loom:issue` before the
-record is written, so reading it as one would mislabel the entire failure
-population.
+**A pre-build label alone is deliberately NOT a rescope signal.** `loom:triage`
+and `loom:curated` are *additive milestones* that outlive the state they once
+described — Loom never strips `loom:curated`, so promotion (`loom:issue`) and
+the Builder's claim (`loom:building`) both leave it in place and essentially
+every built issue carries it for life. A rescope is therefore read only from a
+pre-build label **plus the absence of `loom:issue` and `loom:building`**, which
+is the shape a genuine hand-back actually leaves (the Curator's rescope removes
+the ready/claim label by definition). `loom:issue` matters for a second,
+independent reason: the reaper's own orphaned-claim recovery restores
+`loom:building` → `loom:issue` before the record is written, so reading it as a
+rescope would mislabel the entire failure population.
+
+**An environmental `failure_class` outranks both label-derived forge answers**
+(`curator_rescoped`, `curator_closed`). A dead token pool is not a Curator
+decision no matter what an issue's labels say, and `curator_rescoped` is exempt
+from invariant 2 — so letting a stale label shadow an explicit `preflight-*` /
+`account-exhausted:*` verdict would both mis-bucket the record and drop its
+obligation to say why it failed. The one forge answer that still outranks the
+environmental arm is `noop_already_done` from an issue closed *before* dispatch,
+because that is derived from a `closed_at` comparison rather than from a label
+and cannot go stale the same way.
 
 Unlike every other recent addition, `disposition` is **never skipped on
 serialize**: a required field that silently disappears for one variant is

@@ -172,14 +172,20 @@ pub enum IssueEndState {
     ClosedBeforeDispatch,
     /// The issue was open at dispatch and is closed now.
     ClosedDuringSweep,
-    /// The issue is open and carries a pre-build label (`loom:triage` /
-    /// `loom:curated`) rather than `loom:building` — it was handed back for
-    /// re-scoping rather than built.
+    /// The issue is open, carries a pre-build label (`loom:triage` /
+    /// `loom:curated`) and carries **neither** `loom:issue` nor
+    /// `loom:building` — it was handed back for re-scoping rather than built.
     ///
-    /// Deliberately does **not** include `loom:issue`: the reaper's own
-    /// orphaned-claim recovery restores `loom:building` → `loom:issue` on a
-    /// crash or cancel *before* the outcome record is written, so treating
-    /// that label as a rescope would misread every failed sweep.
+    /// Both halves are load-bearing, because both pre-build labels are
+    /// *additive milestones* that outlive the state they described:
+    ///
+    /// - `loom:curated` is never stripped once applied, so promotion and the
+    ///   Builder's claim both leave it in place — presence alone would mark
+    ///   essentially every built issue as a hand-back (#9441, PR #9471).
+    /// - `loom:issue` is restored by the reaper's own orphaned-claim recovery
+    ///   (`loom:building` → `loom:issue`) on a crash or cancel *before* the
+    ///   outcome record is written, so its presence means "back in the queue",
+    ///   never "rescoped".
     Rescoped,
     /// The issue is open and nothing about its labels suggests a hand-back.
     StillOpen,
@@ -314,14 +320,43 @@ fn disposition_of(signals: &DispositionSignals<'_>) -> SweepDisposition {
     if signals.result == SweepResult::Cancelled {
         return SweepDisposition::Cancelled;
     }
-    // 3. The forge's own answer, when the read succeeded. `ClosedDuringSweep`
-    //    and `Rescoped` are attributed to the Curator only while the sweep
+    // 3. The one forge answer that is derived from a TIMESTAMP rather than
+    //    from labels: the issue was already closed when this sweep was
+    //    dispatched, so there was never anything to do — whatever went wrong
+    //    afterwards. Being timestamp-derived, it cannot be poisoned by a stale
+    //    label the way the two arms in step 5 can, so it stays on top.
+    if signals.issue_end_state == Some(IssueEndState::ClosedBeforeDispatch) {
+        return SweepDisposition::NoopAlreadyDone;
+    }
+    // 4. A failure whose classifier label names an environmental fault is
+    //    settled outright — an exhausted account is not a hard task, and it is
+    //    not a Curator decision either, no matter which phase it struck in or
+    //    what the issue's labels happen to say.
+    //
+    //    This deliberately outranks the label-derived forge arms below
+    //    (#9441, Judge finding on PR #9471): those labels are additive
+    //    milestones that outlive the state they described, so letting one
+    //    shadow an explicit environmental verdict would report a dead token
+    //    pool as `curator_rescoped` — a bucket documented as a *correct*
+    //    outcome and exempt from the mandatory-`failure_class` invariant.
+    //    Restricted to `Failure` because that is the only result that reached
+    //    this check before the reorder (`Cancelled` returns at step 2,
+    //    `Success`/`Blocked` at steps 6/7), which keeps the change a pure
+    //    reordering rather than a new behaviour for those results.
+    if signals.result == SweepResult::Failure
+        && signals
+            .failure_class
+            .is_some_and(is_environmental_failure_class)
+    {
+        return SweepDisposition::EnvFailure;
+    }
+    // 5. The forge's remaining, label-derived answers. `ClosedDuringSweep` and
+    //    `Rescoped` are attributed to the Curator only while the sweep
     //    never reached build work: past that point a closed issue is far more
     //    likely a landed PR this record failed to sample than a Curator
     //    decision, and guessing "curator_closed" there would overstate the
     //    one bucket an operator reads as "working as intended".
     match signals.issue_end_state {
-        Some(IssueEndState::ClosedBeforeDispatch) => return SweepDisposition::NoopAlreadyDone,
         Some(IssueEndState::ClosedDuringSweep) if !signals.reached_build_work() => {
             return SweepDisposition::CuratorClosed;
         }
@@ -330,7 +365,7 @@ fn disposition_of(signals: &DispositionSignals<'_>) -> SweepDisposition {
         }
         _ => {}
     }
-    // 4. The local no-op shape, for every host whose forge read was skipped or
+    // 6. The local no-op shape, for every host whose forge read was skipped or
     //    failed: a clean, short run that produced no PR and no phase at all.
     if signals.result == SweepResult::Success
         && signals.phase_durations.is_empty()
@@ -338,27 +373,18 @@ fn disposition_of(signals: &DispositionSignals<'_>) -> SweepDisposition {
     {
         return SweepDisposition::NoopAlreadyDone;
     }
-    // 5. A success with no PR that is NOT the short no-op shape, and a
+    // 7. A success with no PR that is NOT the short no-op shape, and a
     //    human-decision block, are both genuinely unobservable from here.
     //    Counted as `unknown` rather than folded into a failure bucket they
     //    did not earn.
     if matches!(signals.result, SweepResult::Success | SweepResult::Blocked) {
         return SweepDisposition::Unknown;
     }
-    // 6. A failure. An environmental classifier label settles it outright —
-    //    an exhausted account is not a hard task no matter which phase it
-    //    struck in.
-    if signals
-        .failure_class
-        .is_some_and(is_environmental_failure_class)
-    {
-        return SweepDisposition::EnvFailure;
-    }
-    // 7. Evidence the work itself was attempted and did not succeed.
+    // 8. Evidence the work itself was attempted and did not succeed.
     if signals.has_substantive_signal() {
         return SweepDisposition::SubstantiveFailure;
     }
-    // 8. No phase, no classifier label, gone in under a minute: a spawn or
+    // 9. No phase, no classifier label, gone in under a minute: a spawn or
     //    pre-flight death the classifier simply did not have a signature for.
     if signals.looks_like_spawn_death() {
         return SweepDisposition::EnvFailure;
@@ -684,6 +710,75 @@ mod tests {
             assert_eq!(disposition, SweepDisposition::EnvFailure, "{class}");
             assert_eq!(resolved.as_deref(), Some(class));
         }
+    }
+
+    /// #9441 regression (Judge finding on PR #9471): an environmental
+    /// classifier verdict outranks the **label-derived** forge end states too,
+    /// not just the phase signals. `loom:curated` is a persistent milestone
+    /// this repo never strips, so before the fix a `preflight-*` or
+    /// `account-exhausted:*` death on a normally-curated issue reported
+    /// `curator_rescoped` — "working as intended" — and, because
+    /// `curator_rescoped` is not in `requires_failure_class()`, silently
+    /// dropped invariant 2's protection for that entire population.
+    #[test]
+    fn environmental_classes_outrank_the_label_derived_issue_end_state() {
+        for end_state in [IssueEndState::Rescoped, IssueEndState::ClosedDuringSweep] {
+            for (class, duration) in [
+                ("preflight-token-selection-failed", 0_i64),
+                ("preflight-no-cli-start", 2),
+                ("account-exhausted:model-credits-exhausted", 3),
+                ("no-usable-account", 5),
+                ("execution-error", 900),
+                ("self-kill:background-wait", 1_800),
+            ] {
+                let signals = DispositionSignals {
+                    failure_class: Some(class),
+                    issue_end_state: Some(end_state),
+                    total_duration_sec: duration,
+                    ..base(SweepResult::Failure)
+                };
+                let (disposition, resolved) = classify_disposition(&signals);
+                assert_eq!(disposition, SweepDisposition::EnvFailure, "{class} + {end_state:?}");
+                assert_eq!(
+                    resolved.as_deref(),
+                    Some(class),
+                    "the classifier's own label survives: {class} + {end_state:?}"
+                );
+                assert!(
+                    disposition.requires_failure_class(),
+                    "and invariant 2 still applies to it: {class} + {end_state:?}"
+                );
+            }
+        }
+    }
+
+    /// The timestamp-derived end state stays on top of the environmental arm:
+    /// a sweep dispatched against an already-closed issue had nothing to do,
+    /// and `ClosedBeforeDispatch` is a `closed_at` comparison, not a label —
+    /// it cannot go stale the way the step-5 arms can.
+    #[test]
+    fn closed_before_dispatch_still_outranks_an_environmental_class() {
+        let signals = DispositionSignals {
+            failure_class: Some("preflight-token-selection-failed"),
+            issue_end_state: Some(IssueEndState::ClosedBeforeDispatch),
+            total_duration_sec: 0,
+            ..base(SweepResult::Failure)
+        };
+        assert_eq!(classify_disposition(&signals).0, SweepDisposition::NoopAlreadyDone);
+    }
+
+    /// A non-environmental class leaves the forge end state in charge, so the
+    /// reorder above narrowed nothing else: a genuine Curator hand-back is
+    /// still `curator_rescoped`.
+    #[test]
+    fn a_non_environmental_class_leaves_the_rescope_arm_in_charge() {
+        let signals = DispositionSignals {
+            failure_class: Some("exit-1"),
+            issue_end_state: Some(IssueEndState::Rescoped),
+            total_duration_sec: 900,
+            ..base(SweepResult::Failure)
+        };
+        assert_eq!(classify_disposition(&signals).0, SweepDisposition::CuratorRescoped);
     }
 
     /// A bare `exit-<code>` is deliberately NOT environmental — it says

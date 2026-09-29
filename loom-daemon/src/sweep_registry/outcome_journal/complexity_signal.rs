@@ -53,13 +53,37 @@ use crate::script_helpers::model_tiers::COMPLEXITY_TIERS;
 use crate::script_helpers::sweep_experiment::extract_complexity_marker;
 use crate::telemetry::IssueEndState;
 
-/// The labels that mean an open issue was handed BACK for re-scoping rather
-/// than built (Issue #9441).
+/// The pre-build labels a Curator hands an issue BACK to when it rescopes
+/// rather than builds it (CLAUDE.md § "Issues Are Suggestions": *"relabel back
+/// to `loom:triage`/`loom:curated` if the scope no longer matches"*).
 ///
-/// Deliberately excludes `loom:issue`: the reaper's own orphaned-claim
-/// recovery restores `loom:building` → `loom:issue` before this record is
-/// written, so counting it would misread every failed sweep as a rescope.
+/// **Presence alone is NOT a rescope** — see [`PIPELINE_LABELS`]. `loom:curated`
+/// in particular is a *persistent milestone marker*: Loom never strips it, so
+/// promotion (`loom:issue`) and the Builder's claim (`loom:building`) both
+/// leave it in place and essentially every built issue carries it for life.
 const RESCOPE_LABELS: [&str; 2] = ["loom:triage", "loom:curated"];
+
+/// The labels that prove the issue is still in — or was restored to — the
+/// normal build pipeline, which is what makes a [`RESCOPE_LABELS`] entry on the
+/// same issue a stale milestone rather than a hand-back (Issue #9441).
+///
+/// Both are needed, for two different mechanisms:
+///
+/// - `loom:building` is the Builder's own claim, and `loom:curated` survives it
+///   untouched. Without this exclusion a normally-curated, normally-dispatched
+///   issue would report `Rescoped` for its whole life — measured at 5/5 (100%)
+///   of open `loom:building` issues on this repo, which would silently divert
+///   that entire population into `curator_rescoped` (a *non*-failure bucket
+///   exempt from the mandatory-`failure_class` invariant).
+/// - `loom:issue` is what the reaper's orphaned-claim recovery restores
+///   (`loom:building` → `loom:issue`) before this record is written, so
+///   counting it as a rescope would misread every failed sweep as a hand-back.
+///
+/// What survives: an issue genuinely handed back carries a rescope label and
+/// **neither** of these — the Curator's rescope removes `loom:issue` /
+/// `loom:building` by definition, since the point is that it is no longer ready
+/// to build.
+const PIPELINE_LABELS: [&str; 2] = ["loom:issue", "loom:building"];
 
 /// The subset of an issue's forge state this terminal-transition read needs.
 /// Every field is independently optional — a partial read is still worth
@@ -89,6 +113,11 @@ impl IssueSignals {
     /// compare against) is reported as [`IssueEndState::ClosedDuringSweep`]:
     /// the conservative side, since `ClosedBeforeDispatch` asserts the sweep
     /// was pointless and should never be claimed without evidence.
+    ///
+    /// [`IssueEndState::Rescoped`] is held to the same standard: it needs a
+    /// [`RESCOPE_LABELS`] entry **and** the absence of every
+    /// [`PIPELINE_LABELS`] entry, because the rescope labels are additive
+    /// milestones that outlive the state they once described.
     pub(crate) fn end_state(&self, started_at: Option<DateTime<Utc>>) -> Option<IssueEndState> {
         let closed = self.closed?;
         if closed {
@@ -99,11 +128,15 @@ impl IssueSignals {
                 _ => IssueEndState::ClosedDuringSweep,
             });
         }
-        if self
+        let has_rescope_label = self
             .labels
             .iter()
-            .any(|label| RESCOPE_LABELS.contains(&label.as_str()))
-        {
+            .any(|label| RESCOPE_LABELS.contains(&label.as_str()));
+        let in_build_pipeline = self
+            .labels
+            .iter()
+            .any(|label| PIPELINE_LABELS.contains(&label.as_str()));
+        if has_rescope_label && !in_build_pipeline {
             return Some(IssueEndState::Rescoped);
         }
         Some(IssueEndState::StillOpen)
@@ -334,24 +367,69 @@ mod tests {
         assert_eq!(no_start.end_state(None), Some(IssueEndState::ClosedDuringSweep));
     }
 
-    #[test]
-    fn rescope_labels_are_recognized_but_the_restored_ready_label_is_not() {
-        for label in RESCOPE_LABELS {
-            let signals = IssueSignals {
-                closed: Some(false),
-                labels: vec![label.to_string()],
-                ..IssueSignals::default()
-            };
-            assert_eq!(signals.end_state(None), Some(IssueEndState::Rescoped), "{label}");
-        }
-        // #9441: the reaper's own orphaned-claim recovery sets `loom:issue`
-        // on every failed sweep BEFORE this record is written — reading it as
-        // a Curator rescope would mislabel the entire failure population.
-        let restored = IssueSignals {
+    fn open_with(labels: &[&str]) -> IssueSignals {
+        IssueSignals {
             closed: Some(false),
-            labels: vec!["loom:issue".to_string()],
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
             ..IssueSignals::default()
-        };
-        assert_eq!(restored.end_state(None), Some(IssueEndState::StillOpen));
+        }
+    }
+
+    /// A rescope label on an issue that is NOT in the build pipeline is the
+    /// hand-back shape: the Curator's rescope removes `loom:issue` /
+    /// `loom:building` by definition.
+    #[test]
+    fn a_rescope_label_without_a_pipeline_label_is_a_rescope() {
+        for label in RESCOPE_LABELS {
+            assert_eq!(
+                open_with(&[label]).end_state(None),
+                Some(IssueEndState::Rescoped),
+                "{label}"
+            );
+        }
+        // The full hand-back shape a Curator actually leaves behind: the
+        // persistent `loom:curated` milestone plus a fresh `loom:triage`.
+        assert_eq!(
+            open_with(&["loom:curated", "loom:triage", "tier:goal-supporting"]).end_state(None),
+            Some(IssueEndState::Rescoped)
+        );
+    }
+
+    /// #9441 (Judge finding on PR #9471): the rescope labels are **additive
+    /// milestones**, not transient steps — Loom never strips `loom:curated`,
+    /// so an issue that was normally curated, promoted and claimed still
+    /// carries it. Reading that as a Curator hand-back would divert almost
+    /// every built issue's sweep into `curator_rescoped`, a non-failure bucket
+    /// exempt from the mandatory-`failure_class` invariant. Measured on this
+    /// repo when the defect was found: 5/5 (100%) of open `loom:building`
+    /// issues also carried `loom:curated`.
+    #[test]
+    fn a_pipeline_label_beats_a_persistent_rescope_milestone() {
+        for pipeline in PIPELINE_LABELS {
+            for rescope in RESCOPE_LABELS {
+                assert_eq!(
+                    open_with(&[rescope, pipeline]).end_state(None),
+                    Some(IssueEndState::StillOpen),
+                    "{rescope} + {pipeline}"
+                );
+            }
+        }
+        // The real-world label set of a curated, promoted, claimed issue.
+        assert_eq!(
+            open_with(&["loom:curated", "loom:building", "tier:goal-supporting"]).end_state(None),
+            Some(IssueEndState::StillOpen)
+        );
+    }
+
+    /// #9441: the reaper's own orphaned-claim recovery sets `loom:issue`
+    /// on every failed sweep BEFORE this record is written — reading it as
+    /// a Curator rescope would mislabel the entire failure population.
+    #[test]
+    fn the_restored_ready_label_is_not_a_rescope() {
+        assert_eq!(open_with(&["loom:issue"]).end_state(None), Some(IssueEndState::StillOpen));
+        assert_eq!(
+            open_with(&["loom:issue", "loom:curated"]).end_state(None),
+            Some(IssueEndState::StillOpen)
+        );
     }
 }

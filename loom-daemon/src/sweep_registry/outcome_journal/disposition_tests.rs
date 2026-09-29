@@ -265,6 +265,69 @@ fn the_restored_ready_label_is_not_mistaken_for_a_rescope() {
     assert!(record.disposition_invariants_hold());
 }
 
+/// #9441 regression (Judge finding on PR #9471): `loom:curated` is a
+/// **persistent milestone** this repo never strips — a normally-curated,
+/// normally-claimed issue carries it for life (measured at 5/5 of open
+/// `loom:building` issues when the defect was found). An environmental death
+/// on such an issue must still reach the record as `env_failure` carrying its
+/// real class, NOT as `curator_rescoped` (a documented *correct* outcome that
+/// is exempt from the mandatory-`failure_class` invariant).
+///
+/// Both defences are exercised here: the end state no longer reports
+/// `Rescoped` for a pipeline-labelled issue, and the classifier's
+/// environmental arm now outranks the label-derived end-state arms anyway.
+#[test]
+#[serial]
+fn a_stale_curated_milestone_never_masks_an_environmental_death() {
+    for (issue, labels) in [
+        (94_480_u32, vec!["loom:curated", "loom:building"]),
+        (94_481, vec!["loom:curated", "loom:issue"]),
+        // Belt and braces: even with NO pipeline label left on the issue, the
+        // environmental class outranks the rescope arm.
+        (94_482, vec!["loom:curated", "loom:triage"]),
+    ] {
+        let dir = tempdir().unwrap();
+        let mut registry = disposition_registry(dir.path(), &gh_issue_state("open", None, &labels));
+        let record = emit(
+            &mut registry,
+            issue,
+            0,
+            telemetry::SweepResult::Failure,
+            Some("preflight-token-selection-failed"),
+        );
+        assert_eq!(
+            record.disposition,
+            telemetry::SweepDisposition::EnvFailure,
+            "labels {labels:?}"
+        );
+        assert_eq!(
+            record.failure_class.as_deref(),
+            Some("preflight-token-selection-failed"),
+            "labels {labels:?}"
+        );
+        assert!(record.disposition_invariants_hold(), "labels {labels:?}");
+    }
+}
+
+/// The same staleness, without any classifier label: a long phase-less death
+/// on a claimed issue that still carries `loom:curated` must not be reported
+/// as a Curator hand-back either — it lands in a bucket that is still required
+/// to say why it failed.
+#[test]
+#[serial]
+fn a_stale_curated_milestone_on_a_claimed_issue_is_not_a_rescope() {
+    let dir = tempdir().unwrap();
+    let mut registry = disposition_registry(
+        dir.path(),
+        &gh_issue_state("open", None, &["loom:curated", "loom:building"]),
+    );
+    let record = emit(&mut registry, 94_490, 1_800, telemetry::SweepResult::Failure, None);
+    assert_ne!(record.disposition, telemetry::SweepDisposition::CuratorRescoped);
+    assert!(record.disposition.requires_failure_class());
+    assert!(record.failure_class.is_some());
+    assert!(record.disposition_invariants_hold());
+}
+
 /// An environmental classifier label reaches the record as `env_failure`
 /// with the classifier's own (never overwritten) `failure_class`.
 #[test]
