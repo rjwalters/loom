@@ -290,10 +290,35 @@ mod tests {
     }
 
     #[test]
+    fn assignment_matches_the_cross_host_golden_table() {
+        // These literals are the cross-host contract: if any value here ever
+        // changes, two daemons on different loom versions disagree about
+        // which member serves a repo. Independently computed in Python
+        // (SHA-256 of "loom-read-pool/v1:<repo>", first 8 bytes big-endian,
+        // mod N) against the spec in `assignment_index`'s doc comment, not by
+        // calling this function — a golden table computed by calling the
+        // function it guards can't catch a regression in that function.
+        //
+        // N=3 alone can't guard the byte order in `assignment_index`'s
+        // `u64::from_be_bytes`: since 256 ≡ 1 (mod 3), the mod-3 result only
+        // depends on the byte *sum*, which an endianness swap leaves
+        // unchanged. N=4 does not have that property and is included so a
+        // `from_be_bytes` -> `from_le_bytes` regression fails this test.
+        let golden: &[(&str, usize, usize)] = &[
+            // (owner_repo, N=3, N=4)
+            ("2AMLogic/2am", 2, 2),
+            ("rjwalters/loom", 0, 3),
+            ("2AMLogic/sigchip", 1, 2),
+            ("2AMLogic/marketing", 0, 1),
+        ];
+        for (repo, want_n3, want_n4) in golden {
+            assert_eq!(assignment_index(repo, 3), Some(*want_n3), "N=3 mismatch for {repo}");
+            assert_eq!(assignment_index(repo, 4), Some(*want_n4), "N=4 mismatch for {repo}");
+        }
+    }
+
+    #[test]
     fn assignment_is_stable_for_the_same_repo_and_pool_size() {
-        // The literal matters: it is the cross-host contract. If this value
-        // ever changes, two daemons on different loom versions disagree about
-        // which member serves a repo.
         let first = assignment_index("2AMLogic/2am", 3);
         assert_eq!(first, assignment_index("2AMLogic/2am", 3));
         assert!(first.unwrap() < 3);
