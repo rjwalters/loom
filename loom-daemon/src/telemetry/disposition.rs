@@ -443,10 +443,7 @@ mod tests {
     fn phases(names: &[&str]) -> Vec<PhaseDuration> {
         names
             .iter()
-            .map(|p| PhaseDuration {
-                phase: (*p).to_string(),
-                duration_sec: 10,
-            })
+            .map(|p| PhaseDuration::new((*p).to_string(), 10))
             .collect()
     }
 
