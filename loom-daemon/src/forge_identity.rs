@@ -24,7 +24,9 @@
 //!
 //! # Roster sources, highest first
 //!
-//! - `forge.identities` `{writer, readers, legacyLogins}` when present;
+//! - `forge.identities` `{writer?, readers, legacyLogins}` when present. The
+//!   writer is always `forge.githubApp` (what writes mint from);
+//!   `identities.writer` may only restate it, and a mismatch is logged;
 //! - otherwise the pre-#9537 keys, unchanged: `forge.githubApp` is the writer
 //!   and `forge.githubAppReadPool` / `LOOM_GITHUB_APP_READ_POOL` supplies the
 //!   readers. A host with neither configured behaves byte-identically to
@@ -143,10 +145,19 @@ pub fn from_config(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(normalise_login);
+    // The writer is whatever ACTUALLY writes: `forge.githubApp`, the App
+    // `github-app-token.sh` mints for the daemon's credential delivery, agent
+    // sessions and merge-pr.sh. `forge.identities.writer` may restate it (to
+    // give it a slug) but cannot redirect writes, so on a mismatch the
+    // configured App wins and the disagreement is logged rather than letting
+    // "is this ours?" believe one App while the fleet writes as another.
+    let github_app = crate::config_resolver::get_path(effective, "forge.githubApp")
+        .and_then(identity_from_value);
     let mut roster =
         if let Some(ids) = crate::config_resolver::get_path(effective, "forge.identities") {
+            let declared = ids.get("writer").and_then(identity_from_value);
             Roster {
-                writer: ids.get("writer").and_then(identity_from_value),
+                writer: reconcile_writer(github_app, declared),
                 readers: ids
                     .get("readers")
                     .and_then(Value::as_array)
@@ -188,6 +199,39 @@ pub fn from_config(
         roster.readers.retain(|r| r.app_id != w.app_id);
     }
     roster
+}
+
+/// Pick the roster's writer from the App that writes (`forge.githubApp`) and
+/// the one `forge.identities.writer` declares.
+fn reconcile_writer(configured: Option<Identity>, declared: Option<Identity>) -> Option<Identity> {
+    match (configured, declared) {
+        (Some(mut c), Some(d)) => {
+            if c.app_id == d.app_id {
+                c.slug = c.slug.or(d.slug);
+            } else {
+                log::warn!(
+                    "forge_identity: forge.identities.writer (app {}) differs from forge.githubApp \
+                     (app {}), which is what every write mints from; treating app {} as the \
+                     writer — fix the config so they agree (#9537)",
+                    d.app_id,
+                    c.app_id,
+                    c.app_id
+                );
+            }
+            Some(c)
+        }
+        (Some(c), None) => Some(c),
+        (None, Some(d)) => {
+            log::warn!(
+                "forge_identity: forge.identities.writer (app {}) is set but forge.githubApp is \
+                 not, so writes fall back to ambient gh auth; set forge.githubApp to the same App \
+                 (#9537)",
+                d.app_id
+            );
+            Some(d)
+        }
+        (None, None) => None,
+    }
 }
 
 /// `{appId, privateKeyPath, slug?}` (slug falls back to `name`, as
@@ -489,9 +533,23 @@ pub fn read_credential_in(
     if owner.is_empty() {
         return None;
     }
-    let reader = reader_for(roster, owner_repo)?;
-    let dir = reader_dir(workspace_root, owner, reader);
-    dir_is_fresh(&dir, now).then(|| (dir, reader.app_id.clone()))
+    // Walk the same deterministic order reader_for uses, but also skip a
+    // reader whose token for this owner is missing or near expiry, so one
+    // reader's stalled refresh moves its repos to the next reader rather than
+    // straight onto the writer's budget.
+    let n = roster.readers.len();
+    let start = forge_read_pool::assignment_index(owner_repo, n)?;
+    (0..n)
+        .map(|off| &roster.readers[(start + off) % n])
+        .find_map(|r| {
+            if forge_read_pool::is_withdrawn_at(&r.app_id, now)
+                || repo_withdrawn_at(&r.app_id, owner_repo, now)
+            {
+                return None;
+            }
+            let dir = reader_dir(workspace_root, owner, r);
+            dir_is_fresh(&dir, now).then(|| (dir, r.app_id.clone()))
+        })
 }
 
 /// Point `cmd` at a reader for a read of `owner_repo`, returning the reader's

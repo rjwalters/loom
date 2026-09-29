@@ -441,14 +441,15 @@ LOOM_DAEMON_BIN="$STUB_DIR/daemon-new" run_guard 114
 assert_eq "0" "$RC" "(k3) roster reader app/loom-fleet-reader-1 -> NOT skipped"
 assert_eq "EVALUATE" "$(get_field "$OUT" DECISION)" "(k3) DECISION=EVALUATE for a roster reader"
 
-# (k4) The same daemon says a numbered name is NOT in its roster -> bot-author
-#      SKIP: the daemon's answer wins over the built-in fallback.
+# (k4) A daemon that knows the verb answers not-ours for an unrelated bot ->
+#      bot-author SKIP, and its exit 1 is final (the fallback pattern is NOT
+#      consulted after a definite answer).
 reset_state
 cat > "$STUB_DIR/pr-115.json" <<'EOF'
-{"author":{"is_bot":true,"login":"app/loom-fleet-dispatch-3"},"headRefOid":"f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"}
+{"author":{"is_bot":true,"login":"app/renovate"},"headRefOid":"f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"}
 EOF
 LOOM_DAEMON_BIN="$STUB_DIR/daemon-new" run_guard 115
-assert_eq "10" "$RC" "(k4) daemon answers not-fleet -> exit 10"
+assert_eq "10" "$RC" "(k4) daemon answers not-fleet for app/renovate -> exit 10"
 
 # (k5) An old daemon (no is-fleet verb): the fallback accepts a numbered pool
 #      App -- the #6982 regression the old exact match reintroduced for -1/-2.

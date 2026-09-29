@@ -8,9 +8,26 @@ use loom_daemon::credential_preflight::{GithubAppMinter, GithubAppOutcome};
 use loom_daemon::forge_identity::{self, Identity, IdentityMinter, Roster};
 use serde_json::{json, Value};
 
-/// The workspace the command runs for: the cwd's git top level, else the cwd.
+/// The workspace the command runs for: the MAIN checkout of the cwd's repo
+/// (so a linked worktree still sees the workspace's local config tier and its
+/// published reader tokens), else the cwd.
 fn workspace() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let common = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(&cwd)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+    if let Some(parent) = common
+        .as_deref()
+        .filter(|c| c.ends_with(".git"))
+        .and_then(Path::parent)
+    {
+        return parent.to_path_buf();
+    }
     std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(&cwd)

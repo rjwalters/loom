@@ -332,6 +332,8 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         "ci_telemetry/api.rs", // repos/<o>/<r>/actions/... GETs
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let re = regex::Regex::new(r"\b(read_credential|read_credential_in|apply_read_credential)\b")
+        .unwrap();
     let mut offenders = Vec::new();
     let mut stack = vec![src.clone()];
     while let Some(dir) = stack.pop() {
@@ -350,9 +352,12 @@ fn only_reviewed_read_paths_request_reader_credentials() {
                 .to_string_lossy()
                 .replace('\\', "/");
             let text = std::fs::read_to_string(&path).unwrap_or_default();
-            let calls = text.contains("forge_identity::read_credential")
-                || text.contains("forge_identity::apply_read_credential")
-                || text.contains("forge_identity::read_credential_in");
+            // Whole identifiers in any file that references forge_identity
+            // at all: a brace-list import (`use crate::forge_identity::{…}`)
+            // or a call after a glob import counts as much as a path call,
+            // while another module's own `read_credential` (api_keys_pool
+            // has one) does not.
+            let calls = text.contains("forge_identity") && re.is_match(&text);
             if calls && !ALLOWED.contains(&rel.as_str()) {
                 offenders.push(rel);
             }
@@ -422,4 +427,39 @@ fn an_app_withdrawal_honours_the_reported_reset() {
         SystemTime::now() + Duration::from_secs(1700)
     ));
     assert!(!forge_read_pool::is_withdrawn_at("reset-app", reset + Duration::from_secs(1)));
+}
+
+#[test]
+fn the_writer_is_always_forge_github_app() {
+    // identities with readers but NO writer: forge.githubApp is still the writer.
+    let cfg = json!({"forge": {
+        "githubApp": {"appId": "100", "privateKeyPath": "/k/w.pem"},
+        "identities": {"readers": [{"appId": "201", "slug": "r1", "privateKeyPath": "/k/r1.pem"}]}
+    }});
+    let r = from_config(&cfg, None, &[]);
+    assert_eq!(
+        r.writer.as_ref().unwrap().app_id,
+        "100",
+        "readers-only identities keep the configured writer"
+    );
+    assert_eq!(r.readers.len(), 1);
+
+    // identities.writer restating the same App contributes its slug.
+    let cfg = json!({"forge": {
+        "githubApp": {"appId": "100", "privateKeyPath": "/k/w.pem"},
+        "identities": {"writer": {"appId": "100", "slug": "loom-fleet-dispatch", "privateKeyPath": "/k/w.pem"}}
+    }});
+    assert_eq!(
+        from_config(&cfg, None, &[]).writer.unwrap().slug.as_deref(),
+        Some("loom-fleet-dispatch")
+    );
+
+    // A DIFFERENT identities.writer cannot redirect writes: githubApp wins.
+    let cfg = json!({"forge": {
+        "githubApp": {"appId": "100", "privateKeyPath": "/k/w.pem"},
+        "identities": {"writer": {"appId": "999", "slug": "other", "privateKeyPath": "/k/o.pem"}}
+    }});
+    let w = from_config(&cfg, None, &[]).writer.unwrap();
+    assert_eq!(w.app_id, "100");
+    assert_eq!(w.slug, None, "the other App's slug is not borrowed");
 }

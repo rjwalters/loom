@@ -275,13 +275,18 @@ impl GhCliApi {
             let Some(failure) = failure else {
                 return first;
             };
-            crate::forge_identity::withdraw_after(
-                &app_id,
-                nwo,
-                failure,
-                app_until,
-                &format!("ci_telemetry {path}"),
-            );
+            let why = format!("ci_telemetry {path}");
+            if failure == crate::forge_identity::Failure::App {
+                crate::forge_identity::withdraw_after(&app_id, nwo, failure, app_until, &why);
+                return self.run_once(path, extra, None);
+            }
+            // Coverage only when the writer CAN read it: a real 404 (a deleted
+            // run) fails on both and must not withdraw the repo's reader.
+            let second = self.run_once(path, extra, None);
+            if second.is_ok() {
+                crate::forge_identity::withdraw_after(&app_id, nwo, failure, None, &why);
+            }
+            return second;
         }
         self.run_once(path, extra, None)
     }

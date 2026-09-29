@@ -236,13 +236,21 @@ pub(crate) fn fetch_conditional(
             return Ok(first);
         };
         let repo = target.repo.as_deref().unwrap_or_default();
-        crate::forge_identity::withdraw_after(
-            &app_id,
-            repo,
-            failure,
-            None,
-            &format!("{caller} {url}"),
-        );
+        let why = format!("{caller} {url}");
+        if failure == crate::forge_identity::Failure::App {
+            crate::forge_identity::withdraw_after(&app_id, repo, failure, None, &why);
+            return run_fetch(caller, gh_bin, cwd, target, url, etag, None);
+        }
+        // A 403/404 is only the READER's coverage gap if the writer can read
+        // the same thing; a genuinely missing resource (a deleted issue) 404s
+        // for both and must not take the repo's reader offline for an hour.
+        let second = run_fetch(caller, gh_bin, cwd, target, url, etag, None)?;
+        let writer_ok =
+            second.0.success() || matches!(second.1.as_ref().map(|r| r.status), Some(200 | 304));
+        if writer_ok {
+            crate::forge_identity::withdraw_after(&app_id, repo, failure, None, &why);
+        }
+        return Ok(second);
     }
     run_fetch(caller, gh_bin, cwd, target, url, etag, None)
 }
