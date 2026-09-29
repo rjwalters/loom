@@ -392,7 +392,7 @@ _worktree_resolve_origin_branch_reuse() {
     # trusting the caller. Refuse — the #7765 stance: a check that cannot run
     # safely refuses rather than guessing.
     if ! declare -F check_branch_name >/dev/null 2>&1 || ! check_branch_name "$branch" "worktree branch"; then
-        [[ "$json_output" == "true" ]] && echo '{"success": false, "error": "unsafe-branch-name", "issueNumber": '"$issue_number"'}' >&3
+        [[ "$json_output" == "true" ]] && jq -cn --arg issue "$issue_number" '{success: false, error: "unsafe-branch-name", issueNumber: ($issue | tonumber? // null)}' >&3
         exit 1
     fi
     origin_fetch_result="ok"
