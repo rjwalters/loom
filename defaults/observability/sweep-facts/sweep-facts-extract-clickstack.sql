@@ -1,5 +1,5 @@
--- ClickStack half of the sweep-facts seam (Issues #9446, #9466; pattern:
--- #8665).
+-- ClickStack half of the sweep-facts seam (Issues #9446, #9466, #9433;
+-- pattern: #8665).
 --
 -- This file defines exactly ONE object: `loom_analytics.raw_sweep_fact`, the
 -- view that turns this backend's raw log rows into the normalized sweep-fact
@@ -75,6 +75,10 @@ SELECT
     toInt64OrNull(LogAttributes['loom.hw_files'])                       AS hw_files,
     toInt64OrNull(LogAttributes['loom.generated_lines'])                AS generated_lines,
     toInt64OrNull(LogAttributes['loom.test_lines'])                     AS test_lines,
+    -- The Curator's a-priori size estimate (#9432), the one forecast column
+    -- here. NULL when absent — an unsized issue is not an issue sized at zero
+    -- — and ORDINAL, never summed as a size (SF8, #9433).
+    toInt64OrNull(LogAttributes['loom.story_points'])                   AS story_points,
     toInt64OrNull(LogAttributes['loom.doctor_cycles'])                  AS doctor_cycles,
     if(mapContains(LogAttributes, 'loom.judge_verdicts'),
        LogAttributes['loom.judge_verdicts'], NULL)                      AS judge_verdicts,

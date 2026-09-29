@@ -732,6 +732,16 @@ time, epic #9429). With it on the record, "story points landed per day" (#9433)
 and the estimate-vs-actual calibration loop (#9434) are a `GROUP BY` over this
 journal instead of a join against the forge.
 
+The throughput question is implemented: this field becomes the `story_points`
+column of `sweep_facts`, and **SF8** in
+`defaults/observability/sweep-facts/sweep-facts-queries.sql` answers "points
+landed per day / per ISO week" from it (#9433). Two things that question set
+fixes, and that any other consumer of this field must honour too: absent is a
+reported **data gap**, never a zero (the four omission situations below), and the
+values are **ordinal, not a unit** — sum the measured point value per bucket
+(`landed-size.sql`'s `measured_point_values`), never the raw labels. See
+`sweep-facts-questions.md` for the definitions and the capacity-tuning ops note.
+
 | Field | Type | Source | Notes |
 |---|---|---|---|
 | `story_points` | integer (`1` \| `2` \| `3` \| `5` \| `8` \| `13`) | The `points:*` label in the label list the **same** REST read that sources `complexity` and the disposition end state already returns (`sweep_registry::outcome_journal::complexity_signal`), folded by `crate::story_points`. | **No extra forge round trip** — that read's `--jq` projection already includes `labels`, and using it is what makes the estimate provably about the same issue as `complexity`. The paired `sweep.started` record carries the same field resolved at *dispatch* time, from the label list the #4444 park-label guard already read. |
