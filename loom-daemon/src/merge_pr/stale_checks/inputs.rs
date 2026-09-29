@@ -500,6 +500,7 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
             "Shell Budget Ratchet",
             ".gitignore Convergence Check",
             "Secret Scan",
+            "MCP Guard Wiring Contract",
         ],
     },
 ];
@@ -733,6 +734,27 @@ pub const SPECS: &[CheckSpec] = &[
         scanned: &[],
         coupled: &[],
         removal_sensitive: false,
+    },
+    // `loom-daemon check-guard-wiring` (#9108) — asserts the `mcp__loom__.*`
+    // PreToolUse matcher is wired in BOTH `.claude/settings.json` and the
+    // installer's `_PHOOK_*` arrays, routes through `hook-wiring.sh`, and
+    // carries the fail-closed broken-install floor. Its whole subject is the
+    // relationship BETWEEN those three files plus the hook they name, so they
+    // are `coupled`, not `scanned`: a settings edit on one side and an
+    // installer edit on the other is exactly the combination that can open the
+    // hole while each side looks fine alone. `removal_sensitive` because
+    // deleting the hook file is one of the four violations.
+    CheckSpec {
+        context: "MCP Guard Wiring Contract",
+        global: &["loom-daemon/**", "Cargo.toml", "Cargo.lock", CI_WORKFLOW],
+        scanned: &[],
+        coupled: &[
+            ".claude/settings.json",
+            "defaults/.claude/settings.json",
+            "scripts/install/provision-hooks.sh",
+            "defaults/hooks/guard-mcp-tools.sh",
+        ],
+        removal_sensitive: true,
     },
     // Its ONLY input is its own script: it diffs `merge-base(base, head)..head`
     // by git revision (the full-history checkout has both), so it depends on the PR's own

@@ -19,8 +19,8 @@
 #   AC2 - a clean, fully-documented call is ALLOWED, and both verdicts land in
 #         the decision log when `guards.decisionLog` is on
 #   AC3 - the settings-wiring contract check passes on this checkout (its own
-#         discriminating power is self-tested in
-#         scripts/check-guard-scan-contracts.sh --self-test)
+#         discriminating power is fixture-tested in
+#         loom-daemon/src/guard_wiring/tests.rs)
 #   plus: an off-enum value denies; a reviewed free-text sink (send_terminal_input
 #         .input) is exempt; an out-of-namespace tool is untouched; the
 #         guards.mcpToolArgs toggle (env and config); fail-open when no daemon
@@ -71,7 +71,7 @@ HOOK="$WS/.loom/hooks/guard-mcp-tools.sh"
 # --- pin the daemon under test ----------------------------------------------
 # shellcheck source=../../scripts/tests/lib/require-daemon-bin.sh
 source "$REPO_ROOT/defaults/scripts/tests/lib/require-daemon-bin.sh"
-loom_test_require_daemon_bin "$HELPERS_DIR" "guard-mcp-tools"
+loom_test_require_daemon_bin "$HELPERS_DIR" "guard-mcp-tools" "check-guard-wiring"
 
 DECISION_LOG="$TMP/decisions.log"
 
@@ -290,10 +290,15 @@ printf '%s' "${r#*|}" | jq -e '.hookSpecificOutput.hookEventName == "PreToolUse"
     bad "contract: malformed deny document: ${r#*|}"
 
 # --- AC3: the settings-wiring contract --------------------------------------
-if bash "$REPO_ROOT/scripts/check-guard-scan-contracts.sh" --wiring >/dev/null 2>&1; then
+# `loom-daemon check-guard-wiring`, not inline shell: the check is new
+# executable logic, so it belongs in the daemon per
+# .loom/docs/shell-language-policy.md (its own discriminating power is
+# fixture-tested in loom-daemon/src/guard_wiring/tests.rs). Run against the
+# REAL repo root, which is what the "Daemon Checks" CI gate does.
+if "$LOOM_DAEMON_SELF_BIN" check-guard-wiring --repo-root "$REPO_ROOT" >/dev/null 2>&1; then
     ok "AC3: the mcp__loom__.* matcher + fail-closed floor contract passes"
 else
-    bad "AC3: scripts/check-guard-scan-contracts.sh --wiring failed on this checkout"
+    bad "AC3: loom-daemon check-guard-wiring failed on this checkout"
 fi
 
 # --- defaults/ vs .loom/ parity ---------------------------------------------

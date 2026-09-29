@@ -339,6 +339,16 @@ pub(crate) enum ScriptPortCommand {
     /// every `PreToolUse` matcher.
     GuardMcpTools(super::guard_mcp_tools::GuardMcpToolsArgs),
 
+    /// The `PreToolUse` matcher-coverage contract for that guard (#9108): the
+    /// `mcp__loom__.*` matcher exists in `.claude/settings.json` AND in the
+    /// installer's `_PHOOK_*` arrays, its entry routes through
+    /// `hook-wiring.sh`, and it carries the same fail-closed broken-install
+    /// floor the `Bash` / `Edit|Write` entries carry. Exit 1 on any violation.
+    /// Not a port of working shell: the check's first cut lived inside
+    /// `contract`-category `check-guard-scan-contracts.sh`, which the
+    /// shell-language policy and the #7810 shell-budget gate both send here.
+    CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
+
     /// Per-segment PR latency, derived live from the forge timeline (#8923):
     /// review-queue wait, approval path, `loom:pr`→merged **split by operator
     /// gate**, Doctor response, and verdict invalidations — plus the live queue
@@ -433,6 +443,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),
+            ScriptPortCommand::CheckGuardWiring(args) => args.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),

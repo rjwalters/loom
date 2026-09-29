@@ -13,6 +13,7 @@ mod agent_skills;
 pub(crate) mod api_keys;
 pub(crate) mod cancel;
 pub(crate) mod cargo_target_dir;
+mod check_guard_wiring;
 pub(crate) mod ci_telemetry_cli;
 pub(crate) mod cleanup_ops;
 pub(crate) mod codex_usage_cli;

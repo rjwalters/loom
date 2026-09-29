@@ -187,6 +187,7 @@ pub mod forge_parser;
 pub mod gh_repo_env;
 pub mod git_parser;
 pub mod git_utils;
+pub mod guard_wiring;
 pub mod hard_exclusion;
 pub mod health;
 pub mod health_monitor;

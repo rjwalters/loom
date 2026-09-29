@@ -976,6 +976,28 @@ jobs:
         if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
 
+      # component: MCP Guard Wiring Contract
+      # #9108: `check-guard-scan-contracts.sh` (Structural Checks) answers
+      # "does the guard read the right copy of the command?". This answers the
+      # prior question — "is the guard on the tool call's path at all?" — which
+      # nothing asserted until #9108, and which is how every `mcp__loom__*`
+      # call came to run with no PreToolUse matcher covering it while
+      # `get_agent_metrics` built a shell command line from its raw arguments
+      # (fixed server-side in #9107). A matcher that matches nothing does not
+      # error; it just never fires, so the wiring has to be asserted.
+      #
+      # It lives HERE rather than next to its sibling in Structural Checks
+      # because that job is deliberately toolchain-free (no cargo, no daemon
+      # binary) and this check is a daemon subcommand — new executable logic
+      # goes into the daemon, not into `contract`-category shell
+      # (.loom/docs/shell-language-policy.md, epic #7810). Behind
+      # `daemon != 'false'` like its siblings: that predicate is false only for
+      # a PR entirely inside `dashboard/`, which cannot touch the settings
+      # file, the installer, or the hook this reads.
+      - name: Check the mcp__loom__.* PreToolUse matcher is wired and fails closed (#9108)
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+        run: ./target/debug/loom-daemon check-guard-wiring --repo-root .
+
       # component: Secret Scan
       # Refuses any commit that ADDS a credential-shaped value, whatever its
       # path (#9133): the same `loom-daemon secret-scan` the PreToolUse guard
