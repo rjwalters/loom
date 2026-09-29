@@ -65,10 +65,8 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
-use crate::script_helpers::sweep_experiment::{
-    sum_transcript_usage, sum_transcript_usage_by_model, ModelUsageTotals,
-};
-use crate::script_helpers::transcript_usage::{merge_records, UsageFold};
+use crate::script_helpers::sweep_experiment::{sum_transcript_usage, ModelUsageTotals};
+use crate::script_helpers::transcript_usage::{merge_records, UsageFold, UsageRecord};
 
 /// Bytes of each candidate session file read when testing it for the
 /// `/loom:sweep <issue>` slash command. The command is in the first `user`
@@ -295,12 +293,35 @@ pub fn sum_sweep_tokens(
     (total > 0).then_some(total)
 }
 
+/// Whether `record` belongs inside `window`, keyed on the record's own
+/// [`UsageRecord::at`] rather than the file's mtime (Issue #9454).
+///
+/// `window` here is the sweep's **precise** attribution span — unlike
+/// [`mtime_in_window`], no [`WINDOW_SLACK`] is added, because this is the
+/// per-record filter that runs only *after* [`sweep_transcript_files`] has
+/// already admitted a file on the (deliberately generous) slack-widened mtime
+/// test. Widening it again here would defeat the fix.
+///
+/// `None` (no window at all) keeps every record — the legacy unbounded-sum
+/// behaviour, used only when a caller has no window to filter by. A record
+/// with no parseable timestamp is dropped when a window *is* given: its
+/// origin session cannot be verified, and admitting it is exactly the
+/// "un-owned usage gets folded into whichever sweep happens to be reading"
+/// failure mode this filter exists to close.
+#[must_use]
+fn record_in_window(record: &UsageRecord, window: Option<(DateTime<Utc>, DateTime<Utc>)>) -> bool {
+    let Some((start, end)) = window else {
+        return true;
+    };
+    record.at().is_some_and(|at| at >= start && at <= end)
+}
+
 /// Split input/output token totals for `issue`'s `/loom:sweep` sessions
-/// (Issue #5357): same session-matching and per-transcript summation as
-/// [`sum_sweep_tokens`], but keeping the input/output axes separate rather
-/// than collapsing them into one total — the two price very differently, so
-/// a `sweep.outcome` consumer that wants a cost-weighted figure needs both
-/// counts alongside the record's own `model`, not a single pre-mixed number.
+/// (Issue #5357): same session-matching as [`sum_sweep_tokens`], but keeping
+/// the input/output axes separate rather than collapsing them into one total
+/// — the two price very differently, so a `sweep.outcome` consumer that wants
+/// a cost-weighted figure needs both counts alongside the record's own
+/// `model`, not a single pre-mixed number.
 ///
 /// "Input" here is the three billing-input counters summed
 /// (`input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens`
@@ -309,6 +330,20 @@ pub fn sum_sweep_tokens(
 /// Deliberately **raw**, not cost-weighted: `sweep.outcome` already carries
 /// `model`, so a consumer applies whatever per-model pricing table it wants
 /// without this record needing a backfill when that table changes.
+///
+/// Unlike [`sum_sweep_tokens`] (whole-file summation — deliberate, see that
+/// function's doc), this attributes **per record**, keyed on each usage
+/// record's own `timestamp` against `window` via [`record_in_window`] — the
+/// same pattern [`sum_sweep_tokens_by_window`] already uses for per-phase
+/// splits (Issue #9443). `sweep_transcript_files`'s mtime-based file selection
+/// (shared with every sibling function here, including the safehouse's
+/// whole-issue [`sum_sweep_tokens`]) is unchanged: a candidate file can still
+/// be admitted by the slack-widened mtime test, but only the records inside
+/// it whose own timestamp actually falls in `window` are counted. This is
+/// what stops another `/loom:sweep <same issue>` session sharing a project
+/// directory — a re-dispatch, or a concurrent attempt on another host with a
+/// synced worktree — from having its usage folded into this sweep's total
+/// merely because its transcript file's mtime landed nearby (Issue #9454).
 ///
 /// `None` (never `Some((0, 0))`) when nothing attributable was found — same
 /// "unknown != zero" contract as [`sum_sweep_tokens`].
@@ -329,28 +364,47 @@ pub fn sum_sweep_tokens_split(
     let mut input_total: u64 = 0;
     let mut output_total: u64 = 0;
     for transcript in files {
-        let usage = sum_transcript_usage(&transcript);
-        let input = usage
-            .input_tokens
-            .saturating_add(usage.cache_read_input_tokens)
-            .saturating_add(usage.cache_creation_input_tokens);
-        input_total = input_total.saturating_add(u64::try_from(input).unwrap_or(0));
-        output_total = output_total.saturating_add(u64::try_from(usage.output_tokens).unwrap_or(0));
+        let Ok(text) = std::fs::read_to_string(&transcript) else {
+            continue;
+        };
+        let mut fold = UsageFold::default();
+        fold.add_text(&text);
+        for record in fold.messages() {
+            if !record_in_window(record, window) {
+                continue;
+            }
+            let input = record
+                .input
+                .saturating_add(record.cache_read)
+                .saturating_add(record.cache_write_5m)
+                .saturating_add(record.cache_write_1h);
+            input_total = input_total.saturating_add(u64::try_from(input.max(0)).unwrap_or(0));
+            output_total =
+                output_total.saturating_add(u64::try_from(record.output.max(0)).unwrap_or(0));
+        }
     }
     (input_total > 0 || output_total > 0).then_some((input_total, output_total))
 }
 
 /// Per-`(model, speed, service_tier)` token totals for `issue`'s
-/// `/loom:sweep` sessions (#5740): same session-matching and per-transcript
-/// scan as [`sum_sweep_tokens`]/[`sum_sweep_tokens_split`], but grouped by
+/// `/loom:sweep` sessions (#5740): same session-matching as
+/// [`sum_sweep_tokens`]/[`sum_sweep_tokens_split`], but grouped by
 /// model/speed/tier instead of collapsed into one running total. See
-/// [`ModelUsageTotals`] and [`sum_transcript_usage_by_model`] for why a
-/// single flat sum cannot be priced.
+/// [`ModelUsageTotals`] for why a single flat sum cannot be priced.
 ///
-/// Totals from every matching transcript are merged by tuple across the
-/// whole sweep (a re-dispatched issue's several sessions, and a sweep whose
-/// phases used different models via #5687's downgrade fallback, all
-/// contribute to the same output row when the tuple matches).
+/// This is `sweep.outcome`'s `tokens_by_model` — the flat `tokens_in`/
+/// `tokens_out` pair's per-model breakdown, published on the very same
+/// record — so it is windowed **per record** exactly like
+/// [`sum_sweep_tokens_split`] (Issue #9454): only records whose own
+/// timestamp falls in `window` are counted, via the same
+/// [`record_in_window`] filter. Without this, the flat pair and this
+/// breakdown could disagree about a sweep's own cost after #9454's fix
+/// landed only on one of the two.
+///
+/// Totals from every matching **record inside `window`** are merged by
+/// tuple across the whole sweep (a sweep whose phases used different models
+/// via #5687's downgrade fallback still contributes every phase's usage to
+/// the same output row when the tuple matches).
 ///
 /// `None` (never `Some(vec![])`) when nothing attributable was found — same
 /// "unknown != zero" contract as [`sum_sweep_tokens`].
@@ -370,10 +424,16 @@ pub fn sum_sweep_tokens_by_model(
     )?;
     let mut totals: BTreeMap<(String, String, String), ModelUsageTotals> = BTreeMap::new();
     for transcript in files {
-        crate::script_helpers::transcript_usage::merge_rows(
-            &mut totals,
-            sum_transcript_usage_by_model(&transcript),
-        );
+        let Ok(text) = std::fs::read_to_string(&transcript) else {
+            continue;
+        };
+        let mut fold = UsageFold::default();
+        fold.add_text(&text);
+        let in_window = fold
+            .messages()
+            .iter()
+            .filter(|record| record_in_window(record, window));
+        merge_records(&mut totals, in_window);
     }
     let rows: Vec<ModelUsageTotals> = totals.into_values().collect();
     (!rows.is_empty()).then_some(rows)
@@ -694,6 +754,75 @@ mod tests {
         assert_eq!(sum_sweep_tokens_split(dir.path(), workspace, 4699, None), None);
     }
 
+    /// AC (Issue #9454): two `/loom:sweep <same issue>` sessions run
+    /// back-to-back on one host — reproducing the loom#8450 shape (an earlier,
+    /// much larger same-issue session; a small, later one). Both transcript
+    /// files are written "now" by this test, so both mtimes fall inside each
+    /// other's [`WINDOW_SLACK`] and [`sweep_transcript_files`] admits both as
+    /// candidates for either sweep's window — exactly the situation that let
+    /// the old whole-file summation fold the large session's usage into the
+    /// small sweep's total. Each sweep's own `sum_sweep_tokens_split` call
+    /// must report only the records whose own timestamp falls inside its own
+    /// window.
+    #[test]
+    fn split_attributes_each_of_two_same_issue_sessions_to_only_its_own_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        // Both transcript files get a real (wall-clock "now") mtime when this
+        // test writes them, so the windows must be anchored to `Utc::now()` —
+        // not a fixed calendar instant — for `mtime_in_window`'s slack check
+        // to admit them as candidates the way it would for two real sweeps.
+        let t0 = Utc::now();
+
+        // The large, earlier session: loom#8450's 292-second judge-only sweep,
+        // absorbing what should have been 11 earlier sweeps' worth of usage.
+        let large_start = t0 - chrono::Duration::minutes(90);
+        let large_end = large_start + chrono::Duration::seconds(292);
+        let large_records = [
+            stamped("large-1", large_start + chrono::Duration::seconds(10), 50_000_000, 500_000),
+            stamped("large-2", large_end - chrono::Duration::seconds(10), 30_000_000, 300_000),
+        ]
+        .concat();
+        seed_session(dir.path(), workspace, "uuid-large", "8450", &large_records, &[]);
+
+        // The small, later session: a 22-second curator-only failure.
+        let small_start = t0;
+        let small_end = small_start + chrono::Duration::seconds(22);
+        let small_records = [stamped(
+            "small-1",
+            small_start + chrono::Duration::seconds(5),
+            900,
+            40,
+        )]
+        .concat();
+        seed_session(dir.path(), workspace, "uuid-small", "8450", &small_records, &[]);
+
+        // The small sweep's own window must report ONLY its own usage, not the
+        // large session's — even though the large session's file mtime falls
+        // well inside `small`'s window plus WINDOW_SLACK.
+        assert_eq!(
+            sum_sweep_tokens_split(dir.path(), workspace, 8450, Some((small_start, small_end))),
+            Some((900, 40)),
+            "the small sweep must not absorb the large session's usage"
+        );
+
+        // Symmetrically, the large sweep's own window must report only its own
+        // usage, not the small session's.
+        assert_eq!(
+            sum_sweep_tokens_split(dir.path(), workspace, 8450, Some((large_start, large_end))),
+            Some((80_000_000, 800_000)),
+            "the large sweep must not absorb the small session's usage either"
+        );
+
+        // Non-regression: the safehouse's whole-issue `sum_sweep_tokens` is
+        // untouched and still sums every matching session together (Issue
+        // #4699's deliberate "cost of the whole issue" semantics).
+        assert_eq!(
+            sum_sweep_tokens(dir.path(), workspace, 8450, None),
+            Some(80_000_000 + 800_000 + 900 + 40)
+        );
+    }
+
     // --- sum_sweep_tokens_by_model (#5740) ----------------------------------
 
     #[test]
@@ -758,6 +887,69 @@ mod tests {
         seed_session(dir.path(), workspace, "uuid-a", "4699", "", &[]);
 
         assert_eq!(sum_sweep_tokens_by_model(dir.path(), workspace, 4699, None), None);
+    }
+
+    /// A timestamped, model-tagged usage record — [`stamped`] with an
+    /// explicit `model` instead of the fixed `"claude-sonnet-5"`, for testing
+    /// [`sum_sweep_tokens_by_model`]'s Issue #9454 per-record windowing.
+    fn stamped_model(id: &str, at: DateTime<Utc>, model: &str, input: i64, output: i64) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"id\":\"{id}\",\
+             \"model\":\"{model}\",\"usage\":{{\"input_tokens\":{input},\
+             \"output_tokens\":{output},\"cache_read_input_tokens\":0,\
+             \"cache_creation_input_tokens\":0}}}}}}\n",
+            at.to_rfc3339()
+        )
+    }
+
+    /// AC (Issue #9454): `sum_sweep_tokens_by_model` feeds `sweep.outcome`'s
+    /// `tokens_by_model` from the same transcripts `sum_sweep_tokens_split`
+    /// feeds `tokens_in`/`tokens_out` from — the two must not disagree about
+    /// which session a record belongs to, so this gets the identical
+    /// per-record windowing rather than being left on the old whole-file sum.
+    #[test]
+    fn by_model_is_windowed_per_record_like_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        let t0 = Utc::now();
+
+        let large_start = t0 - chrono::Duration::minutes(90);
+        let large_end = large_start + chrono::Duration::seconds(292);
+        let large = stamped_model(
+            "large-1",
+            large_start + chrono::Duration::seconds(10),
+            "claude-opus-5",
+            50_000_000,
+            500_000,
+        );
+        seed_session(dir.path(), workspace, "uuid-large", "8450", &large, &[]);
+
+        let small_start = t0;
+        let small_end = small_start + chrono::Duration::seconds(22);
+        let small = stamped_model(
+            "small-1",
+            small_start + chrono::Duration::seconds(5),
+            "claude-sonnet-5",
+            900,
+            40,
+        );
+        seed_session(dir.path(), workspace, "uuid-small", "8450", &small, &[]);
+
+        let rows =
+            sum_sweep_tokens_by_model(dir.path(), workspace, 8450, Some((small_start, small_end)))
+                .expect("the small sweep's own per-model usage");
+        assert_eq!(rows.len(), 1, "must not also pick up the large session's model: {rows:?}");
+        assert_eq!(rows[0].model, "claude-sonnet-5");
+        assert_eq!(rows[0].input, 900);
+        assert_eq!(rows[0].output, 40);
+
+        let large_rows =
+            sum_sweep_tokens_by_model(dir.path(), workspace, 8450, Some((large_start, large_end)))
+                .expect("the large sweep's own per-model usage");
+        assert_eq!(large_rows.len(), 1, "must not also pick up the small session's model");
+        assert_eq!(large_rows[0].model, "claude-opus-5");
+        assert_eq!(large_rows[0].input, 50_000_000);
+        assert_eq!(large_rows[0].output, 500_000);
     }
 
     // ----------------------------------------------------------------------
