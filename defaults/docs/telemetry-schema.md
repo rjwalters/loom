@@ -1676,7 +1676,7 @@ describe a different order from the one the tick ran. The `plan` block:
 
 | Field | Type | Notes |
 |---|---|---|
-| `slots` | object | `max_concurrent`, `occupancy` (after the tick), `free` (`max_concurrent − occupancy`), `max_admissions_per_tick`, `saturation_held`, `any_halted` |
+| `slots` | object | `max_concurrent`, `occupancy` (after the tick), `free` (`max_concurrent − occupancy`), `max_admissions_per_tick`, `saturation_held`, `any_halted`, `overflow_free` (bool, optional: whether the host's single `loom:operator-priority` overflow slot, #9244, is unused — a starred issue can still start past the configured cap) |
 | `tick_interval_secs` | integer, optional | the work finder's tick interval |
 | `shard` | object | `configured` (`false` when unsharded), `host_shard`, `shard_count` |
 | `scope` | array | the labels the plan covers: `["loom:issue", "loom:blocked"]` |
