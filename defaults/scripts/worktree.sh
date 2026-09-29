@@ -1543,6 +1543,21 @@ if [[ -d "$WORKTREE_PATH" ]]; then
 
     # Check if it's registered with git
     if git worktree list | grep -q "$WORKTREE_PATH"; then
+        # #9111: every exit-0 path below this point ("preserve existing work"
+        # and both arms of the "stale worktree reset" branch) answers the same
+        # "worktree already exists" question the --sparse/--full reconfigure
+        # fast path above does, so under --json they owe fd 3 the identical
+        # document shape it emits (see sparse.rs's JSON_TEMPLATE comment):
+        # {"success": true, "worktreePath": ..., "branchName": ...,
+        # "issueNumber": ..., "sparse": ..., "cone": ...}. None of these three
+        # paths runs --sparse/--full (that arm already exited above), so
+        # sparse/cone are always the not-sparse defaults ($SPARSE_MODE=false,
+        # $CONE_JSON="[]") set at argument-parsing time. $_abs_worktree_path is
+        # computed once here (mirroring $ABS_WORKTREE_PATH's own `cd ... &&
+        # pwd` on the create path below) since $WORKTREE_PATH is proven a real
+        # directory on every path reachable from here.
+        _abs_worktree_path=$(cd "$WORKTREE_PATH" && pwd)
+
         # The working-tree reading comes FIRST now (#8287): both the drift check
         # below and the staleness reference after it consume it, and the
         # reference also needs that check's `git fetch origin $BRANCH_NAME` to
@@ -1605,6 +1620,8 @@ if [[ -d "$WORKTREE_PATH" ]]; then
                 fi
                 echo ""
                 print_info "To use this worktree: cd $WORKTREE_PATH"
+            else
+                echo '{"success": true, "worktreePath": "'"$_abs_worktree_path"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
             fi
             exit 0
         else
@@ -1638,6 +1655,8 @@ if [[ -d "$WORKTREE_PATH" ]]; then
                     print_success "Stale worktree reset to $stale_display"
                     echo ""
                     print_info "To use this worktree: cd $WORKTREE_PATH"
+                else
+                    echo '{"success": true, "worktreePath": "'"$_abs_worktree_path"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
                 fi
                 exit 0
             else
@@ -1645,6 +1664,8 @@ if [[ -d "$WORKTREE_PATH" ]]; then
                     print_warning "Could not reset stale worktree (continuing to use as-is)"
                     echo ""
                     print_info "To use this worktree: cd $WORKTREE_PATH"
+                else
+                    echo '{"success": true, "worktreePath": "'"$_abs_worktree_path"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
                 fi
                 exit 0
             fi
