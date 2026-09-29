@@ -1576,17 +1576,15 @@ _strip_one_closed_issue_building_label() {
 _strip_closed_issue_building_labels() {
   [[ "$FORGE_TYPE" == "github" ]] || return 0
 
-  local close_targets
+  local close_targets issue_num
   close_targets="$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
   [[ -n "$close_targets" ]] || return 0
 
-  local issue_num
+  # Loop status is 0: each body command (continue / the helper) returns 0.
   while IFS= read -r issue_num; do
     [[ -n "$issue_num" ]] || continue
     _strip_one_closed_issue_building_label "$issue_num"
   done <<< "$close_targets"
-
-  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1594,25 +1592,12 @@ _strip_closed_issue_building_labels() {
 # fix list). `loom-daemon check-stale-blocked` (#8927) finds a stale block at
 # the next sweep pre-wave; this finds it the moment the blocker closes: every
 # open `loom:blocked` issue/PR citing this merged PR, or an issue it closed, as
-# a blocker gets a comment now. The decision and the comment both live in
-# `loom-daemon notify-cleared-blockers` (it reuses the advisory's enumeration
-# and the `dep_recheck` parsers — no second parser, per
-# .loom/docs/shell-language-policy.md); this is only the call. One call per
-# merge, so the population is scanned once. It never edits a label.
-# Best-effort and GitHub-only, like every step in this section.
-_notify_cleared_blockers() {
-  [[ "$FORGE_TYPE" == "github" ]] || return 0
-  local closed=("$PR_NUMBER") n out rc=0
-  while IFS= read -r n; do [[ -n "$n" ]] && closed+=("$n"); done \
-    <<< "$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
-  out="$("${LOOM_DAEMON_BIN:-loom-daemon}" notify-cleared-blockers --repo "$REPO_NWO" --repo-root "${REPO_ROOT:-.}" --closed "${closed[@]}" 2>&1)" || rc=$?
-  if [[ $rc -ne 0 ]]; then
-    warning "Close-triggered loom:blocked re-check (#9102) did not run (exit $rc): ${out//$'\n'/ } The next sweep's check-stale-blocked pass still covers it. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
-  elif [[ "$out" != *"no open loom:blocked artifact newly cleared"* ]]; then
-    info "Close-triggered loom:blocked re-check (#9102): ${out//$'\n'/; }"
-  fi
-  return 0
-}
+# a blocker gets a comment now (never a label edit). Resolving the closed set,
+# the decision and the comment all live in `loom-daemon notify-cleared-blockers`
+# (reusing the advisory's enumeration and the `dep_recheck` parsers — no second
+# parser, .loom/docs/shell-language-policy.md); it always exits 0. Best-effort
+# and GitHub-only, like every step in this section.
+_notify_cleared_blockers() { [[ "$FORGE_TYPE" == "github" ]] || return 0; "${LOOM_DAEMON_BIN:-loom-daemon}" notify-cleared-blockers --pr "$PR_NUMBER" --repo "$REPO_NWO" --repo-root "${REPO_ROOT:-.}" --quiet || warning "Close-triggered loom:blocked re-check (#9102) did not run; the next sweep's check-stale-blocked pass still covers it."; }
 
 # ---------------------------------------------------------------------------
 # Automated stacked-PR reconciliation on parent merge (#3747, stacked-PR v2,

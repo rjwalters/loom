@@ -59,8 +59,18 @@ const MARKER_PREFIX: &str = "<!-- loom:blocker-cleared:#";
 pub(crate) struct NotifyClearedBlockersArgs {
     /// Issue/PR number(s) that just closed or merged. Repeatable, and also
     /// accepts several values after one flag, so one merge is one scan.
-    #[arg(long, value_name = "N", required = true, num_args = 1..)]
+    #[arg(long, value_name = "N", num_args = 1.., required_unless_present = "pr")]
     pub closed: Vec<i64>,
+
+    /// A just-merged PR: adds the PR itself plus every issue it closed
+    /// (`closingIssuesReferences`, the same source as `merge-pr.sh`'s
+    /// `forge_pr_close_targets`) to the closed set. What `merge-pr.sh` passes.
+    #[arg(long, value_name = "N")]
+    pub pr: Option<i64>,
+
+    /// Print nothing when nothing was newly cleared.
+    #[arg(long)]
+    pub quiet: bool,
 
     /// Report what would be posted without posting it.
     #[arg(long)]
@@ -104,6 +114,14 @@ impl NotifyClearedBlockersArgs {
         };
         let repo = self.repo.as_deref();
         let mut closed = self.closed.clone();
+        let mut unread: Vec<String> = Vec::new();
+        if let Some(pr) = self.pr {
+            closed.push(pr);
+            match pr_close_targets(pr, repo, &root) {
+                Ok(targets) => closed.extend(targets),
+                Err(why) => unread.push(format!("PR #{pr} closing references: {why}")),
+            }
+        }
         closed.sort_unstable();
         closed.dedup();
 
@@ -112,7 +130,6 @@ impl NotifyClearedBlockersArgs {
             kinds.push(Artifact::Pr);
         }
 
-        let mut unread: Vec<String> = Vec::new();
         let mut candidates: Vec<(Artifact, i64)> = Vec::new();
         for kind in kinds {
             let (rows, err) = list_blocked(kind, &root, repo, self.limit);
@@ -150,7 +167,7 @@ impl NotifyClearedBlockersArgs {
             }
         }
 
-        report(&notified, &closed, &unread, self.dry_run);
+        report(&notified, &closed, &unread, self.dry_run, self.quiet);
         Ok(())
     }
 }
@@ -206,6 +223,42 @@ fn evaluate(
         reasons,
         posted,
     })
+}
+
+/// The issues a merged PR closed, per the forge's own `closingIssuesReferences`.
+fn pr_close_targets(pr: i64, repo: Option<&str>, root: &Path) -> Result<Vec<i64>, String> {
+    let n = pr.to_string();
+    let mut args = vec![
+        "pr",
+        "view",
+        n.as_str(),
+        "--json",
+        "closingIssuesReferences",
+    ];
+    if let Some(r) = repo {
+        args.extend(["--repo", r]);
+    }
+    match run_gh(&args, root, false) {
+        CmdOutcome::Ran(o) if o.status.success() => parse_close_targets(&o.stdout),
+        CmdOutcome::Ran(o) => Err(format!("gh pr view exited {}", o.status)),
+        CmdOutcome::Unavailable(u) => Err(format!("gh pr view could not be run: {u:?}")),
+    }
+}
+
+/// Parse `gh pr view --json closingIssuesReferences` output. Pure, so tested.
+fn parse_close_targets(stdout: &[u8]) -> Result<Vec<i64>, String> {
+    #[derive(serde::Deserialize)]
+    struct Ref {
+        number: i64,
+    }
+    #[derive(serde::Deserialize)]
+    struct View {
+        #[serde(default, rename = "closingIssuesReferences")]
+        refs: Vec<Ref>,
+    }
+    serde_json::from_slice::<View>(stdout)
+        .map(|v| v.refs.into_iter().map(|r| r.number).collect())
+        .map_err(|e| format!("unreadable closingIssuesReferences JSON: {e}"))
 }
 
 fn fetch_input(
@@ -279,12 +332,12 @@ fn post_comment(
 
 /// Stdout: what was notified (or nothing). Stderr: what could not be read or
 /// posted — reported as unknown, never folded into "nothing to notify".
-fn report(notified: &[Notified], closed: &[i64], unread: &[String], dry_run: bool) {
+fn report(notified: &[Notified], closed: &[i64], unread: &[String], dry_run: bool, quiet: bool) {
     let refs: Vec<String> = closed.iter().map(|n| format!("#{n}")).collect();
     let refs = refs.join(", ");
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
-    if notified.is_empty() {
+    if notified.is_empty() && !quiet {
         let _ = writeln!(
             out,
             "[notify-cleared-blockers] no open loom:blocked artifact newly cleared by {refs}."

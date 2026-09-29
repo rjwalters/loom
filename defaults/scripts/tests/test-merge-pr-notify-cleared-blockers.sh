@@ -8,9 +8,9 @@
 # artifact once per sweep. This closes the highest-value gap #8927 itself
 # named: the moment an issue/PR closes, immediately check whether any OTHER
 # open `loom:blocked` artifact cited it as a blocker, rather than waiting for
-# the next sweep. `merge-pr.sh`'s `_notify_cleared_blockers` is the shell-side
-# fan-out over `forge_pr_close_targets`; the decision AND the comment-posting
-# mutation both live in `loom-daemon notify-cleared-blockers`, which this
+# the next sweep. `merge-pr.sh`'s `_notify_cleared_blockers` is a one-line
+# call; resolving the merged PR's closed issues, the decision AND the comment
+# all live in `loom-daemon notify-cleared-blockers --pr`, which this
 # suite runs FOR REAL (unlike the `merge_pr` "decide from stdin" family, this
 # subcommand makes its own `gh` calls, so there is no JSON-on-stdin contract to
 # fixture instead).
@@ -100,7 +100,7 @@ trap 'rm -rf "$FUNCS_FILE" "$STUB_DIR" 2>/dev/null || true' EXIT
 awk '
   /^_notify_cleared_blockers\(\) \{/ { capture=1 }
   capture { print }
-  capture && /^}/ { capture=0 }
+  capture && /(^}|; }$)/ { capture=0 }
 ' "$MERGE_PR_SRC" > "$FUNCS_FILE"
 
 if ! grep -q "^_notify_cleared_blockers() {" "$FUNCS_FILE"; then
@@ -178,7 +178,16 @@ FORGE_TYPE="github"
 GH="gh"
 
 FORGE_CLOSE_TARGETS=""
-forge_pr_close_targets() { printf '%s' "$FORGE_CLOSE_TARGETS"; }
+
+# The daemon resolves the merged PR's closed issues itself (`gh pr view $PR
+# --json closingIssuesReferences`), so serve FORGE_CLOSE_TARGETS through the
+# stub's pr-$PR_NUMBER.json before each run.
+run_notify() {
+  local refs="" n
+  for n in $FORGE_CLOSE_TARGETS; do refs+="${refs:+,}{\"number\":$n}"; done
+  printf '{"closingIssuesReferences":[%s]}' "$refs" > "$STUB_DIR/pr-$PR_NUMBER.json"
+  _notify_cleared_blockers
+}
 
 reset_fixtures() {
   : > "$STUB_DIR/gh-calls.log"
@@ -211,7 +220,7 @@ cat > "$STUB_DIR/issue-201.json" <<'EOF'
 {"body":"Blocked by #200: needs that first.","comments":[],"closedByPullRequestsReferences":[]}
 EOF
 FORGE_CLOSE_TARGETS="200"
-_notify_cleared_blockers
+run_notify
 log="$(read_log)"
 assert_contains "$log" "issue comment 201" \
   "#201 cites the just-closed #200 -> a comment is posted on #201"
@@ -236,7 +245,7 @@ cat > "$STUB_DIR/issue-555.json" <<'EOF'
 {"state":"OPEN"}
 EOF
 FORGE_CLOSE_TARGETS="200"
-_notify_cleared_blockers
+run_notify
 assert_eq "" "$(read_log)" \
   "#202 cites an unrelated blocker (#555) -> no comment posted for #200's close"
 
@@ -254,14 +263,14 @@ cat > "$STUB_DIR/issue-203.json" <<'EOF'
 {"body":"Blocked by #200: needs that first.","comments":[],"closedByPullRequestsReferences":[]}
 EOF
 FORGE_CLOSE_TARGETS="200"
-_notify_cleared_blockers
+run_notify
 assert_eq "" "$(read_log)" \
   "#203 cites #200 but #200 still reads OPEN -> StillBlocked, no comment"
 
 # T4: the PR closed no issue and nothing cites the PR itself -> no comment.
 reset_fixtures
 FORGE_CLOSE_TARGETS=""
-_notify_cleared_blockers
+run_notify
 assert_eq "" "$(read_log)" "No close targets and no citation of the PR -> no comment"
 
 # T5: FORGE_TYPE != github -> no-op (GitHub-only v1, mirrors the sibling
@@ -278,7 +287,7 @@ cat > "$STUB_DIR/issue-201.json" <<'EOF'
 EOF
 FORGE_TYPE="gitea"
 FORGE_CLOSE_TARGETS="200"
-_notify_cleared_blockers
+run_notify
 assert_eq "" "$(read_log)" "FORGE_TYPE=gitea -> no-op (GitHub-only v1)"
 FORGE_TYPE="github"
 
@@ -295,7 +304,7 @@ cat > "$STUB_DIR/issue-201.json" <<'EOF'
 {"body":"Blocked by #200: needs that first.","comments":[{"author":{"login":"loom-fleet-dispatch"},"body":"<!-- loom:blocker-cleared:#200 -->"}],"closedByPullRequestsReferences":[]}
 EOF
 FORGE_CLOSE_TARGETS="200"
-_notify_cleared_blockers
+run_notify
 assert_eq "" "$(read_log)" \
   "#201 already carries the #200 marker -> no duplicate comment"
 
@@ -315,7 +324,7 @@ cat > "$STUB_DIR/pr-301.json" <<'EOF'
 {"body":"Blocked by #200: filed to track it, standing down.","comments":[],"number":301,"state":"OPEN","labels":[],"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN"}
 EOF
 FORGE_CLOSE_TARGETS="200"
-_notify_cleared_blockers
+run_notify
 log="$(read_log)"
 assert_contains "$log" "pr comment 301" \
   "A parked PR citing the just-closed #200 is also notified"
@@ -333,7 +342,7 @@ cat > "$STUB_DIR/issue-204.json" <<'EOF'
 {"body":"Blocked by #999 landing.","comments":[],"closedByPullRequestsReferences":[]}
 EOF
 FORGE_CLOSE_TARGETS=""
-_notify_cleared_blockers
+run_notify
 assert_contains "$(read_log)" "issue comment 204" \
   "An issue citing the merged PR itself (#999) is notified"
 assert_contains "$(read_comment_body 204)" "<!-- loom:blocker-cleared:#999 -->" \
@@ -351,7 +360,7 @@ cat > "$STUB_DIR/issue-205.json" <<'EOF'
 {"body":"No blocker named here.","comments":[{"author":{"login":"a-human"},"body":"Depends on #200"}],"closedByPullRequestsReferences":[]}
 EOF
 FORGE_CLOSE_TARGETS="200"
-_notify_cleared_blockers
+run_notify
 assert_contains "$(read_log)" "issue comment 205" \
   "A blocker cited only in a comment is found"
 
@@ -371,7 +380,7 @@ cat > "$STUB_DIR/issue-207.json" <<'EOF'
 {"body":"## Dependencies\n\n- [ ] #200: the prerequisite\n","comments":[],"closedByPullRequestsReferences":[]}
 EOF
 FORGE_CLOSE_TARGETS="200"
-_notify_cleared_blockers
+run_notify
 log="$(read_log)"
 assert_contains "$log" "issue comment 206" "First citer (prose) notified"
 assert_contains "$log" "issue comment 207" "Second citer (## Dependencies) notified"
@@ -394,7 +403,7 @@ cat > "$STUB_DIR/issue-208.json" <<'EOF'
 {"body":"Blocked by #200\nBlocked by #555","comments":[],"closedByPullRequestsReferences":[]}
 EOF
 FORGE_CLOSE_TARGETS="200"
-_notify_cleared_blockers
+run_notify
 assert_contains "$(read_log)" "issue comment 208" \
   "A partially cleared block is still notified"
 
@@ -406,7 +415,7 @@ echo "Testing merge-pr.sh wiring..."
 src="$(cat "$MERGE_PR_SRC")"
 assert_contains "$src" "_notify_cleared_blockers || true" \
   "merge-pr.sh invokes the close-triggered re-check at the confirmed-merge choke point"
-assert_contains "$src" 'notify-cleared-blockers --repo "$REPO_NWO"' \
+assert_contains "$src" 'notify-cleared-blockers --pr "$PR_NUMBER"' \
   "merge-pr.sh delegates the decision and the comment-post to loom-daemon notify-cleared-blockers"
 
 # --- Summary ---

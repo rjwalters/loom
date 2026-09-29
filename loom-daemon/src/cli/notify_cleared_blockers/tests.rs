@@ -55,3 +55,20 @@ fn the_posted_comment_never_cites_its_own_closed_number_as_a_blocker() {
     let i = input_with_comment(&comment_body(Artifact::Issue, &[180], &["x".to_string()]));
     assert!(cited_among(Artifact::Issue, &i, &[180]).is_empty());
 }
+
+#[test]
+fn parse_close_targets_reads_every_closing_reference() {
+    let out = br#"{"closingIssuesReferences":[{"number":200},{"number":201}]}"#;
+    assert_eq!(parse_close_targets(out), Ok(vec![200, 201]));
+}
+
+#[test]
+fn parse_close_targets_treats_no_references_as_empty_not_an_error() {
+    assert_eq!(parse_close_targets(br#"{"closingIssuesReferences":[]}"#), Ok(vec![]));
+    assert_eq!(parse_close_targets(b"{}"), Ok(vec![]));
+}
+
+#[test]
+fn parse_close_targets_reports_unreadable_output_as_an_error() {
+    assert!(parse_close_targets(b"not json").is_err());
+}
