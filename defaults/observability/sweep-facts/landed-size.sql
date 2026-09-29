@@ -30,7 +30,7 @@ WITH
     -- ---------------------------------------------------------------------------
     -- Parameters — NAMED and VERSIONED (#9466: "the parameter file versioned").
     -- The fit that produces the values below is the one-time D1 backfill run,
-    -- tracked in 2AMLogic/2am#1608: fit means/SDs and the per-model token
+    -- tracked with the one-time D1 backfill (#9446): fit means/SDs and the per-model token
     -- factors on the baseline window, set the window bounds, bump
     -- params_version, and re-run this file. NOTHING ELSE changes.
     --
@@ -69,7 +69,7 @@ WITH
     -- appears in `models_used`. Deliberately EMPTY in v0-unfitted — an
     -- unfitted factor is NULL, never 1.0: a neutral-looking 1.0 would publish
     -- unnormalized tokens as normalized. Populated during the backfill fit
-    -- (2AMLogic/2am#1608).
+    -- (the backfill run; see #9446).
     model_token_factors(model, factor) AS (
         SELECT NULL AS model, NULL AS factor
         WHERE 0
