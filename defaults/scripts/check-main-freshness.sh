@@ -121,8 +121,13 @@ REMOTE_REF="origin/$BRANCH"
 # No `timeout` available (e.g. minimal macOS without coreutils)? Still fetch —
 # git's own --quiet keeps it unobtrusive and a hung network is a rare edge — so
 # the bound is a command PREFIX rather than a second copy of the same fetch.
+# `${a[@]+"${a[@]}"}` not `"${a[@]}"`: this script runs under `set -u`, and on
+# bash 3.2 (the macOS default) expanding an EMPTY array that way is an "unbound
+# variable" error — the recurring 3.2 portability class in
+# `.loom/docs/shell-language-policy.md`. The `+` form expands to nothing when
+# the array is unset/empty and to the quoted elements otherwise.
 _CMF_BOUND=(); command -v timeout >/dev/null 2>&1 && _CMF_BOUND=(timeout 5)
-"${_CMF_BOUND[@]}" git fetch origin --quiet -- "$BRANCH" >/dev/null 2>&1 || true
+${_CMF_BOUND[@]+"${_CMF_BOUND[@]}"} git fetch origin --quiet -- "$BRANCH" >/dev/null 2>&1 || true
 
 # ---------- verify we have both refs to compare ----------
 

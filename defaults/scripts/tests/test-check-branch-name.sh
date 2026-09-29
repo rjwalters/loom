@@ -305,11 +305,15 @@ done
 # gets its name from the resolver rather than from somewhere new.
 echo ""
 echo "AC2 route 2: resolver-derived names are validated inside loom_default_branch"
-if awk '/^loom_default_branch\(\) \{/{f=1} f; f && /^}/{exit}' "$LIB" | grep -q 'check_branch_name'; then
-    pass "loom_default_branch validates its own result before echoing it"
-else
-    fail "loom_default_branch no longer validates its result — every route-2 sink below is unguarded"
-fi
+# Captured then matched with `case`, NOT `awk … | grep -q`: this file runs under
+# `set -o pipefail`, and `grep -q` closes the pipe as soon as it matches, so awk
+# can take SIGPIPE (141) and fail the whole pipeline. That is the flaky class
+# scripts/check-pipefail-early-exit.sh ratchets (#7060/#7285/#7540/#7736).
+LDB_BODY="$(awk '/^loom_default_branch\(\) \{/{f=1} f; f && /^}/{exit}' "$LIB")"
+case "$LDB_BODY" in
+    *check_branch_name*) pass "loom_default_branch validates its own result before echoing it" ;;
+    *) fail "loom_default_branch no longer validates its result — every route-2 sink below is unguarded" ;;
+esac
 for sink in 'defaults/scripts/check-main-freshness.sh' \
             'defaults/scripts/docs-worktree.sh' \
             'defaults/scripts/pr-worktree.sh' \
