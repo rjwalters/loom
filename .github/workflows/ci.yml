@@ -120,6 +120,17 @@ jobs:
               # re-run those, or the only tests that can catch the regression
               # are skipped on exactly the PRs that cause one (#8665).
               - 'defaults/observability/**'
+              # Same reasoning, two more `include_str!` targets (#9444):
+              # issue_effort_artifacts.rs reads the telemetry schema doc's
+              # normative classification table and the label catalog the rework
+              # derivation keys on, and fails when either drifts from
+              # telemetry/lineage.rs. Without these entries a doc- or
+              # labels-only PR skips the one test that can catch it.
+              - 'defaults/docs/telemetry-schema.md'
+              - '.github/labels.yml'
+              # issue_effort_sqlite.rs executes the committed effort query
+              # against this migration's own `records` DDL.
+              - 'dashboard/migrations/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'

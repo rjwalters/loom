@@ -959,6 +959,10 @@ mod tests {
                 provider: None,
                 profile: None,
                 complexity: None,
+                attempt_index: None,
+                previous_sweep_id: None,
+                trigger: None,
+                rework_events: None,
             }),
         )
     }

@@ -100,6 +100,12 @@ pub(crate) struct TimelineSignals {
     pub(crate) judge_verdicts: Vec<telemetry::JudgeVerdict>,
     /// Completed Doctor cycles — see the module doc's definition.
     pub(crate) doctor_cycles: u32,
+    /// In-sweep rework reconstructed from the SAME events (Issue #9444) — see
+    /// [`super::rework`] for the four label shapes and their
+    /// substantive/environmental classification. Empty (not absent — the
+    /// absent case is the caller's `None`) when the timeline was read and
+    /// carried no rework, which is the clean-landing shape.
+    pub(crate) rework_events: Vec<telemetry::ReworkEvent>,
 }
 
 /// The `--jq` program handed to `gh api`: one `<rfc3339>\t<label>` line per
@@ -187,6 +193,10 @@ pub(crate) fn signals_from_events(events: &[LabelEvent]) -> TimelineSignals {
             _ => {}
         }
     }
+    // Issue #9444: a second fold over the SAME events, so the rework split
+    // costs no additional forge call and can never describe a different
+    // timeline than the verdicts beside it.
+    out.rework_events = super::rework::rework_from_events(events);
     out
 }
 

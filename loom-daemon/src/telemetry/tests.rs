@@ -11,6 +11,7 @@ mod daemon_event;
 mod fleet_captain;
 mod host_health_omissions;
 mod kind_registry;
+mod lineage;
 mod role_tick;
 mod session_analysis;
 mod session_summary;
@@ -120,6 +121,17 @@ fn sweep_outcome() -> TelemetryRecord {
         provider: Some("friendli".to_string()),
         profile: Some("zai-flash".to_string()),
         complexity: Some("routine".to_string()),
+        // Issue #9444: the canonical fixture carries a fully-observed lineage,
+        // so the round-trip and redaction suites exercise the new fields
+        // rather than only their absent case.
+        attempt_index: Some(2),
+        previous_sweep_id: Some("sweep-issue-4703-0-prev".to_string()),
+        trigger: Some(SweepTrigger::RetryAfterEnvFailure),
+        rework_events: Some(vec![ReworkEvent::new(
+            ReworkKind::MergeConflict,
+            Some("loom:merge-conflict".to_string()),
+            Some(1_800),
+        )]),
     })
 }
 
@@ -257,6 +269,10 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         provider: None,
         profile: None,
         complexity: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     for field in [
@@ -270,6 +286,12 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         "provider",
         "profile",
         "complexity",
+        // Issue #9444: an unread journal / unread timeline omits all four
+        // lineage keys — "attempt 1" and "nobody counted" must stay apart.
+        "attempt_index",
+        "previous_sweep_id",
+        "trigger",
+        "rework_events",
     ] {
         assert!(
             value.get(field).is_none(),
@@ -379,6 +401,10 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         provider: None,
         profile: None,
         complexity: Some("complex".to_string()),
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(value["complexity"], "complex");
@@ -430,6 +456,10 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         provider: None,
         profile: None,
         complexity: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
     };
 
     let unobserved = serde_json::to_value(&base).unwrap();
@@ -1021,6 +1051,10 @@ fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
         provider: None,
         profile: None,
         complexity: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
     };
     let value = serde_json::to_value(&resolved).unwrap();
     assert_eq!(value["repo"], "rjwalters/loom");

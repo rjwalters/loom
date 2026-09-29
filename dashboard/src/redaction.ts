@@ -139,6 +139,19 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   // `failure_class` is held back for. The coarse `result` stays public and
   // unchanged.
   //
+  // Issue #9444's four attempt-lineage fields — `attempt_index`,
+  // `previous_sweep_id`, `trigger` and `rework_events` — are absent on exactly
+  // that rule as well. "This private repo needed six attempts, four of them
+  // retries after a substantive Judge rejection" is a finer reading of how a
+  // private repo's work went than `disposition` is, so it stays behind the
+  // same boundary. They are named here rather than merely left out because
+  // the allowlist is fail-safe (an unlisted field is dropped by default) and
+  // a reader must be able to tell a deliberate omission from an unnoticed
+  // one. `rework_events` would additionally need a derivation, not an
+  // allowlist entry, if it were ever made public — it is an array of nested
+  // objects, which the shallow copy cannot police (see the module doc's
+  // `phase_durations` section).
+  //
   // `phase_durations` moved OUT of this list in #9443 and into
   // `PUBLIC_RECORD_DERIVATIONS` below. It used to be a raw copy, which was
   // safe only while its entries were `{phase, duration_sec}`; #9443 added

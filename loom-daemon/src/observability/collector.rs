@@ -519,6 +519,18 @@ fn terminal_records(
             provider: None,
             profile: None,
             complexity: None,
+            // Issue #9444: attempt lineage is derived from the durable
+            // `sweep-outcome-telemetry.jsonl` journal and the PR's label
+            // timeline, neither of which this live event-bus path has in scope
+            // — the same deferral as `tokens_by_model` above. Left absent
+            // rather than derived a second, weaker way here: two lineages for
+            // one sweep that can disagree is worse than one, and the
+            // registry's own terminal record (keyed by the same `sweep_id`)
+            // carries the exact values.
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
         }),
     ]
 }

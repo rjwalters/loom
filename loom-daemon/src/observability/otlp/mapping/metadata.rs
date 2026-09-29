@@ -162,6 +162,31 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
             log::warn!("observability: invalid or oversized verdict history omitted");
         }
     }
+    // Issue #9444: the attempt-lineage axis. `trigger` and the two rework
+    // counts are what an OTLP consumer groups on to split an issue's cost into
+    // clean / substantive-rework / environmental-rework; the counts are
+    // exported rather than the event list because a flat attribute is what a
+    // metric query can aggregate. Each stays absent when unobserved.
+    if let Some(value) = record.attempt_index {
+        attrs.push(kv_int("loom.attempt_index", i64::from(value)));
+    }
+    if let Some(value) = record.previous_sweep_id.as_ref().filter(|v| text(v)) {
+        attrs.push(kv_string("loom.previous_sweep_id", value.clone()));
+    }
+    if let Some(value) = record.trigger {
+        attrs.push(kv_string("loom.trigger", value.as_str().to_string()));
+    }
+    if let Some(events) = record.rework_events.as_deref() {
+        // Some([]) is an observed clean landing — a zero here is a
+        // measurement, not a default, and the absent case stays absent.
+        for (key, class) in [
+            ("loom.rework_substantive", crate::telemetry::ReworkClass::Substantive),
+            ("loom.rework_environmental", crate::telemetry::ReworkClass::Environmental),
+        ] {
+            let count = events.iter().filter(|e| e.classification == class).count();
+            attrs.push(kv_int(key, i64::try_from(count).unwrap_or(i64::MAX)));
+        }
+    }
     if let Some(value) = models(record.models_used.as_deref()) {
         attrs.push(value);
     }

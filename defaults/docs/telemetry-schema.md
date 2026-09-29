@@ -472,14 +472,26 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
   "models_used": ["claude-sonnet-5"],
   "doctor_cycles": 0,
   "judge_verdicts": [{ "attempt": 1, "verdict": "pass" }],
-  "complexity": "routine"
+  "complexity": "routine",
+  "attempt_index": 2,
+  "previous_sweep_id": "sweep-issue-4703-prev",
+  "trigger": "retry_after_env_failure",
+  "rework_events": [
+    {
+      "kind": "merge_conflict",
+      "classification": "environmental",
+      "reason": "loom:merge-conflict",
+      "duration_sec": 1800
+    }
+  ]
 }
 ```
 
 `config` (free-form string map), `phase_durations`, `model`, `effort`,
 `pr_number`, `tokens_in`, `tokens_out`, `lines_added`, `lines_deleted`,
 `tokens_by_model`, `tokens_unattributed`, `failure_class`, `models_used`,
-`doctor_cycles`, `judge_verdicts`, and `complexity` are omitted when
+`doctor_cycles`, `judge_verdicts`, `complexity`, `attempt_index`,
+`previous_sweep_id`, `trigger`, and `rework_events` are omitted when
 empty/unset. `config` is a map — not fixed fields — so operator-tunable knobs
 can be captured without a schema bump. `disposition` (Issue #9441) is the one
 recent addition that is **never** omitted — see its own section below.
@@ -728,6 +740,162 @@ is not a breaking change, a new record kind is (see the version table above).
 `disposition` is not added to the public redaction allowlist, for the same
 reason `failure_class` is not: it is a strictly finer reading of *why* a
 private repo's sweep ended. The coarse `result` stays public and unchanged.
+
+#### Attempt lineage and rework — substantive vs. environmental (Issue #9444)
+
+`disposition` says what one sweep did. It cannot say **why the sweep existed**,
+and neither could anything else: over 2026-08-15..09-29, consecutive sweeps of
+the same issue landed within five minutes of each other **7,099 times** — a
+retry-storm shape — with nothing linking an attempt to its predecessor or
+naming what triggered it, and **~30% of pre-landing attempts unclassifiable**.
+Rebases, merge-conflict resolution, stale-base re-judges and CI reruns were
+recorded nowhere at all.
+
+That matters because effort accounting (#9429) needs an issue's cost split
+three ways, not one:
+
+- **clean** — the work itself;
+- **substantive rework** — a reviewer faulted the work, so the issue is hard;
+- **environmental rework** — main moved, the PR conflicted, an approval went
+  stale, CI flaked, a spawn died. Cost that says nothing about the issue's
+  size.
+
+Folding the last two together makes a flaky week read as a hard one. Four
+additive optional fields close it (no `schema_version` bump):
+
+| Field | Type | Source | Notes |
+|---|---|---|---|
+| `attempt_index` | integer (1-based) | This host's durable `sweep-outcome-telemetry.jsonl`: prior records with the same `repo` + `issue`, counted at the terminal transition. | `1` is the first attempt. Omitted — never `1` — when the journal could not be read or the repo slug did not resolve, so "first attempt" and "nobody counted" stay distinguishable. |
+| `previous_sweep_id` | string | The immediately preceding attempt's `sweep_id` from the same read. | The link that makes an issue's attempt chain walkable without a self-join on timestamps. Absent on attempt 1, and absent whenever `attempt_index` is. |
+| `trigger` | string (see the table below) | The **predecessor's** own terminal state (`disposition`, falling back to `result` + `failure_class` on a pre-#9441 line), refined by this attempt's own `rework_events` where the predecessor did not fail. | Why this sweep was dispatched. Absent under the same condition as `attempt_index`. |
+| `rework_events` | array of `{ "kind", "classification", "reason"?, "duration_sec"? }` | The **same PR label-timeline read** that already produces `doctor_cycles` / `judge_verdicts` (#8222) — a second fold over events already in hand, so **no extra forge round trip**. | Rework observed *inside* this sweep, in opening order. `[]` means "the timeline was read and there was no rework" — the clean-landing shape. An absent key means nobody looked. |
+
+**`attempt_index`'s denominator is this host, deliberately.** An issue fought
+across several hosts reports each host's own attempt count, and retention
+(5 MiB / 30 days) bounds it further. A fleet-wide index is a
+`ROW_NUMBER() OVER (PARTITION BY repo, issue ORDER BY ts)` on the backend,
+where every host's records are in one table; synthesizing one from a single
+host's partial view would be wrong in a way nothing downstream could detect.
+
+##### The classification table (normative)
+
+Every value on both axes is either substantive, environmental, or explicitly
+**neither**. The third bucket is not a rounding error — folding an
+unattributable retry into either rework total is exactly the failure this field
+exists to prevent.
+
+`rework_events[].kind` — in-sweep rework, and the label sequence each is read
+from:
+
+| `kind` | label sequence | class |
+|---|---|---|
+| `rejudge` | `loom:changes-requested` → a later `loom:review-requested` | **substantive** |
+| `stale_base_rejudge` | `loom:pr` → a later `loom:review-requested`, with no change request in between | **environmental** |
+| `merge_conflict` | `loom:merge-conflict` | **environmental** |
+| `ci_rerun` | `loom:ci-failure` | **environmental** |
+| `rebase` | *(not yet emitted — see below)* | **environmental** |
+
+The first two rows are the split this field exists for. Both are "the Judge
+looked again", and a naive count of `loom:review-requested` arrivals merges
+them — but one means *a reviewer faulted the work* and the other means *an
+approval was invalidated by something nobody faulted* (the base moved, or its
+required checks went stale under #8248).
+
+`trigger` — why the sweep was dispatched:
+
+| `trigger` | meaning | class |
+|---|---|---|
+| `first` | No prior attempt in this host's journal. | *neither* — this is the clean bucket's denominator |
+| `retry_after_env_failure` | The predecessor died of an environmental fault (spawn/pre-flight death, account or credit exhaustion, rate limit, harness execution error) or was cancelled. | **environmental** |
+| `retry_after_substantive_failure` | The predecessor failed at the work: Judge rejection, exhausted Doctor loop, a Builder that could not finish. | **substantive** |
+| `doctor_after_changes_requested` | Dispatched to act on a Judge change request. | **substantive** |
+| `merge_conflict` | Dispatched against a PR that conflicted with its base. | **environmental** |
+| `stale_base_rejudge` | Dispatched because an already-approved PR had to go back to the Judge with no change request against it. | **environmental** |
+| `ci_failure_fix` | Dispatched to fix or re-run failing CI. | **environmental** |
+| `rebase_main_moved` | Dispatched because main moved and the branch needed a rebase. *(not yet emitted — see below)* | **environmental** |
+| `operator_redispatch` | The predecessor reached a **non-failure** terminal state and something re-dispatched the issue anyway. | *neither* |
+| `unknown` | A prior attempt exists but nothing observable says why this one followed it. | *neither* |
+
+`operator_redispatch` is named for the *shape* — a decision rather than a retry
+after a fault — not for a confirmed actor: this host's journal cannot separate
+an operator `dispatch_sweep` from a work-finder re-offer from the #9441 no-op
+re-dispatch storm, and deliberately does not guess. That is why it classifies
+as neither.
+
+##### Precedence, and why in-sweep rework never rewrites a fault
+
+A **failed** predecessor always wins: a sweep retried after a spawn death that
+then hits a merge conflict was *dispatched* for the spawn death, and the
+conflict is recorded on the `rework_events` axis instead. Only where the
+predecessor did **not** fail — it landed a PR, was a no-op, or the Curator
+disposed of it — does this attempt's own rework name the trigger (conflict >
+rebase > stale-base re-judge > CI > Doctor pass), falling back to
+`operator_redispatch`. Without that ordering, in-sweep rework would silently
+overwrite the dispatch reason and the two axes would stop being independent.
+
+##### Agreement with `doctor_cycles` is a contract
+
+A `rejudge` event is emitted under **exactly** the condition #8222 counts a
+completed Doctor cycle: a `loom:changes-requested` arrival that a later
+`loom:review-requested` arrival closed the loop on. A rejection nobody handed
+back is a verdict, not a cycle, and likewise not a rework event. So
+`rework_events` filtered to `rejudge` always has the same length as
+`doctor_cycles`; a consumer can never see the two disagree.
+
+##### Openness is reported, not smoothed
+
+A conflict or CI failure still unresolved when the timeline ends is emitted
+with **no** `duration_sec` — the rework happened (the label is the proof) but
+its clearing event was never observed. A `0` there would report a conflict that
+cost nothing. Same "unknown != zero" discipline as everything else here.
+
+##### Not yet emitted: `rebase` / `rebase_main_moved`
+
+A clean rebase leaves no forge-visible trace, so the only site that knows it
+happened is the merge path's own stale-base handling in `merge-pr.sh`. Both
+names are reserved in the vocabulary — and carried by the classification table
+and the committed effort query — so the day that writer lands it is an emit
+site, not a schema change. Nothing in this daemon produces either value today,
+and a consumer should read their absence as "not instrumented", not as "never
+happens".
+
+##### Where lineage is, and is not, published
+
+- **`sweep.outcome`** — all four fields, as above.
+- **The terminal sweep span** — `loom.attempt_index`, `loom.previous_sweep_id`,
+  `loom.trigger`, plus `loom.rework_substantive` / `loom.rework_environmental`
+  as counts (a span attribute is a flat value, and the split is what a query
+  groups on).
+- **The `sweep.outcome` OTLP log record** — the same five attributes.
+- **`sweep.started` — deliberately NOT.** That record is emitted by the live
+  event-bus collector, which has neither a workspace root nor the durable
+  journal in scope (the same reason `tokens_by_model` is `None` there). Adding
+  a second, weaker derivation at dispatch time would give two lineages that can
+  disagree; a consumer that wants a started record's lineage joins its
+  `sweep_id` to the outcome record, which is exact.
+
+None of the four is added to the public redaction allowlist, for the same
+reason `failure_class` and `disposition` are not: they are a finer reading of
+how a private repo's work went.
+
+##### The committed effort query
+
+`defaults/observability/issue-effort-queries.sql` (IE1–IE5) splits per-issue
+effort into clean / substantive-rework / environmental-rework for any window,
+over the same `sweep.outcome` rows. IE1 is the headline split; IE2 ranks the
+issues whose cost was mostly environmental; IE3 reports the fleet-wide
+attempt-count distribution; IE4 breaks the rework down by `kind`; IE5 is the
+coverage check — what fraction of attempts the classification can actually
+attribute, which is the number that must be read *before* trusting the other
+four.
+
+The queries are **executed** in CI, not merely text-checked:
+`loom-daemon/tests/issue_effort_sqlite.rs` runs the committed file verbatim on
+the bundled SQLite against the `records` DDL from
+`dashboard/migrations/0001_init.sql` and asserts the split, while
+`issue_effort_artifacts.rs` pins the vocabulary against
+`telemetry/lineage.rs`'s own `as_str()` arms so this table, the enum and the
+SQL cannot drift apart.
 
 `config.token_account` (Issue #8056) is now resolved from three sources at
 emit time rather than one: the live registry entry, then a re-parse of the

@@ -6,6 +6,15 @@ use super::*;
 /// #8222) — the source of the record's `judge_verdicts` and `doctor_cycles`.
 pub(crate) mod label_timeline;
 
+/// In-sweep rework events reconstructed from the SAME label timeline (Issue
+/// #9444) — the source of the record's `rework_events`.
+pub(crate) mod rework;
+
+/// Attempt lineage derived from this host's durable outcome journal (Issue
+/// #9444) — the source of the record's `attempt_index`, `previous_sweep_id`
+/// and `trigger`.
+pub(crate) mod lineage;
+
 /// The Curator complexity-tier signal read off the sweep's issue body (Issue
 /// #8542) — the source of the record's `complexity`.
 pub(crate) mod complexity_signal;
@@ -750,10 +759,19 @@ impl SweepRegistry {
         // `[]`: `Some(0)`/`Some([])` mean "the timeline was read and there was
         // nothing", which #8057's summary must be able to tell apart from "not
         // observed".
+        //
+        // Issue #9444 rides the same single read: `rework_events` is a second
+        // fold over the very same `labeled` events, so it is present exactly
+        // when the other two are and costs no extra forge round trip.
         let timeline = pr_number.and_then(|pr| self.fetch_timeline_signals(pr));
-        let (doctor_cycles, judge_verdicts) = timeline.map_or((None, None), |signals| {
-            (Some(signals.doctor_cycles), Some(signals.judge_verdicts))
-        });
+        let (doctor_cycles, judge_verdicts, rework_events) =
+            timeline.map_or((None, None, None), |signals| {
+                (
+                    Some(signals.doctor_cycles),
+                    Some(signals.judge_verdicts),
+                    Some(signals.rework_events),
+                )
+            });
 
         // Curator complexity tier (Issue #8542) plus the issue's own end state
         // (Issue #9441), read off the sweep's own issue in ONE REST call — see
@@ -781,6 +799,33 @@ impl SweepRegistry {
                 doctor_cycles,
                 issue_end_state,
             });
+
+        // Attempt lineage (Issue #9444): where this sweep sits in its issue's
+        // attempt chain on THIS host, and why it followed its predecessor. A
+        // pure derivation over the durable journal this registry already
+        // writes — no forge call, no counter state — and deliberately absent
+        // in full (all three fields) when the journal could not be read or the
+        // repo slug did not resolve, so "attempt 1" and "nobody counted" stay
+        // distinguishable. See `lineage`'s module doc for the per-host and
+        // retention limits this denominator carries.
+        //
+        // Read through `config.resolve_outcome_telemetry_path()` — the SAME
+        // resolver the append below uses, never `default_outcome_telemetry_path`
+        // directly. An operator/test override of the journal path would
+        // otherwise make this read a file nothing writes, and every sweep would
+        // silently report `attempt_index: 1` forever: a plausible wrong number,
+        // which is the failure mode this field exists to end.
+        let lineage = repo.as_deref().map(|slug| {
+            lineage::derive_lineage(
+                &crate::sweep_outcomes::read_all_sweep_outcomes(
+                    &self.config.resolve_outcome_telemetry_path(),
+                ),
+                slug,
+                issue,
+                sweep_id,
+                rework_events.as_deref().unwrap_or_default(),
+            )
+        });
 
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
@@ -812,6 +857,10 @@ impl SweepRegistry {
                 .and_then(|r| r.provider.clone()),
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
             complexity,
+            attempt_index: lineage.as_ref().map(|l| l.attempt_index),
+            previous_sweep_id: lineage.as_ref().and_then(|l| l.previous_sweep_id.clone()),
+            trigger: lineage.as_ref().map(|l| l.trigger),
+            rework_events,
         };
         // Issue #9441: both disposition invariants hold on every record this
         // daemon writes. A debug assertion rather than a runtime guard — the
@@ -880,6 +929,29 @@ impl SweepRegistry {
         }
         if let Some(cycles) = outcome_record.doctor_cycles {
             metadata.insert("loom.doctor_cycles".into(), cycles.to_string());
+        }
+        // #9444: the attempt-lineage axis on the span too, so a trace query can
+        // ask "how many attempts did this issue take, and how much of that was
+        // environmental?" without joining the journal. The two rework counts
+        // are stamped as counts rather than as the event list: a span attribute
+        // is a flat value, and the split is what a query groups on.
+        if let Some(index) = outcome_record.attempt_index {
+            metadata.insert("loom.attempt_index".into(), index.to_string());
+        }
+        if let Some(previous) = outcome_record.previous_sweep_id.as_deref() {
+            metadata.insert("loom.previous_sweep_id".into(), previous.to_string());
+        }
+        if let Some(trigger) = outcome_record.trigger {
+            metadata.insert("loom.trigger".into(), trigger.as_str().to_string());
+        }
+        if let Some(events) = outcome_record.rework_events.as_deref() {
+            for (key, class) in [
+                ("loom.rework_substantive", telemetry::ReworkClass::Substantive),
+                ("loom.rework_environmental", telemetry::ReworkClass::Environmental),
+            ] {
+                let count = events.iter().filter(|e| e.classification == class).count();
+                metadata.insert(key.into(), count.to_string());
+            }
         }
         // #9443: the same per-phase numbers `phase_durations` carries, on the
         // execution's own `loom.role_attempt` spans, so the D1/JSONL path and
@@ -1312,3 +1384,16 @@ mod writeback_tests;
     unused_imports
 )]
 mod disposition_tests;
+
+// End-to-end tests for the #9444 attempt-lineage / rework fields as they land
+// on a real journal record, in their own sibling file for the same file-size
+// reason as `timeline_tests` above. The two derivations' own pure tests live
+// with them, in `lineage` and `rework`.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod lineage_tests;

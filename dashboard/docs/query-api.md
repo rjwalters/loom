@@ -294,7 +294,11 @@ non-integer), or `cursor` (non-positive or non-integer) returns `400` with a
   survives in **projected** form (Issue #9443): each entry keeps
   `phase`/`duration_sec`/`attempt` and drops the per-phase
   `tokens_in`/`tokens_out`/`tokens_by_model`, which are the same withheld
-  workload detail in finer-grained form. `host.health` records
+  workload detail in finer-grained form. Issue #9444's four attempt-lineage
+  fields — `attempt_index`/`previous_sweep_id`/`trigger`/`rework_events` — are
+  likewise absent from the private allowlist: how many attempts a private
+  repo's issue took, and how much of that was rework, is a finer reading of
+  its work than `result` is. `host.health` records
   (host-level, no `repo` reference) are never redacted on either route.
 
   `tokens.snapshot` is the one kind whose *shape* differs by route. `/api/*`

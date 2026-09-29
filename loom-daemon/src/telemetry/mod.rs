@@ -59,6 +59,7 @@ pub mod ci;
 pub mod disposition;
 mod envelope;
 pub mod kinds;
+pub mod lineage;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
@@ -71,6 +72,10 @@ pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use disposition::{classify_disposition, DispositionSignals, IssueEndState, SweepDisposition};
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{TelemetryKindMeta, TelemetryKindOtlp, NEW_KIND_SCHEMA_VERSION, TELEMETRY_KINDS};
+pub use lineage::{
+    derive_trigger, AttemptLineage, PriorAttempt, ReworkClass, ReworkEvent, ReworkKind,
+    SweepTrigger, MAX_REWORK_EVENTS,
+};
 pub use ops::MetricPointsRecord;
 pub use queue_snapshot::QueueSnapshotRecord;
 
@@ -770,6 +775,60 @@ pub struct SweepOutcomeRecord {
     /// masquerading as data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complexity: Option<String>,
+    /// 1-based position of this sweep in its issue's attempt sequence **on
+    /// this host's journal** (Issue #9444), this sweep included: `1` is the
+    /// first attempt, `2` the first retry.
+    ///
+    /// Derived at the terminal transition by counting prior `sweep.outcome`
+    /// records with the same `repo` + `issue` in the durable local journal
+    /// (bounded at 5 MiB / 30 days — see [`crate::sweep_outcomes`]). No new
+    /// state and no forge call.
+    ///
+    /// **The denominator is per-host, and that is the honest one to publish**:
+    /// an issue fought across several hosts reports each host's own attempt
+    /// count, never a fleet one. A fleet-wide index is a
+    /// `ROW_NUMBER() OVER (PARTITION BY repo, issue ORDER BY ts)` on the
+    /// backend, where every host's records are in one table; fabricating it
+    /// here from a partial view would be wrong in a way nothing could detect.
+    ///
+    /// Omitted — never `1` — when the journal could not be read: "this is the
+    /// first attempt" and "nobody counted" must stay distinguishable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_index: Option<u32>,
+    /// The `sweep_id` of the attempt immediately preceding this one for the
+    /// same `repo` + `issue` (Issue #9444) — the link that makes an issue's
+    /// attempt chain walkable without a self-join on timestamps.
+    ///
+    /// Absent on `attempt_index: 1` (there is no predecessor) and absent
+    /// whenever `attempt_index` is, for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_sweep_id: Option<String>,
+    /// Why this sweep was dispatched (Issue #9444) — see
+    /// [`SweepTrigger`] for the vocabulary and
+    /// [`SweepTrigger::classification`] for which values count as substantive
+    /// rework, which as environmental, and which as neither.
+    ///
+    /// Derived from the predecessor's own terminal state (its `disposition`,
+    /// falling back to `result` + `failure_class` on a pre-#9441 line) plus,
+    /// where the predecessor did not fail, the rework this attempt itself
+    /// observed. Omitted under the same condition as `attempt_index`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<SweepTrigger>,
+    /// Rework observed **inside** this sweep (Issue #9444), in lifecycle
+    /// order, each carrying its own substantive/environmental classification.
+    ///
+    /// Read off the same PR label timeline as
+    /// [`doctor_cycles`](Self::doctor_cycles) / [`judge_verdicts`](Self::judge_verdicts)
+    /// — no extra forge round trip — so it is absent under exactly the same
+    /// conditions those two are: no PR, `skip_label_flip`, the rate-limit
+    /// breaker, or a failed read.
+    ///
+    /// `Some([])` means "the timeline was read and there was no rework" — the
+    /// clean-landing shape, and a load-bearing observation. An **absent** key
+    /// means nobody looked. A consumer that coerces absent to `[]` counts an
+    /// unobserved sweep as a rework-free one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rework_events: Option<Vec<ReworkEvent>>,
 }
 
 impl SweepOutcomeRecord {

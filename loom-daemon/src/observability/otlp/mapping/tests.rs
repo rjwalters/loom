@@ -5,8 +5,9 @@
 
 use super::*;
 use crate::telemetry::{
-    HostHealthRecord, PhaseDuration, SweepCompletedRecord, SweepDisposition, SweepOutcomeRecord,
-    SweepPhaseRecord, SweepStartedRecord, TokenAccountState, TokenSnapshotRecord,
+    HostHealthRecord, PhaseDuration, ReworkEvent, ReworkKind, SweepCompletedRecord,
+    SweepDisposition, SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, SweepTrigger,
+    TokenAccountState, TokenSnapshotRecord,
 };
 
 fn ts() -> DateTime<Utc> {
@@ -132,6 +133,15 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             doctor_cycles: None,
             judge_verdicts: None,
             complexity: None,
+            // Issue #9444: a fully-observed lineage, so the OTLP attribute
+            // mapping for the new axis is exercised rather than only skipped.
+            attempt_index: Some(2),
+            previous_sweep_id: Some("sweep-issue-4858-prev".to_string()),
+            trigger: Some(SweepTrigger::RetryAfterEnvFailure),
+            rework_events: Some(vec![
+                ReworkEvent::new(ReworkKind::MergeConflict, None, Some(1_800)),
+                ReworkEvent::new(ReworkKind::Rejudge, None, Some(900)),
+            ]),
         }),
     )
 }
@@ -324,6 +334,44 @@ fn sweep_outcome_flattens_config_and_nests_phase_durations() {
         }
         other => panic!("expected loom.phase_durations to be an ArrayValue, got {other:?}"),
     }
+}
+
+/// Issue #9444: the attempt-lineage axis reaches the OTLP log record. The two
+/// rework figures are exported as **counts** rather than as the event list,
+/// because a metric query aggregates a flat attribute and the
+/// substantive/environmental split is exactly what it groups on.
+#[test]
+fn sweep_outcome_carries_the_attempt_lineage_and_rework_split() {
+    let batch = vec![sweep_outcome_envelope()];
+    let request = build_logs_request(&batch).unwrap();
+    let log_record = &request.resource_logs[0].scope_logs[0].log_records[0];
+    let get = |key: &str| {
+        log_record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    assert_eq!(get("loom.attempt_index"), Some(any_value::Value::IntValue(2)));
+    assert_eq!(
+        get("loom.previous_sweep_id"),
+        Some(any_value::Value::StringValue("sweep-issue-4858-prev".to_string()))
+    );
+    assert_eq!(
+        get("loom.trigger"),
+        Some(any_value::Value::StringValue("retry_after_env_failure".to_string()))
+    );
+    assert_eq!(
+        get("loom.rework_environmental"),
+        Some(any_value::Value::IntValue(1)),
+        "the merge_conflict event"
+    );
+    assert_eq!(
+        get("loom.rework_substantive"),
+        Some(any_value::Value::IntValue(1)),
+        "the rejudge event"
+    );
 }
 
 #[test]

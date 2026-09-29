@@ -391,6 +391,10 @@ mod tests {
             provider: None,
             profile: None,
             complexity: Some("complex".to_string()),
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
         }
     }
 
