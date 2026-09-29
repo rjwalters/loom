@@ -84,6 +84,8 @@
 # no loom: label` query) stays in judge.md — this is deliberately a single-PR
 # gate, called once per candidate in the fallback walk.
 
+# requires-daemon: forge optional   #9537 — `forge is-fleet` answers "is this PR author one of Loom's own Apps"; with no daemon, or one that predates the verb (clap exits 2), is_fleet_author falls back to the exact `app/loom-fleet-dispatch(-N)` pattern, so an old binary degrades to the pre-#9537 behaviour (plus the numbered members), never to a failure.
+
 set -euo pipefail
 
 CAP=20
