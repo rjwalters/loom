@@ -55,7 +55,7 @@ fn sweep_phase() -> TelemetryRecord {
 
 fn sweep_completed() -> TelemetryRecord {
     TelemetryRecord::SweepCompleted(SweepCompletedRecord {
-        repo: "rjwalters/loom".to_string(),
+        repo: Some("rjwalters/loom".to_string()),
         visibility: RepoVisibility::Public,
         issue: 4703,
         sweep_id: "sweep-issue-4703-0".to_string(),
@@ -78,7 +78,8 @@ fn sweep_outcome() -> TelemetryRecord {
     let mut config = std::collections::BTreeMap::new();
     config.insert("runtime".to_string(), "claude".to_string());
     TelemetryRecord::SweepOutcome(SweepOutcomeRecord {
-        repo: "rjwalters/loom".to_string(),
+        repo: Some("rjwalters/loom".to_string()),
+        repo_unresolved: false,
         visibility: RepoVisibility::Public,
         issue: 4703,
         sweep_id: "sweep-issue-4703-0".to_string(),
@@ -233,7 +234,8 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
     // sampled, so all four must be entirely absent from the wire
     // payload — never `null` or a fabricated `0`.
     let record = SweepOutcomeRecord {
-        repo: "rjwalters/loom".to_string(),
+        repo: Some("rjwalters/loom".to_string()),
+        repo_unresolved: false,
         visibility: RepoVisibility::Private,
         issue: 5357,
         sweep_id: "sweep-issue-5357-0".to_string(),
@@ -343,7 +345,8 @@ fn sweep_outcome_from_a_pre_5357_daemon_still_decodes() {
 #[test]
 fn sweep_outcome_round_trips_the_completeness_fields() {
     let record = SweepOutcomeRecord {
-        repo: "rjwalters/loom".to_string(),
+        repo: Some("rjwalters/loom".to_string()),
+        repo_unresolved: false,
         visibility: RepoVisibility::Public,
         issue: 8056,
         sweep_id: "sweep-issue-8056-0".to_string(),
@@ -400,7 +403,8 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
     // (#8057's doctor-phase rate) would silently count the second as the
     // first.
     let base = SweepOutcomeRecord {
-        repo: "rjwalters/loom".to_string(),
+        repo: Some("rjwalters/loom".to_string()),
+        repo_unresolved: false,
         visibility: RepoVisibility::Private,
         issue: 8056,
         sweep_id: "sweep-issue-8056-1".to_string(),
@@ -524,7 +528,7 @@ fn sweep_completed_carries_tokens_by_model_when_present() {
 #[test]
 fn sweep_completed_omits_tokens_by_model_when_absent() {
     let record = SweepCompletedRecord {
-        repo: "rjwalters/loom".to_string(),
+        repo: Some("rjwalters/loom".to_string()),
         visibility: RepoVisibility::Private,
         issue: 6384,
         sweep_id: "sweep-issue-6384-0".to_string(),
@@ -976,4 +980,91 @@ fn host_health_from_a_pre_5352_daemon_decodes_with_protection_absent() {
         }
         other => panic!("expected HostHealth, got {other:?}"),
     }
+}
+
+#[test]
+fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
+    // Issue #9442: `repo` is ALWAYS an `owner/name` forge slug, never a local
+    // path. A resolved record carries `repo` and does NOT carry
+    // `repo_unresolved` (byte-compatible with a pre-#9442 record); an
+    // unresolved one omits `repo` entirely and stamps `repo_unresolved: true`
+    // — the gap is counted, never papered over with a host path.
+    let resolved = SweepOutcomeRecord {
+        repo: Some("rjwalters/loom".to_string()),
+        repo_unresolved: false,
+        visibility: RepoVisibility::Public,
+        issue: 9442,
+        sweep_id: "sweep-issue-9442-0".to_string(),
+        model: None,
+        effort: None,
+        config: std::collections::BTreeMap::new(),
+        phase_durations: Vec::new(),
+        total_duration_sec: 60,
+        result: SweepResult::Success,
+        pr_number: None,
+        tokens_in: None,
+        tokens_out: None,
+        lines_added: None,
+        lines_deleted: None,
+        tokens_by_model: None,
+        failure_class: None,
+        models_used: None,
+        doctor_cycles: None,
+        judge_verdicts: None,
+        runtime: None,
+        provider: None,
+        profile: None,
+        complexity: None,
+    };
+    let value = serde_json::to_value(&resolved).unwrap();
+    assert_eq!(value["repo"], "rjwalters/loom");
+    assert!(
+        value.get("repo_unresolved").is_none(),
+        "a resolved record must not carry the unresolved flag: {value}"
+    );
+    let decoded: SweepOutcomeRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded, resolved);
+
+    let unresolved = SweepOutcomeRecord {
+        repo: None,
+        repo_unresolved: true,
+        ..resolved.clone()
+    };
+    let value = serde_json::to_value(&unresolved).unwrap();
+    assert!(
+        value.get("repo").is_none(),
+        "an unresolved record must OMIT repo, never null, never a path: {value}"
+    );
+    assert_eq!(value["repo_unresolved"], true);
+    let decoded: SweepOutcomeRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded, unresolved);
+
+    // A pre-#9442 line — a plain string `repo`, no flag — still parses; its
+    // `repo_unresolved` defaults to false. (Historical lines with path-shaped
+    // repos keep their values; the fix is at the emitters, not the readers.)
+    let legacy: SweepOutcomeRecord = serde_json::from_value(serde_json::json!({
+        "visibility": "public",
+        "issue": 9441,
+        "sweep_id": "sweep-issue-9441-0",
+        "total_duration_sec": 10,
+        "result": "failure",
+        "repo": "/Users/someone/GitHub/somewhere"
+    }))
+    .unwrap();
+    assert_eq!(legacy.repo.as_deref(), Some("/Users/someone/GitHub/somewhere"));
+    assert!(!legacy.repo_unresolved);
+}
+
+#[test]
+fn is_path_shaped_repo_flags_paths_and_empty_only() {
+    // Issue #9442's one predicate, shared by the journal emitter and the
+    // event-bus collector.
+    assert!(super::is_path_shaped_repo("/Users/someone/GitHub/repo"));
+    assert!(super::is_path_shaped_repo("/home/ubuntu/workspaces/repo"));
+    assert!(super::is_path_shaped_repo(""));
+    assert!(!super::is_path_shaped_repo("rjwalters/loom"));
+    assert!(!super::is_path_shaped_repo("2AMLogic/2am"));
+    // A relative workspace name is not an absolute host path; it is also not
+    // a slug, but the predicate's job is only to catch the leak shape.
+    assert!(!super::is_path_shaped_repo("issue-9442"));
 }

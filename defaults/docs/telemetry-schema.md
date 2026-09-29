@@ -404,6 +404,33 @@ result, PR number, and (Issue #5357) the sweep's work-output — tokens
 processed and lines changed. (A distinct type from the daemon's internal
 `sweep_outcomes::OutcomeRecord`, which #4704 maps this into for its journal.)
 
+#### The `repo` contract (Issue #9442)
+
+`repo` — on `sweep.outcome` and `sweep.completed` — is **always an
+`owner/name` forge slug, or absent; never a local filesystem path**. When the
+emitter cannot resolve the workspace's slug, the record omits `repo` and
+carries `"repo_unresolved": true` instead (present only when unresolved — a
+resolved record is byte-identical to a pre-#9442 one). Resolution order at
+the outcome-journal emitter: the `LOOM_REPO` override, then `gh repo view`
+(breaker-gated, fail-open); a `skip_label_flip` run — which gates every forge
+read at that site — uses the `LOOM_REPO` override alone and keeps `visibility:
+private`. The live event-bus collector resolves a path-shaped event value
+locally from `git remote get-url origin` (parsed HTTPS/SSH URL — no network),
+stamping `repo_unresolved` when that too fails.
+
+Why: pre-#9442 records fell back to the workspace's display path on any
+resolution failure — 71 of 134 distinct `repo` strings in the fleet D1 store
+were host paths — which leaked host usernames/layout into fleet-wide views
+and forced every per-repo query to carry a basename normalization step (a
+basename collision across orgs silently merges two repos). Consumers should
+treat absent-`repo` + `repo_unresolved: true` as a countable "unattributed"
+bucket, never guess from the record's other fields. The OTLP mapping mirrors
+this: `loom.repo` only when the slug resolved, plus `loom.repo_unresolved`
+when it did not.
+
+Pre-#9442 journal lines — including path-shaped ones — still parse (`repo`
+is `#[serde(default)]`); the fix is at the emitters, not the readers.
+
 ```json
 {
   "kind": "sweep.outcome",

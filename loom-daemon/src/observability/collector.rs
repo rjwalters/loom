@@ -52,10 +52,10 @@ use chrono::{DateTime, Utc};
 
 use crate::event_bus::{EventBus, RecvError};
 use crate::telemetry::{
-    visibility::derive_visibility, AdmissionBrakeSummary, HostHealthRecord, HostProtectionSummary,
-    ManagedRepoEntry, PhaseDuration, RepoVisibility, RoleTickFailureEntry, RoleTickHealth,
-    SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord, TokenAccountState,
-    TokenSnapshotRecord,
+    is_path_shaped_repo, visibility::derive_visibility, AdmissionBrakeSummary, HostHealthRecord,
+    HostProtectionSummary, ManagedRepoEntry, PhaseDuration, RepoVisibility, RoleTickFailureEntry,
+    RoleTickHealth, SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord,
+    TokenAccountState, TokenSnapshotRecord,
 };
 use crate::tokens_pool::{account_inventory, health_snapshot, AccountProvider};
 use crate::types::{Event, RoleTickRecord, SweepKind};
@@ -428,6 +428,12 @@ fn unknown_sweep_id(issue: u32) -> String {
 
 /// Build the paired `sweep.completed` + `sweep.outcome` records a terminal
 /// event yields.
+///
+/// Issue #9442: the event's `repo` is the registry's workspace path, which is
+/// never written to telemetry. A path-shaped value is resolved locally —
+/// `git remote get-url origin` parsed to `owner/name` — and a slug that still
+/// will not resolve leaves `repo` absent with `repo_unresolved` set, on both
+/// records.
 fn terminal_records(
     repo: &str,
     visibility: RepoVisibility,
@@ -437,10 +443,17 @@ fn terminal_records(
     total_duration_sec: i64,
     pr_number: Option<u32>,
 ) -> Vec<TelemetryRecord> {
+    let (repo, repo_unresolved) = if is_path_shaped_repo(repo) {
+        crate::init::git::extract_repo_info(Path::new(repo))
+            .map(|(o, r)| (Some(format!("{o}/{r}")), false))
+            .unwrap_or((None, true))
+    } else {
+        (Some(repo.to_string()), false)
+    };
     let completed_at = Utc::now();
     vec![
         TelemetryRecord::SweepCompleted(crate::telemetry::SweepCompletedRecord {
-            repo: repo.to_string(),
+            repo: repo.clone(),
             visibility,
             issue,
             sweep_id: sweep_id.clone(),
@@ -458,7 +471,8 @@ fn terminal_records(
             tokens_by_model: None,
         }),
         TelemetryRecord::SweepOutcome(crate::telemetry::SweepOutcomeRecord {
-            repo: repo.to_string(),
+            repo,
+            repo_unresolved,
             visibility,
             issue,
             sweep_id,

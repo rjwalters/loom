@@ -98,7 +98,8 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepOutcome(SweepOutcomeRecord {
-            repo: "rjwalters/loom".to_string(),
+            repo: Some("rjwalters/loom".to_string()),
+            repo_unresolved: false,
             visibility: RepoVisibility::Public,
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),

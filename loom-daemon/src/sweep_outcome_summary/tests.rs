@@ -19,7 +19,8 @@ fn record(
     duration: i64,
 ) -> SweepOutcomeRecord {
     SweepOutcomeRecord {
-        repo: repo.to_string(),
+        repo: Some(repo.to_string()),
+        repo_unresolved: false,
         visibility: RepoVisibility::Private,
         issue: 1,
         sweep_id: sweep_id.to_string(),
