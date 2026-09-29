@@ -305,6 +305,26 @@ impl JobJson {
 /// The instant a run attempt's **first** job was created — the zero point
 /// every job's [`JobJson::dependency_wait_ms`] is measured from (#9089).
 ///
+/// # Scoped to ONE attempt, never to the listing
+///
+/// The poller lists jobs with `filter=all`, which is GitHub's "include jobs
+/// from old executions of this run" mode — so on a re-run that one response
+/// carries **every** attempt's jobs. A baseline taken as the `min` over the
+/// whole listing would charge attempt 2 with the entire inter-attempt gap as
+/// though it were a `needs:` wait. Measured against this repo's real runs:
+/// `36456576713` reports attempt 1's earliest `created_at` at
+/// `2026-09-28T17:13:13Z` and attempt 2's at `17:52:23Z` (39m10s apart), and
+/// `36435114396` reports `14:19:32Z` vs `16:43:44Z` (2h24m apart). Every
+/// attempt-2 job would then report that gap instead of ~0, and section 15's
+/// "`p90_dep_s` above `p90_queue_s` means gated, not capacity-starved" alert
+/// would fire on every re-run.
+///
+/// So construct one only through [`JobCreationBaseline::of_attempt`], or —
+/// when handling a whole listing — through [`JobCreationBaselines`], whose
+/// [`JobCreationBaselines::for_job`] measures each job against **its own**
+/// attempt (`job.run_attempt`, the same per-job attempt `UnitKey::job` keys
+/// on — not the run row's).
+///
 /// # Why the first job, not the run row
 ///
 /// GitHub creates a `needs:`-gated job only once its predecessors finish, so a
@@ -334,18 +354,64 @@ impl JobJson {
 pub struct JobCreationBaseline(Option<DateTime<Utc>>);
 
 impl JobCreationBaseline {
-    /// The earliest `created_at` reported across one run attempt's jobs.
-    /// `None` when GitHub reported none for any of them (a pre-#9089
-    /// recording), which makes every job's dependency wait `None` too.
+    /// The earliest `created_at` reported across the jobs of **one** run
+    /// attempt, ignoring every other attempt in the same `filter=all` listing
+    /// (see the type docs for what mixing them costs). `None` when GitHub
+    /// reported none for any job of that attempt (a pre-#9089 recording),
+    /// which makes every one of its jobs' dependency waits `None` too.
     #[must_use]
-    pub fn of(jobs: &[JobJson]) -> Self {
-        Self(jobs.iter().filter_map(|job| job.created_at).min())
+    pub fn of_attempt(jobs: &[JobJson], attempt: u32) -> Self {
+        Self(
+            jobs.iter()
+                .filter(|job| job.run_attempt == attempt)
+                .filter_map(|job| job.created_at)
+                .min(),
+        )
     }
 
     /// The baseline instant, if one was derivable.
     #[must_use]
     pub fn instant(self) -> Option<DateTime<Utc>> {
         self.0
+    }
+}
+
+/// Every attempt's [`JobCreationBaseline`] for one `filter=all` jobs listing,
+/// computed in a single pass (#9089).
+///
+/// This is what a caller holding a whole listing wants: the listing mixes
+/// attempts, so each job must be measured against its own attempt's first job,
+/// and doing that per job would rescan the listing once per row. Built once
+/// before the per-job pass, it keeps the "computed once per listing" property
+/// while making the attempt scoping impossible to forget — a job whose attempt
+/// is somehow absent gets [`JobCreationBaseline::default()`] ("not measured"),
+/// never another attempt's instant.
+#[derive(Debug, Clone, Default)]
+pub struct JobCreationBaselines(std::collections::HashMap<u32, JobCreationBaseline>);
+
+impl JobCreationBaselines {
+    #[must_use]
+    pub fn of_listing(jobs: &[JobJson]) -> Self {
+        let mut by_attempt: std::collections::HashMap<u32, JobCreationBaseline> =
+            std::collections::HashMap::new();
+        for job in jobs {
+            let Some(created) = job.created_at else {
+                // Still register the attempt: an attempt whose every job lacks
+                // a `created_at` must stay "not measured", not fall through to
+                // another attempt's baseline.
+                by_attempt.entry(job.run_attempt).or_default();
+                continue;
+            };
+            let slot = by_attempt.entry(job.run_attempt).or_default();
+            slot.0 = Some(slot.0.map_or(created, |earliest| earliest.min(created)));
+        }
+        Self(by_attempt)
+    }
+
+    /// The baseline for this job's **own** attempt.
+    #[must_use]
+    pub fn for_job(&self, job: &JobJson) -> JobCreationBaseline {
+        self.0.get(&job.run_attempt).copied().unwrap_or_default()
     }
 }
 
@@ -677,9 +743,10 @@ pub(super) fn visibility_str(visibility: RepoVisibility) -> &'static str {
 /// The envelopes of one completed job's unit: `ci.job`, `ci.duration`
 /// (job), and the `loom.ci.job` span parented to the run span.
 ///
-/// `baseline` is the run attempt's [`JobCreationBaseline`], from which this
-/// job's `dependency_wait_ms` is measured; pass
-/// `JobCreationBaseline::of(&jobs)` for the whole listing, or
+/// `baseline` is **this job's own attempt's** [`JobCreationBaseline`], from
+/// which its `dependency_wait_ms` is measured; pass
+/// `JobCreationBaselines::of_listing(&jobs).for_job(job)` when handling a whole
+/// `filter=all` listing (which mixes attempts), or
 /// `JobCreationBaseline::default()` when only one job is in hand and the
 /// dependency wait is deliberately not being measured.
 #[must_use]

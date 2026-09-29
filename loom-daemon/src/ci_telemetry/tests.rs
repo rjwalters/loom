@@ -34,7 +34,7 @@ use super::journal::Journal;
 use super::ledger::{self, Ledger, UnitDraft, UnitKey};
 use super::poll::{backoff_until, run_cycle, CycleContext, CycleError};
 use super::records::{
-    envelope_identity, job_envelopes, run_envelopes, JobCreationBaseline, JobsPage, RepoJson,
+    envelope_identity, job_envelopes, run_envelopes, JobCreationBaselines, JobsPage, RepoJson,
     RunsPage,
 };
 use super::state::{self, classify as classify_health, Health, PollStatus};
@@ -466,14 +466,14 @@ fn fixture_units(root_repo: &str, run_id: u64) -> Vec<UnitDraft> {
             .clone(),
     )
     .unwrap();
-    // Taken once over the whole listing, exactly as `poll_repo` does.
-    let baseline = JobCreationBaseline::of(&jobs.jobs);
+    // One pass over the whole listing, per attempt, exactly as `poll_repo` does.
+    let baselines = JobCreationBaselines::of_listing(&jobs.jobs);
     let mut units: Vec<UnitDraft> = jobs
         .jobs
         .iter()
         .map(|job| UnitDraft {
             key: UnitKey::job(&repo.full_name, run.id, job.id, job.run_attempt),
-            envelopes: job_envelopes(&repo, &run, job, baseline, "fixture-host"),
+            envelopes: job_envelopes(&repo, &run, job, baselines.for_job(job), "fixture-host"),
         })
         .collect();
     units.push(UnitDraft {

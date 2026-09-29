@@ -660,10 +660,10 @@ segments, and they are now separately reported rather than summed into "the
 run was slow but no job was":
 
 ```
-run_started_at ──── dependency_wait_ms ────▶ created_at
-                                   ──── queued_ms ────▶ started_at
-                                              ──── duration_ms ────▶ completed_at
-  (blocked on `needs:`)      (waiting for a runner)       (doing work)
+attempt's first job created ── dependency_wait_ms ─▶ created_at
+                                        ── queued_ms ─▶ started_at
+                                          ── duration_ms ─▶ completed_at
+    (blocked on `needs:`)   (waiting for a runner)   (doing work)
 ```
 
 **How it is derived.** `created_at` minus the **earliest `created_at` across
@@ -681,8 +681,17 @@ call and no knowledge of the workflow's `needs:` graph.
 (#9007) is time before *any* job existed — and subtracting it per job would
 double-count the run's queue wait into every one of its legs. Taking the
 baseline from the same listing the waits come from keeps the quantity
-internally consistent: the earliest job of a run measures exactly `0`, by
-construction.
+internally consistent: the earliest job of a run attempt measures exactly `0`,
+by construction.
+
+**Scoped to one attempt.** The poller lists jobs with `filter=all` (GitHub's
+"include jobs from old executions of this run" mode), so on a **re-run** that
+one response carries every attempt's jobs — attempt 2's rows are stamped at the
+re-run instant, tens of minutes after attempt 1's. The baseline is therefore
+taken per `run_attempt` and each job is measured against its **own** attempt's
+first job; a baseline spanning the listing would charge attempt 2 the whole
+inter-attempt gap as a `needs:` wait and fire section 15's alert on every
+re-run.
 
 **What it is not.** It does not name *which* dependency a job waited on, and it
 does not split a multi-level `needs:` chain into its links — it is the whole
@@ -690,8 +699,8 @@ closure's elapsed time. For an ungated job it is GitHub's own job-creation lag
 (sub-second in the run above), not a dependency; read a second or two as noise,
 which is why `ci-queries.sql` section 15 reports a `gated_jobs` count beside
 the percentiles. `None` when GitHub reported no `created_at` for the job or for
-any job of its run (a pre-#9089 recording) — never a zero, which would read as
-"waited on nothing".
+any job of its run attempt (a pre-#9089 recording) — never a zero, which would
+read as "waited on nothing".
 
 It is carried on the `ci.job` record and the `loom.ci.job` span only. Step and
 suite spans deliberately do **not** repeat it (unlike the shard trio): it is a
