@@ -1970,7 +1970,13 @@ a key. Only the six keys below order the queue.
    never reads a timeline for an unstarred issue, and removing the star drops the
    cache entry. A missing starred-at falls back to `createdAt`. A star applied
    from loom-ui uses the intent's `requested_at` instead (#9244 C, below). A
-   blocker inheriting a star sorts at that star's position.
+   blocker inheriting a star sorts at that star's position. The cache evicts
+   promptly (any tick that does not list the issue as starred drops its entry),
+   which is deliberate and has two accepted consequences (#9314): a star flipped
+   off and back on entirely *between* two ticks keeps its old starred-at, and an
+   issue that leaves the listing — every `loom:building` claim — is read again
+   when it returns. Both affect ordering among starred issues only; see
+   `StarredAtCache`'s "Accepted staleness" doc comment.
 3. **Red-main fixes first**: an issue whose body carries
    `<!-- loom:main-red-fix -->` at the start of a line, **only while its repo's
    `main` is verified red** (`WorkspaceHealthStates::is_halted`). A marker on a
@@ -2027,6 +2033,26 @@ sweep record carries `overflow: true` (shown in `list_sweeps`,
 `get_sweep_status`, and as `[overflow]` in `loom-daemon status`); the tick counts
 it in `TickReport::dispatched_overflow`, and its ready-queue row reads
 `dispatched this tick (overflow)`.
+
+**The flag survives a daemon restart (#9314).** It is stamped onto the sweep's
+claim lock (`.loom/locks/issue-<N>/owner.json`, `"overflow": true` — written
+only when true) the moment the slot is taken, and `reconstruct()` restores it
+onto the adopted entry. So a restart mid-flight keeps the `[overflow]` marker in
+`status`/`list_sweeps` and keeps the slot accounted as taken, instead of handing
+it to a second starred issue once one normal sweep ends. Two residual gaps, both
+deliberate and both bounded by the same `occupancy <= configured` gate (a host
+never exceeds max+1 either way):
+
+- a sweep adopted from the **machine sweep journal** rather than its lock
+  (`adopt_live_journal_sweeps`, #6262 — the survivor whose lock did *not*
+  survive) comes back without the flag: the journal records no such field, and
+  widening its schema is outside that pass's read-only adopt-only contract;
+- a checkpoint-only recovery is `Crashed`, and only non-terminal entries hold
+  the slot, so it never needs the flag.
+
+If the lock is already gone when the slot is taken (the sweep finished in that
+window), the stamp is skipped with a `warn` — the in-memory mark still governs
+the running daemon.
 
 **Main-health halt admits only fixes.** A repo halted because its `main` is
 verified red still admits its `<!-- loom:main-red-fix -->` candidates, and only

@@ -1212,6 +1212,17 @@ async fn collect_managed_repos(
 ) -> Vec<ManagedRepoEntry> {
     // Each registered workspace's dispatch priority (#9244, loom-ui#153).
     // Best-effort: an unreadable registry just omits `priority`.
+    //
+    // Deliberately re-read per collection rather than cached (Issue #9314).
+    // This runs once per `snapshot_interval` (5 minutes by default), from the
+    // collector task, and reads ONE small local JSON file
+    // (`~/.loom/workspaces.json`) — the same read a dozen other daemon paths
+    // make per tick. Freshness is the point: an operator's `loom-daemon
+    // workspace priority` edit must show up in the next `host.health` sample
+    // without a daemon restart, and `managed_repos` is how the dashboard
+    // renders it. Caching it would trade that for no measurable saving and add
+    // a staleness class (a cached priority outliving the edit) to a field whose
+    // whole job is to report current configuration.
     let priorities: HashMap<PathBuf, u32> =
         crate::workspace_registry::WorkspaceRegistry::load_default()
             .map(|r| {
