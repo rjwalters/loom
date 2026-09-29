@@ -32,6 +32,10 @@ pub enum QueueDisposition {
     DeferredRampCap,
     /// Waiting: the saturation admission brake held new admissions.
     DeferredSaturation,
+    /// Waiting: the build back-off (#9410) held new issue builds because the
+    /// host's review + merge debt is high. Starred and red-main-fix issues
+    /// bypass it, so this row is always an unstarred issue.
+    DeferredBuildBackoff,
     /// Waiting: outside this host's preferred repo slice while the slice still
     /// had work (repo sharding, #6243).
     DeferredOutOfSlice,
@@ -91,12 +95,13 @@ impl QueueDisposition {
     /// ([`Self::LabelledBlocked`] and [`Self::Unknown`] excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
     /// point per entry every tick, zeros included, so an empty queue reads as
     /// `0` rather than as a missing series.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Dispatched,
         Self::InFlight,
         Self::DeferredCapacity,
         Self::DeferredRampCap,
         Self::DeferredSaturation,
+        Self::DeferredBuildBackoff,
         Self::DeferredOutOfSlice,
         Self::DeferredRepoCap,
         Self::WorkspaceHalted,
@@ -127,6 +132,7 @@ impl QueueDisposition {
             Self::DeferredCapacity => "deferred_capacity",
             Self::DeferredRampCap => "deferred_ramp_cap",
             Self::DeferredSaturation => "deferred_saturation",
+            Self::DeferredBuildBackoff => "deferred_build_backoff",
             Self::DeferredOutOfSlice => "deferred_out_of_slice",
             Self::DeferredRepoCap => "deferred_repo_cap",
             Self::WorkspaceHalted => "workspace_halted",
@@ -160,6 +166,7 @@ impl QueueDisposition {
             Self::DeferredCapacity
             | Self::DeferredRampCap
             | Self::DeferredSaturation
+            | Self::DeferredBuildBackoff
             | Self::DeferredOutOfSlice
             | Self::DeferredRepoCap => "ready",
             _ => "blocked",
@@ -175,6 +182,7 @@ impl QueueDisposition {
             Self::DeferredCapacity => "waiting: concurrency cap full",
             Self::DeferredRampCap => "waiting: per-tick admission cap reached",
             Self::DeferredSaturation => "waiting: host saturated (admission brake)",
+            Self::DeferredBuildBackoff => "waiting: build back-off (review/merge debt high)",
             Self::DeferredOutOfSlice => "waiting: outside this host's repo slice",
             Self::DeferredRepoCap => "waiting: this repo is at its per-repo cap",
             Self::WorkspaceHalted => {
@@ -318,6 +326,34 @@ mod tests {
         // does.
         assert_eq!(QueueDisposition::HostClassRefused.state(), "blocked");
         assert_eq!(QueueDisposition::HostClassRefused.as_str(), "host_class_refused");
+    }
+
+    /// Issue #9410: the build back-off disposition round-trips, is a
+    /// capacity-style `ready` wait, and a pre-#9410 tick summary still parses.
+    #[test]
+    fn build_backoff_disposition_round_trips_and_old_summaries_parse() {
+        let d = QueueDisposition::DeferredBuildBackoff;
+        assert_eq!(QueueDisposition::ALL.len(), 24);
+        assert!(QueueDisposition::ALL.contains(&d));
+        let json = serde_json::to_value(d).unwrap();
+        assert_eq!(json, serde_json::json!("deferred_build_backoff"));
+        assert_eq!(serde_json::from_value::<QueueDisposition>(json).unwrap(), d);
+        assert_eq!(d.state(), "ready");
+        assert_eq!(d.reason(), "waiting: build back-off (review/merge debt high)");
+        let gate = serde_json::to_value(crate::types::PlanGate::BuildBackoff).unwrap();
+        assert_eq!(gate, serde_json::json!("build_backoff"));
+
+        let summary: crate::types::WorkFinderTickSummary =
+            serde_json::from_value(serde_json::json!({
+                "at": "2026-09-28T00:00:00Z", "max_concurrent": 2, "seen": 0,
+                "dispatched": 0, "skipped_labeled": 0, "skipped_in_flight": 0,
+                "skipped_quarantined": 0, "skipped_pr_open": 0,
+                "skipped_peer_claim": 0, "skipped_backoff": 0,
+                "deferred_capacity": 0, "deferred_ramp_cap": 0, "errors": 0,
+                "halted": false, "saturation_held": true
+            }))
+            .unwrap();
+        assert_eq!((summary.deferred_build_backoff, summary.build_backoff_held), (0, false));
     }
 
     #[test]

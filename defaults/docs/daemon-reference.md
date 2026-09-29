@@ -2115,7 +2115,8 @@ by `candidate_cmp`, with what the tick did with it:
 - **running**: `dispatched` (detail `overflow` for the host's over-limit
   starred sweep, #9244), `in_flight`
 - **ready** (waiting on a limit): `deferred_capacity`, `deferred_ramp_cap`,
-  `deferred_saturation`, `deferred_out_of_slice`, `deferred_repo_cap`
+  `deferred_saturation`, `deferred_build_backoff` (#9410), `deferred_out_of_slice`,
+  `deferred_repo_cap`
 - **blocked** (held by something specific to the issue or repo): `parked` (with
   the label), `open_pr` (with the PR number), `dispatch_backoff`,
   `open_pr_backoff`, `quarantined`, `noop_cooldown`, `declined`,
@@ -3539,6 +3540,9 @@ bounded reactions follow, purely from that one signal:
 |---|---|---|---|---|
 | Escalating log | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` (5m) | After this many seconds of continuous held+0-in-flight, a `WARN`-level `admission_brake: STARVING …` line fires once per streak, naming the elapsed duration |
 | Escape hatch | `autonomous.workFinder.saturationBrake.starvationEscapeSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS` | `900` (15m) | After this many seconds, the brake yields for **exactly one tick** — held reports `false` even though the raw load reading is still over threshold — logged at `ERROR` as `admission_brake: STARVATION ESCAPE HATCH …` |
+| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410). While engaged, no new unstarred issue build is admitted; starred and red-main-fix issues bypass it. Reads the role runner's demand ledger, so it is inert with the role runner off. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
+| `autonomous.workFinder.buildBackoff.high` | *(config only)* | `40` | Engage when `review + changes + merge` debt is **strictly above** this. Zero, negative or non-integer → default. **Live** |
+| `autonomous.workFinder.buildBackoff.low` | *(config only)* | `25` | Release when the debt is **strictly below** this. Zero, negative or non-integer → default; `low >= high` rejects the pair (both fall back to `40`/`25`, one `WARN`). **Live** |
 
 The escape hatch does not disable the brake or bypass #5270's "dumb mode"
 gate: it is a periodic, bounded safety valve. The starvation streak resets
@@ -3702,7 +3706,11 @@ repository is now the parallelism boundary:
   already makes — the queue-gate listing above, plus one ETag-cached `loom:pr`
   count (`forge_call_stats` caller `role_demand`) after each **admitted**
   champion run — so it adds no forge query per tick per repository. Only PR
-  rows count. A failed listing records nothing, and an entry older than
+  rows count, and the `loom:pr` count leaves out PRs held for a human —
+  those also carrying `loom:blocked`, `loom:operator` or `loom:operator-only`
+  (the set `champion-pr-merge.md` names as not merge-eligible; the critical-file
+  hold is one of them, via `loom:operator`) — because Champion cannot drain
+  them (#9410). The labels come from the same listing rows. A failed listing records nothing, and an entry older than
   `demandWidth.staleSecs` is ignored, so an axis nobody has observed recently is
   **unobserved** and changes nothing. For a PR role,
   `width = clamp(ceil(debt / perRun), 1, min(max, roleMaxConcurrent budget))`
@@ -3741,6 +3749,78 @@ neither field, which parses as `0` active and a `null` ceiling — read `null` a
 **unknown**, not as "unbounded". `loom-daemon calibrate` reports the ceiling
 next to `maxConcurrent` in its "Currently configured" block, and its one-line
 reading appends the worst-case agent sum whenever the role runner is enabled.
+
+#### Build back-off on review and merge debt (#9410)
+
+The work finder's build admission reads no PR debt of its own: with 28 PRs in
+`loom:review-requested` and 59 in `loom:pr`, it would still admit new issue
+builds up to its cap, piling more finished work onto queues Judge and Champion
+are not draining. The **build back-off** is a WIP limit on that debt (Phase 2b
+of #9391). While it is **engaged**, the work finder admits no new unstarred
+issue build; sweeps already in flight are untouched, and the freed host
+resources (token pool, load) go to the role runner's judge / doctor / champion
+runs, which #9392 already sizes to the same debt. It adds no PR dispatch path
+of its own.
+
+- **Input.** Once per multi-workspace tick, the work finder reads the role
+  runner's in-memory demand ledger (see [Concurrent across
+  repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391))
+  with `autonomous.roleRunner.demandWidth.staleSecs`:
+  `debt = review + changes + merge` over the axes with a fresh entry. **No
+  forge call** is added. The merge axis excludes operator-held PRs
+  (`loom:blocked` / `loom:operator` / `loom:operator-only`). The ledger covers
+  only the repositories whose roles this host runs, so the back-off is
+  per-host and two hosts can disagree.
+- **The ledger comes from the role runner. With the role runner off (or
+  `demandWidth.enabled: false`), the ledger stays empty and the back-off is
+  inert.**
+- **Fail open.** A ledger with no fresh entry on any axis never engages, and
+  releases an engaged back-off (logged as `debt unobserved — failing open`). A
+  partly observed ledger sums the axes it has, which can only err toward not
+  engaging.
+- **Hysteresis.** Starting released:
+
+  | Current | Input | Next |
+  |---|---|---|
+  | released | unobserved | released |
+  | released | `debt > high` | **engaged** (edge) |
+  | released | `debt <= high` | released |
+  | engaged | unobserved | **released** (edge, fail open) |
+  | engaged | `debt < low` | **released** (edge) |
+  | engaged | `debt >= low` | engaged |
+  | any | `enabled: false` | released (edge only if it was engaged) |
+
+  So `debt == high` does not engage and `high + 1` does; while engaged,
+  `debt == low` holds and `low − 1` releases.
+- **Bypass.** A `loom:operator-priority` (starred) issue is an explicit human
+  "now", so it is admitted anyway, still subject to the global cap, the #9244
+  overflow slot, the ramp cap and the per-repo cap. A verified red-main fix is
+  admitted too: a red `main` blocks merges, so the fix lowers the very debt
+  holding the back-off engaged. The saturation brake, a host-safety guard, is
+  checked first and still holds both.
+- **Explicit dispatch is unaffected** (`dispatch_sweep` over IPC does not go
+  through the work-finder tick).
+- **Observability.** One `INFO` line per edge, naming the debt, its per-axis
+  split, `high` and `low`, e.g. `work_finder: build back-off ENGAGED —
+  review+changes+merge debt 87 (review=28 changes=0 merge=59) > high=40; new
+  issue builds held until < low=25 (#9410)`. Steady state logs nothing above
+  `DEBUG`. Deferred issues show as `deferred_build_backoff` in `loom-daemon
+  queue`, the tick summary carries `deferred_build_backoff` and
+  `build_backoff_held` (`BUILD-BACKOFF-HELD` in `loom-daemon health`), the
+  decisions metric uses reason `build_backoff`, and the tick result is
+  `build_backoff_held` when nothing was dispatched.
+
+| Config (under `autonomous.workFinder.buildBackoff`) | Default | Validation |
+|---|---|---|
+| `enabled` | `true` | non-bool → default. `false` is exactly the pre-#9410 admission (no ledger read) |
+| `high` (`W`) | `40` | positive integer, else default |
+| `low` (`W_low`) | `25` | positive integer, else default. **`low >= high` rejects the pair**: both fall back to `40`/`25`, with one `WARN` per distinct bad pair |
+
+Config only (no env tier), re-read every tick from the daemon's primary
+workspace. **Deploy note:** a host whose debt is already above `high` engages
+on its first tick after upgrade and stops admitting unstarred builds until its
+debt falls below `low`; that is the intended WIP limit. The escape hatches are
+`buildBackoff.enabled: false` and starring an issue.
 
 #### Sizing `maxConcurrent`: per-machine **and** per-workload (#4512, #4903)
 

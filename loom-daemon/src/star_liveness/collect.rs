@@ -303,6 +303,7 @@ impl<'a> Evaluator<'a> {
                 d @ (QueueDisposition::DeferredCapacity
                 | QueueDisposition::DeferredRampCap
                 | QueueDisposition::DeferredSaturation
+                | QueueDisposition::DeferredBuildBackoff
                 | QueueDisposition::DeferredOutOfSlice
                 | QueueDisposition::DeferredRepoCap
                 | QueueDisposition::HostConstraint

@@ -305,12 +305,37 @@ pub fn count_pr_rows(rows: &[RestIssue]) -> usize {
         .count()
 }
 
+/// Labels that make a `loom:pr` PR one Champion will not merge — held for a
+/// human (#9410). The authoritative set is `champion-pr-merge.md`'s
+/// "`loom:blocked` / `loom:operator` / `loom:operator-only` PRs ... are still
+/// not merge-eligible". The critical-file hold (#6879) is one of these: it
+/// adds `loom:operator` (`champion-critical-file-hold.md`); there is no
+/// separate `loom:critical-file-hold` label, only a comment marker.
+pub const MERGE_HOLD_LABELS: [&str; 3] = ["loom:blocked", "loom:operator", "loom:operator-only"];
+
+/// Open PR rows that count as debt on `axis`. Merge debt leaves out PRs held
+/// for a human ([`MERGE_HOLD_LABELS`]): Champion cannot drain them, and
+/// counting them would keep the work finder's build back-off (#9410) engaged
+/// on a host with many held PRs. Uses the labels already in the listing rows.
+#[must_use]
+pub fn count_axis_rows(axis: DebtAxis, rows: &[RestIssue]) -> usize {
+    let held = |r: &RestIssue| {
+        r.labels
+            .iter()
+            .any(|l| MERGE_HOLD_LABELS.contains(&l.as_str()))
+    };
+    rows.iter()
+        .filter(|r| r.is_pull_request && r.state.eq_ignore_ascii_case("open"))
+        .filter(|r| axis != DebtAxis::Merge || !held(r))
+        .count()
+}
+
 /// Record a queue listing the role runner already made for `root`: a no-op
 /// for a label that feeds no axis, or when `root` has demand width disabled.
 pub fn record_listing(ledger: &DemandLedger, root: &Path, label: &str, rows: &[RestIssue]) {
     if let Some(axis) = DebtAxis::for_label(label) {
         if read_demand_config(root).enabled {
-            ledger.record(root, axis, count_pr_rows(rows));
+            ledger.record(root, axis, count_axis_rows(axis, rows));
         }
     }
 }
@@ -319,7 +344,8 @@ pub fn record_listing(ledger: &DemandLedger, root: &Path, label: &str, rows: &[R
 pub type DemandProbe = Arc<dyn Fn(&Path) -> Result<usize, String> + Send + Sync>;
 
 /// The production merge-debt probe: one ETag-cached `loom:pr` listing (a free
-/// `304` when nothing changed), under caller [`DEMAND_CALLER`].
+/// `304` when nothing changed), under caller [`DEMAND_CALLER`]. Operator-held
+/// PRs are not counted ([`count_axis_rows`]).
 #[must_use]
 pub fn forge_merge_probe() -> DemandProbe {
     Arc::new(|root| {
@@ -335,7 +361,7 @@ pub fn forge_merge_probe() -> DemandProbe {
             DebtAxis::Merge.label(),
             "open",
         )
-        .map(|rows| count_pr_rows(&rows))
+        .map(|rows| count_axis_rows(DebtAxis::Merge, &rows))
         .map_err(|e| e.to_string())
     })
 }

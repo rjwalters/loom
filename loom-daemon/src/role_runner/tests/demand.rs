@@ -111,6 +111,38 @@ fn only_open_pr_rows_are_counted() {
 }
 
 #[test]
+fn operator_held_prs_are_not_merge_debt() {
+    // #9410: Champion will not merge a `loom:pr` PR that also carries a hold
+    // label, so it must not count toward the merge debt the build back-off
+    // reads. Review / changes debt is unaffected by the same labels.
+    let labelled = |n: u32, label: &str| RestIssue {
+        labels: vec!["loom:pr".to_string(), label.to_string()],
+        ..row(n, true)
+    };
+    let rows = vec![
+        row(1, true),
+        labelled(2, "loom:operator"),
+        labelled(3, "loom:operator-only"),
+        labelled(4, "loom:blocked"),
+        labelled(5, "loom:auto-merge-ok"),
+    ];
+    assert_eq!(count_axis_rows(DebtAxis::Merge, &rows), 2, "#1 and #5 only");
+    assert_eq!(count_axis_rows(DebtAxis::Review, &rows), 5);
+
+    let ledger = DemandLedger::default();
+    let ws = workspace("{}");
+    record_listing(&ledger, ws.path(), "loom:pr", &rows);
+    record_listing(&ledger, ws.path(), "loom:review-requested", &rows);
+    let debt = ledger.host_debt(HOUR);
+    assert_eq!(debt.merge.unwrap().total, 2);
+    assert_eq!(debt.review.unwrap().total, 5);
+
+    // Every held PR: the axis is observed and zero, not unobserved.
+    record_listing(&ledger, ws.path(), "loom:pr", &rows[1..4]);
+    assert_eq!(ledger.host_debt(HOUR).merge, Some(AxisDebt::default()));
+}
+
+#[test]
 fn listings_record_nothing_when_demand_width_is_disabled() {
     let ws = workspace(r#"{"autonomous":{"roleRunner":{"demandWidth":{"enabled":false}}}}"#);
     let ledger = DemandLedger::default();

@@ -29,7 +29,7 @@ use crate::work_finder::{Admission, TickReport};
 /// `claim_collision`, `claim_lock_held`), so their parents are reported net of
 /// them: every candidate lands in exactly one reason.
 #[must_use]
-pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 25] {
+pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
     let classified_errors =
         report.refused_token_selection + report.refused_claim_collision + report.refused_claim_lock;
     [
@@ -56,6 +56,7 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 25] {
         ("capacity", report.deferred_capacity),
         ("ramp_cap", report.deferred_ramp_cap),
         ("saturation", report.deferred_saturation),
+        ("build_backoff", report.deferred_build_backoff),
         ("out_of_slice", report.deferred_out_of_slice),
         ("repo_cap", report.deferred_repo_cap),
         ("error", report.errors.saturating_sub(classified_errors)),
@@ -74,6 +75,7 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 25] {
 /// | `dispatched` | at least one sweep started |
 /// | `halted_main_red` | a main-health gate held a workspace |
 /// | `saturation_held` | the saturation admission brake was engaged |
+/// | `build_backoff_held` | the build back-off (#9410) was engaged |
 /// | `error` | a dispatch or listing failed and nothing started |
 /// | `no_eligible_work` | no ready candidates at all |
 /// | `capacity_full` | candidates deferred by the concurrency or ramp cap |
@@ -86,6 +88,8 @@ pub fn tick_result(report: &TickReport) -> &'static str {
         "halted_main_red"
     } else if report.saturation_held {
         "saturation_held"
+    } else if report.build_backoff_held {
+        "build_backoff_held"
     } else if report.errors > 0 {
         "error"
     } else if report.seen == 0 {
