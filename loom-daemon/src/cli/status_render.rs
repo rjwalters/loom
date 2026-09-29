@@ -15,6 +15,7 @@ mod holds;
 mod model_class;
 mod observability_line;
 mod operator_priority_line;
+mod peer_claims_line;
 
 use loom_daemon::daemon_install_state;
 use loom_daemon::self_update;
@@ -2125,29 +2126,33 @@ pub(crate) fn print_status_human(
         Some(pc) if pc.entries.is_empty() => {
             println!(
                 "Peer claims:   none live (self_host: {}, ttl: {}s, room: {}, advertised={} \
-                 received={} expired={} dispatch_skipped={})",
+                 rejected={} received={} expired={} dispatch_skipped={})",
                 pc.self_host,
                 pc.ttl_secs,
                 pc.claims_room.as_deref().unwrap_or("none"),
                 pc.advertised,
+                pc.advertise_rejected,
                 pc.received,
                 pc.expired,
                 pc.dispatch_skipped
             );
+            peer_claims_line::print_coordination_verdict(&pc.coordination);
         }
         Some(pc) => {
             println!(
                 "Peer claims:   {} live (self_host: {}, ttl: {}s, room: {}, advertised={} \
-                 received={} expired={} dispatch_skipped={})",
+                 rejected={} received={} expired={} dispatch_skipped={})",
                 pc.entries.len(),
                 pc.self_host,
                 pc.ttl_secs,
                 pc.claims_room.as_deref().unwrap_or("none"),
                 pc.advertised,
+                pc.advertise_rejected,
                 pc.received,
                 pc.expired,
                 pc.dispatch_skipped
             );
+            peer_claims_line::print_coordination_verdict(&pc.coordination);
             for e in &pc.entries {
                 println!(
                     "               issue #{} ({}) claimed by {} — {}s remaining",

@@ -2383,15 +2383,27 @@ pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
     } else {
         String::new()
     };
+    // Issue #9294: the verdict's own `reason`, appended so this section says WHY
+    // it is degraded. Without it, "N received / M advertised" reads identically
+    // whether peers are idle or the homeserver is refusing every single send —
+    // the measured 2026-09-23 outage was the latter and presented as the former.
+    // Appended (not interpolated) so every pre-#9294 assertion on this sentence's
+    // existing prefix is unchanged.
+    let reason_note = c
+        .reason
+        .as_deref()
+        .map_or_else(String::new, |r| format!(" — {r}"));
     if c.degraded {
         return HealthSection::new(
             "peer_coordination",
             Verdict::Degraded,
             format!(
-                "peer-claim receive path DEGRADED ({} received / {} advertised, room: {room}), \
-                 degraded for {} — {}/{} sustained receive(s) toward recovery (#6157){collisions_note}",
+                "peer-claim receive path DEGRADED ({} received / {} advertised, {} rejected, \
+                 room: {room}), degraded for {} — {}/{} sustained receive(s) toward recovery \
+                 (#6157){collisions_note}{reason_note}",
                 peer_claims.received,
                 peer_claims.advertised,
+                peer_claims.advertise_rejected,
                 c.degraded_for_secs
                     .map(|s| format_age(i64::try_from(s).unwrap_or(i64::MAX)))
                     .unwrap_or_else(|| "?".to_string()),
@@ -2400,6 +2412,8 @@ pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
             ),
             serde_json::json!({
                 "advertised": peer_claims.advertised,
+                "advertise_rejected": peer_claims.advertise_rejected,
+                "reason": c.reason,
                 "received": peer_claims.received,
                 "claims_room": peer_claims.claims_room,
                 "degraded_for_secs": c.degraded_for_secs,
@@ -2426,6 +2440,10 @@ pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
         ),
         serde_json::json!({
             "advertised": peer_claims.advertised,
+            // Issue #9294: surfaced on the healthy path too, so a fleet script
+            // diffing two hosts sees the publish-side counter without having to
+            // wait for a degraded verdict to expose it.
+            "advertise_rejected": peer_claims.advertise_rejected,
             "received": peer_claims.received,
             "claims_room": peer_claims.claims_room,
             // Issue #6243: see the DEGRADED branch's comment above.

@@ -2038,6 +2038,13 @@ pub struct PeerClaimStatus {
     /// peer claim (the #5789 enforcement path) — the proof the mechanism
     /// actually prevented a duplicate.
     pub dispatch_skipped: u64,
+    /// How many of this host's claim-ad sends safehoused **refused** (Issue
+    /// #9294). Read beside `advertised`, which counts *attempts*: when the two
+    /// track each other, this host is publishing nothing and every fleet-wide
+    /// brake built on the channel is inert. `#[serde(default)]` keeps pre-#9294
+    /// wire data / older clients compatible (deserializes as `0`).
+    #[serde(default)]
+    pub advertise_rejected: u64,
     /// Peer-coordination degradation state (Issue #6157) — see
     /// [`PeerCoordinationHealth`]. `#[serde(default)]` keeps pre-#6157 wire
     /// data / older clients compatible (deserializes as the all-healthy
@@ -2088,6 +2095,17 @@ pub struct PeerCoordinationHealth {
     /// How many consecutive receives recovery requires
     /// ([`crate::peer_claims::resolve_coordination_recovery_threshold`]).
     pub recovery_threshold: u64,
+    /// The last verdict sentence
+    /// [`crate::peer_claims::PeerClaimView::evaluate_coordination`] produced —
+    /// Issue #9294. Before this, a degraded verdict surfaced only as a `bool`
+    /// plus two raw counters an operator had to interpret, and the *reason*
+    /// (which distinguishes "peers are idle" from "the homeserver is refusing
+    /// every send") existed only in the reaper's return value, which nothing
+    /// persisted. `None` before the first reaper tick has evaluated. Rendered
+    /// verbatim by `loom-daemon status` whenever `degraded` is true.
+    /// `#[serde(default)]` keeps older clients compatible.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// One live peer claim entry within [`PeerClaimStatus::entries`] (Issue

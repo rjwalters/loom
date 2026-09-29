@@ -1536,7 +1536,9 @@ announces itself when it does not:
    Note that the cooldown lane deliberately does not touch `counters.received`
    (see the "Consume" bullet), so `received` counts **dispatch-claim** traffic —
    it is a proxy for "does anything at all reach me from a peer", not a direct
-   count of cooldown ads.
+   count of cooldown ads. **It is a weak proxy** — see
+   "`received=0` does not mean nothing arrives" below, which #9294 measured and
+   which is why `advertised`/`received` alone must never be the whole diagnosis.
 
 Reported as a bug in #8912 (a peer re-claimed `example-org/tool-repo#1` 196 s
 into a 3600 s cooldown on 2026-09-25); the recording host honoured its own window
@@ -1557,6 +1559,72 @@ peer-claim publisher is attached on this host" — and `grep HOST-LOCAL
 says nothing about precondition 2: a host that never prints it can still be
 receiving nothing, which is why the `advertised`/`received` counters above are
 the second thing to check.
+
+#### `received=0` does not mean nothing arrives (#9294)
+
+Precondition 2's symptom — `advertised` climbing, `received` pinned at zero —
+was read on #8912 as "this host's **receive** path is dead". It was measured on
+`loom-worker-1` on 2026-09-29 and it is not what happened. **The claims room
+itself was dead, for every host, in both directions.**
+
+The evidence, all reproducible against a live daemon:
+
+1. The claims room's most recent event of any kind was **2026-09-23T17:54:52Z**,
+   six days before the measurement, while the narration room was accepting
+   events seconds apart:
+
+   ```bash
+   # Read-only, using safehoused's own session (state/session.json).
+   curl -sH "Authorization: Bearer $TOKEN" \
+     "$HOMESERVER/_matrix/client/v3/rooms/$CLAIMS_ROOM/messages?dir=b&limit=3"
+   ```
+
+2. The homeserver had lost that room's forward extremities, so every send into
+   it fails server-side. The daemon had logged exactly this, twice, and then
+   gone quiet (the WARN is deduped per connection, #4464):
+
+   ```text
+   [2026-09-23T18:08:57.710] [WARN] safehouse: peer claim-ad rejected (safehoused
+     rejected send: sending to room: the server returned an error: [500 /
+     M_UNKNOWN] cannot create a non-create event in a room with no forward
+     extremities in !…); peer-claim dedup disabled, dispatch unaffected
+   ```
+
+3. Live, the failure no longer even produces a rejection: a probe `send`
+   addressed at the claims room over safehoused's socket got **no reply at all**
+   within 60 s (neither `ok:true` nor `ok:false`), because matrix-sdk retries the
+   500 internally and the op never returns. The identical send addressed at the
+   narration room returned `ok:true` in under a second and was relayed straight
+   back to a second socket connection. Same daemon, same socket, same Matrix
+   user, both rooms joined (`GET /_matrix/client/v3/joined_rooms`).
+
+So `received=0` was the honest reading of a room nobody could write to — the
+receive path, own-host filtering, room-id resolution and the #7477 brake logic
+were all working. **When you see `advertised>0 received=0`, check whether the
+room is accepting writes before concluding anything about the receive path**:
+the two cheapest checks are the room's last event timestamp (1 above) and
+whether a send into it is ever acknowledged (3 above).
+
+The remedy for this shape is operational and lives on the homeserver, not in
+Loom: the room has to be repaired or recreated, and every host's
+`LOOM_SAFEHOUSE_ROOM_CLAIMS` repointed at the new id. Loom's own gap was
+visibility, which #9294 closed:
+
+- **The publish side is now tracked.** `PeerClaimView` counts refused sends
+  (`rejected=` on the counters line) *and* sends written to the socket that are
+  never acknowledged. Either one degrades peer coordination immediately, with a
+  reason naming the transport's own error — refusal and silence are the two
+  shapes this outage produced, and a rejection counter alone would have missed
+  the second entirely.
+- **`advertised` is attempts, always.** It counts at enqueue time, before the
+  socket write, and it always did. It is a measure of this host's *intent*, and
+  on its own it can never tell you anything landed.
+- **`loom-daemon status` now renders the verdict.** The #6157 degraded verdict
+  had been firing correctly all along — `loom-daemon health` reported
+  `peer_coordination DEGRADED` throughout — but the `Peer claims:` block printed
+  only counters, so the one command an operator actually runs showed a six-day
+  fleet-wide outage as ordinary output. A DEGRADED channel now prints a
+  `DEGRADED (…)` line with its reason directly under the counters.
 
 ### Fleet-wide token-pool exhaustion hold: the third brake lane (#8001)
 
