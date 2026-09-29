@@ -202,18 +202,28 @@ fn a_failed_listing_marks_the_plan_incomplete() {
     assert!(!ctx.complete);
 }
 
-/// Rows that do not line up with the tick's queue are left unannotated
-/// rather than labelled with another row's plan.
+/// Same-length rows that do not pair up by issue number with the tick's
+/// queue are left unannotated rather than labelled with another row's plan.
 #[test]
 fn mismatched_rows_are_left_unannotated() {
     let report = TickReport {
-        queue: vec![qrow(0, 1, Qd::Dispatched)],
+        queue: vec![qrow(0, 1, Qd::Dispatched), qrow(0, 2, Qd::DeferredCapacity)],
         plan_order: vec![(0, 1)],
         ..TickReport::default()
     };
-    let mut rows = Vec::new();
+    // Same length as `report.queue`, but a different pair of issues: no
+    // position lines up with `ready_queue::ranked(&report.queue)`.
+    let mut rows = ready_queue::finish(
+        &[qrow(0, 9, Qd::Dispatched), qrow(0, 8, Qd::DeferredCapacity)],
+        &[PathBuf::from("/a")],
+    );
+    let before = rows.clone();
     let ctx = annotate(&report, &mut rows, &inputs());
     assert_eq!(ctx.slots.max_concurrent, 4);
+    assert_eq!(rows, before);
+    assert!(rows
+        .iter()
+        .all(|r| r.plan == crate::types::RowPlan::default()));
 }
 
 #[test]

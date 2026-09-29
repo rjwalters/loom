@@ -2161,7 +2161,7 @@ The fleet dashboard view is phase 3.
 (`running` / `next` / `queued` / `blocked`), `gate`, `keys`, `in_slice`,
 `hot`, `owning_shard` and `repo_cap`. The tick summary carries a `plan` block:
 `slots` (`max_concurrent`, `occupancy`, `free`, `max_admissions_per_tick`,
-`saturation_held`, `any_halted`), `tick_interval_secs`, `shard`, `scope` and
+`saturation_held`, `any_halted`, `overflow_free`), `tick_interval_secs`, `shard`, `scope` and
 `ordering`. `position` is the order pass 2 actually offered candidates in,
 after the repo-slice and per-repo-cap shaping. `rank` is still the bare
 comparator rank, so the two differ whenever sharding or
