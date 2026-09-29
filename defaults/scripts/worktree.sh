@@ -1599,6 +1599,18 @@ if [[ -d "$WORKTREE_PATH" ]]; then
         [[ -z "${_WT_DAEMON_BIN:-}" ]] || read -r stale_ref stale_display local_commits_ahead local_commits_behind <<< "$("$_WT_DAEMON_BIN" worktree-stale-ref --worktree "$WORKTREE_PATH" --branch "$BRANCH_NAME" --default-branch "$DEFAULT_BRANCH" --base-ref "$BASE_REF" --base-display "$BASE_DISPLAY" 2>/dev/null || echo "$stale_ref $stale_display $local_commits_ahead $local_commits_behind")"
 
         if [[ "$local_commits_ahead" -gt 0 || -n "$local_uncommitted" ]]; then
+            # rjwalters/kicad-tools#5783: uncommitted changes are the actual
+            # co-occupancy hazard -- two same-host sweeps once edited the same
+            # uncommitted file here at once, and one's edit leaked into the
+            # other's PR. Before handing such a tree back, `loom-daemon lease
+            # co-occupancy` refuses (exit 1) when the issue carries 2+
+            # simultaneously fresh sweep leases; WORKTREE_ALLOW_SHARED_LEASE=1
+            # overrides. Only exit 1 refuses -- a read failure, a timeout, or a
+            # daemon predating the subcommand (clap exit 2) all fail OPEN, as
+            # #8553's check-issue call above does.
+            # shellcheck disable=SC2086  # $_ljson is intentionally unquoted: omits the flag when empty
+            # requires-daemon: lease optional   kicad-tools#5783 fails open on a daemon predating `lease co-occupancy`
+            [[ -z "$local_uncommitted" || -z "${_WT_DAEMON_BIN:-}" ]] || { _ljson=""; _lrc=0; [[ "$JSON_OUTPUT" == "true" ]] && _ljson="--json"; "$_WT_DAEMON_BIN" lease co-occupancy "$ISSUE_NUMBER" --repo "$WORKTREE_REPO_ROOT" $_ljson >&3 || _lrc=$?; [[ "$_lrc" -eq 1 ]] && exit 1; }
             # Worktree has real work - preserve it
             # Back-fill/refresh the Loom sentinel so a resumed worktree that
             # lost its marker stays cleanup-eligible (#3548).
