@@ -114,18 +114,59 @@
 # that.
 #
 # ---------------------------------------------------------------------------
+# SECOND CHECK: THE PreToolUse MATCHER COVERAGE CONTRACT (#9108)
+# ---------------------------------------------------------------------------
+# The tier contract above answers "does the guard read the right copy of the
+# command?". It says nothing about the prior question: "is the guard on the tool
+# call's path at all?" Until #9108 the answer for one whole tool class was no.
+# `.claude/settings.json` wired exactly three `PreToolUse` matchers — `Bash`
+# twice and `Edit|Write` — so every `mcp__loom__*` tool call bypassed the guard
+# surface entirely, while `get_agent_metrics` turned its raw MCP arguments into
+# a shell command line (fixed server-side in #9107). The failure was invisible
+# for the same reason
+# #7755's was: nothing asserted the wiring, and **a matcher that matches nothing
+# does not error — it simply never fires**.
+#
+# So [`check_mcp_guard_wiring`] asserts two things no test could otherwise see:
+#
+#   1. the `mcp__loom__.*` matcher exists in this repo's own
+#      `.claude/settings.json` AND in `scripts/install/provision-hooks.sh`'s
+#      `_PHOOK_*` wiring set (the repo's own file covers THIS checkout; the
+#      installer's arrays are what every fresh consumer gets — one without the
+#      other is a hole);
+#   2. the entry carries the same FAIL-CLOSED floor the `Bash` / `Edit|Write`
+#      entries carry: it routes through `hook-wiring.sh`, and its inline
+#      fallback denies rather than allows when the hook file is absent from a
+#      `.loom/hooks`-bearing workspace, with the `LOOM_GUARD_WIRING_FAILOPEN`
+#      escape hatch as the only way past it.
+#
+# Deliberately a text-level assertion over the settings file rather than a jq
+# query: this checker already runs without jq, and the fail-closed floor it is
+# asserting is a property of the emitted COMMAND STRING, which is what a
+# reviewer reads and what breaks when someone "simplifies" the wrapper.
+#
+# ---------------------------------------------------------------------------
 # Usage:
 #   check-guard-scan-contracts.sh [PATH]
 #     PATH  guard script to check (default:
-#           <repo-root>/defaults/hooks/guard-destructive-generic.sh).
+#           <repo-root>/defaults/hooks/guard-destructive-generic.sh). With an
+#           explicit PATH this stays a pure per-file check; the #9108 wiring
+#           contract only runs in the default (whole-repo) mode.
+#
+#   check-guard-scan-contracts.sh --wiring
+#     Run only the #9108 PreToolUse matcher-coverage contract.
 #
 #   check-guard-scan-contracts.sh --self-test
 #     Synthetic-fixture regression test of the checker's own discriminating
 #     power: a compliant fixture, the #6252 ask-only-into-deny shape (unwaived
 #     and waived), a deny-safe string reaching the catastrophic floor, a
 #     laundering branch, a missing annotation, a stale annotation, an
-#     undeclared reference, an inconsistent re-declaration, and an unclassified
-#     new derivation. Touches only $TMPDIR, never the repo tree.
+#     undeclared reference, an inconsistent re-declaration, an unclassified
+#     new derivation, and — for the #9108 wiring contract — a compliant wiring
+#     fixture plus one missing the MCP matcher, one missing the fail-closed
+#     floor, one whose entry bypasses hook-wiring.sh, and one whose installer
+#     arrays never learned the matcher. Touches only $TMPDIR, never the repo
+#     tree.
 #
 # Portability: this must run in the same environment as the file it checks,
 # which on macOS is stock /bin/bash 3.2.57 (#7751, #7728) — so: no associative
@@ -364,6 +405,117 @@ ${var} ${tier} ${parent}"
     return "$fail"
 }
 
+# --- The #9108 PreToolUse matcher-coverage contract ---------------------------
+#
+# The wiring strings this asserts. Each is a substring of the emitted hook
+# command, so "someone simplified the wrapper" fails loudly instead of quietly
+# restoring the silent-allow hole (#7761) for the MCP surface.
+MCP_MATCHER='mcp__loom__.*'
+MCP_GUARD='guard-mcp-tools.sh'
+# Route-through: the launcher whose rung ladder owns the absent/non-executable
+# cases (defaults/hooks/hook-wiring.sh), plus the exact arguments it is handed.
+# Two substrings rather than one, because the launcher path and its argument
+# list are separated by the wrapper's own `$L` indirection.
+MCP_WIRING_LAUNCHER='hook-wiring.sh'
+MCP_WIRING_ARGS='PreToolUse guard-mcp-tools.sh'
+# The fail-closed floor, as three independent properties of the SAME command:
+# the workspace gate, the deny document, and the single sanctioned escape hatch.
+MCP_FLOOR_WORKSPACE_GATE='.loom/hooks'
+MCP_FLOOR_DENY='permissionDecision'
+MCP_FLOOR_ESCAPE='LOOM_GUARD_WIRING_FAILOPEN'
+
+# Fork-free literal-substring test. Deliberately `case`, not
+# `printf … | grep -qF`: under `set -o pipefail` an early-exit consumer like
+# `grep -q` can close the pipe mid-write and report the whole pipeline as
+# failed (scripts/check-pipefail-early-exit.sh, #7060/#7771). `case` also needs
+# no metacharacter escaping, which matters because every needle here contains
+# `.` and one contains `*`.
+_mcp_contains() { # <haystack> <needle>
+    case "$1" in
+        *"$2"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Prints violations to stderr. Returns 0 clean, 1 otherwise.
+check_mcp_guard_wiring() { # <repo-root>
+    local root="$1"
+    local settings="$root/.claude/settings.json"
+    local provision="$root/scripts/install/provision-hooks.sh"
+    local guard="$root/defaults/hooks/$MCP_GUARD"
+    local fail=0 entry=""
+
+    if [[ ! -f "$settings" ]]; then
+        echo "ERROR: $settings: no settings file — cannot verify the $MCP_MATCHER PreToolUse matcher exists (#9108)" >&2
+        return 1
+    fi
+
+    # (1) the matcher itself. Extracted as ONE physical line: every hook entry
+    # in this file is a single-line JSON string, so the matcher line and the
+    # command line are adjacent and the command can be found by name without a
+    # JSON parser.
+    if ! grep -qF -- "\"$MCP_MATCHER\"" "$settings"; then
+        echo "MISSING MCP MATCHER: $settings has no PreToolUse entry with matcher \"$MCP_MATCHER\" (#9108)." >&2
+        echo "    Every mcp__loom__* tool call then runs with NO guard hook on its path, which is" >&2
+        echo "    the exact gap #9108 closed: mcp-loom is registered at user scope and callable" >&2
+        echo "    from every agent Loom spawns, and get_agent_metrics built a shell command line" >&2
+        echo "    from its raw arguments until #9107. A matcher that is absent does not error — it" >&2
+        echo "    just never fires, which is why this is asserted rather than tested." >&2
+        fail=1
+    fi
+
+    # (2) an entry that actually runs THIS guard, through hook-wiring.sh.
+    # Anchored on `"command"` rather than on `PreToolUse`: an entry that
+    # BYPASSES hook-wiring.sh has no `PreToolUse` argument in it at all, and
+    # filtering on that would misreport the bypass as "no command wired".
+    entry="$(grep -F -- "$MCP_GUARD" "$settings" | grep -F -- '"command"' | head -1)"
+    if [[ -z "$entry" ]]; then
+        echo "MISSING MCP GUARD COMMAND: $settings wires no PreToolUse command for $MCP_GUARD (#9108)." >&2
+        fail=1
+    else
+        if ! _mcp_contains "$entry" "$MCP_WIRING_LAUNCHER" \
+            || ! _mcp_contains "$entry" "$MCP_WIRING_ARGS"; then
+            echo "MCP ENTRY BYPASSES hook-wiring.sh: $settings's $MCP_GUARD command does not route through '$MCP_WIRING_LAUNCHER $MCP_WIRING_ARGS' (#9108)." >&2
+            echo "    The launcher owns the absent / lost-+x / machine-level-fallback rungs; an" >&2
+            echo "    entry that execs the guard directly loses all of them." >&2
+            fail=1
+        fi
+        local prop
+        for prop in "$MCP_FLOOR_WORKSPACE_GATE" "$MCP_FLOOR_DENY" "$MCP_FLOOR_ESCAPE"; do
+            if ! _mcp_contains "$entry" "$prop"; then
+                echo "MCP FAIL-CLOSED FLOOR MISSING ('$prop'): $settings's $MCP_GUARD command does not carry the same broken-install floor the Bash / Edit|Write entries carry (#9108/#7761)." >&2
+                echo "    Required, all three: the '$MCP_FLOOR_WORKSPACE_GATE' workspace gate, a" >&2
+                echo "    '$MCP_FLOOR_DENY' deny document for a .loom/hooks-bearing workspace whose" >&2
+                echo "    copy is absent, and '$MCP_FLOOR_ESCAPE' as the only way past it. A" >&2
+                echo "    missing guard is a broken install, not an opt-out." >&2
+                fail=1
+            fi
+        done
+    fi
+
+    # (3) the installer's own wiring set. This repo's settings file covers THIS
+    # checkout only; _PHOOK_MATCHERS/_PHOOK_NAMES are what a fresh consumer
+    # gets, and one without the other is a hole nobody would notice here.
+    if [[ -f "$provision" ]]; then
+        if ! grep -qF -- "$MCP_MATCHER" "$provision"; then
+            echo "MISSING MCP MATCHER IN INSTALLER: $provision's _PHOOK_MATCHERS does not include \"$MCP_MATCHER\" (#9108) — this repo would be guarded but every fresh install would not." >&2
+            fail=1
+        fi
+        if ! grep -qF -- "$MCP_GUARD" "$provision"; then
+            echo "MISSING MCP GUARD IN INSTALLER: $provision's _PHOOK_NAMES does not include $MCP_GUARD (#9108)." >&2
+            fail=1
+        fi
+    fi
+
+    # (4) the hook file the wiring names must exist at its source of truth.
+    if [[ ! -f "$guard" ]]; then
+        echo "MISSING MCP GUARD FILE: $guard does not exist, but the wiring names it (#9108) — every workspace with a .loom/hooks/ directory would DENY every MCP tool call via hook-wiring.sh rung 5." >&2
+        fail=1
+    fi
+
+    return "$fail"
+}
+
 # --- Self-test ---------------------------------------------------------------
 # Each fixture isolates ONE discriminating property. A fixture that stops
 # failing (or starts failing for a different reason) means the checker lost
@@ -564,14 +716,112 @@ EOF
     _st_expect_fail "a contract with no 'from=' parent is rejected" "$tmp/no-parent.sh" \
         "has no 'from=<PARENT>' clause"
 
+    # --- L-P: the #9108 PreToolUse matcher-coverage contract -----------------
+    _st_wiring_fixtures "$tmp"
+
     if [[ "$_st_fail" -ne 0 ]]; then
         echo "" >&2
         echo "check-guard-scan-contracts --self-test: FAIL — the checker's discriminating power has regressed." >&2
         return 1
     fi
 
-    echo "check-guard-scan-contracts --self-test: OK — compliant and waived fixtures pass; the #6252 ask-only-into-deny shape, a deny-safe copy reaching the catastrophic floor, a laundering branch, a missing annotation, a stale annotation, an undeclared reference, an inconsistent re-declaration, an unclassified derivation, and a parentless contract are all rejected."
+    echo "check-guard-scan-contracts --self-test: OK — compliant and waived fixtures pass; the #6252 ask-only-into-deny shape, a deny-safe copy reaching the catastrophic floor, a laundering branch, a missing annotation, a stale annotation, an undeclared reference, an inconsistent re-declaration, an unclassified derivation, and a parentless contract are all rejected; and the #9108 wiring contract rejects a settings file with no mcp__loom__.* matcher, one with no fail-closed floor, one that bypasses hook-wiring.sh, and an installer whose _PHOOK_* arrays never learned the matcher."
     return 0
+}
+
+# --- Self-test: the #9108 wiring contract ------------------------------------
+
+_stw_expect_pass() { # <label> <root>
+    local out
+    if out="$(check_mcp_guard_wiring "$2" 2>&1)"; then
+        echo "  ok: $1"
+    else
+        echo "SELF-TEST FAIL: $1 — fixture was rejected:" >&2
+        printf '%s\n' "$out" >&2
+        _st_fail=1
+    fi
+}
+
+_stw_expect_fail() { # <label> <root> <expected-substring>
+    local out
+    if out="$(check_mcp_guard_wiring "$2" 2>&1)"; then
+        echo "SELF-TEST FAIL: $1 — fixture was NOT rejected (discriminating power regressed):" >&2
+        printf '%s\n' "$out" >&2
+        _st_fail=1
+    elif ! _mcp_contains "$out" "$3"; then
+        echo "SELF-TEST FAIL: $1 — rejected for the wrong reason (expected to see: $3):" >&2
+        printf '%s\n' "$out" >&2
+        _st_fail=1
+    else
+        echo "  ok: $1"
+    fi
+}
+
+# Build a fixture workspace under <root>. The settings command string is the
+# real shape, abbreviated to the properties the contract asserts.
+#
+# shellcheck disable=SC2016  # the `$L`/`$W`/`$G` expansions are FIXTURE TEXT — they must reach the file unexpanded, exactly as the real settings.json carries them
+_stw_fixture() { # <root> [--no-matcher|--no-floor|--bypass-wiring|--no-installer]
+    local root="$1" variant="${2:-}"
+    local matcher='mcp__loom__.*'
+    local route='exec bash "$L" PreToolUse guard-mcp-tools.sh'
+    local floor='[ -d "$W/.loom/hooks" ] || exit 0; [ "${LOOM_GUARD_WIRING_FAILOPEN:-0}" = "1" ] && exit 0; printf %s "{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\"}}"'
+    local launcher='L=$W/.loom/hooks/hook-wiring.sh;'
+
+    case "$variant" in
+        --no-matcher) matcher='Bash' ;;
+        --no-floor) floor='exit 0' ;;
+        --bypass-wiring)
+            launcher='G=$W/.loom/hooks/guard-mcp-tools.sh;'
+            route='exec "$G"'
+            ;;
+    esac
+
+    mkdir -p "$root/.claude" "$root/scripts/install" "$root/defaults/hooks"
+    # One physical line per hook command, as in the real settings file.
+    {
+        echo '{ "hooks": { "PreToolUse": ['
+        echo "  { \"matcher\": \"$matcher\","
+        echo "    \"hooks\": [ { \"type\": \"command\", \"command\": \"bash -c '$launcher $route; $floor'\" } ] }"
+        echo '] } }'
+    } >"$root/.claude/settings.json"
+
+    if [[ "$variant" == "--no-installer" ]]; then
+        printf '_PHOOK_MATCHERS=(Bash)\n_PHOOK_NAMES=(guard-destructive.sh)\n' \
+            >"$root/scripts/install/provision-hooks.sh"
+    else
+        printf '_PHOOK_MATCHERS=(Bash "mcp__loom__.*")\n_PHOOK_NAMES=(guard-destructive.sh guard-mcp-tools.sh)\n' \
+            >"$root/scripts/install/provision-hooks.sh"
+    fi
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$root/defaults/hooks/guard-mcp-tools.sh"
+}
+
+_st_wiring_fixtures() { # <tmpdir>
+    local tmp="$1"
+
+    _stw_fixture "$tmp/w-ok"
+    _stw_expect_pass "(#9108) a compliant wiring fixture passes" "$tmp/w-ok"
+
+    _stw_fixture "$tmp/w-no-matcher" --no-matcher
+    _stw_expect_fail "(#9108) a settings file with no mcp__loom__.* matcher is rejected" \
+        "$tmp/w-no-matcher" "MISSING MCP MATCHER"
+
+    _stw_fixture "$tmp/w-no-floor" --no-floor
+    _stw_expect_fail "(#9108) an MCP entry with no fail-closed floor is rejected" \
+        "$tmp/w-no-floor" "MCP FAIL-CLOSED FLOOR MISSING"
+
+    _stw_fixture "$tmp/w-bypass" --bypass-wiring
+    _stw_expect_fail "(#9108) an MCP entry that bypasses hook-wiring.sh is rejected" \
+        "$tmp/w-bypass" "MCP ENTRY BYPASSES hook-wiring.sh"
+
+    _stw_fixture "$tmp/w-no-installer" --no-installer
+    _stw_expect_fail "(#9108) an installer whose _PHOOK_* arrays lack the matcher is rejected" \
+        "$tmp/w-no-installer" "MISSING MCP MATCHER IN INSTALLER"
+
+    _stw_fixture "$tmp/w-no-guard"
+    rm -f "$tmp/w-no-guard/defaults/hooks/guard-mcp-tools.sh"
+    _stw_expect_fail "(#9108) wiring that names a guard file which does not exist is rejected" \
+        "$tmp/w-no-guard" "MISSING MCP GUARD FILE"
 }
 
 # --- Entry point -------------------------------------------------------------
@@ -587,10 +837,27 @@ else
     ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 fi
 
+# `--wiring` runs only the #9108 matcher-coverage contract, for anyone
+# exercising that half on its own.
+if [[ "${1:-}" == "--wiring" ]]; then
+    if check_mcp_guard_wiring "$ROOT"; then
+        echo "check-guard-scan-contracts: OK — the mcp__loom__.* PreToolUse matcher is wired in both .claude/settings.json and the installer, and carries the same fail-closed broken-install floor as the Bash / Edit|Write entries."
+        exit 0
+    fi
+    echo "" >&2
+    echo "check-guard-scan-contracts: FAIL — see above. MCP tool calls would run with" >&2
+    echo "no guard hook on their path, which is the #9108 gap." >&2
+    exit 1
+fi
+
+# An explicit PATH keeps this a pure per-file tier check (documented above); the
+# wiring contract is a whole-repo property and only runs in the default mode.
+WIRING=0
 if [[ $# -ge 1 && -n "${1:-}" ]]; then
     TARGET="$1"
 else
     TARGET="$ROOT/defaults/hooks/guard-destructive-generic.sh"
+    WIRING=1
 fi
 
 if [[ ! -f "$TARGET" ]]; then
@@ -598,23 +865,43 @@ if [[ ! -f "$TARGET" ]]; then
     exit 0
 fi
 
+RC=0
 if check_guard_scan_contracts "$TARGET"; then
     echo "check-guard-scan-contracts: OK — every derived scan copy is classified and derived from a copy at least as strict, every deny()/ask() site records what it reads, and no site decides at a stricter tier than the copy it reads was declared for."
-    exit 0
+else
+    RC=1
+    {
+        echo ""
+        echo "check-guard-scan-contracts: FAIL — see above."
+        echo ""
+        echo "guard-destructive-generic.sh decides 'is this executable code or inert"
+        echo "data?' by matching patterns against a chain of LOSSY derived copies of"
+        echo "\$COMMAND. Each copy's masking was only ever proven safe for ONE consumer"
+        echo "tier. A copy reaching a STRICTER consumer than it was declared for turns"
+        echo "an accepted risk (a missed ask) into a security bypass (a missed deny) —"
+        echo "that shipped once already (#6252, ADR-0016)."
+        echo ""
+        echo "Marker format and the full rationale: this script's own header comment."
+        echo "Current inventory: defaults/docs/guard-scan-contracts.md"
+    } >&2
 fi
 
-{
-    echo ""
-    echo "check-guard-scan-contracts: FAIL — see above."
-    echo ""
-    echo "guard-destructive-generic.sh decides 'is this executable code or inert"
-    echo "data?' by matching patterns against a chain of LOSSY derived copies of"
-    echo "\$COMMAND. Each copy's masking was only ever proven safe for ONE consumer"
-    echo "tier. A copy reaching a STRICTER consumer than it was declared for turns"
-    echo "an accepted risk (a missed ask) into a security bypass (a missed deny) —"
-    echo "that shipped once already (#6252, ADR-0016)."
-    echo ""
-    echo "Marker format and the full rationale: this script's own header comment."
-    echo "Current inventory: defaults/docs/guard-scan-contracts.md"
-} >&2
-exit 1
+if [[ "$WIRING" -eq 1 ]]; then
+    if check_mcp_guard_wiring "$ROOT"; then
+        echo "check-guard-scan-contracts: OK — the mcp__loom__.* PreToolUse matcher is wired in both .claude/settings.json and the installer, and carries the same fail-closed broken-install floor as the Bash / Edit|Write entries."
+    else
+        RC=1
+        {
+            echo ""
+            echo "check-guard-scan-contracts: FAIL — see above. MCP tool calls would run with"
+            echo "no guard hook on their path, which is the #9108 gap: mcp-loom is registered at"
+            echo "user scope and callable from every agent Loom spawns, and get_agent_metrics"
+            echo "built a shell command line from its raw arguments until #9107. A PreToolUse"
+            echo "matcher that is missing does not error — it just never fires."
+            echo ""
+            echo "Catalog entry and the category's toggle: defaults/docs/guard-hooks.md"
+        } >&2
+    fi
+fi
+
+exit "$RC"

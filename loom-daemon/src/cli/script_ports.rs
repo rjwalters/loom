@@ -331,6 +331,14 @@ pub(crate) enum ScriptPortCommand {
     /// logic, native from the start per the shell-language policy.
     CheckStaleBlocked(super::stale_blocked::StaleBlockedArgs),
 
+    /// The `PreToolUse` decision for the `mcp__loom__*` tool namespace (#9108),
+    /// behind the `defaults/hooks/guard-mcp-tools.sh` hook entry. Reads the
+    /// hook payload on stdin, prints a deny document or nothing, and **always
+    /// exits 0**. Not a port: brand-new logic, native from the start per the
+    /// shell-language policy — MCP tool calls were the one tool class outside
+    /// every `PreToolUse` matcher.
+    GuardMcpTools(super::guard_mcp_tools::GuardMcpToolsArgs),
+
     /// Per-segment PR latency, derived live from the forge timeline (#8923):
     /// review-queue wait, approval path, `loom:pr`→merged **split by operator
     /// gate**, Doctor response, and verdict invalidations — plus the live queue
@@ -424,6 +432,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
+            ScriptPortCommand::GuardMcpTools(args) => args.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),

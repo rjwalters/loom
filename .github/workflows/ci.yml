@@ -1830,6 +1830,16 @@ jobs:
       # without one, so it needs the binary this job downloads.
       - name: merge-pr async-close-race cleanup gate (#4186, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-worktree-path.sh
+      # #9108: the mcp__loom__.* PreToolUse guard decision is
+      # `loom-daemon guard-mcp-tools`, brand-new logic (no shell twin to
+      # port), so it needs the binary this job downloads. Drives the REAL
+      # defaults/hooks/guard-mcp-tools.sh stub on stdin, exactly as Claude
+      # Code does, so this is the wiring evidence — not just the unit
+      # coverage in loom-daemon/src/mcp_tool_guard/tests.rs — that the guard
+      # is actually on the mcp__loom__* call path. FAILS rather than skips
+      # without a binary.
+      - name: mcp__loom__.* PreToolUse argument guard (#9107, #9108)
+        run: bash defaults/hooks/tests/test-guard-mcp-tools.sh
 
   native-port-daemon-lifecycle:
     name: Native Port Suites (daemon lifecycle, watchdog)

@@ -28,6 +28,7 @@ mod duplicate_scan;
 mod fleet_captain_cmd;
 pub(crate) mod fleet_experiment;
 mod git_blob_lines;
+mod guard_mcp_tools;
 pub(crate) mod health;
 pub(crate) mod inflight;
 pub(crate) mod lease_ensure;

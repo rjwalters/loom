@@ -208,6 +208,7 @@ pub mod launchd_reload;
 pub mod limit_calibration;
 pub mod live_claim;
 pub mod main_health_gate;
+pub mod mcp_tool_guard;
 pub mod merge_pr;
 pub mod metrics_collector;
 pub mod observability;
