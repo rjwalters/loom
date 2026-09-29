@@ -328,6 +328,34 @@ been compared against the ClickStack answers on the same fixture yet. Treat it
 as unproven until that comparison is recorded in `evidence.md`, exactly as the
 trial treats every other unexecuted claim.
 
+## Story-points throughput (Issue #9433)
+
+`story-points-extract.sql` is this backend's half of the story-points
+throughput artifact set (epic #9429) — one view,
+`loom_analytics.raw_ship_story_points`, mapping `signoz_logs.distributed_logs_v2`
+rows onto the normalized per-ship points columns that
+[`../story-points-throughput-rollup.sql`](../story-points-throughput-rollup.sql)
+ingests and
+[`../story-points-throughput-queries.sql`](../story-points-throughput-queries.sql)
+answers PT1–PT7 from. The questions and their definitions are in
+[`../story-points-throughput-questions.md`](../story-points-throughput-questions.md);
+ClickStack uses the same three shared files with only its own extraction view
+swapped in, which is what keeps the two backends comparable under #8529.
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < story-points-extract.sql
+```
+
+**Ops pointer (capacity tuning).** "The pipeline lands N points/day — do we
+need another Judge?" is PT1 over a trailing window (landings/day and
+points/day together) and PT3 for the trend; read PT6's unlabeled share beside
+it — a high share means N *undercounts* because curation is not sizing
+issues, not that the fleet is small. **Not yet executed live here.** The
+query vocabulary is contract-checked in CI
+(`loom-daemon/tests/story_points_throughput_artifacts.rs`), same status as the
+cycle-time extract above; no number produced by it has been compared across
+backends yet.
+
 ## Retention and operation
 
 Set **seven days for logs and traces and 30 days for metrics** in General

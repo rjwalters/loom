@@ -232,6 +232,37 @@ alternative, and the drift-reconciliation query (CT8) are in the questions doc.
 against a real pinned ClickHouse in CI, including the case where every raw row
 has expired.
 
+## Story-points throughput (Issue #9433)
+
+The sibling of the cycle-time set above, answering "how many story points
+land per day?" from the same `sweep.outcome` rows — definitions, the ordinal
+caveat on raw label sums, and the retention reasoning inherited from
+[`../cycle-time-questions.md`](../cycle-time-questions.md) are all in
+[`../story-points-throughput-questions.md`](../story-points-throughput-questions.md).
+Install it the same way, once, after the cycle-time sources exist:
+
+```console
+docker compose --env-file /absolute/private/clickstack.env exec -T clickstack \
+  clickhouse-client --multiquery < story-points-extract.sql
+docker compose --env-file /absolute/private/clickstack.env exec -T clickstack \
+  clickhouse-client --param_since='2026-09-15 00:00:00' \
+    --param_until='2026-09-22 00:00:00' --queries-file ../story-points-throughput-rollup.sql
+```
+
+`story-points-extract.sql` is again the only backend-specific piece; the
+durable table `loom_analytics.ship_story_points` (one row per ship, TTL 400
+days), its hourly refresh and all seven questions are shared with SigNoz.
+
+**Ops pointer (capacity tuning).** "The pipeline lands N points/day — do we
+need another Judge?" is PT1 over a trailing window and PT3 for the trend
+(`--queries-file ../story-points-throughput-queries.sql`); read PT6's
+unlabeled share beside it before acting — a high share means N undercounts
+(curation is not sizing issues), not that the fleet is small. Contract-checked
+in CI (`loom-daemon/tests/story_points_throughput_artifacts.rs`); the
+live-verified precedent for these conventions is the cycle-time set's
+`cycle_time_clickhouse.rs`, and a live points-window execution is follow-up
+work under #8529's comparison.
+
 ## Retention, persistence and key rotation
 
 The collector table TTL defaults to `168h` through
