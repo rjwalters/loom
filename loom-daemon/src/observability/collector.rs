@@ -451,6 +451,23 @@ fn terminal_records(
         (Some(repo.to_string()), false)
     };
     let completed_at = Utc::now();
+    // Issue #9441: this live path sees only result/duration/PR — no classifier
+    // label, no sampled phases, no forge read — so it classifies from exactly
+    // those. It still satisfies both invariants: `landed` ⇔ a PR is present,
+    // and the classifier hands back the mandatory `failure_class` (a
+    // synthesized `unclassified:*` label here, since nothing classified this
+    // transition) together with the disposition.
+    let (disposition, failure_class) =
+        crate::telemetry::classify_disposition(&crate::telemetry::DispositionSignals {
+            result,
+            pr_number,
+            failure_class: None,
+            phase_durations: &[],
+            total_duration_sec,
+            judge_verdicts: None,
+            doctor_cycles: None,
+            issue_end_state: None,
+        });
     vec![
         TelemetryRecord::SweepCompleted(crate::telemetry::SweepCompletedRecord {
             repo: repo.clone(),
@@ -482,6 +499,7 @@ fn terminal_records(
             phase_durations: Vec::<PhaseDuration>::new(),
             total_duration_sec,
             result,
+            disposition,
             pr_number,
             tokens_in: None,
             tokens_out: None,
@@ -491,7 +509,7 @@ fn terminal_records(
             // Issue #9443: no phase entries and no sweep totals here, so there
             // is nothing to take a per-phase remainder of.
             tokens_unattributed: None,
-            failure_class: None,
+            failure_class,
             models_used: None,
             doctor_cycles: None,
             judge_verdicts: None,

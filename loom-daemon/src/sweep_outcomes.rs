@@ -943,6 +943,7 @@ mod tests {
                 phase_durations: Vec::new(),
                 total_duration_sec: duration_sec,
                 result,
+                disposition: telemetry::SweepDisposition::Unknown,
                 pr_number: None,
                 tokens_in: None,
                 tokens_out: None,

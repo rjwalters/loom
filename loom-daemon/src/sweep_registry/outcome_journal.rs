@@ -755,11 +755,32 @@ impl SweepRegistry {
             (Some(signals.doctor_cycles), Some(signals.judge_verdicts))
         });
 
-        // Curator complexity tier (Issue #8542), read off the sweep's own
-        // issue body — see `complexity_signal`'s module doc for why this is a
-        // separate forge read from the PR timeline above rather than a
-        // dispatch-time plumb, and its identical fail-open contract.
-        let complexity = self.fetch_complexity_signal(issue);
+        // Curator complexity tier (Issue #8542) plus the issue's own end state
+        // (Issue #9441), read off the sweep's own issue in ONE REST call — see
+        // `complexity_signal`'s module doc for why this is a separate forge
+        // read from the PR timeline above rather than a dispatch-time plumb,
+        // why the two signals share one call, and their identical fail-open
+        // contract.
+        let issue_signals = self.fetch_issue_signals(issue);
+        let complexity = issue_signals.complexity.clone();
+        let issue_end_state = issue_signals.end_state(started_at);
+
+        // What this sweep actually DID (Issue #9441) — a pure derivation over
+        // the signals already assembled above, NOT new instrumentation. The
+        // disposition and its mandatory `failure_class` come back as one value
+        // so the "env_failure/substantive_failure/unknown must say why"
+        // invariant cannot be half-applied; see `telemetry::disposition`.
+        let (disposition, failure_class) =
+            telemetry::classify_disposition(&telemetry::DispositionSignals {
+                result,
+                pr_number,
+                failure_class: failure_class.as_deref(),
+                phase_durations: &phase_durations,
+                total_duration_sec: duration_sec,
+                judge_verdicts: judge_verdicts.as_deref(),
+                doctor_cycles,
+                issue_end_state,
+            });
 
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
@@ -773,6 +794,7 @@ impl SweepRegistry {
             phase_durations,
             total_duration_sec: duration_sec,
             result,
+            disposition,
             pr_number,
             tokens_in,
             tokens_out,
@@ -791,6 +813,19 @@ impl SweepRegistry {
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
             complexity,
         };
+        // Issue #9441: both disposition invariants hold on every record this
+        // daemon writes. A debug assertion rather than a runtime guard — the
+        // classifier makes them true by construction (and proves it in its own
+        // contract tests), so a violation here is a code defect to catch in
+        // test/CI, never a reason to drop a record in production.
+        debug_assert!(
+            outcome_record.disposition_invariants_hold(),
+            "#9441: sweep.outcome for issue #{issue} ({sweep_id}) violates a disposition \
+             invariant: disposition={}, pr_number={:?}, failure_class={:?}",
+            outcome_record.disposition.as_str(),
+            outcome_record.pr_number,
+            outcome_record.failure_class,
+        );
         // Issue #9056: opt-in, post-`Success`-only issue write-back comment.
         // Only a clone of the assembled record is taken HERE (`outcome_record`
         // itself moves into the telemetry envelope below); every forge call —
@@ -828,6 +863,10 @@ impl SweepRegistry {
         if let Some(pr) = pr_number {
             metadata.insert("loom.pr_number".into(), pr.to_string());
         }
+        // #9441: the "what did this sweep DO" axis on the span too, so a trace
+        // query can separate a landing from a no-op re-dispatch without
+        // joining the journal.
+        metadata.insert("loom.disposition".into(), outcome_record.disposition.as_str().to_string());
         for (key, value) in [
             ("loom.failure_class", outcome_record.failure_class.as_ref()),
             ("loom.configured_model", outcome_record.model.as_ref()),
@@ -1260,3 +1299,16 @@ mod complexity_tests;
     unused_imports
 )]
 mod writeback_tests;
+
+// End-to-end tests for the #9441 `disposition` field as it lands on a real
+// journal record, in their own sibling file for the same file-size reason as
+// `timeline_tests` above. The classifier's own exhaustive contract tests are
+// pure and live with it, in `telemetry::disposition`.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod disposition_tests;

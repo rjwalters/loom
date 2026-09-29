@@ -56,6 +56,7 @@ use std::path::PathBuf;
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 
 pub mod ci;
+pub mod disposition;
 mod envelope;
 pub mod kinds;
 mod sweep_identity;
@@ -67,6 +68,7 @@ pub mod repo_identity;
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
+pub use disposition::{classify_disposition, DispositionSignals, IssueEndState, SweepDisposition};
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{TelemetryKindMeta, TelemetryKindOtlp, NEW_KIND_SCHEMA_VERSION, TELEMETRY_KINDS};
 pub use ops::MetricPointsRecord;
@@ -541,6 +543,40 @@ pub struct SweepOutcomeRecord {
     pub total_duration_sec: i64,
     /// Terminal result.
     pub result: SweepResult,
+    /// What the sweep actually DID, independent of how its process ended
+    /// (Issue #9441) — the axis [`result`](Self::result) cannot express.
+    ///
+    /// `result: success` folds a merged PR together with a no-op re-dispatch
+    /// against an already-closed issue (only 337 of 8,808 measured successes
+    /// carried a `pr_number`; 4,825 were sub-300 s runs with no PR, no tokens
+    /// and no phases), and `result: failure` folds a Judge rejection together
+    /// with a sub-60 s spawn death. `disposition` separates them, so "did this
+    /// sweep land work?" and "was the environment or the work at fault?" are
+    /// each a single field read instead of a duration/PR-presence heuristic.
+    ///
+    /// **Additive, never a replacement**: `result` is emitted unchanged beside
+    /// it, so every pre-#9441 consumer keeps working.
+    ///
+    /// Two invariants hold on every record this daemon writes, both proven in
+    /// [`disposition`]'s own contract tests:
+    ///
+    /// 1. `disposition == landed` **⇔** [`pr_number`](Self::pr_number) is
+    ///    present. This outranks `result`: a sweep cancelled after opening a
+    ///    PR still produced that PR, and `result` still reports the cancel.
+    /// 2. [`failure_class`](Self::failure_class) is **mandatory** whenever
+    ///    `disposition` is `env_failure`, `substantive_failure` or `unknown` —
+    ///    synthesized as a bounded `unclassified:*` label when no classifier
+    ///    produced one, so those buckets can never be silently unexplained.
+    ///
+    /// `#[serde(default)]` (to [`SweepDisposition::Unknown`]) so a journal line
+    /// written before this field existed still parses — every reader here drops
+    /// rather than errors on an unparseable line, so without a default all
+    /// pre-#9441 history would vanish the instant this shipped. Unlike every
+    /// other recent addition it is **never skipped on serialize**: a required
+    /// field that silently disappears for one variant is exactly the ambiguity
+    /// this record already has too much of.
+    #[serde(default)]
+    pub disposition: SweepDisposition,
     /// PR number produced by the sweep, when it opened one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u32>,
@@ -628,8 +664,12 @@ pub struct SweepOutcomeRecord {
     /// the single most-specific label, not a replacement for them.
     ///
     /// Omitted (never `""`, never `"unknown"`) when the terminal transition
-    /// carried no classification at all — including on every success, where
-    /// there is nothing to classify.
+    /// carried no classification at all — with one exception since Issue
+    /// #9441: it is **mandatory** whenever
+    /// [`disposition`](Self::disposition) is `env_failure`,
+    /// `substantive_failure` or `unknown`, and is then synthesized as a
+    /// bounded `unclassified:*` label (never `""`) when no classifier produced
+    /// one. A real classifier label is never overwritten by a synthesized one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
     /// The distinct model ids observed in [`tokens_by_model`](Self::tokens_by_model),
@@ -730,6 +770,31 @@ pub struct SweepOutcomeRecord {
     /// masquerading as data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complexity: Option<String>,
+}
+
+impl SweepOutcomeRecord {
+    /// Whether this record satisfies both #9441 `disposition` invariants (see
+    /// [`SweepOutcomeRecord::disposition`]): `landed` ⇔ a PR is present, and a
+    /// fault disposition carries a non-empty `failure_class`.
+    ///
+    /// The emit path asserts this in debug builds and the outcome-journal
+    /// tests assert it on real records; it is exposed so a consumer reading
+    /// the journal back can validate a line it did not write.
+    ///
+    /// A pre-#9441 line decodes with `disposition: unknown` and no
+    /// `failure_class`, and therefore legitimately fails this check — it is a
+    /// contract on records this daemon *writes*, not on historical ones.
+    #[must_use]
+    pub fn disposition_invariants_hold(&self) -> bool {
+        let landed_iff_pr =
+            (self.disposition == SweepDisposition::Landed) == self.pr_number.is_some();
+        let class_present_where_required = !self.disposition.requires_failure_class()
+            || self
+                .failure_class
+                .as_deref()
+                .is_some_and(|class| !class.is_empty());
+        landed_iff_pr && class_present_where_required
+    }
 }
 
 /// One Judge verdict on a PR, as reconstructed from the forge label timeline
