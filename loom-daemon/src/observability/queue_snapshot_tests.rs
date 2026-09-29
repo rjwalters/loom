@@ -212,6 +212,10 @@ fn plan_fields_ride_the_snapshot_at_version_11() {
             cap: Some(1),
             occupancy: 1,
         }),
+        // Issue #9311: additive, exercised on its own round-trip coverage in
+        // `types::dispatch_plan::tests`; `None` here keeps this test's own
+        // `schema_version` assertion about the pre-existing fields.
+        held_until: None,
     };
     let mut s = summary(vec![r.clone()]);
     s.plan = Some(DispatchPlanContext {

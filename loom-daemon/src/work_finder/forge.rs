@@ -20,7 +20,7 @@ use super::{
 use crate::sweep_registry::SweepRegistry;
 use crate::types::{SweepKind, SweepState};
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -238,6 +238,26 @@ impl WorkDispatcher for RegistryDispatcher {
         }
     }
 
+    /// [`WorkDispatcher::dispatch_backoff_expiry`] (Issue #9311): this host's
+    /// own local window only, mirroring [`Self::pr_open_backed_off`]'s scope
+    /// rather than [`Self::backed_off`]'s fleet union — a peer-armed window's
+    /// expiry is not available here.
+    fn dispatch_backoff_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
+        match self.registry.lock() {
+            Ok(reg) => {
+                let now = chrono::Utc::now();
+                reg.dispatch_backoff_issues(now)
+                    .into_iter()
+                    .filter_map(|issue| reg.dispatch_backoff_until(issue, now).map(|u| (issue, u)))
+                    .collect()
+            }
+            Err(poisoned) => {
+                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                HashMap::new()
+            }
+        }
+    }
+
     /// The subset of `backed_off()` whose window was armed by the
     /// open-PR guard rather than a real dispatch failure (Issue #7606).
     /// Pure in-memory read, mirroring `backed_off()`.
@@ -265,6 +285,25 @@ impl WorkDispatcher for RegistryDispatcher {
         }
     }
 
+    /// [`WorkDispatcher::noop_cooldown_expiry`] (Issue #9311): this host's own
+    /// local window only — a peer-armed window's expiry is not available
+    /// here, mirroring [`Self::dispatch_backoff_expiry`]'s scope.
+    fn noop_cooldown_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
+        match self.registry.lock() {
+            Ok(reg) => {
+                let now = chrono::Utc::now();
+                reg.noop_cooldown_issues(now)
+                    .into_iter()
+                    .filter_map(|issue| reg.noop_cooldown_until(issue, now).map(|u| (issue, u)))
+                    .collect()
+            }
+            Err(poisoned) => {
+                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                HashMap::new()
+            }
+        }
+    }
+
     /// Issues inside a live hard-exclusion decline cooldown window (Issue
     /// #7528). Pure in-memory read of the registry state the reaper's
     /// checkpoint-less clean-exit path maintains — no forge round trip,
@@ -279,6 +318,26 @@ impl WorkDispatcher for RegistryDispatcher {
         }
     }
 
+    /// [`WorkDispatcher::declined_expiry`] (Issue #9311), mirroring
+    /// [`Self::dispatch_backoff_expiry`]'s shape — `decline_cooldown_issues`
+    /// is not fleet-unioned (see its own doc comment), so this is a complete
+    /// per-issue expiry map, not a this-host-only subset.
+    fn declined_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
+        match self.registry.lock() {
+            Ok(reg) => {
+                let now = chrono::Utc::now();
+                reg.decline_cooldown_issues(now)
+                    .into_iter()
+                    .filter_map(|issue| reg.decline_cooldown_until(issue, now).map(|u| (issue, u)))
+                    .collect()
+            }
+            Err(poisoned) => {
+                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                HashMap::new()
+            }
+        }
+    }
+
     /// Issues inside a live PR-less retry window (Issue #7972). Pure
     /// in-memory read of the registry state `reap_once`'s terminal-outcome
     /// classification maintains — no forge round trip, mirroring
@@ -289,6 +348,25 @@ impl WorkDispatcher for RegistryDispatcher {
             Err(poisoned) => {
                 log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
                 HashSet::new()
+            }
+        }
+    }
+
+    /// [`WorkDispatcher::prless_retry_expiry`] (Issue #9311), mirroring
+    /// [`Self::declined_expiry`]'s shape — `prless_retry_issues` is not
+    /// fleet-unioned either, so this is a complete per-issue expiry map.
+    fn prless_retry_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
+        match self.registry.lock() {
+            Ok(reg) => {
+                let now = chrono::Utc::now();
+                reg.prless_retry_issues(now)
+                    .into_iter()
+                    .filter_map(|issue| reg.prless_retry_until(issue, now).map(|u| (issue, u)))
+                    .collect()
+            }
+            Err(poisoned) => {
+                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                HashMap::new()
             }
         }
     }

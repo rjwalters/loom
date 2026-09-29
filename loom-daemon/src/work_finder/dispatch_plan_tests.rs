@@ -20,6 +20,16 @@ fn key(ws: usize, prio: u32, number: u32) -> PriorityCandidate {
 }
 
 fn qrow(ws: usize, number: u32, d: Qd) -> ready_queue::TickQueueRow {
+    qrow_held(ws, number, d, None)
+}
+
+/// [`qrow`] plus a time-boxed hold's absolute expiry (Issue #9311).
+fn qrow_held(
+    ws: usize,
+    number: u32,
+    d: Qd,
+    held_until: Option<chrono::DateTime<chrono::Utc>>,
+) -> ready_queue::TickQueueRow {
     ready_queue::TickQueueRow {
         // One priority per workspace, so rank order is (ws, number).
         key: key(ws, u32::try_from(ws).unwrap() * 10, number),
@@ -27,6 +37,7 @@ fn qrow(ws: usize, number: u32, d: Qd) -> ready_queue::TickQueueRow {
         disposition: Some(d),
         detail: None,
         updated_at: None,
+        held_until,
     }
 }
 
@@ -223,4 +234,56 @@ fn gates_map_only_deferrals() {
     for d in Qd::ALL {
         assert_eq!(gate_of(d).is_some(), d.state() == "ready", "{d:?}");
     }
+}
+
+/// Each of the five time-boxed hold dispositions (Issue #9311) carries its
+/// recorded expiry straight through to `plan.held_until`.
+#[test]
+fn held_until_carries_each_time_boxed_holds_expiry() {
+    let until = |secs: i64| chrono::Utc::now() + chrono::Duration::seconds(secs);
+    let expiries = [
+        (1, Qd::RecheckInterval, until(60)),
+        (2, Qd::DispatchBackoff, until(120)),
+        (3, Qd::OpenPrBackoff, until(180)),
+        (4, Qd::NoopCooldown, until(240)),
+        (5, Qd::Declined, until(300)),
+        (6, Qd::PrlessRetry, until(360)),
+    ];
+    let report = TickReport {
+        queue: expiries
+            .iter()
+            .map(|(n, d, u)| qrow_held(0, *n, *d, Some(*u)))
+            .collect(),
+        plan_order: Vec::new(),
+        ..TickReport::default()
+    };
+    let (rows, _ctx) = plan(&report, &inputs());
+    for (issue, _, expected) in expiries {
+        assert_eq!(by_issue(&rows, issue).plan.held_until, Some(expected), "#{issue}");
+    }
+}
+
+/// Every other disposition — capacity/ramp gates, running, quarantined-style
+/// pre-filters with no recorded expiry, and a not-yet-held candidate — leaves
+/// `held_until` as `None` (Issue #9311): additive, never inferred.
+#[test]
+fn held_until_is_none_for_every_other_disposition() {
+    let report = TickReport {
+        queue: vec![
+            qrow(0, 1, Qd::DeferredCapacity),
+            qrow(0, 2, Qd::DeferredRampCap),
+            qrow(0, 3, Qd::DeferredOutOfSlice),
+            qrow(0, 4, Qd::Dispatched),
+            qrow(0, 5, Qd::InFlight),
+            qrow(0, 6, Qd::Quarantined),
+            qrow(0, 7, Qd::PeerClaim),
+            qrow(0, 8, Qd::Parked),
+        ],
+        plan_order: vec![(0, 4), (0, 1), (0, 2), (0, 3)],
+        max_admissions_per_tick: Some(1),
+        occupancy: Some(0),
+        ..TickReport::default()
+    };
+    let (rows, _ctx) = plan(&report, &inputs());
+    assert!(rows.iter().all(|r| r.plan.held_until.is_none()));
 }

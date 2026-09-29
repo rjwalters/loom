@@ -309,6 +309,19 @@ impl SweepRegistry {
         remaining.to_std().ok().filter(|d| !d.is_zero())
     }
 
+    /// Absolute decline-cooldown expiry for `issue` at `now` (Issue #9311), or
+    /// `None` when it may be dispatched immediately. Mirrors
+    /// [`Self::decline_cooldown_remaining`] but returns the instant itself
+    /// rather than the duration until it.
+    #[must_use]
+    pub fn decline_cooldown_until(&self, issue: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.decline_cooldown_config.enabled {
+            return None;
+        }
+        let state = self.decline_cooldown.get(&issue)?;
+        (state.until > now).then_some(state.until)
+    }
+
     /// Consecutive declines recorded for `issue` (Issue #7528). `0` when no
     /// decline is on record. Test/inspection helper, mirroring
     /// [`Self::noop_release_count`].
