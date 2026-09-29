@@ -395,7 +395,10 @@ pub fn script_runner_factory() -> RunnerFactory {
 /// The production queue probe: the ETag-cached REST listing, so an unchanged
 /// queue costs a free `304`. REST issue listings include pull requests, which
 /// is what judge and doctor queues hold. The PR rows it saw are recorded in
-/// the demand ledger (#9392) — the same listing, no second call.
+/// the demand ledger (#9392) — the same listing, no second call. Changes debt
+/// leaves out PRs Doctor will not drain (`loom:blocked` /
+/// `loom:operator-only`, #9421); review debt is unfiltered
+/// ([`demand::count_axis_rows`]).
 #[must_use]
 pub fn forge_queue_probe() -> QueueProbe {
     Arc::new(|root, labels| {
