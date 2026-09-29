@@ -740,30 +740,30 @@ jobs:
       # egress defaults baked in this fleet's ingest endpoint and scrub list, so
       # a fork provisioned a worker publishing to an unrelated operator's
       # endpoint. The script owns the default root list; this job just runs it.
-    #
-    # Since #8589 this job ALSO runs a REPO-WIDE host-identifier scrub, in the
-    # two `git grep` steps below. Two things about its placement are
-    # deliberate:
-    #
-    #   * Repo-wide, not scoped to the shipping surfaces above. The leak that
-    #     prompted it lived in a file nobody would call a shipping surface:
-    #     WORK_LOG.md carried 127 occurrences of two real EC2 private
-    #     hostnames, disclosing this fleet's subnet and host count from a
-    #     public repo. No scoped root list would ever have covered it.
-    #   * In this job, but NOT inside check-vendored-private-refs.sh. It
-    #     belongs to the same concern, so it must not become a second job or a
-    #     second script — but the script is `contract`-category portable shell,
-    #     and `loom-daemon shell-budget --check` refuses ANY net growth of that
-    #     pool (epic #7810), with no override. Adding the logic there is
-    #     therefore not available; the sanctioned alternative is the daemon,
-    #     and a ~15-line grep does not justify putting a cargo build in front
-    #     of a job that is otherwise toolchain-free and runs in seconds. If
-    #     this check ever grows past a grep, port it to a loom-daemon
-    #     subcommand rather than back into the script.
-    #
-    # Findings report file:line and a class, NEVER the matched text: this log
-    # is public, and echoing the match would re-publish exactly what the check
-    # exists to remove.
+      #
+      # Since #8589 this job ALSO runs a REPO-WIDE host-identifier scrub, in the
+      # two `git grep` steps below. Two things about its placement are
+      # deliberate:
+      #
+      #   * Repo-wide, not scoped to the shipping surfaces above. The leak that
+      #     prompted it lived in a file nobody would call a shipping surface:
+      #     WORK_LOG.md carried 127 occurrences of two real EC2 private
+      #     hostnames, disclosing this fleet's subnet and host count from a
+      #     public repo. No scoped root list would ever have covered it.
+      #   * In this job, but NOT inside check-vendored-private-refs.sh. It
+      #     belongs to the same concern, so it must not become a second job or a
+      #     second script — but the script is `contract`-category portable shell,
+      #     and `loom-daemon shell-budget --check` refuses ANY net growth of that
+      #     pool (epic #7810), with no override. Adding the logic there is
+      #     therefore not available; the sanctioned alternative is the daemon,
+      #     and a ~15-line grep does not justify putting a cargo build in front
+      #     of a job that is otherwise toolchain-free and runs in seconds. If
+      #     this check ever grows past a grep, port it to a loom-daemon
+      #     subcommand rather than back into the script.
+      #
+      # Findings report file:line and a class, NEVER the matched text: this log
+      # is public, and echoing the match would re-publish exactly what the check
+      # exists to remove.
       - name: Self-test the checker against synthetic fixtures
         if: ${{ !cancelled() }}
         run: bash scripts/check-vendored-private-refs.sh --self-test
