@@ -463,3 +463,43 @@ fn the_writer_is_always_forge_github_app() {
     assert_eq!(w.app_id, "100");
     assert_eq!(w.slug, None, "the other App's slug is not borrowed");
 }
+
+#[test]
+fn config_warnings_name_a_mismatched_or_orphaned_writer() {
+    let ok = json!({"forge": {"githubApp": {"appId": "100", "privateKeyPath": "/k"},
+        "identities": {"writer": {"appId": "100", "privateKeyPath": "/k"}}}});
+    assert!(config_warnings(&ok).is_empty());
+    let mismatch = json!({"forge": {"githubApp": {"appId": "100", "privateKeyPath": "/k"},
+        "identities": {"writer": {"appId": "999", "privateKeyPath": "/o"}}}});
+    assert!(config_warnings(&mismatch)[0].contains("differs"));
+    let orphan =
+        json!({"forge": {"identities": {"writer": {"appId": "999", "privateKeyPath": "/o"}}}});
+    assert!(config_warnings(&orphan)[0].contains("ambient gh auth"));
+}
+
+#[test]
+fn a_stale_reader_token_yields_to_the_next_reader_not_the_writer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let r = Roster {
+        writer: Some(ident("100", None)),
+        readers: vec![ident("nx-a", None), ident("nx-b", None)],
+        legacy_logins: vec![],
+    };
+    let repo = "Acme/app";
+    let first = reader_for(&r, repo).unwrap().clone();
+    let second = r
+        .readers
+        .iter()
+        .find(|x| x.app_id != first.app_id)
+        .unwrap()
+        .clone();
+    // Only the SECOND reader has a fresh token for Acme.
+    write_reader_dir(
+        tmp.path(),
+        "Acme",
+        &second,
+        chrono::Utc::now() + chrono::Duration::minutes(30),
+    );
+    let (_, app) = read_credential_in(tmp.path(), &r, repo, SystemTime::now()).unwrap();
+    assert_eq!(app, second.app_id);
+}
