@@ -293,7 +293,8 @@ pub fn sum_sweep_tokens(
     (total > 0).then_some(total)
 }
 
-/// Whether `record` belongs inside `window`, keyed on the record's own
+/// Whether `record` counts toward a sweep's **total** (`tokens_in`/
+/// `tokens_out`/`tokens_by_model`), keyed on the record's own
 /// [`UsageRecord::at`] rather than the file's mtime (Issue #9454).
 ///
 /// `window` here is the sweep's **precise** attribution span — unlike
@@ -302,18 +303,43 @@ pub fn sum_sweep_tokens(
 /// already admitted a file on the (deliberately generous) slack-widened mtime
 /// test. Widening it again here would defeat the fix.
 ///
+/// # Why a clock-less record is *kept*, not dropped
+///
 /// `None` (no window at all) keeps every record — the legacy unbounded-sum
-/// behaviour, used only when a caller has no window to filter by. A record
-/// with no parseable timestamp is dropped when a window *is* given: its
-/// origin session cannot be verified, and admitting it is exactly the
-/// "un-owned usage gets folded into whichever sweep happens to be reading"
-/// failure mode this filter exists to close.
+/// behaviour, used when a caller has no window to filter by. A record with a
+/// parseable timestamp is kept only when that instant falls inside `window`
+/// (this is the actual #9454 fix: it is what stops a *different* same-issue
+/// session's records from being folded in). But a record with **no** parseable
+/// timestamp is still counted in the total, because this predicate gates a
+/// *total*, not a *slice*:
+///
+/// - The file was already legitimately admitted for this issue by
+///   [`sweep_transcript_files`], so its usage belongs to the sweep even when a
+///   single record cannot be placed on the clock.
+/// - The #9430/#9443 reconciliation invariant is
+///   `Σ phase tokens + tokens_unattributed == sweep tokens`, with
+///   `tokens_unattributed` computed by the caller as
+///   `sweep_total − Σ(phase totals)`. A clock-less record is *already*
+///   excluded from every phase slice by
+///   [`sum_sweep_tokens_by_window`]/[`slice_of`] — which is correct, since an
+///   undated record cannot be assigned to a phase — so it is exactly the kind
+///   of usage the remainder exists to carry. Dropping it from the total as
+///   well would make the total *and* the remainder wrong instead of just
+///   naming the usage un-phased (see
+///   `sweep_registry::outcome_journal::phase_usage_tests`).
+///
+/// So the per-phase and per-total policies for a missing timestamp differ on
+/// purpose: unattributable **to a phase**, still attributable **to the sweep**.
 #[must_use]
-fn record_in_window(record: &UsageRecord, window: Option<(DateTime<Utc>, DateTime<Utc>)>) -> bool {
+fn record_counts_toward_total(
+    record: &UsageRecord,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> bool {
     let Some((start, end)) = window else {
         return true;
     };
-    record.at().is_some_and(|at| at >= start && at <= end)
+    // `None` (unparseable/absent `timestamp`) => keep: see the doc above.
+    record.at().is_none_or(|at| at >= start && at <= end)
 }
 
 /// Split input/output token totals for `issue`'s `/loom:sweep` sessions
@@ -333,17 +359,24 @@ fn record_in_window(record: &UsageRecord, window: Option<(DateTime<Utc>, DateTim
 ///
 /// Unlike [`sum_sweep_tokens`] (whole-file summation — deliberate, see that
 /// function's doc), this attributes **per record**, keyed on each usage
-/// record's own `timestamp` against `window` via [`record_in_window`] — the
-/// same pattern [`sum_sweep_tokens_by_window`] already uses for per-phase
-/// splits (Issue #9443). `sweep_transcript_files`'s mtime-based file selection
-/// (shared with every sibling function here, including the safehouse's
-/// whole-issue [`sum_sweep_tokens`]) is unchanged: a candidate file can still
-/// be admitted by the slack-widened mtime test, but only the records inside
-/// it whose own timestamp actually falls in `window` are counted. This is
-/// what stops another `/loom:sweep <same issue>` session sharing a project
-/// directory — a re-dispatch, or a concurrent attempt on another host with a
-/// synced worktree — from having its usage folded into this sweep's total
-/// merely because its transcript file's mtime landed nearby (Issue #9454).
+/// record's own `timestamp` against `window` via
+/// [`record_counts_toward_total`] — the same pattern
+/// [`sum_sweep_tokens_by_window`] already uses for per-phase splits (Issue
+/// #9443). `sweep_transcript_files`'s mtime-based file selection (shared with
+/// every sibling function here, including the safehouse's whole-issue
+/// [`sum_sweep_tokens`]) is unchanged: a candidate file can still be admitted
+/// by the slack-widened mtime test, but a record whose own timestamp falls
+/// *outside* `window` is not counted. This is what stops another
+/// `/loom:sweep <same issue>` session sharing a project directory — a
+/// re-dispatch, or a concurrent attempt on another host with a synced
+/// worktree — from having its usage folded into this sweep's total merely
+/// because its transcript file's mtime landed nearby (Issue #9454).
+///
+/// A record carrying **no** parseable `timestamp` still counts here, even
+/// under a window — it is unattributable to a *phase*, not to the sweep, and
+/// the #9430/#9443 `Σ phase + tokens_unattributed == sweep total` invariant
+/// depends on it landing in this total. See
+/// [`record_counts_toward_total`]'s "Why a clock-less record is *kept*".
 ///
 /// `None` (never `Some((0, 0))`) when nothing attributable was found — same
 /// "unknown != zero" contract as [`sum_sweep_tokens`].
@@ -370,7 +403,7 @@ pub fn sum_sweep_tokens_split(
         let mut fold = UsageFold::default();
         fold.add_text(&text);
         for record in fold.messages() {
-            if !record_in_window(record, window) {
+            if !record_counts_toward_total(record, window) {
                 continue;
             }
             let input = record
@@ -395,11 +428,12 @@ pub fn sum_sweep_tokens_split(
 /// This is `sweep.outcome`'s `tokens_by_model` — the flat `tokens_in`/
 /// `tokens_out` pair's per-model breakdown, published on the very same
 /// record — so it is windowed **per record** exactly like
-/// [`sum_sweep_tokens_split`] (Issue #9454): only records whose own
-/// timestamp falls in `window` are counted, via the same
-/// [`record_in_window`] filter. Without this, the flat pair and this
-/// breakdown could disagree about a sweep's own cost after #9454's fix
-/// landed only on one of the two.
+/// [`sum_sweep_tokens_split`] (Issue #9454): a record whose own timestamp
+/// falls outside `window` is not counted, via the same
+/// [`record_counts_toward_total`] filter (which keeps clock-less records, for
+/// the reasons given there). Without this, the flat pair and this breakdown
+/// could disagree about a sweep's own cost after #9454's fix landed only on
+/// one of the two.
 ///
 /// Totals from every matching **record inside `window`** are merged by
 /// tuple across the whole sweep (a sweep whose phases used different models
@@ -429,11 +463,11 @@ pub fn sum_sweep_tokens_by_model(
         };
         let mut fold = UsageFold::default();
         fold.add_text(&text);
-        let in_window = fold
+        let in_total = fold
             .messages()
             .iter()
-            .filter(|record| record_in_window(record, window));
-        merge_records(&mut totals, in_window);
+            .filter(|record| record_counts_toward_total(record, window));
+        merge_records(&mut totals, in_total);
     }
     let rows: Vec<ModelUsageTotals> = totals.into_values().collect();
     (!rows.is_empty()).then_some(rows)
@@ -820,6 +854,75 @@ mod tests {
         assert_eq!(
             sum_sweep_tokens(dir.path(), workspace, 8450, None),
             Some(80_000_000 + 800_000 + 900 + 40)
+        );
+    }
+
+    /// AC (Issue #9454, corrected): the per-record window filter must exclude a
+    /// record whose own timestamp lands outside the window, but must **keep** a
+    /// record carrying no parseable `timestamp` at all.
+    ///
+    /// A clock-less record cannot be assigned to a *phase* — that is
+    /// [`sum_sweep_tokens_by_window`]/[`slice_of`]'s job, and it correctly
+    /// leaves such a record in no slice — but it is still this sweep's spend:
+    /// the file was legitimately admitted for this issue, and the #9430/#9443
+    /// reconciliation contract is that the caller publishes
+    /// `sweep_total − Σ(phase totals)` as `tokens_unattributed`. Dropping it
+    /// from the **total** too would make the total *and* the remainder wrong
+    /// rather than merely naming the usage un-phased. The end-to-end form of
+    /// this invariant lives in
+    /// `sweep_registry::outcome_journal::phase_usage_tests`; this pins the
+    /// primitive both totals are computed from.
+    #[test]
+    fn a_clockless_record_stays_in_the_sweep_total_while_an_out_of_window_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        // Anchored to "now" so the freshly written file passes `mtime_in_window`.
+        let start = Utc::now();
+        let end = start + chrono::Duration::seconds(300);
+        let parent = [
+            // Inside this sweep's own window: counted, and phase-attributable.
+            stamped("in-window", start + chrono::Duration::seconds(10), 500, 50),
+            // A *different* same-issue session's record, admitted only by the
+            // mtime slack: excluded. This is the actual #9454 fix, preserved.
+            stamped("out-of-window", start - chrono::Duration::minutes(90), 9_000_000, 90_000),
+            // No `timestamp` at all: kept in the total, attributable to no phase.
+            unstamped("no-clock", 7, 3),
+        ]
+        .concat();
+        seed_session(dir.path(), workspace, "uuid-a", "9454", &parent, &[]);
+
+        assert_eq!(
+            sum_sweep_tokens_split(dir.path(), workspace, 9454, Some((start, end))),
+            Some((507, 53)),
+            "the in-window (500,50) plus the clock-less (7,3) — never the \
+             out-of-window (9_000_000,90_000)"
+        );
+
+        // `tokens_by_model` is published on the same record from the same
+        // transcripts, so it must agree with the flat pair exactly.
+        let rows = sum_sweep_tokens_by_model(dir.path(), workspace, 9454, Some((start, end)))
+            .expect("attributable rows expected");
+        assert_eq!(
+            split_of(&rows),
+            (507, 53),
+            "tokens_by_model must not disagree with tokens_in/tokens_out"
+        );
+
+        // The reconciliation invariant at this layer: Σ phase slices +
+        // remainder == the sweep total. Only `in-window` is phase-attributable;
+        // the clock-less record is exactly what the remainder carries.
+        let slices = [(start, start + chrono::Duration::seconds(100))];
+        let per_phase = sum_sweep_tokens_by_window(dir.path(), workspace, 9454, None, &slices);
+        let (phase_in, phase_out) =
+            split_of(per_phase[0].as_deref().expect("one attributed slice"));
+        assert_eq!((phase_in, phase_out), (500, 50));
+        let (total_in, total_out) =
+            sum_sweep_tokens_split(dir.path(), workspace, 9454, Some((start, end))).unwrap();
+        assert_eq!(
+            (u64::try_from(phase_in).unwrap() + 7, u64::try_from(phase_out).unwrap() + 3),
+            (total_in, total_out),
+            "Σ phase tokens + tokens_unattributed == sweep tokens, with the \
+             clock-less record in the remainder rather than missing entirely"
         );
     }
 

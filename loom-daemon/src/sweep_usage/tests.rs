@@ -48,12 +48,7 @@ impl ClaudeStore {
     }
 
     /// Write `<projects>/<slug>/<uuid>.jsonl` for a `/loom:sweep <issue>`
-    /// session carrying one assistant usage record, stamped "now" — Issue
-    /// #9454 made both `sum_sweep_tokens_split` and `sum_sweep_tokens_by_model`
-    /// filter per record against the caller's window, so a record with no
-    /// `timestamp` at all is no longer attributed when a window is given.
-    /// Every real Claude transcript record carries one, so this fixture must
-    /// too.
+    /// session carrying one assistant usage record.
     fn seed_sweep_session(&self, workspace: &Path, issue: u32, input: i64, output: i64) {
         let dir = self
             .projects
@@ -65,10 +60,9 @@ impl ClaudeStore {
              <command-args>{issue}</command-args>\"}}}}\n"
         );
         let usage = format!(
-            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-sonnet-5\",\
+            "{{\"type\":\"assistant\",\"message\":{{\"model\":\"claude-sonnet-5\",\
              \"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output},\
-             \"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}}}\n",
-            Utc::now().to_rfc3339()
+             \"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}}}\n"
         );
         fs::write(dir.join("session-uuid.jsonl"), format!("{head}{usage}")).unwrap();
     }
