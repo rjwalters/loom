@@ -276,7 +276,7 @@ pub struct SafehouseConfig {
     /// Persona to authenticate as; must be in safehoused's allowlist.
     pub persona: String,
     /// Who an operator-priority escalation (#9321) pings in the room: a Matrix
-    /// display name or user id (`@robb:matrix.org`). `None` ⇒ the escalation
+    /// display name or user id (`@operator:example.org`). `None` ⇒ the escalation
     /// line is still posted, just without a mention — the ask is never dropped
     /// over a missing handle. This is a **handle, not a credential**: nothing
     /// here authenticates anything (the persona does), so it belongs in

@@ -84,7 +84,7 @@ default(disabled)**:
 ```
 
 **`operatorMention` is a handle, not a credential.** It is the Matrix display
-name or user id (`"@robb:matrix.org"`) prepended to an operator-priority
+name or user id (`"@operator:example.org"`) prepended to an operator-priority
 escalation line so the room actually notifies a human (#9321). Nothing about it
 authenticates anything — the `persona` does that — so it belongs beside the room
 ids rather than in an owner-only credential store. Leave it `null` and the
@@ -606,7 +606,7 @@ as a forge comment (#9301), and a forge comment is what nobody read for seven
 hours in #9268.
 
 ```
-@robb:matrix.org: loom#9268 · OPERATOR NEEDED · merge-refused at needs-operator
+@operator:example.org: loom#9268 · OPERATOR NEEDED · merge-refused at needs-operator
 Allow merge commits on the repository, or re-run the merge with squash.
 https://github.com/rjwalters/loom/issues/9268 · observed by host-a
 ```

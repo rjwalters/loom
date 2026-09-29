@@ -3065,7 +3065,9 @@ pub enum Event {
     /// with `resolved: true` fires once when that key's ask clears.
     ///
     /// Consumed by the Safehouse narration sink
-    /// ([`crate::safehouse::event_to_envelope`]), which renders it as a
+    /// ([`crate::safehouse::operator_priority_envelope`] — *not*
+    /// `event_to_envelope`, which returns `None` for this variant because the
+    /// body needs `safehouse.operatorMention` from config), which renders it as a
     /// `handoff` envelope — the `Signal` attention class, i.e. the team's
     /// notifications-on Matrix room — so the ask reaches the human rather than
     /// only a forge comment nobody reads in time (the #9268 failure mode).

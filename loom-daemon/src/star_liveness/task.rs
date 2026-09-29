@@ -457,14 +457,34 @@ fn pool_for(root: &Path) -> Option<String> {
         })
 }
 
-/// The forge's web origin for the repo at `root`, from its `origin` remote
-/// (`https://host` for an `https://`/`http://` or `git@host:` remote), so an
-/// escalation link resolves on a Gitea fleet too (#9321). Anything
-/// unrecognizable — no git, no remote, an odd URL — falls back to
-/// [`DEFAULT_WEB_BASE`], which is correct for every GitHub deployment.
+/// The forge's web origin for the repo at `root`, from its `origin` remote, so
+/// an escalation link resolves on a Gitea fleet too (#9321). Recognized shapes:
+///
+/// | Remote | Web base |
+/// |---|---|
+/// | `https://host/o/r.git` | `https://host` |
+/// | `http://host/o/r.git` | `http://host` |
+/// | `git@host:o/r.git` (scp-like) | `https://host` |
+/// | `ssh://git@host/o/r.git` | `https://host` |
+/// | `ssh://git@host:2222/o/r.git` | `https://host` |
+///
+/// An `ssh://` remote's port is the **SSH** port, never the forge's web port, so
+/// it is dropped rather than carried into the URL. Anything unrecognizable — no
+/// git, no remote, an odd URL — falls back to [`DEFAULT_WEB_BASE`], which is
+/// correct for every GitHub deployment.
 #[must_use]
 pub fn web_base_from_remote(remote_url: &str) -> String {
     let url = remote_url.trim();
+    // `ssh://[user@]host[:port]/owner/repo.git` — the forge still serves the web
+    // UI over https on that host, so only the host survives.
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        let authority = rest.split('/').next().unwrap_or_default();
+        let host_port = authority.rsplit('@').next().unwrap_or_default();
+        let host = host_port.split(':').next().unwrap_or_default();
+        if !host.is_empty() {
+            return format!("https://{host}");
+        }
+    }
     if let Some(rest) = url.strip_prefix("git@") {
         if let Some((host, _)) = rest.split_once(':') {
             if !host.is_empty() {

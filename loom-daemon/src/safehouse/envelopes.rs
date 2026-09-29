@@ -17,7 +17,7 @@ use super::{
 use crate::types::{Event, SweepKind};
 
 /// The env override for `safehouse.operatorMention` (#9321). A Matrix display
-/// name or user id (`@robb:matrix.org`) — a handle, never a secret.
+/// name or user id (`@operator:example.org`) — a handle, never a secret.
 pub const OPERATOR_MENTION_ENV: &str = "LOOM_SAFEHOUSE_OPERATOR_MENTION";
 
 /// Map an existing bus [`Event`] to a narration [`Envelope`], or `None` for
@@ -326,8 +326,9 @@ mod tests {
 
     #[test]
     fn an_escalation_pings_the_operator_and_carries_the_ask_and_a_link() {
-        let env = operator_priority_envelope(&escalation_event(false), Some("@robb:matrix.org"))
-            .expect("the escalation variant must render");
+        let env =
+            operator_priority_envelope(&escalation_event(false), Some("@operator:example.org"))
+                .expect("the escalation variant must render");
         assert_eq!(env.kind, "handoff", "handoff ⇒ the Signal (notifications-on) room");
         assert_eq!(
             EnvelopeKind::parse(&env.kind).unwrap().attention_class(),
@@ -335,7 +336,7 @@ mod tests {
             "an operator ask must not land in a muted per-repo firehose"
         );
         assert_eq!(env.task_id.as_deref(), Some("loom_9268"), "threads with the issue");
-        assert!(env.body.starts_with("@robb:matrix.org: "), "got {:?}", env.body);
+        assert!(env.body.starts_with("@operator:example.org: "), "got {:?}", env.body);
         assert!(env
             .body
             .contains("loom#9268 · OPERATOR NEEDED · merge-refused at needs-operator"));
@@ -356,9 +357,11 @@ mod tests {
     #[test]
     fn an_escalation_envelope_is_actually_sendable_over_envelope_v1() {
         for resolved in [false, true] {
-            let env =
-                operator_priority_envelope(&escalation_event(resolved), Some("@robb:matrix.org"))
-                    .unwrap();
+            let env = operator_priority_envelope(
+                &escalation_event(resolved),
+                Some("@operator:example.org"),
+            )
+            .unwrap();
             assert!(env.meta.is_none(), "envelope-v1: `meta` is completion-only");
             let req = build_send_request(&env, 7, None)
                 .expect("an escalation must survive send validation");
@@ -370,12 +373,13 @@ mod tests {
 
     #[test]
     fn a_recovery_says_resolved_without_re_pinging_the_operator() {
-        let env = operator_priority_envelope(&escalation_event(true), Some("@robb:matrix.org"))
-            .expect("the resolved variant must render");
+        let env =
+            operator_priority_envelope(&escalation_event(true), Some("@operator:example.org"))
+                .expect("the resolved variant must render");
         assert_eq!(env.kind, "handoff");
         assert_eq!(env.task_id.as_deref(), Some("loom_9268"), "same thread as the ask");
         assert!(
-            !env.body.contains("@robb:matrix.org"),
+            !env.body.contains("@operator:example.org"),
             "a recovery must not re-ping: {:?}",
             env.body
         );
@@ -451,7 +455,7 @@ mod tests {
             SafehouseConfig {
                 enabled: true,
                 socket: Some(socket.clone()),
-                operator_mention: Some("@robb:matrix.org".to_owned()),
+                operator_mention: Some("@operator:example.org".to_owned()),
                 ..SafehouseConfig::default()
             },
             socket,
@@ -514,7 +518,7 @@ mod tests {
 
         assert_eq!(received.len(), 2);
         let ask = received[0]["body"].as_str().unwrap();
-        assert!(ask.starts_with("@robb:matrix.org: "), "got {ask:?}");
+        assert!(ask.starts_with("@operator:example.org: "), "got {ask:?}");
         assert!(ask.contains("r#1 · OPERATOR NEEDED · merge-risk-hold"), "got {ask:?}");
         assert!(ask.contains("https://github.com/o/r/issues/1"), "got {ask:?}");
         assert!(!ask.contains("#3"), "the unstarred issue is never narrated: {ask:?}");
@@ -522,6 +526,6 @@ mod tests {
 
         let done = received[1]["body"].as_str().unwrap();
         assert!(done.contains("r#1 · operator ask resolved ✓"), "got {done:?}");
-        assert!(!done.contains("@robb:matrix.org"), "a recovery does not re-ping: {done:?}");
+        assert!(!done.contains("@operator:example.org"), "a recovery does not re-ping: {done:?}");
     }
 }

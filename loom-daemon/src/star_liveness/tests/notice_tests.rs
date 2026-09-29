@@ -242,6 +242,29 @@ fn web_base_is_derived_from_the_origin_remote() {
     );
     assert_eq!(web_base_from_remote("https://github.com/o/r.git"), "https://github.com");
     assert_eq!(web_base_from_remote("http://gitea.local/o/r.git"), "http://gitea.local");
+    // `ssh://` is its own remote shape, not covered by the scp-like `git@`
+    // branch above: without an explicit arm it fell through to DEFAULT_WEB_BASE,
+    // pointing a private Gitea repo's escalation at an unrelated public GitHub
+    // repo with the same slug.
+    assert_eq!(
+        web_base_from_remote("ssh://git@gitea.example.com/o/r.git"),
+        "https://gitea.example.com"
+    );
+    assert_eq!(
+        web_base_from_remote("ssh://gitea.example.com/o/r.git\n"),
+        "https://gitea.example.com",
+        "userinfo is optional"
+    );
+    assert_eq!(
+        web_base_from_remote("ssh://git@gitea.example.com:2222/o/r.git"),
+        "https://gitea.example.com",
+        "the SSH port is not the forge's web port, so it is dropped"
+    );
     assert_eq!(web_base_from_remote("not-a-url"), DEFAULT_WEB_BASE);
     assert_eq!(web_base_from_remote(""), DEFAULT_WEB_BASE);
+    assert_eq!(
+        web_base_from_remote("ssh://"),
+        DEFAULT_WEB_BASE,
+        "a scheme with no host is not a web base"
+    );
 }
