@@ -1834,8 +1834,9 @@ heartbeat comments over 10 days, and survived a body-only fix (rewording away
 the matched phrase) because the comment history is immutable — the phrase
 lived on forever in a past comment. `extract-refs` closes the loop instead of
 papering over it: it scans the **body** unconditionally, but a **comment**
-only when it is neither authored by the automation identity (`--bot-login`,
-default `loom-fleet-dispatch`) nor itself carrying a
+only when it is neither authored by one of the fleet's own App identities
+(`--bot-login`, default: every identity in the forge roster — the writer, each
+reader, legacy logins — see `loom-daemon forge identities`) nor itself carrying a
 `curator:dep-recheck:`/`curator:operator-premise-recheck:` marker — so the
 bot's own historical heartbeat comments are never treated as new evidence,
 while a genuine NEW human-authored "Blocked by #N" comment still is.

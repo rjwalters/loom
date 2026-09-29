@@ -2075,8 +2075,9 @@ An escalation is one comment on the issue, carrying
 (issue, key) is posted once: a per-process ledger skips repeats without a
 forge call, and every host reads the issue's comments for the marker before
 posting. Only a marker from an `OWNER` / `MEMBER` / `COLLABORATOR`, the fleet
-App (`LOOM_GITHUB_APP_SLUG` > `forge.githubApp.slug`, else
-`loom-fleet-dispatch*`; only as an App login, `…[bot]` or `app/…`, which no
+App (any identity in the forge roster — `LOOM_GITHUB_APP_SLUG` > the writer's
+slug, each reader, `legacyLogins` — plus `loom-fleet-dispatch` / `-<digits>`
+exactly, never a prefix; only as an App login, `…[bot]` or `app/…`, which no
 user can register) or the daemon itself counts; an outside commenter cannot
 pre-post one to suppress an ask. The `pools-exhausted` key is the issue's forge state, not the
 host's hold, so every host and every re-exhaustion share it until the issue
