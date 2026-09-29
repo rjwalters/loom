@@ -344,7 +344,11 @@ pub fn ingest(db: &ActivityDb, opts: &IngestOptions) -> Result<IngestStats> {
             // config that only wants one of the two record kinds gets
             // exactly that.
             if opts.summary_sink.is_some() || opts.analysis_sink.is_some() {
-                let summary = build_session_summary(&path, &parsed);
+                // The record's join keys — repo slug, issue, PR, session
+                // kind (#9445). Resolved once here, where the pass may
+                // touch the filesystem, and shared by both records.
+                let context = crate::activity::session_context::SessionContext::resolve(&parsed);
+                let summary = build_session_summary(&path, &parsed, &context);
                 if let Some(sink) = &opts.analysis_sink {
                     sink.push(build_session_analysis(&summary, &parsed));
                     stats.session_analyses += 1;

@@ -371,7 +371,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // the parse never copies message text or tool output, so
             // nothing here needs a free-text bound beyond `bounded`'s.
             let mut attributes = vec![
-                kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_string("loom.session_id", r.session_id.clone()),
                 kv_string("loom.runtime", r.runtime.clone()),
@@ -384,7 +383,15 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 kv_int("loom.tool_errors", i64::try_from(r.tool_errors).unwrap_or(i64::MAX)),
             ];
             // Optional fields stay absent when unknown — an unobserved
-            // attribution must be an ABSENT attribute, never a zero one.
+            // attribution must be an ABSENT attribute, never a zero one. That
+            // now includes `loom.repo` (#9445): an unresolvable repo is an
+            // absent slug, never the session's directory name.
+            if let Some(repo) = &r.repo {
+                attributes.push(kv_string("loom.repo", repo.clone()));
+            }
+            if let Some(kind) = r.session_kind {
+                attributes.push(kv_string("loom.session_kind", kind.as_str().to_string()));
+            }
             if let Some(parent) = &r.parent_session_id {
                 attributes.push(kv_string("loom.parent_session_id", parent.clone()));
             }
@@ -430,7 +437,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                     "session summary: {} {} on {}, {} turn(s), {} tool call(s)",
                     r.runtime,
                     r.role.as_deref().unwrap_or("role-unknown"),
-                    r.repo,
+                    r.repo.as_deref().unwrap_or("repo-unresolved"),
                     r.turns,
                     r.tool_calls.iter().map(|c| c.count).sum::<u64>(),
                 ),
@@ -442,10 +449,14 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // rollup, mapped as a log record like `session.summary` — an
             // event with counts and a dollar figure, not a gauge.
             let mut attributes = vec![
-                kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_string("loom.session_id", r.session_id.clone()),
             ];
+            // Absent, never a directory name — see the `session.summary` arm
+            // (#9445); this record copies that one's slug verbatim.
+            if let Some(repo) = &r.repo {
+                attributes.push(kv_string("loom.repo", repo.clone()));
+            }
             if let Some(parent) = &r.parent_session_id {
                 attributes.push(kv_string("loom.parent_session_id", parent.clone()));
             }
@@ -504,7 +515,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 format!(
                     "session analysis: {} on {}, {} retry loop(s), {} anomaly flag(s)",
                     r.session_id,
-                    r.repo,
+                    r.repo.as_deref().unwrap_or("repo-unresolved"),
                     r.retry_loops.len(),
                     r.anomalies.len(),
                 ),

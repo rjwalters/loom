@@ -170,6 +170,54 @@ fn session_summary_never_carries_prompt_tool_output_key_or_email() {
     assert_eq!(attribute(&log, "loom.turns"), Some(any_value::Value::IntValue(1)));
     assert!(attribute(&log, "loom.outcome").is_none(), "unknown outcome stays absent");
 }
+
+/// Issue #9445: the join keys map onto the wire as attributes — and an
+/// unresolved repo is an **absent** `loom.repo`, never a directory name.
+#[test]
+fn session_summary_maps_its_join_keys_and_omits_an_unresolved_repo() {
+    let base = serde_json::json!({
+        "session_id": "uuid-a", "runtime": "claude", "models": [],
+        "tokens_input": 0, "tokens_output": 0,
+        "tokens_cache_read": 0, "tokens_cache_write": 0,
+        "wall_ms": 0, "turns": 0, "tool_calls": [], "tool_errors": 0,
+    });
+    let with = |extra: serde_json::Value| {
+        let mut value = base.clone();
+        let (object, extra) = (value.as_object_mut().unwrap(), extra);
+        for (key, item) in extra.as_object().unwrap() {
+            object.insert(key.clone(), item.clone());
+        }
+        let record: crate::telemetry::SessionSummaryRecord = serde_json::from_value(value).unwrap();
+        map(TelemetryRecord::SessionSummary(record))
+    };
+
+    let joined = with(serde_json::json!({
+        "repo": "apache/superset", "issue": 9445, "pr_number": 9460,
+        "session_kind": "sweep",
+    }));
+    assert_eq!(
+        attribute(&joined, "loom.repo"),
+        Some(any_value::Value::StringValue("apache/superset".into()))
+    );
+    assert_eq!(attribute(&joined, "loom.issue"), Some(any_value::Value::IntValue(9445)));
+    assert_eq!(attribute(&joined, "loom.pr_number"), Some(any_value::Value::IntValue(9460)));
+    assert_eq!(
+        attribute(&joined, "loom.session_kind"),
+        Some(any_value::Value::StringValue("sweep".into()))
+    );
+
+    let unresolved = with(serde_json::json!({ "session_kind": "interactive" }));
+    assert!(
+        attribute(&unresolved, "loom.repo").is_none(),
+        "an unresolvable repo is absent, not a guessed name"
+    );
+    assert!(attribute(&unresolved, "loom.issue").is_none());
+    assert_eq!(
+        attribute(&unresolved, "loom.session_kind"),
+        Some(any_value::Value::StringValue("interactive".into())),
+        "so the absent issue reads as deliberate"
+    );
+}
 /// Issue #8760: a `session.analysis` record — every field a count, id,
 /// allowlisted tool name, duration, or derived dollar figure — carries none
 /// of a prompt/tool-output/key/email marker onto the OTLP wire either,

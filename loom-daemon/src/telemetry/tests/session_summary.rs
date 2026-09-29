@@ -6,14 +6,15 @@ use super::*;
 
 pub fn session_summary() -> TelemetryRecord {
     TelemetryRecord::SessionSummary(SessionSummaryRecord {
-        repo: "loom".to_string(),
+        repo: Some("rjwalters/loom".to_string()),
         visibility: RepoVisibility::Private,
         session_id: "uuid-a".to_string(),
         parent_session_id: Some("uuid-parent".to_string()),
         runtime: "claude".to_string(),
         role: Some("builder".to_string()),
         issue: Some(8757),
-        pr_number: None,
+        pr_number: Some(9460),
+        session_kind: Some(SessionKind::Sweep),
         models: vec!["claude-sonnet-5".to_string()],
         tokens_input: 12,
         tokens_output: 24,
@@ -74,11 +75,67 @@ fn session_summary_unknown_optionals_stay_absent_never_fabricated() {
     inner.parent_session_id = None;
     inner.role = None;
     inner.issue = None;
+    inner.pr_number = None;
     inner.outcome = None;
+    // #9445: an unresolvable repo is an ABSENT slug, never a directory name.
+    inner.repo = None;
     let json = serde_json::to_string(&record).unwrap();
-    for absent in ["parent_session_id", "role", "issue", "pr_number", "outcome"] {
+    for absent in [
+        "parent_session_id",
+        "role",
+        "issue",
+        "pr_number",
+        "outcome",
+        "repo",
+    ] {
         assert!(!json.contains(&format!("\"{absent}\"")), "{absent} fabricated: {json}");
     }
     // Measured fields are always present, even at zero.
     assert!(json.contains("\"turns\":0") || json.contains("\"turns\":1"));
+}
+
+/// #9445: the gateway's log allowlist must keep `loom.session_kind` — an
+/// attribute the collector drops is one no query can read, so this is as
+/// load-bearing as emitting it (the `collector_keeps_every_eta_log_attribute`
+/// precedent).
+#[test]
+fn collector_keeps_the_session_summary_join_keys() {
+    const CONFIG: &str = include_str!("../../../../defaults/observability/collector/config.yaml");
+    let log_keep = CONFIG
+        .lines()
+        .find(|l| {
+            l.contains("keep_keys(attributes, [\"loom.repo\"") && l.contains("loom.ci.chunk_index")
+        })
+        .expect("the transform/privacy log keep_keys line");
+    for key in [
+        "loom.repo",
+        "loom.issue",
+        "loom.pr_number",
+        "loom.session_kind",
+    ] {
+        assert!(log_keep.contains(&format!("\"{key}\"")), "collector drops {key}");
+    }
+}
+
+/// #9445: the join keys survive the wire, and `session_kind` decodes back to
+/// the same variant (a record predating the field decodes as absent, not as a
+/// guessed `interactive`).
+#[test]
+fn session_summary_carries_its_join_keys_over_the_wire() {
+    let record = session_summary();
+    let json = serde_json::to_string(&record).unwrap();
+    assert!(json.contains("\"repo\":\"rjwalters/loom\""), "{json}");
+    assert!(json.contains("\"issue\":8757"), "{json}");
+    assert!(json.contains("\"pr_number\":9460"), "{json}");
+    assert!(json.contains("\"session_kind\":\"sweep\""), "{json}");
+    let decoded: TelemetryRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(record, decoded);
+
+    let TelemetryRecord::SessionSummary(legacy) =
+        serde_json::from_str::<TelemetryRecord>(&json.replace("\"session_kind\":\"sweep\",", ""))
+            .unwrap()
+    else {
+        panic!("kind tag");
+    };
+    assert_eq!(legacy.session_kind, None, "a pre-#9445 record stays honestly unlabelled");
 }

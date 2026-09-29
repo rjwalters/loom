@@ -2,9 +2,13 @@
 //! (Issue #8757, G3 of epic #8714).
 //!
 //! Pure derivation only — this module reads a
-//! [`ParsedTranscript`](super::transcript_parse::ParsedTranscript) plus the
-//! transcript's path (for the parent/subagent split) and produces a
-//! [`SessionSummaryRecord`]. The ingest pass
+//! [`ParsedTranscript`](super::transcript_parse::ParsedTranscript), the
+//! transcript's path (for the parent/subagent split) and the session's
+//! already-resolved join keys
+//! ([`SessionContext`](super::session_context::SessionContext), Issue #9445 —
+//! the repo slug and PR number in it are the one part of this record that
+//! needs a filesystem read, so the ingest pass resolves them and passes them
+//! in) and produces a [`SessionSummaryRecord`]. The ingest pass
 //! ([`super::transcript_ingest`]) owns *when* it is emitted (once per
 //! transcript that contributed `resource_usage` rows, on each pass that
 //! re-reads a changed file) and *where* it goes (the observability
@@ -21,8 +25,9 @@
 
 use std::path::Path;
 
+use crate::activity::session_context::SessionContext;
 use crate::activity::transcript_parse::ParsedTranscript;
-use crate::telemetry::{RepoVisibility, SessionSummaryRecord, ToolCallCount};
+use crate::telemetry::{SessionSummaryRecord, ToolCallCount};
 
 /// Runtime label this pass stamps. It reads Claude Code transcripts only;
 /// #8664's per-runtime tails are the future producers for other runtimes.
@@ -36,8 +41,17 @@ const RUNTIME: &str = "claude";
 /// the file stem) plus the enclosing session's uuid as
 /// `parent_session_id`; a parent-session transcript gets its records'
 /// `sessionId` (file-stem fallback) and no parent.
+///
+/// `context` carries the join keys — repo slug, issue, PR, session kind —
+/// which the ingest pass resolves once per transcript
+/// ([`SessionContext::resolve`], Issue #9445) because two of them need a
+/// filesystem read this pure derivation must not make.
 #[must_use]
-pub fn build_session_summary(path: &Path, parsed: &ParsedTranscript) -> SessionSummaryRecord {
+pub fn build_session_summary(
+    path: &Path,
+    parsed: &ParsedTranscript,
+    context: &SessionContext,
+) -> SessionSummaryRecord {
     let is_subagent = path
         .parent()
         .and_then(Path::file_name)
@@ -89,17 +103,18 @@ pub fn build_session_summary(path: &Path, parsed: &ParsedTranscript) -> SessionS
     };
 
     SessionSummaryRecord {
-        // `unknown` matches `cost_by_role`'s convention for an
-        // unattributable row — honest rather than a guess.
-        repo: parsed.repo.clone().unwrap_or_else(|| "unknown".to_string()),
+        // The resolved `owner/name` slug, absent when no remote answered —
+        // never the cwd basename (#9445).
+        repo: context.repo.clone(),
         // Fail-closed default; see the record's field doc.
-        visibility: RepoVisibility::Private,
+        visibility: context.visibility,
         session_id,
         parent_session_id,
         runtime: RUNTIME.to_string(),
         role: parsed.role.clone(),
-        issue: parsed.issue.and_then(|i| u32::try_from(i).ok()),
-        pr_number: None,
+        issue: context.issue,
+        pr_number: context.pr_number,
+        session_kind: Some(context.kind),
         models,
         tokens_input: sum(|b| b.tokens_input),
         tokens_output: sum(|b| b.tokens_output),
@@ -135,6 +150,21 @@ mod tests {
 
     fn fallback() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc.with_ymd_and_hms(2026, 9, 23, 12, 0, 0).unwrap()
+    }
+
+    /// The transcript-derived join keys plus the slug the ingest pass would
+    /// have resolved from the workspace's remote — so these derivation tests
+    /// need no checkout of their own (`session_context::tests` owns the
+    /// remote-resolution cases).
+    fn context(parsed: &ParsedTranscript) -> SessionContext {
+        SessionContext {
+            repo: Some("rjwalters/loom".to_string()),
+            ..SessionContext::derive(parsed)
+        }
+    }
+
+    fn summary(path: &Path, parsed: &ParsedTranscript) -> SessionSummaryRecord {
+        build_session_summary(path, parsed, &context(parsed))
     }
 
     fn write_transcript(dir: &Path, name: &str, lines: &[String]) -> std::path::PathBuf {
@@ -241,15 +271,15 @@ mod tests {
         );
 
         let parsed = parse_transcript(&path, fallback());
-        let record = build_session_summary(&path, &parsed);
+        let record = summary(&path, &parsed);
 
         assert_eq!(record.session_id, "uuid-a");
         assert_eq!(record.parent_session_id, None);
         assert_eq!(record.runtime, "claude");
         assert_eq!(record.role.as_deref(), Some("sweep"));
         assert_eq!(record.issue, Some(8757));
-        assert_eq!(record.repo, "loom");
-        assert_eq!(record.visibility, RepoVisibility::Private);
+        assert_eq!(record.repo.as_deref(), Some("rjwalters/loom"));
+        assert_eq!(record.visibility, crate::telemetry::RepoVisibility::Private);
         assert_eq!(record.models, vec!["claude-opus-5", "claude-sonnet-5"]);
         // msg_1 (1/2) + msg_2 (1/2) + msg_3 (10/20, the streamed repeat
         // folded) — cache fields only on msg_3.
@@ -290,7 +320,7 @@ mod tests {
         let path = write_transcript(&subagents, "agent-1.jsonl", &lines);
 
         let parsed = parse_transcript(&path, fallback());
-        let record = build_session_summary(&path, &parsed);
+        let record = summary(&path, &parsed);
 
         assert_eq!(record.session_id, "agent-1");
         assert_eq!(record.parent_session_id.as_deref(), Some("uuid-a"));
@@ -313,7 +343,7 @@ mod tests {
         let path = write_transcript(&subagents, "agent-2.jsonl", &lines);
 
         let parsed = parse_transcript(&path, fallback());
-        let record = build_session_summary(&path, &parsed);
+        let record = summary(&path, &parsed);
 
         assert_eq!(record.session_id, "sub-session-9");
         assert_eq!(record.parent_session_id.as_deref(), Some("uuid-a"));
@@ -344,7 +374,7 @@ mod tests {
         );
 
         let parsed = parse_transcript(&path, fallback());
-        let record = build_session_summary(&path, &parsed);
+        let record = summary(&path, &parsed);
 
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains("SECRET"), "raw secret material leaked: {json}");
