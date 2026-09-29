@@ -28,6 +28,16 @@ const ALLOWED_KEYS: &[&str] = &[
     "loom.recovered",
     "loom.timing_source",
     "loom.tool.name",
+    "loom.host.mem_total_bytes",
+    "loom.host.mem_available_bytes",
+    "loom.host.mem_compressed_bytes",
+    "loom.host.swap_total_bytes",
+    "loom.host.swap_used_bytes",
+    "loom.host.swap_in_bytes_total",
+    "loom.host.swap_out_bytes_total",
+    "loom.host.oom_kill_total",
+    "loom.host.pressure",
+    "loom.host.load_per_core",
 ];
 
 fn traced_root() -> tempfile::TempDir {

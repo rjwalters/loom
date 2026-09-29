@@ -170,23 +170,28 @@ pub fn swap_rates(
     now_in: Option<u64>,
     now_out: Option<u64>,
 ) -> (Option<f64>, Option<f64>) {
+    // Elapsed times under this are indistinguishable from measurement/
+    // scheduling noise for this per-boundary telemetry, and dividing a real
+    // counter delta by a near-zero duration produces a nonsense spike rather
+    // than an honest "no rate yet".
+    const MIN_RATE_ELAPSED_SECS: f64 = 1.0;
     let rate = |prev: u64, now: Option<u64>, at: std::time::Instant| {
         let now = now?;
         if now < prev {
             return None; // counter reset: the delta is not a rate
         }
         let secs = at.elapsed().as_secs_f64();
-        if secs <= 0.0 {
+        if secs < MIN_RATE_ELAPSED_SECS {
             return None;
         }
         Some((now - prev) as f64 / secs)
     };
-    match (prev, now_in, now_out) {
-        (Some(prev), Some(in_now), Some(out_now)) => (
-            rate(prev.swap_in_bytes_total, Some(in_now), prev.at),
-            rate(prev.swap_out_bytes_total, Some(out_now), prev.at),
+    match prev {
+        Some(prev) => (
+            rate(prev.swap_in_bytes_total, now_in, prev.at),
+            rate(prev.swap_out_bytes_total, now_out, prev.at),
         ),
-        _ => (None, None),
+        None => (None, None),
     }
 }
 
@@ -341,7 +346,7 @@ pub fn parse_psi_memory(text: &str) -> Option<MemoryPressure> {
         }
     }
     match (some, full) {
-        (Some(full10), Some(_)) if full10 > 0.0 => Some(MemoryPressure::Full),
+        (_, Some(full10)) if full10 > 0.0 => Some(MemoryPressure::Full),
         (Some(some10), _) if some10 > 0.0 => Some(MemoryPressure::Some),
         (Some(0.0), _) => Some(MemoryPressure::None),
         _ => None,
@@ -465,7 +470,11 @@ pub fn parse_swapusage(text: &str) -> (Option<u64>, Option<u64>) {
             return None;
         }
         let num_and_unit = *tokens.get(idx.checked_add(2)?)?;
-        let (num, unit) = num_and_unit.split_once(|c: char| !c.is_ascii_digit() && c != '.')?;
+        // `split_at`, not `split_once`: the latter consumes the matched
+        // delimiter character, dropping single-character units like `M`/`B`
+        // entirely instead of keeping them as `unit`.
+        let split = num_and_unit.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+        let (num, unit) = num_and_unit.split_at(split);
         let num: f64 = num.parse().ok()?;
         let mult: f64 = match unit {
             "M" => 1024.0 * 1024.0,
@@ -661,7 +670,9 @@ Swapouts:                                   567.
     fn rates_missing_counter_is_none_per_side() {
         let (rin, rout) = swap_rates(Some(sample_at(0, 0, 5)), None, Some(10));
         assert_eq!(rin, None);
-        assert_eq!(rout, Some(2.0));
+        // ~2.0 B/s (10 B over ~5s); not exact equality, since `at.elapsed()`
+        // is real wall-clock time and always a hair over the nominal 5s.
+        assert!(rout.unwrap() > 1.9 && rout.unwrap() < 2.1);
     }
 
     #[test]
