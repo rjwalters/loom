@@ -166,12 +166,16 @@ pub(crate) fn identities(as_json: bool) -> Result<()> {
     let roster = forge_identity::resolve(&ws);
     let tokens = published(&ws, &roster);
     let fleet = forge_identity::FleetLogins::of(&roster).names();
+    let warnings = forge_identity::config_warnings_for(&ws);
     if as_json {
         let tokens: Vec<Value> = tokens
             .iter()
             .map(|(o, a, e)| json!({"owner": o, "appId": a, "expiresAt": e}))
             .collect();
-        println!("{}", json!({"roster": roster, "fleetLogins": fleet, "readerTokens": tokens}));
+        println!(
+            "{}",
+            json!({"roster": roster, "fleetLogins": fleet, "readerTokens": tokens, "warnings": warnings})
+        );
         return Ok(());
     }
     let show =
@@ -190,6 +194,9 @@ pub(crate) fn identities(as_json: bool) -> Result<()> {
         println!("reader:  {}", show(r));
     }
     println!("fleet logins: {}", fleet.join(", "));
+    for w in &warnings {
+        println!("WARNING: {w}");
+    }
     for (owner, app, exp) in &tokens {
         println!("  reader token {app} for {owner}: expires {exp}");
     }

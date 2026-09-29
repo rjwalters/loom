@@ -311,20 +311,31 @@ Every host is configured the same way. There is no per-host pinning:
 
 ```json
 "forge": {
+  "githubApp": { "appId": "…", "privateKeyPath": "/abs/path/writer.pem" },
   "identities": {
     "writer":  { "appId": "…", "slug": "loom-fleet-dispatch",  "privateKeyPath": "/abs/path/writer.pem" },
     "readers": [
       { "appId": "…", "slug": "loom-fleet-reader-1", "privateKeyPath": "/abs/path/reader-1.pem" },
       { "appId": "…", "slug": "loom-fleet-reader-2", "privateKeyPath": "/abs/path/reader-2.pem" }
     ],
-    "legacyLogins": ["loom-fleet-dispatch-0"]
+    "legacyLogins": []
   }
 }
 ```
 
-- **Without `forge.identities`**, `forge.githubApp` is the writer and
-  `forge.githubAppReadPool` / `LOOM_GITHUB_APP_READ_POOL` supply the readers.
-  With neither set, reads and writes share the one App, as before.
+- **`forge.githubApp` is the writer, always.** It is the App every write
+  mints from: the daemon's credential delivery, agent sessions, and
+  `merge-pr.sh`. Keep it set. `forge.identities.writer` is optional. If
+  present, it must name the **same** App; it only adds the writer's `slug`.
+  A different App there cannot redirect writes: Loom treats
+  `forge.githubApp` as the writer and reports the mismatch. So does
+  `forge identities`, which also flags an `identities.writer` set without
+  `forge.githubApp`, since writes then fall back to ambient `gh` auth.
+- **Readers** come from `forge.identities.readers`. Without an `identities`
+  block, they come from the older `forge.githubAppReadPool` /
+  `LOOM_GITHUB_APP_READ_POOL`, which have no slugs, so a renamed reader's
+  history is not recognised until the host moves to `forge.identities`.
+  With no readers configured at all, reads share the writer, as before.
 - **Read routing**: each repo's reads go to `hash(owner/repo) mod N`, the same
   reader on every host. A reader that hits a rate limit or an auth/coverage
   error is withdrawn (until the reported reset, where GitHub gives one) and

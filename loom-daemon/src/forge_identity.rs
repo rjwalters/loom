@@ -201,6 +201,36 @@ pub fn from_config(
     roster
 }
 
+/// Config problems an operator should see: the writer declared in
+/// `forge.identities` disagreeing with `forge.githubApp`, or declared without
+/// it. `forge identities` prints these (the daemon also logs them), so a
+/// misconfiguration is visible where an operator checks, not only in a log.
+#[must_use]
+pub fn config_warnings(effective: &Value) -> Vec<String> {
+    let configured = crate::config_resolver::get_path(effective, "forge.githubApp")
+        .and_then(identity_from_value);
+    let declared = crate::config_resolver::get_path(effective, "forge.identities")
+        .and_then(|ids| ids.get("writer"))
+        .and_then(identity_from_value);
+    match (configured, declared) {
+        (Some(c), Some(d)) if c.app_id != d.app_id => vec![format!(
+            "forge.identities.writer (app {}) differs from forge.githubApp (app {}); writes use app {} — make them agree",
+            d.app_id, c.app_id, c.app_id
+        )],
+        (None, Some(d)) => vec![format!(
+            "forge.identities.writer (app {}) is set but forge.githubApp is not: writes fall back to ambient gh auth — set forge.githubApp",
+            d.app_id
+        )],
+        _ => Vec::new(),
+    }
+}
+
+/// [`config_warnings`] for the workspace at `root`.
+#[must_use]
+pub fn config_warnings_for(root: &Path) -> Vec<String> {
+    config_warnings(&crate::config_resolver::resolve_effective_config(root))
+}
+
 /// Pick the roster's writer from the App that writes (`forge.githubApp`) and
 /// the one `forge.identities.writer` declares.
 fn reconcile_writer(configured: Option<Identity>, declared: Option<Identity>) -> Option<Identity> {
