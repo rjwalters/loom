@@ -10,10 +10,7 @@
  * - Query agent metrics
  */
 
-import { exec } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
-import { promisify } from "node:util";
+import { readFile } from "node:fs/promises";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import stripAnsi from "strip-ansi";
 import {
@@ -32,14 +29,14 @@ import { sendDaemonRequest } from "../shared/daemon.js";
 import { formatTerminalOutput } from "../shared/formatting.js";
 import { writeMCPCommand } from "../shared/ipc.js";
 import type {
-  AgentMetricsResult,
   ConfigureTerminalOptions,
   CreateTerminalConfig,
   LogResult,
   Terminal,
 } from "../types.js";
-
-const execAsync = promisify(exec);
+// `get_agent_metrics` is the one tool here that spawns a child process; its
+// argument validation and execution live in their own module (Issue #9107).
+import { getAgentMetrics } from "./agent-metrics.js";
 
 /**
  * Extract error message from daemon error responses.
@@ -510,90 +507,6 @@ async function setPrimaryTerminal(terminalId: string): Promise<{
 }
 
 /**
- * Get agent performance metrics
- */
-async function getAgentMetrics(options: {
-  command?: string;
-  role?: string;
-  period?: string;
-  format?: string;
-  issue?: number;
-}): Promise<AgentMetricsResult> {
-  const workspacePath = getWorkspacePath();
-  const scriptPath = join(workspacePath, ".loom", "scripts", "agent-metrics.sh");
-
-  try {
-    await stat(scriptPath);
-  } catch {
-    return {
-      success: false,
-      error: `Agent metrics script not found at ${scriptPath}. Ensure Loom is installed.`,
-      format: "text",
-      output: "",
-    };
-  }
-
-  const args: string[] = [];
-
-  if (options.command && options.command !== "summary") {
-    args.push(options.command);
-  }
-
-  if (options.role) {
-    args.push("--role", options.role);
-  }
-
-  if (options.period) {
-    args.push("--period", options.period);
-  }
-
-  const format = options.format || "json";
-  args.push("--format", format);
-
-  if (options.issue) {
-    args.push("--issue", String(options.issue));
-  }
-
-  try {
-    const { stdout, stderr } = await execAsync(`bash "${scriptPath}" ${args.join(" ")}`, {
-      cwd: workspacePath,
-    });
-
-    if (stderr) {
-      console.error("agent-metrics.sh stderr:", stderr);
-    }
-
-    let data: unknown;
-    if (format === "json") {
-      try {
-        data = JSON.parse(stdout.trim());
-      } catch {
-        return {
-          success: true,
-          output: stdout.trim(),
-          format: "text",
-        };
-      }
-    }
-
-    return {
-      success: true,
-      data,
-      output: stdout.trim(),
-      format: format as "json" | "text",
-    };
-  } catch (error) {
-    const err = error as { stderr?: string; message?: string };
-    return {
-      success: false,
-      error: err.stderr || err.message || String(error),
-      format: "text",
-      output: "",
-    };
-  }
-}
-
-/**
  * Terminal tool definitions
  */
 export const terminalTools: Tool[] = [
@@ -828,6 +741,9 @@ export const terminalTools: Tool[] = [
     },
   },
   {
+    // The `enum`s below are advertised to the client; they are NOT enforced by
+    // the MCP SDK. The server-side allow-lists in `agent-metrics.ts` are what
+    // actually gate these values (Issue #9107) — keep the two in sync.
     name: "get_agent_metrics",
     description:
       "Get agent performance metrics for self-aware behavior. Enables agents to query their own effectiveness, costs, and velocity. Use this to check if struggling with a task type, select approaches based on historical success, or decide to escalate when below threshold. Part of Phase 5 (Autonomous Learning).",
@@ -1251,21 +1167,19 @@ export async function handleTerminalTool(
     }
 
     case "get_agent_metrics": {
-      const command = (args?.command as string) || "summary";
-      const role = args?.role as string | undefined;
-      const period = (args?.period as string) || "week";
-      const format = (args?.format as string) || "json";
-      const issue = args?.issue as number | undefined;
-
+      // Issue #9107: pass the raw MCP values straight through — no `as string`
+      // casts, which asserted a type the SDK never checked. `getAgentMetrics`
+      // allow-lists every one of them before anything is spawned, and echoes
+      // the resolved values back in `result.filters` for display below.
       const result = await getAgentMetrics({
-        command,
-        role,
-        period,
-        format,
-        issue,
+        command: args?.command,
+        role: args?.role,
+        period: args?.period,
+        format: args?.format,
+        issue: args?.issue,
       });
 
-      if (!result.success) {
+      if (!result.success || !result.filters) {
         return [
           {
             type: "text",
@@ -1273,6 +1187,8 @@ export async function handleTerminalTool(
           },
         ];
       }
+
+      const { command, role, period, format, issue } = result.filters;
 
       const header = `=== Agent Metrics (${command}) ===\n`;
       const filterInfo = [

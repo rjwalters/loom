@@ -193,7 +193,8 @@ mod tests {
     /// `session.analysis` from both.
     fn analyze(path: &Path) -> SessionAnalysisRecord {
         let parsed = parse_transcript(path, fallback());
-        let summary = build_session_summary(path, &parsed);
+        let context = crate::activity::session_context::SessionContext::derive(&parsed);
+        let summary = build_session_summary(path, &parsed, &context);
         build_session_analysis(&summary, &parsed)
     }
 
@@ -304,7 +305,7 @@ mod tests {
     #[test]
     fn high_token_usage_raises_the_anomaly_flag() {
         let summary = SessionSummaryRecord {
-            repo: "loom".to_string(),
+            repo: Some("rjwalters/loom".to_string()),
             visibility: crate::telemetry::RepoVisibility::Private,
             session_id: "uuid-a".to_string(),
             parent_session_id: None,
@@ -312,6 +313,7 @@ mod tests {
             role: None,
             issue: None,
             pr_number: None,
+            session_kind: Some(crate::telemetry::SessionKind::Interactive),
             models: vec!["claude-sonnet-5".to_string()],
             tokens_input: HIGH_TOKEN_USAGE_THRESHOLD,
             tokens_output: 1,
@@ -331,7 +333,7 @@ mod tests {
     #[test]
     fn ordinary_token_usage_raises_no_anomaly() {
         let summary = SessionSummaryRecord {
-            repo: "loom".to_string(),
+            repo: Some("rjwalters/loom".to_string()),
             visibility: crate::telemetry::RepoVisibility::Private,
             session_id: "uuid-a".to_string(),
             parent_session_id: None,
@@ -339,6 +341,7 @@ mod tests {
             role: None,
             issue: None,
             pr_number: None,
+            session_kind: Some(crate::telemetry::SessionKind::Interactive),
             models: vec!["claude-sonnet-5".to_string()],
             tokens_input: 100,
             tokens_output: 100,

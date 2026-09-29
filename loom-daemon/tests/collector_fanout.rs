@@ -672,3 +672,38 @@ fn gateway_forwards_exactly_the_ci_telemetry_vocabulary() {
         assert!(keep("span").contains(*key), "span keep_keys drops role-tick story key {key}");
     }
 }
+
+/// Issue #9440: the gateway must forward the `tokens_status` pair, because the
+/// pair's only job is to make an *absent* `loom.tokens_in` readable. A
+/// `keep_keys` allowlist that strips them leaves a failed sweep's record
+/// looking exactly as ambiguous as it did before #9440 — the token counters
+/// arrive, the explanation for their absence does not, and a lifecycle-cost
+/// query silently undercounts again.
+#[test]
+fn gateway_forwards_the_tokens_status_pair() {
+    let log_keys = {
+        let mut current = "";
+        let mut keys = Vec::new();
+        for line in CONFIG.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("- context:") {
+                current = rest.trim();
+            }
+            if current == "log" && line.contains("keep_keys(") {
+                keys.extend(line.split('"').skip(1).step_by(2).map(str::to_owned));
+            }
+        }
+        keys
+    };
+    for key in ["loom.tokens_status", "loom.tokens_status_reason"] {
+        assert!(
+            log_keys.iter().any(|k| k == key),
+            "log keep_keys drops {key}; an absent loom.tokens_in becomes unreadable again"
+        );
+    }
+    // Stated beside the allowlist, so a reviewer reading the list sees why the
+    // two keys are there rather than having to find this test.
+    assert!(
+        CONFIG.contains("sweep.outcome (#9440) adds loom.tokens_status"),
+        "config.yaml must state why the #9440 status pair is allowlisted"
+    );
+}

@@ -1853,6 +1853,8 @@ pub use dispatch_plan::{
     DispatchPlanContext, PlanGate, PlanKey, PlanShard, PlanSlots, PlanState, RepoCapView, RowPlan,
     PLAN_SCOPE,
 };
+mod fleet_plan;
+pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
 mod work_finder_tick;
 pub use work_finder_tick::WorkFinderTickSummary;
 

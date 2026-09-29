@@ -2104,8 +2104,10 @@ enum TokensAction {
     /// longer exists — the package was deleted in Phase 4 (#4557) — so this name
     /// is a historical reference, not runnable advice.
     Bootstrap {
-        /// Repo root (plain path, default `.` — no upward `.git` walk). The
-        /// pool is written to `<workspace>/.loom/tokens` unless `--shared`.
+        /// Repo root (plain path, default `.` — no upward `.git` walk). This
+        /// selects the account SOURCES only: since #9135 the pool is always
+        /// written to the shared machine-level directory, never inside a
+        /// worktree.
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
 
@@ -2124,9 +2126,10 @@ enum TokensAction {
         #[arg(long)]
         no_home: bool,
 
-        /// Materialize the SHARED machine-level pool at `~/.loom/tokens`
-        /// (override with `$LOOM_SHARED_TOKENS_DIR`) instead of the repo-local
-        /// `<repo>/.loom/tokens`.
+        /// No-op, accepted for backward compatibility (#9135). The shared
+        /// machine-level pool at `~/.loom/tokens` (override with
+        /// `$LOOM_SHARED_TOKENS_DIR`) is now the only destination; the
+        /// repo-local `<repo>/.loom/tokens` pool is retired.
         #[arg(long)]
         shared: bool,
 
@@ -2150,14 +2153,15 @@ enum TokensAction {
     /// Native Rust port of the historical Python `loom-tokens
     /// import-from-monitor` CLI (issue #4106, epic #4081).
     ImportFromMonitor {
-        /// Repo root (plain path, default `.` — no upward `.git` walk). The
-        /// pool is written to `<workspace>/.loom/tokens` unless `--shared`.
+        /// Repo root (plain path, default `.` — no upward `.git` walk). Used
+        /// only to report a retired in-worktree pool: since #9135 the import
+        /// destination is always the shared machine-level pool.
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
 
-        /// Import into the SHARED machine-level pool at `~/.loom/tokens`
-        /// (override with `$LOOM_SHARED_TOKENS_DIR`) instead of the
-        /// repo-local `<repo>/.loom/tokens`.
+        /// No-op, accepted for backward compatibility (#9135). The shared
+        /// machine-level pool at `~/.loom/tokens` (override with
+        /// `$LOOM_SHARED_TOKENS_DIR`) is now the only destination.
         #[arg(long)]
         shared: bool,
 

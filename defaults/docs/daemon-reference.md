@@ -1453,11 +1453,18 @@ that died in ~2s.
 and *all* pool-state bookkeeping resolve the effective pool directory as:
 
 1. the **per-repo** pool `<repo>/.loom/tokens/` when it holds `*.token` files
-   (unchanged for the primary workspace);
+   **and that workspace is not inside a git worktree** — inside one it is
+   refused outright (issue #9135: OAuth credentials must never live in a
+   repository checkout; the refusal is reported with a migration path, and the
+   pool is never read or deleted);
 2. else the **shared** machine-level pool `~/.loom/tokens/` (override
-   `LOOM_SHARED_TOKENS_DIR`; set it empty to disable the fallback);
+   `LOOM_SHARED_TOKENS_DIR`; set it empty to disable the fallback) — the only
+   *supported* location, and the only destination `tokens bootstrap` /
+   `import-from-monitor` will write to;
 3. else the per-repo path (so a truly-unbootstrapped repo still surfaces a clear
-   "run bootstrap" error).
+   "run bootstrap" error) — except when step 1 was refused, where resolution
+   fails closed on a path that can hold no credentials rather than readmitting
+   the in-worktree pool.
 
 Crucially, the **state files** (`.bad_tokens`, `.failure_counts`, `.ranking`,
 `.allowlist`) are read/written in *whichever pool directory was selected* — so a
@@ -2164,6 +2171,8 @@ comparator rank, so the two differ whenever sharding or
 than a hard-coded string. `loom:curated` / `loom:triage` are unordered and never
 listed. The single-workspace tick has no plan (`plan: null`). Field reference:
 [`telemetry-schema.md` § `queue.snapshot`](telemetry-schema.md#queuesnapshot).
+Folding several hosts' plans into one fleet order (`merge_plans`, #9310) is a
+separate rule: [`dispatch-plan.md`](dispatch-plan.md).
 
 ## Forge-side pipeline snapshot (`status --pipeline`, #3977)
 

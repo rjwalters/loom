@@ -68,16 +68,27 @@ pub(crate) fn disk_cache_path(cache_key: &str) -> PathBuf {
     entry_path_in(&disk_cache_dir(), cache_key)
 }
 
-/// Deterministic filename for `cache_key` inside `dir` (FNV-1a hash → hex, so
-/// no path-unsafe characters from the URL leak into the filename).
+/// Deterministic filename for `cache_key` inside `dir`, prefixed with
+/// `"listing-"` (see [`entry_path_with_prefix`] for a caller-chosen prefix,
+/// used by [`crate::forge_cached_view`]'s `"view-"` entries sharing this same
+/// directory).
 pub(crate) fn entry_path_in(dir: &Path, cache_key: &str) -> PathBuf {
+    entry_path_with_prefix(dir, "listing-", cache_key)
+}
+
+/// Deterministic filename for `cache_key` inside `dir`, under `prefix` (FNV-1a
+/// hash → hex, so no path-unsafe characters from the URL leak into the
+/// filename). `prefix` lets two callers share one directory — and one
+/// `private_dir`/prune/invalidate story — while keeping their entries
+/// distinguishable by filename.
+pub(crate) fn entry_path_with_prefix(dir: &Path, prefix: &str, cache_key: &str) -> PathBuf {
     // FNV-1a 64-bit — dependency-free and more than adequate for a filename.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in cache_key.as_bytes() {
         hash ^= u64::from(*b);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    dir.join(format!("listing-{hash:016x}.json"))
+    dir.join(format!("{prefix}{hash:016x}.json"))
 }
 
 /// The on-disk entry shape: the validator ETag plus the raw JSON body it

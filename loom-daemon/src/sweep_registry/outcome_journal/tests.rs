@@ -546,9 +546,13 @@ fn telemetry_outcome_tokens_come_from_matched_transcripts() {
          \"<command-name>/loom:sweep</command-name>\\n\
          <command-args>{issue} --claim-owned {issue}</command-args>\"}}}}\n"
     );
+    // #9454: per-record attribution keys on each record's timestamp, so the
+    // fixture stamps every record now (inside the resolve window, which ends
+    // at the reaper's `now` — after this seeding).
+    let iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let usage = |input: u32, output: u32, read: u32, create: u32| {
         format!(
-            "{{\"message\":{{\"usage\":{{\"input_tokens\":{input},\
+            "{{\"timestamp\":\"{iso}\",\"message\":{{\"usage\":{{\"input_tokens\":{input},\
              \"output_tokens\":{output},\"cache_read_input_tokens\":{read},\
              \"cache_creation_input_tokens\":{create}}}}}}}\n"
         )
@@ -990,10 +994,18 @@ fn telemetry_outcome_failure_class_prefers_the_account_exhaustion_class() {
     );
 }
 
-/// A clean run carries NO `failure_class` key at all — not `null`, not
-/// `"unknown"`, not `""`. There is nothing to classify about a success.
+/// A terminal transition no classifier recognized carries no *classifier*
+/// label — but since Issue #9441 it is no longer silently unexplained: the
+/// disposition says which side the fault fell on, and `failure_class` carries
+/// the synthesized `unclassified:*` label that disposition makes mandatory.
+///
+/// This replaces the pre-#9441 assertion that the key was absent entirely. The
+/// old contract ("nothing to classify about a success") was the measurement
+/// gap #9441 exists to close: this transition is a zero-second, phase-less,
+/// no-progress death, which is exactly the 5,326-record spawn-death shape that
+/// `failure` alone could not distinguish from a hard build.
 #[test]
-fn telemetry_outcome_omits_failure_class_when_there_was_no_classification() {
+fn telemetry_outcome_synthesizes_a_class_when_no_classifier_matched() {
     let dir = tempdir().unwrap();
     let (mut registry, _rec) = fixture_registry(dir.path());
     let issue = 8059;
@@ -1012,9 +1024,16 @@ fn telemetry_outcome_omits_failure_class_when_there_was_no_classification() {
     registry.reap_once();
 
     let raw = raw_outcome_record(&registry, issue);
-    assert!(
-        raw.get("failure_class").is_none(),
-        "an unclassified terminal transition must omit failure_class entirely: {raw}"
+    assert_eq!(
+        raw.get("disposition").and_then(serde_json::Value::as_str),
+        Some("env_failure"),
+        "a zero-second, phase-less death is charged to the environment: {raw}"
+    );
+    assert_eq!(
+        raw.get("failure_class").and_then(serde_json::Value::as_str),
+        Some("unclassified:spawn-death"),
+        "#9441 invariant 2: env_failure must always say why, even when no \
+         classifier matched — a synthesized label, never an absent key: {raw}"
     );
 }
 

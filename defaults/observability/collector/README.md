@@ -259,6 +259,13 @@ counts/ids/allowlisted tool names — never transcript content, same as
 `epic.issue.*` event-bus payload, carried whole as one JSON string rather than
 re-typed per topic — see `crate::event_bus`'s frozen taxonomy).
 
+Issue #9445 adds one more allowlisted attribute and no new kind:
+`session.summary`'s `loom.session_kind` (`sweep` / `role` / `interactive`), a
+fixed three-value vocabulary that says whether a row's absent `loom.issue` is
+deliberate. The same issue makes that kind's `loom.repo` an `owner/name` forge
+slug resolved from the session workspace's git remote — omitted rather than
+falling back to the cwd basename, which had made every row unjoinable.
+
 Issue #8825 (CI telemetry, phase 2) adds a fourth, `ci.job.log`: one ≤ 8 KiB
 chunk of a completed job's log, with `loom.ci.chunk_index`,
 `loom.ci.chunk_count`, `loom.ci.log_bytes_total`, `loom.ci.truncated` and

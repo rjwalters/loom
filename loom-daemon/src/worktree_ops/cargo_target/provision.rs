@@ -301,11 +301,10 @@ fn resolve_root(root: &Path) -> PathBuf {
     )
 }
 
-/// Best-effort physical path; a non-existent path is returned unchanged rather
-/// than dropped, because the containment checks still need something to compare.
-fn realish(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
-}
+// `realish` lives in the parent module: this module and `plan_reclaim` run the
+// same symlink-sensitive `starts_with` containment check, and #9194 was two
+// byte-identical copies of it, only one of which anybody would have fixed.
+use super::realish;
 
 #[cfg(test)]
 mod tests;

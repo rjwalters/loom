@@ -4,7 +4,15 @@
  * the exact string `"public"` as private.
  */
 
-import type { QueuePlanState, QueueRepoRef, QueueRow, QueueRowState, QueueSnapshotRecord } from "./queueTypes";
+import type {
+  QueuePlanShard,
+  QueuePlanState,
+  QueuePlanView,
+  QueueRepoRef,
+  QueueRow,
+  QueueRowState,
+  QueueSnapshotRecord,
+} from "./queueTypes";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -59,7 +67,23 @@ export function parseQueueRow(value: unknown): QueueRow | undefined {
   }
   const gate = str(value.gate);
   if (gate !== undefined) row.gate = gate;
+  const owningShard = nat(value.owning_shard);
+  if (owningShard !== undefined) row.owning_shard = owningShard;
   return row;
+}
+
+/** The tick's plan block, narrowed to the shard posture (Issue #9310). A
+ * plan without a `shard` object parses to `undefined` rather than to an
+ * empty plan, so "this daemon told us nothing about sharding" and "this host
+ * is unsharded" stay distinguishable. */
+function parseQueuePlan(value: unknown): QueuePlanView | undefined {
+  if (!isObject(value) || !isObject(value.shard)) return undefined;
+  const shard: QueuePlanShard = { configured: value.shard.configured === true };
+  const hostShard = nat(value.shard.host_shard);
+  if (hostShard !== undefined) shard.host_shard = hostShard;
+  const shardCount = nat(value.shard.shard_count);
+  if (shardCount !== undefined) shard.shard_count = shardCount;
+  return { shard };
 }
 
 function parseRepoRef(value: unknown): QueueRepoRef | undefined {
@@ -95,6 +119,8 @@ export function parseQueueSnapshot(value: unknown): QueueSnapshotRecord | undefi
   };
   const maxConcurrent = nat(value.max_concurrent);
   if (maxConcurrent !== undefined) record.max_concurrent = maxConcurrent;
+  const plan = parseQueuePlan(value.plan);
+  if (plan !== undefined) record.plan = plan;
   const withheld = nat(value.withheld_rows);
   if (withheld !== undefined) record.withheld_rows = withheld;
   return record;

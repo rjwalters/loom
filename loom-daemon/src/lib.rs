@@ -188,6 +188,7 @@ pub mod forge_read_pool;
 pub mod gh_repo_env;
 pub mod git_parser;
 pub mod git_utils;
+pub mod guard_wiring;
 pub mod hard_exclusion;
 pub mod health;
 pub mod health_monitor;
@@ -209,6 +210,7 @@ pub mod launchd_reload;
 pub mod limit_calibration;
 pub mod live_claim;
 pub mod main_health_gate;
+pub mod mcp_tool_guard;
 pub mod merge_pr;
 pub mod metrics_collector;
 pub mod observability;
@@ -231,6 +233,12 @@ pub mod ram_headroom;
 pub mod rate_limit_breaker;
 pub mod reclaim_pr_warning;
 pub mod reconcile_stack;
+/// Ref-operand validation for forge-derived branch names (#9106). A sibling
+/// module rather than a `reconcile_stack::` submodule: the predicate gates
+/// every place a forge ref reaches a `Command` argv, not just the stacked
+/// reconcile, and it is the Rust half of `check_branch_name` in
+/// `defaults/scripts/lib/default-branch.sh`.
+pub mod refname;
 pub mod release_fetch;
 pub mod release_resolve;
 pub mod repo_root;
@@ -274,6 +282,14 @@ pub mod sweep_journal;
 pub mod sweep_outcome_summary;
 pub mod sweep_outcomes;
 pub mod sweep_registry;
+/// One sweep's token usage *and* the `tokens_status` that explains it (Issue
+/// #9440) — the single resolver both `sweep.outcome` construction sites share,
+/// so a failed, cancelled or watchdog-killed sweep reports its spend exactly
+/// the way a successful one does. A sibling module rather than more code in
+/// [`usage_source`]: this adds a *decision* (measured / not-spawned /
+/// unattributable) on top of that module's reader dispatch, and the two emit
+/// sites must not be able to disagree about it.
+pub mod sweep_usage;
 pub mod tap_usage;
 pub mod target_dir_gc;
 pub mod telemetry;

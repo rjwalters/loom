@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::telemetry::{
-    HostHealthRecord, PhaseDuration, SweepCompletedRecord, SweepOutcomeRecord, SweepPhaseRecord,
-    SweepStartedRecord, TokenAccountState, TokenSnapshotRecord,
+    HostHealthRecord, PhaseDuration, SweepCompletedRecord, SweepDisposition, SweepOutcomeRecord,
+    SweepPhaseRecord, SweepStartedRecord, TokenAccountState, TokenSnapshotRecord,
 };
 
 fn ts() -> DateTime<Utc> {
@@ -55,7 +55,7 @@ fn sweep_completed_envelope(result: SweepResult) -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepCompleted(SweepCompletedRecord {
-            repo: "rjwalters/loom".to_string(),
+            repo: Some("rjwalters/loom".to_string()),
             visibility: RepoVisibility::Public,
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),
@@ -70,7 +70,7 @@ fn sweep_completed_envelope_with_tokens_by_model() -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepCompleted(SweepCompletedRecord {
-            repo: "rjwalters/loom".to_string(),
+            repo: Some("rjwalters/loom".to_string()),
             visibility: RepoVisibility::Public,
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),
@@ -98,7 +98,8 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepOutcome(SweepOutcomeRecord {
-            repo: "rjwalters/loom".to_string(),
+            repo: Some("rjwalters/loom".to_string()),
+            repo_unresolved: false,
             visibility: RepoVisibility::Public,
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),
@@ -106,23 +107,21 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             effort: Some("high".to_string()),
             config,
             phase_durations: vec![
-                PhaseDuration {
-                    phase: "curator".to_string(),
-                    duration_sec: 12,
-                },
-                PhaseDuration {
-                    phase: "builder".to_string(),
-                    duration_sec: 340,
-                },
+                PhaseDuration::new("curator".to_string(), 12),
+                PhaseDuration::new("builder".to_string(), 340),
             ],
             total_duration_sec: 512,
             result: SweepResult::Success,
+            // Issue #9441: this fixture names a PR, so `landed` is the only
+            // disposition the record may carry (invariant 1).
+            disposition: SweepDisposition::Landed,
             pr_number: Some(4861),
             tokens_in: None,
             tokens_out: None,
             lines_added: None,
             lines_deleted: None,
             tokens_by_model: None,
+            tokens_unattributed: None,
             // Issue #8507: this fixture is a Claude sweep, which writes no
             // launch record — so all three stay absent.
             runtime: None,
@@ -133,6 +132,18 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             doctor_cycles: None,
             judge_verdicts: None,
             complexity: None,
+            tokens_status: None,
+            tokens_status_reason: None,
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
+            pr_numbers: None,
+            hw_lines_added: None,
+            hw_lines_deleted: None,
+            hw_files: None,
+            generated_lines: None,
+            test_lines: None,
         }),
     )
 }
@@ -311,6 +322,14 @@ fn sweep_outcome_flattens_config_and_nests_phase_durations() {
         Some(any_value::Value::StringValue("claude".to_string()))
     );
     assert_eq!(get("loom.pr_number"), Some(any_value::Value::IntValue(4861)));
+    // Issue #9441: the disposition travels beside `loom.result`, never
+    // instead of it, and is always present (never conditionally attached like
+    // the optional attributes above).
+    assert_eq!(get("loom.result"), Some(any_value::Value::StringValue("success".to_string())));
+    assert_eq!(
+        get("loom.disposition"),
+        Some(any_value::Value::StringValue("landed".to_string()))
+    );
     match get("loom.phase_durations") {
         Some(any_value::Value::ArrayValue(array)) => {
             assert_eq!(array.values.len(), 2);

@@ -404,5 +404,160 @@ pub fn backticked_partial_increment_warnings(text: &str, pr_number: &str, dry_ru
     out
 }
 
+// --- `Loom-Issue: owner/repo#N` trailer (#9465) ------------------------------
+//
+// The forge's own structured issue↔PR link (`closingIssuesReferences` /
+// `closedByPullRequestsReferences`) exists ONLY for a PR carrying a closing
+// keyword, so it is structurally blind to every non-final PR of a multi-PR
+// landing — 19 of 329 sweep-landing PRs measured over 2026-08-15..09-29 were
+// absent from it, and 20 issues landed through more than one merged PR (one
+// through 47). `Loom-Issue: owner/repo#N` is the additive, machine-readable
+// link for exactly those PRs: fully qualified so a cross-repo consumer can
+// resolve it without knowing which repo the PR came from, and greppable
+// without GitHub's keyword parser or prose-phrase matching.
+//
+// It reuses the `Part of #N` anchoring rules verbatim — line-leading behind an
+// optional list/blockquote marker, fenced blocks stripped, inline code spans
+// blanked — because the failure modes are identical and a second, subtly
+// different set of rules is a second set of bugs. In particular it inherits the
+// #5234/#8796 code-span pitfall AND its #5690-style detector: see
+// [`unparseable_loom_issue_trailer_warnings`].
+
+/// One `Loom-Issue: owner/repo#N` declaration.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LoomIssueRef {
+    /// The `owner/repo` slug, verbatim. Required — see
+    /// [`loom_issue_trailer_refs`].
+    pub repo: String,
+    /// The issue number.
+    pub issue: u64,
+}
+
+impl std::fmt::Display for LoomIssueRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}#{}", self.repo, self.issue)
+    }
+}
+
+/// The `owner/repo` and `#N` halves of the trailer, shared by the parser and
+/// the malformed-shape detector so "what parses" and "what is warned about"
+/// cannot drift apart.
+const LOOM_ISSUE_SLUG: &str = r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*";
+
+/// Every `Loom-Issue: owner/repo#N` trailer declared in `text`, deduped and
+/// sorted by `(repo, issue)`.
+///
+/// The `owner/repo` slug is **required**: a bare `Loom-Issue: #9465` does not
+/// parse, deliberately. The whole point of the trailer is that a consumer
+/// reading a telemetry record or a cross-repo PR list can resolve the issue
+/// without already knowing which repo the PR came from — a slug-less form would
+/// silently produce an ambiguous link, which is worse than no link at all
+/// because it looks like one. A malformed trailer is reported by
+/// [`unparseable_loom_issue_trailer_warnings`] rather than guessed at.
+#[must_use]
+pub fn loom_issue_trailer_refs(text: &str) -> Vec<LoomIssueRef> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(&format!(
+            r"(?im)^[[:blank:]\x0B\x0C\r]*([-*+>]|[0-9]+\.)?[[:blank:]\x0B\x0C\r]*Loom-Issue:[[:blank:]\x0B\x0C\r]*({LOOM_ISSUE_SLUG})#([0-9]+)\b"
+        ))
+        .expect("static loom-issue-trailer pattern")
+    });
+    let cleaned = blank_inline_code(&strip_fenced_code_blocks(text));
+
+    // Groups 2 and 3 only — never a digit scan over the whole match, which
+    // would read a numbered-list marker's own ordinal as an issue number
+    // (the same trap documented on `partial_increment_refs`).
+    let mut set: BTreeSet<LoomIssueRef> = BTreeSet::new();
+    for caps in re.captures_iter(&cleaned) {
+        let (Some(repo), Some(issue)) = (
+            caps.get(2).map(|m| m.as_str().to_string()),
+            caps.get(3).and_then(|m| m.as_str().parse::<u64>().ok()),
+        ) else {
+            continue;
+        };
+        set.insert(LoomIssueRef { repo, issue });
+    }
+    set.into_iter().collect()
+}
+
+/// Whole lines that LOOK like a `Loom-Issue:` trailer but will not parse,
+/// in encounter order, trimmed.
+///
+/// Two shapes, both of which leave a PR looking correct to a human reviewer
+/// while the link is silently absent:
+///
+/// 1. **Backticked** — the #8796 pitfall. Writing the convention's literal
+///    syntax inside a code span reads like the right thing to do, and
+///    [`blank_inline_code`] (correctly, per #5234) makes it invisible.
+/// 2. **Slug-less** — `Loom-Issue: #123`, which drops the `owner/repo` the
+///    trailer exists to carry.
+///
+/// Fenced code blocks are stripped first, so a documentation example (this
+/// repo's own convention docs included) never warns. Inline code spans are NOT
+/// blanked here — they are half of the shape being matched.
+#[must_use]
+pub fn unparseable_loom_issue_trailer_snippets(text: &str) -> Vec<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(&format!(
+            r"(?im)^[[:blank:]\x0B\x0C\r]*(?:[-*+][[:blank:]\x0B\x0C\r]+|[0-9]+\.[[:blank:]\x0B\x0C\r]+|>[[:blank:]\x0B\x0C\r]*)*(?:`+[[:blank:]\x0B\x0C\r]*Loom-Issue:[^`\n]*`+|Loom-Issue:(?:[[:blank:]\x0B\x0C\r]*(?:{LOOM_ISSUE_SLUG})?#[0-9]+)?)[[:blank:]\x0B\x0C\r]*[.,;:]?[[:blank:]\x0B\x0C\r]*$"
+        ))
+        .expect("static unparseable-loom-issue-trailer pattern")
+    });
+    // Lenient re-read of a matched line's own `owner/repo#N`, used only to
+    // decide whether the link is ALREADY declared plainly elsewhere in the
+    // body. Mirrors #5690's rule that an issue named by both the broken and
+    // the working shape is not warned about — the link is present either way.
+    static REF_RE: OnceLock<Regex> = OnceLock::new();
+    let ref_re = REF_RE.get_or_init(|| {
+        Regex::new(&format!(
+            r"(?i)Loom-Issue:[[:blank:]\x0B\x0C\r]*(?:({LOOM_ISSUE_SLUG})#([0-9]+))?"
+        ))
+        .expect("static loom-issue-ref reread pattern")
+    });
+    let cleaned = strip_fenced_code_blocks(text);
+    let parseable: BTreeSet<String> = loom_issue_trailer_refs(text)
+        .iter()
+        .map(LoomIssueRef::to_string)
+        .collect();
+    re.find_iter(&cleaned)
+        .map(|m| m.as_str().trim().to_string())
+        .filter(|line| match ref_re.captures(line) {
+            Some(caps) => match (caps.get(1), caps.get(2)) {
+                (Some(repo), Some(issue)) => {
+                    !parseable.contains(&format!("{}#{}", repo.as_str(), issue.as_str()))
+                }
+                // No slug: unparseable by construction, always a finding.
+                _ => true,
+            },
+            None => true,
+        })
+        .collect()
+}
+
+/// The non-blocking pre-merge warning for a `Loom-Issue:` trailer that will not
+/// parse — same advisory style, and the same "nothing is blocked" contract, as
+/// [`backticked_partial_increment_warnings`]. Empty when there is nothing to
+/// warn about.
+#[must_use]
+pub fn unparseable_loom_issue_trailer_warnings(
+    text: &str,
+    pr_number: &str,
+    dry_run: bool,
+) -> String {
+    let dr = if dry_run { "[dry-run] " } else { "" };
+    let mut out = String::new();
+    for line in unparseable_loom_issue_trailer_snippets(text) {
+        out.push_str(&format!(
+            "{dr}Unparseable Loom-Issue trailer (#9465): PR #{pr_number}'s body carries a line that looks like the issue-link trailer (\"{line}\") but will not parse — it is either wrapped in a code span (deliberately excluded, #5234/#8796) or missing the required `owner/repo` slug.\n"
+        ));
+        out.push_str(&format!(
+            "  {dr}Consequence: this PR carries no machine-readable link to its issue, so per-issue rollups that cannot rely on GitHub's closing reference (every non-final PR of a multi-PR landing) will not see it. Rewrite the line as PLAIN TEXT in the form `Loom-Issue: owner/repo#N` — see .loom/docs/issue-pr-linking.md. Nothing is blocked by this warning.\n"
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests;

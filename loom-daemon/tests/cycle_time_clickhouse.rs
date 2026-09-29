@@ -424,6 +424,40 @@ fn committed_cycle_time_artifacts_answer_the_canonical_questions_on_real_exporte
          extraction reads it as a NAMED tuple precisely because the keys are not in declaration \
          order"
     );
+    // Issue #9443 put per-phase token attribution INSIDE each entry. The
+    // extraction's named `Array(Tuple(phase String, duration_sec Int64))` must
+    // ignore the extra keys rather than fail or shift — a positional read, or a
+    // parse that required an exact key set, would silently break every
+    // cycle-time answer the moment a sweep carried per-phase usage. Only
+    // `ship-alpha-102` carries it, and only on four of its six entries (the
+    // re-judge is deliberately unmeasured), so this also pins that a MIXED
+    // breakdown — some entries with token keys, some without — parses.
+    let attributed = stack.scalar(
+        "SELECT LogAttributes['loom.phase_durations'] FROM default.otel_logs \
+         WHERE LogAttributes['loom.sweep_id'] = 'ship-alpha-102' LIMIT 1",
+    );
+    assert!(
+        attributed.contains(r#""tokens_in":4200"#) && attributed.contains(r#""attempt":2"#),
+        "the exporter dropped #9443's per-phase attribution before ClickHouse: {attributed}"
+    );
+    assert!(
+        !attributed.contains(r#""duration_sec":700,"phase":"judge","tokens_in""#),
+        "the UNMEASURED re-judge gained a fabricated token count: {attributed}"
+    );
+    // And the record-level remainder reaches the wire beside the totals, so an
+    // OTLP consumer can check `Σ phases + remainder == total` (#9443).
+    for (key, expected) in [
+        ("loom.tokens_in", "49190"),
+        ("loom.tokens_out", "6320"),
+        ("loom.tokens_unattributed_in", "2000"),
+        ("loom.tokens_unattributed_out", "300"),
+    ] {
+        let value = stack.scalar(&format!(
+            "SELECT LogAttributes['{key}'] FROM default.otel_logs \
+             WHERE LogAttributes['loom.sweep_id'] = 'ship-alpha-102' LIMIT 1"
+        ));
+        assert_eq!(value.trim(), expected, "{key} did not reach ClickHouse");
+    }
     // Every key the extraction reads must actually be emitted, not merely
     // allowed through the gateway. Read off the real rows, not from a list.
     for key in [
@@ -462,6 +496,23 @@ fn committed_cycle_time_artifacts_answer_the_canonical_questions_on_real_exporte
         .to_string();
     let window: &[(&str, &str)] = &[("since", &since), ("until", &until)];
     stack.run_script(&extract, &[]);
+
+    // #9443: the extraction reads a NAMED tuple, so the per-phase token keys
+    // `ship-alpha-102` now carries inside each entry are ignored rather than
+    // shifting or failing the parse. Asserted through the committed view, on
+    // the only fixture row with a MIXED breakdown (four entries with token
+    // keys, the unmeasured re-judge without).
+    let extracted = stack.scalar(
+        "SELECT arrayStringConcat( \
+             arrayMap((p, d) -> concat(p, '=', toString(d)), phases, phase_durations_sec), ',') \
+         FROM loom_analytics.raw_ship_outcome WHERE sweep_id = 'ship-alpha-102' LIMIT 1",
+    );
+    assert_eq!(
+        extracted.trim(),
+        "curator=60,builder=900,judge=800,doctor=400,judge=700,merge=100",
+        "the named-tuple extraction changed once entries carried extra keys"
+    );
+
     stack.run_script(&rollup, window);
 
     // At-least-once delivery: seven raw rows, six ships.

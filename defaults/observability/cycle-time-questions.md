@@ -21,7 +21,7 @@ therefore a property of the design, not of two hand-synchronized query sets.
 | **ship** | One `sweep.outcome` record: a sweep that reached a terminal state. One row per `(repo, sweep_id)`. |
 | **shipped successfully** | A ship with `result = 'success'`. `CT1`/`CT6` report these separately from failures; a failed sweep's duration is a different quantity, not a slow ship. |
 | **ship cycle time** | `loom.total_duration_sec` — wall-clock seconds from sweep start to terminal state. **Not** time-since-issue-filed (see "What this question set cannot answer"). |
-| **phase** | An entry of `loom.phase_durations`: `{phase, duration_sec}`. Phase names are whatever the lifecycle emitted (`curator`, `builder`, `judge`, `doctor`, `merge`, …); nothing here hardcodes the list. |
+| **phase** | An entry of `loom.phase_durations`: `{phase, duration_sec}`, plus (Issue #9443) that attempt's own `attempt` index and `tokens_in`/`tokens_out` when they were measured. Phase names are whatever the lifecycle emitted (`curator`, `builder`, `judge`, `doctor`, `merge`, …); nothing here hardcodes the list. The questions below read durations only — the token keys are additive and no standing query depends on them. |
 | **dominant phase** | The phase name with the largest **summed** duration in that ship. Summed, because a repair loop emits `judge` twice and the two attempts are one bottleneck, not two small ones. |
 | **absent vs. zero** | An unmeasured field is `NULL`, never `0` or `''`. `phase_durations_present = 0` means the outcome carried no phase breakdown at all — distinct from a measured empty one. `CT7` exists to keep that distinction visible. |
 
