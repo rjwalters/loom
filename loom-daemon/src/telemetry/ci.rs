@@ -55,6 +55,12 @@ pub const CI_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     // (#9089: `started_at − created_at`) — the CI queue segment for each, so
     // "CI queued" and "CI running" are separable at both levels.
     "loom.ci.queued_ms",
+    // `ci.job` only (#9089): milliseconds the job spent blocked on its
+    // `needs:` predecessors before GitHub created it — `created_at` minus the
+    // run attempt's first job creation. Distinct from `loom.ci.queued_ms`,
+    // which starts only once the job exists; see
+    // `ci_telemetry::records::JobCreationBaseline`.
+    "loom.ci.dependency_wait_ms",
     // `ci.run` only (#9337): why this run attempt happened — `new_commit`,
     // `stale_main_bump`, `flaky_retry` or `unknown`
     // (`ci_telemetry::records::TriggerReason`).
@@ -136,6 +142,11 @@ pub const CI_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     // Run span (#9007 follow-up) AND job span (#9089): the CI queue segment,
     // see `CiRunRecord::queued_ms` / `CiJobRecord::queued_ms`.
     "loom.ci.queued_ms",
+    // Job span only (#9089): the dependency segment that precedes the queue
+    // segment — see `CiJobRecord::dependency_wait_ms`. Not carried on step or
+    // suite spans: it is a property of the job, and repeating it there would
+    // multiply one job's wait across its children in any sum.
+    "loom.ci.dependency_wait_ms",
     // Run span only (#9337): the attempt (so `flaky_retry` is auditable from
     // the span — the job span's equivalent is `loom.ci.attempts`) and the
     // trigger attribution, see `CiRunRecord::trigger_reason`.
@@ -297,6 +308,22 @@ pub struct CiJobRecord {
     /// queue).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_ms: Option<i64>,
+    /// Milliseconds this job spent blocked on its `needs:` predecessors before
+    /// GitHub created it: `created_at` minus the run attempt's earliest job
+    /// creation, floored at zero (#9089, issue problem 5).
+    ///
+    /// This is the segment that precedes [`Self::queued_ms`], never part of
+    /// it: `dependency_wait_ms` ends when the job is created,
+    /// `queued_ms` begins there and ends when a runner picks it up. A job that
+    /// waited 59s on `build-daemon` and then 3s for a runner reports
+    /// `59_000` and `3_000`, and a `needs:` fan-in is distinguishable from a
+    /// runner-capacity burst without reading the workflow file.
+    ///
+    /// `None` when GitHub reported no `created_at` for the job or for any job
+    /// of its run (a pre-#9089 recording) — never a zero, which would read as
+    /// "waited on nothing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_wait_ms: Option<i64>,
     /// A matrix leg's 1-based position, parsed from the job's display name
     /// (#9089; see `ci_telemetry::records::parse_shard`). `None` for an
     /// unsharded job.
@@ -342,6 +369,9 @@ impl CiJobRecord {
         out.push(("loom.ci.duration_ms", CiAttr::Int(self.duration_ms)));
         if let Some(queued_ms) = self.queued_ms {
             out.push(("loom.ci.queued_ms", CiAttr::Int(queued_ms)));
+        }
+        if let Some(dependency_wait_ms) = self.dependency_wait_ms {
+            out.push(("loom.ci.dependency_wait_ms", CiAttr::Int(dependency_wait_ms)));
         }
         if let Some(index) = self.shard_index {
             out.push(("loom.ci.shard.index", CiAttr::Int(i64::from(index))));

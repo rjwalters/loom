@@ -287,6 +287,66 @@ impl JobJson {
             _ => None,
         }
     }
+
+    /// Milliseconds this job spent blocked on its `needs:` predecessors before
+    /// GitHub created it at all: `created_at − baseline`, floored at zero
+    /// (#9089, issue problem 5). See [`JobCreationBaseline`] for what the
+    /// baseline is and why. `None` when either end is unknown — a missing
+    /// value never reads as "waited on nothing".
+    #[must_use]
+    pub fn dependency_wait_ms(&self, baseline: JobCreationBaseline) -> Option<i64> {
+        match (baseline.0, self.created_at) {
+            (Some(first), Some(created)) => Some(duration_ms(first, created)),
+            _ => None,
+        }
+    }
+}
+
+/// The instant a run attempt's **first** job was created — the zero point
+/// every job's [`JobJson::dependency_wait_ms`] is measured from (#9089).
+///
+/// # Why the first job, not the run row
+///
+/// GitHub creates a `needs:`-gated job only once its predecessors finish, so a
+/// job's own `created_at` already encodes how long its dependency closure took:
+/// on a `main` CI run measured 2026-09-29, every ungated job reported
+/// `created_at` `01:34:16` while every job with `needs: build-daemon` reported
+/// `01:35:15` — one second after `Build loom-daemon` completed. The gap between
+/// those two instants **is** the dependency wait, and it needs no second API
+/// call and no knowledge of the workflow's `needs:` graph.
+///
+/// The baseline is taken from the jobs listing rather than from the run row's
+/// `run_started_at` deliberately: the run row's queue semantics are a different
+/// measurement (`ci.run`'s own `queued_ms`, #9007, is time before *any* job
+/// existed), and mixing the two would double-count a run's queue wait into
+/// every one of its jobs. Reading the baseline out of the same listing the
+/// waits come from keeps the quantity internally consistent — the earliest job
+/// of a run always measures exactly `0`, by construction.
+///
+/// # What it is not
+///
+/// It does not name *which* dependency a job waited on, and it does not
+/// separate a multi-level `needs:` chain into its links — it is the whole
+/// closure's elapsed time. For an ungated job it is GitHub's own job-creation
+/// lag (sub-second in the run above), not a dependency; read a value of a
+/// second or two as noise, not as a serialized edge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobCreationBaseline(Option<DateTime<Utc>>);
+
+impl JobCreationBaseline {
+    /// The earliest `created_at` reported across one run attempt's jobs.
+    /// `None` when GitHub reported none for any of them (a pre-#9089
+    /// recording), which makes every job's dependency wait `None` too.
+    #[must_use]
+    pub fn of(jobs: &[JobJson]) -> Self {
+        Self(jobs.iter().filter_map(|job| job.created_at).min())
+    }
+
+    /// The baseline instant, if one was derivable.
+    #[must_use]
+    pub fn instant(self) -> Option<DateTime<Utc>> {
+        self.0
+    }
 }
 
 /// One entry of a job row's `steps[]` array (#9089).
@@ -616,11 +676,18 @@ pub(super) fn visibility_str(visibility: RepoVisibility) -> &'static str {
 
 /// The envelopes of one completed job's unit: `ci.job`, `ci.duration`
 /// (job), and the `loom.ci.job` span parented to the run span.
+///
+/// `baseline` is the run attempt's [`JobCreationBaseline`], from which this
+/// job's `dependency_wait_ms` is measured; pass
+/// `JobCreationBaseline::of(&jobs)` for the whole listing, or
+/// `JobCreationBaseline::default()` when only one job is in hand and the
+/// dependency wait is deliberately not being measured.
 #[must_use]
 pub fn job_envelopes(
     repo: &RepoJson,
     run: &RunJson,
     job: &JobJson,
+    baseline: JobCreationBaseline,
     host_id: &str,
 ) -> Vec<TelemetryEnvelope> {
     let started_at = job.started_at.unwrap_or(run.created_at);
@@ -631,6 +698,7 @@ pub fn job_envelopes(
     let ctx = job_context(&repo.full_name, run.id, job.run_attempt, job.id);
     let run_span = run_context(&repo.full_name, run.id, job.run_attempt).span_id;
     let shard = parse_shard(&job.name);
+    let dependency_wait_ms = job.dependency_wait_ms(baseline);
     let record = CiJobRecord {
         repo: repo.full_name.clone(),
         visibility: repo.visibility(),
@@ -647,6 +715,7 @@ pub fn job_envelopes(
         completed_at,
         duration_ms: duration,
         queued_ms: job.queued_ms(),
+        dependency_wait_ms,
         shard_index: shard.index,
         shard_total: shard.total,
         shard_kind: shard.kind.as_str().to_string(),
@@ -687,6 +756,7 @@ pub fn job_envelopes(
             ("loom.ci.ref", run.head_branch.clone()),
             ("loom.pr_number", run.pr_number().map(|n| n.to_string())),
             ("loom.ci.queued_ms", job.queued_ms().map(|ms| ms.to_string())),
+            ("loom.ci.dependency_wait_ms", dependency_wait_ms.map(|ms| ms.to_string())),
             ("loom.ci.shard.index", shard.index.map(|i| i.to_string())),
             ("loom.ci.shard.total", shard.total.map(|t| t.to_string())),
             ("loom.ci.shard.kind", Some(shard.kind.as_str().to_string())),

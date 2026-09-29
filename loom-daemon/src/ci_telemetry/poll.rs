@@ -40,8 +40,8 @@ use super::ledger::{Ledger, PendingUnit, UnitDraft, UnitKey, COMPACT_THRESHOLD_B
 use super::logs::{self, LogTarget};
 use super::owners::{discover, resolve_kind, KindCache, Owner, OwnerStatus};
 use super::records::{
-    envelope_identity, job_envelopes, parse_shard, run_envelopes, JobJson, JobsPage, RepoJson,
-    RunJson, RunsPage, ShardInfo, ShardKind,
+    envelope_identity, job_envelopes, parse_shard, run_envelopes, JobCreationBaseline, JobJson,
+    JobsPage, RepoJson, RunJson, RunsPage, ShardInfo, ShardKind,
 };
 use super::state::{self, CycleLock, CycleSummary, PollStatus};
 use super::story::{self, RepoIdentityFn, RepoStories, Stitch};
@@ -987,10 +987,15 @@ fn poll_repo(
         // Job units first, the run unit LAST: a torn commit can then only
         // lose the run unit, leaving the run "unseen" so the next poll
         // re-lists its jobs and commits exactly the missing ones.
+        // #9089: the zero point every job's `dependency_wait_ms` is measured
+        // from, taken once over the whole listing — a job resolved against a
+        // partial listing would read its own creation as the run's first and
+        // report no dependency wait at all.
+        let baseline = JobCreationBaseline::of(&jobs);
         let mut drafts: Vec<UnitDraft> = jobs
             .iter()
             .map(|job| {
-                let mut envelopes = job_envelopes(repo, run, job, &ctx.host_id);
+                let mut envelopes = job_envelopes(repo, run, job, baseline, &ctx.host_id);
                 if let Some(story) = story {
                     story::stitch_job(&mut envelopes, story, run, job);
                 }
