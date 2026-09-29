@@ -111,8 +111,17 @@ write_manifest() {
 }
 
 run_fixture() { # extra env assignments as args
+    # The GITHUB_* variables are STRIPPED before the caller's own assignments
+    # are applied (`env -u` must precede any VAR=value operand). Without this
+    # the fixture inherits the REAL Actions environment when this suite itself
+    # runs in CI, so "a run outside Actions records run_id=local" would assert
+    # against the live GITHUB_RUN_ID and pass only on a developer's laptop —
+    # exactly how it failed on PR #9423. GITHUB_STEP_SUMMARY is stripped for a
+    # second reason: left set, each fixture run would append its retry section
+    # to the real job summary.
     ( cd "$FIXTURE" && \
-        env LOOM_CI_DAEMON_PIDFILE_CANDIDATES=none \
+        env -u GITHUB_RUN_ID -u GITHUB_RUN_ATTEMPT -u GITHUB_STEP_SUMMARY \
+        LOOM_CI_DAEMON_PIDFILE_CANDIDATES=none \
         LOOM_CI_SERIAL_SUITES='' \
         LOOM_CI_PARALLELISM=3 \
         "$@" \
