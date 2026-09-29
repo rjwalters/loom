@@ -457,6 +457,9 @@ pub fn scan_transcripts_with_targets(
     let mut actions = RoleTickActions::default();
     let mut targets = BTreeSet::new();
     let mut read_any = false;
+    // One fold across every transcript: deduped on `message.id` per scan, not
+    // per file (#8186, #9303, #9315).
+    let mut fold = crate::script_helpers::transcript_usage::UsageFold::default();
 
     for path in transcripts {
         if std::fs::metadata(path)
@@ -470,8 +473,6 @@ pub fn scan_transcripts_with_targets(
         };
         read_any = true;
         let mut session = targets::Session::default();
-        // Deduped on `message.id` per transcript (#8186, #9303).
-        let mut fold = crate::script_helpers::transcript_usage::UsageFold::default();
         for raw in text.lines() {
             let raw = raw.trim();
             if raw.is_empty() {
@@ -485,8 +486,8 @@ pub fn scan_transcripts_with_targets(
                 fold.add(rec);
             }
         }
-        crate::script_helpers::transcript_usage::merge_rows(&mut totals, fold.rows());
     }
+    crate::script_helpers::transcript_usage::merge_rows(&mut totals, fold.rows());
 
     // `None` — never a zeroed scan — when no transcript was readable at all.
     // That is the difference between "this tick did nothing observable" and
