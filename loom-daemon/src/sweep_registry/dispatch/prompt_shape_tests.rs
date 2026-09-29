@@ -141,3 +141,9 @@ fn dispatch_appends_dangerously_skip_permissions() {
              prompt; got: {recorded}"
     );
 }
+
+// Sibling registration (file-size ratchet): the #9432 story-points dispatch
+// tests live in their own file; registered here rather than from `tests.rs`
+// because that module is frozen at its current size.
+#[path = "story_points_dispatch_tests.rs"]
+mod story_points_dispatch_tests;

@@ -355,6 +355,7 @@ mod tests {
                 model: None,
                 effort: None,
                 runtime: None,
+                story_points: None,
             }),
         )
     }

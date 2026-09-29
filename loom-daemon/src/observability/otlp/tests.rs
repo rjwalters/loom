@@ -166,6 +166,7 @@ fn sweep_started_envelope() -> TelemetryEnvelope {
             model: None,
             effort: None,
             runtime: None,
+            story_points: None,
         }),
     )
 }

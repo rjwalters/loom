@@ -429,6 +429,13 @@ impl SweepRegistry {
         let model = info.and_then(|i| i.model.clone());
         let effort = info.and_then(|i| i.effort.clone());
         let runtime = info.map(|i| i.runtime.clone());
+        // Issue #9432: the estimate this sweep was planned against, captured
+        // at dispatch time from the issue's `points:<N>` label — see the
+        // `story_points` field's own doc on `SweepRegistry` for why it is held
+        // beside the entry rather than re-read here. Absent (never `0`) for
+        // every guard-declined shape and for a sweep adopted after a daemon
+        // restart, which reconstructs no dispatch-time label snapshot.
+        let story_points = self.story_points.get(sweep_id).copied();
         // Issue #8056: survives both a missing entry and an entry whose
         // dispatch-time account capture timed out — see `resolve_token_account`.
         let token_name = self.resolve_token_account(sweep_id, issue);
@@ -920,6 +927,7 @@ impl SweepRegistry {
             hw_files: landing_size.as_ref().map(|size| size.hw_files),
             generated_lines: landing_size.as_ref().map(|size| size.generated_lines),
             test_lines: landing_size.as_ref().map(|size| size.test_lines),
+            story_points,
             tokens_status_reason,
         };
         // Issue #9441: both disposition invariants hold on every record this
@@ -1424,6 +1432,18 @@ mod tap_usage_tests;
     unused_imports
 )]
 mod complexity_tests;
+
+// End-to-end tests for the `story_points` field (Issue #9432) — the durable
+// record's read of the estimate the registry retained at dispatch time. Same
+// sibling-file shape as `complexity_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod story_points_tests;
 
 // End-to-end tests for the #9056 issue write-back (posting, idempotency, the
 // `Success`-only gate), in their own sibling file for the same file-size

@@ -14,6 +14,7 @@ mod kind_registry;
 mod role_tick;
 mod session_analysis;
 mod session_summary;
+mod story_points;
 mod token_snapshot;
 use role_tick::role_tick_outcome;
 use token_snapshot::tokens_snapshot;
@@ -39,6 +40,7 @@ fn sweep_started() -> TelemetryRecord {
         model: Some("opus".to_string()),
         effort: Some("high".to_string()),
         runtime: Some("claude".to_string()),
+        story_points: None,
     })
 }
 
@@ -132,6 +134,7 @@ fn sweep_outcome() -> TelemetryRecord {
         hw_files: None,
         generated_lines: None,
         test_lines: None,
+        story_points: None,
     })
 }
 
@@ -281,6 +284,7 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         hw_files: None,
         generated_lines: None,
         test_lines: None,
+        story_points: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     for field in [
@@ -415,6 +419,7 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         hw_files: None,
         generated_lines: None,
         test_lines: None,
+        story_points: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(value["complexity"], "complex");
@@ -478,6 +483,7 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         hw_files: None,
         generated_lines: None,
         test_lines: None,
+        story_points: None,
     };
 
     let unobserved = serde_json::to_value(&base).unwrap();
@@ -1081,6 +1087,7 @@ fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
         hw_files: None,
         generated_lines: None,
         test_lines: None,
+        story_points: None,
     };
     let value = serde_json::to_value(&resolved).unwrap();
     assert_eq!(value["repo"], "rjwalters/loom");

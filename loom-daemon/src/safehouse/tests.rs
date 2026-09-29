@@ -1463,6 +1463,7 @@ fn maps_the_narrated_events() {
         runtime: None,
         runtime_source: None,
         repo: Some("/repos/vibesql".to_owned()),
+        story_points: None,
     };
     let env = event_to_envelope(&dispatch).unwrap();
     assert_eq!(env.kind, "task");
@@ -1598,6 +1599,7 @@ fn maps_events_without_repo_using_bare_fallback() {
         runtime: None,
         runtime_source: None,
         repo: None,
+        story_points: None,
     };
     let env = event_to_envelope(&dispatch).unwrap();
     assert_eq!(env.task_id.as_deref(), Some("42"));
@@ -1766,6 +1768,7 @@ async fn run_sink_enriches_dispatch_body_with_title() {
         runtime: None,
         runtime_source: None,
         repo: Some(dir.path().to_string_lossy().into_owned()),
+        story_points: None,
     })
     .unwrap();
 
@@ -1829,6 +1832,7 @@ async fn run_sink_batches_a_dispatch_burst_into_one_digest_root() {
             runtime: None,
             runtime_source: None,
             repo: Some("/Users/x/GitHub/loom".to_owned()),
+            story_points: None,
         })
         .unwrap();
     }
@@ -1838,6 +1842,7 @@ async fn run_sink_batches_a_dispatch_burst_into_one_digest_root() {
         runtime: None,
         runtime_source: None,
         repo: Some("/Users/x/GitHub/vibesql".to_owned()),
+        story_points: None,
     })
     .unwrap();
 
@@ -1899,6 +1904,7 @@ async fn run_sink_still_narrates_per_issue_events_after_a_digest() {
             runtime: None,
             runtime_source: None,
             repo: Some("/Users/x/GitHub/loom".to_owned()),
+            story_points: None,
         })
         .unwrap();
     }

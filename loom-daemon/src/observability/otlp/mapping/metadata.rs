@@ -139,6 +139,12 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     if let Some(value) = record.doctor_cycles {
         attrs.push(kv_int("loom.doctor_cycles", i64::from(value)));
     }
+    // Issue #9432: the issue's dispatch-time story-point estimate (its single
+    // `points:<N>` label). Absent (never `0`) for every guard-declined shape —
+    // the same "unknown != zero" rule `doctor_cycles` above states.
+    if let Some(value) = record.story_points {
+        attrs.push(kv_int("loom.story_points", i64::from(value)));
+    }
     if let Some(verdicts) = &record.judge_verdicts {
         if verdicts.len() <= MAX_GROUPS
             && verdicts

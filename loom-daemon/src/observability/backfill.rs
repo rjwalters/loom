@@ -364,6 +364,7 @@ mod tests {
                 hw_files: None,
                 generated_lines: None,
                 test_lines: None,
+                story_points: None,
             }),
         )
     }
@@ -423,6 +424,7 @@ mod tests {
             hw_files: None,
             generated_lines: None,
             test_lines: None,
+            story_points: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));
@@ -484,6 +486,7 @@ mod tests {
             hw_files: None,
             generated_lines: None,
             test_lines: None,
+            story_points: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));

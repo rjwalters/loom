@@ -69,12 +69,12 @@ impl SweepRegistry {
     ///
     /// Rides the REST issues endpoint (`repos/{owner}/{repo}/issues/{pr}`),
     /// which serves a pull request's labels too — the same transport, and the
-    /// same separate-from-GraphQL rate-limit bucket, as
-    /// [`first_park_label`](SweepRegistry::first_park_label).
+    /// same separate-from-GraphQL rate-limit bucket, as the dispatch-side
+    /// park guard ([`park_label_and_labels`](SweepRegistry::park_label_and_labels)).
     pub(crate) fn linked_pr_park_label(&self, pr: u32) -> Option<String> {
         let labels = self.current_labels_via_rest(pr)?;
         // `PARK_LABELS` order, not forge order, so a PR carrying both yields a
-        // deterministic answer (matching `first_park_label`).
+        // deterministic answer (matching the dispatch-side park guard).
         crate::work_finder::PARK_LABELS
             .iter()
             .find(|park| labels.iter().any(|l| l == *park))

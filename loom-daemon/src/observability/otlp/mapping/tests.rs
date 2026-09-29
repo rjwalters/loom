@@ -33,6 +33,7 @@ fn sweep_started_envelope() -> TelemetryEnvelope {
             model: Some("opus".to_string()),
             effort: Some("high".to_string()),
             runtime: Some("claude".to_string()),
+            story_points: None,
         }),
     )
 }
@@ -144,6 +145,7 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             hw_files: None,
             generated_lines: None,
             test_lines: None,
+            story_points: None,
         }),
     )
 }
@@ -302,6 +304,33 @@ fn repo_visibility_tag_becomes_a_log_record_attribute_not_a_resource_attribute()
         get_visibility(&log_records[1]),
         Some(any_value::Value::StringValue("private".to_string()))
     );
+}
+
+#[test]
+fn sweep_started_maps_story_points_only_when_resolved() {
+    // Issue #9432: the dispatch-time `points:<N>` estimate rides
+    // `sweep.started` as a NUMERIC `loom.story_points` attribute, and an
+    // unresolved estimate is an ABSENT attribute — never 0.
+    let mut resolved = sweep_started_envelope();
+    let TelemetryRecord::SweepStarted(record) = &mut resolved.record else {
+        unreachable!("fixture is a sweep.started envelope");
+    };
+    record.story_points = Some(13);
+    for (envelope, expected) in [(resolved, Some(13)), (sweep_started_envelope(), None)] {
+        let request = build_logs_request(&[envelope]).unwrap();
+        let log_record = &request.resource_logs[0].scope_logs[0].log_records[0];
+        let got = log_record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "loom.story_points")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone());
+        assert_eq!(
+            got,
+            expected.map(any_value::Value::IntValue),
+            "loom.story_points must be an int attribute only when resolved"
+        );
+    }
 }
 
 #[test]

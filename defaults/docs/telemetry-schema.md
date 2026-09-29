@@ -253,7 +253,8 @@ A sweep began work on an issue.
   "started_at": "2026-07-30T12:00:00Z",
   "model": "opus",
   "effort": "high",
-  "runtime": "claude"
+  "runtime": "claude",
+  "story_points": 5
 }
 ```
 
@@ -263,6 +264,31 @@ A sweep began work on an issue.
 `SweepInfo::runtime` records — and is what lets a consumer say *which agent*
 is working the sweep. Omitted when the dispatch did not name one; never
 defaulted to `"claude"`.
+
+#### `story_points` (Issue #9432, epic #9429)
+
+`story_points` is the **numeric** story-point estimate assigned to the issue
+being swept: the value of its single `points:<N>` forge label (the closed
+vocabulary `1, 2, 3, 5, 8, 13`, applied by the Curator per #9431), read at
+dispatch time from the label snapshot the dispatch path's park guard already
+fetches — never a second forge call. It is what lets a backend query join the
+assigned estimate to the actual cost of the sweep that burned it without
+leaving the store (`loom.story_points` on the OTLP side; see
+"`loom.story_points`" under `sweep.outcome` below for the guard).
+
+**Absent vs. measured zero**: the field is omitted entirely — never `0` —
+when the issue carries no `points:*` label (a pre-epic or operator-filed
+issue), when the one-label guard declined (see below), or when the label
+read itself failed. "No estimate" and "estimated, trivially small" are
+different populations and must not be folded.
+
+**The one-label guard** (`loom-daemon/src/story_points.rs`, pure and
+unit-tested): exactly one `points:*` label per issue is a contract the
+Curator upholds, and the daemon enforces how a violation is reported — zero
+labels → attribute absent; one in-vocabulary label → attribute emitted; more
+than one → a loud dispatch-time warning naming both labels, attribute omitted,
+never a guess about which wins; one out-of-vocabulary value (`points:21`,
+`points:0`, `points:blue`) → surfaced the same way, never coerced.
 
 ### `sweep.identity`
 
@@ -487,6 +513,7 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
   "doctor_cycles": 0,
   "judge_verdicts": [{ "attempt": 1, "verdict": "pass" }],
   "complexity": "routine",
+  "story_points": 5,
   "tokens_status": "measured"
 }
 ```
@@ -503,7 +530,8 @@ is the latest (`pr_number`). A single-model, single-PR sweep collapses to one
 `pr_number`, `pr_numbers`, `tokens_in`, `tokens_out`, `lines_added`,
 `lines_deleted`, `tokens_by_model`, `tokens_unattributed`, `failure_class`,
 `models_used`, `doctor_cycles`, `judge_verdicts`, `complexity`,
-`tokens_status`, and `tokens_status_reason` are omitted when empty/unset.
+`story_points`, `tokens_status`, and `tokens_status_reason` are omitted when
+empty/unset.
 `config` is a map — not fixed fields — so operator-tunable knobs can be
 captured without a schema bump. `disposition` (Issue #9441) is the one recent
 addition that is **never** omitted — see its own section below.
@@ -664,9 +692,9 @@ Neither field is added to the public redaction allowlist, for the same reason as
 the work-output pair above. Cross-file `message.id` dedupe within a window is
 out of scope here (#9315) — the fold this reuses is unchanged.
 
-#### Completeness fields (Issues #8056, #8222, #8542)
+#### Completeness fields (Issues #8056, #8222, #8542, #9432)
 
-Five more **independently optional** fields, added additively (no
+Six more **independently optional** fields, added additively (no
 `schema_version` bump — none of them is a new record kind). Each answers a
 question that previously required joining the sibling `sweep-outcomes.jsonl`
 by `sweep_id`, or could not be answered at all.
@@ -678,6 +706,7 @@ by `sweep_id`, or could not be answered at all.
 | `doctor_cycles` | integer | **The forge label timeline** of the PR named by this record's own `pr_number` (Issue #8222 — re-sourced; the #8056 shipment counted sampled checkpoint markers instead): one cycle per `loom:changes-requested` arrival that a later `loom:review-requested` arrival closed the loop on. | A rejection nobody handed back (the sweep hit the Doctor-cycle cap, or died) is **not** a cycle. Because the label events are durable forge state rather than a ~30s sample, a cycle that opens and closes between two reaper ticks is still counted: this is a certified count, **not** the lower-bound proxy it was under #8056. `0` means "the timeline was read and no Doctor cycle completed"; an **absent** key means the timeline was not read at all. |
 | `judge_verdicts` | array of `{ "attempt": int, "verdict": string }` | The same PR's label timeline: `loom:pr` ⇒ `"pass"`, `loom:changes-requested` ⇒ `"fail"`, in lifecycle order. | What makes **first-pass judge approval rate** computable from this journal alone: `judge_verdicts[0].verdict == "pass"` over the records that carry the field. `attempt` is **1-based per PR**, counting `loom:review-requested` arrivals — attempt 1 is the PR as first opened, attempt 2 the pass after the first Doctor hand-back. A repeat of the same verdict inside one attempt (a label removed and re-applied) is one entry, not two. `[]` means "the timeline was read and carried no verdict" (a sweep that died before Judge); an **absent** key means the timeline was not read. |
 | `complexity` | string (`mechanical` \| `routine` \| `complex`) | One more best-effort REST read at the SAME terminal transition, of the sweep's own issue body's `<!-- loom:complexity=<tier> -->` marker (Issue #8542) — the same marker `resolve-tier-model.sh` reads at dispatch time to pick a model, re-read here rather than plumbed through dispatch because there is no single dispatch-time seam shared by every entry point (`dispatch_sweep`, the epic supervisor, the work finder, the role runner). | What makes a model-routing decision (`sweep.tierModels` / `sweep.optimization`, or a future classifier-driven router) evaluable against a labeled outcome. Unlike `resolve-tier-model.sh`'s own dispatch-time fold (an absent/unrecognized marker there is a **safe default**, `routine`, for model selection), this field is never defaulted: an unmarked issue, an out-of-vocabulary value, or a failed/skipped read all omit the key. A routing-evaluation consumer needs the true absence rate, not a default masquerading as data. |
+| `story_points` | integer | **The issue's `points:<N>` forge label as of dispatch** (Issue #9432, epic #9429): the value of its single points label (closed vocabulary `1, 2, 3, 5, 8, 13`, applied by the Curator per #9431), resolved by the one-label guard from the label snapshot the dispatch path's park guard already reads — no second forge call — and held on the registry keyed by sweep id so the record reports the estimate **this sweep was planned against**, not a re-read at outcome time (a label edited mid-sweep must not retroactively re-price it). Emitted as the numeric OTLP attribute `loom.story_points`. | The estimate-to-actual-cost join the #9429 experiment exists for: group cost/tokens/outcome by the estimate the work was planned against, in one store. **Absent, never `0`**, for every guard-declined shape — no label (pre-epic / operator-filed issue), **more than one** `points:*` label (a loud dispatch-time warning names both; the daemon never guesses which wins), an out-of-vocabulary value (surfaced the same way), a failed label read (every fail-open path), or a sweep adopted after a daemon restart (no dispatch-time snapshot was retained). See `sweep.started`'s own `story_points` section for the guard's full contract. |
 
 **Which PR the two timeline fields describe.** Exactly the one named by this
 record's `pr_number` — the latest PR the sweep's own checkpoint recorded. A
@@ -698,7 +727,7 @@ issue's marker exists whether or not a PR was ever opened) but follows the
 exact same fail-open contract: `skip_label_flip`, the rate-limit breaker, or
 any read failure omits the key, never a fabricated `"routine"`.
 
-All five follow the established "unknown != zero" contract: `0` / `[]` / a
+All six follow the established "unknown != zero" contract: `0` / `[]` / a
 one-element array / a tier string is an observation, an absent key is not. A
 consumer that coerces a missing `doctor_cycles` to `0` reports "no Doctor
 cycle happened" about a sweep nobody watched; one that coerces a missing
@@ -706,7 +735,7 @@ cycle happened" about a sweep nobody watched; one that coerces a missing
 denominator; one that coerces a missing `complexity` to `"routine"` conflates
 "the Curator marked this routine" with "nobody looked".
 
-None of the five is added to the public redaction allowlist, for the same
+None of the six is added to the public redaction allowlist, for the same
 reason as the work-output fields above.
 
 #### `disposition` — what the sweep actually DID (Issue #9441)

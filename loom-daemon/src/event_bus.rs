@@ -716,6 +716,7 @@ mod tests {
             runtime: None,
             runtime_source: None,
             repo: None,
+            story_points: None,
         };
         assert_eq!(ev.topic(), "sweep.global.dispatch");
     }

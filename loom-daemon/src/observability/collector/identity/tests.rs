@@ -38,6 +38,7 @@ fn unchanged_identity_replays_after_start_or_phase_without_rereading_launch() {
             runtime: None,
             runtime_source: None,
             repo: None,
+            story_points: None,
         },
         Event::SweepPhase {
             issue: 42,

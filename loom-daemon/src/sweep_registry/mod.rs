@@ -765,6 +765,24 @@ pub struct SweepRegistry {
     /// Pruned alongside `phase_history` at the same terminal-entry GC site,
     /// for the same "unbounded across many dispatches" reason.
     sampled_loc: HashMap<SweepId, (i64, i64)>,
+    /// The story-point estimate each dispatched sweep was planned against
+    /// (Issue #9432): the resolved value of its issue's single `points:<N>`
+    /// label, captured at dispatch time by the guard in
+    /// [`dispatch.rs`](Self::dispatch) from the label snapshot that path
+    /// already reads. Keyed by `SweepId` (not issue) so a re-dispatch of an
+    /// issue whose estimate changed mid-flight reports the estimate *this*
+    /// sweep was planned against, and held beside the entry rather than on it
+    /// so the ~50 existing `SweepInfo` construction sites (test fixtures,
+    /// restart adoption) stay untouched — an adopted sweep simply carries no
+    /// estimate, the same honest absence a pre-epic issue produces.
+    ///
+    /// Only resolved values land here (the guard's zero/multiple/invalid/
+    /// unread outcomes all resolve to no entry = attribute absent, never `0`).
+    /// Pruned alongside `phase_history`/`sampled_loc` at the same
+    /// terminal-entry GC site, for the same "unbounded across many
+    /// dispatches" reason; its only consumer is the durable `sweep.outcome`
+    /// record, already written by then.
+    story_points: HashMap<SweepId, u8>,
     /// Orphaned process groups awaiting SIGKILL escalation (Issue #4980).
     ///
     /// Written by [`reap_orphaned_group`](Self::reap_orphaned_group) when a
@@ -1004,6 +1022,13 @@ pub struct PreparedIssueDispatch {
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
     pub(crate) depends_on: Option<u32>,
+    /// The dispatch-time story-point estimate resolved from the issue's
+    /// `points:<N>` label by the 2.7 guard's own label read (Issue #9432).
+    /// `None` for every guard-declined shape (no label, multiple labels, out
+    /// of vocabulary, read failed) and always for a `PrSet` dispatch — the
+    /// attribute is then absent on both `sweep.started` and `sweep.outcome`,
+    /// never `0`.
+    pub(crate) story_points: Option<u8>,
     /// What this dispatch resolved onto, and the metered backstop slot that
     /// choosing it took (#8555). Carried here — rather than parked in shared
     /// state keyed on the resolving thread — because this box is precisely the
@@ -1124,6 +1149,7 @@ impl SweepRegistry {
             flap_warned_at: HashMap::new(),
             phase_history: HashMap::new(),
             sampled_loc: HashMap::new(),
+            story_points: HashMap::new(),
             pending_group_reaps: HashMap::new(),
             activity_window: None,
         }

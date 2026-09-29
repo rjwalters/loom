@@ -193,6 +193,13 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(runtime) = &r.runtime {
                 attributes.push(kv_string("loom.runtime", runtime.clone()));
             }
+            // Issue #9432: the dispatch-time `points:<N>` estimate. Absent
+            // (never `0`) whenever the one-label guard declined to resolve
+            // one — same "unknown != zero" rule as every optional counter
+            // this mapping renders.
+            if let Some(story_points) = r.story_points {
+                attributes.push(kv_int("loom.story_points", i64::from(story_points)));
+            }
             (
                 "sweep.started",
                 SeverityNumber::Info,

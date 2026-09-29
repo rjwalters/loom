@@ -2942,6 +2942,16 @@ pub enum Event {
         /// compatible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
+        /// The dispatched issue's story-point estimate (Issue #9432): the
+        /// value of its single `points:<N>` label, resolved by the guard at
+        /// dispatch time. This event is the only transport
+        /// `sweep.started`'s `story_points` field has — the collector's
+        /// event→record mapping is pure, so the value rides the event. Absent
+        /// (never `0`) whenever the guard declined to resolve one; always
+        /// `None` for a `PrSet` dispatch, which claims no issue. Additive:
+        /// `#[serde(default)]` keeps pre-#9432 wire data compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        story_points: Option<u8>,
     },
     /// `sweep.global.runtime_rejected` — a dispatch was **refused** by
     /// fail-closed runtime admission (issue #4494, epic #4489 Phase 5), before

@@ -14,6 +14,7 @@ fn dispatch(issue: u32, sweep: &str) -> Event {
         runtime: None,
         runtime_source: None,
         repo: None,
+        story_points: None,
     }
 }
 fn phase(issue: u32) -> Event {

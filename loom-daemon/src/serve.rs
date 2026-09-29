@@ -1556,6 +1556,7 @@ mod tests {
                 runtime: None,
                 runtime_source: None,
                 repo: None,
+                story_points: None,
             },
             Event::SweepGlobalCompleted {
                 sweep_id: "sweep-4392".to_string(),
@@ -1674,6 +1675,7 @@ mod tests {
             runtime: None,
             runtime_source: None,
             repo: Some("/repos/loom".to_string()),
+            story_points: None,
         });
         let data = frame.trim_start_matches("data: ").trim_end_matches("\n\n");
         let value: serde_json::Value = serde_json::from_str(data).expect("valid json");
@@ -1980,6 +1982,7 @@ mod tests {
                 runtime: None,
                 runtime_source: None,
                 repo: None,
+                story_points: None,
             })
             .expect("publish");
 

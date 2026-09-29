@@ -46,6 +46,7 @@ fn trace_wire_has_hex_ids_and_preserves_parent_and_log_relationship() {
             model: None,
             effort: None,
             runtime: None,
+            story_points: None,
         }),
     );
     log.trace_context = Some(child.clone());

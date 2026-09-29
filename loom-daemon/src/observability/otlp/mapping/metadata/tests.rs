@@ -28,12 +28,17 @@ fn outcomes_preserve_observed_zero_empty_history_and_missing_measurements() {
         "loom.judge_verdicts",
         "loom.tokens_in",
         "loom.tokens_by_model",
+        // Issue #9432: an unresolved estimate is an ABSENT attribute —
+        // indistinguishable here from every other unmeasured key, never 0.
+        "loom.story_points",
     ] {
         assert!(attribute(&missing, key).is_none(), "{key}");
     }
     record.doctor_cycles = Some(0);
     record.judge_verdicts = Some(vec![]);
     record.tokens_in = Some(0);
+    // Issue #9432: one resolved `points:5` label at dispatch.
+    record.story_points = Some(5);
     record.tokens_by_model = Some(vec![ModelUsageTotals {
         model: "glm-5.3-flash".into(),
         ..Default::default()
@@ -41,6 +46,7 @@ fn outcomes_preserve_observed_zero_empty_history_and_missing_measurements() {
     let observed = map(TelemetryRecord::SweepOutcome(record));
     assert_eq!(attribute(&observed, "loom.doctor_cycles"), Some(any_value::Value::IntValue(0)));
     assert_eq!(attribute(&observed, "loom.tokens_in"), Some(any_value::Value::IntValue(0)));
+    assert_eq!(attribute(&observed, "loom.story_points"), Some(any_value::Value::IntValue(5)));
     let Some(any_value::Value::ArrayValue(history)) = attribute(&observed, "loom.judge_verdicts")
     else {
         panic!("missing observed history")

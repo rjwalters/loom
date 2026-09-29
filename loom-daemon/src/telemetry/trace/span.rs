@@ -148,6 +148,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.failure_class"
                     | "loom.effort"
                     | "loom.doctor_cycles"
+                    | "loom.story_points"
                     | "loom.judge_verdict"
                     | "loom.recovered"
                     | "loom.timing_source"

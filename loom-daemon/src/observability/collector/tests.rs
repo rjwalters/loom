@@ -7,13 +7,14 @@ use super::*;
 use crate::health;
 use serial_test::serial;
 
-fn dispatch_event(issue: u32, sweep_id: &str) -> Event {
+pub(super) fn dispatch_event(issue: u32, sweep_id: &str) -> Event {
     Event::SweepGlobalDispatch {
         sweep_id: sweep_id.to_string(),
         kind: SweepKind::Issue(issue),
         runtime: None,
         runtime_source: None,
         repo: Some("/repos/loom".to_string()),
+        story_points: None,
     }
 }
 
@@ -26,7 +27,7 @@ fn phase_event(issue: u32, phase: &str) -> Event {
     }
 }
 
-fn exited_event(issue: u32, exit_code: Option<i32>, duration_sec: i64) -> Event {
+pub(super) fn exited_event(issue: u32, exit_code: Option<i32>, duration_sec: i64) -> Event {
     Event::SweepExited {
         issue,
         exit_code,
@@ -37,7 +38,7 @@ fn exited_event(issue: u32, exit_code: Option<i32>, duration_sec: i64) -> Event 
     }
 }
 
-fn crashed_event(issue: u32) -> Event {
+pub(super) fn crashed_event(issue: u32) -> Event {
     Event::SweepCrashed {
         issue,
         checkpoint_phase: Some("builder".to_string()),
@@ -175,6 +176,7 @@ fn crash_maps_to_failure_with_duration_from_tracked_dispatch() {
             sweep_id: "sweep-issue-5-0".to_string(),
             started_at: Utc::now() - chrono::Duration::seconds(60),
             trace_context: None,
+            story_points: None,
         },
     );
     let records = map_event_to_records(
@@ -216,6 +218,7 @@ fn event_issue_ignores_pr_set_dispatch() {
         runtime: None,
         runtime_source: None,
         repo: None,
+        story_points: None,
     };
     assert_eq!(event_issue(&event), None);
 }
@@ -281,6 +284,7 @@ fn sweep_started_carries_the_dispatch_runtime() {
         runtime: Some("codex".to_string()),
         runtime_source: None,
         repo: Some("/repos/loom".to_string()),
+        story_points: None,
     };
     let records =
         map_event_to_records(&event, 7, "rjwalters/loom", RepoVisibility::Public, &mut dispatches);

@@ -16,6 +16,7 @@ fn legacy_queue_envelope_stays_compatible_and_native_context_is_stripped() {
             model: None,
             effort: None,
             runtime: None,
+            story_points: None,
         }),
     );
     let bytes = serde_json::to_vec(&old).unwrap();

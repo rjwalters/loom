@@ -85,6 +85,10 @@ fn recover_adopted_dispatch(
             sweep_id: identity.sweep_id,
             started_at: identity.started_at,
             trace_context,
+            // An adopted sweep reconstructs no dispatch-time label snapshot,
+            // so its estimate is honestly absent (Issue #9432) — same shape
+            // the durable journal reports for a post-restart adoption.
+            story_points: None,
         },
     );
 }

@@ -78,6 +78,11 @@ pub(crate) struct DispatchState {
     sweep_id: String,
     started_at: DateTime<Utc>,
     trace_context: Option<crate::telemetry::trace::TraceContext>,
+    /// The dispatch-time story-point estimate (Issue #9432), carried from the
+    /// `sweep.global.dispatch` event so the event-path `sweep.outcome` record
+    /// can mirror what the durable journal reports — `None` for every
+    /// guard-declined shape, the attribute then stays absent (never `0`).
+    story_points: Option<u8>,
 }
 
 /// Spawn the collector task on the shared daemon runtime. Subscribes to the
@@ -439,6 +444,7 @@ pub(crate) fn map_event_to_records(
             kind: SweepKind::Issue(_),
             sweep_id,
             runtime,
+            story_points,
             ..
         } => {
             let started_at = Utc::now();
@@ -448,6 +454,7 @@ pub(crate) fn map_event_to_records(
                     sweep_id: sweep_id.clone(),
                     started_at,
                     trace_context: None,
+                    story_points: *story_points,
                 },
             );
             vec![TelemetryRecord::SweepStarted(SweepStartedRecord {
@@ -462,6 +469,10 @@ pub(crate) fn map_event_to_records(
                 // adapter; carrying it here is what lets the dashboard say
                 // *which agent* is working each in-flight sweep.
                 runtime: runtime.clone(),
+                // Issue #9432: the issue's dispatch-time `points:<N>` estimate
+                // — absent (never `0`) whenever the one-label guard declined
+                // to resolve one.
+                story_points: *story_points,
             })]
         }
         Event::SweepGlobalDispatch { .. } => Vec::new(),
@@ -491,12 +502,25 @@ pub(crate) fn map_event_to_records(
                 .as_ref()
                 .map(|d| d.sweep_id.clone())
                 .unwrap_or_else(|| unknown_sweep_id(issue));
+            // Issue #9432: the estimate captured at this sweep's dispatch —
+            // absent when the dispatch event predated the field or the
+            // one-label guard declined to resolve one.
+            let story_points = dispatch.as_ref().and_then(|d| d.story_points);
             let result = if *exit_code == Some(0) {
                 SweepResult::Success
             } else {
                 SweepResult::Failure
             };
-            terminal_records(repo, visibility, issue, sweep_id, result, *duration_sec, None)
+            terminal_records(
+                repo,
+                visibility,
+                issue,
+                sweep_id,
+                result,
+                *duration_sec,
+                None,
+                story_points,
+            )
         }
         Event::SweepCrashed { .. } => {
             let dispatch = dispatches.remove(&(repo.to_owned(), issue));
@@ -504,6 +528,7 @@ pub(crate) fn map_event_to_records(
                 .as_ref()
                 .map(|d| d.sweep_id.clone())
                 .unwrap_or_else(|| unknown_sweep_id(issue));
+            let story_points = dispatch.as_ref().and_then(|d| d.story_points);
             let duration_sec = dispatch
                 .as_ref()
                 .map(|d| (Utc::now() - d.started_at).num_seconds().max(0))
@@ -516,6 +541,7 @@ pub(crate) fn map_event_to_records(
                 SweepResult::Failure,
                 duration_sec,
                 None,
+                story_points,
             )
         }
         _ => Vec::new(),
@@ -534,6 +560,11 @@ fn unknown_sweep_id(issue: u32) -> String {
 /// `git remote get-url origin` parsed to `owner/name` — and a slug that still
 /// will not resolve leaves `repo` absent with `repo_unresolved` set, on both
 /// records.
+// One flat positional list per record field this pure mapping already holds;
+// bundling them into a struct would only move the same values to the two
+// call sites (#9432 added the eighth: the dispatch-time story-point
+// estimate).
+#[allow(clippy::too_many_arguments)]
 fn terminal_records(
     repo: &str,
     visibility: RepoVisibility,
@@ -542,6 +573,7 @@ fn terminal_records(
     result: SweepResult,
     total_duration_sec: i64,
     pr_number: Option<u32>,
+    story_points: Option<u8>,
 ) -> Vec<TelemetryRecord> {
     let (repo, repo_unresolved) = if is_path_shaped_repo(repo) {
         crate::init::git::extract_repo_info(Path::new(repo))
@@ -635,6 +667,9 @@ fn terminal_records(
             hw_files: None,
             generated_lines: None,
             test_lines: None,
+            // Issue #9432: the dispatch-time estimate, unlike the fields this
+            // path cannot know — it rides the dispatch event's own snapshot.
+            story_points,
         }),
     ]
 }
@@ -1330,6 +1365,11 @@ mod tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tokens_status_tests;
+// Issue #9432: the dispatch-time story-points carriage on `sweep.started` /
+// the event-path `sweep.outcome` — sibling module for the file-size ratchet.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod story_points_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod weekly_utilization_tests;

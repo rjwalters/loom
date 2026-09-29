@@ -62,6 +62,48 @@ pub(crate) const LEASE_RENEW_STARTED_ENV: &str = "LOOM_SWEEP_LEASE_RENEW_DISPATC
 /// tokio worker for its duration.
 const LEASE_RENEW_START_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Resolve the `loom.story_points` estimate for a dispatch from the issue's
+/// observed label names (Issue #9432) — the loud-log half of
+/// [`crate::story_points`]'s one-label guard, kept here at its single call
+/// site (the 2.7 park-guard label read) so the state machine itself stays a
+/// pure function.
+///
+/// The two surfaced shapes both LOG LOUDLY and omit the attribute — a
+/// multiple-label conflict or an out-of-vocabulary value is a Curator-side
+/// defect an operator must see, never something the daemon silently resolves
+/// by guessing which label wins:
+///
+/// - `Multiple`: the issue carries more than one `points:*` label;
+/// - `Invalid`: the one `points:*` label's value is not in the closed
+///   vocabulary.
+///
+/// `Absent` (no `points:*` label at all) is the ordinary pre-epic /
+/// operator-filed case and stays quiet — it is a population, not a defect.
+fn resolve_dispatch_story_points(issue: u32, labels: &[String]) -> Option<u8> {
+    match crate::story_points::story_points_from_labels(labels.iter().map(String::as_str)) {
+        crate::story_points::StoryPoints::Absent => None,
+        crate::story_points::StoryPoints::Points(points) => Some(points),
+        crate::story_points::StoryPoints::Multiple(conflicting) => {
+            log::warn!(
+                "sweep_registry: issue #{issue} carries MULTIPLE points labels — [{}] — so \
+                 `loom.story_points` is OMITTED for its sweeps rather than guessed (#9432 \
+                 one-label guard); remove all but one `points:*` label to restore the estimate",
+                conflicting.join(", ")
+            );
+            None
+        }
+        crate::story_points::StoryPoints::Invalid(label) => {
+            log::warn!(
+                "sweep_registry: issue #{issue} carries `{label}`, whose value is not in the \
+                 closed points vocabulary (1, 2, 3, 5, 8, 13), so `loom.story_points` is OMITTED \
+                 for its sweeps rather than coerced (#9432 guard); fix the label to restore \
+                 the estimate"
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the process group of a just-spawned sweep leader (Issue #4980).
 ///
 /// `spawn_child` sets `process_group(0)` on every Unix spawn (#3800), so the
@@ -1948,20 +1990,35 @@ impl SweepRegistry {
         //     proceeds, so a `gh` outage can never wedge the daemon. Skipped
         //     entirely when label flips are disabled (test fixtures without
         //     `gh` credentials).
-        if !self.config.skip_label_flip {
-            if let Some(label) = self.first_park_label(issue_number) {
-                log::info!(
-                    "issue #{issue_number}: refusing dispatch — the issue carries `{label}`, a \
-                     deliberate park that every dispatch route must respect (#4444 park-label \
-                     guard); clear the label to re-enable automation"
-                );
-                return Err(ParkedIssueDispatchError {
-                    issue: issue_number,
-                    label,
+        // Issue #9432: the SAME single REST label read that powers the park
+        // guard below also resolves the sweep's story-point estimate —
+        // `park_label_and_labels` hands back the full label snapshot it
+        // already fetched, so no second forge round trip is added. A `None`
+        // probe (read failed) fails the park guard open AND leaves the
+        // estimate absent — the two halves share one fail-open contract,
+        // never a fabricated `0`.
+        let story_points = if !self.config.skip_label_flip {
+            match self.park_label_and_labels(issue_number) {
+                Some((park, labels)) => {
+                    if let Some(label) = park {
+                        log::info!(
+                            "issue #{issue_number}: refusing dispatch — the issue carries `{label}`, a \
+                             deliberate park that every dispatch route must respect (#4444 park-label \
+                             guard); clear the label to re-enable automation"
+                        );
+                        return Err(ParkedIssueDispatchError {
+                            issue: issue_number,
+                            label,
+                        }
+                        .into());
+                    }
+                    resolve_dispatch_story_points(issue_number, &labels)
                 }
-                .into());
+                None => None,
             }
-        }
+        } else {
+            None
+        };
 
         // 2.75 Noop-cooldown guard (Issue #6917, follow-up to #6670/#6740).
         //      `record_noop_release` (`noop_cooldown.rs`, exposed over IPC as
@@ -2374,6 +2431,7 @@ impl SweepRegistry {
             model: model.filter(|m| !m.is_empty()).map(String::from),
             effort: effort.filter(|e| !e.is_empty()).map(String::from),
             depends_on,
+            story_points,
             admission,
         })))
     }
@@ -2409,6 +2467,7 @@ impl SweepRegistry {
             model,
             effort,
             depends_on,
+            story_points,
             mut admission,
         } = prepared;
 
@@ -2590,6 +2649,17 @@ impl SweepRegistry {
         };
         self.entries.insert(sweep_id.clone(), info);
 
+        // Issue #9432: retain the dispatch-time story-point estimate beside
+        // the entry (keyed by sweep id) so the durable `sweep.outcome` record
+        // written at this sweep's terminal transition reports the estimate
+        // the work was planned against — see the `story_points` field's own
+        // doc on `SweepRegistry`. Only a resolved value lands here; every
+        // declined shape simply never inserts, which is the attribute's
+        // "absent, never 0" rule.
+        if let Some(points) = story_points {
+            self.story_points.insert(sweep_id.clone(), points);
+        }
+
         // 6b. Persist a liveness record to the machine-level sweep journal
         // (`~/.loom/sweeps.json`, Issue #3953). Unlike the in-memory entry
         // above, this file survives a daemon restart, giving
@@ -2627,6 +2697,10 @@ impl SweepRegistry {
             // matching the pattern already used for SweepPhase/Blocker/Exited/
             // Crashed — leave it `None` at construction.
             repo: None,
+            // Issue #9432: the dispatch-time estimate rides the event because
+            // the collector's event→record mapping is pure — this is the only
+            // transport `sweep.started`'s `story_points` field has.
+            story_points,
         });
 
         Ok(DispatchOutcome {
@@ -2798,6 +2872,9 @@ impl SweepRegistry {
             runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
             runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
             repo: None,
+            // A `PrSet` dispatch claims no issue, so there is no estimate to
+            // carry (Issue #9432) — the attribute stays absent, never `0`.
+            story_points: None,
         });
 
         Ok(DispatchOutcome {

@@ -870,6 +870,7 @@ async fn a_real_phase_transition_reaches_the_telemetry_queue() {
             runtime: None,
             runtime_source: None,
             repo: None,
+            story_points: None,
         },
         issue,
         "rjwalters/loom",

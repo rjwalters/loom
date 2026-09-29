@@ -25,6 +25,7 @@ fn dispatched(kind: SweepKind) -> Event {
         runtime: None,
         runtime_source: None,
         repo: None,
+        story_points: None,
     }
 }
 

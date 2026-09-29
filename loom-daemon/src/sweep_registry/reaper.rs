@@ -2229,6 +2229,11 @@ impl SweepRegistry {
             // `sweep.outcome` record, already written at this entry's
             // terminal transition an hour ago.
             self.sampled_loc.remove(&id);
+            // Prune the per-SweepId story-point estimate for the same reason
+            // (Issue #9432): its only consumer is the durable `sweep.outcome`
+            // record, already written at this entry's terminal transition an
+            // hour ago.
+            self.story_points.remove(&id);
             changes += 1;
         }
         ReapOnceOutcome {

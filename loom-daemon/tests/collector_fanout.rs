@@ -707,3 +707,39 @@ fn gateway_forwards_the_tokens_status_pair() {
         "config.yaml must state why the #9440 status pair is allowlisted"
     );
 }
+
+/// Issue #9432: the gateway must forward `loom.story_points`, the sweep's
+/// dispatch-time `points:<N>` estimate, on both `sweep.started` and
+/// `sweep.outcome` log records. A `keep_keys` allowlist that strips it makes
+/// the epic #9429 experiment's whole join — assigned estimate vs. actual cost,
+/// in one store — silently return zero rows, which is indistinguishable from
+/// "no issue was ever estimated". The attribute is numeric and deliberately
+/// ABSENT (not `0`) when unresolved, so forwarding it costs nothing on the
+/// unestimated population.
+#[test]
+fn gateway_forwards_the_sweep_story_points_attribute() {
+    let log_keys = {
+        let mut current = "";
+        let mut keys = Vec::new();
+        for line in CONFIG.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("- context:") {
+                current = rest.trim();
+            }
+            if current == "log" && line.contains("keep_keys(") {
+                keys.extend(line.split('"').skip(1).step_by(2).map(str::to_owned));
+            }
+        }
+        keys
+    };
+    assert!(
+        log_keys.iter().any(|k| k == "loom.story_points"),
+        "log keep_keys drops loom.story_points; the estimate-to-cost join (#9429) \
+         silently returns zero rows"
+    );
+    // Stated beside the allowlist, so a reviewer reading the list sees why the
+    // key is there rather than having to find this test.
+    assert!(
+        CONFIG.contains("sweep.started / sweep.outcome (#9432) add loom.story_points"),
+        "config.yaml must state why loom.story_points is allowlisted"
+    );
+}

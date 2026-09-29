@@ -215,6 +215,7 @@ mod tests {
                 model: None,
                 effort: None,
                 runtime: None,
+                story_points: None,
             }),
         ));
         let active = Arc::new(AtomicUsize::new(0));
@@ -264,6 +265,7 @@ mod tests {
                 model: None,
                 effort: None,
                 runtime: None,
+                story_points: None,
             }),
         ));
         let status = ExportStatus::started("host", "http://localhost", "otlp", 30);

@@ -539,6 +539,20 @@ pub struct SweepStartedRecord {
     /// not name its runtime; never fabricated as `"claude"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// The story-point estimate assigned to the issue being swept
+    /// (Issue #9432, epic #9429): the value of the issue's single `points:<N>`
+    /// label (applied by the Curator per #9431), read at dispatch time from
+    /// the label snapshot the dispatch path already resolves — never a second
+    /// forge fetch. See [`crate::story_points`] for the one-label guard.
+    ///
+    /// Omitted — **never `0`** — when the issue carries no `points:*` label
+    /// (a pre-epic or operator-filed issue), when it carries more than one
+    /// (ambiguous; logged loudly at dispatch, never guessed), when its value
+    /// is out of the closed vocabulary, or when the label read itself failed
+    /// (every fail-open dispatch path): "no estimate" and "estimated, tiny"
+    /// are different populations and must not be folded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u8>,
 }
 
 /// `sweep.phase` — a sweep advanced to a new lifecycle phase.
@@ -942,6 +956,23 @@ pub struct SweepOutcomeRecord {
     /// [`Self::hw_lines_added`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_lines: Option<i64>,
+    /// The story-point estimate the issue carried when this sweep was
+    /// dispatched (Issue #9432, epic #9429): the value of its single
+    /// `points:<N>` label (applied by the Curator per #9431), captured at
+    /// dispatch time from the label snapshot the dispatch path already
+    /// resolves and carried on the registry beside this sweep's id — the
+    /// estimate the work was *planned against*, not a re-read at outcome
+    /// time (a label edited mid-sweep must not retroactively re-price it).
+    /// See [`crate::story_points`] for the one-label guard.
+    ///
+    /// Omitted — **never `0`** — for every case
+    /// [`SweepStartedRecord::story_points`] omits it, plus one outcome-side
+    /// one: a sweep adopted after a daemon restart reconstructs no
+    /// dispatch-time label snapshot, so its record honestly carries no
+    /// estimate rather than a stale re-read. Same "unknown != zero"
+    /// contract as `tokens_in`/`complexity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u8>,
 }
 
 impl SweepOutcomeRecord {

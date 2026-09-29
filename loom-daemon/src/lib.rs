@@ -277,6 +277,7 @@ pub mod stash_retirement;
 /// frozen by the file-size ratchet, and stating the model once is what keeps
 /// the daemon-side budget and the client-side probe budget from drifting.
 pub mod status_budget;
+pub mod story_points;
 pub mod sweep_journal;
 pub mod sweep_outcome_summary;
 pub mod sweep_outcomes;

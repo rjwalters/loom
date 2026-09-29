@@ -58,6 +58,7 @@ fn record(
         hw_files: None,
         generated_lines: None,
         test_lines: None,
+        story_points: None,
     }
 }
 

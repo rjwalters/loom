@@ -1108,10 +1108,20 @@ impl SweepRegistry {
     }
 
     /// Best-effort probe for the first [`PARK_LABELS`] entry currently on
-    /// `issue`, used by the #4444 park-label dispatch guard (step 2.7). Returns
-    /// `Some(label)` when the issue carries a park label and `None` otherwise —
-    /// where `None` covers BOTH "not parked" and any failure (missing/failed/
-    /// timed-out `gh`, unresolvable repo, unparseable output).
+    /// `issue`, used by the #4444 park-label dispatch guard (step 2.7) — PLUS
+    /// the full label snapshot that same REST read already produced, which
+    /// the dispatch path reuses to resolve the `loom.story_points` estimate
+    /// (Issue #9432) without a second fetch. Returns:
+    ///
+    /// - `Some((Some(label), labels))` — the issue carries a park label
+    ///   (chosen by [`PARK_LABELS`] order, not forge order, so the refusal
+    ///   message is deterministic when an issue carries both);
+    /// - `Some((None, labels))` — the read succeeded and the issue carries no
+    ///   park label (dispatch proceeds; `labels` is a real observation, so an
+    ///   issue with no `points:*` label stays distinguishable from an
+    ///   unreadable one);
+    /// - `None` — the read failed (missing/failed/timed-out `gh`,
+    ///   unresolvable repo, unparseable output).
     ///
     /// Callers MUST treat `None` as **fail-open**, matching
     /// [`issue_is_closed_or_pr`](Self::issue_is_closed_or_pr) and
@@ -1126,9 +1136,6 @@ impl SweepRegistry {
     /// under which the #4123 open-PR guard failed open during the 2026-07-29
     /// incident. The `--jq` emits one label name per line.
     ///
-    /// The returned label is chosen by [`PARK_LABELS`] order, not forge order, so
-    /// the refusal message is deterministic when an issue carries both.
-    ///
     /// One narrow exemption applies since #6893 — see
     /// [`mechanical_capability_exempt`](Self::mechanical_capability_exempt).
     /// Keeping it here rather than only in the work-finder's own candidate
@@ -1137,20 +1144,31 @@ impl SweepRegistry {
     /// otherwise be refused two steps later by this very probe.
     ///
     /// [`PARK_LABELS`]: crate::work_finder::PARK_LABELS
-    pub(crate) fn first_park_label(&self, issue: u32) -> Option<String> {
+    pub(crate) fn park_label_and_labels(
+        &self,
+        issue: u32,
+    ) -> Option<(Option<String>, Vec<String>)> {
         let labels = self.current_labels_via_rest(issue)?;
         // `PARK_LABELS` order, not forge order, so the refusal is deterministic
         // when an issue carries both. `loom:blocked` sorts first, so an item
         // carrying it never reaches the exemption below.
-        let park = crate::work_finder::PARK_LABELS
+        let matched = crate::work_finder::PARK_LABELS
             .iter()
-            .find(|park| labels.iter().any(|l| l == *park))?;
-        if **park == *crate::capability::OPERATOR_ONLY_LABEL
-            && self.mechanical_capability_exempt(issue, &labels)
-        {
-            return None;
-        }
-        Some((*park).to_string())
+            .find(|park| labels.iter().any(|l| l == *park))
+            .copied();
+        let park = match matched {
+            // The one #6893 exemption: a `loom:operator-mechanical` item whose
+            // declared capabilities this host fully holds dispatches into the
+            // propose-only lane instead of parking.
+            Some(park)
+                if park == crate::capability::OPERATOR_ONLY_LABEL
+                    && self.mechanical_capability_exempt(issue, &labels) =>
+            {
+                None
+            }
+            other => other.map(str::to_string),
+        };
+        Some((park, labels))
     }
 
     /// True when `issue` is a `loom:operator-mechanical` item whose declared
@@ -1241,9 +1259,10 @@ impl SweepRegistry {
     }
 
     /// Read `issue`'s current label names over the GitHub REST API. `None` on any
-    /// failure (see [`first_park_label`](Self::first_park_label) for the
-    /// fail-open contract); `Some(vec![])` for an issue with no labels, which is
-    /// a *successful* read and must stay distinguishable from a failed one.
+    /// failure (see [`park_label_and_labels`](Self::park_label_and_labels) for
+    /// the fail-open contract); `Some(vec![])` for an issue with no labels,
+    /// which is a *successful* read and must stay distinguishable from a
+    /// failed one.
     pub(crate) fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self

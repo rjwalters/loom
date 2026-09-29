@@ -63,6 +63,7 @@ fn sweep_outcome_omits_complexity_when_no_marker_was_read() {
         hw_files: None,
         generated_lines: None,
         test_lines: None,
+        story_points: None,
     };
     let value = serde_json::to_value(&base).unwrap();
     assert!(
