@@ -283,11 +283,12 @@ fn run_extract_refs(cwd: &Path, opts: &Opts, stdin_text: Option<&str>) -> Result
             .map_err(|e| die(&e.to_string(), 1))?
     };
 
-    let bot = opts
-        .bot_login
-        .as_deref()
-        .unwrap_or(extract::DEFAULT_BOT_LOGIN);
-    let refs = extract::extract(&input, bot);
+    // #9537: with no explicit --bot-login, exclude every fleet identity's
+    // comments (writer, readers, legacy logins), not only the default name.
+    let refs = match opts.bot_login.as_deref() {
+        Some(bot) => extract::extract(&input, bot),
+        None => extract::extract_with(&input, &crate::forge_identity::FleetLogins::for_root(cwd)),
+    };
     if opts.json {
         println!("{}", serde_json::json!({ "refs": refs }));
     } else {

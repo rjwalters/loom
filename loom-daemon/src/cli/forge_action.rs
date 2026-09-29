@@ -185,6 +185,46 @@ pub(crate) enum ForgeAction {
         #[arg(long, value_name = "METHOD")]
         requested: Option<String>,
     },
+
+    /// `forge token --repo <nwo> [--access read|write] [--force]` (#9537) —
+    /// the single entry point for "which App's token should this call use".
+    /// `read` returns the repo's reader App token (deterministic per repo),
+    /// falling back to the writer when there is no usable reader; `write`
+    /// always returns the writer's. Prints one JSON line in the same shape as
+    /// `github-app-token.sh get-token` plus `access`, `slug` and, on a
+    /// fallback, `fallback_reason`; always exits 0 (read `status`).
+    Token {
+        /// Repository, `owner/repo` (selects the installation and the reader).
+        #[arg(long, value_name = "NWO")]
+        repo: String,
+        /// `read` or `write` (default `write`: the attributed identity).
+        #[arg(long, value_name = "ACCESS", default_value = "write")]
+        access: String,
+        /// Bypass the minter's token cache.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// `forge is-fleet <login>` (#9537) — whether `login` (any spelling:
+    /// `x`, `x[bot]`, `app/x`) is one of this fleet's App identities. Prints
+    /// its role (`writer`, `reader`, `legacy`, `default`) and exits 0; exits
+    /// 1 silently when it is not. Replaces every hardcoded fleet login in
+    /// scripts.
+    #[command(name = "is-fleet")]
+    IsFleet {
+        /// The login to test.
+        #[arg(value_name = "LOGIN")]
+        login: String,
+    },
+
+    /// `forge identities [--json]` (#9537) — the resolved roster (writer,
+    /// readers, legacy logins) and, per reader, each published token's owner
+    /// and expiry.
+    Identities {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Handle `loom-daemon forge <issue|pr|auth|auto-merge>` (epic #4081 Phase 3,
@@ -194,6 +234,13 @@ pub(crate) enum ForgeAction {
 pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
     use loom_daemon::forge_cmd::{dispatch, ForgeCmd};
     let cmd = match action {
+        ForgeAction::Token {
+            repo,
+            access,
+            force,
+        } => return super::forge_identity_cmd::token(&repo, &access, force),
+        ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
+        ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),

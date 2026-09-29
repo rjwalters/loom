@@ -141,7 +141,16 @@ pub fn normalise_login(login: &str) -> String {
 /// Whether a comment may contribute references.
 #[must_use]
 pub fn comment_counts(comment: &Comment, bot_login: &str) -> bool {
-    if normalise_login(&comment.author.login) == normalise_login(bot_login) {
+    comment_counts_with(comment, &crate::forge_identity::FleetLogins::single(bot_login))
+}
+
+/// [`comment_counts`] against every fleet identity (#9537): a comment by the
+/// writer, any reader, or a legacy login is the automation's own and never
+/// counts. Readers matter here even though they cannot write any more: a
+/// renamed App's past comments now carry the new name.
+#[must_use]
+pub fn comment_counts_with(comment: &Comment, fleet: &crate::forge_identity::FleetLogins) -> bool {
+    if fleet.contains(&comment.author.login) {
         return false;
     }
     !OWN_MARKERS.iter().any(|m| comment.body.contains(m))
@@ -192,9 +201,15 @@ pub fn comment_counts(comment: &Comment, bot_login: &str) -> bool {
 /// shell would instead have hard-errored trying to fetch the unfetchable token.
 #[must_use]
 pub fn extract(input: &Input, bot_login: &str) -> String {
+    extract_with(input, &crate::forge_identity::FleetLogins::single(bot_login))
+}
+
+/// [`extract`] excluding every fleet identity's comments (#9537).
+#[must_use]
+pub fn extract_with(input: &Input, fleet: &crate::forge_identity::FleetLogins) -> String {
     let mut text = input.body.clone();
     for c in &input.comments {
-        if comment_counts(c, bot_login) {
+        if comment_counts_with(c, fleet) {
             text.push('\n');
             text.push_str(&c.body);
         }
