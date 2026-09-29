@@ -778,6 +778,7 @@ capture, and why) so you can produce the equivalent for your own instance.
 | `dashboard/docs/cloudflare-access.md` | Gating the authenticated view behind SSO; single-URL fallback |
 | `dashboard/docs/query-api.md` | `/api/*` vs `/public/*` routes, redaction policy, live tail |
 | `defaults/observability/cycle-time-questions.md` | Cycle-time analytics on the OTLP sinks: the canonical question set (CT1–CT8), the rollup-vs-raw-TTL retention decision, and what it deliberately cannot answer |
+| `defaults/observability/story-point-questions.md` | Story-point calibration on the OTLP sinks: the canonical question set (SP1–SP5) behind the Fibonacci rubric `defaults/docs/story-points.md` — the clean-landing filter, the token-anchored bounds' derivation, and the #9434 calibration hook |
 | `dashboard/docs/token-analytics.md` | Burn curves, forecasting, per-repo attribution |
 | `defaults/scripts/guide-docs-telemetry.sh` | Local doc-maintenance throughput telemetry (§5b) — record + report, no daemon/Cloudflare involvement |
 | `defaults/scripts/merge-admission-telemetry.sh` | Local merge-admission-recheck outcome telemetry (§5c) — record + report, no daemon/Cloudflare involvement |

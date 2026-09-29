@@ -328,6 +328,39 @@ been compared against the ClickStack answers on the same fixture yet. Treat it
 as unproven until that comparison is recorded in `evidence.md`, exactly as the
 trial treats every other unexecuted claim.
 
+## Story-point calibration (Issue #9430)
+
+`story-point-extract.sql` is this backend's half of the story-point
+calibration seam — one view, `loom_analytics.raw_landing_cost`, holding one
+row per terminal ship with the three cost measures (tokens, lines changed,
+wall-clock) and the `clean_landing` verdict that selects the comparable
+population. [`../story-point-queries.sql`](../story-point-queries.sql) answers
+SP1–SP5 from it; the definitions are in
+[`../story-point-questions.md`](../story-point-questions.md), and the rubric
+the numbers calibrate is
+[`../../docs/story-points.md`](../../docs/story-points.md). ClickStack uses
+the same shared files with only its own extraction view swapped in.
+
+```console
+docker exec -i harness-ops-signoz-clickhouse clickhouse-client \
+  --multiquery < story-point-extract.sql
+# then, with a window and the rubric's cut points:
+docker exec -i harness-ops-signoz-clickhouse clickhouse-client \
+  --param_since='2026-09-14 00:00:00' --param_until='2026-09-30 00:00:00' \
+  --param_top_n=10 --param_cut_1_2=16000000 --param_cut_2_3=24000000 \
+  --param_cut_3_5=39000000 --param_cut_5_8=60000000 \
+  --param_cut_8_13=90000000 --queries-file story-point-queries.sql
+```
+
+**Executed live on 2026-09-29** against the fleet SigNoz on the harness-ops
+host (read-only; the view body inlined in place of the CREATE) — 10 579
+outcome rows, 172 clean landings, full verbatim output in
+[`evidence.md`](evidence.md) § "Story-point calibration, executed live".
+Note the deliberate difference from `cycle-time-extract.sql`: this view
+carries the full terminal population (SP3 counts the exclusions) and
+collapses at-least-once redeliveries itself, because this question set has
+no rollup of its own — #9446's `sweep_facts` owns durable history.
+
 ## Retention and operation
 
 Set **seven days for logs and traces and 30 days for metrics** in General

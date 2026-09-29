@@ -849,6 +849,94 @@ README's documented operator step. Its effect over a multi-day soak therefore
 remains unobserved on a live stack. After applying it, the README's
 `part_log` failed-merge query is the check that should return no rows.
 
+## Story-point calibration, executed live (2026-09-29, #9430)
+
+**Deployment identity: this is not the trial above.** These queries ran
+against the fleet SigNoz on the harness-ops host (container
+`harness-ops-signoz-clickhouse`, ClickHouse 25.12.5), reached read-only via
+`docker exec -i … clickhouse-client`. Because that access is read-only, the
+extraction view's `CREATE OR REPLACE VIEW loom_analytics.raw_landing_cost`
+was **not** executed: the view's SELECT body was cut out of the committed
+`story-point-extract.sql` mechanically (everything after the `AS`, trailing
+`;` stripped) and substituted for each `loom_analytics.raw_landing_cost`
+reference in the committed `story-point-queries.sql`, so the executed SQL is
+literally derived from the committed artifact rather than retyped. All five
+questions ran in one `--queries-file` pass with
+`--param_since='2026-09-14 00:00:00' --param_until='2026-09-30 00:00:00',
+`--param_top_n=10` and cuts `16/24/39/60/90 M` tokens; exit 0.
+
+**Data.** `sweep.outcome` in `signoz_logs.distributed_logs_v2`: **10 579
+rows / 10 578 distinct sweeps** (one at-least-once duplicate — the reason the
+view groups on ship identity), one service (`loom`), window
+2026-09-14 05:04:08 → 2026-09-29 04:30:39 UTC. This supersedes the morning's
+"5 records since 09-25" observation recorded on #9430: by 17:46 UTC the
+store held the 09-14-starting window that matches the 2026-09-28 backup's
+documented coverage, so a restore plus continued export landing in between
+is the likely explanation — the counts above are what was actually queried.
+Field reality on this fleet's records: **no `loom.tokens_status` on any row**
+(the producing daemon predates #9440 — the queries therefore treat an absent
+status with a present token pair as measured), tokens on 1 502 / 10 579 rows
+(14.2%), `doctor_cycles` on 296, and no per-phase token entries (pre-#9443).
+
+The full verbatim output (26 lines, SP order):
+
+```text
+rjwalters/loom  8191  9228  sweep-issue-8191-1790517491  2026-09-27 16:49:28.450  sonnet  158674285  1346  10254
+rjwalters/loom  8450  8616  sweep-issue-8450-1790069387  2026-09-22 09:35:30.758  \N     136963423  958   292
+2AMLogic/sky130-sar-adc  121  389  sweep-issue-121-1790297010  2026-09-25 01:34:52.000  sonnet  119335774  655  3052
+2AMLogic/gf180-surge  58  128  sweep-issue-58-1790354307  2026-09-25 17:17:20.161  sonnet  116704572  16261  2307
+/home/ubuntu/GitHub/sky130-sar-adc  394  398  sweep-issue-394-1790310169  2026-09-25 04:41:02.818  sonnet  111821412  18  1084
+2AMLogic/loom-ui  152  314  sweep-issue-152-1790587695  2026-09-28 10:01:09.986  sonnet  111372124  549  1956
+rjwalters/loom  7755  7846  sweep-issue-7755-1789548974  2026-09-16 09:48:16.022  sonnet  101754934  1105  3082
+rjwalters/loom  8545  8596  sweep-issue-8545-1790039191  2026-09-22 03:18:21.583  sonnet  95804297   1218  7866
+rjwalters/loom  5512  7695  sweep-issue-5512-1789470504  2026-09-15 11:53:22.120  sonnet  91986225   623   2661
+rjwalters/loom  7825  7934  sweep-issue-7825-1789590415  2026-09-16 20:51:55.560  \N     91157446   763   1489
+tokens         138  11956069  27335482  75141054  158674285
+wall_sec       172  691       1800      3981      14261
+lines_changed  172  3         191       1979      138203
+10579  8473  1908  9213  1060  41  172  34  0
+1  27  19.6
+2  27  19.6
+3  42  30.4
+5  24  17.4
+8  8   5.8
+13 10  7.2
+1  27  11876254   28   1127
+2  27  18296416   75   977
+3  42  29562090   152  2032
+5  24  49384458   494  1884
+8  8   76877723   520  2440
+13 10  111596768  860  2484
+```
+
+(SP1: top 10 clean landings, columns repo/issue/pr/sweep_id/finished/model/
+tokens/lines/wall — note the pre-#9442 **path-shaped repo** on line 5, which
+is why repo grouping in this window needs the #9442 caveat; SP2: measure,
+n, p10, p50, p90, max; SP3: ships, not_success, success_without_pr,
+without_phase_breakdown, judge_entries_not_one, doctor_engaged,
+clean_landings, clean_tokens_absent, clean_tokens_suspect; SP4: points,
+landings, pct; SP5: points, landings, tokens p50, lines p50, wall p50.)
+
+What this established, consumed by `defaults/docs/story-points.md`: **172
+clean landings, 138 token-measured**; the token distribution p10/p50/p90 =
+12.0 / 27.3 / 75.1 M reproduces the independent D1 extraction (12.1 / 26.8 /
+70.9 M, issue #9430 comment) almost exactly; under the geometric-mean cuts
+(16/24/39/60/90 M) every bucket's live token median lands inside its own
+range while tracking the D1 medians; and wall-clock is nearly flat across
+buckets (p50 977…2 484 s against a ~9× token span), the empirical form of
+the queue-depth caveat that keeps it from ever anchoring a bound. A strict
+`doctor_cycles = 0`-present filter would have kept 128 of the 172 — the
+phase-array fallback carries the other 44 pre-09-18 landings, which is why
+the filter is the coalesce, not the field.
+
+**Not executed:** the `CREATE` half of `story-point-extract.sql` (read-only
+access, as stated above), and the ClickStack twin
+(`clickstack/story-point-extract.sql`), which is contract-checked in CI
+(`loom-daemon/tests/story_point_artifacts.rs`, including the gateway
+`keep_keys` allowlist assertion that would have caught a
+`loom.disposition`-based landed test reading NULL forever) but has no live
+ClickStack run yet. The rubric itself is marked provisional pending #9434.
+
 ## Acceptance ledger
 
 | Check | Status |

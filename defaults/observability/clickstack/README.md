@@ -232,6 +232,22 @@ alternative, and the drift-reconciliation query (CT8) are in the questions doc.
 against a real pinned ClickHouse in CI, including the case where every raw row
 has expired.
 
+## Story-point calibration (Issue #9430)
+
+`story-point-extract.sql` is the same seam pattern for the Fibonacci
+story-point rubric: one view, `loom_analytics.raw_landing_cost`, mapping this
+deployment's `default.otel_logs` rows onto the per-ship cost columns and the
+`clean_landing` verdict. The five questions (SP1–SP5) and the rubric they
+calibrate are shared with SigNoz — see
+[`../story-point-questions.md`](../story-point-questions.md) and
+[`../../docs/story-points.md`](../../docs/story-points.md). Unlike the
+cycle-time set there is no rollup file here: the view itself deduplicates
+redeliveries, and durable history is #9446's `sweep_facts` rollup, so this
+artifact answers within whatever window the raw TTL still holds.
+`loom-daemon/tests/story_point_artifacts.rs` contract-checks the column list
+and the gateway allowlist in ordinary CI. **Not executed live on this
+backend** — the SigNoz half carries the live run (2026-09-29, fleet host).
+
 ## Retention, persistence and key rotation
 
 The collector table TTL defaults to `168h` through
