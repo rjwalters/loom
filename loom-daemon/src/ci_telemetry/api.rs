@@ -251,36 +251,37 @@ impl GhCliApi {
     /// the reader (until the reported reset, when there is one) and the same
     /// call is retried once on the writer's credential.
     fn run(&self, path: &str, extra: &[&str]) -> Result<ApiResponse, ApiError> {
-        let reader =
-            repo_of_path(path).and_then(|nwo| crate::forge_identity::read_credential(&nwo, None));
-        if let Some((dir, app_id)) = reader {
+        let nwo = repo_of_path(path);
+        let reader = nwo
+            .as_deref()
+            .and_then(|r| crate::forge_identity::read_credential(r, None));
+        if let (Some((dir, app_id)), Some(nwo)) = (reader, nwo.as_deref()) {
             let first = self.run_once(path, extra, Some(&dir));
-            let withdraw_until = match &first {
-                Err(ApiError::RateLimited { reset_epoch, .. }) => Some(
+            let (failure, app_until) = match &first {
+                Err(ApiError::RateLimited { reset_epoch, .. }) => (
+                    Some(crate::forge_identity::Failure::App),
                     reset_epoch
                         .and_then(|e| u64::try_from(e).ok())
-                        .map(|e| std::time::UNIX_EPOCH + std::time::Duration::from_secs(e))
-                        .unwrap_or_else(|| {
-                            std::time::SystemTime::now()
-                                + crate::forge_read_pool::DEFAULT_WITHDRAWAL
-                        }),
+                        .map(|e| std::time::UNIX_EPOCH + std::time::Duration::from_secs(e)),
                 ),
-                Err(ApiError::Http {
-                    status: 401 | 403 | 404,
-                    ..
-                }) => {
-                    Some(std::time::SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL)
+                Err(ApiError::Http { status: 401, .. }) => {
+                    (Some(crate::forge_identity::Failure::App), None)
                 }
-                _ => None,
+                Err(ApiError::Http {
+                    status: 403 | 404, ..
+                }) => (Some(crate::forge_identity::Failure::Coverage), None),
+                _ => (None, None),
             };
-            let Some(until) = withdraw_until else {
+            let Some(failure) = failure else {
                 return first;
             };
-            log::warn!(
-                "ci_telemetry: reader app {app_id} refused {path}; withdrawn and retrying on the \
-                 writer — #9537"
+            crate::forge_identity::withdraw_after(
+                &app_id,
+                nwo,
+                failure,
+                app_until,
+                &format!("ci_telemetry {path}"),
             );
-            crate::forge_read_pool::withdraw_until(&app_id, until);
         }
         self.run_once(path, extra, None)
     }

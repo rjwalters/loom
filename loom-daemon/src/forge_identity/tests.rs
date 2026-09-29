@@ -307,7 +307,9 @@ fn refresh_publishes_each_reader_for_each_owner_and_withdraws_failures() {
             .join("hosts.yml")
             .exists());
     }
-    assert!(forge_read_pool::is_withdrawn("rf-bad"));
+    // A mint failure is owner-level coverage: nothing is withdrawn App-wide;
+    // the unpublished directory is what keeps that owner on the writer.
+    assert!(!forge_read_pool::is_withdrawn("rf-bad"));
     assert!(!forge_read_pool::is_withdrawn("rf-ok"));
     assert!(out
         .iter()
@@ -360,4 +362,64 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         offenders.is_empty(),
         "reader credentials requested outside reviewed read paths: {offenders:?}"
     );
+}
+
+#[test]
+fn failures_are_scoped_app_wide_or_to_one_repo() {
+    use super::Failure::{App, Coverage};
+    assert_eq!(
+        classify_failure("gh: API rate limit exceeded for installation (HTTP 403)", Some(403)),
+        Some(App)
+    );
+    assert_eq!(
+        classify_failure("secondary rate limit", Some(403)),
+        Some(App),
+        "rate-limited 403 is App-wide"
+    );
+    assert_eq!(classify_failure("", Some(429)), Some(App));
+    assert_eq!(classify_failure("Bad credentials (HTTP 401)", Some(401)), Some(App));
+    assert_eq!(classify_failure("gh: Not Found (HTTP 404)", Some(404)), Some(Coverage));
+    assert_eq!(
+        classify_failure("Resource not accessible by integration (HTTP 403)", Some(403)),
+        Some(Coverage)
+    );
+    assert_eq!(classify_failure("Server Error (HTTP 502)", Some(502)), None);
+}
+
+#[test]
+fn a_coverage_withdrawal_affects_only_that_repo() {
+    let r = Roster {
+        writer: Some(ident("100", None)),
+        readers: vec![ident("cov-a", None), ident("cov-b", None)],
+        legacy_logins: vec![],
+    };
+    // Find two repos that hash to the same reader.
+    let first = reader_for(&r, "owner/repo-0").unwrap().app_id.clone();
+    let other = (1..200)
+        .map(|i| format!("owner/repo-{i}"))
+        .find(|repo| reader_for(&r, repo).unwrap().app_id == first)
+        .unwrap();
+    withdraw_after(&first, "owner/repo-0", Failure::Coverage, None, "test");
+    assert_ne!(
+        reader_for(&r, "owner/repo-0").unwrap().app_id,
+        first,
+        "uncovered repo moves to the next reader"
+    );
+    assert_eq!(
+        reader_for(&r, &other).unwrap().app_id,
+        first,
+        "every other repo keeps its reader"
+    );
+    assert!(!forge_read_pool::is_withdrawn(&first), "not App-wide");
+}
+
+#[test]
+fn an_app_withdrawal_honours_the_reported_reset() {
+    let reset = SystemTime::now() + Duration::from_secs(1800);
+    withdraw_after("reset-app", "o/r", Failure::App, Some(reset), "test");
+    assert!(forge_read_pool::is_withdrawn_at(
+        "reset-app",
+        SystemTime::now() + Duration::from_secs(1700)
+    ));
+    assert!(!forge_read_pool::is_withdrawn_at("reset-app", reset + Duration::from_secs(1)));
 }

@@ -359,19 +359,66 @@ pub fn role_of(roster: &Roster, login: &str) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 
 /// The reader that should serve reads for `owner_repo` right now, or `None`
-/// (no readers, or every reader withdrawn).
+/// (no readers, or every reader withdrawn for this repo or entirely).
+///
+/// Walks forward from the #9376 hash index, so the fallback order is itself
+/// deterministic across hosts, skipping a reader withdrawn as an App (rate
+/// limit, bad credentials) or for this one repo (not covered by its
+/// installation).
 #[must_use]
 pub fn reader_for<'a>(roster: &'a Roster, owner_repo: &str) -> Option<&'a Identity> {
-    let pool: Vec<PoolMember> = roster
-        .readers
-        .iter()
-        .map(|r| PoolMember {
-            app_id: r.app_id.clone(),
-            private_key_path: r.private_key_path.clone(),
+    reader_for_at(roster, owner_repo, SystemTime::now())
+}
+
+/// [`reader_for`] with an injected clock.
+#[must_use]
+pub fn reader_for_at<'a>(
+    roster: &'a Roster,
+    owner_repo: &str,
+    now: SystemTime,
+) -> Option<&'a Identity> {
+    let n = roster.readers.len();
+    let start = forge_read_pool::assignment_index(owner_repo, n)?;
+    (0..n)
+        .map(|off| &roster.readers[(start + off) % n])
+        .find(|r| {
+            !forge_read_pool::is_withdrawn_at(&r.app_id, now)
+                && !repo_withdrawn_at(&r.app_id, owner_repo, now)
         })
-        .collect();
-    let chosen = forge_read_pool::select_for_repo(&pool, owner_repo)?;
-    roster.readers.iter().find(|r| r.app_id == chosen.app_id)
+}
+
+/// `(app id, owner/repo)` -> eligible again. A coverage failure is about one
+/// repo the reader's installation does not include; withdrawing the whole App
+/// for it would knock the reader off every repo it does serve.
+fn repo_withdrawals() -> &'static Mutex<std::collections::HashMap<(String, String), SystemTime>> {
+    static MAP: OnceLock<Mutex<std::collections::HashMap<(String, String), SystemTime>>> =
+        OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// How long a reader stays off one repo after a coverage failure. Longer than
+/// an App-wide withdrawal: an installation's repo set changes rarely, and each
+/// re-probe of an uncovered repo is a guaranteed wasted call.
+pub const REPO_WITHDRAWAL: Duration = Duration::from_secs(3600);
+
+fn repo_withdrawn_at(app_id: &str, owner_repo: &str, now: SystemTime) -> bool {
+    let Ok(map) = repo_withdrawals().lock() else {
+        return false;
+    };
+    map.get(&(app_id.to_string(), owner_repo.to_ascii_lowercase()))
+        .is_some_and(|&until| now < until)
+}
+
+/// Withdraw reader `app_id` for `owner_repo` only, until `until`.
+pub fn withdraw_reader_for_repo_until(app_id: &str, owner_repo: &str, until: SystemTime) {
+    if let Ok(mut map) = repo_withdrawals().lock() {
+        let e = map
+            .entry((app_id.to_string(), owner_repo.to_ascii_lowercase()))
+            .or_insert(until);
+        if until > *e {
+            *e = until;
+        }
+    }
 }
 
 /// The directory a reader's token for `owner` is published to.
@@ -460,37 +507,90 @@ pub fn apply_read_credential(
     Some(app_id)
 }
 
-/// Whether a failed read's `stderr` means the *credential* could not serve
-/// it (rate limit, auth, or coverage), so the reader should be withdrawn and
-/// the read retried on the writer. A plain "not found" on a repo the reader
-/// cannot see is coverage, and counts.
-#[must_use]
-pub fn is_credential_failure(stderr: &str, http_status: Option<u16>) -> bool {
-    if matches!(http_status, Some(401 | 403 | 404 | 429)) {
-        return true;
-    }
-    let s = stderr.to_ascii_lowercase();
-    [
-        "rate limit",
-        "bad credentials",
-        "resource not accessible by integration",
-        "http 401",
-        "http 403",
-        "http 404",
-        "http 429",
-    ]
-    .iter()
-    .any(|needle| s.contains(needle))
+/// What a failed read says about the reader that served it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// The App as a whole cannot serve right now (rate limit, bad
+    /// credentials): withdraw it everywhere.
+    App,
+    /// This repo is outside the reader's installation (404, "not accessible
+    /// by integration"): withdraw it for this repo only.
+    Coverage,
 }
 
-/// Withdraw reader `app_id` after a credential failure on a read.
+/// Classify a failed read, or `None` when the failure is not the
+/// credential's (a 5xx, a network error): retrying on the writer would not
+/// help and withdrawing the reader would be wrong.
+#[must_use]
+pub fn classify_failure(stderr: &str, http_status: Option<u16>) -> Option<Failure> {
+    let s = stderr.to_ascii_lowercase();
+    // Rate limits come as 403 or 429 with a telling message, so check the
+    // text before the status: a rate-limited 403 is App-wide, not coverage.
+    if s.contains("rate limit")
+        || s.contains("bad credentials")
+        || matches!(http_status, Some(401 | 429))
+        || s.contains("http 401")
+        || s.contains("http 429")
+    {
+        return Some(Failure::App);
+    }
+    if matches!(http_status, Some(403 | 404))
+        || s.contains("resource not accessible by integration")
+        || s.contains("http 403")
+        || s.contains("http 404")
+    {
+        return Some(Failure::Coverage);
+    }
+    None
+}
+
+/// Whether a failed read is the credential's fault (see [`classify_failure`]).
+#[must_use]
+pub fn is_credential_failure(stderr: &str, http_status: Option<u16>) -> bool {
+    classify_failure(stderr, http_status).is_some()
+}
+
+/// Withdraw reader `app_id` App-wide (a mint failure, or no repo to scope to).
 pub fn withdraw_reader(app_id: &str, why: &str) {
     log::warn!(
-        "forge_identity: reader app {app_id} withdrawn for {}s after a failed read ({why}); \
-         reads fall back to the next reader or the writer — #9537",
+        "forge_identity: reader app {app_id} withdrawn for {}s ({why}); reads fall back to \
+         the next reader or the writer — #9537",
         forge_read_pool::DEFAULT_WITHDRAWAL.as_secs()
     );
     forge_read_pool::withdraw(app_id);
+}
+
+/// Withdraw reader `app_id` after `failure` on a read of `owner_repo`: the
+/// whole App for [`Failure::App`] (until `app_until` when the forge reported
+/// a reset, else the default window), just this repo for
+/// [`Failure::Coverage`].
+pub fn withdraw_after(
+    app_id: &str,
+    owner_repo: &str,
+    failure: Failure,
+    app_until: Option<SystemTime>,
+    why: &str,
+) {
+    match failure {
+        Failure::App => {
+            log::warn!(
+                "forge_identity: reader app {app_id} withdrawn App-wide after a failed read \
+                 ({why}); reads fall back to the next reader or the writer — #9537"
+            );
+            match app_until {
+                Some(t) => forge_read_pool::withdraw_until(app_id, t),
+                None => forge_read_pool::withdraw(app_id),
+            }
+        }
+        Failure::Coverage => {
+            log::info!(
+                "forge_identity: reader app {app_id} does not cover {owner_repo} ({why}); \
+                 withdrawn for that repo for {}s, other repos unaffected — #9537",
+                REPO_WITHDRAWAL.as_secs()
+            );
+            withdraw_reader_for_repo_until(app_id, owner_repo, SystemTime::now() + REPO_WITHDRAWAL);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +664,8 @@ pub struct RefreshOutcome {
 
 /// Mint and publish every reader's token for every owner in `owner_repos`
 /// (one representative `owner/repo` per owner). A reader that fails to mint
-/// for an owner is withdrawn, so reads skip it until the next success.
+/// for an owner just leaves that owner's directory unpublished, so only that
+/// owner's reads fall back to the writer.
 pub fn refresh_reader_credentials(
     workspace_root: &Path,
     roster: &Roster,
@@ -596,8 +697,17 @@ pub fn refresh_reader_credentials(
                     Err("github-app-token.sh reported not_configured for this reader".to_string())
                 }
             };
+            // No withdrawal on a mint failure: the usual cause is this App not
+            // being installed on `owner`, an owner-level coverage gap. That
+            // owner's reader directory simply stays unpublished (or ages out),
+            // so its reads use the writer while every other owner keeps the
+            // reader.
             if let Err(reason) = &result {
-                withdraw_reader(&reader.app_id, &format!("mint for {owner}: {reason}"));
+                log::warn!(
+                    "forge_identity: reader app {} could not refresh its token for {owner} \
+                     ({reason}); {owner}'s reads use the writer until it can — #9537",
+                    reader.app_id
+                );
             }
             out.push(RefreshOutcome {
                 app_id: reader.app_id.clone(),

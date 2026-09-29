@@ -227,10 +227,22 @@ pub(crate) fn fetch_conditional(
         let (status, response, stderr) = &first;
         let http = response.as_ref().map(|r| r.status);
         let ok = status.success() || matches!(http, Some(200 | 304));
-        if ok || !crate::forge_identity::is_credential_failure(stderr, http) {
+        let failure = if ok {
+            None
+        } else {
+            crate::forge_identity::classify_failure(stderr, http)
+        };
+        let Some(failure) = failure else {
             return Ok(first);
-        }
-        crate::forge_identity::withdraw_reader(&app_id, &format!("{caller} {url}"));
+        };
+        let repo = target.repo.as_deref().unwrap_or_default();
+        crate::forge_identity::withdraw_after(
+            &app_id,
+            repo,
+            failure,
+            None,
+            &format!("{caller} {url}"),
+        );
     }
     run_fetch(caller, gh_bin, cwd, target, url, etag, None)
 }
