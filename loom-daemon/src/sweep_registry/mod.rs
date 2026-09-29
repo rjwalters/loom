@@ -1014,6 +1014,13 @@ pub struct PreparedIssueDispatch {
     /// Dropping this box releases the slot, so an abandoned dispatch cannot
     /// leak one. See `runtime_preference::handoff`.
     pub(crate) admission: crate::runtime_preference::DispatchAdmission,
+    /// The issue's story-point size (#9432), resolved at guard-chain step 2.71
+    /// from the label set the #4444 park guard already fetched, and carried
+    /// across the begin→poll→finish seam so `finish_issue_dispatch` can stamp
+    /// it on the `sweep.global.dispatch` event without re-reading the forge.
+    /// `None` for an unsized issue, a defective points label set, or a skipped
+    /// label read — never `0`.
+    pub(crate) story_points: Option<u32>,
 }
 
 /// Result of the lock-scoped [`begin_cancel`](SweepRegistry::begin_cancel)

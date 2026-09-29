@@ -865,6 +865,7 @@ async fn a_real_phase_transition_reaches_the_telemetry_queue() {
     let mut dispatches = HashMap::new();
     crate::observability::collector::map_event_to_records(
         &Event::SweepGlobalDispatch {
+            story_points: None,
             sweep_id: sweep_id.clone(),
             kind: SweepKind::Issue(issue),
             runtime: None,
