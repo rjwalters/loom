@@ -1627,7 +1627,8 @@ impl VerdictReconcileStats {
 
 /// The newest SHA recorded for `kind` across `bodies` (oldest-first, the order
 /// the forge's comment listing returns). Returns `None` when no comment
-/// carries a marker for that verdict kind.
+/// carries a marker for that verdict kind. `bodies` must already be trusted
+/// only (`forge::fetch_comment_bodies`, #9548): this reads markers, not authors.
 ///
 /// **Filtering on `verdict=` is load-bearing, not cosmetic.** A PR rejected at
 /// SHA A and later approved at SHA B carries markers for both, and only the
@@ -3141,15 +3142,12 @@ pub mod forge {
         name: String,
     }
 
-    #[derive(Debug, Deserialize)]
-    struct GhIssueComment {
-        #[serde(default)]
-        body: Option<String>,
-    }
-
-    /// Every comment body on `pr_number`, oldest first. Returns `None` on any
-    /// failure — [`decide_verdict`] then sees `marker_sha: None` and fails
-    /// safe to `Keep(Unverifiable)`, never a spurious invalidation.
+    /// Every TRUSTED comment body on `pr_number`, oldest first (#9548: an
+    /// outsider's or a foreign fleet's well-formed marker is prose, so it is
+    /// dropped here, before any marker is read — see [`crate::comment_trust`]).
+    /// Returns `None` on any failure — [`decide_verdict`] then sees
+    /// `marker_sha: None` and fails safe to `Keep(Unverifiable)`, never a
+    /// spurious invalidation.
     ///
     /// `--paginate` is REQUIRED: without it only the first page (default
     /// per_page=30, oldest-first) comes back, and the verdict marker is always
@@ -3173,8 +3171,7 @@ pub mod forge {
         if !out.status.success() {
             return None;
         }
-        let rows: Vec<GhIssueComment> = serde_json::from_slice(&out.stdout).ok()?;
-        Some(rows.into_iter().filter_map(|c| c.body).collect())
+        crate::comment_trust::TrustPolicy::for_root(root).trusted_bodies(&out.stdout)
     }
 
     fn list_verdict_prs(gh_bin: &Path, root: &Path, kind: VerdictKind) -> Result<Vec<VerdictPr>> {
@@ -3474,3 +3471,7 @@ mod repo_env_tests;
 // reason: neither this module nor `tests.rs` has ratchet headroom.
 #[cfg(test)]
 mod verdict_dedup_tests;
+
+// #9548: only trusted authors' verdict markers count.
+#[cfg(test)]
+mod trusted_comments_tests;

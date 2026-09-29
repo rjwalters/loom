@@ -20,7 +20,13 @@
 //!   never `…[bot]`. Only then is the name compared, through
 //!   [`crate::dep_recheck::extract::normalise_login`]; or
 //! - this daemon's own forge identity, when the forge could name it (an App
-//!   identity, e.g. the `<slug>[bot]` fallback, again only as an App login).
+//!   identity, e.g. the `<slug>[bot]` fallback, again only as an App login);
+//!   or
+//! - a login in the workspace's `forge.trustedCommenters` allowlist.
+//!
+//! The decision itself is [`crate::comment_trust::trusted_by`] (#9548), the
+//! one predicate every marker reader shares; this module only supplies the
+//! liveness pass's view of "the fleet App" (the process-wide registry below).
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -37,13 +43,24 @@ fn registered() -> &'static Mutex<BTreeSet<String>> {
     APPS.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
+/// The `forge.trustedCommenters` allowlist, registered by
+/// [`configured_app_slug`] (raw spellings: the account kind is part of it).
+fn allowlisted() -> &'static Mutex<BTreeSet<String>> {
+    static ALLOW: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    ALLOW.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
 /// The fleet App slug configured for the workspace at `root`:
 /// [`APP_SLUG_ENV`] > `forge.githubApp.slug` (then `.name`). Registered for
 /// [`trusted_author`] as a side effect, so every later decision in this
 /// process believes it.
 pub fn configured_app_slug(root: &Path) -> Option<String> {
+    let effective = crate::config_resolver::resolve_effective_config(root);
+    allowlisted()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(crate::comment_trust::allowlist_from_config(&effective));
     let from_config = || {
-        let effective = crate::config_resolver::resolve_effective_config(root);
         let app = crate::config_resolver::get_path(&effective, "forge.githubApp")?;
         ["slug", "name"]
             .iter()
@@ -78,13 +95,7 @@ pub fn register_fleet_app(slug: &str) {
     }
 }
 
-/// Whether the raw `login` is spelled as a GitHub App (`…[bot]` or `app/…`),
-/// a spelling no user account can register.
-#[must_use]
-pub fn is_app_login(login: &str) -> bool {
-    let l = login.trim().to_ascii_lowercase();
-    l.ends_with("[bot]") || l.starts_with("app/")
-}
+pub use crate::comment_trust::{is_app_login, TRUSTED_ASSOCIATIONS};
 
 /// Whether the normalised `login` names the fleet App. Callers must first
 /// check [`is_app_login`] on the raw login.
@@ -100,9 +111,6 @@ fn is_fleet_app(norm: &str) -> bool {
         || crate::forge_identity::is_default_family(norm)
 }
 
-/// `author_association` values that can already write labels.
-pub const TRUSTED_ASSOCIATIONS: &[&str] = &["OWNER", "MEMBER", "COLLABORATOR"];
-
 /// Whether a comment by `login` with `association` is believed.
 #[must_use]
 pub fn trusted_author(
@@ -110,23 +118,18 @@ pub fn trusted_author(
     association: Option<&str>,
     self_login: Option<&str>,
 ) -> bool {
-    if association.is_some_and(|a| {
-        TRUSTED_ASSOCIATIONS
-            .iter()
-            .any(|t| a.eq_ignore_ascii_case(t))
-    }) {
-        return true;
-    }
-    let Some(login) = login.filter(|l| !l.trim().is_empty()) else {
-        return false;
-    };
-    let app = is_app_login(login);
-    let norm = normalise_login(login);
-    if app && is_fleet_app(&norm) {
-        return true;
-    }
-    // Same account kind and name: a user `x` is never the App `x[bot]`.
-    self_login.is_some_and(|me| is_app_login(me) == app && normalise_login(me) == norm)
+    let allow: Vec<String> = allowlisted()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect();
+    crate::comment_trust::trusted_by(
+        &crate::comment_trust::Author::new(login, association),
+        is_fleet_app,
+        self_login,
+        &allow,
+    )
 }
 
 /// Whether `comment` is believed.

@@ -351,10 +351,14 @@ Commands (run from a checkout):
 loom-daemon forge identities            # roster, fleet logins, reader token expiries
 loom-daemon forge is-fleet app/loom-fleet-reader-1 && echo ours   # prints the role; exit 1 if not ours
 loom-daemon forge token --repo owner/repo --access read    # JSON, same shape as github-app-token.sh get-token
+gh api "repos/{owner}/{repo}/issues/42/comments" --paginate | loom-daemon forge trusted-comments
 ```
 
 Scripts use `forge is-fleet` instead of hardcoding a login, and
 `forge token --access read|write` instead of choosing an App themselves.
+The same roster decides whose comments Loom believes: a marker counts only from
+a repo insider, one of these Apps, or `forge.trustedCommenters` (#9548, see
+[`comment-trust.md`](comment-trust.md)).
 
 ### The cached-permission window: `403 … not accessible by integration` (#6074)
 
