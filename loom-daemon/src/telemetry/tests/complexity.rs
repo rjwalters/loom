@@ -35,6 +35,7 @@ fn sweep_outcome_omits_complexity_when_no_marker_was_read() {
         phase_durations: Vec::new(),
         total_duration_sec: 10,
         result: SweepResult::Failure,
+        disposition: SweepDisposition::Landed,
         pr_number: None,
         tokens_in: None,
         tokens_out: None,

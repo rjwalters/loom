@@ -8,7 +8,7 @@
 use super::*;
 
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
-use crate::telemetry::{PhaseDuration, RepoVisibility};
+use crate::telemetry::{PhaseDuration, RepoVisibility, SweepDisposition};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn record(
@@ -30,6 +30,7 @@ fn record(
         phase_durations: Vec::new(),
         total_duration_sec: duration,
         result,
+        disposition: SweepDisposition::Unknown,
         pr_number: None,
         tokens_in: None,
         tokens_out: None,

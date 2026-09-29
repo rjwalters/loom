@@ -131,7 +131,13 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   // `failure_class`, `models_used`, `doctor_cycles` — are absent for the same
   // reason: why a private repo's sweep died, and which models it burned, is
   // workload detail about that repo. Issue #9443's `tokens_unattributed` joins
-  // them: it is a remainder of the same withheld totals.
+  // them: it is a remainder of the same withheld totals. Issue #9441's
+  // `disposition` is absent on exactly that rule too, and the omission is
+  // deliberate rather than an oversight: it is a strictly finer reading of
+  // *why* a private repo's sweep ended than the `result` above ("the Curator
+  // closed this issue", "the work was rejected"), i.e. the same category
+  // `failure_class` is held back for. The coarse `result` stays public and
+  // unchanged.
   //
   // `phase_durations` moved OUT of this list in #9443 and into
   // `PUBLIC_RECORD_DERIVATIONS` below. It used to be a raw copy, which was

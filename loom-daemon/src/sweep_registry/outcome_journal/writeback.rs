@@ -50,7 +50,7 @@
 //! # Never blocks or fails the terminal transition
 //!
 //! Every step here is the same best-effort shape as
-//! [`super::complexity_signal::fetch_complexity_signal`] and
+//! [`super::complexity_signal`]'s issue read and
 //! [`super::super::prless_retry`]'s comment helpers: a `gh` failure, timeout,
 //! or missing repo context is logged and swallowed, never propagated. Called
 //! AFTER every durable local write in
@@ -372,6 +372,7 @@ mod tests {
             ],
             total_duration_sec: 4000,
             result: telemetry::SweepResult::Success,
+            disposition: telemetry::SweepDisposition::Landed,
             pr_number: Some(42),
             tokens_in: Some(200_000),
             tokens_out: Some(15_000),
