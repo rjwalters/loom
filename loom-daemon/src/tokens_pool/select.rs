@@ -253,6 +253,21 @@ fn shared_pool_hint() -> String {
     }
 }
 
+/// The refusal notice appended to every empty-pool error when `workspace` holds
+/// a retired in-worktree pool (issue #9135).
+///
+/// Without it, retiring the in-worktree pool turns a working host into "No
+/// .token files in ~/.loom/tokens" with no hint that the credentials the
+/// operator provisioned are sitting one directory away, deliberately ignored.
+/// That is the same diagnosis gap [`shadowed_shared_pool_hint`] was written for
+/// (#6614) — an unexplained empty pool costs hours.
+fn retired_pool_notice(workspace: &Path) -> String {
+    match super::paths::retired_in_worktree_pool(workspace) {
+        Some(pool) => format!("\n  {}", super::paths::in_worktree_pool_error(&pool)),
+        None => String::new(),
+    }
+}
+
 /// Count of `.token` files in `dir` that are **usable**: neither bad-marked
 /// ([`super::bad_tokens::is_bad`]'s underlying check, via [`blocking_entry_in_dir`] so this
 /// works against an arbitrary already-resolved directory rather than
@@ -1174,20 +1189,22 @@ fn select_inner(
 ) -> Result<SelectedToken, EmptyTokenPoolError> {
     if !tokens_dir.is_dir() {
         return Err(EmptyTokenPoolError(format!(
-            "Token directory does not exist: {}{}. Run `loom-daemon tokens bootstrap` to populate it \
-             (or `loom-daemon tokens bootstrap --shared` for the machine-level pool).",
+            "Token directory does not exist: {}{}. Run `loom-daemon tokens bootstrap` to populate \
+             the shared machine-level pool.{}",
             tokens_dir.display(),
-            shared_pool_hint()
+            shared_pool_hint(),
+            retired_pool_notice(workspace)
         )));
     }
 
     let all_tokens = list_token_files(tokens_dir);
     if all_tokens.is_empty() {
         return Err(EmptyTokenPoolError(format!(
-            "No .token files in {}{}. Run `loom-daemon tokens bootstrap` \
-             (or `loom-daemon tokens bootstrap --shared` for the machine-level pool).",
+            "No .token files in {}{}. Run `loom-daemon tokens bootstrap` to populate the shared \
+             machine-level pool.{}",
             tokens_dir.display(),
-            shared_pool_hint()
+            shared_pool_hint(),
+            retired_pool_notice(workspace)
         )));
     }
 
