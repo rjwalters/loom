@@ -275,6 +275,13 @@ pub struct SafehouseConfig {
     pub rooms: Option<RoomMap>,
     /// Persona to authenticate as; must be in safehoused's allowlist.
     pub persona: String,
+    /// Who an operator-priority escalation (#9321) pings in the room: a Matrix
+    /// display name or user id (`@robb:matrix.org`). `None` ⇒ the escalation
+    /// line is still posted, just without a mention — the ask is never dropped
+    /// over a missing handle. This is a **handle, not a credential**: nothing
+    /// here authenticates anything (the persona does), so it belongs in
+    /// `.loom/config.json` like the room ids beside it.
+    pub operator_mention: Option<String>,
 }
 
 impl Default for SafehouseConfig {
@@ -285,6 +292,7 @@ impl Default for SafehouseConfig {
             room: None,
             rooms: None,
             persona: DEFAULT_PERSONA.to_owned(),
+            operator_mention: None,
         }
     }
 }
@@ -370,6 +378,11 @@ fn config_from_value(block: Option<&Value>) -> SafehouseConfig {
             cfg.persona = persona.to_owned();
         }
     }
+    if let Some(mention) = block.get("operatorMention").and_then(Value::as_str) {
+        if !mention.trim().is_empty() {
+            cfg.operator_mention = Some(mention.trim().to_owned());
+        }
+    }
     cfg.rooms = rooms_from_value(block.get("rooms"));
     cfg
 }
@@ -419,6 +432,9 @@ fn apply_env_overrides(mut cfg: SafehouseConfig) -> SafehouseConfig {
     }
     if let Some(persona) = env_nonempty(PERSONA_ENV) {
         cfg.persona = persona;
+    }
+    if let Some(mention) = env_nonempty(envelopes::OPERATOR_MENTION_ENV) {
+        cfg.operator_mention = Some(mention);
     }
     cfg.rooms = apply_room_env_overrides(cfg.rooms);
     cfg
@@ -1495,181 +1511,15 @@ fn decode_exit_code_annotation(code: i32) -> &'static str {
 }
 
 // ============================================================================
-// Event → envelope mapping (existing frozen taxonomy only)
+// Event → envelope mapping
 // ============================================================================
+//
+// Both renderers — the frozen-taxonomy mapping and the operator-priority
+// escalation line (#9321) — live in the `envelopes` sibling module. Re-exported
+// here so every existing caller and `use super::*` test keeps its path.
 
-/// Map an existing bus [`Event`] to a narration [`Envelope`], or `None` for
-/// events phase 1 does not narrate.
-///
-/// Every narrated body starts with the repo-qualified `<repo>#<issue>` prefix
-/// ([`repo_issue_prefix`]) and every narrated `task_id` is likewise
-/// repo-qualified ([`qualify_task_id`]) — issue #4201, problem 1 — so the same
-/// issue number in two managed repos threads into distinct Matrix threads
-/// instead of colliding:
-///
-/// | Event | type | body |
-/// |---|---|---|
-/// | `SweepGlobalDispatch(Issue n)` | `task` | `<repo>#n · dispatch` (the sink, [`run_sink`], best-effort appends ` — "<issue title>"`) |
-/// | `SweepPhase` | `task` | `<repo>#n · <phase>` (+ ` · PR #m open` when present) |
-/// | `SweepBlocker` | `handoff` | `<repo>#n · BLOCKED — <reason>` |
-/// | `SweepExited` | `ack` | `<repo>#n · done ✓ · <dur>` or `<repo>#n · failed ✗ · exit <code>[ (decoded)] · <dur>` |
-/// | `SweepCrashed` | `handoff` | `<repo>#n · crashed ✗ at <checkpoint_phase> — resumable (checkpoint kept)` |
-/// | `SweepResumeDispatched` (#4256) | `handoff` | `<repo>#n · reaper resumed crashed sweep at <phase> (open PR #m) — resuming without operator intervention` (or a "still stranded" variant when the resume dispatch itself failed) |
-///
-/// `SweepGlobalCompleted` is intentionally **not** narrated: it carries only a
-/// `sweep_id` (no issue number), and `SweepExited` already emits the completion
-/// `ack` with richer data — narrating both would double-post per completion.
-///
-/// This mapping is 1:1 and pure. The **second** envelope a `SweepExited` can
-/// produce — the public-feed `completion` (#4426) — is built by
-/// [`completion_for_exit`] instead, since it needs an async forge lookup to
-/// confirm the merge; [`run_sink`] emits it after this one.
-#[must_use]
-pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
-    match event {
-        Event::SweepGlobalDispatch {
-            kind: SweepKind::Issue(issue),
-            repo,
-            ..
-        } => Some(dispatch_envelope(repo.as_deref(), *issue)),
-        Event::SweepPhase {
-            issue,
-            phase,
-            pr_number,
-            repo,
-        } => {
-            let mut body = format!("{} · {phase}", repo_issue_prefix(repo.as_deref(), *issue));
-            if let Some(pr) = pr_number {
-                body.push_str(&format!(" · PR #{pr} open"));
-            }
-            Some(Envelope {
-                to: "*".to_owned(),
-                kind: "task".to_owned(),
-                task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
-                body,
-                meta: None,
-            })
-        }
-        Event::SweepBlocker {
-            issue,
-            reason,
-            repo,
-            ..
-        } => Some(Envelope {
-            to: "*".to_owned(),
-            kind: "handoff".to_owned(),
-            task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
-            body: format!("{} · BLOCKED — {reason}", repo_issue_prefix(repo.as_deref(), *issue)),
-            meta: None,
-        }),
-        Event::SweepExited {
-            issue,
-            exit_code,
-            duration_sec,
-            no_progress,
-            death_class: _,
-            repo,
-        } => {
-            let prefix = repo_issue_prefix(repo.as_deref(), *issue);
-            let dur = format_narrated_duration(*duration_sec);
-            let body = match exit_code {
-                // #4366: a clean exit with zero lifecycle progress (parked on
-                // a monitored background task) narrates distinctly from an
-                // ordinary benign self-skip so operators can see the failure
-                // class at a glance.
-                Some(0) if *no_progress => {
-                    format!("{prefix} · no progress ⚠ · exit 0, no checkpoint/PR · {dur}")
-                }
-                Some(0) => format!("{prefix} · done ✓ · {dur}"),
-                Some(code) => format!(
-                    "{prefix} · failed ✗ · exit {code}{} · {dur}",
-                    decode_exit_code_annotation(*code)
-                ),
-                None => format!("{prefix} · failed ✗ · exit ? · {dur}"),
-            };
-            Some(Envelope {
-                to: "*".to_owned(),
-                kind: "ack".to_owned(),
-                task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
-                body,
-                meta: None,
-            })
-        }
-        Event::SweepCrashed {
-            issue,
-            checkpoint_phase,
-            classification: _,
-            death_class: _,
-            repo,
-        } => {
-            let phase = checkpoint_phase.as_deref().unwrap_or("unknown");
-            Some(Envelope {
-                to: "*".to_owned(),
-                kind: "handoff".to_owned(),
-                task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
-                body: format!(
-                    "{} · crashed ✗ at {phase} — resumable (checkpoint kept)",
-                    repo_issue_prefix(repo.as_deref(), *issue)
-                ),
-                meta: None,
-            })
-        }
-        Event::SweepResumeDispatched {
-            issue,
-            pr,
-            checkpoint_phase,
-            dispatched,
-            repo,
-        } => {
-            let phase = checkpoint_phase.as_deref().unwrap_or("unknown");
-            let prefix = repo_issue_prefix(repo.as_deref(), *issue);
-            let body = if *dispatched {
-                format!(
-                    "{prefix} · reaper resumed crashed sweep at {phase} (open PR #{pr}) — \
-                     resuming without operator intervention"
-                )
-            } else {
-                format!(
-                    "{prefix} · reaper attempted resume at {phase} (open PR #{pr}) but the \
-                     dispatch itself failed — still stranded, needs a look"
-                )
-            };
-            Some(Envelope {
-                to: "*".to_owned(),
-                kind: "handoff".to_owned(),
-                task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
-                body,
-                meta: None,
-            })
-        }
-        Event::DaemonIdleExit {
-            trigger,
-            idle_minutes,
-            in_flight_sweeps,
-            active_role_runs,
-            healthy_tokens,
-            total_tokens,
-            message,
-        } => Some(Envelope {
-            to: "*".to_owned(),
-            kind: "handoff".to_owned(),
-            task_id: Some("daemon-idle-exit".to_owned()),
-            body: message.clone(),
-            meta: Some(serde_json::json!({
-                "trigger": trigger,
-                "idle_minutes": idle_minutes,
-                "in_flight_sweeps": in_flight_sweeps,
-                "active_role_runs": active_role_runs,
-                "healthy_tokens": healthy_tokens,
-                "total_tokens": total_tokens,
-            })),
-        }),
-        // SweepGlobalCompleted (no issue number — SweepExited covers it),
-        // SweepGlobalDispatch(PrSet), EpicAction, CapacityAdvisory, TopicLag,
-        // Generic: not narrated in phase 1.
-        _ => None,
-    }
-}
+mod envelopes;
+pub use envelopes::{event_to_envelope, operator_priority_envelope};
 
 // ============================================================================
 // Completion envelope (#4426) — the public-feed emit point
@@ -3377,6 +3227,14 @@ async fn run_sink(
                             .as_mut()
                             .reset(tokio::time::Instant::now() + dispatch_digest_window());
                     }
+                } else if let Some(envelope) =
+                    operator_priority_envelope(&event, config.operator_mention.as_deref())
+                {
+                    // Operator-priority escalation (#9321) — rendered here
+                    // rather than in `event_to_envelope` because the mention
+                    // comes from the config. Never batched: the whole point is
+                    // that the ask reaches the human on the first tick.
+                    outbox.push(envelope);
                 } else if let Some(envelope) = event_to_envelope(&event) {
                     // One bus event can narrate more than one envelope: a
                     // `SweepExited` whose PR merged emits its `ack` **and** the

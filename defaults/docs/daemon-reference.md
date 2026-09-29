@@ -232,6 +232,7 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `daemon.drain.roll_pending` | Drain supervisor (#6007)      | `{in_flight, attempt, window_secs, budget_secs}` |
 | `daemon.drain.superseded`  | Auto-update loop (#8514)       | `{from, to}` (artifact identities) |
 | `forge.event`               | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
+| `operator_priority.escalation` | Star-liveness pass (#9321)   | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 
 The four `epic.issue.{N}.*` topics were authorized by **#3873** (epic #3842
 Phase 4) and are documented in full under [Epic supervisor](#epic-supervisor-3842)
@@ -269,6 +270,23 @@ rate-limited clients and must be idempotent under the per-page dedup contract
 on-disk journal is the copy, the prompt is a "check now"). Invariant source:
 `docs/adr/0021-forge-event-plane.md` (ADR-0021); implementation:
 `loom-daemon/src/forge_events.rs`.
+
+The `operator_priority.escalation` topic was authorized by **#9321** (the
+delivery half of #9244/#9301). Publisher: the star-liveness pass
+(`loom-daemon/src/star_liveness/`); consumer: the Safehouse narration sink,
+which renders it as a `handoff` envelope into the signal room so a starred
+issue's operator ask reaches the human rather than sitting in a forge comment
+nobody reads in time (#9268: four agents commented for seven hours). It is
+emitted on a **state change** like the `*.advisory` topics, but keyed rather
+than boolean: exactly once per `(repo, issue, <kind>:<specifics>)`, and **only
+on the pass that actually posts that key's forge escalation comment**. That
+coupling is what makes it once-per-cause *fleet-wide* rather than per-host — the
+forge marker is the shared lock, so a peer host that finds the comment already
+posted publishes nothing, and neither does a restarted daemon. A second event
+with `resolved: true` fires once when the ask clears, from the host that
+announced it. Room routing, the `safehouse.operatorMention` ping and the
+rendered line are documented in
+[`safehouse.md` → Operator-priority escalations](safehouse.md#operator-priority-escalations-9321).
 
 **`Generic`-topic rule.** A `Generic` topic is allowed only while it (a) is
 listed in this inventory, (b) carries a `source` field naming its producing
@@ -2107,8 +2125,19 @@ exactly, never a prefix; only as an App login, `…[bot]` or `app/…`, which no
 user can register) or the daemon itself counts; an outside commenter cannot
 pre-post one to suppress an ask. The `pools-exhausted` key is the issue's forge state, not the
 host's hold, so every host and every re-exhaustion share it until the issue
-moves. Safehouse / Matrix delivery is not wired yet (the Safehouse sink only
-narrates the frozen event taxonomy).
+moves.
+
+**Matrix delivery (#9321).** The pass that posts a comment also publishes
+`operator_priority.escalation` on the bus, which the Safehouse sink relays into
+the signal room as a `handoff` — pinging `safehouse.operatorMention` — so the
+ask reaches the operator where they actually are, not only on the issue. One
+post per `(issue, key)` fleet-wide: the notice is produced by the same call that
+posts the comment and *only* when it posts, so the marker dedupe above is the
+only dedupe, and a peer host or a restarted daemon that finds the marker stays
+quiet. One un-pinged `resolved ✓` line follows when the ask clears. With
+`safehouse.enabled` false (or no socket) nothing changes: the comment and the
+`health`/`status`/`queue` surfaces still carry the ask. See
+[`safehouse.md` → Operator-priority escalations](safehouse.md#operator-priority-escalations-9321).
 
 **Blocker inheritance.** The issue blocking a starred issue (named by
 `Blocked by #N` on a `loom:blocked` issue, the incident behind a merge refusal,
