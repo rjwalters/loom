@@ -53,7 +53,13 @@
 #   - an invocation using shell quoting or metacharacters, which this runner
 #     splits on whitespace and will not `eval`;
 #   - a gate whose script is not present in this tree (a consumer repo, or a
-#     workflow ahead of the checkout).
+#     workflow ahead of the checkout);
+#   - a gate that exited 127, the conventional "a command it needs is not on
+#     PATH" status. `check-doc-anchors.sh` exits it deliberately when `lychee`
+#     is absent, and CI installs a pinned lychee that a dev host has no reason
+#     to have. A missing tool is "could not check", not "checked and failed" —
+#     reporting it as a red gate forever would train a Builder to ignore the
+#     phase, which is worse than the gap. CI still enforces it for real.
 # Skips are counted and printed. They never turn a red gate green, and they are
 # never silent — a runner that cannot tell "checked, fine" from "could not
 # check" reports OK forever.
@@ -241,6 +247,11 @@ run_gates() {
     if [[ "$rc" -eq 0 ]]; then
       printf '[structural] PASS  (%ss)  %s\n' "$elapsed" "$cmd"
       passed=$((passed + 1))
+    elif [[ "$rc" -eq 127 ]]; then
+      # 127 = a command the gate needs is not on PATH. "Could not check", not
+      # "checked and failed" — see the header's skip table.
+      printf '[structural] SKIP  %s  — exited 127: a command it needs is not on PATH\n' "$cmd"
+      skipped=$((skipped + 1))
     else
       printf '[structural] FAIL  (%ss, exit %s)  %s\n' "$elapsed" "$rc" "$cmd"
       failed=$((failed + 1))
@@ -278,6 +289,7 @@ self_test() {
   printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp/scripts/ok-one.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp/scripts/ok-two.sh"
   printf '#!/usr/bin/env bash\necho "fixture gate is angry" >&2\nexit 1\n' >"$tmp/scripts/bad.sh"
+  printf '#!/usr/bin/env bash\necho "fixture: no such tool" >&2\nexit 127\n' >"$tmp/scripts/needs-tool.sh"
 
   cat >"$tmp/.github/workflows/fixture.yml" <<'YAML'
 name: CI
@@ -298,6 +310,7 @@ jobs:
           # another comment: bash scripts/ghost-two.sh
           bash scripts/ok-two.sh
           bash scripts/bad.sh
+          bash scripts/needs-tool.sh
       - name: provisioning, not a gate
         run: |
           echo "PATH bash: $(command -v bash)"
@@ -322,6 +335,7 @@ YAML
   expected="RUN   bash scripts/ok-one.sh --self-test
 RUN   bash scripts/ok-two.sh
 RUN   bash scripts/bad.sh
+RUN   bash scripts/needs-tool.sh
 SKIP  bash scripts/ok-one.sh --forbid-bump  --base \"\${{ github.event.pull_request.base.sha }}\"  --head \"\${{ github.event.pull_request.head.sha }}\"  [needs the Actions workflow context (\${{ … }} expression)]
 SKIP  bash scripts/not-in-this-tree.sh  [scripts/not-in-this-tree.sh is not present in this tree]"
 
@@ -341,16 +355,20 @@ SKIP  bash scripts/not-in-this-tree.sh  [scripts/not-in-this-tree.sh is not pres
     echo "SELF-TEST FAIL: expected exit 1 from a fixture with one failing gate, got $rc" >&2
     printf '%s\n' "$out" >&2
     fails=$((fails + 1))
-  elif ! printf '%s\n' "$out" | grep -F "2 passed, 1 failed, 2 skipped" >/dev/null; then
-    echo "SELF-TEST FAIL: expected '2 passed, 1 failed, 2 skipped' in the summary" >&2
+  elif ! printf '%s\n' "$out" | grep -F "2 passed, 1 failed, 3 skipped" >/dev/null; then
+    echo "SELF-TEST FAIL: expected '2 passed, 1 failed, 3 skipped' in the summary" >&2
     printf '%s\n' "$out" >&2
     fails=$((fails + 1))
   elif ! printf '%s\n' "$out" | grep -F "fixture gate is angry" >/dev/null; then
     echo "SELF-TEST FAIL: the failing gate's own output was not surfaced" >&2
     printf '%s\n' "$out" >&2
     fails=$((fails + 1))
+  elif ! printf '%s\n' "$out" | grep -F "exited 127" >/dev/null; then
+    echo "SELF-TEST FAIL: a gate exiting 127 must be reported as a SKIP, not counted as a failure" >&2
+    printf '%s\n' "$out" >&2
+    fails=$((fails + 1))
   else
-    echo "  ok: ran past the failure, surfaced its output, exited 1"
+    echo "  ok: ran past the failure, surfaced its output, skipped the 127, exited 1"
   fi
 
   echo "check-structural --self-test: a job with no derivable gate must FAIL, not pass…"
