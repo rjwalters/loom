@@ -1292,6 +1292,47 @@ pub struct ToolCallCount {
     pub count: u64,
 }
 
+/// What a [`SessionSummaryRecord`] was produced by (Issue #9445): the reason
+/// a session carries — or deliberately does not carry — an issue number.
+///
+/// This exists so an absent `loom.issue` is readable rather than ambiguous.
+/// Before #9445 a summary with no issue could equally be an untracked sweep
+/// session (a lost join) or somebody's terminal (correctly unjoined), and a
+/// fleet query had no way to tell the two apart.
+///
+/// Additive vocabulary: a future class is a new variant, never a repurposed
+/// existing one, so an older consumer's exhaustive match degrades to a decode
+/// error instead of silently misreading it (the [`AnomalyFlag`] precedent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    /// The session names an issue — a sweep, one of its subagents, or any
+    /// session running in that issue's worktree or on its branch. These are
+    /// the rows per-issue cost analysis sums over.
+    Sweep,
+    /// A Loom role session that names no issue: a scheduled support-role tick
+    /// (Champion, Guide, Auditor, …) or a hand-run `/loom:<role>` with no
+    /// issue argument. Role-tick issue attribution is #9231's scope, not
+    /// this record's.
+    Role,
+    /// Neither an issue nor a role — an ordinary interactive Claude Code
+    /// session. **Excluded from per-issue cost deliberately**, which is the
+    /// whole point of naming it.
+    Interactive,
+}
+
+impl SessionKind {
+    /// The wire spelling, for the OTLP attribute and log bodies.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Sweep => "sweep",
+            SessionKind::Role => "role",
+            SessionKind::Interactive => "interactive",
+        }
+    }
+}
+
 /// `session.summary` — one transcript's session shape (Issue #8757, G3 of
 /// epic #8714). Emitted by the transcript-ingest pass
 /// ([`crate::activity::transcript_ingest`]), one record per ingested
@@ -1310,7 +1351,7 @@ pub struct ToolCallCount {
 ///
 /// # Field presence contract
 ///
-/// Optional fields (`role`, `issue`, `pr_number`, `outcome`,
+/// Optional fields (`repo`, `role`, `issue`, `pr_number`, `outcome`,
 /// `parent_session_id`) are **omitted** when unknown, never fabricated —
 /// the same "unknown != zero" contract `host.health` established. `outcome`
 /// in particular is reserved: this pass has no positive terminal-outcome
@@ -1318,17 +1359,25 @@ pub struct ToolCallCount {
 /// (`session.analysis`, or registry correlation) can populate it honestly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummaryRecord {
-    /// Repository the session worked — the final path component of the
-    /// session's cwd (a Loom agent's cwd is the workspace root or a worktree
-    /// inside it; both map to the same repo name), matching
-    /// `activity::transcript_parse::repo_from_cwd`. Not an `owner/repo`
-    /// slug: the ingest pass has no forge round-trip to resolve one.
-    pub repo: String,
+    /// Repository the session worked, as the `owner/name` forge slug resolved
+    /// from the session workspace's `origin` remote (Issue #9445) — the same
+    /// join key every other repo-scoped kind carries, so a session's cost is
+    /// joinable to its repo.
+    ///
+    /// **Omitted, never a directory name.** Before #9445 this was the final
+    /// path component of the session's cwd, which for a worktree whose
+    /// directory name is unrelated to the repo (`wood-reward`,
+    /// `agent-afb133cdd702752a5`) produced a value no query could join on.
+    /// A cwd with no resolvable remote now yields an absent field instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// Visibility tag for `repo`. The schema contract (every record that
-    /// references a repository carries one) applies; the ingest pass has no
-    /// `owner/repo` slug to key [`visibility::derive_visibility`]'s cache
-    /// on, so it stamps the fail-closed default — `Private` — exactly what
-    /// every absent/unknown visibility decodes to anyway.
+    /// references a repository carries one) applies; the ingest pass makes
+    /// **no forge round trip** (#9445 resolves `repo` from a local `git
+    /// remote` read only), so it never keys
+    /// [`visibility::derive_visibility`]'s cache and stamps the fail-closed
+    /// default — `Private` — exactly what every absent/unknown visibility
+    /// decodes to anyway.
     #[serde(default)]
     pub visibility: RepoVisibility,
     /// The session's own stable id: the transcript's `sessionId`, or the
@@ -1348,13 +1397,26 @@ pub struct SessionSummaryRecord {
     /// message names one (`activity::transcript_parse::attribute_role`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    /// Issue number, when the session is a `/loom:<role> <N>` invocation.
+    /// Issue number the session worked, from the first of these that answers
+    /// (Issue #9445): the `/loom:<role> <N>` command's own argument, an
+    /// `issue-<N>` worktree in the session's cwd, or a `feature/issue-<N>`
+    /// branch. Absent for a session that names no issue by any of the three —
+    /// see [`Self::session_kind`], which says which case that was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<u32>,
-    /// PR number, when known. Not derivable from a transcript; reserved for
-    /// registry correlation (a later slice).
+    /// PR number, when the issue's own sweep checkpoint
+    /// (`.loom/sweep-checkpoint/issue-<N>.json`) recorded one at or after this
+    /// session started (Issue #9445). Absent for a session with no issue, a
+    /// sweep that has not opened its PR yet, and any checkpoint predating the
+    /// session (an earlier dispatch's PR is not this session's).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u32>,
+    /// Which kind of session this was (Issue #9445) — above all, whether its
+    /// missing `issue` is deliberate (`interactive`) or a lost attribution.
+    /// Absent only on a record produced before #9445; this pass always sets
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<SessionKind>,
     /// Distinct models used across the transcript, sorted — the `(model, day)`
     /// bucket keys collapsed to their model axis.
     pub models: Vec<String>,
@@ -1474,8 +1536,11 @@ pub const HIGH_TOKEN_USAGE_THRESHOLD: i64 = 300_000;
 /// mirroring `session_summary`'s own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionAnalysisRecord {
-    /// Same value as the source `session.summary` record's `repo`.
-    pub repo: String,
+    /// Same value as the source `session.summary` record's `repo` — the
+    /// `owner/name` forge slug since #9445, and absent (never a directory
+    /// name) when that record's is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// Same value as the source `session.summary` record's `visibility`.
     #[serde(default)]
     pub visibility: RepoVisibility,

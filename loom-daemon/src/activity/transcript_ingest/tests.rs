@@ -802,3 +802,187 @@ fn without_an_analysis_sink_no_session_analysis_is_emitted() {
     assert_eq!(stats.session_analyses, 0);
     assert!(!home.path().join("analysis-queue.jsonl").exists());
 }
+
+// ------------------------------------------------------------------
+// Join keys: repo slug / issue / PR / session kind / trace (Issue #9445)
+// ------------------------------------------------------------------
+
+/// Issue #9445 end-to-end, on the shape that produced the live defect: a
+/// Builder subagent session whose first user message is a role prompt (no
+/// `/loom:<role> <N>` argument), running in an issue worktree under a
+/// checkout whose **directory name has nothing to do with the repo**.
+///
+/// Pre-#9445 that record carried `repo: "issue-9445"` (the cwd basename), no
+/// issue, no PR, and — because the #8908 trace join keys on the issue — no
+/// trace id. Every one of the four is now resolved.
+#[test]
+fn a_worktree_session_carries_the_repo_slug_issue_pr_and_sweep_trace() {
+    use crate::observability::runtime_usage::join::{JoinEntry, JOIN_DIR};
+    use crate::telemetry::trace::TraceContext;
+
+    let home = tempfile::tempdir().unwrap();
+    let projects = home.path().join("projects");
+
+    // A checkout named nothing like its repo (the "Superset-style" worktree
+    // of the issue's acceptance criterion), plus the issue worktree in it.
+    let root = home.path().join("wood-reward");
+    std::fs::create_dir_all(&root).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:apache/superset.git",
+        ],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+    let worktree = root.join(".loom/worktrees/issue-9445");
+    std::fs::create_dir_all(&worktree).unwrap();
+
+    // The sweep's own artifacts: the checkpoint naming its PR, and the
+    // persisted trace context the #8908 join reads.
+    let checkpoint = root.join(".loom/sweep-checkpoint");
+    std::fs::create_dir_all(&checkpoint).unwrap();
+    std::fs::write(
+        checkpoint.join("issue-9445.json"),
+        r#"{"phase":"builder-done","pr_number":9460}"#,
+    )
+    .unwrap();
+    let context = TraceContext::root(true);
+    let joins = root.join(JOIN_DIR);
+    std::fs::create_dir_all(&joins).unwrap();
+    std::fs::write(
+        joins.join(format!("{}-{}.json", context.trace_id.as_str(), context.span_id.as_str())),
+        serde_json::to_vec(&JoinEntry {
+            issue: 9445,
+            context: context.clone(),
+            started_at: Utc::now() - chrono::Duration::hours(1),
+            ended_at: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    // The transcript: a Builder subagent prompt, no slash-command argument,
+    // cwd inside the worktree, on the issue's feature branch.
+    let cwd = worktree.to_string_lossy().into_owned();
+    let ts = (Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+    let line = |value: serde_json::Value| value.to_string();
+    let dir = projects.join(project_slug(&worktree));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("uuid-b.jsonl"),
+        [
+            line(serde_json::json!({
+                "type": "user", "timestamp": ts, "sessionId": "uuid-b",
+                "cwd": cwd, "gitBranch": "feature/issue-9445",
+                "message": {"role": "user", "content":
+                    "You are the Loom Builder (Development Worker) for this repository."},
+            })),
+            line(serde_json::json!({
+                "type": "assistant", "timestamp": ts, "sessionId": "uuid-b",
+                "cwd": cwd, "gitBranch": "feature/issue-9445",
+                "message": {"model": "claude-opus-5", "id": "msg_1",
+                            "usage": {"input_tokens": 10, "output_tokens": 20}},
+            })),
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+
+    let sink = sink_for(home.path());
+    let db = open_db(home.path());
+    let stats = ingest(
+        &db,
+        &IngestOptions {
+            summary_sink: Some(sink),
+            ..opts(&projects)
+        },
+    )
+    .unwrap();
+    assert_eq!(stats.session_summaries, 1);
+
+    let envelopes = {
+        use crate::observability::queue::DurableQueue;
+        DurableQueue::open(home.path().join("queue.jsonl"), 100).peek_batch(50)
+    };
+    let envelope = envelopes.first().expect("one envelope");
+    let crate::telemetry::TelemetryRecord::SessionSummary(record) = &envelope.record else {
+        panic!("expected a session.summary record");
+    };
+
+    assert_eq!(
+        record.repo.as_deref(),
+        Some("apache/superset"),
+        "the forge slug, never the `wood-reward` / `issue-9445` directory names"
+    );
+    assert_eq!(record.issue, Some(9445), "attributed from the worktree it ran in");
+    assert_eq!(record.pr_number, Some(9460), "from the issue's own sweep checkpoint");
+    assert_eq!(record.session_kind, Some(crate::telemetry::SessionKind::Sweep));
+    assert_eq!(record.role.as_deref(), Some("builder"));
+    assert_eq!(
+        envelope
+            .trace_context
+            .as_ref()
+            .map(|c| c.trace_id.as_str().to_string()),
+        Some(context.trace_id.as_str().to_string()),
+        "the session nests under the sweep's own trace"
+    );
+}
+
+/// The counterpart: an ordinary interactive session in a directory that is not
+/// a checkout at all. No repo is invented from its name, no issue is guessed,
+/// and `session_kind` says the exclusion was deliberate.
+#[test]
+fn an_interactive_session_is_labelled_rather_than_silently_unjoined() {
+    let home = tempfile::tempdir().unwrap();
+    let projects = home.path().join("projects");
+    let cwd = home.path().join("Downloads");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let dir = projects.join(project_slug(&cwd));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("uuid-c.jsonl"),
+        serde_json::json!({
+            "type": "assistant", "timestamp": "2026-09-18T04:00:00Z", "sessionId": "uuid-c",
+            "cwd": cwd.to_string_lossy(), "gitBranch": "main",
+            "message": {"model": "claude-sonnet-5", "id": "msg_1",
+                        "usage": {"input_tokens": 1, "output_tokens": 2}},
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    let sink = sink_for(home.path());
+    let db = open_db(home.path());
+    ingest(
+        &db,
+        &IngestOptions {
+            summary_sink: Some(sink),
+            ..opts(&projects)
+        },
+    )
+    .unwrap();
+
+    let envelopes = {
+        use crate::observability::queue::DurableQueue;
+        DurableQueue::open(home.path().join("queue.jsonl"), 100).peek_batch(50)
+    };
+    let crate::telemetry::TelemetryRecord::SessionSummary(record) =
+        &envelopes.first().expect("one envelope").record
+    else {
+        panic!("expected a session.summary record");
+    };
+    assert_eq!(record.repo, None, "`Downloads` is not a repo name");
+    assert_eq!(record.issue, None);
+    assert_eq!(record.session_kind, Some(crate::telemetry::SessionKind::Interactive));
+}

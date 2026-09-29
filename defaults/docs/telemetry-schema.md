@@ -768,13 +768,15 @@ output, a key and an email produces a record carrying none of the four.
 ```json
 {
   "kind": "session.summary",
-  "repo": "loom",
+  "repo": "rjwalters/loom",
   "visibility": "private",
   "session_id": "agent-1",
   "parent_session_id": "7d8119a7-250a-48ca-a0ee-b4b2c7f14d92",
   "runtime": "claude",
   "role": "builder",
   "issue": 8757,
+  "pr_number": 8790,
+  "session_kind": "sweep",
   "models": ["claude-sonnet-5", "claude-opus-5"],
   "tokens_input": 12, "tokens_output": 24,
   "tokens_cache_read": 100, "tokens_cache_write": 10,
@@ -787,14 +789,15 @@ output, a key and an email produces a record carrying none of the four.
 
 | Field | Type | Always present | Notes |
 |---|---|---|---|
-| `repo` | string | yes | Final path component of the session's cwd (`repo_from_cwd`) — a Loom agent's cwd is the workspace root or a worktree inside it, both mapping to the same name. `unknown` when the transcript carries no parseable cwd (the `cost_by_role` convention). Not an `owner/repo` slug: the ingest pass makes no forge round trip. |
-| `visibility` | `"public"` / `"private"` | yes | Always `private` today — the ingest pass has no slug to key the visibility cache on, so it stamps the fail-closed default every absent/unknown visibility decodes to anyway. |
+| `repo` | string | no | The `owner/name` forge slug, resolved from the session workspace's `origin` remote — a memoised local `git remote get-url origin`, never a forge round trip (#9445). **Absent, never a directory name**, when no remote answers: before #9445 this was the cwd basename, which for a worktree named `wood-reward` or `agent-afb133cdd702752a5` reported exactly that as the repo and made every row unjoinable. Resolution tries the cwd first (so any worktree layout works), then the enclosing workspace root (so a worktree removed on merge still resolves). |
+| `visibility` | `"public"` / `"private"` | yes | Always `private` — resolving it truthfully needs the `gh` probe this pass deliberately does not make, so it stamps the fail-closed default every absent/unknown visibility decodes to anyway. |
 | `session_id` | string | yes | The transcript's own `sessionId`, or the subagent file's stem for a `subagents/` transcript whose records restate only the parent's id. |
 | `parent_session_id` | string | no | The enclosing session's uuid, for a `subagents/` transcript; absent for a parent session. |
 | `runtime` | string | yes | `claude` — this pass reads Claude Code transcripts only (#8664's `loom.runtime` vocabulary; per-runtime tails are sibling work). |
 | `role` | string | no | Attributed Loom role from the first user message (`attribute_role`); absent when unattributable. |
-| `issue` | integer | no | The `/loom:<role> <N>` command's first argument, when present. |
-| `pr_number` | integer | no | Reserved — not derivable from a transcript; absent until registry correlation exists. |
+| `issue` | integer | no | The issue the session worked, from the first source that answers (#9445): the `/loom:<role> <N>` command's own first argument, then an `issue-<N>` worktree component in the cwd (`.loom/worktrees/issue-42`, or the `.claude/worktrees/` layout), then a `feature/issue-<N>` branch. Absent when none of the three names one — `session_kind` then says whether that was deliberate. |
+| `pr_number` | integer | no | The PR recorded in the issue's own sweep checkpoint (`.loom/sweep-checkpoint/issue-<N>.json`), when that checkpoint was written **at or after** this session started (#9445) — the same freshness rule the registry's live-phase overlay uses, so an earlier dispatch's PR is never pinned onto a later session. Absent with no issue, before the sweep opens its PR, and for a stale checkpoint. |
+| `session_kind` | `"sweep"` / `"role"` / `"interactive"` | no | Why `issue` is set — or deliberately is not (#9445). `sweep`: the session names an issue (a sweep, a subagent of one, or anything running in that issue's worktree or on its branch) — the rows per-issue cost sums over. `role`: a Loom role session with no issue (a scheduled support-role tick, or a hand-run `/loom:<role>`); role-tick issue attribution is #9231's scope. `interactive`: neither — **excluded from per-issue cost deliberately**, which is the point of naming it. Absent only on a record produced before #9445. |
 | `models` | string array | yes | Distinct models used, sorted — the `(model, day)` bucket keys collapsed to their model axis. |
 | `tokens_input` / `tokens_output` / `tokens_cache_read` / `tokens_cache_write` | integer | yes | The four counters `activity.db`'s `resource_usage` tracks, deduped by `message.id` (a streamed message counts once) and summed across buckets. |
 | `wall_ms` | integer | yes | Last record timestamp minus first, milliseconds. `0` when the file carries no timestamps. |
@@ -804,12 +807,15 @@ output, a key and an email produces a record carrying none of the four.
 | `outcome` | string | no | Reserved — this pass has no positive terminal-outcome signal to read from a transcript, so it stays absent until the `session.analysis` slice (or registry correlation) can populate it honestly. |
 
 On the OTLP path this maps to a log record (severity `Info`) with
-`loom.session_id`, `loom.parent_session_id`, `loom.runtime`, `loom.role`,
-`loom.issue`, `loom.models_used`, `loom.tokens.input`, `loom.tokens.output`,
+`loom.repo`, `loom.session_id`, `loom.parent_session_id`, `loom.runtime`,
+`loom.role`, `loom.issue`, `loom.pr_number`, `loom.session_kind`,
+`loom.models_used`, `loom.tokens.input`, `loom.tokens.output`,
 `loom.tokens.cache_read`, `loom.tokens.cache_write`, `loom.wall_ms`,
 `loom.turns`, `loom.tool_calls` (kvlist array), `loom.tool_errors` and
 `loom.outcome` attributes — all covered by the gateway collector's
-`loom.*` privacy allowlist.
+`loom.*` privacy allowlist (contract-tested for the four join keys).
+`loom.repo`, `loom.issue` and `loom.pr_number` are omitted rather than
+defaulted when unresolved.
 
 **Trace join (Issue #8908).** When a traced sweep dispatches, the daemon
 writes a local join entry (`.loom/logs/trace-joins/<trace-id>-<span-id>.json`: issue,
@@ -818,7 +824,11 @@ ingest pass stamps a summary's envelope `trace_context` (the OTLP log's trace
 and span id) with that execution's root context when **exactly one** entry
 names the summary's `issue` and its window covers the session's first
 timestamp. With no issue, no entry or an ambiguous match, the log stays
-unjoined. It is never guessed. The same trace carries the execution's
+unjoined. It is never guessed. Since #9445 the `issue` this keys on is
+resolved from the worktree/branch too, not only from a slash-command
+argument — which is what made the join fire at all: a subagent session's
+first message is a role prompt, so before #9445 almost every row reached
+SigNoz with an empty `trace_id`. The same trace carries the execution's
 `loom.runtime.usage` span (see [`metric.points`](#metricpoints)).
 
 ### `session.analysis`
@@ -847,7 +857,7 @@ pinned by the redaction test suite (`otlp/mapping/metadata/tests.rs` +
 ```json
 {
   "kind": "session.analysis",
-  "repo": "loom",
+  "repo": "rjwalters/loom",
   "visibility": "private",
   "session_id": "uuid-a",
   "parent_session_id": "7d8119a7-250a-48ca-a0ee-b4b2c7f14d92",
@@ -860,7 +870,7 @@ pinned by the redaction test suite (`otlp/mapping/metadata/tests.rs` +
 
 | Field | Type | Always present | Notes |
 |---|---|---|---|
-| `repo` / `visibility` / `session_id` / `parent_session_id` | — | see `session.summary` | Copied verbatim from the source `session.summary` record — `session_id` is the join key a consumer uses to correlate the two records. |
+| `repo` / `visibility` / `session_id` / `parent_session_id` | — | see `session.summary` | Copied verbatim from the source `session.summary` record — `session_id` is the join key a consumer uses to correlate the two records. `repo` is that record's `owner/name` slug since #9445, and is likewise absent (never a directory name) when unresolved. |
 | `retry_loops` | array | yes | Maximal runs of `>= 3` consecutive invocations of the identical tool name, detected purely from call order and name (never arguments/output). `{ "tool", "length" }` per run. Empty (never omitted) when none were detected, so "computed and found none" is distinguishable from "not computed". |
 | `longest_tool_call` | object | no | The `tool_use` -> `tool_result` pairing with the largest elapsed wall time, matched by the content block's own opaque call id (never by content). Absent when no pair could be matched (e.g. a transcript whose `tool_use` blocks carry no id) — never a fabricated zero duration. |
 | `cost_usd` | number | no | Summed per-model across the session's own usage buckets via the shared rate card (`activity::resource_usage::ModelPricing`) — the same helper `transcript_ingest`'s own cost accounting uses. Absent when the transcript contributed no usage buckets at all — never a fabricated `0.0`. |
