@@ -471,6 +471,13 @@ if [[ -f "$SCRIPT_DIR/lib/default-branch.sh" ]]; then
   source "$SCRIPT_DIR/lib/default-branch.sh"
   DEFAULT_BRANCH_NAME="$(cd "$REPO_ROOT" && loom_default_branch 2>/dev/null || true)"
 fi
+# #9106: the same lib carries check_branch_name, the ref-operand validator every
+# forge-derived branch name below must pass before it reaches a git argv. The
+# source above is deliberately defensive (a partially-resynced .loom/), so the
+# validator gets a fail-CLOSED stand-in rather than being silently absent —
+# "the validator is missing" must refuse the merge, never wave it through.
+declare -F check_branch_name >/dev/null 2>&1 || \
+  check_branch_name() { echo "check_branch_name: validator unavailable (lib/default-branch.sh did not load) — refusing to pass '${1-}' to git (#9106). Re-run .loom/scripts/resync-installed.sh." >&2; return 1; }
 forge_detect
 
 # Use gh-cached for read-only queries to reduce API calls (see issue #1609)
@@ -621,6 +628,14 @@ PR_HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha // empty')
 # forge_get_pr responses already carry a `labels` array in this shape, so no
 # extra API call is needed beyond the fetch above.
 PR_LABELS=$(echo "$PR_JSON" | jq -r '.labels[]?.name // empty' 2>/dev/null || true)
+# #9106: $PR_BRANCH is `.head.ref` — chosen by whoever opened the PR. Everything
+# downstream (the _recheck_mergeable_before_refusal fetch, branch_landed,
+# update-ref refs/loom/parent/<branch>, the local `git branch -D`) puts it in a
+# git argv, so it is validated ONCE here and the merge is denied outright if it
+# is not a safe ref operand. The reason names the offending ref, so the refusal
+# is greppable in the run log.
+check_branch_name "$PR_BRANCH" "head branch of PR #$PR_NUMBER" || \
+  error "Merge blocked: PR #$PR_NUMBER's head branch is not a safe git ref operand (see the check_branch_name refusal above, #9106). Refusing before any git command runs on '$PR_BRANCH'. Rename the branch on the PR and re-run."
 
 # Check if already merged
 if [[ "$PR_MERGED" == "true" ]]; then
@@ -1848,8 +1863,19 @@ _recheck_mergeable_before_refusal() {
   # git merge-tree check before conceding this is a genuine conflict.
   [[ -n "$resolved_attempt" ]] && _MPR_FLAGS+=(--resolved-attempt "$resolved_attempt")
   if [[ -z "$resolved_attempt" ]]; then
+    # #9106: both refs are forge-controlled ($base_ref from `.base.ref`,
+    # $head_ref from `.head.ref`) and the fetch below puts them in a git argv.
+    # A name git would parse as a switch is refused HERE, before the fetch —
+    # refuse-stale is the fail-closed verdict (it denies the merge without
+    # claiming a content conflict). An EMPTY ref keeps its pre-existing
+    # --refs-missing classification, which this must not swallow. The `--`
+    # after `origin` is defence in depth, not the gate.
     if [[ -z "$base_ref" || -z "$head_ref" ]]; then _MPR_FLAGS+=(--refs-missing)
-    elif git -C "$repo_root" fetch -q origin "$base_ref" "$head_ref" 2>/dev/null; then
+    elif ! check_branch_name "$base_ref" "base ref of PR #$pr_number" \
+         || ! check_branch_name "$head_ref" "head ref of PR #$pr_number"; then
+      echo "refuse-stale:PR #$pr_number carries a ref name that is not a safe git operand (base='$base_ref' head='$head_ref') — refusing before 'git fetch' could parse it as a switch (#9106). Rename the branch on the PR and re-run."
+      return 0
+    elif git -C "$repo_root" fetch -q origin -- "$base_ref" "$head_ref" 2>/dev/null; then
       if git -C "$repo_root" merge-tree --write-tree "origin/$base_ref" "origin/$head_ref" >/dev/null 2>&1; then _MPR_FLAGS+=(--tree clean); else _MPR_FLAGS+=(--tree conflict); fi
     else _MPR_FLAGS+=(--fetch-failed); fi
   fi

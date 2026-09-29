@@ -105,6 +105,17 @@ if [[ -z "$BRANCH" ]]; then
     exit 0
 fi
 
+# #9106: $BRANCH becomes a bare operand of `git fetch origin -- "$BRANCH"`
+# below. loom_default_branch can source it from LOOM_DEFAULT_BRANCH or from the
+# remote's own HEAD symref, so it is validated before the fetch. This script is
+# advisory and must never exit non-zero — an unsafe name therefore SKIPS (the
+# fetch never runs) rather than erroring.
+if ! declare -F check_branch_name >/dev/null 2>&1 \
+   || ! check_branch_name "$BRANCH" "default branch" 2>/dev/null; then
+    info_oneliner "${YELLOW}[freshness-check] '${BRANCH}' is not a safe git ref operand (or the validator is unavailable); skipping without fetching (#9106).${NC}"
+    exit 0
+fi
+
 REMOTE_REF="origin/$BRANCH"
 
 # ---------- bounded fetch (degrade gracefully) ----------
@@ -114,11 +125,11 @@ REMOTE_REF="origin/$BRANCH"
 # binary) we fall back to whatever refs/remotes/origin/<branch> is already known
 # locally — possibly stale, but the check stays cheap and never blocks.
 if command -v timeout >/dev/null 2>&1; then
-    timeout 5 git fetch origin "$BRANCH" --quiet >/dev/null 2>&1 || true
+    timeout 5 git fetch origin --quiet -- "$BRANCH" >/dev/null 2>&1 || true
 else
     # No `timeout` available (e.g. minimal macOS without coreutils). Still try,
     # but git's own --quiet keeps it unobtrusive; a hung network is a rare edge.
-    git fetch origin "$BRANCH" --quiet >/dev/null 2>&1 || true
+    git fetch origin --quiet -- "$BRANCH" >/dev/null 2>&1 || true
 fi
 
 # ---------- verify we have both refs to compare ----------

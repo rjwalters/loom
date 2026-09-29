@@ -230,6 +230,12 @@ pub mod ram_headroom;
 pub mod rate_limit_breaker;
 pub mod reclaim_pr_warning;
 pub mod reconcile_stack;
+/// Ref-operand validation for forge-derived branch names (#9106). A sibling
+/// module rather than a `reconcile_stack::` submodule: the predicate gates
+/// every place a forge ref reaches a `Command` argv, not just the stacked
+/// reconcile, and it is the Rust half of `check_branch_name` in
+/// `defaults/scripts/lib/default-branch.sh`.
+pub mod refname;
 pub mod release_fetch;
 pub mod release_resolve;
 pub mod repo_root;

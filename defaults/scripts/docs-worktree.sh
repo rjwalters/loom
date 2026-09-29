@@ -141,6 +141,9 @@ if ! DEFAULT_BRANCH="$(cd "$REPO_ROOT" && loom_default_branch)"; then
     print_error "Could not determine the default branch. Set LOOM_DEFAULT_BRANCH or run: git remote set-head origin -a"
     exit 1
 fi
+# #9106: the resolved name becomes a bare operand of `git fetch origin --
+# "$DEFAULT_BRANCH"` below. Validate before the fetch, fail closed.
+check_branch_name "$DEFAULT_BRANCH" "default branch" || exit 1
 
 WORKTREE_PATH="$WORKTREE_ROOT_DIR/docs-guide"
 
@@ -163,7 +166,7 @@ mkdir -p "$WORKTREE_ROOT_DIR"
 
 # Fetch so the new branch is based on current origin/<default-branch> rather
 # than whatever this checkout last saw.
-if ! git -C "$REPO_ROOT" fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1; then
+if ! git -C "$REPO_ROOT" fetch origin -- "$DEFAULT_BRANCH" >/dev/null 2>&1; then
     print_warning "Could not fetch origin/$DEFAULT_BRANCH (continuing with the local ref)"
 fi
 
