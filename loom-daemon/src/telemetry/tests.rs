@@ -1029,6 +1029,8 @@ fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
         provider: None,
         profile: None,
         complexity: None,
+        tokens_status: None,
+        tokens_status_reason: None,
     };
     let value = serde_json::to_value(&resolved).unwrap();
     assert_eq!(value["repo"], "rjwalters/loom");
