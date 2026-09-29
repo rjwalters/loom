@@ -908,7 +908,7 @@ questions the #9440–#9446 study showed it could not: *did this sweep land
 work*, *were its tokens measured and are they plausible*, *why was it
 dispatched*, and *how big was the work it produced*.
 
-**`tokens_status` addendum — the `suspect` guard (Issue #9454):** on top of the `measured`/`not_spawned`/`unattributable` vocabulary #9440 shipped, a *measured* result whose input rate exceeds **100 000 input tokens per wall-clock second** (`sweep_usage::SUSPECT_INPUT_TOKENS_PER_SEC`) is re-classified `suspect` with reason `implausible_input_rate`. The counters are still published — flagged, never as a clean measurement — so a misattribution regression (the study's 250M-tokens-in-22-seconds shape) is visible per host per day (`sweep-facts-queries.sql` SF3) instead of silently poisoning per-issue cost sums. The attribution rule is unchanged: usage is attributed by this sweep's own wall-clock window over this sweep's own directories — the workspace root and this issue's worktree; a sibling issue's worktree is deliberately excluded — never by issue number or directory name alone.
+**`tokens_status` addendum — the `suspect` guard (Issue #9454):** on top of the `measured`/`not_spawned`/`unattributable` vocabulary #9440 shipped, a *measured* result whose input rate exceeds **100 000 input tokens per wall-clock second** (`sweep_usage::SUSPECT_INPUT_TOKENS_PER_SEC`) is re-classified `suspect` with reason `implausible_input_rate`. The counters are still published — flagged, never as a clean measurement — so a misattribution regression (the study's 250M-tokens-in-22-seconds shape) is visible per host per day (`sweep-facts-queries.sql` SF3) instead of silently poisoning per-issue cost sums. The attribution rule beyond the window and directories: attribution is **per usage record**, keyed on each record's own timestamp (Issue #9454) — a transcript file is never attributed whole. This is the root-cause fix for the implausible-rate population: the #8450 shape (a 292-second judge-only sweep reporting 136.8M tokens) happened because the file-level readers attributed a long-lived session's ENTIRE history to whichever sweep's window contained the file's last write. Per-record attribution means a session that predates the sweep contributes only the records it wrote during the window, so two back-to-back sweeps of one issue can never fold each other's sessions (the acceptance test). Directories still bound the scan: the workspace root and this issue's worktree; a sibling issue's worktree is deliberately excluded.
 
 **Attempt lineage** (Issue #9444): `attempt_index` (1-based count of terminal
 sweeps for this repo#issue in **this host's** durable outcome journal — the
@@ -924,20 +924,24 @@ three are absent when the journal could not be read or the repo slug never
 resolved.
 
 **`rework_events`** (array of `{kind, reason?, classification?,
-duration_sec?}`) — in-sweep rework observed by the path that performed it,
-via the append-only marker protocol: the performing path appends one JSON
-object per event to `<workspace_root>/.loom/logs/sweep-rework-events.jsonl`
+duration_sec?}`) — in-sweep rework observed by the terminal turn from two
+sources. The first needs no writer at all: the worktree's own **HEAD reflog**
+is read at the terminal transition, and a real `rebase (start)` performed by
+a Doctor's conflict resolution or a `merge` of moved main records itself
+there with a timestamp — the reflog IS the writer, and every reflog-derived
+event is `environmental` (a reflog entry cannot prove the work was hard).
+The second source is the append-only marker protocol for events only the
+performing path knows: the performing path appends one JSON object per event
+to `<workspace_root>/.loom/logs/sweep-rework-events.jsonl`
 (`{"at":"<RFC3339>","issue":N,"kind":"rebase|merge_conflict|ci_rerun|rejudge",
 "reason":"…","classification":"environmental|substantive","duration_sec":N}`);
 the terminal outcome samples the file for its own issue and window. The
 default classification when the writer omits one: `rejudge` ⇒
 **`substantive`** (the work was hard); `rebase`, `merge_conflict`,
 `ci_rerun` ⇒ **`environmental`** (the ground moved). Absent (never `[]`)
-when no event was marked. *Writer status:* the daemon side (reader,
-classification, rollup) is shipped; the first writer is the merge path's
-stale-base handling, whose wiring is deliberately a follow-up —
-`merge-pr.sh` is at the file-size ratchet, and the shell-language policy
-points that handling at a `loom-daemon` subcommand first.
+when no event was marked. *Writer status:* the reflog reader above is shipped and is the primary
+source; the marker file remains the protocol for events a reflog cannot
+show (a CI rerun, an explicit rejudge).
 
 **PR linkage and the model that ran** (Issue #9465): `pr_numbers` (integer
 array, first-seen order) lists every PR the sweep's lifecycle was observed to

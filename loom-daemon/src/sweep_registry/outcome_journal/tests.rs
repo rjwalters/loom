@@ -546,9 +546,13 @@ fn telemetry_outcome_tokens_come_from_matched_transcripts() {
          \"<command-name>/loom:sweep</command-name>\\n\
          <command-args>{issue} --claim-owned {issue}</command-args>\"}}}}\n"
     );
+    // #9454: per-record attribution keys on each record's timestamp, so the
+    // fixture stamps every record now (inside the resolve window, which ends
+    // at the reaper's `now` — after this seeding).
+    let iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let usage = |input: u32, output: u32, read: u32, create: u32| {
         format!(
-            "{{\"message\":{{\"usage\":{{\"input_tokens\":{input},\
+            "{{\"timestamp\":\"{iso}\",\"message\":{{\"usage\":{{\"input_tokens\":{input},\
              \"output_tokens\":{output},\"cache_read_input_tokens\":{read},\
              \"cache_creation_input_tokens\":{create}}}}}}}\n"
         )
