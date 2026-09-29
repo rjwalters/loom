@@ -92,11 +92,18 @@ write_manifest() {
     : > "$FIX_TESTS/ci-wired.txt"
     for s in "$@"; do printf '%s\n' "$s" >> "$FIX_TESTS/ci-wired.txt"; done
     : > "$FIX_TESTS/ci-excluded.txt"
-    local f name
+    local f name wired
+    # Membership tested with a shell loop rather than `printf … | grep -qxF`:
+    # under `set -o pipefail` an early-exit consumer can SIGPIPE the producer
+    # and fail the whole pipeline (scripts/check-pipefail-early-exit.sh).
     for f in "$FIX_TESTS"/test-*.sh; do
         [[ -e "$f" ]] || continue
         name="$(basename "$f")"
-        if ! printf '%s\n' "$@" | grep -qxF "$name"; then
+        local found=0
+        for wired in "$@"; do
+            [[ "$wired" == "$name" ]] && { found=1; break; }
+        done
+        if [[ "$found" -eq 0 ]]; then
             printf '%s  not used in this scenario (test-run-ci-suites-timings.sh)\n' "$name" \
                 >> "$FIX_TESTS/ci-excluded.txt"
         fi
