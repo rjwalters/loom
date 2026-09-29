@@ -301,39 +301,10 @@ fn resolve_root(root: &Path) -> PathBuf {
     )
 }
 
-/// Best-effort physical path.
-///
-/// `std::fs::canonicalize` fails outright when the leaf does not exist yet —
-/// the common case here: [`provision_with`] compares a derived target root
-/// against `<worktree>/target`, which Cargo has not created at worktree-setup
-/// time. Falling back to the RAW path in that case left one side of the
-/// `starts_with` containment check resolved through a symlinked prefix
-/// (macOS's `/var` -> `/private/var`, present under `tempfile::tempdir()` and
-/// under this scheme's own worktree roots) while the other side stayed
-/// unresolved, so an unredirected host was silently misclassified as
-/// `Provisioned` (issue #9194). Instead, canonicalize the closest EXISTING
-/// ancestor and re-append whatever tail did not exist, so both sides of every
-/// comparison resolve through the same symlinks regardless of which one
-/// happens to already be on disk.
-fn realish(p: &Path) -> PathBuf {
-    if let Ok(real) = std::fs::canonicalize(p) {
-        return real;
-    }
-    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut current = p;
-    while let Some(parent) = current.parent() {
-        tail.push(current.file_name().unwrap_or_default());
-        if let Ok(real) = std::fs::canonicalize(parent) {
-            let mut out = real;
-            for part in tail.into_iter().rev() {
-                out.push(part);
-            }
-            return out;
-        }
-        current = parent;
-    }
-    p.to_path_buf()
-}
+// `realish` lives in the parent module: this module and `plan_reclaim` run the
+// same symlink-sensitive `starts_with` containment check, and #9194 was two
+// byte-identical copies of it, only one of which anybody would have fixed.
+use super::realish;
 
 #[cfg(test)]
 mod tests;

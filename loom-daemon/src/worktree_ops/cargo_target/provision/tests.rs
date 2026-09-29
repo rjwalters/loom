@@ -131,6 +131,11 @@ fn realish_resolves_a_symlinked_prefix_even_when_the_leaf_does_not_exist_yet() {
     // explicit symlink rather than relying on the host's own tmp layout, so
     // the regression holds on every unix host this module runs on, not just
     // one whose ambient tmp happens to be symlinked.
+    //
+    // `realish` is now single-sourced in the parent module, so this also
+    // covers `plan_reclaim`'s copy of the same containment check — the bug was
+    // two byte-identical `realish` definitions, and fixing only the one the
+    // failing test happened to reach would have left the other live.
     let tmp = tempfile::tempdir().expect("tempdir");
     let real = tmp.path().join("real");
     std::fs::create_dir_all(&real).unwrap();
