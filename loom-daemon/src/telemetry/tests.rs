@@ -122,6 +122,16 @@ fn sweep_outcome() -> TelemetryRecord {
         complexity: Some("routine".to_string()),
         tokens_status: None,
         tokens_status_reason: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
+        pr_numbers: None,
+        hw_lines_added: None,
+        hw_lines_deleted: None,
+        hw_files: None,
+        generated_lines: None,
+        test_lines: None,
     })
 }
 
@@ -261,6 +271,16 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
+        pr_numbers: None,
+        hw_lines_added: None,
+        hw_lines_deleted: None,
+        hw_files: None,
+        generated_lines: None,
+        test_lines: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     for field in [
@@ -385,6 +405,16 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         complexity: Some("complex".to_string()),
         tokens_status: None,
         tokens_status_reason: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
+        pr_numbers: None,
+        hw_lines_added: None,
+        hw_lines_deleted: None,
+        hw_files: None,
+        generated_lines: None,
+        test_lines: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(value["complexity"], "complex");
@@ -438,6 +468,16 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
+        pr_numbers: None,
+        hw_lines_added: None,
+        hw_lines_deleted: None,
+        hw_files: None,
+        generated_lines: None,
+        test_lines: None,
     };
 
     let unobserved = serde_json::to_value(&base).unwrap();
@@ -1031,6 +1071,16 @@ fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
         complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
+        pr_numbers: None,
+        hw_lines_added: None,
+        hw_lines_deleted: None,
+        hw_files: None,
+        generated_lines: None,
+        test_lines: None,
     };
     let value = serde_json::to_value(&resolved).unwrap();
     assert_eq!(value["repo"], "rjwalters/loom");

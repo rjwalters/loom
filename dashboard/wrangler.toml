@@ -136,12 +136,26 @@ new_sqlite_classes = ["FleetState"]
 # applied for defense in depth (a burst of hosts could blow the row cap well
 # before the age cutoff, and a single very-chatty host could blow the age
 # cutoff's effective size before enough time passes).
+#
+# Size eviction is TIERED (2AMLogic/2am#1608): unprotected snapshot-class
+# rows (anything that is not `sweep.%`/`session.summary`/`session.analysis`)
+# are evicted oldest-first first; protected sweep-history rows only go if
+# every unprotected row is gone and the table is still over cap. Age
+# eviction stays kind-blind — it IS the 90-day policy. Each sweep that
+# deletes anything also writes a `backend.retention` liveness row, so size
+# evictions leave a queryable trace instead of silently shrinking the
+# history this backend exists to keep.
 # -----------------------------------------------------------------------------
 # Tune to your fleet size and D1 plan limits. These are plain (non-secret)
 # vars, so `wrangler deploy` publishes exactly what is written here.
+#
+# MAX_RECORDS raised 500000 → 1000000 by #1608: at ~506k rows the old cap
+# was the bound actually firing (~1.46 GB), routinely evicting sweep
+# history; 1M rows ≈ 3 GB, well inside D1's limits, and turns the cap back
+# into an emergency brake rather than the routine eviction mechanism.
 [vars]
 RETENTION_DAYS = "90"
-MAX_RECORDS = "500000"
+MAX_RECORDS = "1000000"
 
 # Display timezone for the UI: an IANA name (e.g. "America/Los_Angeles").
 #

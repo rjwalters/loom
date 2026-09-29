@@ -330,6 +330,58 @@ pub enum SweepResult {
 }
 
 /// One attempt at one named lifecycle phase — the unit
+/// Why a sweep was dispatched — the low-cardinality `trigger` vocabulary
+/// (Issue #9444). Serialized snake_case like [`SweepResult`]; carried as the
+/// string's own value on the record so the closed set stays a documentation
+/// and derivation-side contract (derivation in
+/// `sweep_registry::outcome_journal::lineage`).
+pub mod trigger {
+    /// The first sweep for this repo#issue on this host's journal.
+    pub const FIRST: &str = "first";
+    /// Re-dispatch after the previous attempt died to the environment
+    /// (spawn/preflight death, pool exhaustion, cancellation).
+    pub const RETRY_AFTER_ENV_FAILURE: &str = "retry_after_env_failure";
+    /// Re-dispatch after the previous attempt failed substantively (builder
+    /// could not complete, judge rejected, doctor loop exhausted).
+    pub const RETRY_AFTER_SUBSTANTIVE_FAILURE: &str = "retry_after_substantive_failure";
+    /// Dispatched to run Doctor after a judge `changes-requested`.
+    pub const DOCTOR_AFTER_CHANGES_REQUESTED: &str = "doctor_after_changes_requested";
+    /// Dispatched because main moved under the work.
+    pub const REBASE_MAIN_MOVED: &str = "rebase_main_moved";
+    /// Dispatched to resolve a merge conflict.
+    pub const MERGE_CONFLICT: &str = "merge_conflict";
+    /// Re-judge against a stale base.
+    pub const STALE_BASE_REJUDGE: &str = "stale_base_rejudge";
+    /// Dispatched to fix a CI failure.
+    pub const CI_FAILURE_FIX: &str = "ci_failure_fix";
+    /// A human or external tool asked for this sweep.
+    pub const OPERATOR_REDISPATCH: &str = "operator_redispatch";
+    /// The dispatch reason was not observable. Counted, never silently merged.
+    pub const UNKNOWN: &str = "unknown";
+}
+
+/// One in-sweep rework event (Issue #9444) — a counted entry on
+/// [`SweepOutcomeRecord::rework_events`], written by the path that performed
+/// the rework (today: the merge path's stale-base handling via the
+/// `.loom/logs/sweep-rework-events.jsonl` marker protocol; see
+/// `telemetry-schema.md`'s rework table).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReworkEvent {
+    /// What kind of rework: `rebase` | `merge_conflict` | `ci_rerun` |
+    /// `rejudge`.
+    pub kind: String,
+    /// Why it happened, when the emitter knows (free-form-short).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// `substantive` (the work was hard) or `environmental` (the ground moved)
+    /// per the classification table in `telemetry-schema.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
+    /// How long the rework took, when the emitter measured it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_sec: Option<i64>,
+}
+
 /// [`SweepOutcomeRecord::phase_durations`] is a list of: how long it took and
 /// (Issue #9443) what it cost.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -450,6 +502,14 @@ pub enum TokensStatus {
     /// was. Never coerce this to zero: that is exactly the undercount #9440
     /// exists to remove.
     Unattributable,
+    /// Measured, but the plausibility guard fired (Issue #9454): the counters
+    /// imply more input tokens per wall-clock second than the sweep could
+    /// physically have consumed (the #9440-study evidence: 250M tokens in a
+    /// 22-second curator-only failure). The counters are still published —
+    /// flagged, never as a clean measurement — so a misattribution regression
+    /// is visible per host per day (`sweep-facts-queries.sql` SF3) instead of
+    /// silently poisoning per-issue cost sums.
+    Suspect,
 }
 
 /// `sweep.started` — a sweep began work on an issue.
@@ -834,6 +894,54 @@ pub struct SweepOutcomeRecord {
     /// BY`, which is the whole point of separating the absence cases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_status_reason: Option<String>,
+    /// 1-based count of terminal sweeps for this repo#issue in this host's
+    /// durable outcome journal (Issue #9444) — the attempt this sweep was.
+    /// Absent when the journal could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_index: Option<u32>,
+    /// The `sweep_id` of the immediately preceding attempt for this repo#issue
+    /// (Issue #9444), when the journal showed one. Absent for a first attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_sweep_id: Option<String>,
+    /// Why this sweep was dispatched (Issue #9444) — one of the
+    /// [`trigger`] constants. Derived at the terminal transition from the
+    /// journal's previous attempt and this sweep's own recorded context;
+    /// `unknown` is counted, never silently merged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    /// In-sweep rework events (Issue #9444) observed by the paths that
+    /// performed them, in event order. Absent (never `[]`) when none were
+    /// observed for this sweep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rework_events: Option<Vec<ReworkEvent>>,
+    /// Every PR number this sweep's lifecycle was observed to carry, in
+    /// first-seen order (Issue #9465) — the multi-PR slice shape the single
+    /// [`pr_number`](Self::pr_number) (the latest) cannot represent. Absent
+    /// (never `[]`) when no PR was ever sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_numbers: Option<Vec<u32>>,
+    /// Hand-written lines added by the sweep's own commits (Issue #9466):
+    /// [`lines_added`](Self::lines_added) minus the lines in
+    /// generated-classified paths (`generatedPaths` config globs over the
+    /// shipped default — see `telemetry-schema.md`). Absent whenever
+    /// `lines_added` is absent, or the diff's paths could not be classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_lines_added: Option<i64>,
+    /// Hand-written lines deleted, alongside [`Self::hw_lines_added`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_lines_deleted: Option<i64>,
+    /// Distinct non-generated files in the landing diff (Issue #9466).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_files: Option<i64>,
+    /// Lines in generated-classified paths of the landing diff (Issue #9466),
+    /// reported — not counted as work. Absent alongside [`Self::hw_lines_added`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_lines: Option<i64>,
+    /// Lines in test files of the landing diff (Issue #9466) — paths matching
+    /// the documented test-file convention. Absent alongside
+    /// [`Self::hw_lines_added`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_lines: Option<i64>,
 }
 
 impl SweepOutcomeRecord {

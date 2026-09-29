@@ -879,6 +879,69 @@ group), and `reconstruct` restores them onto the adopted entry. A pre-#8056
 explicit model/effort still reports `null` — the honest "inherited the
 session default", never a fabricated value.
 
+#### Attempt lineage, rework events, and landing size (Issues #9444, #9454, #9465, #9466)
+
+Fourteen more **independently optional** fields, all added additively (no
+`schema_version` bump). Together they make `sweep.outcome` answer the four
+questions the #9440–#9446 study showed it could not: *did this sweep land
+work*, *were its tokens measured and are they plausible*, *why was it
+dispatched*, and *how big was the work it produced*.
+
+**`tokens_status` addendum — the `suspect` guard (Issue #9454):** on top of the `measured`/`not_spawned`/`unattributable` vocabulary #9440 shipped, a *measured* result whose input rate exceeds **100 000 input tokens per wall-clock second** (`sweep_usage::SUSPECT_INPUT_TOKENS_PER_SEC`) is re-classified `suspect` with reason `implausible_input_rate`. The counters are still published — flagged, never as a clean measurement — so a misattribution regression (the study's 250M-tokens-in-22-seconds shape) is visible per host per day (`sweep-facts-queries.sql` SF3) instead of silently poisoning per-issue cost sums. The attribution rule is unchanged: usage is attributed by this sweep's own wall-clock window over this sweep's own directories — the workspace root and this issue's worktree; a sibling issue's worktree is deliberately excluded — never by issue number or directory name alone.
+
+**Attempt lineage** (Issue #9444): `attempt_index` (1-based count of terminal
+sweeps for this repo#issue in **this host's** durable outcome journal — the
+honest per-host denominator, not a fleet one), `previous_sweep_id` (the
+immediately preceding attempt), and `trigger` — why this sweep was
+dispatched: `first` \| `retry_after_env_failure` \|
+`retry_after_substantive_failure` \| `doctor_after_changes_requested` \|
+`rebase_main_moved` \| `merge_conflict` \| `stale_base_rejudge` \|
+`ci_failure_fix` \| `operator_redispatch` \| `unknown`. Derived at the
+terminal transition from the previous attempt's disposition (or, for
+pre-#9441 lines, its `result` + `failure_class`); `unknown` is counted. All
+three are absent when the journal could not be read or the repo slug never
+resolved.
+
+**`rework_events`** (array of `{kind, reason?, classification?,
+duration_sec?}`) — in-sweep rework observed by the path that performed it,
+via the append-only marker protocol: the performing path appends one JSON
+object per event to `<workspace_root>/.loom/logs/sweep-rework-events.jsonl`
+(`{"at":"<RFC3339>","issue":N,"kind":"rebase|merge_conflict|ci_rerun|rejudge",
+"reason":"…","classification":"environmental|substantive","duration_sec":N}`);
+the terminal outcome samples the file for its own issue and window. The
+default classification when the writer omits one: `rejudge` ⇒
+**`substantive`** (the work was hard); `rebase`, `merge_conflict`,
+`ci_rerun` ⇒ **`environmental`** (the ground moved). Absent (never `[]`)
+when no event was marked. *Writer status:* the daemon side (reader,
+classification, rollup) is shipped; the first writer is the merge path's
+stale-base handling, whose wiring is deliberately a follow-up —
+`merge-pr.sh` is at the file-size ratchet, and the shell-language policy
+points that handling at a `loom-daemon` subcommand first.
+
+**PR linkage and the model that ran** (Issue #9465): `pr_numbers` (integer
+array, first-seen order) lists every PR the sweep's lifecycle was observed to
+carry — the multi-PR slice shape the single `pr_number` (the **latest**) cannot
+represent. `model` now names the model that **actually ran** — the dominant
+entry in `tokens_by_model` (most input+output tokens) — falling back to the
+dispatched model when nothing was attributed; the dispatch-time experiment arm
+stays under `config["arm"]` (#4809), computed from the dispatched model.
+
+**Landing size** (Issue #9466): `hw_lines_added`, `hw_lines_deleted`,
+`hw_files` (hand-written lines/files of the sweep's own diff),
+`generated_lines` (lines in generated-classified paths, reported not counted),
+and `test_lines` (lines in test files). Classification is repo-owned: a
+`generatedPaths` glob list in `.loom/config.json` (gitignore-like semantics: a
+bare `*.ext` matches at any depth; `**` crosses segments; a config list
+**replaces** the default) over the shipped default covering lockfiles,
+`records/`-style output trees, simulator/netlist/physical-design output,
+CSV/TSV dumps, minified bundles and vendored trees. Test files are any path
+with a `test`/`spec` segment or a `test_*`/`*_test.`/`.spec.`/`.test.` name.
+All five are absent (never 0) whenever the worktree's numstat could not be
+read — the same contract `lines_added`/`lines_deleted` keep. The
+`landed_size`/LSI rollup over these fields lives in
+`defaults/observability/sweep-facts/` (#9446/#9466), beside its definitions
+doc.
+
 ### `role_tick.outcome`
 
 One role-runner tick (Issue #8056) — the per-`(root, role)` counterpart of

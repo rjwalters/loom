@@ -623,6 +623,18 @@ fn terminal_records(
             complexity: None,
             tokens_status: None,
             tokens_status_reason: None,
+            // Issues #9444/#9465/#9466: terminal facts the reaper-side journal
+            // (the real `sweep.outcome`) computes. Absent, never fabricated.
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
+            pr_numbers: None,
+            hw_lines_added: None,
+            hw_lines_deleted: None,
+            hw_files: None,
+            generated_lines: None,
+            test_lines: None,
         }),
     ]
 }
