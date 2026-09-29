@@ -178,6 +178,7 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
                 crate::telemetry::TokensStatus::Measured => "measured",
                 crate::telemetry::TokensStatus::NotSpawned => "not_spawned",
                 crate::telemetry::TokensStatus::Unattributable => "unattributable",
+                crate::telemetry::TokensStatus::Suspect => "suspect",
             }
             .to_string(),
         ));

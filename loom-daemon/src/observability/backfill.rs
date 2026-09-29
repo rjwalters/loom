@@ -354,6 +354,16 @@ mod tests {
                 complexity: None,
                 tokens_status: None,
                 tokens_status_reason: None,
+                attempt_index: None,
+                previous_sweep_id: None,
+                trigger: None,
+                rework_events: None,
+                pr_numbers: None,
+                hw_lines_added: None,
+                hw_lines_deleted: None,
+                hw_files: None,
+                generated_lines: None,
+                test_lines: None,
             }),
         )
     }
@@ -403,6 +413,16 @@ mod tests {
             complexity: None,
             tokens_status: None,
             tokens_status_reason: None,
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
+            pr_numbers: None,
+            hw_lines_added: None,
+            hw_lines_deleted: None,
+            hw_files: None,
+            generated_lines: None,
+            test_lines: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));
@@ -454,6 +474,16 @@ mod tests {
             complexity: None,
             tokens_status: None,
             tokens_status_reason: None,
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
+            pr_numbers: None,
+            hw_lines_added: None,
+            hw_lines_deleted: None,
+            hw_files: None,
+            generated_lines: None,
+            test_lines: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));

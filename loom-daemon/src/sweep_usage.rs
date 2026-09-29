@@ -278,3 +278,33 @@ pub fn window(
 
 #[cfg(test)]
 mod tests;
+
+/// The #9454 plausibility ceiling: input tokens per wall-clock second above
+/// which a *measured* result is re-classified [`TokensStatus::Suspect`]. The
+/// #9440-study fleet median was 32k/s with p90 679k/s — the ceiling sits above
+/// the plausible tail's worst case (parallel subagents legitimately folding
+/// into one sweep) and below the implausible population's floor (513 records
+/// exceeded 200k/s; the median implausible record exceeded 1M/s).
+pub const SUSPECT_INPUT_TOKENS_PER_SEC: u64 = 100_000;
+
+/// Re-classify a *measured* usage as [`TokensStatus::Suspect`] when its input
+/// rate exceeds [`SUSPECT_INPUT_TOKENS_PER_SEC`] (Issue #9454). Any other
+/// status passes through untouched — only clean measurements can be
+/// suspected. The reason names the guard so the wire stays self-describing.
+#[must_use]
+pub fn apply_plausibility_guard(usage: SweepUsage, total_duration_sec: i64) -> SweepUsage {
+    let seconds = i64::max(total_duration_sec, 1);
+    let rate_exceeds_ceiling = usage
+        .tokens_in
+        .unwrap_or(0)
+        .saturating_div(u64::try_from(seconds).unwrap_or(1))
+        > SUSPECT_INPUT_TOKENS_PER_SEC;
+    if usage.status == TokensStatus::Measured && rate_exceeds_ceiling {
+        return SweepUsage {
+            status: TokensStatus::Suspect,
+            reason: Some("implausible_input_rate".to_string()),
+            ..usage
+        };
+    }
+    usage
+}
