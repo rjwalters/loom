@@ -59,7 +59,7 @@
 //!   [`Verdict::Stale`] — the PR-side transposition of the #4634/#7267
 //!   superseding-block gate.
 
-use crate::dep_recheck::{named, premise, recheck};
+use crate::dep_recheck::{extract, named, premise, recheck};
 
 /// Which kind of artifact a finding is about.
 ///
@@ -304,6 +304,52 @@ pub fn classify(e: &Evidence) -> Verdict {
         },
         None => Verdict::Stale(reasons),
     }
+}
+
+/// Which of `closed` an artifact's body/comments cite as a blocker (issue
+/// #9102), in document-independent ascending order, deduplicated.
+///
+/// Backs the close-triggered re-check (`loom-daemon notify-cleared-blockers`,
+/// called from `merge-pr.sh`'s post-merge path). It narrows the open
+/// `loom:blocked` population to the artifacts that named a just-closed
+/// issue/PR, so the close path neither re-reports blocks that were already
+/// stale (the fleet-wide advisory's job) nor pays for a full [`Evidence`]
+/// gather on every artifact — this runs on text already fetched, with no
+/// state lookups.
+///
+/// The vocabulary is exactly the one [`Evidence`] is built from, so this can
+/// never disagree with [`classify`]: [`extract::extract`]'s prose phrases over
+/// the body plus every non-bot comment, and — for an issue only, mirroring
+/// `gather`'s own PR arm — [`named::parse_entries`]'s `## Dependencies`
+/// checklist. Unchecked entries only: a ticked box is never consulted.
+/// Same-repo only: a cross-repo checklist entry (`owner/repo#5`) numerically
+/// equal to a closed number is a different artifact.
+///
+/// A linked closing PR is deliberately not consulted — that answers "what
+/// closes *this* issue", the opposite relation from "what does this issue cite
+/// as its own blocker".
+#[must_use]
+pub fn cited_among(kind: Artifact, input: &extract::Input, closed: &[i64]) -> Vec<i64> {
+    let mut refs: Vec<i64> = extract::extract(input, extract::DEFAULT_BOT_LOGIN)
+        .split_whitespace()
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    if kind == Artifact::Issue {
+        refs.extend(
+            named::parse_entries(&input.body)
+                .into_iter()
+                .filter(|d| d.repo.is_none() && !d.checked)
+                .map(|d| d.number),
+        );
+    }
+    let mut hit: Vec<i64> = closed
+        .iter()
+        .copied()
+        .filter(|n| refs.contains(n))
+        .collect();
+    hit.sort_unstable();
+    hit.dedup();
+    hit
 }
 
 /// Flatten a `dep_recheck` multi-line rendering onto one reportable line.

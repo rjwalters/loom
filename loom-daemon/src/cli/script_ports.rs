@@ -366,6 +366,16 @@ pub(crate) enum ScriptPortCommand {
     /// value, only path, class and sha256[:8]. Exit 0 clean, 1 found, 2 could
     /// not scan. Not a port: new logic, native per the shell-language policy.
     SecretScan(super::secret_scan_cmd::SecretScanArgs),
+
+    /// The close-triggered `loom:blocked` re-check (#9102, item 2 of #8927's
+    /// deferred fix list): given `--closed <N>...` (the merged PR plus every
+    /// issue it closed), comments on each open `loom:blocked` issue/PR that
+    /// cites one of them as a blocker and now classifies stale. Reuses
+    /// `check-stale-blocked`'s enumeration and the `dep_recheck` parsers.
+    /// Called from `merge-pr.sh`'s post-merge path. Unlike
+    /// `CheckStaleBlocked` it WRITES (a comment, never a label); `--dry-run`
+    /// previews. Always exits 0.
+    NotifyClearedBlockers(super::notify_cleared_blockers::NotifyClearedBlockersArgs),
 }
 
 impl ScriptPortCommand {
@@ -418,6 +428,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
             ScriptPortCommand::SecretScan(args) => args.run(),
+            ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
         }
     }
 }
