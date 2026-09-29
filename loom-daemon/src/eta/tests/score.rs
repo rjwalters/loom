@@ -15,6 +15,7 @@ fn fixed_estimate() -> EstimateSummary {
         p75_sec: 2400,
         eta_p50_at: as_of() + Duration::seconds(1200),
         samples_min: 9,
+        stage_marks: Vec::new(),
     });
     EstimateSummary::of(&explanation)
 }
