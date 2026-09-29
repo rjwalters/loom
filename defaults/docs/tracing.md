@@ -236,15 +236,16 @@ zero" contract the telemetry schema states for every measured field.
 
 Role-attempt completion attributes close the same gap on the *why*: a fixed
 `loom.admission.reason` literal — `failure`, `runtime-rejected`,
-`no-token-pool`, `pool-exhausted`, `model-runtime-mismatch`, `load-ceiling` —
-plus the measured context that distinguishes them: the actual load against the
-ceiling on a load deferral, which pool gated and its total size, and the
-runtime's missing capabilities. The free-form text these outcomes carry in
-daemon and role logs is deliberately not exported: span attributes stay
-allowlisted, 256-byte bounded, and free of untrusted content. Together the two
-boundaries' host state and the admission reason let an operator separate an
-attempt deferred for memory pressure from one the kernel killed from one that
-simply timed out, directly in the trace.
+`no-token-pool`, `pool-exhausted`, `model-runtime-mismatch`, `load-ceiling`,
+plus `preflight-rejected` (stamped on the runtime-preflight span itself, not a
+role-attempt finish) — plus the measured context that distinguishes them: the
+actual load against the ceiling on a load deferral, which pool gated and its
+total size, and the runtime's missing capabilities. The free-form text these
+outcomes carry in daemon and role logs is deliberately not exported: span
+attributes stay allowlisted, 256-byte bounded, and free of untrusted content.
+Together the two boundaries' host state and the admission reason let an
+operator separate an attempt deferred for memory pressure from one the kernel
+killed from one that simply timed out, directly in the trace.
 
 ## Journals and recovery
 
