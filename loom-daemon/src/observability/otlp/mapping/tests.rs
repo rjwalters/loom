@@ -5,9 +5,9 @@
 
 use super::*;
 use crate::telemetry::{
-    HostHealthRecord, MemoryPressureSummary, PhaseDuration, SweepCompletedRecord,
-    SweepDisposition, SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord,
-    TokenAccountState, TokenSnapshotRecord,
+    HostHealthRecord, MemoryPressureSummary, PhaseDuration, SweepCompletedRecord, SweepDisposition,
+    SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
+    TokenSnapshotRecord,
 };
 
 fn ts() -> DateTime<Utc> {
