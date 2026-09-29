@@ -121,6 +121,12 @@ mod lease_episode;
 mod locks;
 mod model;
 mod noop_cooldown;
+// The rework-event marker protocol's writer (Issue #9444): the merge path
+// reaches it through the `merge-pr record-rework` CLI; the reader stays
+// crate-internal because only the terminal outcome samples the file.
+pub use outcome_journal::rework::{
+    append_rework_event, issue_for_pr_from_journal, known_kind, ReworkMarker,
+};
 mod outcome_journal;
 mod overflow;
 mod pool_hold_broadcast;

@@ -597,6 +597,16 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_partial_conflict`.
     PartialConflict(super::merge_pr_partial_conflict::PartialConflictArgs),
 
+    /// The FIRST WRITER of Issue #9444's rework-event marker protocol: the
+    /// merge path marking a rework it just performed (a base-sync before a
+    /// merge retry) or forced (a conflict refusal a Doctor turn must
+    /// resolve), so the terminal sweep outcome samples it into
+    /// `rework_events`. Fails OPEN — exit 0 even when the PR cannot be
+    /// linked to an issue; exit 2 = an unknown `--kind`; exit 4 = the marker
+    /// write failed. Telemetry must never block a merge — see
+    /// `cli::merge_pr_record_rework`.
+    RecordRework(super::merge_pr_record_rework::RecordReworkArgs),
+
     /// Which route a FAILED merge's forge error text sends the retry ladder
     /// down (#8191 slice): `merge-in-progress` (405, wait and retry),
     /// `head-mismatch` (#5579 — never retry-and-merge), `base-modified` (sync
@@ -652,6 +662,7 @@ impl MergePrCommand {
             MergePrCommand::WorktreeFindByBranch(args) => args.run(),
             MergePrCommand::PartialReset(args) => args.run(),
             MergePrCommand::PartialConflict(args) => args.run(),
+            MergePrCommand::RecordRework(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),
             MergePrCommand::ClosedBuilding(args) => args.run(),
             MergePrCommand::ReconcilePlan(args) => args.run(),

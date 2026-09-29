@@ -922,7 +922,7 @@ _check_loom_pr_label
 # build-stampede guard (#8252). The refusal named neither the version nor the
 # roll command. That is what these markers and the hint below fix.
 #
-# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, stacked-children, version-policy, partial-reset, closed-building, issue-close-gate, dirty-guard — the last refuses only the post-merge worktree removal, never the merge) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
+# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, stacked-children, version-policy, partial-reset, closed-building, issue-close-gate, dirty-guard — the last refuses only the post-merge worktree removal, never the merge — and record-rework, #9444's best-effort rework-event marker, which loses one telemetry event on an old daemon, never a merge) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
 # requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
 # The `merge-pr >=` floor above covers the whole subcommand group, including
@@ -2316,6 +2316,10 @@ if [[ "$PR_MERGEABLE" == "false" ]]; then
       info "PR #$PR_NUMBER: $_MSM_REASON"
       ;;
     refuse-conflict)
+      # In-sweep rework marker (#9444): a confirmed conflict is rework the
+      # sweep must now perform (a Doctor/Builder turn resolves it). Best-effort
+      # telemetry, fully isolated, never changes the refusal.
+      "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr record-rework --kind merge_conflict --reason "$_MSM_REASON" --pr "$PR_NUMBER" --repo "$REPO_NWO" --workspace "${REPO_ROOT:-.}" >/dev/null 2>&1 || true
       error "PR #$PR_NUMBER has merge conflicts — resolve before merging ($_MSM_REASON)"
       ;;
     *)
@@ -2364,8 +2368,7 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
   # Check for "Merge already in progress" (HTTP 405)
   # This happens when auto-merge triggers at the same time as our merge attempt
   if [[ "$MERGE_RESPONSE_KIND" == "merge-in-progress" ]]; then
-    info "Merge already in progress (HTTP 405), waiting for completion..."
-    sleep 5
+    info "Merge already in progress (HTTP 405), waiting for completion..."; sleep 5
     RECHECK_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
     RECHECK=$(echo "$RECHECK_JSON" | jq -r '.merged // false')
     if [[ "$RECHECK" == "true" ]]; then
@@ -2407,8 +2410,12 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
       }
 
       # Wait for branch to sync
-      info "Waiting ${MERGE_RETRY_DELAY}s for branch to sync..."
-      sleep "$MERGE_RETRY_DELAY"
+      info "Waiting ${MERGE_RETRY_DELAY}s for branch to sync..."; sleep "$MERGE_RETRY_DELAY"
+
+      # In-sweep rework marker (#9444): the base-sync below us IS the rework —
+      # main moved and the merge path had to update the branch before it could
+      # retry. Best-effort telemetry, fully isolated, never blocks the merge.
+      "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr record-rework --kind rebase --reason "base-modified: syncing branch behind base before merge retry (attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES)" --pr "$PR_NUMBER" --repo "$REPO_NWO" --workspace "${REPO_ROOT:-.}" >/dev/null 2>&1 || true
 
       # The sync just pushed to the head branch: re-read it, or the retry
       # below re-gates on a SHA the forge has already superseded (#8164).
