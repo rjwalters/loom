@@ -1185,6 +1185,9 @@ mod provider_accounts_tests;
 mod shell_arm_registry_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+mod terminal_records_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

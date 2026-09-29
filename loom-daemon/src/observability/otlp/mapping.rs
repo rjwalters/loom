@@ -277,7 +277,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 attributes.insert(0, kv_string("loom.repo", repo.clone()));
             }
             if r.repo_unresolved {
-                attributes.push(kv_string("loom.repo_unresolved", "true".into()));
+                attributes.push(kv_string("loom.repo_unresolved", "true".to_string()));
             }
             if let Some(model) = &r.model {
                 attributes.push(kv_string("loom.model", model.clone()));

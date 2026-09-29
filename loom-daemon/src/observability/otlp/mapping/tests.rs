@@ -55,7 +55,7 @@ fn sweep_completed_envelope(result: SweepResult) -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepCompleted(SweepCompletedRecord {
-            repo: "rjwalters/loom".to_string(),
+            repo: Some("rjwalters/loom".to_string()),
             visibility: RepoVisibility::Public,
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),
@@ -70,7 +70,7 @@ fn sweep_completed_envelope_with_tokens_by_model() -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepCompleted(SweepCompletedRecord {
-            repo: "rjwalters/loom".to_string(),
+            repo: Some("rjwalters/loom".to_string()),
             visibility: RepoVisibility::Public,
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),
