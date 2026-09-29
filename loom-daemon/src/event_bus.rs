@@ -711,6 +711,7 @@ mod tests {
         // The Event::SweepGlobalDispatch helper must produce
         // `sweep.global.dispatch` regardless of SweepKind contents.
         let ev = Event::SweepGlobalDispatch {
+            story_points: None,
             sweep_id: "sweep-issue-42-1".to_string(),
             kind: SweepKind::Issue(42),
             runtime: None,

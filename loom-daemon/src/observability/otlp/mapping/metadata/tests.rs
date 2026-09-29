@@ -469,3 +469,25 @@ fn an_invalid_or_oversized_phase_breakdown_is_omitted_whole() {
         attribute(&map(TelemetryRecord::SweepOutcome(record)), "loom.phase_durations").is_none()
     );
 }
+
+/// Issue #9432 (epic #9429): the Curator's story-point size reaches OTLP as a
+/// NUMERIC `loom.story_points` attribute on `sweep.outcome` — and an unsized
+/// sweep emits **no** such attribute rather than a `0` that would claim someone
+/// sized the issue at nothing.
+#[test]
+fn story_points_are_exported_numerically_and_absent_when_unsized() {
+    let mut record = outcome_record();
+    assert!(
+        attribute(&map(TelemetryRecord::SweepOutcome(record.clone())), "loom.story_points")
+            .is_none(),
+        "an issue with no points:* label must omit the attribute entirely"
+    );
+    for points in [1_u32, 2, 3, 5, 8, 13] {
+        record.story_points = Some(points);
+        assert_eq!(
+            attribute(&map(TelemetryRecord::SweepOutcome(record.clone())), "loom.story_points"),
+            Some(any_value::Value::IntValue(i64::from(points))),
+            "{points}"
+        );
+    }
+}

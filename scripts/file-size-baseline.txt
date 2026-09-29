@@ -71,11 +71,11 @@
 1868 loom-daemon/src/tokens_pool/check.rs
 1180 loom-daemon/src/tokens_pool/monitor.rs
 1510 loom-daemon/src/tokens_pool/session_lifecycle.rs
-1128 loom-daemon/src/types.rs
+1656 loom-daemon/src/types.rs
 1050 loom-daemon/src/watch_registry.rs
-1543 loom-daemon/src/work_finder.rs
+1580 loom-daemon/src/work_finder.rs
 3455 loom-daemon/src/work_finder/tests.rs
-1223 loom-daemon/src/worktree_ops/cargo_target.rs
+1225 loom-daemon/src/worktree_ops/cargo_target.rs
 2370 loom-daemon/src/worktree_ops/clean.rs
 1702 loom-daemon/src/worktree_ops/clean/tests.rs
 1589 loom-daemon/src/worktree_ops/orphan_recovery.rs

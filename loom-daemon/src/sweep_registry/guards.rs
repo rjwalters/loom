@@ -1107,11 +1107,19 @@ impl SweepRegistry {
         }
     }
 
-    /// Best-effort probe for the first [`PARK_LABELS`] entry currently on
-    /// `issue`, used by the #4444 park-label dispatch guard (step 2.7). Returns
-    /// `Some(label)` when the issue carries a park label and `None` otherwise —
-    /// where `None` covers BOTH "not parked" and any failure (missing/failed/
-    /// timed-out `gh`, unresolvable repo, unparseable output).
+    /// Best-effort probe for the first [`PARK_LABELS`] entry on `issue`, used by
+    /// the #4444 park-label dispatch guard (step 2.7). Returns `Some(label)`
+    /// when the issue carries a park label and `None` otherwise — where `None`
+    /// covers BOTH "not parked" and any failure (missing/failed/timed-out `gh`,
+    /// unresolvable repo, unparseable output).
+    ///
+    /// Takes the label set as an argument rather than fetching it, so the ONE
+    /// [`current_labels_via_rest`](Self::current_labels_via_rest) read the
+    /// dispatch path makes serves both this guard and the #9432 story-point
+    /// resolution (`crate::story_points`) instead of each probing the forge
+    /// separately. A failed read never reaches here: the caller's `?` on the
+    /// fetch already fails open, which is the same "no opinion ⇒ dispatch
+    /// proceeds" outcome this function's own `None` produces.
     ///
     /// Callers MUST treat `None` as **fail-open**, matching
     /// [`issue_is_closed_or_pr`](Self::issue_is_closed_or_pr) and
@@ -1137,8 +1145,7 @@ impl SweepRegistry {
     /// otherwise be refused two steps later by this very probe.
     ///
     /// [`PARK_LABELS`]: crate::work_finder::PARK_LABELS
-    pub(crate) fn first_park_label(&self, issue: u32) -> Option<String> {
-        let labels = self.current_labels_via_rest(issue)?;
+    pub(crate) fn first_park_label_in(&self, issue: u32, labels: &[String]) -> Option<String> {
         // `PARK_LABELS` order, not forge order, so the refusal is deterministic
         // when an issue carries both. `loom:blocked` sorts first, so an item
         // carrying it never reaches the exemption below.
@@ -1146,7 +1153,7 @@ impl SweepRegistry {
             .iter()
             .find(|park| labels.iter().any(|l| l == *park))?;
         if **park == *crate::capability::OPERATOR_ONLY_LABEL
-            && self.mechanical_capability_exempt(issue, &labels)
+            && self.mechanical_capability_exempt(issue, labels)
         {
             return None;
         }
@@ -1241,7 +1248,7 @@ impl SweepRegistry {
     }
 
     /// Read `issue`'s current label names over the GitHub REST API. `None` on any
-    /// failure (see [`first_park_label`](Self::first_park_label) for the
+    /// failure (see [`first_park_label_in`](Self::first_park_label_in) for the
     /// fail-open contract); `Some(vec![])` for an issue with no labels, which is
     /// a *successful* read and must stay distinguishable from a failed one.
     pub(crate) fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {

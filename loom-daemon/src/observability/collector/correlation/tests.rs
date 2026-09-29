@@ -9,6 +9,7 @@ fn no_evidence() -> Option<TrackedSweepIdentity> {
 
 fn dispatch(issue: u32, sweep: &str) -> Event {
     Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: sweep.into(),
         kind: SweepKind::Issue(issue),
         runtime: None,
