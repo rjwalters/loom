@@ -31,12 +31,16 @@
 --     job families: `Rust Unit Tests` / `Rust OTLP Feature Tests` via
 --     `cargo nextest run --partition`, and `Shell Test Suites` via
 --     `LOOM_CI_SHARD`).
---   * Section 11 (#9089) is the ONLY section that reads TRACES
+--   * Sections 11-13 (#9089) are the ONLY sections that read TRACES
 --     (`signoz_traces.signoz_index_v3`), not logs or metrics: step timings
---     live on `loom.ci.step` spans, which have no log record and no metric
---     series of their own (a per-step histogram would multiply the 30-day
---     series count by every job's step count). Traces are kept 7 days, the
---     same horizon as the log sections.
+--     live on `loom.ci.step` spans and per-suite timings on `loom.ci.suite`
+--     spans, neither of which has a log record or a metric series of its own
+--     (a per-step or per-suite histogram would multiply the 30-day series
+--     count by every job's step count / every leg's suite count). Traces are
+--     kept 7 days, the same horizon as the log sections.
+--   * Section 14 (#9089) reads BOTH `ci.run` and `ci.job` log records and
+--     joins them, so a run's critical path can separate its own queue segment
+--     from the queue + running time of the leg that set its floor (7 days).
 --
 -- Vocabulary is pinned to what the daemon exports and the gateway forwards:
 -- `loom-daemon/tests/signoz_trial_artifacts.rs` fails if any attribute key,
