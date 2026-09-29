@@ -293,7 +293,44 @@
     "p50_sec": 2004,
     "p75_sec": 3552,
     "eta_p50_at": "2026-09-20T12:33:24Z",
-    "samples_min": 22
+    "samples_min": 22,
+    "stage_marks": [
+      {
+        "stage": "sweep.curator",
+        "p25_at": null,
+        "p50_at": null,
+        "p75_at": null,
+        "mean_visits": null
+      },
+      {
+        "stage": "sweep.builder",
+        "p25_at": null,
+        "p50_at": null,
+        "p75_at": null,
+        "mean_visits": null
+      },
+      {
+        "stage": "review_wait",
+        "p25_at": "2026-09-20T12:00:00Z",
+        "p50_at": "2026-09-20T12:00:00Z",
+        "p75_at": "2026-09-20T12:00:00Z",
+        "mean_visits": 1.553
+      },
+      {
+        "stage": "doctor",
+        "p25_at": "2026-09-20T12:06:27Z",
+        "p50_at": "2026-09-20T12:11:35Z",
+        "p75_at": "2026-09-20T12:20:51Z",
+        "mean_visits": 0.553
+      },
+      {
+        "stage": "merge_wait",
+        "p25_at": "2026-09-20T12:15:43Z",
+        "p50_at": "2026-09-20T12:33:24Z",
+        "p75_at": "2026-09-20T12:59:12Z",
+        "mean_visits": 1.0
+      }
+    ]
   },
   "contributions": {
     "p50_share": {

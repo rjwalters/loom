@@ -1362,7 +1362,7 @@ carries **both** the estimating build (`estimate.loom`, exported as
 | Field | Type | Notes |
 |---|---|---|
 | `trigger` | string | `first`, `transition` (stage, rework or refusal changed) or `refresh` (every `refreshSecs`, default 300) |
-| `explanation` | object | the `eta-explanation/v1` record: `estimate_id`, `heuristic`, `kind`, `loom` (required), `as_of`, `subject`, `current_stage`, `history` (`scope`: `local` until #9343 adds `fleet`; per-source and per-host sample counts), `stages[]`, `branches`, `combination`, `result`, `contributions`, `features`, `features_omitted`, `no_estimate_reason`, `truncated` |
+| `explanation` | object | the `eta-explanation/v1` record: `estimate_id`, `heuristic`, `kind`, `loom` (required), `as_of`, `subject`, `current_stage`, `history` (`scope`: `local` until #9343 adds `fleet`; per-source and per-host sample counts), `stages[]`, `branches`, `combination`, `result` (with `stage_marks`, #9366), `contributions`, `features`, `features_omitted`, `no_estimate_reason`, `truncated` |
 
 A refusal is an estimate too: `explanation.result` is absent (never zero) and
 `no_estimate_reason` names why. Refusals are emitted when the reason first
