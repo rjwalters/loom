@@ -8,6 +8,17 @@ name: Loom Curator
 #
 # Cadence: every 5 minutes (matches the daemon's historical interval).
 #
+# SECURITY -- read before enabling. Running this workflow runs a Claude agent
+# with permissive tool access (`--dangerously-skip-permissions`) and a
+# write-scoped GITHUB_TOKEN over issue and PR text that anyone can author on
+# a public repository. That text is agent input, and a write-scoped agent
+# acting on untrusted input is a trust decision, not a default. Only enable
+# the schedule on repositories where you accept that tradeoff (for example,
+# private repos, or public repos where only trusted collaborators can open
+# issues and PRs), and never add a `pull_request_target` trigger to this
+# workflow: that event runs with the base repository's secrets and write
+# token on behalf of fork-authored changes.
+#
 # Disabled by default. To enable on your fork:
 #   1. Uncomment the `schedule:` block below.
 #   2. Add a `CLAUDE_API_KEY` secret to the repository
