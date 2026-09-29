@@ -808,7 +808,7 @@ _check_champion_hold_state_staleness() {
 _check_loom_pr_label() {
   local msg rc=0 flags=()
   [[ "$ALLOW_UNAPPROVED" == "true" ]] && flags+=(--allow-unapproved)
-  msg="$(printf '%s\n' "$PR_LABELS" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr loom-pr-guard --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" "${flags[@]}" 2>/dev/null)" || rc=$?
+  msg="$(printf '%s\n' "$PR_LABELS" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr loom-pr-guard --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" ${flags[@]+"${flags[@]}"} 2>/dev/null)" || rc=$?
   if [[ $rc -eq 0 && "$msg" == "LOOM-PR-GUARD-CLEAN" ]]; then
     _check_champion_hold_state_staleness
     return 0
