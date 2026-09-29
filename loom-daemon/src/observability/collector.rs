@@ -488,6 +488,9 @@ fn terminal_records(
             lines_added: None,
             lines_deleted: None,
             tokens_by_model: None,
+            // Issue #9443: no phase entries and no sweep totals here, so there
+            // is nothing to take a per-phase remainder of.
+            tokens_unattributed: None,
             failure_class: None,
             models_used: None,
             doctor_cycles: None,

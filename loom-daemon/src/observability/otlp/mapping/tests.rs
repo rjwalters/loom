@@ -107,14 +107,8 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             effort: Some("high".to_string()),
             config,
             phase_durations: vec![
-                PhaseDuration {
-                    phase: "curator".to_string(),
-                    duration_sec: 12,
-                },
-                PhaseDuration {
-                    phase: "builder".to_string(),
-                    duration_sec: 340,
-                },
+                PhaseDuration::new("curator".to_string(), 12),
+                PhaseDuration::new("builder".to_string(), 340),
             ],
             total_duration_sec: 512,
             result: SweepResult::Success,
@@ -124,6 +118,7 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             lines_added: None,
             lines_deleted: None,
             tokens_by_model: None,
+            tokens_unattributed: None,
             // Issue #8507: this fixture is a Claude sweep, which writes no
             // launch record — so all three stay absent.
             runtime: None,

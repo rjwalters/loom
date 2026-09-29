@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::sweep_experiment::ModelUsageTotals;
@@ -54,6 +55,22 @@ pub struct UsageRecord {
     pub cache_write_5m: i64,
     pub cache_write_1h: i64,
     pub output: i64,
+}
+
+impl UsageRecord {
+    /// [`timestamp`](Self::timestamp) parsed to an instant, or `None` when the
+    /// record carried none or carried one that is not RFC 3339 (Issue #9443).
+    ///
+    /// An absent instant is what makes a record **unattributable** to any
+    /// per-phase window: it is counted in the sweep's totals and reported in
+    /// `tokens_unattributed`, never guessed into a phase.
+    #[must_use]
+    pub fn at(&self) -> Option<DateTime<Utc>> {
+        let raw = self.timestamp.as_deref()?;
+        DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|t| t.with_timezone(&Utc))
+    }
 }
 
 /// Decode one already-parsed transcript record, or `None` when it carries no
@@ -202,22 +219,53 @@ impl UsageFold {
     /// tuple.
     #[must_use]
     pub fn rows(&self) -> Vec<ModelUsageTotals> {
-        let mut totals: BTreeMap<(String, String, String), ModelUsageTotals> = BTreeMap::new();
-        for rec in &self.messages {
-            let key = (rec.model.clone(), rec.speed.clone(), rec.service_tier.clone());
-            let entry = totals.entry(key).or_insert_with(|| ModelUsageTotals {
-                model: rec.model.clone(),
-                speed: rec.speed.clone(),
-                service_tier: rec.service_tier.clone(),
-                ..ModelUsageTotals::default()
-            });
-            entry.input += rec.input;
-            entry.cache_read += rec.cache_read;
-            entry.cache_write_5m += rec.cache_write_5m;
-            entry.cache_write_1h += rec.cache_write_1h;
-            entry.output += rec.output;
-        }
+        let mut totals = BTreeMap::new();
+        merge_records(&mut totals, &self.messages);
         totals.into_values().collect()
+    }
+
+    /// The deduped messages, one per distinct `message.id` (plus every id-less
+    /// record), in first-seen order — exposed for per-phase attribution (Issue
+    /// #9443).
+    ///
+    /// The load-bearing property: because dedupe has already happened, Σ over
+    /// **any partition** of this slice (via [`merge_records`]) equals
+    /// [`rows`](Self::rows) exactly. That is what lets a caller split one
+    /// transcript's usage into per-phase windows and still reconcile against
+    /// the sweep total — splitting the raw lines instead would double-count a
+    /// streamed message whose chunks straddle a phase boundary.
+    ///
+    /// A deduped message keeps the `timestamp` of its **first** chunk (see
+    /// [`add`](Self::add)), so [`UsageRecord::at`] is the instant the message
+    /// started, and a message is attributed wholly to the phase it started in.
+    #[must_use]
+    pub fn messages(&self) -> &[UsageRecord] {
+        &self.messages
+    }
+}
+
+/// Accumulate already-deduped [`UsageRecord`]s into the per-`(model, speed,
+/// service_tier)` accumulator `into` — the grouping [`UsageFold::rows`]
+/// performs, exposed (Issue #9443) so a caller partitioning one fold's
+/// [`messages`](UsageFold::messages) across several buckets groups them
+/// identically in each.
+pub fn merge_records<'a>(
+    into: &mut BTreeMap<(String, String, String), ModelUsageTotals>,
+    records: impl IntoIterator<Item = &'a UsageRecord>,
+) {
+    for rec in records {
+        let key = (rec.model.clone(), rec.speed.clone(), rec.service_tier.clone());
+        let entry = into.entry(key).or_insert_with(|| ModelUsageTotals {
+            model: rec.model.clone(),
+            speed: rec.speed.clone(),
+            service_tier: rec.service_tier.clone(),
+            ..ModelUsageTotals::default()
+        });
+        entry.input += rec.input;
+        entry.cache_read += rec.cache_read;
+        entry.cache_write_5m += rec.cache_write_5m;
+        entry.cache_write_1h += rec.cache_write_1h;
+        entry.output += rec.output;
     }
 }
 

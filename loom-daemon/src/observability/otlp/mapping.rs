@@ -289,25 +289,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 attributes.push(kv_int("loom.pr_number", i64::from(pr_number)));
             }
             attributes.extend(metadata::outcome(r));
-            if !r.phase_durations.is_empty() {
-                let entries = r
-                    .phase_durations
-                    .iter()
-                    .map(|phase_duration| AnyValue {
-                        value: Some(any_value::Value::KvlistValue(KeyValueList {
-                            values: vec![
-                                kv_string("phase", phase_duration.phase.clone()),
-                                kv_int("duration_sec", phase_duration.duration_sec),
-                            ],
-                        })),
-                    })
-                    .collect();
-                attributes.push(kv(
-                    "loom.phase_durations",
-                    AnyValue {
-                        value: Some(any_value::Value::ArrayValue(ArrayValue { values: entries })),
-                    },
-                ));
+            if let Some(phases) = metadata::phase_durations(&r.phase_durations) {
+                attributes.push(phases);
             }
             (
                 "sweep.outcome",

@@ -327,15 +327,88 @@ pub enum SweepResult {
     Blocked,
 }
 
-/// The wall-clock duration a sweep spent in one named lifecycle phase — the unit
-/// [`SweepOutcomeRecord::phase_durations`] is a list of.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One attempt at one named lifecycle phase — the unit
+/// [`SweepOutcomeRecord::phase_durations`] is a list of: how long it took and
+/// (Issue #9443) what it cost.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PhaseDuration {
     /// Lifecycle phase name (e.g. `"curator"`, `"builder"`, `"judge"`,
     /// `"doctor"`, `"merge"`).
     pub phase: String,
     /// Seconds spent in this phase.
     pub duration_sec: i64,
+    /// Which attempt at this phase this entry is: **1-based per phase name**
+    /// within the record (Issue #9443), the same numbering convention
+    /// [`JudgeVerdict::attempt`] uses. A `curator → builder → judge → doctor →
+    /// judge` lifecycle yields `judge` attempt 1 and `judge` attempt 2, so
+    /// "the *first* judge" — the clean-landing discriminator #9430 needs — is
+    /// addressable rather than collapsed into a total.
+    ///
+    /// Omitted (never a fabricated `1`) on a record written before #9443, so a
+    /// consumer can tell "attempt 1 of 1" from "this journal predates attempt
+    /// numbering".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// Input-side tokens this phase attempt consumed, on exactly the axis
+    /// [`SweepOutcomeRecord::tokens_in`] uses (Issue #9443) — attributed by
+    /// each transcript record's own timestamp against this phase's sampled
+    /// window, so the entries sum into the sweep total rather than being a
+    /// second, independently-scraped measurement.
+    ///
+    /// Omitted — **never `0`** — when this phase attempt's usage is unknown: no
+    /// attributable transcript, a runtime whose store carries no per-record
+    /// instant, or a phase window the sampler never observed. Whatever is
+    /// missing is reported in [`SweepOutcomeRecord::tokens_unattributed`], so
+    /// "this phase was free" and "this phase was not measured" never look
+    /// alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u64>,
+    /// Output-side tokens for the same attempt, on
+    /// [`SweepOutcomeRecord::tokens_out`]'s axis. Same omission contract as
+    /// `tokens_in`, and always present or absent together with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u64>,
+    /// The same attempt's usage grouped by `(model, speed, service_tier)`
+    /// instead of flattened — the per-phase counterpart of
+    /// [`SweepOutcomeRecord::tokens_by_model`], and what makes a phase's cost
+    /// priceable when the Doctor ladder ran it on a different model than the
+    /// Builder. Same omission contract as `tokens_in`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_by_model: Option<Vec<ModelUsageTotals>>,
+}
+
+impl PhaseDuration {
+    /// A duration-only entry, with every #9443 usage field absent.
+    #[must_use]
+    pub fn new(phase: impl Into<String>, duration_sec: i64) -> Self {
+        Self {
+            phase: phase.into(),
+            duration_sec,
+            ..Self::default()
+        }
+    }
+
+    /// This entry's `(tokens_in, tokens_out)` when both are known.
+    #[must_use]
+    pub fn token_split(&self) -> Option<(u64, u64)> {
+        Some((self.tokens_in?, self.tokens_out?))
+    }
+}
+
+/// An input/output token pair on [`SweepOutcomeRecord::tokens_in`]/`tokens_out`'s
+/// axes (Issue #9443) — the shape
+/// [`SweepOutcomeRecord::tokens_unattributed`] reports the per-phase
+/// attribution's remainder in.
+///
+/// Both counters are required *within* the struct: the whole value is optional
+/// on the record, and it is only ever built when the sweep totals are known, so
+/// there is no state in which one axis is measured and the other is not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenTotals {
+    /// Input-side tokens, as [`SweepOutcomeRecord::tokens_in`] counts them.
+    pub tokens_in: u64,
+    /// Output-side tokens, as [`SweepOutcomeRecord::tokens_out`] counts them.
+    pub tokens_out: u64,
 }
 
 /// `sweep.started` — a sweep began work on an issue.
@@ -456,7 +529,12 @@ pub struct SweepOutcomeRecord {
     /// every time an operator-tunable field is added.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub config: std::collections::BTreeMap<String, String>,
-    /// Per-phase wall-clock durations, in lifecycle order.
+    /// Per-phase-attempt breakdown, in lifecycle order: wall-clock duration
+    /// plus (Issue #9443) that attempt's own token usage. A phase that ran twice
+    /// — the Judge↔Doctor cycle — is two entries distinguished by
+    /// [`PhaseDuration::attempt`], never one collapsed total, which is what
+    /// makes clean-landing cost (curator + builder + *first* judge) separable
+    /// from rework cost.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phase_durations: Vec<PhaseDuration>,
     /// Total wall-clock seconds from dispatch to terminal outcome.
@@ -510,6 +588,30 @@ pub struct SweepOutcomeRecord {
     /// rather than re-deriving it from a reconstructed window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_by_model: Option<Vec<ModelUsageTotals>>,
+    /// The part of `tokens_in`/`tokens_out` that **no** `phase_durations` entry
+    /// accounts for (Issue #9443), so the per-phase breakdown is a partition of
+    /// the sweep total rather than an unreconciled second measurement:
+    ///
+    /// ```text
+    /// Σ phase_durations[*].tokens_in  + tokens_unattributed.tokens_in  == tokens_in
+    /// Σ phase_durations[*].tokens_out + tokens_unattributed.tokens_out == tokens_out
+    /// ```
+    ///
+    /// The remainder is real, not slop. It collects the trailing in-flight
+    /// segment (from the last observed phase completion to the terminal
+    /// transition, which the sampler cannot name a phase for — the same segment
+    /// `phase_durations` already declines to attribute), every transcript record
+    /// carrying no usable `timestamp`, and — for a runtime whose usage store has
+    /// no per-record instant, or a sweep whose phase transitions were never
+    /// sampled — the *whole* total. That last case is the point of the field:
+    /// unmeasured per-phase usage shows up here as an explicit remainder instead
+    /// of as phases reporting `0`.
+    ///
+    /// Omitted when `tokens_in`/`tokens_out` are themselves unknown: there is no
+    /// total to take a remainder of, and `0` would claim the phases account for
+    /// everything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_unattributed: Option<TokenTotals>,
     /// Terminal failure classification (Issue #8056), copied verbatim at emit
     /// time from the SAME terminal transition's sibling
     /// [`crate::sweep_outcomes::OutcomeRecord`] — its `death_class` (the

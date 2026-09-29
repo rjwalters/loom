@@ -533,21 +533,29 @@ impl SweepRegistry {
         // restart, or one that died before the first reaper tick): a single
         // best-effort entry naming the last known phase, attributed the whole
         // duration. Empty when neither is available, never a fabricated phase.
-        let phase_durations = started_at
-            .map(|started_at| self.phase_durations_for(sweep_id, started_at))
+        //
+        // Issue #9443 keeps the sampled *windows*, not just their lengths, so
+        // the per-phase token fold below covers exactly the intervals these
+        // durations measure. The fallback entry has no sampled window at all, so
+        // it stays usage-less: attributing the whole sweep's tokens to the one
+        // phase that happened to be observed last would be a fabrication, and
+        // the sweep ran the earlier phases too. That shortfall is reported in
+        // `tokens_unattributed` instead.
+        let phase_windows = started_at
+            .map(|started_at| self.phase_windows_for(sweep_id, started_at))
             .unwrap_or_default();
-        let phase_durations = if phase_durations.is_empty() {
-            latest_phase
+        let mut phase_durations: Vec<telemetry::PhaseDuration> =
+            phase_windows.iter().map(PhaseWindow::to_duration).collect();
+        if phase_durations.is_empty() {
+            phase_durations = latest_phase
                 .map(|phase| {
                     vec![telemetry::PhaseDuration {
-                        phase: phase_label(&phase).to_string(),
-                        duration_sec,
+                        attempt: Some(1),
+                        ..telemetry::PhaseDuration::new(phase_label(&phase), duration_sec)
                     }]
                 })
-                .unwrap_or_default()
-        } else {
-            phase_durations
-        };
+                .unwrap_or_default();
+        }
 
         // The sweep's own PR, taken from the checkpoint values sampled while it
         // ran (free), falling back to the checkpoint still on disk for a sweep
@@ -674,6 +682,59 @@ impl SweepRegistry {
         // (Issue #8056) — see `models_used_from`.
         let models_used = models_used_from(tokens_by_model.as_deref());
 
+        // Per-phase-attempt usage (Issue #9443): the same read, the same
+        // runtime-dispatched source, and the same overall window as
+        // `tokens_by_model` above — folded over each sampled phase window
+        // instead of the sweep as a whole, so clean-landing cost (curator +
+        // builder + FIRST judge) is separable from Doctor/re-judge rework cost.
+        //
+        // Deliberately derived from the per-model rows rather than measured on a
+        // second axis: `TokenUsage::split` is `tokens_in`/`tokens_out`'s own
+        // definition, so Σ phases + `tokens_unattributed` reconciles against the
+        // sweep totals by construction.
+        let phase_slices: Vec<(DateTime<Utc>, DateTime<Utc>)> =
+            phase_windows.iter().map(|w| (w.start, w.end)).collect();
+        let phase_usage = started_at
+            .map(|started_at| {
+                crate::usage_source::sweep_tokens_by_window(
+                    usage_runtime.as_deref(),
+                    &self.config.workspace_root,
+                    issue,
+                    Some((started_at, Utc::now())),
+                    &phase_slices,
+                )
+            })
+            .unwrap_or_default();
+        for (entry, rows) in phase_durations.iter_mut().zip(phase_usage) {
+            let Some(rows) = rows.filter(|rows| !rows.is_empty()) else {
+                continue;
+            };
+            let (tokens_in, tokens_out) =
+                crate::observability::runtime_usage::TokenUsage::from_models(&rows).split();
+            entry.tokens_in = Some(tokens_in);
+            entry.tokens_out = Some(tokens_out);
+            entry.tokens_by_model = Some(rows);
+        }
+
+        // The remainder no phase entry accounts for (Issue #9443). Present only
+        // when the sweep's own totals are known — with nothing to take a
+        // remainder of, `0` would falsely claim the phases cover everything.
+        // Saturating: the two sides are folded from the same file set with the
+        // same dedupe, so the subtraction cannot legitimately go negative, and
+        // clamping is preferable to wrapping if a future source breaks that.
+        let tokens_unattributed = tokens_in.zip(tokens_out).map(|(total_in, total_out)| {
+            let (attributed_in, attributed_out) = phase_durations
+                .iter()
+                .filter_map(telemetry::PhaseDuration::token_split)
+                .fold((0u64, 0u64), |(sum_in, sum_out), (tin, tout)| {
+                    (sum_in.saturating_add(tin), sum_out.saturating_add(tout))
+                });
+            telemetry::TokenTotals {
+                tokens_in: total_in.saturating_sub(attributed_in),
+                tokens_out: total_out.saturating_sub(attributed_out),
+            }
+        });
+
         // Judge verdicts + completed Doctor cycles (Issue #8222), read off the
         // forge label timeline of the PR resolved just above — NOT off the
         // sampled phase history the `doctor_cycles` proxy used through #8056.
@@ -718,6 +779,7 @@ impl SweepRegistry {
             lines_added,
             lines_deleted,
             tokens_by_model,
+            tokens_unattributed,
             failure_class,
             models_used,
             doctor_cycles,
@@ -780,6 +842,29 @@ impl SweepRegistry {
         if let Some(cycles) = outcome_record.doctor_cycles {
             metadata.insert("loom.doctor_cycles".into(), cycles.to_string());
         }
+        // #9443: the same per-phase numbers `phase_durations` carries, on the
+        // execution's own `loom.role_attempt` spans, so the D1/JSONL path and
+        // the OTLP path report one set of per-phase costs. Before
+        // `finish_sweep`/`finish_execution`, which retire the journal.
+        let phase_usage_spans: Vec<crate::observability::runtime_usage::PhaseUsage<'_>> =
+            phase_windows
+                .iter()
+                .zip(&outcome_record.phase_durations)
+                .filter_map(|(window, entry)| {
+                    Some(crate::observability::runtime_usage::PhaseUsage {
+                        role: entry.phase.as_str(),
+                        attempt: entry.attempt.unwrap_or(1),
+                        window: (window.start, window.end),
+                        rows: entry.tokens_by_model.as_deref()?,
+                    })
+                })
+                .collect();
+        crate::observability::runtime_usage::record_phase_usage(
+            &self.config.workspace_root,
+            sweep_id,
+            &phase_usage_spans,
+            outcome_record.runtime.as_deref(),
+        );
         // #8908: this execution's exact token usage, joined to its trace.
         crate::observability::runtime_usage::finish_sweep(
             &self.config.workspace_root,
@@ -1004,41 +1089,84 @@ impl SweepRegistry {
     }
 
     /// Build the `sweep.outcome` record's per-phase breakdown from the
-    /// transition history sampled for `sweep_id` (Issue #4704).
+    /// transition history sampled for `sweep_id` (Issue #4704), as attribution
+    /// *windows* rather than bare lengths (Issue #9443) so the durations and the
+    /// per-phase token fold can never describe different intervals.
     ///
     /// The checkpoint markers are phase *completions* (`curator-done` means the
-    /// Curator phase finished), so the duration attributed to a phase is the
-    /// interval ending at its own observation and beginning at the previous
-    /// observation — or at `started_at` for the first. A phase that appears
-    /// twice in one lifecycle (the Judge↔Doctor cycle) yields two entries, in
-    /// lifecycle order, which is more faithful than collapsing them.
+    /// Curator phase finished), so the interval attributed to a phase ends at its
+    /// own observation and begins at the previous observation — or at
+    /// `started_at` for the first. A phase that appears twice in one lifecycle
+    /// (the Judge↔Doctor cycle) yields two windows, in lifecycle order and
+    /// distinguished by a 1-based-per-phase [`PhaseWindow::attempt`], which is
+    /// more faithful than collapsing them and is what makes "the *first* judge"
+    /// addressable.
     ///
     /// The trailing in-flight segment — from the last observed completion to
     /// the terminal transition — is deliberately **not** emitted: the daemon
     /// does not know which phase the sweep was in, and inventing one would be a
-    /// fabricated label. So the entries sum to at most `total_duration_sec`,
-    /// never more.
-    pub(crate) fn phase_durations_for(
+    /// fabricated label. So the windows cover at most `total_duration_sec`, never
+    /// more, and the tokens spent in that segment land in
+    /// [`telemetry::SweepOutcomeRecord::tokens_unattributed`].
+    ///
+    /// Empty when this sweep's transition history was never sampled (a daemon
+    /// restart mid-sweep, a sweep that died before the first reaper tick) — the
+    /// caller then has no window to attribute anything to, which is why such a
+    /// record's fallback single entry carries no usage.
+    pub(crate) fn phase_windows_for(
         &self,
         sweep_id: &str,
         started_at: DateTime<Utc>,
-    ) -> Vec<telemetry::PhaseDuration> {
+    ) -> Vec<PhaseWindow> {
         let Some(history) = self.phase_history.get(sweep_id) else {
             return Vec::new();
         };
-        let mut out = Vec::with_capacity(history.len());
+        let mut out: Vec<PhaseWindow> = Vec::with_capacity(history.len());
         let mut prev = started_at;
         for observation in history {
-            // `max(0)` guards against a clock step between observations; a
-            // negative duration on the wire would be nonsense to any consumer.
-            let duration_sec = (observation.at - prev).num_seconds().max(0);
-            out.push(telemetry::PhaseDuration {
-                phase: phase_label(&observation.phase).to_string(),
-                duration_sec,
+            let phase = phase_label(&observation.phase).to_string();
+            let attempt = u32::try_from(out.iter().filter(|w| w.phase == phase).count())
+                .unwrap_or(u32::MAX - 1)
+                .saturating_add(1);
+            out.push(PhaseWindow {
+                phase,
+                attempt,
+                // `max(prev)` guards against a clock step between observations;
+                // an end before its own start would be nonsense to a consumer
+                // and would make the window fold nothing.
+                start: prev,
+                end: observation.at.max(prev),
             });
             prev = observation.at;
         }
         out
+    }
+}
+
+/// One sampled phase attempt's attribution window (Issue #9443).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PhaseWindow {
+    /// The normalized lifecycle phase name ([`phase_label`]).
+    pub(crate) phase: String,
+    /// 1-based index among this record's entries for the same `phase`.
+    pub(crate) attempt: u32,
+    /// The previous observation's instant (or the sweep's start, for the first).
+    pub(crate) start: DateTime<Utc>,
+    /// This observation's instant. Never before `start`.
+    pub(crate) end: DateTime<Utc>,
+}
+
+impl PhaseWindow {
+    /// The duration-only `phase_durations` entry for this window; usage fields
+    /// are filled in afterwards, once the usage source is known.
+    pub(crate) fn to_duration(&self) -> telemetry::PhaseDuration {
+        telemetry::PhaseDuration {
+            attempt: Some(self.attempt),
+            ..telemetry::PhaseDuration::new(
+                self.phase.clone(),
+                (self.end - self.start).num_seconds().max(0),
+            )
+        }
     }
 }
 
@@ -1086,6 +1214,17 @@ mod credential_tests;
     unused_imports
 )]
 mod runtime_tests;
+
+// Per-phase token attribution + `tokens_unattributed` (#9443), in its own
+// sibling module for the same file-size reason as `runtime_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod phase_usage_tests;
 
 // Tap-attributed usage accounting (#8556) end-to-end across both terminal
 // journals, in its own sibling module for the same file-size reason.
