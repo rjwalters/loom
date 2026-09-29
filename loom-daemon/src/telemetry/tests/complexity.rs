@@ -41,6 +41,7 @@ fn sweep_outcome_omits_complexity_when_no_marker_was_read() {
         lines_added: None,
         lines_deleted: None,
         tokens_by_model: None,
+        tokens_unattributed: None,
         failure_class: None,
         models_used: None,
         doctor_cycles: None,

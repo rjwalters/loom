@@ -4,7 +4,7 @@ use super::{
     any_string, any_value, kv, kv_int, kv_string, AnyValue, ArrayValue, KeyValue, KeyValueList,
 };
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
-use crate::telemetry::SweepOutcomeRecord;
+use crate::telemetry::{PhaseDuration, SweepOutcomeRecord};
 const MAX_GROUPS: usize = 64;
 const MAX_STRING_BYTES: usize = 256;
 
@@ -60,6 +60,54 @@ pub(super) fn usage(rows: Option<&[ModelUsageTotals]>) -> Option<KeyValue> {
                     kv_int("cache_write_1h", r.cache_write_1h),
                     kv_int("output", r.output),
                 ])
+            })
+            .collect(),
+    ))
+}
+
+/// `loom.phase_durations` (Issue #9443): the per-phase-attempt breakdown, each
+/// entry carrying its `attempt` index and token split beside its duration.
+///
+/// Absent-not-zero is preserved per key: a phase whose usage was not measured
+/// emits `phase`/`duration_sec` alone, so a consumer summing `tokens_in` over
+/// these entries and comparing against `loom.tokens_in` sees the shortfall
+/// (reported explicitly as `loom.tokens_unattributed_in`) rather than a phase
+/// claiming it was free.
+///
+/// Per-phase `tokens_by_model` is deliberately **not** exported here: it would
+/// nest an array of kvlists inside an array of kvlists, and the per-phase model
+/// breakdown already reaches OTLP the better way — as this sweep's
+/// `loom.runtime.usage` spans with `loom.usage.scope=attempt`, one per model
+/// under each `loom.role_attempt`.
+pub(super) fn phase_durations(entries: &[PhaseDuration]) -> Option<KeyValue> {
+    if entries.is_empty() {
+        return None;
+    }
+    if entries.len() > MAX_GROUPS || entries.iter().any(|e| !text(&e.phase)) {
+        log::warn!("observability: invalid or oversized phase durations omitted");
+        return None;
+    }
+    Some(array(
+        "loom.phase_durations",
+        entries
+            .iter()
+            .map(|entry| {
+                let mut values = vec![
+                    kv_string("phase", entry.phase.clone()),
+                    kv_int("duration_sec", entry.duration_sec),
+                ];
+                if let Some(attempt) = entry.attempt {
+                    values.push(kv_int("attempt", i64::from(attempt)));
+                }
+                for (key, value) in [
+                    ("tokens_in", entry.tokens_in),
+                    ("tokens_out", entry.tokens_out),
+                ] {
+                    if let Some(value) = value.and_then(|v| i64::try_from(v).ok()) {
+                        values.push(kv_int(key, value));
+                    }
+                }
+                row(values)
             })
             .collect(),
     ))
@@ -123,6 +171,11 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     for (key, value) in [
         ("loom.tokens_in", record.tokens_in),
         ("loom.tokens_out", record.tokens_out),
+        // Issue #9443: the remainder no phase entry accounts for, exported
+        // alongside the totals so the OTLP side can check the same
+        // Σphases + remainder == total invariant the JSONL record states.
+        ("loom.tokens_unattributed_in", record.tokens_unattributed.map(|t| t.tokens_in)),
+        ("loom.tokens_unattributed_out", record.tokens_unattributed.map(|t| t.tokens_out)),
     ] {
         if let Some(value) = value.and_then(|v| i64::try_from(v).ok()) {
             attrs.push(kv_int(key, value));

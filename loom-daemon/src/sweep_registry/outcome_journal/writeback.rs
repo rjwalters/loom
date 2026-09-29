@@ -367,14 +367,8 @@ mod tests {
             effort: None,
             config: std::collections::BTreeMap::new(),
             phase_durations: vec![
-                telemetry::PhaseDuration {
-                    phase: "curator".to_string(),
-                    duration_sec: 120,
-                },
-                telemetry::PhaseDuration {
-                    phase: "builder".to_string(),
-                    duration_sec: 3600,
-                },
+                telemetry::PhaseDuration::new("curator".to_string(), 120),
+                telemetry::PhaseDuration::new("builder".to_string(), 3600),
             ],
             total_duration_sec: 4000,
             result: telemetry::SweepResult::Success,
@@ -384,6 +378,7 @@ mod tests {
             lines_added: Some(120),
             lines_deleted: Some(30),
             tokens_by_model: None,
+            tokens_unattributed: None,
             failure_class: None,
             models_used: None,
             doctor_cycles: Some(1),

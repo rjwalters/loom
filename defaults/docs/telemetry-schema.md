@@ -442,14 +442,18 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
   "effort": "high",
   "config": { "runtime": "claude" },
   "phase_durations": [
-    { "phase": "curator", "duration_sec": 12 },
-    { "phase": "builder", "duration_sec": 340 }
+    { "phase": "curator", "duration_sec": 12, "attempt": 1, "tokens_in": 4200, "tokens_out": 510 },
+    { "phase": "builder", "duration_sec": 340, "attempt": 1, "tokens_in": 38000, "tokens_out": 4900 },
+    { "phase": "judge", "duration_sec": 60, "attempt": 1, "tokens_in": 3100, "tokens_out": 400 },
+    { "phase": "doctor", "duration_sec": 45, "attempt": 1, "tokens_in": 1800, "tokens_out": 200 },
+    { "phase": "judge", "duration_sec": 20, "attempt": 2 }
   ],
   "total_duration_sec": 512,
   "result": "success",
   "pr_number": 4710,
   "tokens_in": 48213,
   "tokens_out": 6120,
+  "tokens_unattributed": { "tokens_in": 1113, "tokens_out": 110 },
   "lines_added": 214,
   "lines_deleted": 37,
   "tokens_by_model": [
@@ -473,10 +477,10 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
 
 `config` (free-form string map), `phase_durations`, `model`, `effort`,
 `pr_number`, `tokens_in`, `tokens_out`, `lines_added`, `lines_deleted`,
-`tokens_by_model`, `failure_class`, `models_used`, `doctor_cycles`,
-`judge_verdicts`, and `complexity` are omitted when empty/unset. `config` is a
-map — not fixed fields — so operator-tunable knobs can be captured without a
-schema bump.
+`tokens_by_model`, `tokens_unattributed`, `failure_class`, `models_used`,
+`doctor_cycles`, `judge_verdicts`, and `complexity` are omitted when
+empty/unset. `config` is a map — not fixed fields — so operator-tunable knobs
+can be captured without a schema bump.
 
 `tokens_by_model` (Issue #6384) is the same per-model breakdown documented
 under `sweep.completed` above — the same aggregation
@@ -504,6 +508,80 @@ Neither pair is added to the public (unauthenticated, private-repo) redaction
 allowlist — like `pr_number`, they are workload detail about a private repo
 and stay behind the same authenticated-only boundary (see
 `dashboard/src/redaction.ts`).
+
+#### Per-phase token attribution (Issue #9443)
+
+`phase_durations` entries are **per phase attempt**, and each carries that
+attempt's own cost as well as its duration:
+
+| Field | Type | Notes |
+|---|---|---|
+| `phase` | string | The lifecycle phase name, as before (`curator`, `builder`, `judge`, `doctor`, `merge`, …). |
+| `duration_sec` | integer | Wall-clock seconds, as before. |
+| `attempt` | integer | **1-based per phase name** within this record — the same numbering convention `judge_verdicts[].attempt` uses. A `curator → builder → judge(fail) → doctor → judge(pass)` lifecycle yields five entries, with `judge` attempt 1 and `judge` attempt 2 separately addressable. Omitted (never a fabricated `1`) on a record written by a daemon that predates this field, so a consumer can tell "attempt 1 of 1" from "this journal predates attempt numbering". |
+| `tokens_in` | integer | This attempt's input-side tokens, on exactly `tokens_in`'s axis (uncached input + cache reads + cache writes). |
+| `tokens_out` | integer | This attempt's output-side tokens, on `tokens_out`'s axis. Always present or absent together with `tokens_in`. |
+| `tokens_by_model` | array | The same attempt's usage grouped by `(model, speed, service_tier)` — the per-phase counterpart of the record-level `tokens_by_model`, which is what makes a phase priceable when the Doctor ladder ran it on a different model than the Builder. Same presence contract as `tokens_in`. |
+
+**Why per phase.** The record-level totals cannot separate *clean-landing cost*
+(curator + builder + the **first** judge) from *rework cost* (Doctor and
+re-judge loops), because both happen inside one sweep. With `attempt` making the
+first judge addressable and each entry carrying its own usage, both are a
+subtraction rather than a hand-scrape of transcripts.
+
+**The partition invariant.** A sibling field, `tokens_unattributed`
+(`{ "tokens_in": int, "tokens_out": int }`), reports the part of the record-level
+totals that **no** phase entry accounts for, so the breakdown is a partition of
+the sweep total rather than a second, unreconciled measurement:
+
+```text
+Σ phase_durations[*].tokens_in  + tokens_unattributed.tokens_in  == tokens_in
+Σ phase_durations[*].tokens_out + tokens_unattributed.tokens_out == tokens_out
+```
+
+The remainder is real, not slop. It collects the trailing in-flight segment
+(last observed phase completion → terminal transition, the same segment
+`phase_durations` already declines to name a phase for), every transcript record
+carrying no usable `timestamp`, and — for a runtime whose usage store has no
+per-record instant, or a sweep whose transitions were never sampled — the
+**whole** total.
+
+**Unknown is absent, never `0`.** A phase attempt whose usage could not be
+measured omits `tokens_in`/`tokens_out`/`tokens_by_model` entirely; its share
+shows up in `tokens_unattributed` instead, so "this phase was free" and "this
+phase was not measured" never look alike. `tokens_unattributed` is itself
+omitted when `tokens_in`/`tokens_out` are unknown: there is no total to take a
+remainder of, and `0` would claim the phases account for everything. The
+fallback single entry a daemon-restart record falls back to carries **no**
+usage for the same reason — with no sampled window, attributing the whole sweep
+to the one phase that happened to be observed last would be a fabrication.
+
+**Accuracy.** Attribution windows are the sampled phase-transition instants, so
+a phase's tokens are accurate to within one reaper tick — the same caveat
+`phase_durations`' durations already carry (see "**`phase_durations` is
+sampled**" below). Attribution is per transcript **record**, keyed on each
+record's own `timestamp`, after per-message dedupe: a streamed message whose
+chunks straddle a phase boundary is counted once, in the phase it started in,
+which is what keeps the sum from exceeding the total.
+
+**The same numbers reach OTLP.** `loom.phase_durations`' nested entries carry
+`attempt`/`tokens_in`/`tokens_out` (same absent-not-zero discipline), and the
+remainder is exported beside the totals as `loom.tokens_unattributed_in` /
+`loom.tokens_unattributed_out`, so an OTLP consumer can check the same
+invariant. The per-phase `tokens_by_model` breakdown is deliberately **not**
+nested there — it reaches OTLP the better way, as this sweep's
+`loom.runtime.usage` spans with `loom.usage.scope=attempt`, one per model under
+the matching `loom.role_attempt` span (Issue #8525). A phase with no attempt
+span in the trace is skipped rather than given a fabricated parent; the JSONL
+record still reports its usage.
+
+**Redaction.** The nested usage is workload detail about a private repo, exactly
+like the record-level `tokens_in`/`tokens_out` above, so `phase_durations`
+reaches a public, unauthenticated response only through
+`redactPhaseDurations` in `dashboard/src/redaction.ts` — which keeps
+`phase`/`duration_sec`/`attempt` and drops every usage key.
+`tokens_unattributed` is not in the public allowlist at all, being a remainder
+of the same withheld totals.
 
 #### Completeness fields (Issues #8056, #8222, #8542)
 
@@ -1766,7 +1844,11 @@ the earlier observations: such a record falls back to a single best-effort
 entry (last known phase, whole duration) or an empty list, never a fabricated
 phase name. Phase names are the checkpoint markers normalized to lifecycle
 names (`curator-done` → `curator`, `judge-rejected` → `judge`), and a phase
-that runs twice (the Judge↔Doctor cycle) yields two entries in lifecycle order.
+that runs twice (the Judge↔Doctor cycle) yields two entries in lifecycle order,
+distinguished by `attempt`. The **same sampled windows** drive each entry's
+token attribution (Issue #9443), so the durations and the per-phase costs can
+never describe different intervals — and every caveat in this paragraph applies
+to both.
 
 **`pr_number` costs no forge call**: it is captured from the same checkpoint
 read (the sweep skill records `pr_number` from `builder-done` onward), so it

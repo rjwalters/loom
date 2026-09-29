@@ -302,3 +302,130 @@ fn oversized_or_invalid_usage_is_omitted_without_truncating_identity_or_fabricat
         attribute(&map(TelemetryRecord::SweepOutcome(record)), "loom.tokens_by_model").is_none()
     );
 }
+
+/// Issue #9443: the per-phase-attempt breakdown reaches OTLP with the same
+/// absent-vs-zero discipline the JSONL record uses, and the remainder is
+/// exported beside the totals so an OTLP consumer can check
+/// `Σ phases + remainder == total` without the JSONL journal.
+#[test]
+fn per_phase_usage_and_the_unattributed_remainder_reach_otlp_absent_not_zero() {
+    let mut record = outcome_record();
+    // Four measured phases total (330, 33); the fifth (the re-judge) is
+    // unmeasured, so the sweep's own totals exceed them and the remainder — 40
+    // in / 9 out — carries both the re-judge's real spend and the unattributable
+    // trailing segment.
+    record.tokens_in = Some(370);
+    record.tokens_out = Some(42);
+    record.tokens_unattributed = Some(crate::telemetry::TokenTotals {
+        tokens_in: 40,
+        tokens_out: 9,
+    });
+    record.phase_durations = vec![
+        PhaseDuration {
+            attempt: Some(1),
+            tokens_in: Some(10),
+            tokens_out: Some(1),
+            ..PhaseDuration::new("curator", 12)
+        },
+        PhaseDuration {
+            attempt: Some(1),
+            tokens_in: Some(100),
+            tokens_out: Some(10),
+            ..PhaseDuration::new("builder", 340)
+        },
+        PhaseDuration {
+            attempt: Some(1),
+            tokens_in: Some(20),
+            tokens_out: Some(2),
+            ..PhaseDuration::new("judge", 30)
+        },
+        PhaseDuration {
+            attempt: Some(1),
+            tokens_in: Some(200),
+            tokens_out: Some(20),
+            ..PhaseDuration::new("doctor", 90)
+        },
+        // The re-judge: a separate entry with attempt 2, and deliberately
+        // unmeasured — its share is part of the remainder, not a `0`.
+        PhaseDuration {
+            attempt: Some(2),
+            ..PhaseDuration::new("judge", 25)
+        },
+    ];
+    let log = map(TelemetryRecord::SweepOutcome(record));
+    assert_eq!(
+        attribute(&log, "loom.tokens_unattributed_in"),
+        Some(any_value::Value::IntValue(40))
+    );
+    assert_eq!(
+        attribute(&log, "loom.tokens_unattributed_out"),
+        Some(any_value::Value::IntValue(9))
+    );
+    let Some(any_value::Value::ArrayValue(phases)) = attribute(&log, "loom.phase_durations") else {
+        panic!("missing per-phase breakdown")
+    };
+    assert_eq!(phases.values.len(), 5, "judge #1 and judge #2 stay separate entries");
+    let entry = |index: usize| -> Vec<(String, Option<any_value::Value>)> {
+        let Some(any_value::Value::KvlistValue(list)) = &phases.values[index].value else {
+            panic!("phase entry {index} is not a kvlist")
+        };
+        list.values
+            .iter()
+            .map(|kv| (kv.key.clone(), kv.value.as_ref().and_then(|v| v.value.clone())))
+            .collect()
+    };
+    let field = |index: usize, key: &str| -> Option<any_value::Value> {
+        entry(index)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| v)
+    };
+    assert_eq!(field(0, "phase"), Some(any_value::Value::StringValue("curator".into())));
+    assert_eq!(field(0, "duration_sec"), Some(any_value::Value::IntValue(12)));
+    assert_eq!(field(0, "attempt"), Some(any_value::Value::IntValue(1)));
+    assert_eq!(field(0, "tokens_in"), Some(any_value::Value::IntValue(10)));
+    assert_eq!(field(0, "tokens_out"), Some(any_value::Value::IntValue(1)));
+    // The second judge: addressable by `attempt`, and unmeasured — so its token
+    // keys are OMITTED, never published as 0.
+    assert_eq!(field(4, "phase"), Some(any_value::Value::StringValue("judge".into())));
+    assert_eq!(field(4, "attempt"), Some(any_value::Value::IntValue(2)));
+    for key in ["tokens_in", "tokens_out"] {
+        assert!(field(4, key).is_none(), "an unmeasured phase must omit {key}");
+    }
+    // Σ exported phase tokens + the exported remainder == the exported totals.
+    let summed = |key: &str| -> i64 {
+        (0..5)
+            .filter_map(|i| match field(i, key) {
+                Some(any_value::Value::IntValue(v)) => Some(v),
+                _ => None,
+            })
+            .sum()
+    };
+    assert_eq!(
+        (summed("tokens_in") + 40, summed("tokens_out") + 9),
+        (370, 42),
+        "the OTLP side reconciles exactly as the JSONL record does"
+    );
+    assert_eq!(attribute(&log, "loom.tokens_in"), Some(any_value::Value::IntValue(370)));
+
+    // Per-phase `tokens_by_model` is deliberately NOT nested here — it reaches
+    // OTLP as `loom.runtime.usage` spans with `loom.usage.scope=attempt`.
+    let json = serde_json::to_string(&log).unwrap();
+    assert!(!json.contains("tokens_by_model"), "{json}");
+}
+
+/// A control-character or oversized phase name drops the whole attribute rather
+/// than exporting a partial breakdown — same posture as `usage` above.
+#[test]
+fn an_invalid_or_oversized_phase_breakdown_is_omitted_whole() {
+    let mut record = outcome_record();
+    record.phase_durations = vec![PhaseDuration::new("bui\u{0}lder", 1)];
+    assert!(
+        attribute(&map(TelemetryRecord::SweepOutcome(record.clone())), "loom.phase_durations")
+            .is_none()
+    );
+    record.phase_durations = vec![PhaseDuration::new("builder", 1); MAX_GROUPS + 1];
+    assert!(
+        attribute(&map(TelemetryRecord::SweepOutcome(record)), "loom.phase_durations").is_none()
+    );
+}
