@@ -472,6 +472,34 @@ pub fn step_context(
     }
 }
 
+/// A suite span's context inside its run attempt's trace (#9089). Derived from
+/// `(repo, job_id, sanitized suite name)`, following the same determinism rule
+/// as the run, job and step contexts: a replayed or second-host emission of
+/// the same suite is byte-identical in identity, which is what lets the
+/// journal deduplicate on `span|<span_id>`.
+///
+/// The **name** is the identity here, unlike a step's number, because a
+/// suite's position within a shard is not stable: `ci-wired.txt` order and the
+/// `LOOM_CI_SHARD` round robin both shift every entry when one suite is added.
+/// An ordinal-derived id would fork on every manifest edit and make "this
+/// suite's duration over the last week" unanswerable — the exact question the
+/// spans exist for. The name is sanitized *before* derivation so the id
+/// matches the attribute that is actually emitted.
+#[must_use]
+pub fn suite_context(
+    repo: &str,
+    run_id: u64,
+    attempt: u32,
+    job_id: u64,
+    suite: &str,
+) -> TraceContext {
+    let run = run_context(repo, run_id, attempt);
+    TraceContext {
+        span_id: SpanId::derived(&["loom.ci.suite", repo, &job_id.to_string(), suite]),
+        ..run
+    }
+}
+
 fn span_status(conclusion: Option<&str>) -> SpanStatus {
     match conclusion {
         Some("success") => SpanStatus::Ok,
@@ -482,7 +510,7 @@ fn span_status(conclusion: Option<&str>) -> SpanStatus {
 
 /// Span attributes, stamped with the recording daemon's provenance. The
 /// derived IDs stay host-independent; only these attributes name the recorder.
-fn attrs(pairs: Vec<(&str, Option<String>)>) -> TraceAttributes {
+pub(super) fn span_attributes(pairs: Vec<(&str, Option<String>)>) -> TraceAttributes {
     let mut attributes = pairs
         .into_iter()
         .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
@@ -555,7 +583,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         started_at,
         ended_at: completed_at,
         status: span_status(run.conclusion.as_deref()),
-        attributes: attrs(vec![
+        attributes: span_attributes(vec![
             ("loom.repo", Some(repo.full_name.clone())),
             ("loom.repo.visibility", Some(visibility_str(repo.visibility()).to_string())),
             ("loom.ci.run_id", Some(run.id.to_string())),
@@ -579,7 +607,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
     ]
 }
 
-fn visibility_str(visibility: RepoVisibility) -> &'static str {
+pub(super) fn visibility_str(visibility: RepoVisibility) -> &'static str {
     match visibility {
         RepoVisibility::Public => "public",
         RepoVisibility::Private => "private",
@@ -645,7 +673,7 @@ pub fn job_envelopes(
         started_at,
         ended_at: completed_at,
         status: span_status(job.conclusion.as_deref()),
-        attributes: attrs(vec![
+        attributes: span_attributes(vec![
             ("loom.repo", Some(repo.full_name.clone())),
             ("loom.repo.visibility", Some(visibility_str(repo.visibility()).to_string())),
             ("loom.ci.run_id", Some(run.id.to_string())),
@@ -713,7 +741,7 @@ fn step_envelopes(
                 started_at,
                 ended_at,
                 status: span_status(step.conclusion.as_deref()),
-                attributes: attrs(vec![
+                attributes: span_attributes(vec![
                     ("loom.repo", Some(repo.full_name.clone())),
                     ("loom.repo.visibility", Some(visibility_str(repo.visibility()).to_string())),
                     ("loom.ci.run_id", Some(run.id.to_string())),

@@ -76,6 +76,7 @@ pub mod poll;
 pub mod records;
 pub mod state;
 pub mod story;
+pub mod suites;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

@@ -902,8 +902,11 @@ One envelope per completed run attempt (`ci.run`) and per completed job
 `loom.ci.run` / `loom.ci.job` span. All three carry `repo` + `visibility`
 (derived from the repo's `private` flag). Since #9089 each **executed step**
 of a job additionally becomes a span-only envelope (`loom.ci.step`, a child of
-its job span, built from the jobs API's `steps[]` — no log record and no
-metric series, so the record kinds above are unchanged). The full field tables, the
+its job span, built from the jobs API's `steps[]`), and each shell test suite a
+sharded `Shell Test Suites` leg ran becomes one more (`loom.ci.suite`, also a
+child of that job span, built from the leg's uploaded timings artifact) — both
+span-only, no log record and no metric series, so the record kinds above are
+unchanged. The full field tables, the
 exactly-once ledger contract and the `loom.ci.*` allowlist live in
 [`ci-observability.md`](ci-observability.md). They are not duplicated here.
 

@@ -152,6 +152,16 @@ pub const CI_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     // and needs no trace join.
     "loom.ci.step",
     "loom.ci.step_number",
+    // `loom.ci.suite` span only (#9089): which shell test suite of its sharded
+    // job this is, from the timings artifact `run-ci-suites.sh` uploads. The
+    // outcome has its own key rather than reusing `loom.ci.conclusion`: that
+    // one carries GitHub's vocabulary (`success`/`failure`/…) everywhere else,
+    // and mixing a suite's `pass`/`fail`/`skip` into it would corrupt every
+    // group-by over it. Like a step span, a suite span also repeats its job's
+    // identity and shard trio.
+    "loom.ci.suite",
+    "loom.ci.suite.outcome",
+    "loom.ci.suite.retried",
 ];
 
 /// The low-cardinality metric label allowlist for the two CI duration

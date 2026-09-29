@@ -76,6 +76,19 @@ impl GithubApi for CreatedFiltering {
     fn get_document(&self, path: &str) -> Result<ApiResponse, ApiError> {
         self.fixture.get_document(path)
     }
+
+    /// Forwarded, not defaulted (#9089): the default refuses, which would make
+    /// this module's span totals differ from every other module's for a reason
+    /// that has nothing to do with the re-run window under test.
+    fn download_artifact(
+        &self,
+        repo: &str,
+        run_id: u64,
+        name: &str,
+        dest: &std::path::Path,
+    ) -> Result<(), ApiError> {
+        self.fixture.download_artifact(repo, run_id, name, dest)
+    }
 }
 
 /// The floor is the watermark or the trailing rescan window, whichever is
