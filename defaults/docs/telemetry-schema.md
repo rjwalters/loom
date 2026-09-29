@@ -912,11 +912,32 @@ the terminal outcome samples the file for its own issue and window. The
 default classification when the writer omits one: `rejudge` ⇒
 **`substantive`** (the work was hard); `rebase`, `merge_conflict`,
 `ci_rerun` ⇒ **`environmental`** (the ground moved). Absent (never `[]`)
-when no event was marked. *Writer status:* the daemon side (reader,
-classification, rollup) is shipped; the first writer is the merge path's
-stale-base handling, whose wiring is deliberately a follow-up —
-`merge-pr.sh` is at the file-size ratchet, and the shell-language policy
-points that handling at a `loom-daemon` subcommand first.
+when no event was marked.
+
+*Writers.* The marker is appended by **`loom-daemon record-rework`**
+(`--kind` ∈ the four above, `--issue N` or `--branch feature/issue-N`,
+optional `--reason` / `--classification` / `--duration-sec`). It **always
+exits 0** — a marker is telemetry attached to an operation that matters, so
+an unwritable log directory or an unresolvable issue prints a reason and
+records nothing rather than failing the merge it describes; an unknown
+`kind`/`classification` is a clap-level argument error (exit 2), because a
+typo that widens the vocabulary is a silent cardinality leak into every
+rollup. Format, vocabulary and writer live in
+`loom-daemon/src/rework_events.rs`; the reader
+(`sweep_registry::outcome_journal::rework`) delegates to it for the path and
+the classification table, so the two ends cannot drift.
+
+The first caller is `merge-pr.sh`, at two sites (#9444): a **`rebase`** when
+the merge retry loop syncs a base branch that moved under the PR
+(`--duration-sec` is the settle wait it slept, the only measured part), and
+a **`merge_conflict`** when it refuses a PR whose `mergeable=false` was
+*corroborated* by a local `git merge-tree` check. The uncorroborated refusal
+— "the forge's cached state is stale/unknown" — is deliberately **not**
+marked: that is "nobody could tell", not "this branch conflicts", and
+marking it would inflate the environmental bucket with unanswered checks.
+Still unwritten, and the natural next callers: `rejudge` (a Doctor claimed
+for `loom:changes-requested`), `ci_rerun`, and a `merge_conflict` from a
+Doctor claimed for `loom:merge-conflict`.
 
 **PR linkage and the model that ran** (Issue #9465): `pr_numbers` (integer
 array, first-seen order) lists every PR the sweep's lifecycle was observed to

@@ -1,10 +1,12 @@
-//! The in-sweep **rework event** marker protocol (Issue #9444).
+//! The **reader** half of the in-sweep rework-event marker protocol (Issue
+//! #9444).
 //!
-//! Only the code path that *performs* a rework knows it happened — today the
-//! merge path's stale-base handling (`merge-pr.sh`'s rebase-before-merge),
-//! tomorrow the doctor-claim and CI-fix paths. The daemon cannot observe
-//! those from outside, so the protocol is a tiny append-only marker file the
-//! performing path writes and the terminal outcome samples:
+//! Only the code path that *performs* a rework knows it happened — the merge
+//! path's stale-base sync and conflict refusal (`merge-pr.sh`, via
+//! `loom-daemon record-rework`), and the doctor-claim / CI-fix paths after it.
+//! The daemon cannot observe those from outside, so the protocol is a tiny
+//! append-only marker file the performing path writes and the terminal outcome
+//! samples:
 //!
 //! ```text
 //! <workspace_root>/.loom/logs/sweep-rework-events.jsonl
@@ -16,42 +18,22 @@
 //! is what scopes an event to a sweep's window — an event without `at` is
 //! delivered to the issue's next terminal sweep, whatever it is. The
 //! daemon-side reader here never rewrites the file: events are filtered by
-//! issue + window, and the classification table below fills the default when
-//! the writer did not classify. Lines that fail to parse are skipped, never
-//! fatal — a half-written line (the writer crashed mid-append) must not take
-//! the outcome journal down.
+//! issue + window, and [`crate::rework_events::default_classification`] fills
+//! the default when the writer did not classify. Lines that fail to parse are
+//! skipped, never fatal — a half-written line (the writer crashed mid-append)
+//! must not take the outcome journal down. A *foreign* writer's kind is
+//! accepted and classified by the table's catch-all; only
+//! [`crate::rework_events::append`] (this repo's own writer) refuses one.
 //!
-//! The vocabulary and the substantive/environmental table are normative in
-//! `telemetry-schema.md`.
+//! The shared half of the protocol — the path, the `kind` vocabulary, the
+//! classification table, and the writer — lives in [`crate::rework_events`],
+//! so the two ends cannot drift. The vocabulary and the
+//! substantive/environmental table are normative in `telemetry-schema.md`.
 
 use chrono::{DateTime, Utc};
 
+pub(crate) use crate::rework_events::{default_classification, path as rework_events_path};
 use crate::telemetry::ReworkEvent;
-
-/// Where the markers live, under the workspace root.
-pub(crate) const REWORK_EVENTS_FILENAME: &str = "sweep-rework-events.jsonl";
-
-/// The default substantive/environmental classification per rework kind
-/// (Issue #9444's table): a judge asking for real changes or a re-judge is
-/// the work being hard; the ground moving (main advanced, a conflict, CI
-/// flake) is the environment.
-#[must_use]
-pub(crate) fn default_classification(kind: &str) -> &'static str {
-    match kind {
-        "rejudge" => "substantive",
-        "rebase" | "merge_conflict" | "ci_rerun" => "environmental",
-        _ => "environmental",
-    }
-}
-
-/// Path of the marker file for `workspace_root`.
-#[must_use]
-pub(crate) fn rework_events_path(workspace_root: &std::path::Path) -> std::path::PathBuf {
-    workspace_root
-        .join(".loom")
-        .join("logs")
-        .join(REWORK_EVENTS_FILENAME)
-}
 
 /// Read this issue's rework events inside `[window_start, now]`. Best-effort
 /// and order-preserving: a missing file, an unreadable line, or a bad
@@ -172,5 +154,66 @@ mod tests {
         assert_eq!(default_classification("rebase"), "environmental");
         assert_eq!(default_classification("merge_conflict"), "environmental");
         assert_eq!(default_classification("ci_rerun"), "environmental");
+    }
+
+    /// The protocol closes: what [`crate::rework_events::append`] writes is
+    /// what this reader returns, for **every** kind in the vocabulary.
+    ///
+    /// Before #9444's writer slice, `read_rework_events` was the only
+    /// participant in this protocol — nothing wrote the file, so
+    /// `rework_events` could only ever be absent and every rollup over it
+    /// reported a fleet with no rework. Nothing failed; the number was simply
+    /// always zero. This test is the thing that stays true once both halves
+    /// exist: it drives the real writer rather than a restatement of its
+    /// output format, so a field the writer renames fails here instead of
+    /// silently reading back as an unclassified event.
+    #[test]
+    fn what_the_writer_writes_is_what_the_reader_reads() {
+        use crate::rework_events::{append, Marker, KINDS};
+
+        let dir = TempDir::new().unwrap();
+        let before = Utc::now();
+        for kind in KINDS {
+            append(
+                dir.path(),
+                &Marker {
+                    issue: 9444,
+                    kind,
+                    reason: Some("main moved"),
+                    classification: None,
+                    duration_sec: Some(7),
+                },
+            )
+            .unwrap();
+        }
+        // A sibling issue's markers share the file and must not leak in.
+        append(
+            dir.path(),
+            &Marker {
+                issue: 9445,
+                kind: "rebase",
+                reason: None,
+                classification: None,
+                duration_sec: None,
+            },
+        )
+        .unwrap();
+
+        let events = read_rework_events(dir.path(), 9444, Some(before));
+        assert_eq!(events.len(), KINDS.len(), "{events:?}");
+        for (event, kind) in events.iter().zip(KINDS) {
+            assert_eq!(&event.kind, kind);
+            assert_eq!(event.reason.as_deref(), Some("main moved"));
+            assert_eq!(event.duration_sec, Some(7));
+            assert_eq!(
+                event.classification.as_deref(),
+                Some(default_classification(kind)),
+                "the writer stamped a classification this reader does not agree with"
+            );
+        }
+
+        // …and the same markers are outside a window that starts after them.
+        let after = Utc::now() + chrono::Duration::seconds(1);
+        assert!(read_rework_events(dir.path(), 9444, Some(after)).is_empty());
     }
 }
