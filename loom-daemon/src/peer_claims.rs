@@ -91,7 +91,10 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 mod brakes;
-pub use brakes::{observe_brake_ad, MAX_PEER_POOL_HOLD_TTL, POOL_HOLD_SENTINEL_ISSUE};
+pub use brakes::{
+    observe_brake_ad, PeerPrlessRelease, MAX_PEER_POOL_HOLD_TTL, MAX_PEER_PRLESS_RELEASE_TTL,
+    PEER_PRLESS_STREAK_TTL, POOL_HOLD_SENTINEL_ISSUE,
+};
 
 mod coordination_idle;
 pub use coordination_idle::{
@@ -284,6 +287,31 @@ pub enum ClaimKind {
     /// [`crate::sweep_registry::SweepRegistry::record_dispatch_failure`]'s
     /// backoff state.
     DispatchBackoffArmed,
+    /// "I just recorded a PR-less claim/release cycle for issue #N — that is
+    /// my `consecutive`-th in a row, and `remaining_secs` seconds remain on
+    /// the window it armed" (Issue #9292).
+    ///
+    /// The third member of the per-issue brake lane, and the only one whose
+    /// payload matters beyond the window: `consecutive` is what makes the
+    /// #7972 PR-less-retry **tally** fleet-wide rather than per-host.
+    /// Broadcast the moment
+    /// [`crate::sweep_registry::SweepRegistry::record_prless_release`] records
+    /// the local release, and summed across hosts by
+    /// [`PeerClaimView::prless_peer_release_count_at`] so the
+    /// `loom:blocked` hold trips at `threshold` claims **fleet-wide** instead
+    /// of `threshold` claims *per host*. Before #9292 a four-host fleet spent
+    /// up to `4 × threshold` claim/release cycles — and posted up to four
+    /// near-identical "Attempt N of M" notes — before any one host's private
+    /// integer reached the threshold (`rjwalters/loom#8812`, 2026-09-24: nine
+    /// cycles, four notes, one hold).
+    ///
+    /// Arm-only, like [`ClaimKind::NoopCooldownArmed`] and unlike the pool
+    /// lane: a streak is cleared by positive evidence the loop broke (an open
+    /// PR, a merge, a self-reported no-op), all of which are either public
+    /// forge state every host reads for itself or are followed by this host
+    /// simply ceasing to re-advertise. The entry then lapses on its own TTL,
+    /// which is the same `max_backoff` window the local streak-cold rule uses.
+    PrlessReleaseArmed,
     /// "The token pool identified by `pool_key` is UNSPAWNABLE on my host,
     /// `remaining_secs` seconds left on my hold as of my send time" (Issue
     /// #8001, the peer-broadcast half of #7708).
@@ -357,6 +385,7 @@ impl ClaimKind {
             ClaimKind::FilingUnlock => "filing_unlock",
             ClaimKind::NoopCooldownArmed => "noop_cooldown_armed",
             ClaimKind::DispatchBackoffArmed => "dispatch_backoff_armed",
+            ClaimKind::PrlessReleaseArmed => "prless_release_armed",
             ClaimKind::PoolHoldArmed => "pool_hold_armed",
             ClaimKind::PoolHoldCleared => "pool_hold_cleared",
             ClaimKind::Heartbeat => "heartbeat",
@@ -373,6 +402,7 @@ impl ClaimKind {
             "filing_unlock" => Some(ClaimKind::FilingUnlock),
             "noop_cooldown_armed" => Some(ClaimKind::NoopCooldownArmed),
             "dispatch_backoff_armed" => Some(ClaimKind::DispatchBackoffArmed),
+            "prless_release_armed" => Some(ClaimKind::PrlessReleaseArmed),
             "pool_hold_armed" => Some(ClaimKind::PoolHoldArmed),
             "pool_hold_cleared" => Some(ClaimKind::PoolHoldCleared),
             "heartbeat" => Some(ClaimKind::Heartbeat),
@@ -388,13 +418,28 @@ impl ClaimKind {
         matches!(self, ClaimKind::FilingLock | ClaimKind::FilingUnlock)
     }
 
-    /// Whether this kind belongs to the fleet-wide cooldown/backoff-visibility
-    /// lane (Issue #7477) rather than the dispatch-claim, completion-narration,
-    /// or filing-lock lanes — the one predicate every router in the daemon
-    /// needs, mirroring [`Self::is_filing_lock_lane`].
+    /// Whether this kind belongs to the fleet-wide **per-issue brake** lane —
+    /// the #7477 no-op-cooldown / dispatch-backoff windows and, as of Issue
+    /// #9292, the PR-less-retry tally — rather than the dispatch-claim,
+    /// completion-narration, or filing-lock lanes. The one predicate every
+    /// router in the daemon needs, mirroring [`Self::is_filing_lock_lane`].
+    ///
+    /// [`ClaimKind::PrlessReleaseArmed`] belongs here rather than behind a
+    /// fourth predicate because it satisfies this lane's contract exactly: a
+    /// per-`(repo, issue)` window carried in `remaining_secs`, folded into its
+    /// own single-purpose map by [`brakes::observe_brake_ad`], and excluded
+    /// from both the `claims` map and the `#6157` coordination-health
+    /// counters. Keeping it here is what lets the socket layer
+    /// (`safehouse.rs`) stay untouched when a lane is added — the property
+    /// `brakes`'s own module doc states.
     #[must_use]
     pub fn is_cooldown_lane(self) -> bool {
-        matches!(self, ClaimKind::NoopCooldownArmed | ClaimKind::DispatchBackoffArmed)
+        matches!(
+            self,
+            ClaimKind::NoopCooldownArmed
+                | ClaimKind::DispatchBackoffArmed
+                | ClaimKind::PrlessReleaseArmed
+        )
     }
 
     /// Whether this kind belongs to the fleet-wide pool-exhaustion-hold lane
@@ -460,6 +505,18 @@ pub struct ClaimAd {
     /// module doc names. See the fingerprint function's own doc comment for
     /// the full argument.
     pub pool_key: Option<String>,
+    /// The advertising host's **own** consecutive tally at send time (Issue
+    /// #9292). `Some` only for [`ClaimKind::PrlessReleaseArmed`]; every other
+    /// kind leaves it `None`.
+    ///
+    /// Counts only that host's own releases — never a fleet total — so a
+    /// receiver can sum one entry per peer host without double-counting its
+    /// own contribution back in. An ad with `None` here is treated as `0` by
+    /// [`PeerClaimView::observe_prless_release_at`] (a pre-#9292 peer or a
+    /// malformed payload), which is the safe direction: a countless ad may
+    /// not inflate anyone's threshold, and the receiver's own local tally is
+    /// still exact.
+    pub consecutive: Option<u32>,
 }
 
 impl ClaimAd {
@@ -475,6 +532,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -490,6 +548,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -516,6 +575,7 @@ impl ClaimAd {
             pr: Some(pr),
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -537,6 +597,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -554,6 +615,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -581,6 +643,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: Some(remaining_secs),
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -605,6 +668,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: Some(remaining_secs),
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -626,6 +690,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -643,6 +708,7 @@ impl ClaimAd {
             "pr": self.pr,
             "remaining_secs": self.remaining_secs,
             "pool_key": self.pool_key,
+            "consecutive": self.consecutive,
         })
         .to_string()
     }
@@ -702,6 +768,16 @@ impl ClaimAd {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
+        // `consecutive` is new as of Issue #9292: absent (any pre-#9292 peer,
+        // or any kind outside the PR-less-retry lane) degrades to `None`
+        // rather than rejecting the ad. A `PrlessReleaseArmed` ad with `None`
+        // here contributes `0` to the receiver's fleet tally — the safe
+        // direction, since an unreadable count must never be able to inflate
+        // a peer's hold threshold.
+        let consecutive = obj
+            .get("consecutive")
+            .and_then(Value::as_u64)
+            .and_then(|c| u32::try_from(c).ok());
         if repo.is_empty() || host.is_empty() {
             return None;
         }
@@ -715,6 +791,7 @@ impl ClaimAd {
             pr,
             remaining_secs,
             pool_key,
+            consecutive,
         })
     }
 
@@ -1086,6 +1163,26 @@ pub struct PeerClaimView {
     /// (Issue #7477) — the [`Self::noop_cooldowns`] sibling for
     /// [`ClaimKind::DispatchBackoffArmed`].
     dispatch_backoffs: HashMap<(String, u32), Instant>,
+    /// Fleet-visible **PR-less release tallies** broadcast by peer hosts
+    /// (Issue #9292), keyed by `(repo_slug, issue, advertising_host)`.
+    ///
+    /// The host is in the key for the reason `pool_holds`' is: each peer
+    /// reports only its *own* consecutive count, and the fleet total is their
+    /// sum plus this host's local tally. Keying on `(repo, issue)` alone would
+    /// let the last ad to arrive overwrite a different host's contribution,
+    /// silently restoring the per-host threshold #9292 exists to remove.
+    ///
+    /// The value carries **two** local-receipt expiries rather than the single
+    /// [`Instant`] the other per-issue lanes store: the advertised
+    /// dispatch-suppression window (`received_at + remaining_secs`, capped by
+    /// [`brakes::MAX_PEER_PRLESS_RELEASE_TTL`]) and, never shorter, the
+    /// fleet-wide **streak-cold** clock ([`brakes::PEER_PRLESS_STREAK_TTL`]) on
+    /// which the tally itself lapses — a peer that stops re-advertising falls
+    /// out of the sum exactly as a local streak older than `max_backoff`
+    /// restarts at one. They are separate because a backoff window is, by
+    /// construction, the interval after which the *next* host may claim; see
+    /// [`brakes::PEER_PRLESS_STREAK_TTL`] for what collapsing them costs.
+    prless_releases: HashMap<(String, u32, String), brakes::PeerPrlessRelease>,
     /// Fleet-visible token-pool exhaustion holds armed by peer hosts (Issue
     /// #8001), keyed by `(pool_key, advertising_host)`, valued by the
     /// **local** [`Instant`] at which this daemon's copy of the hold expires
@@ -1135,6 +1232,7 @@ impl PeerClaimView {
             filing_lock_ttl: DEFAULT_PEER_FILING_LOCK_TTL,
             noop_cooldowns: HashMap::new(),
             dispatch_backoffs: HashMap::new(),
+            prless_releases: HashMap::new(),
             pool_holds: HashMap::new(),
         }
     }
@@ -1275,6 +1373,7 @@ impl PeerClaimView {
             | ClaimKind::FilingUnlock
             | ClaimKind::NoopCooldownArmed
             | ClaimKind::DispatchBackoffArmed
+            | ClaimKind::PrlessReleaseArmed
             | ClaimKind::PoolHoldArmed
             | ClaimKind::PoolHoldCleared
             | ClaimKind::Heartbeat => {
@@ -1888,6 +1987,7 @@ mod tests {
             pr: None,
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 

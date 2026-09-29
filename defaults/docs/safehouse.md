@@ -1617,6 +1617,79 @@ it. Two more `ClaimKind`s on the same envelope close that:
   tick. The broadcast removes doomed dispatches; it is never the only thing that
   can stop them.
 
+### Fleet-wide PR-less retry tally: the fourth brake lane (#9292)
+
+The three lanes above all broadcast a **window** — "do not dispatch this
+issue/pool until T". The PR-less retry bound (#7972) needs something the other
+three do not: a **count**. Its `loom:blocked` hold fires on the `threshold`-th
+consecutive claim of an issue that produced no pull request, and until #9292
+that tally was a plain per-process `HashMap` — the same fleet-scope gap #7477
+closed for the cooldown lanes, one mechanism later.
+
+The cost is arithmetic. Four dispatch hosts, each counting only its own
+attempts, spend up to `4 × threshold` claim/release cycles before **any** one
+of them reaches `threshold` — and post up to four near-identical "Attempt N of
+M" notes on the way. Observed on `rjwalters/loom#8812`, 2026-09-24: nine
+claim/release cycles at roughly 90 s apart, four `Attempt 2 of 3` notes (one
+per host, none of them a hold), and only then one host's third release applying
+`loom:blocked`.
+
+One more `ClaimKind` on the same envelope closes it:
+
+- **Publish every recorded release.** `SweepRegistry::record_prless_release`
+  broadcasts `ClaimKind::PrlessReleaseArmed` via
+  `publish_peer_prless_release_claim` — a dedicated publisher for the same
+  reason `publish_peer_cooldown_claim` is one: the payload carries a field the
+  generic method has no parameter for. Here that field is `consecutive:
+  Option<u32>`, **this host's own** running count, never a fleet total (a
+  fleet total on the wire would be re-summed by every receiver). Fire-and-forget
+  / fail-open like every other publish on this channel.
+- **Consume into a per-`(repo, issue, host)` map.** `ClaimKind::is_cooldown_lane`
+  already covers this kind, so `PeerClaimSink` routes it through
+  `observe_brake_ad` into `PeerClaimView::observe_prless_release_at` with no
+  change to the socket layer. The **host** is in the key because each peer
+  reports only its own count and the fleet total is their sum: keying on
+  `(repo, issue)` alone would let the last ad to arrive overwrite a different
+  host's contribution and silently restore the per-host threshold. An ad
+  reports a running total rather than an increment, so a redelivered or
+  duplicated ad is idempotent.
+- **Read at the threshold, and at the skip-set seam.**
+  `record_prless_release` compares `local + Σ peers` against
+  `PrlessRetryConfig::threshold`, so the hold trips at `threshold` claims
+  fleet-wide. `prless_retry_issues` unions the peer-advertised windows into the
+  work finder's existing `prless_retry()` pre-filter — the "fleet-wide
+  broadcast of the sub-threshold window" `prless_retry.rs` had explicitly
+  deferred — with no change at the work-finder layer.
+- **One attempt note per streak per _issue_.** The note is posted when the
+  **fleet** total first reaches 2, not on every sub-threshold release per host.
+  Because the fleet total is strictly increasing across a streak, `== 2` is
+  reached exactly once, wherever in the fleet the second release lands. (Two
+  hosts recording simultaneously, neither having yet seen the other's ad, can
+  still both compute 2 — a bounded one-duplicate race, against the
+  four-per-streak floor it replaces.)
+- **Two clocks, both measured against local receipt, both capped.** The
+  advertised **window** expires at
+  `received_at + min(remaining_secs, MAX_PEER_PRLESS_RELEASE_TTL)` (6 h, well
+  above the 1 h default `maxBackoffSecs`) and is what suppresses dispatch. The
+  **tally** expires at `received_at + max(that, PEER_PRLESS_STREAK_TTL)` (1 h,
+  matching the local `maxBackoffSecs` streak-cold rule) and is what counts
+  toward the threshold. They are separate on purpose: a backoff window is by
+  construction the interval after which the *next* host may claim, so a tally
+  keyed to the window would lapse at exactly the moment the fleet's next release
+  landed — the sum could never grow past one, and the fix would silently be the
+  per-host tally again. The tally clock is still finite, so a crashed peer stops
+  contributing rather than pinning an issue one release short of `loom:blocked`
+  forever. A missing/zero `consecutive` (a pre-#9292 peer) contributes `0`; a
+  missing/zero `remaining_secs` reads as an already-elapsed window whose release
+  still counts for the streak hour.
+- **Degrades to the pre-#9292 tally, loudly.** No publisher/view attached, a
+  dropped ad, a pre-#9292 peer, or a poisoned view all reduce the peer term to
+  what could be read, leaving this host's own exact count behind. Precondition 1
+  from the #8912 section above applies verbatim here, and is reported the same
+  way: `record_prless_release` logs "issue #N's PR-less retry tally is
+  HOST-LOCAL only" when no publisher is attached, so `grep HOST-LOCAL
+  ~/.loom/daemon.log` answers it per host.
+
 # Phase 2 — worker-side `safehouse-mcp` injection (#3999)
 
 Phase 1 lets the daemon *narrate*. Phase 2 gives each **worker** session a

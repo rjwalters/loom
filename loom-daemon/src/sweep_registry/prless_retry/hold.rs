@@ -53,9 +53,17 @@ pub const PRLESS_HOLD_COMMENT_MARKER: &str = "<!-- loom:prless-retry-kind=hold (
 
 /// Kind marker on the notice posted when the hold's label write **failed**
 /// (Issue #9239) — the issue is NOT parked and is still a dispatch candidate.
-/// Bounded to one per streak (posted only on the first hold attempt, when
-/// `consecutive == threshold`), so a repo whose label writes are persistently
-/// rejected raises the alarm without re-raising it every cycle.
+/// Bounded to **at most** one per streak (posted only when the count reaching
+/// the hold is exactly `threshold`, i.e. the first hold attempt), so a repo
+/// whose label writes are persistently rejected raises the alarm without
+/// re-raising it every cycle.
+///
+/// "At most", not "exactly", since #9292 made that count fleet-wide: a host
+/// that observes two peer releases at once can step from 1 straight past the
+/// threshold and skip the equality. The failure is still logged at `error` on
+/// the host that hit it every time — only the forge-side alarm is the thing
+/// bounded here, and over-tight is the right direction for a comment whose
+/// whole purpose is to be noticed.
 pub const PRLESS_HOLD_FAILED_COMMENT_MARKER: &str =
     "<!-- loom:prless-retry-kind=hold-failed (#9239) -->";
 
