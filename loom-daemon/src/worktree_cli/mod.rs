@@ -138,11 +138,26 @@
 //! [`cleanup::is_registered`]. [`sentinel`] is the first Rust writer of the
 //! `.loom-managed` marker, pinned byte-for-byte to the shell's until the
 //! remaining writers move.
+//!
+//! Slice 11 is [`check`]: the predicate *"am I inside a linked worktree?"* and
+//! both decisions it gated — the `--check` verb and the create path's
+//! auto-navigation out of a worktree. It is the only slice whose retired code
+//! was **wrong from every position a caller can stand in**: the comparison was
+//! `--git-common-dir` (which git answers *relative to the current directory*
+//! whenever it can) against an absolute `<toplevel>/.git`, so it was
+//! constant-true. `--check` reported the primary clone as a worktree and its
+//! "not in a worktree" arm was unreachable; every `worktree.sh <N>` run from
+//! the primary clone printed four spurious navigation lines and then `cd`'d to
+//! `dirname ".git"` — a no-op by luck rather than by logic. Invisible because
+//! `--json` suppresses all four lines, so nothing a machine reads ever changed
+//! and no retained suite asserts either consumer's output. Same class as slices
+//! 5, 8 and 10: a path compared logically instead of physically.
 
 pub mod baseline;
 pub mod branch_conflict;
 pub mod branch_delete;
 pub mod branch_landed;
+pub mod check;
 pub mod cleanup;
 pub mod closed_pr_branch;
 pub mod default_branch;

@@ -194,6 +194,18 @@ pub(crate) enum ScriptPortCommand {
     /// directory. Exit 0 applied, 1 refused/failed, 2 could not run.
     WorktreeSparse(super::worktree_sparse::WorktreeSparseArgs),
 
+    /// `worktree.sh`'s in-worktree predicate and both decisions it gated
+    /// (#8195 slice 11): the `--check` verb, and the create path's
+    /// auto-navigation out of a worktree. The retired
+    /// `[[ "$(git rev-parse --git-common-dir)" != "$(git rev-parse
+    /// --show-toplevel)/.git" ]]` compared a path git answers RELATIVELY
+    /// against an absolute one, so it was constant-true from every position a
+    /// caller can stand in: `--check` reported the primary clone as a worktree
+    /// and its exit 1 was dead code, and every `worktree.sh <N>` printed four
+    /// spurious navigation lines. Exit 0/1 are the verb's two answers;
+    /// `--porcelain` (the create arm's record stream) is always 0.
+    WorktreeCheck(super::worktree_check::WorktreeCheckArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -385,6 +397,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeStaleRef(args) => args.run(),
             ScriptPortCommand::WorktreeClosedPrBranch(args) => args.run(),
             ScriptPortCommand::WorktreeSparse(args) => args.run(),
+            ScriptPortCommand::WorktreeCheck(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),

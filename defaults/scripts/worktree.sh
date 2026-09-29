@@ -528,8 +528,8 @@ _worktree_upstream_check() {
     return 0
 }
 
-# Shared preamble for the two `loom_exec_script_helper` verbs below (`remove`,
-# and the WIP trio): source lib/script-helper.sh, or exit 2 naming $1. The exec
+# Shared preamble for the `loom_exec_script_helper` verbs below (`remove`, the
+# WIP trio, and `--check`): source lib/script-helper.sh, or exit 2 naming $1. The exec
 # line itself deliberately stays in each caller with its subcommand spelled
 # literally — scripts/check-daemon-subcommand-versions.sh reads a version floor
 # off `loom_exec_script_helper <sub>` in command position, and hoisting that
@@ -721,32 +721,106 @@ fetch_latest_main() {
     fi
 }
 
-# Function to check if we're in a worktree
-check_if_in_worktree() {
-    local git_dir=$(git rev-parse --git-common-dir 2>/dev/null)
-    local work_dir=$(git rev-parse --show-toplevel 2>/dev/null)
-
-    if [[ "$git_dir" != "$work_dir/.git" ]]; then
-        return 0  # In a worktree
-    else
-        return 1  # In main working directory
-    fi
+# --------------------------------------------------------------------------
+# In-worktree detection: the `--check` verb, and the create path's
+# auto-navigation out of a worktree
+# --------------------------------------------------------------------------
+#
+# Ported to `loom-daemon worktree-check` (#8195 slice 11, epic #7810). BOTH
+# consumers of `check_if_in_worktree` moved together, because the predicate they
+# shared was wrong from every position a caller can stand in:
+#
+#   [[ "$(git rev-parse --git-common-dir)" != "$(git rev-parse --show-toplevel)/.git" ]]
+#
+# `--show-toplevel` is always ABSOLUTE; `--git-common-dir` is RELATIVE to the
+# current directory whenever it can be (`.git` at the repo root, `../.git` one
+# level down). So in the primary clone the comparison read `.git` !=
+# `/repo/.git` — true — and the function answered "in a worktree" there, in
+# every subdirectory of it, and inside a real linked worktree alike. It had no
+# reachable false branch at all (verified against git 2.43 from all four
+# positions). Two consequences:
+#
+#   - `worktree.sh --check` reported the primary clone as a worktree and exited
+#     0; its "Not currently in a worktree" arm and its exit 1 were dead code,
+#     while `worktree-return.sh` tells operators to run it.
+#   - every `worktree.sh <N>` from the primary clone printed four spurious
+#     lines ("Currently in a worktree, auto-navigating…", a `Current worktree:`
+#     block naming the primary clone, "Found main workspace: .", "Switched to
+#     main workspace") and then `cd`'d to `dirname ".git"` = "." — a no-op BY
+#     LUCK: git's relative answer happens to be the relative path to the repo
+#     root, so `dirname` of it is too.
+#
+# Invisible for as long as it existed because `--json` suppresses all four of
+# those lines, so nothing a machine reads ever changed, and no retained suite
+# asserts either consumer's output. Same class as slices 5, 8 and 10: a path
+# compared logically instead of physically. `worktree_cli/check.rs` compares
+# `--git-dir` against `--git-common-dir`, both canonicalized — git's own
+# definition of a linked worktree, and correct for a symlinked repo path and a
+# `--separate-git-dir` checkout (where `.git` is a file) alike.
+#
+# LOOM_SCRIPT_HELPER_MISSING_RC=2 — argued, not defaulted: 0 and 1 are the
+# verb's two ANSWERS, and a caller branches on them, so an unresolvable binary
+# must not be readable as either. 2 is the code every other epic-#7810 stub
+# reserves for "could not run at all".
+# requires-daemon: worktree-check >= 0.19.492  #8195 slice 11 — the `--check` verb execs it and refuses with exit 2 without it. The create path's auto-navigation below probes with `--help` and falls back to its own one-line physical check, so a plain `worktree.sh <N>` still needs no daemon.
+_worktree_check_verb() {
+    _worktree_source_script_helper --check
+    LOOM_SCRIPT_HELPER_MISSING_RC=2 \
+        loom_exec_script_helper worktree-check
 }
 
-# Function to get current worktree info
-get_worktree_info() {
-    if check_if_in_worktree; then
-        local worktree_path=$(git rev-parse --show-toplevel)
-        local branch=$(git rev-parse --abbrev-ref HEAD)
-
-        echo "Current worktree:"
-        echo "  Path: $worktree_path"
-        echo "  Branch: $branch"
+# Sets $_WT_IN_WORKTREE / $_WT_MAIN_WORKSPACE for the create path's
+# auto-navigation below. The port prints a `LEVEL<TAB>text` record stream — the
+# shape `merge-pr delete-branch` (#8973) established — replayed here through
+# this script's own print_* so every message and its order stay owned by the
+# port, while the `cd` stays here because only this process can change its own
+# directory. `--quiet` under `--json` mirrors the blanket suppression the
+# retired block applied to all four messages.
+#
+# The fallback is not a second implementation of the DECISION: it is the same
+# physical question in one comparison (is this worktree's git dir the common
+# one?), spelled here so nested-worktree prevention never depends on a built
+# binary — a silent skip would let `git worktree add` create a worktree INSIDE
+# another one, whose removal then takes the child with it.
+# `loom-daemon/tests/worktree_check_differential.rs` asserts the two agree from
+# all four positions. The `--help` probe routes a daemon predating the
+# subcommand to the fallback as well: clap's exit 2 prints no records, which
+# this loop would read as "not in a worktree" — the one wrong answer that loses
+# the guard.
+#
+# What the fallback deliberately does NOT do is re-print the four banner lines.
+# On a host with no resolvable daemon (or one predating this subcommand) the
+# navigation is silent apart from the `✓ Switched to main workspace` below: the
+# SAFETY property is preserved exactly, the DIAGNOSIS degrades — the same trade
+# slices 4, 5 and 9 make with their `optional` markers. Copying the message text
+# back into shell would recreate the second implementation this slice exists to
+# remove, and it is the one thing the port cannot keep pinned.
+_WT_IN_WORKTREE=false
+_WT_MAIN_WORKSPACE=""
+_worktree_locate() {
+    local _l _m _out _q=""
+    [[ "$JSON_OUTPUT" != "true" ]] || _q="--quiet"
+    if [[ -n "${_WT_DAEMON_BIN:-}" ]] && "$_WT_DAEMON_BIN" worktree-check --help >/dev/null 2>&1; then
+        # shellcheck disable=SC2086  # $_q is a fixed literal flag or empty
+        _out="$("$_WT_DAEMON_BIN" worktree-check --porcelain $_q 2>/dev/null)" || _out=""
+        while IFS=$'\t' read -r _l _m; do
+            case "$_l" in
+                IN_WORKTREE)    _WT_IN_WORKTREE=true ;;
+                MAIN_WORKSPACE) _WT_MAIN_WORKSPACE="$_m" ;;
+                WARNING)        print_warning "$_m" ;;
+                INFO)           print_info "$_m" ;;
+                PLAIN)          echo "$_m" ;;
+                BLANK)          echo "" ;;
+            esac
+        done <<<"$_out"
         return 0
-    else
-        echo "Not currently in a worktree (you're in the main working directory)"
-        return 1
     fi
+    local _gd _cd
+    _gd="$(cd "$(git rev-parse --git-dir 2>/dev/null || echo .)" 2>/dev/null && pwd -P)" || _gd=""
+    _cd="$(cd "$(git rev-parse --git-common-dir 2>/dev/null || echo .)" 2>/dev/null && pwd -P)" || _cd=""
+    [[ -n "$_gd" && -n "$_cd" && "$_gd" != "$_cd" ]] || return 0
+    _WT_IN_WORKTREE=true
+    _WT_MAIN_WORKSPACE="$(dirname "$_cd")"
 }
 
 # Function to show help
@@ -993,9 +1067,12 @@ if [[ $# -eq 0 ]] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     exit 0
 fi
 
+# `_worktree_check_verb` execs `loom-daemon worktree-check` and never returns,
+# so the subcommand's own exit code (0 = in a worktree, 1 = the main working
+# directory) reaches the caller directly — see the function for the contract and
+# the LOOM_SCRIPT_HELPER_MISSING_RC choice.
 if [[ "$1" == "--check" ]]; then
-    get_worktree_info
-    exit $?
+    _worktree_check_verb
 fi
 
 # Operator-facing single-worktree removal verb (issue #3769). Dispatched HERE,
@@ -1193,18 +1270,15 @@ if [[ "$SPARSE_MODE" == "true" || "$FULL_MODE" == "true" ]] \
     exit 2
 fi
 
-# Check if already in a worktree and automatically handle it
-if check_if_in_worktree; then
-    if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_warning "Currently in a worktree, auto-navigating to main workspace..."
-        echo ""
-        get_worktree_info
-        echo ""
-    fi
-
-    # Find the git root (common directory for all worktrees)
-    GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null)
-    if [[ -z "$GIT_COMMON_DIR" ]]; then
+# Check if already in a worktree and automatically handle it. The detection, the
+# main-workspace resolution and the first four messages are
+# `loom-daemon worktree-check --porcelain` (#8195 slice 11) — see
+# `_worktree_locate` above, which has already replayed them by the time it
+# returns. What stays here is the `cd` and the two failure arms, because only
+# this process can change its own working directory.
+_worktree_locate
+if [[ "$_WT_IN_WORKTREE" == "true" ]]; then
+    if [[ -z "$_WT_MAIN_WORKSPACE" ]]; then
         if [[ "$JSON_OUTPUT" == "true" ]]; then
             echo '{"error": "Failed to find git common directory"}' >&3
         else
@@ -1213,23 +1287,16 @@ if check_if_in_worktree; then
         exit 1
     fi
 
-    # The main workspace is the parent of .git (or the directory containing .git)
-    MAIN_WORKSPACE=$(dirname "$GIT_COMMON_DIR")
-    if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Found main workspace: $MAIN_WORKSPACE"
-    fi
-
-    # Change to main workspace
-    if cd "$MAIN_WORKSPACE" 2>/dev/null; then
+    if cd "$_WT_MAIN_WORKSPACE" 2>/dev/null; then
         if [[ "$JSON_OUTPUT" != "true" ]]; then
             print_success "Switched to main workspace"
         fi
     else
         if [[ "$JSON_OUTPUT" == "true" ]]; then
-            echo '{"error": "Failed to change to main workspace", "mainWorkspace": "'"$MAIN_WORKSPACE"'"}' >&3
+            echo '{"error": "Failed to change to main workspace", "mainWorkspace": "'"$_WT_MAIN_WORKSPACE"'"}' >&3
         else
-            print_error "Failed to change to main workspace: $MAIN_WORKSPACE"
-            print_info "Please manually run: cd $MAIN_WORKSPACE"
+            print_error "Failed to change to main workspace: $_WT_MAIN_WORKSPACE"
+            print_info "Please manually run: cd $_WT_MAIN_WORKSPACE"
         fi
         exit 1
     fi
