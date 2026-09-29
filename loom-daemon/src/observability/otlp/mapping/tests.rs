@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::telemetry::{
-    HostHealthRecord, PhaseDuration, SweepCompletedRecord, SweepOutcomeRecord, SweepPhaseRecord,
-    SweepStartedRecord, TokenAccountState, TokenSnapshotRecord,
+    HostHealthRecord, PhaseDuration, SweepCompletedRecord, SweepDisposition, SweepOutcomeRecord,
+    SweepPhaseRecord, SweepStartedRecord, TokenAccountState, TokenSnapshotRecord,
 };
 
 fn ts() -> DateTime<Utc> {
@@ -112,6 +112,9 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             ],
             total_duration_sec: 512,
             result: SweepResult::Success,
+            // Issue #9441: this fixture names a PR, so `landed` is the only
+            // disposition the record may carry (invariant 1).
+            disposition: SweepDisposition::Landed,
             pr_number: Some(4861),
             tokens_in: None,
             tokens_out: None,
@@ -307,6 +310,14 @@ fn sweep_outcome_flattens_config_and_nests_phase_durations() {
         Some(any_value::Value::StringValue("claude".to_string()))
     );
     assert_eq!(get("loom.pr_number"), Some(any_value::Value::IntValue(4861)));
+    // Issue #9441: the disposition travels beside `loom.result`, never
+    // instead of it, and is always present (never conditionally attached like
+    // the optional attributes above).
+    assert_eq!(get("loom.result"), Some(any_value::Value::StringValue("success".to_string())));
+    assert_eq!(
+        get("loom.disposition"),
+        Some(any_value::Value::StringValue("landed".to_string()))
+    );
     match get("loom.phase_durations") {
         Some(any_value::Value::ArrayValue(array)) => {
             assert_eq!(array.values.len(), 2);

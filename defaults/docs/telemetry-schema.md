@@ -700,6 +700,12 @@ line carries no `disposition` key and decodes as `unknown` (`#[serde(default)]`)
 default all historical records would vanish. Such a line legitimately fails
 invariant 2: the invariants are a contract on records the daemon *writes*.
 
+**Also on the span and the OTLP log record**, always beside `loom.result` and
+never instead of it: the terminal sweep span carries `loom.disposition` in its
+metadata, and the `sweep.outcome` OTLP mapping emits `loom.disposition` as an
+unconditional attribute. A trace or OTLP consumer can therefore separate a
+landing from a no-op re-dispatch without joining this journal.
+
 Additive, so it did **not** bump `schema_version` — a new optional-shaped field
 is not a breaking change, a new record kind is (see the version table above).
 `disposition` is not added to the public redaction allowlist, for the same

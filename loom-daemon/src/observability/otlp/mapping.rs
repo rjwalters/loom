@@ -271,6 +271,11 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
+                // Issue #9441: the "what did this sweep DO" axis travels with
+                // `loom.result`, never instead of it — an OTLP consumer must be
+                // able to separate a landing from a no-op re-dispatch without
+                // joining the journal. Always present, like the field itself.
+                kv_string("loom.disposition", r.disposition.as_str()),
                 kv_int("loom.total_duration_sec", r.total_duration_sec),
             ];
             if let Some(repo) = &r.repo {

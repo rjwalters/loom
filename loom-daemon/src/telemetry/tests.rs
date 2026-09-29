@@ -1003,6 +1003,9 @@ fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
         phase_durations: Vec::new(),
         total_duration_sec: 60,
         result: SweepResult::Success,
+        // #9441: a clean, short, PR-less, phase-less run is the no-op
+        // re-dispatch shape — the one `result: success` alone cannot express.
+        disposition: SweepDisposition::NoopAlreadyDone,
         pr_number: None,
         tokens_in: None,
         tokens_out: None,
