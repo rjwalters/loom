@@ -1,7 +1,7 @@
 # Story-point calibration: the canonical question set
 
 The standing answer to *"what did a clean landing actually cost?"* — defined
-**once**, here, so that the rubric in [`defaults/docs/story-points.md`](../docs/story-points.md)
+**once**, here, so that the rubric in [`defaults/docs/story-points.md`](https://github.com/rjwalters/loom/blob/main/defaults/docs/story-points.md)
 is anchored in extracted distributions rather than invented numbers (Issue
 #9430, the first phase of the Fibonacci story-points epic #9429). Like the
 cycle-time set (#8665), whose files this mirrors, every question `SP<n>` is a
