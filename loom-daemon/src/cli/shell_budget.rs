@@ -8,6 +8,25 @@
 use anyhow::{Context, Result};
 use loom_daemon::shell_budget;
 
+/// Every subcommand this binary actually registers, aliases included.
+///
+/// Read from clap's own tree rather than from a hand-kept list, and read HERE
+/// rather than in the library: only the binary crate can see its own `Commands`
+/// enum, and `main.rs` is over the file-size ratchet's threshold, so the
+/// registry is derived where it is consumed instead of being restated where it
+/// is declared. A list maintained by hand would drift the moment a subcommand
+/// is renamed, and the drift would show up as a `Shell-Budget-Callout:` trailer
+/// refused for naming a subcommand that does exist.
+fn daemon_subcommands() -> Vec<String> {
+    use clap::CommandFactory;
+    <crate::Cli as CommandFactory>::command()
+        .get_subcommands()
+        .flat_map(|c| {
+            std::iter::once(c.get_name().to_string()).chain(c.get_all_aliases().map(str::to_string))
+        })
+        .collect()
+}
+
 #[derive(clap::Args)]
 pub(crate) struct ShellBudgetArgs {
     /// Emit the measurement as JSON for scripting.
@@ -159,8 +178,31 @@ impl ShellBudgetArgs {
                 );
             }
 
+            // Declared call-sites for ported logic (#9297). Same collection
+            // shape as the floor trailer, plus two things only this leg needs:
+            // the binary's own subcommand registry (to check the name exists)
+            // and the diff (to check the declared lines are really a call-site).
+            let (callouts, callout_malformed) =
+                shell_budget::collect_callout_declarations(&root, &cmp.rev)
+                    .map_err(anyhow::Error::msg)?;
+            for m in &callout_malformed {
+                eprintln!(
+                    "\nshell-budget: ignoring a malformed {} trailer — {}\n  {}",
+                    shell_budget::CALLOUT_TRAILER,
+                    m.why,
+                    m.line
+                );
+            }
+            let subcommands = daemon_subcommands();
+            let evidence =
+                shell_budget::collect_callout_evidence(&root, &cmp.rev, &budget, &callouts)
+                    .map_err(anyhow::Error::msg)?;
+
             let ctx = shell_budget::GrowthContext {
                 declared: &declared,
+                callouts: &callouts,
+                subcommands: &subcommands,
+                evidence: &evidence,
             };
 
             if let Err(why) = shell_budget::check_against_rev(&budget, &before, &desc, &ctx) {
@@ -172,6 +214,17 @@ impl ShellBudgetArgs {
                 // same message-vs-reality defect this whole change is about.
                 eprintln!("\nshell-budget: REFUSED\n\n{why}");
                 std::process::exit(1);
+            }
+
+            // A granted callout is the one way portable shell may grow, so it
+            // must never be silent — the same reason declared floor growth is
+            // printed below. #9297.
+            if !callouts.is_empty() {
+                println!(
+                    "\nshell-budget: portable call-site lines GRANTED for logic ported into \
+                     `loom-daemon` (#9297):\n{}",
+                    shell_budget::callout::render_granted(&callouts, &evidence)
+                );
             }
 
             // Declared growth stays visible. #8154 ask 3: the point is that
