@@ -114,7 +114,8 @@ fn only_open_pr_rows_are_counted() {
 fn operator_held_prs_are_not_merge_debt() {
     // #9410: Champion will not merge a `loom:pr` PR that also carries a hold
     // label, so it must not count toward the merge debt the build back-off
-    // reads. Review / changes debt is unaffected by the same labels.
+    // reads. Review debt is unaffected by the same labels (changes debt has
+    // its own, narrower park set — see `parked_prs_are_not_changes_debt`).
     let labelled = |n: u32, label: &str| RestIssue {
         labels: vec!["loom:pr".to_string(), label.to_string()],
         ..row(n, true)
@@ -140,6 +141,73 @@ fn operator_held_prs_are_not_merge_debt() {
     // Every held PR: the axis is observed and zero, not unobserved.
     record_listing(&ledger, ws.path(), "loom:pr", &rows[1..4]);
     assert_eq!(ledger.host_debt(HOUR).merge, Some(AxisDebt::default()));
+}
+
+#[test]
+fn parked_prs_are_not_changes_debt() {
+    // #9421: Doctor skips `loom:changes-requested` PRs that carry a park label
+    // (`loom:blocked` / `loom:operator-only`, doctor.md Priority 2), so they
+    // must not hold the build back-off engaged. `loom:operator` is still
+    // Doctor work (#7660) and `loom:treating` is a live claim: both count.
+    let labelled = |n: u32, label: &str| RestIssue {
+        labels: vec!["loom:changes-requested".to_string(), label.to_string()],
+        ..row(n, true)
+    };
+    let rows = vec![
+        labelled(1, "loom:needs-fix"),
+        labelled(2, "loom:blocked"), // the Doctor-cycle-cap park
+        labelled(3, "loom:operator-only"),
+        labelled(4, "loom:operator"),
+        labelled(5, "loom:treating"),
+    ];
+    assert_eq!(count_axis_rows(DebtAxis::Changes, &rows), 3, "#1, #4 and #5");
+    assert_eq!(count_axis_rows(DebtAxis::Review, &rows), 5, "review is unfiltered");
+    assert_eq!(count_axis_rows(DebtAxis::Merge, &rows), 2, "merge set unchanged");
+
+    let ledger = DemandLedger::default();
+    let ws = workspace("{}");
+    record_listing(&ledger, ws.path(), "loom:changes-requested", &rows);
+    assert_eq!(
+        ledger.host_debt(HOUR).changes,
+        Some(AxisDebt {
+            total: 3,
+            roots_with_debt: 1
+        })
+    );
+
+    // Every PR parked: the axis is observed and zero, not unobserved.
+    record_listing(&ledger, ws.path(), "loom:changes-requested", &rows[1..3]);
+    assert_eq!(ledger.host_debt(HOUR).changes, Some(AxisDebt::default()));
+}
+
+#[test]
+fn review_debt_counts_held_and_parked_prs() {
+    // #9421: Judge's queue has no label exclusions, so every open
+    // `loom:review-requested` PR is review debt whatever else it carries.
+    let labelled = |n: u32, label: &str| RestIssue {
+        labels: vec!["loom:review-requested".to_string(), label.to_string()],
+        ..row(n, true)
+    };
+    let rows = vec![
+        labelled(1, "loom:blocked"),
+        labelled(2, "loom:operator"),
+        labelled(3, "loom:operator-only"),
+    ];
+    let ledger = DemandLedger::default();
+    let ws = workspace("{}");
+    record_listing(&ledger, ws.path(), "loom:review-requested", &rows);
+    assert_eq!(ledger.host_debt(HOUR).review.unwrap().total, 3);
+}
+
+#[test]
+fn changes_park_set_is_the_work_finder_park_set() {
+    // #9421: the changes exclusion reuses `work_finder::PARK_LABELS` rather
+    // than a second literal list, and deliberately differs from the merge
+    // hold set by `loom:operator` (#7660).
+    assert_eq!(axis_park_labels(DebtAxis::Changes), crate::work_finder::PARK_LABELS);
+    assert!(!axis_park_labels(DebtAxis::Changes).contains(&"loom:operator"));
+    assert_eq!(axis_park_labels(DebtAxis::Merge), &MERGE_HOLD_LABELS[..]);
+    assert!(axis_park_labels(DebtAxis::Review).is_empty());
 }
 
 #[test]

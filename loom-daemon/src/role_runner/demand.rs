@@ -313,25 +313,45 @@ pub fn count_pr_rows(rows: &[RestIssue]) -> usize {
 /// separate `loom:critical-file-hold` label, only a comment marker.
 pub const MERGE_HOLD_LABELS: [&str; 3] = ["loom:blocked", "loom:operator", "loom:operator-only"];
 
-/// Open PR rows that count as debt on `axis`. Merge debt leaves out PRs held
-/// for a human ([`MERGE_HOLD_LABELS`]): Champion cannot drain them, and
-/// counting them would keep the work finder's build back-off (#9410) engaged
-/// on a host with many held PRs. Uses the labels already in the listing rows.
+/// Labels whose presence means `axis`'s owning role will not drain the PR.
+/// Each set is defined once, where its role's skip rule lives:
+///
+/// - Merge: [`MERGE_HOLD_LABELS`] (`champion-pr-merge.md`).
+/// - Changes: [`crate::work_finder::PARK_LABELS`] (`loom:blocked`,
+///   `loom:operator-only`), the set `doctor.md` Priority 2 skips (#9421).
+///   `loom:operator` is deliberately *not* in it: Champion routes stale held
+///   PRs to Doctor with that label still on, and Doctor drains them (#7660).
+///   The Doctor-cycle-cap park (`loom:blocked` + `loom:changes-requested`)
+///   falls in this set. `loom:treating` is a live Doctor claim, not a park,
+///   so it stays counted.
+/// - Review: none. `judge.md`'s queue has no label exclusions.
+fn axis_park_labels(axis: DebtAxis) -> &'static [&'static str] {
+    match axis {
+        DebtAxis::Merge => &MERGE_HOLD_LABELS,
+        DebtAxis::Changes => crate::work_finder::PARK_LABELS,
+        DebtAxis::Review => &[],
+    }
+}
+
+/// Open PR rows that count as debt on `axis`. PRs the axis's owning role will
+/// not drain are left out ([`axis_park_labels`]): merge debt skips PRs held
+/// for a human ([`MERGE_HOLD_LABELS`]), changes debt skips parked PRs
+/// ([`crate::work_finder::PARK_LABELS`], #9421), review debt is unfiltered.
+/// Counting undrainable PRs would keep the work finder's build back-off
+/// (#9410) engaged on a host with many of them. Uses the labels already in
+/// the listing rows.
 #[must_use]
 pub fn count_axis_rows(axis: DebtAxis, rows: &[RestIssue]) -> usize {
-    let held = |r: &RestIssue| {
-        r.labels
-            .iter()
-            .any(|l| MERGE_HOLD_LABELS.contains(&l.as_str()))
-    };
+    let parks = axis_park_labels(axis);
     rows.iter()
         .filter(|r| r.is_pull_request && r.state.eq_ignore_ascii_case("open"))
-        .filter(|r| axis != DebtAxis::Merge || !held(r))
+        .filter(|r| !r.labels.iter().any(|l| parks.contains(&l.as_str())))
         .count()
 }
 
 /// Record a queue listing the role runner already made for `root`: a no-op
 /// for a label that feeds no axis, or when `root` has demand width disabled.
+/// Counts via [`count_axis_rows`], so parked / held PRs are left out per axis.
 pub fn record_listing(ledger: &DemandLedger, root: &Path, label: &str, rows: &[RestIssue]) {
     if let Some(axis) = DebtAxis::for_label(label) {
         if read_demand_config(root).enabled {
