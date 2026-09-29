@@ -1450,6 +1450,7 @@ mod tests {
         std::fs::create_dir(&lock).unwrap();
         let sweep_id = "sweep-issue-404-adopt";
         let owner = LockOwner {
+            overflow: false,
             pgid: None,
             model: None,
             effort: None,
