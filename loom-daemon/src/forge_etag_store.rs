@@ -212,6 +212,41 @@ pub(crate) fn fetch_conditional(
     url: &str,
     etag: Option<&str>,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
+    // #9537: a listing is a read, so it goes to the repo's reader App when one
+    // is usable. On a credential failure the reader is withdrawn and the SAME
+    // request is retried once on the writer, so a broken reader costs one
+    // extra call, never a failed poll. The cache key deliberately stays on the
+    // writer's credential scope: reader choice is deterministic per repo, so
+    // keeping the key means no ETag is invalidated when readers come online.
+    let reader = target
+        .repo
+        .as_deref()
+        .and_then(|r| crate::forge_identity::read_credential(r, target.host.as_deref()));
+    if let Some((dir, app_id)) = reader {
+        let first = run_fetch(caller, gh_bin, cwd, target, url, etag, Some(&dir))?;
+        let (status, response, stderr) = &first;
+        let http = response.as_ref().map(|r| r.status);
+        let ok = status.success() || matches!(http, Some(200 | 304));
+        if ok || !crate::forge_identity::is_credential_failure(stderr, http) {
+            return Ok(first);
+        }
+        crate::forge_identity::withdraw_reader(&app_id, &format!("{caller} {url}"));
+    }
+    run_fetch(caller, gh_bin, cwd, target, url, etag, None)
+}
+
+/// One `gh api --include` run. `reader_dir` = `Some` runs it under that
+/// reader's `GH_CONFIG_DIR`; `None` under the writer's (#5401 per-owner, else
+/// process-global).
+fn run_fetch(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    target: &Target,
+    url: &str,
+    etag: Option<&str>,
+    reader_dir: Option<&Path>,
+) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
     let mut cmd = Command::new(gh_bin);
     cmd.arg("api").arg("--include").arg(url);
     if let Some(host) = &target.host {
@@ -225,10 +260,15 @@ pub(crate) fn fetch_conditional(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    // #5401: point a cross-owner managed repo's listing at its own owner's
-    // installation-token `GH_CONFIG_DIR` (no-op for single-owner fleets / a
-    // `None` cwd).
-    crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, cwd);
+    match reader_dir {
+        Some(dir) => {
+            cmd.env("GH_CONFIG_DIR", dir);
+        }
+        // #5401: point a cross-owner managed repo's listing at its own owner's
+        // installation-token `GH_CONFIG_DIR` (no-op for single-owner fleets / a
+        // `None` cwd).
+        None => crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, cwd),
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let out = cmd
         .output()

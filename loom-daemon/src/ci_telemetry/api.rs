@@ -213,6 +213,20 @@ pub fn parse_raw(raw: &str) -> Option<ApiResponse> {
     Some(response)
 }
 
+/// `owner/repo` from a `repos/<owner>/<repo>/…` API path (leading `/`
+/// allowed), for picking the repo's reader. Anything else (`graphql`,
+/// `orgs/…`) is `None` and runs on the writer.
+fn repo_of_path(path: &str) -> Option<String> {
+    let mut parts = path.trim_start_matches('/').split('/');
+    if parts.next()? != "repos" {
+        return None;
+    }
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    let repo = repo.split(['?', '#']).next().filter(|s| !s.is_empty())?;
+    Some(format!("{owner}/{repo}"))
+}
+
 /// Production client: one `gh api --include` subprocess per request.
 pub struct GhCliApi {
     gh_bin: PathBuf,
@@ -229,12 +243,63 @@ impl GhCliApi {
 }
 
 impl GhCliApi {
-    /// Run one `gh api --include …` invocation and classify its output.
+    /// Run one `gh api --include …` read and classify its output.
+    ///
+    /// #9537: a `repos/<owner>/<repo>/…` path is a repo-scoped read, so it
+    /// runs under that repo's reader App when one is usable (readers carry
+    /// `actions: read`). A rate limit or an auth/coverage refusal withdraws
+    /// the reader (until the reported reset, when there is one) and the same
+    /// call is retried once on the writer's credential.
     fn run(&self, path: &str, extra: &[&str]) -> Result<ApiResponse, ApiError> {
+        let reader =
+            repo_of_path(path).and_then(|nwo| crate::forge_identity::read_credential(&nwo, None));
+        if let Some((dir, app_id)) = reader {
+            let first = self.run_once(path, extra, Some(&dir));
+            let withdraw_until = match &first {
+                Err(ApiError::RateLimited { reset_epoch, .. }) => Some(
+                    reset_epoch
+                        .and_then(|e| u64::try_from(e).ok())
+                        .map(|e| std::time::UNIX_EPOCH + std::time::Duration::from_secs(e))
+                        .unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                + crate::forge_read_pool::DEFAULT_WITHDRAWAL
+                        }),
+                ),
+                Err(ApiError::Http {
+                    status: 401 | 403 | 404,
+                    ..
+                }) => {
+                    Some(std::time::SystemTime::now() + crate::forge_read_pool::DEFAULT_WITHDRAWAL)
+                }
+                _ => None,
+            };
+            let Some(until) = withdraw_until else {
+                return first;
+            };
+            log::warn!(
+                "ci_telemetry: reader app {app_id} refused {path}; withdrawn and retrying on the \
+                 writer — #9537"
+            );
+            crate::forge_read_pool::withdraw_until(&app_id, until);
+        }
+        self.run_once(path, extra, None)
+    }
+
+    /// One `gh api --include …` invocation, under `reader_dir`'s credential
+    /// when given, else the process's own.
+    fn run_once(
+        &self,
+        path: &str,
+        extra: &[&str],
+        reader_dir: Option<&std::path::Path>,
+    ) -> Result<ApiResponse, ApiError> {
         let mut cmd = Command::new(&self.gh_bin);
         cmd.arg("api").arg("--include");
         for argument in extra {
             cmd.arg(argument);
+        }
+        if let Some(dir) = reader_dir {
+            cmd.env("GH_CONFIG_DIR", dir);
         }
         cmd.arg(path).stdout(Stdio::piped()).stderr(Stdio::piped());
         let output = cmd.output().map_err(|e| {
@@ -346,5 +411,23 @@ terminal escapes will be refused by gh rather than captured (upgrade gh to captu
             "gh run download {run_id} --name {name} failed: {}",
             bounded(&stderr)
         )))
+    }
+}
+
+#[cfg(test)]
+mod repo_of_path_tests {
+    use super::repo_of_path;
+
+    #[test]
+    fn repo_scoped_paths_name_their_repo_and_others_do_not() {
+        assert_eq!(
+            repo_of_path("repos/2AMLogic/2am/actions/runs?per_page=5").as_deref(),
+            Some("2AMLogic/2am")
+        );
+        assert_eq!(repo_of_path("/repos/o/r").as_deref(), Some("o/r"));
+        assert_eq!(repo_of_path("repos/o/r?x=1").as_deref(), Some("o/r"));
+        assert_eq!(repo_of_path("graphql"), None);
+        assert_eq!(repo_of_path("orgs/o/installations"), None);
+        assert_eq!(repo_of_path("repos/o"), None);
     }
 }
