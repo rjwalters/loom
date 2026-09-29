@@ -754,6 +754,20 @@ fn emit_correlated(
             rows,
         );
     }
+    // #9231: the tick's terminal transition, mirroring
+    // `runtime_usage::finish_sweep` — the usage spans above, then the close of
+    // the join entry `lifecycle::role_invocation` opened at dispatch.
+    // Unconditional on usage being known: an entry left open because the tick
+    // spent nothing would keep matching every later session of this role for
+    // the full `RETAIN_OPEN_HOURS` window, which is exactly the ambiguity
+    // #9013 item 3 bounded for sweeps.
+    if let Some(trace) = &trace {
+        crate::observability::runtime_usage::join::close(
+            &tick.root,
+            &trace.execution,
+            tick.ended_at,
+        );
+    }
     if let (Some(trace), Some(targets)) = (trace, targets) {
         let facts = story::TickFacts {
             trace,

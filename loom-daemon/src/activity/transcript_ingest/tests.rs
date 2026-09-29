@@ -817,7 +817,7 @@ fn without_an_analysis_sink_no_session_analysis_is_emitted() {
 /// trace id. Every one of the four is now resolved.
 #[test]
 fn a_worktree_session_carries_the_repo_slug_issue_pr_and_sweep_trace() {
-    use crate::observability::runtime_usage::join::{JoinEntry, JOIN_DIR};
+    use crate::observability::runtime_usage::join::{JoinEntry, JoinKey, JOIN_DIR};
     use crate::telemetry::trace::TraceContext;
 
     let home = tempfile::tempdir().unwrap();
@@ -860,12 +860,11 @@ fn a_worktree_session_carries_the_repo_slug_issue_pr_and_sweep_trace() {
     std::fs::create_dir_all(&joins).unwrap();
     std::fs::write(
         joins.join(format!("{}-{}.json", context.trace_id.as_str(), context.span_id.as_str())),
-        serde_json::to_vec(&JoinEntry {
-            issue: 9445,
-            context: context.clone(),
-            started_at: Utc::now() - chrono::Duration::hours(1),
-            ended_at: None,
-        })
+        serde_json::to_vec(&JoinEntry::new(
+            JoinKey::Issue(9445),
+            context.clone(),
+            Utc::now() - chrono::Duration::hours(1),
+        ))
         .unwrap(),
     )
     .unwrap();
