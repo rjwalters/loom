@@ -413,6 +413,45 @@ pub struct TokenTotals {
     pub tokens_out: u64,
 }
 
+/// Why [`SweepOutcomeRecord`]'s token counters are what they are (Issue
+/// #9440) — the discriminator that separates "this sweep burned nothing"
+/// from "this sweep burned something we could not read".
+///
+/// Before #9440 both cases were spelled the same way: the counters were simply
+/// absent. Measured against the fleet's D1 store over 2026-08-15..09-29, only
+/// 10.3% of `sweep.outcome` records carried `tokens_in`/`tokens_out` at all,
+/// so any per-issue "total tokens to land" sum silently collapsed onto the one
+/// landing sweep and reported a lifecycle cost that was, by construction,
+/// indistinguishable from the clean cost. This field is what makes the two
+/// views separable without the consumer having to guess.
+///
+/// The absent-vs-zero discipline `defaults/docs/telemetry-schema.md` states
+/// still holds, and this enum is how: a **measured zero** is published for
+/// [`NotSpawned`](Self::NotSpawned) only, because that is the one case where
+/// zero is the observation rather than the absence of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokensStatus {
+    /// An agent process ran and its usage was read. The counters are real —
+    /// including a **partial** read for a sweep cancelled or killed mid-phase,
+    /// which is the honest answer for work that genuinely happened and then
+    /// stopped, not a reason to omit the measurement.
+    Measured,
+    /// No agent process ever ran: a pre-flight abort or a spawn death, i.e.
+    /// every `preflight-*` class plus `no-usable-account`, none of which
+    /// reaches the CLI at all. This is the **only** status that publishes
+    /// `tokens_in: 0` / `tokens_out: 0`, because for it zero is measured.
+    NotSpawned,
+    /// An agent process ran (or could not be proven not to) but its usage
+    /// could not be attributed — a pruned/rotated transcript, no usage store
+    /// for the runtime, or no bounded wall-clock window to attribute within.
+    /// The counters stay **absent**, and
+    /// [`SweepOutcomeRecord::tokens_status_reason`] names which of those it
+    /// was. Never coerce this to zero: that is exactly the undercount #9440
+    /// exists to remove.
+    Unattributable,
+}
+
 /// `sweep.started` — a sweep began work on an issue.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SweepStartedRecord {
@@ -770,6 +809,31 @@ pub struct SweepOutcomeRecord {
     /// masquerading as data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complexity: Option<String>,
+    /// Why this record's token counters read the way they do (Issue #9440) —
+    /// see [`TokensStatus`]. Present on every record this daemon writes; a
+    /// record written before #9440 omits it, which a consumer must read as
+    /// "unknown", **not** as any of the three statuses.
+    ///
+    /// The invariant that makes a lifecycle sum computable:
+    /// `tokens_status == Measured` ⟺ at least one of
+    /// [`tokens_in`](Self::tokens_in)/[`tokens_by_model`](Self::tokens_by_model)
+    /// is present; `NotSpawned` ⟹ `tokens_in == Some(0)` and
+    /// `tokens_out == Some(0)`; `Unattributable` ⟹ both absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_status: Option<TokensStatus>,
+    /// The machine-readable reason behind a non-`measured`
+    /// [`tokens_status`](Self::tokens_status) (Issue #9440). For
+    /// [`TokensStatus::NotSpawned`] this is the death class that proved it
+    /// (`preflight-no-cli-start`, `preflight-token-selection-failed`,
+    /// `no-usable-account`, …); for [`TokensStatus::Unattributable`] it is one
+    /// of the fixed reasons `crate::sweep_usage` defines (`no-sweep-window`,
+    /// `no-usage-store`, `no-attributable-transcript`).
+    ///
+    /// Always absent for [`TokensStatus::Measured`] — a measurement needs no
+    /// excuse — and never free-form prose: it is a value a query can `GROUP
+    /// BY`, which is the whole point of separating the absence cases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_status_reason: Option<String>,
 }
 
 impl SweepOutcomeRecord {

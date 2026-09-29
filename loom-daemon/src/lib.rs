@@ -281,6 +281,14 @@ pub mod sweep_journal;
 pub mod sweep_outcome_summary;
 pub mod sweep_outcomes;
 pub mod sweep_registry;
+/// One sweep's token usage *and* the `tokens_status` that explains it (Issue
+/// #9440) — the single resolver both `sweep.outcome` construction sites share,
+/// so a failed, cancelled or watchdog-killed sweep reports its spend exactly
+/// the way a successful one does. A sibling module rather than more code in
+/// [`usage_source`]: this adds a *decision* (measured / not-spawned /
+/// unattributable) on top of that module's reader dispatch, and the two emit
+/// sites must not be able to disagree about it.
+pub mod sweep_usage;
 pub mod tap_usage;
 pub mod target_dir_gc;
 pub mod telemetry;

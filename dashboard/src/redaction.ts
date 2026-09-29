@@ -137,7 +137,10 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   // *why* a private repo's sweep ended than the `result` above ("the Curator
   // closed this issue", "the work was rejected"), i.e. the same category
   // `failure_class` is held back for. The coarse `result` stays public and
-  // unchanged.
+  // unchanged. Issue #9440's `tokens_status` / `tokens_status_reason` are
+  // absent too: they describe the token pair's own provenance, so exposing
+  // them without the pair would leak the shape of a private repo's spend (and
+  // with it, nothing a public consumer can use).
   //
   // `phase_durations` moved OUT of this list in #9443 and into
   // `PUBLIC_RECORD_DERIVATIONS` below. It used to be a raw copy, which was
