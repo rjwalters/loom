@@ -3186,6 +3186,10 @@ fn verdict_pr(kind: VerdictKind, head: Option<&str>, marker_sha: Option<&str>) -
         // marker means "confirmed unmarked" rather than "not looked at".
         marker_scan_ok: true,
         on_hold: false,
+        // #9124: the ordinary case is "nobody has announced this transition
+        // yet", so the audit comment goes out. `decide_verdict` does not read
+        // this field at all -- it only gates the duplicate comment.
+        invalidation_recorded: false,
     }
 }
 
@@ -3426,7 +3430,8 @@ fn verdict_reconcile_stats_report_the_residual_unanchored_exposure() {
         checked: 4,
         invalidated: 1,
         unverifiable: 3,
-        anchored: 2,
+        anchored: 2, // #9124's counter is exercised in verdict_dedup_tests.rs
+        ..VerdictReconcileStats::default()
     };
     assert_eq!(stats.residual_unverifiable(), 1);
     stats.merge(VerdictReconcileStats {
@@ -3434,6 +3439,7 @@ fn verdict_reconcile_stats_report_the_residual_unanchored_exposure() {
         invalidated: 0,
         unverifiable: 1,
         anchored: 0,
+        ..VerdictReconcileStats::default()
     });
     assert_eq!(stats.checked, 6);
     assert_eq!(stats.invalidated, 1);
