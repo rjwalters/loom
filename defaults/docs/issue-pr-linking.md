@@ -15,8 +15,8 @@ non-final PR of a multi-PR landing, which is not a rare shape:
 - Measured over 329 landed issues (2026-08-15..09-29, issue #9465), **19 of
   329** sweep-landing PRs were absent from that connection entirely.
 - **20** issues landed through more than one merged PR on a reused
-  `feature/issue-N` branch; one (`2AMLogic/gf180-pll#237`) landed through
-  **47**, whose lifecycle churn was up to 835× the final PR's diff.
+  `feature/issue-N` branch; one (`example-org/hardware-repo#237`) landed
+  through **47**, whose lifecycle churn was up to 835× the final PR's diff.
 
 So "work delivered for issue N" is either under-counted (final PR only) or has
 to be recovered by scraping branch names — which is not a link, only a
