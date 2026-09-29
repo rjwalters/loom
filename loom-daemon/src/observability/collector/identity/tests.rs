@@ -33,6 +33,7 @@ fn unchanged_identity_replays_after_start_or_phase_without_rereading_launch() {
     queue.ack(1);
     for event in [
         Event::SweepGlobalDispatch {
+            story_points: None,
             sweep_id: "sweep-42".into(),
             kind: SweepKind::Issue(42),
             runtime: None,

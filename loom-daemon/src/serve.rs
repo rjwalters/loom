@@ -1551,6 +1551,7 @@ mod tests {
                 repo: None,
             },
             Event::SweepGlobalDispatch {
+                story_points: None,
                 sweep_id: "sweep-4392".to_string(),
                 kind: SweepKind::Issue(4392),
                 runtime: None,
@@ -1669,6 +1670,7 @@ mod tests {
     #[test]
     fn sse_frame_preserves_the_typed_event_payload() {
         let frame = sse_frame(&Event::SweepGlobalDispatch {
+            story_points: None,
             sweep_id: "sweep-4392".to_string(),
             kind: SweepKind::Issue(4392),
             runtime: None,
@@ -1975,6 +1977,7 @@ mod tests {
 
         fake.bus
             .publish(Event::SweepGlobalDispatch {
+                story_points: None,
                 sweep_id: "sweep-4392".to_string(),
                 kind: SweepKind::Issue(4392),
                 runtime: None,
