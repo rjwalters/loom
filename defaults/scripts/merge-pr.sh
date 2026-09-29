@@ -1590,6 +1590,31 @@ _strip_closed_issue_building_labels() {
 }
 
 # ---------------------------------------------------------------------------
+# Close-triggered `loom:blocked` re-check (#9102; item 2 of #8927's deferred
+# fix list). `loom-daemon check-stale-blocked` (#8927) finds a stale block at
+# the next sweep pre-wave; this finds it the moment the blocker closes: every
+# open `loom:blocked` issue/PR citing this merged PR, or an issue it closed, as
+# a blocker gets a comment now. The decision and the comment both live in
+# `loom-daemon notify-cleared-blockers` (it reuses the advisory's enumeration
+# and the `dep_recheck` parsers — no second parser, per
+# .loom/docs/shell-language-policy.md); this is only the call. One call per
+# merge, so the population is scanned once. It never edits a label.
+# Best-effort and GitHub-only, like every step in this section.
+_notify_cleared_blockers() {
+  [[ "$FORGE_TYPE" == "github" ]] || return 0
+  local closed=("$PR_NUMBER") n out rc=0
+  while IFS= read -r n; do [[ -n "$n" ]] && closed+=("$n"); done \
+    <<< "$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
+  out="$("${LOOM_DAEMON_BIN:-loom-daemon}" notify-cleared-blockers --repo "$REPO_NWO" --repo-root "${REPO_ROOT:-.}" --closed "${closed[@]}" 2>&1)" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    warning "Close-triggered loom:blocked re-check (#9102) did not run (exit $rc): ${out//$'\n'/ } The next sweep's check-stale-blocked pass still covers it. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+  elif [[ "$out" != *"no open loom:blocked artifact newly cleared"* ]]; then
+    info "Close-triggered loom:blocked re-check (#9102): ${out//$'\n'/; }"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Automated stacked-PR reconciliation on parent merge (#3747, stacked-PR v2,
 # item 1 of the v2 epic — the remaining five items stay deferred).
 #
@@ -2427,6 +2452,11 @@ _reset_partial_increment_labels || true
 # header comment above) and at the same confirmed-merge choke point.
 # Best-effort — never fails the merge.
 _strip_closed_issue_building_labels || true
+
+# Close-triggered loom:blocked re-check (#9102). Runs right after the
+# loom:building cleanup above, at the same confirmed-merge choke point.
+# Best-effort — never fails the merge. See the function's own header above.
+_notify_cleared_blockers || true
 
 # Automated stacked-PR reconciliation (#3747, stacked-PR v2 item 1). Runs at the
 # same confirmed-merge choke point, and BEFORE branch deletion below so the
