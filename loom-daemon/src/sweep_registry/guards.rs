@@ -2095,6 +2095,18 @@ impl SweepRegistry {
     }
 }
 
+/// The `owner/name` forge slug from the process-global `LOOM_REPO` override —
+/// the LOCAL-only leg of [`SweepRegistry::resolve_owner_repo`], with no forge
+/// call (Issue #9442). This is the only slug source a `skip_label_flip` run
+/// may use at the outcome-journal terminal transition, because that mode
+/// gates every forge read there; an unresolvable workspace yields `None` and
+/// the record ships `repo_unresolved` instead of ever carrying a path.
+pub(crate) fn repo_slug_from_env() -> Option<String> {
+    let repo = std::env::var("LOOM_REPO").ok()?;
+    let (o, r) = repo.split_once('/')?;
+    (!(o.is_empty() || r.is_empty())).then_some(repo)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

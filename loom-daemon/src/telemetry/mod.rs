@@ -388,8 +388,11 @@ pub struct SweepPhaseRecord {
 /// `sweep.completed` — a sweep reached a terminal state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SweepCompletedRecord {
-    /// Repository the sweep worked, `owner/repo` form.
-    pub repo: String,
+    /// Repository the sweep worked, `owner/repo` form (Issue #9442: always a
+    /// forge slug, never a local path; omitted with the outcome record's
+    /// `repo_unresolved` when the workspace's slug could not be resolved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// Public/private tag for `repo`. Missing/unknown ⇒ [`RepoVisibility::Private`].
     #[serde(default)]
     pub visibility: RepoVisibility,
@@ -420,8 +423,21 @@ pub struct SweepCompletedRecord {
 /// #4704's persistence layer); #4704 maps this schema record into its journal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SweepOutcomeRecord {
-    /// Repository the sweep worked, `owner/repo` form.
-    pub repo: String,
+    /// Repository the sweep worked, `owner/repo` form (Issue #9442: ALWAYS a
+    /// forge slug — never a local filesystem path). Omitted (with
+    /// [`Self::repo_unresolved`] set) when the emitter could not resolve the
+    /// workspace's `owner/name` from its git remote / `LOOM_REPO` override:
+    /// every pre-#9442 record and every unresolvable workspace simply carries
+    /// no `repo` key, so per-repo queries no longer need a basename
+    /// normalization step and host usernames/layout never leave the machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// The workspace's `owner/name` could not be resolved at emit time (Issue
+    /// #9442) — the honest companion of an absent [`Self::repo`]. Present
+    /// (serialized as `true`) only when unresolved, so a resolved record is
+    /// byte-identical to a pre-#9442 one apart from the field's absence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repo_unresolved: bool,
     /// Public/private tag for `repo`. Missing/unknown ⇒ [`RepoVisibility::Private`].
     #[serde(default)]
     pub visibility: RepoVisibility,
@@ -664,6 +680,19 @@ pub enum RoleTickResult {
     SkippedLoad,
     /// Skipped pre-spawn: a queue-gated role's work queue was empty (#9391).
     SkippedQueueEmpty,
+}
+
+/// Whether a `repo` string is a local filesystem path (or empty) rather than
+/// an `owner/name` forge slug (Issue #9442).
+///
+/// Emitters must never write a path into a telemetry record's `repo` field:
+/// paths leak host usernames/layout into stores with fleet-wide views, and a
+/// basename collision across orgs would silently merge two repos. This is the
+/// one predicate both the journal emitter and the event-bus collector use to
+/// route a path-shaped value to resolution-or-`repo_unresolved` instead.
+#[must_use]
+pub fn is_path_shaped_repo(repo: &str) -> bool {
+    repo.starts_with('/') || repo.is_empty()
 }
 
 impl RoleTickResult {

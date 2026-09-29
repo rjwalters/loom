@@ -932,7 +932,8 @@ mod tests {
         telemetry::TelemetryEnvelope::new(
             "host-test",
             telemetry::TelemetryRecord::SweepOutcome(telemetry::SweepOutcomeRecord {
-                repo: "rjwalters/loom".to_string(),
+                repo: Some("rjwalters/loom".to_string()),
+                repo_unresolved: false,
                 visibility: telemetry::RepoVisibility::Public,
                 issue,
                 sweep_id: format!("sweep-issue-{issue}-0"),

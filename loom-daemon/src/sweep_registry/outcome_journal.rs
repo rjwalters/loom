@@ -568,22 +568,35 @@ impl SweepRegistry {
                 .flatten()
         });
 
-        let (repo, visibility) = if self.config.skip_label_flip {
-            (
-                self.config.workspace_root.display().to_string(),
-                telemetry::RepoVisibility::Private,
-            )
+        // Issue #9442: `repo` is ALWAYS the `owner/name` forge slug or absent.
+        // The pre-#9442 fallback wrote `workspace_root`'s display path on any
+        // resolution failure — leaking host usernames/layout into fleet-wide
+        // stores and forcing every per-repo query to carry a basename
+        // normalization step. When the slug cannot be resolved, the record
+        // omits `repo` and sets `repo_unresolved` instead.
+        //
+        // The two branches differ ONLY in how far resolution may reach:
+        // `skip_label_flip` gates every forge read at this site (timeline,
+        // complexity), so it keeps that property and resolves from the local
+        // `LOOM_REPO` override alone; the normal branch also asks `gh repo
+        // view` (breaker-gated, fail-open). Visibility stays Private under
+        // `skip_label_flip`, exactly as before.
+        let (repo, visibility, repo_unresolved) = if self.config.skip_label_flip {
+            match repo_slug_from_env() {
+                Some(slug) => (Some(slug), telemetry::RepoVisibility::Private, false),
+                None => (None, telemetry::RepoVisibility::Private, true),
+            }
         } else {
-            let repo_slug = self
+            match self
                 .resolve_owner_repo()
-                .map(|(owner, repo)| format!("{owner}/{repo}"));
-            let visibility = repo_slug
-                .as_deref()
-                .map(telemetry::visibility::derive_visibility)
-                .unwrap_or(telemetry::RepoVisibility::Private);
-            let repo =
-                repo_slug.unwrap_or_else(|| self.config.workspace_root.display().to_string());
-            (repo, visibility)
+                .map(|(owner, repo)| format!("{owner}/{repo}"))
+            {
+                Some(slug) => {
+                    let visibility = telemetry::visibility::derive_visibility(&slug);
+                    (Some(slug), visibility, false)
+                }
+                None => (None, telemetry::RepoVisibility::Private, true),
+            }
         };
 
         // Lines added/deleted (Issue #5357): prefer the value this registry
@@ -689,6 +702,7 @@ impl SweepRegistry {
 
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
+            repo_unresolved,
             visibility,
             issue,
             sweep_id: sweep_id.to_string(),
@@ -730,7 +744,6 @@ impl SweepRegistry {
             .and_then(|v| v.as_str().map(str::to_owned))
             .unwrap_or_else(|| "unknown".into());
         let mut metadata = crate::observability::lifecycle::attributes(&[
-            ("loom.repo", &outcome_record.repo),
             ("loom.issue", &issue.to_string()),
             (
                 "loom.repo.visibility",
@@ -741,6 +754,15 @@ impl SweepRegistry {
                 },
             ),
         ]);
+        // Issue #9442: `loom.repo` only when the slug resolved; the unresolved
+        // case is stamped explicitly so fleet queries can count it instead of
+        // guessing from an absent attribute.
+        if let Some(slug) = outcome_record.repo.as_deref() {
+            metadata.insert("loom.repo".into(), slug.to_string());
+        }
+        if outcome_record.repo_unresolved {
+            metadata.insert("loom.repo_unresolved".into(), "true".into());
+        }
         if let Some(pr) = pr_number {
             metadata.insert("loom.pr_number".into(), pr.to_string());
         }

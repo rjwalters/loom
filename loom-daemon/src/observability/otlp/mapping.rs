@@ -236,13 +236,18 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             ],
         ),
         TelemetryRecord::SweepCompleted(r) => {
+            // Issue #9442: `loom.repo` only when the slug resolved; the
+            // unresolved case is stamped explicitly instead of a path ever
+            // being written.
             let mut attributes = vec![
-                kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
             ];
+            if let Some(repo) = &r.repo {
+                attributes.insert(0, kv_string("loom.repo", repo.clone()));
+            }
             if let Some(usage) = metadata::usage(r.tokens_by_model.as_deref()) {
                 attributes.push(usage);
             }
@@ -252,21 +257,28 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 format!(
                     "sweep completed ({}): {} issue #{}",
                     result_str(r.result),
-                    r.repo,
+                    r.repo.as_deref().unwrap_or("(unresolved repo)"),
                     r.issue
                 ),
                 attributes,
             )
         }
         TelemetryRecord::SweepOutcome(r) => {
+            // Issue #9442: `loom.repo` only when the slug resolved;
+            // `loom.repo_unresolved=true` replaces it, never a host path.
             let mut attributes = vec![
-                kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
                 kv_int("loom.total_duration_sec", r.total_duration_sec),
             ];
+            if let Some(repo) = &r.repo {
+                attributes.insert(0, kv_string("loom.repo", repo.clone()));
+            }
+            if r.repo_unresolved {
+                attributes.push(kv_string("loom.repo_unresolved", "true".to_string()));
+            }
             if let Some(model) = &r.model {
                 attributes.push(kv_string("loom.model", model.clone()));
             }
@@ -303,7 +315,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 format!(
                     "sweep outcome ({}): {} issue #{}, {}s total",
                     result_str(r.result),
-                    r.repo,
+                    r.repo.as_deref().unwrap_or("(unresolved repo)"),
                     r.issue,
                     r.total_duration_sec
                 ),
