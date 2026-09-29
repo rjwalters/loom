@@ -201,7 +201,7 @@ pub fn admission_attributes(outcome: &crate::role_runner::RoleTickOutcome) -> Tr
     use crate::role_runner::RoleTickOutcome;
     let mut attrs = TraceAttributes::new();
     match outcome {
-        RoleTickOutcome::Success => {}
+        RoleTickOutcome::Success | RoleTickOutcome::QueueEmpty => {}
         RoleTickOutcome::Failure(_) => {
             attrs.insert("loom.admission.reason".into(), "failure".into());
         }

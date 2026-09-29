@@ -54,9 +54,8 @@ use crate::event_bus::{EventBus, RecvError};
 use crate::telemetry::{
     is_path_shaped_repo, visibility::derive_visibility, AdmissionBrakeSummary, HostHealthRecord,
     HostProtectionSummary, ManagedRepoEntry, MemoryPressureSummary, PhaseDuration, RepoVisibility,
-    RoleTickFailureEntry,
-    RoleTickHealth, SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord,
-    TokenAccountState, TokenSnapshotRecord,
+    RoleTickFailureEntry, RoleTickHealth, SweepResult, SweepStartedRecord, TelemetryEnvelope,
+    TelemetryRecord, TokenAccountState, TokenSnapshotRecord,
 };
 use crate::tokens_pool::{account_inventory, health_snapshot, AccountProvider};
 use crate::types::{Event, RoleTickRecord, SweepKind};
