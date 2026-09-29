@@ -20,6 +20,7 @@ fn completed(sweep_id: &str) -> Event {
 
 fn dispatched(kind: SweepKind) -> Event {
     Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: "sweep-x".into(),
         kind,
         runtime: None,

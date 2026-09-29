@@ -24,6 +24,7 @@ fn sweep_outcome_carries_complexity_when_the_marker_was_read() {
 #[test]
 fn sweep_outcome_omits_complexity_when_no_marker_was_read() {
     let base = SweepOutcomeRecord {
+        story_points: None,
         repo: Some("rjwalters/loom".to_string()),
         repo_unresolved: false,
         visibility: RepoVisibility::Private,

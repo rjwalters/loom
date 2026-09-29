@@ -861,6 +861,13 @@ impl SweepRegistry {
         let issue_signals = self.fetch_issue_signals(issue);
         let complexity = issue_signals.complexity.clone();
         let issue_end_state = issue_signals.end_state(started_at);
+        // The Curator's story-point size (Issue #9432, epic #9429), folded out
+        // of the SAME read's label list — no extra forge round trip, and the
+        // estimate can never describe a different issue than `complexity` and
+        // the end state do. Pure label folding with the one-label-per-issue
+        // guard: absent, out-of-vocabulary and stacked points labels all yield
+        // `None` (the last two logged loudly), never a guessed or zero size.
+        let story_points = issue_signals.story_points(issue);
 
         // What this sweep actually DID (Issue #9441) — a pure derivation over
         // the signals already assembled above, NOT new instrumentation. The
@@ -909,6 +916,7 @@ impl SweepRegistry {
                 .and_then(|r| r.provider.clone()),
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
             complexity,
+            story_points,
             tokens_status: Some(tokens_status),
             attempt_index,
             previous_sweep_id,
