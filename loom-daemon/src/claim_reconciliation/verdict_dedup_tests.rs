@@ -40,14 +40,14 @@
 //!    diff-vs-base heuristic #9124 originally proposed: `gh api
 //!    compare/{marker_sha}...{head_sha}` reporting `files: []` proves the two
 //!    trees are bit-for-bit identical, not merely "shaped like a rebase". See
-//!    [`super::forge::tree_unchanged`].
+//!    [`super::verdict_invalidation::tree_unchanged`].
 //!
 //! # What changed as a result
 //!
 //! [`super::forge::reconcile_pr_verdicts`] now asks that question before
 //! clearing a verdict `decide_verdict` marked `Invalidate`. When the answer is
 //! "yes, identical", it re-anchors the marker to the new head
-//! ([`super::forge::reanchor_tree_unchanged_verdict`]) instead of clearing the
+//! ([`super::verdict_invalidation::reanchor_tree_unchanged_verdict`]) instead of clearing the
 //! label — the verdict never leaves `loom:pr`/`loom:changes-requested`, so
 //! **this is a direct reduction in PL5a**
 //! (`pr_latency::segments::PrSegments::approval_invalidations`), not merely in
@@ -254,9 +254,8 @@ fn the_repeat_shape_measured_on_pr_9348_is_suppressed_end_to_end() {
 mod tree_carveout_e2e {
     use super::forge;
     use super::{SHA_A, SHA_B};
-    use crate::claim_reconciliation::{
-        VERDICT_STALENESS_ENABLED_ENV, VERDICT_TREE_CARVEOUT_ENABLED_ENV,
-    };
+    use crate::claim_reconciliation::verdict_invalidation::VERDICT_TREE_CARVEOUT_ENABLED_ENV;
+    use crate::claim_reconciliation::VERDICT_STALENESS_ENABLED_ENV;
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;

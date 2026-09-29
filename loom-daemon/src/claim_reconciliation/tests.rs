@@ -3434,11 +3434,11 @@ fn verdict_reconcile_stats_report_the_residual_unanchored_exposure() {
         ..VerdictReconcileStats::default()
     };
     assert_eq!(stats.residual_unverifiable(), 1);
+    // Zero-valued fields come from `..default()` -- `claim_reconciliation.rs`
+    // and this file are both at the file-size ratchet (#9124).
     stats.merge(VerdictReconcileStats {
         checked: 2,
-        invalidated: 0,
         unverifiable: 1,
-        anchored: 0,
         ..VerdictReconcileStats::default()
     });
     assert_eq!(stats.checked, 6);
@@ -3448,7 +3448,6 @@ fn verdict_reconcile_stats_report_the_residual_unanchored_exposure() {
     assert_eq!(stats.residual_unverifiable(), 2);
     // Never underflows if a future caller anchors without counting.
     let odd = VerdictReconcileStats {
-        unverifiable: 0,
         anchored: 1,
         ..VerdictReconcileStats::default()
     };

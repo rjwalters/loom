@@ -3,7 +3,7 @@
 //!
 //! # Why this exists
 //!
-//! [`super::forge::invalidate_verdict`] posts its audit comment **before** it
+//! [`super::verdict_invalidation::invalidate_verdict`] posts its audit comment **before** it
 //! swaps the labels, deliberately: if the label write then fails, the PR keeps
 //! a verdict that is at least explained rather than getting silently
 //! re-queued. That ordering is right, but it was not *idempotent* — and the
@@ -42,7 +42,7 @@
 //! investigation answered separately, with a different result**: a real
 //! avoidable category — a head move whose tree is byte-identical — turned out
 //! to be more than half the sample, and IS carved out. See
-//! `super::forge::tree_unchanged` and `verdict_dedup_tests.rs`'s module doc
+//! `super::verdict_invalidation::tree_unchanged` and `verdict_dedup_tests.rs`'s module doc
 //! for that measurement and fix; the two changes are complementary, not the
 //! same one.
 
@@ -77,7 +77,7 @@ pub(super) fn already_recorded(bodies: &[String], marker_sha: &str, head_sha: &s
     bodies.iter().any(|b| b.contains(&needle))
 }
 
-/// Should [`super::forge::invalidate_verdict`] write the audit comment?
+/// Should [`super::verdict_invalidation::invalidate_verdict`] write the audit comment?
 ///
 /// `false` only when the PR already carries this transition's notice **and**
 /// this pass performed no auto-merge disarm. The disarm carve-out is not
@@ -88,7 +88,7 @@ pub(super) fn should_post(already_recorded: bool, disarmed: bool) -> bool {
     !already_recorded || disarmed
 }
 
-/// The audit comment [`super::forge::invalidate_verdict`] posts.
+/// The audit comment [`super::verdict_invalidation::invalidate_verdict`] posts.
 ///
 /// `disarm_line` is pre-formatted (leading newline included) or empty — an
 /// empty one contributes no line at all, so the comment never claims a disarm
