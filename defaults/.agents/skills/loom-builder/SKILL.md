@@ -324,6 +324,7 @@ gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
 # WRONG: Leaves issue in invalid state with both labels
 gh issue edit <number> --add-label "loom:blocked"
 ```
+Naming a specific dependency? Record it as a park record — see `.loom/docs/park-record.md`.
 
 ### Labels You NEVER Touch
 
@@ -812,6 +813,7 @@ Open the issue and look for:
   ```bash
   gh issue edit <number> --remove-label "loom:issue" --add-label "loom:blocked"
   ```
+  Record the unchecked dependency as a park record — see `.loom/docs/park-record.md`.
 
 **If NO Dependencies section:**
 - Issue has no blockers -> Safe to claim
@@ -827,6 +829,7 @@ If you discover a dependency while working:
    ```
 3. **Create comment** explaining the dependency
 4. **Wait** for dependency to be resolved, or switch to another issue
+5. **Record it as a park record** so the unblock sweep can find it automatically — see `.loom/docs/park-record.md`.
 
 ### Example
 
@@ -999,6 +1002,7 @@ EOF
 ```bash
 gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
 ```
+Record the blocker as a park record too — see `.loom/docs/park-record.md`.
 
 ### Why This Matters
 
