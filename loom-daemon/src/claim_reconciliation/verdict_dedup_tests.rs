@@ -395,6 +395,30 @@ exit 0
         );
     }
 
+    /// #9548: a compare response with no `files` array (an error object, an
+    /// unexpected shape) proves nothing about the trees, so it must fall back
+    /// to the ordinary invalidation, never to a re-anchor.
+    #[test]
+    #[serial]
+    fn a_compare_response_without_files_is_not_an_identical_tree() {
+        for body in [r#"{}"#, r#"{"message":"Not Found"}"#, r#"{"files":null}"#] {
+            let dir = tempdir().unwrap();
+            let repo_root = dir.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            let log = dir.path().join("gh.log");
+            let gh = fake_gh(dir.path(), &log, body);
+            let stats = with_env(
+                &[
+                    (VERDICT_STALENESS_ENABLED_ENV, Some("1")),
+                    (VERDICT_TREE_CARVEOUT_ENABLED_ENV, Some("1")),
+                ],
+                || forge::reconcile_pr_verdicts(&gh, &repo_root),
+            );
+            assert_eq!(stats.invalidated, 1, "{body}");
+            assert_eq!(stats.tree_identical_reanchors, 0, "{body}");
+        }
+    }
+
     /// The kill switch: disabling the carve-out restores the pre-#9124
     /// behavior even when the trees are identical.
     #[test]

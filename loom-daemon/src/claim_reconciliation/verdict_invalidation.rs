@@ -150,17 +150,19 @@ pub(super) fn handle_invalidate(
 /// give a merge queue's required checks a fresh timestamp and explicitly
 /// changes nothing in the tree. `Some(false)` — a real content change;
 /// invalidate as before. `None` — the comparison could not be made (a `gh api`
-/// failure, an unparsable response, a marker SHA the compare endpoint does not
-/// recognize): fails open into "proceed with the ordinary invalidation", the
+/// failure, an unparsable response or one with no `files` array, a marker SHA
+/// the compare endpoint does not recognize): fails open into "proceed with the ordinary invalidation", the
 /// behavior this pass has always had, never into an assumed equivalence on
 /// missing evidence.
 ///
 /// Costs one extra `gh api` call, and only for a PR [`super::decide_verdict`]
 /// has already decided to invalidate — never on the common `Fresh` path.
 fn tree_unchanged(gh_bin: &Path, root: &Path, marker_sha: &str, head_sha: &str) -> Option<bool> {
+    // #9548: `files` is REQUIRED. A response without it (an error object, a
+    // truncated or unexpected shape) is "could not compare", never "the trees
+    // are identical": only the latter re-anchors a verdict without review.
     #[derive(Deserialize)]
     struct CompareFiles {
-        #[serde(default)]
         files: Vec<serde_json::Value>,
     }
     let mut cmd = Command::new(gh_bin);

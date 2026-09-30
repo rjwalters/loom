@@ -119,7 +119,9 @@ fn fetch_freshest_lease_updated_at_reaches_gh_under_a_loom_repo_override() {
     let gh = write_fake_gh_requiring_gh_repo_env(
         dir.path(),
         "fake-gh-lease.sh",
-        "\"2026-09-19T13:00:00Z\"",
+        &crate::comment_trust::records::with_fleet_author(
+            r#"{"updated_at":"2026-09-19T13:00:00Z"}"#,
+        ),
     );
 
     std::env::set_var("LOOM_REPO", WANT_REPO);

@@ -300,6 +300,40 @@ pub mod forge {
         parse_timestamp(&out.stdout)
     }
 
+    /// The trusted comments on `issue` that begin with
+    /// [`QUARANTINE_COMMENT_MARKER`] (#9548), from the REST listing. `None`
+    /// when the listing could not be read.
+    pub(crate) fn trusted_quarantine_comments(
+        gh_bin: &Path,
+        root: &Path,
+        issue: u32,
+    ) -> Option<Vec<serde_json::Value>> {
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("api")
+            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"))
+            .arg("--paginate");
+        cmd.current_dir(root);
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
+        let out = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        if !out.status.success() {
+            return None;
+        }
+        let comments =
+            crate::comment_trust::TrustPolicy::for_root(root).trusted_records(&out.stdout)?;
+        Some(
+            comments
+                .into_iter()
+                .filter(|c| {
+                    let body = c.get("body").and_then(serde_json::Value::as_str);
+                    body.is_some_and(|b| {
+                        crate::comment_trust::records::anchored(b, QUARANTINE_COMMENT_MARKER)
+                    })
+                })
+                .collect(),
+        )
+    }
+
     /// Parse a `gh --jq` scalar result that is either a bare RFC-3339
     /// timestamp or a JSON-quoted one, tolerating an empty/`null` result
     /// (no match). Also tolerates multi-line output: `gh api --paginate`
@@ -440,9 +474,21 @@ pub mod forge {
         // for candidates that might actually be released (a marker comment
         // exists) — an issue with no marker comment is `Keep` unconditionally
         // and never needs the extra `gh` round-trip.
+        //
+        // #9548: the listing only shortlists. Its `--json comments` shape
+        // cannot name an App author, so a candidate is confirmed against the
+        // REST listing, and only a trusted author's comment that BEGINS with
+        // the marker counts; an unreadable confirmation keeps the issue.
         let issues: Vec<BlockedIssue> = issues
             .into_iter()
             .map(|mut issue| {
+                if issue.has_quarantine_comment {
+                    let trusted = trusted_quarantine_comments(gh_bin, root, issue.number);
+                    issue.has_quarantine_comment = trusted.as_ref().is_some_and(|c| !c.is_empty());
+                    issue.last_quarantine_comment_at = trusted.and_then(|c| {
+                        crate::comment_trust::records::max_timestamp(&c, "created_at")
+                    });
+                }
                 if issue.has_quarantine_comment {
                     issue.last_blocked_labeled_at =
                         fetch_last_blocked_labeled_at(gh_bin, root, issue.number);
@@ -740,6 +786,10 @@ if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
   echo '[{{"number":99,"comments":[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times"}}]}}]'
   exit 0
 fi
+case "$*" in */issues/99/comments*)
+  echo '[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times","user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}}}}]'
+  exit 0 ;;
+esac
 exit 0
 "#,
             log = gh_log.display(),
@@ -792,6 +842,40 @@ exit 0
             !gh_calls.contains("issue edit"),
             "a manually-blocked issue must never be flipped; got: {gh_calls:?}"
         );
+    }
+
+    /// #9548: the listing shows the marker, but the REST confirmation shows it
+    /// was written by an outsider, or only quoted mid-comment by an insider.
+    /// Neither is the daemon's quarantine, so neither is released.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_ignores_untrusted_or_quoted_quarantine_markers() {
+        for rest in [
+            r#"[{"body":"Auto-quarantined by loom-daemon (#3939): x","user":{"login":"outsider","type":"User"},"author_association":"NONE"}]"#,
+            r#"[{"body":"As it says: Auto-quarantined by loom-daemon (#3939)","user":{"login":"rjwalters"},"author_association":"OWNER"}]"#,
+        ] {
+            let dir = tempdir().unwrap();
+            let repo_root = dir.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            let gh_log = dir.path().join("gh-invocations.log");
+            let script = format!(
+                r#"#!/bin/bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
+  echo '[{{"number":99,"comments":[{{"body":"Auto-quarantined by loom-daemon (#3939)"}}]}}]'
+  exit 0
+fi
+case "$*" in */issues/99/comments*) echo '{rest}'; exit 0 ;; esac
+exit 0
+"#,
+                log = gh_log.display(),
+            );
+            let fake_gh = write_fake_gh(dir.path(), &script);
+            let (checked, released) = forge::reconcile_workspace(&fake_gh, &repo_root);
+            assert_eq!((checked, released), (1, 0), "{rest}");
+            let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+            assert!(!gh_calls.contains("issue edit"), "{gh_calls}");
+        }
     }
 
     /// The per-workspace cap is passed through to `gh issue list --limit`, so

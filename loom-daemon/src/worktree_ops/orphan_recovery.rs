@@ -1063,9 +1063,9 @@ pub fn format_dry_run_orphans_found_stderr(orphaned_count: usize) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
     use serial_test::serial;
     use tempfile::tempdir;
+    use {super::*, crate::comment_trust::records::with_fleet_author};
 
     fn absent_state() -> SpawnLoopState {
         SpawnLoopState::default()
@@ -1311,7 +1311,7 @@ mod tests {
              printf '%s' '{payload}'\n\
              exit {exit_code}\n\
              fi\n\
-             if [ \"$1\" = \"api\" ]; then printf '2020-01-01T00:00:00Z\\n'; exit 0; fi\n\
+             case \"$*\" in */comments*) exit 0;; esac; if [ \"$1\" = \"api\" ]; then printf '2020-01-01T00:00:00Z\\n'; exit 0; fi\n\
              exit 0\n",
             log = log.display(),
             payload = graphql_payload,
@@ -1526,7 +1526,7 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let log = dir.join("gh-invocations.log");
         let lease_stdout = match lease_updated_at {
-            Some(ts) => format!("printf '%s' '\"{ts}\"'"),
+            Some(ts) => with_fleet_author(&format!("printf '%s' '{{\"updated_at\":\"{ts}\"}}'")),
             None => "true".to_string(),
         };
         let script = format!(
