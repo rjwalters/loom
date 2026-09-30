@@ -203,8 +203,10 @@ pub fn valid_rate(r: f64) -> bool {
 
 #[cfg(target_os = "macos")]
 fn sample_macos() -> HostPressure {
-    let mut out = HostPressure::default();
-    out.mem_total_bytes = sysctl_u64("hw.memsize");
+    let mut out = HostPressure {
+        mem_total_bytes: sysctl_u64("hw.memsize"),
+        ..HostPressure::default()
+    };
     if let Ok(output) = std::process::Command::new("vm_stat").output() {
         if output.status.success() {
             let stats = parse_vm_stat_output(&String::from_utf8_lossy(&output.stdout));
