@@ -1949,16 +1949,31 @@ jobs:
         run: bash defaults/scripts/tests/test-worktree-base-override.sh
       - name: check_branch_name ref-operand guard (#9106; --base ported in #8195 slice 13)
         run: bash defaults/scripts/tests/test-check-branch-name.sh
+      # Moved out of shell-suite-tests by #8195 slice 14: worktree.sh's
+      # LOCAL-branch reuse arm — the reuse warning, the #6095/#6100 upstream
+      # correction (now reached in-process), the #8280 already-landed refusal
+      # and the divergence warning — is one `loom-daemon
+      # worktree-branch-reuse`. The first suite's Tests 4-5 assert the refusal
+      # actually happens; the second's Tests 3-4 assert the arm's own messages,
+      # which they also use to prove WHICH arm ran. Without a binary the arm
+      # prints nothing and refuses nothing (a correct documented degradation to
+      # the pre-#6095/pre-#8280 behaviour) and both sets would measure nothing,
+      # so both pin the binary via loom_test_require_daemon_bin and FAIL rather
+      # than skip. Each suite's REMOTE-arm tests are untouched by the slice.
+      - name: worktree local-branch already-landed refusal (#8280, ported in #8195 slice 14)
+        run: bash defaults/scripts/tests/test-worktree-stale-merged-branch.sh
+      - name: worktree remote/local branch tracking + divergence (#4823, #8280, ported in #8195 slice 14)
+        run: bash defaults/scripts/tests/test-worktree-remote-branch-tracking.sh
       # Moved out of shell-suite-tests by #8195 slice 10: worktree.sh's
       # --sparse/--full family is now `loom-daemon worktree-sparse`, including
       # the re-configure arm this suite's Tests 3/4 drive (its registration
       # check and #3548 sentinel back-fill). Without a binary those flags
       # refuse with exit 2 before touching anything, so the suite pins one via
-      # loom_test_require_daemon_bin and FAILS rather than skips. Fourteen of
-      # the 21 test-worktree-*.sh suites now run here (twelve moved by a port
+      # loom_test_require_daemon_bin and FAILS rather than skips. Eighteen of
+      # the 22 test-worktree-*.sh suites now run here (sixteen moved by a port
       # slice, plus test-worktree-issue-lock.sh and test-worktree-stale-
       # closed-branch.sh, which were daemon-driven from the start); the
-      # remaining seven exercise create-path arms these slices did not touch
+      # remaining four exercise create-path arms these slices did not touch
       # and stay hermetic in shell-suite-tests.
       - name: worktree sentinel back-fill on re-invoke (#3548; --sparse/--full ported in #8195 slice 10)
         run: bash defaults/scripts/tests/test-worktree-sentinel-reinvoke.sh

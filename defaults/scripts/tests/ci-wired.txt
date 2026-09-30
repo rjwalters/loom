@@ -213,10 +213,8 @@ test-warn-operator-gated.sh
 test-warn-out-of-set-deps.sh
 test-worktree-forge-pr-check.sh
 test-worktree-hookspath.sh
-test-worktree-remote-branch-tracking.sh
 test-worktree-root-override.sh
 test-worktree-sentinel.sh
-test-worktree-stale-merged-branch.sh
 
 # tests/hooks/ (repo root) — Claude-path guard suites, wired since #4769.
 tests/hooks/test-guard-destructive-dispatcher.sh

@@ -157,12 +157,28 @@
 //! `--json` suppresses all four lines, so nothing a machine reads ever changed
 //! and no retained suite asserts either consumer's output. Same class as slices
 //! 5, 8 and 10: a path compared logically instead of physically.
+//!
+//! Slice 14 is [`branch_reuse`]: the LOCAL-branch reuse arm, whole — the arm
+//! `worktree.sh <N>` takes whenever `refs/heads/feature/issue-N` already
+//! exists, which on a host that built an earlier slice of the same issue is
+//! the *normal* state, and therefore the arm the partial-increment convention
+//! runs through most often. Four ordered steps (reuse warning, [`upstream`]
+//! correction, the #8280 already-landed refusal, divergence warning) whose
+//! *order* is the contract, so they moved as one unit rather than as four
+//! delegation points the shell would have had to interleave. It retires the
+//! script's last `_worktree_upstream_check` call site — slice 12 took the
+//! other one — so [`upstream`] now has no bash caller at all, and it replaces
+//! a `--json` refusal document spliced by hand around `$BRANCH_NAME`, which
+//! `git check-ref-format` permits a `"` in and which the custom-branch
+//! argument makes operator input: the same defect slice 13 fixed for
+//! `$BASE_BRANCH`, one arm further down the same decision.
 
 pub mod base;
 pub mod baseline;
 pub mod branch_conflict;
 pub mod branch_delete;
 pub mod branch_landed;
+pub mod branch_reuse;
 pub mod check;
 pub mod cleanup;
 pub mod closed_pr_branch;
