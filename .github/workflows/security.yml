@@ -93,6 +93,11 @@ jobs:
     permissions:
       security-events: write
       contents: read
+    env:
+      # Overlay-base databases only serve PR scans, which this repo never runs
+      # (see the `if:` above), so building/uploading them is wasted work (#9565).
+      # NOTE: action-internal override; a codeql-action bump could rename it.
+      CODEQL_ACTION_OVERLAY_ANALYSIS: "false"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2

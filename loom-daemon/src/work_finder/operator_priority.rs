@@ -130,6 +130,37 @@ struct CachedAt {
 /// only for a starred issue with no entry (or an unknown one older than
 /// [`STARRED_AT_RETRY`]) and drops the entry of every issue that is no longer
 /// starred, so un-starring and re-starring reads the new event.
+///
+/// # Accepted staleness (Issue #9314)
+///
+/// The one policy choice here — **evict the moment a starred issue is not in
+/// this tick's starred set** — is what keeps a re-star honest, and everything
+/// below is a consequence of it, reviewed and kept as-is. Nothing here can
+/// affect safety or admission: starred-at is the *second* ordering key among
+/// starred issues only ([`super::ordering::candidate_cmp`]), so every
+/// consequence is at worst two starred issues dispatched in the wrong order,
+/// one tick apart.
+///
+/// - **A star flipped off and back on entirely between two ticks keeps the
+///   old time.** The cache never saw the gap, so the entry survives the
+///   `retain` and a known value is never re-read. Detecting it would mean
+///   re-reading every starred issue's timeline every tick (the cost this cache
+///   exists to avoid) or watching the label events themselves. Pinned by
+///   `the_starred_at_cache_trades_restar_staleness_for_prompt_eviction`.
+/// - **A starred issue that leaves the listing loses its entry**, so its
+///   timeline is read again when it returns — `merge_starred` drops a starred
+///   row that is `loom:building`/`loom:curating`, which is exactly the common
+///   case. This is the *same* eviction, and holding entries through a claim to
+///   save that one read would extend the staleness window above across the
+///   whole claim. One extra read per claim cycle is the cheaper side.
+/// - **A cache miss costs several REST pages** on a long timeline
+///   (`--paginate`). Bounded to once per starred issue per star, on the REST
+///   pool rather than GraphQL, and never for an unstarred issue.
+/// - **While the rate-limit breaker suppresses forge reads** the source errors,
+///   the value is cached as unknown, and the read is retried only after
+///   [`STARRED_AT_RETRY`]. Deliberate: the breaker exists to stop hammering an
+///   exhausted forge, and an unknown starred-at falls back to `createdAt`,
+///   which still orders starred work ahead of everything unstarred.
 #[derive(Debug, Default)]
 pub struct StarredAtCache {
     entries: HashMap<u32, CachedAt>,

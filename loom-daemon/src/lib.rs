@@ -181,9 +181,11 @@ pub mod forge_cmd;
 pub mod forge_disable_auto_merge;
 pub(crate) mod forge_etag_store;
 pub mod forge_events;
+pub mod forge_identity;
 pub mod forge_listing;
 pub mod forge_merge_method;
 pub mod forge_parser;
+pub mod forge_read_pool;
 pub mod gh_repo_env;
 pub mod git_parser;
 pub mod git_utils;
@@ -277,6 +279,11 @@ pub mod stash_retirement;
 /// frozen by the file-size ratchet, and stating the model once is what keeps
 /// the daemon-side budget and the client-side probe budget from drifting.
 pub mod status_budget;
+/// `points:*` story-point size labels (#9432, epic #9429) — the one parser both
+/// telemetry consumers (`sweep.started` at dispatch, `sweep.outcome` at the
+/// terminal transition) resolve points through, including the daemon-side
+/// one-label-per-issue guard.
+pub mod story_points;
 pub mod sweep_journal;
 pub mod sweep_outcome_summary;
 pub mod sweep_outcomes;

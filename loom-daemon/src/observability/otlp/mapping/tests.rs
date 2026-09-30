@@ -25,6 +25,7 @@ fn sweep_started_envelope() -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepStarted(SweepStartedRecord {
+            story_points: None,
             repo: "rjwalters/loom".to_string(),
             visibility: RepoVisibility::Public,
             issue: 4858,
@@ -98,6 +99,7 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepOutcome(SweepOutcomeRecord {
+            story_points: None,
             repo: Some("rjwalters/loom".to_string()),
             repo_unresolved: false,
             visibility: RepoVisibility::Public,
@@ -830,4 +832,34 @@ fn quota_utilization_queries_name_emitted_token_gauges() {
         assert!(sql.contains(&format!("'{name}'")), "{name} missing from the SQL");
         assert!(emitted.contains(&name), "{name} is not emitted by the mapping");
     }
+}
+
+/// Issue #9432 (epic #9429): `sweep.started` exports the size of the work now
+/// in flight as a NUMERIC `loom.story_points` attribute — and an unsized
+/// dispatch exports no such attribute at all (absent, never `0`).
+#[test]
+fn sweep_started_exports_story_points_numerically_when_sized() {
+    let story_points = |envelope: TelemetryEnvelope| {
+        let request = build_logs_request(&[envelope]).unwrap();
+        request.resource_logs[0].scope_logs[0].log_records[0]
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "loom.story_points")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    assert_eq!(
+        story_points(sweep_started_envelope()),
+        None,
+        "an unsized dispatch must omit the attribute, not export 0"
+    );
+
+    let TelemetryRecord::SweepStarted(mut record) = sweep_started_envelope().record else {
+        panic!("fixture is a sweep.started record")
+    };
+    record.story_points = Some(13);
+    assert_eq!(
+        story_points(envelope("host-a", TelemetryRecord::SweepStarted(record))),
+        Some(any_value::Value::IntValue(13))
+    );
 }

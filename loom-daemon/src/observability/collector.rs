@@ -439,6 +439,7 @@ pub(crate) fn map_event_to_records(
             kind: SweepKind::Issue(_),
             sweep_id,
             runtime,
+            story_points,
             ..
         } => {
             let started_at = Utc::now();
@@ -451,6 +452,11 @@ pub(crate) fn map_event_to_records(
                 },
             );
             vec![TelemetryRecord::SweepStarted(SweepStartedRecord {
+                // #9432: the assigned size of the work now in flight, resolved
+                // at dispatch from the issue's single `points:*` label. Copied
+                // straight through — the collector never reads the forge, so an
+                // absent value here IS an absent attribute, never a zero.
+                story_points: *story_points,
                 repo: repo.to_string(),
                 visibility,
                 issue,
@@ -621,6 +627,13 @@ fn terminal_records(
             provider: None,
             profile: None,
             complexity: None,
+            // Issue #9432: like `complexity`, the story-point size is a forge
+            // read this pure, reactor-thread mapping never makes. Absent, never
+            // `0` — the reaper-side journal path (`outcome_journal`) resolves it
+            // from the label list its own single REST read already carries, and
+            // the in-flight `sweep.started` record for this same sweep carries
+            // the size resolved at dispatch.
+            story_points: None,
             tokens_status: None,
             tokens_status_reason: None,
             // Issues #9444/#9465/#9466: terminal facts the reaper-side journal
@@ -1199,6 +1212,17 @@ async fn collect_managed_repos(
 ) -> Vec<ManagedRepoEntry> {
     // Each registered workspace's dispatch priority (#9244, loom-ui#153).
     // Best-effort: an unreadable registry just omits `priority`.
+    //
+    // Deliberately re-read per collection rather than cached (Issue #9314).
+    // This runs once per `snapshot_interval` (5 minutes by default), from the
+    // collector task, and reads ONE small local JSON file
+    // (`~/.loom/workspaces.json`) — the same read a dozen other daemon paths
+    // make per tick. Freshness is the point: an operator's `loom-daemon
+    // workspace priority` edit must show up in the next `host.health` sample
+    // without a daemon restart, and `managed_repos` is how the dashboard
+    // renders it. Caching it would trade that for no measurable saving and add
+    // a staleness class (a cached priority outliving the edit) to a field whose
+    // whole job is to report current configuration.
     let priorities: HashMap<PathBuf, u32> =
         crate::workspace_registry::WorkspaceRegistry::load_default()
             .map(|r| {
@@ -1320,6 +1344,10 @@ mod provider_accounts_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod shell_arm_registry_tests;
+// Issue #9432: `sweep.started`'s story-point pass-through.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod story_points_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod terminal_records_tests;

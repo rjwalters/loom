@@ -102,6 +102,7 @@ mod tests {
 
     fn record(sweep_id: &str, repo: &str, issue: u32, result: SweepResult) -> SweepOutcomeRecord {
         SweepOutcomeRecord {
+            story_points: None,
             repo: Some(repo.to_string()),
             visibility: crate::telemetry::RepoVisibility::Private,
             tokens_status: None,

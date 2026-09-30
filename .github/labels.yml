@@ -272,6 +272,37 @@
   description: Cleanup, refactoring, or improvements not tied to current goals
   color: "D4C5F9"  # purple - lower priority
 
+# Story-Point Size Labels (#9431, epic #9429): exactly one points:* label per
+# curated issue, attached by the Curator in the same `gh issue edit` that
+# applies loom:curated, sized per the rubric in .loom/docs/story-points.md.
+# Points measure the size of one clean landing and are server-side filterable
+# (`gh issue list --label points:3`). The vocabulary stops at 13: anything
+# bigger is split into sub-issues, never sized 21/34. Re-assignment replaces
+# the prior points label; a rescope to loom:triage updates or removes it.
+- name: points:1
+  description: "Story-point size class 1. Applied by: Curator only."
+  color: "06B6D4"  # cyan-500 - story-point size family
+
+- name: points:2
+  description: "Story-point size class 2. Applied by: Curator only."
+  color: "06B6D4"  # cyan-500 - story-point size family
+
+- name: points:3
+  description: "Story-point size class 3. Applied by: Curator only."
+  color: "06B6D4"  # cyan-500 - story-point size family
+
+- name: points:5
+  description: "Story-point size class 5. Applied by: Curator only."
+  color: "06B6D4"  # cyan-500 - story-point size family
+
+- name: points:8
+  description: "Story-point size class 8. Applied by: Curator only."
+  color: "06B6D4"  # cyan-500 - story-point size family
+
+- name: points:13
+  description: "Story-point size class 13, the largest. Applied by: Curator only."
+  color: "06B6D4"  # cyan-500 - story-point size family
+
 # loom:heavy (#9034): the mechanical "heavy" signal the host-class gate refuses
 # on a host_class: local-dev machine (autonomous.workFinder.hostClass) unless
 # explicitly overridden (--allow-local / allowHeavyLocal). A resource-weight
