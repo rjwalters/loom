@@ -62,7 +62,7 @@ function mockJwksFetch(): () => void {
 async function signToken(
   overrides: { aud?: string; expiresIn?: string; email?: string } = {},
 ): Promise<string> {
-  return new SignJWT({ email: overrides.email ?? "operator@2amlogic.com" })
+  return new SignJWT({ email: overrides.email ?? "operator@example.com" })
     .setProtectedHeader({ alg: "RS256" })
     .setIssuedAt()
     .setIssuer(`https://${TEAM_DOMAIN}`)
@@ -256,7 +256,7 @@ describe("GET / — Access JWT wired end to end (real createRemoteJWKSet path)",
     );
 
     // `signToken` puts this address in the JWT's `email` claim.
-    expect(await response.text()).toContain('"email":"operator@2amlogic.com"');
+    expect(await response.text()).toContain('"email":"operator@example.com"');
   });
 
   it("never leaks an identity to an anonymous viewer", async () => {
@@ -264,7 +264,7 @@ describe("GET / — Access JWT wired end to end (real createRemoteJWKSet path)",
     const response = await callWorker(new Request("https://ingest.example/"));
     const html = await response.text();
 
-    expect(html).not.toContain("operator@2amlogic.com");
+    expect(html).not.toContain("operator@example.com");
     expect(html).not.toContain('"email"');
   });
 

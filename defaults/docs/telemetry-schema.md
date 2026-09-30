@@ -1002,9 +1002,43 @@ the terminal outcome samples the file for its own issue and window. The
 default classification when the writer omits one: `rejudge` ⇒
 **`substantive`** (the work was hard); `rebase`, `merge_conflict`,
 `ci_rerun` ⇒ **`environmental`** (the ground moved). Absent (never `[]`)
-when no event was marked. *Writer status:* the reflog reader above is shipped and is the primary
-source; the marker file remains the protocol for events a reflog cannot
-show (a CI rerun, an explicit rejudge).
+when no event was marked.
+
+*Writers.* The reflog source above is the primary one and needs no writer
+(#9511). The marker is appended by **`loom-daemon record-rework`**
+(`--kind` ∈ the four above, `--issue N` or `--branch feature/issue-N`,
+optional `--reason` / `--classification` / `--duration-sec`). It **always
+exits 0** — a marker is telemetry attached to an operation that matters, so
+an unwritable log directory or an unresolvable issue prints a reason and
+records nothing rather than failing the merge it describes; an unknown
+`kind`/`classification` is a clap-level argument error (exit 2), because a
+typo that widens the vocabulary is a silent cardinality leak into every
+rollup. Format, vocabulary, classification table and writer live in
+`loom-daemon/src/rework_events.rs`; both readers
+(`sweep_registry::outcome_journal::rework` — the marker reader and the
+reflog reader) take the path, the `kind` and the classification from it, so
+no end can drift.
+
+*The two sources are disjoint by construction.* A marker records only
+rework the worktree reflog **cannot** show — a forge-side branch update, a
+merge refusal, a CI rerun, a rejudge. A rebase or merge performed with local
+git in the sweep's worktree is **never** marked: the reflog already reports
+it, and a marker would count it twice. The terminal turn therefore
+concatenates both sources rather than de-duplicating them.
+
+The first caller is `merge-pr.sh`, at two sites (#9444): a **`rebase`** when
+the merge retry loop syncs a base branch that moved under the PR (via the
+forge's update-branch API, which never touches the local worktree, so the
+reflog cannot see it; `--duration-sec` is the settle wait it slept, the only
+measured part), and a **`merge_conflict`** when it refuses a PR whose
+`mergeable=false` was *corroborated* by a local `git merge-tree` check. The
+uncorroborated refusal — "the forge's cached state is stale/unknown" — is
+deliberately **not** marked: that is "nobody could tell", not "this branch
+conflicts", and marking it would inflate the environmental bucket with
+unanswered checks. Still unwritten, and the natural next callers:
+`rejudge` (a Doctor claimed for `loom:changes-requested`) and `ci_rerun`. A
+Doctor's own conflict rebase needs no marker — the reflog reports it.
+
 The committed question set that turns these payload fields into the per-issue split lives in
 `defaults/observability/issue-effort-queries.sql`, executed verbatim on
 bundled SQLite by `loom-daemon/tests/issue_effort_sqlite.rs` and

@@ -727,16 +727,16 @@ impl SweepRegistry {
         // merge-from-main records itself there with a timestamp. Both are
         // scoped to this sweep's own window. Absent (never `[]`) when neither
         // saw anything.
-        let rework_events = started_at.map(|started_at| {
-            let mut events =
-                rework::read_rework_events(&self.config.workspace_root, issue, Some(started_at));
-            let worktree = self.worktree_path(issue);
-            if worktree.exists() {
-                events.extend(rework::read_reflog_rework(&worktree, Some(started_at)));
-            }
-            events
-        });
-        let rework_events = rework_events.filter(|events| !events.is_empty());
+        let rework_events = started_at
+            .map(|started_at| {
+                rework::collect_rework_events(
+                    &self.config.workspace_root,
+                    &self.worktree_path(issue),
+                    issue,
+                    started_at,
+                )
+            })
+            .filter(|events| !events.is_empty());
 
         // Every PR this sweep's lifecycle was observed to carry (Issue
         // #9465), in first-seen order — the multi-PR slice shape the single

@@ -184,6 +184,7 @@ pub(crate) mod forge_etag_store;
 pub mod forge_events;
 pub mod forge_identity;
 pub mod forge_listing;
+pub mod forge_merge_config;
 pub mod forge_merge_method;
 pub mod forge_parser;
 pub mod forge_read_pool;
@@ -247,6 +248,12 @@ pub mod release_resolve;
 pub mod repo_root;
 pub mod restart_verify;
 pub mod retry_classify;
+/// The `sweep.outcome` rework-event marker protocol (#9444): where the file
+/// lives, the `kind` vocabulary, the substantive/environmental table, and the
+/// writer. Public because the *writers* are outside the sweep registry — the
+/// `record-rework` subcommand a merge/doctor/CI path shells out to — while the
+/// reader stays beside the outcome journal that samples it.
+pub mod rework_events;
 pub mod role_collision;
 pub mod role_runner;
 pub mod role_shard;

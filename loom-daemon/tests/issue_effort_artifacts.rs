@@ -22,8 +22,10 @@
 //! * the trigger vocabulary — the `pub const`s of `pub mod trigger` in
 //!   `src/telemetry/mod.rs` (the strings the record actually carries);
 //! * the rework kinds and their default substantive/environmental class —
-//!   the match arms of `default_classification` in
-//!   `src/sweep_registry/outcome_journal/rework.rs`;
+//!   the match arms of `default_classification` in `src/rework_events.rs`,
+//!   the one module the marker writer, the marker reader and the reflog
+//!   reader all take the vocabulary from (#9506). Its arms name `KIND_*`
+//!   constants, which are resolved to their wire strings here;
 //! * the payload field names — the serde fields of `SweepOutcomeRecord` and
 //!   `ReworkEvent` in `src/telemetry/mod.rs` (a renamed field is what the
 //!   `json_extract` paths in the query must be checked against).
@@ -40,7 +42,7 @@ use std::collections::BTreeSet;
 use regex::Regex;
 
 const TELEMETRY: &str = include_str!("../src/telemetry/mod.rs");
-const REWORK: &str = include_str!("../src/sweep_registry/outcome_journal/rework.rs");
+const REWORK: &str = include_str!("../src/rework_events.rs");
 const SCHEMA: &str = include_str!("../../defaults/docs/telemetry-schema.md");
 const QUERIES: &str = include_str!("../../defaults/observability/issue-effort-queries.sql");
 const LABELS: &str = include_str!("../../.github/labels.yml");
@@ -92,16 +94,25 @@ fn trigger_strings(source: &str) -> BTreeSet<String> {
 /// Every `(kind, default_class)` pair in `default_classification`'s match
 /// arms, parsed rather than restated: an arm added to the table is picked up
 /// here, and a kind the table does not classify cannot pass the schema-doc
-/// check below.
+/// check below. An arm may name a kind as a string literal or as one of the
+/// module's `pub const KIND_*: &str` constants; a constant is resolved to its
+/// wire string, and one that does not resolve fails loudly.
 fn default_classifications(source: &str) -> Vec<(String, String)> {
+    let constants: std::collections::BTreeMap<String, String> =
+        Regex::new(r#"pub const (KIND_[A-Z0-9_]+): &str = "([a-z0-9_]+)";"#)
+            .unwrap()
+            .captures_iter(source)
+            .map(|capture| (capture[1].to_owned(), capture[2].to_owned()))
+            .collect();
     let start = source
-        .find("pub(crate) fn default_classification")
-        .expect("`default_classification` must exist in outcome_journal/rework.rs");
+        .find("pub fn default_classification")
+        .expect("`default_classification` must exist in src/rework_events.rs");
     let end = start
         + source[start..]
             .find("\n}")
             .expect("`default_classification` must terminate");
     let string_re = Regex::new(r#""([a-z_]+)""#).unwrap();
+    let const_re = Regex::new(r"\b(KIND_[A-Z0-9_]+)\b").unwrap();
     let mut pairs = Vec::new();
     for line in source[start..end].lines() {
         let Some((left, right)) = line.split_once("=>") else {
@@ -116,6 +127,12 @@ fn default_classifications(source: &str) -> Vec<(String, String)> {
             if kind != "_" {
                 pairs.push((kind.to_owned(), class.to_owned()));
             }
+        }
+        for capture in const_re.captures_iter(left) {
+            let kind = constants.get(&capture[1]).unwrap_or_else(|| {
+                panic!("`{}` is not a `pub const KIND_*: &str` in rework_events.rs", &capture[1])
+            });
+            pairs.push((kind.clone(), class.to_owned()));
         }
     }
     assert!(

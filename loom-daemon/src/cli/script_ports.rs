@@ -415,6 +415,18 @@ pub(crate) enum ScriptPortCommand {
     /// shell language policy. Prints each duplicated name once, in file
     /// order.
     LabelDuplicates(super::label_duplicates::LabelDuplicatesArgs),
+
+    /// `fleet-send.sh`'s one-shot safehouse envelope post (#9517, epic
+    /// #7810) — the lifecycle-role posting helper whose bash body was a
+    /// hand-copy of `safehouse.rs`'s protocol. The implementation reuses the
+    /// canonical `build_send_request` so the daemon and the role helper can
+    /// never disagree about the wire again. Its HARD degradation contract is
+    /// inherited verbatim: every failure — missing env, absent socket,
+    /// invalid argument, wire error — is a silent `exit 0`, because the room
+    /// is optional and the role's work is not. (This is also why the stub
+    /// bypasses `lib/script-helper.sh`, whose missing-daemon path is a loud
+    /// error: silence IS this entry point's interface.)
+    FleetSend(super::fleet_send::FleetSendArgs),
 }
 
 impl ScriptPortCommand {
@@ -453,6 +465,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::DaemonUpdate(args) => args.run(),
+            ScriptPortCommand::FleetSend(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
@@ -652,6 +665,14 @@ pub(crate) enum MergePrCommand {
     /// to post. Exit 0 with the route, 2 = stdin unreadable — see
     /// `cli::merge_pr_reconcile`.
     ReconcileChild(super::merge_pr_reconcile::ReconcileChildArgs),
+
+    /// The #6694/#6264 remove-vs-preserve decision for post-merge worktree
+    /// cleanup, shared across the three call sites (the Loom-convention path,
+    /// the porcelain discovery fallback, and a co-existing Judge/Doctor review
+    /// worktree) that used to run it identically three times. Always exits 0
+    /// with `REMOVE`/`PRESERVE` plus `LEVEL<TAB>message` lines to replay — see
+    /// `cli::merge_pr_worktree_preserve`.
+    WorktreePreserve(super::merge_pr_worktree_preserve::WorktreePreserveArgs),
 }
 
 impl MergePrCommand {
@@ -680,6 +701,7 @@ impl MergePrCommand {
             MergePrCommand::ReconcilePlan(args) => args.run(),
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::ChecksFailure(args) => args.run(),
+            MergePrCommand::WorktreePreserve(args) => args.run(),
         }
     }
 }

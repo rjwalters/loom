@@ -323,10 +323,26 @@ pub enum CwdProbe {
 /// refusal costs something real: a worktree that cannot be reset is handed to
 /// the next Builder still carrying drift (the #6291 class). The shell it
 /// replaces matched cwd only, and a port is not the place to widen a guard's
-/// trigger — that is a behaviour change with its own evidence to gather, so it
-/// is filed separately rather than smuggled in here. Both probes share this
-/// module's one `/proc` walk and one `lsof` parse; the difference is a single
-/// flag, so there is no second implementation to drift.
+/// trigger — that is a behaviour change with its own evidence to gather.
+///
+/// **Decided in #9043: stays cwd-only, not widened.** The #7466 widening's
+/// entire justification is protecting a live writer's *untracked* output from
+/// `git clean -fd` — a false negative there is unrecoverable, because nothing
+/// short of the process itself ever wrote those bytes to git. This call site
+/// never runs `git clean`, so that specific justification does not transfer:
+/// any *tracked* content a concurrent writer is holding open is already
+/// captured by the reset path's own rung 3 (`reset.rs`'s foreign-uncommitted-
+/// changes snapshot), taken before the reset runs, regardless of which of
+/// these two probes gated rung 1. Widening would therefore trade a real,
+/// recorded cost (the #6291-class refusal, denying the next Builder a clean
+/// worktree over e.g. a concurrent `git status`'s or `tail -f`'s read-only
+/// handle) for a protection this path's own rescue mechanism already provides
+/// by a different route. No incident record was found of the narrower,
+/// cwd-only signal here missing a genuine foreign writer since #7463 shipped.
+/// If that changes — a real miss is observed — reopen the question with that
+/// evidence; until then this stays the narrower signal. Both probes share
+/// this module's one `/proc` walk and one `lsof` parse; the difference is a
+/// single flag, so there is no second implementation to drift.
 #[must_use]
 pub fn find_processes_with_cwd_in_directory(directory: &Path) -> CwdProbe {
     // `worktree_real="$(cd "$worktree_path" && pwd -P)" || return 1` — an
