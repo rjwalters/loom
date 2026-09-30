@@ -51,6 +51,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
 use crate::merge_pr::sequence::{html_comment_spans, SequenceMarker};
 
 /// The marker prefix identifying a candidate PR's consolidation mapping.
@@ -198,10 +199,12 @@ pub enum EligibilityFailure {
     NoReason,
 }
 
-/// Check one assembled group. `reserved_attempts` maps component number →
-/// the `cons-` attempt id of an unresolved reservation marker, if any;
-/// `markers` maps component number → its newest trusted `loom:sequence`
-/// marker (ordering or reservation). Pure: the caller fetched everything.
+/// Check one assembled group. `markers` maps component number → its newest
+/// trusted `loom:sequence` marker (ordering or reservation) — ideally already
+/// filtered through [`live_marker`]. A marker is honored only while the
+/// component carries `loom:sequenced` (a released hold's marker stays in the
+/// transcript forever and must not reject every later attempt). Pure: the
+/// caller fetched everything.
 #[must_use]
 pub fn check_eligibility(
     components: &[ComponentState],
@@ -270,16 +273,20 @@ pub fn check_eligibility(
                 file: file.clone(),
             });
         }
-        if let Some(attempt) = markers
-            .get(&c.number)
-            .and_then(|m| m.plan.starts_with("cons-").then(|| m.plan.clone()))
+        // A marker only describes a LIVE hold while the `loom:sequenced`
+        // label is on the PR — the rule the #9686 pass itself reads markers
+        // by. Every release path (abort, landing, expiry, dissolve) removes
+        // the label, and the marker it leaves behind is history, not a hold.
+        let live = markers.get(&c.number).filter(|_| c.has(SEQUENCE_LABEL));
+        if let Some(attempt) =
+            live.and_then(|m| m.plan.starts_with("cons-").then(|| m.plan.clone()))
         {
             failures.push(EligibilityFailure::AlreadyReserved {
                 number: c.number,
                 attempt,
             });
         }
-        if let Some(m) = markers.get(&c.number) {
+        if let Some(m) = live {
             if m.source.as_deref() == Some("pass") && !numbers.contains(&m.after) {
                 failures.push(EligibilityFailure::SequencedOutsideGroup {
                     number: c.number,
@@ -745,12 +752,71 @@ pub fn reservation_comment_body(marker: &SequenceMarker, attempt: &str) -> Strin
     )
 }
 
+/// The release-marker prefix the abort comment carries. Deliberately NOT a
+/// `loom:sequence` field list: `sequence::parse` skips it (the first token
+/// has no `=`), so it can never be mistaken for a hold. [`live_marker`] reads
+/// it as "the newest reservation for `plan=` is released".
+pub const RESERVATION_RELEASED_PREFIX: &str = "loom:sequence released";
+
+/// True when `span` (an HTML comment's inner text) is a release marker for
+/// exactly `plan`.
+fn is_release_span_for(span: &str, plan: &str) -> bool {
+    span.trim()
+        .strip_prefix(RESERVATION_RELEASED_PREFIX)
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .is_some_and(|rest| {
+            let mut fields = rest.split_whitespace();
+            fields.next() == Some(&format!("plan={plan}")) && fields.next().is_none()
+        })
+}
+
+/// The newest trusted sequencing marker on `component` that still describes
+/// a LIVE hold, or `None`.
+///
+/// Two independent signals retire a marker, and either suffices:
+///
+/// 1. **The label is gone.** `loom:sequenced` IS the hold — the #9378 gate
+///    reads the label and the #9686 pass only reads markers of labeled PRs.
+///    Every release path removes it, so a marker on an unlabeled PR is
+///    history.
+/// 2. **A newer release marker names the same plan** (`consolidate-abort`'s
+///    `<!-- loom:sequence released plan=… -->`). `sequence::parse` skips that
+///    span by design, so without this check the old reservation would keep
+///    "winning" as the newest valid marker after an abort.
+///
+/// Oldest-first `bodies`, as `fetch_trusted_bodies` returns them.
+#[must_use]
+pub fn live_marker(component: &ComponentState, bodies: &[String]) -> Option<SequenceMarker> {
+    if !component.has(SEQUENCE_LABEL) {
+        return None;
+    }
+    let mut newest: Option<SequenceMarker> = None;
+    for body in bodies {
+        for line in body.lines() {
+            for span in html_comment_spans(line) {
+                let wrapped = format!("<!--{span}-->");
+                if let Some(m) = crate::merge_pr::sequence::parse(std::slice::from_ref(&wrapped)) {
+                    newest = Some(m);
+                } else if newest
+                    .as_ref()
+                    .is_some_and(|m| is_release_span_for(span, &m.plan))
+                {
+                    newest = None;
+                }
+            }
+        }
+    }
+    newest
+}
+
 /// The abort release comment — distinct from the landing release so the
-/// transcript shows which fate the attempt met.
+/// transcript shows which fate the attempt met. Its first line is the
+/// release marker [`live_marker`] honors (the label removal is the primary
+/// release; this marker keeps the transcript self-describing).
 #[must_use]
 pub fn reservation_release_body(marker: &SequenceMarker, attempt: &str) -> String {
     format!(
-        "<!-- loom:sequence released plan={} -->\n\
+        "<!-- {RESERVATION_RELEASED_PREFIX} plan={} -->\n\
          **Consolidation attempt `{}` released this reservation** — the attempt was aborted; \
          this PR is back to its normal pipeline, untouched and actionable.\n\n\
          ---\n\

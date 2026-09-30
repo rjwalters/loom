@@ -12,19 +12,24 @@
 //!   backfilled, present ones left alone.
 //! - A construction conflict is a hard abort: sources untouched, scratch
 //!   worktree removed, no partial candidate.
+//! - A head move detected after the candidate PR exists withdraws that
+//!   candidate (close + release + branch delete) before failing: its attempt
+//!   id is pinned to the old heads, so no later run could ever adopt it.
 //! - Abort releases ONLY the attempt's own reservations (markers whose
 //!   `plan=` names this attempt), preserves every source, and never touches
-//!   a merged candidate (landing wins; reconciliation territory).
+//!   a merged candidate (landing wins; reconciliation territory). A released
+//!   reservation no longer counts against eligibility (`live_marker`).
+//! - Every `gh` call honors `--repo`/`LOOM_REPO` and the per-root credential.
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use loom_daemon::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
 use loom_daemon::merge_pr::consolidate::{
     self as cons, attempt_id, candidate_branch, check_eligibility, fetch_component,
-    find_open_candidate, mapping_body, parse_mapping, push_branch, remove_worktree,
+    find_open_candidate, live_marker, mapping_body, parse_mapping, push_branch, remove_worktree,
     reservation_comment_body, reservation_marker, reservation_present, Bounds, PrepareOutcome,
 };
-use loom_daemon::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
 use loom_daemon::merge_pr::sequence::fetch_trusted_bodies;
+use serde::Deserialize;
 
 #[derive(clap::Args)]
 pub(crate) struct ConsolidatePrepareArgs {
@@ -50,9 +55,7 @@ impl ConsolidatePrepareArgs {
         if self.prs.len() < 2 {
             bail!("consolidation needs at least two component PRs");
         }
-        if let Some(nwo) = self.repo.as_deref() {
-            std::env::set_var("LOOM_REPO", nwo);
-        }
+        scope_repo(self.repo.as_deref());
         let root = std::env::current_dir()?;
         let gh = std::path::PathBuf::from(cons::gh_bin_env());
         let bounds = Bounds::from_env();
@@ -139,9 +142,21 @@ impl ConsolidatePrepareArgs {
         }
         if !moved.is_empty() {
             remove_worktree("git", &root, &worktree);
+            // The candidate PR already exists (step 5) and its attempt id is
+            // derived from the OLD heads, so a retry against the new heads
+            // lands on a different branch and can never adopt it. Withdraw it
+            // now — close, release anything a racing worker reserved under
+            // this attempt, delete the branch — or it is orphaned for good.
+            if let Err(e) = abort(&gh, &root, candidate_pr, AbortCause::HeadsMoved(&moved)) {
+                eprintln!(
+                    "consolidate-prepare: withdrawing candidate #{candidate_pr} failed ({e:#}); \
+                     run `consolidate-abort --pr {candidate_pr}` to finish the cleanup"
+                );
+            }
             bail!(
-                "component heads moved during preparation: {:?} — HARD ABORT per ADR-0023; the \
-                 candidate branch remains for a fresh attempt against the new heads",
+                "component heads moved during preparation: {:?} — HARD ABORT per ADR-0023; \
+                 candidate #{candidate_pr} withdrawn. Re-run against the new heads (a fresh \
+                 attempt id)",
                 moved
             );
         }
@@ -178,21 +193,44 @@ pub(crate) struct ConsolidateAbortArgs {
 
 impl ConsolidateAbortArgs {
     pub(crate) fn run(self) -> Result<()> {
-        if let Some(nwo) = self.repo.as_deref() {
-            std::env::set_var("LOOM_REPO", nwo);
-        }
+        scope_repo(self.repo.as_deref());
         let root = std::env::current_dir()?;
         let gh = std::path::PathBuf::from(cons::gh_bin_env());
-        abort(&gh, &root, self.pr)
+        abort(&gh, &root, self.pr, AbortCause::Requested)
     }
 }
 
 // --- shared helpers (CLI-local I/O glue) --------------------------------
 
+/// Scope every `gh` call in this process to the target repo. `LOOM_REPO`
+/// feeds `consolidate::gh` (which appends `--repo`); `GH_REPO` is what `gh`
+/// itself honors for the subcommands and `{owner}/{repo}` API placeholders
+/// that take no `--repo` flag — including `sequence::fetch_trusted_bodies`.
+fn scope_repo(flag: Option<&str>) {
+    if let Some(nwo) = flag {
+        std::env::set_var("LOOM_REPO", nwo);
+    }
+    if let Ok(nwo) = std::env::var("LOOM_REPO") {
+        if !nwo.trim().is_empty() {
+            std::env::set_var("GH_REPO", nwo);
+        }
+    }
+}
+
+/// A `gh` command in `root` with the per-root credential applied (#5401: a
+/// cross-owner managed repo needs its own owner's installation token) — the
+/// same routing `consolidate::gh` and the sequence reads use.
+fn gh_cmd(gh: &std::path::Path, root: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(gh);
+    cmd.current_dir(root);
+    loom_daemon::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+    cmd
+}
+
 fn cons_default_branch(gh: &std::path::Path, root: &std::path::Path) -> Result<String> {
     // consolidate::default_branch is private to the module; this thin
     // wrapper re-reads it through the same public surface the module tests.
-    let out = std::process::Command::new(gh)
+    let out = gh_cmd(gh, root)
         .args([
             "repo",
             "view",
@@ -201,8 +239,6 @@ fn cons_default_branch(gh: &std::path::Path, root: &std::path::Path) -> Result<S
             "--jq",
             ".defaultBranchRef.name",
         ])
-        .current_dir(root)
-        .env("GH_CONFIG_DIR", std::env::var("GH_CONFIG_DIR").unwrap_or_default())
         .output()
         .context("gh repo view")?;
     if !out.status.success() {
@@ -212,14 +248,13 @@ fn cons_default_branch(gh: &std::path::Path, root: &std::path::Path) -> Result<S
 }
 
 fn live_base(gh: &std::path::Path, root: &std::path::Path, default_branch: &str) -> Result<String> {
-    let out = std::process::Command::new(gh)
+    let out = gh_cmd(gh, root)
         .args([
             "api",
             &format!("repos/{{owner}}/{{repo}}/commits/{default_branch}"),
             "--jq",
             ".sha",
         ])
-        .current_dir(root)
         .output()
         .context("gh api commits")?;
     if !out.status.success() {
@@ -238,9 +273,11 @@ fn fetch_markers(
 ) -> std::collections::BTreeMap<u32, loom_daemon::merge_pr::sequence::SequenceMarker> {
     let bin = gh.to_string_lossy().to_string();
     let mut out = std::collections::BTreeMap::new();
-    for c in components {
+    // Only LIVE holds count (label present, not released by a newer release
+    // marker): a reservation from an aborted attempt must not reject this one.
+    for c in components.iter().filter(|c| c.has(SEQUENCE_LABEL)) {
         if let Some(bodies) = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", c.number) {
-            if let Some(m) = loom_daemon::merge_pr::sequence::parse(&bodies) {
+            if let Some(m) = live_marker(c, &bodies) {
                 out.insert(c.number, m);
             }
         }
@@ -271,7 +308,7 @@ fn backfill_reservations(
     components: &[loom_daemon::merge_pr::consolidate::ComponentState],
 ) -> Result<usize> {
     // The adopted candidate's head: from the PR itself, not re-derived.
-    let out = std::process::Command::new(gh)
+    let out = gh_cmd(gh, root)
         .args([
             "pr",
             "view",
@@ -281,7 +318,6 @@ fn backfill_reservations(
             "--jq",
             ".headRefOid",
         ])
-        .current_dir(root)
         .output()
         .context("gh pr view candidate")?;
     if !out.status.success() {
@@ -313,18 +349,16 @@ fn backfill_reservations_inner(
             continue;
         }
         let n = c.number.to_string();
-        let out = std::process::Command::new(gh)
+        let out = gh_cmd(gh, root)
             .args(["pr", "edit", &n, "--add-label", SEQUENCE_LABEL])
-            .current_dir(root)
             .output()
             .context("gh pr edit (reservation label)")?;
         if !out.status.success() {
             bail!("labeling source PR #{n}: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
         let body = reservation_comment_body(&marker, attempt);
-        let out = std::process::Command::new(gh)
+        let out = gh_cmd(gh, root)
             .args(["pr", "comment", &n, "--body", &body])
-            .current_dir(root)
             .output()
             .context("gh pr comment (reservation)")?;
         if !out.status.success() {
@@ -348,7 +382,7 @@ fn create_candidate_pr(
     let path = root.join(format!(".loom-consolidate-body-{attempt}.md"));
     std::fs::write(&path, body)?;
     let title = format!("consolidated candidate ({attempt})");
-    let out = std::process::Command::new(gh)
+    let out = gh_cmd(gh, root)
         .args([
             "pr",
             "create",
@@ -361,7 +395,6 @@ fn create_candidate_pr(
             "--body-file",
             path.to_str().unwrap_or_default(),
         ])
-        .current_dir(root)
         .output()
         .context("gh pr create")?;
     let _ = std::fs::remove_file(&path);
@@ -383,10 +416,25 @@ fn create_candidate_pr(
     Ok(number)
 }
 
-fn abort(gh: &std::path::Path, root: &std::path::Path, candidate: u32) -> Result<()> {
+/// Why an attempt is being withdrawn — only the candidate's close comment
+/// differs; the release/close/delete steps are identical.
+enum AbortCause<'a> {
+    /// `consolidate-abort` (failed candidate CI, operator decision).
+    Requested,
+    /// `consolidate-prepare` step 6: these components' heads moved after the
+    /// candidate PR was created (ADR-0023 worked example 5).
+    HeadsMoved(&'a [u32]),
+}
+
+fn abort(
+    gh: &std::path::Path,
+    root: &std::path::Path,
+    candidate: u32,
+    cause: AbortCause<'_>,
+) -> Result<()> {
     let bin = gh.to_string_lossy().to_string();
     // 1. The mapping comes from the candidate's own body (the ledger).
-    let out = std::process::Command::new(gh)
+    let out = gh_cmd(gh, root)
         .args([
             "pr",
             "view",
@@ -394,7 +442,6 @@ fn abort(gh: &std::path::Path, root: &std::path::Path, candidate: u32) -> Result
             "--json",
             "body,state,headRefName",
         ])
-        .current_dir(root)
         .output()
         .context("gh pr view candidate")?;
     if !out.status.success() {
@@ -430,21 +477,24 @@ fn abort(gh: &std::path::Path, root: &std::path::Path, candidate: u32) -> Result
             loom_daemon::merge_pr::sequence::parse(&bodies).filter(|m| m.plan == mapping.attempt);
         let Some(marker) = ours else { continue };
         let n = number.to_string();
-        let out = std::process::Command::new(gh)
+        // Label first: the label IS the hold. If it cannot come off, the
+        // reservation is still live — say so and post no release marker,
+        // rather than write a transcript that contradicts the gate.
+        let out = gh_cmd(gh, root)
             .args(["pr", "edit", &n, "--remove-label", SEQUENCE_LABEL])
-            .current_dir(root)
             .output()
             .context("gh pr edit (release)")?;
         if !out.status.success() {
             eprintln!(
-                "consolidate-abort: removing the label from #{n} failed (continuing): {}",
+                "consolidate-abort: removing the label from #{n} failed — its reservation is \
+                 still live; re-run consolidate-abort to release it: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
+            continue;
         }
         let body = cons::reservation_release_body(&marker, &mapping.attempt);
-        let out = std::process::Command::new(gh)
+        let out = gh_cmd(gh, root)
             .args(["pr", "comment", &n, "--body", &body])
-            .current_dir(root)
             .output()
             .context("gh pr comment (release)")?;
         if !out.status.success() {
@@ -454,15 +504,25 @@ fn abort(gh: &std::path::Path, root: &std::path::Path, candidate: u32) -> Result
     }
 
     // 3. Close the candidate (idempotent — closing a closed PR is a no-op).
+    let why = match cause {
+        AbortCause::Requested => "aborted".to_string(),
+        AbortCause::HeadsMoved(moved) => {
+            let list: Vec<String> = moved.iter().map(|n| format!("#{n}")).collect();
+            format!(
+                "aborted during preparation because component head(s) moved after pinning ({}) \
+                 — a fresh attempt against the new heads gets a new id (ADR-0023 worked example 5)",
+                list.join(", ")
+            )
+        }
+    };
     let comment = format!(
-        "Consolidation attempt `{}` aborted: the candidate is withdrawn and every component \
+        "Consolidation attempt `{}` {why}: the candidate is withdrawn and every component \
          reservation is released. The component PRs are untouched and actionable. (ADR-0023 §3, \
          #9688)",
         mapping.attempt
     );
-    let out = std::process::Command::new(gh)
+    let out = gh_cmd(gh, root)
         .args(["pr", "close", &candidate.to_string(), "--comment", &comment])
-        .current_dir(root)
         .output()
         .context("gh pr close")?;
     if !out.status.success() {
@@ -474,14 +534,13 @@ fn abort(gh: &std::path::Path, root: &std::path::Path, candidate: u32) -> Result
 
     // 4. Branch cleanup, best-effort (a leftover is cleaned by the reapers;
     // #9372 guards do not apply — consolidated branches have no children).
-    let out = std::process::Command::new(gh)
+    let out = gh_cmd(gh, root)
         .args([
             "api",
             "-X",
             "DELETE",
             &format!("repos/{{owner}}/{{repo}}/git/refs/heads/{}", c.head_ref_name),
         ])
-        .current_dir(root)
         .output()
         .context("gh api delete ref")?;
     if !out.status.success() {
