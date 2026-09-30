@@ -91,7 +91,6 @@ test-epic-label-preserved-on-escalation.sh
 test-extract-capability-markers.sh
 test-filing-lock.sh
 test-fleet-check.sh
-test-fleet-send.sh
 test-forge-check-runs-pagination.sh
 test-forge-helpers.sh
 test-forge-helpers-rate-limit-fallback.sh
