@@ -106,6 +106,19 @@
   description: "PR has merge conflicts requiring resolution"
   color: "DC2626"  # red-600 - indicates broken state
 
+# loom:sequenced (#9378) is the durable "approved, but not yet" ordering hold:
+# NOT an escalation (loom:operator means a human must rule; a landing order
+# does not) and NOT loom:blocked (an issue-status label that is not a merge
+# gate). The label is refused by merge-pr.sh's verdict-contradiction guard
+# beside loom:pr, with the same no-override treatment. The condition it waits
+# on lives in a trusted `<!-- loom:sequence after=… pred_head=… follower_head=…
+# plan=… -->` marker on the PR, evaluated by `loom-daemon merge-pr
+# sequence-eval`; clearing is REMOVING THE LABEL once the recorded predecessor
+# has landed at the recorded head — a mechanical condition, never a memory.
+- name: loom:sequenced
+  description: "Approved, but sequenced behind another PR. Applied by: the sequencing pass or an operator."
+  color: "A16207"  # yellow-700 - a scheduling hold, one shade apart from the in-progress ambers and the operator orange
+
 - name: loom:auto-merge-ok
   description: Override a Champion merge-risk hold (applied by Judge or human)
   color: "10B981"  # emerald-500 - signals safe to proceed

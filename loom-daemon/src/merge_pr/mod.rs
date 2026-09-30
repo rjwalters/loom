@@ -229,6 +229,7 @@ pub mod reconcile;
 pub mod redate;
 pub mod refs;
 pub mod response;
+pub mod sequence;
 pub mod stacked_children;
 pub mod stale_checks;
 pub mod version_policy;
