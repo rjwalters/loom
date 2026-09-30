@@ -106,6 +106,7 @@ pub mod collector;
 pub mod daemon_event;
 pub mod endpoint_policy;
 pub mod eta;
+pub mod eta_snapshot;
 pub mod exporter;
 pub mod lifecycle;
 pub mod ops;
@@ -1124,8 +1125,14 @@ pub fn spawn_task(
     }
     // `queue.snapshot` (Issue #8852, phase 2): the reverse split — native
     // HTTPS queues only, sampled by the collector below.
-    if let Some(sink) = queue_snapshot::sink_for_native_queues(native_queues, &host_id) {
+    if let Some(sink) = queue_snapshot::sink_for_native_queues(native_queues.clone(), &host_id) {
         queue_snapshot::register_global_sink(sink);
+    }
+    // `eta.snapshot` (Issue #9329): the ETA counterpart of the record above —
+    // the same native-HTTPS-only split, sampled by the same collector pass.
+    // SigNoz keeps the per-estimate `eta.estimate` records registered above.
+    if let Some(sink) = eta_snapshot::sink_for_native_queues(native_queues, &host_id) {
+        eta_snapshot::register_global_sink(sink);
     }
     // `daemon.event` collection (Issue #8760, G4): a second, independent bus
     // subscription alongside `collector::spawn_task` below — see

@@ -8,10 +8,11 @@ offline, and every estimate is **scored** against what happened. Both go to
 SigNoz as `eta.estimate` / `eta.outcome` log records (field reference:
 [`telemetry-schema.md`](telemetry-schema.md)).
 
-Phase 1 of #9289, with backfill and a leak-free backtest (#9325), estimates
-for not-yet-started issues (#9326) and a CLI (#9327, [below](#cli-loom-daemon-eta)).
-Later phases: shadow mode and promotion (#9328), the loom-ui snapshot (#9329)
-and fuller docs (#9330).
+Complete as of #9289's last phase: the core model, backfill and a leak-free
+backtest (#9325), estimates for not-yet-started issues (#9326), a CLI (#9327,
+[below](#cli-loom-daemon-eta)), shadow mode and promotion (#9328), and the
+host-scoped live list the fleet dashboard reads (#9329,
+[below](#the-live-list-etasnapshot)).
 
 ## The model
 
@@ -110,10 +111,50 @@ reserved value today). The estimator stays a pure function of
 | `start-v1` | `start` | slot turnovers (the stage-sample journal) | at dispatch (no verdict) |
 | `finish-v1` | `finish` | in-sweep phase durations (`sweep-outcome-telemetry.jsonl`) | after the in-sweep merge when at least half of the history's successful sweeps merged themselves, else at the verdict |
 | `land-v1` | `land` | in-sweep phases and the stage-sample journal (turnovers too, for an unstarted issue) | after `merge_wait` |
+| `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
 
 A shipped id is **immutable**: a golden test pins each id's output on a fixed
 fixture. A behaviour change is a new id registered beside the old one
 (`eta::Registry`), selected per kind by `autonomous.eta.current`.
+
+### Adding a v2, and comparing it
+
+1. **Register it beside the incumbent** — a new `eta::Heuristic` with its own
+   id, added to `Registry::builtin()`. `current` does not move, so nothing
+   downstream changes: registering a candidate is free.
+2. **Backtest it** (`loom-daemon eta backtest --heuristic land-v2 --compare
+   land-v1`): a leak-free replay over the identical case set, reporting mean
+   pinball loss, coverage and bias for both.
+3. **Let it run in shadow** — from the moment it is registered, the tracker
+   estimates **every** heuristic of the kind at the same `as_of` for the same
+   subject. Each is its own `eta.estimate`; only `current`'s carries
+   `primary: true`, and only `primary` estimates are ever shown as "the" ETA
+   (the CLI, the live list below). Because one outcome scores every pending
+   estimate of a `(repo, issue, kind)` series, the candidate's score and the
+   incumbent's arrive already paired, and
+   `.loom/state/eta/shadow.json` accumulates the running sums.
+4. **Promote it** (`loom-daemon eta promote --candidate land-v2 [--apply]`),
+   which applies the two gates **in order**, both required (operator decision
+   2 on #9289):
+   - **Backtest**: the candidate must beat `current`'s mean pinball loss on
+     the identical replay set. A heuristic that cannot win on history it can
+     be re-run against is not judged on a live sample nobody can replay, so a
+     failure here means the live gate is not even consulted.
+   - **Live**: at least 50 paired observations, the candidate's paired mean
+     pinball loss no worse than `current`'s, and its p25–p75 coverage inside
+     `[40%, 60%]`.
+
+   Either gate failing leaves `current` untouched, and `--apply` on a failing
+   candidate is a refusal, not an override. Every evaluation writes a
+   `eta-promotion-decision/v1` record (`.loom/logs/`) carrying the numbers
+   that decided it, so "why did this flip?" — or "why has it not?" — is
+   answered from the record. A flip is written to the **host-local** config
+   tier (`.loom-local/local.json`): the evidence is this host's own history
+   and pairs (#9343), so rolling a promotion fleet-wide stays an operator
+   action, not something one host decides for everyone.
+
+`land-v2` ships registered-not-current on purpose, as the worked example of
+all of the above.
 
 ## The explanation (`eta-explanation/v1`)
 
@@ -247,11 +288,47 @@ Estimate ids are derived (`derived_hex(["loom.eta.estimate", repo key, issue,
 kind, heuristic, as_of])`), never random, and both kinds sit inside the
 issue's D32 story trace.
 
+## The live list (`eta.snapshot`)
+
+The estimates above are emitted one at a time as `eta.estimate` log records
+and live in SigNoz, which is what accuracy scoring needs and what a dashboard
+list does not: answering "what is this host estimating *right now*" from an
+event stream means reconstructing the current state from every estimate ever
+made. So the collector also publishes a **host-scoped live list**, on the same
+5-minute pass, immediately after the ETA pass: one `eta.snapshot` record with
+one slim row per `(repo, issue, kind)` the tracker currently estimates —
+`repo`, `issue`, `pr`, `kind`, `p25`/`p50`/`p75` (remaining seconds),
+`heuristic`, `estimate_id`, `as_of`, `stage`, `no_estimate_reason`. Field
+reference: [`telemetry-schema.md`](telemetry-schema.md).
+
+- **Native-HTTPS only**, unlike `eta.estimate` / `eta.outcome`: it is a
+  dashboard state key (`eta:<hostId>`, newest per host), not a time series.
+  SigNoz already holds every estimate.
+- **No explanation rides along.** The dashboard's "why this ETA?" fetches the
+  full `eta-explanation/v1` record from SigNoz on demand by `estimate_id`, and
+  the accuracy panel queries `eta.outcome` there.
+- **Only `current`'s estimate.** A shadow candidate's estimate (above) is
+  never the subject's answer, and a superseded refresh is not current: exactly
+  one row survives per `(repo, issue, kind)`.
+- **A refusal is a row.** An issue with a `no_estimate_reason` and no
+  quantiles is carried, not dropped: that it *cannot* be estimated, and why,
+  is the answer.
+- **Only on change.** A pass whose estimate set is identical to the last one
+  emitted sends nothing, so a stalled tracker reads as an ageing `as_of`
+  rather than a re-stamped copy. Nothing is sent at all — never an empty
+  record — when ETA is disabled, when no HTTPS exporter is configured, or when
+  nothing is currently estimated.
+
+It is deliberately separate from `queue.snapshot`: that record is the work
+finder's ready queue, while `land` estimates cover building and in-review
+items which are not in it at all.
+
 ## CLI (`loom-daemon eta`)
 
-Four subcommands, all read-only (nothing here writes an estimate to the
-journal or telemetry — that is the tracker's job, described above). Every
-subcommand also accepts `--repo-root PATH` (default: the current directory).
+Five subcommands. All are read-only except `eta promote --apply`, which writes
+one config key; nothing here writes an estimate to the journal or telemetry —
+that is the tracker's job, described above. Every subcommand also accepts
+`--repo-root PATH` (default: the current directory).
 
 - **`loom-daemon eta backfill [--repo OWNER/NAME] [--limit N] [--dry-run]`** —
   seeds `.loom/logs/eta-stage-samples.jsonl` from `pr-latency`'s own
@@ -295,6 +372,13 @@ subcommand also accepts `--repo-root PATH` (default: the current directory).
   last (stably by issue number) and their reason shown. One bounded `gh issue
   list` plus, per issue, the same open-PR/checkpoint reads `view` makes — no
   extra reads beyond that.
+- **`loom-daemon eta promote --candidate ID [--repo OWNER/NAME] [--since RFC3339] [--apply] [--json]`**
+  — evaluates the two-gate promotion rule
+  ([above](#adding-a-v2-and-comparing-it)) for a registered shadow candidate
+  and, with `--apply` and only when both gates pass, flips
+  `autonomous.eta.current.<kind>` in the host-local config tier (#9328).
+  Without `--apply` it changes nothing. Either way it appends the decision
+  record that explains the outcome.
 
 `loom eta …` (the machine dispatcher, `scripts/loom`) is a thin passthrough to
 `loom-daemon eta …`.
@@ -317,6 +401,11 @@ Each pass logs `eta: pass emitted=N refused=M outcomes=K …`.
 [`eta-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/eta-queries.sql)
 answers, against `signoz_logs.distributed_logs_v2`:
 
+- **Section 0** (preflight): estimates, refusals and outcomes per heuristic,
+  revision and kind; how many outcomes were **scored** vs only counted; the
+  **abandonment** count (`loom.eta.outcome = 'abandoned'`); and how many rows
+  either side of the join carried incomplete provenance. Read it first — it
+  is what says whether the figures below rest on anything.
 - **Q1**: MAE, 25–75 coverage and bias per heuristic, revision, kind, repo
   and horizon bucket.
 - **Q2**: mean pinball loss per heuristic × kind, and per revision.
@@ -324,6 +413,9 @@ answers, against `signoz_logs.distributed_logs_v2`:
   `loom.eta.estimate_id`, and every numeric feature is correlated with the
   error (`rankCorr`, `corr`).
 
-All three group by `(heuristic, revision)` as well as by heuristic, so a
-daemon roll shows as two rows, and all three exclude rows with incomplete
-provenance.
+Q1–Q3 group by `(heuristic, revision)` as well as by heuristic, so a daemon
+roll shows as two rows, and all three exclude rows with incomplete
+provenance. Every `loom.eta.*` attribute they read is pinned to the emitted
+schema by `loom-daemon/tests/eta_artifacts.rs`, so a renamed or dropped
+attribute fails CI here rather than silently returning empty columns in
+SigNoz.
