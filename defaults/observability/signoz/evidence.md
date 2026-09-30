@@ -896,7 +896,7 @@ fails loudly. Observed on the pinned engine:
 | Repo by trace join | `org/alpha` / `org/beta` resolved from the root span, `repos_in_trace` **1** |
 | Wrong container (negative control) | `attributes_number` subscript returns **0** for every row **without erroring** — the silent-empty failure mode, demonstrated rather than claimed |
 
-The static half (`signoz_trial_artifacts.rs`, 6 new tests) derives the permitted
+The static half (`signoz_trial_artifacts.rs`, 5 new tests) derives the permitted
 counter/cost/pricing vocabulary by calling `counter_attributes()` and
 `Pricing::attributes()`, so a rename in the emitting code fails ordinary CI
 instead of silently emptying a saved view.
