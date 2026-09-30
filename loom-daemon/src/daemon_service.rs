@@ -83,40 +83,14 @@ fn gh_token_needs_update(current: Option<&str>, minted: &str) -> bool {
     current != Some(minted)
 }
 
+// Extracted to a sibling file (#9596) rather than left inline: this file is a
+// frozen over-threshold ratchet entry, and `.loom/docs/file-size-policy.md`
+// names extracting a test module as the sanctioned way to make room — "the
+// parent shrinks, and the extracted file is measured on its own terms". Moved
+// verbatim; the tests themselves are unchanged.
 #[cfg(test)]
-mod gh_token_guard_tests {
-    //! Tests for the #4456 value-changed guard on the `github-app` refresh
-    //! tick. Deliberately a *pure* function test — it does not touch the
-    //! process-global `GH_TOKEN`, so it neither races nor adds to the
-    //! test-env-mutation hazard tracked by #4385.
-    use super::gh_token_needs_update;
-
-    #[test]
-    fn cache_hit_same_value_skips_write() {
-        // The ~10-of-11 common case: the shell helper returned the unchanged
-        // cached token, so no `set_var` is warranted.
-        assert!(!gh_token_needs_update(Some("ghs_abc"), "ghs_abc"));
-    }
-
-    #[test]
-    fn genuine_rotation_writes() {
-        // A real ~hourly rotation: the minted value differs -> write.
-        assert!(gh_token_needs_update(Some("ghs_old"), "ghs_new"));
-    }
-
-    #[test]
-    fn unset_env_writes() {
-        // Nothing exported yet (Err(VarError) -> None): treat as different so
-        // the first post-boot tick still exports the token.
-        assert!(gh_token_needs_update(None, "ghs_first"));
-    }
-
-    #[test]
-    fn empty_current_differs_from_nonempty() {
-        // An empty exported value is not equal to a real minted token.
-        assert!(gh_token_needs_update(Some(""), "ghs_real"));
-    }
-}
+#[path = "daemon_service/gh_token_guard_tests.rs"]
+mod gh_token_guard_tests;
 
 /// The daemon's real entry point: CLI dispatch, then full daemon startup ending
 /// in the IPC accept loop (which only returns on a startup failure — a running
@@ -659,6 +633,19 @@ pub(crate) async fn run_daemon() -> Result<()> {
             }
         }
     }
+
+    // Fleet-store sync (#9596). HERE, and not earlier or later, for two hard
+    // ordering reasons: the store is read through `gh` under the credentials
+    // the preflight above just resolved, and every `read_*_config` call that
+    // gates a loop below must see the config the store renders — so this is
+    // the one point that is after the former and before all of the latter. It
+    // awaits the startup render (bounded; an unreachable forge falls back to
+    // the last good cached snapshot and never blocks boot) and then leaves a
+    // `fleet.syncIntervalSecs` timer task behind for drift detection. A host
+    // with no `fleet.repo` — every host that has not opted in — does nothing
+    // at all here. See `loom_daemon::fleet_sync`.
+    let _fleet_sync_handle =
+        loom_daemon::fleet_sync::start(&sweep_workspace, Some(event_bus.clone())).await;
 
     // #4430: ticks every `GITHUB_APP_REFRESH_INTERVAL` (~5min) to keep the
     // minted installation token fresh across its ~1h lifetime for a
