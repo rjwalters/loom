@@ -9964,26 +9964,30 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   **refuses** the restart — it never cancels a sweep, never silently restarts, and
   never silently gives up. `--force-after-timeout` opts into cancelling the
   stragglers via the existing `cancel_sweep` path, then restarts. What happens to
-  *dispatch* at that refusal depends on which kind of drain it is (#6007):
-  - **A relaunch drain (the version roll)** keeps the roll **pending**: the drain
-    flag stays set, so dispatch stays paused, and the supervisor keeps polling and
-    fires the restart the instant in-flight reaches **zero** — no operator, no
-    re-run, no guessed `--timeout`. Retry windows widen geometrically from the
-    requested timeout (`base × 2ⁿ`, capped at 2h each) and the whole sequence is
-    bounded by a total paused-dispatch budget of `4 × --timeout` (capped at 4h).
-    Once that budget is spent the roll is **abandoned**: dispatch resumes exactly
-    as it did pre-#6007, so a wedged sweep can never starve the host of work
-    indefinitely, and the note then says to cancel the stuck sweep rather than
-    widen the window again. Escape hatches while pending:
-    `restart --abort-drain` (give up now, resume dispatch) and
-    `restart --drain --force-after-timeout` (cancel the stragglers and roll on the
-    next supervisor tick — on a *pending* roll this escalates the active drain in
-    place and pulls its re-armed deadline in to now; on a first-attempt drain the
-    #4521 pinning still applies).
-  - **A then-exit teardown drain** (`fleet drain`'s path) keeps the historical
-    behavior byte-for-byte: it clears the flag, resumes dispatch, and stays up —
-    `fleet drain` detects that remote refusal by observing `drain.draining: false`
-    on a still-reachable daemon and reports its documented exit code `2`.
+  *dispatch* at that refusal depends on **who started the drain** (#6007, #9588):
+  - **An operator drain** (every IPC request: `restart --drain [--then-exit]`,
+    `loom-daemon-update.sh --drain`, `fleet drain`) **holds**: dispatch stays
+    paused, the deadline clears, the note and a `daemon.drain.timeout`
+    (`paused: true`) event name the stragglers, and the terminal action still
+    fires when in-flight reaches zero. It never resumes on its own — only
+    `restart --abort-drain` does. `status` shows `timed_out`/`origin`;
+    `fleet drain` maps a held remote to its exit code `2`.
+  - **The auto-update roll** keeps the roll **pending**: dispatch stays paused
+    and the restart fires the instant in-flight reaches zero. Retry windows
+    widen geometrically (`base × 2ⁿ`, capped at 2h each) within a total
+    paused-dispatch budget of `4 × --timeout` (capped at 4h); once spent the
+    roll is **abandoned** and dispatch resumes, so a version roll nobody asked
+    for can never starve a host of work. An operator request against it
+    promotes it to an operator drain (one-way).
+  - **Escalation (#9588):** a later `restart --drain --force-after-timeout`
+    escalates ANY active drain in place — the deadline only moves earlier
+    (`now` for a held or pending drain) — and `--then-exit` escalates
+    relaunch → stay-down (#4521).
+  - **Operator-stop record (#9588):** accepting a then-exit drain moves
+    `autonomy-desired` aside into `autonomy-desired.stopped`. The watchdog
+    never revives past it, startup healing never re-arms the marker, and a
+    supervised relaunch (`RunAtLoad`, reboot) comes up with dispatch **held**.
+    `restart --abort-drain` restores the marker; an explicit start clears it.
   Why this asymmetry: on a host that is actually working, resuming dispatch at the
   deadline handed the admission window straight back to the work finder, which
   admitted more sweeps, which made the *next* drain strictly harder to satisfy. In

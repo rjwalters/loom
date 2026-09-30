@@ -396,7 +396,7 @@ async fn test_ipc_drain_trigger_abandonment_resumes_dispatch_and_renames_the_not
 
     // Arm a relaunch roll directly and drive it to "pending" the way a refused
     // deadline would, so the state being abandoned is the real one.
-    drain.begin(Duration::from_secs(1800), false, false);
+    drain.begin_as(Duration::from_secs(1800), false, false, crate::ipc::DrainOrigin::AutoUpdate);
     drain.set_roll_target(Some("v0.19.390@aaaa".to_string()));
     let refusal = drain.refuse_roll_deadline(chrono::Utc::now() + chrono::Duration::seconds(1800));
     assert!(matches!(refusal, crate::ipc::RollRefusal::Deferred { .. }), "{refusal:?}");

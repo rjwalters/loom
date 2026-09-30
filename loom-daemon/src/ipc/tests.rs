@@ -4755,150 +4755,6 @@ fn test_drain_tick_completes_only_at_zero() {
     assert_eq!(completed, 1, "completes exactly once, at n==0");
 }
 
-/// The `DrainState` machine: begin sets the flag and a deadline, a second
-/// begin is idempotent (does not stack / move the deadline), abort clears
-/// the flag and bumps the generation, and the timeout path clears + notes.
-#[test]
-fn test_drain_state_lifecycle() {
-    let drain = DrainState::new();
-    assert!(!drain.is_draining());
-    assert_eq!(drain.generation(), 0);
-
-    // begin ⇒ Started, flag set, deadline recorded, generation bumped.
-    let (gen1, deadline) = match drain.begin(Duration::from_secs(120), false, false) {
-        DrainBegin::Started {
-            generation,
-            deadline,
-        } => (generation, deadline),
-        other => panic!("expected Started, got {other:?}"),
-    };
-    assert!(drain.is_draining());
-    assert_eq!(gen1, 1);
-    assert_eq!(drain.snapshot().deadline, Some(deadline));
-    assert!(!drain.snapshot().force_after_timeout);
-
-    // A second begin while already draining is idempotent: same generation,
-    // same deadline, flag still set (AC edge: second drain does not stack).
-    match drain.begin(Duration::from_secs(9999), true, false) {
-        DrainBegin::AlreadyDraining {
-            active_then_exit,
-            escalated,
-            force_escalated,
-        } => {
-            assert!(!active_then_exit, "active drain is still a relaunch drain");
-            assert!(!escalated, "a then_exit=false request escalates nothing");
-            assert!(
-                !force_escalated,
-                "#6007: force escalation applies only to a PENDING roll — a \
-                     first-attempt drain's force flag stays pinned (#4521)"
-            );
-        }
-        other => panic!("expected AlreadyDraining, got {other:?}"),
-    }
-    assert!(
-        !drain.snapshot().force_after_timeout,
-        "#4521 invariant: the active first-attempt drain's force flag is pinned"
-    );
-    assert_eq!(drain.generation(), gen1, "idempotent begin does not bump gen");
-    assert_eq!(
-        drain.snapshot().deadline,
-        Some(deadline),
-        "idempotent begin does not move the deadline"
-    );
-
-    // abort ⇒ flag cleared, generation bumped (so a live supervisor stops),
-    // note recorded.
-    assert!(drain.abort());
-    assert!(!drain.is_draining());
-    assert_eq!(drain.generation(), gen1 + 1);
-    assert!(drain.snapshot().note.unwrap().contains("aborted"));
-    // abort again ⇒ no-op.
-    assert!(!drain.abort());
-
-    // timeout resolution clears + notes + bumps generation.
-    let gen_before = drain.generation();
-    let _ = drain.begin(Duration::from_secs(1), false, false);
-    drain.resolve_timeout("timed out".to_string());
-    assert!(!drain.is_draining());
-    assert_eq!(drain.snapshot().note.as_deref(), Some("timed out"));
-    assert!(drain.generation() > gen_before);
-}
-
-/// Issue #4521 AC1 — `then_exit` on the already-draining path is escalated
-/// **one way** (relaunch → stay-down) and the outcome reported back is the
-/// ACTIVE drain's terminal action, never a blind echo of the request.
-#[test]
-fn test_drain_then_exit_escalates_one_way() {
-    // A relaunch-drain is in flight (this is the auto-update roll's shape:
-    // `then_exit=false`).
-    let drain = DrainState::new();
-    let deadline = match drain.begin(Duration::from_secs(120), false, false) {
-        DrainBegin::Started { deadline, .. } => deadline,
-        other => panic!("expected Started, got {other:?}"),
-    };
-    assert!(!drain.snapshot().then_exit);
-
-    // An operator teardown request lands mid-roll: it must NOT be silently
-    // ignored (the #4521 defect) — the active drain escalates to stay-down.
-    match drain.begin(Duration::from_secs(9999), true, true) {
-        DrainBegin::AlreadyDraining {
-            active_then_exit,
-            escalated,
-            force_escalated,
-        } => {
-            assert!(active_then_exit, "the active drain now stays down");
-            assert!(escalated, "the escalation must be reported to the caller");
-            assert!(!force_escalated, "no roll is pending, so force stays pinned (#4521 / #6007)");
-        }
-        other => panic!("expected AlreadyDraining, got {other:?}"),
-    }
-    assert!(
-        drain.snapshot().then_exit,
-        "the escalation must be visible to the already-running supervisor, \
-             which re-reads the descriptor"
-    );
-    // Everything else about the active drain is still pinned.
-    assert_eq!(drain.snapshot().deadline, Some(deadline));
-    assert!(!drain.snapshot().force_after_timeout);
-
-    // Escalating again is a no-op that still reports the truth.
-    match drain.begin(Duration::from_secs(1), false, true) {
-        DrainBegin::AlreadyDraining {
-            active_then_exit,
-            escalated,
-            ..
-        } => {
-            assert!(active_then_exit);
-            assert!(!escalated, "already stay-down — nothing to escalate");
-        }
-        other => panic!("expected AlreadyDraining, got {other:?}"),
-    }
-
-    // A relaunch request against an active teardown drain must NOT downgrade
-    // it: the reply still says "will stay down".
-    match drain.begin(Duration::from_secs(1), false, false) {
-        DrainBegin::AlreadyDraining {
-            active_then_exit,
-            escalated,
-            ..
-        } => {
-            assert!(active_then_exit, "then-exit is never downgraded");
-            assert!(!escalated);
-        }
-        other => panic!("expected AlreadyDraining, got {other:?}"),
-    }
-    assert!(drain.snapshot().then_exit);
-
-    // After an abort, a fresh drain starts from the requested terminal
-    // action again (the escalation does not leak across drains).
-    assert!(drain.abort());
-    match drain.begin(Duration::from_secs(30), false, false) {
-        DrainBegin::Started { .. } => {}
-        other => panic!("expected Started, got {other:?}"),
-    }
-    assert!(!drain.snapshot().then_exit, "a fresh drain honors its own then_exit");
-}
-
 /// Issue #4521 AC3 — the drain-completion exit-code contract: a then-exit
 /// drain must exit `EXIT_SHUTDOWN` (143, **non-zero**) so a launchd job with
 /// `KeepAlive:{SuccessfulExit:true}` stays down; a relaunch drain exits
@@ -5268,25 +5124,13 @@ fn test_drain_roll_abandoned_note_keeps_the_5340_contract() {
 /// `restart --drain --force-after-timeout`; that command must actually do
 /// something. On a **pending** roll it escalates the force flag one-way and
 /// pulls the re-armed deadline in to now, so the next supervisor tick reaches
-/// `TimedOutForce` — while a first-attempt drain keeps #4521's pinning.
+/// `TimedOutForce`. (#9588 widened escalation to every active drain — see
+/// `ipc/drain_state_tests.rs` for the first-attempt case.)
 #[test]
-fn test_force_escalation_applies_only_to_a_pending_roll() {
+fn test_force_escalation_of_a_pending_roll_forces_on_the_next_tick() {
     let drain = DrainState::new();
     let base = Duration::from_secs(1800);
-    let first_deadline = match drain.begin(base, false, false) {
-        DrainBegin::Started { deadline, .. } => deadline,
-        other => panic!("expected Started, got {other:?}"),
-    };
-
-    // Before any refusal: force stays pinned and the deadline does not move.
-    match drain.begin(base, true, false) {
-        DrainBegin::AlreadyDraining {
-            force_escalated, ..
-        } => assert!(!force_escalated, "no roll pending yet ⇒ #4521 pinning holds"),
-        other => panic!("expected AlreadyDraining, got {other:?}"),
-    }
-    assert!(!drain.snapshot().force_after_timeout);
-    assert_eq!(drain.snapshot().deadline, Some(first_deadline));
+    let _ = drain.begin_as(base, false, false, DrainOrigin::AutoUpdate);
 
     // Refuse once ⇒ the roll is pending.
     let started = drain.snapshot().started_at.expect("started_at");
@@ -5381,7 +5225,16 @@ fn test_drain_request_unsupervised_refuses_without_pausing() {
     let bus = Arc::new(EventBus::new());
     let drain = Arc::new(DrainState::new());
 
-    let resp = handle_drain_request(&drain, &pool, &root, &bus, Some(60), false, false);
+    let resp = handle_drain_request(
+        &drain,
+        &pool,
+        &root,
+        &bus,
+        Some(60),
+        false,
+        false,
+        DrainOrigin::Operator,
+    );
     match resp {
         Response::DaemonDrain {
             accepted,
@@ -5439,7 +5292,16 @@ fn test_already_draining_ack_reports_active_terminal_action() {
 
     // Operator teardown request during that window. `then_exit=true` skips
     // the supervisor gate, so no `LOOM_DAEMON_SUPERVISOR` is needed.
-    let resp = handle_drain_request(&drain, &pool, &root, &bus, Some(60), false, true);
+    let resp = handle_drain_request(
+        &drain,
+        &pool,
+        &root,
+        &bus,
+        Some(60),
+        false,
+        true,
+        DrainOrigin::Operator,
+    );
     match resp {
         Response::DaemonDrain {
             accepted,
@@ -5463,7 +5325,16 @@ fn test_already_draining_ack_reports_active_terminal_action() {
     // drain must be acked with `then_exit: true` — it is NOT downgraded, and
     // the ack must not promise a restart that will never happen.
     std::env::set_var("LOOM_DAEMON_SUPERVISOR", "launchd");
-    let resp = handle_drain_request(&drain, &pool, &root, &bus, Some(60), false, false);
+    let resp = handle_drain_request(
+        &drain,
+        &pool,
+        &root,
+        &bus,
+        Some(60),
+        false,
+        false,
+        DrainOrigin::Operator,
+    );
     match resp {
         Response::DaemonDrain {
             accepted,

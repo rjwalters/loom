@@ -98,10 +98,40 @@ pub fn tick(verbose: bool) -> i32 {
     let reporter = report::Reporter::new(paths.log.clone(), verbose);
     let state = consts::StateFiles::resolve(&paths.loom_dir);
 
+    // #9588: an operator stop on record outranks everything, including a stale
+    // marker — the watchdog must never revive a daemon an operator stopped.
+    if crate::operator_stop::is_recorded(&paths.marker) {
+        return operator_stopped(&paths, &reporter, &state);
+    }
     if !paths.marker.exists() {
         return marker_absent(&paths, &reporter, &state);
     }
     marker_present(&paths, &reporter, &state)
+}
+
+/// An operator stop is on record (`<marker>.stopped`, #9588): a
+/// `restart --drain --then-exit` / `fleet drain` moved the marker aside. That
+/// IS the operator's intent, so this is a deliberate stop — no recovery, no
+/// page, exit 0 — whether or not a daemon is still draining toward its exit.
+/// Only `restart --abort-drain` or an explicit start clears it.
+fn operator_stopped(
+    paths: &config::Paths,
+    reporter: &report::Reporter,
+    state: &consts::StateFiles,
+) -> i32 {
+    recovery::clear(&state.recovery, &state.escalation_sentinel);
+    let at = crate::operator_stop::field(&paths.marker, "at").unwrap_or_default();
+    let reason = crate::operator_stop::field(&paths.marker, "reason").unwrap_or_default();
+    reporter.report(
+        report::Level::Ok,
+        &format!(
+            "RULE: operator stop recorded -> not reviving (#9588): {} (at {at}: {reason}). A \
+             drained-and-exited daemon stays down; clear it with `loom-daemon restart \
+             --abort-drain` or an explicit ./.loom/scripts/cli/loom-daemon-start.sh.",
+            crate::operator_stop::record_path(&paths.marker).display()
+        ),
+    );
+    0
 }
 
 /// Sections 2-7: intent is on record, so compare it against reality.

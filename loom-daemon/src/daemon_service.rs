@@ -1756,31 +1756,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // three paths: if the daemon is supervised and the marker is absent, re-write
     // it. An unsupervised (`--foreground`/nohup/debug) run never writes one — it
     // must not arm the host-side pager for a process nothing will relaunch.
-    match autonomy_marker::heal_on_startup(heartbeat_interval.as_secs()) {
-        Some(autonomy_marker::HealOutcome::Healed(path)) => log::warn!(
-            "autonomy_marker: HEALED an absent autonomy-desired marker at {} — a supervised \
-             daemon was running with crash protection disarmed (restart-primitive / self-update / \
-             bare relaunch never re-writes it). The watchdog and `loom-daemon status` now see this \
-             daemon as EXPECTED again (#4331).",
-            path.display()
-        ),
-        Some(autonomy_marker::HealOutcome::AlreadyPresent) => {
-            log::debug!("autonomy_marker: marker already present — no healing needed (#4331)")
-        }
-        Some(autonomy_marker::HealOutcome::UnsupervisedSkip) => log::debug!(
-            "autonomy_marker: unsupervised run (no LOOM_DAEMON_SUPERVISOR) — deliberately NOT \
-             writing an autonomy-desired marker (#4331)"
-        ),
-        Some(autonomy_marker::HealOutcome::WriteFailed { path, error }) => log::warn!(
-            "autonomy_marker: failed to heal the autonomy-desired marker at {} (logged, never \
-             fatal; the daemon keeps running): {error} (#4331)",
-            path.display()
-        ),
-        None => log::warn!(
-            "autonomy_marker: could not resolve a loom dir (no LOOM_SOCKET_PATH / home) — \
-             skipping marker healing for this run (#4331)"
-        ),
-    }
+    // #9588: the per-outcome logging lives beside the outcomes.
+    autonomy_marker::log_heal_outcome(autonomy_marker::heal_on_startup(
+        heartbeat_interval.as_secs(),
+    ));
 
     // Watchdog-provisioning-guard loop (Issue #5405): #5343's
     // heal_watchdog_provisioning_gap() only fires as a side effect of
