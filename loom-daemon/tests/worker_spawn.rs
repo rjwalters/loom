@@ -3,6 +3,8 @@ use std::process::Command;
 #[path = "support/worker_cli.rs"]
 mod worker_cli;
 use worker_cli::fixture;
+#[path = "support/write_scope_root.rs"]
+mod write_scope_root;
 fn worker(root: &std::path::Path, runtime: &str) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
     c.args(["spawn-worker", "--"])
@@ -303,37 +305,12 @@ fn native_role_runner_does_not_require_claude_tokens_or_inherit_sonnet() {
     std::fs::write(roles.join("curator.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
     config(d.path(), serde_json::json!({"runtimes":{"default":"pi"}}));
     // #9548: a role tick launches only on a workspace this installation may
-    // write to, so the probe root is a managed checkout (an origin and a
-    // `.loom/`) whose credential, a fake `gh`, reports push permission.
-    let git = |args: &[&str]| {
-        assert!(Command::new("git")
-            .args(args)
-            .current_dir(d.path())
-            .status()
-            .unwrap()
-            .success());
-    };
-    git(&["init", "-q"]);
-    git(&[
-        "remote",
-        "add",
-        "origin",
-        "https://github.com/acme/role-probe.git",
-    ]);
-    let fake_gh = d.path().join("fake-gh");
-    std::fs::write(
-        &fake_gh,
-        "#!/bin/sh\n[ \"$1 $2\" = \"api repos/acme/role-probe\" ] && echo '{\"push\":true}'\nexit 0\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_gh, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .unwrap();
+    // write to, so the probe root is made a managed, writable checkout.
     let out = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "role_runner_probe", "--nocapture"])
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap())
-        .env("LOOM_GH_BIN", &fake_gh)
-        .env("LOOM_WRITE_SCOPE_CACHE_DIR", d.path().join(".write-scope-cache"))
+        .envs(write_scope_root::writable_env(d.path()))
         .env("LOOM_TEST_NATIVE_ROLE_ROOT", d.path())
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
         .env("LOOM_SHARED_TOKENS_DIR", "")
