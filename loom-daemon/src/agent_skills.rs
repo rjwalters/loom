@@ -129,6 +129,38 @@ pub fn yaml_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Rewrite flat sibling-skill links for the one-dir-per-skill output layout.
+///
+/// Every source file lives together in `defaults/.claude/commands/loom/`, so a
+/// link like ``[`probe-protocol.md`](probe-protocol.md)`` resolves there as a
+/// plain sibling. The generated surface gives each skill its own directory
+/// (`.agents/skills/loom-<name>/SKILL.md`), where that same target does not
+/// exist — so embedding the source verbatim shipped 23 dead links into every
+/// consumer repo that installs Loom. Rewrite each one to the sibling skill's
+/// real path, preserving any `#anchor`.
+///
+/// Only targets naming a **generated** skill are rewritten. A relative link to
+/// a source file with no generated counterpart (`sweep.md`,
+/// `champion-pr-merge.md`) is deliberately left alone: there is nothing in the
+/// output tree to aim it at, and bending it to a path that also does not exist
+/// would trade one broken link for a more confusing one. Those files are
+/// referenced in prose by full path (`.claude/commands/loom/…`), which is why
+/// none of them currently reach the generated surface as a link at all.
+///
+/// Handles the two forms that actually occur, `](<name>.md)` and
+/// `](<name>.md#anchor)`. The `.md)`/`.md#` suffix is what anchors the match,
+/// so a longer name is never clipped by a shorter prefix of it — `judge` does
+/// not match inside `](judge-reference.md)`.
+#[must_use]
+pub fn rewrite_sibling_skill_links(source_content: &str, names: &[String]) -> String {
+    let mut out = source_content.to_string();
+    for name in names {
+        out = out.replace(&format!("]({name}.md#"), &format!("](../loom-{name}/SKILL.md#"));
+        out = out.replace(&format!("]({name}.md)"), &format!("](../loom-{name}/SKILL.md)"));
+    }
+    out
+}
+
 /// Render the full generated `SKILL.md` content for role/sub-skill `name`.
 #[must_use]
 pub fn render_skill_md(name: &str, description: &str, source_content: &str) -> String {
@@ -192,7 +224,7 @@ pub fn generate_all(defaults_dir: &Path) -> Result<Vec<GeneratedSkill>, Generate
     let out_root = defaults_dir.join(".agents").join("skills");
 
     let mut out = Vec::with_capacity(names.len());
-    for name in names {
+    for name in &names {
         let src_path = commands_dir.join(format!("{name}.md"));
         let source_content =
             fs::read_to_string(&src_path).map_err(|_| GenerateError::MissingSource {
@@ -203,10 +235,11 @@ pub fn generate_all(defaults_dir: &Path) -> Result<Vec<GeneratedSkill>, Generate
         let json_text = fs::read_to_string(&json_path).ok();
         let description = derive_description(&source_content, json_text.as_deref())
             .ok_or_else(|| GenerateError::MissingDescription { name: name.clone() })?;
-        let content = render_skill_md(&name, &description, &source_content);
+        let body = rewrite_sibling_skill_links(&source_content, &names);
+        let content = render_skill_md(name, &description, &body);
         let out_path = out_root.join(format!("loom-{name}")).join("SKILL.md");
         out.push(GeneratedSkill {
-            name,
+            name: name.clone(),
             out_path,
             content,
         });
@@ -275,6 +308,94 @@ mod tests {
         let second_delim_idx = rendered.match_indices("---\n").nth(1).unwrap().0;
         let between = &rendered[second_delim_idx + 4..marker_idx];
         assert!(between.trim().is_empty());
+    }
+
+    #[test]
+    fn rewrite_points_sibling_skill_links_at_their_generated_path() {
+        let names = vec!["probe-protocol".to_string(), "driver".to_string()];
+        let src = "lives in [`probe-protocol.md`](probe-protocol.md).\n";
+        assert_eq!(
+            rewrite_sibling_skill_links(src, &names),
+            "lives in [`probe-protocol.md`](../loom-probe-protocol/SKILL.md).\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_preserves_anchors() {
+        let names = vec!["judge-reference".to_string()];
+        let src = "see [rubric](judge-reference.md#scoring-rubric) for detail\n";
+        assert_eq!(
+            rewrite_sibling_skill_links(src, &names),
+            "see [rubric](../loom-judge-reference/SKILL.md#scoring-rubric) for detail\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_does_not_clip_a_longer_name_with_a_shorter_prefix() {
+        // `judge` is a real skill and a prefix of `judge-reference`. Rewriting
+        // must key off the `.md)` suffix, never the bare prefix, or the longer
+        // target silently becomes `../loom-judge/SKILL.md-reference.md`.
+        let names = vec!["judge".to_string(), "judge-reference".to_string()];
+        let src = "[a](judge.md) and [b](judge-reference.md)\n";
+        assert_eq!(
+            rewrite_sibling_skill_links(src, &names),
+            "[a](../loom-judge/SKILL.md) and [b](../loom-judge-reference/SKILL.md)\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_leaves_links_with_no_generated_counterpart_alone() {
+        // `sweep.md` and `champion-pr-merge.md` are sources without a role, so
+        // no `loom-sweep/SKILL.md` exists to point at. Leaving them untouched
+        // is deliberate — see `rewrite_sibling_skill_links`' contract.
+        let names = vec!["champion".to_string()];
+        let src = "[x](sweep.md) and [y](champion-pr-merge.md)\n";
+        assert_eq!(rewrite_sibling_skill_links(src, &names), src);
+    }
+
+    #[test]
+    fn rewrite_leaves_absolute_and_external_targets_alone() {
+        let names = vec!["probe-protocol".to_string()];
+        let src = "[a](https://example.com/probe-protocol.md) [b](../../../.loom/docs/x.md)\n";
+        assert_eq!(rewrite_sibling_skill_links(src, &names), src);
+    }
+
+    #[test]
+    fn generated_body_has_sibling_links_rewritten_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let defaults = tmp.path();
+        write(&defaults.join("roles/driver.md"), "symlink-placeholder");
+        // Mirrors the real shape of driver.md: prose first paragraph (which is
+        // what the `description:` frontmatter is derived from), with the sibling
+        // link further down in the body.
+        write(
+            &defaults.join(".claude/commands/loom/driver.md"),
+            "# Default Shell\n\nYou are working in a standard shell environment.\n\n\
+             ## Terminal Probe Protocol\n\nThe full protocol lives in \
+             [`probe-protocol.md`](probe-protocol.md).\n",
+        );
+        write(&defaults.join("roles/probe-protocol.md"), "symlink-placeholder");
+        write(
+            &defaults.join(".claude/commands/loom/probe-protocol.md"),
+            "# Terminal Probe Protocol\n\nRespond to probes.\n",
+        );
+
+        let skills = generate_all(defaults).unwrap();
+        let driver = skills.iter().find(|s| s.name == "driver").unwrap();
+        assert!(driver
+            .content
+            .contains("](../loom-probe-protocol/SKILL.md)"));
+        assert!(!driver.content.contains("](probe-protocol.md)"));
+        // The provenance header still cites the flat source path it came from.
+        assert!(driver
+            .content
+            .contains("defaults/.claude/commands/loom/driver.md"));
+        // The description is derived from the unrewritten source on purpose: it
+        // is a one-line metadata summary, not a link resolved from any
+        // directory, so a rewritten path there would be meaningless.
+        assert!(driver
+            .content
+            .contains("description: \"You are working in a standard shell environment.\""));
     }
 
     #[test]

@@ -49,7 +49,7 @@ use chrono::{DateTime, Utc};
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::telemetry::trace::journal::Journal;
 use crate::telemetry::trace::store::TraceStore;
-use crate::telemetry::trace::{SpanName, SpanRecord, TraceAttributes};
+use crate::telemetry::trace::{SpanName, SpanRecord, TraceAttributes, TraceContext};
 
 /// One execution's token totals, in Claude's disjoint vocabulary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -82,6 +82,23 @@ impl TokenUsage {
             .saturating_add(self.output)
             .saturating_add(self.cache_read)
             .saturating_add(self.cache_write)
+    }
+
+    /// The `(tokens_in, tokens_out)` split `sweep.outcome` reports (Issue
+    /// #9443): every input-side counter summed — uncached input, cache reads and
+    /// cache writes — against `output` alone.
+    ///
+    /// Mirrors [`crate::transcript_tokens::sum_sweep_tokens_split`] exactly, so
+    /// a per-phase split derived from per-model rows reconciles against the
+    /// sweep total that function produces. Negative counters (impossible from a
+    /// real reader) clamp to `0` rather than wrapping.
+    #[must_use]
+    pub fn split(&self) -> (u64, u64) {
+        let input = self
+            .input
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write);
+        (u64::try_from(input).unwrap_or(0), u64::try_from(self.output).unwrap_or(0))
     }
 
     /// The `loom.tokens.*` span attributes.
@@ -133,6 +150,131 @@ pub fn finish_sweep(
     let window = (started_at.unwrap_or(now), now);
     record_execution_usage(root, execution, window, tokens_by_model, runtime);
     join::close(root, execution, now);
+}
+
+/// One phase attempt's usage, exactly as `sweep.outcome`'s `phase_durations`
+/// carries it (Issue #9443) — the input to [`record_phase_usage`].
+#[derive(Debug, Clone, Copy)]
+pub struct PhaseUsage<'a> {
+    /// The lifecycle phase / role name (`"curator"`, `"builder"`, `"judge"`, …).
+    pub role: &'a str,
+    /// 1-based attempt index within the sweep for this role.
+    pub attempt: u32,
+    /// The attempt's sampled window.
+    pub window: (DateTime<Utc>, DateTime<Utc>),
+    /// The attempt's per-model usage. Empty journals nothing.
+    pub rows: &'a [ModelUsageTotals],
+}
+
+/// Journal each phase attempt's per-model usage as `scope=attempt`
+/// `loom.runtime.usage` spans under the execution's own matching
+/// `loom.role_attempt` span (Issue #9443), so the OTLP path carries the same
+/// per-phase numbers `sweep.outcome`'s `phase_durations` do and the two cannot
+/// disagree about what a phase cost.
+///
+/// Matching is on the attempt span's own `loom.role` plus, when it carries one,
+/// `loom.attempt`; otherwise the role's spans are taken in start order and the
+/// Nth matches attempt N. A phase with **no** attempt span in the journal is
+/// skipped rather than given a fabricated parent — `sweep.outcome` still reports
+/// its usage, and an invented span would claim a role attempt the trace never
+/// observed.
+///
+/// Span ids derive from `(parent, scope, model)`, so a phase whose usage the
+/// in-session `usage-record` path already journalled keeps that span: the
+/// first writer wins and the counters are never double-counted. Call before
+/// `lifecycle::finish_execution`, which lets the journal retire.
+pub fn record_phase_usage(
+    root: &Path,
+    execution: &str,
+    phases: &[PhaseUsage<'_>],
+    runtime: Option<&str>,
+) {
+    if !super::tracing::enabled(root) || phases.is_empty() {
+        return;
+    }
+    if let Err(error) = journal_phase_usage(root, execution, phases, runtime) {
+        log::warn!("observability: per-phase usage spans not journalled: {error}");
+    }
+}
+
+/// [`record_phase_usage`] without the enablement check. Returns the journalled
+/// spans.
+pub fn journal_phase_usage(
+    root: &Path,
+    execution: &str,
+    phases: &[PhaseUsage<'_>],
+    runtime: Option<&str>,
+) -> anyhow::Result<Vec<SpanRecord>> {
+    let store = TraceStore::new(root);
+    let path = store.path(root, execution);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let saved = TraceStore::load(&path)?;
+    let journal = Journal::for_context(&path);
+    let mut attempts: Vec<SpanRecord> = journal
+        .completed()?
+        .into_iter()
+        .filter(|span| {
+            span.name == SpanName::RoleAttempt && span.context.trace_id == saved.context.trace_id
+        })
+        .collect();
+    attempts.sort_by_key(|span| span.started_at);
+    let pricing = cost::Pricing::active();
+    let mut spans = Vec::new();
+    for phase in phases {
+        if phase.rows.is_empty() {
+            continue;
+        }
+        let Some(parent) = match_attempt(&attempts, phase.role, phase.attempt) else {
+            continue;
+        };
+        let mut common = TraceAttributes::new();
+        common.insert("loom.sweep_id".into(), execution.to_string());
+        common.insert("loom.role".into(), phase.role.to_string());
+        common.insert("loom.phase".into(), phase.role.to_string());
+        common.insert("loom.attempt".into(), phase.attempt.to_string());
+        if let Some(runtime) = runtime.filter(|r| !r.is_empty()) {
+            common.insert("loom.runtime".into(), runtime.to_string());
+        }
+        spans.extend(spans::model_usage_spans(
+            parent,
+            phase.window,
+            phase.rows,
+            spans::UsageScope::Attempt,
+            &common,
+            &pricing,
+        ));
+    }
+    spans::append_new(&journal, spans)
+}
+
+/// The `loom.role_attempt` span `attempt` of `role` refers to: the one whose own
+/// `loom.attempt` says so, else the `attempt`-th of that role's spans in start
+/// order (`attempts` must already be sorted).
+fn match_attempt<'a>(
+    attempts: &'a [SpanRecord],
+    role: &str,
+    attempt: u32,
+) -> Option<&'a TraceContext> {
+    let of_role: Vec<&SpanRecord> = attempts
+        .iter()
+        .filter(|span| span.attributes.get("loom.role").is_some_and(|r| r == role))
+        .collect();
+    let labelled = of_role
+        .iter()
+        .find(|span| {
+            span.attributes
+                .get("loom.attempt")
+                .is_some_and(|a| a == &attempt.to_string())
+        })
+        .copied();
+    labelled
+        .or_else(|| {
+            let index = usize::try_from(attempt).ok()?.checked_sub(1)?;
+            of_role.get(index).copied()
+        })
+        .map(|span| &span.context)
 }
 
 /// [`record_execution_usage`] without the enablement check. Returns the
@@ -191,3 +333,9 @@ mod tests;
 #[allow(clippy::unwrap_used)]
 #[path = "runtime_usage/model_tests.rs"]
 mod model_tests;
+
+// Per-phase usage on the execution's `loom.role_attempt` spans (Issue #9443).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+#[path = "runtime_usage/phase_tests.rs"]
+mod phase_tests;

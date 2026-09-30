@@ -107,6 +107,7 @@ fn role_tick_result_str(result: RoleTickResult) -> &'static str {
         RoleTickResult::SkippedPoolExhausted => "skipped_pool_exhausted",
         RoleTickResult::SkippedModelRuntimeMismatch => "skipped_model_runtime_mismatch",
         RoleTickResult::SkippedLoad => "skipped_load",
+        RoleTickResult::SkippedQueueEmpty => "skipped_queue_empty",
     }
 }
 
@@ -192,6 +193,14 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(runtime) = &r.runtime {
                 attributes.push(kv_string("loom.runtime", runtime.clone()));
             }
+            // Issue #9432: the assigned story-point size of the work now in
+            // flight, as a NUMERIC attribute so a backend can sum it. Pushed
+            // only when the issue carried exactly one legal `points:*` label —
+            // an absent, stacked or out-of-vocabulary label set emits no
+            // attribute at all, never `0`.
+            if let Some(story_points) = r.story_points {
+                attributes.push(kv_int("loom.story_points", i64::from(story_points)));
+            }
             (
                 "sweep.started",
                 SeverityNumber::Info,
@@ -235,13 +244,18 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             ],
         ),
         TelemetryRecord::SweepCompleted(r) => {
+            // Issue #9442: `loom.repo` only when the slug resolved; the
+            // unresolved case is stamped explicitly instead of a path ever
+            // being written.
             let mut attributes = vec![
-                kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
             ];
+            if let Some(repo) = &r.repo {
+                attributes.insert(0, kv_string("loom.repo", repo.clone()));
+            }
             if let Some(usage) = metadata::usage(r.tokens_by_model.as_deref()) {
                 attributes.push(usage);
             }
@@ -251,21 +265,33 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 format!(
                     "sweep completed ({}): {} issue #{}",
                     result_str(r.result),
-                    r.repo,
+                    r.repo.as_deref().unwrap_or("(unresolved repo)"),
                     r.issue
                 ),
                 attributes,
             )
         }
         TelemetryRecord::SweepOutcome(r) => {
+            // Issue #9442: `loom.repo` only when the slug resolved;
+            // `loom.repo_unresolved=true` replaces it, never a host path.
             let mut attributes = vec![
-                kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
+                // Issue #9441: the "what did this sweep DO" axis travels with
+                // `loom.result`, never instead of it — an OTLP consumer must be
+                // able to separate a landing from a no-op re-dispatch without
+                // joining the journal. Always present, like the field itself.
+                kv_string("loom.disposition", r.disposition.as_str()),
                 kv_int("loom.total_duration_sec", r.total_duration_sec),
             ];
+            if let Some(repo) = &r.repo {
+                attributes.insert(0, kv_string("loom.repo", repo.clone()));
+            }
+            if r.repo_unresolved {
+                attributes.push(kv_string("loom.repo_unresolved", "true".to_string()));
+            }
             if let Some(model) = &r.model {
                 attributes.push(kv_string("loom.model", model.clone()));
             }
@@ -276,25 +302,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 attributes.push(kv_int("loom.pr_number", i64::from(pr_number)));
             }
             attributes.extend(metadata::outcome(r));
-            if !r.phase_durations.is_empty() {
-                let entries = r
-                    .phase_durations
-                    .iter()
-                    .map(|phase_duration| AnyValue {
-                        value: Some(any_value::Value::KvlistValue(KeyValueList {
-                            values: vec![
-                                kv_string("phase", phase_duration.phase.clone()),
-                                kv_int("duration_sec", phase_duration.duration_sec),
-                            ],
-                        })),
-                    })
-                    .collect();
-                attributes.push(kv(
-                    "loom.phase_durations",
-                    AnyValue {
-                        value: Some(any_value::Value::ArrayValue(ArrayValue { values: entries })),
-                    },
-                ));
+            if let Some(phases) = metadata::phase_durations(&r.phase_durations) {
+                attributes.push(phases);
             }
             (
                 "sweep.outcome",
@@ -302,7 +311,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 format!(
                     "sweep outcome ({}): {} issue #{}, {}s total",
                     result_str(r.result),
-                    r.repo,
+                    r.repo.as_deref().unwrap_or("(unresolved repo)"),
                     r.issue,
                     r.total_duration_sec
                 ),
@@ -370,7 +379,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // the parse never copies message text or tool output, so
             // nothing here needs a free-text bound beyond `bounded`'s.
             let mut attributes = vec![
-                kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_string("loom.session_id", r.session_id.clone()),
                 kv_string("loom.runtime", r.runtime.clone()),
@@ -383,7 +391,15 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 kv_int("loom.tool_errors", i64::try_from(r.tool_errors).unwrap_or(i64::MAX)),
             ];
             // Optional fields stay absent when unknown — an unobserved
-            // attribution must be an ABSENT attribute, never a zero one.
+            // attribution must be an ABSENT attribute, never a zero one. That
+            // now includes `loom.repo` (#9445): an unresolvable repo is an
+            // absent slug, never the session's directory name.
+            if let Some(repo) = &r.repo {
+                attributes.push(kv_string("loom.repo", repo.clone()));
+            }
+            if let Some(kind) = r.session_kind {
+                attributes.push(kv_string("loom.session_kind", kind.as_str().to_string()));
+            }
             if let Some(parent) = &r.parent_session_id {
                 attributes.push(kv_string("loom.parent_session_id", parent.clone()));
             }
@@ -429,7 +445,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                     "session summary: {} {} on {}, {} turn(s), {} tool call(s)",
                     r.runtime,
                     r.role.as_deref().unwrap_or("role-unknown"),
-                    r.repo,
+                    r.repo.as_deref().unwrap_or("repo-unresolved"),
                     r.turns,
                     r.tool_calls.iter().map(|c| c.count).sum::<u64>(),
                 ),
@@ -441,10 +457,14 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // rollup, mapped as a log record like `session.summary` — an
             // event with counts and a dollar figure, not a gauge.
             let mut attributes = vec![
-                kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_string("loom.session_id", r.session_id.clone()),
             ];
+            // Absent, never a directory name — see the `session.summary` arm
+            // (#9445); this record copies that one's slug verbatim.
+            if let Some(repo) = &r.repo {
+                attributes.push(kv_string("loom.repo", repo.clone()));
+            }
             if let Some(parent) = &r.parent_session_id {
                 attributes.push(kv_string("loom.parent_session_id", parent.clone()));
             }
@@ -503,7 +523,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 format!(
                     "session analysis: {} on {}, {} retry loop(s), {} anomaly flag(s)",
                     r.session_id,
-                    r.repo,
+                    r.repo.as_deref().unwrap_or("repo-unresolved"),
                     r.retry_loops.len(),
                     r.anomalies.len(),
                 ),

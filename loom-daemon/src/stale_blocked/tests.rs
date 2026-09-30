@@ -377,3 +377,80 @@ fn artifact_labels_name_both_populations() {
     assert_eq!(Artifact::Issue.label(), "issue");
     assert_eq!(Artifact::Pr.label(), "PR");
 }
+
+// --- cited_among: the close-triggered re-check's population filter (#9102) --
+
+fn input(body: &str, comments: &[(&str, &str)]) -> extract::Input {
+    extract::Input {
+        body: body.to_string(),
+        comments: comments
+            .iter()
+            .map(|(login, body)| extract::Comment {
+                author: extract::Author {
+                    login: (*login).to_string(),
+                },
+                body: (*body).to_string(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn cited_among_matches_a_prose_reference_in_the_body() {
+    let i = input("Blocked by #180: needs that first.", &[]);
+    assert_eq!(cited_among(Artifact::Issue, &i, &[180]), vec![180]);
+    assert!(cited_among(Artifact::Issue, &i, &[181]).is_empty());
+}
+
+#[test]
+fn cited_among_matches_a_reference_that_lives_only_in_a_comment() {
+    let i = input("No blocker in the body.", &[("someone", "Depends on #180")]);
+    assert_eq!(cited_among(Artifact::Issue, &i, &[180]), vec![180]);
+}
+
+#[test]
+fn cited_among_ignores_the_bot_s_own_comments() {
+    // The bot's own notification comment names the closed number; it must
+    // never count as a citation, or a re-run would find its own output.
+    let i = input("", &[(extract::DEFAULT_BOT_LOGIN, "Blocked by #180")]);
+    assert!(cited_among(Artifact::Issue, &i, &[180]).is_empty());
+}
+
+#[test]
+fn cited_among_matches_an_unchecked_same_repo_dependency_entry() {
+    let i = input("## Dependencies\n\n- [ ] #180: the parser\n", &[]);
+    assert_eq!(cited_among(Artifact::Issue, &i, &[180]), vec![180]);
+}
+
+#[test]
+fn cited_among_skips_a_checked_dependency_entry() {
+    let i = input("## Dependencies\n\n- [x] #180: the parser\n", &[]);
+    assert!(cited_among(Artifact::Issue, &i, &[180]).is_empty());
+}
+
+#[test]
+fn cited_among_does_not_match_a_cross_repo_entry_by_number_alone() {
+    let i = input("## Dependencies\n\n- [ ] owner/other#180: elsewhere\n", &[]);
+    assert!(
+        cited_among(Artifact::Issue, &i, &[180]).is_empty(),
+        "a cross-repo #180 is not this repo's #180"
+    );
+}
+
+#[test]
+fn cited_among_reads_no_dependencies_checklist_for_a_pr() {
+    // Mirrors gather()'s PR arm, which never reads a checklist.
+    let i = input("## Dependencies\n\n- [ ] #180: the parser\n", &[]);
+    assert!(cited_among(Artifact::Pr, &i, &[180]).is_empty());
+}
+
+#[test]
+fn cited_among_reports_every_closed_number_cited_once_each() {
+    let i = input("Blocked by #180\nDepends on #200\nRequires #180", &[]);
+    assert_eq!(cited_among(Artifact::Issue, &i, &[200, 180, 999]), vec![180, 200]);
+}
+
+#[test]
+fn cited_among_is_empty_on_an_empty_input() {
+    assert!(cited_among(Artifact::Issue, &input("", &[]), &[180]).is_empty());
+}

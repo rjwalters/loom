@@ -52,7 +52,7 @@ use loom_daemon::stale_blocked::{
 /// up on, which is small in every repo observed (single digits here, three in
 /// the `rulehunt` incident that filed #8927). The cap exists so a pathological
 /// repo cannot turn a pre-flight advisory into a multi-minute forge crawl.
-const DEFAULT_LIMIT: u32 = 100;
+pub(super) const DEFAULT_LIMIT: u32 = 100;
 
 #[derive(clap::Args)]
 pub(crate) struct StaleBlockedArgs {
@@ -88,11 +88,16 @@ pub(crate) struct StaleBlockedArgs {
 
 /// One row of the enumeration query. Shared by both populations — `gh pr list`
 /// and `gh issue list` return the same `number,title` shape.
+///
+/// `pub(super)` (rather than private): reused by `notify_cleared_blockers`
+/// (issue #9102), the close-triggered sibling of this fleet-wide advisory,
+/// which enumerates the same `loom:blocked` population via [`list_blocked`]
+/// rather than re-deriving it.
 #[derive(Debug, Clone, Deserialize)]
-struct IssueRow {
-    number: i64,
+pub(super) struct IssueRow {
+    pub(super) number: i64,
     #[serde(default)]
-    title: String,
+    pub(super) title: String,
 }
 
 /// One classified artifact, ready to render. `Clone` because a prose-only park is
@@ -229,7 +234,7 @@ impl Sections<'_> {
 /// query against `gh pr list`, which is the enumeration #8925 found missing. An
 /// empty result is a fact (`Query::Empty`), not a failure — that is the healthy
 /// repo.
-fn list_blocked(
+pub(super) fn list_blocked(
     kind: Artifact,
     root: &Path,
     repo: Option<&str>,
@@ -282,7 +287,7 @@ fn list_blocked(
 ///   asked.
 /// - The PR's own state supplies [`Evidence::self_block`], the superseding-block
 ///   gate the issue arm gets from `closing` instead.
-fn gather(
+pub(super) fn gather(
     kind: Artifact,
     number: i64,
     repo: Option<&str>,
@@ -294,10 +299,11 @@ fn gather(
     }
     .map_err(|e| e.to_string())?;
 
-    let numbers: Vec<i64> = extract::extract(&input, extract::DEFAULT_BOT_LOGIN)
-        .split_whitespace()
-        .filter_map(|t| t.parse().ok())
-        .collect();
+    let numbers: Vec<i64> =
+        extract::extract_with(&input, &loom_daemon::forge_identity::FleetLogins::for_root(root))
+            .split_whitespace()
+            .filter_map(|t| t.parse().ok())
+            .collect();
     let prose = if numbers.is_empty() {
         Vec::new()
     } else {

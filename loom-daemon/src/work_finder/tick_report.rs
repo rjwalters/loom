@@ -52,6 +52,12 @@ pub struct TickReport {
     /// shortage on a machine whose only problem is that it is already full, and
     /// send an operator to raise a knob that is not binding.
     pub deferred_saturation: usize,
+    /// Issues deferred to a future tick because the **build back-off**
+    /// (#9410, [`build_backoff`](super::build_backoff)) was engaged: review +
+    /// merge debt is high, so no new unstarred issue build is admitted. Its
+    /// own counter for the same reason as [`deferred_saturation`](Self::deferred_saturation):
+    /// no cap was reached, a WIP policy held.
+    pub deferred_build_backoff: usize,
     /// Issues skipped because they are quarantined for repeated insta-crashing
     /// (Issue #3939). Filtered out before the concurrency budget is allocated, so
     /// a quarantined candidate never consumes a shared dispatch slot.
@@ -188,6 +194,10 @@ pub struct TickReport {
     /// indistinguishable from a healthy idle one, which is the exact reporting
     /// gap #4903 was filed on.
     pub saturation_held: bool,
+    /// True when the build back-off (#9410) was engaged for this tick, even
+    /// when nothing was deferred (the [`saturation_held`](Self::saturation_held)
+    /// shape).
+    pub build_backoff_held: bool,
     /// Candidates deferred THIS TICK because they fell outside this host's
     /// preferred repo slice while the slice still had at least one eligible
     /// in-slice candidate (Issue #6243, [`tick_multi_with_sharding`](super::tick_multi_with_sharding)).

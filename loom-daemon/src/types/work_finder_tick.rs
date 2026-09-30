@@ -89,6 +89,11 @@ pub struct WorkFinderTickSummary {
     /// `#[serde(default)]` keeps pre-#4903 wire data / older clients compatible.
     #[serde(default)]
     pub deferred_saturation: usize,
+    /// Issues deferred because the build back-off (Issue #9410) held new
+    /// unstarred issue builds: review + merge debt was high.
+    /// `#[serde(default)]` keeps pre-#9410 wire data compatible.
+    #[serde(default)]
+    pub deferred_build_backoff: usize,
     /// Dispatch attempts that returned an error.
     pub errors: usize,
     /// Whether any workspace was gated by the main-health halt this tick.
@@ -99,6 +104,11 @@ pub struct WorkFinderTickSummary {
     /// "not held". `#[serde(default)]` keeps pre-#4903 wire data compatible.
     #[serde(default)]
     pub saturation_held: bool,
+    /// Whether the build back-off (Issue #9410) was engaged for this tick,
+    /// even with nothing deferred. `#[serde(default)]` keeps pre-#9410 wire
+    /// data compatible.
+    #[serde(default)]
+    pub build_backoff_held: bool,
     /// Cumulative cross-host dispatch collisions observed by this tick's
     /// dispatcher(s) (Issue #4085, Phase 0 of #4028) — dispatches whose
     /// pre-flip label read showed a peer host already claimed the issue.
@@ -151,6 +161,7 @@ impl WorkFinderTickSummary {
             (self.deferred_capacity, "deferred-capacity"),
             (self.deferred_ramp_cap, "deferred-ramp"),
             (self.deferred_saturation, "deferred-saturation"),
+            (self.deferred_build_backoff, "deferred-build-backoff"),
             (self.errors, "error"),
         ] {
             if n > 0 {
@@ -165,6 +176,9 @@ impl WorkFinderTickSummary {
         }
         if self.saturation_held {
             parts.push("SATURATION-HELD".to_string());
+        }
+        if self.build_backoff_held {
+            parts.push("BUILD-BACKOFF-HELD".to_string());
         }
         parts.join(", ")
     }

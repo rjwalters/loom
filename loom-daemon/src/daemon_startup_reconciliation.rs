@@ -35,17 +35,102 @@
 //! [`spawn_startup_passes`], exactly as before.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
-/// Test-only startup delay (milliseconds), injected immediately before the
-/// reconciliation passes run, so an integration test can observe the daemon
-/// answering IPC calls — and its pidfile/heartbeat already live — while a
-/// *slow* startup pass is still in flight, without needing a real
-/// multi-workspace `gh` fan-out to actually run long (#7974). Never read
-/// outside [`spawn_startup_passes`]; a production host has no reason to set
-/// it.
-pub const TEST_STARTUP_DELAY_MS_ENV: &str = "LOOM_TEST_STARTUP_RECONCILE_DELAY_MS";
+/// Test-only rendezvous directory for holding the startup reconciliation
+/// passes open, so an integration test can observe the daemon answering IPC
+/// calls — and its pidfile/heartbeat already live — while a *slow* startup
+/// pass is still in flight, without needing a real multi-workspace `gh`
+/// fan-out to actually run long (#7974).
+///
+/// This used to be a millisecond sleep
+/// (`LOOM_TEST_STARTUP_RECONCILE_DELAY_MS`), which forced its test to prove
+/// "ready while the pass runs" by comparing wall-clock elapsed time against a
+/// fraction of that sleep — a load-sensitive race that flaked on a busy CI
+/// runner (#9092). A rendezvous instead makes the ordering itself
+/// observable: the pass blocks until the test explicitly releases it, so
+/// anything the test observes beforehand provably happened while the pass was
+/// still running, at any speed.
+///
+/// Protocol (all paths relative to this directory, see the `TEST_GATE_*`
+/// constants):
+/// 1. The blocking startup-pass thread creates `entered` and then blocks.
+/// 2. The test does its readiness checks, then creates `release`.
+/// 3. The pass thread wakes, runs the real passes, and creates `completed`.
+///
+/// Never read outside [`spawn_startup_passes`]; a production host has no
+/// reason to set it.
+pub const TEST_STARTUP_GATE_DIR_ENV: &str = "LOOM_TEST_STARTUP_RECONCILE_GATE_DIR";
+
+/// Marker the blocking startup-pass thread creates the moment it starts,
+/// before it blocks on [`TEST_GATE_RELEASE_FILE`]: "the pass is in flight".
+pub const TEST_GATE_ENTERED_FILE: &str = "startup-pass.entered";
+
+/// Marker the *test* creates to release the blocked startup pass.
+pub const TEST_GATE_RELEASE_FILE: &str = "startup-pass.release";
+
+/// Marker created once the startup passes have actually finished — the test's
+/// proof that a readiness observation happened *before* completion, not just
+/// quickly.
+pub const TEST_GATE_COMPLETED_FILE: &str = "startup-pass.completed";
+
+/// Safety cap on the rendezvous: a test that dies before releasing the gate
+/// (or a stray `TEST_STARTUP_GATE_DIR_ENV` on a real host) must not wedge the
+/// startup passes forever.
+const TEST_GATE_MAX_BLOCK: Duration = Duration::from_secs(120);
+
+/// Poll interval while blocked on the rendezvous.
+const TEST_GATE_POLL: Duration = Duration::from_millis(10);
+
+/// Announce that the startup pass thread has begun, then block until the test
+/// releases it (or [`TEST_GATE_MAX_BLOCK`] elapses). Any filesystem failure
+/// is logged and treated as "no gate" — a test whose gate never engages sees
+/// its `entered` marker never appear and fails loudly on that instead of
+/// silently passing a vacuous assertion.
+fn block_on_test_gate(gate_dir: &Path) {
+    if let Err(e) = std::fs::create_dir_all(gate_dir) {
+        log::warn!(
+            "daemon_startup_reconciliation: cannot create test gate dir {} ({e}) — \
+             running the startup passes ungated ({TEST_STARTUP_GATE_DIR_ENV}, #9092)",
+            gate_dir.display()
+        );
+        return;
+    }
+    if let Err(e) =
+        std::fs::write(gate_dir.join(TEST_GATE_ENTERED_FILE), format!("{}\n", std::process::id()))
+    {
+        log::warn!(
+            "daemon_startup_reconciliation: cannot write test gate marker {TEST_GATE_ENTERED_FILE} \
+             in {} ({e}) — running the startup passes ungated (#9092)",
+            gate_dir.display()
+        );
+        return;
+    }
+    log::info!(
+        "daemon_startup_reconciliation: test gate active — startup passes are blocked in {} \
+         until {TEST_GATE_RELEASE_FILE} appears ({TEST_STARTUP_GATE_DIR_ENV}, #7974/#9092)",
+        gate_dir.display()
+    );
+    let release = gate_dir.join(TEST_GATE_RELEASE_FILE);
+    let start = Instant::now();
+    while !release.exists() {
+        if start.elapsed() >= TEST_GATE_MAX_BLOCK {
+            log::warn!(
+                "daemon_startup_reconciliation: test gate was never released within \
+                 {TEST_GATE_MAX_BLOCK:?} — running the startup passes anyway (#9092)"
+            );
+            return;
+        }
+        std::thread::sleep(TEST_GATE_POLL);
+    }
+    log::info!(
+        "daemon_startup_reconciliation: test gate released after {:?} — running the startup \
+         passes (#9092)",
+        start.elapsed()
+    );
+}
 
 /// Spawn the startup claim-reconciliation pass (`is_startup = true`) and the
 /// stranded-quarantine reconciliation pass on a blocking thread, returning a
@@ -62,19 +147,17 @@ pub fn spawn_startup_passes(fallback_root: PathBuf) -> watch::Receiver<bool> {
     tokio::spawn(async move {
         let quarantine_root = fallback_root.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(raw) = std::env::var(TEST_STARTUP_DELAY_MS_ENV) {
-                if let Ok(ms) = raw.parse::<u64>() {
-                    log::info!(
-                        "daemon_startup_reconciliation: test delay active — sleeping {ms}ms \
-                         before the startup passes run ({TEST_STARTUP_DELAY_MS_ENV}, #7974)"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(ms));
-                }
+            let gate_dir = std::env::var_os(TEST_STARTUP_GATE_DIR_ENV).map(PathBuf::from);
+            if let Some(dir) = gate_dir.as_deref() {
+                block_on_test_gate(dir);
             }
             crate::claim_reconciliation::run_reconciliation_pass(&fallback_root, true);
             run_startup_quarantine_pass(&quarantine_root);
             run_startup_profile_provisioning_pass(&quarantine_root);
             run_startup_trace_join_reconciliation_pass(&quarantine_root);
+            if let Some(dir) = gate_dir.as_deref() {
+                let _ = std::fs::write(dir.join(TEST_GATE_COMPLETED_FILE), b"done\n");
+            }
         })
         .await;
         // A `send` error just means every receiver — including the one this
@@ -248,6 +331,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    /// Liveness ceiling for the rendezvous-gate handshake below. Generous on
+    /// purpose: every wait returns the moment its marker appears, so a large
+    /// ceiling costs a passing run nothing, and nothing here compares elapsed
+    /// time against a *fraction* of anything (#9092).
+    const GATE_WAIT: Duration = Duration::from_secs(30);
+
     /// Issue #8672 AC 2, daemon half: the startup pass provisions **every**
     /// pooled profile, not just ones created after this shipped — and is a
     /// no-op on the next start.
@@ -317,7 +406,7 @@ mod tests {
     #[serial]
     fn the_startup_pass_closes_orphaned_trace_join_entries_in_every_registered_workspace() {
         use crate::observability::runtime_usage::join::{
-            context_for_session_at, JoinEntry, JOIN_DIR,
+            context_for_session_at, JoinEntry, JoinKey, JOIN_DIR,
         };
         use crate::telemetry::trace::TraceContext;
         use crate::workspace_registry::{WorkspaceRegistry, REGISTRY_PATH_ENV};
@@ -329,12 +418,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let context = TraceContext::root(true);
         let started_at = chrono::Utc::now() - chrono::Duration::minutes(30);
-        let orphan = JoinEntry {
-            issue: 9013,
-            context: context.clone(),
-            started_at,
-            ended_at: None,
-        };
+        let orphan = JoinEntry::new(JoinKey::Issue(9013), context.clone(), started_at);
         std::fs::write(
             dir.join(format!("{}.json", context.trace_id.as_str())),
             serde_json::to_vec(&orphan).unwrap(),
@@ -356,32 +440,37 @@ mod tests {
         let cwd = workspace.to_string_lossy().into_owned();
         let now = chrono::Utc::now();
         let far_after = Some(now + chrono::Duration::minutes(5));
-        assert_eq!(context_for_session_at(Some(&cwd), Some(9013), far_after, now), None);
+        assert_eq!(context_for_session_at(Some(&cwd), Some(9013), None, far_after, now), None);
         // But one starting inside its original window still joins — proving
         // the pass closed it (bounded retention) rather than deleting it.
         let inside = Some(started_at + chrono::Duration::minutes(1));
-        assert_eq!(context_for_session_at(Some(&cwd), Some(9013), inside, now), Some(context));
+        assert_eq!(
+            context_for_session_at(Some(&cwd), Some(9013), None, inside, now),
+            Some(context)
+        );
     }
 
-    /// The completion signal must not flip to `true` before the injected
-    /// delay elapses, and must flip promptly once it does — the exact
-    /// property the work finder's admission gate (`work_finder.rs`) relies
-    /// on. Reconciliation itself is left disabled
-    /// (`LOOM_STALE_CLAIM_RECONCILE=0` / `LOOM_QUARANTINE_RECONCILE=0`) so the
-    /// pass never shells out to a real `gh`, keeping this test hermetic.
-    /// `#[serial]` because the env vars it sets are process-global and shared
-    /// with `claim_reconciliation`'s own `#[serial]`-guarded tests in this
-    /// same test binary.
+    /// The completion signal must not flip to `true` before the startup
+    /// passes have actually finished, and must flip promptly once they have — the
+    /// exact property the work finder's admission gate (`work_finder.rs`)
+    /// relies on. The pass is held open by the test rendezvous
+    /// ([`TEST_STARTUP_GATE_DIR_ENV`]) rather than by a sleep, so "the pass
+    /// is still in flight" is an *ordering* fact this test establishes rather
+    /// than a wall-clock guess it races against (#9092). Reconciliation
+    /// itself is left disabled (`LOOM_STALE_CLAIM_RECONCILE=0` /
+    /// `LOOM_QUARANTINE_RECONCILE=0`) so the pass never shells out to a real
+    /// `gh`, keeping this test hermetic. `#[serial]` because the env vars it
+    /// sets are process-global and shared with `claim_reconciliation`'s own
+    /// `#[serial]`-guarded tests in this same test binary.
     #[tokio::test]
     #[serial]
-    async fn completion_signal_waits_for_the_injected_delay() {
-        let delay_ms: u64 = 200;
-        std::env::set_var(TEST_STARTUP_DELAY_MS_ENV, delay_ms.to_string());
+    async fn completion_signal_waits_for_the_startup_pass() {
+        let gate = tempfile::tempdir().expect("temp dir");
+        std::env::set_var(TEST_STARTUP_GATE_DIR_ENV, gate.path());
         std::env::set_var(crate::claim_reconciliation::RECONCILE_ENABLED_ENV, "0");
         std::env::set_var(crate::quarantine_reconciliation::RECONCILE_ENABLED_ENV, "0");
 
         let fallback_root = std::env::temp_dir();
-        let started = Instant::now();
         let mut rx = spawn_startup_passes(fallback_root);
 
         // Immediately after spawning, the pass cannot possibly have finished.
@@ -394,21 +483,39 @@ mod tests {
             observed_ready_task.store(true, Ordering::SeqCst);
         });
 
-        // While the delay is still in flight, the gate must not have opened.
-        tokio::time::sleep(Duration::from_millis(delay_ms / 4)).await;
+        // Wait for the pass to actually enter the gate. From here until we
+        // release it below, the pass provably cannot complete — so the
+        // signal-still-closed assertion that follows is not a timing race.
+        let entered = gate.path().join(TEST_GATE_ENTERED_FILE);
+        let start = Instant::now();
+        while !entered.exists() {
+            assert!(
+                start.elapsed() < GATE_WAIT,
+                "the startup pass never entered the test gate within {GATE_WAIT:?} — no \
+                 {TEST_GATE_ENTERED_FILE} in {}",
+                gate.path().display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
             !observed_ready.load(Ordering::SeqCst),
-            "completion signal opened before the injected delay elapsed"
+            "completion signal opened while the startup pass was still in flight"
         );
 
-        waiter.await.expect("waiter task panicked");
-        assert!(
-            started.elapsed() >= Duration::from_millis(delay_ms),
-            "completion signal opened before the full injected delay elapsed"
-        );
+        // Release the gate: only now may the signal flip.
+        std::fs::write(gate.path().join(TEST_GATE_RELEASE_FILE), b"go\n")
+            .expect("write gate release marker");
+        tokio::time::timeout(GATE_WAIT, waiter)
+            .await
+            .expect("completion signal never opened after the gate was released")
+            .expect("waiter task panicked");
         assert!(observed_ready.load(Ordering::SeqCst));
+        assert!(
+            gate.path().join(TEST_GATE_COMPLETED_FILE).exists(),
+            "the startup passes must have run to completion before the signal flipped"
+        );
 
-        std::env::remove_var(TEST_STARTUP_DELAY_MS_ENV);
+        std::env::remove_var(TEST_STARTUP_GATE_DIR_ENV);
         std::env::remove_var(crate::claim_reconciliation::RECONCILE_ENABLED_ENV);
         std::env::remove_var(crate::quarantine_reconciliation::RECONCILE_ENABLED_ENV);
     }

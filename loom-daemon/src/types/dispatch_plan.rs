@@ -45,6 +45,8 @@ pub enum PlanGate {
     Ramp,
     /// The saturation admission brake held new admissions.
     Saturation,
+    /// The build back-off (#9410) held new issue builds on review/merge debt.
+    BuildBackoff,
     /// Its own repo was at `maxConcurrentPerRepo`.
     RepoCap,
     /// Outside this host's preferred repo slice while the slice had work.

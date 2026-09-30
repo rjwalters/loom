@@ -203,4 +203,8 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
     fn resolved_launch(&self) -> Option<crate::role_tick_telemetry::ResolvedLaunch> {
         self.resolved_launch.clone()
     }
+
+    fn trace_context(&self) -> Option<crate::observability::lifecycle::RoleTrace> {
+        self.trace_context.clone()
+    }
 }

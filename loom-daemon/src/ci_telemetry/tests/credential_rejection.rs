@@ -80,7 +80,7 @@ fn a_rejected_credential_aborts_the_cycle_with_no_further_repo_request() {
 
     // Nothing is waited out: the next cycle (credential renewed) polls at once.
     run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
-    assert_eq!(kind_counts(dir.path()), (6, 24, 30, 30));
+    assert_eq!(kind_counts(dir.path()), (6, 24, 30, FIXTURE_SPANS));
 }
 
 #[test]
@@ -167,6 +167,6 @@ fn progress_committed_before_the_credential_died_is_counted_and_never_re_emitted
     let report = run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
     assert_eq!(report.summary.runs_emitted, 3, "beta's runs only");
     assert_eq!(report.summary.jobs_emitted, 24 - jobs);
-    assert_eq!(kind_counts(dir.path()), (6, 24, 30, 30));
+    assert_eq!(kind_counts(dir.path()), (6, 24, 30, FIXTURE_SPANS));
     assert_no_duplicates(dir.path());
 }

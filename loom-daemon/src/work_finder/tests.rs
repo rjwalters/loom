@@ -2517,6 +2517,7 @@ fn test_tick_multi_missing_halt_entry_defaults_not_halted() {
 
 // Cross-repo priority ordering (#3946) and the #9244 operator-priority /
 // red-main-fix lanes live in sibling files (this one is size-frozen).
+mod build_backoff;
 mod main_red_fix;
 mod operator_priority;
 mod ordering;

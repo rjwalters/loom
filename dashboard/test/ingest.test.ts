@@ -343,6 +343,37 @@ describe("POST /ingest — visibility fail-safe default", () => {
   });
 });
 
+describe("POST /ingest — path-shaped repo normalization (rjwalters/loom#9442)", () => {
+  it("stores a filesystem-path repo as its lowercased basename, never a path", async () => {
+    // Pre-#9462 daemons send the local checkout path verbatim; the ingest
+    // half must hold the line until every emitter is upgraded.
+    const envelope = sweepStartedEnvelope({ repo: "/Users/x/GitHub/MyRepo", sweep_id: "sweep-path-repo" });
+    const response = await callWorker(ingestRequest([envelope], "Bearer abc-ingest-key"));
+    expect(response.status).toBe(200);
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.repo).toBe("myrepo");
+    expect(String(rows[0]?.repo).startsWith("/")).toBe(false);
+  });
+
+  it("passes a well-formed slug through unchanged", async () => {
+    const response = await callWorker(ingestRequest([sweepStartedEnvelope({ sweep_id: "sweep-slug-repo" })], "Bearer abc-ingest-key"));
+    expect(response.status).toBe(200);
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows[0]?.repo).toBe("rjwalters/loom");
+  });
+
+  it("leaves an absent repo absent (host-level kinds stay repo-less)", async () => {
+    const response = await callWorker(ingestRequest([hostHealthEnvelope()], "Bearer abc-ingest-key"));
+    expect(response.status).toBe(200);
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows[0]?.repo).toBeNull();
+  });
+});
+
 describe("POST /ingest — idempotent terminal records (Issue #5084)", () => {
   it("re-ingesting the same sweep.completed record does not double-count it", async () => {
     const envelope = sweepCompletedEnvelope();

@@ -314,6 +314,7 @@ fn finish_estimate(
         p75_sec: p75,
         eta_p50_at: as_of + Duration::seconds(p50),
         samples_min,
+        stage_marks: simulation.stage_marks(as_of),
     });
     explanation.contributions = Some(simulation.contributions);
     explanation.enforce_cap();

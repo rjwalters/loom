@@ -46,14 +46,24 @@ fn complexity_registry(ws: &Path, script: &str) -> SweepRegistry {
     SweepRegistry::new(config)
 }
 
-/// A fake `gh` whose issue-body endpoint answers with `body`. Every other
-/// call (the PR timeline, `repo view`) is a silent success with empty output,
-/// matching the real `gh` for a sweep whose PR has no notable timeline.
+/// A fake `gh` whose issue endpoint answers with the `{body, state,
+/// closed_at, labels}` projection `complexity_signal` asks for — one call,
+/// both the #8542 complexity marker and the #9441 end-state signals. Every
+/// other call (the PR timeline, `repo view`) is a silent success with empty
+/// output, matching the real `gh` for a sweep whose PR has no notable
+/// timeline.
 fn gh_issue_body_ok(body: &str) -> String {
+    let payload = serde_json::json!({
+        "body": body,
+        "state": "open",
+        "closed_at": serde_json::Value::Null,
+        "labels": Vec::<String>::new(),
+    })
+    .to_string();
     format!(
         "#!/usr/bin/env bash\n\
          if [[ \"$1\" == \"api\" && \"$2\" == repos/*/issues/* && \"$2\" != */timeline ]]; then\n\
-         printf '%s' '{body}'\n\
+         printf '%s' '{payload}'\n\
          exit 0\n\
          fi\n\
          if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
@@ -61,7 +71,7 @@ fn gh_issue_body_ok(body: &str) -> String {
          exit 0\n\
          fi\n\
          exit 0\n",
-        body = body.replace('\'', "'\\''"),
+        payload = payload.replace('\'', "'\\''"),
     )
 }
 

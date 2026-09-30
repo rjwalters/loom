@@ -26,10 +26,10 @@
 //! Any other per-repo failure is recorded and the cycle moves on to the next
 //! repo; `--once` still exits non-zero naming it.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -40,11 +40,14 @@ use super::ledger::{Ledger, PendingUnit, UnitDraft, UnitKey, COMPACT_THRESHOLD_B
 use super::logs::{self, LogTarget};
 use super::owners::{discover, resolve_kind, KindCache, Owner, OwnerStatus};
 use super::records::{
-    envelope_identity, job_envelopes, run_envelopes, JobJson, JobsPage, RepoJson, RunJson, RunsPage,
+    envelope_identity, job_envelopes, parse_shard, run_envelopes, JobJson, JobsPage, RepoJson,
+    RunJson, RunsPage, ShardInfo, ShardKind,
 };
 use super::state::{self, CycleLock, CycleSummary, PollStatus};
 use super::story::{self, RepoIdentityFn, RepoStories, Stitch};
+use super::suites::{self, ArtifactsPage};
 use super::{journal_path, log_capture_gate, state_dir, LogCaptureGate, ResolvedCiTelemetry};
+use crate::telemetry::TelemetryEnvelope;
 
 /// Everything a cycle needs, resolved up front (a seam for tests: `now`,
 /// `host_id`, and the lookback are injectable).
@@ -161,6 +164,12 @@ impl CycleReport {
                 s.logs_truncated,
                 s.log_failures,
                 s.logs_deferred
+            ));
+        }
+        if s.suite_spans_emitted > 0 || s.suite_artifact_failures > 0 {
+            text.push_str(&format!(
+                "; suites: {} span(s) from {} shard record(s), {} artifact(s) failed",
+                s.suite_spans_emitted, s.suite_records_read, s.suite_artifact_failures
             ));
         }
         let stitched = s.story_runs_stitched
@@ -605,6 +614,168 @@ fn capture_logs(
     Ok(())
 }
 
+/// Where one artifact is unpacked. Under the poller's own state dir (not
+/// `/tmp`) so a host with a full or noexec `/tmp` fails the same way as the
+/// ledger would, and so the path is removed by the same cleanup that removes
+/// the state dir.
+fn artifact_dir(root: &Path, run_id: u64, artifact_id: u64) -> PathBuf {
+    state_dir(root)
+        .join("artifacts")
+        .join(format!("{run_id}-{artifact_id}"))
+}
+
+/// The `loom.ci.suite` spans for this run's sharded shell-suite legs, keyed by
+/// job id (#9089).
+///
+/// **Cost gate.** Returns immediately — zero requests — unless this run has at
+/// least one *not-yet-emitted* `shell-suite-shard` job. A repo that does not
+/// shard shell suites therefore pays nothing for this feature, not even the
+/// artifacts listing, and a re-listed run whose jobs are all already seen does
+/// not re-download anything.
+///
+/// **Failure policy.** This runs BEFORE the run's units are committed, so the
+/// spans ride in the job units themselves and stay exactly-once with
+/// everything else — no second key space and no separate retry pass. The
+/// tradeoff is deliberate and bounded in the other direction: a failure here
+/// degrades to *no suite spans for this run*, counted in
+/// `suite_artifact_failures` and logged, and is never retried. Holding a run's
+/// `ci.run`/`ci.job` records hostage to a side artifact would be the worse
+/// failure — the records are the primary signal, the suite spans are a
+/// refinement of one job in it.
+///
+/// Only a rate limit or a rejected credential escapes as `Err`, because those
+/// are properties of the host and abort the whole cycle wherever they happen.
+fn suite_spans_for_run(
+    ctx: &CycleContext<'_>,
+    api: &dyn GithubApi,
+    ledger: &Ledger,
+    repo: &RepoJson,
+    run: &RunJson,
+    jobs: &[JobJson],
+    report: &mut CycleReport,
+) -> Result<BTreeMap<u64, Vec<TelemetryEnvelope>>, ApiError> {
+    let shards: Vec<(u64, ShardInfo)> = jobs
+        .iter()
+        .map(|job| (job.id, parse_shard(&job.name)))
+        .collect();
+    let has_unemitted_shard_leg = jobs.iter().zip(&shards).any(|(job, (_, shard))| {
+        shard.kind == ShardKind::ShellSuiteShard
+            && !ledger.is_seen(&UnitKey::job(&repo.full_name, run.id, job.id, job.run_attempt))
+    });
+    if !has_unemitted_shard_leg {
+        return Ok(BTreeMap::new());
+    }
+
+    let artifacts = paginate(
+        api,
+        suites::artifacts_path(&repo.full_name, run.id),
+        &mut report.summary.requests,
+        |body| serde_json::from_str::<ArtifactsPage>(body).map(|p| p.artifacts),
+    )?;
+    let mut by_job: BTreeMap<u64, Vec<TelemetryEnvelope>> = BTreeMap::new();
+    for artifact in artifacts
+        .iter()
+        .filter(|a| suites::is_timings_artifact(a))
+        .take(suites::MAX_ARTIFACTS_PER_RUN)
+    {
+        let dest = artifact_dir(ctx.root, run.id, artifact.id);
+        let _ = std::fs::remove_dir_all(&dest);
+        if let Err(error) = std::fs::create_dir_all(&dest) {
+            log::warn!(
+                "ci_telemetry: could not stage suite-timings artifact {} of {} run {}: {error}",
+                artifact.name,
+                repo.full_name,
+                run.id
+            );
+            report.summary.suite_artifact_failures += 1;
+            continue;
+        }
+        report.summary.requests += 1;
+        let downloaded = api.download_artifact(&repo.full_name, run.id, &artifact.name, &dest);
+        let text = match downloaded {
+            Ok(()) => suites::read_artifact_text(&dest),
+            Err(error @ ApiError::RateLimited { .. }) => {
+                let _ = std::fs::remove_dir_all(&dest);
+                return Err(error);
+            }
+            Err(error) if is_credential_rejection(&error) => {
+                let _ = std::fs::remove_dir_all(&dest);
+                return Err(error);
+            }
+            Err(error) => {
+                log::warn!(
+                    "ci_telemetry: suite-timings artifact {} of {} run {} could not be downloaded: {error}",
+                    artifact.name,
+                    repo.full_name,
+                    run.id
+                );
+                None
+            }
+        };
+        let _ = std::fs::remove_dir_all(&dest);
+        let Some(text) = text else {
+            report.summary.suite_artifact_failures += 1;
+            continue;
+        };
+        match suite_envelopes_from_text(repo, run, jobs, &shards, &text, &ctx.host_id) {
+            Ok((job_id, envelopes)) => {
+                report.summary.suite_records_read += 1;
+                report.summary.suite_spans_emitted += envelopes.len();
+                by_job.entry(job_id).or_default().extend(envelopes);
+            }
+            Err(reason) => {
+                log::info!(
+                    "ci_telemetry: suite-timings artifact {} of {} run {} produced no spans: {reason}",
+                    artifact.name,
+                    repo.full_name,
+                    run.id
+                );
+                report.summary.suite_artifact_failures += 1;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(state_dir(ctx.root).join("artifacts"));
+    Ok(by_job)
+}
+
+/// Parse one artifact's text and build its job's suite spans. Split out so the
+/// whole parse → validate → match → emit path is testable without a download.
+fn suite_envelopes_from_text(
+    repo: &RepoJson,
+    run: &RunJson,
+    jobs: &[JobJson],
+    shards: &[(u64, ShardInfo)],
+    text: &str,
+    host_id: &str,
+) -> Result<(u64, Vec<TelemetryEnvelope>), suites::RejectReason> {
+    let timings = suites::parse(text, run.id)?;
+    let job_id = suites::match_job(&timings, shards)?;
+    let job = jobs
+        .iter()
+        .find(|job| job.id == job_id)
+        .expect("match_job only returns a job id taken from this run's own jobs");
+    let shard = parse_shard(&job.name);
+    // The same window `job_envelopes` gives the job span, so a suite span is
+    // always inside its parent even when the runner's clock disagrees.
+    let job_started = job.started_at.unwrap_or(run.created_at);
+    let job_ended = job.completed_at.unwrap_or(job_started).max(job_started);
+    let workflow = run.workflow();
+    let target = suites::SuiteSpanTarget {
+        repo: &repo.full_name,
+        visibility: repo.visibility(),
+        run_id: run.id,
+        attempt: job.run_attempt,
+        job_id: job.id,
+        job: &job.name,
+        workflow: &workflow,
+        shard,
+        job_context: super::records::job_context(&repo.full_name, run.id, job.run_attempt, job.id),
+        job_started,
+        job_ended,
+    };
+    Ok((job_id, suites::suite_envelopes(&target, &timings, host_id)))
+}
+
 /// Replay committed-but-unconfirmed units: append only the envelopes the
 /// journal does not already hold, then confirm. Returns the unit count.
 fn recover(ledger: &mut Ledger, journal: &Journal) -> io::Result<usize> {
@@ -808,6 +979,11 @@ fn poll_repo(
             Some(Stitch::Stitched(story)) => Some(story),
             _ => None,
         };
+        // #9089: suite spans are resolved BEFORE the commit so they ride in
+        // their job's own unit (see `suite_spans_for_run` on why, and on what
+        // a failure here costs). A rate limit or a dead credential still
+        // aborts the cycle; nothing else can stop the run from being emitted.
+        let mut suite_spans = suite_spans_for_run(ctx, api, ledger, repo, run, &jobs, report)?;
         // Job units first, the run unit LAST: a torn commit can then only
         // lose the run unit, leaving the run "unseen" so the next poll
         // re-lists its jobs and commits exactly the missing ones.
@@ -817,6 +993,13 @@ fn poll_repo(
                 let mut envelopes = job_envelopes(repo, run, job, &ctx.host_id);
                 if let Some(story) = story {
                     story::stitch_job(&mut envelopes, story, run, job);
+                }
+                // Appended after stitching so the story pass never sees (and
+                // never copies) a suite span into the story trace: a story
+                // trace is a per-issue summary, and one leg's ~118 suite
+                // spans would swamp it.
+                if let Some(spans) = suite_spans.remove(&job.id) {
+                    envelopes.extend(spans);
                 }
                 UnitDraft {
                     key: UnitKey::job(full, run.id, job.id, job.run_attempt),

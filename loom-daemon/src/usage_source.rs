@@ -289,6 +289,86 @@ pub fn sweep_tokens_by_model(
     }
 }
 
+/// Per-`(model, speed, service_tier)` token totals for one sweep, split across
+/// `slices` — the per-phase-attempt attribution `sweep.outcome`'s
+/// `phase_durations` carries (Issue #9443).
+///
+/// Returns one entry per slice, in the same order; `None` where nothing
+/// attributable fell in that slice (absent, never a fabricated zero). `window`
+/// is the whole sweep's span, as for [`sweep_tokens_by_model`].
+///
+/// Two arms, because the stores differ in what a window *means*:
+///
+/// - **Claude transcripts** — `window` there is a file-mtime prefilter, so a
+///   per-slice call would attribute a whole session file to one phase. The
+///   dedicated per-record reader
+///   ([`crate::transcript_tokens::sum_sweep_tokens_by_window`]) partitions by
+///   each record's own `timestamp` in one pass instead.
+/// - **Every native store** (OpenCode, Kimi, Codex, Pi) — those readers already
+///   filter per record/session timestamp, so one call per slice needs no second
+///   reader. Records those readers drop as unattributable are simply absent
+///   from every slice and land in the caller's `tokens_unattributed`, same as
+///   for Claude. Note those stores key on a **session**'s instant rather than
+///   each message's, so a session spanning a phase boundary is attributed whole
+///   to the phase it started in — coarser than the Claude arm, but still a
+///   partition, which is what the reconciliation invariant needs.
+///
+/// # Half-open slices
+///
+/// The native readers' own windows are **inclusive** on both ends, while the
+/// sampler produces *contiguous* slices — each phase ends exactly where the
+/// next begins. Passing them through unchanged would count a record landing on
+/// a shared boundary instant in **both** adjacent phases, so Σ phases could
+/// exceed the sweep total and `tokens_unattributed` (a saturating remainder)
+/// would silently read `0` on a broken partition. Every slice but the last is
+/// therefore shortened by one nanosecond, which is exactly half-open for any
+/// store whose timestamps are coarser than 1 ns — all of them are (Codex and
+/// OpenCode are second/millisecond). The final slice stays closed, so a record
+/// at the very last phase boundary is attributed rather than dropped into the
+/// remainder — the same rule [`crate::transcript_tokens::sum_sweep_tokens_by_window`]
+/// applies on the Claude arm.
+#[must_use]
+pub fn sweep_tokens_by_window(
+    runtime: Option<&str>,
+    workspace_root: &Path,
+    issue: u32,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    slices: &[(DateTime<Utc>, DateTime<Utc>)],
+) -> Vec<Option<Vec<ModelUsageTotals>>> {
+    if slices.is_empty() {
+        return Vec::new();
+    }
+    if UsageSource::for_runtime(runtime) == UsageSource::ClaudeTranscripts {
+        let Some(projects_dir) = crate::transcript_tokens::claude_projects_dir() else {
+            return vec![None; slices.len()];
+        };
+        return crate::transcript_tokens::sum_sweep_tokens_by_window(
+            &projects_dir,
+            workspace_root,
+            issue,
+            window,
+            slices,
+        );
+    }
+    let last = slices.len() - 1;
+    slices
+        .iter()
+        .enumerate()
+        .map(|(index, (start, end))| {
+            let end = if index == last {
+                *end
+            } else {
+                // `checked_sub` rather than `-`: a slice already at the minimum
+                // representable instant is degenerate, and clamping to it keeps
+                // the window non-inverted instead of panicking.
+                end.checked_sub_signed(chrono::Duration::nanoseconds(1))
+                    .unwrap_or(*end)
+            };
+            sweep_tokens_by_model(runtime, workspace_root, issue, Some((*start, end.max(*start))))
+        })
+        .collect()
+}
+
 /// Per-`(model, speed, service_tier)` token totals for one **role tick**, read
 /// from whichever store `runtime` selects.
 ///
@@ -655,6 +735,69 @@ mod tests {
         assert_eq!((totals[0].input, totals[0].output, totals[0].cache_read), (1_500, 150, 20));
         // No log for the issue at all: unknown, not zero.
         assert_eq!(sweep_tokens_by_model(Some("pi"), root, 1, window), None);
+    }
+
+    /// Issue #9443: a native store's window is INCLUSIVE on both ends, and the
+    /// sampler's phase slices are contiguous — so a record landing exactly on a
+    /// shared boundary must be attributed to ONE phase, not both. Double-counting
+    /// there would make Σ phases exceed the sweep total and leave
+    /// `tokens_unattributed` (a saturating remainder) reading a false `0`.
+    #[test]
+    fn contiguous_native_slices_never_double_count_a_record_on_a_shared_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let log = crate::launch_record::sweep_log_path(root, 9443);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(
+            &log,
+            [
+                r#"# LOOM_LAUNCH {"schema":1,"runtime":"pi","provider":"friendli"}"#.to_string(),
+                pi_message_end("m", 100, 10, "2026-09-29T00:00:30Z"),
+                // Exactly on the builder→judge boundary.
+                pi_message_end("m", 200, 20, "2026-09-29T00:01:00Z"),
+                // Exactly on the LAST slice's closing edge: attributed, not
+                // dropped into the remainder.
+                pi_message_end("m", 400, 40, "2026-09-29T00:02:00Z"),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let at = |s: &str| -> DateTime<Utc> { s.parse().unwrap() };
+        let slices = [
+            (at("2026-09-29T00:00:00Z"), at("2026-09-29T00:01:00Z")),
+            (at("2026-09-29T00:01:00Z"), at("2026-09-29T00:02:00Z")),
+        ];
+        let window = Some((at("2026-09-29T00:00:00Z"), at("2026-09-29T00:02:00Z")));
+        let per_phase = sweep_tokens_by_window(Some("pi"), root, 9443, window, &slices);
+        let input_of = |rows: &Option<Vec<ModelUsageTotals>>| -> i64 {
+            rows.as_ref()
+                .map_or(0, |rows| rows.iter().map(|r| r.input).sum())
+        };
+        assert_eq!(per_phase.len(), 2);
+        assert_eq!(input_of(&per_phase[0]), 100, "the boundary record is NOT in the first slice");
+        assert_eq!(
+            input_of(&per_phase[1]),
+            600,
+            "the boundary record and the closing-edge record both land in the second slice"
+        );
+        // The partition invariant against the same store's flat total.
+        let total: i64 = sweep_tokens_by_model(Some("pi"), root, 9443, window)
+            .unwrap()
+            .iter()
+            .map(|r| r.input)
+            .sum();
+        assert_eq!(
+            input_of(&per_phase[0]) + input_of(&per_phase[1]),
+            total,
+            "Sigma slices must equal the flat total exactly - no record counted twice or dropped"
+        );
+        // Degenerate inputs behave as on the Claude arm.
+        assert!(sweep_tokens_by_window(Some("pi"), root, 9443, window, &[]).is_empty());
+        assert_eq!(
+            sweep_tokens_by_window(Some("pi"), root, 4242, window, &slices),
+            vec![None, None],
+            "an unreadable store is unknown for every slice, never a fabricated zero"
+        );
     }
 
     #[test]

@@ -15,10 +15,10 @@
 2782 defaults/.claude/commands/loom/architect-reference.md
 4419 defaults/.claude/commands/loom/architect.md
 9844 defaults/.claude/commands/loom/auditor.md
-5701 defaults/.claude/commands/loom/builder-complexity.md
-12798 defaults/.claude/commands/loom/builder-pr.md
+5754 defaults/.claude/commands/loom/builder-complexity.md
+12789 defaults/.claude/commands/loom/builder-pr.md
 4043 defaults/.claude/commands/loom/builder-worktree.md
-19325 defaults/.claude/commands/loom/builder.md
+19352 defaults/.claude/commands/loom/builder.md
 4803 defaults/.claude/commands/loom/bump.md
 1184 defaults/.claude/commands/loom/cargo-target-isolation.md
 7185 defaults/.claude/commands/loom/champion-common.md
@@ -35,7 +35,7 @@
 3749 defaults/.claude/commands/loom/champion.md
 1100 defaults/.claude/commands/loom/comment-body-literal-path.md
 3803 defaults/.claude/commands/loom/concierge.md
-35434 defaults/.claude/commands/loom/curator.md
+35503 defaults/.claude/commands/loom/curator.md
 22057 defaults/.claude/commands/loom/doctor.md
 131 defaults/.claude/commands/loom/driver.md
 2998 defaults/.claude/commands/loom/epic.md

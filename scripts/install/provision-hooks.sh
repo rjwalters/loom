@@ -169,12 +169,21 @@ PROJECT_HOOKS_WIRED=0
 # so a delimited single array is unsafe). Order mirrors defaults/.claude/
 # settings.json, plus the Edit|Write worktree guard (design decision 4) that
 # fresh consumers never had wired before.
-_PHOOK_TYPES=(PreToolUse PreToolUse PreToolUse UserPromptSubmit UserPromptSubmit Stop)
-_PHOOK_MATCHERS=(Bash Bash "Edit|Write" "" "" "")
+#
+# `mcp__loom__.*` (#9108) is the MCP namespace matcher. It is a WILDCARD, not an
+# enumerated tool list, on purpose: mcp-loom's tool set is discovered at runtime,
+# so an enumerated matcher would silently stop covering a tool added later —
+# and a matcher that matches nothing does not error, it just never fires. Before
+# it, MCP tool calls were the one tool class outside every PreToolUse matcher,
+# while `get_agent_metrics` turned its raw arguments into a shell command line
+# (fixed server-side in #9107; this matcher is the second, independent layer).
+_PHOOK_TYPES=(PreToolUse PreToolUse PreToolUse PreToolUse UserPromptSubmit UserPromptSubmit Stop)
+_PHOOK_MATCHERS=(Bash Bash "Edit|Write" "mcp__loom__.*" "" "" "")
 _PHOOK_NAMES=(
     guard-destructive.sh
     guard-loom-workflow.sh
     guard-worktree-paths.sh
+    guard-mcp-tools.sh
     skill-router.sh
     methodology-inject.sh
     guard-background-subagents.sh

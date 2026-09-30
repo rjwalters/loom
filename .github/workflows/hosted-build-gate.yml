@@ -30,7 +30,7 @@ jobs:
       LOOM_BUILD_GATE_TIER: full
     steps:
       - name: Validate immutable candidate inputs
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.exportVariable('CARGO_TARGET_DIR', require('path').join(process.env.RUNNER_TEMP, 'loom-hosted-gate-target'));
@@ -58,7 +58,7 @@ jobs:
           git branch hosted-gate-base "$LOOM_GATE_SHA"
           bash .loom/scripts/worktree.sh "$LOOM_GATE_ISSUE" "hosted-gate-$GITHUB_RUN_ID" --base hosted-gate-base
       - name: Verify worktree and record gate predicates
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const fs = require('fs');
@@ -90,7 +90,7 @@ jobs:
         shell: bash
         run: cargo nextest run --package loom-daemon --features otlp --lib --bins --profile ci 2>&1 | tee "$RUNNER_TEMP/hosted-otlp-tests.log"
       - name: Run available lifecycle and native isolation integration tests
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const fs = require('fs');

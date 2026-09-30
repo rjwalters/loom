@@ -98,9 +98,11 @@ pub fn tick_summary(
         deferred_capacity: report.deferred_capacity,
         deferred_ramp_cap: report.deferred_ramp_cap,
         deferred_saturation: report.deferred_saturation,
+        deferred_build_backoff: report.deferred_build_backoff,
         errors: report.errors,
         halted: report.halted,
         saturation_held: report.saturation_held,
+        build_backoff_held: report.build_backoff_held,
         collisions: report.collisions,
     }
 }

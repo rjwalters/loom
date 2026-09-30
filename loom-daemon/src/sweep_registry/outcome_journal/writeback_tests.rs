@@ -112,7 +112,8 @@ fn fake_gh_script_with(
          exit {comments_rc}\n\
          fi\n\
          if [[ \"$1\" == \"api\" && \"$2\" == repos/*/issues/* ]]; then\n\
-         printf '%s' '{body}'\n\
+         if [[ \"$4\" == \".body\" ]]; then printf '%s' '{body}'; \
+         else printf '%s' '{projection}'; fi\n\
          exit 0\n\
          fi\n\
          exit 0\n",
@@ -120,6 +121,18 @@ fn fake_gh_script_with(
         gh_log = gh_log.display(),
         posted_marker = posted_marker.display(),
         body = body.replace('\'', "'\\''"),
+        // #9441: `complexity_signal` now asks for a `{body, state, closed_at,
+        // labels}` projection while `points_signal` still asks for a bare
+        // `.body`, so the fake discriminates on the `--jq` argument exactly
+        // as the real `gh` would.
+        projection = serde_json::json!({
+            "body": body,
+            "state": "open",
+            "closed_at": serde_json::Value::Null,
+            "labels": Vec::<String>::new(),
+        })
+        .to_string()
+        .replace('\'', "'\\''"),
     )
 }
 
