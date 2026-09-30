@@ -849,6 +849,63 @@ README's documented operator step. Its effect over a multi-day soak therefore
 remains unobserved on a live stack. After applying it, the README's
 `part_log` failed-merge query is the check that should return no rows.
 
+## Measured usage: the ClickStack parity gap, and how it was closed
+
+ClickStack's README has carried a **Loom measured usage** saved view since its
+trial landed. The SigNoz side had no counterpart at all: `fixture-queries.sql` 7
+asks the absence-vs-measured-zero question of the `loom.tokens.*` **gauges**
+(subscription utilization), and nothing asked it of the `loom.runtime.usage`
+**spans** (#8908, #9204, #9303) — the one signal family that carries tokens and
+dollars. The two products were therefore not being asked the same question about
+cost, which is a scope-item-4 parity gap, not a missing nicety.
+
+`usage-queries.sql` closes it: sections 0–6 covering arrival preflight, spend and
+tokens by model, the by-repo/role/runtime/model parity view, usage coverage
+(unknown vs measured zero), unpriced models, rate-card provenance, and cache
+composition. Four properties of the family had to be established before the SQL
+could be trusted, and each was read out of the emitting code rather than assumed:
+
+- **Every span attribute is exported as a string.** `otlp/traces.rs` renders the
+  whole attribute map with `kv_string`, with no numeric branch, so the token
+  counts and the USD estimate land in `attributes_string` — the opposite of the
+  CI *log* records, where `loom.ci.run_id` genuinely is an int. A reader moving
+  between `ci-queries.sql` and this file crosses that boundary.
+- **`loom.repo` is never on a usage span.** No caller of `model_usage_spans`
+  puts it in `common` (checked across `runtime_usage.rs`, `runtime_usage/record.rs`
+  and `role_tick_telemetry/usage.rs`), and the gateway's resource allowlist keeps
+  only `service.name` / `service.version` / `service.instance.id` / `host.id`.
+  Repo attribution is a join across the trace, or it is nothing.
+- **Scope is not additive.** A daemon-dispatched sweep emits both an `execution`
+  span and `attempt` spans over overlapping windows.
+- **An unpriced model carries no cost attributes at all**, by the deliberate
+  `Option`-returning lookup in `runtime_usage/cost.rs` — so `sum()` skips it and
+  a spend total is a lower bound unless the query says otherwise.
+
+**Executed, not asserted.** `loom-daemon/tests/signoz_usage_queries.rs` runs the
+committed file verbatim — whole file in one pass, then statement by statement —
+in the pinned ClickHouse 25.12.5 the telemetry store itself runs
+(`clickhouse local`, no server, no volume), over a fixture built so each trap
+fails loudly. Observed on the pinned engine:
+
+| Property | Observation |
+| --- | --- |
+| At-least-once delivery | the execution span delivered twice collapses to **1** in every section |
+| Scope resolution | the both-scopes sweep totals **165** tokens, not the 330 a naive sum reports |
+| Unpriced model | tokens **999**, dollars **NULL** (never `0.0`), `unpriced_spans` **1** |
+| Unknown vs measured zero | Judge attempt `usage_unknown` **1**; Doctor attempt `measured_zero_only` **1**; never merged |
+| Repo by trace join | `org/alpha` / `org/beta` resolved from the root span, `repos_in_trace` **1** |
+| Wrong container (negative control) | `attributes_number` subscript returns **0** for every row **without erroring** — the silent-empty failure mode, demonstrated rather than claimed |
+
+The static half (`signoz_trial_artifacts.rs`, 6 new tests) derives the permitted
+counter/cost/pricing vocabulary by calling `counter_attributes()` and
+`Pricing::attributes()`, so a rename in the emitting code fails ordinary CI
+instead of silently emptying a saved view.
+
+**Not done here.** No run against a live SigNoz over real canary data: the
+fixture is synthetic and the engine is `clickhouse local`, which establishes the
+SQL's behaviour against the pinned ClickHouse but not the trial deployment's
+ingest path. That needs the trial host, the same gap #8525 and #9279 name.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -873,6 +930,7 @@ remains unobserved on a live stack. After applying it, the README's
 | CI metrics retention ≥ 30 days (#8826) | **Passed in effective DDL** — every metric signal table at 30 days |
 | CI logs/traces at 7 days on the current trial | **Open** — API-owned tables still at the upstream 15 days; needs the org login ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | Six CI saved views in the trial org | **Open** — recreation steps written in the README, not yet executed in the UI ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
+| Measured usage parity with ClickStack's "Loom measured usage" view | **Passed against the pinned ClickHouse, open against the live trial.** `usage-queries.sql` (sections 0–6) plus four README saved-view rows close the parity gap; `signoz_usage_queries.rs` executes the committed file verbatim on ClickHouse 25.12.5 and observes scope resolution, at-least-once dedupe, NULL-not-zero dollars for an unpriced model, unknown-vs-measured-zero, the repo-by-trace join, and the wrong-container silent zero (see "Measured usage" above). No run over real canary data on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
 | UI view matrix for Loom's non-HTTP span kinds | **Answered for Service List/APM and Exceptions, via authenticated backend API probes rather than a browser** (see "UI view matrix" above) — Service List/APM populates (`loom-daemon`, correct call/error counts) because RED metrics come from unconditional root-span aggregation, not an HTTP convention; Exceptions stays empty because Loom never emits an OTel `exception` span event. Service Map returned empty but is confounded by the fixture being single-service and no service-graph connector being configured — not attributable to span kind from this evidence. No screenshot has been captured on any session |
 
 Synthetic fixture success establishes transport/schema/query behavior, not a
