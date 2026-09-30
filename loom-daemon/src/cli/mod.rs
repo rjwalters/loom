@@ -119,6 +119,7 @@ pub(crate) mod worktree_closed_pr_branch;
 pub(crate) mod worktree_existing;
 pub(crate) mod worktree_link;
 pub(crate) mod worktree_lock;
+pub(crate) mod worktree_open_pr;
 pub(crate) mod worktree_remove;
 pub(crate) mod worktree_reset;
 mod worktree_sparse;
