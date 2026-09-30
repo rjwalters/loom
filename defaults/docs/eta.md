@@ -8,10 +8,10 @@ offline, and every estimate is **scored** against what happened. Both go to
 SigNoz as `eta.estimate` / `eta.outcome` log records (field reference:
 [`telemetry-schema.md`](telemetry-schema.md)).
 
-Phase 1 of #9289, with backfill and a leak-free backtest (#9325) and
-estimates for not-yet-started issues (#9326). Later phases: a CLI (#9327),
-shadow mode and promotion (#9328), the loom-ui snapshot (#9329) and fuller
-docs (#9330).
+Phase 1 of #9289, with backfill and a leak-free backtest (#9325), estimates
+for not-yet-started issues (#9326) and a CLI (#9327, [below](#cli-loom-daemon-eta)).
+Later phases: shadow mode and promotion (#9328), the loom-ui snapshot (#9329)
+and fuller docs (#9330).
 
 ## The model
 
@@ -246,6 +246,58 @@ the accuracy queries keep only rows where both are true. An outcome carries both
 Estimate ids are derived (`derived_hex(["loom.eta.estimate", repo key, issue,
 kind, heuristic, as_of])`), never random, and both kinds sit inside the
 issue's D32 story trace.
+
+## CLI (`loom-daemon eta`)
+
+Four subcommands, all read-only (nothing here writes an estimate to the
+journal or telemetry — that is the tracker's job, described above). Every
+subcommand also accepts `--repo-root PATH` (default: the current directory).
+
+- **`loom-daemon eta backfill [--repo OWNER/NAME] [--limit N] [--dry-run]`** —
+  seeds `.loom/logs/eta-stage-samples.jsonl` from `pr-latency`'s own
+  forge-derived history (#9325).
+- **`loom-daemon eta backtest --heuristic ID [--compare ID] [--since RFC3339] [--json]`**
+  — leak-free replay of a heuristic against real `sweep.outcome` history: mean
+  pinball loss, p25–p75 coverage and bias, optionally paired against a second
+  heuristic on the identical replay set (#9325).
+- **`loom-daemon eta view OWNER/NAME#ISSUE [--explain] [--json]`** — the
+  current estimate(s) for one issue (#9327). State resolution, in order:
+  1. An **open linked PR**: its review labels
+     (`eta::labels::stage_from_pr_labels`) give the stage
+     (`review_wait`/`doctor`/`merge_wait`); only `land` is estimated, since an
+     open PR under review is the post-Builder world.
+  2. No open PR, but this **host's own** `/loom:sweep` checkpoint
+     (`.loom/sweep-checkpoint/issue-<N>.json`) names a phase: both `finish`
+     and `land` are estimated (a running sweep gets `land` from
+     `sweep.curator` on).
+  3. Neither: the issue's own labels decide the refusal —
+     [`loom:blocked`/`loom:operator*`] is `blocked`,
+     [`loom:triage`/`loom:curating`/`loom:curated`] is `human_gated`,
+     `loom:issue`-only is `no_dispatch_plan`, and anything else (including a
+     running sweep on a *different* host — the checkpoint is host-local,
+     #9343) is `unknown_stage`. **Never guessed.**
+
+  A ready (`loom:issue`) item is refused rather than given a `start` estimate
+  because the dispatch plan `ready_wait` reads (#9326) is the work finder's
+  last **in-process** tick, which a separate CLI process cannot see. Surfacing
+  `start` from the CLI needs a published plan and is not in this phase's scope.
+
+  Without `--explain`: one line per applicable kind, `p25`/`p50`/`p75`
+  (seconds) and `eta_p50_at`, or `no_estimate_reason` when refused. `--explain`
+  prints the full `eta-explanation/v1` `Explanation` JSON for every applicable
+  kind instead (an array when more than one kind applies). `--json` renders the
+  one-line summary as JSON instead of text (ignored with `--explain`, which is
+  already JSON). Exit non-zero only when the issue itself could not be read
+  (`gh issue view` did not answer) — a refusal is a normal, zero-exit answer.
+- **`loom-daemon eta list --repo OWNER/NAME [--limit N] [--json]`** — the
+  landing-next list: every open issue's `land` estimate, resolved the same way
+  `view` resolves one, sorted by `p50` ascending with no-estimate rows listed
+  last (stably by issue number) and their reason shown. One bounded `gh issue
+  list` plus, per issue, the same open-PR/checkpoint reads `view` makes — no
+  extra reads beyond that.
+
+`loom eta …` (the machine dispatcher, `scripts/loom`) is a thin passthrough to
+`loom-daemon eta …`.
 
 ## Configuration
 
