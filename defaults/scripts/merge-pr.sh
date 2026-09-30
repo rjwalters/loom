@@ -578,24 +578,20 @@ if [[ -n "$WORKTREE_PATH_OVERRIDE" ]]; then
   fi
   _WT_ABS="$(cd "$WORKTREE_PATH_OVERRIDE" 2>/dev/null && pwd -P)" || \
     error "--worktree-path could not be resolved: $WORKTREE_PATH_OVERRIDE"
-  # Verify the path is actually a worktree of this repo. Each porcelain stanza
-  # begins with a literal `worktree ` prefix (9 chars) followed by the
-  # unquoted, unescaped absolute path — which may contain spaces. Parse the
-  # path with substr($0, 10), NOT $2/whitespace-split (which truncates at the
-  # first space). Caveat: a path containing a literal newline would still break
-  # this line-oriented parse; `--porcelain -z` (NUL-delimited) would be needed
-  # for full robustness, but spaces are the realistic failure mode (#3717).
-  if ! git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
-       awk -v p="$_WT_ABS" '/^worktree / { if (substr($0, 10) == p) { found=1; exit } } END { exit !found }'; then
-    error "--worktree-path is not a registered worktree of this repository: $WORKTREE_PATH_OVERRIDE (resolved: $_WT_ABS)"
-  fi
-  WORKTREE_PATH_OVERRIDE="$_WT_ABS"
-  unset _WT_ABS
-
-  # Warn if combined with --no-cleanup-worktree (no-op wins).
-  if [[ "$CLEANUP_WORKTREE" == "false" ]]; then
-    warning "--worktree-path was supplied but --no-cleanup-worktree wins; no cleanup will occur"
-  fi
+  # Verify the path is actually a worktree of this repo (#8191 slice):
+  # `loom-daemon merge-pr worktree-contains` shares the porcelain parser
+  # worktree-primary/worktree-branch-for/worktree-find-by-branch already use
+  # (loom-daemon/src/merge_pr/worktrees.rs), which fixed this same family's
+  # #3717 space-in-path truncation. Exit 0 = registered, 1 = parsed and NOT
+  # registered, anything else = the check did not run at all (missing/older
+  # daemon) -- WARN and still merge, but DECLINE the override cleanup and keep
+  # the worktree: a guard that did not run must refuse the removal rather than
+  # wave it through (the #3710 rule; never lean on `git worktree remove` to
+  # refuse an unverified path). Skipped cleanup is always recoverable.
+  _WTC_RC=0; git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr worktree-contains --path "$_WT_ABS" 2>/dev/null || _WTC_RC=$?
+  if [[ $_WTC_RC -eq 1 ]]; then error "--worktree-path is not a registered worktree of this repository: $WORKTREE_PATH_OVERRIDE (resolved: $_WT_ABS)"; elif [[ $_WTC_RC -ne 0 ]]; then warning "--worktree-path's registered-worktree check (#8191 slice) did not run — 'merge-pr worktree-contains' exited $_WTC_RC (a loom-daemon predating this slice has no such verb). The merge still proceeds, but $_WT_ABS is left untouched and worktree cleanup is skipped: an unverified path is never removed. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"; elif [[ "$CLEANUP_WORKTREE" == "false" ]]; then warning "--worktree-path was supplied but --no-cleanup-worktree wins; no cleanup will occur"; fi
+  if [[ $_WTC_RC -eq 0 ]]; then WORKTREE_PATH_OVERRIDE="$_WT_ABS"; else WORKTREE_PATH_OVERRIDE=""; CLEANUP_WORKTREE=false; fi
+  unset _WTC_RC _WT_ABS
 fi
 
 # Fetch PR state — UNCACHED (#8550). $GH may be the `gh-cached` wrapper, whose
@@ -922,12 +918,13 @@ _check_loom_pr_label
 # build-stampede guard (#8252). The refusal named neither the version nor the
 # roll command. That is what these markers and the hint below fix.
 #
-# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, stacked-children, version-policy, partial-reset, closed-building, issue-close-gate, dirty-guard, worktree-preserve — the last two decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
+# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, stacked-children, version-policy, partial-reset, closed-building, issue-close-gate, dirty-guard, worktree-preserve, worktree-contains — the last three decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing, and worktree-contains declines --worktree-path's override cleanup and keeps that path when it is missing) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
 # requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
 # The `merge-pr >=` floor above covers the whole subcommand group, including
 # #8191's post-merge porcelain lookups (`merge-pr worktree-primary` /
-# `worktree-branch-for` / `worktree-find-by-branch`, see _mp_worktree), and it is
+# `worktree-branch-for` / `worktree-find-by-branch`, see _mp_worktree, plus the
+# --worktree-path parse-time `worktree-contains` check), and it is
 # deliberately NOT raised to their landing version. Raising it refuses the MERGE
 # on every host one release behind — the 2026-09-18 incident above — whereas a
 # daemon missing only those leaf verbs declines post-merge CLEANUP: the two
