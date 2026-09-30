@@ -784,7 +784,7 @@ _worktree_base() {
     [[ "$JSON_OUTPUT" != "true" ]] || _q="--quiet"
     if [[ -n "${_WT_DAEMON_BIN:-}" ]] && "$_WT_DAEMON_BIN" worktree-base --help >/dev/null 2>&1; then
         # shellcheck disable=SC2086  # $_q is a fixed literal flag or empty
-        _out="$("$_WT_DAEMON_BIN" worktree-base --default-branch "$DEFAULT_BRANCH" --base-branch "${BASE_BRANCH:-}" $_q)" || _rc=$?
+        _out="$("$_WT_DAEMON_BIN" worktree-base --default-branch="$DEFAULT_BRANCH" --base-branch="${BASE_BRANCH:-}" $_q)" || _rc=$?
         while IFS=$'\t' read -r _l _m; do
             case "$_l" in
                 INFO) print_info "$_m" ;;  SUCCESS) print_success "$_m" ;;

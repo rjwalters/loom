@@ -90,8 +90,10 @@ fn shell(repo: &Path, base: &str, json: bool) -> Output {
 
 fn port(repo: &Path, base: &str, json: bool) -> Output {
     let mut c = Command::new(bin());
-    c.arg("worktree-base")
-        .args(["--default-branch", "main", "--base-branch", base]);
+    c.arg("worktree-base").args([
+        "--default-branch=main".to_string(),
+        format!("--base-branch={base}"),
+    ]);
     if json {
         c.arg("--quiet");
     }
@@ -154,7 +156,14 @@ fn port_agrees_with_the_retired_shell_on_every_case() {
                 assert_eq!(shell_msgs(&s), port_msgs, "messages for {base:?} json={json}");
                 if json && s.status.code() != Some(0) {
                     let sj = String::from_utf8_lossy(&s.stdout);
-                    assert_eq!(sj.trim(), rec(&rs, "JSON").unwrap(), "json doc for {base:?}");
+                    // Compared as values: the shell spaced its hand-built document
+                    // (`"a": b`), serde emits it compact; consumers parse it.
+                    let parse = |t: &str| serde_json::from_str::<serde_json::Value>(t).unwrap();
+                    assert_eq!(
+                        parse(sj.trim()),
+                        parse(&rec(&rs, "JSON").unwrap()),
+                        "json doc for {base:?}"
+                    );
                 }
             }
             let _ = fs::remove_dir_all(a.parent().unwrap());
