@@ -27,7 +27,7 @@ describe("renderBuildInfo", () => {
 
   it("renders the same stamp for an authenticated viewer — commit is not identity", () => {
     const node = container();
-    renderBuildInfo(node, scopeWith({ authenticated: true, email: "operator@2amlogic.com", commit: "abc1234" }));
+    renderBuildInfo(node, scopeWith({ authenticated: true, email: "operator@example.com", commit: "abc1234" }));
 
     expect(node.textContent).toBe("build abc1234");
   });

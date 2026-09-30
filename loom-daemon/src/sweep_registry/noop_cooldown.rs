@@ -447,6 +447,21 @@ impl SweepRegistry {
         remaining.to_std().ok().filter(|d| !d.is_zero())
     }
 
+    /// Absolute no-op-cooldown expiry for `issue` at `now` (Issue #9311), or
+    /// `None` when it may be dispatched immediately. Mirrors
+    /// [`Self::noop_cooldown_remaining`] but returns the instant itself rather
+    /// than the duration until it — this host's own local window only, not
+    /// the fleet-unioned [`Self::noop_cooldown_issues`]: a peer-armed window's
+    /// expiry is not available here.
+    #[must_use]
+    pub fn noop_cooldown_until(&self, issue: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.noop_cooldown_config.enabled {
+            return None;
+        }
+        let state = self.noop_cooldown.get(&issue)?;
+        (state.until > now).then_some(state.until)
+    }
+
     /// Consecutive no-op releases recorded for `issue` (Issue #6670). `0` when
     /// no release is on record. Test/inspection helper, mirroring
     /// [`Self::dispatch_failure_count`].

@@ -11,7 +11,7 @@
 
 use super::*;
 use crate::ci_telemetry::records::{
-    job_envelopes, step_context, JobJson, RunJson, MAX_STEP_SPANS_PER_JOB,
+    job_envelopes, step_context, JobCreationBaseline, JobJson, RunJson, MAX_STEP_SPANS_PER_JOB,
 };
 use crate::telemetry::trace::{SpanName, SpanStatus};
 
@@ -48,7 +48,7 @@ fn job_with_steps(steps: serde_json::Value) -> JobJson {
 }
 
 fn step_spans(job: &JobJson) -> Vec<crate::telemetry::trace::SpanRecord> {
-    job_envelopes(&repo(), &run(), job, "host-1")
+    job_envelopes(&repo(), &run(), job, JobCreationBaseline::default(), "host-1")
         .into_iter()
         .filter_map(|env| match env.record {
             TelemetryRecord::Span(s) if s.name == SpanName::CiStep => Some(s),
@@ -109,7 +109,7 @@ fn a_step_span_carries_its_jobs_identity_and_shard_attributes() {
         "started_at": "2026-09-20T09:00:10Z",
         "completed_at": "2026-09-20T09:00:55Z"
     }]));
-    let envelopes = job_envelopes(&repo(), &run(), &job, "host-1");
+    let envelopes = job_envelopes(&repo(), &run(), &job, JobCreationBaseline::default(), "host-1");
     let job_span = envelopes
         .iter()
         .find_map(|env| match &env.record {
@@ -223,7 +223,10 @@ fn a_job_without_steps_emits_exactly_the_pre_9089_envelopes() {
     }))
     .unwrap();
     assert!(pre_9089.steps.is_empty());
-    assert_eq!(job_envelopes(&repo(), &run(), &pre_9089, "host-1").len(), 3);
+    assert_eq!(
+        job_envelopes(&repo(), &run(), &pre_9089, JobCreationBaseline::default(), "host-1").len(),
+        3
+    );
     assert!(step_spans(&pre_9089).is_empty());
     assert!(step_spans(&job_with_steps(serde_json::json!([]))).is_empty());
 }

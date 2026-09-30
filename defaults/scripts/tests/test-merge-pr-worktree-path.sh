@@ -37,7 +37,7 @@ FORGE_HELPERS="$SCRIPTS_DIR/lib/forge-helpers.sh"
 # tree in pure bash), so this does not gate them.
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
-loom_test_require_daemon_bin "$SCRIPTS_DIR" "merge-pr issue-close-gate"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "merge-pr issue-close-gate" "merge-pr worktree-preserve"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -136,10 +136,11 @@ assert_grep "forge_pr_close_targets" "$MERGE_PR" \
     "merge-pr.sh's cleanup gate consults forge_pr_close_targets (async-close-race adaptation)"
 assert_grep "forge_get_issue_state" "$MERGE_PR" \
     "merge-pr.sh's cleanup gate consults forge_get_issue_state for non-close-target issues"
-assert_grep "Preserving worktree at" "$MERGE_PR" \
-    "default-path preserved-worktree case logs a clear reason"
-assert_grep "Preserving discovered worktree at" "$MERGE_PR" \
-    "discovered-path preserved-worktree case logs a clear reason"
+retired \
+    "default-path preserved-worktree case logs a clear reason" \
+    "the operator-visible preserve message names why a worktree at the Loom-convention path was left in place" \
+    "#8191: the #4186/#6694 remove-vs-preserve decision, and the message text it builds, moved to loom-daemon/src/merge_pr/worktree_preserve.rs — merge-pr.sh's own text is now just \`_worktree_cleanup_decide default \"\$DEFAULT_WT_PATH\"\`, and the retired \"Preserving worktree at\" string is not a shell string anywhere in this file to grep for" \
+    "loom-daemon/tests/merge_pr_worktree_preserve_differential.rs, which drives the frozen retired block (tests/fixtures/merge-pr-worktree-preserve-retired.sh) against the real CLI on a shared corpus and asserts the preserve message is unchanged byte for byte, plus loom-daemon's merge_pr::worktree_preserve::tests::preserve_check_and_not_landed_preserves_with_two_lines"
 assert_grep "forge_get_issue_state" "$FORGE_HELPERS" \
     "forge-helpers.sh defines forge_get_issue_state"
 
@@ -148,10 +149,16 @@ assert_grep "JUDGE_PR_WT_PATH" "$MERGE_PR" \
     "merge-pr.sh declares JUDGE_PR_WT_PATH for the co-existing pr-<N> check"
 assert_grep 'JUDGE_PR_WT_PATH="\$WT_ROOT_DIR/pr-\$PR_NUMBER"' "$MERGE_PR" \
     "JUDGE_PR_WT_PATH is set to pr-\$PR_NUMBER only on the feature/issue-<N> branch"
-assert_grep "Found co-existing Judge/Doctor review worktree" "$MERGE_PR" \
-    "co-existing pr-<N> removal logs a clear reason (#6264)"
-assert_grep "Preserving Judge/Doctor review worktree at" "$MERGE_PR" \
-    "co-existing pr-<N> preserved-worktree case logs a clear reason (#6264)"
+retired \
+    "co-existing pr-<N> removal logs a clear reason (#6264)" \
+    "the operator-visible removal message for a co-existing Judge/Doctor review worktree names why (#6264)" \
+    "#8191: same consolidation as the default/discovered messages above — the text is now loom-daemon/src/merge_pr/worktree_preserve.rs's Kind::JudgePr branch, reached via \`_worktree_cleanup_decide judge-pr \"\$JUDGE_PR_WT_PATH\"\`" \
+    "loom-daemon/tests/merge_pr_worktree_preserve_differential.rs's Kind::JudgePr cases, plus merge_pr::worktree_preserve::tests::no_preserve_check_judge_pr_removes_with_a_note"
+retired \
+    "co-existing pr-<N> preserved-worktree case logs a clear reason (#6264)" \
+    "the operator-visible preserve message for a co-existing Judge/Doctor review worktree names why (#6264)" \
+    "#8191: same consolidation — the \"Preserving Judge/Doctor review worktree at\" text is loom-daemon/src/merge_pr/worktree_preserve.rs's Kind::JudgePr preserve branch, not a shell string" \
+    "loom-daemon/tests/merge_pr_worktree_preserve_differential.rs's Kind::JudgePr preserve cases, plus merge_pr::worktree_preserve::tests::judge_pr_kind_uses_its_own_noun_in_both_6694_messages"
 
 # --- Test 2d: never-closing-issue worktree/branch cleanup (#6694) source surface ---
 assert_grep 'source "\$SCRIPT_DIR/lib/branch-landed.sh"' "$MERGE_PR" \
@@ -165,10 +172,16 @@ assert_grep 'merge-pr delete-branch .*--expected-head-sha "\$expected_head_sha"'
     "_maybe_delete_local_branch hands the merged head SHA to the shared rule (loom-daemon merge-pr delete-branch, #8191)"
 assert_grep 'branch_has_landed "\$PR_BRANCH" "\$DEFAULT_BRANCH_NAME" "\$PR_HEAD_SHA"' "$MERGE_PR" \
     "the worktree-preserve decision reuses the shared primitive at every call site (#6694/#7812)"
-assert_grep "holds nothing unmerged; removing it \\(#6694\\)" "$MERGE_PR" \
-    "a fully-captured branch is cleaned up even when the issue-close gate says preserve (#6694)"
-assert_grep "designed never to close \\(#6694\\), that retry never fires: remove manually" "$MERGE_PR" \
-    "the reworded preserve message names a remedy that does not depend on the issue closing (#6694)"
+retired \
+    "a fully-captured branch is cleaned up even when the issue-close gate says preserve (#6694)" \
+    "when the #4186 issue gate says preserve but branch_has_landed says the branch's content is already on the default branch, cleanup proceeds anyway and says so" \
+    "#8191: the landed-branch override IS the decision that moved — it is now loom-daemon/src/merge_pr/worktree_preserve.rs's \`ctx.preserve_check && ctx.landed\` arm, and the \"holds nothing unmerged; removing it (#6694)\" text is a Rust format string, not a shell string this file can grep for" \
+    "loom-daemon/tests/merge_pr_worktree_preserve_differential.rs, whose corpus asserts (via saw_landed_override_remove) that the override fires for all three kinds with byte-identical text to the frozen pre-port shell, plus merge_pr::worktree_preserve::tests::preserve_check_and_landed_removes_with_one_line — and, behaviourally end to end, cases T/V/W in Test 5b below, which still drive the real merge-pr.sh and observe the worktree actually being removed"
+retired \
+    "the reworded preserve message names a remedy that does not depend on the issue closing (#6694)" \
+    "the preserve message tells an operator how to clean up by hand when the issue is a programme issue that will never close, so the automatic retry never fires" \
+    "#8191: same move — the second (info) line of the preserve branch is built in loom-daemon/src/merge_pr/worktree_preserve.rs and replayed through the shell's \`info\`, so \"designed never to close (#6694), that retry never fires: remove manually\" is not a shell string in this file" \
+    "loom-daemon/tests/merge_pr_worktree_preserve_differential.rs (the preserve cases compare both lines byte for byte against the frozen shell, so a dropped or reworded remedy line fails), plus merge_pr::worktree_preserve::tests::preserve_check_and_not_landed_preserves_with_two_lines"
 
 # --- Test 3: Precedence — --no-cleanup-worktree warns when combined ---
 echo ""

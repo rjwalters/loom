@@ -139,7 +139,9 @@ mod tests {
 
     use super::super::{build_logs_request, build_metrics_request};
     use super::DURATION_BOUNDS_MS;
-    use crate::ci_telemetry::records::{job_envelopes, run_envelopes, JobJson, RepoJson, RunJson};
+    use crate::ci_telemetry::records::{
+        job_envelopes, run_envelopes, JobCreationBaseline, JobJson, RepoJson, RunJson,
+    };
     use crate::observability::otlp::{signal_for, transport::Signal};
     use crate::telemetry::ci::{CI_LOG_ATTRIBUTE_KEYS, CI_METRIC_LABEL_KEYS};
     use crate::telemetry::TelemetryEnvelope;
@@ -164,7 +166,7 @@ mod tests {
             "labels": ["ubuntu-latest"], "run_attempt": 1
         }))
         .unwrap();
-        let mut out = job_envelopes(&repo, &run, &job, "host-a");
+        let mut out = job_envelopes(&repo, &run, &job, JobCreationBaseline::default(), "host-a");
         out.extend(run_envelopes(&repo, &run, "host-a"));
         out
     }

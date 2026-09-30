@@ -585,3 +585,34 @@ fn plan_order_without_shaping_is_the_sorted_order() {
     assert_eq!(report.in_slice, None);
     assert_eq!(report.max_admissions_per_tick, Some(usize::MAX));
 }
+
+/// End-to-end coverage for a held item's `held_until` (Issue #9311): an issue
+/// carrying a self-declared `<!-- loom:recheck-interval=1h -->` marker whose
+/// last forge activity is still inside that window is skipped as
+/// `RecheckInterval`, and the published plan reports exactly when the hold
+/// clears — `updated_at + 1h`, computed independently of wall-clock timing.
+#[test]
+fn a_recheck_interval_hold_reports_its_expiry_end_to_end() {
+    let updated_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+    let item = WorkItem::new(1, vec!["loom:issue".to_string()])
+        .with_body(Some("<!-- loom:recheck-interval=1h -->".to_string()))
+        .with_updated_at(Some(updated_at.to_rfc3339()));
+    let mut workspaces = [(OneShotSource(Some(vec![item])), CapDispatcher::default())];
+    let report = tick_capped(&mut workspaces, &[0], 10, None);
+    assert_eq!(report.skipped_recheck_interval, 1);
+    assert_eq!(rows_with(&report, Qd::RecheckInterval), 1);
+
+    let inputs = dispatch_plan::PlanInputs {
+        max_concurrent: 10,
+        ..Default::default()
+    };
+    let summary = tick_summary(&report, 10, chrono::Utc::now(), &[], Some(&inputs));
+    let row = summary.queue.iter().find(|r| r.issue == 1).unwrap();
+    assert_eq!(row.disposition, Qd::RecheckInterval);
+    let expected = updated_at + chrono::Duration::hours(1);
+    assert_eq!(row.plan.held_until, Some(expected));
+    // Never a substitute for `gate`/`position`: a `blocked` row still has
+    // neither.
+    assert_eq!(row.plan.gate, None);
+    assert_eq!(row.plan.position, None);
+}

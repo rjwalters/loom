@@ -40,7 +40,12 @@
 --     kept 7 days, the same horizon as the log sections.
 --   * Section 14 (#9089) reads BOTH `ci.run` and `ci.job` log records and
 --     joins them, so a run's critical path can separate its own queue segment
---     from the queue + running time of the leg that set its floor (7 days).
+--     from the dependency + queue + running time of the leg that set its floor
+--     (7 days).
+--   * Section 15 (#9089) reads `ci.job` log records only: per-job dependency
+--     wait (`loom.ci.dependency_wait_ms`, time blocked on `needs:`
+--     predecessors before the job was created) beside the runner-queue wait
+--     section 9 ranks, so the two are never read as one number (7 days).
 --
 -- Vocabulary is pinned to what the daemon exports and the gateway forwards:
 -- `loom-daemon/tests/signoz_trial_artifacts.rs` fails if any attribute key,
@@ -80,7 +85,7 @@
 --   repo          'owner/name' to scope to one repository, '' for the whole org
 --   bucket_hours  trend bucket width for sections 1 and 3 (24 = daily, 168 = weekly)
 --   window_hours  section 2 compares [now - w, now) against [now - 2w, now - w)
---   top           row cap for the ranked sections 2, 4, 6, 10 and 11
+--   top           row cap for the ranked sections 2, 4, 6, 10, 11 and 15
 
 -- 0. Preflight: which CI series and record kinds actually exist. An empty
 --    result here means capture is not flowing (poller disabled, exporter not
@@ -701,32 +706,42 @@ ORDER BY run_id DESC, leg_suite_s DESC
 LIMIT {top:UInt32};
 
 -- ---------------------------------------------------------------------------
--- 14. Critical path per run, queue included (#9089). Section 6 compares a run's
---     wall time to its longest job's RUNNING time, and can only say "queueing
---     or a serialized needs: chain dominates" without saying which. Now that
---     every job carries its own `loom.ci.queued_ms`, this ranks each run's jobs
---     by queue + run and names the one that actually set the floor:
+-- 14. Critical path per run, queue and dependency wait included (#9089).
+--     Section 6 compares a run's wall time to its longest job's RUNNING time,
+--     and can only say "queueing or a serialized needs: chain dominates"
+--     without saying which. Every job now carries all three of its segments --
+--     `loom.ci.dependency_wait_ms`, then `loom.ci.queued_ms`, then
+--     `loom.ci.duration_ms` -- so this ranks each run's jobs by their sum and
+--     names the one that actually set the floor:
 --       `critical_job` / `critical_total_s`  the job with the largest
---                                           queued+running sum, and that sum
---       `critical_queued_s`                 how much of it was waiting for a
+--                                           dependency+queue+running sum, and
+--                                           that sum
+--       `critical_dep_wait_s`               how much of it was blocked on
+--                                           `needs:` predecessors, BEFORE the
+--                                           job was created at all
+--       `critical_queued_s`                 how much was then waiting for a
 --                                           runner, never conflated with work
 --       `run_queued_s`                      the RUN's own queue segment (#9007),
 --                                           which is time before any job existed
 --       `unexplained_s`                     run wall time minus (run queue +
 --                                           critical job total)
 --
---     `unexplained_s` is the `needs:` chain, and is the number to act on: it is
---     large exactly when jobs ran in sequence rather than one job being slow, so
---     `build-daemon` fan-in is the suspect rather than any single leg. It is NOT
---     a dependency-wait measurement -- a real one needs the predecessor job's
---     `completed_at` and is still future work (see ci-observability.md §"Suite
---     spans"). Treat it as a residual, and expect it to be slightly negative on
---     a run whose jobs overlap the run's own reported window.
+--     Read `critical_dep_wait_s` first when `unexplained_s` used to be the only
+--     signal: a large value there is the `build-daemon` fan-in, measured rather
+--     than inferred, and the fix is to shorten the predecessor (or to stop
+--     depending on it), not to speed up the leg itself.
 --
---     A job GitHub reported no `created_at` for contributes 0 queue here rather
---     than dropping out of its run's critical path entirely -- unlike section 9,
---     which is a percentile over queue waits and must not be fed a fake zero.
---     Logs-backed (`ci.run` + `ci.job` records): 7 days.
+--     `unexplained_s` survives as the residual for what the three segments
+--     still do not cover -- a MULTI-level `needs:` chain whose critical job is
+--     not the last link, and clock/window mismatch between the run row and its
+--     jobs. Expect it near zero on a run with a single dependency level, and
+--     slightly negative on a run whose jobs overlap the run's own reported
+--     window. It remains a residual, not a measurement.
+--
+--     A job GitHub reported no `created_at` for contributes 0 for both segments
+--     here rather than dropping out of its run's critical path entirely --
+--     unlike sections 9 and 15, which are percentiles and must not be fed a
+--     fake zero. Logs-backed (`ci.run` + `ci.job` records): 7 days.
 WITH runs AS (
     SELECT attributes_string['loom.repo'] AS repo,
            attributes_string['loom.ci.workflow'] AS workflow,
@@ -747,6 +762,7 @@ jobs AS (
            argMax(job, total_ms) AS critical_job,
            max(total_ms) AS critical_total_ms,
            argMax(queued_ms, total_ms) AS critical_queued_ms,
+           argMax(dep_wait_ms, total_ms) AS critical_dep_wait_ms,
            sum(queued_ms) AS summed_queued_ms
     FROM (
         SELECT attributes_string['loom.repo'] AS repo,
@@ -755,8 +771,10 @@ jobs AS (
                toUInt64(attributes_number['loom.ci.job_id']) AS job_id,
                attributes_string['loom.ci.job'] AS job,
                attributes_number['loom.ci.queued_ms'] AS queued_ms,
+               attributes_number['loom.ci.dependency_wait_ms'] AS dep_wait_ms,
                attributes_number['loom.ci.duration_ms']
-                 + attributes_number['loom.ci.queued_ms'] AS total_ms
+                 + attributes_number['loom.ci.queued_ms']
+                 + attributes_number['loom.ci.dependency_wait_ms'] AS total_ms
         FROM signoz_logs.logs_v2
         WHERE body = 'ci.job'
           AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
@@ -771,6 +789,7 @@ SELECT r.repo AS repo, r.workflow AS workflow, r.run_id AS run_id,
        j.jobs,
        j.critical_job,
        round(j.critical_total_ms / 1000, 1) AS critical_total_s,
+       round(j.critical_dep_wait_ms / 1000, 1) AS critical_dep_wait_s,
        round(j.critical_queued_ms / 1000, 1) AS critical_queued_s,
        round(j.summed_queued_ms / 1000, 1) AS summed_job_queued_s,
        round((r.run_ms - r.run_queued_ms - j.critical_total_ms) / 1000, 1)
@@ -779,4 +798,65 @@ FROM runs AS r
 INNER JOIN jobs AS j
   ON j.repo = r.repo AND j.run_id = r.run_id AND j.run_attempt = r.run_attempt
 ORDER BY r.run_ms DESC, r.run_id
+LIMIT {top:UInt32};
+
+-- ---------------------------------------------------------------------------
+-- 15. Dependency wait vs. runner-queue wait, per job (#9089, issue problem 5).
+--     Section 9 answers "how long did this job wait for a RUNNER". This
+--     answers the question that was invisible beside it: how long it waited on
+--     its `needs:` predecessors BEFORE GitHub created it at all. The two are
+--     different problems with different fixes -- a large queue wait is the
+--     account's concurrent-job cap (add capacity, shrink the matrix), a large
+--     dependency wait is workflow shape (`build-daemon` fan-in: shorten the
+--     predecessor, or stop depending on it) -- and until now both landed in
+--     one undifferentiated "the run was slow but no job was".
+--
+--     `dependency_wait_ms` is `created_at` minus the run attempt's EARLIEST job
+--     creation, so an ungated job measures ~0 by construction: GitHub creates a
+--     `needs:`-gated job only once its predecessors finish. Sub-second values
+--     are job-creation lag, not a serialized edge -- hence `gated_jobs`, which
+--     counts only the legs above the 2000 ms gate below and is the column to
+--     read before trusting the percentiles beside it.
+--
+--     ALERT when `p90_dep_s` for a job family exceeds its own `p90_queue_s`:
+--     that family is gated more than it is capacity-starved, and no amount of
+--     runner capacity will move it.
+--
+--     A job GitHub reported no `created_at` for (a pre-#9089 recording)
+--     contributes no sample to either percentile, never a zero -- the same rule
+--     section 9 follows and the opposite of section 14's, which needs every job
+--     of a run present to rank them. Logs-backed (`ci.job` records): 7 days.
+WITH job_waits AS (
+    SELECT attributes_string['loom.repo'] AS repo,
+           attributes_string['loom.ci.workflow'] AS workflow,
+           attributes_string['loom.ci.job'] AS job,
+           toUInt64(attributes_number['loom.ci.job_id']) AS job_id,
+           attributes_number['loom.ci.dependency_wait_ms'] AS dep_wait_ms,
+           attributes_number['loom.ci.queued_ms'] AS queued_ms,
+           attributes_number['loom.ci.duration_ms'] AS duration_ms
+    FROM signoz_logs.logs_v2
+    WHERE body = 'ci.job'
+      AND mapContains(attributes_number, 'loom.ci.dependency_wait_ms')
+      AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    LIMIT 1 BY repo, job_id
+)
+SELECT repo, workflow, job,
+       count() AS jobs,
+       -- 2000 ms: above GitHub's own job-creation lag (observed sub-second),
+       -- below any real predecessor job. Legs under it are not `needs:`-gated.
+       countIf(dep_wait_ms > 2000) AS gated_jobs,
+       round(quantileExact(0.5)(dep_wait_ms) / 1000, 1) AS p50_dep_s,
+       round(quantileExact(0.9)(dep_wait_ms) / 1000, 1) AS p90_dep_s,
+       round(max(dep_wait_ms) / 1000, 1) AS max_dep_s,
+       round(quantileExact(0.9)(queued_ms) / 1000, 1) AS p90_queue_s,
+       round(quantileExact(0.9)(duration_ms) / 1000, 1) AS p90_run_s,
+       -- What share of this family's typical end-to-end time is spent before
+       -- it is even eligible for a runner.
+       round(100 * quantileExact(0.9)(dep_wait_ms)
+             / nullIf(quantileExact(0.9)(dep_wait_ms + queued_ms + duration_ms), 0), 1)
+                                                        AS p90_dep_pct
+FROM job_waits
+GROUP BY repo, workflow, job
+ORDER BY p90_dep_s DESC, repo, workflow, job
 LIMIT {top:UInt32};
