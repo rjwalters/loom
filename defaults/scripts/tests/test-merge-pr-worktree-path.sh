@@ -699,11 +699,15 @@ rm -rf "$GATE_FUNCS_FILE" "$GATE_STUB_DIR" 2>/dev/null || true
 echo ""
 echo "Test 8: --worktree-path with a daemon lacking 'worktree-contains' (exit 2)"
 
-extract_top_block() { # <first-line-regex> <file>: top-level `if` through its `fi`
-    awk -v re="$1" '$0 ~ re { grab=1 } grab { print } grab && /^fi$/ { exit }' "$2"
+extract_top_block() { # <exact-first-line> <file>: top-level `if` through its `fi`
+    FIRST="$1" awk '$0 == ENVIRON["FIRST"] { grab=1 } grab { print } grab && /^fi$/ { exit }' "$2"
 }
-WTC_VALIDATE="$(extract_top_block '^if \[\[ -n "\$WORKTREE_PATH_OVERRIDE" \]\]; then$' "$MERGE_PR")"
-WTC_CLEANUP="$(extract_top_block '^if \[\[ "\$CLEANUP_WORKTREE" == "true" \]\]; then$' "$MERGE_PR")"
+# The block headers and the expected call are literal merge-pr.sh source text.
+# shellcheck disable=SC2016
+WTC_VALIDATE="$(extract_top_block 'if [[ -n "$WORKTREE_PATH_OVERRIDE" ]]; then' "$MERGE_PR")"
+# shellcheck disable=SC2016
+WTC_CLEANUP="$(extract_top_block 'if [[ "$CLEANUP_WORKTREE" == "true" ]]; then' "$MERGE_PR")"
+# shellcheck disable=SC2016
 if [[ "$WTC_VALIDATE" != *"merge-pr worktree-contains"* || "$WTC_CLEANUP" != *'_remove_loom_worktree "$WORKTREE_PATH_OVERRIDE" "true"'* ]]; then
     fail "could not extract the --worktree-path validation / cleanup dispatch blocks from $MERGE_PR"
 else
@@ -721,10 +725,10 @@ FAKEDAEMON
 
     # run_wtc <daemon-bin>: validation block, a merge marker, then the cleanup
     # dispatch -- in a subshell so the eval'd `error` exit cannot kill the suite.
+    # shellcheck disable=SC2030,SC2034,SC2329  # subshell-local on purpose; the stubs and vars serve the eval'd blocks
     run_wtc() (
         set +e
         export LOOM_DAEMON_BIN="$1"; unset LOOM_PRESERVE_WORKTREE
-        # shellcheck disable=SC2034  # read by the eval'd blocks
         REPO_ROOT="$WTC_TMP/repo"; CLEANUP_WORKTREE=true; WORKTREE_PATH_OVERRIDE="$WTC_TMP/wt"
         info() { echo "INFO: $*"; }; warning() { echo "WARN: $*"; }
         error() { echo "ERROR: $*"; exit 1; }
@@ -753,6 +757,7 @@ FAKEDAEMON
 
     # Control: the real daemon verifies the same path, so cleanup IS dispatched
     # to it -- proves T8b's survival is the fail-safe, not a dead harness.
+    # shellcheck disable=SC2031  # the outer, unmodified value is the one wanted
     out="$(run_wtc "${LOOM_DAEMON_BIN:-loom-daemon}" 2>&1)"
     if [[ "$out" == *"REMOVED: $WTC_TMP/wt"* && ! -d "$WTC_TMP/wt" ]]; then
         pass "T8d: control -- a verified --worktree-path is still cleaned up"
