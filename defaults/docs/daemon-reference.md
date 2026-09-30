@@ -1396,7 +1396,6 @@ answering the on-command verbs below.
 | `fleet.autoApply` | `LOOM_FLEET_AUTO_APPLY` | `false` | Let a **timer** pass write (render) and apply (roster) on its own. Off by default — `roster --apply` deregisters workspaces |
 | *(startup cap)* | `LOOM_FLEET_SYNC_STARTUP_TIMEOUT_SECS` | `60` | Wall-clock cap on the startup pass, so a hanging forge cannot hold up boot. `0` waits indefinitely |
 | *(host identity)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` | This host's name in the store (`fleet/hosts/<host>/`, `fleet/state.yml`); `--host` overrides it per command |
-| `fleet.repo` | `LOOM_FLEET_REPO` | *(unset: off)* | The operator's fleet state store (`OWNER/REPO`) read by `loom-daemon fleet-config`; `fleet.ref` / `LOOM_FLEET_REF` picks the ref (default `main`). Unset changes nothing. See [Fleet store](#fleet-store--fleet-config-fleetrepo) |
 
 Every sub-verb takes `--workspace <PATH>` (default: the current repo): the
 daemon workspace whose config names the store and supplies the credentials,
@@ -2071,7 +2070,8 @@ fast bookkeeping workflow (line counter, labeler) runs and succeeds, every run i
 `completed`/`success` and the reducer above returns `green` for a commit the real
 build never judged — relaxing a local red on non-evidence. (Not reachable in this
 repo: `.github/workflows/ci.yml` has no `paths` filter, so a `CI` run exists for
-every `main` commit.)
+every `main` commit — though since #9619 an intermediate one in a merge burst
+may conclude `cancelled`, superseded before it started, which is no verdict.)
 
 The optional `ciWorkflow` knob closes that gap by naming the workflow that
 *counts*. It is **unset by default** — absent, behavior is byte-for-byte the
