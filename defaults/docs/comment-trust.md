@@ -60,7 +60,13 @@ The predicate lives once, in `loom-daemon/src/comment_trust.rs`:
   | Open-linked-PR guard | a fork PR's `Closes #N` | Not a linked PR (a same-repo branch always counts). |
 
   Readers that used `gh … --json comments` now read the REST listing, whose
-  author spelling can name an App.
+  author spelling can name an App. A REST comment listing that comes back
+  empty or unparseable is a failed read, never "no comments".
+
+  Body markers (`premise-check`, `loom:capability=`) are trusted by the
+  **issue author**, because the forge does not say who last edited a body. A
+  trusted insider's marker edited into an outsider-filed body is therefore
+  ignored. That fails closed: post the record as a comment instead.
 - **Structural tests** fail when a new Rust file handles a covered marker
   without being reviewed (`verdict_sha_readers_go_through_the_trust_filter`,
   `structure_tests::every_covered_marker_file_is_reviewed`), and when a

@@ -345,7 +345,11 @@ fn remedy_with(
     // #9548 (H13): only trusted authors' markers are attempt state. An
     // outsider's `stale-check-redate` marker for this head must not escalate
     // the PR to a hold, nor an outsider's hold marker suppress the notice.
-    let root = std::env::current_dir().unwrap_or_default();
+    // The repo root (config, App roster, allowlist), not whatever
+    // subdirectory or worktree the CLI happened to be run from (Judge #9593).
+    let root = crate::repo_root::find_repo_root_from_cwd()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
     let policy = crate::comment_trust::TrustPolicy::for_root(&root);
     let Some(comments) = policy.trusted_bodies(comments.as_bytes()) else {
         return RemedyOutcome::Failed(format!("PR #{pr}'s comment listing did not parse"));

@@ -107,7 +107,10 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "TrustPolicy::for_root(root).trusted_records(",
     ),
     ("dep_classify/forge.rs", "read_issue_in", "records::fetch_trusted_comments("),
-    ("premise_check/cli.rs", "forge_inputs", "fetch_trusted_comments("),
+    // The raw listing goes straight into `trusted_inputs`, whose own body
+    // must filter it (`policy.trusted_listing(`), checked below.
+    ("premise_check/cli.rs", "forge_inputs", "trusted_inputs("),
+    ("premise_check/cli.rs", "trusted_inputs", "policy.trusted_listing("),
     ("merge_pr/redate.rs", "remedy_with", "policy.trusted_bodies("),
     ("merge_pr/redate.rs", "post_comment", ""),
     ("role_runner/roster.rs", "read_roster_comments", "trusted_ndjson("),
@@ -250,9 +253,16 @@ fn every_comment_fetch_in_a_reviewed_file_is_a_filtered_call_site() {
                 Some(_) => {}
             }
         }
-        for (f, name, _) in FETCH_SITES.iter().filter(|(f, _, _)| *f == file) {
-            if !fns.iter().any(|(n, _)| n == name) {
-                problems.push(format!("{f}: reviewed function `{name}` no longer exists"));
+        for (f, name, need) in FETCH_SITES.iter().filter(|(f, _, _)| *f == file) {
+            match fns.iter().find(|(n, _)| n == name) {
+                None => problems.push(format!("{f}: reviewed function `{name}` no longer exists")),
+                // A listed reader keeps its trust call even when its fetch
+                // moved behind a helper (e.g. `forge_inputs`, whose listing
+                // comes from `records::fetch_comment_listing`).
+                Some((_, body)) if !need.is_empty() && !body.contains(need) => {
+                    problems.push(format!("{f}: `{name}` no longer calls `{need}`"));
+                }
+                Some(_) => {}
             }
         }
     }

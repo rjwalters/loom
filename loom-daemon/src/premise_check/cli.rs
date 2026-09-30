@@ -260,25 +260,49 @@ fn forge_inputs(opts: &Options, issue: i64, repo_root: &Path) -> Result<Inputs, 
     // or issue is an error, never "no record".
     let num = issue.to_string();
     let use_cache = !opts.no_cache;
-    let records =
-        crate::comment_trust::records::fetch_trusted_comments(&repo, &num, repo_root, use_cache);
+    let listing =
+        crate::comment_trust::records::fetch_comment_listing(&repo, &num, repo_root, use_cache);
     let object =
         crate::comment_trust::records::fetch_issue_object(&repo, &num, repo_root, use_cache);
-    let (Some(records), Some(object)) = (records, object) else {
-        err(&format!("could not read the comments or author of issue #{issue} in {repo}"));
-        return Err(exit::ERROR);
+    let policy = crate::comment_trust::TrustPolicy::for_root(repo_root);
+    let labels = v.labels.into_iter().map(|l| l.name).collect();
+    let inputs = match (listing, object) {
+        (Some(listing), Some(object)) => {
+            trusted_inputs(&policy, v.title, v.body, labels, &listing, &object)
+        }
+        _ => None,
     };
-    let body_trusted = crate::comment_trust::TrustPolicy::for_root(repo_root).trusts_json(&object);
-    Ok(Inputs {
-        title: v.title,
+    inputs.ok_or_else(|| {
+        err(&format!("could not read the comments or author of issue #{issue} in {repo}"));
+        exit::ERROR
+    })
+}
+
+/// The gate's [`Inputs`] with every record an untrusted author could have
+/// planted removed (#9548, H12): only trusted comments from the raw REST
+/// `listing` survive, and the body keeps its `loom:premise-check` markers only
+/// when the issue `object`'s author is trusted. `None` when the listing is
+/// empty or unparseable — "could not read", never "no record".
+fn trusted_inputs(
+    policy: &crate::comment_trust::TrustPolicy,
+    title: String,
+    body: String,
+    labels: Vec<String>,
+    listing: &[u8],
+    object: &serde_json::Value,
+) -> Option<Inputs> {
+    let records = policy.trusted_listing(listing)?;
+    let body_trusted = policy.trusts_json(object);
+    Some(Inputs {
+        title,
         // An untrusted body still scopes the check (its prose), but no
         // record can be read from it.
         body: if body_trusted {
-            v.body
+            body
         } else {
-            strip_markers(&v.body)
+            strip_markers(&body)
         },
-        labels: v.labels.into_iter().map(|l| l.name).collect(),
+        labels,
         comments: crate::comment_trust::records::bodies(&records),
     })
 }
@@ -329,3 +353,7 @@ fn nwo_from_remote_url(url: &str) -> Option<String> {
     parts.reverse();
     Some(parts.join("/"))
 }
+
+#[cfg(test)]
+#[path = "cli_trust_tests.rs"]
+mod trust_tests;

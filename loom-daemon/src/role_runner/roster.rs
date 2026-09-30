@@ -368,3 +368,7 @@ pub fn spawn_roster_heartbeat_task(fallback_root: PathBuf) -> Option<tokio::task
         }
     }
 }
+
+#[cfg(test)]
+#[path = "roster_trust_tests.rs"]
+mod trust_tests;

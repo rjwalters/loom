@@ -104,6 +104,17 @@ impl TrustPolicy {
         parse_records(bytes).map(|items| self.filter(items))
     }
 
+    /// The trusted comments of a whole REST listing (`gh api …/comments
+    /// --paginate` stdout, NOT a `--jq` projection), oldest first. Unlike
+    /// [`Self::trusted_records`], empty output is `None`: a listing with no
+    /// comments prints `[]`, so nothing at all means the read did not happen
+    /// (Judge #9593, mirroring [`super::parse_listing`]'s #9566 rule). A
+    /// caller treats `None` as "could not read", never as "no marker".
+    #[must_use]
+    pub fn trusted_listing(&self, listing: &[u8]) -> Option<Vec<Value>> {
+        super::parse_listing(listing).map(|items| self.filter(items))
+    }
+
     /// `stdout` (NDJSON, one record per line) keeping only trusted lines, for
     /// a caller whose own parser reads NDJSON. Unparseable lines are dropped:
     /// they carry no author, so no rule could trust them.
@@ -181,10 +192,22 @@ pub fn fetch_trusted_comments(
     repo_root: &Path,
     use_cache: bool,
 ) -> Option<Vec<Value>> {
+    let stdout = fetch_comment_listing(repo, number, repo_root, use_cache)?;
+    TrustPolicy::for_root(repo_root).trusted_listing(&stdout)
+}
+
+/// The raw REST comment listing (`gh api …/comments --paginate` stdout) for
+/// issue/PR `number` of `repo`. `None` when `gh` failed.
+#[must_use]
+pub fn fetch_comment_listing(
+    repo: &str,
+    number: &str,
+    repo_root: &Path,
+    use_cache: bool,
+) -> Option<Vec<u8>> {
     let path = format!("repos/{repo}/issues/{number}/comments");
     let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], repo_root, use_cache);
-    let stdout = &out.ok_output()?.stdout;
-    TrustPolicy::for_root(repo_root).trusted_records(stdout)
+    Some(out.ok_output()?.stdout.clone())
 }
 
 /// The REST issue object for `number` of `repo` (a PR is an issue here), the
