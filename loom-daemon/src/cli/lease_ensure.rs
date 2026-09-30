@@ -74,11 +74,20 @@ const DISPATCHED_MARKER: &str = "LOOM_SWEEP_LEASE_RENEW_DISPATCHED";
 
 /// Environment markers that mean "a durable agent session is hosting this
 /// call". Any one of them suffices.
+///
+/// `LOOM_AGENT_SESSION_PID` (#9453) is the runtime-neutral one. The pi
+/// runtime — the named example in `--force`'s own doc — exports none of the
+/// Claude-specific markers, so a non-Claude hand-claim lane's only way in
+/// was `--force` flag discipline. A marker any long-lived harness can export
+/// is self-describing and needs no flag; its value should be the harness
+/// process's own pid, which is also exactly what `--watch-pid` wants
+/// (`${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}` at the call site).
 const SESSION_MARKERS: &[&str] = &[
     "CLAUDE_PID",
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "LOOM_TERMINAL_ID",
+    "LOOM_AGENT_SESSION_PID",
 ];
 
 #[derive(clap::Subcommand)]
@@ -139,9 +148,12 @@ pub(crate) struct LeaseEnsureArgs {
     /// The default refusal is what keeps `worktree.sh`'s unconditional call
     /// site from posting lease comments out of a plain shell — a CI job, a
     /// shell test suite, or an operator poking at a worktree by hand. A runtime
-    /// that exports none of `CLAUDE_PID` / `CLAUDECODE` /
-    /// `CLAUDE_CODE_ENTRYPOINT` / `LOOM_TERMINAL_ID`, but genuinely is a
-    /// long-lived agent session, can opt back in with this.
+    /// that exports none of `SESSION_MARKERS` (`CLAUDE_PID`, `CLAUDECODE`,
+    /// `CLAUDE_CODE_ENTRYPOINT`, `LOOM_TERMINAL_ID`, or the runtime-neutral
+    /// `LOOM_AGENT_SESSION_PID`, #9453), but genuinely is a long-lived agent
+    /// session, can opt back in with this — though exporting
+    /// `LOOM_AGENT_SESSION_PID` is preferred: self-describing, no flag
+    /// discipline needed on every call.
     #[arg(long)]
     pub(crate) force: bool,
 
@@ -162,9 +174,16 @@ pub(crate) struct SessionEnv {
 
 impl SessionEnv {
     fn from_process() -> Self {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// The pure core of [`from_process`], with the environment lookup
+    /// injected so the marker decision is testable without mutating global
+    /// env state (which is process-wide and therefore race-prone under the
+    /// parallel test harness).
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let non_empty = |key: &str| {
-            std::env::var(key)
-                .ok()
+            lookup(key)
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
