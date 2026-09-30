@@ -18,6 +18,12 @@ version = "0.19.535"
 # baked in at compile time from the checkout the release was actually built
 # from.
 repository = "https://github.com/rjwalters/loom"
+# Both members inherit this (#9085). It records the licence this repo already
+# ships in LICENSE; without it both crates appear in `cargo deny check
+# licenses` as unlicensed packages, and the daily supply-chain job cannot
+# distinguish "this workspace declares nothing" from a real dependency
+# problem. Metadata correction, not a licensing decision.
+license = "MIT"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
