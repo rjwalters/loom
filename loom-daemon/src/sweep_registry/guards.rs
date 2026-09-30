@@ -1107,11 +1107,19 @@ impl SweepRegistry {
         }
     }
 
-    /// Best-effort probe for the first [`PARK_LABELS`] entry currently on
-    /// `issue`, used by the #4444 park-label dispatch guard (step 2.7). Returns
-    /// `Some(label)` when the issue carries a park label and `None` otherwise —
-    /// where `None` covers BOTH "not parked" and any failure (missing/failed/
-    /// timed-out `gh`, unresolvable repo, unparseable output).
+    /// Best-effort probe for the first [`PARK_LABELS`] entry on `issue`, used by
+    /// the #4444 park-label dispatch guard (step 2.7). Returns `Some(label)`
+    /// when the issue carries a park label and `None` otherwise — where `None`
+    /// covers BOTH "not parked" and any failure (missing/failed/timed-out `gh`,
+    /// unresolvable repo, unparseable output).
+    ///
+    /// Takes the label set as an argument rather than fetching it, so the ONE
+    /// [`current_labels_via_rest`](Self::current_labels_via_rest) read the
+    /// dispatch path makes serves both this guard and the #9432 story-point
+    /// resolution (`crate::story_points`) instead of each probing the forge
+    /// separately. A failed read never reaches here: the caller's `?` on the
+    /// fetch already fails open, which is the same "no opinion ⇒ dispatch
+    /// proceeds" outcome this function's own `None` produces.
     ///
     /// Callers MUST treat `None` as **fail-open**, matching
     /// [`issue_is_closed_or_pr`](Self::issue_is_closed_or_pr) and
@@ -1137,8 +1145,7 @@ impl SweepRegistry {
     /// otherwise be refused two steps later by this very probe.
     ///
     /// [`PARK_LABELS`]: crate::work_finder::PARK_LABELS
-    pub(crate) fn first_park_label(&self, issue: u32) -> Option<String> {
-        let labels = self.current_labels_via_rest(issue)?;
+    pub(crate) fn first_park_label_in(&self, issue: u32, labels: &[String]) -> Option<String> {
         // `PARK_LABELS` order, not forge order, so the refusal is deterministic
         // when an issue carries both. `loom:blocked` sorts first, so an item
         // carrying it never reaches the exemption below.
@@ -1146,7 +1153,7 @@ impl SweepRegistry {
             .iter()
             .find(|park| labels.iter().any(|l| l == *park))?;
         if **park == *crate::capability::OPERATOR_ONLY_LABEL
-            && self.mechanical_capability_exempt(issue, &labels)
+            && self.mechanical_capability_exempt(issue, labels)
         {
             return None;
         }
@@ -1241,7 +1248,7 @@ impl SweepRegistry {
     }
 
     /// Read `issue`'s current label names over the GitHub REST API. `None` on any
-    /// failure (see [`first_park_label`](Self::first_park_label) for the
+    /// failure (see [`first_park_label_in`](Self::first_park_label_in) for the
     /// fail-open contract); `Some(vec![])` for an issue with no labels, which is
     /// a *successful* read and must stay distinguishable from a failed one.
     pub(crate) fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
@@ -1997,101 +2004,19 @@ impl SweepRegistry {
     }
 
     /// Restore a crashed/orphaned claim's `loom:building` back to
-    /// `loom:issue` — UNLESS the issue currently carries `loom:blocked`
-    /// (Issue #4206), `loom:operator-only` (Issue #4887), OR the target
-    /// number actually resolves to a pull request (Issue #4653). A
-    /// deliberate operator park (applied by hand, possibly while the now-dead
-    /// sweep was still `loom:building`) must never be clobbered into an
-    /// illegal `loom:blocked`/`loom:operator-only` + `loom:issue` combo by
-    /// the crash-recovery path, and a PR number must never be handed a
-    /// `loom:issue` label meant for issues — that reproduces the stray-label
-    /// symptom from #4653's incident report, reached whenever the 2.5
-    /// dispatch guard's fail-open window lets a PR number through and the
-    /// sweep is later cancelled or crash-recovered.
+    /// `loom:issue` — UNLESS the issue carries a carve-out label
+    /// ([#4206] `loom:blocked`, [#4887] `loom:operator-only`, [#4653] a PR
+    /// number) or is CLOSED ([#9463]: the merge already disposed of it —
+    /// re-adding the queue label to a closed issue is exactly the
+    /// one-in-three landed-issues re-queue #9463 measured).
     ///
-    /// The `loom:operator-only` carve-out closes the #4887 race: a Builder
-    /// that aborts mid-build (e.g. missing OAuth scope, or an operator RETIRE
-    /// decision) correctly re-routes the issue `loom:building` ->
-    /// `loom:operator-only` itself, then exits; when the reaper later notices
-    /// the dead child and calls this restore, an unconditional restore would
-    /// re-add `loom:issue` on top of that reroute ~25-30s later with no
-    /// accompanying comment, leaving the issue in the illegal
-    /// `loom:operator-only` + `loom:issue` combo and re-queuing it for the
-    /// exact same blocker.
-    ///
-    /// All checks are best-effort and fail-open: an unverifiable read falls
-    /// back to the pre-#4206 unconditional restore (re-adding `loom:issue`),
-    /// since a stranded `loom:building` claim is the more common failure mode
-    /// this path exists to fix. Every carve-out only skips the `loom:issue`
-    /// re-add — the stale `loom:building` claim is always removed.
+    /// The implementation lives in
+    /// [`restore_to_ready`](super::restore_to_ready) (a sibling module —
+    /// this file is at the size ratchet), including each carve-out's own
+    /// fail-open contract. Every carve-out only skips the `loom:issue`
+    /// re-add; the stale `loom:building` claim is always removed.
     pub(crate) fn restore_label_to_ready(&self, issue: u32) -> Result<()> {
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let blocked = self.issue_has_blocked_label(issue);
-        // Only probe `loom:operator-only` when `loom:blocked` doesn't already
-        // decide the outcome — avoids a redundant `gh` call in the (more
-        // common) blocked path.
-        let operator_only = !blocked && self.issue_has_operator_only_label(issue);
-        let parked = blocked || operator_only;
-        // Only probe PR-ness when a park carve-out doesn't already decide the
-        // outcome — avoids a redundant `gh` call on the parked path.
-        let is_pr = !parked && self.issue_is_pull_request(issue).unwrap_or(false);
-        let mut cmd = Command::new(&gh);
-        cmd.arg("issue")
-            .arg("edit")
-            .arg(issue.to_string())
-            .arg("--remove-label")
-            .arg("loom:building");
-        if blocked {
-            log::info!(
-                "sweep_registry: restore_label_to_ready for #{issue} found `loom:blocked` \
-                 already present — preserving the operator's park by removing the stale \
-                 `loom:building` claim only, NOT re-adding `loom:issue` (#4206)"
-            );
-        } else if operator_only {
-            log::info!(
-                "sweep_registry: restore_label_to_ready for #{issue} found \
-                 `loom:operator-only` already present — preserving the authoritative \
-                 reroute by removing the stale `loom:building` claim only, NOT re-adding \
-                 `loom:issue` (#4887)"
-            );
-        } else if is_pr {
-            log::info!(
-                "sweep_registry: restore_label_to_ready for #{issue} resolved to a pull \
-                 request — removing the stale `loom:building` claim only, NOT re-adding \
-                 `loom:issue` (#4653)"
-            );
-        } else {
-            cmd.arg("--add-label").arg("loom:issue");
-        }
-        // Scope the restore to the registry's workspace so the crash-path label
-        // recovery resolves against the right repo in a multi-workspace daemon
-        // (#3937). LOOM_REPO still overrides when set.
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        // Best-effort during reap, but bounded so a wedged `gh` on the
-        // `ListSweeps` / `GetSweepStatus` read path cannot block the registry
-        // read indefinitely (Issue #3973).
-        let timeout = reap_gh_timeout();
-        if output_with_timeout(cmd, timeout)?.is_none() {
-            log::warn!(
-                "sweep_registry: restore_label_to_ready gh for #{issue} exceeded {}s \
-                 and was killed (#3973)",
-                timeout.as_secs()
-            );
-        }
-        Ok(())
+        self.restore_label_to_ready_with_state_check(issue)
     }
 }
 
@@ -2880,13 +2805,14 @@ exit 0
         let cwds: Vec<_> = recorded.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(
             cwds.len(),
-            5,
+            6,
             "expected the flip (1 call) + restore (Issue #4206's pre-check `loom:blocked` \
              probe, Issue #4887's follow-up `loom:operator-only` probe — the fake `gh` prints \
              nothing so both park probes read as absent, Issue #4653's `is_pr` probe's \
              `resolve_owner_repo` lookup — which bails before the second `gh api` call since \
-             the fake `gh` prints nothing for `repo view` — then the edit — 4 calls) to invoke \
-             gh five times total; got cwds: {cwds:?}"
+             the fake `gh` prints nothing for `repo view` — Issue #9463's closed-state probe \
+             (an unverifiable state fails open to the restore) — then the edit — 5 calls) to \
+             invoke gh six times total; got cwds: {cwds:?}"
         );
         for cwd in &cwds {
             let got = std::fs::canonicalize(cwd).unwrap();

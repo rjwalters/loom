@@ -134,8 +134,10 @@ would qualify. Settling is opt-in, and staying in scope is always allowed.
    **file**, against the file's size at the merge-base *whatever category it
    held there* — so "reclassify and grow in one move" is refused too, and so is
    a file that appears in `settled` without having existed at the base. There
-   is **no `Shell-Budget-Growth:` override**: that trailer buys a larger
-   permanent floor, and `settled` is not the floor. Without this the category
+   is **no override at all** — not `Shell-Budget-Growth:` (that trailer buys a
+   larger permanent floor, and `settled` is not the floor) and not
+   `Shell-Budget-Callout:` (that one is measured only in `contract` /
+   `hook-entry` files, so a settled script earns nothing from it). Without this the category
    is a laundering route — an author blocked by the portable ratchet
    reclassifies the script, then grows it freely. The category buys exemption
    from being **ported**, never permission to **expand**.
@@ -342,8 +344,12 @@ nothing. A test pins it.
 
 ### Declaring growth in the permanent floor (#8154)
 
-Portable growth (`contract`, `hook-entry`) is what the epic retires, and there
-is **no** override for it. Floor growth (`bootstrap`, `vendored`) is different:
+Portable growth (`contract`, `hook-entry`) is what the epic retires, and the
+only thing that offsets it is a declared **call-site** to a subcommand the
+logic moved into — see [Declaring a call-site for ported
+logic](#declaring-a-call-site-for-ported-logic-9297) below. The
+`Shell-Budget-Growth:` trailer described here does **not** apply to it. Floor
+growth (`bootstrap`, `vendored`) is different:
 the floor is what will still be shell when the epic is done, and some of it
 cannot be ported at all — `resync-installed.sh` is `vendored`, owned upstream,
 and blocked by #7758. Refusing a safety fix to such a script does not advance
@@ -437,6 +443,76 @@ That test earned its keep immediately: when the parser was tightened to reject
 indented trailers, it failed, because the failure message's own template was
 indented. The message would have told every author to write something the
 parser rejected.
+
+### Declaring a call-site for ported logic (#9297)
+
+The portable ratchet has exactly one carve-out, and it exists because the
+ratchet was punishing the move it was built to encourage.
+
+When logic leaves a `contract` script for a `loom-daemon` subcommand, the
+script's **name** survives — role prompts, CI workflows, hooks and consumer
+repos all consume it — so something has to stay behind to reach the new
+subcommand: find the binary, build the argument list, read the result. Those
+lines are shell, in a `contract` file, and the gate could not tell them apart
+from new shell logic. PR #8314 hit it exactly: porting its deny-spec logic into
+`loom-daemon role-tool-policy` cut its growth from +110 to +38, and the gate
+still refused, with no override to reach for. It had to be escalated to a
+human.
+
+Declare the call-site with a commit trailer:
+
+```
+Shell-Budget-Callout: role-tool-policy +38
+```
+
+**This is not a general override on portable growth.** Four mechanical checks
+keep it narrow, and none of them is a judgement call:
+
+1. **The named subcommand must already exist.** The check reads the running
+   binary's own clap registry — not a hand-kept list that could drift — so a
+   trailer naming a subcommand that has not shipped is refused. CI runs the
+   binary built from the PR's own tree, so a PR that adds the subcommand *and*
+   its call-site in one change is fine; a PR that declares a call-site for
+   something imaginary is not.
+2. **The declared lines must be measurable in the diff as a call-site.** Credit
+   is counted per diff **hunk** (`--unified=0`, so a hunk is exactly a
+   contiguous block of added lines): a hunk earns credit when one of its added
+   **code** lines names the subcommand *and* one of its added lines references
+   the `loom-daemon` binary. A comment mentioning the port is prose about a
+   call, not a call — it earns nothing. A hunk is credited at most once, so two
+   trailers cannot bill the same lines.
+3. **Capped per subcommand**, at the same 40 lines as the trivial-glue cap. A
+   call-site is smaller than the `stub` a fully ported file leaves behind;
+   anything larger is logic that belongs inside the subcommand. Two trailers
+   naming the same subcommand are summed before the cap is applied.
+4. **You are granted `min(declared, measured)`.** Over-declaring buys nothing,
+   so the number cannot be padded "just in case".
+
+Everything else is unchanged:
+
+- **Placement rules are the floor trailer's, shared in code** (one scanner,
+  parameterised by key): column 0, outside any ``` fence, never the subject,
+  anywhere in a commit body, accumulating across the commits in the range. A
+  near-miss is **reported as malformed**, never silently ignored.
+- **Undeclared portable growth is refused exactly as before.**
+- **The two trailers do not pay each other's bills.** `Shell-Budget-Callout:`
+  credit is measured only in `contract` / `hook-entry` files, and the amount it
+  can offset in the *total* leg is additionally capped by what portable shell
+  actually grew by — so a change that retires 38 portable lines, adds a 38-line
+  call-site and quietly grows a `bootstrap` script still needs a
+  `Shell-Budget-Growth:` declaration for the floor part. Conversely a
+  `Shell-Budget-Growth:` trailer still buys nothing portable.
+- **`check_against_rev`'s per-file protection is untouched.** Recategorising a
+  script to dodge the limit is refused the same way it was before.
+- **A granted callout is never silent.** `loom-daemon shell-budget --check`
+  prints what was declared, what was measured, and what was granted, for the
+  same reason declared floor growth is printed: the point is that growth stays
+  a conscious, reviewable act.
+
+**If the gate refuses your callout**, the message names which of the four
+checks failed rather than complaining about portable growth — a trailer that
+degraded to zero credit would otherwise send you to fix the wrong thing, which
+is the #8154 defect one level down.
 
 ## Related
 

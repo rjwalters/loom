@@ -600,6 +600,26 @@ pub fn fetch_issue_complexity(gh_bin: &Path, workspace_root: &Path, issue: u32) 
     None
 }
 
+/// Generate a stable sweep ID for the given kind. Format follows the
+/// spawn-loop log naming convention so operators can correlate. Lives beside
+/// the [`SweepKind`] it names; `sweep_registry::mod` re-exports it for its
+/// callers.
+#[must_use]
+pub fn generate_sweep_id(kind: &SweepKind) -> SweepId {
+    let ts = Utc::now().timestamp();
+    match kind {
+        SweepKind::Issue(n) => format!("sweep-issue-{n}-{ts}"),
+        SweepKind::PrSet(prs) => {
+            let joined = prs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("-");
+            format!("sweep-prs-{joined}-{ts}")
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

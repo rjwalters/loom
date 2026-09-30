@@ -179,6 +179,7 @@ pub fn check_topic_taxonomy(content: &str, required_topics: &[&str]) {
                 runtime: None,
                 runtime_source: None,
                 repo: None,
+                story_points: None,
             },
             "sweep.global.dispatch",
         ),
