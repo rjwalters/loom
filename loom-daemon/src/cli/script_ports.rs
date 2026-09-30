@@ -253,6 +253,18 @@ pub(crate) enum ScriptPortCommand {
     /// outage must never block worktree creation.
     WorktreeBranchReuse(super::worktree_branch_reuse::WorktreeBranchReuseArgs),
 
+    /// The forge round-trip behind `lib/worktree-forge-pr-check.sh`'s #7765
+    /// fresh-branch-shadow guard (#8195 slice 15) — the ORIGIN-branch sibling
+    /// of `WorktreeBranchReuse`'s LOCAL-branch arm. Answers whether an OPEN
+    /// PR already head-matches a branch `worktree.sh` is about to create
+    /// fresh, distinguishing "confirmed no PR" / "no forge remote at all,
+    /// nothing to shadow" from "the query itself failed" — the #7863
+    /// regression was exactly those last two collapsing into each other.
+    /// Prints a `TOKEN<TAB>text` record stream; always exits 0 (a query, not
+    /// a refusal — the shell library still builds the `jq -cn` refusal
+    /// documents itself).
+    WorktreeOpenPr(super::worktree_open_pr::WorktreeOpenPrArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -497,6 +509,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeCheck(args) => args.run(),
             ScriptPortCommand::WorktreeExisting(args) => args.run(),
             ScriptPortCommand::WorktreeBranchReuse(args) => args.run(),
+            ScriptPortCommand::WorktreeOpenPr(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
