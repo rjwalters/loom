@@ -2553,7 +2553,8 @@ re-estimates on every sweep transition, and the collector's 5-minute pass
 reads the review-label listings, resolves PRs that left review, and refreshes
 every live estimate. Every observed stage boundary is appended to
 `.loom/logs/eta-stage-samples.jsonl` as it is seen; pending estimates persist
-in `.loom/state/eta/pending.jsonl`.
+in `.loom/state/eta/pending.jsonl` (per-host, never git-tracked — the
+managed gitignore block ignores `.loom/state/eta/`).
 
 | key | env | default |
 |---|---|---|

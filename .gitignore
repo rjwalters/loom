@@ -74,6 +74,7 @@ Thumbs.db
 .loom/sweep-run/
 .loom/state/ci-telemetry/
 .loom/state/fleet-captain/
+.loom/state/eta/
 .loom/concierge/
 .loom/stats/
 .loom/diagnostics/
