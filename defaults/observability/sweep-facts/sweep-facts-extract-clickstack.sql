@@ -32,6 +32,18 @@
 -- STATUS: contract-checked in CI; not yet executed live against a
 -- sweep-facts window (the cycle-time extraction is the live-verified
 -- precedent for these conventions).
+--
+-- OTLP-attribute coverage (#9586): every `loom.*` key this view reads
+-- either survives the gateway's log keep_keys allowlist or is pinned
+-- OTLP-absent in `loom-daemon/tests/story_points_gateway_survival.rs` —
+-- the daemon exports `loom.attempt_index`, `loom.previous_sweep_id`,
+-- `loom.trigger`, `loom.rework_events`, `loom.pr_numbers`,
+-- `loom.hw_lines_{added,deleted}`, `loom.hw_files`, `loom.generated_lines`
+-- and `loom.test_lines` in the D1/JSONL payload (and, for the three
+-- lineage keys, span metadata) but NOT as sweep.outcome log attributes,
+-- so those columns are NULL on this backend BY DESIGN until the OTLP
+-- mapping exports them. D1 fills them from the payload; admitting the
+-- keys in the gateway allowlist would forward nothing.
 
 CREATE DATABASE IF NOT EXISTS loom_analytics;
 

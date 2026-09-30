@@ -35,6 +35,18 @@
 -- so the fact shape carries the same two counts the D1 rollup computes with
 -- `json_each`; and `suspect` is the same derived 0/1 (#9454) the D1 rollup
 -- derives from `tokens_status`.
+--
+-- OTLP-attribute coverage (#9586): every `loom.*` key this view reads
+-- either survives the gateway's log keep_keys allowlist or is pinned
+-- OTLP-absent in `loom-daemon/tests/story_points_gateway_survival.rs` —
+-- the daemon exports `loom.attempt_index`, `loom.previous_sweep_id`,
+-- `loom.trigger`, `loom.rework_events`, `loom.pr_numbers`,
+-- `loom.hw_lines_{added,deleted}`, `loom.hw_files`, `loom.generated_lines`
+-- and `loom.test_lines` in the D1/JSONL payload (and, for the three
+-- lineage keys, span metadata) but NOT as sweep.outcome log attributes,
+-- so those columns are NULL on this backend BY DESIGN until the OTLP
+-- mapping exports them. D1 fills them from the payload; admitting the
+-- keys in the gateway allowlist would forward nothing.
 
 CREATE DATABASE IF NOT EXISTS loom_analytics;
 
