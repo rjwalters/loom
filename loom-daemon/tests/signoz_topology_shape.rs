@@ -15,19 +15,19 @@
 //!
 //! That confound is resolvable without the trial host, because it is a property
 //! of the emitting code rather than of the deployment. A topology edge needs one
-//! of exactly two things:
+//! of exactly three things:
 //!
 //!   1. a parent/child span pair carrying two **different** `service.name`
-//!      values (SigNoz's dependency graph), or
-//!   2. a CLIENT/SERVER (or PRODUCER/CONSUMER) span-kind pair, or a single span
-//!      carrying a peer/virtual-node attribute such as `peer.service` —
-//!      how the OTel `servicegraph` connector synthesizes an edge when the
-//!      remote side never reports.
+//!      values (SigNoz's dependency graph),
+//!   2. a CLIENT/SERVER (or PRODUCER/CONSUMER) span-kind pair, or
+//!   3. a single span carrying a peer/virtual-node attribute such as
+//!      `peer.service` — how the OTel `servicegraph` connector synthesizes an
+//!      edge when the remote side never reports.
 //!
-//! The tests below establish that Loom's exporter satisfies neither, for every
-//! record family the shared fixture generates, and that the neutral gateway
-//! would strip the attributes of (2) even if a later change started emitting
-//! them. So an empty Service Map is a permanent consequence of Loom's span
+//! The tests below establish that Loom's exporter produces none of the three,
+//! for every record family the shared fixture generates, and that the neutral
+//! gateway would strip the attributes of (3) even if a later change started
+//! emitting them. So an empty Service Map is a permanent consequence of Loom's span
 //! shape: configuring a topology connector on the trial, or pointing a
 //! multi-service fixture at it, cannot change the answer *for Loom's data*.
 //!
@@ -114,10 +114,25 @@ impl Sink {
                 while !stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            if let Some(request) = read_request(&mut stream) {
-                                captured.lock().unwrap().push(request);
-                            }
-                            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                            // macOS/BSD `accept()` hands back a socket that
+                            // inherits the listener's O_NONBLOCK (Linux does
+                            // not). A non-blocking read that races the client
+                            // returns WouldBlock mid-request, which silently
+                            // dropped the capture while the sink still answered
+                            // 200 — so the stream must block, with the 5 s read
+                            // timeout set in `read_request` as the bound.
+                            stream.set_nonblocking(false).unwrap();
+                            // A request the sink failed to read is answered 500,
+                            // never 200: a dropped capture must surface as an
+                            // export failure, not as a quietly smaller payload
+                            // set that the assertions below then pass over.
+                            let response = match read_request(&mut stream) {
+                                Some(request) => {
+                                    captured.lock().unwrap().push(request);
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                                }
+                                None => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            };
                             let _ = stream.write_all(response.as_bytes());
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -228,6 +243,23 @@ fn exported_spans(sink: &Sink) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Every exported span, after asserting that there are **exactly** as many as
+/// the generator's own manifest declares. Every test that reads spans goes
+/// through this, so none can pass by quietly asserting over a subset — a sink
+/// that dropped a request would otherwise shrink the evidence without failing
+/// (the macOS non-blocking-accept flake that reached review on #9742).
+fn exported_spans_exact(sink: &Sink, manifest: &serde_json::Value) -> Vec<serde_json::Value> {
+    let spans = exported_spans(sink);
+    let expected = manifest["spans"].as_array().expect("manifest spans").len();
+    assert!(expected > 0, "the fixture must declare spans to assert on");
+    assert_eq!(
+        spans.len(),
+        expected,
+        "exported span count must equal the manifest's own declared span count"
+    );
+    spans
+}
+
 fn attribute_keys(attributes: &serde_json::Value) -> BTreeSet<String> {
     attributes
         .as_array()
@@ -244,7 +276,7 @@ fn attribute_keys(attributes: &serde_json::Value) -> BTreeSet<String> {
 // 1. Span kind: the client/server precondition for a synthesized edge.
 // ---------------------------------------------------------------------------
 
-/// Precondition (2) for a topology edge, on the span-kind side. `kind` is absent
+/// Precondition (2) for a topology edge: the span-kind pair. `kind` is absent
 /// from the JSON when it is `SPAN_KIND_UNSPECIFIED` (proto3 omits defaults), so
 /// a missing field is read as `0` rather than skipped — otherwise an exporter
 /// regression that stopped setting the field at all would pass this test by
@@ -252,14 +284,7 @@ fn attribute_keys(attributes: &serde_json::Value) -> BTreeSet<String> {
 #[tokio::test]
 async fn every_exported_span_is_internal_kind_with_no_client_or_server_pair() {
     let (sink, manifest) = export_shared_fixture().await;
-    let spans = exported_spans(&sink);
-    let expected = manifest["spans"].as_array().expect("manifest spans").len();
-    assert_eq!(
-        spans.len(),
-        expected,
-        "exported span count must equal the manifest's own declared span count"
-    );
-    assert!(expected > 0, "the fixture must declare spans to assert on");
+    let spans = exported_spans_exact(&sink, &manifest);
 
     let kinds: BTreeSet<i64> = spans
         .iter()
@@ -301,6 +326,10 @@ async fn every_exported_resource_carries_one_shared_service_name() {
         .expect("the manifest declares the resource service.name")
         .to_string();
 
+    // Every declared span must be present, so the service-name check below
+    // covers every resource that carried one — not only the requests that
+    // happened to be captured.
+    exported_spans_exact(&sink, &manifest);
     let payloads = sink.payloads("/v1/traces");
     assert!(!payloads.is_empty(), "no trace payload reached the sink");
     let mut names: BTreeSet<String> = BTreeSet::new();
@@ -333,14 +362,13 @@ async fn every_exported_resource_carries_one_shared_service_name() {
 // 3. Peer attributes: the virtual-node precondition.
 // ---------------------------------------------------------------------------
 
-/// Precondition (2) on the attribute side. A `servicegraph` connector will draw
-/// an edge to a *virtual* node from one span alone if it carries a peer key, so
-/// span kind is not sufficient on its own.
+/// Precondition (3). A `servicegraph` connector will draw an edge to a
+/// *virtual* node from one span alone if it carries a peer key, so span kind
+/// (precondition 2) is not sufficient on its own.
 #[tokio::test]
 async fn no_exported_span_or_resource_carries_a_topology_peer_attribute() {
-    let (sink, _) = export_shared_fixture().await;
-    let spans = exported_spans(&sink);
-    assert!(!spans.is_empty(), "no span was exported");
+    let (sink, manifest) = export_shared_fixture().await;
+    let spans = exported_spans_exact(&sink, &manifest);
     for span in &spans {
         let keys = attribute_keys(&span["attributes"]);
         for peer in TOPOLOGY_PEER_KEYS {

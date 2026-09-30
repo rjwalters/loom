@@ -531,16 +531,16 @@ The row above was left unattributable because two candidate causes were present
 at once — a render with no topology connector, and a single-service fixture. That
 confound is decidable **without** the trial host, because one of the two is a
 property of the emitting code rather than of the deployment. A topology view needs
-one of exactly two things to draw an edge:
+one of exactly three things to draw an edge:
 
 1. a parent/child span pair carrying two **different** `service.name` values
-   (what SigNoz's own dependency graph is built from), or
-2. a CLIENT/SERVER (or PRODUCER/CONSUMER) span-kind pair — or one span carrying a
-   peer/virtual-node attribute such as `peer.service`, which is how the OTel
-   `servicegraph` connector synthesizes an edge when the remote side never
-   reports.
+   (what SigNoz's own dependency graph is built from),
+2. a CLIENT/SERVER (or PRODUCER/CONSUMER) span-kind pair, or
+3. one span carrying a peer/virtual-node attribute such as `peer.service`, which
+   is how the OTel `servicegraph` connector synthesizes an edge when the remote
+   side never reports.
 
-Loom's exporter can satisfy neither, and both facts are single unconditional
+Loom's exporter can produce none of the three, and both facts are single unconditional
 sites rather than per-call-site conventions:
 
 - `loom-daemon/src/observability/otlp/traces.rs` sets `kind: SpanKind::Internal`
@@ -996,7 +996,7 @@ ingest path. That needs the trial host, the same gap #8525 and #9279 name.
 | CI logs/traces at 7 days on the current trial | **Open** — API-owned tables still at the upstream 15 days; needs the org login ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | Six CI saved views in the trial org | **Open** — recreation steps written in the README, not yet executed in the UI ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | Measured usage parity with ClickStack's "Loom measured usage" view | **Passed against the pinned ClickHouse, open against the live trial.** `usage-queries.sql` (sections 0–6) plus four README saved-view rows close the parity gap; `signoz_usage_queries.rs` executes the committed file verbatim on ClickHouse 25.12.5 and observes scope resolution, at-least-once dedupe, NULL-not-zero dollars for an unpriced model, unknown-vs-measured-zero, the repo-by-trace join, and the wrong-container silent zero (see "Measured usage" above). No run over real canary data on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
-| UI view matrix for Loom's non-HTTP span kinds | **Answered for Service List/APM and Exceptions, via authenticated backend API probes rather than a browser** (see "UI view matrix" above) — Service List/APM populates (`loom-daemon`, correct call/error counts) because RED metrics come from unconditional root-span aggregation, not an HTTP convention; Exceptions stays empty because Loom never emits an OTel `exception` span event. Service Map returned empty and, since 2026-09-30, **is attributable** — see "Resolving the Service Map confound": every Loom span is `SPAN_KIND_INTERNAL` and every resource carries the one `service.name`, both at single unconditional exporter sites and both measured on the real wire payload, so neither of the two preconditions for a topology edge can be met; the gateway's allowlist strips every peer key as a second layer. Adding a connector or a multi-service fixture cannot change the answer for Loom's data. Enforced by `signoz_topology_shape.rs` in ordinary CI. No screenshot has been captured on any session |
+| UI view matrix for Loom's non-HTTP span kinds | **Answered for Service List/APM and Exceptions, via authenticated backend API probes rather than a browser** (see "UI view matrix" above) — Service List/APM populates (`loom-daemon`, correct call/error counts) because RED metrics come from unconditional root-span aggregation, not an HTTP convention; Exceptions stays empty because Loom never emits an OTel `exception` span event. Service Map returned empty and, since 2026-09-30, **is attributable** — see "Resolving the Service Map confound": every Loom span is `SPAN_KIND_INTERNAL` and every resource carries the one `service.name`, both at single unconditional exporter sites and both measured on the real wire payload, so none of the three preconditions for a topology edge can be met; the gateway's allowlist strips every peer key as a second layer. Adding a connector or a multi-service fixture cannot change the answer for Loom's data. Enforced by `signoz_topology_shape.rs` in ordinary CI. No screenshot has been captured on any session |
 
 Synthetic fixture success establishes transport/schema/query behavior, not a
 real Loom lifecycle. Keep #8528 open until the real-canary and #8529
