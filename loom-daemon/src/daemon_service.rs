@@ -1510,9 +1510,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
         None
     };
     // Starred-issue liveness + loom-ui star intents (#9244 C), alongside dispatch.
-    let _star_liveness = _work_finder_handle
-        .is_some()
-        .then(|| loom_daemon::star_liveness::task::spawn(sweep_workspace.clone()));
+    // The bus handle (#9321) carries each new escalation / recovery onto
+    // `operator_priority.escalation` so the Safehouse sink relays it into the
+    // team's Matrix room rather than leaving the ask as a forge comment only.
+    let _star_liveness = _work_finder_handle.is_some().then(|| {
+        loom_daemon::star_liveness::task::spawn(sweep_workspace.clone(), Some(event_bus.clone()))
+    });
 
     // Idle-edge role triggering (#4364) is inert without the work-finder loop:
     // the work finder is the sole source of the per-root idle signal, so an
