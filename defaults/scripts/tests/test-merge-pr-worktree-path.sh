@@ -743,8 +743,9 @@ FAKEDAEMON
     else
         fail "T8a: expected the validation to fall through to the merge; got: $out"
     fi
+    wt_porcelain="$(git -C "$WTC_TMP/repo" worktree list --porcelain)"
     if [[ -d "$WTC_TMP/wt" && "$out" != *"REMOVED:"* ]] && \
-       git -C "$WTC_TMP/repo" worktree list --porcelain | grep -qxF "worktree $WTC_TMP/wt"; then
+       grep -qxF "worktree $WTC_TMP/wt" <<<"$wt_porcelain"; then
         pass "T8b: the unverified --worktree-path survives untouched (no removal attempted)"
     else
         fail "T8b: the unverified worktree must never be removed; got: $out"
