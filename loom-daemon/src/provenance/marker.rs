@@ -11,14 +11,14 @@
 use std::path::Path;
 use std::process::Command;
 
-use super::{sanitize, NONE, UNKNOWN};
+use super::{origin::WorkOrigin, sanitize, NONE, UNKNOWN};
 
 pub const PREFIX: &str = "<!-- loom:provenance v1 ";
 const SUFFIX: &str = " -->";
-const KEYS: [&str; 9] = [
-    "build", "prompts", "sweep", "story", "trace", "host", "base", "run", "installs",
+const KEYS: [&str; 10] = [
+    "build", "prompts", "sweep", "story", "trace", "host", "base", "run", "installs", "origin",
 ];
-/// `installs` is optional; every other v1 key is always present.
+/// `installs` and `origin` are optional; the preceding v1 keys are required.
 const OPTIONAL: usize = 8;
 
 /// One provenance record. Every field is sanitized text, [`UNKNOWN`] or [`NONE`].
@@ -37,6 +37,8 @@ pub struct Marker {
     pub run: String,
     /// `<version> <40-hex>` of a program this action installs, if any.
     pub installs: Option<String>,
+    /// Missing in old records; never inferred from an author or sweep id.
+    pub origin: Option<WorkOrigin>,
 }
 
 /// Sanitize `value` into exactly `parts` tokens, each unsafe or missing part
@@ -73,6 +75,9 @@ impl Marker {
         if let Some(installs) = &self.installs {
             fields.push(("installs", shaped(installs, 2)));
         }
+        if let Some(origin) = self.origin {
+            fields.push(("origin", origin.as_str().to_string()));
+        }
         let body: Vec<String> = fields
             .into_iter()
             .map(|(key, value)| format!("{key}={value}"))
@@ -91,7 +96,7 @@ impl Marker {
             Skipped,
         }
         let body = line.trim().strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
-        let mut values: [Option<String>; 9] = Default::default();
+        let mut values: [Option<String>; 10] = Default::default();
         let mut slot = Slot::Start;
         for token in body.split_whitespace() {
             let key = token.split_once('=').filter(|(key, _)| {
@@ -121,7 +126,11 @@ impl Marker {
             }
         }
         let installs = values[OPTIONAL].take();
-        let [build, prompts, sweep, story, trace, host, base, run, _] = values;
+        let origin = match values[9].take() {
+            Some(value) => Some(WorkOrigin::parse(&value)?),
+            None => None,
+        };
+        let [build, prompts, sweep, story, trace, host, base, run, _, _] = values;
         Some(Self {
             build: build?,
             prompts: prompts?,
@@ -132,6 +141,7 @@ impl Marker {
             base: base?,
             run: run?,
             installs,
+            origin,
         })
     }
 }
@@ -146,6 +156,7 @@ pub struct MarkerInputs<'a> {
     pub body: Option<&'a str>,
     pub sweep: Option<&'a str>,
     pub base_ref: Option<&'a str>,
+    pub origin: Option<WorkOrigin>,
 }
 
 /// Which story a PR belongs to, per D32: exactly one closing reference joins
@@ -211,6 +222,7 @@ pub fn collect(root: &Path, inputs: &MarkerInputs<'_>) -> Marker {
         base: base_commit(root, inputs.base_ref),
         run: run_field(|k| std::env::var(k).ok()),
         installs: None,
+        origin: Some(inputs.origin.unwrap_or_else(WorkOrigin::from_env)),
     }
 }
 
@@ -275,6 +287,7 @@ mod tests {
             base: UNKNOWN.into(),
             run: NONE.into(),
             installs: None,
+            origin: None,
         }
     }
 

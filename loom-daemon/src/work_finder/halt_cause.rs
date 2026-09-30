@@ -52,6 +52,29 @@ pub enum HaltCause {
 }
 
 impl HaltCause {
+    /// Every halt cause, in [`Self::as_str`] wire-token order.
+    pub const ALL: [Self; 6] = [
+        Self::MainRed,
+        Self::GatePending,
+        Self::TokenPool,
+        Self::PreflightAdvisory,
+        Self::Drain,
+        Self::Breaker,
+    ];
+
+    /// The cause whose [`Self::as_str`] is `raw`, or `None` when `raw` is not
+    /// in the closed vocabulary. The validation half of the disposition-span
+    /// exporter's (#9673) structured-extraction rule: a `workspace_halted`
+    /// row's `detail` may reach a span attribute only through here, so no
+    /// free-form text ever does.
+    #[must_use]
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|cause| cause.as_str() == raw)
+    }
+
     /// The wire token carried in a `workspace_halted` row's `detail`.
     #[must_use]
     pub fn as_str(self) -> &'static str {

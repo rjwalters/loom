@@ -15,6 +15,7 @@ use std::path::Path;
 
 pub mod hooks;
 pub mod marker;
+pub mod origin;
 
 /// The explicit placeholder for a field that exists but could not be determined.
 pub const UNKNOWN: &str = "unknown";
