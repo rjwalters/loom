@@ -52,6 +52,7 @@ mod merge_pr_issue_close_gate;
 mod merge_pr_labels;
 mod merge_pr_loom_pr_guard;
 mod merge_pr_mergeable_recheck;
+mod merge_pr_partial_comment;
 mod merge_pr_partial_conflict;
 mod merge_pr_partial_reset;
 mod merge_pr_reconcile;

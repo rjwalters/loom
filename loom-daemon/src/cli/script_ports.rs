@@ -703,6 +703,16 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_partial_conflict`.
     PartialConflict(super::merge_pr_partial_conflict::PartialConflictArgs),
 
+    /// The two post-merge partial-increment AUDIT COMMENTS (#3667/#4569) —
+    /// `## Partial Increment Merged` and `## Premature Auto-Close Reverted` —
+    /// byte-frozen from the retired shell. Prints `LOOM-MERGE-PR-COMMENT`,
+    /// then the body verbatim with no trailing newline. Always exits 0; the
+    /// seam fails OPEN because both are posted AFTER the mutation they
+    /// describe, but a body is only ever posted when the sentinel is present,
+    /// so a binary predating the verb cannot make the shell overwrite the
+    /// audit trail with silence — see `cli::merge_pr_partial_comment`.
+    PartialComment(super::merge_pr_partial_comment::PartialCommentArgs),
+
     /// Which route a FAILED merge's forge error text sends the retry ladder
     /// down (#8191 slice): `merge-in-progress` (405, wait and retry),
     /// `head-mismatch` (#5579 — never retry-and-merge), `base-modified` (sync
@@ -768,6 +778,7 @@ impl MergePrCommand {
             MergePrCommand::WorktreeContains(args) => args.run(),
             MergePrCommand::PartialReset(args) => args.run(),
             MergePrCommand::PartialConflict(args) => args.run(),
+            MergePrCommand::PartialComment(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),
             MergePrCommand::ClosedBuilding(args) => args.run(),
             MergePrCommand::ReconcilePlan(args) => args.run(),

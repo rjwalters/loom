@@ -204,6 +204,22 @@
 //! against two different variables, and owns the deferral comment's byte-frozen
 //! text.
 //!
+//! [`partial_comment`] is what [`partial_reset`] deliberately left behind: the
+//! same pass's two operator-facing AUDIT COMMENTS, which stayed in the shell
+//! as ~40 lines of heredoc-shaped text inside the mutation arms. It is
+//! [`reconcile::defer_comment`]'s sibling — the precedent that a byte-frozen
+//! operator-visible body belongs beside the decision that emits it — and it is
+//! the one member of the family whose text NOTHING asserted before the port:
+//! the retained suite stubs the comment post, and `partial_reset`'s own
+//! differential stubs `forge_gh_comment_rl_safe` to `:` precisely so the
+//! decision under test is not drowned in prose. So both bodies could have been
+//! mangled silently, including the `## Premature Auto-Close Reverted` one that
+//! is the only place a Builder is told the rule (`close #N` in a
+//! partial-increment PR closes it) that stops the bug recurring. Fails OPEN
+//! with a warning — both comments are posted AFTER the reopen/swap they
+//! describe — but only ever posts a body that arrived behind its sentinel, so
+//! the degraded path cannot overwrite the audit trail with an empty comment.
+//!
 //! [`worktree_preserve`] is the #6694/#6264 remove-vs-preserve rule
 //! `merge-pr.sh`'s post-merge cleanup ran identically at THREE call sites —
 //! the Loom-convention path, the porcelain discovery fallback, and the
@@ -223,6 +239,7 @@ pub mod issue_close_gate;
 pub mod labels;
 pub mod loom_pr_guard;
 pub mod mergeable_recheck;
+pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;
 pub mod reconcile;
