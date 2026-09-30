@@ -179,6 +179,7 @@ pub mod foreign_load;
 pub mod forge_cached_list;
 pub mod forge_cached_view;
 pub mod forge_call_stats;
+pub mod forge_check_branch;
 pub mod forge_check_claim;
 pub mod forge_check_open_pr;
 pub mod forge_cmd;
