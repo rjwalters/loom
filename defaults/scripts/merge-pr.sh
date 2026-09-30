@@ -2035,6 +2035,12 @@ _wait_for_checks_then_sync_merge() {
     # unclassified checks. Degrading it to the all-empty answer instead would
     # be WORSE than the retired shell, because a poll that had already latched
     # observed_checks=true would read that answer as "checks settled".
+    # `$failing`/`$pending` are re-joined ONLY to be handed to `merge-pr
+    # checks-failure` as its two NUL fields, and it drops blank lines from both
+    # -- so `${failing:+…}` not prepending a separator ahead of an EMPTY first
+    # name is invisible there, and every branch test below reads the header's
+    # $f_any/$p_any instead of measuring these strings. Do not start reading
+    # them as lists: the header is the authority on what was found.
     local failing="" pending="" total_count=0 f_any=0 p_any=0 p_lines=1
     local _crr_out _crr_rc=0 _crr_l _crr_t
     _crr_out="$(printf '%s\n' "$runs_raw" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr check-runs-rollup 2>/dev/null)" || _crr_rc=$?
