@@ -60,6 +60,7 @@ mod merge_pr_partial_conflict;
 mod merge_pr_partial_reset;
 mod merge_pr_reconcile;
 mod merge_pr_redate;
+mod merge_pr_redate_report;
 mod merge_pr_refs;
 mod merge_pr_response;
 mod merge_pr_sequence;

@@ -9,7 +9,9 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-_None._
+- **#9662**: fix(merge-pr): route PR comment reads through comment trust (#9548 slice, #9657)
+- **#9733**: docs(adr): combined-PR consolidation contract (#9687)
+- **#9742**: observability: resolve the SigNoz Service Map confound from Loom's trace shape
 
 ## Operator Priority
 
@@ -24,31 +26,33 @@ Issues the operator starred (`loom:operator-priority`); land these first.
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
+- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
 - **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh
+- **#8528**: observability: add the self-hosted SigNoz trial using supported Foundry deployment and Loom traces
 - **#9548**: Authenticate Loom's control signals: markers and phrases count only from trusted authors (work safely on any public repo)
+- **#9669**: feat(telemetry): record candidate queue position and total candidate count on dispatch spans
+- **#9686**: Champion: automatically order overlapping PRs and defer redundant base repairs (9063 first release)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
-- **#8195**: Port worktree.sh to a daemon subcommand (1,812 lines; 26 fixes in 6 months, three of them data-loss classes)
-- **#9201**: ci-telemetry: drive capture from workflow_run/workflow_job webhooks (forge_events feed); demote the repo sweep to a slow correction floor
-- **#9326**: ETA phase 3: start-v1 and land for unstarted issues from dispatch_plan + slot turnover
-- **#9586**: gateway keep_keys strips attributes the sweep-facts extraction reads (silent NULL columns)
-- **#9588**: drain: an operator drain that times out must stay paused, not silently resume dispatch
+- **#9746**: merge timing: keep LOOM_AUTO_MERGE_TIMEOUT; 52% of PRs pay a second CI cycle to freshness re-dates — attribute and narrow
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#9640**: drain: operator drains hold on timeout, escalate in place, and record a durable stop (#9588)
+- **#9680**: feat(telemetry): record queue position, depth and comparator keys on dispatch spans
+- **#9751**: feat(merge-pr): attribute #8508 re-dates with commit trailers + redate-report (#9746)
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#9267**: feat(queue): name the workspace_halted hold cause (#9017)
+- **#9662**: fix(merge-pr): route PR comment reads through comment trust (#9548 slice, #9657)
+- **#9733**: docs(adr): combined-PR consolidation contract (#9687)
+- **#9742**: observability: resolve the SigNoz Service Map confound from Loom's trace shape
 
 ## Proposed
 
@@ -61,7 +65,6 @@ Issues carrying `loom:curated`.
 - **#8058**: token pool: per-model-class exhaustion state — an Opus ceiling bad-marks the whole account and starves Sonnet work *(curated)*
 - **#8103**: Repo settings: main has no required status checks, so CI cannot block a merge (and stale branches never re-run) *(curated)*
 - **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it) *(curated)*
-- **#8195**: Port worktree.sh to a daemon subcommand (1,812 lines; 26 fixes in 6 months, three of them data-loss classes) *(curated)*
 - **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh *(curated)*
 - **#8257**: dashboard: add an ephemeral_compute record type (running-now + elastic-spend views, leak detection, hostless ingest) with a D1 migration *(curated)*
 - **#8370**: Concurrent sweeps exhaust host disk via per-worktree cargo target dirs; surfaces as unrelated StorageFull test failures *(curated)*
@@ -92,21 +95,22 @@ Issues carrying `loom:curated`.
 - **#8917**: ci-telemetry: the local journal has no rotation and is read whole on every backfill — phase-2 log capture makes it a GB/day, whole-file-read problem *(curated)*
 - **#8950**: Live-verify Pi tokens_by_model against a real LOOM_RUNTIME=pi launch *(curated)*
 - **#9006**: observability: live-verify the SigNoz queue-starvation alert rule fires and resolves (#8856 / PR #8935 follow-up) *(curated)*
-- **#9017**: Queue snapshot: name the workspace_halted hold cause (red main, gate, token pool, drain, breaker) *(curated)*
 - **#9045**: Doctor: Priority 1 conflict query doesn't exclude loom:operator-only/-decision, only loom:operator *(curated)*
 - **#9062**: Rejection telemetry counts daemon base-conflict flags (#8922) as Judge rejections *(curated)*
-- **#9063**: feat(champion): dynamic mega-PR batching and merge-train consolidation under high PR congestion *(curated)*
 - **#9065**: CI: cut PR wall time from ~8.5 min to ≤5 min (build once, dedupe nextest, shard serial suites) and stop false-stale merges *(curated)*
 - **#9079**: provenance: D33 record in lease/verdict comments, prompt hash, and in-session trailers (follow-up to #9027) *(curated)*
 - **#9126**: Document the quoted-heredoc rule in comment-body-literal-path.md: an unquoted delimiter silently executes and deletes backticked prose *(curated)*
 - **#9136**: main ruleset: bypass_actors 'RepositoryRole:always' makes pull_request and required_status_checks advisory *(curated)*
 - **#9152**: worktree-link: an already-created worktree keeps its pnpm node_modules alias (#8944 leaves existing worktrees unfixed) *(curated)*
-- **#9201**: ci-telemetry: drive capture from workflow_run/workflow_job webhooks (forge_events feed); demote the repo sweep to a slow correction floor *(curated)*
 - **#9304**: Guard telemetry: rm-scope-unresolved-var denies resolvable scratch-cleanup shapes (57 events) *(curated)*
 - **#9323**: Guard: extract_rm_targets() misses a loop/conditional-body rm written as a one-liner (`; do rm -rf …`) *(curated)*
-- **#9326**: ETA phase 3: start-v1 and land for unstarted issues from dispatch_plan + slot turnover *(curated)*
+- **#9329**: ETA phase 6: eta.snapshot ingest record + loom-ui display (retire dashboard-side estimates) *(curated)*
+- **#9356**: ci: 'Native Port Suites' steps lack !cancelled() guards; #9118 comment overstates coverage *(curated)*
+- **#9373**: Guard: for-loop rm-scope resolver proves header appears in text, not that it executed/still binds — 10 reproduced bypasses *(curated)*
 - **#9548**: Authenticate Loom's control signals: markers and phrases count only from trusted authors (work safely on any public repo) *(curated)*
-- **#9586**: gateway keep_keys strips attributes the sweep-facts extraction reads (silent NULL columns) *(curated)*
+- **#9601**: Guard: rm-scope denies the composed `for w in <literals>` → `d="<literal>/$w/…"` → `rm -rf "$d"` cleanup shape (5/205 real denies, all 5 would allow) *(curated)*
+- **#9686**: Champion: automatically order overlapping PRs and defer redundant base repairs (9063 first release) *(curated)*
+- **#9746**: merge timing: keep LOOM_AUTO_MERGE_TIMEOUT; 52% of PRs pay a second CI cycle to freshness re-dates — attribute and narrow *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -122,19 +126,20 @@ Issues carrying `loom:curated`.
 - **#7810**: [epic] Retire shell: 10 sequential PRs, two foundational then update + agent execution
 - **#8522**: Epic: send Loom traces, logs, and metrics to ClickStack/HyperDX and SigNoz for a side-by-side trial
 - **#8764**: Forge event plane: push GitHub events to daemons via operator Webhook Worker feed (ADR-0021, lifts ADR-0014 Lever C)
+- **#9063**: Epic: order overlapping PRs first, then add automatic merge consolidation
 - **#9429**: Epic: Fibonacci story points — a size-weighted throughput measure Loom can optimize
 
 ## Backlog Balance
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 0 |
+| Operator merge-risk holds | 3 |
 | Operator priority | 3 |
-| Ready (`loom:issue`) | 3 |
-| In Progress (`loom:building`) | 6 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 1 |
+| Ready (`loom:issue`) | 7 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 2 |
+| Approved PRs awaiting merge | 3 |
 | Curated | 53 |
 | Architect / Hermit proposals | 3 |
-| Active epics | 7 |
+| Active epics | 8 |
 <!-- guide:plan-body:end -->

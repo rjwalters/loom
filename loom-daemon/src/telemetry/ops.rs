@@ -79,6 +79,10 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.queue.transition",
     "loom.queue.previous_disposition",
     "loom.queue.park_label",
+    // Queue-position metadata on disposition + admission spans (Issue #9669).
+    "loom.queue.candidate_rank",
+    "loom.queue.total_candidates",
+    "loom.queue.priority_score",
     "loom.queue.halt_cause",
     // Repo lockout weights on a pr-open-skip row's disposition/admission
     // spans (Issue #9674).
