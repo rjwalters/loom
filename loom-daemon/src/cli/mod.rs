@@ -26,6 +26,7 @@ pub(crate) mod dep_recheck;
 pub(crate) mod dispatch;
 pub(crate) mod dispatch_backoff;
 mod duplicate_scan;
+mod eta_cmd;
 mod fleet_captain_cmd;
 pub(crate) mod fleet_experiment;
 pub(crate) mod forge_action;
