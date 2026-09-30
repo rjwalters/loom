@@ -3283,14 +3283,12 @@ pub fn spawn_multi_work_finder_task(
             publish_tick(&report, max_concurrent, tick_started, &roots, Some(&plan));
 
             if report.halted && !was_halted {
-                log::warn!(
-                    "work_finder: main-health gate halted dispatch for {} of {} repo(s) — \
-                     their ready issues held until their main is green again",
-                    halted.iter().filter(|&&h| h).count(),
-                    halted.len()
-                );
+                // #9591: name the hold(s) actually active — a drain is not a red main.
+                let flags = (suppress_dispatch_during_gate, draining, breaker_suppressed);
+                let t = halt_log::tally(&halted, &health_states, &roots, &preflight_held, flags);
+                log::warn!("{}", t.warn_line());
             } else if !report.halted && was_halted {
-                log::info!("work_finder: main-health gate cleared — resuming dispatch");
+                log::info!("work_finder: dispatch hold cleared — resuming dispatch");
             }
             was_halted = report.halted;
 
@@ -3552,6 +3550,10 @@ mod registry_refresh;
 /// #8512) — logs, never gates dispatch. Lives in its own file for the same
 /// file-size-ratchet reason as [`registry_refresh`].
 mod tmpfs_warning;
+
+/// Cause-attributed wording for the "dispatch halted" transition line (#9591).
+/// Its own file for the same file-size-ratchet reason as [`registry_refresh`].
+mod halt_log;
 
 /// Per-tick hot-reload of the operator ceiling `configured_max` (#9060). Its
 /// own file for the same file-size-ratchet reason as [`registry_refresh`].
