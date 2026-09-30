@@ -688,6 +688,80 @@ FAKEDAEMON
 fi
 rm -rf "$GATE_FUNCS_FILE" "$GATE_STUB_DIR" 2>/dev/null || true
 
+# --- Test 8: an older daemon lacking `worktree-contains` never removes the
+# unverified --worktree-path (#8191 slice; Judge's fail-safe fix on PR #9602).
+# The registered-worktree check is a guard, and a guard that did not run must
+# refuse the removal -- never lean on `git worktree remove` to refuse it. Runs
+# the REAL parse-time validation block and the REAL post-merge cleanup dispatch,
+# both extracted from merge-pr.sh, against a real repo + registered worktree.
+# `_remove_loom_worktree` is stubbed to really `git worktree remove --force`
+# the path, so a wrongly-dispatched removal would destroy it here.
+echo ""
+echo "Test 8: --worktree-path with a daemon lacking 'worktree-contains' (exit 2)"
+
+extract_top_block() { # <first-line-regex> <file>: top-level `if` through its `fi`
+    awk -v re="$1" '$0 ~ re { grab=1 } grab { print } grab && /^fi$/ { exit }' "$2"
+}
+WTC_VALIDATE="$(extract_top_block '^if \[\[ -n "\$WORKTREE_PATH_OVERRIDE" \]\]; then$' "$MERGE_PR")"
+WTC_CLEANUP="$(extract_top_block '^if \[\[ "\$CLEANUP_WORKTREE" == "true" \]\]; then$' "$MERGE_PR")"
+if [[ "$WTC_VALIDATE" != *"merge-pr worktree-contains"* || "$WTC_CLEANUP" != *'_remove_loom_worktree "$WORKTREE_PATH_OVERRIDE" "true"'* ]]; then
+    fail "could not extract the --worktree-path validation / cleanup dispatch blocks from $MERGE_PR"
+else
+    WTC_TMP="$(mktemp -d)"; WTC_TMP="$(cd "$WTC_TMP" && pwd -P)"
+    git init -q "$WTC_TMP/repo"
+    git -C "$WTC_TMP/repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+    git -C "$WTC_TMP/repo" worktree add -q -b feature/issue-8191 "$WTC_TMP/wt" 2>/dev/null
+    cat > "$WTC_TMP/no-verb-daemon" <<'FAKEDAEMON'
+#!/usr/bin/env bash
+cat >/dev/null
+echo "error: unrecognized subcommand 'worktree-contains'" >&2
+exit 2
+FAKEDAEMON
+    chmod +x "$WTC_TMP/no-verb-daemon"
+
+    # run_wtc <daemon-bin>: validation block, a merge marker, then the cleanup
+    # dispatch -- in a subshell so the eval'd `error` exit cannot kill the suite.
+    run_wtc() (
+        set +e
+        export LOOM_DAEMON_BIN="$1"; unset LOOM_PRESERVE_WORKTREE
+        # shellcheck disable=SC2034  # read by the eval'd blocks
+        REPO_ROOT="$WTC_TMP/repo"; CLEANUP_WORKTREE=true; WORKTREE_PATH_OVERRIDE="$WTC_TMP/wt"
+        info() { echo "INFO: $*"; }; warning() { echo "WARN: $*"; }
+        error() { echo "ERROR: $*"; exit 1; }
+        _remove_loom_worktree() { echo "REMOVED: $1"; git -C "$REPO_ROOT" worktree remove --force "$1"; }
+        eval "$WTC_VALIDATE"; echo "validated; merge proceeds"
+        eval "$WTC_CLEANUP"
+    )
+
+    out="$(run_wtc "$WTC_TMP/no-verb-daemon" 2>&1)"
+    if [[ "$out" == *"validated; merge proceeds"* && "$out" != *"ERROR:"* ]]; then
+        pass "T8a: an older daemon (exit 2) does not block the merge"
+    else
+        fail "T8a: expected the validation to fall through to the merge; got: $out"
+    fi
+    if [[ -d "$WTC_TMP/wt" && "$out" != *"REMOVED:"* ]] && \
+       git -C "$WTC_TMP/repo" worktree list --porcelain | grep -qxF "worktree $WTC_TMP/wt"; then
+        pass "T8b: the unverified --worktree-path survives untouched (no removal attempted)"
+    else
+        fail "T8b: the unverified worktree must never be removed; got: $out"
+    fi
+    if [[ "$out" == *"WARN:"*"did not run"*"$WTC_TMP/wt is left untouched and worktree cleanup is skipped"* ]]; then
+        pass "T8c: the warning names the preserved path and why cleanup was skipped"
+    else
+        fail "T8c: expected a warning naming the preserved path; got: $out"
+    fi
+
+    # Control: the real daemon verifies the same path, so cleanup IS dispatched
+    # to it -- proves T8b's survival is the fail-safe, not a dead harness.
+    out="$(run_wtc "${LOOM_DAEMON_BIN:-loom-daemon}" 2>&1)"
+    if [[ "$out" == *"REMOVED: $WTC_TMP/wt"* && ! -d "$WTC_TMP/wt" ]]; then
+        pass "T8d: control -- a verified --worktree-path is still cleaned up"
+    else
+        fail "T8d: control: expected the verified path to be removed; got: $out"
+    fi
+    rm -rf "$WTC_TMP"
+fi
+
 # --- Summary ---
 echo ""
 echo "Tests run: $TESTS_RUN, Passed: $TESTS_PASSED, Failed: $TESTS_FAILED"
