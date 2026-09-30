@@ -23,6 +23,18 @@ pub(super) fn run_role_with_timeout(
     backstop: Option<crate::runtime_preference::Reservation>,
     contained: Option<crate::tokens_pool::private_workspace::dispatch::Selection>,
 ) -> RoleTickOutcome {
+    // #9548: every scheduled role (Champion, Curator, Judge, Doctor, ...)
+    // writes labels and control markers on this workspace's repo, through
+    // `gh` calls that resolve it the way `gh` does, an `upstream` remote
+    // first. Refuse to launch one where this installation may not write,
+    // exactly as `private_dispatch::prepare` refuses a sweep. `gate_root`
+    // logs the reason once per change; the role log records each skip.
+    if !crate::write_scope::gate_root(workspace_root, &format!("the {role} role tick")) {
+        let reason = "write scope refused (#9548): this installation may not write to the \
+                      workspace's repository; see the write_scope log line for why";
+        note_pre_spawn_skip(&logs_dir, role, reason);
+        return RoleTickOutcome::Failure(reason.to_string());
+    }
     // #8787: an admission that relied on private-clone containment must launch
     // through the EXACT selection that proved it — never a freshly prepared
     // one (which would be a second account pick against an unproven boundary),

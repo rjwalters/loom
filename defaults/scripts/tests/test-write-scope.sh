@@ -129,6 +129,19 @@ OUT="$(cd "$FORK" && LOOM_DAEMON_BIN="$STUB/daemon-allow" bash "$SCRIPTS_DIR/pos
 check "an allowed post-verdict.sh succeeds" 0 "$RC"
 contains "and names the vetted repo on the write" "$(cat "$GH_LOG")" "pr comment 7 --repo me/widgets"
 
+# Scripts vetted since the first review: a real run from the fork is refused
+# before any write, and only the read that resolves the repo is made.
+: > "$GH_LOG"
+OUT="$(cd "$FORK" && LOOM_DAEMON_BIN="$NO_DAEMON" bash "$SCRIPTS_DIR/sync-labels.sh" 2>&1)"; RC=$?
+check "sync-labels.sh refuses a real sync from the fork" 1 "$RC"
+contains "and says why" "$OUT" "loom-daemon forge may-write refused the repo"
+if grep -qE "^label (create|edit|delete)" "$GH_LOG"; then fail "sync-labels.sh wrote no label" "$(cat "$GH_LOG")"; else pass "sync-labels.sh wrote no label"; fi
+
+: > "$GH_LOG"
+OUT="$(cd "$FORK" && LOOM_DAEMON_BIN="$NO_DAEMON" bash "$SCRIPTS_DIR/clean-stale-building-labels.sh" 2>&1)"; RC=$?
+check "clean-stale-building-labels.sh refuses a real run from the fork" 1 "$RC"
+if grep -qE -- "-X DELETE|--remove-label" "$GH_LOG"; then fail "no label was stripped" "$(cat "$GH_LOG")"; else pass "no label was stripped"; fi
+
 # The real verb, when a built binary is supplied (LOOM_TEST_DAEMON_BIN): the
 # fork checkout is refused because gh would resolve it to upstream.
 if [[ -n "${LOOM_TEST_DAEMON_BIN:-}" && -x "${LOOM_TEST_DAEMON_BIN}" ]] \

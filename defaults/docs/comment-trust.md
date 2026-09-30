@@ -163,8 +163,10 @@ when all three hold:
 Anything unverifiable is a refusal. Reads are never gated.
 
 - **Daemon:** `loom-daemon/src/write_scope.rs`. Claim reconciliation,
-  quarantine reconciliation, star liveness and dispatch skip a refused
-  workspace, logging the reason once. The roster heartbeat checks its
+  quarantine reconciliation, star liveness, sweep dispatch and every
+  scheduled role tick skip a refused workspace, logging the reason once. The
+  `forge issue|pr` write passthroughs and `forge auto-merge` /
+  `disable-auto-merge` vet their target first. The roster heartbeat checks its
   configured repository; `notify-cleared-blockers` and the stale-check redate
   take the repository `merge-pr.sh` already vetted; dependency classification
   resolves `origin` (never gh's preference) or takes its caller's explicit
@@ -173,11 +175,19 @@ Anything unverifiable is a refusal. Reads are never gated.
   file writes to the forge without being reviewed into its list.
 - **Shell:** `loom-daemon forge may-write [--repo OWNER/REPO]` prints the
   repository to name on the write (exit 0) or the reason (exit 1).
-  `loom_write_repo` in `lib/forge-helpers.sh` wraps it, and `post-verdict.sh`,
-  `verdict-staleness-guard.sh --clear/--anchor`, `merge-pr.sh`, the
-  `forge-helpers.sh` comment, label, reopen, create and merge wrappers, and
-  the lease publish/renew scripts all use it, passing `--repo` or
-  `repos/OWNER/REPO` explicitly.
+  `loom_write_repo` in `lib/forge-helpers.sh` wraps it. Every script that
+  writes uses it and then passes `--repo` or `repos/OWNER/REPO` explicitly:
+  `post-verdict.sh`, `verdict-staleness-guard.sh --clear/--anchor`,
+  `merge-pr.sh`, `create-pr.sh`, `check-promotion-landed.sh --apply`,
+  `check-main-clean.sh`, `claim-staleness.sh`, `classify-capacity-defer.sh`,
+  `clean-stale-building-labels.sh`, `rebase-stacked-children.sh`,
+  `reconcile-stack.sh`, `sync-labels.sh`, the lease publish/renew scripts,
+  and the `forge-helpers.sh` comment, label, reopen, create and merge
+  wrappers. `write_scope::tests::shell_write_paths_are_vetted` fails when a
+  script under `defaults/scripts` writes without it.
+- **Cross-repo writes** (`create-issue.sh --repo X`, `sync-labels.sh --repo
+  X`) now need X to be the origin of a registered workspace. To manage X
+  from here, register its checkout: `loom-daemon workspace add <path>`.
 - **Without the verb** (no `loom-daemon`, or an older one), the permission
   check cannot run. The fallback allows a write only from a checkout whose
   one remote is `origin`, only to `origin`, and only with `GH_REPO` unset or

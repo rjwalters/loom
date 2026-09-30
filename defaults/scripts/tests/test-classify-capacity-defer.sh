@@ -32,6 +32,13 @@
 set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# #9548: this suite's subject vets its write target (`forge may-write`)
+# first; that decision is not what this suite tests (test-write-scope.sh does),
+# and without this the outcome would depend on the host's loom-daemon.
+WS_STUB_DIR="$(mktemp -d)"
+# shellcheck source=lib/write-scope-stub.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-stub.sh"
+write_scope_allow_all "$WS_STUB_DIR"
 SCRIPTS_DIR="$(cd "$TEST_DIR/.." && pwd)"
 CCD="$SCRIPTS_DIR/classify-capacity-defer.sh"
 

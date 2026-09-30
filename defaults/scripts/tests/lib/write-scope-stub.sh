@@ -16,8 +16,10 @@
 #   write_scope_allow_all "$STUB_DIR"
 #
 # It writes "$STUB_DIR/loom-daemon-write-scope" and exports LOOM_DAEMON_BIN at
-# it. That wrapper answers `forge may-write [--repo R]` with R, or with what the
-# (stubbed) `gh repo view` names when no repo is given, and hands every other
+# it. That wrapper answers `forge may-write [--repo R]` with R, or with
+# $WRITE_SCOPE_STUB_REPO, or with what the (stubbed) `gh repo view` names when
+# no repo is given (a suite that counts gh calls sets the variable), and hands
+# every other
 # invocation on: to the LOOM_DAEMON_BIN in force when this ran, else to
 # whatever `loom-daemon` is first on PATH *at call time* (so a suite's own PATH
 # stub, installed before or after this call, still answers), else exit 127.
@@ -28,6 +30,7 @@ write_scope_allow_all() {
 #!/usr/bin/env bash
 if [[ "\${1:-} \${2:-}" == "forge may-write" ]]; then
   if [[ "\${3:-}" == "--repo" ]]; then echo "\$4"; exit 0; fi
+  if [[ -n "\${WRITE_SCOPE_STUB_REPO:-}" ]]; then echo "\$WRITE_SCOPE_STUB_REPO"; exit 0; fi
   nwo="\$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null | sed -E 's/.*"nameWithOwner" *: *"([^"]+)".*/\\1/')"
   echo "\${nwo:-owner/repo}"; exit 0
 fi

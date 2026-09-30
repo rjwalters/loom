@@ -37,12 +37,15 @@
 //! # Where it is enforced
 //!
 //! - [`gate_root`] at the top of every per-workspace daemon pass that writes
-//!   (claim reconciliation, quarantine reconciliation, dispatch), which is also
-//!   where the refusal is logged, once per change of reason.
-//! - `loom-daemon forge may-write` for shell, wrapped by
-//!   `loom_write_repo` in `defaults/scripts/lib/forge-helpers.sh`.
+//!   (claim and quarantine reconciliation, star liveness, sweep dispatch, and
+//!   every scheduled role tick), which is also where the refusal is logged,
+//!   once per change of reason.
+//! - `loom-daemon forge may-write` for shell, wrapped by `loom_write_repo` in
+//!   `defaults/scripts/lib/forge-helpers.sh`; the `forge issue|pr` write
+//!   passthroughs and the auto-merge verbs vet with it before they run.
 //! - `tests::daemon_write_paths_are_scoped` fails when a new daemon file
-//!   issues a forge write without being reviewed into its list.
+//!   issues a forge write without being reviewed into its list, and
+//!   `tests::shell_write_paths_are_vetted` does the same for `defaults/scripts`.
 //!
 //! See `defaults/docs/comment-trust.md` § "Loom writes only to repos it
 //! manages".

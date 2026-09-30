@@ -363,7 +363,12 @@ fn daemon_write_paths_are_scoped() {
             Via(DISPATCH, "runs inside a dispatched sweep"),
         ),
         ("merge_pr/redate.rs", ShellVetted("merge-pr.sh")),
-        ("forge_cmd.rs", NotAWrite("operator/shell verbs; shell callers vet the repo")),
+        (
+            "forge_cmd.rs",
+            Via("cli/forge_action.rs", "every writing forge verb is vetted first"),
+        ),
+        ("cli/forge_action.rs", Gated),
+        ("role_runner/launch.rs", Gated),
         (
             "fleet/drain.rs",
             NotAWrite("operator-run `fleet drain` on the operator's own fleet"),
@@ -468,4 +473,60 @@ fn daemon_write_paths_are_scoped() {
     let gate_at = pass.find("write_scope::gate_root").unwrap();
     let first_pass = pass.find("forge::reconcile_workspace(").unwrap();
     assert!(gate_at < first_pass, "the write-scope gate must precede the passes");
+}
+
+/// The shell counterpart of [`daemon_write_paths_are_scoped`] (#9548): a
+/// script in `defaults/scripts` (or its `lib/`) that writes to the forge on a
+/// code line must vet its target with `loom_write_repo`, or be reviewed into
+/// `EXEMPT` with the reason it needs no vetting. Stale exemptions fail too.
+#[test]
+fn shell_write_paths_are_vetted() {
+    const EXEMPT: &[(&str, &str)] = &[
+        ("create-issue.sh", "files through forge_gh_create_issue_rl_safe, which vets"),
+        ("lib/github-app-token.sh", "POSTs to the App token endpoint, not to a repo"),
+        ("check-duplicate.sh", "`gh issue create` appears only in its usage text"),
+        ("land-resync-commit.sh", "`gh pr create` appears only in a printed hint"),
+        ("worktree.sh", "`gh pr create` appears only in a printed hint"),
+        ("docs-guide-lock.sh", "`gh pr create` appears only in its usage text"),
+    ];
+    let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts");
+    let writes = regex::Regex::new(
+        r#"\bgh (issue|pr) (comment|edit|close|reopen|merge|create|ready|review|lock)\b|\bgh label (create|edit|delete)\b|(-X|--method) *"?(POST|PATCH|PUT|DELETE)\b|\bforge_gh_(comment|swap_label|remove_label|reopen_issue|create_issue)_rl_safe\b|\bforge_merge_pr\b"#,
+    )
+    .unwrap();
+    let writes_on_code = |text: &str| {
+        text.lines()
+            .map(str::trim_start)
+            .any(|l| !l.starts_with('#') && writes.is_match(l))
+    };
+    let mut offenders = Vec::new();
+    for dir in [scripts.clone(), scripts.join("lib")] {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sh") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&scripts)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let exempt = EXEMPT.iter().find(|(f, _)| *f == rel);
+            if let Some((f, why)) = exempt {
+                assert!(writes_on_code(&text), "stale exemption: {f} ({why}) no longer matches");
+                continue;
+            }
+            if writes_on_code(&text) && !text.contains("loom_write_repo") {
+                offenders.push(rel);
+            }
+        }
+    }
+    offenders.sort();
+    assert!(
+        offenders.is_empty(),
+        "shell scripts that write to the forge must vet the repo with loom_write_repo \
+         (lib/forge-helpers.sh) and name it on the write, or be listed here with a reason \
+         (#9548): {offenders:?}"
+    );
 }
