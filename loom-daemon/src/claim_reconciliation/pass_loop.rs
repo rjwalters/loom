@@ -12,7 +12,7 @@ use std::path::Path;
 
 pub(super) mod building_heal;
 
-use super::{forge, review_conflict, VerdictReconcileStats};
+use super::{forge, merge_sequence, review_conflict, VerdictReconcileStats};
 
 /// Aggregated counts from [`run_reconciliation_pass_over_roots`] — the same
 /// four scalar accumulators `run_reconciliation_pass` used to keep as loose
@@ -93,6 +93,11 @@ pub(super) fn run_reconciliation_pass_over_roots(
         // #8922: AFTER the verdict pass, so a verdict it just re-queued to
         // `loom:review-requested` is checked for base conflicts on this tick.
         review_conflict::reconcile_review_conflicts(gh_bin, root);
+        // #9686: after review conflicts, so a repair the conflict pass just
+        // deferred (sequenced behind an open predecessor) is recorded by the
+        // same tick, and holds a predecessor landing just released are seen
+        // before the next planning pass reads the label set.
+        merge_sequence::reconcile_merge_sequences(gh_bin, root);
         // Issue #9464: after every other reconciliation — a claim this pass
         // just reclaimed must not be immediately "healed" back. Re-applies
         // `loom:building` to OPEN issues whose sweep is live here but whose

@@ -138,7 +138,24 @@ pub(crate) fn fetch_histories(
     open_only: bool,
     progress: bool,
 ) -> (Vec<PrHistory>, Option<String>) {
-    let (rows, list_error) = list_prs(root, repo, limit, open_only);
+    fetch_histories_matching(root, repo, limit, open_only, None, progress)
+}
+
+/// [`fetch_histories`], narrowed by a `gh pr list --search` expression.
+///
+/// The incremental half of `eta fleet refresh` (#9343): with
+/// `search = "updated:>=<cursor>"` the enumeration covers only PRs that moved
+/// since the cached snapshot was built, so the per-PR timeline reads — the
+/// expensive part — are paid for a handful of PRs instead of the whole repo.
+pub(crate) fn fetch_histories_matching(
+    root: &Path,
+    repo: Option<&str>,
+    limit: u32,
+    open_only: bool,
+    search: Option<&str>,
+    progress: bool,
+) -> (Vec<PrHistory>, Option<String>) {
+    let (rows, list_error) = list_prs(root, repo, limit, open_only, search);
     let mut histories = Vec::with_capacity(rows.len());
     let total = rows.len();
     for (i, row) in rows.into_iter().enumerate() {
@@ -203,6 +220,7 @@ fn list_prs(
     repo: Option<&str>,
     limit: u32,
     open_only: bool,
+    search: Option<&str>,
 ) -> (Vec<PrRow>, Option<String>) {
     let limit = limit.to_string();
     let mut args = vec![
@@ -213,6 +231,9 @@ fn list_prs(
     ];
     if let Some(r) = repo {
         args.extend(["--repo", r]);
+    }
+    if let Some(s) = search {
+        args.extend(["--search", s]);
     }
     args.extend([
         "--json",

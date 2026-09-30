@@ -89,7 +89,10 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+pub mod attribution;
 pub mod budget;
+pub mod report;
+pub use attribution::Attribution;
 pub use budget::{BudgetConfig, BudgetDecision};
 
 /// The `gh` binary, honoring `LOOM_GH_BIN` — the same seam
@@ -150,6 +153,9 @@ fn gh_api_body(bin: &str, args: &[&str], body: Option<&str>) -> Result<String, S
 /// The commit message every re-date commit carries — deterministic and
 /// greppable, so a later pass (or a human) can tell "this is an automated
 /// remedy commit" from the commit log alone without reading this source.
+///
+/// This is the generic, unattributed body: what [`commit_message_with`] writes
+/// when the guard's verdict could not be recomputed (#9746).
 #[must_use]
 pub fn commit_message(pr: &str) -> String {
     format!(
@@ -160,6 +166,18 @@ required-check-freshness guard blocked this merge on evidence that predates \
 the base branch's current tip, and the merge token lacks actions:write to \
 re-run the stale check directly."
     )
+}
+
+/// [`commit_message`] plus, when the verdict is known, the #9746 attribution
+/// trailers as the body's final paragraph. The subject line is byte-identical
+/// either way — [`is_redate_commit_subject`] and the CI telemetry poller key on
+/// it — and `None` yields exactly [`commit_message`].
+#[must_use]
+pub fn commit_message_with(pr: &str, attribution: Option<&Attribution>) -> String {
+    match attribution {
+        Some(a) => format!("{}\n\n{}", commit_message(pr), a.trailers()),
+        None => commit_message(pr),
+    }
 }
 
 /// Whether `subject` (a commit message's FIRST line) is exactly the subject
@@ -324,9 +342,24 @@ pub enum RemedyOutcome {
 /// escalate to a durable operator hold.
 ///
 /// `nwo` is `owner/repo`.
+///
+/// The re-date commit is attributed (#9746) by recomputing the guard's verdict
+/// just before the commit is created — only when a push is actually going to
+/// happen. A recompute failure is reported on stderr and the generic body is
+/// written instead; it never blocks the remedy.
 pub fn remedy(nwo: &str, branch: &str, expected_head_sha: &str, pr: &str) -> RemedyOutcome {
     let cfg = BudgetConfig::for_root(&repo_root());
-    remedy_with(&gh_bin(), nwo, branch, expected_head_sha, pr, cfg, chrono::Utc::now())
+    remedy_with(&gh_bin(), nwo, branch, expected_head_sha, pr, cfg, chrono::Utc::now(), || {
+        match attribution::recompute(nwo, pr, expected_head_sha) {
+            Ok(a) => Some(a),
+            Err(why) => {
+                eprintln!(
+                    "Note: re-date commit for PR #{pr} carries no attribution trailers (#9746): {why}"
+                );
+                None
+            }
+        }
+    })
 }
 
 /// The repo root (config, App roster, allowlist), not whatever subdirectory
@@ -337,8 +370,27 @@ fn repo_root() -> std::path::PathBuf {
         .unwrap_or_default()
 }
 
+/// Test-only convenience over [`remedy_with`] with no attribution: the
+/// generic commit body.
+#[cfg(test)]
+fn remedy_generic_with(
+    gh: &str,
+    nwo: &str,
+    branch: &str,
+    expected_head_sha: &str,
+    pr: &str,
+    cfg: BudgetConfig,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RemedyOutcome {
+    remedy_with(gh, nwo, branch, expected_head_sha, pr, cfg, now, || None)
+}
+
 /// [`remedy`]'s implementation, parameterized on the `gh` binary — the
-/// injection seam the test suite drives directly (see [`gh_api_with`]).
+/// injection seam the test suite drives directly (see [`gh_api_with`]) — plus
+/// the #9746 attribution. `attribute` is called at most once, and only once a
+/// push has been decided on (never for a head move, deferral or escalation);
+/// `None` means "write the generic body".
+#[allow(clippy::too_many_arguments)]
 fn remedy_with(
     gh: &str,
     nwo: &str,
@@ -347,6 +399,7 @@ fn remedy_with(
     pr: &str,
     cfg: BudgetConfig,
     now: chrono::DateTime<chrono::Utc>,
+    attribute: impl FnOnce() -> Option<Attribution>,
 ) -> RemedyOutcome {
     let current = match read_nonempty(
         gh,
@@ -409,7 +462,7 @@ fn remedy_with(
         Err(e) => return RemedyOutcome::Failed(e),
     };
 
-    let message_arg = format!("message={}", commit_message(pr));
+    let message_arg = format!("message={}", commit_message_with(pr, attribute().as_ref()));
     let tree_arg = format!("tree={tree}");
     let parent_arg = format!("parents[]={current}");
     let new_sha = match read_nonempty(

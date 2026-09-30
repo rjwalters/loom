@@ -39,6 +39,16 @@
 //! by the file-size ratchet and does not change here; its exit-5 arm is simply
 //! unreachable).
 //!
+//! # Attribution trailers (#9746)
+//!
+//! Before creating the commit, this recomputes the guard's verdict through the
+//! same fetch/assess path as `merge-pr stale-checks` (the PR's base ref is read
+//! from the forge, so `merge-pr.sh` passes nothing new) and appends
+//! `Stale-Check:` / `Stale-Clause:` / `Coupled-Base-Path:` / `Coupled-PR-Path:`
+//! trailers to the commit body; `merge-pr redate-report` reads them back. The
+//! subject is unchanged. If the verdict cannot be recomputed, a `Note:` goes to
+//! stderr and the generic body is written — the remedy never fails on it.
+//!
 //! Exit 3 mirrors `merge-pr.sh`'s own #5579 contract: it is NOT a failure —
 //! the branch moving out from under a stale-evidence remedy means either a
 //! human already acted or a fresh push already landed, so the caller should

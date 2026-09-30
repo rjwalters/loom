@@ -6,6 +6,7 @@ mod config;
 mod emit;
 mod estimate;
 mod explanation;
+mod fleet;
 mod journal;
 mod primitives;
 mod ready;
