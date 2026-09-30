@@ -93,6 +93,26 @@ pub(crate) enum ForgeAction {
         force_claim: bool,
     },
 
+    /// `forge check-branch <issue>` — the #9447 branch-collision hard-stop
+    /// probe (#9453 Phase 4): does `feature/issue-N` already exist on
+    /// `origin`? Wired into the pre-push fence immediately before a
+    /// Builder's first `git push -u origin feature/issue-N` — a `0` means
+    /// **hard-abort with `BRANCH_COLLISION`**, never create a suffix branch
+    /// past it (the #9447 incident's exact failure mode).
+    ///
+    /// Exits `0` and prints the branch's last-commit timestamp (or its tip
+    /// SHA when the commit is not locally reachable) when the branch already
+    /// exists, `1` on a verified absence (safe to push), and `5` when the
+    /// probe could not answer (fail closed — NOT an absence). Zero
+    /// forge-API calls: `git ls-remote` is the git wire protocol, so this
+    /// works identically on GitHub and Gitea.
+    #[command(name = "check-branch")]
+    CheckBranch {
+        /// Issue number whose `feature/issue-N` branch you are about to push.
+        #[arg(value_name = "ISSUE")]
+        issue: u32,
+    },
+
     /// OPERATOR-ONLY: arm GitHub's server-side auto-merge for a PR. Not a
     /// Loom merge path — use `merge-pr.sh` instead.
     ///
@@ -379,6 +399,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::CheckClaim { issue, force_claim } => {
             ForgeCmd::CheckClaim { issue, force_claim }
         }
+        ForgeAction::CheckBranch { issue } => ForgeCmd::CheckBranch { issue },
         ForgeAction::AutoMerge {
             pr_number,
             method,
