@@ -11,7 +11,10 @@
 //! `LOOM_GH_BIN` env var — that would race across `cargo test`'s parallel
 //! threads in one process.
 
+use super::attribution::{recompute_with, sanitize, TIME_RULE_CLAUSE};
 use super::*;
+use crate::merge_pr::stale_checks::inputs::StaleReason;
+use crate::merge_pr::stale_checks::Verdict;
 use std::fs;
 use std::io::Write;
 
@@ -594,5 +597,199 @@ fn an_untrusted_redate_marker_is_not_attempt_state() {
     fs::write(dir.join("comments.json"), "not json").expect("write listing");
     let outcome = run(&gh, ONE);
     assert!(matches!(outcome, RemedyOutcome::Failed(_)), "{outcome:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- Attribution trailers (#9746) -----------------------------------------
+
+/// #9743's pair: the seed expectation for the narrowing follow-up (#9748).
+fn clause4_verdict() -> Verdict {
+    Verdict::StaleInputs {
+        check: "Structural Checks (Role Prompt Prefix Ratchet)".to_string(),
+        tested_base: "803f0c7d".to_string(),
+        reason: StaleReason {
+            clause: "the base move and this PR both touch this check's coupled inputs",
+            base_path: Some("CLAUDE.md".to_string()),
+            pr_path: Some("defaults/docs/eta.md".to_string()),
+        },
+    }
+}
+
+/// The message's trailer block as git itself parses it — the contract the
+/// report depends on, checked by the real parser rather than by eye.
+fn git_trailers(message: &str) -> Vec<String> {
+    let mut child = std::process::Command::new("git")
+        .args(["interpret-trailers", "--parse"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("git is on PATH for the test suite");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(message.as_bytes())
+        .expect("write message");
+    let out = child.wait_with_output().expect("git interpret-trailers");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+#[test]
+fn a_clause_4_verdict_renders_all_four_trailers() {
+    let a = Attribution::from_verdict(&clause4_verdict()).expect("stale verdict attributes");
+    let msg = commit_message_with("9743", Some(&a));
+    assert_eq!(
+        git_trailers(&msg),
+        vec![
+            "Stale-Check: Structural Checks (Role Prompt Prefix Ratchet)",
+            "Stale-Clause: the base move and this PR both touch this check's coupled inputs",
+            "Coupled-Base-Path: CLAUDE.md",
+            "Coupled-PR-Path: defaults/docs/eta.md",
+        ],
+        "{msg}"
+    );
+    // The subject is byte-identical to the unattributed one, and the generic
+    // body is kept intact above the trailer paragraph.
+    assert_eq!(msg.lines().next(), commit_message("9743").lines().next());
+    assert!(is_redate_commit_subject(msg.lines().next().unwrap()));
+    assert!(msg.starts_with(&commit_message("9743")), "{msg}");
+}
+
+#[test]
+fn a_time_rule_verdict_names_the_check_and_no_paths() {
+    let t = now();
+    let v = Verdict::Stale {
+        check: "Rust Tests".to_string(),
+        started_at: t,
+        base_tip: t,
+    };
+    let a = Attribution::from_verdict(&v).expect("time-rule verdict attributes");
+    assert_eq!(
+        git_trailers(&commit_message_with("1", Some(&a))),
+        vec![
+            "Stale-Check: Rust Tests".to_string(),
+            format!("Stale-Clause: {TIME_RULE_CLAUSE}"),
+            "Coupled-Base-Path: none".to_string(),
+            "Coupled-PR-Path: none".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn fresh_and_unknown_verdicts_carry_no_attribution() {
+    assert_eq!(Attribution::from_verdict(&Verdict::Fresh), None);
+    assert_eq!(Attribution::from_verdict(&Verdict::Unknown("x".into())), None);
+}
+
+#[test]
+fn a_crafted_path_cannot_inject_a_trailer_or_a_line() {
+    let a = Attribution {
+        check: "Lint\nStale-Check: forged".to_string(),
+        clause: "c\r\n\r\nSigned-off-by: mallory".to_string(),
+        base_path: Some("a.md\nCoupled-PR-Path: forged\u{0}\t".to_string()),
+        pr_path: Some("\n\n".to_string()),
+    };
+    let msg = commit_message_with("7", Some(&a));
+    let trailers = git_trailers(&msg);
+    assert_eq!(trailers.len(), 4, "exactly the four trailers, nothing forged: {trailers:?}");
+    assert_eq!(trailers[0], "Stale-Check: Lint Stale-Check: forged");
+    assert_eq!(trailers[1], "Stale-Clause: c Signed-off-by: mallory");
+    assert_eq!(trailers[2], "Coupled-Base-Path: a.md Coupled-PR-Path: forged");
+    assert_eq!(trailers[3], "Coupled-PR-Path: none", "an all-whitespace value reads as none");
+    // The trailer paragraph is exactly four lines: nothing broke out of one.
+    assert_eq!(msg.rsplit("\n\n").next().unwrap().lines().count(), 4, "{msg}");
+}
+
+#[test]
+fn sanitize_caps_length_and_keeps_ordinary_values() {
+    assert_eq!(sanitize("defaults/docs/eta.md"), "defaults/docs/eta.md");
+    assert_eq!(sanitize("  spaced   out  "), "spaced out");
+    assert_eq!(sanitize(""), "none");
+    assert_eq!(sanitize(&"x".repeat(5000)).chars().count(), 300);
+}
+
+#[test]
+fn no_attribution_is_exactly_the_generic_body() {
+    assert_eq!(commit_message_with("42", None), commit_message("42"));
+}
+
+#[test]
+fn the_remedy_writes_the_trailers_into_the_created_commit() {
+    let dir = tmp_dir("attributed-push");
+    let gh = write_stub_gh(&dir, "abc0000", "tree1111", "newsha22", "", "");
+    let a = Attribution::from_verdict(&clause4_verdict());
+    let outcome = remedy_attributed_with(
+        gh.to_str().unwrap(),
+        "o/r",
+        "feature/x",
+        "abc0000",
+        "42",
+        ONE,
+        now(),
+        || a,
+    );
+    assert_eq!(
+        outcome,
+        RemedyOutcome::Pushed {
+            new_sha: "newsha22".to_string()
+        }
+    );
+    let argv = fs::read_to_string(dir.join("argv.log")).expect("argv log");
+    let create = split_stub_calls(&argv)[3].to_string();
+    assert!(create.starts_with("repos/o/r/git/commits "), "{create}");
+    assert!(create.contains("Coupled-Base-Path: CLAUDE.md"), "{create}");
+    assert!(create.contains("Coupled-PR-Path: defaults/docs/eta.md"), "{create}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_unrecomputable_verdict_falls_back_to_the_generic_body_and_still_pushes() {
+    let dir = tmp_dir("attribution-fallback");
+    let gh = write_stub_gh(&dir, "abc0000", "tree1111", "newsha22", "", "");
+    let gh = gh.to_str().unwrap();
+    // The stub answers no `pulls/` path (exit 2), so the recompute fails at its
+    // very first read — the remedy must not care.
+    let recomputed = recompute_with(gh, "o/r", "42", "abc0000");
+    assert!(recomputed.is_err(), "{recomputed:?}");
+    let outcome =
+        remedy_attributed_with(gh, "o/r", "feature/x", "abc0000", "42", ONE, now(), || {
+            recompute_with(gh, "o/r", "42", "abc0000").ok()
+        });
+    assert_eq!(
+        outcome,
+        RemedyOutcome::Pushed {
+            new_sha: "newsha22".to_string()
+        }
+    );
+    let argv = fs::read_to_string(dir.join("argv.log")).expect("argv log");
+    let create = split_stub_calls(&argv)
+        .into_iter()
+        .find(|c| c.starts_with("repos/o/r/git/commits "))
+        .expect("the commit was still created")
+        .to_string();
+    assert!(create.contains(&format!("message={}", commit_message("42"))), "{create}");
+    assert!(!create.contains("Stale-Check:"), "{create}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn attribution_is_never_computed_when_nothing_is_pushed() {
+    let dir = tmp_dir("attribution-lazy");
+    // Head moved: no push, so the (possibly expensive) recompute must not run.
+    let gh = write_stub_gh(&dir, "def9999", "unused", "unused", "", "");
+    let outcome = remedy_attributed_with(
+        gh.to_str().unwrap(),
+        "o/r",
+        "feature/x",
+        "abc0000",
+        "42",
+        ONE,
+        now(),
+        || panic!("attribution must not be computed for a head move"),
+    );
+    assert!(matches!(outcome, RemedyOutcome::HeadMoved { .. }), "{outcome:?}");
     let _ = fs::remove_dir_all(&dir);
 }
