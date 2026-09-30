@@ -210,6 +210,12 @@ pub(crate) fn in_episode<'a>(
 #[path = "lease_episode_dispatch_tests.rs"]
 mod lease_episode_dispatch_tests;
 
+// #9548 / Judge #9593: spoofed-vs-trusted lease records through the
+// tie-break and the watchdog fence (same ratchet reason as above).
+#[cfg(test)]
+#[path = "lease_trust_tests.rs"]
+mod lease_trust_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

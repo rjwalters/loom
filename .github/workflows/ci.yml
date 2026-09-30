@@ -1826,6 +1826,12 @@ jobs:
       # not shell) — needs the binary this job downloads.
       - name: worktree issue claim-lock cross-check (#8553)
         run: bash defaults/scripts/tests/test-worktree-issue-lock.sh
+      # rjwalters/kicad-tools#5783: the "existing worktree has uncommitted
+      # changes -> preserve" fast path now refuses on 2+ simultaneously fresh
+      # sweep leases, via `loom-daemon lease co-occupancy` — needs the binary
+      # this job downloads.
+      - name: worktree shared-lease co-occupancy guard (kicad-tools#5783)
+        run: bash defaults/scripts/tests/test-worktree-lease-co-occupancy.sh
       # #8396: premise-check.sh is a thin stub over `loom-daemon
       # premise-check`, the gate Curator and the sweep orchestrator run before
       # enrichment — needs the binary this job downloads.

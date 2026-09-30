@@ -292,9 +292,14 @@ pub fn filter_document(policy: &TrustPolicy, bytes: &[u8]) -> Option<Value> {
 
 /// Parse a comment listing: one JSON array, or several concatenated (a
 /// paginated `gh api` without `--slurp`, or `--slurp`'s array of pages),
-/// flattened oldest first. `None` on anything else.
+/// flattened oldest first. `None` on anything else, including empty or
+/// whitespace-only input: a listing with no comments is `[]`, so nothing at
+/// all means the fetch did not happen (Judge #9566).
 #[must_use]
 pub fn parse_listing(bytes: &[u8]) -> Option<Vec<Value>> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return None;
+    }
     let mut out = Vec::new();
     for value in serde_json::Deserializer::from_slice(bytes).into_iter::<Value>() {
         match value.ok()? {
@@ -312,5 +317,9 @@ pub fn parse_listing(bytes: &[u8]) -> Option<Vec<Value>> {
     Some(out)
 }
 
+pub mod records;
+
+#[cfg(test)]
+mod structure_tests;
 #[cfg(test)]
 mod tests;
