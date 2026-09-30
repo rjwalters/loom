@@ -23,7 +23,10 @@
 
 use std::path::PathBuf;
 
+use super::ready_queue::{self, TickQueueRow};
+use super::WorkItem;
 use crate::main_health_gate::WorkspaceHealthStates;
+use crate::types::QueueDisposition;
 
 /// Why one workspace's dispatch is held this tick. A closed vocabulary: the
 /// `detail` a `workspace_halted` row carries on public views is one of these
@@ -120,6 +123,28 @@ pub fn causes_per_root(
             breaker_suppressed.then_some(HaltCause::Breaker)
         })
         .collect()
+}
+
+/// Record every `ready` item of held workspace `idx` as a `workspace_halted`
+/// row naming its cause (#9017). `causes` is optional and parallel to the
+/// tick's `halted` slice; a missing entry (or a legacy no-cause caller passing
+/// `None`) records a cause-less row, byte-for-byte the pre-#9017 behaviour.
+/// Lives here rather than inline in the tick loop for the same file-size
+/// ratchet reason as the rest of this module.
+pub fn record_halted(
+    rows: &mut Vec<TickQueueRow>,
+    ready: &[WorkItem],
+    idx: usize,
+    workspace_priority: u32,
+    red: bool,
+    causes: Option<&[Option<HaltCause>]>,
+) {
+    let cause = causes.and_then(|c| c.get(idx).copied()).flatten();
+    for item in ready {
+        let key = ready_queue::key_of(idx, workspace_priority, item, red);
+        let detail = cause.map(|c| c.as_str().to_string());
+        ready_queue::record_skip(rows, key, item, QueueDisposition::WorkspaceHalted, detail);
+    }
 }
 
 #[cfg(test)]

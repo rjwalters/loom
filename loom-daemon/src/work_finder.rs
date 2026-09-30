@@ -1830,21 +1830,8 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         let red = lane.is_red(&ready, || dispatcher.main_red_via_ci());
         let repo_halted = halted.get(idx).copied().unwrap_or(false);
         if repo_halted && !lane.admits_fixes_while_halted() {
-            // #9017: name WHICH hold tripped, not just that one did. The
-            // cause slice is optional and parallel to `halted`; a missing
-            // entry (or a legacy no-cause caller) records a cause-less row,
-            // byte-for-byte the pre-#9017 behaviour.
-            let cause = halt_causes.and_then(|c| c.get(idx).copied()).flatten();
-            for item in &ready {
-                let key = ready_queue::key_of(idx, workspace_priority, item, red);
-                ready_queue::record_skip(
-                    q,
-                    key,
-                    item,
-                    Qd::WorkspaceHalted,
-                    cause.map(|c| c.as_str().to_string()),
-                );
-            }
+            // #9017: name WHICH hold tripped, not just that one did.
+            halt_cause::record_halted(q, &ready, idx, workspace_priority, red, halt_causes);
             continue;
         }
 
