@@ -16,6 +16,7 @@ use clap::{Args, Subcommand};
 
 use loom_daemon::fleet_store::fetch::{self, Freshness, Loaded, Policy};
 use loom_daemon::fleet_store::gh::GhTransport;
+use loom_daemon::fleet_store::propose;
 use loom_daemon::fleet_store::render::{self, Drift};
 use loom_daemon::fleet_store::roster::{self, Change, Registered};
 use loom_daemon::fleet_store::{self as store, state, StoreLocation};
@@ -90,6 +91,57 @@ enum FleetConfigCommand {
         #[arg(long)]
         offline: bool,
     },
+    /// Open a PR against the store instead of hand-editing it (#9599).
+    /// Always a branch + PR — never a direct push. Needs the writer app's
+    /// `contents: write` and `pull_requests: write` on the store, an
+    /// explicit operator grant; without it this fails with a clear error,
+    /// not a crash.
+    Propose {
+        #[command(subcommand)]
+        command: ProposeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProposeCommand {
+    /// Move a host (or, with no `--host`, the fleet default) to a new
+    /// desired run state in `fleet/state.yml`.
+    State {
+        /// `running`, `paused` or `stopped`.
+        state: String,
+        /// Host id in the store (default: the fleet-wide default entry).
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+        /// Why — recorded as `reason` on the entry.
+        #[arg(long)]
+        reason: String,
+        /// Who — recorded as `by` (default: this host's identity).
+        #[arg(long, value_name = "WHO")]
+        by: Option<String>,
+        /// Print the diff without opening a PR.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Change one `repos.yml` record's dispatch priority.
+    Priority {
+        /// The record's `name:`.
+        repo: String,
+        /// The new `fleet_priority`.
+        priority: u32,
+        /// Print the diff without opening a PR.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Turn this host's `render --check` drift into a PR that moves the
+    /// on-disk values into `fleet/hosts/<host>/…`.
+    Adopt {
+        /// Host id in the store (default: `LOOM_HOST_ID`, else the hostname).
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+        /// Print the diff without opening a PR.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Run `fleet-config`, exiting with the documented code.
@@ -146,6 +198,21 @@ fn run(args: FleetConfigArgs) -> Result<i32> {
             json,
             offline,
         } => cmd_state(&ctx, host, json, offline),
+        FleetConfigCommand::Propose { command } => match command {
+            ProposeCommand::State {
+                state,
+                host,
+                reason,
+                by,
+                dry_run,
+            } => cmd_propose_state(&ctx, state, host, reason, by, dry_run),
+            ProposeCommand::Priority {
+                repo,
+                priority,
+                dry_run,
+            } => cmd_propose_priority(&ctx, repo, priority, dry_run),
+            ProposeCommand::Adopt { host, dry_run } => cmd_propose_adopt(&ctx, host, dry_run),
+        },
     }
 }
 
@@ -405,6 +472,153 @@ fn cmd_state(ctx: &Ctx, host: Option<String>, json: bool, offline: bool) -> Resu
         if let Some(v) = v {
             println!("  {k}: {v}");
         }
+    }
+    Ok(0)
+}
+
+fn cmd_propose_state(
+    ctx: &Ctx,
+    state_arg: String,
+    host: Option<String>,
+    reason: String,
+    by: Option<String>,
+    dry_run: bool,
+) -> Result<i32> {
+    let run_state = state::RunState::parse(&state_arg)
+        .ok_or_else(|| anyhow!("`{state_arg}` is not running, paused or stopped"))?;
+    if let Some(h) = &host {
+        store::validate_host(h)?;
+    }
+    // Fail closed: an edit must be based on content the forge confirmed
+    // current in this invocation, or its blob `sha` (and so the PUT below)
+    // could target a commit that has already moved on.
+    let loaded = ctx.load(Policy::FailClosed)?;
+    let text = loaded.snapshot.text(store::STATE_PATH)?.ok_or_else(|| {
+        anyhow!("the store has no {} to propose a state change to", store::STATE_PATH)
+    })?;
+    let by = by.unwrap_or_else(loom_daemon::sweep_registry::host_identity);
+    let since = Utc::now().format("%Y-%m-%dT%H:%MZ").to_string();
+    let after = propose::edit_state(&text, host.as_deref(), run_state, &reason, &by, &since)?;
+    let change = propose::FileChange {
+        before_sha: loaded
+            .snapshot
+            .manifest
+            .files
+            .get(store::STATE_PATH)
+            .cloned(),
+        path: store::STATE_PATH.to_string(),
+        before: Some(text),
+        after,
+    };
+    let who = host.as_deref().unwrap_or("the fleet default");
+    let title = format!("fleet-config: set {who} state to {}", run_state.as_str());
+    submit_or_print(ctx, &loaded, "state", vec![change], title, dry_run)
+}
+
+fn cmd_propose_priority(ctx: &Ctx, repo: String, priority: u32, dry_run: bool) -> Result<i32> {
+    let loaded = ctx.load(Policy::FailClosed)?;
+    let text = loaded
+        .snapshot
+        .text(store::ROSTER_PATH)?
+        .ok_or_else(|| anyhow!("the store has no {}", store::ROSTER_PATH))?;
+    let after = propose::edit_priority(&text, &repo, priority)?;
+    let change = propose::FileChange {
+        before_sha: loaded
+            .snapshot
+            .manifest
+            .files
+            .get(store::ROSTER_PATH)
+            .cloned(),
+        path: store::ROSTER_PATH.to_string(),
+        before: Some(text),
+        after,
+    };
+    let title = format!("fleet-config: set {repo} priority to {priority}");
+    submit_or_print(ctx, &loaded, "priority", vec![change], title, dry_run)
+}
+
+fn cmd_propose_adopt(ctx: &Ctx, host: Option<String>, dry_run: bool) -> Result<i32> {
+    let host = resolve_host(host)?;
+    let loaded = ctx.load(Policy::FailClosed)?;
+    let machine_path = loom_daemon::config_resolver::private_defaults_path().ok_or_else(|| {
+        anyhow!(
+            "the machine tier is disabled ({} is set to the empty string)",
+            loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV
+        )
+    })?;
+    let local_path = ctx
+        .workspace
+        .join(loom_daemon::config_resolver::LOCAL_CONFIG_REL);
+    let adopted = propose::adopt::plan(&loaded.snapshot, &host, &machine_path, &local_path)?;
+    if adopted.is_empty() {
+        println!("{}", source_line(ctx, &loaded));
+        println!("{host}: no drift to adopt — the on-disk config already matches the store");
+        return Ok(0);
+    }
+    let files: Vec<propose::FileChange> = adopted
+        .into_iter()
+        .map(|f| propose::FileChange {
+            before_sha: loaded.snapshot.manifest.files.get(&f.path).cloned(),
+            path: f.path,
+            before: f.before,
+            after: f.after,
+        })
+        .collect();
+    let title = format!("fleet-config: adopt {host}'s local drift");
+    submit_or_print(ctx, &loaded, "adopt", files, title, dry_run)
+}
+
+/// Common tail of every `propose` sub-verb: print the branch/title/diff
+/// report, then either stop there (`--dry-run`) or open the PR.
+///
+/// A sub-verb whose edit turned out to be a no-op (the store already says
+/// what it was asked to say) stops here with nothing proposed: an empty PR
+/// is noise for the operator who has to review it.
+fn submit_or_print(
+    ctx: &Ctx,
+    loaded: &Loaded,
+    kind: &str,
+    files: Vec<propose::FileChange>,
+    title: String,
+    dry_run: bool,
+) -> Result<i32> {
+    let files = propose::drop_unchanged(files);
+    if files.is_empty() {
+        println!("{}", source_line(ctx, loaded));
+        println!("nothing to propose — the store already matches this change");
+        return Ok(0);
+    }
+    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let branch = propose::branch_name(kind, &stamp);
+    let marker = propose::provenance_marker(&ctx.workspace, &loaded.snapshot.manifest.commit);
+    let body = format!(
+        "Opened by `loom-daemon fleet-config propose {kind}` (see `daemon-reference.md` § \
+         \"Fleet store\" for the store's file contract). Merges stay the operator's — this \
+         command only ever proposes.\n\n{marker}\n"
+    );
+    let proposal = propose::Proposal {
+        branch,
+        title,
+        body,
+        files,
+    };
+    println!("{}", source_line(ctx, loaded));
+    print!("{}", proposal.report());
+    if dry_run {
+        println!("(--dry-run: no PR opened)");
+        return Ok(0);
+    }
+    let pr = propose::submit(
+        &ctx.transport,
+        &ctx.location.repo,
+        &ctx.location.reference,
+        &loaded.snapshot.manifest.commit,
+        &proposal,
+    )?;
+    match (pr.number, pr.url) {
+        (Some(n), Some(url)) => println!("opened PR #{n}: {url}"),
+        (_, Some(url)) => println!("opened PR: {url}"),
+        _ => println!("opened the PR (the forge did not echo its number/URL back)"),
     }
     Ok(0)
 }

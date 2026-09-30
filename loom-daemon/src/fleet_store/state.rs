@@ -32,7 +32,9 @@ pub enum RunState {
 }
 
 impl RunState {
-    fn parse(s: &str) -> Option<Self> {
+    /// Parse `running`, `paused` or `stopped`; `None` for anything else.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "running" => Some(Self::Running),
             "paused" => Some(Self::Paused),

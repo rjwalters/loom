@@ -1515,6 +1515,57 @@ Prints the host's desired run state: its `hosts.<H>` entry if it sets
 that decided it. A state other than `running`/`paused`/`stopped`, or no state
 at all, is an error. Report only — the daemon does not enforce it yet.
 
+### `fleet-config propose <state|priority|adopt>` (#9599)
+
+Every other sub-verb above only reads the store. `propose` is the one place
+`fleet-config` writes to it — and it never writes directly: each sub-verb
+edits a fresh fetch of the relevant store file in memory, then opens a
+**branch + PR** (never a direct push) carrying that one change and the hidden
+`<!-- loom:provenance v1 … -->` marker every Loom-authored PR body carries
+(`loom-daemon/src/provenance`), with `base=` the store commit it branched
+from. Merges stay the operator's, per the store's own branch policy — this command
+has no auto-merge path, and it never touches `repos.yml`'s `fleet`/`firewall`
+flags. `--dry-run` prints the diff and stops before opening anything.
+
+Every edit is **format-preserving**: it patches only the lines the change
+requires (a small line-oriented editor, not a YAML re-serialize), so a
+reviewer's diff is exactly that change — comments, ordering and unrelated
+records in `repos.yml` / `fleet/state.yml` are untouched.
+
+- **`propose state <running|paused|stopped> [--host H] --reason … [--by WHO]
+  [--dry-run]`** — sets `fleet/state.yml`'s `hosts.<H>.state` (or, with no
+  `--host`, the top-level `fleet.state` default), always (re)writing
+  `since`/`by`; `reason` is required. Creates `hosts:` and/or the host's own
+  entry when either is missing; editing the fleet default requires that
+  block to already exist. `--by` defaults to this host's identity.
+- **`propose priority <repo> <priority> [--dry-run]`** — sets the named
+  `repos[]` record's `fleet_priority` in `repos.yml`, inserting the key if
+  the record does not have one yet. Every other key on that record, and
+  every other record, is untouched.
+- **`propose adopt [--host H] [--dry-run]`** — turns this host's `render
+  --check` drift into the store-side edit that would make it the new
+  rendered value: the host-local tier (`fleet/hosts/<H>/local.json`) is
+  adopted verbatim (including creating it when the store has never had one
+  for this host); the machine tier (`fleet/hosts/<H>/defaults.json`) is
+  patched leaf-by-leaf, so the host's other overrides survive untouched.
+  Exits with nothing to propose (and no PR) when the host has no drift.
+
+Any sub-verb whose edit came out a no-op — the store already says what it
+was asked to say — prints `nothing to propose` and exits 0 without opening
+anything, so a re-run is never an empty PR for someone to review. A failure
+partway through a submit leaves an inert `loom/fleet-propose/…` branch and
+no PR (the store's own ref is never touched); re-running takes a fresh,
+differently-stamped branch rather than resuming the broken one.
+
+**Credentials — the write half.** Every write call (`POST
+git/refs`/`PUT contents`/`POST pulls`) runs under the **writer App** only,
+never a reader (a reader is never granted write scope). This needs an
+explicit operator grant — `contents: write` and `pull_requests: write` on the
+store — beyond the read-only `contents: read` the rest of `fleet-config`
+needs; without it, a write fails with a clear error naming the missing
+scope, not a crash. Calls are counted in the forge-call stats as
+`fleet_store_write`.
+
 ## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)
 
 `loom-daemon sweep-experiment` already randomizes **per issue**, by parity
