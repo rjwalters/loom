@@ -2061,6 +2061,11 @@ jobs:
       # splitting the suite.
       - name: forge check-runs pagination + truncated-read settle guard (#8895, #8987, #8191)
         run: bash defaults/scripts/tests/test-forge-check-runs-pagination.sh
+      # Its #3664 pending-vs-failing assertions used to mirror the retired jq
+      # filters (passing against a copy); they now drive the real
+      # `merge-pr check-runs-rollup`, pinned the same way.
+      - name: merge-pr pending-vs-failing check-runs classification (#3664, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-unstable-fallback.sh
 
   native-port-daemon-lifecycle:
     name: Native Port Suites (daemon lifecycle, watchdog)
