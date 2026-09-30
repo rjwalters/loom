@@ -48,17 +48,21 @@ paired n=240 test. This document defines the units; it is not tuned prose.
   since 2026-08-15 (26,260 records; at its row cap and evicting; tracked by the fleet-telemetry retention-cap issue).
   Live SigNoz retains ~7 days and cannot support this.
 - **Filter (relaxed)**: landed PR, exactly one `judge` phase, no `doctor`
-  phase: 284 of 329 landings. The strict filter (`doctor_cycles = 0`, one
-  judge) is not yet applicable: `doctor_cycles` exists only since 2026-09-18
-  (119 kept) and per-phase data is #9443.
+  phase: 284 of 332 landings — measured 2026-09-30 (#9521); the exclusion
+  split is 42 on judge count, 6 on a doctor phase. The strict filter
+  (`doctor_cycles = 0`, one judge) kept 119; per-phase data is #9443.
 - **Caveats**: tokens on only ~10% of sweeps (#9440), ~19% of token values
   implausible (#9454), tokens per sweep not per phase (#9443), rework cause
   unrecorded (#9444).
-- **Status of the numbers**: the table is the tuning-set medians quoted in
-  #9430. They were **not re-extracted** by the query artifact
-  (`observability/story-points-queries.sql`); see
-  `observability/story-points-evidence.md` for what ran and what remains.
-  Bounds are provisional until SP4 is run against fitted params.
+- **Status of the numbers**: SP1/SP2 were executed 2026-09-30 against the D1
+  cache snapshot (see `observability/story-points-evidence.md`): the filter
+  accounting and the token medians are extracted, not quoted, and confirm the
+  table's tokens column within the CAL4 tolerance. The hand-written
+  lines/files columns could **not** be re-extracted — the #9466 emitters
+  postdate the snapshot — and the experiment's own bucket table contradicts
+  them at the top classes (non-monotonic, n ≤ 12), so the lines column stays
+  **provisional** pending CAL4 drift on the labeled population; SP4's even-n
+  median is verified aligned with SP2's.
 
 ## Revision history
 
