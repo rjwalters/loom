@@ -218,11 +218,17 @@ log_hasi() { grep -qi "$1" "$WDLOG" 2>/dev/null; }
 # substitution pipe (which would otherwise block the caller for the full sleep).
 sleeper() { sleep 60 >/dev/null 2>&1 & echo $!; }
 
-# A dead pid we own, already killed and synchronously reaped (used for the
-# "confirmed down" pid-file fixtures below). Sets $DEAD_PID and tracks it via
-# bg_proc_track for the EXIT/INT/TERM trap. The sleep must be OUR OWN child,
+# A dead pid we own, already exited and synchronously reaped (used for the
+# "confirmed down" pid-file fixtures below). Sets $DEAD_PID. No `kill` is
+# sent (#9562): on Linux the parent usually runs first after fork, so a kill
+# landed before the child exec'd `sleep`; the forked bash still had the
+# script's INT/TERM trap, caught the signal, then dropped the pending trap on
+# exec, so `sleep 60` ran to completion and `wait` blocked 60s per call. A
+# no-op child exits by itself — no lost-signal window. Not bg_proc_track'd:
+# it is already reaped, and tracking a reaped pid risks the EXIT trap killing
+# an unrelated process that later reuses it. The child must be OUR OWN,
 # not a $(sleeper) capture: inside a command substitution the subshell exits
-# immediately and orphans the sleep to PID 1, whose SIGCHLD reaping the
+# immediately and orphans the child to PID 1, whose SIGCHLD reaping the
 # watchdog tick below can RACE. An orphan killed there stays a zombie —
 # still answering `kill -0`, the watchdog's liveness signal, with a young
 # etime — until PID 1 gets around to reaping it. A tick that read the pid
@@ -232,14 +238,12 @@ sleeper() { sleep 60 >/dev/null 2>&1 & echo $!; }
 # That is precisely the "#6272 branch-3 skipped when repo-scoped exists"
 # pair of failures (expected rc=1, got rc=0 + zero filings) PR #9261's CI
 # hit once and a re-run of the same head did not: a fixture race, not a
-# behaviour change. As a real child, `wait` reaps the kill SYNCHRONOUSLY, so
+# behaviour change. As a real child, `wait` reaps it SYNCHRONOUSLY, so
 # the pid is gone from the process table before the pid file is written and
 # no tick can observe it alive.
 spawn_dead_pid() {
-    sleep 60 >/dev/null 2>&1 &
+    : &
     DEAD_PID=$!
-    bg_proc_track "$DEAD_PID"
-    kill "$DEAD_PID" 2>/dev/null
     wait "$DEAD_PID" 2>/dev/null
 }
 

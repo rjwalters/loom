@@ -89,11 +89,43 @@ mod report;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Best-effort physical path for comparison purposes. A path that does not
-/// exist is returned unchanged rather than dropped — containment checks still
-/// need something to compare.
-fn realish(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+/// Best-effort physical path for comparison purposes.
+///
+/// `canonicalize` fails outright when the leaf does not exist yet, which is
+/// the *common* case for the paths this module compares: both [`plan_reclaim`]
+/// and [`provision::provision_with`] weigh a derived target root against a
+/// worktree that already exists, and Cargo has not created that root yet.
+///
+/// Returning the RAW path in that case (what this did before #9194) left one
+/// side of a `starts_with` containment check resolved through a symlinked
+/// prefix — macOS resolves `/var` to `/private/var`, and every `tempfile`
+/// root plus many real worktree roots live under it — while the other side
+/// stayed unresolved. The check then missed and the caller silently took the
+/// wrong branch: an unredirected host was classified as needing provisioning,
+/// relocating a build cache for no benefit (the exact rebuild storm
+/// #6013/#6014 exist to prevent).
+///
+/// So: canonicalize the nearest EXISTING ancestor and re-append whatever tail
+/// did not exist. Both sides of every comparison then resolve through the same
+/// symlinks regardless of which one happens to already be on disk.
+pub(crate) fn realish(path: &Path) -> PathBuf {
+    if let Ok(real) = path.canonicalize() {
+        return real;
+    }
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut current = path;
+    while let Some(parent) = current.parent() {
+        tail.push(current.file_name().unwrap_or_default());
+        if let Ok(real) = parent.canonicalize() {
+            let mut out = real;
+            for part in tail.into_iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        current = parent;
+    }
+    path.to_path_buf()
 }
 
 /// Real (canonicalized) system roots that are exactly as shallow and shared

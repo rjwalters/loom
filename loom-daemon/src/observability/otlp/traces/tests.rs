@@ -38,6 +38,7 @@ fn trace_wire_has_hex_ids_and_preserves_parent_and_log_relationship() {
     let mut log = TelemetryEnvelope::new(
         "host",
         TelemetryRecord::SweepStarted(crate::telemetry::SweepStartedRecord {
+            story_points: None,
             repo: "test/fixture".into(),
             visibility: crate::telemetry::RepoVisibility::Private,
             issue: 18,

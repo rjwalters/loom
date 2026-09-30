@@ -325,6 +325,7 @@ mod tests {
         TelemetryEnvelope::new(
             host_id,
             TelemetryRecord::SweepOutcome(telemetry::SweepOutcomeRecord {
+                story_points: None,
                 repo: Some("rjwalters/loom".to_string()),
                 repo_unresolved: false,
                 visibility: telemetry::RepoVisibility::Public,
@@ -354,6 +355,16 @@ mod tests {
                 complexity: None,
                 tokens_status: None,
                 tokens_status_reason: None,
+                attempt_index: None,
+                previous_sweep_id: None,
+                trigger: None,
+                rework_events: None,
+                pr_numbers: None,
+                hw_lines_added: None,
+                hw_lines_deleted: None,
+                hw_files: None,
+                generated_lines: None,
+                test_lines: None,
             }),
         )
     }
@@ -374,6 +385,7 @@ mod tests {
             output: 300,
         }];
         let outcome = telemetry::SweepOutcomeRecord {
+            story_points: None,
             repo: Some("rjwalters/loom".to_string()),
             repo_unresolved: false,
             visibility: telemetry::RepoVisibility::Public,
@@ -403,6 +415,16 @@ mod tests {
             complexity: None,
             tokens_status: None,
             tokens_status_reason: None,
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
+            pr_numbers: None,
+            hw_lines_added: None,
+            hw_lines_deleted: None,
+            hw_files: None,
+            generated_lines: None,
+            test_lines: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));
@@ -425,6 +447,7 @@ mod tests {
     fn synthesize_completed_omits_tokens_by_model_when_the_outcome_has_none() {
         // No attributable transcript ⇒ absent, never a fabricated empty vec.
         let outcome = telemetry::SweepOutcomeRecord {
+            story_points: None,
             repo: Some("rjwalters/loom".to_string()),
             repo_unresolved: false,
             visibility: telemetry::RepoVisibility::Public,
@@ -454,6 +477,16 @@ mod tests {
             complexity: None,
             tokens_status: None,
             tokens_status_reason: None,
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
+            pr_numbers: None,
+            hw_lines_added: None,
+            hw_lines_deleted: None,
+            hw_files: None,
+            generated_lines: None,
+            test_lines: None,
         };
         let envelope =
             TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));

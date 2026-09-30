@@ -329,12 +329,12 @@ fn oldest_first(a: Option<&String>, b: Option<&String>) -> std::cmp::Ordering {
     }
 }
 
-/// The documented #3946/#9244 order, written out independently of
+/// The documented #3946/#9244 lane order, written out independently of
 /// `candidate_keys`: starred first; among starred, starred-at (else
-/// `createdAt`) oldest first; red-main fixes first; workspace priority asc;
-/// `createdAt` oldest first; number asc. A change to dispatch order must
-/// update both this and `candidate_keys` — which is the point.
-fn reference_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Ordering {
+/// `createdAt`) oldest first; red-main fixes first. The first three
+/// `candidate_keys` — and so `lane_cmp`, which is a slice of them — must
+/// match this exactly.
+fn reference_lane_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let starred_at =
         |c: &PriorityCandidate| c.operator_priority_at.clone().or(c.created_at.clone());
@@ -346,6 +346,14 @@ fn reference_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Orde
         },
     );
     lane.then(b.main_red_fix.cmp(&a.main_red_fix))
+}
+
+/// The documented #3946/#9244 order, written out independently of
+/// `candidate_keys`: [`reference_lane_cmp`]; workspace priority asc;
+/// `createdAt` oldest first; number asc. A change to dispatch order must
+/// update both this and `candidate_keys` — which is the point.
+fn reference_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Ordering {
+    reference_lane_cmp(a, b)
         .then(a.workspace_priority.cmp(&b.workspace_priority))
         .then(oldest_first(a.created_at.as_ref(), b.created_at.as_ref()))
         .then(a.number.cmp(&b.number))
@@ -386,7 +394,8 @@ fn candidate_domain() -> Vec<PriorityCandidate> {
 
 /// The property, exhaustively over every pair in the domain: the
 /// lexicographic compare of `candidate_keys` IS `candidate_cmp`, and both
-/// match the documented order; the first three keys are `lane_cmp`.
+/// match the documented order; the first three keys are `lane_cmp`, pinned
+/// against [`reference_lane_cmp`].
 #[test]
 fn candidate_keys_lexicographic_compare_is_candidate_cmp() {
     let domain = candidate_domain();
@@ -395,6 +404,11 @@ fn candidate_keys_lexicographic_compare_is_candidate_cmp() {
             let by_keys = ready_queue::candidate_keys(a).cmp(&ready_queue::candidate_keys(b));
             assert_eq!(by_keys, candidate_cmp(a, b), "{a:?} vs {b:?}");
             assert_eq!(by_keys, reference_cmp(a, b), "{a:?} vs {b:?}");
+            assert_eq!(
+                super::super::ordering::lane_cmp(a, b),
+                reference_lane_cmp(a, b),
+                "{a:?} vs {b:?}"
+            );
         }
     }
 }
