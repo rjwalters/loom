@@ -49,6 +49,8 @@ use super::suites::{self, ArtifactsPage};
 use super::{journal_path, log_capture_gate, state_dir, LogCaptureGate, ResolvedCiTelemetry};
 use crate::telemetry::TelemetryEnvelope;
 
+pub mod targeted;
+
 /// Everything a cycle needs, resolved up front (a seam for tests: `now`,
 /// `host_id`, and the lookback are injectable).
 #[derive(Debug, Clone)]
@@ -956,117 +958,15 @@ fn poll_repo(
             );
             continue;
         }
-        let run_key = UnitKey::run(full, run.id, run.run_attempt);
-        if ledger.is_seen(&run_key) {
-            continue;
-        }
-        let jobs: Vec<JobJson> =
-            paginate(api, jobs_path(full, run.id), &mut report.summary.requests, |body| {
-                serde_json::from_str::<JobsPage>(body).map(|p| p.jobs)
-            })?;
-        if jobs.iter().any(|job| !job.is_completed()) {
-            hold(
+        match record_run(ctx, api, ledger, journal, repo, run, stories.as_ref(), report)? {
+            RunOutcome::Seen | RunOutcome::Recorded => {}
+            RunOutcome::Held => hold(
                 run.created_at,
                 ctx.now,
                 ctx.rescan_window,
                 ctx.initial_lookback,
                 &mut oldest_incomplete,
-            );
-            continue;
-        }
-        let stitch = stories.as_ref().map(|stories| stories.decide(run));
-        let story = match &stitch {
-            Some(Stitch::Stitched(story)) => Some(story),
-            _ => None,
-        };
-        // #9089: suite spans are resolved BEFORE the commit so they ride in
-        // their job's own unit (see `suite_spans_for_run` on why, and on what
-        // a failure here costs). A rate limit or a dead credential still
-        // aborts the cycle; nothing else can stop the run from being emitted.
-        let mut suite_spans = suite_spans_for_run(ctx, api, ledger, repo, run, &jobs, report)?;
-        // Job units first, the run unit LAST: a torn commit can then only
-        // lose the run unit, leaving the run "unseen" so the next poll
-        // re-lists its jobs and commits exactly the missing ones.
-        // #9089: the zero point every job's `dependency_wait_ms` is measured
-        // from, taken once over the whole listing — a job resolved against a
-        // partial listing would read its own creation as the run's first and
-        // report no dependency wait at all. Per ATTEMPT, because `jobs_path` is
-        // `filter=all`: the listing carries a re-run's older attempts too, and
-        // one baseline across all of them would charge attempt 2 the whole
-        // inter-attempt gap as a `needs:` wait. `for_job` keys on
-        // `job.run_attempt`, the same per-job attempt `UnitKey::job` uses —
-        // not `run.run_attempt`, which is only the newest.
-        let baselines = JobCreationBaselines::of_listing(&jobs);
-        let mut drafts: Vec<UnitDraft> = jobs
-            .iter()
-            .map(|job| {
-                let mut envelopes =
-                    job_envelopes(repo, run, job, baselines.for_job(job), &ctx.host_id);
-                if let Some(story) = story {
-                    story::stitch_job(&mut envelopes, story, run, job);
-                }
-                // Appended after stitching so the story pass never sees (and
-                // never copies) a suite span into the story trace: a story
-                // trace is a per-issue summary, and one leg's ~118 suite
-                // spans would swamp it.
-                if let Some(spans) = suite_spans.remove(&job.id) {
-                    envelopes.extend(spans);
-                }
-                UnitDraft {
-                    key: UnitKey::job(full, run.id, job.id, job.run_attempt),
-                    envelopes,
-                }
-            })
-            .filter(|draft| !ledger.is_seen(&draft.key))
-            .collect();
-        let mut run_unit = run_envelopes(repo, run, &ctx.host_id);
-        if let Some(story) = story {
-            story::stitch_run(&mut run_unit, story, run);
-        }
-        drafts.push(UnitDraft {
-            key: run_key,
-            envelopes: run_unit,
-        });
-        let committed = ledger.commit(drafts)?;
-        emit(ledger, journal, &committed)?;
-        for unit in &committed {
-            if unit.key.job_id.is_some() {
-                report.summary.jobs_emitted += 1;
-            } else {
-                report.summary.runs_emitted += 1;
-                if let Some(stitch) = &stitch {
-                    count_stitch(&mut report.summary, full, run, stitch);
-                }
-            }
-        }
-        // #8825: record which jobs' logs are wanted, durably, right after the
-        // records land. The download itself happens in this cycle's log pass
-        // (or a later cycle's), driven off the ledger rather than off this
-        // listing — once the run unit is committed the run is "seen" and its
-        // jobs are never listed again, so a retry has nowhere else to come
-        // from.
-        if ctx.captures_logs(repo) {
-            let wanted: Vec<LogTarget> = jobs
-                .iter()
-                .filter(|job| {
-                    committed
-                        .iter()
-                        .any(|unit| unit.key.job_id == Some(job.id) && !unit.key.logs)
-                })
-                .map(|job| LogTarget {
-                    repo: full.to_string(),
-                    visibility: repo.visibility(),
-                    run_id: run.id,
-                    job_id: job.id,
-                    attempt: job.run_attempt,
-                    workflow: run.workflow(),
-                    job: job.name.clone(),
-                    completed_at: job
-                        .completed_at
-                        .unwrap_or(job.started_at.unwrap_or(run.created_at)),
-                })
-                .collect();
-            ledger.want_logs(&wanted)?;
+            ),
         }
     }
     // `.max(watermark)` keeps the watermark monotonic: the rescan window can
@@ -1074,6 +974,142 @@ fn poll_repo(
     // regressing watermark would re-walk history every cycle.
     ledger.set_watermark(full, oldest_incomplete.unwrap_or(newest).max(watermark))?;
     Ok(())
+}
+
+/// What [`record_run`] did with one completed run attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    /// Already in the ledger — nothing requested, nothing emitted.
+    Seen,
+    /// A job is still unfinished; the caller decides whether to hold.
+    Held,
+    /// Committed and emitted (possibly only the units that were missing).
+    Recorded,
+}
+
+/// Record one **completed** run attempt: list its jobs, resolve suite spans
+/// and story stitching, commit job units then the run unit, emit, and record
+/// the wanted job logs. Shared by the repo sweep ([`poll_repo`]) and the
+/// feed-driven single-run path ([`targeted`], #9201) so the two can never
+/// record a run differently. Never touches the watermark — that is the
+/// sweep's alone.
+#[allow(clippy::too_many_arguments)]
+fn record_run(
+    ctx: &CycleContext<'_>,
+    api: &dyn GithubApi,
+    ledger: &mut Ledger,
+    journal: &Journal,
+    repo: &RepoJson,
+    run: &RunJson,
+    stories: Option<&RepoStories>,
+    report: &mut CycleReport,
+) -> Result<RunOutcome, RepoError> {
+    let full = repo.full_name.as_str();
+    let run_key = UnitKey::run(full, run.id, run.run_attempt);
+    if ledger.is_seen(&run_key) {
+        return Ok(RunOutcome::Seen);
+    }
+    let jobs: Vec<JobJson> =
+        paginate(api, jobs_path(full, run.id), &mut report.summary.requests, |body| {
+            serde_json::from_str::<JobsPage>(body).map(|p| p.jobs)
+        })?;
+    if jobs.iter().any(|job| !job.is_completed()) {
+        return Ok(RunOutcome::Held);
+    }
+    let stitch = stories.map(|stories| stories.decide(run));
+    let story = match &stitch {
+        Some(Stitch::Stitched(story)) => Some(story),
+        _ => None,
+    };
+    // #9089: suite spans are resolved BEFORE the commit so they ride in
+    // their job's own unit (see `suite_spans_for_run` on why, and on what
+    // a failure here costs). A rate limit or a dead credential still
+    // aborts the cycle; nothing else can stop the run from being emitted.
+    let mut suite_spans = suite_spans_for_run(ctx, api, ledger, repo, run, &jobs, report)?;
+    // Job units first, the run unit LAST: a torn commit can then only
+    // lose the run unit, leaving the run "unseen" so the next poll
+    // re-lists its jobs and commits exactly the missing ones.
+    // #9089: the zero point every job's `dependency_wait_ms` is measured
+    // from, taken once over the whole listing — a job resolved against a
+    // partial listing would read its own creation as the run's first and
+    // report no dependency wait at all. Per ATTEMPT, because `jobs_path` is
+    // `filter=all`: the listing carries a re-run's older attempts too, and
+    // one baseline across all of them would charge attempt 2 the whole
+    // inter-attempt gap as a `needs:` wait. `for_job` keys on
+    // `job.run_attempt`, the same per-job attempt `UnitKey::job` uses —
+    // not `run.run_attempt`, which is only the newest.
+    let baselines = JobCreationBaselines::of_listing(&jobs);
+    let mut drafts: Vec<UnitDraft> = jobs
+        .iter()
+        .map(|job| {
+            let mut envelopes = job_envelopes(repo, run, job, baselines.for_job(job), &ctx.host_id);
+            if let Some(story) = story {
+                story::stitch_job(&mut envelopes, story, run, job);
+            }
+            // Appended after stitching so the story pass never sees (and
+            // never copies) a suite span into the story trace: a story
+            // trace is a per-issue summary, and one leg's ~118 suite
+            // spans would swamp it.
+            if let Some(spans) = suite_spans.remove(&job.id) {
+                envelopes.extend(spans);
+            }
+            UnitDraft {
+                key: UnitKey::job(full, run.id, job.id, job.run_attempt),
+                envelopes,
+            }
+        })
+        .filter(|draft| !ledger.is_seen(&draft.key))
+        .collect();
+    let mut run_unit = run_envelopes(repo, run, &ctx.host_id);
+    if let Some(story) = story {
+        story::stitch_run(&mut run_unit, story, run);
+    }
+    drafts.push(UnitDraft {
+        key: run_key,
+        envelopes: run_unit,
+    });
+    let committed = ledger.commit(drafts)?;
+    emit(ledger, journal, &committed)?;
+    for unit in &committed {
+        if unit.key.job_id.is_some() {
+            report.summary.jobs_emitted += 1;
+        } else {
+            report.summary.runs_emitted += 1;
+            if let Some(stitch) = &stitch {
+                count_stitch(&mut report.summary, full, run, stitch);
+            }
+        }
+    }
+    // #8825: record which jobs' logs are wanted, durably, right after the
+    // records land. The download itself happens in this cycle's log pass
+    // (or a later cycle's), driven off the ledger rather than off this
+    // listing — once the run unit is committed the run is "seen" and its
+    // jobs are never listed again, so a retry has nowhere else to come
+    // from.
+    if ctx.captures_logs(repo) {
+        let wanted: Vec<LogTarget> = jobs
+            .iter()
+            .filter(|job| {
+                committed
+                    .iter()
+                    .any(|unit| unit.key.job_id == Some(job.id) && !unit.key.logs)
+            })
+            .map(|job| LogTarget {
+                repo: full.to_string(),
+                visibility: repo.visibility(),
+                run_id: run.id,
+                job_id: job.id,
+                attempt: job.run_attempt,
+                workflow: run.workflow(),
+                job: job.name.clone(),
+                completed_at: job
+                    .completed_at
+                    .unwrap_or(job.started_at.unwrap_or(run.created_at)),
+            })
+            .collect();
+        ledger.want_logs(&wanted)?;
+    }
+    Ok(RunOutcome::Recorded)
 }
 
 /// Count (and log) one emitted run's story decision (#9088). A run that is

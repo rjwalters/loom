@@ -605,6 +605,21 @@ fn the_bus_payload_is_routing_hints_only() {
     assert!(!rendered.contains("rjwalters/loom"), "{rendered}");
 }
 
+/// #9201: a finished `workflow_run` event adds its `(repo, run_id)`
+/// invalidation key — and nothing else from the event — under `runs`.
+#[test]
+fn a_workflow_run_page_carries_run_invalidation_keys_only() {
+    let events = vec![
+        serde_json::json!({"seq": 3, "type": "workflow_run", "action": "completed",
+                           "repo": "rjwalters/loom", "run_id": 77, "title": "secret"}),
+        serde_json::json!({"seq": 4, "type": "workflow_run", "action": "requested",
+                           "repo": "rjwalters/loom", "run_id": 78}),
+    ];
+    let payload = page_payload("mac-studio", &events);
+    assert_eq!(payload["runs"], serde_json::json!([{"repo": "rjwalters/loom", "run_id": 77}]));
+    assert!(!payload.to_string().contains("secret"));
+}
+
 // ============================================================================
 // poll_once — one poll's whole effect
 // ============================================================================

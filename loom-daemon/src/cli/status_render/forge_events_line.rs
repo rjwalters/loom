@@ -55,6 +55,15 @@ fn render_wakes(s: &ForgeEventsStatus) -> Vec<String> {
 /// nothing arrived" and "not armed" are different answers, and distinguishing
 /// them is the whole point of the surface.
 fn wake_line(w: &ForgeEventsWakeStatus) -> String {
+    // The CI telemetry run consumer (#9201) is not an early ticker: it has no
+    // spacing floor and no multiplier, so its counters mean something else.
+    if w.config_key == loom_daemon::forge_events::wake::CI_TELEMETRY_RUNS.config_key {
+        return format!(
+            "Forge event wakes: {} (forgeEvents.events.{}) — {} prompt(s) → {} targeted \
+             batch(es), {} run key(s) dropped; correction-floor sweep cadence {}s",
+            w.consumer, w.config_key, w.prompts, w.early_ticks, w.throttled, w.cadence_secs
+        );
+    }
     format!(
         "Forge event wakes: {} (forgeEvents.events.{}) — {} prompt(s) → {} early tick(s), {} \
          throttled by the {}s floor; cadence {}s, ceiling {}x",
