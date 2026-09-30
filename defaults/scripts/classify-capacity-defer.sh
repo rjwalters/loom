@@ -232,6 +232,7 @@ _resolve_repo() {
 # numeric id is fetched separately, uncached, ONLY when --apply needs to
 # PATCH. Both paths then filter through `loom-daemon forge trusted-comments`;
 # a listing the filter cannot authenticate yields nothing (stderr says so).
+# requires-daemon: forge optional   Without the `trusted-comments` verb (absent binary, or one predating #9548) no author can be verified, so every capacity-defer marker reads as ABSENT and the issue is not deferred (stderr says so) -- the safe direction: one un-deferred sweep, never an attacker-driven deferral.
 _get_comments() {
     local raw filtered
     if [[ -n "$COMMENTS_FILE" ]]; then

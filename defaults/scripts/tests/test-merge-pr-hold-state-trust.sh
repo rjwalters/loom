@@ -103,10 +103,14 @@ chmod +x "$STUB_DIR/gh"
 export PATH="$STUB_DIR:$PATH"
 
 # --- The extracted function's environment -----------------------------------
-FORGE_TYPE="github"
-REPO_NWO="o/r"
-PR_NUMBER="9"
-PR_HEAD_SHA="abc1234"
+# Read by the extracted functions sourced below, which shellcheck cannot see.
+# shellcheck disable=SC2034
+{
+    FORGE_TYPE="github"
+    REPO_NWO="o/r"
+    PR_NUMBER="9"
+    PR_HEAD_SHA="abc1234"
+}
 WARNINGS=""
 warning() { WARNINGS+="$1"$'\n'; }
 
