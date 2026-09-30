@@ -433,4 +433,129 @@ fn plan_report_counts_groups_without_writing() {
     assert!(r.groups.is_empty());
     assert_eq!(r.already_planned, 0);
     assert_eq!(r.holders, 0);
+    assert_eq!(r.skipped_held, 0);
+}
+
+// --- Judge-requested coverage (re-review of #9707) ----------------------
+
+#[test]
+fn a_three_node_cycle_skips_the_component() {
+    // 1→2→3→1 via manual markers. Kahn's detection is general; this pins
+    // that a cycle longer than the trivial 2-cycle is also skipped whole.
+    let prs = [
+        pr(1, "2026-01-01T00:00:00Z"),
+        pr(2, "2026-01-02T00:00:00Z"),
+        pr(3, "2026-01-03T00:00:00Z"),
+    ];
+    let f = files(&[(1, &["s.rs"]), (2, &["s.rs"]), (3, &["s.rs"])]);
+    let mut markers = NO_MARKERS;
+    for (follower, after) in [(1, 2), (2, 3), (3, 1)] {
+        markers.insert(
+            follower,
+            SequenceMarker {
+                after,
+                pred_head: format!("{:040x}", after),
+                follower_head: format!("{:040x}", follower),
+                plan: "manual".into(),
+                source: None,
+            },
+        );
+    }
+    assert!(plan_repo(&prs, &f, &markers).is_empty(), "3-cycle ⇒ no plan");
+}
+
+#[test]
+fn a_diamond_orders_both_paths_without_dropping_a_member() {
+    // 4 depends on 2 AND 3; both depend on 1. Every member placed exactly
+    // once, 4 last, 1 first — the two middle members in age order.
+    let prs = [
+        pr(1, "2026-01-01T00:00:00Z"),
+        pr(2, "2026-01-02T00:00:00Z"),
+        pr(3, "2026-01-03T00:00:00Z"),
+        pr(4, "2026-01-04T00:00:00Z"),
+    ];
+    let f = files(&[
+        (1, &["s.rs"]),
+        (2, &["s.rs"]),
+        (3, &["s.rs"]),
+        (4, &["s.rs"]),
+    ]);
+    let mut markers = NO_MARKERS;
+    for (follower, after) in [(2, 1), (3, 1), (4, 2), (4, 3)] {
+        markers.insert(
+            follower,
+            SequenceMarker {
+                after,
+                pred_head: format!("{:040x}", after),
+                follower_head: format!("{:040x}", follower),
+                plan: "manual".into(),
+                source: None,
+            },
+        );
+    }
+    let groups = plan_repo(&prs, &f, &markers);
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    let g = &groups[0];
+    assert_eq!(g.order.first(), Some(&1));
+    assert_eq!(g.order.last(), Some(&4));
+    assert_eq!(g.order.len(), 4, "every member placed: {:?}", g.order);
+    // Edges are a CHAIN over the placed order (4 has one predecessor, not two).
+    assert_eq!(g.edges.len(), 3);
+}
+
+#[test]
+fn a_follower_marker_disagreeing_with_age_order_wins() {
+    // Without the marker, ages put #2 before #1. The trusted marker says
+    // #2 lands AFTER #1 — the constraint beats the age default.
+    let prs = [pr(1, "2026-01-02T00:00:00Z"), pr(2, "2026-01-01T00:00:00Z")];
+    let third = pr(3, "2026-01-03T00:00:00Z");
+    let prs = [prs[0].clone(), prs[1].clone(), third];
+    let f = files(&[(1, &["s.rs"]), (2, &["s.rs"]), (3, &["other.rs"])]);
+    let mut markers = NO_MARKERS;
+    markers.insert(
+        2,
+        SequenceMarker {
+            after: 1,
+            pred_head: format!("{:040x}", 1),
+            follower_head: format!("{:040x}", 2),
+            plan: "manual".into(),
+            source: None,
+        },
+    );
+    let groups = plan_repo(&prs, &f, &markers);
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    assert_eq!(groups[0].order, vec![1, 2], "the marker overrides age order");
+}
+
+#[test]
+fn a_new_pr_chains_behind_a_held_predecessor() {
+    // The Phase-2 membership fix (Judge re-review of #9707): #1 is already
+    // held (loom:sequenced with a plan marker), #2 arrives later touching
+    // the same files. #2 must be planned AFTER #1 — the hold's existence
+    // must not make the overlap invisible for the life of the hold.
+    let mut held = pr(1, "2026-01-01T00:00:00Z");
+    held.labels.push(SEQUENCE_LABEL.to_string());
+    let fresh = pr(2, "2026-01-05T00:00:00Z");
+    let prs = [held.clone(), fresh, pr(3, "2026-01-03T00:00:00Z")];
+    let f = files(&[(1, &["s.rs"]), (2, &["s.rs"]), (3, &["other.rs"])]);
+    let mut markers = NO_MARKERS;
+    markers.insert(
+        1,
+        SequenceMarker {
+            after: 99,
+            pred_head: format!("{:040x}", 99),
+            follower_head: format!("{:040x}", 1),
+            plan: "seq-old".into(),
+            source: Some("pass".into()),
+        },
+    );
+    let groups = plan_repo(&prs, &f, &markers);
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    let g = &groups[0];
+    // The held #1 participates in the order (its marker points out-of-group,
+    // which order_component ignores; it is still a group member and lands
+    // first by age), and the fresh #2 is planned after it.
+    assert_eq!(g.order, vec![1, 2], "{g:?}");
+    assert_eq!(g.edges.len(), 1);
+    assert_eq!((g.edges[0].follower, g.edges[0].after), (2, 1));
 }

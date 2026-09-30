@@ -806,6 +806,11 @@ pub struct PlanReport {
     /// Edges already satisfied by an identical marker — no write would occur.
     pub already_planned: usize,
     pub holders: usize,
+    /// Edges suppressed because the follower already carries an ordering
+    /// state (trusted marker or hold label) — reported so the dry-run's
+    /// "what would the pass write" matches the live pass edge for edge
+    /// (Judge re-review of #9707).
+    pub skipped_held: usize,
 }
 
 /// Compute the plan report without writing anything.
@@ -825,7 +830,12 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
         .iter()
         .filter(|p| p.eligible_for_ordering() && p.pinnable())
         .collect();
-    report.holders = eligible.iter().filter(|p| p.has(SEQUENCE_LABEL)).count();
+    let holder_numbers: BTreeSet<u32> = eligible
+        .iter()
+        .filter(|p| p.has(SEQUENCE_LABEL))
+        .map(|p| p.number)
+        .collect();
+    report.holders = holder_numbers.len();
     let mut files: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
     for pr in &eligible {
         if let Some(f) = changed_files(gh_bin, root, pr.number) {
@@ -834,6 +844,15 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     }
     let markers = fetch_markers(gh_bin, root, &eligible);
     report.groups = plan_repo(&open, &files, &markers);
+    for g in &mut report.groups {
+        g.edges.retain(|e| {
+            if markers.contains_key(&e.follower) || holder_numbers.contains(&e.follower) {
+                report.skipped_held += 1;
+                return false;
+            }
+            true
+        });
+    }
     for g in &report.groups {
         for e in &g.edges {
             if markers
@@ -859,10 +878,38 @@ fn release_hold(gh_bin: &Path, root: &Path, number: u32, body: &str) -> Result<(
     Ok(())
 }
 
-/// Apply one planned edge: label + marker comment, idempotent. Returns
-/// `Ok(false)` when nothing was written because the exact marker already
-/// exists (identical plan, identical pins) — the repeated-comment guard that
-/// makes competing daemons converge.
+/// Does the PR carry the sequencing label right now? Live read — the label
+/// and the marker are checked independently so a partial write is healed
+/// per-side on the next tick.
+fn has_sequence_label(gh_bin: &Path, root: &Path, number: u32) -> Result<bool> {
+    let stdout = gh_pr(
+        gh_bin,
+        root,
+        &[
+            "view",
+            &number.to_string(),
+            "--json",
+            "labels",
+            "--jq",
+            ".labels[].name",
+        ],
+    )?;
+    let text = String::from_utf8_lossy(&stdout);
+    Ok(text.lines().any(|l| l.trim() == SEQUENCE_LABEL))
+}
+
+/// Apply one planned edge: marker comment + label, idempotent PER SIDE.
+/// Returns `Ok(false)` only when both sides already agree — the convergence
+/// guard that makes competing daemons settle without duplicate comments.
+///
+/// ORDER IS THE SAFETY PROPERTY (Judge re-review of #9707): the marker
+/// comment goes FIRST, the label second. A label without a marker is the one
+/// unrecoverable shape — Phase 1 reads "label, no marker" as a manual hold
+/// no pass owns releasing — so the write order must never create it. The
+/// inverse partial failure (marker posted, label write fails) leaves the PR
+/// un-gated for at most one tick and is healed here on the next run: each
+/// side is checked independently, so the follow-up adds the missing label
+/// without re-posting the comment.
 fn apply_edge(
     gh_bin: &Path,
     root: &Path,
@@ -872,13 +919,19 @@ fn apply_edge(
     let bin = gh_bin.to_string_lossy().to_string();
     let bodies =
         fetch_trusted_bodies(&bin, root, "{owner}/{repo}", edge.follower).unwrap_or_default();
-    if bodies.iter().any(|b| b.contains(&marker_text(marker))) {
+    let marker_present = bodies.iter().any(|b| b.contains(&marker_text(marker)));
+    let label_present = has_sequence_label(gh_bin, root, edge.follower)?;
+    if marker_present && label_present {
         return Ok(false);
     }
     let n = edge.follower.to_string();
-    gh_pr(gh_bin, root, &["edit", &n, "--add-label", SEQUENCE_LABEL])?;
-    let body = apply_comment_body(marker, edge.reason);
-    gh_pr(gh_bin, root, &["comment", &n, "--body", &body])?;
+    if !marker_present {
+        let body = apply_comment_body(marker, edge.reason);
+        gh_pr(gh_bin, root, &["comment", &n, "--body", &body])?;
+    }
+    if !label_present {
+        gh_pr(gh_bin, root, &["edit", &n, "--add-label", SEQUENCE_LABEL])?;
+    }
     Ok(true)
 }
 
@@ -976,16 +1029,17 @@ pub fn reconcile_merge_sequences(gh_bin: &Path, root: &Path) -> MergeSequenceSta
         }
     }
 
-    // Phase 2: plan the unmarked eligible set. Holders — including ones this
-    // tick just voided — are re-planned NEXT tick, from a fresh listing, so
-    // a void can never be immediately replaced by a plan built from the same
-    // stale read that voided it.
+    // Phase 2: plan the eligible set INCLUDING existing holders (Judge
+    // re-review of #9707): a new PR overlapping a held predecessor must be
+    // chained behind it, not treated as unrelated for the life of the hold.
+    // Holders never receive NEW edges — their holds are Phase 1's to
+    // release or void — and a hold voided this tick is re-planned NEXT tick
+    // from a fresh listing, so a void can never be replaced by a plan built
+    // from the same stale read that voided it.
     let holder_numbers: BTreeSet<u32> = holders.iter().map(|h| h.number).collect();
     let eligible: Vec<&SequencePr> = open
         .iter()
-        .filter(|p| {
-            p.eligible_for_ordering() && p.pinnable() && !holder_numbers.contains(&p.number)
-        })
+        .filter(|p| p.eligible_for_ordering() && p.pinnable())
         .collect();
     if eligible.len() < 2 {
         return stats;
@@ -1000,6 +1054,13 @@ pub fn reconcile_merge_sequences(gh_bin: &Path, root: &Path) -> MergeSequenceSta
     for group in plan_repo(&open, &files, &markers) {
         stats.groups += 1;
         for edge in group.edges {
+            // Never re-plan a follower that already carries an ordering
+            // state: a trusted marker (any author — a manual marker without
+            // a label is still someone's stated order) or a hold label
+            // present at tick start.
+            if markers.contains_key(&edge.follower) || holder_numbers.contains(&edge.follower) {
+                continue;
+            }
             let marker = edge_marker(&edge);
             match apply_edge(gh_bin, root, &edge, &marker) {
                 Ok(true) => {
