@@ -19,10 +19,10 @@ use tokio::net::UnixListener;
 /// whatever repos happen to be registered on the machine running the
 /// tests) fail silently. Every `run_sink` test holds one of these for its
 /// duration; `Drop` restores the ambient (unset) env regardless of panic.
-struct SafehouseTestPaths;
+pub(super) struct SafehouseTestPaths;
 
 impl SafehouseTestPaths {
-    fn set(dir: &std::path::Path) -> Self {
+    pub(super) fn set(dir: &std::path::Path) -> Self {
         std::env::set_var(COMPLETIONS_PATH_ENV, dir.join("safehouse-completed.json"));
         std::env::set_var(
             crate::workspace_registry::REGISTRY_PATH_ENV,
@@ -3973,7 +3973,7 @@ async fn run_sink_narrates_only_the_ack_when_nothing_merged() {
 /// Minimal stub safehoused: accept one connection, read the `hello`, reply
 /// `{"ok":true}`, then for each `send` optionally emit an interleaved push
 /// line (no id) before the id-echoed reply. Returns received `send` bodies.
-async fn stub_server(
+pub(super) async fn stub_server(
     listener: UnixListener,
     interleave_push: bool,
     expected_sends: usize,

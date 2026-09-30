@@ -211,6 +211,7 @@ pub fn repo_input(slug: &str) -> RepoInput {
         slug: slug.to_string(),
         tick_rows: Vec::new(),
         pool: None,
+        web_base: crate::star_liveness::task::DEFAULT_WEB_BASE.to_string(),
     }
 }
 
@@ -225,6 +226,9 @@ pub fn settings() -> Settings {
 pub struct Host {
     pub id: String,
     pub state: LivenessState,
+    /// Every fleet-comms notice this host's passes produced (#9321), in order
+    /// — the test-side stand-in for the event-bus publish `task::spawn` does.
+    pub notices: Vec<crate::star_liveness::escalate::Notice>,
 }
 
 impl Host {
@@ -232,7 +236,19 @@ impl Host {
         Self {
             id: id.to_string(),
             state: LivenessState::default(),
+            notices: Vec::new(),
         }
+    }
+
+    /// Simulate a daemon restart: the process-lifetime ledger is gone, the
+    /// forge (the `World`) is not.
+    pub fn restart(&mut self) {
+        self.state = LivenessState::default();
+    }
+
+    /// The bus events this host's notices would publish (#9321).
+    pub fn events(&self) -> Vec<crate::types::Event> {
+        self.notices.iter().map(|n| n.to_event(&self.id)).collect()
     }
 
     pub fn pass(
@@ -255,8 +271,11 @@ impl Host {
     ) -> StarLivenessReport {
         let w = world.clone();
         let mut factory = move |_root: &Path, slug: &str| w.forge(slug);
-        self.state
-            .run_pass(repos, intents, settings, &self.id, now, &mut factory)
+        let report = self
+            .state
+            .run_pass(repos, intents, settings, &self.id, now, &mut factory);
+        self.notices.extend(self.state.take_notices());
+        report
     }
 }
 
