@@ -37,6 +37,12 @@ fn comp(number: u32, head: &str, files: &[&str]) -> ComponentState {
 const H1: &str = "a111111111111111111111111111111111111111";
 const H2: &str = "b222222222222222222222222222222222222222";
 
+/// The component with the `loom:sequenced` hold label on it.
+fn sequenced(mut c: ComponentState) -> ComponentState {
+    c.labels.push(SEQUENCE_LABEL.to_string());
+    c
+}
+
 fn clean_markers() -> std::collections::BTreeMap<u32, SequenceMarker> {
     std::collections::BTreeMap::new()
 }
@@ -189,7 +195,10 @@ fn path_disjointness_never_qualifies() {
 
 #[test]
 fn a_competing_consolidation_reservation_rejects() {
-    let group = [comp(1, H1, &["shared.rs"]), comp(2, H2, &["shared.rs"])];
+    let group = [
+        sequenced(comp(1, H1, &["shared.rs"])),
+        comp(2, H2, &["shared.rs"]),
+    ];
     let mut markers = clean_markers();
     markers.insert(
         1,
@@ -220,7 +229,10 @@ fn a_competing_consolidation_reservation_rejects() {
 
 #[test]
 fn an_out_of_group_ordering_predecessor_rejects_but_an_in_group_one_does_not() {
-    let group = [comp(1, H1, &["shared.rs"]), comp(2, H2, &["shared.rs"])];
+    let group = [
+        comp(1, H1, &["shared.rs"]),
+        sequenced(comp(2, H2, &["shared.rs"])),
+    ];
     let mut markers = clean_markers();
     // #2 sequenced after #7 — outside the group ⇒ E7 failure.
     markers.insert(
@@ -554,4 +566,134 @@ fn the_reservation_comment_tells_the_source_what_will_happen() {
     let release = reservation_release_body(&m, "cons-ab12cd34");
     assert!(release.contains("loom:sequence released"), "{release}");
     assert!(release.contains("aborted"), "{release}");
+}
+
+// --- Abort → re-consolidation (Judge finding on #9744) --------------------
+
+fn reservation_on(source: &ComponentState, attempt: &str) -> SequenceMarker {
+    reservation_marker(99, H1, source, attempt)
+}
+
+fn default_bounds() -> Bounds {
+    Bounds {
+        max_components: 4,
+        max_diff_lines: 800,
+    }
+}
+
+#[test]
+fn the_release_marker_is_not_a_sequence_marker() {
+    // It must never parse as a hold — and on its own it would never supersede
+    // one, which is why eligibility needs `live_marker`.
+    let source = comp(12, H2, &[]);
+    let m = reservation_on(&source, "cons-ab12cd34");
+    let release = reservation_release_body(&m, "cons-ab12cd34");
+    assert_eq!(crate::merge_pr::sequence::parse(&[release]), None);
+}
+
+#[test]
+fn a_live_reservation_is_seen() {
+    let source = sequenced(comp(12, H2, &["shared.rs"]));
+    let m = reservation_on(&source, "cons-ab12cd34");
+    let bodies = vec![reservation_comment_body(&m, "cons-ab12cd34")];
+    assert_eq!(live_marker(&source, &bodies), Some(m));
+}
+
+#[test]
+fn an_aborted_reservation_is_not_live_once_the_label_is_gone() {
+    // Abort removes the label and posts the release comment. Either signal
+    // alone retires the marker; this is the label half.
+    let source = comp(12, H2, &["shared.rs"]); // no loom:sequenced
+    let m = reservation_on(&source, "cons-ab12cd34");
+    let bodies = vec![reservation_comment_body(&m, "cons-ab12cd34")];
+    assert_eq!(live_marker(&source, &bodies), None);
+}
+
+#[test]
+fn a_newer_release_marker_retires_the_reservation_even_if_the_label_lingers() {
+    let source = sequenced(comp(12, H2, &["shared.rs"]));
+    let m = reservation_on(&source, "cons-ab12cd34");
+    let bodies = vec![
+        reservation_comment_body(&m, "cons-ab12cd34"),
+        reservation_release_body(&m, "cons-ab12cd34"),
+    ];
+    assert_eq!(live_marker(&source, &bodies), None);
+}
+
+#[test]
+fn a_release_for_a_different_attempt_does_not_retire_this_one() {
+    let source = sequenced(comp(12, H2, &["shared.rs"]));
+    let old = reservation_on(&source, "cons-00000000");
+    let current = reservation_on(&source, "cons-ab12cd34");
+    let bodies = vec![
+        reservation_comment_body(&current, "cons-ab12cd34"),
+        reservation_release_body(&old, "cons-00000000"),
+    ];
+    assert_eq!(live_marker(&source, &bodies), Some(current));
+}
+
+#[test]
+fn a_reservation_made_after_a_release_is_live_again() {
+    let source = sequenced(comp(12, H2, &["shared.rs"]));
+    let first = reservation_on(&source, "cons-00000000");
+    let second = reservation_on(&source, "cons-ab12cd34");
+    let bodies = vec![
+        reservation_comment_body(&first, "cons-00000000"),
+        reservation_release_body(&first, "cons-00000000"),
+        reservation_comment_body(&second, "cons-ab12cd34"),
+    ];
+    assert_eq!(live_marker(&source, &bodies), Some(second));
+}
+
+#[test]
+fn a_source_from_an_aborted_attempt_is_eligible_again() {
+    // The end-to-end shape of the Judge's finding: #1 was a source of an
+    // aborted attempt. Its transcript still carries the reservation marker,
+    // then the release comment; abort removed the label.
+    let aborted = "cons-deadbeef";
+    let one = comp(1, H1, &["shared.rs"]);
+    let two = comp(2, H2, &["shared.rs"]);
+    let reservation = reservation_on(&one, aborted);
+    let bodies = vec![
+        reservation_comment_body(&reservation, aborted),
+        reservation_release_body(&reservation, aborted),
+    ];
+
+    let mut markers = clean_markers();
+    if let Some(m) = live_marker(&one, &bodies) {
+        markers.insert(1, m);
+    }
+    let failures = check_eligibility(
+        &[one.clone(), two.clone()],
+        &markers,
+        "main",
+        "reason",
+        &default_bounds(),
+    );
+    assert!(failures.is_empty(), "an aborted attempt must not reserve forever: {failures:?}");
+
+    // Even a caller that skips `live_marker` and hands over the raw newest
+    // marker gets the right answer, because the label is gone.
+    let mut raw = clean_markers();
+    raw.insert(1, crate::merge_pr::sequence::parse(&bodies).expect("the old marker parses"));
+    let failures = check_eligibility(&[one, two], &raw, "main", "reason", &default_bounds());
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+#[test]
+fn a_source_still_reserved_by_a_live_attempt_stays_ineligible() {
+    let live = "cons-deadbeef";
+    let one = sequenced(comp(1, H1, &["shared.rs"]));
+    let two = comp(2, H2, &["shared.rs"]);
+    let bodies = vec![reservation_comment_body(&reservation_on(&one, live), live)];
+    let mut markers = clean_markers();
+    if let Some(m) = live_marker(&one, &bodies) {
+        markers.insert(1, m);
+    }
+    let failures = check_eligibility(&[one, two], &markers, "main", "reason", &default_bounds());
+    assert!(
+        failures.iter().any(|f| matches!(f,
+            EligibilityFailure::AlreadyReserved { number: 1, attempt } if attempt == live)),
+        "{failures:?}"
+    );
 }
