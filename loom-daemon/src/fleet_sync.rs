@@ -61,6 +61,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::fleet_state::{self, Enforcement, Enforcer, StatePass};
 use crate::fleet_store::fetch::{self, Freshness, Policy, Transport};
 use crate::fleet_store::render::{self, Drift};
 use crate::fleet_store::roster::{self, Change, Plan, Registered};
@@ -90,6 +91,10 @@ pub const STATUS_FILENAME: &str = "fleet-sync-status.json";
 
 /// Event-bus topic the timer pass publishes a drift/health record on.
 pub const DRIFT_TOPIC: &str = "fleet.sync.drift";
+
+/// Event-bus topic a run-state *transition* is published on (#9598). Only
+/// transitions land here — the steady state of a paused host is silent.
+pub const STATE_TOPIC: &str = "fleet.sync.state";
 
 // ============================================================================
 // Configuration
@@ -465,6 +470,25 @@ pub struct FleetSyncStatus {
     pub config: ConfigPass,
     /// The roster diff.
     pub roster: RosterPass,
+    /// This host's desired run state and what was done about it (#9598).
+    /// `#[serde(default)]` so a snapshot written by a pre-#9598 daemon still
+    /// reads back.
+    #[serde(default)]
+    pub state: crate::fleet_state::StatePass,
+    /// What this host is **actually** doing about that state (#9598) — the
+    /// *actual* half of `status`'s desired-vs-actual pair, against
+    /// [`StatePass::desired`]'s *desired* half.
+    ///
+    /// [`run_pass`] seeds it with what the state *requires*
+    /// ([`StatePass::enforcement`]); the timer's [`enforce`] then overwrites it
+    /// with what actually happened, which differs only when a `stopped` host's
+    /// drain-and-exit was refused and it merely held dispatch instead.
+    #[serde(default = "default_enforced")]
+    pub enforced: Enforcement,
+}
+
+fn default_enforced() -> Enforcement {
+    Enforcement::Proceed
 }
 
 impl FleetSyncStatus {
@@ -590,6 +614,7 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     }
     head.push(')');
     let mut lines = vec![head];
+    lines.extend(state_lines(s));
     for tier in &s.config.tiers {
         let detail = tier.detail.as_deref().unwrap_or("in sync");
         let verb = if tier.wrote {
@@ -633,6 +658,50 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     Some(lines.join("\n"))
 }
 
+/// The run-state lines of the `Fleet store:` block (#9598) — the *desired*
+/// state the store named, and the *actual* enforcement this host applied.
+///
+/// Empty when the pass resolved no state at all (a store with no
+/// `fleet/state.yml`, a first boot behind an unreachable forge), except that a
+/// read *error* is always reported: "the state could not be read" is the one
+/// thing an operator must not have to infer from silence.
+fn state_lines(s: &FleetSyncStatus) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(desired) = s.state.desired {
+        let from = match s.state.source.as_deref() {
+            Some("host") => "host entry",
+            Some(_) => "fleet default",
+            None => "unknown entry",
+        };
+        let how = if s.state.from_last_recorded {
+            ", from this host's LAST RECORDED state — no snapshot was readable"
+        } else if s.state.cached {
+            ", from a CACHED snapshot"
+        } else {
+            ""
+        };
+        let actual = match s.enforced {
+            Enforcement::Proceed => "dispatching normally",
+            Enforcement::Hold => "new dispatch HELD, in-flight work finishes",
+            Enforcement::Stop => "refusing to start / draining to exit",
+        };
+        lines.push(format!("  run state: desired {} ({from}{how}) -> {actual}", desired.as_str()));
+        for (k, v) in [
+            ("by", &s.state.by),
+            ("since", &s.state.since),
+            ("reason", &s.state.reason),
+        ] {
+            if let Some(v) = v {
+                lines.push(format!("    {k}: {v}"));
+            }
+        }
+    }
+    if let Some(e) = &s.state.error {
+        lines.push(format!("  run state: NOT ENFORCED — {e}"));
+    }
+    lines
+}
+
 // ============================================================================
 // The daemon's startup pass and timer loop
 // ============================================================================
@@ -655,6 +724,19 @@ struct PassInputs {
 fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> FleetSyncStatus {
     let transport =
         crate::fleet_store::gh::GhTransport::new(&inputs.workspace, &inputs.location.repo);
+    // #9598: the desired run state, read first so the config half below cannot
+    // make a `stopped` host look like it converged before it was told to stop.
+    // The fallback is this host's *last recorded* state (see `state_pass`), so a
+    // forge outage with a wiped cache still cannot resume a stopped host.
+    let state = fleet_state::state_pass(
+        &transport,
+        &inputs.cache,
+        &inputs.location,
+        &inputs.host,
+        last_recorded_state(),
+        now,
+    );
+    let enforced = state.enforcement();
     let local_path = inputs
         .workspace
         .join(crate::config_resolver::LOCAL_CONFIG_REL);
@@ -688,7 +770,19 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         auto_apply: inputs.auto_apply,
         config,
         roster,
+        state,
+        enforced,
     }
+}
+
+/// This host's last recorded desired run state (#9598): from the pass held in
+/// process memory, else from the snapshot the previous *process* left on disk —
+/// which is the one the startup pass reads. `None` on a host that has never
+/// successfully resolved a state.
+fn last_recorded_state() -> Option<crate::fleet_store::state::RunState> {
+    cached_status()
+        .or_else(probe_status)
+        .and_then(|s| s.state.desired)
 }
 
 /// The roster half of [`run_pass`]. Skipped outright when the config half was
@@ -784,17 +878,73 @@ fn report(status: &FleetSyncStatus, bus: Option<&crate::event_bus::EventBus>) {
     let _ = bus.publish_generic(DRIFT_TOPIC, payload);
 }
 
+/// What [`start`] left for the caller: the `paused` hold this boot must begin
+/// under, plus everything [`Started::spawn_timer`] needs to arm the
+/// drift/enforcement timer.
+///
+/// A `stopped` state is **already handled** by the time this exists — `start`
+/// exits the process. What cannot be handled there is `paused`: enforcing it
+/// needs [`crate::ipc::DrainState`], which does not exist yet at the point in
+/// boot where the startup config render has to happen. So the hold travels to
+/// the caller as a note, and so does the timer, which enforces later changes
+/// through the same drain state. [`crate::fleet_state::wire`] is the one
+/// production caller that does both.
+pub struct Started {
+    /// The drain note for a `paused` host, or `None` for every other state —
+    /// what [`crate::ipc::DrainState::with_fleet_hold`] takes.
+    pub hold_note: Option<String>,
+    /// The state read this boot, as persisted for `loom-daemon status`.
+    pub state: StatePass,
+    /// This host's id in the store.
+    pub host: String,
+    /// The store, `OWNER/REPO`.
+    pub repo: String,
+    inputs: PassInputs,
+    bus: Option<std::sync::Arc<crate::event_bus::EventBus>>,
+}
+
+impl Started {
+    /// The daemon workspace this host syncs from — the fallback sweep root an
+    /// [`crate::fleet_state::IpcEnforcer`]'s drain request needs.
+    #[must_use]
+    pub fn workspace(&self) -> &Path {
+        &self.inputs.workspace
+    }
+
+    /// Arm the `fleet.syncIntervalSecs` timer. `enforcer` acts on a *change* of
+    /// desired run state; `None` keeps the pre-#9598 report-only timer, which is
+    /// what a caller with no drain state (a test, a future read-only consumer)
+    /// wants.
+    #[must_use]
+    pub fn spawn_timer(
+        self,
+        enforcer: Option<std::sync::Arc<dyn Enforcer>>,
+    ) -> tokio::task::JoinHandle<()> {
+        spawn_timer(self.inputs, self.bus, enforcer)
+    }
+}
+
 /// Start fleet-store syncing for the daemon workspace at `workspace`.
 ///
 /// Returns `None` — having done nothing at all — when `fleet.repo` is unset,
 /// which is every host that has not opted in. Otherwise runs the **startup
 /// pass** to completion (bounded by [`resolve_startup_timeout`]) before
 /// returning, so the caller can spawn its config-dependent loops against the
-/// config the store just rendered, and returns the handle of the timer task.
+/// config the store just rendered, and returns the `paused` hold plus the means
+/// to arm the timer ([`Started`]).
+///
+/// # This call does not return on a `stopped` host (#9598)
+///
+/// The desired run state is resolved by the same startup pass, and a `stopped`
+/// state is acted on **here** — the earliest point at which it is known, and
+/// before any dispatch producer, IPC listener or role loop exists to drain.
+/// [`crate::fleet_state::enforce_at_boot`] prints the refusal and exits
+/// [`crate::fleet_state::EXIT_FLEET_STOPPED`]. That is deliberate: deferring
+/// the decision to the caller means every caller has to remember to make it.
 pub async fn start(
     workspace: &Path,
     bus: Option<std::sync::Arc<crate::event_bus::EventBus>>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<Started> {
     let effective = crate::config_resolver::resolve_effective_config(workspace);
     let config = match resolve_config(&effective, &|k| std::env::var(k).ok()) {
         Ok(Some(c)) => c,
@@ -854,14 +1004,29 @@ pub async fn start(
         inputs.host,
         inputs.interval.as_secs()
     );
-    startup_pass(&inputs, bus.as_deref()).await;
-    Some(spawn_timer(inputs, bus))
+    let state = startup_pass(&inputs, bus.as_deref()).await;
+    // Diverges on `stopped`: this host is not meant to be up at all.
+    let hold_note = fleet_state::enforce_at_boot(&state, &inputs.host, &inputs.location.repo).await;
+    Some(Started {
+        hold_note,
+        state,
+        host: inputs.host.clone(),
+        repo: inputs.location.repo.clone(),
+        inputs,
+        bus,
+    })
 }
 
 /// The startup pass: render (write) the config tiers before any
 /// config-dependent loop is spawned, under a wall-clock cap so an unreachable
 /// (or, worse, silently hanging) forge cannot hold up boot.
-async fn startup_pass(inputs: &PassInputs, bus: Option<&crate::event_bus::EventBus>) {
+///
+/// Returns the desired run state it read (#9598). A pass that panicked or blew
+/// its cap returns an empty [`StatePass`], whose enforcement is `Proceed`: a
+/// timed-out fetch is not evidence of a `stopped` host, and refusing to boot on
+/// it would let one slow forge take a fleet down. The **timer** re-reads within
+/// `fleet.syncIntervalSecs` and enforces then.
+async fn startup_pass(inputs: &PassInputs, bus: Option<&crate::event_bus::EventBus>) -> StatePass {
     let owned = inputs.clone();
     let join =
         tokio::task::spawn_blocking(move || run_pass(&owned, "startup", Mode::Write, Utc::now()));
@@ -873,23 +1038,38 @@ async fn startup_pass(inputs: &PassInputs, bus: Option<&crate::event_bus::EventB
         Ok(Ok(status)) => {
             publish(&status);
             report(&status, bus);
+            status.state
         }
-        Ok(Err(e)) => log::warn!("fleet_sync: the startup pass panicked: {e}"),
-        Err(cap) => log::warn!(
-            "fleet_sync: the startup pass did not finish within {}s — continuing boot with the \
-             config already on disk (set {STARTUP_TIMEOUT_ENV} to retune, 0 to wait \
-             indefinitely). The pass is still running and will finish in the background; its \
-             render takes effect on the next start.",
-            cap.as_secs()
-        ),
+        Ok(Err(e)) => {
+            log::warn!("fleet_sync: the startup pass panicked: {e}");
+            StatePass::default()
+        }
+        Err(cap) => {
+            log::warn!(
+                "fleet_sync: the startup pass did not finish within {}s — continuing boot with \
+                 the config already on disk, and with the desired run state NOT enforced this \
+                 boot (the timer re-reads it within {}s). Set {STARTUP_TIMEOUT_ENV} to retune, 0 \
+                 to wait indefinitely. The pass is still running and will finish in the \
+                 background; its render takes effect on the next start.",
+                cap.as_secs(),
+                inputs.interval.as_secs(),
+            );
+            StatePass::default()
+        }
     }
 }
 
 /// The timer loop: one pass per `fleet.syncIntervalSecs`. Checks only, unless
 /// `fleet.autoApply` armed the write path.
+///
+/// Run-state enforcement (#9598) is **not** gated on `fleet.autoApply`: that
+/// flag guards writes to this host's config files and workspace registry, a
+/// different and more invasive act than honouring the run state an operator
+/// committed. A host that reads the store at all obeys `paused` / `stopped`.
 fn spawn_timer(
     inputs: PassInputs,
     bus: Option<std::sync::Arc<crate::event_bus::EventBus>>,
+    enforcer: Option<std::sync::Arc<dyn Enforcer>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mode = if inputs.auto_apply {
@@ -903,7 +1083,14 @@ fn spawn_timer(
             match tokio::task::spawn_blocking(move || run_pass(&owned, "timer", mode, Utc::now()))
                 .await
             {
-                Ok(status) => {
+                Ok(mut status) => {
+                    // Enforce BEFORE publishing: `enforce` corrects `enforced`
+                    // to what this host actually ended up doing, and the
+                    // snapshot `loom-daemon status` reads must carry that, not
+                    // the pre-enforcement requirement.
+                    if let Some(e) = enforcer.as_deref() {
+                        enforce(&mut status, e, bus.as_deref());
+                    }
                     publish(&status);
                     report(&status, bus.as_deref());
                 }
@@ -911,6 +1098,44 @@ fn spawn_timer(
             }
         }
     })
+}
+
+/// Apply one timer pass's run-state decision (#9598), and publish the
+/// transition when there was one.
+///
+/// Only *transitions* are acted on and logged: the steady state of a paused host
+/// is one silent `None` action per tick, so enforcement adds no log volume and
+/// no repeated drain requests.
+fn enforce(
+    status: &mut FleetSyncStatus,
+    enforcer: &dyn Enforcer,
+    bus: Option<&crate::event_bus::EventBus>,
+) {
+    let required = status.enforced;
+    let action = fleet_state::timer_action(required, enforcer.is_held());
+    let applied =
+        fleet_state::apply(action, required, enforcer, &status.state, &status.host, &status.repo);
+    // `enforced` is the *actual* half of the desired-vs-actual pair, so correct
+    // it when the host could not do what the store asked (a refused
+    // drain-and-exit degrades `stop` to `hold`). `status` must not report a
+    // stop that did not happen.
+    status.enforced = applied.effective;
+    let Some(line) = applied.log else {
+        return;
+    };
+    log::warn!("fleet_sync: {line}");
+    if let Some(bus) = bus {
+        let _ = bus.publish_generic(
+            STATE_TOPIC,
+            serde_json::json!({
+                "host": status.host,
+                "repo": status.repo,
+                "desired": status.state.desired,
+                "enforced": status.enforced.as_str(),
+                "detail": line,
+            }),
+        );
+    }
 }
 
 #[cfg(test)]

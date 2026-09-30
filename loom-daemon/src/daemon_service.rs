@@ -644,7 +644,16 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `fleet.syncIntervalSecs` timer task behind for drift detection. A host
     // with no `fleet.repo` — every host that has not opted in — does nothing
     // at all here. See `loom_daemon::fleet_sync`.
-    let _fleet_sync_handle =
+    //
+    // #9598: the startup pass also resolves this host's *desired run state*
+    // from `fleet/state.yml`. A `stopped` state is acted on INSIDE this call —
+    // it exits `EXIT_FLEET_STOPPED` here, before any dispatch producer, IPC
+    // listener or role loop is constructed, so there is nothing to drain. A
+    // `paused` state cannot be: `DrainState` is built ~650 lines below, after
+    // the workspace pool, so the hold travels in `Started::hold_note` and is
+    // applied there by `fleet_state::wire`. `running`, an unreadable state and
+    // an unset `fleet.repo` all carry on untouched.
+    let fleet_started =
         loom_daemon::fleet_sync::start(&sweep_workspace, Some(event_bus.clone())).await;
 
     // #4430: ticks every `GITHUB_APP_REFRESH_INTERVAL` (~5min) to keep the
@@ -1293,7 +1302,17 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // it and renders it in `loom-daemon status`). With no drain requested the flag
     // stays `false`, so every producer's halt check is byte-for-byte unchanged.
     // #8652: backed by the persisted paused-time ledger (see `DrainState::with_default_ledger`).
-    let drain_state = Arc::new(loom_daemon::ipc::DrainState::with_default_ledger());
+    // #9598: `fleet_state::wire` is that same `with_default_ledger()` for every
+    // host with no `fleet.repo` — and for a host whose store says `running` —
+    // so boot is byte-for-byte unchanged there. A `paused` host instead starts
+    // HELD: dispatch producers see the same flag a `fleet drain` sets, so
+    // in-flight work (there is none yet at boot) finishes and nothing new is
+    // admitted. `wire` also arms the `fleet.syncIntervalSecs` timer against
+    // this drain state, which is what enforces a run-state change that lands
+    // mid-run — it is armed HERE, rather than inside `fleet_sync::start`
+    // above, because neither the drain state nor the workspace pool it drains
+    // through exists at the point in boot where the startup render must happen.
+    let drain_state = loom_daemon::fleet_state::wire(fleet_started, &workspace_pool, &event_bus);
     let drain_flag = drain_state.flag();
 
     // Shared role-runner in-progress guard (#4364): one set, cloned into both
