@@ -1,42 +1,74 @@
 # Configuration for cargo-deny
 # https://embarkstudios.github.io/cargo-deny/
+#
+# Run by `.github/workflows/ci-daily.yml` (#9085), as four separate
+# `cargo deny check <which>` steps so an advisory and a licence regression
+# cannot hide behind each other.
+#
+# Until #9085 this file existed but NO job ran it (found in the #9065
+# supply-chain audit, 2026-09-26), so it had quietly kept the pre-0.14
+# cargo-deny schema: `[advisories] vulnerability/unmaintained/unsound/notice`
+# and `[licenses] unlicensed/copyleft/default`. Those keys are gone from
+# current cargo-deny, and a config it refuses to parse is a check that cannot
+# run -- which must not look like a check that passed (ci-principles.md rule 6).
+# This file is now the modern schema. Deliberately NO `version = 2` key either:
+# it was the opt-in to this behaviour in 0.14-0.17 and is the default now, so
+# omitting it is the form that parses across the widest range of versions.
 
 [advisories]
-# Security vulnerabilities from RustSec advisory database
-vulnerability = "deny"
-unmaintained = "warn"
-unsound = "warn"
+# Everything in the RustSec database is an error by default under the current
+# schema; the old per-class severity knobs no longer exist. Exceptions go in
+# `ignore` below, each with a comment saying why and when it goes away.
+ignore = []
+# A yanked crate in the lockfile is a warning, not a failure: yanking is often
+# administrative (a bad publish, a version-number mistake) and the daily run
+# should not go red for one while a `cargo update` is pending.
 yanked = "warn"
-notice = "warn"
 
 [licenses]
-# Ensure all dependencies have acceptable licenses
-unlicensed = "deny"
-# Allow common open source licenses
+# Anything not listed here is denied. The list is the licences actually present
+# in this workspace's dependency graph under --all-features; an OR expression
+# needs only one of its branches allowed, so e.g.
+# "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT" is satisfied by MIT.
+#
+# The two workspace members carry `license.workspace = true` (-> MIT, matching
+# the repo's LICENSE) so they are not themselves unlicensed crates in this
+# graph. That is metadata correction, not a licensing decision.
 allow = [
-    "MIT",
+    "0BSD",
     "Apache-2.0",
-    "BSD-3-Clause",
     "BSD-2-Clause",
+    "BSD-3-Clause",
+    # webpki-root-certs -- a permissive data licence for the Mozilla root store.
+    "CDLA-Permissive-2.0",
     "ISC",
-    "Unicode-DFS-2016",  # For unicode-ident
-    "0BSD",              # For adler
+    "MIT",
+    # option-ext, a transitive dependency of `directories`. Weak copyleft and
+    # file-scoped; it imposes nothing on this workspace's own sources.
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
 ]
-copyleft = "warn"
-# Allow licenses that are not in the allowed list to pass for now
-# This can be tightened later
-default = "warn"
+confidence-threshold = 0.8
+exceptions = []
 
 [bans]
-# Warn about multiple versions of the same crate
+# Multiple versions of one crate are a size/compile-time problem, not a
+# correctness one, and in a tree this size some duplication is unavoidable.
 multiple-versions = "warn"
-# Wildcards in dependencies are not allowed
+# A wildcard version requirement means the next breaking release of that crate
+# lands in this workspace without a diff. No registry dependency is wildcarded.
+# The only version-less requirement is loom-api's intra-workspace path
+# dependency on loom-daemon, which cannot drift that way. allow-wildcard-paths
+# exempts it, and it applies only because loom-api is `publish = false`.
+# Do not add a `version =` to that path dependency to satisfy this check:
+# PRs must never hand-edit version-bearing files (#7743).
 wildcards = "deny"
-# Prevent known bad crates
+allow-wildcard-paths = true
 deny = []
 
 [sources]
-# Ensure dependencies come from trusted sources
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

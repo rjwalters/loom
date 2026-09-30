@@ -1610,10 +1610,7 @@ if [[ -d "$WORKTREE_PATH" ]]; then
                 elif [[ -n "$local_uncommitted" ]]; then
                     print_info "Worktree has uncommitted changes - preserving existing work"
                 fi
-                echo ""
-                print_info "To use this worktree: cd $WORKTREE_PATH"
             fi
-            exit 0
         else
             # Stale worktree: no commits ahead, no uncommitted changes
             # Reset in place instead of removing (avoids CWD corruption)
@@ -1643,21 +1640,22 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             # already gated by check_branch_name above.
             if git -C "$WORKTREE_PATH" fetch origin -- "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null && \
                loom_worktree_reset_or_rescue "$WORKTREE_PATH" "$stale_ref" "issue-$ISSUE_NUMBER-stale-worktree-reset"; then
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_success "Stale worktree reset to $stale_display"
-                    echo ""
-                    print_info "To use this worktree: cd $WORKTREE_PATH"
-                fi
-                exit 0
+                [[ "$JSON_OUTPUT" == "true" ]] || print_success "Stale worktree reset to $stale_display"
             else
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_warning "Could not reset stale worktree (continuing to use as-is)"
-                    echo ""
-                    print_info "To use this worktree: cd $WORKTREE_PATH"
-                fi
-                exit 0
+                [[ "$JSON_OUTPUT" == "true" ]] || print_warning "Could not reset stale worktree (continuing to use as-is)"
             fi
         fi
+        # #9111: the preserve and both stale-reset outcomes share this one exit.
+        # Under --json it emits the same key set as the --sparse/--full fast
+        # path above (sparse.rs JSON_TEMPLATE); that arm already exited, so
+        # $SPARSE_MODE/$CONE_JSON are always their not-sparse defaults here.
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            echo '{"success": true, "worktreePath": "'"$(cd "$WORKTREE_PATH" && pwd)"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
+        else
+            echo ""
+            print_info "To use this worktree: cd $WORKTREE_PATH"
+        fi
+        exit 0
     else
         print_error "Directory exists but is not a registered worktree"
         echo ""

@@ -7,6 +7,44 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-30
+- **PR #9544**: fix(gitignore): stop tracking the daemon's per-host ETA ledger (.loom/state/eta/)
+- **PR #9155**: chore(deps): bump sigstore/cosign-installer from 3.9.1 to 4.1.2
+- **PR #9307**: chore(deps): bump the all-dependencies group across 1 directory with 3 updates
+- **PR #9574**: stale-checks: narrow the daemon-implemented gates' global inputs off loom-daemon/**
+- **Issue #9321** (closed): operator-priority escalations must reach the operator in Matrix, not only as GitHub comments (#9244 follow-up)
+- **PR #9559**: feat(daemon): relay operator-priority escalations into Matrix (#9321)
+- **Issue #9311** (closed): dispatch_plan C: held_until on time-boxed holds (backoff, recheck, cooldowns) so plans can say when an item unblocks
+- **PR #9531**: dispatch_plan C: held_until on time-boxed holds
+- **Issue #9294** (closed): Peer-claim channel is one-way on loom-worker-2 (advertised=3765, received=0) — every fleet-wide brake consumes nothing
+- **PR #9523**: fix(peer-claims): surface a one-way claim channel in status, and detect the publish side going dead
+- **Issue #9278** (closed): Flaky: merge_pr_partial_reset_differential::plan_agrees_with_the_retired_shell_on_every_input fails on OTLP job only
+- **PR #9522**: fix(tests): stop a starved shell oracle from accusing the partial-reset port
+- **Issue #9292** (closed): prless-retry counts PR-less releases per host, so four dispatch hosts spend 4x the runway before any one holds
+- **PR #9516**: feat(daemon): count PR-less releases fleet-wide, not per dispatch host (#9292)
+- **PR #9505**: feat(telemetry): per-issue effort query pack IE1-IE5 over the raw records store (#9444)
+- **PR #9369**: fix(runtimes): put a provisioned tap ahead of gemini in the fall-through chain
+- **Issue #9312** (closed): Guard telemetry: force-op:detached blocks own-branch worktree resync via -C "$VAR" (31 events)
+- **PR #9317**: fix(guard): resolve NAME=$(cd <path> && pwd)/$(realpath <path>) in force-op cwd capture
+- **PR #9218**: fix(merge-pr): recognize feature/harness-ops-<N> stacked-parent branches
+- **Issue #9026** (closed): feat(curator): embed backlog rightsizing and sibling issue consolidation rules into Curator role prompt
+- **PR #9206**: feat(curator): backlog rightsizing and sibling consolidation gate (#9026)
+- **PR #9156**: chore(deps): bump the all-dependencies group with 2 updates
+- **Issue #9051** (closed): observability: host memory/swap/pressure context at role-attempt span boundaries — separate deferred-for-memory from killed from timed-out
+- **PR #9055**: feat(observability): host memory/swap/pressure state at role-attempt span boundaries and host.health (#9051)
+- **Issue #8884** (closed): Install-time session-mode flag: empty terminals + loom.sh start refusal
+- **PR #8893**: feat(install): add --mode session install-time flag
+- **Issue #8875** (closed): install over a pre-#4187 install duplicates 11 workflow labels, so sync-labels.sh --check can never converge
+- **PR #8887**: fix(install): absorb pre-#4187 legacy label duplicates on install
+- **Issue #8460** (closed): guard rmScope: allow removing a private build/target dir the current session created under a scratch root (#8453 item 5)
+- **PR #8531**: feat(guard): admit rm of the session's own private scratch dir under rmScope
+- **Issue #9109** (closed): forge-helpers/worktree-forge-pr-check: URL-encode branch in Gitea API path; build fd-3 refusal JSON with jq (unescaped headRefName)
+- **PR #9483**: fix(forge): URL-encode branch in Gitea/GitHub API paths; build fd-3 refusal JSON with jq
+- **Issue #9322** (closed): Guard: decide whether rm-scope may resolve `VAR=$(cat <literal-path>)` by executing cat at hook time (#9304 shape 2)
+- **PR #9541**: docs(guard): record `VAR=$(cat <path>)` rm-scope resolution as denied by design
+- **Issue #9144** (closed): test-loom-daemon-update.sh scenario 64: pipefail + `grep -q` SIGPIPE race turns a passing --help assertion into a CI failure
+- **PR #9495**: fix(tests): herestrings for echo|grep -q under pipefail (#9144)
+- **PR #9158**: chore(deps-dev): bump the all-dependencies group in /dashboard with 3 updates
+- **PR #9566**: fix(security): count verdict markers and promotion verdicts only from trusted authors (#9548)
 - **PR #9570**: chore(deps): bump fast-uri from 3.1.7 to 3.1.8 in /mcp-loom
 - **PR #9564**: test(watchdog): stop signalling the dead-pid fixture pre-exec — removes ten ~60s CI stalls
 - **Issue #9552** (closed): bug(sweep-lease): fence/publish/renew pass -R to gh api, so every lease read/write fails when LOOM_REPO is set
