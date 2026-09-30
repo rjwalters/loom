@@ -2047,6 +2047,25 @@ jobs:
       # without a binary.
       - name: mcp__loom__.* PreToolUse argument guard (#9107, #9108)
         run: bash defaults/hooks/tests/test-guard-mcp-tools.sh
+      # Moved out of shell-suite-tests by #8191's check-runs-rollup slice:
+      # merge-pr.sh's _wait_for_checks_then_sync_merge now reads its
+      # failing/pending/total_count via `loom-daemon merge-pr
+      # check-runs-rollup`, so extracting and running the REAL function (as
+      # both suites below do) needs the binary this job downloads. Both pin
+      # it via loom_test_require_daemon_bin --self-only and FAIL rather than
+      # skip without one.
+      - name: merge-pr wait-for-checks empty-settle guard (#6169, #9091, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh
+      # test-forge-check-runs-pagination.sh's Parts 1/2/4/5 (forge-helpers.sh
+      # pagination, no daemon involved) move here with Part 3 rather than
+      # splitting the suite.
+      - name: forge check-runs pagination + truncated-read settle guard (#8895, #8987, #8191)
+        run: bash defaults/scripts/tests/test-forge-check-runs-pagination.sh
+      # Its #3664 pending-vs-failing assertions used to mirror the retired jq
+      # filters (passing against a copy); they now drive the real
+      # `merge-pr check-runs-rollup`, pinned the same way.
+      - name: merge-pr pending-vs-failing check-runs classification (#3664, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-unstable-fallback.sh
 
   native-port-daemon-lifecycle:
     name: Native Port Suites (daemon lifecycle, watchdog)

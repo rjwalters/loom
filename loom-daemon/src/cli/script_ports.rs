@@ -657,6 +657,14 @@ pub(crate) enum MergePrCommand {
     /// see `cli::merge_pr_check_runs_streak`.
     CheckRunsStreak(super::merge_pr_check_runs_streak::CheckRunsStreakArgs),
 
+    /// The per-poll READ of the check-runs rollup in the same wait loop
+    /// (#8191 slice): failing names, pending names and `total_count` out of
+    /// the `forge_get_check_runs` payload on stdin. Exit 0 with four
+    /// NUL-terminated fields ending `LOOM-CHECK-RUNS-ROLLUP`; exit 2 (nothing
+    /// on stdout) for a payload outside the forge contract, which the caller
+    /// treats as still pending — see `cli::merge_pr_check_runs_rollup`.
+    CheckRunsRollup(super::merge_pr_check_runs_rollup::CheckRunsRollupArgs),
+
     /// The OTHER classification in the same wait loop (#8191 slice): once a
     /// poll finds a FAILING check, whether it is a required status-check
     /// context (refuse), informational with nothing pending (proceed to the
@@ -800,6 +808,7 @@ impl MergePrCommand {
             MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
             MergePrCommand::CheckRunsStreak(args) => args.run(),
+            MergePrCommand::CheckRunsRollup(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
             MergePrCommand::StackedChildren(args) => args.run(),
             MergePrCommand::WorktreePrimary(args) => args.run(),

@@ -43,6 +43,7 @@ mod label_duplicates;
 pub(crate) mod lease_co_occupancy;
 pub(crate) mod lease_ensure;
 pub(crate) mod legacy_script_cmds;
+mod merge_pr_check_runs_rollup;
 mod merge_pr_check_runs_streak;
 mod merge_pr_checks_failure;
 mod merge_pr_cleanup_paths;
