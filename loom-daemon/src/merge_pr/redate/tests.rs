@@ -96,10 +96,14 @@ fn remedy_outcome_variants_are_distinct() {
     assert_ne!(moved, pushed);
     assert_ne!(
         RemedyOutcome::Escalated {
-            notice_posted: true
+            notice_posted: true,
+            spent: 1,
+            budget: 1
         },
         RemedyOutcome::Escalated {
-            notice_posted: false
+            notice_posted: false,
+            spent: 1,
+            budget: 1
         }
     );
 }
@@ -143,8 +147,10 @@ fn hold_notice_idempotency_is_keyed_on_the_head() {
 
 #[test]
 fn redate_comment_body_records_the_marker_and_explains_the_re_review() {
-    let body = redate_comment_body("8493", "abc1234def");
+    let body = redate_comment_body("8493", "abc1234def", 2, 3);
     assert!(body.starts_with(&redate_marker("abc1234def")));
+    assert!(body.contains(&budget::attempt_marker("abc1234def", 2)), "{body}");
+    assert!(body.contains("2 of 3"), "{body}");
     for needle in ["#8248", "#8508", "tree-identical", "#5686", "abc1234"] {
         assert!(body.contains(needle), "body should mention {needle:?}: {body}");
     }
@@ -170,11 +176,29 @@ fn comment_bodies_tolerate_a_short_sha() {
     // The short-sha slice must never panic on a sha shorter than 7 chars —
     // `--expected-head-sha` is caller-supplied, and a truncated value is a
     // bad-input case, not a crash case.
-    assert!(redate_comment_body("1", "ab").contains("ab"));
+    assert!(redate_comment_body("1", "ab", 1, 1).contains("ab"));
     assert!(hold_comment_body("1", "ab", "r").contains("ab"));
 }
 
 // --- Stubbed forge I/O ---------------------------------------------------
+
+/// A budget of one with no backoff: #8508's original "one re-date per head,
+/// then escalate" bound, which the pre-#9590 tests below pin.
+const ONE: BudgetConfig = BudgetConfig {
+    budget: 1,
+    backoff_secs: 0,
+};
+
+/// A fixed "now" for the stubbed runs, so backoff decisions are deterministic.
+pub(super) fn now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
+        .expect("valid timestamp")
+        .with_timezone(&chrono::Utc)
+}
+
+pub(super) fn run(gh: &std::path::Path, cfg: BudgetConfig) -> RemedyOutcome {
+    remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42", cfg, now())
+}
 
 /// Writes an executable fake `gh` to `dir` that answers the calls
 /// [`remedy_with`] makes from canned values — and appends every invocation's
@@ -184,7 +208,7 @@ fn comment_bodies_tolerate_a_short_sha() {
 /// reused for BOTH the read (no `-X`) and the write (`-X PATCH`); the case
 /// arms tell them apart by scanning for `-X PATCH` anywhere in argv,
 /// mirroring this repo's other stubs.
-fn write_stub_gh(
+pub(super) fn write_stub_gh(
     dir: &std::path::Path,
     current_sha: &str,
     tree_sha: &str,
@@ -284,7 +308,7 @@ esac
     path
 }
 
-fn tmp_dir(name: &str) -> std::path::PathBuf {
+pub(super) fn tmp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("loom-redate-test-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create tmp dir");
@@ -295,7 +319,7 @@ fn tmp_dir(name: &str) -> std::path::PathBuf {
 /// create-commit call's `message=` argument and the comment bodies embed real
 /// newlines, so the stub terminates each record with an explicit sentinel
 /// instead of relying on one call == one line.
-fn split_stub_calls(argv_log: &str) -> Vec<&str> {
+pub(super) fn split_stub_calls(argv_log: &str) -> Vec<&str> {
     argv_log
         .split("<<<REDATE-STUB-CALL-END>>>\n")
         .map(str::trim_end)
@@ -308,7 +332,7 @@ fn remedy_pushes_a_tree_identical_commit_when_head_matches() {
     let dir = tmp_dir("happy-path");
     let gh = write_stub_gh(&dir, "abc0000", "tree1111", "newsha22", "", "");
 
-    let outcome = remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42");
+    let outcome = run(&gh, ONE);
     assert_eq!(
         outcome,
         RemedyOutcome::Pushed {
@@ -363,7 +387,7 @@ fn remedy_pushes_a_tree_identical_commit_when_head_matches() {
 fn remedy_records_the_attempt_marker_after_the_push_lands() {
     let dir = tmp_dir("marker-recorded");
     let gh = write_stub_gh(&dir, "abc0000", "tree1111", "newsha22", "", "");
-    let _ = remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42");
+    let _ = run(&gh, ONE);
 
     let argv = fs::read_to_string(dir.join("argv.log")).expect("argv log");
     let calls = split_stub_calls(&argv);
@@ -393,7 +417,7 @@ fn remedy_refuses_to_push_when_the_branch_already_moved() {
     // Stub reports "def9999" as the live ref; caller expected "abc0000".
     let gh = write_stub_gh(&dir, "def9999", "unused", "unused", "", "");
 
-    let outcome = remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42");
+    let outcome = run(&gh, ONE);
     assert_eq!(
         outcome,
         RemedyOutcome::HeadMoved {
@@ -417,11 +441,13 @@ fn remedy_escalates_instead_of_pushing_a_second_commit_for_the_same_head() {
     let prior = redate_marker("abc0000");
     let gh = write_stub_gh(&dir, "abc0000", "tree1111", "newsha22", &prior, "");
 
-    let outcome = remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42");
+    let outcome = run(&gh, ONE);
     assert_eq!(
         outcome,
         RemedyOutcome::Escalated {
-            notice_posted: true
+            notice_posted: true,
+            spent: 1,
+            budget: 1
         }
     );
 
@@ -448,11 +474,13 @@ fn escalation_does_not_repost_an_existing_notice_but_re_asserts_the_label() {
     let prior = format!("{}\n{}", redate_marker("abc0000"), hold_marker("abc0000"));
     let gh = write_stub_gh(&dir, "abc0000", "tree1111", "newsha22", &prior, "");
 
-    let outcome = remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42");
+    let outcome = run(&gh, ONE);
     assert_eq!(
         outcome,
         RemedyOutcome::Escalated {
-            notice_posted: false
+            notice_posted: false,
+            spent: 1,
+            budget: 1
         }
     );
 
@@ -479,7 +507,7 @@ fn remedy_fails_when_the_ref_update_errors() {
     let dir = tmp_dir("patch-fails");
     let gh = write_stub_gh(&dir, "abc0000", "tree1111", "newsha22", "", "patch");
 
-    let outcome = remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42");
+    let outcome = run(&gh, ONE);
     match outcome {
         RemedyOutcome::Failed(msg) => {
             assert!(msg.contains("newsha22"), "failure should name the dangling commit: {msg}");
@@ -499,7 +527,7 @@ fn remedy_fails_when_the_commit_cannot_be_created() {
     let dir = tmp_dir("create-fails");
     let gh = write_stub_gh(&dir, "abc0000", "tree1111", "newsha22", "", "create");
 
-    let outcome = remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42");
+    let outcome = run(&gh, ONE);
     assert!(matches!(outcome, RemedyOutcome::Failed(_)), "expected Failed, got {outcome:?}");
 
     let _ = fs::remove_dir_all(&dir);
@@ -513,7 +541,7 @@ fn remedy_fails_closed_when_the_attempt_state_cannot_be_read() {
     let dir = tmp_dir("comments-unreadable");
     let gh = write_stub_gh(&dir, "abc0000", "tree1111", "newsha22", "", "read-comments");
 
-    let outcome = remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42");
+    let outcome = run(&gh, ONE);
     assert!(matches!(outcome, RemedyOutcome::Failed(_)), "expected Failed, got {outcome:?}");
     let argv = fs::read_to_string(dir.join("argv.log")).expect("argv log");
     assert!(
@@ -529,7 +557,7 @@ fn a_landed_push_whose_marker_cannot_be_recorded_reports_the_exposure() {
     let dir = tmp_dir("marker-unwritable");
     let gh = write_stub_gh(&dir, "abc0000", "tree1111", "newsha22", "", "comment");
 
-    match remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42") {
+    match run(&gh, ONE) {
         RemedyOutcome::Failed(msg) => {
             assert!(
                 msg.contains("landed") && msg.contains(&redate_marker("newsha22")),
@@ -555,7 +583,7 @@ fn an_untrusted_redate_marker_is_not_attempt_state() {
         "body": redate_marker("abc0000"),
     }]);
     fs::write(dir.join("comments.json"), outsider.to_string()).expect("write listing");
-    let outcome = remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42");
+    let outcome = run(&gh, ONE);
     assert_eq!(
         outcome,
         RemedyOutcome::Pushed {
@@ -564,7 +592,7 @@ fn an_untrusted_redate_marker_is_not_attempt_state() {
     );
 
     fs::write(dir.join("comments.json"), "not json").expect("write listing");
-    let outcome = remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42");
+    let outcome = run(&gh, ONE);
     assert!(matches!(outcome, RemedyOutcome::Failed(_)), "{outcome:?}");
     let _ = fs::remove_dir_all(&dir);
 }

@@ -282,6 +282,10 @@ chmod +x "$STUB_DIR/github-app-token.sh"
 
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# #9548: the subject filters lease markers through `forge trusted-comments`.
+# shellcheck source=lib/trust-stub.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/trust-stub.sh"
+loom_trust_stub "$STUB_DIR"
 export LOOM_GITHUB_APP_SCRIPT="$STUB_DIR/github-app-token.sh"
 
 reset_state() {
@@ -499,6 +503,28 @@ JSON
 run_script renew-once 6485
 assert_eq "4" "$RC" "(i-4) newest-wins candidate is the yielded loser's lease -> exit 4, refuse to renew"
 assert_contains "$ERR" "host=host-loser sweep=sweep-loser" "(i-4) stderr names the yielded owner, not the winner"
+
+# (i-5) #9548: an UNTRUSTED yield record naming our own (host, sweep) is prose,
+# and an untrusted newer lease is never the renewal candidate.
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[
+  {"id": 42, "body": "<!-- loom:lease host=hostA sweep=sweepA -->\nprose"},
+  {"id": 43, "user": {"login": "drive-by", "type": "User"}, "author_association": "NONE", "body": "<!-- loom:lease-yield host=hostA sweep=sweepA earliest_host=hostB earliest_sweep=sweepB -->"},
+  {"id": 44, "user": {"login": "drive-by", "type": "User"}, "author_association": "NONE", "body": "<!-- loom:lease host=hostA sweep=sweepA -->"}
+]
+JSON
+run_script renew-once 6485 --host hostA --sweep-id sweepA
+assert_eq "0" "$RC" "(i-5) an untrusted yield record does not stop renewal (exit 0)"
+assert_true "$([[ -f "$STUB_DIR/patch-42-1.body" ]] && echo true || echo false)" "(i-5) the trusted lease (42), not the outsider's (44), is renewed"
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[
+  {"id": 42, "body": "<!-- loom:lease host=hostA sweep=sweepA -->\nprose"}
+]
+JSON
+LOOM_TEST_NO_TRUST_VERB=1 run_script renew-once 6485 --host hostA --sweep-id sweepA
+assert_eq "1" "$RC" "(i-6) no trust filter -> exit 1 (transient failure, nothing patched)"
 
 # --- (j) start's default --host/--sweep-id auto-resolution (#6485) --------
 echo ""

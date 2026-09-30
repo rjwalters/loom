@@ -42,11 +42,19 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "claim_reconciliation/review_conflict.rs",
         "writer; reader via fetch_comment_bodies",
     ),
+    (
+        "cli/lease_co_occupancy.rs",
+        "lease + lease-yield reader in read_rows (FETCH_SITES, #9631)",
+    ),
     ("comment_trust/records.rs", "the H14 filter itself"),
     ("dep_classify/cli.rs", "reads IssueView from dep_classify/forge.rs (trusted)"),
     ("dep_classify/consts.rs", "constants"),
     ("dep_recheck/forge.rs", "a PR's own closing refs, not the linked-PR guard"),
     ("merge_pr/redate.rs", "writer; reader in remedy_with (FETCH_SITES)"),
+    (
+        "merge_pr/redate/budget.rs",
+        "pure parser over remedy_with's trusted listing (#9590)",
+    ),
     ("premise_check/cli.rs", "reader in forge_inputs (FETCH_SITES)"),
     ("premise_check/record.rs", "parser over already-filtered chunks"),
     ("quarantine_reconciliation.rs", "reader (FETCH_SITES)"),
@@ -80,6 +88,7 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "TrustPolicy::for_root(root).trusted_bodies(",
     ),
     ("sweep_registry/guards.rs", "read_lease_comments", "policy.trusted_ndjson("),
+    ("cli/lease_co_occupancy.rs", "read_rows", "policy.trusted_ndjson("),
     ("sweep_registry/guards.rs", "issue_body_via_rest", "records::trusted_body("),
     (
         "sweep_registry/guards.rs",
@@ -111,7 +120,7 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     // must filter it (`policy.trusted_listing(`), checked below.
     ("premise_check/cli.rs", "forge_inputs", "trusted_inputs("),
     ("premise_check/cli.rs", "trusted_inputs", "policy.trusted_listing("),
-    ("merge_pr/redate.rs", "remedy_with", "policy.trusted_bodies("),
+    ("merge_pr/redate.rs", "remedy_with", "policy.trusted_listing("),
     ("merge_pr/redate.rs", "post_comment", ""),
     ("role_runner/roster.rs", "read_roster_comments", "trusted_ndjson("),
     ("role_runner/roster.rs", "create_roster_comment", ""),

@@ -364,12 +364,16 @@ cmd_publish() {
     local comments_ndjson read_ok=1
     if ! comments_ndjson="$(gh api "repos/${repo_path}/issues/${issue}/comments" \
         --paginate --jq \
-        ".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {updated_at: .updated_at, body: .body}" \
+        ".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {updated_at: .updated_at, body: .body, user: {login: .user.login, type: .user.type}, author_association: .author_association}" \
         2>&1)"; then
         echo "WARN: could not read existing lease comments for issue #${issue} (${comments_ndjson}) -- publishing anyway (absence of evidence is not evidence of a peer)" >&2
         read_ok=0
         comments_ndjson=""
     fi
+    # #9548: only a TRUSTED author's lease/yield marker is a peer or a record.
+    # requires-daemon: forge optional   Without the `trusted-comments` verb the markers are unverifiable: treated like an unreadable listing (publish anyway), the existing direction.
+    ((read_ok == 1)) && ! comments_ndjson="$(jq -s -c '.' <<< "$comments_ndjson" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments 2> /dev/null | jq -c '.[]')" \
+        && { echo "WARN: lease comments on issue #${issue} could not be authenticated -- publishing anyway" >&2; read_ok=0; comments_ndjson=""; }
 
     if ((read_ok == 1)) && [[ -n "$(printf '%s' "$comments_ndjson" | tr -d '[:space:]')" ]]; then
         # Scan EVERY fresh, NON-YIELDED lease comment for a foreign host --

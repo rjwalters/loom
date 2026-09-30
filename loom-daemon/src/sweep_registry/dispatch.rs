@@ -1667,34 +1667,27 @@ impl SweepRegistry {
     /// after the poll, under a re-taken lock. So a same-idempotency-key retry
     /// that lands **between** a `Spawned` return here and the matching
     /// `finish_issue_dispatch` (i.e. inside the window the mutex is released
-    /// for, bounded by `TOKEN_NAME_CAPTURE_TIMEOUT`, up to ~5s) MISSES the
-    /// short-circuit above and falls through to the guard chain.
+    /// for, bounded by `TOKEN_NAME_CAPTURE_TIMEOUT`, up to ~5s) MISSES step 1's
+    /// short-circuit.
     ///
-    /// **No double-spawn results** — the guard chain refuses such a retry
-    /// before any second `Command::spawn()`, via one of two independent
-    /// mechanisms (which one fires is platform-dependent; both are treated as
-    /// correct):
-    ///
-    /// - The #4556 live-claim guard's **argv process-scan** leg
-    ///   (`live_claim::live_sweep_process_in`) matches the just-spawned child
-    ///   directly, needing neither a tracked entry nor lock ownership. It
-    ///   fires wherever the platform exposes another process's argv (Linux
-    ///   `/proc`). Note the guard's *bookkeeping* legs genuinely are blind
-    ///   here — `has_tracked_sweep_for` is still false, and the claim lock's
-    ///   `owner.json` still holds this daemon's own pid because
-    ///   `record_child_pid_in_lock` runs in `finish_issue_dispatch` — so do
-    ///   not reason about this window from those legs alone.
-    /// - The atomic `acquire_lock` mkdir at step 3 is the unconditional,
-    ///   platform-independent backstop: `lock collision`.
-    ///
-    /// The behavior that *does* differ inside this window is the retry's
-    /// caller-visible outcome: a hard `Err` (of either shape above) instead of
-    /// the graceful `was_new: false` hand-back it receives before or after.
-    /// This is accepted rather than papered over — the realistic client retry
-    /// the split targets follows a 30s ack timeout, well past a ~5s window —
-    /// and is pinned by
-    /// `same_key_retry_during_the_unlocked_poll_window_is_refused_not_double_spawned`
-    /// in this module's tests.
+    /// Issue #9572 closed this gap: step 1b consults a second, in-memory
+    /// `self.inflight_idempotency` map that step 3.05 (below) writes right
+    /// after THIS attempt claims the lock — well before the window step 1's
+    /// doc paragraph above describes even opens — so a same-key retry landing
+    /// inside the window gets the same graceful `Done(Ok(DispatchOutcome {
+    /// was_new: false, .. }))` hand-back a retry gets before or after it,
+    /// naming the SAME `sweep_id`, rather than falling through to the guard
+    /// chain. **No double-spawn results, exactly as before** — this is a
+    /// strictly earlier, and therefore *more* precise, catch than the two
+    /// guard-chain mechanisms that used to be the only backstop here (the
+    /// #4556 live-claim guard's argv-scan leg, and the atomic `acquire_lock`
+    /// mkdir's `lock collision`) — both remain in place for a same-key retry
+    /// that somehow still misses the in-flight map (e.g. a key mismatch), and
+    /// for every OTHER duplicate-dispatch shape they have always covered.
+    /// Pinned by
+    /// `same_key_retry_during_the_unlocked_poll_window_returns_the_inflight_sweep_id`
+    /// in this module's tests (renamed from ...`_is_refused_not_double_spawned`
+    /// — the refusal this issue replaces was itself the fix's whole point).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_prepared_issue_dispatch(
         &mut self,
@@ -1714,6 +1707,42 @@ impl SweepRegistry {
                     pid: existing.pid,
                     token_name: existing.token_name.clone(),
                     log_path: existing.log_path.clone(),
+                    was_new: false,
+                })));
+            }
+
+            // 1b. Idempotency dedup against an ALREADY-CLAIMED, not-yet-finished
+            //     attempt for the same key (Issue #9572). Step 1 above only
+            //     matches `self.entries`, which `finish_issue_dispatch` does not
+            //     populate until AFTER the unlocked account-selection poll
+            //     (#6592) — so, before this check existed, a same-key retry
+            //     landing inside that window missed both dedup checks and fell
+            //     through to the guard chain, which refused it with a hard
+            //     `Err` (`lock collision` or the #4556 live-claim guard) instead
+            //     of the graceful hand-back a retry gets before or after the
+            //     window. `self.inflight_idempotency` is written below, right
+            //     after this attempt claims the lock (step 3), and cleared by
+            //     `finish_issue_dispatch` — on both its success and error paths
+            //     — and by every early `Err` return in this function from that
+            //     point onward, so a hit here can only ever name a genuinely
+            //     still-in-flight sweep, never a stale/abandoned one.
+            //
+            //     `pid`/`token_name` are genuinely unknown this early — the
+            //     child has not been spawned yet — so this reports `pid: 0` and
+            //     `UNKNOWN_TOKEN_NAME`, the same "not yet known" sentinels the
+            //     #4689/#6614 preflight-death paths already use elsewhere.
+            //     `log_path` is recomputed (not stored) since it is a pure
+            //     function of `issue_number`, already available from `kind`.
+            if let Some(sweep_id) = self.inflight_idempotency.get(key).cloned() {
+                let log_path = match kind {
+                    SweepKind::Issue(n) => self.compute_log_path(*n),
+                    SweepKind::PrSet(prs) => self.compute_prset_log_path(prs),
+                };
+                return Ok(BeginIssueDispatch::Done(Ok(DispatchOutcome {
+                    sweep_id,
+                    pid: 0,
+                    token_name: crate::sweep_registry::UNKNOWN_TOKEN_NAME.to_string(),
+                    log_path,
                     was_new: false,
                 })));
             }
@@ -2210,6 +2239,20 @@ impl SweepRegistry {
         }
         self.acquire_lock(issue_number, &sweep_id)?;
 
+        // 3.05 Record the in-flight idempotency key (Issue #9572), now that
+        //      this attempt has actually claimed the lock and its `sweep_id`
+        //      is allocated — see `inflight_idempotency`'s doc comment and
+        //      step 1b above for the window this closes. From here on, every
+        //      early `Err` return in this function MUST clear this entry (see
+        //      the three sites below) so a failed attempt never wedges a
+        //      later, legitimate same-key dispatch; the success path clears
+        //      it in `finish_issue_dispatch` instead, once the attempt is
+        //      visible via the ordinary `self.entries`-scoped dedup.
+        if let Some(ref key) = idempotency_key {
+            self.inflight_idempotency
+                .insert(key.clone(), sweep_id.clone());
+        }
+
         // 3a. Soft cross-host claim (Issue #4028): advertise this claim over the
         //     shared safehouse room **before** the non-atomic label flip below,
         //     so a peer daemon backs off far faster than the `loom:building`
@@ -2258,6 +2301,12 @@ impl SweepRegistry {
                 );
                 self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
                 let _ = self.release_lock_owned(issue_number, &sweep_id);
+                // #9572: this attempt is abandoned — release the in-flight
+                // idempotency key claimed at step 3.05 so a later same-key
+                // dispatch is not wedged behind a sweep that never spawned.
+                if let Some(ref key) = idempotency_key {
+                    self.inflight_idempotency.remove(key);
+                }
                 return Err(CollisionDispatchError {
                     issue: issue_number,
                     source: CollisionSource::ForgeLabel { labels },
@@ -2345,6 +2394,12 @@ impl SweepRegistry {
             // not broken, it already has an owner), and it does not affect
             // the `loom:building` label the earlier claimant still holds.
             self.record_dispatch_failure(issue_number);
+            // #9572: this attempt is abandoned — release the in-flight
+            // idempotency key claimed at step 3.05 so a later same-key
+            // dispatch is not wedged behind a sweep that never spawned.
+            if let Some(ref key) = idempotency_key {
+                self.inflight_idempotency.remove(key);
+            }
             return Err(LeaseOrderDispatchError {
                 issue: issue_number,
                 sweep_id: sweep_id.clone(),
@@ -2404,6 +2459,12 @@ impl SweepRegistry {
                 }
                 self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
                 let _ = self.release_lock_owned(issue_number, &sweep_id);
+                // #9572: this attempt is abandoned — release the in-flight
+                // idempotency key claimed at step 3.05 so a later same-key
+                // dispatch is not wedged behind a sweep that never spawned.
+                if let Some(ref key) = idempotency_key {
+                    self.inflight_idempotency.remove(key);
+                }
                 return Err(e.context("failed to spawn sweep child"));
             }
         };
@@ -2507,6 +2568,13 @@ impl SweepRegistry {
             //     instead of the whole backlog re-cycling every tick forever.
             self.record_dispatch_failure(issue_number);
             self.record_token_selection_failure(issue_number);
+            // #9572: this attempt never reaches `self.entries`, so release
+            // the in-flight idempotency key claimed in `begin_prepared_issue_dispatch`
+            // (step 3.05) here — its only other clearing site is the success
+            // path below, which this branch does not reach.
+            if let Some(ref key) = idempotency_key {
+                self.inflight_idempotency.remove(key);
+            }
             return Err(TokenSelectionDispatchError {
                 issue: issue_number,
                 log_path: log_path.clone(),
@@ -2604,6 +2672,16 @@ impl SweepRegistry {
                  #{issue_number} (reconstruct may treat it as stale after a daemon restart, \
                  and a post-restart cancel may not reach the whole process group): {e}"
             );
+        }
+
+        // #9572: this attempt is about to become visible via the ordinary
+        // `self.entries`-scoped dedup (`find_running_by_key`, step 1 above),
+        // so release the in-flight idempotency key claimed in
+        // `begin_prepared_issue_dispatch` (step 3.05) now — a same-key retry
+        // arriving after this point falls through to step 1 exactly as
+        // before #9572, not to the now-cleared step 1b.
+        if let Some(ref key) = idempotency_key {
+            self.inflight_idempotency.remove(key);
         }
 
         // 6. Record the entry. The model is carried on the registry entry
@@ -3349,3 +3427,10 @@ pub(crate) fn dispatch_model_releasing_poll_lock(
     unused_imports
 )]
 mod tests;
+
+// Issue #9572's in-flight idempotency-key coverage. A plain child module
+// declared here rather than an inline `mod` on `dispatch/tests.rs`, which is
+// over the file-size ratchet threshold — see that file's own top-of-file
+// note on this pattern.
+#[cfg(test)]
+mod idempotency_inflight_tests;

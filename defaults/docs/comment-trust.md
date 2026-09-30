@@ -101,3 +101,31 @@ gh api "repos/{owner}/{repo}/issues/$N/comments" --paginate \
 
 Anything other than an array of logins is ignored with a warning: a malformed
 value never widens trust.
+
+## Shell and role-prompt readers
+
+`loom-daemon forge trusted-comments --fetch N [--repo owner/name]` fetches
+issue/PR N's REST listing itself and prints the trusted subset (exit 1 when it
+cannot). `--with-body` puts the issue/PR first, so its body survives only when
+its author is trusted; `--gh-shape` prints `gh --json comments` field names
+(`author.login`, `authorAssociation`, `body`, `createdAt`) for splicing into a
+`gh … --json` document. Readers and their direction when the filter is
+unavailable:
+
+| Reader | Markers / phrases | Filter unavailable |
+|---|---|---|
+| `claim-staleness.sh` | `loom:claim-activity`, `loom:standdown` | `unknown` (never stomp) |
+| `sweep-lease-fence.sh` | `loom:lease`, `loom:lease-yield` | fails open, as on an unreadable listing |
+| `sweep-lease-publish.sh` | same | publishes anyway, as on an unreadable listing |
+| `sweep-lease-renew.sh` | same | exit 1, nothing patched |
+| `classify-ac-verification.sh` | `loom:ac-verified` (comments; the PR body only when its author is trusted) | no evidence: the issue stays held |
+| Champion merge precheck | hold markers, release phrases, new Judge reviews | skip the PR this pass |
+| Champion criterion #5 | "real activity" comments | the raw read (it can only read as more active) |
+| Critical-file hold | `champion:critical-file-*`, `hold-state` | the raw read (bookkeeping only; a FAIL never merges) |
+| Champion epic | epic verdict / escalation markers | skip the epic this pass |
+| Judge fast-track | `loom:conflict-only` | full evaluation |
+| Curator AC-hold check | `champion:ac-hold` | treated as no hold |
+
+Role prompts that read forge text carry either the full untrusted-content
+block or a one-line pointer to this page; see
+[`untrusted-external-content.md`](untrusted-external-content.md).

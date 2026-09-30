@@ -581,7 +581,7 @@ fn set(paths: &[&str]) -> FileSet {
     file_set(paths.iter().map(|p| (*p, false)))
 }
 
-fn spec(ctx: &str) -> &'static CheckSpec {
+fn spec(ctx: &str) -> &'static CheckSpec<'static> {
     spec_for(ctx).unwrap_or_else(|| panic!("{ctx} must have a spec"))
 }
 

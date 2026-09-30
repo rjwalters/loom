@@ -47,14 +47,15 @@
 //! no-op commit every tick forever — burning a full CI run and a Judge
 //! re-review each time while never out-racing `main`.
 //!
-//! So the bound is one remedy per head: every push records
-//! `<!-- loom:stale-check-redate to=<new-sha> -->` on the PR, and finding that
-//! marker for the CURRENT head means "we already re-dated, CI ran, and the
-//! guard STILL blocks — nothing automated is making progress". That is #8508's
-//! bounded signal, evaluated from durable forge state rather than from a tick
-//! counter no process owns. It is also strictly stronger than counting ticks:
-//! it can only fire when a full re-date → CI → block cycle has completed with
-//! no forward progress.
+//! So the remedy has a budget: N re-dates per chain of tree-identical heads,
+//! with exponential backoff between them (#9590, [`budget`]; #8508 allowed
+//! one). Every push records `<!-- loom:stale-check-redate to=<new-sha> -->`
+//! plus [`budget::attempt_marker`]'s chain position on the PR. Finding the
+//! current head at the end of a chain that spent the whole budget means
+//! "we re-dated N times, CI ran each time, and the guard STILL blocks —
+//! nothing automated is making progress". The count is durable, trusted
+//! forge state rather than a tick counter no process owns, and each step
+//! needs a full re-date → CI → block cycle.
 //!
 //! Reaching the bound escalates exactly the way `champion-pr-merge.md`'s
 //! merge-risk hold does: one idempotent rationale comment (keyed on the head,
@@ -87,6 +88,9 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+
+pub mod budget;
+pub use budget::{BudgetConfig, BudgetDecision};
 
 /// The `gh` binary, honoring `LOOM_GH_BIN` — the same seam
 /// `stale_checks::fetch` / `head_sync::fetch` provide.
@@ -224,7 +228,10 @@ pub fn decide(expected_head_sha: &str, current_head_sha: &str) -> PushDecision {
     }
 }
 
-/// Has the remedy already run against exactly this head?
+/// Has the remedy already run against exactly this head? Since #9590 this is
+/// no longer the bound by itself — [`budget::chain_position`] reads it (as
+/// chain position 1 when no attempt marker is present) — but it is still
+/// what a pre-#9590 daemon in a mixed fleet checks.
 ///
 /// `comments` is the PR's comment bodies as one blob; the markers are
 /// single-line HTML comments, so a substring test over the concatenation is
@@ -240,12 +247,13 @@ pub fn hold_already_posted(comments: &str, head_sha: &str) -> bool {
     comments.contains(&hold_marker(head_sha))
 }
 
-/// The comment recorded after a successful push.
+/// The comment recorded after a successful push: re-date `n` of `budget`
+/// for this chain (#9590), carrying both markers.
 #[must_use]
-pub fn redate_comment_body(pr: &str, new_sha: &str) -> String {
+pub fn redate_comment_body(pr: &str, new_sha: &str, n: u32, budget: u32) -> String {
     let short = &new_sha[..new_sha.len().min(7)];
     format!(
-        "{}\n**Automated re-date of stale required checks (#8508)**\n\n\
+        "{}\n{}\n**Automated re-date of stale required checks (#8508), {n} of {budget}**\n\n\
 The #8248 required-check-freshness guard blocked the merge of PR #{pr}: a required \
 check's green result predates the current base-branch tip, and this repo's merge token \
 has no `actions:write` to re-run that check directly. Pushed a **tree-identical** no-op \
@@ -254,8 +262,11 @@ check now re-runs against a current timestamp.\n\n\
 This moves the head SHA, which invalidates the standing Judge approval (#5686). Expect \
 this PR to cycle back through `loom:review-requested` once CI on `{short}` completes, \
 then merge normally once re-approved.\n\n\
-The #8248 guard itself is unchanged and still applies to the next merge attempt.",
-        redate_marker(new_sha)
+The #8248 guard itself is unchanged and still applies to the next merge attempt. This is \
+re-date {n} of a budget of {budget} for this chain of tree-identical heads (#9590); once the \
+budget is spent, a further block escalates to `{HOLD_LABEL}`.",
+        redate_marker(new_sha),
+        budget::attempt_marker(new_sha, n)
     )
 }
 
@@ -285,11 +296,21 @@ not being bypassed here.",
 pub enum RemedyOutcome {
     /// A new, tree-identical commit was pushed as the branch's new tip.
     Pushed { new_sha: String },
-    /// The remedy had already run against this exact head and the guard still
-    /// blocks: the bound is reached, and the PR was escalated to a durable
+    /// This head's re-date chain already spent `spent` of `budget` re-dates
+    /// and the guard still blocks: the PR was escalated to a durable
     /// `loom:operator` hold. `notice_posted` is false when a notice for this
     /// head was already on the PR (idempotency), true when this call posted it.
-    Escalated { notice_posted: bool },
+    Escalated {
+        notice_posted: bool,
+        spent: u32,
+        budget: u32,
+    },
+    /// Budget remains, but the backoff after re-date `spent` has not elapsed
+    /// (#9590). Nothing was written; retry the merge after `retry_after`.
+    Deferred {
+        spent: u32,
+        retry_after: chrono::DateTime<chrono::Utc>,
+    },
     /// The branch already moved past `expected_head_sha` before this ran —
     /// no push was attempted. Mirrors `merge-pr.sh`'s #5579 exit-3 contract:
     /// re-evaluate fresh next tick, do not treat this as an error.
@@ -304,7 +325,16 @@ pub enum RemedyOutcome {
 ///
 /// `nwo` is `owner/repo`.
 pub fn remedy(nwo: &str, branch: &str, expected_head_sha: &str, pr: &str) -> RemedyOutcome {
-    remedy_with(&gh_bin(), nwo, branch, expected_head_sha, pr)
+    let cfg = BudgetConfig::for_root(&repo_root());
+    remedy_with(&gh_bin(), nwo, branch, expected_head_sha, pr, cfg, chrono::Utc::now())
+}
+
+/// The repo root (config, App roster, allowlist), not whatever subdirectory
+/// or worktree the CLI happened to be run from (Judge #9593).
+fn repo_root() -> std::path::PathBuf {
+    crate::repo_root::find_repo_root_from_cwd()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default()
 }
 
 /// [`remedy`]'s implementation, parameterized on the `gh` binary — the
@@ -315,6 +345,8 @@ fn remedy_with(
     branch: &str,
     expected_head_sha: &str,
     pr: &str,
+    cfg: BudgetConfig,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> RemedyOutcome {
     let current = match read_nonempty(
         gh,
@@ -334,7 +366,7 @@ fn remedy_with(
         PushDecision::Proceed => {}
     }
 
-    // Durable attempt state, read before any write: one remedy per head.
+    // Durable attempt state, read before any write: the chain's budget.
     let comments =
         match gh_api_with(gh, &[&format!("repos/{nwo}/issues/{pr}/comments"), "--paginate"]) {
             Ok(s) => s,
@@ -345,20 +377,24 @@ fn remedy_with(
     // #9548 (H13): only trusted authors' markers are attempt state. An
     // outsider's `stale-check-redate` marker for this head must not escalate
     // the PR to a hold, nor an outsider's hold marker suppress the notice.
-    // The repo root (config, App roster, allowlist), not whatever
-    // subdirectory or worktree the CLI happened to be run from (Judge #9593).
-    let root = crate::repo_root::find_repo_root_from_cwd()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_default();
-    let policy = crate::comment_trust::TrustPolicy::for_root(&root);
-    let Some(comments) = policy.trusted_bodies(comments.as_bytes()) else {
+    let policy = crate::comment_trust::TrustPolicy::for_root(&repo_root());
+    let Some(trusted) = policy.trusted_listing(comments.as_bytes()) else {
         return RemedyOutcome::Failed(format!("PR #{pr}'s comment listing did not parse"));
     };
-    let comments = comments.join("\n");
-
-    if already_redated(&comments, &current) {
-        return escalate(gh, nwo, pr, &current, &comments);
-    }
+    let pos = budget::chain_position(&trusted, &current);
+    let n = match budget::decide_budget(&pos, &cfg, now) {
+        BudgetDecision::Push { n } => n,
+        BudgetDecision::Defer { retry_after } => {
+            return RemedyOutcome::Deferred {
+                spent: pos.spent,
+                retry_after,
+            };
+        }
+        BudgetDecision::Exhausted { spent } => {
+            let bodies = crate::comment_trust::records::bodies(&trusted).join("\n");
+            return escalate(gh, nwo, pr, &current, &bodies, spent, cfg.budget);
+        }
+    };
 
     let tree = match read_nonempty(
         gh,
@@ -418,7 +454,8 @@ fn remedy_with(
 
     // Record the attempt LAST: a marker without a landed push would bound the
     // remedy out of existence on the next tick for a push that never happened.
-    if let Err(e) = post_comment(gh, nwo, pr, &redate_comment_body(pr, &new_sha)) {
+    let body = redate_comment_body(pr, &new_sha, n, cfg.budget);
+    if let Err(e) = post_comment(gh, nwo, pr, &body) {
         return RemedyOutcome::Failed(format!(
             "the re-date commit {new_sha} landed on heads/{branch}, but recording it on PR #{pr} \
 failed ({e}) — the next tick cannot tell the remedy already ran and may push a second one; \
@@ -435,15 +472,25 @@ re-run once the forge is writable, or post {} by hand",
 /// even when the notice was already present — the label is what actually
 /// parks the PR, and a hand-removed label with an unresolved block would
 /// otherwise never come back.
-fn escalate(gh: &str, nwo: &str, pr: &str, head: &str, comments: &str) -> RemedyOutcome {
-    let reason =
-        "an automated re-date commit was already pushed for this head and its CI has run, \
-yet the guard still reports the required checks stale — the base branch is moving faster than CI \
-can re-date them, so another no-op commit would not help";
+fn escalate(
+    gh: &str,
+    nwo: &str,
+    pr: &str,
+    head: &str,
+    comments: &str,
+    spent: u32,
+    budget: u32,
+) -> RemedyOutcome {
+    let reason = format!(
+        "the re-date budget is exhausted (#9590): {spent} of {budget} automated re-date commits \
+were pushed for this chain of tree-identical heads, CI ran on each, and the guard still reports \
+the required checks stale — the base branch is moving faster than CI can re-date them, so another \
+no-op commit would not help"
+    );
     let notice_posted = if hold_already_posted(comments, head) {
         false
     } else {
-        if let Err(e) = post_comment(gh, nwo, pr, &hold_comment_body(pr, head, reason)) {
+        if let Err(e) = post_comment(gh, nwo, pr, &hold_comment_body(pr, head, &reason)) {
             return RemedyOutcome::Failed(format!("could not post the #8508 hold notice: {e}"));
         }
         true
@@ -455,7 +502,11 @@ can re-date them, so another no-op commit would not help";
     ) {
         return RemedyOutcome::Failed(format!("could not apply {HOLD_LABEL} to PR #{pr}: {e}"));
     }
-    RemedyOutcome::Escalated { notice_posted }
+    RemedyOutcome::Escalated {
+        notice_posted,
+        spent,
+        budget,
+    }
 }
 
 fn post_comment(gh: &str, nwo: &str, pr: &str, body: &str) -> Result<String, String> {

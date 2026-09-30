@@ -10,6 +10,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 use tempfile::TempDir;
 
+use loom_daemon::forge_identity::{FleetLogins, Roster};
+
 const ISSUE: u64 = 5781;
 
 fn now() -> DateTime<Utc> {
@@ -174,9 +176,9 @@ fn read_rows_parses_a_successful_gh_read() {
     let dir = TempDir::new().unwrap();
     let gh = fake_gh(
         dir.path(),
-        "printf '%s\\n' '{\"updated_at\":\"2026-09-28T11:59:00Z\",\"body\":\"<!-- loom:lease host=h sweep=s -->\"}'\n",
+        &format!("printf '%s\\n' '{}'\n", row("<!-- loom:lease host=h sweep=s -->", FLEET_APP)),
     );
-    let rows = read_rows(&gh, dir.path(), ISSUE, Duration::from_secs(10)).unwrap();
+    let rows = read_rows(&gh, dir.path(), ISSUE, Duration::from_secs(10), &policy()).unwrap();
     assert_eq!(rows.len(), 1);
 }
 
@@ -184,14 +186,14 @@ fn read_rows_parses_a_successful_gh_read() {
 fn read_rows_is_none_when_gh_fails() {
     let dir = TempDir::new().unwrap();
     let gh = fake_gh(dir.path(), "echo 'HTTP 502' >&2\nexit 1\n");
-    assert!(read_rows(&gh, dir.path(), ISSUE, Duration::from_secs(10)).is_none());
+    assert!(read_rows(&gh, dir.path(), ISSUE, Duration::from_secs(10), &policy()).is_none());
 }
 
 #[test]
 fn read_rows_is_none_when_gh_is_missing() {
     let dir = TempDir::new().unwrap();
     let missing = dir.path().join("no-such-gh");
-    assert!(read_rows(&missing, dir.path(), ISSUE, Duration::from_secs(10)).is_none());
+    assert!(read_rows(&missing, dir.path(), ISSUE, Duration::from_secs(10), &policy()).is_none());
 }
 
 #[test]
@@ -199,9 +201,143 @@ fn read_rows_gives_up_at_its_deadline() {
     let dir = TempDir::new().unwrap();
     let gh = fake_gh(dir.path(), "sleep 30\n");
     let start = Instant::now();
-    assert!(read_rows(&gh, dir.path(), ISSUE, Duration::from_millis(300)).is_none());
+    assert!(read_rows(&gh, dir.path(), ISSUE, Duration::from_millis(300), &policy()).is_none());
     assert!(
         start.elapsed() < Duration::from_secs(10),
         "a hung read must not stall worktree.sh"
     );
+}
+
+// ---- #9631: only trusted authors' lease / lease-yield records count ----
+
+/// The rules for an unconfigured host: the default fleet App family, no self
+/// login, no allowlist (what `TrustPolicy::for_root` resolves to with an
+/// empty roster).
+fn policy() -> TrustPolicy {
+    TrustPolicy::new(FleetLogins::of(&Roster::default()), None, Vec::new())
+}
+
+/// This fleet's default App (trusted on every host).
+const FLEET_APP: &str =
+    r#""user":{"login":"loom-fleet-dispatch[bot]","type":"Bot"},"author_association":"NONE""#;
+/// A repo owner (trusted by association).
+const OWNER: &str = r#""user":{"login":"rjwalters","type":"User"},"author_association":"OWNER""#;
+/// An outsider with no write access.
+const OUTSIDER: &str = r#""user":{"login":"mallory","type":"User"},"author_association":"NONE""#;
+/// A look-alike App that is not this fleet's.
+const FOREIGN_APP: &str =
+    r#""user":{"login":"loom-fleet-dispatch-evil[bot]","type":"Bot"},"author_association":"NONE""#;
+/// No author fields at all (e.g. a deleted account's `user: null`).
+const NO_AUTHOR: &str = r#""user":null"#;
+
+/// One NDJSON line as the real `--jq` projection emits it.
+fn row(body: &str, author: &str) -> String {
+    let body = serde_json::to_string(body).unwrap();
+    format!(r#"{{"updated_at":"2026-09-28T11:59:00Z","body":{body},{author}}}"#)
+}
+
+fn lease_line(host: &str, sweep: &str, author: &str) -> String {
+    row(&format!("<!-- loom:lease host={host} sweep={sweep} -->\nprose"), author)
+}
+
+fn yield_line(host: &str, sweep: &str, author: &str) -> String {
+    row(
+        &format!(
+            "<!-- loom:lease-yield host={host} sweep={sweep} earliest_host=h0 \
+             earliest_sweep=s0 -->\nprose"
+        ),
+        author,
+    )
+}
+
+/// `read_rows` over a fake `gh` that prints `lines`, then the verdict.
+fn verdict_for(lines: &[String]) -> Verdict {
+    let dir = TempDir::new().unwrap();
+    let fixture = dir.path().join("rows.ndjson");
+    fs::write(&fixture, lines.join("\n") + "\n").unwrap();
+    let gh = fake_gh(dir.path(), &format!("cat '{}'\n", fixture.display()));
+    let rows = read_rows(&gh, dir.path(), ISSUE, Duration::from_secs(10), &policy());
+    assert!(rows.is_some(), "a successful read is evidence, not a failure");
+    decide(ISSUE, rows.as_deref(), Utc::now(), chrono::Duration::days(3650), false, false)
+}
+
+#[test]
+fn trusted_fleet_app_and_owner_leases_are_honoured() {
+    let v = verdict_for(&[
+        lease_line("h1", "sweep-a", FLEET_APP),
+        lease_line("h2", "sweep-b", OWNER),
+    ]);
+    assert_eq!(v.exit_code, 1, "two trusted fresh leases are a real co-occupancy");
+}
+
+#[test]
+fn spoofed_leases_from_an_outsider_cannot_force_a_refusal() {
+    let v = verdict_for(&[
+        lease_line("h1", "sweep-a", FLEET_APP),
+        lease_line("evil", "spoof-1", OUTSIDER),
+        lease_line("evil", "spoof-2", OUTSIDER),
+    ]);
+    assert_eq!(v.exit_code, 0, "an outsider's lease is prose: {:?}", v.stderr);
+}
+
+#[test]
+fn a_look_alike_foreign_app_lease_is_ignored() {
+    let v = verdict_for(&[
+        lease_line("h1", "sweep-a", FLEET_APP),
+        lease_line("h9", "sweep-z", FOREIGN_APP),
+    ]);
+    assert_eq!(v.exit_code, 0, "{:?}", v.stderr);
+}
+
+#[test]
+fn a_lease_with_no_author_is_untrusted() {
+    let v = verdict_for(&[
+        lease_line("h1", "sweep-a", FLEET_APP),
+        lease_line("h2", "sweep-b", NO_AUTHOR),
+        // Pre-#9631 shape: no author fields at all.
+        r#"{"updated_at":"2026-09-28T11:59:00Z","body":"<!-- loom:lease host=h3 sweep=sweep-c -->"}"#
+            .to_string(),
+    ]);
+    assert_eq!(v.exit_code, 0, "{:?}", v.stderr);
+}
+
+#[test]
+fn a_spoofed_yield_cannot_excuse_a_real_live_lease() {
+    let v = verdict_for(&[
+        lease_line("h1", "sweep-a", FLEET_APP),
+        lease_line("h2", "sweep-b", FLEET_APP),
+        yield_line("h2", "sweep-b", OUTSIDER),
+    ]);
+    assert_eq!(v.exit_code, 1, "an outsider cannot stand a real claimant down");
+}
+
+#[test]
+fn a_trusted_yield_still_excuses_its_own_lease() {
+    let v = verdict_for(&[
+        lease_line("h1", "sweep-a", FLEET_APP),
+        lease_line("h2", "sweep-b", FLEET_APP),
+        yield_line("h2", "sweep-b", FLEET_APP),
+    ]);
+    assert_eq!(v.exit_code, 0, "{:?}", v.stderr);
+}
+
+#[test]
+fn every_row_untrusted_is_an_empty_read_not_a_failed_one() {
+    let dir = TempDir::new().unwrap();
+    let fixture = dir.path().join("rows.ndjson");
+    fs::write(&fixture, lease_line("evil", "s", OUTSIDER) + "\n").unwrap();
+    let gh = fake_gh(dir.path(), &format!("cat '{}'\n", fixture.display()));
+    let rows = read_rows(&gh, dir.path(), ISSUE, Duration::from_secs(10), &policy());
+    assert_eq!(rows, Some(Vec::new()));
+}
+
+#[test]
+fn the_forge_read_projects_the_author() {
+    // Without the author in the projection every row would be dropped.
+    let dir = TempDir::new().unwrap();
+    let args = dir.path().join("args");
+    let gh = fake_gh(dir.path(), &format!("printf '%s\\n' \"$@\" > '{}'\n", args.display()));
+    read_rows(&gh, dir.path(), ISSUE, Duration::from_secs(10), &policy());
+    let recorded = fs::read_to_string(&args).unwrap();
+    assert!(recorded.contains(AUTHOR_JQ), "{recorded}");
 }

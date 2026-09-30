@@ -338,13 +338,35 @@ fn write_sentinel(opts: &Options) -> Result<(), Outcome> {
 /// `origin/<branch>` its own remote was already fetched by the upstream check
 /// that ran immediately before this arm, and refreshing the base too is
 /// harmless.
+///
+/// **`-c maintenance.auto=false` (#9620).** Every `git fetch` ends by spawning
+/// `git maintenance run --auto --detach`, and the detached child keeps the
+/// fetch's cwd, which is this worktree. The #7463 liveness probe that
+/// [`super::reset::run`] opens with then counts git's own housekeeping as a
+/// foreign live holder and refuses the reset. The shell took two `exec`s to
+/// reach its probe, so the child had nearly always exited by then. This port
+/// probes in-process microseconds after the fetch, and on Linux's instant
+/// `/proc` walk it lost that race often enough to leave stale worktrees
+/// unreset. The config form is used rather than `--no-auto-maintenance`
+/// because older gits ignore an unknown key but reject an unknown flag, and a
+/// rejected fetch here means no reset at all. The probe itself is untouched.
 fn perform_reset_with(opts: &Options, req: &ResetRequest) -> bool {
     let fetch_key = if opts.base_branch.is_empty() {
         opts.default_branch.as_str()
     } else {
         opts.base_branch.as_str()
     };
-    if !git_ok(&opts.worktree, &["fetch", "origin", "--", fetch_key]) {
+    if !git_ok(
+        &opts.worktree,
+        &[
+            "-c",
+            "maintenance.auto=false",
+            "fetch",
+            "origin",
+            "--",
+            fetch_key,
+        ],
+    ) {
         return false;
     }
     super::reset::run(&super::reset::Options {

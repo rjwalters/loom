@@ -641,6 +641,11 @@ cmd_renew_once() {
         echo "ERROR: 'gh api .../issues/${issue}/comments --paginate' failed (escalation ladder exhausted)" >&2
         exit 1
     fi
+    # #9548: renew only a TRUSTED author's lease, and honour only a trusted
+    # yield record; an outsider's copy of either is prose.
+    # requires-daemon: forge optional   Without the `trusted-comments` verb the listing cannot be authenticated: exit 1, the same transient failure as an unreadable listing (nothing is patched).
+    comments_json="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments <<< "$comments_json" 2> /dev/null)" \
+        || { echo "ERROR: lease comments on issue #${issue} could not be authenticated (loom-daemon forge trusted-comments unavailable)" >&2; exit 1; }
 
     local candidate_id
     candidate_id="$(jq -r --arg marker "$LEASE_MARKER_PREFIX" --arg exact "$exact" '

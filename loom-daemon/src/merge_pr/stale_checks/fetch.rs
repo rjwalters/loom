@@ -43,6 +43,12 @@
 //! is [`CiScope::Unscoped`], i.e. the whole-file behaviour from before the
 //! narrowing existed.
 //!
+//! And, ONLY when a green required context with a usable base move has no
+//! built-in spec (a consumer repo, #9589), one read of the base tip's
+//! `.loom/stale-check-inputs.json` — see [`super::repo_specs`]. A 404 is
+//! "no declaration"; any other failure rejects it with a warning, which leaves
+//! those contexts exactly as strict as before.
+//!
 //! Everything in (1)–(3) is fallible I/O reporting `Err(reason)`; every caller
 //! outcome of an `Err` is "refuse the merge" (the guard's fail-closed
 //! contract), never "skip". (4)–(6) are different: a failure there is recorded
@@ -53,6 +59,7 @@ use super::evidence::{
     compare_usable, parse_tested_base, strip_validated_restamps, to_file_set, ChangedFile,
 };
 use super::inputs::{BaseMove, ScopedEvidence, CI_WORKFLOW};
+use super::repo_specs::{RepoSpecs, DECLARATION_PATH};
 use super::workflow_scope::{self, CiScope, Workflow};
 use super::CheckRun;
 use chrono::{DateTime, Utc};
@@ -702,7 +709,29 @@ workflow log"
             }
         }
     }
+    // The per-repo declaration (#9589) is read only when some context with a
+    // usable base move has no built-in spec, so loom's own repo never pays.
+    if ev
+        .base_moves
+        .keys()
+        .any(|ctx| super::inputs::specs_for(ctx).is_none())
+    {
+        ev.repo_specs = RepoSpecs::from_fetch(fetch_declaration(gh, nwo, tip_sha));
+    }
     (Some(ev), notices)
+}
+
+/// The base tip's [`DECLARATION_PATH`] — the BASE tip, never the PR head, so a
+/// PR cannot narrow its own freshness check (#9589).
+fn fetch_declaration(gh: &str, nwo: &str, tip_sha: &str) -> Result<String, String> {
+    gh_api(
+        gh,
+        &[
+            "-H",
+            "Accept: application/vnd.github.raw",
+            &format!("repos/{nwo}/contents/{DECLARATION_PATH}?ref={tip_sha}"),
+        ],
+    )
 }
 
 /// Gather everything [`super::assess_scoped`] needs from the live forge.

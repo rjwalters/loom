@@ -4,14 +4,18 @@
 //! **tree-identical** no-op commit onto the head branch. Any push re-triggers
 //! every `pull_request` CI run on the new head, and — crucially — makes GitHub
 //! rebuild the test merge commit against the **current** base, which is the only
-//! thing that produces genuinely fresh evidence. When the remedy has already run
-//! against this exact head and the guard STILL blocks, nothing automated is
-//! making progress, so the PR is escalated to a durable `loom:operator` hold
-//! instead of re-pushing forever.
+//! thing that produces genuinely fresh evidence. Each chain of tree-identical
+//! re-dates has a budget, default 3, with exponential backoff between attempts
+//! from a 600 s base (#9590; env `LOOM_REDATE_BUDGET` / `LOOM_REDATE_BACKOFF_SECS`
+//! beat config `champion.redateBudget` / `champion.redateBackoffSecs`, which beat
+//! the defaults). Once the chain has spent the budget and
+//! the guard STILL blocks, nothing automated is making progress, so the PR is
+//! escalated to a durable `loom:operator` hold instead of re-pushing forever.
 //!
 //! | outcome | stdout | exit |
 //! |---|---|---|
 //! | pushed the re-date commit | `LOOM-REDATE-PUSHED sha=<new-sha>` | 0 |
+//! | inside the backoff window; nothing written | `LOOM-REDATE-DEFERRED …` | 0 |
 //! | could not read/write the forge state needed | the reason | 1 |
 //! | branch already moved past `--expected-head-sha` | the reason | 3 |
 //! | bound reached; escalated to `loom:operator` | `LOOM-REDATE-ESCALATED …` | 4 |
@@ -53,7 +57,7 @@ use loom_daemon::merge_pr::redate::{remedy, RemedyOutcome, HOLD_LABEL};
 #[derive(clap::Args)]
 pub(crate) struct RedateChecksArgs {
     /// The PR number: the commit message names it, and its comment thread is
-    /// where the one-remedy-per-head bound and the hold notice are recorded.
+    /// where the re-date budget (#9590) and the hold notice are recorded.
     #[arg(long, value_name = "N")]
     pr: String,
 
@@ -117,13 +121,30 @@ the checks without re-testing the current base; only a new push does that. Going
                 println!("LOOM-REDATE-PUSHED sha={new_sha}");
                 std::process::exit(0);
             }
-            RemedyOutcome::Escalated { notice_posted } => {
+            RemedyOutcome::Deferred { spent, retry_after } => {
                 println!(
-                    "LOOM-REDATE-ESCALATED pr={} head={} label={HOLD_LABEL} notice={}\n\
-PR #{}'s #8248 block survived an automated re-date of this exact head, so the remedy is \
-exhausted: applied {HOLD_LABEL} and {}. A human must merge it with an elevated token, rebase it \
-onto the current base, or push any commit (which rebuilds the merge commit against the current \
-base and re-runs every required check).",
+                    "LOOM-REDATE-DEFERRED pr={} head={} spent={spent} retry_after={}\n\
+PR #{}'s #8248 block is on a head already re-dated {spent} time(s) in this chain; the backoff \
+before the next re-date (#9590) has not elapsed, so nothing was pushed. Retry the merge after \
+that time.",
+                    self.pr,
+                    self.expected_head_sha,
+                    retry_after.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    self.pr
+                );
+                std::process::exit(0);
+            }
+            RemedyOutcome::Escalated {
+                notice_posted,
+                spent,
+                budget,
+            } => {
+                println!(
+                    "LOOM-REDATE-ESCALATED pr={} head={} label={HOLD_LABEL} notice={} spent={spent} budget={budget}\n\
+PR #{}'s #8248 block survived {spent} of {budget} automated re-dates in this chain, so the \
+re-date budget is exhausted (#9590): applied {HOLD_LABEL} and {}. A human must merge it with an \
+elevated token, rebase it onto the current base, or push any commit (which rebuilds the merge \
+commit against the current base, re-runs every required check, and starts a fresh budget).",
                     self.pr,
                     self.expected_head_sha,
                     if notice_posted {
