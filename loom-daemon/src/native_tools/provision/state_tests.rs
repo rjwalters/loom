@@ -186,7 +186,26 @@ fn every_guarded_runtime_pins_tmpdir_into_a_short_reclaimable_path() {
     let temp = tempfile::tempdir().unwrap();
     let root = workspace(temp.path(), "repo");
     let base = temp.path().join("native-state");
-    let pinned_base = temp.path().join("pinned-tmp");
+    // `pinned_base` must be a genuinely SHORT root, because that is what the
+    // production default is: `pinned_tmp_base()` falls back to
+    // `platform_tmp_root().join(PINNED_TMPDIR_LEAF)` — `/tmp/loom-nt` on unix,
+    // a fixed short root that deliberately ignores `$TMPDIR`. The old fixture
+    // rooted it at `tempfile::tempdir()` instead, which DOES resolve through
+    // `$TMPDIR`; on macOS that is a long per-process `/var/folders/...` path,
+    // so `<50 chars>/pinned-tmp/<36-char uuid>` blew the `< 90` socket-path
+    // assertion below even though the real default never would. The bug was
+    // the fixture, not the product (issue #9194) — so mirror
+    // `platform_tmp_root()` here and keep the assertion at full strength.
+    let short_tmp_root = if cfg!(unix) {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let pinned_root = tempfile::Builder::new()
+        .prefix("loom-nt-test-")
+        .tempdir_in(&short_tmp_root)
+        .expect("short pinned-tmp root under the platform tmp root");
+    let pinned_base = pinned_root.path().to_path_buf();
     std::env::set_var(NATIVE_PINNED_TMPDIR_BASE_ENV, &pinned_base);
 
     for runtime in ["pi", "opencode", "kimi"] {

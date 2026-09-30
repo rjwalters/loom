@@ -48,23 +48,46 @@ impl ClaudeStore {
     }
 
     /// Write `<projects>/<slug>/<uuid>.jsonl` for a `/loom:sweep <issue>`
-    /// session carrying one assistant usage record.
+    /// session carrying one assistant usage record, timestamped inside the
+    /// default test window (per-record attribution keys on each record's own
+    /// `timestamp` — Issue #9454).
     fn seed_sweep_session(&self, workspace: &Path, issue: u32, input: i64, output: i64) {
+        self.seed_session_record(
+            workspace,
+            issue,
+            input,
+            output,
+            Utc::now() - chrono::Duration::minutes(1),
+        );
+    }
+
+    /// Same, with an explicit record timestamp — what lets a test place one
+    /// session's records inside a sweep's window and another's outside it.
+    fn seed_session_record(
+        &self,
+        workspace: &Path,
+        issue: u32,
+        input: i64,
+        output: i64,
+        at: chrono::DateTime<Utc>,
+    ) {
         let dir = self
             .projects
             .join(crate::transcript_tokens::project_slug(workspace));
         fs::create_dir_all(&dir).unwrap();
+        let iso = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let head = format!(
-            "{{\"type\":\"user\",\"message\":{{\"content\":\
+            "{{\"type\":\"user\",\"timestamp\":\"{iso}\",\"message\":{{\"content\":\
              \"<command-name>/loom:sweep</command-name>\\n\
              <command-args>{issue}</command-args>\"}}}}\n"
         );
         let usage = format!(
-            "{{\"type\":\"assistant\",\"message\":{{\"model\":\"claude-sonnet-5\",\
+            "{{\"type\":\"assistant\",\"timestamp\":\"{iso}\",\"message\":{{\"model\":\"claude-sonnet-5\",\
              \"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output},\
              \"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}}}\n"
         );
-        fs::write(dir.join("session-uuid.jsonl"), format!("{head}{usage}")).unwrap();
+        let name = format!("session-{}.jsonl", at.timestamp_nanos_opt().unwrap_or_default());
+        fs::write(dir.join(name), format!("{head}{usage}")).unwrap();
     }
 }
 
@@ -158,6 +181,58 @@ fn cancellation_mid_builder_reports_the_partial_usage_it_really_burned() {
     let rows = usage.tokens_by_model.expect("per-model breakdown");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].model, "claude-sonnet-5");
+}
+
+/// Issue #9454's acceptance: two sweeps of the same issue run back-to-back
+/// on one host, and each `resolve` reports only its own window's usage —
+/// an older session's history is never folded into a later sweep's
+/// window, however recently the older file was last written.
+#[test]
+#[serial]
+fn two_back_to_back_sweeps_never_fold_each_others_sessions() {
+    let store = ClaudeStore::seed();
+    let workspace = Path::new("/workspace/back-to-back");
+
+    // Sweep 1's session wrote a big record two hours ago; sweep 2's wrote
+    // a small record one minute ago. Both FILES now have fresh mtimes
+    // (the second write refreshed the first file's), which is exactly the
+    // shape that made the old whole-file attribution fold sweep 1's
+    // history into sweep 2.
+    store.seed_session_record(
+        workspace,
+        9454,
+        5_000_000,
+        40_000,
+        Utc::now() - chrono::Duration::hours(2),
+    );
+    store.seed_session_record(
+        workspace,
+        9454,
+        80_000,
+        2_000,
+        Utc::now() - chrono::Duration::minutes(1),
+    );
+
+    let now = Utc::now();
+    let sweep1 = resolve(
+        None,
+        workspace,
+        9454,
+        Some((now - chrono::Duration::hours(3), now - chrono::Duration::hours(1))),
+        None,
+    );
+    let sweep2 =
+        resolve(None, workspace, 9454, Some((now - chrono::Duration::minutes(30), now)), None);
+
+    assert_eq!(sweep1.status, crate::telemetry::TokensStatus::Measured);
+    assert_eq!(sweep1.tokens_in, Some(5_000_000), "sweep 1 sees only its own window's record");
+    assert_eq!(sweep2.status, crate::telemetry::TokensStatus::Measured);
+    assert_eq!(
+        sweep2.tokens_in,
+        Some(80_000),
+        "sweep 2 must not inherit sweep 1's history (#9454)"
+    );
+    assert_eq!(sweep2.tokens_out, Some(2_000));
 }
 
 #[test]
@@ -301,4 +376,74 @@ fn window_declines_when_neither_end_is_known() {
     // every such sweep as a fabricated zero.
     assert_eq!(window(None, 0), None);
     assert_eq!(window(None, -5), None);
+}
+
+// ── The #9454 plausibility guard ──
+
+fn measured_usage(tokens_in: u64) -> SweepUsage {
+    SweepUsage {
+        tokens_in: Some(tokens_in),
+        tokens_out: Some(1_000),
+        tokens_by_model: None,
+        status: TokensStatus::Measured,
+        reason: None,
+    }
+}
+
+#[test]
+fn a_measured_result_over_the_ceiling_is_reclassified_suspect() {
+    // 136.8M input tokens in 292s ≈ 468k/s — the #9454 evidence row
+    // (rjwalters/loom#8450's judge-only landing sweep).
+    let usage = apply_plausibility_guard(measured_usage(136_800_000), 292);
+    assert_eq!(usage.status, TokensStatus::Suspect);
+    assert_eq!(usage.reason.as_deref(), Some("implausible_input_rate"));
+    // The counters are still published — flagged, not dropped.
+    assert_eq!(usage.tokens_in, Some(136_800_000));
+}
+
+#[test]
+fn a_plausible_measured_result_passes_through_untouched() {
+    // ~32k/s — the #9440-study fleet median shape.
+    let usage = apply_plausibility_guard(measured_usage(3_200_000), 100);
+    assert_eq!(usage.status, TokensStatus::Measured);
+    assert_eq!(usage.reason, None);
+}
+
+#[test]
+fn non_measured_statuses_are_never_suspected() {
+    // A preflight death's measured zero cannot become suspect, whatever
+    // the duration; neither can an unattributable absence.
+    let zero = SweepUsage {
+        tokens_in: Some(0),
+        tokens_out: Some(0),
+        tokens_by_model: None,
+        status: TokensStatus::NotSpawned,
+        reason: Some("preflight-no-cli-start".to_string()),
+    };
+    assert_eq!(apply_plausibility_guard(zero, 0).status, TokensStatus::NotSpawned);
+
+    let absent = SweepUsage::unattributable(REASON_NO_TRANSCRIPT);
+    assert_eq!(apply_plausibility_guard(absent, 0).status, TokensStatus::Unattributable);
+}
+
+#[test]
+fn the_ceiling_is_the_documented_100k_per_second() {
+    // Exactly at the ceiling is measured; one token past it is suspect.
+    assert_eq!(
+        apply_plausibility_guard(measured_usage(100_000), 1).status,
+        TokensStatus::Measured
+    );
+    assert_eq!(
+        apply_plausibility_guard(measured_usage(100_001), 1).status,
+        TokensStatus::Suspect
+    );
+    // A zero/negative duration divides by one second, not by zero.
+    assert_eq!(
+        apply_plausibility_guard(measured_usage(50_000), 0).status,
+        TokensStatus::Measured
+    );
+    assert_eq!(
+        apply_plausibility_guard(measured_usage(200_000), 0).status,
+        TokensStatus::Suspect
+    );
 }

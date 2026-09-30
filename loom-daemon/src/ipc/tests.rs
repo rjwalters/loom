@@ -1933,11 +1933,14 @@ fn timing_tolerance_from_busy_fraction_widens_near_saturation_but_is_capped() {
 #[serial_test::serial]
 async fn dispatch_sweep_nonblocking_burst_acks_well_under_the_client_deadline() {
     const BURST: u32 = 10;
-    let poll_delay = Duration::from_millis(700);
-    let (sr, dir) = slow_poll_sweep_registry_in_tempdir(poll_delay);
+    let (sr, dir) = slow_poll_sweep_registry_in_tempdir(Duration::from_millis(700));
     let _guard = seed_temp_registry(&[dir.path()]);
     let bus = Arc::new(EventBus::new());
     let pool = Arc::new(WorkspacePool::new(bus.clone(), test_runtime_handle()));
+
+    // Calibrate against THIS host's cost of one serialized dispatch (#9194);
+    // see `dispatch_burst_calibration::measure_serial_cost`.
+    let measured_serial_one = dispatch_burst_calibration::measure_serial_cost(&sr, 83_999).await;
 
     let start = std::time::Instant::now();
     let mut handles = Vec::new();
@@ -1971,7 +1974,13 @@ async fn dispatch_sweep_nonblocking_burst_acks_well_under_the_client_deadline() 
     let elapsed = start.elapsed();
     assert_eq!(sweep_ids.len(), BURST as usize);
 
-    let serialized_bound = poll_delay * BURST;
+    // A deliberately-serialized burst would take roughly
+    // `measured_serial_one * BURST` — measured moments ago, on this same
+    // host, under the same load, rather than assumed from a fixed constant.
+    // Assert the concurrent burst completes in well under that, proving it
+    // did NOT serialize behind the registry mutex, while still tolerating
+    // host-load inflation that hits both measurements alike.
+    let serialized_bound = measured_serial_one * BURST;
     assert!(
         elapsed < serialized_bound / 2,
         "burst of {BURST} concurrent dispatch_sweep calls took {elapsed:?} — looks \
@@ -1983,8 +1992,7 @@ async fn dispatch_sweep_nonblocking_burst_acks_well_under_the_client_deadline() 
     );
 
     for id in &sweep_ids {
-        let mut sr = sr.lock().unwrap();
-        let _ = sr.cancel(id, Duration::from_millis(50));
+        let _ = sr.lock().unwrap().cancel(id, Duration::from_millis(50));
     }
 }
 
@@ -5694,3 +5702,9 @@ fn test_abort_supersedes_running_supervisor_generation() {
 }
 
 mod status_round_trip;
+
+// The #9194 burst-calibration helper lives in its own sibling module rather
+// than being appended here: this module is over the 1000-line ratchet
+// threshold and frozen at its current size (`.loom/docs/file-size-policy.md`
+// — "put the new code in a NEW sibling module").
+mod dispatch_burst_calibration;

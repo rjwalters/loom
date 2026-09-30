@@ -330,6 +330,58 @@ pub enum SweepResult {
 }
 
 /// One attempt at one named lifecycle phase — the unit
+/// Why a sweep was dispatched — the low-cardinality `trigger` vocabulary
+/// (Issue #9444). Serialized snake_case like [`SweepResult`]; carried as the
+/// string's own value on the record so the closed set stays a documentation
+/// and derivation-side contract (derivation in
+/// `sweep_registry::outcome_journal::lineage`).
+pub mod trigger {
+    /// The first sweep for this repo#issue on this host's journal.
+    pub const FIRST: &str = "first";
+    /// Re-dispatch after the previous attempt died to the environment
+    /// (spawn/preflight death, pool exhaustion, cancellation).
+    pub const RETRY_AFTER_ENV_FAILURE: &str = "retry_after_env_failure";
+    /// Re-dispatch after the previous attempt failed substantively (builder
+    /// could not complete, judge rejected, doctor loop exhausted).
+    pub const RETRY_AFTER_SUBSTANTIVE_FAILURE: &str = "retry_after_substantive_failure";
+    /// Dispatched to run Doctor after a judge `changes-requested`.
+    pub const DOCTOR_AFTER_CHANGES_REQUESTED: &str = "doctor_after_changes_requested";
+    /// Dispatched because main moved under the work.
+    pub const REBASE_MAIN_MOVED: &str = "rebase_main_moved";
+    /// Dispatched to resolve a merge conflict.
+    pub const MERGE_CONFLICT: &str = "merge_conflict";
+    /// Re-judge against a stale base.
+    pub const STALE_BASE_REJUDGE: &str = "stale_base_rejudge";
+    /// Dispatched to fix a CI failure.
+    pub const CI_FAILURE_FIX: &str = "ci_failure_fix";
+    /// A human or external tool asked for this sweep.
+    pub const OPERATOR_REDISPATCH: &str = "operator_redispatch";
+    /// The dispatch reason was not observable. Counted, never silently merged.
+    pub const UNKNOWN: &str = "unknown";
+}
+
+/// One in-sweep rework event (Issue #9444) — a counted entry on
+/// [`SweepOutcomeRecord::rework_events`], written by the path that performed
+/// the rework (today: the merge path's stale-base handling via the
+/// `.loom/logs/sweep-rework-events.jsonl` marker protocol; see
+/// `telemetry-schema.md`'s rework table).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReworkEvent {
+    /// What kind of rework: `rebase` | `merge_conflict` | `ci_rerun` |
+    /// `rejudge`.
+    pub kind: String,
+    /// Why it happened, when the emitter knows (free-form-short).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// `substantive` (the work was hard) or `environmental` (the ground moved)
+    /// per the classification table in `telemetry-schema.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
+    /// How long the rework took, when the emitter measured it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_sec: Option<i64>,
+}
+
 /// [`SweepOutcomeRecord::phase_durations`] is a list of: how long it took and
 /// (Issue #9443) what it cost.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -450,6 +502,14 @@ pub enum TokensStatus {
     /// was. Never coerce this to zero: that is exactly the undercount #9440
     /// exists to remove.
     Unattributable,
+    /// Measured, but the plausibility guard fired (Issue #9454): the counters
+    /// imply more input tokens per wall-clock second than the sweep could
+    /// physically have consumed (the #9440-study evidence: 250M tokens in a
+    /// 22-second curator-only failure). The counters are still published —
+    /// flagged, never as a clean measurement — so a misattribution regression
+    /// is visible per host per day (`sweep-facts-queries.sql` SF3) instead of
+    /// silently poisoning per-issue cost sums.
+    Suspect,
 }
 
 /// `sweep.started` — a sweep began work on an issue.
@@ -479,6 +539,23 @@ pub struct SweepStartedRecord {
     /// not name its runtime; never fabricated as `"claude"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// The Curator's story-point size estimate for this sweep's issue (Issue
+    /// #9432, epic #9429) — the numeric value of its single `points:*` label,
+    /// carried on the `sweep.global.dispatch` event from the label read the
+    /// dispatch path's own park-label guard already performs (**no** extra
+    /// forge round trip).
+    ///
+    /// Present here as well as on [`SweepOutcomeRecord::story_points`] so a
+    /// consumer can see the size of the work **in flight**, not only after it
+    /// terminates — queue-weight and capacity questions ("how many points are
+    /// being worked right now?") cannot wait for the outcome record.
+    ///
+    /// **Absent, never zero** — same contract as the outcome record's field: no
+    /// `points:*` label, an out-of-vocabulary one, more than one (logged
+    /// loudly, never guessed), a skipped/failed label read, or a `PrSet`
+    /// dispatch (which claims no issue) all omit the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u32>,
 }
 
 /// `sweep.phase` — a sweep advanced to a new lifecycle phase.
@@ -809,6 +886,29 @@ pub struct SweepOutcomeRecord {
     /// masquerading as data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complexity: Option<String>,
+    /// The Curator's story-point size estimate for this sweep's issue (Issue
+    /// #9432, epic #9429) — the numeric value of its single `points:*` label,
+    /// one of `1`/`2`/`3`/`5`/`8`/`13`.
+    ///
+    /// This is the *a priori* size axis that makes every actual this record
+    /// already carries (`tokens_in`/`tokens_out`, `lines_added`/`lines_deleted`,
+    /// `total_duration_sec`, `doctor_cycles`) joinable to an estimate without
+    /// leaving the telemetry store: "story points landed per day" (#9433) and
+    /// the estimate-vs-actual calibration loop (#9434) both read it from here.
+    ///
+    /// Resolved by [`crate::story_points::resolve_story_points`] from the label
+    /// list the terminal transition's `fetch_issue_signals` read already
+    /// carries — **no** extra forge round trip, the same single REST call that
+    /// sources [`complexity`](Self::complexity) and the disposition end state.
+    ///
+    /// **Absent, never zero.** The key is omitted when the issue carries no
+    /// `points:*` label (a pre-epic or operator-filed issue), when its single
+    /// points label is out of vocabulary, when it carries **more than one**
+    /// (logged loudly and never guessed at — see `story_points`' module doc),
+    /// or when the read failed/was skipped. A `0` would claim someone sized
+    /// this issue at nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u32>,
     /// Why this record's token counters read the way they do (Issue #9440) —
     /// see [`TokensStatus`]. Present on every record this daemon writes; a
     /// record written before #9440 omits it, which a consumer must read as
@@ -834,6 +934,54 @@ pub struct SweepOutcomeRecord {
     /// BY`, which is the whole point of separating the absence cases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_status_reason: Option<String>,
+    /// 1-based count of terminal sweeps for this repo#issue in this host's
+    /// durable outcome journal (Issue #9444) — the attempt this sweep was.
+    /// Absent when the journal could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_index: Option<u32>,
+    /// The `sweep_id` of the immediately preceding attempt for this repo#issue
+    /// (Issue #9444), when the journal showed one. Absent for a first attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_sweep_id: Option<String>,
+    /// Why this sweep was dispatched (Issue #9444) — one of the
+    /// [`trigger`] constants. Derived at the terminal transition from the
+    /// journal's previous attempt and this sweep's own recorded context;
+    /// `unknown` is counted, never silently merged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    /// In-sweep rework events (Issue #9444) observed by the paths that
+    /// performed them, in event order. Absent (never `[]`) when none were
+    /// observed for this sweep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rework_events: Option<Vec<ReworkEvent>>,
+    /// Every PR number this sweep's lifecycle was observed to carry, in
+    /// first-seen order (Issue #9465) — the multi-PR slice shape the single
+    /// [`pr_number`](Self::pr_number) (the latest) cannot represent. Absent
+    /// (never `[]`) when no PR was ever sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_numbers: Option<Vec<u32>>,
+    /// Hand-written lines added by the sweep's own commits (Issue #9466):
+    /// [`lines_added`](Self::lines_added) minus the lines in
+    /// generated-classified paths (`generatedPaths` config globs over the
+    /// shipped default — see `telemetry-schema.md`). Absent whenever
+    /// `lines_added` is absent, or the diff's paths could not be classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_lines_added: Option<i64>,
+    /// Hand-written lines deleted, alongside [`Self::hw_lines_added`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_lines_deleted: Option<i64>,
+    /// Distinct non-generated files in the landing diff (Issue #9466).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_files: Option<i64>,
+    /// Lines in generated-classified paths of the landing diff (Issue #9466),
+    /// reported — not counted as work. Absent alongside [`Self::hw_lines_added`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_lines: Option<i64>,
+    /// Lines in test files of the landing diff (Issue #9466) — paths matching
+    /// the documented test-file convention. Absent alongside
+    /// [`Self::hw_lines_added`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_lines: Option<i64>,
 }
 
 impl SweepOutcomeRecord {
@@ -1479,6 +1627,85 @@ pub struct HostHealthRecord {
     /// empty; a pre-#9014 record decodes as empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captainless_singleton_jobs: Vec<String>,
+    /// This host's memory/pressure readings at the sampling moment — the
+    /// "deferred vs killed vs timed out" slice (RAM, compressed memory,
+    /// swap and its rates, PSI class, kernel OOM counter) — see
+    /// [`MemoryPressureSummary`]. `None` when the platform measured nothing
+    /// at all (older daemons predating this field decode as `None` too).
+    ///
+    /// `#[serde(default)]` so a pre-memory-field record still decodes
+    /// rather than failing the whole envelope — the same
+    /// backward-compatibility contract `protection` established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryPressureSummary>,
+}
+
+/// Memory/pressure readings at one host.health sampling moment: physical
+/// RAM total/available, the compressed page store, swap capacity/usage,
+/// the cumulative swap in/out counters and per-sample rates, the PSI
+/// pressure class, and the kernel OOM-kill counter. This is the host state
+/// an operator needs to read off a ~30-minute role attempt that ended in a
+/// load deferral *without* any runtime span: with these beside the span's
+/// bound, "deferred for memory" (PSI some/full, swapping, attempt never
+/// reached a runtime), "killed" (`oom_kill_total` grew, exit unobserved),
+/// and "timed out" (no pressure, nothing measured) are distinguishable.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryPressureSummary {
+    /// Total physical memory installed, in bytes
+    /// (`/proc/meminfo` on Linux, `hw.memsize` on macOS) — the denominator
+    /// for a readable availability percentage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_total_bytes: Option<u64>,
+    /// Memory available to meet a new allocation without reclaim, in bytes
+    /// (`MemAvailable` on Linux; free + inactive on macOS). The single most
+    /// direct "is this host about to run out of memory" gauge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_available_bytes: Option<u64>,
+    /// Memory the kernel has compressed rather than paged to disk (macOS
+    /// `vm_stat` "occupied by compressor") — a leading pressure indicator
+    /// before swapping starts. Unmeasurable through the Linux sources this
+    /// daemon reads, so absent there, never a fake `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_compressed_bytes: Option<u64>,
+    /// Total swap capacity in bytes, when the platform exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_total_bytes: Option<u64>,
+    /// Swap currently in use, in bytes; absent where the platform exposes
+    /// no counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_used_bytes: Option<u64>,
+    /// Cumulative swap-in volume for the host's lifetime, normalized to
+    /// **bytes** (both macOS and Linux count pages) so one gauge means one
+    /// thing fleet-wide. Counters reset only across a reboot; a rollback
+    /// reads as unknown, never negative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_in_bytes_total: Option<u64>,
+    /// Cumulative swap-out volume, normalized to bytes; same absence and
+    /// rollback contract as `swap_in_bytes_total`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_out_bytes_total: Option<u64>,
+    /// Swap-in rate in bytes/second, computed by the daemon between
+    /// successive samples (`None` on the first sample after daemon start,
+    /// on a counter reset, or when the counters are unmeasurable — never a
+    /// fabricated `0.0`). Persistent nonzero values are the host's loudest
+    /// "out of physical memory" signal in metric form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_in_bytes_per_sec: Option<f64>,
+    /// Swap-out rate in bytes/second; same measurement and absence
+    /// contract as `swap_in_bytes_per_sec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_out_bytes_per_sec: Option<f64>,
+    /// PSI memory-pressure class over the last 10 s (`"none"` / `"some"` /
+    /// `"full"`, from Linux `/proc/pressure/memory`); macOS has no PSI file,
+    /// and the compression/swap fields carry the pressure signal instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_pressure: Option<crate::host_pressure::MemoryPressure>,
+    /// Cumulative kernel OOM kills for the host's lifetime (Linux
+    /// `/proc/vmstat` `oom_kill`), when the kernel exposes the counter —
+    /// the span-level signal that an unobserved exit was *killed* rather
+    /// than *deferred*. Absent on kernels without the counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_kill_total: Option<u64>,
 }
 
 /// One repository this host's daemon is currently managing (Issue #4976) —

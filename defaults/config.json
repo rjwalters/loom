@@ -16,6 +16,7 @@
     "socket": null,
     "room": null,
     "persona": "loom_daemon",
+    "operatorMention": null,
     "workerPersonas": [],
     "mcpCommand": "safehouse-mcp",
     "peerClaimTtlSecs": 120,

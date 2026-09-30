@@ -1853,6 +1853,8 @@ pub use dispatch_plan::{
     DispatchPlanContext, PlanGate, PlanKey, PlanShard, PlanSlots, PlanState, RepoCapView, RowPlan,
     PLAN_SCOPE,
 };
+mod fleet_plan;
+pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
 mod work_finder_tick;
 pub use work_finder_tick::WorkFinderTickSummary;
 
@@ -2038,6 +2040,13 @@ pub struct PeerClaimStatus {
     /// peer claim (the #5789 enforcement path) — the proof the mechanism
     /// actually prevented a duplicate.
     pub dispatch_skipped: u64,
+    /// How many of this host's claim-ad sends safehoused **refused** (Issue
+    /// #9294). Read beside `advertised`, which counts *attempts*: when the two
+    /// track each other, this host is publishing nothing and every fleet-wide
+    /// brake built on the channel is inert. `#[serde(default)]` keeps pre-#9294
+    /// wire data / older clients compatible (deserializes as `0`).
+    #[serde(default)]
+    pub advertise_rejected: u64,
     /// Peer-coordination degradation state (Issue #6157) — see
     /// [`PeerCoordinationHealth`]. `#[serde(default)]` keeps pre-#6157 wire
     /// data / older clients compatible (deserializes as the all-healthy
@@ -2088,6 +2097,17 @@ pub struct PeerCoordinationHealth {
     /// How many consecutive receives recovery requires
     /// ([`crate::peer_claims::resolve_coordination_recovery_threshold`]).
     pub recovery_threshold: u64,
+    /// The last verdict sentence
+    /// [`crate::peer_claims::PeerClaimView::evaluate_coordination`] produced —
+    /// Issue #9294. Before this, a degraded verdict surfaced only as a `bool`
+    /// plus two raw counters an operator had to interpret, and the *reason*
+    /// (which distinguishes "peers are idle" from "the homeserver is refusing
+    /// every send") existed only in the reaper's return value, which nothing
+    /// persisted. `None` before the first reaper tick has evaluated. Rendered
+    /// verbatim by `loom-daemon status` whenever `degraded` is true.
+    /// `#[serde(default)]` keeps older clients compatible.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// One live peer claim entry within [`PeerClaimStatus::entries`] (Issue
@@ -2940,6 +2960,20 @@ pub enum Event {
         /// compatible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
+        /// The issue's story-point size estimate (#9432, epic #9429) — the
+        /// numeric value of its single `points:*` label, resolved from the
+        /// label list the dispatch path's own #4444 park-label guard already
+        /// read (no extra forge round trip). Carried on the event because
+        /// `sweep.started` telemetry is derived from it and the collector has
+        /// no issue-label access of its own.
+        ///
+        /// Absent — never `0` — for an unsized issue, an out-of-vocabulary or
+        /// stacked points label (both logged loudly, never guessed), a skipped
+        /// label read (`skip_label_flip`), and every `PrSet` dispatch (which
+        /// claims no issue). `#[serde(default)]` keeps pre-#9432 wire data
+        /// compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        story_points: Option<u32>,
     },
     /// `sweep.global.runtime_rejected` — a dispatch was **refused** by
     /// fail-closed runtime admission (issue #4494, epic #4489 Phase 5), before
@@ -3036,6 +3070,63 @@ pub enum Event {
         /// Operator-facing advisory message naming the concrete cause.
         message: String,
     },
+    /// `operator_priority.escalation` — a starred (`loom:operator-priority`)
+    /// issue reached (or left) a state only the operator can move (Issue
+    /// #9321, the delivery half of #9244/#9301).
+    ///
+    /// Published by [`crate::star_liveness`]'s liveness pass, **exactly once
+    /// per (repo, issue, dedupe key)** and only on the pass that actually
+    /// posts the forge escalation comment — the same
+    /// `<!-- loom:operator-priority-escalation key=… -->` marker dedupe that
+    /// makes the comment once-per-cause fleet-wide therefore makes this event
+    /// once-per-cause too, across ticks, hosts and restarts. A second event
+    /// with `resolved: true` fires once when that key's ask clears.
+    ///
+    /// Consumed by the Safehouse narration sink
+    /// ([`crate::safehouse::operator_priority_envelope`] — *not*
+    /// `event_to_envelope`, which returns `None` for this variant because the
+    /// body needs `safehouse.operatorMention` from config), which renders it as a
+    /// `handoff` envelope — the `Signal` attention class, i.e. the team's
+    /// notifications-on Matrix room — so the ask reaches the human rather than
+    /// only a forge comment nobody reads in time (the #9268 failure mode).
+    ///
+    /// Secret-free by construction: forge slug, issue number, dedupe key, ask
+    /// kind/stage wire names, the operator-facing ask sentence, the issue's
+    /// web URL, and the observing host id. No token, account, credential or
+    /// log path.
+    OperatorPriorityEscalation {
+        /// Forge `owner/repo` of the escalated issue. (This topic is not
+        /// shared with `sweep.issue.{N}.*`, so it needs no #3929
+        /// workspace-root `repo` field to disambiguate issue numbers — the
+        /// slug already does, and the operator-facing link needs it anyway.)
+        slug: String,
+        /// The escalated issue.
+        issue: u32,
+        /// The escalation's dedupe key, `<kind>:<specifics>` — identical to
+        /// the key in the forge comment's marker
+        /// ([`crate::star_liveness::escalate::marker`]).
+        key: String,
+        /// [`AskKind`] wire name (e.g. `no-progress`, `merge-refused`).
+        kind: String,
+        /// [`LandingStage`] wire name at escalation time (e.g. `in-review`).
+        stage: String,
+        /// The ask itself, one or two sentences naming what to do.
+        text: String,
+        /// The issue's canonical web URL, so the room line is clickable.
+        url: String,
+        /// The host whose pass observed it (the same id the forge comment
+        /// names).
+        host: String,
+        /// Set when the escalated row is a blocker that inherited its star:
+        /// the starred issue it inherited from.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inherited_from: Option<u32>,
+        /// `false` on the escalation itself; `true` on the recovery notice
+        /// fired once when the ask clears. Mirrors
+        /// `daemon.capacity.advisory`'s `pressured` direction flag rather than
+        /// spending a second topic on the clearing edge.
+        resolved: bool,
+    },
     /// `daemon.idle_exit` — the daemon is cleanly yielding to a host
     /// idle-shutdown guard (Issue #4467).
     DaemonIdleExit {
@@ -3078,6 +3169,7 @@ impl Event {
     /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
     /// | `CapacityAdvisory {..}` | `daemon.capacity.advisory` |
     /// | `PreflightAdvisory {..}` | `daemon.preflight.advisory` |
+    /// | `OperatorPriorityEscalation {..}` | `operator_priority.escalation` |
     /// | `TopicLag {..}` | `sweep.system.topic_lag` |
     /// | `Generic {topic, ..}` | the explicit topic string |
     ///
@@ -3105,6 +3197,7 @@ impl Event {
             }
             Self::CapacityAdvisory { .. } => "daemon.capacity.advisory".to_string(),
             Self::PreflightAdvisory { .. } => "daemon.preflight.advisory".to_string(),
+            Self::OperatorPriorityEscalation { .. } => "operator_priority.escalation".to_string(),
             Self::DaemonIdleExit { .. } => "daemon.idle_exit".to_string(),
             Self::TopicLag { .. } => "sweep.system.topic_lag".to_string(),
             Self::Generic { topic, .. } => topic.clone(),

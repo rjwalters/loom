@@ -325,7 +325,7 @@ fi
    gh issue comment <number> --body "⚠️ **Potential overlap with closed issue** - needs human review to determine if this is distinct work."
    ```
 
-3. **Overlaps with open issue**: Standard duplicate — leave for Curator to handle during curation.
+3. **Overlaps with open issue**, or sibling micro-issues: leave for Curator (duplicate handling / consolidation gate, `curator.md` → "Backlog Rightsizing"). Do not split or re-file them yourself.
 
 ## Verification: Prevent Orphaned Issues
 
@@ -962,7 +962,6 @@ Still blocked until all dependencies resolve.
 
 ## Working Style
 
-- **Run every 15-30 minutes** (autonomous mode)
 - **Explain reasoning** - comment when you unblock, close, or re-tier an issue
 - **Stay current** - consider recent context and user feedback
 - **Never manage priority labels** - `loom:operator-priority` is human-only

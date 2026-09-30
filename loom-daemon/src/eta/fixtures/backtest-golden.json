@@ -1,0 +1,56 @@
+{
+  "heuristic": "land-v1",
+  "kind": "land",
+  "overall": {
+    "n": 164,
+    "scored": 110,
+    "refused": 54,
+    "mean_pinball_loss_sec": 15962.464,
+    "coverage": 0.336,
+    "bias_sec": 9069.791
+  },
+  "by_repo": {
+    "rjwalters/loom": {
+      "n": 164,
+      "scored": 110,
+      "refused": 54,
+      "mean_pinball_loss_sec": 15962.464,
+      "coverage": 0.336,
+      "bias_sec": 9069.791
+    }
+  },
+  "by_horizon": {
+    "15m_1h": {
+      "n": 43,
+      "scored": 43,
+      "refused": 0,
+      "mean_pinball_loss_sec": 8847.983,
+      "coverage": 0.256,
+      "bias_sec": 5116.953
+    },
+    "1h_4h": {
+      "n": 42,
+      "scored": 42,
+      "refused": 0,
+      "mean_pinball_loss_sec": 29039.22,
+      "coverage": 0.333,
+      "bias_sec": 16088.69
+    },
+    "lt_15m": {
+      "n": 25,
+      "scored": 25,
+      "refused": 0,
+      "mean_pinball_loss_sec": 6230.42,
+      "coverage": 0.48,
+      "bias_sec": 4076.92
+    },
+    "refused": {
+      "n": 54,
+      "scored": 0,
+      "refused": 54,
+      "mean_pinball_loss_sec": null,
+      "coverage": null,
+      "bias_sec": null
+    }
+  }
+}

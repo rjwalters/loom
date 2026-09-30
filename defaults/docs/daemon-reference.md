@@ -232,6 +232,7 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `daemon.drain.roll_pending` | Drain supervisor (#6007)      | `{in_flight, attempt, window_secs, budget_secs}` |
 | `daemon.drain.superseded`  | Auto-update loop (#8514)       | `{from, to}` (artifact identities) |
 | `forge.event`               | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
+| `operator_priority.escalation` | Star-liveness pass (#9321)   | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 
 The four `epic.issue.{N}.*` topics were authorized by **#3873** (epic #3842
 Phase 4) and are documented in full under [Epic supervisor](#epic-supervisor-3842)
@@ -269,6 +270,23 @@ rate-limited clients and must be idempotent under the per-page dedup contract
 on-disk journal is the copy, the prompt is a "check now"). Invariant source:
 `docs/adr/0021-forge-event-plane.md` (ADR-0021); implementation:
 `loom-daemon/src/forge_events.rs`.
+
+The `operator_priority.escalation` topic was authorized by **#9321** (the
+delivery half of #9244/#9301). Publisher: the star-liveness pass
+(`loom-daemon/src/star_liveness/`); consumer: the Safehouse narration sink,
+which renders it as a `handoff` envelope into the signal room so a starred
+issue's operator ask reaches the human rather than sitting in a forge comment
+nobody reads in time (#9268: four agents commented for seven hours). It is
+emitted on a **state change** like the `*.advisory` topics, but keyed rather
+than boolean: exactly once per `(repo, issue, <kind>:<specifics>)`, and **only
+on the pass that actually posts that key's forge escalation comment**. That
+coupling is what makes it once-per-cause *fleet-wide* rather than per-host — the
+forge marker is the shared lock, so a peer host that finds the comment already
+posted publishes nothing, and neither does a restarted daemon. A second event
+with `resolved: true` fires once when the ask clears, from the host that
+announced it. Room routing, the `safehouse.operatorMention` ping and the
+rendered line are documented in
+[`safehouse.md` → Operator-priority escalations](safehouse.md#operator-priority-escalations-9321).
 
 **`Generic`-topic rule.** A `Generic` topic is allowed only while it (a) is
 listed in this inventory, (b) carries a `source` field naming its producing
@@ -1970,7 +1988,13 @@ a key. Only the six keys below order the queue.
    never reads a timeline for an unstarred issue, and removing the star drops the
    cache entry. A missing starred-at falls back to `createdAt`. A star applied
    from loom-ui uses the intent's `requested_at` instead (#9244 C, below). A
-   blocker inheriting a star sorts at that star's position.
+   blocker inheriting a star sorts at that star's position. The cache evicts
+   promptly (any tick that does not list the issue as starred drops its entry),
+   which is deliberate and has two accepted consequences (#9314): a star flipped
+   off and back on entirely *between* two ticks keeps its old starred-at, and an
+   issue that leaves the listing — every `loom:building` claim — is read again
+   when it returns. Both affect ordering among starred issues only; see
+   `StarredAtCache`'s "Accepted staleness" doc comment.
 3. **Red-main fixes first**: an issue whose body carries
    `<!-- loom:main-red-fix -->` at the start of a line, **only while its repo's
    `main` is verified red** (`WorkspaceHealthStates::is_halted`). A marker on a
@@ -2028,6 +2052,26 @@ sweep record carries `overflow: true` (shown in `list_sweeps`,
 it in `TickReport::dispatched_overflow`, and its ready-queue row reads
 `dispatched this tick (overflow)`.
 
+**The flag survives a daemon restart (#9314).** It is stamped onto the sweep's
+claim lock (`.loom/locks/issue-<N>/owner.json`, `"overflow": true` — written
+only when true) the moment the slot is taken, and `reconstruct()` restores it
+onto the adopted entry. So a restart mid-flight keeps the `[overflow]` marker in
+`status`/`list_sweeps` and keeps the slot accounted as taken, instead of handing
+it to a second starred issue once one normal sweep ends. Two residual gaps, both
+deliberate and both bounded by the same `occupancy <= configured` gate (a host
+never exceeds max+1 either way):
+
+- a sweep adopted from the **machine sweep journal** rather than its lock
+  (`adopt_live_journal_sweeps`, #6262 — the survivor whose lock did *not*
+  survive) comes back without the flag: the journal records no such field, and
+  widening its schema is outside that pass's read-only adopt-only contract;
+- a checkpoint-only recovery is `Crashed`, and only non-terminal entries hold
+  the slot, so it never needs the flag.
+
+If the lock is already gone when the slot is taken (the sweep finished in that
+window), the stamp is skipped with a `warn` — the in-memory mark still governs
+the running daemon.
+
 **Main-health halt admits only fixes.** A repo halted because its `main` is
 verified red still admits its `<!-- loom:main-red-fix -->` candidates, and only
 those; every other ready issue in it, starred or not, keeps `workspace_halted`.
@@ -2075,13 +2119,25 @@ An escalation is one comment on the issue, carrying
 (issue, key) is posted once: a per-process ledger skips repeats without a
 forge call, and every host reads the issue's comments for the marker before
 posting. Only a marker from an `OWNER` / `MEMBER` / `COLLABORATOR`, the fleet
-App (`LOOM_GITHUB_APP_SLUG` > `forge.githubApp.slug`, else
-`loom-fleet-dispatch*`; only as an App login, `…[bot]` or `app/…`, which no
+App (any identity in the forge roster — `LOOM_GITHUB_APP_SLUG` > the writer's
+slug, each reader, `legacyLogins` — plus `loom-fleet-dispatch` / `-<digits>`
+exactly, never a prefix; only as an App login, `…[bot]` or `app/…`, which no
 user can register) or the daemon itself counts; an outside commenter cannot
 pre-post one to suppress an ask. The `pools-exhausted` key is the issue's forge state, not the
 host's hold, so every host and every re-exhaustion share it until the issue
-moves. Safehouse / Matrix delivery is not wired yet (the Safehouse sink only
-narrates the frozen event taxonomy).
+moves.
+
+**Matrix delivery (#9321).** The pass that posts a comment also publishes
+`operator_priority.escalation` on the bus, which the Safehouse sink relays into
+the signal room as a `handoff` — pinging `safehouse.operatorMention` — so the
+ask reaches the operator where they actually are, not only on the issue. One
+post per `(issue, key)` fleet-wide: the notice is produced by the same call that
+posts the comment and *only* when it posts, so the marker dedupe above is the
+only dedupe, and a peer host or a restarted daemon that finds the marker stays
+quiet. One un-pinged `resolved ✓` line follows when the ask clears. With
+`safehouse.enabled` false (or no socket) nothing changes: the comment and the
+`health`/`status`/`queue` surfaces still carry the ask. See
+[`safehouse.md` → Operator-priority escalations](safehouse.md#operator-priority-escalations-9321).
 
 **Blocker inheritance.** The issue blocking a starred issue (named by
 `Blocked by #N` on a `loom:blocked` issue, the incident behind a merge refusal,
@@ -2161,7 +2217,7 @@ The fleet dashboard view is phase 3.
 (`running` / `next` / `queued` / `blocked`), `gate`, `keys`, `in_slice`,
 `hot`, `owning_shard` and `repo_cap`. The tick summary carries a `plan` block:
 `slots` (`max_concurrent`, `occupancy`, `free`, `max_admissions_per_tick`,
-`saturation_held`, `any_halted`), `tick_interval_secs`, `shard`, `scope` and
+`saturation_held`, `any_halted`, `overflow_free`), `tick_interval_secs`, `shard`, `scope` and
 `ordering`. `position` is the order pass 2 actually offered candidates in,
 after the repo-slice and per-repo-cap shaping. `rank` is still the bare
 comparator rank, so the two differ whenever sharding or
@@ -2171,6 +2227,8 @@ comparator rank, so the two differ whenever sharding or
 than a hard-coded string. `loom:curated` / `loom:triage` are unordered and never
 listed. The single-workspace tick has no plan (`plan: null`). Field reference:
 [`telemetry-schema.md` § `queue.snapshot`](telemetry-schema.md#queuesnapshot).
+Folding several hosts' plans into one fleet order (`merge_plans`, #9310) is a
+separate rule: [`dispatch-plan.md`](dispatch-plan.md).
 
 ## Forge-side pipeline snapshot (`status --pipeline`, #3977)
 
@@ -2495,7 +2553,8 @@ re-estimates on every sweep transition, and the collector's 5-minute pass
 reads the review-label listings, resolves PRs that left review, and refreshes
 every live estimate. Every observed stage boundary is appended to
 `.loom/logs/eta-stage-samples.jsonl` as it is seen; pending estimates persist
-in `.loom/state/eta/pending.jsonl`.
+in `.loom/state/eta/pending.jsonl` (per-host, never git-tracked — the
+managed gitignore block ignores `.loom/state/eta/`).
 
 | key | env | default |
 |---|---|---|
@@ -4645,9 +4704,9 @@ knobs not yet audited here.
 | `autonomous.workFinder.declineCooldown.cooldownSecs` | `LOOM_WORK_FINDER_DECLINE_COOLDOWN_SECS` | `21600` (6h) | How long a sweep that declined on a hard-exclusion label rule holds the issue out of dispatch. Flat, non-exponential. Deliberately longer than `noopCooldown.cooldownSecs`: a no-op release means "nothing to do *yet*", a decline means a label only a maintainer can remove is present. Zero/invalid → default |
 | `autonomous.workFinder.declineCooldown.warnThreshold` | `LOOM_WORK_FINDER_DECLINE_WARN_THRESHOLD` | `3` | Consecutive declines of one issue that emit a single WARN naming the issue and the rule it declined on. Matches `quarantine.threshold`. Zero/invalid → default |
 | `autonomous.workFinder.prlessRetry.enabled` | `LOOM_WORK_FINDER_PRLESS_RETRY` | `true` | PR-less retry bound on/off (#7972). A safety backstop — defaults on. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. See "PR-less retry bound (#7972)" below |
-| `autonomous.workFinder.prlessRetry.threshold` | `LOOM_WORK_FINDER_PRLESS_RETRY_THRESHOLD` | `3` | Consecutive dispatches that claim an issue, release it, and leave **no pull request** behind before the issue is held with `loom:blocked` (plus a comment naming the failure and the count). Matches `quarantine.threshold`. Zero/invalid → default |
+| `autonomous.workFinder.prlessRetry.threshold` | `LOOM_WORK_FINDER_PRLESS_RETRY_THRESHOLD` | `3` | Consecutive dispatches that claim an issue, release it, and leave **no pull request** behind before the issue is held with `loom:blocked` (plus a comment naming the failure and the count). Counted **fleet-wide** across dispatch hosts when peer coordination is on (#9292), per-host otherwise. Matches `quarantine.threshold`. Zero/invalid → default |
 | `autonomous.workFinder.prlessRetry.backoffSecs` | `LOOM_WORK_FINDER_PRLESS_RETRY_BACKOFF_SECS` | `300` | Window applied after the **first** PR-less release; doubles per consecutive release. Deliberately longer than `dispatchBackoff.baseSecs` — the reported symptom was claim/release pairs inside the same minute, and a PR-less release follows a full agent session, so a one-minute retry cannot plausibly land differently. Zero/invalid → default |
-| `autonomous.workFinder.prlessRetry.maxBackoffSecs` | `LOOM_WORK_FINDER_PRLESS_RETRY_MAX_BACKOFF_SECS` | `3600` | Ceiling on the doubling — also the idle window after which a cold streak restarts at zero, and the in-memory TTL of a hold (whose durable half is the `loom:blocked` label). Zero/invalid → default; clamped up to `backoffSecs` |
+| `autonomous.workFinder.prlessRetry.maxBackoffSecs` | `LOOM_WORK_FINDER_PRLESS_RETRY_MAX_BACKOFF_SECS` | `3600` | Ceiling on the doubling — also the idle window after which a cold streak restarts at zero, and the in-memory TTL of a hold (whose durable half is the `loom:blocked` label). The fleet-wide streak clock (#9292) is the shipped 3600 s regardless of this value, since a receiving host reads its peers' releases rather than their config. Zero/invalid → default; clamped up to `backoffSecs` |
 | `autonomous.workFinder.extraSkipLabels` | `LOOM_WORK_FINDER_EXTRA_SKIP_LABELS` (comma-separated) | `[]` | Per-workspace/per-repo **additional** label names (#6685) the work-finder treats as a skip/park signal, beyond the hardcoded `loom:blocked` / `loom:operator-only` (`PARK_LABELS`) — e.g. a repo-local `blocked-upstream` label that will never be renamed to a `loom:*` name. Purely additive to `SKIP_LABELS`' candidate-query filter (`WorkItem::is_skipped_with_extra`); it does **not** extend the separate dispatch()-level park-label guard (#4444) above, which stays keyed on `PARK_LABELS` only. Env replaces config entirely when set (even to an empty string); resolved once per workspace, live on the next tick (a cheap `.loom/config.json` read, no daemon restart needed). **`loom:building` can never be added to the resolved list** — filtered out defensively even if named explicitly in config/env, so a misconfiguration can never re-introduce the "an in-flight claim is treated as a park" regression `SKIP_LABELS`' own doc comment warns against |
 | *(env only)* | `LOOM_OPEN_PR_MEMO` | `true` | Verified-open-PR memo for the #4123 open-PR dispatch guard (#6788). Falsy (`0`/`false`/`no`/`off`) disables; anything else (including unset) enables. When on, the guard (a) reuses a verified "issue #N has open linked PR #M" answer for 15 minutes instead of re-running the closes-graph query on every work-finder tick, and (b) when **both** the GraphQL probe and its #5911 REST fallback fail, re-verifies that one known PR over a single `GET repos/{owner}/{repo}/pulls/{M}` before conceding. The documented fail-open contract is unchanged: with no memo, or if that recheck also cannot answer, the guard still proceeds. In-memory only — a daemon restart clears it. Disable only to restore the exact pre-#6788 probe |
 | *(env only)* | `LOOM_EMPTY_POOL_BREAKER_THRESHOLD` | `3` | How many **distinct** sources must hit an unsatisfiable token selection (exit 78) inside the window below before new dispatch to that workspace is paused (#6614). A source is an issue dispatch, or — since #7607 — a `(workspace, role)` role tick whose pre-spawn pool preflight found zero spawnable accounts. Distinct *sources*, not raw failures: one issue cycling through its own `dispatchBackoff`, or one role looping on one workspace, can never trip it. Crossing it trips the existing pre-flight advisory (#4386) + half-open dispatch gate (#5030) — one loud `ERROR` plus a `daemon.preflight.advisory` event — and the first dispatch that gets past token selection clears it. Zero/invalid → default |
@@ -5295,24 +5354,38 @@ dispatch left a pull request behind** — the one thing that loop could not fake
   release arms a window the work finder skips *before* the capacity gate —
   counted as **`prless-retry-skip`** on the per-tick summary line — so a
   re-claim cannot land in the same minute as the release, and a held candidate
-  never reserves a shared dispatch slot. A streak older than `maxBackoffSecs`
-  is cold and restarts at 1: a failure an hour ago and a failure now are not a
-  pattern.
-- **Visibility.** From the **second** consecutive release the failure reason is
+  never reserves a shared dispatch slot. A peer host's window is unioned into
+  the same skip set (#9292), so it spaces out *every* host's next claim, not
+  only the one that armed it. A streak older than `maxBackoffSecs` is cold and
+  restarts at 1: a failure an hour ago and a failure now are not a pattern.
+- **The tally is fleet-wide (#9292).** Every recorded release is broadcast over
+  the peer-claim room's brake lane carrying that host's own running count, and
+  `threshold` is compared against the **sum** — so four dispatch hosts spend
+  `threshold` claims between them, not `threshold` claims each. Before #9292 the
+  tally was a per-process integer: on `rjwalters/loom#8812` (2026-09-24) four
+  hosts spent nine claim/release cycles and posted four near-identical
+  `Attempt 2 of 3` notes before any one of them reached a hold. Requires peer
+  coordination (`safehouse.enabled`); without it each host counts alone, exactly
+  as before, and says so once per release —
+  `grep "HOST-LOCAL only" ~/.loom/daemon.log`. A dropped ad, a pre-#9292 peer,
+  or an unreadable view all fail open to this host's own exact count. A peer's
+  contribution lapses after an hour (the fleet-wide form of the streak-cold
+  rule), so a crashed host cannot pin an issue one release short of a hold.
+- **Visibility.** When the **fleet** count reaches 2 the failure reason is
   posted to the issue, so the next claimer starts from "the last attempt died
-  like *this*" instead of from nothing. Bounded by construction: at most
-  `threshold` comments per streak, versus the fourteen claim cycles and
-  eighteen comments the observed loop produced. These are **attempt notes, not
-  holds** — they apply no label and the issue stays in the queue. Each body
-  declares its kind (`<!-- loom:prless-retry-kind=attempt -->` /
-  `…=hold` / `…=hold-failed`, #9239) in addition to the shared
-  `<!-- loom:prless-retry (#7972) -->` marker, so an audit never has to infer
-  the difference from prose — before #9239 it had to, and got it wrong: on
-  `rjwalters/loom#8812` four of five "holds" were `Attempt 2 of 3` notes, one
-  per dispatch host.
-- **Hold (`threshold`).** The `threshold`-th consecutive PR-less release adds
-  `loom:blocked`, removes `loom:issue`, and comments with the failure and the
-  count. `loom:blocked` (not `loom:operator`) because it is the established
+  like *this*" instead of from nothing. Bounded by construction: one attempt
+  note per streak per *issue* (#9292 — it used to be one per streak per *host*),
+  versus the fourteen claim cycles and eighteen comments the observed loop
+  produced. These are **attempt notes, not holds** — they apply no label and the
+  issue stays in the queue. Each body declares its kind
+  (`<!-- loom:prless-retry-kind=attempt -->` / `…=hold` / `…=hold-failed`,
+  #9239) in addition to the shared `<!-- loom:prless-retry (#7972) -->` marker,
+  so an audit never has to infer the difference from prose — before #9239 it had
+  to, and got it wrong: on `rjwalters/loom#8812` four of five "holds" were
+  `Attempt 2 of 3` notes, one per dispatch host.
+- **Hold (`threshold`).** The `threshold`-th consecutive PR-less release
+  fleet-wide adds `loom:blocked`, removes `loom:issue`, and comments with the
+  failure and the count. `loom:blocked` (not `loom:operator`) because it is the established
   automated-hold state the work finder's skip-label filter and
   `quarantine_reconciliation` already understand. Release it the way every
   other `loom:blocked` park is released — fix the cause and flip it back to
