@@ -365,3 +365,81 @@ fn only_the_refusals_are_nonzero() {
     assert_eq!(Outcome::Unregistered.code(), 1);
     assert_eq!(Outcome::SentinelFailed.code(), 1);
 }
+
+/// #9106 on the ported arm: a branch name that starts with `-` reaches git as a
+/// ref OPERAND, never as an option. Both fetches this arm performs — the drift
+/// check's `fetch origin -- <branch>` and the pre-reset `fetch origin --
+/// <base>` — are driven with `--upload-pack=<payload>` against a PATH origin,
+/// which is exactly the transport on which that switch executes its value.
+///
+/// The control half proves the repro is live (without `--` the payload DOES
+/// run), so the assertion that it does not run through the port cannot pass
+/// vacuously. Dropping the `--` from either call site fails this test.
+#[test]
+fn a_dash_prefixed_branch_is_never_a_git_option() {
+    let dir = tmpdir("dash-branch");
+    let work = repo(&dir, "work");
+    let bare = dir.join("origin.git");
+    git(
+        &dir,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            work.to_str().expect("utf-8"),
+            bare.to_str().expect("utf-8"),
+        ],
+    );
+    git(&work, &["remote", "add", "origin", bare.to_str().expect("utf-8")]);
+    let wt = dir.join("wt");
+    add_worktree(&work, &wt, "feature/dash");
+
+    // git runs `--upload-pack=<cmd>` through `sh -c`, so the payload lives in a
+    // dir whose name has no shell metacharacters ([`tmpdir`]'s embeds the
+    // `ThreadId(N)` parentheses).
+    let pdir = std::env::temp_dir().join(format!("loom-wt-dash-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&pdir);
+    fs::create_dir_all(&pdir).expect("create payload dir");
+    let pdir = fs::canonicalize(&pdir).expect("canonicalize payload dir");
+    let marker = pdir.join("PWNED");
+    let payload = pdir.join("payload.sh");
+    fs::write(&payload, format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()))
+        .expect("write payload");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&payload, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let evil = format!("--upload-pack={}", payload.display());
+
+    // Control: the unseparated form really does execute the payload here.
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(&wt)
+        .args(["fetch", "origin", evil.as_str()])
+        .output()
+        .expect("run git");
+    assert!(
+        marker.exists(),
+        "control failed: `git fetch origin {evil}` did not run the payload, so this test would be vacuous"
+    );
+    fs::remove_file(&marker).expect("clear marker");
+
+    // The port, end to end with the REAL reset step: the drift check fetches the
+    // branch, and a stale verdict (0 ahead, clean) reaches the pre-reset fetch
+    // of the base.
+    let mut o = opts(&work, &wt, &evil);
+    o.base_branch = evil.clone();
+    let outcome = decide(&o, &|req| perform_reset_with(&o, req));
+
+    assert!(
+        !marker.exists(),
+        "a `-`-prefixed branch name was interpreted as a git option on the Rust path"
+    );
+    // The fetch of a refspec named `--upload-pack=…` fails, so no reset is
+    // attempted and the worktree is left as-is — still a usable exit 0.
+    assert_eq!(outcome, Outcome::ResetFailed);
+    assert_eq!(outcome.code(), 0);
+
+    let _ = fs::remove_dir_all(&pdir);
+    let _ = fs::remove_dir_all(&dir);
+}

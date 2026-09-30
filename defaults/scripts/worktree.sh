@@ -773,18 +773,15 @@ _worktree_sparse() {
 # default branch checked out. Relies on the global DEFAULT_BRANCH (resolved via
 # loom_default_branch before this is called).
 fetch_latest_main() {
-    if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Fetching latest changes from origin/$DEFAULT_BRANCH..."
-    fi
-
-    if git fetch origin "$DEFAULT_BRANCH" 2>/dev/null; then
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_success "Fetched latest origin/$DEFAULT_BRANCH"
-        fi
+    # `--` ends option parsing (#9106); loom_default_branch has already refused
+    # an unsafe $DEFAULT_BRANCH before this function can be reached.
+    local quiet=""
+    [[ "$JSON_OUTPUT" == "true" ]] && quiet=1
+    [[ -n "$quiet" ]] || print_info "Fetching latest changes from origin/$DEFAULT_BRANCH..."
+    if git fetch origin -- "$DEFAULT_BRANCH" 2>/dev/null; then
+        [[ -n "$quiet" ]] || print_success "Fetched latest origin/$DEFAULT_BRANCH"
     else
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_warning "Could not fetch origin/$DEFAULT_BRANCH (continuing with local state)"
-        fi
+        [[ -n "$quiet" ]] || print_warning "Could not fetch origin/$DEFAULT_BRANCH (continuing with local state)"
     fi
 }
 
@@ -1482,6 +1479,13 @@ if ! DEFAULT_BRANCH="$(loom_default_branch)"; then
     exit 1
 fi
 
+# #9106: $DEFAULT_BRANCH reaches `git fetch origin -- "$DEFAULT_BRANCH"` (and
+# `origin/$DEFAULT_BRANCH` refs) as a bare operand. It is normally locally
+# derived, but LOOM_DEFAULT_BRANCH is an env escape hatch and `ls-remote
+# --symref` reads it off the remote — so loom_default_branch validates its own
+# result and returns non-zero on an unsafe name, which lands in the arm above
+# (check_branch_name has already printed the precise refusal to stderr).
+
 # Fetch latest changes from origin/$DEFAULT_BRANCH before creating the worktree
 # Uses fetch-only to avoid conflicts with worktrees that have it checked out
 fetch_latest_main
@@ -1497,13 +1501,18 @@ fetch_latest_main
 BASE_REF="origin/$DEFAULT_BRANCH"
 BASE_DISPLAY="$DEFAULT_BRANCH"
 if [[ -n "$BASE_BRANCH" ]]; then
-    git fetch origin "$BASE_BRANCH" 2>/dev/null || true
+    # #9106: --base names a branch that reaches `git fetch` as a bare operand.
+    # Refuse an unsafe name outright — a `--base --upload-pack=/tmp/x` would
+    # otherwise be handed straight to git as a switch.
+    check_branch_name "$BASE_BRANCH" "--base branch" || {
+        [[ "$JSON_OUTPUT" == "true" ]] && echo '{"success": false, "error": "unsafe-base-branch-name", "baseBranch": "'"$BASE_BRANCH"'"}' >&3
+        exit 1
+    }
+    git fetch origin -- "$BASE_BRANCH" 2>/dev/null || true
     if git show-ref --verify --quiet "refs/remotes/origin/$BASE_BRANCH"; then
-        BASE_REF="origin/$BASE_BRANCH"
-        BASE_DISPLAY="origin/$BASE_BRANCH"
+        BASE_REF="origin/$BASE_BRANCH"; BASE_DISPLAY="$BASE_REF"
     elif git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
-        BASE_REF="$BASE_BRANCH"
-        BASE_DISPLAY="$BASE_BRANCH"
+        BASE_REF="$BASE_BRANCH"; BASE_DISPLAY="$BASE_REF"
     else
         if [[ "$JSON_OUTPUT" == "true" ]]; then
             echo '{"success": false, "error": "base-branch-not-found", "baseBranch": "'"$BASE_BRANCH"'"}' >&3
@@ -1513,9 +1522,7 @@ if [[ -n "$BASE_BRANCH" ]]; then
         fi
         exit 1
     fi
-    if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Stacked worktree base: $BASE_DISPLAY (from --base $BASE_BRANCH)"
-    fi
+    [[ "$JSON_OUTPUT" == "true" ]] || print_info "Stacked worktree base: $BASE_DISPLAY (from --base $BASE_BRANCH)"
 fi
 
 # Determine branch name
@@ -1616,6 +1623,11 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     # outcomes this arm always reported as 0); non-zero = do not hand it over.
     # See `_worktree_existing` above and loom-daemon/src/worktree_cli/existing.rs.
     _worktree_existing || exit 1
+    # #9111: under --json the port is --quiet, so the success document for the
+    # preserve and both stale-reset outcomes is emitted here — the same key set
+    # as the --sparse/--full fast path (sparse.rs JSON_TEMPLATE), which already
+    # exited, so $SPARSE_MODE/$CONE_JSON are their not-sparse defaults.
+    [[ "$JSON_OUTPUT" != "true" ]] || echo '{"success": true, "worktreePath": "'"$(cd "$WORKTREE_PATH" && pwd)"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
     exit 0
 fi
 

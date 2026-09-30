@@ -9,6 +9,12 @@
 
 import { describe, expect, it } from "vitest";
 
+// The fleet-merge rule's shared fixture (Issue #9310) — the same file
+// loom-daemon/src/work_finder/dispatch_plan_merge_tests.rs `include_str!`s,
+// so the Rust implementation and this port cannot drift apart silently.
+// Same cross-package fixture precedent as dashboard/test/fixtures/
+// sweep-identity.json, which the Rust telemetry tests read too.
+import mergeFixtureJson from "../../test/fixtures/dispatch-plan-merge.json";
 import { buildFleetView } from "../src/fleet";
 import { parseFleetSnapshot } from "../src/parse";
 import { parseQueueSnapshot } from "../src/queueParse";
@@ -28,7 +34,9 @@ import {
   reasonText,
   summarizeHostQueue,
   QUEUE_STALE_AFTER_SEC,
+  type HostQueueSummary,
 } from "../src/workQueue";
+import type { QueueRowState } from "../src/queueTypes";
 
 const NOW = new Date("2026-09-25T12:10:00Z");
 
@@ -171,14 +179,113 @@ describe("mergeFleetQueue", () => {
     expect(issue100[0]?.primary.hostId).toBe("host-a");
     expect(issue100[0]?.others.map((o) => o.hostId)).toEqual(["host-b"]);
     expect(issue100[0]?.sweep?.phase).toBe("judge");
-    // Stale hosts still contribute rows (flagged by their host badge);
-    // running first, then starred ready (#9244), then by age.
+    // Stale hosts still contribute rows (flagged by their host badge).
+    // Fleet order (#9310): the running item, then the queued band
+    // round-robin over its hosts (host-b's #300 before host-d's #400, both
+    // round 0, host id breaking the tie), then blocked. These rows predate
+    // #9288 and carry no plan, so each host's `rank` stands in for its
+    // position.
     expect(items.map((item) => item.issue)).toEqual([100, 300, 400, 200]);
+    expect(items.map((item) => item.planState)).toEqual(["running", "queued", "queued", "blocked"]);
   });
 
   it("parses the daemon's open-PR detail", () => {
     expect(openPrNumber({ rank: 1, visibility: "public", urgent: false, disposition: "open_pr", state: "blocked", reason: "", detail: "open PR #201" })).toBe(201);
     expect(openPrNumber({ rank: 1, visibility: "public", urgent: false, disposition: "parked", state: "blocked", reason: "", detail: "loom:blocked" })).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The shared fleet-merge fixture (Issue #9310)
+// ---------------------------------------------------------------------------
+
+interface FixtureRow {
+  repo: string;
+  issue: number;
+  position?: number;
+  plan_state?: string;
+  gate?: string;
+  owning_shard?: number;
+}
+
+interface FixtureHost {
+  host_id: string;
+  shard: { configured: boolean; host_shard?: number; shard_count?: number };
+  rows: FixtureRow[];
+}
+
+interface FixtureCase {
+  name: string;
+  hosts: FixtureHost[];
+  expected: { repo: string; issue: number; plan_state: string; primary: string; others: string[] }[];
+}
+
+/** The fixture is authored for the Rust side's `Vec<HostPlan>`, which is
+ * structural; TypeScript's inferred JSON type is a union over each row's own
+ * optional fields, so it is re-stated as the shape both sides agree on. */
+const mergeFixture = mergeFixtureJson as unknown as { cases: FixtureCase[] };
+
+/** The coarse `state` the daemon would have sent beside each plan state.
+ * The merge never reads it — only the views bucket on it — but a queue row
+ * without one would not be a realistic payload. */
+const COARSE_STATE: Readonly<Record<string, QueueRowState>> = {
+  running: "running",
+  next: "ready",
+  queued: "ready",
+  blocked: "blocked",
+};
+
+/** One fixture case's hosts as the merge sees them: real `queue.snapshot`
+ * payloads through the real parser, so `owning_shard` and `plan.shard` are
+ * covered end to end rather than hand-built into the view model. */
+function fixtureSummaries(testCase: FixtureCase): HostQueueSummary[] {
+  return testCase.hosts.map((host) => {
+    const record = parseQueueSnapshot({
+      tick_at: minutesAgo(2),
+      rows: host.rows.map((planRow, index) => ({
+        rank: index + 1,
+        visibility: "public",
+        urgent: false,
+        disposition: "deferred_capacity",
+        reason: "",
+        state: COARSE_STATE[planRow.plan_state ?? ""] ?? "unknown",
+        ...planRow,
+      })),
+      plan: { shard: host.shard },
+    })!;
+    return {
+      hostId: host.host_id,
+      health: "active",
+      ageSec: 60,
+      queue: { record, updatedAt: minutesAgo(1) },
+      incomplete: false,
+    };
+  });
+}
+
+describe("mergeFleetQueue — the fleet merge rule, pinned by the shared fixture (#9310)", () => {
+  for (const testCase of mergeFixture.cases) {
+    it(testCase.name, () => {
+      const items = mergeFleetQueue(fixtureSummaries(testCase), []);
+      expect(
+        items.map((item) => ({
+          repo: item.repo,
+          issue: item.issue,
+          plan_state: item.planState,
+          primary: item.primary.hostId,
+          others: item.others.map((other) => other.hostId),
+        })),
+      ).toEqual(testCase.expected);
+    });
+  }
+
+  it("carries the winning host's own row through, loser and all", () => {
+    const headline = mergeFixture.cases[0]!;
+    const item = mergeFleetQueue(fixtureSummaries(headline), []).find((i) => i.issue === 100)!;
+    expect(item.primary.hostId).toBe("host-a");
+    expect(item.primary.row.position).toBe(1);
+    expect(item.primary.row.owning_shard).toBe(0);
+    expect(item.others[0]?.row.plan_state).toBe("blocked");
   });
 });
 

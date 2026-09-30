@@ -91,12 +91,21 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 mod brakes;
-pub use brakes::{observe_brake_ad, MAX_PEER_POOL_HOLD_TTL, POOL_HOLD_SENTINEL_ISSUE};
+pub use brakes::{
+    observe_brake_ad, PeerPrlessRelease, MAX_PEER_POOL_HOLD_TTL, MAX_PEER_PRLESS_RELEASE_TTL,
+    PEER_PRLESS_STREAK_TTL, POOL_HOLD_SENTINEL_ISSUE,
+};
 
 mod coordination_idle;
 pub use coordination_idle::{
     resolve_advertise_activity_window, ADVERTISE_ACTIVITY_WINDOW_ENV,
     DEFAULT_ADVERTISE_ACTIVITY_WINDOW,
+};
+
+mod send_health;
+pub use send_health::{
+    publish_blocked_reason, unacknowledged_reason, ClaimSendHealth, PublishBlock,
+    MIN_UNACKED_SENDS, UNACKED_SEND_GRACE,
 };
 
 // ============================================================================
@@ -151,7 +160,7 @@ pub const COORDINATION_DEGRADE_GRACE_ENV: &str = "LOOM_PEER_COORDINATION_DEGRADE
 /// caught in minutes, not hours.
 ///
 /// Raised from the original 10-minute default (Issue #8276, 2026-09-19):
-/// three independent flap episodes on `ip-172-31-74-176` (#8276 itself) each
+/// three independent flap episodes on `ip-198-51-100-42` (#8276 itself) each
 /// crossed the (then-)600s grace and later recovered. Code tracing
 /// (`evaluate_coordination`/`observe_at`) ruled out a receive-path defect:
 /// recovery depends solely on inbound peer ads, which are independent of
@@ -284,6 +293,31 @@ pub enum ClaimKind {
     /// [`crate::sweep_registry::SweepRegistry::record_dispatch_failure`]'s
     /// backoff state.
     DispatchBackoffArmed,
+    /// "I just recorded a PR-less claim/release cycle for issue #N — that is
+    /// my `consecutive`-th in a row, and `remaining_secs` seconds remain on
+    /// the window it armed" (Issue #9292).
+    ///
+    /// The third member of the per-issue brake lane, and the only one whose
+    /// payload matters beyond the window: `consecutive` is what makes the
+    /// #7972 PR-less-retry **tally** fleet-wide rather than per-host.
+    /// Broadcast the moment
+    /// [`crate::sweep_registry::SweepRegistry::record_prless_release`] records
+    /// the local release, and summed across hosts by
+    /// [`PeerClaimView::prless_peer_release_count_at`] so the
+    /// `loom:blocked` hold trips at `threshold` claims **fleet-wide** instead
+    /// of `threshold` claims *per host*. Before #9292 a four-host fleet spent
+    /// up to `4 × threshold` claim/release cycles — and posted up to four
+    /// near-identical "Attempt N of M" notes — before any one host's private
+    /// integer reached the threshold (`rjwalters/loom#8812`, 2026-09-24: nine
+    /// cycles, four notes, one hold).
+    ///
+    /// Arm-only, like [`ClaimKind::NoopCooldownArmed`] and unlike the pool
+    /// lane: a streak is cleared by positive evidence the loop broke (an open
+    /// PR, a merge, a self-reported no-op), all of which are either public
+    /// forge state every host reads for itself or are followed by this host
+    /// simply ceasing to re-advertise. The entry then lapses on its own TTL,
+    /// which is the same `max_backoff` window the local streak-cold rule uses.
+    PrlessReleaseArmed,
     /// "The token pool identified by `pool_key` is UNSPAWNABLE on my host,
     /// `remaining_secs` seconds left on my hold as of my send time" (Issue
     /// #8001, the peer-broadcast half of #7708).
@@ -357,6 +391,7 @@ impl ClaimKind {
             ClaimKind::FilingUnlock => "filing_unlock",
             ClaimKind::NoopCooldownArmed => "noop_cooldown_armed",
             ClaimKind::DispatchBackoffArmed => "dispatch_backoff_armed",
+            ClaimKind::PrlessReleaseArmed => "prless_release_armed",
             ClaimKind::PoolHoldArmed => "pool_hold_armed",
             ClaimKind::PoolHoldCleared => "pool_hold_cleared",
             ClaimKind::Heartbeat => "heartbeat",
@@ -373,6 +408,7 @@ impl ClaimKind {
             "filing_unlock" => Some(ClaimKind::FilingUnlock),
             "noop_cooldown_armed" => Some(ClaimKind::NoopCooldownArmed),
             "dispatch_backoff_armed" => Some(ClaimKind::DispatchBackoffArmed),
+            "prless_release_armed" => Some(ClaimKind::PrlessReleaseArmed),
             "pool_hold_armed" => Some(ClaimKind::PoolHoldArmed),
             "pool_hold_cleared" => Some(ClaimKind::PoolHoldCleared),
             "heartbeat" => Some(ClaimKind::Heartbeat),
@@ -388,13 +424,28 @@ impl ClaimKind {
         matches!(self, ClaimKind::FilingLock | ClaimKind::FilingUnlock)
     }
 
-    /// Whether this kind belongs to the fleet-wide cooldown/backoff-visibility
-    /// lane (Issue #7477) rather than the dispatch-claim, completion-narration,
-    /// or filing-lock lanes — the one predicate every router in the daemon
-    /// needs, mirroring [`Self::is_filing_lock_lane`].
+    /// Whether this kind belongs to the fleet-wide **per-issue brake** lane —
+    /// the #7477 no-op-cooldown / dispatch-backoff windows and, as of Issue
+    /// #9292, the PR-less-retry tally — rather than the dispatch-claim,
+    /// completion-narration, or filing-lock lanes. The one predicate every
+    /// router in the daemon needs, mirroring [`Self::is_filing_lock_lane`].
+    ///
+    /// [`ClaimKind::PrlessReleaseArmed`] belongs here rather than behind a
+    /// fourth predicate because it satisfies this lane's contract exactly: a
+    /// per-`(repo, issue)` window carried in `remaining_secs`, folded into its
+    /// own single-purpose map by [`brakes::observe_brake_ad`], and excluded
+    /// from both the `claims` map and the `#6157` coordination-health
+    /// counters. Keeping it here is what lets the socket layer
+    /// (`safehouse.rs`) stay untouched when a lane is added — the property
+    /// `brakes`'s own module doc states.
     #[must_use]
     pub fn is_cooldown_lane(self) -> bool {
-        matches!(self, ClaimKind::NoopCooldownArmed | ClaimKind::DispatchBackoffArmed)
+        matches!(
+            self,
+            ClaimKind::NoopCooldownArmed
+                | ClaimKind::DispatchBackoffArmed
+                | ClaimKind::PrlessReleaseArmed
+        )
     }
 
     /// Whether this kind belongs to the fleet-wide pool-exhaustion-hold lane
@@ -460,6 +511,18 @@ pub struct ClaimAd {
     /// module doc names. See the fingerprint function's own doc comment for
     /// the full argument.
     pub pool_key: Option<String>,
+    /// The advertising host's **own** consecutive tally at send time (Issue
+    /// #9292). `Some` only for [`ClaimKind::PrlessReleaseArmed`]; every other
+    /// kind leaves it `None`.
+    ///
+    /// Counts only that host's own releases — never a fleet total — so a
+    /// receiver can sum one entry per peer host without double-counting its
+    /// own contribution back in. An ad with `None` here is treated as `0` by
+    /// [`PeerClaimView::observe_prless_release_at`] (a pre-#9292 peer or a
+    /// malformed payload), which is the safe direction: a countless ad may
+    /// not inflate anyone's threshold, and the receiver's own local tally is
+    /// still exact.
+    pub consecutive: Option<u32>,
 }
 
 impl ClaimAd {
@@ -475,6 +538,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -490,6 +554,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -516,6 +581,7 @@ impl ClaimAd {
             pr: Some(pr),
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -537,6 +603,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -554,6 +621,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -581,6 +649,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: Some(remaining_secs),
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -605,6 +674,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: Some(remaining_secs),
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -626,6 +696,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 
@@ -643,6 +714,7 @@ impl ClaimAd {
             "pr": self.pr,
             "remaining_secs": self.remaining_secs,
             "pool_key": self.pool_key,
+            "consecutive": self.consecutive,
         })
         .to_string()
     }
@@ -702,6 +774,16 @@ impl ClaimAd {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
+        // `consecutive` is new as of Issue #9292: absent (any pre-#9292 peer,
+        // or any kind outside the PR-less-retry lane) degrades to `None`
+        // rather than rejecting the ad. A `PrlessReleaseArmed` ad with `None`
+        // here contributes `0` to the receiver's fleet tally — the safe
+        // direction, since an unreadable count must never be able to inflate
+        // a peer's hold threshold.
+        let consecutive = obj
+            .get("consecutive")
+            .and_then(Value::as_u64)
+            .and_then(|c| u32::try_from(c).ok());
         if repo.is_empty() || host.is_empty() {
             return None;
         }
@@ -715,6 +797,7 @@ impl ClaimAd {
             pr,
             remaining_secs,
             pool_key,
+            consecutive,
         })
     }
 
@@ -928,6 +1011,13 @@ pub struct PeerClaimCounters {
     /// #5789 enforcement path) — the proof the mechanism actually prevented
     /// a duplicate, not just observed one.
     pub dispatch_skipped: u64,
+    /// How many claim-ad sends safehoused **refused** (`ok:false`) — Issue
+    /// #9294. The counter [`Self::advertised`] is not: `advertised` is
+    /// attempts, this is the subset the transport threw away. `advertised>0`
+    /// with `advertise_rejected` tracking it 1:1 is a dead channel, which is
+    /// otherwise indistinguishable from a quiet fleet by counter inspection.
+    /// See [`send_health`] for the measured six-day outage that motivated it.
+    pub advertise_rejected: u64,
 }
 
 /// One tick's peer-coordination health verdict (Issue #6157) — see
@@ -1086,6 +1176,26 @@ pub struct PeerClaimView {
     /// (Issue #7477) — the [`Self::noop_cooldowns`] sibling for
     /// [`ClaimKind::DispatchBackoffArmed`].
     dispatch_backoffs: HashMap<(String, u32), Instant>,
+    /// Fleet-visible **PR-less release tallies** broadcast by peer hosts
+    /// (Issue #9292), keyed by `(repo_slug, issue, advertising_host)`.
+    ///
+    /// The host is in the key for the reason `pool_holds`' is: each peer
+    /// reports only its *own* consecutive count, and the fleet total is their
+    /// sum plus this host's local tally. Keying on `(repo, issue)` alone would
+    /// let the last ad to arrive overwrite a different host's contribution,
+    /// silently restoring the per-host threshold #9292 exists to remove.
+    ///
+    /// The value carries **two** local-receipt expiries rather than the single
+    /// [`Instant`] the other per-issue lanes store: the advertised
+    /// dispatch-suppression window (`received_at + remaining_secs`, capped by
+    /// [`brakes::MAX_PEER_PRLESS_RELEASE_TTL`]) and, never shorter, the
+    /// fleet-wide **streak-cold** clock ([`brakes::PEER_PRLESS_STREAK_TTL`]) on
+    /// which the tally itself lapses — a peer that stops re-advertising falls
+    /// out of the sum exactly as a local streak older than `max_backoff`
+    /// restarts at one. They are separate because a backoff window is, by
+    /// construction, the interval after which the *next* host may claim; see
+    /// [`brakes::PEER_PRLESS_STREAK_TTL`] for what collapsing them costs.
+    prless_releases: HashMap<(String, u32, String), brakes::PeerPrlessRelease>,
     /// Fleet-visible token-pool exhaustion holds armed by peer hosts (Issue
     /// #8001), keyed by `(pool_key, advertising_host)`, valued by the
     /// **local** [`Instant`] at which this daemon's copy of the hold expires
@@ -1107,6 +1217,29 @@ pub struct PeerClaimView {
     ///   for diagnostics, exactly as the filing lane does for its own
     ///   fleet-wide hold.
     pool_holds: HashMap<(String, String), Instant>,
+    /// Publish-side health (Issue #9294): whether safehoused is currently
+    /// **accepting** this host's claim ads at all. See [`send_health`] — a
+    /// refused send is direct proof the channel is one-way, which every other
+    /// field here can only infer from silence.
+    send_health: ClaimSendHealth,
+    /// The `reason` from the most recent [`Self::evaluate_coordination`] tick
+    /// (Issue #9294), so [`Self::to_status`] can explain a verdict instead of
+    /// rendering a bare boolean. `None` until the first reaper tick.
+    last_coordination_reason: Option<String>,
+    /// Whether the current DEGRADED verdict was caused by
+    /// [`Self::send_health`]'s publish block rather than by receive-quiet time
+    /// (Issue #9294).
+    ///
+    /// The two need different exits. A receive-quiet verdict recovers only on
+    /// `recovery_threshold` genuine peer receives — deliberately strict, since
+    /// one stray ad proves little. A publish-blocked verdict cannot use that
+    /// bar at all: while this host's sends were being refused it was mute, so
+    /// peers had nothing of its to answer, and demanding receives would keep a
+    /// repaired channel DEGRADED until traffic happened to resume. So a
+    /// publish-caused verdict retires the moment a send is accepted, and the
+    /// receive-quiet clock is rebased to give the heuristic a full fresh window
+    /// (the same treatment #8026 gives a host coming back from idle).
+    degraded_cause_publish: bool,
 }
 
 impl PeerClaimView {
@@ -1135,8 +1268,43 @@ impl PeerClaimView {
             filing_lock_ttl: DEFAULT_PEER_FILING_LOCK_TTL,
             noop_cooldowns: HashMap::new(),
             dispatch_backoffs: HashMap::new(),
+            prless_releases: HashMap::new(),
             pool_holds: HashMap::new(),
+            send_health: ClaimSendHealth::default(),
+            last_coordination_reason: None,
+            degraded_cause_publish: false,
         }
+    }
+
+    /// Record that one claim ad was written to the safehoused socket and a
+    /// reply is now owed (Issue #9294). Paired with
+    /// [`Self::observe_send_outcome_at`]: together they are what lets the view
+    /// tell "safehoused answered `ok:false`" from "safehoused answered
+    /// nothing", the second of which is the shape the 2026-09-29 outage was
+    /// actually in (see [`send_health`]).
+    pub fn observe_send_attempt_at(&mut self, now: Instant) {
+        self.send_health.observe_attempt(now);
+    }
+
+    /// Fold in the outcome of one outbound claim-ad send (Issue #9294):
+    /// `Some(reason)` when safehoused refused it (`ok:false`), `None` when it
+    /// accepted it. Called from [`crate::safehouse::PeerClaimSink`], the only
+    /// component that sees the socket's replies.
+    ///
+    /// This is the publish-side counterpart to [`Self::observe_at`]: that
+    /// method answers "is anyone else talking", this one answers "is anything
+    /// this host says getting out". [`Self::evaluate_coordination`] gives the
+    /// latter absolute precedence, because it is proof rather than inference.
+    pub fn observe_send_outcome_at(&mut self, rejection: Option<&str>, now: Instant) {
+        self.send_health.observe(rejection, now);
+        self.counters.advertise_rejected = self.send_health.rejected();
+    }
+
+    /// Publish-side health, for callers rendering the counters (see
+    /// [`send_health::ClaimSendHealth::publish_blocked`]).
+    #[must_use]
+    pub fn send_health(&self) -> &ClaimSendHealth {
+        &self.send_health
     }
 
     /// Record the resolved claims-room identity (Issue #6242) —
@@ -1275,6 +1443,7 @@ impl PeerClaimView {
             | ClaimKind::FilingUnlock
             | ClaimKind::NoopCooldownArmed
             | ClaimKind::DispatchBackoffArmed
+            | ClaimKind::PrlessReleaseArmed
             | ClaimKind::PoolHoldArmed
             | ClaimKind::PoolHoldCleared
             | ClaimKind::Heartbeat => {
@@ -1667,12 +1836,75 @@ impl PeerClaimView {
     ///   heartbeat never counts toward this (see
     ///   [`Self::observe_heartbeat_at`]'s doc comment): recovery requires
     ///   proof a real claim arrived, not just that a peer is alive.
+    /// - Whatever the verdict, its `reason` is retained (Issue #9294) so
+    ///   `loom-daemon status` can print *why* rather than leaving an operator
+    ///   to interpret a bare `degraded: true` beside two raw counters.
     pub fn evaluate_coordination(
         &mut self,
         now: Instant,
         grace: Duration,
         recovery_threshold: u64,
     ) -> CoordinationEvaluation {
+        let eval = self.evaluate_coordination_verdict(now, grace, recovery_threshold);
+        // Recorded here rather than at each `return` inside the verdict body,
+        // so a future branch cannot forget to publish its own reason.
+        self.last_coordination_reason = Some(eval.reason.clone());
+        eval
+    }
+
+    /// [`Self::evaluate_coordination`]'s decision body — see that method for
+    /// the decision rule. Split out only so the public entry point can record
+    /// every branch's `reason` in one place.
+    fn evaluate_coordination_verdict(
+        &mut self,
+        now: Instant,
+        grace: Duration,
+        recovery_threshold: u64,
+    ) -> CoordinationEvaluation {
+        // Issue #9294, highest precedence: safehoused is REFUSING this host's
+        // claim ads, or answering none of them at all. Either is direct proof
+        // the channel publishes nothing — not an inference from silence — so
+        // it is not subject to #8026's idle gate (a host whose sends are
+        // refused or unanswered is by definition trying to send), and it
+        // outranks the recovery branch below: recovery requires inbound peer
+        // claims, and nothing can arrive in a room this host cannot even write
+        // to. It clears the moment a send is acknowledged. See [`send_health`]
+        // for the measured outage and for each shape's own grace rule.
+        if let Some(block) = self.send_health.publish_blocked_at(now) {
+            let reason = block.reason();
+            let transitioned = !self.coordination_degraded;
+            self.coordination_degraded = true;
+            self.degraded_cause_publish = true;
+            if transitioned {
+                self.coordination_degraded_since = Some(now);
+            }
+            self.consecutive_receives_while_degraded = 0;
+            return CoordinationEvaluation {
+                degraded: true,
+                reason,
+                transitioned,
+            };
+        }
+        // The publish block has cleared (a send was acknowledged). Retire the
+        // verdict it caused rather than handing it to the receive-quiet recovery
+        // bar below: that bar wants genuine peer receives, and while this host
+        // was mute there was nothing of its for a peer to answer. Rebase the
+        // quiet clock so the receive heuristic gets a full fresh window — the
+        // same stale-anchor treatment #8026 gives a host coming back from idle.
+        if self.degraded_cause_publish {
+            self.degraded_cause_publish = false;
+            self.coordination_degraded = false;
+            self.coordination_degraded_since = None;
+            self.consecutive_receives_while_degraded = 0;
+            self.coordination_clock_base = Some(now);
+            return CoordinationEvaluation {
+                degraded: false,
+                reason: "peer claim ads are being ACKNOWLEDGED again — the publish side \
+                         recovered; receive-quiet clock rebased for a fresh grace window"
+                    .to_string(),
+                transitioned: true,
+            };
+        }
         if self.coordination_degraded {
             if self.consecutive_receives_while_degraded >= recovery_threshold {
                 self.coordination_degraded = false;
@@ -1838,11 +2070,13 @@ impl PeerClaimView {
             received: c.received,
             expired: c.expired,
             dispatch_skipped: c.dispatch_skipped,
+            advertise_rejected: c.advertise_rejected,
             coordination: crate::types::PeerCoordinationHealth {
                 degraded: self.coordination_degraded,
                 degraded_for_secs: self.coordination_degraded_for_secs(now),
                 consecutive_receives_toward_recovery: self.consecutive_receives_while_degraded,
                 recovery_threshold: resolve_coordination_recovery_threshold(),
+                reason: self.last_coordination_reason.clone(),
             },
             claims_room: self.claims_room.clone(),
             same_issue_collisions: self.same_issue_collision_count(now),
@@ -1888,6 +2122,7 @@ mod tests {
             pr: None,
             remaining_secs: None,
             pool_key: None,
+            consecutive: None,
         }
     }
 

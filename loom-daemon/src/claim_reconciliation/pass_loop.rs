@@ -10,6 +10,8 @@
 
 use std::path::Path;
 
+pub(super) mod building_heal;
+
 use super::{forge, review_conflict, VerdictReconcileStats};
 
 /// Aggregated counts from [`run_reconciliation_pass_over_roots`] — the same
@@ -83,6 +85,12 @@ pub(super) fn run_reconciliation_pass_over_roots(
         // #8922: AFTER the verdict pass, so a verdict it just re-queued to
         // `loom:review-requested` is checked for base conflicts on this tick.
         review_conflict::reconcile_review_conflicts(gh_bin, root);
+        // Issue #9464: after every other reconciliation — a claim this pass
+        // just reclaimed must not be immediately "healed" back. Re-applies
+        // `loom:building` to OPEN issues whose sweep is live here but whose
+        // forge-visible claim label went missing; never touches a CLOSED
+        // issue (#9463). Self-logging; best-effort.
+        building_heal::heal_missing_building_labels(gh_bin, root);
         stats.roots_processed += 1;
     }
     stats

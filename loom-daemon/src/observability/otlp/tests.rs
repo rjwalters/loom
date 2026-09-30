@@ -158,6 +158,7 @@ fn sweep_started_envelope() -> TelemetryEnvelope {
     TelemetryEnvelope::new(
         "host-otlp-test",
         TelemetryRecord::SweepStarted(SweepStartedRecord {
+            story_points: None,
             repo: "rjwalters/loom".to_string(),
             visibility: crate::telemetry::RepoVisibility::Public,
             issue: 4858,
@@ -194,6 +195,7 @@ fn host_health_envelope() -> TelemetryEnvelope {
             is_captain: None,
             armed_singleton_jobs: Vec::new(),
             captainless_singleton_jobs: Vec::new(),
+            memory: None,
         }),
     )
 }

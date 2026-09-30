@@ -19,10 +19,10 @@ use tokio::net::UnixListener;
 /// whatever repos happen to be registered on the machine running the
 /// tests) fail silently. Every `run_sink` test holds one of these for its
 /// duration; `Drop` restores the ambient (unset) env regardless of panic.
-struct SafehouseTestPaths;
+pub(super) struct SafehouseTestPaths;
 
 impl SafehouseTestPaths {
-    fn set(dir: &std::path::Path) -> Self {
+    pub(super) fn set(dir: &std::path::Path) -> Self {
         std::env::set_var(COMPLETIONS_PATH_ENV, dir.join("safehouse-completed.json"));
         std::env::set_var(
             crate::workspace_registry::REGISTRY_PATH_ENV,
@@ -1458,6 +1458,7 @@ fn decode_exit_code_annotates_only_well_known_codes() {
 #[test]
 fn maps_the_narrated_events() {
     let dispatch = Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: "sweep-issue-42-1".to_owned() as SweepId,
         kind: SweepKind::Issue(42),
         runtime: None,
@@ -1593,6 +1594,7 @@ fn maps_events_without_repo_using_bare_fallback() {
     // wires the bus) still narrates — just without repo qualification,
     // matching the pre-#4201 behavior for task_id and body prefix.
     let dispatch = Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: "sweep-issue-42-1".to_owned() as SweepId,
         kind: SweepKind::Issue(42),
         runtime: None,
@@ -1761,6 +1763,7 @@ async fn run_sink_enriches_dispatch_body_with_title() {
     ));
 
     bus.publish(Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: "sweep-issue-4201-1".to_owned() as SweepId,
         kind: SweepKind::Issue(4201),
         runtime: None,
@@ -1824,6 +1827,7 @@ async fn run_sink_batches_a_dispatch_burst_into_one_digest_root() {
 
     for issue in [4028u32, 4106, 4144] {
         bus.publish(Event::SweepGlobalDispatch {
+            story_points: None,
             sweep_id: format!("sweep-issue-{issue}-1") as SweepId,
             kind: SweepKind::Issue(issue),
             runtime: None,
@@ -1833,6 +1837,7 @@ async fn run_sink_batches_a_dispatch_burst_into_one_digest_root() {
         .unwrap();
     }
     bus.publish(Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: "sweep-issue-6173-1".to_owned() as SweepId,
         kind: SweepKind::Issue(6173),
         runtime: None,
@@ -1894,6 +1899,7 @@ async fn run_sink_still_narrates_per_issue_events_after_a_digest() {
 
     for issue in [4028u32, 4106] {
         bus.publish(Event::SweepGlobalDispatch {
+            story_points: None,
             sweep_id: format!("sweep-issue-{issue}-1") as SweepId,
             kind: SweepKind::Issue(issue),
             runtime: None,
@@ -3967,7 +3973,7 @@ async fn run_sink_narrates_only_the_ack_when_nothing_merged() {
 /// Minimal stub safehoused: accept one connection, read the `hello`, reply
 /// `{"ok":true}`, then for each `send` optionally emit an interleaved push
 /// line (no id) before the id-echoed reply. Returns received `send` bodies.
-async fn stub_server(
+pub(super) async fn stub_server(
     listener: UnixListener,
     interleave_push: bool,
     expected_sends: usize,

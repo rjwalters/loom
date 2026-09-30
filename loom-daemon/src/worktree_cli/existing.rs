@@ -127,7 +127,7 @@ pub struct Options {
     /// `$BASE_DISPLAY` — how `base_ref` is spelled to a human.
     pub base_display: String,
     /// `$BASE_BRANCH` — the `--base` override, empty when absent. Only the
-    /// pre-reset `git fetch origin "${BASE_BRANCH:-$DEFAULT_BRANCH}"` reads it.
+    /// pre-reset `git fetch origin -- "${BASE_BRANCH:-$DEFAULT_BRANCH}"` reads it.
     pub base_branch: String,
     /// `--json` mode: suppress every message the shell gated on
     /// `[[ "$JSON_OUTPUT" != "true" ]]`, and route the ungated ones to stderr
@@ -320,9 +320,17 @@ fn write_sentinel(opts: &Options) -> Result<(), Outcome> {
 /// The real destructive step: the shell's
 ///
 /// ```text
-/// git -C "$WORKTREE_PATH" fetch origin "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null && \
+/// git -C "$WORKTREE_PATH" fetch origin -- "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null && \
 ///    loom_worktree_reset_or_rescue "$WORKTREE_PATH" "$stale_ref" "issue-$N-stale-worktree-reset"
 /// ```
+///
+/// The `--` is #9106's end-of-options separator and is load-bearing: without
+/// it a `--base` / default-branch name such as `--upload-pack=/tmp/x` is
+/// re-parsed by git as a switch (on a path origin, that EXECUTES the payload).
+/// With it the name is a refspec, the fetch fails, and no reset is attempted.
+/// `worktree.sh` has already refused such names via `check_branch_name` before
+/// delegating here; this is the defence in depth behind that check, and
+/// `a_dash_prefixed_branch_is_never_a_git_option` pins it.
 ///
 /// Both halves, in order, short-circuiting on the fetch exactly as `&&` did —
 /// a fetch that fails means no reset is attempted at all. The fetch key stays
@@ -336,7 +344,7 @@ fn perform_reset_with(opts: &Options, req: &ResetRequest) -> bool {
     } else {
         opts.base_branch.as_str()
     };
-    if !git_ok(&opts.worktree, &["fetch", "origin", fetch_key]) {
+    if !git_ok(&opts.worktree, &["fetch", "origin", "--", fetch_key]) {
         return false;
     }
     super::reset::run(&super::reset::Options {

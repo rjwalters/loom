@@ -21,6 +21,7 @@ fn reconstruct_admits_live_lock_owners() {
     let lock = locks.join("issue-77");
     std::fs::create_dir(&lock).unwrap();
     let owner = LockOwner {
+        overflow: false,
         pgid: None,
         model: None,
         effort: None,
@@ -78,6 +79,7 @@ fn unregistered_locked_issues_surfaces_live_lock_with_no_entry() {
     let lock = locks.join("issue-4201");
     std::fs::create_dir(&lock).unwrap();
     let owner = LockOwner {
+        overflow: false,
         pgid: None,
         model: None,
         effort: None,
@@ -109,6 +111,7 @@ fn unregistered_locked_issues_excludes_registered_live_entry() {
     let lock = locks.join("issue-4202");
     std::fs::create_dir(&lock).unwrap();
     let owner = LockOwner {
+        overflow: false,
         pgid: None,
         model: None,
         effort: None,
@@ -144,6 +147,7 @@ fn unregistered_locked_issues_excludes_stale_dead_pid_lock() {
     let lock = locks.join("issue-4203");
     std::fs::create_dir(&lock).unwrap();
     let owner = LockOwner {
+        overflow: false,
         pgid: None,
         model: None,
         effort: None,
@@ -172,6 +176,7 @@ fn reconstruct_drops_stale_locks() {
     let lock = locks.join("issue-78");
     std::fs::create_dir(&lock).unwrap();
     let owner = LockOwner {
+        overflow: false,
         pgid: None,
         model: None,
         effort: None,
@@ -224,6 +229,7 @@ fn reconstruct_recovers_daemon_owned_checkpoint() {
     let lock = locks.join("issue-91");
     std::fs::create_dir(&lock).unwrap();
     let owner = LockOwner {
+        overflow: false,
         pgid: None,
         model: None,
         effort: None,
@@ -391,6 +397,7 @@ fn reconstruct_recovers_token_name_from_log() {
     std::fs::create_dir(&lock).unwrap();
     let sweep_id = "sweep-issue-401-adopt";
     let owner = LockOwner {
+        overflow: false,
         pgid: None,
         model: None,
         effort: None,
@@ -485,6 +492,85 @@ fn reconstruct_leaves_model_and_effort_none_without_a_stamp() {
     let info = registry.get(sweep_id).unwrap();
     assert_eq!(info.model, None, "never a fabricated model");
     assert_eq!(info.effort, None, "never a fabricated effort");
+    assert!(!info.overflow, "a pre-#9314 owner.json adopts as not-overflow");
+}
+
+/// Issue #9314: `mark_overflow` stamps the host's single overflow slot onto
+/// the sweep's claim lock, and `reconstruct` restores it — so a daemon restart
+/// no longer silently frees the slot (and no longer drops the `[overflow]`
+/// marker from `status`/`list_sweeps`) while the over-limit sweep still runs.
+#[test]
+fn reconstruct_restores_the_overflow_flag_marked_at_dispatch() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let sweep_id = insert_running_at(&mut registry, 9314, 1, Utc::now());
+    registry.acquire_lock(9314, &sweep_id).unwrap();
+    registry
+        .record_child_pid_in_lock(9314, std::process::id(), None, Some("claude-opus-5"), None)
+        .unwrap();
+
+    // What the work finder does when a starred candidate takes the slot.
+    assert!(registry.mark_overflow(&sweep_id));
+    assert!(registry.overflow_in_flight());
+    // Durable, not just in RAM — and the model stamped earlier survives the
+    // read-modify-write in both directions.
+    let owner_json =
+        std::fs::read_to_string(registry.config.locks_dir().join("issue-9314/owner.json")).unwrap();
+    let owner: LockOwner = serde_json::from_str(&owner_json).unwrap();
+    assert!(owner.overflow, "{owner_json}");
+    assert_eq!(owner.model.as_deref(), Some("claude-opus-5"), "{owner_json}");
+
+    // The restart: in-memory state is gone, the lock and its live owner are not.
+    registry.entries.clear();
+    assert!(!registry.overflow_in_flight());
+    let admitted = registry.reconstruct().unwrap();
+    assert!(admitted >= 1);
+    let info = registry.get(&sweep_id).unwrap();
+    assert!(info.overflow, "the adopted sweep still holds the overflow slot");
+    assert!(
+        registry.overflow_in_flight(),
+        "so the next tick cannot hand the same slot to a second starred issue"
+    );
+}
+
+/// The other half: an ordinary in-cap dispatch is never marked, so its lock
+/// carries no `overflow` key at all (`skip_serializing_if`) and it adopts back
+/// as not-overflow — the slot stays free across the restart.
+#[test]
+fn an_unmarked_sweep_adopts_without_the_overflow_flag() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let sweep_id = insert_running_at(&mut registry, 9315, 1, Utc::now());
+    registry.acquire_lock(9315, &sweep_id).unwrap();
+    registry
+        .record_child_pid_in_lock(9315, std::process::id(), None, None, None)
+        .unwrap();
+
+    let owner_json =
+        std::fs::read_to_string(registry.config.locks_dir().join("issue-9315/owner.json")).unwrap();
+    assert!(
+        !owner_json.contains("overflow"),
+        "the flag is on the wire only when true: {owner_json}"
+    );
+
+    registry.entries.clear();
+    assert!(registry.reconstruct().unwrap() >= 1);
+    assert!(!registry.get(&sweep_id).unwrap().overflow);
+    assert!(!registry.overflow_in_flight());
+}
+
+/// A lock that is already gone (the sweep finished between dispatch and the
+/// mark) must not fail the mark: the in-memory flag is what this tick's
+/// accounting reads, and losing the durable copy degrades to exactly the
+/// pre-#9314 behaviour rather than to anything unsafe (#9314).
+#[test]
+fn marking_overflow_survives_a_missing_lock() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let sweep_id = insert_running_at(&mut registry, 9316, 1, Utc::now());
+    assert!(registry.mark_overflow(&sweep_id), "no lock on disk at all");
+    assert!(registry.get(&sweep_id).unwrap().overflow);
+    assert!(!registry.mark_overflow("sweep-issue-404-1"), "unknown sweep is still false");
 }
 
 /// Issue #4173: a missing log, or a log without the selection line, degrades
@@ -501,6 +587,7 @@ fn reconstruct_token_recovery_degrades_to_unknown() {
     let lock_a = locks.join("issue-402");
     std::fs::create_dir(&lock_a).unwrap();
     let owner_a = LockOwner {
+        overflow: false,
         pgid: None,
         model: None,
         effort: None,
@@ -520,6 +607,7 @@ fn reconstruct_token_recovery_degrades_to_unknown() {
     let lock_b = locks.join("issue-403");
     std::fs::create_dir(&lock_b).unwrap();
     let owner_b = LockOwner {
+        overflow: false,
         pgid: None,
         model: None,
         effort: None,
@@ -598,6 +686,7 @@ fn adopt_live_journal_sweeps_never_double_counts_a_reconstructed_sweep() {
     let lock = locks.join("issue-6262");
     std::fs::create_dir(&lock).unwrap();
     let owner = LockOwner {
+        overflow: false,
         pgid: None,
         model: None,
         effort: None,
@@ -693,6 +782,7 @@ fn lock_adoption_evidence_names_the_original_sweep_id_and_start() {
     let lock = registry.config.locks_dir().join("issue-8720");
     std::fs::create_dir_all(&lock).unwrap();
     let owner = LockOwner {
+        overflow: false,
         pgid: None,
         model: None,
         effort: None,

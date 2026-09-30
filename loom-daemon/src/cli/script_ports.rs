@@ -68,6 +68,19 @@ pub(crate) enum ScriptPortCommand {
     /// flattened enum is what keeps a new top-level subcommand free.
     ShellBudget(super::shell_budget::ShellBudgetArgs),
 
+    /// Seed and evaluate the ETA estimators (#9325, Phase 2 of #9289).
+    ///
+    /// `eta backfill` populates the stage-sample journal from `pr-latency`
+    /// history so the heuristics have a baseline on day one; `eta backtest`
+    /// replays a heuristic against real outcomes leak-free and scores it.
+    ///
+    /// Not a script port either: it lives here for the same
+    /// frozen-`main.rs` reason as `shell-budget` above, which is also what
+    /// keeps `eta` a real nested subcommand (`loom-daemon eta backfill`,
+    /// not a flattened top-level `backfill`) at zero cost to `main.rs`.
+    #[command(subcommand)]
+    Eta(super::eta_cmd::EtaCommand),
+
     /// `merge-pr.sh`'s closing-reference / partial-increment analysis (#8191,
     /// slice 1). Reads the PR body on stdin — it is untrusted external content
     /// and routinely tens of kilobytes, so it does not belong in argv.
@@ -344,6 +357,24 @@ pub(crate) enum ScriptPortCommand {
     /// logic, native from the start per the shell-language policy.
     CheckStaleBlocked(super::stale_blocked::StaleBlockedArgs),
 
+    /// The `PreToolUse` decision for the `mcp__loom__*` tool namespace (#9108),
+    /// behind the `defaults/hooks/guard-mcp-tools.sh` hook entry. Reads the
+    /// hook payload on stdin, prints a deny document or nothing, and **always
+    /// exits 0**. Not a port: brand-new logic, native from the start per the
+    /// shell-language policy — MCP tool calls were the one tool class outside
+    /// every `PreToolUse` matcher.
+    GuardMcpTools(super::guard_mcp_tools::GuardMcpToolsArgs),
+
+    /// The `PreToolUse` matcher-coverage contract for that guard (#9108): the
+    /// `mcp__loom__.*` matcher exists in `.claude/settings.json` AND in the
+    /// installer's `_PHOOK_*` arrays, its entry routes through
+    /// `hook-wiring.sh`, and it carries the same fail-closed broken-install
+    /// floor the `Bash` / `Edit|Write` entries carry. Exit 1 on any violation.
+    /// Not a port of working shell: the check's first cut lived inside
+    /// `contract`-category `check-guard-scan-contracts.sh`, which the
+    /// shell-language policy and the #7810 shell-budget gate both send here.
+    CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
+
     /// Per-segment PR latency, derived live from the forge timeline (#8923):
     /// review-queue wait, approval path, `loom:pr`→merged **split by operator
     /// gate**, Doctor response, and verdict invalidations — plus the live queue
@@ -389,6 +420,26 @@ pub(crate) enum ScriptPortCommand {
     /// `CheckStaleBlocked` it WRITES (a comment, never a label); `--dry-run`
     /// previews. Always exits 0.
     NotifyClearedBlockers(super::notify_cleared_blockers::NotifyClearedBlockersArgs),
+    /// `sync-labels.sh`'s duplicate-declared-name scan (#8875): a
+    /// `labels.yml` that carries two `- name:` entries for the same label
+    /// (the pre-#4187-upgrade shape `merge_labels_block` now absorbs on
+    /// install) is structural drift in the file itself, independent of
+    /// forge state. Ported out of the `contract`-category script per the
+    /// shell language policy. Prints each duplicated name once, in file
+    /// order.
+    LabelDuplicates(super::label_duplicates::LabelDuplicatesArgs),
+
+    /// `fleet-send.sh`'s one-shot safehouse envelope post (#9517, epic
+    /// #7810) — the lifecycle-role posting helper whose bash body was a
+    /// hand-copy of `safehouse.rs`'s protocol. The implementation reuses the
+    /// canonical `build_send_request` so the daemon and the role helper can
+    /// never disagree about the wire again. Its HARD degradation contract is
+    /// inherited verbatim: every failure — missing env, absent socket,
+    /// invalid argument, wire error — is a silent `exit 0`, because the room
+    /// is optional and the role's work is not. (This is also why the stub
+    /// bypasses `lib/script-helper.sh`, whose missing-daemon path is a loud
+    /// error: silence IS this entry point's interface.)
+    FleetSend(super::fleet_send::FleetSendArgs),
 }
 
 impl ScriptPortCommand {
@@ -406,6 +457,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
+            ScriptPortCommand::Eta(cmd) => cmd.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::CargoTargetDir(cmd) => cmd.run(),
@@ -427,6 +479,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::DaemonUpdate(args) => args.run(),
+            ScriptPortCommand::FleetSend(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
@@ -438,11 +491,14 @@ impl ScriptPortCommand {
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
+            ScriptPortCommand::GuardMcpTools(args) => args.run(),
+            ScriptPortCommand::CheckGuardWiring(args) => args.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
             ScriptPortCommand::SecretScan(args) => args.run(),
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
+            ScriptPortCommand::LabelDuplicates(args) => args.run(),
         }
     }
 }
@@ -623,6 +679,14 @@ pub(crate) enum MergePrCommand {
     /// to post. Exit 0 with the route, 2 = stdin unreadable — see
     /// `cli::merge_pr_reconcile`.
     ReconcileChild(super::merge_pr_reconcile::ReconcileChildArgs),
+
+    /// The #6694/#6264 remove-vs-preserve decision for post-merge worktree
+    /// cleanup, shared across the three call sites (the Loom-convention path,
+    /// the porcelain discovery fallback, and a co-existing Judge/Doctor review
+    /// worktree) that used to run it identically three times. Always exits 0
+    /// with `REMOVE`/`PRESERVE` plus `LEVEL<TAB>message` lines to replay — see
+    /// `cli::merge_pr_worktree_preserve`.
+    WorktreePreserve(super::merge_pr_worktree_preserve::WorktreePreserveArgs),
 }
 
 impl MergePrCommand {
@@ -651,6 +715,7 @@ impl MergePrCommand {
             MergePrCommand::ReconcilePlan(args) => args.run(),
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::ChecksFailure(args) => args.run(),
+            MergePrCommand::WorktreePreserve(args) => args.run(),
         }
     }
 }

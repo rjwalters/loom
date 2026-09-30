@@ -45,6 +45,15 @@
 //!    both are proved *as divergences* by [`the_two_deliberate_divergences_are_real`]
 //!    rather than excluded silently: a non-array rollup, and an element whose
 //!    `number`/`headRefName` is unusable. See that test for the argument.
+//! 3. **The harness-ops widening (2AMLogic/2am#1298).** [`issue_from_branch`]
+//!    recognizes `feature/harness-ops-<N>` alongside `feature/issue-<N>`; the
+//!    frozen fixture only ever knew the latter. This is a widening, not a
+//!    tightening — the retired shell said `NOT-STACKED` for a harness-ops
+//!    parent and derived no issue for a harness-ops child, silently stranding
+//!    that Builder convention's stacked children (harness-ops#283, #356).
+//!    Proved *as a divergence* by
+//!    [`the_harness_ops_widening_is_a_deliberate_divergence`], the same way
+//!    the two tightenings above are.
 //!
 //! Note that a trailing `\r` is NOT a divergence — it is an agreement worth
 //! testing on purpose, which [`a_trailing_cr_is_data_on_both_sides`] does. An
@@ -57,7 +66,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use loom_daemon::merge_pr::reconcile::{child_route, defer_comment, plan, Plan, Route, Row};
+use loom_daemon::merge_pr::reconcile::{
+    child_route, defer_comment, issue_from_branch, plan, Plan, Route, Row,
+};
 
 /// The frozen copy of the retired decisions.
 fn fixture() -> PathBuf {
@@ -145,13 +156,14 @@ fn branch_corpus() -> Vec<String> {
         }
     }
 
-    // Wholly unrelated names the parent gate met in production.
+    // Wholly unrelated names the parent gate met in production. NOT
+    // `feature/harness-ops-<N>` — since #1298 that is a recognized convention,
+    // not an unrelated name; see `the_harness_ops_widening_is_a_deliberate_divergence`.
     for name in [
         "main",
         "master",
         "release-1",
         "chore/resync-installed",
-        "feature/harness-ops-9",
         "dependabot/cargo/all-dependencies-80ab654de6",
         "feature/issue",
         "featureissue-12",
@@ -377,9 +389,11 @@ fn rollup_corpus() -> Vec<String> {
         r#"[{"number":501,"headRefName":"feature/issue-201"},{"number":502,"headRefName":"feature/issue-202"}]"#.to_string(),
         // Order must be the rollup's, not sorted — the retired `.[]` preserved it.
         r#"[{"number":9,"headRefName":"feature/issue-9"},{"number":3,"headRefName":"feature/issue-3"}]"#.to_string(),
-        // A child on an ad-hoc branch: no issue, so no claim to race.
+        // A child on an ad-hoc branch: no issue, so no claim to race. NOT
+        // `feature/harness-ops-<N>` — since #1298 the port derives an issue for
+        // that branch where the retired shell derived none; see
+        // `the_harness_ops_widening_is_a_deliberate_divergence`.
         r#"[{"number":503,"headRefName":"hotfix/xyz"}]"#.to_string(),
-        r#"[{"number":503,"headRefName":"feature/harness-ops-9"}]"#.to_string(),
         // Extra keys are ignored by both sides.
         r#"[{"number":504,"headRefName":"feature/issue-204","title":"x","isDraft":false}]"#.to_string(),
         // A digit string where a number is expected — `"\(.number)"` rendered
@@ -511,6 +525,42 @@ fn the_two_deliberate_divergences_are_real() {
         matches!(&rows[0], Row::Child { pr, .. } if pr == "501")
             && matches!(&rows[2], Row::Child { pr, .. } if pr == "503"),
         "the sibling rows must survive"
+    );
+}
+
+/// The third deliberate divergence (2AMLogic/2am#1298): the frozen fixture only
+/// ever knew `feature/issue-<N>`, so it necessarily says `NOT-STACKED` for a
+/// `feature/harness-ops-<N>` parent and derives no issue for a
+/// `feature/harness-ops-<N>` child. The port now recognizes both conventions
+/// (see [`issue_from_branch`]) — asserted here as an intentional widening, the
+/// same way [`the_two_deliberate_divergences_are_real`] pins the two
+/// tightenings, so neither drifts back into the general-agreement corpora
+/// above by accident.
+#[test]
+fn the_harness_ops_widening_is_a_deliberate_divergence() {
+    // Parent gate: the retired shell says NOT-STACKED; the port says stacked.
+    let want = shell("retired_plan", &["feature/harness-ops-9", "[]"]).expect("fixture must run");
+    assert!(
+        want.starts_with("NOT-STACKED"),
+        "the retired shell had no harness-ops convention, by construction: {want}"
+    );
+    assert_ne!(
+        plan("feature/harness-ops-9", b"[]"),
+        Plan::NotStacked,
+        "the port must treat feature/harness-ops-<N> as a stackable parent"
+    );
+
+    // Child derivation: the retired shell derives no issue; the port derives one.
+    let rollup = r#"[{"number":503,"headRefName":"feature/harness-ops-9"}]"#;
+    let want = shell("retired_plan", &["feature/issue-100", rollup]).expect("fixture must run");
+    assert!(
+        want.contains("CHILD 503\tfeature/harness-ops-9\t\n"),
+        "the retired shell derived no issue for a harness-ops child; it said: {want}"
+    );
+    assert_eq!(
+        issue_from_branch("feature/harness-ops-9"),
+        Some("9".to_string()),
+        "the port must derive issue #9 from a feature/harness-ops-9 child branch"
     );
 }
 

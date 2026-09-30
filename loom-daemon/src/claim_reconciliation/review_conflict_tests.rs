@@ -245,7 +245,7 @@ fn end_to_end_mergeable_again_is_cleared_only_when_we_flagged_it() {
     let mc = format!(
         r#"[{{"number":8909,"headRefOid":"{SHA}","mergeable":"MERGEABLE","labels":[{{"name":"loom:merge-conflict"}},{{"name":"loom:changes-requested"}}]}}]"#
     );
-    let ours = r#"[{"body":"<!-- loom:base-conflict flagged -->\nflagged"}]"#;
+    let ours = r#"[{"user":{"login":"loom-fleet-dispatch[bot]"},"body":"<!-- loom:base-conflict flagged -->\nflagged"}]"#;
     let (stats, calls) = run("[]", &mc, ours);
     assert_eq!(stats.cleared, 1, "{calls}");
     assert!(calls.contains(
@@ -255,7 +255,7 @@ fn end_to_end_mergeable_again_is_cleared_only_when_we_flagged_it() {
 
     // A Judge's own DIRTY fallback (no flag of ours) is never undone.
     let judges = format!(
-        r#"[{{"body":"rebase please <!-- loom:verdict-sha sha={SHA} verdict=changes-requested -->"}}]"#
+        r#"[{{"author_association":"OWNER","body":"rebase please <!-- loom:verdict-sha sha={SHA} verdict=changes-requested -->"}}]"#
     );
     let (stats, calls) = run("[]", &mc, &judges);
     assert_eq!(stats.cleared, 0);

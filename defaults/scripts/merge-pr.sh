@@ -466,11 +466,14 @@ source "$SCRIPT_DIR/lib/branch-landed.sh"
 # fails to resolve (e.g. no network + no origin/HEAD symref) still falls back
 # to the literal "main"/"master" check in _maybe_delete_local_branch below.
 DEFAULT_BRANCH_NAME=""
-if [[ -f "$SCRIPT_DIR/lib/default-branch.sh" ]]; then
-  # shellcheck source=lib/default-branch.sh
-  source "$SCRIPT_DIR/lib/default-branch.sh"
-  DEFAULT_BRANCH_NAME="$(cd "$REPO_ROOT" && loom_default_branch 2>/dev/null || true)"
-fi
+# Sourced UNCONDITIONALLY (#9106). This lib carries check_branch_name, the
+# ref-operand validator every forge-derived branch name below must pass before
+# it reaches a git argv, and a fail-closed security guard must not be optional:
+# the old `if [[ -f ... ]]` guard let a partially-resynced .loom/ drop the
+# validator silently. A missing lib now aborts here instead.
+# shellcheck source=lib/default-branch.sh
+source "$SCRIPT_DIR/lib/default-branch.sh"
+DEFAULT_BRANCH_NAME="$(cd "$REPO_ROOT" && loom_default_branch 2>/dev/null || true)"
 forge_detect
 
 # Use gh-cached for read-only queries to reduce API calls (see issue #1609)
@@ -621,6 +624,13 @@ PR_HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha // empty')
 # forge_get_pr responses already carry a `labels` array in this shape, so no
 # extra API call is needed beyond the fetch above.
 PR_LABELS=$(echo "$PR_JSON" | jq -r '.labels[]?.name // empty' 2>/dev/null || true)
+# #9106: $PR_BRANCH is `.head.ref` — chosen by whoever opened the PR. Everything
+# downstream (the _recheck_mergeable_before_refusal fetch, branch_landed,
+# update-ref refs/loom/parent/<branch>, the local `git branch -D`) puts it in a
+# git argv, so it is validated ONCE here and the merge is denied outright if it
+# is not a safe ref operand. The reason names the offending ref, so the refusal
+# is greppable in the run log.
+check_branch_name "$PR_BRANCH" "head branch of PR #$PR_NUMBER" || error "Merge blocked: PR #$PR_NUMBER's head branch is not a safe git ref operand (see the check_branch_name refusal above, #9106). Refusing before any git command runs on '$PR_BRANCH'. Rename the branch on the PR and re-run."
 
 # Check if already merged
 if [[ "$PR_MERGED" == "true" ]]; then
@@ -912,7 +922,7 @@ _check_loom_pr_label
 # build-stampede guard (#8252). The refusal named neither the version nor the
 # roll command. That is what these markers and the hint below fix.
 #
-# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, stacked-children, version-policy, partial-reset, closed-building, issue-close-gate, dirty-guard — the last refuses only the post-merge worktree removal, never the merge) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
+# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, stacked-children, version-policy, partial-reset, closed-building, issue-close-gate, dirty-guard, worktree-preserve — the last two decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
 # requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
 # The `merge-pr >=` floor above covers the whole subcommand group, including
@@ -929,6 +939,7 @@ _check_loom_pr_label
 # which is the one a refused MERGE should name.
 # requires-daemon: cargo-target-dir optional   #9153 — the post-merge #7239 target-dir reclaim; without the resolve|reclaim verbs a daemon prints nothing, `$target_dir_resolved` stays empty and no reclaim is attempted, which is the pre-#7239 behaviour. A missed disk reclaim, never a failed merge: post-merge cleanup is best-effort by design and `loom-clean`, the daemon's reaper and `worktree.sh remove` all reclaim the same directory on their own schedule.
 # requires-daemon: notify-cleared-blockers optional   #9102 — the post-merge close-triggered loom:blocked re-check; a daemon lacking the verb exits non-zero, `_notify_cleared_blockers` prints one warning and the merge proceeds. A delayed notice, never a failed merge: the next sweep's `check-stale-blocked` pre-wave pass reports the same stale block.
+# requires-daemon: record-rework optional   #9444 — the two in-sweep rework markers this script emits (a `rebase` when it syncs a base that moved, a `merge_conflict` when it refuses a PR that genuinely conflicts). Both calls are `>/dev/null 2>&1 || true`: a daemon lacking the verb records nothing and the merge is byte-for-byte unaffected. Pure telemetry — the cost of a missing marker is one under-reported environmental rework in `sweep.outcome`'s `rework_events`, never a merge that did or did not happen.
 #
 # _mp_daemon_roll_hint <subcommand> [resolved-bin] -- the concrete, host-local
 # remediation for "your loom-daemon is too old for <subcommand>": the declared
@@ -1848,8 +1859,17 @@ _recheck_mergeable_before_refusal() {
   # git merge-tree check before conceding this is a genuine conflict.
   [[ -n "$resolved_attempt" ]] && _MPR_FLAGS+=(--resolved-attempt "$resolved_attempt")
   if [[ -z "$resolved_attempt" ]]; then
+    # #9106: both refs are forge-controlled ($base_ref from `.base.ref`,
+    # $head_ref from `.head.ref`) and the fetch below puts them in a git argv.
+    # A name git would parse as a switch is refused HERE, before the fetch —
+    # refuse-stale is the fail-closed verdict (it denies the merge without
+    # claiming a content conflict). An EMPTY ref keeps its pre-existing
+    # --refs-missing classification, which this must not swallow. The `--`
+    # after `origin` is defence in depth, not the gate.
     if [[ -z "$base_ref" || -z "$head_ref" ]]; then _MPR_FLAGS+=(--refs-missing)
-    elif git -C "$repo_root" fetch -q origin "$base_ref" "$head_ref" 2>/dev/null; then
+    elif ! check_branch_name "$base_ref" "base ref of PR #$pr_number" || ! check_branch_name "$head_ref" "head ref of PR #$pr_number"; then
+      echo "refuse-stale:PR #$pr_number carries a ref name that is not a safe git operand (base='$base_ref' head='$head_ref') — refused before 'git fetch' could parse it as a switch (#9106). Rename the branch on the PR and re-run."; return 0
+    elif git -C "$repo_root" fetch -q origin -- "$base_ref" "$head_ref" 2>/dev/null; then
       if git -C "$repo_root" merge-tree --write-tree "origin/$base_ref" "origin/$head_ref" >/dev/null 2>&1; then _MPR_FLAGS+=(--tree clean); else _MPR_FLAGS+=(--tree conflict); fi
     else _MPR_FLAGS+=(--fetch-failed); fi
   fi
@@ -2296,7 +2316,15 @@ if [[ "$PR_MERGEABLE" == "false" ]]; then
     merge)
       info "PR #$PR_NUMBER: $_MSM_REASON"
       ;;
-    refuse-conflict)
+    # #9444: a CORROBORATED conflict — the forge said `mergeable=false` and the
+    # local `git merge-tree` check agreed — is the `merge_conflict` rework
+    # event, and the one acceptance criterion this writer exists to satisfy.
+    # The `*` arm below is deliberately NOT marked: it refuses because the
+    # cached state could not be corroborated, which is "nobody could tell",
+    # not "this branch conflicts", and marking it would inflate the
+    # environmental bucket with unanswered checks. Emitted on this line
+    # because `error` exits, and inline because the file is ratcheted.
+    refuse-conflict) "${LOOM_DAEMON_BIN:-loom-daemon}" record-rework --kind merge_conflict --branch "$PR_BRANCH" --repo-root "$REPO_ROOT" --reason "$_MSM_REASON" >/dev/null 2>&1 || true
       error "PR #$PR_NUMBER has merge conflicts — resolve before merging ($_MSM_REASON)"
       ;;
     *)
@@ -2393,7 +2421,15 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
 
       # The sync just pushed to the head branch: re-read it, or the retry
       # below re-gates on a SHA the forge has already superseded (#8164).
-      _refresh_precondition_sha
+      #
+      # …and mark it (#9444). This is the canonical "main moved under the
+      # work" event: the base advanced, so the branch had to be synced before
+      # it could merge. `--duration-sec` is the settle wait we just slept —
+      # the only part of this rework that is measured here; the forge-side
+      # merge that produced the new head is not. Appended to the line above
+      # rather than given its own so the file does not grow (it is
+      # ratcheted); `|| true` because a marker may never fail a merge.
+      _refresh_precondition_sha; "${LOOM_DAEMON_BIN:-loom-daemon}" record-rework --kind rebase --branch "$PR_BRANCH" --repo-root "$REPO_ROOT" --reason "base branch was modified; synced before merge retry $MERGE_ATTEMPT/$MAX_MERGE_RETRIES" --duration-sec "$MERGE_RETRY_DELAY" >/dev/null 2>&1 || true
 
       # Increase delay for next attempt (exponential backoff)
       MERGE_RETRY_DELAY=$((MERGE_RETRY_DELAY * 2))
@@ -2951,6 +2987,44 @@ _issue_is_closed_for_cleanup() {
   return 1
 }
 
+# _worktree_cleanup_decide <kind: default|discovered|judge-pr> <path>
+#
+# The #6694/#6264 remove-vs-preserve decision, now shared verbatim across
+# worktree cleanup's three call sites (the Loom-convention path, the porcelain
+# discovery fallback, and a co-existing Judge/Doctor review worktree) instead
+# of tripled: `loom-daemon merge-pr worktree-preserve` (Rust,
+# loom-daemon/src/merge_pr/worktree_preserve.rs — #8191 slice). Only the two
+# already-run checks it needs (_issue_is_closed_for_cleanup, immediately
+# above, and the shared branch_has_landed primitive, #7812) and the
+# _remove_loom_worktree mutation stay here — the two-input decision plus its
+# message text moved. Fails toward PRESERVE on any guard fault (missing/older
+# daemon, an unrecognized first line) — the same fail-unsafe-to-preserve
+# direction _issue_is_closed_for_cleanup already takes just above, because a
+# guessed REMOVE risks the #5031 worktree data-loss class this whole pass
+# exists to avoid, while a skipped cleanup is always recoverable later.
+_worktree_cleanup_decide() {
+  local kind="$1" path="$2" flags=()
+  if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
+    flags+=(--preserve-check)
+    ! branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA" || flags+=(--landed)
+  fi
+  local out rc=0
+  out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr worktree-preserve --kind "$kind" --path "$path" --repo-root "$REPO_ROOT" --pr "$PR_NUMBER" --branch "$PR_BRANCH" --issue-num "${ISSUE_NUM:-}" "${flags[@]+"${flags[@]}"}" --landed-verdict "${BRANCH_LANDED_VERDICT:-}" --landed-evidence "${BRANCH_LANDED_EVIDENCE:-}" 2>/dev/null)" || rc=$?
+  local action="${out%%$'\n'*}"
+  if [[ $rc -ne 0 || ( "$action" != "REMOVE" && "$action" != "PRESERVE" ) ]]; then
+    warning "Worktree cleanup's #6694/#6264 remove-vs-preserve decision for $path did not run — 'loom-daemon merge-pr worktree-preserve' exited $rc without a recognized verdict (a loom-daemon predating #8191's slice has no such verb). Preserving rather than guessing REMOVE: a skipped cleanup is always recoverable (loom-clean, the daemon's reaper, or a future merge), an incorrectly removed worktree is not. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+    return 0
+  fi
+  local lines="" level text
+  [[ "$out" != *$'\n'* ]] || lines="${out#*$'\n'}"
+  while IFS=$'\t' read -r level text; do
+    [[ -n "$level" ]] || continue
+    case "$level" in WARNING) warning "$text" ;; *) info "$text" ;; esac
+  done <<< "$lines"
+  [[ "$action" == "REMOVE" ]] && _remove_loom_worktree "$path"
+  return 0
+}
+
 if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
   if [[ "${LOOM_PRESERVE_WORKTREE:-0}" == "1" ]]; then
     info "Worktree cleanup skipped (LOOM_PRESERVE_WORKTREE=1) — local branch left in place"
@@ -2988,28 +3062,9 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
       # Close-target-aware gate (#4186): ISSUE_NUM is only set when
       # PR_BRANCH matched the feature/issue-<N> convention above. When it's
       # unset (the pr-<N> path) this check is skipped entirely — unchanged
-      # behavior.
-      if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
-        # #6694: the issue-close gate above says "preserve", but that is only
-        # correct while the worktree/branch might still be needed. When the
-        # branch has already LANDED (#7812 — forge PR state, tree equality,
-        # or ancestry), every change on it made it into the default branch —
-        # the worktree holds nothing unmerged regardless of whether the ISSUE
-        # itself ever closes. Without this
-        # check, a programme issue intentionally designed to accumulate
-        # `Part of #N` increments forever (every merge non-closing by
-        # design) would preserve this worktree/branch indefinitely, since
-        # _issue_is_closed_for_cleanup never flips true for it.
-        if branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA"; then
-          info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' has already landed (${BRANCH_LANDED_EVIDENCE}) — its content is already on the default branch, so the worktree holds nothing unmerged; removing it (#6694)"
-          _remove_loom_worktree "$DEFAULT_WT_PATH"
-        else
-          warning "Preserving worktree at $DEFAULT_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' has not landed (${BRANCH_LANDED_VERDICT}/${BRANCH_LANDED_EVIDENCE}) — it carries content the default branch does not have"
-          info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$DEFAULT_WT_PATH\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
-        fi
-      else
-        _remove_loom_worktree "$DEFAULT_WT_PATH"
-      fi
+      # behavior. See _worktree_cleanup_decide above for the #6694 landed-
+      # branch override this now shares with the two call sites below.
+      _worktree_cleanup_decide default "$DEFAULT_WT_PATH"
     else
       # Discovery fallback (warn-only): the Loom-convention path is missing,
       # so walk porcelain looking for any worktree tracking $PR_BRANCH. We
@@ -3030,23 +3085,10 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
         elif [[ -f "$DISCOVERED_WT/.loom-managed" ]]; then
           # Rare case: Loom-managed worktree at a non-standard path. The
           # sentinel says it's safe to remove — unless the close-target-aware
-          # gate (#4186) says preserve.
-          if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
-            # #6694: see the matching comment at the default-path call site
-            # above — reuse the landed check so a never-closing programme
-            # issue does not preserve this non-standard-path worktree forever
-            # either.
-            if branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA"; then
-              info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' has already landed (${BRANCH_LANDED_EVIDENCE}) — its content is already on the default branch, so the discovered worktree holds nothing unmerged; removing it (#6694)"
-              _remove_loom_worktree "$DISCOVERED_WT"
-            else
-              warning "Preserving discovered worktree at $DISCOVERED_WT — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' has not landed (${BRANCH_LANDED_VERDICT}/${BRANCH_LANDED_EVIDENCE}) — it carries content the default branch does not have"
-              info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$DISCOVERED_WT\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
-            fi
-          else
-            info "Discovered Loom-managed worktree at non-standard path: $DISCOVERED_WT"
-            _remove_loom_worktree "$DISCOVERED_WT"
-          fi
+          # gate (#4186), or the #6694 landed-branch override
+          # _worktree_cleanup_decide shares with the default-path call site
+          # above, says preserve.
+          _worktree_cleanup_decide discovered "$DISCOVERED_WT"
         else
           warning "Discovered worktree for branch '$PR_BRANCH' at: $DISCOVERED_WT"
           warning "Worktree lacks .loom-managed sentinel — not removing (user-owned)."
@@ -3075,22 +3117,9 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
     # (loom-daemon's #5939 periodic backstop) own PR-number+path keyed
     # eligibility, which is likewise branch-state-independent.
     if [[ -n "$JUDGE_PR_WT_PATH" ]] && [[ -d "$JUDGE_PR_WT_PATH" ]]; then
-      if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
-        # #6694: see the matching comment at the default-path call site
-        # above — reuse the landed check so a never-closing programme issue
-        # does not preserve this Judge/Doctor review worktree forever
-        # either.
-        if branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA"; then
-          info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' has already landed (${BRANCH_LANDED_EVIDENCE}) — its content is already on the default branch, so the Judge/Doctor review worktree holds nothing unmerged; removing it (#6694)"
-          _remove_loom_worktree "$JUDGE_PR_WT_PATH"
-        else
-          warning "Preserving Judge/Doctor review worktree at $JUDGE_PR_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' has not landed (${BRANCH_LANDED_VERDICT}/${BRANCH_LANDED_EVIDENCE}) — it carries content the default branch does not have"
-          info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$JUDGE_PR_WT_PATH\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
-        fi
-      else
-        info "Found co-existing Judge/Doctor review worktree at $JUDGE_PR_WT_PATH (PR #$PR_NUMBER, alongside issue-$ISSUE_NUM handling above) — removing (#6264)"
-        _remove_loom_worktree "$JUDGE_PR_WT_PATH"
-      fi
+      # See the matching comment at the default-path call site above — the
+      # same #4186/#6694 decision, shared via _worktree_cleanup_decide.
+      _worktree_cleanup_decide judge-pr "$JUDGE_PR_WT_PATH"
     fi
     # Local-branch delete (#4100): the default-convention path, the
     # discovered-Loom-managed-non-standard-path, and the no-worktree-at-all

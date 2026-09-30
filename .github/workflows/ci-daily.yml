@@ -1,0 +1,738 @@
+# The slow, thorough backstop for the fast per-commit gate (#9085).
+#
+# WHY THIS EXISTS
+#
+# #9065 / #9069 made ci.yml fast, and did it by trading thoroughness for wall
+# time in five deliberate ways. Each is correct for a merge gate; none should
+# be the only verification the repo ever gets:
+#
+#   1. nextest is PARTITIONED three ways, so a cross-test interaction between
+#      tests in different legs can no longer occur -- and therefore can no
+#      longer be observed.
+#   2. The shell suites are SHARDED two ways and run 4-wide inside each shard,
+#      and the retry-once policy (#7791) records a non-hermetic suite without
+#      failing on it.
+#   3. Jobs that only RUN the daemon share one debug build. Only Release Build
+#      Check compiles the release profile, and only for x86_64-unknown-linux-gnu.
+#   4. On PRs, rust-cache RESTORES main's cache, so a clean-from-scratch build
+#      never happens and a warm target/ can mask breakage.
+#   5. On PRs, jobs are PATH-FILTERED. Pushes to main run everything, but only
+#      for the one commit.
+#
+# This workflow undoes each of those, on a schedule, where wall time costs
+# nobody a merge. It is NEVER a required check and never blocks anything.
+#
+# HOW FAILURES SURFACE
+#
+# A red daily run nobody reads is worse than none, because it trains people to
+# ignore red. The `report` job at the bottom opens or updates exactly ONE
+# tracking issue per failing job (stable title `[ci-daily] <job name>`), and
+# closes it on the next run where that same job is green. See
+# .loom/docs/ci-principles.md ("The daily backstop and its tracking issues").
+#
+# SigNoz needs nothing here: `loom-daemon ci-telemetry` captures every run of
+# every workflow of the configured owners by auto-discovery, so this workflow
+# is in scope on the day it lands (.loom/docs/ci-observability.md).
+name: CI Daily
+
+on:
+  schedule:
+    # 08:00 UTC daily. A single fixed hour, not a spread -- the point of the
+    # run is trend data, and a moving start time makes wall-clock comparisons
+    # between runs harder to read.
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+# NEVER cancelled, never superseded (.loom/docs/ci-principles.md rule 2). The
+# group is keyed on the run id, which is unique per run, so two daily runs can
+# never contend for it -- a manual `workflow_dispatch` while the scheduled run
+# is still in flight is two distinct verifications of two distinct commits, and
+# both deserve to finish. `cancel-in-progress: false` is belt and braces.
+concurrency:
+  group: ci-daily-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ===========================================================================
+  # Item 1 -- a clean, unsharded, unpartitioned full run.
+  # ===========================================================================
+  full-suite:
+    name: Full Suite (clean, unpartitioned)
+    runs-on: ubuntu-latest
+    # Generous on purpose: no cache, full debuginfo, every test in one process
+    # per test, plus four Docker-backed --ignored suites.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      # DELIBERATELY NO Swatinem/rust-cache. ci.yml restores main's cache on
+      # every PR, so nothing in the fast gate ever compiles from scratch and a
+      # warm target/ can hide a break (a stale .rlib that still links, a
+      # build.rs whose output is cached past the change that invalidated it).
+      # This is the run that would notice.
+      #
+      # ci.yml also sets CARGO_PROFILE_{DEV,TEST}_DEBUG=line-tables-only at the
+      # workflow level to shrink target/ and speed relinking. Not set here:
+      # this run uses the profile defaults a developer gets locally.
+      - name: Assert the build really is from scratch
+        run: |
+          set -euo pipefail
+          if [ -e target ]; then
+            echo "::error::target/ already exists before the first build -- something restored a cache into this job, which defeats its entire purpose."
+            exit 1
+          fi
+          echo "OK: no target/ present; this build starts cold."
+      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
+        with:
+          tool: nextest
+      # Every step runs even when an earlier one failed, so one red suite never
+      # hides another -- the same `!cancelled()` discipline ci.yml's grouped
+      # jobs use (ci-principles.md rule 8).
+      - name: nextest, whole workspace, UNPARTITIONED
+        if: ${{ !cancelled() }}
+        # The one place the full cross-test interaction surface exists. Under
+        # ci.yml's `--partition count:k/3` two tests that collide can never
+        # land in the same process tree, so the collision is unobservable.
+        run: cargo nextest run --workspace --profile ci
+      - name: nextest, loom-daemon with --features otlp, UNPARTITIONED
+        if: ${{ !cancelled() }}
+        # `otlp` is not purely additive (two tests are `cfg(not(feature =
+        # "otlp"))`), so neither this nor the default-feature run subsumes the
+        # other. `--workspace --features otlp` is not a thing in a virtual
+        # workspace where only one member declares the feature.
+        run: cargo nextest run --package loom-daemon --features otlp --profile ci
+      - name: nextest, whole workspace, --all-features
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --workspace --all-features --profile ci
+      - name: Doctests
+        if: ${{ !cancelled() }}
+        # nextest does not run doctests; libtest still owns them (#4385).
+        run: cargo test --workspace --doc
+      # --- the #[ignore]d suites nothing else in CI runs unpartitioned -------
+      - name: "Ignored: OTLP against a real pinned Collector"
+        if: ${{ !cancelled() }}
+        run: cargo test --package loom-daemon --features otlp --test otlp_collector -- --ignored --nocapture
+      - name: "Ignored: cycle-time SQL against a real pinned ClickHouse"
+        if: ${{ !cancelled() }}
+        run: cargo test --package loom-daemon --features otlp --test cycle_time_clickhouse -- --ignored --nocapture
+      - name: "Ignored: Collector fan-out contract"
+        if: ${{ !cancelled() }}
+        # #8664: needs Docker and the pinned collector-contrib image. Never run
+        # by ci.yml at all, in any partition -- it is `#[ignore]`d and no job
+        # passes `--ignored` for it.
+        run: cargo test --package loom-daemon --features otlp --test collector_fanout -- --ignored --nocapture
+      - name: "Ignored: session filelog redaction contract"
+        if: ${{ !cancelled() }}
+        run: cargo test --package loom-daemon --features otlp --test collector_filelog -- --ignored --nocapture
+
+  # ===========================================================================
+  # Item 2 -- the release matrix, minus signing and publishing.
+  # ===========================================================================
+  release-matrix:
+    name: Release Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      # Never mask one platform's failure with another's success, and never let
+      # one platform's failure cancel an in-flight build for another -- the same
+      # reasoning release.yml's own matrix records.
+      fail-fast: false
+      matrix:
+        # Mirrors release.yml's build-daemon matrix exactly, including the
+        # ubuntu-22.04 pins (#8842: `ubuntu-latest` silently rolled 22.04 ->
+        # 24.04 and bricked a glibc-2.35 fleet worker). A target-specific break
+        # -- a cross-compilation regression, a macOS-only link failure -- shows
+        # up here days before release day instead of on it.
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            cross: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            cross: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      # `targets:` above lands the target on the action's own `stable`, not on
+      # the 1.96.0 this repo pins in rust-toolchain.toml, so cargo would build
+      # under a toolchain that has no std for it (#5167). `rustup target add`
+      # operates on the directory's ACTIVE toolchain, which is the pinned one.
+      - name: Add the target to the pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+      # No rust-cache here either: a release build is exactly the thing whose
+      # "it only breaks from cold" failures the fast gate cannot see.
+      - name: Verify build host glibc floor
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        # Same check release.yml runs at release time (#8842). Running it daily
+        # means a retired/rerouted `ubuntu-22.04` label is noticed on an
+        # ordinary morning rather than mid-release.
+        run: |
+          set -euo pipefail
+          floor_major=2
+          floor_minor=35
+          host_version="$(ldd --version | head -n1 | awk '{print $NF}')"
+          host_major="$(printf '%s' "$host_version" | cut -d. -f1)"
+          host_minor="$(printf '%s' "$host_version" | cut -d. -f2)"
+          echo "Build host glibc: ${host_version} (documented floor: ${floor_major}.${floor_minor})"
+          if [ "$host_major" -gt "$floor_major" ] || { [ "$host_major" -eq "$floor_major" ] && [ "$host_minor" -gt "$floor_minor" ]; }; then
+            echo "::error::Build host glibc ${host_version} is newer than the documented floor ${floor_major}.${floor_minor} -- this runner has drifted (see .loom/docs/release-glibc-floor.md)."
+            exit 1
+          fi
+          echo "OK: build host glibc is within the documented floor."
+      - name: Install cross-compilation toolchain
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build loom-daemon (release, otlp)
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --package loom-daemon --release --features otlp --target ${{ matrix.target }}
+      - name: Verify OTLP capability of the built binary
+        if: ${{ !cancelled() && !matrix.cross }}
+        run: target/${{ matrix.target }}/release/loom-daemon telemetry-capabilities --require-otlp
+      # NO signing, NO notarization, NO cosign, NO artifact upload, NO publish.
+      # Those need release secrets and produce shippable artifacts; this job
+      # exists to answer "does it still build for every target", nothing more.
+
+  # ===========================================================================
+  # Item 4 -- supply chain.
+  # ===========================================================================
+  supply-chain:
+    name: Supply Chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # cargo-deny
+        with:
+          tool: cargo-deny
+      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # cargo-audit
+        with:
+          tool: cargo-audit
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      # deny.toml has existed since the repo's early days and NO job has ever
+      # run it (confirmed in the #9065 supply-chain audit, 2026-09-26). Four
+      # separate steps rather than one `cargo deny check`, so a licence
+      # regression and an advisory cannot hide behind each other, and so the
+      # tracking issue's excerpt names which check went red.
+      - name: cargo-deny -- advisories
+        if: ${{ !cancelled() }}
+        run: cargo deny check advisories
+      - name: cargo-deny -- bans
+        if: ${{ !cancelled() }}
+        run: cargo deny check bans
+      - name: cargo-deny -- licenses
+        if: ${{ !cancelled() }}
+        run: cargo deny check licenses
+      - name: cargo-deny -- sources
+        if: ${{ !cancelled() }}
+        run: cargo deny check sources
+      # security.yml already runs cargo-audit, but only on a Cargo.lock PR, a
+      # push to main, and weekly. A new advisory published on a Monday against
+      # an unchanged lockfile is invisible for up to six days. Daily closes
+      # that window; the duplication is intentional and cheap.
+      - name: cargo-audit
+        if: ${{ !cancelled() }}
+        run: cargo audit --deny warnings
+      - name: npm audit (every lockfile)
+        if: ${{ !cancelled() }}
+        # Every package-lock.json in the tree, found rather than hand-listed --
+        # a fourth Node package added next month is covered the day it lands.
+        # --audit-level=high: low/moderate transitive advisories in dev-only
+        # tooling are noise at daily cadence; high and critical are not.
+        run: |
+          set -euo pipefail
+          rc=0
+          while IFS= read -r lock; do
+            dir="$(dirname "$lock")"
+            echo "::group::npm audit -- $dir"
+            if ! npm audit --audit-level=high --prefix "$dir"; then
+              echo "::error::npm audit reported a high or critical advisory in $dir"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done < <(git ls-files '*package-lock.json')
+          exit "$rc"
+      - name: Every pinned action SHA still resolves
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Two claims, both of which the fast gate makes nowhere:
+        #   (a) every `uses:` is pinned by 40-hex commit SHA (the #9069
+        #       convention), not by a mutable tag or branch;
+        #   (b) each of those SHAs still resolves in its action's repository --
+        #       a force-push or a repo deletion upstream turns a pin that reads
+        #       fine into a run that cannot start.
+        run: |
+          set -euo pipefail
+          # Anchored at line start so the scan cannot match its own grep
+          # pattern, or a `uses:` mentioned in a comment. Tracked files only.
+          mapfile -t REFS < <(
+            git ls-files -- '.github/workflows/*.yml' \
+              | xargs grep -hoE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]]+' \
+              | sed -E 's/^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*//' \
+              | sort -u
+          )
+          if [ "${#REFS[@]}" -eq 0 ]; then
+            echo "::error::found no 'uses:' lines at all -- the scan is broken, not the tree"
+            exit 1
+          fi
+          echo "Scanning ${#REFS[@]} distinct action references."
+          fail=0
+          seen=""
+          for ref in "${REFS[@]}"; do
+            case "$ref" in
+              ./*|.github/*) continue ;;   # local reusable workflow
+              docker://*)    continue ;;   # container action, not a git ref
+            esac
+            if ! printf '%s' "$ref" | grep -qE '@[0-9a-f]{40}$'; then
+              echo "::error::not SHA-pinned: $ref (pin it to a 40-hex commit SHA with a trailing '# vX.Y.Z' comment, per #9069)"
+              fail=1
+              continue
+            fi
+            sha="${ref##*@}"
+            path="${ref%@*}"
+            owner="$(printf '%s' "$path" | cut -d/ -f1)"
+            name="$(printf '%s' "$path" | cut -d/ -f2)"
+            key="$owner/$name@$sha"
+            case " $seen " in *" $key "*) continue ;; esac
+            seen="$seen $key"
+            if gh api "repos/$owner/$name/commits/$sha" --jq '.sha' >/dev/null 2>&1; then
+              echo "OK  $key"
+            else
+              echo "::error::pinned SHA does not resolve: $key (upstream force-push, deleted repo, or a typo)"
+              fail=1
+            fi
+          done
+          exit "$fail"
+      - name: Report stale hand-pinned tool versions (advisory)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Report-only, and deliberately so: bumping a checksum-verified pin is
+        # a decision with a diff, not something a cron job should make. The
+        # point is that nobody has to remember to look. Each row is
+        # "<upstream repo> <the version this repo pins>"; the pin is grepped
+        # out of the workflow that owns it so this table cannot drift silently.
+        run: |
+          set -euo pipefail
+          {
+            echo "### Hand-pinned tool versions"
+            echo
+            echo "| Tool | Pinned here | Latest upstream |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Each pin is grepped out of the workflow that owns it, never
+          # restated here, so this table cannot drift away from the real pin.
+          # A pin that stops being findable reads as "?" and warns, rather than
+          # silently comparing an empty string and looking current.
+          lychee="$(grep -oE 'VER=v[0-9.]+' .github/workflows/ci.yml | head -n1 | sed 's/^VER=//')"
+          shellcheck_pin="$(grep -oE 'SHELLCHECK_VERSION="?v[0-9.]+' .github/workflows/shell-lint.yml | grep -oE 'v[0-9.]+' | head -n1)"
+          node_pin="$(grep -oE 'node-version: "[0-9]+"' .github/workflows/ci.yml | head -n1 | tr -dc '0-9')"
+
+          warned=0
+          row() {
+            local label="$1" pinned="$2" latest="$3"
+            [ -n "$pinned" ] || pinned="?"
+            [ -n "$latest" ] || latest="?"
+            if [ "$pinned" = "$latest" ]; then
+              echo "| $label | \`$pinned\` | \`$latest\` (current) |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| $label | \`$pinned\` | \`$latest\` :warning: |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::$label pin '$pinned' differs from upstream '$latest'"
+              warned=$((warned + 1))
+            fi
+          }
+
+          row "lychee (ci.yml)" "$lychee" \
+            "$(gh api repos/lycheeverse/lychee/releases/latest --jq '.tag_name' 2>/dev/null | sed 's/^lychee-//' || true)"
+          row "shellcheck (shell-lint.yml)" "$shellcheck_pin" \
+            "$(gh api repos/koalaman/shellcheck/releases/latest --jq '.tag_name' 2>/dev/null || true)"
+          # Node against the current LTS major, not `releases/latest` -- that
+          # is whatever Current happens to be, so comparing against it would
+          # warn every single day and teach everyone to skip the table.
+          row "Node major (ci.yml)" "$node_pin" \
+            "$(curl -fsSL https://nodejs.org/dist/index.json 2>/dev/null \
+               | jq -r 'map(select(.lts != false)) | .[0].version' \
+               | tr -d 'v' | cut -d. -f1 || true)"
+
+          {
+            echo
+            echo "$warned pin(s) differ from upstream. Advisory only -- this step never fails the job."
+            echo "Bumping a checksum-verified pin is a decision with a diff, not something a cron job should make."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # Item 3 -- flake detection (Rust half).
+  # ===========================================================================
+  flake-rust:
+    name: Flake Detection (Rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
+        with:
+          tool: nextest
+      - name: Run the whole suite three times
+        # nextest has no --stress-count; a loop is the dumber mechanism and
+        # needs no new dependency (ci-principles.md rule 1). Unpartitioned, so
+        # each repetition exercises the full cross-test surface. `--retries 0`
+        # comes from .config/nextest.toml: this job exists to FIND flakes, and
+        # a retry would hide exactly what it is looking for.
+        #
+        # The failing repetition number is the finding: "passed 1 and 3, failed
+        # 2" is a flake, "failed all three" is a regression the fast gate
+        # should already have caught.
+        run: |
+          set -euo pipefail
+          failed=""
+          for i in 1 2 3; do
+            echo "::group::nextest repetition $i/3"
+            if cargo nextest run --workspace --profile ci; then
+              echo "repetition $i: PASS"
+            else
+              echo "repetition $i: FAIL"
+              failed="$failed $i"
+            fi
+            echo "::endgroup::"
+          done
+          {
+            echo "### nextest x3 (unpartitioned)"
+            echo
+            if [ -z "$failed" ]; then
+              echo "All three repetitions passed."
+            else
+              echo "Failed repetitions:$failed of 1 2 3."
+              echo
+              echo "A subset failing is a FLAKE (#7789). All three failing is a regression."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ -z "$failed" ] || { echo "::error::nextest failed on repetition(s)$failed of 3"; exit 1; }
+
+  # ===========================================================================
+  # Item 3 -- flake detection (shell half) and item 5 -- the macOS/bash-3.2 leg.
+  # ===========================================================================
+  flake-shell:
+    name: Flake Detection (shell suites, ${{ matrix.os }}, parallelism ${{ matrix.parallelism }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Item 3: the same suites at both ends of the concurrency range. A
+          # non-hermetic suite shows up at 8 and disappears at 1; a suite that
+          # depends on a sibling having run first shows up at 1. ci.yml runs
+          # them 4-wide inside a 2-way shard and sees neither end.
+          - os: ubuntu-latest
+            parallelism: 1
+          - os: ubuntu-latest
+            parallelism: 8
+          # Item 5: the macOS / bash 3.2 leg. run-ci-suites.sh claims bash-3.2
+          # support, and ci.yml's macOS leg only checks SYNTAX plus one
+          # self-test -- it never RUNS the suites there. Stock macOS ships
+          # /bin/bash 3.2.57 and `#!/usr/bin/env bash` resolves straight to it,
+          # so this is the interpreter a large share of operators actually
+          # have. Unsharded and single-lane: the first question about a macOS
+          # failure is "is it macOS or is it concurrency", and parallelism 1
+          # answers it up front.
+          - os: macos-latest
+            parallelism: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Report the bash under test
+        run: |
+          echo "PATH bash: $(command -v bash)"
+          bash --version | head -1
+          echo "/bin/bash: $(/bin/bash --version | head -1)"
+      - name: Configure git identity for suite fixtures
+        run: |
+          git config --global user.email "ci@loom.test"
+          git config --global user.name "Loom CI"
+      - name: Assert the wired/excluded manifest invariant (#4455)
+        run: bash defaults/scripts/tests/check-ci-suite-manifest.sh
+      - name: Run the CI-wired shell test suites (UNSHARDED)
+        # No LOOM_CI_SHARD: every suite runs in this one job. LOOM_CI_PARALLELISM
+        # is the axis under test. LOOM_TEST_ALLOW_SYSTEMD only on Linux -- macOS
+        # has no user manager for the #4862 block to talk to, and the block
+        # self-skips there anyway.
+        env:
+          LOOM_CI_PARALLELISM: ${{ matrix.parallelism }}
+          LOOM_TEST_ALLOW_SYSTEMD: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
+        run: bash defaults/scripts/tests/run-ci-suites.sh
+      - name: Upload the per-suite retry log (#7791)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # #7789's flake data should come from RUNS, not from reading issue
+          # titles. ci.yml uploads this too, but only for a sharded 4-wide run;
+          # these three legs add the 1-wide, 8-wide and macOS columns.
+          name: ci-suite-retry-log-${{ matrix.os }}-p${{ matrix.parallelism }}
+          path: /tmp/ci-suite-retry-log.tsv
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ===========================================================================
+  # Item 6 -- the upcoming toolchain, warn-only.
+  # ===========================================================================
+  beta-toolchain:
+    name: "Upcoming Toolchain: Rust beta (warn-only)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # `continue-on-error` keeps a beta regression from turning the run red, and
+    # the `(warn-only)` suffix in the name keeps the `report` job from filing a
+    # tracking issue for it. Both are needed: continue-on-error still reports a
+    # `failure` conclusion on the job itself. The suffix is the contract --
+    # see .loom/docs/ci-principles.md.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # beta
+        with:
+          toolchain: beta
+      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
+        with:
+          tool: nextest
+      # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml's `channel = "1.96.0"`,
+      # which would otherwise win over the toolchain the action just installed
+      # and make this job a second copy of full-suite.
+      - name: Confirm the toolchain really is beta
+        env:
+          RUSTUP_TOOLCHAIN: beta
+        run: |
+          set -euo pipefail
+          rustc --version
+          rustc --version | grep -q beta || {
+            echo "::error::expected a beta rustc; rust-toolchain.toml's pin appears to have won"
+            exit 1
+          }
+      - name: Build and test on beta
+        env:
+          RUSTUP_TOOLCHAIN: beta
+        run: |
+          cargo build --workspace --all-targets
+          cargo nextest run --workspace --profile ci
+
+  # ===========================================================================
+  # Item 7 -- Docker smokes, with no path filter.
+  # ===========================================================================
+  docker-smokes:
+    name: Docker Image Smokes (unfiltered)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      # No rust-cache and no `changes.docker` gate. ci.yml only builds these
+      # images when the PR touched docker/**, so a change to the daemon's own
+      # startup path -- which every one of these smokes exercises inside the
+      # image -- is never validated against the image until a release.
+      - name: Build loom-daemon (release)
+        run: cargo build --release --package loom-daemon
+      - name: Package the binary where the Dockerfiles expect it
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/loom-daemon dist/loom-daemon-linux-amd64
+      - name: Build the loom-worker image
+        run: docker build -f docker/worker/Dockerfile -t ghcr.io/rjwalters/loom-worker:ci-daily .
+      - name: loom-worker smoke
+        if: ${{ !cancelled() }}
+        run: ./docker/worker/test-image.sh ghcr.io/rjwalters/loom-worker:ci-daily
+      - name: loom-worker mount-contract test
+        if: ${{ !cancelled() }}
+        run: ./docker/worker/test-mount-contract.sh ghcr.io/rjwalters/loom-worker:ci-daily
+      - name: loom-worker run-job seam test
+        if: ${{ !cancelled() }}
+        run: ./docker/worker/test-run-job.sh ghcr.io/rjwalters/loom-worker:ci-daily
+      - name: Build and smoke the loom-worker-session image
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          docker build -f docker/session/Dockerfile \
+            --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-daily \
+            -t loom-worker-session:ci-daily .
+          ./docker/session/test-image.sh loom-worker-session:ci-daily
+      - name: Build and smoke the loom-worker-native image
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          docker build -f docker/native/Dockerfile \
+            --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-daily \
+            -t loom-worker-native:ci-daily .
+          ./docker/native/test-image.sh loom-worker-native:ci-daily
+
+  # ===========================================================================
+  # How failures surface: one tracking issue per failing job.
+  # ===========================================================================
+  report:
+    name: Daily Failure Report
+    needs:
+      - full-suite
+      - release-matrix
+      - supply-chain
+      - flake-rust
+      - flake-shell
+      - beta-toolchain
+      - docker-smokes
+    # `always()` would also run after the operator cancels the run, and a
+    # cancelled job is not a failing job. `!cancelled()` runs after failures
+    # and successes and nothing else.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+      actions: read   # reading this run's own job list and completed-job logs
+    steps:
+      - name: Open, update and close tracking issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # An EXISTING label from .github/labels.yml -- this workflow never
+          # creates labels (the label set is intentional and labels.yml is
+          # authoritative). The issue is identified by its title, not by this
+          # label, so Curator relabelling it does not orphan it.
+          TRACKING_LABEL: loom:triage
+          TITLE_PREFIX: '[ci-daily] '
+        run: |
+          set -euo pipefail
+
+          REPO="$GITHUB_REPOSITORY"
+          RUN_URL="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"
+
+          # This run's jobs, base64'd one per line so names containing spaces
+          # and parentheses survive the read loop intact.
+          gh api --paginate \
+            "repos/$REPO/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+            --jq '.jobs[] | {id, name, conclusion, html_url} | @base64' > /tmp/jobs.b64
+
+          # Currently-open tracking issues, by REST (not `gh issue list`, which
+          # is GraphQL-backed). `-X GET` is load-bearing: `gh api` switches to
+          # POST as soon as any `-f` is present, and a POST to /issues is a
+          # create. /issues returns PRs too; drop them. Matched on the stable
+          # title prefix across ALL open issues, deliberately NOT filtered by
+          # label: the tracking label is the ordinary intake label, which the
+          # Curator replaces, so a label filter would lose the issue after
+          # triage and open a duplicate the next night.
+          gh api --paginate -X GET "repos/$REPO/issues" \
+            -f state=open -f per_page=100 \
+            --jq '.[] | select(.pull_request == null) | {number, title}' \
+            | jq -s --arg p "$TITLE_PREFIX" 'map(select(.title | startswith($p)))' \
+            > /tmp/open-tracking.json
+
+          # First lines of a failed job's log that look like the failure. Best
+          # effort: an empty excerpt is fine, the run link is the real handle.
+          excerpt() {
+            gh api "repos/$REPO/actions/jobs/$1/logs" 2>/dev/null \
+              | grep -aiE 'error|failed|panicked at|assertion|FAIL ' \
+              | head -n 25 || true
+          }
+
+          opened=0; updated=0; closed=0; untouched=0
+
+          while IFS= read -r b64; do
+            [ -n "$b64" ] || continue
+            row="$(printf '%s' "$b64" | base64 -d)"
+            job_id="$(printf '%s' "$row" | jq -r '.id')"
+            job_name="$(printf '%s' "$row" | jq -r '.name')"
+            conclusion="$(printf '%s' "$row" | jq -r '.conclusion // "null"')"
+            job_url="$(printf '%s' "$row" | jq -r '.html_url')"
+
+            # This job is still running (it is the one asking), and a
+            # `(warn-only)` job reports its own failures to the step summary
+            # and nowhere else -- see the beta-toolchain job's comment.
+            case "$job_name" in
+              "Daily Failure Report") continue ;;
+              *"(warn-only)")
+                echo "warn-only, not tracked: $job_name ($conclusion)"
+                continue ;;
+            esac
+
+            title="${TITLE_PREFIX}${job_name}"
+            number="$(jq -r --arg t "$title" \
+              'map(select(.title == $t)) | (.[0].number // empty)' /tmp/open-tracking.json)"
+
+            case "$conclusion" in
+              failure|timed_out)
+                body_excerpt="$(excerpt "$job_id")"
+                if [ -n "$number" ]; then
+                  jq -n --arg run "$RUN_URL" --arg job "$job_url" --arg ex "$body_excerpt" \
+                    '{body: ("Still failing.\n\n- Run: \($run)\n- Job: \($job)\n\n<details><summary>First failing lines</summary>\n\n```\n\($ex)\n```\n\n</details>")}' \
+                    > /tmp/payload.json
+                  gh api -X POST "repos/$REPO/issues/$number/comments" --input /tmp/payload.json >/dev/null
+                  echo "updated #$number -- $title"
+                  updated=$((updated + 1))
+                else
+                  jq -n --arg t "$title" --arg run "$RUN_URL" --arg job "$job_url" \
+                        --arg ex "$body_excerpt" --arg label "$TRACKING_LABEL" \
+                    '{title: $t, labels: [$label], body: ("The nightly `ci-daily.yml` job failed.\n\n- Run: \($run)\n- Job: \($job)\n\n<details><summary>First failing lines</summary>\n\n```\n\($ex)\n```\n\n</details>\n\nThis issue is opened, updated and closed by `.github/workflows/ci-daily.yml`. It closes itself on the next daily run in which this job is green. **Keep the title unchanged**: the workflow finds this issue by its exact title (whatever labels it carries), so a renamed issue is orphaned and a duplicate opens the next night.")}' \
+                    > /tmp/payload.json
+                  # REST, not `gh issue create`: that is GraphQL-backed, and
+                  # this path also has no business going through
+                  # create-issue.sh's fleet filing lock and duplicate backstop
+                  # (the exact-title lookup above IS the dedup).
+                  new="$(gh api -X POST "repos/$REPO/issues" --input /tmp/payload.json --jq '.number')"
+                  echo "opened #$new -- $title"
+                  opened=$((opened + 1))
+                fi
+                ;;
+              success)
+                if [ -n "$number" ]; then
+                  jq -n --arg run "$RUN_URL" \
+                    '{body: ("Green again -- closing.\n\n- Run: \($run)")}' > /tmp/payload.json
+                  gh api -X POST "repos/$REPO/issues/$number/comments" --input /tmp/payload.json >/dev/null
+                  gh api -X PATCH "repos/$REPO/issues/$number" -f state=closed >/dev/null
+                  echo "closed #$number -- $title"
+                  closed=$((closed + 1))
+                fi
+                ;;
+              *)
+                # skipped, cancelled, neutral, still-running. NOT a pass:
+                # ci-principles.md rule 6. Leave any open tracking issue
+                # exactly as it is rather than closing it on a non-result.
+                echo "no result ($conclusion), leaving alone: $job_name"
+                untouched=$((untouched + 1))
+                ;;
+            esac
+          done < /tmp/jobs.b64
+
+          {
+            echo "### Tracking issues"
+            echo
+            echo "- opened: $opened"
+            echo "- updated: $updated"
+            echo "- closed: $closed"
+            echo "- no result (left alone): $untouched"
+            echo
+            echo "Filed with label \`$TRACKING_LABEL\`; matched by title \`${TITLE_PREFIX}<job name>\`."
+          } >> "$GITHUB_STEP_SUMMARY"

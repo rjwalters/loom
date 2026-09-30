@@ -186,7 +186,9 @@ if git worktree list | grep -q "$WORKTREE_PATH"; then
         fi
 
         write_loom_sentinel "$WORKTREE_PATH"
-        if git -C "$WORKTREE_PATH" fetch origin "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null && \
+        # `--` ends option parsing (#9106) — carried into this frozen copy so it
+        # matches the arm as main last shipped it, not a pre-hardening snapshot.
+        if git -C "$WORKTREE_PATH" fetch origin -- "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null && \
            loom_worktree_reset_or_rescue "$WORKTREE_PATH" "$stale_ref" "issue-$ISSUE_NUMBER-stale-worktree-reset"; then
             if [[ "$JSON_OUTPUT" != "true" ]]; then
                 print_success "Stale worktree reset to $stale_display"

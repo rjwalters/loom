@@ -14,6 +14,8 @@
 
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
+
 use crate::types::{PlanKey, QueueDisposition, ReadyQueueRow};
 
 use super::{candidate_cmp, PriorityCandidate, WorkItem};
@@ -33,6 +35,12 @@ pub struct TickQueueRow {
     /// The issue's `updatedAt` from the listing, which seeds its queue-dwell
     /// clock (#8856, `observability::ops::dwell`).
     pub updated_at: Option<String>,
+    /// When a time-boxed hold clears (Issue #9311): `RecheckInterval`,
+    /// `DispatchBackoff`/`OpenPrBackoff`, `NoopCooldown`, `Declined`, or
+    /// `PrlessRetry`. `None` for every other disposition, including a
+    /// candidate still awaiting pass 2 — `dispatch_plan::annotate_rows` copies
+    /// this straight into `RowPlan::held_until`.
+    pub held_until: Option<DateTime<Utc>>,
 }
 
 fn tier_of(item: &WorkItem) -> Option<String> {
@@ -99,7 +107,10 @@ pub fn plan_keys(c: &PriorityCandidate) -> Vec<PlanKey> {
         .collect()
 }
 
-/// Record a ready issue the tick dropped before the global sort.
+/// Record a ready issue the tick dropped before the global sort, with no
+/// time-boxed hold expiry. Mirrors [`record_skip_held`] with `held_until:
+/// None` — the common case, every disposition but the five Issue #9311
+/// tracks an expiry for.
 pub fn record_skip(
     rows: &mut Vec<TickQueueRow>,
     key: PriorityCandidate,
@@ -107,17 +118,34 @@ pub fn record_skip(
     disposition: QueueDisposition,
     detail: Option<String>,
 ) {
+    record_skip_held(rows, key, item, disposition, detail, None);
+}
+
+/// [`record_skip`] plus a time-boxed hold's absolute expiry (Issue #9311):
+/// `RecheckInterval`, `DispatchBackoff`/`OpenPrBackoff`, `NoopCooldown`,
+/// `Declined`, or `PrlessRetry`, when known.
+pub fn record_skip_held(
+    rows: &mut Vec<TickQueueRow>,
+    key: PriorityCandidate,
+    item: &WorkItem,
+    disposition: QueueDisposition,
+    detail: Option<String>,
+    held_until: Option<DateTime<Utc>>,
+) {
     rows.push(TickQueueRow {
         key,
         tier: tier_of(item),
         disposition: Some(disposition),
         detail,
         updated_at: item.updated_at.clone(),
+        held_until,
     });
 }
 
 /// Record a ready issue that entered the dispatch candidate list. Pass 2
-/// resolves its disposition with [`resolve`].
+/// resolves its disposition with [`resolve`]. Never carries a `held_until`:
+/// only a pass-1 skip can, and a dispatched/deferred candidate is never a
+/// time-boxed hold.
 pub fn record_candidate(rows: &mut Vec<TickQueueRow>, key: &PriorityCandidate, item: &WorkItem) {
     rows.push(TickQueueRow {
         key: PriorityCandidate {
@@ -128,6 +156,7 @@ pub fn record_candidate(rows: &mut Vec<TickQueueRow>, key: &PriorityCandidate, i
         disposition: None,
         detail: None,
         updated_at: item.updated_at.clone(),
+        held_until: None,
     });
 }
 

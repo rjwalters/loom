@@ -6,7 +6,7 @@ use super::*;
 
 pub fn session_analysis() -> TelemetryRecord {
     TelemetryRecord::SessionAnalysis(SessionAnalysisRecord {
-        repo: "loom".to_string(),
+        repo: Some("rjwalters/loom".to_string()),
         visibility: RepoVisibility::Private,
         session_id: "uuid-a".to_string(),
         parent_session_id: Some("uuid-parent".to_string()),

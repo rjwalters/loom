@@ -21,6 +21,19 @@ pub(crate) mod points_signal;
 /// Markdown and posts it, once, to the sweep's originating issue.
 pub(crate) mod writeback;
 
+/// Attempt lineage (Issue #9444): `attempt_index`, `previous_sweep_id` and
+/// the dispatch `trigger`, derived from this host's durable outcome journal.
+pub(crate) mod lineage;
+
+/// In-sweep rework events (Issue #9444): the marker-file protocol the
+/// performing paths write and the terminal outcome samples.
+pub(crate) mod rework;
+
+/// Generated-path classification and the landing-diff hand-written size
+/// facts (Issue #9466): `hw_lines_*`, `hw_files`, `generated_lines`,
+/// `test_lines`.
+pub(crate) mod landing_size;
+
 /// One observed lifecycle-phase transition for a live sweep (Issue #4704):
 /// the checkpoint phase marker and the instant [`SweepRegistry::reap_once`]
 /// first observed it.
@@ -533,21 +546,29 @@ impl SweepRegistry {
         // restart, or one that died before the first reaper tick): a single
         // best-effort entry naming the last known phase, attributed the whole
         // duration. Empty when neither is available, never a fabricated phase.
-        let phase_durations = started_at
-            .map(|started_at| self.phase_durations_for(sweep_id, started_at))
+        //
+        // Issue #9443 keeps the sampled *windows*, not just their lengths, so
+        // the per-phase token fold below covers exactly the intervals these
+        // durations measure. The fallback entry has no sampled window at all, so
+        // it stays usage-less: attributing the whole sweep's tokens to the one
+        // phase that happened to be observed last would be a fabrication, and
+        // the sweep ran the earlier phases too. That shortfall is reported in
+        // `tokens_unattributed` instead.
+        let phase_windows = started_at
+            .map(|started_at| self.phase_windows_for(sweep_id, started_at))
             .unwrap_or_default();
-        let phase_durations = if phase_durations.is_empty() {
-            latest_phase
+        let mut phase_durations: Vec<telemetry::PhaseDuration> =
+            phase_windows.iter().map(PhaseWindow::to_duration).collect();
+        if phase_durations.is_empty() {
+            phase_durations = latest_phase
                 .map(|phase| {
                     vec![telemetry::PhaseDuration {
-                        phase: phase_label(&phase).to_string(),
-                        duration_sec,
+                        attempt: Some(1),
+                        ..telemetry::PhaseDuration::new(phase_label(&phase), duration_sec)
                     }]
                 })
-                .unwrap_or_default()
-        } else {
-            phase_durations
-        };
+                .unwrap_or_default();
+        }
 
         // The sweep's own PR, taken from the checkpoint values sampled while it
         // ran (free), falling back to the checkpoint still on disk for a sweep
@@ -615,30 +636,28 @@ impl SweepRegistry {
             .or_else(|| self.probe_worktree_loc(issue))
             .map_or((None, None), |(added, deleted)| (Some(added), Some(deleted)));
 
-        // Tokens in/out (Issue #5357): summed straight from the sweep's own
-        // Claude Code transcripts, split into input/output axes (raw, NOT
-        // cost-weighted — see the schema doc and `tokens_in`'s own doc for
-        // why). Bounded to this run's own wall-clock window so a
-        // re-dispatched issue's earlier runs are never folded in. Best
-        // effort: any failure (no project dir, no matching session, pruned
-        // logs) degrades to `None`, never a fabricated `0`.
-        let (tokens_in, tokens_out) = started_at
-            .and_then(|started_at| {
-                let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
-                crate::transcript_tokens::sum_sweep_tokens_split(
-                    &projects_dir,
-                    &self.config.workspace_root,
-                    issue,
-                    Some((started_at, Utc::now())),
-                )
-            })
-            .map_or((None, None), |(tin, tout)| (Some(tin), Some(tout)));
-
-        // Per-model token breakdown (Issue #6384): same wall-clock window as
-        // `tokens_in`/`tokens_out` above, but grouped by
-        // `(model, speed, service_tier)` instead of flattened — see
+        // Tokens in/out (Issue #5357) and the per-model breakdown (#6384),
+        // resolved together with the `tokens_status` that explains them
+        // (Issue #9440) — see `crate::sweep_usage`, which owns the whole
+        // decision so this path and the live collector path cannot disagree
+        // about what an empty read means.
+        //
+        // Summed straight from the sweep's own transcripts, split into
+        // input/output axes (raw, NOT cost-weighted — see the schema doc and
+        // `tokens_in`'s own doc for why), and grouped by `(model, speed,
+        // service_tier)` rather than flattened for `tokens_by_model` — see
         // `ModelUsageTotals`'s own doc for why a flat sum cannot be priced.
-        // Same best-effort/never-fabricated-zero contract.
+        // Bounded to this run's own wall-clock window so a re-dispatched
+        // issue's earlier runs are never folded in; a sweep whose registry
+        // entry is already gone reconstructs that window from its measured
+        // duration rather than declining to measure at all (#9440).
+        //
+        // Issue #9440 is what makes this run for a FAILED sweep too: a
+        // pre-flight death publishes a measured zero, a cancelled or
+        // watchdog-killed sweep publishes the partial usage it really burned,
+        // and only a sweep whose usage genuinely could not be read publishes
+        // absent counters — now with a reason attached instead of looking
+        // identical to "never spawned".
         //
         // Issue #8507: the SOURCE is runtime-dispatched through
         // `crate::usage_source`. The Claude on-disk JSONL transcripts stay the
@@ -661,18 +680,157 @@ impl SweepRegistry {
             &self.config.workspace_root,
             issue,
         );
-        let tokens_by_model = started_at.and_then(|started_at| {
-            crate::usage_source::sweep_tokens_by_model(
+        let usage = crate::sweep_usage::apply_plausibility_guard(
+            crate::sweep_usage::resolve(
                 usage_runtime.as_deref(),
                 &self.config.workspace_root,
                 issue,
-                Some((started_at, Utc::now())),
-            )
+                crate::sweep_usage::window(started_at, duration_sec),
+                failure_class.as_deref(),
+            ),
+            duration_sec,
+        );
+        let crate::sweep_usage::SweepUsage {
+            tokens_in,
+            tokens_out,
+            tokens_by_model,
+            status: tokens_status,
+            reason: tokens_status_reason,
+        } = usage;
+
+        // ── Issues #9444/#9465/#9466: the terminal facts that are neither
+        // disposition nor usage-status — attempt lineage, marked rework,
+        // every sampled PR, the landing's hand-written size, and the model
+        // that actually ran. All but the rework markers are free (local
+        // journal/phase-history/git reads); none can fail the append.
+
+        // Attempt lineage (Issue #9444): where this sweep sits in the issue's
+        // local attempt chain and what triggered it. Read off this host's
+        // durable outcome journal — no forge calls, no new state. Absent
+        // (never fabricated) when the journal could not be read or the repo
+        // slug never resolved (the journal matches on it).
+        let lineage = repo.as_deref().and_then(|repo_slug| {
+            let journal_path = self.config.resolve_outcome_telemetry_path();
+            let prior = sweep_outcomes::read_all_sweep_outcomes(&journal_path);
+            lineage::derive_lineage(&prior, repo_slug, issue, sweep_id)
         });
+        let (attempt_index, previous_sweep_id, trigger) = lineage
+            .map_or((None, None, None), |(index, previous, trigger)| {
+                (Some(index), previous, Some(trigger.to_string()))
+            });
+
+        // In-sweep rework events (Issue #9444), two sources, markers first:
+        // (a) events the performing paths explicitly marked in the
+        // `sweep-rework-events.jsonl` protocol, and (b) events read off the
+        // worktree's own HEAD reflog — the mechanical writer that needs no
+        // role compliance, since a Doctor's conflict rebase or a Builder's
+        // merge-from-main records itself there with a timestamp. Both are
+        // scoped to this sweep's own window. Absent (never `[]`) when neither
+        // saw anything.
+        let rework_events = started_at
+            .map(|started_at| {
+                rework::collect_rework_events(
+                    &self.config.workspace_root,
+                    &self.worktree_path(issue),
+                    issue,
+                    started_at,
+                )
+            })
+            .filter(|events| !events.is_empty());
+
+        // Every PR this sweep's lifecycle was observed to carry (Issue
+        // #9465), in first-seen order — the multi-PR slice shape the single
+        // latest `pr_number` cannot represent.
+        let pr_numbers = self.sampled_pr_numbers(sweep_id);
+
+        // Landing-size facts (Issue #9466): the hand-written vs generated
+        // split of this sweep's own diff, classified by the repo-owned
+        // `generatedPaths` globs over the shipped default. Best-effort and
+        // local only — omitted (never 0) whenever the worktree's numstat
+        // could not be read, the same contract `lines_added` keeps.
+        let landing_size = {
+            let worktree = self.worktree_path(issue);
+            if worktree.exists() {
+                crate::git_utils::diff_rows_against_mainline(&worktree).map(|rows| {
+                    let matcher = landing_size::GeneratedMatcher::new(
+                        &landing_size::generated_patterns(&self.config.workspace_root),
+                    );
+                    landing_size::classify_numstat(&rows, &matcher)
+                })
+            } else {
+                None
+            }
+        };
+
+        // Issue #9465: `model` names what actually ran — the dominant model
+        // in the per-model breakdown — with the dispatched model as the
+        // fallback when nothing was attributed. The dispatch-time arm stays
+        // under `config["arm"]` (#4809).
+        let model = tokens_by_model
+            .as_ref()
+            .and_then(|rows| {
+                rows.iter()
+                    .max_by_key(|row| row.input.saturating_add(row.output))
+                    .map(|row| row.model.clone())
+            })
+            .or(model);
 
         // Distinct model ids actually observed in this sweep's transcripts
         // (Issue #8056) — see `models_used_from`.
         let models_used = models_used_from(tokens_by_model.as_deref());
+
+        // Per-phase-attempt usage (Issue #9443): the same read, the same
+        // runtime-dispatched source, and the same overall window as
+        // `tokens_by_model` above — folded over each sampled phase window
+        // instead of the sweep as a whole, so clean-landing cost (curator +
+        // builder + FIRST judge) is separable from Doctor/re-judge rework cost.
+        //
+        // Deliberately derived from the per-model rows rather than measured on a
+        // second axis: `TokenUsage::split` is `tokens_in`/`tokens_out`'s own
+        // definition, so Σ phases + `tokens_unattributed` reconciles against the
+        // sweep totals by construction.
+        let phase_slices: Vec<(DateTime<Utc>, DateTime<Utc>)> =
+            phase_windows.iter().map(|w| (w.start, w.end)).collect();
+        let phase_usage = started_at
+            .map(|started_at| {
+                crate::usage_source::sweep_tokens_by_window(
+                    usage_runtime.as_deref(),
+                    &self.config.workspace_root,
+                    issue,
+                    Some((started_at, Utc::now())),
+                    &phase_slices,
+                )
+            })
+            .unwrap_or_default();
+        for (entry, rows) in phase_durations.iter_mut().zip(phase_usage) {
+            let Some(rows) = rows.filter(|rows| !rows.is_empty()) else {
+                continue;
+            };
+            let (tokens_in, tokens_out) =
+                crate::observability::runtime_usage::TokenUsage::from_models(&rows).split();
+            entry.tokens_in = Some(tokens_in);
+            entry.tokens_out = Some(tokens_out);
+            entry.tokens_by_model = Some(rows);
+        }
+
+        // The remainder no phase entry accounts for (Issue #9443). Present only
+        // when the sweep's own totals are known — with nothing to take a
+        // remainder of, `0` would falsely claim the phases cover everything.
+        // Saturating: the two sides are folded from the same file set with the
+        // same dedupe, so the subtraction cannot legitimately go negative, and
+        // clamping is preferable to wrapping if a future source breaks that.
+        let tokens_unattributed = tokens_in.zip(tokens_out).map(|(total_in, total_out)| {
+            let (attributed_in, attributed_out) = phase_durations
+                .iter()
+                .filter_map(telemetry::PhaseDuration::token_split)
+                .fold((0u64, 0u64), |(sum_in, sum_out), (tin, tout)| {
+                    (sum_in.saturating_add(tin), sum_out.saturating_add(tout))
+                });
+            telemetry::TokenTotals {
+                tokens_in: total_in.saturating_sub(attributed_in),
+                tokens_out: total_out.saturating_sub(attributed_out),
+            }
+        });
 
         // Judge verdicts + completed Doctor cycles (Issue #8222), read off the
         // forge label timeline of the PR resolved just above — NOT off the
@@ -694,11 +852,39 @@ impl SweepRegistry {
             (Some(signals.doctor_cycles), Some(signals.judge_verdicts))
         });
 
-        // Curator complexity tier (Issue #8542), read off the sweep's own
-        // issue body — see `complexity_signal`'s module doc for why this is a
-        // separate forge read from the PR timeline above rather than a
-        // dispatch-time plumb, and its identical fail-open contract.
-        let complexity = self.fetch_complexity_signal(issue);
+        // Curator complexity tier (Issue #8542) plus the issue's own end state
+        // (Issue #9441), read off the sweep's own issue in ONE REST call — see
+        // `complexity_signal`'s module doc for why this is a separate forge
+        // read from the PR timeline above rather than a dispatch-time plumb,
+        // why the two signals share one call, and their identical fail-open
+        // contract.
+        let issue_signals = self.fetch_issue_signals(issue);
+        let complexity = issue_signals.complexity.clone();
+        let issue_end_state = issue_signals.end_state(started_at);
+        // The Curator's story-point size (Issue #9432, epic #9429), folded out
+        // of the SAME read's label list — no extra forge round trip, and the
+        // estimate can never describe a different issue than `complexity` and
+        // the end state do. Pure label folding with the one-label-per-issue
+        // guard: absent, out-of-vocabulary and stacked points labels all yield
+        // `None` (the last two logged loudly), never a guessed or zero size.
+        let story_points = issue_signals.story_points(issue);
+
+        // What this sweep actually DID (Issue #9441) — a pure derivation over
+        // the signals already assembled above, NOT new instrumentation. The
+        // disposition and its mandatory `failure_class` come back as one value
+        // so the "env_failure/substantive_failure/unknown must say why"
+        // invariant cannot be half-applied; see `telemetry::disposition`.
+        let (disposition, failure_class) =
+            telemetry::classify_disposition(&telemetry::DispositionSignals {
+                result,
+                pr_number,
+                failure_class: failure_class.as_deref(),
+                phase_durations: &phase_durations,
+                total_duration_sec: duration_sec,
+                judge_verdicts: judge_verdicts.as_deref(),
+                doctor_cycles,
+                issue_end_state,
+            });
 
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
@@ -712,12 +898,14 @@ impl SweepRegistry {
             phase_durations,
             total_duration_sec: duration_sec,
             result,
+            disposition,
             pr_number,
             tokens_in,
             tokens_out,
             lines_added,
             lines_deleted,
             tokens_by_model,
+            tokens_unattributed,
             failure_class,
             models_used,
             doctor_cycles,
@@ -728,7 +916,33 @@ impl SweepRegistry {
                 .and_then(|r| r.provider.clone()),
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
             complexity,
+            story_points,
+            tokens_status: Some(tokens_status),
+            attempt_index,
+            previous_sweep_id,
+            trigger,
+            rework_events,
+            pr_numbers,
+            hw_lines_added: landing_size.as_ref().map(|size| size.hw_lines_added),
+            hw_lines_deleted: landing_size.as_ref().map(|size| size.hw_lines_deleted),
+            hw_files: landing_size.as_ref().map(|size| size.hw_files),
+            generated_lines: landing_size.as_ref().map(|size| size.generated_lines),
+            test_lines: landing_size.as_ref().map(|size| size.test_lines),
+            tokens_status_reason,
         };
+        // Issue #9441: both disposition invariants hold on every record this
+        // daemon writes. A debug assertion rather than a runtime guard — the
+        // classifier makes them true by construction (and proves it in its own
+        // contract tests), so a violation here is a code defect to catch in
+        // test/CI, never a reason to drop a record in production.
+        debug_assert!(
+            outcome_record.disposition_invariants_hold(),
+            "#9441: sweep.outcome for issue #{issue} ({sweep_id}) violates a disposition \
+             invariant: disposition={}, pr_number={:?}, failure_class={:?}",
+            outcome_record.disposition.as_str(),
+            outcome_record.pr_number,
+            outcome_record.failure_class,
+        );
         // Issue #9056: opt-in, post-`Success`-only issue write-back comment.
         // Only a clone of the assembled record is taken HERE (`outcome_record`
         // itself moves into the telemetry envelope below); every forge call —
@@ -766,6 +980,22 @@ impl SweepRegistry {
         if let Some(pr) = pr_number {
             metadata.insert("loom.pr_number".into(), pr.to_string());
         }
+        // #9441: the "what did this sweep DO" axis on the span too, so a trace
+        // query can separate a landing from a no-op re-dispatch without
+        // joining the journal.
+        metadata.insert("loom.disposition".into(), outcome_record.disposition.as_str().to_string());
+        // Issues #9444/#9465/#9466: the new terminal facts ride the trace
+        // metadata too, so a span-side reader sees the same verdict the
+        // record carries.
+        if let Some(index) = outcome_record.attempt_index {
+            metadata.insert("loom.attempt_index".into(), index.to_string());
+        }
+        if let Some(previous) = outcome_record.previous_sweep_id.as_deref() {
+            metadata.insert("loom.previous_sweep_id".into(), previous.to_string());
+        }
+        if let Some(trigger) = outcome_record.trigger.as_deref() {
+            metadata.insert("loom.trigger".into(), trigger.to_string());
+        }
         for (key, value) in [
             ("loom.failure_class", outcome_record.failure_class.as_ref()),
             ("loom.configured_model", outcome_record.model.as_ref()),
@@ -780,6 +1010,29 @@ impl SweepRegistry {
         if let Some(cycles) = outcome_record.doctor_cycles {
             metadata.insert("loom.doctor_cycles".into(), cycles.to_string());
         }
+        // #9443: the same per-phase numbers `phase_durations` carries, on the
+        // execution's own `loom.role_attempt` spans, so the D1/JSONL path and
+        // the OTLP path report one set of per-phase costs. Before
+        // `finish_sweep`/`finish_execution`, which retire the journal.
+        let phase_usage_spans: Vec<crate::observability::runtime_usage::PhaseUsage<'_>> =
+            phase_windows
+                .iter()
+                .zip(&outcome_record.phase_durations)
+                .filter_map(|(window, entry)| {
+                    Some(crate::observability::runtime_usage::PhaseUsage {
+                        role: entry.phase.as_str(),
+                        attempt: entry.attempt.unwrap_or(1),
+                        window: (window.start, window.end),
+                        rows: entry.tokens_by_model.as_deref()?,
+                    })
+                })
+                .collect();
+        crate::observability::runtime_usage::record_phase_usage(
+            &self.config.workspace_root,
+            sweep_id,
+            &phase_usage_spans,
+            outcome_record.runtime.as_deref(),
+        );
         // #8908: this execution's exact token usage, joined to its trace.
         crate::observability::runtime_usage::finish_sweep(
             &self.config.workspace_root,
@@ -949,6 +1202,23 @@ impl SweepRegistry {
             .find_map(|o| o.pr_number)
     }
 
+    /// Every PR number this sweep's lifecycle was observed to carry (Issue
+    /// #9465), in first-seen order — the multi-PR slice shape a single
+    /// latest-`pr_number` cannot represent. Free (no forge call): read off
+    /// the same phase history [`Self::sampled_pr_number`] reads.
+    pub(crate) fn sampled_pr_numbers(&self, sweep_id: &str) -> Option<Vec<u32>> {
+        let history = self.phase_history.get(sweep_id)?;
+        let mut seen = Vec::new();
+        for observation in history {
+            if let Some(pr) = observation.pr_number {
+                if !seen.contains(&pr) {
+                    seen.push(pr);
+                }
+            }
+        }
+        (!seen.is_empty()).then_some(seen)
+    }
+
     /// The most recent `(jev_tier, jev_confidence)` pair observed on this
     /// sweep's checkpoint (Issue #8543), or `None` when no Tier-2.5 Jev call
     /// was ever sampled (no `TYPESAFE_API_KEY`, or the call failed/never
@@ -1004,41 +1274,84 @@ impl SweepRegistry {
     }
 
     /// Build the `sweep.outcome` record's per-phase breakdown from the
-    /// transition history sampled for `sweep_id` (Issue #4704).
+    /// transition history sampled for `sweep_id` (Issue #4704), as attribution
+    /// *windows* rather than bare lengths (Issue #9443) so the durations and the
+    /// per-phase token fold can never describe different intervals.
     ///
     /// The checkpoint markers are phase *completions* (`curator-done` means the
-    /// Curator phase finished), so the duration attributed to a phase is the
-    /// interval ending at its own observation and beginning at the previous
-    /// observation — or at `started_at` for the first. A phase that appears
-    /// twice in one lifecycle (the Judge↔Doctor cycle) yields two entries, in
-    /// lifecycle order, which is more faithful than collapsing them.
+    /// Curator phase finished), so the interval attributed to a phase ends at its
+    /// own observation and begins at the previous observation — or at
+    /// `started_at` for the first. A phase that appears twice in one lifecycle
+    /// (the Judge↔Doctor cycle) yields two windows, in lifecycle order and
+    /// distinguished by a 1-based-per-phase [`PhaseWindow::attempt`], which is
+    /// more faithful than collapsing them and is what makes "the *first* judge"
+    /// addressable.
     ///
     /// The trailing in-flight segment — from the last observed completion to
     /// the terminal transition — is deliberately **not** emitted: the daemon
     /// does not know which phase the sweep was in, and inventing one would be a
-    /// fabricated label. So the entries sum to at most `total_duration_sec`,
-    /// never more.
-    pub(crate) fn phase_durations_for(
+    /// fabricated label. So the windows cover at most `total_duration_sec`, never
+    /// more, and the tokens spent in that segment land in
+    /// [`telemetry::SweepOutcomeRecord::tokens_unattributed`].
+    ///
+    /// Empty when this sweep's transition history was never sampled (a daemon
+    /// restart mid-sweep, a sweep that died before the first reaper tick) — the
+    /// caller then has no window to attribute anything to, which is why such a
+    /// record's fallback single entry carries no usage.
+    pub(crate) fn phase_windows_for(
         &self,
         sweep_id: &str,
         started_at: DateTime<Utc>,
-    ) -> Vec<telemetry::PhaseDuration> {
+    ) -> Vec<PhaseWindow> {
         let Some(history) = self.phase_history.get(sweep_id) else {
             return Vec::new();
         };
-        let mut out = Vec::with_capacity(history.len());
+        let mut out: Vec<PhaseWindow> = Vec::with_capacity(history.len());
         let mut prev = started_at;
         for observation in history {
-            // `max(0)` guards against a clock step between observations; a
-            // negative duration on the wire would be nonsense to any consumer.
-            let duration_sec = (observation.at - prev).num_seconds().max(0);
-            out.push(telemetry::PhaseDuration {
-                phase: phase_label(&observation.phase).to_string(),
-                duration_sec,
+            let phase = phase_label(&observation.phase).to_string();
+            let attempt = u32::try_from(out.iter().filter(|w| w.phase == phase).count())
+                .unwrap_or(u32::MAX - 1)
+                .saturating_add(1);
+            out.push(PhaseWindow {
+                phase,
+                attempt,
+                // `max(prev)` guards against a clock step between observations;
+                // an end before its own start would be nonsense to a consumer
+                // and would make the window fold nothing.
+                start: prev,
+                end: observation.at.max(prev),
             });
             prev = observation.at;
         }
         out
+    }
+}
+
+/// One sampled phase attempt's attribution window (Issue #9443).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PhaseWindow {
+    /// The normalized lifecycle phase name ([`phase_label`]).
+    pub(crate) phase: String,
+    /// 1-based index among this record's entries for the same `phase`.
+    pub(crate) attempt: u32,
+    /// The previous observation's instant (or the sweep's start, for the first).
+    pub(crate) start: DateTime<Utc>,
+    /// This observation's instant. Never before `start`.
+    pub(crate) end: DateTime<Utc>,
+}
+
+impl PhaseWindow {
+    /// The duration-only `phase_durations` entry for this window; usage fields
+    /// are filled in afterwards, once the usage source is known.
+    pub(crate) fn to_duration(&self) -> telemetry::PhaseDuration {
+        telemetry::PhaseDuration {
+            attempt: Some(self.attempt),
+            ..telemetry::PhaseDuration::new(
+                self.phase.clone(),
+                (self.end - self.start).num_seconds().max(0),
+            )
+        }
     }
 }
 
@@ -1087,6 +1400,17 @@ mod credential_tests;
 )]
 mod runtime_tests;
 
+// Per-phase token attribution + `tokens_unattributed` (#9443), in its own
+// sibling module for the same file-size reason as `runtime_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod phase_usage_tests;
+
 // Tap-attributed usage accounting (#8556) end-to-end across both terminal
 // journals, in its own sibling module for the same file-size reason.
 #[cfg(test)]
@@ -1121,3 +1445,40 @@ mod complexity_tests;
     unused_imports
 )]
 mod writeback_tests;
+
+// End-to-end tests for the #9441 `disposition` field as it lands on a real
+// journal record, in their own sibling file for the same file-size reason as
+// `timeline_tests` above. The classifier's own exhaustive contract tests are
+// pure and live with it, in `telemetry::disposition`.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod disposition_tests;
+
+// End-to-end tests for the #9440 `tokens_status` axis (a failed/cancelled
+// sweep's token counters and the absence-case discriminator), in their own
+// sibling file for the same file-size reason as `timeline_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod tokens_status_tests;
+
+// Contract tests for the #9465 PR-linkage and actually-ran-model derivation
+// (`pr_numbers`, `model` vs. `config["arm"]`), in their own sibling file for
+// the same file-size reason as `timeline_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod pr_link_tests;

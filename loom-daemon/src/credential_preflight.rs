@@ -503,7 +503,7 @@ where
 /// (`{"status": "ok"|"not_configured"|"error", …}`) into a
 /// [`GithubAppOutcome`]. Split out from I/O so it is unit-testable without a
 /// real subprocess — mirrors [`resolve`].
-fn parse_github_app_response(stdout: &str) -> GithubAppOutcome {
+pub(crate) fn parse_github_app_response(stdout: &str) -> GithubAppOutcome {
     let parsed: Value = match serde_json::from_str(stdout.trim()) {
         Ok(v) => v,
         Err(e) => {

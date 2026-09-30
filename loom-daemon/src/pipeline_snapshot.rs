@@ -30,14 +30,25 @@
 //! # Parallelism
 //!
 //! [`collect_pipeline_snapshots`] fans the per-repo fetch out onto Tokio's
-//! blocking-thread pool (`gh` is a synchronous subprocess call) so N managed
-//! repos cost roughly one repo's worth of wall-clock latency, not N.
+//! blocking-thread pool (`gh` is a synchronous subprocess call), bounded to a
+//! few roots at a time (Issue #9253, [`DEFAULT_FETCH_CONCURRENCY`]).
+//!
+//! # Forge cost (Issue #9253)
+//!
+//! The label counts come from the disk-persistent REST + ETag listing
+//! ([`crate::forge_listing::list_issues_cached_persistent`]), so an unchanged
+//! root answers them with free `304`s. What REST cannot serve stays on
+//! GraphQL — the merged-in-window search, and `mergeable` for held PRs (only
+//! when any exist) — so an unchanged root costs at most ~2 billable calls.
+//! See [`rest_source`].
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+
+mod rest_source;
 
 /// One managed repo's forge-side pipeline counts.
 ///
@@ -382,12 +393,12 @@ fn describe_gh_unavailable(
     }
 }
 
-/// A `gh`-backed [`PipelineSource`]. Runs up to six `gh` invocations per repo
-/// (one per requested metric — see [`PipelineMetrics`]) scoped to that repo's
-/// own working directory so `gh` auto-detects the remote — same convention as
-/// [`crate::work_finder::forge::GhWorkSource::for_root`]. `--limit 500` is
-/// generous headroom over the default `gh` page size of 30, which would
-/// otherwise silently undercount a busy repo's queue.
+/// A `gh`-backed [`PipelineSource`], scoped to each repo's own working
+/// directory so `gh` auto-detects the remote — same convention as
+/// [`crate::work_finder::forge::GhWorkSource::for_root`]. Label counts use the
+/// cached REST listing ([`rest_source`], Issue #9253); the GraphQL `gh … list
+/// --limit 500` queries below remain for merge throughput, held-PR
+/// `mergeable`, and a metric whose REST page came back full (truncated).
 pub struct GhPipelineSource {
     gh_bin: PathBuf,
     metrics: PipelineMetrics,
@@ -541,161 +552,11 @@ impl Default for GhPipelineSource {
 }
 
 impl PipelineSource for GhPipelineSource {
+    /// Issue #9253: served from the disk-persistent REST + ETag listing (one
+    /// conditional request per label, a free `304` when unchanged) — see
+    /// [`rest_source`]. GraphQL is used only where REST cannot answer.
     fn fetch(&self, root: &Path) -> RepoPipelineSnapshot {
-        let mut snap = RepoPipelineSnapshot {
-            root: root.to_path_buf(),
-            ..Default::default()
-        };
-        let mut first_err: Option<String> = None;
-        let mut record = |result: Result<usize>| -> Option<usize> {
-            match result {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e.to_string());
-                    }
-                    None
-                }
-            }
-        };
-
-        if self.metrics.queued {
-            let search = Self::queued_search_query();
-            snap.queued = record(self.count(
-                root,
-                &[
-                    "issue", "list", "--search", &search, "--json", "number", "--limit", "500",
-                ],
-            ));
-        }
-        if self.metrics.building {
-            snap.building = record(self.count(
-                root,
-                &[
-                    "issue",
-                    "list",
-                    "--state",
-                    "open",
-                    "--label",
-                    "loom:building",
-                    "--json",
-                    "number",
-                    "--limit",
-                    "500",
-                ],
-            ));
-        }
-        if self.metrics.review_requested {
-            snap.review_requested = record(self.count(
-                root,
-                &[
-                    "pr",
-                    "list",
-                    "--state",
-                    "open",
-                    "--label",
-                    "loom:review-requested",
-                    "--json",
-                    "number",
-                    "--limit",
-                    "500",
-                ],
-            ));
-        }
-        if self.metrics.changes_requested {
-            snap.changes_requested = record(self.count(
-                root,
-                &[
-                    "pr",
-                    "list",
-                    "--state",
-                    "open",
-                    "--label",
-                    "loom:changes-requested",
-                    "--json",
-                    "number",
-                    "--limit",
-                    "500",
-                ],
-            ));
-        }
-        if self.metrics.changes_requested_unclaimed {
-            let search = Self::changes_requested_unclaimed_search_query();
-            snap.changes_requested_unclaimed = record(self.count(
-                root,
-                &[
-                    "pr", "list", "--search", &search, "--json", "number", "--limit", "500",
-                ],
-            ));
-        }
-        if self.metrics.approved {
-            snap.approved = record(self.count(
-                root,
-                &[
-                    "pr", "list", "--state", "open", "--label", "loom:pr", "--json", "number",
-                    "--limit", "500",
-                ],
-            ));
-        }
-
-        if self.metrics.merged {
-            let search = Self::merged_since_query(chrono::Utc::now(), self.merge_window);
-            snap.merged_24h = record(self.count(
-                root,
-                &[
-                    "pr", "list", "--state", "merged", "--search", &search, "--json", "number",
-                    "--limit", "500",
-                ],
-            ));
-        }
-
-        // Issue #8091: `operator_held`/`operator_held_conflicting`/
-        // `operator_held_oldest_days` are all derived from the same row set,
-        // so — unlike every metric above — this is not a `record(self.count(..))`
-        // call; a failure here leaves all three `None` rather than a
-        // fabricated 0 (the "must not render 0 held on a failed read" rule).
-        // The error path still routes through `record` (discarding its
-        // `Option<usize>` return) so `first_err` keeps exactly one owner.
-        if self.metrics.operator_held {
-            match self.operator_held_rows(root) {
-                Ok(rows) => {
-                    snap.operator_held = Some(rows.len());
-                    snap.operator_held_conflicting = Some(
-                        rows.iter()
-                            .filter(|r| r.mergeable.as_deref() == Some("CONFLICTING"))
-                            .count(),
-                    );
-                    snap.operator_held_oldest_days = rows
-                        .iter()
-                        .map(|r| r.created_at)
-                        .min()
-                        .map(|oldest| (chrono::Utc::now() - oldest).num_days().max(0));
-                }
-                Err(e) => {
-                    record(Err(e));
-                }
-            }
-        }
-        if self.metrics.operator_only_issues {
-            snap.operator_only_issues = record(self.count(
-                root,
-                &[
-                    "issue",
-                    "list",
-                    "--state",
-                    "open",
-                    "--label",
-                    "loom:operator-only",
-                    "--json",
-                    "number",
-                    "--limit",
-                    "500",
-                ],
-            ));
-        }
-
-        snap.error = first_err;
-        snap
+        rest_source::fetch(self, root)
     }
 }
 
@@ -716,18 +577,59 @@ where
     // without a second generic threading through `ServeState`/`run`.
     S: PipelineSource + Send + Sync + ?Sized + 'static,
 {
-    let handles: Vec<(PathBuf, tokio::task::JoinHandle<RepoPipelineSnapshot>)> = roots
-        .into_iter()
-        .map(|root| {
-            let source = Arc::clone(&source);
-            let root_for_task = root.clone();
-            (root, tokio::task::spawn_blocking(move || source.fetch(&root_for_task)))
-        })
-        .collect();
+    collect_pipeline_snapshots_bounded(source, roots, fetch_concurrency()).await
+}
+
+/// Default cap on concurrently-running per-root fetches (Issue #9253).
+pub const DEFAULT_FETCH_CONCURRENCY: usize = 4;
+
+/// The per-root fan-out bound: `LOOM_PIPELINE_FETCH_CONCURRENCY` when it is a
+/// positive integer, else [`DEFAULT_FETCH_CONCURRENCY`].
+fn fetch_concurrency() -> usize {
+    std::env::var("LOOM_PIPELINE_FETCH_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_FETCH_CONCURRENCY)
+}
+
+/// [`collect_pipeline_snapshots`] with an explicit concurrency bound (Issue
+/// #9253). Before the bound, every root got its own `spawn_blocking` at once,
+/// so a ~58-root fleet fired every root's forge calls in the same instant — a
+/// burst that trips GitHub's secondary (concurrency) limits on top of the
+/// primary budget. A permit is acquired *before* each blocking fetch starts,
+/// so at most `bound` roots are in flight; output order still matches input.
+async fn collect_pipeline_snapshots_bounded<S>(
+    source: Arc<S>,
+    roots: Vec<PathBuf>,
+    bound: usize,
+) -> Vec<RepoPipelineSnapshot>
+where
+    S: PipelineSource + Send + Sync + ?Sized + 'static,
+{
+    let permits = Arc::new(tokio::sync::Semaphore::new(bound.max(1)));
+    let handles: Vec<(PathBuf, tokio::task::JoinHandle<Result<RepoPipelineSnapshot, String>>)> =
+        roots
+            .into_iter()
+            .map(|root| {
+                let source = Arc::clone(&source);
+                let acquire = Arc::clone(&permits).acquire_owned();
+                let root_for_task = root.clone();
+                let task = tokio::spawn(async move {
+                    // The semaphore is never closed, so this cannot fail; a
+                    // missing permit would only mean running unbounded.
+                    let _permit = acquire.await.ok();
+                    tokio::task::spawn_blocking(move || source.fetch(&root_for_task))
+                        .await
+                        .map_err(|e| e.to_string())
+                });
+                (root, task)
+            })
+            .collect();
 
     let mut out = Vec::with_capacity(handles.len());
     for (root, handle) in handles {
-        match handle.await {
+        match handle.await.map_err(|e| e.to_string()).and_then(|r| r) {
             Ok(snap) => out.push(snap),
             Err(join_err) => out.push(RepoPipelineSnapshot {
                 root,
@@ -977,6 +879,51 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    /// A [`PipelineSource`] that records the peak number of concurrently
+    /// running `fetch` calls (Issue #9253 AC2).
+    #[derive(Default)]
+    struct ConcurrencyProbe {
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PipelineSource for ConcurrencyProbe {
+        fn fetch(&self, root: &Path) -> RepoPipelineSnapshot {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            self.in_flight.fetch_sub(1, SeqCst);
+            RepoPipelineSnapshot {
+                root: root.to_path_buf(),
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Issue #9253 AC2: at most `bound` roots are fetched at once, every
+    /// root is still fetched, and output order matches input order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn collect_bounds_concurrent_fetches_and_keeps_order() {
+        let probe = Arc::new(ConcurrencyProbe::default());
+        let roots: Vec<PathBuf> = (0..12)
+            .map(|i| PathBuf::from(format!("/repo/{i}")))
+            .collect();
+
+        let out = collect_pipeline_snapshots_bounded(Arc::clone(&probe), roots.clone(), 3).await;
+
+        let peak = probe.peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(peak <= 3, "fan-out exceeded the bound: peak {peak}");
+        assert!(peak >= 2, "the bound should still allow parallelism: peak {peak}");
+        let got: Vec<PathBuf> = out.into_iter().map(|s| s.root).collect();
+        assert_eq!(got, roots);
+    }
+
+    #[test]
+    fn fetch_concurrency_default_is_small_and_positive() {
+        assert!((1..=8).contains(&DEFAULT_FETCH_CONCURRENCY));
+    }
+
     // ===================================================================
     // GhPipelineSource — real fan-out against a fake `gh` binary
     // ===================================================================
@@ -999,120 +946,8 @@ mod tests {
         path
     }
 
-    /// `#[serial]` is load-bearing (#4547): concurrent `std::env::set_var`
-    /// (used by `disk_headroom.rs`'s PATH-mutating tests) races any
-    /// concurrently-running thread that reads the process environment,
-    /// including the implicit env read inside every `std::process::Command`
-    /// spawn below — not just subprocesses that literally do a `PATH`
-    /// lookup for their own executable.
-    #[test]
-    #[serial]
-    fn gh_pipeline_source_counts_each_metric_independently() {
-        let tmp = tempfile::tempdir().unwrap();
-        let gh = write_fake_gh(
-            tmp.path(),
-            r#"
-case "$*" in
-  *"--search is:open label:loom:issue"*)
-    echo '[{"number":1},{"number":2},{"number":3}]'
-    ;;
-  *"--label loom:building"*)
-    echo '[{"number":4}]'
-    ;;
-  *"--label loom:review-requested"*)
-    echo '[{"number":5},{"number":6}]'
-    ;;
-  *"--label loom:changes-requested"*)
-    echo '[]'
-    ;;
-  *"is:pr label:loom:changes-requested"*)
-    echo '[{"number":12}]'
-    ;;
-  *"--label loom:pr"*)
-    echo '[{"number":7}]'
-    ;;
-  *"--state merged"*)
-    echo '[{"number":8},{"number":9},{"number":10},{"number":11}]'
-    ;;
-  *"mergeable,createdAt"*)
-    echo '[{"number":13,"mergeable":"CONFLICTING","createdAt":"2026-07-01T00:00:00Z"},{"number":14,"mergeable":"MERGEABLE","createdAt":"2026-08-01T00:00:00Z"}]'
-    ;;
-  *"loom:operator-only"*)
-    echo '[{"number":15}]'
-    ;;
-  *)
-    echo '[]'
-    ;;
-esac
-"#,
-        );
-
-        let source = GhPipelineSource::new().with_gh_bin(gh);
-        let root = tmp.path();
-        let snap = source.fetch(root);
-
-        assert_eq!(snap.root, root);
-        assert_eq!(snap.queued, Some(3));
-        assert_eq!(snap.building, Some(1));
-        assert_eq!(snap.review_requested, Some(2));
-        assert_eq!(snap.changes_requested, Some(0));
-        assert_eq!(snap.changes_requested_unclaimed, Some(1));
-        assert_eq!(snap.approved, Some(1));
-        assert_eq!(snap.merged_24h, Some(4));
-        assert_eq!(snap.operator_held, Some(2), "#8091: two held PRs");
-        assert_eq!(
-            snap.operator_held_conflicting,
-            Some(1),
-            "#8091: only one of the two is CONFLICTING"
-        );
-        // The oldest of 2026-07-01 / 2026-08-01 is 2026-07-01 — older than
-        // 2026-08-01, so its age (measured against the real wall clock) must
-        // be the larger of the two.
-        assert!(snap.operator_held_oldest_days.is_some_and(|d| d > 0));
-        assert_eq!(snap.operator_only_issues, Some(1), "#8091");
-        assert!(snap.is_complete());
-    }
-
-    /// `#[serial]` is load-bearing (#4547): the fake-`gh` script this test
-    /// spawns is a subprocess whose resolution depends on the inherited
-    /// `PATH`, which `disk_headroom.rs`'s tests mutate process-globally.
-    #[test]
-    #[serial]
-    fn gh_pipeline_source_records_error_but_keeps_other_metrics() {
-        let tmp = tempfile::tempdir().unwrap();
-        let gh = write_fake_gh(
-            tmp.path(),
-            r#"
-case "$*" in
-  *"--search is:open label:loom:issue"*)
-    echo "boom: not authenticated" 1>&2
-    exit 1
-    ;;
-  *"--label loom:building"*)
-    echo '[{"number":1}]'
-    ;;
-  *)
-    echo '[]'
-    ;;
-esac
-"#,
-        );
-
-        let source = GhPipelineSource::new().with_gh_bin(gh);
-        let snap = source.fetch(tmp.path());
-
-        assert_eq!(snap.queued, None);
-        assert_eq!(snap.building, Some(1));
-        assert!(!snap.is_complete());
-        assert!(snap.error.as_deref().unwrap().contains("not authenticated"));
-        // Other metrics that had no dedicated case still resolve (as 0),
-        // proving one failed call didn't abort the rest of the fetch.
-        assert_eq!(snap.merged_24h, Some(0));
-    }
-
-    /// `#[serial]` is load-bearing (#4547) for the same reason as
-    /// `gh_pipeline_source_counts_each_metric_independently` above — even a
-    /// failed `Command::spawn` attempt reads the process environment.
+    /// `#[serial]` is load-bearing (#4547): even a failed `Command::spawn`
+    /// attempt reads the process environment, which other tests mutate.
     #[test]
     #[serial]
     fn gh_pipeline_source_missing_binary_is_a_contained_failure() {
@@ -1158,80 +993,6 @@ esac
         assert_eq!(source.merge_window, chrono::Duration::hours(24));
         let source = GhPipelineSource::new().with_merge_window(chrono::Duration::minutes(-5));
         assert_eq!(source.merge_window, chrono::Duration::hours(24));
-    }
-
-    /// The #4761 cost control, as widened by #5021, #5272, and #8091: the
-    /// HEALTH mask must issue exactly the eight `gh` calls the health
-    /// sections read — queue depth, the four review-side axes (including the
-    /// #5272 no-owner count), merge throughput, and the two #8091
-    /// operator-attention axes — and must still skip `building`, which no
-    /// section consumes. The mask exists to keep the one-shot command off the
-    /// metrics nothing reads, not to be `ALL`.
-    #[test]
-    #[serial]
-    fn health_metrics_mask_fetches_every_axis_the_sections_read_but_not_building() {
-        let tmp = tempfile::tempdir().unwrap();
-        let calls = tmp.path().join("calls.log");
-        let gh = write_fake_gh(
-            tmp.path(),
-            &format!(
-                r#"
-echo "$*" >> {}
-case "$*" in
-  *"mergeable,createdAt"*)
-    echo '[{{"number":1,"mergeable":"CONFLICTING","createdAt":"2026-07-01T00:00:00Z"}}]'
-    ;;
-  *)
-    echo '[{{"number":1}}]'
-    ;;
-esac
-"#,
-                calls.display()
-            ),
-        );
-
-        let source = GhPipelineSource::new()
-            .with_gh_bin(gh)
-            .with_metrics(PipelineMetrics::HEALTH);
-        let snap = source.fetch(tmp.path());
-
-        assert_eq!(snap.queued, Some(1));
-        assert_eq!(snap.merged_24h, Some(1));
-        assert_eq!(snap.review_requested, Some(1), "#5021: the review axis must be fetched");
-        assert_eq!(snap.changes_requested, Some(1));
-        assert_eq!(
-            snap.changes_requested_unclaimed,
-            Some(1),
-            "#5272: the no-owner axis must be fetched"
-        );
-        assert_eq!(snap.approved, Some(1));
-        assert_eq!(snap.building, None, "no health section reads `building`");
-        assert_eq!(snap.operator_held, Some(1), "#8091: the operator-held axis must be fetched");
-        assert_eq!(snap.operator_held_conflicting, Some(1));
-        assert!(snap.operator_held_oldest_days.is_some_and(|d| d >= 0));
-        assert_eq!(
-            snap.operator_only_issues,
-            Some(1),
-            "#8091: the operator-only-issues axis must be fetched"
-        );
-        assert!(snap.is_complete());
-
-        let log = std::fs::read_to_string(&calls).unwrap();
-        assert_eq!(log.lines().count(), 8, "exactly eight gh calls, got:\n{log}");
-        assert!(log.contains("loom:issue"));
-        assert!(log.contains("loom:review-requested"));
-        assert!(log.contains("loom:changes-requested"));
-        assert!(
-            log.contains("-label:loom:treating"),
-            "#5272: no-owner query must exclude loom:treating"
-        );
-        assert!(log.contains("--state merged"));
-        assert!(!log.contains("loom:building"));
-        assert!(
-            log.contains("--label loom:operator "),
-            "#8091: the held-PR query must fetch by loom:operator, not loom:operator-only: {log}"
-        );
-        assert!(log.contains("loom:operator-only"), "#8091: {log}");
     }
 
     #[test]
@@ -1283,35 +1044,5 @@ esac
                 "expected '-label:{label}' in query: {query}"
             );
         }
-    }
-
-    /// A row that is `loom:issue` *and* park-labeled must not be counted
-    /// toward `queued` — exercised end-to-end against a fake `gh` that
-    /// mimics `--search`'s label-negation semantics.
-    #[test]
-    #[serial]
-    fn gh_pipeline_source_excludes_park_labeled_rows_from_queued() {
-        let tmp = tempfile::tempdir().unwrap();
-        let gh = write_fake_gh(
-            tmp.path(),
-            r#"
-case "$*" in
-  *"--search is:open label:loom:issue -label:loom:blocked -label:loom:operator-only"*)
-    echo '[{"number":1},{"number":2}]'
-    ;;
-  *)
-    echo '[]'
-    ;;
-esac
-"#,
-        );
-
-        let source = GhPipelineSource::new()
-            .with_gh_bin(gh)
-            .with_metrics(PipelineMetrics::HEALTH);
-        let snap = source.fetch(tmp.path());
-
-        assert_eq!(snap.queued, Some(2), "the fake gh only matches the fully-negated query");
-        assert!(snap.is_complete());
     }
 }

@@ -2,6 +2,7 @@
 name = "loom-daemon"
 version.workspace = true
 repository.workspace = true
+license.workspace = true
 edition = "2021"
 
 [dependencies]
@@ -20,7 +21,7 @@ regex = "1.12"
 clap = { version = "4.6", features = ["derive", "env"] }
 sha2 = "0.11.0"
 hex = "0.4.3"
-toml = "0.9"
+toml = "1.1"
 # Minimal async HTTP client for the observability exporter (#4705): JSON-over-
 # HTTPS push only, no TLS-backend duplication with other tooling in this repo.
 # `rustls-tls` avoids an OpenSSL system dependency; `default-features = false`
@@ -36,7 +37,7 @@ libc = "0.2"
 # deliberately NOT enabled — `OtlpExporter` posts the JSON encoding over the
 # existing `reqwest` client (reusing `super::sender`'s drain/retry loop), so
 # no gRPC transport stack is pulled in.
-opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["logs", "metrics", "trace", "gen-tonic-messages", "with-serde"], optional = true }
+opentelemetry-proto = { version = "0.33.0", default-features = false, features = ["logs", "metrics", "trace", "gen-tonic-messages", "with-serde"], optional = true }
 
 tempfile = "3.27"
 # `.tar.zst` transcript archiving (#8494): `tar` builds/reads the archive
