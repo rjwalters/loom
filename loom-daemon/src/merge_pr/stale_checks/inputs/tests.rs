@@ -391,7 +391,8 @@ fn every_script_a_required_job_runs_is_a_global_input() {
             let spec = spec(component);
             pinned += 1;
             // These three run only the built daemon, no script; their G set
-            // carries `loom-daemon/**` instead.
+            // carries the subcommand's Rust surface instead, pinned by
+            // `daemon_surface_tests.rs`.
             assert!(
                 !refs.is_empty()
                     || matches!(

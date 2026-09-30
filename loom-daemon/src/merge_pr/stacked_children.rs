@@ -110,15 +110,36 @@ pub enum Outcome {
     NeedsPin,
 }
 
-/// `^feature/issue-([0-9]+)$` — the strict pattern, so `release-1` and
-/// `fix-bug-42` classify as PR-style rather than issue-style. Only a parent PR
-/// on an issue branch can have Loom-style stacked children.
+/// The strict, closed allow-list of recognized Builder branch prefixes:
+/// `feature/issue-<N>` (worktree.sh's default) and `feature/harness-ops-<N>`
+/// (2AMLogic/harness-ops's Builder convention). The ONE definition shared by
+/// [`is_stackable_parent_branch`] (this module's pre-merge gate) and
+/// [`super::reconcile::issue_from_branch`] (the post-merge plan and
+/// child-issue derivation), so the two decisions can never disagree on which
+/// parent branches are stackable (2AMLogic/2am#1298, #1396). Before #1298, a
+/// `feature/harness-ops-<N>` parent wrote no `refs/loom/parent/<branch>` pin,
+/// recorded no `STACKED_CHILDREN` snapshot, and was skipped by the post-merge
+/// plan too, so every harness-ops parent merge silently stranded its open
+/// children (harness-ops#283, #356).
+///
+/// Deliberately a short, closed allow-list — not a configurable
+/// naming-convention system, and not widened to an unconditional `feature/`
+/// prefix.
+pub const STACKABLE_PARENT_PREFIXES: [&str; 2] = ["feature/issue-", "feature/harness-ops-"];
+
+/// `^feature/(issue|harness-ops)-([0-9]+)$` — see [`STACKABLE_PARENT_PREFIXES`].
+/// Only a parent PR on a recognized Builder branch can have Loom-style stacked
+/// children. Still strict/anchored: `feature/issue-100-extra`,
+/// `feature/issue-100/sub`, `feature/harness-ops-350-extra`,
+/// `feature/harness-ops-350/sub`, and `feature/other-350` do not match.
 #[must_use]
 pub fn is_stackable_parent_branch(branch: &str) -> bool {
-    let Some(rest) = branch.strip_prefix("feature/issue-") else {
-        return false;
-    };
-    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+    for prefix in STACKABLE_PARENT_PREFIXES {
+        if let Some(rest) = branch.strip_prefix(prefix) {
+            return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
+        }
+    }
+    false
 }
 
 /// The pin ref for `branch`, e.g. `refs/loom/parent/feature/issue-100`.

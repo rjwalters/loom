@@ -27,6 +27,8 @@ use anyhow::Result;
 
 use loom_daemon::script_helpers;
 
+#[path = "record_rework.rs"]
+mod record_rework;
 #[path = "telemetry_export.rs"]
 mod telemetry_export;
 #[path = "telemetry_fixture.rs"]
@@ -96,6 +98,21 @@ pub(crate) enum TelemetryCommand {
     /// `--agent-id`. `usage-record`, not `usage record`, so `usage` stays a
     /// leaf. Always exits 0 — a telemetry failure never fails a sweep.
     UsageRecord(usage_record::UsageRecordArgs),
+
+    /// Mark one in-sweep **rework event** so the sweep's `sweep.outcome`
+    /// carries it (Issue #9444).
+    ///
+    /// The writer half of the marker protocol whose reader shipped with
+    /// #9481: the path that *performs* a rework (today `merge-pr.sh`'s
+    /// stale-base sync and its conflict refusal) appends one line to
+    /// `<workspace_root>/.loom/logs/sweep-rework-events.jsonl`, and the
+    /// terminal outcome samples it for its own issue and window. Without a
+    /// writer the field is always absent and every rework rollup reads zero.
+    ///
+    /// `record-rework`, not `rework record`: it is shelled out to from the
+    /// merge path, where a leaf verb is one fewer thing to get wrong. Always
+    /// exits 0 — a marker must never fail the merge it describes.
+    RecordRework(record_rework::RecordReworkArgs),
 
     /// Per-model token usage from OpenCode's own session store (Issue #8507).
     ///
@@ -171,6 +188,7 @@ impl TelemetryCommand {
             TelemetryCommand::IngestTranscripts(args) => args.run(),
             TelemetryCommand::UsageReport(args) => args.run(),
             TelemetryCommand::UsageRecord(args) => args.run(),
+            TelemetryCommand::RecordRework(args) => args.run(),
             TelemetryCommand::OpencodeUsage(args) => args.run(),
             TelemetryCommand::CodexUsage(args) => args.run(),
             TelemetryCommand::PiUsage(args) => args.run(),

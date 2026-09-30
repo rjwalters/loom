@@ -1957,13 +1957,19 @@ fi
 
 ### Step 3: Merge the PR
 
-Execute the merge with comprehensive error handling.
-
 **Ordering invariant**: Step 2's comment is already on the PR before this runs.
 `merge-pr.sh` records no actor and posts no Champion-identifying comment, so a
 merge performed here without Step 2 having succeeded is indistinguishable after
 the fact from a human running the same script by hand — which is exactly how the
 #4742 incident's hold reversal became unattributable.
+
+**Timeout invariant (#9096)**: run this block under a **600000 ms** Bash-tool
+timeout, keeping `LOOM_AUTO_MERGE_TIMEOUT` (420s below) **strictly under** it,
+so `merge-pr.sh` is what gives up and its exit 5 reaches the re-queue branch;
+the 180s gap absorbs the merge and cleanup that run *after* the wait. At the
+script's own 600s default the two are *equal*, the tool wins, and Step 2's
+"Proceeding with merge..." is the PR's last word (the #9096 stall). **Edit one
+number, edit both.**
 
 ```bash
 PR_NUMBER=$1
@@ -1974,49 +1980,37 @@ echo "Attempting to merge PR #$PR_NUMBER..."
 # merge-pr.sh may not exist on PR branches checked out via gh pr checkout
 git checkout main 2>/dev/null || true
 
-# Use merge-pr.sh for worktree-safe merge via GitHub API
-# --auto waits, merges HERE (not server-side queue, #8410)
-#
-# merge-pr.sh reads the PR's head SHA itself (a fresh, uncached read — see
-# "Cached forge reads" above) immediately before merging, and passes it
-# through to the forge's merge API as an optimistic-concurrency precondition
-# (#5579). Capture the exit code rather than using a bare `||`: exits 3, 4 and
-# 5 are DISTINCT outcomes from exit 1, never handled as failures (all below).
-# --redate-stale-checks (#8508) lets the script perform the #8248 guard's OWN
-# documented remedy rather than only naming it; exit 4 reports that, and
-# bypasses nothing.
+# Worktree-safe merge via the forge API; deletes the branch after. --auto waits
+# then merges HERE, never arming a server-side queue (#8410); merge-pr.sh takes
+# its own fresh, uncached head-SHA read ("Cached forge reads" above) as the
+# merge API's optimistic-concurrency precondition (#5579); --redate-stale-checks
+# performs the #8248 guard's OWN remedy, bypassing nothing (#8508). Capture the
+# exit code, not a bare `||`: 3/4/5 are DISTINCT from 1, never failures (below).
+# 420s < this call's 600000 ms timeout ("Timeout invariant" above).
 MERGE_RC=0
-./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks || MERGE_RC=$?
+LOOM_AUTO_MERGE_TIMEOUT=420 \
+  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks || MERGE_RC=$?
 
 if [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ] || [ "$MERGE_RC" -eq 5 ]; then
-  # Exit 3 (#5579): the head moved past the SHA this attempt gated on, usually
-  # a session pushing to an open loom:pr branch. Exit 4
-  # (#8508): merge-pr.sh re-dated the stale required checks itself. Exit 5
-  # (#8896): CI outlasted --auto's bounded settle-wait. None is a merge
-  # failure — nothing merged and the PR stays Judge-approved. Do NOT follow
-  # the failure steps below for any of them; see the "Exit codes 3, 4 and 5"
-  # exception in "Error Handling" (it also says why the head SHAs exits 3/4
-  # print stay in stderr rather than going onto the PR).
+  # 3 head moved (#5579) / 4 stale checks re-dated by this run (#8508) / 5
+  # settle-wait expired (#8896). None is a merge failure — nothing merged, the
+  # PR stays Judge-approved, and nothing goes onto the PR (not even the head
+  # SHAs 3/4 print to stderr). See "Exit codes 3, 4 and 5" in "Error Handling".
   echo "PR #$PR_NUMBER not merged this pass (head moved, re-dated, or CI unsettled) — re-queuing instead of failing"
 elif [ "$MERGE_RC" -ne 0 ]; then
   echo "Merge failed for PR #$PR_NUMBER"
   # Post failure comment (see Error Handling section)
 fi
+
+# Completion sentinel — keep LAST. A killed call never reaches it, so its
+# ABSENCE is the only evidence that no MERGE_RC was evaluated (#9096).
+echo "CHAMPION-MERGE-OUTCOME pr=$PR_NUMBER rc=$MERGE_RC"
 ```
 
-**Merge strategy**:
-- Uses `merge-pr.sh` which merges via GitHub API (worktree-safe)
-- **Squash merge**: Combines all commits into single commit (clean history)
-- **`--auto`**: Waits for checks, merges in-process (#8410)
-- Branch deleted automatically after merge
-- **Head-moved guard (#5579)**: `merge-pr.sh` refuses to merge (exit 3, not a
-  failure) if the PR's head branch advanced past the SHA it read immediately
-  before merging — see "Exit codes 3, 4 and 5" in "Error Handling" below
-- **Stale-check re-date (#8508)**: exit 4, not a failure — #8248
-  blocked the merge; `--redate-stale-checks` pushed a tree-identical
-  no-op commit (an in-place re-run cannot revalidate, #8919)
-- **Settle-wait timeout (#8896)**: exit 5, not a failure — CI outlasted
-  `--auto`'s bounded wait (`LOOM_AUTO_MERGE_TIMEOUT`, 600s)
+**No `CHAMPION-MERGE-OUTCOME` line in that output** — timed out, killed, empty —
+means the outcome is **unknown**: not a failure and not a re-queue code. Never
+infer an `MERGE_RC`; re-read the PR state — a killed call may have merged and
+lost only its report — then go to "No exit code at all" in "Error Handling".
 
 ### Step 4: Verify Issue Auto-Close
 
@@ -3242,43 +3236,48 @@ This PR met all safety criteria but the merge operation failed. A human will nee
 
 ### Exception: exit codes 3, 4 and 5 — not merged, re-queue, not a failure (#5579, #8508, #8896)
 
-`merge-pr.sh` exits **3** (not the generic failure exit **1**) when the PR's
-head branch changed between the fresh head-SHA read it took immediately before
-merging and the merge call itself — most commonly a session pushing new commits
-to an open, `loom:pr`-labeled branch while Champion was running.
+`merge-pr.sh` reserves three codes (never the generic failure exit **1**) for
+"the merge did not happen and nothing is wrong":
 
-Exit **4** is the same shape with a different cause: the #8248 required-check
-freshness guard blocked the merge, and `--redate-stale-checks` performed that
-guard's own documented remedy — a tree-identical no-op commit so CI re-runs
-with a current timestamp. Nothing merged, nothing bypassed. It is bounded to
-one push per head; a repeat block escalates the PR to a durable
-`loom:operator` hold and returns exit 1 with the original refusal — a held PR.
-
-Exit **5**: `--auto`'s bounded settle-wait expired before this
-head's checks finished, or before the check-runs API became readable (#8896).
-CI outran `LOOM_AUTO_MERGE_TIMEOUT` (default 600s) — nothing merged, no
-required check went red, the wait simply ran out. Common where suites outrun
-that default; raise the env var if it recurs.
+- **3** — the head branch moved between the fresh head-SHA read taken just
+  before merging and the merge call itself.
+- **4** — the #8248 required-check freshness guard blocked the merge and
+  `--redate-stale-checks` performed that guard's own remedy, a tree-identical
+  no-op commit. Nothing bypassed; bounded to one push per head, a repeat block
+  escalating to a durable `loom:operator` hold that returns exit 1.
+- **5** — `--auto`'s bounded settle-wait expired; nothing merged, no required
+  check went red. **Do not "fix" a recurring exit 5 by raising
+  `LOOM_AUTO_MERGE_TIMEOUT`** — Step 3 pins it under the caller's own timeout
+  (#9096); re-queuing is cheap.
 
 **Do not follow the 5 failure steps above for any of the three outcomes:**
 
 - Do **not** post the "Merge Failed" comment — the PR is still Judge-approved;
   the merge just did not happen.
 - Do **not** count it as an error in the completion summary.
-- Leave `loom:pr` in place and move on to the next PR in the queue. A later
-  Champion pass will pick this PR up fresh — its safety criteria (including
-  `updatedAt` and CI status) will naturally re-evaluate before merging it.
+- Leave `loom:pr` in place, move to the next PR. A later pass picks it up
+  fresh, re-evaluating its safety criteria (`updatedAt`, CI) first.
 
 **Leaving `loom:pr` in place after exit 3 or 4 does NOT mean the approval still
-applies to the new head (#5686).** The head moving is exactly the condition
-that invalidates a verdict; this exception only says "don't treat the failed
-merge as an error". The next pass's Verdict-State Janitor Part 2 resolves it —
-never short-circuit that by re-merging on a later tick without re-running it.
-Exit 5 moves no head and invalidates nothing.
+applies to the new head (#5686)** — a head move is exactly what invalidates a
+verdict; this exception only says "not an error". The next pass's Verdict-State
+Janitor Part 2 resolves it; never short-circuit it by re-merging on a later tick
+without re-running it. Exit 5 moves no head and invalidates nothing.
 
-Exit 4's bound, exit 5's contract, why none of the three is commented on the
-PR, and the merge-ancestry trap that defeats `git merge-base
---is-ancestor` here:
+**No exit code at all is a fourth, different case (#9096).** This silence is
+conditioned on *having* an outcome to be silent about; all three reported
+themselves. A killed call (no `CHAMPION-MERGE-OUTCOME` sentinel in Step 3's
+output) reported nothing, so — once a state re-read confirms it is not already
+merged — it gets a forge-visible **"Champion: Merge Outcome Unknown"** notice:
+neither "Merge Failed" (asserts an unobserved error, parks a mergeable PR on a
+human) nor this silence (leaving Step 2's "Proceeding with merge..." as the PR's
+last word — the #9096 stall). Marker-keyed to the head
+(`champion:merge-outcome-unknown`), it re-queues as 3/4/5 do, never firing on
+them.
+
+Exit 4's bound, exit 5's contract, why 3/4/5 are never commented on, the
+unknown-outcome recipe, and the merge-ancestry trap that defeats
+`git merge-base --is-ancestor` here:
 [`merge-pr-exit-code-exceptions.md`](../../../.loom/docs/merge-pr-exit-code-exceptions.md).
 
 ---
