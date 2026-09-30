@@ -4,6 +4,7 @@
 //! `sweep_registry/mod.rs`).
 
 use super::*;
+pub(crate) use crate::comment_trust::records::with_fleet_author;
 use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
@@ -1316,7 +1317,7 @@ pub(crate) fn fixture_registry_with_lease_gh(
          exit {code}\n\
          fi\n\
          exit 1\n",
-        stdout = comments_stdout.replace('\'', "'\\''"),
+        stdout = with_fleet_author(comments_stdout).replace('\'', "'\\''"),
         code = comments_exit,
     );
     std::fs::write(&fake_gh, &script).unwrap();
@@ -2071,7 +2072,7 @@ pub(crate) fn lease_order_dispatch_registry(
             let escaped = marker.replace('\\', "\\\\").replace('"', "\\\"");
             let now = Utc::now().to_rfc3339();
             seeded.push_str(&format!(
-                "{{\"id\":{id},\"created_at\":\"{now}\",\"updated_at\":\"{now}\",\"body\":\"{escaped}\"}}\n",
+                "{{\"user\":{{\"login\":\"loom-fleet-dispatch[bot]\",\"type\":\"Bot\"}},\"id\":{id},\"created_at\":\"{now}\",\"updated_at\":\"{now}\",\"body\":\"{escaped}\"}}\n",
             ));
         }
         std::fs::write(&comments_store, seeded).unwrap();
@@ -2087,7 +2088,7 @@ pub(crate) fn lease_order_dispatch_registry(
              [[ -z \"$count\" ]] && count=0\n\
              id=$((count + 1))\n\
              now=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n\
-             printf '{{\"id\":%d,\"created_at\":\"%s\",\"updated_at\":\"%s\",\"body\":\"%s\"}}\\n' \"$id\" \"$now\" \"$now\" \"$esc\" >> \"{store}\"\n\
+             printf '{{\"user\":{{\"login\":\"loom-fleet-dispatch[bot]\",\"type\":\"Bot\"}},\"id\":%d,\"created_at\":\"%s\",\"updated_at\":\"%s\",\"body\":\"%s\"}}\\n' \"$id\" \"$now\" \"$now\" \"$esc\" >> \"{store}\"\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
@@ -2160,11 +2161,11 @@ pub(crate) fn lease_order_dispatch_registry(
 /// Like [`lease_order_dispatch_registry`], but its fake `gh` ALSO answers the
 /// two forge reads [`crate::claim_reconciliation::forge::reconcile_workspace`]
 /// needs — `gh api --include <listing-url>` ([`crate::forge_listing::list_issues_cached`],
-/// which `list_building_issues` wraps) and the bare-max-timestamp `.../comments`
-/// query ([`crate::claim_reconciliation::forge::fetch_freshest_lease_updated_at`],
-/// distinguished from [`super::guards::SweepRegistry::read_lease_comments`]'s
-/// own `.../comments` read by sniffing the `--jq` filter text for the `max`
-/// aggregation only `fetch_freshest_lease_updated_at`'s filter contains) —
+/// which `list_building_issues` wraps) and the `.../comments` lease query
+/// ([`crate::claim_reconciliation::forge::fetch_freshest_lease_updated_at`];
+/// since #9548 it reads the same NDJSON, author included, as
+/// [`super::guards::SweepRegistry::read_lease_comments`], so one store answers
+/// both) —
 /// against the SAME on-disk lease-comment store `lease_order_dispatch_registry`
 /// already models. This is the harness for Issue #6288 Scenario 3 (Epic
 /// #6165 Phase 2's combined, safehouse-down regression test): one fake `gh`,
@@ -2191,8 +2192,8 @@ pub(crate) fn safehouse_down_combined_registry(
             let id = idx + 1;
             let escaped = marker.replace('\\', "\\\\").replace('"', "\\\"");
             seeded.push_str(&format!(
-                "{{\"id\":{id},\"created_at\":\"{}\",\"body\":\"{escaped}\"}}\n",
-                Utc::now().to_rfc3339(),
+                "{{\"user\":{{\"login\":\"loom-fleet-dispatch[bot]\",\"type\":\"Bot\"}},\"id\":{id},\"created_at\":\"{t}\",\"updated_at\":\"{t}\",\"body\":\"{escaped}\"}}\n",
+                t = Utc::now().to_rfc3339(),
             ));
         }
         std::fs::write(&comments_store, seeded).unwrap();
@@ -2208,29 +2209,12 @@ pub(crate) fn safehouse_down_combined_registry(
              [[ -z \"$count\" ]] && count=0\n\
              id=$((count + 1))\n\
              now=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n\
-             printf '{{\"id\":%d,\"created_at\":\"%s\",\"body\":\"%s\"}}\\n' \"$id\" \"$now\" \"$esc\" >> \"{store}\"\n\
+             printf '{{\"user\":{{\"login\":\"loom-fleet-dispatch[bot]\",\"type\":\"Bot\"}},\"id\":%d,\"created_at\":\"%s\",\"updated_at\":\"%s\",\"body\":\"%s\"}}\\n' \"$id\" \"$now\" \"$now\" \"$esc\" >> \"{store}\"\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$*\" == *\"--include\"* ]]; then\n\
              printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'\n\
              printf '[{{\"number\":{issue},\"state\":\"open\",\"labels\":[{{\"name\":\"loom:building\"}}],\"updated_at\":\"{label_ts}\"}}]\\n'\n\
-             exit 0\n\
-             fi\n\
-             if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* && \"$*\" == *\"max // empty\"* ]]; then\n\
-             max_ts=\"\"\n\
-             if [[ -f \"{store}\" ]]; then\n\
-             while IFS= read -r line; do\n\
-             [[ -z \"$line\" ]] && continue\n\
-             [[ \"$line\" != *'\"body\":\"<!-- loom:lease host='* ]] && continue\n\
-             ts=$(printf '%s' \"$line\" | sed -n 's/.*\"created_at\":\"\\([^\"]*\\)\".*/\\1/p')\n\
-             if [[ -n \"$ts\" ]] && {{ [[ -z \"$max_ts\" ]] || [[ \"$ts\" > \"$max_ts\" ]]; }}; then\n\
-             max_ts=\"$ts\"\n\
-             fi\n\
-             done < \"{store}\"\n\
-             fi\n\
-             if [[ -n \"$max_ts\" ]]; then\n\
-             printf '\"%s\"\\n' \"$max_ts\"\n\
-             fi\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\

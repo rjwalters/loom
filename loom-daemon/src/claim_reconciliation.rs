@@ -2800,7 +2800,8 @@ pub mod forge {
             .arg("--paginate")
             .arg("--jq")
             .arg(format!(
-                r#"[.[] | select(.body | startswith("{LEASE_MARKER_PREFIX}")) | .updated_at] | max // empty"#
+                r#".[] | select(.body | startswith("{LEASE_MARKER_PREFIX}")) | {{updated_at, {}}}"#,
+                crate::comment_trust::records::AUTHOR_JQ
             ));
         cmd.current_dir(root);
         // #5401: cross-owner managed repo -> its own owner's installation-token
@@ -2816,22 +2817,13 @@ pub mod forge {
         if !out.status.success() {
             return LeaseProbe::ReadFailed;
         }
-        match parse_max_timestamp(&out.stdout) {
-            Some(ts) => LeaseProbe::Found(ts),
-            None => LeaseProbe::NotFound,
+        // #9548: only a trusted author's lease counts; an outsider's reads as
+        // absent (never as a live claim holding the issue).
+        match crate::comment_trust::TrustPolicy::for_root(root).trusted_records(&out.stdout) {
+            None => LeaseProbe::ReadFailed,
+            Some(leases) => crate::comment_trust::records::max_timestamp(&leases, "updated_at")
+                .map_or(LeaseProbe::NotFound, LeaseProbe::Found),
         }
-    }
-
-    /// One row of `gh pr view --json comments`, trimmed to the fields the
-    /// claim-activity scan needs. Both fields are optional so a partial /
-    /// unexpected payload degrades to "not claimant activity" rather than
-    /// failing the whole fetch.
-    #[derive(Debug, Deserialize)]
-    struct GhPrComment {
-        #[serde(rename = "createdAt", default)]
-        created_at: Option<String>,
-        #[serde(default)]
-        body: Option<String>,
     }
 
     /// Best-effort fetch of the most recent **claimant activity** comment
@@ -2849,13 +2841,17 @@ pub mod forge {
     /// fall back to `claim_labeled_at`/`updated_at` alone, preserving the
     /// #4618 regression guard (a claim with no claimant heartbeat since must
     /// still age out and be reclaimed).
-    fn fetch_most_recent_claim_activity_at(
+    ///
+    /// #9548: the REST listing (not `gh pr view --json comments`, which cannot
+    /// name an App author), and only trusted authors' comments count: an
+    /// outsider's activity marker cannot keep a dead claim alive.
+    pub(super) fn fetch_most_recent_claim_activity_at(
         gh_bin: &Path,
         root: &Path,
         pr_number: u32,
         since: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
-        // Render `since` in exactly the shape the forge emits for `createdAt`
+        // Render `since` in exactly the shape the forge emits for `created_at`
         // (`...Z`, second precision) so the jq `>` comparison — which is a raw
         // *string* comparison — orders correctly. `to_rfc3339()` would render
         // the same instant with a `+00:00` offset suffix, which sorts *before*
@@ -2864,42 +2860,35 @@ pub mod forge {
         // (This is also the exact rendering `claim_activity_marker` embeds.)
         let since_iso = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("view")
-            .arg(pr_number.to_string())
-            .arg("--json")
-            .arg("comments")
+        cmd.arg("api")
+            .arg(format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/comments"))
+            .arg("--paginate")
             .arg("--jq")
             .arg(format!(
-                r#"[.comments[] | select(.createdAt > "{since_iso}") | {{createdAt, body}}]"#
+                r#".[] | select(.created_at > "{since_iso}") | {{created_at, body, {}}}"#,
+                crate::comment_trust::records::AUTHOR_JQ
             ));
         cmd.current_dir(root);
         // #5401: cross-owner managed repo -> its own owner's installation-token
         // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
         crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
+        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let out = cmd.output().ok()?;
         if !out.status.success() {
             return None;
         }
-        let raw = String::from_utf8_lossy(&out.stdout);
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed == "null" {
-            return None;
-        }
-        let rows: Vec<GhPrComment> = serde_json::from_str(trimmed).ok()?;
+        let rows =
+            crate::comment_trust::TrustPolicy::for_root(root).trusted_records(&out.stdout)?;
         let comments: Vec<PrComment> = rows
-            .into_iter()
+            .iter()
             .filter_map(|r| {
-                let created_at = chrono::DateTime::parse_from_rfc3339(r.created_at.as_deref()?)
-                    .ok()?
-                    .with_timezone(&chrono::Utc);
                 Some(PrComment {
-                    created_at,
-                    body: r.body.unwrap_or_default(),
+                    created_at: crate::comment_trust::records::max_timestamp(
+                        std::slice::from_ref(r),
+                        "created_at",
+                    )?,
+                    body: r.get("body")?.as_str().unwrap_or_default().to_string(),
                 })
             })
             .collect();

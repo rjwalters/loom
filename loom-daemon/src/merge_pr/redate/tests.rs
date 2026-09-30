@@ -193,6 +193,18 @@ fn write_stub_gh(
     fail_at: &str,
 ) -> std::path::PathBuf {
     let path = dir.join("gh");
+    // #9548: the listing the remedy reads is REST JSON, filtered by author;
+    // a non-empty `comments` is one comment by this fleet's default App.
+    let listing = if comments.is_empty() {
+        serde_json::json!([])
+    } else {
+        serde_json::json!([{
+            "user": {"login": "loom-fleet-dispatch[bot]", "type": "Bot"},
+            "author_association": "NONE",
+            "body": comments,
+        }])
+    };
+    fs::write(dir.join("comments.json"), listing.to_string()).expect("write comments listing");
     let script = format!(
         r#"#!/usr/bin/env bash
 set -uo pipefail
@@ -237,7 +249,7 @@ case "$PATH_ARG" in
       echo '{{"id":1}}'
     else
       [ "{fail_at}" = "read-comments" ] && exit 1
-      printf '%s' '{comments}'
+      cat "{dir}/comments.json"
     fi
     ;;
   */issues/*/labels)
@@ -527,5 +539,32 @@ fn a_landed_push_whose_marker_cannot_be_recorded_reports_the_exposure() {
         other => panic!("expected Failed, got {other:?}"),
     }
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// #9548 (H13): a re-date marker for this head written by an outsider is not
+/// attempt state, so it neither escalates the PR to a hold nor stops the one
+/// re-date the remedy is allowed; an unparseable listing fails the remedy.
+#[test]
+fn an_untrusted_redate_marker_is_not_attempt_state() {
+    let dir = tmp_dir("untrusted-marker");
+    let gh = write_stub_gh(&dir, "abc0000", "tree1111", "newsha22", "", "");
+    let outsider = serde_json::json!([{
+        "user": {"login": "drive-by", "type": "User"},
+        "author_association": "NONE",
+        "body": redate_marker("abc0000"),
+    }]);
+    fs::write(dir.join("comments.json"), outsider.to_string()).expect("write listing");
+    let outcome = remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42");
+    assert_eq!(
+        outcome,
+        RemedyOutcome::Pushed {
+            new_sha: "newsha22".to_string()
+        }
+    );
+
+    fs::write(dir.join("comments.json"), "not json").expect("write listing");
+    let outcome = remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42");
+    assert!(matches!(outcome, RemedyOutcome::Failed(_)), "{outcome:?}");
     let _ = fs::remove_dir_all(&dir);
 }

@@ -2889,6 +2889,31 @@ old→new-SHA comment, then swaps the verdict label (plus the per-tree companion
 | Head SHA unreadable | `Keep(NoHeadSha)` — fail safe. |
 | `loom:blocked` / `loom:operator` / `loom:operator-only` | `Keep(Held)` — still stale, but clearing would silently un-park a PR an operator (or Champion's capped-PR recovery pass) deliberately held. |
 | Force-push vs. new commits | Not distinguished, deliberately. Any head move invalidates the verdict; an appended commit is as much "not the tree that was reviewed" as a rebase. |
+| Head moved but the **tree** did not | `handle_invalidate` re-anchors instead of clearing (#9124) — see below. |
+
+#### The tree-identical head move is not a stale verdict (#9124, #9576)
+
+`decide_verdict` stays a pure function: any head move off the marker SHA is
+`Invalidate`, with no inference from commit message, author or ref-update shape.
+The one carve-out sits strictly *downstream* of that answer and runs on
+**evidence**: `forge_tree_unchanged::tree_unchanged` asks GitHub's own
+`compare/{marker}...{head}`, and `files: []` **together with** `status`
+`identical` or `ahead` proves the two commits' trees are byte-for-byte identical.
+`files: []` alone does not: the three-dot compare diffs the merge-base, so a head
+force-pushed *back* to an ancestor reads `behind` with no files although the trees
+differ, and `diverged` has the same hole — both invalidate (PR #9581 review). When
+equality is proven the reviewed code *is* what is at the new head, so
+clearing the verdict buys a full extra Judge cycle and nothing else. The measured
+cause on this repo is the `#8248` required-check-freshness guard's automated
+`chore: re-date required checks …` commit (#8508).
+
+| Property | Behavior |
+|----------|----------|
+| Kill switch | `LOOM_VERDICT_TREE_CARVEOUT` (`0`/`false`/`no`/`off` disables) — honoured by **both** paths, since it is read inside the shared module: the daemon pass (where it is nested inside `LOOM_VERDICT_STALENESS_RECONCILE`) and `forge tree-unchanged`, which with the switch off makes no compare call and exits 1 with no answer, so the shell guard invalidates too. Defaults **ON** — it can only ever *reduce* exposure, since it fires only on a positive proof of equality. |
+| Daemon pass | `reanchor_tree_unchanged_verdict` posts a marker for the new head and leaves the verdict label untouched. Nothing is disarmed: an armed auto-merge would land the reviewed tree. Counter: `VerdictReconcileStats::tree_identical_reanchors`. |
+| Shell guard | Reports `FRESH` (exit 0) with the reason naming the byte-identical trees, and writes nothing. It does **not** re-anchor — the marker write stays in the daemon — so it pays one compare call per pass until the periodic pass re-anchors. |
+| Comparison unavailable | `None` / no `TREE_UNCHANGED=1` line ⇒ **invalidate as before**. A `gh` failure, an unparsable response or one missing `status`/`files`, a ref the repo does not carry, an argument that is not a bare hex SHA, a non-GitHub forge, an absent `loom-daemon`, or one predating the verb all land here. Fail closed, in both paths. |
+| One implementation | `loom-daemon/src/forge_tree_unchanged.rs`. The daemon pass calls it in-process; the shell guard reaches it through `loom-daemon forge tree-unchanged <base> <head>` (prints `TREE_UNCHANGED=1|0`, exit 0; exit 1 = no answer). There is deliberately no copy of the comparison in shell — #9576 was caused by the shell guard having *no* tree comparison while the daemon had one, so PRs #9541/#9483 lost verdicts the daemon pass would have kept. |
 
 #### Anchoring an unmarked verdict (#6319)
 
@@ -2920,14 +2945,20 @@ reads `Fresh` against a tree nobody read. It bounds future exposure from
 "forever" to "one tick"; it is a backstop for judge.md's marker, never a
 substitute for it.
 
-**Agent-side fast paths** (same complementary relationship as the claim passes,
-and they share the guard script `.loom/scripts/verdict-staleness-guard.sh`, which
-takes `--clear` / `--anchor` and reports
-`FRESH`/`UNVERIFIABLE`/`STALE`/`ANCHORED` via exit codes `0`/`11`/`12`/`13`):
+**Agent-side fast paths** (same complementary relationship as the claim passes)
+run through `.loom/scripts/verdict-staleness-guard.sh`, which takes `--clear` /
+`--anchor` and reports `FRESH`/`UNVERIFIABLE`/`STALE`/`ANCHORED` via exit codes
+`0`/`11`/`12`/`13`. That guard is the agents' own re-implementation of the
+decision, **not** the code this pass runs — they are two mechanisms that must be
+kept agreeing, and the two places they share an implementation are the ones that
+were too costly to duplicate: the #8900 auto-merge disarm (`loom-daemon forge
+disable-auto-merge`) and the #9124 tree-identical test (`loom-daemon forge
+tree-unchanged`, #9576). Callers:
 judge.md's "Stale-Verdict Sweep" (step 0 of every pass),
 doctor.md's "Stale-Verdict Check" (before claiming from either priority queue),
-and champion-pr-merge.md's "Verdict-State Janitor → Part 2" (before the 6 safety
-criteria — the gate that stops a stale approval from auto-merging).
+champion-pr-merge.md's "Verdict-State Janitor → Part 2" (before the 6 safety
+criteria — the gate that stops a stale approval from auto-merging), and
+sweep-mode-c-lifecycle.md's pre-merge check.
 
 Log line on action: `claim_reconciliation: cleared stale loom:pr from PR #N in
 <root> (verdict recorded for <old>, head is now <new>) — re-queued as

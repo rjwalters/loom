@@ -263,8 +263,9 @@ mod tree_carveout_e2e {
     /// A fake `gh` for PR #9124: carries `loom:pr` approved at `SHA_A`, head
     /// is now `SHA_B` (the `#8248`/`#8508` re-date shape), and `pr view`
     /// reports no auto-merge armed. `compare_body` stands in for GitHub's
-    /// `compare/{base}...{head}` response -- `{"files": []}` for a
-    /// tree-identical move, a non-empty `files` array for a real one.
+    /// `compare/{base}...{head}` response -- `{"status": "ahead", "files": []}`
+    /// for a tree-identical appended commit, a non-empty `files` array for a
+    /// real change, `{"status": "behind", "files": []}` for a rewind.
     fn fake_gh(
         dir: &std::path::Path,
         log: &std::path::Path,
@@ -337,7 +338,7 @@ exit 0
         let repo_root = dir.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
         let log = dir.path().join("gh.log");
-        let gh = fake_gh(dir.path(), &log, r#"{"files": []}"#);
+        let gh = fake_gh(dir.path(), &log, r#"{"status": "ahead", "files": []}"#);
 
         let stats = with_env(
             &[
@@ -375,7 +376,11 @@ exit 0
         let repo_root = dir.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
         let log = dir.path().join("gh.log");
-        let gh = fake_gh(dir.path(), &log, r#"{"files": [{"filename": "src/lib.rs"}]}"#);
+        let gh = fake_gh(
+            dir.path(),
+            &log,
+            r#"{"status": "ahead", "files": [{"filename": "src/lib.rs"}]}"#,
+        );
 
         let stats = with_env(
             &[
@@ -395,6 +400,61 @@ exit 0
         );
     }
 
+    /// #9548 / PR #9581 review: a compare response that would otherwise prove
+    /// equality (`status: "ahead"`) but carries no usable `files` array, or an
+    /// empty `files` with no `status`, proves nothing about the trees, so it
+    /// must fall back to the ordinary invalidation, never to a re-anchor.
+    #[test]
+    #[serial]
+    fn a_compare_response_without_files_is_not_an_identical_tree() {
+        for body in [
+            r#"{"status":"ahead"}"#,
+            r#"{"status":"ahead","files":null}"#,
+            r#"{"status":"identical"}"#,
+            r#"{"files":[]}"#,
+        ] {
+            let dir = tempdir().unwrap();
+            let repo_root = dir.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            let log = dir.path().join("gh.log");
+            let gh = fake_gh(dir.path(), &log, body);
+            let stats = with_env(
+                &[
+                    (VERDICT_STALENESS_ENABLED_ENV, Some("1")),
+                    (VERDICT_TREE_CARVEOUT_ENABLED_ENV, Some("1")),
+                ],
+                || forge::reconcile_pr_verdicts(&gh, &repo_root),
+            );
+            assert_eq!(stats.invalidated, 1, "{body}");
+            assert_eq!(stats.tree_identical_reanchors, 0, "{body}");
+        }
+    }
+
+    /// PR #9581 review: a force-push that rewinds the head to an ancestor of
+    /// the reviewed commit gives `status: "behind"` with `files: []` (the
+    /// three-dot compare diffs the merge-base, which is the head itself). The
+    /// daemon pass must invalidate, not re-anchor onto unreviewed code.
+    #[test]
+    #[serial]
+    fn a_rewound_head_with_empty_files_is_still_invalidated() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let log = dir.path().join("gh.log");
+        let gh = fake_gh(dir.path(), &log, r#"{"status": "behind", "files": []}"#);
+
+        let stats = with_env(
+            &[
+                (VERDICT_STALENESS_ENABLED_ENV, Some("1")),
+                (VERDICT_TREE_CARVEOUT_ENABLED_ENV, Some("1")),
+            ],
+            || forge::reconcile_pr_verdicts(&gh, &repo_root),
+        );
+
+        assert_eq!(stats.invalidated, 1, "a rewind must invalidate");
+        assert_eq!(stats.tree_identical_reanchors, 0, "a rewind must never re-anchor");
+    }
+
     /// The kill switch: disabling the carve-out restores the pre-#9124
     /// behavior even when the trees are identical.
     #[test]
@@ -404,7 +464,7 @@ exit 0
         let repo_root = dir.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
         let log = dir.path().join("gh.log");
-        let gh = fake_gh(dir.path(), &log, r#"{"files": []}"#);
+        let gh = fake_gh(dir.path(), &log, r#"{"status": "ahead", "files": []}"#);
 
         let stats = with_env(
             &[

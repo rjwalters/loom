@@ -1,9 +1,9 @@
-use super::*;
 use chrono::Duration;
 use serial_test::serial;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
+use {super::*, crate::comment_trust::records::TEST_FLEET_AUTHOR as FLEET_AUTHOR};
 
 fn issue(number: u32, updated_at: Option<DateTime<Utc>>) -> BuildingIssue {
     BuildingIssue { number, updated_at }
@@ -1288,7 +1288,7 @@ fn write_fake_gh(
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "api" ]; then
+if [ "$1" = "api" ] && [[ "$*" != */comments* ]]; then
   printf 'HTTP/2.0 200 OK\r\n\r\n'
   echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{updated_at}"}}]'
   exit 0
@@ -1333,7 +1333,7 @@ fn write_fake_gh_with_partial_reclaim(
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "api" ]; then
+if [ "$1" = "api" ] && [[ "$*" != */comments* ]]; then
   printf 'HTTP/2.0 200 OK\r\n\r\n'
   echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{updated_at}"}}]'
   exit 0
@@ -1386,7 +1386,7 @@ fn write_fake_gh_with_persistent_partial_reclaim(
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "api" ]; then
+if [ "$1" = "api" ] && [[ "$*" != */comments* ]]; then
   printf 'HTTP/2.0 200 OK\r\n\r\n'
   echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{updated_at}"}}]'
   exit 0
@@ -1514,7 +1514,7 @@ fn write_fake_gh_with_lease(
 ) -> std::path::PathBuf {
     let fake_gh = dir.join("fake-gh-lease.sh");
     let lease_stdout = match lease_updated_at {
-        Some(ts) => format!("echo '\"{ts}\"'"),
+        Some(ts) => format!("echo '{{\"updated_at\":\"{ts}\",{FLEET_AUTHOR}}}'"),
         None => "true # no lease comment -- empty stdout".to_string(),
     };
     let script = format!(
@@ -2207,7 +2207,7 @@ fn reconcile_workspace_no_fast_reclaim_when_open_pr_exists() {
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "api" ]; then
+if [ "$1" = "api" ] && [[ "$*" != */comments* ]]; then
   printf 'HTTP/2.0 200 OK\r\n\r\n'
   echo '[{{"number":82,"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{now}"}}]'
   exit 0
@@ -3117,7 +3117,7 @@ fn write_fake_gh_lease_probe_only(
 ) -> std::path::PathBuf {
     let fake_gh = dir.join("fake-gh-lease-probe-only.sh");
     let body = match outcome.strip_prefix("found:") {
-        Some(ts) => format!("echo '\"{ts}\"'\nexit 0\n"),
+        Some(ts) => format!("echo '{{\"updated_at\":\"{ts}\",{FLEET_AUTHOR}}}'\nexit 0\n"),
         None if outcome == "not-found" => "exit 0\n".to_string(),
         None if outcome == "fail" => {
             "echo 'simulated transient gh api failure' >&2\nexit 1\n".to_string()

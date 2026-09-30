@@ -35,7 +35,7 @@ case "$*" in
     echo '[{{"number":300,"headRefOid":"{SHA_B}","labels":[{{"name":"loom:pr"}}]}}]' ;;
   "pr list "*) echo '[]' ;;
   "api repos/{{owner}}/{{repo}}/issues/300/comments"*) cat "{listing}" ;;
-  "api "*compare/*) echo '{{"files":[{{"filename":"src/lib.rs"}}]}}' ;;
+  "api "*compare/*) echo '{{"status":"ahead","files":[{{"filename":"src/lib.rs"}}]}}' ;;
   *) echo '{{}}' ;;
 esac
 "#,
@@ -82,4 +82,71 @@ fn an_insiders_marker_still_counts() {
     let listing = format!("[{}]", comment("maintainer", "User", "COLLABORATOR", SHA_B));
     let stats = reconcile(&listing);
     assert_eq!((stats.invalidated, stats.unverifiable), (0, 0), "{stats:?}");
+}
+
+/// A fake `gh` whose every `api …/comments` call prints `stdout` (it ignores
+/// the `--jq` projection, as the real one would have applied it already).
+fn comments_gh(dir: &std::path::Path, stdout: &str) -> std::path::PathBuf {
+    let out = dir.join("comments.ndjson");
+    std::fs::write(&out, stdout).unwrap();
+    let gh = dir.join("fake-gh-comments.sh");
+    std::fs::write(&gh, format!("#!/usr/bin/env bash\ncat \"{}\"\n", out.display())).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    gh
+}
+
+fn ndjson(login: &str, kind: &str, assoc: &str, fields: &str) -> String {
+    format!(
+        r#"{{"user":{{"login":"{login}","type":"{kind}"}},"author_association":"{assoc}",{fields}}}"#
+    )
+}
+
+/// H7: only a trusted author's lease is evidence of a live claim. An
+/// outsider's (or a foreign fleet's) fresh lease reads as no lease at all.
+#[test]
+#[serial]
+fn a_lease_from_an_untrusted_author_is_not_found() {
+    let dir = tempdir().unwrap();
+    let ts = r#""updated_at":"2026-09-29T00:00:00Z""#;
+    let untrusted = [
+        ndjson("drive-by", "User", "NONE", ts),
+        ndjson("loom-fleet-dispatch", "User", "CONTRIBUTOR", ts),
+        ndjson("other-fleet[bot]", "Bot", "NONE", ts),
+    ]
+    .join("\n");
+    let gh = comments_gh(dir.path(), &untrusted);
+    assert_eq!(
+        forge::fetch_freshest_lease_updated_at(&gh, dir.path(), 1),
+        forge::LeaseProbe::NotFound
+    );
+    let gh = comments_gh(dir.path(), &ndjson("loom-fleet-dispatch[bot]", "Bot", "NONE", ts));
+    assert!(matches!(
+        forge::fetch_freshest_lease_updated_at(&gh, dir.path(), 1),
+        forge::LeaseProbe::Found(_)
+    ));
+    // Unparseable output is a failed read, never "no lease".
+    let gh = comments_gh(dir.path(), "not json");
+    assert_eq!(
+        forge::fetch_freshest_lease_updated_at(&gh, dir.path(), 1),
+        forge::LeaseProbe::ReadFailed
+    );
+}
+
+/// H8: an outsider cannot keep a claim alive by posting this claim's
+/// activity marker; the fleet's own heartbeat still counts.
+#[test]
+#[serial]
+fn claim_activity_counts_only_from_trusted_authors() {
+    let dir = tempdir().unwrap();
+    let claimed_at = DateTime::parse_from_rfc3339("2026-09-29T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let fields = format!(
+        r#""created_at":"2026-09-29T01:00:00Z","body":"still working {}""#,
+        claim_activity_marker(claimed_at)
+    );
+    let gh = comments_gh(dir.path(), &ndjson("drive-by", "User", "NONE", &fields));
+    assert_eq!(forge::fetch_most_recent_claim_activity_at(&gh, dir.path(), 7, claimed_at), None);
+    let gh = comments_gh(dir.path(), &ndjson("loom-fleet-dispatch[bot]", "Bot", "NONE", &fields));
+    assert!(forge::fetch_most_recent_claim_activity_at(&gh, dir.path(), 7, claimed_at).is_some());
 }

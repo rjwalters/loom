@@ -435,6 +435,187 @@ assert_deny_env "rmScope repo (#6805): unassigned \$WT with a suffix still denie
 assert_allow_env "rmScope repo (#6805): single-quoted literal '\$WT/sub' is not resolved as a variable" \
     "LOOM_RM_SCOPE=repo" "WT=/etc/foo; rm -rf './\$WT/sub'" "$REPO_ROOT"
 
+# ---- #9304 shape 1 / #9373: the ALL-LITERAL `for` LIST stays denied ---------
+# ---- `for d in <literal> <literal>; do rm -rf "$d"; done` is lexically
+# ---- provable in principle — unlike the `$(cat …)` shape above — but it is
+# ---- denied on a MEASUREMENT (zero real denies converted to allows over 205
+# ---- unique rm-scope-unresolved-var records) plus the soundness requirements
+# ---- PR #9324 failed. See the "...AND THE ALL-LITERAL `for` LIST STOPS HERE ON
+# ---- A MEASUREMENT" block comment in
+# ---- defaults/hooks/guard-destructive-generic.sh for the four reasons, the
+# ---- requirements, and the bar for reopening. #9601 is the COMPOSED shape that
+# ---- does have measured yield.
+#
+# GROUP A — the shape itself. These three are the only assertions in this
+# section a future sound resolver may NARROW (never delete): they would flip to
+# allow, and the resolved members would then be judged by the ordinary
+# repo/worktree/tmp scope check like any literal target.
+assert_deny_env "rmScope repo (#9304): multi-line all-literal for-list rm -rf \"\$d\" denies (shape 1)" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9304-a /tmp/loom-9304-b; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9304): all-literal for-list of IN-REPO paths denies (shape 1)" \
+    "LOOM_RM_SCOPE=repo" "for d in $REPO_ROOT/scratch-a $REPO_ROOT/scratch-b; do
+  rm -rf \"\$d\"
+done" "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9304): all-literal for-list with a literal suffix (\${d}/sub) denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9304-a /tmp/loom-9304-b; do
+  rm -rf "${d}/sub"
+done' "$REPO_ROOT"
+#
+# GROUP B — the fail-closed FLOOR (#9373). Every row below denied on `main` and
+# ALLOWED on PR #9324's head, reaching `/` or `$HOME` at runtime. They must deny
+# FOREVER: a resolver that narrows any of them is unsound, not improved. Rows
+# 1-6 and 9-10 need nothing but bash; rows 7-8 need zsh, and are asserted here
+# even though this harness runs bash because the guard only ever reads TEXT.
+#
+# B1-B3: the loop may never execute or may run in a subshell, so `$d` is unbound
+# at the `rm` and the literal SUFFIX becomes the whole target.
+assert_deny_env "rmScope repo (#9373 floor): short-circuited header (false && for …) then rm denies" \
+    "LOOM_RM_SCOPE=repo" 'false && for d in /tmp/loom-9373-a; do :; done
+rm -rf "$d"/opt/vendor/important' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): header in a pipeline subshell (done | cat) then rm denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do :; done | cat
+rm -rf "$d"/opt/vendor/important' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): header in a background subshell (done &) then rm denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do :; done &
+rm -rf "$d"/opt/vendor/important' "$REPO_ROOT"
+# B4-B5: the binding is destroyed between the header and the rm — including by
+# an EMPTY assignment, which a `length(seg) > length("d=")` rebind test misses.
+assert_deny_env "rmScope repo (#9373 floor): unset d inside the loop body then rm denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do
+  unset d
+  rm -rf "$d"/opt/vendor/important
+done' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): EMPTY d= rebind after the loop then rm denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do :; done
+d=
+rm -rf "$d"/opt/vendor/important' "$REPO_ROOT"
+# B6: a backslash-newline continuation inside the word list — the vetted word is
+# not the word the shell joins.
+assert_deny_env "rmScope repo (#9373 floor): backslash-newline continuation in the for list denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a\
+/../../opt/vendor/important; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+# B7-B8: zsh glob qualifiers and history-style modifiers rewrite a word that a
+# blocklist of `$`/backtick/glob metacharacters reads as a pure literal.
+assert_deny_env "rmScope repo (#9373 floor): zsh glob-qualifier modifier member (:h:h) denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/zz(:h:h); do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): zsh substitution-modifier member (:s:…:…:) denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/zz(:s:/tmp/zz:/opt/vendor/important:); do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+# B9: a default-assignment expansion rebinds the name without an `=` segment.
+assert_deny_env "rmScope repo (#9373 floor): \${d:=…} default-assignment rebind then rm denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do :; done
+unset d
+: "${d:=/opt/vendor/important}"
+rm -rf "$d"' "$REPO_ROOT"
+# B10: the rebinding forms an enumerate-the-rebinders test misses (the same debt
+# #9331 tracks for the shipped fast paths).
+assert_deny_env "rmScope repo (#9373 floor): mapfile -t d rebind then rm denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do :; done
+mapfile -t d < /etc/loom-9373-targets
+rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): IFS=: read -ra d rebind then rm denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do :; done
+IFS=: read -ra d <<< /opt/vendor/important
+rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): getopts d rebind then rm denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do :; done
+getopts abc d
+rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): select d in … rebind then rm denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do :; done
+select d in /opt/vendor/important; do break; done
+rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): eval-ed rebind then rm denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do :; done
+eval "d=/opt/vendor/important"
+rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): d+= append inside the loop body denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do
+  d+=/../../opt/vendor/important
+  rm -rf "$d"
+done' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): d[0]= indexed rebind inside the loop body denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do
+  d[0]=/opt/vendor/important
+  rm -rf "$d"
+done' "$REPO_ROOT"
+# B11: requirement (c) — an `rm` that is NOT inside this header's do…done reads
+# a binding the loop may never have made (an empty list leaves it untouched).
+assert_deny_env "rmScope repo (#9373 floor): rm AFTER done (outside the loop body) denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a /tmp/loom-9373-b; do :; done
+rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): rm BEFORE the header (inherited binding) denies" \
+    "LOOM_RM_SCOPE=repo" 'rm -rf "$d"
+for d in /tmp/loom-9373-a /tmp/loom-9373-b; do :; done' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): subshell-scoped header then rm denies" \
+    "LOOM_RM_SCOPE=repo" '(for d in /tmp/loom-9373-a /tmp/loom-9373-b; do :; done)
+rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): two for headers for one name (ambiguous) denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a; do
+  rm -rf "$d"
+done
+for d in /etc; do :; done' "$REPO_ROOT"
+#
+# GROUP C — a single non-literal member fails the WHOLE list closed. No partial
+# resolution, no guessing about the rest.
+assert_deny_env "rmScope repo (#9373 floor): one \$-expanding member denies the whole list" \
+    "LOOM_RM_SCOPE=repo" 'X=/tmp/loom-9373-x
+for d in /tmp/loom-9373-a $X; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): one glob member denies the whole list" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a /tmp/*; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): one brace-expansion member denies the whole list" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9373-a /tmp/{b,../../etc}; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): one \$(cat …) member denies the whole list" \
+    "LOOM_RM_SCOPE=repo" 'for d in $(cat /tmp/loom-9373-dirs.txt); do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9373 floor): relative members deny (nothing to judge without a cwd guess)" \
+    "LOOM_RM_SCOPE=repo" 'for d in build dist; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+#
+# GROUP D — the scope floor. Resolution would prove literal-ness ONLY, never
+# scope: an out-of-scope or catastrophic member must still deny, and a list must
+# never be allowed because SOME member is in scope.
+assert_deny_env "rmScope repo (#9304): an out-of-scope literal member denies (literal-ness is not scope)" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9304-a /opt/vendor/important; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9304): a catastrophic top-level member denies" \
+    "LOOM_RM_SCOPE=repo" 'for d in /tmp/loom-9304-a /etc; do
+  rm -rf "$d"
+done' "$REPO_ROOT"
+#
+# GROUP E — the COMPOSED shape (#9601): a literal assignment whose RHS contains
+# the loop-bound variable. This is where the measured friction is (5 of the 205
+# records, all five would resolve in scope), and it is a DIFFERENT, two-level
+# relaxation awaiting its own explicit decision — pinned here as denying today
+# so that decision is a deliberate change, not a side effect.
+#
+# NB the `rm` is on its own line on purpose. Written as the one-liner the real
+# records use — `if [ -d "$d" ]; then rm -rf "$d"; fi` — the segment's first word
+# is `then`, so extract_rm_targets() emits NO target and the command ALLOWS
+# without any of this block being consulted (#9323, open). The real records deny
+# only because their `rm` follows a `;`/`&&` rather than `then`/`do` directly.
+assert_deny_env "rmScope repo (#9601): composed for-list + literal assignment (\$w in the RHS) denies today" \
+    "LOOM_RM_SCOPE=repo" 'for w in issue-9601a issue-9601b; do
+  d=".loom/worktrees/$w/target"
+  rm -rf "$d"
+done' "$REPO_ROOT"
+
 # ---- Decoy-heredoc mktemp-escape-hatch bypass (#6549) — rm_scope_mktemp_same_
 # ---- command_safe() used to scan the raw (heredoc-unmasked) command text one
 # ---- physical line at a time, so a NEVER-EXECUTED `NAME=$(mktemp -d)` line

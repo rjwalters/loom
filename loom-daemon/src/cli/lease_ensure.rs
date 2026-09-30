@@ -50,7 +50,7 @@
 //! when that becomes true". Creating an issue worktree IS that instant. A label
 //! read would also add a `gh` call to every worktree creation, and publication
 //! is already bounded three ways: it is a no-op while this sweep's own lease is
-//! fresh, it refuses outright when a *different* host holds a fresh lease
+//! fresh, it refuses outright when any *other* sweep holds a fresh lease
 //! (exit 4), and it only ever runs inside an agent session (see
 //! [`SessionEnv`]).
 
@@ -91,12 +91,19 @@ pub(crate) enum LeaseCommand {
     /// authoritative claim; a lease only improves the evidence, so nothing here
     /// may block or fail a builder's actual work.
     Ensure(LeaseEnsureArgs),
+
+    /// Exit `1` when `<issue>` carries 2+ simultaneously fresh sweep leases —
+    /// the signature of two live sweeps sharing one issue worktree
+    /// (rjwalters/kicad-tools#5783). Fails open (exit `0`) on any read error.
+    /// See `cli::lease_co_occupancy`.
+    CoOccupancy(super::lease_co_occupancy::LeaseCoOccupancyArgs),
 }
 
 impl LeaseCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
             LeaseCommand::Ensure(args) => args.run(),
+            LeaseCommand::CoOccupancy(args) => args.run(),
         }
     }
 }
@@ -226,8 +233,9 @@ impl Outcome {
                  issue #{issue}"
             ),
             Self::PublishDeclined(code) => format!(
-                "publish for issue #{issue} exited {code:?} (4 = a live peer host holds a fresh \
-                 lease; 2 = the publish gh call failed) — proceeding without a lease"
+                "publish for issue #{issue} exited {code:?} (4 = another sweep, on this host or \
+                 another, holds a fresh lease; 2 = the publish gh call failed) — proceeding \
+                 without a lease"
             ),
             Self::PublishUnparseable(line) => format!(
                 "could not parse '<host> <sweep-id>' out of sweep-lease-publish.sh's output for \

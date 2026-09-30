@@ -41,9 +41,37 @@ The predicate lives once, in `loom-daemon/src/comment_trust.rs`:
 - **Shell readers** call `loom-daemon forge trusted-comments`, which reads a
   comment listing on stdin and prints the trusted subset in the same shape.
   `verdict-staleness-guard.sh` and `check-promotion-landed.sh` use it.
-- **A structural test** (`comment_trust::tests::verdict_sha_readers_go_through_the_trust_filter`)
-  fails when a new Rust file handles `loom:verdict-sha` without being reviewed
-  into the list of filtered readers.
+  Empty or whitespace-only stdin exits 1 like any other non-listing: an
+  empty listing is `[]`, so nothing at all means the fetch never happened.
+- **The other Rust marker readers** (#9548, High slice) filter the same way,
+  through `comment_trust::records`:
+
+  | Reader | Marker | When the author is untrusted |
+  |---|---|---|
+  | Lease probes (claim reconciliation, orphan recovery, dispatch tie-break, mid-build watchdog) | `loom:lease` | Not a lease: it can neither hold a claim, win the tie-break, nor fence a cleanup. |
+  | Claim reconciliation | `loom:claim-activity` / `loom:standdown` | Not claimant activity: it cannot keep a dead claim alive. |
+  | Review-conflict pass | `loom:base-conflict flagged` | Not "ours", so a Judge's verdict is never undone. |
+  | Quarantine reconciliation | `Auto-quarantined by loom-daemon (#3939)` | Not the daemon's quarantine; the marker must also *start* the comment. |
+  | Dependency classification | `champion:proposal-escalated` / `dep-cycle` / `proposal-unescalated` | Absent. |
+  | `premise-check` | `loom:premise-check … verdict=` | Absent (comments; a body counts only when its author is trusted). |
+  | Required-check re-date | `loom:stale-check-redate` / its hold marker | Not attempt state. |
+  | Mechanical-capability lane | body `loom:capability=` | No declaration: the park stays. |
+  | Role-shard roster | `loom:roster` | Not a ring member. |
+  | Open-linked-PR guard | a fork PR's `Closes #N` | Not a linked PR (a same-repo branch always counts). |
+
+  Readers that used `gh … --json comments` now read the REST listing, whose
+  author spelling can name an App. A REST comment listing that comes back
+  empty or unparseable is a failed read, never "no comments".
+
+  Body markers (`premise-check`, `loom:capability=`) are trusted by the
+  **issue author**, because the forge does not say who last edited a body. A
+  trusted insider's marker edited into an outsider-filed body is therefore
+  ignored. That fails closed: post the record as a comment instead.
+- **Structural tests** fail when a new Rust file handles a covered marker
+  without being reviewed (`verdict_sha_readers_go_through_the_trust_filter`,
+  `structure_tests::every_covered_marker_file_is_reviewed`), and when a
+  reviewed file gains a comment fetch outside its filtered call sites
+  (`structure_tests::every_comment_fetch_in_a_reviewed_file_is_a_filtered_call_site`).
 
 When the filter cannot run (no `loom-daemon`, or one that predates the verb),
 the answer degrades toward safety: the verdict guard treats every marker as

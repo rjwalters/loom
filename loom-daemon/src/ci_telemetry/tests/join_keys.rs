@@ -120,7 +120,13 @@ fn job_span_carries_the_same_join_keys_as_its_run() {
     let mut run = bare_run();
     run.pull_requests = vec![PullRequestRefJson { number: 555 }];
     let job = bare_job();
-    let envelopes = job_envelopes(&repo, &run, &job, "test-host");
+    let envelopes = job_envelopes(
+        &repo,
+        &run,
+        &job,
+        crate::ci_telemetry::records::JobCreationBaseline::default(),
+        "test-host",
+    );
     let span = envelopes
         .iter()
         .find_map(span_attrs)

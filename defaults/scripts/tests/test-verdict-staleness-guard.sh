@@ -209,9 +209,40 @@ chmod +x "$STUB_DIR/gh"
 # App-spelled) and logs to trust-calls.log, NOT daemon-writes.log, so the
 # #8900 assertions about daemon WRITES are unaffected. $STUB_DIR/trust-verb-
 # missing simulates a binary predating the verb (clap: exit 2, empty stdout).
+#
+# #9576: `loom-daemon forge tree-unchanged <base> <head>` answers whether the
+# two commits' trees are byte-identical. It is a READ, so it logs to
+# tree-calls.log — also NOT daemon-writes.log, for the same reason: (q5)/(q6)/
+# (q10) assert the guard makes no daemon WRITES on those paths, and a read that
+# every STALE path now performs must not falsify them.
+#   -> default: TREE_UNCHANGED=0, exit 0 — the trees differ, i.e. every
+#      pre-#9576 fixture keeps its existing STALE expectations untouched
+#   -> $STUB_DIR/tree-identical: TREE_UNCHANGED=1, exit 0 — the #9541/#9483
+#      re-date shape the exemption exists for
+#   -> $STUB_DIR/tree-compare-fail: exit 1, nothing on stdout — the `gh api
+#      compare` failure / unparsable-response shape, which must FAIL CLOSED
+#   -> $STUB_DIR/tree-verb-missing: exit 2, nothing on stdout — a binary
+#      predating the verb (clap), which must fail closed identically
 cat > "$STUB_DIR/loom-daemon" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub loom-daemon: LOOM_TEST_STUB_DIR not set}"
+if [[ "$1" == "forge" && "$2" == "tree-unchanged" ]]; then
+  printf 'TREE %s\n' "$*" >> "$STUB_DIR_FROM_ENV/tree-calls.log"
+  if [[ -f "$STUB_DIR_FROM_ENV/tree-verb-missing" ]]; then
+    echo "error: unrecognized subcommand 'tree-unchanged'" >&2
+    exit 2
+  fi
+  if [[ -f "$STUB_DIR_FROM_ENV/tree-compare-fail" ]]; then
+    echo "stub loom-daemon: could not compare $3...$4" >&2
+    exit 1
+  fi
+  if [[ -f "$STUB_DIR_FROM_ENV/tree-identical" ]]; then
+    echo "TREE_UNCHANGED=1"
+  else
+    echo "TREE_UNCHANGED=0"
+  fi
+  exit 0
+fi
 if [[ "$1" == "forge" && "$2" == "trusted-comments" ]]; then
   printf 'TRUST %s\n' "$*" >> "$STUB_DIR_FROM_ENV/trust-calls.log"
   if [[ -f "$STUB_DIR_FROM_ENV/trust-verb-missing" ]]; then
@@ -363,6 +394,8 @@ reset_state() {
     rm -f "$STUB_DIR"/disarm-fail "$STUB_DIR"/daemon-declined
     rm -f "$STUB_DIR"/trust-calls.log "$STUB_DIR"/trust-verb-missing
     rm -f "$STUB_DIR"/scope-calls.log "$STUB_DIR"/scope-deny
+    rm -f "$STUB_DIR"/tree-calls.log "$STUB_DIR"/tree-identical
+    rm -f "$STUB_DIR"/tree-compare-fail "$STUB_DIR"/tree-verb-missing
 }
 
 run_guard() {
@@ -373,6 +406,7 @@ run_guard() {
     COMMENTS_POSTED="$(cat "$STUB_DIR/comment-writes.log" 2>/dev/null || true)"
     GRAPHQL="$(cat "$STUB_DIR/graphql-writes.log" 2>/dev/null || true)"
     DAEMON="$(cat "$STUB_DIR/daemon-writes.log" 2>/dev/null || true)"
+    TREE_CALLS="$(cat "$STUB_DIR/tree-calls.log" 2>/dev/null || true)"
 }
 
 get_field() {
@@ -1182,6 +1216,105 @@ pr_json 266 "$SHA_B" "loom:pr"
 run_guard 266 --clear
 assert_eq "1" "$(get_field "$OUT" CLEARED)" "(w2) Allowed: cleared"
 assert_contains "$WRITES" "--repo owner/repo" "(w2) The label edit names the vetted repo"
+# --- #9576: a tree-identical head move is not a stale verdict ---------------
+#
+# THE #9576 INCIDENT: PR #9541's approval was anchored at 490fb81a8; the #8248
+# required-check-freshness guard's automated `chore: re-date required checks`
+# commit (#8508) moved the head to 42ea7263a with an IDENTICAL tree
+# (`compare/490fb81a8...42ea7263a` → `files=0`). The daemon's own pass has
+# skipped that since #9124, but this guard had no tree comparison at all, so it
+# stripped `loom:pr` anyway and forced a full Judge re-cycle. #9483 lost its
+# verdict the same way. The guard now asks `loom-daemon forge tree-unchanged`,
+# the SAME implementation the daemon pass calls in-process.
+
+# (u1) The incident itself: head moved, trees byte-identical -> FRESH, and with
+#      --clear NOTHING is written (no label flip, no comment, no disarm).
+reset_state
+pr_json 270 "$SHA_B" "loom:pr"
+{ echo "["; verdict_comment "2026-09-30T00:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-270.json"
+: > "$STUB_DIR/tree-identical"
+run_guard 270 --clear
+assert_eq "0" "$RC" "(u1) Tree-identical head move -> exit 0"
+assert_eq "FRESH" "$(get_field "$OUT" DECISION)" "(u1) DECISION=FRESH"
+assert_eq "$SHA_A" "$(get_field "$OUT" MARKER_SHA)" "(u1) MARKER_SHA is still the reviewed SHA"
+assert_eq "$SHA_B" "$(get_field "$OUT" HEAD_SHA)" "(u1) HEAD_SHA is the moved head"
+assert_eq "" "$WRITES" "(u1) loom:pr is NOT removed on a tree-identical move"
+assert_eq "" "$COMMENTS_POSTED" "(u1) No stale-verdict comment posted"
+assert_eq "" "$DAEMON" "(u1) No auto-merge disarm — the reviewed tree IS what is at the head"
+assert_contains "$TREE_CALLS" "forge tree-unchanged $SHA_A $SHA_B" "(u1) The comparison is asked marker...head, in that order"
+assert_contains "$OUT" "byte-identical" "(u1) REASON says why the verdict survived"
+
+# (u2) The other half of AC1: a head move that DOES change the tree still
+#      invalidates, exactly as before #9576.
+reset_state
+pr_json 271 "$SHA_B" "loom:pr"
+{ echo "["; verdict_comment "2026-09-30T00:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-271.json"
+run_guard 271 --clear
+assert_eq "12" "$RC" "(u2) Tree-changed head move -> still exit 12"
+assert_eq "STALE" "$(get_field "$OUT" DECISION)" "(u2) DECISION=STALE"
+assert_eq "1" "$(get_field "$OUT" CLEARED)" "(u2) CLEARED=1"
+assert_contains "$WRITES" "--remove-label loom:pr" "(u2) The approval is still cleared on a real change"
+assert_contains "$TREE_CALLS" "forge tree-unchanged" "(u2) The comparison was consulted"
+
+# (u3) FAIL CLOSED (AC2): the comparison itself failed (`gh api compare` error,
+#      unparsable response). The verdict must still be invalidated — matching
+#      the daemon's `None` arm, never an assumed equivalence.
+reset_state
+pr_json 272 "$SHA_B" "loom:pr"
+{ echo "["; verdict_comment "2026-09-30T00:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-272.json"
+: > "$STUB_DIR/tree-compare-fail"
+run_guard 272 --clear
+assert_eq "12" "$RC" "(u3) Failed compare -> exit 12 (fail closed)"
+assert_eq "1" "$(get_field "$OUT" CLEARED)" "(u3) CLEARED=1 — an unavailable comparison never keeps a verdict"
+assert_contains "$WRITES" "--remove-label loom:pr" "(u3) The approval is cleared"
+
+# (u4) FAIL CLOSED on a daemon predating the verb (clap: non-zero, empty
+#      stdout) — indistinguishable from a failed compare, and must behave
+#      identically. A mixed fleet therefore degrades to the pre-#9576 answer.
+reset_state
+pr_json 273 "$SHA_B" "loom:changes-requested"
+{ echo "["; verdict_comment "2026-09-30T00:00:00Z" "$SHA_A" "changes-requested"; echo "]"; } > "$STUB_DIR/comments-273.json"
+: > "$STUB_DIR/tree-verb-missing"
+run_guard 273 --clear
+assert_eq "12" "$RC" "(u4) Daemon predating tree-unchanged -> exit 12"
+assert_eq "1" "$(get_field "$OUT" CLEARED)" "(u4) CLEARED=1"
+
+# (u5) The common FRESH path costs NO comparison: when the marker already names
+#      the current head there is nothing to compare, so the extra call must not
+#      be made at all (and a host with no daemon still reads FRESH).
+reset_state
+pr_json 274 "$SHA_A" "loom:pr"
+{ echo "["; verdict_comment "2026-09-30T00:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-274.json"
+: > "$STUB_DIR/tree-identical"
+run_guard 274 --clear
+assert_eq "0" "$RC" "(u5) Marker == head -> exit 0"
+assert_eq "" "$TREE_CALLS" "(u5) No compare call on the unchanged-head fast path"
+
+# (u6) Report-only (no --clear) on a tree-identical move: FRESH, exit 0, and
+#      still nothing written — a caller that only reports must see the
+#      exemption too, or Champion's janitor and Judge's sweep disagree.
+reset_state
+pr_json 275 "$SHA_C" "loom:changes-requested"
+{ echo "["; verdict_comment "2026-09-30T00:00:00Z" "$SHA_A" "changes-requested"; echo "]"; } > "$STUB_DIR/comments-275.json"
+: > "$STUB_DIR/tree-identical"
+run_guard 275
+assert_eq "0" "$RC" "(u6) Report-only tree-identical move -> exit 0"
+assert_eq "FRESH" "$(get_field "$OUT" DECISION)" "(u6) DECISION=FRESH"
+assert_eq "" "$WRITES" "(u6) Nothing written in report-only mode"
+
+# (u7) An armed auto-merge on a tree-identical move is deliberately left armed:
+#      the code at the head is provably the reviewed code, so there is nothing
+#      unsafe about the queued merge landing it. Same reasoning as the daemon's
+#      re-anchor path, which also disarms nothing.
+reset_state
+pr_json_armed 276 "$SHA_B" "loom:pr"
+{ echo "["; verdict_comment "2026-09-30T00:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-276.json"
+: > "$STUB_DIR/tree-identical"
+run_guard 276 --clear
+assert_eq "0" "$RC" "(u7) Armed + tree-identical -> exit 0"
+assert_eq "0" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(u7) AUTO_MERGE_DISARMED=0"
+assert_eq "" "$DAEMON" "(u7) The disarm subcommand is not invoked at all"
+assert_eq "" "$GRAPHQL" "(u7) And no inline mutation either"
 
 # --- Summary -------------------------------------------------------------
 echo ""

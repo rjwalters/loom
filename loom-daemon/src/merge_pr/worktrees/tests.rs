@@ -165,3 +165,36 @@ fn blank_input_does_not_match_the_empty_path() {
     assert_eq!(branch_for_path("\n\n\n", ""), None);
     assert_eq!(find_by_branch("\n\n\n", ""), None);
 }
+
+/// `contains_path` finds a match ANYWHERE in the list, not only the first
+/// entry — the property that distinguishes it from `primary_path`.
+#[test]
+fn contains_path_matches_any_position_not_just_the_first() {
+    assert!(contains_path(THREE_STANZAS, "/repo/main"));
+    assert!(contains_path(THREE_STANZAS, "/repo/wt-a"));
+    assert!(contains_path(THREE_STANZAS, "/repo/wt-b"));
+    assert!(contains_path(LAST_NO_BLANK, "/repo/wt-a"));
+    assert!(!contains_path(THREE_STANZAS, "/repo/nope"));
+}
+
+/// #3717's class again: an exact match on a path containing spaces, not a
+/// `$2`-truncated prefix of it.
+#[test]
+fn contains_path_matches_the_whole_path_including_spaces() {
+    let porcelain = "\
+worktree /Users/x/My Repos/loom
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+
+";
+    assert!(contains_path(porcelain, "/Users/x/My Repos/loom"));
+    assert!(!contains_path(porcelain, "/Users/x/My"));
+}
+
+/// No worktree record at all (a `git worktree list` failure, or genuinely
+/// empty output) is "not found", same fail direction as the other three.
+#[test]
+fn contains_path_is_false_with_no_porcelain() {
+    assert!(!contains_path("", "/repo/main"));
+    assert!(!contains_path("fatal: not a git repository\n", "/repo/main"));
+}

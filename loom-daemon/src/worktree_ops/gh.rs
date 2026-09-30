@@ -258,7 +258,7 @@ pub const OPEN_LINKED_PR_QUERY: &str = "query($owner:String!,$repo:String!,$num:
      repository(owner:$owner,name:$repo){\
      issue(number:$num){\
      closedByPullRequestsReferences(first:20,includeClosedPrs:false){\
-     nodes{ number state } } } } }";
+     nodes{ number state isCrossRepository authorAssociation author{ login __typename } } } } } }";
 
 /// The REST `--jq` filter behind [`open_linked_pr_timeline_args`], as a format
 /// template over `{owner}/{repo}`.
@@ -288,7 +288,9 @@ const OPEN_LINKED_PR_TIMELINE_JQ: &str = ".[] | select(.event == \"cross-referen
      and .source.issue.pull_request != null \
      and .source.issue.state == \"open\" \
      and .source.issue.repository.full_name == \"{full_name}\") \
-     | {number: .source.issue.number, body: (.source.issue.body // \"\")}";
+     | {number: .source.issue.number, body: (.source.issue.body // \"\"), \
+     user: {login: .source.issue.user.login, type: .source.issue.user.type}, \
+     author_association: .source.issue.author_association}";
 
 /// `gh` arguments for the REST timeline (non-closing-reference) probe on
 /// `issue` — the union transport shared by
@@ -467,6 +469,27 @@ pub fn parse_open_linked_pr(stdout: &str) -> OpenPrProbe {
     OpenPrProbe::NoneOpen
 }
 
+/// [`parse_open_linked_pr`] after #9548 (H14): an open PR from a FORK whose
+/// author is not trusted is not a linked PR. Anyone can open a fork PR saying
+/// `Closes #N`; counting it would let an outsider park any issue indefinitely.
+/// A same-repo branch needs write access, so it always counts, and a node
+/// without author fields errs toward counting (the non-destructive answer).
+#[must_use]
+pub fn parse_open_linked_pr_trusted(stdout: &str, root: &Path) -> OpenPrProbe {
+    let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    parse_open_linked_pr(&policy.drop_untrusted_fork_prs(stdout))
+}
+
+/// [`parse_open_linked_pr_timeline`] after #9548 (H14): a candidate whose
+/// author is known and untrusted is dropped. The timeline cannot say which
+/// repo a PR's head lives in, so the author alone decides here; the fleet's
+/// own PRs are App-authored (`x[bot]`) and pass.
+#[must_use]
+pub fn parse_open_linked_pr_timeline_trusted(stdout: &str, issue: u32, root: &Path) -> OpenPrProbe {
+    let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    parse_open_linked_pr_timeline(&policy.drop_untrusted_timeline_prs(stdout), issue)
+}
+
 /// Resolve `(owner, repo)` for `repo_root` via `gh repo view`.
 ///
 /// Unlike `sweep_registry::guards::SweepRegistry::resolve_owner_repo` this does
@@ -540,13 +563,13 @@ pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
         return OpenPrProbe::ProbeFailed;
     };
     let graphql = run_probe(repo_root, open_linked_pr_args(&owner, &repo, issue), &|s| {
-        parse_open_linked_pr(s)
+        parse_open_linked_pr_trusted(s, repo_root)
     });
     if matches!(graphql, OpenPrProbe::Open(_)) {
         return graphql;
     }
     let timeline = run_probe(repo_root, open_linked_pr_timeline_args(&owner, &repo, issue), &|s| {
-        parse_open_linked_pr_timeline(s, issue)
+        parse_open_linked_pr_timeline_trusted(s, issue, repo_root)
     });
     // A verified NoneOpen from leg 1 survives a leg-2 probe failure: leg 2 is a
     // superset *when it answers*, and an unanswered superset is no evidence.

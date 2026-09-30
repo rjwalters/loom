@@ -219,6 +219,19 @@ pub(crate) enum ScriptPortCommand {
     /// `--porcelain` (the create arm's record stream) is always 0.
     WorktreeCheck(super::worktree_check::WorktreeCheckArgs),
 
+    /// `worktree.sh`'s "the worktree directory already exists" arm, whole
+    /// (#8195 slice 12): the registration probe, the preserve-vs-reset verdict,
+    /// the #3548 sentinel back-fill and the stale-worktree `git reset --hard`
+    /// behind its #6334 rescue guard. Retires the LAST unanchored
+    /// `git worktree list | grep -q "$WORKTREE_PATH"` in the script — a
+    /// substring match against symlink-RESOLVED paths, which refused a live
+    /// worktree on any repo reached through a symlink (every macOS `/tmp`
+    /// fixture) and accepted an unregistered `issue-4` beside a registered
+    /// `issue-44`, then wrote a sentinel into it. Exit 0 = the worktree is
+    /// usable, 1 = not a registered worktree (or the sentinel could not be
+    /// written).
+    WorktreeExisting(super::worktree_existing::WorktreeExistingArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -415,6 +428,18 @@ pub(crate) enum ScriptPortCommand {
     /// shell language policy. Prints each duplicated name once, in file
     /// order.
     LabelDuplicates(super::label_duplicates::LabelDuplicatesArgs),
+
+    /// `fleet-send.sh`'s one-shot safehouse envelope post (#9517, epic
+    /// #7810) — the lifecycle-role posting helper whose bash body was a
+    /// hand-copy of `safehouse.rs`'s protocol. The implementation reuses the
+    /// canonical `build_send_request` so the daemon and the role helper can
+    /// never disagree about the wire again. Its HARD degradation contract is
+    /// inherited verbatim: every failure — missing env, absent socket,
+    /// invalid argument, wire error — is a silent `exit 0`, because the room
+    /// is optional and the role's work is not. (This is also why the stub
+    /// bypasses `lib/script-helper.sh`, whose missing-daemon path is a loud
+    /// error: silence IS this entry point's interface.)
+    FleetSend(super::fleet_send::FleetSendArgs),
 }
 
 impl ScriptPortCommand {
@@ -448,11 +473,13 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeClosedPrBranch(args) => args.run(),
             ScriptPortCommand::WorktreeSparse(args) => args.run(),
             ScriptPortCommand::WorktreeCheck(args) => args.run(),
+            ScriptPortCommand::WorktreeExisting(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::DaemonUpdate(args) => args.run(),
+            ScriptPortCommand::FleetSend(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
@@ -603,6 +630,12 @@ pub(crate) enum MergePrCommand {
     /// Empty at exit 0 when no worktree holds it.
     WorktreeFindByBranch(super::merge_pr_worktrees::WorktreeFindByBranchArgs),
 
+    /// `--worktree-path`'s PRE-flight registered-worktree check, from
+    /// porcelain on stdin: is `--path` ANY `worktree ` record, not just the
+    /// first. Exit 0 = registered, 1 = parsed and not registered — the
+    /// retired `awk` answered through exit status alone, so this does too.
+    WorktreeContains(super::merge_pr_worktrees::WorktreeContainsArgs),
+
     /// The post-merge partial-increment label reset decision (#3667/#4569):
     /// from the referenced issue's fresh body on stdin plus the pre-merge
     /// guard's `--conflicted` / `--open-before-merge` facts, the ordered
@@ -652,6 +685,14 @@ pub(crate) enum MergePrCommand {
     /// to post. Exit 0 with the route, 2 = stdin unreadable — see
     /// `cli::merge_pr_reconcile`.
     ReconcileChild(super::merge_pr_reconcile::ReconcileChildArgs),
+
+    /// The #6694/#6264 remove-vs-preserve decision for post-merge worktree
+    /// cleanup, shared across the three call sites (the Loom-convention path,
+    /// the porcelain discovery fallback, and a co-existing Judge/Doctor review
+    /// worktree) that used to run it identically three times. Always exits 0
+    /// with `REMOVE`/`PRESERVE` plus `LEVEL<TAB>message` lines to replay — see
+    /// `cli::merge_pr_worktree_preserve`.
+    WorktreePreserve(super::merge_pr_worktree_preserve::WorktreePreserveArgs),
 }
 
 impl MergePrCommand {
@@ -673,6 +714,7 @@ impl MergePrCommand {
             MergePrCommand::WorktreePrimary(args) => args.run(),
             MergePrCommand::WorktreeBranchFor(args) => args.run(),
             MergePrCommand::WorktreeFindByBranch(args) => args.run(),
+            MergePrCommand::WorktreeContains(args) => args.run(),
             MergePrCommand::PartialReset(args) => args.run(),
             MergePrCommand::PartialConflict(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),
@@ -680,6 +722,7 @@ impl MergePrCommand {
             MergePrCommand::ReconcilePlan(args) => args.run(),
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::ChecksFailure(args) => args.run(),
+            MergePrCommand::WorktreePreserve(args) => args.run(),
         }
     }
 }

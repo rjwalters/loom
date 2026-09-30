@@ -74,8 +74,9 @@ fn read_roster_comments(
         .arg("--paginate")
         .arg("--jq")
         .arg(format!(
-            r#".[] | select(.body | startswith("{prefix}")) | {{id: .id, created_at: .created_at, updated_at: .updated_at, body: .body}}"#,
+            r#".[] | select(.body | startswith("{prefix}")) | {{id: .id, created_at: .created_at, updated_at: .updated_at, body: .body, {author}}}"#,
             prefix = crate::role_shard::roster::ROSTER_MARKER_PREFIX,
+            author = crate::comment_trust::records::AUTHOR_JQ,
         ));
     cmd.current_dir(cwd);
     // #5401: cross-owner managed repo -> its own owner's installation-token
@@ -86,7 +87,10 @@ fn read_roster_comments(
     if !output.status.success() {
         return None;
     }
-    Some(crate::role_shard::roster::parse_roster_comments_json(&output.stdout))
+    // #9548: a roster record from an untrusted author is prose; it must not
+    // join the ring and shard this fleet's work away from its own hosts.
+    let trusted = crate::comment_trust::TrustPolicy::for_root(cwd).trusted_ndjson(&output.stdout);
+    Some(crate::role_shard::roster::parse_roster_comments_json(&trusted))
 }
 
 /// `POST` a brand-new roster comment for this host (its first heartbeat ever
@@ -370,3 +374,7 @@ pub fn spawn_roster_heartbeat_task(fallback_root: PathBuf) -> Option<tokio::task
         }
     }
 }
+
+#[cfg(test)]
+#[path = "roster_trust_tests.rs"]
+mod trust_tests;

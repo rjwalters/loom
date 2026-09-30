@@ -52,3 +52,16 @@ retired_find_worktree_by_branch() {
       END          { if (br == want && !found) { print wt } }
     '
 }
+
+# --worktree-path's pre-flight registered-worktree check (porcelain on
+# stdin). The original communicated its answer through EXIT STATUS alone (no
+# `print` in either arm); it is wrapped here to echo true/false so the
+# differential harness — which captures stdout — can compare it like the
+# other three. The awk body itself is unchanged.
+retired_worktree_contains_path() {
+  if awk -v p="$1" '/^worktree / { if (substr($0, 10) == p) { found=1; exit } } END { exit !found }'; then
+    echo true
+  else
+    echo false
+  fi
+}

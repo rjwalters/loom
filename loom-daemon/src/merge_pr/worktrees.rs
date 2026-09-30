@@ -1,6 +1,6 @@
 //! `git worktree list --porcelain` parsing for `merge-pr.sh` (#8191 slice).
 //!
-//! Three queries, all over the same porcelain text:
+//! Four queries, all over the same porcelain text:
 //!
 //! - [`primary_path`] — the PRIMARY (main) working copy's path. This is the
 //!   input to the #3710 hard guard that refuses to `git worktree remove` the
@@ -10,6 +10,11 @@
 //!   it) and used to decide which local branch to delete afterwards.
 //! - [`find_by_branch`] — the worktree path with a given branch checked out.
 //!   The post-merge discovery fallback when the Loom-convention path is absent.
+//! - [`contains_path`] — whether ANY `worktree ` record equals a given path.
+//!   The `--worktree-path` PRE-flight validation query (unlike the other
+//!   three, this one runs at argument-parsing time, before a merge is even
+//!   attempted): reject an operator-supplied override early if it is not a
+//!   registered worktree of this repository at all.
 //!
 //! # Why these next
 //!
@@ -142,6 +147,22 @@ pub fn branch_for_path(porcelain: &str, want_path: &str) -> Option<String> {
 pub fn find_by_branch<'a>(porcelain: &'a str, want_branch: &str) -> Option<&'a str> {
     let want = format!("refs/heads/{want_branch}");
     scan(porcelain, |wt, br| (br == want).then_some(wt))
+}
+
+/// Whether `want_path` is a registered worktree: ANY `worktree ` record equal
+/// to it, not just the first (contrast [`primary_path`], which only ever
+/// looks at the first).
+///
+/// Literal port of `awk -v p="$path" '/^worktree / { if (substr($0, 10) == p)
+/// { found=1; exit } } END { exit !found }'` — `--worktree-path`'s early
+/// validation, immediately after the operator's path is resolved to an
+/// absolute path via `cd … && pwd -P` and before any network call. That `awk`
+/// communicated its answer through exit status alone (no `print`), which is
+/// why this returns `bool` rather than `Option<&str>` like its three
+/// siblings.
+#[must_use]
+pub fn contains_path(porcelain: &str, want_path: &str) -> bool {
+    records(porcelain).any(|line| line.strip_prefix("worktree ") == Some(want_path))
 }
 
 /// The shared stanza walk: `awk`'s three rules plus its `END` block.

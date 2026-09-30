@@ -122,7 +122,12 @@ fn listings_parse_single_concatenated_and_slurped_pages() {
     for bytes in [single, concat.into_bytes(), slurp] {
         assert_eq!(p.trusted_bodies(&bytes), Some(vec!["b".to_string()]));
     }
-    assert_eq!(p.trusted_bodies(b""), Some(vec![]));
+    // Judge #9566: nothing at all is a fetch that did not happen, not "no
+    // comments" (an empty listing is `[]`).
+    assert_eq!(p.trusted_bodies(b""), None);
+    assert_eq!(p.trusted_bodies(b" \n"), None);
+    assert_eq!(filter_document(&p, b""), None);
+    assert_eq!(p.trusted_bodies(b"[]"), Some(vec![]));
     assert_eq!(p.trusted_bodies(b"{\"message\":\"Not Found\"}"), None);
     assert_eq!(p.trusted_bodies(b"not json"), None);
 }

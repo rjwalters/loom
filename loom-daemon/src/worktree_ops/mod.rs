@@ -43,7 +43,12 @@ pub mod gh;
 pub mod landed;
 pub(crate) mod liveness;
 pub mod logs;
-pub(crate) mod naming;
+/// `pub` rather than `pub(crate)` since #9444: the `record-rework` subcommand
+/// lives in the binary crate and derives an issue number from a PR's branch
+/// name, which is exactly what `issue_from_branch` already answers. A second
+/// `strip_prefix("feature/issue-")` in the CLI would be a copy of the
+/// convention, not a use of it.
+pub mod naming;
 pub mod orphan_recovery;
 pub mod removal_log;
 pub mod repo;

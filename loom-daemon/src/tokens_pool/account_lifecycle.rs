@@ -1079,11 +1079,11 @@ mod tests {
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service
-            .add_with_email("agent-1", false, Some("agent-1@2amlogic.com"))
+            .add_with_email("agent-1", false, Some("agent-1@example.com"))
             .unwrap();
         let accounts = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
         assert_eq!(accounts.len(), 1);
-        assert_eq!(accounts[0].email.as_deref(), Some("agent-1@2amlogic.com"));
+        assert_eq!(accounts[0].email.as_deref(), Some("agent-1@example.com"));
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 

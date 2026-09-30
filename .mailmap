@@ -3,7 +3,7 @@
 # Format: Proper Name <proper@email> <commit@email>
 #
 # Deliberately NOT mapped:
-#   - Robb Walters' agent-N@2amlogic.com identities. Those are Loom's own
+#   - The operator's per-agent (agent-N) commit identities. Those are Loom's own
 #     autonomous agents committing under the operator's name; folding them into
 #     the human identity would erase the human/agent distinction, which is a
 #     policy call rather than a typo.
@@ -11,7 +11,14 @@
 
 # Two addresses, and one of them carried the wrong surname from a machine's
 # leftover git config.
-Joseph Turian <turian@gmail.com> <joseph@2amlogic.com>
+#
+# The mapping line below is the ONE line exempt from CI's repo-wide identity
+# scrub (#8589), via its trailing `identity-scrub: allow` marker, which the gate
+# honours only in this file and only on the line that carries it. Keeping it
+# preserves correct git log/shortlog/blame attribution, and removing it would
+# hide nothing: the same address is already in ~70 commit trailers in history.
+# A new mapping line without the marker is still flagged.
+Joseph Turian <turian@gmail.com> <joseph@2amlogic.com>  # identity-scrub: allow
 
 # A shell `echo` leaked into this machine's user.email, appending "echo" to the
 # address on 31 commits. Same identity, malformed address.
