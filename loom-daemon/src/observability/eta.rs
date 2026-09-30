@@ -298,18 +298,12 @@ fn sink() -> Option<&'static dyn QueueSink> {
     SINK.get().map(|(queue, _)| queue.as_ref())
 }
 
-/// Fold `outcomes` into the shadow ledger and persist it (#9328).
-///
-/// Every heuristic of a kind estimated the same subject at the same `as_of`,
-/// and `Tracker::resolve` scores all of them against one outcome, so the pairs
-/// are already formed — this only sorts them into `(current, candidate)` runs
-/// and adds them up. Best-effort: a failed persist costs a longer wait for the
-/// 50-pair gate, never a wrong answer.
-fn note_outcomes(state: &mut State, outcomes: &[Resolved]) {
-    if outcomes.is_empty() {
-        return;
-    }
-    let ids: BTreeMap<Kind, String> = [Kind::Start, Kind::Finish, Kind::Land]
+/// The `current` heuristic id of each kind, per `autonomous.eta.current` and
+/// the registry's own default. The one definition of "the subject's answer":
+/// every other heuristic of a kind is a shadow candidate (#9328), which
+/// pairs outcomes in the ledger below but is never shown as *the* ETA.
+fn current_ids(state: &State) -> BTreeMap<Kind, String> {
+    [Kind::Start, Kind::Finish, Kind::Land]
         .into_iter()
         .map(|kind| {
             (
@@ -321,7 +315,35 @@ fn note_outcomes(state: &mut State, outcomes: &[Resolved]) {
                     .to_string(),
             )
         })
-        .collect();
+        .collect()
+}
+
+/// What [`super::eta_snapshot`] needs to build one `eta.snapshot` (#9329):
+/// every estimate still awaiting an outcome, and the `current` heuristic id
+/// per kind. `None` when ETA is disabled — there is then no tracker, and no
+/// snapshot is emitted at all.
+///
+/// Read under the one tracker lock and cloned out, so the snapshot builder
+/// runs no tracker code and holds no lock: it is a reader of state the
+/// tracker already keeps in memory, never a second tick loop.
+pub(super) fn snapshot_input() -> Option<(Vec<EstimateSummary>, BTreeMap<Kind, String>)> {
+    let guard = lock();
+    let state = guard.as_ref()?;
+    Some((state.tracker.pending().to_vec(), current_ids(state)))
+}
+
+/// Fold `outcomes` into the shadow ledger and persist it (#9328).
+///
+/// Every heuristic of a kind estimated the same subject at the same `as_of`,
+/// and `Tracker::resolve` scores all of them against one outcome, so the pairs
+/// are already formed — this only sorts them into `(current, candidate)` runs
+/// and adds them up. Best-effort: a failed persist costs a longer wait for the
+/// 50-pair gate, never a wrong answer.
+fn note_outcomes(state: &mut State, outcomes: &[Resolved]) {
+    if outcomes.is_empty() {
+        return;
+    }
+    let ids = current_ids(state);
     state
         .shadow
         .record(&|kind| ids.get(&kind).cloned().unwrap_or_default(), outcomes);
