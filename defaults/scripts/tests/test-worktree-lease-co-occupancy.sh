@@ -83,8 +83,10 @@ export LOOM_GH_BIN="$TMP/gh"
 unset WORKTREE_ALLOW_SHARED_LEASE
 
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Authored by the fleet's default App, as the real --jq projection now
+# attributes every row: the reader drops untrusted/unattributed ones (#9631).
 lease_line() {
-    printf '{"updated_at":"%s","body":"<!-- loom:lease host=%s sweep=%s -->\\nprose"}\n' "$NOW_ISO" "$1" "$2"
+    printf '{"updated_at":"%s","body":"<!-- loom:lease host=%s sweep=%s -->\\nprose","user":{"login":"loom-fleet-dispatch[bot]","type":"Bot"},"author_association":"NONE"}\n' "$NOW_ISO" "$1" "$2"
 }
 two_leases() { { lease_line host-x sweep-a; lease_line host-x sweep-b; } > "$TMP/leases.ndjson"; }
 
