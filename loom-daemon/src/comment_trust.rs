@@ -268,7 +268,19 @@ impl TrustPolicy {
 #[must_use]
 pub fn filter_document(policy: &TrustPolicy, bytes: &[u8]) -> Option<Value> {
     if let Ok(Value::Object(mut obj)) = serde_json::from_slice::<Value>(bytes) {
-        for key in ["comments", "reviews"] {
+        // An object is a comment document only when it carries at least one
+        // of `comments` / `reviews` and EVERY one it carries is a plain array.
+        // Anything else (a forge error object, a GraphQL `{nodes: [...]}`
+        // connection, a document nested under `data`) is rejected rather than
+        // echoed back, so no caller can mistake unfiltered text for filtered.
+        let keys: Vec<&str> = ["comments", "reviews"]
+            .into_iter()
+            .filter(|k| obj.contains_key(*k))
+            .collect();
+        if keys.is_empty() || keys.iter().any(|k| !obj[*k].is_array()) {
+            return None;
+        }
+        for key in keys {
             if let Some(Value::Array(items)) = obj.get_mut(key) {
                 *items = policy.filter(std::mem::take(items));
             }

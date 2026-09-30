@@ -144,6 +144,35 @@ fn documents_filter_arrays_and_object_comment_fields() {
     assert_eq!(filter_document(&p, b"42"), None);
 }
 
+/// Judge #9566: an object that is not a comment document is rejected, never
+/// echoed back with outsider text still in it.
+#[test]
+fn objects_that_are_not_comment_documents_are_rejected() {
+    let p = policy(&[]);
+    assert!(
+        filter_document(&p, br#"{"message":"Bad credentials"}"#).is_none(),
+        "forge error object"
+    );
+    assert!(
+        filter_document(&p, br#"{"comments":{"nodes":[{"author":{"login":"x"},"body":"b"}]}}"#)
+            .is_none(),
+        "GraphQL connection shape"
+    );
+    assert!(
+        filter_document(&p, br#"{"data":{"repository":{"pullRequest":{"comments":[]}}}}"#)
+            .is_none(),
+        "nested GraphQL document"
+    );
+    assert!(
+        filter_document(&p, br#"{"comments":[],"reviews":{"nodes":[]}}"#).is_none(),
+        "every present key must be an array"
+    );
+    assert!(
+        filter_document(&p, br#"{"reviews":[]}"#).is_some(),
+        "reviews alone is a document"
+    );
+}
+
 #[test]
 fn the_allowlist_comes_from_config_and_a_malformed_value_widens_nothing() {
     let cfg = json!({"forge": {"trustedCommenters": [" robb-bot ", "", "x[bot]"]}});
