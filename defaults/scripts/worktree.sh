@@ -56,10 +56,11 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/default-branch.sh"
 # keeping a second bash implementation alive. The ledger's line format is
 # unchanged, so one grep/jq still reads every removal path's entries together.
 #
-# #8458's per-worktree CARGO_TARGET_DIR needs nothing sourced here either: the
-# create path below drives `loom-daemon cargo-target-dir provision` straight
-# off the located binary, and every removal path reads the marker through the
-# same daemon (`cargo-target-dir is-attributable|marker`).
+# #8458's per-worktree CARGO_TARGET_DIR needs nothing sourced here either, and
+# since #8195 slice 16 this script does not even invoke it: the create path's
+# provisioning runs inside `loom-daemon worktree-postadd`, which also hands the
+# result to the post-worktree hook, and every removal path reads the marker
+# through the same daemon (`cargo-target-dir is-attributable|marker`).
 
 # Shared "has this branch landed?" primitive (#7812): forge PR state first,
 # then `git merge-tree --write-tree` tree equality, answering landed /
@@ -723,7 +724,6 @@ _worktree_remove_verb() {
 # considered your tree and declined" rather than "this install is broken". The
 # explicit check below reports 2 instead — the one thing the exit codes must
 # never do is lie about which of those happened.
-# requires-daemon: cargo-target-dir optional  #8458 — per-worktree CARGO_TARGET_DIR; a host whose binary predates it (or has none) simply gets no per-worktree dir, which is the pre-#8458 behaviour
 # requires-daemon: worktree-wip >= 0.19.224  #8433 (#8195 slice 2) — the WIP-verb port; without it the stub exits 2 and the verbs refuse
 _worktree_wip_verb() {
     _worktree_source_script_helper "$1"
@@ -1848,15 +1848,6 @@ if _try_worktree_add; then
         _worktree_sparse create "$ABS_WORKTREE_PATH"
     fi
 
-    # Set git hooks path so .githooks/ works in worktrees (no npx/husky needed).
-    # Only when the repo actually ships a .githooks/ dir — otherwise pointing
-    # core.hooksPath at a missing dir silently disables all hooks (git treats a
-    # nonexistent hooksPath as "no hooks"). $WORKTREE_REPO_ROOT is the main repo
-    # root captured at L824 (cwd is the main workspace here, not the worktree).
-    if [[ -d "$WORKTREE_REPO_ROOT/.githooks" ]]; then
-        git -C "$ABS_WORKTREE_PATH" config core.hooksPath .githooks
-    fi
-
     # Store return-to directory if provided
     if [[ -n "$RETURN_TO_DIR" ]]; then
         ABS_RETURN_TO=$(cd "$RETURN_TO_DIR" && pwd)
@@ -1975,50 +1966,66 @@ if _try_worktree_add; then
         print_warning "No loom-daemon resolved - skipping node_modules/.mcp.json/linkPaths symlinks (worktree still created)"
     fi
 
-    # #8458: give this worktree its own Cargo target dir under the otherwise
-    # shared root and record it in the `.loom-cargo-target-dir` marker, so the
-    # removal paths (`loom-daemon worktree-remove`, merge-pr.sh, `loom-daemon
-    # clean`, the reaper) can attribute and reclaim it. Off unless the repo opts
-    # in; a pure no-op on
-    # a host whose Cargo output is not redirected outside the worktree.
+    # --------------------------------------------------------------------
+    # Finalization: core.hooksPath, the per-worktree cargo target dir, and
+    # the project post-worktree hook
+    # --------------------------------------------------------------------
     #
-    # Sets LOOM_WORKTREE_CARGO_TARGET_DIR for the post-worktree hook below —
-    # NOT CARGO_TARGET_DIR, which would make the hook's main-workspace binary
-    # lookup miss and reintroduce #6013/#6014's rebuild storm.
+    # Ported to `loom-daemon worktree-postadd` (#8195 slice 16, epic #7810).
+    # Three blocks moved as ONE unit because they are one sequence with one
+    # internal dependency: #8458 provisions the target dir and #6013/#6014
+    # require its value to reach the hook as LOOM_WORKTREE_CARGO_TARGET_DIR
+    # (never CARGO_TARGET_DIR, which makes the hook's main-workspace binary
+    # lookup miss and reintroduces the rebuild storm). Splitting them would
+    # have put that hand-off back on the shell. `core.hooksPath` (#3638)
+    # joins them because it is the third interpolated-path write into the
+    # same just-created worktree.
     #
-    # Always `|| true`: the daemon binary may not be built yet (this runs at
-    # worktree creation, before the hook that seeds one), and a build-cache
-    # optimisation must never fail a worktree creation. Empty stdout means
-    # "no directory" — the subcommand exits 0 for every not-applicable case.
-    # `--report`'s stderr is deliberately NOT swallowed (stdout is the directory,
-    # which `--json` mode needs clean): it is the one operator-visible sign the
-    # scheme is on. Exporting an empty value is harmless — every consumer tests
-    # `-n` — so no second statement is needed to unset it.
-    _pwt_bin="$(loom_locate_daemon_bin "$MAIN_WORKSPACE_DIR" 2>/dev/null || true)"
-    [[ -z "${_pwt_bin:-}" ]] || export LOOM_WORKTREE_CARGO_TARGET_DIR="$("$_pwt_bin" cargo-target-dir \
-        provision --repo-root "$MAIN_WORKSPACE_DIR" --report "$ABS_WORKTREE_PATH" || true)"
-
-    # Run project-specific post-worktree hook if it exists
-    # This allows projects to add custom setup steps (e.g., pnpm install, lake exe cache get)
-    # The hook is stored in .loom/hooks/ which is NOT overwritten by Loom upgrades
-    # Note: MAIN_WORKSPACE_DIR is already set by the submodule section above
-    POST_WORKTREE_HOOK="$MAIN_WORKSPACE_DIR/.loom/hooks/post-worktree.sh"
-    if [[ -x "$POST_WORKTREE_HOOK" ]]; then
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_info "Running project-specific post-worktree hook..."
-        fi
-
-        # Run the hook from the new worktree directory
-        # Pass: worktree path, branch name, issue number
-        if (cd "$ABS_WORKTREE_PATH" && "$POST_WORKTREE_HOOK" "$ABS_WORKTREE_PATH" "$BRANCH_NAME" "$ISSUE_NUMBER"); then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_success "Post-worktree hook completed"
-            fi
-        else
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Post-worktree hook failed (worktree still created)"
-            fi
-        fi
+    # THIS FAMILY because it is the create path's last block that hands an
+    # interpolated path to an EXTERNAL PROGRAM: a `cd` into the worktree,
+    # three quoted argv words, a `git -C`, and an `export VAR="$(...)"`.
+    # That is #7858's class — the unquoted path that turned a guard into an
+    # `rm -rf` on a live worktree — in the shape review is least likely to
+    # catch, since each of those lines is correct today only because someone
+    # remembered the quotes. In Rust each is an OsString `Command` takes
+    # whole; `worktree_cli::postadd::tests` fails if word-splitting returns.
+    #
+    # ONE DELIBERATE CHANGE, argued in the module doc: the #8458 block asked
+    # `loom_locate_daemon_bin` ("the daemon this caller manages") while every
+    # other subcommand on this path asks $_WT_DAEMON_BIN /
+    # `loom_resolve_self_daemon_bin` ("the binary that implements this
+    # script"). The provisioning now runs in-process, inside the binary this
+    # call site already resolved — one resolution, not two tiers that can
+    # disagree.
+    #
+    # THE CONTRACT THIS CALL SITE PRESERVES, verbatim: the hook's two
+    # messages and their order, silence under --json (fd 1 is already stderr
+    # there, so `--quiet` suppresses rather than reroutes), the hook's own
+    # stdout/stderr left inherited, the #8458 report line still on stderr and
+    # NOT suppressed by --quiet, and best-effort semantics — a failed hook
+    # warns and worktree creation still succeeds, which is why the exit code
+    # is discarded here and `worktree-postadd` returns 0 unconditionally.
+    #
+    # NO DAEMON means none of the three steps run, matching the two
+    # best-effort neighbours immediately above: the worktree is usable and
+    # merely missing setup a `git -C <wt> config core.hooksPath .githooks`
+    # plus a manual hook run restores. Nothing here is destructive, so there
+    # is no silent-skip-mistaken-for-completed hazard of the kind that makes
+    # the `remove`/`wip` verbs refuse at LOOM_SCRIPT_HELPER_MISSING_RC=2.
+    #
+    # requires-daemon: worktree-postadd optional   #8195 slice 16 — a daemon predating the port skips core.hooksPath, the per-worktree cargo target dir and the post-worktree hook with a warning; the worktree is created either way
+    # $MAIN_WORKSPACE_DIR and $WT_QUIET_FLAGS are resolved by the submodule
+    # section above, which runs unconditionally on this path. The retired
+    # `core.hooksPath` guard probed `$WORKTREE_REPO_ROOT/.githooks` instead;
+    # both name the main workspace root at this point (one is `pwd` there, the
+    # other `git rev-parse --show-toplevel` from there), differing at most
+    # logical-vs-physical, which cannot change whether `.githooks` exists.
+    if [[ -n "${_WT_DAEMON_BIN:-}" ]]; then
+        "$_WT_DAEMON_BIN" worktree-postadd --repo-root "$MAIN_WORKSPACE_DIR" \
+            --worktree "$ABS_WORKTREE_PATH" --branch "$BRANCH_NAME" \
+            --issue "$ISSUE_NUMBER" "${WT_QUIET_FLAGS[@]}" || true
+    elif [[ "$JSON_OUTPUT" != "true" ]]; then
+        print_warning "No loom-daemon resolved - skipping core.hooksPath/cargo-target-dir/post-worktree hook (worktree still created)"
     fi
 
     # Output results

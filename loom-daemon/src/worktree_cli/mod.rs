@@ -187,6 +187,21 @@
 //! of them, stay in the shell; see [`open_pr`]'s module doc for why drawing
 //! the line there keeps `test-worktree-forge-pr-check.sh`'s literal-JSON
 //! audit meaningful instead of needing a second whitelisted name.
+//!
+//! Slice 16 is [`postadd`]: the create path's FINALIZATION block — the
+//! `core.hooksPath` guard (#3638), the per-worktree Cargo target dir (#8458)
+//! and the project `post-worktree.sh` hook — the three steps that follow
+//! [`link`] and precede the script's result. It is the last block in that path
+//! that hands an interpolated path to an *external program* (a `cd` into the
+//! worktree, three quoted argv words, a `git -C`, an `export VAR="$(… )"`),
+//! which is #7858's class in the one shape review is least likely to catch:
+//! every one of those expansions is correct today only because somebody
+//! remembered the quotes. It also retires the create path's LAST second-tier
+//! daemon resolution — the #8458 block asked `loom_locate_daemon_bin` (*"the
+//! daemon this caller manages"*) where the rest of the path asks
+//! `loom_resolve_self_daemon_bin` (*"the binary that implements this script"*)
+//! — by moving the provisioning in-process, so there is one resolution instead
+//! of two disagreeing tiers.
 
 pub mod base;
 pub mod baseline;
@@ -203,6 +218,7 @@ pub mod issue_lock;
 pub mod link;
 pub mod lock;
 pub mod open_pr;
+pub mod postadd;
 pub mod remove;
 pub mod reset;
 pub mod sentinel;

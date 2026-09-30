@@ -16,11 +16,24 @@
 #
 # Pattern follows test-worktree-root-override.sh: throwaway bare origin + repo
 # in a mktemp dir, copy worktree.sh + lib/, run.
+#
+# BOTH ASSERTIONS ARE UNCHANGED by #8195 slice 16, which moved this guard into
+# `loom-daemon worktree-postadd`. What the slice adds is the harness pin below:
+# the fixture COPIES worktree.sh into a mktemp dir, so `loom_resolve_self_daemon_bin`'s
+# script-relative tier finds no build and falls through to whatever `loom-daemon`
+# is installed on the host — which, for a subcommand that has not shipped yet,
+# means the guard is skipped and Test 1 fails for an environment reason rather
+# than a behavioural one (#8176's class). `loom_test_require_daemon_bin` pins
+# the freshest build from THIS checkout and fails loudly if it cannot.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "worktree-postadd"
 
 WORKTREE_SH="$SCRIPTS_DIR/worktree.sh"
 

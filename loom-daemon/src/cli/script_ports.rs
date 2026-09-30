@@ -267,6 +267,17 @@ pub(crate) enum ScriptPortCommand {
     /// documents itself).
     WorktreeOpenPr(super::worktree_open_pr::WorktreeOpenPrArgs),
 
+    /// `worktree.sh`'s post-`git worktree add` FINALIZATION steps (#8195 slice
+    /// 16), in the shell's own order: the `core.hooksPath` guard (#3638), the
+    /// per-worktree Cargo target dir (#8458), and the project
+    /// `.loom/hooks/post-worktree.sh` hook — run from inside the worktree with
+    /// `LOOM_WORKTREE_CARGO_TARGET_DIR` (never `CARGO_TARGET_DIR`) set from the
+    /// step before it. The create path's last block that hands an interpolated
+    /// path to an external program, which is #7858's class. Always exits 0: the
+    /// worktree already exists and best-effort provisioning must never make the
+    /// caller abandon it.
+    WorktreePostadd(super::worktree_postadd::WorktreePostaddArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -504,6 +515,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeReset(args) => args.run(),
             ScriptPortCommand::WorktreeBranchConflict(args) => args.run(),
             ScriptPortCommand::WorktreeSubmodules(args) => args.run(),
+            ScriptPortCommand::WorktreePostadd(args) => args.run(),
             ScriptPortCommand::WorktreeUpstream(args) => args.run(),
             ScriptPortCommand::WorktreeStaleRef(args) => args.run(),
             ScriptPortCommand::WorktreeClosedPrBranch(args) => args.run(),
