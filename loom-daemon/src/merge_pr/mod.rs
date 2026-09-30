@@ -220,6 +220,23 @@
 //! describe — but only ever posts a body that arrived behind its sentinel, so
 //! the degraded path cannot overwrite the audit trail with an empty comment.
 //!
+//! [`check_runs_rollup`] is what every branch of that same poll loop reads
+//! FROM (#8191 slice): the three `jq` filters at the top of each poll that
+//! name the terminal-failing checks, the still-pending ones, and the rollup's
+//! own `total_count`. It is the input to [`checks_failure`],
+//! [`zero_checks`] and the pending wait alike, so a wrong answer here is a
+//! wrong answer in all three — and each filter was written `2>/dev/null ||
+//! true`, which made a payload `jq` could not walk (`check_runs: null`, a
+//! non-object row, a top-level array) indistinguishable from "nothing is
+//! failing and nothing is running". The port keeps that empty answer
+//! deliberately, because it routes the poll into #6169's zero-row guard
+//! rather than settlement; what it does NOT keep is the SHELL reaching the
+//! same empty answer when the parse never ran at all, which now costs one
+//! more poll instead of a merge on unclassified checks. It also pins the two
+//! `jq` idioms a rewrite loses: `unique` sorts as well as de-duplicates, and
+//! `jq -r` unquotes strings only — so a check-run with no `name` is the
+//! literal text `null` in the pending set, not a dropped row.
+//!
 //! [`worktree_preserve`] is the #6694/#6264 remove-vs-preserve rule
 //! `merge-pr.sh`'s post-merge cleanup ran identically at THREE call sites —
 //! the Loom-convention path, the porcelain discovery fallback, and the
@@ -229,6 +246,7 @@
 //! caller and passed in; this module owns only the two-input decision and its
 //! byte-frozen message text, consolidating three copies into one.
 
+pub mod check_runs_rollup;
 pub mod check_runs_streak;
 pub mod checks_failure;
 pub mod cleanup_paths;

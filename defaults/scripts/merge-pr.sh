@@ -2011,17 +2011,52 @@ _wait_for_checks_then_sync_merge() {
     fi
     not_found_streak=0
 
-    # Failing (terminal non-success) and pending (not yet completed) check names.
-    local failing pending total_count
-    failing="$(echo "$runs_raw" | \
-      jq -r '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled" or .conclusion == "action_required") | .name] | unique | .[]' 2>/dev/null || true)"
-    pending="$(echo "$runs_raw" | \
-      jq -r '[.check_runs[] | select(.status != "completed") | .name] | unique | .[]' 2>/dev/null || true)"
-    total_count="$(echo "$runs_raw" | jq -r '.total_count // 0' 2>/dev/null || echo 0)"
-    [[ "$total_count" =~ ^[0-9]+$ ]] || total_count=0
+    # Failing (terminal non-success) and pending (not yet completed) check
+    # names, plus the rollup's own total_count — the parse every branch below
+    # reads from, ported to Rust (#8191 slice): `loom-daemon merge-pr
+    # check-runs-rollup` (loom-daemon/src/merge_pr/check_runs_rollup.rs) holds
+    # the three retired `jq` filters, jq's `unique` ordering, its
+    # strings-only `-r` rendering (so a check-run with no `.name` is still the
+    # literal text `null` in the pending set, not a dropped row), and the
+    # `.total_count // 0` + `^[0-9]+$` gate — so the value handed to the `-gt`
+    # below is always ASCII digits.
+    #
+    # The forge READ stays here, exactly as before: `forge_get_check_runs`
+    # above, its retry-once, and the FORGE_CHECK_RUNS_RC_* classification.
+    # Naming which checks are failing is not deciding what to do about them.
+    #
+    # A payload no JSON parser can walk is NOT a fault — it is the all-empty
+    # answer the retired `2>/dev/null || true` produced, which routes this
+    # poll into #6169's zero-row guard rather than settlement, and the port
+    # reproduces it deliberately. A fault is the parse never RUNNING (missing
+    # binary, one predating this slice), and that is handled below as
+    # still-pending: which checks are failing or running is then unknown, and
+    # the one thing a guard fault must never do is authorize a merge on
+    # unclassified checks. Degrading it to the all-empty answer instead would
+    # be WORSE than the retired shell, because a poll that had already latched
+    # observed_checks=true would read that answer as "checks settled".
+    local failing="" pending="" total_count=0 f_any=0 p_any=0 p_lines=1
+    local _crr_out _crr_rc=0 _crr_l _crr_t
+    _crr_out="$(printf '%s\n' "$runs_raw" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr check-runs-rollup 2>/dev/null)" || _crr_rc=$?
+    while IFS=$'\t' read -r _crr_l _crr_t; do case "$_crr_l" in
+      FAILING) failing+="${failing:+$'\n'}$_crr_t" ;;
+      PENDING) pending+="${pending:+$'\n'}$_crr_t" ;;
+    esac; done <<< "$_crr_out"
+    IFS=$'\t' read -r _crr_l total_count f_any p_any p_lines <<< "${_crr_out%%$'\n'*}"
+    if [[ $_crr_rc -ne 0 || "$_crr_l" != "LOOM-CHECK-RUNS-ROLLUP" ]]; then
+      warning "PR #$PR_NUMBER: the check-runs rollup parse (#8191 slice) did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr check-runs-rollup' exited $_crr_rc without a LOOM-CHECK-RUNS-ROLLUP line (a loom-daemon predating this slice has no such verb). Treating this poll as still-pending: which checks are failing or still running is unknown, and a fault here must cost time, never authorize a merge on unclassified checks. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+      [[ "$(date +%s)" -lt "$deadline" ]] || { warning "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for PR #$PR_NUMBER's check-runs rollup to become classifiable — exiting 5 (not merged, not a failure: re-queue)."; exit 5; }
+      sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
+      continue
+    fi
     [[ "$total_count" -gt 0 ]] && observed_checks=true
 
-    if [[ -n "$failing" ]]; then
+    # `$f_any` (and `$p_any` below) is the port's answer to the question the
+    # retired `[[ -n "$failing" ]]` asked — whether the NEWLINE-JOINED list is
+    # non-empty — not "did the parse find rows". Those differ: a lone
+    # check-run named "" yielded one empty line, which `$(…)` stripped to the
+    # empty string, so the retired shell read it as nothing failing/pending.
+    if [[ "$f_any" == 1 ]]; then
       # A check failed — classify against branch protection. A required failing
       # check can never merge on this SHA; refuse now. A lookup failure fails
       # closed (refuse), mirroring the UNSTABLE fallback.
@@ -2059,10 +2094,10 @@ _wait_for_checks_then_sync_merge() {
       esac
     fi
 
-    if [[ -n "$pending" ]]; then
-      # Hoisted out of both branches below (it was computed identically in
-      # each) so the #8896 comment can land without growing the file.
-      local n; n="$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
+    if [[ "$p_any" == 1 ]]; then
+      # $p_lines is `printf '%s\n' "$pending" | wc -l`, answered by the parse
+      # above (#8191 slice) — the same count both messages below narrate.
+      local n="$p_lines"
       if [[ "$(date +%s)" -ge "$deadline" ]]; then
         # #8896: exit 5, not error()'s exit 1. CI outlasting the bounded wait is
         # the re-queue signal exits 3/4 already carry — nothing merged, nothing

@@ -652,6 +652,17 @@ pub(crate) enum MergePrCommand {
     /// see `cli::merge_pr_check_runs_streak`.
     CheckRunsStreak(super::merge_pr_check_runs_streak::CheckRunsStreakArgs),
 
+    /// The PARSE every branch of that wait loop reads from (#8191 slice):
+    /// given the check-runs rollup on stdin, which check names are
+    /// terminal-FAILING, which are still PENDING, and what the rollup's own
+    /// `total_count` is — the three `jq` filters whose `2>/dev/null || true`
+    /// made an unwalkable payload indistinguishable from "nothing failing,
+    /// nothing running". Always exits 0 for readable stdin (a payload no
+    /// parser can walk is the all-empty answer, which routes the poll into
+    /// #6169's zero-row guard), 2 only if stdin could not be read — see
+    /// `cli::merge_pr_check_runs_rollup`.
+    CheckRunsRollup(super::merge_pr_check_runs_rollup::CheckRunsRollupArgs),
+
     /// The OTHER classification in the same wait loop (#8191 slice): once a
     /// poll finds a FAILING check, whether it is a required status-check
     /// context (refuse), informational with nothing pending (proceed to the
@@ -794,6 +805,7 @@ impl MergePrCommand {
             MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
             MergePrCommand::CheckRunsStreak(args) => args.run(),
+            MergePrCommand::CheckRunsRollup(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
             MergePrCommand::StackedChildren(args) => args.run(),
             MergePrCommand::WorktreePrimary(args) => args.run(),
