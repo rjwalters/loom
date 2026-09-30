@@ -388,6 +388,41 @@ forge_get_check_runs() {
 
 COMPLETE_ROLLUP='{"total_count":1,"check_runs":[{"name":"build","status":"completed","conclusion":"success"}]}'
 
+# --- Stub the one loom-daemon verb a SUCCESSFUL poll now needs ---
+#
+# Since the #8191 slice, every poll whose fetch succeeded delegates the rollup
+# PARSE to `loom-daemon merge-pr check-runs-rollup` before it can classify
+# anything, and a parse it cannot run is treated as still-pending (never as
+# settlement). This suite is CI-wired, hence hermetic with no built
+# loom-daemon, so the verb is stubbed here; everything else still exits 2,
+# which keeps the fail-open `check-runs-streak` and `zero-checks-settle`
+# degradations these scenarios already relied on exactly as they were.
+#
+# WHICH IMPLEMENTATION THIS MODELS (verification-recipes.md §6): the RETIRED jq
+# filters, wrapped in the port's output protocol. What proves the real
+# subcommand agrees with them is
+# loom-daemon/tests/merge_pr_check_runs_rollup_differential.rs, not this shim —
+# do not "update" it to track a future port.
+DAEMON_STUB="$WORK_DIR/loom-daemon"
+cat > "$DAEMON_STUB" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+[[ "${1:-}" == "merge-pr" && "${2:-}" == "check-runs-rollup" ]] || exit 2
+raw="$(cat)"
+failing="$(jq -r '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled" or .conclusion == "action_required") | .name] | unique | .[]' <<<"$raw" 2>/dev/null || true)"
+pending="$(jq -r '[.check_runs[] | select(.status != "completed") | .name] | unique | .[]' <<<"$raw" 2>/dev/null || true)"
+total="$(jq -r '.total_count // 0' <<<"$raw" 2>/dev/null || echo 0)"
+[[ "$total" =~ ^[0-9]+$ ]] || total=0
+f_any=0; p_any=0
+[[ -z "$failing" ]] || f_any=1
+[[ -z "$pending" ]] || p_any=1
+printf 'LOOM-CHECK-RUNS-ROLLUP\t%s\t%s\t%s\t%s\n' \
+  "$total" "$f_any" "$p_any" "$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
+if [[ -n "$failing" ]]; then while IFS= read -r name; do printf 'FAILING\t%s\n' "$name"; done <<<"$failing"; fi
+if [[ -n "$pending" ]]; then while IFS= read -r name; do printf 'PENDING\t%s\n' "$name"; done <<<"$pending"; fi
+STUB
+chmod +x "$DAEMON_STUB"
+
 reset_loop_state() {
     : > "$LOG_FILE"
     echo 0 > "$DATE_FILE"
@@ -400,6 +435,7 @@ reset_loop_state() {
     MERGE_PRECONDITION_SHA=""
     LOOM_AUTO_MERGE_POLL_INTERVAL=1
     LOOM_CHECK_RUNS_404_STREAK=2
+    LOOM_DAEMON_BIN="$DAEMON_STUB"
 }
 queue_poll() { printf '%s\n' "$1" >> "$QUEUE_FILE"; }
 
