@@ -10,22 +10,30 @@
 //!   `COLLABORATOR`), the people who can change labels anyway;
 //! - the fleet's GitHub App, which GitHub reports as `CONTRIBUTOR` or
 //!   `NONE`: the **configured** App slug ([`APP_SLUG_ENV`] >
-//!   `forge.githubApp.slug`, see [`configured_app_slug`]), and as a fallback
-//!   the default `loom-fleet-dispatch` name and its numbered pool members.
+//!   `forge.githubApp.slug`, see [`configured_app_slug`]), every identity in
+//!   the forge roster (#9537: the writer, each reader, and `legacyLogins`), and
+//!   the default `loom-fleet-dispatch` name and its numbered members
+//!   (`-<digits>` exactly — never a bare prefix, which trusted `-evil`).
 //!   The raw login must carry an App spelling ([`is_app_login`]: `…[bot]`
 //!   from REST, `app/…` from GraphQL), which only a GitHub App can have: a
 //!   plain user may register `loom-fleet-dispatch-evil` or the bare slug,
 //!   never `…[bot]`. Only then is the name compared, through
 //!   [`crate::dep_recheck::extract::normalise_login`]; or
 //! - this daemon's own forge identity, when the forge could name it (an App
-//!   identity, e.g. the `<slug>[bot]` fallback, again only as an App login).
+//!   identity, e.g. the `<slug>[bot]` fallback, again only as an App login);
+//!   or
+//! - a login in the workspace's `forge.trustedCommenters` allowlist.
+//!
+//! The decision itself is [`crate::comment_trust::trusted_by`] (#9548), the
+//! one predicate every marker reader shares; this module only supplies the
+//! liveness pass's view of "the fleet App" (the process-wide registry below).
 
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use super::forge::ForgeComment;
-use crate::dep_recheck::extract::{normalise_login, DEFAULT_BOT_LOGIN};
+use crate::dep_recheck::extract::normalise_login;
 
 /// Env override naming the fleet's GitHub App slug (e.g. `acme-dispatch`).
 pub const APP_SLUG_ENV: &str = "LOOM_GITHUB_APP_SLUG";
@@ -35,13 +43,24 @@ fn registered() -> &'static Mutex<BTreeSet<String>> {
     APPS.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
+/// The `forge.trustedCommenters` allowlist, registered by
+/// [`configured_app_slug`] (raw spellings: the account kind is part of it).
+fn allowlisted() -> &'static Mutex<BTreeSet<String>> {
+    static ALLOW: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    ALLOW.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
 /// The fleet App slug configured for the workspace at `root`:
 /// [`APP_SLUG_ENV`] > `forge.githubApp.slug` (then `.name`). Registered for
 /// [`trusted_author`] as a side effect, so every later decision in this
 /// process believes it.
 pub fn configured_app_slug(root: &Path) -> Option<String> {
+    let effective = crate::config_resolver::resolve_effective_config(root);
+    allowlisted()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(crate::comment_trust::allowlist_from_config(&effective));
     let from_config = || {
-        let effective = crate::config_resolver::resolve_effective_config(root);
         let app = crate::config_resolver::get_path(&effective, "forge.githubApp")?;
         ["slug", "name"]
             .iter()
@@ -52,7 +71,15 @@ pub fn configured_app_slug(root: &Path) -> Option<String> {
         .ok()
         .or_else(from_config)
         .map(|s| normalise_login(s.trim()))
-        .filter(|s| !s.is_empty())?;
+        .filter(|s| !s.is_empty());
+    // #9537: believe the whole roster, not only the writer's slug — readers'
+    // and renamed Apps' past comments carry their current names.
+    for name in crate::forge_identity::FleetLogins::for_root(root).names() {
+        if !name.contains('(') {
+            register_fleet_app(&name);
+        }
+    }
+    let slug = slug?;
     register_fleet_app(&slug);
     Some(slug)
 }
@@ -68,13 +95,7 @@ pub fn register_fleet_app(slug: &str) {
     }
 }
 
-/// Whether the raw `login` is spelled as a GitHub App (`…[bot]` or `app/…`),
-/// a spelling no user account can register.
-#[must_use]
-pub fn is_app_login(login: &str) -> bool {
-    let l = login.trim().to_ascii_lowercase();
-    l.ends_with("[bot]") || l.starts_with("app/")
-}
+pub use crate::comment_trust::{is_app_login, TRUSTED_ASSOCIATIONS};
 
 /// Whether the normalised `login` names the fleet App. Callers must first
 /// check [`is_app_login`] on the raw login.
@@ -87,11 +108,8 @@ fn is_fleet_app(norm: &str) -> bool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(norm)
-        || norm.starts_with(DEFAULT_BOT_LOGIN)
+        || crate::forge_identity::is_default_family(norm)
 }
-
-/// `author_association` values that can already write labels.
-pub const TRUSTED_ASSOCIATIONS: &[&str] = &["OWNER", "MEMBER", "COLLABORATOR"];
 
 /// Whether a comment by `login` with `association` is believed.
 #[must_use]
@@ -100,23 +118,18 @@ pub fn trusted_author(
     association: Option<&str>,
     self_login: Option<&str>,
 ) -> bool {
-    if association.is_some_and(|a| {
-        TRUSTED_ASSOCIATIONS
-            .iter()
-            .any(|t| a.eq_ignore_ascii_case(t))
-    }) {
-        return true;
-    }
-    let Some(login) = login.filter(|l| !l.trim().is_empty()) else {
-        return false;
-    };
-    let app = is_app_login(login);
-    let norm = normalise_login(login);
-    if app && is_fleet_app(&norm) {
-        return true;
-    }
-    // Same account kind and name: a user `x` is never the App `x[bot]`.
-    self_login.is_some_and(|me| is_app_login(me) == app && normalise_login(me) == norm)
+    let allow: Vec<String> = allowlisted()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect();
+    crate::comment_trust::trusted_by(
+        &crate::comment_trust::Author::new(login, association),
+        is_fleet_app,
+        self_login,
+        &allow,
+    )
 }
 
 /// Whether `comment` is believed.
@@ -179,6 +192,15 @@ mod tests {
         }
         assert!(trusted_author(Some("loom-fleet-dispatch-2[bot]"), Some("NONE"), None));
         assert!(trusted_author(Some("app/loom-fleet-dispatch-2"), Some("NONE"), None));
+        // #9537: the default family is the exact name or `-<digits>`, never a
+        // bare prefix, even App-spelled (the old `starts_with` trusted these).
+        for app in [
+            "loom-fleet-dispatch-evil[bot]",
+            "app/loom-fleet-dispatcher",
+            "loom-fleet-dispatch-[bot]",
+        ] {
+            assert!(!trusted_author(Some(app), Some("NONE"), None), "{app}");
+        }
         // A configured slug: only the App spelling.
         register_fleet_app("zeta-dispatch");
         assert!(trusted_author(Some("zeta-dispatch[bot]"), Some("NONE"), None));

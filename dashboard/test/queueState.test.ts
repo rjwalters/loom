@@ -224,8 +224,9 @@ describe("dispatch plan fields (#9288)", () => {
     plan_state: "queued",
     gate: "repo_cap",
     keys: [
+      { name: "operator_priority", value: false },
+      { name: "main_red_fix", value: false },
       { name: "workspace_priority", value: 100 },
-      { name: "urgent", value: false },
       { name: "created_at", value: "2026-09-01T00:00:00Z" },
       { name: "number", value: 4343 },
       { name: "bogus", value: { nested: "/Users/x" } },
@@ -236,11 +237,19 @@ describe("dispatch plan fields (#9288)", () => {
     repo_cap: { cap: 1, occupancy: 1 },
   });
   const plan = {
-    slots: { max_concurrent: 4, occupancy: 3, free: 1, max_admissions_per_tick: 2, saturation_held: false, any_halted: false },
+    slots: {
+      max_concurrent: 4,
+      occupancy: 3,
+      free: 1,
+      max_admissions_per_tick: 2,
+      saturation_held: false,
+      any_halted: false,
+      overflow_free: true,
+    },
     tick_interval_secs: 60,
     shard: { configured: true, host_shard: 1, shard_count: 2 },
     scope: ["loom:issue", "loom:blocked"],
-    ordering: ["workspace_priority", "urgent", "created_at", "number"],
+    ordering: ["operator_priority", "operator_priority_at", "main_red_fix", "workspace_priority", "created_at", "number"],
     complete: true,
     local_path: "/Users/someone",
   };
@@ -256,8 +265,17 @@ describe("dispatch plan fields (#9288)", () => {
       owning_shard: 1,
       repo_cap: { cap: 1, occupancy: 1 },
     });
-    expect(record.rows[0]?.keys?.map((k) => k.name)).toEqual(["workspace_priority", "urgent", "created_at", "number"]);
-    expect(record.plan).toMatchObject({ slots: { free: 1, max_admissions_per_tick: 2 }, tick_interval_secs: 60 });
+    expect(record.rows[0]?.keys?.map((k) => k.name)).toEqual([
+      "operator_priority",
+      "main_red_fix",
+      "workspace_priority",
+      "created_at",
+      "number",
+    ]);
+    expect(record.plan).toMatchObject({
+      slots: { free: 1, max_admissions_per_tick: 2, overflow_free: true },
+      tick_interval_secs: 60,
+    });
     expect(record.plan?.shard).toEqual({ configured: true, host_shard: 1, shard_count: 2 });
     expect(JSON.stringify(record)).not.toContain("/Users/");
   });
@@ -297,7 +315,7 @@ describe("dispatch plan fields (#9288)", () => {
   it("a public row keeps every plan field", () => {
     const redacted = redactQueueSnapshot(normalizeQueueSnapshot(queueRecord({ rows: [planRow("rjwalters/loom", "public")] }))!);
     expect(redacted.rows[0]).toMatchObject({ owning_shard: 1, repo_cap: { cap: 1, occupancy: 1 } });
-    expect(redacted.rows[0]?.keys).toHaveLength(4);
+    expect(redacted.rows[0]?.keys).toHaveLength(5);
   });
 });
 

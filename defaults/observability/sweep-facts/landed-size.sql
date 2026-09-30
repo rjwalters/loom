@@ -24,6 +24,43 @@
 -- first. The landing predicate mirrors `issue-effort.sql`'s `landings` CTE
 -- exactly (disposition = 'landed', with the documented pre-#9441 fallback);
 -- if one changes, change both.
+--
+-- This file defines TWO views, in this order: `measured_point_values` (the
+-- per-class point table) and `issue_landed_size` (the per-landing index, which
+-- reads it). Both are `CREATE VIEW IF NOT EXISTS`, so re-defining either after
+-- an edit means dropping it first — `DROP VIEW issue_landed_size;
+-- DROP VIEW measured_point_values;` then re-running this file.
+
+-- ---------------------------------------------------------------------------
+-- Measured point values per size class, from the story-points experiment's
+-- bucket ratios (#9466): tokens 1 : 1.3 : 2.2 : 3.4 : 5.1 : 8.2, lines
+-- 1 : 8.5 : 21 : 47 : 82 : 197.
+--
+-- This is the ONE place those numbers are written down (#9433): SF2 reaches
+-- them through `issue_landed_size` below, for a landing's MEASURED class, and
+-- SF8 joins this view directly on the Curator's ASSIGNED `story_points` class,
+-- for the forecast side. Two copies of the ratios would be two definitions of
+-- "a point", so there is one view and both sides read it.
+--
+-- PROVISIONAL — the two components disagree by design (that is the
+-- experiment's finding: raw Fibonacci labels are not a unit on any component),
+-- and #9434's calibration loop collapses them into one point value per class.
+-- Sums over landings must use LSI or these measured values, NEVER the raw
+-- labels. `size_class` is TEXT because it is a label, not a quantity.
+-- Class 21 is deliberately absent: it has no measured landing yet, so a
+-- landing in it joins to NULL rather than to an extrapolation — and it is not
+-- a legal `story_points` value either (telemetry-schema.md §`story_points`),
+-- so on the forecast side a non-NULL estimate that misses this table is an
+-- out-of-vocabulary emitter defect, which SF8 counts rather than hides.
+-- ---------------------------------------------------------------------------
+CREATE VIEW IF NOT EXISTS measured_point_values
+    (size_class, measured_point_tokens, measured_point_lines) AS
+          SELECT '1',  1.0,   1.0
+UNION ALL SELECT '2',  1.3,   8.5
+UNION ALL SELECT '3',  2.2,  21.0
+UNION ALL SELECT '5',  3.4,  47.0
+UNION ALL SELECT '8',  5.1,  82.0
+UNION ALL SELECT '13', 8.2, 197.0;
 
 CREATE VIEW IF NOT EXISTS issue_landed_size AS
 WITH
@@ -74,21 +111,13 @@ WITH
         SELECT NULL AS model, NULL AS factor
         WHERE 0
     ),
-    -- Measured point values per class, from the story-points experiment's
-    -- bucket ratios (#9466): tokens 1 : 1.3 : 2.2 : 3.4 : 5.1 : 8.2,
-    -- lines 1 : 8.5 : 21 : 47 : 82 : 197. PROVISIONAL — the two components
-    -- disagree by design (that is the experiment's finding: raw Fibonacci
-    -- labels are not a unit on any component), and #9434's calibration loop
-    -- collapses them into one point value per class. Sums over landings must
-    -- use LSI or these measured values, NEVER the raw labels. Class 21 has no
-    -- measured landing yet — its point value is NULL, not an extrapolation.
-    measured_points(size_class, measured_point_tokens, measured_point_lines) AS (
-        SELECT '1',  1.0,   1.0
-        UNION ALL SELECT '2',  1.3,   8.5
-        UNION ALL SELECT '3',  2.2,  21.0
-        UNION ALL SELECT '5',  3.4,  47.0
-        UNION ALL SELECT '8',  5.1,  82.0
-        UNION ALL SELECT '13', 8.2, 197.0
+    -- Measured point values per class — read from the `measured_point_values`
+    -- view above, which is the single definition of those bucket ratios
+    -- (#9433). Nothing is restated here: a second copy of the ratios would be
+    -- a second meaning of "a point".
+    measured_points AS (
+        SELECT size_class, measured_point_tokens, measured_point_lines
+        FROM measured_point_values
     ),
     -- The landing sweeps — predicate mirrors `issue-effort.sql` `landings`.
     landings AS (

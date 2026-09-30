@@ -1,0 +1,47 @@
+name: CodeQL
+
+# Daily + on-demand only (#9567). Deliberately no push / pull_request trigger:
+# code-scanning alerts attach to code, so one daily scan of the main tip covers
+# every merged commit.
+on:
+  schedule:
+    - cron: '17 6 * * *'  # Daily, off the top of the hour
+  workflow_dispatch:
+
+# Queue, never cancel (.loom/docs/ci-principles.md rule 2).
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  security-events: write
+  contents: read
+
+jobs:
+  analyze:
+    name: CodeQL Analysis (${{ matrix.language }})
+    runs-on: ubuntu-22.04
+    # The Rust leg has never run here; its runtime/memory are unknown.
+    timeout-minutes: 120
+    env:
+      # Overlay-base databases only serve PR scans, which this workflow never
+      # runs, so building/uploading them is wasted work (#9565).
+      # NOTE: action-internal override; a codeql-action bump could rename it.
+      CODEQL_ACTION_OVERLAY_ANALYSIS: "false"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          - language: rust
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: "/language:${{ matrix.language }}"

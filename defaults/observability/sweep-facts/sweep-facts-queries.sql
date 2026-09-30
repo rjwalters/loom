@@ -1,12 +1,13 @@
--- Sweep facts: the canonical question set SF1..SF7 (Issues #9446, #9466).
+-- Sweep facts: the canonical question set SF1..SF8 (Issues #9446, #9466,
+-- #9433).
 --
 -- D1/SQLite dialect (JSON1 + window functions). Every question, its exact
 -- definition, and what this set deliberately cannot answer are in
 -- `sweep-facts-questions.md`. Do not read a number out of here without it —
 -- especially "absent vs. zero". Run `sweep-facts-rollup.sql` first; SF1/SF5
--- also read the `issue_effort` view (`issue-effort.sql`) and SF2 reads
--- `issue_landed_size` (`landed-size.sql`, whose `params_version` names the
--- parameter set any LSI figure was computed under).
+-- also read the `issue_effort` view (`issue-effort.sql`) and SF2/SF8 read
+-- `issue_landed_size` and `measured_point_values` (`landed-size.sql`, whose
+-- `params_version` names the parameter set any LSI figure was computed under).
 --
 -- Windows are BOUND, never edited into a query. D1 has no client-side bind
 -- parameters for a committed file, so the window lives in the `sf_window`
@@ -15,7 +16,7 @@
 --
 --   wrangler d1 execute loom-fleet-telemetry --file sweep-facts-queries.sql
 --
--- All seven answers come back in one pass, in SF order.
+-- All eight answers come back in one pass, in SF order.
 
 -- The window every SF query reads. Edit HERE, once.
 CREATE VIEW IF NOT EXISTS sf_window AS
@@ -47,9 +48,12 @@ WHERE e.landed_at >= w.since AND e.landed_at < w.until
 ORDER BY e.lifecycle_tokens_in DESC, e.repo, e.issue;
 
 -- SF2. How much work lands per day: Σ LSI over the day's landings — the
--- size-weighted throughput KPI (#9466, consumed by #9433). Labels are never
--- summed (a "13" is not thirteen "1"s — see the measured bucket ratios in the
--- questions doc); the two provisional measured-point columns are the
+-- size-weighted throughput KPI (#9466), and the headline half of the pair it
+-- forms with SF8 (#9433): SF2 is what actually landed, SF8 is what the Curator
+-- forecast would land and how much of the day was sized at all. Labels are
+-- never summed (a "13" is not thirteen "1"s — see the measured bucket ratios in
+-- `landed-size.sql`'s `measured_point_values`); the two provisional
+-- measured-point columns are the
 -- experiment's alternative until #9434 collapses them into one point value.
 -- `without_token_component` counts landings whose LSI used two components, so
 -- a day that mixes definitions is visible. All LSI values are NULL under an
@@ -231,6 +235,125 @@ SELECT
        FROM sweep_facts f, sf_window w
       WHERE f.emitted_at >= w.since AND f.emitted_at < w.until)
                                                           AS unexplained_drops;
+
+-- SF8. Points landed per day and per ISO week: the FORECAST side of the
+-- throughput KPI (#9433, epic #9429), read beside SF2's measured `lsi_landed`.
+-- One statement, two grains — `grain` is `'day'` or `'iso_week'` and `bucket`
+-- is that grain's key, so a window can be read at either resolution without a
+-- second query drifting from this one's definitions.
+--
+-- Three rules this query exists to enforce, each of them load-bearing:
+--
+--   1. LANDED ONLY. The predicate mirrors `landed-size.sql`'s `landings` CTE
+--      exactly (`disposition = 'landed'`, with the documented pre-#9441
+--      fallback); if one changes, change both. A failed, cancelled or no-op
+--      sweep lands nothing, so it contributes to neither the points columns
+--      nor `landings`.
+--   2. MISSING IS NOT ZERO. `points_missing` counts landings whose
+--      `story_points` is absent — the CT7/SF4 data gap, reported BESIDE the
+--      sums and never folded into them. A day whose points look low because
+--      nobody sized the work must stay distinguishable from a day that
+--      genuinely landed small work. `points_sized + points_missing` always
+--      equals `landings`, which is how a reader checks the coverage.
+--   3. LABELS ARE NOT A UNIT. Fibonacci labels are ORDINAL: the experiment's
+--      pre-registered ±30% additivity test fails on every measured axis
+--      (tokens 1 : 1.3 : 2.2 : 3.4 : 5.1 : 8.2; hand-written lines
+--      1 : 8.5 : 21 : 47 : 82 : 197 — #9429). "Points landed" is therefore the
+--      sum of the MEASURED point value of each landing's ASSIGNED class,
+--      joined from `measured_point_values` (`landed-size.sql`) — two columns,
+--      because the two components disagree by design until #9434 collapses
+--      them into one. The raw label sum is still reported, but only under a
+--      name that states what it is not: it is for spotting a mislabelled
+--      window, never for reading size out of.
+--
+-- `landings` is reported alongside on purpose: over a measured 34-day window
+-- issue count alone explains R² 0.83 of daily delivered size and summed points
+-- raise that only to 0.94 — most daily variation is volume, not size mix.
+--
+-- `sized_without_measured_value` counts landings that carry an estimate with no
+-- row in `measured_point_values`. It must be 0: `story_points` is constrained
+-- to 1/2/3/5/8/13 by the emitter (telemetry-schema.md §`story_points`), so a
+-- positive value is an emitter or vocabulary defect, counted here rather than
+-- silently dropped by the LEFT JOIN.
+--
+-- `lsi_landed` is SF2's measured total, re-read through `issue_landed_size` on
+-- the landing sweep rather than recomputed, so forecast and actual for the same
+-- bucket sit in one row. It is NULL under an unfitted parameter set
+-- (`params_version = 'v0-unfitted'`) — exactly as in SF2.
+--
+-- The ISO week key is computed, not `strftime`'d: `%V`/`%G` require SQLite
+-- >= 3.46, so the week is keyed off the THURSDAY of the landing's ISO week
+-- (`date(d, '-3 days', 'weekday 4')`), whose calendar year IS the ISO year by
+-- definition and whose day-of-year yields the week number exactly
+-- ((day_of_year - 1) / 7 + 1, since that Thursday always falls in Jan 1..7 for
+-- week 1 and shifts by exactly 7 days per week thereafter).
+WITH sf8_landed AS (
+    SELECT
+        f.repo       AS repo,
+        f.issue      AS issue,
+        f.sweep_id   AS sweep_id,
+        f.emitted_at AS landed_at,
+        f.story_points AS story_points
+    FROM sweep_facts f, sf_window w
+    WHERE f.emitted_at >= w.since AND f.emitted_at < w.until
+      AND (f.disposition = 'landed'
+           OR (f.disposition IS NULL
+               AND f.result = 'success'
+               AND f.pr_number IS NOT NULL))
+),
+sf8_points AS (
+    SELECT
+        date(l.landed_at)                                        AS day,
+        strftime('%Y', date(l.landed_at, '-3 days', 'weekday 4'))
+            || '-W'
+            || substr('0' || ((CAST(strftime('%j',
+                 date(l.landed_at, '-3 days', 'weekday 4')) AS INTEGER) - 1)
+                 / 7 + 1), -2)                                   AS iso_week,
+        l.story_points                                           AS story_points,
+        m.measured_point_tokens                                  AS measured_point_tokens,
+        m.measured_point_lines                                   AS measured_point_lines,
+        v.LSI                                                    AS lsi
+    FROM sf8_landed l
+    -- The forecast join: the Curator's ASSIGNED class (an INTEGER label on the
+    -- fact row) against the measured point table's TEXT class key.
+    LEFT JOIN measured_point_values m
+           ON m.size_class = CAST(l.story_points AS TEXT)
+    -- The actual side, keyed on the landing sweep itself.
+    LEFT JOIN issue_landed_size v
+           ON v.repo = l.repo
+          AND v.issue = l.issue
+          AND v.landing_sweep_id = l.sweep_id
+)
+SELECT
+    'day'                                          AS grain,
+    p.day                                          AS bucket,
+    count(*)                                       AS landings,
+    sum(p.story_points IS NOT NULL)                AS points_sized,
+    sum(p.story_points IS NULL)                    AS points_missing,
+    sum(p.measured_point_tokens)                   AS measured_points_tokens_landed,
+    sum(p.measured_point_lines)                    AS measured_points_lines_landed,
+    sum(p.story_points IS NOT NULL
+        AND p.measured_point_tokens IS NULL)       AS sized_without_measured_value,
+    sum(p.story_points)                            AS labels_summed_ordinal_do_not_use_as_size,
+    sum(p.lsi)                                     AS lsi_landed
+FROM sf8_points p
+GROUP BY p.day
+UNION ALL
+SELECT
+    'iso_week'                                     AS grain,
+    p.iso_week                                     AS bucket,
+    count(*)                                       AS landings,
+    sum(p.story_points IS NOT NULL)                AS points_sized,
+    sum(p.story_points IS NULL)                    AS points_missing,
+    sum(p.measured_point_tokens)                   AS measured_points_tokens_landed,
+    sum(p.measured_point_lines)                    AS measured_points_lines_landed,
+    sum(p.story_points IS NOT NULL
+        AND p.measured_point_tokens IS NULL)       AS sized_without_measured_value,
+    sum(p.story_points)                            AS labels_summed_ordinal_do_not_use_as_size,
+    sum(p.lsi)                                     AS lsi_landed
+FROM sf8_points p
+GROUP BY p.iso_week
+ORDER BY grain, bucket;
 
 -- The window was the only state this file created.
 DROP VIEW IF EXISTS sf_window;

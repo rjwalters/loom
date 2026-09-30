@@ -14,6 +14,7 @@ mod kind_registry;
 mod role_tick;
 mod session_analysis;
 mod session_summary;
+mod story_points;
 mod token_snapshot;
 use role_tick::role_tick_outcome;
 use token_snapshot::tokens_snapshot;
@@ -31,6 +32,7 @@ pub(super) fn ts() -> DateTime<Utc> {
 
 fn sweep_started() -> TelemetryRecord {
     TelemetryRecord::SweepStarted(SweepStartedRecord {
+        story_points: None,
         repo: "rjwalters/loom".to_string(),
         visibility: RepoVisibility::Public,
         issue: 4703,
@@ -74,10 +76,11 @@ fn sweep_completed() -> TelemetryRecord {
     })
 }
 
-fn sweep_outcome() -> TelemetryRecord {
+pub(super) fn sweep_outcome() -> TelemetryRecord {
     let mut config = std::collections::BTreeMap::new();
     config.insert("runtime".to_string(), "claude".to_string());
     TelemetryRecord::SweepOutcome(SweepOutcomeRecord {
+        story_points: None,
         repo: Some("rjwalters/loom".to_string()),
         repo_unresolved: false,
         visibility: RepoVisibility::Public,
@@ -242,6 +245,7 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
     // sampled, so all four must be entirely absent from the wire
     // payload — never `null` or a fabricated `0`.
     let record = SweepOutcomeRecord {
+        story_points: None,
         repo: Some("rjwalters/loom".to_string()),
         repo_unresolved: false,
         visibility: RepoVisibility::Private,
@@ -367,6 +371,7 @@ fn sweep_outcome_from_a_pre_5357_daemon_still_decodes() {
 #[test]
 fn sweep_outcome_round_trips_the_completeness_fields() {
     let record = SweepOutcomeRecord {
+        story_points: None,
         repo: Some("rjwalters/loom".to_string()),
         repo_unresolved: false,
         visibility: RepoVisibility::Public,
@@ -439,6 +444,7 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
     // (#8057's doctor-phase rate) would silently count the second as the
     // first.
     let base = SweepOutcomeRecord {
+        story_points: None,
         repo: Some("rjwalters/loom".to_string()),
         repo_unresolved: false,
         visibility: RepoVisibility::Private,
@@ -487,6 +493,9 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         "doctor_cycles",
         "judge_verdicts",
         "complexity",
+        // Issue #9432: an unsized issue carries NO `story_points` key — a `0`
+        // would claim the Curator sized it at nothing.
+        "story_points",
     ] {
         assert!(
             unobserved.get(field).is_none(),
@@ -545,6 +554,9 @@ fn sweep_outcome_from_a_pre_8056_daemon_still_decodes() {
             assert_eq!(r.doctor_cycles, None);
             assert_eq!(r.judge_verdicts, None);
             assert_eq!(r.complexity, None);
+            // Issue #9432: a pre-story-points record decodes with no size,
+            // which reads as "nobody sized this issue" — not as size 0.
+            assert_eq!(r.story_points, None);
         }
         other => panic!("expected SweepOutcome, got {other:?}"),
     }
@@ -1040,6 +1052,7 @@ fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
     // unresolved one omits `repo` entirely and stamps `repo_unresolved: true`
     // — the gap is counted, never papered over with a host path.
     let resolved = SweepOutcomeRecord {
+        story_points: None,
         repo: Some("rjwalters/loom".to_string()),
         repo_unresolved: false,
         visibility: RepoVisibility::Public,

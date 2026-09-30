@@ -258,10 +258,10 @@ usage() {
 }
 
 # --- Repo-relative `gh` targeting (#6179's convention: LOOM_REPO override) --
-gh_repo_args() {
-    if [[ -n "${LOOM_REPO:-}" ]]; then
-        printf -- '-R\n%s\n' "$LOOM_REPO"
-    fi
+# `gh api` has no -R flag (#9552), so the repo goes in the endpoint path.
+gh_repo_path() {
+    local placeholder='{owner}/{repo}'
+    printf '%s' "${LOOM_REPO:-$placeholder}"
 }
 
 # --- Opaque host id (Issue #6322, ported verbatim from sweep-lease-fence.sh
@@ -617,10 +617,8 @@ cmd_renew_once() {
         esac
     done
 
-    local -a repo_args=()
-    while IFS= read -r line; do
-        [[ -n "$line" ]] && repo_args+=("$line")
-    done < <(gh_repo_args)
+    local repo_path
+    repo_path="$(gh_repo_path)"
 
     local exact=""
     if [[ -n "$host" && -n "$sweep_id" ]]; then
@@ -639,7 +637,7 @@ cmd_renew_once() {
     # eventual SUCCESS, and merging those into $comments_json would corrupt
     # the JSON this function is about to parse.
     local comments_json
-    if ! comments_json="$(forge_gh_perm_safe api "${repo_args[@]+"${repo_args[@]}"}" "repos/{owner}/{repo}/issues/${issue}/comments" --paginate)"; then
+    if ! comments_json="$(forge_gh_perm_safe api "repos/${repo_path}/issues/${issue}/comments" --paginate)"; then
         echo "ERROR: 'gh api .../issues/${issue}/comments --paginate' failed (escalation ladder exhausted)" >&2
         exit 1
     fi
@@ -712,7 +710,7 @@ cmd_renew_once() {
     local patch_body_file
     patch_body_file="$(mktemp)"
     printf '%s' "$new_body" > "$patch_body_file"
-    if ! forge_gh_perm_safe api "${repo_args[@]+"${repo_args[@]}"}" --method PATCH "repos/{owner}/{repo}/issues/comments/${candidate_id}" \
+    if ! forge_gh_perm_safe api --method PATCH "repos/${repo_path}/issues/comments/${candidate_id}" \
         -F "body=@${patch_body_file}" \
         > /dev/null; then
         rm -f "$patch_body_file"

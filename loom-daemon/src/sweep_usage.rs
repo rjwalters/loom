@@ -202,21 +202,40 @@ pub fn resolve(
         return SweepUsage::unattributable(REASON_NO_WINDOW);
     }
 
-    let tokens_by_model =
-        crate::usage_source::sweep_tokens_by_model(usage_runtime, workspace_root, issue, window)
-            .filter(|rows| !rows.is_empty());
+    // Issue #9454: attribution is PER RECORD, not per file. The file-level
+    // readers (`sweep_tokens_by_model` and friends) prefilter by the
+    // transcript's **mtime** and then attribute the file WHOLE — so a
+    // long-lived session whose last write landed inside this sweep's window
+    // folded its entire history into this sweep (the #8440-study evidence:
+    // 136.8M tokens reported by a 292-second judge-only sweep that had merely
+    // read last). Keying each usage record on its own timestamp means a
+    // session that predates the sweep contributes only the records it wrote
+    // during the window — which are this sweep's spend by definition.
+    //
+    // `sweep_tokens_by_window` with a single slice covering the whole window
+    // is exactly that per-record fold, on every runtime's reader. The
+    // non-Claude arms slice their whole-session stores per window (a session
+    // db row has no finer public grain), which is the store's own semantics —
+    // unchanged here. The Claude flat pair is now `flatten` of the per-record
+    // rows rather than `sum_sweep_tokens_split`'s whole-file fold: for a
+    // sweep whose transcripts contain only in-window records the two agree
+    // exactly, and where they disagree the per-record number is the honest
+    // one.
+    let slices: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
+        window.map(|w| vec![w]).unwrap_or_default();
+    let tokens_by_model = crate::usage_source::sweep_tokens_by_window(
+        usage_runtime,
+        workspace_root,
+        issue,
+        window,
+        &slices,
+    )
+    .into_iter()
+    .flatten()
+    .next()
+    .filter(|rows| !rows.is_empty());
 
-    // The Claude flat split stays the primary source for `tokens_in`/
-    // `tokens_out` so a Claude sweep's published pair is byte-identical to
-    // pre-#9440. It naturally yields `None` for a non-Claude runtime (there are
-    // no Claude transcripts for that sweep), and the per-model breakdown then
-    // supplies the same two axes — which is how an OpenCode/Codex/Pi sweep
-    // gains a flat pair it never had.
-    let projects_dir = crate::transcript_tokens::claude_projects_dir().filter(|dir| dir.is_dir());
-    let split = projects_dir.as_deref().and_then(|dir| {
-        crate::transcript_tokens::sum_sweep_tokens_split(dir, workspace_root, issue, window)
-    });
-    let (tokens_in, tokens_out) = match split.or_else(|| tokens_by_model.as_deref().map(flatten)) {
+    let (tokens_in, tokens_out) = match tokens_by_model.as_deref().map(flatten) {
         Some((tokens_in, tokens_out)) => (Some(tokens_in), Some(tokens_out)),
         None => (None, None),
     };
@@ -234,7 +253,9 @@ pub fn resolve(
             crate::usage_source::UsageSource::for_runtime(usage_runtime),
             crate::usage_source::UsageSource::ClaudeTranscripts
         );
-        let reason = if claude_arm && projects_dir.is_none() {
+        let store_exists =
+            crate::transcript_tokens::claude_projects_dir().is_some_and(|dir| dir.is_dir());
+        let reason = if claude_arm && !store_exists {
             REASON_NO_STORE
         } else {
             REASON_NO_TRANSCRIPT

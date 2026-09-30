@@ -325,6 +325,7 @@ mod tests {
         TelemetryEnvelope::new(
             host_id,
             TelemetryRecord::SweepOutcome(telemetry::SweepOutcomeRecord {
+                story_points: None,
                 repo: Some("rjwalters/loom".to_string()),
                 repo_unresolved: false,
                 visibility: telemetry::RepoVisibility::Public,
@@ -384,6 +385,7 @@ mod tests {
             output: 300,
         }];
         let outcome = telemetry::SweepOutcomeRecord {
+            story_points: None,
             repo: Some("rjwalters/loom".to_string()),
             repo_unresolved: false,
             visibility: telemetry::RepoVisibility::Public,
@@ -445,6 +447,7 @@ mod tests {
     fn synthesize_completed_omits_tokens_by_model_when_the_outcome_has_none() {
         // No attributable transcript ⇒ absent, never a fabricated empty vec.
         let outcome = telemetry::SweepOutcomeRecord {
+            story_points: None,
             repo: Some("rjwalters/loom".to_string()),
             repo_unresolved: false,
             visibility: telemetry::RepoVisibility::Public,

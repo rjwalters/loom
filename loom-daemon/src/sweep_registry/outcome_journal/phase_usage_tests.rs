@@ -27,8 +27,9 @@ fn stamped(id: &str, at: DateTime<Utc>, input: i64, output: i64) -> String {
     )
 }
 
-/// The same record with no `timestamp` — counted in the sweep totals,
-/// attributable to no phase.
+/// The same record with no `timestamp` — under #9454's per-record
+/// attribution an unplaceable record is unprovable and is dropped from the
+/// sweep totals entirely (it could be any age inside a long-lived file).
 fn unstamped(id: &str, input: i64, output: i64) -> String {
     format!(
         "{{\"type\":\"assistant\",\"message\":{{\"id\":\"{id}\",\
@@ -220,8 +221,10 @@ fn a_five_phase_lifecycle_emits_five_attributed_entries_that_sum_to_the_sweep_to
     );
     assert_eq!(
         (remainder.tokens_in, remainder.tokens_out),
-        (10, 6),
-        "the remainder is exactly the trailing (7,5) and clock-less (3,1) records"
+        (7, 5),
+        "the remainder is exactly the trailing (7,5) record — the clock-less \
+         (3,1) record is dropped outright (#9454: an unplaceable record is \
+         unprovable, and counting it was the misattribution bug)"
     );
 }
 
@@ -269,13 +272,16 @@ fn an_unmeasured_phase_omits_its_token_keys_and_its_share_lands_in_the_remainder
         vec![None, Some((100, 10)), None],
         "unmeasured phases carry no split at all"
     );
+    // The clock-less (3,1) record is dropped outright under #9454's
+    // per-record attribution: sweep totals exclude it, every attributed token
+    // lands in its phase, and the remainder — present because the totals are
+    // known — is an explicit zero (Σ phases + remainder == total).
     assert_eq!(
         record.tokens_unattributed,
         Some(telemetry::TokenTotals {
-            tokens_in: 3,
-            tokens_out: 1
-        }),
-        "the clock-less record is the whole remainder"
+            tokens_in: 0,
+            tokens_out: 0
+        })
     );
 
     // On the wire: absent keys, not zeros.
