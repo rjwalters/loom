@@ -421,6 +421,11 @@ pub mod forge {
             );
             return (0, 0);
         }
+        // #9548: this pass only exists to strip labels and comment; skip a
+        // root this installation may not write to.
+        if !crate::write_scope::gate_root(root, "quarantine reconciliation") {
+            return (0, 0);
+        }
         let issues = match list_blocked_issues(gh_bin, root) {
             Ok(v) => v,
             Err(e) => {

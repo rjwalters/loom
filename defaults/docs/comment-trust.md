@@ -73,3 +73,53 @@ gh api "repos/{owner}/{repo}/issues/$N/comments" --paginate \
 
 Anything other than an array of logins is ignored with a warning: a malformed
 value never widens trust.
+
+## Loom writes only to repos it manages
+
+The same principle, in the other direction: an installation that can work on
+any public repository must never act as a control plane on one it does not
+manage. GitHub lets any account comment on any public issue, so a write aimed
+at the wrong repository does not fail. Its label edits are refused, but its
+comments, markers included, land.
+
+The wrong repository comes from `gh`, not from any explicit choice. Without
+`--repo`, and for `{owner}/{repo}` and `gh repo view`, `gh` resolves the base
+repository from `GH_REPO`, then a `gh repo set-default` pin, then the remotes
+ranked **`upstream` > `github` > `origin`**. A fork checkout therefore reads
+and writes the upstream project.
+
+A comment, label edit, merge or lease write to `OWNER/REPO` is allowed only
+when all three hold:
+
+1. **Resolved from the checkout, the target is its `origin`.** A checkout
+   that `gh` resolves elsewhere is refused, not redirected, because its reads
+   go there too. If `origin` is the repository Loom manages, pin it:
+   `gh repo set-default OWNER/REPO`.
+2. **The repository is managed:** the `origin` of a workspace in this
+   daemon's registry, or of the Loom-installed checkout the call runs in.
+3. **The credential has WRITE.** A user token needs `push`, `maintain` or
+   `admin`; an App installation token needs the repository in its
+   installation. Probed once per repository per hour
+   (`LOOM_WRITE_SCOPE_TTL_SECS`). On Gitea only rules 1 and 2 apply.
+
+Anything unverifiable is a refusal. Reads are never gated.
+
+- **Daemon:** `loom-daemon/src/write_scope.rs`. Claim reconciliation,
+  quarantine reconciliation, star liveness and dispatch skip a refused
+  workspace, logging the reason once. Explicit-target writes (roster
+  heartbeat, dependency classification, `notify-cleared-blockers`) check the
+  named repository. The structural test
+  `write_scope::tests::daemon_write_paths_are_scoped` fails when a new daemon
+  file writes to the forge without being reviewed into its list.
+- **Shell:** `loom-daemon forge may-write [--repo OWNER/REPO]` prints the
+  repository to name on the write (exit 0) or the reason (exit 1).
+  `loom_write_repo` in `lib/forge-helpers.sh` wraps it, and `post-verdict.sh`,
+  `verdict-staleness-guard.sh --clear/--anchor`, `merge-pr.sh`, the
+  `forge-helpers.sh` comment, label, reopen, create and merge wrappers, and
+  the lease publish/renew scripts all use it, passing `--repo` or
+  `repos/OWNER/REPO` explicitly.
+- **Without the verb** (no `loom-daemon`, or an older one), the permission
+  check cannot run. The fallback allows a write only from a checkout whose
+  one remote is `origin`, only to `origin`, and only with `GH_REPO` unset or
+  equal, so it can never reach another project. A fork checkout therefore
+  cannot write at all until the daemon is rolled.

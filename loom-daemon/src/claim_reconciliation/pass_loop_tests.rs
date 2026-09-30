@@ -115,3 +115,28 @@ fn run_reconciliation_pass_over_roots_visits_every_root_when_never_suppressed() 
     assert!(gh_calls.contains("repo-a"), "root A should have been called; got: {gh_calls:?}");
     assert!(gh_calls.contains("repo-b"), "root B should have been called; got: {gh_calls:?}");
 }
+
+/// #9548: a root this installation may not write to gets no pass at all —
+/// not the listing reads that feed the writes, and never a write — while the
+/// loop still counts it as visited.
+#[test]
+fn a_root_outside_the_write_scope_is_skipped_without_a_forge_call() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("fork-checkout");
+    std::fs::create_dir_all(&root).unwrap();
+    let gh_log = dir.path().join("gh-invocations.log");
+    let fake_gh = write_fake_gh_logging_cwd(dir.path(), &gh_log);
+
+    crate::write_scope::test_override::deny(Some("gh resolves this checkout to upstream"));
+    let stats = run_reconciliation_pass_over_roots(&[root], &fake_gh, false, || false);
+    crate::write_scope::test_override::deny(None);
+
+    assert_eq!(stats.roots_processed, 1);
+    assert_eq!(stats.total_checked + stats.total_pr_checked, 0);
+    assert!(
+        std::fs::read_to_string(&gh_log)
+            .unwrap_or_default()
+            .is_empty(),
+        "no gh invocation for a refused root"
+    );
+}

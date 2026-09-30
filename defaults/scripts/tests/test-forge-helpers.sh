@@ -42,6 +42,11 @@ echo "Testing _extract_host..."
 
 # Need to source the library
 source "$HELPERS_DIR/lib/forge-helpers.sh"
+# #9548: the write wrappers vet their repo first; that decision is not what
+# this suite tests (test-write-scope.sh does), so fixture repos are allowed.
+WS_STUB_DIR=$(mktemp -d)
+source "$SCRIPT_DIR/lib/write-scope-stub.sh"
+write_scope_allow_all "$WS_STUB_DIR"
 
 # Reset state for testing
 FORGE_TYPE=""

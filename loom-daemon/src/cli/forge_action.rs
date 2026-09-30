@@ -234,6 +234,21 @@ pub(crate) enum ForgeAction {
         self_login: Option<String>,
     },
 
+    /// `forge may-write [--repo OWNER/REPO]` (#9548) — may this installation
+    /// write (comment, label, merge, lease) to the repository? Yes only when
+    /// it is managed here (origin of a registered workspace or of this Loom
+    /// checkout) and this process's credential has WRITE (cached probe). With
+    /// no `--repo`, the target is what `gh` resolves from the checkout, which
+    /// must be its `origin` (gh prefers an `upstream` remote). Prints the
+    /// OWNER/REPO to name on the write and exits 0; exits 1 with the reason on
+    /// stderr. See `.loom/docs/comment-trust.md`.
+    #[command(name = "may-write")]
+    MayWrite {
+        /// Repository to vet (default: this checkout's gh target).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
     /// `forge identities [--json]` (#9537) — the resolved roster (writer,
     /// readers, legacy logins) and, per reader, each published token's owner
     /// and expiry.
@@ -258,6 +273,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         } => return super::forge_identity_cmd::token(&repo, &access, force),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
+        ForgeAction::MayWrite { repo } => return super::forge_identity_cmd::may_write(repo),
         ForgeAction::TrustedComments { self_login } => {
             return super::forge_identity_cmd::trusted_comments(self_login)
         }

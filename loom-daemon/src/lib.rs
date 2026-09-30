@@ -336,6 +336,7 @@ pub mod worktree_ops;
 pub mod worktree_reaper;
 pub mod worktree_root;
 pub mod worktree_state;
+pub mod write_scope;
 
 use std::collections::HashSet;
 use std::fs;

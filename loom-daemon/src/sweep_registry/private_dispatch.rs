@@ -26,6 +26,15 @@ pub(crate) fn prepare(
     if config.skip_label_flip {
         return Ok(None);
     }
+    // #9548: IPC and scheduled dispatch both pass here. A sweep claims,
+    // leases and comments on the workspace's repo; refuse one this
+    // installation may not write to (the claim flip failing does not stop a
+    // dispatch on its own).
+    if let crate::write_scope::Verdict::Deny(why) =
+        crate::write_scope::root_writable(&config.workspace_root)
+    {
+        anyhow::bail!("dispatch refused (#9548): {why}");
+    }
     let issue = match kind {
         SweepKind::Issue(n) => Some(u64::from(*n)),
         SweepKind::PrSet(_) => None,

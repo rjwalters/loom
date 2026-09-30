@@ -282,6 +282,10 @@ chmod +x "$STUB_DIR/github-app-token.sh"
 
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# #9548: lease writes vet their repo first; that decision is not what this
+# suite tests (test-write-scope.sh does), so fixture repos are allowed.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/write-scope-stub.sh"
+write_scope_allow_all "$STUB_DIR"
 export LOOM_GITHUB_APP_SCRIPT="$STUB_DIR/github-app-token.sh"
 
 reset_state() {

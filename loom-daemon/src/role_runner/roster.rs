@@ -241,6 +241,12 @@ fn roster_heartbeat_once(
         chrono::Utc::now(),
         ttl_secs,
     );
+    // #9548: the roster issue is configured, not resolved; it must still be a
+    // repository this installation manages and can write to.
+    let roster_repo = format!("{}/{}", issue.owner, issue.repo);
+    if !crate::write_scope::gate_repo(fallback_root, &roster_repo, "roster heartbeat") {
+        return;
+    }
     let ok = match action {
         crate::role_shard::roster::RosterPublish::Patch { id } => {
             patch_roster_comment(gh, fallback_root, &issue.owner, &issue.repo, id, &body)

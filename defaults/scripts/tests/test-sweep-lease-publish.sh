@@ -231,6 +231,10 @@ chmod +x "$STUB_DIR/gh"
 
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# #9548: lease writes vet their repo first; that decision is not what this
+# suite tests (test-write-scope.sh does), so fixture repos are allowed.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/write-scope-stub.sh"
+write_scope_allow_all "$STUB_DIR"
 # Deterministic identity + clock for every case below.
 export LOOM_HOST_ID="studio-host"
 # Issue #6322/#6333: by default (no LOOM_LEASE_PUBLISH_HOSTNAME opt-in), the

@@ -590,6 +590,14 @@ fn format_held_for(held: chrono::Duration) -> String {
 ///
 /// Fail-open: without safehouse coordination `peer_pool_hold` is always
 /// `(false, [])` and every line below collapses to the pre-#8001 behaviour.
+///
+/// # The write-scope hold (Issue #9548)
+///
+/// A root this installation may not write to
+/// ([`crate::write_scope::gate_root`]) is held too, and yields no probe.
+/// Dispatch continues past a failed claim-label flip, so without this a root
+/// whose `gh` target is an `upstream` it cannot label still got sweeps, and
+/// their comments landed there.
 pub fn preflight_held_per_root(
     workspaces: &WorkspacePool,
     roots: &[PathBuf],
@@ -605,7 +613,8 @@ pub fn preflight_held_per_root(
             let mut registry = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let pool_held = fold_peer_pool_hold(state, &registry, &observation);
+            let pool_held = fold_peer_pool_hold(state, &registry, &observation)
+                || !crate::write_scope::gate_root(root, "dispatch");
             match registry.preflight_dispatch_gate(now) {
                 PreflightDispatchGate::Open => pool_held,
                 PreflightDispatchGate::Held => true,

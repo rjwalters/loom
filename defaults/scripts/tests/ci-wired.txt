@@ -211,6 +211,7 @@ test-version-check-gate.sh
 test-warn-operator-gated.sh
 test-warn-out-of-set-deps.sh
 test-worktree-base-override.sh
+test-write-scope.sh
 test-worktree-forge-pr-check.sh
 test-worktree-hookspath.sh
 test-worktree-remote-branch-tracking.sh

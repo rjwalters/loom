@@ -571,8 +571,18 @@ fn run_probe(
     }
 }
 
+/// #9548: both writers below resolve the repo from `repo_root`'s remotes;
+/// refuse unless this installation may write there.
+fn require_write_scope(repo_root: &Path) -> Result<()> {
+    match crate::write_scope::root_writable(repo_root) {
+        crate::write_scope::Verdict::Allow(_) => Ok(()),
+        crate::write_scope::Verdict::Deny(why) => Err(anyhow!("write refused (#9548): {why}")),
+    }
+}
+
 /// `gh issue edit <N> --remove-label <remove> --add-label <add>`.
 pub fn edit_labels(repo_root: &Path, issue: u32, remove: &str, add: &str) -> Result<()> {
+    require_write_scope(repo_root)?;
     let out = gh_command(repo_root)
         .args([
             "issue",
@@ -596,6 +606,7 @@ pub fn edit_labels(repo_root: &Path, issue: u32, remove: &str, add: &str) -> Res
 
 /// `gh issue comment <N> --body <body>`.
 pub fn comment(repo_root: &Path, issue: u32, body: &str) -> Result<()> {
+    require_write_scope(repo_root)?;
     let out = gh_command(repo_root)
         .args(["issue", "comment", &issue.to_string(), "--body", body])
         .output()
