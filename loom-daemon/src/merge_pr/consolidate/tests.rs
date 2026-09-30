@@ -43,12 +43,6 @@ fn sequenced(mut c: ComponentState) -> ComponentState {
 const H1: &str = "a111111111111111111111111111111111111111";
 const H2: &str = "b222222222222222222222222222222222222222";
 
-/// The component with the `loom:sequenced` hold label on it.
-fn sequenced(mut c: ComponentState) -> ComponentState {
-    c.labels.push(SEQUENCE_LABEL.to_string());
-    c
-}
-
 fn clean_markers() -> std::collections::BTreeMap<u32, SequenceMarker> {
     std::collections::BTreeMap::new()
 }

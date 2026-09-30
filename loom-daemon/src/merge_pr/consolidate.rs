@@ -52,7 +52,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
-use crate::merge_pr::sequence::{html_comment_spans, release_marker_text, SequenceMarker};
+use crate::merge_pr::sequence::{
+    html_comment_spans, release_marker_text, SequenceMarker, MARKER_PREFIX,
+};
 
 /// The marker prefix identifying a candidate PR's consolidation mapping.
 pub const CONSOLIDATION_PREFIX: &str = "loom:consolidation";
@@ -726,6 +728,57 @@ pub fn reservation_marker(
 #[must_use]
 pub fn reservation_present(bodies: &[String], marker: &SequenceMarker) -> bool {
     bodies.iter().any(|b| b.contains(&marker_text_of(marker)))
+}
+
+/// The source PR's LIVE consolidation reservation, if any (ADR-0023 §4: the
+/// eligibility input for E6).
+///
+/// Two signals retire a reservation, and EITHER suffices — this is the
+/// #9689 review's "released reservations no longer read as live" fix:
+///
+/// 1. **The label is gone** (`loom:sequenced` absent from the live label
+///    set). The label is the gate; a marker beside a missing label is a
+///    transcript fossil, not a hold. This half also makes a caller that
+///    skips this function and hands `check_eligibility` the raw parsed
+///    marker get the same answer, because E6 requires the label too.
+/// 2. **A release comment for the SAME attempt appears after the
+///    reservation** in the transcript (`<!-- loom:sequence released
+///    plan=<attempt> -->`). A release for a *different* attempt retires
+///    only that attempt, and a reservation posted after a release is live
+///    again — the transcript is walked in order, newest event wins per
+///    attempt, and the newest still-live reservation is returned.
+#[must_use]
+pub fn live_marker(source: &ComponentState, bodies: &[String]) -> Option<SequenceMarker> {
+    if !source.has(SEQUENCE_LABEL) {
+        return None;
+    }
+    // Per-attempt state, walked oldest → newest: the newest reservation
+    // marker per attempt, and whether a later release retired it.
+    let mut live: Vec<(String, SequenceMarker)> = Vec::new();
+    for body in bodies {
+        // Release events first: `<!-- loom:sequence released plan=<id> -->`
+        // (the canonical renderer's exact output).
+        for line in body.lines() {
+            for span in html_comment_spans(line) {
+                let text = span.trim();
+                if let Some(rest) = text.strip_prefix(MARKER_PREFIX) {
+                    if let Some(plan) = rest.strip_prefix(" released plan=").map(str::trim) {
+                        live.retain(|(attempt, _)| attempt != plan);
+                    }
+                }
+            }
+        }
+        // Reservation events: the body's newest sequence marker with a
+        // `cons-` plan (the release comment itself never parses as a hold —
+        // pinned by a test).
+        if let Some(m) = crate::merge_pr::sequence::parse(std::slice::from_ref(body)) {
+            if m.plan.starts_with("cons-") {
+                live.retain(|(attempt, _)| attempt != &m.plan);
+                live.push((m.plan.clone(), m));
+            }
+        }
+    }
+    live.last().map(|(_, m)| m.clone())
 }
 
 fn marker_text_of(marker: &SequenceMarker) -> String {
