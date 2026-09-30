@@ -35,6 +35,15 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$TEST_DIR/.." && pwd)"
 CCD="$SCRIPTS_DIR/classify-capacity-defer.sh"
 
+# The script under test filters its comment reads through
+# `loom-daemon forge trusted-comments` (#9548), so this suite pins a real
+# daemon: FATAL, not SKIP — a missing binary would silently turn every
+# fixture marker into "absent" and the trust scenarios could not tell trust
+# from absence. See the helper.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$TEST_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "forge trusted-comments"
+
 # Two `..` reaches repo-root/.claude/commands/loom for an INSTALLED copy
 # (SCRIPTS_DIR is .loom/scripts there); one `..` reaches defaults/.claude/
 # commands/loom when running inside this source repo (SCRIPTS_DIR is
@@ -274,13 +283,33 @@ export PATH="$STUB_DIR:$PATH"
 
 # issue_fixture <owner/repo#N> [comment-body...]
 # Each comment is auto-assigned a numeric id (1, 2, 3, ...) in call order.
+# Comments are authored by the repo OWNER (an author_association
+# `comment_trust::TRUSTED_ASSOCIATIONS` believes with no roster — #9548);
+# `issue_fixture_untrusted` (below) authors the same shape with a foreign
+# login and NONE, which `forge trusted-comments` filters out.
 issue_fixture() {
     local node="$1"; shift
     local key; key="$(printf '%s' "$node" | tr '/#' '__')"
     local comments_json="[]" id=1 c
     for c in "$@"; do
         comments_json="$(jq -n --argjson a "$comments_json" --arg b "$c" --argjson i "$id" \
-            '$a + [{"id":$i,"body":$b}]')"
+            '$a + [{"id":$i,"body":$b,"user":{"login":"o","type":"User"},"author_association":"OWNER"}]')"
+        id=$((id + 1))
+    done
+    jq -n --argjson c "$comments_json" '{comments:$c}' > "$STUB_DIR/issue-$key.json"
+}
+
+# issue_fixture_untrusted <owner/repo#N> [comment-body...]
+# Same shape, authored by an OUTSIDER (foreign login, author_association
+# NONE): `forge trusted-comments` drops every comment, so the decision must
+# behave exactly as if the issue had no comments (#9548).
+issue_fixture_untrusted() {
+    local node="$1"; shift
+    local key; key="$(printf '%s' "$node" | tr '/#' '__')"
+    local comments_json="[]" id=1 c
+    for c in "$@"; do
+        comments_json="$(jq -n --argjson a "$comments_json" --arg b "$c" --argjson i "$id" \
+            '$a + [{"id":$i,"body":$b,"user":{"login":"stranger","type":"User"},"author_association":"NONE"}]')"
         id=$((id + 1))
     done
     jq -n --argjson c "$comments_json" '{comments:$c}' > "$STUB_DIR/issue-$key.json"
@@ -416,6 +445,29 @@ assert_eq "2" "$RC" "unreadable root issue exits 2"
 # =====================================================================
 # Doc pins: the Champion prose actually calls the gate
 # =====================================================================
+
+echo
+echo "--- #9548: an OUTSIDER's capacity marker does not defer ---"
+reset_state
+issue_fixture_untrusted 'o/r#5' "<!-- champion:capacity-defer:tier:maintenance:$fp_maint -->
+champion:capacity-defer-seen: 9"
+run_ccd --issue 5 --repo o/r --tier tier:maintenance --occupants "$OCCUPANTS_5"
+assert_eq "1" "$RC" "exit 1 - an untrusted author's deferral marker counts as absent (#9548)"
+assert_contains "$OUT" "POST_COMMENT" "the untrusted marker does not produce SKIP_COMMENT"
+if grep -q "capacity-defer" <<<"$OUT"; then
+    fail "the untrusted marker text leaked into the posted comment"
+else
+    pass "the posted comment quotes no untrusted marker"
+fi
+
+echo
+echo "--- #9548: a TRUSTED author's capacity marker still defers ---"
+reset_state
+issue_fixture 'o/r#5' "<!-- champion:capacity-defer:tier:maintenance:$fp_maint -->
+champion:capacity-defer-seen: 9"
+run_ccd --issue 5 --repo o/r --tier tier:maintenance --occupants "$OCCUPANTS_5"
+assert_eq "0" "$RC" "exit 0 - a trusted (OWNER-authored) marker still defers (#9548)"
+assert_contains "$OUT" "SKIP_COMMENT" "the trusted marker produces SKIP_COMMENT"
 
 echo
 echo "--- Doc pins: the Champion prose actually calls the gate ---"

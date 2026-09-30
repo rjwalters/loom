@@ -220,18 +220,31 @@ _resolve_repo() {
 # Forge reads / writes
 # =====================================================================
 
-# _get_comments -- emits a JSON array of {"id":.., "body":..} objects
-# (REST shape). With --comments-file, reads that file verbatim (tests supply
-# it already in this shape). Otherwise: GraphQL via $GH_READ for the common
-# (read-only, decision) path -- `id` is a GraphQL node id there, which is
-# fine because the decision only ever inspects `.body`; the numeric id is
-# fetched separately, uncached, ONLY when --apply needs to PATCH.
+# _get_comments -- emits a JSON array of TRUSTED-authored comment objects
+# (#9548: a capacity-deferral marker is a control phrase -- it defers fleet
+# work -- so it counts only from a trusted author; an unauthenticated or
+# untrusted marker counts as ABSENT, never as a deferral, which is the safe
+# direction: the worst case is one un-deferred sweep, not attacker-driven
+# deferral). With --comments-file, reads that file (fixtures carry a trusted
+# author: user.login + author_association). Otherwise: GraphQL via $GH_READ
+# for the common (read-only, decision) path -- `id` is a GraphQL node id
+# there, which is fine because the decision only ever inspects `.body`; the
+# numeric id is fetched separately, uncached, ONLY when --apply needs to
+# PATCH. Both paths then filter through `loom-daemon forge trusted-comments`;
+# a listing the filter cannot authenticate yields nothing (stderr says so).
 _get_comments() {
+    local raw filtered
     if [[ -n "$COMMENTS_FILE" ]]; then
-        cat "$COMMENTS_FILE"
-        return 0
+        raw="$(cat "$COMMENTS_FILE")"
+    else
+        raw="$("$GH_READ" issue view "$ISSUE" --repo "$REPO_NWO" --json comments --jq '.comments' 2>/dev/null)"
     fi
-    "$GH_READ" issue view "$ISSUE" --repo "$REPO_NWO" --json comments --jq '.comments' 2>/dev/null
+    [[ -n "$raw" ]] || return 0
+    filtered="$(printf '%s\n' "$raw" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments 2>/dev/null)" || {
+        echo "capacity-defer: could not authenticate comment authors ('loom-daemon forge trusted-comments' failed); treating markers as absent (#9548)" >&2
+        return 0
+    }
+    printf '%s\n' "$filtered"
 }
 
 # _patch_streak <fingerprint> -- finds the numeric REST id of the latest
