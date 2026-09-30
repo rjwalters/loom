@@ -277,12 +277,24 @@ echo "Testing the merge-pr floor covers every fail-closed sub-subcommand (#8967)
 #   classify-response  97609b86f (#9228, squash)          0.19.455 -> 0.19.456
 #   partial-conflict   2ab7630c5 (merge of #9246)          0.19.463 -> 0.19.464
 #   checks-failure     397f06feb (merge of #9272)          0.19.464 -> 0.19.465
+#
+# A row for a verb landing in THIS commit can only name a version that already
+# exists: the assertion above requires the declared marker to be <= this
+# repo's VERSION, and the release carrying the verb is bumped AFTER the merge.
+# So a just-added `closed` verb is declared at the VERSION its own branch was
+# cut from, which UNDERSTATES its first release by however many merges land
+# between the two. The understatement is in the safe direction for the operator
+# the floor exists to help -- a host below the declared floor is told to roll,
+# which is correct -- and the residual window is hosts within a patch or two
+# above it, which is the same granularity every row here already carries.
+#   check-runs-rollup  this commit's own branch point            0.19.585
 MERGE_PR_VERB_TABLE="verdict-contradiction closed 0.19.172
 stale-checks closed 0.19.221
 loom-pr-guard closed 0.19.375
 classify-response closed 0.19.456
 partial-conflict closed 0.19.464
 checks-failure closed 0.19.465
+check-runs-rollup closed 0.19.585
 head-sync-retry open -
 hold-state open -
 redate-checks open -
@@ -332,7 +344,7 @@ CALLED_VERBS="$(grep -o 'loom-daemon}" merge-pr [a-z][a-z0-9-]*' "$MERGE_PR_SRC"
 # If the invocation idiom is ever refactored, the scan above could come back
 # empty and every assertion below would vacuously pass. Pin the three verbs
 # that are fail-closed TODAY so that refactor fails loudly instead.
-for _known in verdict-contradiction stale-checks loom-pr-guard classify-response partial-conflict checks-failure; do
+for _known in verdict-contradiction stale-checks loom-pr-guard classify-response partial-conflict checks-failure check-runs-rollup; do
     assert_contains "$CALLED_VERBS" "$_known" \
       "the invocation scan still finds 'merge-pr $_known' in merge-pr.sh"
 done

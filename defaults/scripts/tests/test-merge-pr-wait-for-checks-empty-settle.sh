@@ -170,6 +170,42 @@ forge_get_pr_nocache() { echo '{"merged": false}'; }
 # required-context lookup lives in the daemon subcommand as of #9091 ---
 forge_get_required_status_check_contexts() { echo ""; }
 
+# --- The check-runs-rollup arm every stub in this file shares ---
+#
+# Since the #8191 slice, EVERY poll of the function under test delegates the
+# rollup PARSE to `loom-daemon merge-pr check-runs-rollup` before it can reach
+# the zero-row branch these scenarios are about. This suite is CI-wired, which
+# in this repo means hermetic — no built loom-daemon (a suite that needs one
+# belongs in ci-excluded.txt) — so the stubs answer that verb themselves.
+#
+# WHICH IMPLEMENTATION THIS MODELS (verification-recipes.md §6): the RETIRED jq
+# filters, verbatim, wrapped in the port's output protocol. It is a harness
+# shim, not a second implementation to keep in sync — what proves the real
+# subcommand agrees with these filters is
+# loom-daemon/tests/merge_pr_check_runs_rollup_differential.rs. Do NOT "update"
+# it to match a future port; if the protocol changes, the scenarios below break
+# loudly, which is the intent.
+ROLLUP_ARM="$STATE_DIR/rollup-arm.sh"
+cat > "$ROLLUP_ARM" <<'ARM'
+# _stub_check_runs_rollup: reads the payload on stdin, prints the port's
+# sentinel-led header plus one record per name.
+_stub_check_runs_rollup() {
+    local raw failing pending total f_any=0 p_any=0 name
+    raw="$(cat)"
+    failing="$(jq -r '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled" or .conclusion == "action_required") | .name] | unique | .[]' <<<"$raw" 2>/dev/null || true)"
+    pending="$(jq -r '[.check_runs[] | select(.status != "completed") | .name] | unique | .[]' <<<"$raw" 2>/dev/null || true)"
+    total="$(jq -r '.total_count // 0' <<<"$raw" 2>/dev/null || echo 0)"
+    [[ "$total" =~ ^[0-9]+$ ]] || total=0
+    [[ -z "$failing" ]] || f_any=1
+    [[ -z "$pending" ]] || p_any=1
+    printf 'LOOM-CHECK-RUNS-ROLLUP\t%s\t%s\t%s\t%s\n' \
+      "$total" "$f_any" "$p_any" "$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
+    if [[ -n "$failing" ]]; then while IFS= read -r name; do printf 'FAILING\t%s\n' "$name"; done <<<"$failing"; fi
+    if [[ -n "$pending" ]]; then while IFS= read -r name; do printf 'PENDING\t%s\n' "$name"; done <<<"$pending"; fi
+}
+ARM
+export ROLLUP_ARM
+
 # --- Stub the loom-daemon binary the zero-row branch shells out to ---
 # A real binary is deliberately NOT used here: these scenarios are about the
 # WIRING (is the subcommand consulted, with what, and is its verdict obeyed),
@@ -181,6 +217,11 @@ forge_get_required_status_check_contexts() { echo ""; }
 # the DEADLINE-ONLY policy -- WAIT until the caller's own --deadline has passed,
 # then TIMEOUT. That default is #6169's pre-#9091 behaviour, which keeps
 # scenarios (a) and (b) measuring exactly what they measured before.
+#
+# `check-runs-rollup` is answered BEFORE $ZCS_ARGV is appended: it is a
+# different verb on every poll, and counting it would make zcs_call_count()
+# measure polls rather than zero-row delegations -- which is precisely what
+# scenario (i) asserts is zero.
 DAEMON_STUB="$STATE_DIR/loom-daemon"
 ZCS_ARGV="$STATE_DIR/zcs-argv"        # one line per invocation
 ZCS_QUEUE="$STATE_DIR/zcs-queue"      # canned decision lines, consumed in order
@@ -188,6 +229,9 @@ ZCS_REQUIRED_FILE="$STATE_DIR/zcs-required"   # token the default policy echoes
 cat > "$DAEMON_STUB" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
+# shellcheck disable=SC1090
+source "$ROLLUP_ARM"
+[[ "${1:-}" == "merge-pr" && "${2:-}" == "check-runs-rollup" ]] && { _stub_check_runs_rollup; exit 0; }
 printf '%s\n' "$*" >> "$ZCS_ARGV"
 # Anything but the expected verb is an old/wrong binary: exit non-zero with no
 # sentinel, which is what the caller's fail-closed fallback keys on.
@@ -403,25 +447,51 @@ assert_eq "1
 assert_contains "$WARN_LOG" "remained empty" \
   "(g) A TIMEOUT verdict narrates through warning(), not info() -- nothing was ever confirmed"
 
-# (h) Fail closed when the subcommand cannot be run at all, or answers with
-# something that is not a decision: the bounded settle is unavailable, so
+# (h) Fail closed when THE ZERO-ROW SETTLE VERB cannot be answered, or answers
+# with something that is not a decision: the bounded settle is unavailable, so
 # #6169's FULL deadline-bounded wait applies. The one thing this must never
 # degrade into is settling on a single empty read -- that IS #6169. Two shapes
-# are checked, because they fail differently: a missing/old binary exits
-# non-zero (the easy case), while garbage on stdout with a ZERO exit is the
-# shape a naive caller would accept as a verdict.
+# are checked, because they fail differently: a binary that predates the verb
+# exits non-zero (the easy case), while garbage on stdout with a ZERO exit is
+# the shape a naive caller would accept as a verdict.
 #
-# A "garbage, exit 0" stub lives in its own file so $DAEMON_STUB stays intact
-# for the scenarios after this one.
+# Both stubs answer `check-runs-rollup` (via $ROLLUP_ARM) and fail only on
+# `zero-checks-settle`, which is what makes this scenario still be ABOUT the
+# zero-row delegation. Before the #8191 slice the first shape was a wholly
+# missing binary; that shape now stops the poll one step earlier, at the rollup
+# parse, and is covered by scenario (j) below -- so it moved there rather than
+# being dropped. `zero-checks-settle` shipped BEFORE `check-runs-rollup`, so
+# "has the rollup verb but not the settle verb" is not a real release; it is the
+# isolation this scenario needs to keep measuring one verb at a time, and the
+# junk shape below is realistic for either verb on its own.
+#
+# Both live in their own files so $DAEMON_STUB stays intact for the scenarios
+# after this one.
+NO_ZCS_STUB="$STATE_DIR/loom-daemon-predates-zero-checks-settle"
+cat > "$NO_ZCS_STUB" <<'NOZCS'
+#!/usr/bin/env bash
+set -uo pipefail
+# shellcheck disable=SC1090
+source "$ROLLUP_ARM"
+[[ "${1:-}" == "merge-pr" && "${2:-}" == "check-runs-rollup" ]] && { _stub_check_runs_rollup; exit 0; }
+echo "error: unrecognized subcommand 'zero-checks-settle'" >&2
+exit 2
+NOZCS
+chmod +x "$NO_ZCS_STUB"
+
 JUNK_STUB="$STATE_DIR/loom-daemon-junk"
 cat > "$JUNK_STUB" <<'JUNK'
 #!/usr/bin/env bash
+set -uo pipefail
+# shellcheck disable=SC1090
+source "$ROLLUP_ARM"
+[[ "${1:-}" == "merge-pr" && "${2:-}" == "check-runs-rollup" ]] && { _stub_check_runs_rollup; exit 0; }
 echo "hello, this is not a decision"
 exit 0
 JUNK
 chmod +x "$JUNK_STUB"
 
-for bad_bin in "$STATE_DIR/does-not-exist" "$JUNK_STUB"; do
+for bad_bin in "$NO_ZCS_STUB" "$JUNK_STUB"; do
     reset_test_state
     LOOM_DAEMON_BIN="$bad_bin"
     LOOM_AUTO_MERGE_TIMEOUT=4
@@ -453,6 +523,48 @@ _wait_for_checks_then_sync_merge
 rc=$?
 assert_eq "0" "$rc" "(i) Function returns 0 for the ordinary pending-then-settled path"
 assert_eq "0" "$(zcs_call_count)" "(i) The subcommand is never consulted when the rollup is non-empty"
+
+# (j) The shape scenario (h) used to carry as "does-not-exist": a binary that
+# cannot answer the ROLLUP PARSE at all, which since the #8191 slice stops the
+# poll one step before the zero-row branch. The rollup fed in is ALL-GREEN --
+# the one payload that would otherwise return 0 immediately and merge -- so
+# this measures the only thing that matters about a parse fault: it must never
+# be read as settlement. It re-polls to the deadline and then exits 5 (the
+# #8896 re-queue signal the sibling unfetchable-rollup arm already uses),
+# rather than proceeding on check names nobody classified.
+#
+# #6169's own guarantee is strengthened rather than weakened here: before the
+# slice, an unusable daemon fell back to the full wait and then MERGED on a
+# zero-row read; now it cannot merge at all.
+#
+# Run inside a command substitution (a subshell) because the function `exit`s
+# rather than returning -- the narration is read back off stdout via locally
+# redefined info/warning shims, since this shell's INFO_LOG/WARN_LOG cannot
+# survive the subshell.
+reset_test_state
+LOOM_DAEMON_BIN="$STATE_DIR/does-not-exist"
+LOOM_AUTO_MERGE_TIMEOUT=4
+LOOM_AUTO_MERGE_POLL_INTERVAL=1
+queue_fgcr_response "$ONE_SUCCESS_ROLLUP"
+j_out="$(
+    info()    { echo "INFO: $*"; }
+    warning() { echo "WARN: $*"; }
+    _wait_for_checks_then_sync_merge 2>&1
+)"
+j_rc=$?
+j_calls="$(fgcr_call_count)"
+assert_eq "5" "$j_rc" \
+  "(j) An unanswerable rollup parse exits 5 (re-queue), never 0 -- an ALL-GREEN rollup it could not classify is not settlement"
+assert_contains "$j_out" "check-runs rollup parse (#8191 slice) did not run" \
+  "(j) Says out loud, on every degraded poll, that the parse could not be delegated"
+assert_contains "$j_out" "never authorize a merge on unclassified checks" \
+  "(j) ...and names the fail direction, so the narration cannot be mistaken for a transient blip"
+assert_contains "$j_out" "exiting 5 (not merged, not a failure: re-queue)" \
+  "(j) The terminal (deadline-reached) poll narrates the re-queue signal it is about to exit with"
+assert_eq "true" "$([[ $j_calls -gt 1 ]] && echo true || echo false)" \
+  "(j) Polled MORE THAN ONCE (call count=$j_calls) -- a parse fault costs time before it gives up, it does not bail on the first read"
+assert_eq "0" "$(zcs_call_count)" \
+  "(j) The zero-row delegation is never reached: the parse gates it, so a rollup-parse fault cannot be answered by the settle verb's fallback"
 
 echo ""
 echo "=== Test Summary ==="

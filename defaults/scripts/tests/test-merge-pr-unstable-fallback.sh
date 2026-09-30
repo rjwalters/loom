@@ -43,11 +43,25 @@ HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW_LABEL='\033[1;33m'
 NC='\033[0m'
 
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
+
+# An assertion that CANNOT survive a port, retired under the three-part test in
+# defaults/docs/verification-recipes.md §6 (the convention #8184 introduced).
+# Printed, not deleted: a reader must be able to see what was removed, why it
+# can never be true again, and what proves the property now. Counted as run so
+# the totals stay honest.
+retired() { # <what> <property> <why-structural> <successor>
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${YELLOW_LABEL}RETIRED${NC}: $1"
+    echo "      property:   $2"
+    echo "      structural: $3"
+    echo "      successor:  $4"
+}
 
 assert_eq() {
     local expected="$1"
@@ -670,18 +684,37 @@ fi
 # The UNSTABLE-fallback poll in merge-pr.sh derives two sets from the head-SHA
 # check-runs rollup: FAILING (terminal non-success conclusions) and PENDING
 # (status != "completed", i.e. queued/in_progress → conclusion still null).
-# These mirror the two jq filters used inside the poll body so the script stays
-# in lockstep with the test. The #3664 bug was that a rollup that is UNSTABLE
-# *solely* because required checks are still running has an empty FAILING set,
-# so the pre-#3664 code hit the "unknown gap" hard-error instead of waiting.
+# The #3664 bug was that a rollup that is UNSTABLE *solely* because required
+# checks are still running has an empty FAILING set, so the pre-#3664 code hit
+# the "unknown gap" hard-error instead of waiting.
+#
 echo ""
 echo "Testing pending-vs-failing check-run classification (#3664)..."
 
-# Mirror merge-pr.sh's _UNSTABLE_FAILING filter.
+# WHICH IMPLEMENTATION THESE TWO MODEL (verification-recipes.md §6: "if the test
+# needs its own copy of the parser, say explicitly which side it models, because
+# a maintainer who later syncs it to the wrong side silently deletes the check
+# while leaving it green"): they are the RETIRED jq filters, frozen. Since the
+# #8191 slice these are no longer in merge-pr.sh at all — the parse is
+# `loom-daemon merge-pr check-runs-rollup`
+# (loom-daemon/src/merge_pr/check_runs_rollup.rs) — and this suite is CI-wired,
+# which by this repo's rule means hermetic: no built loom-daemon is available
+# to it (a suite needing one belongs in ci-excluded.txt). So these stay jq, and
+# what keeps them honest against the port is NOT this file: it is
+# loom-daemon/tests/merge_pr_check_runs_rollup_differential.rs, which replays a
+# corpus through the real subcommand AND the same frozen filters (kept a second
+# time, deliberately, in loom-daemon/tests/fixtures/
+# merge-pr-check-runs-rollup-retired.sh) and requires byte-identical answers.
+#
+# Do NOT "update" these to match a future port. Their whole value is that they
+# are the pre-port answer; the differential is where the two sides meet.
+#
+# What the block below therefore still tests is the DECISION SHAPE
+# (_unstable_decision) over a known-correct pair of name sets — which is what
+# the #3664 bug was about — not the parse that produces them.
 _failing_names() {
     echo "$1" | jq -r '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled" or .conclusion == "action_required") | .name] | unique | .[]' 2>/dev/null || true
 }
-# Mirror merge-pr.sh's _UNSTABLE_PENDING filter.
 _pending_names() {
     echo "$1" | jq -r '[.check_runs[] | select(.status != "completed") | .name] | unique | .[]' 2>/dev/null || true
 }
@@ -858,16 +891,13 @@ assert_eq "5" "${LOOM_AUTO_MERGE_POLL_INTERVAL:-30}" "#3664: poll interval honor
 assert_eq "120" "${LOOM_AUTO_MERGE_TIMEOUT:-600}" "#3664: poll timeout honors a caller override"
 unset LOOM_AUTO_MERGE_POLL_INTERVAL LOOM_AUTO_MERGE_TIMEOUT 2>/dev/null || true
 
-# Assert the merge-pr.sh source actually contains the pending-set filter and the
-# poll-window env vars, so a refactor that drops them fails this test.
+# Assert the merge-pr.sh source actually contains the poll-window env vars, so a
+# refactor that drops them fails this test.
 MERGE_PR_SRC="$HELPERS_DIR/merge-pr.sh"
-if grep -q 'select(.status != "completed")' "$MERGE_PR_SRC"; then
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh computes the PENDING set (status != completed)"
-else
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing the PENDING-set filter"
-fi
+retired "the source grep asserting merge-pr.sh contains the PENDING-set jq filter, \`select(.status != \"completed\")\`" \
+  "The still-pending set must be a DENYLIST of exactly one status value, not an allowlist of the statuses known when it was written. A check-run whose status the forge invents later — or one carrying no status at all — has to count as pending, because the alternative is reading an unrecognised status as settled and merging a tree whose checks are still running." \
+  "The filter is gone from merge-pr.sh: the #8191 slice moved the whole rollup parse to \`loom-daemon merge-pr check-runs-rollup\` (loom-daemon/src/merge_pr/check_runs_rollup.rs), so there is no jq pipeline left in this file for a grep to find. Restoring one would not restore the property either — the shell no longer decides which checks are pending at all, it re-joins the records the subcommand emits. The construct the scan read does not exist rather than merely being guarded." \
+  "loom-daemon/src/merge_pr/check_runs_rollup/tests.rs::any_status_other_than_completed_is_pending, ::a_check_run_with_no_status_is_pending and ::a_non_string_status_is_pending_not_an_error assert the denylist directly; loom-daemon/tests/merge_pr_check_runs_rollup_differential.rs replays every status GitHub reports (plus \`waiting\`, \`pending\`, \`requested\` and a case-folded \`COMPLETED\`) through BOTH the real subcommand and the frozen retired filter (tests/fixtures/merge-pr-check-runs-rollup-retired.sh) and requires byte-identical answers. This suite cannot be the successor and does not claim to be: it is CI-wired, so it is hermetic and has no built loom-daemon — its own _failing_names/_pending_names are now labelled as frozen models of the RETIRED filter, kept for the #3664 decision-shape block below. Strictly stronger all the same: the grep checked that a line of jq was PRESENT; the tests above check which statuses the pending set actually CONTAINS, and the differential checks the port and the retired filter agree on every one of them."
 if grep -q 'LOOM_AUTO_MERGE_TIMEOUT' "$MERGE_PR_SRC" && grep -q 'LOOM_AUTO_MERGE_POLL_INTERVAL' "$MERGE_PR_SRC"; then
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "  ${GREEN}PASS${NC}: merge-pr.sh wires the LOOM_AUTO_MERGE_* poll-window env vars"
