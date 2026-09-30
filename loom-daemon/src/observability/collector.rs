@@ -952,6 +952,10 @@ async fn sample_snapshots(
     // ETA (Issue #9289): review listings, outcome checks and re-estimates,
     // after `stage_dwell` so the ETag-cached listings are warm.
     super::eta::record(workspace_root, workspace_pool, slug_cache).await;
+    // This host's live estimate set (Issue #9329) — native HTTPS only, and
+    // only when the set changed. After `eta::record` so it carries this
+    // pass's estimates rather than the previous pass's.
+    super::eta_snapshot::record().await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant

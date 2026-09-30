@@ -122,8 +122,10 @@ jobs:
               - 'loom-daemon/**'
               - 'loom-api/**'
               # The observability artifacts are Rust-tested seams, not inert
-              # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs
-              # and cycle_time_artifacts.rs all `include_str!` these files and
+              # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs,
+              # signoz_topology_shape.rs (the render + gateway allowlist the
+              # Service Map conclusion rests on) and cycle_time_artifacts.rs all
+              # `include_str!` these files and
               # fail on drift, and cycle_time_clickhouse.rs / signoz_usage_queries.rs
               # execute the SQL verbatim against a real ClickHouse. An artifact-only PR must
               # re-run those, or the only tests that can catch the regression
@@ -1668,6 +1670,14 @@ jobs:
         run: bash defaults/scripts/tests/test-per-worktree-target-dir.sh
       - name: merge-pr loom:pr review-signal guard (#7419, #8191 slice)
         run: bash defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh
+      # #9657 (#9548 slice): both suites pin the working-tree binary for the
+      # real `forge trusted-comments` filter, so they need this job's shared
+      # build; capacity-defer moved out of shell-suite-tests/ci-wired.txt for
+      # exactly that reason.
+      - name: merge-pr hold-state comment trust (#9657, #9548 slice)
+        run: bash defaults/scripts/tests/test-merge-pr-hold-state-trust.sh
+      - name: classify-capacity-defer comment trust (#9657, #9548 slice)
+        run: bash defaults/scripts/tests/test-classify-capacity-defer.sh
       - name: merge-pr PR-label fetch freshness (#8550)
         run: bash defaults/scripts/tests/test-merge-pr-label-freshness.sh
       - name: merge-pr stale required-checks guard (#8248, #8191 slice 3)
