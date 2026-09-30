@@ -358,6 +358,7 @@ mod tests {
 
     fn fixture_record() -> telemetry::SweepOutcomeRecord {
         telemetry::SweepOutcomeRecord {
+            story_points: None,
             repo: Some("rjwalters/loom".to_string()),
             repo_unresolved: false,
             visibility: telemetry::RepoVisibility::Private,

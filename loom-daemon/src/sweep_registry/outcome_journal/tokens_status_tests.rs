@@ -47,13 +47,17 @@ impl ClaudeStore {
             .projects
             .join(crate::transcript_tokens::project_slug(workspace));
         std::fs::create_dir_all(&dir).unwrap();
+        // #9454: per-record attribution keys on each record's timestamp, so
+        // the fixture stamps it now — inside every reconstructed window
+        // (window() ends at the resolve-time `now`, which is after seeding).
+        let iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let head = format!(
-            "{{\"type\":\"user\",\"message\":{{\"content\":\
+            "{{\"type\":\"user\",\"timestamp\":\"{iso}\",\"message\":{{\"content\":\
              \"<command-name>/loom:sweep</command-name>\\n\
              <command-args>{issue}</command-args>\"}}}}\n"
         );
         let usage = format!(
-            "{{\"type\":\"assistant\",\"message\":{{\"model\":\"claude-sonnet-5\",\
+            "{{\"type\":\"assistant\",\"timestamp\":\"{iso}\",\"message\":{{\"model\":\"claude-sonnet-5\",\
              \"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output},\
              \"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}}}\n"
         );

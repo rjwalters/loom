@@ -139,6 +139,15 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     if let Some(value) = record.doctor_cycles {
         attrs.push(kv_int("loom.doctor_cycles", i64::from(value)));
     }
+    // Issue #9432 (epic #9429): the Curator's a-priori size estimate, exported
+    // as a NUMERIC attribute so a backend can sum "story points landed per day"
+    // (#9433) and join estimate against the actuals already on this record
+    // (#9434) without leaving the telemetry store. Absent-not-zero: an unsized
+    // issue, a stacked points label set (logged loudly at resolution time) and
+    // an unread issue all omit the attribute entirely.
+    if let Some(value) = record.story_points {
+        attrs.push(kv_int("loom.story_points", i64::from(value)));
+    }
     if let Some(verdicts) = &record.judge_verdicts {
         if verdicts.len() <= MAX_GROUPS
             && verdicts

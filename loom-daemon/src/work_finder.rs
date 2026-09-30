@@ -229,6 +229,7 @@ pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP
 
 pub mod build_backoff;
 pub mod dispatch_plan;
+pub mod dispatch_plan_merge;
 mod labels;
 pub mod main_red_fix;
 pub mod operator_priority;

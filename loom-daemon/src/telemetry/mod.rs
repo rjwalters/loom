@@ -539,6 +539,23 @@ pub struct SweepStartedRecord {
     /// not name its runtime; never fabricated as `"claude"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// The Curator's story-point size estimate for this sweep's issue (Issue
+    /// #9432, epic #9429) — the numeric value of its single `points:*` label,
+    /// carried on the `sweep.global.dispatch` event from the label read the
+    /// dispatch path's own park-label guard already performs (**no** extra
+    /// forge round trip).
+    ///
+    /// Present here as well as on [`SweepOutcomeRecord::story_points`] so a
+    /// consumer can see the size of the work **in flight**, not only after it
+    /// terminates — queue-weight and capacity questions ("how many points are
+    /// being worked right now?") cannot wait for the outcome record.
+    ///
+    /// **Absent, never zero** — same contract as the outcome record's field: no
+    /// `points:*` label, an out-of-vocabulary one, more than one (logged
+    /// loudly, never guessed), a skipped/failed label read, or a `PrSet`
+    /// dispatch (which claims no issue) all omit the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u32>,
 }
 
 /// `sweep.phase` — a sweep advanced to a new lifecycle phase.
@@ -869,6 +886,29 @@ pub struct SweepOutcomeRecord {
     /// masquerading as data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complexity: Option<String>,
+    /// The Curator's story-point size estimate for this sweep's issue (Issue
+    /// #9432, epic #9429) — the numeric value of its single `points:*` label,
+    /// one of `1`/`2`/`3`/`5`/`8`/`13`.
+    ///
+    /// This is the *a priori* size axis that makes every actual this record
+    /// already carries (`tokens_in`/`tokens_out`, `lines_added`/`lines_deleted`,
+    /// `total_duration_sec`, `doctor_cycles`) joinable to an estimate without
+    /// leaving the telemetry store: "story points landed per day" (#9433) and
+    /// the estimate-vs-actual calibration loop (#9434) both read it from here.
+    ///
+    /// Resolved by [`crate::story_points::resolve_story_points`] from the label
+    /// list the terminal transition's `fetch_issue_signals` read already
+    /// carries — **no** extra forge round trip, the same single REST call that
+    /// sources [`complexity`](Self::complexity) and the disposition end state.
+    ///
+    /// **Absent, never zero.** The key is omitted when the issue carries no
+    /// `points:*` label (a pre-epic or operator-filed issue), when its single
+    /// points label is out of vocabulary, when it carries **more than one**
+    /// (logged loudly and never guessed at — see `story_points`' module doc),
+    /// or when the read failed/was skipped. A `0` would claim someone sized
+    /// this issue at nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u32>,
     /// Why this record's token counters read the way they do (Issue #9440) —
     /// see [`TokensStatus`]. Present on every record this daemon writes; a
     /// record written before #9440 omits it, which a consumer must read as

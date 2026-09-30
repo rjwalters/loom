@@ -26,8 +26,12 @@ use tempfile::tempdir;
 /// One assistant usage record attributed to `model`, with a distinct
 /// `message.id` so the fold counts it as its own message.
 fn usage_line(id: &str, model: &str, input: i64, output: i64) -> String {
+    // #9454: per-record attribution keys on each record's timestamp, so the
+    // fixture stamps it now — inside the resolve window (which ends at the
+    // reaper's `now`, after this seeding).
+    let iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     format!(
-        "{{\"type\":\"assistant\",\"message\":{{\"id\":\"{id}\",\"model\":\"{model}\",\
+        "{{\"type\":\"assistant\",\"timestamp\":\"{iso}\",\"message\":{{\"id\":\"{id}\",\"model\":\"{model}\",\
          \"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output},\
          \"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}}}\n"
     )

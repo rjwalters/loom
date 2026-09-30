@@ -65,9 +65,7 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
-use crate::script_helpers::sweep_experiment::{
-    sum_transcript_usage, sum_transcript_usage_by_model, ModelUsageTotals,
-};
+use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::script_helpers::transcript_usage::{merge_records, UsageFold};
 
 /// Bytes of each candidate session file read when testing it for the
@@ -260,6 +258,20 @@ fn sweep_transcript_files(
     Some(out)
 }
 
+/// Fold every transcript in `files` into ONE [`UsageFold`] (#9315), so a
+/// `message.id` copied into a resumed session's transcript is counted once
+/// per sweep, matching the quota burn reader's cross-file dedupe. Unreadable
+/// files are skipped.
+fn fold_files(files: &[PathBuf]) -> UsageFold {
+    let mut fold = UsageFold::default();
+    for transcript in files {
+        if let Ok(text) = std::fs::read_to_string(transcript) {
+            fold.add_text(&text);
+        }
+    }
+    fold
+}
+
 /// Total tokens processed by every `/loom:sweep <issue>` session under
 /// `projects_dir` for `workspace_root`, or `None` when nothing attributable was
 /// found.
@@ -283,13 +295,13 @@ pub fn sum_sweep_tokens(
         "safehouse token total",
     )?;
     let mut total: u64 = 0;
-    for transcript in files {
-        let usage = sum_transcript_usage(&transcript);
-        let sum = usage
-            .input_tokens
-            .saturating_add(usage.output_tokens)
-            .saturating_add(usage.cache_read_input_tokens)
-            .saturating_add(usage.cache_creation_input_tokens);
+    for row in fold_files(&files).rows() {
+        let sum = row
+            .input
+            .saturating_add(row.output)
+            .saturating_add(row.cache_read)
+            .saturating_add(row.cache_write_5m)
+            .saturating_add(row.cache_write_1h);
         total = total.saturating_add(u64::try_from(sum).unwrap_or(0));
     }
     (total > 0).then_some(total)
@@ -328,14 +340,14 @@ pub fn sum_sweep_tokens_split(
     )?;
     let mut input_total: u64 = 0;
     let mut output_total: u64 = 0;
-    for transcript in files {
-        let usage = sum_transcript_usage(&transcript);
-        let input = usage
-            .input_tokens
-            .saturating_add(usage.cache_read_input_tokens)
-            .saturating_add(usage.cache_creation_input_tokens);
+    for row in fold_files(&files).rows() {
+        let input = row
+            .input
+            .saturating_add(row.cache_read)
+            .saturating_add(row.cache_write_5m)
+            .saturating_add(row.cache_write_1h);
         input_total = input_total.saturating_add(u64::try_from(input).unwrap_or(0));
-        output_total = output_total.saturating_add(u64::try_from(usage.output_tokens).unwrap_or(0));
+        output_total = output_total.saturating_add(u64::try_from(row.output).unwrap_or(0));
     }
     (input_total > 0 || output_total > 0).then_some((input_total, output_total))
 }
@@ -344,7 +356,7 @@ pub fn sum_sweep_tokens_split(
 /// `/loom:sweep` sessions (#5740): same session-matching and per-transcript
 /// scan as [`sum_sweep_tokens`]/[`sum_sweep_tokens_split`], but grouped by
 /// model/speed/tier instead of collapsed into one running total. See
-/// [`ModelUsageTotals`] and [`sum_transcript_usage_by_model`] for why a
+/// [`ModelUsageTotals`] and [`sum_transcript_usage_by_model`](crate::script_helpers::sweep_experiment::sum_transcript_usage_by_model) for why a
 /// single flat sum cannot be priced.
 ///
 /// Totals from every matching transcript are merged by tuple across the
@@ -368,14 +380,7 @@ pub fn sum_sweep_tokens_by_model(
         window,
         "safehouse per-model token total",
     )?;
-    let mut totals: BTreeMap<(String, String, String), ModelUsageTotals> = BTreeMap::new();
-    for transcript in files {
-        crate::script_helpers::transcript_usage::merge_rows(
-            &mut totals,
-            sum_transcript_usage_by_model(&transcript),
-        );
-    }
-    let rows: Vec<ModelUsageTotals> = totals.into_values().collect();
+    let rows: Vec<ModelUsageTotals> = fold_files(&files).rows();
     (!rows.is_empty()).then_some(rows)
 }
 
@@ -422,7 +427,7 @@ fn slice_of(at: DateTime<Utc>, slices: &[(DateTime<Utc>, DateTime<Utc>)]) -> Opt
 ///
 /// # What it is honest about
 ///
-/// - Dedupe happens per transcript **before** partitioning ([`UsageFold`]), and
+/// - Dedupe happens across all the sweep's transcripts **before** partitioning ([`UsageFold`]), and
 ///   a message is attributed wholly to the phase its first chunk started in, so
 ///   Σ over the slices plus the remainder equals the sweep total exactly — a
 ///   streamed message straddling a boundary is never counted twice.
@@ -457,18 +462,11 @@ pub fn sum_sweep_tokens_by_window(
     };
     let mut totals: Vec<BTreeMap<(String, String, String), ModelUsageTotals>> =
         vec![BTreeMap::new(); slices.len()];
-    for transcript in files {
-        let Ok(text) = std::fs::read_to_string(&transcript) else {
+    for message in fold_files(&files).messages() {
+        let Some(index) = message.at().and_then(|at| slice_of(at, slices)) else {
             continue;
         };
-        let mut fold = UsageFold::default();
-        fold.add_text(&text);
-        for message in fold.messages() {
-            let Some(index) = message.at().and_then(|at| slice_of(at, slices)) else {
-                continue;
-            };
-            merge_records(&mut totals[index], std::iter::once(message));
-        }
+        merge_records(&mut totals[index], std::iter::once(message));
     }
     totals
         .into_iter()
@@ -547,6 +545,24 @@ mod tests {
             }
         }
         session
+    }
+
+    #[test]
+    fn same_message_id_in_two_transcripts_of_one_sweep_counts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        let line = "{\"type\":\"assistant\",\"message\":{\"id\":\"msg_dup\",\
+            \"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":10,\
+            \"output_tokens\":20,\"cache_read_input_tokens\":300,\
+            \"cache_creation_input_tokens\":40}}}\n";
+        // Parent and a resumed copy (subagent file) carry the same message.
+        seed_session(dir.path(), workspace, "uuid-a", "4699", line, &[line]);
+
+        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, None), Some(370));
+        assert_eq!(sum_sweep_tokens_split(dir.path(), workspace, 4699, None), Some((350, 20)));
+        let rows = sum_sweep_tokens_by_model(dir.path(), workspace, 4699, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].input, rows[0].output, rows[0].cache_read), (10, 20, 300));
     }
 
     #[test]
