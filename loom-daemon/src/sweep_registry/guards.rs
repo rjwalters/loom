@@ -111,7 +111,7 @@ fn open_pr_memo_enabled() -> bool {
 /// **`<host>` is an opaque id by default (Issue #6322), not this host's raw
 /// hostname.** [`SweepRegistry::published_host_id`] is what actually decides
 /// the value every writer below uses — see its doc comment.
-pub(crate) const LEASE_MARKER_PREFIX: &str = "<!-- loom:lease host=";
+pub const LEASE_MARKER_PREFIX: &str = "<!-- loom:lease host=";
 
 /// Lookback window (Issue #6287, Epic #6165 Phase 2) bounding which lease
 /// comments [`SweepRegistry::resolve_lease_order`] treats as belonging to
@@ -1544,7 +1544,7 @@ impl SweepRegistry {
     /// available for #6286's reclamation guard to reuse rather than
     /// re-deriving). Only the first line is inspected — the format contract
     /// forbids depending on anything past the marker's closing `-->`.
-    pub(crate) fn parse_lease_marker_line(body: &str) -> Option<(String, String)> {
+    pub fn parse_lease_marker_line(body: &str) -> Option<(String, String)> {
         let first_line = body.lines().next()?;
         let rest = first_line.strip_prefix(LEASE_MARKER_PREFIX)?;
         let rest = rest.strip_suffix(" -->")?;

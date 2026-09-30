@@ -21,7 +21,7 @@ echo "OK: published lease record for issue" >&2
 echo "host-abc12345 sweep-insession-20260918-1234"
 "#;
 
-/// The real script's exit 4: a different host holds a fresh lease.
+/// The real script's exit 4: another sweep (any host) holds a fresh lease.
 const PUBLISH_PEER_HOLDS: &str = r#"#!/usr/bin/env bash
 printf '%s\n' "$*" > publish-argv
 echo "SKIP: a live peer holds this claim" >&2

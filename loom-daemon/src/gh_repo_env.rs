@@ -68,7 +68,7 @@ use std::process::Command;
 /// A no-op when `LOOM_REPO` is unset (the single-owner-fleet default), in
 /// which case `gh api` resolves the repo from the command's `current_dir`
 /// remote exactly as before.
-pub(crate) fn apply_loom_repo_override(cmd: &mut Command) {
+pub fn apply_loom_repo_override(cmd: &mut Command) {
     if let Ok(repo) = std::env::var("LOOM_REPO") {
         cmd.env("GH_REPO", repo);
     }

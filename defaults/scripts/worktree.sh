@@ -1622,6 +1622,19 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     # usable (preserved, reset, or reset-refused-and-left-alone, the three
     # outcomes this arm always reported as 0); non-zero = do not hand it over.
     # See `_worktree_existing` above and loom-daemon/src/worktree_cli/existing.rs.
+    # rjwalters/kicad-tools#5783: uncommitted changes are the actual
+    # co-occupancy hazard -- two same-host sweeps once edited the same
+    # uncommitted file here at once, and one's edit leaked into the other's
+    # PR. Before `_worktree_existing` hands such a tree back (it always
+    # preserves one with uncommitted changes), `loom-daemon lease co-occupancy`
+    # refuses (exit 1) when the issue carries 2+ simultaneously fresh sweep
+    # leases; WORKTREE_ALLOW_SHARED_LEASE=1 overrides. Only exit 1 refuses -- a
+    # read failure, a timeout, or a daemon predating the subcommand (clap exit
+    # 2) all fail OPEN, as #8553's check-issue call above does. The `.git`
+    # probe keeps `git status` from walking up into the parent checkout.
+    # shellcheck disable=SC2086  # $_ljson is intentionally unquoted: omits the flag when empty
+    # requires-daemon: lease optional   kicad-tools#5783 fails open on a daemon predating `lease co-occupancy`
+    [[ -z "${_WT_DAEMON_BIN:-}" || ! -e "$WORKTREE_PATH/.git" || -z "$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null)" ]] || { _ljson=""; _lrc=0; [[ "$JSON_OUTPUT" == "true" ]] && _ljson="--json"; "$_WT_DAEMON_BIN" lease co-occupancy "$ISSUE_NUMBER" --repo "$WORKTREE_REPO_ROOT" $_ljson >&3 || _lrc=$?; [[ "$_lrc" -eq 1 ]] && exit 1; }
     _worktree_existing || exit 1
     # #9111: under --json the port is --quiet, so the success document for the
     # preserve and both stale-reset outcomes is emitted here — the same key set
