@@ -30,14 +30,16 @@ MERGE_PR="$SCRIPTS_DIR/merge-pr.sh"
 FORGE_HELPERS="$SCRIPTS_DIR/lib/forge-helpers.sh"
 
 # #8191: `_issue_is_closed_for_cleanup`'s decision now delegates to
-# `loom-daemon merge-pr issue-close-gate`. Pin the binary Test 7 below execs
-# and verify it HAS that subcommand, mirroring every other ported-decision
-# suite in this family (e.g. test-merge-pr-closed-issue-cleanup.sh). Tests
-# 1-6 above never invoke the real function (they re-simulate the decision
-# tree in pure bash), so this does not gate them.
+# `loom-daemon merge-pr issue-close-gate`, and the CLI's own --worktree-path
+# validation (Test 1 below) now delegates to `loom-daemon merge-pr
+# worktree-contains`. Pin the binary those exec and verify it HAS the
+# subcommands, mirroring every other ported-decision suite in this family
+# (e.g. test-merge-pr-closed-issue-cleanup.sh). Tests 2-6 above never invoke
+# the real function (they re-simulate the decision tree in pure bash), so
+# this does not gate them.
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
-loom_test_require_daemon_bin "$SCRIPTS_DIR" "merge-pr issue-close-gate" "merge-pr worktree-preserve"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "merge-pr issue-close-gate" "merge-pr worktree-preserve" "merge-pr worktree-contains"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

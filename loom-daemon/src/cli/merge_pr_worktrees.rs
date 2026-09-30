@@ -1,5 +1,6 @@
 //! `loom-daemon merge-pr worktree-*` (#8191 slice) — the porcelain parsing
-//! behind `merge-pr.sh`'s post-merge worktree and branch cleanup.
+//! behind `merge-pr.sh`'s post-merge worktree and branch cleanup, plus the
+//! `--worktree-path` PRE-flight registered-worktree check ([`WorktreeContainsArgs`]).
 //!
 //! # Why the porcelain arrives on stdin
 //!
@@ -98,5 +99,29 @@ impl WorktreeFindByBranchArgs {
             println!("{path}");
         }
         Ok(())
+    }
+}
+
+/// `--worktree-path`'s PRE-flight registered-worktree check. Unlike the three
+/// verbs above, the retired `awk` this replaces communicated its answer
+/// through exit status alone — no line printed either way — so this does too:
+/// exit 0 = registered, 1 = parsed and not registered. `merge-pr.sh` treats
+/// any OTHER exit (missing binary, or one predating this verb) as "the check
+/// did not run" and decides its own fallback from there, exactly as it does
+/// for every other guard in this family.
+#[derive(clap::Args)]
+pub(crate) struct WorktreeContainsArgs {
+    /// The path to look up, already canonicalised by the caller (`cd … &&
+    /// pwd -P`), matching the other two path-keyed verbs above.
+    #[arg(long, value_name = "PATH")]
+    path: String,
+}
+
+impl WorktreeContainsArgs {
+    pub(crate) fn run(self) -> Result<()> {
+        if worktrees::contains_path(&porcelain()?, &self.path) {
+            std::process::exit(0);
+        }
+        std::process::exit(1);
     }
 }

@@ -249,6 +249,32 @@ fn find_by_branch_agrees_with_the_retired_awk() {
     );
 }
 
+#[test]
+fn contains_path_agrees_with_the_retired_awk() {
+    let script = fixture();
+    let mut compared = 0usize;
+    for (i, input) in CORPUS.iter().enumerate() {
+        for path in PATH_QUERIES {
+            let Some(want) = shell(&script, "retired_worktree_contains_path", input, Some(path))
+            else {
+                continue;
+            };
+            let got = format!("{}\n", worktrees::contains_path(input, path));
+            assert_eq!(
+                got, want,
+                "entry {i} query {path:?} diverged.\n  input: {input:?}\n  \
+                 shell: {want:?}\n  rust:  {got:?}"
+            );
+            compared += 1;
+        }
+    }
+    assert_eq!(
+        compared,
+        CORPUS.len() * PATH_QUERIES.len(),
+        "only {compared} comparisons ran — the shell harness is not running"
+    );
+}
+
 /// The corpus must actually contain the cases it claims to. A differential
 /// whose inputs all miss compares `""` with `""` everywhere and passes
 /// regardless of what either side does — which is the "silently compared

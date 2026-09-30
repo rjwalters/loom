@@ -578,17 +578,18 @@ if [[ -n "$WORKTREE_PATH_OVERRIDE" ]]; then
   fi
   _WT_ABS="$(cd "$WORKTREE_PATH_OVERRIDE" 2>/dev/null && pwd -P)" || \
     error "--worktree-path could not be resolved: $WORKTREE_PATH_OVERRIDE"
-  # Verify the path is actually a worktree of this repo. Each porcelain stanza
-  # begins with a literal `worktree ` prefix (9 chars) followed by the
-  # unquoted, unescaped absolute path — which may contain spaces. Parse the
-  # path with substr($0, 10), NOT $2/whitespace-split (which truncates at the
-  # first space). Caveat: a path containing a literal newline would still break
-  # this line-oriented parse; `--porcelain -z` (NUL-delimited) would be needed
-  # for full robustness, but spaces are the realistic failure mode (#3717).
-  if ! git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
-       awk -v p="$_WT_ABS" '/^worktree / { if (substr($0, 10) == p) { found=1; exit } } END { exit !found }'; then
-    error "--worktree-path is not a registered worktree of this repository: $WORKTREE_PATH_OVERRIDE (resolved: $_WT_ABS)"
-  fi
+  # Verify the path is actually a worktree of this repo (#8191 slice):
+  # `loom-daemon merge-pr worktree-contains` shares the porcelain parser
+  # worktree-primary/worktree-branch-for/worktree-find-by-branch already use
+  # (loom-daemon/src/merge_pr/worktrees.rs), which fixed this same family's
+  # #3717 space-in-path truncation. Exit 0 = registered, 1 = parsed and NOT
+  # registered, anything else = the check did not run at all (missing/older
+  # daemon) -- WARN and skip rather than block --worktree-path outright:
+  # `git worktree remove` itself still refuses any path that is not actually a
+  # registered worktree, so the only cost of skipping is a less specific error.
+  _WTC_RC=0; git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr worktree-contains --path "$_WT_ABS" 2>/dev/null || _WTC_RC=$?
+  if [[ $_WTC_RC -eq 1 ]]; then error "--worktree-path is not a registered worktree of this repository: $WORKTREE_PATH_OVERRIDE (resolved: $_WT_ABS)"; elif [[ $_WTC_RC -ne 0 ]]; then warning "--worktree-path's registered-worktree check (#8191 slice) did not run — 'merge-pr worktree-contains' exited $_WTC_RC (a loom-daemon predating this slice has no such verb). Proceeding unchecked: 'git worktree remove' itself still refuses any path that is not actually a registered worktree. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"; fi
+  unset _WTC_RC
   WORKTREE_PATH_OVERRIDE="$_WT_ABS"
   unset _WT_ABS
 

@@ -616,6 +616,12 @@ pub(crate) enum MergePrCommand {
     /// Empty at exit 0 when no worktree holds it.
     WorktreeFindByBranch(super::merge_pr_worktrees::WorktreeFindByBranchArgs),
 
+    /// `--worktree-path`'s PRE-flight registered-worktree check, from
+    /// porcelain on stdin: is `--path` ANY `worktree ` record, not just the
+    /// first. Exit 0 = registered, 1 = parsed and not registered — the
+    /// retired `awk` answered through exit status alone, so this does too.
+    WorktreeContains(super::merge_pr_worktrees::WorktreeContainsArgs),
+
     /// The post-merge partial-increment label reset decision (#3667/#4569):
     /// from the referenced issue's fresh body on stdin plus the pre-merge
     /// guard's `--conflicted` / `--open-before-merge` facts, the ordered
@@ -694,6 +700,7 @@ impl MergePrCommand {
             MergePrCommand::WorktreePrimary(args) => args.run(),
             MergePrCommand::WorktreeBranchFor(args) => args.run(),
             MergePrCommand::WorktreeFindByBranch(args) => args.run(),
+            MergePrCommand::WorktreeContains(args) => args.run(),
             MergePrCommand::PartialReset(args) => args.run(),
             MergePrCommand::PartialConflict(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),

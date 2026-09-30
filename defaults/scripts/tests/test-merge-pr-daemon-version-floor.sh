@@ -294,6 +294,7 @@ partial-reset open -
 closed-building open -
 issue-close-gate open -
 dirty-guard open -
+worktree-contains open -
 worktree-preserve open -"
 
 # Shared comparison, so the controls below exercise the SAME logic the real
