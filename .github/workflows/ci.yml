@@ -1670,6 +1670,14 @@ jobs:
         run: bash defaults/scripts/tests/test-per-worktree-target-dir.sh
       - name: merge-pr loom:pr review-signal guard (#7419, #8191 slice)
         run: bash defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh
+      # #9657 (#9548 slice): both suites pin the working-tree binary for the
+      # real `forge trusted-comments` filter, so they need this job's shared
+      # build; capacity-defer moved out of shell-suite-tests/ci-wired.txt for
+      # exactly that reason.
+      - name: merge-pr hold-state comment trust (#9657, #9548 slice)
+        run: bash defaults/scripts/tests/test-merge-pr-hold-state-trust.sh
+      - name: classify-capacity-defer comment trust (#9657, #9548 slice)
+        run: bash defaults/scripts/tests/test-classify-capacity-defer.sh
       - name: merge-pr PR-label fetch freshness (#8550)
         run: bash defaults/scripts/tests/test-merge-pr-label-freshness.sh
       - name: merge-pr stale required-checks guard (#8248, #8191 slice 3)
