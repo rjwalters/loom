@@ -79,6 +79,11 @@ SELECT timestamp, resources_string['host.id'] AS host,
        attributes_string['loom.queue.disposition'] AS disposition,
        attributes_string['loom.queue.state']       AS state,
        attributes_string['loom.queue.rank']        AS rank,
+       -- Issue #9669: queue position at the sampled tick — candidate_rank is
+       -- the plan's pass-2 position when the row has one, else its rank.
+       attributes_string['loom.queue.candidate_rank']   AS candidate_rank,
+       attributes_string['loom.queue.total_candidates'] AS total_candidates,
+       attributes_string['loom.queue.priority_score']   AS priority_score,
        attributes_string['loom.queue.transition']  AS transition,
        attributes_string['loom.queue.park_label']  AS park_label,
        attributes_string['loom.dispatch.admission_result'] AS admission_result,

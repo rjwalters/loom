@@ -169,13 +169,24 @@ pub fn tick_span(
 /// and `loom.dispatch.reason` (the `loom.dispatch.decisions` reason), plus
 /// `loom.repo`/`loom.repo.visibility` (Issue #9222) when `repo_refs` has an
 /// entry for the admission's `workspace_idx` — omitted, never a local path,
-/// when it does not.
+/// when it does not — and the candidate's queue position (Issue #9669):
+/// `loom.queue.candidate_rank` (1-indexed position in the shaped pass-2
+/// candidate order) and `loom.queue.total_candidates` (its length), present
+/// only when the tick recorded a plan order that names this admission — a
+/// single-workspace tick records none.
 #[must_use]
 pub fn admission_spans(
     report: &TickReport,
     tick: &SpanRecord,
     repo_refs: &HashMap<usize, QueueRepoRef>,
 ) -> Vec<SpanRecord> {
+    let candidate_ranks: HashMap<(usize, u32), u32> = report
+        .plan_order
+        .iter()
+        .zip(1u32..)
+        .map(|(key, position)| (*key, position))
+        .collect();
+    let total_candidates = report.plan_order.len();
     report
         .admissions
         .iter()
@@ -194,6 +205,13 @@ pub fn admission_spans(
                 attributes.insert(
                     "loom.repo.visibility".to_string(),
                     visibility_str(repo_ref.visibility).to_string(),
+                );
+            }
+            if let Some(rank) = candidate_ranks.get(&(admission.workspace_idx, admission.issue)) {
+                attributes.insert("loom.queue.candidate_rank".to_string(), rank.to_string());
+                attributes.insert(
+                    "loom.queue.total_candidates".to_string(),
+                    int(total_candidates).to_string(),
                 );
             }
             crate::telemetry::trace::provenance::stamp(&mut attributes);

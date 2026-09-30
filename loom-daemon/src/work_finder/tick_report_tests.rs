@@ -199,6 +199,40 @@ fn each_dispatch_attempt_is_one_admission_span_under_the_tick_span() {
     // No repo_refs entry for workspace 0: `loom.repo` is omitted, never a
     // fabricated or local-path value (Issue #9222).
     assert!(!spans[0].attributes.contains_key("loom.repo"));
+    // Issue #9669: each admission carries its 1-indexed position in the
+    // tick's shaped pass-2 candidate order and that order's length.
+    assert_eq!(
+        spans
+            .iter()
+            .map(|s| s.attributes["loom.queue.candidate_rank"].as_str())
+            .collect::<Vec<_>>(),
+        ["1", "2", "3"]
+    );
+    assert_eq!(spans[0].attributes["loom.queue.total_candidates"], "3");
+}
+
+/// Issue #9669: a single-workspace tick records no plan order, so its
+/// admission spans carry no queue-position attributes — omitted, never
+/// fabricated, the same convention as `loom.repo`.
+#[test]
+fn an_admission_without_a_plan_order_omits_queue_position_attributes() {
+    let mut source = Source(items(&[7]));
+    let mut disp = Refusing {
+        refuse: lease_order,
+        ok: HashSet::new(),
+    };
+    let report = tick(&mut source, &mut disp, 4, false).unwrap();
+    assert!(report.plan_order.is_empty());
+    let tick_span = tick_span(&report, 4, Utc::now(), Utc::now());
+    let spans = admission_spans(&report, &tick_span, &HashMap::new());
+    assert_eq!(spans.len(), 1);
+    assert!(!spans[0]
+        .attributes
+        .contains_key("loom.queue.candidate_rank"));
+    assert!(!spans[0]
+        .attributes
+        .contains_key("loom.queue.total_candidates"));
+    assert_eq!(spans[0].clone().bounded().attributes, spans[0].attributes);
 }
 
 #[test]
