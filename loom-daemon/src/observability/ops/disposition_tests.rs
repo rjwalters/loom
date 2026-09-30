@@ -25,6 +25,7 @@ fn row(slug: &str, issue: u32, rank: usize, disposition: Qd) -> DispositionRow {
         disposition,
         park_label: None,
         pr_number: None,
+        story_points: None,
     }
 }
 
@@ -140,6 +141,7 @@ fn summary_row(
         main_red_fix: false,
         created_at: None,
         tier: None,
+        story_points: None,
         disposition,
         detail: detail.map(str::to_string),
         state: disposition.state().to_string(),
@@ -313,7 +315,7 @@ fn changed_emission() -> Emission {
 
 #[test]
 fn every_attribute_survives_the_export_time_allowlist() {
-    let span = build_span(&changed_emission(), Utc::now(), None);
+    let span = build_span(&changed_emission(), Utc::now(), None, &HashMap::new());
     assert_eq!(span.clone().bounded().attributes, span.attributes);
     assert_eq!(span.name, SpanName::DispatchDisposition);
     assert_eq!(span.attributes["loom.repo"], "acme/widgets");
@@ -338,7 +340,7 @@ fn left_queue_emission_omits_rank_and_previous_disposition() {
         pr_number: None,
         ..changed_emission()
     };
-    let span = build_span(&emission, Utc::now(), None);
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
     assert!(!span.attributes.contains_key("loom.queue.rank"));
     assert!(!span
         .attributes
@@ -348,14 +350,141 @@ fn left_queue_emission_omits_rank_and_previous_disposition() {
 
 #[test]
 fn a_span_is_parented_to_the_tick_when_given_a_context_and_a_root_otherwise() {
-    let root_span = build_span(&changed_emission(), Utc::now(), None);
+    let root_span = build_span(&changed_emission(), Utc::now(), None, &HashMap::new());
     assert_eq!(root_span.parent_span_id, None);
 
     let parent = crate::telemetry::trace::TraceContext::derived("dispatch.tick", &["k"]);
-    let child_span = build_span(&changed_emission(), Utc::now(), Some(&parent));
+    let child_span = build_span(&changed_emission(), Utc::now(), Some(&parent), &HashMap::new());
     assert_eq!(child_span.parent_span_id, Some(parent.span_id.clone()));
     assert_eq!(child_span.context.trace_id, parent.trace_id);
     assert_ne!(child_span.context.span_id, parent.span_id);
+}
+
+// --------------------------------------------------------------------------- lockout stamping (Issue #9674)
+
+use super::super::lockout::{FrozenBacklog, RepoLockout};
+
+fn locked_map(
+    slug: &str,
+    backlog: FrozenBacklog,
+    duration: Option<i64>,
+) -> HashMap<String, RepoLockout> {
+    HashMap::from([(
+        slug.to_string(),
+        RepoLockout {
+            backlog,
+            duration_secs: duration,
+        },
+    )])
+}
+
+/// An `open_pr` span in a locked repo carries the repo's whole lockout
+/// weight: candidate count, summed story points, and the observation-floor
+/// clock — and everything survives the export-time allowlist, so the facts
+/// actually reach SigNoz.
+#[test]
+fn an_open_pr_span_in_a_locked_repo_carries_the_lockout_weight() {
+    let emission = Emission {
+        disposition: Qd::OpenPr,
+        park_label: None,
+        pr_number: Some(456),
+        ..changed_emission()
+    };
+    let lockouts = locked_map(
+        "acme/widgets",
+        FrozenBacklog {
+            candidates: 51,
+            points: 97,
+        },
+        Some(3_600),
+    );
+    let span = build_span(&emission, Utc::now(), None, &lockouts);
+    assert_eq!(span.attributes["loom.queue.disposition"], "open_pr");
+    assert_eq!(span.attributes["lockout.frozen_candidates_count"], "51");
+    assert_eq!(span.attributes["lockout.frozen_points_sum"], "97");
+    assert_eq!(span.attributes["lockout.duration_seconds"], "3600");
+    assert_eq!(span.clone().bounded().attributes, span.attributes);
+}
+
+/// The count/sum attributes are the lock itself — stamped even while the
+/// clock has no reading yet — while a repo under no lock stays silent.
+#[test]
+fn lockout_attributes_are_absent_without_a_lock_or_outside_open_pr_rows() {
+    // OpenPr row, but this sample's rows say the repo is not locked.
+    let emission = Emission {
+        disposition: Qd::OpenPr,
+        pr_number: Some(456),
+        park_label: None,
+        ..changed_emission()
+    };
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
+    assert!(!span
+        .attributes
+        .contains_key("lockout.frozen_candidates_count"));
+    assert!(!span.attributes.contains_key("lockout.frozen_points_sum"));
+    assert!(!span.attributes.contains_key("lockout.duration_seconds"));
+
+    // Locked repo, but the row is a different disposition: the repo's other
+    // rows do not double-report the lock.
+    let lockouts = locked_map(
+        "acme/widgets",
+        FrozenBacklog {
+            candidates: 2,
+            points: 5,
+        },
+        Some(30),
+    );
+    let span = build_span(&changed_emission(), Utc::now(), None, &lockouts);
+    assert!(!span
+        .attributes
+        .contains_key("lockout.frozen_candidates_count"));
+
+    // A zero-duration clock (first observation) still stamps `0`, not absence.
+    let emission = Emission {
+        disposition: Qd::OpenPr,
+        pr_number: Some(1),
+        park_label: None,
+        ..changed_emission()
+    };
+    let lockouts = locked_map(
+        "acme/widgets",
+        FrozenBacklog {
+            candidates: 1,
+            points: 0,
+        },
+        Some(0),
+    );
+    let span = build_span(&emission, Utc::now(), None, &lockouts);
+    assert_eq!(span.attributes["lockout.duration_seconds"], "0");
+}
+
+/// A `left_queue` span never reports lock state: the row has already left the
+/// queue, so the repo's current lock is not this row's story.
+#[test]
+fn a_left_queue_span_never_carries_lockout_attributes() {
+    let emission = Emission {
+        transition: Transition::LeftQueue,
+        rank: None,
+        previous_disposition: None,
+        park_label: None,
+        pr_number: None,
+        disposition: Qd::OpenPr,
+        ..changed_emission()
+    };
+    let lockouts = locked_map(
+        "acme/widgets",
+        FrozenBacklog {
+            candidates: 1,
+            points: 3,
+        },
+        Some(60),
+    );
+    let span = build_span(&emission, Utc::now(), None, &lockouts);
+    assert_eq!(span.attributes["loom.queue.transition"], "left_queue");
+    assert!(!span
+        .attributes
+        .contains_key("lockout.frozen_candidates_count"));
+    assert!(!span.attributes.contains_key("lockout.duration_seconds"));
 }
 
 // --------------------------------------------------------------------------- record()
