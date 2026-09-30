@@ -100,7 +100,9 @@ when all three hold:
 3. **The credential has WRITE.** A user token needs `push`, `maintain` or
    `admin`; an App installation token needs the repository in its
    installation. Probed once per repository per hour
-   (`LOOM_WRITE_SCOPE_TTL_SECS`). On Gitea only rules 1 and 2 apply.
+   (`LOOM_WRITE_SCOPE_TTL_SECS`); when a re-probe cannot answer, a WRITE
+   verified in the last 24 hours still counts, and a definitive "no" never
+   does. On Gitea only rules 1 and 2 apply.
 
 Anything unverifiable is a refusal. Reads are never gated.
 

@@ -239,6 +239,7 @@ fn a_fork_checkout_with_an_upstream_remote_is_refused() {
 }
 
 #[test]
+#[serial_test::serial(write_scope_cache)]
 fn the_cache_answers_repeat_questions_without_a_second_probe() {
     let dir = tempfile::tempdir().unwrap();
     // SAFETY-free: the variable is read only by this module's cache.
@@ -260,6 +261,33 @@ fn the_cache_answers_repeat_questions_without_a_second_probe() {
     };
     assert!(matches!(other.permission("acme/cache-test"), Permission::Insufficient(_)));
     assert_eq!(other.inner.calls.get(), 1, "a different credential probes again");
+    std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
+}
+
+#[test]
+#[serial_test::serial(write_scope_cache)]
+fn an_unanswerable_reprobe_keeps_a_recent_write_but_not_an_old_one() {
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("g"));
+    probe::clear_memory();
+    let hour = std::time::Duration::from_secs(3600);
+    let down = || probe::Cached {
+        inner: FakeProbe::new(Permission::Unknown("HTTP 502".into())),
+        key_dir: Some(dir.path().join("cred-g")),
+    };
+    // Verified two hours ago: past the TTL, inside the 24 h grace.
+    probe::seed_disk(Some(&dir.path().join("cred-g")), "acme/grace", true, 2 * hour);
+    let p = down();
+    assert_eq!(p.permission("acme/grace"), Permission::Write);
+    assert_eq!(p.inner.calls.get(), 1, "it did re-probe");
+    // Verified 25 hours ago: the outage now refuses.
+    probe::clear_memory();
+    probe::seed_disk(Some(&dir.path().join("cred-g")), "acme/old", true, 25 * hour);
+    assert!(matches!(down().permission("acme/old"), Permission::Unknown(_)));
+    // A definitive "no" is never overridden by an earlier yes.
+    probe::clear_memory();
+    probe::seed_disk(Some(&dir.path().join("cred-g")), "acme/revoked", false, 2 * hour);
+    assert!(matches!(down().permission("acme/revoked"), Permission::Unknown(_)));
     std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
 }
 
