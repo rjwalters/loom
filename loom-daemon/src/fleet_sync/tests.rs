@@ -456,6 +456,8 @@ fn sample_status() -> FleetSyncStatus {
         auto_apply: false,
         config: ConfigPass::default(),
         roster: RosterPass::default(),
+        state: StatePass::default(),
+        enforced: Enforcement::Proceed,
     }
 }
 
@@ -540,4 +542,167 @@ fn status_line_distinguishes_a_skipped_roster_from_a_clean_one() {
     assert!(line.contains("CACHED snapshot"), "{line}");
     assert!(line.contains("roster: not checked"), "{line}");
     assert!(!line.contains("roster: in sync"), "a skipped roster is not a clean one: {line}");
+}
+
+// ------------------------------------------------------------------------
+// Run-state enforcement on the timer pass (#9598)
+// ------------------------------------------------------------------------
+
+/// An [`Enforcer`] that records what it was asked to do. `stop_accepts=false`
+/// models the one production divergence: a host with no supervisor, where the
+/// drain-and-exit is refused and `IpcEnforcer` holds dispatch instead.
+#[derive(Default)]
+struct RecordingEnforcer {
+    calls: std::sync::Mutex<Vec<&'static str>>,
+    held: std::sync::Mutex<bool>,
+    stop_accepts: bool,
+}
+
+impl RecordingEnforcer {
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl Enforcer for RecordingEnforcer {
+    fn hold(&self, _note: String) -> bool {
+        self.calls.lock().unwrap().push("hold");
+        let mut held = self.held.lock().unwrap();
+        !std::mem::replace(&mut held, true)
+    }
+
+    fn release(&self) -> bool {
+        self.calls.lock().unwrap().push("release");
+        std::mem::replace(&mut self.held.lock().unwrap(), false)
+    }
+
+    fn is_held(&self) -> bool {
+        *self.held.lock().unwrap()
+    }
+
+    fn stop(&self, _reason: String) -> bool {
+        self.calls.lock().unwrap().push("stop");
+        if !self.stop_accepts {
+            *self.held.lock().unwrap() = true;
+        }
+        self.stop_accepts
+    }
+}
+
+fn status_desiring(state: crate::fleet_store::state::RunState) -> FleetSyncStatus {
+    let mut status = sample_status();
+    status.state = StatePass {
+        desired: Some(state),
+        source: Some("host".to_string()),
+        ..StatePass::default()
+    };
+    status.enforced = status.state.enforcement();
+    status
+}
+
+#[test]
+fn a_running_store_leaves_an_unheld_host_completely_alone() {
+    let enforcer = RecordingEnforcer::default();
+    let mut status = status_desiring(crate::fleet_store::state::RunState::Running);
+    enforce(&mut status, &enforcer, None);
+    assert_eq!(status.enforced, Enforcement::Proceed);
+    assert!(enforcer.calls().is_empty(), "no drain primitive was touched");
+}
+
+#[test]
+fn a_paused_store_holds_once_and_is_silent_thereafter() {
+    let enforcer = RecordingEnforcer::default();
+    let mut status = status_desiring(crate::fleet_store::state::RunState::Paused);
+    enforce(&mut status, &enforcer, None);
+    assert_eq!(status.enforced, Enforcement::Hold);
+    assert!(enforcer.is_held());
+
+    let mut again = status_desiring(crate::fleet_store::state::RunState::Paused);
+    enforce(&mut again, &enforcer, None);
+    assert_eq!(again.enforced, Enforcement::Hold);
+    assert_eq!(enforcer.calls(), vec!["hold"], "the steady state re-requests nothing");
+}
+
+#[test]
+fn a_store_flipping_back_to_running_releases_the_fleet_hold() {
+    let enforcer = RecordingEnforcer::default();
+    let mut paused = status_desiring(crate::fleet_store::state::RunState::Paused);
+    enforce(&mut paused, &enforcer, None);
+
+    let mut running = status_desiring(crate::fleet_store::state::RunState::Running);
+    enforce(&mut running, &enforcer, None);
+    assert_eq!(running.enforced, Enforcement::Proceed);
+    assert!(!enforcer.is_held());
+    assert_eq!(enforcer.calls(), vec!["hold", "release"]);
+}
+
+#[test]
+fn a_refused_stop_is_reported_as_the_hold_it_actually_became() {
+    let enforcer = RecordingEnforcer::default(); // stop_accepts = false
+    let mut status = status_desiring(crate::fleet_store::state::RunState::Stopped);
+    assert_eq!(status.enforced, Enforcement::Stop, "the store asked for a stop");
+    enforce(&mut status, &enforcer, None);
+    assert_eq!(
+        status.enforced,
+        Enforcement::Hold,
+        "the snapshot `status` reads must not claim a stop that did not happen"
+    );
+}
+
+#[test]
+fn an_accepted_stop_stays_a_stop_in_the_snapshot() {
+    let enforcer = RecordingEnforcer {
+        stop_accepts: true,
+        ..RecordingEnforcer::default()
+    };
+    let mut status = status_desiring(crate::fleet_store::state::RunState::Stopped);
+    enforce(&mut status, &enforcer, None);
+    assert_eq!(status.enforced, Enforcement::Stop);
+    assert_eq!(enforcer.calls(), vec!["stop"]);
+}
+
+// ------------------------------------------------------------------------
+// The desired-vs-actual `status` lines (#9598)
+// ------------------------------------------------------------------------
+
+#[test]
+fn the_status_block_pairs_desired_with_actual() {
+    let now = Utc::now();
+    let mut status = status_desiring(crate::fleet_store::state::RunState::Paused);
+    status.state.by = Some("operator".to_string());
+    status.state.reason = Some("disk replacement".to_string());
+    let line = render_line(Some(&status), now).expect("a line");
+    assert!(line.contains("run state: desired paused (host entry)"), "{line}");
+    assert!(line.contains("-> new dispatch HELD"), "{line}");
+    assert!(line.contains("reason: disk replacement"), "{line}");
+}
+
+#[test]
+fn the_status_block_names_a_cached_or_last_recorded_answer() {
+    let now = Utc::now();
+    let mut cached = status_desiring(crate::fleet_store::state::RunState::Stopped);
+    cached.state.cached = true;
+    let line = render_line(Some(&cached), now).expect("a line");
+    assert!(line.contains("from a CACHED snapshot"), "{line}");
+    assert!(line.contains("desired stopped"), "{line}");
+
+    let mut recorded = status_desiring(crate::fleet_store::state::RunState::Stopped);
+    recorded.state.cached = true;
+    recorded.state.from_last_recorded = true;
+    let line = render_line(Some(&recorded), now).expect("a line");
+    assert!(line.contains("LAST RECORDED state"), "{line}");
+}
+
+#[test]
+fn a_state_that_could_not_be_read_is_never_silent() {
+    let now = Utc::now();
+    let mut status = sample_status();
+    status.state.error = Some("the store has no fleet/state.yml".to_string());
+    let line = render_line(Some(&status), now).expect("a line");
+    assert!(line.contains("run state: NOT ENFORCED"), "{line}");
+
+    // …and a host whose store says nothing at all about run state, with no
+    // error either, adds no run-state line (pre-#9598 output, byte for byte).
+    let quiet = render_line(Some(&sample_status()), now).expect("a line");
+    assert!(!quiet.contains("run state"), "{quiet}");
 }

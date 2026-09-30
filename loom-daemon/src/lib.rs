@@ -173,6 +173,7 @@ pub mod event_bus;
 pub mod filing_lock;
 pub mod fleet;
 pub mod fleet_captain;
+pub mod fleet_state;
 pub mod fleet_store;
 pub mod fleet_sync;
 pub mod foreign_load;
