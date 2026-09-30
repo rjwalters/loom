@@ -26,6 +26,7 @@ fn row(slug: &str, issue: u32, rank: usize, disposition: Qd) -> DispositionRow {
         park_label: None,
         pr_number: None,
         story_points: None,
+        halt_cause: None,
     }
 }
 
@@ -297,6 +298,111 @@ fn pr_number_is_present_only_for_open_pr_rows() {
     assert_eq!(rows[0].pr_number, None);
 }
 
+// --------------------------------------------------------------------------- halt_cause (#9673)
+
+fn repos_with_repo() -> HashMap<String, QueueRepoRef> {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    repos
+}
+
+#[test]
+fn halt_cause_is_present_only_for_a_closed_vocabulary_detail() {
+    let repos = repos_with_repo();
+
+    // A real #9017 halt-cause token survives, verbatim.
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row(
+            "/repo",
+            1,
+            1,
+            Qd::WorkspaceHalted,
+            Some("main_red"),
+        )],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].halt_cause.as_deref(), Some("main_red"));
+
+    // A cause-less legacy row (a pre-#9017 caller) exports nothing.
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row("/repo", 2, 1, Qd::WorkspaceHalted, None)],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].halt_cause, None);
+
+    // A detail token outside the closed vocabulary is never exported.
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row(
+            "/repo",
+            3,
+            1,
+            Qd::WorkspaceHalted,
+            Some("sorta_halted"),
+        )],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].halt_cause, None);
+
+    // A disposition that never carries a halt cause ignores detail text
+    // entirely, however cause-shaped it looks.
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row(
+            "/repo",
+            4,
+            1,
+            Qd::DeferredCapacity,
+            Some("main_red"),
+        )],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].halt_cause, None);
+}
+
+#[test]
+fn every_halt_cause_token_round_trips_through_the_wire_vocabulary() {
+    // The exporter re-emits `HaltCause::from_wire(..)?.as_str()`, so each
+    // closed-vocabulary token must survive the round trip unchanged.
+    for cause in crate::work_finder::halt_cause::HaltCause::ALL {
+        assert_eq!(HaltCause::from_wire(cause.as_str()), Some(cause));
+    }
+}
+
+#[test]
+fn workspace_halted_emission_carries_the_halt_cause_attribute() {
+    let emission = Emission {
+        disposition: Qd::WorkspaceHalted,
+        park_label: None,
+        halt_cause: Some("token_pool".to_string()),
+        ..changed_emission()
+    };
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
+    assert_eq!(span.attributes["loom.queue.disposition"], "workspace_halted");
+    assert_eq!(span.attributes["loom.queue.state"], "blocked");
+    assert_eq!(span.attributes["loom.queue.halt_cause"], "token_pool");
+    // The key must survive the export-time attribute allowlist
+    // (`OPS_SPAN_ATTRIBUTE_KEYS` is re-applied at export), or the attribute
+    // would silently never reach SigNoz.
+    let bounded = span.clone().bounded();
+    assert_eq!(bounded.attributes["loom.queue.halt_cause"], "token_pool");
+    assert!(span.validate().is_ok());
+
+    // No halt cause, no attribute — a cause-less legacy row stays
+    // indistinguishable from a pre-#9673 span rather than exporting an empty
+    // value.
+    let emission = Emission {
+        disposition: Qd::WorkspaceHalted,
+        park_label: None,
+        halt_cause: None,
+        ..changed_emission()
+    };
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
+    assert!(!span.attributes.contains_key("loom.queue.halt_cause"));
+}
+
 // --------------------------------------------------------------------------- build_span
 
 fn changed_emission() -> Emission {
@@ -310,6 +416,7 @@ fn changed_emission() -> Emission {
         transition: Transition::Changed,
         park_label: Some("loom:blocked".to_string()),
         pr_number: None,
+        halt_cause: None,
     }
 }
 

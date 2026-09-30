@@ -75,6 +75,7 @@ use crate::telemetry::queue_snapshot::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 use crate::telemetry::RepoVisibility;
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
+use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::{PARK_LABELS, SKIP_LABELS};
 
 /// Env override for the refresh cadence, in seconds.
@@ -132,6 +133,10 @@ pub struct DispositionRow {
     /// The issue's resolved story-point size (#9432, Issue #9674) — `None`
     /// when unsized or a labeled defect (never a guess).
     pub story_points: Option<u32>,
+    /// Present only for `WorkspaceHalted` rows whose detail is the closed
+    /// `work_finder::halt_cause` vocabulary (#9017) — see [`halt_cause_token`]
+    /// (#9673).
+    pub halt_cause: Option<String>,
 }
 
 /// One row's outcome for a [`record`] sample: enough to build its span.
@@ -148,6 +153,9 @@ pub struct Emission {
     pub transition: Transition,
     pub park_label: Option<String>,
     pub pr_number: Option<u32>,
+    /// Present only for a `WorkspaceHalted` row whose detail named a
+    /// closed-vocabulary halt cause — see [`halt_cause_token`] (#9673).
+    pub halt_cause: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +233,7 @@ impl DispositionTracker {
                     transition,
                     park_label: row.park_label.clone(),
                     pr_number: row.pr_number,
+                    halt_cause: row.halt_cause.clone(),
                 });
             }
         }
@@ -248,6 +257,7 @@ impl DispositionTracker {
                     transition: Transition::LeftQueue,
                     park_label: None,
                     pr_number: None,
+                    halt_cause: None,
                 });
                 // Dropped: not reinserted into `next`, so this key reads as
                 // "first sight" (`Changed`) if the issue ever reappears.
@@ -297,6 +307,19 @@ fn open_pr_number(disposition: QueueDisposition, detail: Option<&str>) -> Option
     digits.parse().ok()
 }
 
+/// The closed-vocabulary halt cause in a `WorkspaceHalted` row's `detail`
+/// (#9017) — validated through [`HaltCause::from_wire`] and re-emitted as its
+/// canonical `as_str` token, never the raw text (#9673). A cause-less legacy
+/// row (a pre-#9017 caller) and any token outside the vocabulary export
+/// nothing.
+#[must_use]
+fn halt_cause_token(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
+    if disposition != QueueDisposition::WorkspaceHalted {
+        return None;
+    }
+    HaltCause::from_wire(detail?).map(|cause| cause.as_str().to_string())
+}
+
 /// Build this tick's disposition rows from `summary`'s ranked queue, resolving
 /// each row's repo through `repos` (as [`super::super::repo_ref::resolve_repo_refs`]
 /// already resolved it). A row whose repo did not resolve is dropped and
@@ -327,6 +350,7 @@ pub fn build_rows(
             park_label: allowed_park_label(row.disposition, row.detail.as_deref()),
             pr_number: open_pr_number(row.disposition, row.detail.as_deref()),
             story_points: row.story_points,
+            halt_cause: halt_cause_token(row.disposition, row.detail.as_deref()),
         });
     }
     (rows, dropped)
@@ -481,6 +505,9 @@ pub fn build_span(
                 attributes.insert("lockout.duration_seconds".to_string(), secs.to_string());
             }
         }
+    }
+    if let Some(cause) = &emission.halt_cause {
+        attributes.insert("loom.queue.halt_cause".to_string(), cause.clone());
     }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
