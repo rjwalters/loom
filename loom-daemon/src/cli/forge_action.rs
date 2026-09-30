@@ -186,6 +186,35 @@ pub(crate) enum ForgeAction {
         requested: Option<String>,
     },
 
+    /// `forge merge-config` (#9287) — advisory, READ-ONLY check that
+    /// `merge-pr.sh` can merge on the default branch at all. Computes the
+    /// effective merge-method set (the repository's `allow_*` flags
+    /// intersected with `allowed_merge_methods` of every ACTIVE ruleset on the
+    /// branch) and warns when it is empty, when `required_linear_history`
+    /// leaves only `merge`, or when it excludes the method `merge-pr.sh` will
+    /// use. Silent when there is nothing to report (`--verbose` prints an OK
+    /// line). A probe it cannot answer (403, no auth) prints "could not
+    /// determine", never a finding. ALWAYS exits 0 and never writes a ruleset
+    /// or repository setting. GitHub only; Gitea is skipped.
+    #[command(name = "merge-config")]
+    MergeConfig {
+        /// Repository, `owner/repo`. Default: the repository of the CWD.
+        #[arg(long, value_name = "NWO")]
+        repo: Option<String>,
+
+        /// Branch to check. Default: the repository's default branch.
+        #[arg(long, value_name = "BRANCH")]
+        branch: Option<String>,
+
+        /// Check this merge method instead of `merge-pr.sh`'s auto-detect.
+        #[arg(long, value_name = "METHOD", value_parser = ["merge", "squash", "rebase"])]
+        method: Option<String>,
+
+        /// Also print a one-line OK summary when there is nothing to report.
+        #[arg(long)]
+        verbose: bool,
+    },
+
     /// `forge token --repo <nwo> [--access read|write] [--force]` (#9537) —
     /// the single entry point for "which App's token should this call use".
     /// `read` returns the repo's reader App token (deterministic per repo),
@@ -285,6 +314,17 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             hold,
         },
         ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
+        ForgeAction::MergeConfig {
+            repo,
+            branch,
+            method,
+            verbose,
+        } => ForgeCmd::MergeConfig {
+            repo,
+            branch,
+            method,
+            verbose,
+        },
     };
     dispatch(cmd)
 }
