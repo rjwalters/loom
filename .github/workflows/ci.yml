@@ -126,8 +126,9 @@ jobs:
               # signoz_topology_shape.rs (the render + gateway allowlist the
               # Service Map conclusion rests on) and cycle_time_artifacts.rs all
               # `include_str!` these files and
-              # fail on drift, and cycle_time_clickhouse.rs / signoz_usage_queries.rs
-              # execute the SQL verbatim against a real ClickHouse. An artifact-only PR must
+              # fail on drift, and cycle_time_clickhouse.rs / signoz_usage_queries.rs /
+              # signoz_cycle_time.rs execute the SQL verbatim against a real ClickHouse.
+              # An artifact-only PR must
               # re-run those, or the only tests that can catch the regression
               # are skipped on exactly the PRs that cause one (#8665).
               - 'defaults/observability/**'
@@ -472,6 +473,15 @@ jobs:
       # out of the engine the way the artifact's header claims.
       - name: Verify the measured-usage queries against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_usage_queries -- --ignored --nocapture
+      # #8528 / #8665: executes signoz/cycle-time-extract.sql (and the shared
+      # rollup + CT1-CT8 queries) verbatim against the same pinned ClickHouse,
+      # over a fixture seeded to match the SigNoz ingester's own
+      # attributes_string/attributes_number split. Closes the "NOT yet
+      # executed against a live SigNoz deployment" status the extract view
+      # carried since #8665 landed — the ClickStack side was already covered
+      # by cycle_time_clickhouse.rs above.
+      - name: Verify the SigNoz cycle-time extraction against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_cycle_time -- --ignored --nocapture
 
   backend-otlp-tests:
     name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})

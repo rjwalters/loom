@@ -13,11 +13,18 @@
 --     loom-signoz-telemetrystore-clickhouse-0-0 \
 --     clickhouse-client --multiquery < cycle-time-extract.sql
 --
--- STATUS: contract-checked in CI, NOT yet executed against a live SigNoz
--- deployment — the ClickStack side is the live-verified one
--- (`loom-daemon/tests/cycle_time_clickhouse.rs`). See
--- `../cycle-time-questions.md` § "Verification status" before treating a number
--- produced here as comparable evidence under #8529.
+-- STATUS: contract-checked in CI, and — since
+-- `loom-daemon/tests/signoz_cycle_time.rs` — executed verbatim through the
+-- shared rollup and all eight CT queries against the pinned ClickHouse the
+-- SigNoz trial's telemetry store runs, over a fixture shaped like the real
+-- `distributed_logs_v2` schema (the same seven `sweep.outcome` envelopes the
+-- ClickStack proof uses, hand-translated through the real OTLP mapper's own
+-- attribute-type decisions). That is a proof against the pinned engine, NOT
+-- against a live, running SigNoz deployment — no telemetry has gone through
+-- SigNoz's actual ingester for this view, which is what #8529's real-canary
+-- comparison still needs. See `../cycle-time-questions.md` §
+-- "Verification status" before treating a number produced here as comparable
+-- evidence under #8529.
 --
 -- Two deliberate differences from the ClickStack view, both forced by SigNoz's
 -- schema rather than chosen:
