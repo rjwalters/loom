@@ -35,6 +35,9 @@ pub fn drain_json(report: &DaemonStatusReport) -> serde_json::Value {
             "in_flight": r.in_flight,
             "target": r.target,
             "then_exit": r.then_exit,
+            "origin": r.origin,
+            "timed_out": r.timed_out,
+            "startup_hold": r.startup_hold,
         })),
         // #8652: `{ "YYYY-MM-DD": secs }`, UTC days, live pause included. `{}`
         // when nothing was recorded (and from a pre-#8652 daemon).
@@ -72,7 +75,13 @@ pub fn paused_by_day_line(report: &DaemonStatusReport) -> Option<String> {
 #[must_use]
 pub fn roll_line(report: &DaemonStatusReport) -> Option<String> {
     let roll = report.drain_roll.as_ref()?;
-    let state = if roll.roll_pending {
+    // #9588: say WHY dispatch is paused before anything else.
+    let state = if roll.startup_hold {
+        "HELD at startup (operator stop on record — `restart --abort-drain` releases it)"
+    } else if roll.timed_out {
+        "TIMED OUT, dispatch held PAUSED until the stragglers finish (operator drain — \
+         `--abort-drain` resumes, `--drain --force-after-timeout` cancels them)"
+    } else if roll.roll_pending {
         "PENDING"
     } else {
         "armed"
@@ -89,8 +98,13 @@ pub fn roll_line(report: &DaemonStatusReport) -> Option<String> {
         || " [no artifact target — not an auto-update roll]".to_string(),
         |t| format!(" [target {t}]"),
     );
+    let origin = if roll.origin.is_empty() {
+        String::new()
+    } else {
+        format!(" [origin: {}]", roll.origin)
+    };
     Some(format!(
-        "       roll {state} {since} — dispatch paused {}{budget}, {} in flight, {} refusal(s){target}",
+        "       roll {state} {since} — dispatch paused {}{budget}, {} in flight, {} refusal(s){target}{origin}",
         human_secs(roll.paused_secs),
         roll.in_flight,
         roll.refusals,
@@ -136,6 +150,9 @@ mod tests {
             in_flight: 3,
             target: Some("v0.19.24@abcd".to_string()),
             then_exit: false,
+            origin: "auto-update".to_string(),
+            timed_out: false,
+            startup_hold: false,
         }
     }
 
@@ -192,6 +209,33 @@ mod tests {
         assert!(!line.contains("PENDING"), "{line}");
         assert!(line.contains("dispatch paused 45s"), "{line}");
         assert!(line.contains("no artifact target"), "{line}");
+    }
+
+    /// #9588: a timed-out operator drain says dispatch is HELD, why, and how
+    /// to end it — in both the human line and `--json`.
+    #[test]
+    fn a_timed_out_operator_drain_says_it_is_held_paused() {
+        let mut roll = pending_roll();
+        roll.roll_pending = false;
+        roll.target = None;
+        roll.origin = "operator".to_string();
+        roll.timed_out = true;
+        let line = roll_line(&report_with(Some(roll.clone()))).unwrap();
+        assert!(line.contains("TIMED OUT, dispatch held PAUSED"), "{line}");
+        assert!(line.contains("--abort-drain"), "{line}");
+        assert!(line.contains("[origin: operator]"), "{line}");
+        let value = drain_json(&report_with(Some(roll)));
+        assert_eq!(value["roll"]["timed_out"], serde_json::json!(true));
+        assert_eq!(value["roll"]["origin"], serde_json::json!("operator"));
+    }
+
+    #[test]
+    fn a_startup_hold_says_an_operator_stop_is_on_record() {
+        let mut roll = pending_roll();
+        roll.startup_hold = true;
+        roll.origin = "operator".to_string();
+        let line = roll_line(&report_with(Some(roll))).unwrap();
+        assert!(line.contains("HELD at startup"), "{line}");
     }
 
     #[test]

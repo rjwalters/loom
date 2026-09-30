@@ -139,6 +139,8 @@ impl DrainTrigger for IpcDrainTrigger {
             None,
             false,
             false,
+            // #9588: keeps #6007's pending-roll-then-abandon timeout semantics.
+            crate::ipc::DrainOrigin::AutoUpdate,
         );
         // Issue #4521: the reply's `then_exit` reports the ACTIVE drain's
         // terminal action, not this request's. `true` here means an operator
@@ -202,7 +204,7 @@ impl DrainTrigger for IpcDrainTrigger {
         // `roll_target`. Re-deriving that reset by hand is exactly the class of
         // mistake that could resurrect the pre-#6007 drain/work-finder
         // livelock, so this path does not.
-        let superseded = self.drain.abort();
+        let superseded = self.drain.abort_auto_update_roll();
         if superseded {
             // `abort()`'s own note says "aborted by operator", which is not what
             // happened — overwrite it so `status` explains the real reason the
@@ -223,7 +225,7 @@ impl DrainTrigger for IpcDrainTrigger {
         // stands down without exiting the process, and resets every piece of
         // #6007's pending-roll bookkeeping. Re-deriving that reset by hand is
         // how the pre-#6007 drain/work-finder livelock would come back.
-        let abandoned = self.drain.abort();
+        let abandoned = self.drain.abort_auto_update_roll();
         if abandoned {
             // `abort()`'s own note says "aborted by operator", which is not what
             // happened — the daemon gave up on its own roll. Overwrite it so

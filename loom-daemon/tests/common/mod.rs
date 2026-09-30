@@ -80,7 +80,10 @@ pub fn isolate_daemon_state(cmd: &mut Command, fixture: &Path) {
         .env("LOOM_WORKSPACES_PATH", fixture.join("workspaces.json"))
         .env("LOOM_SWEEPS_JOURNAL_PATH", fixture.join("sweeps.json"))
         .env("LOOM_WATCHES_PATH", fixture.join("watches.json"))
-        .env("LOOM_WATCH_RESULTS_LOG", fixture.join("watch-results.log"));
+        .env("LOOM_WATCH_RESULTS_LOG", fixture.join("watch-results.log"))
+        // #9588: a then-exit drain moves the autonomy-desired marker aside —
+        // never let a test daemon reach an inherited/real marker path.
+        .env("LOOM_AUTONOMY_MARKER", fixture.join("autonomy-desired"));
 }
 
 /// Test daemon instance that cleans up on drop

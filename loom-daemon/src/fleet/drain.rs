@@ -60,9 +60,7 @@ use serde::{Deserialize, Serialize};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::{
-    default_fleet_registry_path, CommandOutput, CommandRunner, FleetRegistry, WorkerRecord,
-};
+use super::{default_fleet_registry_path, CommandRunner, FleetRegistry, WorkerRecord};
 use crate::fleet::add_worker::SshRunner;
 
 /// Default bound on how long the remote drain waits for in-flight sweeps
@@ -451,89 +449,11 @@ impl ClaimResetter for GhClaimResetter {
     }
 }
 
-// ===========================================================================
-// Remote status parsing
-// ===========================================================================
-
-/// Whether a remote `status --json` payload (given as raw stdout) reports the
-/// daemon still draining — used by `wait-remote-exit` to distinguish "still
-/// waiting" from "drain was refused and dispatch resumed". Thin string-level
-/// wrapper over [`still_draining`]; the polling path parses once and calls
-/// [`classify_remote_exit`] instead.
+#[path = "drain_probe.rs"]
+mod drain_probe;
 #[cfg(test)]
-#[must_use]
-fn parse_still_draining(stdout: &str) -> Option<bool> {
-    let value = serde_json::from_str::<serde_json::Value>(stdout).ok()?;
-    still_draining(&value)
-}
-
-/// Read the drain flag out of an already-parsed `status --json` payload.
-///
-/// The real payload **nests** this under `drain` — `build_status_json_value`
-/// in `main.rs` emits `"drain": { "draining": …, "deadline": …, "note": … }`
-/// (#4090) — so a top-level-only read always returns `None` against a live
-/// daemon and silently disables the refusal branch in [`wait_remote_exit`].
-/// The top-level fallback keeps a hypothetical flatter/older payload legible
-/// rather than making the parse brittle.
-#[must_use]
-fn still_draining(value: &serde_json::Value) -> Option<bool> {
-    value
-        .get("drain")
-        .and_then(|drain| drain.get("draining"))
-        .or_else(|| value.get("draining"))
-        .and_then(serde_json::Value::as_bool)
-}
-
-/// One `wait-remote-exit` poll's verdict about the remote daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemoteExitProbe {
-    /// The remote daemon is gone — the expected outcome of a `then_exit`
-    /// drain, whether the *host* is still up (the normal case) or also gone.
-    Exited,
-    /// Still draining, or the payload is not (yet) legible — keep polling.
-    StillGoing,
-    /// The daemon is reachable and reports `draining: false` — the drain was
-    /// refused/aborted and dispatch resumed. Fail loudly.
-    Refused,
-}
-
-/// Classify one remote `loom-daemon status --json` invocation.
-///
-/// Three shapes matter, and only the first used to be handled:
-///
-/// 1. **Empty stdout + non-zero exit** — the SSH transport itself failed
-///    (connection refused, exit 255): host gone ⇒ `Exited`.
-/// 2. **A payload with a top-level `error` key** — the #4069
-///    unreachable-daemon payload (`print_status_unreachable_json` in
-///    `main.rs`) `println!`s `{"error": "could not reach loom-daemon at …",
-///    "install_state": …}` to **stdout** and exits non-zero
-///    (`install_state.exit_code()`). This is the normal post-`then_exit`
-///    state (host up, daemon down) and is therefore the primary success
-///    signal, not a parse miss. Mirrors
-///    [`super::status::classify_status_output`]'s `DaemonDown` arm.
-/// 3. **A live status payload** — inspect `drain.draining` to tell "still
-///    draining" from "refused and dispatching again".
-#[must_use]
-fn classify_remote_exit(out: &CommandOutput) -> RemoteExitProbe {
-    if out.stdout.trim().is_empty() {
-        return if out.ok() {
-            // Reachable but silent — nothing to conclude yet.
-            RemoteExitProbe::StillGoing
-        } else {
-            RemoteExitProbe::Exited
-        };
-    }
-    match serde_json::from_str::<serde_json::Value>(&out.stdout) {
-        Ok(value) if value.get("error").is_some() => RemoteExitProbe::Exited,
-        Ok(value) => match still_draining(&value) {
-            Some(false) => RemoteExitProbe::Refused,
-            // `Some(true)` (still draining) or `None` (a payload without the
-            // field at all) ⇒ keep polling.
-            _ => RemoteExitProbe::StillGoing,
-        },
-        Err(_) => RemoteExitProbe::StillGoing,
-    }
-}
+use drain_probe::parse_still_draining;
+use drain_probe::{classify_remote_exit, RemoteExitProbe};
 
 /// Best-effort mapping from a captured in-flight sweep's workspace-root path
 /// (`SweepInfo.repo`) to one of the worker's registered forge slugs, by
@@ -840,6 +760,17 @@ fn wait_remote_exit(runner: &dyn CommandRunner, config: &DrainConfig) -> PhaseOu
             Ok(out) => match classify_remote_exit(&out) {
                 RemoteExitProbe::Exited => return PhaseOutcome::Changed,
                 RemoteExitProbe::StillGoing => { /* keep polling */ }
+                RemoteExitProbe::TimedOutHeld => {
+                    return PhaseOutcome::Failed {
+                        reason: format!(
+                            "remote drain timed out (no --force-after-timeout) — {} is HOLDING \
+                             dispatch PAUSED (#9588) and will stop once its stragglers finish. \
+                             Re-run `fleet drain --force-after-timeout` to cancel them, or run \
+                             `loom-daemon restart --abort-drain` on the host to resume dispatch.",
+                            config.ssh_host
+                        ),
+                    };
+                }
                 RemoteExitProbe::Refused => {
                     return PhaseOutcome::Failed {
                         reason: format!(

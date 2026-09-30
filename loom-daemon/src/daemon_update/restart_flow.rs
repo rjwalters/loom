@@ -145,7 +145,7 @@ fn report_drain_failsafe(p: &Plan<'_>, cur_pid: &str, poll_secs: &str) -> ! {
     // the recurrence advice is "do nothing", not "re-run" — re-running on a
     // busy host is what reproduced this.
     if restart::drain_roll_still_armed(p.provision_target) {
-        out::warn("The daemon reports its drain STILL IN PROGRESS past the deadline — it has KEPT THE ROLL PENDING (#6007): new dispatch is still paused and the restart re-arms itself the moment the in-flight set reaches zero. Nothing to re-run — this host converges onto the provisioned binary on its own (or resumes dispatch and says so once the pending roll's paused-dispatch budget is spent).");
+        out::warn("The daemon reports its drain STILL IN PROGRESS past the deadline — it has KEPT THE ROLL PENDING and, as an operator drain, HOLDS it (#6007, #9588): new dispatch stays paused and the restart fires the moment the in-flight set reaches zero. Nothing to re-run — this host converges onto the provisioned binary on its own; dispatch does NOT resume until it does or you abort.");
         out::warn("Watch it with 'loom-daemon status' (the line under 'Drain: DRAINING …' explains the pending roll). To take over: 'loom-daemon restart --abort-drain' gives up and resumes dispatch now, or 'loom-daemon restart --drain --force-after-timeout' cancels the remaining sweep(s) and rolls immediately.");
     } else {
         out::warn("Re-run this script (or 'loom-daemon restart --drain' by hand) once the in-flight sweep(s) finish, or re-run with --force-after-timeout to force the roll through.");

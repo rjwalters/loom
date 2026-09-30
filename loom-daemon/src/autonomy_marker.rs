@@ -83,6 +83,11 @@ pub enum HealOutcome {
     /// Supervised, marker absent, but the write failed. Non-fatal — logged and
     /// the daemon keeps running.
     WriteFailed { path: PathBuf, error: String },
+    /// Supervised and the marker is absent **because an operator stopped this
+    /// daemon** (#9588 — [`crate::operator_stop`]'s record exists). NOT
+    /// re-armed: healing it would let the watchdog revive a daemon an operator
+    /// deliberately stopped.
+    OperatorStopped(PathBuf),
 }
 
 /// The fields a healing marker records — the exact set
@@ -235,6 +240,9 @@ pub fn heal_marker(
     if supervisor.is_none() {
         return HealOutcome::UnsupervisedSkip;
     }
+    if crate::operator_stop::is_recorded(marker_path) {
+        return HealOutcome::OperatorStopped(crate::operator_stop::record_path(marker_path));
+    }
     if marker_path.exists() {
         return HealOutcome::AlreadyPresent;
     }
@@ -295,6 +303,43 @@ pub fn heal_on_startup(heartbeat_interval_secs: u64) -> Option<HealOutcome> {
     Some(heal_marker(supervisor.as_deref(), &marker_path, &fields))
 }
 
+/// Log a [`heal_on_startup`] outcome — one line per branch, at the level each
+/// deserves. Lives here (not in the frozen `daemon_service.rs`) so a new
+/// outcome never has to grow that file.
+pub fn log_heal_outcome(outcome: Option<HealOutcome>) {
+    match outcome {
+        Some(HealOutcome::Healed(path)) => log::warn!(
+            "autonomy_marker: HEALED an absent autonomy-desired marker at {} — a supervised \
+             daemon was running with crash protection disarmed (restart-primitive / self-update / \
+             bare relaunch never re-writes it). The watchdog and `loom-daemon status` now see this \
+             daemon as EXPECTED again (#4331).",
+            path.display()
+        ),
+        Some(HealOutcome::AlreadyPresent) => {
+            log::debug!("autonomy_marker: marker already present — no healing needed (#4331)");
+        }
+        Some(HealOutcome::UnsupervisedSkip) => log::debug!(
+            "autonomy_marker: unsupervised run (no LOOM_DAEMON_SUPERVISOR) — deliberately NOT \
+             writing an autonomy-desired marker (#4331)"
+        ),
+        Some(HealOutcome::WriteFailed { path, error }) => log::warn!(
+            "autonomy_marker: failed to heal the autonomy-desired marker at {} (logged, never \
+             fatal; the daemon keeps running): {error} (#4331)",
+            path.display()
+        ),
+        Some(HealOutcome::OperatorStopped(record)) => log::warn!(
+            "autonomy_marker: NOT healing the autonomy-desired marker — an operator stop is on \
+             record at {} (#9588), so the watchdog must not revive this daemon. Dispatch is held; \
+             `loom-daemon restart --abort-drain` releases it and restores the marker.",
+            record.display()
+        ),
+        None => log::warn!(
+            "autonomy_marker: could not resolve a loom dir (no LOOM_SOCKET_PATH / home) — \
+             skipping marker healing for this run (#4331)"
+        ),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -331,6 +376,21 @@ mod tests {
         let outcome = heal_marker(Some("launchd"), &marker, &sample_fields(dir.path()));
         assert_eq!(outcome, HealOutcome::Healed(marker.clone()));
         assert!(marker.exists(), "supervised + absent marker ⇒ healed");
+    }
+
+    /// #9588: an operator stop on record blocks healing, so a supervised
+    /// relaunch cannot re-arm the watchdog behind the operator's back.
+    #[test]
+    fn an_operator_stop_record_blocks_healing() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(MARKER_FILENAME);
+        crate::operator_stop::record(&marker, "then-exit").unwrap();
+        let outcome = heal_marker(Some("systemd"), &marker, &sample_fields(dir.path()));
+        assert_eq!(
+            outcome,
+            HealOutcome::OperatorStopped(crate::operator_stop::record_path(&marker))
+        );
+        assert!(!marker.exists(), "the stopped daemon's marker must stay absent");
     }
 
     #[test]
