@@ -3051,7 +3051,19 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
     # any of these names, and was always reached.
     _CP_RC=0; _CP_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr cleanup-paths --repo-root "$REPO_ROOT" --branch "$PR_BRANCH" --pr "$PR_NUMBER" 2>/dev/null)" || _CP_RC=$?
     [[ $_CP_RC -eq 0 && "$_CP_OUT" == "LOOM-CLEANUP-PATHS"$'\t'* ]] || { warning "Post-merge worktree cleanup for PR #$PR_NUMBER did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr cleanup-paths' exited $_CP_RC without a LOOM-CLEANUP-PATHS line (a loom-daemon predating #8191's slice has no such verb), so which worktree paths this merge owns is unknown. Nothing is removed rather than guessed — the merge itself already succeeded and is unaffected. Clean up by hand once loom-daemon is available: ${SCRIPT_DIR:-.loom/scripts}/worktree.sh remove <issue>, or loom-clean. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"; _CP_OUT="LOOM-CLEANUP-PATHS"$'\t\t\t'; }
-    IFS=$'\t' read -r ISSUE_NUM DEFAULT_WT_PATH JUDGE_PR_WT_PATH <<<"${_CP_OUT#*$'\t'}"
+    # Field order is $DEFAULT_WT_PATH FIRST, and that is load-bearing, not
+    # cosmetic: tab is an IFS *whitespace* character, so `read` strips a leading
+    # run of IFS whitespace and collapses runs of it — an empty LEADING field
+    # cannot survive this read at all. With $ISSUE_NUM first (the order the
+    # retired inline shell assigned these in), a non-feature/issue-<N> branch
+    # rendered `…\t\t<default>\t`, the `\t\t` run collapsed, $DEFAULT_WT_PATH
+    # landed in $ISSUE_NUM and both path names came out EMPTY — silently skipping
+    # cleanup for every PR-only branch (docs/…, security/…, slice branches) with
+    # no warning at all, because the verb had exited 0 with a well-formed line.
+    # Empty TRAILING fields `read` does preserve, and $DEFAULT_WT_PATH is the one
+    # field the verb never leaves empty (the other two are empty together, by
+    # #6264's asymmetry), so leading with it keeps both empties in the tail.
+    IFS=$'\t' read -r DEFAULT_WT_PATH ISSUE_NUM JUDGE_PR_WT_PATH <<<"${_CP_OUT#*$'\t'}"
     if [[ -d "$DEFAULT_WT_PATH" ]]; then
       # Close-target-aware gate (#4186): ISSUE_NUM is only set when
       # PR_BRANCH matched the feature/issue-<N> convention above. When it's

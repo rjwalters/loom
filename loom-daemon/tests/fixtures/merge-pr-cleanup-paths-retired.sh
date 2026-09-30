@@ -52,7 +52,11 @@ _cleanup_paths_retired() {
     fi
 
     # Harness-only: publish what the retired block left in scope, in the same
-    # field order the ported verb prints.
+    # field order the ported verb prints — $DEFAULT_WT_PATH first, because tab is
+    # IFS whitespace and bash's `read` cannot preserve an empty LEADING field, so
+    # the one always-non-empty name has to lead. See `render`'s docs. The retired
+    # block had no wire format of its own (it just assigned these four variables),
+    # so this ordering is purely the harness's choice of how to publish them.
     printf 'LOOM-CLEANUP-PATHS\t%s\t%s\t%s\n' \
-        "${ISSUE_NUM:-}" "$DEFAULT_WT_PATH" "$JUDGE_PR_WT_PATH"
+        "$DEFAULT_WT_PATH" "${ISSUE_NUM:-}" "$JUDGE_PR_WT_PATH"
 }

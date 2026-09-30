@@ -39,6 +39,20 @@
 //!    (`_loom_root_unreadable`) that `worktree_root_readable` exists to keep.
 //!
 //! There are no known divergences: the port changes no decision.
+//!
+//! # What it deliberately does NOT prove
+//!
+//! The **framing/parse round-trip**. Both sides here emit a rendered line and
+//! the comparison is between those two strings, so a field order bash's `read`
+//! cannot actually parse back passes this test — the retired shell never
+//! serialised anything (it assigned four variables in scope), so the wire format
+//! is new surface the port introduced and has no pre-port counterpart to
+//! differ from. That gap is covered by
+//! `merge_pr::cleanup_paths::tests::the_rendered_line_round_trips_through_the_shells_read`
+//! (real `bash`, the verbatim `read` from `merge-pr.sh`) and by Test 10 in
+//! `defaults/scripts/tests/test-merge-pr-worktree-path.sh` (the real cleanup
+//! block, a non-issue branch, the real daemon). This file only adds the cheap
+//! half of the guard: the leading field is asserted non-empty on every case.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -261,20 +275,27 @@ fn the_plan_agrees_with_the_retired_shell_on_every_input() {
                     "cfg={cfg:?} branch={branch:?} pr={pr:?}: the port disagrees with the \
                      retired shell"
                 );
-                // Field 1 non-empty iff the branch classified as issue-style;
+                // Field 2 non-empty iff the branch classified as issue-style;
                 // record which side of #6264's asymmetry this case exercised.
+                // (Field 1 is the default path — it leads precisely because it
+                // is the only one that is never empty; see `render`'s docs.)
                 let fields: Vec<&str> = rust.trim_end_matches('\n').split('\t').collect();
                 assert_eq!(fields.len(), 4, "framing must stay four fields: {rust:?}");
-                if fields[1].is_empty() {
+                assert!(
+                    !fields[1].is_empty(),
+                    "the leading field must never be empty — bash's `read` cannot preserve an \
+                     empty leading field when IFS is a whitespace character: {rust:?}"
+                );
+                if fields[2].is_empty() {
                     assert!(fields[3].is_empty(), "no issue number ⇒ no judge-pr path");
                     without_issue += 1;
                 } else {
                     assert!(!fields[3].is_empty(), "issue number ⇒ a judge-pr path");
                     with_issue += 1;
                 }
-                let root = fields[2]
+                let root = fields[1]
                     .rsplit_once('/')
-                    .map_or(fields[2], |(head, _)| head)
+                    .map_or(fields[1], |(head, _)| head)
                     .to_string();
                 if !distinct_roots.contains(&root) {
                     distinct_roots.push(root);

@@ -769,7 +769,9 @@ pub(crate) enum MergePrCommand {
     /// strict `^feature/issue-([0-9]+)$` classification, the override-aware
     /// worktree root, and from them the default cleanup target plus the
     /// co-existing Judge/Doctor `pr-<N>` review worktree. Prints one
-    /// `LOOM-CLEANUP-PATHS<TAB>issue<TAB>default<TAB>judge-pr` line; every
+    /// `LOOM-CLEANUP-PATHS<TAB>default<TAB>issue<TAB>judge-pr` line (the
+    /// always-non-empty path leads: tab is IFS whitespace, so bash's `read`
+    /// cannot preserve an empty LEADING field); every
     /// `[[ -d ]]`/sentinel test and the removal itself stay in the shell. Exit
     /// 2 = the resolved root cannot be framed unambiguously. The seam fails
     /// OPEN (no targets, clean up nothing) — see `cli::merge_pr_cleanup_paths`.

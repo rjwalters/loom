@@ -128,10 +128,45 @@ pub fn plan(branch: &str, pr_number: &str, worktree_root: &Path) -> Plan {
 /// possibly empty.
 ///
 /// ```text
-/// LOOM-CLEANUP-PATHS<TAB><issue-num><TAB><default-path><TAB><judge-pr-path>
+/// LOOM-CLEANUP-PATHS<TAB><default-path><TAB><issue-num><TAB><judge-pr-path>
 /// ```
 ///
-/// A tab or newline inside any field would make that framing ambiguous, and an
+/// # Why `default-path` leads, and why that is not cosmetic
+///
+/// The consumer is one `IFS=$'\t' read -r DEFAULT_WT_PATH ISSUE_NUM
+/// JUDGE_PR_WT_PATH`, and **tab is an IFS *whitespace* character in bash**:
+/// `read` strips leading/trailing IFS whitespace from the line before splitting
+/// and collapses a *run* of it into a single delimiter. So an **empty leading**
+/// field cannot survive that read at all — with the fields in the order the
+/// original shell assigned them (`issue` first), a non-`feature/issue-<N>`
+/// branch rendered `…\t\t<default>\t`, the `\t\t` run collapsed, and
+/// `$DEFAULT_WT_PATH` landed in `$ISSUE_NUM` while both real path names came
+/// out empty — silently skipping post-merge cleanup for every PR-only branch
+/// (`docs/…`, `security/…`, slice branches) with no warning, because the verb
+/// had exited 0 with a well-formed sentinel.
+///
+/// Empty **trailing** fields `read` handles correctly, so putting the one field
+/// that is non-empty in every case first fixes it:
+///
+/// ```text
+/// IFS=$'\t' read -r a b c <<< $'/wt/pr-7\t\t'        → a=/wt/pr-7  b=''  c=''
+/// IFS=$'\t' read -r a b c <<< $'/wt/issue-42\t42\t/wt/pr-7'
+///                                                    → a=/wt/issue-42 b=42 c=/wt/pr-7
+/// ```
+///
+/// That is only sound because `default_path` is the sole field with no `None`
+/// case, and because the other two are empty *together*: [`plan`] sets
+/// `issue_num` and `judge_pr_path` from the same branch classification, so
+/// `issue_num.is_some() == judge_pr_path.is_some()` always (#6264's asymmetry —
+/// asserted as an invariant of every differential case, and by
+/// `tests::the_two_optional_fields_are_always_empty_together`). Both empties
+/// therefore always move to the tail together; neither can ever become a
+/// leading empty field.
+///
+/// A non-whitespace `IFS` delimiter was not an option: every byte except NUL
+/// and newline can legally appear in a path.
+///
+/// A tab or newline inside any field would make the framing ambiguous, and an
 /// ambiguous answer here names a path something later force-removes. Only the
 /// worktree root can carry one (the branch already passed `check_branch_name`,
 /// #9106, and the PR number is digits), so this returns `None` instead —
@@ -152,7 +187,7 @@ pub fn render(plan: &Plan) -> Option<String> {
     {
         return None;
     }
-    Some(format!("LOOM-CLEANUP-PATHS\t{issue}\t{default}\t{judge}\n"))
+    Some(format!("LOOM-CLEANUP-PATHS\t{default}\t{issue}\t{judge}\n"))
 }
 
 #[cfg(test)]

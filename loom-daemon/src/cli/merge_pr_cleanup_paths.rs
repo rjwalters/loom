@@ -9,12 +9,18 @@
 //! retired `lib/worktree-root.sh` also performed — and prints exactly one line:
 //!
 //! ```text
-//! LOOM-CLEANUP-PATHS<TAB><issue-num><TAB><default-path><TAB><judge-pr-path>
+//! LOOM-CLEANUP-PATHS<TAB><default-path><TAB><issue-num><TAB><judge-pr-path>
 //! ```
 //!
-//! Fields 1 and 3 are empty for a non-`feature/issue-<N>` branch, which is what
+//! Fields 2 and 3 are empty for a non-`feature/issue-<N>` branch, which is what
 //! the shell's `ISSUE_NUM` / `JUDGE_PR_WT_PATH` held there. The separator count
-//! is fixed at three so `IFS=$'\t' read -r a b c` fills all three names.
+//! is fixed at three, but that alone is NOT what makes `IFS=$'\t' read -r a b c`
+//! fill all three names: **tab is IFS whitespace**, so bash strips a leading run
+//! of it and an empty *leading* field is unrecoverable. `<default-path>` — the
+//! only field with no absent case — therefore leads, which pushes both possible
+//! empties to the tail, where `read` does preserve them. See
+//! [`loom_daemon::merge_pr::cleanup_paths::render`] for the full reasoning and
+//! the bug this ordering fixes.
 //!
 //! # Exit code
 //!
