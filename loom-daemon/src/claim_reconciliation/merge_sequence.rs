@@ -1,0 +1,1006 @@
+//! Proactive landing-order planning for overlapping PRs (#9686 — the first
+//! release of the #9063 epic: automatic ordering, not combinations).
+//!
+//! # The problem
+//!
+//! When several PRs touch the same area, repairing each against every
+//! intermediate main tip sends the same work through Doctor and Judge
+//! repeatedly, and Champion merges whichever approved PR it reaches first —
+//! possibly the wrong one of an ordered pair (the #9378 incident). Ordering
+//! was previously agreed in prose, which no tool reads.
+//!
+//! # What the pass does, per tick per repo
+//!
+//! - **Trigger.** Repos with ≤2 open PRs are a byte-identical no-op (the
+//!   trigger counts ALL open PRs, including drafts and held ones — only the
+//!   *ordering* excludes them).
+//! - **Plan.** Eligible open PRs (not draft, no hold label, no agent
+//!   mid-flight, pinnable head) are grouped into connected components of the
+//!   shared-changed-file graph. Shared filenames are evidence of possible
+//!   overlap, never proof of semantic compatibility — the pass only orders,
+//!   it never merges, vouches, or combines. Within a component, existing
+//!   trusted `loom:sequence` markers and base-branch stacking are
+//!   authoritative constraints; everything else orders oldest-first (stable
+//!   tiebreak on PR number). A constraint cycle skips the whole component
+//!   for that tick — a half-rewritten order is worse than a deferred one.
+//! - **Apply.** Consecutive pairs in each ordered component become chain
+//!   edges: the follower gets `loom:sequenced` (#9378's durable gate) and a
+//!   trusted `source=pass` marker pinning both heads and the plan id.
+//!   Followers that already carry a trusted marker are never re-planned —
+//!   a human's or another pass's "after" wins over the computed order.
+//! - **Release / replan.** Every open holder is re-evaluated with #9378's
+//!   [`evaluate`]: predecessor landed at the recorded head ⇒ release;
+//!   predecessor closed unmerged ⇒ release with that reason; any moved head
+//!   ⇒ the stale hold is voided (label off, replan note) and the next tick
+//!   re-derives a fresh, correctly-pinned plan. Soft (`source=pass`) holds
+//!   on approved followers expire when the predecessor has been quiet for
+//!   `LOOM_MERGE_SEQUENCE_MAX_AGE_HOURS` (default 72) — a scheduling
+//!   preference must not starve mergeable work. Hard holds (no `source=`,
+//!   the human-authored shape) never auto-expire: expiring a semantic
+//!   dependency into merge permission is exactly the failure #9063 forbids.
+//! - **Defer repairs.** The review-conflict pass
+//!   (`super::review_conflict`) consults this module's `defer_base_repair`:
+//!   a base-conflicting review-queue PR whose sequencing predecessor is
+//!   still open at the recorded head is NOT flagged for Doctor — the
+//!   predecessor landing will move the base again, so the repair would be
+//!   redundant. The deferral is this pass's own marker on the PR and ends on
+//!   its own: once the predecessor lands (or the hold releases for any
+//!   reason), the follower is an ordinary conflicting PR and the next tick
+//!   flags it. The last needed repair always still runs.
+//!
+//! # What it never does
+//!
+//! No merge, no branch mutation, no verdict or CI result is fabricated or
+//! carried forward (#9416 owns proven equivalence), no substantive Judge
+//! rejection is suppressed (only THIS pass's base-conflict auto-flag
+//! consults the sequence state), and independent PRs are untouched. Every
+//! write is idempotent: an identical marker already on the PR suppresses the
+//! repeat comment, so competing daemons converge instead of spamming.
+//!
+//! Kill switch: [`MERGE_SEQUENCE_ENABLED_ENV`] (default ON), nested inside
+//! the master `LOOM_STALE_CLAIM_RECONCILE` switch like the review-conflict
+//! pass. Read-only inspection: `loom-daemon merge-pr sequence-plan`.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+use crate::merge_pr::sequence::{
+    evaluate, fetch_predecessor, fetch_trusted_bodies, marker_text, parse, KeepReason,
+    PredecessorState, SequenceMarker, Verdict,
+};
+/// Kill switch for this pass (`0`/`false`/`no`/`off` disables). Defaults ON.
+pub const MERGE_SEQUENCE_ENABLED_ENV: &str = "LOOM_MERGE_SEQUENCE_RECONCILE";
+
+/// Soft holds expire when the predecessor has been quiet (its `updatedAt`
+/// has not moved) for this many hours AND the follower is Judge-approved.
+/// Any predecessor activity — even a comment — keeps the order fresh; the
+/// bound exists so a stalled ordering cannot starve mergeable work forever.
+pub const MERGE_SEQUENCE_MAX_AGE_ENV: &str = "LOOM_MERGE_SEQUENCE_MAX_AGE_HOURS";
+const DEFAULT_MAX_AGE_HOURS: f64 = 72.0;
+
+/// The durable hold label this pass applies (defined by #9378).
+pub const SEQUENCE_LABEL: &str = "loom:sequenced";
+
+/// The trigger: repositories with MORE THAN TWO open PRs are planned; two or
+/// fewer keep byte-identical behavior. Counts ALL open PRs (the issue is
+/// explicit that drafts and held PRs count toward the trigger while staying
+/// ineligible for ordering).
+pub const TRIGGER_OPEN_PRS: usize = 2;
+
+/// An agent is actively working the PR — never plan around it.
+const IN_FLIGHT_LABELS: [&str; 2] = ["loom:reviewing", "loom:treating"];
+
+/// `source=pass` — the marker this pass writes. Soft: expiry-eligible.
+pub const SOURCE_PASS: &str = "pass";
+
+/// Is this pass enabled? See [`MERGE_SEQUENCE_ENABLED_ENV`].
+#[must_use]
+pub fn merge_sequence_enabled() -> bool {
+    match std::env::var(MERGE_SEQUENCE_ENABLED_ENV) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
+}
+
+/// The soft-hold expiry bound, in hours.
+#[must_use]
+pub fn max_age_hours() -> f64 {
+    std::env::var(MERGE_SEQUENCE_MAX_AGE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|h| *h > 0.0)
+        .unwrap_or(DEFAULT_MAX_AGE_HOURS)
+}
+
+/// An open PR as the planning core sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequencePr {
+    pub number: u32,
+    /// RFC3339; lexicographic order is chronological order.
+    pub created_at: String,
+    /// RFC3339; moves on ANY predecessor activity — the staleness signal.
+    pub updated_at: String,
+    pub head_sha: Option<String>,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub draft: bool,
+    pub labels: Vec<String>,
+}
+
+impl SequencePr {
+    #[must_use]
+    pub fn has(&self, label: &str) -> bool {
+        self.labels.iter().any(|l| l == label)
+    }
+
+    /// Ordering eligibility: drafts and held PRs stay out of the plan (they
+    /// count toward the trigger only), and an agent mid-flight is left alone.
+    #[must_use]
+    pub fn eligible_for_ordering(&self) -> bool {
+        if self.draft {
+            return false;
+        }
+        if super::VERDICT_HOLD_LABELS.iter().any(|l| self.has(l)) {
+            return false;
+        }
+        !IN_FLIGHT_LABELS.iter().any(|l| self.has(l))
+    }
+
+    /// Pinnable: a head SHA the marker can pin. An unpinnable PR cannot be
+    /// re-checked later, so it is never ordered.
+    #[must_use]
+    pub fn pinnable(&self) -> bool {
+        self.head_sha.as_deref().is_some_and(|s| !s.is_empty())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GhLabel {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhSequencePr {
+    number: u32,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    #[serde(rename = "updatedAt")]
+    updated_at: String,
+    #[serde(rename = "headRefOid", default)]
+    head_ref_oid: Option<String>,
+    #[serde(rename = "headRefName", default)]
+    head_ref_name: Option<String>,
+    #[serde(rename = "baseRefName", default)]
+    base_ref_name: Option<String>,
+    #[serde(default)]
+    is_draft: bool,
+    #[serde(default)]
+    labels: Vec<GhLabel>,
+}
+
+/// Parse one `gh pr list --json` payload with the fields the planner needs.
+///
+/// # Errors
+/// Malformed JSON.
+pub fn parse_pr_list(stdout: &[u8]) -> Result<Vec<SequencePr>> {
+    let rows: Vec<GhSequencePr> =
+        serde_json::from_slice(stdout).context("parse gh pr list JSON")?;
+    Ok(rows
+        .into_iter()
+        .map(|r| SequencePr {
+            number: r.number,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            head_sha: r.head_ref_oid,
+            head_ref: r.head_ref_name.unwrap_or_default(),
+            base_ref: r.base_ref_name.unwrap_or_default(),
+            draft: r.is_draft,
+            labels: r.labels.into_iter().map(|l| l.name).collect(),
+        })
+        .collect())
+}
+
+/// Why a component/edge exists — recorded on the plan, consumed by telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeReason {
+    /// Shared changed filenames inside the component.
+    SharedFiles,
+    /// The follower's base branch is the predecessor's head branch (stacked).
+    StackedBase,
+}
+
+/// One planned ordering edge: `follower` waits for `after` (chain order).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceEdge {
+    pub follower: u32,
+    pub after: u32,
+    /// The predecessor head to pin (`pred_head=`).
+    pub pred_head: String,
+    /// The follower head to pin (`follower_head=`).
+    pub follower_head: String,
+    /// Deterministic plan id shared by every edge of one component.
+    pub plan: String,
+    pub reason: EdgeReason,
+}
+
+/// A planned component: ordered members plus the chain edges to apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceGroup {
+    pub plan: String,
+    /// Member PR numbers in landing order (oldest-first absent constraints).
+    pub order: Vec<u32>,
+    pub edges: Vec<SequenceEdge>,
+}
+
+/// Deterministic plan id for one component: `seq-` + 8 hex of SHA-256 over
+/// the sorted `number:head` member lines. Same members at same heads ⇒ same
+/// id across daemons and versions ⇒ apply is idempotent (a re-run recognizes
+/// its own marker instead of posting a duplicate).
+#[must_use]
+pub fn plan_id(members: &[(u32, &str)]) -> String {
+    let mut lines: Vec<String> = members.iter().map(|(n, h)| format!("{n}:{h}")).collect();
+    lines.sort();
+    let mut hasher = Sha256::new();
+    for line in &lines {
+        hasher.update(line.as_bytes());
+        hasher.update(b"\n");
+    }
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("seq-{}", &digest[..8])
+}
+
+/// Connected components of the shared-file overlap graph over `eligible`.
+///
+/// `files` maps PR number → its changed paths. PRs without an entry (a
+/// failed files read) are singletons — a failed read must not widen a group
+/// by pretending to know the files.
+#[must_use]
+pub fn overlap_components(
+    eligible: &[&SequencePr],
+    files: &BTreeMap<u32, BTreeSet<String>>,
+) -> Vec<Vec<u32>> {
+    let nums: Vec<u32> = eligible.iter().map(|p| p.number).collect();
+    let mut adj: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for (i, a) in eligible.iter().enumerate() {
+        for b in &eligible[i + 1..] {
+            let shared = files
+                .get(&a.number)
+                .zip(files.get(&b.number))
+                .is_some_and(|(fa, fb)| fa.iter().any(|f| fb.contains(f)));
+            if shared {
+                adj.entry(a.number).or_default().push(b.number);
+                adj.entry(b.number).or_default().push(a.number);
+            }
+        }
+    }
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    let mut out = Vec::new();
+    for start in &nums {
+        if seen.contains(start) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut queue = VecDeque::from([*start]);
+        seen.insert(*start);
+        while let Some(n) = queue.pop_front() {
+            component.push(n);
+            for next in adj.get(&n).into_iter().flatten() {
+                if seen.insert(*next) {
+                    queue.push_back(*next);
+                }
+            }
+        }
+        out.push(component);
+    }
+    out
+}
+
+/// Order one component's members: constraint edges first (trusted markers
+/// among members, stacked bases), then oldest-first with a stable number
+/// tiebreak. `None` on a constraint cycle — the caller skips the component
+/// whole rather than applying a partial order.
+#[must_use]
+pub fn order_component(members: &[&SequencePr], constraints: &[(u32, u32)]) -> Option<Vec<u32>> {
+    let nums: BTreeSet<u32> = members.iter().map(|p| p.number).collect();
+    let mut succ: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut indegree: BTreeMap<u32, usize> = members.iter().map(|p| (p.number, 0)).collect();
+    for (follower, after) in constraints {
+        if nums.contains(follower) && nums.contains(after) && follower != after {
+            succ.entry(*after).or_default().push(*follower);
+            indegree.entry(*follower).and_modify(|d| *d += 1);
+        }
+    }
+    let by_number: BTreeMap<u32, &SequencePr> = members.iter().map(|p| (p.number, *p)).collect();
+    let mut ready: Vec<u32> = indegree
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(n, _)| *n)
+        .collect();
+    let mut ordered = Vec::with_capacity(members.len());
+    while !ready.is_empty() {
+        // Oldest-first among the currently placeable: a stable total order
+        // independent of the input listing's order.
+        ready.sort_by(|a, b| {
+            let (pa, pb) = (by_number[a], by_number[b]);
+            (&pa.created_at, pa.number).cmp(&(&pb.created_at, pb.number))
+        });
+        let n = ready.remove(0);
+        ordered.push(n);
+        for next in succ.get(&n).into_iter().flatten() {
+            let d = indegree.get_mut(next).expect("edge target is a member");
+            *d -= 1;
+            if *d == 0 {
+                ready.push(*next);
+            }
+        }
+    }
+    (ordered.len() == members.len()).then_some(ordered)
+}
+
+/// Plan chain edges for one ordered component.
+///
+/// Followers with no pinnable head SHA yield no edge: an unpinned hold
+/// cannot be re-checked safely. Edges carry [`EdgeReason::SharedFiles`]
+/// except where the follower's base branch IS the predecessor's head branch
+/// ([`EdgeReason::StackedBase`]).
+#[must_use]
+pub fn plan_group(
+    plan: &str,
+    order: &[u32],
+    by_number: &BTreeMap<u32, SequencePr>,
+) -> SequenceGroup {
+    let mut edges = Vec::new();
+    for pair in order.windows(2) {
+        let (after, follower) = (pair[0], pair[1]);
+        let (Some(pred), Some(fol)) = (by_number.get(&after), by_number.get(&follower)) else {
+            continue;
+        };
+        let (Some(pred_head), Some(follower_head)) =
+            (pred.head_sha.as_deref(), fol.head_sha.as_deref())
+        else {
+            continue;
+        };
+        edges.push(SequenceEdge {
+            follower: fol.number,
+            after,
+            pred_head: pred_head.to_string(),
+            follower_head: follower_head.to_string(),
+            plan: plan.to_string(),
+            reason: if fol.base_ref == pred.head_ref {
+                EdgeReason::StackedBase
+            } else {
+                EdgeReason::SharedFiles
+            },
+        });
+    }
+    SequenceGroup {
+        plan: plan.to_string(),
+        order: order.to_vec(),
+        edges,
+    }
+}
+
+/// The full plan for one repo's open set. Pure: the caller fetched listing +
+/// files + trusted markers, and gets back the groups to apply. Constraints
+/// come from `markers` (trusted, by follower) and from base-branch stacking
+/// among members. Components of size 1 are not groups.
+#[must_use]
+pub fn plan_repo(
+    open_prs: &[SequencePr],
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    markers: &BTreeMap<u32, SequenceMarker>,
+) -> Vec<SequenceGroup> {
+    if open_prs.len() <= TRIGGER_OPEN_PRS {
+        return Vec::new();
+    }
+    let eligible: Vec<&SequencePr> = open_prs
+        .iter()
+        .filter(|p| p.eligible_for_ordering() && p.pinnable())
+        .collect();
+    let by_number: BTreeMap<u32, SequencePr> =
+        open_prs.iter().map(|p| (p.number, p.clone())).collect();
+    let mut groups = Vec::new();
+    for component in overlap_components(&eligible, files) {
+        if component.len() < 2 {
+            continue;
+        }
+        let mut constraints: Vec<(u32, u32)> = Vec::new();
+        for n in &component {
+            if let Some(m) = markers.get(n) {
+                constraints.push((*n, m.after));
+            }
+            if let Some(p) = by_number.get(n) {
+                for other in &component {
+                    if other != n
+                        && by_number
+                            .get(other)
+                            .is_some_and(|o| p.base_ref == o.head_ref)
+                    {
+                        constraints.push((*n, *other));
+                    }
+                }
+            }
+        }
+        let members: Vec<&SequencePr> = component.iter().filter_map(|n| by_number.get(n)).collect();
+        let Some(order) = order_component(&members, &constraints) else {
+            log::info!(
+                "merge_sequence: component {component:?} has a constraint cycle — skipped this tick"
+            );
+            continue;
+        };
+        let member_pins: Vec<(u32, &str)> = order
+            .iter()
+            .filter_map(|n| {
+                by_number
+                    .get(n)
+                    .and_then(|p| p.head_sha.as_deref())
+                    .map(|h| (*n, h))
+            })
+            .collect();
+        let id = plan_id(&member_pins);
+        groups.push(plan_group(&id, &order, &by_number));
+    }
+    groups
+}
+
+/// The marker an edge implies: `source=pass`, pinned heads, the group plan.
+#[must_use]
+pub fn edge_marker(edge: &SequenceEdge) -> SequenceMarker {
+    SequenceMarker {
+        after: edge.after,
+        pred_head: edge.pred_head.clone(),
+        follower_head: edge.follower_head.clone(),
+        plan: edge.plan.clone(),
+        source: Some(SOURCE_PASS.to_string()),
+    }
+}
+
+// --- Phase 1: hold evaluation -------------------------------------------
+
+/// What Phase 1 wants to do with one existing `loom:sequenced` hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldAction {
+    /// Leave the label; the ordering is being honored (soft).
+    HoldSoft,
+    /// Leave the label; a human-authored hold never auto-expires.
+    HoldHard,
+    /// Predecessor landed at the recorded head: release.
+    Release,
+    /// Predecessor closed unmerged: release, naming the reason.
+    ReleaseDissolved,
+    /// A pinned head moved: the stale hold is VOID — label off, replan note;
+    /// the next tick re-derives a fresh plan from current heads.
+    VoidAndReplan,
+    /// Soft hold on an approved follower whose predecessor went quiet past
+    /// the bound: release so mergeable work is not starved.
+    Expire,
+}
+
+/// Pure Phase-1 decision for one hold. `pred` is `None` when the predecessor
+/// could not be read — fail closed: hold (the release needs a positive
+/// signal, the #9378 asymmetry).
+#[must_use]
+pub fn hold_action(
+    marker: &SequenceMarker,
+    pred: Option<&PredecessorState>,
+    follower_has_loom_pr: bool,
+    max_age_hours: f64,
+) -> HoldAction {
+    let hard = marker.source.as_deref() != Some(SOURCE_PASS);
+    let Some(pred) = pred else {
+        return if hard {
+            HoldAction::HoldHard
+        } else {
+            HoldAction::HoldSoft
+        };
+    };
+    match evaluate(marker, pred, &marker.follower_head) {
+        Verdict::Clear => HoldAction::Release,
+        Verdict::Dissolved => HoldAction::ReleaseDissolved,
+        Verdict::Keep(KeepReason::InFlight) => {
+            if hard {
+                HoldAction::HoldHard
+            } else if follower_has_loom_pr
+                && pred_quiet_hours(pred).is_some_and(|age| age > max_age_hours)
+            {
+                HoldAction::Expire
+            } else {
+                HoldAction::HoldSoft
+            }
+        }
+        Verdict::Keep(_) => HoldAction::VoidAndReplan,
+    }
+}
+
+/// Hours since the predecessor's last activity, or `None` when unknown —
+/// unknown never expires.
+#[must_use]
+pub fn pred_quiet_hours(pred: &PredecessorState) -> Option<f64> {
+    let updated = pred.updated_at.as_deref()?;
+    let then = chrono::DateTime::parse_from_rfc3339(updated).ok()?;
+    let now = Utc::now();
+    Some((now.timestamp_millis() as f64 - then.timestamp_millis() as f64) / 3_600_000.0)
+}
+
+// --- Comments -----------------------------------------------------------
+
+/// The apply comment body. Carries the marker (the machine state) and a
+/// concise human explanation.
+#[must_use]
+pub fn apply_comment_body(marker: &SequenceMarker, reason: EdgeReason) -> String {
+    let why = match reason {
+        EdgeReason::StackedBase => format!("its base branch is #{}'s head branch", marker.after),
+        EdgeReason::SharedFiles => format!("it changes files #{} also changes", marker.after),
+    };
+    format!(
+        "**Landing order recorded** — this PR overlaps other open work\n\n\
+         Planned by the merge-sequencing pass (#9686): this PR lands AFTER #{}, because {why}. \
+         Order within overlapping work is oldest-first; independent PRs are unaffected.\n\n\
+         While the `loom:sequenced` label is present, `merge-pr.sh` refuses to merge this PR \
+         (the #9378 gate). The label clears mechanically when #{} lands at the recorded head \
+         — or by re-evaluation if it closes or moves. This is a scheduling preference: it \
+         suppresses only redundant base-conflict repairs while #{} is in flight, never a \
+         genuine review finding.\n\n\
+         {}\n\n\
+         ---\n\
+         *Automated by loom-daemon claim reconciliation (#9686, plan {})*",
+        marker.after,
+        marker.after,
+        marker.after,
+        marker_text(marker),
+        marker.plan
+    )
+}
+
+/// The release comment (predecessor landed / dissolved / expired).
+#[must_use]
+pub fn release_comment_body(marker: &SequenceMarker, action: HoldAction) -> String {
+    let why = match action {
+        HoldAction::Release => {
+            format!("#{} merged at the recorded head — this PR may land now", marker.after)
+        }
+        HoldAction::ReleaseDissolved => {
+            format!("#{} closed without merging — the ordering's subject is gone", marker.after)
+        }
+        HoldAction::Expire => format!(
+            "#{} has been quiet past the {:.0}h soft-ordering bound while this PR is approved — \
+             the scheduling preference expired rather than starve mergeable work",
+            marker.after,
+            max_age_hours()
+        ),
+        _ => "released".to_string(),
+    };
+    format!(
+        "<!-- loom:sequence released plan={} -->\n\
+         **Sequencing hold released**: {why}. The `loom:sequenced` label is removed; normal \
+         merge rules apply from here.\n\n\
+         ---\n\
+         *Automated by loom-daemon claim reconciliation (#9686)*",
+        marker.plan
+    )
+}
+
+/// The void note posted when a hold's pins no longer describe reality.
+pub const REPLAN_NOTE_BODY: &str =
+    "**Sequencing hold voided and re-planned** — a pinned head moved \
+     since the last plan, so the old hold no longer describes this tree. The label is removed; \
+     the pass re-derives the landing order from the current heads on its next tick, and if the \
+     overlap is gone this PR simply proceeds unordered.\n\n\
+     <!-- loom:sequence replanned -->\n\n\
+     ---\n\
+     *Automated by loom-daemon claim reconciliation (#9686)*";
+
+/// The repair-deferral marker: written by the review-conflict pass when a
+/// base conflict is deferred behind an open predecessor instead of flagged.
+pub const DEFER_REPAIR_MARKER_FMT: &str =
+    "<!-- loom:sequence defer-repair plan=%PLAN% pred=%PRED% -->";
+
+/// The deferral comment body.
+#[must_use]
+pub fn defer_comment_body(marker: &SequenceMarker) -> String {
+    format!(
+        "<!-- loom:sequence defer-repair plan={} pred={} -->\n\
+         **Base-conflict repair deferred** — this PR is sequenced behind #{} (plan {}), which is \
+         still open at the recorded head. Rebasing now would be redundant: #{} landing will move \
+         the base again. The conflict is re-checked every tick; when #{} lands (or the hold \
+         releases for any reason), a still-conflicting tree is flagged for repair as usual. A \
+         genuine review finding is NOT deferred — only this automated base-conflict routing is.\n\n\
+         ---\n\
+         *Automated by loom-daemon claim reconciliation (#9686)*",
+        marker.plan, marker.after, marker.after, marker.after, marker.after, marker.after
+    )
+}
+
+/// True when a base-conflict repair should be DEFERRED rather than flagged:
+/// the follower's newest trusted marker describes a predecessor that is
+/// still open at the recorded head (the ordinary in-flight ordering state).
+/// Any replan-shaped state (moved heads, landed, dissolved) does NOT defer —
+/// the hold needs attention, and a conflict flag beside it is information,
+/// not churn.
+#[must_use]
+pub fn defer_base_repair(marker: &SequenceMarker, pred: &PredecessorState) -> bool {
+    matches!(
+        evaluate(marker, pred, &marker.follower_head),
+        Verdict::Keep(KeepReason::InFlight)
+    )
+}
+
+/// Evaluate whether the review-conflict pass should DEFER flagging `number`:
+/// `Ok(Some(marker))` defers behind the marker's open predecessor,
+/// `Ok(None)` means flag normally. A comment-read failure is `Err` — the
+/// caller flags anyway (fail toward repair, never toward suppression); a
+/// missing marker or an unreadable predecessor is `Ok(None)`, since an
+/// unverifiable ordering state must not suppress a repair either.
+pub fn defer_flag_decision(
+    gh_bin: &Path,
+    root: &Path,
+    number: u32,
+) -> Result<Option<SequenceMarker>> {
+    let bin = gh_bin.to_string_lossy().to_string();
+    let Some(bodies) = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", number) else {
+        anyhow::bail!("could not read trusted comments on PR #{number}");
+    };
+    let Some(marker) = parse(&bodies) else {
+        return Ok(None);
+    };
+    let Some(pred) = fetch_predecessor(&bin, root, "{owner}/{repo}", marker.after) else {
+        return Ok(None);
+    };
+    Ok(defer_base_repair(&marker, &pred).then_some(marker))
+}
+
+/// Record a deferral on the PR — idempotent: the exact defer-marker comment
+/// already present suppresses the repeat, so the tick cannot spam.
+pub(crate) fn defer_repair(
+    gh_bin: &Path,
+    root: &Path,
+    number: u32,
+    marker: &SequenceMarker,
+) -> Result<()> {
+    let bin = gh_bin.to_string_lossy().to_string();
+    let bodies = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", number).unwrap_or_default();
+    let want =
+        format!("<!-- loom:sequence defer-repair plan={} pred={} -->", marker.plan, marker.after);
+    if bodies.iter().any(|b| b.contains(&want)) {
+        return Ok(());
+    }
+    let n = number.to_string();
+    let body = defer_comment_body(marker);
+    gh_pr(gh_bin, root, &["comment", &n, "--body", &body])?;
+    Ok(())
+}
+
+// --- Counters -----------------------------------------------------------
+
+/// Counters for one workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MergeSequenceStats {
+    pub checked: usize,
+    pub groups: usize,
+    pub applied: usize,
+    pub voided: usize,
+    pub released: usize,
+    pub expired: usize,
+    pub held: usize,
+}
+
+// --- Forge reads --------------------------------------------------------
+
+/// Run `gh pr <args…>` in `root` with the per-root credential and `LOOM_REPO`
+/// applied — the same invocation shape as the review-conflict pass.
+fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let mut cmd = Command::new(gh_bin);
+    cmd.arg("pr").args(args);
+    cmd.current_dir(root);
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+    if let Ok(repo) = std::env::var("LOOM_REPO") {
+        cmd.arg("--repo").arg(repo);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd
+        .output()
+        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!(
+            "gh pr {} failed in {}: {}",
+            args.first().copied().unwrap_or_default(),
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
+fn list_open_prs(gh_bin: &Path, root: &Path) -> Result<Vec<SequencePr>> {
+    let limit = super::MAX_ISSUES_PER_WORKSPACE.to_string();
+    let stdout = gh_pr(
+        gh_bin,
+        root,
+        &[
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            &limit,
+            "--json",
+            "number,createdAt,updatedAt,headRefOid,headRefName,baseRefName,isDraft,labels",
+        ],
+    )?;
+    parse_pr_list(&stdout)
+}
+
+/// Changed paths for one PR. `None` on any failure: a failed read shrinks
+/// the plan (singleton) rather than fabricating overlap.
+fn changed_files(gh_bin: &Path, root: &Path, number: u32) -> Option<BTreeSet<String>> {
+    #[derive(Debug, Deserialize)]
+    struct Row {
+        path: String,
+    }
+    #[derive(Debug, Deserialize)]
+    struct Files {
+        #[serde(default)]
+        files: Vec<Row>,
+    }
+    let stdout = gh_pr(gh_bin, root, &["view", &number.to_string(), "--json", "files"]).ok()?;
+    let parsed: Files = serde_json::from_slice(&stdout).ok()?;
+    Some(parsed.files.into_iter().map(|Row { path }| path).collect())
+}
+
+/// The newest trusted marker per PR, for PRs carrying the hold label.
+fn fetch_markers(gh_bin: &Path, root: &Path, prs: &[&SequencePr]) -> BTreeMap<u32, SequenceMarker> {
+    let bin = gh_bin.to_string_lossy().to_string();
+    let mut out = BTreeMap::new();
+    for pr in prs.iter().filter(|p| p.has(SEQUENCE_LABEL)) {
+        if let Some(bodies) = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", pr.number) {
+            if let Some(m) = parse(&bodies) {
+                out.insert(pr.number, m);
+            }
+        }
+    }
+    out
+}
+
+// --- Read-only plan (shared by the pass and the dry-run verb) ------------
+
+/// A read-only plan report for one repo: what the pass WOULD do this tick.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlanReport {
+    pub open_prs: usize,
+    pub groups: Vec<SequenceGroup>,
+    /// Edges already satisfied by an identical marker — no write would occur.
+    pub already_planned: usize,
+    pub holders: usize,
+}
+
+/// Compute the plan report without writing anything.
+///
+/// # Errors
+/// Forge listing or files reads.
+pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
+    let open = list_open_prs(gh_bin, root)?;
+    let mut report = PlanReport {
+        open_prs: open.len(),
+        ..PlanReport::default()
+    };
+    if open.len() <= TRIGGER_OPEN_PRS {
+        return Ok(report);
+    }
+    let eligible: Vec<&SequencePr> = open
+        .iter()
+        .filter(|p| p.eligible_for_ordering() && p.pinnable())
+        .collect();
+    report.holders = eligible.iter().filter(|p| p.has(SEQUENCE_LABEL)).count();
+    let mut files: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
+    for pr in &eligible {
+        if let Some(f) = changed_files(gh_bin, root, pr.number) {
+            files.insert(pr.number, f);
+        }
+    }
+    let markers = fetch_markers(gh_bin, root, &eligible);
+    report.groups = plan_repo(&open, &files, &markers);
+    for g in &report.groups {
+        for e in &g.edges {
+            if markers
+                .get(&e.follower)
+                .is_some_and(|m| marker_text(m) == marker_text(&edge_marker(e)))
+            {
+                report.already_planned += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
+// --- Writes -------------------------------------------------------------
+
+/// Label off first, then comment — a released hold whose comment fails is
+/// still released (a lost transcript line is recoverable; an on-PR hold that
+/// outlives its subject is not).
+fn release_hold(gh_bin: &Path, root: &Path, number: u32, body: &str) -> Result<()> {
+    let n = number.to_string();
+    gh_pr(gh_bin, root, &["edit", &n, "--remove-label", SEQUENCE_LABEL])?;
+    gh_pr(gh_bin, root, &["comment", &n, "--body", body])?;
+    Ok(())
+}
+
+/// Apply one planned edge: label + marker comment, idempotent. Returns
+/// `Ok(false)` when nothing was written because the exact marker already
+/// exists (identical plan, identical pins) — the repeated-comment guard that
+/// makes competing daemons converge.
+fn apply_edge(
+    gh_bin: &Path,
+    root: &Path,
+    edge: &SequenceEdge,
+    marker: &SequenceMarker,
+) -> Result<bool> {
+    let bin = gh_bin.to_string_lossy().to_string();
+    let bodies =
+        fetch_trusted_bodies(&bin, root, "{owner}/{repo}", edge.follower).unwrap_or_default();
+    if bodies.iter().any(|b| b.contains(&marker_text(marker))) {
+        return Ok(false);
+    }
+    let n = edge.follower.to_string();
+    gh_pr(gh_bin, root, &["edit", &n, "--add-label", SEQUENCE_LABEL])?;
+    let body = apply_comment_body(marker, edge.reason);
+    gh_pr(gh_bin, root, &["comment", &n, "--body", &body])?;
+    Ok(true)
+}
+
+// --- The pass ------------------------------------------------------------
+
+/// Run the pass over one workspace `root`. Best effort: any `gh` failure is
+/// logged at `warn` and contributes nothing, mirroring the review-conflict
+/// pass's posture.
+pub fn reconcile_merge_sequences(gh_bin: &Path, root: &Path) -> MergeSequenceStats {
+    let mut stats = MergeSequenceStats::default();
+    if !merge_sequence_enabled() {
+        return stats;
+    }
+    let open = match list_open_prs(gh_bin, root) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("claim_reconciliation (merge sequence): {}: {e}", root.display());
+            crate::rate_limit_breaker::global_observe_failure(
+                &e.to_string(),
+                "claim_reconciliation",
+            );
+            return stats;
+        }
+    };
+    stats.checked = open.len();
+    if open.len() <= TRIGGER_OPEN_PRS {
+        return stats;
+    }
+    let max_age = max_age_hours();
+
+    // Phase 1: evaluate every existing hold, oldest first for a stable
+    // transcript.
+    let holders: Vec<SequencePr> = open
+        .iter()
+        .filter(|p| p.has(SEQUENCE_LABEL))
+        .cloned()
+        .collect();
+    let bin = gh_bin.to_string_lossy().to_string();
+    for pr in &holders {
+        let bodies = match fetch_trusted_bodies(&bin, root, "{owner}/{repo}", pr.number) {
+            Some(b) => b,
+            None => {
+                // The label gates merges regardless (#9378); a failed read
+                // never releases anything.
+                log::warn!(
+                    "claim_reconciliation (merge sequence): PR #{} in {}: could not read trusted \
+                     comments — hold left in place (fail closed)",
+                    pr.number,
+                    root.display()
+                );
+                stats.held += 1;
+                continue;
+            }
+        };
+        let Some(marker) = parse(&bodies) else {
+            // A label with no trusted marker is an operator-held PR (the
+            // manual shape #9378 documented): nothing here owns releasing it.
+            log::info!(
+                "claim_reconciliation (merge sequence): PR #{} in {} carries {} with no trusted \
+                 sequence marker — treated as a manual hold",
+                pr.number,
+                root.display(),
+                SEQUENCE_LABEL
+            );
+            stats.held += 1;
+            continue;
+        };
+        let pred = fetch_predecessor(&bin, root, "{owner}/{repo}", marker.after);
+        let action = hold_action(&marker, pred.as_ref(), pr.has("loom:pr"), max_age);
+        let result = match action {
+            HoldAction::Release | HoldAction::ReleaseDissolved | HoldAction::Expire => {
+                release_hold(gh_bin, root, pr.number, &release_comment_body(&marker, action))
+                    .map(|_| action)
+            }
+            HoldAction::VoidAndReplan => {
+                release_hold(gh_bin, root, pr.number, REPLAN_NOTE_BODY).map(|_| action)
+            }
+            HoldAction::HoldSoft | HoldAction::HoldHard => Ok(action),
+        };
+        match result {
+            Ok(HoldAction::Release) => stats.released += 1,
+            Ok(HoldAction::ReleaseDissolved) => stats.released += 1,
+            Ok(HoldAction::Expire) => stats.expired += 1,
+            Ok(HoldAction::VoidAndReplan) => stats.voided += 1,
+            Ok(_) => stats.held += 1,
+            Err(e) => {
+                stats.held += 1;
+                log::warn!(
+                    "claim_reconciliation (merge sequence): PR #{} in {}: {e}",
+                    pr.number,
+                    root.display()
+                );
+            }
+        }
+    }
+
+    // Phase 2: plan the unmarked eligible set. Holders — including ones this
+    // tick just voided — are re-planned NEXT tick, from a fresh listing, so
+    // a void can never be immediately replaced by a plan built from the same
+    // stale read that voided it.
+    let holder_numbers: BTreeSet<u32> = holders.iter().map(|h| h.number).collect();
+    let eligible: Vec<&SequencePr> = open
+        .iter()
+        .filter(|p| {
+            p.eligible_for_ordering() && p.pinnable() && !holder_numbers.contains(&p.number)
+        })
+        .collect();
+    if eligible.len() < 2 {
+        return stats;
+    }
+    let mut files: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
+    for pr in &eligible {
+        if let Some(f) = changed_files(gh_bin, root, pr.number) {
+            files.insert(pr.number, f);
+        }
+    }
+    let markers = fetch_markers(gh_bin, root, &eligible);
+    for group in plan_repo(&open, &files, &markers) {
+        stats.groups += 1;
+        for edge in group.edges {
+            let marker = edge_marker(&edge);
+            match apply_edge(gh_bin, root, &edge, &marker) {
+                Ok(true) => {
+                    stats.applied += 1;
+                    log::info!(
+                        "claim_reconciliation (merge sequence): PR #{} in {} now sequenced after \
+                         #{} (plan {}, {:?})",
+                        edge.follower,
+                        root.display(),
+                        edge.after,
+                        edge.plan,
+                        edge.reason
+                    );
+                }
+                Ok(false) => stats.held += 1,
+                Err(e) => log::warn!(
+                    "claim_reconciliation (merge sequence): failed to sequence PR #{} after #{} \
+                     in {}: {e}",
+                    edge.follower,
+                    edge.after,
+                    root.display()
+                ),
+            }
+        }
+    }
+    stats
+}
+
+#[cfg(test)]
+#[path = "merge_sequence_tests.rs"]
+mod tests;
