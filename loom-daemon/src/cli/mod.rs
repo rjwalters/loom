@@ -29,6 +29,7 @@ mod duplicate_scan;
 mod eta_cmd;
 mod fleet_captain_cmd;
 pub(crate) mod fleet_config;
+mod fleet_config_reload;
 pub(crate) mod fleet_experiment;
 pub(crate) mod fleet_send;
 pub(crate) mod forge_action;
