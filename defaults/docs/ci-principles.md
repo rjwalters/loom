@@ -110,9 +110,10 @@ to ignore red. So the `report` job is part of the mechanism, not a nicety:
 
 - **One tracking issue per failing job**, never per run and never per failing
   step. Title is exactly `[ci-daily] <job name>`; the lookup is an exact
-  title match against the open issues carrying `ci:daily-failure`, so a
-  second consecutive failure comments on the existing issue instead of
-  opening a duplicate. Matrix legs are distinct jobs and get distinct issues.
+  title match against **all** open issues (not a label query), so a second
+  consecutive failure comments on the existing issue instead of opening a
+  duplicate, however the issue has been relabelled since. Matrix legs are
+  distinct jobs and get distinct issues.
 - **The next green run for that same job closes it**, with a comment naming
   the run that went green.
 - **Only `failure` and `timed_out` open an issue, and only `success` closes
@@ -124,20 +125,12 @@ to ignore red. So the `report` job is part of the mechanism, not a nicety:
   enough, because the job still reports a `failure` conclusion to the jobs
   API. Rust beta is the only job that carries it today — an upcoming-toolchain
   regression is information, not a defect in this repo.
-- **The tracking issues stay out of the normal issue pipeline.** They carry
-  `ci:daily-failure` and no `loom:*` label, and their body says so. If the
-  underlying defect needs real work, file a real issue for it; do not curate
-  an auto-closing tracking issue.
-
-`ci:daily-failure` is **not** declared in `.github/labels.yml`. The workflow's
-own idempotent `gh label create` is its only declaration — one mechanism, per
-rule 4. `labels.yml` is co-owned: Loom manages the `BEGIN`/`END LOOM LABELS`
-block and the whole file is installed into consumer repos, so a declaration
-*inside* the block exports a label no consumer can ever apply, and one *below*
-the `END` marker leaves a residue that survives uninstall, which strips only
-the block (installer Test 24 asserts the file is gone). `ci:` is also not the
-`loom:` prefix `sync-labels.sh --check` audits, so an undeclared
-`ci:daily-failure` is not drift it reports.
+- **The tracking issues use an existing label, never a new one.** They are
+  filed with `loom:triage` — the ordinary intake label — so they enter the
+  normal pipeline like any other filed issue. The workflow creates no labels:
+  the label set is intentional and `.github/labels.yml` is authoritative.
+  Identity lives in the title, which is why the lookup ignores labels and the
+  issue body asks that the title be left unchanged.
 
 SigNoz needs nothing workflow-side: `loom-daemon ci-telemetry` captures every
 run of every workflow of the configured owners by auto-discovery, so the daily

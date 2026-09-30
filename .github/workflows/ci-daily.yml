@@ -618,26 +618,17 @@ jobs:
       - name: Open, update and close tracking issues
         env:
           GH_TOKEN: ${{ github.token }}
-          TRACKING_LABEL: ci:daily-failure
+          # An EXISTING label from .github/labels.yml -- this workflow never
+          # creates labels (the label set is intentional and labels.yml is
+          # authoritative). The issue is identified by its title, not by this
+          # label, so Curator relabelling it does not orphan it.
+          TRACKING_LABEL: loom:triage
+          TITLE_PREFIX: '[ci-daily] '
         run: |
           set -euo pipefail
 
           REPO="$GITHUB_REPOSITORY"
           RUN_URL="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"
-
-          # This idempotent create is the label's ONLY declaration -- it is
-          # deliberately NOT in .github/labels.yml (rule 4, one mechanism per
-          # behaviour). That file is co-owned: Loom manages the BEGIN/END LOOM
-          # LABELS block and ships the whole file into consumer repos, so a
-          # declaration inside the block exports a label no consumer can ever
-          # apply, and one below the END marker leaves a residue that survives
-          # uninstall (which strips only the block) -- caught by installer Test
-          # 24, "After uninstall, .github/labels.yml removed". `ci:` is not the
-          # `loom:` prefix sync-labels.sh --check audits, so an undeclared
-          # `ci:daily-failure` is not drift it reports either.
-          gh label create "$TRACKING_LABEL" --color B60205 \
-            --description "Failing ci-daily.yml job tracker; auto-closes on the next green run. Applied by: ci-daily.yml." \
-            >/dev/null 2>&1 || true
 
           # This run's jobs, base64'd one per line so names containing spaces
           # and parentheses survive the read loop intact.
@@ -648,11 +639,16 @@ jobs:
           # Currently-open tracking issues, by REST (not `gh issue list`, which
           # is GraphQL-backed). `-X GET` is load-bearing: `gh api` switches to
           # POST as soon as any `-f` is present, and a POST to /issues is a
-          # create. /issues returns PRs too; drop them.
+          # create. /issues returns PRs too; drop them. Matched on the stable
+          # title prefix across ALL open issues, deliberately NOT filtered by
+          # label: the tracking label is the ordinary intake label, which the
+          # Curator replaces, so a label filter would lose the issue after
+          # triage and open a duplicate the next night.
           gh api --paginate -X GET "repos/$REPO/issues" \
-            -f state=open -f "labels=$TRACKING_LABEL" -f per_page=100 \
+            -f state=open -f per_page=100 \
             --jq '.[] | select(.pull_request == null) | {number, title}' \
-            | jq -s '.' > /tmp/open-tracking.json
+            | jq -s --arg p "$TITLE_PREFIX" 'map(select(.title | startswith($p)))' \
+            > /tmp/open-tracking.json
 
           # First lines of a failed job's log that look like the failure. Best
           # effort: an empty excerpt is fine, the run link is the real handle.
@@ -682,7 +678,7 @@ jobs:
                 continue ;;
             esac
 
-            title="[ci-daily] $job_name"
+            title="${TITLE_PREFIX}${job_name}"
             number="$(jq -r --arg t "$title" \
               'map(select(.title == $t)) | (.[0].number // empty)' /tmp/open-tracking.json)"
 
@@ -699,7 +695,7 @@ jobs:
                 else
                   jq -n --arg t "$title" --arg run "$RUN_URL" --arg job "$job_url" \
                         --arg ex "$body_excerpt" --arg label "$TRACKING_LABEL" \
-                    '{title: $t, labels: [$label], body: ("The nightly `ci-daily.yml` job failed.\n\n- Run: \($run)\n- Job: \($job)\n\n<details><summary>First failing lines</summary>\n\n```\n\($ex)\n```\n\n</details>\n\nThis issue is opened, updated and closed by `.github/workflows/ci-daily.yml`. It closes itself on the next daily run in which this job is green, so there is nothing to do here beyond fixing the job. Do not curate it into the normal issue pipeline -- file a separate issue if the underlying defect needs its own work item.")}' \
+                    '{title: $t, labels: [$label], body: ("The nightly `ci-daily.yml` job failed.\n\n- Run: \($run)\n- Job: \($job)\n\n<details><summary>First failing lines</summary>\n\n```\n\($ex)\n```\n\n</details>\n\nThis issue is opened, updated and closed by `.github/workflows/ci-daily.yml`. It closes itself on the next daily run in which this job is green. **Keep the title unchanged**: the workflow finds this issue by its exact title (whatever labels it carries), so a renamed issue is orphaned and a duplicate opens the next night.")}' \
                     > /tmp/payload.json
                   # REST, not `gh issue create`: that is GraphQL-backed, and
                   # this path also has no business going through
@@ -738,5 +734,5 @@ jobs:
             echo "- closed: $closed"
             echo "- no result (left alone): $untouched"
             echo
-            echo "Label: \`$TRACKING_LABEL\`. Title form: \`[ci-daily] <job name>\`."
+            echo "Filed with label \`$TRACKING_LABEL\`; matched by title \`${TITLE_PREFIX}<job name>\`."
           } >> "$GITHUB_STEP_SUMMARY"
