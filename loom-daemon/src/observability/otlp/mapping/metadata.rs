@@ -216,6 +216,79 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
             attrs.push(kv_int(key, value));
         }
     }
+    // Issue #9466: the classified landed-size split, computed by the merge
+    // path's writeback (`outcome_journal::landing_size`) — the story-points
+    // rubric's primary anchor (#9430) and the SP3 landed-size fit read these
+    // off `sweep_facts` (#9586). Absent whenever the sweep never measured a
+    // landing diff; never zero-filled.
+    for (key, value) in [
+        ("loom.hw_lines_added", record.hw_lines_added),
+        ("loom.hw_lines_deleted", record.hw_lines_deleted),
+        ("loom.hw_files", record.hw_files),
+        ("loom.generated_lines", record.generated_lines),
+        ("loom.test_lines", record.test_lines),
+    ] {
+        if let Some(value) = value.filter(|v| *v >= 0) {
+            attrs.push(kv_int(key, value));
+        }
+    }
+    // Issue #9444: attempt lineage — which retry of this issue's sweep chain
+    // this record is, what it replaced, why it was dispatched, and every PR
+    // it produced (#9586: exported so the sweep-facts extraction can join
+    // attempts instead of NULLing the columns).
+    if let Some(value) = record.attempt_index {
+        attrs.push(kv_int("loom.attempt_index", i64::from(value)));
+    }
+    if let Some(value) = record.previous_sweep_id.as_ref().filter(|v| text(v)) {
+        attrs.push(kv_string("loom.previous_sweep_id", value.clone()));
+    }
+    if let Some(value) = record.trigger.as_ref().filter(|v| text(v)) {
+        attrs.push(kv_string("loom.trigger", value.clone()));
+    }
+    if let Some(numbers) = &record.pr_numbers {
+        if !numbers.is_empty() && numbers.len() <= MAX_GROUPS {
+            attrs.push(array(
+                "loom.pr_numbers",
+                numbers
+                    .iter()
+                    .map(|number| row(vec![kv_int("pr_number", i64::from(*number))]))
+                    .collect(),
+            ));
+        }
+    }
+    // Issue #9444: the rework marker history, exported as a bounded array so
+    // the sweep-facts extraction can split substantive from environmental
+    // rework (#9586). Rows mirror the JSONL record's own shape; every
+    // free-form string is bounded by `text` like every other export.
+    if let Some(events) = &record.rework_events {
+        if events.len() <= MAX_GROUPS && events.iter().all(|event| text(&event.kind)) {
+            attrs.push(array(
+                "loom.rework_events",
+                events
+                    .iter()
+                    .map(|event| {
+                        let mut values = vec![kv_string("kind", event.kind.clone())];
+                        if let Some(reason) = event.reason.as_ref().filter(|reason| text(reason)) {
+                            values.push(kv_string("reason", reason.clone()));
+                        }
+                        if let Some(classification) = event
+                            .classification
+                            .as_ref()
+                            .filter(|classification| text(classification))
+                        {
+                            values.push(kv_string("classification", classification.clone()));
+                        }
+                        if let Some(duration_sec) = event.duration_sec {
+                            values.push(kv_int("duration_sec", duration_sec));
+                        }
+                        row(values)
+                    })
+                    .collect(),
+            ));
+        } else {
+            log::warn!("observability: invalid or oversized rework history omitted");
+        }
+    }
     attrs
 }
 
