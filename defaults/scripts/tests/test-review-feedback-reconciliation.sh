@@ -481,6 +481,9 @@ reset_fixtures
 ISOLATED="$WORK_DIR/isolated"
 mkdir -p "$ISOLATED"
 cp "$POST_VERDICT" "$ISOLATED/post-verdict.sh"
+# lib/ ships with every install; only the gate script is what is missing here.
+# post-verdict.sh needs lib/forge-helpers.sh to vet its write target (#9548).
+cp -R "$(dirname "$POST_VERDICT")/lib" "$ISOLATED/lib"
 set +e
 PV_OUT=$("$ISOLATED/post-verdict.sh" 5369 approved "$HEAD_SHA" --body "Approved." 2>&1)
 PV_RC=$?
