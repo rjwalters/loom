@@ -1853,6 +1853,8 @@ pub use dispatch_plan::{
     DispatchPlanContext, PlanGate, PlanKey, PlanShard, PlanSlots, PlanState, RepoCapView, RowPlan,
     PLAN_SCOPE,
 };
+mod fleet_plan;
+pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
 mod work_finder_tick;
 pub use work_finder_tick::WorkFinderTickSummary;
 
@@ -2940,6 +2942,20 @@ pub enum Event {
         /// compatible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
+        /// The issue's story-point size estimate (#9432, epic #9429) — the
+        /// numeric value of its single `points:*` label, resolved from the
+        /// label list the dispatch path's own #4444 park-label guard already
+        /// read (no extra forge round trip). Carried on the event because
+        /// `sweep.started` telemetry is derived from it and the collector has
+        /// no issue-label access of its own.
+        ///
+        /// Absent — never `0` — for an unsized issue, an out-of-vocabulary or
+        /// stacked points label (both logged loudly, never guessed), a skipped
+        /// label read (`skip_label_flip`), and every `PrSet` dispatch (which
+        /// claims no issue). `#[serde(default)]` keeps pre-#9432 wire data
+        /// compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        story_points: Option<u32>,
     },
     /// `sweep.global.runtime_rejected` — a dispatch was **refused** by
     /// fail-closed runtime admission (issue #4494, epic #4489 Phase 5), before

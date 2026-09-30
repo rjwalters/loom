@@ -932,6 +932,7 @@ mod tests {
         telemetry::TelemetryEnvelope::new(
             "host-test",
             telemetry::TelemetryRecord::SweepOutcome(telemetry::SweepOutcomeRecord {
+                story_points: None,
                 repo: Some("rjwalters/loom".to_string()),
                 repo_unresolved: false,
                 visibility: telemetry::RepoVisibility::Public,

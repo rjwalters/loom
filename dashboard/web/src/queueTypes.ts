@@ -50,6 +50,25 @@ export interface QueueRow {
   plan_state?: QueuePlanState;
   /** Which admission gate holds a deferred row (`capacity`, `ramp`, …). */
   gate?: string;
+  /** The shard that owns this row's workspace, when the fleet is sharded.
+   * Compared against the reporting host's own `plan.shard.host_shard` by the
+   * fleet merge (Issue #9310). Withheld from the public view. */
+  owning_shard?: number;
+}
+
+/** The reporting host's shard posture for the tick (Issue #9288). */
+export interface QueuePlanShard {
+  configured: boolean;
+  host_shard?: number;
+  shard_count?: number;
+}
+
+/** The host's per-tick dispatch-plan block, narrowed to what the UI reads.
+ * The daemon also sends `slots`, `ordering`, `scope` and `complete`; only
+ * `shard` is re-declared here, because the fleet merge's `owning_shard`
+ * tie-break is the one thing the browser needs it for (Issue #9310). */
+export interface QueuePlanView {
+  shard?: QueuePlanShard;
 }
 
 export interface QueueRepoRef {
@@ -71,6 +90,8 @@ export interface QueueSnapshotRecord {
   rows: QueueRow[];
   unresolved_rows: number;
   rows_truncated: number;
+  /** This tick's dispatch plan. Absent from a pre-#9288 daemon. */
+  plan?: QueuePlanView;
   /** Public view only: how many rows had their repo detail withheld. */
   withheld_rows?: number;
 }

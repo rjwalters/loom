@@ -406,7 +406,7 @@ mod tests {
     #[serial]
     fn the_startup_pass_closes_orphaned_trace_join_entries_in_every_registered_workspace() {
         use crate::observability::runtime_usage::join::{
-            context_for_session_at, JoinEntry, JOIN_DIR,
+            context_for_session_at, JoinEntry, JoinKey, JOIN_DIR,
         };
         use crate::telemetry::trace::TraceContext;
         use crate::workspace_registry::{WorkspaceRegistry, REGISTRY_PATH_ENV};
@@ -418,12 +418,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let context = TraceContext::root(true);
         let started_at = chrono::Utc::now() - chrono::Duration::minutes(30);
-        let orphan = JoinEntry {
-            issue: 9013,
-            context: context.clone(),
-            started_at,
-            ended_at: None,
-        };
+        let orphan = JoinEntry::new(JoinKey::Issue(9013), context.clone(), started_at);
         std::fs::write(
             dir.join(format!("{}.json", context.trace_id.as_str())),
             serde_json::to_vec(&orphan).unwrap(),
@@ -445,11 +440,14 @@ mod tests {
         let cwd = workspace.to_string_lossy().into_owned();
         let now = chrono::Utc::now();
         let far_after = Some(now + chrono::Duration::minutes(5));
-        assert_eq!(context_for_session_at(Some(&cwd), Some(9013), far_after, now), None);
+        assert_eq!(context_for_session_at(Some(&cwd), Some(9013), None, far_after, now), None);
         // But one starting inside its original window still joins — proving
         // the pass closed it (bounded retention) rather than deleting it.
         let inside = Some(started_at + chrono::Duration::minutes(1));
-        assert_eq!(context_for_session_at(Some(&cwd), Some(9013), inside, now), Some(context));
+        assert_eq!(
+            context_for_session_at(Some(&cwd), Some(9013), None, inside, now),
+            Some(context)
+        );
     }
 
     /// The completion signal must not flip to `true` before the startup

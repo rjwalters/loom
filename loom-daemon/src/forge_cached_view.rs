@@ -53,13 +53,12 @@
 //! own write is unconditional, guarding against a replica-lag `304`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Map, Value};
 
 use crate::forge_cmd::{detect_forge, ForgeType};
-use crate::forge_listing::parse_http_response;
+use crate::forge_etag_store as store;
 
 /// Exit code signalling "this shape is not cacheable; fall back to `gh`".
 pub const DECLINED: i32 = crate::forge_cmd::EX_FORGE_DECLINED;
@@ -97,7 +96,7 @@ const PR_FIELDS: &[&str] = &[
 ];
 
 /// Filename prefix that distinguishes view entries from the listing entries
-/// sharing [`cache_dir`].
+/// sharing [`store::disk_cache_dir`].
 const VIEW_PREFIX: &str = "view-";
 
 /// View entries whose last `200` write is older than this are pruned on the
@@ -131,7 +130,7 @@ pub fn handle(entity: &str, args: &[String]) -> ! {
             .skip(1)
             .find(|a| !a.starts_with('-'))
             .and_then(|a| a.parse::<u32>().ok());
-        invalidate(&cache_dir(), number);
+        invalidate(&store::disk_cache_dir(), number);
         std::process::exit(0);
     }
     if detect_forge(None) == ForgeType::Gitea {
@@ -155,7 +154,14 @@ type Fetcher<'a> = dyn Fn(&str, u32, Option<&str>) -> Option<String> + 'a;
 fn default_fetcher(entity: &str, number: u32, repo: Option<&str>) -> Option<String> {
     let gh_bin = std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string());
     let cwd = std::env::current_dir().ok();
-    fetch_conditional(Path::new(&gh_bin), cwd.as_deref(), &cache_dir(), entity, number, repo)
+    fetch_conditional(
+        Path::new(&gh_bin),
+        cwd.as_deref(),
+        &store::disk_cache_dir(),
+        entity,
+        number,
+        repo,
+    )
 }
 
 /// Side-effect-free (given `fetch`) pipeline: parse → fetch → project → jq.
@@ -316,26 +322,12 @@ fn project_labels(labels: &Value) -> Option<Value> {
 // Disk-persistent ETag store for view entries
 // ============================================================================
 //
-// Self-contained on purpose: the shared disk-ETag primitives are still private
-// to `forge_listing.rs` until "PR A" (#9251/#9252, PR #9261) makes them
-// `pub(crate)`. Fold this store (and record 200/304 through PR A's stats sink)
-// into them once it lands — tracked by #9273.
-
-/// Shared with the listing store (`LOOM_LISTING_CACHE_DIR` overrides; else
-/// `${TMPDIR:-/tmp}/loom-forge-listing-cache`); view files carry
-/// [`VIEW_PREFIX`].
-fn cache_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("LOOM_LISTING_CACHE_DIR") {
-        if !d.is_empty() {
-            return PathBuf::from(d);
-        }
-    }
-    let base = std::env::var("TMPDIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/tmp".to_string());
-    PathBuf::from(base).join("loom-forge-listing-cache")
-}
+// Backed by the shared [`crate::forge_etag_store`] primitives (#9261): the
+// same `private_dir`-guarded read/write, the same resolved `Target` +
+// `cache_key`, and the same `fetch_conditional` (which records 200/304
+// through `forge_call_stats` for us) as the listing store — folded in by
+// #9273. Only the filename prefix ([`VIEW_PREFIX`]) and the age-based pruning
+// below stay local to this module.
 
 #[must_use]
 pub fn build_view_url(entity: &str, repo: Option<&str>, number: u32) -> String {
@@ -344,79 +336,11 @@ pub fn build_view_url(entity: &str, repo: Option<&str>, number: u32) -> String {
     format!("repos/{repo_path}/{kind}/{number}")
 }
 
-/// Resolved `owner/repo` (explicit, else `cwd`'s origin remote, else the raw
-/// path) — the placeholder URL alone says nothing about which repo it hits.
-fn repo_scope(cwd: Option<&Path>, repo: Option<&str>) -> String {
-    if let Some(r) = repo {
-        return r.to_string();
-    }
-    cwd.map(|dir| {
-        crate::credential_preflight::nwo_from_git_remote(dir)
-            .unwrap_or_else(|| dir.display().to_string())
-    })
-    .unwrap_or_default()
-}
-
-/// Credential identity: host, config dir, and a truncated SHA-256 fingerprint
-/// of any env token (never the token itself), so two identities never share
-/// an entry.
-fn credential_identity(cwd: Option<&Path>) -> String {
-    use sha2::{Digest, Sha256};
-    let env = |k: &str| std::env::var(k).unwrap_or_default();
-    let token = [env("GH_TOKEN"), env("GITHUB_TOKEN")].concat();
-    let fingerprint = if token.is_empty() {
-        String::new()
-    } else {
-        Sha256::digest(token.as_bytes())
-            .iter()
-            .take(8)
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    };
-    let scoped_config = cwd
-        .and_then(crate::credential_preflight::gh_config_dir_for_root)
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    format!("{}|{}|{scoped_config}|{fingerprint}", env("GH_HOST"), env("GH_CONFIG_DIR"))
-}
-
+/// `view-{entity}-{number}-{hash}.json`, keeping view entries distinguishable
+/// from the listing store's `listing-{hash}.json` entries sharing the same
+/// directory ([`store::disk_cache_dir`]).
 fn entry_path(dir: &Path, entity: &str, number: u32, cache_key: &str) -> PathBuf {
-    // FNV-1a 64-bit: dependency-free, path-safe.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in cache_key.as_bytes() {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    dir.join(format!("{VIEW_PREFIX}{entity}-{number}-{hash:016x}.json"))
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct DiskEntry {
-    etag: String,
-    body: String,
-}
-
-fn read_entry(path: &Path) -> Option<DiskEntry> {
-    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
-}
-
-/// Atomic (temp + rename) best-effort write.
-fn write_entry(path: &Path, entry: &DiskEntry) {
-    let Some(dir) = path.parent() else { return };
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let Ok(serialized) = serde_json::to_string(entry) else {
-        return;
-    };
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("entry")
-    ));
-    if std::fs::write(&tmp, serialized).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    store::entry_path_with_prefix(dir, &format!("{VIEW_PREFIX}{entity}-{number}-"), cache_key)
 }
 
 /// View entry files in `dir`, as `(path, file name)`.
@@ -461,8 +385,12 @@ fn prune_stale(dir: &Path) {
     }
 }
 
-/// One conditional `gh api --include` GET. Returns the body to serve (fresh on
-/// `200`, the stored body on `304`), or `None` to decline.
+/// One conditional `gh api --include` GET via the shared
+/// [`store::fetch_conditional`] (recorded against caller `"forge_cached_view"`
+/// in `forge_call_stats`). Returns the body to serve (fresh on `200`, the
+/// stored body on `304`), or `None` to decline: any `gh` invocation failure, a
+/// non-200/304 answer, or an exit-code failure on what should have been a
+/// `200`.
 fn fetch_conditional(
     gh_bin: &Path,
     cwd: Option<&Path>,
@@ -473,46 +401,37 @@ fn fetch_conditional(
 ) -> Option<String> {
     let env_repo = std::env::var("LOOM_REPO").ok().filter(|s| !s.is_empty());
     let repo = repo_override.or(env_repo.as_deref());
-    let url = build_view_url(entity, repo, number);
-    let key = format!("{}|{}|{url}", repo_scope(cwd, repo), credential_identity(cwd));
+    let target = store::resolve_target(cwd, repo);
+    let url = build_view_url(entity, target.repo.as_deref(), number);
+    let key = store::cache_key(cwd, &target, &url);
     let path = entry_path(dir, entity, number, &key);
-    let prior = read_entry(&path);
+    let prior = store::read_disk_entry(&path);
+    let prior_etag = prior.as_ref().map(|p| p.etag.as_str());
 
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("api").arg("--include").arg(&url);
-    if let Some(p) = &prior {
-        cmd.arg("-H").arg(format!("If-None-Match: {}", p.etag));
-    }
-    if let Some(d) = cwd {
-        cmd.current_dir(d);
-    }
-    crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, cwd);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let out = cmd.output().ok()?;
-    let response = parse_http_response(&String::from_utf8_lossy(&out.stdout))?;
+    let (status, response, _stderr) =
+        store::fetch_conditional("forge_cached_view", gh_bin, cwd, &target, &url, prior_etag)
+            .ok()?;
 
-    match response.status {
-        304 => match prior {
+    match response {
+        Some(r) if r.status == 304 => match prior {
             Some(p) => Some(p.body),
             None => {
                 let _ = std::fs::remove_file(&path);
                 None
             }
         },
-        200 if out.status.success() => {
-            if let Some(etag) = response.etag {
-                write_entry(
+        Some(r) if r.status == 200 && status.success() => {
+            if let Some(etag) = r.etag.clone() {
+                store::write_disk_entry(
                     &path,
-                    &DiskEntry {
+                    &store::DiskEntry {
                         etag,
-                        body: response.body.clone(),
+                        body: r.body.clone(),
                     },
                 );
                 prune_stale(dir);
             }
-            Some(response.body)
+            Some(r.body)
         }
         _ => None,
     }
@@ -521,6 +440,8 @@ fn fetch_conditional(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
 
     fn argv(parts: &[&str]) -> Vec<String> {
@@ -810,15 +731,54 @@ esac
         assert!(!log.lines().nth(2).unwrap().contains("If-None-Match"));
     }
 
+    /// #9273: a `200` then a `304` on the shared store are recorded against
+    /// caller `"forge_cached_view"` in `forge_call_stats` (mirrors
+    /// `forge_call_stats_tests.rs`'s sink-round-trip shape). Counts are
+    /// process-wide and other tests in this module share the same caller
+    /// string, so this asserts a lower bound on the delta (this call's own
+    /// contribution) rather than an exact value — an equality assertion would
+    /// be flaky under the test harness's default parallelism.
+    #[test]
+    fn view_200_then_304_records_stats_for_forge_cached_view_caller() {
+        fn counts(caller: &str) -> (u64, u64) {
+            crate::forge_call_stats::status_report(chrono::Utc::now(), None)
+                .since_start
+                .into_iter()
+                .find(|r| r.caller == caller)
+                .map(|r| (r.ok, r.not_modified))
+                .unwrap_or_default()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let gh = write_fake_gh(dir.path());
+        let before = counts("forge_cached_view");
+
+        // Round 1: unconditional 200.
+        assert!(
+            fetch_conditional(&gh, Some(dir.path()), cache.path(), "issue", 4200, Some("o/r"))
+                .is_some()
+        );
+        // Round 2: sends If-None-Match, gets 304.
+        assert!(
+            fetch_conditional(&gh, Some(dir.path()), cache.path(), "issue", 4200, Some("o/r"))
+                .is_some()
+        );
+
+        let after = counts("forge_cached_view");
+        assert!(after.0 > before.0, "the 200 was recorded as Ok");
+        assert!(after.1 > before.1, "the 304 was recorded as NotModified");
+    }
+
     #[test]
     fn invalidate_scopes_to_number_and_kind_prefix() {
         let cache = tempfile::tempdir().unwrap();
-        let entry = DiskEntry {
+        let entry = store::DiskEntry {
             etag: "e".into(),
             body: "{}".into(),
         };
         for (entity, n) in [("issue", 42), ("pr", 42), ("issue", 420), ("pr", 4)] {
-            write_entry(&entry_path(cache.path(), entity, n, "k"), &entry);
+            store::write_disk_entry(&entry_path(cache.path(), entity, n, "k"), &entry);
         }
         std::fs::write(cache.path().join("listing-abc.json"), "{}").unwrap();
         invalidate(cache.path(), Some(42));
@@ -848,6 +808,44 @@ esac
         }
         assert!(
             fetch_conditional(&gh, Some(dir.path()), dir.path(), "pr", 1, Some("o/r")).is_none()
+        );
+    }
+
+    /// #9273: the view path now goes through the shared store's
+    /// `private_dir`-guarded [`store::read_disk_entry`], so a `(etag, body)`
+    /// pair planted in a group/world-writable cache dir (as another local
+    /// user could) is never served as a `304` — it is silently refused and
+    /// the call goes out unconditionally, fetching the real fresh body.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_entry_in_a_world_writable_cache_dir_is_not_served() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let cache = cache_base.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let gh = write_fake_gh(dir.path());
+
+        let target = store::resolve_target(Some(dir.path()), Some("o/r"));
+        let url = build_view_url("issue", target.repo.as_deref(), 4300);
+        let key = store::cache_key(Some(dir.path()), &target, &url);
+        let path = entry_path(&cache, "issue", 4300, &key);
+        // Bypass the trusted write path: plant a raw entry directly, as an
+        // attacker sharing this untrusted directory could.
+        std::fs::write(&path, r#"{"etag":"W/\"v1\"","body":"{\"planted\":true}"}"#).unwrap();
+
+        let out =
+            fetch_conditional(&gh, Some(dir.path()), &cache, "issue", 4300, Some("o/r")).unwrap();
+        assert!(
+            !out.contains("planted"),
+            "a planted entry in an untrusted dir must not be served"
+        );
+        let log = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+        assert!(
+            !log.lines().next_back().unwrap().contains("If-None-Match"),
+            "the untrusted entry was never read, so no If-None-Match was sent"
         );
     }
 }

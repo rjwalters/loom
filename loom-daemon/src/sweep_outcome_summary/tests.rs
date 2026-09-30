@@ -19,6 +19,7 @@ fn record(
     duration: i64,
 ) -> SweepOutcomeRecord {
     SweepOutcomeRecord {
+        story_points: None,
         repo: Some(repo.to_string()),
         repo_unresolved: false,
         visibility: RepoVisibility::Private,

@@ -73,6 +73,10 @@ export interface QueuePlan {
     max_admissions_per_tick?: number;
     saturation_held: boolean;
     any_halted: boolean;
+    /** Whether the host's single `loom:operator-priority` overflow slot
+     * (#9244) is unused: a starred issue can still start past the
+     * configured cap. Absent from a daemon older than #9318. */
+    overflow_free?: boolean;
   };
   tick_interval_secs?: number;
   shard: { configured: boolean; host_shard?: number; shard_count?: number };
@@ -218,6 +222,8 @@ export function normalizePlan(value: unknown): QueuePlan | undefined {
     const n = optCount(slots[key]);
     if (n !== undefined) plan.slots[key] = n;
   }
+  const overflowFree = bool(slots.overflow_free);
+  if (overflowFree !== undefined) plan.slots.overflow_free = overflowFree;
   const hostShard = optCount(shard.host_shard);
   if (hostShard !== undefined) plan.shard.host_shard = hostShard;
   const shardCount = optCount(shard.shard_count);
