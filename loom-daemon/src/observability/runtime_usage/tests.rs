@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 
-use super::join::{context_for_session_at, open_at, workspace_of, JoinEntry, JOIN_DIR};
+use super::join::{
+    context_for_session_at, open_at, open_keyed_at, workspace_of, JoinEntry, JoinKey, JOIN_DIR,
+};
 use super::*;
 use crate::activity::transcript_ingest::{ingest, IngestOptions};
 use crate::activity::ActivityDb;
@@ -178,14 +180,16 @@ fn the_usage_span_is_a_child_of_the_runtime_run_span_over_its_interval() {
     assert!(drained.iter().any(|s| s.name == SpanName::RuntimeUsage));
 }
 
-fn entry(issue: u32, started: i64, ended: Option<i64>) -> JoinEntry {
+fn keyed_entry(key: JoinKey<'_>, started: i64, ended: Option<i64>) -> JoinEntry {
     let base = Utc::now();
-    JoinEntry {
-        issue,
-        context: TraceContext::root(true),
-        started_at: base + Duration::minutes(started),
-        ended_at: ended.map(|m| base + Duration::minutes(m)),
-    }
+    let mut entry =
+        JoinEntry::new(key, TraceContext::root(true), base + Duration::minutes(started));
+    entry.ended_at = ended.map(|m| base + Duration::minutes(m));
+    entry
+}
+
+fn entry(issue: u32, started: i64, ended: Option<i64>) -> JoinEntry {
+    keyed_entry(JoinKey::Issue(issue), started, ended)
 }
 
 fn plant(root: &Path, entry: &JoinEntry) {
@@ -209,20 +213,20 @@ fn a_session_joins_only_when_exactly_one_entry_names_its_issue_and_covers_its_st
     plant(root, &entry(8909, -60, None));
     let at = |m: i64| Some(now + Duration::minutes(m));
 
-    let joined = context_for_session_at(Some(&cwd), Some(8908), at(-30), now);
+    let joined = context_for_session_at(Some(&cwd), Some(8908), None, at(-30), now);
     assert_eq!(joined, Some(one.context.clone()));
     // An issue worktree resolves to the same workspace.
     let worktree = format!("{cwd}/.loom/worktrees/issue-8908");
     assert_eq!(workspace_of(Path::new(&worktree)), root);
-    assert!(context_for_session_at(Some(&worktree), Some(8908), at(-30), now).is_some());
+    assert!(context_for_session_at(Some(&worktree), Some(8908), None, at(-30), now).is_some());
     // Outside the window, another issue, or no issue: unjoined.
-    assert_eq!(context_for_session_at(Some(&cwd), Some(8908), at(-5), now), None);
-    assert_eq!(context_for_session_at(Some(&cwd), Some(8908), at(-90), now), None);
-    assert_eq!(context_for_session_at(Some(&cwd), Some(1), at(-30), now), None);
-    assert_eq!(context_for_session_at(Some(&cwd), None, at(-30), now), None);
+    assert_eq!(context_for_session_at(Some(&cwd), Some(8908), None, at(-5), now), None);
+    assert_eq!(context_for_session_at(Some(&cwd), Some(8908), None, at(-90), now), None);
+    assert_eq!(context_for_session_at(Some(&cwd), Some(1), None, at(-30), now), None);
+    assert_eq!(context_for_session_at(Some(&cwd), None, None, at(-30), now), None);
     // Ambiguous (a second covering entry for the same issue): never guessed.
     plant(root, &entry(8908, -45, None));
-    assert_eq!(context_for_session_at(Some(&cwd), Some(8908), at(-30), now), None);
+    assert_eq!(context_for_session_at(Some(&cwd), Some(8908), None, at(-30), now), None);
 }
 
 /// #9013 item 2: past `MAX_ENTRIES` candidates, a second match could be
@@ -243,7 +247,7 @@ fn a_capped_directory_reports_ambiguous_even_with_one_real_covering_entry() {
     plant(root, &real);
     // Below the cap: still joins normally.
     assert_eq!(
-        context_for_session_at(Some(&cwd), Some(8908), at(-30), now),
+        context_for_session_at(Some(&cwd), Some(8908), None, at(-30), now),
         Some(real.context.clone())
     );
 
@@ -252,7 +256,7 @@ fn a_capped_directory_reports_ambiguous_even_with_one_real_covering_entry() {
         plant(root, &entry(90_000 + issue, -60, Some(-10)));
     }
     assert_eq!(
-        context_for_session_at(Some(&cwd), Some(8908), at(-30), now),
+        context_for_session_at(Some(&cwd), Some(8908), None, at(-30), now),
         None,
         "capped: never guess a single match past the read limit"
     );
@@ -269,12 +273,8 @@ fn close_ends_and_renames_an_entry_opened_under_the_pre_story_name() {
     let legacy = root
         .join(JOIN_DIR)
         .join(format!("{}.json", context.trace_id.as_str()));
-    let opened = JoinEntry {
-        issue: 9038,
-        context: context.clone(),
-        started_at: Utc::now() - Duration::minutes(5),
-        ended_at: None,
-    };
+    let opened =
+        JoinEntry::new(JoinKey::Issue(9038), context.clone(), Utc::now() - Duration::minutes(5));
     std::fs::create_dir_all(root.join(JOIN_DIR)).unwrap();
     std::fs::write(&legacy, serde_json::to_vec(&opened).unwrap()).unwrap();
     super::join::close(root, "in-flight", Utc::now());
@@ -313,11 +313,11 @@ fn restart_reconciliation_closes_entries_still_open() {
     // The orphan is now closed at `now`, so a session starting well after it
     // no longer matches — the whole point of bounding its retention down.
     let at = Some(now + Duration::minutes(5));
-    assert_eq!(context_for_session_at(Some(&cwd), Some(9013), at, now), None);
+    assert_eq!(context_for_session_at(Some(&cwd), Some(9013), None, at, now), None);
     // A session inside its (now-bounded) window still joins.
     let inside = Some(orphan.started_at + Duration::minutes(1));
     assert_eq!(
-        context_for_session_at(Some(&cwd), Some(9013), inside, now),
+        context_for_session_at(Some(&cwd), Some(9013), None, inside, now),
         Some(orphan.context)
     );
 
@@ -339,7 +339,7 @@ fn expired_entries_are_pruned() {
     plant(tmp.path(), &stale);
     let cwd = tmp.path().to_string_lossy().into_owned();
     let at = Some(stale.started_at + Duration::minutes(1));
-    assert_eq!(context_for_session_at(Some(&cwd), Some(1), at, Utc::now()), None);
+    assert_eq!(context_for_session_at(Some(&cwd), Some(1), None, at, Utc::now()), None);
     assert_eq!(
         std::fs::read_dir(tmp.path().join(JOIN_DIR))
             .unwrap()
@@ -511,4 +511,259 @@ fn a_subagent_transcript_naming_no_issue_stays_unjoined_while_its_parent_joins()
         .expect("subagent summary");
     assert_eq!(subagent_summary.issue, None, "no slash command in the subagent's own head");
     assert!(subagent_trace.is_none(), "unattributed issue never guesses a join");
+}
+
+// ---------------------------------------------------------------------------
+// Role-runner ticks (Issue #9231): the same span + join treatment #8908 gave a
+// sweep, keyed on the role a tick launched as rather than on an issue it never
+// names.
+// ---------------------------------------------------------------------------
+
+fn role_entry(role: &str, started: i64, ended: Option<i64>) -> JoinEntry {
+    keyed_entry(JoinKey::Role(role), started, ended)
+}
+
+/// #9231 acceptance: a **role-runner tick** — not a sweep, and naming no issue
+/// anywhere — produces a `loom.runtime.usage` span and a `session.summary`
+/// record that share one trace id. Fixture transcript, real trace store, real
+/// ingest pass, real usage journalling; the only thing stood in for is the
+/// enablement check (`tracing::enabled` is `cfg!(feature = "otlp")`-gated), so
+/// the test calls the same functions the wired path calls, one layer in.
+#[test]
+fn a_traced_role_ticks_session_summary_and_usage_span_share_one_trace_id() {
+    use crate::observability::lifecycle::{role_execution_id, RoleTrace};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    // Dispatch, exactly as `lifecycle::role_invocation` does it: an execution
+    // keyed by `role_execution_id` (the tick's own identity — role + start
+    // instant, NOT the per-role log's `tick_anchor`), its persisted root
+    // context, and a role-keyed join entry opened for it.
+    let started_at = Utc::now() - Duration::minutes(10);
+    let execution = role_execution_id("judge", started_at);
+    let root_context = TraceStore::new(&workspace)
+        .load_or_create(&workspace, &execution)
+        .unwrap()
+        .context;
+    open_keyed_at(&workspace, &execution, JoinKey::Role("judge"), started_at).unwrap();
+
+    // The tick's own Claude transcript. Its head is a bare `/loom:judge` with
+    // NO argument; its cwd is the workspace root, never an `issue-<N>`
+    // worktree; and there is no `feature/issue-<N>` branch — so all three of
+    // `session_context`'s issue sources resolve to `None`, which is precisely
+    // why an issue-keyed entry could never have joined this log.
+    let cwd = workspace.to_string_lossy().into_owned();
+    let ts = (started_at + Duration::minutes(1)).to_rfc3339();
+    let lines = [
+        serde_json::json!({"type": "user", "sessionId": "uuid-judge-tick", "cwd": cwd,
+            "timestamp": ts, "message": {"role": "user", "content":
+            "<command-name>/loom:judge</command-name>\n<command-args></command-args>"}}),
+        serde_json::json!({"type": "assistant", "sessionId": "uuid-judge-tick", "cwd": cwd,
+            "timestamp": ts, "message": {"model": "claude-sonnet-5", "id": "msg_1",
+            "content": [{"type": "text", "text": "PRIVATE transcript body"}],
+            "usage": {"input_tokens": 11, "output_tokens": 22,
+                      "cache_read_input_tokens": 33, "cache_creation_input_tokens": 44}}}),
+    ];
+    let projects = tmp.path().join("projects");
+    let project = projects.join(crate::transcript_tokens::project_slug(&workspace));
+    std::fs::create_dir_all(&project).unwrap();
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(project.join("uuid-judge-tick.jsonl"), body).unwrap();
+
+    let queue_path = tmp.path().join("queue.jsonl");
+    let db = ActivityDb::new(tmp.path().join("activity.db")).unwrap();
+    ingest(
+        &db,
+        &IngestOptions {
+            projects_dir: projects,
+            summary_sink: Some(SessionSummarySink::new(
+                Arc::new(DurableQueue::open(queue_path.clone(), 100)),
+                "host-test",
+            )),
+            ..IngestOptions::default()
+        },
+    )
+    .unwrap();
+    let envelopes = DurableQueue::open(queue_path, 100).peek_batch(10);
+    let (summary, log_trace) = envelopes
+        .iter()
+        .find_map(|e| match &e.record {
+            TelemetryRecord::SessionSummary(s) => Some((s, e.trace_context.as_ref())),
+            _ => None,
+        })
+        .expect("one session.summary");
+    assert_eq!(summary.issue, None, "a role tick names no issue — that is the whole point");
+    let log_trace = log_trace.expect("joined to the tick's trace on its role key");
+    assert_eq!(log_trace.trace_id, root_context.trace_id);
+    let wire = serde_json::to_string(&envelopes[0]).unwrap();
+    assert!(!wire.contains("PRIVATE"), "no transcript body is exported");
+
+    // Terminal transition, exactly as `role_tick_telemetry::emit_correlated`
+    // does it: the per-model usage spans, then the join close.
+    let ended_at = Utc::now();
+    let trace = RoleTrace {
+        context: root_context.clone(),
+        execution: execution.clone(),
+        started_at,
+    };
+    crate::role_tick_telemetry::usage::journal_execution(
+        &workspace,
+        &trace,
+        "judge",
+        ended_at,
+        Some("claude"),
+        &[row(11, 22, 33, 44, 0)],
+    );
+    let store = TraceStore::new(&workspace);
+    let spans = Journal::for_context(&store.path(&workspace, &execution))
+        .completed()
+        .unwrap();
+    let span = spans
+        .iter()
+        .find(|s| s.name == SpanName::RuntimeUsage)
+        .expect("the tick journalled a loom.runtime.usage span");
+    assert_eq!(span.name.as_str(), "loom.runtime.usage");
+    assert_eq!(span.context.trace_id, log_trace.trace_id, "one trace id for log and span");
+    assert_eq!(span.attributes["loom.tokens.total"], "110");
+    assert_eq!(span.attributes["loom.role"], "judge");
+    assert_eq!(span.attributes["loom.sweep_id"], execution);
+
+    super::join::close(&workspace, &execution, ended_at);
+    let closed: JoinEntry = serde_json::from_slice(
+        &std::fs::read(workspace.join(JOIN_DIR).join(format!(
+            "{}-{}.json",
+            root_context.trace_id.as_str(),
+            root_context.span_id.as_str()
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(closed.role.as_deref(), Some("judge"));
+    assert_eq!(closed.issue, None);
+    assert_eq!(closed.ended_at, Some(ended_at), "the terminal transition closed the entry");
+}
+
+/// #9231: the role key joins the role's own tick and nothing else. Champion
+/// and Doctor ticks name no issue either, so this is the ordinary case for
+/// every role-runner role — and the cases it must refuse are what keep it from
+/// stealing a sweep phase's log.
+#[test]
+fn a_role_keyed_entry_joins_only_a_session_that_launched_as_that_role() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let cwd = root.to_string_lossy().into_owned();
+    let now = Utc::now();
+    let at = |m: i64| Some(now + Duration::minutes(m));
+
+    let champion = role_entry("champion", -60, Some(-10));
+    plant(root, &champion);
+    plant(root, &role_entry("doctor", -60, None));
+
+    // The tick's own session: no issue, head named `/loom:champion`.
+    assert_eq!(
+        context_for_session_at(Some(&cwd), None, Some("champion"), at(-30), now),
+        Some(champion.context.clone())
+    );
+    // Case-insensitive, like every other role comparison in the daemon.
+    assert_eq!(
+        context_for_session_at(Some(&cwd), None, Some("Champion"), at(-30), now),
+        Some(champion.context.clone())
+    );
+    // Another role, outside the window, or no key at all: unjoined.
+    assert_eq!(context_for_session_at(Some(&cwd), None, Some("judge"), at(-30), now), None);
+    assert_eq!(context_for_session_at(Some(&cwd), None, Some("champion"), at(-5), now), None);
+    assert_eq!(context_for_session_at(Some(&cwd), None, None, at(-30), now), None);
+
+    // A session that names an issue joins that issue's execution or nothing —
+    // it never falls through to a role key. Otherwise a sweep phase whose own
+    // execution is untraced would attach itself to whatever role-runner tick
+    // happened to be open.
+    assert_eq!(
+        context_for_session_at(Some(&cwd), Some(9231), Some("champion"), at(-30), now),
+        None
+    );
+
+    // Two covering entries for the same role (an operator hand-running the
+    // same slash command in the tick's window): ambiguous, never guessed.
+    plant(root, &role_entry("champion", -45, None));
+    assert_eq!(context_for_session_at(Some(&cwd), None, Some("champion"), at(-30), now), None);
+}
+
+/// #9231: an issue-keyed and a role-keyed entry are distinct keys, not two
+/// spellings of one. Neither matches the other's session even with identical
+/// windows in the same workspace.
+#[test]
+fn issue_keyed_and_role_keyed_entries_never_match_each_others_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let cwd = root.to_string_lossy().into_owned();
+    let now = Utc::now();
+    let at = Some(now - Duration::minutes(30));
+
+    let sweep = entry(9231, -60, None);
+    let tick = role_entry("judge", -60, None);
+    plant(root, &sweep);
+    plant(root, &tick);
+
+    assert_eq!(
+        context_for_session_at(Some(&cwd), Some(9231), None, at, now),
+        Some(sweep.context)
+    );
+    assert_eq!(
+        context_for_session_at(Some(&cwd), None, Some("judge"), at, now),
+        Some(tick.context)
+    );
+}
+
+/// #9231: a pre-upgrade entry — written as `{"issue": N, …}` with no `role`
+/// field — still deserializes and still joins as issue-keyed. An execution in
+/// flight across the upgrade must not lose its join.
+#[test]
+fn a_pre_role_key_entry_still_deserializes_and_joins_on_its_issue() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let context = TraceContext::root(true);
+    let started_at = Utc::now() - Duration::minutes(30);
+    let legacy = serde_json::json!({
+        "issue": 9231,
+        "context": context,
+        "started_at": started_at,
+    });
+    let dir = root.join(JOIN_DIR);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{}.json", context.trace_id.as_str())),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    let cwd = root.to_string_lossy().into_owned();
+    let now = Utc::now();
+    let decoded: JoinEntry =
+        serde_json::from_value(legacy).expect("a pre-#9231 entry still decodes");
+    assert_eq!(decoded.issue, Some(9231));
+    assert_eq!(decoded.role, None);
+    assert_eq!(
+        context_for_session_at(
+            Some(&cwd),
+            Some(9231),
+            None,
+            Some(started_at + Duration::minutes(1)),
+            now
+        ),
+        Some(context)
+    );
+}
+
+/// #9231: the precedence rule, stated once as a unit.
+#[test]
+fn a_sessions_join_key_prefers_its_issue_and_falls_back_to_its_slash_role() {
+    use super::join::session_key;
+
+    assert_eq!(session_key(Some(42), None), Some(JoinKey::Issue(42)));
+    assert_eq!(session_key(Some(42), Some("judge")), Some(JoinKey::Issue(42)));
+    assert_eq!(session_key(None, Some("judge")), Some(JoinKey::Role("judge")));
+    assert_eq!(session_key(None, None), None);
 }

@@ -207,6 +207,7 @@ mod tests {
         queue.push(TelemetryEnvelope::new(
             "host",
             TelemetryRecord::SweepStarted(SweepStartedRecord {
+                story_points: None,
                 repo: "test/fixture".into(),
                 visibility: RepoVisibility::Private,
                 issue: 18,
@@ -256,6 +257,7 @@ mod tests {
         queue.push(TelemetryEnvelope::new(
             "host",
             TelemetryRecord::SweepStarted(SweepStartedRecord {
+                story_points: None,
                 repo: "test/fixture".into(),
                 visibility: RepoVisibility::Private,
                 issue: 18,

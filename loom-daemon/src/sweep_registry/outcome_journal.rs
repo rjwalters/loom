@@ -719,12 +719,24 @@ impl SweepRegistry {
                 (Some(index), previous, Some(trigger.to_string()))
             });
 
-        // In-sweep rework events (Issue #9444) the performing paths marked,
-        // scoped to this sweep's own window. Absent (never `[]`) when none.
-        let rework_events = started_at.map(|started_at| {
-            rework::read_rework_events(&self.config.workspace_root, issue, Some(started_at))
-        });
-        let rework_events = rework_events.filter(|events| !events.is_empty());
+        // In-sweep rework events (Issue #9444), two sources, markers first:
+        // (a) events the performing paths explicitly marked in the
+        // `sweep-rework-events.jsonl` protocol, and (b) events read off the
+        // worktree's own HEAD reflog — the mechanical writer that needs no
+        // role compliance, since a Doctor's conflict rebase or a Builder's
+        // merge-from-main records itself there with a timestamp. Both are
+        // scoped to this sweep's own window. Absent (never `[]`) when neither
+        // saw anything.
+        let rework_events = started_at
+            .map(|started_at| {
+                rework::collect_rework_events(
+                    &self.config.workspace_root,
+                    &self.worktree_path(issue),
+                    issue,
+                    started_at,
+                )
+            })
+            .filter(|events| !events.is_empty());
 
         // Every PR this sweep's lifecycle was observed to carry (Issue
         // #9465), in first-seen order — the multi-PR slice shape the single
@@ -849,6 +861,13 @@ impl SweepRegistry {
         let issue_signals = self.fetch_issue_signals(issue);
         let complexity = issue_signals.complexity.clone();
         let issue_end_state = issue_signals.end_state(started_at);
+        // The Curator's story-point size (Issue #9432, epic #9429), folded out
+        // of the SAME read's label list — no extra forge round trip, and the
+        // estimate can never describe a different issue than `complexity` and
+        // the end state do. Pure label folding with the one-label-per-issue
+        // guard: absent, out-of-vocabulary and stacked points labels all yield
+        // `None` (the last two logged loudly), never a guessed or zero size.
+        let story_points = issue_signals.story_points(issue);
 
         // What this sweep actually DID (Issue #9441) — a pure derivation over
         // the signals already assembled above, NOT new instrumentation. The
@@ -897,6 +916,7 @@ impl SweepRegistry {
                 .and_then(|r| r.provider.clone()),
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
             complexity,
+            story_points,
             tokens_status: Some(tokens_status),
             attempt_index,
             previous_sweep_id,
@@ -1450,3 +1470,15 @@ mod disposition_tests;
     unused_imports
 )]
 mod tokens_status_tests;
+
+// Contract tests for the #9465 PR-linkage and actually-ran-model derivation
+// (`pr_numbers`, `model` vs. `config["arm"]`), in their own sibling file for
+// the same file-size reason as `timeline_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod pr_link_tests;

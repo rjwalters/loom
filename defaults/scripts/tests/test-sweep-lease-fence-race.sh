@@ -151,7 +151,9 @@ if [[ "$1" == "api" ]]; then
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --jq) filter="$2"; shift 2 ;;
-      -R) shift 2 ;;
+      -R|--repo)
+        # Real `gh api` has no -R/--repo flag (#9552): fail exactly like it.
+        echo "unknown shorthand flag: 'R' in -R" >&2; exit 1 ;;
       --paginate) shift ;;
       *)
         if [[ -z "$path" ]]; then path="$1"; fi
@@ -159,6 +161,7 @@ if [[ "$1" == "api" ]]; then
         ;;
     esac
   done
+  echo "$path" >> "$D/api-paths.log"
   if [[ "$path" == repos/*/issues/*/comments ]]; then
     if [[ -f "$D/comments-fail" ]]; then
       echo "stub gh: comments fetch failed" >&2

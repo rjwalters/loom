@@ -55,6 +55,28 @@ pub struct MalformedDeclaration {
 pub fn parse_growth_declarations(
     text: &str,
 ) -> (Vec<GrowthDeclaration>, Vec<MalformedDeclaration>) {
+    scan_trailers(text, GROWTH_TRAILER, parse_declaration_value)
+}
+
+/// The positional rules every Loom shell-budget trailer obeys, parameterised by
+/// the trailer key and by what its VALUE means.
+///
+/// Extracted from `parse_growth_declarations` when the `Shell-Budget-Callout:`
+/// trailer arrived (#9297). The edge cases below — a fence closed only by its
+/// own marker, an indent that is prose rather than a fence, the subject line, a
+/// folded continuation that must stop at the next field — each cost a defect to
+/// find. A second trailer with its own copy of them would drift from this one
+/// silently, and the drift would show up as "my declaration was ignored", which
+/// is precisely the failure the reporting of malformed lines exists to prevent.
+///
+/// Two trailers cannot interact: a line is only ever examined against ONE key,
+/// and a line carrying the other key is not `looks_like` for this one, so it is
+/// neither accepted nor reported here.
+pub(super) fn scan_trailers<T>(
+    text: &str,
+    key: &str,
+    parse_value: impl Fn(&str, &str) -> Result<T, MalformedDeclaration>,
+) -> (Vec<T>, Vec<MalformedDeclaration>) {
     let mut ok = Vec::new();
     let mut bad = Vec::new();
     // The marker that opened the current fence, so it is closed only by its
@@ -87,7 +109,7 @@ pub fn parse_growth_declarations(
         }
         let fenced = fence.is_some();
 
-        let looks_like = strip_trailer_prefix(trimmed).is_some();
+        let looks_like = strip_trailer_prefix(trimmed, key).is_some();
         if !looks_like {
             continue;
         }
@@ -123,7 +145,7 @@ pub fn parse_growth_declarations(
         }
 
         let line = raw.trim_end();
-        let Some(rest) = strip_trailer_prefix(line) else {
+        let Some(rest) = strip_trailer_prefix(line, key) else {
             continue;
         };
 
@@ -141,7 +163,7 @@ pub fn parse_growth_declarations(
             // continuation. Folding swallowed an indented `Closes #1` into a
             // reason that cited no issue, manufacturing the citation the rule
             // requires — and pulled `Co-Authored-By:` in with it.
-            if strip_trailer_prefix(nt).is_some()
+            if strip_trailer_prefix(nt, key).is_some()
                 || nt.split_once(':').is_some_and(|(k, _)| {
                     !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
                 })
@@ -156,7 +178,7 @@ pub fn parse_growth_declarations(
             j += 1;
         }
 
-        match parse_declaration_value(&value, line) {
+        match parse_value(&value, line) {
             Ok(d) => ok.push(d),
             Err(m) => bad.push(m),
         }
@@ -212,8 +234,7 @@ fn parse_declaration_value(
 }
 
 /// Case-insensitive match on the trailer key, so `shell-budget-growth:` works.
-fn strip_trailer_prefix(line: &str) -> Option<&str> {
-    let key = GROWTH_TRAILER;
+fn strip_trailer_prefix<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     // `get` rather than a slice: real commit messages are not ASCII, and
     // `line[..20]` panics outright when byte 20 lands inside a multi-byte
     // character. Scanning the epic's own history hit exactly that on an

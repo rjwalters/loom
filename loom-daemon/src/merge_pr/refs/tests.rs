@@ -438,3 +438,147 @@ fn a_distant_negation_word_in_the_same_clause_does_not_suppress_a_later_close() 
         "{body:?}"
     );
 }
+
+// --- `Loom-Issue: owner/repo#N` trailer (#9465) ---
+//
+// The trailer is the machine-readable half of the issue↔PR link convention
+// (`.loom/docs/issue-pr-linking.md`). These cases pin the two properties the
+// convention actually depends on: a well-formed trailer round-trips, and every
+// shape that LOOKS right but does not parse is reported rather than silently
+// dropped — the #8796 pitfall that stranded #5240 at `loom:building`.
+
+/// AC: a well-formed trailer round-trips — parsed out, rendered back to the
+/// exact text a body would carry, and reparsed to the same value.
+#[test]
+fn a_well_formed_trailer_round_trips() {
+    let body = "## Summary\n\nFirst slice.\n\nPart of #9465\nLoom-Issue: rjwalters/loom#9465\n";
+    let refs = loom_issue_trailer_refs(body);
+    assert_eq!(
+        refs,
+        vec![LoomIssueRef {
+            repo: "rjwalters/loom".to_string(),
+            issue: 9465
+        }]
+    );
+    let rendered = format!("Loom-Issue: {}", refs[0]);
+    assert_eq!(rendered, "Loom-Issue: rjwalters/loom#9465");
+    assert_eq!(loom_issue_trailer_refs(&rendered), refs, "render -> reparse is identity");
+    // The trailer is additive: it does not disturb the two existing readings.
+    assert_eq!(partial_increment_refs(body), vec![9465]);
+    assert_eq!(closing_refs(body), Vec::<u64>::new());
+    assert_eq!(unparseable_loom_issue_trailer_warnings(body, "1", false), "");
+}
+
+/// AC: the trailer survives the #8796 code-span pitfall the same way
+/// `Part of #N` does — the backticked form is NOT a declaration, and the
+/// detector makes that silence visible instead of leaving the PR looking right.
+#[test]
+fn a_backticked_trailer_is_not_a_declaration_but_is_warned_about() {
+    let body = "## Summary\n\nFirst slice.\n\n`Loom-Issue: rjwalters/loom#9465`";
+    assert_eq!(
+        loom_issue_trailer_refs(body),
+        Vec::<LoomIssueRef>::new(),
+        "#8796: a whole-line code span is not a declaration (same rule as #5234)"
+    );
+    assert_eq!(
+        unparseable_loom_issue_trailer_snippets(body),
+        vec!["`Loom-Issue: rjwalters/loom#9465`".to_string()]
+    );
+    let warnings = unparseable_loom_issue_trailer_warnings(body, "9999", false);
+    assert!(
+        warnings.contains("Unparseable Loom-Issue trailer (#9465)"),
+        "warning names the finding: {warnings:?}"
+    );
+    assert!(warnings.contains("PR #9999"), "warning names the PR: {warnings:?}");
+    assert!(
+        warnings.contains("`Loom-Issue: rjwalters/loom#9465`"),
+        "warning quotes the offending line verbatim: {warnings:?}"
+    );
+    assert!(
+        unparseable_loom_issue_trailer_warnings(body, "9999", true).starts_with("[dry-run] "),
+        "dry-run prefixes every line, same contract as the #5690 warning"
+    );
+}
+
+/// AC: the `owner/repo` slug is required. A slug-less trailer is not a
+/// half-answer to be guessed at — it is a finding.
+#[test]
+fn a_slug_less_trailer_does_not_parse_and_is_warned_about() {
+    let body = "## Summary\n\nFirst slice.\n\nLoom-Issue: #9465";
+    assert_eq!(loom_issue_trailer_refs(body), Vec::<LoomIssueRef>::new());
+    assert_eq!(
+        unparseable_loom_issue_trailer_snippets(body),
+        vec!["Loom-Issue: #9465".to_string()]
+    );
+    assert!(
+        unparseable_loom_issue_trailer_warnings(body, "1", false).contains("owner/repo"),
+        "the warning names what is missing"
+    );
+}
+
+/// AC: the anchoring rules are `Part of #N`'s, verbatim — line-leading behind
+/// an optional list/blockquote marker, and a numbered-list ordinal is never
+/// read as an issue number.
+#[test]
+fn the_trailer_shares_part_of_s_anchoring_rules() {
+    let body = "- Loom-Issue: rjwalters/loom#1\n\
+                3. Loom-Issue: rjwalters/loom#789\n\
+                > Loom-Issue: rjwalters/kicad-tools#42\n";
+    assert_eq!(
+        loom_issue_trailer_refs(body),
+        vec![
+            LoomIssueRef {
+                repo: "rjwalters/kicad-tools".to_string(),
+                issue: 42
+            },
+            LoomIssueRef {
+                repo: "rjwalters/loom".to_string(),
+                issue: 1
+            },
+            LoomIssueRef {
+                repo: "rjwalters/loom".to_string(),
+                issue: 789
+            },
+        ],
+        "sorted by (repo, issue); the list ordinal 3 is not an issue number"
+    );
+    // Mid-sentence is a mention, not a declaration.
+    assert_eq!(
+        loom_issue_trailer_refs("I will add Loom-Issue: rjwalters/loom#5 later"),
+        Vec::<LoomIssueRef>::new()
+    );
+}
+
+/// AC: repeated declarations dedupe, and a fenced example never parses OR
+/// warns — the convention's own documentation must not warn on itself.
+#[test]
+fn repeats_dedupe_and_a_fenced_example_is_inert() {
+    let body = "Loom-Issue: rjwalters/loom#9465\nLoom-Issue: rjwalters/loom#9465\n";
+    assert_eq!(
+        loom_issue_trailer_refs(body),
+        vec![LoomIssueRef {
+            repo: "rjwalters/loom".to_string(),
+            issue: 9465
+        }]
+    );
+
+    let doc = "Write it as:\n\n```markdown\nLoom-Issue: owner/repo#123\n`Loom-Issue: owner/repo#123`\nLoom-Issue: #123\n```\n";
+    assert_eq!(loom_issue_trailer_refs(doc), Vec::<LoomIssueRef>::new());
+    assert_eq!(unparseable_loom_issue_trailer_warnings(doc, "1", false), "");
+}
+
+/// AC: a line named by BOTH the broken and the working shape is not warned
+/// about — the link is present, so warning would train readers to ignore it
+/// (the same rule `backticked_partial_increment_warnings` applies).
+#[test]
+fn a_backticked_trailer_whose_link_is_also_declared_plainly_does_not_warn() {
+    let body = "`Loom-Issue: rjwalters/loom#9465`\n\nLoom-Issue: rjwalters/loom#9465\n";
+    assert_eq!(
+        loom_issue_trailer_refs(body),
+        vec![LoomIssueRef {
+            repo: "rjwalters/loom".to_string(),
+            issue: 9465
+        }]
+    );
+    assert_eq!(unparseable_loom_issue_trailer_warnings(body, "1", false), "");
+}

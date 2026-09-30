@@ -355,10 +355,17 @@ pub fn ingest(db: &ActivityDb, opts: &IngestOptions) -> Result<IngestStats> {
                 }
                 if let Some(sink) = &opts.summary_sink {
                     // #8908: join the log to its execution's trace, when
-                    // exactly one traced sweep of this issue covers it.
+                    // exactly one traced sweep of this issue covers it — or,
+                    // for a session that names no issue, exactly one traced
+                    // role-runner tick of the role this session launched as
+                    // (#9231). `parsed.slash_role`, never `parsed.role`: the
+                    // latter's keyword scan reads a subagent's dispatch prose
+                    // ("You are the Loom Judge…"), which must not become a
+                    // join key.
                     let trace = crate::observability::runtime_usage::join::context_for_session(
                         parsed.cwd.as_deref(),
                         summary.issue,
+                        parsed.slash_role.as_deref(),
                         parsed.first_timestamp,
                     );
                     sink.push_traced(summary, trace);

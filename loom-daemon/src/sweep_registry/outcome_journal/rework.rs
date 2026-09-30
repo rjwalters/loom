@@ -32,6 +32,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::rework_events::KIND_REBASE;
 pub(crate) use crate::rework_events::{default_classification, path as rework_events_path};
 use crate::telemetry::ReworkEvent;
 
@@ -82,6 +83,134 @@ pub(crate) fn read_rework_events(
             })
         })
         .collect()
+}
+
+/// Every rework event the terminal turn reports for `issue`'s sweep: the
+/// marker file's events first (in file order), then the worktree reflog's
+/// (oldest first), both scoped to `[started_at, now]`. A missing worktree
+/// contributes nothing. The two sources are disjoint by construction (see
+/// [`crate::rework_events`]), so this concatenates rather than de-duplicates.
+#[must_use]
+pub(crate) fn collect_rework_events(
+    workspace_root: &std::path::Path,
+    worktree: &std::path::Path,
+    issue: u32,
+    started_at: DateTime<Utc>,
+) -> Vec<ReworkEvent> {
+    let mut events = read_rework_events(workspace_root, issue, Some(started_at));
+    if worktree.exists() {
+        events.extend(read_reflog_rework(worktree, Some(started_at)));
+    }
+    events
+}
+
+/// Rework events read off the sweep's own worktree **reflog** — the
+/// mechanical writer that needs no role compliance (Issue #9444).
+///
+/// When a Doctor resolves a merge conflict or a Builder integrates moved
+/// main, the worktree's `HEAD` reflog records it durably (`rebase (start)`,
+/// `rebase (finish): returning to ...`, `merge origin/main ...`), timestamped.
+/// Reading that at the terminal turn means the rework event exists whether or
+/// not any prompt remembered to write a marker: the reflog IS the writer.
+///
+/// Every reflog-derived event is a [`KIND_REBASE`], classified by the shared
+/// table in [`crate::rework_events`] (so **environmental** — the ground moved
+/// under the work) — a reflog entry cannot distinguish "the judge asked for
+/// real changes", which is `rejudge`'s job and arrives via the marker file.
+/// This source and the marker file are disjoint by construction: markers
+/// record only rework this reflog cannot show (a forge-side branch update, a
+/// refusal, a CI rerun, a rejudge), never a local rebase — see
+/// [`crate::rework_events`]'s "Two sources" section.
+/// Consecutive `rebase (start)`/`rebase (finish)` entries collapse into one
+/// event: a rebase is one rework, not two.
+///
+/// Best-effort on every axis: a missing worktree, a non-git directory, or an
+/// unreadable entry skips that entry only.
+#[must_use]
+pub(crate) fn read_reflog_rework(
+    worktree: &std::path::Path,
+    window_start: Option<DateTime<Utc>>,
+) -> Vec<ReworkEvent> {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["reflog", "--date=iso", "--no-decorate"])
+        .current_dir(worktree)
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut events: Vec<ReworkEvent> = Vec::new();
+    let mut in_rebase = false;
+    for line in text.lines().rev() {
+        // Format: `<sha> HEAD@{<iso date>}: <message>` (--date=iso renders
+        // `2026-09-29 12:00:00 +0000` inside the braces).
+        let Some((head, message)) = line.split_once(": ") else {
+            continue;
+        };
+        let Some(open) = head.find("HEAD@{") else {
+            continue;
+        };
+        let raw_date = head[open + 6..].trim_end_matches('}').trim();
+        let Some(at) = parse_reflog_date(raw_date) else {
+            continue;
+        };
+        if let Some(start) = window_start {
+            if at < start {
+                continue;
+            }
+        }
+        let lower = message.to_ascii_lowercase();
+        if lower.starts_with("rebase (finish)") || lower.starts_with("rebase (abort)") {
+            in_rebase = false;
+            continue;
+        }
+        if lower.starts_with("rebase (start)") {
+            // Collapse the start/finish pair into one event, anchored at the
+            // START (when the rework began).
+            in_rebase = true;
+            events.push(reflog_event("worktree reflog: rebase".to_string()));
+            continue;
+        }
+        if in_rebase {
+            // Inside a rebase pair: the finish arm already handled the close.
+            continue;
+        }
+        if lower.starts_with("merge ") || lower.starts_with("commit (merge)") {
+            events.push(reflog_event(format!("worktree reflog: {message}")));
+        }
+    }
+    events
+}
+
+/// One reflog-derived event: the shared vocabulary's [`KIND_REBASE`],
+/// classified by the shared table rather than a local literal.
+fn reflog_event(reason: String) -> ReworkEvent {
+    ReworkEvent {
+        kind: KIND_REBASE.to_string(),
+        reason: Some(reason),
+        classification: Some(default_classification(KIND_REBASE).to_string()),
+        duration_sec: None,
+    }
+}
+
+/// Parse a `git reflog --date=iso` timestamp (`2026-09-29 12:00:00 -0700`)
+/// into the UTC instant it names. The offset is honoured, not discarded:
+/// git renders reflog dates in the host's local zone, so reading the wall
+/// clock as if it were UTC shifts every event by the host's offset and drops
+/// real rebases out of the window on any non-UTC host (Issue #9553). An
+/// offset-less date (never emitted by `--date=iso`, kept for tolerance) is
+/// read as UTC.
+fn parse_reflog_date(raw: &str) -> Option<DateTime<Utc>> {
+    if let Ok(at) = DateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S %z") {
+        return Some(at.with_timezone(&Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|at| at.and_utc())
 }
 
 #[cfg(test)]
@@ -146,6 +275,136 @@ mod tests {
     fn missing_file_is_empty_not_fatal() {
         let dir = TempDir::new().unwrap();
         assert!(read_rework_events(dir.path(), 42, None).is_empty());
+    }
+
+    /// A real rebase performed in a real temp repo is observed as one
+    /// environmental `rebase` event inside the sweep's window (Issue #9444's
+    /// mechanical-writer contract — no marker file involved).
+    #[test]
+    fn a_real_rebase_is_observed_from_the_worktree_reflog() {
+        let git_works = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !git_works {
+            return; // no git on PATH: the mechanical observation cannot run
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["checkout", "-q", "-b", "feature/issue-9"]);
+        std::fs::write(repo.join("work.txt"), "work\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "work"]);
+        // Main moves after the branch forks.
+        run(&["checkout", "-q", "main"]);
+        std::fs::write(repo.join("main.txt"), "main\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "main moves"]);
+        run(&["checkout", "-q", "feature/issue-9"]);
+        // The Doctor's conflict rebase, performed for real.
+        run(&["rebase", "main"]);
+
+        let window_start = chrono::Utc::now() - chrono::Duration::hours(1);
+        let events = read_reflog_rework(&repo, Some(window_start));
+        assert!(
+            events.iter().any(|event| event.kind == "rebase"
+                && event.classification.as_deref() == Some("environmental")),
+            "the rebase must be observed as one environmental event: {events:?}"
+        );
+
+        // The terminal turn reads BOTH sources. The merge path's markers
+        // (a corroborated conflict refusal, a forge-side base sync) describe
+        // rework this worktree's reflog never saw; the local rebase is
+        // reported by the reflog alone, exactly once — no source counts
+        // another's event.
+        let workspace = TempDir::new().unwrap();
+        for kind in [
+            crate::rework_events::KIND_MERGE_CONFLICT,
+            crate::rework_events::KIND_REBASE,
+        ] {
+            crate::rework_events::append(
+                workspace.path(),
+                &crate::rework_events::Marker {
+                    issue: 9,
+                    kind,
+                    reason: Some("merge-pr.sh"),
+                    classification: None,
+                    duration_sec: None,
+                },
+            )
+            .unwrap();
+        }
+        let all = collect_rework_events(workspace.path(), &repo, 9, window_start);
+        let reflog_rebases = all
+            .iter()
+            .filter(|event| {
+                event
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("worktree reflog"))
+            })
+            .count();
+        assert_eq!(reflog_rebases, 1, "one local rebase, one event: {all:?}");
+        assert_eq!(all.len(), 3, "2 markers + 1 reflog rebase: {all:?}");
+        assert_eq!(all[0].kind, "merge_conflict");
+        assert_eq!(all[1].reason.as_deref(), Some("merge-pr.sh"));
+        assert!(all
+            .iter()
+            .all(|event| event.classification.as_deref()
+                == Some(default_classification(&event.kind))));
+
+        // A worktree that no longer exists contributes nothing, not an error.
+        let gone =
+            collect_rework_events(workspace.path(), &dir.path().join("reaped"), 9, window_start);
+        assert_eq!(gone.len(), 2);
+    }
+
+    /// A non-UTC offset names a different instant than the same wall clock
+    /// in UTC; the parse must convert, not discard (Issue #9553).
+    #[test]
+    fn reflog_date_offset_is_converted_to_utc_not_discarded() {
+        let expect = |rfc3339: &str| {
+            DateTime::parse_from_rfc3339(rfc3339)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        assert_eq!(
+            parse_reflog_date("2026-09-29 10:00:00 -0700"),
+            Some(expect("2026-09-29T17:00:00Z"))
+        );
+        assert_eq!(
+            parse_reflog_date("2026-09-29 10:00:00 +0530"),
+            Some(expect("2026-09-29T04:30:00Z"))
+        );
+        assert_eq!(
+            parse_reflog_date("2026-09-29 10:00:00 +0000"),
+            Some(expect("2026-09-29T10:00:00Z"))
+        );
+        assert_eq!(parse_reflog_date("2026-09-29 10:00:00"), Some(expect("2026-09-29T10:00:00Z")));
+        assert_eq!(parse_reflog_date("not a date"), None);
     }
 
     #[test]

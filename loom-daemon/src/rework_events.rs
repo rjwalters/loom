@@ -33,6 +33,26 @@
 //! the file-size ratchet, and a subcommand is also what makes the marker
 //! writable from a doctor/CI path later without a third copy of this format.
 //!
+//! # Two sources, one vocabulary — and what a writer must NOT mark
+//!
+//! `rework_events` has a second, writer-free source: the sweep worktree's
+//! own `HEAD` reflog, read at the terminal turn
+//! (`outcome_journal::rework::read_reflog_rework`, #9511). A rebase or a
+//! merge of moved main performed *in the worktree* records itself there, and
+//! is reported as a [`KIND_REBASE`] event classified by this module's table.
+//! Both sources are read, and they are kept **disjoint by construction**, not
+//! by a fuzzy de-duplication after the fact:
+//!
+//! - a marker records only rework the worktree reflog *cannot* show — a
+//!   forge-side branch update (`merge-pr.sh`'s `forge_update_branch`, which
+//!   never touches the local worktree), a merge refusal, a CI rerun, a
+//!   rejudge;
+//! - a rebase or merge performed with local git in the sweep's worktree is
+//!   **never** marked: the reflog already reports it, and a marker would
+//!   count it twice.
+//!
+//! A future writer (a Doctor or CI-fix path) must keep to that rule.
+//!
 //! # Durability and failure
 //!
 //! A marker is telemetry: **it may never fail the operation it describes.**
@@ -56,7 +76,22 @@ pub const FILENAME: &str = "sweep-rework-events.jsonl";
 /// cardinality leak into every downstream rollup, so it is refused at the
 /// writer instead of being classified by [`default_classification`]'s
 /// catch-all.
-pub const KINDS: &[&str] = &["rebase", "merge_conflict", "ci_rerun", "rejudge"];
+pub const KINDS: &[&str] = &[
+    KIND_REBASE,
+    KIND_MERGE_CONFLICT,
+    KIND_CI_RERUN,
+    KIND_REJUDGE,
+];
+
+/// `kind` for the ground moving under the work: main advanced and the branch
+/// was synced. The only kind the worktree-reflog source emits.
+pub const KIND_REBASE: &str = "rebase";
+/// `kind` for a branch that genuinely conflicts with its base.
+pub const KIND_MERGE_CONFLICT: &str = "merge_conflict";
+/// `kind` for a CI rerun.
+pub const KIND_CI_RERUN: &str = "ci_rerun";
+/// `kind` for a judge asking for real changes.
+pub const KIND_REJUDGE: &str = "rejudge";
 
 /// The two classifications, and the only values a rollup buckets on.
 pub const CLASSIFICATIONS: &[&str] = &["substantive", "environmental"];
@@ -86,8 +121,8 @@ pub const KEEP_LINES: usize = 512;
 #[must_use]
 pub fn default_classification(kind: &str) -> &'static str {
     match kind {
-        "rejudge" => "substantive",
-        "rebase" | "merge_conflict" | "ci_rerun" => "environmental",
+        KIND_REJUDGE => "substantive",
+        KIND_REBASE | KIND_MERGE_CONFLICT | KIND_CI_RERUN => "environmental",
         // Unreachable through `append` (which validates against `KINDS`), but
         // the reader accepts a foreign writer's line and must classify it.
         // "The ground moved" is the conservative default: it does not inflate
