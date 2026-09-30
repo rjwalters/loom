@@ -112,6 +112,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use super::halt_cause::HaltCause;
 use crate::sweep_registry::PreflightDispatchGate;
 use crate::tokens_pool::select::{
     pool_account_fingerprint, pool_clear_estimate, spawnable_pool_state,
@@ -555,14 +556,41 @@ fn format_held_for(held: chrono::Duration) -> String {
     format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
 }
 
+/// **The cause split behind the #9017 detail.** The #7708 pool hold and the
+/// #5030 pre-flight advisory fold into one bool above; this pure helper names
+/// which one tripped. A pool hold outranks everything here — mirroring both
+/// the "a pool hold outranks a #5030 recovery probe" rule above and
+/// `halt_cause::causes_per_root`'s `token_pool` > `preflight_advisory`
+/// precedence — so it names `token_pool` even when the advisory gate is also
+/// `Held`. Split out so the mapping is unit-testable without a
+/// `WorkspacePool`, the same way `fold_peer_pool_hold` was.
+pub(crate) fn preflight_cause(
+    pool_held: bool,
+    gate: PreflightDispatchGate,
+) -> (bool, Option<HaltCause>) {
+    if pool_held {
+        (true, Some(HaltCause::TokenPool))
+    } else {
+        match gate {
+            PreflightDispatchGate::Open => (false, None),
+            PreflightDispatchGate::Held => (true, Some(HaltCause::PreflightAdvisory)),
+            // The probe-granted case (not held this tick) is decided by the
+            // caller, which owns `probe_roots`; the cause stays `None` either
+            // way for a probe root.
+            PreflightDispatchGate::Probe => (false, None),
+        }
+    }
+}
+
 /// Compute this tick's per-root dispatch-hold slice, folding the #7708
 /// pool-exhaustion hold together with the #5030 claude-wrapper pre-flight
 /// advisory gate.
 ///
-/// Returns `(held, probe_roots)` parallel to / drawn from `roots`:
+/// Returns `(held, causes, probe_roots)` parallel to / drawn from `roots`:
 /// `held[i] == true` means no new dispatch may go to `roots[i]` this tick;
-/// `probe_roots` lists the roots whose #5030 half-open breaker granted a
-/// single recovery probe dispatch.
+/// `causes[i]` names WHICH of the two holds tripped (#9017, via
+/// [`preflight_cause`]); `probe_roots` lists the roots whose #5030 half-open
+/// breaker granted a single recovery probe dispatch.
 ///
 /// **A pool hold outranks a #5030 recovery probe.** The probe exists to test
 /// whether a broken workspace recovered, but a probe dispatched into a pool
@@ -594,17 +622,19 @@ fn format_held_for(held: chrono::Duration) -> String {
 /// # The write-scope hold (Issue #9548)
 ///
 /// A root this installation may not write to
-/// ([`crate::write_scope::gate_root`]) is held too, and yields no probe.
-/// Dispatch continues past a failed claim-label flip, so without this a root
-/// whose `gh` target is an `upstream` it cannot label still got sweeps, and
-/// their comments landed there.
-pub fn preflight_held_per_root(
+/// ([`crate::write_scope::gate_root`]) is held too, with cause
+/// [`HaltCause::WriteScope`], and yields no probe. Dispatch continues past a
+/// failed claim-label flip, so without this a root whose `gh` target is an
+/// `upstream` it cannot label still got sweeps, and their comments landed
+/// there.
+pub fn preflight_held_causes_per_root(
     workspaces: &WorkspacePool,
     roots: &[PathBuf],
     now: DateTime<Utc>,
-) -> (Vec<bool>, Vec<PathBuf>) {
+) -> (Vec<bool>, Vec<Option<HaltCause>>, Vec<PathBuf>) {
     let state = PoolHoldState::global();
     let mut probe_roots: Vec<PathBuf> = Vec::new();
+    let mut causes: Vec<Option<HaltCause>> = Vec::with_capacity(roots.len());
     let held = roots
         .iter()
         .map(|root| {
@@ -613,22 +643,32 @@ pub fn preflight_held_per_root(
             let mut registry = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let pool_held = fold_peer_pool_hold(state, &registry, &observation)
-                || !crate::write_scope::gate_root(root, "dispatch");
-            match registry.preflight_dispatch_gate(now) {
-                PreflightDispatchGate::Open => pool_held,
-                PreflightDispatchGate::Held => true,
-                PreflightDispatchGate::Probe => {
-                    if pool_held {
-                        true
-                    } else {
-                        probe_roots.push(root.clone());
-                        false
-                    }
-                }
+            let pool_held = fold_peer_pool_hold(state, &registry, &observation);
+            let gate = registry.preflight_dispatch_gate(now);
+            let (held, cause) = if crate::write_scope::gate_root(root, "dispatch") {
+                preflight_cause(pool_held, gate)
+            } else {
+                (true, Some(HaltCause::WriteScope))
+            };
+            causes.push(cause);
+            if !held && matches!(gate, PreflightDispatchGate::Probe) {
+                probe_roots.push(root.clone());
             }
+            held
         })
         .collect();
+    (held, causes, probe_roots)
+}
+
+/// The pre-#9017 projection of [`preflight_held_causes_per_root`]: the same
+/// fold, minus the cause slice. Kept byte-for-byte for its existing bool-only
+/// consumers and tests.
+pub fn preflight_held_per_root(
+    workspaces: &WorkspacePool,
+    roots: &[PathBuf],
+    now: DateTime<Utc>,
+) -> (Vec<bool>, Vec<PathBuf>) {
+    let (held, _causes, probe_roots) = preflight_held_causes_per_root(workspaces, roots, now);
     (held, probe_roots)
 }
 

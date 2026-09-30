@@ -66,6 +66,53 @@ pub(crate) enum ForgeAction {
         issue: u32,
     },
 
+    /// `forge check-claim <issue> [--force-claim]` — the aggregated
+    /// pre-flight claim-CAS probe (#9453 Phase 1): "may I claim issue N
+    /// **right now**?" Four legs, cheapest-first, short-circuiting on the
+    /// first blocker — open linked PR (#4123), claim label
+    /// (`loom:building`/`loom:reviewing`/`loom:treating`), fresh foreign
+    /// lease (`LOOM_LEASE_TTL_MINUTES`), remote `feature/issue-N` branch.
+    ///
+    /// Exits `0` BLOCKED with the reason token on stdout (`OPEN_PR #X` /
+    /// `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` /
+    /// `BRANCH_EXISTS feature/issue-N`), `1` verified safe to claim, `5`
+    /// fail closed (a leg could not answer — NOT an all-clear), `3` Gitea
+    /// decline. `--force-claim` overrides the label/lease/branch legs only —
+    /// it never overrides the `OPEN_PR` leg.
+    #[command(name = "check-claim")]
+    CheckClaim {
+        /// Issue number you are about to claim.
+        #[arg(value_name = "ISSUE")]
+        issue: u32,
+
+        /// Override the claim-label, fresh-lease, and remote-branch legs.
+        /// NEVER overrides the open-linked-PR leg (someone's submitted work
+        /// is not a claim race) — and an unreadable open-PR leg still fails
+        /// closed.
+        #[arg(long)]
+        force_claim: bool,
+    },
+
+    /// `forge check-branch <issue>` — the #9447 branch-collision hard-stop
+    /// probe (#9453 Phase 4): does `feature/issue-N` already exist on
+    /// `origin`? Wired into the pre-push fence immediately before a
+    /// Builder's first `git push -u origin feature/issue-N` — a `0` means
+    /// **hard-abort with `BRANCH_COLLISION`**, never create a suffix branch
+    /// past it (the #9447 incident's exact failure mode).
+    ///
+    /// Exits `0` and prints the branch's last-commit timestamp (or its tip
+    /// SHA when the commit is not locally reachable) when the branch already
+    /// exists, `1` on a verified absence (safe to push), and `5` when the
+    /// probe could not answer (fail closed — NOT an absence). Zero
+    /// forge-API calls: `git ls-remote` is the git wire protocol, so this
+    /// works identically on GitHub and Gitea.
+    #[command(name = "check-branch")]
+    CheckBranch {
+        /// Issue number whose `feature/issue-N` branch you are about to push.
+        #[arg(value_name = "ISSUE")]
+        issue: u32,
+    },
+
     /// OPERATOR-ONLY: arm GitHub's server-side auto-merge for a PR. Not a
     /// Loom merge path — use `merge-pr.sh` instead.
     ///
@@ -377,6 +424,10 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
         ForgeAction::CheckOpenPr { issue } => ForgeCmd::CheckOpenPr { issue },
+        ForgeAction::CheckClaim { issue, force_claim } => {
+            ForgeCmd::CheckClaim { issue, force_claim }
+        }
+        ForgeAction::CheckBranch { issue } => ForgeCmd::CheckBranch { issue },
         ForgeAction::AutoMerge {
             pr_number,
             method,

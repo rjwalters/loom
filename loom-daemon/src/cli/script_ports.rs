@@ -18,6 +18,8 @@ use anyhow::Result;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum ScriptPortCommand {
+    /// Ordered PR work for Judge, Doctor and Champion.
+    PrQueue(super::pr_queue::PrQueueArgs),
     /// Supervised persistent-container transport backing spawn-codex.sh.
     #[command(subcommand)]
     SessionExec(loom_daemon::session_exec::SessionExecCommand),
@@ -207,6 +209,14 @@ pub(crate) enum ScriptPortCommand {
     /// directory. Exit 0 applied, 1 refused/failed, 2 could not run.
     WorktreeSparse(super::worktree_sparse::WorktreeSparseArgs),
 
+    /// `worktree.sh`'s base-ref preparation (#8195 slice 13): the fetch of
+    /// `origin/$DEFAULT_BRANCH` and the `--base <branch>` stacked-PR
+    /// resolution (validate, fetch, prefer `origin/<base>`, fall back to a
+    /// local branch, refuse when neither exists). Prints `TOKEN<TAB>text`
+    /// records the shell replays; `--json` refusal documents are built with
+    /// `serde_json` instead of spliced by hand. Exit 0 resolved, 1 refused.
+    WorktreeBase(super::worktree_base::WorktreeBaseArgs),
+
     /// `worktree.sh`'s in-worktree predicate and both decisions it gated
     /// (#8195 slice 11): the `--check` verb, and the create path's
     /// auto-navigation out of a worktree. The retired
@@ -231,6 +241,31 @@ pub(crate) enum ScriptPortCommand {
     /// usable, 1 = not a registered worktree (or the sentinel could not be
     /// written).
     WorktreeExisting(super::worktree_existing::WorktreeExistingArgs),
+
+    /// `worktree.sh`'s LOCAL-branch reuse arm, whole (#8195 slice 14): the
+    /// "already exists - reusing it" warning, the #6095/#6100 upstream
+    /// correction (reached in-process, retiring the shell's last
+    /// `_worktree_upstream_check` call site), the #8280 already-landed refusal
+    /// and its degenerate-tip guard, and the base-ref divergence warning. Four
+    /// steps whose ORDER is the contract, so they move as one unit. Retires a
+    /// hand-spliced `--json` refusal document that was not valid JSON for any
+    /// refname holding a quote — `git check-ref-format` permits one, and
+    /// `$BRANCH_NAME` is operator input via the custom-branch argument. Exit 0
+    /// = reuse, 1 = refuse; every inability to decide is 0, because a forge
+    /// outage must never block worktree creation.
+    WorktreeBranchReuse(super::worktree_branch_reuse::WorktreeBranchReuseArgs),
+
+    /// The forge round-trip behind `lib/worktree-forge-pr-check.sh`'s #7765
+    /// fresh-branch-shadow guard (#8195 slice 15) — the ORIGIN-branch sibling
+    /// of `WorktreeBranchReuse`'s LOCAL-branch arm. Answers whether an OPEN
+    /// PR already head-matches a branch `worktree.sh` is about to create
+    /// fresh, distinguishing "confirmed no PR" / "no forge remote at all,
+    /// nothing to shadow" from "the query itself failed" — the #7863
+    /// regression was exactly those last two collapsing into each other.
+    /// Prints a `TOKEN<TAB>text` record stream; always exits 0 (a query, not
+    /// a refusal — the shell library still builds the `jq -cn` refusal
+    /// documents itself).
+    WorktreeOpenPr(super::worktree_open_pr::WorktreeOpenPrArgs),
 
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
@@ -447,6 +482,7 @@ impl ScriptPortCommand {
     /// the stubs' callers branch on.
     pub(crate) fn run(self) -> Result<()> {
         match self {
+            ScriptPortCommand::PrQueue(args) => args.run(),
             ScriptPortCommand::SessionExec(args) => args.run(),
             ScriptPortCommand::PrivateWorkspace(args) => args.run(),
             ScriptPortCommand::SweepCheckpoint(args) => args.run(),
@@ -472,8 +508,11 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeStaleRef(args) => args.run(),
             ScriptPortCommand::WorktreeClosedPrBranch(args) => args.run(),
             ScriptPortCommand::WorktreeSparse(args) => args.run(),
+            ScriptPortCommand::WorktreeBase(args) => args.run(),
             ScriptPortCommand::WorktreeCheck(args) => args.run(),
             ScriptPortCommand::WorktreeExisting(args) => args.run(),
+            ScriptPortCommand::WorktreeBranchReuse(args) => args.run(),
+            ScriptPortCommand::WorktreeOpenPr(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
@@ -591,6 +630,17 @@ pub(crate) enum MergePrCommand {
     /// exits 0 with one sentinel-led line — see `cli::merge_pr_zero_checks`.
     ZeroChecksSettle(super::merge_pr_zero_checks::ZeroChecksSettleArgs),
 
+    /// The persistent-vs-transient check-runs HTTP 404 classification in the
+    /// same wait loop (#6389, an #8191 slice): invoked only after a poll's
+    /// fetch attempt has already failed, decides whether a confirmed 404 has
+    /// now repeated `LOOM_CHECK_RUNS_404_STREAK` times in a row — in which
+    /// case give up waiting and proceed straight to the synchronous merge —
+    /// or is still below threshold, in which case the caller's existing
+    /// truncated-check/deadline/sleep handling runs unchanged. Always exits 0
+    /// with one `LOOM-CHECK-RUNS-STREAK <PROCEED|PENDING> <streak>` line —
+    /// see `cli::merge_pr_check_runs_streak`.
+    CheckRunsStreak(super::merge_pr_check_runs_streak::CheckRunsStreakArgs),
+
     /// The OTHER classification in the same wait loop (#8191 slice): once a
     /// poll finds a FAILING check, whether it is a required status-check
     /// context (refuse), informational with nothing pending (proceed to the
@@ -653,6 +703,16 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_partial_conflict`.
     PartialConflict(super::merge_pr_partial_conflict::PartialConflictArgs),
 
+    /// The two post-merge partial-increment AUDIT COMMENTS (#3667/#4569) —
+    /// `## Partial Increment Merged` and `## Premature Auto-Close Reverted` —
+    /// byte-frozen from the retired shell. Prints `LOOM-MERGE-PR-COMMENT`,
+    /// then the body verbatim with no trailing newline. Always exits 0; the
+    /// seam fails OPEN because both are posted AFTER the mutation they
+    /// describe, but a body is only ever posted when the sentinel is present,
+    /// so a binary predating the verb cannot make the shell overwrite the
+    /// audit trail with silence — see `cli::merge_pr_partial_comment`.
+    PartialComment(super::merge_pr_partial_comment::PartialCommentArgs),
+
     /// Which route a FAILED merge's forge error text sends the retry ladder
     /// down (#8191 slice): `merge-in-progress` (405, wait and retry),
     /// `head-mismatch` (#5579 — never retry-and-merge), `base-modified` (sync
@@ -709,6 +769,7 @@ impl MergePrCommand {
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
+            MergePrCommand::CheckRunsStreak(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
             MergePrCommand::StackedChildren(args) => args.run(),
             MergePrCommand::WorktreePrimary(args) => args.run(),
@@ -717,6 +778,7 @@ impl MergePrCommand {
             MergePrCommand::WorktreeContains(args) => args.run(),
             MergePrCommand::PartialReset(args) => args.run(),
             MergePrCommand::PartialConflict(args) => args.run(),
+            MergePrCommand::PartialComment(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),
             MergePrCommand::ClosedBuilding(args) => args.run(),
             MergePrCommand::ReconcilePlan(args) => args.run(),

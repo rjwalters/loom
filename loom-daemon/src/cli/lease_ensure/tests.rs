@@ -94,6 +94,11 @@ fn in_session() -> SessionEnv {
     }
 }
 
+/// [`SessionEnv::from_lookup`] over a single key/value pair.
+fn env_with(key: &str, value: &str) -> SessionEnv {
+    SessionEnv::from_lookup(|k| (k == key).then(|| value.to_string()))
+}
+
 fn argv(dir: &TempDir, name: &str) -> Option<String> {
     fs::read_to_string(dir.path().join(name)).ok()
 }
@@ -173,6 +178,42 @@ fn force_opts_back_in_without_a_session_marker() {
     a.force = true;
 
     assert!(matches!(a.ensure(&SessionEnv::default()), Outcome::Renewing { .. }));
+}
+
+/// #9453: the pi runtime — and any other non-Claude harness — exports none of
+/// the Claude-specific markers, so a hand-claim lane on it was `--force`
+/// territory. `LOOM_AGENT_SESSION_PID` alone must admit the publish: a marker
+/// any long-lived harness can export is self-describing and needs no flag
+/// discipline on every call.
+#[test]
+fn a_runtime_neutral_agent_marker_alone_admits_publication() {
+    let dir = checkout(PUBLISH_OK, RENEW_OK);
+    let env = env_with("LOOM_AGENT_SESSION_PID", "4242");
+
+    let outcome = args(&dir).ensure(&env);
+    assert!(matches!(outcome, Outcome::Renewing { .. }), "unexpected outcome: {outcome:?}");
+    assert!(argv(&dir, "publish-argv").is_some());
+    assert!(argv(&dir, "renew-argv").is_some());
+}
+
+/// Presence means a non-empty value: a blank `LOOM_AGENT_SESSION_PID` is no
+/// more a session than a blank `CLAUDE_PID` would be, so the refusal (with its
+/// `--force` hint) still fires.
+#[test]
+fn a_blank_runtime_neutral_marker_is_not_a_session() {
+    let dir = checkout(PUBLISH_OK, RENEW_OK);
+    let env = env_with("LOOM_AGENT_SESSION_PID", "  ");
+
+    assert_eq!(args(&dir).ensure(&env), Outcome::NoAgentSession);
+    assert!(argv(&dir, "publish-argv").is_none());
+}
+
+/// The refusal's one-line hint names every marker, so a foreign runtime
+/// reading it learns the `LOOM_AGENT_SESSION_PID` path, not just `--force`.
+#[test]
+fn the_no_session_refusal_names_the_runtime_neutral_marker() {
+    let line = Outcome::NoAgentSession.describe(8193);
+    assert!(line.contains("LOOM_AGENT_SESSION_PID"), "hint lacks the marker: {line}");
 }
 
 #[test]

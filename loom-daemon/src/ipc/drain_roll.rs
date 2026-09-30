@@ -83,6 +83,37 @@ pub fn drain_refusal_path(then_exit: bool) -> RefusalPath {
     }
 }
 
+/// What a [`super::DrainTick::TimedOutRefuse`] tick does, by who started the
+/// drain (Issue #9588).
+#[derive(Debug, PartialEq, Eq)]
+pub enum TimeoutAction {
+    /// **Operator** drains (then-exit or relaunch): keep dispatch PAUSED, name
+    /// the stragglers, keep supervising — never resume on its own
+    /// ([`super::DrainState::hold_after_timeout`]).
+    HoldPaused,
+    /// Auto-update drain with `then_exit` (unreachable in practice — an
+    /// operator then-exit request promotes the origin): the pre-#6007
+    /// refuse-and-resume path.
+    ResumeDispatch,
+    /// Auto-update roll: #6007's retain / re-arm / abandon-after-budget path.
+    /// Deliberately kept: a version roll nobody asked for must not starve a
+    /// host of work forever.
+    RetainRoll,
+}
+
+/// Pick the [`TimeoutAction`] for a refused deadline (Issue #9588). Pure, so
+/// the operator-vs-auto-update split is a test assertion.
+#[must_use]
+pub fn drain_timeout_action(origin: super::DrainOrigin, then_exit: bool) -> TimeoutAction {
+    match origin {
+        super::DrainOrigin::Operator => TimeoutAction::HoldPaused,
+        super::DrainOrigin::AutoUpdate => match drain_refusal_path(then_exit) {
+            RefusalPath::ResumeDispatch => TimeoutAction::ResumeDispatch,
+            RefusalPath::RetainRoll => TimeoutAction::RetainRoll,
+        },
+    }
+}
+
 /// Total paused-dispatch budget a retained ("pending") roll may spend, derived
 /// from the operator's requested drain timeout (Issue #6007).
 #[must_use]
@@ -170,6 +201,18 @@ pub struct DrainRollStatus {
     /// (a `fleet drain` teardown) rather than "exit for a supervised
     /// relaunch" — a teardown is never superseded by a newer artifact.
     pub then_exit: bool,
+    /// Who started (or last promoted) this drain — `"operator"` or
+    /// `"auto-update"` (#9588). Decides what a deadline without force does.
+    #[serde(default)]
+    pub origin: String,
+    /// `true` once an operator drain passed its deadline without force and is
+    /// being held with dispatch PAUSED (#9588) — it never resumes on its own.
+    #[serde(default)]
+    pub timed_out: bool,
+    /// `true` when dispatch is held because this daemon started while an
+    /// operator-stop record existed (#9588).
+    #[serde(default)]
+    pub startup_hold: bool,
 }
 
 /// Project the live drain state into [`DrainRollStatus`] (Issue #8514).
@@ -195,6 +238,9 @@ pub fn roll_status(
         in_flight,
         target: snap.roll_target.clone(),
         then_exit: snap.then_exit,
+        origin: snap.origin.as_str().to_string(),
+        timed_out: snap.timed_out,
+        startup_hold: snap.startup_hold,
     })
 }
 
@@ -312,7 +358,12 @@ mod tests {
     #[test]
     fn a_relaunch_roll_can_be_labelled_with_the_artifact_it_rolls_to() {
         let drain = DrainState::new();
-        drain.begin(Duration::from_secs(1800), false, false);
+        drain.begin_as(
+            Duration::from_secs(1800),
+            false,
+            false,
+            super::super::DrainOrigin::AutoUpdate,
+        );
         assert_eq!(drain.snapshot().roll_target, None, "unlabelled until told");
         drain.set_roll_target(Some("v0.19.30@bbbb".to_string()));
         assert_eq!(drain.snapshot().roll_target.as_deref(), Some("v0.19.30@bbbb"));
@@ -337,7 +388,12 @@ mod tests {
     #[test]
     fn aborting_clears_the_target_with_the_rest_of_the_pending_bookkeeping() {
         let drain = DrainState::new();
-        drain.begin(Duration::from_secs(1800), false, false);
+        drain.begin_as(
+            Duration::from_secs(1800),
+            false,
+            false,
+            super::super::DrainOrigin::AutoUpdate,
+        );
         drain.set_roll_target(Some("v0.19.30@bbbb".to_string()));
         assert!(drain.abort());
         let snap = drain.snapshot();
@@ -350,10 +406,20 @@ mod tests {
     #[test]
     fn a_fresh_drain_never_inherits_the_previous_rolls_target() {
         let drain = DrainState::new();
-        drain.begin(Duration::from_secs(1800), false, false);
+        drain.begin_as(
+            Duration::from_secs(1800),
+            false,
+            false,
+            super::super::DrainOrigin::AutoUpdate,
+        );
         drain.set_roll_target(Some("v0.19.24@aaaa".to_string()));
         drain.abort();
-        drain.begin(Duration::from_secs(1800), false, false);
+        drain.begin_as(
+            Duration::from_secs(1800),
+            false,
+            false,
+            super::super::DrainOrigin::AutoUpdate,
+        );
         assert_eq!(drain.snapshot().roll_target, None);
     }
 
@@ -361,7 +427,12 @@ mod tests {
     fn an_abandoned_roll_clears_its_target_too() {
         let drain = DrainState::new();
         // A 60s base gives a 240s budget, so a refusal 5 minutes in abandons.
-        drain.begin(Duration::from_secs(60), false, false);
+        drain.begin_as(
+            Duration::from_secs(60),
+            false,
+            false,
+            super::super::DrainOrigin::AutoUpdate,
+        );
         drain.set_roll_target(Some("v0.19.24@aaaa".to_string()));
         let refusal = drain.refuse_roll_deadline(Utc::now() + chrono::Duration::seconds(300));
         assert!(matches!(refusal, super::super::RollRefusal::Abandoned { .. }), "{refusal:?}");
@@ -374,7 +445,12 @@ mod tests {
     fn a_deferred_roll_keeps_its_target_and_projects_as_pending() {
         let drain = DrainState::new();
         let started = Utc::now();
-        drain.begin(Duration::from_secs(1800), false, false);
+        drain.begin_as(
+            Duration::from_secs(1800),
+            false,
+            false,
+            super::super::DrainOrigin::AutoUpdate,
+        );
         drain.set_roll_target(Some("v0.19.24@aaaa".to_string()));
         let refusal = drain.refuse_roll_deadline(started + chrono::Duration::seconds(1800));
         assert!(

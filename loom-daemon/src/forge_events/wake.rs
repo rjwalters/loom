@@ -113,6 +113,9 @@ pub const CLAIM_RECONCILE_WAKE_ENV: &str = "LOOM_FORGE_EVENTS_CLAIM_RECONCILE_WA
 /// `forgeEvents.events.inFlightPrWatch` env override.
 pub const IN_FLIGHT_PR_WATCH_ENV: &str = "LOOM_FORGE_EVENTS_IN_FLIGHT_PR_WATCH";
 
+/// `forgeEvents.events.ciTelemetryRuns` env override (#9201).
+pub const CI_TELEMETRY_RUNS_ENV: &str = "LOOM_FORGE_EVENTS_CI_TELEMETRY_RUNS";
+
 /// `forgeEvents.events.minSpacingSecs` env override.
 pub const MIN_SPACING_SECS_ENV: &str = "LOOM_FORGE_EVENTS_WAKE_MIN_SPACING_SECS";
 
@@ -185,6 +188,11 @@ pub const CLAIM_RECONCILE_EVENT_TYPES: &[&str] = &["issue_comment", "pull_reques
 /// that happens before an auto-merge does.
 pub const IN_FLIGHT_PR_EVENT_TYPES: &[&str] = &["pull_request", "check_run", "check_suite"];
 
+/// The event-type names the CI telemetry run consumer acts on (#9201): a
+/// workflow run finishing. `workflow_job` is deliberately absent — a run's
+/// jobs are fetched with the run, and a job event alone names no run key.
+pub const CI_TELEMETRY_RUNS_EVENT_TYPES: &[&str] = &[super::keys::WORKFLOW_RUN_TYPE];
+
 // ============================================================================
 // Config
 // ============================================================================
@@ -205,6 +213,8 @@ pub struct ConsumerConfig {
     pub claim_reconcile_wake: Option<bool>,
     /// `forgeEvents.events.inFlightPrWatch`.
     pub in_flight_pr_watch: Option<bool>,
+    /// `forgeEvents.events.ciTelemetryRuns` (#9201).
+    pub ci_telemetry_runs: Option<bool>,
     /// `forgeEvents.events.minSpacingSecs` (a zero/invalid value is dropped to
     /// `None` — a zero floor would remove the rate bound entirely).
     pub min_spacing_secs: Option<u64>,
@@ -274,8 +284,30 @@ pub const IN_FLIGHT_PR: Consumer = Consumer {
     flag: |c| c.in_flight_pr_watch,
 };
 
-/// Every shipped consumer, in Phase 2's own (a)/(b)/(c) order.
+/// Every shipped **early-tick** consumer, in Phase 2's own (a)/(b)/(c) order.
+///
+/// [`CI_TELEMETRY_RUNS`] is deliberately not listed: it is not an
+/// [`EarlyTicker`] consumer (see its own doc), so the tick-shaped invariants
+/// asserted over this list do not describe it.
 pub const ALL_CONSUMERS: &[Consumer] = &[WORK_FINDER, CLAIM_RECONCILE, IN_FLIGHT_PR];
+
+/// Consumer (d), #9201: the CI telemetry poller's **run-key** consumer.
+///
+/// Unlike (a)–(c) it does not tick a loop early. It reads the page's
+/// `workflow_run` invalidation keys ([`super::keys`]) and asks the poller to
+/// re-query exactly those runs through its ordinary record path — the ADR-0021
+/// amendment's "a key only chooses what to re-query". Same flag discipline as
+/// every other consumer (**env > config > default**, default off), and the
+/// same status surface: `prompts` counts qualifying pages, `early_ticks`
+/// counts targeted record batches run, `throttled` counts keys dropped (not
+/// an owned repo, excluded, over the batch cap, or the queue was full).
+pub const CI_TELEMETRY_RUNS: Consumer = Consumer {
+    name: "ci-telemetry runs",
+    config_key: "ciTelemetryRuns",
+    env: CI_TELEMETRY_RUNS_ENV,
+    types: CI_TELEMETRY_RUNS_EVENT_TYPES,
+    flag: |c| c.ci_telemetry_runs,
+};
 
 /// Read the `forgeEvents.events` block from `root`'s resolved config.
 ///
@@ -297,6 +329,9 @@ pub fn read_config(root: &Path) -> ConsumerConfig {
             .and_then(serde_json::Value::as_bool),
         in_flight_pr_watch: block
             .get(IN_FLIGHT_PR.config_key)
+            .and_then(serde_json::Value::as_bool),
+        ci_telemetry_runs: block
+            .get(CI_TELEMETRY_RUNS.config_key)
             .and_then(serde_json::Value::as_bool),
         min_spacing_secs: block
             .get("minSpacingSecs")
@@ -455,7 +490,7 @@ fn armed_registry() -> std::sync::MutexGuard<'static, Vec<ArmedWake>> {
 /// Record `consumer` as armed, replacing any previous entry for the same flag.
 ///
 /// Replace rather than push, so the registry is bounded by
-/// [`ALL_CONSUMERS`]`.len()` even if a loop were ever restarted — and so a
+/// [`ALL_CONSUMERS`]`.len() + 1` (the run consumer) even if a loop were ever restarted — and so a
 /// second ticker for the same consumer reports *its* counters rather than the
 /// dead one's.
 fn register_armed(
@@ -478,6 +513,16 @@ fn register_armed(
         Some(at) => registry[at] = entry,
         None => registry.push(entry),
     }
+}
+
+/// Publish a non-ticker consumer's counters on the same status surface as
+/// the early-tick consumers (#9201). Call only once the consumer is armed.
+pub fn register_armed_counters(
+    consumer: &'static Consumer,
+    cadence: Duration,
+    counters: Arc<WakeCounters>,
+) {
+    register_armed(consumer, cadence, Duration::ZERO, counters);
 }
 
 /// The armed consumers' counters, for `loom-daemon status`.

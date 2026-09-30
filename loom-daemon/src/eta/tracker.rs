@@ -56,8 +56,14 @@
 //!   the curator phase has local history like every other in-sweep phase,
 //!   and no refusal reason fits it), and every open PR under a review label
 //!   that closes an issue.
-//! - Nothing for an issue with no running sweep and no open PR: that is
-//!   intake, approval or the ready queue, which a later phase covers.
+//! - `start` (#9326): every ready (`loom:issue`) issue on the last
+//!   work-finder tick's dispatch plan that has no running sweep and no PR
+//!   ([`Tracker::on_ready_queue`]). Such an item sits in `ready_wait` and
+//!   also gets a `land` estimate, over the queue wait plus the post-dispatch
+//!   chain. A row the plan gives no position (blocked) gets a
+//!   `no_dispatch_plan` refusal for both; its dispatch settles `start`
+//!   (`started`) and hands the item to the sweep's own `finish`/`land` chain.
+//! - Nothing for intake or approval (no plan orders them).
 //! - An item in `doctor` always has at least one rework round: `doctor` is
 //!   entered only through a rejection, so an item first seen there (after a
 //!   restart) is counted as having taken one.
@@ -68,8 +74,8 @@ use super::journal::JournalEntry;
 use super::labels::stage_from_pr_labels;
 use super::score::{score, EstimateSummary, OutcomeKind, Score, StageObservation};
 use super::{
-    AgeSource, CurrentStage, CurrentState, EstimateInput, Kind, NoEstimateReason, Provenance,
-    Registry, Stage, StageSamples, Subject,
+    AgeSource, CurrentStage, CurrentState, DispatchInput, EstimateInput, Kind, NoEstimateReason,
+    Provenance, Registry, Stage, StageSamples, Subject,
 };
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use std::collections::BTreeMap;
@@ -140,6 +146,14 @@ struct Item {
     /// The last completed phase and when, to drop duplicate publications.
     last_phase: Option<(String, DateTime<Utc>)>,
     emit: BTreeMap<(Kind, String), EmitState>,
+    /// On the last dispatch plan as a ready row, not yet dispatched (#9326).
+    in_ready_queue: bool,
+    /// Its plan position, when the plan gives it one.
+    ready: Option<DispatchInput>,
+    /// Ready rows on that plan, for the `queue_ready` feature.
+    queue_ready: Option<u32>,
+    /// The plan's concurrency cap, for the `max_concurrent` feature.
+    max_concurrent: Option<u32>,
 }
 
 /// A PR row from a review-label listing.
@@ -237,6 +251,8 @@ pub struct Emission {
 pub struct EstimateContext<'a> {
     /// The heuristics.
     pub registry: &'a Registry,
+    /// Configured current heuristic per kind.
+    pub current_start: Option<&'a str>,
     /// Configured current heuristic per kind.
     pub current_finish: Option<&'a str>,
     /// Configured current heuristic per kind.
@@ -441,6 +457,16 @@ impl Tracker {
         item.sweep_running = true;
         item.landed = false;
         item.verdict_pending_since = None;
+        // The dispatch is the `start` outcome (#9326). From here the sweep
+        // drives the item; the queue wait leaves no duration (its entry is
+        // only the tracker's first sight of the row).
+        let was_ready = std::mem::take(&mut item.in_ready_queue);
+        item.ready = None;
+        if was_ready {
+            item.refused = None;
+        }
+        let outcomes =
+            self.resolve(&key, Kind::Start, OutcomeKind::Started, at, "bus", Some(0), None);
         let mut row = self.transition(
             &key,
             Some(Stage::SweepCurator),
@@ -453,6 +479,7 @@ impl Tracker {
         row.raw = serde_json::json!({"sweep_id": sweep_id});
         Effects {
             journal: vec![row],
+            outcomes,
             dirty: vec![key],
             ..Effects::default()
         }
@@ -937,7 +964,7 @@ impl Tracker {
         let keep = self
             .items
             .get(key)
-            .is_some_and(|i| i.sweep_running || i.in_review_listing);
+            .is_some_and(|i| i.sweep_running || i.in_review_listing || i.in_ready_queue);
         if !keep {
             self.items.remove(key);
         }
@@ -1040,6 +1067,10 @@ impl Tracker {
         if kind == Kind::Finish && !item.sweep_running {
             return None;
         }
+        let ready_only = item.in_ready_queue && !item.sweep_running && item.pr_number.is_none();
+        if kind == Kind::Start && !ready_only {
+            return None;
+        }
         if kind == Kind::Land && item.landed {
             return None;
         }
@@ -1080,6 +1111,13 @@ impl Tracker {
             hour_utc: Some(now.hour()),
             weekday_utc: Some(now.weekday().num_days_from_monday()),
             host_id: ctx.host_id.map(str::to_string),
+            queue_rank: item
+                .ready
+                .as_ref()
+                .map(|r| r.position)
+                .filter(|_| ready_only),
+            queue_ready: item.queue_ready.filter(|_| ready_only),
+            max_concurrent: item.max_concurrent.filter(|_| ready_only),
             ..Features::default()
         };
         let mut omitted = Vec::new();
@@ -1096,6 +1134,7 @@ impl Tracker {
             features,
             features_omitted: omitted,
             provenance: self.loom.clone(),
+            dispatch: item.ready.clone().filter(|_| ready_only),
         })
     }
 
@@ -1117,11 +1156,12 @@ impl Tracker {
             let Some(item) = self.items.get(&key).cloned() else {
                 continue;
             };
-            for kind in [Kind::Finish, Kind::Land] {
+            for kind in [Kind::Start, Kind::Finish, Kind::Land] {
                 let Some(input) = self.input_for(&key, &item, kind, ctx, now) else {
                     continue;
                 };
                 let configured = match kind {
+                    Kind::Start => ctx.current_start,
                     Kind::Finish => ctx.current_finish,
                     Kind::Land => ctx.current_land,
                 };
@@ -1150,6 +1190,13 @@ impl Tracker {
         out
     }
 }
+
+#[path = "tracker_ready.rs"]
+mod ready;
+
+pub use ready::{
+    ReadyPlan, ReadyRow, READY_FIRST_SEEN, READY_PLAN_MAX_AGE_SECS, SLOT_TURNOVER_REPO,
+};
 
 /// Merge several effects.
 #[must_use]

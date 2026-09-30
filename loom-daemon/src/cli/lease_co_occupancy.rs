@@ -39,6 +39,18 @@
 //! (`LOOM_WORKTREE_LEASE_GUARD_TIMEOUT`, default 10s) because `worktree.sh`
 //! sits on every Builder dispatch's hot path.
 //!
+//! ## Only trusted authors' records count (#9631)
+//!
+//! Every row is attributed ([`AUTHOR_JQ`]) and passed through
+//! [`TrustPolicy`] before any marker is parsed, exactly like
+//! `sweep_registry::guards`' lease reader (#9593/#9548): a lease or
+//! lease-yield from an untrusted author reads as absent, and a row with no
+//! author at all is untrusted. Otherwise an outsider could post two fresh
+//! "leases" to wedge every Builder dispatch on the issue, or a fake yield to
+//! excuse a real peer's live lease. Trust fails closed (nothing an
+//! unresolved roster cannot vouch for is believed); the verdict itself stays
+//! fail-open on a failed read, as above.
+//!
 //! ## Why this is Rust and not a `lib/*.sh` helper
 //!
 //! The kicad-tools fix shipped as a new `lib/worktree-foreign-lease-guard.sh`.
@@ -55,6 +67,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use loom_daemon::comment_trust::{records::AUTHOR_JQ, TrustPolicy};
 use loom_daemon::proc_exec::{run_bounded, Completion};
 use loom_daemon::sweep_registry::{SweepRegistry, LEASE_MARKER_PREFIX};
 
@@ -143,14 +156,16 @@ pub(crate) fn live_pairs(
         .collect()
 }
 
-/// Read the issue's lease + lease-yield comments. `None` on ANY failure —
-/// spawn error, nonzero exit, or the deadline — which the caller treats as
-/// "no evidence" (fail open).
+/// Read the issue's lease + lease-yield comments written by authors `policy`
+/// trusts (#9631); every other row is dropped before its marker is read.
+/// `None` on ANY failure — spawn error, nonzero exit, or the deadline — which
+/// the caller treats as "no evidence" (fail open), never as "no marker".
 pub(crate) fn read_rows(
     gh_bin: &Path,
     repo: &Path,
     issue: u64,
     timeout: Duration,
+    policy: &TrustPolicy,
 ) -> Option<Vec<LeaseRow>> {
     let mut cmd = Command::new(gh_bin);
     cmd.arg("api")
@@ -158,7 +173,7 @@ pub(crate) fn read_rows(
         .arg("--paginate")
         .arg("--jq")
         .arg(format!(
-            r#".[] | select(.body != null and ((.body | startswith("{LEASE_MARKER_PREFIX}")) or (.body | startswith("{YIELD_MARKER_PREFIX}")))) | {{updated_at: .updated_at, body: .body}}"#
+            r#".[] | select(.body != null and ((.body | startswith("{LEASE_MARKER_PREFIX}")) or (.body | startswith("{YIELD_MARKER_PREFIX}")))) | {{updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
         ))
         .current_dir(repo)
         .stdin(std::process::Stdio::null());
@@ -166,7 +181,9 @@ pub(crate) fn read_rows(
     loom_daemon::gh_repo_env::apply_loom_repo_override(&mut cmd);
     match run_bounded(cmd, timeout) {
         Ok(Completion::Exited(out)) if out.status.success() => {
-            Some(parse_rows(&String::from_utf8_lossy(&out.stdout)))
+            // #9631: an untrusted (or unattributed) row is prose.
+            let trusted = policy.trusted_ndjson(&out.stdout);
+            Some(parse_rows(&String::from_utf8_lossy(&trusted)))
         }
         _ => None,
     }
@@ -256,7 +273,8 @@ impl LeaseCoOccupancyArgs {
             .filter(|m: &f64| m.is_finite() && *m >= 0.0)
             .unwrap_or(DEFAULT_TTL_MINUTES);
         let ttl = chrono::Duration::seconds((ttl_minutes * 60.0) as i64);
-        let rows = read_rows(&gh_bin, &self.repo, self.issue, timeout);
+        let policy = TrustPolicy::for_root(&self.repo);
+        let rows = read_rows(&gh_bin, &self.repo, self.issue, timeout, &policy);
         let allow_shared = std::env::var(OVERRIDE_ENV).is_ok_and(|v| v == "1");
         let verdict = decide(self.issue, rows.as_deref(), Utc::now(), ttl, allow_shared, self.json);
         for line in &verdict.stderr {

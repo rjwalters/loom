@@ -81,6 +81,7 @@ SELECT timestamp, resources_string['host.id'] AS host,
        attributes_string['loom.queue.rank']        AS rank,
        attributes_string['loom.queue.transition']  AS transition,
        attributes_string['loom.queue.park_label']  AS park_label,
+       attributes_string['loom.queue.halt_cause']  AS halt_cause,
        attributes_string['loom.dispatch.admission_result'] AS admission_result,
        attributes_string['loom.dispatch.reason']           AS admission_reason
 FROM signoz_traces.signoz_index_v3
@@ -90,8 +91,9 @@ WHERE name IN ('loom.dispatch.disposition', 'loom.dispatch.admission')
   AND timestamp > now() - INTERVAL 24 HOUR
 ORDER BY timestamp DESC LIMIT 20;
 
--- For a `workspace_halted` row, join to the parent `loom.dispatch.tick` span
+-- A `workspace_halted` row names its cause on `loom.queue.halt_cause` (#9017
+-- token: main_red / gate_pending / token_pool / preflight_advisory / drain /
+-- breaker / write_scope; #9673, #9548). The column is empty for a cause-less legacy row — join to
+-- the parent `loom.dispatch.tick` span
 -- (`attributes_string['loom.dispatch.result'] = 'halted_main_red'`) through
--- `parentSpanID` — the disposition row itself does not say which of red main,
--- a gate, the token pool, a drain or the host-distress breaker caused the
--- halt (out of scope for #9222).
+-- `parentSpanID` there.

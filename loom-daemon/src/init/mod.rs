@@ -1143,6 +1143,13 @@ mod tests;
 #[cfg(test)]
 mod credential_class_tests;
 
+// #9345: keeps resync-installed.sh's surface classification and
+// land-resync-commit.sh's allowlist from silently re-diverging. Its own file
+// rather than credential_class_tests.rs: that module's subject is the
+// credential class, not the resync surface set.
+#[cfg(test)]
+mod resync_surface_parity_tests;
+
 // #9123 tests live in their own file rather than in `tests.rs`: that module is
 // over the `scripts/check-file-size-budget.sh` threshold and frozen at its
 // recorded size, so additions go to a sibling module.

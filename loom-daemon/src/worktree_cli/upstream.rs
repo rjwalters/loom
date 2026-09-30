@@ -168,7 +168,22 @@ pub fn run(opts: &Options) -> i32 {
 
     // `git fetch origin -- "$BRANCH_NAME" 2>/dev/null || true` — the `--` ends
     // option parsing (#9106), so a `-`-prefixed branch is a refspec, never a switch.
-    git_discard(repo, &["fetch", "origin", "--", branch]);
+    // `maintenance.auto=false` (#9620): for the `registered-worktree` arm `repo`
+    // IS the worktree, and the detached `git maintenance run --auto` a fetch
+    // spawns would sit there with its cwd inside it. The stale-worktree reset
+    // runs moments later, and its liveness probe would count that child as a
+    // foreign holder. See `existing::perform_reset_with`.
+    git_discard(
+        repo,
+        &[
+            "-c",
+            "maintenance.auto=false",
+            "fetch",
+            "origin",
+            "--",
+            branch,
+        ],
+    );
 
     // `if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"`.
     // Everything below is inside this guard: with no remote branch of this

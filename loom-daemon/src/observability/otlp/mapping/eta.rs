@@ -177,6 +177,7 @@ mod tests {
                 tree_state: "clean".to_string(),
                 complete: true,
             },
+            dispatch: None,
         };
         EtaEstimateRecord {
             trigger: Trigger::Transition,

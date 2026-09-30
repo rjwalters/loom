@@ -30,7 +30,10 @@
 //!    through the existing rate-limited forge clients — never the state
 //!    itself. Nothing in this module reads or writes a label, a claim, or a
 //!    PR, and the bus payload it publishes is routing hints only: counts,
-//!    sequence bounds and event-type names, never a copy of an event body.
+//!    sequence bounds and event-type names, never a copy of an event body —
+//!    plus, for finished `workflow_run` events only, the `(repo, run_id)`
+//!    invalidation keys the ADR-0021 amendment permits ([`keys`], #9201),
+//!    which choose what to re-query and are never read as state.
 //! 2. **Polling is the correctness floor.** This module never touches any
 //!    existing poll cadence. A permanently dead feed is indistinguishable
 //!    from the pre-webhook fleet in every correctness property; only latency
@@ -75,6 +78,7 @@ use crate::event_bus::EventBus;
 use crate::observability::endpoint_policy::{reserved_placeholder_host, valid_otlp_endpoint};
 use crate::types::{Event, ForgeEventsState, ForgeEventsStatus};
 
+pub mod keys;
 pub mod wake;
 
 #[cfg(test)]
@@ -831,19 +835,30 @@ fn event_type(event: &serde_json::Value) -> Option<&str> {
 /// it could mistake for the forge's own state. No repo, issue or PR number,
 /// no title, no body, no actor: a subscriber that wanted those would have to
 /// go ask GitHub, which is the entire point (ADR-0014 invariant 1).
+///
+/// The one addition (#9201, under the ADR-0021 2026-09-27 amendment): a page
+/// carrying finished `workflow_run` events also carries their **invalidation
+/// keys** under [`keys::RUNS_FIELD`] — `(repo, run_id)` pairs that choose which
+/// run the CI telemetry poller re-queries, never state. The field is absent
+/// on a page without one, so every other payload is unchanged.
 #[must_use]
 pub fn page_payload(host_id: &str, events: &[serde_json::Value]) -> serde_json::Value {
     let mut types: Vec<&str> = events.iter().filter_map(event_type).collect();
     types.sort_unstable();
     types.dedup();
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "source": PAYLOAD_SOURCE,
         "host_id": host_id,
         "count": events.len(),
         "first_seq": events.first().map(event_seq).unwrap_or(0),
         "last_seq": events.last().map(event_seq).unwrap_or(0),
         "types": types,
-    })
+    });
+    let runs = keys::run_keys(events);
+    if !runs.is_empty() {
+        payload[keys::RUNS_FIELD] = keys::render(&runs);
+    }
+    payload
 }
 
 /// One host's feed consumer: the HTTP client, the durable paths, the cursor,

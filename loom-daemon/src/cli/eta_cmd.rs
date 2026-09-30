@@ -211,7 +211,8 @@ impl EtaBacktestArgs {
         history.push_envelopes(&envelopes);
         let journal_entries = journal::read(&journal::journal_path(&root));
         history.push_journal(&journal_entries, "local");
-        let cases = backtest::cases_from_envelopes(&envelopes);
+        let mut cases = backtest::cases_from_envelopes(&envelopes);
+        cases.extend(backtest::cases_from_journal(&journal_entries));
         let loom = Provenance::current();
 
         if let Some(other_id) = &self.compare {

@@ -892,3 +892,40 @@ fn an_armed_then_cleared_hold_emits_one_hold_span() {
     assert_eq!(span.attributes["loom.pool.hold.accounts"], "2");
     assert!(cleared.metrics.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// #9017 — the pool-hold / advisory-hold cause split
+// ---------------------------------------------------------------------------
+
+/// The #7708 pool hold and the #5030 pre-flight advisory fold into one bool;
+/// `preflight_cause` names which one tripped. A pool hold outranks the
+/// advisory (and its recovery probe) even when both are tripped, mirroring
+/// `halt_cause::causes_per_root`'s precedence.
+#[test]
+fn preflight_cause_names_the_pool_hold_apart_from_the_advisory() {
+    use crate::work_finder::halt_cause::HaltCause;
+
+    // Healthy everywhere ⇒ not held, no cause.
+    assert_eq!(preflight_cause(false, PreflightDispatchGate::Open), (false, None));
+    // Pool held ⇒ token_pool regardless of the advisory gate's state.
+    for gate in [
+        PreflightDispatchGate::Open,
+        PreflightDispatchGate::Held,
+        PreflightDispatchGate::Probe,
+    ] {
+        assert_eq!(
+            preflight_cause(true, gate),
+            (true, Some(HaltCause::TokenPool)),
+            "pool hold must outrank {gate:?}"
+        );
+    }
+    // Advisory tripped, pool healthy ⇒ preflight_advisory.
+    assert_eq!(
+        preflight_cause(false, PreflightDispatchGate::Held),
+        (true, Some(HaltCause::PreflightAdvisory))
+    );
+    // Probe granted, pool healthy ⇒ not held this tick, no cause — the
+    // caller decides the probe dispatch, which this root's row must not
+    // report as a hold.
+    assert_eq!(preflight_cause(false, PreflightDispatchGate::Probe), (false, None));
+}

@@ -10,6 +10,7 @@ mod api_parsing;
 mod captain_gate;
 mod credential_rejection;
 mod dependency_wait;
+mod feed_capture;
 mod job_logs;
 mod join_keys;
 mod owners;

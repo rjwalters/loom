@@ -20,12 +20,15 @@
 //! - [`roster`] — `repos.yml` → desired workspace set, diffed against the
 //!   daemon's workspace registry. Fails closed.
 //! - [`state`] — this host's desired run state from `fleet/state.yml`.
+//! - [`propose`] — the one *write* path: open a PR against the store instead
+//!   of hand-editing it (#9599).
 //!
 //! The file contract is documented in `defaults/docs/daemon-reference.md`
 //! §"Fleet store".
 
 pub mod fetch;
 pub mod gh;
+pub mod propose;
 pub mod render;
 pub mod roster;
 pub mod state;

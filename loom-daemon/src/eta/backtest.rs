@@ -37,12 +37,21 @@
 //! same `pr_latency` histories backfill already reads (the real
 //! `review-requested → merged` lead time) is the fix, tracked separately;
 //! it is not a leakage hazard, just a gap in what can be scored.
+//!
+//! # `start` cases come from the stage journal (#9326)
+//!
+//! No `sweep.outcome` record witnesses a queue wait, so [`Kind::Start`]
+//! cases come from the tracker's own journal instead
+//! ([`cases_from_journal`]): the plan inputs recorded at a ready item's
+//! first sighting, and its dispatch.
 
 use super::history::StageSamples;
+use super::journal::JournalEntry;
 use super::score::{score, EstimateSummary, OutcomeKind, Score};
+use super::tracker::READY_FIRST_SEEN;
 use super::{
-    explanation, AgeSource, CurrentStage, CurrentState, EstimateInput, Heuristic, Kind, Provenance,
-    Stage, Subject,
+    explanation, AgeSource, CurrentStage, CurrentState, DispatchInput, EstimateInput, Heuristic,
+    Kind, Provenance, Stage, Subject,
 };
 use crate::telemetry::{SweepOutcomeRecord, SweepResult, TelemetryEnvelope, TelemetryRecord};
 use chrono::{DateTime, Duration, Utc};
@@ -71,6 +80,9 @@ pub struct ReplayCase {
     pub outcome: OutcomeKind,
     /// When.
     pub actual_at: DateTime<Utc>,
+    /// A `ready_wait` case only (#9326): the dispatch-plan inputs the
+    /// tracker read at `as_of`, replayed verbatim.
+    pub dispatch: Option<DispatchInput>,
 }
 
 /// Every finish/land replay case one `sweep.outcome` record's own phase
@@ -130,6 +142,7 @@ pub fn cases_from_record(
             kind: Kind::Finish,
             outcome: OutcomeKind::Finished,
             actual_at: observed_at,
+            dispatch: None,
         });
         if landed {
             cases.push(ReplayCase {
@@ -140,6 +153,7 @@ pub fn cases_from_record(
                 kind: Kind::Land,
                 outcome: OutcomeKind::Landed,
                 actual_at: observed_at,
+                dispatch: None,
             });
         }
         if stage == Stage::Doctor {
@@ -160,6 +174,54 @@ pub fn cases_from_envelopes<'a>(
             if record.result == SweepResult::Success || record.result == SweepResult::Failure {
                 cases.extend(cases_from_record(record, envelope.emitted_at));
             }
+        }
+    }
+    cases
+}
+
+/// Every `start` case the ETA stage journal answers (#9326): a ready item's
+/// `ready.first_seen` row carrying the plan inputs it was estimated from,
+/// paired with the same item's next `sweep.dispatch` row leaving
+/// `ready_wait`. The case replays from the first sighting, so the only
+/// turnover samples it can see are ones observed before it (leak-free by
+/// the same `select` rule as every other case). A first sighting the plan
+/// gave no position, or one never dispatched, yields no case.
+#[must_use]
+pub fn cases_from_journal(entries: &[JournalEntry]) -> Vec<ReplayCase> {
+    let mut open: BTreeMap<(String, u32), (DateTime<Utc>, DispatchInput)> = BTreeMap::new();
+    let mut cases = Vec::new();
+    for entry in entries {
+        let Some(issue) = entry.issue else {
+            continue;
+        };
+        let key = (entry.repo.clone(), issue);
+        if entry.event == READY_FIRST_SEEN {
+            match serde_json::from_value::<DispatchInput>(entry.raw["dispatch"].clone()) {
+                Ok(dispatch) => {
+                    open.insert(key, (entry.observed_at, dispatch));
+                }
+                Err(_) => {
+                    open.remove(&key);
+                }
+            }
+        } else if entry.event == "sweep.dispatch" && entry.stage == Some(Stage::ReadyWait) {
+            let Some((as_of, dispatch)) = open.remove(&key) else {
+                continue;
+            };
+            let actual_at = entry.left_at.unwrap_or(entry.observed_at);
+            if actual_at < as_of {
+                continue;
+            }
+            cases.push(ReplayCase {
+                subject: Subject::new(&entry.repo, None, issue),
+                as_of,
+                stage: Stage::ReadyWait,
+                rework_rounds: 0,
+                kind: Kind::Start,
+                outcome: OutcomeKind::Started,
+                actual_at,
+                dispatch: Some(dispatch),
+            });
         }
     }
     cases
@@ -288,6 +350,7 @@ pub fn run(
             features: explanation::Features::default(),
             features_omitted: Vec::new(),
             provenance: loom.clone(),
+            dispatch: case.dispatch.clone(),
         };
         let explanation = heuristic.estimate(&input, history);
         let summary = EstimateSummary::of(&explanation);

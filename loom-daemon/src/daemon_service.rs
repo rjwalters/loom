@@ -83,40 +83,14 @@ fn gh_token_needs_update(current: Option<&str>, minted: &str) -> bool {
     current != Some(minted)
 }
 
+// Extracted to a sibling file (#9596) rather than left inline: this file is a
+// frozen over-threshold ratchet entry, and `.loom/docs/file-size-policy.md`
+// names extracting a test module as the sanctioned way to make room — "the
+// parent shrinks, and the extracted file is measured on its own terms". Moved
+// verbatim; the tests themselves are unchanged.
 #[cfg(test)]
-mod gh_token_guard_tests {
-    //! Tests for the #4456 value-changed guard on the `github-app` refresh
-    //! tick. Deliberately a *pure* function test — it does not touch the
-    //! process-global `GH_TOKEN`, so it neither races nor adds to the
-    //! test-env-mutation hazard tracked by #4385.
-    use super::gh_token_needs_update;
-
-    #[test]
-    fn cache_hit_same_value_skips_write() {
-        // The ~10-of-11 common case: the shell helper returned the unchanged
-        // cached token, so no `set_var` is warranted.
-        assert!(!gh_token_needs_update(Some("ghs_abc"), "ghs_abc"));
-    }
-
-    #[test]
-    fn genuine_rotation_writes() {
-        // A real ~hourly rotation: the minted value differs -> write.
-        assert!(gh_token_needs_update(Some("ghs_old"), "ghs_new"));
-    }
-
-    #[test]
-    fn unset_env_writes() {
-        // Nothing exported yet (Err(VarError) -> None): treat as different so
-        // the first post-boot tick still exports the token.
-        assert!(gh_token_needs_update(None, "ghs_first"));
-    }
-
-    #[test]
-    fn empty_current_differs_from_nonempty() {
-        // An empty exported value is not equal to a real minted token.
-        assert!(gh_token_needs_update(Some(""), "ghs_real"));
-    }
-}
+#[path = "daemon_service/gh_token_guard_tests.rs"]
+mod gh_token_guard_tests;
 
 /// The daemon's real entry point: CLI dispatch, then full daemon startup ending
 /// in the IPC accept loop (which only returns on a startup failure — a running
@@ -659,6 +633,19 @@ pub(crate) async fn run_daemon() -> Result<()> {
             }
         }
     }
+
+    // Fleet-store sync (#9596). HERE, and not earlier or later, for two hard
+    // ordering reasons: the store is read through `gh` under the credentials
+    // the preflight above just resolved, and every `read_*_config` call that
+    // gates a loop below must see the config the store renders — so this is
+    // the one point that is after the former and before all of the latter. It
+    // awaits the startup render (bounded; an unreachable forge falls back to
+    // the last good cached snapshot and never blocks boot) and then leaves a
+    // `fleet.syncIntervalSecs` timer task behind for drift detection. A host
+    // with no `fleet.repo` — every host that has not opted in — does nothing
+    // at all here. See `loom_daemon::fleet_sync`.
+    let _fleet_sync_handle =
+        loom_daemon::fleet_sync::start(&sweep_workspace, Some(event_bus.clone())).await;
 
     // #4430: ticks every `GITHUB_APP_REFRESH_INTERVAL` (~5min) to keep the
     // minted installation token fresh across its ~1h lifetime for a
@@ -1620,7 +1607,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
 
     // GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
     // (`autonomous.ciTelemetry.enabled`); `None` and zero side effects when off.
-    let _ci_telemetry_handle = loom_daemon::ci_telemetry::spawn_task(sweep_workspace.clone());
+    // Feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns` is on.
+    let _ci_poller = loom_daemon::ci_telemetry::spawn_task_on(sweep_workspace.clone(), &event_bus);
 
     // Periodic merged-PR worktree reaper (Issue #4876). Before this loop the
     // ONLY trigger for "auto-removed when their PR merges" (CLAUDE.md's stated
@@ -1756,31 +1744,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // three paths: if the daemon is supervised and the marker is absent, re-write
     // it. An unsupervised (`--foreground`/nohup/debug) run never writes one — it
     // must not arm the host-side pager for a process nothing will relaunch.
-    match autonomy_marker::heal_on_startup(heartbeat_interval.as_secs()) {
-        Some(autonomy_marker::HealOutcome::Healed(path)) => log::warn!(
-            "autonomy_marker: HEALED an absent autonomy-desired marker at {} — a supervised \
-             daemon was running with crash protection disarmed (restart-primitive / self-update / \
-             bare relaunch never re-writes it). The watchdog and `loom-daemon status` now see this \
-             daemon as EXPECTED again (#4331).",
-            path.display()
-        ),
-        Some(autonomy_marker::HealOutcome::AlreadyPresent) => {
-            log::debug!("autonomy_marker: marker already present — no healing needed (#4331)")
-        }
-        Some(autonomy_marker::HealOutcome::UnsupervisedSkip) => log::debug!(
-            "autonomy_marker: unsupervised run (no LOOM_DAEMON_SUPERVISOR) — deliberately NOT \
-             writing an autonomy-desired marker (#4331)"
-        ),
-        Some(autonomy_marker::HealOutcome::WriteFailed { path, error }) => log::warn!(
-            "autonomy_marker: failed to heal the autonomy-desired marker at {} (logged, never \
-             fatal; the daemon keeps running): {error} (#4331)",
-            path.display()
-        ),
-        None => log::warn!(
-            "autonomy_marker: could not resolve a loom dir (no LOOM_SOCKET_PATH / home) — \
-             skipping marker healing for this run (#4331)"
-        ),
-    }
+    // #9588: the per-outcome logging lives beside the outcomes.
+    autonomy_marker::log_heal_outcome(autonomy_marker::heal_on_startup(
+        heartbeat_interval.as_secs(),
+    ));
 
     // Watchdog-provisioning-guard loop (Issue #5405): #5343's
     // heal_watchdog_provisioning_gap() only fires as a side effect of

@@ -415,6 +415,12 @@ pub fn run(argv: &[String], argv0: &str) -> ! {
         std::process::exit(1);
     }
 
+    // #9588: an explicit start is the operator's "run again" — drop any
+    // operator-stop record BEFORE launching, so the new daemon does not come
+    // up held and the watchdog is armed by the marker the launch writes.
+    if crate::operator_stop::discard(&ctx.intent_marker) {
+        out::say("Cleared the operator-stop record (#9588) — this start resumes dispatch.");
+    }
     let _ = std::fs::write(&ctx.start_log, "");
 
     if use_launchd && !platform::have("launchctl") {

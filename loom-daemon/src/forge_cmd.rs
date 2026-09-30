@@ -723,6 +723,21 @@ pub enum ForgeCmd {
     /// [`crate::forge_check_open_pr`]; see that module for the exit-code
     /// contract.
     CheckOpenPr { issue: u32 },
+    /// `forge check-claim <issue> [--force-claim]` — the aggregated
+    /// pre-flight claim-CAS probe (#9453 Phase 1): one command answering
+    /// "may I claim issue N right now?" across four legs (open linked PR,
+    /// claim label, fresh foreign lease, remote `feature/issue-N` branch),
+    /// cheapest-first, short-circuiting on the first blocker. Implemented in
+    /// [`crate::forge_check_claim`]; see that module for the exit-code
+    /// contract and the `--force-claim` rule (legs 2–4 only, never
+    /// `OPEN_PR`).
+    CheckClaim { issue: u32, force_claim: bool },
+    /// `forge check-branch <issue>` — the #9447 branch-collision hard-stop
+    /// probe (#9453 Phase 4): does `feature/issue-N` already exist on
+    /// `origin`? Implemented in [`crate::forge_check_branch`]; see that
+    /// module for the exit-code contract. Zero forge-API calls (`git
+    /// ls-remote`, not `gh`).
+    CheckBranch { issue: u32 },
     /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]`.
     /// Operator-only (#8427): arms a server-side merge that bypasses Loom's
     /// merge-time gates; never dispatched from a Loom merge path.
@@ -803,6 +818,10 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ForgeCmd::Pr(args) => gh_passthrough("pr", &args),
         ForgeCmd::Auth(args) => gh_passthrough("auth", &args),
         ForgeCmd::CheckOpenPr { issue } => crate::forge_check_open_pr::handle(issue),
+        ForgeCmd::CheckClaim { issue, force_claim } => {
+            crate::forge_check_claim::handle(issue, force_claim)
+        }
+        ForgeCmd::CheckBranch { issue } => crate::forge_check_branch::handle(issue),
         ForgeCmd::AutoMerge {
             pr,
             method,

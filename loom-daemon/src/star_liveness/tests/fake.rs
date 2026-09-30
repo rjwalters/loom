@@ -296,6 +296,7 @@ pub fn tick_row(
         main_red_fix: false,
         created_at: None,
         tier: None,
+        story_points: None,
         disposition,
         detail: None,
         state: disposition.state().to_string(),

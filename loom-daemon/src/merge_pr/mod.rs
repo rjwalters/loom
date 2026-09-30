@@ -68,6 +68,17 @@
 //! which — unlike [`stale_checks`]'s GitHub-only lookup — also covers Gitea)
 //! stay forge reads in the shell.
 //!
+//! [`check_runs_streak`] is the OTHER classification the same poll loop makes
+//! on a FAILED fetch attempt (#6389, an #8191 slice): whether a confirmed
+//! HTTP 404 — both the attempt and its retry-once agreeing — has now repeated
+//! `LOOM_CHECK_RUNS_404_STREAK` times in a row, which is treated as "this
+//! repo's Checks API is unavailable for this commit" rather than a transient
+//! blip, and short-circuits the wait straight to the synchronous merge. A
+//! single 404 paired with a DIFFERENT failure on the retry does not confirm,
+//! and any non-confirming iteration resets the streak to zero — the shell
+//! keeps owning the fetch attempts themselves and the deadline/timeout
+//! handling; only the streak/threshold classification moved.
+//!
 //! [`loom_pr_guard`] is the pre-merge `loom:pr` review-signal guard (#7419)
 //! — the OTHER half of the verdict-label story [`labels`] tells: this one
 //! fires on `loom:pr`'s ABSENCE ("nobody reviewed this head") rather than a
@@ -193,6 +204,22 @@
 //! against two different variables, and owns the deferral comment's byte-frozen
 //! text.
 //!
+//! [`partial_comment`] is what [`partial_reset`] deliberately left behind: the
+//! same pass's two operator-facing AUDIT COMMENTS, which stayed in the shell
+//! as ~40 lines of heredoc-shaped text inside the mutation arms. It is
+//! [`reconcile::defer_comment`]'s sibling — the precedent that a byte-frozen
+//! operator-visible body belongs beside the decision that emits it — and it is
+//! the one member of the family whose text NOTHING asserted before the port:
+//! the retained suite stubs the comment post, and `partial_reset`'s own
+//! differential stubs `forge_gh_comment_rl_safe` to `:` precisely so the
+//! decision under test is not drowned in prose. So both bodies could have been
+//! mangled silently, including the `## Premature Auto-Close Reverted` one that
+//! is the only place a Builder is told the rule (`close #N` in a
+//! partial-increment PR closes it) that stops the bug recurring. Fails OPEN
+//! with a warning — both comments are posted AFTER the reopen/swap they
+//! describe — but only ever posts a body that arrived behind its sentinel, so
+//! the degraded path cannot overwrite the audit trail with an empty comment.
+//!
 //! [`worktree_preserve`] is the #6694/#6264 remove-vs-preserve rule
 //! `merge-pr.sh`'s post-merge cleanup ran identically at THREE call sites —
 //! the Loom-convention path, the porcelain discovery fallback, and the
@@ -202,6 +229,7 @@
 //! caller and passed in; this module owns only the two-input decision and its
 //! byte-frozen message text, consolidating three copies into one.
 
+pub mod check_runs_streak;
 pub mod checks_failure;
 pub mod closed_building;
 pub mod dirty_guard;
@@ -211,6 +239,7 @@ pub mod issue_close_gate;
 pub mod labels;
 pub mod loom_pr_guard;
 pub mod mergeable_recheck;
+pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;
 pub mod reconcile;

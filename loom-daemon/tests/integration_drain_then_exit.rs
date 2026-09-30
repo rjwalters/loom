@@ -179,4 +179,11 @@ async fn test_drain_then_exit_exits_143_and_stays_down() {
         !re_listened,
         "nothing may answer on the socket after a drain-then-exit — the daemon must stay down"
     );
+
+    // #9588: the operator stop is recorded durably, so neither the host
+    // watchdog nor startup marker healing revives the daemon.
+    assert!(
+        temp_dir.path().join("autonomy-desired.stopped").exists(),
+        "a then-exit drain must write the operator-stop record"
+    );
 }

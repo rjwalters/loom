@@ -137,6 +137,7 @@ async fn ticked_soon(ticker: &mut EarlyTicker) -> bool {
 /// Clear every `forgeEvents.events.*` env override.
 fn clear_env() {
     std::env::remove_var(MIN_SPACING_SECS_ENV);
+    std::env::remove_var(CI_TELEMETRY_RUNS_ENV);
     for consumer in ALL_CONSUMERS {
         std::env::remove_var(consumer.env);
     }
@@ -171,10 +172,14 @@ fn every_consumer_is_off_by_default_and_resolves_env_over_config() {
         );
     }
 
+    // The run consumer (#9201) is not in ALL_CONSUMERS but shares the same
+    // default-off resolver, so it is held to the same guarantee here.
+    assert!(!resolve_enabled(&CI_TELEMETRY_RUNS, &ConsumerConfig::default()));
     let all_on = ConsumerConfig {
         work_finder_tick: Some(true),
         claim_reconcile_wake: Some(true),
         in_flight_pr_watch: Some(true),
+        ci_telemetry_runs: Some(true),
         min_spacing_secs: None,
     };
     for consumer in ALL_CONSUMERS {
@@ -250,7 +255,7 @@ fn read_config_maps_every_camel_case_key() {
     write_events_config(
         dir.path(),
         r#"{"workFinderTick":true,"claimReconcileWake":false,"inFlightPrWatch":true,
-            "minSpacingSecs":45}"#,
+            "ciTelemetryRuns":true,"minSpacingSecs":45}"#,
     );
     assert_eq!(
         read_config(dir.path()),
@@ -258,6 +263,7 @@ fn read_config_maps_every_camel_case_key() {
             work_finder_tick: Some(true),
             claim_reconcile_wake: Some(false),
             in_flight_pr_watch: Some(true),
+            ci_telemetry_runs: Some(true),
             min_spacing_secs: Some(45),
         }
     );

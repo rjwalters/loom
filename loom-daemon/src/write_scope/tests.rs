@@ -306,6 +306,9 @@ enum Scope {
     /// `--repo` from its caller, never gh's base-repo resolution; the file
     /// named must keep resolving origin first.
     OriginResolved(&'static str),
+    /// An operator-run verb with an explicit, configured target, never run by
+    /// an autonomous path. Not write-scoped yet; listed so the gap is visible.
+    OperatorOnly(&'static str),
     /// Matches the pattern but is not a forge write.
     NotAWrite(&'static str),
 }
@@ -317,7 +320,7 @@ enum Scope {
 /// managed-repo + WRITE check.
 #[test]
 fn daemon_write_paths_are_scoped() {
-    use Scope::{Gated, NotAWrite, OriginResolved, ShellVetted, Via};
+    use Scope::{Gated, NotAWrite, OperatorOnly, OriginResolved, ShellVetted, Via};
     const PASS: &str = "claim_reconciliation/pass_loop.rs";
     const DISPATCH: &str = "sweep_registry/private_dispatch.rs";
     let reviewed: &[(&str, Scope)] = &[
@@ -371,7 +374,11 @@ fn daemon_write_paths_are_scoped() {
         ("role_runner/launch.rs", Gated),
         (
             "fleet/drain.rs",
-            NotAWrite("operator-run `fleet drain` on the operator's own fleet"),
+            OperatorOnly("`fleet drain`: the operator's own worker, by name"),
+        ),
+        (
+            "fleet_store/propose/mod.rs",
+            OperatorOnly("`fleet-config propose`: a PR against the configured store"),
         ),
         (
             "watchdog/peer_coord.rs",
@@ -465,7 +472,9 @@ fn daemon_write_paths_are_scoped() {
                     "{file} relies on {resolver} resolving origin before any gh repo view"
                 );
             }
-            NotAWrite(why) => assert!(matches(file), "stale entry: {file} ({why})"),
+            OperatorOnly(why) | NotAWrite(why) => {
+                assert!(matches(file), "stale entry: {file} ({why})");
+            }
         }
     }
     // The reconciliation gate sits in front of every pass it covers.

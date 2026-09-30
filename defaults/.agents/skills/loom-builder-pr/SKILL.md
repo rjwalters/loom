@@ -900,13 +900,15 @@ if [[ "$FENCE_RC" -eq 3 ]]; then
   echo "Lease fence: EXPIRED — MY OWN claim's lease record is stale on the forge's own clock (my renewal loop died). Aborting before push/PR-open; NOT pushing, NOT opening a PR." >&2
   # Stop here for issue $N. Do not push, do not create a PR, do not touch
   # the loom:building label or contest any peer's claim — report this issue
-  # as not-contributed-this-run, same as any other Builder failure marker.
+  # as not-contributed-this-run.
   # (Issue #6783: exit 3 now means the EXPIRED lease is THIS sweep's own —
   # an expired lease owned by a DIFFERENT, abandoned host is no longer a
   # fencing abort; that case is folded into FENCE_RC == 0 below.)
 elif [[ "$FENCE_RC" -eq 4 ]]; then
   echo "Lease fence: SUPERSEDED — a different host's lease is now the freshest for issue $N. Aborting before push/PR-open; NOT pushing, NOT opening a PR." >&2
   # Same stop-here handling as the EXPIRED branch above.
+elif [[ "$FENCE_RC" -eq 5 ]]; then
+  echo "Lease fence: BRANCH_COLLISION — feature/issue-$N exists on origin, unpushed by this worktree. Yours: adopt via create-pr.sh. Else: stand down. NEVER a suffix branch." >&2
 else
   # FENCE_RC == 0 (fresh & own host, OR no lease evidence to fence against —
   # fail-open, see the script's own header doc — OR an EXPIRED lease owned
@@ -928,12 +930,10 @@ the comment is still fresh (`now - updated_at <= LEASE_TTL_MINUTES`, default
 `host=` still names **this** host (`--host`, defaulting to this host's own
 identity — same `LOOM_HOST_ID` > `$HOSTNAME` > `hostname` precedence
 `sweep_registry::host_identity()` uses). It aborts (exit `3` = expired-and-
-own-host, `4` = superseded — the two are logged distinctly so a
-post-incident read can tell them apart) **before doing anything
-externally-visible**: no push, no PR. It never contests or cleans up a peer's
-claim — the `loom:building` label is left exactly as-is; that is out of
-scope for this check (see the script's own header doc,
-`defaults/scripts/sweep-lease-fence.sh`). Since #6320 an in-session run
+own-host, `4` = superseded, `5` = branch collision)
+**before doing anything externally-visible**: no push, no PR. It
+never touches a peer's claim — the `loom:building` label is
+left as-is. Since #6320 an in-session run
 (manual `/loom:sweep`, GH Actions cron, `--no-daemon`) publishes its own
 lease at pre-flight (`sweep-lease-publish.sh`, sweep.md Step 1b), so this
 check is now meaningful on both dispatch paths rather than only the

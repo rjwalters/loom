@@ -7,6 +7,7 @@ mod estimate;
 mod explanation;
 mod journal;
 mod primitives;
+mod ready;
 mod score;
 mod tracker;
 
@@ -21,6 +22,9 @@ pub(crate) const HISTORY_A: &str = include_str!("../fixtures/history-a.jsonl");
 
 /// The golden explanation (`land-v1`, `review_wait`, age 0, over history-a).
 pub(crate) const EXPLANATION_GOLDEN: &str = include_str!("../fixtures/explanation-golden.json");
+
+/// The golden `start-v1` and unstarted `land-v1` explanations (#9326).
+pub(crate) const READY_GOLDEN: &str = include_str!("../fixtures/ready-golden.json");
 
 /// The golden backtest report (`land-v1` replayed over history-a, #9325).
 pub(crate) const BACKTEST_GOLDEN: &str = include_str!("../fixtures/backtest-golden.json");
@@ -92,5 +96,6 @@ pub(crate) fn input_at(stage: Stage, age_sec: i64, rework_rounds: u32) -> Estima
         },
         features_omitted: Vec::new(),
         provenance: provenance(),
+        dispatch: None,
     }
 }
