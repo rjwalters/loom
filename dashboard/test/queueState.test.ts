@@ -208,6 +208,117 @@ describe("forge-side labelled_blocked rows (#8957)", () => {
   });
 });
 
+describe("dispatch plan fields (#9288)", () => {
+  const planRow = (repo: string, visibility: string) => ({
+    rank: 1,
+    repo,
+    visibility,
+    issue: 4343,
+    workspace_priority: 100,
+    urgent: false,
+    created_at: "2026-09-01T00:00:00Z",
+    disposition: "deferred_repo_cap",
+    state: "ready",
+    reason: "waiting: this repo is at its per-repo cap",
+    position: 3,
+    plan_state: "queued",
+    gate: "repo_cap",
+    keys: [
+      { name: "operator_priority", value: false },
+      { name: "main_red_fix", value: false },
+      { name: "workspace_priority", value: 100 },
+      { name: "created_at", value: "2026-09-01T00:00:00Z" },
+      { name: "number", value: 4343 },
+      { name: "bogus", value: { nested: "/Users/x" } },
+    ],
+    in_slice: true,
+    hot: true,
+    owning_shard: 1,
+    repo_cap: { cap: 1, occupancy: 1 },
+  });
+  const plan = {
+    slots: {
+      max_concurrent: 4,
+      occupancy: 3,
+      free: 1,
+      max_admissions_per_tick: 2,
+      saturation_held: false,
+      any_halted: false,
+      overflow_free: true,
+    },
+    tick_interval_secs: 60,
+    shard: { configured: true, host_shard: 1, shard_count: 2 },
+    scope: ["loom:issue", "loom:blocked"],
+    ordering: ["operator_priority", "operator_priority_at", "main_red_fix", "workspace_priority", "created_at", "number"],
+    complete: true,
+    local_path: "/Users/someone",
+  };
+
+  it("keeps the plan row fields and the plan block, and drops what it does not know", () => {
+    const record = normalizeQueueSnapshot(queueRecord({ rows: [planRow("rjwalters/loom", "public")], plan }))!;
+    expect(record.rows[0]).toMatchObject({
+      position: 3,
+      plan_state: "queued",
+      gate: "repo_cap",
+      in_slice: true,
+      hot: true,
+      owning_shard: 1,
+      repo_cap: { cap: 1, occupancy: 1 },
+    });
+    expect(record.rows[0]?.keys?.map((k) => k.name)).toEqual([
+      "operator_priority",
+      "main_red_fix",
+      "workspace_priority",
+      "created_at",
+      "number",
+    ]);
+    expect(record.plan).toMatchObject({
+      slots: { free: 1, max_admissions_per_tick: 2, overflow_free: true },
+      tick_interval_secs: 60,
+    });
+    expect(record.plan?.shard).toEqual({ configured: true, host_shard: 1, shard_count: 2 });
+    expect(JSON.stringify(record)).not.toContain("/Users/");
+  });
+
+  it("an older daemon's row has no plan fields and no plan block", () => {
+    const record = normalizeQueueSnapshot(queueRecord())!;
+    expect(record.plan).toBeUndefined();
+    expect(record.rows[0]).not.toHaveProperty("plan_state");
+    expect(record.rows[0]).not.toHaveProperty("position");
+  });
+
+  it("maps an unrecognized plan_state to unknown", () => {
+    const record = normalizeQueueSnapshot(queueRecord({ rows: [{ ...planRow("o/r", "public"), plan_state: "someday" }] }))!;
+    expect(record.rows[0]?.plan_state).toBe("unknown");
+  });
+
+  it("a private row keeps position, plan_state and gate, and withholds keys, repo_cap and owning_shard", () => {
+    const redacted = redactQueueSnapshot(normalizeQueueSnapshot(queueRecord({ rows: [planRow("acme/secret-app", "private")], plan }))!);
+    expect(redacted.rows[0]).toEqual({
+      rank: 1,
+      visibility: "private",
+      urgent: false,
+      disposition: "deferred_repo_cap",
+      state: "ready",
+      reason: "waiting: this repo is at its per-repo cap",
+      position: 3,
+      plan_state: "queued",
+      gate: "repo_cap",
+    });
+    const text = JSON.stringify(redacted.rows);
+    expect(text).not.toContain("4343");
+    expect(text).not.toContain("2026-09-01");
+    // The per-tick block names no repo and stays on the public view.
+    expect(redacted.plan?.slots.free).toBe(1);
+  });
+
+  it("a public row keeps every plan field", () => {
+    const redacted = redactQueueSnapshot(normalizeQueueSnapshot(queueRecord({ rows: [planRow("rjwalters/loom", "public")] }))!);
+    expect(redacted.rows[0]).toMatchObject({ owning_shard: 1, repo_cap: { cap: 1, occupancy: 1 } });
+    expect(redacted.rows[0]?.keys).toHaveLength(5);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------

@@ -1,7 +1,8 @@
 //! Token-cost telemetry subcommands: what a fleet's agents actually spent.
 //!
-//! Five members: `usage` (what the Anthropic OAuth API reports for the
-//! current credential, live), `ingest-transcripts` (Issue #8059: persist
+//! Members include `usage` (what the Anthropic OAuth API reports for the
+//! current credential, live), `usage-record` (Issue #9303: one in-session
+//! role attempt's usage, journalled into its story trace), `ingest-transcripts` (Issue #8059: persist
 //! what the local transcripts record into `activity.db`), `usage-report`
 //! (Issue #8062: the role/model/repo/day cost breakdown over the rows
 //! ingestion writes), `opencode-usage` (Issue #8507: the same question asked
@@ -34,6 +35,8 @@ mod telemetry_fixture;
 mod telemetry_live;
 #[path = "telemetry_overhead.rs"]
 mod telemetry_overhead;
+#[path = "usage_record.rs"]
+mod usage_record;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
@@ -84,6 +87,15 @@ pub(crate) enum TelemetryCommand {
     /// `--status` flag, unchanged) so `check-usage.sh`'s contract is never at
     /// risk of a parse ambiguity — see `usage_report_cli`'s module doc.
     UsageReport(super::usage_report_cli::UsageReportArgs),
+
+    /// Journal one role attempt's token usage (per model, with a USD
+    /// estimate) into the issue's story trace (Issue #9303).
+    ///
+    /// For in-session sweeps, which never reach the daemon's terminal
+    /// transition: run after each checkpoint write with the role subagent's
+    /// `--agent-id`. `usage-record`, not `usage record`, so `usage` stays a
+    /// leaf. Always exits 0 — a telemetry failure never fails a sweep.
+    UsageRecord(usage_record::UsageRecordArgs),
 
     /// Per-model token usage from OpenCode's own session store (Issue #8507).
     ///
@@ -158,6 +170,7 @@ impl TelemetryCommand {
             TelemetryCommand::Usage(args) => args.run(),
             TelemetryCommand::IngestTranscripts(args) => args.run(),
             TelemetryCommand::UsageReport(args) => args.run(),
+            TelemetryCommand::UsageRecord(args) => args.run(),
             TelemetryCommand::OpencodeUsage(args) => args.run(),
             TelemetryCommand::CodexUsage(args) => args.run(),
             TelemetryCommand::PiUsage(args) => args.run(),

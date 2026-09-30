@@ -307,6 +307,12 @@ pub enum RoleTickOutcome {
         /// would carry, retained here purely for diagnostic value.
         detail: String,
     },
+    /// A queue-gated role (#9391, see
+    /// `concurrent_dispatch::work_queue_labels`) found its work queue empty,
+    /// so no agent was spawned. Not a failure and not a skip that needs an
+    /// operator: the next tick re-checks, and a listing *error* never
+    /// produces this (the gate fails open and dispatches).
+    QueueEmpty,
 }
 
 impl RoleTickOutcome {

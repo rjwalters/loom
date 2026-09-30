@@ -15,7 +15,12 @@
 //! defaults, and the 5-minute/1-hour cache-write split with its older
 //! flat-only fallback.
 
+use std::collections::{BTreeMap, HashMap};
+
+use chrono::{DateTime, Utc};
 use serde_json::Value;
+
+use super::sweep_experiment::ModelUsageTotals;
 
 /// Bucket for a usage block whose `model` is absent, or is the literal
 /// `"<synthetic>"` Claude Code stamps on certain internal/tool-echo messages
@@ -50,6 +55,22 @@ pub struct UsageRecord {
     pub cache_write_5m: i64,
     pub cache_write_1h: i64,
     pub output: i64,
+}
+
+impl UsageRecord {
+    /// [`timestamp`](Self::timestamp) parsed to an instant, or `None` when the
+    /// record carried none or carried one that is not RFC 3339 (Issue #9443).
+    ///
+    /// An absent instant is what makes a record **unattributable** to any
+    /// per-phase window: it is counted in the sweep's totals and reported in
+    /// `tokens_unattributed`, never guessed into a phase.
+    #[must_use]
+    pub fn at(&self) -> Option<DateTime<Utc>> {
+        let raw = self.timestamp.as_deref()?;
+        DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|t| t.with_timezone(&Utc))
+    }
 }
 
 /// Decode one already-parsed transcript record, or `None` when it carries no
@@ -121,6 +142,160 @@ pub fn usage_from_record(obj: &Value) -> Option<UsageRecord> {
         output: get("output_tokens"),
     })
 }
+
+/// Folds usage records into per-`(model, speed, service_tier)` totals,
+/// **deduped on `message.id`** (issue #8186, folded into #9303).
+///
+/// A streamed assistant message is written once per chunk, and every chunk
+/// repeats the same `message.id` carrying that message's **cumulative** usage.
+/// Summing every block therefore counted a streamed message once per chunk
+/// (~2x high on real transcripts). This fold keeps one entry per id and takes
+/// the per-counter maximum across its chunks — correct for both identical
+/// repeats and genuinely growing cumulative chunks, and the same rule
+/// [`crate::activity::transcript_parse`] applies. A record without an id cannot
+/// collide with another message, so it is counted as its own message.
+///
+/// The one reader every token path shares: `sum_transcript_usage{,_by_model}`
+/// (sweep outcomes, `loom.runtime.usage` execution spans, `usage-record`
+/// attempt spans) and the role-tick transcript scan — so an execution total
+/// and the attempt totals it is compared against can never disagree about how
+/// a message is counted.
+#[derive(Debug, Default)]
+pub struct UsageFold {
+    by_id: HashMap<String, usize>,
+    messages: Vec<UsageRecord>,
+    /// Usage blocks seen, before dedupe.
+    pub blocks: usize,
+    /// The first and last record-level `timestamp` of any usage record, as
+    /// written (RFC 3339).
+    pub first_timestamp: Option<String>,
+    pub last_timestamp: Option<String>,
+}
+
+impl UsageFold {
+    /// Fold one decoded record in.
+    pub fn add(&mut self, record: UsageRecord) {
+        self.blocks += 1;
+        if let Some(ts) = &record.timestamp {
+            if self.first_timestamp.is_none() {
+                self.first_timestamp = Some(ts.clone());
+            }
+            self.last_timestamp = Some(ts.clone());
+        }
+        let Some(id) = record.message_id.clone() else {
+            self.messages.push(record);
+            return;
+        };
+        if let Some(&at) = self.by_id.get(&id) {
+            let kept = &mut self.messages[at];
+            kept.input = kept.input.max(record.input);
+            kept.cache_read = kept.cache_read.max(record.cache_read);
+            kept.cache_write_5m = kept.cache_write_5m.max(record.cache_write_5m);
+            kept.cache_write_1h = kept.cache_write_1h.max(record.cache_write_1h);
+            kept.output = kept.output.max(record.output);
+            return;
+        }
+        self.by_id.insert(id, self.messages.len());
+        self.messages.push(record);
+    }
+
+    /// Fold every usage-bearing line of a transcript's text.
+    pub fn add_text(&mut self, text: &str) {
+        for raw in text.lines() {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let Ok(obj) = serde_json::from_str::<Value>(raw) else {
+                continue;
+            };
+            if let Some(record) = usage_from_record(&obj) {
+                self.add(record);
+            }
+        }
+    }
+
+    /// The deduped per-`(model, speed, service_tier)` totals, sorted by that
+    /// tuple.
+    #[must_use]
+    pub fn rows(&self) -> Vec<ModelUsageTotals> {
+        let mut totals = BTreeMap::new();
+        merge_records(&mut totals, &self.messages);
+        totals.into_values().collect()
+    }
+
+    /// The deduped messages, one per distinct `message.id` (plus every id-less
+    /// record), in first-seen order — exposed for per-phase attribution (Issue
+    /// #9443).
+    ///
+    /// The load-bearing property: because dedupe has already happened, Σ over
+    /// **any partition** of this slice (via [`merge_records`]) equals
+    /// [`rows`](Self::rows) exactly. That is what lets a caller split one
+    /// transcript's usage into per-phase windows and still reconcile against
+    /// the sweep total — splitting the raw lines instead would double-count a
+    /// streamed message whose chunks straddle a phase boundary.
+    ///
+    /// A deduped message keeps the `timestamp` of its **first** chunk (see
+    /// [`add`](Self::add)), so [`UsageRecord::at`] is the instant the message
+    /// started, and a message is attributed wholly to the phase it started in.
+    #[must_use]
+    pub fn messages(&self) -> &[UsageRecord] {
+        &self.messages
+    }
+}
+
+/// Accumulate already-deduped [`UsageRecord`]s into the per-`(model, speed,
+/// service_tier)` accumulator `into` — the grouping [`UsageFold::rows`]
+/// performs, exposed (Issue #9443) so a caller partitioning one fold's
+/// [`messages`](UsageFold::messages) across several buckets groups them
+/// identically in each.
+pub fn merge_records<'a>(
+    into: &mut BTreeMap<(String, String, String), ModelUsageTotals>,
+    records: impl IntoIterator<Item = &'a UsageRecord>,
+) {
+    for rec in records {
+        let key = (rec.model.clone(), rec.speed.clone(), rec.service_tier.clone());
+        let entry = into.entry(key).or_insert_with(|| ModelUsageTotals {
+            model: rec.model.clone(),
+            speed: rec.speed.clone(),
+            service_tier: rec.service_tier.clone(),
+            ..ModelUsageTotals::default()
+        });
+        entry.input += rec.input;
+        entry.cache_read += rec.cache_read;
+        entry.cache_write_5m += rec.cache_write_5m;
+        entry.cache_write_1h += rec.cache_write_1h;
+        entry.output += rec.output;
+    }
+}
+
+/// Add `rows` into the per-tuple accumulator `into` (used to total several
+/// transcripts' already-deduped rows).
+pub fn merge_rows(
+    into: &mut BTreeMap<(String, String, String), ModelUsageTotals>,
+    rows: Vec<ModelUsageTotals>,
+) {
+    for row in rows {
+        let key = (row.model.clone(), row.speed.clone(), row.service_tier.clone());
+        match into.get_mut(&key) {
+            Some(entry) => {
+                entry.input += row.input;
+                entry.cache_read += row.cache_read;
+                entry.cache_write_5m += row.cache_write_5m;
+                entry.cache_write_1h += row.cache_write_1h;
+                entry.output += row.output;
+            }
+            None => {
+                into.insert(key, row);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "transcript_usage_fold_tests.rs"]
+mod fold_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

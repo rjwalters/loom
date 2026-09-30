@@ -4,7 +4,7 @@ use super::{
     any_string, any_value, kv, kv_int, kv_string, AnyValue, ArrayValue, KeyValue, KeyValueList,
 };
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
-use crate::telemetry::SweepOutcomeRecord;
+use crate::telemetry::{PhaseDuration, SweepOutcomeRecord};
 const MAX_GROUPS: usize = 64;
 const MAX_STRING_BYTES: usize = 256;
 
@@ -65,6 +65,54 @@ pub(super) fn usage(rows: Option<&[ModelUsageTotals]>) -> Option<KeyValue> {
     ))
 }
 
+/// `loom.phase_durations` (Issue #9443): the per-phase-attempt breakdown, each
+/// entry carrying its `attempt` index and token split beside its duration.
+///
+/// Absent-not-zero is preserved per key: a phase whose usage was not measured
+/// emits `phase`/`duration_sec` alone, so a consumer summing `tokens_in` over
+/// these entries and comparing against `loom.tokens_in` sees the shortfall
+/// (reported explicitly as `loom.tokens_unattributed_in`) rather than a phase
+/// claiming it was free.
+///
+/// Per-phase `tokens_by_model` is deliberately **not** exported here: it would
+/// nest an array of kvlists inside an array of kvlists, and the per-phase model
+/// breakdown already reaches OTLP the better way — as this sweep's
+/// `loom.runtime.usage` spans with `loom.usage.scope=attempt`, one per model
+/// under each `loom.role_attempt`.
+pub(super) fn phase_durations(entries: &[PhaseDuration]) -> Option<KeyValue> {
+    if entries.is_empty() {
+        return None;
+    }
+    if entries.len() > MAX_GROUPS || entries.iter().any(|e| !text(&e.phase)) {
+        log::warn!("observability: invalid or oversized phase durations omitted");
+        return None;
+    }
+    Some(array(
+        "loom.phase_durations",
+        entries
+            .iter()
+            .map(|entry| {
+                let mut values = vec![
+                    kv_string("phase", entry.phase.clone()),
+                    kv_int("duration_sec", entry.duration_sec),
+                ];
+                if let Some(attempt) = entry.attempt {
+                    values.push(kv_int("attempt", i64::from(attempt)));
+                }
+                for (key, value) in [
+                    ("tokens_in", entry.tokens_in),
+                    ("tokens_out", entry.tokens_out),
+                ] {
+                    if let Some(value) = value.and_then(|v| i64::try_from(v).ok()) {
+                        values.push(kv_int(key, value));
+                    }
+                }
+                row(values)
+            })
+            .collect(),
+    ))
+}
+
 pub(super) fn models(values: Option<&[String]>) -> Option<KeyValue> {
     let values = values.filter(|rows| !rows.is_empty() && rows.len() <= MAX_GROUPS)?;
     values
@@ -90,6 +138,15 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     }
     if let Some(value) = record.doctor_cycles {
         attrs.push(kv_int("loom.doctor_cycles", i64::from(value)));
+    }
+    // Issue #9432 (epic #9429): the Curator's a-priori size estimate, exported
+    // as a NUMERIC attribute so a backend can sum "story points landed per day"
+    // (#9433) and join estimate against the actuals already on this record
+    // (#9434) without leaving the telemetry store. Absent-not-zero: an unsized
+    // issue, a stacked points label set (logged loudly at resolution time) and
+    // an unread issue all omit the attribute entirely.
+    if let Some(value) = record.story_points {
+        attrs.push(kv_int("loom.story_points", i64::from(value)));
     }
     if let Some(verdicts) = &record.judge_verdicts {
         if verdicts.len() <= MAX_GROUPS
@@ -120,9 +177,32 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     if let Some(value) = usage(record.tokens_by_model.as_deref()) {
         attrs.push(value);
     }
+    // Issue #9440: the discriminator that makes an absent token pair readable.
+    // A closed vocabulary (the enum's own serde tags), so this is an exported
+    // attribute a query can group by, never free text.
+    if let Some(status) = record.tokens_status {
+        attrs.push(kv_string(
+            "loom.tokens_status",
+            match status {
+                crate::telemetry::TokensStatus::Measured => "measured",
+                crate::telemetry::TokensStatus::NotSpawned => "not_spawned",
+                crate::telemetry::TokensStatus::Unattributable => "unattributable",
+                crate::telemetry::TokensStatus::Suspect => "suspect",
+            }
+            .to_string(),
+        ));
+    }
+    if let Some(value) = record.tokens_status_reason.as_ref().filter(|v| text(v)) {
+        attrs.push(kv_string("loom.tokens_status_reason", value.clone()));
+    }
     for (key, value) in [
         ("loom.tokens_in", record.tokens_in),
         ("loom.tokens_out", record.tokens_out),
+        // Issue #9443: the remainder no phase entry accounts for, exported
+        // alongside the totals so the OTLP side can check the same
+        // Σphases + remainder == total invariant the JSONL record states.
+        ("loom.tokens_unattributed_in", record.tokens_unattributed.map(|t| t.tokens_in)),
+        ("loom.tokens_unattributed_out", record.tokens_unattributed.map(|t| t.tokens_out)),
     ] {
         if let Some(value) = value.and_then(|v| i64::try_from(v).ok()) {
             attrs.push(kv_int(key, value));

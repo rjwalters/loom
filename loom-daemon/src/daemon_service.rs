@@ -892,6 +892,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
         });
     }
 
+    // #9537: keep each reader App's token fresh per managed owner (no-op when
+    // the roster has no readers), so forge reads can leave the writer's budget.
+    loom_daemon::forge_identity::spawn_reader_refresh(
+        sweep_workspace.clone(),
+        github_app_owner_repo.clone(),
+    );
+
     // Declared-cadence liveness heartbeat (Issue #4011): the daemon touches
     // `<loom_dir>/daemon.heartbeat` on a fixed cadence so a host-side watchdog
     // (`loom-daemon-watchdog.sh`, a second StartInterval launchd job) can detect
@@ -1502,6 +1509,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
         None
     };
+    // Starred-issue liveness + loom-ui star intents (#9244 C), alongside dispatch.
+    let _star_liveness = _work_finder_handle
+        .is_some()
+        .then(|| loom_daemon::star_liveness::task::spawn(sweep_workspace.clone()));
 
     // Idle-edge role triggering (#4364) is inert without the work-finder loop:
     // the work finder is the sole source of the per-root idle signal, so an

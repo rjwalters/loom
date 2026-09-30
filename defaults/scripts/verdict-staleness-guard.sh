@@ -32,8 +32,9 @@
 #                     says (#6781).
 #   2. NO_VERDICT   — the PR carries neither `loom:pr` nor
 #                     `loom:changes-requested`. Nothing to invalidate.
-#   3. UNVERIFIABLE — a verdict label is present, but no marker comment exists
-#                     for THAT verdict kind. Fail safe: the verdict is kept.
+#   3. UNVERIFIABLE — a verdict label is present, but no TRUSTED marker exists
+#                     for THAT verdict kind (#9548: an untrusted author's marker is
+#                     prose, not state). Fail safe: the verdict is kept.
 #                     This is the pre-migration/rollout case (verdicts written
 #                     before this guard shipped carry no marker), the
 #                     mixed-fleet case (a host still running the older prompt),
@@ -394,6 +395,20 @@ COMMENTS_JSON="$(gh api "repos/{owner}/{repo}/issues/$PR/comments" --paginate 2>
   exit 1
 }
 
+# #9548: a marker counts only from a TRUSTED author — a repo insider by
+# author_association, one of this fleet's Apps, this daemon's own identity, or
+# forge.trustedCommenters. Anyone can post a well-formed marker on a public
+# repo, and another Loom fleet's markers are not ours; an untrusted marker is
+# prose and reads exactly as if it were absent (so it can neither vouch for a
+# verdict nor invalidate one). The predicate lives in the daemon
+# (`loom-daemon forge trusted-comments`, loom-daemon/src/comment_trust.rs);
+# this script owns none of it. If the filter cannot run, EVERY marker is
+# treated as absent: the verdict reads UNVERIFIABLE (never FRESH on
+# unauthenticated markers) and --anchor is suppressed, since anchoring an
+# unverified verdict to the current head would itself mint a FRESH marker.
+# requires-daemon: forge optional   Without the `trusted-comments` verb (an absent binary, or one predating #9548: clap exits 2 with nothing on stdout) every marker counts as absent, so the verdict reads UNVERIFIABLE with the cause named in REASON and --anchor does not post. No version floor on purpose: the degraded answer is the fail-safe one.
+COMMENTS_JSON="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments <<<"$COMMENTS_JSON" 2>/dev/null)" && TRUSTED=1 || { COMMENTS_JSON='[]'; TRUSTED=0; }
+
 # One "<created_at>\t<sha>" line per matching marker, oldest first (matches
 # --paginate's page order). `test(...)` guards `capture(...)` so a non-matching
 # body is filtered out via `select` rather than raising a per-item jq error.
@@ -418,7 +433,8 @@ MARKER_LINES="$(jq -r --arg t "$MARKER_TEST" --arg c "$MARKER_CAPTURE" '
 MARKER_SHA="$(tail -n 1 <<<"$MARKER_LINES" | cut -f2)"
 
 if [[ -z "$MARKER_SHA" ]]; then
-  UNVERIFIABLE_REASON="verdict label $VERDICT_LABEL present but no <!-- loom:verdict-sha ... verdict=$VERDICT_TOKEN --> marker found (marker never written) — failing safe, verdict kept"
+  UNVERIFIABLE_REASON="verdict label $VERDICT_LABEL present but no <!-- loom:verdict-sha ... verdict=$VERDICT_TOKEN --> marker from a trusted author found — failing safe, verdict kept"
+  [[ "$TRUSTED" -eq 1 ]] || UNVERIFIABLE_REASON="$UNVERIFIABLE_REASON; markers could not be authenticated (loom-daemon forge trusted-comments unavailable), so every marker was treated as absent and --anchor is suppressed (#9548)"
 
   # --- Step 3b: UNVERIFIABLE — optionally anchor to the current head (#6319) -
   # Note the asymmetry with --clear below, and that it is deliberate: this
@@ -426,7 +442,7 @@ if [[ -z "$MARKER_SHA" ]]; then
   # re-queue anything. It only makes the standing verdict checkable from here
   # on. Without it the verdict stays permanently unverifiable and keeps the
   # full pre-#5686 hazard for as long as the label sits there.
-  if [[ "$ANCHOR" -eq 1 ]]; then
+  if [[ "$ANCHOR" -eq 1 && "$TRUSTED" -eq 1 ]]; then
     HOLD_LABEL="$(hold_label)"
     if [[ -n "$HOLD_LABEL" ]]; then
       emit "UNVERIFIABLE" "$UNVERIFIABLE_REASON; anchor suppressed — PR is on an explicit $HOLD_LABEL hold" \

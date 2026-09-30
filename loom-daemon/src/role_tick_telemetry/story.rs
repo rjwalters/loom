@@ -103,6 +103,9 @@ pub struct TickFacts {
     pub result: String,
     pub runtime: Option<String>,
     pub model: Option<String>,
+    /// The tick's per-model usage (#9303); attempt-scoped usage joins the
+    /// story only when exactly one target is stitched ([`super::usage`]).
+    pub tokens_by_model: Option<Vec<crate::script_helpers::sweep_experiment::ModelUsageTotals>>,
 }
 
 /// Join `facts`' tick to the stories of `targets`. Blocking and best-effort:
@@ -140,7 +143,12 @@ pub fn emit(root: &Path, facts: &TickFacts, targets: &BTreeSet<Target>) {
         );
         return;
     };
-    let spans = plan(facts, &identity, &slug, &numbers, &resolved);
+    let mut spans = plan(facts, &identity, &slug, &numbers, &resolved);
+    spans.extend(super::usage::attempt_usage(
+        &spans,
+        facts.tokens_by_model.as_deref(),
+        &crate::observability::runtime_usage::cost::Pricing::active(),
+    ));
     if let Err(error) = journal(root, &facts.trace.execution, spans) {
         log::warn!("role_tick_telemetry: story spans not journalled (#9168): {error}");
     }

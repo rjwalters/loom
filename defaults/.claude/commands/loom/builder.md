@@ -309,6 +309,7 @@ gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
 # WRONG: Leaves issue in invalid state with both labels
 gh issue edit <number> --add-label "loom:blocked"
 ```
+**Record the blocker before the label (#9102).** Before any `--add-label "loom:blocked"`, the issue **body** must declare each **open** blocker — a park record (`loom-daemon park-record render --blocked-by N --by builder`; `.loom/docs/park-record.md`), a `## Dependencies` entry, or a `Blocked by #N` / `Depends on #N` / `Requires #N` line. That is what `check-stale-blocked` (#8927), Guide's unblock sweep and `merge-pr.sh` (comments when #N closes) read; a comment is not enough. Never cite an already-closed item (the unblock sweeps would release it at once). No open numbered blocker? Say so in a comment posted just before the label; never invent one.
 
 ### Labels You NEVER Touch
 
@@ -320,14 +321,7 @@ gh issue edit <number> --add-label "loom:blocked"
 | `loom:architect` | Architect | Architect's domain for proposals |
 | `loom:hermit` | Hermit | Hermit's domain for simplification proposals |
 
-### Why This Matters
-
-**Breaking label discipline causes coordination failures:**
-- Removing `loom:pr` -> Champion can't find approved PRs to merge
-- Removing `loom:review-requested` from someone else's PR -> Judge skips the review
-- Starting work without `loom:issue` -> Bypasses curation and approval process
-
-**Rule of thumb**: If you didn't add a label, don't remove it. The owner role is responsible for their labels.
+**Rule of thumb** (starting without `loom:issue` bypasses curation and approval): If you didn't add a label, don't remove it. The owner role is responsible for their labels.
 
 ### Builder's Role in the Label State Machine
 
@@ -797,6 +791,7 @@ Open the issue and look for:
   ```bash
   gh issue edit <number> --remove-label "loom:issue" --add-label "loom:blocked"
   ```
+  Record the unchecked dependency as a park record — see `.loom/docs/park-record.md`.
 
 **If NO Dependencies section:**
 - Issue has no blockers -> Safe to claim
@@ -805,27 +800,13 @@ Open the issue and look for:
 
 If you discover a dependency while working:
 
-1. **Add Dependencies section** to the issue
+1. **Park-record it in the issue body** (or add a Dependencies section) — before step 2, never after
 2. **Mark as blocked** (atomic transition from building to blocked):
    ```bash
    gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
    ```
 3. **Create comment** explaining the dependency
 4. **Wait** for dependency to be resolved, or switch to another issue
-
-### Example
-
-```bash
-# Before claiming issue #100, check it
-gh issue view 100 --comments
-
-# If you see unchecked dependencies, mark as blocked instead
-gh issue edit 100 --remove-label "loom:issue" --add-label "loom:blocked"
-
-# Otherwise, run the step-4 open-PR guard, then claim
-loom-daemon forge check-open-pr 100    # exit 0 => open PR exists, do NOT claim
-gh issue edit 100 --remove-label "loom:issue" --add-label "loom:building"
-```
 
 ## Build Verification During Implementation
 
@@ -974,6 +955,7 @@ gh issue comment <number> --body "$(cat <<'EOF'
 - [List what you looked at — files, functions, patterns]
 - [What you tried or considered]
 - [What specifically blocked you or was unclear]
+- No open numbered blocker (if there is one, park-record it in the body first — Label Discipline)
 
 <!-- loom:builder-note -->
 EOF
@@ -1091,27 +1073,27 @@ Workers use a three-level priority system to determine which issues to work on:
 
 ### Priority Order
 
-1. **Urgent** (`loom:urgent`) - Critical/blocking issues requiring immediate attention
+1. **Starred** (`loom:operator-priority`) - The operator wants it landed ASAP (#9244)
 2. **Curated** (`loom:issue` + `loom:curated`) - Approved and enhanced issues (highest quality)
 3. **Approved Only** (`loom:issue` without `loom:curated`) - Approved but not yet curated (fallback)
 
 ### How to Find Work
 
-**Step 1: Check for urgent issues first**
+**Step 1: Check for starred issues first**
 
 ```bash
-gh issue list --label="loom:issue" --label="loom:urgent" --state=open --limit=5
+gh issue list --label="loom:issue" --label="loom:operator-priority" --state=open --limit=5
 ```
 
-If urgent issues exist, **claim one immediately** - these are critical.
+If any exist, **claim one immediately**.
 
-**Step 2: If no urgent, check curated issues**
+**Step 2: If none starred, check curated issues**
 
 ```bash
 gh issue list --label="loom:issue" --label="loom:curated" --state=open --limit=10
 ```
 
-**Why prefer these**: Highest quality - human approved + Curator added context.
+**Why prefer these**: human approved + Curator context.
 
 **Step 3: If no curated, fall back to approved-only issues**
 
@@ -1125,7 +1107,7 @@ gh issue list --label="loom:issue" --state=open --json number,title,labels \
   \"#\(.number): \(.title)\""
 ```
 
-**Why allow this**: Work can proceed even if Curator hasn't run yet. Builder can implement based on human approval alone if needed.
+**Why allow this**: work can proceed on human approval alone, before Curator runs.
 
 **Step 4 (every tier): guard the claim before you flip the label**
 
@@ -1268,15 +1250,14 @@ fi
   a duplicate trailer for an identity already present. Full reference:
   `defaults/docs/commit-signoff.md`.
 
-### Closing vs Partial Increments (family/epic issues)
+### Closing vs Non-Closing References (multi-PR landings)
 
-Decide whether this PR **fully** resolves the issue (`Closes #N`) or is only a
-**partial increment** of a larger tracked body of work that must stay open
-(`Part of #N` / `Contributes to #N`). The full decision rule — when to use the
-non-closing reference, and the requirement to carry the **same** reference in both
-the PR body and the commit messages — is the canonical guidance in
-**builder-pr.md § "Partial increments (family/epic issues)"**. Do not restate it
-here; follow it there.
+Decide whether this PR **fully** resolves the issue (`Closes #N`) or is one of
+several PRs it lands through, so the issue must stay open (`Part of #N` plus a
+`Loom-Issue: owner/repo#N` trailer). The full decision rule — it covers ANY
+multi-PR landing, not only declared `loom:epic` families — is canonical in
+**builder-pr.md § "Multi-PR landings: every PR declares its issue"**. Do not
+restate it here; follow it there.
 
 ### Creating the PR
 
@@ -1293,14 +1274,14 @@ has landed (the failure that made re-dispatched Builders rebuild identical
 work). The canonical body template (Summary / Changes / Acceptance
 Criteria Verification / Test Plan + the `Closes #N` reference) lives in
 **builder-pr.md § "Creating the PR"** — use it verbatim. Do NOT create PRs with
-just `Closes #N`; the body must include the structured sections. Add the
-`loom:review-requested` label at creation only, and never touch PR labels
-afterward (canonical rules in **builder-pr.md § "PR Label Rules"**). PRs are
+just `Closes #N`; the body must include the structured sections. Add
+`loom:review-requested` at creation only (plus `loom:operator-priority` if the
+issue carries it, #9244), and never touch PR labels afterward (canonical rules in **builder-pr.md § "PR Label Rules"**). PRs are
 merged by Champion using `./.loom/scripts/merge-pr.sh` — never use `gh pr merge`.
 
 ## Working Style
 
-- **Start**: Find work using the three-tier priority order (see "Finding Work: Priority System") — urgent → curated → approved-only; oldest-first is only the tiebreak **within** a tier, not a top-level rule
+- **Start**: Find work using the three-tier priority order (see "Finding Work: Priority System") — starred → curated → approved-only; oldest-first is only the tiebreak **within** a tier, not a top-level rule
 - **Verify before claiming**: Issue MUST have `loom:issue` label (unless explicit user override)
 - **Claim**: Remove `loom:issue`, add `loom:building` - always both labels together
 - **During work**: If you discover out-of-scope needs, PAUSE and create an issue (see builder-complexity.md)
@@ -1323,7 +1304,7 @@ When claiming:
 
 When creating PR:
 - [ ] Add `loom:review-requested` (at creation only)
-- [ ] PR body uses `Closes #N` (full implementation) or `Part of #N` (partial increment of a family/epic issue) — same reference in the commit message
+- [ ] PR body uses `Closes #N` (final PR) or `Part of #N` + `Loom-Issue: owner/repo#N` (any earlier PR) — same reference in the commit message
 
 After PR creation:
 - [ ] STOP - do not touch any PR labels

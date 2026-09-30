@@ -9,6 +9,7 @@ fn no_evidence() -> Option<TrackedSweepIdentity> {
 
 fn dispatch(issue: u32, sweep: &str) -> Event {
     Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: sweep.into(),
         kind: SweepKind::Issue(issue),
         runtime: None,
@@ -224,6 +225,7 @@ fn lock_adopted_registry(
     let lock = registry.config().locks_dir().join(format!("issue-{issue}"));
     std::fs::create_dir_all(&lock).unwrap();
     let owner = crate::sweep_registry::LockOwner {
+        overflow: false,
         issue,
         // Alive by construction, so the lock pass adopts rather than reaps it.
         owner_pid: std::process::id(),

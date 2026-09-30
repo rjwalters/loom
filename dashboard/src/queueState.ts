@@ -38,9 +38,13 @@
  * repo-identifying is `repo`, `issue`, `created_at`, `tier` and `detail` (a
  * park label or an open PR number). For a row whose `visibility` is not
  * exactly `"public"` an unauthenticated viewer gets none of them, only the
- * row's rank, state, disposition and the daemon's fixed reason text. The
- * `counts` are true totals and are kept: like a private sweep's phase, an
- * aggregate count names no repository.
+ * row's rank, state, disposition and the daemon's fixed reason text — plus,
+ * since #9288, its plan `position`, `plan_state` and `gate`, which are
+ * positions and gate names, not repo detail. The row's comparator `keys`
+ * (which repeat `created_at` and the issue number), `repo_cap`,
+ * `owning_shard`, `in_slice` and `hot` are withheld. The `counts` and the
+ * per-tick `plan` block are kept: like a private sweep's phase, an aggregate
+ * count or slot figure names no repository.
  */
 
 import { classifyFreshness, PRUNE_AFTER_MS, type FreshnessInfo } from "./fleetState";
@@ -51,19 +55,65 @@ import { decodeVisibility, type RepoVisibility } from "./telemetry";
  * guessed into one of the three. */
 export type QueueRowState = "running" | "ready" | "blocked" | "unknown";
 
+/** Where a row stands in the host's dispatch plan (Issue #9288). */
+export type QueuePlanState = "running" | "next" | "queued" | "blocked" | "unknown";
+
+/** One comparator key that placed a row, in comparator order. */
+export interface QueuePlanKey {
+  name: string;
+  value: string | number | boolean | null;
+}
+
+/** The host's dispatch-plan block for one tick (Issue #9288). */
+export interface QueuePlan {
+  slots: {
+    max_concurrent?: number;
+    occupancy?: number;
+    free?: number;
+    max_admissions_per_tick?: number;
+    saturation_held: boolean;
+    any_halted: boolean;
+    /** Whether the host's single `loom:operator-priority` overflow slot
+     * (#9244) is unused: a starred issue can still start past the
+     * configured cap. Absent from a daemon older than #9318. */
+    overflow_free?: boolean;
+  };
+  tick_interval_secs?: number;
+  shard: { configured: boolean; host_shard?: number; shard_count?: number };
+  /** Labels the plan covers; `loom:curated` / `loom:triage` are unordered. */
+  scope: string[];
+  /** Comparator key names, in order. */
+  ordering: string[];
+  complete: boolean;
+}
+
 export interface QueueRow {
   rank: number;
   repo?: string;
   visibility: RepoVisibility;
   issue?: number;
   workspace_priority?: number;
+  /** Deprecated (#9244): always false from a current daemon. */
   urgent: boolean;
+  /** Starred (`loom:operator-priority`, #9244). Absent when not starred. */
+  operator_priority?: boolean;
+  /** When it was starred, when the daemon knows. */
+  operator_priority_at?: string;
   created_at?: string;
   tier?: string;
   disposition: string;
   state: QueueRowState;
   reason: string;
   detail?: string;
+  /** Issue #9288 plan fields. Absent from a pre-#9288 daemon. */
+  position?: number;
+  plan_state?: QueuePlanState;
+  keys?: QueuePlanKey[];
+  gate?: string;
+  in_slice?: boolean;
+  hot?: boolean;
+  owning_shard?: number;
+  repo_cap?: { cap?: number; occupancy: number };
 }
 
 export interface QueueRepoRef {
@@ -89,6 +139,8 @@ export interface QueueSnapshot {
   rows: QueueRow[];
   unresolved_rows: number;
   rows_truncated: number;
+  /** The tick's dispatch plan (Issue #9288). Absent from older daemons. */
+  plan?: QueuePlan;
   /** Public view only: rows whose repo-identifying fields were withheld. */
   withheld_rows?: number;
 }
@@ -107,6 +159,7 @@ export interface HostQueueEntry {
 export const MAX_STORED_ROWS = 200;
 
 const ROW_STATES: readonly QueueRowState[] = ["running", "ready", "blocked"];
+const PLAN_STATES: readonly QueuePlanState[] = ["running", "next", "queued", "blocked"];
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -124,6 +177,62 @@ function optCount(value: unknown): number | undefined {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
+function strList(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(str).filter((s): s is string => s !== undefined) : [];
+}
+
+function normalizeKeys(value: unknown): QueuePlanKey[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const keys: QueuePlanKey[] = [];
+  for (const entry of value) {
+    if (!isObject(entry)) continue;
+    const name = str(entry.name);
+    const v = entry.value;
+    if (name === undefined) continue;
+    if (v === null || typeof v === "string" || typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v))) {
+      keys.push({ name, value: v });
+    }
+  }
+  return keys.length > 0 ? keys : undefined;
+}
+
+function normalizeRepoCap(value: unknown): QueueRow["repo_cap"] {
+  if (!isObject(value)) return undefined;
+  const cap = optCount(value.cap);
+  return cap === undefined ? { occupancy: count(value.occupancy) } : { cap, occupancy: count(value.occupancy) };
+}
+
+function bool(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+/** Narrow the #9288 plan block, or `undefined` when absent or malformed. */
+export function normalizePlan(value: unknown): QueuePlan | undefined {
+  if (!isObject(value)) return undefined;
+  const slots = isObject(value.slots) ? value.slots : {};
+  const shard = isObject(value.shard) ? value.shard : {};
+  const plan: QueuePlan = {
+    slots: { saturation_held: slots.saturation_held === true, any_halted: slots.any_halted === true },
+    shard: { configured: shard.configured === true },
+    scope: strList(value.scope),
+    ordering: strList(value.ordering),
+    complete: value.complete === true,
+  };
+  for (const key of ["max_concurrent", "occupancy", "free", "max_admissions_per_tick"] as const) {
+    const n = optCount(slots[key]);
+    if (n !== undefined) plan.slots[key] = n;
+  }
+  const overflowFree = bool(slots.overflow_free);
+  if (overflowFree !== undefined) plan.slots.overflow_free = overflowFree;
+  const hostShard = optCount(shard.host_shard);
+  if (hostShard !== undefined) plan.shard.host_shard = hostShard;
+  const shardCount = optCount(shard.shard_count);
+  if (shardCount !== undefined) plan.shard.shard_count = shardCount;
+  const interval = optCount(value.tick_interval_secs);
+  if (interval !== undefined) plan.tick_interval_secs = interval;
+  return plan;
+}
+
 function normalizeRow(value: unknown): QueueRow | undefined {
   if (!isObject(value)) return undefined;
   const rank = optCount(value.rank);
@@ -136,12 +245,23 @@ function normalizeRow(value: unknown): QueueRow | undefined {
     issue: optCount(value.issue),
     workspace_priority: optCount(value.workspace_priority),
     urgent: value.urgent === true,
+    operator_priority: value.operator_priority === true ? true : undefined,
+    operator_priority_at: str(value.operator_priority_at),
     created_at: str(value.created_at),
     tier: str(value.tier),
     disposition: str(value.disposition) ?? "unknown",
     state,
     reason: str(value.reason) ?? "",
     detail: str(value.detail),
+    position: optCount(value.position),
+    plan_state:
+      value.plan_state === undefined ? undefined : (PLAN_STATES.find((known) => known === value.plan_state) ?? "unknown"),
+    keys: normalizeKeys(value.keys),
+    gate: str(value.gate),
+    in_slice: bool(value.in_slice),
+    hot: bool(value.hot),
+    owning_shard: optCount(value.owning_shard),
+    repo_cap: normalizeRepoCap(value.repo_cap),
   };
   for (const key of Object.keys(row) as (keyof QueueRow)[]) {
     if (row[key] === undefined) delete row[key];
@@ -169,6 +289,7 @@ export function normalizeQueueSnapshot(record: Record<string, unknown>): QueueSn
   const overflow = Math.max(0, rows.length - MAX_STORED_ROWS);
   const counts = isObject(record.counts) ? record.counts : {};
   const maxConcurrent = optCount(record.max_concurrent);
+  const plan = normalizePlan(record.plan);
 
   return {
     kind: "queue.snapshot",
@@ -183,6 +304,7 @@ export function normalizeQueueSnapshot(record: Record<string, unknown>): QueueSn
     rows: rows.slice(0, MAX_STORED_ROWS),
     unresolved_rows: count(record.unresolved_rows),
     rows_truncated: count(record.rows_truncated) + overflow,
+    ...(plan !== undefined && { plan }),
   };
 }
 
@@ -219,14 +341,20 @@ export function classifyAndPruneQueues(
  * reduced to non-identifying fields when private. */
 export function redactQueueRow(row: QueueRow): QueueRow {
   if (row.visibility === "public") return row;
-  return {
+  const redacted: QueueRow = {
     rank: row.rank,
     visibility: "private",
     urgent: row.urgent,
+    operator_priority: row.operator_priority,
     disposition: row.disposition,
     state: row.state,
     reason: row.reason,
   };
+  // Plan position, state and gate place the row without naming it (#9288).
+  if (row.position !== undefined) redacted.position = row.position;
+  if (row.plan_state !== undefined) redacted.plan_state = row.plan_state;
+  if (row.gate !== undefined) redacted.gate = row.gate;
+  return redacted;
 }
 
 /** The public projection of a whole snapshot. Counts, `seen` and the tick
@@ -251,5 +379,10 @@ export function publicQueuePayload(payload: Record<string, unknown>): Record<str
   const normalized = normalizeQueueSnapshot(payload);
   if (!normalized) return {};
   const redacted = redactQueueSnapshot(normalized);
-  return { rows: redacted.rows, listing_failed: redacted.listing_failed, withheld_rows: redacted.withheld_rows };
+  return {
+    rows: redacted.rows,
+    listing_failed: redacted.listing_failed,
+    withheld_rows: redacted.withheld_rows,
+    ...(redacted.plan !== undefined && { plan: redacted.plan }),
+  };
 }

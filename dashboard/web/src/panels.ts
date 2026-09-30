@@ -28,6 +28,7 @@ import { el } from "./dom";
 import { isAuthenticatedViewer } from "./api";
 import { DEFAULT_WINDOW_DAYS, HistoricalChartsPanel } from "./historicalChartsPanel";
 import { LiveFeedPanel } from "./liveFeedPanel";
+import { LivePanel } from "./livePanel";
 import { SpendPanel } from "./spendPanel";
 import { currentSurface } from "./analytics/bootstrap";
 import { mountTokenAnalytics } from "./analytics/render";
@@ -40,6 +41,7 @@ export const PANEL_STATUS: Readonly<Record<PanelRouteName, string>> = {
   tokens: "Token & cost analytics",
   spend: "Elastic compute spend",
   feed: "Live event feed",
+  live: "Live status board",
 };
 
 /** A mounted panel's teardown. Panels with no live resource return a no-op. */
@@ -159,16 +161,12 @@ function mountFeed(root: HTMLElement): PanelTeardown {
   root.replaceChildren(
     section(
       "Live event feed",
-      // Honest about the gap rather than rendering a silently-partial view:
-      // sweep.started/completed/outcome all flow today, but sweep.phase is
-      // never emitted (#4863), so phase transitions are missing and the
-      // per-sweep timeline has nothing to draw. Drop this note when #4863
-      // lands.
+      // The raw stream. The `#/live` board is the readable view of the same
+      // events; this one is for when you want every frame.
       el(
         "p",
-        { class: "panel-route__note", data: { testid: "feed-phase-caveat" } },
-        "Sweep lifecycle events as they arrive. Phase transitions are not shown yet — " +
-          "the daemon does not emit sweep.phase telemetry (see issue #4863).",
+        { class: "panel-route__note", data: { testid: "feed-note" } },
+        "Every telemetry event as it arrives, newest first. For a per-issue view with phases and labels, see Live.",
       ),
       feed,
     ),
@@ -186,11 +184,24 @@ function mountFeed(root: HTMLElement): PanelTeardown {
   return () => panel.stop();
 }
 
+function mountLive(root: HTMLElement): PanelTeardown {
+  const panel = new LivePanel({
+    container: root,
+    feedUrl: isAuthenticatedViewer() ? "/api/events" : "/public/events",
+  });
+  panel.start();
+
+  // Three live resources — the poll timer, the one-second tick, and the SSE
+  // connection — all released here.
+  return () => panel.stop();
+}
+
 const MOUNTERS: Readonly<Record<PanelRouteName, (root: HTMLElement) => PanelTeardown>> = {
   charts: mountCharts,
   tokens: mountTokens,
   spend: mountSpend,
   feed: mountFeed,
+  live: mountLive,
 };
 
 /** Mount `name` into `root`, replacing its contents. Returns the teardown. */

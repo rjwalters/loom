@@ -53,6 +53,7 @@ fn reaper_real_clean_exit_does_not_count_as_insta_crash() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     // Retain the handle (mirrors `dispatch()`'s `self.children.insert`) so
@@ -566,6 +567,7 @@ async fn reaper_emits_crashed_event_with_checkpoint_phase() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -655,6 +657,7 @@ async fn reaper_crashed_event_carries_classification() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -717,6 +720,7 @@ async fn reaper_emits_exited_event_for_clean_exit() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -775,6 +779,7 @@ fn reap_marks_dead_pid_exited_when_no_checkpoint() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -1017,6 +1022,7 @@ fn cancel_preserves_lock_and_skips_restore_when_superseded() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -1105,6 +1111,7 @@ fn cancel_skips_restore_when_forge_shows_a_newer_claim_from_another_host() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -1176,6 +1183,7 @@ fn reap_skips_restore_when_forge_shows_a_newer_claim_from_another_host() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -1241,6 +1249,7 @@ fn get_status_returns_clone_or_none() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -1284,6 +1293,7 @@ fn tail_log_returns_last_n_lines() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -1349,6 +1359,7 @@ fn cancel_on_already_terminal_is_idempotent_noop() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -1392,6 +1403,7 @@ fn cancel_dead_pid_transitions_to_exited_without_sigkill() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -1453,6 +1465,7 @@ fn cancel_escalates_to_sigkill_when_child_ignores_sigterm() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -1533,28 +1546,19 @@ fn split_cancel_does_not_hold_lock_across_grace_window() {
                 effort: None,
                 depends_on: None,
                 repo: None,
+                overflow: false,
             },
         );
+        // Same shape as the target, on another issue with a dead pid.
+        let target_info = reg.entries[&target].clone();
         reg.entries.insert(
             other.clone(),
             SweepInfo {
-                pgid: None,
                 sweep_id: other.clone(),
                 kind: SweepKind::Issue(881),
                 pid: 2_147_483_640, // ~i32::MAX, harmless dead pid
-                token_name: "unknown".into(),
-                runtime: "unknown".into(),
-                runtime_source: None,
                 log_path: other_log,
-                idempotency_key: None,
-                started_at: Utc::now(),
-                state: SweepState::Running,
-                latest_phase: None,
-                pr_number: None,
-                model: None,
-                effort: None,
-                depends_on: None,
-                repo: None,
+                ..target_info
             },
         );
     }
@@ -1656,6 +1660,7 @@ fn cancel_emits_exited_and_completed_events() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -1996,6 +2001,7 @@ fn reaper_reaps_the_surviving_group_of_a_dead_leader() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 
@@ -2109,6 +2115,7 @@ fn group_signalling_refuses_this_processs_own_group() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     assert!(
@@ -2593,6 +2600,7 @@ fn reap_dead_sweep_preserves_newer_sweep_lock_and_skips_resume() {
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 

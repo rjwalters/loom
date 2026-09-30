@@ -81,12 +81,12 @@ Agents coordinate through labels. See `.github/labels.yml` for full definitions.
 **Epic Lifecycle**: `loom:epic` → phased `loom:architect` + `loom:epic-phase`
 child issues.
 
-**Escape-hatch / status labels**: `loom:blocked` (implementation blocked, needs
-help), `loom:operator-only` (requires human action outside automation —
-credentials, infra, hardware; skipped by autonomous dispatch), `loom:abort`
-(signal to abort in-flight work for this issue, returns to `loom:issue`),
-`loom:urgent`. Priority axis: `tier:goal-advancing` / `tier:goal-supporting` /
-`tier:maintenance`.
+**Escape-hatch / status labels**: `loom:blocked` (needs help),
+`loom:operator-only` (human action outside automation: credentials, infra,
+hardware; dispatch skips it), `loom:abort` (abort in-flight work, returns to
+`loom:issue`). `loom:operator-priority`: the operator's star, land it first;
+human-only, not a hold. Priority axis: `tier:goal-advancing` /
+`tier:goal-supporting` / `tier:maintenance`.
 
 ### REST vs GraphQL for forge queries
 

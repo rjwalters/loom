@@ -644,7 +644,25 @@ fn merge_hook_commands(existing_entry: &mut Value, loom_entry: &Value) {
     }
 }
 
+/// Permission allow rules that earlier Loom releases shipped in
+/// `defaults/.claude/settings.json` and that have since been replaced.
+///
+/// These exact strings are Loom-authored, so they are dropped from a
+/// consumer's existing `permissions.allow` on merge (reinstall/update) and on
+/// uninstall. Only these exact strings are removed; user-authored rules are
+/// never touched.
+///
+/// - `Bash(./scripts/**:*)` / `Bash(./.loom/scripts/**:*)` (#9447): current
+///   Claude Code rejects `*` mixed with the trailing `:*` prefix syntax (the
+///   `**` is matched literally, so the rules never matched anything) and warns
+///   on every launch. Replaced by `Bash(./scripts/*)` / `Bash(./.loom/scripts/*)`.
+const LEGACY_LOOM_PERMISSIONS: &[&str] = &["Bash(./scripts/**:*)", "Bash(./.loom/scripts/**:*)"];
+
 /// Merge permissions, unioning the allow arrays.
+///
+/// Legacy Loom-shipped rules (see [`LEGACY_LOOM_PERMISSIONS`]) are dropped from
+/// the existing allow array before the union so a reinstall replaces them
+/// rather than keeping them alongside their successors.
 fn merge_permissions(
     existing: Option<&serde_json::Map<String, Value>>,
     loom: &serde_json::Map<String, Value>,
@@ -657,6 +675,11 @@ fn merge_permissions(
             .or_insert_with(|| Value::Array(Vec::new()));
 
         if let Some(existing_arr) = existing_allow.as_array_mut() {
+            existing_arr.retain(|v| {
+                !v.as_str()
+                    .is_some_and(|s| LEGACY_LOOM_PERMISSIONS.contains(&s))
+            });
+
             let existing_set: std::collections::HashSet<String> = existing_arr
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
@@ -731,19 +754,21 @@ pub fn remove_loom_hooks(settings: &mut Value) {
 
 /// Remove Loom-specific permissions from a settings.json value.
 ///
-/// Removes permissions that match Loom's default permission list exactly.
+/// Removes permissions that match Loom's default permission list exactly, plus
+/// the legacy Loom-shipped rules in [`LEGACY_LOOM_PERMISSIONS`].
 #[allow(dead_code)]
 pub fn remove_loom_permissions(settings: &mut Value, loom_defaults: &Value) {
-    let Some(loom_perms) = loom_defaults
+    let loom_perms = loom_defaults
         .get("permissions")
         .and_then(|p| p.get("allow"))
-        .and_then(|a| a.as_array())
-    else {
-        return;
-    };
+        .and_then(|a| a.as_array());
 
-    let loom_perm_set: std::collections::HashSet<&str> =
-        loom_perms.iter().filter_map(|v| v.as_str()).collect();
+    let loom_perm_set: std::collections::HashSet<&str> = loom_perms
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .chain(LEGACY_LOOM_PERMISSIONS.iter().copied())
+        .collect();
 
     let Some(allow) = settings
         .get_mut("permissions")
@@ -1525,3 +1550,8 @@ mod tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod agent_skills_tests;
+
+// Sibling module for the same file-size-ratchet reason as `agent_skills_tests`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod legacy_permissions_tests;

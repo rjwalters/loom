@@ -220,6 +220,10 @@ pub fn classify(outcome: &RoleTickOutcome) -> (RoleTickResult, Option<String>) {
             RoleTickResult::SkippedLoad,
             Some(format!("load-skipped[{load_per_core:.2}]: {detail}")),
         ),
+        // #9391: the queue gate found nothing to do — never spawned.
+        RoleTickOutcome::QueueEmpty => {
+            (RoleTickResult::SkippedQueueEmpty, Some("queue-empty".to_string()))
+        }
     }
 }
 
@@ -453,6 +457,9 @@ pub fn scan_transcripts_with_targets(
     let mut actions = RoleTickActions::default();
     let mut targets = BTreeSet::new();
     let mut read_any = false;
+    // One fold across every transcript: deduped on `message.id` per scan, not
+    // per file (#8186, #9303, #9315).
+    let mut fold = crate::script_helpers::transcript_usage::UsageFold::default();
 
     for path in transcripts {
         if std::fs::metadata(path)
@@ -475,23 +482,12 @@ pub fn scan_transcripts_with_targets(
                 continue;
             };
             tally_record_actions(&obj, &mut actions, &mut session, &mut targets);
-            let Some(rec) = crate::script_helpers::transcript_usage::usage_from_record(&obj) else {
-                continue;
-            };
-            let key = (rec.model.clone(), rec.speed.clone(), rec.service_tier.clone());
-            let entry = totals.entry(key).or_insert_with(|| ModelUsageTotals {
-                model: rec.model,
-                speed: rec.speed,
-                service_tier: rec.service_tier,
-                ..ModelUsageTotals::default()
-            });
-            entry.input += rec.input;
-            entry.cache_read += rec.cache_read;
-            entry.cache_write_5m += rec.cache_write_5m;
-            entry.cache_write_1h += rec.cache_write_1h;
-            entry.output += rec.output;
+            if let Some(rec) = crate::script_helpers::transcript_usage::usage_from_record(&obj) {
+                fold.add(rec);
+            }
         }
     }
+    crate::script_helpers::transcript_usage::merge_rows(&mut totals, fold.rows());
 
     // `None` — never a zeroed scan — when no transcript was readable at all.
     // That is the difference between "this tick did nothing observable" and
@@ -725,6 +721,11 @@ fn emit_correlated(
     // The launch record's runtime, else the resolved-runtime marker (#8594);
     // absent (unknown, never guessed) for a Claude tick with neither.
     let story_runtime = usage_runtime.clone().flatten();
+    // #9303: the tick's per-model usage, kept for its usage spans below.
+    let tokens_by_model = scan
+        .as_ref()
+        .map(|scan| scan.tokens_by_model.clone())
+        .filter(|rows| !rows.is_empty());
     let record = build_record(tick, repo, visibility, scan);
     let record = apply_runtime_attribution(record, runtime_attribution);
     let path = crate::sweep_outcomes::default_role_tick_telemetry_path(&tick.root);
@@ -744,6 +745,30 @@ fn emit_correlated(
     }
     // #9168: join the story of every issue/PR this tick wrote to — after the
     // durable record, so a slow forge lookup can never cost the tick record.
+    if let (Some(trace), Some(rows)) = (&trace, &tokens_by_model) {
+        usage::journal_execution(
+            &tick.root,
+            trace,
+            &tick.role,
+            tick.ended_at,
+            story_runtime.as_deref(),
+            rows,
+        );
+    }
+    // #9231: the tick's terminal transition, mirroring
+    // `runtime_usage::finish_sweep` — the usage spans above, then the close of
+    // the join entry `lifecycle::role_invocation` opened at dispatch.
+    // Unconditional on usage being known: an entry left open because the tick
+    // spent nothing would keep matching every later session of this role for
+    // the full `RETAIN_OPEN_HOURS` window, which is exactly the ambiguity
+    // #9013 item 3 bounded for sweeps.
+    if let Some(trace) = &trace {
+        crate::observability::runtime_usage::join::close(
+            &tick.root,
+            &trace.execution,
+            tick.ended_at,
+        );
+    }
     if let (Some(trace), Some(targets)) = (trace, targets) {
         let facts = story::TickFacts {
             trace,
@@ -752,6 +777,7 @@ fn emit_correlated(
             result: result_label(tick.result),
             runtime: story_runtime,
             model: tick.model.clone(),
+            tokens_by_model,
         };
         story::emit(&tick.root, &facts, &targets);
     }
@@ -769,6 +795,7 @@ pub fn result_label(result: RoleTickResult) -> String {
 
 pub mod story;
 pub mod targets;
+pub mod usage;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

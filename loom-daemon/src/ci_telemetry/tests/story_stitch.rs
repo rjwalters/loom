@@ -117,6 +117,19 @@ impl GithubApi for StoryApi {
         self.inner.get_document(path)
     }
 
+    /// Forwarded so a stitched cycle emits the same suite spans (#9089) an
+    /// unstitched one does — the "a story trace never carries suite spans"
+    /// assertion below is only meaningful if the spans exist at all.
+    fn download_artifact(
+        &self,
+        repo: &str,
+        run_id: u64,
+        name: &str,
+        dest: &std::path::Path,
+    ) -> Result<(), ApiError> {
+        self.inner.download_artifact(repo, run_id, name, dest)
+    }
+
     fn graphql(&self, query: &str) -> Result<ApiResponse, ApiError> {
         self.graphql_calls.lock().unwrap().push(query.to_string());
         if self.graphql_refuses {
@@ -408,6 +421,31 @@ fn story_span_attributes_are_all_inside_the_telemetry_allowlist() {
             assert!(span_keep.contains(key), "collector span keep_keys lacks {key}");
         }
     }
+}
+
+/// #9337: the story copy is a clone of the per-run span, so the trigger
+/// attribution (and the run attempt) reach the story trace untouched.
+#[test]
+fn the_story_copy_carries_the_runs_trigger_reason() {
+    let dir = TempDir::new().unwrap();
+    // beta 2002's fixture head commit is the #8508 re-date subject.
+    let api = StoryApi::new().run("beta", 2002, set_branch("feature/issue-9027"));
+    run_cycle(&stitching(dir.path()), &api).unwrap();
+    let copy = story_spans(dir.path())
+        .into_iter()
+        .find(|s| s.name == SpanName::CiRun)
+        .unwrap();
+    assert_eq!(copy.attributes["loom.ci.trigger_reason"], "stale_main_bump");
+    assert_eq!(copy.attributes["loom.ci.run_attempt"], "1");
+    let per_run = spans(dir.path())
+        .into_iter()
+        .find(|s| {
+            s.name == SpanName::CiRun
+                && !s.attributes.contains_key("loom.story")
+                && s.attributes["loom.ci.run_id"] == "2002"
+        })
+        .unwrap();
+    assert_eq!(per_run.attributes["loom.ci.trigger_reason"], "stale_main_bump");
 }
 
 // ---------------------------------------------------------------------------

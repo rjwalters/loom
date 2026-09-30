@@ -209,7 +209,7 @@ The Doctor dwells in the space between creation and approval, transforming feedb
 - "I guide the team toward what matters most"
 
 **In the System**:
-The Guide walks among all open issues, continuously assessing priorities and guiding the team's focus. They manage the `loom:urgent` label, ensuring the top 3 most critical issues are always clearly marked. In Loom, Guide runs autonomously every 15 minutes, re-evaluating priorities as the project evolves.
+The Guide walks among all open issues, continuously assessing priorities and guiding the team's focus. They keep the backlog tiered, unblocked and documented; the one priority signal, the operator's star, stays in human hands. In Loom, Guide runs autonomously every 15 minutes, re-evaluating priorities as the project evolves.
 
 ---
 

@@ -43,8 +43,54 @@ use super::{accumulate_observed, repo_label, HealthInputs, HealthSection, Verdic
 /// above), none of these failure paths can themselves flip the exit code —
 /// that would reintroduce the exact problem `EXIT_INDETERMINATE_BUSY`
 /// (#6191) exists to keep a non-fault state off the fault exit code for.
+///
+/// # Starred issues (#9244 C)
+///
+/// The daemon's starred-issue liveness pass rides along: every starred issue
+/// escalated to the operator (with its one concrete ask) is appended to the
+/// summary and listed under `detail.starred_needs_operator`. Still Green.
 #[must_use]
 pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
+    let mut section = assess_forge_holds(inputs);
+    let Some(report) = inputs
+        .status
+        .as_ref()
+        .and_then(|s| s.operator_priority_landing.as_ref())
+    else {
+        return section;
+    };
+    let asks: Vec<serde_json::Value> = report
+        .needs_operator()
+        .map(|r| {
+            serde_json::json!({
+                "repo": r.repo,
+                "issue": r.issue,
+                "stage": r.stage.as_str(),
+                "kind": r.ask.as_ref().map(|a| a.kind.as_str()),
+                "ask": r.ask.as_ref().map(|a| a.text.as_str()),
+                "inherited_from": r.inherited_from,
+            })
+        })
+        .collect();
+    if !asks.is_empty() {
+        section.summary.push_str(&format!(
+            "; {} starred issue(s) need you: {}",
+            asks.len(),
+            report
+                .needs_operator()
+                .map(|r| format!("{}#{}", r.repo, r.issue))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(obj) = section.detail.as_object_mut() {
+        obj.insert("starred_tracked".into(), report.rows.len().into());
+        obj.insert("starred_needs_operator".into(), serde_json::Value::Array(asks));
+    }
+    section
+}
+
+fn assess_forge_holds(inputs: &HealthInputs) -> HealthSection {
     if let Some(gh) = &inputs.gh_unavailable {
         return HealthSection::new(
             "operator_attention",
@@ -376,6 +422,60 @@ mod tests {
             EXIT_HEALTHY,
             "an operator-attention read failure alone must not degrade the exit code"
         );
+    }
+
+    /// #9244 C: starred escalations are listed, and the section stays Green
+    /// (the exit code is unchanged by them).
+    #[test]
+    fn starred_escalations_are_listed_and_stay_green() {
+        use crate::types::{
+            AskKind, LandingStage, OperatorAsk, StarLandingRow, StarLivenessReport,
+        };
+        let mut inputs = crate::health::tests::healthy_inputs();
+        let row = StarLandingRow {
+            repo: "o/r".into(),
+            issue: 8256,
+            stage: LandingStage::NeedsOperator,
+            next_actor: "operator".into(),
+            stage_since: None,
+            time_in_stage_secs: 0,
+            pr: Some(8314),
+            blocked_by: None,
+            no_capacity: None,
+            ask: Some(OperatorAsk {
+                kind: AskKind::OperatorDecision,
+                key: "operator-decision:pr-8314".into(),
+                text: "decide".into(),
+            }),
+            inherited_from: None,
+            operator_priority_at: None,
+            last_progress_at: None,
+        };
+        let quiet = StarLandingRow {
+            issue: 1,
+            stage: LandingStage::Building,
+            ask: None,
+            ..row.clone()
+        };
+        if let Some(status) = inputs.status.as_mut() {
+            status.operator_priority_landing = Some(StarLivenessReport {
+                rows: vec![row, quiet],
+                ..StarLivenessReport::default()
+            });
+        }
+        let report = assess(&inputs);
+        let section = report.section("operator_attention").unwrap();
+        assert_eq!(section.verdict, Verdict::Green);
+        assert!(
+            section
+                .summary
+                .contains("1 starred issue(s) need you: o/r#8256"),
+            "{}",
+            section.summary
+        );
+        assert_eq!(section.detail["starred_tracked"], 2);
+        assert_eq!(section.detail["starred_needs_operator"][0]["kind"], "operator-decision");
+        assert_eq!(report.exit_code(), EXIT_HEALTHY, "{}", report.render_human());
     }
 
     /// Zero managed repos is `0 held, 0 operator-only`, not a crash or `?`.

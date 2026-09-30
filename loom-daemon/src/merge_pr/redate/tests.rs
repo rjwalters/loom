@@ -60,6 +60,28 @@ fn commit_message_is_deterministic() {
 }
 
 #[test]
+fn the_redate_subject_classifier_recognizes_exactly_what_commit_message_writes() {
+    // Producer and classifier (#9337's `stale_main_bump`) must not drift.
+    for pr in ["123", "8493", "1"] {
+        let msg = commit_message(pr);
+        assert!(is_redate_commit_subject(msg.lines().next().unwrap()), "{msg}");
+    }
+    for near_miss in [
+        "chore: re-date required checks for PR #123",
+        "chore: re-date required checks for PR # (#8248 guard, automated by #8508)",
+        "chore: re-date required checks for PR #12a (#8248 guard, automated by #8508)",
+        "chore: re-date required checks for PR #123 (#8248 guard, automated by #8508) ",
+        " chore: re-date required checks for PR #123 (#8248 guard, automated by #8508)",
+        "fix: something else (#123)",
+        "",
+    ] {
+        assert!(!is_redate_commit_subject(near_miss), "{near_miss:?}");
+    }
+    // Only the first line is a subject; a whole message is not.
+    assert!(!is_redate_commit_subject(&commit_message("123")));
+}
+
+#[test]
 fn remedy_outcome_variants_are_distinct() {
     // Guards against a match-arm regression collapsing the outcomes — callers
     // branch on all four (HeadMoved = re-queue silently, Pushed = report and

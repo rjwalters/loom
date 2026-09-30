@@ -569,6 +569,7 @@ pub(crate) fn insert_clean_exit_running(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     registry.children.insert(sweep_id.clone(), child);
@@ -686,6 +687,7 @@ pub(crate) fn insert_running_at(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     sweep_id
@@ -726,6 +728,7 @@ pub(crate) fn insert_running_with_pid_at(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     sweep_id
@@ -790,6 +793,7 @@ pub(crate) fn insert_dead_running_at(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
     sweep_id
@@ -1276,6 +1280,7 @@ pub(crate) fn insert_terminal_issue(
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 }
@@ -2035,10 +2040,12 @@ pub(crate) fn collision_dispatch_registry(
 
 /// Install a fake `gh` that models a shared forge-side lease-comment store
 /// for the claim-then-verify-order tie-break (Issue #6287): `gh issue
-/// comment <n> --body ...` appends a `{id, created_at, body}` record (`id`
-/// assigned as `existing_count + 1`, mirroring a real forge's monotonic
-/// comment ids); `gh api repos/.../issues/<n>/comments ...` reads the whole
-/// store back as NDJSON (one `{id, created_at, body}` object per line, no
+/// comment <n> --body ...` appends a `{id, created_at, updated_at, body}`
+/// record (`id` assigned as `existing_count + 1`, mirroring a real forge's
+/// monotonic comment ids, and `updated_at == created_at` on creation
+/// exactly as a real forge assigns them);
+/// `gh api repos/.../issues/<n>/comments ...` reads the whole
+/// store back as NDJSON (one `{id, created_at, updated_at, body}` object per line, no
 /// enclosing array), exactly like
 /// [`super::guards::SweepRegistry::read_lease_comments`]'s real `--jq`
 /// filter would (every stored record already carries the lease marker
@@ -2062,9 +2069,9 @@ pub(crate) fn lease_order_dispatch_registry(
         for (idx, marker) in other_lease_markers.iter().enumerate() {
             let id = idx + 1;
             let escaped = marker.replace('\\', "\\\\").replace('"', "\\\"");
+            let now = Utc::now().to_rfc3339();
             seeded.push_str(&format!(
-                "{{\"id\":{id},\"created_at\":\"{}\",\"body\":\"{escaped}\"}}\n",
-                Utc::now().to_rfc3339(),
+                "{{\"id\":{id},\"created_at\":\"{now}\",\"updated_at\":\"{now}\",\"body\":\"{escaped}\"}}\n",
             ));
         }
         std::fs::write(&comments_store, seeded).unwrap();
@@ -2080,7 +2087,7 @@ pub(crate) fn lease_order_dispatch_registry(
              [[ -z \"$count\" ]] && count=0\n\
              id=$((count + 1))\n\
              now=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n\
-             printf '{{\"id\":%d,\"created_at\":\"%s\",\"body\":\"%s\"}}\\n' \"$id\" \"$now\" \"$esc\" >> \"{store}\"\n\
+             printf '{{\"id\":%d,\"created_at\":\"%s\",\"updated_at\":\"%s\",\"body\":\"%s\"}}\\n' \"$id\" \"$now\" \"$now\" \"$esc\" >> \"{store}\"\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
@@ -2352,6 +2359,7 @@ pub(crate) fn insert_dead_running_entry(reg: &mut SweepRegistry, issue: u32, swe
             effort: None,
             depends_on: None,
             repo: None,
+            overflow: false,
         },
     );
 }

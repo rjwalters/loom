@@ -1017,14 +1017,22 @@ describe("GET /public/history vs GET /api/history — end-to-end redaction", () 
       const publicResponse = await callWorker(new Request("https://ingest.example/public/history"));
       const publicText = await publicResponse.text();
       expect(publicText).not.toContain("rjwalters/loom");
-      expect(publicText).not.toContain("4703");
+      // The issue number survives redaction as `"issue":null` (the value is
+      // nulled, the key kept), so anchor on a non-null value instead of a
+      // bare digit substring — bare digits collide with wall-clock
+      // `ingestedAt` milliseconds and row ids (#9021, merge train #9020).
+      expect(publicText).not.toMatch(/"issue"\s*:\s*4703\b/);
       expect(publicText).not.toContain("sweep-issue-4703-0");
       if (kind === "sweep.outcome") {
-        expect(publicText).not.toContain("4710"); // pr_number
-        // Issue #5357 work-output fields: same private-only treatment.
-        expect(publicText).not.toContain("48213"); // tokens_in
-        expect(publicText).not.toContain("6120"); // tokens_out
-        expect(publicText).not.toContain("214"); // lines_added
+        // Issue #5357 work-output fields: same private-only treatment. The
+        // allowlist drops these keys entirely, so anchor on the key itself —
+        // that catches the leak whatever the value, and (unlike the bare
+        // `not.toContain("<digits>")` forms this replaces) can never match a
+        // timestamp's millisecond digits (#9021, merge train #9020).
+        expect(publicText).not.toMatch(/"pr_number"\s*:/); // pr_number
+        expect(publicText).not.toMatch(/"tokens_in"\s*:/); // tokens_in
+        expect(publicText).not.toMatch(/"tokens_out"\s*:/); // tokens_out
+        expect(publicText).not.toMatch(/"lines_added"\s*:/); // lines_added
         // lines_deleted (37) is too short/common a substring to assert
         // absence of textually — covered precisely by the unit tests above.
       }

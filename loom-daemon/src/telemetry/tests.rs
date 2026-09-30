@@ -14,6 +14,7 @@ mod kind_registry;
 mod role_tick;
 mod session_analysis;
 mod session_summary;
+mod story_points;
 mod token_snapshot;
 use role_tick::role_tick_outcome;
 use token_snapshot::tokens_snapshot;
@@ -31,6 +32,7 @@ pub(super) fn ts() -> DateTime<Utc> {
 
 fn sweep_started() -> TelemetryRecord {
     TelemetryRecord::SweepStarted(SweepStartedRecord {
+        story_points: None,
         repo: "rjwalters/loom".to_string(),
         visibility: RepoVisibility::Public,
         issue: 4703,
@@ -55,7 +57,7 @@ fn sweep_phase() -> TelemetryRecord {
 
 fn sweep_completed() -> TelemetryRecord {
     TelemetryRecord::SweepCompleted(SweepCompletedRecord {
-        repo: "rjwalters/loom".to_string(),
+        repo: Some("rjwalters/loom".to_string()),
         visibility: RepoVisibility::Public,
         issue: 4703,
         sweep_id: "sweep-issue-4703-0".to_string(),
@@ -74,11 +76,13 @@ fn sweep_completed() -> TelemetryRecord {
     })
 }
 
-fn sweep_outcome() -> TelemetryRecord {
+pub(super) fn sweep_outcome() -> TelemetryRecord {
     let mut config = std::collections::BTreeMap::new();
     config.insert("runtime".to_string(), "claude".to_string());
     TelemetryRecord::SweepOutcome(SweepOutcomeRecord {
-        repo: "rjwalters/loom".to_string(),
+        story_points: None,
+        repo: Some("rjwalters/loom".to_string()),
+        repo_unresolved: false,
         visibility: RepoVisibility::Public,
         issue: 4703,
         sweep_id: "sweep-issue-4703-0".to_string(),
@@ -86,17 +90,12 @@ fn sweep_outcome() -> TelemetryRecord {
         effort: Some("high".to_string()),
         config,
         phase_durations: vec![
-            PhaseDuration {
-                phase: "curator".to_string(),
-                duration_sec: 12,
-            },
-            PhaseDuration {
-                phase: "builder".to_string(),
-                duration_sec: 340,
-            },
+            PhaseDuration::new("curator".to_string(), 12),
+            PhaseDuration::new("builder".to_string(), 340),
         ],
         total_duration_sec: 512,
         result: SweepResult::Success,
+        disposition: SweepDisposition::Landed,
         pr_number: Some(4710),
         tokens_in: Some(48_213),
         tokens_out: Some(6_120),
@@ -112,6 +111,7 @@ fn sweep_outcome() -> TelemetryRecord {
             cache_write_1h: 1_500,
             output: 6_120,
         }]),
+        tokens_unattributed: None,
         failure_class: None,
         models_used: Some(vec!["claude-sonnet-5".to_string()]),
         doctor_cycles: Some(0),
@@ -123,6 +123,18 @@ fn sweep_outcome() -> TelemetryRecord {
         provider: Some("friendli".to_string()),
         profile: Some("zai-flash".to_string()),
         complexity: Some("routine".to_string()),
+        tokens_status: None,
+        tokens_status_reason: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
+        pr_numbers: None,
+        hw_lines_added: None,
+        hw_lines_deleted: None,
+        hw_files: None,
+        generated_lines: None,
+        test_lines: None,
     })
 }
 
@@ -145,10 +157,12 @@ fn host_health() -> TelemetryRecord {
             ManagedRepoEntry {
                 slug: "rjwalters/loom".to_string(),
                 visibility: RepoVisibility::Public,
+                priority: Some(0),
             },
             ManagedRepoEntry {
                 slug: "2AMLogic/gf180-pll".to_string(),
                 visibility: RepoVisibility::Private,
+                priority: None,
             },
         ],
         roles: RoleTickHealth {
@@ -231,7 +245,9 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
     // sampled, so all four must be entirely absent from the wire
     // payload — never `null` or a fabricated `0`.
     let record = SweepOutcomeRecord {
-        repo: "rjwalters/loom".to_string(),
+        story_points: None,
+        repo: Some("rjwalters/loom".to_string()),
+        repo_unresolved: false,
         visibility: RepoVisibility::Private,
         issue: 5357,
         sweep_id: "sweep-issue-5357-0".to_string(),
@@ -241,12 +257,14 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         phase_durations: Vec::new(),
         total_duration_sec: 40,
         result: SweepResult::Failure,
+        disposition: SweepDisposition::EnvFailure,
         pr_number: None,
         tokens_in: None,
         tokens_out: None,
         lines_added: None,
         lines_deleted: None,
         tokens_by_model: None,
+        tokens_unattributed: None,
         failure_class: None,
         models_used: None,
         doctor_cycles: None,
@@ -255,6 +273,18 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         provider: None,
         profile: None,
         complexity: None,
+        tokens_status: None,
+        tokens_status_reason: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
+        pr_numbers: None,
+        hw_lines_added: None,
+        hw_lines_deleted: None,
+        hw_files: None,
+        generated_lines: None,
+        test_lines: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     for field in [
@@ -341,7 +371,9 @@ fn sweep_outcome_from_a_pre_5357_daemon_still_decodes() {
 #[test]
 fn sweep_outcome_round_trips_the_completeness_fields() {
     let record = SweepOutcomeRecord {
-        repo: "rjwalters/loom".to_string(),
+        story_points: None,
+        repo: Some("rjwalters/loom".to_string()),
+        repo_unresolved: false,
         visibility: RepoVisibility::Public,
         issue: 8056,
         sweep_id: "sweep-issue-8056-0".to_string(),
@@ -351,12 +383,14 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         phase_durations: Vec::new(),
         total_duration_sec: 900,
         result: SweepResult::Success,
+        disposition: SweepDisposition::Landed,
         pr_number: Some(8100),
         tokens_in: None,
         tokens_out: None,
         lines_added: None,
         lines_deleted: None,
         tokens_by_model: None,
+        tokens_unattributed: None,
         failure_class: Some("account-exhausted:model-credits-exhausted".to_string()),
         models_used: Some(vec!["claude-opus-5".to_string(), "claude-sonnet-5".to_string()]),
         doctor_cycles: Some(2),
@@ -374,6 +408,18 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         provider: None,
         profile: None,
         complexity: Some("complex".to_string()),
+        tokens_status: None,
+        tokens_status_reason: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
+        pr_numbers: None,
+        hw_lines_added: None,
+        hw_lines_deleted: None,
+        hw_files: None,
+        generated_lines: None,
+        test_lines: None,
     };
     let value = serde_json::to_value(&record).unwrap();
     assert_eq!(value["complexity"], "complex");
@@ -398,7 +444,9 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
     // (#8057's doctor-phase rate) would silently count the second as the
     // first.
     let base = SweepOutcomeRecord {
-        repo: "rjwalters/loom".to_string(),
+        story_points: None,
+        repo: Some("rjwalters/loom".to_string()),
+        repo_unresolved: false,
         visibility: RepoVisibility::Private,
         issue: 8056,
         sweep_id: "sweep-issue-8056-1".to_string(),
@@ -408,12 +456,14 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         phase_durations: Vec::new(),
         total_duration_sec: 10,
         result: SweepResult::Failure,
+        disposition: SweepDisposition::Unknown,
         pr_number: None,
         tokens_in: None,
         tokens_out: None,
         lines_added: None,
         lines_deleted: None,
         tokens_by_model: None,
+        tokens_unattributed: None,
         failure_class: None,
         models_used: None,
         doctor_cycles: None,
@@ -422,6 +472,18 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         provider: None,
         profile: None,
         complexity: None,
+        tokens_status: None,
+        tokens_status_reason: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
+        pr_numbers: None,
+        hw_lines_added: None,
+        hw_lines_deleted: None,
+        hw_files: None,
+        generated_lines: None,
+        test_lines: None,
     };
 
     let unobserved = serde_json::to_value(&base).unwrap();
@@ -431,6 +493,9 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         "doctor_cycles",
         "judge_verdicts",
         "complexity",
+        // Issue #9432: an unsized issue carries NO `story_points` key — a `0`
+        // would claim the Curator sized it at nothing.
+        "story_points",
     ] {
         assert!(
             unobserved.get(field).is_none(),
@@ -489,6 +554,9 @@ fn sweep_outcome_from_a_pre_8056_daemon_still_decodes() {
             assert_eq!(r.doctor_cycles, None);
             assert_eq!(r.judge_verdicts, None);
             assert_eq!(r.complexity, None);
+            // Issue #9432: a pre-story-points record decodes with no size,
+            // which reads as "nobody sized this issue" — not as size 0.
+            assert_eq!(r.story_points, None);
         }
         other => panic!("expected SweepOutcome, got {other:?}"),
     }
@@ -522,7 +590,7 @@ fn sweep_completed_carries_tokens_by_model_when_present() {
 #[test]
 fn sweep_completed_omits_tokens_by_model_when_absent() {
     let record = SweepCompletedRecord {
-        repo: "rjwalters/loom".to_string(),
+        repo: Some("rjwalters/loom".to_string()),
         visibility: RepoVisibility::Private,
         issue: 6384,
         sweep_id: "sweep-issue-6384-0".to_string(),
@@ -779,6 +847,10 @@ fn host_health_serializes_managed_repos_with_slug_and_visibility() {
             .and_then(serde_json::Value::as_str),
         Some("private")
     );
+    // #9244: a registered repo's dispatch priority ships; an unknown one is
+    // omitted.
+    assert_eq!(repos[0]["priority"], 0);
+    assert!(repos[1].get("priority").is_none());
 }
 
 #[test]
@@ -810,6 +882,27 @@ fn managed_repo_entry_with_missing_visibility_defaults_to_private() {
     let decoded: ManagedRepoEntry = serde_json::from_str(json).unwrap();
     assert_eq!(decoded.visibility, RepoVisibility::Private);
     assert_eq!(decoded.slug, "owner/repo");
+    // No `priority` either (an older daemon): it decodes as absent.
+    assert_eq!(decoded.priority, None);
+}
+
+#[test]
+fn managed_repo_entry_priority_is_on_the_wire_only_when_known() {
+    // #9244 / loom-ui#153: `priority` ships for a registered workspace and is
+    // omitted (never a fabricated default) for one that is not.
+    let known = ManagedRepoEntry {
+        slug: "rjwalters/loom".to_string(),
+        visibility: RepoVisibility::Public,
+        priority: Some(0),
+    };
+    let wire = serde_json::to_value(&known).unwrap();
+    assert_eq!(wire["priority"], 0);
+    let unknown = ManagedRepoEntry {
+        priority: None,
+        ..known
+    };
+    let wire = serde_json::to_value(&unknown).unwrap();
+    assert!(wire.get("priority").is_none(), "{wire}");
 }
 
 // ------------------------------------------------------------------
@@ -949,4 +1042,108 @@ fn host_health_from_a_pre_5352_daemon_decodes_with_protection_absent() {
         }
         other => panic!("expected HostHealth, got {other:?}"),
     }
+}
+
+#[test]
+fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
+    // Issue #9442: `repo` is ALWAYS an `owner/name` forge slug, never a local
+    // path. A resolved record carries `repo` and does NOT carry
+    // `repo_unresolved` (byte-compatible with a pre-#9442 record); an
+    // unresolved one omits `repo` entirely and stamps `repo_unresolved: true`
+    // — the gap is counted, never papered over with a host path.
+    let resolved = SweepOutcomeRecord {
+        story_points: None,
+        repo: Some("rjwalters/loom".to_string()),
+        repo_unresolved: false,
+        visibility: RepoVisibility::Public,
+        issue: 9442,
+        sweep_id: "sweep-issue-9442-0".to_string(),
+        model: None,
+        effort: None,
+        config: std::collections::BTreeMap::new(),
+        phase_durations: Vec::new(),
+        total_duration_sec: 60,
+        result: SweepResult::Success,
+        // #9441: a clean, short, PR-less, phase-less run is the no-op
+        // re-dispatch shape — the one `result: success` alone cannot express.
+        disposition: SweepDisposition::NoopAlreadyDone,
+        pr_number: None,
+        tokens_in: None,
+        tokens_out: None,
+        lines_added: None,
+        lines_deleted: None,
+        tokens_by_model: None,
+        tokens_unattributed: None,
+        failure_class: None,
+        models_used: None,
+        doctor_cycles: None,
+        judge_verdicts: None,
+        runtime: None,
+        provider: None,
+        profile: None,
+        complexity: None,
+        tokens_status: None,
+        tokens_status_reason: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
+        pr_numbers: None,
+        hw_lines_added: None,
+        hw_lines_deleted: None,
+        hw_files: None,
+        generated_lines: None,
+        test_lines: None,
+    };
+    let value = serde_json::to_value(&resolved).unwrap();
+    assert_eq!(value["repo"], "rjwalters/loom");
+    assert!(
+        value.get("repo_unresolved").is_none(),
+        "a resolved record must not carry the unresolved flag: {value}"
+    );
+    let decoded: SweepOutcomeRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded, resolved);
+
+    let unresolved = SweepOutcomeRecord {
+        repo: None,
+        repo_unresolved: true,
+        ..resolved.clone()
+    };
+    let value = serde_json::to_value(&unresolved).unwrap();
+    assert!(
+        value.get("repo").is_none(),
+        "an unresolved record must OMIT repo, never null, never a path: {value}"
+    );
+    assert_eq!(value["repo_unresolved"], true);
+    let decoded: SweepOutcomeRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded, unresolved);
+
+    // A pre-#9442 line — a plain string `repo`, no flag — still parses; its
+    // `repo_unresolved` defaults to false. (Historical lines with path-shaped
+    // repos keep their values; the fix is at the emitters, not the readers.)
+    let legacy: SweepOutcomeRecord = serde_json::from_value(serde_json::json!({
+        "visibility": "public",
+        "issue": 9441,
+        "sweep_id": "sweep-issue-9441-0",
+        "total_duration_sec": 10,
+        "result": "failure",
+        "repo": "/Users/someone/GitHub/somewhere"
+    }))
+    .unwrap();
+    assert_eq!(legacy.repo.as_deref(), Some("/Users/someone/GitHub/somewhere"));
+    assert!(!legacy.repo_unresolved);
+}
+
+#[test]
+fn is_path_shaped_repo_flags_paths_and_empty_only() {
+    // Issue #9442's one predicate, shared by the journal emitter and the
+    // event-bus collector.
+    assert!(super::is_path_shaped_repo("/Users/someone/GitHub/repo"));
+    assert!(super::is_path_shaped_repo("/home/ubuntu/workspaces/repo"));
+    assert!(super::is_path_shaped_repo(""));
+    assert!(!super::is_path_shaped_repo("rjwalters/loom"));
+    assert!(!super::is_path_shaped_repo("2AMLogic/2am"));
+    // A relative workspace name is not an absolute host path; it is also not
+    // a slug, but the predicate's job is only to catch the leak shape.
+    assert!(!super::is_path_shaped_repo("issue-9442"));
 }

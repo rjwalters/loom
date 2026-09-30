@@ -78,12 +78,13 @@ fn tick_capped<const N: usize>(
     tick_multi_with_repo_cap(
         workspaces,
         priorities,
-        max_concurrent,
+        max_concurrent.into(),
         &[false; N],
         usize::MAX,
         false,
         None,
         max_concurrent_per_repo,
+        &[],
     )
 }
 
@@ -354,10 +355,8 @@ fn shape_queue_never_adds_or_drops_a_candidate() {
     let cand = |idx: usize, number: u32| PriorityCandidate {
         workspace_idx: idx,
         workspace_priority: 0,
-        urgent: false,
-        created_at: None,
         number,
-        complexity: None,
+        ..PriorityCandidate::default()
     };
     let candidates = vec![cand(0, 1), cand(1, 2), cand(0, 3)];
     let mut report = TickReport::default();
@@ -476,10 +475,8 @@ fn a_missing_occupancy_entry_fails_open() {
     let cand = PriorityCandidate {
         workspace_idx: 7,
         workspace_priority: 0,
-        urgent: false,
-        created_at: None,
         number: 1,
-        complexity: None,
+        ..PriorityCandidate::default()
     };
     let mut report = TickReport::default();
     assert!(!cap.defer(&cand, &mut report), "an unseeded workspace is not at any cap");
@@ -498,4 +495,93 @@ fn the_single_workspace_tick_is_unaffected() {
 
     assert_eq!(report.dispatched, 3);
     assert_eq!(report.deferred_repo_cap, 0);
+}
+
+// ===================================================================
+// Dispatch plan (Issue #9288) — the recorded order is the real order
+// ===================================================================
+
+/// `plan_order` is the shaped order pass 2 iterated: under a preferred slice
+/// AND a per-repo cap, the `dispatch()` calls the tick made are exactly
+/// `plan_order` minus the repo-capped deferrals, in the same order — and the
+/// published `position` follows `plan_order`, not the comparator `rank`.
+#[test]
+fn plan_order_is_the_dispatch_order_under_slice_and_cap() {
+    let mut workspaces = [
+        (OneShotSource::of(&[1, 2]), CapDispatcher::default()),
+        // Hot: one live sweep, so affinity floats it ahead of workspace 0.
+        (OneShotSource::of(&[5, 6]), CapDispatcher::holding(1)),
+        // Out of this host's slice.
+        (OneShotSource::of(&[9]), CapDispatcher::default()),
+    ];
+    let slice = [true, true, false];
+    let report = tick_multi_with_repo_cap(
+        &mut workspaces,
+        &[10, 20, 30],
+        10.into(),
+        &[false; 3],
+        usize::MAX,
+        false,
+        Some(&slice),
+        Some(2),
+        &[],
+    );
+
+    assert_eq!(report.plan_order, vec![(1, 5), (1, 6), (0, 1), (0, 2)]);
+    let calls: Vec<(usize, u32)> = report
+        .admissions
+        .iter()
+        .map(|a| (a.workspace_idx, a.issue))
+        .collect();
+    assert_eq!(calls, vec![(1, 5), (0, 1), (0, 2)], "#6 hit its repo's cap of 2");
+    let capped: Vec<(usize, u32)> = report
+        .queue
+        .iter()
+        .filter(|r| r.disposition == Some(Qd::DeferredRepoCap))
+        .map(|r| (r.key.workspace_idx, r.key.number))
+        .collect();
+    let offered: Vec<(usize, u32)> = report
+        .plan_order
+        .iter()
+        .copied()
+        .filter(|k| !capped.contains(k))
+        .collect();
+    assert_eq!(offered, calls);
+    assert_eq!(report.in_slice.as_deref(), Some(&slice[..]));
+    assert_eq!(report.repo_cap.as_ref().map(|c| c.occupancy.clone()), Some(vec![0, 1, 0]));
+
+    let inputs = dispatch_plan::PlanInputs {
+        max_concurrent: 10,
+        ..Default::default()
+    };
+    let summary = tick_summary(&report, 10, chrono::Utc::now(), &[], Some(&inputs));
+    let pos = |issue: u32| {
+        let row = summary.queue.iter().find(|r| r.issue == issue).unwrap();
+        (row.rank, row.plan.position)
+    };
+    // (rank, position): the comparator ranks workspace 0 first; the plan
+    // shaped workspace 1 (hot) ahead, and the out-of-slice #9 behind both.
+    assert_eq!(pos(1), (1, Some(3)));
+    assert_eq!(pos(5), (3, Some(1)));
+    assert_eq!(pos(6), (4, Some(2)));
+    assert_eq!(pos(9), (5, Some(5)));
+    let plan = summary
+        .plan
+        .expect("the multi-workspace summary carries a plan");
+    assert_eq!(plan.slots.occupancy, Some(4));
+    assert_eq!(plan.slots.free, Some(6));
+}
+
+/// A tick without a slice or cap still records its (unshaped) order, which
+/// is then just the comparator order.
+#[test]
+fn plan_order_without_shaping_is_the_sorted_order() {
+    let mut workspaces = [
+        (OneShotSource::of(&[3, 4]), CapDispatcher::default()),
+        (OneShotSource::of(&[1]), CapDispatcher::default()),
+    ];
+    let report = tick_capped(&mut workspaces, &[5, 0], 10, None);
+    assert_eq!(report.plan_order, vec![(1, 1), (0, 3), (0, 4)]);
+    assert_eq!(report.in_slice, None);
+    assert_eq!(report.max_admissions_per_tick, Some(usize::MAX));
 }

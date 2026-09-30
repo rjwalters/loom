@@ -73,7 +73,7 @@
 .queue-row--blocked .queue__reason {
   color: var(--warn);
 }
-.badge--urgent {
+.badge--starred {
   color: var(--bad);
   border-color: color-mix(in srgb, var(--bad) 45%, transparent);
 }

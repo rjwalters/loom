@@ -71,6 +71,12 @@ pub(crate) enum AccountsAction {
         /// is a pure read.
         #[arg(long)]
         ranking: bool,
+        /// Measure **live** via `codex app-server` (`account/rateLimits/read`)
+        /// instead of reading rollout snapshots (#9233). A session-managed
+        /// account is probed only inside its running session container
+        /// (ADR-0017); with none running it reports `session_unavailable`.
+        #[arg(long)]
+        live: bool,
         #[arg(long)]
         json: bool,
     },

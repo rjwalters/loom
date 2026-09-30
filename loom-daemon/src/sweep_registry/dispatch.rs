@@ -1948,8 +1948,18 @@ impl SweepRegistry {
         //     proceeds, so a `gh` outage can never wedge the daemon. Skipped
         //     entirely when label flips are disabled (test fixtures without
         //     `gh` credentials).
-        if !self.config.skip_label_flip {
-            if let Some(label) = self.first_park_label(issue_number) {
+        //
+        //     The label set this guard reads is ALSO what the #9432 story-point
+        //     resolution below consumes: one REST read, two consumers, no
+        //     second fetch (epic #9429: "read the issue's `points:*` label from
+        //     the issue data the dispatch path already resolves").
+        let dispatch_labels = if self.config.skip_label_flip {
+            None
+        } else {
+            self.current_labels_via_rest(issue_number)
+        };
+        if let Some(labels) = dispatch_labels.as_deref() {
+            if let Some(label) = self.first_park_label_in(issue_number, labels) {
                 log::info!(
                     "issue #{issue_number}: refusing dispatch — the issue carries `{label}`, a \
                      deliberate park that every dispatch route must respect (#4444 park-label \
@@ -1962,6 +1972,21 @@ impl SweepRegistry {
                 .into());
             }
         }
+
+        // 2.71 Story-point size (Issue #9432, epic #9429). Resolved here — from
+        //      the labels step 2.7 just read, never a second forge call — and
+        //      carried on this dispatch's `sweep.global.dispatch` event so
+        //      `sweep.started` telemetry reports the assigned size of the work
+        //      now in flight. Pure label folding: zero forge cost, and a
+        //      stacked/malformed points label is logged loudly and resolves to
+        //      no value rather than to a guess (see `crate::story_points`).
+        //
+        //      `None` here covers "unsized issue", "unreadable/skipped label
+        //      read" and "defective labels" alike — the attribute is simply
+        //      omitted downstream, never emitted as `0`.
+        let story_points = dispatch_labels
+            .as_deref()
+            .and_then(|labels| crate::story_points::resolve_story_points(issue_number, labels));
 
         // 2.75 Noop-cooldown guard (Issue #6917, follow-up to #6670/#6740).
         //      `record_noop_release` (`noop_cooldown.rs`, exposed over IPC as
@@ -2375,6 +2400,7 @@ impl SweepRegistry {
             effort: effort.filter(|e| !e.is_empty()).map(String::from),
             depends_on,
             admission,
+            story_points,
         })))
     }
 
@@ -2410,6 +2436,7 @@ impl SweepRegistry {
             effort,
             depends_on,
             mut admission,
+            story_points,
         } = prepared;
 
         // Issue #4689: the child already died — synchronously observed,
@@ -2586,6 +2613,7 @@ impl SweepRegistry {
             // get_sweep_status responses disambiguate this repo's issue #N from
             // another managed repo's identically-numbered issue.
             repo: Some(self.config.workspace_root.display().to_string()),
+            overflow: false,
         };
         self.entries.insert(sweep_id.clone(), info);
 
@@ -2626,6 +2654,9 @@ impl SweepRegistry {
             // matching the pattern already used for SweepPhase/Blocker/Exited/
             // Crashed — leave it `None` at construction.
             repo: None,
+            // #9432: the size estimate resolved at step 2.71 from the labels
+            // the park guard already read. Absent for an unsized issue.
+            story_points,
         });
 
         Ok(DispatchOutcome {
@@ -2781,6 +2812,7 @@ impl SweepRegistry {
             effort: effort.filter(|e| !e.is_empty()).map(String::from),
             depends_on: None,
             repo: Some(self.config.workspace_root.display().to_string()),
+            overflow: false,
         };
         self.entries.insert(sweep_id.clone(), info);
 
@@ -2796,6 +2828,10 @@ impl SweepRegistry {
             runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
             runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
             repo: None,
+            // A `PrSet` dispatch claims no issue (see this method's doc
+            // comment), so there is no `points:*` label to resolve — omitted,
+            // never `0` (#9432).
+            story_points: None,
         });
 
         Ok(DispatchOutcome {

@@ -76,6 +76,24 @@
  * (not a special-cased bypass), so a future field added to either is dropped
  * by default until the table is deliberately updated — the fail-safe
  * direction never flips silently.
+ *
+ * ## A nested field the allowlist cannot police: `phase_durations` (#9443)
+ *
+ * The allowlist is a **shallow** copy: it decides which top-level keys of the
+ * `record` payload survive, not what is inside them. `sweep.outcome`'s
+ * `phase_durations` was safely allowlisted while its entries were
+ * `{phase, duration_sec}` — pure lifecycle shape — but Issue #9443 put
+ * per-phase `tokens_in`/`tokens_out`/`tokens_by_model` inside each entry, which
+ * is precisely the workload detail the sweep-level token fields are withheld
+ * for. A shallow copy would have re-emitted it, in finer-grained form, through
+ * a key nobody re-examined.
+ *
+ * So `phase_durations` was moved out of the allowlist and into
+ * `PUBLIC_RECORD_DERIVATIONS` (`redactPhaseDurations`), the same treatment
+ * `managed_repos` and `accounts` get. The general rule this establishes:
+ * **an allowlisted field whose value is a nested object or array needs a
+ * derivation, not an allowlist entry**, because only the derivation re-states
+ * the boundary every time the nested schema grows.
  */
 
 import type { RepoVisibility } from "./telemetry";
@@ -102,7 +120,7 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   "sweep.identity": ["kind", "runtime", "provider", "model"],
   "sweep.phase": ["kind", "phase", "entered_at"],
   "sweep.completed": ["kind", "completed_at", "result"],
-  "sweep.outcome": ["kind", "model", "effort", "config", "phase_durations", "total_duration_sec", "result"],
+  "sweep.outcome": ["kind", "model", "effort", "config", "total_duration_sec", "result"],
   // `pr_number` is deliberately ABSENT above (the PR-link leak vector), and
   // so are the four work-output fields issue #5357 added — `tokens_in`,
   // `tokens_out`, `lines_added`, `lines_deleted`. Per that issue's own text,
@@ -112,7 +130,16 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   // getting a bespoke exception. Issue #8056's three additions —
   // `failure_class`, `models_used`, `doctor_cycles` — are absent for the same
   // reason: why a private repo's sweep died, and which models it burned, is
-  // workload detail about that repo.
+  // workload detail about that repo. Issue #9443's `tokens_unattributed` joins
+  // them: it is a remainder of the same withheld totals.
+  //
+  // `phase_durations` moved OUT of this list in #9443 and into
+  // `PUBLIC_RECORD_DERIVATIONS` below. It used to be a raw copy, which was
+  // safe only while its entries were `{phase, duration_sec}`; #9443 added
+  // per-phase `tokens_in`/`tokens_out`/`tokens_by_model` to each entry, and a
+  // shallow allowlist copy would have carried exactly the token counts the
+  // paragraph above withholds straight through the public view. Timings stay
+  // public; the nested usage does not.
   // Host-level kinds: no repo/issue/branch/PR reference exists on either —
   // see the module doc's "tokens.snapshot / host.health" section. Every
   // field the schema defines today is listed explicitly (not "pass
@@ -536,6 +563,47 @@ export function redactAdmissionBrakeRow(brake: AdmissionBrakeRow): Record<string
 }
 
 /**
+ * `sweep.outcome`'s `phase_durations` (Issue #4704), projected for a public,
+ * unauthenticated viewer of a **private** repo's record.
+ *
+ * Each entry keeps only what describes the *shape* of the lifecycle — which
+ * phase, which attempt at it, and how long it took. Those are the same
+ * category of machine/cadence detail `total_duration_sec` and `result` are
+ * already allowed through on, and they are what the public view's phase
+ * breakdown renders.
+ *
+ * Issue #9443's per-phase `tokens_in`, `tokens_out` and `tokens_by_model` are
+ * deliberately dropped, exactly as their sweep-level counterparts (#5357's
+ * `tokens_in`/`tokens_out`, #6384's `tokens_by_model`) already are: a
+ * per-phase split is *more* revealing about a private repo's workload than the
+ * total it partitions, not less, so allowing it in nested form would be a
+ * bespoke exception to the boundary the allowlist states. An operator reading
+ * their own fleet still gets every field on the authenticated `/api/*`
+ * surface, which this module does not touch.
+ *
+ * A per-field pick, not a spread (the `redactManagedRepos` pattern), so a
+ * field added to the phase-entry schema tomorrow is dropped from the public
+ * view by default until this function is deliberately updated — the fail-safe
+ * direction never flips silently. A non-object entry (malformed payload) is
+ * projected to `{}` rather than copied through, so no type-confusion path
+ * carries raw usage out.
+ */
+export function redactPhaseDurations(entries: readonly unknown[]): Record<string, unknown>[] {
+  return entries.map((entry) => {
+    const redacted: Record<string, unknown> = {};
+    if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+      const row = entry as Record<string, unknown>;
+      if ("phase" in row) redacted.phase = row.phase;
+      if ("duration_sec" in row) redacted.duration_sec = row.duration_sec;
+      if ("attempt" in row) redacted.attempt = row.attempt;
+      // `tokens_in`/`tokens_out`/`tokens_by_model` are deliberately NOT copied
+      // here (#9443) — see the doc comment.
+    }
+    return redacted;
+  });
+}
+
+/**
  * Per-kind *derivations* layered on top of the field allowlist: fields the
  * public view gets that are computed from redacted-away input rather than
  * copied from it.
@@ -550,7 +618,19 @@ export function redactAdmissionBrakeRow(brake: AdmissionBrakeRow): Record<string
 const PUBLIC_RECORD_DERIVATIONS: Readonly<Record<string, (payload: Record<string, unknown>) => Record<string, unknown>>> =
   {
     "tokens.snapshot": (payload) => deriveTokenPoolAggregate(payload) as unknown as Record<string, unknown>,
-    // Issue #8852: private rows keep only rank/state/disposition/reason.
+    // Issue #9443: `phase_durations`' timings stay public, its per-phase token
+    // usage does not — so the whole field reaches a public response only
+    // through `redactPhaseDurations`, never as a raw allowlist copy. Absent
+    // entirely when the payload carries no phase breakdown (a sweep whose
+    // transitions were never sampled), so the field-presence contract stays
+    // "the daemon sent this".
+    "sweep.outcome": (payload) =>
+      Array.isArray(payload.phase_durations)
+        ? { phase_durations: redactPhaseDurations(payload.phase_durations) }
+        : {},
+    // Issue #8852: private rows keep only rank/state/disposition/reason (and,
+    // since #9288, their plan position/plan_state/gate). The per-tick `plan`
+    // block is carried in its normalized form — slot counts, no repo names.
     "queue.snapshot": publicQueuePayload,
     // `managed_repos` (#4976) and `roles` (#5022) are both deliberately ABSENT
     // from `RECORD_FIELD_ALLOWLIST` — like `tokens.snapshot`'s `accounts`,

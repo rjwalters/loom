@@ -136,7 +136,7 @@ if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
   exit 0
 fi
 if [ "$1" = "api" ]; then
-  echo '[{{"created_at":"2026-09-22T22:00:00Z","body":"LGTM.\n\n<!-- loom:verdict-sha sha={sha_a} verdict=approved -->"}}]'
+  echo '[{{"user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}},"author_association":"NONE","created_at":"2026-09-22T22:00:00Z","body":"LGTM.\n\n<!-- loom:verdict-sha sha={sha_a} verdict=approved -->"}}]'
   exit 0
 fi
 exit 0

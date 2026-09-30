@@ -66,6 +66,11 @@ pub struct UsageBucket {
 pub struct ParsedTranscript {
     pub session_id: Option<String>,
     pub role: Option<String>,
+    /// The role this session's own slash command named
+    /// ([`slash_command_role`]), with no keyword-scan fallback — the strict
+    /// half of [`Self::role`], and the only one a trace join may key on
+    /// (Issue #9231).
+    pub slash_role: Option<String>,
     pub cwd: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
@@ -144,12 +149,40 @@ struct MessageUsage {
     cache_write: i64,
 }
 
+/// The role a session's **own** `<command-name>/loom:NAME</command-name>`
+/// header names — pass 1 of [`attribute_role`], with no keyword-scan fallback
+/// (Issue #9231).
+///
+/// Separate from [`attribute_role`] because the two answer different questions.
+/// The keyword scan is right for *cost attribution*, where a subagent's
+/// dispatch prompt ("You are the Loom Judge…") genuinely names the role whose
+/// budget the tokens belong to. It is wrong for a *join key*: a sweep's Judge
+/// subagent must never let its `session.summary` join a concurrent role-runner
+/// Judge tick's trace on the strength of prose. Only a session that launched
+/// itself as `/loom:<role>` — which is exactly what
+/// [`crate::role_tick_telemetry::head_names_role`] requires of a transcript it
+/// attributes tokens to — is keyed on its role.
+#[must_use]
+pub fn slash_command_role(first_user_text: &str) -> Option<String> {
+    const NAME_OPEN: &str = "<command-name>/loom:";
+    let at = first_user_text.find(NAME_OPEN)?;
+    let rest = &first_user_text[at + NAME_OPEN.len()..];
+    let name = rest
+        .split('<')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    ROLE_KEYWORDS.contains(&name.as_str()).then_some(name)
+}
+
 /// Attribute a transcript to a Loom role from its first user message.
 ///
 /// Two passes, in order:
 ///
 /// 1. A `<command-name>/loom:NAME</command-name>` slash-command marker — how a
-///    `/loom:sweep` parent session and every role-runner session start.
+///    `/loom:sweep` parent session and every role-runner session start
+///    ([`slash_command_role`]).
 /// 2. Otherwise the **earliest** whole-word occurrence of a [`ROLE_KEYWORDS`]
 ///    entry, which is how a subagent's dispatch prompt names its role ("Load
 ///    and follow the instructions in `.claude/commands/loom/doctor.md`…",
@@ -159,18 +192,8 @@ struct MessageUsage {
 /// `cost_by_role`, which is honest rather than a guess.
 #[must_use]
 pub fn attribute_role(first_user_text: &str) -> Option<String> {
-    const NAME_OPEN: &str = "<command-name>/loom:";
-    if let Some(at) = first_user_text.find(NAME_OPEN) {
-        let rest = &first_user_text[at + NAME_OPEN.len()..];
-        let name = rest
-            .split('<')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        if ROLE_KEYWORDS.contains(&name.as_str()) {
-            return Some(name);
-        }
+    if let Some(name) = slash_command_role(first_user_text) {
+        return Some(name);
     }
 
     // `to_ascii_lowercase` is byte-length preserving, so indexes into `lower`
@@ -502,6 +525,7 @@ pub fn parse_transcript(path: &Path, fallback_timestamp: DateTime<Utc>) -> Parse
 
     if let Some(text) = first_user_text.as_deref() {
         parsed.role = attribute_role(text);
+        parsed.slash_role = slash_command_role(text);
         parsed.issue = attribute_issue(text);
     }
     if let Some(cwd) = parsed.cwd.as_deref() {
@@ -817,6 +841,35 @@ mod tests {
         );
         // A non-role loom command is not forced into the role set.
         assert_eq!(attribute_role("<command-name>/loom:watch</command-name>"), None);
+    }
+
+    /// #9231: the strict half. A join key may only come from what the session
+    /// *launched as* — a subagent's dispatch prose names a role for cost
+    /// attribution, and must never let that subagent's `session.summary` join
+    /// a concurrent role-runner tick of the same role.
+    #[test]
+    fn only_a_slash_command_yields_a_join_keyable_role() {
+        assert_eq!(
+            slash_command_role("<command-name>/loom:judge</command-name>").as_deref(),
+            Some("judge")
+        );
+        assert_eq!(
+            slash_command_role(
+                "<command-name>/loom:sweep</command-name>\n<command-args>8059</command-args>"
+            )
+            .as_deref(),
+            Some("sweep")
+        );
+        assert_eq!(slash_command_role("<command-name>/loom:watch</command-name>"), None);
+        // Exactly the prose `attribute_role` does attribute, and must not.
+        for prose in [
+            "You are the Loom Builder (Development Worker) for this repository.",
+            "Load and follow the instructions in `.claude/commands/loom/doctor.md` in full.",
+            "Judge rejected it.",
+        ] {
+            assert!(attribute_role(prose).is_some(), "cost attribution still reads prose");
+            assert_eq!(slash_command_role(prose), None, "a join key never does: {prose}");
+        }
     }
 
     #[test]

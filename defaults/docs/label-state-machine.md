@@ -12,6 +12,13 @@ invisible to `gh pr list`, the dashboard, or any label-filtered query. See
 prompted this (four Judge-approved PRs sat held-but-invisible for up to 126
 hours).
 
+One auxiliary vocabulary rides the curation transition: when the Curator
+applies `loom:curated`, it attaches exactly one `points:*` story-point size
+label (`1`/`2`/`3`/`5`/`8`/`13`, rubric in `.loom/docs/story-points.md`,
+#9431) in the same `gh issue edit` — re-assignment replaces it, and a rescope
+back to `loom:triage` updates or removes it, so stale points never survive a
+scope change.
+
 `loom:operator` moves that state onto the label substrate, where every other
 pipeline state already lives.
 
@@ -20,6 +27,7 @@ pipeline state already lives.
 
 - [Definition](#definition)
 - [Relationship to `loom:blocked`, `loom:operator-only`, and `loom:needs-capability`](#relationship-to-loomblocked-loomoperator-only-and-loomneeds-capability)
+- [`loom:operator-priority` is not a hold (#9244)](#loomoperator-priority-is-not-a-hold-9244)
 - [Entry points](#entry-points)
 - [Exit rule](#exit-rule)
 - [Current implementation](#current-implementation)
@@ -46,7 +54,7 @@ each definition, for the terse version of this same table):
 
 | Label | Question it answers | Does sweep/shepherd skip it? |
 |---|---|---|
-| `loom:blocked` | Waiting on a dependency, but still automatable once that clears | **Yes**, for a *fresh* work-finder candidate — `loom:blocked` is in [`PARK_LABELS`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/work_finder/labels.rs), the daemon's own authoritative park set. "Still automatable once that clears" describes what happens *after* the label is removed, not while it is present — see #8925, which found this exact row previously read "No" while the code already skipped it. The unblock sweep (`guide.md`'s `check_and_unblock`/`check_and_unblock_prs`) and `loom-daemon check-stale-blocked` are what re-evaluate it and clear it once its declared blocker resolves (`defaults/docs/park-record.md`) |
+| `loom:blocked` | Waiting on a dependency, but still automatable once that clears | **Yes**, for a *fresh* work-finder candidate — `loom:blocked` is in [`PARK_LABELS`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/work_finder/labels.rs), the daemon's own authoritative park set. "Still automatable once that clears" describes what happens *after* the label is removed, not while it is present — see #8925, which found this exact row previously read "No" while the code already skipped it. The unblock sweep (`guide.md`'s `check_and_unblock`/`check_and_unblock_prs`) and `loom-daemon check-stale-blocked` (plus, at merge time, `merge-pr.sh`'s `notify-cleared-blockers` comment on each citer, #9102) are what re-evaluate it and clear it once its declared blocker resolves (`defaults/docs/park-record.md`) |
 | `loom:operator-only` | Requires human action or ruling *outside* automation entirely (credentials, infra, hardware, an owner-gated decision) | **Yes** — sweep/shepherd skip it, except the narrow capability-matched `loom:operator-mechanical` case (#6893, see "Dispatch path" below) |
 | `loom:needs-capability` | Blocked on a missing tool/agent capability — not an operator-by-right decision, but automation genuinely cannot proceed without the capability existing first (#5817) | **Yes** — sweep/shepherd skip it, identically to `loom:operator-only` today |
 | `loom:operator` | The engine has stopped on this specific artifact and a human must act, but the item stays live in its normal queue so the engine's own release conditions can still fire | **New-builder skip only** — the work finder does not *start* a fresh `--claim-owned` build on it (vibesql#6664); re-evaluation lanes (Champion/role ticks, watchdog re-dispatch, reaper resume, explicit `loom-daemon dispatch <N>`) still reach it |
@@ -68,6 +76,31 @@ already-claimed one (it will not *start* work), while every route that
 *re-evaluates* or explicitly targets the item still proceeds. The label never
 refuses dispatch by itself — it is not in the park set the dispatch-time
 guard consults.
+
+## `loom:operator-priority` is not a hold (#9244)
+
+`loom:operator-priority` (the operator's "star") shares a prefix with
+`loom:operator` but means the opposite: not "the engine stopped, a human must
+act" but "a human wants this landed ASAP, act now". It is the one "land this
+ASAP" signal; the older urgent label is retired (its `labels.yml` description
+says so, and no role applies it).
+
+- **Human-only.** No role decides to apply or remove it. The daemon only relays
+  a loom-ui star intent, and Builder copies it from a starred issue onto the PR
+  it opens.
+- **Starred first, every stage.** Curator curates starred issues first (a
+  starred issue with no workflow label counts as `loom:triage`) and promotes
+  them straight to `loom:issue`, because the star is the Tier-3 approval. A
+  starred `loom:epic` instead leads Champion's epic queue. Judge, Doctor and Champion drain starred PRs before their oldest-first pass.
+  Builder takes starred `loom:issue` work first.
+- **Guards unchanged.** `loom:blocked`, `loom:operator-only`,
+  `loom:operator-decision`, Champion's merge-risk and critical-file holds, the
+  host-class gate and Judge's bar all still apply. A starred PR on a hold stays
+  held and is listed first (marked ⭐) in the pinned hold digest (#6877).
+- **Red-main fixes** are a body marker, not a label: an issue that fixes a red
+  `main` carries `<!-- loom:main-red-fix -->` (Doctor adds it when filing a
+  pre-existing failure confirmed on `origin/main`). Curator takes these next,
+  after starred work, with no promotion bypass.
 
 ## Entry points
 

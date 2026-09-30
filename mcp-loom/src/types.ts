@@ -98,6 +98,22 @@ export interface ConfigureTerminalOptions {
 }
 
 /**
+ * The resolved (validated + defaulted) `get_agent_metrics` arguments a
+ * successful run was executed with, plus the exact argv array handed to
+ * `execFile` (Issue #9107). Narrowed to the allow-listed literal unions by
+ * `AgentMetricsInvocation` in `tools/terminals.ts`; kept structural here so
+ * `types.ts` stays import-free.
+ */
+export interface AgentMetricsFilters {
+  argv: string[];
+  command: string;
+  role?: string;
+  period: string;
+  format: "json" | "text";
+  issue?: number;
+}
+
+/**
  * Agent metrics result structure
  */
 export interface AgentMetricsResult {
@@ -106,4 +122,6 @@ export interface AgentMetricsResult {
   error?: string;
   format: "json" | "text";
   output: string;
+  /** Present only on success — see `AgentMetricsFilters`. */
+  filters?: AgentMetricsFilters;
 }

@@ -295,13 +295,9 @@ human, never self-clear it. Rules: `.loom/docs/premise-gate.md` §
 
 ### Priority Assessment
 
-Add `loom:urgent` only if:
-- Critical bug affecting users NOW
-- Security vulnerability requiring immediate patch
-- Blocks all other work
-- Production issue that needs hotfix
-
-When in doubt, leave as normal priority.
+Never apply a priority label (`loom:operator-priority` is human-only, #9244).
+If it looks critical (user-facing bug NOW, security hole, blocks all work), say
+so in the body; the operator decides.
 
 ---
 
@@ -390,7 +386,7 @@ Architect uses context-specific instruction files to keep token usage efficient:
 
 When you receive a probe command, respond with: `AGENT:Architect:<brief-task>` — e.g. `AGENT:Architect:analyzing-system-design`.
 
-**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](probe-protocol.md).**
+**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](../loom-probe-protocol/SKILL.md).**
 
 ---
 

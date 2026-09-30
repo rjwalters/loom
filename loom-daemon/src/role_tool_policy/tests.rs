@@ -5,6 +5,10 @@
 //! the requirement is byte-for-byte parity with `_loom_role_deny_specs()` in
 //! `spawn-claude.sh`, and a test that re-derives the answer from the code
 //! under test cannot detect a transcription error in either direction.
+//!
+//! The one place that parity is deliberately broken is the wildcard rule
+//! (#8943) — see the "The ONE wildcard rule" section below, and the module
+//! doc's section of the same name for why.
 
 use super::*;
 
@@ -367,33 +371,117 @@ fn unknown_granted_names_neither_grant_nor_crash() {
 }
 
 // ---------------------------------------------------------------------------
-// The two wildcard rules (spawn-claude substring vs. spawn-codex exact)
+// The ONE wildcard rule: an exact `"*"` element, both paths (#8943)
+//
+// This section replaces the port's two-rule pinning tests. It used to hold
+// `the_two_wildcard_rules_diverge_only_on_a_star_bearing_substring`, which
+// asserted that `["cloud-*"]` was UNRESTRICTED on the deny-specs path (mirroring
+// `spawn-claude.sh`'s substring test) while RESTRICTED on the Codex path
+// (mirroring `spawn-codex.sh`'s `index("*")`). #8943 resolved that divergence in
+// favour of the exact-element rule — the fail-closed one — so the replacement
+// test below asserts the two paths now agree, and the old assertion is
+// deliberately gone rather than relaxed.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_two_wildcard_rules_agree_on_a_bare_star() {
+fn a_bare_star_is_the_wildcard_on_both_paths() {
     let p = policy("builder", declared(&["*"]));
-    assert!(p.has_spawn_claude_wildcard());
+    assert!(p.has_wildcard());
+    // Unrestricted on the Codex predicate…
     assert!(!p.is_restricted());
+    // …and no deny specs on the --disallowedTools path.
+    assert!(p.denied_capabilities().is_empty());
     assert!(p.deny_specs().is_empty());
 }
 
 #[test]
-fn the_two_wildcard_rules_diverge_only_on_a_star_bearing_substring() {
-    // Inherited from the shell verbatim: spawn-claude.sh substring-tests the
-    // joined allowlist, spawn-codex.sh asks jq for index("*"). Documented in
-    // the module doc; pinned here so a future "cleanup" is a deliberate
-    // behaviour change with a failing test, not a silent one.
+fn the_unified_wildcard_rule_keeps_a_star_bearing_substring_restricted_on_both_paths() {
+    // Replaces `the_two_wildcard_rules_diverge_only_on_a_star_bearing_substring`
+    // (#8943). `cloud-*` is not a capability name and not the wildcard — it is
+    // an unrecognized string, so it is INERT: it grants nothing and disarms
+    // nothing, and BOTH paths say "restricted".
     let p = policy("role", declared(&["cloud-*"]));
-    assert!(p.has_spawn_claude_wildcard());
-    assert!(p.deny_specs().is_empty(), "spawn-claude: unrestricted");
-    assert!(p.is_restricted(), "spawn-codex: restricted");
+    assert!(!p.has_wildcard(), "`cloud-*` must not count as a wildcard");
+
+    // Codex path: restricted (unchanged from the port).
+    assert!(p.is_restricted(), "codex path: restricted");
+
+    // Deny-specs path: restricted too — this is the behaviour change. It used
+    // to produce 0 specs (a silent full disarm); it now denies the whole
+    // namespace, because `cloud-*` granted nothing.
+    assert_eq!(
+        p.denied_capabilities(),
+        [
+            "remote-shell",
+            "cloud-cli",
+            "forge-secrets",
+            "credential-store"
+        ],
+        "deny-specs path: `cloud-*` grants nothing, so nothing is spared"
+    );
+    assert_eq!(p.deny_specs().len(), 38);
 }
 
 #[test]
-fn undeclared_is_never_restricted_on_either_rule() {
+fn an_unknown_star_bearing_capability_is_inert_not_a_glob() {
+    // Every star-bearing shape that is not exactly `"*"`: a prefix glob, a
+    // suffix glob, a doubled star, a real capability name with a star stuck to
+    // it, and a bare star buried inside a longer token. None is a wildcard and
+    // none grants a capability — so each behaves exactly like the plain unknown
+    // string `"database"` does in `unknown_granted_names_neither_grant_nor_crash`.
+    let baseline = policy("role", declared(&["database"]));
+    for name in ["cloud-*", "*-cli", "**", "cloud-cli*", "*cloud-cli", "a*b"] {
+        let p = policy("role", declared(&[name]));
+        assert!(!p.has_wildcard(), "{name} was read as a wildcard");
+        assert!(p.is_restricted(), "{name} disarmed the Codex path");
+        assert!(deny_specs_for(name).is_empty(), "{name} resolved to a capability's specs");
+        assert_eq!(
+            p.denied_capabilities(),
+            baseline.denied_capabilities(),
+            "{name} is not inert: it differs from an ordinary unknown string"
+        );
+        assert_eq!(p.deny_specs(), baseline.deny_specs(), "{name}");
+    }
+
+    // …and an inert name sitting next to a real grant spares only the real one.
+    let p = policy("role", declared(&["cloud-*", "cloud-cli"]));
+    assert!(p.is_restricted());
+    assert_eq!(p.denied_capabilities(), ["remote-shell", "forge-secrets", "credential-store"]);
+}
+
+#[test]
+fn the_wildcard_constant_is_the_rule_both_paths_use() {
+    // A structural guard on AC1: there is one wildcard rule, so a declaration
+    // of CAPABILITY_WILDCARD alone must be the unrestricted case on both
+    // paths, and `denied_capabilities()` must be empty for exactly the
+    // not-`is_restricted()` cases.
+    for allowlist in [
+        Allowlist::Undeclared,
+        declared(&[]),
+        declared(&[CAPABILITY_WILDCARD]),
+        declared(&["cloud-*"]),
+        declared(&["cloud-cli"]),
+        declared(&["database"]),
+        declared(&["cloud-cli", CAPABILITY_WILDCARD]),
+    ] {
+        let p = policy("role", allowlist.clone());
+        assert_eq!(
+            p.denied_capabilities().is_empty(),
+            !p.is_restricted(),
+            "the two paths disagreed about {allowlist:?}"
+        );
+        assert_eq!(
+            p.deny_specs().is_empty(),
+            !p.is_restricted(),
+            "the two paths disagreed about {allowlist:?}"
+        );
+    }
+}
+
+#[test]
+fn undeclared_is_never_restricted_nor_wildcarded() {
     let p = policy("curator", Allowlist::Undeclared);
-    assert!(!p.has_spawn_claude_wildcard());
+    assert!(!p.has_wildcard());
     assert!(!p.is_restricted());
 }
 

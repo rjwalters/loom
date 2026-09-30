@@ -135,12 +135,16 @@ fn summary_row(
         issue,
         workspace_priority: 100,
         urgent: false,
+        operator_priority: false,
+        operator_priority_at: None,
+        main_red_fix: false,
         created_at: None,
         tier: None,
         disposition,
         detail: detail.map(str::to_string),
         state: disposition.state().to_string(),
         reason: disposition.reason().to_string(),
+        plan: Default::default(),
     }
 }
 

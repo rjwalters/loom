@@ -547,9 +547,15 @@ impl RestQueueSource {
 
 impl QueueSource for RestQueueSource {
     fn list_queue(&mut self, root: &Path, label: &str) -> Result<Vec<QueueItem>, String> {
-        let rows =
-            crate::forge_listing::list_issues_cached(&self.gh_bin, Some(root), None, label, "open")
-                .map_err(|e| e.to_string())?;
+        let rows = crate::forge_listing::list_issues_cached_as(
+            "role_collision",
+            &self.gh_bin,
+            Some(root),
+            None,
+            label,
+            "open",
+        )
+        .map_err(|e| e.to_string())?;
         Ok(rows
             .into_iter()
             .map(|r| QueueItem {

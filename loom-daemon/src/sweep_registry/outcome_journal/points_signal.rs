@@ -11,7 +11,7 @@
 //! ([`super::writeback`]) is actually about to be built: unlike `complexity`,
 //! which is a permanent field on every `sweep.outcome` telemetry record, this
 //! value is opt-in-consumed only, so fetching it unconditionally (the way
-//! `fetch_complexity_signal` does) would add a needless forge round trip to
+//! `fetch_issue_signals` does) would add a needless forge round trip to
 //! every terminal transition even while
 //! `autonomous.sweepOutcomeWriteback.enabled` stays at its default `false`.
 //!
@@ -22,7 +22,7 @@
 //!
 //! # Fail-open contract
 //!
-//! Identical to [`super::complexity_signal::fetch_complexity_signal`]: any
+//! Identical to [`super::complexity_signal`]'s own fetch: any
 //! failure — `skip_label_flip`, the fleet rate-limit breaker, a spawn error, a
 //! timeout, a non-zero exit, or an issue body with no recognized marker —
 //! yields `None`, never a fabricated value.
@@ -34,7 +34,7 @@ impl SweepRegistry {
     /// Best-effort Curator points estimate for `issue` (Issue #9056), read
     /// off the issue body via one REST `gh api` call — same transport,
     /// timeout, breaker-gating and `skip_label_flip` short-circuit as
-    /// [`SweepRegistry::fetch_complexity_signal`]. Called only from
+    /// [`SweepRegistry::fetch_issue_signals`]. Called only from
     /// [`super::writeback`]'s own gate (opt-in flag + `Success` result +
     /// idempotency check already passed), never unconditionally, so this
     /// costs nothing while the write-back stays disabled (the default).

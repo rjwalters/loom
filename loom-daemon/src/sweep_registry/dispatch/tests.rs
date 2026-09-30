@@ -186,6 +186,7 @@ fn readvertise_republishes_live_issue_claims_only() {
         effort: None,
         depends_on: None,
         repo: None,
+        overflow: false,
     };
     let live_log = registry.compute_log_path(4431);
     let dead_log = registry.compute_log_path(999);
@@ -193,18 +194,13 @@ fn readvertise_republishes_live_issue_claims_only() {
         "sweep-live".to_string(),
         mk_info("sweep-live", 4431, SweepState::Running, live_log),
     );
-    registry.entries.insert(
-        "sweep-dead".to_string(),
-        mk_info(
-            "sweep-dead",
-            999,
-            SweepState::Exited {
-                code: None,
-                at: Utc::now(),
-            },
-            dead_log,
-        ),
-    );
+    let exited = SweepState::Exited {
+        code: None,
+        at: Utc::now(),
+    };
+    registry
+        .entries
+        .insert("sweep-dead".to_string(), mk_info("sweep-dead", 999, exited, dead_log));
 
     assert_eq!(registry.readvertise_peer_claims(), 1);
     let ad = rx.try_recv().expect("one re-advertisement published");
@@ -3029,6 +3025,13 @@ fn concurrent_issue_dispatches_do_not_serialize_on_the_account_selection_poll() 
     );
     let registry = Arc::new(Mutex::new(lifecycle_registry(dir.path(), &script)));
 
+    // Calibrate the "if this were serialized" bound against THIS host's
+    // actual cost of one full, genuinely serialized dispatch, rather than
+    // assuming an idle-host `poll_delay` constant (issue #9194); see
+    // `dispatch_burst_calibration::measure_one_serialized_dispatch`.
+    let measured_serial_one =
+        dispatch_burst_calibration::measure_one_serialized_dispatch(&registry, 80_999);
+
     const BURST: u32 = 10;
     let start = Instant::now();
     let handles: Vec<std::thread::JoinHandle<DispatchOutcome>> = (0..BURST)
@@ -3083,19 +3086,20 @@ fn concurrent_issue_dispatches_do_not_serialize_on_the_account_selection_poll() 
         );
     }
 
-    // Serialized (pre-#6592: registry mutex held across the poll) would
-    // take roughly BURST * poll_delay (7s for 10x700ms). Concurrent
-    // (post-#6592) should complete close to ONE poll_delay plus
-    // guard-chain/spawn overhead. Assert well under the serialized
-    // bound — and well under the 30s client ack deadline (AC2) this
-    // issue targets.
-    let serialized_bound = poll_delay * BURST;
+    // A deliberately-serialized burst (pre-#6592: registry mutex held across
+    // the poll) would take roughly `measured_serial_one * BURST` — measured
+    // moments ago, on this same host, under the same load, rather than
+    // assumed from `poll_delay` alone (issue #9194). Concurrent (post-#6592)
+    // should complete close to ONE dispatch's cost plus guard-chain/spawn
+    // overhead. Assert well under the serialized bound — and well under the
+    // 30s client ack deadline (AC2) this issue targets.
+    let serialized_bound = measured_serial_one * BURST;
     assert!(
-            elapsed < serialized_bound / 2,
-            "burst of {BURST} concurrent dispatches took {elapsed:?} (poll_delay={poll_delay:?}) \
-             — looks serialized behind the registry mutex (serialized bound ~{serialized_bound:?}), \
-             not concurrent"
-        );
+        elapsed < serialized_bound / 2,
+        "burst of {BURST} concurrent dispatches took {elapsed:?} (measured serial cost of \
+             one dispatch on this host: {measured_serial_one:?}) — looks serialized behind the \
+             registry mutex (serialized bound ~{serialized_bound:?}), not concurrent"
+    );
     assert!(
         elapsed < Duration::from_secs(30),
         "burst took {elapsed:?}, at or over the 30s client ack deadline this issue targets"
@@ -3940,6 +3944,11 @@ fn dispatch_refuses_operator_only_issue() {
 // `guards_union_tests.rs` / `guards_preflip_tests.rs`.
 #[path = "operator_hold_tests.rs"]
 mod operator_hold_tests;
+
+// The #9194 burst-calibration helper lives in its own sibling file for the
+// same reason as `operator_hold_tests` above.
+#[path = "dispatch_burst_calibration.rs"]
+mod dispatch_burst_calibration;
 
 /// AC (the load-bearing exclusion): `loom:building` ALONE must NOT refuse.
 /// It is legitimately present on the daemon's own in-flight claim, so a guard
