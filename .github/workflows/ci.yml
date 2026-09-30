@@ -802,7 +802,21 @@ jobs:
           printf 'OPS@%s\n' "$(printf '%s' "$domain" | tr '[:lower:]' '[:upper:]')" >>"$tmp/ids"
           [ "$(grep -ciE "$identity" "$tmp/ids" || true)" -eq 2 ] \
             || { echo "::error::identity pattern missed a fixture (case-insensitivity?)" >&2; exit 1; }
-          echo "host-identifier patterns: OK (3 private ranges caught, documentation + public edges clean, identities case-insensitive)"
+          # The line-level exemption (keep in sync with the scrub step below):
+          # only a .mailmap MAPPING line whose trailing comment is exactly the
+          # marker. Of the four fixture lines, only the first may be exempted:
+          # an unmarked new mapping, a marked COMMENT line, and a marked line
+          # in any other file must all still be flagged.
+          exempt='^\.mailmap:[0-9]+:[^#]*>[[:space:]]+#[[:space:]]*identity-scrub: allow[[:space:]]*$'
+          mkdir "$tmp/repo"
+          printf 'A <a@example.org> <a@%s>  # identity-scrub: allow\n' "$domain" >"$tmp/repo/.mailmap"
+          printf 'B <b@example.org> <b@%s>\n' "$domain" >>"$tmp/repo/.mailmap"
+          printf '# see <c@%s>  # identity-scrub: allow\n' "$domain" >>"$tmp/repo/.mailmap"
+          printf 'D <d@example.org> <d@%s>  # identity-scrub: allow\n' "$domain" >"$tmp/repo/other.md"
+          flagged="$(cd "$tmp/repo" && grep -niE "$identity" .mailmap other.md | { grep -vE "$exempt" || true; } | cut -d: -f1,2)"
+          [ "$flagged" = "$(printf '.mailmap:2\n.mailmap:3\nother.md:1')" ] \
+            || { echo "::error::identity exemption is wrong; flagged: $(printf '%s' "$flagged" | tr '\n' ' ')" >&2; exit 1; }
+          echo "host-identifier patterns: OK (3 private ranges caught, documentation + public edges clean, identities case-insensitive, .mailmap line exemption narrow)"
       - name: Scrub the repository for host identifiers and operator identities
         if: ${{ !cancelled() }}
         run: |
@@ -817,6 +831,14 @@ jobs:
           # mention of a public deployment hostname is not a person.
           domain='2amlogic.com'
           identity="@[A-Za-z0-9._%+:~-]*${domain//./\\.}"
+          # ONE line-level exemption, by operator decision on #8613: a .mailmap
+          # mapping line whose trailing comment is the `identity-scrub: allow`
+          # marker. It corrects git log/blame attribution, and the address it
+          # maps is already in ~70 history trailers, so removing it would hide
+          # nothing. Honoured in .mailmap only and on mapping lines only (not
+          # comments); an unmarked new mapping is still flagged. The self-test
+          # step above exercises this regex — keep the two copies identical.
+          exempt='^\.mailmap:[0-9]+:[^#]*>[[:space:]]+#[[:space:]]*identity-scrub: allow[[:space:]]*$'
           rc=0
           # `cut` keeps file:line and DROPS the matched text.
           if hosts="$(git grep -nIE -e "$host_id" -- . | cut -d: -f1,2)" && [ -n "$hosts" ]; then
@@ -824,7 +846,7 @@ jobs:
             printf '%s\n' "$hosts" | sed 's/^/  /' >&2
             rc=1
           fi
-          if ids="$(git grep -niIE -e "$identity" -- . | cut -d: -f1,2)" && [ -n "$ids" ]; then
+          if ids="$(git grep -niIE -e "$identity" -- . | { grep -vE "$exempt" || true; } | cut -d: -f1,2)" && [ -n "$ids" ]; then
             echo "::error::identity at an operator-owned domain — value withheld:" >&2
             printf '%s\n' "$ids" | sed 's/^/  /' >&2
             rc=1
