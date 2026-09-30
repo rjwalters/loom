@@ -241,15 +241,15 @@ command-verifiable, not a judgment call, **and** (2) the diff touches only
 non-executing files (`.md`, `.txt`, similar) — never `.sh`/`.rs`/`.ts`, a role
 prompt, `.github/labels.yml`, or `.loom/config.json`. A predicate on the
 *change*, not a config toggle or approval gate. **Judge, Champion, and step
-0's open-PR guard still apply** — a hand-claim duplicates in-flight work as
+0's claim guard still apply** — a hand-claim duplicates in-flight work as
 readily as a dispatched one; only Curator may be skipped.
 
 ### Builder Workflow
 
-0. Guard: `loom-daemon forge check-open-pr 42` — **exit 0 prints an already-open
-   linked PR, so do NOT claim**; 1 = none; anything else = unanswered, not an
-   all-clear (`--help` has the contract). Same probe the daemon's dispatch
-   refuses on, and a hand-claim is not exempt.
+0. Guard: `loom-daemon forge check-claim 42` — **exit 0 prints a blocker
+   token (`OPEN_PR #X` / `BUILDING` / `LEASE_ALREADY_HELD …` /
+   `BRANCH_EXISTS …`): do NOT claim**; 1 = safe; else = unanswered, not an
+   all-clear (`--help` has it). A hand-claim is not exempt.
 1. Find issue: `gh issue list --label="loom:issue"`
 2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`, then
    lease it: `loom-daemon lease ensure 42 --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`.

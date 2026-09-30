@@ -462,51 +462,42 @@ fn sweep_md_documents_experiment_tier_2_5_suppression() {
 /// `loom:building` skip-test bullet, so the marker check is structurally a
 /// precondition of that bullet rather than a footnote appended after it.
 #[test]
-fn sweep_md_step_1a_self_claim_check_precedes_loom_building_skip_bullet() {
+fn sweep_md_step_1a_self_claim_check_precedes_claim_cas_probe() {
     let content = read_sweep_md();
 
-    // CONTRACT: "Step 1a" is the stable anchor for the mandatory daemon
-    // self-claim check (#4111); the skip-test bullet's opening clause is the
-    // stable anchor for the loom:building rule it must precede. Both are
-    // load-bearing identifiers — a rename of either without updating this
-    // test is exactly the drift this doc-lint exists to catch.
+    // CONTRACT (updated by #9453 Phase 1): "Step 1a" remains the stable anchor
+    // for the mandatory daemon self-claim check. The claim-CAS probe bullet is
+    // the new anchor for the rule Step 1a must precede — the probe REPLACED the
+    // #3823-era `loom:building` skip bullet this lint used to anchor on. Two
+    // things are load-bearing: the ordering (Step 1a evaluates FIRST, before
+    // any skip/probe rule) and Step 1a's carve-out — a daemon self-claim does
+    // NOT run the probe for its own issue. A rename of any anchor without
+    // updating this test is exactly the drift this doc-lint exists to catch.
     let step_1a_pos = content.find("Step 1a").unwrap_or_else(|| {
         panic!(
-            "sweep.md is missing the `Step 1a` daemon self-claim check anchor \
-             — #4111 requires the marker check be a MANDATORY, separately \
-             numbered pre-flight step, not an exception clause folded into \
-             the loom:building skip bullet"
+            "sweep-wave-lifecycle.md is missing the `Step 1a` daemon self-claim check anchor \
+             — #4111 requires the marker check be a MANDATORY, separately numbered pre-flight \
+             step, not an exception clause folded into a skip bullet"
         )
     });
-    let skip_bullet_pos = content
-        .find("If the issue already has `loom:building`")
-        .unwrap_or_else(|| {
-            panic!(
-                "sweep.md is missing the `loom:building` skip-test bullet — \
-                 the #3823-era pre-flight rule this doc-lint anchors to"
-            )
-        });
-
+    let cas_pos = content.find("Claim-CAS probe (#9453)").unwrap_or_else(|| {
+        panic!(
+            "sweep-wave-lifecycle.md is missing the `Claim-CAS probe (#9453)` bullet — \
+             the pre-flight claim-CAS probe must be documented where the `loom:building` \
+             skip bullet used to be"
+        )
+    });
     assert!(
-        step_1a_pos < skip_bullet_pos,
-        "sweep.md's `Step 1a` daemon self-claim check (byte offset {step_1a_pos}) \
-         must appear BEFORE the `loom:building` skip-test bullet (byte offset \
-         {skip_bullet_pos}) in the \"1. Per-issue pre-flight\" section — #4111's \
-         entire fix is making the marker check evaluate first. If this ever \
-         regresses (Step 1a moved after the skip bullet, or collapsed back \
-         into an inline exception clause), the marker becomes prose-optional \
-         again exactly as it was when #4111 was filed."
+        step_1a_pos < cas_pos,
+        "Step 1a (daemon self-claim check) must appear BEFORE the Claim-CAS probe bullet — \
+         the self-claim carve-out is a precondition of the probe, not a footnote after it"
     );
-
-    // CONTRACT: the check must be stated as MANDATORY, not advisory — a
-    // reword that softens "MANDATORY" to something optional-sounding would
-    // reintroduce the exact compliance gap #4111 fixed.
     assert!(
-        content.contains("MANDATORY"),
-        "sweep.md's Step 1a daemon self-claim check must be stated as \
-         MANDATORY (#4111) — the prior #3823 phrasing was a non-mandatory \
-         exception clause and was silently skipped by a daemon-dispatched \
-         child in production"
+        content.contains("Do NOT run the claim-CAS probe"),
+        "Step 1a must carry its carve-out: a daemon self-claim (`--claim-owned` / \
+         `LOOM_SWEEP_CLAIM_OWNED`) does not run the claim-CAS probe for its own issue — \
+         without it, #4111's failure mode (a dispatched child 'disproving' its own claim) \
+         returns"
     );
 }
 
