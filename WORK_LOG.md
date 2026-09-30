@@ -7,6 +7,27 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-30
+- **Issue #9330** (closed): ETA phase 7: docs + eta-queries.sql + CI artifact test
+- **Issue #9328** (closed): ETA phase 5: shadow mode + promotion switch (backtest-gated), land-v2 with censoring
+- **PR #9749**: feat(eta): shadow mode + backtest-then-live promotion switch, land-v2 (#9328)
+- **PR #9739**: feat(merge-pr): port the post-merge worktree cleanup target plan to Rust (#8191 slice)
+- **PR #9696**: feat(forge): pr-congestion report — the #9063 Phase 1 congestion signal (report-only)
+- **Issue #9453** (closed): fix(sweep): enforce pre-flight lease CAS guard and branch collision abort to prevent competing PRs (#9447)
+- **Issue #9683** (closed): feat(config): consolidate all Loom operational hyperparameters into a unified, structured config file
+- **PR #9698**: feat(config): unify operational hyperparameters with validation, digest provenance, and an optimizer vector
+- **Issue #9719** (closed): docs: CLAUDE.md CI rule needs the #9619 "once it has started" qualifier; daemon-reference lists fleet.repo twice
+- **Issue #9741** (closed): docs: CI operating summaries still say 'never cancel a distinct commit' after #9619's main concurrency bound
+- **PR #9743**: docs: state the #9619 main CI concurrency bound in the operating summaries
+- **Issue #9327** (closed): ETA phase 4: loom-daemon eta CLI (per-issue --explain, landing-next list)
+- **PR #9721**: ETA phase 4: loom-daemon eta view/list CLI
+- **PR #9732**: chore: pause story-point estimation and curation checks
+- **PR #9726**: feat(scripts): add create-pr.sh 1:1 issue-to-PR review-gate guard (#9453 phase 5)
+- **Issue #9708** (closed): flaky test: api_keys_pool proxy-mark test fails under nextest in the OTLP partition only
+- **Issue #9598** (closed): fleet-config: enforce fleet/state.yml (running / paused / stopped) at daemon start
+- **PR #9727**: feat(fleet): enforce fleet/state.yml run state (running/paused/stopped) at daemon start and on the sync timer
+- **Issue #9597** (closed): fleet-config: apply rendered config without a daemon restart (live reload)
+- **PR #9730**: feat(fleet-config): classify render changes as live-reloadable or restart-required
+- **Issue #9724** (closed): docs/audit sweep: mechanical fixes from the 2026-09-30 /repo:all pass
 - **PR #9729**: docs: mechanical doc-drift fixes from /repo:all audit (#9724)
 - **Issue #9378** (closed): No label means "approved, but not yet" — loom:blocked is not a merge gate
 - **PR #9700**: feat(merge-pr): durable 'approved, but not yet' sequencing gate (#9378)
