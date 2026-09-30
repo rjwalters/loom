@@ -132,8 +132,10 @@
     "roles": {
       "judge": "codex"
     },
+    "_comment": "preference follows the operator's runtime order: Claude -> Codex -> OpenCode (metered z.ai, backstop only) -> gemini (last). Codex is NOT dropped for Builder/Doctor by a per-role list: defaults/runtimes/codex.json declares worktreeIsolation 'partial' (#4495) and defaults/roles/builder.json / doctor.json require it, so the admission gate skips Codex for those two roles only (logged as codex:not-admitted(worktreeIsolation)) and lifts automatically once the capability is promoted. Judge (requires only loomControl) keeps its own rolePreference with Codex first, for review independence from the Builder's runtime.",
     "preference": [
       "claude",
+      "codex",
       {
         "runtime": "opencode",
         "modelProfile": "zai-flash"
