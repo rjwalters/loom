@@ -40,5 +40,17 @@ inner="$inner"
 exec "\$inner" "\$@"
 EOF
   chmod +x "$dir/loom-daemon-write-scope"
+  WRITE_SCOPE_STUB_PREV_BIN="$inner"
   export LOOM_DAEMON_BIN="$dir/loom-daemon-write-scope"
+}
+
+# write_scope_unwrap: restore LOOM_DAEMON_BIN to what it was before
+# write_scope_allow_all, e.g. before tests/lib/require-daemon-bin.sh pins a
+# real binary (it prefers LOOM_DAEMON_BIN, and the wrapper is not one).
+write_scope_unwrap() {
+  if [[ -n "${WRITE_SCOPE_STUB_PREV_BIN:-}" ]]; then
+    export LOOM_DAEMON_BIN="$WRITE_SCOPE_STUB_PREV_BIN"
+  else
+    unset LOOM_DAEMON_BIN
+  fi
 }

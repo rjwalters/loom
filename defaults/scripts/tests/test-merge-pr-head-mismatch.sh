@@ -215,6 +215,9 @@ echo "Testing _classify_merge_response / error_head_moved (extracted)..."
 # green.
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+# #9548: the early forge_merge_pr section wrapped LOOM_DAEMON_BIN; hand the
+# real resolution back before pinning (the wrapper is re-applied below).
+write_scope_unwrap
 loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr"
 # #9548: merge-pr.sh vets its repo first (`forge may-write`); that decision is
 # not what this suite tests (test-write-scope.sh does), so the fixture repo is
