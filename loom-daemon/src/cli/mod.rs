@@ -110,6 +110,7 @@ pub(crate) mod usage_report_cli;
 pub(crate) mod watch;
 mod watchdog;
 pub(crate) mod workspace_fleet;
+pub(crate) mod worktree_base;
 pub(crate) mod worktree_branch_conflict;
 pub(crate) mod worktree_check;
 pub(crate) mod worktree_cleanup;

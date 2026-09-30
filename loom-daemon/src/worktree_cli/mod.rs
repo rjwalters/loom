@@ -120,6 +120,11 @@
 //! `origin/<branch>` carries the branch's real commits and the local branch
 //! does not (the #8147/#8190 incident).
 //!
+//! Slice 13 is [`base`]: the `origin/$DEFAULT_BRANCH` fetch and the `--base`
+//! stacked-PR base-ref resolution — one decision (which ref a new branch starts
+//! from), moved whole, with its `--json` refusal documents now built by
+//! `serde_json` rather than spliced into a string by hand.
+//!
 //! [`closed_pr_branch`] is the same kind of addition (#9083): the third arm of
 //! the branch-resolution contract the shell had no answer for — a pushed
 //! `origin/feature/issue-N` whose tip is the head of a PR CLOSED WITHOUT
@@ -153,6 +158,7 @@
 //! and no retained suite asserts either consumer's output. Same class as slices
 //! 5, 8 and 10: a path compared logically instead of physically.
 
+pub mod base;
 pub mod baseline;
 pub mod branch_conflict;
 pub mod branch_delete;

@@ -207,6 +207,14 @@ pub(crate) enum ScriptPortCommand {
     /// directory. Exit 0 applied, 1 refused/failed, 2 could not run.
     WorktreeSparse(super::worktree_sparse::WorktreeSparseArgs),
 
+    /// `worktree.sh`'s base-ref preparation (#8195 slice 13): the fetch of
+    /// `origin/$DEFAULT_BRANCH` and the `--base <branch>` stacked-PR
+    /// resolution (validate, fetch, prefer `origin/<base>`, fall back to a
+    /// local branch, refuse when neither exists). Prints `TOKEN<TAB>text`
+    /// records the shell replays; `--json` refusal documents are built with
+    /// `serde_json` instead of spliced by hand. Exit 0 resolved, 1 refused.
+    WorktreeBase(super::worktree_base::WorktreeBaseArgs),
+
     /// `worktree.sh`'s in-worktree predicate and both decisions it gated
     /// (#8195 slice 11): the `--check` verb, and the create path's
     /// auto-navigation out of a worktree. The retired
@@ -472,6 +480,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeStaleRef(args) => args.run(),
             ScriptPortCommand::WorktreeClosedPrBranch(args) => args.run(),
             ScriptPortCommand::WorktreeSparse(args) => args.run(),
+            ScriptPortCommand::WorktreeBase(args) => args.run(),
             ScriptPortCommand::WorktreeCheck(args) => args.run(),
             ScriptPortCommand::WorktreeExisting(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
