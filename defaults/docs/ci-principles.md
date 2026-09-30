@@ -34,8 +34,9 @@ the next person to add one will have an equally good argument.
    The price is visible and expected: about a third of `main` runs now conclude
    `cancelled`. A `cancelled` `main` run is **no verdict**, neither a pass nor
    a rule violation. `main_health_gate.rs` reduces it to `Unknown`, and
-   `work_finder/main_red_fix.rs` counts only `failure`/`timed_out`. Do not
-   re-run it to "complete" the record, and do not treat it as a skipped check.
+   `work_finder/main_red_fix.rs` counts only `failure`/`timed_out`/
+   `startup_failure`. Do not re-run it to "complete" the record, and do not
+   treat it as a skipped check.
 
 3. **Path-filtering is an optimisation, not a correctness tool.** A check that
    can fail because of a file *outside* its path group must not be filtered by
