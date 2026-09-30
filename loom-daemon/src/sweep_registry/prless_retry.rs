@@ -766,6 +766,19 @@ impl SweepRegistry {
         remaining.to_std().ok().filter(|d| !d.is_zero())
     }
 
+    /// Absolute PR-less-retry expiry for `issue` at `now` (Issue #9311), or
+    /// `None` when it may be dispatched immediately. Mirrors
+    /// [`Self::prless_retry_remaining`] but returns the instant itself rather
+    /// than the duration until it.
+    #[must_use]
+    pub fn prless_retry_until(&self, issue: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.prless_retry_config.enabled {
+            return None;
+        }
+        let state = self.prless_retry.get(&issue)?;
+        (state.until > now).then_some(state.until)
+    }
+
     /// Consecutive PR-less releases recorded for `issue` (Issue #7972). `0` when
     /// none is on record. Test/inspection helper, mirroring
     /// [`Self::noop_release_count`].

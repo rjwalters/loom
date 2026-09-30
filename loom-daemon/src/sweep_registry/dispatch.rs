@@ -1276,6 +1276,22 @@ impl SweepRegistry {
         remaining.to_std().ok().filter(|d| !d.is_zero())
     }
 
+    /// Absolute dispatch-backoff expiry for `issue` at `now` (Issue #9311), or
+    /// `None` when it may be dispatched immediately. Mirrors
+    /// [`Self::dispatch_backoff_remaining`] but returns the instant itself
+    /// rather than the duration until it — this host's own local window only,
+    /// same scope as [`Self::open_pr_backoff_issues`] (not the fleet-unioned
+    /// [`Self::dispatch_backoff_issues`]): a peer-armed window's expiry is not
+    /// available here.
+    #[must_use]
+    pub fn dispatch_backoff_until(&self, issue: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.dispatch_backoff_config.enabled {
+            return None;
+        }
+        let state = self.dispatch_backoff.get(&issue)?;
+        (state.until > now).then_some(state.until)
+    }
+
     /// Consecutive failed dispatch attempts recorded for `issue` (Issue #4485).
     /// `0` when no failure is on record. Test/inspection helper, mirroring
     /// [`insta_crash_count`](Self::insta_crash_count).

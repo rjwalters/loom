@@ -3250,6 +3250,33 @@ fn test_is_within_recheck_interval() {
     assert!(!no_timestamp.is_within_recheck_interval(now));
 }
 
+/// `recheck_interval_until` (Issue #9311) computes `updated_at + interval`
+/// regardless of whether the window has already elapsed — it names the
+/// instant a hold clears, not whether it currently holds — and falls
+/// through to `None` on exactly the same missing-half cases as
+/// [`WorkItem::is_within_recheck_interval`].
+#[test]
+fn test_recheck_interval_until() {
+    let now = chrono::Utc::now();
+    let five_minutes_ago = now - chrono::Duration::minutes(5);
+
+    let fresh = issue_with_recheck_interval(1, "1h", &five_minutes_ago.to_rfc3339());
+    assert_eq!(
+        fresh.recheck_interval_until(),
+        Some(five_minutes_ago + chrono::Duration::hours(1))
+    );
+
+    // Elapsed windows still report their (past) expiry — this is "when did
+    // it clear", not "is it still held".
+    let two_hours_ago = now - chrono::Duration::hours(2);
+    let stale = issue_with_recheck_interval(1, "1h", &two_hours_ago.to_rfc3339());
+    assert_eq!(stale.recheck_interval_until(), Some(two_hours_ago + chrono::Duration::hours(1)));
+
+    assert_eq!(issue(1).recheck_interval_until(), None, "no marker");
+    let no_timestamp = issue(1).with_body(Some("<!-- loom:recheck-interval=6h -->".to_string()));
+    assert_eq!(no_timestamp.recheck_interval_until(), None, "marker but no updated_at");
+}
+
 #[test]
 fn test_tick_skips_issue_within_its_recheck_interval() {
     // #6685 AC2: a tracker issue carrying a self-declared re-check-
