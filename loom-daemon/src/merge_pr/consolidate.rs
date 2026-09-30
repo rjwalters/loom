@@ -783,5 +783,112 @@ pub enum PrepareOutcome {
     },
 }
 
+// --- Landing reconciliation (#9689, ADR-0023 §6) --------------------------
+//
+// The candidate merges through the canonical merge-pr.sh path — never here.
+// What this section owns is everything AFTER a verified landing: per-component
+// status, reservation release, component closure, linked-issue closure, and
+// branch cleanup, in that order, each step idempotent (re-read before acting)
+// so a crash anywhere leaves a state the next run continues from.
+
+/// The per-component status marker: presence = this component's landing
+/// status is durably recorded (the reconciliation ledger entry).
+#[must_use]
+pub fn status_marker(candidate_pr: u32, component: u32) -> String {
+    format!("<!-- {CONSOLIDATION_PREFIX}-status candidate={candidate_pr} component={component} -->")
+}
+
+/// The landing status comment for one component.
+#[must_use]
+pub fn status_comment_body(
+    component: u32,
+    candidate_pr: u32,
+    merge_sha: &str,
+    attempt: &str,
+) -> String {
+    format!(
+        "{}\n**Merged into candidate #{}** — consolidation attempt `{}` landed; this PR's \
+         changes (pinned at construction) are contained in the combined merge `{}`.\n\n\
+         Status: `merged-into #{}` (per ADR-0023 §6: GitHub closing this PR is recorded as \
+         merged-into, never as an independent merge). Follow-up work goes against the default \
+         branch as usual.\n\n\
+         ---\n\
+         *Automated by loom-daemon merge-pr consolidate-reconcile (#9689)*",
+        status_marker(candidate_pr, component),
+        candidate_pr,
+        attempt,
+        merge_sha,
+        candidate_pr
+    )
+}
+
+/// Status recorded? Reads the live comment stream; a failed read is "not
+/// present" (the comment gets re-posted — idempotent recovery errs toward a
+/// duplicate status line, never a lost one).
+#[must_use]
+pub fn status_present(bodies: &[String], candidate_pr: u32, component: u32) -> bool {
+    bodies
+        .iter()
+        .any(|b| b.contains(&status_marker(candidate_pr, component)))
+}
+
+/// Inclusion proof (ADR-0023 §6.2): the pinned head must be an ancestor of
+/// the candidate branch head RECORDED AT PREPARE TIME — the tree the
+/// candidate's CI tested and Judge reviewed, not a live re-read. Construction
+/// merged the pins `--no-ff`, so ancestry is the containment fact.
+pub fn inclusion_verified(
+    git_bin: &str,
+    repo_root: &Path,
+    pinned_head: &str,
+    candidate_head: &str,
+) -> bool {
+    let out = Command::new(git_bin)
+        .args(["merge-base", "--is-ancestor", pinned_head, candidate_head])
+        .current_dir(repo_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .status();
+    matches!(out, Ok(s) if s.success())
+}
+
+/// The landing-release comment — the reservation's subject landed.
+#[must_use]
+pub fn landing_release_body(marker: &SequenceMarker, attempt: &str) -> String {
+    format!(
+        "<!-- loom:sequence released plan={} -->\n\
+         **Consolidation candidate #{} landed** — this component's diff is contained in the \
+         combined merge, so its reservation is released and the landing reconciliation \
+         (status, closure, linked issues) proceeds. (ADR-0023 §6, attempt `{}`)\n\n\
+         ---\n\
+         *Automated by loom-daemon merge-pr consolidate-reconcile (#9689)*",
+        marker.plan, marker.after, attempt
+    )
+}
+
+/// The component-PR closure comment: the exact combined merge SHA, per the
+/// contract's "no bare closed".
+#[must_use]
+pub fn component_close_body(candidate_pr: u32, merge_sha: &str) -> String {
+    format!(
+        "Closed as **merged-into #{candidate_pr}** — this PR's changes landed with the \
+         combined candidate; the exact combined merge commit is `{merge_sha}`. (ADR-0023 §6, \
+         #9689)"
+    )
+}
+
+/// The linked-issue closure comment: what landed, where, and why closure is
+/// performed here (the closing PR merged as part of a candidate, so the
+/// forge never fired its own auto-close).
+#[must_use]
+pub fn issue_close_body(component_pr: u32, candidate_pr: u32, merge_sha: &str) -> String {
+    format!(
+        "Closed via consolidation: component PR #{component_pr} (which closes this issue) was \
+         verified as included in combined candidate #{candidate_pr}, which landed as `{merge_sha}` \
+         after its own independent review and green CI. The component's acceptance criteria were \
+         reviewed on the candidate's combined diff; if anything is missing, reopen with the gap \
+         named. (ADR-0023 §6, #9689)"
+    )
+}
+
 #[cfg(test)]
 mod tests;

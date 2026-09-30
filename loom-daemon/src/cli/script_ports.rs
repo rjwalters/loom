@@ -610,6 +610,15 @@ pub(crate) enum MergePrCommand {
     /// landing wins and #9689's reconcile owns the aftermath.
     ConsolidateAbort(super::merge_pr_consolidate::ConsolidateAbortArgs),
 
+    /// Reconcile a MERGED consolidation candidate (#9689, ADR-0023 §6):
+    /// verify each component's inclusion by ancestry against the recorded
+    /// candidate tree, post per-component merged-into status, release only
+    /// this attempt's reservations, close component PRs with the exact
+    /// combined merge SHA, close their declared closing-reference issues
+    /// through the existing refs analysis, and clean the candidate branch —
+    /// every step idempotent, so a crash anywhere resumes. Never merges.
+    ConsolidateReconcile(super::merge_pr_consolidate::ConsolidateReconcileArgs),
+
     /// The async-close-race worktree-cleanup gate (#4186): whether a merged
     /// PR's issue is actually finished, so a partial-increment worktree the
     /// next Builder increment still needs is not removed out from under it.
@@ -774,6 +783,7 @@ impl MergePrCommand {
             MergePrCommand::SequencePlan(args) => args.run(),
             MergePrCommand::ConsolidatePrepare(args) => args.run(),
             MergePrCommand::ConsolidateAbort(args) => args.run(),
+            MergePrCommand::ConsolidateReconcile(args) => args.run(),
             MergePrCommand::IssueCloseGate(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
