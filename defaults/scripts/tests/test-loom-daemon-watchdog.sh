@@ -220,16 +220,10 @@ sleeper() { sleep 60 >/dev/null 2>&1 & echo $!; }
 
 # A dead pid we own, already exited and synchronously reaped (used for the
 # "confirmed down" pid-file fixtures below). Sets $DEAD_PID. No `kill` is
-# sent (#9562): on Linux the parent usually runs first after fork, so a kill
-# landed before the child exec'd `sleep`; the forked bash still had the
-# script's INT/TERM trap, caught the signal, then dropped the pending trap on
-# exec, so `sleep 60` ran to completion and `wait` blocked 60s per call. A
-# no-op child exits by itself — no lost-signal window. Not bg_proc_track'd:
-# it is already reaped, and tracking a reaped pid risks the EXIT trap killing
-# an unrelated process that later reuses it. The child must be OUR OWN,
-# not a $(sleeper) capture: inside a command substitution the subshell exits
-# immediately and orphans the child to PID 1, whose SIGCHLD reaping the
-# watchdog tick below can RACE. An orphan killed there stays a zombie —
+# sent (#9562): the child must be OUR OWN, not a $(sleeper) capture: inside a
+# command substitution the subshell exits immediately and orphans the sleep
+# to PID 1, whose SIGCHLD reaping the watchdog tick below can RACE. An
+# orphan killed there stays a zombie —
 # still answering `kill -0`, the watchdog's liveness signal, with a young
 # etime — until PID 1 gets around to reaping it. A tick that read the pid
 # file inside that window classified the daemon ALIVE inside the 90s startup
@@ -241,6 +235,22 @@ sleeper() { sleep 60 >/dev/null 2>&1 & echo $!; }
 # behaviour change. As a real child, `wait` reaps it SYNCHRONOUSLY, so
 # the pid is gone from the process table before the pid file is written and
 # no tick can observe it alive.
+#
+# The child EXITS ON ITS OWN; it is never signalled. It used to be a
+# `sleep 60 &` that was immediately `kill`ed, and that SIGTERM reliably landed
+# in the forked child BEFORE it exec'd `sleep` -- while it was still a copy of
+# this shell carrying the suite's INT/TERM trap (strace on Ubuntu/bash 5.2:
+# `clone() = N` then `kill(N, SIGTERM)` 0.4 ms later, no execve in between).
+# That pre-exec delivery went one of two ways, both bad:
+#   - the signal was lost across the execve (the live `sleep 60` showed no
+#     pending or caught TERM in /proc/<pid>/status), so it ran to completion and the `wait` below blocked for the full 60s. That is
+#     the ten ~60s stalls (~600 of the 638s) in the CI step -- one per call.
+#   - the copied trap RAN in the child: `bg_proc_reap; rm -rf "$WORKDIR";
+#     exit 1`, killing every tracked sleeper and deleting the suite's WORKDIR
+#     mid-run, so every later case failed on missing files.
+# A child that just exits has no signal to lose and no trap to run. It is not
+# bg_proc_track'ed either: once reaped its pid is free for reuse, and the EXIT
+# trap's reap would then `kill` whatever unrelated process inherited it.
 spawn_dead_pid() {
     : &
     DEAD_PID=$!
@@ -555,7 +565,15 @@ rm -rf "$PS_STUB3B"
 # 4. Intent present, daemon DEAD ⇒ DIVERGENCE (expected but not running).
 #    This IS the #4011 outage, reproduced.
 # ===================================================================
-spawn_dead_pid; dead_pid=$DEAD_PID
+# Fixture guard first: spawn_dead_pid must return at once with a pid that is
+# already gone, and must leave $WORKDIR standing. The signalled-sleep version
+# it replaced failed both ways (60s stall, or the trap deleting $WORKDIR).
+t0=$SECONDS; spawn_dead_pid; dead_pid=$DEAD_PID
+if (( SECONDS - t0 < 5 )) && ! kill -0 "$dead_pid" 2>/dev/null && [[ -d "$WORKDIR" ]]; then
+    pass "spawn_dead_pid fixture: returns at once, pid gone, WORKDIR intact"
+else
+    fail "spawn_dead_pid fixture: took $((SECONDS - t0))s, pid alive=$(kill -0 "$dead_pid" 2>/dev/null && echo yes || echo no), WORKDIR exists=$([[ -d "$WORKDIR" ]] && echo yes || echo no)"
+fi
 echo "$dead_pid" > "$WORKDIR/pidC"
 write_marker "$WORKDIR/pidC" 60
 printf 'x\n' > "$HEARTBEAT"
