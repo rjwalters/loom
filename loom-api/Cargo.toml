@@ -4,6 +4,9 @@ version.workspace = true
 license.workspace = true
 edition = "2021"
 description = "External REST API for Loom analytics data access"
+# Never published to crates.io. Also lets deny.toml's allow-wildcard-paths
+# exempt the path dependency on loom-daemon below.
+publish = false
 
 [dependencies]
 serde = { workspace = true }

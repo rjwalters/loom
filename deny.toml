@@ -58,8 +58,14 @@ exceptions = []
 # correctness one, and in a tree this size some duplication is unavoidable.
 multiple-versions = "warn"
 # A wildcard version requirement means the next breaking release of that crate
-# lands in this workspace without a diff. There are none today; keep it that way.
+# lands in this workspace without a diff. No registry dependency is wildcarded.
+# The only version-less requirement is loom-api's intra-workspace path
+# dependency on loom-daemon, which cannot drift that way. allow-wildcard-paths
+# exempts it, and it applies only because loom-api is `publish = false`.
+# Do not add a `version =` to that path dependency to satisfy this check:
+# PRs must never hand-edit version-bearing files (#7743).
 wildcards = "deny"
+allow-wildcard-paths = true
 deny = []
 
 [sources]
