@@ -552,8 +552,9 @@ pub const DEFAULT_LEASE_TTL_MINUTES: f64 = 15.0;
 
 /// Resolve the lease-freshness TTL (minutes) down the tier chain: the
 /// single-knob env var, then the hyperparameters layer (Issue #9683 —
-/// `hyperparameters.lifecycle.leaseTtlMinutes`, startup-captured via the
-/// process global so a per-call config re-read is unnecessary), then
+/// `hyperparameters.lifecycle.leaseTtlMinutes`, hot-applied per #9768: the
+/// layer is re-resolved against the startup root on every call, so a
+/// committed-block edit lands without a daemon restart), then
 /// [`DEFAULT_LEASE_TTL_MINUTES`] for an absent, unparseable, or non-positive
 /// value at either tier.
 #[must_use]
