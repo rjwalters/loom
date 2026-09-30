@@ -65,32 +65,7 @@ enum Commands {
     /// Serve the guarded native tool surface to an MCP client over stdio.
     NativeMcp(loom_daemon::native_tools::mcp::McpArgs),
     /// Initialize a Loom workspace in a target repository
-    Init {
-        /// Target workspace directory (must be a git repository)
-        #[arg(value_name = "PATH", default_value = ".")]
-        workspace: String,
-
-        /// Path to defaults directory
-        #[arg(long, default_value = "defaults")]
-        defaults: String,
-
-        /// Overwrite existing .loom directory if it exists
-        #[arg(long)]
-        force: bool,
-
-        /// Install-time workspace mode (#8884). `session` writes an
-        /// attended-operator config: `terminals: []` plus the daemon-tier work
-        /// generators off, persisted as `"mode": "session"` in
-        /// `.loom/config.json` so a later reinstall/resync re-asserts it.
-        /// Omitting the flag (or passing `default`) is the stock install; it
-        /// never REMOVES a marker already on disk.
-        #[arg(long, value_name = "MODE", default_value = "default")]
-        mode: loom_daemon::init::InstallMode,
-
-        /// Print what would be done without making changes
-        #[arg(long)]
-        dry_run: bool,
-    },
+    Init(cli::misc_cmds::InitArgs),
 
     /// Rewrite only the marker-delimited Loom-managed `.gitignore` block in a
     /// workspace, converging it on the current `EPHEMERAL_PATTERNS` set without
@@ -2560,12 +2535,6 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         | Commands::Serve { .. } => {
             unreachable!("handled in main() before handle_cli_command")
         }
-        Commands::Init {
-            workspace,
-            defaults,
-            force,
-            mode,
-            dry_run,
-        } => cli::misc_cmds::run_init(workspace, defaults, force, mode, dry_run),
+        Commands::Init(args) => cli::misc_cmds::run_init(args),
     }
 }

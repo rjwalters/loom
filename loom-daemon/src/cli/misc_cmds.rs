@@ -7,16 +7,47 @@ use chrono::{DateTime, Utc};
 
 use loom_daemon::role_validation;
 
+/// Arguments for `loom-daemon init [PATH]`. Lives here rather than inline in
+/// `main.rs`'s `Commands` enum so `main.rs` stays under its file-size ratchet.
+#[derive(clap::Args, Debug)]
+pub(crate) struct InitArgs {
+    /// Target workspace directory (must be a git repository)
+    #[arg(value_name = "PATH", default_value = ".")]
+    pub(crate) workspace: String,
+
+    /// Path to defaults directory
+    #[arg(long, default_value = "defaults")]
+    pub(crate) defaults: String,
+
+    /// Overwrite existing .loom directory if it exists
+    #[arg(long)]
+    pub(crate) force: bool,
+
+    /// Install-time workspace mode (#8884). `session` writes an
+    /// attended-operator config: `terminals: []` plus the daemon-tier work
+    /// generators off, persisted as `"mode": "session"` in
+    /// `.loom/config.json` so a later reinstall/resync re-asserts it.
+    /// Omitting the flag (or passing `default`) is the stock install; it
+    /// never REMOVES a marker already on disk.
+    #[arg(long, value_name = "MODE", default_value = "default")]
+    pub(crate) mode: loom_daemon::init::InstallMode,
+
+    /// Print what would be done without making changes
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
 /// Handle `loom-daemon init [PATH]`: initialize (or, for the Loom source repo
 /// itself, validate) a Loom workspace. Extracted from `handle_cli_command`'s
 /// `Commands::Init` match arm (Issue #4712).
-pub(crate) fn run_init(
-    workspace: String,
-    defaults: String,
-    force: bool,
-    mode: loom_daemon::init::InstallMode,
-    dry_run: bool,
-) -> Result<()> {
+pub(crate) fn run_init(args: InitArgs) -> Result<()> {
+    let InitArgs {
+        workspace,
+        defaults,
+        force,
+        mode,
+        dry_run,
+    } = args;
     let workspace_path = std::path::Path::new(&workspace);
     let absolute_workspace = if workspace_path.is_absolute() {
         workspace_path.to_path_buf()
