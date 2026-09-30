@@ -330,10 +330,11 @@ pub fn classify(e: &Evidence) -> Verdict {
 /// as its own blocker".
 #[must_use]
 pub fn cited_among(kind: Artifact, input: &extract::Input, closed: &[i64]) -> Vec<i64> {
-    let mut refs: Vec<i64> = extract::extract(input, extract::DEFAULT_BOT_LOGIN)
-        .split_whitespace()
-        .filter_map(|t| t.parse().ok())
-        .collect();
+    let mut refs: Vec<i64> =
+        extract::extract_with(input, &crate::forge_identity::FleetLogins::current())
+            .split_whitespace()
+            .filter_map(|t| t.parse().ok())
+            .collect();
     if kind == Artifact::Issue {
         refs.extend(
             named::parse_entries(&input.body)

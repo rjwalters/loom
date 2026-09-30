@@ -136,8 +136,13 @@ import {
   redactLiveTailStream,
   withheldElasticSpend,
 } from "./redaction";
-import { parseRetentionConfig, runRetentionSweep } from "./retention";
-import { validateEnvelope, extractRecordFields, type TelemetryEnvelope } from "./telemetry";
+import { parseRetentionConfig, recordRetentionOutcome, runRetentionSweep } from "./retention";
+import {
+  validateEnvelope,
+  extractRecordFields,
+  isPathShapedRepo,
+  type TelemetryEnvelope,
+} from "./telemetry";
 
 export { FleetState };
 
@@ -310,8 +315,20 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
   }
 
   const nowIso = new Date().toISOString();
+  // rjwalters/loom#9442: count path-shaped `repo` values across this batch
+  // so the fix's effect is observable in the Worker's logs — the emitter
+  // side (PR #9462) is being fixed separately, so until every daemon
+  // upgrades, each batch that still arrives with filesystem paths warns
+  // exactly once, with a total, rather than silently (or noisily per-row)
+  // absorbing them. `extractRecordFields` does the normalization itself
+  // (see `telemetry.ts`); this is only the tally.
+  let pathShapedRepoCount = 0;
   const statements = envelopes.map((envelope) => {
     const fields = extractRecordFields(envelope.record);
+    const rawRepo = envelope.record.repo;
+    if (typeof rawRepo === "string" && isPathShapedRepo(rawRepo)) {
+      pathShapedRepoCount++;
+    }
     // `OR IGNORE` (Issue #5084): `idx_records_terminal_sweep_once`
     // (migrations/0002) enforces a partial UNIQUE(kind, sweep_id) for
     // exactly `sweep.completed`/`sweep.outcome` — the two kinds a sweep
@@ -368,6 +385,17 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
     }
   } catch (error) {
     console.error(`fleet state update failed (D1 write already committed): ${(error as Error).message}`);
+  }
+
+  // rjwalters/loom#9442 — one warn per batch that carried path-shaped repo
+  // values (never per row; see the tally above). Goes to the Worker's log
+  // tail, so it doubles as a rough "which daemons still need the #9462
+  // emitter fix" signal: when this stops appearing, the fleet is clean.
+  if (pathShapedRepoCount > 0) {
+    console.warn(
+      `ingest: normalized ${pathShapedRepoCount} path-shaped repo value(s) to their basename ` +
+        `(rjwalters/loom#9442; emitter fix tracked in PR #9462)`,
+    );
   }
 
   return ingestAck(envelopes.length, auth.hostId);
@@ -852,8 +880,23 @@ export default {
   async scheduled(_event, env) {
     const config = parseRetentionConfig(env);
     const result = await runRetentionSweep(env.DB, config);
+    // Per-tier breakdown (2AMLogic/2am#1608): `deletedBySize` alone hid the
+    // fact that the size cap was eating `sweep.*` history. A non-zero
+    // `deletedBySizeProtected` in this line is the "the cap is pressing on
+    // protected history" alarm — see `retention.ts`'s module doc.
     console.log(
-      `retention sweep: deleted ${result.deletedByAge} by age, ${result.deletedBySize} by size cap`,
+      `retention sweep: deleted ${result.deletedByAge} by age, ${result.deletedBySize} by size cap ` +
+        `(unprotected tier: ${result.deletedBySizeUnprotected}, protected overflow tier: ${result.deletedBySizeProtected})`,
     );
+    // Eviction visibility (#1608): record what this sweep deleted as a
+    // `backend.retention` row, so size evictions leave a queryable trace
+    // instead of silently shrinking history. Best-effort — the sweep itself
+    // already committed, and a liveness-row failure must not fail the cron
+    // run (same reasoning as the DO update in `handleIngest`).
+    try {
+      await recordRetentionOutcome(env.DB, config, result);
+    } catch (error) {
+      console.error(`retention liveness record failed: ${(error as Error).message}`);
+    }
   },
 } satisfies ExportedHandler<Env>;

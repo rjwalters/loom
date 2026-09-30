@@ -10,8 +10,10 @@
 //!   `COLLABORATOR`), the people who can change labels anyway;
 //! - the fleet's GitHub App, which GitHub reports as `CONTRIBUTOR` or
 //!   `NONE`: the **configured** App slug ([`APP_SLUG_ENV`] >
-//!   `forge.githubApp.slug`, see [`configured_app_slug`]), and as a fallback
-//!   the default `loom-fleet-dispatch` name and its numbered pool members.
+//!   `forge.githubApp.slug`, see [`configured_app_slug`]), every identity in
+//!   the forge roster (#9537: the writer, each reader, and `legacyLogins`), and
+//!   the default `loom-fleet-dispatch` name and its numbered members
+//!   (`-<digits>` exactly — never a bare prefix, which trusted `-evil`).
 //!   The raw login must carry an App spelling ([`is_app_login`]: `…[bot]`
 //!   from REST, `app/…` from GraphQL), which only a GitHub App can have: a
 //!   plain user may register `loom-fleet-dispatch-evil` or the bare slug,
@@ -25,7 +27,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use super::forge::ForgeComment;
-use crate::dep_recheck::extract::{normalise_login, DEFAULT_BOT_LOGIN};
+use crate::dep_recheck::extract::normalise_login;
 
 /// Env override naming the fleet's GitHub App slug (e.g. `acme-dispatch`).
 pub const APP_SLUG_ENV: &str = "LOOM_GITHUB_APP_SLUG";
@@ -52,7 +54,15 @@ pub fn configured_app_slug(root: &Path) -> Option<String> {
         .ok()
         .or_else(from_config)
         .map(|s| normalise_login(s.trim()))
-        .filter(|s| !s.is_empty())?;
+        .filter(|s| !s.is_empty());
+    // #9537: believe the whole roster, not only the writer's slug — readers'
+    // and renamed Apps' past comments carry their current names.
+    for name in crate::forge_identity::FleetLogins::for_root(root).names() {
+        if !name.contains('(') {
+            register_fleet_app(&name);
+        }
+    }
+    let slug = slug?;
     register_fleet_app(&slug);
     Some(slug)
 }
@@ -87,7 +97,7 @@ fn is_fleet_app(norm: &str) -> bool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(norm)
-        || norm.starts_with(DEFAULT_BOT_LOGIN)
+        || crate::forge_identity::is_default_family(norm)
 }
 
 /// `author_association` values that can already write labels.
@@ -179,6 +189,15 @@ mod tests {
         }
         assert!(trusted_author(Some("loom-fleet-dispatch-2[bot]"), Some("NONE"), None));
         assert!(trusted_author(Some("app/loom-fleet-dispatch-2"), Some("NONE"), None));
+        // #9537: the default family is the exact name or `-<digits>`, never a
+        // bare prefix, even App-spelled (the old `starts_with` trusted these).
+        for app in [
+            "loom-fleet-dispatch-evil[bot]",
+            "app/loom-fleet-dispatcher",
+            "loom-fleet-dispatch-[bot]",
+        ] {
+            assert!(!trusted_author(Some(app), Some("NONE"), None), "{app}");
+        }
         // A configured slug: only the App spelling.
         register_fleet_app("zeta-dispatch");
         assert!(trusted_author(Some("zeta-dispatch[bot]"), Some("NONE"), None));

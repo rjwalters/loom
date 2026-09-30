@@ -193,6 +193,14 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(runtime) = &r.runtime {
                 attributes.push(kv_string("loom.runtime", runtime.clone()));
             }
+            // Issue #9432: the assigned story-point size of the work now in
+            // flight, as a NUMERIC attribute so a backend can sum it. Pushed
+            // only when the issue carried exactly one legal `points:*` label —
+            // an absent, stacked or out-of-vocabulary label set emits no
+            // attribute at all, never `0`.
+            if let Some(story_points) = r.story_points {
+                attributes.push(kv_int("loom.story_points", i64::from(story_points)));
+            }
             (
                 "sweep.started",
                 SeverityNumber::Info,

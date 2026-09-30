@@ -158,6 +158,54 @@ fn removing_the_star_invalidates_the_cached_starred_at() {
     assert_eq!(items[0].operator_priority_at.as_deref(), Some("2026-09-05T00:00:00Z"));
 }
 
+/// Issue #9314: the two documented consequences of prompt eviction, pinned as
+/// intended behaviour rather than fixed.
+///
+/// 1. A star flipped OFF and back ON entirely between two ticks keeps the old
+///    starred-at: the cache never saw the gap, so nothing invalidates it.
+/// 2. A starred issue that merely leaves the listing (claimed
+///    `loom:building`, which `merge_starred` drops) loses its entry and is read
+///    again when it returns.
+///
+/// Both are at worst a mis-ordering between two starred issues one tick apart;
+/// see `StarredAtCache`'s "Accepted staleness" section for why the alternative
+/// (holding entries through a claim) is the worse trade.
+#[test]
+fn the_starred_at_cache_trades_restar_staleness_for_prompt_eviction() {
+    let mut src = FakeTimeline::default();
+    src.answers.insert(1, "2026-09-01T00:00:00Z".into());
+    let mut cache = StarredAtCache::default();
+    let now = Instant::now();
+
+    cache.resolve(&mut [starred(1, &["loom:issue"])], &mut src, now);
+    assert_eq!(src.calls, vec![1]);
+
+    // (1) Unstarred and re-starred between ticks: the tick still sees a
+    // starred row, so the entry survives and the NEW star time is not read.
+    src.answers.insert(1, "2026-09-20T00:00:00Z".into());
+    let mut items = [starred(1, &["loom:issue"])];
+    cache.resolve(&mut items, &mut src, now + Duration::from_secs(60));
+    assert_eq!(src.calls, vec![1], "no re-read: the gap was never observed");
+    assert_eq!(
+        items[0].operator_priority_at.as_deref(),
+        Some("2026-09-01T00:00:00Z"),
+        "the old starred-at is kept — accepted staleness, ordering only"
+    );
+
+    // (2) The issue leaves the listing (it is being built, so `merge_starred`
+    // drops the row): the entry goes with it, and the return costs one read.
+    cache.resolve(&mut [], &mut src, now + Duration::from_secs(120));
+    assert!(cache.is_empty(), "leaving the listing evicts, exactly like unstarring");
+    let mut items = [starred(1, &["loom:issue"])];
+    cache.resolve(&mut items, &mut src, now + Duration::from_secs(180));
+    assert_eq!(src.calls, vec![1, 1], "one read per claim cycle, by design");
+    assert_eq!(
+        items[0].operator_priority_at.as_deref(),
+        Some("2026-09-20T00:00:00Z"),
+        "and the re-read is what finally picks the re-star up"
+    );
+}
+
 #[test]
 fn a_failed_starred_at_read_falls_back_instead_of_failing() {
     let mut src = FakeTimeline {

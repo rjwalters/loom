@@ -141,6 +141,25 @@ impl IssueSignals {
         }
         Some(IssueEndState::StillOpen)
     }
+
+    /// The Curator's story-point size for this issue (Issue #9432, epic #9429),
+    /// folded out of [`Self::labels`] — the label list this read ALREADY
+    /// carries for the #9441 end state, so points cost **no** extra forge round
+    /// trip and can never describe a different issue than `complexity` does.
+    ///
+    /// Delegates the vocabulary and the one-`points:*`-label-per-issue guard to
+    /// [`crate::story_points::resolve_story_points`], which is also what the
+    /// dispatch path resolves `sweep.started`'s value through, so the two
+    /// telemetry records cannot disagree about what a legal size is or about
+    /// how a defective label set resolves.
+    ///
+    /// `None` — and therefore an **absent** attribute, never `0` — for an
+    /// unsized issue, an out-of-vocabulary label, more than one points label
+    /// (logged loudly), and a read that failed or was skipped (which yields
+    /// empty [`IssueSignals`], hence no labels at all).
+    pub(crate) fn story_points(&self, issue: u32) -> Option<u32> {
+        crate::story_points::resolve_story_points(issue, &self.labels)
+    }
 }
 
 /// Parse the `gh api --jq` projection this module requests into
@@ -419,6 +438,37 @@ mod tests {
             open_with(&["loom:curated", "loom:building", "tier:goal-supporting"]).end_state(None),
             Some(IssueEndState::StillOpen)
         );
+    }
+
+    /// #9432: the story-point size comes out of the labels THIS read already
+    /// carries — no second fetch — and honors the one-label-per-issue guard.
+    /// The three telemetry-visible outcomes, on the real projection shape.
+    #[test]
+    fn story_points_are_folded_out_of_the_same_projection() {
+        let sized = parse_issue_signals(
+            r#"{"body":"text","state":"open","closed_at":null,
+                "labels":["loom:building","loom:curated","points:5"]}"#,
+        );
+        assert_eq!(sized.story_points(9432), Some(5));
+
+        // No points label at all: absent, NOT zero.
+        let no_points = parse_issue_signals(
+            r#"{"body":"text","state":"open","closed_at":null,
+                "labels":["loom:building","loom:curated"]}"#,
+        );
+        assert_eq!(no_points.story_points(9432), None);
+
+        // Stacked labels: logged loudly by `resolve_story_points` and resolved
+        // to NO value — never to either of the two candidates.
+        let stacked = parse_issue_signals(
+            r#"{"body":"text","state":"open","closed_at":null,
+                "labels":["points:3","points:8"]}"#,
+        );
+        assert_eq!(stacked.story_points(9432), None);
+
+        // A failed/skipped read yields empty signals, hence no labels at all —
+        // the same absent attribute as an unsized issue, never a fabricated 0.
+        assert_eq!(IssueSignals::default().story_points(9432), None);
     }
 
     /// #9441: the reaper's own orphaned-claim recovery sets `loom:issue`

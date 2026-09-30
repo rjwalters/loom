@@ -21,6 +21,19 @@ pub(crate) mod points_signal;
 /// Markdown and posts it, once, to the sweep's originating issue.
 pub(crate) mod writeback;
 
+/// Attempt lineage (Issue #9444): `attempt_index`, `previous_sweep_id` and
+/// the dispatch `trigger`, derived from this host's durable outcome journal.
+pub(crate) mod lineage;
+
+/// In-sweep rework events (Issue #9444): the marker-file protocol the
+/// performing paths write and the terminal outcome samples.
+pub(crate) mod rework;
+
+/// Generated-path classification and the landing-diff hand-written size
+/// facts (Issue #9466): `hw_lines_*`, `hw_files`, `generated_lines`,
+/// `test_lines`.
+pub(crate) mod landing_size;
+
 /// One observed lifecycle-phase transition for a live sweep (Issue #4704):
 /// the checkpoint phase marker and the instant [`SweepRegistry::reap_once`]
 /// first observed it.
@@ -667,12 +680,15 @@ impl SweepRegistry {
             &self.config.workspace_root,
             issue,
         );
-        let usage = crate::sweep_usage::resolve(
-            usage_runtime.as_deref(),
-            &self.config.workspace_root,
-            issue,
-            crate::sweep_usage::window(started_at, duration_sec),
-            failure_class.as_deref(),
+        let usage = crate::sweep_usage::apply_plausibility_guard(
+            crate::sweep_usage::resolve(
+                usage_runtime.as_deref(),
+                &self.config.workspace_root,
+                issue,
+                crate::sweep_usage::window(started_at, duration_sec),
+                failure_class.as_deref(),
+            ),
+            duration_sec,
         );
         let crate::sweep_usage::SweepUsage {
             tokens_in,
@@ -681,6 +697,83 @@ impl SweepRegistry {
             status: tokens_status,
             reason: tokens_status_reason,
         } = usage;
+
+        // ── Issues #9444/#9465/#9466: the terminal facts that are neither
+        // disposition nor usage-status — attempt lineage, marked rework,
+        // every sampled PR, the landing's hand-written size, and the model
+        // that actually ran. All but the rework markers are free (local
+        // journal/phase-history/git reads); none can fail the append.
+
+        // Attempt lineage (Issue #9444): where this sweep sits in the issue's
+        // local attempt chain and what triggered it. Read off this host's
+        // durable outcome journal — no forge calls, no new state. Absent
+        // (never fabricated) when the journal could not be read or the repo
+        // slug never resolved (the journal matches on it).
+        let lineage = repo.as_deref().and_then(|repo_slug| {
+            let journal_path = self.config.resolve_outcome_telemetry_path();
+            let prior = sweep_outcomes::read_all_sweep_outcomes(&journal_path);
+            lineage::derive_lineage(&prior, repo_slug, issue, sweep_id)
+        });
+        let (attempt_index, previous_sweep_id, trigger) = lineage
+            .map_or((None, None, None), |(index, previous, trigger)| {
+                (Some(index), previous, Some(trigger.to_string()))
+            });
+
+        // In-sweep rework events (Issue #9444), two sources, markers first:
+        // (a) events the performing paths explicitly marked in the
+        // `sweep-rework-events.jsonl` protocol, and (b) events read off the
+        // worktree's own HEAD reflog — the mechanical writer that needs no
+        // role compliance, since a Doctor's conflict rebase or a Builder's
+        // merge-from-main records itself there with a timestamp. Both are
+        // scoped to this sweep's own window. Absent (never `[]`) when neither
+        // saw anything.
+        let rework_events = started_at.map(|started_at| {
+            let mut events =
+                rework::read_rework_events(&self.config.workspace_root, issue, Some(started_at));
+            let worktree = self.worktree_path(issue);
+            if worktree.exists() {
+                events.extend(rework::read_reflog_rework(&worktree, Some(started_at)));
+            }
+            events
+        });
+        let rework_events = rework_events.filter(|events| !events.is_empty());
+
+        // Every PR this sweep's lifecycle was observed to carry (Issue
+        // #9465), in first-seen order — the multi-PR slice shape the single
+        // latest `pr_number` cannot represent.
+        let pr_numbers = self.sampled_pr_numbers(sweep_id);
+
+        // Landing-size facts (Issue #9466): the hand-written vs generated
+        // split of this sweep's own diff, classified by the repo-owned
+        // `generatedPaths` globs over the shipped default. Best-effort and
+        // local only — omitted (never 0) whenever the worktree's numstat
+        // could not be read, the same contract `lines_added` keeps.
+        let landing_size = {
+            let worktree = self.worktree_path(issue);
+            if worktree.exists() {
+                crate::git_utils::diff_rows_against_mainline(&worktree).map(|rows| {
+                    let matcher = landing_size::GeneratedMatcher::new(
+                        &landing_size::generated_patterns(&self.config.workspace_root),
+                    );
+                    landing_size::classify_numstat(&rows, &matcher)
+                })
+            } else {
+                None
+            }
+        };
+
+        // Issue #9465: `model` names what actually ran — the dominant model
+        // in the per-model breakdown — with the dispatched model as the
+        // fallback when nothing was attributed. The dispatch-time arm stays
+        // under `config["arm"]` (#4809).
+        let model = tokens_by_model
+            .as_ref()
+            .and_then(|rows| {
+                rows.iter()
+                    .max_by_key(|row| row.input.saturating_add(row.output))
+                    .map(|row| row.model.clone())
+            })
+            .or(model);
 
         // Distinct model ids actually observed in this sweep's transcripts
         // (Issue #8056) — see `models_used_from`.
@@ -768,6 +861,13 @@ impl SweepRegistry {
         let issue_signals = self.fetch_issue_signals(issue);
         let complexity = issue_signals.complexity.clone();
         let issue_end_state = issue_signals.end_state(started_at);
+        // The Curator's story-point size (Issue #9432, epic #9429), folded out
+        // of the SAME read's label list — no extra forge round trip, and the
+        // estimate can never describe a different issue than `complexity` and
+        // the end state do. Pure label folding with the one-label-per-issue
+        // guard: absent, out-of-vocabulary and stacked points labels all yield
+        // `None` (the last two logged loudly), never a guessed or zero size.
+        let story_points = issue_signals.story_points(issue);
 
         // What this sweep actually DID (Issue #9441) — a pure derivation over
         // the signals already assembled above, NOT new instrumentation. The
@@ -816,7 +916,18 @@ impl SweepRegistry {
                 .and_then(|r| r.provider.clone()),
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
             complexity,
+            story_points,
             tokens_status: Some(tokens_status),
+            attempt_index,
+            previous_sweep_id,
+            trigger,
+            rework_events,
+            pr_numbers,
+            hw_lines_added: landing_size.as_ref().map(|size| size.hw_lines_added),
+            hw_lines_deleted: landing_size.as_ref().map(|size| size.hw_lines_deleted),
+            hw_files: landing_size.as_ref().map(|size| size.hw_files),
+            generated_lines: landing_size.as_ref().map(|size| size.generated_lines),
+            test_lines: landing_size.as_ref().map(|size| size.test_lines),
             tokens_status_reason,
         };
         // Issue #9441: both disposition invariants hold on every record this
@@ -873,6 +984,18 @@ impl SweepRegistry {
         // query can separate a landing from a no-op re-dispatch without
         // joining the journal.
         metadata.insert("loom.disposition".into(), outcome_record.disposition.as_str().to_string());
+        // Issues #9444/#9465/#9466: the new terminal facts ride the trace
+        // metadata too, so a span-side reader sees the same verdict the
+        // record carries.
+        if let Some(index) = outcome_record.attempt_index {
+            metadata.insert("loom.attempt_index".into(), index.to_string());
+        }
+        if let Some(previous) = outcome_record.previous_sweep_id.as_deref() {
+            metadata.insert("loom.previous_sweep_id".into(), previous.to_string());
+        }
+        if let Some(trigger) = outcome_record.trigger.as_deref() {
+            metadata.insert("loom.trigger".into(), trigger.to_string());
+        }
         for (key, value) in [
             ("loom.failure_class", outcome_record.failure_class.as_ref()),
             ("loom.configured_model", outcome_record.model.as_ref()),
@@ -1077,6 +1200,23 @@ impl SweepRegistry {
             .iter()
             .rev()
             .find_map(|o| o.pr_number)
+    }
+
+    /// Every PR number this sweep's lifecycle was observed to carry (Issue
+    /// #9465), in first-seen order — the multi-PR slice shape a single
+    /// latest-`pr_number` cannot represent. Free (no forge call): read off
+    /// the same phase history [`Self::sampled_pr_number`] reads.
+    pub(crate) fn sampled_pr_numbers(&self, sweep_id: &str) -> Option<Vec<u32>> {
+        let history = self.phase_history.get(sweep_id)?;
+        let mut seen = Vec::new();
+        for observation in history {
+            if let Some(pr) = observation.pr_number {
+                if !seen.contains(&pr) {
+                    seen.push(pr);
+                }
+            }
+        }
+        (!seen.is_empty()).then_some(seen)
     }
 
     /// The most recent `(jev_tier, jev_confidence)` pair observed on this
@@ -1330,3 +1470,15 @@ mod disposition_tests;
     unused_imports
 )]
 mod tokens_status_tests;
+
+// Contract tests for the #9465 PR-linkage and actually-ran-model derivation
+// (`pr_numbers`, `model` vs. `config["arm"]`), in their own sibling file for
+// the same file-size reason as `timeline_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod pr_link_tests;
