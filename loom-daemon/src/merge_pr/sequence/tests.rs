@@ -284,3 +284,92 @@ fn the_sentinels_are_distinct_positive_signals() {
         }
     }
 }
+
+// --- Live-hold parsing (release / replan tombstones, #9745 review) --------
+
+#[test]
+fn a_release_tombstone_ends_the_hold_it_names() {
+    let bodies = vec![
+        marker_line(111, PRED, FOLLOWER, "cons-a"),
+        format!("{}\nreleased — prose", release_marker_text("cons-a")),
+    ];
+    // `parse` still reports what the newest marker said (the gate reads the
+    // label, not this) …
+    assert_eq!(parse(&bodies).map(|m| m.plan), Some("cons-a".to_string()));
+    // … but the history-only question "is this hold still in force?" is no.
+    assert_eq!(parse_live(&bodies), None);
+}
+
+#[test]
+fn a_release_of_another_plan_does_not_void_a_newer_hold() {
+    let bodies = vec![
+        marker_line(111, PRED, FOLLOWER, "seq-old"),
+        marker_line(222, OTHER, FOLLOWER, "cons-new"),
+        release_marker_text("seq-old"),
+    ];
+    assert_eq!(parse_live(&bodies).map(|m| m.plan), Some("cons-new".to_string()));
+}
+
+#[test]
+fn a_hold_re_applied_after_its_release_is_live_again() {
+    // Newest wins in both directions: an abort then a fresh reservation under
+    // the same deterministic attempt id is a live reservation.
+    let bodies = vec![
+        marker_line(111, PRED, FOLLOWER, "cons-a"),
+        release_marker_text("cons-a"),
+        marker_line(333, OTHER, FOLLOWER, "cons-a"),
+    ];
+    assert_eq!(parse_live(&bodies).map(|m| m.after), Some(333));
+}
+
+#[test]
+fn a_replan_void_ends_any_hold() {
+    let bodies = vec![
+        marker_line(111, PRED, FOLLOWER, "seq-a"),
+        "<!-- loom:sequence replanned -->".to_string(),
+    ];
+    assert_eq!(parse_live(&bodies), None);
+}
+
+#[test]
+fn tombstone_look_alikes_are_not_tombstones() {
+    for fake in [
+        "<!-- loom:sequence released -->",
+        "<!-- loom:sequence released plan= -->",
+        "<!-- loom:sequence released plan=cons-a extra=1 -->",
+        "<!-- loom:sequence-x released plan=cons-a -->",
+        "`<!-- loom:sequence released plan=cons-a` -->",
+    ] {
+        let bodies = vec![marker_line(111, PRED, FOLLOWER, "cons-a"), fake.to_string()];
+        assert!(parse_live(&bodies).is_some(), "{fake:?} must not release the hold");
+    }
+}
+
+#[test]
+fn every_hold_releasing_writer_emits_a_tombstone_parse_live_reads() {
+    // Drift guard: the pass (#9686) and both consolidation verbs render their
+    // own release bodies; each must end the hold under `parse_live`.
+    use crate::claim_reconciliation::merge_sequence::{
+        release_comment_body, HoldAction, REPLAN_NOTE_BODY,
+    };
+    use crate::merge_pr::consolidate::{landing_release_body, reservation_release_body};
+    let m = SequenceMarker {
+        after: 111,
+        pred_head: PRED.into(),
+        follower_head: FOLLOWER.into(),
+        plan: "cons-ab12cd34".into(),
+        source: Some("pass".into()),
+    };
+    let writers = [
+        release_comment_body(&m, HoldAction::Release),
+        release_comment_body(&m, HoldAction::ReleaseDissolved),
+        release_comment_body(&m, HoldAction::Expire),
+        REPLAN_NOTE_BODY.to_string(),
+        reservation_release_body(&m, "cons-ab12cd34"),
+        landing_release_body(&m, "cons-ab12cd34"),
+    ];
+    for release in writers {
+        let bodies = vec![marker_text(&m), release.clone()];
+        assert_eq!(parse_live(&bodies), None, "not recognized as a release:\n{release}");
+    }
+}
