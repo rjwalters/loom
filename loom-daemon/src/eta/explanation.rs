@@ -110,23 +110,46 @@ pub struct HistoryWindow {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryScope {
-    /// This host's own journals only (every v1 estimate).
+    /// This host's own journals only.
     #[default]
     Local,
-    /// A fleet-wide snapshot. Reserved for #9343; never produced yet.
+    /// The history includes at least one **host-independent** source: a
+    /// fleet-wide snapshot derived from the forge
+    /// ([`super::fleet::FleetSnapshot`], #9343). Two hosts holding the same
+    /// snapshot id estimate identically from it.
     Fleet,
+}
+
+impl HistoryScope {
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HistoryScope::Local => "local",
+            HistoryScope::Fleet => "fleet",
+        }
+    }
 }
 
 /// The history an estimate read, and where its samples came from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HistoryRecord {
-    /// `local` (this host's journals) or, later, `fleet`.
+    /// `local` (this host's journals) or `fleet` (#9343).
     pub scope: HistoryScope,
-    /// Journals the distributions may read.
+    /// Journals the distributions may read — the heuristic's own filter, as
+    /// written. It is deliberately *not* expanded to name the equivalent
+    /// sources that filter also admits ([`super::history::SampleSource::admits`]);
+    /// `samples_by_source` below reports what was actually read, and keeping
+    /// this field the literal filter means a scope switch cannot silently
+    /// rewrite a shipped heuristic's recorded contract.
     pub sources: Vec<String>,
-    /// Stage samples used by the path's distributions, per journal.
+    /// Stage samples used by the path's distributions, per journal — the
+    /// **actual** attribution, so `forge:pr-timeline` appears here (and only
+    /// here) on a fleet estimate.
     pub samples_by_source: std::collections::BTreeMap<String, usize>,
     /// Stage samples used by the path's distributions, per recording host.
+    /// A forge-derived sample was recorded by no host and is attributed to
+    /// [`super::fleet::FORGE_HOST`].
     pub samples_by_host: std::collections::BTreeMap<String, usize>,
 }
 

@@ -41,14 +41,18 @@
 //! sample observed at or after `as_of`, so a replay over past instants cannot
 //! leak its own future (the backtest in #9325 depends on this).
 //!
-//! # Limitation: history is host-local (#9343)
+//! # History scope: local and fleet (#9343)
 //!
-//! v1 history is this host's own journals only, so estimates are empty on
-//! hosts that ran no sweeps for a repo, biased where they did, and
-//! inconsistent between hosts; the human-gated stages happen on the forge,
-//! not on any host. Every explanation records `history.scope = "local"` and
-//! the samples each source and host contributed. See [`history`] for the
-//! detail and the fleet-snapshot direction.
+//! Host-local history is this host's own journals only, so estimates are empty
+//! on hosts that ran no sweeps for a repo, biased where they did, and
+//! inconsistent between hosts; the human-gated stages happen on the forge, not
+//! on any host. [`fleet`] is the host-independent alternative: one
+//! forge-derived stage-boundary snapshot per repo, built outside the estimator,
+//! cached on disk, and handed in as an ordinary [`StageSamples`] value. Every
+//! explanation records `history.scope` (`local` / `fleet`) and the samples each
+//! source and host contributed, so forensics can always tell which view
+//! produced a number. See [`history`] for the trade-offs and [`fleet`] for the
+//! snapshot's determinism and cost properties.
 //!
 //! # Versioning
 //!
@@ -69,6 +73,7 @@ pub mod backtest;
 pub mod config;
 pub mod emit;
 pub mod explanation;
+pub mod fleet;
 pub mod grid;
 pub mod heuristics;
 pub mod history;

@@ -2869,6 +2869,7 @@ rules with `git check-ignore`.
 | `autonomous.eta.enabled` | `LOOM_ETA_ENABLED` | `true` |
 | `autonomous.eta.dryRun` | `LOOM_ETA_DRY_RUN` | `false` (log `eta: would emit …`, enqueue nothing) |
 | `autonomous.eta.refreshSecs` | `LOOM_ETA_REFRESH_SECS` | `300` |
+| `autonomous.eta.historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` — `local` (this host's journals), `augment` (plus the cached fleet snapshot) or `fleet` (the snapshot alone). A no-op until `loom-daemon eta fleet backfill` caches one (#9343) |
 | `autonomous.eta.current.{finish,land}` | none | `finish-v1` / `land-v1` |
 
 Model, heuristics, explanation schema, scoring and queries:
