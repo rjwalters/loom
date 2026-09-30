@@ -159,7 +159,22 @@
 # #4669 established.
 #
 # EXPLICITLY OUT OF SCOPE (never touched by resync — updated by other mechanisms):
-#   .loom/config.json       - operator-owned; needs merge-semantics design
+#   .loom/config.json       - operator-owned; needs merge-semantics design.
+#                             LOAD-BEARING for session mode (#8884): the
+#                             install-time `"mode": "session"` marker (and the
+#                             `terminals: []` / `autonomous.*.enabled: false`
+#                             key set it implies) persists precisely BECAUSE
+#                             this file is never touched here -- there is no
+#                             "restore the default terminals array" step to
+#                             suppress. A reinstall goes through
+#                             loom-daemon init's merge_config_file() instead,
+#                             which re-asserts the key set whenever it sees the
+#                             marker. Locked in by
+#                             defaults/scripts/tests/test-session-mode.sh, so a
+#                             future change that DOES start resyncing this file
+#                             fails there rather than silently re-arming the
+#                             tmux pool in a session-mode repo. See
+#                             defaults/docs/session-mode.md.
 #   CLAUDE.md               - repo-customized at install; needs managed-section markers,
 #                             WITH ONE NARROW EXCEPTION (#6612, narrowed further by
 #                             #8147), mirroring .loom/CLAUDE.md's #5559 exception
