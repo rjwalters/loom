@@ -95,7 +95,7 @@ pub fn resolve(repo: &Path, default_branch: &str, base: Option<&str>, quiet: boo
     // already validated `default_branch` (loom_default_branch), and this
     // refuses again rather than trusting that.
     if let Err(e) = check_refname(default_branch) {
-        rec.push((Level::Error, e.to_string()));
+        rec.push((Level::Error, refusal("default branch", &e)));
         return Outcome {
             records: rec,
             code: 1,
@@ -122,7 +122,7 @@ pub fn resolve(repo: &Path, default_branch: &str, base: Option<&str>, quiet: boo
     // 2. --base (#3729).
     if let Some(base) = base.filter(|b| !b.is_empty()) {
         if let Err(e) = check_refname(base) {
-            rec.push((Level::Error, e.to_string()));
+            rec.push((Level::Error, refusal("--base branch", &e)));
             rec.push((
                 Level::Json,
                 serde_json::json!({
@@ -209,6 +209,12 @@ pub fn emit(outcome: &Outcome) -> i32 {
         println!("{}\t{}", level.token(), text.replace('\n', " "));
     }
     outcome.code
+}
+
+/// The wording `check_branch_name` printed, which retained suites (and operators'
+/// muscle memory) match on: naming WHICH operand was refused.
+fn refusal(what: &str, e: &crate::refname::RefnameError) -> String {
+    format!("check_branch_name: REFUSING this {what} — {e}")
 }
 
 fn git_ok(repo: &Path, args: &[&str]) -> bool {

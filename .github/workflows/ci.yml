@@ -1942,6 +1942,13 @@ jobs:
         run: bash defaults/scripts/tests/test-worktree-local-branch-upstream-tracking.sh
       - name: worktree existing-dir upstream + drift check (#6257, #6291, ported in #8195 slice 9)
         run: bash defaults/scripts/tests/test-worktree-existing-dir-drift-check.sh
+      # Moved out of shell-suite-tests by #8195 slice 13: worktree.sh's `--base`
+      # stacked-PR resolution is `loom-daemon worktree-base`. Both suites pin it
+      # via loom_test_require_daemon_bin and FAIL rather than skip without one.
+      - name: worktree --base stacked-PR resolution (#3729, ported in #8195 slice 13)
+        run: bash defaults/scripts/tests/test-worktree-base-override.sh
+      - name: check_branch_name ref-operand guard (#9106; --base ported in #8195 slice 13)
+        run: bash defaults/scripts/tests/test-check-branch-name.sh
       # Moved out of shell-suite-tests by #8195 slice 10: worktree.sh's
       # --sparse/--full family is now `loom-daemon worktree-sparse`, including
       # the re-configure arm this suite's Tests 3/4 drive (its registration
