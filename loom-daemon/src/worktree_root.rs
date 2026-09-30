@@ -101,6 +101,48 @@ fn read_config_worktree_root(repo_root: &Path) -> Option<String> {
     Some(root.to_string())
 }
 
+/// [`worktree_root`], plus the bash helper's **unreadable-override fallback**.
+///
+/// `loom_worktree_root` does not merely resolve an override — on both override
+/// branches it also probes the resolved target with `_loom_root_unreadable`
+/// (`[[ -d "$t" ]] && ! ls "$t"`) and falls back to `${repo_root}/.loom/worktrees`
+/// when the directory exists but `readdir` fails. macOS TCC removable-volume
+/// denials produce exactly that state: `stat`/`df` keep succeeding while
+/// `ls`/`readdir` returns `EPERM`, so an `is_dir()` check alone cannot see it.
+///
+/// [`worktree_root`] deliberately keeps that probe out: its callers (the
+/// daemon's terminal-destroy GC, [`is_worktree_path`]) ask "which root is
+/// CONFIGURED", and a GC that silently retargeted the default root on a
+/// transient `EPERM` would start considering a different set of paths for
+/// removal. Callers that stand in for the bash helper — i.e. ports of a script
+/// that used to source `worktree-root.sh` — want the probe, because dropping it
+/// would be a behaviour change smuggled in by a port. `merge-pr cleanup-paths`
+/// (#8191) is the first such caller.
+///
+/// The probe applies only when an override actually moved the root: the bash
+/// helper's default branch (branch 3) returns without checking anything, and a
+/// default root that is unreadable has nowhere to fall back to anyway.
+pub fn worktree_root_readable(repo_root: &Path) -> PathBuf {
+    let resolved = worktree_root(repo_root);
+    let default = repo_root.join(".loom").join("worktrees");
+    if resolved != default && unreadable(&resolved) {
+        log::warn!(
+            "worktree root target exists but is unreadable (readdir failed, e.g. macOS TCC \
+             removable-volumes denial): '{}'; falling back to default",
+            resolved.display()
+        );
+        return default;
+    }
+    resolved
+}
+
+/// `_loom_root_unreadable <dir>`: the path exists as a directory (so `stat`
+/// succeeds) but listing it fails. Anything else — including "does not exist"
+/// — is NOT unreadable, matching the bash helper's leading `[[ -d "$1" ]]`.
+fn unreadable(dir: &Path) -> bool {
+    dir.is_dir() && std::fs::read_dir(dir).is_err()
+}
+
 /// Whether `path` is a Loom-managed worktree eligible for GC.
 ///
 /// Two-way match mirroring `defaults/scripts/agent-destroy.sh`: a path counts if
