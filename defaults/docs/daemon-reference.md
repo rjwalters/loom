@@ -4932,6 +4932,14 @@ Autonomous mode can be enabled and tuned entirely from committed config — no e
 vars required — so a repo can declare "this workspace runs autonomous mode with
 concurrency ceiling 5" and share it with the team:
 
+> **Operational tunables have their own surface (#9683/#9768).** The knobs that
+> govern *how fast and how much* the engine runs — tick cadence, concurrency,
+> admission ramps, lease TTL, review-debt backoff — live in the validated
+> [`hyperparameters`](hyperparameters.md) block (with the `$LOOM_HYPERPARAMS`
+> optimizer vector and the `loom.hyperparams.digest` run-provenance stamp), not
+> in the `autonomous` feature block below. The two compose: the
+> `hyperparameters` layer wins per-field where both set the same knob.
+
 ```json
 {
   "autonomous": {
