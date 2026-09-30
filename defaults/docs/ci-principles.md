@@ -10,10 +10,18 @@ the next person to add one will have an equally good argument.
    cheaper than an unverified merge, and far cheaper than a misattributed
    failure that costs an agent a triage cycle.
 
-2. **Never cancel verification of a distinct commit.** Superseding is correct
-   on a PR branch, where a newer push replaces an older one and the older
-   result is worthless. It is never correct on the default branch, where every
-   commit is distinct work that nothing else will verify.
+2. **Never cancel verification of a distinct commit once it has started.**
+   Superseding is correct on a PR branch, where a newer push replaces an
+   older one and the older result is worthless. On the default branch every
+   commit is distinct work, so a started `main` run is never cancelled.
+   Bounding the *queue* is the one exception (#9608): `main` shares one
+   concurrency group with `cancel-in-progress: false`, so at most one run is
+   in progress and one waits, and a newer push supersedes only a run that has
+   not started. The tip is always verified. What a merge burst loses is the
+   per-commit result for the intermediate commits that never started; if the
+   tip is red, bisect across the burst to find the culprit. Without the bound,
+   a burst of ~45 merges queued ~30 full runs and left the tip unverified for
+   hours.
 
 3. **Path-filtering is an optimisation, not a correctness tool.** A check that
    can fail because of a file *outside* its path group must not be filtered by
@@ -184,7 +192,8 @@ a cancellation rate.
 
 ## Related
 
-- #7779 / PR #7803 — the cancellation fix
+- #7779 / PR #7803 — the cancellation fix; #9608 — the bounded `main` queue
+  (one running + newest pending) that rule 2 now allows
 - #7789 / #7791 — flake tracking, and why retry must *record* rather than hide
 - #7745 / #7761 — the same "a skipped check must not read as a pass" rule,
   learned in the resync and guard layers
