@@ -17,14 +17,14 @@
 //!   a merged candidate (landing wins; reconciliation territory).
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use loom_daemon::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
 use loom_daemon::merge_pr::consolidate::{
     self as cons, attempt_id, candidate_branch, check_eligibility, fetch_component,
     find_open_candidate, mapping_body, parse_mapping, push_branch, remove_worktree,
     reservation_comment_body, reservation_marker, reservation_present, Bounds, PrepareOutcome,
 };
-use loom_daemon::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
 use loom_daemon::merge_pr::sequence::fetch_trusted_bodies;
+use serde::Deserialize;
 
 #[derive(clap::Args)]
 pub(crate) struct ConsolidatePrepareArgs {
