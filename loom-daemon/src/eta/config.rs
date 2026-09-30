@@ -5,6 +5,7 @@
 //! | `enabled` | `LOOM_ETA_ENABLED` | `true` (operator decision on #9289) |
 //! | `dryRun` | `LOOM_ETA_DRY_RUN` | `false`: compute and log, enqueue nothing |
 //! | `refreshSecs` | `LOOM_ETA_REFRESH_SECS` | `300` |
+//! | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 //! | `current.start` / `current.finish` / `current.land` | — | `start-v1` / `finish-v1` / `land-v1` |
 
 use super::Kind;
@@ -16,6 +17,54 @@ pub const DEFAULT_REFRESH_SECS: u64 = 300;
 /// Shortest refresh accepted, so a misconfiguration cannot flood the queue.
 pub const MIN_REFRESH_SECS: u64 = 60;
 
+/// Which history an estimate reads (#9343).
+///
+/// The default is [`HistoryScopeMode::Augment`], and it is a no-op until an
+/// operator runs `loom-daemon eta fleet backfill`: with no cached snapshot
+/// there is nothing to augment with, so a host that has not opted in behaves
+/// exactly as before.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HistoryScopeMode {
+    /// This host's journals only. Pre-#9343 behaviour, kept as an escape
+    /// hatch.
+    Local,
+    /// The cached fleet snapshot **plus** this host's journals, reported as
+    /// `scope = fleet`. The daemon default: the forge cannot see in-sweep
+    /// phases, so dropping the local journals would cost every `finish`
+    /// estimate.
+    #[default]
+    Augment,
+    /// The cached fleet snapshot **only**, so the estimate is a pure function
+    /// of a named snapshot and two hosts holding the same snapshot id agree
+    /// byte for byte. Falls back to local when no snapshot exists — a missing
+    /// cache must not silently become "no history".
+    Fleet,
+}
+
+impl HistoryScopeMode {
+    /// Parse the config / env / CLI vocabulary. `None` for anything else, so a
+    /// typo leaves the default in force rather than picking a scope at random.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "local" => Some(HistoryScopeMode::Local),
+            "augment" => Some(HistoryScopeMode::Augment),
+            "fleet" => Some(HistoryScopeMode::Fleet),
+            _ => None,
+        }
+    }
+
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HistoryScopeMode::Local => "local",
+            HistoryScopeMode::Augment => "augment",
+            HistoryScopeMode::Fleet => "fleet",
+        }
+    }
+}
+
 /// Resolved ETA settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EtaConfig {
@@ -25,6 +74,8 @@ pub struct EtaConfig {
     pub dry_run: bool,
     /// Refresh an unchanged estimate after this many seconds.
     pub refresh_secs: u64,
+    /// Which history an estimate reads (#9343).
+    pub history_scope: HistoryScopeMode,
     /// Configured `current` heuristic for `start`.
     pub current_start: Option<String>,
     /// Configured `current` heuristic for `finish`.
@@ -39,6 +90,7 @@ impl Default for EtaConfig {
             enabled: true,
             dry_run: false,
             refresh_secs: DEFAULT_REFRESH_SECS,
+            history_scope: HistoryScopeMode::default(),
             current_start: None,
             current_finish: None,
             current_land: None,
@@ -81,6 +133,12 @@ pub fn resolve(config: &serde_json::Value, env: impl Fn(&str) -> Option<String>)
     if let Some(v) = get("refreshSecs").and_then(serde_json::Value::as_u64) {
         resolved.refresh_secs = v;
     }
+    if let Some(v) = get("historyScope")
+        .and_then(serde_json::Value::as_str)
+        .and_then(HistoryScopeMode::parse)
+    {
+        resolved.history_scope = v;
+    }
     let current = get("current");
     let id = |kind: &str| {
         current
@@ -100,6 +158,12 @@ pub fn resolve(config: &serde_json::Value, env: impl Fn(&str) -> Option<String>)
     }
     if let Some(v) = env("LOOM_ETA_REFRESH_SECS").and_then(|s| s.trim().parse::<u64>().ok()) {
         resolved.refresh_secs = v;
+    }
+    if let Some(v) = env("LOOM_ETA_HISTORY_SCOPE")
+        .as_deref()
+        .and_then(HistoryScopeMode::parse)
+    {
+        resolved.history_scope = v;
     }
     resolved.refresh_secs = resolved.refresh_secs.max(MIN_REFRESH_SECS);
     resolved

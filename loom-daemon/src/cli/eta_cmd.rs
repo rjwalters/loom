@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 
 use loom_daemon::cmd_out::Query;
 use loom_daemon::eta::backtest::{self, BacktestReport, Bucket, Comparison, Filter};
+use loom_daemon::eta::config::HistoryScopeMode;
 use loom_daemon::eta::explanation::{Explanation, Features};
+use loom_daemon::eta::fleet;
 use loom_daemon::eta::history::StageSamples;
 use loom_daemon::eta::journal::{self, censored_from_pr_history, entries_from_pr_history};
 use loom_daemon::eta::labels as eta_labels;
@@ -67,6 +69,12 @@ pub(crate) enum EtaCommand {
     /// and with `--apply`, flip `autonomous.eta.current.<kind>` when — and
     /// only when — both gates pass.
     Promote(EtaPromoteArgs),
+    /// Build, top up and inspect the fleet-wide forge-derived history
+    /// snapshot (#9343): `loom-daemon eta fleet backfill|refresh|show`.
+    Fleet {
+        #[command(subcommand)]
+        command: super::eta_fleet_cmd::FleetCommand,
+    },
 }
 
 impl EtaCommand {
@@ -77,6 +85,7 @@ impl EtaCommand {
             EtaCommand::View(args) => args.run(),
             EtaCommand::List(args) => args.run(),
             EtaCommand::Promote(args) => args.run(),
+            EtaCommand::Fleet { command } => command.run(),
         }
     }
 }
@@ -309,7 +318,7 @@ impl EtaBackfillArgs {
 /// `owner/repo`, from `gh repo view`. Unlike `pr-latency` (which lets `gh`
 /// resolve the repo implicitly for every call it makes), backfill needs the
 /// slug up front to stamp on every derived row.
-fn resolve_repo(root: &Path) -> Option<String> {
+pub(crate) fn resolve_repo(root: &Path) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct NameWithOwner {
         #[serde(rename = "nameWithOwner")]
@@ -437,14 +446,29 @@ fn load_outcome_envelopes(root: &Path) -> Vec<TelemetryEnvelope> {
 /// [`StageSamples`] read the same way `eta backtest` builds it
 /// ([`load_outcome_envelopes`] plus the stage-sample journal), for `eta
 /// view`/`eta list`: the `sweep.outcome` telemetry journal merged with
-/// `.loom/logs/eta-stage-samples.jsonl` transitions this host observed.
-fn load_history(root: &Path) -> StageSamples {
+/// `.loom/logs/eta-stage-samples.jsonl` transitions this host observed, with
+/// `scope` applied on top (#9343).
+///
+/// `scope` reads the cached fleet snapshot only — it makes no forge call, so
+/// `eta view` costs the same whichever scope it runs at. Building that cache
+/// is `eta fleet backfill`'s job.
+fn load_history(root: &Path, scope: HistoryScopeMode) -> StageSamples {
     let envelopes = load_outcome_envelopes(root);
     let mut history = StageSamples::default();
     history.push_envelopes(&envelopes);
     let journal_entries = journal::read(&journal::journal_path(root));
     history.push_journal(&journal_entries, "local");
-    history
+    fleet::apply_scope(scope, root, history)
+}
+
+/// The scope a `--scope` flag asks for: the flag when given, else the
+/// configured `autonomous.eta.historyScope`.
+fn resolve_scope(flag: Option<&str>, root: &Path) -> Result<HistoryScopeMode> {
+    match flag {
+        Some(raw) => HistoryScopeMode::parse(raw)
+            .ok_or_else(|| anyhow::anyhow!("invalid --scope {raw:?} (local | augment | fleet)")),
+        None => Ok(loom_daemon::eta::config::read(root).history_scope),
+    }
 }
 
 /// Parse `owner/repo#issue` (the `eta view` positional argument) into its
@@ -737,10 +761,11 @@ fn explain_current(
     issue_labels: &[String],
     has_open_pr: bool,
     now: DateTime<Utc>,
+    scope: HistoryScopeMode,
 ) -> Vec<Explanation> {
     let config = loom_daemon::eta::config::read(root);
     let registry = Registry::builtin();
-    let history = load_history(root);
+    let history = load_history(root, scope);
     eligible_kinds(current, has_open_pr)
         .iter()
         .map(|&kind| {
@@ -770,6 +795,12 @@ pub(crate) struct EtaViewArgs {
     /// Defaults to the current directory.
     #[arg(long, value_name = "PATH")]
     pub repo_root: Option<PathBuf>,
+
+    /// Which history to estimate from (#9343): `local` (this host's journals),
+    /// `augment` (local plus the cached fleet snapshot) or `fleet` (the cached
+    /// snapshot alone). Defaults to `autonomous.eta.historyScope`.
+    #[arg(long, value_name = "SCOPE")]
+    pub scope: Option<String>,
 }
 
 impl EtaViewArgs {
@@ -796,8 +827,16 @@ impl EtaViewArgs {
         let mut subject = Subject::new(&repo, resolve_repo_id(&root, &repo), issue);
         subject.pr_number = pr_number;
 
-        let explanations =
-            explain_current(&root, &subject, &current, &issue_labels, pr_number.is_some(), now);
+        let scope = resolve_scope(self.scope.as_deref(), &root)?;
+        let explanations = explain_current(
+            &root,
+            &subject,
+            &current,
+            &issue_labels,
+            pr_number.is_some(),
+            now,
+            scope,
+        );
 
         if self.explain {
             let value = if explanations.len() == 1 {
@@ -845,6 +884,11 @@ pub(crate) struct EtaListArgs {
     /// Emit the list as JSON instead of text.
     #[arg(long)]
     pub json: bool,
+
+    /// Which history to estimate from (#9343): `local`, `augment` or `fleet`.
+    /// Defaults to `autonomous.eta.historyScope`.
+    #[arg(long, value_name = "SCOPE")]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -901,7 +945,7 @@ impl EtaListArgs {
 
         let config = loom_daemon::eta::config::read(&root);
         let registry = Registry::builtin();
-        let history = load_history(&root);
+        let history = load_history(&root, resolve_scope(self.scope.as_deref(), &root)?);
         let repo_id = resolve_repo_id(&root, &repo);
 
         let mut out: Vec<ListRow> = Vec::with_capacity(rows.len());
