@@ -4,6 +4,7 @@
 
 use super::{NoEstimateReason, Stage};
 use crate::observability::queue_blocked::{BLOCKED_LABEL, HOLD_LABELS};
+use crate::types::{PlanState, RowPlan};
 use crate::work_finder::{BUILDING_LABEL, PARK_LABELS, SKIP_LABELS};
 
 /// A PR waiting for a Judge verdict.
@@ -73,17 +74,36 @@ pub fn stage_from_pr_labels(labels: &[String]) -> Result<Stage, NoEstimateReason
     }
 }
 
-/// Why an issue with no running sweep and no open PR has no estimate.
+/// Why an issue with no running sweep and no open PR has no estimate, or
+/// `None` when it has one: a ready issue the dispatch plan (#9288) gives a
+/// position (#9326). `plan` is its row on the last tick, `None` when no plan
+/// covers it.
 #[must_use]
-pub fn unstarted_issue_reason(labels: &[String]) -> NoEstimateReason {
+pub fn unstarted_issue_reason(
+    labels: &[String],
+    plan: Option<&RowPlan>,
+) -> Option<NoEstimateReason> {
     if let Err(reason) = check_holds(labels) {
-        return reason;
+        return Some(reason);
     }
     if HUMAN_GATED_LABELS.iter().any(|l| has(labels, l)) {
-        NoEstimateReason::HumanGated
+        Some(NoEstimateReason::HumanGated)
     } else if has(labels, READY_LABEL) {
-        NoEstimateReason::NoDispatchPlan
+        plan.map_or(Some(NoEstimateReason::NoDispatchPlan), ready_row_reason)
     } else {
-        NoEstimateReason::UnknownStage
+        Some(NoEstimateReason::UnknownStage)
+    }
+}
+
+/// Why a ready row of the dispatch plan has no `start` estimate, or `None`
+/// when it has one: it is waiting (`next`/`queued`) at a plan position.
+/// A `blocked` row, a row with no position, and a row whose state this build
+/// does not know are all outside the plan's coverage: `no_dispatch_plan`.
+/// (`running` rows are dispatched; the sweep, not the plan, estimates them.)
+#[must_use]
+pub fn ready_row_reason(plan: &RowPlan) -> Option<NoEstimateReason> {
+    match (plan.plan_state, plan.position) {
+        (PlanState::Next | PlanState::Queued, Some(_)) => None,
+        _ => Some(NoEstimateReason::NoDispatchPlan),
     }
 }

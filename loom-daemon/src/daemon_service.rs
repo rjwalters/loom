@@ -20,6 +20,7 @@ use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::host_breaker;
+use loom_daemon::hyperparams;
 use loom_daemon::idle_exit;
 use loom_daemon::install_self_check;
 use loom_daemon::ipc::IpcServer;
@@ -135,6 +136,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // the room and to relay a vetted command (Issue #7947), so it needs
             // the async runtime for the same reason `quarantine` does.
             Commands::Concierge(args) => args.action.run().await,
+            // `hyperparams` prints the resolved hyperparameter vector
+            // (Issue #9683) — pure config resolution, no live daemon, so it
+            // needs neither the socket nor the async runtime.
+            Commands::Hyperparams(args) => args.run(),
             // `quarantine` connects to the running daemon over its Unix socket
             // (the quarantine state is in-memory), so it needs the async runtime.
             Commands::Quarantine { action } => handle_quarantine_command(action).await,
@@ -382,6 +387,16 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 .display(),
         );
     }
+
+    // Unified operational hyperparameters (Issue #9683): resolve the vector
+    // down its tier chain (single-knob env > $LOOM_HYPERPARAMS vector >
+    // "hyperparameters" config block > legacy autonomous.* keys > defaults),
+    // fail fast on any out-of-range/unknown/contradictory value on the
+    // hyperparameters surface, and capture the resolved vector + digest into
+    // the process globals the per-knob resolvers and the span provenance
+    // stamper read. Runs before any span exists so every span of this run
+    // records `loom.hyperparams.digest` for the vector it started under.
+    hyperparams::startup_init(&sweep_workspace)?;
 
     let sweep_config = SweepRegistryConfig::new(sweep_workspace.clone());
 
@@ -644,7 +659,16 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `fleet.syncIntervalSecs` timer task behind for drift detection. A host
     // with no `fleet.repo` — every host that has not opted in — does nothing
     // at all here. See `loom_daemon::fleet_sync`.
-    let _fleet_sync_handle =
+    //
+    // #9598: the startup pass also resolves this host's *desired run state*
+    // from `fleet/state.yml`. A `stopped` state is acted on INSIDE this call —
+    // it exits `EXIT_FLEET_STOPPED` here, before any dispatch producer, IPC
+    // listener or role loop is constructed, so there is nothing to drain. A
+    // `paused` state cannot be: `DrainState` is built ~650 lines below, after
+    // the workspace pool, so the hold travels in `Started::hold_note` and is
+    // applied there by `fleet_state::wire`. `running`, an unreadable state and
+    // an unset `fleet.repo` all carry on untouched.
+    let fleet_started =
         loom_daemon::fleet_sync::start(&sweep_workspace, Some(event_bus.clone())).await;
 
     // #4430: ticks every `GITHUB_APP_REFRESH_INTERVAL` (~5min) to keep the
@@ -1293,7 +1317,17 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // it and renders it in `loom-daemon status`). With no drain requested the flag
     // stays `false`, so every producer's halt check is byte-for-byte unchanged.
     // #8652: backed by the persisted paused-time ledger (see `DrainState::with_default_ledger`).
-    let drain_state = Arc::new(loom_daemon::ipc::DrainState::with_default_ledger());
+    // #9598: `fleet_state::wire` is that same `with_default_ledger()` for every
+    // host with no `fleet.repo` — and for a host whose store says `running` —
+    // so boot is byte-for-byte unchanged there. A `paused` host instead starts
+    // HELD: dispatch producers see the same flag a `fleet drain` sets, so
+    // in-flight work (there is none yet at boot) finishes and nothing new is
+    // admitted. `wire` also arms the `fleet.syncIntervalSecs` timer against
+    // this drain state, which is what enforces a run-state change that lands
+    // mid-run — it is armed HERE, rather than inside `fleet_sync::start`
+    // above, because neither the drain state nor the workspace pool it drains
+    // through exists at the point in boot where the startup render must happen.
+    let drain_state = loom_daemon::fleet_state::wire(fleet_started, &workspace_pool, &event_bus);
     let drain_flag = drain_state.flag();
 
     // Shared role-runner in-progress guard (#4364): one set, cloned into both

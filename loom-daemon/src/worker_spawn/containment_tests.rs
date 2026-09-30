@@ -506,6 +506,7 @@ fn host_only_paths_are_not_forwarded_into_the_container() {
         "the native container has no business holding a Claude token"
     );
     assert!(forwarded_by_name("LOOM_ROLE"));
+    assert!(forwarded_by_name("LOOM_WORK_ORIGIN"));
     assert!(forwarded_by_name("LOOM_SWEEP_CLAIM_OWNED"));
     assert!(forwarded_by_name("GH_TOKEN"));
 }

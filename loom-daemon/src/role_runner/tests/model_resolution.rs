@@ -717,3 +717,26 @@ fn test_invoke_writes_resolved_effort_into_the_role_log_header() {
 
     std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
 }
+
+#[test]
+#[serial(loom_config_env)]
+fn autonomous_role_overrides_interactive_parent_origin() {
+    let old = std::env::var_os(crate::provenance::origin::ENV);
+    std::env::set_var(crate::provenance::origin::ENV, "interactive");
+    let tmp = tempfile::tempdir().unwrap();
+    let script = write_fake_script(
+        tmp.path(),
+        "origin-spawn.sh",
+        "printf '%s' \"$LOOM_WORK_ORIGIN\" > origin.txt",
+    );
+    let mut runner =
+        ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+    let result = runner.invoke("doctor", "/loom:doctor");
+    if let Some(old) = old {
+        std::env::set_var(crate::provenance::origin::ENV, old);
+    } else {
+        std::env::remove_var(crate::provenance::origin::ENV);
+    }
+    assert_eq!(result, RoleTickOutcome::Success);
+    assert_eq!(fs::read_to_string(tmp.path().join("origin.txt")).unwrap(), "autonomous");
+}

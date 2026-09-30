@@ -17,6 +17,7 @@ use clap::{Args, Subcommand};
 use loom_daemon::fleet_store::fetch::{self, Freshness, Loaded, Policy};
 use loom_daemon::fleet_store::gh::GhTransport;
 use loom_daemon::fleet_store::propose;
+use loom_daemon::fleet_store::reload;
 use loom_daemon::fleet_store::render::{self, Drift};
 use loom_daemon::fleet_store::roster::{self, Change, Registered};
 use loom_daemon::fleet_store::{self as store, state, StoreLocation};
@@ -53,6 +54,14 @@ enum FleetConfigCommand {
     /// (`fleet/hosts/<H>/local.json`) and write them where the daemon reads
     /// them. Falls back to the cached snapshot (with a warning) if the forge
     /// is unreachable.
+    ///
+    /// Every changed key is classified live-reloadable or restart-required
+    /// (#9597, [`loom_daemon::fleet_store::reload`]). A live-reloadable
+    /// change is confirmed against a running daemon over IPC (`DaemonStatus`)
+    /// with no restart; a restart-required change is recorded in
+    /// [`loom_daemon::fleet_store::pending_restart`] so `loom-daemon status`
+    /// keeps reporting it until the daemon that was running at render time
+    /// actually restarts.
     Render {
         /// Host id in the store (default: `LOOM_HOST_ID`, else the hostname).
         #[arg(long, value_name = "HOST")]
@@ -323,8 +332,11 @@ fn cmd_render(ctx: &Ctx, host: Option<String>, check: bool, offline: bool) -> Re
         for (t, d) in targets.iter().zip(&drifts) {
             print_drift(t, d);
         }
+        print_reload_classification(&targets, &drifts);
         return Ok(render::check_exit_code(&drifts));
     }
+    let drifts: Vec<Drift> = targets.iter().map(render::drift).collect();
+    let (live, restart_required) = classify_drifted_paths(&targets, &drifts);
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let mut wrote = false;
     for t in &targets {
@@ -338,12 +350,54 @@ fn cmd_render(ctx: &Ctx, host: Option<String>, check: bool, offline: bool) -> Re
         }
     }
     if wrote {
-        println!(
-            "note: many daemon knobs are read once at startup — restart the daemon for the new \
-             config to take effect (see fleet-config-lifecycle.md)"
-        );
+        super::fleet_config_reload::report(&ctx.workspace, &live, &restart_required);
     }
     Ok(0)
+}
+
+/// [`Reloadability`](reload::Reloadability)-classify every path each target's
+/// `Drift::Differs` names, returning `(live, restart_required)` in target
+/// order (Issue #9597). A `Missing`/`Unparseable` target replaces the whole
+/// file, so there is no meaningful per-path diff to classify — it is
+/// conservatively treated as restart-required as a whole, named by tier
+/// rather than by key.
+fn classify_drifted_paths(
+    targets: &[render::Target],
+    drifts: &[Drift],
+) -> (Vec<String>, Vec<String>) {
+    let mut live = Vec::new();
+    let mut restart_required = Vec::new();
+    for (t, d) in targets.iter().zip(drifts) {
+        match d {
+            Drift::Differs(_) => {
+                let (l, r) = reload::partition(&render::drifted_paths(t));
+                live.extend(l);
+                restart_required.extend(r);
+            }
+            Drift::Missing | Drift::Unparseable(_) => {
+                restart_required.push(format!("{} (whole file)", t.tier.name()));
+            }
+            Drift::InSync => {}
+        }
+    }
+    (live, restart_required)
+}
+
+/// `render --check`'s read-only counterpart to the write path's live-reload
+/// report: names which changed keys are live-reloadable vs. restart-required,
+/// without signaling a daemon or writing the pending-restart marker (nothing
+/// was written).
+fn print_reload_classification(targets: &[render::Target], drifts: &[Drift]) {
+    let (live, restart_required) = classify_drifted_paths(targets, drifts);
+    if !live.is_empty() {
+        println!("live-reloadable if applied (no restart needed): {}", live.join(", "));
+    }
+    if !restart_required.is_empty() {
+        println!(
+            "restart-required if applied (needs the daemon to restart): {}",
+            restart_required.join(", ")
+        );
+    }
 }
 
 fn print_drift(t: &render::Target, d: &Drift) {

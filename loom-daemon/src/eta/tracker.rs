@@ -56,8 +56,14 @@
 //!   the curator phase has local history like every other in-sweep phase,
 //!   and no refusal reason fits it), and every open PR under a review label
 //!   that closes an issue.
-//! - Nothing for an issue with no running sweep and no open PR: that is
-//!   intake, approval or the ready queue, which a later phase covers.
+//! - `start` (#9326): every ready (`loom:issue`) issue on the last
+//!   work-finder tick's dispatch plan that has no running sweep and no PR
+//!   ([`Tracker::on_ready_queue`]). Such an item sits in `ready_wait` and
+//!   also gets a `land` estimate, over the queue wait plus the post-dispatch
+//!   chain. A row the plan gives no position (blocked) gets a
+//!   `no_dispatch_plan` refusal for both; its dispatch settles `start`
+//!   (`started`) and hands the item to the sweep's own `finish`/`land` chain.
+//! - Nothing for intake or approval (no plan orders them).
 //! - An item in `doctor` always has at least one rework round: `doctor` is
 //!   entered only through a rejection, so an item first seen there (after a
 //!   restart) is counted as having taken one.
@@ -68,8 +74,8 @@ use super::journal::JournalEntry;
 use super::labels::stage_from_pr_labels;
 use super::score::{score, EstimateSummary, OutcomeKind, Score, StageObservation};
 use super::{
-    AgeSource, CurrentStage, CurrentState, EstimateInput, Kind, NoEstimateReason, Provenance,
-    Registry, Stage, StageSamples, Subject,
+    AgeSource, CurrentStage, CurrentState, DispatchInput, EstimateInput, Heuristic, Kind,
+    NoEstimateReason, Provenance, Registry, Stage, StageSamples, Subject,
 };
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use std::collections::BTreeMap;
@@ -140,6 +146,14 @@ struct Item {
     /// The last completed phase and when, to drop duplicate publications.
     last_phase: Option<(String, DateTime<Utc>)>,
     emit: BTreeMap<(Kind, String), EmitState>,
+    /// On the last dispatch plan as a ready row, not yet dispatched (#9326).
+    in_ready_queue: bool,
+    /// Its plan position, when the plan gives it one.
+    ready: Option<DispatchInput>,
+    /// Ready rows on that plan, for the `queue_ready` feature.
+    queue_ready: Option<u32>,
+    /// The plan's concurrency cap, for the `max_concurrent` feature.
+    max_concurrent: Option<u32>,
 }
 
 /// A PR row from a review-label listing.
@@ -230,6 +244,14 @@ pub struct Emission {
     pub trigger: Trigger,
     /// The estimate.
     pub explanation: Explanation,
+    /// Whether this is the `current` heuristic's estimate for its kind — the
+    /// one every existing consumer reads (#9328).
+    ///
+    /// A `false` here is a **shadow** estimate: computed, journaled and
+    /// emitted as its own `eta.estimate` so a candidate accumulates a live
+    /// record, but never the subject's answer. Nothing downstream may treat a
+    /// shadow estimate as the item's ETA.
+    pub primary: bool,
 }
 
 /// Context the caller supplies to every estimate.
@@ -237,6 +259,8 @@ pub struct Emission {
 pub struct EstimateContext<'a> {
     /// The heuristics.
     pub registry: &'a Registry,
+    /// Configured current heuristic per kind.
+    pub current_start: Option<&'a str>,
     /// Configured current heuristic per kind.
     pub current_finish: Option<&'a str>,
     /// Configured current heuristic per kind.
@@ -359,9 +383,15 @@ impl Tracker {
 
     /// [`Self::transition`], but the stage being left did **not** complete —
     /// it ended by closure (a PR closed unmerged). The row names the stage it
-    /// leaves and carries no `entered_at`/`duration_sec`, so
+    /// leaves and carries no `duration_sec`, so
     /// [`JournalEntry::history_sample`] skips it and no truncated stage enters
     /// the distributions.
+    ///
+    /// It does carry a `censored_sec` **lower bound** when the entry instant
+    /// was exactly observed (#9328): the stage provably lasted at least that
+    /// long without completing. Only `land-v2`'s Kaplan–Meier grids read it
+    /// ([`JournalEntry::censored_sample`]); every v1 distribution is
+    /// unchanged.
     #[allow(clippy::too_many_arguments)]
     fn transition_unobserved(
         &mut self,
@@ -416,6 +446,11 @@ impl Tracker {
                     left_at: at,
                     source: observed_source.to_string(),
                 });
+            } else if old.exact {
+                // Cut short, but the entry instant was exact: a right-censored
+                // lower bound, never a duration (#9328).
+                row.entered_at = Some(old.entered_at);
+                row.censored_sec = Some((at - old.entered_at).num_seconds().max(0));
             }
         }
         item.stage = next.map(|stage| StageTrack {
@@ -441,6 +476,16 @@ impl Tracker {
         item.sweep_running = true;
         item.landed = false;
         item.verdict_pending_since = None;
+        // The dispatch is the `start` outcome (#9326). From here the sweep
+        // drives the item; the queue wait leaves no duration (its entry is
+        // only the tracker's first sight of the row).
+        let was_ready = std::mem::take(&mut item.in_ready_queue);
+        item.ready = None;
+        if was_ready {
+            item.refused = None;
+        }
+        let outcomes =
+            self.resolve(&key, Kind::Start, OutcomeKind::Started, at, "bus", Some(0), None);
         let mut row = self.transition(
             &key,
             Some(Stage::SweepCurator),
@@ -453,6 +498,7 @@ impl Tracker {
         row.raw = serde_json::json!({"sweep_id": sweep_id});
         Effects {
             journal: vec![row],
+            outcomes,
             dirty: vec![key],
             ..Effects::default()
         }
@@ -937,7 +983,7 @@ impl Tracker {
         let keep = self
             .items
             .get(key)
-            .is_some_and(|i| i.sweep_running || i.in_review_listing);
+            .is_some_and(|i| i.sweep_running || i.in_review_listing || i.in_ready_queue);
         if !keep {
             self.items.remove(key);
         }
@@ -1040,6 +1086,10 @@ impl Tracker {
         if kind == Kind::Finish && !item.sweep_running {
             return None;
         }
+        let ready_only = item.in_ready_queue && !item.sweep_running && item.pr_number.is_none();
+        if kind == Kind::Start && !ready_only {
+            return None;
+        }
         if kind == Kind::Land && item.landed {
             return None;
         }
@@ -1080,6 +1130,13 @@ impl Tracker {
             hour_utc: Some(now.hour()),
             weekday_utc: Some(now.weekday().num_days_from_monday()),
             host_id: ctx.host_id.map(str::to_string),
+            queue_rank: item
+                .ready
+                .as_ref()
+                .map(|r| r.position)
+                .filter(|_| ready_only),
+            queue_ready: item.queue_ready.filter(|_| ready_only),
+            max_concurrent: item.max_concurrent.filter(|_| ready_only),
             ..Features::default()
         };
         let mut omitted = Vec::new();
@@ -1096,12 +1153,27 @@ impl Tracker {
             features,
             features_omitted: omitted,
             provenance: self.loom.clone(),
+            dispatch: item.ready.clone().filter(|_| ready_only),
         })
     }
 
     /// Estimate `keys` (every item when `None`) at `now`, returning the
     /// estimates the emit policy lets out. Each emitted estimate becomes
     /// pending until its outcome.
+    ///
+    /// # Shadow mode (#9328)
+    ///
+    /// **Every** registered heuristic of each kind is estimated, not only
+    /// `current` — [`Emission::primary`] marks which one is the subject's
+    /// answer. The additions are strictly additive: `current`'s estimate is
+    /// computed from the identical input against the identical history and is
+    /// emitted first, so no existing consumer sees a different number, only
+    /// extra rows beside it.
+    ///
+    /// Each `(kind, heuristic)` series keeps its own emit state, so a shadow
+    /// estimate's refresh cadence never gates `current`'s, and vice versa; and
+    /// each becomes pending, so one outcome scores both sides at the same
+    /// `as_of` — the pairing [`super::shadow::ShadowLedger`] reads.
     pub fn estimate(
         &mut self,
         keys: Option<&[ItemKey]>,
@@ -1117,39 +1189,59 @@ impl Tracker {
             let Some(item) = self.items.get(&key).cloned() else {
                 continue;
             };
-            for kind in [Kind::Finish, Kind::Land] {
+            for kind in [Kind::Start, Kind::Finish, Kind::Land] {
                 let Some(input) = self.input_for(&key, &item, kind, ctx, now) else {
                     continue;
                 };
                 let configured = match kind {
+                    Kind::Start => ctx.current_start,
                     Kind::Finish => ctx.current_finish,
                     Kind::Land => ctx.current_land,
                 };
-                let heuristic = ctx.registry.current(kind, configured);
+                let current_id = ctx.registry.current(kind, configured).id();
                 let signature = Signature {
                     stage: item.stage.as_ref().map(|s| s.stage),
                     rework_rounds: item.rework_rounds,
                     reason: item.refused,
                 };
-                let series = (kind, heuristic.id().to_string());
-                let state = item.emit.get(&series).cloned().unwrap_or_default();
-                let Some(trigger) = state.decide(signature, now, ctx.refresh_secs) else {
-                    continue;
-                };
-                let explanation = heuristic.estimate(&input, ctx.history);
-                if let Some(item) = self.items.get_mut(&key) {
-                    item.emit.entry(series).or_default().record(signature, now);
+                // `current` first, then every shadow candidate: the primary
+                // estimate is emitted before any candidate can be mistaken for
+                // it, and its ordering in the output is what it always was.
+                let ordered: Vec<&dyn Heuristic> = ctx
+                    .registry
+                    .for_kind(kind)
+                    .filter(|h| h.id() == current_id)
+                    .chain(ctx.registry.for_kind(kind).filter(|h| h.id() != current_id))
+                    .collect();
+                for heuristic in ordered {
+                    let series = (kind, heuristic.id().to_string());
+                    let state = item.emit.get(&series).cloned().unwrap_or_default();
+                    let Some(trigger) = state.decide(signature, now, ctx.refresh_secs) else {
+                        continue;
+                    };
+                    let explanation = heuristic.estimate(&input, ctx.history);
+                    if let Some(item) = self.items.get_mut(&key) {
+                        item.emit.entry(series).or_default().record(signature, now);
+                    }
+                    self.pending.push(EstimateSummary::of(&explanation));
+                    out.push(Emission {
+                        trigger,
+                        explanation,
+                        primary: heuristic.id() == current_id,
+                    });
                 }
-                self.pending.push(EstimateSummary::of(&explanation));
-                out.push(Emission {
-                    trigger,
-                    explanation,
-                });
             }
         }
         out
     }
 }
+
+#[path = "tracker_ready.rs"]
+mod ready;
+
+pub use ready::{
+    ReadyPlan, ReadyRow, READY_FIRST_SEEN, READY_PLAN_MAX_AGE_SECS, SLOT_TURNOVER_REPO,
+};
 
 /// Merge several effects.
 #[must_use]

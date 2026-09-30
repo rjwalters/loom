@@ -60,6 +60,8 @@ enum Commands {
     /// Inspect worker model profiles; run a launch behind the credential proxy.
     #[command(subcommand_required = true)]
     Worker(loom_daemon::worker_spawn::WorkerCommand),
+    /// Print the resolved hyperparameter vector, its provenance and digest (Issue #9683).
+    Hyperparams(loom_daemon::hyperparams::HyperparamsArgs),
     /// Execute one guarded native harness tool request from stdin.
     RuntimeTool(loom_daemon::native_tools::ToolArgs),
     /// Serve the guarded native tool surface to an MCP client over stdio.
@@ -2532,6 +2534,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::JevMergeRisk { .. }
         | Commands::JevTier { .. }
         | Commands::Concierge(..)
+        | Commands::Hyperparams(..)
         | Commands::Quarantine { .. }
         | Commands::DispatchBackoff { .. }
         | Commands::NoopCooldown { .. }

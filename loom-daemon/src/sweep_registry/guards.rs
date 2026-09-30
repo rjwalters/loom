@@ -12,6 +12,14 @@ use crate::comment_trust::records;
 #[path = "preflip_labels.rs"]
 pub(crate) mod preflip_labels;
 
+/// The `labeled loom:building` timeline probe (#5017/#5282) and the
+/// leaseless-claim dispatch yield built on it (#9453 Phase 3.1). A plain child
+/// module (`guards/claim_label.rs`) for the same reason `repo_env_tests` is one:
+/// this file is frozen at its current size by `scripts/file-size-baseline.txt`.
+/// `pub(crate)` so the dispatch-level yield tests can name the identity
+/// constants the leaseless leg reports rather than re-spelling them.
+pub(crate) mod claim_label;
+
 /// Three-state result of the open-linked-PR probe (Issue #4452).
 ///
 /// Defined in [`crate::worktree_ops::gh`] and re-exported here, where it
@@ -272,6 +280,15 @@ pub(crate) enum LeaseOrderDecision {
         earliest_host: String,
         earliest_sweep_id: String,
     },
+    /// No peer lease comment exists in the claim episode, but the issue's
+    /// newest `labeled loom:building` timeline event predates this dispatch
+    /// attempt and is still inside the label grace (Issue #9453 Phase 3.1):
+    /// a live claim from a lane that published no lease — a hand-claim. Yield
+    /// exactly like [`Yield`](Self::Yield); the event names no host or sweep,
+    /// so the identity reported downstream is
+    /// [`claim_label::LEASELESS_CLAIM_HOST`] plus the label's own timestamp
+    /// (see [`LeaseOrderDecision::yield_identity`]).
+    YieldToLeaselessClaim { labeled_at: DateTime<Utc> },
 }
 
 /// Resolve whether cross-host dispatch-collision detection runs (Issue #4085,
@@ -359,119 +376,11 @@ impl SweepRegistry {
         preflip_labels::classify_observed_labels(labels)
     }
 
-    // ------------------------------------------------------------------------
     // Cross-host claim-ownership verification before release/reclaim
-    // (Issue #5017 / #5282)
-    // ------------------------------------------------------------------------
-    //
-    // `.loom/locks/issue-<N>` (see `locks.rs`'s `release_lock_owned`) is
-    // strictly HOST-LOCAL filesystem state: it is written by `acquire_lock`
-    // when *this* daemon dispatches *its own* sweep, and no other host's
-    // daemon ever sees it. That makes it structurally blind to a genuine
-    // cross-host race: when host B cancels its own losing duplicate dispatch
-    // for an issue host A is actively (and validly) building, host B's local
-    // lock names host B's own (about-to-be-cancelled) sweep as the owner —
-    // it matches, so `release_lock_owned` returns `Released`, not
-    // `Superseded`, and the caller proceeds to call `restore_label_to_ready`,
-    // destroying the ONLY cross-host mutex (the `loom:building` label)
-    // out from under host A's still-live sweep. This is exactly what
-    // happened on loom#5270 (2026-08-04): cancelling loom-worker-1's losing
-    // duplicate reverted `loom:building` on the issue robb-studio's sweep
-    // still owned, reopening it to a third dispatch.
-    //
-    // The forge's own label-event timeline, by contrast, is observed
-    // identically by every host — it is the one piece of claim state that is
-    // NOT host-local. `fetch_claim_labeled_at` / `claim_superseded_on_forge`
-    // below add that cross-host signal as an ADDITIONAL guard alongside (not
-    // a replacement for) the cheaper host-local `Superseded`/`HolderAlive`
-    // checks: every call site short-circuits on the existing local check
-    // first, so the extra `gh api .../timeline` round trip is only paid when
-    // the local lock could not already answer the question.
-
-    /// Fetch the most recent `labeled loom:building` timeline event timestamp
-    /// for `issue` (Issue #5017/#5282) — the forge-side, cross-host claim
-    /// signal every host observes identically, unlike the host-local
-    /// `.loom/locks/issue-<N>` claim lock.
-    ///
-    /// Mirrors [`crate::claim_reconciliation::forge`]'s own
-    /// `fetch_claim_labeled_at` (used there for PR-claim reconciliation) —
-    /// the underlying `issues/{n}/timeline` REST endpoint is identical for
-    /// issues and PRs, so the query shape is reused verbatim; this copy lives
-    /// in `sweep_registry` so the cancel/reap label-restore path (this
-    /// module) can call it without a cross-module `pub(crate)` promotion of a
-    /// function whose doc comments are specific to PR-claim reconciliation.
-    ///
-    /// FAIL-OPEN: returns `None` on any `gh` failure/timeout/non-zero
-    /// exit/unparseable output, or when the label was never applied. Callers
-    /// MUST treat `None` as "cannot verify, proceed with existing behavior"
-    /// — same fail-open contract as every other forge probe in this module
-    /// ([`classify_preflip_labels`](Self::classify_preflip_labels),
-    /// [`issue_is_closed_or_pr`](Self::issue_is_closed_or_pr)).
-    pub(crate) fn fetch_claim_labeled_at(&self, issue: u32) -> Option<DateTime<Utc>> {
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline"))
-            .arg("--paginate")
-            .arg("--jq")
-            .arg(
-                r#"[.[] | select(.event == "labeled" and .label.name == "loom:building") | .created_at] | max // empty"#,
-            );
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as
-        // a `--repo` flag (`gh api` has none and aborts on one).
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        let timeout = reap_gh_timeout();
-        let output = output_with_timeout(cmd, timeout).ok().flatten()?;
-        if !output.status.success() {
-            return None;
-        }
-        parse_max_timestamp(&output.stdout)
-    }
-
-    /// Whether the forge's `loom:building` claim on `issue` was (re-)applied
-    /// STRICTLY AFTER `claimed_at` (Issue #5017/#5282) — i.e. a different
-    /// claimant, possibly on another host entirely invisible to this host's
-    /// `.loom/locks/issue-<N>`, has (re-)claimed the issue since this sweep's
-    /// own claim/dispatch time. When `true`, the caller MUST skip
-    /// [`restore_label_to_ready`](Self::restore_label_to_ready) — exactly the
-    /// same "leave the live claim alone" contract as a host-local
-    /// `Superseded`/`HolderAlive` verdict from `release_lock_owned`.
-    ///
-    /// FAIL-OPEN: an unverifiable read ([`fetch_claim_labeled_at`] returns
-    /// `None`) resolves to `false` (not superseded) — an unreachable forge
-    /// must never permanently wedge a claim, matching every other check in
-    /// this module's fail-open posture (see `restore_label_to_ready`'s own
-    /// doc comment).
-    ///
-    /// [`fetch_claim_labeled_at`]: Self::fetch_claim_labeled_at
-    pub(crate) fn claim_superseded_on_forge(&self, issue: u32, claimed_at: DateTime<Utc>) -> bool {
-        match self.fetch_claim_labeled_at(issue) {
-            Some(labeled_at) if labeled_at > claimed_at => {
-                log::warn!(
-                    "sweep_registry: issue #{issue}'s `loom:building` claim was (re-)applied at \
-                     {} — AFTER this sweep's own claim/dispatch time {} — leaving the label \
-                     alone instead of restoring it (#5017/#5282 cross-host claim-ownership \
-                     guard). A different claimant, possibly on another host, now owns this \
-                     issue; destroying its claim here would repeat the loom#5270 incident.",
-                    labeled_at.to_rfc3339(),
-                    claimed_at.to_rfc3339(),
-                );
-                true
-            }
-            _ => false,
-        }
-    }
+    // (Issues #5017/#5282) — `fetch_claim_labeled_at` /
+    // `claim_superseded_on_forge` — lives in the `claim_label` child module
+    // declared at the top of this file, alongside #9453 Phase 3.1's
+    // leaseless-claim dispatch yield, which reads the same timeline event.
 
     /// When detection is enabled, probe the pre-flip label state and record a
     /// cross-host collision (Issue #4085). Returns `None` — without invoking
@@ -1787,6 +1696,33 @@ impl SweepRegistry {
     /// confirmation budget, that nonetheless produced two completed sweep
     /// passes) is most consistent with.
     ///
+    /// # Issue #9453 Phase 3.1: the label leg, for a claim with no lease
+    ///
+    /// Everything above reads lease **comments**, so it is structurally blind
+    /// to a lane that publishes none. The measured Class A incident (#9432) is
+    /// exactly that shape: an operator-directed hand-claim applied
+    /// `loom:building` and nothing else, and the fleet — finding no lease
+    /// record anywhere — dispatched a duplicate builder 76 minutes later.
+    ///
+    /// So when this dispatcher is the SOLE in-window claimant
+    /// ([`claim_label::is_sole_claimant`]), one further signal is consulted
+    /// before committing to [`LeaseOrderDecision::Proceed`]: the issue's newest
+    /// `labeled loom:building` timeline event, via the
+    /// [`fetch_claim_labeled_at`](Self::fetch_claim_labeled_at) read the reap
+    /// path already uses. A label event older than this attempt's
+    /// `episode_start` but younger than the 10-minute label grace yields
+    /// [`LeaseOrderDecision::YieldToLeaselessClaim`] — see
+    /// [`SweepRegistry::resolve_leaseless_claim_order`] for why a bare label is
+    /// evidence only now that Phase 2 leases every compliant lane, and
+    /// [`claim_label::claim_label_is_live_foreign`] for why the event this
+    /// dispatcher's own flip just created cannot trigger it.
+    ///
+    /// The leg is additive and changes nothing when a lease comment IS found:
+    /// with any foreign record in-window the comment-order verdict stands
+    /// unmodified (both racing daemons see the same young label, so firing it
+    /// there would make both yield and neither build). Like every other leg it
+    /// is FAIL-OPEN — an unreadable timeline is not evidence of anything.
+    ///
     /// [`read_lease_comments`]: Self::read_lease_comments
     pub(crate) fn resolve_lease_order(
         &self,
@@ -1851,6 +1787,7 @@ impl SweepRegistry {
             let Some(earliest) = in_window.iter().min_by_key(|c| c.id) else {
                 return LeaseOrderDecision::Proceed;
             };
+            let sole = claim_label::is_sole_claimant(&in_window, &host, sweep_id);
             return if earliest.id < own_id {
                 LeaseOrderDecision::Yield {
                     earliest_host: earliest.host.clone(),
@@ -1861,7 +1798,11 @@ impl SweepRegistry {
                 // — confirm with a few bounded re-reads before committing
                 // to Proceed, since a genuine peer's earlier comment may
                 // simply not have propagated into THIS read yet (#6951).
+                // With no peer lease record in-window at all, the label leg
+                // (#9453 Phase 3.1) gets the last word: a leaseless claim is
+                // invisible to every read above.
                 self.confirm_sole_claim(issue, sweep_id, &host, cutoff, renewal_cutoff)
+                    .or_leaseless_claim(self, issue, episode_start, sole)
             };
         }
         // Unreachable in practice (the loop above always returns within its

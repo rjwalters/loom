@@ -44,7 +44,7 @@ fn prose_and_documentation_mentions_of_the_format_never_match() {
 fn the_newest_marker_wins() {
     let old = marker_line(1, PRED, FOLLOWER, "plan-old");
     let new = marker_line(2, OTHER, FOLLOWER, "plan-new");
-    match parse(&vec![old, new]) {
+    match parse(&[old, new]) {
         Some(m) => {
             assert_eq!(m.after, 2);
             assert_eq!(m.plan, "plan-new");
@@ -61,7 +61,7 @@ fn a_malformed_newer_span_does_not_shadow_an_older_valid_marker() {
     let old = marker_line(1, PRED, FOLLOWER, "plan-old");
     let truncated_new =
         "<!-- loom:sequence after=2 pred_head=abc follower_head=def plan=new -->".to_string();
-    match parse(&vec![old, truncated_new]) {
+    match parse(&[old, truncated_new]) {
         Some(m) => assert_eq!(m.plan, "plan-old"),
         None => panic!("the valid older marker must survive"),
     }
@@ -83,7 +83,7 @@ fn after_zero_or_nonnumeric_is_not_a_marker() {
         let line = format!(
             "<!-- loom:sequence after={bad} pred_head={PRED} follower_head={FOLLOWER} plan=p -->"
         );
-        assert_eq!(parse(&vec![line]), None, "after={bad:?}");
+        assert_eq!(parse(&[line]), None, "after={bad:?}");
     }
 }
 
@@ -95,7 +95,7 @@ fn missing_fields_are_not_markers() {
         "<!-- loom:sequence after=1 pred_head={PRED} follower_head={FOLLOWER} -->",
     ] {
         let line = line.replace("{PRED}", PRED).replace("{FOLLOWER}", FOLLOWER);
-        assert_eq!(parse(&[line.clone()]), None, "{line}");
+        assert_eq!(parse(std::slice::from_ref(&line)), None, "{line}");
     }
 }
 
@@ -104,7 +104,7 @@ fn unknown_fields_make_the_span_not_a_marker() {
     let line = format!(
         "<!-- loom:sequence after=1 pred_head={PRED} follower_head={FOLLOWER} plan=p surprise=1 -->"
     );
-    assert_eq!(parse(&vec![line]), None);
+    assert_eq!(parse(&[line]), None);
 }
 
 #[test]
@@ -118,8 +118,42 @@ fn a_different_marker_namespace_is_not_ours() {
 #[test]
 fn an_empty_comment_stream_has_no_marker() {
     assert_eq!(parse(&[]), None);
-    assert_eq!(parse(&vec![String::new()]), None);
-    assert_eq!(parse(&vec!["<!-- something else -->".to_string()]), None);
+    assert_eq!(parse(&[String::new()]), None);
+    assert_eq!(parse(&["<!-- something else -->".to_string()]), None);
+}
+
+// --- Render / round-trip (#9686's source field) -------------------------
+
+#[test]
+fn marker_text_round_trips_through_parse() {
+    let m = SequenceMarker {
+        after: 7,
+        pred_head: PRED.into(),
+        follower_head: FOLLOWER.into(),
+        plan: "seq-ab12cd34".into(),
+        source: Some("pass".into()),
+    };
+    assert_eq!(parse(&[marker_text(&m)]), Some(m.clone()));
+    let hard = SequenceMarker { source: None, ..m };
+    assert_eq!(parse(&[marker_text(&hard)]), Some(hard));
+}
+
+#[test]
+fn a_source_pass_marker_is_soft_and_its_absence_is_hard() {
+    // A marker with no source field parses as source: None — the HARD,
+    // human-authored shape that never auto-expires.
+    let bare = parse(&[marker_line(1, PRED, FOLLOWER, "seq-abc")]);
+    match bare {
+        Some(m) => assert_eq!(m.source, None, "missing source = hard hold"),
+        None => panic!("a plain marker must parse"),
+    }
+    let line = format!(
+        "<!-- loom:sequence after=1 pred_head={PRED} follower_head={FOLLOWER} plan=seq-abc source=pass -->"
+    );
+    match parse(&[line]) {
+        Some(m) => assert_eq!(m.source.as_deref(), Some("pass")),
+        None => panic!("source=pass marker must parse"),
+    }
 }
 
 // --- Render / round-trip (#9686's source field) -------------------------
