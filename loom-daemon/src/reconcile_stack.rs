@@ -96,6 +96,10 @@ pub enum Prerequisite {
     DirtyWorktree,
     /// The child branch does not resolve in this repository.
     ChildBranch,
+    /// A ref in the request is not a safe git operand — git would parse it as
+    /// a switch rather than a ref (#9106). Raised before ANY git process
+    /// starts, so no `rebase`/`rev-parse`/`merge-base`/`fetch` ever sees it.
+    InvalidRef,
 }
 
 impl Prerequisite {
@@ -109,6 +113,7 @@ impl Prerequisite {
             Prerequisite::ParentAncestry => "PARENT-ANCESTRY",
             Prerequisite::DirtyWorktree => "DIRTY-WORKTREE",
             Prerequisite::ChildBranch => "CHILD-BRANCH",
+            Prerequisite::InvalidRef => "INVALID-REF",
         }
     }
 }
@@ -223,7 +228,8 @@ fn fetch_and_pin_target(
 ) -> Result<(String, String), PlanError> {
     let target_ref = format!("refs/remotes/{remote}/{branch}");
     let refspec = format!("+refs/heads/{branch}:{target_ref}");
-    let fetched = git(repo_dir, &["fetch", remote, &refspec], GIT_NET_TIMEOUT);
+    // `--` ends option parsing (#9106), behind `refname::check_all` in `plan`.
+    let fetched = git(repo_dir, &["fetch", remote, "--", &refspec], GIT_NET_TIMEOUT);
     if !fetched.succeeded() {
         let stderr = fetched.stderr_trimmed();
         // `couldn't find remote ref` is git's wording for "the remote has no
@@ -353,6 +359,27 @@ fn resolve_parent_ref(
 pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
     let mut notices = Vec::new();
 
+    // #9106 — FIRST, before `fetch_and_pin_target` (and therefore before any
+    // git process at all). `child_branch` is the forge's `headRefName` and
+    // `parent_branch` comes from a caller that read one; an argv blocks shell
+    // injection but NOT git-option injection, so a `--upload-pack=/tmp/x` name
+    // would reach `fetch`/`rev-parse`/`merge-base`/`rebase` as a switch. All
+    // four names are cleared as one gate: a request carrying any unsafe ref is
+    // refused whole, never partially executed.
+    crate::refname::check_all(&[
+        req.remote,
+        req.default_branch,
+        req.child_branch,
+        req.parent_branch,
+    ])
+    .map_err(|e| PlanError {
+        prerequisite: Prerequisite::InvalidRef,
+        message: format!(
+            "{e}\nRefusing before any git command ran — nothing was fetched, rebased, or \
+             pushed. Rename the branch on the PR and re-run."
+        ),
+    })?;
+
     let (target_commit, target_ref) =
         fetch_and_pin_target(req.repo_dir, req.remote, req.default_branch)?;
     notices.push(Notice {
@@ -455,10 +482,14 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
 pub fn rebase(plan: &Plan) -> Result<(), String> {
     let outcome = git(
         &plan.git_dir,
+        // `--` ends option parsing before the two ref operands (#9106). The
+        // primary gate is `refname::check_all` in `plan`, which both names
+        // cleared before this Plan could exist; this is defence in depth.
         &[
             "rebase",
             "--onto",
             &plan.target_commit,
+            "--",
             &plan.parent_ref,
             &plan.child_branch,
         ],

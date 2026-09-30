@@ -50,7 +50,7 @@
 //! # Never blocks or fails the terminal transition
 //!
 //! Every step here is the same best-effort shape as
-//! [`super::complexity_signal::fetch_complexity_signal`] and
+//! [`super::complexity_signal`]'s issue read and
 //! [`super::super::prless_retry`]'s comment helpers: a `gh` failure, timeout,
 //! or missing repo context is logged and swallowed, never propagated. Called
 //! AFTER every durable local write in
@@ -358,7 +358,9 @@ mod tests {
 
     fn fixture_record() -> telemetry::SweepOutcomeRecord {
         telemetry::SweepOutcomeRecord {
-            repo: "rjwalters/loom".to_string(),
+            story_points: None,
+            repo: Some("rjwalters/loom".to_string()),
+            repo_unresolved: false,
             visibility: telemetry::RepoVisibility::Private,
             issue: 9056,
             sweep_id: "sweep-issue-9056-0".to_string(),
@@ -366,23 +368,19 @@ mod tests {
             effort: None,
             config: std::collections::BTreeMap::new(),
             phase_durations: vec![
-                telemetry::PhaseDuration {
-                    phase: "curator".to_string(),
-                    duration_sec: 120,
-                },
-                telemetry::PhaseDuration {
-                    phase: "builder".to_string(),
-                    duration_sec: 3600,
-                },
+                telemetry::PhaseDuration::new("curator".to_string(), 120),
+                telemetry::PhaseDuration::new("builder".to_string(), 3600),
             ],
             total_duration_sec: 4000,
             result: telemetry::SweepResult::Success,
+            disposition: telemetry::SweepDisposition::Landed,
             pr_number: Some(42),
             tokens_in: Some(200_000),
             tokens_out: Some(15_000),
             lines_added: Some(120),
             lines_deleted: Some(30),
             tokens_by_model: None,
+            tokens_unattributed: None,
             failure_class: None,
             models_used: None,
             doctor_cycles: Some(1),
@@ -394,6 +392,18 @@ mod tests {
             provider: None,
             profile: None,
             complexity: Some("complex".to_string()),
+            tokens_status: None,
+            tokens_status_reason: None,
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
+            pr_numbers: None,
+            hw_lines_added: None,
+            hw_lines_deleted: None,
+            hw_files: None,
+            generated_lines: None,
+            test_lines: None,
         }
     }
 

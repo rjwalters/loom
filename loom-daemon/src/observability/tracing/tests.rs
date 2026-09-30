@@ -8,6 +8,7 @@ fn legacy_queue_envelope_stays_compatible_and_native_context_is_stripped() {
     let mut old = TelemetryEnvelope::new(
         "host",
         TelemetryRecord::SweepStarted(crate::telemetry::SweepStartedRecord {
+            story_points: None,
             repo: "test/fixture".into(),
             visibility: crate::telemetry::RepoVisibility::Private,
             issue: 18,

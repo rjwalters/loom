@@ -1453,11 +1453,18 @@ that died in ~2s.
 and *all* pool-state bookkeeping resolve the effective pool directory as:
 
 1. the **per-repo** pool `<repo>/.loom/tokens/` when it holds `*.token` files
-   (unchanged for the primary workspace);
+   **and that workspace is not inside a git worktree** — inside one it is
+   refused outright (issue #9135: OAuth credentials must never live in a
+   repository checkout; the refusal is reported with a migration path, and the
+   pool is never read or deleted);
 2. else the **shared** machine-level pool `~/.loom/tokens/` (override
-   `LOOM_SHARED_TOKENS_DIR`; set it empty to disable the fallback);
+   `LOOM_SHARED_TOKENS_DIR`; set it empty to disable the fallback) — the only
+   *supported* location, and the only destination `tokens bootstrap` /
+   `import-from-monitor` will write to;
 3. else the per-repo path (so a truly-unbootstrapped repo still surfaces a clear
-   "run bootstrap" error).
+   "run bootstrap" error) — except when step 1 was refused, where resolution
+   fails closed on a path that can hold no credentials rather than readmitting
+   the in-worktree pool.
 
 Crucially, the **state files** (`.bad_tokens`, `.failure_counts`, `.ranking`,
 `.allowlist`) are read/written in *whichever pool directory was selected* — so a
@@ -1963,7 +1970,13 @@ a key. Only the six keys below order the queue.
    never reads a timeline for an unstarred issue, and removing the star drops the
    cache entry. A missing starred-at falls back to `createdAt`. A star applied
    from loom-ui uses the intent's `requested_at` instead (#9244 C, below). A
-   blocker inheriting a star sorts at that star's position.
+   blocker inheriting a star sorts at that star's position. The cache evicts
+   promptly (any tick that does not list the issue as starred drops its entry),
+   which is deliberate and has two accepted consequences (#9314): a star flipped
+   off and back on entirely *between* two ticks keeps its old starred-at, and an
+   issue that leaves the listing — every `loom:building` claim — is read again
+   when it returns. Both affect ordering among starred issues only; see
+   `StarredAtCache`'s "Accepted staleness" doc comment.
 3. **Red-main fixes first**: an issue whose body carries
    `<!-- loom:main-red-fix -->` at the start of a line, **only while its repo's
    `main` is verified red** (`WorkspaceHealthStates::is_halted`). A marker on a
@@ -2021,6 +2034,26 @@ sweep record carries `overflow: true` (shown in `list_sweeps`,
 it in `TickReport::dispatched_overflow`, and its ready-queue row reads
 `dispatched this tick (overflow)`.
 
+**The flag survives a daemon restart (#9314).** It is stamped onto the sweep's
+claim lock (`.loom/locks/issue-<N>/owner.json`, `"overflow": true` — written
+only when true) the moment the slot is taken, and `reconstruct()` restores it
+onto the adopted entry. So a restart mid-flight keeps the `[overflow]` marker in
+`status`/`list_sweeps` and keeps the slot accounted as taken, instead of handing
+it to a second starred issue once one normal sweep ends. Two residual gaps, both
+deliberate and both bounded by the same `occupancy <= configured` gate (a host
+never exceeds max+1 either way):
+
+- a sweep adopted from the **machine sweep journal** rather than its lock
+  (`adopt_live_journal_sweeps`, #6262 — the survivor whose lock did *not*
+  survive) comes back without the flag: the journal records no such field, and
+  widening its schema is outside that pass's read-only adopt-only contract;
+- a checkpoint-only recovery is `Crashed`, and only non-terminal entries hold
+  the slot, so it never needs the flag.
+
+If the lock is already gone when the slot is taken (the sweep finished in that
+window), the stamp is skipped with a `warn` — the in-memory mark still governs
+the running daemon.
+
 **Main-health halt admits only fixes.** A repo halted because its `main` is
 verified red still admits its `<!-- loom:main-red-fix -->` candidates, and only
 those; every other ready issue in it, starred or not, keeps `workspace_halted`.
@@ -2068,8 +2101,9 @@ An escalation is one comment on the issue, carrying
 (issue, key) is posted once: a per-process ledger skips repeats without a
 forge call, and every host reads the issue's comments for the marker before
 posting. Only a marker from an `OWNER` / `MEMBER` / `COLLABORATOR`, the fleet
-App (`LOOM_GITHUB_APP_SLUG` > `forge.githubApp.slug`, else
-`loom-fleet-dispatch*`; only as an App login, `…[bot]` or `app/…`, which no
+App (any identity in the forge roster — `LOOM_GITHUB_APP_SLUG` > the writer's
+slug, each reader, `legacyLogins` — plus `loom-fleet-dispatch` / `-<digits>`
+exactly, never a prefix; only as an App login, `…[bot]` or `app/…`, which no
 user can register) or the daemon itself counts; an outside commenter cannot
 pre-post one to suppress an ask. The `pools-exhausted` key is the issue's forge state, not the
 host's hold, so every host and every re-exhaustion share it until the issue
@@ -2154,7 +2188,7 @@ The fleet dashboard view is phase 3.
 (`running` / `next` / `queued` / `blocked`), `gate`, `keys`, `in_slice`,
 `hot`, `owning_shard` and `repo_cap`. The tick summary carries a `plan` block:
 `slots` (`max_concurrent`, `occupancy`, `free`, `max_admissions_per_tick`,
-`saturation_held`, `any_halted`), `tick_interval_secs`, `shard`, `scope` and
+`saturation_held`, `any_halted`, `overflow_free`), `tick_interval_secs`, `shard`, `scope` and
 `ordering`. `position` is the order pass 2 actually offered candidates in,
 after the repo-slice and per-repo-cap shaping. `rank` is still the bare
 comparator rank, so the two differ whenever sharding or
@@ -2164,6 +2198,8 @@ comparator rank, so the two differ whenever sharding or
 than a hard-coded string. `loom:curated` / `loom:triage` are unordered and never
 listed. The single-workspace tick has no plan (`plan: null`). Field reference:
 [`telemetry-schema.md` § `queue.snapshot`](telemetry-schema.md#queuesnapshot).
+Folding several hosts' plans into one fleet order (`merge_plans`, #9310) is a
+separate rule: [`dispatch-plan.md`](dispatch-plan.md).
 
 ## Forge-side pipeline snapshot (`status --pipeline`, #3977)
 

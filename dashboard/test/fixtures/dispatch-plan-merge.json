@@ -1,0 +1,194 @@
+{
+  "_comment": [
+    "Issue #9310: the fleet dispatch-plan merge rule, pinned once and read by both",
+    "implementations of it — loom-daemon's work_finder::dispatch_plan_merge::merge_plans",
+    "(loom-daemon/src/work_finder/dispatch_plan_merge_tests.rs) and the dashboard's port",
+    "in dashboard/web/src/workQueue.ts (dashboard/web/test/workQueue.test.ts).",
+    "Neither side owns it: a change to the rule has to change this file, which fails the",
+    "other language's test until it is ported too. The rule itself is documented in",
+    "defaults/docs/dispatch-plan.md.",
+    "",
+    "Each case's `hosts` deserialize directly into Vec<HostPlan>: per-row plan fields are",
+    "flattened beside repo/issue exactly as the daemon flattens RowPlan into a queue row.",
+    "`expected` is the merged fleet plan in fleet order, each item naming its primary host",
+    "and the other hosts that also listed it, best-first."
+  ],
+  "cases": [
+    {
+      "name": "most advanced plan_state wins, then hosts interleave within each state band",
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "shard": { "configured": true, "host_shard": 0, "shard_count": 2 },
+          "rows": [
+            { "repo": "acme/one", "issue": 100, "position": 1, "plan_state": "running", "owning_shard": 0 },
+            { "repo": "acme/one", "issue": 101, "position": 2, "plan_state": "next", "gate": "capacity", "owning_shard": 0 }
+          ]
+        },
+        {
+          "host_id": "host-b",
+          "shard": { "configured": true, "host_shard": 1, "shard_count": 2 },
+          "rows": [
+            { "repo": "acme/one", "issue": 100, "plan_state": "blocked", "owning_shard": 0 },
+            { "repo": "acme/two", "issue": 200, "position": 1, "plan_state": "queued", "gate": "out_of_slice", "owning_shard": 0 },
+            { "repo": "acme/two", "issue": 201, "position": 2, "plan_state": "next", "gate": "capacity", "owning_shard": 1 }
+          ]
+        }
+      ],
+      "expected": [
+        { "repo": "acme/one", "issue": 100, "plan_state": "running", "primary": "host-a", "others": ["host-b"] },
+        { "repo": "acme/one", "issue": 101, "plan_state": "next", "primary": "host-a", "others": [] },
+        { "repo": "acme/two", "issue": 201, "plan_state": "next", "primary": "host-b", "others": [] },
+        { "repo": "acme/two", "issue": 200, "plan_state": "queued", "primary": "host-b", "others": [] }
+      ]
+    },
+    {
+      "name": "on a state tie the shard owner wins, even from a worse position",
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "shard": { "configured": true, "host_shard": 0, "shard_count": 2 },
+          "rows": [{ "repo": "acme/one", "issue": 300, "position": 1, "plan_state": "queued", "gate": "out_of_slice", "owning_shard": 1 }]
+        },
+        {
+          "host_id": "host-b",
+          "shard": { "configured": true, "host_shard": 1, "shard_count": 2 },
+          "rows": [{ "repo": "acme/one", "issue": 300, "position": 5, "plan_state": "queued", "gate": "capacity", "owning_shard": 1 }]
+        }
+      ],
+      "expected": [{ "repo": "acme/one", "issue": 300, "plan_state": "queued", "primary": "host-b", "others": ["host-a"] }]
+    },
+    {
+      "name": "no shard owner: lower position, then host id — and a row with no position sorts last",
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "shard": { "configured": false },
+          "rows": [
+            { "repo": "acme/one", "issue": 400, "plan_state": "blocked" },
+            { "repo": "acme/one", "issue": 401, "plan_state": "blocked" }
+          ]
+        },
+        {
+          "host_id": "host-b",
+          "shard": { "configured": false },
+          "rows": [
+            { "repo": "acme/one", "issue": 400, "position": 2, "plan_state": "blocked" },
+            { "repo": "acme/one", "issue": 401, "plan_state": "blocked" }
+          ]
+        },
+        {
+          "host_id": "host-c",
+          "shard": { "configured": false },
+          "rows": [{ "repo": "acme/one", "issue": 400, "position": 7, "plan_state": "blocked" }]
+        }
+      ],
+      "expected": [
+        { "repo": "acme/one", "issue": 401, "plan_state": "blocked", "primary": "host-a", "others": ["host-b"] },
+        { "repo": "acme/one", "issue": 400, "plan_state": "blocked", "primary": "host-b", "others": ["host-c", "host-a"] }
+      ]
+    },
+    {
+      "name": "a single-host fleet is a pass-through in that host's own plan order",
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "shard": { "configured": false },
+          "rows": [
+            { "repo": "acme/one", "issue": 503, "plan_state": "blocked" },
+            { "repo": "acme/one", "issue": 502, "position": 3, "plan_state": "queued", "gate": "repo_cap" },
+            { "repo": "acme/one", "issue": 501, "position": 2, "plan_state": "next", "gate": "capacity" },
+            { "repo": "acme/one", "issue": 500, "position": 1, "plan_state": "running" }
+          ]
+        }
+      ],
+      "expected": [
+        { "repo": "acme/one", "issue": 500, "plan_state": "running", "primary": "host-a", "others": [] },
+        { "repo": "acme/one", "issue": 501, "plan_state": "next", "primary": "host-a", "others": [] },
+        { "repo": "acme/one", "issue": 502, "plan_state": "queued", "primary": "host-a", "others": [] },
+        { "repo": "acme/one", "issue": 503, "plan_state": "blocked", "primary": "host-a", "others": [] }
+      ]
+    },
+    {
+      "name": "round-robin: one host's long backlog never buries another host's first row",
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "shard": { "configured": false },
+          "rows": [
+            { "repo": "acme/one", "issue": 600, "position": 1, "plan_state": "queued", "gate": "capacity" },
+            { "repo": "acme/one", "issue": 601, "position": 2, "plan_state": "queued", "gate": "capacity" },
+            { "repo": "acme/one", "issue": 602, "position": 3, "plan_state": "queued", "gate": "capacity" }
+          ]
+        },
+        {
+          "host_id": "host-b",
+          "shard": { "configured": false },
+          "rows": [{ "repo": "acme/two", "issue": 700, "position": 1, "plan_state": "queued", "gate": "capacity" }]
+        }
+      ],
+      "expected": [
+        { "repo": "acme/one", "issue": 600, "plan_state": "queued", "primary": "host-a", "others": [] },
+        { "repo": "acme/two", "issue": 700, "plan_state": "queued", "primary": "host-b", "others": [] },
+        { "repo": "acme/one", "issue": 601, "plan_state": "queued", "primary": "host-a", "others": [] },
+        { "repo": "acme/one", "issue": 602, "plan_state": "queued", "primary": "host-a", "others": [] }
+      ]
+    },
+    {
+      "name": "workspace_priority is never compared across hosts: host id decides, not the bigger number",
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "shard": { "configured": false },
+          "rows": [
+            {
+              "repo": "acme/one",
+              "issue": 800,
+              "position": 3,
+              "plan_state": "queued",
+              "gate": "capacity",
+              "keys": [{ "name": "workspace_priority", "value": 10 }]
+            }
+          ]
+        },
+        {
+          "host_id": "host-b",
+          "shard": { "configured": false },
+          "rows": [
+            {
+              "repo": "acme/one",
+              "issue": 800,
+              "position": 3,
+              "plan_state": "queued",
+              "gate": "capacity",
+              "keys": [{ "name": "workspace_priority", "value": 900 }]
+            }
+          ]
+        }
+      ],
+      "expected": [{ "repo": "acme/one", "issue": 800, "plan_state": "queued", "primary": "host-a", "others": ["host-b"] }]
+    },
+    {
+      "name": "an unknown plan_state (a newer daemon) ranks last and never displaces a known one",
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "shard": { "configured": false },
+          "rows": [{ "repo": "acme/one", "issue": 900, "position": 1, "plan_state": "someday" }]
+        },
+        {
+          "host_id": "host-b",
+          "shard": { "configured": false },
+          "rows": [
+            { "repo": "acme/one", "issue": 900, "plan_state": "blocked" },
+            { "repo": "acme/one", "issue": 901, "position": 1, "plan_state": "running" }
+          ]
+        }
+      ],
+      "expected": [
+        { "repo": "acme/one", "issue": 901, "plan_state": "running", "primary": "host-b", "others": [] },
+        { "repo": "acme/one", "issue": 900, "plan_state": "blocked", "primary": "host-b", "others": ["host-a"] }
+      ]
+    }
+  ]
+}

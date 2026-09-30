@@ -4,7 +4,7 @@
 use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 
-use crate::{ClaudeConfigAction, ForgeAction, PinAction, TokensAction};
+use crate::{ClaudeConfigAction, PinAction, TokensAction};
 
 mod select_cmd;
 
@@ -182,6 +182,10 @@ fn resolve_tokens_pool_dir_for_cli(workspace: &str) -> Result<(PathBuf, bool)> {
     use loom_daemon::workspace_registry::{resolve_client_workspace_default, WorkspaceRegistry};
 
     let ws = resolve_tokens_workspace(workspace)?;
+    // Whatever the resolution branch below decides, a legacy in-worktree pool
+    // at `ws` is now ignored — say so once, here, rather than in each arm
+    // (issue #9135).
+    warn_retired_in_worktree_pool(&ws);
     if workspace != "." {
         return Ok((paths::resolve_tokens_dir(&ws), false));
     }
@@ -197,6 +201,65 @@ fn resolve_tokens_pool_dir_for_cli(workspace: &str) -> Result<(PathBuf, bool)> {
     let anchored_to_shared = resolve_client_workspace_default(&ws, &registry).is_none()
         && paths::shared_tokens_dir().is_some();
     Ok((paths::resolve_tokens_dir_anchored(&ws, &registry), anchored_to_shared))
+}
+
+/// The one supported destination for a provisioning command (`tokens
+/// bootstrap` / `tokens import-from-monitor`): the shared machine-level pool
+/// (issue #9135).
+///
+/// There is no workspace-relative alternative any more. `--shared` used to
+/// select this and is now the only behavior, so provisioning cannot
+/// materialize OAuth credentials inside a git worktree — the failure mode a
+/// `.gitignore` entry plus two stager guards, all keyed on one literal path,
+/// could not actually prevent (a single directory rename or a manual
+/// `git add -A` defeats all three at once).
+///
+/// Exits non-zero rather than falling back anywhere:
+///
+/// - **Shared pool disabled** (`LOOM_SHARED_TOKENS_DIR=""`): there is nowhere
+///   supported to write, and the retired in-worktree path is not a fallback.
+/// - **Shared pool inside a checkout**: an operator can point
+///   `LOOM_SHARED_TOKENS_DIR` at a directory that is itself inside a git
+///   worktree, which would reintroduce the exact hazard through the front
+///   door. The invariant is "outside every worktree", not "named
+///   `~/.loom/tokens`", so it is enforced on the resolved path.
+fn provisioning_destination_pool() -> PathBuf {
+    use loom_daemon::tokens_pool::paths::{is_inside_git_worktree, shared_tokens_dir};
+
+    let Some(dir) = shared_tokens_dir() else {
+        eprintln!(
+            "error: the shared machine-level token pool is disabled (LOOM_SHARED_TOKENS_DIR is \
+             empty) and a per-repo pool inside a git worktree is no longer supported (issue \
+             #9135). Unset LOOM_SHARED_TOKENS_DIR to use ~/.loom/tokens, or point it at a \
+             directory outside every repository checkout."
+        );
+        std::process::exit(1);
+    };
+    if is_inside_git_worktree(&dir) {
+        eprintln!(
+            "error: refusing to provision the token pool at {} — it is inside a git worktree, \
+             and OAuth credentials must never live inside a repository checkout (issue #9135). \
+             Point LOOM_SHARED_TOKENS_DIR at a directory outside every checkout (default \
+             ~/.loom/tokens).",
+            dir.display()
+        );
+        std::process::exit(1);
+    }
+    eprintln!("Provisioning the shared machine-level pool at {}", dir.display());
+    dir
+}
+
+/// Warn when `workspace` still holds a retired in-worktree pool (issue #9135).
+///
+/// Loud but non-fatal on purpose: the supported pool may be perfectly healthy,
+/// and hard-failing an operator's `tokens check` over a legacy directory Loom
+/// already ignores would be a self-inflicted outage. The *fatal* form of this
+/// is the empty-pool error in `tokens_pool::select`, which fires exactly when
+/// the refused pool was the only one present.
+fn warn_retired_in_worktree_pool(workspace: &Path) {
+    if let Some(pool) = loom_daemon::tokens_pool::paths::retired_in_worktree_pool(workspace) {
+        eprintln!("warning: {}", loom_daemon::tokens_pool::paths::in_worktree_pool_error(&pool));
+    }
 }
 
 /// One pool discovered by `--all-pools` (issue #7527).
@@ -225,7 +288,8 @@ pub(crate) struct PoolTarget {
 /// the end already covers it.
 pub(crate) fn enumerate_all_pools() -> Vec<PoolTarget> {
     use loom_daemon::tokens_pool::paths::{
-        has_token_files, per_repo_tokens_dir, shared_tokens_dir,
+        has_token_files, is_inside_git_worktree as paths_is_inside_git_worktree,
+        per_repo_tokens_dir, shared_tokens_dir,
     };
     use loom_daemon::workspace_registry::WorkspaceRegistry;
     use std::collections::HashSet;
@@ -237,10 +301,19 @@ pub(crate) fn enumerate_all_pools() -> Vec<PoolTarget> {
     for ws in &registry.workspaces {
         let dir = per_repo_tokens_dir(&ws.root);
         if has_token_files(&dir) && seen.insert(dir.clone()) {
-            pools.push(PoolTarget {
-                label: format!("repo-local: {}", ws.root.display()),
-                dir,
-            });
+            // Still enumerated when retired (issue #9135): `--all-pools` is the
+            // operator's inventory view, and a pool selection now refuses is
+            // exactly what they need to see in order to migrate it. The label
+            // says which kind it is so the listing is not misleading.
+            let label = if paths_is_inside_git_worktree(&ws.root) {
+                format!(
+                    "legacy in-worktree, RETIRED and ignored by selection: {}",
+                    ws.root.display()
+                )
+            } else {
+                format!("repo-local: {}", ws.root.display())
+            };
+            pools.push(PoolTarget { label, dir });
         }
     }
 
@@ -542,41 +615,6 @@ fn print_monitor_import(result: &loom_daemon::tokens_pool::monitor_db::MonitorIm
     }
 }
 
-/// Handle `loom-daemon forge <issue|pr|auth|auto-merge>` (epic #4081 Phase 3,
-/// family 3 — the native port of `loom-forge` / `loom-auto-merge`). Handlers
-/// exec `gh` / exit the process directly, so this only returns `Err` when a
-/// child process cannot be spawned. See `loom-daemon/src/forge_cmd.rs`.
-pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
-    use loom_daemon::forge_cmd::{dispatch, ForgeCmd};
-    let cmd = match action {
-        ForgeAction::Issue { args } => ForgeCmd::Issue(args),
-        ForgeAction::Pr { args } => ForgeCmd::Pr(args),
-        ForgeAction::Auth { args } => ForgeCmd::Auth(args),
-        ForgeAction::CheckOpenPr { issue } => ForgeCmd::CheckOpenPr { issue },
-        ForgeAction::AutoMerge {
-            pr_number,
-            method,
-            expected_head_sha,
-            ..
-        } => ForgeCmd::AutoMerge {
-            pr: pr_number,
-            method,
-            expected_head_sha,
-        },
-        ForgeAction::DisableAutoMerge {
-            pr_number,
-            audit_comment,
-            hold,
-        } => ForgeCmd::DisableAutoMerge {
-            pr: pr_number,
-            audit_comment,
-            hold,
-        },
-        ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
-    };
-    dispatch(cmd)
-}
-
 /// Handle `loom-daemon tokens <select|pin|unpin|unblock|mark-bad>` (Issue
 /// #4082, Phase 1 of epic #4081; `mark-bad` added in #4228, Phase 2). Purely
 /// file-based — does not require a running daemon. See
@@ -613,13 +651,15 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             env,
             home_env,
             no_home,
-            shared,
+            // Retained for backward compatibility only (issue #9135): the
+            // shared pool is now the only destination, so this flag selects
+            // what already happens. Scripts across the fleet still pass it.
+            shared: _,
             force,
             dry_run,
             json,
         } => {
             use loom_daemon::tokens_pool::bootstrap::{self, BootstrapError, BootstrapOptions};
-            use loom_daemon::tokens_pool::paths::shared_tokens_dir;
 
             let repo_root = resolve_tokens_workspace(&workspace)?;
 
@@ -635,29 +675,11 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
                 std::process::exit(1);
             }
 
-            // `--shared` redirects the destination pool to the machine-level
-            // location (issue #3938). Only the write target changes; account
-            // sources are unchanged. Refuse when the shared pool is disabled.
-            let tokens_dir = if shared {
-                match shared_tokens_dir() {
-                    Some(dir) => {
-                        eprintln!(
-                            "Bootstrapping the shared machine-level pool at {}",
-                            dir.display()
-                        );
-                        Some(dir)
-                    }
-                    None => {
-                        eprintln!(
-                            "error: --shared requested but the shared pool is disabled \
-                             (LOOM_SHARED_TOKENS_DIR is empty). Unset it or point it at a directory."
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                None
-            };
+            // The destination is always the shared machine-level pool (issue
+            // #9135). Only the write target was ever workspace-relative;
+            // account *sources* still come from `repo_root` as before.
+            let tokens_dir = provisioning_destination_pool();
+            warn_retired_in_worktree_pool(&repo_root);
 
             // `--no-home` disables the master; `--home-env` points elsewhere;
             // neither falls through to default resolution ($LOOM_ACCOUNTS_ENV).
@@ -707,7 +729,8 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
 
         TokensAction::ImportFromMonitor {
             workspace,
-            shared,
+            // Backward-compatibility no-op, as on `bootstrap` (issue #9135).
+            shared: _,
             db,
             force,
             prune,
@@ -717,33 +740,12 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             use loom_daemon::tokens_pool::monitor_db::{
                 import_from_monitor, ImportOptions, MonitorImportError,
             };
-            use loom_daemon::tokens_pool::paths::shared_tokens_dir;
 
-            // Destination: the shared machine-level pool, or this repo's pool
-            // (mirrors cli._cmd_import_from_monitor). `--workspace` is a
-            // plain path here (no upward `.git` walk), matching the sibling
-            // `bootstrap` / `check` / `select` CLI arms.
-            let tokens_dir = if shared {
-                match shared_tokens_dir() {
-                    Some(dir) => {
-                        eprintln!(
-                            "Importing into the shared machine-level pool at {}",
-                            dir.display()
-                        );
-                        dir
-                    }
-                    None => {
-                        eprintln!(
-                            "error: --shared requested but the shared pool is disabled \
-                             (LOOM_SHARED_TOKENS_DIR is empty). Unset it or point it at a directory."
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                let ws = resolve_tokens_workspace(&workspace)?;
-                ws.join(".loom").join("tokens")
-            };
+            // Destination: always the shared machine-level pool (issue #9135).
+            // `--workspace` is still resolved (and still rejects a pool path,
+            // #4948) so a legacy in-worktree pool there can be reported.
+            let tokens_dir = provisioning_destination_pool();
+            warn_retired_in_worktree_pool(&resolve_tokens_workspace(&workspace)?);
 
             let db_path = db.map(std::path::PathBuf::from);
             let opts = ImportOptions {

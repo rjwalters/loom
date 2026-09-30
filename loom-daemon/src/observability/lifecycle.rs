@@ -754,6 +754,16 @@ pub fn role_invocation(
         execution: execution.clone(),
         started_at: s.active.record.started_at,
     });
+    // #9231: let the transcript-ingest pass join this tick's own
+    // `session.summary` log to the tick's trace — the role-runner counterpart
+    // of `sweep_registry::spawn_process`'s `join::open`, keyed on the role
+    // because a tick names no issue (see `join::JoinKey`). Opened here, at
+    // dispatch rather than at the terminal transition, for the same reason the
+    // sweep path does: an ingest pass that runs while the tick is still in
+    // flight must find the entry already open.
+    if trace.is_some() {
+        super::runtime_usage::join::open_role(root, &execution, role);
+    }
     ROLE_CONTEXT.with(|slot| *slot.borrow_mut() = span);
     let outcome = invoke();
     ROLE_CONTEXT.with(|slot| {

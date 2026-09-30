@@ -856,8 +856,13 @@ pub struct BootstrapOptions {
     pub force: bool,
     /// Compute dispositions without writing anything.
     pub dry_run: bool,
-    /// Destination pool dir override (`--shared`). `None` = `<repo>/.loom/tokens`.
-    pub tokens_dir: Option<PathBuf>,
+    /// Destination pool dir. **Required** since issue #9135 — there is no
+    /// implicit `<repo>/.loom/tokens` default any more, because a default that
+    /// pointed inside the caller's checkout is how OAuth credentials ended up
+    /// in a git worktree in the first place. The CLI always passes the shared
+    /// machine-level pool; any other caller must name a directory outside every
+    /// repository checkout.
+    pub tokens_dir: PathBuf,
 }
 
 /// One entry in the effective merged account set (no secrets).
@@ -950,12 +955,9 @@ impl From<std::io::Error> for BootstrapError {
 /// Bootstrap `.loom/tokens/` from the merged account sources (#3695, #3698).
 /// Mirrors `bootstrap.bootstrap_tokens`.
 pub fn bootstrap_tokens(opts: &BootstrapOptions) -> Result<BootstrapResult, BootstrapError> {
-    // Destination pool dir: the repo-local pool by default, or an explicit
-    // override (e.g. the shared machine-level pool for `--shared`, #3938).
-    let tokens_dir = opts
-        .tokens_dir
-        .clone()
-        .unwrap_or_else(|| opts.repo_root.join(".loom").join("tokens"));
+    // Destination pool dir — always explicit (issue #9135: no repo-local
+    // default). Account *sources* still resolve from `opts.repo_root`.
+    let tokens_dir = opts.tokens_dir.clone();
     let index_path = tokens_dir.join("index.json");
 
     // Resolve the sources. `home_env_path` uses a nested Option so an explicit
@@ -1563,7 +1565,7 @@ mod tests {
             home_env_path: None,
             force: false,
             dry_run: false,
-            tokens_dir: None,
+            tokens_dir: repo.path().join("pool"),
         };
         let result = bootstrap_tokens(&opts).unwrap();
         assert_eq!(result.written.len(), 2);
@@ -1572,9 +1574,11 @@ mod tests {
         let files: Vec<&str> = result.effective.iter().map(|a| a.file.as_str()).collect();
         assert!(files.contains(&"alice-example.token"));
         assert!(files.contains(&"bob-example.token"));
-        let pool = repo.path().join(".loom").join("tokens");
+        let pool = repo.path().join("pool");
         assert!(pool.join("index.json").is_file());
         assert!(pool.join("alice-example.token").is_file());
+        // Issue #9135: nothing lands in the repo-local `.loom/tokens` path.
+        assert!(!repo.path().join(".loom").join("tokens").exists());
         std::env::remove_var(HOME_ACCOUNTS_ENV_VAR);
         std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
     }
@@ -1590,16 +1594,11 @@ mod tests {
             home_env_path: None,
             force: false,
             dry_run: true,
-            tokens_dir: None,
+            tokens_dir: repo.path().join("pool"),
         };
         let result = bootstrap_tokens(&opts).unwrap();
         assert_eq!(result.effective.len(), 1);
-        assert!(!repo
-            .path()
-            .join(".loom")
-            .join("tokens")
-            .join("index.json")
-            .exists());
+        assert!(!repo.path().join("pool").join("index.json").exists());
         std::env::remove_var(HOME_ACCOUNTS_ENV_VAR);
         std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
     }
@@ -1616,7 +1615,7 @@ mod tests {
             home_env_path: None,
             force: false,
             dry_run: false,
-            tokens_dir: None,
+            tokens_dir: tmp.path().join("pool"),
         };
         match bootstrap_tokens(&opts) {
             Err(BootstrapError::NoSource(_)) => {}
@@ -1645,7 +1644,7 @@ mod tests {
             home_env_path: Some(None), // --no-home
             force: false,
             dry_run: true,
-            tokens_dir: None,
+            tokens_dir: repo.path().join("pool"),
         };
         let result = bootstrap_tokens(&opts).unwrap();
         // Only the repo account survives.
@@ -1670,7 +1669,7 @@ mod tests {
             home_env_path: None,
             force: false,
             dry_run: true,
-            tokens_dir: None,
+            tokens_dir: repo.path().join("pool"),
         };
         let result = bootstrap_tokens(&opts).unwrap();
         assert_eq!(result.effective.len(), 1);
@@ -1697,7 +1696,7 @@ mod tests {
             home_env_path: None,
             force: false,
             dry_run: false,
-            tokens_dir: None,
+            tokens_dir: repo.path().join("pool"),
         };
         match bootstrap_tokens(&opts) {
             Err(BootstrapError::DuplicateFile(_)) => {}
@@ -1720,7 +1719,7 @@ mod tests {
             home_env_path: None,
             force: false,
             dry_run: false,
-            tokens_dir: Some(shared_pool.clone()),
+            tokens_dir: shared_pool.clone(),
         };
         let result = bootstrap_tokens(&opts).unwrap();
         assert_eq!(result.tokens_dir.as_deref(), Some(shared_pool.as_path()));

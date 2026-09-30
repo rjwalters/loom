@@ -110,10 +110,9 @@ on every `loom:pr` candidate **before** the 6 safety criteria:
 - If the marker's SHA still matches the current head (`FRESH`, exit `0`) or no
   marker exists at all — the verdict predates this convention, or the Judge
   dropped the marker (`UNVERIFIABLE`, exit `11`, fails safe) → proceed to the
-  safety criteria as before. Since #6319 an unmarked verdict is *anchored* to
-  the then-current head by Judge's sweep (`--anchor`) and by the daemon's
-  periodic pass, so exit `11` should be rare and short-lived rather than a
-  permanent resting state.
+  safety criteria as before, unless the reason says the markers *could not
+  be authenticated* (#9548): then do NOT merge. Since #6319 Judge's sweep
+  (`--anchor`) and the daemon anchor unmarked verdicts, so exit `11` is rare.
 - If the head has moved since the verdict was rendered (`STALE`, exit `12`)
   → the guard has already cleared `loom:pr` and re-queued the PR as
   `loom:review-requested` with an auditable old→new-SHA comment. **Do not

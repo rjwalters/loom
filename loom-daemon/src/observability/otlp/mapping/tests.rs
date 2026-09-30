@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::telemetry::{
-    HostHealthRecord, PhaseDuration, SweepCompletedRecord, SweepOutcomeRecord, SweepPhaseRecord,
-    SweepStartedRecord, TokenAccountState, TokenSnapshotRecord,
+    HostHealthRecord, PhaseDuration, SweepCompletedRecord, SweepDisposition, SweepOutcomeRecord,
+    SweepPhaseRecord, SweepStartedRecord, TokenAccountState, TokenSnapshotRecord,
 };
 
 fn ts() -> DateTime<Utc> {
@@ -25,6 +25,7 @@ fn sweep_started_envelope() -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepStarted(SweepStartedRecord {
+            story_points: None,
             repo: "rjwalters/loom".to_string(),
             visibility: RepoVisibility::Public,
             issue: 4858,
@@ -55,7 +56,7 @@ fn sweep_completed_envelope(result: SweepResult) -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepCompleted(SweepCompletedRecord {
-            repo: "rjwalters/loom".to_string(),
+            repo: Some("rjwalters/loom".to_string()),
             visibility: RepoVisibility::Public,
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),
@@ -70,7 +71,7 @@ fn sweep_completed_envelope_with_tokens_by_model() -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepCompleted(SweepCompletedRecord {
-            repo: "rjwalters/loom".to_string(),
+            repo: Some("rjwalters/loom".to_string()),
             visibility: RepoVisibility::Public,
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),
@@ -98,7 +99,9 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepOutcome(SweepOutcomeRecord {
-            repo: "rjwalters/loom".to_string(),
+            story_points: None,
+            repo: Some("rjwalters/loom".to_string()),
+            repo_unresolved: false,
             visibility: RepoVisibility::Public,
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),
@@ -106,23 +109,21 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             effort: Some("high".to_string()),
             config,
             phase_durations: vec![
-                PhaseDuration {
-                    phase: "curator".to_string(),
-                    duration_sec: 12,
-                },
-                PhaseDuration {
-                    phase: "builder".to_string(),
-                    duration_sec: 340,
-                },
+                PhaseDuration::new("curator".to_string(), 12),
+                PhaseDuration::new("builder".to_string(), 340),
             ],
             total_duration_sec: 512,
             result: SweepResult::Success,
+            // Issue #9441: this fixture names a PR, so `landed` is the only
+            // disposition the record may carry (invariant 1).
+            disposition: SweepDisposition::Landed,
             pr_number: Some(4861),
             tokens_in: None,
             tokens_out: None,
             lines_added: None,
             lines_deleted: None,
             tokens_by_model: None,
+            tokens_unattributed: None,
             // Issue #8507: this fixture is a Claude sweep, which writes no
             // launch record — so all three stay absent.
             runtime: None,
@@ -133,6 +134,18 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             doctor_cycles: None,
             judge_verdicts: None,
             complexity: None,
+            tokens_status: None,
+            tokens_status_reason: None,
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
+            pr_numbers: None,
+            hw_lines_added: None,
+            hw_lines_deleted: None,
+            hw_files: None,
+            generated_lines: None,
+            test_lines: None,
         }),
     )
 }
@@ -311,6 +324,14 @@ fn sweep_outcome_flattens_config_and_nests_phase_durations() {
         Some(any_value::Value::StringValue("claude".to_string()))
     );
     assert_eq!(get("loom.pr_number"), Some(any_value::Value::IntValue(4861)));
+    // Issue #9441: the disposition travels beside `loom.result`, never
+    // instead of it, and is always present (never conditionally attached like
+    // the optional attributes above).
+    assert_eq!(get("loom.result"), Some(any_value::Value::StringValue("success".to_string())));
+    assert_eq!(
+        get("loom.disposition"),
+        Some(any_value::Value::StringValue("landed".to_string()))
+    );
     match get("loom.phase_durations") {
         Some(any_value::Value::ArrayValue(array)) => {
             assert_eq!(array.values.len(), 2);
@@ -811,4 +832,34 @@ fn quota_utilization_queries_name_emitted_token_gauges() {
         assert!(sql.contains(&format!("'{name}'")), "{name} missing from the SQL");
         assert!(emitted.contains(&name), "{name} is not emitted by the mapping");
     }
+}
+
+/// Issue #9432 (epic #9429): `sweep.started` exports the size of the work now
+/// in flight as a NUMERIC `loom.story_points` attribute — and an unsized
+/// dispatch exports no such attribute at all (absent, never `0`).
+#[test]
+fn sweep_started_exports_story_points_numerically_when_sized() {
+    let story_points = |envelope: TelemetryEnvelope| {
+        let request = build_logs_request(&[envelope]).unwrap();
+        request.resource_logs[0].scope_logs[0].log_records[0]
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "loom.story_points")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    assert_eq!(
+        story_points(sweep_started_envelope()),
+        None,
+        "an unsized dispatch must omit the attribute, not export 0"
+    );
+
+    let TelemetryRecord::SweepStarted(mut record) = sweep_started_envelope().record else {
+        panic!("fixture is a sweep.started record")
+    };
+    record.story_points = Some(13);
+    assert_eq!(
+        story_points(envelope("host-a", TelemetryRecord::SweepStarted(record))),
+        Some(any_value::Value::IntValue(13))
+    );
 }
