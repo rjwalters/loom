@@ -90,6 +90,16 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
                     .arg(number.to_string())
                     .output()
                     .context("run Judge fallback guard")?;
+                // Velocity is independent of admission, including an empty queue.
+                // Keep diagnostics off stdout, which belongs to the queue JSON.
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stdout.lines().any(|line| line == "VELOCITY_ALERT=1") {
+                    let count = stdout
+                        .lines()
+                        .find_map(|line| line.strip_prefix("VELOCITY_COUNT="))
+                        .unwrap_or("unknown");
+                    eprintln!("Judge fallback warning for PR #{number}: VELOCITY_ALERT=1 VELOCITY_COUNT={count}");
+                }
                 match output.status.code() {
                     Some(0) => {}
                     Some(10..=12) => continue,

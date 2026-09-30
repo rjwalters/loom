@@ -243,3 +243,116 @@ fn actions_capture_is_autonomous_even_under_interactive_environment() {
         .unwrap()
         .contains("origin=autonomous"));
 }
+
+#[cfg(unix)]
+#[test]
+fn real_fallback_guard_preserves_velocity_alerts_and_decisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".loom/scripts")).unwrap();
+    let guard = root.join(".loom/scripts/judge-fallback-guard.sh");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../defaults/scripts/judge-fallback-guard.sh"),
+        &guard,
+    )
+    .unwrap();
+    let mut pr = row(123, "interactive", "");
+    pr["labels"] = serde_json::json!([]);
+    std::fs::write(root.join("pulls.json"), serde_json::to_vec(&vec![pr]).unwrap()).unwrap();
+    script(
+        &root.join("gh"),
+        r#"
+case "$*" in
+ *pulls*) printf 'HTTP/2 200 OK\r\n\r\n'; cat pulls.json;;
+ *'pr view'*) cat pr.json;;
+ *comments*)
+   if test "${FAIL_GUARD:-0}" = 1; then echo 'fixture forge failure' >&2; exit 1; fi
+   cat comments.json;;
+ *) echo 'unexpected forge call' >&2; exit 1;;
+esac
+"#,
+    );
+    let head = "a".repeat(40);
+    let old_head = "b".repeat(40);
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let prepare = |cmd: &mut Command| {
+        cmd.current_dir(root)
+            .env("PATH", format!("{}:{}", root.display(), std::env::var("PATH").unwrap()))
+            .env("LOOM_GH_BIN", root.join("gh"))
+            .env("FAIL_GUARD", "0");
+    };
+    // Exercise actual guard outcomes, including an empty queue with an alert.
+    for (case, code, count, same_head, recent, bot) in [
+        ("sha-alert", 12, 8, true, true, false),
+        ("cap-alert", 11, 20, false, true, false),
+        ("eligible-alert", 0, 8, false, true, false),
+        ("eligible-quiet", 0, 0, false, true, false),
+        ("sha-quiet", 12, 1, true, true, false),
+        ("cap-quiet", 11, 20, false, false, false),
+        ("bot-quiet", 10, 0, false, true, true),
+    ] {
+        std::fs::write(
+            root.join("pr.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "author":{"login":"operator","is_bot":bot}, "headRefOid":head
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let comments: Vec<_> = (0..count)
+            .map(|_| serde_json::json!({
+                "body":format!("<!-- loom:fallback-evaluated sha={} -->", if same_head { &head } else { &old_head }),
+                "created_at":if recent { now.as_str() } else { "2020-01-01T00:00:00Z" }
+            }))
+            .collect();
+        std::fs::write(root.join("comments.json"), serde_json::to_vec(&comments).unwrap()).unwrap();
+        let mut direct = Command::new(&guard);
+        prepare(&mut direct);
+        let out = direct.arg("123").output().unwrap();
+        assert_eq!(out.status.code(), Some(code), "{case}: {out:?}");
+        let alert = recent && count >= 8;
+        assert!(
+            String::from_utf8_lossy(&out.stdout)
+                .contains(&format!("VELOCITY_ALERT={}", u8::from(alert))),
+            "{case}"
+        );
+
+        let mut queue = cli(root);
+        prepare(&mut queue);
+        let out = queue
+            .args(["pr-queue", "--role", "judge"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{case}: {out:?}");
+        let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), usize::from(code == 0), "{case}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        if alert {
+            assert!(stderr.contains("PR #123"), "{case}: {stderr}");
+            assert!(stderr.contains("VELOCITY_ALERT=1"), "{case}: {stderr}");
+            assert!(stderr.contains(&format!("VELOCITY_COUNT={count}")), "{case}: {stderr}");
+        } else {
+            assert!(stderr.is_empty(), "{case}: {stderr}");
+        }
+    }
+
+    // A failed guard remains an error, never a successful empty queue.
+    std::fs::write(
+        root.join("pr.json"),
+        format!(r#"{{"author":{{"login":"operator","is_bot":false}},"headRefOid":"{head}"}}"#),
+    )
+    .unwrap();
+    let mut queue = cli(root);
+    prepare(&mut queue);
+    let out = queue
+        .args(["pr-queue", "--role", "judge"])
+        .env("FAIL_GUARD", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("Judge fallback guard failed for #123"), "{stderr}");
+    assert!(stderr.contains("fixture forge failure"), "{stderr}");
+}
