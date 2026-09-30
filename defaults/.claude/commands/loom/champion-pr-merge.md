@@ -3187,18 +3187,11 @@ Use `loom-daemon pr-queue --role champion` and evaluate rows in its order; see `
 
 After each completed/skipped PR, refresh the queue and take the next unvisited row; keep a per-pass visited set. Continue past individual merge failures.
 
-**Congestion signal, report-only (`loom-daemon forge pr-congestion`, #9063
-Phase 1).** At the start of the pass, run `loom-daemon forge pr-congestion`
-from the repo root and copy its verdict line (queue depth, story points,
-congested y/n, bundle estimate) into the pass summary. This is a
-*measurement*, not a decision input: it changes nothing about which PRs
-merge, in what order, or how — the sequential oldest-first drain above is
-unchanged. Do **not** hand-bundle PRs into merge trains, do not hold, delay,
-or reorder a PR because the report says "congested": the failure mode this
-guard prevents is an agent improvising a merge train from the signal before
-#9063's design questions (bundle compatibility, partial-failure semantics)
-are settled by an operator ruling. If the command fails, note that in one
-line and continue the pass — a missing measurement is never a blocker.
+**Congestion signal, report-only.** At the start of the pass, run
+`loom-daemon forge pr-congestion` from the repo root and copy its verdict
+line into the pass summary — measurement only, never a merge-order input.
+Full policy: `.loom/docs/pr-congestion-signal.md` (source:
+`defaults/docs/pr-congestion-signal.md`).
 
 **Starred PRs first (`loom:operator-priority`, #9244).** The shared queue puts stars
 ahead of interactive work, then ordinary work (oldest first within each class). The star changes order only: all 6
