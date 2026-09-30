@@ -204,6 +204,7 @@ pub mod health_monitor;
 pub mod host_affinity;
 pub mod host_breaker;
 pub mod host_pressure;
+pub mod hyperparams;
 pub mod idle_exit;
 pub mod inflight;
 pub mod init;

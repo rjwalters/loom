@@ -20,6 +20,7 @@ use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::host_breaker;
+use loom_daemon::hyperparams;
 use loom_daemon::idle_exit;
 use loom_daemon::install_self_check;
 use loom_daemon::ipc::IpcServer;
@@ -135,6 +136,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // the room and to relay a vetted command (Issue #7947), so it needs
             // the async runtime for the same reason `quarantine` does.
             Commands::Concierge(args) => args.action.run().await,
+            // `hyperparams` prints the resolved hyperparameter vector
+            // (Issue #9683) — pure config resolution, no live daemon, so it
+            // needs neither the socket nor the async runtime.
+            Commands::Hyperparams(args) => args.run(),
             // `quarantine` connects to the running daemon over its Unix socket
             // (the quarantine state is in-memory), so it needs the async runtime.
             Commands::Quarantine { action } => handle_quarantine_command(action).await,
@@ -382,6 +387,16 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 .display(),
         );
     }
+
+    // Unified operational hyperparameters (Issue #9683): resolve the vector
+    // down its tier chain (single-knob env > $LOOM_HYPERPARAMS vector >
+    // "hyperparameters" config block > legacy autonomous.* keys > defaults),
+    // fail fast on any out-of-range/unknown/contradictory value on the
+    // hyperparameters surface, and capture the resolved vector + digest into
+    // the process globals the per-knob resolvers and the span provenance
+    // stamper read. Runs before any span exists so every span of this run
+    // records `loom.hyperparams.digest` for the vector it started under.
+    hyperparams::startup_init(&sweep_workspace)?;
 
     let sweep_config = SweepRegistryConfig::new(sweep_workspace.clone());
 
