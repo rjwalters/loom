@@ -316,6 +316,73 @@ pub fn stop_reason(pass: &StatePass, host: &str, repo: &str) -> String {
 }
 
 // ============================================================================
+// The boot decision
+// ============================================================================
+
+/// Act on the desired run state at boot, and return the `paused` hold note.
+///
+/// Called from [`crate::fleet_sync::start`], which is the earliest point at
+/// which the state is known and still before any dispatch producer, IPC
+/// listener or role loop exists.
+///
+/// - `stopped` **never returns**: the refusal goes to the log *and* to stderr
+///   (a wrapper script's own transcript is often all an operator has at 3am),
+///   and the process exits [`EXIT_FLEET_STOPPED`] through the observability
+///   shutdown path so queued telemetry still flushes. There is nothing to
+///   drain — nothing has started.
+/// - `paused` returns the note for [`crate::ipc::DrainState::with_fleet_hold`];
+///   the caller cannot apply it here because the drain state does not exist yet.
+/// - `running`, an unreadable state and an unset `fleet.repo` all return `None`.
+pub async fn enforce_at_boot(pass: &StatePass, host: &str, repo: &str) -> Option<String> {
+    match pass.enforcement() {
+        Enforcement::Proceed => None,
+        Enforcement::Hold => Some(hold_note(pass, host, repo)),
+        Enforcement::Stop => {
+            let message = refusal_message(pass, host, repo);
+            log::warn!("{message}");
+            eprintln!("{message}");
+            crate::observability::shutdown::exit(EXIT_FLEET_STOPPED).await
+        }
+    }
+}
+
+/// Build the daemon's [`crate::ipc::DrainState`] and arm run-state enforcement
+/// on it (#9598) — the whole wiring of this module into `run_daemon`, in one
+/// call so the boot sequence carries a single line for it.
+///
+/// `started` is [`crate::fleet_sync::start`]'s result: `None` on every host with
+/// no `fleet.repo`, in which case this is exactly the pre-#9598
+/// `DrainState::with_default_ledger()` and no timer is armed at all.
+/// Otherwise the returned drain state starts held when the store says `paused`,
+/// and the `fleet.syncIntervalSecs` timer enforces every later change through
+/// it: holding, releasing a hold *this* mechanism placed, or draining to exit.
+///
+/// The returned [`tokio::task::JoinHandle`] is deliberately dropped: a dropped
+/// handle detaches the task, which then runs for the life of the process —
+/// which is exactly as long as the timer is wanted.
+#[must_use]
+pub fn wire(
+    started: Option<crate::fleet_sync::Started>,
+    workspace_pool: &std::sync::Arc<crate::workspace_pool::WorkspacePool>,
+    event_bus: &std::sync::Arc<crate::event_bus::EventBus>,
+) -> std::sync::Arc<crate::ipc::DrainState> {
+    let hold = started.as_ref().and_then(|s| s.hold_note.clone());
+    let drain =
+        std::sync::Arc::new(crate::ipc::DrainState::with_default_ledger().with_fleet_hold(hold));
+    if let Some(started) = started {
+        let enforcer: std::sync::Arc<dyn Enforcer> = std::sync::Arc::new(IpcEnforcer::new(
+            drain.clone(),
+            workspace_pool.clone(),
+            started.workspace().to_path_buf(),
+            event_bus.clone(),
+            tokio::runtime::Handle::current(),
+        ));
+        drop(started.spawn_timer(Some(enforcer)));
+    }
+    drain
+}
+
+// ============================================================================
 // The timer decision
 // ============================================================================
 

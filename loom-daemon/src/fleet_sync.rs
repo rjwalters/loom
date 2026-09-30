@@ -878,40 +878,37 @@ fn report(status: &FleetSyncStatus, bus: Option<&crate::event_bus::EventBus>) {
     let _ = bus.publish_generic(DRIFT_TOPIC, payload);
 }
 
-/// What [`start`] resolved: the run-state decision for this boot, plus
-/// everything [`Started::spawn_timer`] needs to arm the drift/enforcement timer.
+/// What [`start`] left for the caller: the `paused` hold this boot must begin
+/// under, plus everything [`Started::spawn_timer`] needs to arm the
+/// drift/enforcement timer.
 ///
-/// The timer is **not** spawned by `start` (#9598): enforcing `paused` /
-/// `stopped` on a running daemon needs [`crate::ipc::DrainState`], which does
-/// not exist yet at the point in boot where the startup config render must
-/// happen. So `start` runs the startup pass and hands the caller a decision;
-/// the caller applies it, builds its drain state, and then arms the timer.
+/// A `stopped` state is **already handled** by the time this exists — `start`
+/// exits the process. What cannot be handled there is `paused`: enforcing it
+/// needs [`crate::ipc::DrainState`], which does not exist yet at the point in
+/// boot where the startup config render has to happen. So the hold travels to
+/// the caller as a note, and so does the timer, which enforces later changes
+/// through the same drain state. [`crate::fleet_state::wire`] is the one
+/// production caller that does both.
 pub struct Started {
-    /// What the store's desired run state requires of this boot.
-    pub enforcement: Enforcement,
-    /// The state read that produced it — the input to
-    /// [`crate::fleet_state::refusal_message`] / [`crate::fleet_state::hold_note`].
+    /// The drain note for a `paused` host, or `None` for every other state —
+    /// what [`crate::ipc::DrainState::with_fleet_hold`] takes.
+    pub hold_note: Option<String>,
+    /// The state read this boot, as persisted for `loom-daemon status`.
     pub state: StatePass,
-    /// This host's id in the store, for those messages.
+    /// This host's id in the store.
     pub host: String,
-    /// The store, `OWNER/REPO`, for those messages.
+    /// The store, `OWNER/REPO`.
     pub repo: String,
     inputs: PassInputs,
     bus: Option<std::sync::Arc<crate::event_bus::EventBus>>,
 }
 
 impl Started {
-    /// The refusal message for a `stopped` host, or the hold note for a
-    /// `paused` one — whichever this boot's [`Self::enforcement`] calls for.
+    /// The daemon workspace this host syncs from — the fallback sweep root an
+    /// [`crate::fleet_state::IpcEnforcer`]'s drain request needs.
     #[must_use]
-    pub fn message(&self) -> Option<String> {
-        match self.enforcement {
-            Enforcement::Proceed => None,
-            Enforcement::Hold => Some(fleet_state::hold_note(&self.state, &self.host, &self.repo)),
-            Enforcement::Stop => {
-                Some(fleet_state::refusal_message(&self.state, &self.host, &self.repo))
-            }
-        }
+    pub fn workspace(&self) -> &Path {
+        &self.inputs.workspace
     }
 
     /// Arm the `fleet.syncIntervalSecs` timer. `enforcer` acts on a *change* of
@@ -933,8 +930,17 @@ impl Started {
 /// which is every host that has not opted in. Otherwise runs the **startup
 /// pass** to completion (bounded by [`resolve_startup_timeout`]) before
 /// returning, so the caller can spawn its config-dependent loops against the
-/// config the store just rendered, and returns the run-state decision plus the
-/// means to arm the timer ([`Started`]).
+/// config the store just rendered, and returns the `paused` hold plus the means
+/// to arm the timer ([`Started`]).
+///
+/// # This call does not return on a `stopped` host (#9598)
+///
+/// The desired run state is resolved by the same startup pass, and a `stopped`
+/// state is acted on **here** — the earliest point at which it is known, and
+/// before any dispatch producer, IPC listener or role loop exists to drain.
+/// [`crate::fleet_state::enforce_at_boot`] prints the refusal and exits
+/// [`crate::fleet_state::EXIT_FLEET_STOPPED`]. That is deliberate: deferring
+/// the decision to the caller means every caller has to remember to make it.
 pub async fn start(
     workspace: &Path,
     bus: Option<std::sync::Arc<crate::event_bus::EventBus>>,
@@ -999,8 +1005,10 @@ pub async fn start(
         inputs.interval.as_secs()
     );
     let state = startup_pass(&inputs, bus.as_deref()).await;
+    // Diverges on `stopped`: this host is not meant to be up at all.
+    let hold_note = fleet_state::enforce_at_boot(&state, &inputs.host, &inputs.location.repo).await;
     Some(Started {
-        enforcement: state.enforcement(),
+        hold_note,
         state,
         host: inputs.host.clone(),
         repo: inputs.location.repo.clone(),

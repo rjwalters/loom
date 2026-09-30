@@ -1517,7 +1517,9 @@ fallback, and no partial or default roster.
 Prints the host's desired run state: its `hosts.<H>` entry if it sets
 `state`, else the `fleet` default, with `since`/`by`/`reason` from the entry
 that decided it. A state other than `running`/`paused`/`stopped`, or no state
-at all, is an error. Report only — the daemon does not enforce it yet.
+at all, is an error. This verb is report-only; what **enforces** the same state
+on a live host is the daemon's own sync, below
+([Run-state enforcement](#run-state-enforcement-9598)).
 
 ### `fleet-config propose <state|priority|adopt>` (#9599)
 
@@ -1612,6 +1614,62 @@ drift, roster drift, and whether anything was written), and `status --json`
 carries the same record under `fleet_store`. Both are read host-locally from
 `~/.loom/fleet-sync-status.json`, so they still answer when the daemon does not
 — including when the startup pass itself is what went wrong.
+
+### Run-state enforcement (#9598)
+
+The same two passes also **enforce** `fleet/state.yml`'s desired run state for
+this host — the state `fleet-config state` reports. There is no new flag and no
+new config key: `paused` and `stopped` both go through the drain machinery
+(#4090) an operator's own `fleet drain` / `restart --drain --then-exit` uses.
+
+| Store says | At startup | On a timer pass, already running |
+|---|---|---|
+| `running` | nothing — normal dispatch | releases a hold **this** mechanism placed; leaves every other drain alone |
+| `paused` | starts with new dispatch **held** | holds new dispatch; in-flight sweeps and role ticks finish |
+| `stopped` | **refuses to start**: prints why and exits `79` | drains and exits (the drain finishes in-flight work first) |
+
+- **`stopped` is not a crash, and says so.** The refusal names the deciding
+  entry (`hosts.<H>` vs the `fleet` default, with `by`/`since`/`reason`), where
+  the answer came from (live, cached, or last recorded), and the command that
+  changes it. Exit `79` is distinct from both `0` (the *restart* code) and `1`
+  (a startup failure), so `KeepAlive: SuccessfulExit` / `Restart=on-success`
+  supervisors and log scrapers can tell a policy refusal from a crash without
+  parsing prose. A `stopped` state that lands mid-run drains **and** writes the
+  operator-stop record (#9588), which is what keeps a watchdog from reviving
+  the host the store just took down.
+- **Enforcement is not gated on `fleet.autoApply`.** That flag guards *writes*
+  to this host's config files and workspace registry — a more invasive act than
+  honouring the run state an operator committed. A host that reads the store at
+  all obeys `paused` / `stopped`.
+- **A forge outage never resumes a stopped host.** The state read is the same
+  `AllowStale` read the config half uses, so the last good cached snapshot
+  answers (with its staleness warning); if even the cache is gone, the state
+  this host last *recorded* answers. Only a host that has never resolved a
+  state at all proceeds normally — refusing to boot on no evidence would strand
+  a fleet on one bad fetch.
+- **A local operator stop outranks the store.** A `running` state releases only
+  a hold this mechanism placed; a #9588 operator-stop record, a supervised
+  `restart --drain` and an auto-update roll all keep their own pause and their
+  own release path. Conversely `restart --abort-drain` on a `paused` host
+  resumes dispatch only until the next sync pass re-reads the store, and says so.
+- **Unset `fleet.repo` is unchanged.** No state is read, nothing is held, and
+  nothing can refuse to start.
+
+`status` reports the pair — desired (from the store) and actual (what this host
+did about it) — in the same `Fleet store:` block:
+
+```
+  run state: desired paused (host entry, from a CACHED snapshot) -> new dispatch HELD, in-flight work finishes
+    by: operator
+    reason: disk replacement
+```
+
+They differ in exactly one case: a `stopped` host whose drain-and-exit was
+refused for want of a supervisor, which holds dispatch instead of exiting and
+reports `hold`, not `stop`. `status --json` carries `fleet_store.state`
+(desired, provenance, `by`/`since`/`reason`) and `fleet_store.enforced`
+(`proceed` / `hold` / `stop`); a transition — never the steady state — is also
+published on the event bus as `fleet.sync.state`.
 
 ## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)
 

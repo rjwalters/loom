@@ -446,7 +446,45 @@ fn the_stopped_exit_code_is_not_the_relaunch_code() {
         crate::ipc::EXIT_STARTUP_FAILURE,
         "an operator must be able to tell a policy refusal from a crash"
     );
-    assert!(EXIT_FLEET_STOPPED > 0 && EXIT_FLEET_STOPPED < 126);
+    // A `const` block: the range is the *contract* of the constant (non-zero so
+    // no supervisor reads it as a clean restart, below 126 so it cannot collide
+    // with a shell's signal-encoding range), so a violation should fail to
+    // compile rather than at test time.
+    const { assert!(EXIT_FLEET_STOPPED > 0 && EXIT_FLEET_STOPPED < 126) };
+}
+
+// ============================================================================
+// The boot seam
+// ============================================================================
+
+/// The two boot outcomes that *return*. The third — `stopped` — exits the
+/// process by design, so it is covered by the message and exit-code tests above
+/// rather than by calling it.
+#[tokio::test]
+async fn the_boot_pass_holds_on_paused_and_is_inert_otherwise() {
+    assert_eq!(
+        enforce_at_boot(
+            &StatePass {
+                desired: Some(RunState::Running),
+                ..StatePass::default()
+            },
+            "build-1",
+            "acme/fleet",
+        )
+        .await,
+        None,
+        "a `running` host boots with no hold at all"
+    );
+    assert_eq!(
+        enforce_at_boot(&StatePass::default(), "build-1", "acme/fleet").await,
+        None,
+        "an unreadable state (and an unset fleet.repo) boots unchanged"
+    );
+    let note = enforce_at_boot(&paused_pass(), "build-1", "acme/fleet")
+        .await
+        .expect("a `paused` host boots held");
+    assert!(note.contains("dispatch HELD"), "{note}");
+    assert!(note.contains("In-flight work finishes"), "{note}");
 }
 
 #[test]
