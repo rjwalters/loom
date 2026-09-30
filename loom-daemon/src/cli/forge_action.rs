@@ -164,6 +164,37 @@ pub(crate) enum ForgeAction {
         hold: Option<String>,
     },
 
+    /// `forge tree-unchanged <base> <head>` (#9576) — did the tree change at
+    /// all between two commits? Backed by GitHub's own
+    /// `compare/{base}...{head}` reporting `files: []`, i.e. evidence, never a
+    /// "shaped like a rebase" heuristic.
+    ///
+    /// Prints `TREE_UNCHANGED=1` (byte-identical trees) or `TREE_UNCHANGED=0`
+    /// (a real content change) and exits 0 for both; exits 1 with nothing on
+    /// stdout when the comparison could not be made. So a caller keys on the
+    /// stdout line, and every failure mode — absent binary, a daemon predating
+    /// this verb, a `gh` outage, a non-GitHub forge — collapses into the same
+    /// fail-closed "assume the tree changed" arm.
+    ///
+    /// WHY IT EXISTS: this is the test #9124 added to the daemon's periodic
+    /// verdict-invalidation pass so a tree-identical head move (the #8248
+    /// guard's automated re-date commit, #8508) re-anchors the verdict instead
+    /// of clearing it. `verdict-staleness-guard.sh`, the agent-side fast path,
+    /// had no tree comparison at all and kept clearing those verdicts anyway
+    /// (#9541, #9483). This verb is how the shell guard asks the *same*
+    /// implementation ([`crate::forge_tree_unchanged`]) rather than growing a
+    /// second copy of it.
+    #[command(name = "tree-unchanged")]
+    TreeUnchanged {
+        /// The commit the verdict was rendered against (7-40 lowercase hex).
+        #[arg(value_name = "BASE")]
+        base: String,
+
+        /// The commit to compare it with, normally the PR's current head.
+        #[arg(value_name = "HEAD")]
+        head: String,
+    },
+
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should use,
     /// replacing its old unconditional `forge_detect_merge_method` call.
@@ -284,6 +315,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             audit_comment,
             hold,
         },
+        ForgeAction::TreeUnchanged { base, head } => ForgeCmd::TreeUnchanged { base, head },
         ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
     };
     dispatch(cmd)

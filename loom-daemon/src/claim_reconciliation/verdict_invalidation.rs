@@ -32,13 +32,21 @@
 //! `#8248` required-check-freshness guard's automated re-date commit (#8508),
 //! whose own message says it changes nothing in the tree. See
 //! `verdict_dedup_tests.rs`'s module doc for the measurement.
+//!
+//! **The comparison itself no longer lives here** (#9576). It moved to
+//! [`crate::forge_tree_unchanged`], which this module calls in-process and
+//! `defaults/scripts/verdict-staleness-guard.sh` reaches through the
+//! `loom-daemon forge tree-unchanged` verb. The agent-side guard had no tree
+//! comparison at all while this one did, so the two paths disagreed and PRs
+//! #9541/#9483 lost verdicts here that the daemon pass would have kept. One
+//! implementation, two callers.
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use super::{VerdictKind, VerdictPr, VerdictReconcileStats};
+use crate::forge_tree_unchanged::tree_unchanged;
 
 /// Env kill switch for the tree-identical re-anchor carve-out (Issue #9124),
 /// nested inside [`super::VERDICT_STALENESS_ENABLED_ENV`]. Defaults to ON for
@@ -88,7 +96,7 @@ pub(super) fn handle_invalidate(
     // (comparison unavailable) fall straight through to the ordinary clear,
     // unchanged from before #9124.
     if tree_carveout {
-        if let Some(true) = tree_unchanged(gh_bin, root, marker_sha, head_sha) {
+        if let Some(true) = tree_unchanged(gh_bin, Some(root), marker_sha, head_sha) {
             match reanchor_tree_unchanged_verdict(gh_bin, root, pr, marker_sha, head_sha) {
                 Ok(()) => {
                     stats.tree_identical_reanchors += 1;
@@ -137,44 +145,6 @@ pub(super) fn handle_invalidate(
             );
         }
     }
-}
-
-/// Does `head_sha`'s tree differ from `marker_sha`'s at all (Issue #9124)?
-/// Backed by GitHub's own `compare/{base}...{head}`, which reports
-/// `files: []` when nothing changed between the two commits' trees —
-/// bit-for-bit, not "shaped like a rebase".
-///
-/// `Some(true)` — the codebase is byte-for-byte unchanged; commonest cause
-/// measured on this repo is the `#8248` required-check-freshness guard's
-/// automated "re-date required checks" commit (#8508), which exists ONLY to
-/// give a merge queue's required checks a fresh timestamp and explicitly
-/// changes nothing in the tree. `Some(false)` — a real content change;
-/// invalidate as before. `None` — the comparison could not be made (a `gh api`
-/// failure, an unparsable response, a marker SHA the compare endpoint does not
-/// recognize): fails open into "proceed with the ordinary invalidation", the
-/// behavior this pass has always had, never into an assumed equivalence on
-/// missing evidence.
-///
-/// Costs one extra `gh api` call, and only for a PR [`super::decide_verdict`]
-/// has already decided to invalidate — never on the common `Fresh` path.
-fn tree_unchanged(gh_bin: &Path, root: &Path, marker_sha: &str, head_sha: &str) -> Option<bool> {
-    #[derive(Deserialize)]
-    struct CompareFiles {
-        #[serde(default)]
-        files: Vec<serde_json::Value>,
-    }
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("api")
-        .arg(format!("repos/{{owner}}/{{repo}}/compare/{marker_sha}...{head_sha}"));
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let parsed: CompareFiles = serde_json::from_slice(&out.stdout).ok()?;
-    Some(parsed.files.is_empty())
 }
 
 /// Re-anchor a verdict whose head moved but whose tree did not (Issue #9124):

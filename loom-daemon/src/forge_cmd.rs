@@ -750,6 +750,14 @@ pub enum ForgeCmd {
         audit_comment: bool,
         hold: Option<String>,
     },
+    /// `forge tree-unchanged <base> <head>` (#9576) — did the tree change at
+    /// all between two commits? The single implementation of the test #9124
+    /// gave the daemon's verdict-invalidation pass, exposed so
+    /// `verdict-staleness-guard.sh` can ask it instead of keeping its own
+    /// (absent) copy. Implemented in
+    /// [`crate::forge_tree_unchanged::handle`]; see that module for the
+    /// stdout/exit-code contract and the fail-closed arm.
+    TreeUnchanged { base: String, head: String },
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should pass
     /// to `forge_merge_pr`. See
@@ -800,6 +808,7 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
             audit_comment,
             hold.as_deref(),
         ),
+        ForgeCmd::TreeUnchanged { base, head } => crate::forge_tree_unchanged::handle(&base, &head),
         ForgeCmd::MergeMethod { repo, requested } => {
             crate::forge_merge_method::handle_merge_method(&repo, requested.as_deref())
         }
