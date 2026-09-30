@@ -127,6 +127,29 @@ struct GitIdent {
     date: Option<DateTime<Utc>>,
 }
 
+/// Enumerate `root`'s PRs (`repo`, else whatever `gh` resolves) and fetch
+/// each one's timeline, newest first. Shared by `pr-latency` itself and by
+/// `eta backfill` (#9325), which seeds the ETA stage-sample journal from the
+/// same forge-derived histories rather than re-deriving them.
+pub(crate) fn fetch_histories(
+    root: &Path,
+    repo: Option<&str>,
+    limit: u32,
+    open_only: bool,
+    progress: bool,
+) -> (Vec<PrHistory>, Option<String>) {
+    let (rows, list_error) = list_prs(root, repo, limit, open_only);
+    let mut histories = Vec::with_capacity(rows.len());
+    let total = rows.len();
+    for (i, row) in rows.into_iter().enumerate() {
+        if progress {
+            eprintln!("[pr-latency] {}/{total} #{}", i + 1, row.number);
+        }
+        histories.push(history_for(&row, repo, root));
+    }
+    (histories, list_error)
+}
+
 impl PrLatencyArgs {
     /// In `--advise` mode this always returns `Ok(())` and exits 0 — the
     /// pre-wave-advisory contract shared with `check-stale-blocked`,
@@ -142,15 +165,9 @@ impl PrLatencyArgs {
             .unwrap_or_else(|| PathBuf::from("."));
         let repo = self.repo.as_deref();
 
-        let (rows, list_error) = list_prs(&root, repo, self.limit, self.advise);
-        let mut histories = Vec::with_capacity(rows.len());
-        let total = rows.len();
-        for (i, row) in rows.into_iter().enumerate() {
-            if self.progress {
-                eprintln!("[pr-latency] {}/{total} #{}", i + 1, row.number);
-            }
-            histories.push(history_for(&row, repo, &root));
-        }
+        let (histories, list_error) =
+            fetch_histories(&root, repo, self.limit, self.advise, self.progress);
+        let total = histories.len();
 
         let report = LatencyReport::build(&histories, Utc::now());
         let threshold = self.threshold_hours.max(0) * 3600;

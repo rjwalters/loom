@@ -8,18 +8,22 @@
 //!
 //! **Write side.** When a traced sweep is dispatched, [`open`] writes
 //! `.loom/logs/trace-joins/<trace-id>-<span-id>.json` = `{issue, context, started_at}`
-//! (the execution's persisted root context). At the terminal transition,
-//! [`close`] stamps `ended_at`. Entries are pruned [`RETAIN_CLOSED_HOURS`]
-//! after they close, or [`RETAIN_OPEN_HOURS`] after they open.
+//! (the execution's persisted root context). A traced **role-runner tick**
+//! writes the same entry keyed on its role instead ([`open_role`], Issue
+//! #9231). At the terminal transition, [`close`] stamps `ended_at`. Entries are
+//! pruned [`RETAIN_CLOSED_HOURS`] after they close, or [`RETAIN_OPEN_HOURS`]
+//! after they open.
 //!
 //! **Read side.** [`context_for_session`] takes a transcript's `cwd`, its
-//! attributed issue (the `/loom:<role> <N>` head) and its first timestamp.
-//! It resolves the workspace (the `cwd` itself, or the part before
-//! `/.loom/worktrees/`) and returns a context only when **exactly one** entry
-//! names that issue and has a window containing the session's start (with
-//! [`START_SLACK_SECS`] of clock slack). No issue, no entry, or an ambiguous
-//! match returns `None`: the log stays unjoined and is never guessed. A
-//! subagent transcript whose head names no issue is therefore unjoined.
+//! attributed issue (the `/loom:<role> <N>` head, an `issue-<N>` worktree, a
+//! `feature/issue-<N>` branch), the role its own slash command named, and its
+//! first timestamp. It resolves the workspace (the `cwd` itself, or the part
+//! before `/.loom/worktrees/`) and returns a context only when **exactly one**
+//! entry carries the session's [`JoinKey`] and has a window containing the
+//! session's start (with [`START_SLACK_SECS`] of clock slack). No key, no
+//! entry, or an ambiguous match returns `None`: the log stays unjoined and is
+//! never guessed. A subagent transcript that names neither an issue nor a
+//! `/loom:<role>` command of its own is therefore unjoined.
 //!
 //! The index lives beside `trace-context/` rather than inside it, because
 //! every `.json`/`.jsonl` there is an execution context or a span journal.
@@ -45,10 +49,61 @@ pub const START_SLACK_SECS: i64 = 120;
 /// without duplicating the constant.
 pub(crate) const MAX_ENTRIES: usize = 1024;
 
+/// What a join entry — and a session looking for one — is keyed on.
+///
+/// A **sweep** keys on the issue it claims. A **role-runner tick** has no issue
+/// to key on: its prompt is a bare `/loom:<role>` (the roster in
+/// `role_runner.rs` never passes an argument), it runs with `current_dir` at the
+/// workspace root rather than in an `issue-<N>` worktree, and on no
+/// `feature/issue-<N>` branch — so every one of
+/// [`crate::activity::session_context`]'s three issue sources resolves to
+/// `None` and an issue-keyed entry could never match. It keys on its role
+/// instead (Issue #9231), which is exactly the key
+/// [`crate::role_tick_telemetry`] already attributes that tick's *tokens* on:
+/// role + workspace root + window.
+///
+/// The residual ambiguity is the same one that module documents — an operator
+/// hand-running `/loom:<role>` in the same window on the same checkout — and it
+/// resolves the same way: two covering entries are ambiguous, so the session
+/// stays unjoined rather than joining the wrong trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKey<'a> {
+    /// A sweep of one issue, and any session that names that issue.
+    Issue(u32),
+    /// One role-runner tick, and any session whose own head named
+    /// `/loom:<role>` without an issue.
+    Role(&'a str),
+}
+
+/// The key a session joins on: its issue when any source names one, else the
+/// role its own slash command named
+/// ([`crate::activity::transcript_parse::slash_command_role`]).
+///
+/// Precedence, deliberately **not** a fallback chain: a session that names an
+/// issue joins that issue's execution or nothing at all. Letting it fall
+/// through to a role key when no issue entry matched would let a sweep phase
+/// whose own execution is untraced attach itself to whatever role-runner tick
+/// happened to be open.
+#[must_use]
+pub fn session_key<'a>(issue: Option<u32>, role: Option<&'a str>) -> Option<JoinKey<'a>> {
+    match (issue, role) {
+        (Some(issue), _) => Some(JoinKey::Issue(issue)),
+        (None, Some(role)) => Some(JoinKey::Role(role)),
+        (None, None) => None,
+    }
+}
+
 /// One execution's join entry.
+///
+/// Exactly one of `issue` / `role` is set — see [`JoinKey`]. Both are optional
+/// and skipped when absent so a pre-#9231 entry (`{"issue": 42, …}`, written by
+/// a daemon that ran across the upgrade) still deserializes as issue-keyed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinEntry {
-    pub issue: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub context: TraceContext,
     pub started_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,6 +111,34 @@ pub struct JoinEntry {
 }
 
 impl JoinEntry {
+    /// An entry with `key` and no window/timing opinion.
+    #[must_use]
+    pub fn new(key: JoinKey<'_>, context: TraceContext, started_at: DateTime<Utc>) -> Self {
+        let (issue, role) = match key {
+            JoinKey::Issue(issue) => (Some(issue), None),
+            JoinKey::Role(role) => (None, Some(role.to_ascii_lowercase())),
+        };
+        Self {
+            issue,
+            role,
+            context,
+            started_at,
+            ended_at: None,
+        }
+    }
+
+    /// Whether this entry is the one `key` names.
+    #[must_use]
+    fn keyed_by(&self, key: JoinKey<'_>) -> bool {
+        match key {
+            JoinKey::Issue(issue) => self.issue == Some(issue),
+            JoinKey::Role(role) => self
+                .role
+                .as_deref()
+                .is_some_and(|own| own.eq_ignore_ascii_case(role)),
+        }
+    }
+
     fn covers(&self, at: DateTime<Utc>) -> bool {
         at >= self.started_at - Duration::seconds(START_SLACK_SECS)
             && self.ended_at.is_none_or(|end| at <= end)
@@ -98,31 +181,45 @@ fn saved_context(root: &Path, execution: &str) -> Option<TraceContext> {
         .map(|saved| saved.context)
 }
 
-/// Open `execution`'s join entry for `issue`. A no-op when tracing is off or
-/// the execution has no persisted trace context. Best-effort.
+/// Open `execution`'s join entry for `issue` (a sweep dispatch). A no-op when
+/// tracing is off or the execution has no persisted trace context.
+/// Best-effort.
 pub fn open(root: &Path, execution: &str, issue: u32) {
+    open_keyed(root, execution, JoinKey::Issue(issue));
+}
+
+/// Open `execution`'s join entry for a role-runner tick of `role` (Issue
+/// #9231) — [`open`]'s counterpart for a dispatch with no issue to key on.
+pub fn open_role(root: &Path, execution: &str, role: &str) {
+    open_keyed(root, execution, JoinKey::Role(role));
+}
+
+/// [`open`] / [`open_role`] over an explicit [`JoinKey`].
+pub fn open_keyed(root: &Path, execution: &str, key: JoinKey<'_>) {
     if !super::super::tracing::enabled(root) {
         return;
     }
-    if let Err(error) = open_at(root, execution, issue, Utc::now()) {
+    if let Err(error) = open_keyed_at(root, execution, key, Utc::now()) {
         log::warn!("observability: session trace join not recorded: {error}");
     }
 }
 
 /// [`open`] without the enablement check.
 pub fn open_at(root: &Path, execution: &str, issue: u32, now: DateTime<Utc>) -> anyhow::Result<()> {
+    open_keyed_at(root, execution, JoinKey::Issue(issue), now)
+}
+
+/// [`open_keyed`] without the enablement check.
+pub fn open_keyed_at(
+    root: &Path,
+    execution: &str,
+    key: JoinKey<'_>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
     let Some(context) = saved_context(root, execution) else {
         return Ok(());
     };
-    write(
-        root,
-        &JoinEntry {
-            issue,
-            context,
-            started_at: now,
-            ended_at: None,
-        },
-    )
+    write(root, &JoinEntry::new(key, context, now))
 }
 
 /// Close `execution`'s join entry at `ended_at`. A no-op when none is open.
@@ -254,13 +351,20 @@ fn entries(root: &Path, now: DateTime<Utc>) -> (Vec<JoinEntry>, bool) {
 
 /// The trace context a session's `session.summary` joins, or `None` (see the
 /// module doc for the exactly-one rule).
+///
+/// `role` is the session's own [`slash_command_role`][slash], never the
+/// keyword-scan `attribute_role`: a join key must come from what the session
+/// *launched as*, not from prose in a subagent's dispatch prompt.
+///
+/// [slash]: crate::activity::transcript_parse::slash_command_role
 #[must_use]
 pub fn context_for_session(
     cwd: Option<&str>,
     issue: Option<u32>,
+    role: Option<&str>,
     started_at: Option<DateTime<Utc>>,
 ) -> Option<TraceContext> {
-    context_for_session_at(cwd, issue, started_at, Utc::now())
+    context_for_session_at(cwd, issue, role, started_at, Utc::now())
 }
 
 /// [`context_for_session`] at an explicit `now` (tests).
@@ -268,10 +372,22 @@ pub fn context_for_session(
 pub fn context_for_session_at(
     cwd: Option<&str>,
     issue: Option<u32>,
+    role: Option<&str>,
     started_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Option<TraceContext> {
-    let (cwd, issue, started_at) = (cwd?, issue?, started_at?);
+    context_for_key_at(cwd, session_key(issue, role)?, started_at, now)
+}
+
+/// [`context_for_session_at`] over an already-decided [`JoinKey`].
+#[must_use]
+pub fn context_for_key_at(
+    cwd: Option<&str>,
+    key: JoinKey<'_>,
+    started_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<TraceContext> {
+    let (cwd, started_at) = (cwd?, started_at?);
     let root = workspace_of(Path::new(cwd));
     let (found, capped) = entries(&root, now);
     if capped {
@@ -282,7 +398,7 @@ pub fn context_for_session_at(
     }
     let mut matches = found
         .into_iter()
-        .filter(|entry| entry.issue == issue && entry.covers(started_at));
+        .filter(|entry| entry.keyed_by(key) && entry.covers(started_at));
     let only = matches.next()?;
     matches.next().is_none().then_some(only.context)
 }

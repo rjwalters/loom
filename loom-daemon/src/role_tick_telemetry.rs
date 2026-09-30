@@ -457,6 +457,9 @@ pub fn scan_transcripts_with_targets(
     let mut actions = RoleTickActions::default();
     let mut targets = BTreeSet::new();
     let mut read_any = false;
+    // One fold across every transcript: deduped on `message.id` per scan, not
+    // per file (#8186, #9303, #9315).
+    let mut fold = crate::script_helpers::transcript_usage::UsageFold::default();
 
     for path in transcripts {
         if std::fs::metadata(path)
@@ -470,8 +473,6 @@ pub fn scan_transcripts_with_targets(
         };
         read_any = true;
         let mut session = targets::Session::default();
-        // Deduped on `message.id` per transcript (#8186, #9303).
-        let mut fold = crate::script_helpers::transcript_usage::UsageFold::default();
         for raw in text.lines() {
             let raw = raw.trim();
             if raw.is_empty() {
@@ -485,8 +486,8 @@ pub fn scan_transcripts_with_targets(
                 fold.add(rec);
             }
         }
-        crate::script_helpers::transcript_usage::merge_rows(&mut totals, fold.rows());
     }
+    crate::script_helpers::transcript_usage::merge_rows(&mut totals, fold.rows());
 
     // `None` — never a zeroed scan — when no transcript was readable at all.
     // That is the difference between "this tick did nothing observable" and
@@ -752,6 +753,20 @@ fn emit_correlated(
             tick.ended_at,
             story_runtime.as_deref(),
             rows,
+        );
+    }
+    // #9231: the tick's terminal transition, mirroring
+    // `runtime_usage::finish_sweep` — the usage spans above, then the close of
+    // the join entry `lifecycle::role_invocation` opened at dispatch.
+    // Unconditional on usage being known: an entry left open because the tick
+    // spent nothing would keep matching every later session of this role for
+    // the full `RETAIN_OPEN_HOURS` window, which is exactly the ambiguity
+    // #9013 item 3 bounded for sweeps.
+    if let Some(trace) = &trace {
+        crate::observability::runtime_usage::join::close(
+            &tick.root,
+            &trace.execution,
+            tick.ended_at,
         );
     }
     if let (Some(trace), Some(targets)) = (trace, targets) {

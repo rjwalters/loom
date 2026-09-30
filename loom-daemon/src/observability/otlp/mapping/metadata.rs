@@ -139,6 +139,15 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     if let Some(value) = record.doctor_cycles {
         attrs.push(kv_int("loom.doctor_cycles", i64::from(value)));
     }
+    // Issue #9432 (epic #9429): the Curator's a-priori size estimate, exported
+    // as a NUMERIC attribute so a backend can sum "story points landed per day"
+    // (#9433) and join estimate against the actuals already on this record
+    // (#9434) without leaving the telemetry store. Absent-not-zero: an unsized
+    // issue, a stacked points label set (logged loudly at resolution time) and
+    // an unread issue all omit the attribute entirely.
+    if let Some(value) = record.story_points {
+        attrs.push(kv_int("loom.story_points", i64::from(value)));
+    }
     if let Some(verdicts) = &record.judge_verdicts {
         if verdicts.len() <= MAX_GROUPS
             && verdicts
@@ -167,6 +176,24 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     }
     if let Some(value) = usage(record.tokens_by_model.as_deref()) {
         attrs.push(value);
+    }
+    // Issue #9440: the discriminator that makes an absent token pair readable.
+    // A closed vocabulary (the enum's own serde tags), so this is an exported
+    // attribute a query can group by, never free text.
+    if let Some(status) = record.tokens_status {
+        attrs.push(kv_string(
+            "loom.tokens_status",
+            match status {
+                crate::telemetry::TokensStatus::Measured => "measured",
+                crate::telemetry::TokensStatus::NotSpawned => "not_spawned",
+                crate::telemetry::TokensStatus::Unattributable => "unattributable",
+                crate::telemetry::TokensStatus::Suspect => "suspect",
+            }
+            .to_string(),
+        ));
+    }
+    if let Some(value) = record.tokens_status_reason.as_ref().filter(|v| text(v)) {
+        attrs.push(kv_string("loom.tokens_status_reason", value.clone()));
     }
     for (key, value) in [
         ("loom.tokens_in", record.tokens_in),

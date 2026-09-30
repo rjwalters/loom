@@ -81,6 +81,32 @@
 //! - Every set is safe to **over**-populate: every clause is monotone in
 //!   `G`, `S` and `C`, so a path listed too broadly can only make the guard
 //!   refuse more often.
+//!
+//! # Gates implemented inside the daemon binary
+//!
+//! Four components (`Shell Budget Ratchet`, `.gitignore Convergence Check`,
+//! `Secret Scan`, `MCP Guard Wiring Contract`) run a `loom-daemon` subcommand
+//! rather than a script. Their `G` used to be `loom-daemon/**`, which nearly
+//! every base move and nearly every PR touches, so they read as stale almost
+//! always and the guard stopped distinguishing anything (PRs #9543/#9544,
+//! 2026-09-29: refused on `cli/forge_action.rs` vs `init/post_init.rs`).
+//!
+//! Each now lists the **source files its verdict can depend on**: the
+//! subcommand's handler, the library module(s) that handler reaches by
+//! following `mod` / `use crate::…` / `loom_daemon::…` / `super::…` paths
+//! transitively, the dispatch chain from `main()` to the handler, and the
+//! build inputs (`Cargo.toml`s, `Cargo.lock`, `rust-toolchain.toml`,
+//! `.cargo/config.toml`, `build.rs`). `daemon_surface_tests.rs` recomputes
+//! that closure from the source on every test run and fails when a checker
+//! starts reaching a file its spec does not list, so the globs grow with the
+//! code instead of silently going stale.
+//!
+//! What these globs deliberately do **not** model is whether the merged tree
+//! still *compiles*: a Rust-level semantic conflict between an unrelated base
+//! move and this PR (a renamed function on one side, a new caller on the
+//! other) fails the build that `Daemon Checks` depends on, and no gate's
+//! input set is the right place to guard that. It is out of scope here; see
+//! the merge-time re-verification follow-up (#9571).
 
 use super::workflow_scope::{CiScope, CiScopes};
 use std::collections::{BTreeMap, BTreeSet};
@@ -500,6 +526,7 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
             "Shell Budget Ratchet",
             ".gitignore Convergence Check",
             "Secret Scan",
+            "MCP Guard Wiring Contract",
         ],
     },
 ];
@@ -530,15 +557,33 @@ pub const SPECS: &[CheckSpec] = &[
     },
     // `loom-daemon shell-budget --check` — the measuring logic is Rust, and
     // the allowlist supplies each script's category.
+    //
+    // Rust surface: the handler (`cli/shell_budget.rs`), the `shell_budget`
+    // module tree it calls, and the binary's top-level subcommand registry —
+    // the handler reads `crate::Cli`'s subcommand names to validate
+    // `Shell-Budget-Callout:` trailers, so `main.rs` and every enum it
+    // `#[command(flatten)]`s (`cli/telemetry.rs`, `cli/script_ports.rs`,
+    // `cli/dep_classify.rs`) are inputs too. MUST grow if the checker starts
+    // using another module — `daemon_surface_tests.rs` fails until it does.
     CheckSpec {
         context: "Shell Budget Ratchet",
         global: &[
-            "loom-daemon/**",
+            "loom-daemon/src/cli/shell_budget.rs",
+            "loom-daemon/src/shell_budget.rs",
+            "loom-daemon/src/shell_budget/**",
+            "loom-daemon/src/main.rs",
+            "loom-daemon/src/daemon_service.rs",
+            "loom-daemon/src/cli/script_ports.rs",
+            "loom-daemon/src/cli/telemetry.rs",
+            "loom-daemon/src/cli/dep_classify.rs",
             "scripts/shell-allowlist.txt",
             "scripts/shell-budget-baseline.txt",
             "Cargo.toml",
             "Cargo.lock",
             "rust-toolchain.toml",
+            ".cargo/config.toml",
+            "loom-daemon/Cargo.toml",
+            "loom-daemon/build.rs",
             CI_WORKFLOW,
         ],
         scanned: SHELL,
@@ -705,13 +750,32 @@ pub const SPECS: &[CheckSpec] = &[
         removal_sensitive: true,
     },
     // `.gitignore` against EPHEMERAL_PATTERNS, which lives in Rust.
+    //
+    // Rust surface: `update-gitignore`'s handler in `cli/misc_cmds.rs` calls
+    // `loom_daemon::init::update_gitignore` (`init/post_init.rs`, which owns
+    // EPHEMERAL_PATTERNS). The whole `init` module tree is listed, plus the
+    // modules its production code reaches (`agent_skills`, `proc_exec`,
+    // `self_update`), and the dispatch chain. MUST grow if the checker
+    // starts using another module — `daemon_surface_tests.rs` fails until it
+    // does. The script also runs `scripts/cargo-target-dir.sh`.
     CheckSpec {
         context: ".gitignore Convergence Check",
         global: &[
             "scripts/check-gitignore-convergence.sh",
-            "loom-daemon/**",
+            "scripts/cargo-target-dir.sh",
+            "loom-daemon/src/cli/misc_cmds.rs",
+            "loom-daemon/src/init/**",
+            "loom-daemon/src/agent_skills.rs",
+            "loom-daemon/src/proc_exec.rs",
+            "loom-daemon/src/self_update.rs",
+            "loom-daemon/src/main.rs",
+            "loom-daemon/src/daemon_service.rs",
             "Cargo.toml",
             "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            "loom-daemon/Cargo.toml",
+            "loom-daemon/build.rs",
             CI_WORKFLOW,
         ],
         scanned: &[],
@@ -721,18 +785,72 @@ pub const SPECS: &[CheckSpec] = &[
     // Scans the commits in `base..head` by revision (#9133), so like the
     // version-bump check it depends on the PR's own commits alone; `main`
     // moving can only make it stale through the scanner or its allowlist.
+    //
+    // Rust surface: the handler (`cli/secret_scan_cmd.rs`), the self-contained
+    // `secret_scan` module (std + external crates only), and the dispatch
+    // chain through `cli/script_ports.rs`. MUST grow if the checker starts
+    // using another module — `daemon_surface_tests.rs` fails until it does.
     CheckSpec {
         context: "Secret Scan",
         global: &[
-            "loom-daemon/**",
+            "loom-daemon/src/cli/secret_scan_cmd.rs",
+            "loom-daemon/src/secret_scan.rs",
+            "loom-daemon/src/secret_scan/**",
+            "loom-daemon/src/main.rs",
+            "loom-daemon/src/daemon_service.rs",
+            "loom-daemon/src/cli/script_ports.rs",
             "Cargo.toml",
             "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            "loom-daemon/Cargo.toml",
+            "loom-daemon/build.rs",
             ".loom/secret-scan-allow",
             CI_WORKFLOW,
         ],
         scanned: &[],
         coupled: &[],
         removal_sensitive: false,
+    },
+    // `loom-daemon check-guard-wiring` (#9108) — asserts the `mcp__loom__.*`
+    // PreToolUse matcher is wired in BOTH `.claude/settings.json` and the
+    // installer's `_PHOOK_*` arrays, routes through `hook-wiring.sh`, and
+    // carries the fail-closed broken-install floor. Its whole subject is the
+    // relationship BETWEEN those three files plus the hook they name, so they
+    // are `coupled`, not `scanned`: a settings edit on one side and an
+    // installer edit on the other is exactly the combination that can open the
+    // hole while each side looks fine alone. `removal_sensitive` because
+    // deleting the hook file is one of the four violations.
+    //
+    // Rust surface: the handler (`cli/check_guard_wiring.rs`), the
+    // self-contained `guard_wiring` module, and the dispatch chain through
+    // `cli/script_ports.rs`. MUST grow if the checker starts using another
+    // module — `daemon_surface_tests.rs` fails until it does.
+    CheckSpec {
+        context: "MCP Guard Wiring Contract",
+        global: &[
+            "loom-daemon/src/cli/check_guard_wiring.rs",
+            "loom-daemon/src/guard_wiring.rs",
+            "loom-daemon/src/guard_wiring/**",
+            "loom-daemon/src/main.rs",
+            "loom-daemon/src/daemon_service.rs",
+            "loom-daemon/src/cli/script_ports.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            "loom-daemon/Cargo.toml",
+            "loom-daemon/build.rs",
+            CI_WORKFLOW,
+        ],
+        scanned: &[],
+        coupled: &[
+            ".claude/settings.json",
+            "defaults/.claude/settings.json",
+            "scripts/install/provision-hooks.sh",
+            "defaults/hooks/guard-mcp-tools.sh",
+        ],
+        removal_sensitive: true,
     },
     // Its ONLY input is its own script: it diffs `merge-base(base, head)..head`
     // by git revision (the full-history checkout has both), so it depends on the PR's own
@@ -816,3 +934,6 @@ fn wildcard_match(pat: &str, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod daemon_surface_tests;

@@ -9,6 +9,7 @@ use serial_test::serial;
 
 fn dispatch_event(issue: u32, sweep_id: &str) -> Event {
     Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: sweep_id.to_string(),
         kind: SweepKind::Issue(issue),
         runtime: None,
@@ -211,6 +212,7 @@ fn blocker_event_yields_no_records() {
 #[test]
 fn event_issue_ignores_pr_set_dispatch() {
     let event = Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: "sweep-prs-0".to_string(),
         kind: SweepKind::PrSet(vec![1, 2]),
         runtime: None,
@@ -276,6 +278,7 @@ fn registry_provider_accounts_are_empty_when_nothing_is_registered() {
 fn sweep_started_carries_the_dispatch_runtime() {
     let mut dispatches = HashMap::new();
     let event = Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: "sweep-issue-7-0".to_string(),
         kind: SweepKind::Issue(7),
         runtime: Some("codex".to_string()),
@@ -1163,6 +1166,7 @@ fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healt
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
+        memory: None,
     };
     assert_eq!(
         host_health.roles.persistent.len(),

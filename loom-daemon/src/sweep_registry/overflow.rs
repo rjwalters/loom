@@ -6,21 +6,54 @@
 //! flag survives into `list_sweeps` / `get_sweep_status` / `loom-daemon
 //! status`, and so the next tick can see the slot is still taken.
 //!
+//! The flag is also stamped onto the sweep's claim lock (Issue #9314) so it
+//! survives a **daemon restart**: `reconstruct()` adopts a live sweep from its
+//! `owner.json`, and before the lock carried the flag every adopted sweep came
+//! back as `overflow: false` — silently freeing the host's single slot while
+//! the over-limit sweep was still running.
+//!
 //! Its own file: `sweep_registry/mod.rs` is frozen by the file-size ratchet.
 
 use super::SweepRegistry;
+use crate::types::SweepKind;
 
 impl SweepRegistry {
     /// Mark `sweep_id` as the host's overflow sweep. Returns `false` when no
     /// such sweep is registered (it already finished, or was never recorded).
+    ///
+    /// Also stamps the flag onto the sweep's `issue-<N>` claim lock so a daemon
+    /// restart restores it (#9314). The stamp is **best-effort**: a lock that
+    /// is already gone (the sweep finished between dispatch and this call) or
+    /// unwritable is logged and ignored, because the in-memory mark is what
+    /// this tick's accounting reads and losing the durable copy degrades to
+    /// exactly the pre-#9314 behaviour rather than to anything unsafe. A
+    /// non-`Issue` sweep (a `PrSet`) has no `issue-<N>` lock to stamp, and no
+    /// `PrSet` dispatch ever takes the slot — the work finder only admits
+    /// starred *issues* — so that arm is a silent no-op.
+    ///
+    /// The stamp is one small local read-modify-write of a file this registry
+    /// already owns, made under the registry mutex the caller holds and with no
+    /// `.await` in sight — the same shape (and the same cost) as
+    /// `record_child_pid_in_lock`'s dispatch-time stamp.
     pub fn mark_overflow(&mut self, sweep_id: &str) -> bool {
-        match self.entries.get_mut(sweep_id) {
-            Some(info) => {
-                info.overflow = true;
-                true
+        let Some(info) = self.entries.get_mut(sweep_id) else {
+            return false;
+        };
+        info.overflow = true;
+        let issue = match info.kind {
+            SweepKind::Issue(n) => Some(n),
+            _ => None,
+        };
+        if let Some(issue) = issue {
+            if let Err(e) = self.stamp_overflow_in_lock(issue) {
+                log::warn!(
+                    "sweep_registry: could not persist the overflow flag for issue #{issue} \
+                     ({e}) — the mark holds for this daemon's lifetime, but a restart will \
+                     adopt the sweep without it (#9314)"
+                );
             }
-            None => false,
         }
+        true
     }
 
     /// Whether a non-terminal sweep in this registry is marked overflow.

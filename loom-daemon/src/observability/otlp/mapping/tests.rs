@@ -5,8 +5,9 @@
 
 use super::*;
 use crate::telemetry::{
-    HostHealthRecord, PhaseDuration, SweepCompletedRecord, SweepOutcomeRecord, SweepPhaseRecord,
-    SweepStartedRecord, TokenAccountState, TokenSnapshotRecord,
+    HostHealthRecord, MemoryPressureSummary, PhaseDuration, SweepCompletedRecord, SweepDisposition,
+    SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
+    TokenSnapshotRecord,
 };
 
 fn ts() -> DateTime<Utc> {
@@ -25,6 +26,7 @@ fn sweep_started_envelope() -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepStarted(SweepStartedRecord {
+            story_points: None,
             repo: "rjwalters/loom".to_string(),
             visibility: RepoVisibility::Public,
             issue: 4858,
@@ -98,6 +100,7 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
     envelope(
         "host-a",
         TelemetryRecord::SweepOutcome(SweepOutcomeRecord {
+            story_points: None,
             repo: Some("rjwalters/loom".to_string()),
             repo_unresolved: false,
             visibility: RepoVisibility::Public,
@@ -112,6 +115,9 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             ],
             total_duration_sec: 512,
             result: SweepResult::Success,
+            // Issue #9441: this fixture names a PR, so `landed` is the only
+            // disposition the record may carry (invariant 1).
+            disposition: SweepDisposition::Landed,
             pr_number: Some(4861),
             tokens_in: None,
             tokens_out: None,
@@ -129,6 +135,18 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             doctor_cycles: None,
             judge_verdicts: None,
             complexity: None,
+            tokens_status: None,
+            tokens_status_reason: None,
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
+            pr_numbers: None,
+            hw_lines_added: None,
+            hw_lines_deleted: None,
+            hw_files: None,
+            generated_lines: None,
+            test_lines: None,
         }),
     )
 }
@@ -196,6 +214,19 @@ fn host_health_envelope() -> TelemetryEnvelope {
             is_captain: None,
             armed_singleton_jobs: Vec::new(),
             captainless_singleton_jobs: Vec::new(),
+            memory: Some(MemoryPressureSummary {
+                mem_total_bytes: Some(34_359_738_368),
+                mem_available_bytes: Some(4_294_967_296),
+                mem_compressed_bytes: None,
+                swap_total_bytes: Some(30_397_721_600),
+                swap_used_bytes: Some(29_201_205_253),
+                swap_in_bytes_total: Some(536_870_912_000),
+                swap_out_bytes_total: Some(644_245_094_400),
+                swap_in_bytes_per_sec: Some(51_200.5),
+                swap_out_bytes_per_sec: Some(71_680.0),
+                memory_pressure: Some(crate::host_pressure::MemoryPressure::Some),
+                oom_kill_total: Some(3),
+            }),
         }),
     )
 }
@@ -307,6 +338,14 @@ fn sweep_outcome_flattens_config_and_nests_phase_durations() {
         Some(any_value::Value::StringValue("claude".to_string()))
     );
     assert_eq!(get("loom.pr_number"), Some(any_value::Value::IntValue(4861)));
+    // Issue #9441: the disposition travels beside `loom.result`, never
+    // instead of it, and is always present (never conditionally attached like
+    // the optional attributes above).
+    assert_eq!(get("loom.result"), Some(any_value::Value::StringValue("success".to_string())));
+    assert_eq!(
+        get("loom.disposition"),
+        Some(any_value::Value::StringValue("landed".to_string()))
+    );
     match get("loom.phase_durations") {
         Some(any_value::Value::ArrayValue(array)) => {
             assert_eq!(array.values.len(), 2);
@@ -423,8 +462,53 @@ fn host_health_becomes_gauge_metrics() {
         "loom.host.roles_total_ticks",
         "loom.host.roles_ok_ticks",
         "loom.host.roles_persistent_failures",
+        // Memory-pressure gauges (deferred vs killed vs timed out): all
+        // eleven measured in `host_health_envelope`'s fixture, so all
+        // eleven must appear.
+        "loom.host.mem_total_bytes",
+        "loom.host.mem_available_bytes",
+        "loom.host.swap_total_bytes",
+        "loom.host.swap_used_bytes",
+        "loom.host.swap_in_bytes_total",
+        "loom.host.swap_out_bytes_total",
+        "loom.host.swap_in_bytes_per_sec",
+        "loom.host.swap_out_bytes_per_sec",
+        "loom.host.memory_pressure",
+        "loom.host.oom_kill_total",
     ] {
         assert!(names.contains(&expected), "missing metric {expected} in {names:?}");
+    }
+    // The fixture's `mem_compressed_bytes` is None (a macOS-shaped sample)
+    // and must NOT appear — the absence contract: unmeasured never plots
+    // as a zero gauge.
+    assert!(
+        !names.contains(&"loom.host.mem_compressed_bytes"),
+        "unmeasured mem_compressed_bytes must not become a gauge: {names:?}"
+    );
+}
+
+#[test]
+fn unmeasured_memory_summary_produces_no_memory_gauges_at_all() {
+    // A host whose platform measured nothing (or an older daemon) carries
+    // `memory: None`: none of the memory gauges may exist — not even as
+    // zeros.
+    let mut envelope_ = host_health_envelope();
+    if let TelemetryRecord::HostHealth(record) = &mut envelope_.record {
+        record.memory = None;
+    }
+    let batch = vec![envelope_];
+    let request =
+        build_metrics_request(&batch).expect("host.health must produce a metrics request");
+    let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+    let names: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
+    for forbidden in [
+        "loom.host.mem_total_bytes",
+        "loom.host.mem_available_bytes",
+        "loom.host.swap_used_bytes",
+        "loom.host.memory_pressure",
+        "loom.host.oom_kill_total",
+    ] {
+        assert!(!names.contains(&forbidden), "{forbidden} must be absent: {names:?}");
     }
 }
 
@@ -544,6 +628,7 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
+        memory: None,
     };
     let batch = vec![envelope(
         "host-c",
@@ -807,4 +892,34 @@ fn quota_utilization_queries_name_emitted_token_gauges() {
         assert!(sql.contains(&format!("'{name}'")), "{name} missing from the SQL");
         assert!(emitted.contains(&name), "{name} is not emitted by the mapping");
     }
+}
+
+/// Issue #9432 (epic #9429): `sweep.started` exports the size of the work now
+/// in flight as a NUMERIC `loom.story_points` attribute — and an unsized
+/// dispatch exports no such attribute at all (absent, never `0`).
+#[test]
+fn sweep_started_exports_story_points_numerically_when_sized() {
+    let story_points = |envelope: TelemetryEnvelope| {
+        let request = build_logs_request(&[envelope]).unwrap();
+        request.resource_logs[0].scope_logs[0].log_records[0]
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "loom.story_points")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    assert_eq!(
+        story_points(sweep_started_envelope()),
+        None,
+        "an unsized dispatch must omit the attribute, not export 0"
+    );
+
+    let TelemetryRecord::SweepStarted(mut record) = sweep_started_envelope().record else {
+        panic!("fixture is a sweep.started record")
+    };
+    record.story_points = Some(13);
+    assert_eq!(
+        story_points(envelope("host-a", TelemetryRecord::SweepStarted(record))),
+        Some(any_value::Value::IntValue(13))
+    );
 }

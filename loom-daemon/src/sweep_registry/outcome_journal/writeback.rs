@@ -50,7 +50,7 @@
 //! # Never blocks or fails the terminal transition
 //!
 //! Every step here is the same best-effort shape as
-//! [`super::complexity_signal::fetch_complexity_signal`] and
+//! [`super::complexity_signal`]'s issue read and
 //! [`super::super::prless_retry`]'s comment helpers: a `gh` failure, timeout,
 //! or missing repo context is logged and swallowed, never propagated. Called
 //! AFTER every durable local write in
@@ -358,6 +358,7 @@ mod tests {
 
     fn fixture_record() -> telemetry::SweepOutcomeRecord {
         telemetry::SweepOutcomeRecord {
+            story_points: None,
             repo: Some("rjwalters/loom".to_string()),
             repo_unresolved: false,
             visibility: telemetry::RepoVisibility::Private,
@@ -372,6 +373,7 @@ mod tests {
             ],
             total_duration_sec: 4000,
             result: telemetry::SweepResult::Success,
+            disposition: telemetry::SweepDisposition::Landed,
             pr_number: Some(42),
             tokens_in: Some(200_000),
             tokens_out: Some(15_000),
@@ -390,6 +392,18 @@ mod tests {
             provider: None,
             profile: None,
             complexity: Some("complex".to_string()),
+            tokens_status: None,
+            tokens_status_reason: None,
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
+            pr_numbers: None,
+            hw_lines_added: None,
+            hw_lines_deleted: None,
+            hw_files: None,
+            generated_lines: None,
+            test_lines: None,
         }
     }
 

@@ -149,7 +149,7 @@ label, then posts one audit comment carrying
 `<!-- loom:operator-priority-intent=<id> action=<a> requested_at=<ts> -->`,
 unless a trusted comment with that intent id already exists, so resending an
 intent, or several hosts managing the repo, is harmless. Trusted means an
-`OWNER` / `MEMBER` / `COLLABORATOR`, the fleet App (the configured slug, else `loom-fleet-dispatch*`, as a `…[bot]` login only), or
+`OWNER` / `MEMBER` / `COLLABORATOR`, a fleet App identity (any identity in the forge roster, or `loom-fleet-dispatch` / `-<digits>` exactly, as a `…[bot]` login only), or
 the daemon's own login: a marker an outside commenter posts neither suppresses
 the audit comment nor sets the starred-at. `requested_by` is shown inside a
 code span, so an email address stays whole and an `@name` pings no one. `requested_at` becomes the
@@ -253,7 +253,8 @@ A sweep began work on an issue.
   "started_at": "2026-07-30T12:00:00Z",
   "model": "opus",
   "effort": "high",
-  "runtime": "claude"
+  "runtime": "claude",
+  "story_points": 5
 }
 ```
 
@@ -263,6 +264,16 @@ A sweep began work on an issue.
 `SweepInfo::runtime` records — and is what lets a consumer say *which agent*
 is working the sweep. Omitted when the dispatch did not name one; never
 defaulted to `"claude"`.
+
+`story_points` (Issue #9432, epic #9429) is the Curator's *a priori* size
+estimate for the issue — the numeric value of its single `points:*` label, one
+of `1`/`2`/`3`/`5`/`8`/`13` — carried here so a consumer can weigh the work
+**in flight**, not only once it terminates. Same source and same contract as
+[`sweep.outcome`'s own `story_points`](#story_points--the-curators-size-estimate-issue-9432);
+it rides the `sweep.global.dispatch` event, resolved from the label list the
+dispatch path's #4444 park-label guard already read (**no** extra forge round
+trip). **Omitted, never `0`**, for an unsized issue, a defective points label
+set, a skipped label read, and every PR-set dispatch (which claims no issue).
 
 ### `sweep.identity`
 
@@ -385,11 +396,14 @@ token data to fall back on.
 
 Populated on the backfill/local-journal export path
 (`observability::backfill::synthesize_completed`, copied verbatim from the
-paired `sweep.outcome` record's own `tokens_by_model` — see below); the live
-event-bus path (`observability::collector::terminal_records`) does not yet
-compute it (that path also does not compute `sweep.outcome`'s `tokens_in`/
-`tokens_out` today, for the same reason — no `workspace_root`/sweep-start
-instant in scope at that call site).
+paired `sweep.outcome` record's own `tokens_by_model` — see below) **and**, since
+Issue #9440, on the live event-bus path too: `collector::terminal_records` stays
+a pure, I/O-free mapping and a post-pass (`collector::attach_outcome_usage`)
+performs one usage read per terminal event off the reactor thread, applying it to
+both records of the `sweep.completed` / `sweep.outcome` pair so the two can never
+disagree. Before #9440 that path hard-coded both this field and
+`sweep.outcome`'s `tokens_in`/`tokens_out` absent — see
+"`tokens_status`" below for the measurement hole that produced.
 
 This field is purely additive — a `schema_version` bump is unnecessary (see
 "`schema_version` semantics" above). Like `pr_number`/`tokens_in`/
@@ -438,9 +452,9 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
   "visibility": "public",
   "issue": 4703,
   "sweep_id": "sweep-issue-4703-0",
-  "model": "opus",
+  "model": "claude-opus-5",
   "effort": "high",
-  "config": { "runtime": "claude" },
+  "config": { "runtime": "claude", "arm": "B" },
   "phase_durations": [
     { "phase": "curator", "duration_sec": 12, "attempt": 1, "tokens_in": 4200, "tokens_out": 510 },
     { "phase": "builder", "duration_sec": 340, "attempt": 1, "tokens_in": 38000, "tokens_out": 4900 },
@@ -450,7 +464,9 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
   ],
   "total_duration_sec": 512,
   "result": "success",
+  "disposition": "landed",
   "pr_number": 4710,
+  "pr_numbers": [4698, 4710],
   "tokens_in": 48213,
   "tokens_out": 6120,
   "tokens_unattributed": { "tokens_in": 1113, "tokens_out": 110 },
@@ -461,26 +477,49 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
       "model": "claude-sonnet-5",
       "speed": "standard",
       "service_tier": "standard",
-      "input": 48000,
-      "cache_read": 15000,
-      "cache_write_5m": 500,
-      "cache_write_1h": 1500,
-      "output": 6120
+      "input": 18000,
+      "cache_read": 11000,
+      "cache_write_5m": 400,
+      "cache_write_1h": 1100,
+      "output": 2120
+    },
+    {
+      "model": "claude-opus-5",
+      "speed": "standard",
+      "service_tier": "standard",
+      "input": 30000,
+      "cache_read": 4000,
+      "cache_write_5m": 100,
+      "cache_write_1h": 400,
+      "output": 4000
     }
   ],
-  "models_used": ["claude-sonnet-5"],
+  "models_used": ["claude-opus-5", "claude-sonnet-5"],
   "doctor_cycles": 0,
   "judge_verdicts": [{ "attempt": 1, "verdict": "pass" }],
-  "complexity": "routine"
+  "complexity": "routine",
+  "story_points": 5,
+  "tokens_status": "measured"
 }
 ```
 
+This example is deliberately a **Doctor-escalated** sweep, the shape that makes
+the #9465 fields legible: it was dispatched on the `sonnet` arm
+(`config.arm: "B"`) but most of its tokens were spent by `claude-opus-5`, so
+`model` reports `claude-opus-5` (what actually ran) while `arm` keeps the
+dispatch-time assignment, and it opened two PRs (`pr_numbers`) of which #4710
+is the latest (`pr_number`). A single-model, single-PR sweep collapses to one
+`tokens_by_model` row with `model` equal to it, and `pr_numbers == [pr_number]`.
+
 `config` (free-form string map), `phase_durations`, `model`, `effort`,
-`pr_number`, `tokens_in`, `tokens_out`, `lines_added`, `lines_deleted`,
-`tokens_by_model`, `tokens_unattributed`, `failure_class`, `models_used`,
-`doctor_cycles`, `judge_verdicts`, and `complexity` are omitted when
-empty/unset. `config` is a map — not fixed fields — so operator-tunable knobs
-can be captured without a schema bump.
+`pr_number`, `pr_numbers`, `tokens_in`, `tokens_out`, `lines_added`,
+`lines_deleted`, `tokens_by_model`, `tokens_unattributed`, `failure_class`,
+`models_used`, `doctor_cycles`, `judge_verdicts`, `complexity`,
+`story_points`, `tokens_status`, and `tokens_status_reason` are omitted when
+empty/unset.
+`config` is a map — not fixed fields — so operator-tunable knobs can be
+captured without a schema bump. `disposition` (Issue #9441) is the one recent
+addition that is **never** omitted — see its own section below.
 
 `tokens_by_model` (Issue #6384) is the same per-model breakdown documented
 under `sweep.completed` above — the same aggregation
@@ -583,6 +622,61 @@ reaches a public, unauthenticated response only through
 `tokens_unattributed` is not in the public allowlist at all, being a remainder
 of the same withheld totals.
 
+#### `tokens_status` — why the token pair reads the way it does (Issue #9440)
+
+Before #9440 the token pair was computed only for a sweep that still had a live
+registry entry at its terminal transition, and the live event-bus collector path
+hard-coded it absent outright. Measured against the fleet's D1 store over
+2026-08-15..09-29, **10.3%** of `sweep.outcome` records carried `tokens_in` at
+all (2,707 of 26,260) — flat on every host and every week. A failed or cancelled
+attempt was almost always token-less, so a per-issue "total tokens to land" sum
+collapsed onto the single landing sweep (Spearman 0.996 against that sweep's own
+tokens; 96% of landed issues at a ratio of exactly 1.0). That was an artifact of
+the measurement, not a property of the work: on the 20 multi-attempt issues that
+*did* have complete tokens, lifecycle cost was a median **1.5×** the landing
+sweep's.
+
+Two independently optional fields close it. They make **absence readable**,
+which is what a lifecycle sum needs — not more counters.
+
+| Field | Type | Source | Notes |
+|---|---|---|---|
+| `tokens_status` | string (`measured` \| `not_spawned` \| `unattributable`) | `crate::sweep_usage::resolve`, the single resolver both construction sites (`sweep_registry::outcome_journal` and `observability::collector`) now share. | A **closed** vocabulary, so a consumer can `GROUP BY` it. Present on every record this daemon writes, whatever the `result`; a record written before #9440 omits it, which reads as *unknown* — **not** as any of the three statuses. |
+| `tokens_status_reason` | string | The death class for `not_spawned`; one of `no-sweep-window` / `no-usage-store` / `no-attributable-transcript` for `unattributable`. | Short, enumerable, never free-form prose — the point of separating the absence cases is that each one is countable. Always absent for `measured`: a measurement needs no excuse. |
+
+The three statuses, and exactly what the counters do under each:
+
+| `tokens_status` | `tokens_in` / `tokens_out` | `tokens_by_model` | What it means |
+|---|---|---|---|
+| `measured` | present | present when the breakdown was readable | An agent process ran and its usage was read. Includes a **partial** read — a sweep cancelled mid-Builder, or watchdog-killed — because those tokens were really spent. Invariant: at least one of `tokens_in` / `tokens_by_model` is present. |
+| `not_spawned` | **`0` / `0`** | absent | No agent process ever ran: every `preflight-*` class plus `no-usable-account`, none of which reaches the CLI. This is the **only** status that publishes a zero, because here zero is the observation. `tokens_by_model` still stays absent — a sweep that never ran has no *model* to attribute a zero row to. |
+| `unattributable` | **absent** | absent | Something ran (or could not be proven not to) and its usage could not be attributed. `tokens_status_reason` names which: the sweep's wall-clock window was unknown (`no-sweep-window`), the runtime's usage store does not exist on this host (`no-usage-store`), or the store held nothing for this sweep in its window — the pruned/rotated-transcript case (`no-attributable-transcript`). |
+
+This is the same "unknown != zero" contract the rest of this record follows, made
+explicit rather than inferred: `not_spawned`'s `0` is a measurement, and
+`unattributable`'s absence is the absence of one. A consumer that coerces an
+`unattributable` record to `0` re-creates precisely the undercount #9440 removed.
+
+Two deliberate non-classifications:
+
+- **`account-exhausted:*` is never `not_spawned`.** Those classes are matched
+  from rate-limit / credit signatures the CLI itself printed, so the CLI ran and
+  very often burned tokens first. Calling that a zero would re-introduce the
+  undercount in the one shape where the spend is real and interesting.
+- **A read is never unbounded.** Every reader behind
+  `usage_source::sweep_tokens_by_model` is window-filtered, because a per-issue
+  transcript directory accumulates *every* dispatch of that issue. A sweep whose
+  registry entry is already gone reconstructs its window from the measured
+  `total_duration_sec` (the terminal transition is happening now, so the sweep
+  began that long ago); a sweep with neither a start instant nor a positive
+  duration reports `no-sweep-window` rather than folding an earlier attempt's
+  tokens in. Turning an undercount into a silent double-count would be strictly
+  worse.
+
+Neither field is added to the public redaction allowlist, for the same reason as
+the work-output pair above. Cross-file `message.id` dedupe within a window is
+out of scope here (#9315) — the fold this reuses is unchanged.
+
 #### Completeness fields (Issues #8056, #8222, #8542)
 
 Five more **independently optional** fields, added additively (no
@@ -593,7 +687,7 @@ by `sweep_id`, or could not be answered at all.
 | Field | Type | Source | Notes |
 |---|---|---|---|
 | `failure_class` | string | The paired `sweep_outcomes::OutcomeRecord`'s own classification for the same terminal transition: `death_class` when the pre-flight classifier derived one (`preflight-token-selection-failed`, `preflight-no-cli-start`, …), otherwise `crash_classification` (`account-exhausted:model-credits-exhausted`, `no-usable-account`, …). | Copied at emit time in the same function that writes the sibling record — never a post-hoc joiner. Lets a consumer separate real build failures from sub-60s spawn deaths from this journal alone. The sibling record still carries both classifier fields separately; this is the single most canonical label, not a replacement. Omitted entirely when nothing classified the transition — including on every success. |
-| `models_used` | string array | The distinct `model` ids in `tokens_by_model`, sorted and deduped. | The top-level "did this sweep run more than one model?" signal. `model` names the **dispatched** model, so a sweep that escalated to `claude-opus-5` through the Doctor ladder still reports `model: "sonnet"`; `models_used` is what makes the escalation visible. Inherits `tokens_by_model`'s contract exactly: omitted (never `[]`) when no attributable transcript was found. |
+| `models_used` | string array | The distinct `model` ids in `tokens_by_model`, sorted and deduped. | The top-level "did this sweep run more than one model?" signal. Since #9465 `model` names the **dominant** model that actually ran (the largest input+output row in `tokens_by_model`, dispatched model as fallback), so a sweep that escalated to `claude-opus-5` through the Doctor ladder reports `model: "claude-opus-5"` with `config["arm"]` still carrying the dispatch-time arm — `models_used` is what shows that the *earlier* phases ran something else. Inherits `tokens_by_model`'s contract exactly: omitted (never `[]`) when no attributable transcript was found. |
 | `doctor_cycles` | integer | **The forge label timeline** of the PR named by this record's own `pr_number` (Issue #8222 — re-sourced; the #8056 shipment counted sampled checkpoint markers instead): one cycle per `loom:changes-requested` arrival that a later `loom:review-requested` arrival closed the loop on. | A rejection nobody handed back (the sweep hit the Doctor-cycle cap, or died) is **not** a cycle. Because the label events are durable forge state rather than a ~30s sample, a cycle that opens and closes between two reaper ticks is still counted: this is a certified count, **not** the lower-bound proxy it was under #8056. `0` means "the timeline was read and no Doctor cycle completed"; an **absent** key means the timeline was not read at all. |
 | `judge_verdicts` | array of `{ "attempt": int, "verdict": string }` | The same PR's label timeline: `loom:pr` ⇒ `"pass"`, `loom:changes-requested` ⇒ `"fail"`, in lifecycle order. | What makes **first-pass judge approval rate** computable from this journal alone: `judge_verdicts[0].verdict == "pass"` over the records that carry the field. `attempt` is **1-based per PR**, counting `loom:review-requested` arrivals — attempt 1 is the PR as first opened, attempt 2 the pass after the first Doctor hand-back. A repeat of the same verdict inside one attempt (a label removed and re-applied) is one entry, not two. `[]` means "the timeline was read and carried no verdict" (a sweep that died before Judge); an **absent** key means the timeline was not read. |
 | `complexity` | string (`mechanical` \| `routine` \| `complex`) | One more best-effort REST read at the SAME terminal transition, of the sweep's own issue body's `<!-- loom:complexity=<tier> -->` marker (Issue #8542) — the same marker `resolve-tier-model.sh` reads at dispatch time to pick a model, re-read here rather than plumbed through dispatch because there is no single dispatch-time seam shared by every entry point (`dispatch_sweep`, the epic supervisor, the work finder, the role runner). | What makes a model-routing decision (`sweep.tierModels` / `sweep.optimization`, or a future classifier-driven router) evaluable against a labeled outcome. Unlike `resolve-tier-model.sh`'s own dispatch-time fold (an absent/unrecognized marker there is a **safe default**, `routine`, for model selection), this field is never defaulted: an unmarked issue, an out-of-vocabulary value, or a failed/skipped read all omit the key. A routing-evaluation consumer needs the true absence rate, not a default masquerading as data. |
@@ -603,7 +697,9 @@ record's `pr_number` — the latest PR the sweep's own checkpoint recorded. A
 sweep that opened more than one PR (a re-dispatch after a park, a
 partial-increment slice) reports its **latest** PR and never aggregates across
 PRs, so `attempt` numbering always restarts at 1 per record and a join from
-`sweep.outcome` to a PR is exact rather than a blend.
+`sweep.outcome` to a PR is exact rather than a blend. The full set is still
+recoverable — `pr_numbers` (#9465) lists every PR the sweep carried — but the
+timeline fields deliberately describe only the one `pr_number` names.
 
 **When the timeline fields are absent.** Both are omitted together, and only
 together: the sweep opened no PR, the daemon was configured not to touch the
@@ -625,6 +721,157 @@ denominator; one that coerces a missing `complexity` to `"routine"` conflates
 
 None of the five is added to the public redaction allowlist, for the same
 reason as the work-output fields above.
+
+#### `story_points` — the Curator's size estimate (Issue #9432)
+
+The one thing every actual on this record could not be compared against: an
+*a priori* size. `story_points` is the numeric value of the issue's single
+`points:*` label (`1`/`2`/`3`/`5`/`8`/`13`, the vocabulary
+`defaults/docs/story-points.md` defines and the Curator applies at curation
+time, epic #9429). With it on the record, "story points landed per day" (#9433)
+and the estimate-vs-actual calibration loop (#9434) are a `GROUP BY` over this
+journal instead of a join against the forge.
+
+The throughput question is implemented: this field becomes the `story_points`
+column of `sweep_facts`, and **SF8** in
+`defaults/observability/sweep-facts/sweep-facts-queries.sql` answers "points
+landed per day / per ISO week" from it (#9433). Two things that question set
+fixes, and that any other consumer of this field must honour too: absent is a
+reported **data gap**, never a zero (the four omission situations below), and the
+values are **ordinal, not a unit** — sum the measured point value per bucket
+(`landed-size.sql`'s `measured_point_values`), never the raw labels. See
+`sweep-facts-questions.md` for the definitions and the capacity-tuning ops note.
+
+| Field | Type | Source | Notes |
+|---|---|---|---|
+| `story_points` | integer (`1` \| `2` \| `3` \| `5` \| `8` \| `13`) | The `points:*` label in the label list the **same** REST read that sources `complexity` and the disposition end state already returns (`sweep_registry::outcome_journal::complexity_signal`), folded by `crate::story_points`. | **No extra forge round trip** — that read's `--jq` projection already includes `labels`, and using it is what makes the estimate provably about the same issue as `complexity`. The paired `sweep.started` record carries the same field resolved at *dispatch* time, from the label list the #4444 park-label guard already read. |
+
+**Additive** (no `schema_version` bump — not a new record kind), and **absent is
+never a measured zero**, the same contract the fields above follow. Four
+distinct situations all omit the key:
+
+| situation | why not a number |
+|---|---|
+| no `points:*` label | The issue was never sized — a pre-epic issue, an operator-filed issue, an uncurated issue. `0` would claim a Curator sized it at nothing, and would drag every mean estimate toward zero. |
+| one label, out of vocabulary (`points:21`, `points:xl`) | A curation defect. Folding it onto the nearest legal bucket would invent an estimate nobody made; it is logged at `warn` and omitted. |
+| **more than one** `points:*` label | There is no correct answer, so the daemon does not pick one. Enforced daemon-side (the guard #9431 leaves to this phase): the conflict is logged **loudly** — naming the issue and every offending label — and the key is omitted. First/last/largest/newest would each publish a number no human assigned. |
+| the read failed, timed out, or was skipped | Same fail-open contract as `complexity`: `skip_label_flip`, the fleet rate-limit breaker, or any read failure yields no labels at all, hence no size. |
+
+The label vocabulary is shared with the older `<!-- loom:points=<N> -->` body
+marker (#9056) via `crate::points_marker::POINTS_VALUES`, so the label family
+and the marker can never disagree about what a legal size is. Points are stored
+in **labels**, not the body (adjudicated on #9431): labels are server-side
+filterable and already fetched, so this phase introduced **no** new labels
+connection at all — and where a future one is added, it caps `labels(first:)` at
+the vocabulary size (`crate::story_points::POINTS_LABEL_PAGE_CAP`) so the cost
+stays flat as an issue's label count grows.
+
+**OTLP.** Both records export it as the numeric attribute `loom.story_points`
+(absent when the field is), so a backend can `sum()` assigned points per window
+and join them to `loom.tokens_in` / `loom.lines_added` /
+`loom.total_duration_sec` on the same record. Not added to the public
+redaction allowlist, for the same reason as the fields above.
+
+#### `disposition` — what the sweep actually DID (Issue #9441)
+
+`result` answers "did the process end well?", which is not the question a
+throughput or effort metric asks. Measured on the fleet store over
+2026-08-15..09-29 (26,260 outcomes): only **337 of 8,808 `success` records
+carried a `pr_number`**, and 4,825 of them were sub-300 s runs with no PR, no
+tokens and no phases — re-dispatch no-ops against an issue that was already
+done (one issue accumulated 970 such "successes" over 40 days). On the other
+side, 16,898 `failure` records folded 5,326 sub-60 s spawn deaths together with
+235 genuine Judge rejections and 6,373 deaths nothing observed at all.
+
+`disposition` is that missing axis. It is **required on every record written
+since #9441**, low-cardinality, and **strictly additive**: `result` is emitted
+unchanged beside it, so every pre-#9441 consumer keeps working.
+
+| value | meaning |
+|---|---|
+| `landed` | The sweep produced a PR for its issue. |
+| `noop_already_done` | Nothing to do: the issue was already closed before dispatch, or the run exited clean and short having produced no PR, no phase and no work. |
+| `curator_closed` | The Curator closed the issue instead of building it (the "Issues Are Suggestions" path) — a correct outcome, not a failure. |
+| `curator_rescoped` | The Curator handed the issue back to `loom:triage` / `loom:curated` (and off `loom:issue` / `loom:building`) instead of building it. |
+| `env_failure` | The *environment* broke: spawn/pre-flight death, account or credit exhaustion, rate limit, harness execution error. |
+| `substantive_failure` | The *work* did not succeed: the Judge rejected it, the Doctor loop was exhausted, or the Builder could not finish. |
+| `cancelled` | An operator- or watchdog-initiated cancellation. |
+| `unknown` | Genuinely unobservable. Counted, never silently merged into a neighbouring bucket. |
+
+**Two invariants hold on every record the daemon writes**, both proven by
+contract tests in `loom-daemon/src/telemetry/disposition.rs` (exhaustive over
+the signal space) and on assembled records in
+`sweep_registry/outcome_journal/disposition_tests.rs`:
+
+1. **`disposition == "landed"` ⇔ `pr_number` is present.** This deliberately
+   outranks `result`: a sweep cancelled after opening a PR still *produced*
+   that PR, and "did this sweep land work?" must have exactly one answer.
+   Nothing is lost — `result` still reports `cancelled` on such a record.
+2. **`failure_class` is MANDATORY when `disposition` is `env_failure`,
+   `substantive_failure` or `unknown`.** When no classifier labeled the
+   transition, a bounded `unclassified:*` label is synthesized from the
+   strongest observed signal (`unclassified:spawn-death`,
+   `unclassified:judge-rejected`, `unclassified:doctor-loop`,
+   `unclassified:stopped-after-<phase>`, `unclassified:after-<phase>`,
+   `unclassified:no-phase-signal`, `unclassified:success-without-pr`,
+   `unclassified:blocked-on-human-decision`). A real classifier label is never
+   overwritten by a synthesized one, and the `unclassified:` prefix is what
+   keeps the two tellable apart. Phase names in a synthesized label are folded
+   to the closed `curator|builder|judge|doctor|merge|other` vocabulary, so the
+   cardinality stays bounded.
+
+**Derived, not newly instrumented.** The classifier is a pure function of
+signals this record already carries — `result`, `pr_number`, `phase_durations`,
+`total_duration_sec`, `failure_class`, `judge_verdicts`, `doctor_cycles` — plus
+one addition that costs **no extra forge round trip**: the issue's own end
+state (`state` / `closed_at` / `labels`), folded into the `--jq` projection of
+the SAME REST read that already fetches the `complexity` marker. That end state
+is what separates "already done" from "the Curator closed it" from "the Curator
+rescoped it", three shapes the local signals cannot tell apart. It follows the
+identical fail-open contract: a skipped or failed read simply yields no forge
+opinion, and the classifier falls back to its local-signal arms.
+
+**A pre-build label alone is deliberately NOT a rescope signal.** `loom:triage`
+and `loom:curated` are *additive milestones* that outlive the state they once
+described — Loom never strips `loom:curated`, so promotion (`loom:issue`) and
+the Builder's claim (`loom:building`) both leave it in place and essentially
+every built issue carries it for life. A rescope is therefore read only from a
+pre-build label **plus the absence of `loom:issue` and `loom:building`**, which
+is the shape a genuine hand-back actually leaves (the Curator's rescope removes
+the ready/claim label by definition). `loom:issue` matters for a second,
+independent reason: the reaper's own orphaned-claim recovery restores
+`loom:building` → `loom:issue` before the record is written, so reading it as a
+rescope would mislabel the entire failure population.
+
+**An environmental `failure_class` outranks both label-derived forge answers**
+(`curator_rescoped`, `curator_closed`). A dead token pool is not a Curator
+decision no matter what an issue's labels say, and `curator_rescoped` is exempt
+from invariant 2 — so letting a stale label shadow an explicit `preflight-*` /
+`account-exhausted:*` verdict would both mis-bucket the record and drop its
+obligation to say why it failed. The one forge answer that still outranks the
+environmental arm is `noop_already_done` from an issue closed *before* dispatch,
+because that is derived from a `closed_at` comparison rather than from a label
+and cannot go stale the same way.
+
+Unlike every other recent addition, `disposition` is **never skipped on
+serialize**: a required field that silently disappears for one variant is
+exactly the ambiguity this record already has too much of. A pre-#9441 journal
+line carries no `disposition` key and decodes as `unknown` (`#[serde(default)]`)
+— the readers drop rather than error on an unparseable line, so without that
+default all historical records would vanish. Such a line legitimately fails
+invariant 2: the invariants are a contract on records the daemon *writes*.
+
+**Also on the span and the OTLP log record**, always beside `loom.result` and
+never instead of it: the terminal sweep span carries `loom.disposition` in its
+metadata, and the `sweep.outcome` OTLP mapping emits `loom.disposition` as an
+unconditional attribute. A trace or OTLP consumer can therefore separate a
+landing from a no-op re-dispatch without joining this journal.
+
+Additive, so it did **not** bump `schema_version` — a new optional-shaped field
+is not a breaking change, a new record kind is (see the version table above).
+`disposition` is not added to the public redaction allowlist, for the same
+reason `failure_class` is not: it is a strictly finer reading of *why* a
+private repo's sweep ended. The coarse `result` stays public and unchanged.
 
 `config.token_account` (Issue #8056) is now resolved from three sources at
 emit time rather than one: the live registry entry, then a re-parse of the
@@ -715,6 +962,83 @@ group), and `reconstruct` restores them onto the adopted entry. A pre-#8056
 `owner.json` has neither key and still parses; a dispatch that requested no
 explicit model/effort still reports `null` — the honest "inherited the
 session default", never a fabricated value.
+
+#### Attempt lineage, rework events, and landing size (Issues #9444, #9454, #9465, #9466)
+
+Fourteen more **independently optional** fields, all added additively (no
+`schema_version` bump). Together they make `sweep.outcome` answer the four
+questions the #9440–#9446 study showed it could not: *did this sweep land
+work*, *were its tokens measured and are they plausible*, *why was it
+dispatched*, and *how big was the work it produced*.
+
+**`tokens_status` addendum — the `suspect` guard (Issue #9454):** on top of the `measured`/`not_spawned`/`unattributable` vocabulary #9440 shipped, a *measured* result whose input rate exceeds **100 000 input tokens per wall-clock second** (`sweep_usage::SUSPECT_INPUT_TOKENS_PER_SEC`) is re-classified `suspect` with reason `implausible_input_rate`. The counters are still published — flagged, never as a clean measurement — so a misattribution regression (the study's 250M-tokens-in-22-seconds shape) is visible per host per day (`sweep-facts-queries.sql` SF3) instead of silently poisoning per-issue cost sums. The attribution rule beyond the window and directories: attribution is **per usage record**, keyed on each record's own timestamp (Issue #9454) — a transcript file is never attributed whole. This is the root-cause fix for the implausible-rate population: the #8450 shape (a 292-second judge-only sweep reporting 136.8M tokens) happened because the file-level readers attributed a long-lived session's ENTIRE history to whichever sweep's window contained the file's last write. Per-record attribution means a session that predates the sweep contributes only the records it wrote during the window, so two back-to-back sweeps of one issue can never fold each other's sessions (the acceptance test). Directories still bound the scan: the workspace root and this issue's worktree; a sibling issue's worktree is deliberately excluded.
+
+**Attempt lineage** (Issue #9444): `attempt_index` (1-based count of terminal
+sweeps for this repo#issue in **this host's** durable outcome journal — the
+honest per-host denominator, not a fleet one), `previous_sweep_id` (the
+immediately preceding attempt), and `trigger` — why this sweep was
+dispatched: `first` \| `retry_after_env_failure` \|
+`retry_after_substantive_failure` \| `doctor_after_changes_requested` \|
+`rebase_main_moved` \| `merge_conflict` \| `stale_base_rejudge` \|
+`ci_failure_fix` \| `operator_redispatch` \| `unknown`. Derived at the
+terminal transition from the previous attempt's disposition (or, for
+pre-#9441 lines, its `result` + `failure_class`); `unknown` is counted. All
+three are absent when the journal could not be read or the repo slug never
+resolved.
+
+**`rework_events`** (array of `{kind, reason?, classification?,
+duration_sec?}`) — in-sweep rework observed by the terminal turn from two
+sources. The first needs no writer at all: the worktree's own **HEAD reflog**
+is read at the terminal transition, and a real `rebase (start)` performed by
+a Doctor's conflict resolution or a `merge` of moved main records itself
+there with a timestamp — the reflog IS the writer, and every reflog-derived
+event is `environmental` (a reflog entry cannot prove the work was hard).
+The second source is the append-only marker protocol for events only the
+performing path knows: the performing path appends one JSON object per event
+to `<workspace_root>/.loom/logs/sweep-rework-events.jsonl`
+(`{"at":"<RFC3339>","issue":N,"kind":"rebase|merge_conflict|ci_rerun|rejudge",
+"reason":"…","classification":"environmental|substantive","duration_sec":N}`);
+the terminal outcome samples the file for its own issue and window. The
+default classification when the writer omits one: `rejudge` ⇒
+**`substantive`** (the work was hard); `rebase`, `merge_conflict`,
+`ci_rerun` ⇒ **`environmental`** (the ground moved). Absent (never `[]`)
+when no event was marked. *Writer status:* the reflog reader above is shipped and is the primary
+source; the marker file remains the protocol for events a reflog cannot
+show (a CI rerun, an explicit rejudge).
+The committed question set that turns these payload fields into the per-issue split lives in
+`defaults/observability/issue-effort-queries.sql`, executed verbatim on
+bundled SQLite by `loom-daemon/tests/issue_effort_sqlite.rs` and
+vocabulary-checked by `loom-daemon/tests/issue_effort_artifacts.rs`: IE1 (the
+per-issue clean / substantive-rework / environmental-rework split), IE2 (the
+issues whose cost was mostly environment), IE3 (the attempt/trigger
+distribution), IE4 (in-sweep rework by kind), IE5 (how much of the cost the
+classification can attribute at all). It reads the raw `records` store,
+complementing #9446's `sweep_facts` rollup (whose rework columns are
+per-classification *counts*, not per-event durations).
+
+**PR linkage and the model that ran** (Issue #9465): `pr_numbers` (integer
+array, first-seen order) lists every PR the sweep's lifecycle was observed to
+carry — the multi-PR slice shape the single `pr_number` (the **latest**) cannot
+represent. `model` now names the model that **actually ran** — the dominant
+entry in `tokens_by_model` (most input+output tokens) — falling back to the
+dispatched model when nothing was attributed; the dispatch-time experiment arm
+stays under `config["arm"]` (#4809), computed from the dispatched model.
+
+**Landing size** (Issue #9466): `hw_lines_added`, `hw_lines_deleted`,
+`hw_files` (hand-written lines/files of the sweep's own diff),
+`generated_lines` (lines in generated-classified paths, reported not counted),
+and `test_lines` (lines in test files). Classification is repo-owned: a
+`generatedPaths` glob list in `.loom/config.json` (gitignore-like semantics: a
+bare `*.ext` matches at any depth; `**` crosses segments; a config list
+**replaces** the default) over the shipped default covering lockfiles,
+`records/`-style output trees, simulator/netlist/physical-design output,
+CSV/TSV dumps, minified bundles and vendored trees. Test files are any path
+with a `test`/`spec` segment or a `test_*`/`*_test.`/`.spec.`/`.test.` name.
+All five are absent (never 0) whenever the worktree's numstat could not be
+read — the same contract `lines_added`/`lines_deleted` keep. The
+`landed_size`/LSI rollup over these fields lives in
+`defaults/observability/sweep-facts/` (#9446/#9466), beside its definitions
+doc.
 
 ### `role_tick.outcome`
 
@@ -1260,7 +1584,7 @@ Tokens, providers and pools (Issues #8908, #8931):
 |---|---|---|---|
 | `loom.pool.account_marks` | delta `Sum` | `{account}`; labels `provider`, `reason` | one per account mark the daemon writes, at the seam that writes it: sweep and role-tick Codex terminal feedback (`provider=codex`), API-key pool bad marks (`provider` = the pool namespace, e.g. `zai`), and the Claude insta-crash exhaustion mark (`claude`). `reason` ∈ `rate_limited`, `exhausted`, `session_limit`, `model_credits`, `credential`, `transient`. No point when no mark is written (a native credential failure, a Codex `SUCCESS`/`TIMEOUT`, a failed write) |
 | `loom.pool.hold` span | own root trace (derived from `loom.pool.hold.pool` + hold start) | `loom.pool.hold.pool` (16-hex SHA-256 prefix of the pool directory — the pool's identity, never its path), `loom.pool.hold.post_mortem` (`true` when a real token-selection death armed it), `loom.pool.hold.accounts` | one work-finder pool dispatch hold, from arming to clearing. A hold still armed when the daemon stops emits no span |
-| `loom.runtime.usage` span | one per **model**, child of the unit it measures (see below) | `loom.usage.scope` (`execution` \| `attempt`), `loom.model`, `loom.tokens.input`, `.output`, `.cache_read`, `.cache_write` (= `.cache_write_5m` + `.cache_write_1h`), `.total`; aliases `gen_ai.usage.input_tokens` (uncached input, like `loom.tokens.input`), `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`; `loom.cost.usd_estimate` = `gen_ai.cost.usd_estimate` with `loom.pricing.verified_on` and `loom.pricing.source` (`asset` \| `compiled`); optional `loom.runtime`, `loom.role`, `loom.attempt`, `loom.sweep_id`, `loom.issue`, `loom.pr_number` | one unit's exact token usage for one model (#8908, #9204, #9303). Absent when usage is unknown or has no model rows; a model row's measured-zero counter is `"0"`. No cost attributes for a model the rate card does not know (never a Sonnet fallback) |
+| `loom.runtime.usage` span | one per **model**, child of the unit it measures (see below) | `loom.usage.scope` (`execution` \| `attempt`), `loom.model`, `loom.tokens.input`, `.output`, `.cache_read`, `.cache_write` (= `.cache_write_5m` + `.cache_write_1h`), `.total`; aliases `gen_ai.usage.input_tokens` (**uncached input only, NOT total input** — decision #9315: kept, following Anthropic's vocabulary and so that `input + cache_read + cache_write` never double-counts; a generic OTel GenAI consumer must add `.cache_read_input_tokens` and `.cache_creation_input_tokens` to get total input, as the downstream telemetry consumer must), `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`; `loom.cost.usd_estimate` = `gen_ai.cost.usd_estimate` with `loom.pricing.verified_on` and `loom.pricing.source` (`asset` \| `compiled`); optional `loom.runtime`, `loom.role`, `loom.attempt`, `loom.sweep_id`, `loom.issue`, `loom.pr_number` | one unit's exact token usage for one model (#8908, #9204, #9303). Absent when usage is unknown or has no model rows; a model row's measured-zero counter is `"0"`. No cost attributes for a model the rate card does not know (never a Sonnet fallback) |
 
 **Usage spans: scope, sources, and how to total them (#9204, #9303).**
 
@@ -1372,7 +1696,7 @@ describe a different order from the one the tick ran. The `plan` block:
 
 | Field | Type | Notes |
 |---|---|---|
-| `slots` | object | `max_concurrent`, `occupancy` (after the tick), `free` (`max_concurrent − occupancy`), `max_admissions_per_tick`, `saturation_held`, `any_halted` |
+| `slots` | object | `max_concurrent`, `occupancy` (after the tick), `free` (`max_concurrent − occupancy`), `max_admissions_per_tick`, `saturation_held`, `any_halted`, `overflow_free` (bool, optional: whether the host's single `loom:operator-priority` overflow slot, #9244, is unused — a starred issue can still start past the configured cap) |
 | `tick_interval_secs` | integer, optional | the work finder's tick interval |
 | `shard` | object | `configured` (`false` when unsharded), `host_shard`, `shard_count` |
 | `scope` | array | the labels the plan covers: `["loom:issue", "loom:blocked"]` |
@@ -1811,6 +2135,73 @@ redaction unchanged (`dashboard/src/redaction.ts`): `is_captain` describes
 this host's own role in an operator-assigned fleet-wide designation, and a
 singleton job name is an allowlisted identifier a repo declares — the same
 footing as a role name — neither names a repo, issue, branch, or operator.
+
+**Memory pressure state (`memory`).** An optional object carrying the
+host's RAM/swap/pressure readings at the sampling moment — the slice that lets
+an operator distinguish a role attempt **deferred for memory** (PSI
+`some`/`full`, swapping, no runtime span) from one **killed**
+(`oom_kill_total` grew around the span's end, exit unobserved) from one that
+simply **timed out** (no pressure in either bound, no OOM growth):
+
+```json
+{
+  "mem_total_bytes": 34359738368,
+  "mem_available_bytes": 4294967296,
+  "mem_compressed_bytes": 17179869184,
+  "swap_total_bytes": 29696549888,
+  "swap_used_bytes": 29201163776,
+  "swap_in_bytes_total": 536870912000,
+  "swap_out_bytes_total": 644245094400,
+  "swap_in_bytes_per_sec": 51200.5,
+  "swap_out_bytes_per_sec": 71680.0,
+  "memory_pressure": "some",
+  "oom_kill_total": 12
+}
+```
+
+- `mem_total_bytes` — physical RAM installed (`hw.memsize` on macOS,
+  `MemTotal` on Linux), in bytes.
+- `mem_available_bytes` — memory a new allocation can take **without
+  reclaim**, in bytes (macOS: free + inactive pages × page size; Linux:
+  `MemAvailable`). The single most direct "about to run out" gauge.
+- `mem_compressed_bytes` — bytes held by the kernel's page compressor instead
+  of paged to swap (macOS `vm_stat` "Pages occupied by compressor"); **absent
+  on Linux** — the sources this daemon reads there expose no equivalent — never a
+  fake `0`.
+- `swap_total_bytes` / `swap_used_bytes` — capacity and current use, in
+  bytes, **when the platform exposes one** (macOS `vm.swapusage`).
+- `swap_in_bytes_total` / `swap_out_bytes_total` — cumulative host-lifetime
+  swap volume, normalized to **bytes**: both macOS `vm_stat` and Linux
+  `pswpin`/`pswpout` count pages, and the daemon converts both (using each
+  platform's actual page size) so one gauge means one thing fleet-wide.
+  Counters reset only across a reboot; a rollback (daemon seeing a reset)
+  reads as *unknown*, never negative.
+- `swap_in_bytes_per_sec` / `swap_out_bytes_per_sec` — rates computed by the
+  emitting daemon **between successive samples** from the two cumulative
+  totals; absent on the first sample after daemon start, after any counter
+  rollback, or when the cumulative pair is unmeasurable on either side. This is
+  the live "the host is swapping right now" signal, in metric form.
+- `memory_pressure` — PSI memory-pressure class over the last 10 seconds,
+  exactly `"none"` / `"some"` / `"full"` (Linux `/proc/pressure/memory`
+  `avg10`); **absent on macOS** (no PSI), where compression + swap carry the
+  pressure signal instead.
+- `oom_kill_total` — cumulative kernel OOM kills for the host's lifetime
+  (Linux `/proc/vmstat oom_kill`), when the kernel exposes the counter
+  (none on macOS). A growth of this counter between the two host snapshots
+  bound of a role span is the kill, not a deferral.
+
+The whole `memory` object is **omitted** when the platform measured nothing
+at all, or on a record from a daemon that predates the field — the same
+absence contract `protection`/`admission_brake` hold: absent means
+"unmeasured", never zero. Inside the object, every source that is genuinely
+unmeasurable on that platform stays an absent key, not a fabricated value
+("unknown != zero"). Additive, so no `schema_version` bump (see
+"`schema_version` semantics" above); the fields all describe the machine, not
+any repo, issue, or operator, so they pass through public redaction unchanged,
+like `worktree_root_free_gb`. The same fields ride **span-boundary trace
+attributes** (`loom.host.*`) on role attempts — see
+[tracing.md](tracing.md) — so the state is captured at the decision moment,
+not only on each 30 s sampling cadence.
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 

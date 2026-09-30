@@ -581,8 +581,9 @@ impl MonitorImportResult {
 
 /// Options for [`import_from_monitor`].
 pub struct ImportOptions<'a> {
-    /// Destination pool (per-repo `<repo>/.loom/tokens` or the shared
-    /// machine-level pool — the caller resolves which).
+    /// Destination pool. Since issue #9135 the CLI always resolves this to
+    /// the shared machine-level pool — there is no supported per-repo
+    /// destination any more.
     pub tokens_dir: &'a Path,
     /// Override the database location (`--db`, tests). When `None`, resolved
     /// from `monitor_dir`.

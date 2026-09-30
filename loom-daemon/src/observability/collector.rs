@@ -45,7 +45,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -53,9 +53,9 @@ use chrono::{DateTime, Utc};
 use crate::event_bus::{EventBus, RecvError};
 use crate::telemetry::{
     is_path_shaped_repo, visibility::derive_visibility, AdmissionBrakeSummary, HostHealthRecord,
-    HostProtectionSummary, ManagedRepoEntry, PhaseDuration, RepoVisibility, RoleTickFailureEntry,
-    RoleTickHealth, SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord,
-    TokenAccountState, TokenSnapshotRecord,
+    HostProtectionSummary, ManagedRepoEntry, MemoryPressureSummary, PhaseDuration, RepoVisibility,
+    RoleTickFailureEntry, RoleTickHealth, SweepResult, SweepStartedRecord, TelemetryEnvelope,
+    TelemetryRecord, TokenAccountState, TokenSnapshotRecord,
 };
 use crate::tokens_pool::{account_inventory, health_snapshot, AccountProvider};
 use crate::types::{Event, RoleTickRecord, SweepKind};
@@ -245,7 +245,7 @@ async fn handle_event(
     };
     let visibility = resolve_visibility(&slug).await;
     let root = Path::new(&workspace_path);
-    for envelope in correlation::map_envelopes(
+    let mut envelopes = correlation::map_envelopes(
         &event,
         issue,
         &slug,
@@ -257,8 +257,108 @@ async fn handle_event(
         // map has nothing, so an ordinary dispatched sweep's every phase event
         // costs no registry lock at all.
         &|| registry_evidence(workspace_pool, root, issue),
-    ) {
+    );
+    attach_outcome_usage(&mut envelopes, root, issue, event_death_class(&event)).await;
+    for envelope in envelopes {
         queue.offer(envelope);
+    }
+}
+
+/// Fill in the token counters and `tokens_status` of any `sweep.outcome`
+/// envelope this event produced (Issue #9440).
+///
+/// # Why this is a post-pass rather than part of the mapping
+///
+/// [`map_event_to_records`] is a pure, I/O-free function, and its terminal
+/// branch hard-coded `tokens_in: None` precisely because it has no workspace
+/// root in scope. Keeping it pure is worth more than threading a reader into
+/// it: everything the usage read needs is already *on the record it produced*.
+/// `total_duration_sec` plus "this terminal transition is happening now" is the
+/// same window the durable journal path computes from its registry entry, so
+/// this reconstructs rather than re-correlates — see
+/// [`crate::sweep_usage::window`].
+///
+/// The read itself is bounded local-disk work (transcript/session-store scans),
+/// so it goes through `spawn_blocking` rather than running on the collector's
+/// reactor thread. Terminal events are once-per-sweep, so this adds no
+/// per-phase cost at all.
+///
+/// Fail-open by construction: a panicking or failed blocking hop leaves the
+/// envelope exactly as the mapping built it (absent counters, absent status),
+/// which is the pre-#9440 shape — never a fabricated zero.
+async fn attach_outcome_usage(
+    envelopes: &mut [TelemetryEnvelope],
+    root: &Path,
+    issue: u32,
+    death_class: Option<String>,
+) {
+    // One read per terminal event, applied to both records of the pair — the
+    // `sweep.completed` sibling carries the same per-model breakdown, and
+    // re-deriving it would be a second scan that could disagree with the first.
+    let Some(duration_sec) = envelopes
+        .iter()
+        .find_map(|envelope| match &envelope.record {
+            TelemetryRecord::SweepOutcome(record) => Some(record.total_duration_sec),
+            _ => None,
+        })
+    else {
+        return;
+    };
+    let owned_root = root.to_path_buf();
+    let resolved = tokio::task::spawn_blocking(move || {
+        // Same usage-source resolution the journal path uses: the
+        // `# LOOM_RUNTIME_RESOLVED` marker in the sweep's own log, which a
+        // legacy adapter writes even when it writes no launch record.
+        let usage_runtime = crate::usage_source::sweep_usage_runtime(None, &owned_root, issue);
+        crate::sweep_usage::resolve(
+            usage_runtime.as_deref(),
+            &owned_root,
+            issue,
+            crate::sweep_usage::window(None, duration_sec),
+            death_class.as_deref(),
+        )
+    })
+    .await;
+    let Ok(usage) = resolved else {
+        log::warn!(
+            "observability: sweep usage read for issue #{issue} panicked; leaving sweep.outcome \
+             token counters unset (#9440)"
+        );
+        return;
+    };
+    for envelope in envelopes.iter_mut() {
+        match &mut envelope.record {
+            TelemetryRecord::SweepOutcome(record) => {
+                record.tokens_in = usage.tokens_in;
+                record.tokens_out = usage.tokens_out;
+                record.models_used =
+                    crate::sweep_registry::models_used_from(usage.tokens_by_model.as_deref());
+                record.tokens_by_model = usage.tokens_by_model.clone();
+                record.tokens_status = Some(usage.status);
+                record.tokens_status_reason = usage.reason.clone();
+            }
+            TelemetryRecord::SweepCompleted(record) => {
+                record.tokens_by_model = usage.tokens_by_model.clone();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The reaper's pre-flight/crash classification carried on a terminal event,
+/// when it derived one (Issue #9440) — the signal that separates "never
+/// spawned, so truly zero" from every other failure. Same precedence the
+/// durable journal uses: `death_class` (the pre-flight classifier) first, then
+/// the crash classification.
+fn event_death_class(event: &Event) -> Option<String> {
+    match event {
+        Event::SweepExited { death_class, .. } => death_class.clone(),
+        Event::SweepCrashed {
+            death_class,
+            classification,
+            ..
+        } => death_class.clone().or_else(|| classification.clone()),
+        _ => None,
     }
 }
 
@@ -339,6 +439,7 @@ pub(crate) fn map_event_to_records(
             kind: SweepKind::Issue(_),
             sweep_id,
             runtime,
+            story_points,
             ..
         } => {
             let started_at = Utc::now();
@@ -351,6 +452,11 @@ pub(crate) fn map_event_to_records(
                 },
             );
             vec![TelemetryRecord::SweepStarted(SweepStartedRecord {
+                // #9432: the assigned size of the work now in flight, resolved
+                // at dispatch from the issue's single `points:*` label. Copied
+                // straight through — the collector never reads the forge, so an
+                // absent value here IS an absent attribute, never a zero.
+                story_points: *story_points,
                 repo: repo.to_string(),
                 visibility,
                 issue,
@@ -451,6 +557,23 @@ fn terminal_records(
         (Some(repo.to_string()), false)
     };
     let completed_at = Utc::now();
+    // Issue #9441: this live path sees only result/duration/PR — no classifier
+    // label, no sampled phases, no forge read — so it classifies from exactly
+    // those. It still satisfies both invariants: `landed` ⇔ a PR is present,
+    // and the classifier hands back the mandatory `failure_class` (a
+    // synthesized `unclassified:*` label here, since nothing classified this
+    // transition) together with the disposition.
+    let (disposition, failure_class) =
+        crate::telemetry::classify_disposition(&crate::telemetry::DispositionSignals {
+            result,
+            pr_number,
+            failure_class: None,
+            phase_durations: &[],
+            total_duration_sec,
+            judge_verdicts: None,
+            doctor_cycles: None,
+            issue_end_state: None,
+        });
     vec![
         TelemetryRecord::SweepCompleted(crate::telemetry::SweepCompletedRecord {
             repo: repo.clone(),
@@ -459,15 +582,11 @@ fn terminal_records(
             sweep_id: sweep_id.clone(),
             completed_at,
             result,
-            // Issue #6384: this live event-bus path has no `workspace_root`
-            // or sweep-start instant in scope (unlike
-            // `sweep_registry::outcome_journal`, which already computes
-            // `tokens_in`/`tokens_out` for the same reason those two fields
-            // are also hardcoded `None` below) — deferred rather than
-            // threading a larger signature change through
-            // `map_event_to_records` for this "routine"-scoped issue. The
-            // backfill path (`observability::backfill::synthesize_completed`)
-            // is the real, non-deferred construction site.
+            // Left unset HERE and filled by `attach_outcome_usage` (Issue
+            // #9440), which reads usage once for this terminal event and
+            // applies it to both records of the pair. This function is
+            // deliberately pure — it has no workspace root in scope — so the
+            // read happens in the caller, off the reactor thread.
             tokens_by_model: None,
         }),
         TelemetryRecord::SweepOutcome(crate::telemetry::SweepOutcomeRecord {
@@ -482,7 +601,13 @@ fn terminal_records(
             phase_durations: Vec::<PhaseDuration>::new(),
             total_duration_sec,
             result,
+            disposition,
             pr_number,
+            // Token fields (and `tokens_status`) are filled by
+            // `attach_outcome_usage` in the caller — see `tokens_by_model` on
+            // the paired `sweep.completed` record above (#9440). This path
+            // emitted the MAJORITY of the fleet's `sweep.outcome` records and
+            // was the larger half of the 10.3% measurement rate #9440 found.
             tokens_in: None,
             tokens_out: None,
             lines_added: None,
@@ -491,16 +616,38 @@ fn terminal_records(
             // Issue #9443: no phase entries and no sweep totals here, so there
             // is nothing to take a per-phase remainder of.
             tokens_unattributed: None,
-            failure_class: None,
+            failure_class,
             models_used: None,
             doctor_cycles: None,
             judge_verdicts: None,
-            // Issue #8507: same deferral as `tokens_by_model` above — this
-            // live event-bus path has no launch-record log path in scope.
+            // Issue #8507: this live event-bus path has no launch-record log
+            // path in scope, so the runtime labels stay deferred to the
+            // durable journal path.
             runtime: None,
             provider: None,
             profile: None,
             complexity: None,
+            // Issue #9432: like `complexity`, the story-point size is a forge
+            // read this pure, reactor-thread mapping never makes. Absent, never
+            // `0` — the reaper-side journal path (`outcome_journal`) resolves it
+            // from the label list its own single REST read already carries, and
+            // the in-flight `sweep.started` record for this same sweep carries
+            // the size resolved at dispatch.
+            story_points: None,
+            tokens_status: None,
+            tokens_status_reason: None,
+            // Issues #9444/#9465/#9466: terminal facts the reaper-side journal
+            // (the real `sweep.outcome`) computes. Absent, never fabricated.
+            attempt_index: None,
+            previous_sweep_id: None,
+            trigger: None,
+            rework_events: None,
+            pr_numbers: None,
+            hw_lines_added: None,
+            hw_lines_deleted: None,
+            hw_files: None,
+            generated_lines: None,
+            test_lines: None,
         }),
     ]
 }
@@ -807,6 +954,15 @@ async fn sample_host_health(
         workspace_root,
         &crate::sweep_registry::host_identity(),
     );
+    // Host memory-pressure state (the "what was the host doing when a role
+    // tick died" slice). The probe shells to `vm_stat`/`sysctl` or reads
+    // `/proc`, so it runs off the async runtime exactly like the disk probe
+    // above; a failed sample degrades to all-`None` (host_pressure::sample
+    // never panics), which the wire fields then omit — unknown != zero.
+    let pressure = tokio::task::spawn_blocking(crate::host_pressure::sample)
+        .await
+        .unwrap_or_default();
+    let (swap_in_bytes_per_sec, swap_out_bytes_per_sec) = swap_sample_rates(&pressure);
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -834,7 +990,74 @@ async fn sample_host_health(
             workspace_root,
         ),
         captainless_singleton_jobs: crate::fleet_captain::captainless_singleton_job_names(),
+        // Memory/pressure slice ("deferred vs killed vs timed out"): the
+        // whole object is omitted when nothing was measured — never a flat
+        // zero — the same absence contract `protection`/`admission_brake`
+        // follow. Swap rates come from the process-global sample history.
+        memory: memory_summary(pressure, swap_in_bytes_per_sec, swap_out_bytes_per_sec),
     }
+}
+
+/// Process-global previous swap-counter sample, kept so successive
+/// `host.health` samples can turn the two cumulative totals into rates. A plain
+/// `Mutex` (not async): the critical section is a few nanoseconds and the
+/// collector is the only writer. Poison is recovered rather than propagated —
+/// the daemon must keep sampling if a past holder ever panicked (a dead rate
+/// is a `None`, never a wedged health loop).
+static SWAP_RATE_HISTORY: Mutex<Option<crate::host_pressure::SwapCounterSample>> = Mutex::new(None);
+
+/// Fold one fresh sample and its computed rates into the wire
+/// [`MemoryPressureSummary`], returning `None` when nothing at all was
+/// measured (the wire field's absence contract — an all-`None` summary must
+/// not be serialized as an empty-looking object).
+fn memory_summary(
+    pressure: crate::host_pressure::HostPressure,
+    swap_in_bytes_per_sec: Option<f64>,
+    swap_out_bytes_per_sec: Option<f64>,
+) -> Option<MemoryPressureSummary> {
+    let summary = MemoryPressureSummary {
+        mem_total_bytes: pressure.mem_total_bytes,
+        mem_available_bytes: pressure.mem_available_bytes,
+        mem_compressed_bytes: pressure.mem_compressed_bytes,
+        swap_total_bytes: pressure.swap_total_bytes,
+        swap_used_bytes: pressure.swap_used_bytes,
+        swap_in_bytes_total: pressure.swap_in_bytes_total,
+        swap_out_bytes_total: pressure.swap_out_bytes_total,
+        swap_in_bytes_per_sec,
+        swap_out_bytes_per_sec,
+        memory_pressure: pressure.memory_pressure,
+        oom_kill_total: pressure.oom_kill_total,
+    };
+    (summary != MemoryPressureSummary::default()).then_some(summary)
+}
+
+/// Turn one fresh [`crate::host_pressure::HostPressure`] sample into the
+/// `swap_*_bytes_per_sec` wire pair, remembering the counters for the next
+/// cycle.
+///
+/// The rate is only honest when **both** cumulative totals were measured on
+/// this side and the last — a partially-measured sample (e.g. `vm_stat` read
+/// but the headers were malformed) is dropped for rate purposes rather than
+/// blended, and the history keeps the last fully-measured pair. The pure
+/// per-side rules (first sample, counter rollback, zero elapsed) live in
+/// [`crate::host_pressure::swap_rates`].
+fn swap_sample_rates(pressure: &crate::host_pressure::HostPressure) -> (Option<f64>, Option<f64>) {
+    let mut history = SWAP_RATE_HISTORY.lock().unwrap_or_else(|p| p.into_inner());
+    let rates = crate::host_pressure::swap_rates(
+        *history,
+        pressure.swap_in_bytes_total,
+        pressure.swap_out_bytes_total,
+    );
+    if let (Some(in_now), Some(out_now)) =
+        (pressure.swap_in_bytes_total, pressure.swap_out_bytes_total)
+    {
+        *history = Some(crate::host_pressure::SwapCounterSample {
+            at: std::time::Instant::now(),
+            swap_in_bytes_total: in_now,
+            swap_out_bytes_total: out_now,
+        });
+    }
+    rates
 }
 
 /// Project this host's [`crate::admission_brake::BrakeSnapshot`] onto the wire
@@ -1065,6 +1288,17 @@ async fn collect_managed_repos(
 ) -> Vec<ManagedRepoEntry> {
     // Each registered workspace's dispatch priority (#9244, loom-ui#153).
     // Best-effort: an unreadable registry just omits `priority`.
+    //
+    // Deliberately re-read per collection rather than cached (Issue #9314).
+    // This runs once per `snapshot_interval` (5 minutes by default), from the
+    // collector task, and reads ONE small local JSON file
+    // (`~/.loom/workspaces.json`) — the same read a dozen other daemon paths
+    // make per tick. Freshness is the point: an operator's `loom-daemon
+    // workspace priority` edit must show up in the next `host.health` sample
+    // without a daemon restart, and `managed_repos` is how the dashboard
+    // renders it. Caching it would trade that for no measurable saving and add
+    // a staleness class (a cached priority outliving the edit) to a field whose
+    // whole job is to report current configuration.
     let priorities: HashMap<PathBuf, u32> =
         crate::workspace_registry::WorkspaceRegistry::load_default()
             .map(|r| {
@@ -1186,12 +1420,20 @@ mod provider_accounts_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod shell_arm_registry_tests;
+// Issue #9432: `sweep.started`'s story-point pass-through.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod story_points_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod terminal_records_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+// Issue #9440: the terminal records' token counters + `tokens_status`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tokens_status_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod weekly_utilization_tests;

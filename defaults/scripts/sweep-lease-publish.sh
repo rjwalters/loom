@@ -149,10 +149,10 @@ usage() {
 }
 
 # --- Repo-relative `gh` targeting (mirrors sweep-lease-fence.sh) -----------
-gh_repo_args() {
-    if [[ -n "${LOOM_REPO:-}" ]]; then
-        printf -- '-R\n%s\n' "$LOOM_REPO"
-    fi
+# `gh api` has no -R flag (#9552), so the repo goes in the endpoint path.
+gh_repo_path() {
+    local placeholder='{owner}/{repo}'
+    printf '%s' "${LOOM_REPO:-$placeholder}"
 }
 
 # --- sha256 hex digest of stdin, tolerating either common tool -------------
@@ -342,10 +342,8 @@ cmd_publish() {
         exit 1
     fi
 
-    local -a repo_args=()
-    while IFS= read -r line; do
-        [[ -n "$line" ]] && repo_args+=("$line")
-    done < <(gh_repo_args)
+    local repo_path
+    repo_path="$(gh_repo_path)"
 
     # --- Read existing lease AND lease-yield comments in ONE round trip
     # (NDJSON; see sweep-lease-fence.sh on why this is deliberately NOT an
@@ -354,7 +352,7 @@ cmd_publish() {
     # scan below for why a publish-side peer check needs the yield records
     # too (Issue #5331).
     local comments_ndjson read_ok=1
-    if ! comments_ndjson="$(gh api "${repo_args[@]+"${repo_args[@]}"}" "repos/{owner}/{repo}/issues/${issue}/comments" \
+    if ! comments_ndjson="$(gh api "repos/${repo_path}/issues/${issue}/comments" \
         --paginate --jq \
         ".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {updated_at: .updated_at, body: .body}" \
         2>&1)"; then
@@ -502,7 +500,7 @@ cmd_publish() {
     # (#6320, the same trap fixed in sweep-lease-renew.sh).
     local post_out
     if ! post_out="$(printf '%s' "$lease_body" \
-        | gh api "${repo_args[@]+"${repo_args[@]}"}" --method POST "repos/{owner}/{repo}/issues/${issue}/comments" -F body=@- 2>&1)"; then
+        | gh api --method POST "repos/${repo_path}/issues/${issue}/comments" -F body=@- 2>&1)"; then
         echo "ERROR: failed to publish lease comment on issue #${issue}: ${post_out}" >&2
         echo "Proceeding without a lease is safe but degrades reclaim evidence (best-effort, mirrors #6179's fail-open dispatch write)." >&2
         exit 2

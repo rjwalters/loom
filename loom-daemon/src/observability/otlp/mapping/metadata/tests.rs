@@ -67,6 +67,46 @@ fn outcomes_preserve_observed_zero_empty_history_and_missing_measurements() {
     );
     assert!(attribute(&observed, "loom.tokens_out").is_none());
 }
+
+/// Issue #9440: the status pair that makes an absent token counter readable.
+/// Both keys are exported so a SigNoz query can `GROUP BY` either; a
+/// `measured` status carries no reason, because a measurement needs no excuse.
+#[test]
+fn outcomes_export_the_tokens_status_pair_as_groupable_attributes() {
+    let mut record = outcome_record();
+    // Pre-#9440 records carry no status at all, and must stay that way on the
+    // wire — an absent status reads as "unknown", never as one of the three.
+    let legacy = map(TelemetryRecord::SweepOutcome(record.clone()));
+    for key in ["loom.tokens_status", "loom.tokens_status_reason"] {
+        assert!(attribute(&legacy, key).is_none(), "{key}");
+    }
+
+    record.tokens_status = Some(crate::telemetry::TokensStatus::NotSpawned);
+    record.tokens_status_reason = Some("preflight-no-cli-start".to_string());
+    record.tokens_in = Some(0);
+    record.tokens_out = Some(0);
+    let not_spawned = map(TelemetryRecord::SweepOutcome(record.clone()));
+    assert_eq!(
+        attribute(&not_spawned, "loom.tokens_status"),
+        Some(any_value::Value::StringValue("not_spawned".to_string()))
+    );
+    assert_eq!(
+        attribute(&not_spawned, "loom.tokens_status_reason"),
+        Some(any_value::Value::StringValue("preflight-no-cli-start".to_string()))
+    );
+    // The measured zero rides alongside it — this is the one status for which
+    // zero is the observation rather than the absence of one.
+    assert_eq!(attribute(&not_spawned, "loom.tokens_in"), Some(any_value::Value::IntValue(0)));
+
+    record.tokens_status = Some(crate::telemetry::TokensStatus::Measured);
+    record.tokens_status_reason = None;
+    let measured = map(TelemetryRecord::SweepOutcome(record));
+    assert_eq!(
+        attribute(&measured, "loom.tokens_status"),
+        Some(any_value::Value::StringValue("measured".to_string()))
+    );
+    assert!(attribute(&measured, "loom.tokens_status_reason").is_none());
+}
 #[test]
 fn repair_history_and_observed_model_groups_survive_without_creating_metrics() {
     let mut record = outcome_record();
@@ -428,4 +468,26 @@ fn an_invalid_or_oversized_phase_breakdown_is_omitted_whole() {
     assert!(
         attribute(&map(TelemetryRecord::SweepOutcome(record)), "loom.phase_durations").is_none()
     );
+}
+
+/// Issue #9432 (epic #9429): the Curator's story-point size reaches OTLP as a
+/// NUMERIC `loom.story_points` attribute on `sweep.outcome` — and an unsized
+/// sweep emits **no** such attribute rather than a `0` that would claim someone
+/// sized the issue at nothing.
+#[test]
+fn story_points_are_exported_numerically_and_absent_when_unsized() {
+    let mut record = outcome_record();
+    assert!(
+        attribute(&map(TelemetryRecord::SweepOutcome(record.clone())), "loom.story_points")
+            .is_none(),
+        "an issue with no points:* label must omit the attribute entirely"
+    );
+    for points in [1_u32, 2, 3, 5, 8, 13] {
+        record.story_points = Some(points);
+        assert_eq!(
+            attribute(&map(TelemetryRecord::SweepOutcome(record.clone())), "loom.story_points"),
+            Some(any_value::Value::IntValue(i64::from(points))),
+            "{points}"
+        );
+    }
 }

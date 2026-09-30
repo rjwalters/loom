@@ -623,12 +623,92 @@ pub fn comparison(root: &Path, base_ref: &str) -> Result<Comparison, String> {
     })
 }
 
+pub mod callout;
 pub mod churn;
 mod declaration;
 
+pub use callout::{
+    parse_callout_declarations, CalloutDeclaration, CalloutEvidence, CALLOUT_CAP, CALLOUT_TRAILER,
+};
 pub use declaration::{
     parse_growth_declarations, GrowthDeclaration, MalformedDeclaration, GROWTH_TRAILER,
 };
+
+/// Every commit message in `base_rev..HEAD`, NUL-separated.
+///
+/// # Errors
+/// Returns a message when `git log` cannot be run.
+fn commit_messages(root: &Path, base_rev: &str) -> Result<String, String> {
+    let out = Command::new("git")
+        .current_dir(root)
+        .args(["log", "--format=%x00%B", &format!("{base_rev}..HEAD")])
+        .output()
+        .map_err(|e| format!("could not run git log: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git log {base_rev}..HEAD failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Read the `Shell-Budget-Callout:` declarations from every commit in
+/// `base_rev..HEAD` (#9297).
+///
+/// Same positional rules, same malformed-not-ignored reporting, and the same
+/// reasons for not using `git interpret-trailers` as
+/// [`collect_growth_declarations`] — see its documentation.
+///
+/// # Errors
+/// Returns a message when `git log` cannot be run.
+pub fn collect_callout_declarations(
+    root: &Path,
+    base_rev: &str,
+) -> Result<(Vec<CalloutDeclaration>, Vec<MalformedDeclaration>), String> {
+    let text = commit_messages(root, base_rev)?;
+    let mut ok = Vec::new();
+    let mut bad = Vec::new();
+    for message in text.split('\0').filter(|m| !m.trim().is_empty()) {
+        let (mut o, mut b) = parse_callout_declarations(message);
+        ok.append(&mut o);
+        bad.append(&mut b);
+    }
+    Ok((ok, bad))
+}
+
+/// Measure how many added code lines this change actually spends on each
+/// declared call-site.
+///
+/// Diffs `base_rev` against the WORKING TREE, matching what [`measure`] reads,
+/// so an uncommitted call-site is measured exactly as a committed one is.
+///
+/// # Errors
+/// Returns a message when `git diff` cannot be run.
+pub fn collect_callout_evidence(
+    root: &Path,
+    base_rev: &str,
+    now: &Budget,
+    declared: &[CalloutDeclaration],
+) -> Result<Vec<CalloutEvidence>, String> {
+    if declared.is_empty() {
+        return Ok(Vec::new());
+    }
+    let out = Command::new("git")
+        .current_dir(root)
+        // `--unified=0`: a hunk with no context lines is exactly the block of
+        // adjacent added lines the attribution rule needs.
+        .args(["diff", "--unified=0", "--no-color", base_rev, "--", "*.sh"])
+        .output()
+        .map_err(|e| format!("could not run git diff: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git diff --unified=0 {base_rev} -- '*.sh' failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(callout::measure_evidence(&String::from_utf8_lossy(&out.stdout), now, declared))
+}
 
 /// Read the `Shell-Budget-Growth:` declarations from every commit in
 /// `base_rev..HEAD`.
@@ -667,19 +747,7 @@ pub fn collect_growth_declarations(
     root: &Path,
     base_rev: &str,
 ) -> Result<(Vec<GrowthDeclaration>, Vec<MalformedDeclaration>), String> {
-    let out = Command::new("git")
-        .current_dir(root)
-        .args(["log", "--format=%x00%B", &format!("{base_rev}..HEAD")])
-        .output()
-        .map_err(|e| format!("could not run git log: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git log {base_rev}..HEAD failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = commit_messages(root, base_rev)?;
     let mut ok = Vec::new();
     let mut bad = Vec::new();
     for message in text.split('\0').filter(|m| !m.trim().is_empty()) {
@@ -695,6 +763,15 @@ pub fn collect_growth_declarations(
 pub struct GrowthContext<'a> {
     /// `Shell-Budget-Growth:` trailers found in the compared commit range.
     pub declared: &'a [GrowthDeclaration],
+    /// `Shell-Budget-Callout:` trailers found in the same range (#9297).
+    pub callouts: &'a [CalloutDeclaration],
+    /// Every subcommand `loom-daemon` actually registers. Supplied by the
+    /// caller because only the BINARY crate can see its own clap registry —
+    /// and an empty slice is treated as "could not check", which refuses a
+    /// callout rather than accepting it unverified.
+    pub subcommands: &'a [String],
+    /// What the diff shows each declared call-site is actually made of.
+    pub evidence: &'a [CalloutEvidence],
 }
 
 impl<'a> GrowthContext<'a> {
@@ -702,15 +779,24 @@ impl<'a> GrowthContext<'a> {
     /// every pre-#8154 caller had.
     #[must_use]
     pub const fn none() -> Self {
-        Self { declared: &[] }
+        Self {
+            declared: &[],
+            callouts: &[],
+            subcommands: &[],
+            evidence: &[],
+        }
     }
 }
 
 /// Compare this tree against a base revision. `Ok` when the change does not
-/// grow the portable pool.
+/// grow the portable pool beyond what `ctx`'s `Shell-Budget-Callout:`
+/// declarations bought (#9297 — zero in the common case, where this reads as
+/// "does not grow the portable pool" exactly as it did before).
 ///
 /// # Errors
-/// Returns the operator-facing explanation when it does.
+/// Returns the operator-facing explanation when it does — or when a callout
+/// declaration is itself unusable, which is reported in preference to the
+/// growth it failed to pay for.
 pub fn check_against_rev(
     now: &Budget,
     before: &Budget,
@@ -718,12 +804,26 @@ pub fn check_against_rev(
     ctx: &GrowthContext<'_>,
 ) -> Result<(), String> {
     let declared = ctx.declared;
-    // Portable growth is NOT overridable, deliberately. The trailer buys a
-    // larger permanent floor, which is a cost the epic can price; it does not
-    // buy more of the thing the epic exists to retire. #8154 asked only for the
-    // floor and this keeps it there.
-    if now.portable() > before.portable() {
-        return Err(portable_growth_message(now, before, base_desc));
+
+    // The ONE carve-out in the portable leg (#9297): lines that call a
+    // `loom-daemon` subcommand the logic moved into. Computed first because an
+    // unusable declaration must refuse with a message about the TRAILER — an
+    // author whose typo'd trailer degraded to zero credit would otherwise read
+    // a message about portable growth and go fix the wrong thing.
+    //
+    // Four mechanical checks keep it from being a general override: the
+    // subcommand must exist, the lines must be measured from the diff as an
+    // actual call-site, the declaration is capped per subcommand, and the grant
+    // is `min(declared, measured)` so padding buys nothing. See
+    // `callout::allowance`.
+    let callout = callout::allowance(ctx.callouts, ctx.subcommands, ctx.evidence)?;
+
+    // Portable growth is otherwise NOT overridable, deliberately. The
+    // `Shell-Budget-Growth:` trailer buys a larger permanent floor, which is a
+    // cost the epic can price; it does not buy more of the thing the epic
+    // exists to retire. #8154 asked only for the floor and this keeps it there.
+    if now.portable() > before.portable().saturating_add(callout) {
+        return Err(portable_growth_message(now, before, base_desc, callout));
     }
 
     // `settled` may shrink, never grow — per FILE, and with no override
@@ -754,7 +854,13 @@ pub fn check_against_rev(
     // that route and, as a side effect, guarantees any growth the total leg
     // reports below is genuinely floor growth rather than smuggled portable
     // growth, so that message's claim is no longer only sometimes true.
-    if now.comparable() > before.comparable() {
+    //
+    // The callout allowance applies here too, and must: a declared call-site is
+    // portable growth, so it raises `comparable()` by exactly the same amount
+    // it raises `portable()`. Without the offset this leg would refuse every
+    // change the leg above just admitted, and the carve-out would be
+    // decorative.
+    if now.comparable() > before.comparable().saturating_add(callout) {
         return Err(comparable_growth_message(now, before, base_desc));
     }
 
@@ -765,7 +871,27 @@ pub fn check_against_rev(
     // reporting -439. Portable is what the epic retires, but growth in the
     // permanent floor is still growth and should be deliberate.
     if now.total() > before.total() {
-        let growth = now.total() - before.total();
+        // Call-site lines are counted in `total()` like any other, so a change
+        // whose whole growth IS the declared call-site must not then be sent
+        // here to look for a floor declaration it does not need. Subtract the
+        // allowance first and stop if nothing is left.
+        //
+        // Subtracting rather than skipping the leg matters: whatever growth
+        // survives the subtraction is elsewhere — the permanent floor — and
+        // still needs its own `Shell-Budget-Growth:` declaration. A callout
+        // cannot pay for floor growth.
+        //
+        // And the subtraction is bounded by what portable ACTUALLY grew by, not
+        // by what was declared. Otherwise a change that retires 38 portable
+        // lines, adds a 38-line call-site, and quietly grows a `bootstrap`
+        // script by 10 nets out to zero portable growth while the callout pays
+        // for the floor's 10 — the laundering route the per-file check below
+        // exists to close, reopened one leg up.
+        let spendable = callout.min(now.portable().saturating_sub(before.portable()));
+        let growth = (now.total() - before.total()).saturating_sub(spendable);
+        if growth == 0 {
+            return Ok(());
+        }
         // Saturating: two `u64::MAX` declarations overflow. Debug panics
         // (fail-closed but ugly); release wraps to a small number and would
         // then REFUSE growth it should allow, which is the wrong failure.
@@ -1005,7 +1131,13 @@ fn comparable_growth_message(now: &Budget, before: &Budget, base_desc: &str) -> 
 }
 
 /// The portable-growth explanation, split out so both callers read the same.
-fn portable_growth_message(now: &Budget, before: &Budget, base_desc: &str) -> String {
+///
+/// `callout` is the allowance already granted by `Shell-Budget-Callout:`
+/// trailers (#9297) — zero in the common case. It is named in the message
+/// because "this change adds 38 portable lines" is confusing to read when 20 of
+/// them were already admitted: the author needs to know the shortfall, not the
+/// gross figure.
+fn portable_growth_message(now: &Budget, before: &Budget, base_desc: &str, callout: u64) -> String {
     let mut grew: Vec<(&String, u64, u64)> = Vec::new();
     for (cat, lines) in &now.by_category {
         if !PORTABLE.contains(&cat.as_str()) {
@@ -1022,22 +1154,47 @@ fn portable_growth_message(now: &Budget, before: &Budget, base_desc: &str) -> St
         .collect::<Vec<_>>()
         .join("\n");
 
+    // Only ever printed when the growth exceeded what was already granted, so
+    // the author is looking at a shortfall and the gross figure alone would
+    // misdescribe it.
+    let granted = if callout == 0 {
+        String::new()
+    } else {
+        format!(
+            "\n\n{callout} line(s) were already admitted by `{CALLOUT_TRAILER}` declarations, \
+             so the shortfall is {}.",
+            (now.portable() - before.portable()).saturating_sub(callout)
+        )
+    };
+
     format!(
-        "This change adds {} code lines of PORTABLE shell (vs {base_desc}: {} -> {}).\n\n{detail}\n\n\
+        "This change adds {} code lines of PORTABLE shell (vs {base_desc}: {} -> {}).\n\n{detail}{granted}\n\n\
          Portable shell is what epic #7810 is retiring — `contract` + `hook-entry`, whose logic \
          moves into the daemon behind a stub. Adding to it works directly against the epic.\n\n\
          Options, best first:\n\n\
          \x20 1. Put the new logic in the daemon instead. That is the language policy\n\
          \x20    (.loom/docs/shell-language-policy.md) and it makes this gate a non-event.\n\
-         \x20 2. Remove portable shell elsewhere in the same change to pay for it.\n\
-         \x20 3. If the script must stay shell forever, it may belong in `bootstrap` or\n\
+         \x20 2. If these lines ARE that port's call-site — finding the binary, building the\n\
+         \x20    argument list, reading the result back — declare them (see below).\n\
+         \x20 3. Remove portable shell elsewhere in the same change to pay for it.\n\
+         \x20 4. If the script must stay shell forever, it may belong in `bootstrap` or\n\
          \x20    `vendored` rather than `contract` — but that is a claim about the script,\n\
          \x20    argued in scripts/shell-allowlist.txt, not a way around this number.\n\
-         \x20 4. If it is shell we are deliberately KEEPING — quiet, low blast radius, and\n\
+         \x20 5. If it is shell we are deliberately KEEPING — quiet, low blast radius, and\n\
          \x20    nobody intends to port it — it may belong in `settled` (#8237). That is a\n\
          \x20    mechanical claim, machine-checked on every run by\n\
          \x20    scripts/check-shell-allowlist.sh, and it does NOT let the file grow: a\n\
          \x20    settled file may shrink, never expand, with no override.\n\n\
+         Option 2 in full (#9297) — declare the call-site on a line of its own in a commit \
+         BODY:\n\n\
+         {CALLOUT_TRAILER} <subcommand> +<n>\n\n\
+         The subcommand must ALREADY exist in `loom-daemon`; the declared lines must be \
+         measurable in the diff as a call-site (an added CODE line naming the subcommand, in a \
+         hunk that also references the binary); and no one subcommand may declare more than \
+         {CALLOUT_CAP} lines. You are granted the smaller of what you declared and what the diff \
+         shows, so over-declaring buys nothing. Same placement rules as `{GROWTH_TRAILER}`: \
+         column 0, outside any ``` fence, never the commit subject. A near-miss is reported as \
+         malformed rather than ignored.\n\n\
          Note this compares against the MERGE-BASE, so it is measuring what YOUR change did.\n\
          Whatever main did meanwhile is not your problem and not this gate's business.",
         now.portable() - before.portable(),

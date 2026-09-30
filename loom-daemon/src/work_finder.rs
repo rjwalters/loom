@@ -119,7 +119,7 @@
 //! ([`crate::sweep_registry::spawn_reaper_task`]) rather than the epic
 //! supervisor's OS-thread machinery.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -229,6 +229,7 @@ pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP
 
 pub mod build_backoff;
 pub mod dispatch_plan;
+pub mod dispatch_plan_merge;
 mod labels;
 pub mod main_red_fix;
 pub mod operator_priority;
@@ -535,6 +536,19 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// The absolute expiry of each entry in [`backed_off`](Self::backed_off)
+    /// (Issue #9311), when known — same membership, keyed the same way, a
+    /// sibling snapshot rather than a replacement so `backed_off`'s existing
+    /// callers and fakes are unaffected. Populates `dispatch_plan`'s
+    /// `held_until` field; the work finder's own skip decision still reads
+    /// `backed_off` alone.
+    ///
+    /// Defaults to empty so a dispatcher that does not model the backoff
+    /// (e.g. a test fake) opts out with zero boilerplate.
+    fn dispatch_backoff_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
+        HashMap::new()
+    }
+
     /// The subset of [`backed_off`](Self::backed_off) whose window was armed
     /// specifically by the open-PR guard (#4123) refusing dispatch, rather
     /// than a real dispatch failure (Issue #7606). Checked immediately after
@@ -576,6 +590,15 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// The absolute expiry of each entry in [`noop_cooldown`](Self::noop_cooldown)
+    /// (Issue #9311), when known — a sibling snapshot, mirroring
+    /// [`dispatch_backoff_expiry`](Self::dispatch_backoff_expiry). Defaults to
+    /// empty so a dispatcher that does not model the cooldown (e.g. a test
+    /// fake) opts out with zero boilerplate.
+    fn noop_cooldown_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
+        HashMap::new()
+    }
+
     /// The set of issue numbers currently inside a **hard-exclusion decline
     /// cooldown window** (Issue #7528): a sweep for this issue exited cleanly
     /// without a checkpoint while the issue carried a
@@ -599,6 +622,15 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// The absolute expiry of each entry in [`declined`](Self::declined)
+    /// (Issue #9311), when known — a sibling snapshot, mirroring
+    /// [`dispatch_backoff_expiry`](Self::dispatch_backoff_expiry). Defaults to
+    /// empty so a dispatcher that does not model the cooldown (e.g. a test
+    /// fake) opts out with zero boilerplate.
+    fn declined_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
+        HashMap::new()
+    }
+
     /// The set of issue numbers currently inside a **PR-less retry window**
     /// (Issue #7972): a previous dispatch claimed the issue, released it, and
     /// left no pull request behind, and the window the reaper armed has not yet
@@ -617,6 +649,15 @@ pub trait WorkDispatcher {
     /// test fake) opts out with zero boilerplate.
     fn prless_retry(&self) -> HashSet<u32> {
         HashSet::new()
+    }
+
+    /// The absolute expiry of each entry in [`prless_retry`](Self::prless_retry)
+    /// (Issue #9311), when known — a sibling snapshot, mirroring
+    /// [`dispatch_backoff_expiry`](Self::dispatch_backoff_expiry). Defaults to
+    /// empty so a dispatcher that does not model the bound (e.g. a test fake)
+    /// opts out with zero boilerplate.
+    fn prless_retry_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
+        HashMap::new()
     }
 
     /// Whether this dispatcher's workspace is missing
@@ -1615,6 +1656,15 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     let backed_off_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.backed_off()).collect();
 
+    // Sibling snapshot of `backed_off_sets`' absolute expiry (Issue #9311),
+    // read alongside it so `dispatch_plan::annotate` can publish
+    // `held_until` — the skip decision above still reads `backed_off_sets`
+    // alone, unaffected.
+    let backed_off_until: Vec<HashMap<u32, chrono::DateTime<chrono::Utc>>> = workspaces
+        .iter()
+        .map(|(_, d)| d.dispatch_backoff_expiry())
+        .collect();
+
     // Snapshot each workspace's open-PR-guard-armed subset of `backed_off`
     // (Issue #7606) alongside it, so pass 1 can attribute a pre-filtered skip
     // more specifically than the generic `skipped_backoff` tally.
@@ -1630,9 +1680,23 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     let noop_cooldown_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.noop_cooldown()).collect();
 
+    // Sibling snapshot of `noop_cooldown_sets`' absolute expiry (Issue #9311),
+    // mirroring `backed_off_until`.
+    let noop_cooldown_until: Vec<HashMap<u32, chrono::DateTime<chrono::Utc>>> = workspaces
+        .iter()
+        .map(|(_, d)| d.noop_cooldown_expiry())
+        .collect();
+
     // Snapshot each workspace's hard-exclusion decline set (#7528) alongside
     // its no-op-cooldown set, dropped in pass 1 for the same reason.
     let declined_sets: Vec<HashSet<u32>> = workspaces.iter().map(|(_, d)| d.declined()).collect();
+
+    // Sibling snapshot of `declined_sets`' absolute expiry (Issue #9311),
+    // mirroring `backed_off_until`.
+    let declined_until: Vec<HashMap<u32, chrono::DateTime<chrono::Utc>>> = workspaces
+        .iter()
+        .map(|(_, d)| d.declined_expiry())
+        .collect();
 
     // Snapshot each workspace's PR-less retry set (#7972) alongside the
     // decline set, dropped in pass 1 for the same reason: an issue whose last
@@ -1640,6 +1704,13 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // produce none again.
     let prless_retry_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.prless_retry()).collect();
+
+    // Sibling snapshot of `prless_retry_sets`' absolute expiry (Issue #9311),
+    // mirroring `backed_off_until`.
+    let prless_retry_until: Vec<HashMap<u32, chrono::DateTime<chrono::Utc>>> = workspaces
+        .iter()
+        .map(|(_, d)| d.prless_retry_expiry())
+        .collect();
 
     // Snapshot each workspace's peer-claim set (#4028) alongside its quarantined
     // set. A peer's live soft claim drops the candidate in pass 1, before the
@@ -1772,11 +1843,17 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
 
         for item in ready {
             let key = ready_queue::key_of(idx, workspace_priority, &item, red);
-            let mut skip = |d: Qd, detail: Option<String>| {
-                ready_queue::record_skip(q, key.clone(), &item, d, detail);
-            };
+            // `held_until` (Issue #9311): `None` for every disposition but
+            // the five time-boxed holds below, which pass their computed
+            // expiry explicitly as the third argument.
+            let mut skip =
+                |d: Qd,
+                 detail: Option<String>,
+                 held_until: Option<chrono::DateTime<chrono::Utc>>| {
+                    ready_queue::record_skip_held(q, key.clone(), &item, d, detail, held_until);
+                };
             if repo_halted && !item.is_main_red_fix() {
-                skip(Qd::WorkspaceHalted, None);
+                skip(Qd::WorkspaceHalted, None, None);
                 continue;
             }
             // Host-affinity constraint (#7456) — checked first, before any
@@ -1786,7 +1863,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             let host_constraint = item.host_constraint();
             if !host_constraint.matches(&current_host_ids[idx]) {
                 report.skipped_host_constraint += 1;
-                skip(Qd::HostConstraint, Some(host_constraint.describe()));
+                skip(Qd::HostConstraint, Some(host_constraint.describe()), None);
                 log::info!(
                     "work_finder: skipping issue #{} — requires host {}, this is {}",
                     item.number,
@@ -1802,6 +1879,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
                 skip(
                     Qd::HostClassRefused,
                     Some(heavy_local_policies[idx].class.as_str().to_string()),
+                    None,
                 );
                 continue;
             }
@@ -1810,7 +1888,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
                 &held_capability_sets[idx],
             ) {
                 report.skipped_labeled += 1;
-                skip(Qd::Parked, ready_queue::park_label(&item, &extra_skip_label_sets[idx]));
+                skip(Qd::Parked, ready_queue::park_label(&item, &extra_skip_label_sets[idx]), None);
                 log_capability_gap(&item, &held_capability_sets[idx]);
                 continue;
             }
@@ -1820,7 +1898,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             // never claim, never spend a session).
             if let Some(rule) = crate::hard_exclusion::declining_label(&item.labels) {
                 report.skipped_declined += 1;
-                skip(Qd::HardExclusion, Some(rule.to_string()));
+                skip(Qd::HardExclusion, Some(rule.to_string()), None);
                 log_hard_exclusion_skip(item.number, rule);
                 continue;
             }
@@ -1830,19 +1908,19 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             // independent of and never reading `noop_cooldown` state.
             if item.is_within_recheck_interval(now) {
                 report.skipped_recheck_interval += 1;
-                skip(Qd::RecheckInterval, None);
+                skip(Qd::RecheckInterval, None, item.recheck_interval_until());
                 continue;
             }
             if in_flight.contains(&item.number) {
                 report.skipped_in_flight += 1;
-                skip(Qd::InFlight, None);
+                skip(Qd::InFlight, None, None);
                 continue;
             }
             // Insta-crash quarantine (#3939): drop before the candidate ever
             // enters the global queue, so it consumes no shared slot.
             if quarantined_sets[idx].contains(&item.number) {
                 report.skipped_quarantined += 1;
-                skip(Qd::Quarantined, None);
+                skip(Qd::Quarantined, None, None);
                 continue;
             }
             // Dispatch backoff (#4485): a failing issue inside its backoff
@@ -1851,12 +1929,13 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             // more specific `pr_open_backoff` counter instead, mutually
             // exclusive with `skipped_backoff`.
             if backed_off_sets[idx].contains(&item.number) {
+                let held_until = backed_off_until[idx].get(&item.number).copied();
                 if pr_open_backed_off_sets[idx].contains(&item.number) {
                     report.skipped_pr_open_backoff += 1;
-                    skip(Qd::OpenPrBackoff, None);
+                    skip(Qd::OpenPrBackoff, None, held_until);
                 } else {
                     report.skipped_backoff += 1;
-                    skip(Qd::DispatchBackoff, None);
+                    skip(Qd::DispatchBackoff, None, held_until);
                 }
                 continue;
             }
@@ -1866,7 +1945,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             // independently of both.
             if noop_cooldown_sets[idx].contains(&item.number) {
                 report.skipped_noop_cooldown += 1;
-                skip(Qd::NoopCooldown, None);
+                skip(Qd::NoopCooldown, None, noop_cooldown_until[idx].get(&item.number).copied());
                 continue;
             }
             // Hard-exclusion decline cooldown (#7528): a previous sweep for
@@ -1875,7 +1954,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             // above and independently of all of them.
             if declined_sets[idx].contains(&item.number) {
                 report.skipped_declined += 1;
-                skip(Qd::Declined, None);
+                skip(Qd::Declined, None, declined_until[idx].get(&item.number).copied());
                 continue;
             }
             // PR-less retry window (#7972): a previous dispatch claimed this
@@ -1884,14 +1963,14 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             // all of them.
             if prless_retry_sets[idx].contains(&item.number) {
                 report.skipped_prless_retry += 1;
-                skip(Qd::PrlessRetry, None);
+                skip(Qd::PrlessRetry, None, prless_retry_until[idx].get(&item.number).copied());
                 continue;
             }
             // Peer soft claim (#4028): a peer host is already building it — drop
             // before the global queue so it consumes no shared slot.
             if peer_claimed_sets[idx].contains(&item.number) {
                 report.skipped_peer_claim += 1;
-                skip(Qd::PeerClaim, None);
+                skip(Qd::PeerClaim, None, None);
                 log::info!(
                     "work_finder: skipping issue #{} — a peer host advertised a soft claim \
                      over safehouse (#4028)",
