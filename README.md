@@ -403,7 +403,7 @@ silently drops that platform's artifact from an otherwise-"successful" run.
 
 ```bash
 # In the Loom repository
-/imagine a CLI tool for managing dotfiles
+/loom:imagine a CLI tool for managing dotfiles
 ```
 
 Creates a new GitHub repo with Loom pre-installed and initial roadmap.

@@ -205,9 +205,9 @@ this script.
 <!-- agents-md:include:start -->
 ### CI is dumb and reliable, on purpose
 
-Prefer a slow correct job to a clever fast one. **Never cancel verification of a
-distinct commit** — superseding is for PR branches; every default-branch commit
-is distinct work. Path-filtering is an optimisation, not a correctness tool. One
+Prefer a slow correct job to a clever fast one. **Never cancel a distinct commit's
+run once started**; the default branch supersedes only pending runs (no verdict).
+Path-filtering is an optimisation, not a correctness tool. One
 mechanism per behaviour: two that both cancel, skip or retry will surprise
 someone. A check that *cannot run* must never look like one that passed. Rules +
 the incidents behind them: [`.loom/docs/ci-principles.md`](.loom/docs/ci-principles.md).
@@ -257,7 +257,8 @@ readily as a dispatched one; only Curator may be skipped.
    directly — a leaseless claim is invisible to other lanes and gets reclaimed (#9453)
 3. Create worktree: `./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42`
 4. Implement, test, commit
-5. Create PR: `git push -u origin feature/issue-42 && gh pr create --label "loom:review-requested" --body "Closes #42"`
+5. Create PR: `git push -u origin feature/issue-42 &&
+   ./.loom/scripts/create-pr.sh --label "loom:review-requested" --body "Closes #42"` (#9453).
 
 ### Judge Workflow
 

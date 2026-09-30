@@ -28,8 +28,32 @@ pub struct IdleExitConfig {
 
 #[must_use]
 pub fn read_config(root: &Path) -> IdleExitConfig {
-    let config = crate::config_resolver::resolve_effective_config(root);
-    let Some(block) = crate::config_resolver::get_path(&config, "autonomous.idleExit") else {
+    let effective = crate::config_resolver::resolve_effective_config(root);
+    let mut config = parse_effective(&effective);
+    // Hyperparameters overlay (Issue #9683): a valid
+    // `hyperparameters.lifecycle.idleExitMinutes` wins over the legacy
+    // `autonomous.idleExit.idleMinutes`. Invalid layer values soft-ignore
+    // here (per-tick re-read after startup); `hyperparams::startup_init` is
+    // the strict gate that names them at daemon startup.
+    let layer = crate::hyperparams::overlay_from_effective(&effective);
+    if let Some(mins) = layer
+        .get("lifecycle")
+        .and_then(|l| l.get("idleExitMinutes"))
+        .filter(|v| !v.is_null())
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+    {
+        config.idle_minutes = Some(mins);
+    }
+    config
+}
+
+/// Pure parse of an already-resolved effective config — the legacy tier only,
+/// no hyperparameters overlay (read by `hyperparams::resolve_effective` so
+/// per-field provenance never double-counts the overlay).
+#[must_use]
+pub fn parse_effective(effective: &serde_json::Value) -> IdleExitConfig {
+    let Some(block) = crate::config_resolver::get_path(effective, "autonomous.idleExit") else {
         return IdleExitConfig::default();
     };
     IdleExitConfig {

@@ -2335,13 +2335,13 @@ impl SweepRegistry {
                     //     here and acted on AFTER `note_label_flip` below, so
                     //     flap-detection bookkeeping for this real flip stays
                     //     unconditional either way.
-                    if let LeaseOrderDecision::Yield {
-                        earliest_host,
-                        earliest_sweep_id,
-                    } = self.resolve_lease_order(issue_number, &sweep_id, episode_start)
-                    {
-                        lease_order_yield = Some((earliest_host, earliest_sweep_id));
-                    }
+                    //     Since #9453 Phase 3.1 the same call also yields to a
+                    //     young LEASELESS foreign `loom:building` — a claim
+                    //     from a lane that published no lease record — which
+                    //     `yield_identity` reports through this same channel.
+                    lease_order_yield = self
+                        .resolve_lease_order(issue_number, &sweep_id, episode_start)
+                        .yield_identity();
                 }
                 Err(e) => {
                     log::warn!(
@@ -2370,11 +2370,11 @@ impl SweepRegistry {
         if let Some((earliest_host, earliest_sweep_id)) = lease_order_yield {
             log::warn!(
                 "sweep_registry: YIELDING dispatch of issue #{issue_number} sweep_id={sweep_id} \
-                 — a lease comment from host={earliest_host} sweep={earliest_sweep_id} has an \
-                 earlier forge-assigned comment order (#6287 claim-then-verify-order tie-break, \
-                 Epic #6165 Phase 2). Standing down before spawning a builder; the \
-                 `loom:building` label is left in place since it already protects the earlier \
-                 claimant's own winning lease."
+                 — an earlier claim (host={earliest_host} sweep={earliest_sweep_id}) already owns \
+                 it: either a lease comment with an earlier forge-assigned order (#6287 \
+                 claim-then-verify-order tie-break, Epic #6165 Phase 2) or a young leaseless \
+                 `loom:building` (#9453 Phase 3.1). Standing down before spawning a builder; the \
+                 label is left in place since it already protects the winning claimant's claim."
             );
             self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
             let _ = self.release_lock_owned(issue_number, &sweep_id);

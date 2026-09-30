@@ -110,6 +110,7 @@ pub(super) fn run_role_with_timeout(
     };
 
     let mut cmd = Command::new(script);
+    cmd.env(crate::provenance::origin::ENV, "autonomous");
     cmd.arg("-p").arg(prompt);
     // Model pin (issue #4501): appended immediately after the prompt, exactly as
     // `sweep_registry::spawn_child` does, so a role child never inherits the

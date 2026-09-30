@@ -10,7 +10,7 @@
 //! stage grids, then the stage marks, and names what it dropped in
 //! `truncated`.
 
-use super::{AgeSource, Kind, NoEstimateReason, Provenance, Stage, Subject};
+use super::{AgeSource, DispatchInput, Kind, NoEstimateReason, Provenance, Stage, Subject};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -145,6 +145,24 @@ pub struct PathRecord {
     pub merge_share: Option<f64>,
     /// How many successful sweeps `merge_share` is over.
     pub merge_share_n: Option<usize>,
+    /// A `ready_wait` start only (#9326): the dispatch-plan inputs and the
+    /// queue wait they imply. Absent on every other path, so explanations of
+    /// started items are byte-identical to pre-#9326 ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<DispatchRecord>,
+}
+
+/// How a ready item's queue wait is simulated (#9326): `turnovers` draws
+/// from the `ready_wait` (slot-turnover) grid, plus `admission_delay_sec`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DispatchRecord {
+    /// The plan inputs, as the tracker read them.
+    #[serde(flatten)]
+    pub input: DispatchInput,
+    /// Slot turnovers still needed ([`DispatchInput::turnovers`]).
+    pub turnovers: u32,
+    /// Fixed admission delay ([`DispatchInput::admission_delay_sec`]).
+    pub admission_delay_sec: i64,
 }
 
 /// One stage on the path.
@@ -167,6 +185,11 @@ pub struct StageEntry {
 pub struct Distribution {
     /// Samples it was built from.
     pub n: usize,
+    /// Right-censored samples the Kaplan–Meier grid used on top of `n`
+    /// (#9328). Absent — and the grid is the plain nearest-rank one — for
+    /// every heuristic that ignores censoring, which is every v1 heuristic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub censored_n: Option<usize>,
     /// Which samples were used.
     pub filters: Filters,
     /// `[0, 5, …, 100]`. Empty only when truncated.

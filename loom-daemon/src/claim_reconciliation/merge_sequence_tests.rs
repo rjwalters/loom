@@ -247,7 +247,7 @@ fn release_decisions_follow_the_evaluation_contract() {
     // Landed at recorded head ⇒ release; dissolved ⇒ release; unknown ⇒ hold.
     let m = marker_after(5, Some("pass"));
     assert_eq!(
-        hold_action(&m, Some(&pred_open_at_head(&m.pred_head)), true, 72.0),
+        hold_action(&m, Some(&pred_open_at_head(&m.pred_head)), live(&m), true, 72.0),
         HoldAction::HoldSoft
     );
     let landed = PredecessorState {
@@ -256,25 +256,81 @@ fn release_decisions_follow_the_evaluation_contract() {
         head_sha: Some(m.pred_head.clone()),
         updated_at: None,
     };
-    assert_eq!(hold_action(&m, Some(&landed), true, 72.0), HoldAction::Release);
+    assert_eq!(hold_action(&m, Some(&landed), live(&m), true, 72.0), HoldAction::Release);
     let dissolved = PredecessorState {
         merged: false,
         open: false,
         head_sha: Some(m.pred_head.clone()),
         updated_at: None,
     };
-    assert_eq!(hold_action(&m, Some(&dissolved), true, 72.0), HoldAction::ReleaseDissolved);
+    assert_eq!(
+        hold_action(&m, Some(&dissolved), live(&m), true, 72.0),
+        HoldAction::ReleaseDissolved
+    );
     // Unreadable predecessor ⇒ fail closed (hold), never release.
-    assert_eq!(hold_action(&m, None, true, 72.0), HoldAction::HoldSoft);
+    assert_eq!(hold_action(&m, None, live(&m), true, 72.0), HoldAction::HoldSoft);
     let hard = marker_after(5, None);
-    assert_eq!(hold_action(&hard, None, true, 72.0), HoldAction::HoldHard);
+    assert_eq!(hold_action(&hard, None, live(&hard), true, 72.0), HoldAction::HoldHard);
+}
+
+/// The follower's live head when it has NOT moved since the marker.
+fn live(m: &SequenceMarker) -> Option<&str> {
+    Some(m.follower_head.as_str())
+}
+
+#[test]
+fn a_moved_follower_head_voids_the_hold_for_replanning() {
+    // The follower received new commits (or a force-push) while held: the
+    // marker no longer describes THIS tree, so the hold is void whatever the
+    // predecessor is doing — in flight, landed, or unreadable.
+    let moved = format!("{:040x}", 424242);
+    let soft = marker_after(5, Some("pass"));
+    let hard = marker_after(5, None);
+    let in_flight = pred_open_at_head(&soft.pred_head);
+    assert_eq!(
+        hold_action(&soft, Some(&in_flight), Some(&moved), true, 72.0),
+        HoldAction::VoidAndReplan
+    );
+    assert_eq!(
+        hold_action(&hard, Some(&in_flight), Some(&moved), true, 72.0),
+        HoldAction::VoidAndReplan
+    );
+    let landed = PredecessorState {
+        merged: true,
+        open: false,
+        head_sha: Some(soft.pred_head.clone()),
+        updated_at: None,
+    };
+    assert_eq!(
+        hold_action(&soft, Some(&landed), Some(&moved), true, 72.0),
+        HoldAction::VoidAndReplan,
+        "a landed predecessor must not release a hold pinned to an older follower tree"
+    );
+    assert_eq!(hold_action(&soft, None, Some(&moved), true, 72.0), HoldAction::VoidAndReplan);
+}
+
+#[test]
+fn an_unknown_follower_head_fails_closed() {
+    // No live head in the listing ⇒ nothing proves the pin is stale or
+    // current: hold, never release or void.
+    let soft = marker_after(5, Some("pass"));
+    let hard = marker_after(5, None);
+    let landed = PredecessorState {
+        merged: true,
+        open: false,
+        head_sha: Some(soft.pred_head.clone()),
+        updated_at: None,
+    };
+    assert_eq!(hold_action(&soft, Some(&landed), None, true, 72.0), HoldAction::HoldSoft);
+    assert_eq!(hold_action(&soft, Some(&landed), Some(""), true, 72.0), HoldAction::HoldSoft);
+    assert_eq!(hold_action(&hard, Some(&landed), None, true, 72.0), HoldAction::HoldHard);
 }
 
 #[test]
 fn a_moved_predecessor_head_voids_the_hold_for_replanning() {
     let m = marker_after(5, Some("pass"));
     let moved = pred_open_at_head(&format!("{:040x}", 12345));
-    assert_eq!(hold_action(&m, Some(&moved), true, 72.0), HoldAction::VoidAndReplan);
+    assert_eq!(hold_action(&m, Some(&moved), live(&m), true, 72.0), HoldAction::VoidAndReplan);
 }
 
 #[test]
@@ -288,20 +344,26 @@ fn only_soft_holds_on_approved_followers_expire() {
     let soft = marker_after(5, Some("pass"));
     let hard = marker_after(5, None);
     // Soft + approved + quiet past the bound ⇒ expire.
-    assert_eq!(hold_action(&soft, Some(&quiet), true, 72.0), HoldAction::Expire);
+    assert_eq!(hold_action(&soft, Some(&quiet), live(&soft), true, 72.0), HoldAction::Expire);
     // Soft but NOT approved ⇒ hold (nothing mergeable is starved).
-    assert_eq!(hold_action(&soft, Some(&quiet), false, 72.0), HoldAction::HoldSoft);
+    assert_eq!(hold_action(&soft, Some(&quiet), live(&soft), false, 72.0), HoldAction::HoldSoft);
     // Hard + approved + quiet ⇒ hold (a semantic dependency never expires
     // into merge permission — the #9063 non-negotiable).
-    assert_eq!(hold_action(&hard, Some(&quiet), true, 72.0), HoldAction::HoldHard);
+    assert_eq!(hold_action(&hard, Some(&quiet), live(&hard), true, 72.0), HoldAction::HoldHard);
     // Soft + approved + quiet but within the bound ⇒ hold.
-    assert_eq!(hold_action(&soft, Some(&quiet), true, f64::INFINITY), HoldAction::HoldSoft);
+    assert_eq!(
+        hold_action(&soft, Some(&quiet), live(&soft), true, f64::INFINITY),
+        HoldAction::HoldSoft
+    );
     // Predecessor with unknown freshness ⇒ hold.
     let freshless = PredecessorState {
         updated_at: None,
         ..quiet.clone()
     };
-    assert_eq!(hold_action(&soft, Some(&freshless), true, 72.0), HoldAction::HoldSoft);
+    assert_eq!(
+        hold_action(&soft, Some(&freshless), live(&soft), true, 72.0),
+        HoldAction::HoldSoft
+    );
 }
 
 // --- Deferral -----------------------------------------------------------
@@ -309,9 +371,13 @@ fn only_soft_holds_on_approved_followers_expire() {
 #[test]
 fn deferral_applies_only_to_clean_in_flight_ordering() {
     let m = marker_after(5, Some("pass"));
-    assert!(defer_base_repair(&m, &pred_open_at_head(&m.pred_head)));
+    assert!(defer_base_repair(&m, &pred_open_at_head(&m.pred_head), &m.follower_head));
     // Moved head ⇒ replan territory: flag the conflict, don't hide it.
-    assert!(!defer_base_repair(&m, &pred_open_at_head(&format!("{:040x}", 777))));
+    assert!(!defer_base_repair(
+        &m,
+        &pred_open_at_head(&format!("{:040x}", 777)),
+        &m.follower_head
+    ));
     // Landed ⇒ flag: the follower must now be repaired against the new base.
     let landed = PredecessorState {
         merged: true,
@@ -319,7 +385,7 @@ fn deferral_applies_only_to_clean_in_flight_ordering() {
         head_sha: Some(m.pred_head.clone()),
         updated_at: None,
     };
-    assert!(!defer_base_repair(&m, &landed));
+    assert!(!defer_base_repair(&m, &landed, &m.follower_head));
     // Dissolved ⇒ flag.
     let dissolved = PredecessorState {
         merged: false,
@@ -327,7 +393,18 @@ fn deferral_applies_only_to_clean_in_flight_ordering() {
         head_sha: Some(m.pred_head.clone()),
         updated_at: None,
     };
-    assert!(!defer_base_repair(&m, &dissolved));
+    assert!(!defer_base_repair(&m, &dissolved, &m.follower_head));
+}
+
+#[test]
+fn a_moved_follower_head_never_defers_a_repair() {
+    // The review-conflict pass found the follower conflicting at its LIVE
+    // head; a marker pinned to an older follower tree must not defer that
+    // repair even though the predecessor is still in flight at its pin.
+    let m = marker_after(5, Some("pass"));
+    let in_flight = pred_open_at_head(&m.pred_head);
+    assert!(defer_base_repair(&m, &in_flight, &m.follower_head));
+    assert!(!defer_base_repair(&m, &in_flight, &format!("{:040x}", 424242)));
 }
 
 // --- Rendered comments --------------------------------------------------
@@ -356,4 +433,129 @@ fn plan_report_counts_groups_without_writing() {
     assert!(r.groups.is_empty());
     assert_eq!(r.already_planned, 0);
     assert_eq!(r.holders, 0);
+    assert_eq!(r.skipped_held, 0);
+}
+
+// --- Judge-requested coverage (re-review of #9707) ----------------------
+
+#[test]
+fn a_three_node_cycle_skips_the_component() {
+    // 1→2→3→1 via manual markers. Kahn's detection is general; this pins
+    // that a cycle longer than the trivial 2-cycle is also skipped whole.
+    let prs = [
+        pr(1, "2026-01-01T00:00:00Z"),
+        pr(2, "2026-01-02T00:00:00Z"),
+        pr(3, "2026-01-03T00:00:00Z"),
+    ];
+    let f = files(&[(1, &["s.rs"]), (2, &["s.rs"]), (3, &["s.rs"])]);
+    let mut markers = NO_MARKERS;
+    for (follower, after) in [(1, 2), (2, 3), (3, 1)] {
+        markers.insert(
+            follower,
+            SequenceMarker {
+                after,
+                pred_head: format!("{:040x}", after),
+                follower_head: format!("{:040x}", follower),
+                plan: "manual".into(),
+                source: None,
+            },
+        );
+    }
+    assert!(plan_repo(&prs, &f, &markers).is_empty(), "3-cycle ⇒ no plan");
+}
+
+#[test]
+fn a_diamond_orders_both_paths_without_dropping_a_member() {
+    // 4 depends on 2 AND 3; both depend on 1. Every member placed exactly
+    // once, 4 last, 1 first — the two middle members in age order.
+    let prs = [
+        pr(1, "2026-01-01T00:00:00Z"),
+        pr(2, "2026-01-02T00:00:00Z"),
+        pr(3, "2026-01-03T00:00:00Z"),
+        pr(4, "2026-01-04T00:00:00Z"),
+    ];
+    let f = files(&[
+        (1, &["s.rs"]),
+        (2, &["s.rs"]),
+        (3, &["s.rs"]),
+        (4, &["s.rs"]),
+    ]);
+    let mut markers = NO_MARKERS;
+    for (follower, after) in [(2, 1), (3, 1), (4, 2), (4, 3)] {
+        markers.insert(
+            follower,
+            SequenceMarker {
+                after,
+                pred_head: format!("{:040x}", after),
+                follower_head: format!("{:040x}", follower),
+                plan: "manual".into(),
+                source: None,
+            },
+        );
+    }
+    let groups = plan_repo(&prs, &f, &markers);
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    let g = &groups[0];
+    assert_eq!(g.order.first(), Some(&1));
+    assert_eq!(g.order.last(), Some(&4));
+    assert_eq!(g.order.len(), 4, "every member placed: {:?}", g.order);
+    // Edges are a CHAIN over the placed order (4 has one predecessor, not two).
+    assert_eq!(g.edges.len(), 3);
+}
+
+#[test]
+fn a_follower_marker_disagreeing_with_age_order_wins() {
+    // Without the marker, ages put #2 before #1. The trusted marker says
+    // #2 lands AFTER #1 — the constraint beats the age default.
+    let prs = [pr(1, "2026-01-02T00:00:00Z"), pr(2, "2026-01-01T00:00:00Z")];
+    let third = pr(3, "2026-01-03T00:00:00Z");
+    let prs = [prs[0].clone(), prs[1].clone(), third];
+    let f = files(&[(1, &["s.rs"]), (2, &["s.rs"]), (3, &["other.rs"])]);
+    let mut markers = NO_MARKERS;
+    markers.insert(
+        2,
+        SequenceMarker {
+            after: 1,
+            pred_head: format!("{:040x}", 1),
+            follower_head: format!("{:040x}", 2),
+            plan: "manual".into(),
+            source: None,
+        },
+    );
+    let groups = plan_repo(&prs, &f, &markers);
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    assert_eq!(groups[0].order, vec![1, 2], "the marker overrides age order");
+}
+
+#[test]
+fn a_new_pr_chains_behind_a_held_predecessor() {
+    // The Phase-2 membership fix (Judge re-review of #9707): #1 is already
+    // held (loom:sequenced with a plan marker), #2 arrives later touching
+    // the same files. #2 must be planned AFTER #1 — the hold's existence
+    // must not make the overlap invisible for the life of the hold.
+    let mut held = pr(1, "2026-01-01T00:00:00Z");
+    held.labels.push(SEQUENCE_LABEL.to_string());
+    let fresh = pr(2, "2026-01-05T00:00:00Z");
+    let prs = [held.clone(), fresh, pr(3, "2026-01-03T00:00:00Z")];
+    let f = files(&[(1, &["s.rs"]), (2, &["s.rs"]), (3, &["other.rs"])]);
+    let mut markers = NO_MARKERS;
+    markers.insert(
+        1,
+        SequenceMarker {
+            after: 99,
+            pred_head: format!("{:040x}", 99),
+            follower_head: format!("{:040x}", 1),
+            plan: "seq-old".into(),
+            source: Some("pass".into()),
+        },
+    );
+    let groups = plan_repo(&prs, &f, &markers);
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    let g = &groups[0];
+    // The held #1 participates in the order (its marker points out-of-group,
+    // which order_component ignores; it is still a group member and lands
+    // first by age), and the fresh #2 is planned after it.
+    assert_eq!(g.order, vec![1, 2], "{g:?}");
+    assert_eq!(g.edges.len(), 1);
+    assert_eq!((g.edges[0].follower, g.edges[0].after), (2, 1));
 }

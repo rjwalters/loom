@@ -219,6 +219,53 @@ docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compo
 Verified against a local `clickhouse-local` with a mock `samples_v4` /
 `time_series_v4` shape, not yet against a live SigNoz.
 
+### Measured usage queries
+
+`usage-queries.sql` (#8528) is the SigNoz half of ClickStack's "Loom measured
+usage" view: what a run's tokens and dollars actually were, from the
+`loom.runtime.usage` spans (#8908, #9204, #9303) rather than from the token
+gauges. **The two are different questions and must not be mixed** — a
+`loom.tokens.usage_fraction` gauge says how much of a subscription's weekly
+window is left (`quota-utilization.sql`), and a pool percentage never becomes
+dollars. Section 0 is the arrival preflight; sections 1–6 are the views in the
+table below. Bind all three parameters once:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery --param_since='2026-09-01 00:00:00' --param_repo='' --param_top=50 < usage-queries.sql
+```
+
+Five properties of this family make it easy to query wrongly, each returning a
+plausible number instead of an error. The file's header states them and
+`loom-daemon/tests/signoz_usage_queries.rs` **demonstrates** each one by
+executing the committed SQL verbatim against the same pinned ClickHouse
+(25.12.5) the telemetry store runs:
+
+- **Every span attribute is a string.** The trace mapper renders the whole
+  attribute map with `kv_string`, so the token counts and the USD estimate land
+  in `attributes_string` — unlike the CI *log* records, where `loom.ci.run_id`
+  genuinely is an int in `attributes_number`. The test's negative control reads
+  a counter from `attributes_number` and observes the failure mode: 0 on every
+  row, no error.
+- **Scope is not additive.** A daemon-dispatched sweep can carry both an
+  `execution` span and `attempt` spans whose counters overlap; total from
+  `execution` when present, else from `attempt`, never both.
+- **An unpriced model carries no cost attributes at all**, so `sum()` skips it
+  and a spend total is a lower bound. Every section that sums dollars reports
+  `unpriced_spans` beside it, and section 4 names the models.
+- **Absence is not zero.** A unit whose usage could not be determined has no
+  usage span; one measured at nothing has a span whose counter is `"0"`.
+- **`loom.repo` is not on the usage span** (no caller puts it there, and it is
+  not a resource attribute either), so repo attribution is a join across the
+  trace.
+
+`signoz_trial_artifacts.rs` additionally fails in ordinary CI if any counter,
+cost, pricing or scope key drifts from `counter_attributes()` /
+`Pricing::attributes()`, if a span name drifts from `SpanName`, or if any key is
+read from a container other than `attributes_string`.
+
+Executed against the pinned ClickHouse with a synthetic fixture, not yet against
+a live SigNoz over real canary data.
+
 ### CI retro queries
 
 `ci-queries.sql` is the standing build/CI retro (#8826): numbered sections over
@@ -259,6 +306,10 @@ return 0 on every row instead of erroring. Policy and pipeline:
 | Correlated logs | Logs Explorer: exact trace ID and span ID; follow the trace link and inspect related logs from the selected span (`fixture-queries.sql` 6) |
 | Host/token gauges | Metrics Explorer: the actual emitted names and units — the shared fixture emits `loom.tokens.usage_fraction` and `loom.tokens.exhausted` only, labelled by `account`. An absent series is not a measured zero: the fixture's `synthetic-unknown` account intentionally has no `usage_fraction` point while `synthetic-zero` has `0.0` (`fixture-queries.sql` 7) |
 | Subscription quota utilization | Dashboards → New dashboard `Loom quota` → Time series panel. Metric `loom.tokens.usage_fraction` (5-hour window) and a second query on `loom.tokens.usage_fraction_weekly` (rolling 7-day window, #9005), aggregation **Max**, group by `provider`, `account`; time range 7 days. Providers with no utilization source (Codex, OpenCode/Z.ai, Kimi) have no series at all — a gap, never a `0`. Last week's used fraction per provider and the idle headroom thrown away at each weekly reset need window functions, so they live in SQL only (`quota-utilization.sql` 1–3) |
+| Loom measured usage | Trace Explorer: filter `name = 'loom.runtime.usage'`, group by `loom.model` with **Sum** over the token counters, and separately by `loom.role` / `loom.runtime`. The UI reads these attributes as STRINGS (they are exported as strings, like every span attribute), so a numeric aggregation of them belongs in SQL — and the scope resolution a correct total needs cannot be expressed as an Explorer filter at all. Treat the panel as a browsing surface and the SQL as the figures (`usage-queries.sql` 1 and 2) |
+| Usage coverage | Trace Explorer: filter `name = 'loom.role_attempt'` and compare against the usage spans beneath each. An attempt with **no** `loom.runtime.usage` child has usage UNKNOWN; one whose child reports `loom.tokens.total = '0'` is a measured zero. Never impute one from the other — the split is SQL-only (`usage-queries.sql` 3) |
+| Unpriced models and rate-card provenance | Trace Explorer: filter `name = 'loom.runtime.usage'` and add `loom.cost.usd_estimate`, `loom.pricing.source`, `loom.pricing.verified_on` as columns. A blank estimate is a model the rate card does not know, never a $0 model: it must be excluded from spend explicitly, and fixing it is a rate-card change, not a query change. Two `verified_on` values in one window mean the fleet rolled a card mid-window (`usage-queries.sql` 4 and 5) |
+| Cache composition | Trace Explorer: filter `name = 'loom.runtime.usage'` and add `loom.tokens.input`, `loom.tokens.cache_read`, `loom.tokens.cache_write_5m`, `loom.tokens.cache_write_1h`. The four are DISJOINT — `input` is uncached input, so input-side total is their sum — and the two cache-write horizons stay apart because they are priced differently (`usage-queries.sql` 6) |
 | Delivery health | Scrape the neutral gateway's own Prometheus endpoint (`config.yaml` publishes `detailed` telemetry on port 8888) and read `otelcol_exporter_*` series filtered to `exporter="otlp_http/signoz"` — queue size, sent, send-failed and enqueue-failed. These series are **not** exported into SigNoz through the OTLP pipeline, so they are unavailable in the UI and must be captured beside it. Backend readiness is not delivery evidence |
 | In-progress sweep | Compare partial child spans before the root completes, then query again after completion; do not infer success from a missing root/end span (`fixture-queries.sql` 5, which lists every trace with children but no `loom.sweep` root) |
 | CI duration trend | Dashboards → New dashboard `Loom CI` → Time series panel. Metric `loom.ci.job.duration_ms`, aggregation **P50**, a second query on the same metric with **P95** and a third with **Max**; group by `repo`, `workflow`, `job`; optional filter `repo = '<owner/name>'`; time range 30 days. UI percentiles interpolate within the histogram's 1s…6h bucket bounds; the SQL is exact (`ci-queries.sql` 1) |
