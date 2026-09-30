@@ -143,3 +143,60 @@ fn a_long_gap_is_capped_and_a_missing_reading_emits_no_gauge() {
     );
     assert_eq!(next, None, "no occupancy reading, no gauge and no new hold");
 }
+
+// ---- slot turnover, the ETA `ready_wait` samples (#9326) ----
+
+fn dispatched_id(sweep_id: &str) -> Event {
+    Event::SweepGlobalDispatch {
+        story_points: None,
+        sweep_id: sweep_id.into(),
+        kind: SweepKind::Issue(1),
+        runtime: None,
+        runtime_source: None,
+        repo: None,
+    }
+}
+
+#[test]
+fn turnover_samples_the_interval_between_freeings_while_busy() {
+    use super::{Turnover, TurnoverLedger};
+    let mut ledger = TurnoverLedger::default();
+    for id in ["sweep-issue-1-1", "sweep-issue-2-1", "sweep-issue-3-1"] {
+        assert_eq!(ledger.observe(&dispatched_id(id), at(0)), None);
+    }
+    // The first freeing has no predecessor: no sample.
+    assert_eq!(ledger.observe(&completed("sweep-issue-1-1"), at(100)), None);
+    // Two still running across the interval: a sample.
+    assert_eq!(
+        ledger.observe(&completed("sweep-issue-2-1"), at(400)),
+        Some(Turnover {
+            from: at(100),
+            to: at(400),
+            running_at_start: 2
+        })
+    );
+    assert_eq!(
+        ledger
+            .observe(&completed("sweep-issue-3-1"), at(1000))
+            .map(|t| t.seconds()),
+        Some(600)
+    );
+    // The pool went idle after that freeing: the next interval spans a gap
+    // with no work, so it is not a turnover.
+    ledger.observe(&dispatched_id("sweep-issue-4-1"), at(5000));
+    assert_eq!(ledger.observe(&completed("sweep-issue-4-1"), at(5600)), None);
+}
+
+#[test]
+fn turnover_ignores_non_issue_sweeps_and_unknown_running_sets() {
+    use super::TurnoverLedger;
+    let mut ledger = TurnoverLedger::default();
+    // A restart: completions of sweeps it never saw dispatched leave the
+    // running set empty, so no interval is trusted.
+    assert_eq!(ledger.observe(&completed("sweep-issue-7-1"), at(0)), None);
+    assert_eq!(ledger.observe(&completed("sweep-issue-8-1"), at(50)), None);
+    // PR-set sweeps occupy no work-finder slot.
+    ledger.observe(&dispatched(SweepKind::PrSet(vec![1])), at(60));
+    assert_eq!(ledger.observe(&completed("sweep-prs-1-1"), at(70)), None);
+    assert_eq!(ledger.observe(&completed("sweep-issue-9-1"), at(80)), None);
+}

@@ -5,7 +5,7 @@
 //! | `enabled` | `LOOM_ETA_ENABLED` | `true` (operator decision on #9289) |
 //! | `dryRun` | `LOOM_ETA_DRY_RUN` | `false`: compute and log, enqueue nothing |
 //! | `refreshSecs` | `LOOM_ETA_REFRESH_SECS` | `300` |
-//! | `current.finish` / `current.land` | — | `finish-v1` / `land-v1` |
+//! | `current.start` / `current.finish` / `current.land` | — | `start-v1` / `finish-v1` / `land-v1` |
 
 use super::Kind;
 use std::path::Path;
@@ -25,6 +25,8 @@ pub struct EtaConfig {
     pub dry_run: bool,
     /// Refresh an unchanged estimate after this many seconds.
     pub refresh_secs: u64,
+    /// Configured `current` heuristic for `start`.
+    pub current_start: Option<String>,
     /// Configured `current` heuristic for `finish`.
     pub current_finish: Option<String>,
     /// Configured `current` heuristic for `land`.
@@ -37,6 +39,7 @@ impl Default for EtaConfig {
             enabled: true,
             dry_run: false,
             refresh_secs: DEFAULT_REFRESH_SECS,
+            current_start: None,
             current_finish: None,
             current_land: None,
         }
@@ -48,6 +51,7 @@ impl EtaConfig {
     #[must_use]
     pub fn current(&self, kind: Kind) -> Option<&str> {
         match kind {
+            Kind::Start => self.current_start.as_deref(),
             Kind::Finish => self.current_finish.as_deref(),
             Kind::Land => self.current_land.as_deref(),
         }
@@ -84,6 +88,7 @@ pub fn resolve(config: &serde_json::Value, env: impl Fn(&str) -> Option<String>)
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     };
+    resolved.current_start = id("start");
     resolved.current_finish = id("finish");
     resolved.current_land = id("land");
 

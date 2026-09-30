@@ -1,19 +1,23 @@
-//! The shipped heuristics. `finish-v1` and `land-v1` share one engine
-//! ([`estimate_path`]); they differ in which history they read and where the
-//! path ends. Their ids are immutable: a behaviour change is a new id.
+//! The shipped heuristics. `start-v1`, `finish-v1` and `land-v1` share one
+//! engine ([`estimate_path`]); they differ in which history they read and
+//! where the path ends. Their ids are immutable: a behaviour change is a new
+//! id.
 
 mod finish_v1;
 mod land_v1;
+mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
 pub use land_v1::{LandV1, LAND_V1};
+pub use start_v1::{StartV1, START_V1};
 
 use super::explanation::{
-    Branches, ChangesRequested, Combination, Conditioning, CurrentStageRecord, Distribution,
-    EstimateResult, Explanation, Filters, HistoryRecord, HistoryWindow, PathRecord, StageEntry,
+    Branches, ChangesRequested, Combination, Conditioning, CurrentStageRecord, DispatchRecord,
+    Distribution, EstimateResult, Explanation, Filters, HistoryRecord, HistoryWindow, PathRecord,
+    StageEntry,
 };
 use super::history::{window_from, Level, SampleSource, StageSamples};
-use super::simulate::{may_reject, reachable, run, spec_from_explanation};
+use super::simulate::{may_reject, reachable_path, run, spec_from_explanation};
 use super::{
     estimate_id, grid, round3, seed_for, CurrentState, EstimateInput, Kind, NoEstimateReason,
     Stage, DRAWS, EXPLANATION_SCHEMA, MAX_REWORK_ROUNDS, MIN_COND, MIN_SAMPLES,
@@ -91,6 +95,21 @@ pub(crate) fn estimate_path(
         CurrentState::At(current) => current,
     };
     let start = current.stage;
+    // `start` exists only for a ready item, and a ready item has no running
+    // sweep to `finish`. A ready item with no plan position has no estimate.
+    let ready = start == Stage::ReadyWait;
+    if (rules.kind == Kind::Start && !ready) || (rules.kind == Kind::Finish && ready) {
+        return refuse(explanation, NoEstimateReason::UnknownStage);
+    }
+    let dispatch = match (&input.dispatch, ready) {
+        (Some(d), true) => Some(DispatchRecord {
+            input: d.clone(),
+            turnovers: d.turnovers(),
+            admission_delay_sec: d.admission_delay_sec(),
+        }),
+        (None, true) => return refuse(explanation, NoEstimateReason::NoDispatchPlan),
+        (_, false) => None,
+    };
     // An item in `doctor` has taken at least one rejection, whatever the
     // resolver counted: `doctor` is entered only through one.
     let rework_rounds = if start == Stage::Doctor {
@@ -126,6 +145,19 @@ pub(crate) fn estimate_path(
             .collect(),
     });
 
+    // `start` ends at dispatch: no merge share and no verdict to model.
+    if rules.kind == Kind::Start {
+        explanation.path = Some(PathRecord {
+            start,
+            include_merge: false,
+            terminal: Stage::ReadyWait,
+            merge_share: None,
+            merge_share_n: None,
+            dispatch,
+        });
+        return finish_estimate(explanation, rules, input, history, false, Vec::new());
+    }
+
     // Where an approved path ends.
     let (include_merge, merge_share) = if rules.always_merge || start == Stage::MergeWait {
         (true, None)
@@ -145,6 +177,7 @@ pub(crate) fn estimate_path(
         },
         merge_share: merge_share.map(|(s, _)| s),
         merge_share_n: merge_share.map(|(_, n)| n),
+        dispatch,
     });
 
     // The Judge branch, when the path still reaches a verdict.
@@ -226,8 +259,9 @@ fn finish_estimate(
         .as_ref()
         .map_or(current.rework_rounds, |c| c.rework_rounds);
     let rejectable = may_reject(&p_by_attempt, rework_rounds, MAX_REWORK_ROUNDS);
+    let stop_at_dispatch = rules.kind == Kind::Start;
 
-    for stage in reachable(start, include_merge, rejectable) {
+    for stage in reachable_path(start, include_merge, rejectable, stop_at_dispatch) {
         let Some(selection) = history.select(repo, stage, as_of, rules.sources) else {
             return refuse(explanation, NoEstimateReason::InsufficientSamples);
         };
@@ -241,7 +275,8 @@ fn finish_estimate(
         }
         let sorted = &selection.sorted;
         let grid_sec = grid::grid_of(sorted);
-        let conditioning = if stage == start && age > 0 {
+        // A queue wait is never age-conditioned (see `simulate`).
+        let conditioning = if stage == start && age > 0 && stage != Stage::ReadyWait {
             let n_above = sorted.iter().filter(|&&d| d > age).count();
             let f_age = round6(grid::cdf(&grid_sec, age));
             let record = Conditioning {
@@ -283,7 +318,12 @@ fn finish_estimate(
         draws: DRAWS,
         seed: format!("0x{seed:016x}"),
         rng: "splitmix64".to_string(),
-        draw_order: "per path: one uniform per stage visited; after each review_wait below the cap, one uniform for its verdict (u < p = rejected)".to_string(),
+        draw_order: if start == Stage::ReadyWait {
+            "per path: one uniform per ready_wait turnover (path.dispatch.turnovers), plus path.dispatch.admission_delay_sec; then one uniform per stage visited; after each review_wait below the cap, one uniform for its verdict (u < p = rejected)"
+        } else {
+            "per path: one uniform per stage visited; after each review_wait below the cap, one uniform for its verdict (u < p = rejected)"
+        }
+        .to_string(),
         independence_assumed: true,
     });
 

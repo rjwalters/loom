@@ -12,6 +12,17 @@
 //! slot freeing to the dispatch. The samples are exported as the delta pair
 //! `loom.dispatch.slot_turnaround` / `.samples`, so the mean is their ratio.
 //!
+//! # Slot turnover: the ETA `ready_wait` samples (#9326)
+//!
+//! [`TurnoverLedger`] is the sibling the ETA tracker feeds from the same two
+//! events: the interval between two consecutive issue-sweep slots **freeing**
+//! — how often a slot opens for the next ready issue. An interval counts only
+//! when at least one issue sweep this ledger saw dispatched was running from
+//! its start to its end; one spanning an idle pool (or a restart, when the
+//! running set is unknown) produces no sample rather than a gap full of "no
+//! work". Each sample is journaled as an `eta-stage-samples.jsonl` row
+//! (`stage: ready_wait`), which is what `start-v1` reads.
+//!
 //! Turnaround includes time when there was simply no work. The
 //! "idle while work waited" half is [`idle_points`], below. A slot freed
 //! before the daemon started is never seen, so the first dispatches after a
@@ -28,7 +39,7 @@
 //! `loom.pool.exhausted_seconds`). Gaps longer than [`MAX_HOLD_SECS`] (a
 //! stopped or suspended daemon) are capped, not credited in full.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
@@ -85,6 +96,76 @@ impl SlotLedger {
     #[must_use]
     pub fn pending(&self) -> usize {
         self.freed.len()
+    }
+}
+
+/// One slot-turnover interval (#9326).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Turnover {
+    /// The earlier slot freeing.
+    pub from: DateTime<Utc>,
+    /// This one.
+    pub to: DateTime<Utc>,
+    /// Issue sweeps this ledger knew to be running when the interval began.
+    pub running_at_start: usize,
+}
+
+impl Turnover {
+    /// Whole seconds, never negative.
+    #[must_use]
+    pub fn seconds(&self) -> i64 {
+        (self.to - self.from).num_seconds().max(0)
+    }
+}
+
+/// Consecutive issue-sweep slot freeings, and whether the pool stayed busy
+/// in between (see the module docs).
+#[derive(Debug, Default)]
+pub struct TurnoverLedger {
+    running: BTreeSet<String>,
+    /// The last freeing, and how many sweeps were running right after it.
+    last_freed: Option<(DateTime<Utc>, usize)>,
+    /// The running set has not been empty since `last_freed`.
+    busy_since: bool,
+}
+
+impl TurnoverLedger {
+    /// Apply one bus event observed at `now`. Returns the interval when the
+    /// event freed a slot and the pool stayed busy since the previous one.
+    pub fn observe(&mut self, event: &Event, now: DateTime<Utc>) -> Option<Turnover> {
+        match event {
+            Event::SweepGlobalDispatch {
+                sweep_id,
+                kind: SweepKind::Issue(_),
+                ..
+            } => {
+                if self.running.len() >= MAX_FREED {
+                    // Bound memory if completions stop arriving; forgetting
+                    // the set only ever suppresses samples.
+                    self.running.clear();
+                    self.busy_since = false;
+                }
+                self.running.insert(sweep_id.clone());
+                None
+            }
+            Event::SweepGlobalCompleted { sweep_id, .. } if is_issue_sweep(sweep_id) => {
+                self.running.remove(sweep_id);
+                let sample = match self.last_freed {
+                    Some((from, running_at_start)) if self.busy_since && running_at_start > 0 => {
+                        Some(Turnover {
+                            from,
+                            to: now,
+                            running_at_start,
+                        })
+                    }
+                    _ => None,
+                };
+                self.last_freed = Some((now, self.running.len()));
+                self.busy_since = !self.running.is_empty();
+                sample
+            }
+            _ => None,
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 //! ETA as a Loom primitive (#9289): versioned, explainable estimates of when an
-//! issue's sweep finishes (`finish`) and when its work lands (`land`).
+//! issue's sweep starts (`start`), finishes (`finish`) and when its work lands
+//! (`land`).
 //!
 //! # The model
 //!
@@ -7,9 +8,16 @@
 //! the stage it is in now, with one branch at every Judge verdict:
 //!
 //! ```text
-//! sweep.curator → sweep.builder → review_wait ─┬─ approved ──→ merge_wait → landed
+//! ready_wait → sweep.curator → sweep.builder → review_wait ─┬─ approved ──→ merge_wait → landed
 //!                                              └─ changes_requested → doctor ─┘ (loop, capped)
 //! ```
+//!
+//! `ready_wait` (#9326) is the stage a ready (`loom:issue`) issue spends
+//! waiting for a dispatch slot. Its distribution is the host's empirical
+//! **slot turnover** — the interval between two issue-sweep slots freeing —
+//! and a ready item visits it once per turnover it still needs, from its
+//! `dispatch_plan` position ([`DispatchInput`]). `start` ends at dispatch;
+//! `land` for an unstarted issue prepends it to the post-dispatch chain.
 //!
 //! Each stage is summarised per `(repo, stage)` as a 21-point nearest-rank
 //! quantile grid of observed durations ([`grid`]), with a host-wide fallback
@@ -44,7 +52,7 @@
 //!
 //! # Versioning
 //!
-//! A heuristic id (`finish-v1`, `land-v1`) is immutable once shipped: a
+//! A heuristic id (`start-v1`, `finish-v1`, `land-v1`) is immutable once shipped: a
 //! golden test pins each id's output over a fixed fixture. A behaviour change
 //! is a new id, registered next to the old one ([`Registry`]).
 
@@ -102,6 +110,8 @@ pub const MAX_REWORK_ROUNDS: u32 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
+    /// A ready issue's sweep is dispatched (#9326).
+    Start,
     /// The running sweep reaches a terminal state.
     Finish,
     /// The issue's PR merges, or the issue closes as completed.
@@ -113,6 +123,7 @@ impl Kind {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Kind::Start => "start",
             Kind::Finish => "finish",
             Kind::Land => "land",
         }
@@ -143,11 +154,31 @@ pub enum Stage {
     /// Approved (`loom:pr`), waiting to merge.
     #[serde(rename = "merge_wait")]
     MergeWait,
+    /// Ready (`loom:issue`), waiting for a dispatch slot (#9326). One visit
+    /// is one slot turnover.
+    #[serde(rename = "ready_wait")]
+    ReadyWait,
 }
 
+/// How many [`Stage`] variants there are: the length of per-stage arrays.
+pub const STAGE_COUNT: usize = 6;
+
 impl Stage {
-    /// Every stage, in path order.
+    /// Every post-dispatch stage, in path order. `ready_wait` precedes them
+    /// on an unstarted issue's path but is deliberately not in this list, so
+    /// every output built over it before #9326 is unchanged ([`Self::EVERY`]
+    /// has all six).
     pub const ALL: [Stage; 5] = [
+        Stage::SweepCurator,
+        Stage::SweepBuilder,
+        Stage::ReviewWait,
+        Stage::Doctor,
+        Stage::MergeWait,
+    ];
+
+    /// Every stage, in path order, `ready_wait` first.
+    pub const EVERY: [Stage; STAGE_COUNT] = [
+        Stage::ReadyWait,
         Stage::SweepCurator,
         Stage::SweepBuilder,
         Stage::ReviewWait,
@@ -164,6 +195,7 @@ impl Stage {
             Stage::ReviewWait => "review_wait",
             Stage::Doctor => "doctor",
             Stage::MergeWait => "merge_wait",
+            Stage::ReadyWait => "ready_wait",
         }
     }
 
@@ -176,6 +208,7 @@ impl Stage {
             Stage::ReviewWait => 2,
             Stage::Doctor => 3,
             Stage::MergeWait => 4,
+            Stage::ReadyWait => 5,
         }
     }
 
@@ -212,7 +245,8 @@ pub enum NoEstimateReason {
     InsufficientSamples,
     /// The item has been in its stage longer than all but [`MIN_COND`] samples.
     BeyondHistory,
-    /// Not started; needs the dispatch plan (a later phase).
+    /// Not started, and the dispatch plan gives it no position (a blocked
+    /// row, no plan on this host, or an issue the plan does not cover).
     NoDispatchPlan,
     /// No stage, or contradictory stage labels.
     UnknownStage,
@@ -380,6 +414,53 @@ pub enum CurrentState {
     Refused(NoEstimateReason),
 }
 
+/// Where a ready item stands in the dispatch plan (#9288), as `start-v1`
+/// and an unstarted `land-v1` read it. Recorded verbatim in the
+/// explanation's `path.dispatch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchInput {
+    /// 1-based plan position.
+    pub position: u32,
+    /// `next` or `queued`.
+    pub plan_state: String,
+    /// The admission gate holding it, when one does.
+    pub gate: Option<String>,
+    /// Waiting rows (`next`/`queued`) ahead of it in plan order.
+    pub ahead: u32,
+    /// Free slots when the tick finished.
+    pub free_slots: u32,
+    /// Admissions per tick, when capped.
+    pub max_admissions_per_tick: Option<u32>,
+    /// The work finder's tick interval.
+    pub tick_interval_secs: u64,
+    /// Whether the saturation brake held every admission this tick.
+    pub saturation_held: bool,
+    /// The tick the plan came from.
+    pub plan_at: DateTime<Utc>,
+}
+
+impl DispatchInput {
+    /// Slot turnovers that must happen before it can be admitted: one per
+    /// waiting row ahead of it, plus its own, less the slots already free.
+    #[must_use]
+    pub fn turnovers(&self) -> u32 {
+        (self.ahead + 1).saturating_sub(self.free_slots)
+    }
+
+    /// Fixed seconds from its admitting slot freeing to the dispatch: half a
+    /// tick (the mean wait for the next tick), plus one whole tick per full
+    /// admission batch ahead of it when it needs no turnover at all.
+    #[must_use]
+    pub fn admission_delay_sec(&self) -> i64 {
+        let tick = i64::try_from(self.tick_interval_secs).unwrap_or(i64::MAX / 4);
+        let batches = match (self.turnovers(), self.max_admissions_per_tick) {
+            (0, Some(cap)) if cap > 0 => i64::from(self.ahead / cap),
+            _ => 0,
+        };
+        tick / 2 + batches.saturating_mul(tick)
+    }
+}
+
 /// Everything an estimator reads besides history.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EstimateInput {
@@ -395,6 +476,9 @@ pub struct EstimateInput {
     pub features_omitted: Vec<explanation::FeatureOmitted>,
     /// The computing build.
     pub provenance: Provenance,
+    /// The dispatch plan's view of a ready item; `None` for every started
+    /// one.
+    pub dispatch: Option<DispatchInput>,
 }
 
 /// A registered estimator. Implementations must be pure.
@@ -418,7 +502,11 @@ impl Registry {
     #[must_use]
     pub fn builtin() -> Self {
         Registry {
-            heuristics: vec![Box::new(heuristics::FinishV1), Box::new(heuristics::LandV1)],
+            heuristics: vec![
+                Box::new(heuristics::StartV1),
+                Box::new(heuristics::FinishV1),
+                Box::new(heuristics::LandV1),
+            ],
         }
     }
 
@@ -441,6 +529,7 @@ impl Registry {
     #[must_use]
     pub fn default_current(kind: Kind) -> &'static str {
         match kind {
+            Kind::Start => heuristics::START_V1,
             Kind::Finish => heuristics::FINISH_V1,
             Kind::Land => heuristics::LAND_V1,
         }

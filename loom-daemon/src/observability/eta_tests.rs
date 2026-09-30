@@ -29,6 +29,7 @@ fn lifecycle(loom: Provenance) -> (Vec<Emission>, Vec<Resolved>) {
     repo_ids.insert(REPO.to_string(), 1_073_994_527_u64);
     let ctx = EstimateContext {
         registry: &registry,
+        current_start: None,
         current_finish: None,
         current_land: None,
         history: &history,
