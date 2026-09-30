@@ -48,6 +48,7 @@ use loom_daemon::merge_pr::stale_checks::evidence::{
     strip_validated_restamps, to_file_set, ChangedFile,
 };
 use loom_daemon::merge_pr::stale_checks::inputs::{BaseMove, ScopedEvidence};
+use loom_daemon::merge_pr::stale_checks::workflow_scope::{self, CiScope};
 use loom_daemon::merge_pr::stale_checks::{
     assess_scoped, stale_inputs_message, unknown_message, Verdict, CLEAN,
 };
@@ -267,7 +268,9 @@ fn warn_all(notices: &[String]) {
 ///                  "status": "modified", "patch": "@@ …"}]
 ///     }
 ///   },
-///   "fallbacks": {"Some Check": "why it has no evidence"}
+///   "fallbacks": {"Some Check": "why it has no evidence"},
+///   "workflow": "name: CI\non:\n…",
+///   "pr_workflow": "name: CI\non:\n…"
 /// }
 /// ```
 ///
@@ -275,15 +278,32 @@ fn warn_all(notices: &[String]) {
 /// the time rule exactly as before. The same
 /// [`strip_validated_restamps`] the live path applies runs here, so a suite can
 /// drive the restamp validation end-to-end.
+///
+/// `workflow` is the base tip's `.github/workflows/ci.yml` text and
+/// `pr_workflow` the PR head's — the two inputs #9065's `ci.yml` narrowing
+/// needs, one per side, each being the tree that side's patches diff *to*.
+/// Omit `workflow` and every base move gets [`CiScope::Unscoped`]; omit
+/// `pr_workflow` and so does `P`. Either way `ci.yml` stays a whole-file global
+/// input on that side, exactly as before, so both fields are purely an opt-in
+/// for a suite that wants to drive the narrowing. Attributing `P` also needs a
+/// `patch` on its `ci.yml` entry in `pr_files`; without one the side stays
+/// unscoped.
 fn scoped_from_json(v: &serde_json::Value) -> Option<ScopedEvidence> {
     if v.get("pr_files").is_none() && v.get("base_moves").is_none() {
         return None;
     }
     let pr_files = changed_files(v.get("pr_files"));
+    let workflow = v
+        .get("workflow")
+        .and_then(|s| s.as_str())
+        .map(workflow_scope::parse);
     let mut base_moves: BTreeMap<String, BaseMove> = BTreeMap::new();
     if let Some(obj) = v.get("base_moves").and_then(|m| m.as_object()) {
         for (ctx, mv) in obj {
             let files = changed_files(mv.get("files"));
+            let ci_scope = workflow
+                .as_ref()
+                .map_or(CiScope::Unscoped, |wf| workflow_scope::scope_for_files(wf, &files));
             base_moves.insert(
                 ctx.clone(),
                 BaseMove {
@@ -293,6 +313,7 @@ fn scoped_from_json(v: &serde_json::Value) -> Option<ScopedEvidence> {
                         .unwrap_or("<unknown>")
                         .to_string(),
                     files: to_file_set(&strip_validated_restamps(&files)),
+                    ci_scope,
                 },
             );
         }
@@ -303,8 +324,15 @@ fn scoped_from_json(v: &serde_json::Value) -> Option<ScopedEvidence> {
             fallbacks.insert(ctx.clone(), why.as_str().unwrap_or("no reason given").to_string());
         }
     }
+    let pr_ci_scope = v
+        .get("pr_workflow")
+        .and_then(|s| s.as_str())
+        .map_or(CiScope::Unscoped, |text| {
+            workflow_scope::scope_for_files(&workflow_scope::parse(text), &pr_files)
+        });
     Some(ScopedEvidence {
         pr_delta: to_file_set(&pr_files),
+        pr_ci_scope,
         base_moves,
         fallbacks,
     })

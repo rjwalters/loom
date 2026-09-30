@@ -141,6 +141,12 @@ never refreshes `updatedAt`. Absent when the host has never sent one (a daemon
 older than #8852 phase 2, or its work finder is off); present with `seen: 0`
 and a `live` freshness when the queue is genuinely empty. `/public/fleet-state`
 redacts it per row on each row's own `visibility` (see `src/queueState.ts`).
+Since #9288 each row may carry the host's dispatch-plan fields (`position`,
+`plan_state`, `gate`, `keys`, `in_slice`, `hot`, `owning_shard`, `repo_cap`)
+and the record a `plan` block (slots, tick interval, shard, `scope`,
+`ordering`). On the public view a private row keeps `position`, `plan_state`
+and `gate` and loses the rest; the `plan` block is aggregate and kept.
+`position` is per host: positions from different hosts are not comparable.
 
 **`missingHosts`** (issue #8792) is present only when the deployment sets the
 `EXPECTED_HOSTS` var (see `deploy-runbook.md` → "Declaring the expected host
@@ -284,7 +290,11 @@ non-integer), or `cursor` (non-positive or non-integer) returns `400` with a
   `total_duration_sec`/`result` but never `repo`/`issue`/`sweep_id`/
   `pr_number` — nor (Issue #5357) its `tokens_in`/`tokens_out`/`lines_added`/
   `lines_deleted` work-output fields, held back for the same "workload
-  detail about a private repo" reason as `pr_number`. `host.health` records
+  detail about a private repo" reason as `pr_number`. `phase_durations`
+  survives in **projected** form (Issue #9443): each entry keeps
+  `phase`/`duration_sec`/`attempt` and drops the per-phase
+  `tokens_in`/`tokens_out`/`tokens_by_model`, which are the same withheld
+  workload detail in finer-grained form. `host.health` records
   (host-level, no `repo` reference) are never redacted on either route.
 
   `tokens.snapshot` is the one kind whose *shape* differs by route. `/api/*`

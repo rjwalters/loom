@@ -37,6 +37,20 @@ fn rust_class(strip_dir_slash: bool) -> BTreeSet<String> {
         .collect()
 }
 
+/// The Rust class as the `git add -A` pathspec exclusion mirrors spell it
+/// (#9134): trailing `/` stripped, then a trailing `*` appended so the
+/// pathspec also excludes a sibling rename/backup of the credential path, not
+/// just the exact path — matching [`super::is_credential_path`]'s widened
+/// prefix-match contract (verified empirically to widen coverage the same
+/// way for `git add -A -- . ':!...'` pathspecs, since `*` there is glob magic
+/// that matches across `/`, unlike a bare literal pathspec element).
+fn rust_class_pathspec_glob() -> BTreeSet<String> {
+    CREDENTIAL_PATTERNS
+        .iter()
+        .map(|p| format!("{}*", p.trim_end_matches('/')))
+        .collect()
+}
+
 /// Extract `LOOM_CREDENTIAL_PATTERNS=( ... )` (possibly multi-line) from
 /// land-resync-commit.sh.
 fn land_resync_commit_array() -> BTreeSet<String> {
@@ -124,7 +138,7 @@ fn land_resync_commit_array_matches_rust_class() {
 fn resync_installed_pathspec_matches_rust_class() {
     assert_eq!(
         pathspec_excludes(RESYNC_INSTALLED, "defaults/scripts/resync-installed.sh"),
-        rust_class(true),
+        rust_class_pathspec_glob(),
         "defaults/scripts/resync-installed.sh's printed `git add -A` exclusions have drifted \
          from loom-daemon/src/init/post_init.rs CREDENTIAL_PATTERNS — keep them identical (#8005)"
     );
@@ -137,7 +151,7 @@ fn install_loom_sh_pathspec_matches_rust_class() {
     // exclusion pathspec, same reasoning as resync-installed.sh's above.
     assert_eq!(
         pathspec_excludes(SCRIPTS_INSTALL_LOOM, "scripts/install-loom.sh"),
-        rust_class(true),
+        rust_class_pathspec_glob(),
         "scripts/install-loom.sh's initial-commit `git add -A` exclusions have drifted from \
          loom-daemon/src/init/post_init.rs CREDENTIAL_PATTERNS — keep them identical (#8005/#8734)"
     );
@@ -149,7 +163,7 @@ fn install_sh_pathspec_matches_rust_class() {
     // copy of the same pattern (same reachability as install-loom.sh's).
     assert_eq!(
         pathspec_excludes(INSTALL_SH, "install.sh"),
-        rust_class(true),
+        rust_class_pathspec_glob(),
         "install.sh's initial-commit `git add -A` exclusions have drifted from \
          loom-daemon/src/init/post_init.rs CREDENTIAL_PATTERNS — keep them identical (#8005/#8734)"
     );
@@ -162,14 +176,35 @@ fn is_credential_path_matching_contract() {
     assert!(is_credential_path(".loom/tokens/acct-1.json"));
     assert!(is_credential_path(".loom/gh-config-by-owner/some-owner/hosts.yml"));
     assert!(is_credential_path(".loom/claude-config/builder-1/.credentials.json"));
-    // File pattern: exact only.
+    // File pattern: exact match.
     assert!(is_credential_path(".loom/accounts.env"));
-    assert!(!is_credential_path(".loom/accounts.env.example"));
     assert!(!is_credential_path(".loom/accounts.json"));
-    // Prefix-lookalikes must not match a directory pattern.
-    assert!(!is_credential_path(".loom/tokens-archive/x"));
-    assert!(!is_credential_path(".loom/gh-configx"));
-    // Deliberately outside the class (see CREDENTIAL_PATTERNS docs).
+    // #9134: a sibling-renamed credential dir (e.g. `mv .loom/tokens
+    // .loom/tokens.disabled-<ts>`, a natural operator move the repo's own
+    // .gitignore documents the `name.bak-$(date +%Y%m%dT%H%M%SZ)` convention
+    // for) must not escape the class just because it is no longer the exact
+    // directory name. One example per credential-bearing directory:
+    assert!(is_credential_path(".loom/tokens.disabled-20260101T000000Z/a.token"));
+    assert!(is_credential_path(".loom/tokens-old/a.token"));
+    assert!(is_credential_path(".loom/claude-config.bak-20260101T000000Z/builder-1/x"));
+    assert!(is_credential_path(".loom/api-keys.disabled-20260101T000000Z/zai/x.env"));
+    assert!(is_credential_path(".loom/gh-config.bak-20260101T000000Z/hosts.yml"));
+    assert!(is_credential_path(
+        ".loom/gh-config-by-owner.disabled-20260101T000000Z/some-owner/hosts.yml"
+    ));
+    // Same widening applies to the one file pattern, per decision (b) in
+    // #9134: a hand-made backup of the account source file must also stay
+    // covered.
+    assert!(is_credential_path(".loom/accounts.env.bak"));
+    // The contract is a uniform prefix match (decision (a) in #9134): a path
+    // that merely LOOKS like a sibling by sharing the same string prefix is
+    // deliberately swept in too, trading a few over-inclusive false
+    // positives for no false negatives — see CREDENTIAL_PATTERNS' doc comment.
+    assert!(is_credential_path(".loom/tokens-archive/x"));
+    assert!(is_credential_path(".loom/gh-configx"));
+    assert!(is_credential_path(".loom/accounts.env.example"));
+    // Deliberately outside the class (see CREDENTIAL_PATTERNS docs) — none of
+    // these share a credential pattern's prefix.
     assert!(!is_credential_path(".loom/account-health.json"));
     assert!(!is_credential_path(".loom-local/local.json"));
     assert!(!is_credential_path(".loom/hooks/foo.sh"));

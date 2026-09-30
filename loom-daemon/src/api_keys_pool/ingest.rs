@@ -290,27 +290,65 @@ pub fn ingest_launch_log(
     };
 
     let reason = format!("{} (classified from the launch log)", classification.label());
-    let marked = super::paths::resolve_provider_root(workspace, &provider)
+    let root = match super::paths::resolve_provider_root(workspace, &provider)
         .map_err(|e| e.to_string())
-        .and_then(|root| {
-            bad_marks::mark_bad_for_class(
-                &root,
-                &provider,
-                &account,
-                &reason,
-                Some(cooldown),
-                model_class.as_deref(),
-            )
-        });
-    let detail = match &marked {
-        Ok(_) => format!(
-            "api-keys pool: bad-marked {provider}/{account} ({scope}) as {} for {cooldown}s from \
-             the launch log",
-            classification.label()
+    {
+        Ok(root) => root,
+        Err(error) => {
+            return Some(LaunchFeedback {
+                detail: format!(
+                    "api-keys pool: could not bad-mark {provider}/{account} ({scope}) as {}: {error}",
+                    classification.label()
+                ),
+                provider,
+                account,
+                model_class,
+                classification,
+                mark: None,
+            });
+        }
+    };
+    // #8699 AC2's double-mark guard: the egress proxy (or a concurrent
+    // launch on the same account) may already have bad-marked this
+    // `(account, class)` pair. `escalate_bad_for_class` skips the write only
+    // when that existing mark lasts at least as long as the one this log
+    // implies, and replaces it otherwise — so a proxy's 60s `rate-limited`
+    // from a bare 429 is upgraded to the 6h `exhausted` the log proves, and a
+    // weaker late signal never shortens a stronger mark. The check and the
+    // write share one lock, on the proxied and unproxied paths alike.
+    let marked = bad_marks::escalate_bad_for_class(
+        &root,
+        &provider,
+        &account,
+        &reason,
+        Some(cooldown),
+        model_class.as_deref(),
+    );
+    let (detail, mark) = match marked {
+        Ok(bad_marks::MarkWrite::Written(mark)) => (
+            format!(
+                "api-keys pool: bad-marked {provider}/{account} ({scope}) as {} for {cooldown}s \
+                 from the launch log",
+                classification.label()
+            ),
+            Some(mark),
         ),
-        Err(error) => format!(
-            "api-keys pool: could not bad-mark {provider}/{account} ({scope}) as {}: {error}",
-            classification.label()
+        Ok(bad_marks::MarkWrite::AlreadyCovered(existing)) => (
+            format!(
+                "api-keys pool: {provider}/{account} ({scope}) is already bad-marked ({}) at \
+                 least as long as a {cooldown}s {} mark — skipping a duplicate mark from the \
+                 launch log (likely already marked at the egress proxy, #8699)",
+                existing.reason,
+                classification.label()
+            ),
+            Some(existing),
+        ),
+        Err(error) => (
+            format!(
+                "api-keys pool: could not bad-mark {provider}/{account} ({scope}) as {}: {error}",
+                classification.label()
+            ),
+            None,
         ),
     };
     Some(LaunchFeedback {
@@ -318,7 +356,7 @@ pub fn ingest_launch_log(
         account,
         model_class,
         classification,
-        mark: marked.ok(),
+        mark,
         detail,
     })
 }

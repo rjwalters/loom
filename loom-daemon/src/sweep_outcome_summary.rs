@@ -1058,8 +1058,14 @@ pub fn summarize(
                 (format!("{model}/{tier}"), None)
             }
             GroupBy::Repo => {
-                let repo = record.repo.trim();
-                let repo = if repo.is_empty() { UNKNOWN_GROUP } else { repo };
+                // Issue #9442: an unresolved repo groups under UNKNOWN_GROUP —
+                // records never carry a path to trim.
+                let repo = record
+                    .repo
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|repo| !repo.is_empty())
+                    .unwrap_or(UNKNOWN_GROUP);
                 (repo.to_string(), None)
             }
             GroupBy::Host => {
@@ -1107,7 +1113,14 @@ pub fn summarize(
         }
         if let Some(pr) = record.pr_number {
             acc.prs_opened += 1;
-            match lookup.merge_state(&record.repo, pr) {
+            // Issue #9442: an unresolved repo has no forge merge state to look
+            // up — counted as NotMerged rather than guessed.
+            match record
+                .repo
+                .as_deref()
+                .map(|repo| lookup.merge_state(repo, pr))
+                .unwrap_or(MergeState::NotMerged)
+            {
                 MergeState::Merged => {
                     acc.merged += 1;
                     if let (Some(added), Some(deleted)) = (record.lines_added, record.lines_deleted)

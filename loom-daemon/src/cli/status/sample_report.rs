@@ -78,9 +78,11 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         host_breaker: None,
         admission_brake: None,
         rate_limit_breaker: None,
+        forge_calls: None,
         safehouse: None,
         work_finder_enabled: Some(true),
         last_work_finder_tick: None,
+        operator_priority_landing: None,
         role_tick_records: vec![],
         role_last_tick: vec![],
         // #6102: role-agent load alongside the sweep in-flight list.

@@ -59,14 +59,14 @@
 //! Re-dispatched sweeps produce several sessions for one issue; all matching
 //! sessions are summed, since the feed reports what the issue cost in total.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
-use crate::script_helpers::sweep_experiment::{
-    sum_transcript_usage, sum_transcript_usage_by_model, ModelUsageTotals,
-};
+use crate::script_helpers::sweep_experiment::ModelUsageTotals;
+use crate::script_helpers::transcript_usage::{merge_records, UsageFold};
 
 /// Bytes of each candidate session file read when testing it for the
 /// `/loom:sweep <issue>` slash command. The command is in the first `user`
@@ -208,25 +208,28 @@ pub fn session_transcripts(session_jsonl: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Total tokens processed by every `/loom:sweep <issue>` session under
-/// `projects_dir` for `workspace_root`, or `None` when nothing attributable was
-/// found.
+/// Every transcript file attributable to `issue`'s own `/loom:sweep` sessions:
+/// each parent session under `projects_dir`/`slug(workspace_root)` whose mtime
+/// falls in `window` and whose head names this issue, plus that session's
+/// subagent transcripts, with oversized files dropped (and logged as `what`).
 ///
-/// Blocking file I/O — call from a blocking context. `None` (never `Some(0)`)
-/// is returned for "no attributable transcripts", matching the envelope
-/// contract that an absent total omits the key rather than publishing a
-/// misleading zero.
-#[must_use]
-pub fn sum_sweep_tokens(
+/// `None` — never an empty vec — when the project directory cannot be read, so
+/// every caller keeps its "unknown is not zero" early return.
+///
+/// Extracted by #9443 so the flat total, the input/output split, the per-model
+/// breakdown, and the per-phase windowed fold provably scan the **same** file
+/// set: the per-phase numbers are reconciled against the sweep totals, and a
+/// drifted file set would break that invariant silently.
+fn sweep_transcript_files(
     projects_dir: &Path,
     workspace_root: &Path,
     issue: u32,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Option<u64> {
+    what: &str,
+) -> Option<Vec<PathBuf>> {
     let project = projects_dir.join(project_slug(workspace_root));
     let entries = std::fs::read_dir(&project).ok()?;
-
-    let mut total: u64 = 0;
+    let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "jsonl") {
@@ -242,23 +245,64 @@ pub fn sum_sweep_tokens(
             continue;
         }
         for transcript in session_transcripts(&path) {
-            let too_big =
-                std::fs::metadata(&transcript).is_ok_and(|m| m.len() > MAX_TRANSCRIPT_BYTES);
-            if too_big {
+            if std::fs::metadata(&transcript).is_ok_and(|m| m.len() > MAX_TRANSCRIPT_BYTES) {
                 log::warn!(
-                    "safehouse: skipping oversized transcript {} for issue #{issue} token total",
+                    "{what}: skipping oversized transcript {} for issue #{issue}",
                     transcript.display()
                 );
                 continue;
             }
-            let usage = sum_transcript_usage(&transcript);
-            let sum = usage
-                .input_tokens
-                .saturating_add(usage.output_tokens)
-                .saturating_add(usage.cache_read_input_tokens)
-                .saturating_add(usage.cache_creation_input_tokens);
-            total = total.saturating_add(u64::try_from(sum).unwrap_or(0));
+            out.push(transcript);
         }
+    }
+    Some(out)
+}
+
+/// Fold every transcript in `files` into ONE [`UsageFold`] (#9315), so a
+/// `message.id` copied into a resumed session's transcript is counted once
+/// per sweep, matching the quota burn reader's cross-file dedupe. Unreadable
+/// files are skipped.
+fn fold_files(files: &[PathBuf]) -> UsageFold {
+    let mut fold = UsageFold::default();
+    for transcript in files {
+        if let Ok(text) = std::fs::read_to_string(transcript) {
+            fold.add_text(&text);
+        }
+    }
+    fold
+}
+
+/// Total tokens processed by every `/loom:sweep <issue>` session under
+/// `projects_dir` for `workspace_root`, or `None` when nothing attributable was
+/// found.
+///
+/// Blocking file I/O — call from a blocking context. `None` (never `Some(0)`)
+/// is returned for "no attributable transcripts", matching the envelope
+/// contract that an absent total omits the key rather than publishing a
+/// misleading zero.
+#[must_use]
+pub fn sum_sweep_tokens(
+    projects_dir: &Path,
+    workspace_root: &Path,
+    issue: u32,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Option<u64> {
+    let files = sweep_transcript_files(
+        projects_dir,
+        workspace_root,
+        issue,
+        window,
+        "safehouse token total",
+    )?;
+    let mut total: u64 = 0;
+    for row in fold_files(&files).rows() {
+        let sum = row
+            .input
+            .saturating_add(row.output)
+            .saturating_add(row.cache_read)
+            .saturating_add(row.cache_write_5m)
+            .saturating_add(row.cache_write_1h);
+        total = total.saturating_add(u64::try_from(sum).unwrap_or(0));
     }
     (total > 0).then_some(total)
 }
@@ -287,44 +331,23 @@ pub fn sum_sweep_tokens_split(
     issue: u32,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Option<(u64, u64)> {
-    let project = projects_dir.join(project_slug(workspace_root));
-    let entries = std::fs::read_dir(&project).ok()?;
-
+    let files = sweep_transcript_files(
+        projects_dir,
+        workspace_root,
+        issue,
+        window,
+        "sweep.outcome token split",
+    )?;
     let mut input_total: u64 = 0;
     let mut output_total: u64 = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|e| e != "jsonl") {
-            continue;
-        }
-        if !mtime_in_window(&path, window) {
-            continue;
-        }
-        let Some(head) = read_head(&path) else {
-            continue;
-        };
-        if !head_names_sweep_issue(&head, issue) {
-            continue;
-        }
-        for transcript in session_transcripts(&path) {
-            let too_big =
-                std::fs::metadata(&transcript).is_ok_and(|m| m.len() > MAX_TRANSCRIPT_BYTES);
-            if too_big {
-                log::warn!(
-                    "sweep.outcome: skipping oversized transcript {} for issue #{issue} token split",
-                    transcript.display()
-                );
-                continue;
-            }
-            let usage = sum_transcript_usage(&transcript);
-            let input = usage
-                .input_tokens
-                .saturating_add(usage.cache_read_input_tokens)
-                .saturating_add(usage.cache_creation_input_tokens);
-            input_total = input_total.saturating_add(u64::try_from(input).unwrap_or(0));
-            output_total =
-                output_total.saturating_add(u64::try_from(usage.output_tokens).unwrap_or(0));
-        }
+    for row in fold_files(&files).rows() {
+        let input = row
+            .input
+            .saturating_add(row.cache_read)
+            .saturating_add(row.cache_write_5m)
+            .saturating_add(row.cache_write_1h);
+        input_total = input_total.saturating_add(u64::try_from(input).unwrap_or(0));
+        output_total = output_total.saturating_add(u64::try_from(row.output).unwrap_or(0));
     }
     (input_total > 0 || output_total > 0).then_some((input_total, output_total))
 }
@@ -333,7 +356,7 @@ pub fn sum_sweep_tokens_split(
 /// `/loom:sweep` sessions (#5740): same session-matching and per-transcript
 /// scan as [`sum_sweep_tokens`]/[`sum_sweep_tokens_split`], but grouped by
 /// model/speed/tier instead of collapsed into one running total. See
-/// [`ModelUsageTotals`] and [`sum_transcript_usage_by_model`] for why a
+/// [`ModelUsageTotals`] and [`sum_transcript_usage_by_model`](crate::script_helpers::sweep_experiment::sum_transcript_usage_by_model) for why a
 /// single flat sum cannot be priced.
 ///
 /// Totals from every matching transcript are merged by tuple across the
@@ -350,53 +373,108 @@ pub fn sum_sweep_tokens_by_model(
     issue: u32,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Option<Vec<ModelUsageTotals>> {
-    let project = projects_dir.join(project_slug(workspace_root));
-    let entries = std::fs::read_dir(&project).ok()?;
+    let files = sweep_transcript_files(
+        projects_dir,
+        workspace_root,
+        issue,
+        window,
+        "safehouse per-model token total",
+    )?;
+    let rows: Vec<ModelUsageTotals> = fold_files(&files).rows();
+    (!rows.is_empty()).then_some(rows)
+}
 
-    let mut totals: std::collections::BTreeMap<(String, String, String), ModelUsageTotals> =
-        std::collections::BTreeMap::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|e| e != "jsonl") {
-            continue;
-        }
-        if !mtime_in_window(&path, window) {
-            continue;
-        }
-        let Some(head) = read_head(&path) else {
+/// Which of `slices` an instant belongs to (Issue #9443), or `None` when it
+/// falls outside every one of them.
+///
+/// Slices are half-open `[start, end)` so contiguous phase windows — which is
+/// what the sampler produces, each phase ending exactly where the next begins —
+/// partition their records with no double-count. The **final** slice is closed
+/// at its end instead, so a record written at the exact last phase boundary is
+/// attributed rather than silently dropped into the remainder.
+#[must_use]
+fn slice_of(at: DateTime<Utc>, slices: &[(DateTime<Utc>, DateTime<Utc>)]) -> Option<usize> {
+    if let Some(index) = slices
+        .iter()
+        .position(|(start, end)| at >= *start && at < *end)
+    {
+        return Some(index);
+    }
+    let last = slices.len().checked_sub(1)?;
+    (at == slices[last].1).then_some(last)
+}
+
+/// Per-model token totals for `issue`'s `/loom:sweep` sessions, split across
+/// `slices` (Issue #9443) — the per-phase counterpart of
+/// [`sum_sweep_tokens_by_model`], and what makes clean-landing cost separable
+/// from rework cost.
+///
+/// Returns one entry per slice, in the same order, `None` where no usage record
+/// fell inside that slice (absent, never a fabricated zero row set). The vec is
+/// always `slices.len()` long — including when the project directory is
+/// unreadable, which yields all-`None`.
+///
+/// # Why this cannot be `sum_sweep_tokens_by_model(…, Some(phase_window))`
+///
+/// `window` in every other function here is a **file-mtime** prefilter, not a
+/// per-record filter: a session file's mtime is when it was last appended to,
+/// so a narrow per-phase window would admit or reject a transcript *whole*.
+/// Handed phase windows, it would attribute every token of a sweep to whichever
+/// phase happened to contain the file's final write — i.e. the last one — and
+/// nothing to the rest. So attribution is done per **record**, keyed on the
+/// record's own `timestamp` ([`UsageRecord::at`]), with `window` kept for its
+/// original cheap-prefilter job.
+///
+/// # What it is honest about
+///
+/// - Dedupe happens across all the sweep's transcripts **before** partitioning ([`UsageFold`]), and
+///   a message is attributed wholly to the phase its first chunk started in, so
+///   Σ over the slices plus the remainder equals the sweep total exactly — a
+///   streamed message straddling a boundary is never counted twice.
+/// - A record with no parseable `timestamp`, or one outside every slice (the
+///   trailing in-flight segment the sampler cannot name a phase for, or an
+///   earlier dispatch's session admitted by the mtime slack), is attributed to
+///   **no** slice. The caller reports that remainder as `tokens_unattributed`.
+/// - Slice boundaries are the sampled phase-transition instants, so attribution
+///   is accurate to within one reaper tick — the same caveat `phase_durations`
+///   already carries.
+///
+/// [`UsageRecord::at`]: crate::script_helpers::transcript_usage::UsageRecord::at
+#[must_use]
+pub fn sum_sweep_tokens_by_window(
+    projects_dir: &Path,
+    workspace_root: &Path,
+    issue: u32,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    slices: &[(DateTime<Utc>, DateTime<Utc>)],
+) -> Vec<Option<Vec<ModelUsageTotals>>> {
+    if slices.is_empty() {
+        return Vec::new();
+    }
+    let Some(files) = sweep_transcript_files(
+        projects_dir,
+        workspace_root,
+        issue,
+        window,
+        "sweep.outcome per-phase token attribution",
+    ) else {
+        return vec![None; slices.len()];
+    };
+    let mut totals: Vec<BTreeMap<(String, String, String), ModelUsageTotals>> =
+        vec![BTreeMap::new(); slices.len()];
+    for message in fold_files(&files).messages() {
+        let Some(index) = message.at().and_then(|at| slice_of(at, slices)) else {
             continue;
         };
-        if !head_names_sweep_issue(&head, issue) {
-            continue;
-        }
-        for transcript in session_transcripts(&path) {
-            let too_big =
-                std::fs::metadata(&transcript).is_ok_and(|m| m.len() > MAX_TRANSCRIPT_BYTES);
-            if too_big {
-                log::warn!(
-                    "safehouse: skipping oversized transcript {} for issue #{issue} per-model token total",
-                    transcript.display()
-                );
-                continue;
-            }
-            for row in sum_transcript_usage_by_model(&transcript) {
-                let key = (row.model.clone(), row.speed.clone(), row.service_tier.clone());
-                let entry = totals.entry(key).or_insert_with(|| ModelUsageTotals {
-                    model: row.model.clone(),
-                    speed: row.speed.clone(),
-                    service_tier: row.service_tier.clone(),
-                    ..ModelUsageTotals::default()
-                });
-                entry.input += row.input;
-                entry.cache_read += row.cache_read;
-                entry.cache_write_5m += row.cache_write_5m;
-                entry.cache_write_1h += row.cache_write_1h;
-                entry.output += row.output;
-            }
-        }
+        merge_records(&mut totals[index], std::iter::once(message));
     }
-    let rows: Vec<ModelUsageTotals> = totals.into_values().collect();
-    (!rows.is_empty()).then_some(rows)
+    totals
+        .into_iter()
+        .map(|rows| {
+            let rows: Vec<ModelUsageTotals> = rows.into_values().collect();
+            (!rows.is_empty()).then_some(rows)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -467,6 +545,24 @@ mod tests {
             }
         }
         session
+    }
+
+    #[test]
+    fn same_message_id_in_two_transcripts_of_one_sweep_counts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        let line = "{\"type\":\"assistant\",\"message\":{\"id\":\"msg_dup\",\
+            \"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":10,\
+            \"output_tokens\":20,\"cache_read_input_tokens\":300,\
+            \"cache_creation_input_tokens\":40}}}\n";
+        // Parent and a resumed copy (subagent file) carry the same message.
+        seed_session(dir.path(), workspace, "uuid-a", "4699", line, &[line]);
+
+        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, None), Some(370));
+        assert_eq!(sum_sweep_tokens_split(dir.path(), workspace, 4699, None), Some((350, 20)));
+        let rows = sum_sweep_tokens_by_model(dir.path(), workspace, 4699, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].input, rows[0].output, rows[0].cache_read), (10, 20, 300));
     }
 
     #[test]
@@ -678,5 +774,178 @@ mod tests {
         seed_session(dir.path(), workspace, "uuid-a", "4699", "", &[]);
 
         assert_eq!(sum_sweep_tokens_by_model(dir.path(), workspace, 4699, None), None);
+    }
+
+    // ----------------------------------------------------------------------
+    // Per-phase windowed attribution (Issue #9443)
+    // ----------------------------------------------------------------------
+
+    /// A stamped usage record: a distinct `message.id` (so the fold's dedupe
+    /// treats each as its own message) and a top-level `timestamp`, which is
+    /// what the windowed fold partitions on.
+    fn stamped(id: &str, at: DateTime<Utc>, input: i64, output: i64) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"id\":\"{id}\",\
+             \"model\":\"claude-sonnet-5\",\"usage\":{{\"input_tokens\":{input},\
+             \"output_tokens\":{output},\"cache_read_input_tokens\":0,\
+             \"cache_creation_input_tokens\":0}}}}}}\n",
+            at.to_rfc3339()
+        )
+    }
+
+    /// The same record with no `timestamp` at all — counted in the sweep
+    /// totals, attributable to no phase.
+    fn unstamped(id: &str, input: i64, output: i64) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"id\":\"{id}\",\
+             \"model\":\"claude-sonnet-5\",\"usage\":{{\"input_tokens\":{input},\
+             \"output_tokens\":{output},\"cache_read_input_tokens\":0,\
+             \"cache_creation_input_tokens\":0}}}}}}\n"
+        )
+    }
+
+    fn split_of(rows: &[ModelUsageTotals]) -> (i64, i64) {
+        (
+            rows.iter()
+                .map(|r| r.input + r.cache_read + r.cache_write_5m + r.cache_write_1h)
+                .sum(),
+            rows.iter().map(|r| r.output).sum(),
+        )
+    }
+
+    /// AC: a `curator → builder → judge(fail) → doctor → judge(pass)` lifecycle
+    /// yields five attributed windows, and Σ windows + the remainder equals the
+    /// flat sweep split exactly — the invariant that makes clean-landing cost
+    /// (curator + builder + FIRST judge) subtractable from the total.
+    #[test]
+    fn five_phase_windows_each_get_their_own_records_and_reconcile_with_the_sweep_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 29, 0, 0, 0).unwrap();
+        let mark = |secs: i64| t0 + chrono::Duration::seconds(secs);
+        // Contiguous windows, as the phase sampler produces them.
+        let slices = [
+            (t0, mark(100)),
+            (mark(100), mark(200)),
+            (mark(200), mark(300)),
+            (mark(300), mark(400)),
+            (mark(400), mark(500)),
+        ];
+        let parent = [
+            stamped("curator", mark(50), 10, 1),
+            stamped("builder", mark(150), 100, 10),
+            stamped("judge-1", mark(250), 20, 2),
+            stamped("doctor", mark(350), 200, 20),
+            // On the exact final boundary: the last window is closed at its end,
+            // so this belongs to judge attempt 2 rather than being dropped.
+            stamped("judge-2", mark(500), 30, 3),
+            // After every window (the trailing in-flight segment) and with no
+            // instant at all: both unattributable.
+            stamped("trailing", mark(560), 7, 5),
+            unstamped("no-clock", 3, 1),
+        ]
+        .concat();
+        seed_session(dir.path(), workspace, "uuid-a", "9443", &parent, &[]);
+
+        let per_phase = sum_sweep_tokens_by_window(dir.path(), workspace, 9443, None, &slices);
+        assert_eq!(per_phase.len(), 5, "one entry per requested window, in order");
+        let splits: Vec<(i64, i64)> = per_phase
+            .iter()
+            .map(|rows| split_of(rows.as_deref().expect("every window here has records")))
+            .collect();
+        assert_eq!(splits, vec![(10, 1), (100, 10), (20, 2), (200, 20), (30, 3)]);
+
+        // Σ windows + remainder == the flat split over the same file set.
+        let (total_in, total_out) =
+            sum_sweep_tokens_split(dir.path(), workspace, 9443, None).unwrap();
+        let attributed_in: i64 = splits.iter().map(|s| s.0).sum();
+        let attributed_out: i64 = splits.iter().map(|s| s.1).sum();
+        assert_eq!(
+            (attributed_in, attributed_out),
+            (360, 36),
+            "the trailing and clock-less records are attributed to no window"
+        );
+        assert_eq!(
+            (
+                u64::try_from(attributed_in).unwrap() + 10,
+                u64::try_from(attributed_out).unwrap() + 6
+            ),
+            (total_in, total_out),
+            "remainder is the trailing (7,5) plus the clock-less (3,1) record"
+        );
+    }
+
+    /// AC: an unmeasured window is **absent**, never a zero row set — and the
+    /// invariant still holds, with the shortfall showing up as a larger
+    /// remainder rather than as a phase claiming it was free.
+    #[test]
+    fn a_window_with_no_records_is_absent_rather_than_a_zero_row_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 29, 0, 0, 0).unwrap();
+        let mark = |secs: i64| t0 + chrono::Duration::seconds(secs);
+        let slices = [
+            (t0, mark(100)),
+            (mark(100), mark(200)),
+            (mark(200), mark(300)),
+        ];
+        let parent = [
+            stamped("curator", mark(50), 10, 1),
+            stamped("judge", mark(250), 30, 3),
+        ]
+        .concat();
+        seed_session(dir.path(), workspace, "uuid-a", "9443", &parent, &[]);
+
+        let per_phase = sum_sweep_tokens_by_window(dir.path(), workspace, 9443, None, &slices);
+        assert!(per_phase[0].is_some());
+        assert_eq!(per_phase[1], None, "the empty middle window must be absent, not Some(vec![])");
+        assert!(per_phase[2].is_some());
+    }
+
+    /// A streamed message's chunks repeat one `message.id` with cumulative
+    /// counters. Dedupe happens before partitioning, so a message whose chunks
+    /// straddle a window boundary counts ONCE, in the window it started in —
+    /// the property that keeps Σ windows ≤ the sweep total.
+    #[test]
+    fn a_streamed_message_straddling_a_boundary_is_counted_once_in_the_window_it_started_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 29, 0, 0, 0).unwrap();
+        let mark = |secs: i64| t0 + chrono::Duration::seconds(secs);
+        let slices = [(t0, mark(100)), (mark(100), mark(200))];
+        let parent = [
+            stamped("streamed", mark(95), 40, 4),
+            // Later chunk of the SAME message, past the boundary, carrying the
+            // cumulative counters.
+            stamped("streamed", mark(105), 90, 9),
+        ]
+        .concat();
+        seed_session(dir.path(), workspace, "uuid-a", "9443", &parent, &[]);
+
+        let per_phase = sum_sweep_tokens_by_window(dir.path(), workspace, 9443, None, &slices);
+        assert_eq!(split_of(per_phase[0].as_deref().unwrap()), (90, 9), "max over chunks, once");
+        assert_eq!(per_phase[1], None, "the second chunk is not a second message");
+        assert_eq!(
+            sum_sweep_tokens_split(dir.path(), workspace, 9443, None),
+            Some((90, 9)),
+            "and the sweep total counts it exactly once too"
+        );
+    }
+
+    /// No slices asked for ⇒ no work and no entries; an unreadable project
+    /// directory still returns one entry per slice, all absent.
+    #[test]
+    fn degenerate_inputs_never_fabricate_entries_or_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 29, 0, 0, 0).unwrap();
+        let slices = [(t0, t0 + chrono::Duration::seconds(10))];
+
+        assert!(sum_sweep_tokens_by_window(dir.path(), workspace, 9443, None, &[]).is_empty());
+        assert_eq!(
+            sum_sweep_tokens_by_window(dir.path(), workspace, 9443, None, &slices),
+            vec![None],
+            "an unreadable project directory is unknown for every window"
+        );
     }
 }

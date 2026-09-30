@@ -483,6 +483,7 @@ vocabulary (`loom.queue.disposition`'s wire values):
 | Operator term | Disposition(s) |
 |---|---|
 | "admission brake" | `deferred_saturation` (decisions reason `saturation`, tick result `saturation_held`) |
+| "build back-off" / "WIP limit" (PR debt high) | `deferred_build_backoff` (decisions reason `build_backoff`, tick result `build_backoff_held`, #9410) |
 | "dependency blocked" | Loom has no issue-dependency gate. Nearest: `parked` (a `PARK_LABELS`/`SKIP_LABELS` entry, e.g. `loom:blocked`, alongside `loom:issue`) or `labelled_blocked` (`loom:blocked` without `loom:issue` — forge-side only, from `queue.snapshot`, never a tick outcome so it never appears on a `loom.dispatch.disposition` span) |
 | "lower tier" (ranked behind others) | `deferred_capacity` (machine concurrency cap full), `deferred_ramp_cap` (per-tick admission cap), `deferred_repo_cap` (per-repo cap), or `deferred_out_of_slice` (repo sharding) — `tier:*` labels do not affect dispatch order, only `loom.queue.rank` does |
 
@@ -503,9 +504,13 @@ point, so exhaustion can be split by cause (a 429 versus plan exhaustion
 versus a session limit), which the snapshot-derived `loom.pool.exhaustions`
 cannot do. Each work-finder pool hold emits a `loom.pool.hold` span when it
 clears. At a sweep's terminal transition, the execution's exact token
-breakdown is journalled as a `loom.runtime.usage` span in the sweep's trace,
+breakdown is journalled as one `loom.runtime.usage` span per model and scope
+(execution/attempt) in the sweep's trace,
 and the transcript-ingest pass stamps the sweep's `session.summary` log with
-the same trace when the match is unambiguous. Details are in
+the same trace when the match is unambiguous — which needs the summary to know
+its issue, so #9445 resolves that from the session's worktree/branch as well as
+from a slash-command argument (and its `loom.repo` from the workspace's git
+remote, as an `owner/name` slug or not at all). Details are in
 [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
 To add a signal, add a `MetricName` or `SpanName` variant. If it needs a new
@@ -527,7 +532,11 @@ cardinality:
   `queue.snapshot` record, sampled on the `host.health` interval whenever the
   work finder has ticked since the last snapshot. Each row carries its forge
   `owner/repo` and its own `visibility` tag. The OTLP exporter never receives
-  this record.
+  this record. Since #9288 each row also carries its dispatch-plan fields
+  (`position`, `plan_state`, `gate`, …) and the record carries a `plan` block.
+  That block holds the host's slots, tick interval, shard posture, `scope` and
+  key `ordering`. These are per-host plan data only: no gauge or label is
+  added on the OTLP side, and `loom:curated` / `loom:triage` stay unordered.
 
 Both are derived from the same rows as `loom-daemon queue`. See
 [`telemetry-schema.md` → `queue.snapshot`](telemetry-schema.md#queuesnapshot).

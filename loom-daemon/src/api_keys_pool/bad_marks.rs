@@ -244,6 +244,54 @@ pub fn mark_bad_for_class(
     cooldown_secs: Option<u64>,
     model_class: Option<&str>,
 ) -> Result<BadMark, String> {
+    match write_mark(root, provider, name, reason, cooldown_secs, model_class, false)? {
+        MarkWrite::Written(mark) | MarkWrite::AlreadyCovered(mark) => Ok(mark),
+    }
+}
+
+/// Outcome of [`escalate_bad_for_class`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MarkWrite {
+    /// A new mark was written (nothing active covered its horizon).
+    Written(BadMark),
+    /// An already-active mark blocks the same `(account, class)` scope at
+    /// least as long as the requested mark would; nothing was written.
+    AlreadyCovered(BadMark),
+}
+
+/// [`mark_bad_for_class`] for **automatic** signals (the egress proxy and the
+/// launch-log ingest, #8699): it never shortens a horizon.
+///
+/// Skips the write only when an active mark on the same account already
+/// covers the requested scope (account-wide, or the same class) with a reset
+/// at or after `now + cooldown_secs` (or no reset at all). A weaker existing
+/// mark — e.g. the proxy's 60s `rate-limited` from a bare 429 — is replaced by
+/// a stronger one (a 6h `exhausted`), and a weaker mark arriving after a
+/// stronger one never downgrades it. The check runs under the same lock as
+/// the write, so two concurrent launches cannot race past it.
+///
+/// An operator's explicit `mark` keeps [`mark_bad_for_class`]'s plain
+/// replace semantics — shortening a horizon on purpose is their call.
+pub fn escalate_bad_for_class(
+    root: &Path,
+    provider: &str,
+    name: &str,
+    reason: &str,
+    cooldown_secs: Option<u64>,
+    model_class: Option<&str>,
+) -> Result<MarkWrite, String> {
+    write_mark(root, provider, name, reason, cooldown_secs, model_class, true)
+}
+
+fn write_mark(
+    root: &Path,
+    provider: &str,
+    name: &str,
+    reason: &str,
+    cooldown_secs: Option<u64>,
+    model_class: Option<&str>,
+    never_shorten: bool,
+) -> Result<MarkWrite, String> {
     validate_provider(provider)?;
     validate_account(name)?;
     if cooldown_secs == Some(0) {
@@ -279,6 +327,28 @@ pub fn mark_bad_for_class(
     // `?`: refuse to rewrite an unusable file from an empty read, which would
     // permanently drop every other account's mark.
     let mut marks = read_marks(root, provider)?;
+    if never_shorten {
+        let wanted = cooldown_secs.map(|secs| now + secs);
+        let covering = marks
+            .iter()
+            .filter(|m| {
+                m.name == name
+                    && m.is_active_at(now)
+                    // Account-wide covers every class; otherwise only the
+                    // same class covers (a class mark never covers an
+                    // account-wide request).
+                    && (m.model_class.is_none() || m.model_class == model_class)
+                    && match (m.resets_at, wanted) {
+                        (None, _) => true,
+                        (Some(_), None) => false,
+                        (Some(have), Some(want)) => have >= want,
+                    }
+            })
+            .max_by_key(|m| m.resets_at.unwrap_or(u64::MAX));
+        if let Some(existing) = covering {
+            return Ok(MarkWrite::AlreadyCovered(existing.clone()));
+        }
+    }
     // Replace only the same (account, class) pair: a class-scoped mark must
     // not clear the account-wide one, nor another class's.
     marks.retain(|m| !(m.name == name && m.model_class == model_class));
@@ -296,7 +366,7 @@ pub fn mark_bad_for_class(
             .then_with(|| a.model_class.cmp(&b.model_class))
     });
     write_marks(root, provider, &marks)?;
-    Ok(mark)
+    Ok(MarkWrite::Written(mark))
 }
 
 /// Clear every mark for `provider/name` (an operator override, or a successful

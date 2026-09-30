@@ -1358,6 +1358,10 @@ pub const VERDICT_STALENESS_ENABLED_ENV: &str = "LOOM_VERDICT_STALENESS_RECONCIL
 /// nothing).
 pub const VERDICT_ANCHOR_ENABLED_ENV: &str = "LOOM_VERDICT_ANCHOR";
 
+// The #9124 tree-identical carve-out's own kill switch
+// (`LOOM_VERDICT_TREE_CARVEOUT`) lives beside the logic it gates, in
+// `verdict_invalidation` — this module has no file-size ratchet headroom.
+
 /// The marker Judge stamps into every verdict comment
 /// (`defaults/.claude/commands/loom/judge.md` -> "Verdict SHA Marker"),
 /// recording WHICH TREE the verdict describes:
@@ -1458,6 +1462,16 @@ pub struct VerdictPr {
     pub marker_scan_ok: bool,
     /// Does the PR carry any of [`VERDICT_HOLD_LABELS`]?
     pub on_hold: bool,
+    /// Does the PR already carry a `loom:verdict-stale` notice for exactly the
+    /// `marker_sha -> head_sha` transition this pass is about to invalidate
+    /// (Issue #9124)? Read from the same comment listing the marker scan used,
+    /// so it costs no extra API call, and `false` whenever that listing was
+    /// not read (`marker_scan_ok == false`) — unknown means "post it", never
+    /// "assume someone else did".
+    ///
+    /// Suppresses only the duplicate *comment*; the label swap is unaffected,
+    /// which is what makes the retry after a failed label write still work.
+    pub invalidation_recorded: bool,
 }
 
 /// Why [`decide_verdict`] left a verdict in place.
@@ -1573,6 +1587,23 @@ pub struct VerdictReconcileStats {
     pub unverifiable: usize,
     /// Of those, how many this pass anchored to the current head.
     pub anchored: usize,
+    /// Invalidations whose audit comment was already on the PR and so was not
+    /// re-posted (Issue #9124). A persistently non-zero value is a signal in
+    /// its own right: it means some host keeps reaching `Invalidate` for a
+    /// transition another host already announced — usually because its label
+    /// write is failing while its comment write succeeds.
+    pub redundant_comments_skipped: usize,
+    /// `decide_verdict` said `Invalidate`, but GitHub's own compare API proved
+    /// the two trees are byte-identical, so this pass re-anchored the marker
+    /// to the new head instead of clearing the verdict (Issue #9124). Measured
+    /// root cause on `rjwalters/loom`: the `#8248` required-check-freshness
+    /// guard's automated "re-date required checks" commit (#8508), which
+    /// exists ONLY to give a merge queue's checks a fresh timestamp and
+    /// explicitly changes nothing in the tree — see `verdict_dedup_tests.rs`
+    /// for the sampled breakdown. This is the number that moves PL5a
+    /// (`pr_latency::segments::PrSegments::approval_invalidations`); the
+    /// `redundant_comments_skipped` counter above does not.
+    pub tree_identical_reanchors: usize,
 }
 
 impl VerdictReconcileStats {
@@ -1589,6 +1620,8 @@ impl VerdictReconcileStats {
         self.invalidated += other.invalidated;
         self.unverifiable += other.unverifiable;
         self.anchored += other.anchored;
+        self.redundant_comments_skipped += other.redundant_comments_skipped;
+        self.tree_identical_reanchors += other.tree_identical_reanchors;
     }
 }
 
@@ -1622,6 +1655,14 @@ pub fn extract_latest_verdict_sha(bodies: &[String], kind: VerdictKind) -> Optio
 /// appended commit is as much "not the tree that was reviewed" as a rebase is,
 /// and distinguishing them would not change a single answer (#5686 scopes it
 /// out explicitly).
+///
+/// Issue #9124 adds a narrower, strictly evidence-based carve-out **on top
+/// of** this function's answer, not inside it: see
+/// `forge::reconcile_pr_verdicts`'s tree-identical re-anchor step. It never
+/// guesses from event shape (force-push vs. fast-forward, the heuristic
+/// #5686 already rejected above) — it runs only after this function has
+/// already returned `Invalidate`, and only proceeds with the clear once
+/// GitHub's own compare API has confirmed the two trees actually differ.
 #[must_use]
 pub fn decide_verdict(pr: &VerdictPr) -> VerdictAction {
     let Some(head_sha) = pr.head_sha.as_deref() else {
@@ -1868,6 +1909,17 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
             verdict_stats.residual_unverifiable()
         );
     }
+    // #9124: this is the counter that maps to PL5a
+    // (`pr_latency::segments::PrSegments::approval_invalidations`) — every one
+    // of these is an invalidation that did NOT happen because the tree was
+    // proven unchanged, unlike `redundant_comments_skipped` above it.
+    if verdict_stats.tree_identical_reanchors > 0 {
+        log::info!(
+            "claim_reconciliation: verdict-staleness pass re-anchored {} verdict(s) whose head \
+             moved but whose tree did not, instead of invalidating them (#9124)",
+            verdict_stats.tree_identical_reanchors
+        );
+    }
 }
 
 /// Spawn the periodic reconciliation loop on the shared daemon runtime
@@ -1948,10 +2000,23 @@ pub fn spawn_periodic_reconciliation_task(
 /// rather than growing `forge` inline.
 mod pr_label_info;
 
-/// The #8900 auto-merge disarm hook [`forge::invalidate_verdict`] calls before
-/// posting its stale-verdict comment — a sibling file per the file-size ratchet
+/// The #8900 auto-merge disarm hook
+/// [`verdict_invalidation::invalidate_verdict`] calls before posting its
+/// stale-verdict comment — a sibling file per the file-size ratchet
 /// (`.loom/docs/file-size-policy.md`) rather than more inline logic here.
 mod auto_merge_disarm;
+
+/// The stale-verdict audit comment's body and its #9124 idempotence test —
+/// a sibling file per the file-size ratchet. The measurement behind it (25% of
+/// this repo's invalidation comments were duplicates) is in that module's own
+/// header.
+mod verdict_stale_comment;
+
+/// Everything [`forge::reconcile_pr_verdicts`] does once [`decide_verdict`]
+/// answers `Invalidate`: the #9124 tree-identical re-anchor carve-out and the
+/// #5686 clear it falls through to — a sibling file per the file-size ratchet,
+/// leaving a single dispatch call in the match arm here.
+mod verdict_invalidation;
 
 /// The #8922 base-conflict pass for `loom:review-requested` PRs — a sibling
 /// file per the file-size ratchet, run on the same tick right after
@@ -1963,6 +2028,11 @@ pub mod review_conflict;
 /// file-size ratchet rather than more inline logic here.
 mod pass_loop;
 
+/// The ETag-cached `loom:building` listing [`forge`] reconciles against — a
+/// sibling file per the file-size ratchet, attributed to `claim_reconciliation`
+/// in the #9251 forge-call accounting.
+mod building_listing;
+
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::work_finder::forge`] / [`crate::epic_supervisor::forge`]) — the
 /// decision logic above is the fully-covered surface; this module is a thin,
@@ -1972,10 +2042,10 @@ pub mod forge {
         apply_live_claim_veto, classify_lease_evidence, decide_anchor, decide_verdict,
         extract_latest_verdict_sha, most_recent_claim_activity_at, plan, plan_pr,
         resolve_lease_ttl_minutes, resolve_no_progress_grace_minutes, resolve_stale_hours,
-        verdict_anchoring_enabled, verdict_staleness_enabled, AnchorAction, BuildingIssue,
-        ClaimedPr, LeaseEvidence, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrComment,
-        PrReclaimReason, PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction,
-        VerdictKeepReason, VerdictKind, VerdictPr, VerdictReconcileStats, LEASE_MARKER_PREFIX,
+        verdict_anchoring_enabled, verdict_staleness_enabled, AnchorAction, ClaimedPr,
+        LeaseEvidence, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrComment, PrReclaimReason,
+        PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction, VerdictKeepReason,
+        VerdictKind, VerdictPr, VerdictReconcileStats, LEASE_MARKER_PREFIX,
         MAX_ISSUES_PER_WORKSPACE, VERDICT_HOLD_LABELS,
     };
     use crate::sweep_journal;
@@ -1985,30 +2055,7 @@ pub mod forge {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    fn list_building_issues(gh_bin: &Path, root: &Path) -> Result<Vec<BuildingIssue>> {
-        // ETag-cached REST listing (#4428): an unchanged claim set costs zero
-        // rate limit (304). `LOOM_REPO` precedence is handled inside; the
-        // `pull_request` filter keeps the pre-#4428 issue-only semantics.
-        let rows = crate::forge_listing::list_issues_cached(
-            gh_bin,
-            Some(root),
-            None,
-            "loom:building",
-            "open",
-        )?;
-        Ok(rows
-            .into_iter()
-            .filter(|r| !r.is_pull_request)
-            .map(|r| BuildingIssue {
-                number: r.number,
-                updated_at: r
-                    .updated_at
-                    .as_deref()
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc)),
-            })
-            .collect())
-    }
+    use super::building_listing::list_building_issues;
 
     /// Does an OPEN pull request exist for issue `issue`'s conventional branch
     /// (`feature/issue-<N>`, the name `worktree.sh` establishes)? Returns
@@ -3173,12 +3220,25 @@ pub mod forge {
                 // rate limit for nothing. `marker_scan_ok` records that the
                 // skip happened, so the anchoring pass (#6319) cannot mistake
                 // "not looked at" for "confirmed unmarked".
-                let (marker_sha, marker_scan_ok) = if on_hold {
-                    (None, false)
+                //
+                // The #9124 dedup rides on the SAME listing: whether this
+                // PR already carries the notice for the exact transition
+                // we would announce is answerable from these bodies, so it
+                // adds no call of its own.
+                let (marker_sha, marker_scan_ok, invalidation_recorded) = if on_hold {
+                    (None, false, false)
                 } else {
                     match fetch_comment_bodies(gh_bin, root, r.number) {
-                        Some(bodies) => (extract_latest_verdict_sha(&bodies, kind), true),
-                        None => (None, false),
+                        Some(bodies) => {
+                            let marker_sha = extract_latest_verdict_sha(&bodies, kind);
+                            let recorded = super::verdict_stale_comment::already_recorded(
+                                &bodies,
+                                marker_sha.as_deref().unwrap_or_default(),
+                                r.head_ref_oid.as_deref().unwrap_or_default(),
+                            );
+                            (marker_sha, true, recorded)
+                        }
+                        None => (None, false, false),
                     }
                 };
                 VerdictPr {
@@ -3188,128 +3248,10 @@ pub mod forge {
                     marker_sha,
                     marker_scan_ok,
                     on_hold,
+                    invalidation_recorded,
                 }
             })
             .collect())
-    }
-
-    /// Clear one stale verdict: post the auditable old->new SHA comment, then
-    /// swap the verdict label (plus its per-tree companions) for
-    /// `loom:review-requested`.
-    ///
-    /// The comment goes FIRST, deliberately: if the label write then fails,
-    /// the PR keeps a verdict that is at least explained, rather than getting
-    /// silently re-queued with no record of why. A failed comment aborts
-    /// before touching any label, so the transition is never applied without
-    /// its audit trail.
-    ///
-    /// Ahead of even the comment, any armed GitHub auto-merge is **disarmed**
-    /// (issue #8900) — see [`super::auto_merge_disarm`] for why the disarm is
-    /// first and why it is safe there. Without it the label flip below is
-    /// cosmetic: the queued server-side merge is gated only by the ruleset's
-    /// required checks and merges the unreviewed head anyway (#8694, #8847,
-    /// #8843 all merged that way on 2026-09-25).
-    fn invalidate_verdict(
-        gh_bin: &Path,
-        root: &Path,
-        pr: &VerdictPr,
-        marker_sha: &str,
-        head_sha: &str,
-    ) -> Result<()> {
-        let label = pr.kind.label();
-        // `None` (the common case: nothing was armed) contributes no line at
-        // all, so the comment never claims a disarm that did not happen.
-        let disarm_line =
-            super::auto_merge_disarm::disarm_before_invalidation(gh_bin, root, pr.number)
-                .map(|line| format!("\n{line}"))
-                .unwrap_or_default();
-        let body = format!(
-            "<!-- loom:verdict-stale from={marker_sha} to={head_sha} -->\n\
-             **Stale review verdict cleared — head SHA moved**\n\n\
-             This PR's `{label}` verdict was rendered against `{marker_sha}`, but the current \
-             head is `{head_sha}`. A review verdict is a statement about a specific tree, so it \
-             does not survive a rebase, a force-push, or new commits.\n\n\
-             - Verdict cleared: `{label}` (recorded for `{marker_sha}`)\n\
-             - Returned to the review queue: `loom:review-requested` (current head `{head_sha}`)\
-             {disarm_line}\n\n\
-             Judge will re-evaluate the tree that is actually here now. No judgment about the new \
-             tree is implied either way — the old verdict simply no longer describes it.\n\n\
-             ---\n\
-             *Automated by loom-daemon claim reconciliation (#5686)*"
-        );
-
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("comment")
-            .arg(pr.number.to_string())
-            .arg("--body")
-            .arg(&body);
-        cmd.current_dir(root);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
-        if !out.status.success() {
-            return Err(anyhow!(
-                "gh pr comment failed for #{} in {}: {}",
-                pr.number,
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-
-        // `loom:ci-failure` / `loom:merge-conflict` are findings about the OLD
-        // tree too — they ride along with the verdict they were applied
-        // beside, so they go with it.
-        //
-        // Remove BOTH terminal verdict labels here (`loom:pr` AND
-        // `loom:changes-requested`), not just `label` — this PR's OWN detected
-        // kind (issue #7018). `list_verdict_prs` walks the two verdict kinds
-        // independently, so a PR carrying both labels simultaneously (a
-        // contradictory state, a manual label edit, or debris left by an
-        // earlier partial write) is only ever reasoned about here under ONE
-        // kind at a time; a single-label removal would leave the OTHER
-        // verdict label standing beside the freshly re-added
-        // `loom:review-requested` — the exact mutual-exclusion violation this
-        // pass exists to prevent. `gh pr edit --remove-label` on a label that
-        // isn't present is a documented no-op, so requesting removal of both
-        // unconditionally is always safe.
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("edit")
-            .arg(pr.number.to_string())
-            .arg("--remove-label")
-            .arg(VerdictKind::Approved.label())
-            .arg("--remove-label")
-            .arg(VerdictKind::ChangesRequested.label())
-            .arg("--remove-label")
-            .arg("loom:ci-failure")
-            .arg("--remove-label")
-            .arg("loom:merge-conflict")
-            .arg("--add-label")
-            .arg("loom:review-requested");
-        cmd.current_dir(root);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
-        if !out.status.success() {
-            return Err(anyhow!(
-                "gh pr edit (clear {label}) failed for #{} in {}: {}",
-                pr.number,
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(())
     }
 
     /// Anchor one unmarked verdict to the PR's current head (Issue #6319):
@@ -3416,6 +3358,7 @@ pub mod forge {
             return stats;
         }
         let anchoring = verdict_anchoring_enabled();
+        let tree_carveout = super::verdict_invalidation::verdict_tree_carveout_enabled();
 
         for kind in [VerdictKind::Approved, VerdictKind::ChangesRequested] {
             let prs = match list_verdict_prs(gh_bin, root, kind) {
@@ -3453,28 +3396,15 @@ pub mod forge {
                     VerdictAction::Invalidate {
                         marker_sha,
                         head_sha,
-                    } => match invalidate_verdict(gh_bin, root, &pr, &marker_sha, &head_sha) {
-                        Ok(()) => {
-                            stats.invalidated += 1;
-                            log::warn!(
-                                "claim_reconciliation: cleared stale {} from PR #{} in {} \
-                                 (verdict recorded for {marker_sha}, head is now {head_sha}) — \
-                                 re-queued as loom:review-requested (#5686)",
-                                pr.kind.label(),
-                                pr.number,
-                                root.display(),
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "claim_reconciliation: failed to clear stale {} from PR #{} in \
-                                 {}: {e}",
-                                pr.kind.label(),
-                                pr.number,
-                                root.display()
-                            );
-                        }
-                    },
+                    } => super::verdict_invalidation::handle_invalidate(
+                        gh_bin,
+                        root,
+                        &pr,
+                        &marker_sha,
+                        &head_sha,
+                        tree_carveout,
+                        &mut stats,
+                    ),
                     VerdictAction::Keep(VerdictKeepReason::Unverifiable) => {
                         // Count only what we POSITIVELY know is unanchored. A
                         // held PR's comments are never fetched and a failed
@@ -3539,3 +3469,8 @@ mod tests;
 // so this over-threshold module does not grow (scripts/file-size-baseline.txt).
 #[cfg(test)]
 mod repo_env_tests;
+
+// Issue #9124's verdict-dedup coverage, in its own sibling file for the same
+// reason: neither this module nor `tests.rs` has ratchet headroom.
+#[cfg(test)]
+mod verdict_dedup_tests;

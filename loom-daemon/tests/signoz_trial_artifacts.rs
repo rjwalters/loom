@@ -23,7 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use loom_daemon::telemetry::ci::{
     CiAttr, CI_JOB_DURATION_METRIC, CI_METRIC_LABEL_KEYS, CI_RUN_DURATION_METRIC,
+    CI_SPAN_ATTRIBUTE_KEYS,
 };
+use loom_daemon::telemetry::trace::SpanName;
 use loom_daemon::telemetry::{CiJobLogRecord, CiJobRecord, CiRunRecord, RepoVisibility};
 use regex::Regex;
 
@@ -38,6 +40,8 @@ const SIGNOZ_README: &str = include_str!("../../defaults/observability/signoz/RE
 /// The standing build/CI retro queries (#8826). Governed by the CI record
 /// family's own vocabulary, not the shared fixture manifest's.
 const CI_QUERIES: &str = include_str!("../../defaults/observability/signoz/ci-queries.sql");
+/// The ETA accuracy queries (#9289).
+const ETA_QUERIES: &str = include_str!("../../defaults/observability/signoz/eta-queries.sql");
 
 /// Loom's own attribute namespace. Presence probes outside it are deliberate
 /// absence assertions (see [`fixture_queries_assert_the_privacy_sentinel_is_dropped`])
@@ -115,6 +119,26 @@ fn referenced_attribute_keys(sql: &str, container: &str) -> BTreeSet<String> {
     let mut keys = subscript_keys(sql, container);
     keys.extend(contains_keys(sql, container));
     keys
+}
+
+/// The artifact's statements, split on `;`. A statement carries the comment
+/// block that precedes it, which is why the split is on the terminator rather
+/// than on section headers.
+fn statements(sql: &str) -> Vec<&str> {
+    sql.split(';').filter(|s| !s.trim().is_empty()).collect()
+}
+
+/// The statements that read one SigNoz table. A `loom.ci.*` attribute is
+/// admitted by a *different* gateway allowlist depending on the signal it
+/// rides (log vs. span keep_keys), so "is this key forwarded?" can only be
+/// asked per statement, never over the whole file (#9089: section 11 is the
+/// first CI statement to read traces).
+fn statements_reading(sql: &str, table: &str) -> String {
+    statements(sql)
+        .into_iter()
+        .filter(|statement| statement.contains(table))
+        .collect::<Vec<_>>()
+        .join(";\n")
 }
 
 /// Span-name literals in Loom's namespace. Anchored on a non-identifier byte so
@@ -218,6 +242,7 @@ fn saved_queries_only_reference_forwarded_attribute_and_resource_keys() {
         ("fixture-queries.sql", FIXTURE_QUERIES),
         ("queries.sql", ADHOC_QUERIES),
         ("ci-queries.sql", CI_QUERIES),
+        ("eta-queries.sql", ETA_QUERIES),
     ] {
         for container in ["attributes_string", "attributes_number", "attributes_bool"] {
             for key in referenced_attribute_keys(sql, container) {
@@ -400,6 +425,7 @@ fn daemon_ci_log_attribute_containers() -> BTreeMap<String, &'static str> {
         completed_at: at,
         duration_ms: 0,
         queued_ms: Some(0),
+        trigger_reason: Some("new_commit".into()),
     };
     let job = CiJobRecord {
         repo: "2amlogic/example".into(),
@@ -416,6 +442,10 @@ fn daemon_ci_log_attribute_containers() -> BTreeMap<String, &'static str> {
         started_at: at,
         completed_at: at,
         duration_ms: 0,
+        queued_ms: Some(0),
+        shard_index: Some(1),
+        shard_total: Some(3),
+        shard_kind: "nextest-partition".into(),
     };
     let chunk = CiJobLogRecord {
         repo: "2amlogic/example".into(),
@@ -482,8 +512,15 @@ fn all_metric_name_literals(sql: &str) -> BTreeSet<String> {
 fn ci_queries_read_log_attributes_the_gateway_forwards_from_the_column_the_daemon_fills() {
     let log_keys = &keep_keys_by_context()["log"];
     let daemon = daemon_ci_log_attribute_containers();
+    // Log-reading statements only: the same `loom.ci.*` key is admitted by a
+    // different allowlist when it rides a span, and is rendered as an OTLP
+    // string there rather than by the log record's own type (#9089's section
+    // 11 reads traces — `ci_queries_read_span_attributes_the_gateway_forwards`
+    // is its counterpart).
+    let log_sql = statements_reading(CI_QUERIES, "signoz_logs.logs_v2");
+    assert!(!log_sql.is_empty(), "ci-queries.sql no longer reads signoz_logs.logs_v2 at all");
     for container in ["attributes_string", "attributes_number", "attributes_bool"] {
-        let keys = referenced_attribute_keys(CI_QUERIES, container);
+        let keys = referenced_attribute_keys(&log_sql, container);
         assert!(
             !keys.is_empty(),
             "ci-queries.sql no longer reads anything from {container}; if that is deliberate, \
@@ -509,6 +546,74 @@ fn ci_queries_read_log_attributes_the_gateway_forwards_from_the_column_the_daemo
                 ),
             }
         }
+    }
+}
+
+/// The trace-reading counterpart (#9089). Step and suite timings live only on
+/// `loom.ci.step` / `loom.ci.suite` spans (there is no log record and no metric
+/// series for either), so sections 11–13 read
+/// `signoz_traces.signoz_index_v3`
+/// — a different gateway allowlist (span `keep_keys`) and a different type
+/// rule: every span attribute is exported as an OTLP string, so SigNoz files
+/// all of them under `attributes_string` regardless of what the value looks
+/// like. Reading `attributes_number['loom.ci.step_number']` would return 0
+/// for every row rather than error, which is the silent-zero-rows failure
+/// this whole file exists to rule out.
+#[test]
+fn ci_queries_read_span_attributes_the_gateway_forwards_from_the_string_column() {
+    let span_keys = &keep_keys_by_context()["span"];
+    let trace_sql = statements_reading(CI_QUERIES, "signoz_traces.signoz_index_v3");
+    assert!(
+        !trace_sql.is_empty(),
+        "ci-queries.sql no longer reads signoz_traces.signoz_index_v3; if the step-span and \
+         suite-span sections (#9089) were deliberately removed, remove this guard with them \
+         rather than letting it go vacuous"
+    );
+    let ci_span_vocabulary: BTreeSet<&str> = CI_SPAN_ATTRIBUTE_KEYS
+        .iter()
+        .copied()
+        .chain(["loom.repo", "loom.repo.visibility", "loom.pr_number"])
+        .collect();
+    for container in ["attributes_number", "attributes_bool"] {
+        assert!(
+            referenced_attribute_keys(&trace_sql, container).is_empty(),
+            "ci-queries.sql reads a span attribute from {container}; the daemon exports every \
+             span attribute as an OTLP string, so that subscript is an empty/zero value on \
+             every row, not an error"
+        );
+    }
+    let keys = referenced_attribute_keys(&trace_sql, "attributes_string");
+    assert!(!keys.is_empty(), "ci-queries.sql's trace section reads no span attribute");
+    for key in keys {
+        assert!(
+            span_keys.contains(&key),
+            "ci-queries.sql: attributes_string['{key}'] is stripped by the gateway's SPAN \
+             keep_keys allowlist, so this query can only ever return zero rows"
+        );
+        assert!(
+            ci_span_vocabulary.contains(key.as_str()),
+            "ci-queries.sql reads span attribute '{key}', which no CI span sets; the daemon's \
+             CI span vocabulary is {ci_span_vocabulary:?}"
+        );
+    }
+    // Derived from the enum, not restated: a CI span name added to `SpanName`
+    // is admitted here automatically, while a typo or a non-CI span name in the
+    // SQL (which would silently return zero rows) still fails.
+    let ci_span_names: BTreeSet<&str> = [
+        SpanName::CiRun,
+        SpanName::CiJob,
+        SpanName::CiStep,
+        SpanName::CiSuite,
+    ]
+    .iter()
+    .map(|name| name.as_str())
+    .collect();
+    for name in span_name_literals(&trace_sql) {
+        assert!(
+            ci_span_names.contains(name.as_str()),
+            "ci-queries.sql's trace section filters span name '{name}', which is not one of the \
+             CI spans the daemon emits ({ci_span_names:?})"
+        );
     }
 }
 

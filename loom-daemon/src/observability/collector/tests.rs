@@ -9,6 +9,7 @@ use serial_test::serial;
 
 fn dispatch_event(issue: u32, sweep_id: &str) -> Event {
     Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: sweep_id.to_string(),
         kind: SweepKind::Issue(issue),
         runtime: None,
@@ -211,6 +212,7 @@ fn blocker_event_yields_no_records() {
 #[test]
 fn event_issue_ignores_pr_set_dispatch() {
     let event = Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: "sweep-prs-0".to_string(),
         kind: SweepKind::PrSet(vec![1, 2]),
         runtime: None,
@@ -276,6 +278,7 @@ fn registry_provider_accounts_are_empty_when_nothing_is_registered() {
 fn sweep_started_carries_the_dispatch_runtime() {
     let mut dispatches = HashMap::new();
     let event = Event::SweepGlobalDispatch {
+        story_points: None,
         sweep_id: "sweep-issue-7-0".to_string(),
         kind: SweepKind::Issue(7),
         runtime: Some("codex".to_string()),
@@ -887,7 +890,11 @@ async fn collect_managed_repos_reports_every_provisioned_registrys_repo_even_whe
         }
     }
 
-    let mut repos = collect_managed_repos_with(&pool, &mut slug_cache, fake_visibility).await;
+    // #9244 (loom-ui#153): repo-a is a registered workspace at priority 0;
+    // repo-b is not registered, so it carries no priority.
+    let priorities = HashMap::from([(a_root.clone(), 0)]);
+    let mut repos =
+        collect_managed_repos_with(&pool, &mut slug_cache, fake_visibility, &priorities).await;
     repos.sort_by(|a, b| a.slug.cmp(&b.slug));
     assert_eq!(
         repos,
@@ -895,10 +902,12 @@ async fn collect_managed_repos_reports_every_provisioned_registrys_repo_even_whe
             ManagedRepoEntry {
                 slug: "loom-test-fixture/repo-a".to_string(),
                 visibility: RepoVisibility::Public,
+                priority: Some(0),
             },
             ManagedRepoEntry {
                 slug: "loom-test-fixture/repo-b".to_string(),
                 visibility: RepoVisibility::Private,
+                priority: None,
             },
         ],
         "both registered repos are in the roster, each with its derived visibility, \

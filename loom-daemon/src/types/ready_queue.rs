@@ -4,9 +4,11 @@
 //! backoff-skip, 2 deferred-capacity"); these rows say *which* issue got
 //! *which* outcome, in the order the work finder actually ranks them. The
 //! order is the daemon's own dispatch comparator,
-//! `crate::work_finder::candidate_cmp`: workspace priority, then `loom:urgent`,
-//! then oldest `createdAt`, then issue number. `tier:*` labels are carried
-//! as information only; they do not affect dispatch order.
+//! `crate::work_finder::candidate_cmp` (#9244): `loom:operator-priority`
+//! (starred) first, starred issues by starred-at, then red-main fixes (only
+//! while that repo's `main` is verified red), then workspace priority, then
+//! oldest `createdAt`, then issue number. `loom:urgent` and `tier:*` labels
+//! do not affect dispatch order.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +32,10 @@ pub enum QueueDisposition {
     DeferredRampCap,
     /// Waiting: the saturation admission brake held new admissions.
     DeferredSaturation,
+    /// Waiting: the build back-off (#9410) held new issue builds because the
+    /// host's review + merge debt is high. Starred and red-main-fix issues
+    /// bypass it, so this row is always an unstarred issue.
+    DeferredBuildBackoff,
     /// Waiting: outside this host's preferred repo slice while the slice still
     /// had work (repo sharding, #6243).
     DeferredOutOfSlice,
@@ -89,12 +95,13 @@ impl QueueDisposition {
     /// ([`Self::LabelledBlocked`] and [`Self::Unknown`] excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
     /// point per entry every tick, zeros included, so an empty queue reads as
     /// `0` rather than as a missing series.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Dispatched,
         Self::InFlight,
         Self::DeferredCapacity,
         Self::DeferredRampCap,
         Self::DeferredSaturation,
+        Self::DeferredBuildBackoff,
         Self::DeferredOutOfSlice,
         Self::DeferredRepoCap,
         Self::WorkspaceHalted,
@@ -125,6 +132,7 @@ impl QueueDisposition {
             Self::DeferredCapacity => "deferred_capacity",
             Self::DeferredRampCap => "deferred_ramp_cap",
             Self::DeferredSaturation => "deferred_saturation",
+            Self::DeferredBuildBackoff => "deferred_build_backoff",
             Self::DeferredOutOfSlice => "deferred_out_of_slice",
             Self::DeferredRepoCap => "deferred_repo_cap",
             Self::WorkspaceHalted => "workspace_halted",
@@ -158,6 +166,7 @@ impl QueueDisposition {
             Self::DeferredCapacity
             | Self::DeferredRampCap
             | Self::DeferredSaturation
+            | Self::DeferredBuildBackoff
             | Self::DeferredOutOfSlice
             | Self::DeferredRepoCap => "ready",
             _ => "blocked",
@@ -173,6 +182,7 @@ impl QueueDisposition {
             Self::DeferredCapacity => "waiting: concurrency cap full",
             Self::DeferredRampCap => "waiting: per-tick admission cap reached",
             Self::DeferredSaturation => "waiting: host saturated (admission brake)",
+            Self::DeferredBuildBackoff => "waiting: build back-off (review/merge debt high)",
             Self::DeferredOutOfSlice => "waiting: outside this host's repo slice",
             Self::DeferredRepoCap => "waiting: this repo is at its per-repo cap",
             Self::WorkspaceHalted => {
@@ -210,8 +220,20 @@ pub struct ReadyQueueRow {
     pub issue: u32,
     /// The owning workspace's priority tier (lower dispatches first).
     pub workspace_priority: u32,
-    /// Whether the issue carries `loom:urgent`.
+    /// Deprecated (#9244): always `false`. `loom:urgent` no longer affects
+    /// dispatch order; the field stays on the wire for one release.
     pub urgent: bool,
+    /// Whether the issue is starred (`loom:operator-priority`, #9244).
+    #[serde(default)]
+    pub operator_priority: bool,
+    /// When it was starred, when known (#9244). Absent for an unstarred
+    /// issue, or a starred one ordered by its `createdAt` fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_priority_at: Option<String>,
+    /// Whether it is a red-main fix boosted this tick: it carries
+    /// `<!-- loom:main-red-fix -->` and its repo's `main` is verified red.
+    #[serde(default)]
+    pub main_red_fix: bool,
     /// The issue's `createdAt`, when the listing supplied it.
     #[serde(default)]
     pub created_at: Option<String>,
@@ -233,6 +255,12 @@ pub struct ReadyQueueRow {
     /// [`QueueDisposition::reason`], serialized for the same reason.
     #[serde(default)]
     pub reason: String,
+    /// The dispatch-plan fields (Issue #9288): `position`, `plan_state`,
+    /// `keys`, `gate`, `in_slice`, `hot`, `owning_shard`, `repo_cap`.
+    /// Flattened, so they sit beside `rank` on the wire; all default when
+    /// absent.
+    #[serde(flatten, default)]
+    pub plan: super::RowPlan,
 }
 
 #[cfg(test)]
@@ -251,6 +279,39 @@ mod tests {
         assert_eq!(row.created_at, None);
         // A pre-phase-2 payload has no `state`/`reason`: they default empty.
         assert!(row.state.is_empty() && row.reason.is_empty());
+        // A pre-#9288 payload has no plan fields: they default.
+        assert_eq!(row.plan, crate::types::RowPlan::default());
+    }
+
+    /// Issue #9288: the plan fields are flattened beside `rank`, and a tick
+    /// summary without a `plan` block still parses.
+    #[test]
+    fn plan_fields_flatten_and_old_summaries_parse() {
+        let row: ReadyQueueRow = serde_json::from_value(serde_json::json!({
+            "rank": 4, "repo": "/r", "issue": 7, "workspace_priority": 100,
+            "urgent": false, "disposition": "deferred_capacity",
+            "position": 2, "plan_state": "next", "gate": "capacity",
+            "keys": [{"name": "number", "value": 7}]
+        }))
+        .unwrap();
+        assert_eq!(row.plan.position, Some(2));
+        assert_eq!(row.plan.plan_state, crate::types::PlanState::Next);
+        let back = serde_json::to_value(&row).unwrap();
+        assert_eq!(back["position"], 2);
+        assert_eq!(back["plan_state"], "next");
+        assert!(back.get("plan").is_none(), "flattened, not nested: {back}");
+
+        let summary: crate::types::WorkFinderTickSummary =
+            serde_json::from_value(serde_json::json!({
+                "at": "2026-09-28T00:00:00Z", "max_concurrent": 2, "seen": 0,
+                "dispatched": 0, "skipped_labeled": 0, "skipped_in_flight": 0,
+                "skipped_quarantined": 0, "skipped_pr_open": 0,
+                "skipped_peer_claim": 0, "skipped_backoff": 0,
+                "deferred_capacity": 0, "deferred_ramp_cap": 0, "errors": 0,
+                "halted": false
+            }))
+            .unwrap();
+        assert!(summary.plan.is_none());
     }
 
     #[test]
@@ -265,6 +326,34 @@ mod tests {
         // does.
         assert_eq!(QueueDisposition::HostClassRefused.state(), "blocked");
         assert_eq!(QueueDisposition::HostClassRefused.as_str(), "host_class_refused");
+    }
+
+    /// Issue #9410: the build back-off disposition round-trips, is a
+    /// capacity-style `ready` wait, and a pre-#9410 tick summary still parses.
+    #[test]
+    fn build_backoff_disposition_round_trips_and_old_summaries_parse() {
+        let d = QueueDisposition::DeferredBuildBackoff;
+        assert_eq!(QueueDisposition::ALL.len(), 24);
+        assert!(QueueDisposition::ALL.contains(&d));
+        let json = serde_json::to_value(d).unwrap();
+        assert_eq!(json, serde_json::json!("deferred_build_backoff"));
+        assert_eq!(serde_json::from_value::<QueueDisposition>(json).unwrap(), d);
+        assert_eq!(d.state(), "ready");
+        assert_eq!(d.reason(), "waiting: build back-off (review/merge debt high)");
+        let gate = serde_json::to_value(crate::types::PlanGate::BuildBackoff).unwrap();
+        assert_eq!(gate, serde_json::json!("build_backoff"));
+
+        let summary: crate::types::WorkFinderTickSummary =
+            serde_json::from_value(serde_json::json!({
+                "at": "2026-09-28T00:00:00Z", "max_concurrent": 2, "seen": 0,
+                "dispatched": 0, "skipped_labeled": 0, "skipped_in_flight": 0,
+                "skipped_quarantined": 0, "skipped_pr_open": 0,
+                "skipped_peer_claim": 0, "skipped_backoff": 0,
+                "deferred_capacity": 0, "deferred_ramp_cap": 0, "errors": 0,
+                "halted": false, "saturation_held": true
+            }))
+            .unwrap();
+        assert_eq!((summary.deferred_build_backoff, summary.build_backoff_held), (0, false));
     }
 
     #[test]

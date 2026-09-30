@@ -96,10 +96,10 @@ label documents its own `Applied by:` owner). State transitions:
 - **Epic**: `loom:epic` → Champion creates phased `loom:architect` +
   `loom:epic-phase` issues.
 
-`loom:operator` is the first-class "a human is needed" state (engine stops
-acting, re-evaluable, unlike `loom:operator-only`) — wired at Champion's
-merge-risk hold only so far. What is currently waiting on you: the pinned
-merge-risk hold digest (#6877) and the two label queries, both in
+`loom:operator` means "a human is needed" (engine stops, re-evaluable, unlike
+`loom:operator-only`; set by Champion's merge-risk hold). `loom:operator-priority`
+is the operator's star (not a hold); every stage takes it first. Your
+queue: the pinned hold digest (#6877) and label queries in
 [`.loom/docs/label-state-machine.md`](.loom/docs/label-state-machine.md).
 
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from
@@ -128,10 +128,10 @@ second copy can go missing its pre-claim guard (#8551).
 - Loom-managed worktrees (with the `.loom-managed` sentinel) are auto-removed on
   merge AND by the daemon's periodic reaper (#4876, catches merges made on another
   host); user-provisioned worktrees are never removed — `LOOM_PRESERVE_WORKTREE=1`.
-- `worktree.sh N` detects and skips a stale `origin/feature/issue-N` whose tip is
-  already the head of a **merged** PR (e.g. a partial-increment slice's branch
-  name reused by the next slice, #3667/#3599) instead of reusing it — see
-  [`.loom/docs/troubleshooting.md`](.loom/docs/troubleshooting.md) (#5657).
+- `worktree.sh N` skips a stale `origin/feature/issue-N` whose tip heads a
+  **merged** PR (slice branch reuse, #3667/#3599), and refuses outright — naming
+  the PR + a resume path — when it heads a PR **closed unmerged**; see
+  [`.loom/docs/troubleshooting.md`](.loom/docs/troubleshooting.md) (#5657/#9083).
 
 ### Merging PRs
 

@@ -67,8 +67,8 @@ fn persistent_context_is_stable_across_reopen_and_distinct_per_execution_repo() 
     assert_eq!(TraceStore::load(&store.path(a.path(), "issue-18-attempt-1")).unwrap(), first);
 }
 
-/// harness-ops `internal/storyid/testdata/vectors.json`, copied verbatim: the
-/// cross-language D32 v1 conformance vectors (#9068).
+/// 2AMLogic/2am `infra/ops/internal/storyid/testdata/vectors.json`, copied
+/// verbatim: the cross-language D32 v1 conformance vectors (#9068, #9223).
 const D32_VECTORS: &str = include_str!("../../../tests/fixtures/story_vectors_d32_v1.json");
 
 #[test]
@@ -87,7 +87,7 @@ fn story_ids_match_every_d32_v1_reference_vector() {
         assert_eq!(story.flags, 1);
     }
     let spans = fixture["span_vectors"].as_array().unwrap();
-    assert_eq!(spans.len(), 2);
+    assert_eq!(spans.len(), 10);
     for v in spans {
         let span = story_span_id(
             v["repo_id"].as_u64().unwrap(),
@@ -105,6 +105,11 @@ fn story_ids_match_every_d32_v1_reference_vector() {
         .map(|k| k.as_str().unwrap())
         .collect();
     assert_eq!(kinds, STORY_SPAN_KINDS);
+    // Every kind is pinned by at least one cross-language span vector, so a
+    // kind cannot join the allowlist with an unchecked derivation.
+    for kind in STORY_SPAN_KINDS {
+        assert!(spans.iter().any(|v| v["kind"] == kind), "no span vector for {kind}");
+    }
     assert_eq!(fixture["source_event_id_pattern"], "^[A-Za-z0-9._-]{1,256}$");
 }
 
@@ -129,7 +134,22 @@ fn story_span_id_refuses_what_d32_refuses() {
     let ok = |kind: &str, event: &str| story_span_id(1, 1, kind, event);
     assert!(ok("story.merge", "a.B_c-9").is_ok());
     assert!(ok("story.merge", &"x".repeat(256)).is_ok());
-    for kind in ["loom.story", "ci.run", "story.Merge", "story.merge ", ""] {
+    for kind in STORY_SPAN_KINDS {
+        assert!(ok(kind, "1").is_ok(), "{kind:?}");
+    }
+    for kind in [
+        "loom.story",
+        "ci.run",
+        "story.Merge",
+        "story.merge ",
+        "",
+        "story.Rework",
+        "story.rework ",
+        "story.operator-hold",
+        "story.operator_hold ",
+        "story.doctor",
+        "story.ci.",
+    ] {
         assert_eq!(ok(kind, "1"), Err(StoryIdError::UnknownKind), "{kind:?}");
     }
     let too_long = "x".repeat(257);

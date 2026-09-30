@@ -124,7 +124,9 @@ loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr"
 # command, and every `# requires-daemon:` marker comment — that function reads
 # the floor back out of ${BASH_SOURCE[0]}, i.e. out of THIS extracted file, so
 # the markers have to travel with it or the refusal degrades to
-# `<undeclared>` here while production says 0.19.172.
+# `<undeclared>` here while production names whatever version the marker
+# declares. Deliberately not quoting that version: it MOVES (#8967 raised it
+# from 0.19.172 to 0.19.465), and a number pinned in prose here just goes stale.
 FUNCS_FILE="$(mktemp)"
 trap 'rm -f "$FUNCS_FILE" 2>/dev/null || true' EXIT
 awk '
@@ -249,13 +251,15 @@ assert_contains "$LAST_OUT" "loom:review-requested" "Block message names loom:re
 # actually opens the merge, and that it opens it for NOTHING ELSE.
 DRY_RUN=false
 PR_HEAD_SHA="c0ffee1"
-PR_LABELS=$'loom:pr\nloom:operator\nloom:urgent'
+PR_LABELS=$'loom:pr\nloom:operator\nloom:operator-priority'
 run_guard
 assert_eq "1" "$LAST_RC" "#9016: while the critical-file hold's loom:operator is on, the merge is still refused"
 
 # The operator's release: the label is gone, `loom:pr` (Judge's approval of this
 # head) stays. No flag, no bypass — the contradiction is simply no longer there.
-PR_LABELS=$'loom:pr\nloom:urgent'
+# loom:operator-priority (#9244) rides along to prove the release is an EXACT
+# match on loom:operator, never a prefix match on the operator's star.
+PR_LABELS=$'loom:pr\nloom:operator-priority'
 run_guard
 assert_eq "0" "$LAST_RC" "#9016: once the operator removes loom:operator, merge-pr.sh passes this guard with no override flag"
 assert_not_contains "$LAST_OUT" "Merge blocked" "#9016: a released critical-file hold produces no block message"
@@ -266,7 +270,7 @@ assert_not_contains "$LAST_OUT" "Merge blocked" "#9016: a released critical-file
 PR_LABELS=$'loom:pr\nloom:changes-requested'
 run_guard
 assert_eq "1" "$LAST_RC" "#9016 does not weaken #8112: loom:pr + loom:changes-requested is still a hard block"
-PR_LABELS=$'loom:pr\nloom:changes-requested\nloom:urgent'
+PR_LABELS=$'loom:pr\nloom:changes-requested\nloom:operator-priority'
 run_guard
 assert_eq "1" "$LAST_RC" "#9016 does not weaken #8112: a rejection blocks even with loom:operator absent"
 assert_contains "$LAST_OUT" "loom:changes-requested" "#9016: the rejection is still the named blocker"

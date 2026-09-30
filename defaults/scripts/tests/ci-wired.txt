@@ -48,6 +48,7 @@ test-champion-issue-promo-escalation-respects-human-hold.sh
 test-champion-pr-merge-negation-guard.sh
 test-champion-premise-false-close.sh
 test-champion-standing-authorization.sh
+test-check-branch-name.sh
 test-check-ci-status.sh
 test-check-config-no-host-paths.sh
 test-check-conflict-markers.sh
@@ -107,7 +108,6 @@ test-guide-operator-only-exclude.sh
 test-guide-plan-body-stable-sort.sh
 test-guide-pool-pressure-defer.sh
 test-guide-superseding-block-merge-state.sh
-test-guide-urgency-rank.sh
 test-guide-work-log-debounce.sh
 test-guide-work-log-issue-out-of-order.sh
 test-guide-work-log-issue-pagination.sh
@@ -174,6 +174,7 @@ test-resync-installed-gh-config-guard.sh
 test-resync-installed-guard-check.sh
 test-resync-installed-local-fix-guard.sh
 test-resync-installed-retired-dry-run.sh
+test-resync-installed-dogfood-symlink.sh
 test-resync-installed.sh
 test-review-feedback-reconciliation.sh
 test-run-ci-suites-daemon-guard.sh
@@ -181,6 +182,7 @@ test-run-ci-suites-failure-excerpt.sh
 test-run-ci-suites-retry.sh
 test-run-ci-suites-serial-lane.sh
 test-run-ci-suites-shard.sh
+test-run-ci-suites-timings.sh
 test-run-job.sh
 test-safe-stash-pop.sh
 test-safehoused-service.sh
@@ -199,8 +201,8 @@ test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
 test-sync-labels-check.sh
 test-token-cache-affinity.sh
+test-claude-wrapper-proxy-rotation.sh
 test-sync-labels-repo-flag.sh
-test-urgent-flip-guard.sh
 test-verdict-staleness-guard.sh
 test-verify-install-scope.sh
 test-version-bump-workflow-identity.sh
@@ -213,7 +215,6 @@ test-worktree-forge-pr-check.sh
 test-worktree-hookspath.sh
 test-worktree-remote-branch-tracking.sh
 test-worktree-root-override.sh
-test-worktree-sentinel-reinvoke.sh
 test-worktree-sentinel.sh
 test-worktree-stale-merged-branch.sh
 
@@ -245,6 +246,7 @@ tests/hooks/test-post-worktree-target-dir.sh
 defaults/hooks/tests/test-guard-background-subagents.sh
 defaults/hooks/tests/test-guard-installed-file-writes.sh
 defaults/hooks/tests/test-guard-loom-workspace.sh
+defaults/hooks/tests/test-guard-secret-scan.sh
 defaults/hooks/tests/test-guard-worktree-paths.sh
 defaults/hooks/tests/test-hook-wiring.sh
 defaults/hooks/tests/test-methodology-inject.sh

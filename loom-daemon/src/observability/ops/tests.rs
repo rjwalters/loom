@@ -482,12 +482,16 @@ fn queue_summary(
                 issue: u32::try_from(i).unwrap(),
                 workspace_priority: 100,
                 urgent: false,
+                operator_priority: false,
+                operator_priority_at: None,
+                main_red_fix: false,
                 created_at: None,
                 tier: None,
                 disposition: *d,
                 detail: None,
                 state: d.state().into(),
                 reason: d.reason().into(),
+                plan: Default::default(),
             })
             .collect(),
         ..Default::default()

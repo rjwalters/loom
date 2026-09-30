@@ -155,6 +155,7 @@ in ordinary CI, with no Docker, network or credential:
 | Every image is digest-pinned and byte-identical to the casting, and its version tag is still the one this README lists | Catches a floating tag, a hand-edited render, and a stale version table |
 | The histogram helper's SHA-256 check runs *before* `tar -xzf`, pins both architectures, refuses unknown ones, and matches the digests above | It is the one component fetched at start-up rather than pinned by digest, so ordering is the whole integrity property |
 | The documented 3.75 GiB steady-state / 768 MiB transient budget is the sum of the rendered `mem_limit`s, and every service caps logs at three 10 MiB files | Sizing figures an operator provisions a host against, and the disk claim below |
+| Every ClickHouse `system.*_log` keeps a `DELETE` TTL, and `metric_log` uses the transposed schema, set by the casting's declarative patch | The wide upstream `metric_log`'s TTL merge does not fit the 2 GiB cap, so it silently stops expiring (see "ClickHouse self-telemetry" below) |
 
 It deliberately asserts nothing about a *running* deployment: readiness, storage
 and retention stay `evidence.md`'s job.
@@ -220,12 +221,15 @@ Verified against a local `clickhouse-local` with a mock `samples_v4` /
 
 ### CI retro queries
 
-`ci-queries.sql` is the standing build/CI retro (#8826): six numbered sections
-over what `loom-daemon ci-telemetry` captures — duration trend, regression
-spotlight, outcome mix, top slow jobs, failed run → logs, and run waterfall.
+`ci-queries.sql` is the standing build/CI retro (#8826): numbered sections over
+what `loom-daemon ci-telemetry` captures — duration trend, regression
+spotlight, outcome mix, top slow jobs, failed run → logs, run waterfall, the
+per-issue ship breakdown, CI time per trigger reason, and (#9089) job queue
+wait, shard imbalance, step timings, slowest suites and suite-level rebalance.
 Sections 1–3 read the `loom.ci.*.duration_ms` histograms (kept 30 days);
-4–6 read the `ci.run` / `ci.job` / `ci.job.log` records (kept 7 days). Bind
-all five parameters once:
+4–10 and 14 read the `ci.run` / `ci.job` / `ci.job.log` records (kept 7
+days); 11–13 read `signoz_traces.signoz_index_v3` (kept 7 days). Bind all five parameters
+once:
 
 ```console
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery --param_since='2026-09-01 00:00:00' --param_repo='' --param_bucket_hours=24 --param_window_hours=168 --param_top=20 < ci-queries.sql
@@ -237,7 +241,12 @@ queries: every log attribute it reads must be in the gateway's **log**
 daemon sends it as (`loom.ci.run_id` is an int, so `attributes_number`), every
 metric label must be a CI histogram label the **datapoint** allowlist keeps,
 and every metric series must be a `.sum` / `.count` series of the two CI
-histograms. Policy and pipeline: [CI observability](../../docs/ci-observability.md).
+histograms. The trace-reading sections (11–13) are guarded separately: their
+attributes must be in the gateway's **span** `keep_keys`, and must be read from
+`attributes_string` only — every OTLP span attribute is a string regardless of
+the type it names, so a subscript into `attributes_number` there would silently
+return 0 on every row instead of erroring. Policy and pipeline:
+[CI observability](../../docs/ci-observability.md).
 
 ### Saved views
 
@@ -257,21 +266,30 @@ histograms. Policy and pipeline: [CI observability](../../docs/ci-observability.
 | CI top slow jobs | Logs Explorer: filter `body = 'ci.job'`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.duration_ms`, `loom.ci.run_id`, `loom.ci.job_id`; sort by `loom.ci.duration_ms` descending; save as view `CI top slow jobs` (`ci-queries.sql` 4) |
 | CI failed run → logs | Logs Explorer: filter `body = 'ci.run' AND loom.ci.conclusion IN ('failure', 'timed_out', 'startup_failure')`, save as `CI failed runs`; take a `loom.ci.run_id`, filter `body = 'ci.job' AND loom.ci.run_id = <id> AND loom.ci.conclusion != 'success'` for its failing jobs, then `loom.ci.job_id = <job id> AND loom.ci.chunk_index EXISTS` sorted by `loom.ci.chunk_index` ascending for the job's log, in order (`ci-queries.sql` 5) |
 | CI run waterfall | Trace Explorer: filter `name = 'loom.ci.run'`, sort by duration descending, open a run; its `loom.ci.job` children are the waterfall, and the longest child against the root's duration is the run/longest-job comparison (`ci-queries.sql` 6) |
+| CI job queue wait | Logs Explorer: filter `body = 'ci.job' AND loom.ci.queued_ms EXISTS`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.queued_ms`; group by `loom.ci.job` with **P50**/**P90**, time range 7 days; **alert when p90 exceeds 60s** — a runner-queue-cap burst shows here long before it shows in the run-level queue segment. A job GitHub reported no `created_at` for contributes no sample, not a zero (`ci-queries.sql` 9) |
+| CI shard balance | Logs Explorer: filter `body = 'ci.job' AND loom.ci.shard.kind != 'none'`, add columns `loom.ci.run_id`, `loom.ci.job`, `loom.ci.shard.index`, `loom.ci.shard.total`, `loom.ci.duration_ms`; group by `loom.ci.run_id`, `loom.ci.shard.kind` — the spread between the slowest and fastest leg of one run is the rebalancing signal. The ranked spread across runs lives in the SQL (`ci-queries.sql` 10) |
+| CI step waterfall | Trace Explorer: open a run as above and expand a `loom.ci.job` child — its `loom.ci.step` children are the within-job waterfall (compile vs. test). For the cross-run view, filter `name = 'loom.ci.step'`, group by `loom.ci.job`, `loom.ci.step` with **P90**, sorted descending (`ci-queries.sql` 11) |
+| CI slowest suites | Trace Explorer: filter `name = 'loom.ci.suite'`, group by `loom.ci.job`, `loom.ci.suite` with **Sum** (and a second query with **P90**), time range 7 days, sorted descending. Add `loom.ci.suite.outcome` / `loom.ci.suite.retried` as filters to separate "slow because it runs twice" from "slow". A suite that did not run in a leg has no span at all, so it never appears here as a fast suite (`ci-queries.sql` 12) |
+| CI suite rebalance | Same filter grouped by `loom.ci.run_id`, `loom.ci.shard.index` with **Sum** — one bar per leg of a run, which is the per-leg suite time a `LOOM_CI_SHARD` split should equalize. `argMax(suite, duration)` per leg (the named suite to move) is SQL-only (`ci-queries.sql` 13). Expect the summed suite time to be **less** than the leg's job wall time (checkout and toolchain setup are steps, not suites) and **more** than the wall time of the step that ran them (suites run concurrently); the comparison that matters is between legs of the same run |
+| CI critical path | Logs Explorer: filter `body = 'ci.job' AND loom.ci.run_id = <id>`, add columns `loom.ci.job`, `loom.ci.queued_ms`, `loom.ci.duration_ms`, and sort by `loom.ci.duration_ms` descending — the leg with the largest queue + running sum is the run's critical path. The `unexplained_s` residual (run wall time minus the run's own queue and that leg's total, i.e. the serialized `needs:` time) requires a run↔job join and is SQL-only (`ci-queries.sql` 14) |
 
-`ci-queries.sql` 7) (#9007's per-issue Builder/CI/Judge/merge breakdown) has no
-row above: it joins `loom_analytics.raw_ship_outcome` against `ci.run` records
-across two logical sources, which is not a single SigNoz Explorer/dashboard
-panel the way sections 1–6 are — it is a `clickhouse-client`-only report, run
-the same way as the rollup's other CT queries.
+`ci-queries.sql` 7) (#9007's per-issue Builder/CI/Judge/merge breakdown) and 8)
+(#9337's CI time per trigger reason) have no row above: 7 joins
+`loom_analytics.raw_ship_outcome` against `ci.run` records across two logical
+sources, which is not a single SigNoz Explorer/dashboard panel the way the
+other sections are — it is a `clickhouse-client`-only report, run the same way
+as the rollup's other CT queries.
 
-The six CI rows are **recreation steps, not yet observed**: no session has had
-an authenticated UI (or API) credential for the trial org since they were
-written, so none of the six has been created there yet
+The twelve CI rows are **recreation steps, not yet observed**: no session has
+had an authenticated UI (or API) credential for the trial org since they were
+written, so none of the twelve has been created there yet
 ([#8946](https://github.com/rjwalters/loom/issues/8946)). Their SQL
 counterparts in `ci-queries.sql` are the executed, verified form — see
 `evidence.md`'s "CI retro queries, executed live" section — and remain the
 acceptance surface until someone with the trial org's login creates the saved
-views and records it.
+views and records it. The six #9089 rows are additionally **unexecuted**:
+sections 9–14 read attributes and spans this change introduces, so no run
+predating it can have produced a row for them.
 
 Save these searches/dashboards through the installed UI and retain sanitized
 exports where supported. These precise steps avoid asserting that mutable
@@ -354,15 +372,156 @@ Accounts, dashboards and settings in PostgreSQL persist independently.
 Container stdout/stderr rotate separately at three 10 MiB files per service;
 ClickHouse's own system tables and metadata also consume storage.
 
+### ClickHouse self-telemetry
+
+ClickHouse's own `system.*_log` tables, not Loom's signals, dominate this
+trial's disk: about 480 MiB against about 2.5 MiB of Loom data on a 2.5-day
+soak (`evidence.md`, 2026-09-28). Upstream renders a 1-day TTL for each of
+them, which ClickHouse applies only during merges. The casting switches
+`system.metric_log` to ClickHouse's `transposed_with_wide_view` schema
+because the default 1,552-column table's merge memory grows with input parts
+times columns. Under the 2 GiB cap, its TTL-applying merge failed thousands of
+times an hour, and parts outlived their TTL. `system.metric_log` stays
+queryable as a view with the same columns.
+
+A deployment first started from an older render keeps its wide table. The
+config is a single-file bind mount, so a plain `up -d` does not pick up a
+re-render: recreate the ClickHouse container (its volume persists). On start
+it renames the old table to `system.metric_log_0`, stuck parts included. That
+table holds ClickHouse's own diagnostics only, no Loom signal, so drop it:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml up -d --wait --wait-timeout 1800 --force-recreate --no-deps loom-signoz-telemetrystore-clickhouse-0-0
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "DROP TABLE system.metric_log_0"
+```
+
+Check for merge failures when you check retention. A non-zero count means some
+table has stopped expiring:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT table, countIf(error != 0) failed_merges, countIf(error = 0) ok FROM system.part_log WHERE event_type = 'MergeParts' GROUP BY table HAVING failed_merges > 0"
+```
+
 Use the same `--env-file` and `-f` arguments for every Compose command.
 `docker compose ... stop` preserves all data.
 Restart with the same rendered files and `up -d --wait --wait-timeout 1800`;
 verify an old trace, gauge and saved view before accepting restart persistence.
 For backup, stop this project and snapshot its four named volumes together:
 PostgreSQL data, Keeper coordination, ClickHouse data and histogram user scripts.
-Retain the casting, lock and rendered configuration. Test restoration into a
-separate project/network before relying on the backup. Never stop or remove
-another deployment's containers/volumes.
+Retain the casting, lock and rendered configuration — **and the private
+`--env-file`**: the snapshot replays a metastore whose database role and
+session-signing secret are already set, so a restore with a fresh secret file
+cannot read it. Never stop or remove another deployment's
+containers/volumes. Then rehearse the restore as below before relying on the
+backup.
+
+## Backup-restore rehearsal
+
+A snapshot you have never restored is a guess. Rehearse it with
+`restore-override.yaml`, which layers onto the same rendered compose and turns
+it into an isolated `loom-signoz-restore` project. **Do not improvise this with
+`docker compose -p` alone**: every volume in the render carries an explicit
+top-level `name:`, so a bare project rename produces a second stack that mounts
+the *live* volumes read-write. The overlay re-points all four volumes, every
+pinned container name, both networks and the published port; it also re-points
+the external `loom-observability` network at an egress-less bridge and scales
+the ingester to zero, so the rehearsal cannot register the
+`signoz-otel-collector` alias a second time and take a share of live OTLP
+traffic. `loom-daemon/tests/signoz_restore_contract.rs` re-derives each of
+those from the rendered compose, so a later re-render that adds a volume or a
+port cannot silently escape the overlay.
+
+Run every command below **from this directory**, like the rest of this README:
+`-f` paths are resolved against the working directory, not against the first
+compose file. The overlay replaces the published-port list with the Compose
+`!override` tag, so Compose **v2.24.4 or newer** is required here (the trial's
+baseline of Compose v2 alone is not enough); an older Compose appends instead,
+keeps the live `18081` binding and the rehearsal cannot start.
+
+Snapshot (the live project must be stopped for a consistent copy). The helper
+that tars each volume is the deployment's **own** pinned PostgreSQL image, so
+the procedure introduces no unpinned image and pulls nothing new on the trial
+host; it runs as root with `--numeric-owner` so the restored data directories
+keep the uids PostgreSQL and ClickHouse expect:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml stop
+TARBALLER=postgres:16@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6
+for v in loom-signoz-metastore-postgres-0-data loom-signoz-telemetrykeeper-0-data \
+         loom-signoz-telemetrystore-0-0-data loom-signoz-telemetrystore-user-scripts; do
+  docker run --rm --entrypoint sh -v "$v":/src:ro -v /absolute/private/signoz-backup:/bk "$TARBALLER" \
+    -c "tar -C /src --numeric-owner -czf /bk/$v.tar.gz ."
+done
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml up -d --wait --wait-timeout 1800
+```
+
+Restore into the rehearsal project — note the `loom-signoz-restore-` volume
+names, and that the source tarball keeps the *live* name so the mapping stays
+readable:
+
+```console
+docker volume create loom-signoz-restore-telemetrystore-0-0-data
+docker run --rm --entrypoint sh -v loom-signoz-restore-telemetrystore-0-0-data:/dst \
+  -v /absolute/private/signoz-backup:/bk:ro "$TARBALLER" \
+  -c 'cd /dst && tar --numeric-owner -xzf /bk/loom-signoz-telemetrystore-0-0-data.tar.gz'
+# ...repeat for the metastore, keeper and user-scripts volumes...
+
+docker compose --env-file /absolute/private/signoz.env \
+  -f pours/deployment/compose.yaml -f restore-override.yaml \
+  up -d --wait --wait-timeout 1800 loom-signoz-signoz-0
+```
+
+Naming only `loom-signoz-signoz-0` starts its dependency chain (metastore,
+keeper, ClickHouse, migrator, user-scripts) and leaves the ingester out. Use
+the **same** `--env-file` as the backup, for the reason above.
+
+Verify against the live deployment rather than by eye — run the same
+`fixture-queries.sql` on both and diff the output:
+
+```console
+docker compose --env-file /absolute/private/signoz.env \
+  -f pours/deployment/compose.yaml -f restore-override.yaml exec -T \
+  loom-signoz-telemetrystore-clickhouse-0-0 \
+  clickhouse-client --multiquery --param_run='loom-synthetic-<run-id>' < fixture-queries.sql
+```
+
+`exec` addresses a **service**, and the overlay renames containers rather than
+services — so this is the same service name the live commands above use, and the
+`-f restore-override.yaml` argument is the only thing that decides which of the
+two projects it lands in. Never drop it from a rehearsal command: without it the
+identical line reads the **live** ClickHouse.
+
+Signal rows, the trace graph and the effective TTL DDL must match exactly.
+Expect the raw per-table inventory to differ for `signoz_metrics`: SigNoz's own
+self-monitoring metrics keep accruing, so a copy taken later than the baseline
+read legitimately holds more of them. Confirm that is what you are seeing by
+re-reading the **live** side now — it should have caught up to the restored
+count — rather than accepting the delta. Also check the restored app on its own
+port (`127.0.0.1:18091`), log in with the same credential, and confirm a
+dashboard you created before the snapshot is listed.
+
+Tear down with the project's own arguments, and **dry-run it first** so you can
+read the object list before anything is removed:
+
+```console
+docker compose --env-file /absolute/private/signoz.env \
+  -f pours/deployment/compose.yaml -f restore-override.yaml down --volumes --dry-run
+```
+
+Every line must name a `loom-signoz-restore-` object. If any live volume,
+container or network appears, stop: the overlay is out of step with the render.
+Re-run without `--dry-run` to finish, then `docker volume ls --filter
+name=loom-signoz-restore-` to confirm nothing survived — `down --volumes` removes
+only volumes the project declares, so a volume you created by hand for a
+tarball it turned out not to need is left behind.
+
+**Status of this procedure: the overlay renders and is contract-tested, but the
+rehearsal has not been executed against real backup tarballs yet** — see
+"Backup-restore rehearsal overlay" in `evidence.md` for exactly what was and was
+not verified. [#9279](https://github.com/rjwalters/loom/issues/9279) owns the
+live run; until it lands, treat this backup as untested.
+
+## Upgrade, wipe and Cloud
 
 Upgrade by changing explicit pins, rendering, inspecting the diff and testing
 schema migration/restore against a copy of trial data. Database migrations may

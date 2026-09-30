@@ -775,6 +775,13 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ForgeCmd::Pr(args) if crate::forge_cached_list::is_cached_list(&args) => {
             crate::forge_cached_list::handle("pr", &args)
         }
+        // `forge <issue|pr> view --cached …` — conditional single-object read (#9254).
+        ForgeCmd::Issue(args) if crate::forge_cached_view::is_cached_view(&args) => {
+            crate::forge_cached_view::handle("issue", &args)
+        }
+        ForgeCmd::Pr(args) if crate::forge_cached_view::is_cached_view(&args) => {
+            crate::forge_cached_view::handle("pr", &args)
+        }
         ForgeCmd::Issue(args) => gh_passthrough("issue", &args),
         ForgeCmd::Pr(args) => gh_passthrough("pr", &args),
         ForgeCmd::Auth(args) => gh_passthrough("auth", &args),

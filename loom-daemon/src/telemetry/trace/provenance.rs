@@ -39,19 +39,45 @@ pub const KEYS: &[&str] = &[
 /// Workspace-relative directories whose files are the prompts a sweep runs.
 const PROMPT_ROOTS: &[&str] = &[".claude/commands/loom", ".loom/roles"];
 
+/// The running binary's identity: version, full git SHA and tree state.
+///
+/// The single source for [`stamp`] and for every record that carries
+/// provenance as typed fields instead of span attributes (the ETA records,
+/// #9289), so the two can never report different builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Daemon {
+    /// `CARGO_PKG_VERSION`.
+    pub version: &'static str,
+    /// Full 40-hex git SHA, or `unknown` for a tarball build.
+    pub revision: &'static str,
+    /// `clean`, `dirty` or `unknown`.
+    pub tree_state: &'static str,
+}
+
+/// The binary that is running now.
+#[must_use]
+pub const fn daemon() -> Daemon {
+    Daemon {
+        version: env!("CARGO_PKG_VERSION"),
+        revision: crate::self_update::BUILT_COMMIT_FULL,
+        tree_state: crate::self_update::BUILT_TREE_STATE,
+    }
+}
+
 /// Record the creating binary on `attributes`. Never overwrites: a span
 /// restored from a queue keeps the binary that created it, not the one
 /// exporting it.
 pub fn stamp(attributes: &mut TraceAttributes) {
+    let build = daemon();
     attributes
         .entry(DAEMON_VERSION.into())
-        .or_insert_with(|| env!("CARGO_PKG_VERSION").into());
+        .or_insert_with(|| build.version.into());
     attributes
         .entry(DAEMON_REVISION.into())
-        .or_insert_with(|| crate::self_update::BUILT_COMMIT_FULL.into());
+        .or_insert_with(|| build.revision.into());
     attributes
         .entry(DAEMON_TREE_STATE.into())
-        .or_insert_with(|| crate::self_update::BUILT_TREE_STATE.into());
+        .or_insert_with(|| build.tree_state.into());
 }
 
 /// The installed Loom surface and prompt digest for `root`. Best-effort: an

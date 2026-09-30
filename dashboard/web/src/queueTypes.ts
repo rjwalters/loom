@@ -6,11 +6,15 @@
  * re-declares the rest of the snapshot (no Workers types in a browser bundle).
  *
  * On `/public/fleet-state` a private row keeps only `rank`, `visibility`,
- * `urgent`, `disposition`, `state` and `reason`, so every repo-identifying
- * field here is optional.
+ * `urgent`, `operator_priority`, `disposition`, `state` and `reason` (plus
+ * the #9288 plan `position`, `plan_state` and `gate`), so every
+ * repo-identifying field here is optional.
  */
 
 export type QueueRowState = "running" | "ready" | "blocked" | "unknown";
+
+/** Where a row stands in its host's dispatch plan (Issue #9288). */
+export type QueuePlanState = "running" | "next" | "queued" | "blocked" | "unknown";
 
 export interface QueueRow {
   /** 1-based dispatch order on the host. Gaps mean the daemon dropped rows
@@ -21,7 +25,13 @@ export interface QueueRow {
   visibility: "public" | "private";
   issue?: number;
   workspace_priority?: number;
+  /** Deprecated (#9244): always false. `loom:urgent` no longer orders work. */
   urgent: boolean;
+  /** Starred (`loom:operator-priority`, #9244): dispatched ahead of all other
+   * work. Absent when not starred or from an older daemon. */
+  operator_priority?: boolean;
+  /** When it was starred, when the daemon knows. */
+  operator_priority_at?: string;
   /** The issue's own `createdAt` — the only age the daemon knows. */
   created_at?: string;
   /** Informational `tier:*` label; the daemon does not order by it. */
@@ -33,6 +43,32 @@ export interface QueueRow {
   reason: string;
   /** The park label (`parked`) or the open PR number (`open_pr`). */
   detail?: string;
+  /** 1-based position in the host's shaped dispatch plan (Issue #9288).
+   * Per host: positions from two hosts are not comparable. Absent when the
+   * row is not dispatchable on that host this tick, or from older daemons. */
+  position?: number;
+  plan_state?: QueuePlanState;
+  /** Which admission gate holds a deferred row (`capacity`, `ramp`, …). */
+  gate?: string;
+  /** The shard that owns this row's workspace, when the fleet is sharded.
+   * Compared against the reporting host's own `plan.shard.host_shard` by the
+   * fleet merge (Issue #9310). Withheld from the public view. */
+  owning_shard?: number;
+}
+
+/** The reporting host's shard posture for the tick (Issue #9288). */
+export interface QueuePlanShard {
+  configured: boolean;
+  host_shard?: number;
+  shard_count?: number;
+}
+
+/** The host's per-tick dispatch-plan block, narrowed to what the UI reads.
+ * The daemon also sends `slots`, `ordering`, `scope` and `complete`; only
+ * `shard` is re-declared here, because the fleet merge's `owning_shard`
+ * tie-break is the one thing the browser needs it for (Issue #9310). */
+export interface QueuePlanView {
+  shard?: QueuePlanShard;
 }
 
 export interface QueueRepoRef {
@@ -54,6 +90,8 @@ export interface QueueSnapshotRecord {
   rows: QueueRow[];
   unresolved_rows: number;
   rows_truncated: number;
+  /** This tick's dispatch plan. Absent from a pre-#9288 daemon. */
+  plan?: QueuePlanView;
   /** Public view only: how many rows had their repo detail withheld. */
   withheld_rows?: number;
 }

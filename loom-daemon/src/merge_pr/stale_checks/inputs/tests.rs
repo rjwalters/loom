@@ -165,7 +165,7 @@ fn an_empty_base_move_is_fresh_for_every_required_check() {
     for ctx in REQUIRED_CONTEXTS {
         let specs = specs_for(ctx).unwrap_or_else(|| panic!("{ctx} must resolve"));
         assert_eq!(
-            composite_stale_reason(&specs, &FileSet::default(), &p),
+            composite_stale_reason(&specs, &FileSet::default(), &p, &CiScopes::unscoped()),
             None,
             "{ctx} must be fresh when the base did not move"
         );
@@ -249,98 +249,10 @@ fn glob_patterns_match_the_shapes_the_table_uses() {
 /// host where the path resolved to something else.
 const CI_YML: &str = include_str!("../../../../../.github/workflows/ci.yml");
 
-/// One `ci.yml` job: its key, its expanded display name(s), and its own lines.
-struct Job {
-    names: Vec<String>,
-    lines: Vec<String>,
-}
-
-/// A deliberately small `ci.yml` reader: job keys at indent 2 under `jobs:`,
-/// the `name:` at indent 4, and `${{ matrix.os }}` expanded from the job's own
-/// `os:` list. Enough to pin the table, with nothing to go wrong in a YAML
-/// dependency.
-fn parse_jobs(yaml: &str) -> Vec<Job> {
-    let mut jobs: Vec<Job> = Vec::new();
-    let mut in_jobs = false;
-    let mut current: Option<Vec<String>> = None;
-    for line in yaml.lines() {
-        if !in_jobs {
-            in_jobs = line == "jobs:";
-            continue;
-        }
-        if !line.starts_with(' ') && !line.trim().is_empty() && !line.starts_with('#') {
-            break; // left the `jobs:` mapping
-        }
-        let is_key = line.starts_with("  ")
-            && !line.starts_with("   ")
-            && line.trim_end().ends_with(':')
-            && !line.trim_start().starts_with('#');
-        if is_key {
-            if let Some(lines) = current.take() {
-                jobs.push(finish(lines));
-            }
-            current = Some(Vec::new());
-        } else if let Some(lines) = current.as_mut() {
-            lines.push(line.to_string());
-        }
-    }
-    if let Some(lines) = current.take() {
-        jobs.push(finish(lines));
-    }
-    jobs
-}
-
-fn finish(lines: Vec<String>) -> Job {
-    let raw = lines
-        .iter()
-        .find_map(|l| l.strip_prefix("    name: "))
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let names = if raw.contains("${{ matrix.os }}") {
-        matrix_os(&lines)
-            .into_iter()
-            .map(|os| raw.replace("${{ matrix.os }}", &os))
-            .collect()
-    } else {
-        vec![raw]
-    };
-    Job { names, lines }
-}
-
-/// The job's `os:` matrix values, from either the flow (`os: [a, b]`) or block
-/// (`os:` then `- a`) form.
-fn matrix_os(lines: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut in_os = false;
-    for line in lines {
-        let t = line.trim();
-        if let Some(rest) = t.strip_prefix("os:") {
-            let rest = rest.trim();
-            if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
-                return inner
-                    .split(',')
-                    .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
-            in_os = rest.is_empty();
-            continue;
-        }
-        if in_os {
-            match t.strip_prefix("- ") {
-                Some(v) => out.push(v.trim().trim_matches('"').to_string()),
-                None => in_os = false,
-            }
-        }
-    }
-    out
-}
-
 /// Every `scripts/…​.sh` / `defaults/scripts/…​.sh` a job's non-comment lines
 /// name. Paths under another prefix (`.loom/scripts/…`) are the installed
 /// copies, not this repo's sources, and are deliberately not collected.
-fn script_refs(lines: &[String]) -> BTreeSet<String> {
+fn script_refs(lines: &[&str]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for line in lines {
         if line.trim_start().starts_with('#') {
@@ -409,8 +321,9 @@ fn the_table_covers_exactly_mains_required_contexts() {
 
 #[test]
 fn every_required_context_names_a_real_ci_yml_job() {
-    let jobs = parse_jobs(CI_YML);
-    let names: BTreeSet<&str> = jobs
+    let wf = super::super::workflow_scope::parse(CI_YML);
+    let names: BTreeSet<&str> = wf
+        .jobs
         .iter()
         .flat_map(|j| j.names.iter().map(String::as_str))
         .collect();
@@ -424,65 +337,67 @@ table is out of date"
     }
 }
 
-/// A composite job's lines split at its `      # component: <name>` markers.
-/// Lines before the first marker (checkout, artifact download) belong to no
-/// component and are returned under `""`.
-fn component_groups(lines: &[String]) -> Vec<(String, Vec<String>)> {
-    let mut groups: Vec<(String, Vec<String>)> = vec![(String::new(), Vec::new())];
-    for line in lines {
-        if let Some(name) = line.strip_prefix("      # component: ") {
-            groups.push((name.trim().to_string(), Vec::new()));
-        } else if let Some(last) = groups.last_mut() {
-            last.1.push(line.clone());
-        }
-    }
-    groups
-}
-
 #[test]
 fn every_script_a_required_job_runs_is_a_global_input() {
     // The pin that makes the table maintainable: adding a step to a required
     // job fails HERE, at PR time, instead of silently making the guard trust a
     // check whose new input it cannot see. Scripts are pinned to the COMPONENT
-    // whose marker they sit under, not merely to the composite context.
-    let jobs = parse_jobs(CI_YML);
+    // whose marker they sit under, not merely to the composite context — and
+    // to the SAME parse of `ci.yml` the freshness guard itself attributes a
+    // base move's hunks with (#9065), so the pin and the guard can never read
+    // the workflow differently.
+    let wf = super::super::workflow_scope::parse(CI_YML);
     let mut pinned = 0;
     for req in REQUIRED_CHECKS {
-        let job = jobs
-            .iter()
-            .find(|j| j.names.iter().any(|n| n == req.context))
+        let job = wf
+            .job_named(req.context)
             .unwrap_or_else(|| panic!("{}: no ci.yml job", req.context));
-        let groups: Vec<(String, Vec<String>)> = if req.components.len() == 1 {
-            vec![(req.components[0].to_string(), job.lines.clone())]
+        // A single-gate job carries no marker: its whole body is that gate's.
+        let groups: Vec<(&str, Vec<&str>)> = if job.components.is_empty() {
+            assert_eq!(
+                req.components.len(),
+                1,
+                "{}: a job with no `# component:` markers must run exactly one gate",
+                req.context
+            );
+            vec![(req.components[0], job.lines.iter().map(String::as_str).collect())]
         } else {
-            component_groups(&job.lines)
+            job.components
+                .iter()
+                .map(|c| (c.name.as_str(), job.component_lines(&c.name)))
+                .collect()
         };
-        let marked: BTreeSet<&str> = groups
-            .iter()
-            .map(|(n, _)| n.as_str())
-            .filter(|n| !n.is_empty())
-            .collect();
+        let marked: BTreeSet<&str> = groups.iter().map(|(n, _)| *n).collect();
         let expected: BTreeSet<&str> = req.components.iter().copied().collect();
         assert_eq!(
             marked, expected,
             "{}: the job's `# component:` markers must name exactly its REQUIRED_CHECKS components",
             req.context
         );
+        // In a COMPOSITE job, nothing before the first marker may run a gate
+        // script: such a step belongs to no component, so no spec would cover
+        // its input. A single-gate job has no markers and no setup region —
+        // its whole body is the gate's, and was pinned as such above.
+        if !job.components.is_empty() {
+            let setup = script_refs(&job.setup_lines());
+            assert!(
+                setup.is_empty(),
+                "{}: {setup:?} run before the first `# component:` marker, so no spec covers them",
+                req.context
+            );
+        }
         for (component, lines) in &groups {
             let refs = script_refs(lines);
-            if component.is_empty() {
-                assert!(
-                    refs.is_empty(),
-                    "{}: {refs:?} run before the first `# component:` marker, so no spec covers \
-them",
-                    req.context
-                );
-                continue;
-            }
             let spec = spec(component);
             pinned += 1;
+            // These three run only the built daemon, no script; their G set
+            // carries `loom-daemon/**` instead.
             assert!(
-                !refs.is_empty() || component == "Shell Budget Ratchet",
+                !refs.is_empty()
+                    || matches!(
+                        *component,
+                        "Shell Budget Ratchet" | "Secret Scan" | "MCP Guard Wiring Contract"
+                    ),
                 "{component}: no script references found — the parser probably broke"
             );
             for script in refs {
@@ -508,7 +423,8 @@ fn a_composite_context_is_stale_when_any_component_is() {
     // main tightens the file-size baseline; the PR edits a Rust source file.
     let d = set(&["scripts/file-size-baseline.txt"]);
     let p = set(&["loom-daemon/src/lib.rs"]);
-    let (component, _) = composite_stale_reason(&specs, &d, &p).expect("stale");
+    let (component, _) =
+        composite_stale_reason(&specs, &d, &p, &CiScopes::unscoped()).expect("stale");
     assert_eq!(component, "File Size Ratchet");
 }
 
@@ -537,7 +453,7 @@ fn a_composite_context_is_not_stale_on_cross_component_terms() {
             .all(|pat| !glob_match(pat, "defaults/roles/curator.md")),
         "precondition: the moved gate does not read the PR's file"
     );
-    let stale = composite_stale_reason(&specs, &d, &p);
+    let stale = composite_stale_reason(&specs, &d, &p, &CiScopes::unscoped());
     assert!(stale.is_none(), "cross-component terms must not refuse: {stale:?}");
 }
 
@@ -557,4 +473,109 @@ fn every_spec_lists_the_ci_workflow_as_a_global_input() {
     for s in SPECS {
         assert!(s.global.contains(&CI_WORKFLOW), "{}: ci.yml must be a global input", s.context);
     }
+}
+
+// --- The `P`-side ci.yml narrowing (#9065) -----------------------------------
+
+/// `CiScopes` with only the named components on the `P` side and the base side
+/// left at the whole-file meaning.
+fn pr_scope(components: &[&str]) -> CiScopes {
+    CiScopes {
+        base: CiScope::Unscoped,
+        pr: CiScope::Scoped(components.iter().map(|c| (*c).to_string()).collect()),
+    }
+}
+
+#[test]
+fn a_pr_editing_an_unrelated_ci_yml_job_is_not_a_global_input_change() {
+    // The #9065 churn on the PRs that this very issue produces: `ci.yml` is in
+    // EVERY component's `G`, and `Conflict Marker Check` scans `**`, so a PR
+    // that so much as reformats the `backend-tests` block was stale against any
+    // base move at all — permanently, since `main` moves every ~11 min.
+    let d = set(&["loom-daemon/src/unrelated.rs"]);
+    let p = set(&[CI_WORKFLOW]);
+    let s = spec("Conflict Marker Check");
+
+    // Unscoped — the pre-narrowing meaning — refuses.
+    assert!(stale_reason(s, &d, &p).is_some());
+    // Attributed to a job no required context runs, it does not.
+    assert!(stale_reason_scoped(s, &d, &p, &pr_scope(&[])).is_none());
+}
+
+#[test]
+fn a_pr_editing_this_gates_own_ci_yml_block_is_still_stale() {
+    // The half that must NOT relax. The PR changed the rule this gate runs
+    // under, and `main` brought new subjects for that rule to judge — exactly
+    // clause 2, and the merged tree has never been judged that way.
+    let d = set(&["loom-daemon/src/unrelated.rs"]);
+    let p = set(&[CI_WORKFLOW]);
+    let s = spec("Conflict Marker Check");
+    assert!(stale_reason_scoped(s, &d, &p, &pr_scope(&["Conflict Marker Check"])).is_some());
+    // …and a scope naming some OTHER gate does not accidentally cover this one.
+    assert!(stale_reason_scoped(s, &d, &p, &pr_scope(&["File Size Ratchet"])).is_none());
+}
+
+#[test]
+fn the_pr_side_narrowing_does_not_rescue_a_real_global_input_change() {
+    // The narrowing removes ONE path from the `P` match. A PR that edits
+    // `ci.yml` in an unrelated block AND tightens the gate's baseline is still
+    // stale on the baseline.
+    let d = set(&["loom-daemon/src/big.rs"]);
+    let p = set(&[CI_WORKFLOW, "scripts/file-size-baseline.txt"]);
+    let reason = stale_reason_scoped(spec("File Size Ratchet"), &d, &p, &pr_scope(&[]))
+        .expect("the baseline edit is a global-input change regardless of ci.yml");
+    assert_eq!(reason.pr_path.as_deref(), Some("scripts/file-size-baseline.txt"));
+}
+
+#[test]
+fn the_two_sides_narrow_independently() {
+    // `D` and `P` are attributed against different trees, so one side's answer
+    // must never stand in for the other's.
+    let s = spec("Conflict Marker Check");
+    let d = set(&[CI_WORKFLOW]);
+    let p = set(&["loom-daemon/src/lib.rs"]);
+    let none = CiScope::Scoped(BTreeSet::new());
+
+    // Base narrowed, `P` untouched by ci.yml: clause 1 no longer fires.
+    assert!(stale_reason_scoped(
+        s,
+        &d,
+        &p,
+        &CiScopes {
+            base: none.clone(),
+            pr: CiScope::Unscoped
+        }
+    )
+    .is_none());
+    // The SAME base move with the base side unscoped still refuses — a narrow
+    // `P` scope does not cover for it.
+    assert!(stale_reason_scoped(
+        s,
+        &d,
+        &p,
+        &CiScopes {
+            base: CiScope::Unscoped,
+            pr: none
+        }
+    )
+    .is_some());
+}
+
+#[test]
+fn the_pr_side_narrowing_is_confined_to_clauses_1_and_2() {
+    // Clauses 3-5 match `P` against `scanned`/`coupled`/`removed` and are left
+    // un-narrowed on purpose: over-refusing is the safe direction, so a scope
+    // that excludes every component must not turn those clauses off.
+    let none = pr_scope(&[]);
+
+    // Clause 3: both sides touch ci.yml, which `Conflict Marker Check` scans
+    // via `**`. Only the BASE scope may silence it.
+    let both = set(&[CI_WORKFLOW]);
+    assert!(stale_reason_scoped(spec("Conflict Marker Check"), &both, &both, &none).is_some());
+
+    // Clause 5: the PR deletes a path while the base move touches the link
+    // graph. `P`'s removal set is never filtered.
+    let d = set(&["docs/some-page.md"]);
+    let p = set_with_removal(&[], &["scripts/gone.sh"]);
+    assert!(stale_reason_scoped(spec("Dangling Link Check"), &d, &p, &none).is_some());
 }

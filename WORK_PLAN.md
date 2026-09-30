@@ -12,13 +12,11 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#8613**: chore: scrub private host identifiers and operator identities from HEAD
 - **#8893**: feat(install): add --mode session install-time flag
 
-## Urgent
+## Operator Priority
 
-Issues flagged as highest priority (`loom:urgent`).
+Issues the operator starred (`loom:operator-priority`); land these first.
 
-- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
-- **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh
-- **#8838**: rework #8486 (issue #8458): bring the per-worktree CARGO_TARGET_DIR portable-shell delta to <= 0 (declaration commit ineffective - portable pool has no declare-exit)
+_None._
 
 ## Ready
 
@@ -148,7 +146,7 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 2 |
-| Urgent | 3 |
+| Operator priority | 0 |
 | Ready (`loom:issue`) | 15 |
 | In Progress (`loom:building`) | 7 |
 | PRs awaiting review | 0 |

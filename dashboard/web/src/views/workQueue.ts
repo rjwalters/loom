@@ -31,6 +31,7 @@ import {
   QUEUE_STALE_AFTER_SEC,
   openPrNumber,
   queueFilterOptions,
+  planText,
   rankText,
   reasonText,
   summarizeHostQueue,
@@ -134,7 +135,10 @@ function waitingCell(row: QueueRow, now: Date): HTMLElement {
 
 function flags(row: QueueRow): HTMLElement | null {
   const parts: HTMLElement[] = [];
-  if (row.urgent) parts.push(el("span", { class: "badge badge--urgent", title: "loom:urgent" }, "urgent"));
+  if (row.operator_priority) {
+    const title = row.operator_priority_at ? `loom:operator-priority since ${formatAbsolute(row.operator_priority_at)}` : "loom:operator-priority";
+    parts.push(el("span", { class: "badge badge--starred", title }, "starred"));
+  }
   if (row.tier) {
     parts.push(el("span", { class: "queue__tier", title: "Informational: the daemon does not order by tier" }, row.tier));
   }
@@ -462,7 +466,7 @@ function hostRow(row: QueueRow, sweeps: readonly ActiveSweep[], now: Date): HTML
     el("td", {}, rankText(row)),
     el("td", {}, issueCell(row.repo, row.issue, row.visibility), flags(row)),
     el("td", {}, repoCell(row.repo)),
-    el("td", {}, row.state),
+    el("td", {}, planText(row)),
     el("td", {}, row.state === "running" ? phaseText(sweep, now) : UNKNOWN),
     el("td", {}, waitingCell(row, now)),
     el("td", {}, reasonCell(row, row.repo)),

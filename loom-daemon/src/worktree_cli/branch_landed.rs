@@ -24,6 +24,15 @@
 //! not even be attempted" — which is why the shell exports it as a side-channel
 //! global rather than folding it into the verdict.
 //!
+//! **A closed-unmerged PR's head is [`Verdict::NotLanded`], and stays that
+//! way (#9083).** Do not add a fourth verdict for it. Such a branch genuinely
+//! has not landed — that verdict is exactly what stops
+//! [`super::branch_delete`] escalating to `git branch -D` on work nobody
+//! merged — and the three-way answer's value is that no consumer has to handle
+//! a token it has never seen. `worktree.sh`'s reuse arm does need to tell that
+//! shape apart, and asks it separately, at the one call site that cares:
+//! [`super::closed_pr_branch`].
+//!
 //! # Deliberate divergences from the shell, both argued
 //!
 //! 1. **No `jq` dependency.** The shell probe returns `unavailable` on a host

@@ -62,6 +62,17 @@ fn probe(args: &[&str], parent: i32) -> Result<Option<String>> {
             || SIGNAL.load(Ordering::Relaxed) != 0
             || unsafe { libc::getppid() } != parent
         {
+            let trigger = if started.elapsed() >= Duration::from_secs(3) {
+                "probe-deadline"
+            } else if SIGNAL.load(Ordering::Relaxed) != 0 {
+                "host-signal"
+            } else {
+                "host-reparented"
+            };
+            eprintln!(
+                "session-exec: probe abandoned (trigger={trigger}, docker {})",
+                args.first().unwrap_or(&"")
+            );
             child.kill()?;
             child.wait()?;
             return Ok(None);
@@ -130,6 +141,16 @@ pub fn run(args: HostArgs) -> Result<i32> {
         || !owner.alive()
         || shell_cancelled()
     {
+        let trigger = if SIGNAL.load(Ordering::Relaxed) != 0 {
+            "host-signal"
+        } else if unsafe { libc::getppid() } != parent {
+            "host-reparented"
+        } else if !owner.alive() {
+            "owner-dead"
+        } else {
+            "shell-cancelled"
+        };
+        eprintln!("session-exec: refusing dispatch before start (trigger={trigger})");
         return Ok(143);
     }
     let id = uuid::Uuid::new_v4().to_string();
@@ -195,14 +216,33 @@ pub fn run(args: HostArgs) -> Result<i32> {
                 || !owner.alive()
                 || shell_cancelled())
         {
+            let trigger = if SIGNAL.load(Ordering::Relaxed) != 0 {
+                "host-signal"
+            } else if unsafe { libc::getppid() } != parent {
+                "host-reparented"
+            } else if !owner.alive() {
+                "owner-dead"
+            } else {
+                "shell-cancelled"
+            };
+            eprintln!("session-exec: cancelling dispatch (trigger={trigger})");
             let _ = input.write_all(b"cancel\n");
             stopping = Some(Instant::now());
         }
         if stopping.is_none() && last_beat.elapsed() >= Duration::from_millis(250) {
-            if writeln!(input, "{}", now_ms() + LEASE_MS).is_err() {
-                stopping = Some(Instant::now());
+            // One pre-formed line per beat (#9067): a single write of
+            // <= PIPE_BUF bytes on an O_NONBLOCK pipe is all-or-EAGAIN, so a
+            // full buffer can never emit a half-written lease line (the
+            // fmt-per-piece writes in `writeln!` could split a number from
+            // its newline under backpressure, and the reassembled garbage
+            // parsed as a cancelled lease on the worker). A failed beat is
+            // skipped and retried, not fatal: the worker's stall tolerance
+            // rides out the backpressure, and real death is signalled by the
+            // explicit cancel line above, EOF, or this side's own exit.
+            let beat = format!("{}\n", now_ms() + LEASE_MS);
+            if input.write_all(beat.as_bytes()).is_ok() {
+                last_beat = Instant::now();
             }
-            last_beat = Instant::now();
         }
         if stopping.is_some_and(|start| start.elapsed() >= Duration::from_secs(4)) {
             child.kill()?;

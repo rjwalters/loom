@@ -119,19 +119,56 @@
 //! staleness — and therefore `git reset --hard` — against, when a live
 //! `origin/<branch>` carries the branch's real commits and the local branch
 //! does not (the #8147/#8190 incident).
+//!
+//! [`closed_pr_branch`] is the same kind of addition (#9083): the third arm of
+//! the branch-resolution contract the shell had no answer for — a pushed
+//! `origin/feature/issue-N` whose tip is the head of a PR CLOSED WITHOUT
+//! MERGING. It is deliberately NOT a fourth [`branch_landed`] verdict; see its
+//! module doc for why that primitive's three-way answer stays three-way.
+//!
+//! Slice 10 is [`sparse`]: `--sparse <paths...>` and `--full`, on both arms
+//! they reach. It is the one part of the create path that is opt-in, so it
+//! could leave the shell outright without moving the ordinary
+//! `worktree.sh <N>` onto a built binary. It carried a silent exit 128 on any
+//! cone git rejects, a cone-to-JSON builder that did not escape, and a
+//! re-configure arm whose "is this a registered worktree?" was an unanchored
+//! `grep` substring match — which could disagree with [`cleanup`]'s orphan
+//! guard about the same directory, and on its false-positive side wrote a
+//! [`sentinel`] into a directory git did not know about. The port asks
+//! [`cleanup::is_registered`]. [`sentinel`] is the first Rust writer of the
+//! `.loom-managed` marker, pinned byte-for-byte to the shell's until the
+//! remaining writers move.
+//!
+//! Slice 11 is [`check`]: the predicate *"am I inside a linked worktree?"* and
+//! both decisions it gated — the `--check` verb and the create path's
+//! auto-navigation out of a worktree. It is the only slice whose retired code
+//! was **wrong from every position a caller can stand in**: the comparison was
+//! `--git-common-dir` (which git answers *relative to the current directory*
+//! whenever it can) against an absolute `<toplevel>/.git`, so it was
+//! constant-true. `--check` reported the primary clone as a worktree and its
+//! "not in a worktree" arm was unreachable; every `worktree.sh <N>` run from
+//! the primary clone printed four spurious navigation lines and then `cd`'d to
+//! `dirname ".git"` — a no-op by luck rather than by logic. Invisible because
+//! `--json` suppresses all four lines, so nothing a machine reads ever changed
+//! and no retained suite asserts either consumer's output. Same class as slices
+//! 5, 8 and 10: a path compared logically instead of physically.
 
 pub mod baseline;
 pub mod branch_conflict;
 pub mod branch_delete;
 pub mod branch_landed;
+pub mod check;
 pub mod cleanup;
+pub mod closed_pr_branch;
 pub mod default_branch;
 pub mod issue_lock;
 pub mod link;
 pub mod lock;
 pub mod remove;
 pub mod reset;
+pub mod sentinel;
 pub mod snapshot;
+pub mod sparse;
 pub mod stale_ref;
 pub mod submodules;
 pub mod upstream;

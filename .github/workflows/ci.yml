@@ -38,19 +38,14 @@ env:
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
-  # Belt-and-suspenders cancellation (#6683): the native `cancel-in-progress`
-  # above does NOT reliably cancel a superseded run that is still `queued`
-  # (zero jobs materialized yet) — only a run that has already reached
-  # `in_progress` is cancelled reliably. Observed 2026-08-21 on PR #6680: a
-  # force-pushed rebase created a new run that sat `pending` with zero jobs
-  # for ~20 minutes because the OLD run was `queued` (not yet `in_progress`)
-  # and kept holding the `ci-${{ github.ref }}` concurrency group; a manual
-  # `POST actions/runs/<id>/cancel` on the old run unblocked the new one
-  # immediately. This job explicitly cancels any other queued/in_progress run
-  # of THIS workflow on the SAME head branch, scoped strictly by `--branch`
-  # so it can never touch an unrelated ref's run. It has no `needs:` so it
-  # starts immediately in parallel with every other job below, and it does
-  # not gate them — its only side effect is cancelling stale runs elsewhere.
+  # Detect Changes: path groups for the filtered jobs below, plus (first step,
+  # PR events only) the belt-and-suspenders cancellation of superseded runs
+  # (#6683), folded in from its own job by #9065. The native
+  # `cancel-in-progress` above does NOT reliably cancel a superseded run that
+  # is still `queued`: observed 2026-08-21 on PR #6680, a force-pushed rebase's
+  # new run sat `pending` ~20 minutes behind the old queued one. The cancel
+  # step is scoped strictly by `--branch`, and continue-on-error keeps a cancel
+  # hiccup from failing the path filter every filtered job `needs`.
   changes:
     name: Detect Changes
     runs-on: ubuntu-latest
@@ -370,11 +365,10 @@ jobs:
       - run: cargo clippy --package loom-daemon --package loom-api -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
       - run: cargo check --workspace --all-targets
       # Folded in from the former Rust Doctests job (#9065): nextest does not
-      # run doctests, so libtest still owns them (#4385).
-      # nextest does not run doctests, so libtest still owns those (#4385). Its
-      # own job since #9065 rather than riding one partition of Rust Unit Tests,
-      # where it would make that leg the long pole.
+      # run doctests, so libtest still owns them (#4385). `!cancelled()` so a
+      # clippy failure above does not hide a doctest failure.
       - name: Run doctests
+        if: ${{ !cancelled() }}
         run: cargo test --workspace --doc
 
   backend-tests:
@@ -804,11 +798,11 @@ jobs:
       # job used to run (which required, rather than forbade, a version bump
       # alongside a defaults/ change -- #5874, superseded by #7743 after
       # nine follow-up issues about the per-PR-bump cost in 60 days).
-      # fetch-depth: 0 + an explicit head sha (instead of the default
-      # single-commit fetch of the synthetic refs/pull/<N>/merge ref) ensure
-      # both the PR's base and head commits are present locally for the
-      # script's `git show <ref>:<path>` value extraction -- and that their
-      # merge-base resolves, which --forbid-bump needs (#7823): base.sha is
+      # This job's full-history checkout (fetch-depth: 0 of the
+      # refs/pull/<N>/merge ref, whose parents are the base and the head)
+      # ensures both commits are present locally for the script's
+      # `git show <ref>:<path>` value extraction -- and that their merge-base
+      # resolves, which --forbid-bump needs (#7823): base.sha is
       # the live tip of main at trigger time, so comparing against it raw
       # would false-FAIL any PR cut before a sibling defaults/-touching merge
       # bumped the version. The script narrows to merge-base(base, head)
@@ -981,6 +975,60 @@ jobs:
       - name: Check .gitignore matches the current EPHEMERAL_PATTERNS set
         if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
+
+      # component: MCP Guard Wiring Contract
+      # #9108: `check-guard-scan-contracts.sh` (Structural Checks) answers
+      # "does the guard read the right copy of the command?". This answers the
+      # prior question — "is the guard on the tool call's path at all?" — which
+      # nothing asserted until #9108, and which is how every `mcp__loom__*`
+      # call came to run with no PreToolUse matcher covering it while
+      # `get_agent_metrics` built a shell command line from its raw arguments
+      # (fixed server-side in #9107). A matcher that matches nothing does not
+      # error; it just never fires, so the wiring has to be asserted.
+      #
+      # It lives HERE rather than next to its sibling in Structural Checks
+      # because that job is deliberately toolchain-free (no cargo, no daemon
+      # binary) and this check is a daemon subcommand — new executable logic
+      # goes into the daemon, not into `contract`-category shell
+      # (.loom/docs/shell-language-policy.md, epic #7810). Behind
+      # `daemon != 'false'` like its siblings: that predicate is false only for
+      # a PR entirely inside `dashboard/`, which cannot touch the settings
+      # file, the installer, or the hook this reads.
+      - name: Check the mcp__loom__.* PreToolUse matcher is wired and fails closed (#9108)
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+        run: ./target/debug/loom-daemon check-guard-wiring --repo-root .
+
+      # component: Secret Scan
+      # Refuses any commit that ADDS a credential-shaped value, whatever its
+      # path (#9133): the same `loom-daemon secret-scan` the PreToolUse guard
+      # and .githooks/ run, so there is one pattern list. Each commit in the
+      # event is scanned on its own, not the net diff, because a value added
+      # and then deleted on a branch is still published by the push.
+      # Runs on push to main too: a commit that reaches main through a
+      # ruleset bypass never runs PR checks (#9136), which is how the
+      # 2026-09-26 leak arrived. There it cannot prevent anything; it turns a
+      # silent disclosure into a red run. Behind `daemon != 'false'` like its
+      # siblings, so a dashboard-only PR is not scanned here; the guard and
+      # hooks still cover that path.
+      - name: Refuse commits that add a credential-shaped value (#9133)
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ -n "$PUSH_BEFORE" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            range="$PUSH_BEFORE..$PUSH_AFTER"
+          else
+            range="$PUSH_AFTER^!"
+          fi
+          echo "Scanning $range"
+          ./target/debug/loom-daemon secret-scan --range "$range"
 
   install-surface-checks:
     name: Install Surface Checks
@@ -1466,6 +1514,8 @@ jobs:
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
       - name: check-stale-blocked advisory (#8927)
         run: bash defaults/scripts/tests/test-check-stale-blocked.sh
+      - name: merge-pr close-triggered loom:blocked re-check (#9102)
+        run: bash defaults/scripts/tests/test-merge-pr-notify-cleared-blockers.sh
       - name: merge-pr verdict-label contradiction guard (#8112, #8191 slice 2)
         run: bash defaults/scripts/tests/test-merge-pr-verdict-label-guard.sh
       # #8458: the per-worktree cargo target dir. Its creation half
@@ -1524,6 +1574,13 @@ jobs:
       # sources that library, so it needs the binary this job downloads.
       - name: daemon-update fixture containment (#8712)
         run: bash defaults/scripts/tests/test-daemon-update-fixture-containment.sh
+      # #8069: 284 assertions that had never run in ANY CI job. They were
+      # excluded on the reason "wiring it needs a cargo build step or a binary
+      # stub — follow-up"; this job (with the shared build) is that step. The subject is
+      # spawn-claude.sh's token selection — the path behind the 228-instance
+      # crash incident (#7708).
+      - name: spawn-claude token selection (#4228, #7708)
+        run: bash defaults/scripts/tests/test-spawn-claude.sh
       # Moved out of shell-suite-tests by #8037: claude-wrapper.sh's six retry
       # classifiers now delegate to `loom-daemon retry-classify`, so these 44
       # assertions — written against the pre-port shell in #8032 and unchanged
@@ -1720,6 +1777,18 @@ jobs:
       # same reasoning as race-rescue just above.
       - name: worktree branch-conflict auto-recovery (ported in #8195 slice 7)
         run: bash defaults/scripts/tests/test-worktree-json-purity.sh
+      # #9083: the closed-unmerged arm of worktree.sh's branch-resolution
+      # contract. #5657 already skips reuse of an origin/feature/issue-N
+      # whose tip is a MERGED PR's head; this covers the strictly worse
+      # sibling shape it did not — a tip that is the head of a PR CLOSED
+      # WITHOUT MERGING, which carries work somebody decided not to take.
+      # `loom-daemon worktree-closed-pr-branch` is Rust-only (no shell twin;
+      # lib/worktree-forge-pr-check.sh is `contract`-category and the
+      # portable-shell ratchet gives its growth no override), so the suite
+      # pins the binary via loom_test_require_daemon_bin and FAILS rather
+      # than skips without one.
+      - name: worktree closed-unmerged-PR branch refusal (#9083)
+        run: bash defaults/scripts/tests/test-worktree-stale-closed-branch.sh
       # Moved out of shell-suite-tests by #8195 slice 9: worktree.sh's TWO
       # hand-maintained copies of the upstream-tracking correction — the
       # branch-reuse arm (#6095/#6100) and the registered-worktree fast path
@@ -1730,15 +1799,24 @@ jobs:
       # ACTUALLY HAPPENS; without a binary neither runs at all, which is a
       # correct documented degradation to the pre-#6095/pre-#6257 behaviour but
       # would leave the assertions measuring nothing. Both pin the binary via
-      # loom_test_require_daemon_bin and FAIL rather than skip. Twelve of the 20
-      # test-worktree-*.sh suites now run here (eleven moved by a port slice,
-      # plus test-worktree-issue-lock.sh, which was daemon-driven from the
-      # start); the remaining eight exercise create-path arms these slices did
-      # not touch and stay hermetic in shell-suite-tests.
+      # loom_test_require_daemon_bin and FAIL rather than skip.
       - name: worktree local-branch upstream correction (#6095, #6100, ported in #8195 slice 9)
         run: bash defaults/scripts/tests/test-worktree-local-branch-upstream-tracking.sh
       - name: worktree existing-dir upstream + drift check (#6257, #6291, ported in #8195 slice 9)
         run: bash defaults/scripts/tests/test-worktree-existing-dir-drift-check.sh
+      # Moved out of shell-suite-tests by #8195 slice 10: worktree.sh's
+      # --sparse/--full family is now `loom-daemon worktree-sparse`, including
+      # the re-configure arm this suite's Tests 3/4 drive (its registration
+      # check and #3548 sentinel back-fill). Without a binary those flags
+      # refuse with exit 2 before touching anything, so the suite pins one via
+      # loom_test_require_daemon_bin and FAILS rather than skips. Fourteen of
+      # the 21 test-worktree-*.sh suites now run here (twelve moved by a port
+      # slice, plus test-worktree-issue-lock.sh and test-worktree-stale-
+      # closed-branch.sh, which were daemon-driven from the start); the
+      # remaining seven exercise create-path arms these slices did not touch
+      # and stay hermetic in shell-suite-tests.
+      - name: worktree sentinel back-fill on re-invoke (#3548; --sparse/--full ported in #8195 slice 10)
+        run: bash defaults/scripts/tests/test-worktree-sentinel-reinvoke.sh
       # Moved out of shell-suite-tests by #8191's delete-branch slice:
       # merge-pr.sh's `_maybe_delete_local_branch` now delegates to
       # `loom-daemon merge-pr delete-branch` (the same branch_delete rule
@@ -1774,9 +1852,19 @@ jobs:
       # without one, so it needs the binary this job downloads.
       - name: merge-pr async-close-race cleanup gate (#4186, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-worktree-path.sh
+      # #9108: the mcp__loom__.* PreToolUse guard decision is
+      # `loom-daemon guard-mcp-tools`, brand-new logic (no shell twin to
+      # port), so it needs the binary this job downloads. Drives the REAL
+      # defaults/hooks/guard-mcp-tools.sh stub on stdin, exactly as Claude
+      # Code does, so this is the wiring evidence — not just the unit
+      # coverage in loom-daemon/src/mcp_tool_guard/tests.rs — that the guard
+      # is actually on the mcp__loom__* call path. FAILS rather than skips
+      # without a binary.
+      - name: mcp__loom__.* PreToolUse argument guard (#9107, #9108)
+        run: bash defaults/hooks/tests/test-guard-mcp-tools.sh
 
   native-port-daemon-lifecycle:
-    name: Native Port Suites (daemon lifecycle, watchdog, spawn-claude)
+    name: Native Port Suites (daemon lifecycle, watchdog)
     needs: [changes, build-daemon]
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
     # Already path-filtered, so it SKIPS whole on a dashboard-only PR and never
@@ -1788,6 +1876,9 @@ jobs:
     # longest pole in CI. The steps are unchanged; only which runner runs
     # them moved. Same trigger, same build, and the same FAIL-never-SKIP
     # contract without a binary.
+    # The spawn-claude suite moved back to Native Port Suites (#9065 follow-up):
+    # with it, this job was the critical path (build-daemon, then 265s). Every
+    # suite runs under !cancelled(), so one red suite cannot hide the others.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1834,10 +1925,13 @@ jobs:
       # giving them inside its concurrent pool — by construction rather than by
       # quarantine list.
       - name: loom-daemon-start (#4773, #6568, #7391, ported in #8087)
+        if: ${{ !cancelled() }}
         run: bash defaults/scripts/tests/test-loom-daemon-start.sh
       - name: loom-daemon-start launchd plist rendering (#5343, #6387, #8087)
+        if: ${{ !cancelled() }}
         run: bash defaults/scripts/tests/test-loom-daemon-launchd-plist.sh
       - name: loom-daemon-update (#4078, #6639, #8087)
+        if: ${{ !cancelled() }}
         run: bash defaults/scripts/tests/test-loom-daemon-update.sh
       # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
       # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
@@ -1853,14 +1947,8 @@ jobs:
       # nothing to bootout. On a developer host, run them through
       # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
       - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
+        if: ${{ !cancelled() }}
         run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
-      # #8069: 284 assertions that had never run in ANY CI job. They were
-      # excluded on the reason "wiring it needs a cargo build step or a binary
-      # stub — follow-up"; this job is that cargo build step. The subject is
-      # spawn-claude.sh's token selection — the path behind the 228-instance
-      # crash incident (#7708).
-      - name: spawn-claude token selection (#4228, #7708)
-        run: bash defaults/scripts/tests/test-spawn-claude.sh
 
   installer-tests:
     name: Installer Integration Tests
@@ -2099,6 +2187,23 @@ jobs:
         with:
           name: ci-suite-retry-log-${{ matrix.shard }}
           path: /tmp/ci-suite-retry-log.tsv
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload CI suite timings (#9089)
+        # The per-suite durations run-ci-suites.sh prints are only ever read by
+        # eye, in one job's log. This artifact is the same data machine-readable
+        # so `loom-daemon ci-telemetry` can turn each entry into a
+        # `loom.ci.suite` span under THIS leg's job span — which is what makes
+        # "why was this shard slow" and "are the legs balanced" answerable in
+        # SigNoz instead of by hand. The NAME is a contract: the poller only
+        # looks at artifacts whose name starts with `ci-suite-timings` (see
+        # defaults/docs/ci-observability.md §"Suite spans (#9089)"), so renaming
+        # this silently stops suite spans.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-suite-timings-${{ matrix.shard }}
+          path: /tmp/ci-suite-timings.json
           if-no-files-found: ignore
           retention-days: 14
 

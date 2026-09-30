@@ -193,3 +193,118 @@ fn a_gh_that_exits_zero_printing_nothing_is_not_read_as_zero_checks() {
         .expect_err("an empty read is a degraded read, not a commit without checks");
     assert!(error.contains("no pages"), "{error}");
 }
+
+// pr_ci_scope: the `P`-side ci.yml attribution (#9065)
+// ---------------------------------------------------------------------------
+
+use super::{pr_ci_scope, CiScope};
+use crate::merge_pr::stale_checks::evidence::ChangedFile;
+use crate::merge_pr::stale_checks::inputs::CI_WORKFLOW;
+
+const PR_CI_YML: &str = include_str!("../../../../../.github/workflows/ci.yml");
+
+fn pr_file(path: &str) -> ChangedFile {
+    ChangedFile {
+        path: path.to_string(),
+        status: "modified".to_string(),
+        previous_filename: None,
+        patch: None,
+    }
+}
+
+/// A `gh` stub that answers the `pulls/{n}/files` read with `entry` and every
+/// `contents/` read with the real `ci.yml`. Both are heredocs, so a payload
+/// containing `$`, backticks or `${{ }}` survives verbatim.
+fn pr_gh_stub(dir: &Path, entry: &str) -> PathBuf {
+    let path = dir.join("gh");
+    let files = dir.join("files.json");
+    let wf = dir.join("workflow.yml");
+    std::fs::write(&files, entry).unwrap();
+    std::fs::write(&wf, PR_CI_YML).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {argv}\nfor a in \"$@\"; do\n  case \"$a\" in\n    *contents*) cat {wf}; exit 0;; \n  esac\ndone\ncat {files}\n",
+            argv = dir.join("argv").display(),
+            wf = wf.display(),
+            files = files.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The `{status, patch}` object `gh --jq` emits for a `ci.yml` entry that adds
+/// one line at `line`.
+fn pr_entry(line: usize) -> String {
+    let patch = format!("@@ -{line},0 +{line},1 @@\\n+      # touched by this PR\\n");
+    format!(r#"{{"status":"modified","patch":"{patch}"}}"#)
+}
+
+fn line_of(needle: &str) -> usize {
+    PR_CI_YML.lines().position(|l| l == needle).unwrap() + 1
+}
+
+#[test]
+fn a_pr_that_does_not_touch_ci_yml_costs_no_reads_and_stays_unscoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = pr_gh_stub(dir.path(), &pr_entry(10));
+    let scope = pr_ci_scope(
+        gh.to_str().unwrap(),
+        "o/r",
+        "9065",
+        "deadbeef",
+        &[pr_file("loom-daemon/src/lib.rs")],
+    );
+    assert_eq!(scope, CiScope::Unscoped);
+    assert!(!dir.path().join("argv").exists(), "no gh call is made at all");
+}
+
+#[test]
+fn a_prs_ci_yml_edit_is_attributed_against_the_head_workflow() {
+    let dir = tempfile::tempdir().unwrap();
+    // A block no required context runs.
+    let gh = pr_gh_stub(dir.path(), &pr_entry(line_of("  backend-tests:") + 3));
+    assert_eq!(
+        pr_ci_scope(gh.to_str().unwrap(), "o/r", "9065", "deadbeef", &[pr_file(CI_WORKFLOW)]),
+        CiScope::Scoped(std::collections::BTreeSet::new()),
+    );
+
+    // Both reads happened, and the workflow one was pinned to the PR HEAD —
+    // the tree `pulls/{n}/files`' patches diff TO, not the base tip.
+    let argv = argv_of(dir.path());
+    assert!(argv.contains("pulls/9065/files"), "{argv}");
+    assert!(argv.contains("contents/.github/workflows/ci.yml?ref=deadbeef"), "{argv}");
+
+    // …and a block that IS a required gate's own definition.
+    let dir = tempfile::tempdir().unwrap();
+    let gh = pr_gh_stub(dir.path(), &pr_entry(line_of("      # component: File Size Ratchet") + 2));
+    assert!(
+        pr_ci_scope(gh.to_str().unwrap(), "o/r", "9065", "deadbeef", &[pr_file(CI_WORKFLOW)])
+            .affects("File Size Ratchet"),
+    );
+}
+
+#[test]
+fn an_unreadable_pr_side_read_keeps_the_whole_file_meaning() {
+    let dir = tempfile::tempdir().unwrap();
+    for entry in [
+        "",                                                        // the endpoint returned no such file
+        "not json at all",                                         // an answer that will not parse
+        r#"{"status":"modified","patch":null}"#,                   // GitHub suppressed the patch
+        r#"{"status":"renamed","patch":"@@ -1,0 +1,1 @@\n+x\n"}"#, // not an in-file edit
+    ] {
+        let gh = pr_gh_stub(dir.path(), entry);
+        assert_eq!(
+            pr_ci_scope(gh.to_str().unwrap(), "o/r", "9065", "deadbeef", &[pr_file(CI_WORKFLOW)]),
+            CiScope::Unscoped,
+            "{entry:?}"
+        );
+    }
+    // A `gh` that cannot run at all is the same answer.
+    assert_eq!(
+        pr_ci_scope("/nonexistent/gh", "o/r", "9065", "deadbeef", &[pr_file(CI_WORKFLOW)]),
+        CiScope::Unscoped,
+    );
+}

@@ -23,6 +23,14 @@
 # ordinary file, asserting the credential paths are excluded from the index
 # while the ordinary file is staged.
 #
+# #9134: each `':!...'` element now carries a trailing `*`, so the exclusion
+# also matches a sibling-renamed credential path (e.g. `mv .loom/tokens
+# .loom/tokens.disabled-<ts>`) -- not just the exact CREDENTIAL_PATTERNS
+# entry. This is a uniform, deliberately over-inclusive prefix match: a path
+# that merely shares the prefix (e.g. `.loom/tokens-archive/`) is excluded
+# too, trading a few false positives for no false negatives (see
+# CREDENTIAL_PATTERNS' own matching-contract doc comment in post_init.rs).
+#
 # Self-contained, no network. Exit code 0 = all tests pass, 1 = failures.
 
 set -euo pipefail
@@ -76,8 +84,14 @@ make_fixture_repo() {
   echo "fake-gh-config" > "$dir/.loom/gh-config/hosts.yml"
   echo "fake-gh-config-by-owner" > "$dir/.loom/gh-config-by-owner/some-owner/hosts.yml"
   echo "FAKE_TOKEN=abc123" > "$dir/.loom/accounts.env"
-  # Prefix-lookalikes: must NOT be excluded (same contract as
-  # is_credential_path()'s matching rules).
+  # #9134: a sibling-renamed credential dir (the operator move the repo's own
+  # .gitignore documents the `name.bak-$(date +%Y%m%dT%H%M%SZ)` convention
+  # for) must be excluded too, not just the exact CREDENTIAL_PATTERNS path.
+  mkdir -p "$dir/.loom/tokens.disabled-20260101T000000Z"
+  echo "fake-token" > "$dir/.loom/tokens.disabled-20260101T000000Z/acct-1.json"
+  echo "fake-account-backup" > "$dir/.loom/accounts.env.bak"
+  # Prefix-lookalikes: the widened, deliberately over-inclusive contract
+  # (#9134) now excludes these too, since they share the credential prefix.
   mkdir -p "$dir/.loom/tokens-archive"
   echo "not a live credential" > "$dir/.loom/tokens-archive/x.json"
   echo "not a live credential" > "$dir/.loom/accounts.env.example"
@@ -123,16 +137,30 @@ run_case() {
     fi
   done
 
-  # Prefix-lookalikes must still be staged (excluded ONLY the exact class).
+  # #9134: a sibling-renamed credential path must be excluded too.
+  for sibling_path in \
+    ".loom/tokens.disabled-20260101T000000Z/acct-1.json" \
+    ".loom/accounts.env.bak"
+  do
+    if grep -qxF "$sibling_path" <<<"$staged"; then
+      assert_true "$label: sibling-renamed $sibling_path is NOT staged" "false"
+    else
+      assert_true "$label: sibling-renamed $sibling_path is NOT staged" "true"
+    fi
+  done
+
+  # Prefix-lookalikes are now excluded too (#9134): the widened contract is a
+  # uniform, deliberately over-inclusive prefix match — see the fixture's own
+  # comment above.
   if grep -qxF ".loom/tokens-archive/x.json" <<<"$staged"; then
-    assert_true "$label: prefix-lookalike .loom/tokens-archive/x.json IS staged" "true"
+    assert_true "$label: prefix-lookalike .loom/tokens-archive/x.json is NOT staged" "false"
   else
-    assert_true "$label: prefix-lookalike .loom/tokens-archive/x.json IS staged" "false"
+    assert_true "$label: prefix-lookalike .loom/tokens-archive/x.json is NOT staged" "true"
   fi
   if grep -qxF ".loom/accounts.env.example" <<<"$staged"; then
-    assert_true "$label: prefix-lookalike .loom/accounts.env.example IS staged" "true"
+    assert_true "$label: prefix-lookalike .loom/accounts.env.example is NOT staged" "false"
   else
-    assert_true "$label: prefix-lookalike .loom/accounts.env.example IS staged" "false"
+    assert_true "$label: prefix-lookalike .loom/accounts.env.example is NOT staged" "true"
   fi
 
   # The ordinary file must still be staged -- the exclusion must not swallow

@@ -1,5 +1,5 @@
 {
-  "spec": "docs/story-trace.md (D32), derivation v1",
+  "spec": "infra/signoz/docs/story-trace.md (D32), derivation v1",
   "derivation": {
     "input": "loom-story/v1:github:<repo_id>:<number>",
     "trace_id": "hex(sha256(input)[0:16])",
@@ -35,9 +35,14 @@
   "span_kinds": [
     "story.intake",
     "story.queue_dwell",
+    "story.ci",
+    "story.ci.queue",
+    "story.ci.run",
     "story.review_wait",
+    "story.rework",
     "story.merge",
-    "story.reopened"
+    "story.reopened",
+    "story.operator_hold"
   ],
   "source_event_id_pattern": "^[A-Za-z0-9._-]{1,256}$",
   "span_vectors": [
@@ -58,6 +63,78 @@
       "kind": "story.review_wait",
       "source_event_id": "20473627891",
       "span_id": "d028f658590dfc35"
+    },
+    {
+      "story": "2AMLogic/harness-ops#307",
+      "repo_id": 1377976597,
+      "number": 307,
+      "input": "loom-story/v1:github:1377976597:307",
+      "kind": "story.ci",
+      "source_event_id": "456",
+      "span_id": "3b0b5e0aa9bc4ae0"
+    },
+    {
+      "story": "2AMLogic/harness-ops#307",
+      "repo_id": 1377976597,
+      "number": 307,
+      "input": "loom-story/v1:github:1377976597:307",
+      "kind": "story.ci.queue",
+      "source_event_id": "789",
+      "span_id": "8b8e03edf8dc36e9"
+    },
+    {
+      "story": "rjwalters/loom#9027",
+      "repo_id": 1073994527,
+      "number": 9027,
+      "input": "loom-story/v1:github:1073994527:9027",
+      "kind": "story.ci.run",
+      "source_event_id": "456",
+      "span_id": "f2c7cb6683a87d21"
+    },
+    {
+      "story": "2AMLogic/harness-ops#307",
+      "repo_id": 1377976597,
+      "number": 307,
+      "input": "loom-story/v1:github:1377976597:307",
+      "kind": "story.rework",
+      "source_event_id": "654",
+      "span_id": "d84da974e982a540"
+    },
+    {
+      "story": "rjwalters/loom#9027",
+      "repo_id": 1073994527,
+      "number": 9027,
+      "input": "loom-story/v1:github:1073994527:9027",
+      "kind": "story.operator_hold",
+      "source_event_id": "20473627999",
+      "span_id": "7d60e15df9dcb6d0"
+    },
+    {
+      "story": "2AMLogic/harness-ops#1",
+      "repo_id": 1377976597,
+      "number": 1,
+      "input": "loom-story/v1:github:1377976597:1",
+      "kind": "story.intake",
+      "source_event_id": "101",
+      "span_id": "dfa890bd983ed2a0"
+    },
+    {
+      "story": "rjwalters/loom#9027",
+      "repo_id": 1073994527,
+      "number": 9027,
+      "input": "loom-story/v1:github:1073994527:9027",
+      "kind": "story.queue_dwell",
+      "source_event_id": "20473627123",
+      "span_id": "75fd3645192bc860"
+    },
+    {
+      "story": "2AMLogic/harness-ops#1",
+      "repo_id": 1377976597,
+      "number": 1,
+      "input": "loom-story/v1:github:1377976597:1",
+      "kind": "story.reopened",
+      "source_event_id": "303",
+      "span_id": "722dac848277c7d2"
     }
   ]
 }

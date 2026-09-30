@@ -62,7 +62,7 @@ If you post a comment via `gh issue comment` / `gh pr comment` / `gh api ...
 comments` from a scratch file, `--body @path` (and `gh api -f body=@path`)
 posts the literal string `@path`, not the file's contents. **Full pitfall,
 incident citation, and fixes**:
-[`comment-body-literal-path.md`](comment-body-literal-path.md).
+[`comment-body-literal-path.md`](../loom-comment-body-literal-path/SKILL.md).
 
 ---
 
@@ -783,10 +783,10 @@ discover_project_goals() {
     grep -E "^- \[.\]|^## M[0-9]" docs/roadmap.md ROADMAP.md 2>/dev/null | head -10
   fi
 
-  # 3. Check for urgent/high-priority goal-advancing issues
+  # 3. Goal-advancing and operator-starred work
   echo "Current goal-advancing work:"
   "$GH_READ" issue list --label="tier:goal-advancing" --state=open --limit=5
-  "$GH_READ" issue list --label="loom:urgent" --state=open --limit=5
+  "$GH_READ" issue list --label="loom:operator-priority" --state=open --limit=5
 
   # 4. Summary
   echo "Simplification proposals should support these focus areas"

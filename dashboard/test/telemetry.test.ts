@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { decodeVisibility, extractRecordFields, validateEnvelope } from "../src/telemetry";
+import {
+  decodeVisibility,
+  extractRecordFields,
+  isPathShapedRepo,
+  normalizePathRepo,
+  validateEnvelope,
+} from "../src/telemetry";
 import { hostHealthEnvelope, sweepStartedEnvelope } from "./testHelpers";
 
 describe("decodeVisibility — fail-safe-to-private (mirrors the Rust RepoVisibility decode)", () => {
@@ -108,5 +114,54 @@ describe("extractRecordFields", () => {
     // No visibility field at all on a host-level record — must still
     // fail-safe to private, never left undefined/public.
     expect(fields.visibility).toBe("private");
+  });
+});
+
+describe("path-shaped repo normalization (rjwalters/loom#9442)", () => {
+  it("isPathShapedRepo flags exactly the leading-slash values", () => {
+    expect(isPathShapedRepo("/Users/x/GitHub/MyRepo")).toBe(true);
+    expect(isPathShapedRepo("/home/ubuntu/loom")).toBe(true);
+    expect(isPathShapedRepo("/")).toBe(true);
+    expect(isPathShapedRepo("rjwalters/loom")).toBe(false);
+    expect(isPathShapedRepo("MyRepo")).toBe(false);
+    expect(isPathShapedRepo("")).toBe(false);
+  });
+
+  it("normalizePathRepo takes the lowercased basename, POSIX-style", () => {
+    expect(normalizePathRepo("/Users/x/GitHub/MyRepo")).toBe("myrepo");
+    expect(normalizePathRepo("/home/ubuntu/Loom")).toBe("loom");
+    // Trailing slash is stripped before taking the basename…
+    expect(normalizePathRepo("/Users/x/GitHub/MyRepo/")).toBe("myrepo");
+    // …and a degenerate path has no basename at all.
+    expect(normalizePathRepo("/")).toBe("");
+  });
+
+  it("extractRecordFields normalizes a filesystem path to its basename — never stores a value starting with /", () => {
+    const envelope = sweepStartedEnvelope({ repo: "/Users/x/GitHub/MyRepo" });
+    const result = validateEnvelope(envelope, 0);
+    if (!result.ok) throw new Error("expected valid envelope");
+    const fields = extractRecordFields(result.envelope.record);
+    expect(fields.repo).toBe("myrepo");
+    expect(fields.repo?.startsWith("/")).toBe(false);
+  });
+
+  it("extractRecordFields leaves a slug (Owner/Repo) untouched", () => {
+    const envelope = sweepStartedEnvelope({ repo: "rjwalters/loom" });
+    const result = validateEnvelope(envelope, 0);
+    if (!result.ok) throw new Error("expected valid envelope");
+    expect(extractRecordFields(result.envelope.record).repo).toBe("rjwalters/loom");
+  });
+
+  it("extractRecordFields still leaves an absent repo absent", () => {
+    const result = validateEnvelope(hostHealthEnvelope(), 0);
+    if (!result.ok) throw new Error("expected valid envelope");
+    expect(extractRecordFields(result.envelope.record).repo).toBeUndefined();
+  });
+
+  it("a degenerate path (/) normalizes to absent rather than an empty string", () => {
+    const envelope = sweepStartedEnvelope({ repo: "/", sweep_id: "sweep-degenerate-repo" });
+    const result = validateEnvelope(envelope, 0);
+    if (!result.ok) throw new Error("expected valid envelope");
+    expect(extractRecordFields(result.envelope.record).repo).toBeUndefined();
   });
 });

@@ -1309,7 +1309,8 @@ pub mod forge {
             // GraphQL's `"OPEN"`) — `EpicSnapshot::is_open` compares
             // case-insensitively, so both forms are safe. The `pull_request`
             // filter keeps the pre-#4428 issue-only semantics.
-            let rows = crate::forge_listing::list_issues_cached(
+            let rows = crate::forge_listing::list_issues_cached_as(
+                "epic_supervisor",
                 &self.gh_bin,
                 self.cwd.as_deref(),
                 self.repo.as_deref(),
