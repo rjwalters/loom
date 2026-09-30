@@ -3,7 +3,12 @@
 //! changes, on a periodic refresh, or once when the row leaves the queue — so
 //! SigNoz can answer "why hasn't `owner/repo#N` started" for any queued issue,
 //! not just the ones that reached a `dispatch()` attempt
-//! ([`super::dispatch`]'s `loom.dispatch.admission`).
+//! ([`super::dispatch`]'s `loom.dispatch.admission`). Each span also carries
+//! the row's queue position metadata (Issue #9669): `loom.queue.candidate_rank`
+//! (1-indexed, plan position when the row has one, else its comparator rank),
+//! `loom.queue.total_candidates` (the tick's ready-queue depth) and
+//! `loom.queue.priority_score` (the comparator keys that placed it, as one
+//! compact JSON object).
 //!
 //! # Where this runs, and why not the tick loop
 //!
@@ -75,7 +80,7 @@ use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::telemetry::queue_snapshot::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 use crate::telemetry::RepoVisibility;
-use crate::types::{QueueDisposition, WorkFinderTickSummary};
+use crate::types::{PlanKey, QueueDisposition, WorkFinderTickSummary};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::{PARK_LABELS, SKIP_LABELS};
 
@@ -131,6 +136,19 @@ pub struct DispositionRow {
     pub park_label: Option<String>,
     /// Present only for `OpenPr` rows — see [`open_pr_number`].
     pub pr_number: Option<u32>,
+    /// 1-indexed queue position at this tick (Issue #9669): the row's
+    /// dispatch-plan `position` in the shaped pass-2 candidate order when the
+    /// plan annotated it, else its bare comparator `rank` — a blocked row's
+    /// would-be position once unblocked. Always present on a queue row.
+    pub candidate_rank: u32,
+    /// The tick's ready-queue row count — the denominator of
+    /// [`Self::candidate_rank`] (Issue #9669).
+    pub total_candidates: usize,
+    /// The comparator keys that placed the row, as one compact JSON object in
+    /// comparator order — see [`priority_score`]. `None` when the row carries
+    /// no plan annotation (no keys) or the JSON exceeds the span-attribute
+    /// byte bound.
+    pub priority_score: Option<String>,
     /// The issue's resolved story-point size (#9432, Issue #9674) — `None`
     /// when unsized or a labeled defect (never a guess).
     pub story_points: Option<u32>,
@@ -154,6 +172,16 @@ pub struct Emission {
     pub transition: Transition,
     pub park_label: Option<String>,
     pub pr_number: Option<u32>,
+    /// 1-indexed queue position at this tick (Issue #9669); absent on a
+    /// `left_queue` emission, whose row is no longer ranked.
+    pub candidate_rank: Option<u32>,
+    /// The tick's ready-queue row count (Issue #9669); absent on a
+    /// `left_queue` emission.
+    pub total_candidates: Option<usize>,
+    /// The comparator keys that placed the row, as one compact JSON object
+    /// (Issue #9669); absent without a plan annotation or on a `left_queue`
+    /// emission.
+    pub priority_score: Option<String>,
     /// Present only for a `WorkspaceHalted` row whose detail named a
     /// closed-vocabulary halt cause — see [`halt_cause_token`] (#9673).
     pub halt_cause: Option<String>,
@@ -234,6 +262,9 @@ impl DispositionTracker {
                     transition,
                     park_label: row.park_label.clone(),
                     pr_number: row.pr_number,
+                    candidate_rank: Some(row.candidate_rank),
+                    total_candidates: Some(row.total_candidates),
+                    priority_score: row.priority_score.clone(),
                     halt_cause: row.halt_cause.clone(),
                 });
             }
@@ -258,6 +289,9 @@ impl DispositionTracker {
                     transition: Transition::LeftQueue,
                     park_label: None,
                     pr_number: None,
+                    candidate_rank: None,
+                    total_candidates: None,
+                    priority_score: None,
                     halt_cause: None,
                 });
                 // Dropped: not reinserted into `next`, so this key reads as
@@ -310,6 +344,30 @@ fn open_pr_number(disposition: QueueDisposition, detail: Option<&str>) -> Option
     digits.parse().ok()
 }
 
+/// A row's composite priority weight (Issue #9669): its comparator keys as
+/// one compact JSON object in comparator order, e.g.
+/// `{"operator_priority":false,"workspace_priority":100,…}`. The dispatch
+/// comparator is lexicographic over named keys, so there is no numeric score
+/// to fabricate — the key tuple *is* the weight that placed the row, taken
+/// from the row's plan annotation (the same projection the dispatch plan
+/// publishes, Issue #9288). `None` without keys (no plan annotation), or when
+/// the JSON would exceed the 256-byte span-attribute bound, which would drop
+/// it at emission anyway.
+#[must_use]
+fn priority_score(keys: &[PlanKey]) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+    let score = format!(
+        "{{{}}}",
+        keys.iter()
+            .map(|key| format!("\"{}\":{}", key.name, key.value))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    (score.len() <= 256).then_some(score)
+}
+
 /// The closed-vocabulary halt cause in a `WorkspaceHalted` row's `detail`
 /// (#9017) — validated through [`HaltCause::from_wire`] and re-emitted as its
 /// canonical `as_str` token, never the raw text (#9673). A cause-less legacy
@@ -333,6 +391,7 @@ pub fn build_rows(
     summary: &WorkFinderTickSummary,
     repos: &HashMap<String, QueueRepoRef>,
 ) -> (Vec<DispositionRow>, DroppedCounts) {
+    let total_candidates = summary.queue.len();
     let mut rows = Vec::new();
     let mut dropped = DroppedCounts::default();
     for row in &summary.queue {
@@ -352,6 +411,16 @@ pub fn build_rows(
             disposition: row.disposition,
             park_label: allowed_park_label(row.disposition, row.detail.as_deref()),
             pr_number: open_pr_number(row.disposition, row.detail.as_deref()),
+            // The plan's pass-2 position is the rank among *eligible*
+            // candidates; the bare comparator rank is the fallback for a row
+            // the plan gave no position (blocked, or a pre-#9288 payload) —
+            // where it would sit once unblocked (Issue #9669).
+            candidate_rank: row
+                .plan
+                .position
+                .unwrap_or_else(|| u32::try_from(row.rank).unwrap_or(u32::MAX)),
+            total_candidates,
+            priority_score: priority_score(&row.plan.keys),
             story_points: row.story_points,
             halt_cause: halt_cause_token(row.disposition, row.detail.as_deref()),
         });
@@ -472,6 +541,15 @@ pub fn build_span(
     .collect();
     if let Some(rank) = emission.rank {
         attributes.insert("loom.queue.rank".to_string(), rank.to_string());
+    }
+    if let Some(candidate_rank) = emission.candidate_rank {
+        attributes.insert("loom.queue.candidate_rank".to_string(), candidate_rank.to_string());
+    }
+    if let Some(total) = emission.total_candidates {
+        attributes.insert("loom.queue.total_candidates".to_string(), int(total).to_string());
+    }
+    if let Some(score) = &emission.priority_score {
+        attributes.insert("loom.queue.priority_score".to_string(), score.clone());
     }
     if let Some(previous) = emission.previous_disposition {
         attributes

@@ -956,7 +956,7 @@ live peer genuinely holds the claim.
 ### Creating the PR
 
 **Open the PR with `./.loom/scripts/create-pr.sh`, never a bare `gh pr create` (#6074).**
-The flags are a subset of `gh pr create`'s, so the call below reads the same — but three
+The flags are a subset of `gh pr create`'s, so the call below reads the same — but four
 things a bare `gh pr create` cannot do are load-bearing here:
 
 - **It adopts an already-open PR for your branch** (prints that PR's URL, exits 0, creates
@@ -969,6 +969,11 @@ things a bare `gh pr create` cannot do are load-bearing here:
   supersede it refuses to open a duplicate PR (names the superseding PR, exits non-zero,
   does not push further, does not delete the branch). `Part of #N` / `Contributes to #N`
   partial-increment references are exempt by construction — see "Multi-PR landings" below.
+- **It enforces a 1:1 issue-to-PR review-gate (#9453 phase 5)** — the race adopt-first
+  above can't catch: two builders on *different* branches for the *same* issue. Re-runs
+  `forge check-open-pr` on your body's referenced issue (closing OR `Part of`); an open PR
+  on a different head branch refuses (exit `6`, names it). **If refused: stand down** —
+  close your branch, or escalate to Judge/a human if yours genuinely supersedes it.
 - **It survives the GitHub App permission window.** A cached App installation token can
   hold `Contents:write` while `Pull-requests:write` has not propagated into it yet, so
   your `git push` succeeds and the very next `gh pr create` returns `403 Resource not

@@ -37,6 +37,7 @@ impl Heuristic for StartV1 {
                 kind: Kind::Start,
                 sources: &[SampleSource::StageJournal],
                 always_merge: false,
+                censoring: false,
             },
             input,
             history,
