@@ -219,6 +219,19 @@ pub(crate) enum ScriptPortCommand {
     /// `--porcelain` (the create arm's record stream) is always 0.
     WorktreeCheck(super::worktree_check::WorktreeCheckArgs),
 
+    /// `worktree.sh`'s "the worktree directory already exists" arm, whole
+    /// (#8195 slice 12): the registration probe, the preserve-vs-reset verdict,
+    /// the #3548 sentinel back-fill and the stale-worktree `git reset --hard`
+    /// behind its #6334 rescue guard. Retires the LAST unanchored
+    /// `git worktree list | grep -q "$WORKTREE_PATH"` in the script — a
+    /// substring match against symlink-RESOLVED paths, which refused a live
+    /// worktree on any repo reached through a symlink (every macOS `/tmp`
+    /// fixture) and accepted an unregistered `issue-4` beside a registered
+    /// `issue-44`, then wrote a sentinel into it. Exit 0 = the worktree is
+    /// usable, 1 = not a registered worktree (or the sentinel could not be
+    /// written).
+    WorktreeExisting(super::worktree_existing::WorktreeExistingArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -460,6 +473,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeClosedPrBranch(args) => args.run(),
             ScriptPortCommand::WorktreeSparse(args) => args.run(),
             ScriptPortCommand::WorktreeCheck(args) => args.run(),
+            ScriptPortCommand::WorktreeExisting(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),

@@ -161,6 +161,7 @@ pub mod check;
 pub mod cleanup;
 pub mod closed_pr_branch;
 pub mod default_branch;
+pub mod existing;
 pub mod issue_lock;
 pub mod link;
 pub mod lock;

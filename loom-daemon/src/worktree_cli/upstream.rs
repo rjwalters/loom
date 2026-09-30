@@ -166,8 +166,9 @@ pub fn run(opts: &Options) -> i32 {
     let branch = opts.branch.as_str();
     let tracking = format!("origin/{branch}");
 
-    // `git fetch origin "$BRANCH_NAME" 2>/dev/null || true`
-    git_discard(repo, &["fetch", "origin", branch]);
+    // `git fetch origin -- "$BRANCH_NAME" 2>/dev/null || true` — the `--` ends
+    // option parsing (#9106), so a `-`-prefixed branch is a refspec, never a switch.
+    git_discard(repo, &["fetch", "origin", "--", branch]);
 
     // `if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"`.
     // Everything below is inside this guard: with no remote branch of this

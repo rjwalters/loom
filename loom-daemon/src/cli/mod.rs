@@ -112,6 +112,7 @@ pub(crate) mod worktree_branch_conflict;
 pub(crate) mod worktree_check;
 pub(crate) mod worktree_cleanup;
 pub(crate) mod worktree_closed_pr_branch;
+pub(crate) mod worktree_existing;
 pub(crate) mod worktree_link;
 pub(crate) mod worktree_lock;
 pub(crate) mod worktree_remove;
