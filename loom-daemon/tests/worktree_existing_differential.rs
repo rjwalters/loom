@@ -148,6 +148,20 @@ fn hermetic(cmd: &mut Command) -> &mut Command {
         // it: a differential test whose answer depends on the network is not
         // one.
         .env("LOOM_BRANCH_LANDED_OFFLINE", "1")
+        // Every `git fetch` spawns a DETACHED `git maintenance run --auto`
+        // whose cwd is the fetch's `-C` directory, which is the worktree. If
+        // that child is still alive when the reset's #7463 liveness probe
+        // runs, the probe counts it as a live holder and refuses (#9620). The
+        // frozen fixture's retired fetch still spawns one, and whether it has
+        // exited before the shell's probe is up to the scheduler. A
+        // differential test whose answer depends on a detached process's
+        // timing is not one either, so both sides run without it. The port no
+        // longer spawns it at all: see
+        // `the_ports_own_fetches_never_spawn_background_maintenance`, which
+        // runs with auto-maintenance ENABLED.
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+        .env("GIT_CONFIG_VALUE_0", "false")
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -540,6 +554,10 @@ fn stale_level_agrees_and_both_reset() {
     assert_same("stale", &shell, &rust);
     assert_eq!(shell.code, 0);
     assert!(rust.stdout.contains("Stale worktree detected"), "{}", rust.stdout);
+    // Agreeing is not enough: both could agree on a refusal. The stale worktree
+    // must actually be RESET on both sides, and nothing may be refused (#9620).
+    assert!(rust.stdout.contains("Stale worktree reset to main"), "{}", rust.stdout);
+    assert!(rust.stderr.is_empty(), "{}", rust.stderr);
     assert!(rust.sentinel.is_some());
 }
 
@@ -549,6 +567,59 @@ fn stale_behind_agrees_and_both_reset_to_the_base() {
     assert_same("behind", &shell, &rust);
     assert_eq!(shell.code, 0);
     assert_eq!(rust.head, "newer", "the stale worktree must end up at origin/main's tip");
+}
+
+/// #9620: `git fetch` ends by spawning a detached `git maintenance run --auto`
+/// that keeps the fetch's cwd, which is the worktree. The port probes for live
+/// holders in-process right after its own fetches, so that child, if spawned,
+/// is read as a foreign holder and a stale worktree is randomly left unreset
+/// (Linux CI lost that race regularly). A race cannot be asserted
+/// deterministically, but its precondition can: with auto-maintenance ENABLED
+/// (the harness's `hermetic()` override removed), no git the port runs may
+/// start a `maintenance` child, and the reset must land.
+#[test]
+fn the_ports_own_fetches_never_spawn_background_maintenance() {
+    let side = build_side("maint", "rust", Reach::Canonical, State::StaleBehind);
+    let trace = side.root.join("trace2.perf");
+
+    let mut cmd = Command::new(bin());
+    arm_env(&mut cmd, &side, false);
+    cmd.env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_KEY_0")
+        .env_remove("GIT_CONFIG_VALUE_0")
+        .env("GIT_TRACE2_PERF", &trace)
+        .arg("worktree-existing")
+        .arg("--worktree")
+        .arg(&side.worktree)
+        .arg("--repo")
+        .arg(&side.repo)
+        .args(["--issue", "42"])
+        .args(["--branch", "feature/issue-42"])
+        .args(["--default-branch", "main"])
+        .args(["--base-ref", "origin/main"])
+        .args(["--base-display", "main"])
+        .args(["--base-branch", ""])
+        .args(["--ignore-pid", &std::process::id().to_string()])
+        .current_dir(&side.repo);
+    let out = cmd.output().expect("run port");
+    let observed = observe(&out, &side);
+
+    let trace_text = fs::read_to_string(&trace).expect("the port's gits must have traced");
+    assert!(
+        trace_text.contains("| cmd_name ") && trace_text.contains("fetch"),
+        "the trace must cover the port's fetches, or this test proves nothing:\n{trace_text}"
+    );
+    let spawned: Vec<&str> = trace_text
+        .lines()
+        .filter(|l| l.contains("child_start") && l.contains("maintenance"))
+        .collect();
+    assert!(
+        spawned.is_empty(),
+        "the port's fetches spawned background maintenance: {spawned:#?}"
+    );
+    assert_eq!(observed.code, 0, "{observed:?}");
+    assert!(observed.stderr.is_empty(), "{}", observed.stderr);
+    assert_eq!(observed.head, "newer", "the stale worktree must have been reset");
 }
 
 /// The #8287 shape: 0 commits ahead of the base, but `origin/<branch>` is live
