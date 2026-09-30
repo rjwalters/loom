@@ -2553,8 +2553,20 @@ re-estimates on every sweep transition, and the collector's 5-minute pass
 reads the review-label listings, resolves PRs that left review, and refreshes
 every live estimate. Every observed stage boundary is appended to
 `.loom/logs/eta-stage-samples.jsonl` as it is seen; pending estimates persist
-in `.loom/state/eta/pending.jsonl` (per-host, never git-tracked — the
-managed gitignore block ignores `.loom/state/eta/`).
+in `.loom/state/eta/pending.jsonl` (per-host, never git-tracked — see the
+`.loom/state/` contract below).
+
+**`.loom/state/` tracking contract (#9592).** Everything the daemon writes
+under `.loom/state/` is per-host runtime state and is never tracked: the
+managed gitignore block ignores `.loom/state/*` wholesale, so a new
+subsystem's directory is covered without registering it. The one tracked
+file is `.loom/state/detect-unlabeled-epics-dismissed`, re-included by a
+`!` negation: a human maintains it by hand (`detect-unlabeled-epics.sh
+--dismiss-file`) and commits it so the dismissals are shared. Add a
+negation only for a file a human writes and wants committed, never for
+daemon output. `post_init.rs`'s
+`every_daemon_state_path_is_ignored_by_the_managed_block` test checks both
+rules with `git check-ignore`.
 
 | key | env | default |
 |---|---|---|
@@ -6297,8 +6309,8 @@ calls `fleet_captain::record_shell_arm` on the **armed** path (and, since
 #9014, `forget_shell_arm` on a **refused** one, so a captain handoff clears
 the old captain's record at its next check instead of leaving a false
 "armed on a non-captain host" flag for up to the TTL), writing
-`<root>/.loom/state/fleet-captain/armed.json` (never git-tracked — same
-per-host-runtime-state class as `.loom/state/ci-telemetry/`): job name →
+`<root>/.loom/state/fleet-captain/armed.json` (never git-tracked — see
+the `.loom/state/` contract): job name →
 `last_armed_at`. Updates to that file hold an `flock` on the sibling
 `armed.lock` (#9014), so concurrent checks on one host cannot drop an entry. `sample_host_health` merges this file (via
 `fleet_captain::armed_singleton_job_names_for_host`) with the in-process
