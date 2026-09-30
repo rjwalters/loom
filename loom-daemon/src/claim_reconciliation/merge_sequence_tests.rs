@@ -247,7 +247,7 @@ fn release_decisions_follow_the_evaluation_contract() {
     // Landed at recorded head ⇒ release; dissolved ⇒ release; unknown ⇒ hold.
     let m = marker_after(5, Some("pass"));
     assert_eq!(
-        hold_action(&m, Some(&pred_open_at_head(&m.pred_head)), true, 72.0),
+        hold_action(&m, Some(&pred_open_at_head(&m.pred_head)), live(&m), true, 72.0),
         HoldAction::HoldSoft
     );
     let landed = PredecessorState {
@@ -256,25 +256,81 @@ fn release_decisions_follow_the_evaluation_contract() {
         head_sha: Some(m.pred_head.clone()),
         updated_at: None,
     };
-    assert_eq!(hold_action(&m, Some(&landed), true, 72.0), HoldAction::Release);
+    assert_eq!(hold_action(&m, Some(&landed), live(&m), true, 72.0), HoldAction::Release);
     let dissolved = PredecessorState {
         merged: false,
         open: false,
         head_sha: Some(m.pred_head.clone()),
         updated_at: None,
     };
-    assert_eq!(hold_action(&m, Some(&dissolved), true, 72.0), HoldAction::ReleaseDissolved);
+    assert_eq!(
+        hold_action(&m, Some(&dissolved), live(&m), true, 72.0),
+        HoldAction::ReleaseDissolved
+    );
     // Unreadable predecessor ⇒ fail closed (hold), never release.
-    assert_eq!(hold_action(&m, None, true, 72.0), HoldAction::HoldSoft);
+    assert_eq!(hold_action(&m, None, live(&m), true, 72.0), HoldAction::HoldSoft);
     let hard = marker_after(5, None);
-    assert_eq!(hold_action(&hard, None, true, 72.0), HoldAction::HoldHard);
+    assert_eq!(hold_action(&hard, None, live(&hard), true, 72.0), HoldAction::HoldHard);
+}
+
+/// The follower's live head when it has NOT moved since the marker.
+fn live(m: &SequenceMarker) -> Option<&str> {
+    Some(m.follower_head.as_str())
+}
+
+#[test]
+fn a_moved_follower_head_voids_the_hold_for_replanning() {
+    // The follower received new commits (or a force-push) while held: the
+    // marker no longer describes THIS tree, so the hold is void whatever the
+    // predecessor is doing — in flight, landed, or unreadable.
+    let moved = format!("{:040x}", 424242);
+    let soft = marker_after(5, Some("pass"));
+    let hard = marker_after(5, None);
+    let in_flight = pred_open_at_head(&soft.pred_head);
+    assert_eq!(
+        hold_action(&soft, Some(&in_flight), Some(&moved), true, 72.0),
+        HoldAction::VoidAndReplan
+    );
+    assert_eq!(
+        hold_action(&hard, Some(&in_flight), Some(&moved), true, 72.0),
+        HoldAction::VoidAndReplan
+    );
+    let landed = PredecessorState {
+        merged: true,
+        open: false,
+        head_sha: Some(soft.pred_head.clone()),
+        updated_at: None,
+    };
+    assert_eq!(
+        hold_action(&soft, Some(&landed), Some(&moved), true, 72.0),
+        HoldAction::VoidAndReplan,
+        "a landed predecessor must not release a hold pinned to an older follower tree"
+    );
+    assert_eq!(hold_action(&soft, None, Some(&moved), true, 72.0), HoldAction::VoidAndReplan);
+}
+
+#[test]
+fn an_unknown_follower_head_fails_closed() {
+    // No live head in the listing ⇒ nothing proves the pin is stale or
+    // current: hold, never release or void.
+    let soft = marker_after(5, Some("pass"));
+    let hard = marker_after(5, None);
+    let landed = PredecessorState {
+        merged: true,
+        open: false,
+        head_sha: Some(soft.pred_head.clone()),
+        updated_at: None,
+    };
+    assert_eq!(hold_action(&soft, Some(&landed), None, true, 72.0), HoldAction::HoldSoft);
+    assert_eq!(hold_action(&soft, Some(&landed), Some(""), true, 72.0), HoldAction::HoldSoft);
+    assert_eq!(hold_action(&hard, Some(&landed), None, true, 72.0), HoldAction::HoldHard);
 }
 
 #[test]
 fn a_moved_predecessor_head_voids_the_hold_for_replanning() {
     let m = marker_after(5, Some("pass"));
     let moved = pred_open_at_head(&format!("{:040x}", 12345));
-    assert_eq!(hold_action(&m, Some(&moved), true, 72.0), HoldAction::VoidAndReplan);
+    assert_eq!(hold_action(&m, Some(&moved), live(&m), true, 72.0), HoldAction::VoidAndReplan);
 }
 
 #[test]
@@ -288,20 +344,26 @@ fn only_soft_holds_on_approved_followers_expire() {
     let soft = marker_after(5, Some("pass"));
     let hard = marker_after(5, None);
     // Soft + approved + quiet past the bound ⇒ expire.
-    assert_eq!(hold_action(&soft, Some(&quiet), true, 72.0), HoldAction::Expire);
+    assert_eq!(hold_action(&soft, Some(&quiet), live(&soft), true, 72.0), HoldAction::Expire);
     // Soft but NOT approved ⇒ hold (nothing mergeable is starved).
-    assert_eq!(hold_action(&soft, Some(&quiet), false, 72.0), HoldAction::HoldSoft);
+    assert_eq!(hold_action(&soft, Some(&quiet), live(&soft), false, 72.0), HoldAction::HoldSoft);
     // Hard + approved + quiet ⇒ hold (a semantic dependency never expires
     // into merge permission — the #9063 non-negotiable).
-    assert_eq!(hold_action(&hard, Some(&quiet), true, 72.0), HoldAction::HoldHard);
+    assert_eq!(hold_action(&hard, Some(&quiet), live(&hard), true, 72.0), HoldAction::HoldHard);
     // Soft + approved + quiet but within the bound ⇒ hold.
-    assert_eq!(hold_action(&soft, Some(&quiet), true, f64::INFINITY), HoldAction::HoldSoft);
+    assert_eq!(
+        hold_action(&soft, Some(&quiet), live(&soft), true, f64::INFINITY),
+        HoldAction::HoldSoft
+    );
     // Predecessor with unknown freshness ⇒ hold.
     let freshless = PredecessorState {
         updated_at: None,
         ..quiet.clone()
     };
-    assert_eq!(hold_action(&soft, Some(&freshless), true, 72.0), HoldAction::HoldSoft);
+    assert_eq!(
+        hold_action(&soft, Some(&freshless), live(&soft), true, 72.0),
+        HoldAction::HoldSoft
+    );
 }
 
 // --- Deferral -----------------------------------------------------------
@@ -309,9 +371,13 @@ fn only_soft_holds_on_approved_followers_expire() {
 #[test]
 fn deferral_applies_only_to_clean_in_flight_ordering() {
     let m = marker_after(5, Some("pass"));
-    assert!(defer_base_repair(&m, &pred_open_at_head(&m.pred_head)));
+    assert!(defer_base_repair(&m, &pred_open_at_head(&m.pred_head), &m.follower_head));
     // Moved head ⇒ replan territory: flag the conflict, don't hide it.
-    assert!(!defer_base_repair(&m, &pred_open_at_head(&format!("{:040x}", 777))));
+    assert!(!defer_base_repair(
+        &m,
+        &pred_open_at_head(&format!("{:040x}", 777)),
+        &m.follower_head
+    ));
     // Landed ⇒ flag: the follower must now be repaired against the new base.
     let landed = PredecessorState {
         merged: true,
@@ -319,7 +385,7 @@ fn deferral_applies_only_to_clean_in_flight_ordering() {
         head_sha: Some(m.pred_head.clone()),
         updated_at: None,
     };
-    assert!(!defer_base_repair(&m, &landed));
+    assert!(!defer_base_repair(&m, &landed, &m.follower_head));
     // Dissolved ⇒ flag.
     let dissolved = PredecessorState {
         merged: false,
@@ -327,7 +393,18 @@ fn deferral_applies_only_to_clean_in_flight_ordering() {
         head_sha: Some(m.pred_head.clone()),
         updated_at: None,
     };
-    assert!(!defer_base_repair(&m, &dissolved));
+    assert!(!defer_base_repair(&m, &dissolved, &m.follower_head));
+}
+
+#[test]
+fn a_moved_follower_head_never_defers_a_repair() {
+    // The review-conflict pass found the follower conflicting at its LIVE
+    // head; a marker pinned to an older follower tree must not defer that
+    // repair even though the predecessor is still in flight at its pin.
+    let m = marker_after(5, Some("pass"));
+    let in_flight = pred_open_at_head(&m.pred_head);
+    assert!(defer_base_repair(&m, &in_flight, &m.follower_head));
+    assert!(!defer_base_repair(&m, &in_flight, &format!("{:040x}", 424242)));
 }
 
 // --- Rendered comments --------------------------------------------------

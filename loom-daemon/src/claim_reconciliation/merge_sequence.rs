@@ -486,25 +486,42 @@ pub enum HoldAction {
     Expire,
 }
 
-/// Pure Phase-1 decision for one hold. `pred` is `None` when the predecessor
-/// could not be read — fail closed: hold (the release needs a positive
-/// signal, the #9378 asymmetry).
+/// Pure Phase-1 decision for one hold.
+///
+/// `follower_head` is the follower's LIVE head SHA from this tick's listing —
+/// never the marker's own recorded `follower_head`, which would make the
+/// follower-moved check in [`evaluate`] vacuous. It is checked first, per
+/// `evaluate`'s contract: a marker that no longer describes this tree is void
+/// whatever the predecessor did, so a moved follower voids the hold even when
+/// the predecessor is unreadable (the listing itself is the positive signal).
+///
+/// `follower_head` is `None` when the listing carried no head, and `pred` is
+/// `None` when the predecessor could not be read — both fail closed: hold
+/// (the release needs a positive signal, the #9378 asymmetry).
 #[must_use]
 pub fn hold_action(
     marker: &SequenceMarker,
     pred: Option<&PredecessorState>,
+    follower_head: Option<&str>,
     follower_has_loom_pr: bool,
     max_age_hours: f64,
 ) -> HoldAction {
     let hard = marker.source.as_deref() != Some(SOURCE_PASS);
-    let Some(pred) = pred else {
-        return if hard {
-            HoldAction::HoldHard
-        } else {
-            HoldAction::HoldSoft
-        };
+    let hold = if hard {
+        HoldAction::HoldHard
+    } else {
+        HoldAction::HoldSoft
     };
-    match evaluate(marker, pred, &marker.follower_head) {
+    let Some(follower_head) = follower_head.filter(|h| !h.is_empty()) else {
+        return hold;
+    };
+    if follower_head != marker.follower_head {
+        return HoldAction::VoidAndReplan;
+    }
+    let Some(pred) = pred else {
+        return hold;
+    };
+    match evaluate(marker, pred, follower_head) {
         Verdict::Clear => HoldAction::Release,
         Verdict::Dissolved => HoldAction::ReleaseDissolved,
         Verdict::Keep(KeepReason::InFlight) => {
@@ -627,12 +644,17 @@ pub fn defer_comment_body(marker: &SequenceMarker) -> String {
 /// Any replan-shaped state (moved heads, landed, dissolved) does NOT defer —
 /// the hold needs attention, and a conflict flag beside it is information,
 /// not churn.
+///
+/// `follower_head` is the follower's LIVE head — the one the caller just
+/// found base-conflicting — so a marker written against an older tree of the
+/// follower never defers a repair of the tree actually there now.
 #[must_use]
-pub fn defer_base_repair(marker: &SequenceMarker, pred: &PredecessorState) -> bool {
-    matches!(
-        evaluate(marker, pred, &marker.follower_head),
-        Verdict::Keep(KeepReason::InFlight)
-    )
+pub fn defer_base_repair(
+    marker: &SequenceMarker,
+    pred: &PredecessorState,
+    follower_head: &str,
+) -> bool {
+    matches!(evaluate(marker, pred, follower_head), Verdict::Keep(KeepReason::InFlight))
 }
 
 /// Evaluate whether the review-conflict pass should DEFER flagging `number`:
@@ -641,10 +663,14 @@ pub fn defer_base_repair(marker: &SequenceMarker, pred: &PredecessorState) -> bo
 /// caller flags anyway (fail toward repair, never toward suppression); a
 /// missing marker or an unreadable predecessor is `Ok(None)`, since an
 /// unverifiable ordering state must not suppress a repair either.
+///
+/// `follower_head` is the live head the caller's conflict decision was made
+/// at (see [`defer_base_repair`]).
 pub fn defer_flag_decision(
     gh_bin: &Path,
     root: &Path,
     number: u32,
+    follower_head: &str,
 ) -> Result<Option<SequenceMarker>> {
     let bin = gh_bin.to_string_lossy().to_string();
     let Some(bodies) = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", number) else {
@@ -656,7 +682,7 @@ pub fn defer_flag_decision(
     let Some(pred) = fetch_predecessor(&bin, root, "{owner}/{repo}", marker.after) else {
         return Ok(None);
     };
-    Ok(defer_base_repair(&marker, &pred).then_some(marker))
+    Ok(defer_base_repair(&marker, &pred, follower_head).then_some(marker))
 }
 
 /// Record a deferral on the PR — idempotent: the exact defer-marker comment
@@ -921,7 +947,8 @@ pub fn reconcile_merge_sequences(gh_bin: &Path, root: &Path) -> MergeSequenceSta
             continue;
         };
         let pred = fetch_predecessor(&bin, root, "{owner}/{repo}", marker.after);
-        let action = hold_action(&marker, pred.as_ref(), pr.has("loom:pr"), max_age);
+        let action =
+            hold_action(&marker, pred.as_ref(), pr.head_sha.as_deref(), pr.has("loom:pr"), max_age);
         let result = match action {
             HoldAction::Release | HoldAction::ReleaseDissolved | HoldAction::Expire => {
                 release_hold(gh_bin, root, pr.number, &release_comment_body(&marker, action))
