@@ -72,7 +72,9 @@ impl SampleSource {
     }
 }
 
-/// One observed stage duration.
+/// One observed stage duration. A sample in [`StageSamples::censored`] is the
+/// same shape but its `duration_sec` is a **lower bound**: the stage had not
+/// completed when it was observed (#9328).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageSample {
     /// `owner/repo`.
@@ -119,6 +121,15 @@ pub struct SweepPathSample {
 pub struct StageSamples {
     /// Stage durations.
     pub stages: Vec<StageSample>,
+    /// Right-censored stage durations (#9328): the stage was still open when
+    /// it was observed, so `duration_sec` is a lower bound, not a duration.
+    ///
+    /// Deliberately a **separate** vector rather than a flag on
+    /// [`StageSample`]: [`Self::select`] is the only read every shipped v1
+    /// heuristic makes, and keeping censored samples out of `stages` means no
+    /// v1 estimate can change by construction. Only a heuristic that asks for
+    /// them ([`Self::select_censored`]) sees them.
+    pub censored: Vec<StageSample>,
     /// Judge verdicts.
     pub verdicts: Vec<VerdictSample>,
     /// Successful sweep paths.
@@ -334,6 +345,47 @@ impl StageSamples {
             });
         }
         None
+    }
+
+    /// The **censored** lower bounds of `stage` for `repo` at `level`,
+    /// ascending: same window, same source and leak-free rules as
+    /// [`Self::select`], but read from [`Self::censored`] (#9328).
+    ///
+    /// `level` is the level [`Self::select`] already resolved for the same
+    /// stage, so the censored set describes the same population as the
+    /// observed one — never a repo-level observed grid paired with host-wide
+    /// censoring.
+    ///
+    /// Capped at [`MAX_SAMPLES`] most-recent, exactly as the observed side is:
+    /// a censored sample is one sample's worth of evidence either way.
+    #[must_use]
+    pub fn select_censored(
+        &self,
+        repo: &str,
+        stage: Stage,
+        as_of: DateTime<Utc>,
+        sources: &[SampleSource],
+        level: Level,
+    ) -> Vec<i64> {
+        let mut picked: Vec<&StageSample> = self
+            .censored
+            .iter()
+            .filter(|s| {
+                s.stage == stage
+                    && sources.contains(&s.source)
+                    && in_window(s.observed_at, as_of)
+                    && (level == Level::Host || same_repo(&s.repo, repo))
+            })
+            .collect();
+        picked.sort_by(|a, b| {
+            b.observed_at
+                .cmp(&a.observed_at)
+                .then(a.duration_sec.cmp(&b.duration_sec))
+        });
+        picked.truncate(MAX_SAMPLES);
+        let mut sorted: Vec<i64> = picked.iter().map(|s| s.duration_sec).collect();
+        sorted.sort_unstable();
+        sorted
     }
 
     /// Verdict counts `(n, rejected)` per attempt `1..=cap` at `level`,

@@ -148,6 +148,7 @@ fn child_env(input: &[String], config: &Config, job: &lease::Job) -> Result<Vec<
         if let Some((key, value)) = item.split_once('=') {
             if [
                 "LOOM_ROLE",
+                "LOOM_WORK_ORIGIN",
                 "LOOM_TERMINAL_ID",
                 "LOOM_SWEEP_ID",
                 "LOOM_SWEEP_CLAIM_OWNED",
@@ -217,6 +218,7 @@ mod tests {
                 "LOOM_DAEMON_SOCKET=/host/socket".into(),
                 "LOOM_RUN_JOB_HOST=host".into(),
                 "LOOM_ROLE=guide".into(),
+                "LOOM_WORK_ORIGIN=autonomous".into(),
             ],
             &config,
             &job,
@@ -224,6 +226,7 @@ mod tests {
         .unwrap();
         assert!(env.contains(&"LOOM_WORKSPACE=/workspace/repo".into()));
         assert!(env.contains(&"LOOM_ROLE=guide".into()));
+        assert!(env.contains(&"LOOM_WORK_ORIGIN=autonomous".into()));
         // The bound control identity and base revision the worker re-checks
         // come from the host lease, never from caller-supplied environment.
         assert!(env.contains(&format!("LOOM_PRIVATE_CONTROL={}", "b".repeat(64))));

@@ -29,6 +29,7 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.estimate_id",
     "loom.eta.kind",
     "loom.eta.heuristic",
+    "loom.eta.primary",
     "loom.eta.trigger",
     "loom.eta.version",
     "loom.eta.revision",
@@ -64,10 +65,25 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
 pub struct EtaEstimateRecord {
     /// Why it was emitted now.
     pub trigger: Trigger,
+    /// Whether this is the `current` heuristic's estimate for its kind
+    /// (#9328). A `false` is a **shadow** estimate: a registered candidate
+    /// computed beside `current` so it accumulates a live record, never the
+    /// subject's answer.
+    ///
+    /// Queries that want "the ETA" must filter `loom.eta.primary = true`;
+    /// accuracy and promotion queries deliberately want both sides.
+    /// `#[serde(default)]` to `true`: every record written before shadow mode
+    /// existed was, by definition, the only and therefore primary one.
+    #[serde(default = "primary_default")]
+    pub primary: bool,
     /// The estimate. Its `loom` field is the computing build (required),
     /// and its `result` is absent on a refusal. Boxed: it is by far the
     /// largest payload of any record kind.
     pub explanation: Box<Explanation>,
+}
+
+fn primary_default() -> bool {
+    true
 }
 
 /// One estimate's outcome, scored.

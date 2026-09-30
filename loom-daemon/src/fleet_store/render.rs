@@ -176,6 +176,55 @@ pub fn diff_values(path: &str, current: &Value, wanted: &Value, out: &mut Vec<St
     }
 }
 
+/// The bare dotted paths that differ between `current` (on disk) and
+/// `wanted` (rendered) — the path half of [`diff_values`]'s formatted lines,
+/// for a caller (`fleet-config render`'s live-reload classification, #9597)
+/// that needs to classify each change rather than print it. A separate walk
+/// rather than post-parsing `diff_values`'s output: the formatted lines
+/// truncate long values ([`brief`]), which would corrupt a path containing
+/// `": "` — this never touches formatting at all.
+pub fn diff_paths(path: &str, current: &Value, wanted: &Value, out: &mut Vec<String>) {
+    match (current, wanted) {
+        (Value::Object(c), Value::Object(w)) => {
+            for (k, cv) in c {
+                let p = join(path, k);
+                match w.get(k) {
+                    Some(wv) => diff_paths(&p, cv, wv, out),
+                    None => out.push(p),
+                }
+            }
+            for (k, _) in w {
+                if !c.contains_key(k) {
+                    out.push(join(path, k));
+                }
+            }
+        }
+        (c, w) if c == w => {}
+        (_, _) => out.push(if path.is_empty() {
+            ".".to_string()
+        } else {
+            path.to_string()
+        }),
+    }
+}
+
+/// [`diff_paths`] between `target`'s on-disk file and its rendered value —
+/// the same comparison [`drift`] makes, naming which paths changed rather
+/// than formatting a human diff. Empty when the file is missing/unparseable
+/// (nothing to enumerate — the whole file is what changed) or in sync.
+#[must_use]
+pub fn drifted_paths(target: &Target) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(&target.path) else {
+        return Vec::new();
+    };
+    let Ok(current) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    diff_paths("", &current, &target.value, &mut out);
+    out
+}
+
 fn join(path: &str, key: &str) -> String {
     if path.is_empty() {
         key.to_string()

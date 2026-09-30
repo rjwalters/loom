@@ -176,3 +176,33 @@ fn a_path_traversing_host_id_is_refused() {
     let p = paths();
     assert!(render(&snapshot_of(&sample_files()), "../x", &p.machine, &p.local).is_err());
 }
+
+#[test]
+fn drifted_paths_names_the_bare_changed_paths() {
+    let p = paths();
+    let targets = render(&snapshot_of(&sample_files()), "build-1", &p.machine, &p.local).unwrap();
+    let mut on_disk = targets[0].value.clone();
+    on_disk["autonomous"]["workFinder"]["maxConcurrent"] = json!(12);
+    on_disk["handEdited"] = json!(true);
+    std::fs::create_dir_all(p.machine.parent().unwrap()).unwrap();
+    std::fs::write(&p.machine, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+    let mut paths = drifted_paths(&targets[0]);
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            "autonomous.workFinder.maxConcurrent".to_string(),
+            "handEdited".to_string()
+        ]
+    );
+}
+
+#[test]
+fn drifted_paths_is_empty_for_a_missing_or_unparseable_file() {
+    let p = paths();
+    let targets = render(&snapshot_of(&sample_files()), "build-1", &p.machine, &p.local).unwrap();
+    assert!(drifted_paths(&targets[0]).is_empty(), "missing file");
+    std::fs::create_dir_all(p.machine.parent().unwrap()).unwrap();
+    std::fs::write(&p.machine, "{ <<<<<<< HEAD").unwrap();
+    assert!(drifted_paths(&targets[0]).is_empty(), "unparseable file");
+}

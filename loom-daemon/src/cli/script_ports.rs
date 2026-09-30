@@ -18,6 +18,8 @@ use anyhow::Result;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum ScriptPortCommand {
+    /// Ordered PR work for Judge, Doctor and Champion.
+    PrQueue(super::pr_queue::PrQueueArgs),
     /// Supervised persistent-container transport backing spawn-codex.sh.
     #[command(subcommand)]
     SessionExec(loom_daemon::session_exec::SessionExecCommand),
@@ -253,6 +255,18 @@ pub(crate) enum ScriptPortCommand {
     /// outage must never block worktree creation.
     WorktreeBranchReuse(super::worktree_branch_reuse::WorktreeBranchReuseArgs),
 
+    /// The forge round-trip behind `lib/worktree-forge-pr-check.sh`'s #7765
+    /// fresh-branch-shadow guard (#8195 slice 15) — the ORIGIN-branch sibling
+    /// of `WorktreeBranchReuse`'s LOCAL-branch arm. Answers whether an OPEN
+    /// PR already head-matches a branch `worktree.sh` is about to create
+    /// fresh, distinguishing "confirmed no PR" / "no forge remote at all,
+    /// nothing to shadow" from "the query itself failed" — the #7863
+    /// regression was exactly those last two collapsing into each other.
+    /// Prints a `TOKEN<TAB>text` record stream; always exits 0 (a query, not
+    /// a refusal — the shell library still builds the `jq -cn` refusal
+    /// documents itself).
+    WorktreeOpenPr(super::worktree_open_pr::WorktreeOpenPrArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -468,6 +482,7 @@ impl ScriptPortCommand {
     /// the stubs' callers branch on.
     pub(crate) fn run(self) -> Result<()> {
         match self {
+            ScriptPortCommand::PrQueue(args) => args.run(),
             ScriptPortCommand::SessionExec(args) => args.run(),
             ScriptPortCommand::PrivateWorkspace(args) => args.run(),
             ScriptPortCommand::SweepCheckpoint(args) => args.run(),
@@ -497,6 +512,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeCheck(args) => args.run(),
             ScriptPortCommand::WorktreeExisting(args) => args.run(),
             ScriptPortCommand::WorktreeBranchReuse(args) => args.run(),
+            ScriptPortCommand::WorktreeOpenPr(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
@@ -564,6 +580,11 @@ pub(crate) enum MergePrCommand {
     /// already spent on this head, so the PR was escalated to a durable
     /// `loom:operator` hold, 1 = could not produce fresh evidence.
     RedateChecks(super::merge_pr_redate::RedateChecksArgs),
+
+    /// Read-only report of which required checks and paths forced the #8508
+    /// re-dates (#9746), from the trailers on the re-date commits reachable
+    /// from `--ref` (default origin/main) within `--since` (default 24h).
+    RedateReport(super::merge_pr_redate_report::RedateReportArgs),
 
     /// The pre-merge `loom:pr` review-signal guard (#7419): refuse a merge
     /// whose current head does not carry `loom:pr`, unless
@@ -727,6 +748,16 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_partial_conflict`.
     PartialConflict(super::merge_pr_partial_conflict::PartialConflictArgs),
 
+    /// The two post-merge partial-increment AUDIT COMMENTS (#3667/#4569) —
+    /// `## Partial Increment Merged` and `## Premature Auto-Close Reverted` —
+    /// byte-frozen from the retired shell. Prints `LOOM-MERGE-PR-COMMENT`,
+    /// then the body verbatim with no trailing newline. Always exits 0; the
+    /// seam fails OPEN because both are posted AFTER the mutation they
+    /// describe, but a body is only ever posted when the sentinel is present,
+    /// so a binary predating the verb cannot make the shell overwrite the
+    /// audit trail with silence — see `cli::merge_pr_partial_comment`.
+    PartialComment(super::merge_pr_partial_comment::PartialCommentArgs),
+
     /// Which route a FAILED merge's forge error text sends the retry ladder
     /// down (#8191 slice): `merge-in-progress` (405, wait and retry),
     /// `head-mismatch` (#5579 — never retry-and-merge), `base-modified` (sync
@@ -767,6 +798,18 @@ pub(crate) enum MergePrCommand {
     /// with `REMOVE`/`PRESERVE` plus `LEVEL<TAB>message` lines to replay — see
     /// `cli::merge_pr_worktree_preserve`.
     WorktreePreserve(super::merge_pr_worktree_preserve::WorktreePreserveArgs),
+
+    /// Which worktree paths a merged PR owns (#6264/#3530, #8191 slice): the
+    /// strict `^feature/issue-([0-9]+)$` classification, the override-aware
+    /// worktree root, and from them the default cleanup target plus the
+    /// co-existing Judge/Doctor `pr-<N>` review worktree. Prints one
+    /// `LOOM-CLEANUP-PATHS<TAB>default<TAB>issue<TAB>judge-pr` line (the
+    /// always-non-empty path leads: tab is IFS whitespace, so bash's `read`
+    /// cannot preserve an empty LEADING field); every
+    /// `[[ -d ]]`/sentinel test and the removal itself stay in the shell. Exit
+    /// 2 = the resolved root cannot be framed unambiguously. The seam fails
+    /// OPEN (no targets, clean up nothing) — see `cli::merge_pr_cleanup_paths`.
+    CleanupPaths(super::merge_pr_cleanup_paths::CleanupPathsArgs),
 }
 
 impl MergePrCommand {
@@ -777,6 +820,7 @@ impl MergePrCommand {
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
+            MergePrCommand::RedateReport(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::HoldState(args) => args.run(),
             MergePrCommand::SequenceEval(args) => args.run(),
@@ -797,12 +841,14 @@ impl MergePrCommand {
             MergePrCommand::WorktreeContains(args) => args.run(),
             MergePrCommand::PartialReset(args) => args.run(),
             MergePrCommand::PartialConflict(args) => args.run(),
+            MergePrCommand::PartialComment(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),
             MergePrCommand::ClosedBuilding(args) => args.run(),
             MergePrCommand::ReconcilePlan(args) => args.run(),
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::ChecksFailure(args) => args.run(),
             MergePrCommand::WorktreePreserve(args) => args.run(),
+            MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }
 }

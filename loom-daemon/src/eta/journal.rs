@@ -55,6 +55,18 @@ pub struct JournalEntry {
     pub left_at: Option<DateTime<Utc>>,
     /// `left_at − entered_at`, when both were observed (never a lower bound).
     pub duration_sec: Option<i64>,
+    /// A **lower bound** on the stage's duration, when the row records a stage
+    /// that did not complete: the item was still in it when it was observed,
+    /// or it was cut short by something other than the stage finishing (#9328).
+    ///
+    /// Mutually exclusive with `duration_sec` — a row never carries both — and
+    /// read only by `land-v2`'s Kaplan–Meier grids
+    /// ([`JournalEntry::censored_sample`]); [`JournalEntry::history_sample`]
+    /// ignores it, so no censored row can reach a v1 distribution.
+    ///
+    /// `#[serde(default)]`: rows written before #9328 simply have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub censored_sec: Option<i64>,
     /// The stage entered next, when known.
     pub next_stage: Option<Stage>,
     /// Judge verdict this row records (`pass`/`fail`), and its 1-based attempt.
@@ -88,6 +100,7 @@ impl JournalEntry {
             entered_at: None,
             left_at: None,
             duration_sec: None,
+            censored_sec: None,
             next_stage: None,
             verdict: None,
             attempt: None,
@@ -111,6 +124,28 @@ impl JournalEntry {
             repo: self.repo.clone(),
             stage,
             duration_sec,
+            observed_at: self.observed_at,
+            source: SampleSource::StageJournal,
+            host: host.to_string(),
+        })
+    }
+
+    /// The **right-censored** stage sample this row contributes (#9328): a
+    /// non-negative `censored_sec` lower bound on a stage that never
+    /// completed, from a journal the sweep-outcome one does not already carry.
+    ///
+    /// A row that carries a real `duration_sec` is never censored — the stage
+    /// finished and [`Self::history_sample`] already has it.
+    #[must_use]
+    pub fn censored_sample(&self, host: &str) -> Option<StageSample> {
+        if self.in_sweep || self.duration_sec.is_some() {
+            return None;
+        }
+        let (stage, censored_sec) = (self.stage?, self.censored_sec?);
+        (censored_sec >= 0).then(|| StageSample {
+            repo: self.repo.clone(),
+            stage,
+            duration_sec: censored_sec,
             observed_at: self.observed_at,
             source: SampleSource::StageJournal,
             host: host.to_string(),
@@ -257,6 +292,94 @@ pub fn entries_from_pr_history(
     rows
 }
 
+/// Every **right-censored** stage-sample row one PR's `pr-latency` history
+/// contributes at `as_of` (#9328): the open segments
+/// [`entries_from_pr_history`] drops on the floor.
+///
+/// Three, mirroring its three completed shapes:
+///
+/// - a `review_wait` entry with no verdict after it — the PR is sitting in
+///   review right now;
+/// - a `doctor` entry with no push after it — the rejection has not been
+///   answered yet;
+/// - an approval in force with no merge — `loom:pr` applied, still unmerged
+///   (the merge-risk-hold shape this fleet produces constantly).
+///
+/// Each is censored at `as_of`, the instant the history was read: the stage
+/// has lasted *at least* `as_of − entered_at`. Segments that started at or
+/// after `as_of`, and PRs already merged or closed, contribute nothing.
+///
+/// This is where the bias `land-v1` carries actually comes from: every one of
+/// these is a **slow** segment, and dropping them is what makes the observed
+/// set read short. Kept as a separate function from
+/// [`entries_from_pr_history`] so the completed rows every shipped heuristic
+/// reads are byte-identical to before.
+#[must_use]
+pub fn censored_from_pr_history(
+    h: &crate::pr_latency::PrHistory,
+    repo: &str,
+    as_of: DateTime<Utc>,
+    loom: &Provenance,
+) -> Vec<JournalEntry> {
+    use crate::pr_latency::history::{PrEvent, PrState};
+    use crate::pr_latency::{APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED};
+
+    if h.state != PrState::Open {
+        return Vec::new();
+    }
+
+    let mut rows = Vec::new();
+    let mut open = |stage: Stage, entered_at: DateTime<Utc>| {
+        if entered_at >= as_of {
+            return;
+        }
+        let mut row = JournalEntry::new("stage.open", repo, as_of, loom);
+        row.pr_number = Some(h.number);
+        row.stage = Some(stage);
+        row.entered_at = Some(entered_at);
+        row.censored_sec = Some((as_of - entered_at).num_seconds().max(0));
+        row.resolution_sec = Some(0);
+        rows.push(row);
+    };
+
+    let verdict_clears = |e: &PrEvent| {
+        matches!(e, PrEvent::Labeled { label, .. }
+        if label == APPROVED || label == CHANGES_REQUESTED)
+    };
+    if let Some(req) = entry_transitions(h, REVIEW_REQUESTED, &verdict_clears)
+        .into_iter()
+        .next_back()
+    {
+        if h.next_verdict_after(req).is_none() {
+            open(Stage::ReviewWait, req);
+        }
+    }
+
+    let push_clears = |e: &PrEvent| matches!(e, PrEvent::Pushed { .. });
+    if let Some(rejected) = entry_transitions(h, CHANGES_REQUESTED, &push_clears)
+        .into_iter()
+        .next_back()
+    {
+        if h.next_push_after(rejected).is_none() {
+            open(Stage::Doctor, rejected);
+        }
+    }
+
+    // An approval still in force on an unmerged PR: `merge_wait`, open.
+    if h.merged_at.is_none() {
+        if let Some(approved_at) = h.last_labeled_before(APPROVED, as_of) {
+            let unlabeled = h.events.iter().any(|e| {
+                matches!(e, PrEvent::Unlabeled { label, at } if label == APPROVED && *at > approved_at)
+            });
+            if !unlabeled {
+                open(Stage::MergeWait, approved_at);
+            }
+        }
+    }
+
+    rows
+}
+
 /// Every instant `label` *entered* force on `h` — as opposed to
 /// [`crate::pr_latency::PrHistory::labelings`]'s raw applications.
 ///
@@ -388,6 +511,9 @@ impl StageSamples {
         for entry in entries {
             if let Some(sample) = entry.history_sample(host) {
                 self.stages.push(sample);
+            }
+            if let Some(sample) = entry.censored_sample(host) {
+                self.censored.push(sample);
             }
             if let Some(verdict) = entry.history_verdict() {
                 self.verdicts.push(verdict);
