@@ -31,6 +31,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 MERGE_PR="$SCRIPTS_DIR/merge-pr.sh"
+# #9548: merge-pr.sh vets its repo (`forge may-write`) before it validates
+# anything else; that decision is not what this suite tests
+# (test-write-scope.sh does), and without this the outcome would depend on the
+# host's loom-daemon and credential. Later cases that set LOOM_DAEMON_BIN or
+# PATH for one invocation still see their own stubs.
+WS_STUB_DIR="$(mktemp -d)"
+# shellcheck source=lib/write-scope-stub.sh
+source "$SCRIPT_DIR/lib/write-scope-stub.sh"
+write_scope_allow_all "$WS_STUB_DIR"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

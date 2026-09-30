@@ -147,6 +147,12 @@ case "$mode" in
 esac
 STUB
 chmod +x "$STUB_DIR/loom-daemon"
+# #9548: the write is vetted (`forge may-write`) before it is made; that
+# decision is not what this suite tests (test-write-scope.sh does), and without
+# this the outcome would depend on which loom-daemon the host has installed.
+# shellcheck source=lib/write-scope-stub.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/write-scope-stub.sh"
+write_scope_allow_all "$STUB_DIR"
 
 # A `gh` stub sharing the same mode/attempt protocol, for the forge_merge_pr
 # and forge_gh_perm_safe cases.

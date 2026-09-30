@@ -136,6 +136,12 @@ chmod +x "$STUB_DIR/gh"
 
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# #9548: the write is vetted (`forge may-write`) before it is made; that
+# decision is not what this suite tests (test-write-scope.sh does), and without
+# this the outcome would depend on which loom-daemon the host has installed.
+# shellcheck source=lib/write-scope-stub.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/write-scope-stub.sh"
+write_scope_allow_all "$STUB_DIR"
 
 reset_state() {
   rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR/last-pr.txt" "$STUB_DIR/last-body.txt"
