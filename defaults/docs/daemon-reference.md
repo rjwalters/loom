@@ -2867,18 +2867,22 @@ old→new-SHA comment, then swaps the verdict label (plus the per-tree companion
 `Invalidate`, with no inference from commit message, author or ref-update shape.
 The one carve-out sits strictly *downstream* of that answer and runs on
 **evidence**: `forge_tree_unchanged::tree_unchanged` asks GitHub's own
-`compare/{marker}...{head}`, and `files: []` proves the two commits' trees are
-byte-for-byte identical — the reviewed code *is* what is at the new head, so
+`compare/{marker}...{head}`, and `files: []` **together with** `status`
+`identical` or `ahead` proves the two commits' trees are byte-for-byte identical.
+`files: []` alone does not: the three-dot compare diffs the merge-base, so a head
+force-pushed *back* to an ancestor reads `behind` with no files although the trees
+differ, and `diverged` has the same hole — both invalidate (PR #9581 review). When
+equality is proven the reviewed code *is* what is at the new head, so
 clearing the verdict buys a full extra Judge cycle and nothing else. The measured
 cause on this repo is the `#8248` required-check-freshness guard's automated
 `chore: re-date required checks …` commit (#8508).
 
 | Property | Behavior |
 |----------|----------|
-| Kill switch | `LOOM_VERDICT_TREE_CARVEOUT` (`0`/`false`/`no`/`off` disables), nested inside `LOOM_VERDICT_STALENESS_RECONCILE`. Defaults **ON** — it can only ever *reduce* exposure, since it fires only on a positive proof of equality. |
+| Kill switch | `LOOM_VERDICT_TREE_CARVEOUT` (`0`/`false`/`no`/`off` disables) — honoured by **both** paths, since it is read inside the shared module: the daemon pass (where it is nested inside `LOOM_VERDICT_STALENESS_RECONCILE`) and `forge tree-unchanged`, which with the switch off makes no compare call and exits 1 with no answer, so the shell guard invalidates too. Defaults **ON** — it can only ever *reduce* exposure, since it fires only on a positive proof of equality. |
 | Daemon pass | `reanchor_tree_unchanged_verdict` posts a marker for the new head and leaves the verdict label untouched. Nothing is disarmed: an armed auto-merge would land the reviewed tree. Counter: `VerdictReconcileStats::tree_identical_reanchors`. |
 | Shell guard | Reports `FRESH` (exit 0) with the reason naming the byte-identical trees, and writes nothing. It does **not** re-anchor — the marker write stays in the daemon — so it pays one compare call per pass until the periodic pass re-anchors. |
-| Comparison unavailable | `None` / no `TREE_UNCHANGED=1` line ⇒ **invalidate as before**. A `gh` failure, an unparsable response, a ref the repo does not carry, an argument that is not a bare hex SHA, a non-GitHub forge, an absent `loom-daemon`, or one predating the verb all land here. Fail closed, in both paths. |
+| Comparison unavailable | `None` / no `TREE_UNCHANGED=1` line ⇒ **invalidate as before**. A `gh` failure, an unparsable response or one missing `status`/`files`, a ref the repo does not carry, an argument that is not a bare hex SHA, a non-GitHub forge, an absent `loom-daemon`, or one predating the verb all land here. Fail closed, in both paths. |
 | One implementation | `loom-daemon/src/forge_tree_unchanged.rs`. The daemon pass calls it in-process; the shell guard reaches it through `loom-daemon forge tree-unchanged <base> <head>` (prints `TREE_UNCHANGED=1|0`, exit 0; exit 1 = no answer). There is deliberately no copy of the comparison in shell — #9576 was caused by the shell guard having *no* tree comparison while the daemon had one, so PRs #9541/#9483 lost verdicts the daemon pass would have kept. |
 
 #### Anchoring an unmarked verdict (#6319)

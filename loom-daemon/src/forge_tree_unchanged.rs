@@ -14,9 +14,33 @@
 //! in front of it. Clearing it buys a full extra Judge cycle and nothing else.
 //!
 //! [`tree_unchanged`] answers that one question against GitHub's own
-//! `compare/{base}...{head}`, which reports `files: []` when the two commits'
-//! trees are byte-for-byte identical. It is evidence, never a heuristic: no
-//! "shaped like a rebase" inference is made anywhere.
+//! `compare/{base}...{head}`. It is evidence, never a heuristic: no "shaped
+//! like a rebase" inference is made anywhere.
+//!
+//! # `files: []` alone is NOT proof — `status` must be `identical`/`ahead`
+//!
+//! The endpoint is a **three-dot** compare: it diffs `merge-base(base, head)`
+//! against `head`, not `base` against `head`. The two coincide only when the
+//! merge-base *is* `base`, i.e. `status` is `"identical"` (same commit) or
+//! `"ahead"` (`head` descends from `base` — the re-date shape: a tree-identical
+//! commit appended on top). When `head` was moved **back** to an ancestor of
+//! `base` (a force-push that drops the reviewed commits), the merge-base is
+//! `head` itself and `files` is empty even though the trees differ — measured
+//! on this repo, `compare/main...main~3` reports `status: "behind"`,
+//! `files: 0` against a 25-file real diff (PR #9581 review). A `"diverged"`
+//! head whose tree equals the merge-base has the same hole. So
+//! [`tree_unchanged`] returns `Some(true)` **only** for an empty `files` array
+//! *together with* `status` `identical`/`ahead`; `behind`, `diverged`, or an
+//! unknown `status` never prove equality, and a response missing `status` or
+//! `files` is no answer at all.
+//!
+//! # The kill switch lives here too
+//!
+//! [`VERDICT_TREE_CARVEOUT_ENABLED_ENV`] (`LOOM_VERDICT_TREE_CARVEOUT`) turns
+//! the carve-out off. Both callers read it from this one module — the daemon
+//! pass through [`verdict_tree_carveout_enabled`], the shell guard because
+//! [`handle`] checks it before asking anything — so switching it off cannot
+//! leave one path still applying the exemption (PR #9581 review).
 //!
 //! # Why it lives here and not in the pass that first needed it
 //!
@@ -51,9 +75,10 @@
 //!
 //! | Situation | [`tree_unchanged`] | CLI |
 //! |---|---|---|
-//! | `files: []` | `Some(true)` | `TREE_UNCHANGED=1`, exit 0 |
-//! | a real content change | `Some(false)` | `TREE_UNCHANGED=0`, exit 0 |
-//! | `gh` failed, unparseable JSON, unknown ref, non-GitHub forge | `None` | exit 1, nothing on stdout |
+//! | `files: []` and `status` `identical`/`ahead` | `Some(true)` | `TREE_UNCHANGED=1`, exit 0 |
+//! | non-empty `files`, or `status` `behind`/`diverged`/unknown | `Some(false)` | `TREE_UNCHANGED=0`, exit 0 |
+//! | `gh` failed, unparseable JSON, missing `status`/`files`, unknown ref, non-GitHub forge | `None` | exit 1, nothing on stdout |
+//! | carve-out switched off (`LOOM_VERDICT_TREE_CARVEOUT=0`) | not asked | exit 1, nothing on stdout, no `gh` call |
 //!
 //! The `None` arm is the pre-#9124 behavior, so an unavailable comparison can
 //! only ever cost a redundant re-review — never a verdict kept on a tree nobody
@@ -64,6 +89,25 @@ use std::process::{Command, Stdio};
 
 use anyhow::Result;
 use serde::Deserialize;
+
+/// Env kill switch for the tree-identical carve-out (Issues #9124, #9576).
+/// Defaults to ON: the carve-out can only ever *reduce* exposure relative to
+/// invalidating on every head move, because it fires only on a positive proof
+/// of equality and fails closed whenever that proof is unavailable.
+/// `0`/`false`/`no`/`off` disables it on **both** paths — the daemon's periodic
+/// pass (nested inside `LOOM_VERDICT_STALENESS_RECONCILE`) and the shell
+/// guard's `forge tree-unchanged` call — restoring invalidate-on-every-move.
+pub const VERDICT_TREE_CARVEOUT_ENABLED_ENV: &str = "LOOM_VERDICT_TREE_CARVEOUT";
+
+/// Is the tree-identical carve-out enabled? See
+/// [`VERDICT_TREE_CARVEOUT_ENABLED_ENV`].
+#[must_use]
+pub fn verdict_tree_carveout_enabled() -> bool {
+    match std::env::var(VERDICT_TREE_CARVEOUT_ENABLED_ENV) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
+}
 
 /// Is `s` a plausible commit SHA — 7-40 lowercase hex digits, the same shape
 /// `verdict-staleness-guard.sh`'s marker regex (`sha=[0-9a-f]{7,40}`) and
@@ -82,17 +126,19 @@ fn is_sha(s: &str) -> bool {
 }
 
 /// Does `head`'s tree differ from `base`'s at all (Issue #9124)? Backed by
-/// GitHub's own `compare/{base}...{head}`, which reports `files: []` when
-/// nothing changed between the two commits' trees — bit-for-bit, not "shaped
-/// like a rebase".
+/// GitHub's own `compare/{base}...{head}`: equality is proven only by
+/// `files: []` **and** `status` `"identical"`/`"ahead"` — see the module doc
+/// for why an empty `files` under `behind`/`diverged` proves nothing.
 ///
 /// `Some(true)` — the codebase is byte-for-byte unchanged; commonest cause
 /// measured on this repo is the `#8248` required-check-freshness guard's
 /// automated "re-date required checks" commit (#8508), which exists ONLY to
 /// give a merge queue's required checks a fresh timestamp and explicitly
-/// changes nothing in the tree. `Some(false)` — a real content change;
-/// invalidate as before. `None` — the comparison could not be made (a `gh api`
-/// failure, an unparsable response, a SHA the compare endpoint does not
+/// changes nothing in the tree. `Some(false)` — a real content change, or a
+/// `status` under which an empty `files` proves nothing (`behind`, `diverged`,
+/// anything unrecognized); invalidate as before. `None` — the comparison could
+/// not be made (a `gh api` failure, an unparsable response or one missing its
+/// `status`/`files` keys, a SHA the compare endpoint does not
 /// recognize, an argument that is not a bare hex SHA): fails open into "proceed
 /// with the ordinary invalidation", the behavior both paths have always had,
 /// never into an assumed equivalence on missing evidence.
@@ -107,9 +153,12 @@ fn is_sha(s: &str) -> bool {
 /// decided to invalidate on — never on the common `Fresh` path.
 #[must_use]
 pub fn tree_unchanged(gh_bin: &Path, cwd: Option<&Path>, base: &str, head: &str) -> Option<bool> {
+    // Both keys are REQUIRED: a response missing either fails to deserialize,
+    // i.e. `None`, never an assumed equality (PR #9581 review — the inherited
+    // `#[serde(default)]` on `files` was the one fail-open arm).
     #[derive(Deserialize)]
-    struct CompareFiles {
-        #[serde(default)]
+    struct Compare {
+        status: String,
         files: Vec<serde_json::Value>,
     }
     if !is_sha(base) || !is_sha(head) {
@@ -129,8 +178,33 @@ pub fn tree_unchanged(gh_bin: &Path, cwd: Option<&Path>, base: &str, head: &str)
     if !out.status.success() {
         return None;
     }
-    let parsed: CompareFiles = serde_json::from_slice(&out.stdout).ok()?;
-    Some(parsed.files.is_empty())
+    let parsed: Compare = serde_json::from_slice(&out.stdout).ok()?;
+    Some(proves_identical_trees(&parsed.status, parsed.files.is_empty()))
+}
+
+/// The one predicate: does a three-dot compare response prove `base` and
+/// `head` carry byte-identical trees? Only when the merge-base is `base`
+/// (`identical`/`ahead`) does an empty `files` list describe `base` vs `head`;
+/// under `behind` or `diverged` it describes the merge-base instead, and any
+/// status this code does not recognize is treated the same way.
+fn proves_identical_trees(status: &str, files_empty: bool) -> bool {
+    files_empty && matches!(status, "identical" | "ahead")
+}
+
+/// What [`handle`] answers, with the kill switch passed in explicitly so the
+/// "switched off => no `gh` call, no answer" contract is unit-testable without
+/// mutating process env.
+fn answer(
+    carveout_enabled: bool,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    base: &str,
+    head: &str,
+) -> Option<bool> {
+    if !carveout_enabled {
+        return None;
+    }
+    tree_unchanged(gh_bin, cwd, base, head)
 }
 
 /// Handle `loom-daemon forge tree-unchanged <base> <head>`. Never returns
@@ -152,9 +226,22 @@ pub fn tree_unchanged(gh_bin: &Path, cwd: Option<&Path>, base: &str, head: &str)
 /// daemon predating this verb, a `gh` outage, a non-GitHub forge) collapse into
 /// the same fail-closed arm as `None` above. `verdict-staleness-guard.sh`
 /// reads it exactly that way.
+///
+/// With [`VERDICT_TREE_CARVEOUT_ENABLED_ENV`] switched off, no comparison is
+/// made and the verb exits 1 with nothing on stdout — so the shell guard
+/// invalidates exactly as the daemon pass does with the switch off.
 pub fn handle(base: &str, head: &str) -> Result<()> {
+    let enabled = verdict_tree_carveout_enabled();
+    if !enabled {
+        eprintln!(
+            "loom-daemon forge tree-unchanged: the tree-identical carve-out is disabled \
+             ({VERDICT_TREE_CARVEOUT_ENABLED_ENV} is off). No answer — callers invalidate on \
+             every head move."
+        );
+        std::process::exit(1);
+    }
     let gh = crate::forge_cmd::gh_bin();
-    match tree_unchanged(Path::new(&gh), None, base, head) {
+    match answer(enabled, Path::new(&gh), None, base, head) {
         Some(true) => {
             println!("TREE_UNCHANGED=1");
             std::process::exit(0);
@@ -208,13 +295,15 @@ exit 0
     const SHA_A: &str = "1111111111111111111111111111111111111111";
     const SHA_B: &str = "2222222222222222222222222222222222222222";
 
-    /// The #9576 incident shape: a re-date commit moved the head and changed
-    /// nothing, so `compare` reports an empty `files` array.
+    /// The #9576 incident shape: a re-date commit appended on top of the
+    /// reviewed head changed nothing, so `compare` reports `status: "ahead"`
+    /// with an empty `files` array — the merge-base is `base`, so this really
+    /// is `base` vs `head`.
     #[test]
-    fn empty_files_is_tree_unchanged() {
+    fn ahead_with_empty_files_is_tree_unchanged() {
         let dir = tempdir().unwrap();
         let log = dir.path().join("gh.log");
-        let gh = fake_gh(dir.path(), &log, r#"{"files": []}"#, 0);
+        let gh = fake_gh(dir.path(), &log, r#"{"status": "ahead", "files": []}"#, 0);
         assert_eq!(tree_unchanged(&gh, Some(dir.path()), SHA_A, SHA_B), Some(true));
         let argv = std::fs::read_to_string(&log).unwrap();
         assert!(
@@ -223,29 +312,88 @@ exit 0
         );
     }
 
-    /// A `files` array with content is a real change: invalidate as before.
+    /// Same commit: `status: "identical"`, `files: []` — unchanged.
     #[test]
-    fn non_empty_files_is_tree_changed() {
+    fn identical_is_tree_unchanged() {
         let dir = tempdir().unwrap();
         let log = dir.path().join("gh.log");
-        let gh = fake_gh(dir.path(), &log, r#"{"files": [{"filename": "src/main.rs"}]}"#, 0);
+        let gh = fake_gh(dir.path(), &log, r#"{"status": "identical", "files": []}"#, 0);
+        assert_eq!(tree_unchanged(&gh, Some(dir.path()), SHA_A, SHA_B), Some(true));
+    }
+
+    /// An appended commit that DOES change files is a real change.
+    #[test]
+    fn ahead_with_files_is_tree_changed() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("gh.log");
+        let body = r#"{"status": "ahead", "files": [{"filename": "src/main.rs"}]}"#;
+        let gh = fake_gh(dir.path(), &log, body, 0);
         assert_eq!(tree_unchanged(&gh, Some(dir.path()), SHA_A, SHA_B), Some(false));
     }
 
-    /// `#[serde(default)]` is retained from #9124 verbatim, so a response with
-    /// no `files` key at all deserializes to an empty vec and reads as
-    /// "unchanged". Real `compare` responses always carry the key (`files: []`
-    /// is what `status: "identical"` comes with, and a >300-file diff is
-    /// truncated rather than omitted), so this arm is hypothetical — but it is
-    /// the one place the inherited reading is fail-*open*, so it is pinned here
-    /// to make any future change to it a deliberate one rather than a silent
-    /// side effect of this relocation.
+    /// THE PR #9581 REVIEW HOLE: a force-push that rewinds the head to an
+    /// ancestor of the reviewed commit. The three-dot compare's merge-base is
+    /// then `head` itself, so `files` is empty although the trees differ
+    /// (measured: `compare/main...main~3` -> `behind`, 0 files, 25-file real
+    /// diff). Must never read as unchanged.
     #[test]
-    fn absent_files_key_matches_the_inherited_9124_reading() {
+    fn behind_with_empty_files_is_not_unchanged() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("gh.log");
+        let gh = fake_gh(dir.path(), &log, r#"{"status": "behind", "files": []}"#, 0);
+        assert_eq!(tree_unchanged(&gh, Some(dir.path()), SHA_A, SHA_B), Some(false));
+    }
+
+    /// A diverged head whose tree equals the merge-base: `files: []` again
+    /// describes the merge-base, not `base`. Must never read as unchanged.
+    #[test]
+    fn diverged_with_empty_files_is_not_unchanged() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("gh.log");
+        let gh = fake_gh(dir.path(), &log, r#"{"status": "diverged", "files": []}"#, 0);
+        assert_eq!(tree_unchanged(&gh, Some(dir.path()), SHA_A, SHA_B), Some(false));
+    }
+
+    /// A status this code does not recognize proves nothing.
+    #[test]
+    fn unknown_status_with_empty_files_is_not_unchanged() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("gh.log");
+        let gh = fake_gh(dir.path(), &log, r#"{"status": "mystery", "files": []}"#, 0);
+        assert_eq!(tree_unchanged(&gh, Some(dir.path()), SHA_A, SHA_B), Some(false));
+    }
+
+    /// A response with no `status` is no answer (`None`), even with `files: []`
+    /// — the one-key reading #9124 shipped with is exactly the hole above.
+    #[test]
+    fn missing_status_is_indeterminate() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("gh.log");
+        let gh = fake_gh(dir.path(), &log, r#"{"files": []}"#, 0);
+        assert_eq!(tree_unchanged(&gh, Some(dir.path()), SHA_A, SHA_B), None);
+    }
+
+    /// Flipped from the inherited #9124 `#[serde(default)]` reading (which
+    /// was fail-*open*): a response with no `files` key is no answer.
+    #[test]
+    fn absent_files_key_is_indeterminate() {
         let dir = tempdir().unwrap();
         let log = dir.path().join("gh.log");
         let gh = fake_gh(dir.path(), &log, r#"{"status": "identical"}"#, 0);
-        assert_eq!(tree_unchanged(&gh, Some(dir.path()), SHA_A, SHA_B), Some(true));
+        assert_eq!(tree_unchanged(&gh, Some(dir.path()), SHA_A, SHA_B), None);
+    }
+
+    /// Kill switch off: no `gh` call, no answer — even for a response that
+    /// would otherwise prove equality. This is what `handle` (the shell
+    /// guard's path) consults, so the switch now covers both callers.
+    #[test]
+    fn carveout_disabled_answers_nothing_without_calling_gh() {
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("gh.log");
+        let gh = fake_gh(dir.path(), &log, r#"{"status": "identical", "files": []}"#, 0);
+        assert_eq!(answer(false, &gh, Some(dir.path()), SHA_A, SHA_B), None);
+        assert!(!log.exists(), "a disabled carve-out must not call `gh`");
+        assert_eq!(answer(true, &gh, Some(dir.path()), SHA_A, SHA_B), Some(true));
     }
 
     /// A failed `gh` call is `None` — the fail-closed arm.
@@ -272,7 +420,7 @@ exit 0
     fn non_sha_arguments_are_refused_without_calling_gh() {
         let dir = tempdir().unwrap();
         let log = dir.path().join("gh.log");
-        let gh = fake_gh(dir.path(), &log, r#"{"files": []}"#, 0);
+        let gh = fake_gh(dir.path(), &log, r#"{"status": "ahead", "files": []}"#, 0);
         for (base, head) in [
             ("../../pulls/1", SHA_B),
             (SHA_A, "HEAD"),

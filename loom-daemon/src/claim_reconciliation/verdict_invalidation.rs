@@ -48,28 +48,13 @@ use std::process::{Command, Stdio};
 use super::{VerdictKind, VerdictPr, VerdictReconcileStats};
 use crate::forge_tree_unchanged::tree_unchanged;
 
-/// Env kill switch for the tree-identical re-anchor carve-out (Issue #9124),
-/// nested inside [`super::VERDICT_STALENESS_ENABLED_ENV`]. Defaults to ON for
-/// the same shape of argument as [`super::VERDICT_ANCHOR_ENABLED_ENV`]: it can
-/// only ever *reduce* exposure relative to the pre-#9124 behavior, because it
-/// fires only once GitHub's own compare API has proven the two trees are
-/// byte-identical, and it fails open into the ordinary invalidation whenever
-/// that proof is unavailable (a `gh api compare` failure, a malformed
-/// response, an abbreviated marker SHA the compare endpoint rejects) — see
-/// [`tree_unchanged`]. `0`/`false`/`no`/`off` disables it, restoring the
-/// pre-#9124 behavior of invalidating on every SHA move regardless of tree
-/// content.
-pub(super) const VERDICT_TREE_CARVEOUT_ENABLED_ENV: &str = "LOOM_VERDICT_TREE_CARVEOUT";
-
-/// Is the tree-identical re-anchor carve-out enabled? See
-/// [`VERDICT_TREE_CARVEOUT_ENABLED_ENV`].
-#[must_use]
-pub(super) fn verdict_tree_carveout_enabled() -> bool {
-    match std::env::var(VERDICT_TREE_CARVEOUT_ENABLED_ENV) {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
-        Err(_) => true,
-    }
-}
+// The carve-out's kill switch (`LOOM_VERDICT_TREE_CARVEOUT`, nested here inside
+// [`super::VERDICT_STALENESS_ENABLED_ENV`]) moved to the shared module with the
+// comparison, so the shell guard's `forge tree-unchanged` call honours the same
+// switch this pass does (PR #9581 review). Re-exported under the old path.
+pub(super) use crate::forge_tree_unchanged::verdict_tree_carveout_enabled;
+#[cfg(test)]
+pub(super) use crate::forge_tree_unchanged::VERDICT_TREE_CARVEOUT_ENABLED_ENV;
 
 /// Carry out the `Invalidate` action for one PR: the #9124 carve-out if the
 /// trees turn out to be identical, otherwise the ordinary #5686 clear.

@@ -1826,6 +1826,13 @@ jobs:
       # it via loom_test_require_daemon_bin and FAIL rather than skip without one.
       - name: merge-pr local-branch cleanup (#4100, #5015, ported in #8191)
         run: bash defaults/scripts/tests/test-merge-pr-local-branch-cleanup.sh
+      # #9576 / PR #9581 review: the stub-driven verdict-staleness-guard suite
+      # (shell-suite-tests) cannot prove what lives behind `forge
+      # tree-unchanged` — the rewind (`behind`, no files) reading and the
+      # LOOM_VERDICT_TREE_CARVEOUT kill switch — so this sibling drives the
+      # guard against the binary this job downloads.
+      - name: verdict-staleness-guard tree-identical exemption, real verb (#9576)
+        run: bash defaults/scripts/tests/test-verdict-staleness-guard-tree.sh
       - name: merge-pr dirty-worktree guard (#5031, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-dirty-worktree-guard.sh
       - name: merge-pr primary-checkout advice (#4171, #8191)

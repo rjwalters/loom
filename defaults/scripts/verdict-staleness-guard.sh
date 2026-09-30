@@ -523,8 +523,11 @@ fi
 # (loom-daemon/src/forge_tree_unchanged.rs) — the SAME function the daemon's
 # periodic pass calls in-process, so the two can no longer disagree. It prints
 # TREE_UNCHANGED=1|0 and exits 0 for both; anything else (exit 1, an absent
-# binary, a daemon predating the verb) leaves this empty, which is not "1" and
-# therefore falls through to STALE. See the header for why that is fail-closed.
+# binary, a daemon predating the verb, LOOM_VERDICT_TREE_CARVEOUT switched off —
+# the verb evaluates the kill switch itself) leaves this empty, which is not "1"
+# and therefore falls through to STALE. "1" requires compare `status`
+# identical/ahead, never `files: []` alone (a rewound head reads `behind`, no
+# files). See the header for why that is fail-closed.
 # requires-daemon: forge optional   Without the `tree-unchanged` verb (an absent binary, or one predating #9576: clap exits non-zero with nothing on stdout) a tree-identical head move reads STALE — the pre-#9576 behavior, which only ever costs a redundant Judge cycle. No version floor on purpose: the degraded answer is the fail-safe one.
 FRESH_REASON=""
 if [[ "${HEAD_SHA:0:${#MARKER_SHA}}" == "$MARKER_SHA" ]]; then

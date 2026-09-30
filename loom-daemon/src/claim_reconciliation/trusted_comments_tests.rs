@@ -35,7 +35,7 @@ case "$*" in
     echo '[{{"number":300,"headRefOid":"{SHA_B}","labels":[{{"name":"loom:pr"}}]}}]' ;;
   "pr list "*) echo '[]' ;;
   "api repos/{{owner}}/{{repo}}/issues/300/comments"*) cat "{listing}" ;;
-  "api "*compare/*) echo '{{"files":[{{"filename":"src/lib.rs"}}]}}' ;;
+  "api "*compare/*) echo '{{"status":"ahead","files":[{{"filename":"src/lib.rs"}}]}}' ;;
   *) echo '{{}}' ;;
 esac
 "#,
