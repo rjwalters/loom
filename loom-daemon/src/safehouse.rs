@@ -275,6 +275,13 @@ pub struct SafehouseConfig {
     pub rooms: Option<RoomMap>,
     /// Persona to authenticate as; must be in safehoused's allowlist.
     pub persona: String,
+    /// Who an operator-priority escalation (#9321) pings in the room: a Matrix
+    /// display name or user id (`@operator:example.org`). `None` ⇒ the escalation
+    /// line is still posted, just without a mention — the ask is never dropped
+    /// over a missing handle. This is a **handle, not a credential**: nothing
+    /// here authenticates anything (the persona does), so it belongs in
+    /// `.loom/config.json` like the room ids beside it.
+    pub operator_mention: Option<String>,
 }
 
 impl Default for SafehouseConfig {
@@ -285,6 +292,7 @@ impl Default for SafehouseConfig {
             room: None,
             rooms: None,
             persona: DEFAULT_PERSONA.to_owned(),
+            operator_mention: None,
         }
     }
 }
@@ -370,6 +378,11 @@ fn config_from_value(block: Option<&Value>) -> SafehouseConfig {
             cfg.persona = persona.to_owned();
         }
     }
+    if let Some(mention) = block.get("operatorMention").and_then(Value::as_str) {
+        if !mention.trim().is_empty() {
+            cfg.operator_mention = Some(mention.trim().to_owned());
+        }
+    }
     cfg.rooms = rooms_from_value(block.get("rooms"));
     cfg
 }
@@ -419,6 +432,9 @@ fn apply_env_overrides(mut cfg: SafehouseConfig) -> SafehouseConfig {
     }
     if let Some(persona) = env_nonempty(PERSONA_ENV) {
         cfg.persona = persona;
+    }
+    if let Some(mention) = env_nonempty(envelopes::OPERATOR_MENTION_ENV) {
+        cfg.operator_mention = Some(mention);
     }
     cfg.rooms = apply_room_env_overrides(cfg.rooms);
     cfg
@@ -1495,181 +1511,15 @@ fn decode_exit_code_annotation(code: i32) -> &'static str {
 }
 
 // ============================================================================
-// Event → envelope mapping (existing frozen taxonomy only)
+// Event → envelope mapping
 // ============================================================================
+//
+// Both renderers — the frozen-taxonomy mapping and the operator-priority
+// escalation line (#9321) — live in the `envelopes` sibling module. Re-exported
+// here so every existing caller and `use super::*` test keeps its path.
 
-/// Map an existing bus [`Event`] to a narration [`Envelope`], or `None` for
-/// events phase 1 does not narrate.
-///
-/// Every narrated body starts with the repo-qualified `<repo>#<issue>` prefix
-/// ([`repo_issue_prefix`]) and every narrated `task_id` is likewise
-/// repo-qualified ([`qualify_task_id`]) — issue #4201, problem 1 — so the same
-/// issue number in two managed repos threads into distinct Matrix threads
-/// instead of colliding:
-///
-/// | Event | type | body |
-/// |---|---|---|
-/// | `SweepGlobalDispatch(Issue n)` | `task` | `<repo>#n · dispatch` (the sink, [`run_sink`], best-effort appends ` — "<issue title>"`) |
-/// | `SweepPhase` | `task` | `<repo>#n · <phase>` (+ ` · PR #m open` when present) |
-/// | `SweepBlocker` | `handoff` | `<repo>#n · BLOCKED — <reason>` |
-/// | `SweepExited` | `ack` | `<repo>#n · done ✓ · <dur>` or `<repo>#n · failed ✗ · exit <code>[ (decoded)] · <dur>` |
-/// | `SweepCrashed` | `handoff` | `<repo>#n · crashed ✗ at <checkpoint_phase> — resumable (checkpoint kept)` |
-/// | `SweepResumeDispatched` (#4256) | `handoff` | `<repo>#n · reaper resumed crashed sweep at <phase> (open PR #m) — resuming without operator intervention` (or a "still stranded" variant when the resume dispatch itself failed) |
-///
-/// `SweepGlobalCompleted` is intentionally **not** narrated: it carries only a
-/// `sweep_id` (no issue number), and `SweepExited` already emits the completion
-/// `ack` with richer data — narrating both would double-post per completion.
-///
-/// This mapping is 1:1 and pure. The **second** envelope a `SweepExited` can
-/// produce — the public-feed `completion` (#4426) — is built by
-/// [`completion_for_exit`] instead, since it needs an async forge lookup to
-/// confirm the merge; [`run_sink`] emits it after this one.
-#[must_use]
-pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
-    match event {
-        Event::SweepGlobalDispatch {
-            kind: SweepKind::Issue(issue),
-            repo,
-            ..
-        } => Some(dispatch_envelope(repo.as_deref(), *issue)),
-        Event::SweepPhase {
-            issue,
-            phase,
-            pr_number,
-            repo,
-        } => {
-            let mut body = format!("{} · {phase}", repo_issue_prefix(repo.as_deref(), *issue));
-            if let Some(pr) = pr_number {
-                body.push_str(&format!(" · PR #{pr} open"));
-            }
-            Some(Envelope {
-                to: "*".to_owned(),
-                kind: "task".to_owned(),
-                task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
-                body,
-                meta: None,
-            })
-        }
-        Event::SweepBlocker {
-            issue,
-            reason,
-            repo,
-            ..
-        } => Some(Envelope {
-            to: "*".to_owned(),
-            kind: "handoff".to_owned(),
-            task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
-            body: format!("{} · BLOCKED — {reason}", repo_issue_prefix(repo.as_deref(), *issue)),
-            meta: None,
-        }),
-        Event::SweepExited {
-            issue,
-            exit_code,
-            duration_sec,
-            no_progress,
-            death_class: _,
-            repo,
-        } => {
-            let prefix = repo_issue_prefix(repo.as_deref(), *issue);
-            let dur = format_narrated_duration(*duration_sec);
-            let body = match exit_code {
-                // #4366: a clean exit with zero lifecycle progress (parked on
-                // a monitored background task) narrates distinctly from an
-                // ordinary benign self-skip so operators can see the failure
-                // class at a glance.
-                Some(0) if *no_progress => {
-                    format!("{prefix} · no progress ⚠ · exit 0, no checkpoint/PR · {dur}")
-                }
-                Some(0) => format!("{prefix} · done ✓ · {dur}"),
-                Some(code) => format!(
-                    "{prefix} · failed ✗ · exit {code}{} · {dur}",
-                    decode_exit_code_annotation(*code)
-                ),
-                None => format!("{prefix} · failed ✗ · exit ? · {dur}"),
-            };
-            Some(Envelope {
-                to: "*".to_owned(),
-                kind: "ack".to_owned(),
-                task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
-                body,
-                meta: None,
-            })
-        }
-        Event::SweepCrashed {
-            issue,
-            checkpoint_phase,
-            classification: _,
-            death_class: _,
-            repo,
-        } => {
-            let phase = checkpoint_phase.as_deref().unwrap_or("unknown");
-            Some(Envelope {
-                to: "*".to_owned(),
-                kind: "handoff".to_owned(),
-                task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
-                body: format!(
-                    "{} · crashed ✗ at {phase} — resumable (checkpoint kept)",
-                    repo_issue_prefix(repo.as_deref(), *issue)
-                ),
-                meta: None,
-            })
-        }
-        Event::SweepResumeDispatched {
-            issue,
-            pr,
-            checkpoint_phase,
-            dispatched,
-            repo,
-        } => {
-            let phase = checkpoint_phase.as_deref().unwrap_or("unknown");
-            let prefix = repo_issue_prefix(repo.as_deref(), *issue);
-            let body = if *dispatched {
-                format!(
-                    "{prefix} · reaper resumed crashed sweep at {phase} (open PR #{pr}) — \
-                     resuming without operator intervention"
-                )
-            } else {
-                format!(
-                    "{prefix} · reaper attempted resume at {phase} (open PR #{pr}) but the \
-                     dispatch itself failed — still stranded, needs a look"
-                )
-            };
-            Some(Envelope {
-                to: "*".to_owned(),
-                kind: "handoff".to_owned(),
-                task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
-                body,
-                meta: None,
-            })
-        }
-        Event::DaemonIdleExit {
-            trigger,
-            idle_minutes,
-            in_flight_sweeps,
-            active_role_runs,
-            healthy_tokens,
-            total_tokens,
-            message,
-        } => Some(Envelope {
-            to: "*".to_owned(),
-            kind: "handoff".to_owned(),
-            task_id: Some("daemon-idle-exit".to_owned()),
-            body: message.clone(),
-            meta: Some(serde_json::json!({
-                "trigger": trigger,
-                "idle_minutes": idle_minutes,
-                "in_flight_sweeps": in_flight_sweeps,
-                "active_role_runs": active_role_runs,
-                "healthy_tokens": healthy_tokens,
-                "total_tokens": total_tokens,
-            })),
-        }),
-        // SweepGlobalCompleted (no issue number — SweepExited covers it),
-        // SweepGlobalDispatch(PrSet), EpicAction, CapacityAdvisory, TopicLag,
-        // Generic: not narrated in phase 1.
-        _ => None,
-    }
-}
+mod envelopes;
+pub use envelopes::{event_to_envelope, operator_priority_envelope};
 
 // ============================================================================
 // Completion envelope (#4426) — the public-feed emit point
@@ -3377,6 +3227,14 @@ async fn run_sink(
                             .as_mut()
                             .reset(tokio::time::Instant::now() + dispatch_digest_window());
                     }
+                } else if let Some(envelope) =
+                    operator_priority_envelope(&event, config.operator_mention.as_deref())
+                {
+                    // Operator-priority escalation (#9321) — rendered here
+                    // rather than in `event_to_envelope` because the mention
+                    // comes from the config. Never batched: the whole point is
+                    // that the ask reaches the human on the first tick.
+                    outbox.push(envelope);
                 } else if let Some(envelope) = event_to_envelope(&event) {
                     // One bus event can narrate more than one envelope: a
                     // `SweepExited` whose PR merged emits its `ack` **and** the
@@ -3698,128 +3556,36 @@ pub trait InboundEventSink: Send + Sync {
     /// Handle one inbound room-event push line (a JSON object carrying an
     /// `event` key). Best-effort: an implementation must never panic or block.
     fn on_event(&self, event: &Value);
+
+    /// Handle the outcome of one of THIS host's outbound sends on the same
+    /// connection (Issue #9294): `Some(reason)` when safehoused replied
+    /// `ok:false`, `None` when it accepted the send.
+    ///
+    /// Defaulted to a no-op so the outbound half stays optional for a sink that
+    /// only consumes. [`PeerClaimSink`] implements it, which is what lets
+    /// `loom-daemon status` distinguish "publishing into a room that refuses
+    /// every event" from "the fleet is quiet" — a distinction the previous
+    /// once-per-connection `warn!` could not make.
+    fn on_send_outcome(&self, _rejection: Option<&str>) {}
+
+    /// Handle one of THIS host's outbound sends being written to the socket
+    /// (Issue #9294) — the reply, if any, arrives later via
+    /// [`Self::on_send_outcome`].
+    ///
+    /// Needed because the measured 2026-09-29 outage produced **no reply at
+    /// all**: safehoused's send op never returned (matrix-sdk retries the
+    /// homeserver's 500 internally), so `on_send_outcome` was never called and
+    /// a rejection counter alone would have stayed at zero through a six-day
+    /// dead channel. Pairing writes with replies is what makes that shape
+    /// visible.
+    fn on_send_attempt(&self) {}
 }
 
-/// The peer-claim consumer: parses claim ads out of inbound room events and
-/// folds them into a shared [`PeerClaimView`] (self-claim recognition + TTL live
-/// in the view). A non-claim event (a human chat message, a narration line) is
-/// silently ignored.
-pub struct PeerClaimSink {
-    view: Arc<Mutex<PeerClaimView>>,
-}
-
-impl PeerClaimSink {
-    #[must_use]
-    pub fn new(view: Arc<Mutex<PeerClaimView>>) -> Self {
-        Self { view }
-    }
-}
-
-impl InboundEventSink for PeerClaimSink {
-    fn on_event(&self, event: &Value) {
-        // #6249: safehoused's live push (`main.rs` `on_message`) carries the
-        // message text at `envelope.body` — there is no top-level `body`.
-        // Reading only the top level dropped 100% of inbound claims fleet-wide
-        // (`received=0` while peers visibly advertised). Read the writer's real
-        // shape first, keeping the top-level `body` as a fallback for any
-        // legacy emitter of the flat shape.
-        let Some(body) = event
-            .pointer("/envelope/body")
-            .and_then(Value::as_str)
-            .or_else(|| event.get("body").and_then(Value::as_str))
-        else {
-            return;
-        };
-        let Some(ad) = ClaimAd::from_body_str(body) else {
-            return; // not a claim (human chat, narration, malformed) — ignore
-        };
-        match self.view.lock() {
-            Ok(mut view) => {
-                let now = Instant::now();
-                // Issue #6352: a `Completed` ad routes to the dedicated
-                // completion-dedup map (its own TTL, no #6157
-                // coordination-health side effects) rather than
-                // `observe_at`'s dispatch-claims map — see
-                // `PeerClaimView::observe_completion_at`'s doc comment.
-                if ad.kind.is_filing_lock_lane() {
-                    // Issue #6714: the issue-filing lane. Fold into the view's
-                    // own single-purpose bookkeeping AND mirror to the
-                    // machine-wide on-disk store, which is the only thing the
-                    // shell filer (`create-issue.sh` -> `lib/filing-lock.sh`)
-                    // can see — the daemon is the bridge between the
-                    // cross-host transport and the cross-process lock.
-                    if view.observe_filing_lock_at(&ad, now) {
-                        mirror_filing_lock_to_disk(&ad);
-                    }
-                    for expired in view.prune_expired_filing_locks(now) {
-                        clear_filing_lock_mirror(&expired);
-                    }
-                } else if ad.kind.is_cooldown_lane() || ad.kind.is_pool_hold_lane() {
-                    // The BRAKE lanes: the #7477 per-issue no-op-cooldown /
-                    // dispatch-backoff windows and the #8001 per-pool
-                    // exhaustion hold. Each folds into its own single-purpose
-                    // map (mirroring the filing-lock lane above) rather than
-                    // `observe_at`'s dispatch-claims map — a brake answers
-                    // "may a dispatch happen at all right now", not "is a
-                    // sweep in flight". The per-lane routing lives beside the
-                    // lanes themselves in `peer_claims::brakes`, so adding a
-                    // lane never touches this socket layer.
-                    crate::peer_claims::observe_brake_ad(&mut view, &ad, now);
-                } else if ad.kind == crate::peer_claims::ClaimKind::Completed {
-                    view.observe_completion_at(&ad, now);
-                    view.prune_expired_completions(now);
-                } else if ad.kind == crate::peer_claims::ClaimKind::Heartbeat {
-                    // Issue #8736: a liveness ping, folded into its own
-                    // single-purpose field rather than `observe_at`'s
-                    // dispatch-claims map — see `observe_heartbeat_at`'s doc
-                    // comment for why it must never inflate the `#6157`
-                    // transport counters.
-                    view.observe_heartbeat_at(&ad, now);
-                } else {
-                    view.observe_at(&ad, now);
-                    // Opportunistically prune so a crashed peer's entries do
-                    // not accumulate between work-finder queries.
-                    view.prune_expired(now);
-                }
-            }
-            Err(poisoned) => {
-                log::error!("safehouse: peer-claim view mutex poisoned ({poisoned:?})");
-            }
-        }
-    }
-}
-
-/// Mirror an observed peer [`crate::peer_claims::ClaimKind::FilingLock`] /
-/// `FilingUnlock` into the machine-wide filing-lock store (Issue #6714).
-///
-/// The daemon is the bridge: only it is connected to the safehouse room, and
-/// only the on-disk store is visible to the shell filers
-/// (`create-issue.sh` → `lib/filing-lock.sh`) that actually run `gh issue
-/// create`. Best-effort — an unresolvable store degrades the fleet tier to
-/// host-only serialization, never to a failed filing.
-fn mirror_filing_lock_to_disk(ad: &ClaimAd) {
-    let Some(store) = crate::filing_lock::store_dir() else {
-        return;
-    };
-    match ad.kind {
-        crate::peer_claims::ClaimKind::FilingLock => {
-            crate::filing_lock::record_peer_hold(&store, &ad.host);
-        }
-        crate::peer_claims::ClaimKind::FilingUnlock => {
-            crate::filing_lock::clear_peer_hold(&store, &ad.host);
-        }
-        _ => {}
-    }
-}
-
-/// Clear a TTL-expired peer's filing-hold mirror (Issue #6714) — the
-/// crash-release path: a peer that dies mid-burst never sends `FilingUnlock`,
-/// so its marker must be removed when the view expires it.
-fn clear_filing_lock_mirror(host: &str) {
-    if let Some(store) = crate::filing_lock::store_dir() {
-        crate::filing_lock::clear_peer_hold(&store, host);
-    }
-}
+mod claim_sink;
+/// The peer-claim inbound consumer, defined in [`claim_sink`] (moved there in
+/// Issue #9294 to keep this file inside its size ratchet). Re-exported so every
+/// existing `safehouse::PeerClaimSink` call site is unchanged.
+pub use claim_sink::PeerClaimSink;
 
 /// Build the `task`-typed advertisement envelope for a claim ad (Gap 2 of
 /// #4028): the envelope `type` enum is closed and owned by the safehouse repo, so
@@ -4045,11 +3811,19 @@ async fn run_coordination(
                                 // disabling peer-claim dedup (#4028/#4431). WARN
                                 // once per outage and name the fix when it is a
                                 // missing room; dispatch is unaffected.
+                                let reason = value
+                                    .get("error")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown error");
+                                // #9294: record EVERY rejection in the view.
+                                // The `warn!` below stays deduped per
+                                // connection (a hot loop of identical WARNs is
+                                // its own problem), but the counter must not
+                                // be — a six-day outage that produces one log
+                                // line and no status change is exactly the
+                                // failure this issue was filed for.
+                                sink.on_send_outcome(Some(reason));
                                 if !ad_rejected {
-                                    let reason = value
-                                        .get("error")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("unknown error");
                                     if reason.contains("'room' required") {
                                         log::warn!(
                                             "safehouse: peer claim-ad rejected — set \
@@ -4066,9 +3840,15 @@ async fn run_coordination(
                                     }
                                     ad_rejected = true;
                                 }
+                            } else if value.get("id").is_some() {
+                                // An accepted reply echo (has `id`, `ok:true`)
+                                // to one of our own sends. #9294: this is the
+                                // only positive proof the channel actually
+                                // publishes, and it is what clears a prior
+                                // rejection (the #4464 stickiness rule — a mere
+                                // reconnect does not).
+                                sink.on_send_outcome(None);
                             }
-                            // An accepted reply echo (has `id`, `ok:true`) to
-                            // one of our own sends: nothing to do, drop it.
                         }
                         Ok(None) => break true,          // peer closed → reconnect
                         Err(e) => {
@@ -4101,6 +3881,12 @@ async fn run_coordination(
                                         );
                                         break true;
                                     }
+                                    // #9294: the ad is on the wire and a reply
+                                    // is now owed. A send that is never
+                                    // answered is the shape the measured
+                                    // outage took, and it is invisible to the
+                                    // rejection path above.
+                                    sink.on_send_attempt();
                                 }
                                 // A claim ad that would be rejected by safehoused
                                 // (bad type/task_id) is a bug, not a transport
