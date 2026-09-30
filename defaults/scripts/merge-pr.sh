@@ -1108,23 +1108,9 @@ _check_required_check_freshness
 PARTIAL_OPEN_BEFORE_MERGE=""
 PARTIAL_CONFLICT_ISSUES=""
 
-# Strips Markdown fenced code blocks (``` ... ```) from stdin, one line at a
-# time: a fence-open/-close toggle drops everything between the fences
-# (inclusive of the fence markers themselves). Used so a `Part of #N` shown as
-# example/quoted text inside a fenced block reads as documentation, never a
-# live declaration (#5234).
-_strip_fenced_code_blocks() {
-  # Retained only for any out-of-tree caller; the analysis below no longer
-  # uses it (loom-daemon strips fences itself, identically).
-  awk '
-    /^[[:space:]]*```/ { infence = !infence; next }
-    !infence { print }
-  '
-}
-
 # Closing-reference / partial-increment analysis, ported to Rust (#8191).
 #
-# These five predicates decide whether merging would close an issue this PR
+# These predicates decide whether merging would close an issue this PR
 # only declared itself a PART OF. Their whole bug history is about what a
 # stacked grep/sed/awk pipeline accidentally matched -- #5234 (a backticked
 # hypothetical mention read as a declaration, reopening a correctly closed
@@ -1191,45 +1177,6 @@ _mp_refs() {
 # reference, and get reopened right after a correct close.
 _partial_increment_refs() {
   printf '%s\n' "$1" | _mp_refs partial-increment-refs
-}
-
-# Issue numbers referenced with a GitHub CLOSING keyword anywhere in the text
-# read from stdin, one per line, deduped. The regex is deliberately the same one
-# forge_pr_close_targets() uses on its Gitea branch (the canonical keyword set,
-# with `\b` guarding against substring traps like `Discloses #N`).
-#
-# Why a text regex and not only the authoritative GraphQL
-# `closingIssuesReferences`: that field is GraphQL-only, and the incident this
-# guard exists for happened while GraphQL quota was exhausted (the PR was even
-# created via raw REST for that reason). A quota-free text signal is the one that
-# still works in exactly the conditions where this bug bites.
-_closing_refs_stdin() {
-  _mp_refs closing-refs
-}
-
-# Same, for text passed as $1 (the PR body, historically the only source).
-_body_closing_refs() {
-  printf '%s\n' "$1" | _mp_refs closing-refs
-}
-
-# The literal offending snippets ("close #N", "Fixes #N", …) that reference
-# issue $2 with a closing keyword inside the text $1, rendered for a warning as
-# `snippet", "snippet`. Empty when the text carries no such reference — which is
-# how the caller tells WHICH source (body vs. commit messages) is at fault.
-_closing_ref_snippets() {
-  printf '%s\n' "$1" | _mp_refs closing-ref-snippets --issue "$2"
-}
-
-# The literal declaration text (`Part of #N` / `Contributes to #N`) that
-# _partial_increment_refs read as authoritative for issue $2 inside text $1,
-# rendered the same way _closing_ref_snippets renders the closing-keyword side
-# (`snippet", "snippet`) — so the pre-merge warning can show an operator BOTH
-# sides of the conflict and judge for themselves whether the declaration was
-# real (AC #4, #5234). Runs the identical fenced-block/inline-code-span
-# stripping as _partial_increment_refs so the quoted snippet always matches
-# what was actually matched, never a code-block artifact.
-_partial_increment_ref_snippets() {
-  printf '%s\n' "$1" | _mp_refs partial-increment-ref-snippets --issue "$2"
 }
 
 # Every commit message of this PR, concatenated (#4595). merge-pr.sh squash-
