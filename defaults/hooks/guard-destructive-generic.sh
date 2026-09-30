@@ -7769,6 +7769,91 @@ rm_scope_literal_same_command_resolve() {
 # =============================================================================
 
 # =============================================================================
+# ...AND THE ALL-LITERAL `for` LIST STOPS HERE ON A MEASUREMENT, NOT ON A
+# PRINCIPLE (#9304 "shape 1"; attempted in PR #9324 and withdrawn; the
+# soundness requirements it failed are #9373)
+#
+# The shape:
+#     for d in /tmp/a /tmp/b; do
+#       rm -rf "$d"
+#     done
+# denies today on `rm-scope-unresolved-var`, and stays denied for now. Unlike
+# the `$(cat P)` block immediately above, that is NOT a design position: every
+# value `$d` can take IS in the command's own source text, so the shape is
+# lexically provable in exactly the sense the two shipped fast paths are. It is
+# denied because the two things it needs — a sound resolver and a measured
+# benefit — are both absent, and because the second is what decides whether the
+# first is worth its blast radius on this code path.
+#
+# 1. THE FIRST ATTEMPT WAS A BLOCKLIST AND IT LEAKED. PR #9324 proved only that
+#    a `for NAME in <words>` header APPEARS in the text — not that it EXECUTED,
+#    not that NAME is still bound where the `rm` runs, and not that the words
+#    are literal under the shell that runs them. An adversarial review
+#    reproduced 10 shapes that denied on `main` and ALLOWED on that head,
+#    reaching `/` or `$HOME` at runtime: `false && for …`, `… done | cat`,
+#    `… done &`, an `unset d` inside the body, an EMPTY `d=` rebind (the rebind
+#    test required `length(seg) > length("d=")`), a backslash-newline
+#    continuation inside the word list, two zsh glob-qualifier/modifier forms
+#    (`/tmp/zz(:h:h)`, `/tmp/zz(:s:…:…:)`), `: "${d:=/evil}"`, and
+#    `mapfile`/`IFS=: read -ra`/`getopts`/`select`/`eval` rebinds. The first
+#    five need nothing but bash. Every row is pinned as a deny control in the
+#    suite (search `#9373`): they are the floor any future attempt clears
+#    BEFORE it ships, and none of them may ever be narrowed.
+#
+# 2. WHAT A SOUND RESOLVER OWES (#9373), so the next attempt starts from the
+#    requirements rather than from the shape:
+#    (a) a POSITIVE allowlist for list words — `^/[A-Za-z0-9._/@%+,=-]+$` after
+#        whole-word quote stripping — not the blocklist #9324 used: `(`, `)`,
+#        `:`, `\`, `~`, `!`, `^`, `#`, `<` and `>` all passed that, and zsh
+#        qualifiers, modifiers and extendedglob are built from exactly those;
+#    (b) NAME occurs NOWHERE except that one header and the `rm` targets
+#        themselves. An enumerate-the-rebinders test is permanently one form
+#        behind — #9331 is the shipped siblings' own version of that debt;
+#    (c) the header is unconditional and in the CURRENT shell, and the `rm`
+#        sits between that header's `do` and its `done`. An `rm` after `done`
+#        reads a binding a subshell, a short-circuit or an empty list may never
+#        have made — and with a literal SUFFIX on the target (`rm -rf
+#        "$d"/etc`), an unbound NAME turns the vetted value into an unvetted
+#        absolute path, which is how rows 1-5 above reach `/`.
+#
+# 3. THE MEASURED YIELD IS ZERO — the same kind of measurement reason 4 above
+#    rests on, re-derived for this shape over 205 unique
+#    `rm-scope-unresolved-var` DENY records: every guard-decisions.log on one
+#    dispatch worker (50 files across 48 repos), 2026-08-15 .. 2026-09-30, with
+#    this suite's own synthetic probes excluded. Exactly ONE record is this
+#    shape (2026-09-22, nine `/home/ubuntu/…` scratch/cache dirs), and every
+#    one of its nine list members is outside repo, worktree and temp scope — so
+#    a sound resolver converts that record from `rm-scope-unresolved-var` into
+#    `rm-scope-outside-repo`. A RELABELLED DENY, NOT AN ALLOW. Checked against
+#    the live hook member by member, not reasoned about. Zero denies converted,
+#    six weeks, 48 repos.
+#
+# 4. AND THE COMMON SPELLING WOULD NOT REACH IT ANYWAY. A one-liner
+#    `for d in …; do rm -rf "$d"; done` never enters this block at all:
+#    `do`/`then` are not separators, so `extract_rm_targets()` sees a segment
+#    whose first word is not `rm` and emits no target (#9323, still open — the
+#    shape ALLOWS today, which is that issue's problem, not this one's). A
+#    resolver added here would be unreachable from the spelling agents write
+#    most often, and reachable only from the multi-line form.
+#
+# WHERE THE YIELD ACTUALLY IS (#9601). The same 205 records contain FIVE of a
+# COMPOSED shape, and all five would resolve to in-scope paths and allow:
+#     for w in issue-8197 issue-8191; do d=".loom/worktrees/$w/target"
+#       ...; rm -rf "$d"; done
+# — a literal assignment whose RHS contains a loop-bound variable. That is a
+# two-level lexical proof, it inherits both halves' fail-closed obligations,
+# and requirement (b) above forbids the occurrence it depends on (NAME in an
+# assignment RHS), so it needs its own explicit yes/no rather than being folded
+# in here. #9601 carries the measurement and the bar.
+#
+# REOPENING BAR for this shape: (a) a nonzero count of real denies that would
+# become ALLOWS — not relabelled denies — under the constraints in 2, and (b) an
+# implementation that denies every `#9373` control in the rm-scope suite. Reason
+# 1 is history and reason 4 closes when #9323 lands; reason 3 is the
+# measurement, and it is the one that can change.
+# =============================================================================
+
+# =============================================================================
 # extract_write_targets() — Bash-tool write-idiom target extraction (#4178).
 #
 # Emits one "<cwd>\t<target>" line (TAB-separated, US separator 0x1f — mirrors
@@ -8964,6 +9049,14 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                         # "WHERE THE rm-scope FAST-PATH FAMILY STOPS" block
                         # comment above extract_write_targets() for the four
                         # reasons and the bar for reopening it (#9322).
+                        # A `for NAME in <literal> <literal>; do rm -rf
+                        # "$NAME"; done` list is denied here too, but for a
+                        # different reason — it IS lexically provable, and it
+                        # is denied on a measurement (zero real denies
+                        # converted) plus the soundness requirements PR #9324
+                        # failed. Same place, the block comment immediately
+                        # after that one (#9304/#9373; #9601 is the composed
+                        # shape that does have measured yield).
                         deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime (guards.rmScope=repo). Unresolvable rm targets fail closed (mirrors rjwalters/repo#244, fixing #239). Use an explicit literal path." "rm-scope-unresolved-var"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_RM_MKTEMP_SCAN
                     fi
                 fi
