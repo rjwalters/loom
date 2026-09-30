@@ -444,7 +444,7 @@ repo.
 ### Dedup contract: never record the same job twice
 
 Everything below lives under `.loom/state/ci-telemetry/`, which is
-gitignored.
+gitignored (the managed block ignores all of `.loom/state/*`, #9592).
 
 - **`seen.jsonl` is the ledger.** It is append-only. Each `unit` line holds
   one run or job's key `(repo, run_id, job_id)` and its run attempt, a

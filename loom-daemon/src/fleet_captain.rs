@@ -371,7 +371,7 @@ type ShellArmRegistry = BTreeMap<String, ShellArmEntry>;
 /// git-tracked (added to `EPHEMERAL_PATTERNS` in `init/post_init.rs`
 /// alongside its `ci-telemetry` sibling): committing one host's arm state
 /// would hand it to every other host as a false starting fact.
-fn shell_arm_registry_path(root: &Path) -> PathBuf {
+pub(crate) fn shell_arm_registry_path(root: &Path) -> PathBuf {
     root.join(".loom")
         .join("state")
         .join("fleet-captain")

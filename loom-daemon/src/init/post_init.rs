@@ -222,28 +222,25 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/exit-codes/",
     ".loom/sweep-checkpoint/",
     ".loom/sweep-run/",
-    // Durable per-host subsystem state (#8824: the CI telemetry dedup
-    // ledger, status and export cursor under `.loom/state/ci-telemetry/`).
-    // Committing it would hand one host's "already emitted" set to another.
-    // Scoped to `ci-telemetry/` so a sibling hand-maintained file such as
-    // `.loom/state/detect-unlabeled-epics-dismissed` stays trackable.
-    ".loom/state/ci-telemetry/",
-    // Durable shell-arm registry for the fleet-captain singleton gate
-    // (#8901): `.loom/state/fleet-captain/armed.json` records when a
-    // `loom-daemon fleet-captain <job>` invocation last armed on THIS host.
-    // Same never-commit reasoning as `ci-telemetry/` just above — one host's
-    // arm timestamps are meaningless, and actively misleading, on another.
-    ".loom/state/fleet-captain/",
-    // Per-host pending-ETA ledger (`observability/eta.rs` `pending_path()`):
-    // `.loom/state/eta/pending.jsonl` holds the estimates THIS daemon has
-    // issued and not yet resolved. Committing it hands one host's pending set
-    // to another. Not hypothetical: loom `101aa8f66` ("chore: resync installed
-    // Loom surfaces") committed it from a Mac whose daemon workspace is the
-    // loom checkout itself; the file then re-dirtied constantly, fleet-resync
-    // refused to fast-forward that dirty Loom source clone, and resyncs from
-    // it were refused as DOWNGRADE fleet-wide on those hosts. Scoped to
-    // `eta/` for the same sibling-file reason as `ci-telemetry/` above.
-    ".loom/state/eta/",
+    // `.loom/state/` is daemon-written, per-host runtime state, ignored
+    // WHOLESALE (#9592). It used to be ignored one subsystem at a time
+    // (`ci-telemetry/` #8824, `fleet-captain/` #8901, `eta/` #9544), and each
+    // new subsystem shipped unignored until someone noticed: loom `101aa8f66`
+    // committed `.loom/state/eta/pending.jsonl` from a host whose daemon
+    // workspace is the loom checkout, which kept that clone permanently dirty,
+    // stopped fleet-resync fast-forwarding it, and got resyncs from it refused
+    // as downgrades. Committing any of this hands one host's ledgers to
+    // another. `/*` rather than `/` is load-bearing: git cannot re-include a
+    // file whose parent directory is itself excluded, so the negation below
+    // only works against a `/*` pattern. Guarded by
+    // `every_daemon_state_path_is_ignored_by_the_managed_block`.
+    ".loom/state/*",
+    // The one TRACKED file under `.loom/state/`: the hand-maintained dismiss
+    // list read by `detect-unlabeled-epics.sh` (#6715), which a human commits
+    // so the exclusion is shared. Must stay AFTER `.loom/state/*` (git applies
+    // the last matching pattern). Add a negation here only for a file a human
+    // writes and wants committed — never for anything the daemon writes.
+    "!.loom/state/detect-unlabeled-epics-dismissed",
     // Concierge budget ledger (#7947): the per-day turn / per-tick relay
     // counters the operator-agent persona consults at the top of every turn.
     // Machine-local and disposable — deleting it costs at most one day's spent
@@ -991,6 +988,57 @@ mod tests {
         );
     }
 
+    /// #9592: every path the daemon writes under `.loom/state/` must be ignored
+    /// by the managed block, including a subsystem that does not exist yet, and
+    /// the one hand-maintained file there must stay trackable. The writer paths
+    /// come from the writers' own path functions, not string literals, so moving
+    /// a ledger cannot leave this test checking a stale location. Answered by
+    /// real `git check-ignore` (no `-v`: with `-v` a negation match also exits
+    /// 0, which would read the tracked file as ignored).
+    #[test]
+    fn every_daemon_state_path_is_ignored_by_the_managed_block() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("run git")
+        };
+        assert!(git(&["init", "-q"]).status.success(), "git init failed");
+        update_gitignore(root).unwrap();
+        let ignored = |path: &str| {
+            git(&["check-ignore", "-q", "--no-index", path])
+                .status
+                .success()
+        };
+
+        let writers = [
+            crate::observability::eta::pending_path(root),
+            crate::ci_telemetry::state_dir(root).join("seen.jsonl"),
+            crate::fleet_captain::shell_arm_registry_path(root),
+            // A subsystem added after this test: must need no registration.
+            root.join(".loom/state/some-future-subsystem/ledger.jsonl"),
+            root.join(".loom/state/top-level-file.json"),
+        ];
+        for abs in &writers {
+            let rel = abs.strip_prefix(root).unwrap().to_str().unwrap();
+            assert!(rel.starts_with(".loom/state/"), "{rel} is not under .loom/state/");
+            assert!(
+                ignored(rel),
+                "{rel} is daemon runtime state but NOT ignored by the managed block"
+            );
+        }
+        assert!(
+            !ignored(".loom/state/detect-unlabeled-epics-dismissed"),
+            "the hand-maintained dismiss list must stay trackable (#6715)"
+        );
+    }
+
     #[test]
     fn appends_missing_patterns_to_existing_gitignore() {
         let tmp = TempDir::new().unwrap();
@@ -1097,9 +1145,9 @@ mod tests {
             ".loom/status/",
             ".loom/retry-state/",
             ".loom/sweep-checkpoint/",
-            // Per-host pending-ETA ledger; committed once by a resync
-            // (101aa8f66), which wedged the Macs' Loom source clone.
-            ".loom/state/eta/",
+            // #9592: all daemon-written `.loom/state/` runtime state (the
+            // pending-ETA ledger was committed once by a resync, 101aa8f66).
+            ".loom/state/*",
             // #7947: the concierge budget ledger. Committing it would hand one
             // host's spent turn budget to every other host as a starting
             // balance.
