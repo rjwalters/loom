@@ -240,6 +240,19 @@ pub(crate) enum ScriptPortCommand {
     /// written).
     WorktreeExisting(super::worktree_existing::WorktreeExistingArgs),
 
+    /// `worktree.sh`'s LOCAL-branch reuse arm, whole (#8195 slice 14): the
+    /// "already exists - reusing it" warning, the #6095/#6100 upstream
+    /// correction (reached in-process, retiring the shell's last
+    /// `_worktree_upstream_check` call site), the #8280 already-landed refusal
+    /// and its degenerate-tip guard, and the base-ref divergence warning. Four
+    /// steps whose ORDER is the contract, so they move as one unit. Retires a
+    /// hand-spliced `--json` refusal document that was not valid JSON for any
+    /// refname holding a quote — `git check-ref-format` permits one, and
+    /// `$BRANCH_NAME` is operator input via the custom-branch argument. Exit 0
+    /// = reuse, 1 = refuse; every inability to decide is 0, because a forge
+    /// outage must never block worktree creation.
+    WorktreeBranchReuse(super::worktree_branch_reuse::WorktreeBranchReuseArgs),
+
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
     /// the predicate holds, 1 when it does not — an answer, not an error.
@@ -483,6 +496,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeBase(args) => args.run(),
             ScriptPortCommand::WorktreeCheck(args) => args.run(),
             ScriptPortCommand::WorktreeExisting(args) => args.run(),
+            ScriptPortCommand::WorktreeBranchReuse(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
