@@ -153,14 +153,17 @@ pub struct QueueLandingRow {
 }
 
 /// `detail` survives only for dispositions whose detail is structured: the
-/// park label, the open PR, and a `labelled_blocked` row's allowlisted hold
-/// labels (#8957).
+/// park label, the open PR, a `labelled_blocked` row's allowlisted hold
+/// labels (#8957), and a `workspace_halted` row's closed-vocabulary hold
+/// cause (#9017 — `main_red`, `gate_pending`, `token_pool`, …, emitted by
+/// `work_finder::halt_cause`, never free-form text).
 #[must_use]
 pub fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
     match disposition {
-        QueueDisposition::Parked | QueueDisposition::OpenPr | QueueDisposition::LabelledBlocked => {
-            detail.map(str::to_string)
-        }
+        QueueDisposition::Parked
+        | QueueDisposition::OpenPr
+        | QueueDisposition::LabelledBlocked
+        | QueueDisposition::WorkspaceHalted => detail.map(str::to_string),
         _ => None,
     }
 }

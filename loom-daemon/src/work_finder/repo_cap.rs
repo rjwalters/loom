@@ -323,6 +323,7 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
         priorities,
         max_concurrent.into(),
         halted,
+        None,
         max_admissions_per_tick,
         saturation_held,
         preferred_slice,
