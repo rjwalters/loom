@@ -25,6 +25,7 @@ use loom_daemon::telemetry::ci::{
     CiAttr, CI_JOB_DURATION_METRIC, CI_METRIC_LABEL_KEYS, CI_RUN_DURATION_METRIC,
     CI_SPAN_ATTRIBUTE_KEYS,
 };
+use loom_daemon::telemetry::ops::{MetricName, OPS_METRIC_LABEL_KEYS};
 use loom_daemon::telemetry::trace::SpanName;
 use loom_daemon::telemetry::{CiJobLogRecord, CiJobRecord, CiRunRecord, RepoVisibility};
 use regex::Regex;
@@ -47,6 +48,24 @@ const ETA_QUERIES: &str = include_str!("../../defaults/observability/signoz/eta-
 /// manifest's — the fixture generator emits no usage spans, so these read real
 /// canary data. The live half is `signoz_usage_queries.rs`.
 const USAGE_QUERIES: &str = include_str!("../../defaults/observability/signoz/usage-queries.sql");
+/// The ready-queue dwell/starvation standing queries (#8856). Governed by
+/// `metric.points`' `MetricName` vocabulary, not the shared fixture manifest's
+/// — the fixture generator emits no `loom.queue.*` metrics.
+const QUEUE_DWELL: &str = include_str!("../../defaults/observability/signoz/queue-dwell.sql");
+/// The subscription quota utilization standing queries (#9005). Governed by
+/// the `tokens.snapshot` record's own emitted metric names (see
+/// `tokens_metric_names`), which are not a `MetricName` variant.
+const QUOTA_UTILIZATION: &str =
+    include_str!("../../defaults/observability/signoz/quota-utilization.sql");
+/// The queue-starvation alert rule (#8856): a saved SigNoz alert definition,
+/// not a `.sql` file, but its embedded `query` field is real ClickHouse SQL
+/// subject to the same drift.
+const QUEUE_STARVATION_ALERT: &str =
+    include_str!("../../defaults/observability/signoz/alerts/queue-starvation.json");
+/// The daemon's OTLP mapping source (#9586 established this as an authority
+/// for record kinds whose metric names are literals rather than a
+/// `MetricName` variant — see `tokens_metric_names`).
+const OTLP_MAPPING: &str = include_str!("../src/observability/otlp/mapping.rs");
 
 /// Loom's own attribute namespace. Presence probes outside it are deliberate
 /// absence assertions (see [`fixture_queries_assert_the_privacy_sentinel_is_dropped`])
@@ -249,6 +268,11 @@ fn saved_queries_only_reference_forwarded_attribute_and_resource_keys() {
         ("ci-queries.sql", CI_QUERIES),
         ("eta-queries.sql", ETA_QUERIES),
         ("usage-queries.sql", USAGE_QUERIES),
+        // Only query 5 (the dispatch disposition/admission span read) uses
+        // these containers; queries 1-4 read `signoz_metrics` exclusively —
+        // see `queue_dwell_queries_match_the_ops_metric_vocabulary` below for
+        // those.
+        ("queue-dwell.sql", QUEUE_DWELL),
     ] {
         for container in ["attributes_string", "attributes_number", "attributes_bool"] {
             for key in referenced_attribute_keys(sql, container) {
@@ -918,4 +942,187 @@ fn every_usage_query_section_is_cited_by_a_readme_saved_view() {
              {section}; it cites {cited:?}"
         );
     }
+}
+
+// ============================================================================
+// queue-dwell.sql (#8856), quota-utilization.sql (#9005) and
+// alerts/queue-starvation.json (#8856): the ops metric-vocabulary drift guard
+// ============================================================================
+//
+// These three saved artifacts predate this file's drift guard entirely: none
+// of the CI/usage/fixture sections above cover them. The same silent-empty
+// failure modes apply: a `metric_name` literal that no emitter's `MetricName`
+// (or, for `tokens.snapshot`, the mapping's own literal) still matches returns
+// zero rows forever, and a `JSONExtractString(labels, '...')` label key the
+// gateway's DATAPOINT `keep_keys` allowlist strips does the same. Query 5 of
+// `queue-dwell.sql` additionally reads span attributes and a resource key —
+// that half is covered by
+// `saved_queries_only_reference_forwarded_attribute_and_resource_keys` above,
+// which now includes `queue-dwell.sql` in its file list.
+//
+// Reuses `metric_label_keys` / `all_metric_name_literals`, already defined
+// above for the CI section.
+
+/// Asserts a metric-point label this artifact reads is either the one
+/// resource attribute the SigNoz OTLP exporter promotes into every metric
+/// point's labels (`host.id` — documented at the top of `queue-dwell.sql`), or
+/// a key in `OPS_METRIC_LABEL_KEYS` that the gateway's DATAPOINT `keep_keys`
+/// allowlist still forwards.
+fn assert_ops_metric_label_is_forwarded(
+    artifact: &str,
+    label: &str,
+    datapoint_keys: &BTreeSet<String>,
+) {
+    if label == "host.id" {
+        assert!(
+            allowlist().resource.contains(label),
+            "{artifact} reads label 'host.id', which the gateway's resource keep_keys allowlist \
+             no longer keeps"
+        );
+        return;
+    }
+    assert!(
+        OPS_METRIC_LABEL_KEYS.contains(&label),
+        "{artifact} reads metric label '{label}', which is not in OPS_METRIC_LABEL_KEYS \
+         ({OPS_METRIC_LABEL_KEYS:?})"
+    );
+    assert!(
+        datapoint_keys.contains(label),
+        "{artifact} reads metric label '{label}', which the gateway's DATAPOINT keep_keys \
+         allowlist strips"
+    );
+}
+
+#[test]
+fn queue_dwell_queries_match_the_ops_metric_vocabulary() {
+    let datapoint_keys = &keep_keys_by_context()["datapoint"];
+    // The dwell/starvation metrics `queue-dwell.sql` 1-4 read (query 5 reads
+    // spans, not `metric.points`, and is governed by the general
+    // attribute/resource-forwarding test instead).
+    let dwell_metric_names: BTreeSet<&str> = [
+        MetricName::QueueOldestWait,
+        MetricName::QueueStarved,
+        MetricName::QueueStarvedByReason,
+        MetricName::QueueDispatchWait,
+        MetricName::QueueDispatchWaitSamples,
+    ]
+    .iter()
+    .map(|name| name.as_str())
+    .collect();
+
+    let named = all_metric_name_literals(QUEUE_DWELL);
+    assert!(!named.is_empty(), "queue-dwell.sql no longer queries any loom.queue.* metric");
+    for name in &named {
+        assert!(
+            dwell_metric_names.contains(name.as_str()),
+            "queue-dwell.sql queries metric '{name}', which is not one of the queue-dwell \
+             metrics MetricName defines ({dwell_metric_names:?})"
+        );
+    }
+    for metric in &dwell_metric_names {
+        assert!(named.contains(*metric), "queue-dwell.sql no longer reads {metric} at all");
+    }
+
+    let labels = metric_label_keys(QUEUE_DWELL);
+    assert!(!labels.is_empty(), "queue-dwell.sql no longer reads any metric label");
+    for label in &labels {
+        assert_ops_metric_label_is_forwarded("queue-dwell.sql", label, datapoint_keys);
+    }
+}
+
+/// Derived from `mapping.rs`'s `TokensSnapshot` arm text: the `loom.tokens.*`
+/// gauge names the account-utilization metric family emits. Not a
+/// `MetricName` variant — this record kind writes its OTLP metric names as
+/// literals directly in the mapping, so the mapping source is the authority
+/// here, exactly as `sweep_facts_gateway_survival.rs` already treats it for a
+/// different record family.
+fn tokens_metric_names() -> BTreeSet<String> {
+    let arm_start = OTLP_MAPPING
+        .find("TelemetryRecord::TokensSnapshot(r) =>")
+        .expect("mapping.rs no longer has a TokensSnapshot arm");
+    let next_arm = OTLP_MAPPING[arm_start + 1..]
+        .find("TelemetryRecord::")
+        .map(|offset| arm_start + 1 + offset);
+    let arm = match next_arm {
+        Some(end) => &OTLP_MAPPING[arm_start..end],
+        None => &OTLP_MAPPING[arm_start..],
+    };
+    let names: BTreeSet<String> = Regex::new(r#"name:\s*"(loom\.tokens\.[a-z_]+)""#)
+        .unwrap()
+        .captures_iter(arm)
+        .map(|capture| capture[1].to_owned())
+        .collect();
+    assert!(
+        !names.is_empty(),
+        "failed to parse any loom.tokens.* metric name out of the TokensSnapshot mapping arm"
+    );
+    names
+}
+
+#[test]
+fn quota_utilization_queries_match_the_tokens_snapshot_vocabulary() {
+    let datapoint_keys = &keep_keys_by_context()["datapoint"];
+    let emitted = tokens_metric_names();
+
+    let named = all_metric_name_literals(QUOTA_UTILIZATION);
+    assert!(
+        !named.is_empty(),
+        "quota-utilization.sql no longer queries any loom.tokens.* metric"
+    );
+    for name in &named {
+        assert!(
+            emitted.contains(name),
+            "quota-utilization.sql queries metric '{name}', which the TokensSnapshot mapping \
+             never emits; it emits {emitted:?}"
+        );
+    }
+    for metric in [
+        "loom.tokens.usage_fraction",
+        "loom.tokens.usage_fraction_weekly",
+        "loom.tokens.exhausted",
+    ] {
+        assert!(
+            emitted.contains(metric),
+            "the TokensSnapshot mapping arm no longer emits {metric}"
+        );
+        assert!(named.contains(metric), "quota-utilization.sql no longer reads {metric} at all");
+    }
+
+    let labels = metric_label_keys(QUOTA_UTILIZATION);
+    assert!(!labels.is_empty(), "quota-utilization.sql no longer reads any metric label");
+    for label in &labels {
+        assert!(
+            label == "provider" || label == "account",
+            "quota-utilization.sql reads metric label '{label}', which the tokens.snapshot \
+             mapping never sets on a metric point; it sets only provider/account"
+        );
+        assert_ops_metric_label_is_forwarded("quota-utilization.sql", label, datapoint_keys);
+    }
+}
+
+#[test]
+fn queue_starvation_alert_matches_the_ops_metric_vocabulary() {
+    let datapoint_keys = &keep_keys_by_context()["datapoint"];
+    let named = all_metric_name_literals(QUEUE_STARVATION_ALERT);
+    assert_eq!(
+        named,
+        BTreeSet::from([MetricName::QueueStarved.as_str().to_owned()]),
+        "alerts/queue-starvation.json's embedded query must alert on exactly \
+         loom.queue.starved"
+    );
+
+    let labels = metric_label_keys(QUEUE_STARVATION_ALERT);
+    assert!(
+        labels.contains("state"),
+        "alerts/queue-starvation.json no longer filters the 'state' label (it must alert on the \
+         ready-state starvation count only, per its own \"Loom ready queue starved\" name)"
+    );
+    for label in &labels {
+        assert_ops_metric_label_is_forwarded("alerts/queue-starvation.json", label, datapoint_keys);
+    }
+    assert!(
+        QUEUE_STARVATION_ALERT.contains("= 'ready'"),
+        "alerts/queue-starvation.json must filter state = 'ready', matching its \"Loom ready \
+         queue starved\" name"
+    );
 }

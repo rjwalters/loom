@@ -971,6 +971,40 @@ fixture is synthetic and the engine is `clickhouse local`, which establishes the
 SQL's behaviour against the pinned ClickHouse but not the trial deployment's
 ingest path. That needs the trial host, the same gap #8525 and #9279 name.
 
+## Closing the drift guard's last gap: queue-dwell, quota-utilization, the alert (2026-09-30)
+
+`fixture-queries.sql`, `ci-queries.sql` and `usage-queries.sql` all gained a
+static CI contract as they landed — a saved query that subscripts an attribute
+the gateway strips, or names a metric no emitter produces, returns zero rows
+forever rather than failing, which is indistinguishable from "the backend lost
+the data". `queue-dwell.sql` (#8856), `quota-utilization.sql` (#9005) and
+`alerts/queue-starvation.json` (#8856) — all scope-item-4 "host/token gauges"
+artifacts in this same directory — had no such guard at all: a rename of
+`loom.queue.starved`, `loom.tokens.usage_fraction_weekly` or any of their
+`state`/`reason`/`provider`/`account` labels would have gone unnoticed by
+ordinary CI.
+
+Three new tests in `signoz_trial_artifacts.rs` close the gap, each derived
+rather than restated: `queue_dwell_queries_match_the_ops_metric_vocabulary`
+against the public `MetricName` enum (`loom-daemon/src/telemetry/ops.rs`);
+`quota_utilization_queries_match_the_tokens_snapshot_vocabulary` against the
+`TokensSnapshot` OTLP mapping arm's own literal metric names, parsed out of
+`mapping.rs` the same way `sweep_facts_gateway_survival.rs` (#9586) already
+treats that source file as an authority; and
+`queue_starvation_alert_matches_the_ops_metric_vocabulary` against the alert
+JSON's embedded `query` string. `queue-dwell.sql` was also added to the
+existing `saved_queries_only_reference_forwarded_attribute_and_resource_keys`
+file list, covering query 5's span-attribute/resource reads.
+
+Each of the three was confirmed to fail for its own reason before being
+committed: a typo'd `loom.queue.starved` in `queue-dwell.sql`, a typo'd
+`loom.tokens.exhausted` in `quota-utilization.sql`, and a typo'd
+`loom.queue.starved` inside the alert's embedded query each produced the
+intended panic message naming the exact stale/unknown literal. No Docker,
+network, backend or credential is used, so this runs in ordinary CI on any
+host — including this one, which has neither Docker Compose nor a running
+trial to observe.
+
 ## Acceptance ledger
 
 | Check | Status |
