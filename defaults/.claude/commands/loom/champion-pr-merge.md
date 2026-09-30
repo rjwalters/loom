@@ -1986,8 +1986,7 @@ git checkout main 2>/dev/null || true
 # merge API's optimistic-concurrency precondition (#5579); --redate-stale-checks
 # performs the #8248 guard's OWN remedy, bypassing nothing (#8508). Capture the
 # exit code, not a bare `||`: 3/4/5 are DISTINCT from 1, never failures (below).
-# 420s is strictly under this call's own 600000 ms timeout — see "Timeout
-# invariant" above; change both or neither.
+# 420s < this call's 600000 ms timeout ("Timeout invariant" above).
 MERGE_RC=0
 LOOM_AUTO_MERGE_TIMEOUT=420 \
   ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks || MERGE_RC=$?
