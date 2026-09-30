@@ -14,7 +14,10 @@ mod join_keys;
 mod owners;
 mod queue_time;
 mod rerun_window;
+mod shard_queue;
+mod step_spans;
 mod story_stitch;
+mod suite_spans;
 mod trigger_reason;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -69,6 +72,14 @@ struct FixtureApi {
     /// Paths whose next `get_document` call fails transiently (then heals) —
     /// the retry-after-failure seam.
     flaky_logs: Mutex<HashMap<String, usize>>,
+    /// Downloadable run artifacts (#9089), keyed by artifact **name**: `file`
+    /// is the name `gh run download` would unpack, `text` its contents. The
+    /// seams that read and mutate these two live in `suite_spans.rs` beside
+    /// the tests that use them (a child module sees its parent's private
+    /// fields), so the shared fixture here stays the state and not the policy.
+    artifacts: Mutex<BTreeMap<String, Value>>,
+    /// Artifact names whose next `download_artifact` call fails transiently.
+    flaky_artifacts: Mutex<HashMap<String, usize>>,
 }
 
 impl FixtureApi {
@@ -93,6 +104,8 @@ impl FixtureApi {
             panic_at: None,
             job_logs: Mutex::new(job_logs),
             flaky_logs: Mutex::new(HashMap::new()),
+            artifacts: Mutex::new(suite_spans::fixture_artifacts(&fx)),
+            flaky_artifacts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -223,6 +236,18 @@ impl GithubApi for FixtureApi {
             ..ApiResponse::default()
         })
     }
+
+    /// Delegated to `suite_spans::serve_artifact` (#9089) — see it for what
+    /// `gh run download --name X --dir dest` is being stood in for.
+    fn download_artifact(
+        &self,
+        repo: &str,
+        run_id: u64,
+        name: &str,
+        dest: &Path,
+    ) -> Result<(), ApiError> {
+        suite_spans::serve_artifact(self, repo, run_id, name, dest)
+    }
 }
 
 fn now() -> DateTime<Utc> {
@@ -273,6 +298,21 @@ fn assert_no_duplicates(root: &Path) {
     assert!(dupes.is_empty(), "double-emitted: {dupes:?}");
 }
 
+/// Spans one clean cycle over the fixture emits: 6 run spans + 24 job spans
+/// + [`FIXTURE_STEP_SPANS`] + [`FIXTURE_SUITE_SPANS`] (#9089).
+pub(super) const FIXTURE_SPANS: usize = 6 + 24 + FIXTURE_STEP_SPANS + FIXTURE_SUITE_SPANS;
+
+/// `loom.ci.step` spans the fixture's two `steps[]`-bearing jobs produce
+/// (#9089): four from job 10012 and one from job 10034 — whose second step
+/// has neither timestamp, so it is deliberately NOT a span.
+pub(super) const FIXTURE_STEP_SPANS: usize = 5;
+
+/// `loom.ci.suite` spans the fixture's one suite-timings artifact produces
+/// (#9089), all under job 10012 (`Shell Test Suites (hermetic, 2/2)`): its
+/// record holds six entries, of which the skipped one (no window) and the
+/// repeat of an earlier suite name emit nothing.
+pub(super) const FIXTURE_SUITE_SPANS: usize = 4;
+
 fn kind_counts(root: &Path) -> (usize, usize, usize, usize) {
     let (mut runs, mut jobs, mut durations, mut spans) = (0, 0, 0, 0);
     for env in journal(root) {
@@ -316,7 +356,7 @@ fn once_emits_every_run_and_job_with_correct_durations() {
     assert_eq!(report.summary.repos_polled, 2, "archived repo must be skipped");
     assert_eq!((report.summary.runs_emitted, report.summary.jobs_emitted), (6, 24));
     // Each run/job unit = its record + a duration sample + a span.
-    assert_eq!(kind_counts(dir.path()), (6, 24, 30, 30));
+    assert_eq!(kind_counts(dir.path()), (6, 24, 30, FIXTURE_SPANS));
     assert_no_duplicates(dir.path());
     assert!(
         !api.requests()
@@ -356,30 +396,6 @@ fn once_emits_every_run_and_job_with_correct_durations() {
     assert_eq!(status.consecutive_failures, 0);
 }
 
-#[test]
-fn job_spans_parent_to_their_run_span_in_one_trace() {
-    let dir = TempDir::new().unwrap();
-    run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
-    let spans: Vec<_> = journal(dir.path())
-        .into_iter()
-        .filter_map(|e| match e.record {
-            TelemetryRecord::Span(s) => Some(s),
-            _ => None,
-        })
-        .collect();
-    let roots: HashMap<String, _> = spans
-        .iter()
-        .filter(|s| s.parent_span_id.is_none())
-        .map(|s| (s.attributes["loom.ci.run_id"].clone(), s))
-        .collect();
-    assert_eq!(roots.len(), 6);
-    for job in spans.iter().filter(|s| s.parent_span_id.is_some()) {
-        let root = roots[&job.attributes["loom.ci.run_id"]];
-        assert_eq!(job.parent_span_id.as_ref(), Some(&root.context.span_id));
-        assert_eq!(job.context.trace_id, root.context.trace_id);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // AC3: idempotency — the money AC
 // ---------------------------------------------------------------------------
@@ -414,7 +430,11 @@ fn killing_the_process_at_any_request_then_rerunning_emits_each_job_exactly_once
         }));
         assert!(crashed.is_err(), "kill point {kill_at} did not fire");
         run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
-        assert_eq!(kind_counts(dir.path()), (6, 24, 30, 30), "kill at request {kill_at}");
+        assert_eq!(
+            kind_counts(dir.path()),
+            (6, 24, 30, FIXTURE_SPANS),
+            "kill at request {kill_at}"
+        );
         assert_no_duplicates(dir.path());
     }
 }
@@ -471,7 +491,7 @@ fn crash_between_ledger_commit_and_journal_emit_emits_exactly_once() {
     let report = run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
     assert_eq!(report.summary.recovered_units, 5);
     // Recovered units are not re-committed by the poll; totals are exact.
-    assert_eq!(kind_counts(dir.path()), (6, 24, 30, 30));
+    assert_eq!(kind_counts(dir.path()), (6, 24, 30, FIXTURE_SPANS));
     assert_no_duplicates(dir.path());
 }
 
@@ -494,7 +514,7 @@ fn crash_mid_journal_write_is_repaired_and_emits_exactly_once() {
     drop(ledger);
 
     run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
-    assert_eq!(kind_counts(dir.path()), (6, 24, 30, 30));
+    assert_eq!(kind_counts(dir.path()), (6, 24, 30, FIXTURE_SPANS));
     assert_no_duplicates(dir.path());
 }
 
@@ -601,7 +621,7 @@ fn an_in_progress_run_holds_the_watermark_and_is_emitted_once_it_completes() {
 
     let report = run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
     assert_eq!((report.summary.runs_emitted, report.summary.jobs_emitted), (1, 4));
-    assert_eq!(kind_counts(dir.path()), (6, 24, 30, 30));
+    assert_eq!(kind_counts(dir.path()), (6, 24, 30, FIXTURE_SPANS));
     assert_no_duplicates(dir.path());
 }
 
@@ -681,7 +701,7 @@ fn a_rate_limit_backs_off_the_whole_org() {
     later.now = now() + Duration::seconds(601);
     run_cycle(&later, &FixtureApi::new()).unwrap();
     assert_eq!(state::load_status(&state_dir(dir.path())).backoff_until, None);
-    assert_eq!(kind_counts(dir.path()), (6, 24, 30, 30));
+    assert_eq!(kind_counts(dir.path()), (6, 24, 30, FIXTURE_SPANS));
 }
 
 #[test]

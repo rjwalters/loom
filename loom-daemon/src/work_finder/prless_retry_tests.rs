@@ -1,4 +1,5 @@
-//! Work-finder coverage for the PR-less retry bound's skip set (Issue #7972).
+//! Work-finder coverage for the PR-less retry bound's skip set (Issues #7972,
+//! #9292).
 //!
 //! Lives in its own file rather than in the shared `work_finder::tests` module
 //! for the file-size-ratchet reason `tmpfs_warning` / `registry_refresh` do
@@ -150,4 +151,68 @@ fn a_prless_held_workspace_does_not_starve_a_sibling() {
     assert_eq!(report.dispatched, 1);
     assert!(multi[0].1.dispatched.is_empty(), "the held workspace dispatches nothing");
     assert_eq!(multi[1].1.dispatched, vec![10], "the healthy sibling gets the shared slot");
+}
+
+/// #9292 at the work-finder seam, through the **production** dispatcher rather
+/// than a fake: the four tests above inject a skip set directly, so they cannot
+/// tell a window this host armed from one a peer did. This one arms nothing
+/// locally — the registry has never seen issue #8812 — and lets a single peer
+/// ad be the only reason it is skipped, which is the path a second dispatch host
+/// actually takes.
+///
+/// `RegistryDispatcher::prless_retry()` is a pure in-memory read of
+/// `SweepRegistry::prless_retry_issues`, and #9292 is what made that read a
+/// union of local and peer-advertised windows. Nothing at this layer changed:
+/// the assertion is that nothing had to.
+#[test]
+fn tick_skips_an_issue_only_a_peer_host_armed() {
+    use crate::peer_claims::{observe_brake_ad, ClaimAd, PeerClaimView};
+    use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    // Hermetic: no label flips, so `workspace_commands_missing()` stays false
+    // without installing `.claude/commands/loom/` on disk.
+    config.skip_label_flip = true;
+    let mut registry = SweepRegistry::new(config);
+    let repo = crate::peer_claims::repo_slug(&registry.config().workspace_root);
+
+    // A peer host's release ad — the only record of #8812 anywhere in this
+    // process. `observe_brake_ad` is the exact routing `safehouse::PeerClaimSink`
+    // performs on an inbound envelope.
+    let view = Arc::new(Mutex::new(PeerClaimView::new("self".into(), Duration::from_secs(120))));
+    {
+        let mut v = view.lock().unwrap();
+        observe_brake_ad(
+            &mut v,
+            &ClaimAd::prless_release_armed(
+                8812,
+                repo,
+                "host-e1d4c843".into(),
+                7,
+                "2026-09-24T07:06:00Z".into(),
+                2,
+                300,
+            ),
+            Instant::now(),
+        );
+    }
+    registry.set_peer_claims(view);
+
+    let mut source = OneShotSource::of(&[8812]);
+    let mut disp = RegistryDispatcher::new(Arc::new(Mutex::new(registry)));
+    assert_eq!(
+        disp.prless_retry(),
+        HashSet::from([8812]),
+        "the production skip-set read must include a peer-armed window (#9292)"
+    );
+
+    let report = tick(&mut source, &mut disp, 10, false).unwrap();
+    assert_eq!(
+        report.skipped_prless_retry, 1,
+        "a peer's PR-less release must space out THIS host's next claim too"
+    );
+    assert_eq!(report.dispatched, 0, "nothing may be dispatched — and no spawn is attempted");
 }

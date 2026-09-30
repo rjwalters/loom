@@ -48,6 +48,36 @@ test run is trusted:
 If a daemon test fails on the host but passes on CI (or the reverse), check
 these two before reading the code.
 
+## Syncing the tree
+
+Sync **exactly the tracked tree**, not a gitignore filter:
+
+```bash
+git ls-files -z | rsync -az --files-from=- ./ <host>:build/<task>/
+```
+
+Commit (or `worktree.sh snapshot <N>`) before syncing — `git ls-files` lists
+the tracked tree, so uncommitted work is not picked up and untracked scratch
+never leaks. The files-from form cannot drop a tracked file and cannot leak a
+gitignored one (`.env`, `target/`), which is precisely the two failure modes
+of the tempting alternative, `rsync -az --delete --filter=':- .gitignore'
+--exclude '.git/' ./ <host>:build/<task>/`: under macOS's system rsync that
+filter is **silently** wrong (#9467). Observed: `defaults/roles/` synced
+whole while every tracked file under `defaults/.claude/commands/` was
+dropped — with `git check-ignore` reporting the files not ignored — and the
+host suite then failed six tests whose only cause was the missing files
+(`cannot read …/defaults/.claude/commands/loom/*.md` in the `jev_*` prompt
+tables, the `init` defaults-tree and conformance-fixture tests). A filter
+that fails by omission, only under one OS, is not a runbook command.
+
+If a host suite fails on files it should have, diff what arrived against the
+tracked set before reading any code:
+
+```bash
+git ls-files | wc -l                       # locally
+ssh <host> 'cd build/<task> && find . -type f -not -path "./target/*" | wc -l'
+```
+
 ## Fanning several tasks out onto one host
 
 Several concurrent tasks (subagents, parallel issues) can share one host:

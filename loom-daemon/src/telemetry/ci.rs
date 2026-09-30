@@ -51,8 +51,9 @@ pub const CI_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.ci.started_at",
     "loom.ci.completed_at",
     "loom.ci.duration_ms",
-    // `ci.run` only (#9007 follow-up): `run_started_at − created_at`, the CI
-    // queue segment, so "CI queued" and "CI running" are separable.
+    // `ci.run` (#9007 follow-up: `run_started_at − created_at`) AND `ci.job`
+    // (#9089: `started_at − created_at`) — the CI queue segment for each, so
+    // "CI queued" and "CI running" are separable at both levels.
     "loom.ci.queued_ms",
     // `ci.run` only (#9337): why this run attempt happened — `new_commit`,
     // `stale_main_bump`, `flaky_retry` or `unknown`
@@ -63,6 +64,11 @@ pub const CI_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.ci.runner",
     "loom.ci.attempts",
     "loom.ci.timed_out",
+    // `ci.job` only (#9089): a matrix leg's shard identity, parsed from its
+    // display name — see `ci_telemetry::records::parse_shard`.
+    "loom.ci.shard.index",
+    "loom.ci.shard.total",
+    "loom.ci.shard.kind",
     // `ci.job.log` (#8825). `loom.ci.chunk_index` doubles as the gateway's
     // "this is a job-log chunk" predicate — the scrub stage in
     // `defaults/observability/collector/config.yaml` is scoped by exactly
@@ -127,14 +133,35 @@ pub const CI_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     // always-admitted key list and the collector's span `keep_keys`.
     "loom.ci.head_sha",
     "loom.ci.ref",
-    // Run span only (#9007 follow-up): the CI queue segment, see
-    // `CiRunRecord::queued_ms`.
+    // Run span (#9007 follow-up) AND job span (#9089): the CI queue segment,
+    // see `CiRunRecord::queued_ms` / `CiJobRecord::queued_ms`.
     "loom.ci.queued_ms",
     // Run span only (#9337): the attempt (so `flaky_retry` is auditable from
     // the span — the job span's equivalent is `loom.ci.attempts`) and the
     // trigger attribution, see `CiRunRecord::trigger_reason`.
     "loom.ci.run_attempt",
     "loom.ci.trigger_reason",
+    // Job span only (#9089): a matrix leg's shard identity — see
+    // `ci_telemetry::records::parse_shard`.
+    "loom.ci.shard.index",
+    "loom.ci.shard.total",
+    "loom.ci.shard.kind",
+    // `loom.ci.step` span only (#9089): which step of its job this is. The
+    // step span also repeats its job's `loom.ci.job`/`loom.ci.job_id` and the
+    // shard trio above, so "which step of which leg is slow" is one group-by
+    // and needs no trace join.
+    "loom.ci.step",
+    "loom.ci.step_number",
+    // `loom.ci.suite` span only (#9089): which shell test suite of its sharded
+    // job this is, from the timings artifact `run-ci-suites.sh` uploads. The
+    // outcome has its own key rather than reusing `loom.ci.conclusion`: that
+    // one carries GitHub's vocabulary (`success`/`failure`/…) everywhere else,
+    // and mixing a suite's `pass`/`fail`/`skip` into it would corrupt every
+    // group-by over it. Like a step span, a suite span also repeats its job's
+    // identity and shard trio.
+    "loom.ci.suite",
+    "loom.ci.suite.outcome",
+    "loom.ci.suite.retried",
 ];
 
 /// The low-cardinality metric label allowlist for the two CI duration
@@ -263,6 +290,32 @@ pub struct CiJobRecord {
     pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
     pub duration_ms: i64,
+    /// Milliseconds this job sat queued for a runner: `started_at −
+    /// created_at`, floored at zero (#9089 — the per-job analogue of
+    /// [`CiRunRecord::queued_ms`]). `None` when GitHub reported no
+    /// `created_at` for the job (a pre-#9089 recording never reads as a zero
+    /// queue).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_ms: Option<i64>,
+    /// A matrix leg's 1-based position, parsed from the job's display name
+    /// (#9089; see `ci_telemetry::records::parse_shard`). `None` for an
+    /// unsharded job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_index: Option<u32>,
+    /// The matrix's total leg count, alongside `shard_index`. `None` for an
+    /// unsharded job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_total: Option<u32>,
+    /// Which sharded job family this is: `nextest-partition`,
+    /// `shell-suite-shard`, or `none` (#9089). Always present — unlike
+    /// `shard_index`/`shard_total`, "not sharded" is itself the answer, not
+    /// an absence.
+    #[serde(default = "shard_kind_none")]
+    pub shard_kind: String,
+}
+
+fn shard_kind_none() -> String {
+    "none".to_string()
 }
 
 impl CiJobRecord {
@@ -287,6 +340,16 @@ impl CiJobRecord {
         out.push(("loom.ci.started_at", CiAttr::Str(self.started_at.to_rfc3339())));
         out.push(("loom.ci.completed_at", CiAttr::Str(self.completed_at.to_rfc3339())));
         out.push(("loom.ci.duration_ms", CiAttr::Int(self.duration_ms)));
+        if let Some(queued_ms) = self.queued_ms {
+            out.push(("loom.ci.queued_ms", CiAttr::Int(queued_ms)));
+        }
+        if let Some(index) = self.shard_index {
+            out.push(("loom.ci.shard.index", CiAttr::Int(i64::from(index))));
+        }
+        if let Some(total) = self.shard_total {
+            out.push(("loom.ci.shard.total", CiAttr::Int(i64::from(total))));
+        }
+        out.push(("loom.ci.shard.kind", CiAttr::Str(self.shard_kind.clone())));
         out
     }
 }

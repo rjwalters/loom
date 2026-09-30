@@ -125,12 +125,57 @@ export function validateEnvelope(
   };
 }
 
+/**
+ * True when a `repo` value is path-shaped — a filesystem path rather than
+ * the `owner/name` slug the schema expects (issue rjwalters/loom#9442:
+ * 71 distinct path-shaped values like `/Users/x/GitHub/Name` and
+ * `/home/ubuntu/...` are in the historical data, emitted by pre-#9462
+ * daemons that sent `record.repo` verbatim from a local checkout path).
+ * Exported so the ingest handler can count occurrences per batch without
+ * re-deriving the predicate (and thereby drifting from the normalizer).
+ */
+export function isPathShapedRepo(repo: string): boolean {
+  return repo.startsWith("/");
+}
+
+/**
+ * Normalize a path-shaped `repo` to its final path component (basename),
+ * lowercased — `/Users/x/GitHub/MyRepo` becomes `myrepo`. This is a
+ * lossy-but-honest degradation, deliberately NOT a silent verbatim store
+ * (rjwalters/loom#9442): a filesystem path leaks operator usernames and
+ * directory layout into the fleet database, groups under a different value
+ * per machine, and can never start with `/` again once stored. Storing the
+ * lowercased basename keeps same-repo records from different machines
+ * collapsing into distinct `repo` values, while remaining visibly a
+ * single-component name rather than a fake slug.
+ *
+ * Trailing slashes are stripped first (POSIX basename semantics), and a
+ * degenerate input whose basename is empty (`"/"`) normalizes to `""` —
+ * the caller maps that to "absent", because there is no honest repo name
+ * to recover and an empty string is not a value worth indexing.
+ */
+export function normalizePathRepo(repo: string): string {
+  const withoutTrailingSlashes = repo.replace(/\/+$/, "");
+  const base = withoutTrailingSlashes.slice(withoutTrailingSlashes.lastIndexOf("/") + 1);
+  return base.toLowerCase();
+}
+
 /** Extract the fields this backend indexes from a validated envelope's
  * `record`, defensively (works for any `kind`, known or forward-compatible
- * unknown). */
+ * unknown).
+ *
+ * A path-shaped `repo` (starting with `/`) is normalized to its lowercased
+ * basename before it can reach storage — the backend never persists a
+ * filesystem path (rjwalters/loom#9442; the emitter side is fixed separately
+ * in PR #9462, so the ingest half must hold the line until then). */
 export function extractRecordFields(record: Record<string, unknown>): ExtractedRecordFields {
   const kind = record.kind as string;
-  const repo = typeof record.repo === "string" ? record.repo : undefined;
+  let repo = typeof record.repo === "string" ? record.repo : undefined;
+  if (repo !== undefined && isPathShapedRepo(repo)) {
+    // `|| undefined`: a degenerate path (`"/"`) has no basename — store
+    // absence, not an empty string.
+    repo = normalizePathRepo(repo) || undefined;
+  }
   const visibility = decodeVisibility(record.visibility);
   const issue = typeof record.issue === "number" && Number.isInteger(record.issue) ? record.issue : undefined;
   const sweepId = typeof record.sweep_id === "string" ? record.sweep_id : undefined;

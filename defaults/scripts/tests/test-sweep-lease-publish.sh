@@ -127,10 +127,10 @@ STUB_DIR="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 
 # --- Stub gh on PATH ------------------------------------------------------
-#   gh api [-R repo] repos/{owner}/{repo}/issues/<N>/comments --paginate --jq F
+#   gh api repos/{owner}/{repo}/issues/<N>/comments --paginate --jq F
 #       -> applies the real `jq` filter F to $STUB_DIR/comments.json (or "[]");
 #          fails if $STUB_DIR/comments-fail exists
-#   gh api [-R repo] --method POST repos/{owner}/{repo}/issues/<N>/comments -F body=@-
+#   gh api --method POST repos/{owner}/{repo}/issues/<N>/comments -F body=@-
 #       -> resolves the body EXACTLY as real gh would (only -F reads stdin;
 #          -f is a literal string), writes it to $STUB_DIR/post-<n>.body,
 #          appends a line to $STUB_DIR/post-calls.log, prints a comment JSON;
@@ -148,7 +148,9 @@ if [[ "$1" == "api" ]]; then
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --method) method="$2"; shift 2 ;;
-      -R) shift 2 ;;
+      -R|--repo)
+        # Real `gh api` has no -R/--repo flag (#9552): fail exactly like it.
+        echo "unknown shorthand flag: 'R' in -R" >&2; exit 1 ;;
       --paginate) shift ;;
       --jq) jq_filter="$2"; shift 2 ;;
       -f)
@@ -167,6 +169,7 @@ if [[ "$1" == "api" ]]; then
         ;;
     esac
   done
+  echo "$path" >> "$D/api-paths.log"
   resolve_body() {
     if [[ -n "$have_typed_body" ]]; then
       case "$typed_body" in
@@ -545,6 +548,17 @@ assert_eq "1" "$HELP_RC" "--help exits 1 (usage-exit convention, matches sweep-l
 "$SCRIPT" bogus-command > /dev/null 2>&1
 BOGUS_RC=$?
 assert_true "$([[ "$BOGUS_RC" -ne 0 ]] && echo true || echo false)" "an unknown command exits non-zero"
+
+# --- (p) LOOM_REPO set -> the repo is addressed in the endpoint PATH, never
+# via `-R` (#9552): `gh api` has no -R flag, so the old splice made both the
+# read and the POST fail and no lease was ever written.
+reset_state
+: > "$STUB_DIR/api-paths.log"
+LOOM_REPO=acme/widget run_script publish 6320 --sweep-id sweep-repo-set
+assert_eq "0" "$RC" "(p) LOOM_REPO set -> exit 0 (publish succeeds)"
+assert_eq "1" "$(post_count)" "(p) LOOM_REPO set: the lease comment was actually posted"
+assert_eq "repos/acme/widget/issues/6320/comments
+repos/acme/widget/issues/6320/comments" "$(cat "$STUB_DIR/api-paths.log")" "(p) LOOM_REPO set: both the read and the POST name the repo in the path"
 
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

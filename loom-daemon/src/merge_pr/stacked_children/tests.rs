@@ -36,6 +36,16 @@ fn only_a_strict_feature_issue_branch_is_a_stackable_parent() {
     assert!(is_stackable_parent_branch("feature/issue-7"));
 }
 
+/// `feature/harness-ops-<N>` (2AMLogic/harness-ops's Builder convention) is a
+/// stackable parent too (2AMLogic/2am#1298, #1396) — the same two-name
+/// allow-list [`super::STACKABLE_PARENT_PREFIXES`] shares with
+/// `reconcile::issue_from_branch`.
+#[test]
+fn a_harness_ops_branch_is_also_a_stackable_parent() {
+    assert!(is_stackable_parent_branch("feature/harness-ops-350"));
+    assert!(is_stackable_parent_branch("feature/harness-ops-7"));
+}
+
 /// The retired anchored regex was `^feature/issue-([0-9]+)$`, and the whole
 /// point of the anchors is that `release-1` / `fix-bug-42` classify as PR-style
 /// rather than issue-style. A `strip_prefix` port is only equivalent if the
@@ -53,6 +63,25 @@ fn a_near_miss_branch_name_is_not_a_stackable_parent() {
         "xfeature/issue-1",
         "feature/issue-1 ",
         "",
+    ] {
+        assert!(
+            !is_stackable_parent_branch(branch),
+            "{branch} must not be treated as a stackable parent"
+        );
+    }
+}
+
+/// The generalized match stays just as strict/anchored on the harness-ops
+/// shape — these near-misses must not slip through the two-name allow-list
+/// (2AMLogic/2am#1298, #1396's T12).
+#[test]
+fn a_harness_ops_near_miss_branch_name_is_not_a_stackable_parent() {
+    for branch in [
+        "feature/harness-ops-",
+        "feature/harness-ops-350-extra",
+        "feature/harness-ops-350/sub",
+        "feature/harness-ops-abc",
+        "feature/other-350",
     ] {
         assert!(
             !is_stackable_parent_branch(branch),

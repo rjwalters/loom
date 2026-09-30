@@ -221,12 +221,15 @@ Verified against a local `clickhouse-local` with a mock `samples_v4` /
 
 ### CI retro queries
 
-`ci-queries.sql` is the standing build/CI retro (#8826): six numbered sections
-over what `loom-daemon ci-telemetry` captures — duration trend, regression
-spotlight, outcome mix, top slow jobs, failed run → logs, and run waterfall.
+`ci-queries.sql` is the standing build/CI retro (#8826): numbered sections over
+what `loom-daemon ci-telemetry` captures — duration trend, regression
+spotlight, outcome mix, top slow jobs, failed run → logs, run waterfall, the
+per-issue ship breakdown, CI time per trigger reason, and (#9089) job queue
+wait, shard imbalance, step timings, slowest suites and suite-level rebalance.
 Sections 1–3 read the `loom.ci.*.duration_ms` histograms (kept 30 days);
-4–6 read the `ci.run` / `ci.job` / `ci.job.log` records (kept 7 days). Bind
-all five parameters once:
+4–10 and 14 read the `ci.run` / `ci.job` / `ci.job.log` records (kept 7
+days); 11–13 read `signoz_traces.signoz_index_v3` (kept 7 days). Bind all five parameters
+once:
 
 ```console
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery --param_since='2026-09-01 00:00:00' --param_repo='' --param_bucket_hours=24 --param_window_hours=168 --param_top=20 < ci-queries.sql
@@ -238,7 +241,12 @@ queries: every log attribute it reads must be in the gateway's **log**
 daemon sends it as (`loom.ci.run_id` is an int, so `attributes_number`), every
 metric label must be a CI histogram label the **datapoint** allowlist keeps,
 and every metric series must be a `.sum` / `.count` series of the two CI
-histograms. Policy and pipeline: [CI observability](../../docs/ci-observability.md).
+histograms. The trace-reading sections (11–13) are guarded separately: their
+attributes must be in the gateway's **span** `keep_keys`, and must be read from
+`attributes_string` only — every OTLP span attribute is a string regardless of
+the type it names, so a subscript into `attributes_number` there would silently
+return 0 on every row instead of erroring. Policy and pipeline:
+[CI observability](../../docs/ci-observability.md).
 
 ### Saved views
 
@@ -258,21 +266,30 @@ histograms. Policy and pipeline: [CI observability](../../docs/ci-observability.
 | CI top slow jobs | Logs Explorer: filter `body = 'ci.job'`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.duration_ms`, `loom.ci.run_id`, `loom.ci.job_id`; sort by `loom.ci.duration_ms` descending; save as view `CI top slow jobs` (`ci-queries.sql` 4) |
 | CI failed run → logs | Logs Explorer: filter `body = 'ci.run' AND loom.ci.conclusion IN ('failure', 'timed_out', 'startup_failure')`, save as `CI failed runs`; take a `loom.ci.run_id`, filter `body = 'ci.job' AND loom.ci.run_id = <id> AND loom.ci.conclusion != 'success'` for its failing jobs, then `loom.ci.job_id = <job id> AND loom.ci.chunk_index EXISTS` sorted by `loom.ci.chunk_index` ascending for the job's log, in order (`ci-queries.sql` 5) |
 | CI run waterfall | Trace Explorer: filter `name = 'loom.ci.run'`, sort by duration descending, open a run; its `loom.ci.job` children are the waterfall, and the longest child against the root's duration is the run/longest-job comparison (`ci-queries.sql` 6) |
+| CI job queue wait | Logs Explorer: filter `body = 'ci.job' AND loom.ci.queued_ms EXISTS`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.queued_ms`; group by `loom.ci.job` with **P50**/**P90**, time range 7 days; **alert when p90 exceeds 60s** — a runner-queue-cap burst shows here long before it shows in the run-level queue segment. A job GitHub reported no `created_at` for contributes no sample, not a zero (`ci-queries.sql` 9) |
+| CI shard balance | Logs Explorer: filter `body = 'ci.job' AND loom.ci.shard.kind != 'none'`, add columns `loom.ci.run_id`, `loom.ci.job`, `loom.ci.shard.index`, `loom.ci.shard.total`, `loom.ci.duration_ms`; group by `loom.ci.run_id`, `loom.ci.shard.kind` — the spread between the slowest and fastest leg of one run is the rebalancing signal. The ranked spread across runs lives in the SQL (`ci-queries.sql` 10) |
+| CI step waterfall | Trace Explorer: open a run as above and expand a `loom.ci.job` child — its `loom.ci.step` children are the within-job waterfall (compile vs. test). For the cross-run view, filter `name = 'loom.ci.step'`, group by `loom.ci.job`, `loom.ci.step` with **P90**, sorted descending (`ci-queries.sql` 11) |
+| CI slowest suites | Trace Explorer: filter `name = 'loom.ci.suite'`, group by `loom.ci.job`, `loom.ci.suite` with **Sum** (and a second query with **P90**), time range 7 days, sorted descending. Add `loom.ci.suite.outcome` / `loom.ci.suite.retried` as filters to separate "slow because it runs twice" from "slow". A suite that did not run in a leg has no span at all, so it never appears here as a fast suite (`ci-queries.sql` 12) |
+| CI suite rebalance | Same filter grouped by `loom.ci.run_id`, `loom.ci.shard.index` with **Sum** — one bar per leg of a run, which is the per-leg suite time a `LOOM_CI_SHARD` split should equalize. `argMax(suite, duration)` per leg (the named suite to move) is SQL-only (`ci-queries.sql` 13). Expect the summed suite time to be **less** than the leg's job wall time (checkout and toolchain setup are steps, not suites) and **more** than the wall time of the step that ran them (suites run concurrently); the comparison that matters is between legs of the same run |
+| CI critical path | Logs Explorer: filter `body = 'ci.job' AND loom.ci.run_id = <id>`, add columns `loom.ci.job`, `loom.ci.queued_ms`, `loom.ci.duration_ms`, and sort by `loom.ci.duration_ms` descending — the leg with the largest queue + running sum is the run's critical path. The `unexplained_s` residual (run wall time minus the run's own queue and that leg's total, i.e. the serialized `needs:` time) requires a run↔job join and is SQL-only (`ci-queries.sql` 14) |
 
-`ci-queries.sql` 7) (#9007's per-issue Builder/CI/Judge/merge breakdown) has no
-row above: it joins `loom_analytics.raw_ship_outcome` against `ci.run` records
-across two logical sources, which is not a single SigNoz Explorer/dashboard
-panel the way sections 1–6 are — it is a `clickhouse-client`-only report, run
-the same way as the rollup's other CT queries.
+`ci-queries.sql` 7) (#9007's per-issue Builder/CI/Judge/merge breakdown) and 8)
+(#9337's CI time per trigger reason) have no row above: 7 joins
+`loom_analytics.raw_ship_outcome` against `ci.run` records across two logical
+sources, which is not a single SigNoz Explorer/dashboard panel the way the
+other sections are — it is a `clickhouse-client`-only report, run the same way
+as the rollup's other CT queries.
 
-The six CI rows are **recreation steps, not yet observed**: no session has had
-an authenticated UI (or API) credential for the trial org since they were
-written, so none of the six has been created there yet
+The twelve CI rows are **recreation steps, not yet observed**: no session has
+had an authenticated UI (or API) credential for the trial org since they were
+written, so none of the twelve has been created there yet
 ([#8946](https://github.com/rjwalters/loom/issues/8946)). Their SQL
 counterparts in `ci-queries.sql` are the executed, verified form — see
 `evidence.md`'s "CI retro queries, executed live" section — and remain the
 acceptance surface until someone with the trial org's login creates the saved
-views and records it.
+views and records it. The six #9089 rows are additionally **unexecuted**:
+sections 9–14 read attributes and spans this change introduces, so no run
+predating it can have produced a row for them.
 
 Save these searches/dashboards through the installed UI and retain sanitized
 exports where supported. These precise steps avoid asserting that mutable

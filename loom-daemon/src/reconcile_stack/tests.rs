@@ -16,6 +16,7 @@ fn prerequisite_tokens_are_distinct_and_greppable() {
         Prerequisite::ParentAncestry,
         Prerequisite::DirtyWorktree,
         Prerequisite::ChildBranch,
+        Prerequisite::InvalidRef,
     ];
     let mut seen = std::collections::BTreeSet::new();
     for p in all {

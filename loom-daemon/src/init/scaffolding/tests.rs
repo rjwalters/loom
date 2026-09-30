@@ -3035,7 +3035,7 @@ fn test_labels_block_range_absent_or_malformed() {
 fn test_merge_labels_block_replaces_marked_range_preserving_outside() {
     // Consumer file: labels above and below a stale Loom block.
     let existing = "- name: team:above\n  color: \"111111\"\n\n# BEGIN LOOM LABELS\n- name: loom:issue\n  color: \"000000\"\n# END LOOM LABELS\n\n- name: team:below\n  color: \"222222\"\n";
-    let merged = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
+    let (merged, _absorbed) = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
 
     // Consumer entries outside the block are byte-preserved.
     assert!(merged.contains("- name: team:above"));
@@ -3052,7 +3052,7 @@ fn test_merge_labels_block_replaces_marked_range_preserving_outside() {
 #[test]
 fn test_merge_labels_block_appends_to_markerless_file() {
     let existing = "- name: team:frontend\n  color: \"00ff00\"\n  description: consumer label\n";
-    let merged = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
+    let (merged, _absorbed) = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
 
     // Every existing entry survives.
     assert!(merged.contains("- name: team:frontend"));

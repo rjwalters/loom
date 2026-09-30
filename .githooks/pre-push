@@ -1,0 +1,10 @@
+#!/bin/sh
+# Pre-push hook: refuse to push any commit that adds a credential-shaped value,
+# whatever its path (#9133). Scans each commit being pushed, not the net diff,
+# so a value added and then deleted on the branch is still caught: history is
+# what gets published. Activate with: git config core.hooksPath .githooks
+SCAN_BIN="${LOOM_DAEMON_SELF_BIN:-loom-daemon}"
+if "$SCAN_BIN" secret-scan --help >/dev/null 2>&1; then
+  exec "$SCAN_BIN" secret-scan --pre-push
+fi
+echo "pre-push: loom-daemon secret-scan unavailable; pushed commits were NOT scanned for credentials (#9133)" >&2

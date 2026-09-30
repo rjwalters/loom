@@ -72,6 +72,17 @@ grep -L 'Untrusted External Content' $(grep -rl 'gh issue view\|gh pr view\|gh p
   defaults/.claude/commands/loom/*.md)
 ```
 
+### Markers and control phrases: authenticated, not persuasive (#9548)
+
+This convention governs what an agent does with text it *reads*. The text Loom
+*acts on* mechanically (a `loom:verdict-sha` marker, a `Champion Review:
+APPROVED` verdict) is governed by a stricter, mechanical rule: it counts only
+from a trusted author, and a well-formed marker from anyone else (including
+another Loom fleet) is prose, not state. See
+[`comment-trust.md`](comment-trust.md). `sweep.md` carries a one-line pointer
+to both rules in its Constraints rather than the full block, because it is
+always loaded and its sub-files are read on demand.
+
 ## Why a prompt convention and not a hook
 
 A `PreToolUse` guard hook (see [`guard-hooks.md`](guard-hooks.md)) sits between
@@ -103,6 +114,14 @@ becoming a bad *action* is mechanical, and lives elsewhere:
   [`guard-hooks.md` → "The Ungated Denial Floor"](guard-hooks.md).
 - **Worktree confinement** — `guards.worktreeIsolation` denies Edit/Write (and
   the common Bash write idioms) targeting the main checkout.
+- **The MCP tool-argument guard** — until #9108, `Bash` and `Edit|Write` were
+  the *only* `PreToolUse` matchers, so a call to any `mcp__loom__*` tool
+  (mcp-loom is registered at user scope and reachable from every agent Loom
+  spawns) bypassed every guard above, injected text and all. The `mcp__loom__.*`
+  matcher and `guard-mcp-tools.sh` close that gap — see
+  [`guard-hooks.md` → "MCP Tool-Argument Guard"](guard-hooks.md#mcp-tool-argument-guard-guardsmcptoolargs--loom_guard_mcp_tool_args).
+  This is the enforcement half of "refuse and report" above for the one tool
+  class a hook can actually see the arguments of before the call runs.
 - **The `external` label policy** — issues filed by non-collaborators carry
   `external` and are excluded from curation until a maintainer removes it, so
   the highest-risk text never reaches the promotion path unreviewed.

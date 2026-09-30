@@ -7,7 +7,8 @@
 //!
 //! Size: target [`TARGET_BYTES`], hard cap [`MAX_BYTES`] (the trace journal's
 //! entry cap). [`Explanation::enforce_cap`] drops `features` first, then the
-//! stage grids, and names what it dropped in `truncated`.
+//! stage grids, then the stage marks, and names what it dropped in
+//! `truncated`.
 
 use super::{AgeSource, Kind, NoEstimateReason, Provenance, Stage, Subject};
 use chrono::{DateTime, Utc};
@@ -24,6 +25,9 @@ pub const TRUNCATED_FEATURES: &str = "features";
 
 /// `truncated[]` entry when the stage grids were dropped.
 pub const TRUNCATED_GRIDS: &str = "stages.distribution.grid";
+
+/// `truncated[]` entry when the stage marks were dropped.
+pub const TRUNCATED_STAGE_MARKS: &str = "result.stage_marks";
 
 /// `truncated[]` entry when every remaining list was dropped (stages,
 /// branches, contributions, history detail) — the last resort that
@@ -251,6 +255,33 @@ pub struct Combination {
     pub independence_assumed: bool,
 }
 
+/// One stage's projected wall-clock times on the simulated path (#9366).
+///
+/// `*_at` is `as_of` plus that percentile of the stage's cumulative entry
+/// time over the simulated paths — the draws `combination` already made, no
+/// new ones. The terminal stage's mark is the path completion time (its
+/// boundary is the estimate itself), so its `p50_at` equals
+/// `EstimateResult.eta_p50_at` exactly. A stage no path visits carries
+/// `None` times, never a fabricated one. `mean_visits` mirrors
+/// [`StageEntry.mean_visits`] so the list is self-contained: a client can
+/// draw the projected timeline from `stage_marks` alone, even after the
+/// grids were dropped to fit the cap.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageMark {
+    /// The stage.
+    pub stage: Stage,
+    /// `as_of` + the entry time's 25th percentile; `None` when no path
+    /// visits the stage.
+    pub p25_at: Option<DateTime<Utc>>,
+    /// `as_of` + the entry time's median; `None` when no path visits.
+    pub p50_at: Option<DateTime<Utc>>,
+    /// `as_of` + the entry time's 75th percentile; `None` when no path
+    /// visits.
+    pub p75_at: Option<DateTime<Utc>>,
+    /// Mean visits per simulated path; `None` when no path visits.
+    pub mean_visits: Option<f64>,
+}
+
 /// The estimate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EstimateResult {
@@ -264,6 +295,14 @@ pub struct EstimateResult {
     pub eta_p50_at: DateTime<Utc>,
     /// Smallest `n` over the path's distributions.
     pub samples_min: usize,
+    /// Projected entry times per stage, in [`Stage::ALL`] order (#9366).
+    ///
+    /// `serde(default)` because the field post-dates the first shipped v1
+    /// payloads: an explanation recorded before it still parses (with an
+    /// empty list), and every new payload carries it — additive, so no
+    /// schema bump.
+    #[serde(default)]
+    pub stage_marks: Vec<StageMark>,
 }
 
 /// What dominates the result, per stage.
@@ -434,8 +473,8 @@ impl Explanation {
     }
 
     /// Enforce [`MAX_BYTES`]: drop `features`, then the stage grids, then
-    /// every remaining list, stopping as soon as the record fits, and
-    /// recording each drop in `truncated`.
+    /// the stage marks, then every remaining list, stopping as soon as the
+    /// record fits, and recording each drop in `truncated`.
     pub fn enforce_cap(&mut self) {
         if self.size_bytes() <= MAX_BYTES {
             return;
@@ -451,6 +490,13 @@ impl Explanation {
             entry.distribution.grid_sec.clear();
         }
         self.truncated.push(TRUNCATED_GRIDS.to_string());
+        if self.size_bytes() <= MAX_BYTES {
+            return;
+        }
+        if let Some(result) = &mut self.result {
+            result.stage_marks.clear();
+        }
+        self.truncated.push(TRUNCATED_STAGE_MARKS.to_string());
         if self.size_bytes() <= MAX_BYTES {
             return;
         }

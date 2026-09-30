@@ -18,9 +18,9 @@
 //!
 //! # The narrowing
 //!
-//! `ci.yml` in `D` still counts as a global-input move — but only for the
-//! components whose own definition the base move actually edited. The mapping
-//! is derived from the tip's `ci.yml` itself, never hand-maintained:
+//! `ci.yml` in a change set still counts as a global-input move — but only for
+//! the components whose own definition that change set actually edited. The
+//! mapping is derived from the workflow's own text, never hand-maintained:
 //!
 //! - lines **outside** the `jobs:` mapping (`on:`, `env:`, `concurrency:`,
 //!   `permissions:`, `defaults:`) affect every component;
@@ -37,26 +37,56 @@
 //! can still be trusted, and a job block the check does not run is not part of
 //! what it read.
 //!
+//! # Both sides, against their own tree
+//!
+//! [`CiScopes`] carries the attribution for `D` **and** `P`. The machinery is
+//! identical; only the tree each patch's new side belongs to differs:
+//!
+//! - `D`'s patch comes from `compare/B...tip`, so its new-side line numbers
+//!   index the **base tip's** `ci.yml`.
+//! - `P`'s patch comes from `pulls/{n}/files`, so its new-side line numbers
+//!   index the **PR head's** `ci.yml`.
+//!
+//! The `P` side matters because the checks the guard judges ran on
+//! `merge(head, B)` — a tree that *already contains* the PR's `ci.yml` edits.
+//! What clause 2 asks is whether the PR changed a **rule** that `main`'s new
+//! files then need re-judging under; if the PR's `ci.yml` hunks land in a job
+//! block that defines no part of gate `C`, then `C`'s rule in the merged tree
+//! is `main`'s own, and `main`'s verdict on `main`'s own files is not this
+//! PR's business (the module header of [`super::inputs`] spells the same
+//! argument out for the `D` side).
+//!
+//! The narrowing is applied only to the two clauses where `ci.yml` can
+//! actually appear on the `P` side — clauses 1 and 2, whose patterns include
+//! `G`. Clauses 3-5 match `P` against `scanned`/`coupled`/`removed`, which is
+//! left deliberately un-narrowed: staying stale more often is the safe
+//! direction.
+//!
 //! # Fail-closed, in every direction
 //!
-//! Everything below answers [`CiScope::Unscoped`] — i.e. "`ci.yml` is a global
-//! input of everything", the pre-#9065 behaviour — the moment it cannot prove
-//! otherwise:
+//! Everything below answers [`CiScope::Unscoped`] for the side it happened on
+//! — i.e. "`ci.yml` is a global input of everything", the pre-#9065 behaviour —
+//! the moment it cannot prove otherwise ("the workflow" below means the tip's
+//! for `D` and the PR head's for `P`; neither side's failure narrows or widens
+//! the other):
 //!
 //! - `ci.yml` was added, removed or renamed rather than `modified`;
-//! - the compare suppressed its patch (too large / binary);
-//! - a hunk header will not parse, or names a line past the tip file's end;
+//! - the API suppressed its patch (too large / binary), or supplied none;
+//! - the workflow itself could not be read or parsed;
+//! - a hunk header will not parse, or names a line past the workflow's end —
+//!   added lines and deletions alike, the latter with one allowance for a
+//!   deletion running to the file's tail (see [`changed_new_lines`]);
 //! - a **deleted** line is structural: a top-level key, a job key, or a
 //!   `# component:` marker. A deletion is attributed by position on the *new*
-//!   side, and a deleted job is not in the tip's map at all, so any structural
-//!   deletion is treated as unattributable rather than guessed at;
+//!   side, and a deleted job is not in the workflow's map at all, so any
+//!   structural deletion is treated as unattributable rather than guessed at;
 //! - any touched line lands outside every job (the preamble);
-//! - a required check's job cannot be located in the tip's workflow, or its
+//! - a required check's job cannot be located in the workflow, or its
 //!   `needs:` closure names a job that is not there;
-//! - the tip's `# component:` markers inside a required job do not name
+//! - the workflow's `# component:` markers inside a required job do not name
 //!   exactly the components [`REQUIRED_CHECKS`] lists for it (see
-//!   [`markers_agree`]) — the case that covers a gate `main` added to a
-//!   required job after this binary was built.
+//!   [`markers_agree`]) — the case that covers a gate added to a required job
+//!   after this binary was built, on either side.
 //!
 //! The narrowing therefore only ever *removes* refusals it can justify from
 //! the workflow's own text, and any doubt restores the old, broader answer.
@@ -65,7 +95,7 @@ use super::evidence::ChangedFile;
 use super::inputs::{CI_WORKFLOW, REQUIRED_CHECKS};
 use std::collections::{BTreeSet, VecDeque};
 
-/// Which components' `ci.yml` inputs a base move touched.
+/// Which components' `ci.yml` inputs one side's change set touched.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum CiScope {
     /// `ci.yml` is a global input of every component — the pre-#9065 behaviour
@@ -78,13 +108,49 @@ pub enum CiScope {
 }
 
 impl CiScope {
-    /// Does a `ci.yml` entry in `D` count as a global-input change for
-    /// `component`?
+    /// Does a `ci.yml` entry in this side's change set count as a global-input
+    /// change for `component`?
     #[must_use]
     pub fn affects(&self, component: &str) -> bool {
         match self {
             Self::Unscoped => true,
             Self::Scoped(set) => set.contains(component),
+        }
+    }
+}
+
+/// The `ci.yml` attribution for **both** sides of the predicate.
+///
+/// The two are computed the same way but against different trees, because the
+/// two patches have different new sides: `D`'s hunks are attributed against the
+/// base tip's workflow (the tree the compare diffs *to*), and `P`'s against the
+/// PR head's workflow (the tree `pulls/{n}/files` diffs *to*). Neither side
+/// narrows the other, and [`Default`] — both [`CiScope::Unscoped`] — is the
+/// pre-#9065 whole-file meaning on both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CiScopes {
+    /// Attribution of the **base move**'s `ci.yml` hunks, against the base
+    /// tip's workflow.
+    pub base: CiScope,
+    /// Attribution of the **PR**'s own `ci.yml` hunks, against the PR head's
+    /// workflow.
+    pub pr: CiScope,
+}
+
+impl CiScopes {
+    /// Both sides unscoped — `ci.yml` as a whole-file global input everywhere,
+    /// which is what every caller with no attribution to offer must pass.
+    #[must_use]
+    pub fn unscoped() -> Self {
+        Self::default()
+    }
+
+    /// A [`CiScopes`] that narrows only the base-move side.
+    #[must_use]
+    pub fn from_base(base: CiScope) -> Self {
+        Self {
+            base,
+            pr: CiScope::Unscoped,
         }
     }
 }
@@ -398,10 +464,12 @@ struct Touched {
     components: BTreeSet<(String, String)>,
 }
 
-/// [`scope_for_patch`] for the `ci.yml` entry of a compare's file list, if it
-/// has one. A base move that did not touch `ci.yml` gets
-/// [`CiScope::Unscoped`], which is inert: `D` holds no `ci.yml` path for the
-/// scope to narrow.
+/// [`scope_for_patch`] for the `ci.yml` entry of a changed-file list, if it has
+/// one. A change set that did not touch `ci.yml` gets [`CiScope::Unscoped`],
+/// which is inert: that side holds no `ci.yml` path for the scope to narrow.
+///
+/// `workflow` must be parsed from the tree the list's patches diff **to** — the
+/// base tip for a compare, the PR head for `pulls/{n}/files`.
 #[must_use]
 pub fn scope_for_files(workflow: &Workflow, files: &[ChangedFile]) -> CiScope {
     let Some(f) = files.iter().find(|f| f.path == CI_WORKFLOW) else {
@@ -538,9 +606,10 @@ fn is_structural(content: &str) -> bool {
 /// The new-side line numbers a unified diff changes: every added line, and —
 /// for a deletion, which has no new-side line of its own — the lines on either
 /// side of the gap it left. `None` when a header will not parse, a body line
-/// carries an unexpected marker, an added line lands past `line_count` (the
-/// patch and the fetched tip do not describe the same file), or nothing at all
-/// was changed.
+/// carries an unexpected marker, a touched line lands past `line_count` (the
+/// patch and the fetched tip do not describe the same file — with the single
+/// exception of a deletion at exactly `line_count + 1`, the file's tail), or
+/// nothing at all was changed.
 fn changed_new_lines(patch: &str, line_count: usize) -> Option<Vec<usize>> {
     let mut out: Vec<usize> = Vec::new();
     let mut cursor: Option<usize> = None;
@@ -567,11 +636,25 @@ fn changed_new_lines(patch: &str, line_count: usize) -> Option<Vec<usize>> {
         } else if line.starts_with('-') {
             // The removed text sat between the previous and the current
             // new-side line; charge both, so a deletion at a block boundary
-            // cannot be attributed to only one side of it. A deletion past the
-            // last line (the file's tail) charges the last line.
-            out.push(pos.min(line_count).max(1));
+            // cannot be attributed to only one side of it.
+            //
+            // `pos == line_count + 1` is the one legitimate off-the-end value:
+            // the removed run reached the old file's end, so it has no
+            // following new-side line and only `pos - 1` exists. The cursor
+            // advances once per new-side line and never on a `-`, so a patch
+            // that describes THIS file can never exceed that. Anything beyond
+            // it means the patch and the fetched tip are different files, and
+            // fails closed exactly as an added line past the end does — the
+            // #9363 review's second note, which found this the one arm of an
+            // otherwise uniformly fail-closed parser that clamped instead.
+            if pos > line_count + 1 {
+                return None;
+            }
+            if pos <= line_count {
+                out.push(pos);
+            }
             if pos > 1 {
-                out.push((pos - 1).min(line_count));
+                out.push(pos - 1);
             }
         } else if line.starts_with(' ') || line.is_empty() {
             cursor = Some(pos + 1);

@@ -1069,9 +1069,15 @@ if [[ "$LOCAL_MODE" != "true" ]]; then
     fi
   fi
 
-  # Fetch latest
+  # Fetch latest.
+  # `--` ends option parsing (#9106): $DEFAULT_BRANCH can come from
+  # `git symbolic-ref refs/remotes/origin/HEAD`, which `git remote set-head -a`
+  # populates from the REMOTE, so it is not guaranteed to be a locally-chosen
+  # name. This script is standalone (it cannot source `check_branch_name` from
+  # a `.loom/` it is in the middle of removing), so `--` is the dependency-free
+  # half of the same mitigation.
   info "Fetching latest changes from origin/${DEFAULT_BRANCH}..."
-  git fetch origin "${DEFAULT_BRANCH}" 2>/dev/null || true
+  git fetch origin -- "${DEFAULT_BRANCH}" 2>/dev/null || true
 
   # Determine base branch ref
   if git show-ref --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}"; then

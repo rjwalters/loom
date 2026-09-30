@@ -13,6 +13,7 @@
 //! `loom:triage` have **no dispatcher order** and are never listed —
 //! [`DispatchPlanContext::scope`] names what the plan covers.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Where a row stands in the plan.
@@ -45,6 +46,8 @@ pub enum PlanGate {
     Ramp,
     /// The saturation admission brake held new admissions.
     Saturation,
+    /// The build back-off (#9410) held new issue builds on review/merge debt.
+    BuildBackoff,
     /// Its own repo was at `maxConcurrentPerRepo`.
     RepoCap,
     /// Outside this host's preferred repo slice while the slice had work.
@@ -100,6 +103,15 @@ pub struct RowPlan {
     pub owning_shard: Option<u32>,
     #[serde(default)]
     pub repo_cap: Option<RepoCapView>,
+    /// When a time-boxed hold clears (Issue #9311): the recheck interval,
+    /// dispatch backoff (including the open-PR-guard-armed subset), no-op
+    /// cooldown, decline cooldown, or PR-less-retry window. `None` for a
+    /// `position`-bearing row (capacity/ramp/repo-cap/out-of-slice deferrals
+    /// name a gate, not a clock) and for every other `blocked` disposition
+    /// this field does not (yet) trace — additive, never a substitute for
+    /// `gate` or `plan_state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_until: Option<DateTime<Utc>>,
 }
 
 /// Admission capacity as of the tick.
@@ -192,5 +204,31 @@ mod tests {
         assert_eq!(serde_json::to_value(PlanState::Next).unwrap(), "next");
         assert_eq!(serde_json::to_value(PlanGate::RepoCap).unwrap(), "repo_cap");
         assert_eq!(serde_json::to_value(PlanGate::OutOfSlice).unwrap(), "out_of_slice");
+    }
+
+    /// `held_until` (Issue #9311) round-trips as RFC-3339 when present, and
+    /// is simply absent from the serialized payload when `None` — the same
+    /// `#[serde(default)]` convention as every other `RowPlan` field, so a
+    /// plan with no held item is byte-identical to pre-#9311 output.
+    #[test]
+    fn held_until_round_trips_and_is_absent_when_none() {
+        let at = "2026-09-29T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let held = RowPlan {
+            held_until: Some(at),
+            ..RowPlan::default()
+        };
+        let value = serde_json::to_value(&held).unwrap();
+        assert_eq!(value["held_until"], "2026-09-29T12:00:00Z");
+        let round_tripped: RowPlan = serde_json::from_value(value).unwrap();
+        assert_eq!(round_tripped.held_until, Some(at));
+
+        let unheld = RowPlan::default();
+        let value = serde_json::to_value(&unheld).unwrap();
+        assert!(
+            value.get("held_until").is_none(),
+            "held_until must be absent when None, not null: {value:?}"
+        );
+        let round_tripped: RowPlan = serde_json::from_value(value).unwrap();
+        assert_eq!(round_tripped.held_until, None);
     }
 }

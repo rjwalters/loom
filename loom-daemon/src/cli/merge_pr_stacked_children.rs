@@ -69,7 +69,7 @@ pub(crate) struct StackedChildrenArgs {
     repo_root: PathBuf,
 
     /// The parent PR's head branch (`$PR_BRANCH`). Anything other than
-    /// `feature/issue-<N>` skips the guard.
+    /// `feature/issue-<N>` or `feature/harness-ops-<N>` skips the guard.
     #[arg(long, value_name = "BRANCH", default_value = "")]
     branch: String,
 

@@ -36,6 +36,18 @@ pub struct CycleSummary {
     /// Wanted job logs left for the next cycle by the per-cycle download cap.
     #[serde(default)]
     pub logs_deferred: usize,
+    /// `loom.ci.suite` spans emitted this cycle (#9089).
+    #[serde(default)]
+    pub suite_spans_emitted: usize,
+    /// Suite-timings artifacts read, parsed and paired with a job this cycle.
+    #[serde(default)]
+    pub suite_records_read: usize,
+    /// Suite-timings artifacts that could NOT be turned into spans — a failed
+    /// download, an unparseable or foreign record, or one whose shard matched
+    /// no unique job. Counted rather than silent: with no counter, "this leg
+    /// emitted no suite spans" and "this leg ran no suites" look identical.
+    #[serde(default)]
+    pub suite_artifact_failures: usize,
     /// Emitted runs also stitched into their issue's story trace (#9088).
     #[serde(default)]
     pub story_runs_stitched: usize,

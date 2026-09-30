@@ -26,6 +26,17 @@ pub enum SpanName {
     /// One job of a GitHub Actions run, parented to its [`Self::CiRun`] span.
     #[serde(rename = "loom.ci.job")]
     CiJob,
+    /// One step of a GitHub Actions job (Issue #9089), parented to its
+    /// [`Self::CiJob`] span. Derived from the `steps[]` array of the jobs
+    /// listing the poller already fetches — no extra API call.
+    #[serde(rename = "loom.ci.step")]
+    CiStep,
+    /// One shell test suite of a sharded job (Issue #9089), parented to its
+    /// [`Self::CiJob`] span. Built from the timings artifact
+    /// `run-ci-suites.sh` uploads — the only surface that carries per-suite
+    /// durations out of a finished runner.
+    #[serde(rename = "loom.ci.suite")]
+    CiSuite,
     /// One work-finder tick (Issue #8860) — its own root trace per tick.
     #[serde(rename = "loom.dispatch.tick")]
     DispatchTick,
@@ -60,6 +71,8 @@ impl SpanName {
             Self::Tool => "loom.tool",
             Self::CiRun => "loom.ci.run",
             Self::CiJob => "loom.ci.job",
+            Self::CiStep => "loom.ci.step",
+            Self::CiSuite => "loom.ci.suite",
             Self::DispatchTick => "loom.dispatch.tick",
             Self::RuntimeUsage => "loom.runtime.usage",
             Self::PoolHold => "loom.pool.hold",
@@ -133,6 +146,22 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.configured_model"
                     | "loom.result"
                     | "loom.failure_class"
+                    | "loom.host.mem_total_bytes"
+                    | "loom.host.mem_available_bytes"
+                    | "loom.host.mem_compressed_bytes"
+                    | "loom.host.swap_total_bytes"
+                    | "loom.host.swap_used_bytes"
+                    | "loom.host.swap_in_bytes_total"
+                    | "loom.host.swap_out_bytes_total"
+                    | "loom.host.oom_kill_total"
+                    | "loom.host.pressure"
+                    | "loom.host.load_per_core"
+                    | "loom.admission.reason"
+                    | "loom.admission.load_per_core"
+                    | "loom.admission.load_threshold"
+                    | "loom.admission.pool"
+                    | "loom.admission.pool_total"
+                    | "loom.admission.unmet_capabilities"
                     | "loom.effort"
                     | "loom.doctor_cycles"
                     | "loom.judge_verdict"

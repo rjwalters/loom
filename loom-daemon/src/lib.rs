@@ -142,6 +142,7 @@ pub mod ci_telemetry;
 pub mod claim_reconciliation;
 pub mod cmd_out;
 pub mod codex_usage;
+pub mod comment_trust;
 pub mod concierge;
 pub mod config_resolver;
 pub mod cpu_headroom;
@@ -181,18 +182,22 @@ pub mod forge_cmd;
 pub mod forge_disable_auto_merge;
 pub(crate) mod forge_etag_store;
 pub mod forge_events;
+pub mod forge_identity;
 pub mod forge_listing;
 pub mod forge_merge_config;
 pub mod forge_merge_method;
 pub mod forge_parser;
+pub mod forge_read_pool;
 pub mod gh_repo_env;
 pub mod git_parser;
 pub mod git_utils;
+pub mod guard_wiring;
 pub mod hard_exclusion;
 pub mod health;
 pub mod health_monitor;
 pub mod host_affinity;
 pub mod host_breaker;
+pub mod host_pressure;
 pub mod idle_exit;
 pub mod inflight;
 pub mod init;
@@ -209,6 +214,7 @@ pub mod launchd_reload;
 pub mod limit_calibration;
 pub mod live_claim;
 pub mod main_health_gate;
+pub mod mcp_tool_guard;
 pub mod merge_pr;
 pub mod metrics_collector;
 pub mod observability;
@@ -231,6 +237,12 @@ pub mod ram_headroom;
 pub mod rate_limit_breaker;
 pub mod reclaim_pr_warning;
 pub mod reconcile_stack;
+/// Ref-operand validation for forge-derived branch names (#9106). A sibling
+/// module rather than a `reconcile_stack::` submodule: the predicate gates
+/// every place a forge ref reaches a `Command` argv, not just the stacked
+/// reconcile, and it is the Rust half of `check_branch_name` in
+/// `defaults/scripts/lib/default-branch.sh`.
+pub mod refname;
 pub mod release_fetch;
 pub mod release_resolve;
 pub mod repo_root;
@@ -254,6 +266,8 @@ pub mod safehouse;
 pub mod safehouse_chatops;
 pub mod scratch_reclaim;
 pub mod script_helpers;
+/// Content scan for credential-shaped values before commit/push (#9133).
+pub mod secret_scan;
 pub mod self_update;
 pub mod serve;
 pub mod shell_budget;
@@ -268,10 +282,23 @@ pub mod stash_retirement;
 /// frozen by the file-size ratchet, and stating the model once is what keeps
 /// the daemon-side budget and the client-side probe budget from drifting.
 pub mod status_budget;
+/// `points:*` story-point size labels (#9432, epic #9429) — the one parser both
+/// telemetry consumers (`sweep.started` at dispatch, `sweep.outcome` at the
+/// terminal transition) resolve points through, including the daemon-side
+/// one-label-per-issue guard.
+pub mod story_points;
 pub mod sweep_journal;
 pub mod sweep_outcome_summary;
 pub mod sweep_outcomes;
 pub mod sweep_registry;
+/// One sweep's token usage *and* the `tokens_status` that explains it (Issue
+/// #9440) — the single resolver both `sweep.outcome` construction sites share,
+/// so a failed, cancelled or watchdog-killed sweep reports its spend exactly
+/// the way a successful one does. A sibling module rather than more code in
+/// [`usage_source`]: this adds a *decision* (measured / not-spawned /
+/// unattributable) on top of that module's reader dispatch, and the two emit
+/// sites must not be able to disagree about it.
+pub mod sweep_usage;
 pub mod tap_usage;
 pub mod target_dir_gc;
 pub mod telemetry;

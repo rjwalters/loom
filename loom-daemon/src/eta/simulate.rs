@@ -14,9 +14,10 @@
 //! [`run_explanation`] rebuilds the whole simulation from an explanation's
 //! fields alone, which is what makes an estimate recomputable offline.
 
-use super::explanation::{Contributions, Explanation};
+use super::explanation::{Contributions, Explanation, StageMark};
 use super::grid;
 use super::{round3, Stage};
+use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
 
 /// SplitMix64: small, fast, and fully specified, so anyone can reproduce a
@@ -74,6 +75,11 @@ pub struct PathSpec {
 pub struct Simulation {
     /// Remaining seconds, `(p25, p50, p75)`.
     pub quantiles: (i64, i64, i64),
+    /// Per-stage cumulative entry-time seconds, `(p25, p50, p75)`, over the
+    /// paths that visit the stage (#9366); `None` for a stage no path
+    /// visits. The terminal stage's samples are the path completion times,
+    /// so its `p50` equals `quantiles.1`.
+    pub entry_marks: [Option<(i64, i64, i64)>; 5],
     /// Fraction of paths visiting each stage.
     pub reached: [f64; 5],
     /// Mean visits per path for each stage.
@@ -82,6 +88,35 @@ pub struct Simulation {
     pub expected_rework_rounds: f64,
     /// What dominates the result.
     pub contributions: Contributions,
+}
+
+impl Simulation {
+    /// The explanation's `stage_marks`: one mark per [`Stage::ALL`] stage,
+    /// in stage order, projected at wall-clock `as_of` (#9366).
+    #[must_use]
+    pub fn stage_marks(&self, as_of: DateTime<Utc>) -> Vec<StageMark> {
+        Stage::ALL
+            .iter()
+            .map(|&stage| {
+                let times = self.entry_marks[stage.index()].map(|(p25, p50, p75)| {
+                    (
+                        Some(as_of + Duration::seconds(p25)),
+                        Some(as_of + Duration::seconds(p50)),
+                        Some(as_of + Duration::seconds(p75)),
+                    )
+                });
+                let (p25_at, p50_at, p75_at) = times.unwrap_or((None, None, None));
+                let mean_visits = self.mean_visits[stage.index()];
+                StageMark {
+                    stage,
+                    p25_at,
+                    p50_at,
+                    p75_at,
+                    mean_visits: (mean_visits > 0.0).then_some(mean_visits),
+                }
+            })
+            .collect()
+    }
 }
 
 /// Why a spec cannot be simulated.
@@ -172,6 +207,7 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     let mut reworks: Vec<u32> = Vec::with_capacity(spec.draws);
     let mut visits = [0_usize; 5];
     let mut visited_paths = [0_usize; 5];
+    let mut entries: [Vec<(f64, usize)>; 5] = Default::default();
 
     for path in 0..spec.draws {
         let mut stage = spec.start;
@@ -192,6 +228,12 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
                 _ => grid::inv_cdf(grid, u),
             };
             first = false;
+            if !seen[stage.index()] {
+                // First visit: the path enters this stage at its running
+                // total so far (#9366). Captured without touching the
+                // generator, so every draw stream is byte-identical.
+                entries[stage.index()].push((total, path));
+            }
             total += duration;
             times[stage.index()] += duration;
             visits[stage.index()] += 1;
@@ -228,14 +270,32 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     }
 
     totals.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let k = spec.draws;
-    let q = |pct: usize| -> i64 {
-        let rank = (pct * k).div_ceil(100).clamp(1, k);
-        totals[rank - 1].0.round() as i64
-    };
-    let quantiles = (q(25), q(50), q(75));
+    let quantiles = nearest_rank3(&totals);
 
-    let draws = k as f64;
+    // The stage every path ends on: the approving verdict when the path
+    // stops there, else `merge_wait`. Its mark is the path completion time —
+    // each path's sample is that path's total, through the same rank math —
+    // so the terminal mark's p50 is the estimate itself, to the second.
+    let terminal = if spec.include_merge {
+        Stage::MergeWait
+    } else {
+        Stage::ReviewWait
+    };
+    let mut entry_marks: [Option<(i64, i64, i64)>; 5] = Default::default();
+    for stage in Stage::ALL {
+        let i = stage.index();
+        let samples: &[(f64, usize)] = if i == terminal.index() {
+            &totals
+        } else {
+            entries[i].sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            &entries[i]
+        };
+        if !samples.is_empty() {
+            entry_marks[i] = Some(nearest_rank3(samples));
+        }
+    }
+
+    let draws = spec.draws as f64;
     let mut reached = [0.0; 5];
     let mut mean_visits = [0.0; 5];
     for i in 0..5 {
@@ -247,11 +307,24 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     let contributions = contributions(&totals, &per_stage, &reworks);
     Ok(Simulation {
         quantiles,
+        entry_marks,
         reached,
         mean_visits,
         expected_rework_rounds,
         contributions,
     })
+}
+
+/// Nearest-rank `(p25, p50, p75)` over sorted `(value, path)` samples,
+/// rounded to whole seconds — the one quantile discipline for the path
+/// totals and the stage-entry marks alike.
+fn nearest_rank3(samples: &[(f64, usize)]) -> (i64, i64, i64) {
+    let k = samples.len();
+    let q = |pct: usize| -> i64 {
+        let rank = (pct * k).div_ceil(100).clamp(1, k);
+        samples[rank - 1].0.round() as i64
+    };
+    (q(25), q(50), q(75))
 }
 
 /// Mean per-stage time over the paths ranked in `[lo, hi)` (fractions of K).
@@ -376,4 +449,15 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
 pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64)> {
     let spec = spec_from_explanation(explanation)?;
     run(&spec).ok().map(|s| s.quantiles)
+}
+
+/// Recompute an explanation's stage marks (#9366) from the same fields
+/// [`run_explanation`] reads — `path`, `current_stage`,
+/// `stages[].distribution.grid_sec`, `stages[0].conditioning`, `branches`,
+/// `combination` — and nothing else. `None` when the explanation carries no
+/// estimate or was truncated.
+#[must_use]
+pub fn run_marks(explanation: &Explanation) -> Option<Vec<StageMark>> {
+    let spec = spec_from_explanation(explanation)?;
+    run(&spec).ok().map(|s| s.stage_marks(explanation.as_of))
 }

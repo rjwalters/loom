@@ -90,7 +90,19 @@ fn print_peer_claims_human(peer_claims: Option<&PeerClaimStatus>) {
         }
     }
     println!(
-        "  counters: advertised={} received={} expired={} dispatch_skipped={}",
-        pc.advertised, pc.received, pc.expired, pc.dispatch_skipped
+        "  counters: advertised={} rejected={} received={} expired={} dispatch_skipped={}",
+        pc.advertised, pc.advertise_rejected, pc.received, pc.expired, pc.dispatch_skipped
     );
+    // Issue #9294: the verdict, not just the numbers. `advertised` counts send
+    // ATTEMPTS; `rejected` tracking it means this host publishes nothing, which
+    // is what a bare counter pair could not say out loud.
+    if pc.coordination.degraded {
+        println!(
+            "  coordination: DEGRADED{}",
+            pc.coordination
+                .reason
+                .as_deref()
+                .map_or_else(String::new, |r| format!(" — {r}"))
+        );
+    }
 }

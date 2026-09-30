@@ -1001,12 +1001,16 @@ impl SweepRegistry {
             // the pool-hold lane (Issue #8001) each have their own dedicated
             // publisher (`publish_peer_cooldown_claim` /
             // `publish_peer_pool_hold_claim`), since each carries a payload
-            // this method's signature has no parameter for.
+            // this method's signature has no parameter for. The PR-less-retry
+            // lane (Issue #9292) does the same, for the same reason — its ad
+            // carries the advertiser's own consecutive tally (see
+            // `publish_peer_prless_release_claim`).
             peer_claims::ClaimKind::Completed
             | peer_claims::ClaimKind::FilingLock
             | peer_claims::ClaimKind::FilingUnlock
             | peer_claims::ClaimKind::NoopCooldownArmed
             | peer_claims::ClaimKind::DispatchBackoffArmed
+            | peer_claims::ClaimKind::PrlessReleaseArmed
             | peer_claims::ClaimKind::PoolHoldArmed
             | peer_claims::ClaimKind::PoolHoldCleared
             | peer_claims::ClaimKind::Heartbeat => return,
@@ -1270,6 +1274,22 @@ impl SweepRegistry {
             return None;
         }
         remaining.to_std().ok().filter(|d| !d.is_zero())
+    }
+
+    /// Absolute dispatch-backoff expiry for `issue` at `now` (Issue #9311), or
+    /// `None` when it may be dispatched immediately. Mirrors
+    /// [`Self::dispatch_backoff_remaining`] but returns the instant itself
+    /// rather than the duration until it — this host's own local window only,
+    /// same scope as [`Self::open_pr_backoff_issues`] (not the fleet-unioned
+    /// [`Self::dispatch_backoff_issues`]): a peer-armed window's expiry is not
+    /// available here.
+    #[must_use]
+    pub fn dispatch_backoff_until(&self, issue: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.dispatch_backoff_config.enabled {
+            return None;
+        }
+        let state = self.dispatch_backoff.get(&issue)?;
+        (state.until > now).then_some(state.until)
     }
 
     /// Consecutive failed dispatch attempts recorded for `issue` (Issue #4485).
@@ -1948,8 +1968,18 @@ impl SweepRegistry {
         //     proceeds, so a `gh` outage can never wedge the daemon. Skipped
         //     entirely when label flips are disabled (test fixtures without
         //     `gh` credentials).
-        if !self.config.skip_label_flip {
-            if let Some(label) = self.first_park_label(issue_number) {
+        //
+        //     The label set this guard reads is ALSO what the #9432 story-point
+        //     resolution below consumes: one REST read, two consumers, no
+        //     second fetch (epic #9429: "read the issue's `points:*` label from
+        //     the issue data the dispatch path already resolves").
+        let dispatch_labels = if self.config.skip_label_flip {
+            None
+        } else {
+            self.current_labels_via_rest(issue_number)
+        };
+        if let Some(labels) = dispatch_labels.as_deref() {
+            if let Some(label) = self.first_park_label_in(issue_number, labels) {
                 log::info!(
                     "issue #{issue_number}: refusing dispatch — the issue carries `{label}`, a \
                      deliberate park that every dispatch route must respect (#4444 park-label \
@@ -1962,6 +1992,21 @@ impl SweepRegistry {
                 .into());
             }
         }
+
+        // 2.71 Story-point size (Issue #9432, epic #9429). Resolved here — from
+        //      the labels step 2.7 just read, never a second forge call — and
+        //      carried on this dispatch's `sweep.global.dispatch` event so
+        //      `sweep.started` telemetry reports the assigned size of the work
+        //      now in flight. Pure label folding: zero forge cost, and a
+        //      stacked/malformed points label is logged loudly and resolves to
+        //      no value rather than to a guess (see `crate::story_points`).
+        //
+        //      `None` here covers "unsized issue", "unreadable/skipped label
+        //      read" and "defective labels" alike — the attribute is simply
+        //      omitted downstream, never emitted as `0`.
+        let story_points = dispatch_labels
+            .as_deref()
+            .and_then(|labels| crate::story_points::resolve_story_points(issue_number, labels));
 
         // 2.75 Noop-cooldown guard (Issue #6917, follow-up to #6670/#6740).
         //      `record_noop_release` (`noop_cooldown.rs`, exposed over IPC as
@@ -2375,6 +2420,7 @@ impl SweepRegistry {
             effort: effort.filter(|e| !e.is_empty()).map(String::from),
             depends_on,
             admission,
+            story_points,
         })))
     }
 
@@ -2410,6 +2456,7 @@ impl SweepRegistry {
             effort,
             depends_on,
             mut admission,
+            story_points,
         } = prepared;
 
         // Issue #4689: the child already died — synchronously observed,
@@ -2627,6 +2674,9 @@ impl SweepRegistry {
             // matching the pattern already used for SweepPhase/Blocker/Exited/
             // Crashed — leave it `None` at construction.
             repo: None,
+            // #9432: the size estimate resolved at step 2.71 from the labels
+            // the park guard already read. Absent for an unsized issue.
+            story_points,
         });
 
         Ok(DispatchOutcome {
@@ -2798,6 +2848,10 @@ impl SweepRegistry {
             runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
             runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
             repo: None,
+            // A `PrSet` dispatch claims no issue (see this method's doc
+            // comment), so there is no `points:*` label to resolve — omitted,
+            // never `0` (#9432).
+            story_points: None,
         });
 
         Ok(DispatchOutcome {

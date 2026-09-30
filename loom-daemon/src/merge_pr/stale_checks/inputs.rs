@@ -40,10 +40,11 @@
 //! - **`G`** — global inputs: the check's own scripts, its baseline / allowlist
 //!   / budget files, and `.github/workflows/ci.yml`. A change to any of these
 //!   can flip the verdict for *every* file. `ci.yml` is the one entry judged
-//!   below whole-file granularity: [`super::workflow_scope`] attributes the
-//!   base move's hunks to the job/component blocks they edit, so a change to a
-//!   job no required context runs is not a global-input move (#9065). Any
-//!   unattributable edit keeps the whole-file meaning.
+//!   below whole-file granularity: [`super::workflow_scope`] attributes **each
+//!   side's** hunks to the job/component blocks they edit — `D`'s against the
+//!   base tip's workflow, `P`'s against the PR head's — so a change to a job no
+//!   required context runs is not a global-input move on that side (#9065). Any
+//!   unattributable edit keeps the whole-file meaning, per side.
 //! - **`S`** — per-file scanned paths: the verdict for each such file depends
 //!   only on that file's own content, plus `G`.
 //! - **`C`** — coupled paths: cross-file aggregates (a SUM over a set) or links
@@ -80,19 +81,45 @@
 //! - Every set is safe to **over**-populate: every clause is monotone in
 //!   `G`, `S` and `C`, so a path listed too broadly can only make the guard
 //!   refuse more often.
+//!
+//! # Gates implemented inside the daemon binary
+//!
+//! Four components (`Shell Budget Ratchet`, `.gitignore Convergence Check`,
+//! `Secret Scan`, `MCP Guard Wiring Contract`) run a `loom-daemon` subcommand
+//! rather than a script. Their `G` used to be `loom-daemon/**`, which nearly
+//! every base move and nearly every PR touches, so they read as stale almost
+//! always and the guard stopped distinguishing anything (PRs #9543/#9544,
+//! 2026-09-29: refused on `cli/forge_action.rs` vs `init/post_init.rs`).
+//!
+//! Each now lists the **source files its verdict can depend on**: the
+//! subcommand's handler, the library module(s) that handler reaches by
+//! following `mod` / `use crate::…` / `loom_daemon::…` / `super::…` paths
+//! transitively, the dispatch chain from `main()` to the handler, and the
+//! build inputs (`Cargo.toml`s, `Cargo.lock`, `rust-toolchain.toml`,
+//! `.cargo/config.toml`, `build.rs`). `daemon_surface_tests.rs` recomputes
+//! that closure from the source on every test run and fails when a checker
+//! starts reaching a file its spec does not list, so the globs grow with the
+//! code instead of silently going stale.
+//!
+//! What these globs deliberately do **not** model is whether the merged tree
+//! still *compiles*: a Rust-level semantic conflict between an unrelated base
+//! move and this PR (a renamed function on one side, a new caller on the
+//! other) fails the build that `Daemon Checks` depends on, and no gate's
+//! input set is the right place to guard that. It is out of scope here; see
+//! the merge-time re-verification follow-up (#9571).
 
-use super::workflow_scope::CiScope;
+use super::workflow_scope::{CiScope, CiScopes};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// `.github/workflows/ci.yml` is a global input to every required context:
 /// it is where the job's steps, its runner and its path filters live.
 ///
 /// It is the **only** `G` entry that is narrowed below the whole file: one
-/// path covers ~25 jobs of which three are required, so #9065 attributes a
-/// base move's `ci.yml` hunks to the job/component blocks they edit (see
-/// [`super::workflow_scope`]) and lets clause 1 fire only for the components
-/// whose own definition moved. Every unattributable edit restores the
-/// whole-file meaning.
+/// path covers ~25 jobs of which three are required, so #9065 attributes each
+/// side's `ci.yml` hunks to the job/component blocks they edit (see
+/// [`super::workflow_scope`]) and lets clauses 1 and 2 fire only for the
+/// components whose own definition moved on that side. Every unattributable
+/// edit restores the whole-file meaning.
 pub const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 
 /// One side's changed-path set — `D` (the base move) or `P` (the PR delta).
@@ -120,8 +147,9 @@ impl FileSet {
     }
 
     /// [`Self::first_match`], optionally treating [`CI_WORKFLOW`] as absent —
-    /// the #9065 narrowing, applied to the `D` side only (see
-    /// [`stale_reason_scoped`]).
+    /// the #9065 narrowing (see
+    /// [`stale_reason_scoped`]), applied to whichever side the caller is
+    /// matching.
     fn first_match_scoped(&self, patterns: &[&str], skip_ci: bool) -> Option<&str> {
         self.paths
             .iter()
@@ -167,6 +195,14 @@ pub struct BaseMove {
 pub struct ScopedEvidence {
     /// `P` — the PR's own delta.
     pub pr_delta: FileSet,
+    /// Which components a `.github/workflows/ci.yml` entry in [`Self::pr_delta`]
+    /// is a global input *for* (#9065), attributed against the **PR head's**
+    /// workflow. [`CiScope::Unscoped`] — the default, and the answer to every
+    /// unattributable edit — is the pre-#9065 whole-file meaning.
+    ///
+    /// One value for the whole PR, not one per context: `P` is a single file
+    /// set read once, unlike `D`, which is keyed on each context's tested base.
+    pub pr_ci_scope: CiScope,
     /// Per required context, the base it tested and the move since.
     pub base_moves: BTreeMap<String, BaseMove>,
     /// Per required context with no `base_moves` entry, why — surfaced as the
@@ -228,34 +264,40 @@ impl std::fmt::Display for StaleReason {
 /// form that narrows it (#9065).
 #[must_use]
 pub fn stale_reason(spec: &CheckSpec, d: &FileSet, p: &FileSet) -> Option<StaleReason> {
-    stale_reason_scoped(spec, d, p, &CiScope::Unscoped)
+    stale_reason_scoped(spec, d, p, &CiScopes::unscoped())
 }
 
-/// [`stale_reason`] with the base move's `ci.yml` attribution (#9065).
+/// [`stale_reason`] with each side's `ci.yml` attribution (#9065).
 ///
-/// The narrowing applies to the **`D` side only**. `D`'s `ci.yml` entry comes
-/// with a patch, so which job blocks moved is a fact readable from the compare;
-/// `P` is read from `pulls/{n}/files` by path alone, so a PR that edits `ci.yml`
-/// keeps the conservative whole-file meaning. That asymmetry is deliberate: the
-/// churn #9065 measured is `main` editing an unrelated job under an open PR,
-/// not the rarer PR that edits the workflow itself.
+/// Both sides are narrowed, each against the tree its own patch's new side
+/// belongs to (see [`CiScopes`]), and each independently: a side with no
+/// attribution to offer stays [`CiScope::Unscoped`], i.e. keeps `ci.yml`'s
+/// whole-file `G` meaning, with no effect on the other.
+///
+/// The `P`-side narrowing reaches **clauses 1 and 2 only** — the two whose
+/// patterns include `G`, and therefore the only two where `P`'s `ci.yml` entry
+/// can match at all. Clauses 3-5 match `P` against `scanned` / `coupled` /
+/// `removed` and are left un-narrowed on that side: over-refusing is the
+/// direction this guard is allowed to err in.
 #[must_use]
 pub fn stale_reason_scoped(
     spec: &CheckSpec,
     d: &FileSet,
     p: &FileSet,
-    ci: &CiScope,
+    ci: &CiScopes,
 ) -> Option<StaleReason> {
     if d.is_empty() {
         // The base has not moved (once validated restamps are discounted), so
         // the tree the check tested IS the tree it will merge onto.
         return None;
     }
-    // When the base move's ci.yml hunks land outside this component's own job
-    // block (and outside everything that job needs), that path is not one of
-    // this check's inputs and must not read as a global-input move.
-    let skip_ci = !ci.affects(spec.context);
-    let d_match = |pats: &[&str]| d.first_match_scoped(pats, skip_ci);
+    // When a side's ci.yml hunks land outside this component's own job block
+    // (and outside everything that job needs), that path is not one of this
+    // check's inputs and must not read as a global-input move.
+    let skip_ci_d = !ci.base.affects(spec.context);
+    let skip_ci_p = !ci.pr.affects(spec.context);
+    let d_match = |pats: &[&str]| d.first_match_scoped(pats, skip_ci_d);
+    let p_match = |pats: &[&str]| p.first_match_scoped(pats, skip_ci_p);
     let any: Vec<&str> = spec
         .global
         .iter()
@@ -266,7 +308,7 @@ pub fn stale_reason_scoped(
 
     // Clause 1: main changed a global input, and the PR has something for that
     // input to re-judge.
-    if let (Some(b), Some(pp)) = (d_match(spec.global), p.first_match(&any)) {
+    if let (Some(b), Some(pp)) = (d_match(spec.global), p_match(&any)) {
         return Some(StaleReason {
             clause: "the base move changed a global input of this check",
             base_path: Some(b.to_string()),
@@ -275,7 +317,7 @@ pub fn stale_reason_scoped(
     }
     // Clause 2: the PR changed a global input, and main has something for it
     // to re-judge.
-    if let (Some(pp), Some(b)) = (p.first_match(spec.global), d_match(&any)) {
+    if let (Some(pp), Some(b)) = (p_match(spec.global), d_match(&any)) {
         return Some(StaleReason {
             clause: "this PR changes a global input of this check and the base moved under it",
             base_path: Some(b.to_string()),
@@ -286,7 +328,7 @@ pub fn stale_reason_scoped(
     if let Some(shared) = d
         .paths
         .iter()
-        .filter(|path| !(skip_ci && path.as_str() == CI_WORKFLOW))
+        .filter(|path| !(skip_ci_d && path.as_str() == CI_WORKFLOW))
         .find(|path| {
             p.paths.contains(*path) && spec.scanned.iter().any(|pat| glob_match(pat, path))
         })
@@ -312,7 +354,7 @@ pub fn stale_reason_scoped(
         if let (Some(b), Some(pp)) = (
             d.removed
                 .iter()
-                .find(|path| !(skip_ci && path.as_str() == CI_WORKFLOW)),
+                .find(|path| !(skip_ci_d && path.as_str() == CI_WORKFLOW)),
             p.first_match(spec.coupled).map(str::to_string),
         ) {
             return Some(StaleReason {
@@ -374,7 +416,7 @@ pub fn composite_stale_reason(
     components: &[&'static CheckSpec],
     d: &FileSet,
     p: &FileSet,
-    ci: &CiScope,
+    ci: &CiScopes,
 ) -> Option<(&'static str, StaleReason)> {
     components
         .iter()
@@ -480,7 +522,12 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
     },
     RequiredCheck {
         context: "Daemon Checks",
-        components: &["Shell Budget Ratchet", ".gitignore Convergence Check"],
+        components: &[
+            "Shell Budget Ratchet",
+            ".gitignore Convergence Check",
+            "Secret Scan",
+            "MCP Guard Wiring Contract",
+        ],
     },
 ];
 
@@ -510,15 +557,33 @@ pub const SPECS: &[CheckSpec] = &[
     },
     // `loom-daemon shell-budget --check` — the measuring logic is Rust, and
     // the allowlist supplies each script's category.
+    //
+    // Rust surface: the handler (`cli/shell_budget.rs`), the `shell_budget`
+    // module tree it calls, and the binary's top-level subcommand registry —
+    // the handler reads `crate::Cli`'s subcommand names to validate
+    // `Shell-Budget-Callout:` trailers, so `main.rs` and every enum it
+    // `#[command(flatten)]`s (`cli/telemetry.rs`, `cli/script_ports.rs`,
+    // `cli/dep_classify.rs`) are inputs too. MUST grow if the checker starts
+    // using another module — `daemon_surface_tests.rs` fails until it does.
     CheckSpec {
         context: "Shell Budget Ratchet",
         global: &[
-            "loom-daemon/**",
+            "loom-daemon/src/cli/shell_budget.rs",
+            "loom-daemon/src/shell_budget.rs",
+            "loom-daemon/src/shell_budget/**",
+            "loom-daemon/src/main.rs",
+            "loom-daemon/src/daemon_service.rs",
+            "loom-daemon/src/cli/script_ports.rs",
+            "loom-daemon/src/cli/telemetry.rs",
+            "loom-daemon/src/cli/dep_classify.rs",
             "scripts/shell-allowlist.txt",
             "scripts/shell-budget-baseline.txt",
             "Cargo.toml",
             "Cargo.lock",
             "rust-toolchain.toml",
+            ".cargo/config.toml",
+            "loom-daemon/Cargo.toml",
+            "loom-daemon/build.rs",
             CI_WORKFLOW,
         ],
         scanned: SHELL,
@@ -685,18 +750,107 @@ pub const SPECS: &[CheckSpec] = &[
         removal_sensitive: true,
     },
     // `.gitignore` against EPHEMERAL_PATTERNS, which lives in Rust.
+    //
+    // Rust surface: `update-gitignore`'s handler in `cli/misc_cmds.rs` calls
+    // `loom_daemon::init::update_gitignore` (`init/post_init.rs`, which owns
+    // EPHEMERAL_PATTERNS). The whole `init` module tree is listed, plus the
+    // modules its production code reaches (`agent_skills`, `proc_exec`,
+    // `self_update`), and the dispatch chain. MUST grow if the checker
+    // starts using another module — `daemon_surface_tests.rs` fails until it
+    // does. The script also runs `scripts/cargo-target-dir.sh`.
     CheckSpec {
         context: ".gitignore Convergence Check",
         global: &[
             "scripts/check-gitignore-convergence.sh",
-            "loom-daemon/**",
+            "scripts/cargo-target-dir.sh",
+            "loom-daemon/src/cli/misc_cmds.rs",
+            "loom-daemon/src/init/**",
+            "loom-daemon/src/agent_skills.rs",
+            "loom-daemon/src/proc_exec.rs",
+            "loom-daemon/src/self_update.rs",
+            "loom-daemon/src/main.rs",
+            "loom-daemon/src/daemon_service.rs",
             "Cargo.toml",
             "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            "loom-daemon/Cargo.toml",
+            "loom-daemon/build.rs",
             CI_WORKFLOW,
         ],
         scanned: &[],
         coupled: &[".gitignore"],
         removal_sensitive: false,
+    },
+    // Scans the commits in `base..head` by revision (#9133), so like the
+    // version-bump check it depends on the PR's own commits alone; `main`
+    // moving can only make it stale through the scanner or its allowlist.
+    //
+    // Rust surface: the handler (`cli/secret_scan_cmd.rs`), the self-contained
+    // `secret_scan` module (std + external crates only), and the dispatch
+    // chain through `cli/script_ports.rs`. MUST grow if the checker starts
+    // using another module — `daemon_surface_tests.rs` fails until it does.
+    CheckSpec {
+        context: "Secret Scan",
+        global: &[
+            "loom-daemon/src/cli/secret_scan_cmd.rs",
+            "loom-daemon/src/secret_scan.rs",
+            "loom-daemon/src/secret_scan/**",
+            "loom-daemon/src/main.rs",
+            "loom-daemon/src/daemon_service.rs",
+            "loom-daemon/src/cli/script_ports.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            "loom-daemon/Cargo.toml",
+            "loom-daemon/build.rs",
+            ".loom/secret-scan-allow",
+            CI_WORKFLOW,
+        ],
+        scanned: &[],
+        coupled: &[],
+        removal_sensitive: false,
+    },
+    // `loom-daemon check-guard-wiring` (#9108) — asserts the `mcp__loom__.*`
+    // PreToolUse matcher is wired in BOTH `.claude/settings.json` and the
+    // installer's `_PHOOK_*` arrays, routes through `hook-wiring.sh`, and
+    // carries the fail-closed broken-install floor. Its whole subject is the
+    // relationship BETWEEN those three files plus the hook they name, so they
+    // are `coupled`, not `scanned`: a settings edit on one side and an
+    // installer edit on the other is exactly the combination that can open the
+    // hole while each side looks fine alone. `removal_sensitive` because
+    // deleting the hook file is one of the four violations.
+    //
+    // Rust surface: the handler (`cli/check_guard_wiring.rs`), the
+    // self-contained `guard_wiring` module, and the dispatch chain through
+    // `cli/script_ports.rs`. MUST grow if the checker starts using another
+    // module — `daemon_surface_tests.rs` fails until it does.
+    CheckSpec {
+        context: "MCP Guard Wiring Contract",
+        global: &[
+            "loom-daemon/src/cli/check_guard_wiring.rs",
+            "loom-daemon/src/guard_wiring.rs",
+            "loom-daemon/src/guard_wiring/**",
+            "loom-daemon/src/main.rs",
+            "loom-daemon/src/daemon_service.rs",
+            "loom-daemon/src/cli/script_ports.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            "loom-daemon/Cargo.toml",
+            "loom-daemon/build.rs",
+            CI_WORKFLOW,
+        ],
+        scanned: &[],
+        coupled: &[
+            ".claude/settings.json",
+            "defaults/.claude/settings.json",
+            "scripts/install/provision-hooks.sh",
+            "defaults/hooks/guard-mcp-tools.sh",
+        ],
+        removal_sensitive: true,
     },
     // Its ONLY input is its own script: it diffs `merge-base(base, head)..head`
     // by git revision (the full-history checkout has both), so it depends on the PR's own
@@ -780,3 +934,6 @@ fn wildcard_match(pat: &str, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod daemon_surface_tests;

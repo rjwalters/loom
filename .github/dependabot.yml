@@ -1,5 +1,15 @@
 version: 2
 
+# Security-update routing only (`renovate.json5` owns scheduled version
+# updates). Every entry below sets `open-pull-requests-limit: 0`, which stops
+# Dependabot from opening its own weekly version-bump PRs — those would
+# duplicate Renovate's — while leaving Dependabot's *security*-update PRs
+# (driven by the repo's vulnerability alerts, independent of any schedule)
+# fully enabled. GitHub's security-update path reuses the labels/directory
+# config from a matching entry here even when that entry's own version
+# updates are capped at zero, which is exactly why this file is kept rather
+# than deleted outright.
+#
 # Every ecosystem below applies `loom:review-requested` in addition to its own
 # labels. That is not cosmetic — it is what keeps a Dependabot PR OUT of the
 # Judge's fallback queue (#5455).
@@ -49,6 +59,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
     labels:
       - "dependencies"
       - "loom:review-requested"
@@ -65,6 +76,7 @@ updates:
     directory: "/mcp-loom"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
     labels:
       - "dependencies"
       - "loom:review-requested"
@@ -78,6 +90,7 @@ updates:
     directory: "/dashboard"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
     labels:
       - "dependencies"
       - "loom:review-requested"
@@ -91,6 +104,7 @@ updates:
     directory: "/dashboard/web"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
     labels:
       - "dependencies"
       - "loom:review-requested"
@@ -104,6 +118,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
     labels:
       - "dependencies"
       - "loom:review-requested"
@@ -117,6 +132,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
     labels:
       - "dependencies"
       - "loom:review-requested"

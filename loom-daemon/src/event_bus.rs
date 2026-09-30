@@ -40,6 +40,7 @@
 //! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, disk_headroom, ram_headroom, token_axis_limit, message}` |
 //! | `daemon.preflight.advisory` | Daemon reaper (`SweepRegistry`) | `{workspace_root, consecutive_deaths, marker, message}` |
 //! | `forge.event` | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
+//! | `operator_priority.escalation` | Star-liveness pass (#9321) | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally
 //! pinned. The four `epic.issue.{N}.*` topics were authorized by **#3873**
@@ -102,6 +103,26 @@
 //! — it never carries a payload field into a decision — which is how the
 //! "never drive an external write without a forge-verified re-read" condition
 //! below is satisfied structurally: the early tick *is* the loop's own re-read.
+//!
+//! The `operator_priority.escalation` topic was authorized by **#9321** (the
+//! delivery half of #9244/#9301) so a starred issue's operator ask reaches the
+//! human in the team's Matrix room, not only as a forge comment nobody reads in
+//! time (the #9268 failure mode: four agents commented for seven hours). Publisher:
+//! [`crate::star_liveness`]'s liveness pass
+//! ([`crate::types::Event::OperatorPriorityEscalation`]); consumer: the
+//! Safehouse narration sink, which renders it as a `handoff` envelope into the
+//! `Signal` attention room.
+//!
+//! It is emitted on a **state change**, the same dedup discipline as the three
+//! `*.advisory` topics above, but keyed rather than boolean: exactly once per
+//! `(repo, issue, <kind>:<specifics>)` dedupe key, and **only on the pass that
+//! actually posts that key's forge escalation comment**. That coupling is what
+//! makes the once-per-cause property fleet-wide rather than per-host — the
+//! forge marker is the shared lock, so a peer host that finds the comment
+//! already posted publishes nothing, and neither does a restarted daemon. A
+//! second event with `resolved: true` fires once when the key's ask clears
+//! (emitted by the host that announced it; a host that restarts in between
+//! simply does not narrate the recovery, which loses a nicety, never an ask).
 //!
 //! **`Generic`-topic rule.** A `Generic` topic is allowed only while it (a) is
 //! listed in this inventory, (b) carries a `source` field naming its producing
@@ -711,6 +732,7 @@ mod tests {
         // The Event::SweepGlobalDispatch helper must produce
         // `sweep.global.dispatch` regardless of SweepKind contents.
         let ev = Event::SweepGlobalDispatch {
+            story_points: None,
             sweep_id: "sweep-issue-42-1".to_string(),
             kind: SweepKind::Issue(42),
             runtime: None,

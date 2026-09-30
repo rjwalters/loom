@@ -1,5 +1,5 @@
 {
- "_comment": "Recorded-shape GitHub REST fixture for loom-daemon ci_telemetry tests (#8824): a synthetic org with 2 active repos x 3 completed runs x 4 jobs, plus one archived repo that must never be polled. Keys are request paths with the `created` watermark query parameter removed; `next` mirrors the Link rel=next header. Run k of each repo lasts k*60s; job j lasts j*10s. Job logs (#8825) live under `job_logs`, keyed by the same request path shape: `text` is served verbatim (BOM included, exactly as GitHub's text/plain job-log response arrives), `repeat` builds a large log without committing megabytes, and `status` forces a failure. A job with no entry gets a one-line synthesized log. Neither credential-shaped string below is real: they exist to prove the daemon forwards what GitHub sent, because the gateway is the redaction boundary. Beta's three runs carry a `head_commit` (#9337 trigger attribution: an ordinary subject, the #8508 re-date subject, and a merge-from-main subject); alpha's deliberately do not, proving an absent `head_commit` still deserializes.",
+ "_comment": "Recorded-shape GitHub REST fixture for loom-daemon ci_telemetry tests (#8824): a synthetic org with 2 active repos x 3 completed runs x 4 jobs, plus one archived repo that must never be polled. Keys are request paths with the `created` watermark query parameter removed; `next` mirrors the Link rel=next header. Run k of each repo lasts k*60s; job j lasts j*10s. Job logs (#8825) live under `job_logs`, keyed by the same request path shape: `text` is served verbatim (BOM included, exactly as GitHub's text/plain job-log response arrives), `repeat` builds a large log without committing megabytes, and `status` forces a failure. A job with no entry gets a one-line synthesized log. Neither credential-shaped string below is real: they exist to prove the daemon forwards what GitHub sent, because the gateway is the redaction boundary. Beta's three runs carry a `head_commit` (#9337 trigger attribution: an ordinary subject, the #8508 re-date subject, and a merge-from-main subject); alpha's deliberately do not, proving an absent `head_commit` still deserializes. Two alpha jobs carry a `steps[]` array (#9089 step spans): 10012 (four steps, all with timestamps) and 10034 (a failing step followed by one the job never reached, which has neither timestamp and must therefore produce no span); every other job has no `steps[]` at all, proving a pre-#9089 recording still deserializes. Alpha run 1001 additionally has an artifacts listing (#9089 suite spans) naming one `ci-suite-timings-2` record, one unrelated artifact that must never be downloaded, and one expired timings artifact that must be skipped; the downloadable artifact bodies live under `artifacts`, keyed by artifact name.",
  "job_logs": {
   "repos/fixture-org/alpha/actions/jobs/10011/logs": {
    "text": "﻿2026-09-20T09:00:10.1000000Z Current runner version: '2.337.0'\n2026-09-20T09:00:10.2000000Z ##[group]Run actions/checkout@v7\n2026-09-20T09:00:11.0000000Z   with:\n2026-09-20T09:00:11.1000000Z     token: ghp_FIXTUREAAAAAAAAAAAAAAAAAAAAAAAAAAA\n2026-09-20T09:00:11.2000000Z ##[endgroup]\n2026-09-20T09:00:12.0000000Z ##[group]Run cargo test --workspace\n2026-09-20T09:00:40.0000000Z test result: ok. 412 passed; 0 failed\n2026-09-20T09:00:41.0000000Z ##[error]Process completed with exit code 1.\n"
@@ -63,15 +63,50 @@
      {
       "completed_at": "2026-09-20T09:00:30Z",
       "conclusion": "success",
+      "created_at": "2026-09-20T09:00:05Z",
       "id": 10012,
       "labels": [
        "ubuntu-latest"
       ],
-      "name": "job-2",
+      "name": "Shell Test Suites (hermetic, 2/2)",
       "run_attempt": 1,
       "run_id": 1001,
       "started_at": "2026-09-20T09:00:10Z",
-      "status": "completed"
+      "status": "completed",
+      "steps": [
+       {
+        "completed_at": "2026-09-20T09:00:12Z",
+        "conclusion": "success",
+        "name": "Set up job",
+        "number": 1,
+        "started_at": "2026-09-20T09:00:10Z",
+        "status": "completed"
+       },
+       {
+        "completed_at": "2026-09-20T09:00:28Z",
+        "conclusion": "success",
+        "name": "Run shell suites",
+        "number": 2,
+        "started_at": "2026-09-20T09:00:12Z",
+        "status": "completed"
+       },
+       {
+        "completed_at": "2026-09-20T09:00:28Z",
+        "conclusion": "skipped",
+        "name": "Upload retry log",
+        "number": 3,
+        "started_at": "2026-09-20T09:00:28Z",
+        "status": "completed"
+       },
+       {
+        "completed_at": "2026-09-20T09:00:30Z",
+        "conclusion": "success",
+        "name": "Complete job",
+        "number": 4,
+        "started_at": "2026-09-20T09:00:28Z",
+        "status": "completed"
+       }
+      ]
      }
     ],
     "total_count": 4
@@ -229,7 +264,25 @@
       "run_attempt": 1,
       "run_id": 1003,
       "started_at": "2026-09-20T11:00:10Z",
-      "status": "completed"
+      "status": "completed",
+      "steps": [
+       {
+        "completed_at": "2026-09-20T11:00:50Z",
+        "conclusion": "failure",
+        "name": "Run the failing thing",
+        "number": 1,
+        "started_at": "2026-09-20T11:00:10Z",
+        "status": "completed"
+       },
+       {
+        "completed_at": null,
+        "conclusion": null,
+        "name": "Never reached",
+        "number": 2,
+        "started_at": null,
+        "status": "queued"
+       }
+      ]
      }
     ],
     "total_count": 4
@@ -572,6 +625,33 @@
     ]
    },
    "status": 200
+  },
+  "repos/fixture-org/alpha/actions/runs/1001/artifacts?per_page=100": {
+   "body": {
+    "artifacts": [
+     {
+      "id": 5001,
+      "expired": false,
+      "name": "build-daemon"
+     },
+     {
+      "id": 5002,
+      "expired": false,
+      "name": "ci-suite-timings-2"
+     },
+     {
+      "id": 5003,
+      "expired": true,
+      "name": "ci-suite-timings-9"
+     }
+    ]
+   }
+  }
+ },
+ "artifacts": {
+  "ci-suite-timings-2": {
+   "file": "ci-suite-timings.json",
+   "text": "{\n  \"schema\": \"loom.ci.suite-timings/1\",\n  \"run_id\": \"1001\",\n  \"run_attempt\": \"1\",\n  \"branch\": \"main\",\n  \"shard\": \"2/2\",\n  \"total_duration_s\": 20,\n  \"suites\": [\n    {\n      \"suite\": \"test-alpha-fast.sh\",\n      \"outcome\": \"pass\",\n      \"started_at_epoch\": 1789894810,\n      \"ended_at_epoch\": 1789894812,\n      \"retried\": false\n    },\n    {\n      \"suite\": \"test-alpha-slow.sh\",\n      \"outcome\": \"pass\",\n      \"started_at_epoch\": 1789894812,\n      \"ended_at_epoch\": 1789894830,\n      \"retried\": true\n    },\n    {\n      \"suite\": \"test-alpha-broken.sh\",\n      \"outcome\": \"fail\",\n      \"started_at_epoch\": 1789894820,\n      \"ended_at_epoch\": 1789894825,\n      \"retried\": true\n    },\n    {\n      \"suite\": \"test-alpha-guarded.sh\",\n      \"outcome\": \"skip\",\n      \"started_at_epoch\": 0,\n      \"ended_at_epoch\": 0,\n      \"retried\": false\n    },\n    {\n      \"suite\": \"test-alpha-fast.sh\",\n      \"outcome\": \"pass\",\n      \"started_at_epoch\": 1789894810,\n      \"ended_at_epoch\": 1789894811,\n      \"retried\": false\n    },\n    {\n      \"suite\": \"test-alpha-skewed.sh\",\n      \"outcome\": \"pass\",\n      \"started_at_epoch\": 1789894740,\n      \"ended_at_epoch\": 1789895100,\n      \"retried\": false\n    }\n  ]\n}\n"
   }
  }
 }

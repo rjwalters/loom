@@ -68,6 +68,19 @@ pub(crate) enum ScriptPortCommand {
     /// flattened enum is what keeps a new top-level subcommand free.
     ShellBudget(super::shell_budget::ShellBudgetArgs),
 
+    /// Seed and evaluate the ETA estimators (#9325, Phase 2 of #9289).
+    ///
+    /// `eta backfill` populates the stage-sample journal from `pr-latency`
+    /// history so the heuristics have a baseline on day one; `eta backtest`
+    /// replays a heuristic against real outcomes leak-free and scores it.
+    ///
+    /// Not a script port either: it lives here for the same
+    /// frozen-`main.rs` reason as `shell-budget` above, which is also what
+    /// keeps `eta` a real nested subcommand (`loom-daemon eta backfill`,
+    /// not a flattened top-level `backfill`) at zero cost to `main.rs`.
+    #[command(subcommand)]
+    Eta(super::eta_cmd::EtaCommand),
+
     /// `merge-pr.sh`'s closing-reference / partial-increment analysis (#8191,
     /// slice 1). Reads the PR body on stdin — it is untrusted external content
     /// and routinely tens of kilobytes, so it does not belong in argv.
@@ -174,6 +187,37 @@ pub(crate) enum ScriptPortCommand {
     /// the base from discarding an open PR's only local trace (#8147/#8190).
     /// Exit 0 always; one line, four tokens.
     WorktreeStaleRef(super::worktree_stale_ref::WorktreeStaleRefArgs),
+
+    /// `worktree.sh`'s CLOSED-UNMERGED arm (#9083): the third state a pushed
+    /// `origin/feature/issue-N` can be in, next to the open-PR (#4823/#7765)
+    /// and merged-PR (#5657) arms that already had answers. A tip that is the
+    /// head of a PR closed WITHOUT merging carries work somebody decided not
+    /// to take, and reusing it silently seeded a worktree with a reverted
+    /// slice plus a rejected follow-up, tens of commits behind `main` (the
+    /// #8195 incident). Exit 0 = proceed and reuse as before, 1 = refuse; every
+    /// inability to decide is 0, because a forge outage must never block
+    /// worktree creation.
+    WorktreeClosedPrBranch(super::worktree_closed_pr_branch::WorktreeClosedPrBranchArgs),
+    /// `worktree.sh`'s `--sparse <paths...>` / `--full` family (#8195 slice
+    /// 10), on both arms it reaches: after `git worktree add --no-checkout`,
+    /// and the "worktree already exists" re-configure early exit. Retires a
+    /// silent exit 128 on any cone git rejects, an unescaped cone-to-JSON
+    /// builder, and a `git worktree list | grep -q` substring registration
+    /// check that could disagree with the orphan guard about the same
+    /// directory. Exit 0 applied, 1 refused/failed, 2 could not run.
+    WorktreeSparse(super::worktree_sparse::WorktreeSparseArgs),
+
+    /// `worktree.sh`'s in-worktree predicate and both decisions it gated
+    /// (#8195 slice 11): the `--check` verb, and the create path's
+    /// auto-navigation out of a worktree. The retired
+    /// `[[ "$(git rev-parse --git-common-dir)" != "$(git rev-parse
+    /// --show-toplevel)/.git" ]]` compared a path git answers RELATIVELY
+    /// against an absolute one, so it was constant-true from every position a
+    /// caller can stand in: `--check` reported the primary clone as a worktree
+    /// and its exit 1 was dead code, and every `worktree.sh <N>` printed four
+    /// spurious navigation lines. Exit 0/1 are the verb's two answers;
+    /// `--porcelain` (the create arm's record stream) is always 0.
+    WorktreeCheck(super::worktree_check::WorktreeCheckArgs),
 
     /// `claude-wrapper.sh`'s retry/rotation classifiers (#8037): retry vs give
     /// up, rotate, mark a credential dead, and the backoff curve. Exit 0 when
@@ -300,6 +344,24 @@ pub(crate) enum ScriptPortCommand {
     /// logic, native from the start per the shell-language policy.
     CheckStaleBlocked(super::stale_blocked::StaleBlockedArgs),
 
+    /// The `PreToolUse` decision for the `mcp__loom__*` tool namespace (#9108),
+    /// behind the `defaults/hooks/guard-mcp-tools.sh` hook entry. Reads the
+    /// hook payload on stdin, prints a deny document or nothing, and **always
+    /// exits 0**. Not a port: brand-new logic, native from the start per the
+    /// shell-language policy — MCP tool calls were the one tool class outside
+    /// every `PreToolUse` matcher.
+    GuardMcpTools(super::guard_mcp_tools::GuardMcpToolsArgs),
+
+    /// The `PreToolUse` matcher-coverage contract for that guard (#9108): the
+    /// `mcp__loom__.*` matcher exists in `.claude/settings.json` AND in the
+    /// installer's `_PHOOK_*` arrays, its entry routes through
+    /// `hook-wiring.sh`, and it carries the same fail-closed broken-install
+    /// floor the `Bash` / `Edit|Write` entries carry. Exit 1 on any violation.
+    /// Not a port of working shell: the check's first cut lived inside
+    /// `contract`-category `check-guard-scan-contracts.sh`, which the
+    /// shell-language policy and the #7810 shell-budget gate both send here.
+    CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
+
     /// Per-segment PR latency, derived live from the forge timeline (#8923):
     /// review-queue wait, approval path, `loom:pr`→merged **split by operator
     /// gate**, Doctor response, and verdict invalidations — plus the live queue
@@ -327,6 +389,32 @@ pub(crate) enum ScriptPortCommand {
     /// new points check moved here, to keep the #7810 `shell-budget` gate a
     /// non-event for this addition.
     CheckPointsMarker(super::points_marker_check::CheckPointsMarkerArgs),
+
+    /// Refuse content carrying a credential shape — a Claude OAuth/API key,
+    /// GitHub/Tailscale/Slack token, AWS key id, private key — whatever its
+    /// path (#9133). Backs the `guard-loom-workflow.sh` commit/push check,
+    /// `.githooks/pre-commit`/`pre-push`, and the CI scan. Never prints a
+    /// value, only path, class and sha256[:8]. Exit 0 clean, 1 found, 2 could
+    /// not scan. Not a port: new logic, native per the shell-language policy.
+    SecretScan(super::secret_scan_cmd::SecretScanArgs),
+
+    /// The close-triggered `loom:blocked` re-check (#9102, item 2 of #8927's
+    /// deferred fix list): given `--closed <N>...` (the merged PR plus every
+    /// issue it closed), comments on each open `loom:blocked` issue/PR that
+    /// cites one of them as a blocker and now classifies stale. Reuses
+    /// `check-stale-blocked`'s enumeration and the `dep_recheck` parsers.
+    /// Called from `merge-pr.sh`'s post-merge path. Unlike
+    /// `CheckStaleBlocked` it WRITES (a comment, never a label); `--dry-run`
+    /// previews. Always exits 0.
+    NotifyClearedBlockers(super::notify_cleared_blockers::NotifyClearedBlockersArgs),
+    /// `sync-labels.sh`'s duplicate-declared-name scan (#8875): a
+    /// `labels.yml` that carries two `- name:` entries for the same label
+    /// (the pre-#4187-upgrade shape `merge_labels_block` now absorbs on
+    /// install) is structural drift in the file itself, independent of
+    /// forge state. Ported out of the `contract`-category script per the
+    /// shell language policy. Prints each duplicated name once, in file
+    /// order.
+    LabelDuplicates(super::label_duplicates::LabelDuplicatesArgs),
 }
 
 impl ScriptPortCommand {
@@ -344,6 +432,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
+            ScriptPortCommand::Eta(cmd) => cmd.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::CargoTargetDir(cmd) => cmd.run(),
@@ -356,6 +445,9 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeSubmodules(args) => args.run(),
             ScriptPortCommand::WorktreeUpstream(args) => args.run(),
             ScriptPortCommand::WorktreeStaleRef(args) => args.run(),
+            ScriptPortCommand::WorktreeClosedPrBranch(args) => args.run(),
+            ScriptPortCommand::WorktreeSparse(args) => args.run(),
+            ScriptPortCommand::WorktreeCheck(args) => args.run(),
             ScriptPortCommand::RetryClassify(cmd) => cmd.run(),
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
@@ -372,9 +464,14 @@ impl ScriptPortCommand {
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
+            ScriptPortCommand::GuardMcpTools(args) => args.run(),
+            ScriptPortCommand::CheckGuardWiring(args) => args.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
+            ScriptPortCommand::SecretScan(args) => args.run(),
+            ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
+            ScriptPortCommand::LabelDuplicates(args) => args.run(),
         }
     }
 }

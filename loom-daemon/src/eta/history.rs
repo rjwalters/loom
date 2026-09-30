@@ -45,6 +45,12 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Bucket a sweep-outcome sample lands in when the record's `repo` slug was
+/// unresolved (Issue #9442) — records never carry paths, so per-repo
+/// conditioning groups all unresolved workspaces under this one sentinel
+/// instead of one pseudo-repo per host path.
+const UNRESOLVED_REPO_BUCKET: &str = "(unresolved)";
+
 /// Where a sample came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -187,12 +193,20 @@ impl StageSamples {
         let fallback = record.phase_durations.len() == 1
             && record.phase_durations[0].duration_sec == record.total_duration_sec
             && record.total_duration_sec > 0;
+        // Issue #9442: a record whose slug could not be resolved carries no
+        // `repo`. The ETA samples condition per-repo, so they bucket under one
+        // shared sentinel — strictly better than the pre-#9442 behavior, where
+        // the leaked workspace PATH made every host its own pseudo-repo.
+        let repo = record
+            .repo
+            .clone()
+            .unwrap_or_else(|| UNRESOLVED_REPO_BUCKET.to_string());
         if !fallback {
             for phase in &record.phase_durations {
                 if let Some(stage) = Stage::from_sweep_phase(&phase.phase) {
                     if phase.duration_sec >= 0 {
                         self.stages.push(StageSample {
-                            repo: record.repo.clone(),
+                            repo: repo.clone(),
                             stage,
                             duration_sec: phase.duration_sec,
                             observed_at,
@@ -210,7 +224,7 @@ impl StageSamples {
                 _ => continue,
             };
             self.verdicts.push(VerdictSample {
-                repo: record.repo.clone(),
+                repo: repo.clone(),
                 attempt: verdict.attempt,
                 rejected,
                 observed_at,
@@ -218,7 +232,7 @@ impl StageSamples {
         }
         if record.result == SweepResult::Success {
             self.paths.push(SweepPathSample {
-                repo: record.repo.clone(),
+                repo,
                 merged_in_sweep: record.phase_durations.iter().any(|p| p.phase == "merge"),
                 observed_at,
             });
