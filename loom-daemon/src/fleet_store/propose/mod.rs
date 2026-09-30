@@ -248,6 +248,7 @@ pub fn provenance_marker(daemon_workspace: &Path, base_commit: &str) -> String {
         base: base_commit.to_string(),
         run: marker::run_field(|k| std::env::var(k).ok()),
         installs: None,
+        origin: Some(crate::provenance::origin::WorkOrigin::from_env()),
     }
     .render()
 }
