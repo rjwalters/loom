@@ -4321,6 +4321,69 @@ function mask_comment(s,   out, n, i, c, prev, mode, SQ, DQ) {
 #     guard never writes to it, executes it, or reports its content back to
 #     the caller — only the boolean "did it match curcwd" outcome feeds the
 #     resolution.
+#
+# `NAME=$(cd <literal-path> && pwd)` / `NAME=$(realpath <literal-path>)`
+# SELF-CONTAINED CWD CAPTURE (#9312): guard-decision telemetry (#3898) showed
+# force-op:detached firing at ASK 31 times for yet another capture shape none
+# of #6152/#6724/#7532 above cover -- a SINGLE assignment whose OWN command
+# substitution both changes directory AND captures the result, e.g.:
+#
+#   WORKTREE_ABS="$(cd .loom/worktrees/issue-N && pwd)"
+#   git -C "$WORKTREE_ABS" reset --hard origin/feature/issue-N
+#
+# This is NOT the #6724 shape: #6724's cd_proven/$(pwd) carve-out requires a
+# SEPARATE, EARLIER same-command `cd <path>` segment to have already proven
+# curcwd before it will trust a later bare `$(pwd)` -- it never even inspects
+# an assignment whose `cd` and `pwd` are both INSIDE that assignment's own
+# substitution, so that scan never fires for this shape at all. Unlike the
+# `$(pwd)`/`$(cat <file>)` carve-outs above, this capture needs no cd_proven
+# trust gate: the `cd <literal-path>` is itself part of the literal text being
+# recognized, so the resulting absolute path is derived the exact same way a
+# real top-level `cd <literal-path>` argument already is (join a relative
+# literal against the tracked curcwd, absolute literal used as-is -- see the
+# `toks[1] == "cd"` case a few hundred lines below) -- never guessed, never
+# dependent on anything having actually run.
+#
+# CROSS-SEGMENT SPLIT (`$(realpath …)` is NOT affected): qsplit() (#3755,
+# #7498) is "live substitution"-aware -- it treats `&&`/`;`/`|` INSIDE a
+# `$(...)`/backtick span as a REAL, live command separator, because it
+# genuinely is one to the real shell (outer quoting only suppresses
+# word-splitting of the substitution's OUTPUT, never the parsing of its own
+# contents). So `NAME="$(cd <literal-path> && pwd)"` is ALREADY split in two
+# by the time this scan ever sees it -- `NAME="$(cd <literal-path>` (open,
+# unterminated) as one segment, `pwd)"` (close) as the very next. The `cd`
+# half is recognized and its literal path stashed in
+# pending_cdpwd_name/pending_cdpwd_path (extract_cdpwd_open(), tried in
+# next_assignword_len()'s chain via match_cdpwd_open_assignword()); the
+# resolution itself happens at the TOP of the NEXT segment's processing (see
+# the `if (pending_cdpwd_name != "")` check in the main per-segment loop
+# below), where the `pwd)`/`` pwd` `` close is expected -- any other shape
+# there abandons the pending capture unresolved, fail closed. `$(realpath
+# <literal-path>)` has no internal separator at all, so qsplit() never splits
+# it -- it resolves in a single step via extract_realpath_path(), exactly
+# like the #7532 `$(cat <file>)` carve-out above.
+#
+# Narrow scope, mirroring #7532's own narrow scope:
+#   - ONLY the literal shapes `$(cd <literal-path> && pwd)`, `` `cd
+#     <literal-path> && pwd` ``, `$(realpath <literal-path>)`, and `` `realpath
+#     <literal-path>` `` (bare, double-quoted, or backtick) -- any other
+#     command substitution is left to fall through to record_assign()
+#     unresolved, same as before.
+#   - `<literal-path>` itself must be a TRUE literal: once unquoted via
+#     strip_cd_quoting(), any surviving `$`, `"`, or `'` byte (a nested
+#     variable/substitution, or a quote left unterminated) aborts the
+#     recognizer and falls through unresolved -- fail closed, exactly #7532's
+#     own literal-only contract.
+#   - a SINGLE-QUOTED `NAME='$(cd <path> && pwd)'` is excluded on purpose,
+#     same rationale as the single-quoted `$(pwd)`/`$(cat <file>)` cases
+#     above.
+#   - this recognizer ONLY widens where a literal cwd string can be EXTRACTED
+#     FROM (an additional same-command assignment shape feeding `-C`/`cd`) --
+#     it does not touch `_fdetached_safe`'s own downstream safe-shape
+#     predicate (the managed-worktree/own-branch checks), and it does not
+#     touch the UNRELATED force-push handling at all (`git -C "$VAR" push
+#     --force-with-lease` keeps resolving through its existing, separate
+#     code path).
 parse_force_ops() {
     printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_VARRESOLVE_AWK"'
     # #7532: recognize a literal `$(cat <file>)` / `` `cat <file>` `` command
@@ -4359,6 +4422,96 @@ parse_force_ops() {
         close(path)
         if (rc <= 0) return ""
         return line
+    }
+    # #9312: recognize an OPEN (not-yet-closed) `$(cd <literal-path>` / `` `cd
+    # <literal-path> `` command substitution -- the FIRST half of `NAME=$(cd
+    # <literal-path> && pwd)` after qsplit()'"'"'s quote-aware segmentation has
+    # already split it in two. qsplit() is "live substitution"-aware (#7498):
+    # it recognizes `&&` INSIDE a `$(...)`/backtick span as a REAL, live
+    # command separator (because it genuinely is one to the real shell --
+    # outer quoting only suppresses word-splitting of the substitution'"'"'s
+    # OUTPUT, never the parsing of its own contents) and splits there, even
+    # though the whole thing sits inside an outer-quoted assignment value.
+    # So by the time parse_force_ops()'"'"'s per-segment loop ever sees this
+    # value, `NAME="$(cd <literal-path> && pwd)"` has ALREADY become two
+    # `\n`-joined segments:
+    #   segment N:   NAME="$(cd <literal-path><trailing-space>
+    #   segment N+1: <leading-space>pwd)"
+    # (see the `pending_cdpwd_name` check in the main per-segment loop below
+    # for the segment-N+1 half). Returns the UNQUOTED <literal-path>
+    # extracted from segment N'"'"'s value, or "" if `v` is not that exact
+    # open shape (including when <literal-path> is not itself a true literal
+    # -- see the header comment above parse_force_ops() for the full
+    # rationale). Sets the global `_cdpwd_open_backtick` side flag (awk
+    # functions return one value; every OTHER caller in this file overwrites
+    # it immediately after checking this call'"'"'s return, so no value can
+    # leak across calls). Purely textual -- never touches the filesystem.
+    function extract_cdpwd_open(v,   dq, sq, inner) {
+        dq = sprintf("%c", 34)
+        sq = sprintf("%c", 39)
+        _cdpwd_open_backtick = 0
+        if (length(v) >= 1 && substr(v, 1, 1) == dq) {
+            v = substr(v, 2)   # a lone, still-open leading double quote --
+                                # the matching close arrives via segment N+1.
+        }
+        if (v ~ /^\$\(cd[ \t]+[^)]*$/) {
+            inner = v
+            sub(/^\$\(cd[ \t]+/, "", inner)
+        } else if (v ~ /^`cd[ \t]+[^`]*$/) {
+            inner = v
+            sub(/^`cd[ \t]+/, "", inner)
+            _cdpwd_open_backtick = 1
+        } else {
+            return ""
+        }
+        sub(/[ \t]+$/, "", inner)
+        if (inner == "") return ""
+        inner = strip_cd_quoting(inner)   # unquote the path argument itself
+        # literal-only: a surviving `$`/quote byte means a nested
+        # variable/substitution or an unterminated quote -- fail closed.
+        if (index(inner, "$") > 0 || index(inner, dq) > 0 || index(inner, sq) > 0) return ""
+        return inner
+    }
+    # #9312: the `realpath` sibling of extract_cdpwd_open() above -- recognizes
+    # `$(realpath <literal-path>)` / `` `realpath <literal-path>` `` and
+    # returns the same UNQUOTED, literal-only-checked <literal-path>, or "" if
+    # `v` is not that exact shape.
+    function extract_realpath_path(v,   dq, sq, inner) {
+        dq = sprintf("%c", 34)
+        sq = sprintf("%c", 39)
+        if (length(v) >= 2 && substr(v, 1, 1) == dq && substr(v, length(v), 1) == dq) {
+            v = substr(v, 2, length(v) - 2)
+        }
+        if (v ~ /^\$\(realpath[ \t]+[^)]+\)$/) {
+            inner = v
+            sub(/^\$\(realpath[ \t]+/, "", inner)
+            sub(/\)$/, "", inner)
+        } else if (v ~ /^`realpath[ \t]+[^`]+`$/) {
+            inner = v
+            sub(/^`realpath[ \t]+/, "", inner)
+            sub(/`$/, "", inner)
+        } else {
+            return ""
+        }
+        sub(/^[ \t]+/, "", inner)
+        sub(/[ \t]+$/, "", inner)
+        if (inner == "") return ""
+        inner = strip_cd_quoting(inner)   # unquote the path argument itself
+        if (index(inner, "$") > 0 || index(inner, dq) > 0 || index(inner, sq) > 0) return ""
+        return inner
+    }
+    # #9312: join a literal path extracted by extract_cdpwd_open()/
+    # extract_realpath_path() against the tracked curcwd -- the SAME
+    # absolute-vs-relative join (plus ~/`$HOME` expansion via expand_cd_arg())
+    # a literal top-level `cd <literal-path>` argument already gets a few
+    # hundred lines below (the `toks[1] == "cd"` case). Returns "" (leave
+    # unresolved) only when the path is relative and curcwd is not yet known
+    # -- curcwd is seeded from startcwd, so in practice this is never empty.
+    function resolve_cdpwd_literal(litpath, curcwd, home,   expanded) {
+        expanded = expand_cd_arg(litpath, home)
+        if (expanded ~ /^\//) return expanded
+        if (curcwd == "") return ""
+        return curcwd "/" expanded
     }
     # #7532: match_assignword() (shared, #6953) deliberately stops an UNQUOTED
     # assignment value at its first unquoted space/tab -- documented there as
@@ -4401,16 +4554,90 @@ parse_force_ops() {
         }
         return 0
     }
+    # #9312: the same unquoted-measuring carve-out as match_cat_assignword()
+    # above, for `NAME=$(realpath <path>)` / `` NAME=`realpath <path>` ``.
+    # Without this, match_assignword() would truncate an UNQUOTED assignment
+    # at its first unquoted space (the space right after `realpath`) before
+    # extract_realpath_path() ever saw the full value. Returns 0 (never
+    # matches) for every other shape, including the already-handled
+    # double-quoted form (match_assignword() already spans that correctly).
+    function match_realpath_assignword(seg,   n, rest, closeidx, spanlen, nxt) {
+        if (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=\$\(realpath[ \t]+/)) {
+            n = RSTART + RLENGTH
+            rest = substr(seg, n)
+            closeidx = index(rest, ")")
+            if (closeidx == 0) return 0
+            spanlen = (n - 1) + closeidx
+            # #9317: a non-whitespace byte AFTER the close means the real
+            # assignment value is LONGER than this span (e.g.
+            # `W=$(realpath <path>)/../../..`, which the shell sets to a
+            # DIFFERENT directory than the substitution alone yields). The
+            # measured span is what the value-extractor downstream sees, so
+            # matching here would hand it a PREFIX of the true value and let
+            # the guard judge safety against the wrong directory. Refuse the
+            # match entirely (fail closed) -- the same discipline the cdpwd
+            # close-test already applies by requiring an empty/`"` remainder.
+            if (spanlen < length(seg)) {
+                nxt = substr(seg, spanlen + 1, 1)
+                if (nxt != " " && nxt != "\t") return 0
+            }
+            while (spanlen < length(seg) && (substr(seg, spanlen + 1, 1) == " " || substr(seg, spanlen + 1, 1) == "\t")) spanlen++
+            return spanlen
+        }
+        if (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=`realpath[ \t]+/)) {
+            n = RSTART + RLENGTH
+            rest = substr(seg, n)
+            closeidx = index(rest, "`")
+            if (closeidx == 0) return 0
+            spanlen = (n - 1) + closeidx
+            # #9317: a non-whitespace byte AFTER the close means the real
+            # assignment value is LONGER than this span (e.g.
+            # `W=$(realpath <path>)/../../..`, which the shell sets to a
+            # DIFFERENT directory than the substitution alone yields). The
+            # measured span is what the value-extractor downstream sees, so
+            # matching here would hand it a PREFIX of the true value and let
+            # the guard judge safety against the wrong directory. Refuse the
+            # match entirely (fail closed) -- the same discipline the cdpwd
+            # close-test already applies by requiring an empty/`"` remainder.
+            if (spanlen < length(seg)) {
+                nxt = substr(seg, spanlen + 1, 1)
+                if (nxt != " " && nxt != "\t") return 0
+            }
+            while (spanlen < length(seg) && (substr(seg, spanlen + 1, 1) == " " || substr(seg, spanlen + 1, 1) == "\t")) spanlen++
+            return spanlen
+        }
+        return 0
+    }
+    # #9312: the OPEN-ended sibling of match_realpath_assignword() above, for
+    # the UNQUOTED `NAME=$(cd <path>` / `` NAME=`cd <path> `` half qsplit()
+    # leaves behind after splitting on the live `&&` inside the substitution
+    # (see extract_cdpwd_open()'"'"'s header comment for the full rationale).
+    # Unlike every other matcher in this chain, there is no closing
+    # `)`/backtick to search for AT ALL in `seg` -- the match is anchored to
+    # the true END of `seg` (`$`), so this returns `length(seg)` (consume the
+    # WHOLE remainder) only when NOTHING follows the open substitution in this
+    # segment, which is exactly the shape qsplit()'"'"'s split produces. Returns 0
+    # for every other shape, including a `$(cd <path>)` that is ALREADY fully
+    # closed within this same segment (a `cd` with no `&& pwd` at all --
+    # out of scope, left for match_assignword() as before).
+    function match_cdpwd_open_assignword(seg) {
+        if (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=\$\(cd[ \t]+[^)]*$/) return length(seg)
+        if (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=`cd[ \t]+[^`]*$/) return length(seg)
+        return 0
+    }
     # #7532: try the narrow cat-specific carve-out FIRST (it only ever matches
     # the exact unquoted `NAME=$(cat <file>)`/`` NAME=`cat <file>` `` shape);
-    # fall back to the shared match_assignword() for every other assignment,
-    # completely unchanged from before this issue.
+    # then the #9312 realpath carve-out, then the #9312 open-ended cd
+    # carve-out; fall back to the shared match_assignword() for every other
+    # assignment, completely unchanged from before any of these issues.
     function next_assignword_len(seg,   l) {
         l = match_cat_assignword(seg)
+        if (l == 0) l = match_realpath_assignword(seg)
+        if (l == 0) l = match_cdpwd_open_assignword(seg)
         if (l == 0) l = match_assignword(seg)
         return l
     }
-    BEGIN { SEP = sprintf("%c", 31); curcwd = startcwd; cd_proven = 0 }
+    BEGIN { SEP = sprintf("%c", 31); curcwd = startcwd; cd_proven = 0; pending_cdpwd_name = "" }
                                        # SEP is non-whitespace so bash read
                                        # does not trim an empty cpath.
                                        # cd_proven (#6724) tracks whether a
@@ -4420,7 +4647,13 @@ parse_force_ops() {
                                        # cwd) even with NO cd at all, so
                                        # curcwd != "" alone cannot distinguish
                                        # a proven same-command cd from that
-                                       # default seed.
+                                       # default seed. pending_cdpwd_name
+                                       # (#9312) threads an OPEN `NAME=$(cd
+                                       # <path>` half (see
+                                       # extract_cdpwd_open()'"'"'s header
+                                       # comment) across to the very next
+                                       # segment, where its `pwd)`/`` pwd` ``
+                                       # close is expected.
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
@@ -4429,6 +4662,39 @@ parse_force_ops() {
             sub(/^[ \t]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
+            # #9312: if the PREVIOUS segment left an open `NAME=$(cd <path>`
+            # capture pending, this segment MUST be its `pwd)`/`` pwd` ``
+            # close (qsplit()'"'"'s live-substitution split always produces
+            # these as adjacent segments, see extract_cdpwd_open()'"'"'s header
+            # comment) -- checked BEFORE the assignment scan below because
+            # this segment is pure closing syntax, never a real assignment or
+            # command of its own. A match resolves the pending literal path
+            # against curcwd (resolve_cdpwd_literal(), same join a literal
+            # `cd <path>` argument gets a few hundred lines below) and stores
+            # it into varmap; anything else abandons the pending capture
+            # (fail closed -- never guessed) and falls through to this
+            # segment'"'"'s own normal processing.
+            if (pending_cdpwd_name != "") {
+                _cdpwd_closed = 0
+                if (_cdpwd_open_backtick) {
+                    if (match(seg, /^pwd[ \t]*`/)) {
+                        _cdpwd_rest = substr(seg, RSTART + RLENGTH)
+                        if (_cdpwd_rest == "" || _cdpwd_rest == DQ) _cdpwd_closed = 1
+                    }
+                } else {
+                    if (match(seg, /^pwd[ \t]*\)/)) {
+                        _cdpwd_rest = substr(seg, RSTART + RLENGTH)
+                        if (_cdpwd_rest == "" || _cdpwd_rest == DQ) _cdpwd_closed = 1
+                    }
+                }
+                if (_cdpwd_closed) {
+                    _cdpwd_resolved = resolve_cdpwd_literal(pending_cdpwd_path, curcwd, home)
+                    if (_cdpwd_resolved != "") varmap[pending_cdpwd_name] = _cdpwd_resolved
+                    pending_cdpwd_name = ""
+                    continue
+                }
+                pending_cdpwd_name = ""
+            }
             # Record any `NAME=value` assignment(s) leading this segment into
             # varmap for LATER segments'"'"' -C/cd resolve_var() lookups (#6152) —
             # mirrors extract_write_targets()'"'"'s identical assignment scan
@@ -4468,6 +4734,38 @@ parse_force_ops() {
                     # curcwd, see the header comment above parse_force_ops()
                     # for the full rationale and narrow scope.
                     varmap[pwdname] = curcwd
+                } else if ((cdpwdpath = extract_realpath_path(pwdval)) != "") {
+                    # #9312: NAME=$(realpath <literal-path>) -- SELF-CONTAINED
+                    # cwd capture (no internal shell separator, so qsplit()
+                    # never splits it -- unlike the `cd <path> && pwd` shape
+                    # just below), no cd_proven gate needed (see the header
+                    # comment above parse_force_ops() for the full rationale).
+                    # Resolve the extracted literal against curcwd exactly
+                    # like a literal `cd <literal-path>` argument does a few
+                    # hundred lines below; an unresolvable join (relative
+                    # literal, no curcwd yet) falls through to record_assign()
+                    # unresolved, same fail-toward-asking default as
+                    # everywhere else in this scan.
+                    cdpwdresolved = resolve_cdpwd_literal(cdpwdpath, curcwd, home)
+                    if (cdpwdresolved != "") {
+                        varmap[pwdname] = cdpwdresolved
+                    } else {
+                        record_assign(assignword)
+                    }
+                } else if ((cdpwdpath = extract_cdpwd_open(pwdval)) != "") {
+                    # #9312: NAME=$(cd <literal-path> && pwd) / `` `cd
+                    # <literal-path> && pwd` `` -- this is the OPEN half only
+                    # (qsplit() has already split this segment right before
+                    # the live `&&`, see extract_cdpwd_open()'"'"'s header
+                    # comment); do not resolve yet -- thread it to the very
+                    # next segment via pending_cdpwd_name/pending_cdpwd_path,
+                    # where the matching `pwd)`/`` pwd` `` close (checked at
+                    # the top of this per-segment loop, above) actually
+                    # resolves it into varmap. If that close never arrives
+                    # (any other shape), the pending capture is simply
+                    # abandoned there -- fail closed, never guessed.
+                    pending_cdpwd_name = pwdname
+                    pending_cdpwd_path = cdpwdpath
                 } else {
                     record_assign(assignword)
                 }
