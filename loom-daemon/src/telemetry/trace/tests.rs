@@ -87,7 +87,7 @@ fn story_ids_match_every_d32_v1_reference_vector() {
         assert_eq!(story.flags, 1);
     }
     let spans = fixture["span_vectors"].as_array().unwrap();
-    assert_eq!(spans.len(), 10);
+    assert_eq!(spans.len(), 11);
     for v in spans {
         let span = story_span_id(
             v["repo_id"].as_u64().unwrap(),
@@ -147,7 +147,10 @@ fn story_span_id_refuses_what_d32_refuses() {
         "story.rework ",
         "story.operator-hold",
         "story.operator_hold ",
-        "story.doctor",
+        // The #1533-adjacent names that were proposed and not adopted, by
+        // exact spelling only (2am's storyid_test pins the same refusals).
+        "story.remediation",
+        "story.re_review",
         "story.ci.",
     ] {
         assert_eq!(ok(kind, "1"), Err(StoryIdError::UnknownKind), "{kind:?}");

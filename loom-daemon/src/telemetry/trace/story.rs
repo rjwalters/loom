@@ -13,11 +13,12 @@ pub const STORY_KEY_VERSION: &str = "v1";
 
 /// D32's closed set of derived story-span kinds, in 2am `storyid.Kinds()`
 /// model order (`story.ci*` #9223; `story.rework` #9334 and
-/// `story.operator_hold` #9335 from the 2026-09-28 amendment). Loom emits none
+/// `story.operator_hold` #9335 from the 2026-09-28 amendment; `story.doctor`
+/// #1533 from the 2026-09-30 amendment). Loom emits none
 /// of them — the 2am storyline reconciler does — it only derives and accepts
 /// their ids. `loom.story` is deliberately absent: the root has exactly one
 /// id, [`story_context`]'s `span_id`.
-pub const STORY_SPAN_KINDS: [&str; 10] = [
+pub const STORY_SPAN_KINDS: [&str; 11] = [
     "story.intake",
     "story.queue_dwell",
     "story.ci",
@@ -25,6 +26,7 @@ pub const STORY_SPAN_KINDS: [&str; 10] = [
     "story.ci.run",
     "story.review_wait",
     "story.rework",
+    "story.doctor",
     "story.merge",
     "story.reopened",
     "story.operator_hold",

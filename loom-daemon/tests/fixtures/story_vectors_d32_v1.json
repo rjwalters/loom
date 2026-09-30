@@ -40,6 +40,7 @@
     "story.ci.run",
     "story.review_wait",
     "story.rework",
+    "story.doctor",
     "story.merge",
     "story.reopened",
     "story.operator_hold"
@@ -99,6 +100,15 @@
       "kind": "story.rework",
       "source_event_id": "654",
       "span_id": "d84da974e982a540"
+    },
+    {
+      "story": "2AMLogic/harness-ops#307",
+      "repo_id": 1377976597,
+      "number": 307,
+      "input": "loom-story/v1:github:1377976597:307",
+      "kind": "story.doctor",
+      "source_event_id": "321",
+      "span_id": "d8faca15d2a14f76"
     },
     {
       "story": "rjwalters/loom#9027",
