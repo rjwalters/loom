@@ -151,21 +151,42 @@ If CI on the re-dated head takes longer than the interval between merges on
 would push a fresh no-op commit every tick forever, burning a full CI run and a
 Judge re-review each time while never out-racing the base branch.
 
-So the remedy is bounded to **one push per head**. Each push records
+So the remedy has a **budget per re-date chain** (#9590; #8508 allowed one
+push per head, which parked about ten approved PRs on `loom:operator` when `main`
+moved faster than CI). A chain is the run of consecutive tree-identical re-date
+commits that started from a head Loom did not create. Each push records
 
 ```
 <!-- loom:stale-check-redate to=<new-sha> -->
+<!-- loom:stale-check-redate-attempt to=<new-sha> n=<k> -->
 ```
 
-on the PR. Finding that marker for the *current* head means the full re-date →
-CI → block cycle already completed with no forward progress, which is a
-strictly stronger signal than a tick counter (and needs no process to own the
-count — it is durable forge state).
+on the PR: the #8508 marker, kept so an older daemon still escalates
+conservatively, plus the head's position `k` in its chain. A legacy-only marker
+counts as position 1. A head with no marker (a human, Builder, Doctor or
+head-sync push) starts a fresh chain.
+
+| Setting | env (wins) | `.loom/config.json` | default |
+|---|---|---|---|
+| re-dates per chain (1–10) | `LOOM_REDATE_BUDGET` | `champion.redateBudget` | 3 |
+| backoff base, seconds (≤ 86400) | `LOOM_REDATE_BACKOFF_SECS` | `champion.redateBackoffSecs` | 600 |
+
+Re-date `k+1` is pushed only once `base × 2^(k-1)` has elapsed since the comment
+recording re-date `k`. Inside that window the remedy writes nothing and prints
+`LOOM-REDATE-DEFERRED … retry_after=<time>`; `merge-pr.sh` exits **4**, so the
+merge is retried later.
+
+It is still a bound. The count is durable, trusted forge state rather than a
+tick counter no process owns, and only trusted authors' markers count (#9548).
+Each step needs a full re-date → CI → block cycle, and the remedy's own pushes
+can never reset the chain; only a push from outside the remedy can.
 
 ### Escalation when the bound is reached
 
-The PR is escalated the same way `champion-pr-merge.md`'s merge-risk hold
-escalates:
+Once the chain has spent the whole budget and the guard still blocks, the PR is
+escalated the same way `champion-pr-merge.md`'s merge-risk hold escalates. The
+notice and the `LOOM-REDATE-ESCALATED … spent=<k> budget=<N>` line both say the
+budget is exhausted:
 
 - one idempotent notice keyed on the blocked head
   (`<!-- loom:stale-check-hold head=<sha> -->`), so a later push re-opens the
