@@ -108,10 +108,11 @@ Anything unverifiable is a refusal. Reads are never gated.
 
 - **Daemon:** `loom-daemon/src/write_scope.rs`. Claim reconciliation,
   quarantine reconciliation, star liveness and dispatch skip a refused
-  workspace, logging the reason once. Explicit-target writes (roster
-  heartbeat, dependency classification) check the named repository;
-  `notify-cleared-blockers` and the stale-check redate take the repository
-  `merge-pr.sh` already vetted. The structural test
+  workspace, logging the reason once. The roster heartbeat checks its
+  configured repository; `notify-cleared-blockers` and the stale-check redate
+  take the repository `merge-pr.sh` already vetted; dependency classification
+  resolves `origin` (never gh's preference) or takes its caller's explicit
+  `--repo`. The structural test
   `write_scope::tests::daemon_write_paths_are_scoped` fails when a new daemon
   file writes to the forge without being reviewed into its list.
 - **Shell:** `loom-daemon forge may-write [--repo OWNER/REPO]` prints the

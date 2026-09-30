@@ -144,33 +144,23 @@ pub struct GhWriter<'a> {
 }
 
 impl GhWriter<'_> {
-    /// #9548: every write below goes through here, and is refused unless this
-    /// installation may write to `repo`. A refusal ran nothing, so it reports
-    /// as a spawn failure.
-    fn write(&self, args: &[&str]) -> crate::cmd_out::CmdOutcome {
-        if let crate::write_scope::Verdict::Deny(why) =
-            crate::write_scope::repo_writable(self.repo_root, self.repo)
-        {
-            return crate::cmd_out::CmdOutcome::Unavailable(crate::cmd_out::Unavailable::Spawn(
-                format!("write refused (#9548): {why}"),
-            ));
-        }
-        run_gh(args, self.repo_root, false)
-    }
-
     /// Add labels — the cycle report's own write, which no un-escalation makes,
     /// so it lives here rather than on the [`super::apply::Writer`] trait.
     pub fn add_labels(&mut self, labels: &str) -> crate::cmd_out::CmdOutcome {
         let n = self.issue.to_string();
-        self.write(&[
-            "issue",
-            "edit",
-            &n,
-            "--repo",
-            self.repo,
-            "--add-label",
-            labels,
-        ])
+        run_gh(
+            &[
+                "issue",
+                "edit",
+                &n,
+                "--repo",
+                self.repo,
+                "--add-label",
+                labels,
+            ],
+            self.repo_root,
+            false,
+        )
     }
 }
 
@@ -179,25 +169,37 @@ impl super::apply::Writer for GhWriter<'_> {
         let n = self.issue.to_string();
         // Writes never use the read cache: a cached response to a mutation is
         // meaningless, and `gh-cached` is a read-side wrapper.
-        self.write(&[
-            "issue",
-            "edit",
-            &n,
-            "--repo",
-            self.repo,
-            "--remove-label",
-            label,
-        ])
+        run_gh(
+            &[
+                "issue",
+                "edit",
+                &n,
+                "--repo",
+                self.repo,
+                "--remove-label",
+                label,
+            ],
+            self.repo_root,
+            false,
+        )
     }
 
     fn post_comment(&mut self, body: &str) -> crate::cmd_out::CmdOutcome {
         let n = self.issue.to_string();
-        self.write(&["issue", "comment", &n, "--repo", self.repo, "--body", body])
+        run_gh(
+            &["issue", "comment", &n, "--repo", self.repo, "--body", body],
+            self.repo_root,
+            false,
+        )
     }
 
     fn edit_body(&mut self, body: &str) -> crate::cmd_out::CmdOutcome {
         let n = self.issue.to_string();
-        self.write(&["issue", "edit", &n, "--repo", self.repo, "--body", body])
+        run_gh(
+            &["issue", "edit", &n, "--repo", self.repo, "--body", body],
+            self.repo_root,
+            false,
+        )
     }
 }
 

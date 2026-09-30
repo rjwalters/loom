@@ -302,6 +302,10 @@ enum Scope {
     /// A CLI verb whose only caller is the named shell script, which vets
     /// the repo with `loom_write_repo` and passes it as `--repo`.
     ShellVetted(&'static str),
+    /// A CLI verb whose target is `git remote get-url origin` or an explicit
+    /// `--repo` from its caller, never gh's base-repo resolution; the file
+    /// named must keep resolving origin first.
+    OriginResolved(&'static str),
     /// Matches the pattern but is not a forge write.
     NotAWrite(&'static str),
 }
@@ -313,7 +317,7 @@ enum Scope {
 /// managed-repo + WRITE check.
 #[test]
 fn daemon_write_paths_are_scoped() {
-    use Scope::{Gated, NotAWrite, ShellVetted, Via};
+    use Scope::{Gated, NotAWrite, OriginResolved, ShellVetted, Via};
     const PASS: &str = "claim_reconciliation/pass_loop.rs";
     const DISPATCH: &str = "sweep_registry/private_dispatch.rs";
     let reviewed: &[(&str, Scope)] = &[
@@ -335,7 +339,7 @@ fn daemon_write_paths_are_scoped() {
             Via("star_liveness/task.rs", "repos pass the task's gate"),
         ),
         ("role_runner/roster.rs", Gated),
-        ("dep_classify/forge.rs", Gated),
+        ("dep_classify/forge.rs", OriginResolved("dep_classify/cli.rs")),
         ("cli/notify_cleared_blockers.rs", ShellVetted("merge-pr.sh")),
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
@@ -444,6 +448,15 @@ fn daemon_write_paths_are_scoped() {
                 assert!(
                     text.contains("loom_write_repo") && matches(file),
                     "{file} relies on {script} vetting its --repo with loom_write_repo"
+                );
+            }
+            OriginResolved(resolver) => {
+                let text = std::fs::read_to_string(src.join(resolver)).unwrap_or_default();
+                let origin = text.find(r#"["remote", "get-url", "origin"]"#);
+                let gh = text.find(r#"["repo", "view""#);
+                assert!(
+                    matches(file) && origin.is_some() && gh.is_none_or(|g| origin < Some(g)),
+                    "{file} relies on {resolver} resolving origin before any gh repo view"
                 );
             }
             NotAWrite(why) => assert!(matches(file), "stale entry: {file} ({why})"),
