@@ -271,6 +271,9 @@ enum Scope {
     Gated,
     /// Reached only through the named file, which is `Gated`.
     Via(&'static str, &'static str),
+    /// A CLI verb whose only caller is the named shell script, which vets
+    /// the repo with `loom_write_repo` and passes it as `--repo`.
+    ShellVetted(&'static str),
     /// Matches the pattern but is not a forge write.
     NotAWrite(&'static str),
 }
@@ -282,7 +285,7 @@ enum Scope {
 /// managed-repo + WRITE check.
 #[test]
 fn daemon_write_paths_are_scoped() {
-    use Scope::{Gated, NotAWrite, Via};
+    use Scope::{Gated, NotAWrite, ShellVetted, Via};
     const PASS: &str = "claim_reconciliation/pass_loop.rs";
     const DISPATCH: &str = "sweep_registry/private_dispatch.rs";
     let reviewed: &[(&str, Scope)] = &[
@@ -305,7 +308,7 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("role_runner/roster.rs", Gated),
         ("dep_classify/forge.rs", Gated),
-        ("cli/notify_cleared_blockers.rs", Gated),
+        ("cli/notify_cleared_blockers.rs", ShellVetted("merge-pr.sh")),
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         (
@@ -327,10 +330,7 @@ fn daemon_write_paths_are_scoped() {
             "script_helpers/validate_phase.rs",
             Via(DISPATCH, "runs inside a dispatched sweep"),
         ),
-        (
-            "merge_pr/redate.rs",
-            NotAWrite("reached only from merge-pr.sh, which vets REPO_NWO"),
-        ),
+        ("merge_pr/redate.rs", ShellVetted("merge-pr.sh")),
         ("forge_cmd.rs", NotAWrite("operator/shell verbs; shell callers vet the repo")),
         (
             "fleet/drain.rs",
@@ -409,6 +409,14 @@ fn daemon_write_paths_are_scoped() {
                     "{file} ({why}) is reached via {parent}, which must be a gated entry"
                 );
                 assert!(matches(file), "stale entry: {file} ({why}) no longer writes");
+            }
+            ShellVetted(script) => {
+                let text = std::fs::read_to_string(src.join("../../defaults/scripts").join(script))
+                    .unwrap_or_default();
+                assert!(
+                    text.contains("loom_write_repo") && matches(file),
+                    "{file} relies on {script} vetting its --repo with loom_write_repo"
+                );
             }
             NotAWrite(why) => assert!(matches(file), "stale entry: {file} ({why})"),
         }

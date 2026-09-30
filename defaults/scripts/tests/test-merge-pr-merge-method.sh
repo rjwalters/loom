@@ -188,6 +188,9 @@ STUB_DIR=$(mktemp -d)
 trap 'rm -rf "$STUB_DIR"' EXIT
 cat > "$STUB_DIR/loom-daemon" <<'STUB'
 #!/usr/bin/env bash
+# #9548: merge-pr.sh vets its repo first; allowed here (test-write-scope.sh
+# covers the refusal), since an exit 1 would read as a write-scope refusal.
+if [[ "$1" == "forge" && "$2" == "may-write" ]]; then echo "owner/repo"; exit 0; fi
 if [[ "$1" == "forge" && "$2" == "merge-method" ]]; then
   echo "requested merge method 'merge' is not allowed by this repository; allowed method(s): squash" >&2
   exit 1

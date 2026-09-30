@@ -102,6 +102,12 @@ export ATTEMPT_LOG MINT_LOG MODE_FILE MINT_MODE_FILE
 #   head-mismatch - exit 4, EX_FORGE_HEAD_MISMATCH.
 cat > "$STUB_DIR/loom-daemon" <<'STUB'
 #!/usr/bin/env bash
+# #9548: the write-scope vetting (`forge may-write`) is allowed and NOT logged
+# as an attempt; test-write-scope.sh covers it.
+if [[ "${1:-} ${2:-}" == "forge may-write" ]]; then
+  if [[ "${3:-}" == "--repo" ]]; then echo "$4"; else echo "owner/repo"; fi
+  exit 0
+fi
 mode="$(cat "$MODE_FILE" 2>/dev/null || echo ok)"
 cred="ambient"
 [[ -n "${GH_TOKEN:-}" ]] && cred="token:${GH_TOKEN}"

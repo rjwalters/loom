@@ -63,6 +63,13 @@ source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
 # and the pre-merge conflict guard's is `merge-pr partial-conflict` (#8191
 # slices), so the same binary must carry both verbs too.
 loom_test_require_daemon_bin "$HELPERS_DIR" merge-pr-refs "merge-pr partial-reset" "merge-pr partial-conflict"
+# #9548: merge-pr.sh vets its repo first (`forge may-write`); that decision is
+# not what this suite tests (test-write-scope.sh does), so the fixture repo is
+# allowed and every other verb still reaches the pinned binary.
+WS_STUB_DIR="$(mktemp -d)"
+# shellcheck source=lib/write-scope-stub.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/write-scope-stub.sh"
+write_scope_allow_all "$WS_STUB_DIR"
 
 # Colors
 RED='\033[0;31m'

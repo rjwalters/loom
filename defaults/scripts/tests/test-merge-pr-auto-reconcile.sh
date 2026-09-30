@@ -47,6 +47,13 @@ MERGE_PR_SRC="$HELPERS_DIR/merge-pr.sh"
 source "$TEST_DIR/lib/require-daemon-bin.sh"
 loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr reconcile-plan" \
     "merge-pr reconcile-child"
+# #9548: merge-pr.sh vets its repo first (`forge may-write`); that decision is
+# not what this suite tests (test-write-scope.sh does), so the fixture repo is
+# allowed and every other verb still reaches the pinned binary.
+WS_STUB_DIR="$(mktemp -d)"
+# shellcheck source=lib/write-scope-stub.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/write-scope-stub.sh"
+write_scope_allow_all "$WS_STUB_DIR"
 
 # Colors
 RED='\033[0;31m'

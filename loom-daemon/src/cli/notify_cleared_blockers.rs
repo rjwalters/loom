@@ -322,13 +322,6 @@ fn post_comment(
         Artifact::Pr => "pr",
     };
     let n = number.to_string();
-    // #9548: only on a repository this installation manages and can write.
-    if let loom_daemon::write_scope::Verdict::Deny(why) =
-        loom_daemon::write_scope::may_write_from(root, repo)
-    {
-        eprintln!("notify-cleared-blockers: not commenting on {entity} #{n}: {why} (#9548)");
-        return false;
-    }
     let body = comment_body(kind, cited, reasons);
     let mut args = vec![entity, "comment", n.as_str(), "--body", body.as_str()];
     if let Some(r) = repo {
