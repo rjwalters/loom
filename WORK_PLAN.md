@@ -9,7 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#9514**: feat(merge-pr): record-rework — the first writer for #9444's rework-event markers
+_None._
 
 ## Operator Priority
 
@@ -24,44 +24,31 @@ Issues the operator starred (`loom:operator-priority`); land these first.
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#4765**: feat(champion): opt-in flag to auto-merge Dependabot dependency PRs
-- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
-- **#8195**: Port worktree.sh to a daemon subcommand (1,812 lines; 26 fixes in 6 months, three of them data-loss classes)
 - **#8256**: security: per-role tool-restriction allowlist enforced at the harness (roles/*.json field + guard-hook backstop), so a persuaded read-only role cannot reach ssh/aws/gh secret/~/.ssh
-- **#8589**: Public-surface scrub: fleet EC2 private hostnames in WORK_LOG.md + a Rust doc comment, and operator-domain emails in test fixtures, are live at HEAD
-- **#9017**: Queue snapshot: name the workspace_halted hold cause (red main, gate, token pool, drain, breaker)
-- **#9043**: Decide whether worktree.sh's stale-reset liveness veto should use the widened (#7466) any-open-fd signal
-- **#9085**: CI: add a slow, thorough daily run to backstop the fast per-commit gate
-- **#9089**: ci-telemetry: step spans, per-job queue wait, and shard/suite/test spans so CI sharding is observable in SigNoz
-- **#9096**: Champion: a killed merge-pr.sh --auto call leaves no forge-visible outcome (follow-up to #9091 item 2)
-- **#9111**: worktree.sh --json: the "preserve existing work" path exits 0 with empty stdout, emitting no JSON document
-- **#9198**: config: enable the CI telemetry poller (owners 2amlogic + rjwalters) and declare fleet.captain = loom-worker-1
-- **#9287**: install/upgrade never verifies the repo's merge configuration — a ruleset can make merge-pr.sh structurally unable to merge, silently
-- **#9576**: verdict-staleness-guard.sh drops Judge verdicts on tree-identical re-date commits — the daemon path's #9124 tree-unchanged exemption was never ported
+- **#9548**: Authenticate Loom's control signals: markers and phrases count only from trusted authors (work safely on any public repo)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#9304**: Guard telemetry: rm-scope-unresolved-var denies resolvable scratch-cleanup shapes (57 events)
-- **#9434**: [Epic #9429] story-points: estimate-vs-actual calibration loop
-- **#9548**: Authenticate Loom's control signals: markers and phrases count only from trusted authors (work safely on any public repo)
-- **#9572**: daemon: Issue dispatch_sweep takes 30–70s — ~20 serial gh calls under the registry mutex on a tokio worker; retry not idempotent
+- **#8191**: Port merge-pr.sh to a daemon subcommand (1,458 lines; 48 fixes in 6 months, and the ratchet now blocks fixing it)
+- **#8195**: Port worktree.sh to a daemon subcommand (1,812 lines; 26 fixes in 6 months, three of them data-loss classes)
+- **#9201**: ci-telemetry: drive capture from workflow_run/workflow_job webhooks (forge_events feed); demote the repo sweep to a slow correction floor
+- **#9326**: ETA phase 3: start-v1 and land for unstarted issues from dispatch_plan + slot turnover
+- **#9586**: gateway keep_keys strips attributes the sweep-facts extraction reads (silent NULL columns)
+- **#9588**: drain: an operator drain that times out must stay paused, not silently resume dispatch
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#9271**: docs(worktree-safety): decide the cwd-only-vs-any-open-fd tradeoff for the stale-worktree reset veto (#9043)
-- **#9396**: docs(champion): pin the merge settle budget under the caller's timeout and report a killed merge
-- **#9506**: feat(telemetry): first writer for the rework-event marker protocol (#9444)
-- **#9581**: fix: share the tree-identical test between both verdict-invalidation paths
+- **#9640**: drain: operator drains hold on timeout, escalate in place, and record a durable stop (#9588)
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#9514**: feat(merge-pr): record-rework — the first writer for #9444's rework-event markers
-- **#9578**: feat(eta): eta backfill + leak-free eta backtest harness (#9325)
+- **#9267**: feat(queue): name the workspace_halted hold cause (#9017)
 
 ## Proposed
 
@@ -87,7 +74,6 @@ Issues carrying `loom:curated`.
 - **#8529**: observability: validate both backends with the same Loom traces and publish a comparison *(curated)*
 - **#8570**: Guard: refuse a build/scratch dir assignment that resolves onto a tmpfs mount (upstream PR to rjwalters/repo, split from #8512) *(curated)*
 - **#8576**: observability: document managed-cloud fanout and verify indexed data in both backends *(curated)*
-- **#8589**: Public-surface scrub: fleet EC2 private hostnames in WORK_LOG.md + a Rust doc comment, and operator-domain emails in test fixtures, are live at HEAD *(curated)*
 - **#8606**: Run a live Kimi Code CLI canary with a real Moonshot/Kimi credential and record a docs/experiments receipt *(curated)*
 - **#8628**: Kimi account pool C2: AccountProvider::Kimi, kimi login lifecycle CLI, per-account KIMI_CODE_HOME, availability probe *(curated)*
 - **#8667**: Fleet feed: ModelLabels.tsx needs a Kimi/Moonshot label+icon mapping (marketing-site repo, follow-up to #8564/#8507) *(curated)*
@@ -107,28 +93,20 @@ Issues carrying `loom:curated`.
 - **#8950**: Live-verify Pi tokens_by_model against a real LOOM_RUNTIME=pi launch *(curated)*
 - **#9006**: observability: live-verify the SigNoz queue-starvation alert rule fires and resolves (#8856 / PR #8935 follow-up) *(curated)*
 - **#9017**: Queue snapshot: name the workspace_halted hold cause (red main, gate, token pool, drain, breaker) *(curated)*
-- **#9043**: Decide whether worktree.sh's stale-reset liveness veto should use the widened (#7466) any-open-fd signal *(curated)*
 - **#9045**: Doctor: Priority 1 conflict query doesn't exclude loom:operator-only/-decision, only loom:operator *(curated)*
 - **#9062**: Rejection telemetry counts daemon base-conflict flags (#8922) as Judge rejections *(curated)*
 - **#9063**: feat(champion): dynamic mega-PR batching and merge-train consolidation under high PR congestion *(curated)*
 - **#9065**: CI: cut PR wall time from ~8.5 min to ≤5 min (build once, dedupe nextest, shard serial suites) and stop false-stale merges *(curated)*
 - **#9079**: provenance: D33 record in lease/verdict comments, prompt hash, and in-session trailers (follow-up to #9027) *(curated)*
-- **#9085**: CI: add a slow, thorough daily run to backstop the fast per-commit gate *(curated)*
-- **#9089**: ci-telemetry: step spans, per-job queue wait, and shard/suite/test spans so CI sharding is observable in SigNoz *(curated)*
-- **#9096**: Champion: a killed merge-pr.sh --auto call leaves no forge-visible outcome (follow-up to #9091 item 2) *(curated)*
-- **#9111**: worktree.sh --json: the "preserve existing work" path exits 0 with empty stdout, emitting no JSON document *(curated)*
 - **#9126**: Document the quoted-heredoc rule in comment-body-literal-path.md: an unquoted delimiter silently executes and deletes backticked prose *(curated)*
 - **#9136**: main ruleset: bypass_actors 'RepositoryRole:always' makes pull_request and required_status_checks advisory *(curated)*
 - **#9152**: worktree-link: an already-created worktree keeps its pnpm node_modules alias (#8944 leaves existing worktrees unfixed) *(curated)*
-- **#9198**: config: enable the CI telemetry poller (owners 2amlogic + rjwalters) and declare fleet.captain = loom-worker-1 *(curated)*
 - **#9201**: ci-telemetry: drive capture from workflow_run/workflow_job webhooks (forge_events feed); demote the repo sweep to a slow correction floor *(curated)*
-- **#9287**: install/upgrade never verifies the repo's merge configuration — a ruleset can make merge-pr.sh structurally unable to merge, silently *(curated)*
 - **#9304**: Guard telemetry: rm-scope-unresolved-var denies resolvable scratch-cleanup shapes (57 events) *(curated)*
 - **#9323**: Guard: extract_rm_targets() misses a loop/conditional-body rm written as a one-liner (`; do rm -rf …`) *(curated)*
-- **#9325**: ETA phase 2: backfill + leak-free backtest harness (eta backfill, eta backtest) *(curated)*
+- **#9326**: ETA phase 3: start-v1 and land for unstarted issues from dispatch_plan + slot turnover *(curated)*
 - **#9548**: Authenticate Loom's control signals: markers and phrases count only from trusted authors (work safely on any public repo) *(curated)*
-- **#9572**: daemon: Issue dispatch_sweep takes 30–70s — ~20 serial gh calls under the registry mutex on a tokio worker; retry not idempotent *(curated)*
-- **#9576**: verdict-staleness-guard.sh drops Judge verdicts on tree-identical re-date commits — the daemon path's #9124 tree-unchanged exemption was never ported *(curated)*
+- **#9586**: gateway keep_keys strips attributes the sweep-facts extraction reads (silent NULL columns) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -150,13 +128,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 1 |
+| Operator merge-risk holds | 0 |
 | Operator priority | 3 |
-| Ready (`loom:issue`) | 14 |
-| In Progress (`loom:building`) | 4 |
-| PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 2 |
-| Curated | 62 |
+| Ready (`loom:issue`) | 3 |
+| In Progress (`loom:building`) | 6 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 1 |
+| Curated | 53 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->

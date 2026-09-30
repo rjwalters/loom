@@ -7,6 +7,73 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-30
+- **Issue #9638** (closed): story-points: re-estimate points on every backlog recontemplation — Curator re-curation must re-pick the points label
+- **PR #9639**: story-points: re-pick the points label on re-curation passes (#9638)
+- **Issue #9631** (closed): main regression: lease_co_occupancy.rs (#9543) reads markers without comment trust — #9593 coverage test fails
+- **PR #9637**: lease co-occupancy: read leases/yields through TrustPolicy (#9631)
+- **Issue #9592** (closed): state: guard that every daemon-written .loom/state/ path is gitignored (the class behind #9544)
+- **PR #9628**: gitignore: ignore .loom/state/* wholesale, guarded by a test (#9592)
+- **Issue #9546** (closed): gateway keep_keys strips loom.story_points on main: emitted by daemon, dropped in transit (#9432 follow-up)
+- **Issue #9620** (closed): main regression: worktree_existing_differential stale_level diverges (port vs retired shell) after #9455/#9543/#9484 batch merges
+- **PR #9632**: fix(worktree-existing): port's own fetch spawned a detached maintenance child its reset probe refused on (#9620)
+- **Issue #9590** (closed): champion: replace one-re-date-then-escalate with a bounded re-date budget
+- **PR #9629**: merge-pr: bounded re-date budget with backoff for the #8248 guard (#9590)
+- **Issue #9605** (closed): quarantine: escalate relapsed quarantines — probation + doubling TTL (rebuild of #8440, scope-limited)
+- **PR #9627**: fix(loom-daemon): escalate relapsed quarantines — probation + doubling TTL (#9605)
+- **Issue #9589** (closed): stale-checks: consumer repos' unspecced required contexts go stale on ANY base move — add per-repo input scopes or a conservative fallback
+- **PR #9626**: stale-checks: per-repo input declarations for unspecced required contexts (#9589)
+- **Issue #9572** (closed): daemon: Issue dispatch_sweep takes 30–70s — ~20 serial gh calls under the registry mutex on a tokio worker; retry not idempotent
+- **PR #9623**: perf(daemon): cache resolve_owner_repo and dedup in-flight idempotency retries
+- **Issue #9608** (closed): ci: on main, keep one running + newest pending CI run (concurrency, cancel-in-progress: false); amend rule 2
+- **PR #9619**: ci: on main, keep one running + newest pending CI run; amend rule 2
+- **PR #9612**: security: trust-filter the shell and role-prompt marker readers; frame forge text (#9548)
+- **PR #9600**: feat(fleet-config): read an operator's fleet state store
+- **Issue #9630** (closed): ci: check-pipefail-early-exit regression in test-merge-pr-worktree-path.sh blocks every PR (Structural Checks fail)
+- **PR #9633**: test(merge-pr): drop pipefail-unsafe pipe from Test 8b worktree check (#9630)
+- **Issue #9591** (closed): work_finder: 'main-health gate halted dispatch for N of N repos' fires during every drain — attribute the hold to its real cause
+- **PR #9624**: work_finder: attribute the dispatch-halted log line to its real cause (#9591)
+- **Issue #9625** (closed): fix(merge-pr): worktree-contains fail-open must decline the --worktree-path cleanup, not wave it through (PR #9602 carry-over)
+- **PR #9604**: docs(guard): record the all-literal for-loop rm list as denied on a measurement (#9304)
+- **Issue #9610** (closed): check-vendored-private-refs red on main: example host matrix.org in mail-send.md (#9594)
+- **PR #9621**: mail-send.md: replace matrix.org example host with example.org
+- **PR #9602**: feat(merge-pr): port --worktree-path's registered-worktree check to Rust (#8191 slice)
+- **Issue #9606** (closed): merge-pr.sh: remove dead closing-ref/fenced-block helpers to free contract shell budget (unblocks #8314)
+- **PR #9607**: merge-pr.sh: remove dead closing-ref/fenced-block helpers (-18 contract lines)
+- **Issue #9585** (closed): clippy -D warnings fails on macOS: field_reassign_with_default in host_pressure::sample_macos
+- **PR #9603**: fix(host_pressure): clear macOS-only clippy field_reassign_with_default
+- **Issue #9434** (closed): [Epic #9429] story-points: estimate-vs-actual calibration loop
+- **PR #9595**: story-points: estimate-vs-actual calibration loop (#9434)
+- **PR #9543**: fix(lease): yield to same-host peers on one issue; guard dirty shared worktrees (kicad-tools#5783)
+- **PR #9593**: security: route the High-severity Rust marker readers through comment trust (#9548)
+- **Issue #9583** (closed): feat(skills): mail-send — loom-ui inbox + Matrix room as one atomic, attributed send
+- **PR #9594**: feat(commands): add mail-send — one atomic loom-ui + Matrix send to the operator
+- **PR #9455**: feat(worktree): port the "worktree dir already exists" arm to `loom-daemon worktree-existing` (#8195 slice 12)
+- **PR #9587**: fix(telemetry): admit loom.story_points through the gateway keep_keys
+- **Issue #9576** (closed): verdict-staleness-guard.sh drops Judge verdicts on tree-identical re-date commits — the daemon path's #9124 tree-unchanged exemption was never ported
+- **PR #9581**: fix: share the tree-identical test between both verdict-invalidation paths
+- **Issue #8918** (closed): stale-verdict guard: keep loom:pr when a push is tree-identical to the approved head? (operator decision, split from #8914)
+- **Issue #9580** (closed): merge freshness: Daemon Checks treats all of loom-daemon/** as a global input — every daemon merge stales every open PR (livelock root cause)
+- **Issue #9198** (closed): config: enable the CI telemetry poller (owners 2amlogic + rjwalters) and declare fleet.captain = loom-worker-1
+- **Issue #9111** (closed): worktree.sh --json: the "preserve existing work" path exits 0 with empty stdout, emitting no JSON document
+- **PR #9484**: fix(worktree): emit JSON on preserve/stale-reset exit-0 paths under --json
+- **Issue #9085** (closed): CI: add a slow, thorough daily run to backstop the fast per-commit gate
+- **PR #9381**: ci: add a slow, thorough daily run to backstop the fast per-commit gate
+- **Issue #9096** (closed): Champion: a killed merge-pr.sh --auto call leaves no forge-visible outcome (follow-up to #9091 item 2)
+- **PR #9396**: docs(champion): pin the merge settle budget under the caller's timeout and report a killed merge
+- **PR #9276**: feat(merge-pr): port the worktree remove-vs-preserve decision to Rust (#8191 slice)
+- **Issue #8589** (closed): Public-surface scrub: fleet EC2 private hostnames in WORK_LOG.md + a Rust doc comment, and operator-domain emails in test fixtures, are live at HEAD
+- **PR #8613**: chore: scrub private host identifiers and operator identities from HEAD
+- **PR #9506**: feat(telemetry): first writer for the rework-event marker protocol (#9444)
+- **Issue #9287** (closed): install/upgrade never verifies the repo's merge configuration — a ruleset can make merge-pr.sh structurally unable to merge, silently
+- **PR #9386**: feat: check-merge-config advisory — report a merge config merge-pr.sh cannot use (#9287)
+- **Issue #9517** (closed): Port fleet-send.sh to a loom-daemon subcommand (epic #7810)
+- **PR #9519**: feat(daemon): port fleet-send.sh to `loom-daemon fleet-send` on the canonical safehouse wire builder (#9517)
+- **Issue #9089** (closed): ci-telemetry: step spans, per-job queue wait, and shard/suite/test spans so CI sharding is observable in SigNoz
+- **PR #9457**: feat(ci-telemetry): per-job dependency wait, the segment before the runner queue (#9089)
+- **Issue #9043** (closed): Decide whether worktree.sh's stale-reset liveness veto should use the widened (#7466) any-open-fd signal
+- **PR #9271**: docs(worktree-safety): decide the cwd-only-vs-any-open-fd tradeoff for the stale-worktree reset veto (#9043)
+- **Issue #9325** (closed): ETA phase 2: backfill + leak-free backtest harness (eta backfill, eta backtest)
+- **PR #9578**: feat(eta): eta backfill + leak-free eta backtest harness (#9325)
 - **PR #9544**: fix(gitignore): stop tracking the daemon's per-host ETA ledger (.loom/state/eta/)
 - **PR #9155**: chore(deps): bump sigstore/cosign-installer from 3.9.1 to 4.1.2
 - **PR #9307**: chore(deps): bump the all-dependencies group across 1 directory with 3 updates
