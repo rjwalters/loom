@@ -50,6 +50,10 @@ const MARKER_FILES: &[(&str, &str)] = &[
     ("dep_classify/cli.rs", "reads IssueView from dep_classify/forge.rs (trusted)"),
     ("dep_classify/consts.rs", "constants"),
     ("dep_recheck/forge.rs", "a PR's own closing refs, not the linked-PR guard"),
+    (
+        "forge_check_claim.rs",
+        "lease + lease-yield reader in read_freshest_live_lease (FETCH_SITES, #9453)",
+    ),
     ("merge_pr/redate.rs", "writer; reader in remedy_with (FETCH_SITES)"),
     (
         "merge_pr/redate/budget.rs",
@@ -89,6 +93,7 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     ),
     ("sweep_registry/guards.rs", "read_lease_comments", "policy.trusted_ndjson("),
     ("cli/lease_co_occupancy.rs", "read_rows", "policy.trusted_ndjson("),
+    ("forge_check_claim.rs", "read_freshest_live_lease", "policy.trusted_ndjson("),
     ("sweep_registry/guards.rs", "issue_body_via_rest", "records::trusted_body("),
     (
         "sweep_registry/guards.rs",

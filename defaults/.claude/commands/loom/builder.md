@@ -395,7 +395,7 @@ workflow) that require maintainer approval before being worked on.
 
 - **Find work**: Use the three-tier priority order in "Finding Work: Priority System" below (urgent → curated → approved-only); FIFO (oldest-first) is only the tiebreak **within** a tier.
 - **Check dependencies**: all task-list items checked before claiming
-- **Guard, then claim**: `loom-daemon forge check-open-pr <number>` must not exit 0 (exit 0 = an open linked PR — take another issue), then `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`, then lease it: `loom-daemon lease ensure <number> --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`. `worktree.sh` (below) runs this itself; a lane NOT using it MUST call `lease ensure` directly — a leaseless claim is invisible to other lanes and reclaimable (#9453)
+- **Guard, then claim**: `loom-daemon forge check-claim <number>` must not exit 0 (exit 0 = blocked — open PR, claim label, fresh lease, or remote branch; take another issue), then `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`, then lease it: `loom-daemon lease ensure <number> --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`. `worktree.sh` (below) runs this itself; a lane NOT using it MUST call `lease ensure` directly — a leaseless claim is invisible to other lanes and reclaimable (#9453)
 - **Do the work**: Implement, test, commit, create PR
 - **Mark PR for review**: `./.loom/scripts/create-pr.sh --label "loom:review-requested"` — never a bare `gh pr create` (#6074); the structured body template is canonical in builder-pr.md § "Creating the PR"
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
@@ -1109,10 +1109,10 @@ gh issue list --label="loom:issue" --state=open --json number,title,labels \
 **Step 4 (every tier): guard the claim before you flip the label**
 
 ```bash
-loom-daemon forge check-open-pr <number>   # exit 0 PRINTS an open linked PR
+loom-daemon forge check-claim <number>   # exit 0 PRINTS the blocker token
 ```
 
-**Exit 0 means an open linked PR already exists — do NOT claim; take the next candidate.** Exit 1 (verified "none open") is the only safe-to-claim answer; any other code means the probe could not answer (rate limit, `gh` failure, Gitea) and is **not** an all-clear. Same #4123 probe the daemon's dispatch refuses on, so a hand-claim cannot race past a guard a dispatched sweep would have honored — skipping it once burned a verification pass re-doing already-shipped PR #8462 (#8551).
+**Exit 0 means blocked** — stdout names why (`OPEN_PR #X` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N`); take the next issue. Exit 1 is the only all-clear answer; any other code is unanswered — **not** an all-clear. Same signals a dispatched sweep honors (#4123/#4085/#6286 + branch) — a hand-claim cannot race past a fleet guard (#8551/#9453). `--force-claim` overrides label/lease/branch legs only, never `OPEN_PR`.
 
 ### Priority Guidelines
 

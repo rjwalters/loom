@@ -1644,6 +1644,23 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     exit 0
 fi
 
+# --- Pre-creation claim probe (#9453 Phase 1) ----------------------------
+# Reached only on the CREATE path (the reuse arm above already exited),
+# before `git worktree add` below. `loom-daemon forge check-claim
+# --force-claim` aggregates the four claim signals; --force-claim because
+# this script's caller has ALWAYS already claimed by the time it runs
+# (builder.md: claim, then create worktree), so the issue legitimately
+# carries the caller's own `loom:building` label, lease, and possibly
+# branch -- the only leg that still means "do not build a duplicate" is
+# OPEN_PR, the one leg --force-claim can never override. Only exit 0
+# (blocked; its reason token went to >&3, its explanation to stderr)
+# refuses; a read failure, an old daemon, or any other code fails OPEN,
+# exactly like the #8553/#5783 guards above. A caller refused here adopts
+# the existing PR (create-pr.sh) or stands down -- never a suffix branch.
+# requires-daemon: forge optional   #9453 — `forge check-claim` at worktree creation; without it (absent or pre-#9453 binary) no pre-create OPEN_PR gate is performed and creation proceeds as before
+# shellcheck disable=SC2015  # the trailing `|| true` IS the fail-open path: only exit 0 (blocked) refuses
+[[ -n "$_WT_DAEMON_BIN" ]] && "$_WT_DAEMON_BIN" forge check-claim "$ISSUE_NUMBER" --force-claim >&3 && exit 1 || true
+
 # Check if branch already exists
 if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
     if [[ "$JSON_OUTPUT" != "true" ]]; then
