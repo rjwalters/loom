@@ -35,11 +35,11 @@
 3749 defaults/.claude/commands/loom/champion.md
 1100 defaults/.claude/commands/loom/comment-body-literal-path.md
 3803 defaults/.claude/commands/loom/concierge.md
-35503 defaults/.claude/commands/loom/curator.md
+35501 defaults/.claude/commands/loom/curator.md
 22057 defaults/.claude/commands/loom/doctor.md
 131 defaults/.claude/commands/loom/driver.md
 2998 defaults/.claude/commands/loom/epic.md
-39100 defaults/.claude/commands/loom/guide.md
+32523 defaults/.claude/commands/loom/guide.md
 1968 defaults/.claude/commands/loom/help.md
 9970 defaults/.claude/commands/loom/hermit-patterns.md
 5857 defaults/.claude/commands/loom/hermit.md

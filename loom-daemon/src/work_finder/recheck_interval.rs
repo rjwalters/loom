@@ -61,6 +61,20 @@ impl WorkItem {
         };
         now.signed_duration_since(updated_at.with_timezone(&chrono::Utc)) < interval
     }
+
+    /// The instant [`Self::is_within_recheck_interval`] stops holding (Issue
+    /// #9311): [`Self::updated_at`] + [`Self::recheck_interval`]. `None` when
+    /// either half is missing or unparseable, mirroring
+    /// [`Self::is_within_recheck_interval`]'s own fall-through — computed
+    /// directly from fields already on `WorkItem`, no registry state needed.
+    #[must_use]
+    pub fn recheck_interval_until(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let interval = self.recheck_interval()?;
+        let updated_at = self.updated_at.as_deref()?;
+        let updated_at = chrono::DateTime::parse_from_rfc3339(updated_at).ok()?;
+        let interval = chrono::Duration::from_std(interval).ok()?;
+        Some(updated_at.with_timezone(&chrono::Utc) + interval)
+    }
 }
 
 /// The marker key inside the `<!-- ... -->` comment declaring a tracker

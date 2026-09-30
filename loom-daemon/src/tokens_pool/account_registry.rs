@@ -1142,7 +1142,7 @@ mod tests {
     #[test]
     fn validate_name_rejects_at_and_other_docker_unsafe_characters() {
         for name in [
-            "agent-3@2amlogic.com",
+            "agent-3@example.com",
             "has space",
             "colon:here",
             "slash/free/already",
@@ -1194,10 +1194,10 @@ mod tests {
 
     #[test]
     fn matches_reference_by_registered_email_case_insensitively() {
-        let account = codex_descriptor("agent-1", Some("Agent-1@2amlogic.com"));
-        assert!(account_matches_reference(&account, "agent-1@2amlogic.com"));
-        assert!(account_matches_reference(&account, "AGENT-1@2AMLOGIC.COM"));
-        assert!(!account_matches_reference(&account, "someone-else@2amlogic.com"));
+        let account = codex_descriptor("agent-1", Some("Agent-1@example.com"));
+        assert!(account_matches_reference(&account, "agent-1@example.com"));
+        assert!(account_matches_reference(&account, "AGENT-1@EXAMPLE.COM"));
+        assert!(!account_matches_reference(&account, "someone-else@example.com"));
     }
 
     #[test]
@@ -1205,9 +1205,9 @@ mod tests {
         // A registered email must never accidentally match a name-shaped
         // reference that happens to be a substring/prefix of it -- only an
         // exact name match or a `@`-containing exact email match count.
-        let account = codex_descriptor("agent-1", Some("agent-1@2amlogic.com"));
-        assert!(!account_matches_reference(&account, "agent-1@2amlogic"));
-        assert!(!account_matches_reference(&account, "2amlogic.com"));
+        let account = codex_descriptor("agent-1", Some("agent-1@example.com"));
+        assert!(!account_matches_reference(&account, "agent-1@example"));
+        assert!(!account_matches_reference(&account, "example.com"));
     }
 
     #[test]
@@ -1215,8 +1215,8 @@ mod tests {
         // The hard constraint (issue #7389): resolution must always land on
         // the short profile name, which by construction (docker container
         // names reject `@`) can never itself contain one.
-        let account = codex_descriptor("agent-1", Some("agent-1@2amlogic.com"));
-        assert!(account_matches_reference(&account, "agent-1@2amlogic.com"));
+        let account = codex_descriptor("agent-1", Some("agent-1@example.com"));
+        assert!(account_matches_reference(&account, "agent-1@example.com"));
         assert!(!account.id.name.contains('@'));
     }
 }

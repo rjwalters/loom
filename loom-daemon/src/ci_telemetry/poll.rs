@@ -40,8 +40,8 @@ use super::ledger::{Ledger, PendingUnit, UnitDraft, UnitKey, COMPACT_THRESHOLD_B
 use super::logs::{self, LogTarget};
 use super::owners::{discover, resolve_kind, KindCache, Owner, OwnerStatus};
 use super::records::{
-    envelope_identity, job_envelopes, parse_shard, run_envelopes, JobJson, JobsPage, RepoJson,
-    RunJson, RunsPage, ShardInfo, ShardKind,
+    envelope_identity, job_envelopes, parse_shard, run_envelopes, JobCreationBaselines, JobJson,
+    JobsPage, RepoJson, RunJson, RunsPage, ShardInfo, ShardKind,
 };
 use super::state::{self, CycleLock, CycleSummary, PollStatus};
 use super::story::{self, RepoIdentityFn, RepoStories, Stitch};
@@ -987,10 +987,21 @@ fn poll_repo(
         // Job units first, the run unit LAST: a torn commit can then only
         // lose the run unit, leaving the run "unseen" so the next poll
         // re-lists its jobs and commits exactly the missing ones.
+        // #9089: the zero point every job's `dependency_wait_ms` is measured
+        // from, taken once over the whole listing — a job resolved against a
+        // partial listing would read its own creation as the run's first and
+        // report no dependency wait at all. Per ATTEMPT, because `jobs_path` is
+        // `filter=all`: the listing carries a re-run's older attempts too, and
+        // one baseline across all of them would charge attempt 2 the whole
+        // inter-attempt gap as a `needs:` wait. `for_job` keys on
+        // `job.run_attempt`, the same per-job attempt `UnitKey::job` uses —
+        // not `run.run_attempt`, which is only the newest.
+        let baselines = JobCreationBaselines::of_listing(&jobs);
         let mut drafts: Vec<UnitDraft> = jobs
             .iter()
             .map(|job| {
-                let mut envelopes = job_envelopes(repo, run, job, &ctx.host_id);
+                let mut envelopes =
+                    job_envelopes(repo, run, job, baselines.for_job(job), &ctx.host_id);
                 if let Some(story) = story {
                     story::stitch_job(&mut envelopes, story, run, job);
                 }

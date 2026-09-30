@@ -164,6 +164,37 @@ pub(crate) enum ForgeAction {
         hold: Option<String>,
     },
 
+    /// `forge tree-unchanged <base> <head>` (#9576) — did the tree change at
+    /// all between two commits? Backed by GitHub's own
+    /// `compare/{base}...{head}` reporting `files: []`, i.e. evidence, never a
+    /// "shaped like a rebase" heuristic.
+    ///
+    /// Prints `TREE_UNCHANGED=1` (byte-identical trees) or `TREE_UNCHANGED=0`
+    /// (a real content change) and exits 0 for both; exits 1 with nothing on
+    /// stdout when the comparison could not be made. So a caller keys on the
+    /// stdout line, and every failure mode — absent binary, a daemon predating
+    /// this verb, a `gh` outage, a non-GitHub forge — collapses into the same
+    /// fail-closed "assume the tree changed" arm.
+    ///
+    /// WHY IT EXISTS: this is the test #9124 added to the daemon's periodic
+    /// verdict-invalidation pass so a tree-identical head move (the #8248
+    /// guard's automated re-date commit, #8508) re-anchors the verdict instead
+    /// of clearing it. `verdict-staleness-guard.sh`, the agent-side fast path,
+    /// had no tree comparison at all and kept clearing those verdicts anyway
+    /// (#9541, #9483). This verb is how the shell guard asks the *same*
+    /// implementation ([`crate::forge_tree_unchanged`]) rather than growing a
+    /// second copy of it.
+    #[command(name = "tree-unchanged")]
+    TreeUnchanged {
+        /// The commit the verdict was rendered against (7-40 lowercase hex).
+        #[arg(value_name = "BASE")]
+        base: String,
+
+        /// The commit to compare it with, normally the PR's current head.
+        #[arg(value_name = "HEAD")]
+        head: String,
+    },
+
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should use,
     /// replacing its old unconditional `forge_detect_merge_method` call.
@@ -184,6 +215,35 @@ pub(crate) enum ForgeAction {
         /// unchanged behavior).
         #[arg(long, value_name = "METHOD")]
         requested: Option<String>,
+    },
+
+    /// `forge merge-config` (#9287) — advisory, READ-ONLY check that
+    /// `merge-pr.sh` can merge on the default branch at all. Computes the
+    /// effective merge-method set (the repository's `allow_*` flags
+    /// intersected with `allowed_merge_methods` of every ACTIVE ruleset on the
+    /// branch) and warns when it is empty, when `required_linear_history`
+    /// leaves only `merge`, or when it excludes the method `merge-pr.sh` will
+    /// use. Silent when there is nothing to report (`--verbose` prints an OK
+    /// line). A probe it cannot answer (403, no auth) prints "could not
+    /// determine", never a finding. ALWAYS exits 0 and never writes a ruleset
+    /// or repository setting. GitHub only; Gitea is skipped.
+    #[command(name = "merge-config")]
+    MergeConfig {
+        /// Repository, `owner/repo`. Default: the repository of the CWD.
+        #[arg(long, value_name = "NWO")]
+        repo: Option<String>,
+
+        /// Branch to check. Default: the repository's default branch.
+        #[arg(long, value_name = "BRANCH")]
+        branch: Option<String>,
+
+        /// Check this merge method instead of `merge-pr.sh`'s auto-detect.
+        #[arg(long, value_name = "METHOD", value_parser = ["merge", "squash", "rebase"])]
+        method: Option<String>,
+
+        /// Also print a one-line OK summary when there is nothing to report.
+        #[arg(long)]
+        verbose: bool,
     },
 
     /// `forge token --repo <nwo> [--access read|write] [--force]` (#9537) —
@@ -284,7 +344,19 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             audit_comment,
             hold,
         },
+        ForgeAction::TreeUnchanged { base, head } => ForgeCmd::TreeUnchanged { base, head },
         ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
+        ForgeAction::MergeConfig {
+            repo,
+            branch,
+            method,
+            verbose,
+        } => ForgeCmd::MergeConfig {
+            repo,
+            branch,
+            method,
+            verbose,
+        },
     };
     dispatch(cmd)
 }

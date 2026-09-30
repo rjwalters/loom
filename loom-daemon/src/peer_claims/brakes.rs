@@ -1,7 +1,7 @@
 //! The fleet-visible **brake lanes** of the peer-claim room.
 //!
 //! A *claim* ad (`Advertise`/`Retract`, [`super`]'s own subject) answers "is a
-//! sweep in flight on issue #N". The three kinds routed here answer a
+//! sweep in flight on issue #N". The kinds routed here answer a
 //! different question — "may a dispatch happen at all right now" — and none of
 //! them claims anything:
 //!
@@ -9,6 +9,7 @@
 //! |------|-------|-------|-------|
 //! | No-op cooldown | [`ClaimKind::NoopCooldownArmed`] | one issue | #7477 |
 //! | Dispatch backoff | [`ClaimKind::DispatchBackoffArmed`] | one issue | #7477 |
+//! | PR-less retry tally | [`ClaimKind::PrlessReleaseArmed`] | one issue | #9292 |
 //! | Pool-exhaustion hold | [`ClaimKind::PoolHoldArmed`]/[`ClaimKind::PoolHoldCleared`] | one **token pool**, every issue on it | #8001 |
 //!
 //! They share three properties, which is why they share a module:
@@ -22,10 +23,30 @@
 //!    answers "is *dispatch* coordination healthy"; brake traffic is not
 //!    dispatch traffic, so it must never manufacture a false recovery.
 //!
+//! # The PR-less lane carries a COUNT, not just a window (Issue #9292)
+//!
+//! The other three lanes answer a yes/no question — is this issue (or pool)
+//! braked right now — so a receiver only has to remember an expiry. The
+//! PR-less lane is different: #7972's hold fires on a **tally**, and a tally
+//! that lives in one process is a tally each host accumulates privately. Four
+//! dispatch hosts therefore spent up to `4 × threshold` claim/release cycles
+//! before any one of them reached `threshold` — the `rjwalters/loom#8812`
+//! trace behind #9292 shows nine cycles and four near-duplicate "Attempt 2 of
+//! 3" notes before the first hold. So this lane's entries carry the
+//! advertiser's own `consecutive` count as well as its window, keyed per
+//! **host** so the receiver can sum them (see
+//! [`PeerClaimView::prless_peer_release_count_at`]).
+//!
+//! The count also needs its **own clock**, longer than the window's: an
+//! advertised window is the interval after which the next host may claim, so a
+//! tally expiring with it would lapse at exactly the moment the fleet's next
+//! release is about to be recorded, and nothing would ever accumulate. See
+//! [`PEER_PRLESS_STREAK_TTL`].
+//!
 //! This module exists as a sibling of `peer_claims.rs` rather than inside it
 //! for the reason `repo_slug_tests`/`coordination_tests` do: that module is
 //! over the size ratchet (`scripts/file-size-baseline.txt`) and has no line
-//! budget for a fourth lane.
+//! budget for the brake lanes.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -55,6 +76,69 @@ pub const POOL_HOLD_SENTINEL_ISSUE: u32 = 0;
 /// outlives the outage.
 pub const MAX_PEER_POOL_HOLD_TTL: Duration = Duration::from_secs(900);
 
+/// Hard ceiling on the TTL a single [`ClaimKind::PrlessReleaseArmed`] ad may
+/// install in a receiver's view (Issue #9292), regardless of the
+/// `remaining_secs` it advertises: **six hours**.
+///
+/// Comfortably above `DEFAULT_PRLESS_RETRY_MAX_BACKOFF_SECS` (one hour), the
+/// ceiling a well-behaved advertiser's window is already clamped to on the
+/// arming side, so a healthy ad is never truncated — a repo that deliberately
+/// configures a longer `maxBackoffSecs` still gets up to six hours of
+/// fleet-visible streak. The ceiling exists for the ill-behaved ad: unlike the
+/// #7477 lanes this one contributes to a **hold** decision, so a single ad
+/// advertising a year of remaining streak must not be able to keep an issue
+/// one release away from `loom:blocked` indefinitely. Bounded here so the
+/// worst case degrades to "one over-long streak window", never to a permanent
+/// phantom tally.
+pub const MAX_PEER_PRLESS_RELEASE_TTL: Duration = Duration::from_secs(6 * 3600);
+
+/// How long a peer's PR-less release keeps counting toward the **fleet tally**
+/// (Issue #9292): one hour, matching `DEFAULT_PRLESS_RETRY_MAX_BACKOFF_SECS` —
+/// the window the arming side's own streak-cold rule uses, where a release
+/// older than `max_backoff` restarts the tally at one.
+///
+/// # Why this is NOT the advertised window
+///
+/// The two clocks answer different questions and, crucially, have different
+/// lengths. The advertised `remaining_secs` is the **backoff** — 300 s after a
+/// first release on shipped config — and it is precisely the interval after
+/// which the next host is *allowed to claim*. Reusing it as the tally's TTL
+/// makes the fleet-wide count self-defeating: host A's contribution lapses at
+/// the exact moment host B becomes free to claim, so B's release (a minute or
+/// two later still) sees an empty peer map and reads `1` — and so on around the
+/// fleet, forever, which is the pre-#9292 per-host tally with extra steps.
+///
+/// A streak is a slower thing than a backoff, so it gets the slower clock: a
+/// peer's release counts for as long as the local rule would have counted the
+/// same release on the host that recorded it.
+pub const PEER_PRLESS_STREAK_TTL: Duration = Duration::from_secs(3600);
+
+/// One peer host's PR-less-release tally for one issue (Issue #9292) — the
+/// value type of [`PeerClaimView::prless_releases`].
+///
+/// Three fields rather than the bare [`Instant`] the other per-issue lanes
+/// store, because this lane answers "how many" as well as "until when" (see the
+/// module doc's "The PR-less lane carries a COUNT" section) — and because its
+/// two "until when"s are different clocks, see [`PEER_PRLESS_STREAK_TTL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerPrlessRelease {
+    /// The advertiser's **own** consecutive PR-less releases at send time —
+    /// never a fleet total, so summing one entry per host is exact.
+    pub consecutive: u32,
+    /// Local [`Instant`] at which the advertised **dispatch-suppression
+    /// window** lapses, computed once at receipt as
+    /// `now + min(remaining_secs, MAX_PEER_PRLESS_RELEASE_TTL)`. Read by
+    /// [`PeerClaimView::prless_release_issues_at`].
+    pub window_expiry: Instant,
+    /// Local [`Instant`] at which this release stops counting toward the
+    /// **fleet tally**, computed once at receipt as
+    /// `now + max(window TTL, PEER_PRLESS_STREAK_TTL)` — never shorter than
+    /// the window, and by default an hour longer. Read by
+    /// [`PeerClaimView::prless_peer_release_count_at`], and the field the
+    /// whole entry is pruned on.
+    pub streak_expiry: Instant,
+}
+
 /// Route one inbound brake-lane ad into `view` and prune that lane's lapsed
 /// entries (Issue #8001).
 ///
@@ -73,6 +157,10 @@ pub fn observe_brake_ad(view: &mut PeerClaimView, ad: &ClaimAd, now: Instant) {
         ClaimKind::DispatchBackoffArmed => {
             view.observe_dispatch_backoff_at(ad, now);
             view.prune_expired_dispatch_backoffs(now);
+        }
+        ClaimKind::PrlessReleaseArmed => {
+            view.observe_prless_release_at(ad, now);
+            view.prune_expired_prless_releases(now);
         }
         ClaimKind::PoolHoldArmed | ClaimKind::PoolHoldCleared => {
             view.observe_pool_hold_at(ad, now);
@@ -110,6 +198,40 @@ impl ClaimAd {
             pr: None,
             remaining_secs: Some(remaining_secs),
             pool_key: Some(pool_key),
+            consecutive: None,
+        }
+    }
+
+    /// "I recorded my `consecutive`-th consecutive PR-less claim/release cycle
+    /// on issue #N, `remaining_secs` seconds left on the window it armed"
+    /// (Issue #9292). Broadcast by
+    /// [`crate::sweep_registry::SweepRegistry::publish_peer_prless_release_claim`]
+    /// from every [`crate::sweep_registry::SweepRegistry::record_prless_release`].
+    ///
+    /// `consecutive` is this host's own tally only — see
+    /// [`ClaimAd::consecutive`] for why a fleet total on the wire would
+    /// double-count.
+    #[must_use]
+    pub fn prless_release_armed(
+        issue: u32,
+        repo: String,
+        host: String,
+        pid: u32,
+        ts: String,
+        consecutive: u32,
+        remaining_secs: u64,
+    ) -> Self {
+        Self {
+            kind: ClaimKind::PrlessReleaseArmed,
+            issue,
+            repo,
+            host,
+            pid,
+            ts,
+            pr: None,
+            remaining_secs: Some(remaining_secs),
+            pool_key: None,
+            consecutive: Some(consecutive),
         }
     }
 
@@ -135,6 +257,7 @@ impl ClaimAd {
             pr: None,
             remaining_secs: None,
             pool_key: Some(pool_key),
+            consecutive: None,
         }
     }
 }
@@ -234,6 +357,113 @@ impl PeerClaimView {
     /// (Issue #7477).
     pub fn prune_expired_dispatch_backoffs(&mut self, now: Instant) {
         self.dispatch_backoffs.retain(|_, expiry| *expiry > now);
+    }
+
+    // ------------------------------------------------------------------
+    // Fleet-wide PR-less-retry tally (Issue #9292)
+    // ------------------------------------------------------------------
+
+    /// Observe an inbound [`ClaimKind::PrlessReleaseArmed`] ad at local time
+    /// `now`: "peer host H has now recorded `consecutive` consecutive PR-less
+    /// releases on issue #N in `repo`, with `remaining_secs` left on the
+    /// window it armed as of H's send time".
+    ///
+    /// Stores the peer's count **verbatim, per host**, replacing that host's
+    /// previous entry rather than accumulating — an ad reports a running
+    /// total, not an increment, so a redelivered or duplicated ad is
+    /// idempotent and can never inflate a threshold.
+    ///
+    /// Two local expiries, both measured from receipt (the TTL discipline every
+    /// other map in this module uses, never the advertiser's clock):
+    /// `window_expiry = now + min(remaining_secs, MAX_PEER_PRLESS_RELEASE_TTL)`
+    /// for the dispatch-suppression half, and `streak_expiry = now +
+    /// max(that, PEER_PRLESS_STREAK_TTL)` for the tally half. See
+    /// [`PEER_PRLESS_STREAK_TTL`] for why collapsing them into one clock would
+    /// hand the tally straight back to the per-host behaviour #9292 removes.
+    ///
+    /// Returns `true` when applied, `false` when ignored as this host's own ad
+    /// — the identical self-claim recognition [`Self::observe_noop_cooldown_at`]
+    /// applies, `UNKNOWN_HOST` carve-out included. Ignoring our own ad is what
+    /// keeps the sum in [`Self::prless_peer_release_count_at`] disjoint from
+    /// the caller's local tally: counting it in both places would double every
+    /// release this host recorded and trip the hold at half the threshold.
+    ///
+    /// A missing/zero `consecutive` (a pre-#9292 peer or a malformed payload)
+    /// contributes `0` and a missing/zero `remaining_secs` degrades to
+    /// "already expired" — both the safe direction, since the worst case is
+    /// that the fleet falls back to this host's own exact local tally.
+    pub fn observe_prless_release_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
+        debug_assert_eq!(ad.kind, ClaimKind::PrlessReleaseArmed);
+        let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
+        if ad.host == self.self_host && !is_unresolved_identity {
+            return false; // our own releases are already in our local tally
+        }
+        let window =
+            Duration::from_secs(ad.remaining_secs.unwrap_or(0)).min(MAX_PEER_PRLESS_RELEASE_TTL);
+        self.prless_releases.insert(
+            (ad.repo.clone(), ad.issue, ad.host.clone()),
+            PeerPrlessRelease {
+                consecutive: ad.consecutive.unwrap_or(0),
+                window_expiry: now + window,
+                streak_expiry: now + window.max(PEER_PRLESS_STREAK_TTL),
+            },
+        );
+        true
+    }
+
+    /// The sum of every **peer** host's live PR-less-release tally for
+    /// `(repo, issue)` at local time `now` (Issue #9292) — the term
+    /// [`crate::sweep_registry::SweepRegistry::record_prless_release`] adds to
+    /// its own local count before comparing against
+    /// `PrlessRetryConfig::threshold`, which is what makes the `loom:blocked`
+    /// hold trip at `threshold` claims fleet-wide rather than per host.
+    ///
+    /// Counted against `streak_expiry` — the slower of the entry's two clocks,
+    /// for the reason [`PEER_PRLESS_STREAK_TTL`] spells out: a peer's release
+    /// must keep counting past the moment its backoff window frees the next
+    /// host to claim, or the fleet tally can never accumulate at all.
+    ///
+    /// Saturating, and `0` when nothing is on record — a fleet with no peer
+    /// coordination degrades byte-for-byte to the pre-#9292 per-host tally.
+    #[must_use]
+    pub fn prless_peer_release_count_at(&self, repo: &str, issue: u32, now: Instant) -> u32 {
+        self.prless_releases
+            .iter()
+            .filter(|((r, i, _), entry)| r == repo && *i == issue && entry.streak_expiry > now)
+            .fold(0u32, |acc, (_, entry)| acc.saturating_add(entry.consecutive))
+    }
+
+    /// Every issue in `repo` with a live peer-advertised PR-less-release
+    /// window at local time `now` (Issue #9292) — unioned into
+    /// [`crate::sweep_registry::SweepRegistry::prless_retry_issues`] so a
+    /// peer's backoff window also spaces out *this* host's next claim, the
+    /// half of the fix `prless_retry`'s own doc comment deferred as "fleet-wide
+    /// broadcast of the sub-threshold window".
+    ///
+    /// Read against `window_expiry`, the faster of the entry's two clocks: this
+    /// is the advertised backoff, and when it lapses the next host SHOULD be
+    /// free to claim. The tally keeps counting after that
+    /// ([`Self::prless_peer_release_count_at`]) — a claim's runway and a
+    /// streak's memory are deliberately different lengths.
+    #[must_use]
+    pub fn prless_release_issues_at(&self, repo: &str, now: Instant) -> HashSet<u32> {
+        self.prless_releases
+            .iter()
+            .filter(|((r, _, _), entry)| r == repo && entry.window_expiry > now)
+            .map(|((_, issue, _), _)| *issue)
+            .collect()
+    }
+
+    /// Drop every `prless_releases` entry whose **streak** clock has lapsed at
+    /// local time `now` (Issue #9292) — the
+    /// [`Self::prune_expired_noop_cooldowns`] sibling, pruning on the later of
+    /// the entry's two expiries so an elapsed window never discards a tally
+    /// that is still counting. Also the fleet-wide half of the streak-cold
+    /// rule: a peer that stops re-advertising stops contributing, exactly as a
+    /// local streak older than `max_backoff` restarts at one.
+    pub fn prune_expired_prless_releases(&mut self, now: Instant) {
+        self.prless_releases
+            .retain(|_, entry| entry.streak_expiry > now);
     }
 
     // ------------------------------------------------------------------
@@ -618,6 +848,286 @@ mod tests {
             !view.dispatch_backoff_issues_at("loom", t).contains(&7466),
             "a no-op cooldown must not read back as a dispatch backoff"
         );
+    }
+
+    // ==================================================================
+    // Fleet-wide PR-less-retry tally (Issue #9292)
+    // ==================================================================
+
+    /// A [`ClaimKind::PrlessReleaseArmed`] ad from `host` (Issue #9292).
+    fn prless_ad(host: &str, issue: u32, consecutive: u32, remaining_secs: u64) -> ClaimAd {
+        ClaimAd::prless_release_armed(
+            issue,
+            "rjwalters/loom".to_owned(),
+            host.to_owned(),
+            42,
+            "2026-09-29T00:00:00Z".to_owned(),
+            consecutive,
+            remaining_secs,
+        )
+    }
+
+    #[test]
+    fn prless_release_ads_round_trip_over_the_wire() {
+        let a = prless_ad("host-a", 8812, 2, 600);
+        let parsed = ClaimAd::from_body_str(&a.to_body_json()).unwrap();
+        assert_eq!(parsed, a);
+        assert_eq!(parsed.consecutive, Some(2));
+        assert_eq!(parsed.remaining_secs, Some(600));
+        assert!(
+            parsed.kind.is_cooldown_lane(),
+            "the PR-less lane must route through the brake-lane predicate the \
+             socket layer already gates on, so `safehouse.rs` needs no change"
+        );
+    }
+
+    /// A pre-#9292 peer's ad (or a malformed one) carries no `consecutive`.
+    /// It must parse rather than be rejected, and contribute `0` — never an
+    /// unreadable number that could inflate someone's hold threshold.
+    #[test]
+    fn an_absent_consecutive_degrades_to_none_and_counts_as_zero() {
+        let body = serde_json::json!({
+            super::super::PEER_CLAIM_MARKER: super::super::CLAIM_SCHEMA_VERSION,
+            "kind": "prless_release_armed",
+            "issue": 8812,
+            "repo": "rjwalters/loom",
+            "host": "host-a",
+            "remaining_secs": 600,
+        });
+        let parsed = ClaimAd::from_body_value(&body).unwrap();
+        assert_eq!(parsed.kind, ClaimKind::PrlessReleaseArmed);
+        assert!(parsed.consecutive.is_none());
+
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        assert!(view.observe_prless_release_at(&parsed, t));
+        assert_eq!(view.prless_peer_release_count_at("rjwalters/loom", 8812, t), 0);
+    }
+
+    /// The core #9292 read path: peers' tallies SUM, so three hosts at one
+    /// release each read back as three — the fleet total the threshold is
+    /// compared against.
+    #[test]
+    fn peer_tallies_sum_across_hosts() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        for host in ["B", "C", "D"] {
+            assert!(view.observe_prless_release_at(&prless_ad(host, 8812, 1, 600), t));
+        }
+        assert_eq!(view.prless_peer_release_count_at("rjwalters/loom", 8812, t), 3);
+        assert!(view
+            .prless_release_issues_at("rjwalters/loom", t)
+            .contains(&8812));
+    }
+
+    /// An ad reports a RUNNING TOTAL, not an increment, so a host's repeat ad
+    /// replaces its own entry rather than accumulating — a redelivered or
+    /// duplicated ad can never manufacture a hold.
+    #[test]
+    fn a_repeat_ad_from_one_host_replaces_rather_than_accumulates() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        view.observe_prless_release_at(&prless_ad("B", 8812, 1, 600), t);
+        view.observe_prless_release_at(&prless_ad("B", 8812, 1, 600), t);
+        assert_eq!(
+            view.prless_peer_release_count_at("rjwalters/loom", 8812, t),
+            1,
+            "a duplicate delivery must be idempotent"
+        );
+        view.observe_prless_release_at(&prless_ad("B", 8812, 2, 600), t);
+        assert_eq!(
+            view.prless_peer_release_count_at("rjwalters/loom", 8812, t),
+            2,
+            "a genuine second release raises the same host's entry"
+        );
+    }
+
+    /// This host's own ad is ignored — which is what keeps the peer sum
+    /// disjoint from the caller's local tally. Counting it in both places
+    /// would double every release and trip the hold at half the threshold.
+    /// The `UNKNOWN_HOST` carve-out still applies, as in every other lane.
+    #[test]
+    fn a_hosts_own_prless_ad_is_ignored_but_unknown_host_is_not() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        assert!(!view.observe_prless_release_at(&prless_ad("A", 8812, 3, 600), t));
+        assert_eq!(view.prless_peer_release_count_at("rjwalters/loom", 8812, t), 0);
+
+        let mut unresolved = PeerClaimView::new(
+            crate::sweep_registry::UNKNOWN_HOST.to_string(),
+            Duration::from_secs(120),
+        );
+        let ad = prless_ad(crate::sweep_registry::UNKNOWN_HOST, 8812, 1, 600);
+        assert!(unresolved.observe_prless_release_at(&ad, t));
+        assert_eq!(unresolved.prless_peer_release_count_at("rjwalters/loom", 8812, t), 1);
+    }
+
+    /// A lapsed entry stops counting — the fleet-wide form of the local
+    /// streak-cold rule. A crashed peer must not pin an issue one release
+    /// short of `loom:blocked` forever.
+    #[test]
+    fn a_lapsed_peer_tally_stops_counting_and_prunes() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t0 = Instant::now();
+        view.observe_prless_release_at(&prless_ad("B", 8812, 2, 600), t0);
+        assert_eq!(
+            view.prless_peer_release_count_at(
+                "rjwalters/loom",
+                8812,
+                t0 + Duration::from_secs(599)
+            ),
+            2
+        );
+        let after = t0 + PEER_PRLESS_STREAK_TTL + Duration::from_secs(1);
+        assert_eq!(view.prless_peer_release_count_at("rjwalters/loom", 8812, after), 0);
+        assert!(view
+            .prless_release_issues_at("rjwalters/loom", after)
+            .is_empty());
+
+        view.observe_prless_release_at(&prless_ad("C", 9999, 1, 4 * 3600), t0);
+        view.prune_expired_prless_releases(after);
+        assert!(
+            view.prless_release_issues_at("rjwalters/loom", after)
+                .contains(&9999),
+            "pruning on the streak clock must not discard a still-live window"
+        );
+    }
+
+    /// The #9292 correctness trap, pinned: the tally's clock is **not** the
+    /// advertised window's. A first release advertises a 300 s backoff — which
+    /// is exactly the interval after which the next host is free to claim — so
+    /// a tally that lapsed with the window would be empty at the precise moment
+    /// the fleet's second release lands, and the fleet-wide count could never
+    /// reach the threshold at all. The window stops suppressing dispatch on
+    /// schedule; the count keeps counting.
+    #[test]
+    fn the_tally_outlives_the_advertised_window_it_rode_in_on() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t0 = Instant::now();
+        // Shipped config's first-release window: 300s.
+        view.observe_prless_release_at(&prless_ad("B", 8812, 1, 300), t0);
+
+        // A minute past the window: B's *claim* is unblocked...
+        let unblocked = t0 + Duration::from_secs(360);
+        assert!(
+            !view
+                .prless_release_issues_at("rjwalters/loom", unblocked)
+                .contains(&8812),
+            "the advertised window must free the next claim on schedule"
+        );
+        // ...but B's release still counts toward the fleet streak, which is the
+        // whole mechanism.
+        assert_eq!(
+            view.prless_peer_release_count_at("rjwalters/loom", 8812, unblocked),
+            1,
+            "a lapsed backoff window must not erase the release that armed it"
+        );
+        // And it is not immortal either: the streak clock is the local
+        // cold-streak window.
+        assert_eq!(
+            view.prless_peer_release_count_at(
+                "rjwalters/loom",
+                8812,
+                t0 + PEER_PRLESS_STREAK_TTL + Duration::from_secs(1)
+            ),
+            0
+        );
+    }
+
+    /// An advertiser whose configured window is LONGER than the default streak
+    /// window (a repo with a raised `maxBackoffSecs`, or any held issue riding
+    /// the ceiling) must not have its tally lapse while its own suppression
+    /// window is still live — the streak clock is never the shorter of the two.
+    #[test]
+    fn a_window_longer_than_the_streak_ttl_extends_the_tally_with_it() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t0 = Instant::now();
+        let long = PEER_PRLESS_STREAK_TTL + Duration::from_secs(3600);
+        view.observe_prless_release_at(&prless_ad("B", 8812, 2, long.as_secs()), t0);
+
+        let late = t0 + long - Duration::from_secs(1);
+        assert!(view
+            .prless_release_issues_at("rjwalters/loom", late)
+            .contains(&8812));
+        assert_eq!(view.prless_peer_release_count_at("rjwalters/loom", 8812, late), 2);
+    }
+
+    /// Scoped per `(repo, issue)`: neither another repo's identical issue
+    /// number nor another issue in the same repo may contribute.
+    #[test]
+    fn peer_tallies_are_scoped_to_their_own_repo_and_issue() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        view.observe_prless_release_at(&prless_ad("B", 8812, 2, 600), t);
+        let mut other_repo = prless_ad("B", 8812, 5, 600);
+        other_repo.repo = "someone/else".to_owned();
+        view.observe_prless_release_at(&other_repo, t);
+        view.observe_prless_release_at(&prless_ad("B", 7893, 4, 600), t);
+
+        assert_eq!(view.prless_peer_release_count_at("rjwalters/loom", 8812, t), 2);
+        assert_eq!(view.prless_peer_release_count_at("someone/else", 8812, t), 5);
+        assert_eq!(view.prless_peer_release_count_at("rjwalters/loom", 7893, t), 4);
+    }
+
+    /// An ill-behaved ad cannot keep an issue one release from a hold
+    /// indefinitely: the advertised window is clamped at the cap.
+    #[test]
+    fn an_overlong_prless_window_is_clamped() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t0 = Instant::now();
+        view.observe_prless_release_at(&prless_ad("B", 8812, 2, 365 * 86_400), t0);
+        assert_eq!(
+            view.prless_peer_release_count_at(
+                "rjwalters/loom",
+                8812,
+                t0 + MAX_PEER_PRLESS_RELEASE_TTL - Duration::from_secs(1)
+            ),
+            2
+        );
+        assert_eq!(
+            view.prless_peer_release_count_at(
+                "rjwalters/loom",
+                8812,
+                t0 + MAX_PEER_PRLESS_RELEASE_TTL
+            ),
+            0,
+            "no ad may install a window longer than the cap"
+        );
+    }
+
+    /// A PR-less ad must not be folded into the dispatch-claims map, and must
+    /// not perturb the #6157 coordination-health bookkeeping — the same
+    /// contract every other brake lane carries.
+    #[test]
+    fn a_prless_ad_is_neither_a_claim_nor_dispatch_traffic() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        assert!(!view.observe_at(&prless_ad("B", 8812, 1, 600), t));
+        assert!(view.is_empty());
+        view.observe_prless_release_at(&prless_ad("B", 8812, 1, 600), t);
+        assert_eq!(view.counters(), PeerClaimCounters::default());
+        assert!(!view.coordination_degraded());
+        assert_eq!(view.coordination_receives_toward_recovery(), 0);
+    }
+
+    /// `observe_brake_ad` routes the PR-less lane into its own map — no lane
+    /// may read back as another.
+    #[test]
+    fn observe_brake_ad_routes_the_prless_lane_to_its_own_map() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        observe_brake_ad(&mut view, &prless_ad("B", 8812, 2, 600), t);
+        assert_eq!(view.prless_peer_release_count_at("rjwalters/loom", 8812, t), 2);
+        assert!(
+            !view
+                .noop_cooldown_issues_at("rjwalters/loom", t)
+                .contains(&8812),
+            "a PR-less release must not read back as a no-op cooldown"
+        );
+        assert!(!view
+            .dispatch_backoff_issues_at("rjwalters/loom", t)
+            .contains(&8812));
+        assert!(view.is_empty(), "no brake lane may fold into the claims map");
     }
 
     // ==================================================================

@@ -217,7 +217,7 @@ export async function signAccessToken(
 ): Promise<string> {
   if (!signingKey) throw new Error("call initAccessTestKeys() in beforeAll first");
   const { SignJWT } = await import("jose");
-  return new SignJWT({ email: overrides.email ?? "operator@2amlogic.com" })
+  return new SignJWT({ email: overrides.email ?? "operator@example.com" })
     .setProtectedHeader({ alg: "RS256" })
     .setIssuedAt()
     .setIssuer(`https://${TEST_TEAM_DOMAIN}`)

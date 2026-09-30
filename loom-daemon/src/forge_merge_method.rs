@@ -40,13 +40,13 @@ use crate::forge_cmd::{detect_forge, gh_bin, ForgeType, EX_FORGE_DECLINED, FORGE
 /// `bool`s so [`resolve_merge_method`] never has to know which forge or
 /// transport it came from.
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
-struct RepoMergeFlags {
+pub(crate) struct RepoMergeFlags {
     #[serde(default)]
-    allow_squash_merge: bool,
+    pub(crate) allow_squash_merge: bool,
     #[serde(default, alias = "allow_merge_commits")]
-    allow_merge_commit: bool,
+    pub(crate) allow_merge_commit: bool,
     #[serde(default)]
-    allow_rebase_merge: bool,
+    pub(crate) allow_rebase_merge: bool,
 }
 
 /// The pure decision behind `loom-daemon forge merge-method` (#8845): given
@@ -63,7 +63,10 @@ struct RepoMergeFlags {
 ///   augments, in `defaults/scripts/lib/forge-merge-method.sh`) uses, including
 ///   its fail-open-to-merge degenerate case (a forge reporting every allow_*
 ///   flag false, which neither forge's UI actually permits).
-fn resolve_merge_method(requested: Option<&str>, flags: RepoMergeFlags) -> Result<String, String> {
+pub(crate) fn resolve_merge_method(
+    requested: Option<&str>,
+    flags: RepoMergeFlags,
+) -> Result<String, String> {
     if let Some(req) = requested {
         let allowed = match req {
             "squash" => flags.allow_squash_merge,

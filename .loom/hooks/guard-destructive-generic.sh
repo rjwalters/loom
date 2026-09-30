@@ -1060,6 +1060,209 @@ resolve_worktree_root() {
 }
 
 # =============================================================================
+# SESSION-OWNED SCRATCH DIRECTORY — the one rm-scope carve-out (issue #8460,
+# parent #8453 item 5). Read this whole comment before touching any of the
+# three functions below: every condition is load-bearing, and the failure mode
+# of getting one wrong is one agent deleting another agent's work.
+#
+# WHAT PROBLEM THIS SOLVES
+# A worker that needs a hermetic build — a private CARGO_TARGET_DIR, so that a
+# shared cross-worktree cargo target dir cannot cross-contaminate its test
+# binaries (#8453) — must put that directory OUTSIDE the repo: a multi-GB build
+# tree inside the worktree is exactly what the worktree-removal path is not
+# built to carry. rmScope=repo then refuses to let the worker clean up after
+# itself (`rm-scope-outside-repo`), so on 2026-09-20 three agents each
+# abandoned 3.5-11 GB of private build output on one fleet host.
+#
+# THE RULE: a session may remove ITS OWN scratch directory, and nothing else.
+# An rm target is admitted only when ALL of the following hold:
+#   1. A scratch ROOT resolves and survives the sanity screen below
+#      (LOOM_GUARD_SCRATCH_ROOT / guards.scratchRoot / $HOME/.cache default).
+#   2. The acting session has a plausible, path-segment-safe session id.
+#   3. The target is `<root>/<session-id>` itself, or a path UNDER it. The root
+#      itself is never admitted, and `<root>/<other-session-id>` can never
+#      match, because the segment is compared to THIS session's own id.
+#   4. `<root>/<session-id>` is a real directory, not a symlink.
+#   5. It carries an ownership marker naming THIS session (see below).
+#   6. The target's PHYSICAL path is still inside the session dir's physical
+#      path — so a symlink planted inside the session dir cannot be used as a
+#      tunnel to something outside it.
+# Anything unprovable — no root, no session id, no marker, unreadable marker,
+# marker naming a different session — returns failure, which leaves IN_SCOPE
+# false and lets the ordinary `rm-scope-outside-repo` deny fire. The carve-out
+# can only ever ADD an allow for a path it has positively proven; it is
+# structurally incapable of widening any other rm decision, and it is reached
+# only AFTER the unconditional catastrophic-path deny (/, $HOME, /<one-seg>)
+# has already run, so the denial floor is untouched.
+#
+# WHY THIS LIVES IN THE GUARD AT ALL. Issue #8460 asked for an explicit choice
+# between this and a `loom-daemon` subcommand that performs the removal itself.
+# The guard won on ONE decisive property: Claude Code supplies `session_id` on
+# this hook's STDIN, and the hook is spawned by the harness, not by the model,
+# so the acting session cannot influence the value. A daemon-side remover is
+# invoked as an ordinary Bash command, so the only identity available to it is
+# one the caller supplies (`CLAUDE_CODE_SESSION_ID=<victim> loom-daemon …`) —
+# i.e. exactly the spoofable ownership check #8460's acceptance criteria call
+# out — and it would add a privileged deletion surface reachable from any Bash
+# command. Full rationale, and the recipe agents follow:
+# defaults/docs/guard-hooks.md → "Session-owned scratch directories".
+# =============================================================================
+
+# Ownership marker file name. Nothing in Loom WRITES this file: the session
+# that wants a private scratch dir creates it itself (`mkdir` + one redirect,
+# both already permitted outside the repo). This guard only ever READS it.
+# Contract, documented in guard-hooks.md: a regular file whose `session=<id>`
+# line names the session that owns the directory.
+SESSION_SCRATCH_MARKER=".loom-session-scratch"
+
+# Resolve the scratch root, or return 1 when none is usable (carve-out inert).
+# Resolution order mirrors every other knob in this file: env → config →
+# default. LAZY + cached: only ever reached after a target has already failed
+# every other in-scope test, so the config read never touches the hot path.
+_SCRATCH_ROOT_DONE=""
+_SCRATCH_ROOT_CACHE=""
+resolve_scratch_root() {
+    if [[ -z "$_SCRATCH_ROOT_DONE" ]]; then
+        _SCRATCH_ROOT_DONE=yes
+        local root="" bad=0
+        if [[ -n "${LOOM_GUARD_SCRATCH_ROOT:-}" ]]; then
+            # Env wins. NOT agent-settable in practice: this hook runs as a
+            # separate process spawned by the harness, so an inline
+            # `LOOM_GUARD_SCRATCH_ROOT=… rm -rf …` prefix does NOT reach here
+            # (the same property the worktree-isolation deny messages rely on).
+            root="$LOOM_GUARD_SCRATCH_ROOT"
+        elif [[ -n "$REPO_ROOT" ]]; then
+            root=$(loom_config_get "$REPO_ROOT" "guards.scratchRoot" "" 2>/dev/null) || root=""
+        fi
+        if [[ -z "$root" && -n "${HOME:-}" ]]; then
+            root="$HOME/.cache/loom/session-scratch"
+        fi
+        # Absolute + lexically normalized, so the containment tests below are
+        # byte comparisons against a canonical form. A relative value is
+        # meaningless here and is dropped rather than cwd-joined.
+        if [[ "$root" == /* ]]; then
+            root=$(normalize_abs_path "$root")
+        else
+            root=""
+        fi
+        # ROOT SANITY SCREEN — a misconfigured root must make the carve-out
+        # inert, never broad. Each rejected shape is one where `<root>/<id>`
+        # could name something that is not a private scratch directory:
+        #   /                        — the catastrophic target itself
+        #   $HOME                    — `<root>/<id>` would be a home subdir
+        #   /<one-segment>           — /tmp, /usr, /opt … (system dirs)
+        #   the repo root, or any ancestor of it — the repo's own siblings
+        if [[ -n "$root" ]]; then
+            if [[ "$root" == "/" ]]; then
+                bad=1
+            elif [[ -n "${HOME:-}" && "$root" == "$HOME" ]]; then
+                bad=1
+            elif [[ "$root" =~ ^/[^/]+$ ]]; then
+                bad=1
+            elif [[ -n "$REPO_ROOT" ]] && \
+                 { [[ "$root" == "$REPO_ROOT" ]] || [[ "$REPO_ROOT" == "$root"/* ]]; }; then
+                bad=1
+            fi
+            if [[ "$bad" == 1 ]]; then
+                log_hook_error "scratch root rejected as unsafe; session-scratch carve-out inert: $root"
+                root=""
+            fi
+        fi
+        _SCRATCH_ROOT_CACHE="$root"
+    fi
+    [[ -n "$_SCRATCH_ROOT_CACHE" ]] || return 1
+    printf '%s' "$_SCRATCH_ROOT_CACHE"
+}
+
+# The acting session's id, straight off this hook's stdin (see the block
+# comment above for why that channel is the trustworthy one). Returns 1 —
+# carve-out inert — when absent or not a plausible path segment. The shape gate
+# is a SAFETY check, not cosmetics: an empty / `.` / `..` / slash-bearing /
+# very short id would make `<root>/<id>` name something other than one
+# session's own private directory.
+_SCRATCH_SID_DONE=""
+_SCRATCH_SID_CACHE=""
+current_session_id() {
+    if [[ -z "$_SCRATCH_SID_DONE" ]]; then
+        _SCRATCH_SID_DONE=yes
+        local sid=""
+        sid=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null) || sid=""
+        if ! [[ "$sid" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]]; then
+            sid=""
+        fi
+        _SCRATCH_SID_CACHE="$sid"
+    fi
+    [[ -n "$_SCRATCH_SID_CACHE" ]] || return 1
+    printf '%s' "$_SCRATCH_SID_CACHE"
+}
+
+# Return 0 ONLY when $1 (an already-normalized absolute rm target) is this
+# session's own scratch directory or something under it. $2 is the same
+# target's RAW absolute spelling, before normalize_abs_path() ran. Every
+# failure path returns 1 (fail CLOSED) — see the six numbered conditions above.
+rm_scope_session_scratch_admits() {
+    local abs="$1" raw="${2-}"
+    local root sid dir marker recorded pdir pabs
+    # (0) No `..` segment anywhere in the raw target (and a missing raw
+    # spelling is itself unprovable). normalize_abs_path() pops `..`
+    # LEXICALLY, but the kernel resolves it PHYSICALLY: with
+    # `<session-dir>/tunnel -> /some/dir/inner`, the target
+    # `<session-dir>/tunnel/../x` normalizes to `<session-dir>/x` — which
+    # passes (3) and (6) — while `rm` actually deletes `/some/dir/x`. Deeper
+    # nesting reaches anything the symlink's depth allows. Condition (6) can
+    # only re-check the NORMALIZED text, so the one sound fix is to never
+    # admit a target whose raw spelling needs `..` resolution at all; the
+    # documented recipe never uses one.
+    [[ -n "$raw" ]] || return 1
+    if [[ "/$raw/" == */../* ]]; then
+        return 1
+    fi
+    root=$(resolve_scratch_root) || return 1
+    sid=$(current_session_id) || return 1
+    dir="$root/$sid"
+
+    # (3) The session dir itself, or a descendant. NEVER the root (it has no
+    # owning session), and never a sibling: the segment IS this session's id.
+    if [[ "$abs" != "$dir" && "$abs" != "$dir"/* ]]; then
+        return 1
+    fi
+    # (4) A real directory. A SYMLINK named `<root>/<session-id>` would let
+    # whoever planted it choose what this carve-out admits, so it is refused
+    # outright rather than followed.
+    if [[ ! -d "$dir" ]] || [[ -L "$dir" ]]; then
+        return 1
+    fi
+    # (5) The ownership marker must exist as a regular non-symlink file and
+    # record THIS session. A missing, unreadable, malformed, or
+    # different-session marker is a refusal — which is what makes "another
+    # agent's private dir under the same root" unremovable even though its
+    # path shape is identical to ours.
+    marker="$dir/$SESSION_SCRATCH_MARKER"
+    if [[ ! -f "$marker" ]] || [[ -L "$marker" ]]; then
+        return 1
+    fi
+    recorded=$(head -c 8192 "$marker" 2>/dev/null | sed -n 's/^session=//p' | head -1) || recorded=""
+    if [[ -z "$recorded" || "$recorded" != "$sid" ]]; then
+        return 1
+    fi
+    # (6) Symlink-traversal defense. The lexical test in (3) proves the TEXT of
+    # the target is under the session dir; it cannot see that
+    # `<session-dir>/link` is a symlink to /important, which `rm -rf
+    # <session-dir>/link/x` would delete through. Re-check containment on the
+    # physical paths, using the session dir's own physical form as the base, so
+    # a symlinked ANCESTOR (the root, $HOME) is not mistaken for an escape.
+    pdir=$(physical_abs_path "$dir" 2>/dev/null) || pdir=""
+    pabs=$(physical_abs_path "$abs" 2>/dev/null) || pabs=""
+    if [[ -z "$pdir" || -z "$pabs" ]]; then
+        return 1
+    fi
+    if [[ "$pabs" != "$pdir" && "$pabs" != "$pdir"/* ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
 # worktree-isolation toggle — Bash-tool write confinement (issue #4178).
 #
 # guard-worktree-paths.sh confines the Edit/Write TOOL matcher to a builder's
@@ -4118,6 +4321,69 @@ function mask_comment(s,   out, n, i, c, prev, mode, SQ, DQ) {
 #     guard never writes to it, executes it, or reports its content back to
 #     the caller — only the boolean "did it match curcwd" outcome feeds the
 #     resolution.
+#
+# `NAME=$(cd <literal-path> && pwd)` / `NAME=$(realpath <literal-path>)`
+# SELF-CONTAINED CWD CAPTURE (#9312): guard-decision telemetry (#3898) showed
+# force-op:detached firing at ASK 31 times for yet another capture shape none
+# of #6152/#6724/#7532 above cover -- a SINGLE assignment whose OWN command
+# substitution both changes directory AND captures the result, e.g.:
+#
+#   WORKTREE_ABS="$(cd .loom/worktrees/issue-N && pwd)"
+#   git -C "$WORKTREE_ABS" reset --hard origin/feature/issue-N
+#
+# This is NOT the #6724 shape: #6724's cd_proven/$(pwd) carve-out requires a
+# SEPARATE, EARLIER same-command `cd <path>` segment to have already proven
+# curcwd before it will trust a later bare `$(pwd)` -- it never even inspects
+# an assignment whose `cd` and `pwd` are both INSIDE that assignment's own
+# substitution, so that scan never fires for this shape at all. Unlike the
+# `$(pwd)`/`$(cat <file>)` carve-outs above, this capture needs no cd_proven
+# trust gate: the `cd <literal-path>` is itself part of the literal text being
+# recognized, so the resulting absolute path is derived the exact same way a
+# real top-level `cd <literal-path>` argument already is (join a relative
+# literal against the tracked curcwd, absolute literal used as-is -- see the
+# `toks[1] == "cd"` case a few hundred lines below) -- never guessed, never
+# dependent on anything having actually run.
+#
+# CROSS-SEGMENT SPLIT (`$(realpath …)` is NOT affected): qsplit() (#3755,
+# #7498) is "live substitution"-aware -- it treats `&&`/`;`/`|` INSIDE a
+# `$(...)`/backtick span as a REAL, live command separator, because it
+# genuinely is one to the real shell (outer quoting only suppresses
+# word-splitting of the substitution's OUTPUT, never the parsing of its own
+# contents). So `NAME="$(cd <literal-path> && pwd)"` is ALREADY split in two
+# by the time this scan ever sees it -- `NAME="$(cd <literal-path>` (open,
+# unterminated) as one segment, `pwd)"` (close) as the very next. The `cd`
+# half is recognized and its literal path stashed in
+# pending_cdpwd_name/pending_cdpwd_path (extract_cdpwd_open(), tried in
+# next_assignword_len()'s chain via match_cdpwd_open_assignword()); the
+# resolution itself happens at the TOP of the NEXT segment's processing (see
+# the `if (pending_cdpwd_name != "")` check in the main per-segment loop
+# below), where the `pwd)`/`` pwd` `` close is expected -- any other shape
+# there abandons the pending capture unresolved, fail closed. `$(realpath
+# <literal-path>)` has no internal separator at all, so qsplit() never splits
+# it -- it resolves in a single step via extract_realpath_path(), exactly
+# like the #7532 `$(cat <file>)` carve-out above.
+#
+# Narrow scope, mirroring #7532's own narrow scope:
+#   - ONLY the literal shapes `$(cd <literal-path> && pwd)`, `` `cd
+#     <literal-path> && pwd` ``, `$(realpath <literal-path>)`, and `` `realpath
+#     <literal-path>` `` (bare, double-quoted, or backtick) -- any other
+#     command substitution is left to fall through to record_assign()
+#     unresolved, same as before.
+#   - `<literal-path>` itself must be a TRUE literal: once unquoted via
+#     strip_cd_quoting(), any surviving `$`, `"`, or `'` byte (a nested
+#     variable/substitution, or a quote left unterminated) aborts the
+#     recognizer and falls through unresolved -- fail closed, exactly #7532's
+#     own literal-only contract.
+#   - a SINGLE-QUOTED `NAME='$(cd <path> && pwd)'` is excluded on purpose,
+#     same rationale as the single-quoted `$(pwd)`/`$(cat <file>)` cases
+#     above.
+#   - this recognizer ONLY widens where a literal cwd string can be EXTRACTED
+#     FROM (an additional same-command assignment shape feeding `-C`/`cd`) --
+#     it does not touch `_fdetached_safe`'s own downstream safe-shape
+#     predicate (the managed-worktree/own-branch checks), and it does not
+#     touch the UNRELATED force-push handling at all (`git -C "$VAR" push
+#     --force-with-lease` keeps resolving through its existing, separate
+#     code path).
 parse_force_ops() {
     printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_VARRESOLVE_AWK"'
     # #7532: recognize a literal `$(cat <file>)` / `` `cat <file>` `` command
@@ -4156,6 +4422,96 @@ parse_force_ops() {
         close(path)
         if (rc <= 0) return ""
         return line
+    }
+    # #9312: recognize an OPEN (not-yet-closed) `$(cd <literal-path>` / `` `cd
+    # <literal-path> `` command substitution -- the FIRST half of `NAME=$(cd
+    # <literal-path> && pwd)` after qsplit()'"'"'s quote-aware segmentation has
+    # already split it in two. qsplit() is "live substitution"-aware (#7498):
+    # it recognizes `&&` INSIDE a `$(...)`/backtick span as a REAL, live
+    # command separator (because it genuinely is one to the real shell --
+    # outer quoting only suppresses word-splitting of the substitution'"'"'s
+    # OUTPUT, never the parsing of its own contents) and splits there, even
+    # though the whole thing sits inside an outer-quoted assignment value.
+    # So by the time parse_force_ops()'"'"'s per-segment loop ever sees this
+    # value, `NAME="$(cd <literal-path> && pwd)"` has ALREADY become two
+    # `\n`-joined segments:
+    #   segment N:   NAME="$(cd <literal-path><trailing-space>
+    #   segment N+1: <leading-space>pwd)"
+    # (see the `pending_cdpwd_name` check in the main per-segment loop below
+    # for the segment-N+1 half). Returns the UNQUOTED <literal-path>
+    # extracted from segment N'"'"'s value, or "" if `v` is not that exact
+    # open shape (including when <literal-path> is not itself a true literal
+    # -- see the header comment above parse_force_ops() for the full
+    # rationale). Sets the global `_cdpwd_open_backtick` side flag (awk
+    # functions return one value; every OTHER caller in this file overwrites
+    # it immediately after checking this call'"'"'s return, so no value can
+    # leak across calls). Purely textual -- never touches the filesystem.
+    function extract_cdpwd_open(v,   dq, sq, inner) {
+        dq = sprintf("%c", 34)
+        sq = sprintf("%c", 39)
+        _cdpwd_open_backtick = 0
+        if (length(v) >= 1 && substr(v, 1, 1) == dq) {
+            v = substr(v, 2)   # a lone, still-open leading double quote --
+                                # the matching close arrives via segment N+1.
+        }
+        if (v ~ /^\$\(cd[ \t]+[^)]*$/) {
+            inner = v
+            sub(/^\$\(cd[ \t]+/, "", inner)
+        } else if (v ~ /^`cd[ \t]+[^`]*$/) {
+            inner = v
+            sub(/^`cd[ \t]+/, "", inner)
+            _cdpwd_open_backtick = 1
+        } else {
+            return ""
+        }
+        sub(/[ \t]+$/, "", inner)
+        if (inner == "") return ""
+        inner = strip_cd_quoting(inner)   # unquote the path argument itself
+        # literal-only: a surviving `$`/quote byte means a nested
+        # variable/substitution or an unterminated quote -- fail closed.
+        if (index(inner, "$") > 0 || index(inner, dq) > 0 || index(inner, sq) > 0) return ""
+        return inner
+    }
+    # #9312: the `realpath` sibling of extract_cdpwd_open() above -- recognizes
+    # `$(realpath <literal-path>)` / `` `realpath <literal-path>` `` and
+    # returns the same UNQUOTED, literal-only-checked <literal-path>, or "" if
+    # `v` is not that exact shape.
+    function extract_realpath_path(v,   dq, sq, inner) {
+        dq = sprintf("%c", 34)
+        sq = sprintf("%c", 39)
+        if (length(v) >= 2 && substr(v, 1, 1) == dq && substr(v, length(v), 1) == dq) {
+            v = substr(v, 2, length(v) - 2)
+        }
+        if (v ~ /^\$\(realpath[ \t]+[^)]+\)$/) {
+            inner = v
+            sub(/^\$\(realpath[ \t]+/, "", inner)
+            sub(/\)$/, "", inner)
+        } else if (v ~ /^`realpath[ \t]+[^`]+`$/) {
+            inner = v
+            sub(/^`realpath[ \t]+/, "", inner)
+            sub(/`$/, "", inner)
+        } else {
+            return ""
+        }
+        sub(/^[ \t]+/, "", inner)
+        sub(/[ \t]+$/, "", inner)
+        if (inner == "") return ""
+        inner = strip_cd_quoting(inner)   # unquote the path argument itself
+        if (index(inner, "$") > 0 || index(inner, dq) > 0 || index(inner, sq) > 0) return ""
+        return inner
+    }
+    # #9312: join a literal path extracted by extract_cdpwd_open()/
+    # extract_realpath_path() against the tracked curcwd -- the SAME
+    # absolute-vs-relative join (plus ~/`$HOME` expansion via expand_cd_arg())
+    # a literal top-level `cd <literal-path>` argument already gets a few
+    # hundred lines below (the `toks[1] == "cd"` case). Returns "" (leave
+    # unresolved) only when the path is relative and curcwd is not yet known
+    # -- curcwd is seeded from startcwd, so in practice this is never empty.
+    function resolve_cdpwd_literal(litpath, curcwd, home,   expanded) {
+        expanded = expand_cd_arg(litpath, home)
+        if (expanded ~ /^\//) return expanded
+        if (curcwd == "") return ""
+        return curcwd "/" expanded
     }
     # #7532: match_assignword() (shared, #6953) deliberately stops an UNQUOTED
     # assignment value at its first unquoted space/tab -- documented there as
@@ -4198,16 +4554,90 @@ parse_force_ops() {
         }
         return 0
     }
+    # #9312: the same unquoted-measuring carve-out as match_cat_assignword()
+    # above, for `NAME=$(realpath <path>)` / `` NAME=`realpath <path>` ``.
+    # Without this, match_assignword() would truncate an UNQUOTED assignment
+    # at its first unquoted space (the space right after `realpath`) before
+    # extract_realpath_path() ever saw the full value. Returns 0 (never
+    # matches) for every other shape, including the already-handled
+    # double-quoted form (match_assignword() already spans that correctly).
+    function match_realpath_assignword(seg,   n, rest, closeidx, spanlen, nxt) {
+        if (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=\$\(realpath[ \t]+/)) {
+            n = RSTART + RLENGTH
+            rest = substr(seg, n)
+            closeidx = index(rest, ")")
+            if (closeidx == 0) return 0
+            spanlen = (n - 1) + closeidx
+            # #9317: a non-whitespace byte AFTER the close means the real
+            # assignment value is LONGER than this span (e.g.
+            # `W=$(realpath <path>)/../../..`, which the shell sets to a
+            # DIFFERENT directory than the substitution alone yields). The
+            # measured span is what the value-extractor downstream sees, so
+            # matching here would hand it a PREFIX of the true value and let
+            # the guard judge safety against the wrong directory. Refuse the
+            # match entirely (fail closed) -- the same discipline the cdpwd
+            # close-test already applies by requiring an empty/`"` remainder.
+            if (spanlen < length(seg)) {
+                nxt = substr(seg, spanlen + 1, 1)
+                if (nxt != " " && nxt != "\t") return 0
+            }
+            while (spanlen < length(seg) && (substr(seg, spanlen + 1, 1) == " " || substr(seg, spanlen + 1, 1) == "\t")) spanlen++
+            return spanlen
+        }
+        if (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=`realpath[ \t]+/)) {
+            n = RSTART + RLENGTH
+            rest = substr(seg, n)
+            closeidx = index(rest, "`")
+            if (closeidx == 0) return 0
+            spanlen = (n - 1) + closeidx
+            # #9317: a non-whitespace byte AFTER the close means the real
+            # assignment value is LONGER than this span (e.g.
+            # `W=$(realpath <path>)/../../..`, which the shell sets to a
+            # DIFFERENT directory than the substitution alone yields). The
+            # measured span is what the value-extractor downstream sees, so
+            # matching here would hand it a PREFIX of the true value and let
+            # the guard judge safety against the wrong directory. Refuse the
+            # match entirely (fail closed) -- the same discipline the cdpwd
+            # close-test already applies by requiring an empty/`"` remainder.
+            if (spanlen < length(seg)) {
+                nxt = substr(seg, spanlen + 1, 1)
+                if (nxt != " " && nxt != "\t") return 0
+            }
+            while (spanlen < length(seg) && (substr(seg, spanlen + 1, 1) == " " || substr(seg, spanlen + 1, 1) == "\t")) spanlen++
+            return spanlen
+        }
+        return 0
+    }
+    # #9312: the OPEN-ended sibling of match_realpath_assignword() above, for
+    # the UNQUOTED `NAME=$(cd <path>` / `` NAME=`cd <path> `` half qsplit()
+    # leaves behind after splitting on the live `&&` inside the substitution
+    # (see extract_cdpwd_open()'"'"'s header comment for the full rationale).
+    # Unlike every other matcher in this chain, there is no closing
+    # `)`/backtick to search for AT ALL in `seg` -- the match is anchored to
+    # the true END of `seg` (`$`), so this returns `length(seg)` (consume the
+    # WHOLE remainder) only when NOTHING follows the open substitution in this
+    # segment, which is exactly the shape qsplit()'"'"'s split produces. Returns 0
+    # for every other shape, including a `$(cd <path>)` that is ALREADY fully
+    # closed within this same segment (a `cd` with no `&& pwd` at all --
+    # out of scope, left for match_assignword() as before).
+    function match_cdpwd_open_assignword(seg) {
+        if (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=\$\(cd[ \t]+[^)]*$/) return length(seg)
+        if (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=`cd[ \t]+[^`]*$/) return length(seg)
+        return 0
+    }
     # #7532: try the narrow cat-specific carve-out FIRST (it only ever matches
     # the exact unquoted `NAME=$(cat <file>)`/`` NAME=`cat <file>` `` shape);
-    # fall back to the shared match_assignword() for every other assignment,
-    # completely unchanged from before this issue.
+    # then the #9312 realpath carve-out, then the #9312 open-ended cd
+    # carve-out; fall back to the shared match_assignword() for every other
+    # assignment, completely unchanged from before any of these issues.
     function next_assignword_len(seg,   l) {
         l = match_cat_assignword(seg)
+        if (l == 0) l = match_realpath_assignword(seg)
+        if (l == 0) l = match_cdpwd_open_assignword(seg)
         if (l == 0) l = match_assignword(seg)
         return l
     }
-    BEGIN { SEP = sprintf("%c", 31); curcwd = startcwd; cd_proven = 0 }
+    BEGIN { SEP = sprintf("%c", 31); curcwd = startcwd; cd_proven = 0; pending_cdpwd_name = "" }
                                        # SEP is non-whitespace so bash read
                                        # does not trim an empty cpath.
                                        # cd_proven (#6724) tracks whether a
@@ -4217,7 +4647,13 @@ parse_force_ops() {
                                        # cwd) even with NO cd at all, so
                                        # curcwd != "" alone cannot distinguish
                                        # a proven same-command cd from that
-                                       # default seed.
+                                       # default seed. pending_cdpwd_name
+                                       # (#9312) threads an OPEN `NAME=$(cd
+                                       # <path>` half (see
+                                       # extract_cdpwd_open()'"'"'s header
+                                       # comment) across to the very next
+                                       # segment, where its `pwd)`/`` pwd` ``
+                                       # close is expected.
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
@@ -4226,6 +4662,39 @@ parse_force_ops() {
             sub(/^[ \t]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
+            # #9312: if the PREVIOUS segment left an open `NAME=$(cd <path>`
+            # capture pending, this segment MUST be its `pwd)`/`` pwd` ``
+            # close (qsplit()'"'"'s live-substitution split always produces
+            # these as adjacent segments, see extract_cdpwd_open()'"'"'s header
+            # comment) -- checked BEFORE the assignment scan below because
+            # this segment is pure closing syntax, never a real assignment or
+            # command of its own. A match resolves the pending literal path
+            # against curcwd (resolve_cdpwd_literal(), same join a literal
+            # `cd <path>` argument gets a few hundred lines below) and stores
+            # it into varmap; anything else abandons the pending capture
+            # (fail closed -- never guessed) and falls through to this
+            # segment'"'"'s own normal processing.
+            if (pending_cdpwd_name != "") {
+                _cdpwd_closed = 0
+                if (_cdpwd_open_backtick) {
+                    if (match(seg, /^pwd[ \t]*`/)) {
+                        _cdpwd_rest = substr(seg, RSTART + RLENGTH)
+                        if (_cdpwd_rest == "" || _cdpwd_rest == DQ) _cdpwd_closed = 1
+                    }
+                } else {
+                    if (match(seg, /^pwd[ \t]*\)/)) {
+                        _cdpwd_rest = substr(seg, RSTART + RLENGTH)
+                        if (_cdpwd_rest == "" || _cdpwd_rest == DQ) _cdpwd_closed = 1
+                    }
+                }
+                if (_cdpwd_closed) {
+                    _cdpwd_resolved = resolve_cdpwd_literal(pending_cdpwd_path, curcwd, home)
+                    if (_cdpwd_resolved != "") varmap[pending_cdpwd_name] = _cdpwd_resolved
+                    pending_cdpwd_name = ""
+                    continue
+                }
+                pending_cdpwd_name = ""
+            }
             # Record any `NAME=value` assignment(s) leading this segment into
             # varmap for LATER segments'"'"' -C/cd resolve_var() lookups (#6152) —
             # mirrors extract_write_targets()'"'"'s identical assignment scan
@@ -4265,6 +4734,38 @@ parse_force_ops() {
                     # curcwd, see the header comment above parse_force_ops()
                     # for the full rationale and narrow scope.
                     varmap[pwdname] = curcwd
+                } else if ((cdpwdpath = extract_realpath_path(pwdval)) != "") {
+                    # #9312: NAME=$(realpath <literal-path>) -- SELF-CONTAINED
+                    # cwd capture (no internal shell separator, so qsplit()
+                    # never splits it -- unlike the `cd <path> && pwd` shape
+                    # just below), no cd_proven gate needed (see the header
+                    # comment above parse_force_ops() for the full rationale).
+                    # Resolve the extracted literal against curcwd exactly
+                    # like a literal `cd <literal-path>` argument does a few
+                    # hundred lines below; an unresolvable join (relative
+                    # literal, no curcwd yet) falls through to record_assign()
+                    # unresolved, same fail-toward-asking default as
+                    # everywhere else in this scan.
+                    cdpwdresolved = resolve_cdpwd_literal(cdpwdpath, curcwd, home)
+                    if (cdpwdresolved != "") {
+                        varmap[pwdname] = cdpwdresolved
+                    } else {
+                        record_assign(assignword)
+                    }
+                } else if ((cdpwdpath = extract_cdpwd_open(pwdval)) != "") {
+                    # #9312: NAME=$(cd <literal-path> && pwd) / `` `cd
+                    # <literal-path> && pwd` `` -- this is the OPEN half only
+                    # (qsplit() has already split this segment right before
+                    # the live `&&`, see extract_cdpwd_open()'"'"'s header
+                    # comment); do not resolve yet -- thread it to the very
+                    # next segment via pending_cdpwd_name/pending_cdpwd_path,
+                    # where the matching `pwd)`/`` pwd` `` close (checked at
+                    # the top of this per-segment loop, above) actually
+                    # resolves it into varmap. If that close never arrives
+                    # (any other shape), the pending capture is simply
+                    # abandoned there -- fail closed, never guessed.
+                    pending_cdpwd_name = pwdname
+                    pending_cdpwd_path = cdpwdpath
                 } else {
                     record_assign(assignword)
                 }
@@ -8319,6 +8820,9 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
         elif [[ -n "$CWD" ]]; then
             ABS_PATH="$CWD/$_rmclassify"
         fi
+        # Pre-normalization spelling, for the session-scratch carve-out's
+        # `..`-segment refusal (#8460) — see rm_scope_session_scratch_admits().
+        _rm_abs_raw="$ABS_PATH"
 
         # Lexically normalize the absolute target BEFORE the protected-path
         # check. This collapses //, resolves . and .., and strips trailing
@@ -8443,6 +8947,7 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                     _rm_literal_resolved=$(rm_scope_literal_same_command_resolve "$target" "$COMMAND_RM_MKTEMP_SCAN") || true
                     if [[ -n "$_rm_literal_resolved" ]]; then
                         ABS_PATH="$_rm_literal_resolved"
+                        _rm_abs_raw="$ABS_PATH"
                         if [[ "$ABS_PATH" = /* ]]; then
                             ABS_PATH=$(normalize_abs_path "$ABS_PATH")
                         fi
@@ -8508,8 +9013,31 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                     esac
                 fi
 
+                # THIS SESSION'S OWN private scratch/build directory (#8460).
+                # Deliberately LAST: every cheaper, purely-lexical test above
+                # has already failed, and this one stats the filesystem and
+                # reads an ownership marker. It admits `<scratch-root>/<this
+                # session's id>` and paths under it, and nothing else — not the
+                # root, not a sibling session's directory, not a symlink out.
+                # See rm_scope_session_scratch_admits()'s own block comment.
+                if [[ "$IN_SCOPE" == false ]] && rm_scope_session_scratch_admits "$ABS_PATH" "$_rm_abs_raw"; then
+                    IN_SCOPE=true
+                fi
+
                 if [[ "$IN_SCOPE" == false ]]; then
-                    deny "BLOCKED: rm target outside repo scope (LOOM_RM_SCOPE=repo): $ABS_PATH" "rm-scope-outside-repo"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_RM_MKTEMP_SCAN
+                    # Remediation hint for the case this deny is most often
+                    # WRONGLY worked around by simply abandoning a multi-GB
+                    # build dir: the target IS under the session-scratch root,
+                    # but this session could not prove it owns it. Emitted only
+                    # for such targets, so every other out-of-repo deny keeps
+                    # its existing wording byte-for-byte.
+                    _rm_scratch_hint=""
+                    _rm_scratch_root=$(resolve_scratch_root) || _rm_scratch_root=""
+                    if [[ -n "$_rm_scratch_root" ]] && \
+                       { [[ "$ABS_PATH" == "$_rm_scratch_root" ]] || [[ "$ABS_PATH" == "$_rm_scratch_root"/* ]]; }; then
+                        _rm_scratch_hint=" This path is under the session-scratch root ($_rm_scratch_root), but this session cannot prove it owns it. The only removable path there is <root>/<this session's id> — or something under it — and that directory must be a real (non-symlink) directory holding a regular file named $SESSION_SCRATCH_MARKER whose 'session=' line names that same id. The root itself is never removable, and another session's directory never is. See defaults/docs/guard-hooks.md -> 'Session-owned scratch directories' for the create-build-remove recipe."
+                    fi
+                    deny "BLOCKED: rm target outside repo scope (LOOM_RM_SCOPE=repo): $ABS_PATH$_rm_scratch_hint" "rm-scope-outside-repo"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_RM_MKTEMP_SCAN
                 fi
             fi
         fi

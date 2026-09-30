@@ -478,3 +478,314 @@ fn self_heartbeat_is_ignored() {
         now
     ));
 }
+
+// ============================================================================
+// Issue #9294: publish-side blockage, and what `received=0` actually means
+// ============================================================================
+//
+// **The measured outage.** `loom-worker-1`, 2026-09-29: the fleet's claims
+// room (`!WyzxHvMPAPaCqaXmL6:…`) had accepted no event of any kind since
+// 2026-09-23T17:54:52Z — the homeserver lost its forward extremities and 500s
+// every send (`cannot create a non-create event in a room with no forward
+// extremities`). Both fleet hosts were advertising into it and neither could
+// receive, because nothing was ever committed for anyone to receive.
+//
+// What the daemon reported: `advertised=247 received=0` on the `Peer claims:`
+// status line, and — correctly — `peer_coordination DEGRADED` from
+// `loom-daemon health`. The #6157 verdict fired; it simply was not rendered
+// anywhere an operator reading `loom-daemon status` would see it, and it
+// blamed "the receive path" for a publish-side fault. Both are what the tests
+// below pin down.
+
+/// A refused send is *proof* the channel publishes nothing, so it must degrade
+/// on the first tick: no grace window to wait out, and no way for the receive
+/// heuristic to reach the same conclusion (nothing can arrive in a room this
+/// host cannot write to, so `quiet_for` is measuring a consequence, not a
+/// cause).
+#[test]
+fn a_rejected_claim_ad_degrades_immediately_without_waiting_out_the_grace() {
+    let grace = Duration::from_secs(1200);
+    let mut view = PeerClaimView::new("loom-worker-1".into(), Duration::from_secs(120));
+    let base = Instant::now();
+
+    // One tick of ordinary healthy advertising: nothing wrong yet.
+    view.record_advertised_at(base);
+    let healthy = view.evaluate_coordination(base, grace, RECOVERY);
+    assert!(!healthy.degraded, "{}", healthy.reason);
+
+    // safehoused refuses the next send with the homeserver's real error.
+    view.record_advertised_at(base + Duration::from_secs(REAPER_TICK));
+    view.observe_send_outcome_at(
+        Some("[500 / M_UNKNOWN] cannot create a non-create event in a room with no forward extremities"),
+        base + Duration::from_secs(REAPER_TICK),
+    );
+    let eval = view.evaluate_coordination(base + Duration::from_secs(REAPER_TICK), grace, RECOVERY);
+
+    assert!(
+        eval.degraded && eval.transitioned,
+        "a refused send must degrade on the very next tick, {}s into a {}s grace: {}",
+        REAPER_TICK,
+        grace.as_secs(),
+        eval.reason
+    );
+    assert!(
+        eval.reason.contains("REJECTED") && eval.reason.contains("forward extremities"),
+        "the verdict must name the transport's own reason: {}",
+        eval.reason
+    );
+    assert_eq!(view.counters().advertise_rejected, 1);
+}
+
+/// The idle gate (#8026) withholds the *receive-quiet* verdict from a host that
+/// is publishing nothing — but it must not suppress a *rejection*. A host whose
+/// sends are refused is, by definition, trying to send; the gate's stated
+/// premise ("this host is saying nothing, so it has no standing to judge the
+/// silence") is false for it.
+#[test]
+fn the_idle_gate_does_not_suppress_a_publish_rejection() {
+    let grace = Duration::from_secs(1200);
+    let mut view = PeerClaimView::new("loom-worker-1".into(), Duration::from_secs(120));
+    let base = Instant::now();
+
+    // Deliberately never call `record_advertised_at` — from the gate's point of
+    // view this host looks idle.
+    view.observe_send_outcome_at(Some("room dead"), base);
+    let eval = view.evaluate_coordination(base, grace, RECOVERY);
+    assert!(eval.degraded, "{}", eval.reason);
+    assert!(
+        !eval.reason.contains("not currently advertising"),
+        "the idle gate must not claim this host is silent when its sends are being refused: {}",
+        eval.reason
+    );
+}
+
+/// Recovery from a publish-blocked verdict requires an **accepted send**, not
+/// inbound receives — and one accepted send is enough, because acceptance is
+/// itself proof the transport works again (#4464's stickiness rule, mirrored).
+#[test]
+fn an_accepted_send_recovers_a_publish_blocked_verdict() {
+    let grace = Duration::from_secs(1200);
+    let mut view = PeerClaimView::new("loom-worker-1".into(), Duration::from_secs(120));
+    let base = Instant::now();
+
+    view.record_advertised_at(base);
+    view.observe_send_outcome_at(Some("room dead"), base);
+    assert!(view.evaluate_coordination(base, grace, RECOVERY).degraded);
+
+    // Peer receives cannot clear this: the publish side is still refused.
+    view.observe_at(&ad(ClaimKind::Advertise, 1, "loom", "peer"), base + Duration::from_secs(10));
+    let still = view.evaluate_coordination(base + Duration::from_secs(10), grace, RECOVERY);
+    assert!(
+        still.degraded,
+        "a receive must not clear a publish-side block: {}",
+        still.reason
+    );
+
+    // An accepted send does, on the next tick.
+    view.record_advertised_at(base + Duration::from_secs(20));
+    view.observe_send_outcome_at(None, base + Duration::from_secs(20));
+    let recovered = view.evaluate_coordination(base + Duration::from_secs(20), grace, RECOVERY);
+    assert!(!recovered.degraded, "an accepted send must clear it: {}", recovered.reason);
+    // The historical rejection is still counted — it happened.
+    assert_eq!(view.counters().advertise_rejected, 1);
+}
+
+/// **The shape the outage was actually in when measured.** safehoused never
+/// answers: the send op is stuck retrying the homeserver's 500 internally, so
+/// no `ok:false` is ever produced and `advertise_rejected` stays at zero
+/// forever. Verified live on 2026-09-29 — a probe `send` into the claims room
+/// got no reply in 60s, while the identical send into the narration room
+/// returned `ok:true` in under a second.
+///
+/// A rejection counter alone would have missed this entirely, which is why the
+/// verdict also watches for sends that are written and never acknowledged.
+#[test]
+fn sends_that_are_never_acknowledged_degrade_even_with_zero_rejections() {
+    let grace = Duration::from_secs(1200);
+    let mut view = PeerClaimView::new("loom-worker-1".into(), Duration::from_secs(120));
+    let base = Instant::now();
+
+    // Reaper ticks: every one queues an ad and writes it to the socket, and
+    // not one is ever answered.
+    let mut t = 0;
+    let mut last = None;
+    while t <= UNACKED_SEND_GRACE.as_secs() {
+        let at = base + Duration::from_secs(t);
+        view.record_advertised_at(at);
+        view.observe_send_attempt_at(at);
+        last = Some(view.evaluate_coordination(at, grace, RECOVERY));
+        t += REAPER_TICK;
+    }
+    let eval = last.expect("at least one tick");
+
+    assert!(
+        eval.degraded,
+        "an unanswered socket is a dead publish side, even inside the {}s receive grace: {}",
+        grace.as_secs(),
+        eval.reason
+    );
+    assert!(
+        eval.reason.contains("has not acknowledged"),
+        "the verdict must say the sends went unanswered, not blame the receive path: {}",
+        eval.reason
+    );
+    assert_eq!(
+        view.counters().advertise_rejected,
+        0,
+        "this shape produces no rejection at all — that is the whole point"
+    );
+}
+
+/// The converse guard: a healthy channel acknowledges what it is sent, so the
+/// unanswered-send rule must never fire on it however long the host runs.
+#[test]
+fn an_acknowledged_channel_never_trips_the_unanswered_send_rule() {
+    let grace = Duration::from_secs(1200);
+    let mut view = PeerClaimView::new("loom-worker-1".into(), Duration::from_secs(120));
+    let base = Instant::now();
+
+    let mut t = 0;
+    while t <= UNACKED_SEND_GRACE.as_secs() * 4 {
+        let at = base + Duration::from_secs(t);
+        view.record_advertised_at(at);
+        view.observe_send_attempt_at(at);
+        view.observe_send_outcome_at(None, at);
+        // A peer ad arrives too, so the receive-quiet clock stays anchored and
+        // this test isolates the publish-side rule.
+        view.observe_at(&ad(ClaimKind::Advertise, 1, "loom", "peer"), at);
+        let eval = view.evaluate_coordination(at, grace, RECOVERY);
+        assert!(
+            !eval.degraded,
+            "an acknowledged, receiving channel must stay healthy at t={t}s: {}",
+            eval.reason
+        );
+        t += REAPER_TICK;
+    }
+}
+
+/// A brief backlog — a couple of replies still in flight — is a race, not an
+/// outage. Only a sustained one counts, so a busy tick cannot flap the verdict.
+#[test]
+fn a_brief_unacknowledged_backlog_does_not_degrade() {
+    let grace = Duration::from_secs(1200);
+    let mut view = PeerClaimView::new("loom-worker-1".into(), Duration::from_secs(120));
+    let base = Instant::now();
+
+    for i in 0..(MIN_UNACKED_SENDS + 2) {
+        let at = base + Duration::from_secs(i);
+        view.record_advertised_at(at);
+        view.observe_send_attempt_at(at);
+    }
+    // Well short of the unanswered-send grace.
+    let at = base + UNACKED_SEND_GRACE - Duration::from_secs(1);
+    view.record_advertised_at(at);
+    let eval = view.evaluate_coordination(at, grace, RECOVERY);
+    assert!(!eval.degraded, "replies still in flight are not an outage: {}", eval.reason);
+}
+
+/// **The issue's AC4, heartbeat half.** The curator's hypothesis on #9294 was
+/// that `ClaimKind::Heartbeat` anchors the receive-quiet clock while never
+/// incrementing `received`, so a host hearing only heartbeats would show
+/// `received=0` AND stay healthy — making `received=0` mean "no peer dispatched
+/// a claim I could see", not "nothing arrives".
+///
+/// **Confirmed as behaviour, refuted as the cause of the reported incident.**
+/// The mechanism is real and this test pins it as intended. It was not what
+/// happened on the fleet: no heartbeats were arriving either (the room was
+/// dead for every sender), and the verdict *did* go DEGRADED there. Keeping
+/// this test is what stops a future reader from re-deriving the hypothesis and
+/// "fixing" a heartbeat path that is working as designed.
+#[test]
+fn heartbeats_only_keeps_the_channel_healthy_at_received_zero() {
+    let grace = Duration::from_secs(1200);
+    let mut view = PeerClaimView::new("loom-worker-1".into(), Duration::from_secs(120));
+    let base = Instant::now();
+
+    // Advertise continuously for well past the grace window, receiving nothing
+    // but heartbeats from an idle peer.
+    let mut t = 0_u64;
+    while t <= grace.as_secs() * 2 {
+        let at = base + Duration::from_secs(t);
+        view.record_advertised_at(at);
+        view.observe_heartbeat_at(
+            &ad(ClaimKind::Heartbeat, HEARTBEAT_SENTINEL_ISSUE, "loom", "peer"),
+            at,
+        );
+        let eval = view.evaluate_coordination(at, grace, RECOVERY);
+        assert!(
+            !eval.degraded,
+            "heartbeats prove the receive path is alive, so t={t}s must stay healthy: {}",
+            eval.reason
+        );
+        t += REAPER_TICK;
+    }
+    assert_eq!(
+        view.counters().received,
+        0,
+        "`received` counts only the dispatch-claim lane — heartbeats are not dispatch traffic"
+    );
+    assert_eq!(view.counters().advertise_rejected, 0);
+}
+
+/// **The issue's AC4, nothing-at-all half.** Same sustained advertising, but
+/// with no heartbeats and no claims: the receive path really is silent, and the
+/// verdict must fire once the grace window is exhausted.
+///
+/// This is the control for the test above: the two differ only in whether a
+/// heartbeat arrives, which is exactly the distinction `received=0` alone
+/// cannot express.
+#[test]
+fn advertising_into_total_silence_degrades_once_the_grace_expires() {
+    let grace = Duration::from_secs(1200);
+    let mut view = PeerClaimView::new("loom-worker-1".into(), Duration::from_secs(120));
+    let base = Instant::now();
+
+    let evals = run_ticks(&mut view, base, 0, grace.as_secs(), true, grace);
+    let transitioned = evals
+        .iter()
+        .find(|e| e.transitioned)
+        .expect("a host advertising into total silence must eventually degrade");
+    assert!(transitioned.degraded);
+    assert!(transitioned.reason.contains("one-way or dead"), "{}", transitioned.reason);
+    assert_eq!(view.counters().received, 0);
+}
+
+/// AC4's surfacing requirement: whatever the verdict, `to_status` carries its
+/// `reason` so `loom-daemon status` can print *why* instead of leaving an
+/// operator to compare `advertised` against `received` by eye.
+#[test]
+fn to_status_carries_the_verdict_reason_and_the_rejection_counter() {
+    let grace = Duration::from_secs(1200);
+    let mut view = PeerClaimView::new("loom-worker-1".into(), Duration::from_secs(120));
+    let base = Instant::now();
+
+    // Before any tick there is no verdict to report.
+    assert_eq!(view.to_status(base).coordination.reason, None);
+
+    view.record_advertised_at(base);
+    view.observe_send_outcome_at(Some("[500 / M_UNKNOWN] no forward extremities"), base);
+    view.evaluate_coordination(base, grace, RECOVERY);
+
+    let status = view.to_status(base);
+    assert!(status.coordination.degraded);
+    assert_eq!(status.advertise_rejected, 1);
+    let reason = status.coordination.reason.expect("a verdict reason");
+    assert!(reason.contains("no forward extremities"), "{reason}");
+    assert!(
+        reason.contains("attempts that never landed"),
+        "the reason must explain what `advertised` is actually counting: {reason}"
+    );
+}
+
+/// A healthy verdict's reason is reported too — an operator confirming a fix
+/// needs the positive statement, not just the absence of a warning.
+#[test]
+fn to_status_carries_a_healthy_verdict_reason_too() {
+    let mut view = PeerClaimView::new("loom-worker-1".into(), Duration::from_secs(120));
+    let base = Instant::now();
+    view.record_advertised_at(base);
+    view.evaluate_coordination(base, Duration::from_secs(1200), RECOVERY);
+    let status = view.to_status(base);
+    assert!(!status.coordination.degraded);
+    assert_eq!(status.coordination.reason.as_deref(), Some("receiving normally"));
+}

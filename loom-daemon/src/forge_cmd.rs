@@ -626,7 +626,7 @@ fn is_head_mismatch_response(text: &str) -> bool {
 /// (`defaults/scripts/lib/forge-helpers.sh`), which has always had this
 /// fallback. The git fallback works offline / under API exhaustion because it
 /// never calls out to `gh`.
-fn repo_nwo(gh: &str) -> Option<String> {
+pub(crate) fn repo_nwo(gh: &str) -> Option<String> {
     repo_nwo_in(gh, None)
 }
 
@@ -750,6 +750,14 @@ pub enum ForgeCmd {
         audit_comment: bool,
         hold: Option<String>,
     },
+    /// `forge tree-unchanged <base> <head>` (#9576) — did the tree change at
+    /// all between two commits? The single implementation of the test #9124
+    /// gave the daemon's verdict-invalidation pass, exposed so
+    /// `verdict-staleness-guard.sh` can ask it instead of keeping its own
+    /// (absent) copy. Implemented in
+    /// [`crate::forge_tree_unchanged::handle`]; see that module for the
+    /// stdout/exit-code contract and the fail-closed arm.
+    TreeUnchanged { base: String, head: String },
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should pass
     /// to `forge_merge_pr`. See
@@ -757,6 +765,15 @@ pub enum ForgeCmd {
     MergeMethod {
         repo: String,
         requested: Option<String>,
+    },
+    /// `forge merge-config [--repo] [--branch] [--method] [--verbose]` (#9287)
+    /// — advisory, read-only: can `merge-pr.sh` merge here at all? See
+    /// [`crate::forge_merge_config::handle_merge_config`]. Always exits 0.
+    MergeConfig {
+        repo: Option<String>,
+        branch: Option<String>,
+        method: Option<String>,
+        verbose: bool,
     },
 }
 
@@ -800,9 +817,21 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
             audit_comment,
             hold.as_deref(),
         ),
+        ForgeCmd::TreeUnchanged { base, head } => crate::forge_tree_unchanged::handle(&base, &head),
         ForgeCmd::MergeMethod { repo, requested } => {
             crate::forge_merge_method::handle_merge_method(&repo, requested.as_deref())
         }
+        ForgeCmd::MergeConfig {
+            repo,
+            branch,
+            method,
+            verbose,
+        } => crate::forge_merge_config::handle_merge_config(
+            repo.as_deref(),
+            branch.as_deref(),
+            method.as_deref(),
+            verbose,
+        ),
     }
 }
 
