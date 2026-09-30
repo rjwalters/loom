@@ -141,3 +141,30 @@ fn dispatch_appends_dangerously_skip_permissions() {
              prompt; got: {recorded}"
     );
 }
+
+#[test]
+#[serial]
+fn autonomous_sweep_overrides_interactive_parent_origin() {
+    let old = std::env::var_os(crate::provenance::origin::ENV);
+    std::env::set_var(crate::provenance::origin::ENV, "interactive");
+    let dir = tempdir().unwrap();
+    let (mut registry, record_log) = fixture_registry(dir.path());
+    let script = dir.path().join(".loom/scripts/spawn-claude.sh");
+    let body = std::fs::read_to_string(&script).unwrap();
+    std::fs::write(
+        &script,
+        body.replace("exit 0", "printf '%s' \"$LOOM_WORK_ORIGIN\" > origin.txt\nexit 0"),
+    )
+    .unwrap();
+    let result = registry.dispatch(&SweepKind::Issue(9685), None, None, None, None);
+    let outcome = result.unwrap();
+    assert_child_wrote(&record_log, &format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id));
+    let origin_path = dir.path().join("origin.txt");
+    assert!(wait_for_contents(&origin_path, "autonomous", FIXTURE_CHILD_WAIT_MS));
+    if let Some(old) = old {
+        std::env::set_var(crate::provenance::origin::ENV, old);
+    } else {
+        std::env::remove_var(crate::provenance::origin::ENV);
+    }
+    assert_eq!(std::fs::read_to_string(origin_path).unwrap(), "autonomous");
+}

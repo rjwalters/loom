@@ -18,6 +18,8 @@ use anyhow::Result;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum ScriptPortCommand {
+    /// Ordered PR work for Judge, Doctor and Champion.
+    PrQueue(super::pr_queue::PrQueueArgs),
     /// Supervised persistent-container transport backing spawn-codex.sh.
     #[command(subcommand)]
     SessionExec(loom_daemon::session_exec::SessionExecCommand),
@@ -468,6 +470,7 @@ impl ScriptPortCommand {
     /// the stubs' callers branch on.
     pub(crate) fn run(self) -> Result<()> {
         match self {
+            ScriptPortCommand::PrQueue(args) => args.run(),
             ScriptPortCommand::SessionExec(args) => args.run(),
             ScriptPortCommand::PrivateWorkspace(args) => args.run(),
             ScriptPortCommand::SweepCheckpoint(args) => args.run(),

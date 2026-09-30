@@ -127,3 +127,5 @@ mod worktree_state;
 pub(crate) mod worktree_submodules;
 pub(crate) mod worktree_upstream;
 pub(crate) mod worktree_wip;
+
+pub(crate) mod pr_queue;
