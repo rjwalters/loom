@@ -43,7 +43,19 @@ HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
+
+# A source-text assertion that cannot survive a port to loom-daemon, recorded
+# per defaults/docs/verification-recipes.md §6 rather than silently deleted
+# (same convention as test-merge-pr-check-runs-404-fallback.sh).
+retired() { # <what> <property> <why-structural> <successor>
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${YELLOW}RETIRED${NC}: $1"
+    echo "      property:   $2"
+    echo "      structural: $3"
+    echo "      successor:  $4"
+}
 
 TESTS_RUN=0
 TESTS_PASSED=0
@@ -861,12 +873,16 @@ unset LOOM_AUTO_MERGE_POLL_INTERVAL LOOM_AUTO_MERGE_TIMEOUT 2>/dev/null || true
 # Assert the merge-pr.sh source actually contains the pending-set filter and the
 # poll-window env vars, so a refactor that drops them fails this test.
 MERGE_PR_SRC="$HELPERS_DIR/merge-pr.sh"
-if grep -q 'select(.status != "completed")' "$MERGE_PR_SRC"; then
+retired "merge-pr.sh computes the PENDING set (status != completed)" \
+    "the settle-wait derives a PENDING set of every check-run whose status is not 'completed', so a still-running check keeps the wait going" \
+    "#8191 slice: the three jq filters (failing / pending / total_count) moved to loom-daemon/src/merge_pr/check_runs_rollup.rs — merge-pr.sh now reads them from 'loom-daemon merge-pr check-runs-rollup', so there is no select(.status != \"completed\") left in the shell to grep for" \
+    "loom-daemon/tests/merge_pr_check_runs_rollup_differential.rs (the frozen retired filters, tests/fixtures/merge-pr-check-runs-rollup-retired.sh, vs. the real CLI on a grammar-enumerated corpus, byte for byte), merge_pr::check_runs_rollup::tests::missing_or_non_string_status_is_pending_like_jq_inequality, and the delegation assertion below"
+if grep -q '"$_crr_bin" merge-pr check-runs-rollup' "$MERGE_PR_SRC"; then
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh computes the PENDING set (status != completed)"
+    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh derives the FAILING/PENDING sets via 'loom-daemon merge-pr check-runs-rollup'"
 else
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing the PENDING-set filter"
+    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing the check-runs-rollup delegation"
 fi
 if grep -q 'LOOM_AUTO_MERGE_TIMEOUT' "$MERGE_PR_SRC" && grep -q 'LOOM_AUTO_MERGE_POLL_INTERVAL' "$MERGE_PR_SRC"; then
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
