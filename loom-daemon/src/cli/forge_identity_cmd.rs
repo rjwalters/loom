@@ -205,29 +205,99 @@ pub(crate) fn identities(as_json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `forge trusted-comments [--self-login L]` (#9548): stdin is a comment
-/// listing (REST or `gh --json` shape, one array, concatenated pages, or an
-/// object with `comments`/`reviews`); stdout is the same JSON holding only
-/// the comments whose author [`loom_daemon::comment_trust`] trusts. Exits 1
-/// with nothing on stdout when stdin is not such a document, so a caller can
-/// never mistake a failed filter for "no trusted comments".
-pub(crate) fn trusted_comments(self_login: Option<String>) -> Result<()> {
+/// `forge trusted-comments [--self-login L] [--fetch N [--repo R]
+/// [--with-body]] [--gh-shape]` (#9548): the input is a comment listing
+/// (stdin, or issue/PR N's REST listing with `--fetch`) in REST or `gh
+/// --json` shape (one array, concatenated pages, or an object with
+/// `comments`/`reviews`); stdout is the same JSON holding only the comments
+/// whose author [`loom_daemon::comment_trust`] trusts. Exits 1 with nothing
+/// on stdout when the input is not such a document (including empty stdin)
+/// or cannot be fetched, so a caller can never mistake a failed filter for
+/// "no trusted comments".
+pub(crate) fn trusted_comments(
+    self_login: Option<String>,
+    fetch: Option<(u64, Option<String>, bool)>,
+    gh_shape: bool,
+) -> Result<()> {
     use std::io::Read;
-    let mut input = Vec::new();
-    std::io::stdin().read_to_end(&mut input)?;
+    let root = workspace();
+    let input = match fetch {
+        Some((n, repo, with_body)) => fetch_listing(&root, n, repo.as_deref(), with_body),
+        None => {
+            let mut input = Vec::new();
+            std::io::stdin().read_to_end(&mut input)?;
+            Some(input)
+        }
+    };
     let policy =
-        loom_daemon::comment_trust::TrustPolicy::for_root(&workspace()).with_self_login(self_login);
-    match loom_daemon::comment_trust::filter_document(&policy, &input) {
+        loom_daemon::comment_trust::TrustPolicy::for_root(&root).with_self_login(self_login);
+    match input.and_then(|i| loom_daemon::comment_trust::filter_document(&policy, &i)) {
+        Some(Value::Array(items)) if gh_shape => {
+            println!("{}", Value::Array(items.iter().map(gh_comment).collect()));
+            Ok(())
+        }
         Some(out) => {
             println!("{out}");
             Ok(())
         }
         None => {
             eprintln!(
-                "forge trusted-comments: stdin is not a JSON comment listing (an array of \
-                 comments, or an object with comments/reviews)"
+                "forge trusted-comments: no JSON comment listing to filter (stdin empty or not \
+                 an array of comments / an object with comments/reviews, or --fetch failed)"
             );
             std::process::exit(1)
         }
+    }
+}
+
+/// Issue/PR `n`'s REST comment listing, with the issue/PR object itself first
+/// when `with_body` (so the trust filter decides whether its body counts).
+fn fetch_listing(root: &Path, n: u64, repo: Option<&str>, with_body: bool) -> Option<Vec<u8>> {
+    let repo = repo.unwrap_or("{owner}/{repo}");
+    let get = |path: String| {
+        let out = loom_daemon::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
+        out.ok_output().map(|o| o.stdout.clone())
+    };
+    let comments = get(format!("repos/{repo}/issues/{n}/comments"))?;
+    if !with_body {
+        return Some(comments);
+    }
+    let issue: Value = serde_json::from_slice(&get(format!("repos/{repo}/issues/{n}"))?).ok()?;
+    let mut items = vec![issue];
+    items.extend(loom_daemon::comment_trust::parse_listing(&comments)?);
+    serde_json::to_vec(&items).ok()
+}
+
+/// One REST comment in the `gh --json comments` field names.
+fn gh_comment(c: &Value) -> Value {
+    json!({
+        "author": {"login": c.pointer("/user/login").or_else(|| c.pointer("/author/login"))},
+        "authorAssociation": c.get("author_association").or_else(|| c.get("authorAssociation")),
+        "body": c.get("body"),
+        "createdAt": c.get("created_at").or_else(|| c.get("createdAt")),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gh_comment;
+    use serde_json::json;
+
+    /// `--gh-shape` renames the REST fields and keeps the App spelling.
+    #[test]
+    fn gh_comment_renames_rest_fields() {
+        let rest = json!({
+            "user": {"login": "loom-fleet-dispatch[bot]", "type": "Bot"},
+            "author_association": "NONE",
+            "body": "<!-- champion:merge-risk-hold -->",
+            "created_at": "2026-09-29T00:00:00Z",
+        });
+        let out = gh_comment(&rest);
+        assert_eq!(out["author"]["login"], "loom-fleet-dispatch[bot]");
+        assert_eq!(out["authorAssociation"], "NONE");
+        assert_eq!(out["body"], "<!-- champion:merge-risk-hold -->");
+        assert_eq!(out["createdAt"], "2026-09-29T00:00:00Z");
+        let gh = json!({"author": {"login": "x"}, "authorAssociation": "OWNER", "body": "b", "createdAt": "t"});
+        assert_eq!(gh_comment(&gh), gh);
     }
 }

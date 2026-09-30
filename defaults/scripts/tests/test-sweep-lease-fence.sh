@@ -165,6 +165,10 @@ chmod +x "$STUB_DIR/gh"
 
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# #9548: the subject filters lease markers through `forge trusted-comments`.
+# shellcheck source=lib/trust-stub.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/trust-stub.sh"
+loom_trust_stub "$STUB_DIR"
 
 reset_state() {
     rm -f "$STUB_DIR"/comments.json "$STUB_DIR"/comments-fail
@@ -469,6 +473,21 @@ reset_state
 : > "$STUB_DIR/api-paths.log"
 LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
 assert_eq "repos/{owner}/{repo}/issues/6309/comments" "$(cat "$STUB_DIR/api-paths.log")" "(m) LOOM_REPO unset: gh's {owner}/{repo} placeholder is used"
+
+# --- (t) #9548: a fresh foreign lease from an UNTRUSTED author is prose ----
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[
+  {"id": 1, "updated_at": "2026-08-15T15:50:00Z", "body": "<!-- loom:lease host=studio-host sweep=sweep-a -->\nprose"},
+  {"id": 2, "updated_at": "2026-08-15T15:51:00Z", "user": {"login": "drive-by", "type": "User"}, "author_association": "NONE", "body": "<!-- loom:lease host=other-host sweep=sweep-b -->"},
+  {"id": 3, "updated_at": "2026-08-15T15:51:30Z", "user": {"login": "other-fleet[bot]", "type": "Bot"}, "author_association": "NONE", "body": "<!-- loom:lease host=other-host sweep=sweep-c -->"}
+]
+JSON
+LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
+assert_eq "0" "$RC" "(t) untrusted fresher leases do not supersede this sweep's own (PASS)"
+LOOM_TEST_NO_TRUST_VERB=1 LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
+assert_eq "0" "$RC" "(t) no trust filter -> unverifiable, fails open (PASS)"
+assert_contains "$ERR" "could not be authenticated" "(t) stderr names the missing authentication"
 
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"
