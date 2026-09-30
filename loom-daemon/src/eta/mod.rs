@@ -55,6 +55,15 @@
 //! A heuristic id (`start-v1`, `finish-v1`, `land-v1`) is immutable once shipped: a
 //! golden test pins each id's output over a fixed fixture. A behaviour change
 //! is a new id, registered next to the old one ([`Registry`]).
+//!
+//! # Shadow mode and promotion (#9328)
+//!
+//! Every registered heuristic of a kind is computed and logged for every
+//! tracked subject ([`Registry::for_kind`]); exactly one is `current`
+//! (`autonomous.eta.current.<kind>`) and only its estimate is the primary one
+//! existing consumers read. A candidate becomes `current` only by clearing two
+//! gates, in order — the phase-2 [`backtest`] first, then live paired scoring
+//! — and the switch that flips the config is [`shadow`].
 
 pub mod backtest;
 pub mod config;
@@ -66,6 +75,7 @@ pub mod history;
 pub mod journal;
 pub mod labels;
 pub mod score;
+pub mod shadow;
 pub mod simulate;
 pub mod tracker;
 
@@ -506,6 +516,7 @@ impl Registry {
                 Box::new(heuristics::StartV1),
                 Box::new(heuristics::FinishV1),
                 Box::new(heuristics::LandV1),
+                Box::new(heuristics::LandV2),
             ],
         }
     }
@@ -523,6 +534,19 @@ impl Registry {
     #[must_use]
     pub fn ids(&self) -> Vec<&'static str> {
         self.heuristics.iter().map(|h| h.id()).collect()
+    }
+
+    /// Every registered heuristic that predicts `kind`, in registration
+    /// order — the shadow-mode input (#9328).
+    ///
+    /// This is what makes a candidate observable at all: the tracker computes
+    /// and logs an estimate for each of these, while only
+    /// [`Self::current`]'s is the primary one existing consumers read.
+    pub fn for_kind(&self, kind: Kind) -> impl Iterator<Item = &dyn Heuristic> {
+        self.heuristics
+            .iter()
+            .filter(move |h| h.kind() == kind)
+            .map(std::convert::AsRef::as_ref)
     }
 
     /// The default `current` heuristic id for `kind`.

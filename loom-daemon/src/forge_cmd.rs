@@ -723,6 +723,23 @@ pub enum ForgeCmd {
     /// [`crate::forge_check_open_pr`]; see that module for the exit-code
     /// contract.
     CheckOpenPr { issue: u32 },
+    /// `forge pr-congestion [--json] [--max-open N] [--max-points N]` — the
+    /// #9063 **Phase 1** congestion signal, report-only: approved-queue depth,
+    /// story points awaiting merge, and a path-disjoint bundle estimate over
+    /// the open `loom:pr` queue. Never merges, creates, or closes anything —
+    /// bundle execution is Phases 2–3 and stays operator-gated. Implemented
+    /// in [`crate::forge_pr_congestion`]; see that module for the exit-code
+    /// contract.
+    PrCongestion {
+        /// Emit machine-readable JSON instead of the human report.
+        json: bool,
+        /// Congestion threshold: trip when the approved queue is deeper than
+        /// this (issue #9063's ">5 open PRs" example).
+        max_open: usize,
+        /// Congestion threshold: trip when known story points awaiting merge
+        /// exceed this.
+        max_points: u32,
+    },
     /// `forge check-claim <issue> [--force-claim]` — the aggregated
     /// pre-flight claim-CAS probe (#9453 Phase 1): one command answering
     /// "may I claim issue N right now?" across four legs (open linked PR,
@@ -818,6 +835,11 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ForgeCmd::Pr(args) => gh_passthrough("pr", &args),
         ForgeCmd::Auth(args) => gh_passthrough("auth", &args),
         ForgeCmd::CheckOpenPr { issue } => crate::forge_check_open_pr::handle(issue),
+        ForgeCmd::PrCongestion {
+            json,
+            max_open,
+            max_points,
+        } => crate::forge_pr_congestion::handle(json, max_open, max_points),
         ForgeCmd::CheckClaim { issue, force_claim } => {
             crate::forge_check_claim::handle(issue, force_claim)
         }

@@ -76,7 +76,19 @@ pub struct WorkFinderConfig {
 #[must_use]
 pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
     let effective = crate::config_resolver::resolve_effective_config(repo_root);
-    let Some(autonomous) = crate::config_resolver::get_path(&effective, "autonomous") else {
+    let mut config = parse_effective(&effective);
+    apply_hyperparams(&effective, &mut config);
+    config
+}
+
+/// Pure parse of an already-resolved effective config — the legacy tier only,
+/// no hyperparameters overlay. [`hyperparams`][crate::hyperparams]'s
+/// provenance resolver reads through this so a field supplied by the
+/// `hyperparameters` block is reported as `config`, never double-counted as
+/// `legacy`.
+#[must_use]
+pub fn parse_effective(effective: &serde_json::Value) -> WorkFinderConfig {
+    let Some(autonomous) = crate::config_resolver::get_path(effective, "autonomous") else {
         return WorkFinderConfig::default();
     };
 
@@ -128,6 +140,46 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
         host_class: host_class::parse_config(wf),
         allow_heavy_local: host_class::parse_config_allow_heavy_local(wf),
         deprecated_cpu_keys,
+    }
+}
+
+/// Overlay the `hyperparameters.dispatch` layer onto the legacy-parsed
+/// fields (Issue #9683): a valid layer value wins over its legacy
+/// `autonomous.workFinder.*` counterpart. Type/range-invalid layer values
+/// soft-ignore here exactly like every other malformed field in this parser —
+/// `hyperparams::startup_init` is the strict gate that names them at daemon
+/// startup; a value introduced mid-run by a per-tick config edit has already
+/// passed (or never seen) that gate.
+fn apply_hyperparams(effective: &serde_json::Value, config: &mut WorkFinderConfig) {
+    let layer = crate::hyperparams::overlay_from_effective(effective);
+    let Some(dispatch) = layer.get("dispatch").filter(|d| !d.is_null()) else {
+        return;
+    };
+    if let Some(secs) = dispatch
+        .get("tickIntervalSecs")
+        .filter(|v| !v.is_null())
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&s| s > 0)
+    {
+        config.interval_secs = Some(secs);
+    }
+    if let Some(max) = dispatch
+        .get("maxConcurrent")
+        .filter(|v| !v.is_null())
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&n| n > 0)
+        .and_then(|n| usize::try_from(n).ok())
+    {
+        config.max_concurrent = Some(max);
+    }
+    if let Some(max) = dispatch
+        .get("maxAdmissionsPerTick")
+        .filter(|v| !v.is_null())
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&n| n > 0)
+        .and_then(|n| usize::try_from(n).ok())
+    {
+        config.max_admissions_per_tick = Some(max);
     }
 }
 

@@ -25,6 +25,9 @@ fn row(slug: &str, issue: u32, rank: usize, disposition: Qd) -> DispositionRow {
         disposition,
         park_label: None,
         pr_number: None,
+        candidate_rank: u32::try_from(rank).unwrap_or(u32::MAX),
+        total_candidates: 1,
+        priority_score: None,
         story_points: None,
         halt_cause: None,
     }
@@ -210,6 +213,63 @@ fn loom_repo_is_the_resolved_slug_never_the_local_path() {
     let (rows, _) = build_rows(&summary, &repos);
     assert_eq!(rows[0].slug, "rjwalters/loom");
     assert!(!rows[0].slug.starts_with('/'));
+}
+
+/// Issue #9669: every row carries its 1-indexed queue position (the plan's
+/// pass-2 position when annotated, else the comparator rank — a blocked row's
+/// would-be position), the tick's ready-queue depth as the denominator, and
+/// the comparator keys as the `priority_score` JSON object.
+#[test]
+fn build_rows_extracts_queue_position_metadata() {
+    use crate::types::PlanKey;
+
+    let key = |name: &str, value: serde_json::Value| PlanKey {
+        name: name.to_string(),
+        value,
+    };
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    let mut planned = summary_row("/repo", 7, 3, Qd::DeferredCapacity, None);
+    planned.plan.position = Some(2);
+    planned.plan.keys = vec![
+        key("operator_priority", serde_json::Value::Bool(false)),
+        key("main_red_fix", serde_json::Value::Bool(false)),
+        key("workspace_priority", serde_json::json!(100)),
+    ];
+    // Issue 9 is blocked (no plan position): its rank is the fallback.
+    let mut blocked = summary_row("/repo", 9, 1, Qd::Parked, Some("loom:blocked"));
+    blocked.plan.keys = planned.plan.keys.clone();
+    let summary = WorkFinderTickSummary {
+        queue: vec![planned, blocked],
+        ..Default::default()
+    };
+    let (rows, dropped) = build_rows(&summary, &repos);
+    assert!(dropped.unresolved == 0 && dropped.truncated == 0);
+    assert_eq!(rows.len(), 2);
+    // Every row sees the same denominator: the tick's ready-queue depth.
+    assert_eq!(rows.iter().map(|r| r.total_candidates).collect::<Vec<_>>(), [2, 2]);
+    // The planned row's candidate_rank is its pass-2 position, not its rank.
+    assert_eq!(rows[0].candidate_rank, 2);
+    // The blocked row has no plan position: the comparator rank stands in.
+    assert_eq!(rows[1].candidate_rank, 1);
+    // priority_score is the comparator keys, compact JSON in key order.
+    let expected = r#"{"operator_priority":false,"main_red_fix":false,"workspace_priority":100}"#;
+    assert_eq!(rows[0].priority_score.as_deref(), Some(expected));
+    assert_eq!(rows[1].priority_score.as_deref(), Some(expected));
+}
+
+/// Issue #9669: a row without a plan annotation (no keys) carries no
+/// `priority_score` — the attribute is omitted, never fabricated.
+#[test]
+fn a_row_without_plan_keys_has_no_priority_score() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row("/repo", 7, 1, Qd::DeferredCapacity, None)],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].priority_score, None);
 }
 
 // ------------------------------------------------------------------ park_label / pr_number
@@ -470,6 +530,12 @@ fn changed_emission() -> Emission {
         transition: Transition::Changed,
         park_label: Some("loom:blocked".to_string()),
         pr_number: None,
+        candidate_rank: Some(2),
+        total_candidates: Some(7),
+        priority_score: Some(
+            r#"{"operator_priority":false,"main_red_fix":false,"workspace_priority":100}"#
+                .to_string(),
+        ),
         halt_cause: None,
     }
 }
@@ -485,6 +551,13 @@ fn every_attribute_survives_the_export_time_allowlist() {
     assert_eq!(span.attributes["loom.queue.disposition"], "deferred_saturation");
     assert_eq!(span.attributes["loom.queue.state"], "ready");
     assert_eq!(span.attributes["loom.queue.rank"], "3");
+    // Queue-position metadata (Issue #9669).
+    assert_eq!(span.attributes["loom.queue.candidate_rank"], "2");
+    assert_eq!(span.attributes["loom.queue.total_candidates"], "7");
+    assert_eq!(
+        span.attributes["loom.queue.priority_score"],
+        r#"{"operator_priority":false,"main_red_fix":false,"workspace_priority":100}"#
+    );
     assert_eq!(span.attributes["loom.queue.transition"], "changed");
     assert_eq!(span.attributes["loom.queue.previous_disposition"], "deferred_capacity");
     assert_eq!(span.attributes["loom.queue.park_label"], "loom:blocked");
@@ -499,10 +572,18 @@ fn left_queue_emission_omits_rank_and_previous_disposition() {
         previous_disposition: None,
         park_label: None,
         pr_number: None,
+        candidate_rank: None,
+        total_candidates: None,
+        priority_score: None,
         ..changed_emission()
     };
     let span = build_span(&emission, Utc::now(), None, &HashMap::new());
     assert!(!span.attributes.contains_key("loom.queue.rank"));
+    // Issue #9669: a row that left the queue is no longer ranked, so none of
+    // the queue-position metadata is exported either.
+    assert!(!span.attributes.contains_key("loom.queue.candidate_rank"));
+    assert!(!span.attributes.contains_key("loom.queue.total_candidates"));
+    assert!(!span.attributes.contains_key("loom.queue.priority_score"));
     assert!(!span
         .attributes
         .contains_key("loom.queue.previous_disposition"));

@@ -179,8 +179,8 @@ only Curator may be skipped.
 
 ### CI is dumb and reliable, on purpose
 
-Slow correct job over clever fast one. **Never cancel verification of a distinct
-commit** — superseding is for PR branches; every `main` commit is distinct work.
+Slow correct job over clever fast one. **Never cancel a distinct commit's run once started**;
+`main` keeps one running + newest pending (a superseded pending run is no-verdict).
 Path-filtering is an optimisation, not a correctness tool; one mechanism per
 behaviour. Rules + incidents: [`ci-principles`](.loom/docs/ci-principles.md).
 All org CI is captured in SigNoz: [`ci-observability`](.loom/docs/ci-observability.md).
