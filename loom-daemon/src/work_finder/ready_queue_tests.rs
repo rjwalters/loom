@@ -180,6 +180,36 @@ fn every_seen_issue_gets_one_row_with_its_reason() {
     assert_eq!(q[0].repo, "workspace #0");
 }
 
+/// Issue #9674: each row carries the issue's resolved story-point size, read
+/// off the labels the listing already fetched — a legal single label
+/// resolves, an unsized issue stays `None` (never zero), and a stacked pair
+/// resolves to nothing rather than guessing (the loud warn belongs to the
+/// dispatch path, not to this per-tick read).
+#[test]
+fn rows_carry_the_resolved_story_points() {
+    let mut multi = vec![(
+        OneShotSource(Some(vec![
+            item(1, &["loom:issue", "points:5"], "2026-09-01T00:00:00Z"),
+            item(2, &["loom:issue"], "2026-09-02T00:00:00Z"),
+            item(3, &["loom:issue", "points:3", "points:8"], "2026-09-03T00:00:00Z"),
+            item(4, &["loom:issue", "points:21"], "2026-09-04T00:00:00Z"),
+        ])),
+        Disp::default(),
+    )];
+    let report = tick_multi(&mut multi, &[], 10, &[false]);
+    let by_issue = |n: u32| {
+        rows(&report, &[])
+            .into_iter()
+            .find(|r| r.issue == n)
+            .unwrap()
+            .story_points
+    };
+    assert_eq!(by_issue(1), Some(5));
+    assert_eq!(by_issue(2), None, "absent is never 0");
+    assert_eq!(by_issue(3), None, "stacked labels are never guessed");
+    assert_eq!(by_issue(4), None, "out-of-vocabulary is a defect, not a size");
+}
+
 /// A halted repo's issues still appear, marked blocked by the gate, so an
 /// empty "ready" list is never mistaken for an empty backlog.
 #[test]

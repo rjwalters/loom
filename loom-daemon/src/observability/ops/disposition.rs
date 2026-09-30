@@ -53,6 +53,17 @@
 //! all (`WorkFinderTickSummary::queue` is empty), so it never has anything to
 //! export here — the same limitation `queue_snapshot` and `stage_dwell`
 //! already document.
+//!
+//! # Repo lockout attributes (Issue #9674)
+//!
+//! Rows the #4123 open-PR guard refused (`pr-open-skip`,
+//! [`QueueDisposition::OpenPr`]) are the observable signature of a repository
+//! whose backlog is frozen behind an open linked PR. Each `open_pr` span
+//! carries its repo's lockout weight — `lockout.frozen_candidates_count`,
+//! `lockout.frozen_points_sum`, `lockout.duration_seconds` (an in-process
+//! observation floor; see [`super::lockout`]) — so SigNoz can rank which
+//! repo's lockout is starving the most ready work. The computation is pure
+//! over this tick's rows; nothing here ever reads the forge.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -118,6 +129,9 @@ pub struct DispositionRow {
     pub park_label: Option<String>,
     /// Present only for `OpenPr` rows — see [`open_pr_number`].
     pub pr_number: Option<u32>,
+    /// The issue's resolved story-point size (#9432, Issue #9674) — `None`
+    /// when unsized or a labeled defect (never a guess).
+    pub story_points: Option<u32>,
 }
 
 /// One row's outcome for a [`record`] sample: enough to build its span.
@@ -312,6 +326,7 @@ pub fn build_rows(
             disposition: row.disposition,
             park_label: allowed_park_label(row.disposition, row.detail.as_deref()),
             pr_number: open_pr_number(row.disposition, row.detail.as_deref()),
+            story_points: row.story_points,
         });
     }
     (rows, dropped)
@@ -380,11 +395,19 @@ pub fn dropped_points(dropped: DroppedCounts) -> Vec<MetricPoint> {
 /// [`super::dispatch::tick_span`]'s own root when no parent applies. Span IDs
 /// are always derived from `(slug, issue, now)`, never random — the
 /// trace-identity policy every span in this package follows.
+///
+/// An `OpenPr` emission (a `pr-open-skip` row) in a repo this sample says is
+/// locked also carries the repo's lockout attributes (Issue #9674):
+/// `lockout.duration_seconds` from the global tracker,
+/// `lockout.frozen_candidates_count` and `lockout.frozen_points_sum` from
+/// `lockouts`. `LeftQueue` emissions never carry them — the row has already
+/// left the queue, so its repo's current lock state is not this row's story.
 #[must_use]
 pub fn build_span(
     emission: &Emission,
     now: DateTime<Utc>,
     parent: Option<&TraceContext>,
+    lockouts: &HashMap<String, super::lockout::RepoLockout>,
 ) -> SpanRecord {
     let slug: &str = &emission.slug;
     let issue = emission.issue.to_string();
@@ -433,6 +456,32 @@ pub fn build_span(
     if let Some(pr) = emission.pr_number {
         attributes.insert("loom.pr_number".to_string(), pr.to_string());
     }
+    // Issue #9674: a pr-open-skip row is the lock it reports. Stamp the
+    // repo-level lockout attributes on exactly those rows, so a SigNoz query
+    // over `loom.queue.disposition = "open_pr"` spans ranks every repo's
+    // lockout by frozen backlog without double counting the repo's other
+    // (non-blocked) rows. A `LeftQueue` emission is excluded: the row has
+    // already left the queue, so the repo's current lock state is not this
+    // row's story.
+    if emission.transition != Transition::LeftQueue
+        && emission.disposition == QueueDisposition::OpenPr
+    {
+        if let Some(lockout) = lockouts.get(slug) {
+            attributes.insert(
+                "lockout.frozen_candidates_count".to_string(),
+                int(lockout.backlog.candidates).to_string(),
+            );
+            attributes.insert(
+                "lockout.frozen_points_sum".to_string(),
+                i64::try_from(lockout.backlog.points)
+                    .unwrap_or(i64::MAX)
+                    .to_string(),
+            );
+            if let Some(secs) = lockout.duration_secs {
+                attributes.insert("lockout.duration_seconds".to_string(), secs.to_string());
+            }
+        }
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context,
@@ -477,6 +526,15 @@ pub(in crate::observability) async fn record(slug_cache: &mut HashMap<String, St
     let (rows, dropped) = build_rows(&summary, &repos);
     let failed = failed_slugs(&summary, &repos);
     let now = Utc::now();
+    // Issue #9674: aggregate this tick's pr-open-skip rows per repo, advance
+    // the global lockout clock (insert-if-absent, failed listings preserved),
+    // and stamp the resulting weights on the repo's `open_pr` spans below.
+    let lockouts = super::lockout::sample(
+        rows.iter()
+            .map(|r| (r.slug.as_str(), r.disposition, r.story_points)),
+        &failed,
+        now,
+    );
     let refresh = Duration::seconds(refresh_secs(std::env::var(REFRESH_SECS_ENV).ok().as_deref()));
     let emissions = TRACKER
         .get_or_init(|| Mutex::new(DispositionTracker::default()))
@@ -487,7 +545,7 @@ pub(in crate::observability) async fn record(slug_cache: &mut HashMap<String, St
         .filter(|(at, _)| *at == summary.at)
         .map(|(_, context)| context);
     for emission in &emissions {
-        sink.emit_span(build_span(emission, now, parent.as_ref()));
+        sink.emit_span(build_span(emission, now, parent.as_ref(), &lockouts));
     }
     sink.emit_metrics_since(dropped_points(dropped), previous_sample);
     *LAST_SAMPLED_TICK

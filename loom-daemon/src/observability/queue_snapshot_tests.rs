@@ -24,6 +24,7 @@ fn row(rank: usize, repo: &str, issue: u32, d: Qd, detail: Option<&str>) -> Read
         main_red_fix: false,
         created_at: Some("2026-09-01T00:00:00Z".into()),
         tier: Some("tier:goal-advancing".into()),
+        story_points: None,
         disposition: d,
         detail: detail.map(str::to_string),
         state: d.state().into(),

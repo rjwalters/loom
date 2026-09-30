@@ -1562,7 +1562,9 @@ id and the tick span as its parent. Its attributes are `loom.issue`,
 `error`) and `loom.dispatch.reason` (the `loom.dispatch.decisions` reason it
 was counted under), plus `loom.repo`/`loom.repo.visibility` (Issue #9222) when
 the admitting workspace's forge slug has already been resolved by the
-collector — omitted, never a local path, on a cache miss. Its status is
+collector — omitted, never a local path, on a cache miss. A `pr_open` refusal
+in a locked repo also carries that repo's `lockout.*` weight (Issue #9674;
+see the disposition span's table below). Its status is
 `error` only for `error`.
 
 #### `loom.dispatch.disposition` (Issue #9222): per-issue "why is it waiting"
@@ -1597,6 +1599,19 @@ tick; otherwise a root of its own. Attributes:
 | `loom.queue.previous_disposition` | present only on a `changed` transition after the first sighting |
 | `loom.queue.park_label` | only for `parked`/`hard_exclusion`, and only when the label is in the closed `PARK_LABELS ∪ SKIP_LABELS` vocabulary — a repo-configured extra skip label or a hard-exclusion rule name outside that set is never exported |
 | `loom.pr_number` | only for `open_pr`, parsed from the row's structured detail |
+| `lockout.frozen_candidates_count` | only for `open_pr` (Issue #9674): how many ready issues in this repo the #4123 open-PR guard is currently blocking (`pr-open-skip`) — the repo's frozen backlog |
+| `lockout.frozen_points_sum` | only for `open_pr` (Issue #9674): the summed story points of those blocked issues (`points:*` labels, `crate::story_points`); unsized issues contribute nothing — absent is never `0` |
+| `lockout.duration_seconds` | only for `open_pr` (Issue #9674): seconds since this daemon process first observed the repo locked — an observation **floor** on the true lockout age (a daemon restart restarts the clock; the daemon never probes the forge for PR timestamps). A failed listing never reads as a cleared lock |
+
+The lockout attributes ride the repo's `open_pr` rows only — the guard's own
+refusals — so a per-repo ranking never double counts the repo's other rows.
+`loom.dispatch.admission` spans with `loom.dispatch.reason = "pr_open"` carry
+the same three attributes (Issue #9674). Rank lockouts by frozen backlog with
+a SigNoz query over `span.name = 'loom.dispatch.disposition'` and
+`loom.queue.disposition = 'open_pr'`, grouping by `loom.repo` and taking the
+latest `lockout.frozen_candidates_count` / `lockout.frozen_points_sum` per
+repo (or `max` over a short window — both are step functions that only move
+when a tick's guard verdicts change).
 
 Free-form dispatch-error text is never exported. Rows past 256 per sample, or
 whose repo root never resolved, are dropped and counted on
