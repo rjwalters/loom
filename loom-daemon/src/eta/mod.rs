@@ -48,6 +48,7 @@
 //! golden test pins each id's output over a fixed fixture. A behaviour change
 //! is a new id, registered next to the old one ([`Registry`]).
 
+pub mod backtest;
 pub mod config;
 pub mod emit;
 pub mod explanation;

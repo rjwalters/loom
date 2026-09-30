@@ -68,6 +68,19 @@ pub(crate) enum ScriptPortCommand {
     /// flattened enum is what keeps a new top-level subcommand free.
     ShellBudget(super::shell_budget::ShellBudgetArgs),
 
+    /// Seed and evaluate the ETA estimators (#9325, Phase 2 of #9289).
+    ///
+    /// `eta backfill` populates the stage-sample journal from `pr-latency`
+    /// history so the heuristics have a baseline on day one; `eta backtest`
+    /// replays a heuristic against real outcomes leak-free and scores it.
+    ///
+    /// Not a script port either: it lives here for the same
+    /// frozen-`main.rs` reason as `shell-budget` above, which is also what
+    /// keeps `eta` a real nested subcommand (`loom-daemon eta backfill`,
+    /// not a flattened top-level `backfill`) at zero cost to `main.rs`.
+    #[command(subcommand)]
+    Eta(super::eta_cmd::EtaCommand),
+
     /// `merge-pr.sh`'s closing-reference / partial-increment analysis (#8191,
     /// slice 1). Reads the PR body on stdin — it is untrusted external content
     /// and routinely tens of kilobytes, so it does not belong in argv.
@@ -419,6 +432,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
+            ScriptPortCommand::Eta(cmd) => cmd.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::CargoTargetDir(cmd) => cmd.run(),
