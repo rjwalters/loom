@@ -350,6 +350,9 @@ pub struct ReviewConflictStats {
     pub checked: usize,
     pub flagged: usize,
     pub cleared: usize,
+    /// Base conflicts NOT flagged because the PR is sequenced behind an open
+    /// predecessor (#9686): the repair would be redundant until it lands.
+    pub deferred: usize,
 }
 
 /// Run the pass over one workspace `root`. Best effort: any `gh` failure is
@@ -377,23 +380,71 @@ pub fn reconcile_review_conflicts(gh_bin: &Path, root: &Path) -> ReviewConflictS
 
     for pr in prs.values() {
         match decide_review_conflict(pr) {
-            ConflictAction::Flag { head_sha } => match flag(gh_bin, root, pr.number, &head_sha) {
-                Ok(()) => {
-                    stats.flagged += 1;
-                    log::warn!(
-                        "claim_reconciliation: PR #{} in {} is CONFLICTING with its base at \
-                         {head_sha} — moved from loom:review-requested to \
-                         loom:changes-requested + loom:merge-conflict (#8922)",
+            ConflictAction::Flag { head_sha } => {
+                // #9686 deferral: a PR sequenced behind an OPEN predecessor
+                // would have its base repaired redundantly — the predecessor
+                // landing moves the base again. Skip the flag; record the
+                // deferral on the PR (idempotently) instead. Only THIS
+                // pass's automated routing defers: a Judge verdict never
+                // reaches this branch, and once the predecessor lands (or
+                // the hold voids/releases) the ordinary flag fires.
+                if pr.has(super::merge_sequence::SEQUENCE_LABEL) {
+                    match super::merge_sequence::defer_flag_decision(
+                        gh_bin, root, pr.number, &head_sha,
+                    ) {
+                        Ok(Some(marker)) => {
+                            match super::merge_sequence::defer_repair(
+                                gh_bin, root, pr.number, &marker,
+                            ) {
+                                Ok(()) => {
+                                    stats.deferred += 1;
+                                    log::info!(
+                                        "claim_reconciliation: PR #{} in {} is CONFLICTING but \
+                                         sequenced behind open #{} — base repair deferred (#9686)",
+                                        pr.number,
+                                        root.display(),
+                                        marker.after
+                                    );
+                                }
+                                Err(e) => log::warn!(
+                                    "claim_reconciliation: failed to record deferral on PR #{} \
+                                     in {}: {e}",
+                                    pr.number,
+                                    root.display()
+                                ),
+                            }
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::warn!(
+                                "claim_reconciliation: could not evaluate sequencing state for \
+                                 PR #{} in {}: {e} — flagging the conflict anyway (fail open \
+                                 toward repair, never toward suppression)",
+                                pr.number,
+                                root.display()
+                            );
+                        }
+                    }
+                }
+                match flag(gh_bin, root, pr.number, &head_sha) {
+                    Ok(()) => {
+                        stats.flagged += 1;
+                        log::warn!(
+                            "claim_reconciliation: PR #{} in {} is CONFLICTING with its base at \
+                             {head_sha} — moved from loom:review-requested to \
+                             loom:changes-requested + loom:merge-conflict (#8922)",
+                            pr.number,
+                            root.display()
+                        );
+                    }
+                    Err(e) => log::warn!(
+                        "claim_reconciliation: failed to flag base conflict on PR #{} in {}: {e}",
                         pr.number,
                         root.display()
-                    );
+                    ),
                 }
-                Err(e) => log::warn!(
-                    "claim_reconciliation: failed to flag base conflict on PR #{} in {}: {e}",
-                    pr.number,
-                    root.display()
-                ),
-            },
+            }
             ConflictAction::ClearIfOurs => {
                 // A failed fetch is "unknown", never "ours".
                 let ours = forge::fetch_comment_bodies(gh_bin, root, pr.number)

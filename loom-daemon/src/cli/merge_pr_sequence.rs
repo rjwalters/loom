@@ -79,3 +79,58 @@ impl SequenceEvalArgs {
         Ok(())
     }
 }
+
+/// `loom-daemon merge-pr sequence-plan` (#9686) — compute the landing-order
+/// plan for a repository and PRINT it, touching nothing. The read-only
+/// replay surface: run it against a real PR inventory to record what the
+/// pass would do before enabling it.
+#[derive(clap::Args)]
+pub(crate) struct SequencePlanArgs {
+    /// OWNER/REPO to plan. Omit to let `gh` resolve the repository from the
+    /// working directory.
+    #[arg(long, value_name = "OWNER/REPO")]
+    repo: Option<String>,
+}
+
+impl SequencePlanArgs {
+    pub(crate) fn run(self) -> Result<()> {
+        // The planner resolves the repo from cwd (gh_pr applies LOOM_REPO),
+        // so run from the requested directory when one is given.
+        if let Some(nwo) = self.repo.as_deref() {
+            std::env::set_var("LOOM_REPO", nwo);
+        }
+        let root = std::env::current_dir()?;
+        let gh = std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".into());
+        let report = loom_daemon::claim_reconciliation::merge_sequence::plan_report(
+            std::path::Path::new(&gh),
+            &root,
+        )?;
+        println!(
+            "{} open PR(s); trigger is >2; {} existing holder(s)",
+            report.open_prs, report.holders
+        );
+        if report.groups.is_empty() {
+            println!("no overlapping groups planned");
+            return Ok(());
+        }
+        for g in &report.groups {
+            let chain: Vec<String> = g.order.iter().map(|n| format!("#{n}")).collect();
+            println!("group {} (plan {}): {}", chain.join(" -> "), g.plan, chain.join(" -> "));
+            for e in &g.edges {
+                println!(
+                    "  would sequence #{follower} after #{after} at pred_head {} [{reason:?}]",
+                    e.pred_head,
+                    follower = e.follower,
+                    after = e.after,
+                    reason = e.reason
+                );
+            }
+        }
+        println!(
+            "would apply {} edge(s); {} already satisfied",
+            report.groups.iter().map(|g| g.edges.len()).sum::<usize>() - report.already_planned,
+            report.already_planned
+        );
+        Ok(())
+    }
+}

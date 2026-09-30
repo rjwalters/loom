@@ -2023,6 +2023,7 @@ mod verdict_stale_comment;
 /// leaving a single dispatch call in the match arm here.
 mod verdict_invalidation;
 
+pub mod merge_sequence;
 /// The #8922 base-conflict pass for `loom:review-requested` PRs — a sibling
 /// file per the file-size ratchet, run on the same tick right after
 /// [`forge::reconcile_pr_verdicts`].
