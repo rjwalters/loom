@@ -379,6 +379,7 @@ fn daemon_write_paths_are_scoped() {
         ("role_tick_telemetry.rs", NotAWrite("classifies commands, runs none")),
         ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
         ("terminal.rs", NotAWrite("tmux flags")),
+        ("fleet_store/gh.rs", NotAWrite("store reads: its one method is `--method GET`")),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
         ("worker_spawn/egress_proxy/server.rs", NotAWrite("HTTP method check in a proxy")),
     ];

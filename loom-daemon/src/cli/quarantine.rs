@@ -115,10 +115,11 @@ fn render_quarantine_list(entries: &[QuarantineEntry]) {
         println!("{}:", root.display());
         for e in group {
             println!(
-                "  #{}  insta-crash {}/{}  applied {}  ttl remaining {}s",
+                "  #{}  insta-crash {}/{}  generation {}  applied {}  ttl remaining {}s",
                 e.issue,
                 e.insta_crash_count,
                 e.insta_crash_threshold,
+                e.generation,
                 e.quarantined_at.to_rfc3339(),
                 e.ttl_remaining_secs
             );

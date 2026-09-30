@@ -71,7 +71,9 @@
 //! # Failing closed
 //!
 //! - A required context with **no spec here** is stale whenever `D` is
-//!   non-empty. Adding a step to a required job without updating this table
+//!   non-empty, unless the repo declares its inputs in
+//!   `.loom/stale-check-inputs.json` (#9589, see [`super::repo_specs`]) —
+//!   the path a consumer repo, whose contexts this table never names, uses. Adding a step to a required job without updating this table
 //!   therefore blocks merges rather than silently passing them — and the pin
 //!   test in `tests.rs` fails first, at PR time.
 //! - Missing `B`, `D` or `P` (a non-Actions check, an unreadable log, a
@@ -108,6 +110,7 @@
 //! input set is the right place to guard that. It is out of scope here; see
 //! the merge-time re-verification follow-up (#9571).
 
+use super::repo_specs::RepoSpecs;
 use super::workflow_scope::{CiScope, CiScopes};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -208,21 +211,29 @@ pub struct ScopedEvidence {
     /// Per required context with no `base_moves` entry, why — surfaced as the
     /// `Warning:` that accompanies the fallback to the time rule.
     pub fallbacks: BTreeMap<String, String>,
+    /// The base tip's per-repo input declaration (#9589), consulted only for a
+    /// context with no built-in spec. [`RepoSpecs::Absent`] — the default —
+    /// keeps such a context stale on any base move.
+    pub repo_specs: RepoSpecs,
 }
 
 /// One required context's input specification. See the module header for what
 /// `global` / `scanned` / `coupled` mean and why over-population is safe.
+///
+/// Generic over the borrow so a per-repo declaration (#9589,
+/// [`super::repo_specs`]) can be judged by the very same clauses; the built-in
+/// table is `CheckSpec<'static>`.
 #[derive(Debug, Clone, Copy)]
-pub struct CheckSpec {
+pub struct CheckSpec<'a> {
     /// The component gate's name: its former `ci.yml` job name, and the name its
     /// `# component:` marker uses (see [`RequiredCheck`]).
-    pub context: &'static str,
+    pub context: &'a str,
     /// `G` — inputs whose change can flip the verdict for every file.
-    pub global: &'static [&'static str],
+    pub global: &'a [&'a str],
     /// `S` — paths whose verdict depends only on their own content plus `G`.
-    pub scanned: &'static [&'static str],
+    pub scanned: &'a [&'a str],
     /// `C` — cross-file aggregates and links.
-    pub coupled: &'static [&'static str],
+    pub coupled: &'a [&'a str],
     /// Does a *deletion or rename* on one side, with the other side touching
     /// `C`, make this check stale? True for the link/parity checks, where the
     /// path that disappeared need not itself be in `C`.
@@ -263,7 +274,7 @@ impl std::fmt::Display for StaleReason {
 /// `ci.yml` keeps its whole-file `G` meaning; [`stale_reason_scoped`] is the
 /// form that narrows it (#9065).
 #[must_use]
-pub fn stale_reason(spec: &CheckSpec, d: &FileSet, p: &FileSet) -> Option<StaleReason> {
+pub fn stale_reason(spec: &CheckSpec<'_>, d: &FileSet, p: &FileSet) -> Option<StaleReason> {
     stale_reason_scoped(spec, d, p, &CiScopes::unscoped())
 }
 
@@ -281,7 +292,7 @@ pub fn stale_reason(spec: &CheckSpec, d: &FileSet, p: &FileSet) -> Option<StaleR
 /// direction this guard is allowed to err in.
 #[must_use]
 pub fn stale_reason_scoped(
-    spec: &CheckSpec,
+    spec: &CheckSpec<'_>,
     d: &FileSet,
     p: &FileSet,
     ci: &CiScopes,
@@ -383,8 +394,8 @@ pub fn stale_reason_scoped(
 #[must_use]
 pub fn unknown_check_reason(d: &FileSet) -> Option<StaleReason> {
     d.paths.iter().next().map(|b| StaleReason {
-        clause: "this required check has no entry in the input-scope table, so which files it \
-                 reads is unknown",
+        clause: "this required check has no entry in the input-scope table and no declaration \
+                 in `.loom/stale-check-inputs.json`, so which files it reads is unknown",
         base_path: Some(b.clone()),
         pr_path: None,
     })
@@ -392,7 +403,7 @@ pub fn unknown_check_reason(d: &FileSet) -> Option<StaleReason> {
 
 /// The spec for one component gate, or `None`.
 #[must_use]
-pub fn spec_for(component: &str) -> Option<&'static CheckSpec> {
+pub fn spec_for(component: &str) -> Option<&'static CheckSpec<'static>> {
     SPECS.iter().find(|s| s.context == component)
 }
 
@@ -401,7 +412,7 @@ pub fn spec_for(component: &str) -> Option<&'static CheckSpec> {
 /// one spec. `None` when any component is unmapped, which
 /// [`unknown_check_reason`] then turns into a refusal (fail closed).
 #[must_use]
-pub fn specs_for(context: &str) -> Option<Vec<&'static CheckSpec>> {
+pub fn specs_for(context: &str) -> Option<Vec<&'static CheckSpec<'static>>> {
     match REQUIRED_CHECKS.iter().find(|r| r.context == context) {
         Some(req) => req.components.iter().map(|c| spec_for(c)).collect(),
         None => spec_for(context).map(|s| vec![s]),
@@ -413,7 +424,7 @@ pub fn specs_for(context: &str) -> Option<Vec<&'static CheckSpec>> {
 /// stale.
 #[must_use]
 pub fn composite_stale_reason(
-    components: &[&'static CheckSpec],
+    components: &[&'static CheckSpec<'static>],
     d: &FileSet,
     p: &FileSet,
     ci: &CiScopes,
@@ -533,7 +544,7 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
 
 /// The hand-maintained input table. **Adding a step to a required job means
 /// updating the matching entry here** — `tests.rs`'s pin test fails otherwise.
-pub const SPECS: &[CheckSpec] = &[
+pub const SPECS: &[CheckSpec<'static>] = &[
     // Reads exactly one file's line count.
     CheckSpec {
         context: "CLAUDE.md Line Budget",

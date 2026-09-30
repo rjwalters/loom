@@ -6,20 +6,29 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-# Supersede on a PR; NEVER on main (#7779).
+# Supersede on a PR; on main, queue at most one run and NEVER cancel a
+# started one (#7779, #9608).
 #
-# `github.ref` is `refs/heads/main` for every push to main, so one shared
-# group meant each merge cancelled the previous merge's verification.
-# Measured before this change: of the last 30 main runs, 22 cancelled and 7
-# succeeded. At ~3.3 merges/hour against a run longer than the gap between
-# merges, near-total cancellation is the steady state, and `main` stops being
-# a usable control for "does this fail here too?" -- the first question in any
-# flake triage (#7789).
+# #7779: `github.ref` is `refs/heads/main` for every push to main, so one
+# shared group WITH cancel-in-progress meant each merge cancelled the previous
+# merge's in-progress verification. Measured then: of the last 30 main runs,
+# 22 cancelled and 7 succeeded. At ~3.3 merges/hour against a run longer than
+# the gap between merges, near-total cancellation is the steady state, and
+# `main` stops being a usable control for "does this fail here too?" -- the
+# first question in any flake triage (#7789).
 #
-# Keyed on the PR number when there is one, and on the commit SHA otherwise,
-# so every main commit gets its own group and has nothing to supersede.
+# #9608: keying main on the commit SHA fixed that but left main unbounded --
+# a merge burst on 2026-09-30 queued ~30 full runs behind the concurrent-job
+# cap. So main is keyed on the ref again, but with cancel-in-progress FALSE:
+# GitHub never cancels a run that has started, and a newly arriving run
+# supersedes only a still-*pending* run in the group. Net: one running plus
+# the newest pending, and the tip is always verified. The cost is per-commit
+# results inside a burst (bisect across it if the tip is red); see
+# ci-principles.md rule 2. PR runs are unchanged: keyed on the PR number,
+# cancel-in-progress true. This stanza is the ONLY cancellation mechanism on
+# main (rule 4) -- the `changes` job's cancel step is PR-only.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Rust caches (#9065): every Swatinem/rust-cache step restores on any ref but

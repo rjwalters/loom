@@ -286,12 +286,29 @@ pub(crate) enum ForgeAction {
     /// JSON shape; exits 1 with nothing on stdout on unparseable input. `gh
     /// --json` spells an App as a bare login, so fleet-authored markers need
     /// the REST listing. See `.loom/docs/comment-trust.md`.
+    ///
+    /// `--fetch N` reads issue/PR N's REST listing itself (one call for role
+    /// prompts and scripts; exits 1 when it cannot be read). `--with-body`
+    /// puts the issue/PR itself first, so its body survives only when its
+    /// author is trusted; `--gh-shape` prints `gh --json comments` fields.
     #[command(name = "trusted-comments")]
     TrustedComments {
         /// This caller's own login, trusted with the same account kind
         /// (default: the configured writer App, `<slug>[bot]`).
         #[arg(long, value_name = "LOGIN")]
         self_login: Option<String>,
+        /// Fetch issue/PR N's comments (REST) instead of reading stdin.
+        #[arg(long, value_name = "N")]
+        fetch: Option<u64>,
+        /// With `--fetch`: `owner/name` (default: the cwd's repo).
+        #[arg(long, value_name = "NWO", requires = "fetch")]
+        repo: Option<String>,
+        /// With `--fetch`: the issue/PR body first, kept only if trusted.
+        #[arg(long, requires = "fetch")]
+        with_body: bool,
+        /// Print `{author:{login},authorAssociation,body,createdAt}` items.
+        #[arg(long)]
+        gh_shape: bool,
     },
 
     /// `forge may-write [--repo OWNER/REPO]` (#9548) — may this installation
@@ -334,8 +351,15 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
         ForgeAction::MayWrite { repo } => return super::forge_identity_cmd::may_write(repo),
-        ForgeAction::TrustedComments { self_login } => {
-            return super::forge_identity_cmd::trusted_comments(self_login)
+        ForgeAction::TrustedComments {
+            self_login,
+            fetch,
+            repo,
+            with_body,
+            gh_shape,
+        } => {
+            let fetch = fetch.map(|n| (n, repo, with_body));
+            return super::forge_identity_cmd::trusted_comments(self_login, fetch, gh_shape);
         }
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),

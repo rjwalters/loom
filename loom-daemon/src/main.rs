@@ -1137,6 +1137,12 @@ enum Commands {
     // surface goes in a sibling module behind a one-line dispatch arm. A
     // `#[derive(Args)]` struct parses identically to an inline variant body.
     SweepOutcomes(cli::sweep_outcomes_cli::SweepOutcomesArgs),
+
+    /// Read the operator's fleet state store (config key `fleet.repo` / env
+    /// `LOOM_FLEET_REPO`): `fetch` it, `render` this host's config (`--check`
+    /// = drift detector), diff/apply the `roster`, and report the desired run
+    /// `state`. Args live in `cli::fleet_config` (main.rs is size-frozen).
+    FleetConfig(cli::fleet_config::FleetConfigArgs),
 }
 
 /// Sub-actions for `loom-daemon checkpoint` (issue #4275).
@@ -2365,6 +2371,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             verbose,
         } => handle_validate_command(&workspace, &format, strict, verbose),
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
+        Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
         Commands::Stats {
             command,
             role,

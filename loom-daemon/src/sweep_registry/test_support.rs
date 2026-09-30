@@ -956,7 +956,7 @@ pub(crate) fn spawn_bin_missing_registry(ws: &Path) -> (SweepRegistry, PathBuf) 
 /// deliberately never calls `finish_issue_dispatch` — reproducing "the
 /// daemon died between the label flip and the post-spawn journal write"
 /// without any timing dependence, exactly like
-/// `same_key_retry_during_the_unlocked_poll_window_is_refused_not_double_spawned`
+/// `same_key_retry_during_the_unlocked_poll_window_returns_the_inflight_sweep_id`
 /// reproduces its own unlocked-poll-window race by simply stopping short.
 pub(crate) fn crash_before_finish_registry(ws: &Path) -> (SweepRegistry, PathBuf) {
     let gh_log = ws.join("gh-invocations.log");

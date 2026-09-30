@@ -10,10 +10,18 @@ the next person to add one will have an equally good argument.
    cheaper than an unverified merge, and far cheaper than a misattributed
    failure that costs an agent a triage cycle.
 
-2. **Never cancel verification of a distinct commit.** Superseding is correct
-   on a PR branch, where a newer push replaces an older one and the older
-   result is worthless. It is never correct on the default branch, where every
-   commit is distinct work that nothing else will verify.
+2. **Never cancel verification of a distinct commit once it has started.**
+   Superseding is correct on a PR branch, where a newer push replaces an
+   older one and the older result is worthless. On the default branch every
+   commit is distinct work, so a started `main` run is never cancelled.
+   Bounding the *queue* is the one exception (#9608): `main` shares one
+   concurrency group with `cancel-in-progress: false`, so at most one run is
+   in progress and one waits, and a newer push supersedes only a run that has
+   not started. The tip is always verified. What a merge burst loses is the
+   per-commit result for the intermediate commits that never started; if the
+   tip is red, bisect across the burst to find the culprit. Without the bound,
+   a burst of ~45 merges queued ~30 full runs and left the tip unverified for
+   hours.
 
 3. **Path-filtering is an optimisation, not a correctness tool.** A check that
    can fail because of a file *outside* its path group must not be filtered by
@@ -61,7 +69,7 @@ the next person to add one will have an equally good argument.
    The freshness guard asks a different question — "can merging this PR turn
    a check that already ran and passed red?" — and answering it needs the
    input set the check actually read (`merge_pr/stale_checks/inputs.rs`).
-   Two narrowings live there, and both must obey the same three constraints:
+   Three narrowings live there, and both must obey the same three constraints:
    **derive the scope from the repo's own text, never a hand-maintained
    second copy**; **keep it per-file, never per-commit**; and **fail closed
    to the broader answer on any doubt**.
@@ -81,6 +89,13 @@ the next person to add one will have an equally good argument.
      guard's component table all restore the whole-file meaning on that side.
      Nothing is skipped and no check's coverage narrows — every gate still
      runs on every PR.
+   - *Per-repo declarations* (#9589): a consumer repo's required contexts are
+     absent from loom's table, so each is stale on any base move unless the
+     repo declares its inputs in `.loom/stale-check-inputs.json`
+     ([stale-check-inputs](stale-check-inputs.md)). The declaration is the
+     repo's own text, read from the base tip, and is itself a global input of
+     every check it declares. An unlisted context gets no guessed default, and
+     any malformed or unreadable file is ignored with a warning.
 
 10. **Every speed trade-off on the merge gate is owed a slow run somewhere
     else.** Rules 7 and 8 make a fast gate legitimate; they do not make it
@@ -184,7 +199,8 @@ a cancellation rate.
 
 ## Related
 
-- #7779 / PR #7803 — the cancellation fix
+- #7779 / PR #7803 — the cancellation fix; #9608 — the bounded `main` queue
+  (one running + newest pending) that rule 2 now allows
 - #7789 / #7791 — flake tracking, and why retry must *record* rather than hide
 - #7745 / #7761 — the same "a skipped check must not read as a pass" rule,
   learned in the resync and guard layers

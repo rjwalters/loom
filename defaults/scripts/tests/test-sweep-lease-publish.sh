@@ -241,6 +241,10 @@ chmod +x "$STUB_DIR/gh"
 
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# #9548: the subject filters lease markers through `forge trusted-comments`.
+# shellcheck source=lib/trust-stub.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/trust-stub.sh"
+loom_trust_stub "$STUB_DIR"
 # #9548: lease writes vet their repo first; that decision is not what this
 # suite tests (test-write-scope.sh does), so fixture repos are allowed.
 source "$(dirname "${BASH_SOURCE[0]}")/lib/write-scope-stub.sh"

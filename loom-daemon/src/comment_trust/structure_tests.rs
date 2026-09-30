@@ -47,6 +47,10 @@ const MARKER_FILES: &[(&str, &str)] = &[
     ("dep_classify/consts.rs", "constants"),
     ("dep_recheck/forge.rs", "a PR's own closing refs, not the linked-PR guard"),
     ("merge_pr/redate.rs", "writer; reader in remedy_with (FETCH_SITES)"),
+    (
+        "merge_pr/redate/budget.rs",
+        "pure parser over remedy_with's trusted listing (#9590)",
+    ),
     ("premise_check/cli.rs", "reader in forge_inputs (FETCH_SITES)"),
     ("premise_check/record.rs", "parser over already-filtered chunks"),
     ("quarantine_reconciliation.rs", "reader (FETCH_SITES)"),
@@ -111,7 +115,7 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     // must filter it (`policy.trusted_listing(`), checked below.
     ("premise_check/cli.rs", "forge_inputs", "trusted_inputs("),
     ("premise_check/cli.rs", "trusted_inputs", "policy.trusted_listing("),
-    ("merge_pr/redate.rs", "remedy_with", "policy.trusted_bodies("),
+    ("merge_pr/redate.rs", "remedy_with", "policy.trusted_listing("),
     ("merge_pr/redate.rs", "post_comment", ""),
     ("role_runner/roster.rs", "read_roster_comments", "trusted_ndjson("),
     ("role_runner/roster.rs", "create_roster_comment", ""),
