@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeKind {
+    /// `start`: the issue's sweep was dispatched (#9326).
+    Started,
     /// `land`: PR merged, or issue closed as completed.
     Landed,
     /// `finish`: the sweep reached a terminal state (any result).
@@ -247,7 +249,7 @@ pub fn score(
 
     let scored = match outcome {
         OutcomeKind::Abandoned => None,
-        OutcomeKind::Landed | OutcomeKind::Finished => estimate.quantiles(),
+        OutcomeKind::Started | OutcomeKind::Landed | OutcomeKind::Finished => estimate.quantiles(),
     };
     let age_bucket = estimate.age_sec.map(|a| bucket(a).to_string());
     let stage_at_estimate = estimate.stage;

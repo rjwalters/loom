@@ -4,6 +4,11 @@
 //! Reads in-sweep phase durations and the ETA tracker's own stage-sample
 //! journal (the external Judge and merge paths). An approved path always
 //! ends with `merge_wait`.
+//!
+//! For an issue not yet started (#9326) the path starts at `ready_wait`: the
+//! same queue wait `start-v1` simulates, then the post-dispatch chain from
+//! `sweep.curator`, in one resampling pass. Every started item's output is
+//! unchanged.
 
 use super::{estimate_path, PathRules};
 use crate::eta::history::{SampleSource, StageSamples};
@@ -32,6 +37,7 @@ impl Heuristic for LandV1 {
                 kind: Kind::Land,
                 sources: &[SampleSource::SweepOutcome, SampleSource::StageJournal],
                 always_merge: true,
+                censoring: false,
             },
             input,
             history,

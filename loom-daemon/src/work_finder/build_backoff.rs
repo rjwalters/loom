@@ -105,7 +105,8 @@ impl BuildBackoffConfig {
         }
     }
 
-    /// Read `root`'s effective `autonomous.workFinder.buildBackoff`.
+    /// Read `root`'s effective `autonomous.workFinder.buildBackoff`, with the
+    /// `hyperparameters.rework` layer (Issue #9683) overlaid per field.
     #[must_use]
     pub fn read(root: &Path) -> ParsedConfig {
         let effective = crate::config_resolver::resolve_effective_config(root);
@@ -114,7 +115,54 @@ impl BuildBackoffConfig {
             .and_then(|w| w.get("buildBackoff"))
             .cloned()
             .unwrap_or(Value::Null);
-        Self::parse(&block)
+        apply_hyperparams(&effective, Self::parse(&block))
+    }
+}
+
+/// Overlay `hyperparameters.rework.{buildBackoffHigh,buildBackoffLow}`
+/// (Issue #9683) onto the legacy-parsed pair, then re-run the crossed-pair
+/// rejection against the **final** pair: a layer-supplied `high` must still
+/// sit above whatever `low` resolved to, whichever tier each came from. A
+/// crossed final pair falls back to the defaults (40/25) — the same soft
+/// contract [`BuildBackoffConfig::parse`] applies to a legacy-only pair;
+/// `hyperparams::startup_init` is the strict gate that names a crossed pair
+/// supplied through the `hyperparameters` surface at daemon startup. An
+/// overlay that lands clears any legacy rejected-pair note — it no longer
+/// describes the pair that will run.
+fn apply_hyperparams(effective: &Value, parsed: ParsedConfig) -> ParsedConfig {
+    let layer = crate::hyperparams::overlay_from_effective(effective);
+    let Some(rework) = layer.get("rework").filter(|r| !r.is_null()) else {
+        return parsed;
+    };
+    let overlay_high = rework
+        .get("buildBackoffHigh")
+        .filter(|v| !v.is_null())
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok());
+    let overlay_low = rework
+        .get("buildBackoffLow")
+        .filter(|v| !v.is_null())
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok());
+    if overlay_high.is_none() && overlay_low.is_none() {
+        return parsed;
+    }
+    let mut config = parsed.config;
+    if let Some(high) = overlay_high {
+        config.high = high;
+    }
+    if let Some(low) = overlay_low {
+        config.low = low;
+    }
+    if config.low >= config.high {
+        return ParsedConfig {
+            config: BuildBackoffConfig::default(),
+            rejected_pair: Some((config.high, config.low)),
+        };
+    }
+    ParsedConfig {
+        config,
+        rejected_pair: None,
     }
 }
 

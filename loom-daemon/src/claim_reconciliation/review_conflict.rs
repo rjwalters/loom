@@ -389,7 +389,9 @@ pub fn reconcile_review_conflicts(gh_bin: &Path, root: &Path) -> ReviewConflictS
                 // reaches this branch, and once the predecessor lands (or
                 // the hold voids/releases) the ordinary flag fires.
                 if pr.has(super::merge_sequence::SEQUENCE_LABEL) {
-                    match super::merge_sequence::defer_flag_decision(gh_bin, root, pr.number) {
+                    match super::merge_sequence::defer_flag_decision(
+                        gh_bin, root, pr.number, &head_sha,
+                    ) {
                         Ok(Some(marker)) => {
                             match super::merge_sequence::defer_repair(
                                 gh_bin, root, pr.number, &marker,

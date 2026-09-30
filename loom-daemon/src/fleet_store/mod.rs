@@ -22,13 +22,19 @@
 //! - [`state`] — this host's desired run state from `fleet/state.yml`.
 //! - [`propose`] — the one *write* path: open a PR against the store instead
 //!   of hand-editing it (#9599).
+//! - [`reload`] — classify a changed config path as live-reloadable or
+//!   restart-required (#9597).
+//! - [`pending_restart`] — track a restart-required render until the daemon
+//!   it was rendered against actually restarts (#9597).
 //!
 //! The file contract is documented in `defaults/docs/daemon-reference.md`
 //! §"Fleet store".
 
 pub mod fetch;
 pub mod gh;
+pub mod pending_restart;
 pub mod propose;
+pub mod reload;
 pub mod render;
 pub mod roster;
 pub mod state;

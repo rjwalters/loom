@@ -11,6 +11,12 @@
 //! builder spawn or worktree access, that the winning claimant's
 //! `loom:building` label is left intact, and that this host's own local
 //! side effects (claim lock, peer-claim advertisement) are unwound.
+//!
+//! Issue #9453 Phase 3.1 extends the same dispatch path with a second signal —
+//! a young `loom:building` label carrying NO lease record at all, the shape an
+//! operator-directed hand-claim leaves behind — and its two end-to-end cases
+//! (yield while young, proceed once past the label grace) live here too,
+//! reusing this file's harness and assertion shape.
 
 use crate::sweep_registry::test_support::*;
 use crate::sweep_registry::*;
@@ -254,6 +260,141 @@ fn set_preflip_labels(ws: &Path, labels: &[&str]) {
         script.replace(before, &format!("printf '{{\"labels\":[{payload}]}}\\n'")),
     )
     .unwrap();
+}
+
+/// Rewrite the harness's fake `gh` so its `api .../timeline` read answers with
+/// a `labeled loom:building` event `secs_ago` seconds old — the signal
+/// [`SweepRegistry::fetch_claim_labeled_at`](crate::sweep_registry::SweepRegistry::fetch_claim_labeled_at)
+/// reads for #9453 Phase 3.1's leaseless-claim leg.
+///
+/// Must be spliced in BEFORE the shared harness's generic `$2 == repos/*` arm:
+/// the timeline path also matches that glob, and that arm prints an empty line
+/// (the "no label event" fail-open shape every other test in this file relies
+/// on). Patched in place for the same reason `set_preflip_labels` is — keeping
+/// `test_support.rs`, which is over the file-size ratchet, untouched.
+fn set_claim_labeled_at(ws: &Path, secs_ago: i64) {
+    let fake_gh = ws.join("fake-gh.sh");
+    let script = std::fs::read_to_string(&fake_gh).unwrap();
+    let generic = "if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then";
+    assert!(
+        script.contains(generic),
+        "the shared harness's generic `api repos/*` arm changed shape; update this patch"
+    );
+    let arm = format!(
+        "if [[ \"$1\" == \"api\" && \"$*\" == *\"/timeline\"* ]]; then\n\
+         printf '%s\\n' '{ts}'\n\
+         exit 0\n\
+         fi\n\
+         {generic}",
+        ts = (Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339(),
+    );
+    std::fs::write(&fake_gh, script.replacen(generic, &arm, 1)).unwrap();
+}
+
+/// **The #9453 Phase 3.1 regression (Class A of #9447).** An operator-directed
+/// hand-claim applied `loom:building` five minutes ago and published no lease
+/// record — the lane Phase 2 now requires to publish one, and the lane that
+/// raced the fleet on #9432 (label applied 19:57:07Z; the fleet opened a
+/// duplicate PR 76 minutes later).
+///
+/// The comment read-back therefore contains nothing but this dispatcher's own
+/// freshly-written lease, so #6287's comment-order leg and #8840's renewal leg
+/// both see a clean, uncontested claim. The label leg must supply the refusal,
+/// and — the acceptance criterion — it must land BEFORE any builder spawn,
+/// worktree access, or label revert. The identity it reports is an explicit
+/// unknown: a label event names no host and no sweep.
+#[test]
+#[serial]
+fn dispatch_yields_to_a_young_leaseless_foreign_building_claim() {
+    let dir = tempdir().unwrap();
+    let (mut registry, gh_log, spawn_log, store) = lease_order_dispatch_registry(dir.path(), &[]);
+    set_claim_labeled_at(dir.path(), 300);
+
+    let err = registry
+        .dispatch(&SweepKind::Issue(9432), None, None, None, None)
+        .expect_err("a young leaseless foreign `loom:building` must refuse this dispatch");
+    let lease_err = err
+        .downcast_ref::<LeaseOrderDispatchError>()
+        .unwrap_or_else(|| panic!("expected a LeaseOrderDispatchError, got: {err:#}"));
+    assert_eq!(lease_err.issue, 9432);
+    assert_eq!(
+        lease_err.earliest_host,
+        guards::claim_label::LEASELESS_CLAIM_HOST,
+        "a label event names no host — the yield must say so rather than invent one"
+    );
+    assert!(
+        lease_err
+            .earliest_sweep_id
+            .starts_with(guards::claim_label::LEASELESS_CLAIM_SWEEP_PREFIX),
+        "the reported sweep id must name the leaseless label and its timestamp, got: {}",
+        lease_err.earliest_sweep_id
+    );
+
+    assert_eq!(
+        registry.len(),
+        0,
+        "no sweep entry may be recorded for a dispatch that lost to a live leaseless claim"
+    );
+    assert!(
+        !spawn_log.exists(),
+        "the yield must land BEFORE any builder spawn — this is the acceptance criterion the \
+         #9432 incident violated"
+    );
+    assert!(
+        !registry.config().locks_dir().join("issue-9432").exists(),
+        "this host's own claim lock must be released when it stands down"
+    );
+    assert!(
+        !dir.path().join(".loom/worktrees/issue-9432").exists(),
+        "the yield must land before any worktree access"
+    );
+
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        gh_calls.contains("loom:lease-yield"),
+        "a standdown annotation must record the yield; gh log: {gh_calls}"
+    );
+    assert!(
+        !gh_calls.contains("--add-label loom:issue")
+            && !gh_calls.contains("--remove-label loom:building"),
+        "the hand-claim's loom:building label must be left intact (loom#5270 — it is the \
+         claimant's only cross-host mutex); gh log: {gh_calls}"
+    );
+    assert!(
+        std::fs::read_to_string(&store)
+            .unwrap_or_default()
+            .contains("loom:lease host="),
+        "this dispatcher's own lease record is written before the tie-break and is not revoked \
+         by the standdown — only the local claim lock and peer advertisement are unwound"
+    );
+}
+
+/// The anti-wedge complement of the regression above, and the reason the leg
+/// reuses orphan recovery's 10-minute label grace: a `loom:building` older than
+/// that grace is the shape a finished or abandoned claim leaves behind. If it
+/// blocked dispatch, every redispatch of a previously-claimed issue would lose
+/// to its own history — the `LEASE_ORDER_LOOKBACK_SECS` failure mode, one signal
+/// over.
+#[test]
+#[serial]
+fn dispatch_proceeds_past_a_leaseless_building_label_older_than_the_grace() {
+    let dir = tempdir().unwrap();
+    let (mut registry, gh_log, spawn_log, _store) = lease_order_dispatch_registry(dir.path(), &[]);
+    set_claim_labeled_at(dir.path(), guards::claim_label::LEASELESS_CLAIM_LABEL_GRACE_SECS + 60);
+
+    let outcome = registry
+        .dispatch(&SweepKind::Issue(9436), None, None, None, None)
+        .expect("a `loom:building` label past the grace must not block a fresh dispatch");
+    assert!(outcome.was_new);
+    assert!(
+        wait_for_contents(&spawn_log, "spawned", FIXTURE_CHILD_WAIT_MS),
+        "an aged-out claim label must still spawn its builder"
+    );
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        !gh_calls.contains("loom:lease-yield"),
+        "no standdown may be posted for a claim label past the grace; gh log: {gh_calls}"
+    );
 }
 
 /// Make the harness's fake `gh` fail every lease-comment READ-back, while

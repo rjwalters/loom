@@ -550,15 +550,19 @@ pub const LEASE_TTL_MINUTES_ENV: &str = "LOOM_LEASE_TTL_MINUTES";
 /// claim is treated as unproven by this evidence source.
 pub const DEFAULT_LEASE_TTL_MINUTES: f64 = 15.0;
 
-/// Resolve the lease-freshness TTL (minutes) from [`LEASE_TTL_MINUTES_ENV`],
-/// falling back to [`DEFAULT_LEASE_TTL_MINUTES`] for an absent, unparseable,
-/// or non-positive value.
+/// Resolve the lease-freshness TTL (minutes) down the tier chain: the
+/// single-knob env var, then the hyperparameters layer (Issue #9683 —
+/// `hyperparameters.lifecycle.leaseTtlMinutes`, startup-captured via the
+/// process global so a per-call config re-read is unnecessary), then
+/// [`DEFAULT_LEASE_TTL_MINUTES`] for an absent, unparseable, or non-positive
+/// value at either tier.
 #[must_use]
 pub fn resolve_lease_ttl_minutes() -> f64 {
     std::env::var(LEASE_TTL_MINUTES_ENV)
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
+        .or_else(crate::hyperparams::lease_ttl_minutes_from_layer)
         .unwrap_or(DEFAULT_LEASE_TTL_MINUTES)
 }
 

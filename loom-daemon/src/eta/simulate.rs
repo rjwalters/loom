@@ -8,6 +8,13 @@
 //! The first stage's draw is conditioned on its age: `u` is mapped onto
 //! `[f_age, 1]` and the age is subtracted (floored at zero).
 //!
+//! A path from `ready_wait` (#9326) first draws one slot turnover per
+//! turnover the item still needs (`ready_visits`), adds the fixed admission
+//! delay, and then either stops (`start`: the path ends at dispatch) or walks
+//! the post-dispatch chain from `sweep.curator` exactly as above. Its
+//! `ready_wait` draws are never age-conditioned: the item's age in the queue
+//! says nothing about the turnover in progress.
+//!
 //! The quantiles of the path totals are nearest-rank over the sorted
 //! totals, rounded to whole seconds.
 //!
@@ -16,7 +23,7 @@
 
 use super::explanation::{Contributions, Explanation, StageMark};
 use super::grid;
-use super::{round3, Stage};
+use super::{round3, Stage, STAGE_COUNT};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
 
@@ -57,7 +64,13 @@ pub struct PathSpec {
     /// Whether an approved path continues to `merge_wait`.
     pub include_merge: bool,
     /// Grid per stage (`Stage::index`); `None` for a stage not on the path.
-    pub grids: [Option<Vec<i64>>; 5],
+    pub grids: [Option<Vec<i64>>; STAGE_COUNT],
+    /// `ready_wait` start only: slot turnovers drawn before dispatch.
+    pub ready_visits: u32,
+    /// `ready_wait` start only: fixed seconds added at dispatch.
+    pub ready_offset_sec: i64,
+    /// The path ends at dispatch (`start`).
+    pub stop_at_dispatch: bool,
     /// `(f_age, age_sec)` for the first stage.
     pub conditioning: Option<(f64, i64)>,
     /// `P(reject | attempt k)` for `k = 1..=cap`.
@@ -79,11 +92,11 @@ pub struct Simulation {
     /// paths that visit the stage (#9366); `None` for a stage no path
     /// visits. The terminal stage's samples are the path completion times,
     /// so its `p50` equals `quantiles.1`.
-    pub entry_marks: [Option<(i64, i64, i64)>; 5],
+    pub entry_marks: [Option<(i64, i64, i64)>; STAGE_COUNT],
     /// Fraction of paths visiting each stage.
-    pub reached: [f64; 5],
+    pub reached: [f64; STAGE_COUNT],
     /// Mean visits per path for each stage.
-    pub mean_visits: [f64; 5],
+    pub mean_visits: [f64; STAGE_COUNT],
     /// Mean new rework rounds per path.
     pub expected_rework_rounds: f64,
     /// What dominates the result.
@@ -92,11 +105,15 @@ pub struct Simulation {
 
 impl Simulation {
     /// The explanation's `stage_marks`: one mark per [`Stage::ALL`] stage,
-    /// in stage order, projected at wall-clock `as_of` (#9366).
+    /// in stage order, projected at wall-clock `as_of` (#9366) — preceded by
+    /// a `ready_wait` mark only when the path starts there (#9326).
     #[must_use]
     pub fn stage_marks(&self, as_of: DateTime<Utc>) -> Vec<StageMark> {
-        Stage::ALL
+        Stage::EVERY
             .iter()
+            .filter(|&&stage| {
+                stage != Stage::ReadyWait || self.entry_marks[stage.index()].is_some()
+            })
             .map(|&stage| {
                 let times = self.entry_marks[stage.index()].map(|(p25, p50, p75)| {
                     (
@@ -152,6 +169,17 @@ pub fn may_reject(p_by_attempt: &[f64], start_rework: u32, cap: u32) -> bool {
 /// Every stage a path from `start` can visit.
 #[must_use]
 pub fn reachable(start: Stage, include_merge: bool, may_reject: bool) -> Vec<Stage> {
+    reachable_path(start, include_merge, may_reject, false)
+}
+
+/// [`reachable`], for a path that may end at dispatch (`start`).
+#[must_use]
+pub fn reachable_path(
+    start: Stage,
+    include_merge: bool,
+    may_reject: bool,
+    stop_at_dispatch: bool,
+) -> Vec<Stage> {
     let mut stages = Vec::new();
     let mut push = |s: Stage| {
         if !stages.contains(&s) {
@@ -159,6 +187,16 @@ pub fn reachable(start: Stage, include_merge: bool, may_reject: bool) -> Vec<Sta
         }
     };
     match start {
+        Stage::ReadyWait if stop_at_dispatch => {
+            push(Stage::ReadyWait);
+            return stages;
+        }
+        Stage::ReadyWait => {
+            push(Stage::ReadyWait);
+            push(Stage::SweepCurator);
+            push(Stage::SweepBuilder);
+            push(Stage::ReviewWait);
+        }
         Stage::SweepCurator => {
             push(Stage::SweepCurator);
             push(Stage::SweepBuilder);
@@ -193,7 +231,8 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
         return Err(SpecError::NoDraws);
     }
     let rejectable = may_reject(&spec.p_by_attempt, spec.start_rework, spec.cap);
-    for stage in reachable(spec.start, spec.include_merge, rejectable) {
+    let stop = spec.stop_at_dispatch && spec.start == Stage::ReadyWait;
+    for stage in reachable_path(spec.start, spec.include_merge, rejectable, stop) {
         match &spec.grids[stage.index()] {
             None => return Err(SpecError::MissingGrid(stage)),
             Some(g) if g.len() != grid::GRID_POINTS => return Err(SpecError::BadGrid(stage)),
@@ -203,20 +242,42 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
 
     let mut rng = SplitMix64::new(spec.seed);
     let mut totals: Vec<(f64, usize)> = Vec::with_capacity(spec.draws);
-    let mut per_stage: Vec<[f64; 5]> = Vec::with_capacity(spec.draws);
+    let mut per_stage: Vec<[f64; STAGE_COUNT]> = Vec::with_capacity(spec.draws);
     let mut reworks: Vec<u32> = Vec::with_capacity(spec.draws);
-    let mut visits = [0_usize; 5];
-    let mut visited_paths = [0_usize; 5];
-    let mut entries: [Vec<(f64, usize)>; 5] = Default::default();
+    let mut visits = [0_usize; STAGE_COUNT];
+    let mut visited_paths = [0_usize; STAGE_COUNT];
+    let mut entries: [Vec<(f64, usize)>; STAGE_COUNT] = Default::default();
 
     for path in 0..spec.draws {
         let mut stage = spec.start;
         let mut rework = spec.start_rework;
         let mut first = true;
         let mut total = 0.0;
-        let mut times = [0.0_f64; 5];
-        let mut seen = [false; 5];
+        let mut times = [0.0_f64; STAGE_COUNT];
+        let mut seen = [false; STAGE_COUNT];
+        if stage == Stage::ReadyWait {
+            // The queue wait: one turnover draw per turnover still needed,
+            // then the fixed admission delay. Never age-conditioned.
+            let i = Stage::ReadyWait.index();
+            let grid = spec.grids[i]
+                .as_deref()
+                .unwrap_or_else(|| unreachable!("checked above"));
+            entries[i].push((0.0, path));
+            let mut wait = spec.ready_offset_sec.max(0) as f64;
+            for _ in 0..spec.ready_visits {
+                wait += grid::inv_cdf(grid, rng.next_f64());
+            }
+            total += wait;
+            times[i] += wait;
+            visits[i] += spec.ready_visits as usize;
+            seen[i] = true;
+            first = false;
+            stage = Stage::SweepCurator;
+        }
         loop {
+            if stop {
+                break;
+            }
             let grid = spec.grids[stage.index()]
                 .as_deref()
                 .unwrap_or_else(|| unreachable!("checked above"));
@@ -257,6 +318,7 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
                     }
                 }
                 Stage::MergeWait => break,
+                Stage::ReadyWait => Stage::SweepCurator,
             };
         }
         for (i, s) in seen.iter().enumerate() {
@@ -276,13 +338,15 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     // stops there, else `merge_wait`. Its mark is the path completion time —
     // each path's sample is that path's total, through the same rank math —
     // so the terminal mark's p50 is the estimate itself, to the second.
-    let terminal = if spec.include_merge {
+    let terminal = if stop {
+        Stage::ReadyWait
+    } else if spec.include_merge {
         Stage::MergeWait
     } else {
         Stage::ReviewWait
     };
-    let mut entry_marks: [Option<(i64, i64, i64)>; 5] = Default::default();
-    for stage in Stage::ALL {
+    let mut entry_marks: [Option<(i64, i64, i64)>; STAGE_COUNT] = Default::default();
+    for stage in Stage::EVERY {
         let i = stage.index();
         let samples: &[(f64, usize)] = if i == terminal.index() {
             &totals
@@ -296,9 +360,9 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     }
 
     let draws = spec.draws as f64;
-    let mut reached = [0.0; 5];
-    let mut mean_visits = [0.0; 5];
-    for i in 0..5 {
+    let mut reached = [0.0; STAGE_COUNT];
+    let mut mean_visits = [0.0; STAGE_COUNT];
+    for i in 0..STAGE_COUNT {
         reached[i] = round3(visited_paths[i] as f64 / draws);
         mean_visits[i] = round3(visits[i] as f64 / draws);
     }
@@ -330,14 +394,14 @@ fn nearest_rank3(samples: &[(f64, usize)]) -> (i64, i64, i64) {
 /// Mean per-stage time over the paths ranked in `[lo, hi)` (fractions of K).
 fn band_means(
     totals: &[(f64, usize)],
-    per_stage: &[[f64; 5]],
+    per_stage: &[[f64; STAGE_COUNT]],
     lo: f64,
     hi: f64,
-) -> ([f64; 5], f64) {
+) -> ([f64; STAGE_COUNT], f64) {
     let k = totals.len();
     let start = ((lo * k as f64) as usize).min(k);
     let end = ((hi * k as f64) as usize).clamp(start, k);
-    let mut sums = [0.0; 5];
+    let mut sums = [0.0; STAGE_COUNT];
     let mut total = 0.0;
     let count = (end - start).max(1) as f64;
     for &(t, path) in &totals[start..end] {
@@ -351,13 +415,13 @@ fn band_means(
 
 fn contributions(
     totals: &[(f64, usize)],
-    per_stage: &[[f64; 5]],
+    per_stage: &[[f64; STAGE_COUNT]],
     reworks: &[u32],
 ) -> Contributions {
     let mut p50_share = BTreeMap::new();
     let (mid, mid_total) = band_means(totals, per_stage, 0.4, 0.6);
     if mid_total > 0.0 {
-        for stage in Stage::ALL {
+        for stage in Stage::EVERY {
             let v = mid[stage.index()];
             if v > 0.0 {
                 p50_share.insert(stage.as_str().to_string(), round3(v / mid_total));
@@ -368,10 +432,12 @@ fn contributions(
     let mut iqr_share = BTreeMap::new();
     let (upper, _) = band_means(totals, per_stage, 0.5, 0.75);
     let (lower, _) = band_means(totals, per_stage, 0.25, 0.5);
-    let gaps: Vec<f64> = (0..5).map(|i| (upper[i] - lower[i]).max(0.0)).collect();
+    let gaps: Vec<f64> = (0..STAGE_COUNT)
+        .map(|i| (upper[i] - lower[i]).max(0.0))
+        .collect();
     let gap_sum: f64 = gaps.iter().sum();
     if gap_sum > 0.0 {
-        for stage in Stage::ALL {
+        for stage in Stage::EVERY {
             let g = gaps[stage.index()];
             if g > 0.0 {
                 iqr_share.insert(stage.as_str().to_string(), round3(g / gap_sum));
@@ -415,7 +481,7 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
     let path = explanation.path.as_ref()?;
     let current = explanation.current_stage.as_ref()?;
     let combination = explanation.combination.as_ref()?;
-    let mut grids: [Option<Vec<i64>>; 5] = Default::default();
+    let mut grids: [Option<Vec<i64>>; STAGE_COUNT] = Default::default();
     for entry in &explanation.stages {
         if entry.distribution.grid_sec.len() != grid::GRID_POINTS {
             return None;
@@ -431,11 +497,19 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
         Some(b) => (b.changes_requested.p_by_attempt.clone(), b.changes_requested.cap),
         None => (Vec::new(), 0),
     };
+    let (ready_visits, ready_offset_sec) = match (path.start, &path.dispatch) {
+        (Stage::ReadyWait, Some(d)) => (d.turnovers, d.admission_delay_sec),
+        (Stage::ReadyWait, None) => return None,
+        _ => (0, 0),
+    };
     Some(PathSpec {
         start: path.start,
         start_rework: current.rework_rounds,
         include_merge: path.include_merge,
         grids,
+        ready_visits,
+        ready_offset_sec,
+        stop_at_dispatch: path.terminal == Stage::ReadyWait,
         conditioning,
         p_by_attempt,
         cap,
