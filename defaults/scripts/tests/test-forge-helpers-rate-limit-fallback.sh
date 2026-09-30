@@ -437,7 +437,13 @@ else
 fi
 
 comment_call_count="$(grep -c 'forge_gh_comment_rl_safe "\$REPO_NWO"' "$MERGE_PR_SRC" || true)"
-assert_eq "4" "$comment_call_count" "merge-pr.sh routes all 4 comment call sites (2x issue, 2x PR) through forge_gh_comment_rl_safe"
+assert_eq "3" "$comment_call_count" "merge-pr.sh routes all 3 comment call sites (PR override, shared partial-increment helper, stacked-child PR) through forge_gh_comment_rl_safe"
+
+# The two partial-increment comments (partial-merged, premature-close) share
+# one helper that owns the single wrapper call above; both kinds must still
+# reach it, so the #4856 rate-limit-safe coverage of each is preserved.
+partial_helper_calls="$(grep -c '^ *_mp_post_partial_comment \(partial-merged\|premature-close\) ' "$MERGE_PR_SRC" || true)"
+assert_eq "2" "$partial_helper_calls" "both partial-increment comment kinds route through _mp_post_partial_comment"
 
 # The raw, un-wrapped mutating calls this issue is about must no longer
 # appear standalone (they are now routed through the wrapper functions
