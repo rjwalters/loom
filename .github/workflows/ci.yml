@@ -1009,6 +1009,28 @@ jobs:
         if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
 
+      # component: MCP Guard Wiring Contract
+      # #9108: `check-guard-scan-contracts.sh` (Structural Checks) answers
+      # "does the guard read the right copy of the command?". This answers the
+      # prior question — "is the guard on the tool call's path at all?" — which
+      # nothing asserted until #9108, and which is how every `mcp__loom__*`
+      # call came to run with no PreToolUse matcher covering it while
+      # `get_agent_metrics` built a shell command line from its raw arguments
+      # (fixed server-side in #9107). A matcher that matches nothing does not
+      # error; it just never fires, so the wiring has to be asserted.
+      #
+      # It lives HERE rather than next to its sibling in Structural Checks
+      # because that job is deliberately toolchain-free (no cargo, no daemon
+      # binary) and this check is a daemon subcommand — new executable logic
+      # goes into the daemon, not into `contract`-category shell
+      # (.loom/docs/shell-language-policy.md, epic #7810). Behind
+      # `daemon != 'false'` like its siblings: that predicate is false only for
+      # a PR entirely inside `dashboard/`, which cannot touch the settings
+      # file, the installer, or the hook this reads.
+      - name: Check the mcp__loom__.* PreToolUse matcher is wired and fails closed (#9108)
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+        run: ./target/debug/loom-daemon check-guard-wiring --repo-root .
+
       # component: Secret Scan
       # Refuses any commit that ADDS a credential-shaped value, whatever its
       # path (#9133): the same `loom-daemon secret-scan` the PreToolUse guard
@@ -1863,6 +1885,16 @@ jobs:
       # without one, so it needs the binary this job downloads.
       - name: merge-pr async-close-race cleanup gate (#4186, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-worktree-path.sh
+      # #9108: the mcp__loom__.* PreToolUse guard decision is
+      # `loom-daemon guard-mcp-tools`, brand-new logic (no shell twin to
+      # port), so it needs the binary this job downloads. Drives the REAL
+      # defaults/hooks/guard-mcp-tools.sh stub on stdin, exactly as Claude
+      # Code does, so this is the wiring evidence — not just the unit
+      # coverage in loom-daemon/src/mcp_tool_guard/tests.rs — that the guard
+      # is actually on the mcp__loom__* call path. FAILS rather than skips
+      # without a binary.
+      - name: mcp__loom__.* PreToolUse argument guard (#9107, #9108)
+        run: bash defaults/hooks/tests/test-guard-mcp-tools.sh
 
   native-port-daemon-lifecycle:
     name: Native Port Suites (daemon lifecycle, watchdog)

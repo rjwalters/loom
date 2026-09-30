@@ -56,6 +56,7 @@ use std::path::PathBuf;
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 
 pub mod ci;
+pub mod disposition;
 mod envelope;
 pub mod kinds;
 mod sweep_identity;
@@ -67,6 +68,7 @@ pub mod repo_identity;
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
+pub use disposition::{classify_disposition, DispositionSignals, IssueEndState, SweepDisposition};
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{TelemetryKindMeta, TelemetryKindOtlp, NEW_KIND_SCHEMA_VERSION, TELEMETRY_KINDS};
 pub use ops::MetricPointsRecord;
@@ -327,15 +329,187 @@ pub enum SweepResult {
     Blocked,
 }
 
-/// The wall-clock duration a sweep spent in one named lifecycle phase — the unit
-/// [`SweepOutcomeRecord::phase_durations`] is a list of.
+/// One attempt at one named lifecycle phase — the unit
+/// Why a sweep was dispatched — the low-cardinality `trigger` vocabulary
+/// (Issue #9444). Serialized snake_case like [`SweepResult`]; carried as the
+/// string's own value on the record so the closed set stays a documentation
+/// and derivation-side contract (derivation in
+/// `sweep_registry::outcome_journal::lineage`).
+pub mod trigger {
+    /// The first sweep for this repo#issue on this host's journal.
+    pub const FIRST: &str = "first";
+    /// Re-dispatch after the previous attempt died to the environment
+    /// (spawn/preflight death, pool exhaustion, cancellation).
+    pub const RETRY_AFTER_ENV_FAILURE: &str = "retry_after_env_failure";
+    /// Re-dispatch after the previous attempt failed substantively (builder
+    /// could not complete, judge rejected, doctor loop exhausted).
+    pub const RETRY_AFTER_SUBSTANTIVE_FAILURE: &str = "retry_after_substantive_failure";
+    /// Dispatched to run Doctor after a judge `changes-requested`.
+    pub const DOCTOR_AFTER_CHANGES_REQUESTED: &str = "doctor_after_changes_requested";
+    /// Dispatched because main moved under the work.
+    pub const REBASE_MAIN_MOVED: &str = "rebase_main_moved";
+    /// Dispatched to resolve a merge conflict.
+    pub const MERGE_CONFLICT: &str = "merge_conflict";
+    /// Re-judge against a stale base.
+    pub const STALE_BASE_REJUDGE: &str = "stale_base_rejudge";
+    /// Dispatched to fix a CI failure.
+    pub const CI_FAILURE_FIX: &str = "ci_failure_fix";
+    /// A human or external tool asked for this sweep.
+    pub const OPERATOR_REDISPATCH: &str = "operator_redispatch";
+    /// The dispatch reason was not observable. Counted, never silently merged.
+    pub const UNKNOWN: &str = "unknown";
+}
+
+/// One in-sweep rework event (Issue #9444) — a counted entry on
+/// [`SweepOutcomeRecord::rework_events`], written by the path that performed
+/// the rework (today: the merge path's stale-base handling via the
+/// `.loom/logs/sweep-rework-events.jsonl` marker protocol; see
+/// `telemetry-schema.md`'s rework table).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReworkEvent {
+    /// What kind of rework: `rebase` | `merge_conflict` | `ci_rerun` |
+    /// `rejudge`.
+    pub kind: String,
+    /// Why it happened, when the emitter knows (free-form-short).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// `substantive` (the work was hard) or `environmental` (the ground moved)
+    /// per the classification table in `telemetry-schema.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
+    /// How long the rework took, when the emitter measured it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_sec: Option<i64>,
+}
+
+/// [`SweepOutcomeRecord::phase_durations`] is a list of: how long it took and
+/// (Issue #9443) what it cost.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PhaseDuration {
     /// Lifecycle phase name (e.g. `"curator"`, `"builder"`, `"judge"`,
     /// `"doctor"`, `"merge"`).
     pub phase: String,
     /// Seconds spent in this phase.
     pub duration_sec: i64,
+    /// Which attempt at this phase this entry is: **1-based per phase name**
+    /// within the record (Issue #9443), the same numbering convention
+    /// [`JudgeVerdict::attempt`] uses. A `curator → builder → judge → doctor →
+    /// judge` lifecycle yields `judge` attempt 1 and `judge` attempt 2, so
+    /// "the *first* judge" — the clean-landing discriminator #9430 needs — is
+    /// addressable rather than collapsed into a total.
+    ///
+    /// Omitted (never a fabricated `1`) on a record written before #9443, so a
+    /// consumer can tell "attempt 1 of 1" from "this journal predates attempt
+    /// numbering".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// Input-side tokens this phase attempt consumed, on exactly the axis
+    /// [`SweepOutcomeRecord::tokens_in`] uses (Issue #9443) — attributed by
+    /// each transcript record's own timestamp against this phase's sampled
+    /// window, so the entries sum into the sweep total rather than being a
+    /// second, independently-scraped measurement.
+    ///
+    /// Omitted — **never `0`** — when this phase attempt's usage is unknown: no
+    /// attributable transcript, a runtime whose store carries no per-record
+    /// instant, or a phase window the sampler never observed. Whatever is
+    /// missing is reported in [`SweepOutcomeRecord::tokens_unattributed`], so
+    /// "this phase was free" and "this phase was not measured" never look
+    /// alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u64>,
+    /// Output-side tokens for the same attempt, on
+    /// [`SweepOutcomeRecord::tokens_out`]'s axis. Same omission contract as
+    /// `tokens_in`, and always present or absent together with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u64>,
+    /// The same attempt's usage grouped by `(model, speed, service_tier)`
+    /// instead of flattened — the per-phase counterpart of
+    /// [`SweepOutcomeRecord::tokens_by_model`], and what makes a phase's cost
+    /// priceable when the Doctor ladder ran it on a different model than the
+    /// Builder. Same omission contract as `tokens_in`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_by_model: Option<Vec<ModelUsageTotals>>,
+}
+
+impl PhaseDuration {
+    /// A duration-only entry, with every #9443 usage field absent.
+    #[must_use]
+    pub fn new(phase: impl Into<String>, duration_sec: i64) -> Self {
+        Self {
+            phase: phase.into(),
+            duration_sec,
+            ..Self::default()
+        }
+    }
+
+    /// This entry's `(tokens_in, tokens_out)` when both are known.
+    #[must_use]
+    pub fn token_split(&self) -> Option<(u64, u64)> {
+        Some((self.tokens_in?, self.tokens_out?))
+    }
+}
+
+/// An input/output token pair on [`SweepOutcomeRecord::tokens_in`]/`tokens_out`'s
+/// axes (Issue #9443) — the shape
+/// [`SweepOutcomeRecord::tokens_unattributed`] reports the per-phase
+/// attribution's remainder in.
+///
+/// Both counters are required *within* the struct: the whole value is optional
+/// on the record, and it is only ever built when the sweep totals are known, so
+/// there is no state in which one axis is measured and the other is not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenTotals {
+    /// Input-side tokens, as [`SweepOutcomeRecord::tokens_in`] counts them.
+    pub tokens_in: u64,
+    /// Output-side tokens, as [`SweepOutcomeRecord::tokens_out`] counts them.
+    pub tokens_out: u64,
+}
+
+/// Why [`SweepOutcomeRecord`]'s token counters are what they are (Issue
+/// #9440) — the discriminator that separates "this sweep burned nothing"
+/// from "this sweep burned something we could not read".
+///
+/// Before #9440 both cases were spelled the same way: the counters were simply
+/// absent. Measured against the fleet's D1 store over 2026-08-15..09-29, only
+/// 10.3% of `sweep.outcome` records carried `tokens_in`/`tokens_out` at all,
+/// so any per-issue "total tokens to land" sum silently collapsed onto the one
+/// landing sweep and reported a lifecycle cost that was, by construction,
+/// indistinguishable from the clean cost. This field is what makes the two
+/// views separable without the consumer having to guess.
+///
+/// The absent-vs-zero discipline `defaults/docs/telemetry-schema.md` states
+/// still holds, and this enum is how: a **measured zero** is published for
+/// [`NotSpawned`](Self::NotSpawned) only, because that is the one case where
+/// zero is the observation rather than the absence of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokensStatus {
+    /// An agent process ran and its usage was read. The counters are real —
+    /// including a **partial** read for a sweep cancelled or killed mid-phase,
+    /// which is the honest answer for work that genuinely happened and then
+    /// stopped, not a reason to omit the measurement.
+    Measured,
+    /// No agent process ever ran: a pre-flight abort or a spawn death, i.e.
+    /// every `preflight-*` class plus `no-usable-account`, none of which
+    /// reaches the CLI at all. This is the **only** status that publishes
+    /// `tokens_in: 0` / `tokens_out: 0`, because for it zero is measured.
+    NotSpawned,
+    /// An agent process ran (or could not be proven not to) but its usage
+    /// could not be attributed — a pruned/rotated transcript, no usage store
+    /// for the runtime, or no bounded wall-clock window to attribute within.
+    /// The counters stay **absent**, and
+    /// [`SweepOutcomeRecord::tokens_status_reason`] names which of those it
+    /// was. Never coerce this to zero: that is exactly the undercount #9440
+    /// exists to remove.
+    Unattributable,
+    /// Measured, but the plausibility guard fired (Issue #9454): the counters
+    /// imply more input tokens per wall-clock second than the sweep could
+    /// physically have consumed (the #9440-study evidence: 250M tokens in a
+    /// 22-second curator-only failure). The counters are still published —
+    /// flagged, never as a clean measurement — so a misattribution regression
+    /// is visible per host per day (`sweep-facts-queries.sql` SF3) instead of
+    /// silently poisoning per-issue cost sums.
+    Suspect,
 }
 
 /// `sweep.started` — a sweep began work on an issue.
@@ -365,6 +539,23 @@ pub struct SweepStartedRecord {
     /// not name its runtime; never fabricated as `"claude"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// The Curator's story-point size estimate for this sweep's issue (Issue
+    /// #9432, epic #9429) — the numeric value of its single `points:*` label,
+    /// carried on the `sweep.global.dispatch` event from the label read the
+    /// dispatch path's own park-label guard already performs (**no** extra
+    /// forge round trip).
+    ///
+    /// Present here as well as on [`SweepOutcomeRecord::story_points`] so a
+    /// consumer can see the size of the work **in flight**, not only after it
+    /// terminates — queue-weight and capacity questions ("how many points are
+    /// being worked right now?") cannot wait for the outcome record.
+    ///
+    /// **Absent, never zero** — same contract as the outcome record's field: no
+    /// `points:*` label, an out-of-vocabulary one, more than one (logged
+    /// loudly, never guessed), a skipped/failed label read, or a `PrSet`
+    /// dispatch (which claims no issue) all omit the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u32>,
 }
 
 /// `sweep.phase` — a sweep advanced to a new lifecycle phase.
@@ -456,13 +647,52 @@ pub struct SweepOutcomeRecord {
     /// every time an operator-tunable field is added.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub config: std::collections::BTreeMap<String, String>,
-    /// Per-phase wall-clock durations, in lifecycle order.
+    /// Per-phase-attempt breakdown, in lifecycle order: wall-clock duration
+    /// plus (Issue #9443) that attempt's own token usage. A phase that ran twice
+    /// — the Judge↔Doctor cycle — is two entries distinguished by
+    /// [`PhaseDuration::attempt`], never one collapsed total, which is what
+    /// makes clean-landing cost (curator + builder + *first* judge) separable
+    /// from rework cost.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phase_durations: Vec<PhaseDuration>,
     /// Total wall-clock seconds from dispatch to terminal outcome.
     pub total_duration_sec: i64,
     /// Terminal result.
     pub result: SweepResult,
+    /// What the sweep actually DID, independent of how its process ended
+    /// (Issue #9441) — the axis [`result`](Self::result) cannot express.
+    ///
+    /// `result: success` folds a merged PR together with a no-op re-dispatch
+    /// against an already-closed issue (only 337 of 8,808 measured successes
+    /// carried a `pr_number`; 4,825 were sub-300 s runs with no PR, no tokens
+    /// and no phases), and `result: failure` folds a Judge rejection together
+    /// with a sub-60 s spawn death. `disposition` separates them, so "did this
+    /// sweep land work?" and "was the environment or the work at fault?" are
+    /// each a single field read instead of a duration/PR-presence heuristic.
+    ///
+    /// **Additive, never a replacement**: `result` is emitted unchanged beside
+    /// it, so every pre-#9441 consumer keeps working.
+    ///
+    /// Two invariants hold on every record this daemon writes, both proven in
+    /// [`disposition`]'s own contract tests:
+    ///
+    /// 1. `disposition == landed` **⇔** [`pr_number`](Self::pr_number) is
+    ///    present. This outranks `result`: a sweep cancelled after opening a
+    ///    PR still produced that PR, and `result` still reports the cancel.
+    /// 2. [`failure_class`](Self::failure_class) is **mandatory** whenever
+    ///    `disposition` is `env_failure`, `substantive_failure` or `unknown` —
+    ///    synthesized as a bounded `unclassified:*` label when no classifier
+    ///    produced one, so those buckets can never be silently unexplained.
+    ///
+    /// `#[serde(default)]` (to [`SweepDisposition::Unknown`]) so a journal line
+    /// written before this field existed still parses — every reader here drops
+    /// rather than errors on an unparseable line, so without a default all
+    /// pre-#9441 history would vanish the instant this shipped. Unlike every
+    /// other recent addition it is **never skipped on serialize**: a required
+    /// field that silently disappears for one variant is exactly the ambiguity
+    /// this record already has too much of.
+    #[serde(default)]
+    pub disposition: SweepDisposition,
     /// PR number produced by the sweep, when it opened one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u32>,
@@ -510,6 +740,30 @@ pub struct SweepOutcomeRecord {
     /// rather than re-deriving it from a reconstructed window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_by_model: Option<Vec<ModelUsageTotals>>,
+    /// The part of `tokens_in`/`tokens_out` that **no** `phase_durations` entry
+    /// accounts for (Issue #9443), so the per-phase breakdown is a partition of
+    /// the sweep total rather than an unreconciled second measurement:
+    ///
+    /// ```text
+    /// Σ phase_durations[*].tokens_in  + tokens_unattributed.tokens_in  == tokens_in
+    /// Σ phase_durations[*].tokens_out + tokens_unattributed.tokens_out == tokens_out
+    /// ```
+    ///
+    /// The remainder is real, not slop. It collects the trailing in-flight
+    /// segment (from the last observed phase completion to the terminal
+    /// transition, which the sampler cannot name a phase for — the same segment
+    /// `phase_durations` already declines to attribute), every transcript record
+    /// carrying no usable `timestamp`, and — for a runtime whose usage store has
+    /// no per-record instant, or a sweep whose phase transitions were never
+    /// sampled — the *whole* total. That last case is the point of the field:
+    /// unmeasured per-phase usage shows up here as an explicit remainder instead
+    /// of as phases reporting `0`.
+    ///
+    /// Omitted when `tokens_in`/`tokens_out` are themselves unknown: there is no
+    /// total to take a remainder of, and `0` would claim the phases account for
+    /// everything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_unattributed: Option<TokenTotals>,
     /// Terminal failure classification (Issue #8056), copied verbatim at emit
     /// time from the SAME terminal transition's sibling
     /// [`crate::sweep_outcomes::OutcomeRecord`] — its `death_class` (the
@@ -526,8 +780,12 @@ pub struct SweepOutcomeRecord {
     /// the single most-specific label, not a replacement for them.
     ///
     /// Omitted (never `""`, never `"unknown"`) when the terminal transition
-    /// carried no classification at all — including on every success, where
-    /// there is nothing to classify.
+    /// carried no classification at all — with one exception since Issue
+    /// #9441: it is **mandatory** whenever
+    /// [`disposition`](Self::disposition) is `env_failure`,
+    /// `substantive_failure` or `unknown`, and is then synthesized as a
+    /// bounded `unclassified:*` label (never `""`) when no classifier produced
+    /// one. A real classifier label is never overwritten by a synthesized one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
     /// The distinct model ids observed in [`tokens_by_model`](Self::tokens_by_model),
@@ -628,6 +886,127 @@ pub struct SweepOutcomeRecord {
     /// masquerading as data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complexity: Option<String>,
+    /// The Curator's story-point size estimate for this sweep's issue (Issue
+    /// #9432, epic #9429) — the numeric value of its single `points:*` label,
+    /// one of `1`/`2`/`3`/`5`/`8`/`13`.
+    ///
+    /// This is the *a priori* size axis that makes every actual this record
+    /// already carries (`tokens_in`/`tokens_out`, `lines_added`/`lines_deleted`,
+    /// `total_duration_sec`, `doctor_cycles`) joinable to an estimate without
+    /// leaving the telemetry store: "story points landed per day" (#9433) and
+    /// the estimate-vs-actual calibration loop (#9434) both read it from here.
+    ///
+    /// Resolved by [`crate::story_points::resolve_story_points`] from the label
+    /// list the terminal transition's `fetch_issue_signals` read already
+    /// carries — **no** extra forge round trip, the same single REST call that
+    /// sources [`complexity`](Self::complexity) and the disposition end state.
+    ///
+    /// **Absent, never zero.** The key is omitted when the issue carries no
+    /// `points:*` label (a pre-epic or operator-filed issue), when its single
+    /// points label is out of vocabulary, when it carries **more than one**
+    /// (logged loudly and never guessed at — see `story_points`' module doc),
+    /// or when the read failed/was skipped. A `0` would claim someone sized
+    /// this issue at nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u32>,
+    /// Why this record's token counters read the way they do (Issue #9440) —
+    /// see [`TokensStatus`]. Present on every record this daemon writes; a
+    /// record written before #9440 omits it, which a consumer must read as
+    /// "unknown", **not** as any of the three statuses.
+    ///
+    /// The invariant that makes a lifecycle sum computable:
+    /// `tokens_status == Measured` ⟺ at least one of
+    /// [`tokens_in`](Self::tokens_in)/[`tokens_by_model`](Self::tokens_by_model)
+    /// is present; `NotSpawned` ⟹ `tokens_in == Some(0)` and
+    /// `tokens_out == Some(0)`; `Unattributable` ⟹ both absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_status: Option<TokensStatus>,
+    /// The machine-readable reason behind a non-`measured`
+    /// [`tokens_status`](Self::tokens_status) (Issue #9440). For
+    /// [`TokensStatus::NotSpawned`] this is the death class that proved it
+    /// (`preflight-no-cli-start`, `preflight-token-selection-failed`,
+    /// `no-usable-account`, …); for [`TokensStatus::Unattributable`] it is one
+    /// of the fixed reasons `crate::sweep_usage` defines (`no-sweep-window`,
+    /// `no-usage-store`, `no-attributable-transcript`).
+    ///
+    /// Always absent for [`TokensStatus::Measured`] — a measurement needs no
+    /// excuse — and never free-form prose: it is a value a query can `GROUP
+    /// BY`, which is the whole point of separating the absence cases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_status_reason: Option<String>,
+    /// 1-based count of terminal sweeps for this repo#issue in this host's
+    /// durable outcome journal (Issue #9444) — the attempt this sweep was.
+    /// Absent when the journal could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_index: Option<u32>,
+    /// The `sweep_id` of the immediately preceding attempt for this repo#issue
+    /// (Issue #9444), when the journal showed one. Absent for a first attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_sweep_id: Option<String>,
+    /// Why this sweep was dispatched (Issue #9444) — one of the
+    /// [`trigger`] constants. Derived at the terminal transition from the
+    /// journal's previous attempt and this sweep's own recorded context;
+    /// `unknown` is counted, never silently merged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    /// In-sweep rework events (Issue #9444) observed by the paths that
+    /// performed them, in event order. Absent (never `[]`) when none were
+    /// observed for this sweep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rework_events: Option<Vec<ReworkEvent>>,
+    /// Every PR number this sweep's lifecycle was observed to carry, in
+    /// first-seen order (Issue #9465) — the multi-PR slice shape the single
+    /// [`pr_number`](Self::pr_number) (the latest) cannot represent. Absent
+    /// (never `[]`) when no PR was ever sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_numbers: Option<Vec<u32>>,
+    /// Hand-written lines added by the sweep's own commits (Issue #9466):
+    /// [`lines_added`](Self::lines_added) minus the lines in
+    /// generated-classified paths (`generatedPaths` config globs over the
+    /// shipped default — see `telemetry-schema.md`). Absent whenever
+    /// `lines_added` is absent, or the diff's paths could not be classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_lines_added: Option<i64>,
+    /// Hand-written lines deleted, alongside [`Self::hw_lines_added`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_lines_deleted: Option<i64>,
+    /// Distinct non-generated files in the landing diff (Issue #9466).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_files: Option<i64>,
+    /// Lines in generated-classified paths of the landing diff (Issue #9466),
+    /// reported — not counted as work. Absent alongside [`Self::hw_lines_added`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_lines: Option<i64>,
+    /// Lines in test files of the landing diff (Issue #9466) — paths matching
+    /// the documented test-file convention. Absent alongside
+    /// [`Self::hw_lines_added`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_lines: Option<i64>,
+}
+
+impl SweepOutcomeRecord {
+    /// Whether this record satisfies both #9441 `disposition` invariants (see
+    /// [`SweepOutcomeRecord::disposition`]): `landed` ⇔ a PR is present, and a
+    /// fault disposition carries a non-empty `failure_class`.
+    ///
+    /// The emit path asserts this in debug builds and the outcome-journal
+    /// tests assert it on real records; it is exposed so a consumer reading
+    /// the journal back can validate a line it did not write.
+    ///
+    /// A pre-#9441 line decodes with `disposition: unknown` and no
+    /// `failure_class`, and therefore legitimately fails this check — it is a
+    /// contract on records this daemon *writes*, not on historical ones.
+    #[must_use]
+    pub fn disposition_invariants_hold(&self) -> bool {
+        let landed_iff_pr =
+            (self.disposition == SweepDisposition::Landed) == self.pr_number.is_some();
+        let class_present_where_required = !self.disposition.requires_failure_class()
+            || self
+                .failure_class
+                .as_deref()
+                .is_some_and(|class| !class.is_empty());
+        landed_iff_pr && class_present_where_required
+    }
 }
 
 /// One Judge verdict on a PR, as reconstructed from the forge label timeline
@@ -1248,6 +1627,85 @@ pub struct HostHealthRecord {
     /// empty; a pre-#9014 record decodes as empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captainless_singleton_jobs: Vec<String>,
+    /// This host's memory/pressure readings at the sampling moment — the
+    /// "deferred vs killed vs timed out" slice (RAM, compressed memory,
+    /// swap and its rates, PSI class, kernel OOM counter) — see
+    /// [`MemoryPressureSummary`]. `None` when the platform measured nothing
+    /// at all (older daemons predating this field decode as `None` too).
+    ///
+    /// `#[serde(default)]` so a pre-memory-field record still decodes
+    /// rather than failing the whole envelope — the same
+    /// backward-compatibility contract `protection` established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryPressureSummary>,
+}
+
+/// Memory/pressure readings at one host.health sampling moment: physical
+/// RAM total/available, the compressed page store, swap capacity/usage,
+/// the cumulative swap in/out counters and per-sample rates, the PSI
+/// pressure class, and the kernel OOM-kill counter. This is the host state
+/// an operator needs to read off a ~30-minute role attempt that ended in a
+/// load deferral *without* any runtime span: with these beside the span's
+/// bound, "deferred for memory" (PSI some/full, swapping, attempt never
+/// reached a runtime), "killed" (`oom_kill_total` grew, exit unobserved),
+/// and "timed out" (no pressure, nothing measured) are distinguishable.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryPressureSummary {
+    /// Total physical memory installed, in bytes
+    /// (`/proc/meminfo` on Linux, `hw.memsize` on macOS) — the denominator
+    /// for a readable availability percentage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_total_bytes: Option<u64>,
+    /// Memory available to meet a new allocation without reclaim, in bytes
+    /// (`MemAvailable` on Linux; free + inactive on macOS). The single most
+    /// direct "is this host about to run out of memory" gauge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_available_bytes: Option<u64>,
+    /// Memory the kernel has compressed rather than paged to disk (macOS
+    /// `vm_stat` "occupied by compressor") — a leading pressure indicator
+    /// before swapping starts. Unmeasurable through the Linux sources this
+    /// daemon reads, so absent there, never a fake `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_compressed_bytes: Option<u64>,
+    /// Total swap capacity in bytes, when the platform exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_total_bytes: Option<u64>,
+    /// Swap currently in use, in bytes; absent where the platform exposes
+    /// no counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_used_bytes: Option<u64>,
+    /// Cumulative swap-in volume for the host's lifetime, normalized to
+    /// **bytes** (both macOS and Linux count pages) so one gauge means one
+    /// thing fleet-wide. Counters reset only across a reboot; a rollback
+    /// reads as unknown, never negative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_in_bytes_total: Option<u64>,
+    /// Cumulative swap-out volume, normalized to bytes; same absence and
+    /// rollback contract as `swap_in_bytes_total`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_out_bytes_total: Option<u64>,
+    /// Swap-in rate in bytes/second, computed by the daemon between
+    /// successive samples (`None` on the first sample after daemon start,
+    /// on a counter reset, or when the counters are unmeasurable — never a
+    /// fabricated `0.0`). Persistent nonzero values are the host's loudest
+    /// "out of physical memory" signal in metric form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_in_bytes_per_sec: Option<f64>,
+    /// Swap-out rate in bytes/second; same measurement and absence
+    /// contract as `swap_in_bytes_per_sec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_out_bytes_per_sec: Option<f64>,
+    /// PSI memory-pressure class over the last 10 s (`"none"` / `"some"` /
+    /// `"full"`, from Linux `/proc/pressure/memory`); macOS has no PSI file,
+    /// and the compression/swap fields carry the pressure signal instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_pressure: Option<crate::host_pressure::MemoryPressure>,
+    /// Cumulative kernel OOM kills for the host's lifetime (Linux
+    /// `/proc/vmstat` `oom_kill`), when the kernel exposes the counter —
+    /// the span-level signal that an unobserved exit was *killed* rather
+    /// than *deferred*. Absent on kernels without the counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_kill_total: Option<u64>,
 }
 
 /// One repository this host's daemon is currently managing (Issue #4976) —

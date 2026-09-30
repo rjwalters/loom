@@ -113,7 +113,8 @@ fn a_declaration_covering_the_growth_admits_floor_growth() {
         &before,
         "base",
         &GrowthContext {
-            declared: &decl(59)
+            declared: &decl(59),
+            ..GrowthContext::none()
         }
     )
     .is_ok());
@@ -129,7 +130,8 @@ fn a_declaration_larger_than_the_growth_also_admits_it() {
         &before,
         "base",
         &GrowthContext {
-            declared: &decl(59)
+            declared: &decl(59),
+            ..GrowthContext::none()
         }
     )
     .is_ok());
@@ -147,6 +149,7 @@ fn a_declaration_short_of_the_growth_still_fails_and_says_by_how_much() {
         "base",
         &GrowthContext {
             declared: &decl(10),
+            ..GrowthContext::none()
         },
     )
     .expect_err("must fail");
@@ -176,6 +179,7 @@ fn a_declaration_never_admits_portable_growth() {
         "base",
         &GrowthContext {
             declared: &decl(9999),
+            ..GrowthContext::none()
         },
     )
     .expect_err("must fail");
@@ -206,7 +210,16 @@ fn the_failure_message_describes_the_format_the_code_accepts() {
     assert!(bad.is_empty(), "the message's own template must parse: {bad:?}");
     assert_eq!(ok.len(), 1, "from {concrete:?}");
     assert_eq!(ok[0].lines, 500, "must carry the measured growth");
-    assert!(check_against_rev(&now, &before, "base", &GrowthContext { declared: &ok }).is_ok());
+    assert!(check_against_rev(
+        &now,
+        &before,
+        "base",
+        &GrowthContext {
+            declared: &ok,
+            ..GrowthContext::none()
+        }
+    )
+    .is_ok());
 }
 
 #[test]
@@ -218,7 +231,16 @@ fn declarations_accumulate_across_commits_in_the_range() {
     assert_eq!(ok.len(), 2);
     let before = budget_with(&[("vendored", 500, 1)]);
     let now = budget_with(&[("vendored", 559, 1)]);
-    assert!(check_against_rev(&now, &before, "base", &GrowthContext { declared: &ok }).is_ok());
+    assert!(check_against_rev(
+        &now,
+        &before,
+        "base",
+        &GrowthContext {
+            declared: &ok,
+            ..GrowthContext::none()
+        }
+    )
+    .is_ok());
 }
 
 #[test]
@@ -418,8 +440,16 @@ fn an_in_place_recategorisation_cannot_launder_portable_growth() {
         "the line count is unchanged — only the category moved"
     );
     let d = decl(9999);
-    let err = check_against_rev(&now, &before, "base", &GrowthContext { declared: &d })
-        .expect_err("a relisted portable file must count as a total loss");
+    let err = check_against_rev(
+        &now,
+        &before,
+        "base",
+        &GrowthContext {
+            declared: &d,
+            ..GrowthContext::none()
+        },
+    )
+    .expect_err("a relisted portable file must count as a total loss");
     assert!(err.contains("c.sh  30 -> gone"), "{err}");
 }
 
@@ -454,15 +484,31 @@ fn a_declaration_cannot_buy_growth_while_portable_shell_is_retired() {
     let before = budget_files(&[("c.sh", "contract", 30), ("a.sh", "contract", 0)]);
     let now = budget_files(&[("d.sh", "bootstrap", 30), ("a.sh", "contract", 20)]);
     let d = decl(9999);
-    let err = check_against_rev(&now, &before, "base", &GrowthContext { declared: &d })
-        .expect_err("a renamed-away portable file must not be buyable");
+    let err = check_against_rev(
+        &now,
+        &before,
+        "base",
+        &GrowthContext {
+            declared: &d,
+            ..GrowthContext::none()
+        },
+    )
+    .expect_err("a renamed-away portable file must not be buyable");
     assert!(err.contains("c.sh  30 -> gone"), "{err}");
 
     // (b) the same, with the lines moved in place and NO allowlist change
     let before = budget_files(&[("c.sh", "contract", 30), ("b.sh", "bootstrap", 0)]);
     let now = budget_files(&[("c.sh", "contract", 10), ("b.sh", "bootstrap", 40)]);
-    let err = check_against_rev(&now, &before, "base", &GrowthContext { declared: &d })
-        .expect_err("a portable file that shrank must not be buyable");
+    let err = check_against_rev(
+        &now,
+        &before,
+        "base",
+        &GrowthContext {
+            declared: &d,
+            ..GrowthContext::none()
+        },
+    )
+    .expect_err("a portable file that shrank must not be buyable");
     assert!(err.contains("c.sh  30 -> 10"), "{err}");
     assert!(err.contains("Split the change"), "{err}");
 }
@@ -475,7 +521,16 @@ fn an_honest_floor_addition_is_still_buyable() {
     let before = budget_files(&[("c.sh", "contract", 30), ("v.sh", "vendored", 500)]);
     let now = budget_files(&[("c.sh", "contract", 30), ("v.sh", "vendored", 559)]);
     let d = decl(59);
-    assert!(check_against_rev(&now, &before, "base", &GrowthContext { declared: &d }).is_ok());
+    assert!(check_against_rev(
+        &now,
+        &before,
+        "base",
+        &GrowthContext {
+            declared: &d,
+            ..GrowthContext::none()
+        }
+    )
+    .is_ok());
 }
 
 #[test]
@@ -506,7 +561,16 @@ fn two_enormous_declarations_do_not_overflow() {
     ];
     // Debug would panic on a plain sum; release would wrap to a small
     // number and then REFUSE growth it should allow.
-    assert!(check_against_rev(&now, &before, "base", &GrowthContext { declared: &d },).is_ok());
+    assert!(check_against_rev(
+        &now,
+        &before,
+        "base",
+        &GrowthContext {
+            declared: &d,
+            ..GrowthContext::none()
+        },
+    )
+    .is_ok());
 }
 
 #[test]
@@ -820,8 +884,16 @@ fn a_settled_file_may_not_grow_and_there_is_no_override() {
 
     // And a declaration — which DOES buy floor growth — must not buy this.
     let d = decl(9999);
-    let err = check_against_rev(&now, &before, "base", &GrowthContext { declared: &d })
-        .expect_err("no override exists for settled growth");
+    let err = check_against_rev(
+        &now,
+        &before,
+        "base",
+        &GrowthContext {
+            declared: &d,
+            ..GrowthContext::none()
+        },
+    )
+    .expect_err("no override exists for settled growth");
     assert!(err.contains("GROWS shell in the `settled` category"), "{err}");
     assert!(
         err.contains(&format!("no `{GROWTH_TRAILER}` override")),
@@ -892,8 +964,16 @@ fn settling_a_script_does_not_read_as_retiring_it_when_the_floor_grows() {
         ("gate.sh", "bootstrap", 460),
     ]);
     let d = decl(60);
-    check_against_rev(&now, &before, "base", &GrowthContext { declared: &d })
-        .expect("a declared floor addition alongside a pure reclassification must land");
+    check_against_rev(
+        &now,
+        &before,
+        "base",
+        &GrowthContext {
+            declared: &d,
+            ..GrowthContext::none()
+        },
+    )
+    .expect("a declared floor addition alongside a pure reclassification must land");
 }
 
 #[test]
@@ -931,8 +1011,16 @@ fn a_settled_reclassification_cannot_smuggle_portable_growth_elsewhere() {
     assert_eq!(now.comparable(), before.comparable() + 100);
 
     let d = decl(100);
-    let err = check_against_rev(&now, &before, "base", &GrowthContext { declared: &d })
-        .expect_err("comparable() rose by 100 and there is no override for that");
+    let err = check_against_rev(
+        &now,
+        &before,
+        "base",
+        &GrowthContext {
+            declared: &d,
+            ..GrowthContext::none()
+        },
+    )
+    .expect_err("comparable() rose by 100 and there is no override for that");
     assert!(err.contains("portable + settled"), "{err}");
     assert!(err.contains("150 -> 250"), "must name the comparable delta: {err}");
 }

@@ -155,12 +155,12 @@ STUB_DIR="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 
 # --- Stub gh on PATH ---------------------------------------------------
-#   gh api [-R repo] repos/{owner}/{repo}/issues/<N>/comments --paginate
+#   gh api repos/{owner}/{repo}/issues/<N>/comments --paginate
 #       -> cat $STUB_DIR/comments.json (or "[]"; fails if comments-fail exists)
 #          -- OR a 403 "not accessible by integration" if comments-403-always
 #          exists, or on the FIRST attempt only if comments-403-once exists
 #          (each attempt is counted in $D/comments-attempt-count)
-#   gh api [-R repo] --method PATCH repos/{owner}/{repo}/issues/comments/<id> -F body=@<path>
+#   gh api --method PATCH repos/{owner}/{repo}/issues/comments/<id> -F body=@<path>
 #       -> reads the file the -F value's "@" prefix references into
 #          $STUB_DIR/patch-<id>-N.body, appends "<id>" to
 #          $STUB_DIR/patch-calls.log, prints "{}" (fails if patch-fail exists)
@@ -197,7 +197,9 @@ if [[ "$1" == "api" ]]; then
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --method) method="$2"; shift 2 ;;
-      -R) shift 2 ;;
+      -R|--repo)
+        # Real `gh api` has no -R/--repo flag (#9552): fail exactly like it.
+        echo "unknown shorthand flag: 'R' in -R" >&2; exit 1 ;;
       --paginate) shift ;;
       -f|--raw-field) field_flag="-f"; field_kv="$2"; shift 2 ;;
       -F|--field) field_flag="-F"; field_kv="$2"; shift 2 ;;
@@ -207,6 +209,7 @@ if [[ "$1" == "api" ]]; then
         ;;
     esac
   done
+  echo "$path" >> "$D/api-paths.log"
   if [[ "$method" == "GET" && "$path" == repos/*/issues/*/comments ]]; then
     if [[ -f "$D/comments-fail" ]]; then
       echo "stub gh: comments fetch failed" >&2
@@ -1134,6 +1137,20 @@ assert_eq "1" "$HELP_RC" "--help exits 1 (usage-exit convention, matches sweep-r
 "$SCRIPT" bogus-command > /dev/null 2>&1
 BOGUS_RC=$?
 assert_true "$([[ "$BOGUS_RC" -ne 0 ]] && echo true || echo false)" "an unknown command exits non-zero"
+
+# --- (v) LOOM_REPO set -> the repo is addressed in the endpoint PATH, never
+# via `-R` (#9552): `gh api` has no -R flag, so the old splice made every
+# renewal cycle exit 1.
+reset_state
+: > "$STUB_DIR/api-paths.log"
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[{"id": 100, "body": "<!-- loom:lease host=studio-host sweep=sweep-renew-set -->\nLease to renew."}]
+JSON
+LOOM_REPO=acme/widget run_script renew-once 9552
+assert_eq "0" "$RC" "(v) LOOM_REPO set -> exit 0 (renew succeeds)"
+assert_eq "100" "$(cat "$STUB_DIR/patch-calls.log" 2>/dev/null)" "(v) LOOM_REPO set: the lease comment was actually PATCHed"
+assert_eq "repos/acme/widget/issues/9552/comments
+repos/acme/widget/issues/comments/100" "$(cat "$STUB_DIR/api-paths.log")" "(v) LOOM_REPO set: both the read and the PATCH name the repo in the path"
 
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

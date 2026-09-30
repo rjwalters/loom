@@ -299,10 +299,11 @@ pub(super) fn gather(
     }
     .map_err(|e| e.to_string())?;
 
-    let numbers: Vec<i64> = extract::extract(&input, extract::DEFAULT_BOT_LOGIN)
-        .split_whitespace()
-        .filter_map(|t| t.parse().ok())
-        .collect();
+    let numbers: Vec<i64> =
+        extract::extract_with(&input, &loom_daemon::forge_identity::FleetLogins::for_root(root))
+            .split_whitespace()
+            .filter_map(|t| t.parse().ok())
+            .collect();
     let prose = if numbers.is_empty() {
         Vec::new()
     } else {

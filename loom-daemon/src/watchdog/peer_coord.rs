@@ -58,10 +58,24 @@ pub fn parse(json: &str) -> Option<Health> {
     let show = |o: Option<u64>| o.map_or_else(|| "0".to_string(), |n| n.to_string());
     let show_q = |o: Option<u64>| o.map_or_else(|| "?".to_string(), |n| n.to_string());
 
+    // Issue #9294: the daemon's own verdict sentence, when it supplies one.
+    // Appended rather than interpolated so every pre-#9294 assertion on this
+    // summary's prefix still holds, and absent on a pre-#9294 daemon.
+    //
+    // It matters because "receive path DEGRADED" above is a guess about WHICH
+    // half broke, and the measured 2026-09-29 outage was the other half: the
+    // homeserver was refusing every *send* into the claims room, so no host
+    // could publish and the receive path was fine. The watchdog files issues
+    // from this string; without the reason it files a misdiagnosis.
+    let reason_note = coordination
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(String::new, |r| format!(" — {r}"));
+
     let summary = if degraded {
         format!(
             "peer-claim receive path DEGRADED ({} received / {} advertised), degraded for {}s — \
-             {}/{} sustained receive(s) toward recovery",
+             {}/{} sustained receive(s) toward recovery{reason_note}",
             show(received),
             show(advertised),
             show_q(num("degraded_for_secs")),
@@ -655,6 +669,25 @@ mod tests {
         assert!(h.summary.contains("1 received / 5 advertised"), "{}", h.summary);
         assert!(h.summary.contains("degraded for 420s"), "{}", h.summary);
         assert!(h.summary.contains("2/5 sustained receive(s)"), "{}", h.summary);
+    }
+
+    /// Issue #9294: the daemon's own verdict reason rides along, so a
+    /// publish-side fault is not filed as a receive-path one. A pre-#9294
+    /// daemon supplies no `reason` and the summary is unchanged (the test
+    /// above covers that shape).
+    #[test]
+    fn a_degraded_report_carries_the_daemons_own_reason_when_it_supplies_one() {
+        let j = r#"{"advertised":3765,"received":0,"coordination":{"degraded":true,
+                    "degraded_for_secs":518400,"consecutive_receives_toward_recovery":0,
+                    "recovery_threshold":3,
+                    "reason":"every peer claim ad is being REJECTED by safehoused"}}"#;
+        let h = parse(j).expect("parse");
+        assert_eq!(h.verdict, Verdict::Degraded);
+        assert!(
+            h.summary.contains("REJECTED by safehoused"),
+            "a publish-side fault must not be filed as a receive-path one: {}",
+            h.summary
+        );
     }
 
     #[test]

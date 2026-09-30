@@ -50,6 +50,41 @@ fn errors_when_no_token_files() {
     std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
 }
 
+/// Issue #9135: a populated pool inside a git worktree is refused, and the
+/// resulting empty-pool error has to *say so* — otherwise retiring the
+/// in-worktree pool looks like the tokens simply vanished.
+#[test]
+#[serial]
+fn in_worktree_pool_is_refused_and_the_error_explains_the_migration() {
+    let tmp = make_pool(&["agent-1", "agent-2"]);
+    // Turn the fixture workspace into a linked git worktree (the shape
+    // `.loom/scripts/worktree.sh` creates).
+    fs::write(tmp.path().join(".git"), "gitdir: /elsewhere/.git/worktrees/issue-1\n").unwrap();
+    std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, "");
+    let err = select_token(tmp.path(), None).unwrap_err();
+    std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+    assert!(err.0.contains("REFUSED TOKEN POOL"), "explains the refusal: {}", err.0);
+    assert!(err.0.contains("#9135"), "cites the policy: {}", err.0);
+    assert!(
+        err.0.contains(&pool_dir(tmp.path()).display().to_string()),
+        "names the refused pool: {}",
+        err.0
+    );
+}
+
+/// The same workspace with no `.git` is a plain legacy layout, not a leak
+/// vector — selection still works, so the refusal is scoped to the policy it
+/// enforces rather than breaking every non-repo pool on the host.
+#[test]
+#[serial]
+fn a_pool_outside_any_worktree_is_still_selectable() {
+    let tmp = make_pool(&["agent-1"]);
+    std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, "");
+    let selected = select_token(tmp.path(), None);
+    std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+    assert_eq!(selected.unwrap().name, "agent-1");
+}
+
 #[test]
 fn single_token_selected_via_random_tier() {
     let tmp = make_pool(&["only"]);

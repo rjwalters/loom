@@ -106,7 +106,13 @@ use std::time::{Duration, Instant};
 // `pub(crate)` item cannot cross that crate boundary, only a genuinely `pub`
 // one can.
 pub mod containment_signal;
-mod crash_signals;
+// `crash_signals` is `pub(crate)` so the crate-wide child-liveness probe
+// `is_pid_alive` reaches every consumer (the reaper, the orphan reaper, and
+// #9464's claim-label heal) without a re-export line in this ratcheted file.
+pub(crate) mod crash_signals;
+// `generate_sweep_id` lives with the `SweepKind` it names (model.rs) — moved out
+// of this ratcheted file; re-exported for the existing callers.
+pub use model::generate_sweep_id;
 mod decline_cooldown;
 mod dispatch;
 mod guards;
@@ -122,6 +128,7 @@ pub(crate) mod private_dispatch;
 mod prless_retry;
 mod quarantine;
 pub(crate) mod reaper;
+mod restore_to_ready;
 mod spawn_process;
 mod stacking;
 #[cfg(test)]
@@ -1007,6 +1014,13 @@ pub struct PreparedIssueDispatch {
     /// Dropping this box releases the slot, so an abandoned dispatch cannot
     /// leak one. See `runtime_preference::handoff`.
     pub(crate) admission: crate::runtime_preference::DispatchAdmission,
+    /// The issue's story-point size (#9432), resolved at guard-chain step 2.71
+    /// from the label set the #4444 park guard already fetched, and carried
+    /// across the begin→poll→finish seam so `finish_issue_dispatch` can stamp
+    /// it on the `sweep.global.dispatch` event without re-reading the forge.
+    /// `None` for an unsized issue, a defective points label set, or a skipped
+    /// label read — never `0`.
+    pub(crate) story_points: Option<u32>,
 }
 
 /// Result of the lock-scoped [`begin_cancel`](SweepRegistry::begin_cancel)
@@ -1058,24 +1072,6 @@ pub struct CancelOutcome {
 pub struct TrackedSweepIdentity {
     pub sweep_id: SweepId,
     pub started_at: DateTime<Utc>,
-}
-
-/// Generate a stable sweep ID for the given kind. Format follows the
-/// spawn-loop log naming convention so operators can correlate.
-#[must_use]
-pub fn generate_sweep_id(kind: &SweepKind) -> SweepId {
-    let ts = Utc::now().timestamp();
-    match kind {
-        SweepKind::Issue(n) => format!("sweep-issue-{n}-{ts}"),
-        SweepKind::PrSet(prs) => {
-            let joined = prs
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("-");
-            format!("sweep-prs-{joined}-{ts}")
-        }
-    }
 }
 
 impl SweepRegistry {

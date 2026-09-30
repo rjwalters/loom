@@ -247,9 +247,107 @@ pub fn diff_stat_against_mainline(working_dir: &Path) -> Option<(i64, i64)> {
     if !is_git_repo(working_dir) {
         return None;
     }
-    mainline_candidates(working_dir)
-        .into_iter()
-        .find_map(|base_ref| diff_stat_since_merge_base(working_dir, &base_ref))
+    let merge_base = merge_base_with_mainline(working_dir)?;
+    diff_stat_between(working_dir, &merge_base, "HEAD")
+}
+
+/// The merge base of `working_dir`'s `HEAD` with its mainline — the first
+/// candidate ref from [`mainline_candidates`] that `git merge-base` resolves
+/// against `HEAD`. `None` when no candidate resolves (shallow clone, no
+/// shared history).
+fn merge_base_with_mainline(working_dir: &Path) -> Option<String> {
+    for base_ref in mainline_candidates(working_dir) {
+        let merge_base_output = Command::new("git")
+            .args(["merge-base", "HEAD", &base_ref])
+            .current_dir(working_dir)
+            .output()
+            .ok()?;
+        if merge_base_output.status.success() {
+            let merge_base = String::from_utf8(merge_base_output.stdout)
+                .ok()?
+                .trim()
+                .to_string();
+            if !merge_base.is_empty() {
+                return Some(merge_base);
+            }
+        }
+    }
+    None
+}
+
+/// One `git diff --numstat` row for [`diff_rows_against_mainline`] — per-path
+/// add/delete counts so a caller can classify paths (Issue #9466's generated
+/// vs hand-written split). Binary rows (`-\t-\tpath`) are skipped: they carry
+/// no line counts to classify.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitDiffRow {
+    pub added: i64,
+    pub deleted: i64,
+    pub path: String,
+}
+
+/// Local per-path numstat for `working_dir`'s current branch against its
+/// mainline merge base (Issue #9466) — the per-path sibling of
+/// [`diff_stat_against_mainline`], same mainline resolution and same
+/// never-a-fabricated-zero contract (`None` when the worktree is absent,
+/// not a git repo, or no base resolves). Never a forge API call.
+///
+/// # Panics
+/// Never: a malformed numstat row is skipped, not unwrapped.
+#[must_use]
+pub fn diff_rows_against_mainline(working_dir: &Path) -> Option<Vec<GitDiffRow>> {
+    if !is_git_repo(working_dir) {
+        return None;
+    }
+    let merge_base = merge_base_with_mainline(working_dir)?;
+    let output = Command::new("git")
+        .args(["diff", "--numstat", &merge_base, "HEAD"])
+        .current_dir(working_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    Some(
+        stdout
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() < 3 {
+                    return None;
+                }
+                // Renames render as `added\tdeleted\told => new` (or with a
+                // `{prefix => suffix}` brace form); classify the post-image
+                // path, which is what a landing diff reports.
+                let added = parts[0].parse::<i64>().ok()?;
+                let deleted = parts[1].parse::<i64>().ok()?;
+                Some(GitDiffRow {
+                    added,
+                    deleted,
+                    path: normalize_diff_path(parts[2]),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The post-image path of a numstat path column: plain paths pass through;
+/// `old => new` renames keep `new`; `{a => b}/rest` brace forms reassemble
+/// to `b/rest`.
+#[must_use]
+fn normalize_diff_path(raw: &str) -> String {
+    if let Some((head, new)) = raw.rsplit_once(" => ") {
+        if let Some(open) = head.rfind('{') {
+            if let Some(close) = head[open..].find('}') {
+                let prefix = &head[..open];
+                let suffix = &head[open + close + 1..];
+                return format!("{prefix}{new}{suffix}");
+            }
+        }
+        return new.to_string();
+    }
+    raw.to_string()
 }
 
 /// Capture git changes and create a `PromptChanges` record

@@ -24,6 +24,7 @@ fn sweep_outcome_carries_complexity_when_the_marker_was_read() {
 #[test]
 fn sweep_outcome_omits_complexity_when_no_marker_was_read() {
     let base = SweepOutcomeRecord {
+        story_points: None,
         repo: Some("rjwalters/loom".to_string()),
         repo_unresolved: false,
         visibility: RepoVisibility::Private,
@@ -35,12 +36,14 @@ fn sweep_outcome_omits_complexity_when_no_marker_was_read() {
         phase_durations: Vec::new(),
         total_duration_sec: 10,
         result: SweepResult::Failure,
+        disposition: SweepDisposition::Landed,
         pr_number: None,
         tokens_in: None,
         tokens_out: None,
         lines_added: None,
         lines_deleted: None,
         tokens_by_model: None,
+        tokens_unattributed: None,
         failure_class: None,
         models_used: None,
         doctor_cycles: None,
@@ -49,6 +52,18 @@ fn sweep_outcome_omits_complexity_when_no_marker_was_read() {
         provider: None,
         profile: None,
         complexity: None,
+        tokens_status: None,
+        tokens_status_reason: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
+        pr_numbers: None,
+        hw_lines_added: None,
+        hw_lines_deleted: None,
+        hw_files: None,
+        generated_lines: None,
+        test_lines: None,
     };
     let value = serde_json::to_value(&base).unwrap();
     assert!(

@@ -108,10 +108,11 @@ pub enum Row {
         pr: String,
         /// The child's head branch, verbatim from the rollup.
         branch: String,
-        /// The child's issue number, derived from `branch` when it follows the
-        /// `feature/issue-<N>` convention. `None` means the branch does not,
-        /// which the retired shell treated as "no `loom:building` claim to
-        /// race, so safe".
+        /// The child's issue number, derived from `branch` when it follows a
+        /// recognized Builder branch convention (see
+        /// [`issue_from_branch`]). `None` means the branch does not, which
+        /// the retired shell treated as "no `loom:building` claim to race, so
+        /// safe".
         issue: Option<String>,
     },
     /// A rollup element that is not a usable child row. The retired `jq`
@@ -129,8 +130,9 @@ pub enum Row {
 /// What [`plan`] concluded about a merged parent branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
-    /// The parent branch is not `feature/issue-<N>`, so it cannot have stacked
-    /// children by this convention. The retired shell's first `return 0`.
+    /// The parent branch follows no recognized Builder branch convention (see
+    /// [`issue_from_branch`]), so it cannot have stacked children. The
+    /// retired shell's first `return 0`.
     NotStacked,
     /// The rollup is not a JSON array. The retired shell's `jq` errored here
     /// and `|| echo 0` / `|| true` turned that into "no children"; this says so
@@ -225,23 +227,37 @@ fn json_kind(value: &serde_json::Value) -> String {
     .to_string()
 }
 
-/// The issue number a `feature/issue-<N>` branch names, or `None`.
+/// The issue number a recognized Builder branch names, or `None`.
 ///
 /// This is the ONE definition of the predicate the retired shell wrote out
 /// twice — once as the parent gate, once as the child derivation. See the
 /// module's fidelity note for why it is a hand parse returning a `String`
 /// rather than a regex returning a `u64`.
 ///
-/// Rejects `feature/issue-` with no digits, any non-ASCII-digit character
-/// anywhere after the prefix (including a trailing newline, which bash's
+/// Shares [`super::stacked_children::STACKABLE_PARENT_PREFIXES`] with the
+/// pre-merge gate ([`super::stacked_children::is_stackable_parent_branch`])
+/// so the two decisions can never disagree on which parent branches are
+/// stackable (2AMLogic/2am#1298, #1396) — recognizing `feature/issue-<N>`
+/// (worktree.sh's default) and `feature/harness-ops-<N>`
+/// (2AMLogic/harness-ops's Builder convention). Before #1298, only the first
+/// was matched here, so a harness-ops parent merge silently skipped
+/// stacked-child reconciliation and stranded open children
+/// (harness-ops#283, #356).
+///
+/// Rejects a prefix with no digits, any non-ASCII-digit character anywhere
+/// after the prefix (including a trailing newline, which bash's
 /// unanchored-`$`-free ERE also rejected), and a leading `+`/`-`.
 pub fn issue_from_branch(branch: &str) -> Option<String> {
-    let rest = branch.strip_prefix("feature/issue-")?;
-    if is_ascii_digits(rest) {
-        Some(rest.to_string())
-    } else {
-        None
+    for prefix in super::stacked_children::STACKABLE_PARENT_PREFIXES {
+        if let Some(rest) = branch.strip_prefix(prefix) {
+            return if is_ascii_digits(rest) {
+                Some(rest.to_string())
+            } else {
+                None
+            };
+        }
     }
+    None
 }
 
 /// A non-empty run of ASCII digits and nothing else — `[0-9]+` under an anchored
@@ -296,8 +312,10 @@ pub struct Decision {
 /// Safe/unsafe for one child, from its issue's live label set.
 ///
 /// `issue` is [`Row::Child::issue`]: `None` means the child branch does not
-/// follow the `feature/issue-<N>` convention, so there is no claim to race and
-/// the retired shell short-circuited to safe without any forge read at all.
+/// follow a recognized Builder branch convention (see
+/// [`super::stacked_children::STACKABLE_PARENT_PREFIXES`]), so there is no
+/// claim to race and the retired shell short-circuited to safe without any
+/// forge read at all.
 ///
 /// `labels` is the raw bytes of the uncached `gh api repos/<nwo>/issues/<n>`
 /// label list, one name per line, as `merge-pr.sh` still extracts it. It is
@@ -308,7 +326,8 @@ pub fn child_route(issue: Option<&str>, labels: &[u8]) -> Decision {
     if issue.is_none() {
         return Decision {
             route: Route::Reconcile,
-            why: "child branch is not feature/issue-<N>, so it carries no loom:building claim",
+            why: "child branch is not a recognized Builder branch (feature/issue-<N> or \
+                  feature/harness-ops-<N>), so it carries no loom:building claim",
         };
     }
     if labels.iter().all(|b| b.is_ascii_whitespace()) {

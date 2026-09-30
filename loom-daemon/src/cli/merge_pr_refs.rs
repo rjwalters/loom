@@ -69,6 +69,29 @@ pub(crate) enum MergePrRefsCommand {
         dry_run: bool,
     },
 
+    /// Every `Loom-Issue: owner/repo#N` trailer the body declares, one
+    /// `owner/repo#N` per line, deduped and sorted (#9465). The
+    /// machine-readable issue↔PR link for a PR GitHub's closing reference
+    /// cannot see — every non-final PR of a multi-PR landing. The
+    /// `owner/repo` slug is required; a bare `Loom-Issue: #N` is not a
+    /// declaration. Always exits 0 — "no trailer" is an answer.
+    LoomIssueTrailerRefs,
+
+    /// The non-blocking pre-merge warning for a `Loom-Issue:` trailer that
+    /// will not parse (#9465) — wrapped in a code span (#5234/#8796) or
+    /// missing the `owner/repo` slug. One finding (two lines) per offending
+    /// line, empty when there is nothing to warn about; always exits 0.
+    /// Same contract as `backticks-partial-increment-warnings`.
+    LoomIssueTrailerWarnings {
+        #[arg(long, value_name = "N")]
+        pr: String,
+
+        /// Prefix every line `[dry-run] `, matching the #4569/#4595 conflict
+        /// warnings' contract.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Tri-state read of the text's closing-keyword references to `--issue`
     /// (#1057). Exit 0 when at least one such reference is NOT negated
     /// (`does not fix #N` does not count, but a later unnegated `fixes #N`
@@ -141,6 +164,14 @@ impl MergePrRefsCommand {
             }
             MergePrRefsCommand::BackticksPartialIncrementWarnings { pr, dry_run } => {
                 print!("{}", refs::backticked_partial_increment_warnings(&body, &pr, dry_run));
+            }
+            MergePrRefsCommand::LoomIssueTrailerRefs => {
+                for r in refs::loom_issue_trailer_refs(&body) {
+                    println!("{r}");
+                }
+            }
+            MergePrRefsCommand::LoomIssueTrailerWarnings { pr, dry_run } => {
+                print!("{}", refs::unparseable_loom_issue_trailer_warnings(&body, &pr, dry_run));
             }
         }
         Ok(())

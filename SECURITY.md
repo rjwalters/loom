@@ -31,7 +31,7 @@ This repository uses several automated tools to detect security issues:
 - **Dependabot**: Security-fix PRs from vulnerability alerts (scheduled version updates are disabled in favor of Renovate)
 - **Cargo Audit**: Scans Rust dependencies for known security vulnerabilities
 - **NPM Audit**: Scans JavaScript dependencies for known security vulnerabilities
-- **CodeQL**: Static analysis to detect security issues in JavaScript/TypeScript code
+- **CodeQL**: Static analysis to detect security issues in JavaScript/TypeScript and Rust code, run daily and on demand (`.github/workflows/codeql.yml`)
 - **Cargo Deny**: Supply chain security checks for Rust dependencies
 
 ### Supply Chain Security

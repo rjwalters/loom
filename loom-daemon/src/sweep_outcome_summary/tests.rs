@@ -8,7 +8,7 @@
 use super::*;
 
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
-use crate::telemetry::{PhaseDuration, RepoVisibility};
+use crate::telemetry::{PhaseDuration, RepoVisibility, SweepDisposition};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn record(
@@ -19,6 +19,7 @@ fn record(
     duration: i64,
 ) -> SweepOutcomeRecord {
     SweepOutcomeRecord {
+        story_points: None,
         repo: Some(repo.to_string()),
         repo_unresolved: false,
         visibility: RepoVisibility::Private,
@@ -30,12 +31,14 @@ fn record(
         phase_durations: Vec::new(),
         total_duration_sec: duration,
         result,
+        disposition: SweepDisposition::Unknown,
         pr_number: None,
         tokens_in: None,
         tokens_out: None,
         lines_added: None,
         lines_deleted: None,
         tokens_by_model: None,
+        tokens_unattributed: None,
         failure_class: None,
         models_used: None,
         doctor_cycles: None,
@@ -44,6 +47,18 @@ fn record(
         provider: None,
         profile: None,
         complexity: None,
+        tokens_status: None,
+        tokens_status_reason: None,
+        attempt_index: None,
+        previous_sweep_id: None,
+        trigger: None,
+        rework_events: None,
+        pr_numbers: None,
+        hw_lines_added: None,
+        hw_lines_deleted: None,
+        hw_files: None,
+        generated_lines: None,
+        test_lines: None,
     }
 }
 
@@ -719,14 +734,8 @@ fn merges_per_weighted_token_and_lines_per_merged_pr() {
 fn doctor_rate_reads_phase_durations_and_the_cycles_seam() {
     let mut phased = record("a", "o/r", None, SweepResult::Success, 600);
     phased.phase_durations = vec![
-        PhaseDuration {
-            phase: "builder".into(),
-            duration_sec: 300,
-        },
-        PhaseDuration {
-            phase: "doctor".into(),
-            duration_sec: 120,
-        },
+        PhaseDuration::new("builder", 300),
+        PhaseDuration::new("doctor", 120),
     ];
     assert!(doctor_engaged(&phased));
 
