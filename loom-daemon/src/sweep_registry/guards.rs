@@ -1297,6 +1297,17 @@ impl SweepRegistry {
     /// probe accepts a `--repo` flag. Prefers the process-global `LOOM_REPO`
     /// override (`owner/repo`) when set, else asks `gh repo view` in the
     /// workspace root. Returns `None` on any failure so both guards fail open.
+    ///
+    /// Issue #9572: a single dispatch calls this from ~10 different guard/
+    /// probe sites, and the answer never changes for the life of the
+    /// process — `workspace_root` is fixed at registry construction — so a
+    /// successful `gh repo view` resolve is cached in
+    /// [`owner_repo_cache`](SweepRegistry::owner_repo_cache) and every later
+    /// call (still checking `LOOM_REPO` first, unchanged) returns the cached
+    /// pair instead of spawning another subprocess. A *failed* resolve is
+    /// deliberately never cached: every guard downstream of this method
+    /// fails open on `None`, and caching a transient `gh` outage would turn
+    /// one bad call into a permanent one for the rest of the process's life.
     pub(crate) fn resolve_owner_repo(&self) -> Option<(String, String)> {
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             if let Some((o, r)) = repo.split_once('/') {
@@ -1304,6 +1315,14 @@ impl SweepRegistry {
                     return Some((o.to_string(), r.to_string()));
                 }
             }
+        }
+        if let Some(cached) = self
+            .owner_repo_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Some(cached);
         }
         let gh = self
             .config
@@ -1329,13 +1348,20 @@ impl SweepRegistry {
             return None;
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.trim().split_once('/').and_then(|(o, r)| {
+        let resolved = stdout.trim().split_once('/').and_then(|(o, r)| {
             if o.is_empty() || r.is_empty() {
                 None
             } else {
                 Some((o.to_string(), r.to_string()))
             }
-        })
+        });
+        if let Some(ref pair) = resolved {
+            *self
+                .owner_repo_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pair.clone());
+        }
+        resolved
     }
 
     pub(crate) fn flip_label_to_building(&self, issue: u32) -> Result<()> {
@@ -3880,3 +3906,9 @@ mod preflip_tests;
 // two-line form fits the budget the shared-helper call site above freed.
 #[cfg(test)]
 mod repo_env_tests;
+
+// Issue #9572's `resolve_owner_repo` caching coverage. Same rationale as
+// `repo_env_tests` immediately above: a plain child module keeps this test
+// code out of the frozen guards.rs budget.
+#[cfg(test)]
+mod owner_repo_cache_tests;

@@ -2158,7 +2158,7 @@ fn second_dispatch_after_spawn_child_failure_is_not_refused_by_the_live_claim_gu
 /// is written, `dispatch.rs`'s `sweep_journal::record_sweep_at` call).
 /// Reproduced deterministically by simply not calling
 /// `finish_issue_dispatch` — no threads, no timing dependence — exactly
-/// like `same_key_retry_during_the_unlocked_poll_window_is_refused_not_double_spawned`
+/// like `same_key_retry_during_the_unlocked_poll_window_returns_the_inflight_sweep_id`
 /// reproduces the same window for its own (different) assertion.
 ///
 /// This is a CHARACTERIZATION test: it pins that the gap exists (the
@@ -3266,50 +3266,40 @@ echo \"spawn-claude: using OAuth account 'agent-idem' (mode=random)\" >&2\nsleep
 
 /// Pins the *caller-visible* behavior of a same-idempotency-key retry that
 /// lands inside the begin/poll/finish window this issue's lock split opens
-/// (Issue #6592, Judge review of PR #6600).
+/// (Issue #6592, Judge review of PR #6600) — UPDATED by Issue #9572, which
+/// deliberately changes the pinned outcome (see below).
 ///
 /// `find_running_by_key` matches only entries already in `self.entries`,
 /// and a dispatch's entry is not inserted until `finish_issue_dispatch`
 /// (post-poll, re-locked). So between `begin_issue_dispatch` returning
 /// `Spawned` and `finish_issue_dispatch` recording the entry — the window
 /// the registry mutex is deliberately released for, bounded by
-/// `TOKEN_NAME_CAPTURE_TIMEOUT` (~5s) — a same-key retry MISSES the
-/// idempotency short-circuit and falls through to the guard chain.
+/// `TOKEN_NAME_CAPTURE_TIMEOUT` (~5s) — a same-key retry MISSES step 1's
+/// `find_running_by_key` short-circuit.
 ///
-/// **The safety property still holds — no double-spawn** — because the
-/// guard chain refuses the retry before any second `Command::spawn()`. Two
-/// independent mechanisms can do the refusing, and *which one wins is
-/// platform-dependent*, so this test deliberately accepts either:
+/// **Issue #9572**: it no longer falls through to the guard chain from
+/// there. `begin_prepared_issue_dispatch`'s step 3.05 records this key's
+/// `sweep_id` in `self.inflight_idempotency` right after the first attempt
+/// claims the lock, and step 1b — checked immediately after step 1 —
+/// consults that map before any guard runs. So the retry now gets the SAME
+/// graceful `Done(Ok(DispatchOutcome { was_new: false, .. }))` hand-back a
+/// retry gets before or after this window, naming the in-flight attempt's
+/// `sweep_id` — never a second `Command::spawn()`, and never the hard `Err`
+/// (`lock collision` / #4556 live-claim guard) this test used to pin as the
+/// window's caller-visible cost.
 ///
-/// 1. The #4556 live-claim guard's process-scan leg
-///    (`live_claim::live_sweep_process_in`), which matches the
-///    just-spawned child by **argv** and so needs neither a tracked entry
-///    nor lock ownership. It fires where the platform exposes another
-///    process's argv (Linux `/proc`) — observed refusing this exact retry
-///    on CI. The guard's *bookkeeping* legs are indeed blind here
-///    (`has_tracked_sweep_for` is still false, and the lock's `owner.json`
-///    still carries this daemon's own pid because
-///    `record_child_pid_in_lock` runs in `finish_issue_dispatch`) — the
-///    argv leg is not.
-/// 2. The atomic `acquire_lock` mkdir, which is unconditional and
-///    platform-independent — the backstop that refuses the retry with a
-///    `lock collision` wherever leg 1 cannot see the child (observed on
-///    macOS).
-///
-/// What *does* differ inside this window is the retry's caller-visible
-/// outcome: a hard `Err` either way, not the graceful `was_new: false` a
-/// retry gets before or after. This test pins that, so the distinction is
-/// a checked behavior rather than a surprise rediscovered later. It is
+/// This is still a CHARACTERIZATION test, now pinning the NEW behavior: the
+/// in-flight sweep id is returned, not double-spawned, not refused. It is
 /// deterministic: the window is reproduced by simply not calling
-/// `finish_issue_dispatch` yet — no threads, no timing dependence, and no
-/// dependence on which of the two guards happens to fire.
+/// `finish_issue_dispatch` yet — no threads, no timing dependence.
 ///
 /// Contrast `begin_issue_dispatch_idempotency_hit_returns_done_without_spawning`
 /// above, which covers a retry *after* completion (the realistic client
-/// case: a retry follows a 30s ack timeout, long past the ~5s window).
+/// case: a retry follows a 30s ack timeout, long past the ~5s window) via
+/// the ORIGINAL step-1 `self.entries` dedup, unaffected by #9572.
 #[test]
 #[serial]
-fn same_key_retry_during_the_unlocked_poll_window_is_refused_not_double_spawned() {
+fn same_key_retry_during_the_unlocked_poll_window_returns_the_inflight_sweep_id() {
     let dir = tempdir().unwrap();
     let script = "#!/usr/bin/env bash\nset -euo pipefail\n\
 echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep 5\n";
@@ -3333,13 +3323,12 @@ echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep
         BeginIssueDispatch::Done(result) => panic!("expected Spawned, got Done({result:?})"),
     };
 
-    // Same-key retry landing INSIDE that window. It misses the
-    // idempotency-key short-circuit (no entry to match yet) and must be
-    // REFUSED by the guard chain — never a second spawn. Either refusal
-    // mechanism is acceptable and both are asserted for explicitly (see
-    // this test's doc comment): the #4556 live-claim argv probe where the
-    // platform exposes the child's argv, otherwise the atomic
-    // `acquire_lock` mkdir.
+    // Same-key retry landing INSIDE that window. It misses step 1's
+    // `find_running_by_key` short-circuit (no entry to match yet), but
+    // #9572's step 1b now finds it in `self.inflight_idempotency` and hands
+    // back the SAME sweep id gracefully — never a second spawn, never a
+    // guard-chain refusal.
+    let racing_sweep_id = prepared.sweep_id.clone();
     let racing = registry.begin_issue_dispatch(
         &SweepKind::Issue(82_002),
         Some("race-key-6592".to_string()),
@@ -3348,27 +3337,25 @@ echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep
         None,
         None,
     );
-    match racing {
-        Err(e) => {
-            let msg = e.to_string();
-            assert!(
-                msg.contains("lock collision") || msg.contains("#4556 live-claim guard"),
-                "a same-key retry inside the unlocked-poll window must be refused by the \
-                     claim lock or the #4556 live-claim guard; got an unrecognized error: {msg}"
-            );
-        }
-        Ok(BeginIssueDispatch::Spawned(_)) => {
-            panic!("same-key retry inside the unlocked-poll window must NOT spawn a second child")
-        }
-        Ok(BeginIssueDispatch::Done(result)) => panic!(
-            "same-key retry inside the unlocked-poll window is expected to be refused by the \
-                 guard chain, not to short-circuit: Done({result:?})"
-        ),
-    }
+    // Any shape other than a graceful in-flight hit (a second spawn, an
+    // inner dispatch error, or an outer guard-chain refusal) is the #9572
+    // regression this test pins against.
+    let outcome = match racing {
+        Ok(BeginIssueDispatch::Done(Ok(outcome))) => outcome,
+        Ok(BeginIssueDispatch::Done(Err(e))) => panic!("expected an in-flight hit; got Err: {e}"),
+        Ok(BeginIssueDispatch::Spawned(_)) => panic!("must not spawn a second child"),
+        Err(e) => panic!("expected an in-flight hit; guard chain refused: {e}"),
+    };
+    assert!(!outcome.was_new, "expected a graceful idempotency hit, got: {outcome:?}");
+    assert_eq!(
+        outcome.sweep_id, racing_sweep_id,
+        "the retry must name the SAME sweep id as the still-in-flight first attempt"
+    );
 
-    // Now close the window and confirm it was genuinely transient: once
-    // `finish_issue_dispatch` records the entry, the SAME retry gets the
-    // graceful idempotent hand-back instead of the lock-collision error.
+    // Now close the window and confirm the in-flight hand-back and the
+    // post-finish `self.entries` hand-back agree: once `finish_issue_dispatch`
+    // records the entry, the SAME retry still gets the graceful idempotent
+    // hand-back, now via the ORIGINAL step-1 dedup instead of #9572's step 1b.
     let (token_name, runtime, death) = poll_and_classify_spawned_child(
         &mut prepared.child,
         &prepared.log_path,
