@@ -756,13 +756,13 @@ pub fn reservation_comment_body(marker: &SequenceMarker, attempt: &str) -> Strin
 /// `loom:sequence` field list: `sequence::parse` skips it (the first token
 /// has no `=`), so it can never be mistaken for a hold. [`live_marker`] reads
 /// it as "the newest reservation for `plan=` is released".
-pub const RELEASE_MARKER_PREFIX: &str = "loom:sequence released";
+pub const RESERVATION_RELEASED_PREFIX: &str = "loom:sequence released";
 
 /// True when `span` (an HTML comment's inner text) is a release marker for
 /// exactly `plan`.
 fn is_release_span_for(span: &str, plan: &str) -> bool {
     span.trim()
-        .strip_prefix(RELEASE_MARKER_PREFIX)
+        .strip_prefix(RESERVATION_RELEASED_PREFIX)
         .filter(|rest| rest.starts_with(char::is_whitespace))
         .is_some_and(|rest| {
             let mut fields = rest.split_whitespace();
@@ -816,7 +816,7 @@ pub fn live_marker(component: &ComponentState, bodies: &[String]) -> Option<Sequ
 #[must_use]
 pub fn reservation_release_body(marker: &SequenceMarker, attempt: &str) -> String {
     format!(
-        "<!-- {RELEASE_MARKER_PREFIX} plan={} -->\n\
+        "<!-- {RESERVATION_RELEASED_PREFIX} plan={} -->\n\
          **Consolidation attempt `{}` released this reservation** — the attempt was aborted; \
          this PR is back to its normal pipeline, untouched and actionable.\n\n\
          ---\n\
