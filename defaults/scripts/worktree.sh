@@ -768,21 +768,39 @@ _worktree_sparse() {
     fi
 }
 
-# Function to fetch latest changes from the default branch
-# Uses fetch-only approach to avoid conflicts with worktrees that have the
-# default branch checked out. Relies on the global DEFAULT_BRANCH (resolved via
-# loom_default_branch before this is called).
-fetch_latest_main() {
-    # `--` ends option parsing (#9106); loom_default_branch has already refused
-    # an unsafe $DEFAULT_BRANCH before this function can be reached.
-    local quiet=""
-    [[ "$JSON_OUTPUT" == "true" ]] && quiet=1
-    [[ -n "$quiet" ]] || print_info "Fetching latest changes from origin/$DEFAULT_BRANCH..."
-    if git fetch origin -- "$DEFAULT_BRANCH" 2>/dev/null; then
-        [[ -n "$quiet" ]] || print_success "Fetched latest origin/$DEFAULT_BRANCH"
-    else
-        [[ -n "$quiet" ]] || print_warning "Could not fetch origin/$DEFAULT_BRANCH (continuing with local state)"
+# Base-ref preparation: the `origin/$DEFAULT_BRANCH` fetch and the `--base`
+# stacked-PR resolution (#3729). Ported WHOLE to `loom-daemon worktree-base`
+# (#8195 slice 13, epic #7810) - they were one decision (which ref a new branch
+# starts from) with one ordering constraint. The verb prints `TOKEN<TAB>text`
+# records replayed through this script's own print_* helpers; BASE_REF /
+# BASE_DISPLAY are data records, JSON is a complete --json failure document
+# (now built by serde_json; the retired shell spliced $BASE_BRANCH in by hand).
+# Without a usable daemon the default-branch fetch degrades to one best-effort
+# `git fetch`, but --base REFUSES (exit 2, nothing touched): un-stacking a child
+# onto the default branch silently is the failure the block existed to prevent.
+# requires-daemon: worktree-base optional  #8195 slice 13 - without it only the default-branch fetch runs (silently); a plain `worktree.sh <N>` is unaffected and --base refuses with exit 2 before touching anything
+_worktree_base() {
+    local _l _m _out _rc=0 _q=""
+    [[ "$JSON_OUTPUT" != "true" ]] || _q="--quiet"
+    if [[ -n "${_WT_DAEMON_BIN:-}" ]] && "$_WT_DAEMON_BIN" worktree-base --help >/dev/null 2>&1; then
+        # shellcheck disable=SC2086  # $_q is a fixed literal flag or empty
+        _out="$("$_WT_DAEMON_BIN" worktree-base --default-branch "$DEFAULT_BRANCH" --base-branch "${BASE_BRANCH:-}" $_q)" || _rc=$?
+        while IFS=$'\t' read -r _l _m; do
+            case "$_l" in
+                INFO) print_info "$_m" ;;  SUCCESS) print_success "$_m" ;;
+                WARNING) print_warning "$_m" ;;  ERROR) print_error "$_m" ;;
+                PLAIN) echo "$_m" ;;  JSON) echo "$_m" >&3 ;;
+                BASE_REF) BASE_REF="$_m" ;;  BASE_DISPLAY) BASE_DISPLAY="$_m" ;;
+            esac
+        done <<<"$_out"
+        return "$_rc"
     fi
+    if [[ -n "$BASE_BRANCH" ]]; then
+        [[ "$JSON_OUTPUT" != "true" ]] || echo '{"success": false, "error": "base-requires-loom-daemon"}' >&3
+        print_error "--base needs 'loom-daemon worktree-base' (#8195 slice 13), and ${_WT_DAEMON_BIN:-no resolvable loom-daemon} cannot run it. Install or update loom-daemon, or re-run without --base."
+        return 2
+    fi
+    git fetch origin -- "$DEFAULT_BRANCH" 2>/dev/null || true
 }
 
 # --------------------------------------------------------------------------
@@ -1486,44 +1504,13 @@ fi
 # result and returns non-zero on an unsafe name, which lands in the arm above
 # (check_branch_name has already printed the precise refusal to stderr).
 
-# Fetch latest changes from origin/$DEFAULT_BRANCH before creating the worktree
-# Uses fetch-only to avoid conflicts with worktrees that have it checked out
-fetch_latest_main
-
-# ─── Base-branch resolution (#3729, stacked-PR v1) ──────────────────────────
-# By default a new feature branch is created from origin/$DEFAULT_BRANCH. When
-# --base <branch> is passed (e.g. `--base feature/issue-<parent>` from
-# /loom:sweep --depends-on), resolve a ref for that base and use it instead so
-# the child branch stacks on top of the parent's branch. Prefer the pushed
-# origin/<base>, fall back to a local <base>. Hard-fail if neither resolves —
-# an explicit base that can't be found is worse than silently branching off
-# main (which would un-stack the child).
+# Fetch origin/$DEFAULT_BRANCH (fetch-only, so a worktree with it checked out is
+# not disturbed) and resolve the base ref: origin/$DEFAULT_BRANCH by default, or
+# the `--base <branch>` a stacked child builds on (#3729). Hard-fails rather than
+# silently un-stacking. See `_worktree_base` above.
 BASE_REF="origin/$DEFAULT_BRANCH"
 BASE_DISPLAY="$DEFAULT_BRANCH"
-if [[ -n "$BASE_BRANCH" ]]; then
-    # #9106: --base names a branch that reaches `git fetch` as a bare operand.
-    # Refuse an unsafe name outright — a `--base --upload-pack=/tmp/x` would
-    # otherwise be handed straight to git as a switch.
-    check_branch_name "$BASE_BRANCH" "--base branch" || {
-        [[ "$JSON_OUTPUT" == "true" ]] && echo '{"success": false, "error": "unsafe-base-branch-name", "baseBranch": "'"$BASE_BRANCH"'"}' >&3
-        exit 1
-    }
-    git fetch origin -- "$BASE_BRANCH" 2>/dev/null || true
-    if git show-ref --verify --quiet "refs/remotes/origin/$BASE_BRANCH"; then
-        BASE_REF="origin/$BASE_BRANCH"; BASE_DISPLAY="$BASE_REF"
-    elif git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
-        BASE_REF="$BASE_BRANCH"; BASE_DISPLAY="$BASE_REF"
-    else
-        if [[ "$JSON_OUTPUT" == "true" ]]; then
-            echo '{"success": false, "error": "base-branch-not-found", "baseBranch": "'"$BASE_BRANCH"'"}' >&3
-        else
-            print_error "Requested --base '$BASE_BRANCH' not found as origin/$BASE_BRANCH or a local branch."
-            echo "  Ensure the parent sweep has created/pushed feature/issue-<parent> before stacking a child on it."
-        fi
-        exit 1
-    fi
-    [[ "$JSON_OUTPUT" == "true" ]] || print_info "Stacked worktree base: $BASE_DISPLAY (from --base $BASE_BRANCH)"
-fi
+_worktree_base || exit $?
 
 # Determine branch name
 if [[ -n "$CUSTOM_BRANCH" ]]; then
