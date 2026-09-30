@@ -58,3 +58,27 @@ fn loom_story_points_survives_the_gateway_log_allowlist() {
          as unsized (NULL forever, indistinguishable from an unsized fleet)"
     );
 }
+
+/// Regression guard for concurrent-edit clobbering of the allowlists. Each
+/// `keep_keys` list is one very long line, so a stale-copy conflict
+/// resolution silently drops keys other PRs added. That has happened more
+/// than once (this PR's first revision deleted every key below). Pin one
+/// representative key from each previously clobbered slice in the context
+/// that carries it.
+#[test]
+fn previously_clobbered_allowlist_keys_survive_their_contexts() {
+    let pinned: &[(&str, &str, &str)] = &[
+        ("log", "loom.ci.dependency_wait_ms", "#9457 ci.job `needs:` wait segment"),
+        ("span", "loom.ci.dependency_wait_ms", "#9457 ci.job span `needs:` wait segment"),
+        ("span", "loom.host.pressure", "#9051 host-pressure slice"),
+        ("span", "loom.admission.reason", "#9051 admission slice"),
+    ];
+    for (context, key, why) in pinned {
+        assert!(
+            allowlist(context).contains(*key),
+            "the gateway's {context} keep_keys no longer admits `{key}` ({why}); likely a \
+             stale-copy merge resolution of defaults/observability/collector/config.yaml. \
+             Rebuild the edit from current main instead of dropping other PRs' keys"
+        );
+    }
+}
