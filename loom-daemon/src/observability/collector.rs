@@ -42,6 +42,20 @@
 //! (`sweep_registry.rs`) — `SweepGlobalCompleted` carries no `issue` number
 //! and would double-emit the same outcome, so this collector does not
 //! subscribe to `sweep.global.completed` at all.
+//!
+//! # `sweep.outcome`: the reaper's outcome journal wins, this path defers
+//!
+//! This path's own `sweep.outcome` record (built in `terminal_records`) is
+//! deliberately impoverished — no `pr_number`, no `config`, no per-phase
+//! breakdown — because the reaper's durable outcome journal
+//! (`sweep_registry::outcome_journal`) writes the authoritative rich record
+//! for the SAME `sweep_id`, synchronously, before it ever emits the bus event
+//! this collector reacts to. Since the backend's `sweep.outcome` ingest keeps
+//! only the first writer per `sweep_id` (Issue #9477), `handle_event` drops
+//! this path's copy for every sweep_id the journal will also cover, and keeps
+//! it only for the synthesized `unknown-issue-{N}` fallback the journal never
+//! writes under — see [`suppress_journal_owned_outcome`]'s own doc for the
+//! full reasoning.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -259,9 +273,116 @@ async fn handle_event(
         &|| registry_evidence(workspace_pool, root, issue),
     );
     attach_outcome_usage(&mut envelopes, root, issue, event_death_class(&event)).await;
+    // Issue #9477: drop this path's own `sweep.outcome` for every sweep_id
+    // the durable outcome journal will also cover — see
+    // `suppress_journal_owned_outcome`'s own doc for why.
+    suppress_journal_owned_outcome(&mut envelopes);
     for envelope in envelopes {
         queue.offer(envelope);
     }
+}
+
+/// Drop this collector's own `sweep.outcome` envelope for every sweep_id the
+/// reaper's durable outcome journal will (or already did) cover — Issue
+/// #9477.
+///
+/// # The race this closes
+///
+/// The backend ingests `sweep.outcome` with `INSERT OR IGNORE` against a
+/// partial `UNIQUE(kind, sweep_id)` index — `idx_records_terminal_sweep_once`,
+/// declared in `dashboard/migrations/0002_idempotent_terminal_records.sql` and
+/// applied by `dashboard/src/index.ts` — so the FIRST writer for a given
+/// `sweep_id` wins and every later one is silently absorbed. Two independent
+/// paths write that same `(kind="sweep.outcome", sweep_id)` for one terminal
+/// sweep transition:
+///
+/// - **this live event-bus path** (`terminal_records`, below): fires
+///   synchronously off `Event::SweepExited`/`SweepCrashed`, with no
+///   `pr_number`, empty `phase_durations`, and no `config`/`failure_class`/
+///   `judge_verdicts`/`doctor_cycles`/`complexity`;
+/// - **the reaper's outcome journal**
+///   (`sweep_registry::outcome_journal::append_outcome_telemetry_journal`),
+///   drained on a periodic cadence by `super::backfill` — the RICH record,
+///   with every one of those fields populated from state the reaper already
+///   holds.
+///
+/// The reaper always calls `append_outcome_journal` synchronously BEFORE it
+/// emits the paired `SweepExited`/`SweepCrashed` bus event for the exact same
+/// transition (`sweep_registry::reaper`), so by the time this collector's
+/// live path even sees the event, the rich journal line already exists on
+/// disk — it is simply not exported yet, since the backfill drain that reads
+/// it only runs on a periodic tick (first-boot, then every
+/// `snapshot_interval`), while this live path pushes to the export queue
+/// immediately. The live record therefore reaches the backend first on
+/// (almost) every sweep, and the rich journal record loses the `INSERT OR
+/// IGNORE` race and is silently discarded.
+///
+/// # What that costs, measured
+///
+/// Over the 987 `sweep.outcome` lines in this repo's own outcome-telemetry
+/// journal (`.loom/logs/sweep-outcome-telemetry.jsonl{,.1}`), the journal
+/// record carries `config` on 100%, `pr_number` on 27.9%, a real classifier
+/// `failure_class` on 19.1%, `phase_durations` on 67.8%, `lines_added` on
+/// 70.0% and `model` on 95.2%. The live record this path builds for those
+/// same 987 `sweep_id`s carries `config: {}`, `pr_number: None`,
+/// `phase_durations: []`, `lines_added: None` and `model: None` on 100% of
+/// them — by construction, see `terminal_records`. Not one of the 987 journal
+/// lines is under a synthesized id, so the live record collides with the rich
+/// one on *every* sweep this host reaped. That is the low field-completeness
+/// #9441/#9440 measured at the backend, from this side of the wire.
+///
+/// # Why suppression, not enrichment (Option A over Option C)
+///
+/// Enriching this live path to carry the same fields would duplicate the
+/// journal's own logic (a second source of truth for `config`/
+/// `judge_verdicts`/`complexity`/…) for the larger of the two diffs. This
+/// path already KNOWS, from its own correlation state, whether the journal
+/// will emit under the same id — that is exactly what a tracked
+/// [`DispatchState`] (dispatched here, or adopted via registry evidence, see
+/// `correlation::recover_adopted_dispatch`) means. So the cheapest sound fix
+/// is to drop the redundant, poorer copy here and let the richer one win by
+/// simply not having a competitor.
+///
+/// # The one case this still emits: the synthesized fallback id
+///
+/// [`unknown_sweep_id`] is used only when this process has NO correlated
+/// identity for the terminal transition (a daemon restart with no adoption
+/// evidence). The reaper still journals the sweep under its OWN real
+/// `sweep_id` in that case — never under `unknown-issue-{N}` — so the two
+/// records do not collide at ingest at all; suppressing the fallback record
+/// would only lose data, not avoid a race. A record whose own `sweep_id`
+/// equals [`unknown_sweep_id`] of its `issue` is therefore never suppressed.
+///
+/// # What this deliberately does NOT touch: `sweep.completed`
+///
+/// `sweep.completed` is under the *same* partial unique index, and
+/// `super::backfill`'s `synthesize_completed` does rebuild one per journal
+/// line, so the live copy wins that race too — but there it is the right
+/// winner, and the scope stops here. The synthesized record carries exactly
+/// the same fields the live one does (`repo`/`visibility`/`issue`/`sweep_id`/`result`
+/// plus `tokens_by_model`), so nothing is lost by the live copy landing
+/// first, while `sweep.completed` is the kind the dashboard reads as the
+/// *moment* a sweep ended — delaying it by up to a backfill tick would trade
+/// away liveness for no completeness gain at all. `sweep.outcome`, the
+/// analytics record, has the opposite tradeoff: nobody watches it live, and
+/// its fields are the whole point.
+///
+/// # The accepted tradeoff
+///
+/// This makes the journal the *sole* source of `sweep.outcome`, which is what
+/// `super::backfill`'s own module doc already declares it ("the local outcome-
+/// telemetry journal is the queue of record"). The one shape that regresses is
+/// a terminal transition whose journal append itself fails — best-effort by
+/// contract, logged at `warn` with the path — which previously still produced
+/// this path's thin record and now produces none. That is a logged, visible
+/// disk failure, and the row it would have saved carried no `pr_number`, no
+/// `config` and no phases, so the trade is a rare thin row against a rich row
+/// on (almost) every sweep.
+fn suppress_journal_owned_outcome(envelopes: &mut Vec<TelemetryEnvelope>) {
+    envelopes.retain(|envelope| match &envelope.record {
+        TelemetryRecord::SweepOutcome(record) => record.sweep_id == unknown_sweep_id(record.issue),
+        _ => true,
+    });
 }
 
 /// Fill in the token counters and `tokens_status` of any `sweep.outcome`
@@ -336,6 +457,28 @@ async fn attach_outcome_usage(
                 record.tokens_by_model = usage.tokens_by_model.clone();
                 record.tokens_status = Some(usage.status);
                 record.tokens_status_reason = usage.reason.clone();
+                // Issue #9477/#9486: #9440 filled the totals above but left
+                // `tokens_unattributed` at `None`, which breaks the schema's
+                // own documented invariant — `Σ phase_durations[*].tokens_in
+                // + tokens_unattributed.tokens_in == tokens_in`, and the
+                // `_out` twin — for every record this path emits, because
+                // `terminal_records` builds an EMPTY `phase_durations` and
+                // nothing else ever fills it. An empty Σ means the whole
+                // measured total is the remainder, which is exactly the case
+                // `tokens_unattributed`'s doc calls "the point of the field".
+                //
+                // Written as the same saturating Σ-and-subtract fold the
+                // durable journal path uses
+                // (`outcome_journal::append_outcome_telemetry_journal`)
+                // rather than as a direct copy of the totals, so the invariant
+                // survives a future change that DOES give this path per-phase
+                // entries instead of silently becoming a double count.
+                //
+                // Omitted — never `Some(0, 0)` — when the totals themselves
+                // are unknown, matching `tokens_in`/`tokens_out`'s own
+                // "unknown != zero" contract; a *measured* zero still yields
+                // `Some(0, 0)`, since zero of zero really is accounted for.
+                record.tokens_unattributed = phase_remainder(record);
             }
             TelemetryRecord::SweepCompleted(record) => {
                 record.tokens_by_model = usage.tokens_by_model.clone();
@@ -343,6 +486,33 @@ async fn attach_outcome_usage(
             _ => {}
         }
     }
+}
+
+/// The part of `record`'s sweep totals that no `phase_durations` entry
+/// accounts for — [`crate::telemetry::SweepOutcomeRecord::tokens_unattributed`]'s
+/// own definition (Issue #9443), computed here for the live path (#9477).
+///
+/// Deliberately the same shape as the durable journal path's fold in
+/// [`crate::sweep_registry::SweepRegistry::append_outcome_telemetry_journal`]:
+/// `None` whenever the totals are unknown (there is nothing to take a
+/// remainder of, and `0` would falsely claim the phases cover everything), and
+/// a saturating subtraction otherwise, so the two emit paths can never disagree
+/// about what the remainder means.
+fn phase_remainder(
+    record: &crate::telemetry::SweepOutcomeRecord,
+) -> Option<crate::telemetry::TokenTotals> {
+    let (total_in, total_out) = record.tokens_in.zip(record.tokens_out)?;
+    let (attributed_in, attributed_out) = record
+        .phase_durations
+        .iter()
+        .filter_map(PhaseDuration::token_split)
+        .fold((0u64, 0u64), |(sum_in, sum_out), (tokens_in, tokens_out)| {
+            (sum_in.saturating_add(tokens_in), sum_out.saturating_add(tokens_out))
+        });
+    Some(crate::telemetry::TokenTotals {
+        tokens_in: total_in.saturating_sub(attributed_in),
+        tokens_out: total_out.saturating_sub(attributed_out),
+    })
 }
 
 /// The reaper's pre-flight/crash classification carried on a terminal event,
@@ -613,8 +783,12 @@ fn terminal_records(
             lines_added: None,
             lines_deleted: None,
             tokens_by_model: None,
-            // Issue #9443: no phase entries and no sweep totals here, so there
-            // is nothing to take a per-phase remainder of.
+            // Filled by `attach_outcome_usage` in the caller once the sweep
+            // totals are known (Issue #9440/#9477) — this construction site
+            // has no workspace root in scope, so there is nothing to take a
+            // remainder of yet. `phase_durations` above is always empty on
+            // this path, so that fill-in is the WHOLE total, not a partial
+            // remainder — see `attach_outcome_usage`'s own comment.
             tokens_unattributed: None,
             failure_class,
             models_used: None,
@@ -1414,6 +1588,10 @@ fn collect_active_sweep_ids(workspace_pool: &WorkspacePool) -> Vec<String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod admission_brake_tests;
+// Issue #9477: `sweep.outcome` live-vs-journal precedence.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod outcome_precedence_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod provider_accounts_tests;

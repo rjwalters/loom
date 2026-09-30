@@ -35,6 +35,7 @@ impl Harness {
     fn estimate(&mut self, at: DateTime<Utc>) -> Vec<crate::eta::tracker::Emission> {
         let ctx = EstimateContext {
             registry: &self.registry,
+            current_start: None,
             current_finish: None,
             current_land: None,
             history: &self.history,

@@ -124,8 +124,8 @@ fn blocked_labels_return_no_estimate() {
             );
         }
         assert_eq!(
-            unstarted_issue_reason(&labels(&["loom:issue", hold])),
-            NoEstimateReason::Blocked
+            unstarted_issue_reason(&labels(&["loom:issue", hold]), None),
+            Some(NoEstimateReason::Blocked)
         );
     }
     assert!(!hold_labels().contains(&"loom:building"), "the claim label is not a hold");
@@ -150,10 +150,13 @@ fn pr_labels_resolve_to_stages() {
     assert_eq!(stage_from_pr_labels(&labels(&[CHANGES_REQUESTED, TREATING])), Ok(Stage::Doctor));
     assert_eq!(stage_from_pr_labels(&labels(&[TREATING])), Ok(Stage::Doctor));
     assert_eq!(stage_from_pr_labels(&labels(&["loom:pr"])), Ok(Stage::MergeWait));
-    assert_eq!(unstarted_issue_reason(&labels(&["loom:curated"])), NoEstimateReason::HumanGated);
     assert_eq!(
-        unstarted_issue_reason(&labels(&["loom:issue"])),
-        NoEstimateReason::NoDispatchPlan
+        unstarted_issue_reason(&labels(&["loom:curated"]), None),
+        Some(NoEstimateReason::HumanGated)
+    );
+    assert_eq!(
+        unstarted_issue_reason(&labels(&["loom:issue"]), None),
+        Some(NoEstimateReason::NoDispatchPlan)
     );
 }
 
@@ -209,7 +212,7 @@ fn provenance_validation_requires_full_sha_and_known_state() {
 #[test]
 fn registry_resolves_current_per_kind() {
     let registry = Registry::builtin();
-    assert_eq!(registry.ids(), vec!["finish-v1", "land-v1"]);
+    assert_eq!(registry.ids(), vec!["start-v1", "finish-v1", "land-v1"]);
     assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
     assert_eq!(registry.current(Kind::Finish, None).id(), "finish-v1");
     // A configured id of the wrong kind, or an unknown one, falls back.

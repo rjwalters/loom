@@ -83,6 +83,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.queue.candidate_rank",
     "loom.queue.total_candidates",
     "loom.queue.priority_score",
+    "loom.queue.halt_cause",
+    // Repo lockout weights on a pr-open-skip row's disposition/admission
+    // spans (Issue #9674).
+    "lockout.duration_seconds",
+    "lockout.frozen_candidates_count",
+    "lockout.frozen_points_sum",
 ];
 
 /// Longest label value kept, in bytes.

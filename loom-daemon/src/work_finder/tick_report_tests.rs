@@ -26,6 +26,16 @@ fn lease_order(issue: u32) -> anyhow::Error {
     .into()
 }
 
+/// The #4123 open-PR guard's typed refusal: `pr` is the (synthetic) open
+/// linked PR the guard names.
+fn open_pr_guard(issue: u32) -> anyhow::Error {
+    crate::sweep_registry::OpenPrDispatchError {
+        issue,
+        pr: issue + 1000,
+    }
+    .into()
+}
+
 fn token_selection(issue: u32) -> anyhow::Error {
     TokenSelectionDispatchError {
         issue,
@@ -176,7 +186,7 @@ fn each_dispatch_attempt_is_one_admission_span_under_the_tick_span() {
     let started = Utc::now() - Duration::seconds(1);
     let report = tick_multi(&mut multi, &[], 4, &[false]);
     let tick = tick_span(&report, 4, started, Utc::now());
-    let spans = admission_spans(&report, &tick, &HashMap::new());
+    let spans = admission_spans(&report, &tick, &HashMap::new(), &HashMap::new());
     assert_eq!(spans.len(), 3);
     for span in &spans {
         assert_eq!(span.name, SpanName::DispatchAdmission);
@@ -224,7 +234,7 @@ fn an_admission_without_a_plan_order_omits_queue_position_attributes() {
     let report = tick(&mut source, &mut disp, 4, false).unwrap();
     assert!(report.plan_order.is_empty());
     let tick_span = tick_span(&report, 4, Utc::now(), Utc::now());
-    let spans = admission_spans(&report, &tick_span, &HashMap::new());
+    let spans = admission_spans(&report, &tick_span, &HashMap::new(), &HashMap::new());
     assert_eq!(spans.len(), 1);
     assert!(!spans[0]
         .attributes
@@ -239,7 +249,7 @@ fn an_admission_without_a_plan_order_omits_queue_position_attributes() {
 fn a_tick_with_no_dispatch_attempt_has_no_admission_spans() {
     let report = TickReport::default();
     let tick = tick_span(&report, 1, Utc::now(), Utc::now());
-    assert!(admission_spans(&report, &tick, &HashMap::new()).is_empty());
+    assert!(admission_spans(&report, &tick, &HashMap::new(), &HashMap::new()).is_empty());
 }
 
 /// Issue #9222: when the caller resolves the admitting workspace's repo ref
@@ -265,9 +275,71 @@ fn admission_span_carries_loom_repo_when_the_workspace_resolves() {
             visibility: crate::telemetry::RepoVisibility::Public,
         },
     );
-    let spans = admission_spans(&report, &tick, &repo_refs);
+    let spans = admission_spans(&report, &tick, &repo_refs, &HashMap::new());
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].attributes["loom.repo"], "acme/widgets");
     assert_eq!(spans[0].attributes["loom.repo.visibility"], "public");
     assert_eq!(spans[0].clone().bounded().attributes, spans[0].attributes);
+}
+
+/// Issue #9674: a `pr_open` admission in a repo the lockout sample says is
+/// locked carries the repo's frozen-backlog weight — and it survives the
+/// export-time allowlist, so the facts reach SigNoz.
+#[test]
+fn a_pr_open_admission_in_a_locked_repo_carries_the_lockout_weight() {
+    use crate::observability::ops::lockout::{FrozenBacklog, RepoLockout};
+
+    let mut multi = vec![(
+        Source(items(&[7])),
+        Refusing {
+            refuse: open_pr_guard,
+            ok: HashSet::new(),
+        },
+    )];
+    let report = tick_multi(&mut multi, &[], 4, &[false]);
+    let tick = tick_span(&report, 4, Utc::now(), Utc::now());
+    let mut repo_refs = HashMap::new();
+    repo_refs.insert(
+        0,
+        crate::telemetry::queue_snapshot::QueueRepoRef {
+            repo: "acme/widgets".to_string(),
+            visibility: crate::telemetry::RepoVisibility::Public,
+        },
+    );
+    let lockouts = HashMap::from([(
+        "acme/widgets".to_string(),
+        RepoLockout {
+            backlog: FrozenBacklog {
+                candidates: 20,
+                points: 58,
+            },
+            duration_secs: Some(86_400),
+        },
+    )]);
+    let spans = admission_spans(&report, &tick, &repo_refs, &lockouts);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].attributes["loom.dispatch.reason"], "pr_open");
+    assert_eq!(spans[0].attributes["loom.repo"], "acme/widgets");
+    assert_eq!(spans[0].attributes["lockout.frozen_candidates_count"], "20");
+    assert_eq!(spans[0].attributes["lockout.frozen_points_sum"], "58");
+    assert_eq!(spans[0].attributes["lockout.duration_seconds"], "86400");
+    // Every stamped attribute survives the export-time allowlist (#9674).
+    assert_eq!(spans[0].clone().bounded().attributes, spans[0].attributes);
+
+    // A non-pr_open admission in the same locked repo does not report the
+    // lock: the repo's other attempts do not double-report it.
+    let mut multi = vec![(
+        Source(items(&[9])),
+        Refusing {
+            refuse: lease_order,
+            ok: HashSet::new(),
+        },
+    )];
+    let report = tick_multi(&mut multi, &[], 4, &[false]);
+    let tick = tick_span(&report, 4, Utc::now(), Utc::now());
+    let spans = admission_spans(&report, &tick, &repo_refs, &lockouts);
+    assert_eq!(spans[0].attributes["loom.dispatch.reason"], "lease_order_lost");
+    assert!(!spans[0]
+        .attributes
+        .contains_key("lockout.frozen_candidates_count"));
 }

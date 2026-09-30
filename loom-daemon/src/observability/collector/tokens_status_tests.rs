@@ -137,6 +137,63 @@ async fn a_failed_sweeps_live_record_now_carries_the_tokens_it_burned() {
     assert_eq!(completed.tokens_by_model, outcome.tokens_by_model);
 }
 
+/// `Σ phase_durations[*] + tokens_unattributed == tokens_in/tokens_out` —
+/// [`crate::telemetry::SweepOutcomeRecord::tokens_unattributed`]'s own
+/// documented invariant, asserted rather than eyeballed (Issue #9486).
+/// Panics with the offending record on either axis.
+fn assert_tokens_reconcile(outcome: &crate::telemetry::SweepOutcomeRecord) {
+    let (Some(total_in), Some(total_out)) = (outcome.tokens_in, outcome.tokens_out) else {
+        assert_eq!(
+            outcome.tokens_unattributed, None,
+            "with no totals there is nothing to take a remainder of: {outcome:?}"
+        );
+        return;
+    };
+    let (attributed_in, attributed_out) = outcome
+        .phase_durations
+        .iter()
+        .filter_map(crate::telemetry::PhaseDuration::token_split)
+        .fold((0u64, 0u64), |(sum_in, sum_out), (tokens_in, tokens_out)| {
+            (sum_in + tokens_in, sum_out + tokens_out)
+        });
+    let remainder = outcome.tokens_unattributed.as_ref().unwrap_or_else(|| {
+        panic!("a record with known totals must carry a remainder: {outcome:?}")
+    });
+    assert_eq!(attributed_in + remainder.tokens_in, total_in, "tokens_in");
+    assert_eq!(attributed_out + remainder.tokens_out, total_out, "tokens_out");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_measured_record_with_no_phase_attribution_carries_the_whole_total_as_unattributed() {
+    // Issue #9486 (absorbed into #9477): #9440 filled the totals on this path
+    // but left `tokens_unattributed` at `None`, while `terminal_records`
+    // builds an empty `phase_durations` and nothing else fills it — so every
+    // record this path emits violated the schema's documented invariant. An
+    // empty Σ means the WHOLE measured total is the remainder.
+    let store = ClaudeStore::seed();
+    let workspace = tempfile::tempdir().unwrap();
+    let issue = 9477;
+    store.seed_sweep_session(workspace.path(), issue, 4_200, 730);
+
+    let mut envelopes = terminal_envelopes(issue, 600);
+    attach_outcome_usage(&mut envelopes, workspace.path(), issue, None).await;
+
+    let outcome = outcome_of(&envelopes);
+    assert_eq!(outcome.tokens_status, Some(crate::telemetry::TokensStatus::Measured));
+    assert!(outcome.phase_durations.is_empty(), "this path samples no per-phase windows");
+    assert_eq!(outcome.tokens_in, Some(4_200));
+    assert_eq!(outcome.tokens_out, Some(730));
+    assert_eq!(
+        outcome.tokens_unattributed,
+        Some(crate::telemetry::TokenTotals {
+            tokens_in: 4_200,
+            tokens_out: 730,
+        }),
+    );
+    assert_tokens_reconcile(outcome);
+}
+
 #[tokio::test]
 #[serial]
 async fn a_spawn_death_on_the_live_path_is_a_measured_zero() {
@@ -160,6 +217,17 @@ async fn a_spawn_death_on_the_live_path_is_a_measured_zero() {
     assert_eq!(outcome.tokens_in, Some(0));
     assert_eq!(outcome.tokens_out, Some(0));
     assert_eq!(outcome.tokens_status_reason.as_deref(), Some("preflight-no-cli-start"));
+    // #9486: a *measured* zero is a known total, so it still reconciles —
+    // `Some(0, 0)`, since zero of zero really is accounted for. Only an
+    // *unknown* total omits the remainder.
+    assert_eq!(
+        outcome.tokens_unattributed,
+        Some(crate::telemetry::TokenTotals {
+            tokens_in: 0,
+            tokens_out: 0,
+        }),
+    );
+    assert_tokens_reconcile(outcome);
 }
 
 #[tokio::test]
@@ -178,6 +246,10 @@ async fn a_sweep_with_no_transcript_is_unattributable_with_a_reason() {
         outcome.tokens_status_reason.as_deref(),
         Some(crate::sweep_usage::REASON_NO_TRANSCRIPT)
     );
+    // #9486: unknown totals leave the remainder absent — `Some(0, 0)` would
+    // claim the (empty) per-phase breakdown accounts for everything.
+    assert_eq!(outcome.tokens_unattributed, None);
+    assert_tokens_reconcile(outcome);
 }
 
 #[tokio::test]

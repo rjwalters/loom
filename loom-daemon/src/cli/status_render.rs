@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use std::path::Path;
 
 mod drain_render;
+mod fleet_store_line;
 mod forge_calls_render;
 mod forge_events_line;
 mod holds;
@@ -16,6 +17,7 @@ mod model_class;
 mod observability_line;
 mod operator_priority_line;
 mod peer_claims_line;
+mod pending_restart_line;
 
 use loom_daemon::daemon_install_state;
 use loom_daemon::self_update;
@@ -743,6 +745,20 @@ pub(crate) fn build_status_json_value(
             "journal_adopted_at_startup".to_string(),
             serde_json::json!(report.journal_adopted_at_startup),
         );
+    }
+    // Fleet-store sync (#9596) — client-side and host-local, like `protection`
+    // above, and inserted only when this host actually has a snapshot, so a
+    // host with no `fleet.repo` emits exactly the payload it always did.
+    if let Some(s) = loom_daemon::fleet_sync::probe_status() {
+        value["fleet_store"] = fleet_store_line::json(Some(&s));
+    }
+    // Pending-restart marker (#9597) — a restart-required `fleet-config
+    // render` change this daemon's pid has not yet picked up. Same
+    // client-side/host-local shape as the fleet-store block above, inserted
+    // only when there is one to report.
+    let pending_restart = pending_restart_line::json(report.daemon_pid);
+    if !pending_restart.is_null() {
+        value["pending_restart"] = pending_restart;
     }
     value
 }
@@ -2202,6 +2218,14 @@ pub(crate) fn print_status_human(
     println!("{}", forge_events_line::render_block(report.forge_events.as_ref(), Utc::now()));
     // Starred issues' landing states (#9244 C); nothing when nothing is starred.
     operator_priority_line::print(report.operator_priority_landing.as_ref());
+    // Fleet-store sync (#9596): what the last startup/timer pass found — the
+    // drift the timer detects but deliberately does not write. Nothing at all
+    // on a host with no `fleet.repo`.
+    fleet_store_line::print(loom_daemon::fleet_sync::probe_status().as_ref());
+    // Pending-restart marker (#9597): a restart-required `fleet-config
+    // render` change this daemon's pid has not yet picked up. Nothing at all
+    // once the daemon that saw the drift has restarted (or if none ever did).
+    pending_restart_line::print(report.daemon_pid);
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
     // alive — but is anything positioned to notice when it *stops* being? Before

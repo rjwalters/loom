@@ -1,8 +1,70 @@
-# Loom Development Scripts
+# Loom Repository Scripts
 
-This directory contains shell scripts for managing the daemon during development.
+Shell tooling for developing and maintaining the Loom repository itself: CI
+structural guards (`check-*.sh`), installer/uninstaller and their tests,
+release/version helpers, and daemon dev-mode helpers. Scripts shipped *to
+consumer installs* live under `defaults/scripts/` (installed as `.loom/scripts/`),
+not here. Per the shell language policy
+(`defaults/docs/shell-language-policy.md`), new executable logic belongs in a
+`loom-daemon` subcommand; every script here is accounted for in
+`shell-allowlist.txt`.
 
-## Scripts
+## Index
+
+### CI structural guards
+
+`check-structural.sh` runs every gate below (except advisory ones) locally,
+the same set CI's `Structural Checks` job runs.
+
+| Script | Guards |
+|--------|--------|
+| `check-structural.sh` | Runs all structural gates before anything expensive |
+| `check-claude-md-budget.sh` | `CLAUDE.md` line budget |
+| `check-markdown-token-budget.sh` | Agent-facing markdown token ratchet |
+| `check-role-prompt-budget.sh` | Whole per-role prompt prefix ratchet |
+| `check-file-size-budget.sh` | Oversized source file ratchet |
+| `check-shell-allowlist.sh` | Every tracked `.sh` is in `shell-allowlist.txt` |
+| `check-pipefail-early-exit.sh` | `pipefail` + early-exit SIGPIPE ratchet |
+| `check-dangling-links.sh` | Relative markdown links resolve |
+| `check-doc-anchors.sh` | Markdown `#anchor` links resolve |
+| `check-doc-tocs.sh` | Generated TOCs in large docs (`--fix` regenerates) |
+| `check-docs-defaults-parity.sh` | `.loom/docs` vs `defaults/docs` parity |
+| `check-hooks-defaults-parity.sh` | `defaults/hooks`/`scripts` vs installed copies |
+| `check-agents-md-sync.sh` | `defaults/.loom/AGENTS.md` is not stale |
+| `check-gitignore-convergence.sh` | Loom-managed `.gitignore` block is current |
+| `check-retired-list-drift.sh` | Deleted `defaults/` payloads are in `.loom-retired.list` |
+| `check-daemon-subcommand-versions.sh` | Scripts declare the minimum `loom-daemon` version they need |
+| `check-guard-scan-contracts.sh` | Consumer-tier contract on guard scan strings |
+| `check-guard-destructive-drift.sh` | Advisory drift check on the vendored destructive-command guard |
+| `check-vendored-private-refs.sh` | No private repo/host names in scanned trees |
+
+Baselines/allowlists: `*-baseline.txt`, `role-prompt-budget.txt`, `shell-allowlist.txt`.
+
+### Install / release
+
+| Path | Purpose |
+|------|---------|
+| `install-loom.sh`, `uninstall-loom.sh` | Install/remove Loom in a target repo |
+| `install/` | Installer helpers (label sync, hooks/skills provisioning, branch protection, migration) |
+| `loom/` | Loom CLI entry-point helpers |
+| `setup-mcp.sh` | Demoted MCP bundle-rebuild / legacy-migration tool |
+| `version.sh` | Keep all version-bearing files in sync (release path only; never in a PR) |
+| `changelog.sh` | Generate/verify Keep-a-Changelog entries |
+| `test-installer.sh`, `test-install-local-mode.sh`, `test-migrate-consumer.sh`, `test-changelog.sh`, `test-daemon-liveness.sh` | Tests for the above |
+
+### Development / maintenance
+
+| Path | Purpose |
+|------|---------|
+| `dev-daemon.sh`, `start-daemon.sh`, `stop-daemon.sh`, `restart-daemon.sh`, `daemon-headless.sh`, `daemon-build.sh` | Daemon dev-mode helpers (detailed below) |
+| `worktree.sh` | Worktree helper |
+| `cargo-target-dir.sh` | Cargo target directory resolution |
+| `cleanup-branches.sh`, `clean-tmux.sh` | Stale branch / tmux session cleanup |
+| `archive-logs.sh` | Archive task outputs and daemon logs with retention |
+
+## Daemon dev scripts
+
+Details for the daemon development helpers:
 
 ### dev-daemon.sh
 **Interactive development mode** - Starts daemon and provides live monitoring dashboard.

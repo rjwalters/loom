@@ -58,17 +58,30 @@
 //! all (`WorkFinderTickSummary::queue` is empty), so it never has anything to
 //! export here — the same limitation `queue_snapshot` and `stage_dwell`
 //! already document.
+//!
+//! # Repo lockout attributes (Issue #9674)
+//!
+//! Rows the #4123 open-PR guard refused (`pr-open-skip`,
+//! [`QueueDisposition::OpenPr`]) are the observable signature of a repository
+//! whose backlog is frozen behind an open linked PR. Each `open_pr` span
+//! carries its repo's lockout weight — `lockout.frozen_candidates_count`,
+//! `lockout.frozen_points_sum`, `lockout.duration_seconds` (an in-process
+//! observation floor; see [`super::lockout`]) — so SigNoz can rank which
+//! repo's lockout is starving the most ready work. The computation is pure
+//! over this tick's rows; nothing here ever reads the forge.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Duration, Utc};
 
+use crate::hard_exclusion::HARD_EXCLUSION_LABELS;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::telemetry::queue_snapshot::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 use crate::telemetry::RepoVisibility;
 use crate::types::{PlanKey, QueueDisposition, WorkFinderTickSummary};
+use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::{PARK_LABELS, SKIP_LABELS};
 
 /// Env override for the refresh cadence, in seconds.
@@ -136,6 +149,13 @@ pub struct DispositionRow {
     /// no plan annotation (no keys) or the JSON exceeds the span-attribute
     /// byte bound.
     pub priority_score: Option<String>,
+    /// The issue's resolved story-point size (#9432, Issue #9674) — `None`
+    /// when unsized or a labeled defect (never a guess).
+    pub story_points: Option<u32>,
+    /// Present only for `WorkspaceHalted` rows whose detail is the closed
+    /// `work_finder::halt_cause` vocabulary (#9017) — see [`halt_cause_token`]
+    /// (#9673).
+    pub halt_cause: Option<String>,
 }
 
 /// One row's outcome for a [`record`] sample: enough to build its span.
@@ -162,6 +182,9 @@ pub struct Emission {
     /// (Issue #9669); absent without a plan annotation or on a `left_queue`
     /// emission.
     pub priority_score: Option<String>,
+    /// Present only for a `WorkspaceHalted` row whose detail named a
+    /// closed-vocabulary halt cause — see [`halt_cause_token`] (#9673).
+    pub halt_cause: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +265,7 @@ impl DispositionTracker {
                     candidate_rank: Some(row.candidate_rank),
                     total_candidates: Some(row.total_candidates),
                     priority_score: row.priority_score.clone(),
+                    halt_cause: row.halt_cause.clone(),
                 });
             }
         }
@@ -268,6 +292,7 @@ impl DispositionTracker {
                     candidate_rank: None,
                     total_candidates: None,
                     priority_score: None,
+                    halt_cause: None,
                 });
                 // Dropped: not reinserted into `next`, so this key reads as
                 // "first sight" (`Changed`) if the issue ever reappears.
@@ -287,20 +312,22 @@ pub struct DroppedCounts {
     pub truncated: usize,
 }
 
-/// The label on `detail`, only for `Parked`/`HardExclusion` rows whose label
-/// is in the closed `PARK_LABELS ∪ SKIP_LABELS` vocabulary — never a
-/// repo-configured extra skip label or other free-form text. `HardExclusion`
-/// labels (`hard_exclusion::HARD_EXCLUSION_LABELS`) are not in that
-/// vocabulary today, so this is expected to be absent for that disposition in
-/// practice; the check is written against the vocabulary, not the
-/// disposition, so it stays correct if that ever changes.
+/// The label on `detail`, only for rows whose disposition carries a label in
+/// a closed vocabulary — never a repo-configured extra skip label or other
+/// free-form text: `Parked` rows export `PARK_LABELS ∪ SKIP_LABELS` entries;
+/// `HardExclusion` rows export `hard_exclusion::HARD_EXCLUSION_LABELS`
+/// entries (e.g. `external`), so a span names which rule declined the issue
+/// (#9672). Anything else — including a hard-exclusion label on a
+/// non-exclusion row — exports nothing.
 #[must_use]
 fn allowed_park_label(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
-    if !matches!(disposition, QueueDisposition::Parked | QueueDisposition::HardExclusion) {
-        return None;
-    }
     let label = detail?;
-    (PARK_LABELS.contains(&label) || SKIP_LABELS.contains(&label)).then(|| label.to_string())
+    let in_vocabulary = match disposition {
+        QueueDisposition::Parked => PARK_LABELS.contains(&label) || SKIP_LABELS.contains(&label),
+        QueueDisposition::HardExclusion => HARD_EXCLUSION_LABELS.contains(&label),
+        _ => false,
+    };
+    in_vocabulary.then(|| label.to_string())
 }
 
 /// The PR number in an `OpenPr` row's detail (`"open PR #<n>"`, the text
@@ -339,6 +366,19 @@ fn priority_score(keys: &[PlanKey]) -> Option<String> {
             .join(",")
     );
     (score.len() <= 256).then_some(score)
+}
+
+/// The closed-vocabulary halt cause in a `WorkspaceHalted` row's `detail`
+/// (#9017) — validated through [`HaltCause::from_wire`] and re-emitted as its
+/// canonical `as_str` token, never the raw text (#9673). A cause-less legacy
+/// row (a pre-#9017 caller) and any token outside the vocabulary export
+/// nothing.
+#[must_use]
+fn halt_cause_token(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
+    if disposition != QueueDisposition::WorkspaceHalted {
+        return None;
+    }
+    HaltCause::from_wire(detail?).map(|cause| cause.as_str().to_string())
 }
 
 /// Build this tick's disposition rows from `summary`'s ranked queue, resolving
@@ -381,6 +421,8 @@ pub fn build_rows(
                 .unwrap_or_else(|| u32::try_from(row.rank).unwrap_or(u32::MAX)),
             total_candidates,
             priority_score: priority_score(&row.plan.keys),
+            story_points: row.story_points,
+            halt_cause: halt_cause_token(row.disposition, row.detail.as_deref()),
         });
     }
     (rows, dropped)
@@ -449,11 +491,19 @@ pub fn dropped_points(dropped: DroppedCounts) -> Vec<MetricPoint> {
 /// [`super::dispatch::tick_span`]'s own root when no parent applies. Span IDs
 /// are always derived from `(slug, issue, now)`, never random — the
 /// trace-identity policy every span in this package follows.
+///
+/// An `OpenPr` emission (a `pr-open-skip` row) in a repo this sample says is
+/// locked also carries the repo's lockout attributes (Issue #9674):
+/// `lockout.duration_seconds` from the global tracker,
+/// `lockout.frozen_candidates_count` and `lockout.frozen_points_sum` from
+/// `lockouts`. `LeftQueue` emissions never carry them — the row has already
+/// left the queue, so its repo's current lock state is not this row's story.
 #[must_use]
 pub fn build_span(
     emission: &Emission,
     now: DateTime<Utc>,
     parent: Option<&TraceContext>,
+    lockouts: &HashMap<String, super::lockout::RepoLockout>,
 ) -> SpanRecord {
     let slug: &str = &emission.slug;
     let issue = emission.issue.to_string();
@@ -511,6 +561,35 @@ pub fn build_span(
     if let Some(pr) = emission.pr_number {
         attributes.insert("loom.pr_number".to_string(), pr.to_string());
     }
+    // Issue #9674: a pr-open-skip row is the lock it reports. Stamp the
+    // repo-level lockout attributes on exactly those rows, so a SigNoz query
+    // over `loom.queue.disposition = "open_pr"` spans ranks every repo's
+    // lockout by frozen backlog without double counting the repo's other
+    // (non-blocked) rows. A `LeftQueue` emission is excluded: the row has
+    // already left the queue, so the repo's current lock state is not this
+    // row's story.
+    if emission.transition != Transition::LeftQueue
+        && emission.disposition == QueueDisposition::OpenPr
+    {
+        if let Some(lockout) = lockouts.get(slug) {
+            attributes.insert(
+                "lockout.frozen_candidates_count".to_string(),
+                int(lockout.backlog.candidates).to_string(),
+            );
+            attributes.insert(
+                "lockout.frozen_points_sum".to_string(),
+                i64::try_from(lockout.backlog.points)
+                    .unwrap_or(i64::MAX)
+                    .to_string(),
+            );
+            if let Some(secs) = lockout.duration_secs {
+                attributes.insert("lockout.duration_seconds".to_string(), secs.to_string());
+            }
+        }
+    }
+    if let Some(cause) = &emission.halt_cause {
+        attributes.insert("loom.queue.halt_cause".to_string(), cause.clone());
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context,
@@ -555,6 +634,15 @@ pub(in crate::observability) async fn record(slug_cache: &mut HashMap<String, St
     let (rows, dropped) = build_rows(&summary, &repos);
     let failed = failed_slugs(&summary, &repos);
     let now = Utc::now();
+    // Issue #9674: aggregate this tick's pr-open-skip rows per repo, advance
+    // the global lockout clock (insert-if-absent, failed listings preserved),
+    // and stamp the resulting weights on the repo's `open_pr` spans below.
+    let lockouts = super::lockout::sample(
+        rows.iter()
+            .map(|r| (r.slug.as_str(), r.disposition, r.story_points)),
+        &failed,
+        now,
+    );
     let refresh = Duration::seconds(refresh_secs(std::env::var(REFRESH_SECS_ENV).ok().as_deref()));
     let emissions = TRACKER
         .get_or_init(|| Mutex::new(DispositionTracker::default()))
@@ -565,7 +653,7 @@ pub(in crate::observability) async fn record(slug_cache: &mut HashMap<String, St
         .filter(|(at, _)| *at == summary.at)
         .map(|(_, context)| context);
     for emission in &emissions {
-        sink.emit_span(build_span(emission, now, parent.as_ref()));
+        sink.emit_span(build_span(emission, now, parent.as_ref(), &lockouts));
     }
     sink.emit_metrics_since(dropped_points(dropped), previous_sample);
     *LAST_SAMPLED_TICK

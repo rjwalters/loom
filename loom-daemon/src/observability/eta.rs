@@ -6,12 +6,14 @@
 //!
 //! - **Bus** ([`spawn_task`]): sweep dispatch, phase and terminal events.
 //!   Each transition is journaled the moment it is seen and the item is
-//!   re-estimated immediately.
+//!   re-estimated immediately. Issue-sweep dispatches and completions also
+//!   feed the slot-turnover ledger whose samples `start-v1` reads (#9326).
 //! - **Pass** ([`record`], on the collector's 5-minute snapshot cadence):
 //!   each managed repo's review-label listings (the ETag-cached REST
 //!   listing, where an unchanged listing is a free `304`), at most
 //!   [`FORGE_READ_BUDGET`] `pulls/{n}` + `issues/{n}` reads for items whose
-//!   outcome is still unknown, history reloaded, and every live item
+//!   outcome is still unknown, the last work-finder tick's dispatch plan
+//!   ingested as ready items (#9326), history reloaded, and every live item
 //!   re-estimated. An unchanged estimate is refreshed every `refreshSecs`.
 //!
 //! **Reads over the budget, and reads that fail, are not lost.** The tracker
@@ -46,7 +48,8 @@ use crate::eta::config::EtaConfig;
 use crate::eta::journal::{self, JournalEntry};
 use crate::eta::score::EstimateSummary;
 use crate::eta::tracker::{
-    Effects, Emission, EstimateContext, IssueState, ItemKey, PrState, PrView, Resolved, Tracker,
+    Effects, Emission, EstimateContext, IssueState, ItemKey, PrState, PrView, ReadyPlan, ReadyRow,
+    Resolved, Tracker,
 };
 use crate::eta::{Provenance, Registry, StageSamples};
 use crate::event_bus::EventBus;
@@ -96,6 +99,7 @@ pub fn register_sink(otlp_queues: Vec<Arc<DurableQueue>>, host_id: &str) {
 
 struct State {
     tracker: Tracker,
+    turnover: super::ops::turnaround::TurnoverLedger,
     config: EtaConfig,
     registry: Registry,
     history: StageSamples,
@@ -273,6 +277,7 @@ fn estimate_locked(
 ) -> Vec<Emission> {
     let ctx = EstimateContext {
         registry: &state.registry,
+        current_start: state.config.current_start.as_deref(),
         current_finish: state.config.current_finish.as_deref(),
         current_land: state.config.current_land.as_deref(),
         history: &state.history,
@@ -342,6 +347,7 @@ pub fn spawn_task(
     );
     *lock() = Some(State {
         tracker,
+        turnover: super::ops::turnaround::TurnoverLedger::default(),
         config,
         registry: Registry::builtin(),
         history: StageSamples::default(),
@@ -350,7 +356,11 @@ pub fn spawn_task(
         host_id,
     });
     let default_root = workspace_root.to_string_lossy().to_string();
-    let mut subscription = bus.subscribe(["sweep.global.dispatch", "sweep.issue"]);
+    let mut subscription = bus.subscribe([
+        "sweep.global.dispatch",
+        "sweep.global.completed",
+        "sweep.issue",
+    ]);
     Some(tokio::spawn(async move {
         let mut slugs: HashMap<String, String> = HashMap::new();
         loop {
@@ -362,6 +372,20 @@ pub fn spawn_task(
                 Err(_) => continue,
             };
             let now = Utc::now();
+            // Slot turnover (#9326): host-wide, so before any repo lookup.
+            let turnover = {
+                let mut guard = lock();
+                let Some(state) = guard.as_mut() else {
+                    break;
+                };
+                state
+                    .turnover
+                    .observe(&event, now)
+                    .map(|t| state.tracker.on_slot_turnover(&t))
+            };
+            if let Some(effects) = turnover {
+                apply_event(effects, now).await;
+            }
             let root = match &event {
                 Event::SweepGlobalDispatch { repo, .. }
                 | Event::SweepPhase { repo, .. }
@@ -617,6 +641,7 @@ pub(super) async fn record(
     .await
     .unwrap_or_default();
 
+    let ready = ready_rows(slug_cache).await;
     let now = Utc::now();
     let mut effects = Vec::new();
     let mut checks = Vec::new();
@@ -628,6 +653,11 @@ pub(super) async fn record(
         };
         state.history = history;
         state.repo_ids.extend(repo_ids);
+        // Before the listings, so a departed ready item's `issues/{n}` read
+        // is offered in this same pass.
+        if let Some((rows, plan)) = &ready {
+            effects.push(state.tracker.on_ready_queue(rows, plan, now));
+        }
         for (root, slug, prs) in &repos {
             let e = state.tracker.on_listing(slug, prs, now, resolution_sec);
             // Checks the tracker still wants answered: PRs that left review
@@ -711,6 +741,35 @@ pub(super) async fn record(
         deferred,
         dropped.orphaned
     );
+}
+
+/// The last work-finder tick's ready rows, keyed by repo slug, and its plan
+/// (#9326). `None` before the first tick, or when the tick carried no plan
+/// (the single-workspace loop): no plan, no ready items.
+async fn ready_rows(
+    slug_cache: &mut HashMap<String, String>,
+) -> Option<(Vec<ReadyRow>, ReadyPlan)> {
+    let summary = crate::work_finder::last_tick_summary()?;
+    let context = summary.plan?;
+    let mut rows = Vec::with_capacity(summary.queue.len());
+    for row in summary.queue {
+        let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, &row.repo).await
+        else {
+            continue;
+        };
+        rows.push(ReadyRow {
+            repo: slug,
+            issue: row.issue,
+            plan: row.plan,
+        });
+    }
+    Some((
+        rows,
+        ReadyPlan {
+            context,
+            at: summary.at,
+        },
+    ))
 }
 
 /// How many of this pass's journal rows came from an answered forge read.

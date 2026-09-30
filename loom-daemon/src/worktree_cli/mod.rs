@@ -172,6 +172,21 @@
 //! `git check-ref-format` permits a `"` in and which the custom-branch
 //! argument makes operator input: the same defect slice 13 fixed for
 //! `$BASE_BRANCH`, one arm further down the same decision.
+//!
+//! Slice 15 is [`open_pr`]: the forge round-trip behind
+//! `lib/worktree-forge-pr-check.sh`'s #7765 guard, the ORIGIN-branch sibling
+//! of slice 14's LOCAL-branch reuse arm — reached whenever `worktree.sh <N>`
+//! is about to create a genuinely fresh branch and needs to know whether an
+//! open PR already claims that name. Its bug class is a `grep -qi` pair
+//! against two hand-copied forge error substrings deciding "nothing to
+//! shadow" vs. "refuse rather than guess safe" (#7863 was exactly this
+//! collapsing the wrong way), which is the epic's usual "review cannot see
+//! it" fragility even though nothing on this arm is destructive. Only the
+//! QUERY moved — the `jq -cn` refusal documents `_worktree_guard_fresh_
+//! branch_against_open_pr` builds, and the #9109 invariant pinning every one
+//! of them, stay in the shell; see [`open_pr`]'s module doc for why drawing
+//! the line there keeps `test-worktree-forge-pr-check.sh`'s literal-JSON
+//! audit meaningful instead of needing a second whitelisted name.
 
 pub mod base;
 pub mod baseline;
@@ -187,6 +202,7 @@ pub mod existing;
 pub mod issue_lock;
 pub mod link;
 pub mod lock;
+pub mod open_pr;
 pub mod remove;
 pub mod reset;
 pub mod sentinel;

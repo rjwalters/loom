@@ -1,0 +1,249 @@
+//! Tests for the merge-sequencing marker parser and release evaluation.
+
+use super::*;
+
+// --- Marker parsing -----------------------------------------------------
+
+fn marker_line(after: u32, pred: &str, follower: &str, plan: &str) -> String {
+    format!("<!-- loom:sequence after={after} pred_head={pred} follower_head={follower} plan={plan} -->")
+}
+
+const PRED: &str = "a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5";
+const FOLLOWER: &str = "f0e1d2c3b4af0e1d2c3b4af0e1d2c3b4af0e1d2c";
+const OTHER: &str = "0123456789abcdef0123456789abcdef01234567";
+
+#[test]
+fn a_well_formed_marker_parses() {
+    let bodies = vec![marker_line(111, PRED, FOLLOWER, "plan-a")];
+    assert_eq!(
+        parse(&bodies),
+        Some(SequenceMarker {
+            after: 111,
+            pred_head: PRED.into(),
+            follower_head: FOLLOWER.into(),
+            plan: "plan-a".into(),
+        })
+    );
+}
+
+#[test]
+fn prose_and_documentation_mentions_of_the_format_never_match() {
+    // The hold_state lesson: documentation lines, backticked examples and
+    // prose all travel through comment streams. A span fails validation
+    // (placeholder values here) and is therefore not a marker at all.
+    let bodies = vec![
+        "The applier writes `<!-- loom:sequence after=1 pred_head=<40-hex> follower_head=<40-hex> plan=<id> -->` on the follower.".to_string(),
+        "Example (multi-line, so it never closes on one line):\n<!-- loom:sequence after=2\n   pred_head=aa3>\n".to_string(),
+        "after=3 pred_head=... follower_head=... plan=... — a bare field list in prose".to_string(),
+    ];
+    assert_eq!(parse(&bodies), None);
+}
+
+#[test]
+fn the_newest_marker_wins() {
+    let old = marker_line(1, PRED, FOLLOWER, "plan-old");
+    let new = marker_line(2, OTHER, FOLLOWER, "plan-new");
+    match parse(&[old, new]) {
+        Some(m) => {
+            assert_eq!(m.after, 2);
+            assert_eq!(m.plan, "plan-new");
+        }
+        None => panic!("expected a marker"),
+    }
+}
+
+#[test]
+fn a_malformed_newer_span_does_not_shadow_an_older_valid_marker() {
+    // A truncated rewrite must not UN-own the hold: the older marker is
+    // still a valid, head-pinned statement of order, and evaluate() re-checks
+    // its pins against live state, so the worst case is a hold that stands.
+    let old = marker_line(1, PRED, FOLLOWER, "plan-old");
+    let truncated_new =
+        "<!-- loom:sequence after=2 pred_head=abc follower_head=def plan=new -->".to_string();
+    match parse(&[old, truncated_new]) {
+        Some(m) => assert_eq!(m.plan, "plan-old"),
+        None => panic!("the valid older marker must survive"),
+    }
+}
+
+#[test]
+fn short_or_uppercase_or_placeholder_shas_are_not_markers() {
+    for bad in ["abc123", &PRED[..39], &PRED.to_uppercase(), "<40-hex>"] {
+        let bodies = vec![marker_line(1, bad, FOLLOWER, "p")];
+        assert_eq!(parse(&bodies), None, "pred_head {bad:?} must not parse");
+        let bodies = vec![marker_line(1, PRED, bad, "p")];
+        assert_eq!(parse(&bodies), None, "follower_head {bad:?} must not parse");
+    }
+}
+
+#[test]
+fn after_zero_or_nonnumeric_is_not_a_marker() {
+    for bad in ["0", "-1", "abc", "1.5"] {
+        let line = format!(
+            "<!-- loom:sequence after={bad} pred_head={PRED} follower_head={FOLLOWER} plan=p -->"
+        );
+        assert_eq!(parse(&[line]), None, "after={bad:?}");
+    }
+}
+
+#[test]
+fn missing_fields_are_not_markers() {
+    for line in [
+        "<!-- loom:sequence after=1 pred_head={PRED} plan=p -->",
+        "<!-- loom:sequence after=1 follower_head={FOLLOWER} plan=p -->",
+        "<!-- loom:sequence after=1 pred_head={PRED} follower_head={FOLLOWER} -->",
+    ] {
+        let line = line.replace("{PRED}", PRED).replace("{FOLLOWER}", FOLLOWER);
+        assert_eq!(parse(std::slice::from_ref(&line)), None, "{line}");
+    }
+}
+
+#[test]
+fn unknown_fields_make_the_span_not_a_marker() {
+    let line = format!(
+        "<!-- loom:sequence after=1 pred_head={PRED} follower_head={FOLLOWER} plan=p surprise=1 -->"
+    );
+    assert_eq!(parse(&[line]), None);
+}
+
+#[test]
+fn a_different_marker_namespace_is_not_ours() {
+    // `loom:sequence-x` must be ignored outright, not parsed as a malformed
+    // sibling: other features may share the prefix without owning this gate.
+    let bodies = vec!["<!-- loom:sequence-extra after=1 -->".to_string()];
+    assert_eq!(parse(&bodies), None);
+}
+
+#[test]
+fn an_empty_comment_stream_has_no_marker() {
+    assert_eq!(parse(&[]), None);
+    assert_eq!(parse(&[String::new()]), None);
+    assert_eq!(parse(&["<!-- something else -->".to_string()]), None);
+}
+
+// --- Evaluation ---------------------------------------------------------
+
+fn marker() -> SequenceMarker {
+    SequenceMarker {
+        after: 111,
+        pred_head: PRED.into(),
+        follower_head: FOLLOWER.into(),
+        plan: "plan-a".into(),
+    }
+}
+
+fn pred(open: bool, merged: bool, head: Option<&str>) -> PredecessorState {
+    PredecessorState {
+        open,
+        merged,
+        head_sha: head.map(str::to_string),
+    }
+}
+
+#[test]
+fn merged_at_the_recorded_head_clears() {
+    assert_eq!(evaluate(&marker(), &pred(false, true, Some(PRED)), FOLLOWER), Verdict::Clear);
+}
+
+#[test]
+fn an_open_predecessor_at_the_recorded_head_keeps_in_flight() {
+    assert_eq!(
+        evaluate(&marker(), &pred(true, false, Some(PRED)), FOLLOWER),
+        Verdict::Keep(KeepReason::InFlight)
+    );
+}
+
+#[test]
+fn a_moved_predecessor_head_requires_a_replan_not_a_release() {
+    assert_eq!(
+        evaluate(&marker(), &pred(true, false, Some(OTHER)), FOLLOWER),
+        Verdict::Keep(KeepReason::PredecessorMoved)
+    );
+}
+
+#[test]
+fn a_closed_unmerged_predecessor_dissolves_the_condition() {
+    assert_eq!(
+        evaluate(&marker(), &pred(false, false, Some(PRED)), FOLLOWER),
+        Verdict::Dissolved
+    );
+}
+
+#[test]
+fn a_moved_follower_head_is_a_replan_before_anything_else() {
+    // Checked FIRST on purpose: a marker that no longer describes this tree
+    // must not be honored even if the predecessor merged in the meantime.
+    assert_eq!(
+        evaluate(&marker(), &pred(false, true, Some(PRED)), OTHER),
+        Verdict::Keep(KeepReason::FollowerMoved)
+    );
+}
+
+#[test]
+fn a_merge_at_an_unrecorded_head_never_releases() {
+    // Merged, but the forge reports a head that is not the recorded one —
+    // landed from a different tree, or pushed after the merge. Unknown fate
+    // for the recorded tree means the hold stands for a human/pass look.
+    assert_eq!(
+        evaluate(&marker(), &pred(false, true, Some(OTHER)), FOLLOWER),
+        Verdict::Keep(KeepReason::MergedAtUnknownHead)
+    );
+    assert_eq!(
+        evaluate(&marker(), &pred(false, true, None), FOLLOWER),
+        Verdict::Keep(KeepReason::MergedAtUnknownHead)
+    );
+}
+
+#[test]
+fn an_open_predecessor_with_withheld_head_keeps_closed() {
+    // `head_sha: None` on an open PR is a failed/withheld read, which must
+    // never compare equal to the recorded pin.
+    assert_eq!(
+        evaluate(&marker(), &pred(true, false, None), FOLLOWER),
+        Verdict::Keep(KeepReason::PredecessorMoved)
+    );
+}
+
+#[test]
+fn sha_comparison_is_exact_not_case_insensitive() {
+    // Different case is a different string. There is no forge where that
+    // arises legitimately, but the gate must not silently treat it as a
+    // match either — same rule redate's decide() pins.
+    assert_eq!(
+        evaluate(&marker(), &pred(false, true, Some(&PRED.to_uppercase())), FOLLOWER),
+        Verdict::Keep(KeepReason::MergedAtUnknownHead)
+    );
+}
+
+// --- Rendering ----------------------------------------------------------
+
+#[test]
+fn every_verdict_renders_its_sentinel_and_reason() {
+    let m = marker();
+    for (verdict, sentinel, needle) in [
+        (Verdict::Clear, CLEAR, "#111"),
+        (Verdict::Dissolved, DISSOLVED, "#111"),
+        (Verdict::Keep(KeepReason::InFlight), KEEP, "#111"),
+        (Verdict::Keep(KeepReason::PredecessorMoved), REPLAN, "#111"),
+        // The follower-side REPLAN names the plan, not the predecessor: the
+        // problem is on this PR's side of the ordering.
+        (Verdict::Keep(KeepReason::FollowerMoved), REPLAN, "plan-a"),
+        (Verdict::Keep(KeepReason::MergedAtUnknownHead), REPLAN, "#111"),
+    ] {
+        let line = verdict_line(verdict, &m);
+        assert!(line.starts_with(sentinel), "{verdict:?} → {line}");
+        assert!(line.contains(needle), "{verdict:?} → {line}");
+    }
+}
+
+#[test]
+fn the_sentinels_are_distinct_positive_signals() {
+    // A caller releases only on CLEAR/DISSOLVED; if any two sentinels ever
+    // collided, one release reason would impersonate another.
+    let all = [CLEAR, DISSOLVED, KEEP, REPLAN, NONE];
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+}

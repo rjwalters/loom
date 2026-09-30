@@ -42,6 +42,11 @@ const SIGNOZ_README: &str = include_str!("../../defaults/observability/signoz/RE
 const CI_QUERIES: &str = include_str!("../../defaults/observability/signoz/ci-queries.sql");
 /// The ETA accuracy queries (#9289).
 const ETA_QUERIES: &str = include_str!("../../defaults/observability/signoz/eta-queries.sql");
+/// The measured token/cost usage queries (#8528 scope item 4). Governed by the
+/// `loom.runtime.usage` span's own emitted vocabulary, not the shared fixture
+/// manifest's — the fixture generator emits no usage spans, so these read real
+/// canary data. The live half is `signoz_usage_queries.rs`.
+const USAGE_QUERIES: &str = include_str!("../../defaults/observability/signoz/usage-queries.sql");
 
 /// Loom's own attribute namespace. Presence probes outside it are deliberate
 /// absence assertions (see [`fixture_queries_assert_the_privacy_sentinel_is_dropped`])
@@ -243,6 +248,7 @@ fn saved_queries_only_reference_forwarded_attribute_and_resource_keys() {
         ("queries.sql", ADHOC_QUERIES),
         ("ci-queries.sql", CI_QUERIES),
         ("eta-queries.sql", ETA_QUERIES),
+        ("usage-queries.sql", USAGE_QUERIES),
     ] {
         for container in ["attributes_string", "attributes_number", "attributes_bool"] {
             for key in referenced_attribute_keys(sql, container) {
@@ -701,6 +707,215 @@ fn every_standing_ci_view_is_a_query_section_and_a_readme_saved_view() {
         assert!(
             SIGNOZ_README.contains(&format!("`ci-queries.sql` {section})")),
             "the SigNoz README's Saved views table has no row citing `ci-queries.sql` {section}"
+        );
+    }
+}
+
+// ============================================================================
+// usage-queries.sql (#8528 scope item 4): measured token and cost usage
+// ============================================================================
+//
+// ClickStack's README has had a "Loom measured usage" saved view since its
+// trial landed; the SigNoz side had none, so the two products were not being
+// asked the same question about the one signal family that carries money.
+// These queries read `loom.runtime.usage` spans, whose vocabulary comes from
+// the emitting code rather than from the shared fixture manifest — the fixture
+// generator emits no usage spans at all, so `manifest()` cannot govern them.
+//
+// The two silent-empty failure modes here are the span-specific ones:
+//
+// 1. A counter read from `attributes_number`. Every span attribute is exported
+//    as an OTLP string (the trace mapper renders the whole map with
+//    `kv_string`), so a numeric-container subscript returns 0 on every row and
+//    nothing errors — the opposite of the CI *log* records, where the run id
+//    genuinely is an int. A reader moving between `ci-queries.sql` and this
+//    file crosses that boundary, which is exactly why it is asserted.
+// 2. A counter, cost or pricing key the usage span does not actually carry.
+
+/// The counter, cost and identity attributes one `loom.runtime.usage` span
+/// carries, derived by calling the emitting code — never restated here. A
+/// priced model is used deliberately: the cost attributes only exist when the
+/// rate card knows the model, and their absence for an unknown one is the
+/// behaviour `usage-queries.sql` 4 exists to surface.
+fn runtime_usage_span_attributes() -> BTreeSet<String> {
+    use loom_daemon::observability::runtime_usage::cost::Pricing;
+    use loom_daemon::observability::runtime_usage::spans::counter_attributes;
+    use loom_daemon::script_helpers::sweep_experiment::ModelUsageTotals;
+
+    let row = ModelUsageTotals {
+        model: "claude-opus-5".to_owned(),
+        input: 100,
+        cache_read: 10,
+        cache_write_5m: 3,
+        cache_write_1h: 2,
+        output: 50,
+        ..ModelUsageTotals::default()
+    };
+    let mut keys: BTreeSet<String> = counter_attributes(&row).into_keys().collect();
+    let cost = Pricing::with(None).attributes(&row);
+    assert!(
+        !cost.is_empty(),
+        "the compiled rate card no longer prices {}, so this test can no longer \
+         derive the cost attribute names from the emitting code",
+        row.model
+    );
+    keys.extend(cost.into_keys());
+    // Set directly by `model_usage_spans`, beside the counters.
+    keys.insert("loom.model".to_owned());
+    keys.insert("loom.usage.scope".to_owned());
+    keys
+}
+
+/// The attribute families the usage span itself owns. A key outside them
+/// (`loom.repo`, `loom.role`, …) rides in from the caller's `common` map and is
+/// governed by the gateway allowlist alone, exactly like the fixture queries.
+const USAGE_OWNED_PREFIXES: &[&str] = &[
+    "loom.tokens.",
+    "gen_ai.",
+    "loom.cost.",
+    "loom.pricing.",
+    "loom.usage.",
+];
+
+#[test]
+fn usage_queries_read_only_usage_attributes_the_span_emits_and_the_gateway_forwards() {
+    let emitted = runtime_usage_span_attributes();
+    let span_keys = &keep_keys_by_context()["span"];
+    let referenced = referenced_attribute_keys(USAGE_QUERIES, "attributes_string");
+    assert!(!referenced.is_empty(), "usage-queries.sql no longer reads any span attribute");
+    let mut owned_seen = 0;
+    for key in &referenced {
+        assert!(
+            span_keys.contains(key),
+            "usage-queries.sql reads span attribute '{key}', which the gateway's SPAN keep_keys \
+             allowlist strips — the query can only ever return zero rows"
+        );
+        if USAGE_OWNED_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            owned_seen += 1;
+            assert!(
+                emitted.contains(key),
+                "usage-queries.sql reads '{key}', which a loom.runtime.usage span never carries; \
+                 the span emits {emitted:?}"
+            );
+        }
+    }
+    assert!(
+        owned_seen > 0,
+        "usage-queries.sql no longer reads any counter, cost or scope attribute of the \
+         loom.runtime.usage span"
+    );
+    for required in [
+        "loom.usage.scope",
+        "loom.tokens.total",
+        "loom.cost.usd_estimate",
+    ] {
+        assert!(
+            referenced.contains(required),
+            "usage-queries.sql must read '{required}': scope resolution, the token total and the \
+             priced-vs-unpriced distinction are the three things this artifact exists for"
+        );
+    }
+}
+
+/// OTLP span attributes are ALL strings, so SigNoz files every one of them
+/// under `attributes_string`. A numeric-container subscript is the silent-zero
+/// trap `signoz_usage_queries.rs` demonstrates live.
+#[test]
+fn usage_queries_read_span_attributes_from_the_string_column_only() {
+    for container in ["attributes_number", "attributes_bool"] {
+        let keys = referenced_attribute_keys(USAGE_QUERIES, container);
+        assert!(
+            keys.is_empty(),
+            "usage-queries.sql reads {keys:?} from {container}; every span attribute is exported \
+             as a string, so that subscript returns 0/false on every row without erroring"
+        );
+    }
+}
+
+#[test]
+fn usage_queries_name_only_span_names_the_daemon_emits() {
+    let allowed: BTreeSet<&str> = [
+        SpanName::RuntimeUsage,
+        SpanName::RoleAttempt,
+        SpanName::Sweep,
+    ]
+    .iter()
+    .map(|name| name.as_str())
+    .collect();
+    let names = span_name_literals(USAGE_QUERIES);
+    assert!(
+        names.contains(SpanName::RuntimeUsage.as_str()),
+        "usage-queries.sql no longer filters on the loom.runtime.usage span at all"
+    );
+    for name in &names {
+        assert!(
+            allowed.contains(name.as_str()),
+            "usage-queries.sql filters span name '{name}', which is not one of the spans this \
+             artifact reads ({allowed:?})"
+        );
+    }
+}
+
+#[test]
+fn usage_queries_documented_invocation_binds_exactly_the_parameters_used() {
+    let used: BTreeSet<String> = Regex::new(r"\{(\w+):\w+\}")
+        .unwrap()
+        .captures_iter(USAGE_QUERIES)
+        .map(|capture| capture[1].to_owned())
+        .collect();
+    let bound: BTreeSet<String> = Regex::new(r"--param_(\w+)=")
+        .unwrap()
+        .captures_iter(USAGE_QUERIES)
+        .map(|capture| capture[1].to_owned())
+        .collect();
+    assert!(!used.is_empty(), "usage-queries.sql is no longer parameterized");
+    assert_eq!(
+        used, bound,
+        "usage-queries.sql's documented clickhouse-client invocation must bind exactly the \
+         parameters its statements reference"
+    );
+}
+
+/// Sections 1-6 are the reproducible views; section 0 is the arrival preflight
+/// the subsection prose describes rather than a saved view of its own.
+#[test]
+fn every_usage_query_section_is_cited_by_a_readme_saved_view() {
+    for section in 0..=6 {
+        assert!(
+            Regex::new(&format!(r"(?m)^-- {section}\. "))
+                .unwrap()
+                .is_match(USAGE_QUERIES),
+            "usage-queries.sql is missing section {section}"
+        );
+    }
+    // A saved-view row cites one or more sections in a single parenthetical
+    // (`usage-queries.sql` 1 and 2), so the citation is read off the table rows
+    // rather than matched as a fixed string.
+    let citation = Regex::new(r"`usage-queries\.sql`([^)]*)\)").unwrap();
+    let number = Regex::new(r"\d+").unwrap();
+    let cited: BTreeSet<u32> = SIGNOZ_README
+        .lines()
+        .filter(|line| line.starts_with("| "))
+        .flat_map(|line| {
+            citation
+                .captures_iter(line)
+                .flat_map(|capture| {
+                    number
+                        .find_iter(capture.get(1).unwrap().as_str())
+                        .filter_map(|m| m.as_str().parse().ok())
+                        .collect::<Vec<u32>>()
+                })
+                .collect::<Vec<u32>>()
+        })
+        .collect();
+    for section in 1..=6u32 {
+        assert!(
+            cited.contains(&section),
+            "the SigNoz README's Saved views table has no row citing `usage-queries.sql` \
+             {section}; it cites {cited:?}"
         );
     }
 }

@@ -7,6 +7,134 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-30
+- **PR #9729**: docs: mechanical doc-drift fixes from /repo:all audit (#9724)
+- **Issue #9378** (closed): No label means "approved, but not yet" — loom:blocked is not a merge gate
+- **PR #9700**: feat(merge-pr): durable 'approved, but not yet' sequencing gate (#9378)
+- **Issue #9047** (closed): Urgent: revoke/rotate the 21 OAuth tokens leaked in commit a9da48c2 (public main); decide on history rewrite
+- **PR #9705**: observability: add SigNoz measured-usage queries with a live ClickHouse proof
+- **Issue #8195** (closed): Port worktree.sh to a daemon subcommand (1,812 lines; 26 fixes in 6 months, three of them data-loss classes)
+- **PR #9704**: feat(daemon): add forge check-branch hard-stop for issue #9453 (phase 4)
+- **Issue #9326** (closed): ETA phase 3: start-v1 and land for unstarted issues from dispatch_plan + slot turnover
+- **PR #9701**: eta: start-v1 and land for unstarted issues from dispatch_plan + slot turnover (#9326)
+- **PR #9697**: feat(merge-pr): port the two partial-increment audit comments to Rust (#8191 slice)
+- **Issue #9672** (closed): observability: hard_exclusion loom.dispatch.disposition spans never name which hard-exclusion label applied
+- **PR #9706**: feat(observability): hard_exclusion disposition spans name their declining label (#9672)
+- **PR #9692**: feat(worktree): port the #7765 forge round-trip to `loom-daemon worktree-open-pr` (#8195 slice 15)
+- **Issue #9673** (closed): observability: name the halt cause on workspace_halted loom.dispatch.disposition spans (follow-up to #9222/#9017)
+- **PR #9690**: feat(observability): carry the #9017 halt-cause token on workspace_halted disposition spans (#9673)
+- **Issue #9685** (closed): Prefer human-directed PRs throughout landing with a disableable planning policy
+- **PR #9695**: feat: prioritize human-directed PRs through landing
+- **PR #9691**: daemon: dispatch-side yield to a leaseless foreign claim (#9453 phase 3.1)
+- **Issue #9674** (closed): feat(telemetry): emit repo lockout duration and frozen backlog weight on work_finder skip spans
+- **PR #9684**: feat(telemetry): emit repo lockout duration and frozen backlog weight (#9674)
+- **Issue #9596** (closed): fleet-config: sync the fleet store at daemon start and on a timer
+- **PR #9681**: feat(daemon): sync the fleet-config store at startup and on a timer
+- **Issue #9599** (closed): fleet-config propose: open PRs against the fleet store instead of hand-editing it
+- **PR #9678**: feat(fleet-config): propose store changes as PRs instead of hand edits
+- **Issue #9141** (closed): resync pipeline correctness batch: staging credential exclusions, stamp convergence, local-fix guard, land allowlist, staging HEAD, unknown-version refusal (consolidates 6 siblings)
+- **PR #9675**: fix(resync): allowlist staging + 5 sibling correctness fixes in the resync pipeline (#9141)
+- **Issue #9477** (closed): telemetry: the collector's sweep.outcome wins the INSERT OR IGNORE race, so config/runtime/LOC/timeline fields are absent on ~87% of records
+- **PR #9671**: fix(telemetry): let the reaper's rich sweep.outcome win the ingest race
+- **Issue #9331** (closed): Guard: rm-scope fast paths miss `NAME+=` / `NAME[0]=` / `mapfile` / `IFS= read` rebindings (fail-open past the catastrophic floor)
+- **PR #9668**: fix(guard): poison the full bash rebinding set in the rm-scope fast paths (#9331)
+- **Issue #9201** (closed): ci-telemetry: drive capture from workflow_run/workflow_job webhooks (forge_events feed); demote the repo sweep to a slow correction floor
+- **PR #9666**: feat(worktree): port the local-branch reuse arm to `loom-daemon worktree-branch-reuse` (#8195 slice 14)
+- **PR #9661**: daemon: forge check-claim aggregated pre-flight claim-CAS probe (#9453 phase 1)
+- **PR #9658**: feat(worktree): port the base-ref preparation to `loom-daemon worktree-base` (#8195 slice 13)
+- **Issue #9613** (closed): resync-installed.sh stamps an `unknown` version when the source path has no package.json or git history
+- **Issue #9550** (closed): resync-installed.sh --output stages at the primary checkout's HEAD, not the invoking worktree's
+- **Issue #9345** (closed): land-resync-commit.sh allowlist missing .agents/skills/* and .gitignore — refuses to land resync-installed.sh's own normal output
+- **Issue #9178** (closed): resync: local-fix guard blocks files never edited — 'last change was not a resync' is permanently true for anything untouched since install
+- **Issue #9174** (closed): resync: stamp loom_commit as a full SHA — abbreviated SHAs differ per host, so install-metadata.json never converges
+- **Issue #9025** (closed): test issue creation probe
+- **Issue #9486** (closed): fix(telemetry): collector-path sweep.outcome sets totals but omits tokens_unattributed (#9443 invariant)
+- **Issue #9476** (closed): telemetry: two paths emit sweep.outcome per sweep and INSERT OR IGNORE keeps the impoverished one
+- **PR #9660**: ci_telemetry: feed-driven single-run capture, sweep as correction floor (#9201)
+- **PR #9656**: feat(merge-pr): port the persistent-404 streak classification to Rust (#8191 slice)
+- **PR #9659**: lease: admit runtime-neutral agent sessions to hand-claim lease publication (#9453 phase 2)
+- **Issue #9655** (closed): classify-dependency-block premise-false shell suite fails 0/8 on main (exit 2, empty output) — surfaced by #9653 CI
+- **Issue #9645** (closed): CI: Native Port Suites failing on main — test-classify-dependency-block-premise-false.sh (8/8 fail, exit 2)
+- **Issue #9647** (closed): Parity: vectors.json copy + span-kind allowlist need story.doctor (2am#1726; successor of #9223)
+- **PR #9653**: parity(storyid): story.doctor joins the D32 v1 kind allowlist and vectors (#9647)
+- **Issue #9649** (closed): story-points: adopt the experiment's validated v6 class definitions into the production rubric
+- **PR #9654**: docs(story-points): adopt the experiment's validated v6 class definitions (#9649)
+- **Issue #9651** (closed): test: premise-false interaction suite's gh stub predates #9548's REST trusted-comments path — 0/8 on main
+- **PR #9652**: test: serve #9548's REST trusted-comments path in the premise-false suite's gh stub (#9651)
+- **Issue #9588** (closed): drain: an operator drain that times out must stay paused, not silently resume dispatch
+- **Issue #9521** (closed): story-points: run SP1-SP4 against D1 and confirm the provisional rubric bounds (follow-up to #9430)
+- **PR #9648**: docs(story-points): run SP1-SP4 against the D1 snapshot; record what confirmed (#9521)
+- **PR #9640**: drain: operator drains hold on timeout, escalate in place, and record a durable stop (#9588)
+- **Issue #9017** (closed): Queue snapshot: name the workspace_halted hold cause (red main, gate, token pool, drain, breaker)
+- **PR #9267**: feat(queue): name the workspace_halted hold cause (#9017)
+- **Issue #9586** (closed): gateway keep_keys strips attributes the sweep-facts extraction reads (silent NULL columns)
+- **PR #9644**: fix(telemetry): export and admit the sweep-facts extraction keys (#9586)
+- **Issue #9638** (closed): story-points: re-estimate points on every backlog recontemplation — Curator re-curation must re-pick the points label
+- **PR #9639**: story-points: re-pick the points label on re-curation passes (#9638)
+- **Issue #9631** (closed): main regression: lease_co_occupancy.rs (#9543) reads markers without comment trust — #9593 coverage test fails
+- **PR #9637**: lease co-occupancy: read leases/yields through TrustPolicy (#9631)
+- **Issue #9592** (closed): state: guard that every daemon-written .loom/state/ path is gitignored (the class behind #9544)
+- **PR #9628**: gitignore: ignore .loom/state/* wholesale, guarded by a test (#9592)
+- **Issue #9546** (closed): gateway keep_keys strips loom.story_points on main: emitted by daemon, dropped in transit (#9432 follow-up)
+- **Issue #9620** (closed): main regression: worktree_existing_differential stale_level diverges (port vs retired shell) after #9455/#9543/#9484 batch merges
+- **PR #9632**: fix(worktree-existing): port's own fetch spawned a detached maintenance child its reset probe refused on (#9620)
+- **Issue #9590** (closed): champion: replace one-re-date-then-escalate with a bounded re-date budget
+- **PR #9629**: merge-pr: bounded re-date budget with backoff for the #8248 guard (#9590)
+- **Issue #9605** (closed): quarantine: escalate relapsed quarantines — probation + doubling TTL (rebuild of #8440, scope-limited)
+- **PR #9627**: fix(loom-daemon): escalate relapsed quarantines — probation + doubling TTL (#9605)
+- **Issue #9589** (closed): stale-checks: consumer repos' unspecced required contexts go stale on ANY base move — add per-repo input scopes or a conservative fallback
+- **PR #9626**: stale-checks: per-repo input declarations for unspecced required contexts (#9589)
+- **Issue #9572** (closed): daemon: Issue dispatch_sweep takes 30–70s — ~20 serial gh calls under the registry mutex on a tokio worker; retry not idempotent
+- **PR #9623**: perf(daemon): cache resolve_owner_repo and dedup in-flight idempotency retries
+- **Issue #9608** (closed): ci: on main, keep one running + newest pending CI run (concurrency, cancel-in-progress: false); amend rule 2
+- **PR #9619**: ci: on main, keep one running + newest pending CI run; amend rule 2
+- **PR #9612**: security: trust-filter the shell and role-prompt marker readers; frame forge text (#9548)
+- **PR #9600**: feat(fleet-config): read an operator's fleet state store
+- **Issue #9630** (closed): ci: check-pipefail-early-exit regression in test-merge-pr-worktree-path.sh blocks every PR (Structural Checks fail)
+- **PR #9633**: test(merge-pr): drop pipefail-unsafe pipe from Test 8b worktree check (#9630)
+- **Issue #9591** (closed): work_finder: 'main-health gate halted dispatch for N of N repos' fires during every drain — attribute the hold to its real cause
+- **PR #9624**: work_finder: attribute the dispatch-halted log line to its real cause (#9591)
+- **Issue #9625** (closed): fix(merge-pr): worktree-contains fail-open must decline the --worktree-path cleanup, not wave it through (PR #9602 carry-over)
+- **PR #9604**: docs(guard): record the all-literal for-loop rm list as denied on a measurement (#9304)
+- **Issue #9610** (closed): check-vendored-private-refs red on main: example host matrix.org in mail-send.md (#9594)
+- **PR #9621**: mail-send.md: replace matrix.org example host with example.org
+- **PR #9602**: feat(merge-pr): port --worktree-path's registered-worktree check to Rust (#8191 slice)
+- **Issue #9606** (closed): merge-pr.sh: remove dead closing-ref/fenced-block helpers to free contract shell budget (unblocks #8314)
+- **PR #9607**: merge-pr.sh: remove dead closing-ref/fenced-block helpers (-18 contract lines)
+- **Issue #9585** (closed): clippy -D warnings fails on macOS: field_reassign_with_default in host_pressure::sample_macos
+- **PR #9603**: fix(host_pressure): clear macOS-only clippy field_reassign_with_default
+- **Issue #9434** (closed): [Epic #9429] story-points: estimate-vs-actual calibration loop
+- **PR #9595**: story-points: estimate-vs-actual calibration loop (#9434)
+- **PR #9543**: fix(lease): yield to same-host peers on one issue; guard dirty shared worktrees (kicad-tools#5783)
+- **PR #9593**: security: route the High-severity Rust marker readers through comment trust (#9548)
+- **Issue #9583** (closed): feat(skills): mail-send — loom-ui inbox + Matrix room as one atomic, attributed send
+- **PR #9594**: feat(commands): add mail-send — one atomic loom-ui + Matrix send to the operator
+- **PR #9455**: feat(worktree): port the "worktree dir already exists" arm to `loom-daemon worktree-existing` (#8195 slice 12)
+- **PR #9587**: fix(telemetry): admit loom.story_points through the gateway keep_keys
+- **Issue #9576** (closed): verdict-staleness-guard.sh drops Judge verdicts on tree-identical re-date commits — the daemon path's #9124 tree-unchanged exemption was never ported
+- **PR #9581**: fix: share the tree-identical test between both verdict-invalidation paths
+- **Issue #8918** (closed): stale-verdict guard: keep loom:pr when a push is tree-identical to the approved head? (operator decision, split from #8914)
+- **Issue #9580** (closed): merge freshness: Daemon Checks treats all of loom-daemon/** as a global input — every daemon merge stales every open PR (livelock root cause)
+- **Issue #9198** (closed): config: enable the CI telemetry poller (owners 2amlogic + rjwalters) and declare fleet.captain = loom-worker-1
+- **Issue #9111** (closed): worktree.sh --json: the "preserve existing work" path exits 0 with empty stdout, emitting no JSON document
+- **PR #9484**: fix(worktree): emit JSON on preserve/stale-reset exit-0 paths under --json
+- **Issue #9085** (closed): CI: add a slow, thorough daily run to backstop the fast per-commit gate
+- **PR #9381**: ci: add a slow, thorough daily run to backstop the fast per-commit gate
+- **Issue #9096** (closed): Champion: a killed merge-pr.sh --auto call leaves no forge-visible outcome (follow-up to #9091 item 2)
+- **PR #9396**: docs(champion): pin the merge settle budget under the caller's timeout and report a killed merge
+- **PR #9276**: feat(merge-pr): port the worktree remove-vs-preserve decision to Rust (#8191 slice)
+- **Issue #8589** (closed): Public-surface scrub: fleet EC2 private hostnames in WORK_LOG.md + a Rust doc comment, and operator-domain emails in test fixtures, are live at HEAD
+- **PR #8613**: chore: scrub private host identifiers and operator identities from HEAD
+- **PR #9506**: feat(telemetry): first writer for the rework-event marker protocol (#9444)
+- **Issue #9287** (closed): install/upgrade never verifies the repo's merge configuration — a ruleset can make merge-pr.sh structurally unable to merge, silently
+- **PR #9386**: feat: check-merge-config advisory — report a merge config merge-pr.sh cannot use (#9287)
+- **Issue #9517** (closed): Port fleet-send.sh to a loom-daemon subcommand (epic #7810)
+- **PR #9519**: feat(daemon): port fleet-send.sh to `loom-daemon fleet-send` on the canonical safehouse wire builder (#9517)
+- **Issue #9089** (closed): ci-telemetry: step spans, per-job queue wait, and shard/suite/test spans so CI sharding is observable in SigNoz
+- **PR #9457**: feat(ci-telemetry): per-job dependency wait, the segment before the runner queue (#9089)
+- **Issue #9043** (closed): Decide whether worktree.sh's stale-reset liveness veto should use the widened (#7466) any-open-fd signal
+- **PR #9271**: docs(worktree-safety): decide the cwd-only-vs-any-open-fd tradeoff for the stale-worktree reset veto (#9043)
+- **Issue #9325** (closed): ETA phase 2: backfill + leak-free backtest harness (eta backfill, eta backtest)
+- **PR #9578**: feat(eta): eta backfill + leak-free eta backtest harness (#9325)
 - **PR #9544**: fix(gitignore): stop tracking the daemon's per-host ETA ledger (.loom/state/eta/)
 - **PR #9155**: chore(deps): bump sigstore/cosign-installer from 3.9.1 to 4.1.2
 - **PR #9307**: chore(deps): bump the all-dependencies group across 1 directory with 3 updates

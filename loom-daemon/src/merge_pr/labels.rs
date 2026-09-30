@@ -41,6 +41,23 @@
 //! Nothing here changed, and nothing here should: the contradiction is
 //! resolved by the label set moving, which is what this guard reads.
 //!
+//! # Why `loom:sequenced` is in the list (#9378)
+//!
+//! `.github/labels.yml` defines it as "approved, but sequenced behind another
+//! PR — mechanically cleared when the recorded predecessor lands". It is the
+//! missing *durable ordering hold*: not an escalation (`loom:operator` means a
+//! human must rule; a landing order does not), and not `loom:blocked` (an
+//! issue-status label the merge script has never read). A PR approved by
+//! Judge AND sequenced behind an unlanded predecessor is exactly the state
+//! that merged #112 before #111 in the incident that filed #9378 — correct by
+//! every per-PR check, wrong for the pair. The condition it waits on lives in
+//! a trusted `<!-- loom:sequence … -->` marker on the PR
+//! ([`super::sequence`]); the LABEL is the gate so every merge path refuses
+//! with no live forge reads, and the separate `merge-pr sequence-eval`
+//! evaluation is what moves the label when the condition is met. Human path
+//! out: the predecessor lands and the pass (or an agent running the verb)
+//! clears the label — a recorded condition, not a flag.
+//!
 //! # There is deliberately no override flag
 //!
 //! `--allow-unapproved` bypasses the *missing*-`loom:pr` guard. This one is
@@ -63,6 +80,7 @@ pub const BLOCKING: &[&str] = &[
     "loom:changes-requested",
     "loom:blocked",
     "loom:operator",
+    "loom:sequenced",
     "loom:review-requested",
 ];
 

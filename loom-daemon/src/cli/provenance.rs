@@ -32,6 +32,9 @@ pub(crate) enum ProvenanceCommand {
         /// Sweep id; defaults to `$LOOM_SWEEP_ID`, else `unknown`.
         #[arg(long)]
         sweep: Option<String>,
+        /// Explicit work origin; otherwise LOOM_WORK_ORIGIN, then unknown.
+        #[arg(long, value_enum)]
+        origin: Option<provenance::origin::WorkOrigin>,
         /// Ref the branch forked from (default `origin/HEAD`, then `origin/main`).
         #[arg(long)]
         base_ref: Option<String>,
@@ -58,6 +61,7 @@ impl ProvenanceCommand {
                 body_file,
                 sweep,
                 base_ref,
+                origin,
                 repo_root,
             } => {
                 let body = match body_file {
@@ -74,6 +78,7 @@ impl ProvenanceCommand {
                     body: body.as_deref(),
                     sweep: sweep.as_deref(),
                     base_ref: base_ref.as_deref(),
+                    origin,
                 };
                 println!("{}", marker::collect(&repo_root, &inputs).render());
             }

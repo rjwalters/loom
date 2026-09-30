@@ -12,15 +12,16 @@
 //! ```
 //!
 //! `running` dispatches normally, `paused` keeps the daemon up without new
-//! dispatch, `stopped` means the daemon is meant to be down. This module only
-//! reads and reports it; nothing enforces it yet.
+//! dispatch, `stopped` means the daemon is meant to be down. This module reads
+//! and reports it; [`crate::fleet_state`] is what *enforces* it on a live host
+//! (#9598).
 
 use anyhow::{anyhow, bail, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A desired run state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RunState {
     /// Dispatching normally.
@@ -32,7 +33,9 @@ pub enum RunState {
 }
 
 impl RunState {
-    fn parse(s: &str) -> Option<Self> {
+    /// Parse `running`, `paused` or `stopped`; `None` for anything else.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "running" => Some(Self::Running),
             "paused" => Some(Self::Paused),
@@ -53,6 +56,9 @@ impl RunState {
 }
 
 /// A host's resolved desired state and where it came from.
+///
+/// `Serialize`-only by design (`source` is a `&'static str`): the persisted
+/// forms live in [`crate::fleet_state::StatePass`], which owns its strings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HostState {
     /// The host.
