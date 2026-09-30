@@ -234,6 +234,16 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // Same never-commit reasoning as `ci-telemetry/` just above — one host's
     // arm timestamps are meaningless, and actively misleading, on another.
     ".loom/state/fleet-captain/",
+    // Per-host pending-ETA ledger (`observability/eta.rs` `pending_path()`):
+    // `.loom/state/eta/pending.jsonl` holds the estimates THIS daemon has
+    // issued and not yet resolved. Committing it hands one host's pending set
+    // to another. Not hypothetical: loom `101aa8f66` ("chore: resync installed
+    // Loom surfaces") committed it from a Mac whose daemon workspace is the
+    // loom checkout itself; the file then re-dirtied constantly, fleet-resync
+    // refused to fast-forward that dirty Loom source clone, and resyncs from
+    // it were refused as DOWNGRADE fleet-wide on those hosts. Scoped to
+    // `eta/` for the same sibling-file reason as `ci-telemetry/` above.
+    ".loom/state/eta/",
     // Concierge budget ledger (#7947): the per-day turn / per-tick relay
     // counters the operator-agent persona consults at the top of every turn.
     // Machine-local and disposable — deleting it costs at most one day's spent
@@ -1087,6 +1097,9 @@ mod tests {
             ".loom/status/",
             ".loom/retry-state/",
             ".loom/sweep-checkpoint/",
+            // Per-host pending-ETA ledger; committed once by a resync
+            // (101aa8f66), which wedged the Macs' Loom source clone.
+            ".loom/state/eta/",
             // #7947: the concierge budget ledger. Committing it would hand one
             // host's spent turn budget to every other host as a starting
             // balance.

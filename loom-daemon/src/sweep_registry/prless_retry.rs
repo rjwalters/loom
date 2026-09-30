@@ -57,6 +57,54 @@
 //!    takes it from there, and the hold is released the way every other
 //!    `loom:blocked` park is — by a human or a Doctor who fixed the cause.
 //!
+//! # The tally is fleet-wide, not per-host (Issue #9292)
+//!
+//! Steps 2–4 all read **one** number: how many consecutive claims of this issue
+//! ended without a pull request. Until #9292 that number lived in a single
+//! process's `HashMap`, so each dispatch host counted only the attempts *it*
+//! made — the #7477 gap, one mechanism later. A four-host fleet therefore spent
+//! up to `4 × threshold` claim/release cycles before any one host's private
+//! integer reached the threshold, and posted up to four near-identical attempt
+//! notes on the way there. `rjwalters/loom#8812`, 2026-09-24: nine cycles at
+//! ~90 s apart, four `Attempt 2 of 3` notes (one per host), one hold.
+//!
+//! So each recorded release is now broadcast over the peer-claim room's brake
+//! lane ([`crate::peer_claims::ClaimKind::PrlessReleaseArmed`]) carrying this
+//! host's own running count, and the threshold is compared against the **sum**:
+//! local count + every peer's live broadcast count. The attempt note is posted
+//! when that sum first reaches 2 — once per streak per *issue*, wherever in the
+//! fleet it lands — instead of once per streak per host.
+//!
+//! Every part of this is fail-open in the same direction as the rest of the
+//! module. No peer coordination (`safehouse.enabled` false), a dropped ad, a
+//! pre-#9292 peer, or a poisoned view all reduce the peer term to what could be
+//! read, leaving this host's own exact tally behind — which is the pre-#9292
+//! behaviour.
+//!
+//! A peer's contribution lapses on [`crate::peer_claims::PEER_PRLESS_STREAK_TTL`]
+//! — the fleet-wide form of the local streak-cold rule, so a crashed host stops
+//! contributing rather than pinning an issue one release short of a hold
+//! forever. That clock is deliberately **not** the broadcast backoff window
+//! (which suppresses dispatch and is capped by
+//! [`crate::peer_claims::MAX_PEER_PRLESS_RELEASE_TTL`]): the window's whole
+//! purpose is to elapse before the next claim, so a tally keyed to it would be
+//! empty every time the fleet's next release landed, and the sum could never
+//! grow past one. A streak is a longer-lived thing than a backoff and gets the
+//! longer clock.
+//!
+//! The lane is **arm-only**, mirroring #7477's cooldown lane rather than #8001's
+//! arm/clear pool lane: there is no "my streak was cleared" ad. A clear happens
+//! on positive evidence the loop broke (an open PR, an observed merge, a
+//! self-reported no-op), and the first two of those are public forge state every
+//! host reads for itself. The residual — a peer's hour-long entry still counting
+//! releases that a later open PR retroactively excused — is caught where it
+//! would matter, immediately before the label write: `apply_prless_hold_label`
+//! spends one closes-graph query and returns
+//! [`PrlessHoldOutcome::VetoedOpenPr`], so the worst case is a vetoed hold
+//! attempt rather than a park on a false premise. Paying for a clear ad to
+//! shorten a window that is already guarded, and self-heals within the hour, is
+//! not worth a second wire kind.
+//!
 //! # The label write is the hold (Issue #9239)
 //!
 //! Step 4 has one deliverable and it is not the comment. `loom:blocked` is what
@@ -118,6 +166,11 @@ use super::*;
 mod hold;
 #[allow(unused_imports)]
 pub use hold::*;
+
+/// The multi-host half of this module's coverage (Issue #9292) — see its own
+/// header. A sibling file because the fleet harness is most of its bulk.
+#[cfg(test)]
+mod fleet_tests;
 
 /// Env var toggling the PR-less retry bound (Issue #7972). `0`/`false`/`no`/
 /// `off` disables; `1`/`true`/`yes`/`on` forces on. Overrides config. Defaults
@@ -214,6 +267,17 @@ pub(crate) struct PrlessRetryState {
     pub(crate) consecutive: u32,
     /// Whether the threshold has been reached and the forge hold applied.
     pub(crate) held: bool,
+    /// The **fleet-wide** total at the moment this release was recorded
+    /// (Issue #9292): [`Self::consecutive`] plus every peer host's live
+    /// broadcast tally for the same issue. This — not `consecutive` — is what
+    /// the threshold, the backoff ladder step, and the attempt note are
+    /// computed from, so four dispatch hosts spend `threshold` claims between
+    /// them rather than `threshold` claims each.
+    ///
+    /// Equal to `consecutive` on a fleet of one, and whenever peer-claim
+    /// coordination is not wired up (`safehouse.enabled` false) — which is
+    /// what makes the single-host path byte-for-byte pre-#9292.
+    pub(crate) fleet_consecutive: u32,
     /// The failure context supplied by the recording caller — logged verbatim
     /// and posted to the issue, so the next claimer sees it.
     pub(crate) reason: String,
@@ -545,6 +609,18 @@ impl SweepRegistry {
     /// mirroring [`Self::record_dispatch_failure`]'s own staleness rule: a
     /// failure a day ago and a failure now are not a pattern.
     ///
+    /// # Fleet-wide as of Issue #9292
+    ///
+    /// The threshold, the ladder step, and the attempt note are computed from
+    /// the **fleet** total — this host's own consecutive count plus every peer
+    /// host's live broadcast tally for the same issue — and the release is
+    /// re-broadcast so peers can do the same. Before #9292 each host counted
+    /// only its own releases, so a four-host fleet spent up to
+    /// `4 × threshold` claim/release cycles, and posted up to four
+    /// near-identical attempt notes, before any one host reached the
+    /// threshold. On a single host, or with peer coordination disabled, the
+    /// fleet total is exactly the local count and this path is unchanged.
+    ///
     /// A no-op when the mechanism is disabled, mirroring
     /// [`Self::record_noop_release`]'s disabled-path contract.
     pub(crate) fn record_prless_release(&mut self, issue: u32, reason: &str) {
@@ -560,7 +636,13 @@ impl SweepRegistry {
             }
             _ => 1,
         };
-        let held = consecutive >= cfg.threshold;
+        // #9292: the peer term. Each peer reports only its OWN running total
+        // and this host's own ad is never folded back into its view, so the
+        // sum is disjoint from `consecutive` above. Zero without peer
+        // coordination, which is what keeps the single-host path identical.
+        let peers = self.peer_prless_release_count(issue);
+        let fleet_consecutive = consecutive.saturating_add(peers);
+        let held = fleet_consecutive >= cfg.threshold;
         // A hold's in-memory half rides the ceiling rather than the ladder:
         // past the threshold the ladder has nothing left to say, and the
         // durable half of the hold is the `loom:blocked` label the work
@@ -568,7 +650,7 @@ impl SweepRegistry {
         let delay = if held {
             cfg.max_backoff
         } else {
-            backoff_delay(consecutive, cfg.backoff, cfg.max_backoff)
+            backoff_delay(fleet_consecutive, cfg.backoff, cfg.max_backoff)
         };
         let until =
             now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero());
@@ -578,15 +660,25 @@ impl SweepRegistry {
                 recorded_at: now,
                 until,
                 consecutive,
+                fleet_consecutive,
                 held,
                 reason: reason.to_string(),
             },
         );
+        // Broadcast BEFORE the hold/comment branch below, so a peer that is
+        // classifying the same issue concurrently sees this release even if
+        // the forge work that follows is slow or wedged. Fail-open: a dropped
+        // ad costs at most one extra spaced-out dispatch somewhere in the
+        // fleet, never correctness — the local tally above is already exact.
+        self.publish_peer_prless_release_claim(issue, consecutive, delay);
+        self.warn_if_prless_tally_is_host_local(issue, consecutive);
         if held {
             log::warn!(
-                "sweep_registry: issue #{issue} has now been claimed and released {consecutive} \
-                 times in a row without producing a pull request — holding it with `loom:blocked` \
-                 instead of re-claiming it again (#7972). Last failure: {reason}"
+                "sweep_registry: issue #{issue} has now been claimed and released \
+                 {fleet_consecutive} times in a row fleet-wide ({consecutive} on this host, \
+                 {peers} broadcast by peers) without producing a pull request — holding it with \
+                 `loom:blocked` instead of re-claiming it again (#7972, #9292). Last failure: \
+                 {reason}"
             );
             // The re-verification inside can veto the hold. An OPEN PR is
             // positive evidence this was never a PR-less loop at all, so drop
@@ -594,7 +686,7 @@ impl SweepRegistry {
             // keep the issue out of dispatch on a false premise. The other two
             // vetoes (already-closed, hermetic fixture) leave the record
             // standing — neither contradicts the tally.
-            match self.apply_prless_hold_label(issue, consecutive, reason) {
+            match self.apply_prless_hold_label(issue, fleet_consecutive, reason) {
                 PrlessHoldOutcome::VetoedOpenPr => {
                     self.clear_prless_retry(issue);
                 }
@@ -616,18 +708,29 @@ impl SweepRegistry {
             }
         } else {
             log::warn!(
-                "sweep_registry: issue #{issue} released without a pull request ({consecutive}/{} \
-                 consecutive) — next dispatch allowed in {}s (#7972). Failure: {reason}",
+                "sweep_registry: issue #{issue} released without a pull request \
+                 ({fleet_consecutive}/{} consecutive fleet-wide; {consecutive} on this host) — \
+                 next dispatch allowed in {}s (#7972, #9292). Failure: {reason}",
                 cfg.threshold,
                 delay.as_secs()
             );
             // The first PR-less release is plausibly a one-off; a REPEAT is the
-            // thing the next claimer needs to know about, and commenting from
-            // the second onward keeps the comment count bounded by the
-            // threshold (2 per streak on default config) rather than by the
-            // length of the loop.
-            if consecutive >= 2 {
-                self.post_prless_attempt_comment(issue, consecutive, cfg.threshold, reason);
+            // thing the next claimer needs to know about.
+            //
+            // #9292: exactly `== 2`, and on the FLEET total rather than this
+            // host's own. The old `consecutive >= 2` posted once per
+            // sub-threshold release per host — four hosts × a threshold of 3
+            // meant four near-identical "Attempt 2 of 3" notes on a single
+            // issue (`rjwalters/loom#8812`), and a threshold of 5 would have
+            // meant three notes per host. Because the fleet total is strictly
+            // increasing across the streak, `== 2` is reached exactly once,
+            // wherever in the fleet the second release happens to land: one
+            // note per streak per ISSUE. (Two hosts recording simultaneously,
+            // neither having yet seen the other's ad, can still both compute
+            // 2 — the residual is bounded at one duplicate per race, against
+            // the four-per-streak floor this replaces.)
+            if fleet_consecutive == 2 {
+                self.post_prless_attempt_comment(issue, fleet_consecutive, cfg.threshold, reason);
             }
         }
     }
@@ -663,12 +766,145 @@ impl SweepRegistry {
         remaining.to_std().ok().filter(|d| !d.is_zero())
     }
 
+    /// Absolute PR-less-retry expiry for `issue` at `now` (Issue #9311), or
+    /// `None` when it may be dispatched immediately. Mirrors
+    /// [`Self::prless_retry_remaining`] but returns the instant itself rather
+    /// than the duration until it.
+    #[must_use]
+    pub fn prless_retry_until(&self, issue: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.prless_retry_config.enabled {
+            return None;
+        }
+        let state = self.prless_retry.get(&issue)?;
+        (state.until > now).then_some(state.until)
+    }
+
     /// Consecutive PR-less releases recorded for `issue` (Issue #7972). `0` when
     /// none is on record. Test/inspection helper, mirroring
     /// [`Self::noop_release_count`].
     #[must_use]
     pub fn prless_release_count(&self, issue: u32) -> u32 {
         self.prless_retry.get(&issue).map_or(0, |s| s.consecutive)
+    }
+
+    /// The **fleet-wide** consecutive PR-less release total recorded for
+    /// `issue` at its most recent release (Issue #9292) — this host's own
+    /// count plus the peer tallies live at that moment. `0` when none is on
+    /// record, and always equal to [`Self::prless_release_count`] on a single
+    /// host or with peer coordination disabled.
+    ///
+    /// This, not [`Self::prless_release_count`], is the number compared
+    /// against [`PrlessRetryConfig::threshold`].
+    #[must_use]
+    pub fn prless_fleet_release_count(&self, issue: u32) -> u32 {
+        self.prless_retry
+            .get(&issue)
+            .map_or(0, |s| s.fleet_consecutive)
+    }
+
+    /// The sum of every **peer** host's live broadcast PR-less-release tally
+    /// for `issue` (Issue #9292). `0` whenever peer-claim coordination is not
+    /// wired up (`safehouse.enabled` false), which is what degrades this host
+    /// byte-for-byte to the pre-#9292 per-host tally — mirroring
+    /// [`Self::fleet_noop_cooldown_issues`]'s disabled-state contract.
+    #[must_use]
+    fn peer_prless_release_count(&self, issue: u32) -> u32 {
+        let Some(view) = &self.peer_claims else {
+            return 0;
+        };
+        let repo = peer_claims::repo_slug(&self.config.workspace_root);
+        let now = Instant::now();
+        match view.lock() {
+            Ok(v) => v.prless_peer_release_count_at(&repo, issue, now),
+            Err(poisoned) => {
+                log::error!("sweep_registry: peer-claim view mutex poisoned ({poisoned:?})");
+                // Fail-open to the local tally: a poisoned view must not be
+                // able to manufacture a hold OUT of a count nobody can read,
+                // and must not stall the streak either.
+                poisoned
+                    .into_inner()
+                    .prless_peer_release_count_at(&repo, issue, now)
+            }
+        }
+    }
+
+    /// Issues with a live peer-broadcast PR-less-release window (Issue #9292)
+    /// — the fleet-wide half of the sub-threshold backoff
+    /// [`Self::prless_retry_issues`]'s doc comment used to defer. Empty
+    /// without a peer-claim view, mirroring
+    /// [`Self::fleet_noop_cooldown_issues`].
+    #[must_use]
+    fn fleet_prless_retry_issues(&self) -> HashSet<u32> {
+        let Some(view) = &self.peer_claims else {
+            return HashSet::new();
+        };
+        let repo = peer_claims::repo_slug(&self.config.workspace_root);
+        match view.lock() {
+            Ok(v) => v.prless_release_issues_at(&repo, Instant::now()),
+            Err(poisoned) => {
+                log::error!("sweep_registry: peer-claim view mutex poisoned ({poisoned:?})");
+                HashSet::new()
+            }
+        }
+    }
+
+    /// Broadcast one PR-less release fleet-wide (Issue #9292) — the
+    /// [`Self::publish_peer_cooldown_claim`] sibling for
+    /// [`peer_claims::ClaimKind::PrlessReleaseArmed`], which needs a parameter
+    /// that method's signature has no room for: `consecutive`, **this host's
+    /// own** running tally.
+    ///
+    /// Same outbound channel and fail-open contract as every other lane: a
+    /// no-op without a publisher (`safehouse.enabled` false), and a full or
+    /// closed channel drops the ad without blocking the reaper. One-shot per
+    /// recorded release rather than re-advertised — each further release
+    /// naturally re-broadcasts a higher count and refreshes every peer's local
+    /// expiry, exactly mirroring the local re-arm.
+    pub(crate) fn publish_peer_prless_release_claim(
+        &self,
+        issue: u32,
+        consecutive: u32,
+        remaining: Duration,
+    ) {
+        let Some(tx) = &self.peer_claim_publisher else {
+            return;
+        };
+        let ad = ClaimAd::prless_release_armed(
+            issue,
+            peer_claims::repo_slug(&self.config.workspace_root),
+            host_identity(),
+            std::process::id(),
+            Utc::now().to_rfc3339(),
+            consecutive,
+            remaining.as_secs(),
+        );
+        if let Err(e) = tx.try_send(ad) {
+            log::debug!(
+                "sweep_registry: PR-less release advertisement for issue #{issue} dropped ({e}); \
+                 this host's own tally and window unaffected (#9292)"
+            );
+        }
+    }
+
+    /// Say out loud, at the moment it matters, that this host's PR-less tally
+    /// is **not** fleet-wide (Issue #9292) — the `record_noop_release`
+    /// HOST-LOCAL line #8912 added, for the same reason and in the same words.
+    ///
+    /// Without a peer-claim publisher (`safehouse.enabled` false on this host)
+    /// the broadcast above is a byte-for-byte no-op, the peer term is always
+    /// zero, and the fleet is back to spending `hosts × threshold` claims. The
+    /// degradation is otherwise invisible: nothing else in the log
+    /// distinguishes "third claim fleet-wide" from "third claim on this host".
+    fn warn_if_prless_tally_is_host_local(&self, issue: u32, consecutive: u32) {
+        if self.peer_claim_publisher.is_some() {
+            return;
+        }
+        log::info!(
+            "sweep_registry: issue #{issue}'s PR-less retry tally is HOST-LOCAL only \
+             ({consecutive} on this host) — no peer-claim publisher is attached (safehouse peer \
+             coordination disabled), so each dispatch host counts its own claims and the fleet \
+             spends up to hosts × threshold of them before any hold (#9292)"
+        );
     }
 
     /// Whether `issue` reached the threshold and was held (Issue #7972).
@@ -688,22 +924,29 @@ impl SweepRegistry {
     /// the set the work finder skips *before* the capacity gate, mirroring
     /// [`Self::noop_cooldown_issues`] / [`Self::decline_cooldown_issues`].
     ///
-    /// Not unioned with a peer-observed view (unlike `noop_cooldown_issues`,
-    /// #7477): once an issue is held, `loom:blocked` is public forge state every
-    /// host reads for itself in its own candidate filter, and below the
-    /// threshold each host's own tally is the honest record of what *it*
-    /// dispatched. Fleet-wide broadcast of the sub-threshold window is left to a
-    /// follow-up rather than guessed at here.
+    /// Fleet-wide as of Issue #9292: unions this host's own local windows with
+    /// any live window a **peer** host has broadcast, exactly as
+    /// [`Self::noop_cooldown_issues`] has since #7477. This is the follow-up
+    /// the pre-#9292 version of this comment deferred — "once an issue is
+    /// held, `loom:blocked` is public forge state every host reads for itself
+    /// … fleet-wide broadcast of the sub-threshold window is left to a
+    /// follow-up rather than guessed at here". The measured cost of leaving it
+    /// deferred was that each host's private sub-threshold window spaced out
+    /// only its own re-claims, so the fleet as a whole kept re-claiming a
+    /// failing issue at roughly one host per window.
     #[must_use]
     pub fn prless_retry_issues(&self, now: DateTime<Utc>) -> HashSet<u32> {
         if !self.prless_retry_config.enabled {
             return HashSet::new();
         }
-        self.prless_retry
+        let mut set: HashSet<u32> = self
+            .prless_retry
             .iter()
             .filter(|(_, s)| s.until > now)
             .map(|(issue, _)| *issue)
-            .collect()
+            .collect();
+        set.extend(self.fleet_prless_retry_issues());
+        set
     }
 }
 
@@ -993,6 +1236,67 @@ mod tests {
             "a self-reported no-op is not a PR-less failure"
         );
         assert!(reg.noop_cooldown_remaining(6670, Utc::now()).is_some());
+    }
+
+    /// #9292: every recorded release is broadcast, carrying THIS host's own
+    /// running count (never a fleet total — see [`ClaimAd::consecutive`]) and
+    /// the window it just armed, on the brake lane the socket layer already
+    /// routes. The multi-host consequences are in [`super::fleet_tests`]; this
+    /// pins the wire shape one host puts on the room.
+    #[test]
+    fn a_recorded_release_broadcasts_this_hosts_own_count_and_window() {
+        let mut reg = test_registry();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        reg.set_peer_claim_publisher(tx);
+
+        reg.record_prless_release(8812, "first");
+        let ad = rx.try_recv().expect("the first release must be advertised");
+        assert_eq!(ad.kind, crate::peer_claims::ClaimKind::PrlessReleaseArmed);
+        assert_eq!(ad.issue, 8812);
+        assert_eq!(ad.consecutive, Some(1));
+        assert_eq!(ad.remaining_secs, Some(DEFAULT_PRLESS_RETRY_BACKOFF_SECS));
+        assert!(ad.kind.is_cooldown_lane(), "routed by the existing brake-lane predicate");
+
+        reg.record_prless_release(8812, "second");
+        let ad = rx
+            .try_recv()
+            .expect("each further release re-advertises a higher count");
+        assert_eq!(ad.consecutive, Some(2));
+        assert_eq!(ad.remaining_secs, Some(DEFAULT_PRLESS_RETRY_BACKOFF_SECS * 2));
+    }
+
+    /// A disabled mechanism publishes nothing — mirrors
+    /// `noop_cooldown`'s `disabled_mechanism_does_not_broadcast`. The #9292
+    /// broadcast must not become a way for a repo that opted out of the bound
+    /// to still push tallies at peers that did not.
+    #[test]
+    fn a_disabled_mechanism_does_not_broadcast() {
+        let mut reg = test_registry();
+        reg.set_prless_retry_config(PrlessRetryConfig {
+            enabled: false,
+            ..PrlessRetryConfig::default()
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        reg.set_peer_claim_publisher(tx);
+
+        reg.record_prless_release(8812, "boom");
+
+        assert!(rx.try_recv().is_err(), "a disabled mechanism must publish nothing");
+    }
+
+    /// With no peer view attached (`safehouse.enabled` false) the fleet count
+    /// IS the local count, so every single-host assertion above holds
+    /// unchanged — the #9292 acceptance criterion that the single-host case
+    /// must not regress, stated as an invariant rather than left implicit.
+    #[test]
+    fn without_a_peer_view_the_fleet_count_equals_the_local_count() {
+        let mut reg = test_registry();
+        for expected in 1..=3u32 {
+            reg.record_prless_release(7893, "no PR");
+            assert_eq!(reg.prless_release_count(7893), expected);
+            assert_eq!(reg.prless_fleet_release_count(7893), expected);
+        }
+        assert!(reg.prless_retry_held(7893));
     }
 
     /// #7972 regression requirement: this is a THIRD, distinct bound. An issue

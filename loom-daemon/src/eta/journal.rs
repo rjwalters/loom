@@ -138,6 +138,162 @@ impl JournalEntry {
     }
 }
 
+/// Every stage-sample row one PR's `pr-latency` history (Issue #8923)
+/// contributes for `eta backfill` (#9325): `review_wait` (PL1,
+/// `loom:review-requested` → the next verdict, with the verdict itself so the
+/// row also feeds [`StageSamples`]'s verdict-count branch probabilities),
+/// `doctor` (PL4, `loom:changes-requested` → the next push) and `merge_wait`
+/// (PL3, the `loom:pr` in force at merge → merge). Every `entered_at`/`left_at`
+/// pair is an exact forge label-event timestamp, so `resolution_sec` is `0`.
+///
+/// This is a day-one baseline, not a full source (#9325's own scope note): it
+/// has no way to tell whether a segment was already an in-sweep transition
+/// the `sweep.outcome` journal recorded, so every row is `in_sweep: false` and
+/// a PR driven end-to-end by `/loom:sweep` contributes to both journals.
+/// `land-v1` is the only shipped heuristic that reads this journal
+/// ([`SampleSource::StageJournal`]), so the exposure is bounded to it, and it
+/// mirrors the same local/partial-view caveat #9343 already documents for
+/// `sweep.outcome` history. A dedicated dedupe is future work.
+///
+/// # A label re-applied is not a stage re-entered
+///
+/// Concurrent agents routinely apply `loom:review-requested` twice seconds
+/// apart, and a bare labeling count would read that as two review waits that
+/// the same verdict answered — two near-duplicate rows that double-weight
+/// one real observation and inflate the attempt number the verdict branch
+/// probabilities are keyed on. [`entry_transitions`] counts *entries*
+/// instead: a labeling only starts a segment when the label is not already
+/// in force, where force is released by an `unlabeled` **or** by the event
+/// that ends the stage (the verdict for `review_wait`, the push for
+/// `doctor`). So a re-application is ignored while a genuine second lap
+/// still counts — which also means two segments can never resolve to the
+/// same verdict or push.
+#[must_use]
+pub fn entries_from_pr_history(
+    h: &crate::pr_latency::PrHistory,
+    repo: &str,
+    loom: &Provenance,
+) -> Vec<JournalEntry> {
+    use crate::pr_latency::history::PrEvent;
+    use crate::pr_latency::{APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED};
+
+    /// The first verdict labeling strictly after `after`, with which label
+    /// fired — `PrHistory::next_verdict_after` answers only the instant, and
+    /// backfill needs the label too to route to `doctor` or `merge_wait`.
+    fn next_verdict_label_after(
+        h: &crate::pr_latency::PrHistory,
+        after: DateTime<Utc>,
+    ) -> Option<(DateTime<Utc>, &'static str)> {
+        h.events
+            .iter()
+            .filter(|e| e.at() > after)
+            .find_map(|e| match e {
+                PrEvent::Labeled { label, at } if label == APPROVED => Some((*at, APPROVED)),
+                PrEvent::Labeled { label, at } if label == CHANGES_REQUESTED => {
+                    Some((*at, CHANGES_REQUESTED))
+                }
+                _ => None,
+            })
+    }
+
+    let mut rows = Vec::new();
+    let row_for = |stage: Stage, entered_at: DateTime<Utc>, left_at: DateTime<Utc>| {
+        let mut row = JournalEntry::new("label.transition", repo, left_at, loom);
+        row.pr_number = Some(h.number);
+        row.stage = Some(stage);
+        row.entered_at = Some(entered_at);
+        row.left_at = Some(left_at);
+        row.duration_sec = Some((left_at - entered_at).num_seconds().max(0));
+        row.resolution_sec = Some(0);
+        row
+    };
+
+    // PL1: each review *entry*, attempt-numbered in order, to the verdict
+    // that answered it. The verdict is also what releases the stage, so two
+    // entries can never share one: the next entry starts strictly after
+    // this one's verdict.
+    let verdict_clears = |e: &PrEvent| {
+        matches!(e, PrEvent::Labeled { label, .. }
+        if label == APPROVED || label == CHANGES_REQUESTED)
+    };
+    let mut attempt = 0_u32;
+    for req in entry_transitions(h, REVIEW_REQUESTED, &verdict_clears) {
+        let Some((verdict_at, label)) = next_verdict_label_after(h, req) else {
+            continue;
+        };
+        attempt += 1;
+        let mut row = row_for(Stage::ReviewWait, req, verdict_at);
+        row.next_stage = Some(if label == APPROVED {
+            Stage::MergeWait
+        } else {
+            Stage::Doctor
+        });
+        row.verdict = Some(if label == APPROVED { "pass" } else { "fail" }.to_string());
+        row.attempt = Some(attempt);
+        rows.push(row);
+    }
+
+    // PL4: each rejection entry, to the push that answered it. The push is
+    // what ends a Doctor lap, so — as above — two entries cannot share one.
+    let push_clears = |e: &PrEvent| matches!(e, PrEvent::Pushed { .. });
+    for rejected in entry_transitions(h, CHANGES_REQUESTED, &push_clears) {
+        let Some(push_at) = h.next_push_after(rejected) else {
+            continue;
+        };
+        let mut row = row_for(Stage::Doctor, rejected, push_at);
+        row.next_stage = Some(Stage::ReviewWait);
+        rows.push(row);
+    }
+
+    // PL3: the approval in force at merge, to the merge.
+    if let Some(merged_at) = h.merged_at {
+        if let Some(approved_at) = h.last_labeled_before(APPROVED, merged_at) {
+            let mut row = row_for(Stage::MergeWait, approved_at, merged_at);
+            row.event = "pr.resolved".to_string();
+            rows.push(row);
+        }
+    }
+
+    rows
+}
+
+/// Every instant `label` *entered* force on `h` — as opposed to
+/// [`crate::pr_latency::PrHistory::labelings`]'s raw applications.
+///
+/// A second `labeled` while the label is already in force is the fleet
+/// re-asserting a state, not re-entering it, and must not open a second
+/// segment. Force is released by an explicit `unlabeled` **or** by any
+/// event `clears` accepts — whatever actually ends the stage. That second
+/// release matters because the fleet does not reliably remove
+/// `loom:review-requested` when a verdict lands: without it a second review
+/// lap on the same PR would be invisible, and with it
+/// `verdict → re-request` reads as a new lap while `request → request`
+/// (nothing in between) does not.
+#[must_use]
+pub fn entry_transitions(
+    h: &crate::pr_latency::PrHistory,
+    label: &str,
+    clears: &dyn Fn(&crate::pr_latency::history::PrEvent) -> bool,
+) -> Vec<DateTime<Utc>> {
+    use crate::pr_latency::history::PrEvent;
+    let mut present = false;
+    let mut entries = Vec::new();
+    for e in &h.events {
+        match e {
+            PrEvent::Labeled { label: l, at } if l == label => {
+                if !present {
+                    entries.push(*at);
+                }
+                present = true;
+            }
+            PrEvent::Unlabeled { label: l, .. } if l == label => present = false,
+            other if clears(other) => present = false,
+            _ => {}
+        }
+    }
+    entries
+}
+
 /// The journal path for `workspace_root` (env override first).
 #[must_use]
 pub fn journal_path(workspace_root: &Path) -> PathBuf {
