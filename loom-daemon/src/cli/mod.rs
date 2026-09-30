@@ -59,6 +59,7 @@ mod merge_pr_reconcile;
 mod merge_pr_redate;
 mod merge_pr_refs;
 mod merge_pr_response;
+mod merge_pr_sequence;
 mod merge_pr_stacked_children;
 mod merge_pr_stale_checks;
 mod merge_pr_version_policy;

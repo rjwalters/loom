@@ -107,6 +107,31 @@ fn a_label_that_merely_contains_a_blocker_is_not_one() {
 }
 
 #[test]
+fn a_sequencing_hold_contradicts_an_approval_and_clears_by_label_removal() {
+    // #9378. `loom:sequenced` is the durable "approved, but not yet" hold:
+    // 1. while the predecessor is unlanded, the approved PR must not merge —
+    assert_eq!(contradiction("loom:pr\nloom:sequenced"), Some("loom:sequenced"));
+    // 2. the condition lives in a trusted `loom:sequence` marker evaluated by
+    //    `merge-pr sequence-eval`; clearing is REMOVING THE LABEL, which is
+    //    why this guard's label-set read is the whole gate;
+    assert_eq!(contradiction("loom:pr\ntier:goal-supporting"), None);
+    // 3. and it composes with every other blocker: a sequenced PR that ALSO
+    //    draws a real rejection still reports the rejection.
+    assert_eq!(
+        contradiction("loom:sequenced\nloom:pr\nloom:changes-requested"),
+        Some("loom:changes-requested")
+    );
+}
+
+#[test]
+fn a_sequencing_hold_without_an_approval_is_handled_upstream() {
+    // The label gates the "approved, but not yet" case. A sequenced PR that
+    // never earned `loom:pr` is refused by the missing-approval guard with
+    // its own message and override; this guard must not claim it.
+    assert_eq!(contradiction("loom:sequenced"), None);
+}
+
+#[test]
 fn surrounding_whitespace_does_not_hide_a_blocker() {
     assert_eq!(
         contradiction("  loom:pr  \n\tloom:blocked\t"),

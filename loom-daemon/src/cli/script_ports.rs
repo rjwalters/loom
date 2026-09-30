@@ -595,6 +595,17 @@ pub(crate) enum MergePrCommand {
     /// the comment stream could not be read at all.
     HoldState(super::merge_pr_hold_state::HoldStateArgs),
 
+    /// Evaluate one durable "approved, but not yet" sequencing hold against
+    /// live forge state (#9378): read the newest trusted `<!-- loom:sequence
+    /// … -->` marker on the PR, re-read the recorded predecessor, and print
+    /// one sentinel — CLEAR (predecessor merged at the recorded head),
+    /// DISSOLVED (closed unmerged), KEEP (waiting at the recorded head),
+    /// REPLAN (a pinned head moved), NONE (no marker). Exit 0 on any answer,
+    /// 2 on a failed read (never release on a failed read). The gate itself
+    /// is the `loom:sequenced` label in `verdict-contradiction`'s BLOCKING
+    /// set; this verb is what moves that label when the condition is met.
+    SequenceEval(super::merge_pr_sequence::SequenceEvalArgs),
+
     /// The async-close-race worktree-cleanup gate (#4186): whether a merged
     /// PR's issue is actually finished, so a partial-increment worktree the
     /// next Builder increment still needs is not removed out from under it.
@@ -765,6 +776,7 @@ impl MergePrCommand {
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::HoldState(args) => args.run(),
+            MergePrCommand::SequenceEval(args) => args.run(),
             MergePrCommand::IssueCloseGate(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
