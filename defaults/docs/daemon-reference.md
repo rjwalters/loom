@@ -1384,13 +1384,17 @@ config, and per-host run state. Hosts read it straight from the forge — the
 forge is the state store, and a fleet change lands as a reviewed commit to that
 repo. `loom-daemon fleet-config` is the reader. Nothing names a store by
 default: with `fleet.repo` unset the feature is off and the daemon behaves
-exactly as it always has. This version only runs **on command**; nothing
-fetches, renders or applies the store automatically.
+exactly as it always has. With it set, the daemon syncs from the store on its
+own — see [Automatic sync](#automatic-sync-startup--timer) — as well as
+answering the on-command verbs below.
 
 | Config key | Env override | Default | Meaning |
 |---|---|---|---|
 | `fleet.repo` | `LOOM_FLEET_REPO` | *(unset: feature off)* | The store, `OWNER/REPO`. Read from the daemon workspace's effective config (any tier) |
 | `fleet.ref` | `LOOM_FLEET_REF` | `main` | Branch, tag or commit to read |
+| `fleet.syncIntervalSecs` | `LOOM_FLEET_SYNC_INTERVAL_SECS` | `300` | Cadence of the daemon's own sync timer; clamped up to a `30`s floor |
+| `fleet.autoApply` | `LOOM_FLEET_AUTO_APPLY` | `false` | Let a **timer** pass write (render) and apply (roster) on its own. Off by default — `roster --apply` deregisters workspaces |
+| *(startup cap)* | `LOOM_FLEET_SYNC_STARTUP_TIMEOUT_SECS` | `60` | Wall-clock cap on the startup pass, so a hanging forge cannot hold up boot. `0` waits indefinitely |
 | *(host identity)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` | This host's name in the store (`fleet/hosts/<host>/`, `fleet/state.yml`); `--host` overrides it per command |
 | `fleet.repo` | `LOOM_FLEET_REPO` | *(unset: off)* | The operator's fleet state store (`OWNER/REPO`) read by `loom-daemon fleet-config`; `fleet.ref` / `LOOM_FLEET_REF` picks the ref (default `main`). Unset changes nothing. See [Fleet store](#fleet-store--fleet-config-fleetrepo) |
 
@@ -1565,6 +1569,49 @@ store — beyond the read-only `contents: read` the rest of `fleet-config`
 needs; without it, a write fails with a clear error naming the missing
 scope, not a crash. Calls are counted in the forge-call stats as
 `fleet_store_write`.
+
+### Automatic sync (startup + timer)
+
+With `fleet.repo` set the daemon does not wait to be told. `loom_daemon::fleet_sync`
+runs the same reader the verbs above use, twice over:
+
+- **At startup**, before any `autonomous.*` loop is spawned: fetch, then render
+  the machine tier and the host-local tier — so the process that goes on to read
+  `maxConcurrent`, `roleRunner.roles` and the rest is the one the store
+  configures, without a second restart. It runs *after* the forge-credential
+  preflight (the store is read through `gh`), so within one boot the fetch uses
+  the credentials already on the host; a credential change landing in the store
+  takes effect on the next start.
+- **On a timer** (`fleet.syncIntervalSecs`): fetch + a render check + a roster
+  check. The steady state is one conditional `304` per tick. Drift is logged,
+  published on the event bus as `fleet.sync.drift`, and recorded for
+  `loom-daemon status` — and **nothing is written**, unless `fleet.autoApply` is
+  on, in which case a timer pass renders and applies exactly as `render` /
+  `roster --apply` would. `autoApply` is ignored (with a warning) on a repo that
+  sets `daemon.delegatedTo`.
+
+Three properties are preserved deliberately:
+
+- **Unset `fleet.repo` changes nothing.** No task is spawned, no file is read or
+  written, and `status` renders no extra line. A snapshot left over from an
+  earlier configured run is removed, so `status` never reports a store the host
+  has stopped reading.
+- **An unreachable forge at startup does not block boot.** The config half loads
+  with the same cached fallback `render` has (`CACHED … last confirmed current
+  <age> ago`), and the whole pass is capped by
+  `LOOM_FLEET_SYNC_STARTUP_TIMEOUT_SECS`; a failure or a timeout is recorded and
+  boot continues on the config already on disk.
+- **The roster stays fail-closed.** It is read only from a snapshot the forge
+  confirmed current in that same pass — no cached fallback, and a
+  `fleet: true` + `firewall: true` record is still a hard error for the whole
+  roster. A pass whose config half came from the cache reports the roster as
+  *not checked* rather than inventing a drift or an error for it.
+
+`loom-daemon status` renders the last pass as a `Fleet store:` block (per-tier
+drift, roster drift, and whether anything was written), and `status --json`
+carries the same record under `fleet_store`. Both are read host-locally from
+`~/.loom/fleet-sync-status.json`, so they still answer when the daemon does not
+— including when the startup pass itself is what went wrong.
 
 ## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)
 
