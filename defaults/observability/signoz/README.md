@@ -351,6 +351,25 @@ not fabricated HTTP requests. Trace Explorer is the acceptance surface; an empty
 HTTP service-map/APM page does not establish a missing trace. Record actual
 Community-edition limitations and missing usage separately from measured zeros.
 
+### Which SigNoz product views can hold Loom data
+
+Three of SigNoz's product pages behave differently against Loom's spans, and the
+reason is Loom's trace *shape*, not the trial's configuration. `evidence.md`'s
+"UI view matrix" has the live probes; the short form:
+
+| Page | Holds Loom data? | Why |
+| --- | --- | --- |
+| Trace Explorer, Logs Explorer, Dashboards | **Yes** — the acceptance surface for every saved view above | They query spans/logs directly, with no semantic-convention requirement |
+| Service List / APM overview | **Yes** | The ingester runs every span through `signozspanmetrics/delta` regardless of kind, so RED metrics come from root-span latency/status — not from the OTel HTTP/RPC conventions the page's name suggests |
+| Exceptions ("All Errors") | **No, permanently** | It indexes span events named `exception`; Loom emits none, surfacing a failure as span `status=Error` plus a correlated `ERROR` log |
+| Service Map | **No, permanently** | A topology edge needs two different `service.name` values, or a CLIENT/SERVER span pair, or a `peer.service`-style peer attribute. Loom's exporter emits one `service.name` (`loom-daemon`) and `SPAN_KIND_INTERNAL` for every span, and the gateway's allowlist forwards no peer key. Configuring a topology connector would not change this |
+
+Do **not** add synthetic HTTP spans, a second `service.name`, or CLIENT-kind
+spans to populate the last two: that fabricates a call graph Loom does not have.
+The two "No" rows are the documented, expected answer for an operational-span
+workload, and `loom-daemon/tests/signoz_topology_shape.rs` fails in ordinary CI
+if the shape they depend on changes.
+
 `fixture-queries.sql` was executed live on 2026-09-22 against a real trial
 deployment; every assertion held on the first pass, including totals, the
 repair-chain graph, root-less-trace detection, absence-vs-zero gauges and the

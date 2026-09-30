@@ -122,8 +122,10 @@ jobs:
               - 'loom-daemon/**'
               - 'loom-api/**'
               # The observability artifacts are Rust-tested seams, not inert
-              # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs
-              # and cycle_time_artifacts.rs all `include_str!` these files and
+              # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs,
+              # signoz_topology_shape.rs (the render + gateway allowlist the
+              # Service Map conclusion rests on) and cycle_time_artifacts.rs all
+              # `include_str!` these files and
               # fail on drift, and cycle_time_clickhouse.rs / signoz_usage_queries.rs
               # execute the SQL verbatim against a real ClickHouse. An artifact-only PR must
               # re-run those, or the only tests that can catch the regression

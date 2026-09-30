@@ -581,6 +581,11 @@ pub(crate) enum MergePrCommand {
     /// `loom:operator` hold, 1 = could not produce fresh evidence.
     RedateChecks(super::merge_pr_redate::RedateChecksArgs),
 
+    /// Read-only report of which required checks and paths forced the #8508
+    /// re-dates (#9746), from the trailers on the re-date commits reachable
+    /// from `--ref` (default origin/main) within `--since` (default 24h).
+    RedateReport(super::merge_pr_redate_report::RedateReportArgs),
+
     /// The pre-merge `loom:pr` review-signal guard (#7419): refuse a merge
     /// whose current head does not carry `loom:pr`, unless
     /// `--allow-unapproved` asserts responsibility. Exit 0 = present or
@@ -786,6 +791,7 @@ impl MergePrCommand {
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
+            MergePrCommand::RedateReport(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::HoldState(args) => args.run(),
             MergePrCommand::SequenceEval(args) => args.run(),
