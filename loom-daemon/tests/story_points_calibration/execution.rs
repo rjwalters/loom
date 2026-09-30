@@ -10,12 +10,9 @@ use regex::Regex;
 use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 
-use super::shared::{
-    split_statements, QUESTION_IDS, QUERIES, ROLLUP, CalResult,
-};
+use super::shared::{split_statements, CalResult, QUERIES, QUESTION_IDS, ROLLUP};
 
 // ---------------------------------------------------------------------------
-
 
 /// The first code line of a statement (leading comment lines skipped).
 fn first_code_line(statement: &str) -> &str {
@@ -807,4 +804,3 @@ fn an_empty_window_reports_zero_populations_per_revision_not_errors() {
     assert!(results["CAL3"].rows.is_empty());
     assert!(results["CAL5"].rows.is_empty());
 }
-
