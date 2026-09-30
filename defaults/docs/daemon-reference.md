@@ -4674,9 +4674,9 @@ knobs not yet audited here.
 | `autonomous.workFinder.declineCooldown.cooldownSecs` | `LOOM_WORK_FINDER_DECLINE_COOLDOWN_SECS` | `21600` (6h) | How long a sweep that declined on a hard-exclusion label rule holds the issue out of dispatch. Flat, non-exponential. Deliberately longer than `noopCooldown.cooldownSecs`: a no-op release means "nothing to do *yet*", a decline means a label only a maintainer can remove is present. Zero/invalid → default |
 | `autonomous.workFinder.declineCooldown.warnThreshold` | `LOOM_WORK_FINDER_DECLINE_WARN_THRESHOLD` | `3` | Consecutive declines of one issue that emit a single WARN naming the issue and the rule it declined on. Matches `quarantine.threshold`. Zero/invalid → default |
 | `autonomous.workFinder.prlessRetry.enabled` | `LOOM_WORK_FINDER_PRLESS_RETRY` | `true` | PR-less retry bound on/off (#7972). A safety backstop — defaults on. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. See "PR-less retry bound (#7972)" below |
-| `autonomous.workFinder.prlessRetry.threshold` | `LOOM_WORK_FINDER_PRLESS_RETRY_THRESHOLD` | `3` | Consecutive dispatches that claim an issue, release it, and leave **no pull request** behind before the issue is held with `loom:blocked` (plus a comment naming the failure and the count). Matches `quarantine.threshold`. Zero/invalid → default |
+| `autonomous.workFinder.prlessRetry.threshold` | `LOOM_WORK_FINDER_PRLESS_RETRY_THRESHOLD` | `3` | Consecutive dispatches that claim an issue, release it, and leave **no pull request** behind before the issue is held with `loom:blocked` (plus a comment naming the failure and the count). Counted **fleet-wide** across dispatch hosts when peer coordination is on (#9292), per-host otherwise. Matches `quarantine.threshold`. Zero/invalid → default |
 | `autonomous.workFinder.prlessRetry.backoffSecs` | `LOOM_WORK_FINDER_PRLESS_RETRY_BACKOFF_SECS` | `300` | Window applied after the **first** PR-less release; doubles per consecutive release. Deliberately longer than `dispatchBackoff.baseSecs` — the reported symptom was claim/release pairs inside the same minute, and a PR-less release follows a full agent session, so a one-minute retry cannot plausibly land differently. Zero/invalid → default |
-| `autonomous.workFinder.prlessRetry.maxBackoffSecs` | `LOOM_WORK_FINDER_PRLESS_RETRY_MAX_BACKOFF_SECS` | `3600` | Ceiling on the doubling — also the idle window after which a cold streak restarts at zero, and the in-memory TTL of a hold (whose durable half is the `loom:blocked` label). Zero/invalid → default; clamped up to `backoffSecs` |
+| `autonomous.workFinder.prlessRetry.maxBackoffSecs` | `LOOM_WORK_FINDER_PRLESS_RETRY_MAX_BACKOFF_SECS` | `3600` | Ceiling on the doubling — also the idle window after which a cold streak restarts at zero, and the in-memory TTL of a hold (whose durable half is the `loom:blocked` label). The fleet-wide streak clock (#9292) is the shipped 3600 s regardless of this value, since a receiving host reads its peers' releases rather than their config. Zero/invalid → default; clamped up to `backoffSecs` |
 | `autonomous.workFinder.extraSkipLabels` | `LOOM_WORK_FINDER_EXTRA_SKIP_LABELS` (comma-separated) | `[]` | Per-workspace/per-repo **additional** label names (#6685) the work-finder treats as a skip/park signal, beyond the hardcoded `loom:blocked` / `loom:operator-only` (`PARK_LABELS`) — e.g. a repo-local `blocked-upstream` label that will never be renamed to a `loom:*` name. Purely additive to `SKIP_LABELS`' candidate-query filter (`WorkItem::is_skipped_with_extra`); it does **not** extend the separate dispatch()-level park-label guard (#4444) above, which stays keyed on `PARK_LABELS` only. Env replaces config entirely when set (even to an empty string); resolved once per workspace, live on the next tick (a cheap `.loom/config.json` read, no daemon restart needed). **`loom:building` can never be added to the resolved list** — filtered out defensively even if named explicitly in config/env, so a misconfiguration can never re-introduce the "an in-flight claim is treated as a park" regression `SKIP_LABELS`' own doc comment warns against |
 | *(env only)* | `LOOM_OPEN_PR_MEMO` | `true` | Verified-open-PR memo for the #4123 open-PR dispatch guard (#6788). Falsy (`0`/`false`/`no`/`off`) disables; anything else (including unset) enables. When on, the guard (a) reuses a verified "issue #N has open linked PR #M" answer for 15 minutes instead of re-running the closes-graph query on every work-finder tick, and (b) when **both** the GraphQL probe and its #5911 REST fallback fail, re-verifies that one known PR over a single `GET repos/{owner}/{repo}/pulls/{M}` before conceding. The documented fail-open contract is unchanged: with no memo, or if that recheck also cannot answer, the guard still proceeds. In-memory only — a daemon restart clears it. Disable only to restore the exact pre-#6788 probe |
 | *(env only)* | `LOOM_EMPTY_POOL_BREAKER_THRESHOLD` | `3` | How many **distinct** sources must hit an unsatisfiable token selection (exit 78) inside the window below before new dispatch to that workspace is paused (#6614). A source is an issue dispatch, or — since #7607 — a `(workspace, role)` role tick whose pre-spawn pool preflight found zero spawnable accounts. Distinct *sources*, not raw failures: one issue cycling through its own `dispatchBackoff`, or one role looping on one workspace, can never trip it. Crossing it trips the existing pre-flight advisory (#4386) + half-open dispatch gate (#5030) — one loud `ERROR` plus a `daemon.preflight.advisory` event — and the first dispatch that gets past token selection clears it. Zero/invalid → default |
@@ -5324,24 +5324,38 @@ dispatch left a pull request behind** — the one thing that loop could not fake
   release arms a window the work finder skips *before* the capacity gate —
   counted as **`prless-retry-skip`** on the per-tick summary line — so a
   re-claim cannot land in the same minute as the release, and a held candidate
-  never reserves a shared dispatch slot. A streak older than `maxBackoffSecs`
-  is cold and restarts at 1: a failure an hour ago and a failure now are not a
-  pattern.
-- **Visibility.** From the **second** consecutive release the failure reason is
+  never reserves a shared dispatch slot. A peer host's window is unioned into
+  the same skip set (#9292), so it spaces out *every* host's next claim, not
+  only the one that armed it. A streak older than `maxBackoffSecs` is cold and
+  restarts at 1: a failure an hour ago and a failure now are not a pattern.
+- **The tally is fleet-wide (#9292).** Every recorded release is broadcast over
+  the peer-claim room's brake lane carrying that host's own running count, and
+  `threshold` is compared against the **sum** — so four dispatch hosts spend
+  `threshold` claims between them, not `threshold` claims each. Before #9292 the
+  tally was a per-process integer: on `rjwalters/loom#8812` (2026-09-24) four
+  hosts spent nine claim/release cycles and posted four near-identical
+  `Attempt 2 of 3` notes before any one of them reached a hold. Requires peer
+  coordination (`safehouse.enabled`); without it each host counts alone, exactly
+  as before, and says so once per release —
+  `grep "HOST-LOCAL only" ~/.loom/daemon.log`. A dropped ad, a pre-#9292 peer,
+  or an unreadable view all fail open to this host's own exact count. A peer's
+  contribution lapses after an hour (the fleet-wide form of the streak-cold
+  rule), so a crashed host cannot pin an issue one release short of a hold.
+- **Visibility.** When the **fleet** count reaches 2 the failure reason is
   posted to the issue, so the next claimer starts from "the last attempt died
-  like *this*" instead of from nothing. Bounded by construction: at most
-  `threshold` comments per streak, versus the fourteen claim cycles and
-  eighteen comments the observed loop produced. These are **attempt notes, not
-  holds** — they apply no label and the issue stays in the queue. Each body
-  declares its kind (`<!-- loom:prless-retry-kind=attempt -->` /
-  `…=hold` / `…=hold-failed`, #9239) in addition to the shared
-  `<!-- loom:prless-retry (#7972) -->` marker, so an audit never has to infer
-  the difference from prose — before #9239 it had to, and got it wrong: on
-  `rjwalters/loom#8812` four of five "holds" were `Attempt 2 of 3` notes, one
-  per dispatch host.
-- **Hold (`threshold`).** The `threshold`-th consecutive PR-less release adds
-  `loom:blocked`, removes `loom:issue`, and comments with the failure and the
-  count. `loom:blocked` (not `loom:operator`) because it is the established
+  like *this*" instead of from nothing. Bounded by construction: one attempt
+  note per streak per *issue* (#9292 — it used to be one per streak per *host*),
+  versus the fourteen claim cycles and eighteen comments the observed loop
+  produced. These are **attempt notes, not holds** — they apply no label and the
+  issue stays in the queue. Each body declares its kind
+  (`<!-- loom:prless-retry-kind=attempt -->` / `…=hold` / `…=hold-failed`,
+  #9239) in addition to the shared `<!-- loom:prless-retry (#7972) -->` marker,
+  so an audit never has to infer the difference from prose — before #9239 it had
+  to, and got it wrong: on `rjwalters/loom#8812` four of five "holds" were
+  `Attempt 2 of 3` notes, one per dispatch host.
+- **Hold (`threshold`).** The `threshold`-th consecutive PR-less release
+  fleet-wide adds `loom:blocked`, removes `loom:issue`, and comments with the
+  failure and the count. `loom:blocked` (not `loom:operator`) because it is the established
   automated-hold state the work finder's skip-label filter and
   `quarantine_reconciliation` already understand. Release it the way every
   other `loom:blocked` park is released — fix the cause and flip it back to

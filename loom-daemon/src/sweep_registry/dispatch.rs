@@ -1001,12 +1001,16 @@ impl SweepRegistry {
             // the pool-hold lane (Issue #8001) each have their own dedicated
             // publisher (`publish_peer_cooldown_claim` /
             // `publish_peer_pool_hold_claim`), since each carries a payload
-            // this method's signature has no parameter for.
+            // this method's signature has no parameter for. The PR-less-retry
+            // lane (Issue #9292) does the same, for the same reason — its ad
+            // carries the advertiser's own consecutive tally (see
+            // `publish_peer_prless_release_claim`).
             peer_claims::ClaimKind::Completed
             | peer_claims::ClaimKind::FilingLock
             | peer_claims::ClaimKind::FilingUnlock
             | peer_claims::ClaimKind::NoopCooldownArmed
             | peer_claims::ClaimKind::DispatchBackoffArmed
+            | peer_claims::ClaimKind::PrlessReleaseArmed
             | peer_claims::ClaimKind::PoolHoldArmed
             | peer_claims::ClaimKind::PoolHoldCleared
             | peer_claims::ClaimKind::Heartbeat => return,
