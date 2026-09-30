@@ -245,8 +245,8 @@ fi
 # Adopt-first above only catches a race when both builders share a head
 # branch. Two builders racing the SAME issue on DIFFERENT branches (a second
 # hand-claim that never saw the first's branch, or a re-dispatch that created
-# a fresh branch name) reach `gh pr create` unchecked otherwise. Reuse the
-# daemon's own `forge check-open-pr` probe (#8551) -- the identical
+# a fresh branch name) reach `gh pr create` unchecked otherwise. Reuse
+# `loom-daemon forge check-open-pr` (#8551) -- the identical
 # closes-graph ∪ timeline union the dispatch guard and the pre-claim
 # hand-check both already use -- against whichever issue THIS PR's own body
 # references (a closing keyword OR a `Part of` / `Contributes to` partial
