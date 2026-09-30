@@ -1604,6 +1604,7 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
         priorities,
         terms,
         halted,
+        halt_causes,
         max_admissions_per_tick,
         saturation_held,
         preferred_slice,
@@ -1619,12 +1620,15 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
 /// nor a verified red-main fix ([`Qd::DeferredBuildBackoff`]). Checked after
 /// the saturation brake and before the overflow / cap gates; in-flight sweeps
 /// are untouched. `false` is [`tick_multi_with_repo_cap`] byte-for-byte.
+/// `halt_causes` is threaded through unchanged — see
+/// [`tick_multi_with_repo_cap`] for its contract (#9017).
 #[allow(clippy::too_many_arguments)]
 pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     workspaces: &mut [(S, D)],
     priorities: &[u32],
     terms: CapTerms,
     halted: &[bool],
+    halt_causes: Option<&[Option<halt_cause::HaltCause>]>,
     max_admissions_per_tick: usize,
     saturation_held: bool,
     preferred_slice: Option<&[bool]>,
