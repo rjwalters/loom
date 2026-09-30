@@ -42,6 +42,10 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "claim_reconciliation/review_conflict.rs",
         "writer; reader via fetch_comment_bodies",
     ),
+    (
+        "cli/lease_co_occupancy.rs",
+        "lease + lease-yield reader in read_rows (FETCH_SITES, #9631)",
+    ),
     ("comment_trust/records.rs", "the H14 filter itself"),
     ("dep_classify/cli.rs", "reads IssueView from dep_classify/forge.rs (trusted)"),
     ("dep_classify/consts.rs", "constants"),
@@ -80,6 +84,7 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "TrustPolicy::for_root(root).trusted_bodies(",
     ),
     ("sweep_registry/guards.rs", "read_lease_comments", "policy.trusted_ndjson("),
+    ("cli/lease_co_occupancy.rs", "read_rows", "policy.trusted_ndjson("),
     ("sweep_registry/guards.rs", "issue_body_via_rest", "records::trusted_body("),
     (
         "sweep_registry/guards.rs",
