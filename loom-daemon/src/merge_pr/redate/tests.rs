@@ -200,7 +200,7 @@ pub(super) fn now() -> chrono::DateTime<chrono::Utc> {
 }
 
 pub(super) fn run(gh: &std::path::Path, cfg: BudgetConfig) -> RemedyOutcome {
-    remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42", cfg, now())
+    remedy_generic_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42", cfg, now())
 }
 
 /// Writes an executable fake `gh` to `dir` that answers the calls
@@ -721,16 +721,8 @@ fn the_remedy_writes_the_trailers_into_the_created_commit() {
     let dir = tmp_dir("attributed-push");
     let gh = write_stub_gh(&dir, "abc0000", "tree1111", "newsha22", "", "");
     let a = Attribution::from_verdict(&clause4_verdict());
-    let outcome = remedy_attributed_with(
-        gh.to_str().unwrap(),
-        "o/r",
-        "feature/x",
-        "abc0000",
-        "42",
-        ONE,
-        now(),
-        || a,
-    );
+    let outcome =
+        remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42", ONE, now(), || a);
     assert_eq!(
         outcome,
         RemedyOutcome::Pushed {
@@ -754,10 +746,9 @@ fn an_unrecomputable_verdict_falls_back_to_the_generic_body_and_still_pushes() {
     // very first read — the remedy must not care.
     let recomputed = recompute_with(gh, "o/r", "42", "abc0000");
     assert!(recomputed.is_err(), "{recomputed:?}");
-    let outcome =
-        remedy_attributed_with(gh, "o/r", "feature/x", "abc0000", "42", ONE, now(), || {
-            recompute_with(gh, "o/r", "42", "abc0000").ok()
-        });
+    let outcome = remedy_with(gh, "o/r", "feature/x", "abc0000", "42", ONE, now(), || {
+        recompute_with(gh, "o/r", "42", "abc0000").ok()
+    });
     assert_eq!(
         outcome,
         RemedyOutcome::Pushed {
@@ -780,16 +771,10 @@ fn attribution_is_never_computed_when_nothing_is_pushed() {
     let dir = tmp_dir("attribution-lazy");
     // Head moved: no push, so the (possibly expensive) recompute must not run.
     let gh = write_stub_gh(&dir, "def9999", "unused", "unused", "", "");
-    let outcome = remedy_attributed_with(
-        gh.to_str().unwrap(),
-        "o/r",
-        "feature/x",
-        "abc0000",
-        "42",
-        ONE,
-        now(),
-        || panic!("attribution must not be computed for a head move"),
-    );
+    let outcome =
+        remedy_with(gh.to_str().unwrap(), "o/r", "feature/x", "abc0000", "42", ONE, now(), || {
+            panic!("attribution must not be computed for a head move")
+        });
     assert!(matches!(outcome, RemedyOutcome::HeadMoved { .. }), "{outcome:?}");
     let _ = fs::remove_dir_all(&dir);
 }

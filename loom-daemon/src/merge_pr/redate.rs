@@ -349,15 +349,8 @@ pub enum RemedyOutcome {
 /// written instead; it never blocks the remedy.
 pub fn remedy(nwo: &str, branch: &str, expected_head_sha: &str, pr: &str) -> RemedyOutcome {
     let cfg = BudgetConfig::for_root(&repo_root());
-    remedy_attributed_with(
-        &gh_bin(),
-        nwo,
-        branch,
-        expected_head_sha,
-        pr,
-        cfg,
-        chrono::Utc::now(),
-        || match attribution::recompute(nwo, pr, expected_head_sha) {
+    remedy_with(&gh_bin(), nwo, branch, expected_head_sha, pr, cfg, chrono::Utc::now(), || {
+        match attribution::recompute(nwo, pr, expected_head_sha) {
             Ok(a) => Some(a),
             Err(why) => {
                 eprintln!(
@@ -365,8 +358,8 @@ pub fn remedy(nwo: &str, branch: &str, expected_head_sha: &str, pr: &str) -> Rem
                 );
                 None
             }
-        },
-    )
+        }
+    })
 }
 
 /// The repo root (config, App roster, allowlist), not whatever subdirectory
@@ -377,11 +370,10 @@ fn repo_root() -> std::path::PathBuf {
         .unwrap_or_default()
 }
 
-/// [`remedy`]'s implementation, parameterized on the `gh` binary — the
-/// injection seam the test suite drives directly (see [`gh_api_with`]) — with
-/// no attribution: the generic commit body.
+/// Test-only convenience over [`remedy_with`] with no attribution: the
+/// generic commit body.
 #[cfg(test)]
-fn remedy_with(
+fn remedy_generic_with(
     gh: &str,
     nwo: &str,
     branch: &str,
@@ -390,14 +382,16 @@ fn remedy_with(
     cfg: BudgetConfig,
     now: chrono::DateTime<chrono::Utc>,
 ) -> RemedyOutcome {
-    remedy_attributed_with(gh, nwo, branch, expected_head_sha, pr, cfg, now, || None)
+    remedy_with(gh, nwo, branch, expected_head_sha, pr, cfg, now, || None)
 }
 
-/// [`remedy_with`] plus the #9746 attribution. `attribute` is called at most
-/// once, and only once a push has been decided on (never for a head move,
-/// deferral or escalation); `None` means "write the generic body".
+/// [`remedy`]'s implementation, parameterized on the `gh` binary — the
+/// injection seam the test suite drives directly (see [`gh_api_with`]) — plus
+/// the #9746 attribution. `attribute` is called at most once, and only once a
+/// push has been decided on (never for a head move, deferral or escalation);
+/// `None` means "write the generic body".
 #[allow(clippy::too_many_arguments)]
-fn remedy_attributed_with(
+fn remedy_with(
     gh: &str,
     nwo: &str,
     branch: &str,

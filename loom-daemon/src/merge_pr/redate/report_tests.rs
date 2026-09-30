@@ -79,7 +79,7 @@ fn aggregate_counts_check_by_path_most_frequent_first() {
         "2026-09-29T00:00:00Z",
     );
     assert_eq!((r.total, r.attributed, r.untrailered), (6, 4, 2));
-    assert_eq!(r.other_redate_subjects, 1, "the hand-made subject is counted apart");
+    assert_eq!(r.other_redate_subjects, 1, "the other-subject re-date is counted apart");
     assert_eq!(r.rows.len(), 2);
     assert_eq!(r.rows[0].count, 3);
     assert_eq!(r.rows[0].key.base_path, "CLAUDE.md");
@@ -97,7 +97,7 @@ fn text_and_json_carry_the_attribution_and_the_untrailered_count() {
     assert!(text.contains("6 (4 attributed, 2 untrailered)"), "{text}");
     assert!(text.contains("base: CLAUDE.md  |  pr: defaults/docs/eta.md"), "{text}");
     assert!(text.contains("#9721 #9743"), "{text}");
-    assert!(text.contains("plus 1 hand-made re-date commit(s)"), "{text}");
+    assert!(text.contains("plus 1 other re-date commit(s)"), "{text}");
     let json = serde_json::to_value(&r).expect("serializes");
     assert_eq!(json["untrailered"], 2);
     assert_eq!(json["rows"][0]["check"], "Structural Checks (Role Prompt Prefix Ratchet)");

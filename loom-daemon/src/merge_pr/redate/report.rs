@@ -77,8 +77,9 @@ pub fn run_git_log(
 }
 
 /// How many records matched the `--grep` pre-filter but are NOT the automated
-/// remedy's exact subject — hand-made re-dates such as
-/// `… (#8248 guard, operator release)`. Reported separately so the table's
+/// remedy's exact subject — operator releases such as
+/// `… (#8248 guard, operator release)` and older automated variants
+/// (`attempt 2`, `loom:operator-hold remedy`). Reported separately so the table's
 /// denominator is never silently short of what `git log --grep` shows.
 #[must_use]
 pub fn count_other_redates(raw: &str) -> usize {
@@ -269,7 +270,7 @@ pub fn render_text(r: &Report) -> String {
     if r.other_redate_subjects > 0 {
         let _ = writeln!(
             out,
-            "(plus {} hand-made re-date commit(s) with a non-automated subject, not counted)",
+            "(plus {} other re-date commit(s) (operator releases and older automated variants), not counted)",
             r.other_redate_subjects
         );
     }
