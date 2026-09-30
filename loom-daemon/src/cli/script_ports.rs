@@ -616,6 +616,21 @@ pub(crate) enum MergePrCommand {
     /// and what the sequencing pass would apply this tick.
     SequencePlan(super::merge_pr_sequence::SequencePlanArgs),
 
+    /// Prepare a combined candidate PR from an eligible group of component
+    /// PRs (#9688, contract ADR-0023): verify eligibility fresh, construct
+    /// the candidate in a scratch worktree, push, create ONE candidate PR
+    /// carrying the trusted component mapping, and reserve every source via
+    /// the #9378 sequencing gate (source = sequenced behind the candidate).
+    /// Adopt-first on the deterministic attempt id; hard-abort on conflict
+    /// or a mid-preparation head push.
+    ConsolidatePrepare(super::merge_pr_consolidate::ConsolidatePrepareArgs),
+
+    /// Abort a consolidation attempt (#9688): release ONLY the attempt's own
+    /// reservations, close the candidate PR, clean up its branch. Sources
+    /// are preserved untouched. A merged candidate cannot be aborted —
+    /// landing wins and #9689's reconcile owns the aftermath.
+    ConsolidateAbort(super::merge_pr_consolidate::ConsolidateAbortArgs),
+
     /// The async-close-race worktree-cleanup gate (#4186): whether a merged
     /// PR's issue is actually finished, so a partial-increment worktree the
     /// next Builder increment still needs is not removed out from under it.
@@ -809,6 +824,8 @@ impl MergePrCommand {
             MergePrCommand::HoldState(args) => args.run(),
             MergePrCommand::SequenceEval(args) => args.run(),
             MergePrCommand::SequencePlan(args) => args.run(),
+            MergePrCommand::ConsolidatePrepare(args) => args.run(),
+            MergePrCommand::ConsolidateAbort(args) => args.run(),
             MergePrCommand::IssueCloseGate(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
