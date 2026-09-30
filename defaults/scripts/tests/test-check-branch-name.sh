@@ -498,9 +498,16 @@ esac
 EOF
 chmod +x "$MP/bin/gh"
 
+# The fixture's origin is a local bare repo, which the #9548 write-scope check
+# (correctly) refuses before merge-pr.sh reaches the ref check. Which repo may
+# be written is not what AC4 tests; test-write-scope.sh is.
+# shellcheck source=lib/write-scope-stub.sh
+source "$SCRIPT_DIR/lib/write-scope-stub.sh"
+write_scope_allow_all "$MP/bin"
 MP_OUT="$(cd "$MP/repo" && PATH="$MP/bin:$PATH" GH_TOKEN=x \
     bash .loom/scripts/merge-pr.sh 1 2>&1)"
 MP_RC=$?
+write_scope_unwrap
 
 assert_contains "$MP_OUT" "$MP_EVIL" "merge-pr.sh names the invalid head ref in its refusal"
 assert_contains "$MP_OUT" '#9106' "merge-pr.sh cites the issue in its refusal"
