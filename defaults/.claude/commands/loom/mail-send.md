@@ -25,7 +25,7 @@ Ask the sender (or take from the task) for:
 2. **`TITLE`** — ≤ 200 characters, single line.
 3. **`BODY`** — the message. Loom-ui caps it at 20 action steps of ≤ 500
    characters each; trim to fit.
-4. **`TO`** (optional) — Matrix handle to mention; default `@operator:example.org`.
+4. **`TO`** (required) — the operator's Matrix handle to mention (e.g. `@operator:example.org`); no default yet (#9622).
 5. **`SEVERITY`** (optional) — `low` / `normal` / `high` / `critical`; default `normal`.
 6. **`KEY`** (optional) — loom-ui inbox key; default
    `mail-<short-hostname>-<epoch-seconds>` (≤ 200 chars, no spaces).
@@ -53,12 +53,12 @@ clobbering caller values, attempts both legs, and verifies each receipt:
 missing=""
 [ -n "${LOOM_UI_INBOX_URL:-}" ]  || missing="$missing LOOM_UI_INBOX_URL"
 [ -n "${LOOM_UI_INGEST_KEY:-}" ] || missing="$missing LOOM_UI_INGEST_KEY"
+[ -n "${TO:-}" ]                 || missing="$missing TO"
 if [ -n "$missing" ]; then
   echo "SEND NOT ATTEMPTED — missing config:$missing (loom-ui docs/deploy-runbook.md §8)"; exit 2
 fi
 H=$(hostname -s)
 FROM="${FROM:-${LOOM_SENDER_IDENTITY:-$H}}"
-TO="${TO:-@operator:example.org}"
 SEVERITY="${SEVERITY:-normal}"
 KEY="${KEY:-mail-$H-$(date +%s)}"
 POST="${MATRIX_POST:-$HOME/.claude/skills/matrix-post/post.sh}"
