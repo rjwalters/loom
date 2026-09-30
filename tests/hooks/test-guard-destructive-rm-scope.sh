@@ -435,6 +435,161 @@ assert_deny_env "rmScope repo (#6805): unassigned \$WT with a suffix still denie
 assert_allow_env "rmScope repo (#6805): single-quoted literal '\$WT/sub' is not resolved as a variable" \
     "LOOM_RM_SCOPE=repo" "WT=/etc/foo; rm -rf './\$WT/sub'" "$REPO_ROOT"
 
+# ---- #9331: THE FULL BASH REBINDING SET POISONS THE LITERAL FAST PATH -------
+# ---- #6676/#6805's resolver counted only a segment that LITERALLY BEGINS
+# ---- `NAME=`, so every other way bash rebinds NAME was invisible to it: the
+# ---- guard substituted the LEXICALLY proved value into the scope check while
+# ---- the shell expanded something else at the `rm` word. Measured on `main`,
+# ---- `d=/tmp/a; d+=/../../etc; rm -rf "$d"` ALLOWED an `rm -rf /etc` — a live
+# ---- bypass of the UNGATED catastrophic top-level floor, which is why this
+# ---- set is a floor requirement and not a refinement. All three fast paths
+# ---- now share _mktemp_is_other_rebind() (#8221), so a form closed in one is
+# ---- closed in all of them; see _MKTEMP_REBIND_AWK's header comment in
+# ---- defaults/hooks/guard-destructive-generic.sh for each form, and for why
+# ---- `unset NAME` is the ONE deliberate omission (asserted as such below).
+#
+# GROUP A — the literal fast path (#6676/#6805). Every row ALLOWED on `main`.
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; d+=/../../etc denies (append rebind reaches /etc)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; d+=/../../etc; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; d[0]=/etc denies (\$d IS \${d[0]})" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; d[0]=/etc; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; d[1]=/etc denies (any indexed rebind poisons)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; d[1]=/etc; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; mapfile -t d denies (array rebind)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; mapfile -t d < /etc/loom-9331-targets; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; readarray -t d denies (mapfile's other name)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; readarray -t d < /etc/loom-9331-targets; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; IFS= read -r d denies (var-assignment prefix before read)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; IFS= read -r d < /etc/loom-9331-targets; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; IFS=: read -ra d denies (prefix + array read)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; IFS=: read -ra d <<< /etc; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; read d denies (bare read rebind)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; read d < /etc/loom-9331-targets; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; command read d denies (builtin reached through a wrapper)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; command read d < /etc/loom-9331-targets; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; printf -v d denies (printf -v rebind)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; printf -v d /etc; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; printf -vd denies (attached -v argument)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; printf -vd /etc; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; export d=/etc denies (declaration-keyword rebind)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; export d=/etc; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; declare d=/etc denies (declaration-keyword rebind)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; declare d=/etc; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; export d+=/../../etc denies (keyword + append)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; export d+=/../../etc; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; eval d=/etc denies (unprovable by construction)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; eval d=/etc; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; eval \"d=/etc\" denies (quoted eval payload)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; eval "d=/etc"; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; source <file> denies (sourced file can rebind anything)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; source /etc/loom-9331-rebind.sh; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; . <file> denies (source's other spelling)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; . /etc/loom-9331-rebind.sh; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; select d in /etc denies (select header binds NAME)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; select d in /etc; do break; done; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; getopts x d denies (getopts binds NAME)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; getopts abc d; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; for d in /etc denies (for header binds NAME)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; for d in /etc; do :; done; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; d= denies (EMPTY-RHS rebind, missed by a length test)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; d=; rm -rf "$d"' "$REPO_ROOT"
+#
+# GROUP B — the same forms on the mktemp fast paths (#6520/#8221), which #8221
+# closed for `read`/`printf -v`/`for`/declaration keywords but not for these.
+assert_deny_env "rmScope repo (#9331): tmp=\$(mktemp -d); tmp+=/../../etc denies (append rebind)" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); tmp+=/../../etc; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): tmp=\$(mktemp -d); tmp[0]=/etc denies (indexed rebind)" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); tmp[0]=/etc; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): tmp=\$(mktemp -d); mapfile -t tmp denies" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); mapfile -t tmp < /etc/loom-9331-targets; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): tmp=\$(mktemp -d); readarray -t tmp denies" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); readarray -t tmp < /etc/loom-9331-targets; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): tmp=\$(mktemp -d); IFS= read -r tmp denies (prefix before read)" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); IFS= read -r tmp < /etc/loom-9331-targets; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): tmp=\$(mktemp -d); eval tmp=/etc denies" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); eval tmp=/etc; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): tmp=\$(mktemp -d); source <file> denies" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); source /etc/loom-9331-rebind.sh; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): tmp=\$(mktemp -d); select tmp in /etc denies" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); select tmp in /etc; do break; done; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): tmp=\$(mktemp -d); getopts x tmp denies" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); getopts abc tmp; rm -rf "$tmp"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): tmp=\$(mktemp -d); tmp= denies (EMPTY-RHS rebind)" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); tmp=; rm -rf "$tmp"' "$REPO_ROOT"
+#
+# GROUP C — `unset NAME` POISONS TOO, and these rows exist because the opposite
+# looked obviously right. `unset` is the one form that reads as harmless: on a
+# BARE `$NAME` target it expands to empty and `rm -rf ""` deletes nothing. But
+# this family also resolves the `$NAME<suffix>` shape (#6805), and there an
+# empty expansion IS the attack — `d=/tmp/a; unset d; rm -rf "$d/etc"` runs
+# `rm -rf /etc`, byte-for-byte the runtime effect of the `d=` empty rebind that
+# nobody disputes must poison. An exemption was drafted for this pass and that
+# command still ALLOWED; these rows are what caught it. Do not re-exempt
+# `unset` without adding an ORDERING model first — and if one lands, only the
+# TRAILING-unset cleanup row at the bottom of this group may be reclaimed.
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; unset d; rm -rf \"\$d/etc\" denies (empty expansion REACHES /etc)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; unset d; rm -rf "$d/etc"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): the same bypass with the suffix OUTSIDE the quotes denies" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; unset d; rm -rf "$d"/etc' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; unset -v d denies (unset's flagged spelling)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; unset -v d; rm -rf "$d/etc"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): d=/tmp/a; unset d[0] denies (subscript glued to the name)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; unset d[0]; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): the empty-\$d sibling denies too (one rule, both shapes)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; unset d; rm -rf "$d"' "$REPO_ROOT"
+# The cost of the rule above, asserted so it is a KNOWN price and not a
+# surprise: a trailing `unset` in the same command text now denies as well,
+# because this scan has no ordering model to tell it from a leading one.
+# Splitting the cleanup across two commands restores the allow.
+assert_deny_env "rmScope repo (#9331 cost): mktemp, rm, then unset tmp in ONE command now denies (order-blind)" \
+    "LOOM_RM_SCOPE=repo" 'tmp=$(mktemp -d); rm -rf "$tmp"; unset tmp' "$REPO_ROOT"
+#
+# A name glued to a REDIRECTION hid the rebinding the same way a subscript did:
+# whitespace splitting alone leaves the token as `d</tmp/list`, not `d`.
+assert_deny_env "rmScope repo (#9331): read with a GLUED redirection denies (token was d</tmp/list)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; read d</etc/loom-9331-targets; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): IFS= read -r with a glued redirection denies (prefix + glue)" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; IFS= read -r d</etc/loom-9331-targets; rm -rf "$d"' "$REPO_ROOT"
+assert_deny_env "rmScope repo (#9331): read with a glued here-string denies" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; read -r d<<</etc; rm -rf "$d"' "$REPO_ROOT"
+#
+# GROUP D — NON-REGRESSION. This pass must not widen beyond a rebinding of the
+# TARGET name, and must not turn any currently-resolving shape into a deny.
+# A rebinding form aimed at a DIFFERENT variable leaves the target resolvable…
+assert_allow_env "rmScope repo (#9331 control): a += append on an UNRELATED name still allows" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; other+=/etc; rm -rf "$d"' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#9331 control): mapfile into an UNRELATED name still allows" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; mapfile -t lines < /etc/loom-9331-targets; rm -rf "$d"' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#9331 control): read into an UNRELATED name still allows" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; IFS= read -r other < /etc/loom-9331-targets; rm -rf "$d"' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#9331 control): printf -v on an UNRELATED name still allows" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; printf -v other /etc; rm -rf "$d"' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#9331 control): for over an UNRELATED name still allows" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; for f in /etc; do :; done; rm -rf "$d"' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#9331 control): unset of an UNRELATED name still allows" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; unset other; rm -rf "$d"' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#9331 control): a command named unset_helper still allows" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; unset_helper; rm -rf "$d"' "$REPO_ROOT"
+# …and the eval/source poison is anchored on the COMMAND WORD, so a word that
+# merely contains or mentions one of those names is not a rebinding.
+assert_allow_env "rmScope repo (#9331 control): the word 'eval' as an ARGUMENT still allows" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; echo eval; rm -rf "$d"' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#9331 control): a command named evaluate_thing still allows" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; evaluate_thing; rm -rf "$d"' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#9331 control): a command named sourcemap_build still allows" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; sourcemap_build; rm -rf "$d"' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#9331 control): a command named readarray_helper still allows" \
+    "LOOM_RM_SCOPE=repo" 'd=/tmp/a; readarray_helper; rm -rf "$d"' "$REPO_ROOT"
+# A name that merely SHARES A PREFIX with the target is a different variable.
+assert_allow_env "rmScope repo (#9331 control): a prefix-sharing name (BUILD vs BUILD_DIR) still allows" \
+    "LOOM_RM_SCOPE=repo" 'BUILD=/tmp/b; BUILD_DIR=/etc; rm -rf "$BUILD"' "$REPO_ROOT"
+# The lone declaration-keyword assignment stays UNRESOLVED (deny), exactly as on
+# `main`: recognizing it as RESOLVABLE would newly allow `export d=/tmp/x`,
+# which is a relaxation this tightening must not smuggle in (that belongs to
+# #9601's family, and must land after this, never before).
+assert_deny_env "rmScope repo (#9331): a lone export d=/tmp/x is still UNRESOLVED (no new allow)" \
+    "LOOM_RM_SCOPE=repo" 'export d=/tmp/x; rm -rf "$d"' "$REPO_ROOT"
+
 # ---- #9304 shape 1 / #9373: the ALL-LITERAL `for` LIST stays denied ---------
 # ---- `for d in <literal> <literal>; do rm -rf "$d"; done` is lexically
 # ---- provable in principle — unlike the `$(cat …)` shape above — but it is

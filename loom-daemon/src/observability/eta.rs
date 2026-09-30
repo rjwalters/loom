@@ -6,12 +6,14 @@
 //!
 //! - **Bus** ([`spawn_task`]): sweep dispatch, phase and terminal events.
 //!   Each transition is journaled the moment it is seen and the item is
-//!   re-estimated immediately.
+//!   re-estimated immediately. Issue-sweep dispatches and completions also
+//!   feed the slot-turnover ledger whose samples `start-v1` reads (#9326).
 //! - **Pass** ([`record`], on the collector's 5-minute snapshot cadence):
 //!   each managed repo's review-label listings (the ETag-cached REST
 //!   listing, where an unchanged listing is a free `304`), at most
 //!   [`FORGE_READ_BUDGET`] `pulls/{n}` + `issues/{n}` reads for items whose
-//!   outcome is still unknown, history reloaded, and every live item
+//!   outcome is still unknown, the last work-finder tick's dispatch plan
+//!   ingested as ready items (#9326), history reloaded, and every live item
 //!   re-estimated. An unchanged estimate is refreshed every `refreshSecs`.
 //!
 //! **Reads over the budget, and reads that fail, are not lost.** The tracker
@@ -45,10 +47,12 @@ use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::config::EtaConfig;
 use crate::eta::journal::{self, JournalEntry};
 use crate::eta::score::EstimateSummary;
+use crate::eta::shadow::{self, ShadowLedger};
 use crate::eta::tracker::{
-    Effects, Emission, EstimateContext, IssueState, ItemKey, PrState, PrView, Resolved, Tracker,
+    Effects, Emission, EstimateContext, IssueState, ItemKey, PrState, PrView, ReadyPlan, ReadyRow,
+    Resolved, Tracker,
 };
-use crate::eta::{Provenance, Registry, StageSamples};
+use crate::eta::{Kind, Provenance, Registry, StageSamples};
 use crate::event_bus::EventBus;
 use crate::forge_listing::RestIssue;
 use crate::telemetry::kinds::eta::{EtaEstimateRecord, EtaOutcomeRecord};
@@ -96,6 +100,10 @@ pub fn register_sink(otlp_queues: Vec<Arc<DurableQueue>>, host_id: &str) {
 
 struct State {
     tracker: Tracker,
+    turnover: super::ops::turnaround::TurnoverLedger,
+    /// Live paired scores per `(kind, current, candidate)` (#9328): the second
+    /// promotion gate's evidence, accumulated as outcomes resolve.
+    shadow: ShadowLedger,
     config: EtaConfig,
     registry: Registry,
     history: StageSamples,
@@ -162,9 +170,10 @@ pub fn deliver(
     for emission in emissions {
         let e = &emission.explanation;
         let line = format!(
-            "eta.estimate kind={} heuristic={} repo={} issue={} {}",
+            "eta.estimate kind={} heuristic={} primary={} repo={} issue={} {}",
             e.kind,
             e.heuristic,
+            emission.primary,
             e.subject.repo,
             e.subject.issue,
             describe_estimate(e)
@@ -173,6 +182,7 @@ pub fn deliver(
         let refused = e.result.is_none();
         let record = EtaEstimateRecord {
             trigger: emission.trigger,
+            primary: emission.primary,
             explanation: Box::new(emission.explanation),
         };
         if !record.has_provenance() {
@@ -273,6 +283,7 @@ fn estimate_locked(
 ) -> Vec<Emission> {
     let ctx = EstimateContext {
         registry: &state.registry,
+        current_start: state.config.current_start.as_deref(),
         current_finish: state.config.current_finish.as_deref(),
         current_land: state.config.current_land.as_deref(),
         history: &state.history,
@@ -285,6 +296,39 @@ fn estimate_locked(
 
 fn sink() -> Option<&'static dyn QueueSink> {
     SINK.get().map(|(queue, _)| queue.as_ref())
+}
+
+/// Fold `outcomes` into the shadow ledger and persist it (#9328).
+///
+/// Every heuristic of a kind estimated the same subject at the same `as_of`,
+/// and `Tracker::resolve` scores all of them against one outcome, so the pairs
+/// are already formed — this only sorts them into `(current, candidate)` runs
+/// and adds them up. Best-effort: a failed persist costs a longer wait for the
+/// 50-pair gate, never a wrong answer.
+fn note_outcomes(state: &mut State, outcomes: &[Resolved]) {
+    if outcomes.is_empty() {
+        return;
+    }
+    let ids: BTreeMap<Kind, String> = [Kind::Start, Kind::Finish, Kind::Land]
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                state
+                    .registry
+                    .current(kind, state.config.current(kind))
+                    .id()
+                    .to_string(),
+            )
+        })
+        .collect();
+    state
+        .shadow
+        .record(&|kind| ids.get(&kind).cloned().unwrap_or_default(), outcomes);
+    let path = shadow::ledger_path(&state.workspace_root);
+    if let Err(error) = shadow::write_ledger(&path, &state.shadow) {
+        log::warn!("eta: persisting the shadow ledger failed: {error}");
+    }
 }
 
 /// Journal, estimate and deliver the aftermath of one bus event.
@@ -301,6 +345,9 @@ async fn apply_event(effects: Effects, now: DateTime<Utc>) {
     dirty.dedup();
     let emissions = estimate_isolated(Some(dirty), now).await;
     append_journal(&root, &effects.journal);
+    if let Some(state) = lock().as_mut() {
+        note_outcomes(state, &effects.outcomes);
+    }
     let loom = Provenance::current();
     deliver(emissions, effects.outcomes, &loom, &host_id, dry_run, sink());
 }
@@ -340,8 +387,11 @@ pub fn spawn_task(
         config.refresh_secs,
         tracker.pending().len()
     );
+    let shadow = shadow::read_ledger(&shadow::ledger_path(&workspace_root));
     *lock() = Some(State {
         tracker,
+        turnover: super::ops::turnaround::TurnoverLedger::default(),
+        shadow,
         config,
         registry: Registry::builtin(),
         history: StageSamples::default(),
@@ -350,7 +400,11 @@ pub fn spawn_task(
         host_id,
     });
     let default_root = workspace_root.to_string_lossy().to_string();
-    let mut subscription = bus.subscribe(["sweep.global.dispatch", "sweep.issue"]);
+    let mut subscription = bus.subscribe([
+        "sweep.global.dispatch",
+        "sweep.global.completed",
+        "sweep.issue",
+    ]);
     Some(tokio::spawn(async move {
         let mut slugs: HashMap<String, String> = HashMap::new();
         loop {
@@ -362,6 +416,20 @@ pub fn spawn_task(
                 Err(_) => continue,
             };
             let now = Utc::now();
+            // Slot turnover (#9326): host-wide, so before any repo lookup.
+            let turnover = {
+                let mut guard = lock();
+                let Some(state) = guard.as_mut() else {
+                    break;
+                };
+                state
+                    .turnover
+                    .observe(&event, now)
+                    .map(|t| state.tracker.on_slot_turnover(&t))
+            };
+            if let Some(effects) = turnover {
+                apply_event(effects, now).await;
+            }
             let root = match &event {
                 Event::SweepGlobalDispatch { repo, .. }
                 | Event::SweepPhase { repo, .. }
@@ -550,6 +618,7 @@ fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> StageS
         if seen.insert(path.clone()) {
             let samples = StageSamples::load_outcome_journal(&path);
             history.stages.extend(samples.stages);
+            history.censored.extend(samples.censored);
             history.verdicts.extend(samples.verdicts);
             history.paths.extend(samples.paths);
         }
@@ -617,6 +686,7 @@ pub(super) async fn record(
     .await
     .unwrap_or_default();
 
+    let ready = ready_rows(slug_cache).await;
     let now = Utc::now();
     let mut effects = Vec::new();
     let mut checks = Vec::new();
@@ -628,6 +698,11 @@ pub(super) async fn record(
         };
         state.history = history;
         state.repo_ids.extend(repo_ids);
+        // Before the listings, so a departed ready item's `issues/{n}` read
+        // is offered in this same pass.
+        if let Some((rows, plan)) = &ready {
+            effects.push(state.tracker.on_ready_queue(rows, plan, now));
+        }
         for (root, slug, prs) in &repos {
             let e = state.tracker.on_listing(slug, prs, now, resolution_sec);
             // Checks the tracker still wants answered: PRs that left review
@@ -672,6 +747,7 @@ pub(super) async fn record(
         }
         let expired = state.tracker.expire(now);
         let all = crate::eta::tracker::merged(effects);
+        note_outcomes(state, &all.outcomes);
         (
             all.journal,
             all.outcomes,
@@ -711,6 +787,35 @@ pub(super) async fn record(
         deferred,
         dropped.orphaned
     );
+}
+
+/// The last work-finder tick's ready rows, keyed by repo slug, and its plan
+/// (#9326). `None` before the first tick, or when the tick carried no plan
+/// (the single-workspace loop): no plan, no ready items.
+async fn ready_rows(
+    slug_cache: &mut HashMap<String, String>,
+) -> Option<(Vec<ReadyRow>, ReadyPlan)> {
+    let summary = crate::work_finder::last_tick_summary()?;
+    let context = summary.plan?;
+    let mut rows = Vec::with_capacity(summary.queue.len());
+    for row in summary.queue {
+        let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, &row.repo).await
+        else {
+            continue;
+        };
+        rows.push(ReadyRow {
+            repo: slug,
+            issue: row.issue,
+            plan: row.plan,
+        });
+    }
+    Some((
+        rows,
+        ReadyPlan {
+            context,
+            at: summary.at,
+        },
+    ))
 }
 
 /// How many of this pass's journal rows came from an answered forge read.

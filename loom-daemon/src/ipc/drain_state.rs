@@ -133,6 +133,17 @@ pub struct DrainDescriptor {
     /// operator-stop record existed (#9588) — no drain supervisor is running,
     /// so a later drain request replaces the hold instead of acking it.
     pub startup_hold: bool,
+    /// `true` when the hold was placed because the fleet store's
+    /// `fleet/state.yml` says this host is **`paused`** (#9598) rather than
+    /// because of a local operator stop.
+    ///
+    /// Always accompanied by `startup_hold` (a fleet hold has no supervisor
+    /// behind it either, so a real drain request must replace it rather than ack
+    /// it). It exists so [`DrainState::release_fleet_hold`] can release a hold
+    /// *this* mechanism placed when the store flips back to `running`, while
+    /// never touching a #9588 operator-stop hold — a local `restart --drain
+    /// --then-exit` is a different operator action and wins locally.
+    pub fleet_hold: bool,
 }
 
 /// Outcome of [`DrainState::begin`].
@@ -243,16 +254,105 @@ impl DrainState {
                 crate::operator_stop::record_path(&marker).display()
             );
             log::warn!("{note}");
-            let inner = self.inner.get_mut().expect("Drain mutex poisoned");
-            inner.active = true;
-            inner.startup_hold = true;
-            inner.origin = DrainOrigin::Operator;
-            inner.started_at = Some(Utc::now());
-            inner.note = Some(note);
-            self.flag.store(true, Ordering::Relaxed);
+            self.set_hold(note, false);
         }
         self.stop_marker = Some(marker);
         self
+    }
+
+    /// Start **held** because the fleet store says this host is `paused`
+    /// (#9598). `None` — every host whose store says `running`, and every host
+    /// with no `fleet.repo` at all — is a no-op, so boot is unchanged.
+    ///
+    /// Deliberately *after* [`Self::with_stop_marker`] in
+    /// [`Self::with_default_ledger`]'s chain and a no-op when a hold is already
+    /// in place: a local operator stop is the more specific intent and keeps its
+    /// own note (and its own `--abort-drain` release path).
+    #[must_use]
+    pub fn with_fleet_hold(mut self, note: Option<String>) -> Self {
+        if let Some(note) = note {
+            if !self.inner.get_mut().expect("Drain mutex poisoned").active {
+                log::warn!("{note}");
+                self.set_hold(note, true);
+            }
+        }
+        self
+    }
+
+    /// Hold dispatch at runtime because the fleet store now says `paused`
+    /// (#9598) — the timer-pass counterpart of [`Self::with_fleet_hold`].
+    ///
+    /// Returns `true` only when this call newly placed the hold. A drain of any
+    /// other kind already in progress is left strictly alone: it already pauses
+    /// dispatch (which is all `paused` asks for) and its terminal action is the
+    /// operator's, not the store's.
+    pub fn hold_for_fleet_state(&self, note: String) -> bool {
+        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        if inner.active {
+            return false;
+        }
+        let at = Utc::now();
+        inner.active = true;
+        inner.startup_hold = true;
+        inner.fleet_hold = true;
+        inner.origin = DrainOrigin::Operator;
+        inner.started_at = Some(at);
+        inner.note = Some(note);
+        self.flag.store(true, Ordering::Relaxed);
+        self.ledger_after(inner, at, true);
+        true
+    }
+
+    /// Release a hold [`Self::hold_for_fleet_state`] / [`Self::with_fleet_hold`]
+    /// placed, because the store now says `running` (#9598). Returns `true` when
+    /// a fleet hold was actually released.
+    ///
+    /// Scoped to `fleet_hold`: a #9588 operator-stop hold, a supervised operator
+    /// drain and an auto-update roll are all left in place — the store may say
+    /// "this host should be dispatching" without that overriding a local
+    /// operator's `restart --drain` or the updater's in-flight roll.
+    pub fn release_fleet_hold(&self) -> bool {
+        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        if !inner.fleet_hold {
+            return false;
+        }
+        self.flag.store(false, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        inner.active = false;
+        inner.deadline = None;
+        inner.startup_hold = false;
+        inner.fleet_hold = false;
+        inner.timed_out = false;
+        inner.note = Some(
+            "fleet-state hold released — the fleet store's fleet/state.yml says this host is \
+             running again, so dispatch resumed"
+                .to_string(),
+        );
+        self.ledger_after(inner, Utc::now(), false);
+        true
+    }
+
+    /// Whether dispatch is currently held because the fleet store says `paused`
+    /// (#9598) — what the sync timer compares the store's latest answer against.
+    #[must_use]
+    pub fn is_fleet_held(&self) -> bool {
+        self.inner.lock().expect("Drain mutex poisoned").fleet_hold
+    }
+
+    /// The supervisor-less startup hold shared by #9588's operator-stop record
+    /// and #9598's fleet `paused` state. Takes `&mut self` because both callers
+    /// are constructors, so no lock contention is possible and the #8652 ledger
+    /// is deliberately not opened: a hold placed before the process has an
+    /// event loop has no interval to close if the boot then fails.
+    fn set_hold(&mut self, note: String, fleet: bool) {
+        let inner = self.inner.get_mut().expect("Drain mutex poisoned");
+        inner.active = true;
+        inner.startup_hold = true;
+        inner.fleet_hold = fleet;
+        inner.origin = DrainOrigin::Operator;
+        inner.started_at = Some(Utc::now());
+        inner.note = Some(note);
+        self.flag.store(true, Ordering::Relaxed);
     }
 
     /// Write the operator-stop record for a then-exit drain (#9588). Never
@@ -508,6 +608,10 @@ impl DrainState {
         };
         inner.timed_out = false;
         inner.startup_hold = false;
+        // #9598: a real, supervised drain replaces a fleet-state hold — the
+        // operator's terminal action (relaunch / stay down) now owns the pause,
+        // so the store must not be able to release it out from under them.
+        inner.fleet_hold = false;
         // Set the flag while holding the descriptor lock so status can never
         // observe `flag=true` with `active=false`.
         self.flag.store(true, Ordering::Relaxed);
@@ -553,14 +657,24 @@ impl DrainState {
         inner.roll_pending = false;
         inner.roll_target = None;
         let was_held = inner.startup_hold;
+        let was_fleet = inner.fleet_hold;
         inner.timed_out = false;
         inner.startup_hold = false;
+        inner.fleet_hold = false;
         if was_held {
-            inner.note = Some(
+            inner.note = Some(if was_fleet {
+                // #9598: naming the store matters — an `--abort-drain` here only
+                // resumes dispatch until the next sync pass re-reads `paused`.
+                "fleet-state hold released by operator — dispatch resumed, but the fleet store \
+                 still says this host is paused, so the next sync pass will hold it again. Propose \
+                 `running` in the store (`loom-daemon fleet-config propose state running`) to make \
+                 it stick."
+                    .to_string()
+            } else {
                 "startup hold released by operator — the operator-stop record was cleared and \
                  dispatch resumed"
-                    .to_string(),
-            );
+                    .to_string()
+            });
         }
         self.ledger_after(inner, Utc::now(), false);
         // #9588: an operator abort undoes the stop intent as well.

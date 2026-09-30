@@ -8,18 +8,24 @@
 //! copy safe: a credential path added on one side of the language boundary
 //! but not the other fails here instead of silently leaving a stager
 //! unguarded. Covers `defaults/scripts/land-resync-commit.sh`,
-//! `defaults/scripts/resync-installed.sh`, `scripts/install-loom.sh`, and
-//! `install.sh`.
+//! `scripts/install-loom.sh`, and `install.sh`.
+//!
+//! `defaults/scripts/resync-installed.sh` used to carry a copy too — the
+//! `':!…'` exclusion list on the `git add -A` recipe its `--output` mode
+//! printed. #9141 removed that recipe entirely in favour of an allowlist of
+//! the paths the run actually wrote, so the script no longer needs to know
+//! what a credential path looks like: an allowlist has no "everything else"
+//! to leak. `resync_surface_parity_tests.rs` asserts the exclusion form does
+//! not come back.
 
 use super::post_init::EPHEMERAL_PATTERNS;
 use super::{is_credential_path, CREDENTIAL_PATTERNS};
 use std::collections::BTreeSet;
 
 const LAND_RESYNC_COMMIT: &str = include_str!("../../../defaults/scripts/land-resync-commit.sh");
-const RESYNC_INSTALLED: &str = include_str!("../../../defaults/scripts/resync-installed.sh");
 // #8734: the two "initial commit" `git add -A` sites audited alongside
-// land-resync-commit.sh / resync-installed.sh above. Unlike those two, these
-// are top-level installer entry points, not `defaults/` payload.
+// land-resync-commit.sh above. Unlike it, these are top-level installer entry
+// points, not `defaults/` payload.
 const SCRIPTS_INSTALL_LOOM: &str = include_str!("../../../scripts/install-loom.sh");
 const INSTALL_SH: &str = include_str!("../../../install.sh");
 
@@ -64,10 +70,9 @@ fn land_resync_commit_array() -> BTreeSet<String> {
     body[..end].split_whitespace().map(str::to_string).collect()
 }
 
-/// Extract every `':!<path>'` exclusion from a `git add -A -- . ...` line
-/// (a printed next-steps recipe, or one this file actually executes).
-/// Shared by resync-installed.sh's printed suggestion and the executed
-/// `git add -A -- .` calls in scripts/install-loom.sh / install.sh.
+/// Extract every `':!<path>'` exclusion from a `git add -A -- . ...` line.
+/// Shared by the executed `git add -A -- .` calls in
+/// scripts/install-loom.sh / install.sh.
 fn pathspec_excludes(content: &str, source_name: &str) -> BTreeSet<String> {
     let line = content
         .lines()
@@ -135,20 +140,12 @@ fn land_resync_commit_array_matches_rust_class() {
 }
 
 #[test]
-fn resync_installed_pathspec_matches_rust_class() {
-    assert_eq!(
-        pathspec_excludes(RESYNC_INSTALLED, "defaults/scripts/resync-installed.sh"),
-        rust_class_pathspec_glob(),
-        "defaults/scripts/resync-installed.sh's printed `git add -A` exclusions have drifted \
-         from loom-daemon/src/init/post_init.rs CREDENTIAL_PATTERNS — keep them identical (#8005)"
-    );
-}
-
-#[test]
 fn install_loom_sh_pathspec_matches_rust_class() {
     // #8734: scripts/install-loom.sh's "Create initial commit" `git add -A`
     // (the non-git-repo bootstrap path) carries its own literal copy of the
-    // exclusion pathspec, same reasoning as resync-installed.sh's above.
+    // exclusion pathspec — an `-A` add over a tree that is not yet a repo, so
+    // there is no "what this run wrote" allowlist available to it the way
+    // resync-installed.sh has one.
     assert_eq!(
         pathspec_excludes(SCRIPTS_INSTALL_LOOM, "scripts/install-loom.sh"),
         rust_class_pathspec_glob(),
@@ -208,4 +205,42 @@ fn is_credential_path_matching_contract() {
     assert!(!is_credential_path(".loom/account-health.json"));
     assert!(!is_credential_path(".loom-local/local.json"));
     assert!(!is_credential_path(".loom/hooks/foo.sh"));
+}
+
+/// The #9046 leak's literal footprint, path by path (#9141).
+///
+/// #9134 widened the *matching contract* to a prefix match, which is what
+/// already covers these — but it was written before commit `a9da48c2` was
+/// analysed, so nothing in the suite named the paths that actually leaked.
+/// This pins them by name: every one of the 26 paths that reached a resync
+/// commit is in the class, so no future "simplification" of the contract back
+/// to exact-path matching can pass CI. `.loom/tokens` alone does NOT cover
+/// them — that is precisely the assumption the incident falsified.
+#[test]
+fn the_a9da48c2_token_pool_copy_footprint_is_in_the_class() {
+    let pool = ".loom/tokens.shadow-disabled-20260926T021559Z";
+    // The 21 `.token` files.
+    for i in 1..=21 {
+        let p = format!("{pool}/acct-{i}.token");
+        assert!(
+            is_credential_path(&p),
+            "{p} leaked in a9da48c2 and must be in the credential class (#9141)"
+        );
+    }
+    // The pool's bookkeeping files, which leaked alongside them.
+    for leaf in [
+        ".ranking",
+        ".ranking.classes.json",
+        ".rotation_cursor",
+        ".bad_tokens",
+    ] {
+        let p = format!("{pool}/{leaf}");
+        assert!(
+            is_credential_path(&p),
+            "{p} leaked in a9da48c2 and must be in the credential class (#9141)"
+        );
+    }
+    // The directory itself, and the `-` separator variant of the same rename.
+    assert!(is_credential_path(pool));
+    assert!(is_credential_path(".loom/tokens-shadow-disabled-20260926T021559Z/acct-1.token"));
 }

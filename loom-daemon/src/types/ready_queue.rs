@@ -243,6 +243,13 @@ pub struct ReadyQueueRow {
     /// finder does not order by it.
     #[serde(default)]
     pub tier: Option<String>,
+    /// The issue's resolved story-point size (#9432, from its single
+    /// `points:*` label), when the listing supplied a legal one (Issue
+    /// #9674). `None` for an unsized issue, a stacked/out-of-vocabulary
+    /// defect (never a guess — see `crate::story_points`), or a pre-#9674
+    /// wire payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u32>,
     /// What the work finder did with it.
     pub disposition: QueueDisposition,
     /// Specifics, when there are any: the park label, the open PR number, the
@@ -281,6 +288,8 @@ mod tests {
         assert_eq!(row.created_at, None);
         // A pre-phase-2 payload has no `state`/`reason`: they default empty.
         assert!(row.state.is_empty() && row.reason.is_empty());
+        // A pre-#9674 payload has no `story_points`: it defaults absent.
+        assert_eq!(row.story_points, None);
         // A pre-#9288 payload has no plan fields: they default.
         assert_eq!(row.plan, crate::types::RowPlan::default());
     }

@@ -23,11 +23,13 @@
 //! `fleet_store`, like the daemon's other conditional reads.
 
 use std::cell::RefCell;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use serde_json::Value;
 
 use super::fetch::{Reply, Transport};
 use crate::credential_preflight::{self as cp, GithubAppMinter, GithubAppOutcome};
@@ -148,6 +150,79 @@ impl GhTransport {
         );
         *self.last_used.borrow_mut() = Some(cred.clone());
         Ok((response, stderr, out.status.success()))
+    }
+
+    /// One write call (`gh api --method POST/PUT … --input -`), always under
+    /// the writer credential — never the reader, which is never granted
+    /// write scope on the store (see the module docs). Any HTTP status,
+    /// including a 403/404 that means the writer app's installation lacks
+    /// `contents: write` / `pull_requests: write`, comes back as `Ok`; only a
+    /// request `gh` itself could not complete at all is `Err`.
+    pub(crate) fn write_raw(&self, method: &str, api_path: &str, body: &Value) -> Result<Reply> {
+        let cred = self.writer();
+        let mut cmd = Command::new(&self.gh_bin);
+        cmd.arg("api")
+            .arg("--include")
+            .arg("--method")
+            .arg(method)
+            .arg(api_path)
+            .arg("--input")
+            .arg("-");
+        if let Credential::ConfigDir { dir, .. } = &cred {
+            cmd.env("GH_CONFIG_DIR", dir);
+        }
+        cmd.current_dir(&self.workspace_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to invoke {}", self.gh_bin))?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("gh api stdin was not piped"))?;
+            let payload =
+                serde_json::to_string(body).context("encoding the gh api request body")?;
+            stdin
+                .write_all(payload.as_bytes())
+                .context("writing the gh api request body")?;
+        }
+        let out = child
+            .wait_with_output()
+            .with_context(|| format!("reading {} output", self.gh_bin))?;
+        let response =
+            crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout));
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        crate::forge_call_stats::record_gh_api(
+            "fleet_store_write",
+            response.as_ref(),
+            out.status.success(),
+            &stderr,
+        );
+        *self.last_used.borrow_mut() = Some(cred.clone());
+        let response = response.ok_or_else(|| {
+            anyhow::anyhow!(
+                "gh api {method} {api_path} failed before an HTTP response: {}",
+                if stderr.is_empty() {
+                    "no output"
+                } else {
+                    &stderr
+                }
+            )
+        })?;
+        Ok(Reply {
+            status: response.status,
+            etag: response.etag,
+            body: response.body,
+        })
+    }
+}
+
+impl super::propose::WriteTransport for GhTransport {
+    fn write(&self, method: &str, api_path: &str, body: &Value) -> Result<Reply> {
+        self.write_raw(method, api_path, body)
     }
 }
 

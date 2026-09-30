@@ -38,6 +38,7 @@ pub mod dispatch;
 pub mod disposition;
 pub mod dwell;
 pub mod host;
+pub mod lockout;
 pub mod pool_marks;
 pub mod queue;
 pub mod quota;

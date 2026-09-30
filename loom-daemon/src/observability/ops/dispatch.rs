@@ -169,13 +169,32 @@ pub fn tick_span(
 /// and `loom.dispatch.reason` (the `loom.dispatch.decisions` reason), plus
 /// `loom.repo`/`loom.repo.visibility` (Issue #9222) when `repo_refs` has an
 /// entry for the admission's `workspace_idx` — omitted, never a local path,
-/// when it does not.
+/// when it does not — and the candidate's queue position (Issue #9669):
+/// `loom.queue.candidate_rank` (1-indexed position in the shaped pass-2
+/// candidate order) and `loom.queue.total_candidates` (its length), present
+/// only when the tick recorded a plan order that names this admission — a
+/// single-workspace tick records none.
+///
+/// A `pr_open` admission (the #4123 guard's skip) in a repo `lockouts` says
+/// is locked also carries that repo's lockout attributes (Issue #9674):
+/// `lockout.frozen_candidates_count`, `lockout.frozen_points_sum` and
+/// `lockout.duration_seconds` — the same facts the
+/// `loom.dispatch.disposition` span for the same refusal carries, on the
+/// tick-time span an operator reaches first.
 #[must_use]
 pub fn admission_spans(
     report: &TickReport,
     tick: &SpanRecord,
     repo_refs: &HashMap<usize, QueueRepoRef>,
+    lockouts: &HashMap<String, crate::observability::ops::lockout::RepoLockout>,
 ) -> Vec<SpanRecord> {
+    let candidate_ranks: HashMap<(usize, u32), u32> = report
+        .plan_order
+        .iter()
+        .zip(1u32..)
+        .map(|(key, position)| (*key, position))
+        .collect();
+    let total_candidates = report.plan_order.len();
     report
         .admissions
         .iter()
@@ -194,6 +213,33 @@ pub fn admission_spans(
                 attributes.insert(
                     "loom.repo.visibility".to_string(),
                     visibility_str(repo_ref.visibility).to_string(),
+                );
+                // Issue #9674: stamp the repo's lockout weight on the very
+                // admission spans the open-PR guard produced.
+                if admission.reason == "pr_open" {
+                    if let Some(lockout) = lockouts.get(&repo_ref.repo) {
+                        attributes.insert(
+                            "lockout.frozen_candidates_count".to_string(),
+                            lockout.backlog.candidates.to_string(),
+                        );
+                        attributes.insert(
+                            "lockout.frozen_points_sum".to_string(),
+                            i64::try_from(lockout.backlog.points)
+                                .unwrap_or(i64::MAX)
+                                .to_string(),
+                        );
+                        if let Some(secs) = lockout.duration_secs {
+                            attributes
+                                .insert("lockout.duration_seconds".to_string(), secs.to_string());
+                        }
+                    }
+                }
+            }
+            if let Some(rank) = candidate_ranks.get(&(admission.workspace_idx, admission.issue)) {
+                attributes.insert("loom.queue.candidate_rank".to_string(), rank.to_string());
+                attributes.insert(
+                    "loom.queue.total_candidates".to_string(),
+                    int(total_candidates).to_string(),
                 );
             }
             crate::telemetry::trace::provenance::stamp(&mut attributes);
@@ -231,23 +277,34 @@ fn visibility_str(visibility: crate::telemetry::RepoVisibility) -> &'static str 
     }
 }
 
-/// The workspace roots referenced by `admissions`, resolved through the
-/// synchronous [`super::super::repo_ref::cached_repo_ref`] cache the collector
-/// populates on its own cadence (Issue #9222). Never shells out itself — a
-/// root not yet resolved this process is simply absent from the map, which
-/// [`admission_spans`] reads as "omit `loom.repo`".
-fn resolved_repo_refs(admissions: &[Admission], roots: &[PathBuf]) -> HashMap<usize, QueueRepoRef> {
+/// The workspace roots referenced by `admissions` and by `report`'s ready-
+/// queue rows, resolved through the synchronous
+/// [`super::super::repo_ref::cached_repo_ref`] cache the collector populates
+/// on its own cadence (Issue #9222). Never shells out itself — a root not yet
+/// resolved this process is simply absent from the map, which
+/// [`admission_spans`] reads as "omit `loom.repo`". The queue rows are in the
+/// resolution set (Issue #9674) so a repo whose candidates were all refused
+/// pre-dispatch still resolves, keeping the lockout aggregation slug-keyed.
+fn resolved_repo_refs(
+    admissions: &[Admission],
+    queue: &[crate::work_finder::ready_queue::TickQueueRow],
+    roots: &[PathBuf],
+) -> HashMap<usize, QueueRepoRef> {
     let mut resolved = HashMap::new();
-    for admission in admissions {
-        if resolved.contains_key(&admission.workspace_idx) {
+    let idxs = admissions
+        .iter()
+        .map(|a| a.workspace_idx)
+        .chain(queue.iter().map(|r| r.key.workspace_idx));
+    for idx in idxs {
+        if resolved.contains_key(&idx) {
             continue;
         }
-        let Some(root) = roots.get(admission.workspace_idx) else {
+        let Some(root) = roots.get(idx) else {
             continue;
         };
         if let Some(repo_ref) = super::super::repo_ref::cached_repo_ref(&root.display().to_string())
         {
-            resolved.insert(admission.workspace_idx, repo_ref);
+            resolved.insert(idx, repo_ref);
         }
     }
     resolved
@@ -296,9 +353,31 @@ pub fn record_tick(
     let Some(sink) = super::global_ops_sink() else {
         return;
     };
+    // Issue #9674: aggregate this tick's pr-open-skip rows per repo, advance
+    // the global lockout clock at the tick boundary (insert-if-absent; the
+    // disposition sampler is the clearing authority), and stamp the repo's
+    // weight on the guard's own `pr_open` admission spans below. A workspace
+    // whose listing failed this tick is absent from `report.queue` without
+    // that being evidence of a cleared lock — mirror the disposition sampler's
+    // failed-repo discipline (unresolvable roots are dropped, the same
+    // accepted edge case its own `failed_slugs` documents).
+    let repo_refs = resolved_repo_refs(&report.admissions, &report.queue, roots);
+    let failed: Vec<String> = report
+        .listing_failed
+        .iter()
+        .filter_map(|idx| repo_refs.get(idx).map(|r| r.repo.clone()))
+        .collect();
+    let lockouts = crate::observability::ops::lockout::sample(
+        report.queue.iter().filter_map(|row| {
+            let slug = repo_refs.get(&row.key.workspace_idx)?.repo.as_str();
+            let disposition = row.disposition?;
+            Some((slug, disposition, row.story_points))
+        }),
+        &failed,
+        completed_at,
+    );
     let tick = tick_span(report, max_concurrent, started_at, completed_at);
-    let repo_refs = resolved_repo_refs(&report.admissions, roots);
-    for span in admission_spans(report, &tick, &repo_refs) {
+    for span in admission_spans(report, &tick, &repo_refs, &lockouts) {
         sink.emit_span(span);
     }
     *last_tick_slot()

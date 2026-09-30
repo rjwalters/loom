@@ -298,6 +298,7 @@ mod tests {
             main_red_fix: false,
             created_at: None,
             tier: None,
+            story_points: None,
             disposition: d,
             detail: None,
             state: d.state().into(),

@@ -25,6 +25,11 @@ fn row(slug: &str, issue: u32, rank: usize, disposition: Qd) -> DispositionRow {
         disposition,
         park_label: None,
         pr_number: None,
+        candidate_rank: u32::try_from(rank).unwrap_or(u32::MAX),
+        total_candidates: 1,
+        priority_score: None,
+        story_points: None,
+        halt_cause: None,
     }
 }
 
@@ -140,6 +145,7 @@ fn summary_row(
         main_red_fix: false,
         created_at: None,
         tier: None,
+        story_points: None,
         disposition,
         detail: detail.map(str::to_string),
         state: disposition.state().to_string(),
@@ -209,6 +215,63 @@ fn loom_repo_is_the_resolved_slug_never_the_local_path() {
     assert!(!rows[0].slug.starts_with('/'));
 }
 
+/// Issue #9669: every row carries its 1-indexed queue position (the plan's
+/// pass-2 position when annotated, else the comparator rank — a blocked row's
+/// would-be position), the tick's ready-queue depth as the denominator, and
+/// the comparator keys as the `priority_score` JSON object.
+#[test]
+fn build_rows_extracts_queue_position_metadata() {
+    use crate::types::PlanKey;
+
+    let key = |name: &str, value: serde_json::Value| PlanKey {
+        name: name.to_string(),
+        value,
+    };
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    let mut planned = summary_row("/repo", 7, 3, Qd::DeferredCapacity, None);
+    planned.plan.position = Some(2);
+    planned.plan.keys = vec![
+        key("operator_priority", serde_json::Value::Bool(false)),
+        key("main_red_fix", serde_json::Value::Bool(false)),
+        key("workspace_priority", serde_json::json!(100)),
+    ];
+    // Issue 9 is blocked (no plan position): its rank is the fallback.
+    let mut blocked = summary_row("/repo", 9, 1, Qd::Parked, Some("loom:blocked"));
+    blocked.plan.keys = planned.plan.keys.clone();
+    let summary = WorkFinderTickSummary {
+        queue: vec![planned, blocked],
+        ..Default::default()
+    };
+    let (rows, dropped) = build_rows(&summary, &repos);
+    assert!(dropped.unresolved == 0 && dropped.truncated == 0);
+    assert_eq!(rows.len(), 2);
+    // Every row sees the same denominator: the tick's ready-queue depth.
+    assert_eq!(rows.iter().map(|r| r.total_candidates).collect::<Vec<_>>(), [2, 2]);
+    // The planned row's candidate_rank is its pass-2 position, not its rank.
+    assert_eq!(rows[0].candidate_rank, 2);
+    // The blocked row has no plan position: the comparator rank stands in.
+    assert_eq!(rows[1].candidate_rank, 1);
+    // priority_score is the comparator keys, compact JSON in key order.
+    let expected = r#"{"operator_priority":false,"main_red_fix":false,"workspace_priority":100}"#;
+    assert_eq!(rows[0].priority_score.as_deref(), Some(expected));
+    assert_eq!(rows[1].priority_score.as_deref(), Some(expected));
+}
+
+/// Issue #9669: a row without a plan annotation (no keys) carries no
+/// `priority_score` — the attribute is omitted, never fabricated.
+#[test]
+fn a_row_without_plan_keys_has_no_priority_score() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row("/repo", 7, 1, Qd::DeferredCapacity, None)],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].priority_score, None);
+}
+
 // ------------------------------------------------------------------ park_label / pr_number
 
 #[test]
@@ -238,8 +301,8 @@ fn park_label_is_present_only_for_a_label_in_the_closed_vocabulary() {
     let (rows, _) = build_rows(&summary, &repos);
     assert_eq!(rows[0].park_label, None);
 
-    // HardExclusion's rule string ("external") is not in the closed
-    // vocabulary either.
+    // HardExclusion's rule string ("external") IS in its own closed
+    // vocabulary now (#9672): the span names which rule declined the issue.
     let summary = WorkFinderTickSummary {
         queue: vec![summary_row(
             "/repo",
@@ -251,7 +314,7 @@ fn park_label_is_present_only_for_a_label_in_the_closed_vocabulary() {
         ..Default::default()
     };
     let (rows, _) = build_rows(&summary, &repos);
-    assert_eq!(rows[0].park_label, None);
+    assert_eq!(rows[0].park_label.as_deref(), Some("external"));
 
     // A disposition that never carries a park label ignores detail text
     // entirely, however label-shaped it looks.
@@ -295,6 +358,165 @@ fn pr_number_is_present_only_for_open_pr_rows() {
     assert_eq!(rows[0].pr_number, None);
 }
 
+// --------------------------------------------------------------------------- halt_cause (#9673)
+
+fn repos_with_repo() -> HashMap<String, QueueRepoRef> {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    repos
+}
+
+#[test]
+fn halt_cause_is_present_only_for_a_closed_vocabulary_detail() {
+    let repos = repos_with_repo();
+
+    // A real #9017 halt-cause token survives, verbatim.
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row(
+            "/repo",
+            1,
+            1,
+            Qd::WorkspaceHalted,
+            Some("main_red"),
+        )],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].halt_cause.as_deref(), Some("main_red"));
+
+    // A cause-less legacy row (a pre-#9017 caller) exports nothing.
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row("/repo", 2, 1, Qd::WorkspaceHalted, None)],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].halt_cause, None);
+
+    // A detail token outside the closed vocabulary is never exported.
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row(
+            "/repo",
+            3,
+            1,
+            Qd::WorkspaceHalted,
+            Some("sorta_halted"),
+        )],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].halt_cause, None);
+
+    // A disposition that never carries a halt cause ignores detail text
+    // entirely, however cause-shaped it looks.
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row(
+            "/repo",
+            4,
+            1,
+            Qd::DeferredCapacity,
+            Some("main_red"),
+        )],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].halt_cause, None);
+}
+
+#[test]
+fn every_halt_cause_token_round_trips_through_the_wire_vocabulary() {
+    // The exporter re-emits `HaltCause::from_wire(..)?.as_str()`, so each
+    // closed-vocabulary token must survive the round trip unchanged.
+    for cause in crate::work_finder::halt_cause::HaltCause::ALL {
+        assert_eq!(HaltCause::from_wire(cause.as_str()), Some(cause));
+    }
+}
+
+#[test]
+fn workspace_halted_emission_carries_the_halt_cause_attribute() {
+    let emission = Emission {
+        disposition: Qd::WorkspaceHalted,
+        park_label: None,
+        halt_cause: Some("token_pool".to_string()),
+        ..changed_emission()
+    };
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
+    assert_eq!(span.attributes["loom.queue.disposition"], "workspace_halted");
+    assert_eq!(span.attributes["loom.queue.state"], "blocked");
+    assert_eq!(span.attributes["loom.queue.halt_cause"], "token_pool");
+    // The key must survive the export-time attribute allowlist
+    // (`OPS_SPAN_ATTRIBUTE_KEYS` is re-applied at export), or the attribute
+    // would silently never reach SigNoz.
+    let bounded = span.clone().bounded();
+    assert_eq!(bounded.attributes["loom.queue.halt_cause"], "token_pool");
+    assert!(span.validate().is_ok());
+
+    // No halt cause, no attribute — a cause-less legacy row stays
+    // indistinguishable from a pre-#9673 span rather than exporting an empty
+    // value.
+    let emission = Emission {
+        disposition: Qd::WorkspaceHalted,
+        park_label: None,
+        halt_cause: None,
+        ..changed_emission()
+    };
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
+    assert!(!span.attributes.contains_key("loom.queue.halt_cause"));
+}
+
+// ------------------------------------------------------------------ hard_exclusion label (#9672)
+
+#[test]
+fn hard_exclusion_rows_export_exactly_the_closed_exclusion_labels() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+
+    // Every HARD_EXCLUSION_LABELS entry exports verbatim, so a span can say
+    // WHICH rule declined the issue.
+    for label in crate::hard_exclusion::HARD_EXCLUSION_LABELS {
+        let summary = WorkFinderTickSummary {
+            queue: vec![summary_row("/repo", 1, 1, Qd::HardExclusion, Some(label))],
+            ..Default::default()
+        };
+        let (rows, _) = build_rows(&summary, &repos);
+        assert_eq!(rows[0].park_label.as_deref(), Some(*label));
+    }
+
+    // A detail string outside every closed vocabulary still never exports —
+    // including one on a HardExclusion row (forward compatibility for rules
+    // not yet in HARD_EXCLUSION_LABELS).
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row(
+            "/repo",
+            2,
+            1,
+            Qd::HardExclusion,
+            Some("team:never-build"),
+        )],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].park_label, None);
+}
+
+#[test]
+fn hard_exclusion_emission_carries_the_label_attribute_through_the_export_allowlist() {
+    let emission = Emission {
+        disposition: Qd::HardExclusion,
+        park_label: Some("external".to_string()),
+        halt_cause: None,
+        ..changed_emission()
+    };
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
+    assert_eq!(span.attributes["loom.queue.disposition"], "hard_exclusion");
+    assert_eq!(span.attributes["loom.queue.park_label"], "external");
+    // `loom.queue.park_label` is already in both the span allowlist and the
+    // collector gateway's keep_keys, so reusing it for #9672 adds no new
+    // allowlist surface — assert the export-time bound anyway.
+    let bounded = span.clone().bounded();
+    assert_eq!(bounded.attributes["loom.queue.park_label"], "external");
+    assert!(span.validate().is_ok());
+}
+
 // --------------------------------------------------------------------------- build_span
 
 fn changed_emission() -> Emission {
@@ -308,12 +530,19 @@ fn changed_emission() -> Emission {
         transition: Transition::Changed,
         park_label: Some("loom:blocked".to_string()),
         pr_number: None,
+        candidate_rank: Some(2),
+        total_candidates: Some(7),
+        priority_score: Some(
+            r#"{"operator_priority":false,"main_red_fix":false,"workspace_priority":100}"#
+                .to_string(),
+        ),
+        halt_cause: None,
     }
 }
 
 #[test]
 fn every_attribute_survives_the_export_time_allowlist() {
-    let span = build_span(&changed_emission(), Utc::now(), None);
+    let span = build_span(&changed_emission(), Utc::now(), None, &HashMap::new());
     assert_eq!(span.clone().bounded().attributes, span.attributes);
     assert_eq!(span.name, SpanName::DispatchDisposition);
     assert_eq!(span.attributes["loom.repo"], "acme/widgets");
@@ -322,6 +551,13 @@ fn every_attribute_survives_the_export_time_allowlist() {
     assert_eq!(span.attributes["loom.queue.disposition"], "deferred_saturation");
     assert_eq!(span.attributes["loom.queue.state"], "ready");
     assert_eq!(span.attributes["loom.queue.rank"], "3");
+    // Queue-position metadata (Issue #9669).
+    assert_eq!(span.attributes["loom.queue.candidate_rank"], "2");
+    assert_eq!(span.attributes["loom.queue.total_candidates"], "7");
+    assert_eq!(
+        span.attributes["loom.queue.priority_score"],
+        r#"{"operator_priority":false,"main_red_fix":false,"workspace_priority":100}"#
+    );
     assert_eq!(span.attributes["loom.queue.transition"], "changed");
     assert_eq!(span.attributes["loom.queue.previous_disposition"], "deferred_capacity");
     assert_eq!(span.attributes["loom.queue.park_label"], "loom:blocked");
@@ -336,10 +572,18 @@ fn left_queue_emission_omits_rank_and_previous_disposition() {
         previous_disposition: None,
         park_label: None,
         pr_number: None,
+        candidate_rank: None,
+        total_candidates: None,
+        priority_score: None,
         ..changed_emission()
     };
-    let span = build_span(&emission, Utc::now(), None);
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
     assert!(!span.attributes.contains_key("loom.queue.rank"));
+    // Issue #9669: a row that left the queue is no longer ranked, so none of
+    // the queue-position metadata is exported either.
+    assert!(!span.attributes.contains_key("loom.queue.candidate_rank"));
+    assert!(!span.attributes.contains_key("loom.queue.total_candidates"));
+    assert!(!span.attributes.contains_key("loom.queue.priority_score"));
     assert!(!span
         .attributes
         .contains_key("loom.queue.previous_disposition"));
@@ -348,14 +592,141 @@ fn left_queue_emission_omits_rank_and_previous_disposition() {
 
 #[test]
 fn a_span_is_parented_to_the_tick_when_given_a_context_and_a_root_otherwise() {
-    let root_span = build_span(&changed_emission(), Utc::now(), None);
+    let root_span = build_span(&changed_emission(), Utc::now(), None, &HashMap::new());
     assert_eq!(root_span.parent_span_id, None);
 
     let parent = crate::telemetry::trace::TraceContext::derived("dispatch.tick", &["k"]);
-    let child_span = build_span(&changed_emission(), Utc::now(), Some(&parent));
+    let child_span = build_span(&changed_emission(), Utc::now(), Some(&parent), &HashMap::new());
     assert_eq!(child_span.parent_span_id, Some(parent.span_id.clone()));
     assert_eq!(child_span.context.trace_id, parent.trace_id);
     assert_ne!(child_span.context.span_id, parent.span_id);
+}
+
+// --------------------------------------------------------------------------- lockout stamping (Issue #9674)
+
+use super::super::lockout::{FrozenBacklog, RepoLockout};
+
+fn locked_map(
+    slug: &str,
+    backlog: FrozenBacklog,
+    duration: Option<i64>,
+) -> HashMap<String, RepoLockout> {
+    HashMap::from([(
+        slug.to_string(),
+        RepoLockout {
+            backlog,
+            duration_secs: duration,
+        },
+    )])
+}
+
+/// An `open_pr` span in a locked repo carries the repo's whole lockout
+/// weight: candidate count, summed story points, and the observation-floor
+/// clock — and everything survives the export-time allowlist, so the facts
+/// actually reach SigNoz.
+#[test]
+fn an_open_pr_span_in_a_locked_repo_carries_the_lockout_weight() {
+    let emission = Emission {
+        disposition: Qd::OpenPr,
+        park_label: None,
+        pr_number: Some(456),
+        ..changed_emission()
+    };
+    let lockouts = locked_map(
+        "acme/widgets",
+        FrozenBacklog {
+            candidates: 51,
+            points: 97,
+        },
+        Some(3_600),
+    );
+    let span = build_span(&emission, Utc::now(), None, &lockouts);
+    assert_eq!(span.attributes["loom.queue.disposition"], "open_pr");
+    assert_eq!(span.attributes["lockout.frozen_candidates_count"], "51");
+    assert_eq!(span.attributes["lockout.frozen_points_sum"], "97");
+    assert_eq!(span.attributes["lockout.duration_seconds"], "3600");
+    assert_eq!(span.clone().bounded().attributes, span.attributes);
+}
+
+/// The count/sum attributes are the lock itself — stamped even while the
+/// clock has no reading yet — while a repo under no lock stays silent.
+#[test]
+fn lockout_attributes_are_absent_without_a_lock_or_outside_open_pr_rows() {
+    // OpenPr row, but this sample's rows say the repo is not locked.
+    let emission = Emission {
+        disposition: Qd::OpenPr,
+        pr_number: Some(456),
+        park_label: None,
+        ..changed_emission()
+    };
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
+    assert!(!span
+        .attributes
+        .contains_key("lockout.frozen_candidates_count"));
+    assert!(!span.attributes.contains_key("lockout.frozen_points_sum"));
+    assert!(!span.attributes.contains_key("lockout.duration_seconds"));
+
+    // Locked repo, but the row is a different disposition: the repo's other
+    // rows do not double-report the lock.
+    let lockouts = locked_map(
+        "acme/widgets",
+        FrozenBacklog {
+            candidates: 2,
+            points: 5,
+        },
+        Some(30),
+    );
+    let span = build_span(&changed_emission(), Utc::now(), None, &lockouts);
+    assert!(!span
+        .attributes
+        .contains_key("lockout.frozen_candidates_count"));
+
+    // A zero-duration clock (first observation) still stamps `0`, not absence.
+    let emission = Emission {
+        disposition: Qd::OpenPr,
+        pr_number: Some(1),
+        park_label: None,
+        ..changed_emission()
+    };
+    let lockouts = locked_map(
+        "acme/widgets",
+        FrozenBacklog {
+            candidates: 1,
+            points: 0,
+        },
+        Some(0),
+    );
+    let span = build_span(&emission, Utc::now(), None, &lockouts);
+    assert_eq!(span.attributes["lockout.duration_seconds"], "0");
+}
+
+/// A `left_queue` span never reports lock state: the row has already left the
+/// queue, so the repo's current lock is not this row's story.
+#[test]
+fn a_left_queue_span_never_carries_lockout_attributes() {
+    let emission = Emission {
+        transition: Transition::LeftQueue,
+        rank: None,
+        previous_disposition: None,
+        park_label: None,
+        pr_number: None,
+        disposition: Qd::OpenPr,
+        ..changed_emission()
+    };
+    let lockouts = locked_map(
+        "acme/widgets",
+        FrozenBacklog {
+            candidates: 1,
+            points: 3,
+        },
+        Some(60),
+    );
+    let span = build_span(&emission, Utc::now(), None, &lockouts);
+    assert_eq!(span.attributes["loom.queue.transition"], "left_queue");
+    assert!(!span
+        .attributes
+        .contains_key("lockout.frozen_candidates_count"));
+    assert!(!span.attributes.contains_key("lockout.duration_seconds"));
 }
 
 // --------------------------------------------------------------------------- record()

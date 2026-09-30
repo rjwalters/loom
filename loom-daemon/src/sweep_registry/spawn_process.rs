@@ -102,6 +102,7 @@ impl SweepRegistry {
             }
         };
         let mut cmd = Command::new(&spawn_bin);
+        cmd.env(crate::provenance::origin::ENV, "autonomous");
         cmd.arg("-p").arg(&prompt);
         // Model selection (issue #3477, Phase 1): the dispatch-param tier of
         // the precedence chain. Appended as an explicit `--model` arg (which

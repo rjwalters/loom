@@ -124,8 +124,8 @@ jobs:
               # The observability artifacts are Rust-tested seams, not inert
               # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs
               # and cycle_time_artifacts.rs all `include_str!` these files and
-              # fail on drift, and cycle_time_clickhouse.rs executes the SQL
-              # verbatim against a real ClickHouse. An artifact-only PR must
+              # fail on drift, and cycle_time_clickhouse.rs / signoz_usage_queries.rs
+              # execute the SQL verbatim against a real ClickHouse. An artifact-only PR must
               # re-run those, or the only tests that can catch the regression
               # are skipped on exactly the PRs that cause one (#8665).
               - 'defaults/observability/**'
@@ -462,6 +462,14 @@ jobs:
       # nor whether the rollup still answers once the raw rows expire.
       - name: Verify the cycle-time artifacts against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test cycle_time_clickhouse -- --ignored --nocapture
+      # #8528: executes the committed measured-usage SQL verbatim against the
+      # same pinned ClickHouse. The static contract can assert that a counter is
+      # read from `attributes_string`; only this run demonstrates that the wrong
+      # container returns 0 on every row instead of erroring, and that scope
+      # resolution, unpriced-model exclusion and absence-vs-measured-zero come
+      # out of the engine the way the artifact's header claims.
+      - name: Verify the measured-usage queries against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_usage_queries -- --ignored --nocapture
 
   backend-otlp-tests:
     name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})
@@ -1942,16 +1950,38 @@ jobs:
         run: bash defaults/scripts/tests/test-worktree-local-branch-upstream-tracking.sh
       - name: worktree existing-dir upstream + drift check (#6257, #6291, ported in #8195 slice 9)
         run: bash defaults/scripts/tests/test-worktree-existing-dir-drift-check.sh
+      # Moved out of shell-suite-tests by #8195 slice 13: worktree.sh's `--base`
+      # stacked-PR resolution is `loom-daemon worktree-base`. Both suites pin it
+      # via loom_test_require_daemon_bin and FAIL rather than skip without one.
+      - name: worktree --base stacked-PR resolution (#3729, ported in #8195 slice 13)
+        run: bash defaults/scripts/tests/test-worktree-base-override.sh
+      - name: check_branch_name ref-operand guard (#9106; --base ported in #8195 slice 13)
+        run: bash defaults/scripts/tests/test-check-branch-name.sh
+      # Moved out of shell-suite-tests by #8195 slice 14: worktree.sh's
+      # LOCAL-branch reuse arm — the reuse warning, the #6095/#6100 upstream
+      # correction (now reached in-process), the #8280 already-landed refusal
+      # and the divergence warning — is one `loom-daemon
+      # worktree-branch-reuse`. The first suite's Tests 4-5 assert the refusal
+      # actually happens; the second's Tests 3-4 assert the arm's own messages,
+      # which they also use to prove WHICH arm ran. Without a binary the arm
+      # prints nothing and refuses nothing (a correct documented degradation to
+      # the pre-#6095/pre-#8280 behaviour) and both sets would measure nothing,
+      # so both pin the binary via loom_test_require_daemon_bin and FAIL rather
+      # than skip. Each suite's REMOTE-arm tests are untouched by the slice.
+      - name: worktree local-branch already-landed refusal (#8280, ported in #8195 slice 14)
+        run: bash defaults/scripts/tests/test-worktree-stale-merged-branch.sh
+      - name: worktree remote/local branch tracking + divergence (#4823, #8280, ported in #8195 slice 14)
+        run: bash defaults/scripts/tests/test-worktree-remote-branch-tracking.sh
       # Moved out of shell-suite-tests by #8195 slice 10: worktree.sh's
       # --sparse/--full family is now `loom-daemon worktree-sparse`, including
       # the re-configure arm this suite's Tests 3/4 drive (its registration
       # check and #3548 sentinel back-fill). Without a binary those flags
       # refuse with exit 2 before touching anything, so the suite pins one via
-      # loom_test_require_daemon_bin and FAILS rather than skips. Fourteen of
-      # the 21 test-worktree-*.sh suites now run here (twelve moved by a port
+      # loom_test_require_daemon_bin and FAILS rather than skips. Eighteen of
+      # the 22 test-worktree-*.sh suites now run here (sixteen moved by a port
       # slice, plus test-worktree-issue-lock.sh and test-worktree-stale-
       # closed-branch.sh, which were daemon-driven from the start); the
-      # remaining seven exercise create-path arms these slices did not touch
+      # remaining four exercise create-path arms these slices did not touch
       # and stay hermetic in shell-suite-tests.
       - name: worktree sentinel back-fill on re-invoke (#3548; --sparse/--full ported in #8195 slice 10)
         run: bash defaults/scripts/tests/test-worktree-sentinel-reinvoke.sh

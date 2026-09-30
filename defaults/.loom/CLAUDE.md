@@ -205,9 +205,9 @@ this script.
 <!-- agents-md:include:start -->
 ### CI is dumb and reliable, on purpose
 
-Prefer a slow correct job to a clever fast one. **Never cancel verification of a
-distinct commit** — superseding is for PR branches; every default-branch commit
-is distinct work. Path-filtering is an optimisation, not a correctness tool. One
+Prefer a slow correct job to a clever fast one. **Never cancel a distinct commit's
+run once started**; the default branch supersedes only pending runs (no verdict).
+Path-filtering is an optimisation, not a correctness tool. One
 mechanism per behaviour: two that both cancel, skip or retry will surprise
 someone. A check that *cannot run* must never look like one that passed. Rules +
 the incidents behind them: [`.loom/docs/ci-principles.md`](.loom/docs/ci-principles.md).
@@ -215,9 +215,8 @@ the incidents behind them: [`.loom/docs/ci-principles.md`](.loom/docs/ci-princip
 
 ### Sweep Lifecycle (MANDATORY)
 
-When implementing issues — whether manually, via `/loom:sweep`, or by spawning
-subagents — **all stages of the lifecycle must be executed in order**. Do not
-skip stages.
+When implementing issues — manually, via `/loom:sweep`, or by spawning
+subagents — **all lifecycle stages must run in order**.
 
 ```
 Curator → Builder → Judge → Doctor (if needed) → Merge
@@ -225,52 +224,52 @@ Curator → Builder → Judge → Doctor (if needed) → Merge
 
 | Stage | What happens | Skip allowed? |
 |-------|-------------|---------------|
-| **Curator** | Enrich the issue with technical details, acceptance criteria, scope | No |
+| **Curator** | Enrich with technical detail, acceptance criteria, scope | No |
 | **Builder** | Implement, test, commit, create PR | No |
 | **Judge** | Review the PR, approve or request changes | No |
 | **Doctor** | Fix issues from judge feedback | Only if judge approves |
 | **Merge** | Champion (or a human) merges approved PRs | No |
 
-**When spawning subagents**: each must run the full lifecycle, not just the
-builder phase — creating a PR labeled `loom:review-requested` is only the
-Builder stage. **`/loom:sweep` handles all stages automatically** — prefer it
-over manual orchestration to avoid skipping any.
+**When spawning subagents**: each must run the full lifecycle — a PR labeled
+`loom:review-requested` is only the Builder stage. **`/loom:sweep` runs all
+stages automatically** — prefer it to avoid skipping any.
 
 **Operator-session lane (the one Curator-skip exemption)**: an operator driving
-the session tools directly may skip Curator and label a new issue `loom:building`
+the session tools may skip Curator and label a new issue `loom:building`
 at filing time — but **only** when *both* hold: (1) the acceptance criterion is
-verifiable by a command, not by judgment, **and** (2) the diff is confined to
-non-executing files (`.md`, `.txt`, and similar). Anything touching `.sh`, `.rs`,
-`.ts`, a role prompt, `.github/labels.yml`, or `.loom/config.json` is out of the
-lane, **unconditionally**. This is a predicate on the *change* (evaluated by
-whoever files), not a config toggle, opt-out, or human-approval gate. **Judge,
-Champion, and step 0's open-PR guard are unaffected** — all three still apply to
-a hand-claim, which duplicates in-flight work as readily as a dispatched one;
-only Curator may be skipped.
+command-verifiable, not a judgment call, **and** (2) the diff touches only
+non-executing files (`.md`, `.txt`, similar) — never `.sh`/`.rs`/`.ts`, a role
+prompt, `.github/labels.yml`, or `.loom/config.json`. A predicate on the
+*change*, not a config toggle or approval gate. **Judge, Champion, and step
+0's claim guard still apply** — a hand-claim duplicates in-flight work as
+readily as a dispatched one; only Curator may be skipped.
 
 ### Builder Workflow
 
-0. Guard: `loom-daemon forge check-open-pr 42` — **exit 0 prints an already-open
-   linked PR, so do NOT claim**; 1 = none; anything else = unanswered, not an
-   all-clear (`--help` has the contract). Same probe the daemon's dispatch
-   refuses on, and a hand-claim is not exempt.
+0. Guard: `loom-daemon forge check-claim 42` — **exit 0 prints a blocker
+   token (`OPEN_PR #X` / `BUILDING` / `LEASE_ALREADY_HELD …` /
+   `BRANCH_EXISTS …`): do NOT claim**; 1 = safe; else = unanswered, not an
+   all-clear (`--help` has it). A hand-claim is not exempt.
 1. Find issue: `gh issue list --label="loom:issue"`
-2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`
+2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`, then
+   lease it: `loom-daemon lease ensure 42 --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`.
+   Step 3's `worktree.sh` does this itself; a lane NOT using it MUST call `lease ensure`
+   directly — a leaseless claim is invisible to other lanes and gets reclaimed (#9453)
 3. Create worktree: `./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42`
 4. Implement, test, commit
-5. Create PR: `git push -u origin feature/issue-42 && gh pr create --label "loom:review-requested" --body "Closes #42"`
+5. Create PR: `git push -u origin feature/issue-42 &&
+   ./.loom/scripts/create-pr.sh --label "loom:review-requested" --body "Closes #42"` (#9453).
 
 ### Judge Workflow
 
 Find `gh pr list --label="loom:review-requested"`, review, then coordinate via
 **labels** (approve → `loom:pr`; changes → `loom:changes-requested`) plus a `gh
-pr comment`. Use `gh pr comment`, **not** `gh pr review --approve` — GitHub's
-API blocks self-review.
+pr comment` — **not** `gh pr review --approve`; GitHub's API blocks self-review.
 
 ### Curator Workflow
 
 Find unlabeled issues (use `-label:` search terms, **not** `--label` — gh ANDs
-`--label` values with no negation syntax), enhance with technical detail, then
+`--label` values, no negation), enhance with technical detail, then
 `gh issue edit 42 --add-label "loom:curated"`.
 
 ## Configuration

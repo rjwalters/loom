@@ -288,14 +288,17 @@ hold-state open -
 redate-checks open -
 delete-branch open -
 zero-checks-settle open -
+check-runs-streak open -
 stacked-children open -
 version-policy open -
 partial-reset open -
+partial-comment open -
 closed-building open -
 issue-close-gate open -
 dirty-guard open -
 worktree-contains open -
-worktree-preserve open -"
+worktree-preserve open -
+cleanup-paths open -"
 
 # Shared comparison, so the controls below exercise the SAME logic the real
 # assertion does rather than a paraphrase of it. `sort -V` over a here-string

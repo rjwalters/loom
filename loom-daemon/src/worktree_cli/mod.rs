@@ -120,6 +120,11 @@
 //! `origin/<branch>` carries the branch's real commits and the local branch
 //! does not (the #8147/#8190 incident).
 //!
+//! Slice 13 is [`base`]: the `origin/$DEFAULT_BRANCH` fetch and the `--base`
+//! stacked-PR base-ref resolution — one decision (which ref a new branch starts
+//! from), moved whole, with its `--json` refusal documents now built by
+//! `serde_json` rather than spliced into a string by hand.
+//!
 //! [`closed_pr_branch`] is the same kind of addition (#9083): the third arm of
 //! the branch-resolution contract the shell had no answer for — a pushed
 //! `origin/feature/issue-N` whose tip is the head of a PR CLOSED WITHOUT
@@ -152,11 +157,43 @@
 //! `--json` suppresses all four lines, so nothing a machine reads ever changed
 //! and no retained suite asserts either consumer's output. Same class as slices
 //! 5, 8 and 10: a path compared logically instead of physically.
+//!
+//! Slice 14 is [`branch_reuse`]: the LOCAL-branch reuse arm, whole — the arm
+//! `worktree.sh <N>` takes whenever `refs/heads/feature/issue-N` already
+//! exists, which on a host that built an earlier slice of the same issue is
+//! the *normal* state, and therefore the arm the partial-increment convention
+//! runs through most often. Four ordered steps (reuse warning, [`upstream`]
+//! correction, the #8280 already-landed refusal, divergence warning) whose
+//! *order* is the contract, so they moved as one unit rather than as four
+//! delegation points the shell would have had to interleave. It retires the
+//! script's last `_worktree_upstream_check` call site — slice 12 took the
+//! other one — so [`upstream`] now has no bash caller at all, and it replaces
+//! a `--json` refusal document spliced by hand around `$BRANCH_NAME`, which
+//! `git check-ref-format` permits a `"` in and which the custom-branch
+//! argument makes operator input: the same defect slice 13 fixed for
+//! `$BASE_BRANCH`, one arm further down the same decision.
+//!
+//! Slice 15 is [`open_pr`]: the forge round-trip behind
+//! `lib/worktree-forge-pr-check.sh`'s #7765 guard, the ORIGIN-branch sibling
+//! of slice 14's LOCAL-branch reuse arm — reached whenever `worktree.sh <N>`
+//! is about to create a genuinely fresh branch and needs to know whether an
+//! open PR already claims that name. Its bug class is a `grep -qi` pair
+//! against two hand-copied forge error substrings deciding "nothing to
+//! shadow" vs. "refuse rather than guess safe" (#7863 was exactly this
+//! collapsing the wrong way), which is the epic's usual "review cannot see
+//! it" fragility even though nothing on this arm is destructive. Only the
+//! QUERY moved — the `jq -cn` refusal documents `_worktree_guard_fresh_
+//! branch_against_open_pr` builds, and the #9109 invariant pinning every one
+//! of them, stay in the shell; see [`open_pr`]'s module doc for why drawing
+//! the line there keeps `test-worktree-forge-pr-check.sh`'s literal-JSON
+//! audit meaningful instead of needing a second whitelisted name.
 
+pub mod base;
 pub mod baseline;
 pub mod branch_conflict;
 pub mod branch_delete;
 pub mod branch_landed;
+pub mod branch_reuse;
 pub mod check;
 pub mod cleanup;
 pub mod closed_pr_branch;
@@ -165,6 +202,7 @@ pub mod existing;
 pub mod issue_lock;
 pub mod link;
 pub mod lock;
+pub mod open_pr;
 pub mod remove;
 pub mod reset;
 pub mod sentinel;

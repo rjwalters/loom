@@ -38,6 +38,7 @@ fn qrow_held(
         detail: None,
         updated_at: None,
         held_until,
+        story_points: None,
     }
 }
 

@@ -41,6 +41,22 @@ pub struct TickQueueRow {
     /// candidate still awaiting pass 2 — `dispatch_plan::annotate_rows` copies
     /// this straight into `RowPlan::held_until`.
     pub held_until: Option<DateTime<Utc>>,
+    /// The issue's resolved story-point size (#9432), from its single
+    /// `points:*` label (Issue #9674). Resolved once here from the listing's
+    /// label projection — zero extra forge reads — so the disposition
+    /// exporter can sum the frozen backlog's weight without reading the
+    /// forge.
+    pub story_points: Option<u32>,
+}
+
+/// The quiet resolution of `item`'s story points: [`PointsLabels::value`] —
+/// `None` for absent, out-of-vocabulary, and stacked labels, with **no log**
+/// (unlike `resolve_story_points`). The listing re-reads every ready issue
+/// every tick, so a curation defect here would otherwise warn per tick,
+/// duplicating the loud warn the dispatch path already emits for the same
+/// issue.
+fn points_of(item: &WorkItem) -> Option<u32> {
+    crate::story_points::classify_points_labels(&item.labels).value()
 }
 
 fn tier_of(item: &WorkItem) -> Option<String> {
@@ -139,6 +155,7 @@ pub fn record_skip_held(
         detail,
         updated_at: item.updated_at.clone(),
         held_until,
+        story_points: points_of(item),
     });
 }
 
@@ -157,6 +174,7 @@ pub fn record_candidate(rows: &mut Vec<TickQueueRow>, key: &PriorityCandidate, i
         detail: None,
         updated_at: item.updated_at.clone(),
         held_until: None,
+        story_points: points_of(item),
     });
 }
 
@@ -239,6 +257,7 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
                 main_red_fix: r.key.main_red_fix,
                 created_at: r.key.created_at.clone(),
                 tier: r.tier.clone(),
+                story_points: r.story_points,
                 disposition,
                 detail: r.detail.clone(),
                 state: disposition.state().to_string(),
