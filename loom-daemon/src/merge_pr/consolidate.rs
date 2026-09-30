@@ -51,7 +51,8 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::merge_pr::sequence::{html_comment_spans, SequenceMarker};
+use crate::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
+use crate::merge_pr::sequence::{html_comment_spans, release_marker_text, SequenceMarker};
 
 /// The marker prefix identifying a candidate PR's consolidation mapping.
 pub const CONSOLIDATION_PREFIX: &str = "loom:consolidation";
@@ -198,10 +199,14 @@ pub enum EligibilityFailure {
     NoReason,
 }
 
-/// Check one assembled group. `reserved_attempts` maps component number →
-/// the `cons-` attempt id of an unresolved reservation marker, if any;
-/// `markers` maps component number → its newest trusted `loom:sequence`
-/// marker (ordering or reservation). Pure: the caller fetched everything.
+/// Check one assembled group. `markers` maps component number → the
+/// sequencing hold its trusted comment history says is still in force
+/// ([`crate::merge_pr::sequence::parse_live`] — released and replanned holds
+/// are already dropped). A marker is consulted only while the component
+/// carries the live `loom:sequenced` label: the label is the gate (#9378), so
+/// a hold whose label is gone — released, voided, or removed by hand — does
+/// not make a PR "reserved" or "sequenced" for eligibility either. Pure: the
+/// caller fetched everything.
 #[must_use]
 pub fn check_eligibility(
     components: &[ComponentState],
@@ -270,16 +275,20 @@ pub fn check_eligibility(
                 file: file.clone(),
             });
         }
-        if let Some(attempt) = markers
-            .get(&c.number)
-            .and_then(|m| m.plan.starts_with("cons-").then(|| m.plan.clone()))
+        let live_hold = if c.has(SEQUENCE_LABEL) {
+            markers.get(&c.number)
+        } else {
+            None
+        };
+        if let Some(attempt) =
+            live_hold.and_then(|m| m.plan.starts_with("cons-").then(|| m.plan.clone()))
         {
             failures.push(EligibilityFailure::AlreadyReserved {
                 number: c.number,
                 attempt,
             });
         }
-        if let Some(m) = markers.get(&c.number) {
+        if let Some(m) = live_hold {
             if m.source.as_deref() == Some("pass") && !numbers.contains(&m.after) {
                 failures.push(EligibilityFailure::SequencedOutsideGroup {
                     number: c.number,
@@ -750,12 +759,13 @@ pub fn reservation_comment_body(marker: &SequenceMarker, attempt: &str) -> Strin
 #[must_use]
 pub fn reservation_release_body(marker: &SequenceMarker, attempt: &str) -> String {
     format!(
-        "<!-- loom:sequence released plan={} -->\n\
+        "{}\n\
          **Consolidation attempt `{}` released this reservation** — the attempt was aborted; \
          this PR is back to its normal pipeline, untouched and actionable.\n\n\
          ---\n\
          *Automated by loom-daemon merge-pr consolidate-abort (#9688)*",
-        marker.plan, attempt
+        release_marker_text(&marker.plan),
+        attempt
     )
 }
 
@@ -845,8 +855,10 @@ pub fn inclusion_verified(
     let out = Command::new(git_bin)
         .args(["merge-base", "--is-ancestor", pinned_head, candidate_head])
         .current_dir(repo_root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Only the exit status is read; nothing is piped, so nothing can
+        // fill an undrained pipe (#9745 review).
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     matches!(out, Ok(s) if s.success())
 }
@@ -855,13 +867,15 @@ pub fn inclusion_verified(
 #[must_use]
 pub fn landing_release_body(marker: &SequenceMarker, attempt: &str) -> String {
     format!(
-        "<!-- loom:sequence released plan={} -->\n\
+        "{}\n\
          **Consolidation candidate #{} landed** — this component's diff is contained in the \
          combined merge, so its reservation is released and the landing reconciliation \
          (status, closure, linked issues) proceeds. (ADR-0023 §6, attempt `{}`)\n\n\
          ---\n\
          *Automated by loom-daemon merge-pr consolidate-reconcile (#9689)*",
-        marker.plan, marker.after, attempt
+        release_marker_text(&marker.plan),
+        marker.after,
+        attempt
     )
 }
 
@@ -889,6 +903,8 @@ pub fn issue_close_body(component_pr: u32, candidate_pr: u32, merge_sha: &str) -
          named. (ADR-0023 §6, #9689)"
     )
 }
+
+pub mod reconcile;
 
 #[cfg(test)]
 mod tests;

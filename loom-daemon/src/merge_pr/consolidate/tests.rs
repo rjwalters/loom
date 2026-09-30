@@ -34,6 +34,12 @@ fn comp(number: u32, head: &str, files: &[&str]) -> ComponentState {
     }
 }
 
+/// The component carries the live `loom:sequenced` gate label.
+fn sequenced(mut c: ComponentState) -> ComponentState {
+    c.labels.push(SEQUENCE_LABEL.to_string());
+    c
+}
+
 const H1: &str = "a111111111111111111111111111111111111111";
 const H2: &str = "b222222222222222222222222222222222222222";
 
@@ -189,7 +195,10 @@ fn path_disjointness_never_qualifies() {
 
 #[test]
 fn a_competing_consolidation_reservation_rejects() {
-    let group = [comp(1, H1, &["shared.rs"]), comp(2, H2, &["shared.rs"])];
+    let group = [
+        sequenced(comp(1, H1, &["shared.rs"])),
+        comp(2, H2, &["shared.rs"]),
+    ];
     let mut markers = clean_markers();
     markers.insert(
         1,
@@ -220,7 +229,10 @@ fn a_competing_consolidation_reservation_rejects() {
 
 #[test]
 fn an_out_of_group_ordering_predecessor_rejects_but_an_in_group_one_does_not() {
-    let group = [comp(1, H1, &["shared.rs"]), comp(2, H2, &["shared.rs"])];
+    let group = [
+        comp(1, H1, &["shared.rs"]),
+        sequenced(comp(2, H2, &["shared.rs"])),
+    ];
     let mut markers = clean_markers();
     // #2 sequenced after #7 — outside the group ⇒ E7 failure.
     markers.insert(
@@ -267,6 +279,46 @@ fn an_out_of_group_ordering_predecessor_rejects_but_an_in_group_one_does_not() {
         }
     )
     .is_empty());
+}
+
+#[test]
+fn a_released_reservation_does_not_block_a_later_consolidation() {
+    // #9745 review: a source that went through a completed (landed or
+    // aborted) attempt keeps the old reservation marker in its history
+    // forever. Neither the history nor a stale marker may make it
+    // "AlreadyReserved" / "SequencedOutsideGroup" once the gate is gone.
+    let group = [comp(1, H1, &["shared.rs"]), comp(2, H2, &["shared.rs"])];
+    let old = SequenceMarker {
+        after: 99,
+        pred_head: H1.to_string(),
+        follower_head: H1.to_string(),
+        plan: "cons-deadbeef".into(),
+        source: Some("pass".into()),
+    };
+    let bounds = Bounds {
+        max_components: 4,
+        max_diff_lines: 800,
+    };
+    // (a) The history ends in the landing release: parse_live drops it, so
+    // the caller never even hands check_eligibility a marker.
+    let history = vec![
+        reservation_comment_body(&old, "cons-deadbeef"),
+        landing_release_body(&old, "cons-deadbeef"),
+    ];
+    assert_eq!(crate::merge_pr::sequence::parse_live(&history), None);
+    let abort_history = vec![
+        reservation_comment_body(&old, "cons-deadbeef"),
+        reservation_release_body(&old, "cons-deadbeef"),
+    ];
+    assert_eq!(crate::merge_pr::sequence::parse_live(&abort_history), None);
+    // (b) Belt and braces: even a live-looking marker is inert without the
+    // gate label (released or removed by hand).
+    let mut markers = clean_markers();
+    markers.insert(1, old);
+    assert!(
+        check_eligibility(&group, &markers, "main", "reason", &bounds).is_empty(),
+        "an unlabeled PR is not reserved"
+    );
 }
 
 // --- Mapping markers ----------------------------------------------------
