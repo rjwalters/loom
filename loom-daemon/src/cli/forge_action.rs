@@ -66,6 +66,33 @@ pub(crate) enum ForgeAction {
         issue: u32,
     },
 
+    /// `forge pr-congestion [--json] [--max-open N] [--max-points N]` — the
+    /// #9063 **Phase 1** congestion signal, report-only: approved-queue
+    /// depth (`loom:pr`), story points awaiting merge, and a path-disjoint
+    /// bundle estimate over that queue.
+    ///
+    /// Exits `0` with the report whether or not it reads congested —
+    /// congestion is information, not failure — `3` on Gitea, and `5`
+    /// fail-closed when the fetch could not answer (never an empty-queue
+    /// measurement). It never merges, creates, or closes anything; bundle
+    /// execution is #9063 Phases 2–3 and stays operator-gated.
+    #[command(name = "pr-congestion")]
+    PrCongestion {
+        /// Emit machine-readable JSON instead of the human report.
+        #[arg(long)]
+        json: bool,
+
+        /// Congestion threshold: trip when the approved queue is strictly
+        /// deeper than this (the issue's ">5 open PRs" example).
+        #[arg(long, default_value_t = loom_daemon::forge_pr_congestion::DEFAULT_MAX_OPEN)]
+        max_open: usize,
+
+        /// Congestion threshold: trip when known story points awaiting merge
+        /// strictly exceed this.
+        #[arg(long, default_value_t = loom_daemon::forge_pr_congestion::DEFAULT_MAX_POINTS)]
+        max_points: u32,
+    },
+
     /// `forge check-claim <issue> [--force-claim]` — the aggregated
     /// pre-flight claim-CAS probe (#9453 Phase 1): "may I claim issue N
     /// **right now**?" Four legs, cheapest-first, short-circuiting on the
@@ -424,6 +451,15 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
         ForgeAction::CheckOpenPr { issue } => ForgeCmd::CheckOpenPr { issue },
+        ForgeAction::PrCongestion {
+            json,
+            max_open,
+            max_points,
+        } => ForgeCmd::PrCongestion {
+            json,
+            max_open,
+            max_points,
+        },
         ForgeAction::CheckClaim { issue, force_claim } => {
             ForgeCmd::CheckClaim { issue, force_claim }
         }

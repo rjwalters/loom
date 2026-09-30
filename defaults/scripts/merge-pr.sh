@@ -427,10 +427,11 @@ REPO_ROOT="$(find_main_repo_root)" || \
 # Source forge helpers for multi-forge support
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
-# Shared worktree-root resolver (#3530) — cleanup must discover worktrees at an
-# overridden root, not just the default .loom/worktrees.
-# shellcheck source=lib/worktree-root.sh
-source "$SCRIPT_DIR/lib/worktree-root.sh"
+# lib/worktree-root.sh is NOT sourced any more (#8191 slice): the overridden-root
+# resolution (#3530) that post-merge cleanup needs is `loom-daemon merge-pr
+# cleanup-paths`, which resolves it through loom-daemon's own port of that helper
+# (loom-daemon/src/worktree_root.rs, `worktree_root_readable`) rather than a
+# second copy reached through a sourced lib. See the cleanup block at the bottom.
 # Worktree-removal ledger (#5950) — post-merge cleanup is one of several
 # independent removers; every one of them records to the same file so
 # "what removed this worktree?" has a single answer. Sourced defensively with a
@@ -924,7 +925,7 @@ _check_loom_pr_label
 # build-stampede guard (#8252). The refusal named neither the version nor the
 # roll command. That is what these markers and the hint below fix.
 #
-# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, check-runs-streak, stacked-children, version-policy, partial-reset, partial-comment, closed-building, issue-close-gate, dirty-guard, worktree-preserve, worktree-contains — partial-comment renders two POST-merge audit comments and skips the note rather than posting an empty one; the last three decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing, and worktree-contains declines --worktree-path's override cleanup and keeps that path when it is missing) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
+# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, check-runs-streak, stacked-children, version-policy, partial-reset, partial-comment, closed-building, issue-close-gate, dirty-guard, worktree-preserve, worktree-contains, cleanup-paths — partial-comment renders two POST-merge audit comments and skips the note rather than posting an empty one; the last four decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing, worktree-contains declines --worktree-path's override cleanup and keeps that path when it is missing, and cleanup-paths leaves the cleanup targets unnamed so nothing is removed) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
 # requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
 # The `merge-pr >=` floor above covers the whole subcommand group, including
@@ -3018,26 +3019,57 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
     info "Cleanup target overridden by --worktree-path: $WORKTREE_PATH_OVERRIDE"
     _remove_loom_worktree "$WORKTREE_PATH_OVERRIDE" "true"
   else
-    # Strict pattern: only `feature/issue-<N>` matches. Trailing-number
-    # heuristics would misclassify branches like `release-1`.
-    # Resolve the worktree base through the shared helper so an overridden
-    # root (#3530) is discovered here; defaults to $REPO_ROOT/.loom/worktrees.
-    WT_ROOT_DIR="$(loom_worktree_root "$REPO_ROOT")"
-    DEFAULT_WT_PATH=""
-    JUDGE_PR_WT_PATH=""
-    if [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]]; then
-      ISSUE_NUM="${BASH_REMATCH[1]}"
-      DEFAULT_WT_PATH="$WT_ROOT_DIR/issue-$ISSUE_NUM"
-      # #6264: a Judge (or Doctor) review of this same ordinary Loom-issue PR
-      # may ALSO have created a co-existing pr-$PR_NUMBER worktree via
-      # pr-worktree.sh — checked and removed independently below, alongside
-      # (not instead of) the issue-$ISSUE_NUM path above.
-      JUDGE_PR_WT_PATH="$WT_ROOT_DIR/pr-$PR_NUMBER"
-    else
-      # External-fork / ad-hoc branch — the doctor would have used a
-      # `pr-<PR_NUMBER>` worktree if any.
-      DEFAULT_WT_PATH="$WT_ROOT_DIR/pr-$PR_NUMBER"
-    fi
+    # Which worktree paths this merge owns, ported to Rust (#8191 slice):
+    # `loom-daemon merge-pr cleanup-paths` (loom-daemon/src/merge_pr/
+    # cleanup_paths.rs) holds the strict `^feature/issue-([0-9]+)$`
+    # classification — only that anchored form matches, so `release-1` /
+    # `fix-bug-42` stay PR-style and a trailing-number heuristic cannot aim
+    # cleanup at issue-1 / issue-42 — the #3530 overridden-root resolution
+    # (through loom-daemon's own port of lib/worktree-root.sh, so the precedence,
+    # the repo-basename namespacing, the relative-override rejection and the
+    # unreadable-target fallback come from ONE implementation instead of two),
+    # $DEFAULT_WT_PATH, and #6264's $JUDGE_PR_WT_PATH — the co-existing
+    # Judge/Doctor pr-$PR_NUMBER review worktree, checked below ALONGSIDE (not
+    # instead of) the issue-$ISSUE_NUM path, and deliberately empty for a
+    # non-issue branch whose default path is already pr-$PR_NUMBER.
+    #
+    # Every filesystem question stays here: the `[[ -d ]]` tests below, the
+    # .loom-managed sentinel, the remove-vs-preserve decision (`merge-pr
+    # worktree-preserve`) and the removal itself. Naming a path is not deciding
+    # to remove it.
+    #
+    # Fail direction OPEN, and specifically toward REMOVING NOTHING: a
+    # missing/older daemon leaves all three names empty, and an empty
+    # $DEFAULT_WT_PATH gates the ENTIRE removal path off — both the convention
+    # call site and the porcelain discovery fallback (hence the `elif [[ -n
+    # "$DEFAULT_WT_PATH" ]]` below, not a bare `else`). Gating both is the whole
+    # point and is NOT redundant: falling into discovery with no plan would be
+    # strictly MORE destructive than the healthy path, because discovery finds
+    # this very worktree by branch (a Loom builder worktree at issue-<N> tracks
+    # feature/issue-<N> and carries .loom-managed) while $ISSUE_NUM is now
+    # empty, so _worktree_cleanup_decide omits --preserve-check and #4186's
+    # still-open-issue protection is skipped — a degraded daemon would delete a
+    # worktree the healthy one preserves, in exactly the #5031 data-loss class
+    # this pass exists to prevent. The merge already happened; skipped cleanup is
+    # recoverable (loom-clean, the daemon's reaper, the next merge) and every
+    # guard that would authorise a removal needs this same binary anyway. The
+    # local-branch delete below still runs — it is keyed on $PR_BRANCH, not on
+    # any of these names, and was always reached.
+    _CP_RC=0; _CP_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr cleanup-paths --repo-root "$REPO_ROOT" --branch "$PR_BRANCH" --pr "$PR_NUMBER" 2>/dev/null)" || _CP_RC=$?
+    [[ $_CP_RC -eq 0 && "$_CP_OUT" == "LOOM-CLEANUP-PATHS"$'\t'* ]] || { warning "Post-merge worktree cleanup for PR #$PR_NUMBER did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr cleanup-paths' exited $_CP_RC without a LOOM-CLEANUP-PATHS line (a loom-daemon predating #8191's slice has no such verb), so which worktree paths this merge owns is unknown. Nothing is removed rather than guessed — the merge itself already succeeded and is unaffected. Clean up by hand once loom-daemon is available: ${SCRIPT_DIR:-.loom/scripts}/worktree.sh remove <issue>, or loom-clean. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"; _CP_OUT="LOOM-CLEANUP-PATHS"$'\t\t\t'; }
+    # Field order is $DEFAULT_WT_PATH FIRST, and that is load-bearing, not
+    # cosmetic: tab is an IFS *whitespace* character, so `read` strips a leading
+    # run of IFS whitespace and collapses runs of it — an empty LEADING field
+    # cannot survive this read at all. With $ISSUE_NUM first (the order the
+    # retired inline shell assigned these in), a non-feature/issue-<N> branch
+    # rendered `…\t\t<default>\t`, the `\t\t` run collapsed, $DEFAULT_WT_PATH
+    # landed in $ISSUE_NUM and both path names came out EMPTY — silently skipping
+    # cleanup for every PR-only branch (docs/…, security/…, slice branches) with
+    # no warning at all, because the verb had exited 0 with a well-formed line.
+    # Empty TRAILING fields `read` does preserve, and $DEFAULT_WT_PATH is the one
+    # field the verb never leaves empty (the other two are empty together, by
+    # #6264's asymmetry), so leading with it keeps both empties in the tail.
+    IFS=$'\t' read -r DEFAULT_WT_PATH ISSUE_NUM JUDGE_PR_WT_PATH <<<"${_CP_OUT#*$'\t'}"
     if [[ -d "$DEFAULT_WT_PATH" ]]; then
       # Close-target-aware gate (#4186): ISSUE_NUM is only set when
       # PR_BRANCH matched the feature/issue-<N> convention above. When it's
@@ -3045,7 +3077,7 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
       # behavior. See _worktree_cleanup_decide above for the #6694 landed-
       # branch override this now shares with the two call sites below.
       _worktree_cleanup_decide default "$DEFAULT_WT_PATH"
-    else
+    elif [[ -n "$DEFAULT_WT_PATH" ]]; then
       # Discovery fallback (warn-only): the Loom-convention path is missing,
       # so walk porcelain looking for any worktree tracking $PR_BRANCH. We
       # never auto-remove a discovered worktree — that would violate the

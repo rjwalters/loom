@@ -595,6 +595,17 @@ pub(crate) enum MergePrCommand {
     /// the comment stream could not be read at all.
     HoldState(super::merge_pr_hold_state::HoldStateArgs),
 
+    /// Evaluate one durable "approved, but not yet" sequencing hold against
+    /// live forge state (#9378): read the newest trusted `<!-- loom:sequence
+    /// … -->` marker on the PR, re-read the recorded predecessor, and print
+    /// one sentinel — CLEAR (predecessor merged at the recorded head),
+    /// DISSOLVED (closed unmerged), KEEP (waiting at the recorded head),
+    /// REPLAN (a pinned head moved), NONE (no marker). Exit 0 on any answer,
+    /// 2 on a failed read (never release on a failed read). The gate itself
+    /// is the `loom:sequenced` label in `verdict-contradiction`'s BLOCKING
+    /// set; this verb is what moves that label when the condition is met.
+    SequenceEval(super::merge_pr_sequence::SequenceEvalArgs),
+
     /// The async-close-race worktree-cleanup gate (#4186): whether a merged
     /// PR's issue is actually finished, so a partial-increment worktree the
     /// next Builder increment still needs is not removed out from under it.
@@ -753,6 +764,18 @@ pub(crate) enum MergePrCommand {
     /// with `REMOVE`/`PRESERVE` plus `LEVEL<TAB>message` lines to replay — see
     /// `cli::merge_pr_worktree_preserve`.
     WorktreePreserve(super::merge_pr_worktree_preserve::WorktreePreserveArgs),
+
+    /// Which worktree paths a merged PR owns (#6264/#3530, #8191 slice): the
+    /// strict `^feature/issue-([0-9]+)$` classification, the override-aware
+    /// worktree root, and from them the default cleanup target plus the
+    /// co-existing Judge/Doctor `pr-<N>` review worktree. Prints one
+    /// `LOOM-CLEANUP-PATHS<TAB>default<TAB>issue<TAB>judge-pr` line (the
+    /// always-non-empty path leads: tab is IFS whitespace, so bash's `read`
+    /// cannot preserve an empty LEADING field); every
+    /// `[[ -d ]]`/sentinel test and the removal itself stay in the shell. Exit
+    /// 2 = the resolved root cannot be framed unambiguously. The seam fails
+    /// OPEN (no targets, clean up nothing) — see `cli::merge_pr_cleanup_paths`.
+    CleanupPaths(super::merge_pr_cleanup_paths::CleanupPathsArgs),
 }
 
 impl MergePrCommand {
@@ -765,6 +788,7 @@ impl MergePrCommand {
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::HoldState(args) => args.run(),
+            MergePrCommand::SequenceEval(args) => args.run(),
             MergePrCommand::IssueCloseGate(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
@@ -785,6 +809,7 @@ impl MergePrCommand {
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::ChecksFailure(args) => args.run(),
             MergePrCommand::WorktreePreserve(args) => args.run(),
+            MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }
 }

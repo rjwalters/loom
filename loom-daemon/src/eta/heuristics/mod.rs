@@ -5,10 +5,12 @@
 
 mod finish_v1;
 mod land_v1;
+mod land_v2;
 mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
 pub use land_v1::{LandV1, LAND_V1};
+pub use land_v2::{LandV2, LAND_V2};
 pub use start_v1::{StartV1, START_V1};
 
 use super::explanation::{
@@ -39,6 +41,11 @@ pub(crate) struct PathRules {
     /// `true`: an approved path always ends with `merge_wait`. `false`: the
     /// history's in-sweep merge share decides.
     pub always_merge: bool,
+    /// `true`: build each stage grid with the Kaplan–Meier product-limit
+    /// estimator over the observed durations **and** the stage's censored
+    /// lower bounds (#9328). `false`: the plain nearest-rank grid over the
+    /// observed durations alone — every v1 heuristic.
+    pub censoring: bool,
 }
 
 /// Round to six decimals — every float the simulation reads is stored
@@ -274,10 +281,22 @@ fn finish_estimate(
             }
         }
         let sorted = &selection.sorted;
-        let grid_sec = grid::grid_of(sorted);
+        // #9328: a censoring heuristic also reads the stage's right-censored
+        // lower bounds, at the level the observed selection resolved to, and
+        // summarises the pair by Kaplan–Meier. Every other heuristic passes an
+        // empty slice, for which `km_grid_of` is exactly `grid_of`.
+        let censored = if rules.censoring {
+            history.select_censored(repo, stage, as_of, rules.sources, selection.level)
+        } else {
+            Vec::new()
+        };
+        let grid_sec = grid::km_grid_of(sorted, &censored);
         // A queue wait is never age-conditioned (see `simulate`).
         let conditioning = if stage == start && age > 0 && stage != Stage::ReadyWait {
-            let n_above = sorted.iter().filter(|&&d| d > age).count();
+            // A censored sample longer than the age is evidence the stage can
+            // outlive it just as an observed one is, so it counts here too.
+            let n_above = sorted.iter().filter(|&&d| d > age).count()
+                + censored.iter().filter(|&&d| d > age).count();
             let f_age = round6(grid::cdf(&grid_sec, age));
             let record = Conditioning {
                 age_sec: age,
@@ -292,6 +311,7 @@ fn finish_estimate(
                     repo,
                     selection.level,
                     sorted,
+                    &censored,
                     grid_sec,
                     Some(record),
                 ));
@@ -307,6 +327,7 @@ fn finish_estimate(
             repo,
             selection.level,
             sorted,
+            &censored,
             grid_sec,
             conditioning,
         ));
@@ -361,19 +382,40 @@ fn finish_estimate(
     explanation
 }
 
+/// The grid index of percentile `pct` (`grid_pct()` is `0, 5, …, 100`).
+fn at_pct(grid_sec: &[i64], pct: usize) -> i64 {
+    grid_sec
+        .get(pct / 5)
+        .copied()
+        .unwrap_or_else(|| grid_sec.last().copied().unwrap_or(0))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn stage_entry(
     stage: Stage,
     rules: PathRules,
     repo: &str,
     level: Level,
     sorted: &[i64],
+    censored: &[i64],
     grid_sec: Vec<i64>,
     conditioning: Option<Conditioning>,
 ) -> StageEntry {
+    // The quartiles are read off the same grid the simulation draws from, so
+    // a censored distribution's summary and its draws cannot disagree. With
+    // no censoring `grid_sec[pct / 5]` is `nearest_rank(sorted, pct)` by
+    // construction, so every v1 value is unchanged.
+    let (p25, p50, p75, p90) = (
+        at_pct(&grid_sec, 25),
+        at_pct(&grid_sec, 50),
+        at_pct(&grid_sec, 75),
+        at_pct(&grid_sec, 90),
+    );
     StageEntry {
         stage,
         distribution: Distribution {
             n: sorted.len(),
+            censored_n: rules.censoring.then_some(censored.len()),
             filters: Filters {
                 repo: (level == Level::Repo).then(|| repo.to_string()),
                 level: level.as_str().to_string(),
@@ -386,10 +428,10 @@ fn stage_entry(
             },
             grid_pct: grid::grid_pct(),
             grid_sec,
-            p25: grid::quantile(sorted, 25),
-            p50: grid::quantile(sorted, 50),
-            p75: grid::quantile(sorted, 75),
-            p90: grid::quantile(sorted, 90),
+            p25,
+            p50,
+            p75,
+            p90,
         },
         conditioning,
         reached_with_probability: None,

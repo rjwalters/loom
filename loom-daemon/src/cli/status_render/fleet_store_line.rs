@@ -59,9 +59,43 @@ mod tests {
             auto_apply: false,
             config: fleet_sync::ConfigPass::default(),
             roster: fleet_sync::RosterPass::default(),
+            state: loom_daemon::fleet_state::StatePass::default(),
+            enforced: loom_daemon::fleet_state::Enforcement::Proceed,
         };
         let value = json(Some(&status));
         assert_eq!(value["repo"], serde_json::json!("acme/fleet"));
         assert_eq!(value["autoApply"], serde_json::json!(false));
+    }
+
+    /// #9598: the desired-vs-actual pair reaches both `status` surfaces.
+    #[test]
+    fn run_state_reaches_the_human_and_json_surfaces() {
+        let status = FleetSyncStatus {
+            repo: "acme/fleet".to_string(),
+            reference: "main".to_string(),
+            host: "build-1".to_string(),
+            pass: "timer".to_string(),
+            at: chrono::Utc::now(),
+            interval_secs: 300,
+            auto_apply: false,
+            config: fleet_sync::ConfigPass::default(),
+            roster: fleet_sync::RosterPass::default(),
+            state: loom_daemon::fleet_state::StatePass {
+                desired: Some(loom_daemon::fleet_store::state::RunState::Paused),
+                source: Some("host".to_string()),
+                by: Some("operator".to_string()),
+                ..Default::default()
+            },
+            enforced: loom_daemon::fleet_state::Enforcement::Hold,
+        };
+        let block = fleet_sync::render_line(Some(&status), chrono::Utc::now())
+            .expect("a snapshot renders a block");
+        assert!(block.contains("desired paused"), "{block}");
+        assert!(block.contains("HELD"), "{block}");
+        assert!(block.contains("by: operator"), "{block}");
+
+        let value = json(Some(&status));
+        assert_eq!(value["state"]["desired"], serde_json::json!("paused"));
+        assert_eq!(value["enforced"], serde_json::json!("hold"));
     }
 }

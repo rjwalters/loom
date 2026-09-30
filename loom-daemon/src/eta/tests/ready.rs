@@ -421,10 +421,14 @@ fn ready_queue_ingestion_estimates_start_and_land_then_settles_on_dispatch() {
     let after = estimate(&mut tracker, &history);
     let kinds: Vec<Kind> = after
         .iter()
-        .filter(|e| e.explanation.subject.issue == 10)
+        .filter(|e| e.explanation.subject.issue == 10 && e.primary)
         .map(|e| e.explanation.kind)
         .collect();
     assert_eq!(kinds, vec![Kind::Finish, Kind::Land]);
+    // The `land-v2` shadow rides alongside, never as the primary (#9328).
+    assert!(after.iter().any(|e| e.explanation.subject.issue == 10
+        && !e.primary
+        && e.explanation.heuristic == crate::eta::heuristics::LAND_V2));
     assert!(tracker
         .pending()
         .iter()

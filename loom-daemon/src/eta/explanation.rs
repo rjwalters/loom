@@ -185,6 +185,11 @@ pub struct StageEntry {
 pub struct Distribution {
     /// Samples it was built from.
     pub n: usize,
+    /// Right-censored samples the Kaplan–Meier grid used on top of `n`
+    /// (#9328). Absent — and the grid is the plain nearest-rank one — for
+    /// every heuristic that ignores censoring, which is every v1 heuristic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub censored_n: Option<usize>,
     /// Which samples were used.
     pub filters: Filters,
     /// `[0, 5, …, 100]`. Empty only when truncated.

@@ -34,8 +34,7 @@ Loom decomposes development into three coordination tiers, with the forge (GitHu
 
 ### 1. Manual Orchestration Mode (MOM)
 
-Open Claude Code in this repo and use slash commands (`/loom:builder`,
-`/loom:judge`, `/loom:curator`, …) — each terminal acts as a specialized agent.
+Use slash commands (`/loom:builder`, `/loom:judge`, `/loom:curator`, …) — each terminal acts as a specialized agent.
 
 ### 2. Single-issue lifecycle: `/loom:sweep <issue>`
 
@@ -76,9 +75,9 @@ interval-cadence Architect/Hermit work generation is out of scope (#3381).
 
 ## Agent Roles
 
-Ten specialized roles (Builder, Judge, Champion, Curator, Architect, Hermit,
-Doctor, Guide, Driver, Auditor) plus `loom` (the daemon-mode operator surface)
-— purpose/cadence table: [`.loom/roles/README.md`](.loom/roles/README.md)
+Eleven specialized roles (Builder, Judge, Champion, Curator, Architect, Hermit,
+Doctor, Guide, Driver, Auditor, Concierge) plus `loom` (daemon-mode operator) —
+purpose/cadence table: [`.loom/roles/README.md`](.loom/roles/README.md)
 §"Available Roles". Full definitions: `.loom/roles/<name>.md`.
 
 ## Label-Based Workflow
@@ -108,7 +107,7 @@ queue: the pinned hold digest (#6877) and label queries in
 
 ### Issues Are Suggestions (Role Autonomy)
 
-Filed issues are the *input queue*, not mandates — this repo runs autonomy-by-default. In autonomous mode **Curator, Builder, and Judge** may **close** (rationale commented first, then `--reason "not planned"`) or **rescope** (relabel back to `loom:triage`/`loom:curated` if the scope no longer matches) an issue rather than build it as filed, when it is obsolete, duplicate, low value, or the wrong approach. **Never** close an issue that encodes a still-pending human decision — use `loom:blocked`/`loom:operator-only` instead. Full guardrails live in each role prompt's own "Issues Are Suggestions" section: `.loom/roles/curator.md`, `builder.md`, `judge.md`.
+Filed issues are the *input queue*, not mandates. In autonomous mode **Curator, Builder, and Judge** may **close** (rationale commented first, then `--reason "not planned"`) or **rescope** (relabel back to `loom:triage`/`loom:curated` if the scope no longer matches) an issue rather than build it as filed, when it is obsolete, duplicate, low value, or the wrong approach. **Never** close an issue that encodes a still-pending human decision — use `loom:blocked`/`loom:operator-only` instead. Guardrails: each role prompt's "Issues Are Suggestions" section (`.loom/roles/curator.md`, `builder.md`, `judge.md`).
 **Champion** gets one narrow addition (#7657): it may close a Hermit/Architect/Auditor proposal for the `premise-false` kind only — every recurring finding across its N=2 unrevised evaluations re-verified false on current `main` — `--reason "not planned"` after a rationale comment; any mixed finding set still escalates to `loom:operator-only` as before.
 
 ## Git Worktree Workflow
@@ -180,20 +179,22 @@ only Curator may be skipped.
 
 ### CI is dumb and reliable, on purpose
 
-Slow correct job over clever fast one. **Never cancel verification of a distinct
-commit** — superseding is for PR branches; every `main` commit is distinct work.
+Slow correct job over clever fast one. **Never cancel a distinct commit's run once started**;
+`main` keeps one running + newest pending (a superseded pending run is no-verdict).
 Path-filtering is an optimisation, not a correctness tool; one mechanism per
 behaviour. Rules + incidents: [`ci-principles`](.loom/docs/ci-principles.md).
 All org CI is captured in SigNoz: [`ci-observability`](.loom/docs/ci-observability.md).
 
 ### Builder Workflow
 
-0. Guard: `loom-daemon forge check-open-pr 42` — **exit 0 prints an already-open
-   linked PR, so do NOT claim**; 1 = none; anything else = unanswered, not an
-   all-clear (`--help` has the contract). Same #4123 probe dispatch refuses on,
-   and a hand-claim is **not** exempt (#8551).
+0. Guard: `loom-daemon forge check-claim 42` — **exit 0 prints a blocker
+   token (`OPEN_PR #X` / `BUILDING` / `LEASE_ALREADY_HELD …` /
+   `BRANCH_EXISTS …`): do NOT claim**; 1 = safe; else = unanswered, not an
+   all-clear. A hand-claim is not exempt.
 1. Find issue: `gh issue list --label="loom:issue"`
-2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`
+2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`, then
+   lease it: `loom-daemon lease ensure 42 --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`.
+   Step 3's `worktree.sh` does this itself; a lane not using it MUST call `lease ensure` (#9453)
 3. Create worktree: `./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42`
 4. Implement, test, commit
 5. Create PR: `git push -u origin feature/issue-42 && gh pr create --label "loom:review-requested" --body "Closes #42"`
@@ -301,7 +302,7 @@ time](.loom/docs/troubleshooting.md).
 
 ## Migration History
 
-Completed-migration history (v0.10.0 shepherd/daemon deprecation, the Rust `loom-daemon` rebuild, `spawn-loop.sh` removal in v0.11.0) lives in
+Completed-migration history lives in
 [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md) and [ADR-0009](docs/adr/0009-shepherd-deprecation.md) — not inline here.
 
 ## Resources
