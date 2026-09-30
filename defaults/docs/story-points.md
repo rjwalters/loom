@@ -29,6 +29,86 @@ around its median (midway to the neighbours on a log scale).
    spans independent concerns, must be split into sub-issues each sized on
    its own. Do not assign 21.
 
+## The classes (what each row means)
+
+Sized from what the issue demands, in order of how much each signal
+mattered in the data: **how many distinct deliverables** it produces, **how
+much verification** proving it needs, **how far** the change reaches, and
+**whether the cause or design still has to be discovered**. Surface
+features — body length, checkbox count, alarming words, generated-artifact
+line counts — predicted almost nothing. Read what the issue actually
+requires. (Class definitions adapted from the story-points experiment's
+validated rubric v6: holdout ρ = 0.82 [0.74, 0.88], n = 133; rubric wording
+variants scored within 0.04 ρ of each other, so these are definitions, not
+tuned prose.)
+
+**1 — the fixed floor.** The thinking is done and only the typing is left.
+The file, often the line, is pinned; done is checked by one command or by
+reading the result. No companion test, no second call site, no judgment
+call — doc-only, no-behavior-change and "tests N/A" issues live here. A 1
+is not free (repo load, checks and review are the floor), but none of the
+cost is the change itself.
+
+**2 — a 1 plus one obligation.** Still pre-diagnosed, but one extra thing
+must also be true: the duplicated helper moves *and* its callers repoint;
+the stale pointer is corrected *and* a check keeps it fresh. One
+subsystem, a few files, verified by an existing suite or lint. Name the
+extra obligation; if you cannot, it is a 1.
+
+**3 — one mechanism, one real judgment.** The problem is located (one
+subsystem, a handful of files), but finishing takes a round of
+investigation, a design choice, or genuinely new test coverage: extending
+a fix to a sibling case that behaves differently, a new rule with its own
+tests, a red-on-main fix where proving correctness is the work. *Not yet a
+5* while the change stays at one site and the cause is roughly known.
+
+**5 — several coordinated deliverables that extend an existing mechanism.**
+Two to four related sites or a repeated pattern, tests that must
+demonstrably bite, docs or evidence updated, usually one embedded
+decision. The phrasing is "mirror what the sibling verbs do",
+"reuse the helper from #N", "sub-issue 1 of 4" — it extends, not invents.
+*Not an 8* while it adds to an existing mechanism instead of building one.
+
+**8 — a new capability with a real verification loop.** Built from nothing
+and proven across more than one condition: a new simulation or
+characterization campaign from scratch, a shared-tooling feature validated
+on several targets, a cross-cutting feature spanning CLI, storage and
+failure handling. Four to six acceptance criteria across subsystems, at
+least one genuine design judgment, iteration expected. "Involves a
+simulation" alone is not an 8; one named bug with a known fix never is.
+
+**13 — several independent correctness claims, each proven.** Not code
+volume: each claim needs its own verification loop, and they multiply —
+an implementation matching a frozen reference plus must-fail negative
+controls; UI across several views with persistence and end-to-end checks;
+six or more separately testable items. Few landed examples exist at this
+size: prefer 8 unless you can name at least two independent claims.
+
+Anything above 13 — or a 13 spanning independent concerns — is step 4's
+split, never a 21.
+
+## Traps
+
+- **Generated output**: simulation and EDA issues can regenerate tens of
+  thousands of lines; judge the hand-written part.
+- **Terse hides real work; verbose hides trivial work**: a two-line
+  "ratify X" can require decision records; a long curated body can
+  describe a one-file fix.
+- **Repo weight**: heavy test and tooling surfaces raise the floor — the
+  same fix costs more there; shift by at most one class.
+- **Templated breadth**: porting many files that follow a sibling's
+  template is cheaper than the same count of new ones.
+- **Prose deliverables** (plans, specs, decision records, research notes)
+  are cheap unless they require new measurements.
+
+## Deciding
+
+Picture the finished PR. Count the distinct deliverables; ask what must be
+run to prove each one; ask whether anything must still be discovered or
+designed. Then pick the row whose definition matches what the issue asks
+for. Between two adjacent rows, choose by how much must be discovered or
+verified, not by how much must be typed.
+
 ## Why landed size, not tokens
 
 Sweep tokens scale as hand-written lines^0.25 (a fixed Curator/Judge/repo
