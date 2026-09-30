@@ -37,6 +37,7 @@ impl Heuristic for LandV1 {
                 kind: Kind::Land,
                 sources: &[SampleSource::SweepOutcome, SampleSource::StageJournal],
                 always_merge: true,
+                censoring: false,
             },
             input,
             history,

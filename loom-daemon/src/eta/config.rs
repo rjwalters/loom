@@ -112,3 +112,81 @@ pub fn read(workspace_root: &Path) -> EtaConfig {
     let effective = crate::config_resolver::resolve_effective_config(workspace_root);
     resolve(&effective, |key| std::env::var(key).ok())
 }
+
+/// The config file a promotion writes to: the **host-local**, gitignored tier
+/// ([`crate::config_resolver::LOCAL_CONFIG_REL`]).
+///
+/// Highest precedence, so the flip takes effect immediately; untracked, so a
+/// daemon can never dirty a worktree by deciding one. The evidence behind a
+/// promotion is this host's own history and live pairs (#9343), so host-local
+/// is also the honest scope — rolling it fleet-wide is an operator copying the
+/// key into the committed config, not one host deciding for all of them.
+#[must_use]
+pub fn promotion_config_path(workspace_root: &Path) -> std::path::PathBuf {
+    workspace_root.join(crate::config_resolver::LOCAL_CONFIG_REL)
+}
+
+/// Set `autonomous.eta.current.<kind>` to `heuristic` in the JSON config at
+/// `path`, creating the file and its parents when absent.
+///
+/// A read-modify-write over the **whole** document: every other key is
+/// preserved byte-for-value, only the one leaf changes. A file that exists but
+/// does not parse as a JSON object is an error rather than something to
+/// overwrite — clobbering an operator's config to land a promotion would be a
+/// far worse outcome than not promoting.
+///
+/// Written through a temp file and renamed, so a crash mid-write cannot leave
+/// a half-written config behind.
+///
+/// # Errors
+///
+/// `path` exists and is not a readable JSON object, its parent could not be
+/// created, or the write/rename failed.
+pub fn promote(path: &Path, kind: Kind, heuristic: &str) -> std::io::Result<()> {
+    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => serde_json::json!({}),
+        Ok(text) => serde_json::from_str(&text).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: not valid JSON, refusing to overwrite it: {e}", path.display()),
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e),
+    };
+    if !root.is_object() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: not a JSON object, refusing to overwrite it", path.display()),
+        ));
+    }
+    let mut cursor = &mut root;
+    for segment in ["autonomous", "eta", "current"] {
+        let object = cursor.as_object_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: autonomous.eta.current is not an object", path.display()),
+            )
+        })?;
+        cursor = object
+            .entry(segment)
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    cursor
+        .as_object_mut()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: autonomous.eta.current is not an object", path.display()),
+            )
+        })?
+        .insert(kind.as_str().to_string(), serde_json::Value::String(heuristic.to_string()));
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(&root).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, format!("{text}\n"))?;
+    std::fs::rename(&tmp, path)
+}

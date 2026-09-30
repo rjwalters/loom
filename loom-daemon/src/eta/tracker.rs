@@ -74,8 +74,8 @@ use super::journal::JournalEntry;
 use super::labels::stage_from_pr_labels;
 use super::score::{score, EstimateSummary, OutcomeKind, Score, StageObservation};
 use super::{
-    AgeSource, CurrentStage, CurrentState, DispatchInput, EstimateInput, Kind, NoEstimateReason,
-    Provenance, Registry, Stage, StageSamples, Subject,
+    AgeSource, CurrentStage, CurrentState, DispatchInput, EstimateInput, Heuristic, Kind,
+    NoEstimateReason, Provenance, Registry, Stage, StageSamples, Subject,
 };
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use std::collections::BTreeMap;
@@ -244,6 +244,14 @@ pub struct Emission {
     pub trigger: Trigger,
     /// The estimate.
     pub explanation: Explanation,
+    /// Whether this is the `current` heuristic's estimate for its kind — the
+    /// one every existing consumer reads (#9328).
+    ///
+    /// A `false` here is a **shadow** estimate: computed, journaled and
+    /// emitted as its own `eta.estimate` so a candidate accumulates a live
+    /// record, but never the subject's answer. Nothing downstream may treat a
+    /// shadow estimate as the item's ETA.
+    pub primary: bool,
 }
 
 /// Context the caller supplies to every estimate.
@@ -375,9 +383,15 @@ impl Tracker {
 
     /// [`Self::transition`], but the stage being left did **not** complete —
     /// it ended by closure (a PR closed unmerged). The row names the stage it
-    /// leaves and carries no `entered_at`/`duration_sec`, so
+    /// leaves and carries no `duration_sec`, so
     /// [`JournalEntry::history_sample`] skips it and no truncated stage enters
     /// the distributions.
+    ///
+    /// It does carry a `censored_sec` **lower bound** when the entry instant
+    /// was exactly observed (#9328): the stage provably lasted at least that
+    /// long without completing. Only `land-v2`'s Kaplan–Meier grids read it
+    /// ([`JournalEntry::censored_sample`]); every v1 distribution is
+    /// unchanged.
     #[allow(clippy::too_many_arguments)]
     fn transition_unobserved(
         &mut self,
@@ -432,6 +446,11 @@ impl Tracker {
                     left_at: at,
                     source: observed_source.to_string(),
                 });
+            } else if old.exact {
+                // Cut short, but the entry instant was exact: a right-censored
+                // lower bound, never a duration (#9328).
+                row.entered_at = Some(old.entered_at);
+                row.censored_sec = Some((at - old.entered_at).num_seconds().max(0));
             }
         }
         item.stage = next.map(|stage| StageTrack {
@@ -1141,6 +1160,20 @@ impl Tracker {
     /// Estimate `keys` (every item when `None`) at `now`, returning the
     /// estimates the emit policy lets out. Each emitted estimate becomes
     /// pending until its outcome.
+    ///
+    /// # Shadow mode (#9328)
+    ///
+    /// **Every** registered heuristic of each kind is estimated, not only
+    /// `current` — [`Emission::primary`] marks which one is the subject's
+    /// answer. The additions are strictly additive: `current`'s estimate is
+    /// computed from the identical input against the identical history and is
+    /// emitted first, so no existing consumer sees a different number, only
+    /// extra rows beside it.
+    ///
+    /// Each `(kind, heuristic)` series keeps its own emit state, so a shadow
+    /// estimate's refresh cadence never gates `current`'s, and vice versa; and
+    /// each becomes pending, so one outcome scores both sides at the same
+    /// `as_of` — the pairing [`super::shadow::ShadowLedger`] reads.
     pub fn estimate(
         &mut self,
         keys: Option<&[ItemKey]>,
@@ -1165,26 +1198,38 @@ impl Tracker {
                     Kind::Finish => ctx.current_finish,
                     Kind::Land => ctx.current_land,
                 };
-                let heuristic = ctx.registry.current(kind, configured);
+                let current_id = ctx.registry.current(kind, configured).id();
                 let signature = Signature {
                     stage: item.stage.as_ref().map(|s| s.stage),
                     rework_rounds: item.rework_rounds,
                     reason: item.refused,
                 };
-                let series = (kind, heuristic.id().to_string());
-                let state = item.emit.get(&series).cloned().unwrap_or_default();
-                let Some(trigger) = state.decide(signature, now, ctx.refresh_secs) else {
-                    continue;
-                };
-                let explanation = heuristic.estimate(&input, ctx.history);
-                if let Some(item) = self.items.get_mut(&key) {
-                    item.emit.entry(series).or_default().record(signature, now);
+                // `current` first, then every shadow candidate: the primary
+                // estimate is emitted before any candidate can be mistaken for
+                // it, and its ordering in the output is what it always was.
+                let ordered: Vec<&dyn Heuristic> = ctx
+                    .registry
+                    .for_kind(kind)
+                    .filter(|h| h.id() == current_id)
+                    .chain(ctx.registry.for_kind(kind).filter(|h| h.id() != current_id))
+                    .collect();
+                for heuristic in ordered {
+                    let series = (kind, heuristic.id().to_string());
+                    let state = item.emit.get(&series).cloned().unwrap_or_default();
+                    let Some(trigger) = state.decide(signature, now, ctx.refresh_secs) else {
+                        continue;
+                    };
+                    let explanation = heuristic.estimate(&input, ctx.history);
+                    if let Some(item) = self.items.get_mut(&key) {
+                        item.emit.entry(series).or_default().record(signature, now);
+                    }
+                    self.pending.push(EstimateSummary::of(&explanation));
+                    out.push(Emission {
+                        trigger,
+                        explanation,
+                        primary: heuristic.id() == current_id,
+                    });
                 }
-                self.pending.push(EstimateSummary::of(&explanation));
-                out.push(Emission {
-                    trigger,
-                    explanation,
-                });
             }
         }
         out

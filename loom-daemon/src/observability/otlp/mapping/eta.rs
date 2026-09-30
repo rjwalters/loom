@@ -67,6 +67,7 @@ pub(super) fn log_parts(
                 kv_string("loom.eta.estimate_id", e.estimate_id.clone()),
                 kv_string("loom.eta.kind", e.kind.as_str()),
                 kv_string("loom.eta.heuristic", e.heuristic.clone()),
+                kv_bool("loom.eta.primary", r.primary),
                 kv_string("loom.eta.trigger", r.trigger.as_str()),
             ];
             provenance(&mut attributes, "loom.eta.", &e.loom);
@@ -181,6 +182,7 @@ mod tests {
         };
         EtaEstimateRecord {
             trigger: Trigger::Transition,
+            primary: true,
             explanation: Box::new(LandV1.estimate(&input, &Default::default())),
         }
     }
