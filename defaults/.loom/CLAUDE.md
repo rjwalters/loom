@@ -257,7 +257,8 @@ readily as a dispatched one; only Curator may be skipped.
    directly — a leaseless claim is invisible to other lanes and gets reclaimed (#9453)
 3. Create worktree: `./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42`
 4. Implement, test, commit
-5. Create PR: `git push -u origin feature/issue-42 && gh pr create --label "loom:review-requested" --body "Closes #42"`
+5. Create PR: `git push -u origin feature/issue-42 &&
+   ./.loom/scripts/create-pr.sh --label "loom:review-requested" --body "Closes #42"` (#9453).
 
 ### Judge Workflow
 
