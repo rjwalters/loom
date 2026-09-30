@@ -70,11 +70,12 @@
 #                         "seen N times" counter. Without it the script is
 #                         strictly read-only. Never posts a NEW comment.
 #   --comments-file <p>   Read comments from this file (a JSON array of
-#                         {"id":..,"body":..} objects, REST shape) instead of
-#                         fetching. Used by tests and by callers that already
-#                         hold the comment list.
-#   --no-cache             Read via plain `gh` instead of the `gh-cached`
-#                         wrapper.
+#                         REST-shaped comments: id, body, user.login,
+#                         user.type, author_association) instead of fetching.
+#                         Used by tests and by callers that already hold the
+#                         REST comment list.
+#   --no-cache             Accepted for compatibility; a no-op. The read is
+#                         always a fresh REST listing (see BOUNDED COST).
 #   --help,-h              Show this help.
 #
 # Output (stdout, marker lines -- parseable by the Champion prose):
@@ -98,15 +99,12 @@
 #       the normal/default action, unaffected by this script existing
 #   2 - error (bad arguments, issue unreadable, missing jq)
 #
-# BOUNDED COST. One cached read of the issue's comments for the decision.
-# --apply additionally costs one uncached REST paginate (to obtain the
-# numeric comment id, which the GraphQL `gh issue view` payload never
-# carries) and one PATCH -- exactly the same two-call shape
-# classify-dependency-block.sh already uses for its own in-place edits.
+# BOUNDED COST. One uncached REST paginate of the issue's comments (via
+# `loom-daemon forge trusted-comments --fetch`), which serves both the
+# decision and --apply (REST carries the numeric comment id the PATCH needs).
+# --apply additionally costs one PATCH.
 
 set -uo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---- output helpers ----
 if [[ -t 2 ]]; then
@@ -118,7 +116,7 @@ err()  { echo -e "${RED}ERROR: $1${NC}" >&2; }
 warn() { echo -e "${YELLOW}WARNING: $1${NC}" >&2; }
 
 show_help() {
-    sed -n '2,110p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,105p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ---- defaults ----
@@ -128,8 +126,6 @@ TIER=""
 OCCUPANTS_RAW=""
 DO_APPLY=0
 COMMENTS_FILE=""
-NO_CACHE=0
-GH_READ="${GH_READ:-gh}"
 
 MARKER_TAG="champion:capacity-defer"
 SEEN_TAG="champion:capacity-defer-seen"
@@ -221,48 +217,40 @@ _resolve_repo() {
 # =====================================================================
 
 # _get_comments -- emits a JSON array of TRUSTED-authored comment objects
-# (#9548: a capacity-deferral marker is a control phrase -- it defers fleet
-# work -- so it counts only from a trusted author; an unauthenticated or
-# untrusted marker counts as ABSENT, never as a deferral, which is the safe
-# direction: the worst case is one un-deferred sweep, not attacker-driven
-# deferral). With --comments-file, reads that file (fixtures carry a trusted
-# author: user.login + author_association). Otherwise: GraphQL via $GH_READ
-# for the common (read-only, decision) path -- `id` is a GraphQL node id
-# there, which is fine because the decision only ever inspects `.body`; the
-# numeric id is fetched separately, uncached, ONLY when --apply needs to
-# PATCH. Both paths then filter through `loom-daemon forge trusted-comments`;
-# a listing the filter cannot authenticate yields nothing (stderr says so).
-# requires-daemon: forge optional   Without the `trusted-comments` verb (absent binary, or one predating #9548) no author can be verified, so every capacity-defer marker reads as ABSENT and the issue is not deferred (stderr says so) -- the safe direction: one un-deferred sweep, never an attacker-driven deferral.
+# (#9548), REST-shaped. A capacity-deferral marker only suppresses a
+# DUPLICATE deferral comment -- it does not defer or promote anything -- but
+# it is still a control phrase: a forged one would silence Champion's comment.
+# So it counts only from a trusted author, and an untrusted marker reads as
+# ABSENT. Reading a genuine marker as absent is NOT free: it re-posts the
+# deferral comment on every Champion pass, the #6729 spam this script exists
+# to stop. That is why the live read is the REST listing (`forge
+# trusted-comments --fetch`): only REST spells a fleet App author as
+# `<slug>[bot]`; `gh issue view --json comments` reduces it to a bare login
+# the filter must treat as a user, dropping every fleet-authored marker
+# (#9657 review: 1 of 7 kept on #9126). --comments-file is filtered the same.
+# requires-daemon: forge optional   Without the `trusted-comments` verb (absent binary, or one predating #9548) no author can be verified, so every capacity-defer marker reads as ABSENT (stderr says so) -- a duplicate deferral comment per pass until the binary is current, never an attacker-silenced one.
 _get_comments() {
-    local raw filtered
+    local filtered
     if [[ -n "$COMMENTS_FILE" ]]; then
-        raw="$(cat "$COMMENTS_FILE")"
+        filtered="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments <"$COMMENTS_FILE" 2>/dev/null)"
     else
-        raw="$("$GH_READ" issue view "$ISSUE" --repo "$REPO_NWO" --json comments --jq '.comments' 2>/dev/null)"
-    fi
-    [[ -n "$raw" ]] || return 0
-    filtered="$(printf '%s\n' "$raw" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments 2>/dev/null)" || {
-        echo "capacity-defer: could not authenticate comment authors ('loom-daemon forge trusted-comments' failed); treating markers as absent (#9548)" >&2
+        filtered="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments --fetch "$ISSUE" --repo "$REPO_NWO" 2>/dev/null)"
+    fi || {
+        echo "capacity-defer: could not read or authenticate $REPO_NWO#$ISSUE's comments ('loom-daemon forge trusted-comments' failed); treating markers as absent (#9548)" >&2
         return 0
     }
     printf '%s\n' "$filtered"
 }
 
-# _patch_streak <fingerprint> -- finds the numeric REST id of the latest
-# comment carrying this exact fingerprint's marker and PATCHes its "seen N
-# times" counter upward. Never posts a new comment. Best-effort: a failure
-# here does not change the SKIP decision already made.
+# _patch_streak <fingerprint> <trusted-comments-json> -- finds, among the
+# TRUSTED comments _get_comments already read (never an outsider's copy of the
+# marker), the latest one carrying this exact fingerprint's marker and PATCHes
+# its "seen N times" counter upward. Never posts a new comment. Best-effort: a
+# failure here does not change the SKIP decision already made.
 _patch_streak() {
-    local fingerprint="$1" marker comment_json comment_id comment_body seen next_seen new_body
+    local fingerprint="$1" comments="$2" marker comment_json comment_id comment_body seen next_seen new_body
     marker="$(capacity_marker "$TIER" "$fingerprint")"
-
-    if [[ -n "$COMMENTS_FILE" ]]; then
-        comment_json="$(jq -r --arg m "$marker" \
-            '[.[] | select(.body | contains($m))] | last // empty' "$COMMENTS_FILE")"
-    else
-        comment_json="$(gh api "repos/{owner}/{repo}/issues/$ISSUE/comments" --paginate 2>/dev/null \
-            | jq -s --arg m "$marker" 'add | [.[] | select(.body | contains($m))] | last // empty')"
-    fi
+    comment_json="$(printf '%s\n' "$comments" | jq -c --arg m "$marker" '[.[] | select(.body | contains($m))] | last // empty')"
 
     comment_id="$(printf '%s' "$comment_json" | jq -r '.id // empty' 2>/dev/null)"
     comment_body="$(printf '%s' "$comment_json" | jq -r '.body // empty' 2>/dev/null)"
@@ -311,7 +299,7 @@ main() {
             --occupants)      OCCUPANTS_RAW="${2:-}"; shift 2 ;;
             --apply)          DO_APPLY=1; shift ;;
             --comments-file)  COMMENTS_FILE="${2:-}"; shift 2 ;;
-            --no-cache)       NO_CACHE=1; shift ;;
+            --no-cache)       shift ;;  # no-op, kept for existing callers
             --help|-h)        show_help; exit 0 ;;
             *)                err "Unexpected argument: $1"; show_help >&2; exit 2 ;;
         esac
@@ -336,12 +324,6 @@ main() {
     if [[ -n "$COMMENTS_FILE" && ! -f "$COMMENTS_FILE" ]]; then
         err "--comments-file not found: $COMMENTS_FILE"
         exit 2
-    fi
-
-    GH_READ="gh"
-    if [[ "$NO_CACHE" -eq 0 ]]; then
-        local ghc="$SCRIPT_DIR/gh-cached"
-        if [[ -x "$ghc" ]] && "$ghc" --version >/dev/null 2>&1; then GH_READ="$ghc"; fi
     fi
 
     if [[ -z "$REPO_NWO" ]]; then
@@ -386,7 +368,7 @@ main() {
         echo "OCCUPANTS: $occupants"
         echo "FINGERPRINT: $fingerprint"
         if [[ "$DO_APPLY" -eq 1 ]]; then
-            _patch_streak "$fingerprint" || true
+            _patch_streak "$fingerprint" "$comments_json" || true
         fi
         exit 0
     fi
