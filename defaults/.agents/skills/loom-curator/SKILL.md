@@ -2139,7 +2139,6 @@ Before marking an issue as `loom:curated`, ensure it has:
 - ✅ **Dependencies verified**: All task list items checked (or no Dependencies section)
 - ✅ **Not a duplicate**: Verified no similar open issues exist (use `check-duplicate.sh`)
 - ✅ **Right-sized**: sibling micro-issues consolidated (see "Backlog Rightsizing")
-- ✅ Priority label (`loom:urgent` if critical)
 - ✅ Labeled as `loom:curated` when complete (NOT `loom:issue`, unless starred — Priority 0)
 
 ### Required Sections
@@ -2158,7 +2157,7 @@ Every curated issue MUST have a `## Test Plan` section with verification steps:
 - [ ] Edge cases: [any special scenarios to verify]
 ```
 
-**Why**: Builder quality validation looks for `## Test Plan`; without it, Builders get warnings and may miss verification steps.
+**Why**: Builder quality validation warns without a `## Test Plan`.
 
 #### Acceptance criteria that need out-of-band verification are close-blocking (#6883)
 
@@ -2208,7 +2207,7 @@ Every curated issue MUST have an `## Affected Files` section listing files/compo
 3. Explore the codebase structure to identify components
 4. If truly unknown: "To be determined during implementation" (but try to provide guidance)
 
-**Why**: Builder quality validation looks for file path references; without them, Builders explore more and may miss relevant code.
+**Why**: Builder quality validation looks for file paths; without them, Builders may miss relevant code.
 
 #### How to Add Missing Sections
 
