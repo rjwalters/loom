@@ -106,6 +106,12 @@ pub struct SequenceMarker {
     pub follower_head: String,
     /// The plan identity grouping this ordering (`plan=`).
     pub plan: String,
+    /// Who authored the hold (`source=`): `Some("pass")` marks a planner-authored,
+    /// SOFT ordering preference — the #9686 pass may expiry-release it when the
+    /// predecessor stalls (starvation bound). `None` (or any other value) is a
+    /// HARD hold: a human's or agent's semantic "after" never expires into merge
+    /// permission (#9063's non-negotiable).
+    pub source: Option<String>,
 }
 
 /// The live predecessor state the evaluation needs, as the forge reports it.
@@ -119,6 +125,11 @@ pub struct PredecessorState {
     /// head ref can still report the SHA on the pull object; a failed parse
     /// must not be read as a match).
     pub head_sha: Option<String>,
+    /// RFC3339 last-activity timestamp, when the forge supplied one. Not part
+    /// of the release decision itself — the #9686 pass reads it for the soft
+    /// hold's starvation bound (any predecessor activity keeps a soft order
+    /// fresh). `None` never expires anything.
+    pub updated_at: Option<String>,
 }
 
 /// Why [`Verdict::Keep`] holds the sequencing label in place.
@@ -149,6 +160,23 @@ pub enum Verdict {
     Dissolved,
     /// The hold stands, for the stated reason.
     Keep(KeepReason),
+}
+
+/// The canonical marker line the applier writes.
+///
+/// Single producer, single format: parse and render live in this module so
+/// they cannot drift — the pass (#9686) writes what this parser reads.
+#[must_use]
+pub fn marker_text(marker: &SequenceMarker) -> String {
+    let source = marker
+        .source
+        .as_deref()
+        .map(|s| format!(" source={s}"))
+        .unwrap_or_default();
+    format!(
+        "<!-- {} after={} pred_head={} follower_head={} plan={}{} -->",
+        MARKER_PREFIX, marker.after, marker.pred_head, marker.follower_head, marker.plan, source
+    )
 }
 
 /// The inner text of every HTML comment that both opens and closes on `line`.
@@ -202,6 +230,7 @@ fn parse_span(span: &str) -> Option<SequenceMarker> {
     let mut pred_head = None;
     let mut follower_head = None;
     let mut plan = None;
+    let mut source = None;
     for field in rest.split_whitespace() {
         let (key, value) = field.split_once('=')?;
         match key {
@@ -209,6 +238,7 @@ fn parse_span(span: &str) -> Option<SequenceMarker> {
             "pred_head" => pred_head = is_full_sha(value).then(|| value.to_string()),
             "follower_head" => follower_head = is_full_sha(value).then(|| value.to_string()),
             "plan" => plan = is_plan_id(value).then(|| value.to_string()),
+            "source" => source = is_plan_id(value).then(|| value.to_string()),
             _ => return None,
         }
     }
@@ -217,6 +247,7 @@ fn parse_span(span: &str) -> Option<SequenceMarker> {
         pred_head: pred_head?,
         follower_head: follower_head?,
         plan: plan?,
+        source,
     })
 }
 
@@ -375,10 +406,15 @@ pub fn predecessor_from_json(body: &[u8]) -> Option<PredecessorState> {
         Some(_) => return None,
         None => None,
     };
+    let updated_at = v
+        .get("updated_at")
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
     Some(PredecessorState {
         open,
         merged,
         head_sha,
+        updated_at,
     })
 }
 

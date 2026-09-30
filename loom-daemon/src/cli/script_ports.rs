@@ -590,6 +590,11 @@ pub(crate) enum MergePrCommand {
     /// set; this verb is what moves that label when the condition is met.
     SequenceEval(super::merge_pr_sequence::SequenceEvalArgs),
 
+    /// Compute the repository's landing-order plan and print it, touching
+    /// nothing (#9686) — the read-only replay surface: groups, chain edges,
+    /// and what the sequencing pass would apply this tick.
+    SequencePlan(super::merge_pr_sequence::SequencePlanArgs),
+
     /// The async-close-race worktree-cleanup gate (#4186): whether a merged
     /// PR's issue is actually finished, so a partial-increment worktree the
     /// next Builder increment still needs is not removed out from under it.
@@ -751,6 +756,7 @@ impl MergePrCommand {
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::HoldState(args) => args.run(),
             MergePrCommand::SequenceEval(args) => args.run(),
+            MergePrCommand::SequencePlan(args) => args.run(),
             MergePrCommand::IssueCloseGate(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
