@@ -7,6 +7,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-30
+- **Issue #9045** (closed): Doctor: Priority 1 conflict query doesn't exclude loom:operator-only/-decision, only loom:operator
+- **Issue #9686** (closed): Champion: automatically order overlapping PRs and defer redundant base repairs (9063 first release)
+- **PR #9707**: feat(reconciliation): automatic landing order for overlapping PRs (#9686)
+- **PR #9763**: docs(observability): document and clean up an abandoned partial SigNoz restore rehearsal
+- **PR #9755**: feat(merge-pr): port check-runs rollup read to loom-daemon (#8191 slice)
+- **Issue #9343** (closed): ETA history must be fleet-global: host-local journals make ETAs empty on most hosts, biased on others, and inconsistent across the fleet
+- **PR #9759**: feat(eta): fleet-global, forge-derived ETA history (#9343)
+- **PR #9757**: test(observability): close the SigNoz drift guard's queue/quota/alert gap
+- **Issue #9329** (closed): ETA phase 6: eta.snapshot ingest record + loom-ui display (retire dashboard-side estimates)
+- **PR #9756**: ETA phase 6: eta.snapshot ingest record + CI artifact test (retire stale docs)
+- **Issue #9657** (closed): #9548 slice: shell verdict-freshness + promotion comment reads through comment trust
+- **PR #9662**: fix(merge-pr): route PR comment reads through comment trust (#9548 slice, #9657)
+- **PR #9742**: observability: resolve the SigNoz Service Map confound from Loom's trace shape
 - **Issue #9746** (closed): merge timing: keep LOOM_AUTO_MERGE_TIMEOUT; 52% of PRs pay a second CI cycle to freshness re-dates — attribute and narrow
 - **PR #9751**: feat(merge-pr): attribute #8508 re-dates with commit trailers + redate-report (#9746)
 - **Issue #9669** (closed): feat(telemetry): record candidate queue position and total candidate count on dispatch spans
