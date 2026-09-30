@@ -379,10 +379,15 @@ fn workspace_halted_emission_carries_the_halt_cause_attribute() {
         halt_cause: Some("token_pool".to_string()),
         ..changed_emission()
     };
-    let span = build_span(&emission, Utc::now(), None);
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
     assert_eq!(span.attributes["loom.queue.disposition"], "workspace_halted");
     assert_eq!(span.attributes["loom.queue.state"], "blocked");
     assert_eq!(span.attributes["loom.queue.halt_cause"], "token_pool");
+    // The key must survive the export-time attribute allowlist
+    // (`OPS_SPAN_ATTRIBUTE_KEYS` is re-applied at export), or the attribute
+    // would silently never reach SigNoz.
+    let bounded = span.clone().bounded();
+    assert_eq!(bounded.attributes["loom.queue.halt_cause"], "token_pool");
     assert!(span.validate().is_ok());
 
     // No halt cause, no attribute — a cause-less legacy row stays
@@ -394,7 +399,7 @@ fn workspace_halted_emission_carries_the_halt_cause_attribute() {
         halt_cause: None,
         ..changed_emission()
     };
-    let span = build_span(&emission, Utc::now(), None);
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
     assert!(!span.attributes.contains_key("loom.queue.halt_cause"));
 }
 
