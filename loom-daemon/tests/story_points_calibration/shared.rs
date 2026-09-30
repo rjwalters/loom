@@ -8,6 +8,10 @@ pub const QUERIES: &str =
     include_str!("../../../defaults/observability/story-points-calibration-queries.sql");
 pub const ROLLUP: &str =
     include_str!("../../../defaults/observability/sweep-facts/sweep-facts-rollup.sql");
+/// The canonical question IDs. Restated here deliberately (the
+/// [`cycle_time_artifacts`]/[`sweep_facts_artifacts`] pattern): this is the
+/// one place the *set* is pinned, and every artifact is checked against it
+/// rather than against another artifact, so two files cannot drift together.
 pub const QUESTION_IDS: &[&str] = &["CAL1", "CAL2", "CAL3", "CAL4", "CAL5", "CAL6"];
 
 /// One CAL query's result: column names plus every row, each cell rendered
@@ -96,4 +100,3 @@ pub fn split_statements(sql: &str) -> Vec<(usize, &str)> {
     }
     out
 }
-

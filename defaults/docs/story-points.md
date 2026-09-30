@@ -76,7 +76,7 @@ moving that bound is the loop working. A revision:
    view groups by the marker — a mid-window change shows up as two
    populations, never a silent average;
 3. keeps the markers identical across this doc and that SQL. The contract
-   test (`loom-daemon/tests/story_points_calibration_artifacts.rs`) fails if
+   test (`loom-daemon/tests/story_points_calibration/static_contracts.rs`) fails if
    the two copies disagree, so neither can drift alone.
 
 | revision | date | what changed | source |

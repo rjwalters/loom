@@ -31,7 +31,7 @@
 -- n beside every figure: n = 0 reads as "the loop is not yet warm", not as a
 -- broken query. No sample data is committed in this artifact — the synthetic
 -- population that verifies these queries lives only in
--- `loom-daemon/tests/story_points_calibration_artifacts.rs`.
+-- `loom-daemon/tests/story_points_calibration/execution.rs`.
 --
 -- This file is the CALIBRATION side of epic #9429's closing pair. The
 -- throughput side (points landed per day, SF8/#9433) lives in

@@ -37,20 +37,16 @@
 //! executed as committed.
 #![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 
+use super::shared::{split_statements, QUERIES, QUESTION_IDS};
 use std::collections::BTreeMap;
-use super::shared::{split_statements, QUESTION_IDS, QUERIES};
 
 use regex::Regex;
 
 const QUESTIONS: &str =
     include_str!("../../../defaults/observability/story-points-calibration-questions.md");
 const RUBRIC_DOC: &str = include_str!("../../../defaults/docs/story-points.md");
-const LANDED_SIZE: &str = include_str!("../../../defaults/observability/sweep-facts/landed-size.sql");
-
-/// The canonical question IDs. Restated here deliberately (the
-/// [`cycle_time_artifacts`]/[`sweep_facts_artifacts`] pattern): this is the
-/// one place the *set* is pinned, and every artifact is checked against it
-/// rather than against another artifact, so two files cannot drift together.
+const LANDED_SIZE: &str =
+    include_str!("../../../defaults/observability/sweep-facts/landed-size.sql");
 
 /// The measured point ratios from the story-points experiment (#9466) — the
 /// one place they may be written down is `landed-size.sql`'s
