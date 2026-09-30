@@ -2724,7 +2724,15 @@ pub struct QuarantineEntry {
     /// QuarantineConfig`] the reaper enforces against — different managed
     /// workspaces may configure different thresholds.
     pub insta_crash_threshold: u32,
-    /// Seconds remaining before TTL auto-release, clamped to `0` — the TTL is
+    /// The quarantine **generation** this entry is serving (vibesql#6639): `1`
+    /// for a first quarantine, `N` for the `(N-1)`th relapse without an
+    /// intervening healthy outcome or operator clear. Drives the escalated TTL
+    /// that `ttl_remaining_secs` is measured against. `#[serde(default)]` (`0`
+    /// = unknown) so a CLI can still read a pre-escalation daemon's rows.
+    #[serde(default)]
+    pub generation: u32,
+    /// Seconds remaining before TTL auto-release — against the entry's
+    /// generation-escalated TTL (vibesql#6639), clamped to `0` — the TTL is
     /// enforced only by [`crate::sweep_registry::SweepRegistry::reap_once`], so
     /// an entry can be momentarily past-TTL between reaper ticks; a negative
     /// remainder would be a confusing thing to render.

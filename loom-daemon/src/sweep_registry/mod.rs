@@ -127,6 +127,7 @@ mod pool_hold_broadcast;
 pub(crate) mod private_dispatch;
 mod prless_retry;
 mod quarantine;
+mod quarantine_escalation;
 pub(crate) mod reaper;
 mod restore_to_ready;
 mod spawn_process;
@@ -162,6 +163,8 @@ pub use outcome_journal::*;
 pub use prless_retry::*;
 #[allow(unused_imports)]
 pub use quarantine::*;
+#[allow(unused_imports)]
+pub use quarantine_escalation::*;
 #[allow(unused_imports)]
 pub use reaper::*;
 #[allow(unused_imports)]
@@ -503,6 +506,15 @@ pub struct SweepRegistry {
     /// releases it. Keyed by issue number; since each registry is scoped to one
     /// workspace root, this is effectively a `(workspace, issue)` key.
     quarantined: HashMap<u32, DateTime<Utc>>,
+    /// Per-issue quarantine **generation** (vibesql#6639, #9605): how many
+    /// times this issue has been quarantined without an intervening healthy
+    /// outcome or operator `quarantine clear`. Deliberately survives the TTL
+    /// release — its presence is the *probation* marker that makes the first
+    /// further insta-crash re-quarantine immediately, and it drives the
+    /// escalated TTL (`ttl * 2^(gen-1)`, capped at `ttl_max`). In-memory like
+    /// `quarantined`: a daemon restart resets the ladder. See
+    /// `quarantine_escalation.rs`.
+    quarantine_generations: HashMap<u32, u32>,
     /// Issues whose `loom:blocked` -> `loom:issue` label restore failed at
     /// least once (Issue #4110): [`release_quarantine_label`](Self::release_quarantine_label)
     /// is a best-effort `gh` call, and a transient failure must not silently
@@ -1151,6 +1163,7 @@ impl SweepRegistry {
             insta_crash_counts: HashMap::new(),
             resume_attempt_counts: HashMap::new(),
             quarantined: HashMap::new(),
+            quarantine_generations: HashMap::new(),
             pending_quarantine_release: HashSet::new(),
             quarantine_release_attempts: HashMap::new(),
             #[cfg(test)]
