@@ -77,10 +77,19 @@ default(disabled)**:
   "enabled": false,       // default off — additive, opt-in
   "socket": null,         // default: $SAFEHOUSED_SOCKET
   "room": null,           // omit only if safehoused joined exactly one room
-  "persona": "loom_daemon"
+  "persona": "loom_daemon",
+  "operatorMention": null // who an operator-priority escalation pings (#9321)
   // "rooms": { … }       // optional attention-class routing — see below (#4225)
 }
 ```
+
+**`operatorMention` is a handle, not a credential.** It is the Matrix display
+name or user id (`"@operator:example.org"`) prepended to an operator-priority
+escalation line so the room actually notifies a human (#9321). Nothing about it
+authenticates anything — the `persona` does that — so it belongs beside the room
+ids rather than in an owner-only credential store. Leave it `null` and the
+escalation is still posted, just without a ping: a missing handle never drops an
+ask.
 
 Env overrides (each wins over config for that key):
 
@@ -90,6 +99,7 @@ Env overrides (each wins over config for that key):
 | `LOOM_SAFEHOUSE_SOCKET` | `socket` |
 | `LOOM_SAFEHOUSE_ROOM` | `room` |
 | `LOOM_SAFEHOUSE_PERSONA` | `persona` |
+| `LOOM_SAFEHOUSE_OPERATOR_MENTION` | `operatorMention` (#9321) |
 | `LOOM_SAFEHOUSE_ROOM_SIGNAL` | `rooms.signal` (#4225) |
 | `LOOM_SAFEHOUSE_ROOMS_BY_REPO` | `rooms.byRepo`, as `repo=room[,repo=room…]` (#4225) |
 | `LOOM_SAFEHOUSE_ROOM_CLAIMS` | `rooms.claims` — dedicated peer-claim coordination room (#4713) |
@@ -585,6 +595,41 @@ each one lands in is decided by its envelope `type` — see
 `task` lines (dispatch/phase) go to that repo's firehose, while `handoff` /
 `ack` / `completion` (blockers, crashes, terminal outcomes) go to the signal room.
 With no `rooms` map configured they all go to the one `room`, as before.
+
+### Operator-priority escalations (#9321)
+
+`operator_priority.escalation` — a starred (`loom:operator-priority`) issue that
+reached a state only the operator can move — is narrated as a **`handoff`**, so
+it lands in the signal room the operator actually watches rather than a muted
+per-repo firehose. That routing *is* the feature: the escalation already exists
+as a forge comment (#9301), and a forge comment is what nobody read for seven
+hours in #9268.
+
+```
+@operator:example.org: loom#9268 · OPERATOR NEEDED · merge-refused at needs-operator
+Allow merge commits on the repository, or re-run the merge with squash.
+https://github.com/rjwalters/loom/issues/9268 · observed by host-a
+```
+
+- **The mention** comes from `safehouse.operatorMention` above; unset ⇒ the same
+  line without the ping, never a dropped ask.
+- **Exactly one post per ask, fleet-wide.** The publisher emits only on the pass
+  that actually posts that ask's forge comment, so the comment's
+  `<!-- loom:operator-priority-escalation key=<kind>:<specifics> -->` marker —
+  already the fleet's shared lock — is the *only* dedupe: no repeat across
+  ticks (a per-process ledger), across hosts (a peer finds the marker), or
+  across restarts (the marker is re-read). A non-starred issue produces no
+  liveness row, hence no post.
+- **Recovery.** When the ask clears, one `resolved ✓` line lands in the same
+  thread, **without** re-pinging the operator — summoning a human to say
+  "never mind" is noise. Only the host that announced the ask narrates its
+  recovery, and a repo whose pass could not be read resolves nothing (an
+  unreadable repo must not read as "everything cleared").
+- **No `meta`.** Envelope-v1 allows `meta` only on a `completion`, so every fact
+  the operator needs is in the body; the structured payload stays on the bus
+  event for other consumers.
+- **`safehouse.enabled` false ⇒ unchanged behavior**: the forge comment and the
+  `health`/`status`/`queue` surfaces still carry the ask, nothing reaches Matrix.
 
 ### Repo qualification (issue #4201)
 

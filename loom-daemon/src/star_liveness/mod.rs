@@ -76,7 +76,7 @@ pub mod task;
 pub mod trust;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Env override for [`Settings::no_progress`] (minutes).
 pub const NO_PROGRESS_MINUTES_ENV: &str = "LOOM_OPERATOR_PRIORITY_NO_PROGRESS_MINUTES";

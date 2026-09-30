@@ -3070,6 +3070,63 @@ pub enum Event {
         /// Operator-facing advisory message naming the concrete cause.
         message: String,
     },
+    /// `operator_priority.escalation` — a starred (`loom:operator-priority`)
+    /// issue reached (or left) a state only the operator can move (Issue
+    /// #9321, the delivery half of #9244/#9301).
+    ///
+    /// Published by [`crate::star_liveness`]'s liveness pass, **exactly once
+    /// per (repo, issue, dedupe key)** and only on the pass that actually
+    /// posts the forge escalation comment — the same
+    /// `<!-- loom:operator-priority-escalation key=… -->` marker dedupe that
+    /// makes the comment once-per-cause fleet-wide therefore makes this event
+    /// once-per-cause too, across ticks, hosts and restarts. A second event
+    /// with `resolved: true` fires once when that key's ask clears.
+    ///
+    /// Consumed by the Safehouse narration sink
+    /// ([`crate::safehouse::operator_priority_envelope`] — *not*
+    /// `event_to_envelope`, which returns `None` for this variant because the
+    /// body needs `safehouse.operatorMention` from config), which renders it as a
+    /// `handoff` envelope — the `Signal` attention class, i.e. the team's
+    /// notifications-on Matrix room — so the ask reaches the human rather than
+    /// only a forge comment nobody reads in time (the #9268 failure mode).
+    ///
+    /// Secret-free by construction: forge slug, issue number, dedupe key, ask
+    /// kind/stage wire names, the operator-facing ask sentence, the issue's
+    /// web URL, and the observing host id. No token, account, credential or
+    /// log path.
+    OperatorPriorityEscalation {
+        /// Forge `owner/repo` of the escalated issue. (This topic is not
+        /// shared with `sweep.issue.{N}.*`, so it needs no #3929
+        /// workspace-root `repo` field to disambiguate issue numbers — the
+        /// slug already does, and the operator-facing link needs it anyway.)
+        slug: String,
+        /// The escalated issue.
+        issue: u32,
+        /// The escalation's dedupe key, `<kind>:<specifics>` — identical to
+        /// the key in the forge comment's marker
+        /// ([`crate::star_liveness::escalate::marker`]).
+        key: String,
+        /// [`AskKind`] wire name (e.g. `no-progress`, `merge-refused`).
+        kind: String,
+        /// [`LandingStage`] wire name at escalation time (e.g. `in-review`).
+        stage: String,
+        /// The ask itself, one or two sentences naming what to do.
+        text: String,
+        /// The issue's canonical web URL, so the room line is clickable.
+        url: String,
+        /// The host whose pass observed it (the same id the forge comment
+        /// names).
+        host: String,
+        /// Set when the escalated row is a blocker that inherited its star:
+        /// the starred issue it inherited from.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inherited_from: Option<u32>,
+        /// `false` on the escalation itself; `true` on the recovery notice
+        /// fired once when the ask clears. Mirrors
+        /// `daemon.capacity.advisory`'s `pressured` direction flag rather than
+        /// spending a second topic on the clearing edge.
+        resolved: bool,
+    },
     /// `daemon.idle_exit` — the daemon is cleanly yielding to a host
     /// idle-shutdown guard (Issue #4467).
     DaemonIdleExit {
@@ -3112,6 +3169,7 @@ impl Event {
     /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
     /// | `CapacityAdvisory {..}` | `daemon.capacity.advisory` |
     /// | `PreflightAdvisory {..}` | `daemon.preflight.advisory` |
+    /// | `OperatorPriorityEscalation {..}` | `operator_priority.escalation` |
     /// | `TopicLag {..}` | `sweep.system.topic_lag` |
     /// | `Generic {topic, ..}` | the explicit topic string |
     ///
@@ -3139,6 +3197,7 @@ impl Event {
             }
             Self::CapacityAdvisory { .. } => "daemon.capacity.advisory".to_string(),
             Self::PreflightAdvisory { .. } => "daemon.preflight.advisory".to_string(),
+            Self::OperatorPriorityEscalation { .. } => "operator_priority.escalation".to_string(),
             Self::DaemonIdleExit { .. } => "daemon.idle_exit".to_string(),
             Self::TopicLag { .. } => "sweep.system.topic_lag".to_string(),
             Self::Generic { topic, .. } => topic.clone(),
