@@ -443,6 +443,7 @@ fn daemon_ci_log_attribute_containers() -> BTreeMap<String, &'static str> {
         completed_at: at,
         duration_ms: 0,
         queued_ms: Some(0),
+        dependency_wait_ms: Some(0),
         shard_index: Some(1),
         shard_total: Some(3),
         shard_kind: "nextest-partition".into(),
