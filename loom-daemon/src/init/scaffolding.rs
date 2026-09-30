@@ -144,31 +144,144 @@ fn labels_block_range(content: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
+/// Collect the `- name: <name>` entries declared inside a Loom-managed labels
+/// block (as returned by [`labels_block_range`]), i.e. Loom's own shipped
+/// label set.
+///
+/// Used by [`strip_legacy_loom_label_entries`] to recognize pre-#4187 copies
+/// of Loom's labels sitting outside the marker block (#8875) — a label
+/// declared inside the managed block can never legitimately also be a
+/// consumer's own label of the same name, since names are the sync key `gh
+/// label` operates on.
+fn extract_label_names(block: &str) -> HashSet<&str> {
+    block
+        .lines()
+        .filter_map(|line| line.strip_prefix("- name:"))
+        .map(str::trim)
+        .collect()
+}
+
+/// Remove label entries from `text` — content that lives (or will live)
+/// *outside* the Loom-managed marker block — whose `name:` matches one of
+/// `loom_names`.
+///
+/// Before #4187, Loom wrote its labels unmarked directly into
+/// `.github/labels.yml`. Installing a modern, marker-aware Loom over such a
+/// repo treated that legacy block as consumer-owned content and preserved it
+/// verbatim alongside the freshly-spliced managed block, leaving every
+/// workflow label defined twice — once stale (legacy) and once current
+/// (managed) — with `sync-labels.sh --check` permanently unable to converge
+/// (#8875). A label name declared inside Loom's shipped block is
+/// unambiguously Loom's own; stripping any same-named entry found outside the
+/// block absorbs it into the managed block instead of preserving a duplicate.
+///
+/// Entries are recognized as line-oriented blocks starting with `- name:
+/// ...` and continuing only through genuine continuation lines — indented,
+/// non-blank, not a `#` comment, and not themselves the start of another YAML
+/// list item (anything beginning with `-`, however indented) — up to the
+/// first line that doesn't meet that description, or the end of `text`; one
+/// immediately-following blank separator line is also swallowed so removal
+/// doesn't leave a doubled blank line. Comments, blank lines, and any entry
+/// whose name is *not* in `loom_names` (genuine consumer content) are
+/// preserved untouched.
+///
+/// The continuation test is deliberately conservative (#8887 adversarial
+/// review): the previous rule scanned for the next literal `- name:` line as
+/// the entry's end, so a blank line, a `#` comment, a sibling entry whose
+/// first key isn't `name:` (e.g. `- color: …` / `  name: …`), or a flow-style
+/// consumer entry (`- {name: x, color: y}`) between two matched entries was
+/// silently swallowed as if it were a continuation line of the one before it
+/// — deleting consumer content that never collided by name. Stopping at the
+/// first line that isn't unambiguously a continuation, and preserving that
+/// line, means an entry whose extent can't be established is left alone
+/// rather than guessed at.
+///
+/// Returns the rewritten text plus the list of Loom-owned names actually
+/// absorbed (stripped because they collided), so callers can log what was
+/// removed — the removal is otherwise silent and irreversible.
+fn strip_legacy_loom_label_entries<'a>(
+    text: &'a str,
+    loom_names: &HashSet<&str>,
+) -> (String, Vec<&'a str>) {
+    if loom_names.is_empty() {
+        return (text.to_string(), Vec::new());
+    }
+
+    let mut out = String::new();
+    let mut absorbed = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        if let Some(name) = line.strip_prefix("- name:").map(str::trim) {
+            if loom_names.contains(name) {
+                absorbed.push(name);
+                // Skip only genuine continuation lines of this entry.
+                while let Some(next) = lines.peek() {
+                    let trimmed = next.trim_start();
+                    let is_continuation = next.len() != trimmed.len()
+                        && !trimmed.is_empty()
+                        && !trimmed.starts_with('#')
+                        && !trimmed.starts_with('-');
+                    if !is_continuation {
+                        break;
+                    }
+                    lines.next();
+                }
+                // Swallow one immediately-following blank separator line.
+                if matches!(lines.peek(), Some(next) if next.trim().is_empty()) {
+                    lines.next();
+                }
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    (out, absorbed)
+}
+
 /// Compute the correct `.github/labels.yml` content for an install, preserving
 /// all consumer-owned entries outside the Loom-managed marker block.
 ///
 /// - **`existing` has a well-formed block** → replace only the marked range with
-///   the shipped block; everything before/after is preserved byte-for-byte.
+///   the shipped block; everything before/after is preserved byte-for-byte,
+///   except any entry whose name duplicates one of Loom's own shipped labels
+///   (see [`strip_legacy_loom_label_entries`]), which is absorbed rather than
+///   kept as a stale duplicate.
 /// - **`existing` is markerless** (a legacy install, or a consumer file Loom has
-///   never touched) → append the shipped block, preserving every existing entry.
+///   never touched) → append the shipped block, preserving every existing entry
+///   except same-named legacy Loom duplicates (as above) — this is the
+///   pre-#4187 upgrade path (#8875).
 /// - **`source` has no block** (defensive; the shipped file always does) →
 ///   return `existing` unchanged rather than risk clobbering consumer content.
 ///
 /// The result is `None` when no change is needed (`existing` already equals the
-/// computed content), letting the caller record the file as `preserved`.
-fn merge_labels_block(existing: &str, source: &str) -> Option<String> {
-    let Some((src_start, src_end)) = labels_block_range(source) else {
-        // Shipped file unexpectedly lacks markers — never clobber the consumer.
-        return None;
-    };
+/// computed content), letting the caller record the file as `preserved`. The
+/// second element of the `Some` tuple lists every Loom-owned name absorbed
+/// from legacy duplicate entries, for the caller to log (see
+/// [`strip_legacy_loom_label_entries`]).
+fn merge_labels_block<'a>(existing: &'a str, source: &str) -> Option<(String, Vec<&'a str>)> {
+    let (src_start, src_end) = labels_block_range(source)?;
     let source_block = &source[src_start..src_end];
+    let loom_names = extract_label_names(source_block);
 
+    let mut absorbed = Vec::new();
     let merged = if let Some((dst_start, dst_end)) = labels_block_range(existing) {
-        // Splice the shipped block over the consumer's marked range.
-        format!("{}{}{}", &existing[..dst_start], source_block, &existing[dst_end..])
+        // Splice the shipped block over the consumer's marked range, absorbing
+        // any same-named legacy Loom entries found in the surrounding text.
+        let (head, head_absorbed) =
+            strip_legacy_loom_label_entries(&existing[..dst_start], &loom_names);
+        let (tail, tail_absorbed) =
+            strip_legacy_loom_label_entries(&existing[dst_end..], &loom_names);
+        absorbed.extend(head_absorbed);
+        absorbed.extend(tail_absorbed);
+        format!("{head}{source_block}{tail}")
     } else {
-        // Markerless consumer file: append the block, preserving all entries.
-        let head = existing.trim_end_matches('\n');
+        // Markerless consumer file: absorb same-named legacy Loom entries,
+        // then append the block, preserving all remaining (genuinely
+        // consumer-owned) entries.
+        let (stripped, stripped_absorbed) = strip_legacy_loom_label_entries(existing, &loom_names);
+        absorbed.extend(stripped_absorbed);
+        let head = stripped.trim_end_matches('\n');
         if head.is_empty() {
             format!("{source_block}\n")
         } else {
@@ -179,7 +292,7 @@ fn merge_labels_block(existing: &str, source: &str) -> Option<String> {
     if merged == existing {
         None
     } else {
-        Some(merged)
+        Some((merged, absorbed))
     }
 }
 
@@ -214,9 +327,17 @@ fn install_labels_block(
         }
         Some(existing) => {
             match merge_labels_block(existing, &source) {
-                Some(merged) => {
+                Some((merged, absorbed)) => {
                     fs::write(dst, &merged)
                         .map_err(|e| format!("Failed to write labels.yml: {e}"))?;
+                    // #8887: the absorption is otherwise silent and
+                    // irreversible — one line per removed legacy duplicate so
+                    // it is visible (and greppable in daemon.log) rather than
+                    // landing as an unremarked scaffolding diff.
+                    for name in absorbed {
+                        eprintln!("absorbed legacy duplicate of '{name}' from {LABELS_YML_REL}");
+                        log::info!("init: {LABELS_YML_REL}: absorbed legacy duplicate of '{name}'");
+                    }
                 }
                 None => {
                     // Content unchanged — but a `--force` directory copy may have
@@ -1555,3 +1676,9 @@ mod agent_skills_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod legacy_permissions_tests;
+// Same reason as `agent_skills_tests` above: `scaffolding/tests.rs` is
+// frozen at its file-size ratchet baseline, so the pre-#4187 legacy-duplicate
+// absorption tests (issue #8875) live in their own sibling module instead.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod legacy_label_duplicates_tests;

@@ -394,6 +394,14 @@ pub(crate) enum ScriptPortCommand {
     /// `CheckStaleBlocked` it WRITES (a comment, never a label); `--dry-run`
     /// previews. Always exits 0.
     NotifyClearedBlockers(super::notify_cleared_blockers::NotifyClearedBlockersArgs),
+    /// `sync-labels.sh`'s duplicate-declared-name scan (#8875): a
+    /// `labels.yml` that carries two `- name:` entries for the same label
+    /// (the pre-#4187-upgrade shape `merge_labels_block` now absorbs on
+    /// install) is structural drift in the file itself, independent of
+    /// forge state. Ported out of the `contract`-category script per the
+    /// shell language policy. Prints each duplicated name once, in file
+    /// order.
+    LabelDuplicates(super::label_duplicates::LabelDuplicatesArgs),
 }
 
 impl ScriptPortCommand {
@@ -449,6 +457,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
             ScriptPortCommand::SecretScan(args) => args.run(),
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
+            ScriptPortCommand::LabelDuplicates(args) => args.run(),
         }
     }
 }

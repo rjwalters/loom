@@ -5,9 +5,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod fake;
+/// `pub(crate)` so `safehouse::tests` can compose the **real** publisher with
+/// the **real** Safehouse relay in one end-to-end test (#9321) instead of
+/// hand-rolling an escalation event that could drift from what a pass emits.
+pub(crate) mod fake;
 mod intents_tests;
 mod landing_tests;
+mod notice_tests;
 mod pass_tests;
 mod replay;
 mod review_fix_tests;

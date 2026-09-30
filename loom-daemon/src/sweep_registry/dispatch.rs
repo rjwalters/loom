@@ -1001,12 +1001,16 @@ impl SweepRegistry {
             // the pool-hold lane (Issue #8001) each have their own dedicated
             // publisher (`publish_peer_cooldown_claim` /
             // `publish_peer_pool_hold_claim`), since each carries a payload
-            // this method's signature has no parameter for.
+            // this method's signature has no parameter for. The PR-less-retry
+            // lane (Issue #9292) does the same, for the same reason — its ad
+            // carries the advertiser's own consecutive tally (see
+            // `publish_peer_prless_release_claim`).
             peer_claims::ClaimKind::Completed
             | peer_claims::ClaimKind::FilingLock
             | peer_claims::ClaimKind::FilingUnlock
             | peer_claims::ClaimKind::NoopCooldownArmed
             | peer_claims::ClaimKind::DispatchBackoffArmed
+            | peer_claims::ClaimKind::PrlessReleaseArmed
             | peer_claims::ClaimKind::PoolHoldArmed
             | peer_claims::ClaimKind::PoolHoldCleared
             | peer_claims::ClaimKind::Heartbeat => return,
@@ -1270,6 +1274,22 @@ impl SweepRegistry {
             return None;
         }
         remaining.to_std().ok().filter(|d| !d.is_zero())
+    }
+
+    /// Absolute dispatch-backoff expiry for `issue` at `now` (Issue #9311), or
+    /// `None` when it may be dispatched immediately. Mirrors
+    /// [`Self::dispatch_backoff_remaining`] but returns the instant itself
+    /// rather than the duration until it — this host's own local window only,
+    /// same scope as [`Self::open_pr_backoff_issues`] (not the fleet-unioned
+    /// [`Self::dispatch_backoff_issues`]): a peer-armed window's expiry is not
+    /// available here.
+    #[must_use]
+    pub fn dispatch_backoff_until(&self, issue: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.dispatch_backoff_config.enabled {
+            return None;
+        }
+        let state = self.dispatch_backoff.get(&issue)?;
+        (state.until > now).then_some(state.until)
     }
 
     /// Consecutive failed dispatch attempts recorded for `issue` (Issue #4485).

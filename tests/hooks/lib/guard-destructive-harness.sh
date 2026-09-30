@@ -40,7 +40,7 @@ unset LOOM_FORCE_SCOPE LOOM_DEFAULT_BRANCH LOOM_GUARD_SQL LOOM_GUARD_CLOUD \
       LOOM_GUARD_REVERSIBLE_GH LOOM_RM_SCOPE LOOM_GUARD_READONLY_FASTPATH \
       LOOM_GUARD_WORKTREE_ISOLATION LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT \
       LOOM_GUARD_DECISION_LOG LOOM_GUARD_DECISION_LOG_FILE LOOM_GUARD_STASH_SCOPE \
-      LOOM_ROLE LOOM_GUARD_CARGO_CLEAN CARGO_TARGET_DIR
+      LOOM_ROLE LOOM_GUARD_CARGO_CLEAN CARGO_TARGET_DIR LOOM_GUARD_SCRATCH_ROOT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
@@ -132,14 +132,22 @@ echo ""
 
 # =========================================================================
 
+# Per-invocation `session_id` on the hook's stdin (#8460). Claude Code always
+# supplies it; the corpus historically did not, so it stays OPTIONAL — empty
+# (the default) omits the key entirely, exactly as before, and every existing
+# assertion is unaffected. A suite that exercises session identity sets this
+# global around the block that needs it and clears it afterwards, which keeps
+# all six assert_* wrappers unchanged.
+GUARD_TEST_SESSION_ID="${GUARD_TEST_SESSION_ID:-}"
+
 make_input() {
     local cmd="$1"
     local cwd="${2:-$TEST_REPO}"
-    jq -n --arg cmd "$cmd" --arg cwd "$cwd" '{
+    jq -n --arg cmd "$cmd" --arg cwd "$cwd" --arg sid "${GUARD_TEST_SESSION_ID:-}" '{
         tool_name: "Bash",
         tool_input: { command: $cmd },
         cwd: $cwd
-    }'
+    } + (if $sid == "" then {} else { session_id: $sid } end)'
 }
 
 run_guard() {

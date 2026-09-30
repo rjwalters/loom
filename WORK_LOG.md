@@ -6,7 +6,165 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-30
+- **PR #9570**: chore(deps): bump fast-uri from 3.1.7 to 3.1.8 in /mcp-loom
+- **PR #9564**: test(watchdog): stop signalling the dead-pid fixture pre-exec — removes ten ~60s CI stalls
+- **Issue #9552** (closed): bug(sweep-lease): fence/publish/renew pass -R to gh api, so every lease read/write fails when LOOM_REPO is set
+- **PR #9556**: fix(sweep-lease): address LOOM_REPO in the gh api path, not via -R (#9552)
+- **Issue #8709** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
+- **Issue #9567** (closed): CI: move CodeQL into its own daily-only workflow (codeql.yml) and add Rust (stacked on #9565)
+- **PR #9569**: ci: move CodeQL to daily-only codeql.yml and add Rust (#9567)
+- **Issue #9565** (closed): CI: CodeQL writes an unused overlay-base DB to the Actions cache on every main push (7.4 GB, repo over 10 GB cap)
+- **PR #9568**: ci: disable CodeQL overlay analysis (#9565)
+
+### 2026-09-29
+- **Issue #9562** (closed): CI: spawn_dead_pid() stalls 60s per call on Linux — watchdog suite 40s→640s, +9 min on every PR's critical path
+- **PR #9563**: fix(test): spawn_dead_pid() sends no signal — removes 60s/call Linux stall in watchdog suite
+- **Issue #9554** (closed): docs(security): ci-integration.md shows a script-injection pattern; role workflows need an enable-at-your-own-risk warning
+- **PR #9558**: docs(security): env-pass PR text in ci-integration.md; warn on role workflows (#9554)
+- **Issue #9553** (closed): bug(outcome-journal): rework.rs drops the reflog UTC offset, shifting rework events and failing the reflog test on non-UTC hosts
+- **PR #9557**: fix(outcome-journal): honour the reflog UTC offset in rework.rs (#9553)
+- **Issue #9537** (closed): forge identity broker: one roster and one entry point for which App a call uses and which logins are ours
+- **Issue #9248** (closed): daemon: use a pool of GitHub Apps on every host for forge reads (reads-only, keyed by owner+app)
+- **PR #9376**: feat(forge): add the reads-only GitHub App pool — config, selection, withdrawal
+- **PR #9545**: feat(forge): identity broker — one writer, a reader pool, one 'is this ours?' (#9537, #9248)
+- **Issue #9433** (closed): [Epic #9429] story-points: points-landed-per-day throughput query and rollup
+- **PR #9555**: feat(observability): points-landed-per-day throughput query (SF8)
+- **PR #9538**: refactor(cli): move ForgeAction + its dispatcher out of main.rs into cli/forge_action.rs
+- **Issue #9314** (closed): Operator-priority follow-ups from #9306 review: overflow flag after restart, starred-at cache edges, registry load
+- **PR #9547**: Fix operator-priority follow-ups from #9306 review: overflow flag, starred-at cache, registry load
+- **Issue #9318** (closed): dispatch_plan follow-ups from #9316 review: per-row alignment check, overflow_free docs/dashboard, stale key names
+- **PR #9540**: Fix dispatch_plan follow-ups from #9316 review
+- **Issue #9315** (closed): telemetry: cross-file message.id dedupe for sweep token sums; gen_ai input_tokens semantics (follow-up to #9313)
+- **PR #9532**: fix(telemetry): cross-file message.id dedupe for sweep token sums (#9315)
+- **Issue #9432** (closed): [Epic #9429] story-points: carry loom.story_points onto sweep telemetry
+- **PR #9536**: feat(telemetry): carry loom.story_points onto sweep telemetry
+- **Issue #9431** (closed): [Epic #9429] story-points: points:* labels and Curator assignment
+- **PR #9528**: story-points: points:* labels and Curator assignment (#9431)
+- **Issue #9310** (closed): dispatch_plan B: fleet-wide merge of host plans as a shipped rule (merge_plans + shared fixture with dashboard)
+- **PR #9525**: feat(dispatch-plan): fleet-wide merge of host plans as a shipped rule (#9310)
+- **Issue #9297** (closed): Shell Budget Ratchet: allow declared call-site lines for logic migrated to a daemon subcommand
+- **PR #9527**: feat: let a declared call-site offset portable shell growth (#9297)
+- **Issue #9444** (closed): telemetry: record attempt lineage and rework reason (main moved, merge conflict, stale-base re-judge, env retry vs judge changes) on sweep records
+- **Issue #9454** (closed): telemetry: ~19% of token-bearing sweep.outcome records attribute tokens a sweep could not have consumed (e.g. 250M tokens in a 22 s curator-only failure)
+- **PR #9511**: feat(telemetry): per-record usage attribution (#9454); reflog-derived rework events (#9444)
+- **Issue #9430** (closed): [Epic #9429] story-points: extract clean-landing cost distributions from SigNoz and draft the Fibonacci rubric
+- **PR #9520**: docs(story-points): Fibonacci rubric, D1 query artifact, verification note
+- **Issue #9194** (closed): loom-daemon: 4 pre-existing test failures on this macOS host, unrelated to any single PR (found via #8191 sweep's post-wave build gate)
+- **PR #9513**: Fix 4 macOS test failures in loom-daemon (#9194)
+- **PR #9515**: chore: resync installed Loom surfaces
+- **Issue #9273** (closed): Fold forge_cached_view's self-contained ETag store into the shared forge_listing primitives (after #9261)
+- **PR #9503**: Fold forge_cached_view's ETag store into forge_etag_store
+- **Issue #9465** (closed): telemetry: PRs aren't reliably linked to their issue (slice PRs lack Closes, pr_number on 2.7% of sweep.outcome, model field is the config arm)
+- **PR #9501**: feat(telemetry): Loom-Issue trailer convention for multi-PR landings + #9465 derivation contract tests
+- **Issue #9499** (closed): Label audit: delete, merge or describe the weird ones (duplicates, retired-but-present, namespace strays)
+- **Issue #9231** (closed): Role-tick executions get no loom.runtime.usage span and no session.summary trace join
+- **PR #9498**: Give role-runner ticks a trace join, keyed on role (#9231)
+- **Issue #9253** (closed): pipeline_snapshot: stop firing 9 GraphQL lists per repo root; use the ETag REST listing and bound fan-out
+- **PR #9256**: fix(daemon): serve pipeline_snapshot counts from cached REST, bound fan-out (#9253)
+- **Issue #9446** (closed): observability: retention-safe sweep_facts + issue_effort rollup (lifecycle vs clean effort), backfilled from D1 before eviction
+- **Issue #9466** (closed): KPI: emit landed size at completion — repo-owned generatedPaths, hand-written lines/files on sweep.outcome, landed_size/LSI in the issue_effort rollup
+- **Issue #9464** (closed): labels: 48% of landed issues were never labelled loom:building, rising to 80–94% of landings since 09-21 — dispatch skips the forge-visible claim
+- **Issue #9463** (closed): labels: 33% of landed issues get loom:issue re-added a median 39 s after they close (sweep claim release races the merge)
+- **PR #9481**: feat(telemetry): sweep facts — disposition, token status, lineage, landing size; claim-label safety; retention + rollups
+- **PR #9250**: docs(adr-0021): amend — the forge event feed buys down forge calls, not only latency
+- **Issue #9140** (closed): build-gate.sh does not run the four structural markdown/ratchet gates CI enforces
+- **PR #9491**: Run CI's structural gate set in build-gate.sh, derived from ci.yml (#9140)
+- **Issue #9124** (closed): Investigate PR approval invalidations: 34 stale-SHA re-reviews vs 19 healthy repair laps
+- **PR #9490**: fix(daemon): stop invalidating PR approvals whose tree did not change
+- **Issue #9135** (closed): Retire the per-repo token pool: OAuth credentials must never live inside a git worktree
+- **PR #9489**: Retire the per-repo token pool inside a git worktree (#9135)
+- **Issue #9440** (closed): telemetry: sweep.outcome carries tokens on only ~10% of sweeps — failed/cancelled attempts are token-less, so lifecycle cost is undercounted
+- **PR #9478**: feat(telemetry): sweep.outcome carries tokens on every sweep, with tokens_status
+- **Issue #9108** (closed): Guards: MCP tool calls are outside every PreToolUse matcher — mcp-loom execute surface is unguarded
+- **PR #9480**: feat(guard): add a PreToolUse argument guard for the mcp__loom__* namespace
+- **Issue #9441** (closed): telemetry: sweep.outcome needs a disposition — result=success includes no-op re-dispatches and 98% of failures are unclassified
+- **PR #9471**: feat(telemetry): add required disposition field to sweep.outcome
+- **Issue #9106** (closed): git: forge-derived branch names reach fetch/rebase unvalidated — option injection (RCE on path-based origins, clone corruption on https)
+- **PR #9474**: fix(git): validate forge-derived branch names before they reach a git argv
+- **Issue #9443** (closed): telemetry: per-phase token attribution on sweep.outcome (curator/builder/judge/doctor), so clean-landing and rework cost are separable
+- **PR #9475**: feat(telemetry): per-phase token attribution on sweep.outcome (#9443)
+- **Issue #9445** (closed): session.summary records in SigNoz are unjoinable: loom.repo is the cwd basename, loom.issue is almost never set, trace_id is empty
+- **PR #9472**: fix(telemetry): make session.summary joinable — slug repo, resolved issue/PR, sweep trace (#9445)
+- **Issue #9442** (closed): telemetry: sweep records sometimes carry a local filesystem path in repo instead of owner/name
+- **PR #9462**: fix(telemetry): sweep repo is always a forge slug or absent — never a host path
+- **Issue #9461** (closed): merge-pr.sh: bare "${flags[@]}" under set -u breaks the loom:pr guard on stock macOS bash 3.2
+- **PR #9469**: fix(merge-pr): expand the loom-pr-guard flags array with the empty-safe idiom (#9461)
+- **Issue #9107** (closed): mcp-loom: get_agent_metrics joins raw MCP tool args into a shell string (no server-side schema enforcement)
+- **PR #9470**: fix(mcp-loom): allow-list get_agent_metrics args; spawn via execFile argv (#9107)
+- **PR #9404**: chore(deps): bump ip-address from 10.3.1 to 10.7.2 in /mcp-loom
+- **PR #9459**: chore: resync installed Loom surfaces
+- **Issue #9467** (closed): remote-build guide: the gitignore-filter rsync form silently drops tracked files (macOS system rsync) — document the tracked-file-set sync
+- **PR #9468**: docs(remote-build): sync the tracked file set — gitignore-filter rsync silently drops tracked files (#9467)
+- **Issue #9458** (closed): Dual loom:building leases granted to issue #8195 within 1 minute across hosts, causing duplicate build
+- **Issue #9447** (closed): defaults/.claude/settings.json: Bash(./scripts/**:*) allow rules are malformed (dead + startup warning)
+- **PR #9451**: fix(settings): replace malformed scripts/**:* Bash allow rules and strip legacy copies on install (#9447)
+- **Issue #9421** (closed): demand ledger: filter parked PRs from changes debt (Doctor-cap loom:blocked) so build back-off can't latch; fix buildBackoff docs rows
+- **PR #9436**: fix(demand): leave parked PRs out of changes debt; move buildBackoff doc rows (#9421)
+- **Issue #9102** (closed): loom:blocked: enforce a machine-checkable reason at apply-time, and re-check on issue close
+- **PR #9427**: loom:blocked: record the blocker before the label; re-check blocked issues on merge (#9102)
+- **Issue #8841** (closed): resync-installed.sh materialized .loom/docs/private-session-dispatch.md as a real file instead of a symlink, breaking Docs/Defaults Parity Check on main
+- **Issue #8967** (closed): merge-pr.sh: the 'requires-daemon: merge-pr >= 0.19.172' floor is stale; fail-closed loom-pr-guard needs >= 0.19.375
+- **PR #9383**: test(watchdog): reap the dead-pid fixtures synchronously — zombie raced the tick (#9382)
+- **PR #9143**: fix(merge-pr): raise the merge-pr daemon floor to its newest fail-closed verb
+- **PR #9142**: fix(resync): create the dogfood .loom/docs symlink for a brand-new defaults doc
+- **PR #9118**: ci: move spawn-claude off the critical path; #9093 review nits
+- **PR #8559**: Adopt Renovate dependency security policy (14-day quarantine)
+- **Issue #9365** (closed): test(watchdog): start_confirmed_down()'s `wait` is a no-op — dead-pid fixture races the watchdog's kill -0, flaking case 46
+- **PR #9406**: train: L3 (#8559, #9118, #9142, #9143, #9383)
+- **PR #9423**: feat(ci-telemetry): per-suite spans from the shard timings artifact, plus critical-path query (#9089)
+- **PR #9424**: feat(worktree): port the in-worktree predicate to `loom-daemon worktree-check` (#8195 slice 11)
+- **Issue #9366** (closed): [eta] projected stage-boundary times (stage_marks) in eta-explanation/v1
+- **PR #9422**: feat(eta): projected stage-boundary times (stage_marks) in eta-explanation/v1 (#9366)
+- **PR #9408**: chore: add .mailmap to consolidate split author identities
+- **PR #9407**: fix(agent-skills): resolve sibling-skill links in the generated Codex surface
+- **Issue #9410** (closed): work finder: build back-off (WIP limit) on review+merge debt with hysteresis (Phase 2b of #9391)
+- **PR #9419**: feat(work_finder): build back-off on review+merge debt with hysteresis (#9410)
+- **Issue #9098** (closed): Extend the #8925 blocked-by marker to extract_blocker_refs, dep-recheck-fingerprint.sh, and individual loom:blocked apply sites
+- **PR #9415**: docs: point loom:blocked apply sites at park-record.md
+
 ### 2026-09-28
+- **Issue #9392** (closed): role runner / work finder: demand-weighted build/review allocation (Phase 2 of #9391)
+- **PR #9413**: feat(role_runner): demand-weighted width and Champion-first reservation (#9392, Phase 2a)
+- **PR #9159**: chore(deps): bump actions/github-script from 7.1.0 to 9.0.0
+- **PR #9147**: feat(worktree): port the sparse-checkout family to `loom-daemon worktree-sparse` (#8195 slice 10)
+- **Issue #9133** (closed): pre-commit: scan staged content for credential shapes (no path-based defence covers an unpredicted path)
+- **PR #9148**: security: refuse credential-shaped content on commit, push and in CI (#9133)
+- **Issue #9391** (closed): role runner: one active instance per (repository, role) for every role, concurrent across repositories (Phase 1; demand-weighting split to #9392)
+- **PR #9403**: Role runner: one instance per (repository, role), concurrent across repositories (Phase 1 of #9391)
+- **Issue #8840** (closed): Investigate daemon dispatch superseding a freshly renewed in-session sweep lease
+- **PR #8853**: fix(dispatch): admit a renewed lease into the claim-episode comparison
+- **PR #9402**: feat(ci-telemetry): per-job queue wait, shard attributes and step spans (#9089)
+- **Issue #9092** (closed): Flaky: integration_startup_reconciliation_gate asserts a wall-clock fraction of STUB_DELAY (failed once on main after #9069)
+- **PR #9393**: test(daemon): replace the startup-gate test's wall-clock margin with a rendezvous
+- **Issue #9382** (closed): watchdog suite: dead-pid fixtures can race the tick via orphaned zombies (CI flake seen on #9261)
+- **Issue #9083** (closed): worktree.sh silently reuses origin/feature/issue-N whose tip is a CLOSED unmerged PR's head (the #5657 guard covers merged only)
+- **PR #9384**: fix(worktree): refuse reuse of a closed-unmerged PR's branch tip (#9083)
+- **PR #9385**: fix(merge-pr): narrow the PR side of the ci.yml freshness scope too (#9065 item 5)
+- **PR #9361**: chore(gitignore): ignore .claude/handoff.md, Repo Skills' one-shot note
+- **PR #9363**: fix(merge-pr): stop false-stale refusals from resync stamps and unrelated ci.yml edits (#9065 item 5)
+- **Issue #9337** (closed): feat(telemetry): attribute CI re-run trigger (new_commit vs stale_main_bump vs flaky_retry) on story.ci.run spans
+- **PR #9348**: feat(ci-telemetry): attribute each CI run's trigger on loom.ci.run (#9337)
+- **Issue #9370** (closed): Build failure on main (11e5ff1e0): eta.rs:589 calls queue_blocked::list_open with 2 args after #9261 made it 3 — every open PR is red
+- **PR #9371**: fix(observability): pass the missing caller arg at eta.rs's list_open call site
+- **Issue #9252** (closed): forge_listing ETag cache: key by resolved owner/repo (not cwd) and persist across daemon restarts
+- **Issue #9251** (closed): forge-call accounting: per-caller 200/304/pool counts on loom-daemon status (ADR-0021 amendment step 0)
+- **PR #9261**: feat(daemon): forge-call accounting + identity-keyed, disk-backed listing cache (#9251, #9252)
+- **Issue #9289** (closed): feat: ETA as a Loom primitive — versioned start/finish/land estimates, logged to SigNoz and scored against outcomes
+- **PR #9355**: feat(eta): tracker, eager stage journal, eta.estimate/eta.outcome (#9289 slice 1b)
+- **Issue #9067** (closed): flake: private_workspace_docker adapter_chain_pushes_private_branch fixture SIGTERMed (exit 143) in Codex Adapter Smoke
+- **PR #9358**: fix(session-exec): ride out lease-channel stalls instead of cancelling dispatches (#9067)
+- **Issue #9233** (closed): accounts probe: live Codex rate limits via app-server (in-container for session-managed accounts) + #8963 snapshot fixes
+- **Issue #8963** (closed): accounts check misreads Codex rate-limit snapshots: weekly primary reported as 5h, integer resets_at ignored, older rollouts skipped
+- **Issue #8959** (closed): Harden the pi_usage / codex_usage source-scan tests against missed read idioms
+- **Issue #8943** (closed): Unify the two wildcard rules in the per-role tool restriction: spawn-claude's substring test fails open where spawn-codex's exact match fails closed
+- **PR #9236**: feat(accounts): live Codex rate limits via app-server (accounts check --live) + snapshot fixes
+- **PR #9175**: check-duplicate: match cross-reference repo case-insensitively
+- **PR #9163**: test(usage): close the read idioms the pi/codex source scans missed
+- **PR #9119**: fix(role-tool-policy): one wildcard rule — fail closed on a glob-shaped capability (#8943)
+- **PR #9080**: feat(dashboard): Live tab — perpetually-updating status board (#9077)
+- **Issue #9077** (closed): dashboard: add a Live tab — perpetually-updating status board
+- **PR #9351**: train: L1 (#9080, #9119, #9163, #9175, #9236)
 - **Issue #9336** (closed): feat(telemetry): add sequential attempt index (loom.attempt: N) and transition reason tags to repeating lifecycle spans
 - **Issue #9335** (closed): feat(telemetry): emit dedicated story.operator_hold span to isolate human decision duration from queue dwell
 - **Issue #9334** (closed): feat(telemetry): emit story.doctor and story.remediation spans for Judge changes-requested repair loops
