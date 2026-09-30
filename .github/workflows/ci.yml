@@ -30,31 +30,37 @@ concurrency:
 # that job.
 #
 # `shared-key` groups jobs that build the SAME SHAPE (2026-09-26). #9065 fixed
-# which refs save; this fixes how many entries they write. rust-cache keys on
-# the job id by default, so every job stored its own target/ — measured on
-# 2026-09-26: 6.88 GB across 24 entries (mean 287 MB), plus 3.08 GB of CodeQL
-# overlay DBs, for 9.99 GB against the 10 GB cap. At the cap every new entry
-# evicts something, and the eviction was already visible: most jobs held two
-# Cargo.lock generations while backend-doctests and gitignore-convergence held
-# one, and four entries named jobs that no longer exist in this file at all --
-# litter per-job keying leaves behind on every rename.
+# which refs save; this trims how many entries they write. rust-cache keys on
+# the job id by default, so every job stores its own target/ — measured on
+# 2026-09-26: 6.88 GB across 24 Rust entries (mean 287 MB), plus 3.08 GB of
+# CodeQL overlay DBs, for 9.99 GB against the 10 GB cap.
 #
-# The groups are (profile, features), because that is what decides whether two
-# jobs want the same artifacts:
-#   debug         default features, dev profile -- build-daemon,
-#                 backend-lint-and-check, backend-tests, codex-adapter-smoke
-#   debug-otlp    --features otlp, dev profile -- backend-otlp-feature,
-#                 backend-otlp-tests
+# A shared cache is NOT the union of its group's artifacts. rust-cache saves
+# once per key: the first job to finish on main saves its target/, every later
+# member hits the exact key and skips the save (or loses the race with a 409,
+# "cache already exists"), and a new Cargo.lock generation restores from that
+# same snapshot. So a shared key is the FIRST SAVER'S SNAPSHOT, and it only
+# helps when that snapshot covers what every other member builds.
+#
+# Shape is (profile, features, mode: build/check/test). Current groups:
+#   debug-otlp      dev, --features otlp -- backend-otlp-feature,
+#                   backend-otlp-tests. backend-otlp-feature usually saves
+#                   first; its clippy --all-targets plus two otlp test targets
+#                   cover the build-mode test deps backend-otlp-tests needs.
 #   release-daemon  --release -- the three *-image-smoke jobs (pre-existing)
-# That takes 8 entries per generation to 4. `release-build` keeps its own key
-# on purpose: it is the only --release --features otlp build, and folding it
-# into release-daemon would make whichever job saves first decide what the
-# other three restore.
+# Everything else keeps its own per-job key on purpose:
+#   - `release-build` is the only --release --features otlp build; folding it
+#     into release-daemon would let whichever job saves first decide what the
+#     other three restore.
+#   - build-daemon (one bin, no dev-deps), codex-adapter-smoke and
+#     backend-tests (dev-dep test binaries, feature unification) and
+#     backend-lint-and-check (clippy/check .rmeta, a separate fingerprint)
+#     are all dev/default-features but different MODES. build-daemon finishes
+#     first, so a shared key would leave the other three missing their
+#     artifacts and rebuilding every run (#9187 review).
 #
-# Do NOT widen a group across profiles or feature sets to save another entry.
-# Only one job per key wins the save race on main (the rest get a 409 and log
-# "cache already exists"), so a group whose members want different artifacts
-# means the losers restore a cache that is missing theirs and rebuild anyway.
+# Do NOT widen a group across profiles, feature sets, or modes to save another
+# entry. Entry count is not worth buying at the price of hit quality.
 #
 # Test and dev builds keep line numbers in backtraces but drop the rest of
 # the DWARF debug info (#9065). Measured on 4 cores, `nextest --no-run`
@@ -295,7 +301,6 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: debug
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build -p loom-daemon --bin loom-daemon
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -389,7 +394,6 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: debug
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --package loom-daemon --package loom-api -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
@@ -429,7 +433,6 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: debug
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Per-test process isolation (#4385). The daemon suite mutates the process
       # environment at ~774 call sites while other tests in the same binary
@@ -2045,7 +2048,6 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: debug
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build native worker dispatcher
         run: cargo build --package loom-daemon
