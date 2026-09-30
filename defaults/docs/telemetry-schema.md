@@ -2257,6 +2257,30 @@ Best-effort like its sibling — a write failure is logged and never blocks
 reaping. Same bounded-retention policy: rotates to a single `.1` backup once
 the file exceeds 5 MiB or its oldest line is more than 30 days old.
 
+**Exactly one path writes each `sweep.outcome` (Issue #9477).** Two paths used
+to. The backend ingests `sweep.completed`/`sweep.outcome` with `INSERT OR
+IGNORE` against a partial `UNIQUE(kind, sweep_id)` index
+(`dashboard/migrations/0002_idempotent_terminal_records.sql`), so for a given
+`sweep_id` the **first** writer wins and every later one is silently absorbed —
+and the live event-bus collector (`observability::collector`) was always first,
+because the journal above is only drained onto the export queue by a periodic
+backfill pass (`observability::backfill`). Its record is thin by construction —
+`config: {}`, `pr_number: None`, `phase_durations: []`, no `judge_verdicts` /
+`doctor_cycles` / `complexity` — so the rich journal record lost the race on
+nearly every sweep. The collector now **suppresses** its own `sweep.outcome`
+for any `sweep_id` it has a correlated identity for (dispatched in this process,
+or adopted from registry evidence per #8720), leaving the journal as the single
+writer. The one case it still emits is the synthesized `unknown-issue-{N}`
+fallback, which the journal never writes under and so cannot collide with.
+
+Two consequences for a consumer. `sweep.outcome` now arrives on **backfill
+latency** (up to one snapshot interval after the sweep ends) rather than at the
+instant of the terminal event — it is the analytics record, not the live one.
+`sweep.completed`, which *is* the live record, is deliberately unchanged: it is
+also under that index and the backfill also synthesizes one, but there the live
+copy is the right winner, since the synthesized record carries the same fields
+and delaying the "this sweep ended" moment would buy no completeness.
+
 **`phase_durations` is sampled**: the registry samples each live sweep's
 checkpoint (`.loom/sweep-checkpoint/issue-<N>.json`) once per reaper tick
 (≤30s, finer in practice) and records each transition, because the checkpoint
