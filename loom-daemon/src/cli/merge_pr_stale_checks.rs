@@ -48,6 +48,7 @@ use loom_daemon::merge_pr::stale_checks::evidence::{
     strip_validated_restamps, to_file_set, ChangedFile,
 };
 use loom_daemon::merge_pr::stale_checks::inputs::{BaseMove, ScopedEvidence};
+use loom_daemon::merge_pr::stale_checks::repo_specs::RepoSpecs;
 use loom_daemon::merge_pr::stale_checks::workflow_scope::{self, CiScope};
 use loom_daemon::merge_pr::stale_checks::{
     assess_scoped, stale_inputs_message, unknown_message, Verdict, CLEAN,
@@ -288,6 +289,10 @@ fn warn_all(notices: &[String]) {
 /// for a suite that wants to drive the narrowing. Attributing `P` also needs a
 /// `patch` on its `ci.yml` entry in `pr_files`; without one the side stays
 /// unscoped.
+///
+/// `stale_check_inputs` is the text of a consumer repo's
+/// `.loom/stale-check-inputs.json` as read from the base tip (#9589). Omit it
+/// and every context without a built-in spec stays stale on any base move.
 fn scoped_from_json(v: &serde_json::Value) -> Option<ScopedEvidence> {
     if v.get("pr_files").is_none() && v.get("base_moves").is_none() {
         return None;
@@ -335,6 +340,10 @@ fn scoped_from_json(v: &serde_json::Value) -> Option<ScopedEvidence> {
         pr_ci_scope,
         base_moves,
         fallbacks,
+        repo_specs: v
+            .get("stale_check_inputs")
+            .and_then(|s| s.as_str())
+            .map_or(RepoSpecs::Absent, RepoSpecs::parse),
     })
 }
 
