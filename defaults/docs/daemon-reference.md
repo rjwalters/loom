@@ -21,6 +21,7 @@
 - [Per-workspace registry pool (`WorkspacePool`, #3928/#3929)](#per-workspace-registry-pool-workspacepool-39283929)
 - [Delegated daemon administration (`daemon.delegatedTo`, #5345)](#delegated-daemon-administration-daemondelegatedto-5345)
 - [Fleet — operator-triggered multi-host worker fanout (`fleet`, #4340)](#fleet--operator-triggered-multi-host-worker-fanout-fleet-4340)
+- [Fleet store — `fleet-config` (`fleet.repo`)](#fleet-store--fleet-config-fleetrepo)
 - [Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)](#fleet-model-ab--sweep-experiment-plan-8055-phase-1)
 - [Token pool provisioning for managed repos (#3938)](#token-pool-provisioning-for-managed-repos-3938)
 - [Per-repo status breakdown + per-repo main-health gate (#3930 — phase d)](#per-repo-status-breakdown--per-repo-main-health-gate-3930--phase-d)
@@ -1374,6 +1375,145 @@ not a claimed success or failure).
 CURRENT`; non-zero if any host is `FAILED`/`UNREACHABLE`, or `--all` was given
 against an empty fleet registry (mirrors `fleet status`'s #5060 "empty roster
 never reads as healthy" policy).
+
+## Fleet store — `fleet-config` (`fleet.repo`)
+
+An operator may keep a whole fleet's **desired state** in one private GitHub
+repository, the *fleet store*: the repo roster and priorities, per-host daemon
+config, and per-host run state. Hosts read it straight from the forge — the
+forge is the state store, and a fleet change lands as a reviewed commit to that
+repo. `loom-daemon fleet-config` is the reader. Nothing names a store by
+default: with `fleet.repo` unset the feature is off and the daemon behaves
+exactly as it always has. This version only runs **on command**; nothing
+fetches, renders or applies the store automatically.
+
+| Config key | Env override | Default | Meaning |
+|---|---|---|---|
+| `fleet.repo` | `LOOM_FLEET_REPO` | *(unset: feature off)* | The store, `OWNER/REPO`. Read from the daemon workspace's effective config (any tier) |
+| `fleet.ref` | `LOOM_FLEET_REF` | `main` | Branch, tag or commit to read |
+| *(host identity)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` | This host's name in the store (`fleet/hosts/<host>/`, `fleet/state.yml`); `--host` overrides it per command |
+| `fleet.repo` | `LOOM_FLEET_REPO` | *(unset: off)* | The operator's fleet state store (`OWNER/REPO`) read by `loom-daemon fleet-config`; `fleet.ref` / `LOOM_FLEET_REF` picks the ref (default `main`). Unset changes nothing. See [Fleet store](#fleet-store--fleet-config-fleetrepo) |
+
+Every sub-verb takes `--workspace <PATH>` (default: the current repo): the
+daemon workspace whose config names the store and supplies the credentials,
+and whose `.loom-local/local.json` is the host-local tier.
+
+### File contract
+
+| Store path | Read by | Contract |
+|---|---|---|
+| `fleet/defaults.json` | `render` | JSON object: the machine tier every host shares |
+| `fleet/hosts/<host>/defaults.json` | `render` | JSON object: that host's overlay. Required for a host `render` is asked about |
+| `fleet/hosts/<host>/local.json` | `render` | JSON object: that host's host-local tier. Optional — absent leaves the local tier alone |
+| `repos.yml` | `roster` | YAML, below |
+| `fleet/state.yml` | `state` | YAML, below |
+
+Other files in the store (a README, a host inventory) are never fetched.
+
+**`repos.yml`** — only these keys are read; any others are ignored:
+
+```yaml
+root: ~/GitHub            # where every repo is cloned; absolute, or ~/…
+repos:
+  - name: app             # unique
+    dir: app              # clone directory under root (default: name); one path component
+    remote: git@github.com:acme/app.git
+    fleet: true           # the daemon manages it (default false)
+    fleet_priority: 10    # dispatch tier, lower first (default 100)
+    firewall: false       # true = never an unattended-agent target (default false)
+```
+
+The desired workspace set is every record with `fleet: true` and not
+`firewall: true`. A record with **both** is a hard error for the whole roster,
+never a silent exclusion — so is a non-boolean `fleet`/`firewall`, a
+non-integer `fleet_priority`, a duplicate `name` or `dir`, or an unsafe `dir`.
+
+**`fleet/state.yml`**:
+
+```yaml
+fleet:                    # default for every host
+  state: running          # running | paused | stopped
+  since: 2026-01-01T00:00Z
+  by: operator
+  reason: free text
+hosts:
+  build-3:
+    state: paused         # a host entry overrides the fleet default
+```
+
+Both YAML files are read by a strict, dependency-free reader of the block-YAML
+subset shown (mappings, sequences, quoted and plain scalars, one-line flow
+`[a, b]`/`{k: v}`, `|`/`>` block scalars, comments). Anchors, aliases, tags,
+multi-line plain scalars, duplicate keys and tabs in indentation are refused,
+not guessed at.
+
+### `fleet-config fetch [--json]`
+
+Fetches the store into `~/.loom/fleet-store/<OWNER>/<REPO>/` and records the
+commit SHA. The ref is revalidated with `If-None-Match` against the last ETag,
+so an unchanged store costs one `304`; a new commit costs the tree listing plus
+one blob read per **changed** contract file (blobs are cached by SHA). The
+cache is always a complete snapshot of one commit. Exit `0` fetched or
+current, `1` fetch failed (the last good snapshot stays in place), `2` error.
+
+**Credentials** — no new credential. Requests go through `gh api` under, in
+order: a **reader App** token the daemon has published for the store's owner
+(`forge.identities.readers`, when fresh); else the **writer App**
+(`forge.githubApp`), minted through the workspace's `github-app-token.sh` and
+published to the same per-owner `GH_CONFIG_DIR` the daemon uses for
+cross-owner repos (`.loom/gh-config-by-owner/<OWNER>/`); else **ambient `gh`
+auth**. A reader that cannot serve the store falls through to the writer after
+one request. The App needs read access to the store repo (`contents: read`).
+Calls are counted in the forge-call stats as `fleet_store`. GitHub only.
+
+### `fleet-config render [--host H] [--check] [--offline]`
+
+Computes the host's machine tier as `deep_merge(fleet/defaults.json,
+fleet/hosts/<H>/defaults.json)` — the same `config_resolver::deep_merge` the
+tier resolver uses (objects merge key by key, arrays and scalars replace,
+`null` clears) — and writes it to the file the machine tier is read from
+(`LOOM_CONFIG_DEFAULTS_FILE`, else `~/.local/share/loom/config/defaults.json`).
+`fleet/hosts/<H>/local.json` is written verbatim to the workspace's
+`.loom-local/local.json`. Writes are atomic and keep exactly one backup of the
+replaced file, `<file>.fleet-store-bak-<UTC>` (other backups are never
+touched). A target already semantically equal to the render is left untouched,
+so a no-op render makes no backup.
+
+`--check` writes nothing: it prints a per-path diff (`~ key: disk -> store`,
+`+`, `-`) and exits `1` on drift, `0` in sync, `2` on error — the drift
+detector. Comparison is semantic (parsed JSON), not textual.
+
+If the forge is unreachable, `render` (and `state`) use the last good snapshot
+and print a `CACHED … last confirmed current <age> ago` warning; `--offline`
+does so without trying. Rendered config takes effect on the daemon's next
+start for the startup-resolved knobs — see
+[fleet-config-lifecycle](fleet-config-lifecycle.md).
+
+### `fleet-config roster [--check | --apply] [--json]`
+
+Diffs the desired set against the workspace registry (`~/.loom/workspaces.json`,
+`LOOM_WORKSPACES_PATH`): **adds** (desired, not registered), **removes**
+(registered, and the store has a record for that path that is not desired —
+`fleet: false` or `firewall: true`) and **priority changes**. A registered
+workspace the store has no record for is reported as *unmanaged* and left
+alone. Paths are compared after the registry's own normalization.
+
+`--check` exits `1` when the registry differs. `--apply` performs the changes
+through the same code paths as `loom-daemon workspace remove` / `add` /
+`set-priority` (removes first), and only for repos already cloned under
+`root` — a missing clone is reported and exits `1`, and is never cloned here.
+
+**Fails closed.** The roster carries the fleet's firewall inputs, so it is
+read only from a snapshot the forge confirmed current in the same invocation
+(a `304` counts). A fetch or parse failure is exit `2`; there is no cached
+fallback, and no partial or default roster.
+
+### `fleet-config state [--host H] [--json] [--offline]`
+
+Prints the host's desired run state: its `hosts.<H>` entry if it sets
+`state`, else the `fleet` default, with `since`/`by`/`reason` from the entry
+that decided it. A state other than `running`/`paused`/`stopped`, or no state
+at all, is an error. Report only — the daemon does not enforce it yet.
 
 ## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)
 
