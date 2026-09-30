@@ -260,9 +260,22 @@ pub fn assess_scoped(
                         None => ((*ctx).clone(), None),
                     }
                 }
-                // Fail closed: an unmapped required context's inputs are
-                // unknown, so any base move at all makes its verdict unknown.
-                None => ((*ctx).clone(), inputs::unknown_check_reason(&mv.files)),
+                // No built-in spec: the repo's own declaration (#9589), read
+                // from the base tip, or — absent/rejected — fail closed: the
+                // inputs are unknown, so any base move makes the verdict so.
+                None => {
+                    let repo = scoped.map(|s| &s.repo_specs);
+                    if let Some(w) = repo.and_then(repo_specs::RepoSpecs::rejection_warning) {
+                        if !warnings.contains(&w) {
+                            warnings.push(w);
+                        }
+                    }
+                    let reason = match repo.and_then(|r| r.declared(ctx)) {
+                        Some(decl) => decl.stale_reason(&mv.files, &scoped_delta(scoped)),
+                        None => inputs::unknown_check_reason(&mv.files),
+                    };
+                    ((*ctx).clone(), reason)
+                }
             };
             if let Some(reason) = reason {
                 if stale.is_none() {
@@ -380,6 +393,7 @@ failure (network, quota, token scope) or re-run the required checks, then re-run
 pub mod evidence;
 pub mod fetch;
 pub mod inputs;
+pub mod repo_specs;
 pub mod workflow_scope;
 pub use fetch::LiveInputs;
 

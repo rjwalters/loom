@@ -350,6 +350,7 @@ fn incident_evidence() -> ScopedEvidence {
         .into_iter()
         .collect(),
         fallbacks: std::collections::BTreeMap::new(),
+        repo_specs: repo_specs::RepoSpecs::Absent,
     }
 }
 
@@ -429,6 +430,7 @@ fn an_unrelated_base_move_is_fresh_even_though_it_postdates_the_run() {
         .into_iter()
         .collect(),
         fallbacks: std::collections::BTreeMap::new(),
+        repo_specs: repo_specs::RepoSpecs::Absent,
     };
     let (verdict, warnings) =
         assess_scoped(base_tip, &ctx(&["File Size Ratchet"]), &runs, Some(&ev));
@@ -458,6 +460,7 @@ fn ci_yml_move(scope: CiScope) -> ScopedEvidence {
         .into_iter()
         .collect(),
         fallbacks: std::collections::BTreeMap::new(),
+        repo_specs: repo_specs::RepoSpecs::Absent,
     }
 }
 
@@ -520,6 +523,7 @@ fn pr_edits_ci_yml(pr_ci_scope: CiScope) -> ScopedEvidence {
         .into_iter()
         .collect(),
         fallbacks: std::collections::BTreeMap::new(),
+        repo_specs: repo_specs::RepoSpecs::Absent,
     }
 }
 
@@ -581,6 +585,7 @@ fn a_context_without_evidence_falls_back_to_the_time_rule_and_warns() {
         fallbacks: [("File Size Ratchet".to_string(), "its job log could not be read".to_string())]
             .into_iter()
             .collect(),
+        repo_specs: repo_specs::RepoSpecs::Absent,
     };
     let (verdict, warnings) =
         assess_scoped(base_tip, &ctx(&["File Size Ratchet"]), &runs, Some(&ev));
@@ -646,6 +651,7 @@ fn an_unmapped_required_context_with_a_moved_base_is_refused() {
         .into_iter()
         .collect(),
         fallbacks: std::collections::BTreeMap::new(),
+        repo_specs: repo_specs::RepoSpecs::Absent,
     };
     let (verdict, _) = assess_scoped(base_tip, &ctx(&["Brand New Gate"]), &runs, Some(&ev));
     match verdict {

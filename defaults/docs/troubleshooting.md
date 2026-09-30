@@ -1037,6 +1037,21 @@ they find one — scoped to a symlink whose target resolves through a
 `loom-tools` path segment and no longer exists, so a same-named script you
 authored yourself is never touched. No manual action needed on either path.
 
+### Every merge re-stales every open PR in a consumer repo (#9589)
+
+**Symptom**: in a repo other than loom itself, each merge makes every other
+open PR's green required check (a lint job, a ratchet) stale:
+`Merge blocked: … this required check has no entry in the input-scope table
+and no declaration in .loom/stale-check-inputs.json`. Each PR then needs a
+re-date push and a fresh CI run before it can merge.
+
+**Cause**: loom's freshness guard only knows its own checks' inputs, and an
+unknown check is stale on any base move. **Fix**: commit
+`.loom/stale-check-inputs.json` on the default branch, declaring what each
+required check reads. See [stale-check-inputs](stale-check-inputs.md). If the
+refusal persists, look for a `Warning: … ignoring .loom/stale-check-inputs.json`
+line, which means the declaration was rejected and names why.
+
 ### Every merge blocked by the freshness guard on a private free-plan repo (#8844)
 
 **Symptom**: on a **private** repository owned by a GitHub Free account or

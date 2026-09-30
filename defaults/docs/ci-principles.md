@@ -61,7 +61,7 @@ the next person to add one will have an equally good argument.
    The freshness guard asks a different question — "can merging this PR turn
    a check that already ran and passed red?" — and answering it needs the
    input set the check actually read (`merge_pr/stale_checks/inputs.rs`).
-   Two narrowings live there, and both must obey the same three constraints:
+   Three narrowings live there, and both must obey the same three constraints:
    **derive the scope from the repo's own text, never a hand-maintained
    second copy**; **keep it per-file, never per-commit**; and **fail closed
    to the broader answer on any doubt**.
@@ -81,6 +81,13 @@ the next person to add one will have an equally good argument.
      guard's component table all restore the whole-file meaning on that side.
      Nothing is skipped and no check's coverage narrows — every gate still
      runs on every PR.
+   - *Per-repo declarations* (#9589): a consumer repo's required contexts are
+     absent from loom's table, so each is stale on any base move unless the
+     repo declares its inputs in `.loom/stale-check-inputs.json`
+     ([stale-check-inputs](stale-check-inputs.md)). The declaration is the
+     repo's own text, read from the base tip, and is itself a global input of
+     every check it declares. An unlisted context gets no guessed default, and
+     any malformed or unreadable file is ignored with a warning.
 
 10. **Every speed trade-off on the merge gate is owed a slow run somewhere
     else.** Rules 7 and 8 make a fast gate legitimate; they do not make it
