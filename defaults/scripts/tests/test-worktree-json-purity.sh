@@ -382,6 +382,22 @@ assert_worktree_json_shape "$OUT" "preserve-ahead"
 rm -f "$OUT"
 cleanup_repo "$REPO"
 
+echo ""
+echo "Test 9: stale-worktree-reset path (no work) produces pure JSON (#9111)"
+# A clean worktree with nothing ahead routes the second run into the "stale
+# worktree reset" arm, which since #9111 shares the preserve arm's exit.
+REPO=$(setup_repo stalereset)
+OUT=$(mktemp /tmp/loom-wtjson-out.XXXXXX)
+(
+    cd "$REPO" || exit 1
+    ./.loom/scripts/worktree.sh --json 108 >/dev/null 2>&1
+    ./.loom/scripts/worktree.sh --json 108 >"$OUT" 2>/dev/null
+)
+assert_pure_json "$OUT" "stale-reset"
+assert_worktree_json_shape "$OUT" "stale-reset"
+rm -f "$OUT"
+cleanup_repo "$REPO"
+
 # --- Summary ---
 echo ""
 echo "Tests run: $TESTS_RUN, Passed: $TESTS_PASSED, Failed: $TESTS_FAILED"
