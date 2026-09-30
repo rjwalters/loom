@@ -939,6 +939,7 @@ _check_loom_pr_label
 # which is the one a refused MERGE should name.
 # requires-daemon: cargo-target-dir optional   #9153 — the post-merge #7239 target-dir reclaim; without the resolve|reclaim verbs a daemon prints nothing, `$target_dir_resolved` stays empty and no reclaim is attempted, which is the pre-#7239 behaviour. A missed disk reclaim, never a failed merge: post-merge cleanup is best-effort by design and `loom-clean`, the daemon's reaper and `worktree.sh remove` all reclaim the same directory on their own schedule.
 # requires-daemon: notify-cleared-blockers optional   #9102 — the post-merge close-triggered loom:blocked re-check; a daemon lacking the verb exits non-zero, `_notify_cleared_blockers` prints one warning and the merge proceeds. A delayed notice, never a failed merge: the next sweep's `check-stale-blocked` pre-wave pass reports the same stale block.
+# requires-daemon: record-rework optional   #9444 — the two in-sweep rework markers this script emits (a `rebase` when it syncs a base that moved, a `merge_conflict` when it refuses a PR that genuinely conflicts). Both calls are `>/dev/null 2>&1 || true`: a daemon lacking the verb records nothing and the merge is byte-for-byte unaffected. Pure telemetry — the cost of a missing marker is one under-reported environmental rework in `sweep.outcome`'s `rework_events`, never a merge that did or did not happen.
 #
 # _mp_daemon_roll_hint <subcommand> [resolved-bin] -- the concrete, host-local
 # remediation for "your loom-daemon is too old for <subcommand>": the declared
@@ -2315,7 +2316,15 @@ if [[ "$PR_MERGEABLE" == "false" ]]; then
     merge)
       info "PR #$PR_NUMBER: $_MSM_REASON"
       ;;
-    refuse-conflict)
+    # #9444: a CORROBORATED conflict — the forge said `mergeable=false` and the
+    # local `git merge-tree` check agreed — is the `merge_conflict` rework
+    # event, and the one acceptance criterion this writer exists to satisfy.
+    # The `*` arm below is deliberately NOT marked: it refuses because the
+    # cached state could not be corroborated, which is "nobody could tell",
+    # not "this branch conflicts", and marking it would inflate the
+    # environmental bucket with unanswered checks. Emitted on this line
+    # because `error` exits, and inline because the file is ratcheted.
+    refuse-conflict) "${LOOM_DAEMON_BIN:-loom-daemon}" record-rework --kind merge_conflict --branch "$PR_BRANCH" --repo-root "$REPO_ROOT" --reason "$_MSM_REASON" >/dev/null 2>&1 || true
       error "PR #$PR_NUMBER has merge conflicts — resolve before merging ($_MSM_REASON)"
       ;;
     *)
@@ -2412,7 +2421,15 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
 
       # The sync just pushed to the head branch: re-read it, or the retry
       # below re-gates on a SHA the forge has already superseded (#8164).
-      _refresh_precondition_sha
+      #
+      # …and mark it (#9444). This is the canonical "main moved under the
+      # work" event: the base advanced, so the branch had to be synced before
+      # it could merge. `--duration-sec` is the settle wait we just slept —
+      # the only part of this rework that is measured here; the forge-side
+      # merge that produced the new head is not. Appended to the line above
+      # rather than given its own so the file does not grow (it is
+      # ratcheted); `|| true` because a marker may never fail a merge.
+      _refresh_precondition_sha; "${LOOM_DAEMON_BIN:-loom-daemon}" record-rework --kind rebase --branch "$PR_BRANCH" --repo-root "$REPO_ROOT" --reason "base branch was modified; synced before merge retry $MERGE_ATTEMPT/$MAX_MERGE_RETRIES" --duration-sec "$MERGE_RETRY_DELAY" >/dev/null 2>&1 || true
 
       # Increase delay for next attempt (exponential backoff)
       MERGE_RETRY_DELAY=$((MERGE_RETRY_DELAY * 2))
