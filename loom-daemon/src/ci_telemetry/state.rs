@@ -103,6 +103,13 @@ pub struct PollStatus {
     /// the refusal was visible only as a per-tick WARN in the daemon log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captain_refusal: Option<CaptainRefusal>,
+    /// The repo-sweep cadence the daemon poller is currently running at
+    /// (#9201): the configured interval, or the slower correction floor while
+    /// a healthy feed drives capture. [`classify`] measures staleness against
+    /// the larger of this and the configured interval, so a deliberately slow
+    /// floor does not read as a stuck poller. Absent ⇒ the configured interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_cadence_secs: Option<u64>,
 }
 
 /// Why the daemon poller is not polling on this host: the
@@ -234,7 +241,8 @@ pub fn classify(status: &PollStatus, now: DateTime<Utc>, interval_secs: u64) -> 
         return Health::NeverPolled;
     };
     let age_secs = (now - last_ok).num_seconds().max(0);
-    let stale_after = i64::try_from(interval_secs.saturating_mul(3)).unwrap_or(i64::MAX);
+    let cadence = interval_secs.max(status.sweep_cadence_secs.unwrap_or(0));
+    let stale_after = i64::try_from(cadence.saturating_mul(3)).unwrap_or(i64::MAX);
     if age_secs > stale_after {
         Health::Stale { age_secs }
     } else {
@@ -270,6 +278,21 @@ pub fn note_captain_gate(
         return Ok(());
     }
     status.captain_refusal = next;
+    save_status(dir, &status)
+}
+
+/// Record the sweep cadence the daemon poller is running at (#9201) — see
+/// [`PollStatus::sweep_cadence_secs`]. A no-op when unchanged, and skipped
+/// (not failed) while a cycle holds the lock: the next tick records it.
+pub fn note_sweep_cadence(dir: &Path, cadence_secs: u64) -> io::Result<()> {
+    let Some(_lock) = CycleLock::try_acquire(dir)? else {
+        return Ok(());
+    };
+    let mut status = load_status(dir);
+    if status.sweep_cadence_secs == Some(cadence_secs) {
+        return Ok(());
+    }
+    status.sweep_cadence_secs = Some(cadence_secs);
     save_status(dir, &status)
 }
 
