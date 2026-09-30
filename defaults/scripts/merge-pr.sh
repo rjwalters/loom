@@ -918,7 +918,7 @@ _check_loom_pr_label
 # build-stampede guard (#8252). The refusal named neither the version nor the
 # roll command. That is what these markers and the hint below fix.
 #
-# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, stacked-children, version-policy, partial-reset, closed-building, issue-close-gate, dirty-guard, worktree-preserve, worktree-contains — the last three decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing, and worktree-contains declines --worktree-path's override cleanup and keeps that path when it is missing) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
+# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, check-runs-streak, stacked-children, version-policy, partial-reset, closed-building, issue-close-gate, dirty-guard, worktree-preserve, worktree-contains — the last three decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing, and worktree-contains declines --worktree-path's override cleanup and keeps that path when it is missing) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
 # requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
 # The `merge-pr >=` floor above covers the whole subcommand group, including
@@ -1948,12 +1948,25 @@ _wait_for_checks_then_sync_merge() {
     [[ "$attempt1_rc" -ne 0 ]] && fetch_rc="$attempt2_rc"
 
     if [[ "$fetch_rc" -ne 0 ]]; then
-      if [[ "$attempt1_rc" -eq "$FORGE_CHECK_RUNS_RC_NOT_FOUND" && "$attempt2_rc" -eq "$FORGE_CHECK_RUNS_RC_NOT_FOUND" ]]; then
-        not_found_streak=$(( not_found_streak + 1 ))
-      else
-        not_found_streak=0
+      # The confirmed-404-streak classification, ported to Rust (#6389, #8191
+      # slice): `loom-daemon merge-pr check-runs-streak` is a pure function of
+      # both attempts' return codes and the running streak — see
+      # loom-daemon/src/merge_pr/check_runs_streak.rs. Always exits 0 with one
+      # `LOOM-CHECK-RUNS-STREAK <PROCEED|PENDING> <streak>` line; anything
+      # else (missing/older binary) degrades to PENDING with the streak reset
+      # to 0 — the pre-#6389 behaviour, so a guard fault can only cost time
+      # via the ordinary LOOM_AUTO_MERGE_TIMEOUT ceiling below, never
+      # misclassify a transient blip as the persistent condition that skips
+      # waiting altogether.
+      local _crs_out _crs_sentinel _crs_verdict _crs_streak
+      _crs_out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr check-runs-streak --attempt1-rc "$attempt1_rc" --attempt2-rc "$attempt2_rc" --streak "$not_found_streak" --threshold "$LOOM_CHECK_RUNS_404_STREAK" --not-found-rc "$FORGE_CHECK_RUNS_RC_NOT_FOUND" 2>/dev/null)" || _crs_out=""
+      read -r _crs_sentinel _crs_verdict _crs_streak <<< "$_crs_out"
+      if [[ "$_crs_sentinel" != "LOOM-CHECK-RUNS-STREAK" ]]; then
+        warning "The persistent-404 streak classification (#6389, #8191 slice) did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr check-runs-streak' printed no recognized decision (a loom-daemon predating this slice has no such verb). Treating this iteration as still-pending with the streak reset — a guard fault here can only cost time, never skip the wait. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
+        _crs_verdict="PENDING"; _crs_streak=0
       fi
-      if [[ "$not_found_streak" -ge "$LOOM_CHECK_RUNS_404_STREAK" ]]; then
+      not_found_streak="${_crs_streak:-0}"
+      if [[ "$_crs_verdict" == "PROCEED" ]]; then
         info "PR #$PR_NUMBER: check-runs API unavailable for this repo (no checks configured); proceeding to synchronous merge"
         return 0
       fi

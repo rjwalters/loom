@@ -591,6 +591,17 @@ pub(crate) enum MergePrCommand {
     /// exits 0 with one sentinel-led line — see `cli::merge_pr_zero_checks`.
     ZeroChecksSettle(super::merge_pr_zero_checks::ZeroChecksSettleArgs),
 
+    /// The persistent-vs-transient check-runs HTTP 404 classification in the
+    /// same wait loop (#6389, an #8191 slice): invoked only after a poll's
+    /// fetch attempt has already failed, decides whether a confirmed 404 has
+    /// now repeated `LOOM_CHECK_RUNS_404_STREAK` times in a row — in which
+    /// case give up waiting and proceed straight to the synchronous merge —
+    /// or is still below threshold, in which case the caller's existing
+    /// truncated-check/deadline/sleep handling runs unchanged. Always exits 0
+    /// with one `LOOM-CHECK-RUNS-STREAK <PROCEED|PENDING> <streak>` line —
+    /// see `cli::merge_pr_check_runs_streak`.
+    CheckRunsStreak(super::merge_pr_check_runs_streak::CheckRunsStreakArgs),
+
     /// The OTHER classification in the same wait loop (#8191 slice): once a
     /// poll finds a FAILING check, whether it is a required status-check
     /// context (refuse), informational with nothing pending (proceed to the
@@ -709,6 +720,7 @@ impl MergePrCommand {
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
+            MergePrCommand::CheckRunsStreak(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
             MergePrCommand::StackedChildren(args) => args.run(),
             MergePrCommand::WorktreePrimary(args) => args.run(),

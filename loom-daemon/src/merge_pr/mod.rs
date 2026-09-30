@@ -68,6 +68,17 @@
 //! which — unlike [`stale_checks`]'s GitHub-only lookup — also covers Gitea)
 //! stay forge reads in the shell.
 //!
+//! [`check_runs_streak`] is the OTHER classification the same poll loop makes
+//! on a FAILED fetch attempt (#6389, an #8191 slice): whether a confirmed
+//! HTTP 404 — both the attempt and its retry-once agreeing — has now repeated
+//! `LOOM_CHECK_RUNS_404_STREAK` times in a row, which is treated as "this
+//! repo's Checks API is unavailable for this commit" rather than a transient
+//! blip, and short-circuits the wait straight to the synchronous merge. A
+//! single 404 paired with a DIFFERENT failure on the retry does not confirm,
+//! and any non-confirming iteration resets the streak to zero — the shell
+//! keeps owning the fetch attempts themselves and the deadline/timeout
+//! handling; only the streak/threshold classification moved.
+//!
 //! [`loom_pr_guard`] is the pre-merge `loom:pr` review-signal guard (#7419)
 //! — the OTHER half of the verdict-label story [`labels`] tells: this one
 //! fires on `loom:pr`'s ABSENCE ("nobody reviewed this head") rather than a
@@ -202,6 +213,7 @@
 //! caller and passed in; this module owns only the two-input decision and its
 //! byte-frozen message text, consolidating three copies into one.
 
+pub mod check_runs_streak;
 pub mod checks_failure;
 pub mod closed_building;
 pub mod dirty_guard;
