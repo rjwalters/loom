@@ -238,13 +238,13 @@ gh issue list --label="loom:issue" --state=open --limit 500 --json number,title,
 
 ### Re-curating Approved Issues
 
-Use this playbook when refreshing an already-approved (`loom:issue`) issue against current `main` — e.g., stale file refs, dependent fixes have merged, or scope drift needs clarification.
+Use this playbook when refreshing an already-approved (`loom:issue`) issue against current `main` — e.g., stale refs, merged dependencies, scope drift.
 
 **Default behavior** (recommended unless the four questions below indicate otherwise):
 
 1. **Retain `loom:issue`** — Do not remove human approval for non-material updates.
-2. **Add `loom:curated`** — Signals "fresh enrichment against current main is available." `loom:curated` is *additive*, not exclusive; it coexists with `loom:issue`. Builders prioritize `loom:issue` + `loom:curated` over `loom:issue` alone, so re-curation has direct downstream impact on Builder selection.
-3. **Prefer body edits over comments for stale references** — Keep the body as the single source of truth for Builders. Use a dated curator comment summarizing what changed (e.g., "Refreshed file refs after #NNNN merged on YYYY-MM-DD").
+2. **Add `loom:curated`** — Signals fresh enrichment against current main. `loom:curated` is *additive*, not exclusive; it coexists with `loom:issue`. Builders prioritize `loom:issue` + `loom:curated` over `loom:issue` alone. **Re-pick `points:<N>`** per the rubric from the current scope, replacing the prior label (#9638).
+3. **Prefer body edits over comments for stale references** — Keep the body as the single source of truth for Builders. Use a dated curator comment summarizing what changed.
 4. **For material scope changes** — When you rewrite the problem statement, re-narrow root cause, or change acceptance criteria materially, remove `loom:issue` and leave only `loom:curated`. This forces fresh human re-approval.
 
 **The four decision questions** (use these to deviate from the default):
@@ -252,7 +252,7 @@ Use this playbook when refreshing an already-approved (`loom:issue`) issue again
 | Question | Default | Deviate when |
 |----------|---------|--------------|
 | Retain `loom:issue`? | Yes | Material scope or AC change |
-| (Re-)add `loom:curated`? | Always yes | Never skip |
+| (Re-)add `loom:curated`? | Always yes (re-pick points) | Never skip |
 | Comment vs body edit? | Body edit + dated comment | Pure context/links → comment |
 | Substantive rewrite? | Drop `loom:issue`, keep `loom:curated` | Minor refresh → keep both |
 
@@ -1182,7 +1182,7 @@ Exit 2 is not an absent marker: fetch failed (usually quota; retry later) or `lo
 
 ### Points estimate marker (`<!-- loom:points=<N> -->`, #9056)
 
-Points are **labels** (#9431): pick exactly one `points:<N>` — `N` one of `1`, `2`, `3`, `5`, `8`, `13`, the `loom:complexity` closed-vocabulary rule — per the rubric in `.loom/docs/story-points.md`: size of one clean landing, not sweep cost or the tier; above 13, split — never size 21. Attach it **in the same `gh issue edit` that applies `loom:curated`** (no second API call); re-assignment **replaces** the prior label (never stacks); a rescope to `loom:triage` updates or removes it in the same mutation — stale points must not survive a scope change:
+Points are **labels** (#9431): pick exactly one `points:<N>` — `N` one of `1`, `2`, `3`, `5`, `8`, `13`, the `loom:complexity` closed-vocabulary rule — per the rubric in `.loom/docs/story-points.md`: size of one clean landing, not sweep cost or the tier; above 13, split — never size 21. Attach it **in the same `gh issue edit` that applies `loom:curated`** (no second API call); re-assignment **replaces** the prior label (never stacks); a rescope to `loom:triage` updates or removes it in the same mutation; a re-curation pass re-picks `N` from the **current** scope and replaces label + marker (#9638) — stale points never survive a scope change or a re-size:
 
 ```bash
 gh issue edit <number> --remove-label "points:<old>" --add-label "loom:curated,points:<new>"
@@ -1190,7 +1190,7 @@ gh issue edit <number> --remove-label "points:<old>" --add-label "loom:curated,p
 
 Still emit the body marker with the same N — `require-complexity-marker.sh` blocks `loom:curated` on it.
 
-**Related but distinct**: `<!-- loom:capability=<name> -->` (#6892, alongside `loom:operator-mechanical` only) is a separate convention, no Curator action — see `defaults/docs/label-state-machine.md` → "Capability-declaration convention" (#6885/#6893).
+**Related but distinct**: `<!-- loom:capability=<name> -->` (#6892, with `loom:operator-mechanical` only) is a separate convention, no Curator action — see `.loom/docs/label-state-machine.md` → "Capability-declaration convention" (#6885/#6893).
 
 ## Where to Add Enhancements
 
