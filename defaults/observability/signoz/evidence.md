@@ -775,6 +775,79 @@ data: the snapshot, restore, cross-project query diff, account/dashboard login a
 teardown steps are all unrun. [#9279](https://github.com/rjwalters/loom/issues/9279)
 owns that run and flips the ledger row below when it happens.
 
+## Backup-restore rehearsal: found executed, interrupted, and torn down (2026-09-30)
+
+The section above is accurate for the worktree it was written from. It is not
+accurate for the trial host as a whole: this pass found a `loom-signoz-restore`
+Compose project already running, five days old. Its containers' own
+`com.docker.compose.project.config_files` labels point at
+`/tmp/loom8528/deploy/compose.yaml` plus `/tmp/loom8528/restore-override.yaml`
+— a worktree that no longer exists — rendered by Compose **v2.40.3**, a plugin
+this host does not have today (`docker: unknown command: docker compose`; no
+`~/.docker/cli-plugins/docker-compose`, no standalone `docker-compose`). Some
+earlier `#8528` session ran the real rehearsal from a worktree that carried its
+own Compose plugin, then the worktree and session ended without the run being
+written up or torn down. [#9279](https://github.com/rjwalters/loom/issues/9279)
+had no worktree and no running process attached to it at discovery, so this was
+not another sweep's in-progress work.
+
+**What actually restored.** `loom-signoz-restore-metastore-postgres-0` and
+`loom-signoz-restore-telemetrystore-clickhouse-0-0` both came up healthy and had
+been running for 5 days (created/started 2026-09-25T16:28:5{2,8}Z) when found.
+Their data predates that start, which is only possible if it arrived via a
+volume-level restore rather than being seeded fresh in place:
+
+- PostgreSQL's `migration` table records `migrated_at` at **2026-09-25
+  15:52:41** — 36 minutes before this container's own creation. The restored
+  `organizations` table holds exactly one row, named `loom-8528`, created
+  `2026-09-25 15:52:52.896024`, with one matching user
+  (`trial8528@example.invalid`).
+- ClickHouse's `signoz_traces.signoz_index_v3` holds 37 rows spanning
+  `2026-09-25 16:06:43`–`16:07:23`, every one `resource_string_service$$name =
+  loom-daemon`: `loom.phase`×14, `loom.role_attempt`×12, `loom.sweep`×7,
+  `loom.runtime.preflight`×2, `loom.tool`×1, `loom.runtime.run`×1 — a real
+  sweep's own spans, not a synthetic fixture row.
+
+Both tables' data is consistent with the README's documented tar-per-volume
+procedure (the pinned `postgres:16` tarballer, `--numeric-owner`) and with
+nothing else: no in-place seeding explains rows timestamped before the
+container holding them existed.
+
+**What did not finish.** `loom-signoz-restore-signoz-0` and
+`loom-signoz-restore-telemetrystore-migrator` were both still `Created` —
+compose never started them. The README's restore step brings up
+`loom-signoz-signoz-0` specifically to pull in that whole dependency chain
+(metastore, keeper, ClickHouse, migrator, user-scripts); here it stopped after
+the datastore layer and the one-shot user-scripts container came up, and never
+reached the app or the migrator. That means no browser/UI login happened, no
+`fixture-queries.sql` cross-project diff was run or captured, and the
+documented teardown (`down --volumes --dry-run`, then for real) never ran
+either. The rehearsal was interrupted partway, not completed.
+
+**Cost of leaving it running.** `docker stats` at discovery showed
+`loom-signoz-restore-telemetrystore-clickhouse-0-0` at **124.52% CPU**, and
+`system.part_log` showed 127,377 failed `metric_log` background merges against
+477 successful ones — the same unpatched `MEMORY_LIMIT_EXCEEDED`
+self-telemetry failure already characterized in "Co-resident 2.5-day soak"
+below, not a new finding, just that same bug reproducing unattended on a
+second project for five days on a shared 8-vCPU dispatch host.
+
+**Disposition.** The genuinely new information above — that a volume-level
+tarball round-trip preserves both PostgreSQL's org/user metadata and
+ClickHouse's trace data — is now captured here. Nothing else in the abandoned
+project was worth keeping: this pass tore the `loom-signoz-restore-*` project
+down with plain `docker rm -f`/`network rm`/`volume rm` restricted to that
+exact name prefix (the `docker compose` plugin that created it is no longer on
+this host, so the README's own `down --volumes --dry-run` step could not be
+run as documented) and filed a follow-up issue covering the missing `docker
+compose` plugin (it blocks anyone, including a future #9279 session, from
+running the documented procedure on this host at all) and the fact that a
+datastore-layer restore ran to completion outside of any tracked session. The
+acceptance-ledger row below stays **Open**: login verification, the query
+diff and a clean, documented teardown are all still unexecuted, and #9279
+still owns deciding whether this partial run is sufficient evidence for the
+datastore layer or should be repeated end-to-end.
+
 ## Co-resident 2.5-day soak: footprint, and a self-telemetry merge failure (2026-09-28)
 
 **What was observed.** A long-running `loom-signoz` project on the primary
@@ -1019,7 +1092,7 @@ trial to observe.
 | Actual Trace Explorer and correlated logs | Passed in authenticated UI; sanitized screenshots linked above |
 | Seven-day effective retention | API, overrides and actual DDL verified; metadata/grace exceptions documented |
 | Restart persistence and shared receiver recovery | Passed for signals, account and effective TTL; fresh three-signal replay indexed |
-| Backup restoration rehearsed into a separate project | **Open** — the isolated `loom-signoz-restore` overlay, its documented procedure and a 13-test static isolation contract all landed and the merged render was verified (see "Backup-restore rehearsal overlay"), but no restore has been executed against real tarballs: that needs the trial host ([#9279](https://github.com/rjwalters/loom/issues/9279)) |
+| Backup restoration rehearsed into a separate project | **Open** — the isolated `loom-signoz-restore` overlay, its documented procedure and a 13-test static isolation contract all landed and the merged render was verified (see "Backup-restore rehearsal overlay"). A real tarball restore *was* found executed on this trial host by an earlier, undocumented session (see "Backup-restore rehearsal: found executed, interrupted, and torn down"): both PostgreSQL's org/user metadata and 37 real ClickHouse trace spans survived the volume round-trip. But the run stopped at the datastore layer — no UI login, no `fixture-queries.sql` diff, no documented teardown — and sat abandoned, burning CPU, for 5 days before this pass found and tore it down (follow-up: [#9762](https://github.com/rjwalters/loom/issues/9762)); [#9279](https://github.com/rjwalters/loom/issues/9279) still owns a complete, documented pass |
 | Saved query artifacts for the shared fixture manifest | **Passed** — executed live above; matches the generated manifest exactly |
 | Shared fixture manifest observed in SigNoz | **Passed** — see "Shared fixture manifest, executed live" above: 37/14/3 signals, exact totals, graph, grouping, root-less detection, absence-vs-zero and privacy-sentinel queries all verified |
 | Real Loom canary / real Judge-Doctor repair trace | Open — the instrumentation slices landed (#8577/#8579), but #8525 itself stays open for its own live-run acceptance, and the run needs the trial host; see #8529 |
