@@ -241,8 +241,8 @@ fn park_label_is_present_only_for_a_label_in_the_closed_vocabulary() {
     let (rows, _) = build_rows(&summary, &repos);
     assert_eq!(rows[0].park_label, None);
 
-    // HardExclusion's rule string ("external") is not in the closed
-    // vocabulary either.
+    // HardExclusion's rule string ("external") IS in its own closed
+    // vocabulary now (#9672): the span names which rule declined the issue.
     let summary = WorkFinderTickSummary {
         queue: vec![summary_row(
             "/repo",
@@ -254,7 +254,7 @@ fn park_label_is_present_only_for_a_label_in_the_closed_vocabulary() {
         ..Default::default()
     };
     let (rows, _) = build_rows(&summary, &repos);
-    assert_eq!(rows[0].park_label, None);
+    assert_eq!(rows[0].park_label.as_deref(), Some("external"));
 
     // A disposition that never carries a park label ignores detail text
     // entirely, however label-shaped it looks.
@@ -401,6 +401,60 @@ fn workspace_halted_emission_carries_the_halt_cause_attribute() {
     };
     let span = build_span(&emission, Utc::now(), None, &HashMap::new());
     assert!(!span.attributes.contains_key("loom.queue.halt_cause"));
+}
+
+// ------------------------------------------------------------------ hard_exclusion label (#9672)
+
+#[test]
+fn hard_exclusion_rows_export_exactly_the_closed_exclusion_labels() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+
+    // Every HARD_EXCLUSION_LABELS entry exports verbatim, so a span can say
+    // WHICH rule declined the issue.
+    for label in crate::hard_exclusion::HARD_EXCLUSION_LABELS {
+        let summary = WorkFinderTickSummary {
+            queue: vec![summary_row("/repo", 1, 1, Qd::HardExclusion, Some(label))],
+            ..Default::default()
+        };
+        let (rows, _) = build_rows(&summary, &repos);
+        assert_eq!(rows[0].park_label.as_deref(), Some(*label));
+    }
+
+    // A detail string outside every closed vocabulary still never exports —
+    // including one on a HardExclusion row (forward compatibility for rules
+    // not yet in HARD_EXCLUSION_LABELS).
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row(
+            "/repo",
+            2,
+            1,
+            Qd::HardExclusion,
+            Some("team:never-build"),
+        )],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    assert_eq!(rows[0].park_label, None);
+}
+
+#[test]
+fn hard_exclusion_emission_carries_the_label_attribute_through_the_export_allowlist() {
+    let emission = Emission {
+        disposition: Qd::HardExclusion,
+        park_label: Some("external".to_string()),
+        halt_cause: None,
+        ..changed_emission()
+    };
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
+    assert_eq!(span.attributes["loom.queue.disposition"], "hard_exclusion");
+    assert_eq!(span.attributes["loom.queue.park_label"], "external");
+    // `loom.queue.park_label` is already in both the span allowlist and the
+    // collector gateway's keep_keys, so reusing it for #9672 adds no new
+    // allowlist surface — assert the export-time bound anyway.
+    let bounded = span.clone().bounded();
+    assert_eq!(bounded.attributes["loom.queue.park_label"], "external");
+    assert!(span.validate().is_ok());
 }
 
 // --------------------------------------------------------------------------- build_span

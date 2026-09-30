@@ -70,6 +70,7 @@ use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Duration, Utc};
 
+use crate::hard_exclusion::HARD_EXCLUSION_LABELS;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::telemetry::queue_snapshot::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
@@ -277,20 +278,22 @@ pub struct DroppedCounts {
     pub truncated: usize,
 }
 
-/// The label on `detail`, only for `Parked`/`HardExclusion` rows whose label
-/// is in the closed `PARK_LABELS ∪ SKIP_LABELS` vocabulary — never a
-/// repo-configured extra skip label or other free-form text. `HardExclusion`
-/// labels (`hard_exclusion::HARD_EXCLUSION_LABELS`) are not in that
-/// vocabulary today, so this is expected to be absent for that disposition in
-/// practice; the check is written against the vocabulary, not the
-/// disposition, so it stays correct if that ever changes.
+/// The label on `detail`, only for rows whose disposition carries a label in
+/// a closed vocabulary — never a repo-configured extra skip label or other
+/// free-form text: `Parked` rows export `PARK_LABELS ∪ SKIP_LABELS` entries;
+/// `HardExclusion` rows export `hard_exclusion::HARD_EXCLUSION_LABELS`
+/// entries (e.g. `external`), so a span names which rule declined the issue
+/// (#9672). Anything else — including a hard-exclusion label on a
+/// non-exclusion row — exports nothing.
 #[must_use]
 fn allowed_park_label(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
-    if !matches!(disposition, QueueDisposition::Parked | QueueDisposition::HardExclusion) {
-        return None;
-    }
     let label = detail?;
-    (PARK_LABELS.contains(&label) || SKIP_LABELS.contains(&label)).then(|| label.to_string())
+    let in_vocabulary = match disposition {
+        QueueDisposition::Parked => PARK_LABELS.contains(&label) || SKIP_LABELS.contains(&label),
+        QueueDisposition::HardExclusion => HARD_EXCLUSION_LABELS.contains(&label),
+        _ => false,
+    };
+    in_vocabulary.then(|| label.to_string())
 }
 
 /// The PR number in an `OpenPr` row's detail (`"open PR #<n>"`, the text
