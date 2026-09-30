@@ -49,11 +49,11 @@ fn seed_renewed_lease(store: &Path, marker: &str, created_secs_ago: i64, updated
     let escaped = marker.replace('\\', "\\\\").replace('"', "\\\"");
     std::fs::write(
         store,
-        format!(
+        with_fleet_author(&format!(
             "{{\"id\":1,\"created_at\":\"{}\",\"updated_at\":\"{}\",\"body\":\"{escaped}\"}}\n",
             created.to_rfc3339(),
             updated.to_rfc3339(),
-        ),
+        )),
     )
     .unwrap();
 }

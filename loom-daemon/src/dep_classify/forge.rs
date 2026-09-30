@@ -5,6 +5,7 @@
 //! each call is bounded and each outcome classified rather than collapsed.
 
 use crate::cmd_out::Query;
+use crate::comment_trust::records;
 use crate::script_helpers::{gh_query, run_gh};
 use serde::Deserialize;
 use std::path::Path;
@@ -95,19 +96,46 @@ pub fn read_issue_in(
     use_cache: bool,
     fields: &str,
 ) -> Option<IssueView> {
-    let q: Query<IssueView> = gh_query(
-        &["issue", "view", num, "--repo", repo, "--json", fields],
-        repo_root,
-        use_cache,
-        // Never "empty": an issue with no body, no labels and no comments is
-        // still a real issue, and treating it as absent would exit 2 on a
-        // perfectly readable one.
-        |_: &IssueView| false,
-    );
-    match q {
-        Query::Populated(v) => Some(v),
-        _ => None,
+    // #9548 (H11): comments come from the REST listing, trusted authors only.
+    // `--json comments` cannot name an App author, and the escalation,
+    // dep-cycle and un-escalation markers read from them change labels: an
+    // outsider's copy of one is prose. An unreadable listing is "could not
+    // read" (exit 2), never "no markers".
+    let want_comments = fields.split(',').any(|f| f == "comments");
+    let other: Vec<&str> = fields.split(',').filter(|f| *f != "comments").collect();
+    let mut view = if other.is_empty() {
+        IssueView::default()
+    } else {
+        let q: Query<IssueView> = gh_query(
+            &[
+                "issue",
+                "view",
+                num,
+                "--repo",
+                repo,
+                "--json",
+                &other.join(","),
+            ],
+            repo_root,
+            use_cache,
+            // Never "empty": an issue with no body, no labels and no comments
+            // is still a real issue, and treating it as absent would exit 2 on
+            // a perfectly readable one.
+            |_: &IssueView| false,
+        );
+        let Query::Populated(v) = q else {
+            return None;
+        };
+        v
+    };
+    if want_comments {
+        let trusted = records::fetch_trusted_comments(repo, num, repo_root, use_cache)?;
+        view.comments = records::bodies(&trusted)
+            .into_iter()
+            .map(|body| Comment { body })
+            .collect();
     }
+    Some(view)
 }
 
 /// Fetch one node for the cycle walk: its state and body.

@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::claim_reconciliation::forge::parse_max_timestamp;
+use crate::comment_trust::records;
 
 /// The pure pre-flip label predicate behind [`CollisionClass`] (Issue #7873).
 /// Declared here rather than in `sweep_registry::mod` because it is this
@@ -997,7 +998,8 @@ impl SweepRegistry {
         if !output.status.success() {
             return OpenPrProbe::ProbeFailed;
         }
-        crate::worktree_ops::gh::parse_open_linked_pr(&String::from_utf8_lossy(&output.stdout))
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        crate::worktree_ops::gh::parse_open_linked_pr_trusted(&stdout, &self.config.workspace_root)
     }
 
     /// REST union for [`probe_open_linked_pr`], consulted when GraphQL returns
@@ -1056,7 +1058,8 @@ impl SweepRegistry {
             return OpenPrProbe::ProbeFailed;
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        crate::worktree_ops::gh::parse_open_linked_pr_timeline(&stdout, issue)
+        let root = &self.config.workspace_root;
+        crate::worktree_ops::gh::parse_open_linked_pr_timeline_trusted(&stdout, issue, root)
     }
 
     /// Best-effort probe for whether `issue` resolves to a pull request in ANY
@@ -1234,7 +1237,7 @@ impl SweepRegistry {
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
-            .arg(".body // \"\"");
+            .arg(format!("{{body: (.body // \"\"), {}}}", records::AUTHOR_JQ));
         cmd.current_dir(&self.config.workspace_root);
         crate::credential_preflight::apply_gh_config_for_root(
             &mut cmd,
@@ -1244,7 +1247,9 @@ impl SweepRegistry {
         if !output.status.success() {
             return None;
         }
-        Some(String::from_utf8_lossy(&output.stdout).to_string())
+        // #9548 (H15): a body declaration counts only when the body's author
+        // is trusted; an outsider-authored body reads as "no declaration".
+        records::trusted_body(&self.config.workspace_root, &output.stdout)
     }
 
     /// Read `issue`'s current label names over the GitHub REST API. `None` on any
@@ -1662,8 +1667,9 @@ impl SweepRegistry {
             .arg("--paginate")
             .arg("--jq")
             .arg(format!(
-                r#".[] | select(.body | startswith("{prefix}")) | {{id: .id, created_at: .created_at, updated_at: .updated_at, body: .body}}"#,
+                r#".[] | select(.body | startswith("{prefix}")) | {{id: .id, created_at: .created_at, updated_at: .updated_at, body: .body, {author}}}"#,
                 prefix = LEASE_MARKER_PREFIX,
+                author = records::AUTHOR_JQ,
             ));
         cmd.current_dir(&self.config.workspace_root);
         // #5401: cross-owner managed repo -> its own owner's installation-token
@@ -1677,7 +1683,10 @@ impl SweepRegistry {
         if !output.status.success() {
             return None;
         }
-        Some(Self::parse_lease_comments_json(&output.stdout))
+        // #9548: an untrusted author's lease is prose, so it can neither win
+        // the tie-break nor fence a watchdog cleanup.
+        let policy = crate::comment_trust::TrustPolicy::for_root(&self.config.workspace_root);
+        Some(Self::parse_lease_comments_json(&policy.trusted_ndjson(&output.stdout)))
     }
 
     /// The claim-then-verify-order tie-break itself (Issue #6287, Epic #6165
@@ -3224,7 +3233,7 @@ exit 0
              exit {code}\n\
              fi\n\
              exit 1\n",
-            stdout = comments_stdout.replace('\'', "'\\''"),
+            stdout = with_fleet_author(comments_stdout).replace('\'', "'\\''"),
             code = exit_code,
         );
         std::fs::write(&fake_gh, &script).unwrap();
@@ -3393,8 +3402,8 @@ exit 0
              exit 1\n",
             counter = counter.display(),
             missing_for_calls = missing_for_calls,
-            before = stdout_before.replace('\'', "'\\''"),
-            after = stdout_after.replace('\'', "'\\''"),
+            before = with_fleet_author(stdout_before).replace('\'', "'\\''"),
+            after = with_fleet_author(stdout_after).replace('\'', "'\\''"),
         );
         std::fs::write(&fake_gh, &script).unwrap();
         let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
@@ -3671,8 +3680,8 @@ exit 0
             counter = counter.display(),
             ok_before = ok_before_calls,
             fail_upper = fail_upper,
-            before = stdout_before.replace('\'', "'\\''"),
-            after = stdout_after.replace('\'', "'\\''"),
+            before = with_fleet_author(stdout_before).replace('\'', "'\\''"),
+            after = with_fleet_author(stdout_after).replace('\'', "'\\''"),
         );
         std::fs::write(&fake_gh, &script).unwrap();
         let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();

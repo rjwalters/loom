@@ -226,17 +226,10 @@ fn forge_inputs(opts: &Options, issue: i64, repo_root: &Path) -> Result<Inputs, 
         body: String,
         #[serde(default)]
         labels: Vec<Label>,
-        #[serde(default)]
-        comments: Vec<Comment>,
     }
     #[derive(serde::Deserialize)]
     struct Label {
         name: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct Comment {
-        #[serde(default)]
-        body: String,
     }
 
     let q: crate::cmd_out::Query<View> = crate::script_helpers::gh_query(
@@ -247,7 +240,7 @@ fn forge_inputs(opts: &Options, issue: i64, repo_root: &Path) -> Result<Inputs, 
             "--repo",
             &repo,
             "--json",
-            "title,body,labels,comments",
+            "title,body,labels",
         ],
         repo_root,
         !opts.no_cache,
@@ -260,12 +253,68 @@ fn forge_inputs(opts: &Options, issue: i64, repo_root: &Path) -> Result<Inputs, 
         return Err(exit::ERROR);
     };
 
-    Ok(Inputs {
-        title: v.title,
-        body: v.body,
-        labels: v.labels.into_iter().map(|l| l.name).collect(),
-        comments: v.comments.into_iter().map(|c| c.body).collect(),
+    // #9548 (H12): a `loom:premise-check` record decides whether an issue
+    // proceeds, so it counts only from a trusted author. Comments come from
+    // the REST listing (the `--json` shape cannot name an App author), and
+    // the body counts only when its author is trusted. An unreadable listing
+    // or issue is an error, never "no record".
+    let num = issue.to_string();
+    let use_cache = !opts.no_cache;
+    let listing =
+        crate::comment_trust::records::fetch_comment_listing(&repo, &num, repo_root, use_cache);
+    let object =
+        crate::comment_trust::records::fetch_issue_object(&repo, &num, repo_root, use_cache);
+    let policy = crate::comment_trust::TrustPolicy::for_root(repo_root);
+    let labels = v.labels.into_iter().map(|l| l.name).collect();
+    let inputs = match (listing, object) {
+        (Some(listing), Some(object)) => {
+            trusted_inputs(&policy, v.title, v.body, labels, &listing, &object)
+        }
+        _ => None,
+    };
+    inputs.ok_or_else(|| {
+        err(&format!("could not read the comments or author of issue #{issue} in {repo}"));
+        exit::ERROR
     })
+}
+
+/// The gate's [`Inputs`] with every record an untrusted author could have
+/// planted removed (#9548, H12): only trusted comments from the raw REST
+/// `listing` survive, and the body keeps its `loom:premise-check` markers only
+/// when the issue `object`'s author is trusted. `None` when the listing is
+/// empty or unparseable — "could not read", never "no record".
+fn trusted_inputs(
+    policy: &crate::comment_trust::TrustPolicy,
+    title: String,
+    body: String,
+    labels: Vec<String>,
+    listing: &[u8],
+    object: &serde_json::Value,
+) -> Option<Inputs> {
+    let records = policy.trusted_listing(listing)?;
+    let body_trusted = policy.trusts_json(object);
+    Some(Inputs {
+        title,
+        // An untrusted body still scopes the check (its prose), but no
+        // record can be read from it.
+        body: if body_trusted {
+            body
+        } else {
+            strip_markers(&body)
+        },
+        labels,
+        comments: crate::comment_trust::records::bodies(&records),
+    })
+}
+
+/// An untrusted body with every `loom:premise-check` marker line removed, so
+/// scoping (which reads prose) still works while no record can be read from
+/// it (#9548).
+fn strip_markers(body: &str) -> String {
+    body.lines()
+        .filter(|l| !l.contains("loom:premise-check"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `owner/repo` from the checkout's origin remote, `gh` as the fallback — the
@@ -304,3 +353,7 @@ fn nwo_from_remote_url(url: &str) -> Option<String> {
     parts.reverse();
     Some(parts.join("/"))
 }
+
+#[cfg(test)]
+#[path = "cli_trust_tests.rs"]
+mod trust_tests;

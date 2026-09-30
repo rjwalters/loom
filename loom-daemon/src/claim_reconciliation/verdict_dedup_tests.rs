@@ -400,6 +400,36 @@ exit 0
         );
     }
 
+    /// #9548 / PR #9581 review: a compare response that would otherwise prove
+    /// equality (`status: "ahead"`) but carries no usable `files` array, or an
+    /// empty `files` with no `status`, proves nothing about the trees, so it
+    /// must fall back to the ordinary invalidation, never to a re-anchor.
+    #[test]
+    #[serial]
+    fn a_compare_response_without_files_is_not_an_identical_tree() {
+        for body in [
+            r#"{"status":"ahead"}"#,
+            r#"{"status":"ahead","files":null}"#,
+            r#"{"status":"identical"}"#,
+            r#"{"files":[]}"#,
+        ] {
+            let dir = tempdir().unwrap();
+            let repo_root = dir.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            let log = dir.path().join("gh.log");
+            let gh = fake_gh(dir.path(), &log, body);
+            let stats = with_env(
+                &[
+                    (VERDICT_STALENESS_ENABLED_ENV, Some("1")),
+                    (VERDICT_TREE_CARVEOUT_ENABLED_ENV, Some("1")),
+                ],
+                || forge::reconcile_pr_verdicts(&gh, &repo_root),
+            );
+            assert_eq!(stats.invalidated, 1, "{body}");
+            assert_eq!(stats.tree_identical_reanchors, 0, "{body}");
+        }
+    }
+
     /// PR #9581 review: a force-push that rewinds the head to an ancestor of
     /// the reviewed commit gives `status: "behind"` with `files: []` (the
     /// three-dot compare diffs the merge-base, which is the head itself). The

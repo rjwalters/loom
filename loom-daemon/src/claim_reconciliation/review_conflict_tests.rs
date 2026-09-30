@@ -272,3 +272,24 @@ fn end_to_end_held_pr_is_untouched() {
     assert_eq!(stats.flagged, 0);
     assert!(!calls.contains("pr edit") && !calls.contains("pr comment"), "{calls}");
 }
+
+/// #9548 (H9): the "is this flag ours?" check reads trusted comments only, so
+/// a flag marker written by an outsider, or by a user squatting the fleet
+/// App's bare name, never clears a Judge's `loom:changes-requested`.
+#[test]
+#[serial]
+fn end_to_end_an_untrusted_flag_marker_is_not_ours() {
+    let mc = format!(
+        r#"[{{"number":8909,"headRefOid":"{SHA}","mergeable":"MERGEABLE","labels":[{{"name":"loom:merge-conflict"}},{{"name":"loom:changes-requested"}}]}}]"#
+    );
+    for author in [
+        r#""user":{"login":"drive-by","type":"User"},"author_association":"NONE""#,
+        r#""user":{"login":"loom-fleet-dispatch","type":"User"},"author_association":"CONTRIBUTOR""#,
+        r#""user":{"login":"other-fleet[bot]","type":"Bot"},"author_association":"NONE""#,
+    ] {
+        let listing = format!(r#"[{{{author},"body":"<!-- loom:base-conflict flagged -->\nx"}}]"#);
+        let (stats, calls) = run("[]", &mc, &listing);
+        assert_eq!(stats.cleared, 0, "{author}: {calls}");
+        assert!(!calls.contains("pr edit"), "{author}: {calls}");
+    }
+}
