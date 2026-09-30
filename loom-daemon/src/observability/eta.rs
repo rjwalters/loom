@@ -47,11 +47,12 @@ use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::config::EtaConfig;
 use crate::eta::journal::{self, JournalEntry};
 use crate::eta::score::EstimateSummary;
+use crate::eta::shadow::{self, ShadowLedger};
 use crate::eta::tracker::{
     Effects, Emission, EstimateContext, IssueState, ItemKey, PrState, PrView, ReadyPlan, ReadyRow,
     Resolved, Tracker,
 };
-use crate::eta::{Provenance, Registry, StageSamples};
+use crate::eta::{Kind, Provenance, Registry, StageSamples};
 use crate::event_bus::EventBus;
 use crate::forge_listing::RestIssue;
 use crate::telemetry::kinds::eta::{EtaEstimateRecord, EtaOutcomeRecord};
@@ -100,6 +101,9 @@ pub fn register_sink(otlp_queues: Vec<Arc<DurableQueue>>, host_id: &str) {
 struct State {
     tracker: Tracker,
     turnover: super::ops::turnaround::TurnoverLedger,
+    /// Live paired scores per `(kind, current, candidate)` (#9328): the second
+    /// promotion gate's evidence, accumulated as outcomes resolve.
+    shadow: ShadowLedger,
     config: EtaConfig,
     registry: Registry,
     history: StageSamples,
@@ -166,9 +170,10 @@ pub fn deliver(
     for emission in emissions {
         let e = &emission.explanation;
         let line = format!(
-            "eta.estimate kind={} heuristic={} repo={} issue={} {}",
+            "eta.estimate kind={} heuristic={} primary={} repo={} issue={} {}",
             e.kind,
             e.heuristic,
+            emission.primary,
             e.subject.repo,
             e.subject.issue,
             describe_estimate(e)
@@ -177,6 +182,7 @@ pub fn deliver(
         let refused = e.result.is_none();
         let record = EtaEstimateRecord {
             trigger: emission.trigger,
+            primary: emission.primary,
             explanation: Box::new(emission.explanation),
         };
         if !record.has_provenance() {
@@ -292,6 +298,39 @@ fn sink() -> Option<&'static dyn QueueSink> {
     SINK.get().map(|(queue, _)| queue.as_ref())
 }
 
+/// Fold `outcomes` into the shadow ledger and persist it (#9328).
+///
+/// Every heuristic of a kind estimated the same subject at the same `as_of`,
+/// and `Tracker::resolve` scores all of them against one outcome, so the pairs
+/// are already formed — this only sorts them into `(current, candidate)` runs
+/// and adds them up. Best-effort: a failed persist costs a longer wait for the
+/// 50-pair gate, never a wrong answer.
+fn note_outcomes(state: &mut State, outcomes: &[Resolved]) {
+    if outcomes.is_empty() {
+        return;
+    }
+    let ids: BTreeMap<Kind, String> = [Kind::Start, Kind::Finish, Kind::Land]
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                state
+                    .registry
+                    .current(kind, state.config.current(kind))
+                    .id()
+                    .to_string(),
+            )
+        })
+        .collect();
+    state
+        .shadow
+        .record(&|kind| ids.get(&kind).cloned().unwrap_or_default(), outcomes);
+    let path = shadow::ledger_path(&state.workspace_root);
+    if let Err(error) = shadow::write_ledger(&path, &state.shadow) {
+        log::warn!("eta: persisting the shadow ledger failed: {error}");
+    }
+}
+
 /// Journal, estimate and deliver the aftermath of one bus event.
 async fn apply_event(effects: Effects, now: DateTime<Utc>) {
     let (dry_run, root, host_id) = {
@@ -306,6 +345,9 @@ async fn apply_event(effects: Effects, now: DateTime<Utc>) {
     dirty.dedup();
     let emissions = estimate_isolated(Some(dirty), now).await;
     append_journal(&root, &effects.journal);
+    if let Some(state) = lock().as_mut() {
+        note_outcomes(state, &effects.outcomes);
+    }
     let loom = Provenance::current();
     deliver(emissions, effects.outcomes, &loom, &host_id, dry_run, sink());
 }
@@ -345,9 +387,11 @@ pub fn spawn_task(
         config.refresh_secs,
         tracker.pending().len()
     );
+    let shadow = shadow::read_ledger(&shadow::ledger_path(&workspace_root));
     *lock() = Some(State {
         tracker,
         turnover: super::ops::turnaround::TurnoverLedger::default(),
+        shadow,
         config,
         registry: Registry::builtin(),
         history: StageSamples::default(),
@@ -574,6 +618,7 @@ fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> StageS
         if seen.insert(path.clone()) {
             let samples = StageSamples::load_outcome_journal(&path);
             history.stages.extend(samples.stages);
+            history.censored.extend(samples.censored);
             history.verdicts.extend(samples.verdicts);
             history.paths.extend(samples.paths);
         }
@@ -702,6 +747,7 @@ pub(super) async fn record(
         }
         let expired = state.tracker.expire(now);
         let all = crate::eta::tracker::merged(effects);
+        note_outcomes(state, &all.outcomes);
         (
             all.journal,
             all.outcomes,

@@ -38,6 +38,7 @@ fn estimate() -> EtaEstimateRecord {
     // No history: a refusal, which must carry provenance all the same.
     EtaEstimateRecord {
         trigger: Trigger::First,
+        primary: true,
         explanation: Box::new(LandV1.estimate(&input, &Default::default())),
     }
 }

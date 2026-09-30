@@ -32,7 +32,8 @@ impl Harness {
         }
     }
 
-    fn estimate(&mut self, at: DateTime<Utc>) -> Vec<crate::eta::tracker::Emission> {
+    /// Every emission, shadow candidates included (#9328).
+    fn estimate_all(&mut self, at: DateTime<Utc>) -> Vec<crate::eta::tracker::Emission> {
         let ctx = EstimateContext {
             registry: &self.registry,
             current_start: None,
@@ -44,6 +45,17 @@ impl Harness {
             repo_ids: &self.repo_ids,
         };
         self.tracker.estimate(None, &ctx, at)
+    }
+
+    /// The **primary** emissions only — `current`'s estimate per kind, which
+    /// is exactly what every consumer predating shadow mode saw. The lifecycle
+    /// tests below assert on this so they keep pinning the behaviour they were
+    /// written for; `shadow_mode_*` asserts on [`Self::estimate_all`].
+    fn estimate(&mut self, at: DateTime<Utc>) -> Vec<crate::eta::tracker::Emission> {
+        self.estimate_all(at)
+            .into_iter()
+            .filter(|e| e.primary)
+            .collect()
     }
 }
 
@@ -205,7 +217,7 @@ fn external_review_path_from_listings_to_merge() {
     let merge_row = &merged.journal[0];
     assert_eq!(merge_row.stage, Some(Stage::MergeWait));
     assert_eq!(merge_row.duration_sec, Some(200), "observed entry: a real sample");
-    assert_eq!(merged.outcomes.len(), 2);
+    assert_eq!(merged.outcomes.len(), 4, "two estimates x land-v1 + the land-v2 shadow");
     for outcome in &merged.outcomes {
         assert_eq!(outcome.score.outcome, OutcomeKind::Landed);
         assert_eq!(outcome.score.actual_at, t(500));
@@ -245,7 +257,9 @@ fn only_the_issue_closing_not_planned_is_abandoned() {
         IssueState::ClosedNotPlanned(t(400)),
         t(600),
     );
-    assert_eq!(not_planned.outcomes.len(), 1);
+    // Two: `land-v1` (primary) and the `land-v2` shadow, scored against
+    // the same outcome at the same `as_of` — the live pair (#9328).
+    assert_eq!(not_planned.outcomes.len(), 2);
     assert_eq!(not_planned.outcomes[0].score.outcome, OutcomeKind::Abandoned);
     assert_eq!(not_planned.outcomes[0].score.error_sec, None);
     assert_eq!(not_planned.outcomes[0].outcome_source, "issues_read");
@@ -284,8 +298,8 @@ fn a_pre_pr_crash_with_the_issue_open_stays_pending() {
         .tracker
         .on_issue_resolved(&ItemKey::new(REPO, 61), IssueState::Open, t(1200));
     assert!(open.outcomes.is_empty(), "still open: neither landed nor abandoned");
-    assert_eq!(h.tracker.pending().len(), 1, "the land estimate waits for the landing");
-    assert_eq!(h.tracker.pending()[0].kind, Kind::Land);
+    assert_eq!(h.tracker.pending().len(), 2, "both land estimates wait for the landing");
+    assert!(h.tracker.pending().iter().all(|p| p.kind == Kind::Land));
     assert!(h.tracker.item_keys().is_empty(), "nothing left to observe");
 
     // A later sweep lands it: `resolve` joins on repo, issue and kind.
@@ -299,8 +313,10 @@ fn a_pre_pr_crash_with_the_issue_open_stays_pending() {
         .iter()
         .filter(|o| o.estimate.as_of == t(1))
         .collect();
-    assert_eq!(landed.len(), 1, "the original estimate scored against the real landing");
-    assert_eq!(landed[0].score.outcome, OutcomeKind::Landed);
+    assert_eq!(landed.len(), 2, "the original estimate, both land heuristics, scored");
+    assert!(landed
+        .iter()
+        .all(|o| o.score.outcome == OutcomeKind::Landed));
 }
 
 #[test]
@@ -309,13 +325,13 @@ fn a_closed_pr_replaced_by_one_that_merges_lands() {
     h.tracker
         .on_listing(REPO, &[pr(701, 71, &["loom:review-requested"], -60)], t(0), 300);
     h.estimate(t(0));
-    assert_eq!(h.tracker.pending().len(), 1);
+    assert_eq!(h.tracker.pending().len(), 2, "land-v1 + the land-v2 shadow");
     h.tracker.on_listing(REPO, &[], t(300), 300);
     h.tracker
         .on_pr_resolved(&ItemKey::new(REPO, 71), PrState::Closed, t(300));
     h.tracker
         .on_issue_resolved(&ItemKey::new(REPO, 71), IssueState::Open, t(300));
-    assert_eq!(h.tracker.pending().len(), 1, "not abandoned: a replacement may land");
+    assert_eq!(h.tracker.pending().len(), 2, "not abandoned: a replacement may land");
 
     // The replacement PR for the same issue.
     h.tracker
@@ -329,8 +345,8 @@ fn a_closed_pr_replaced_by_one_that_merges_lands() {
         .iter()
         .filter(|o| o.estimate.as_of == t(0))
         .collect();
-    assert_eq!(first.len(), 1, "the first PR's estimate scored against the landing");
-    assert_eq!(first[0].score.outcome, OutcomeKind::Landed);
+    assert_eq!(first.len(), 2, "the first PR's estimates scored against the landing");
+    assert!(first.iter().all(|o| o.score.outcome == OutcomeKind::Landed));
 }
 
 #[test]
@@ -346,7 +362,7 @@ fn an_issue_closed_as_completed_without_a_pr_lands() {
         IssueState::ClosedCompleted(t(700)),
         t(900),
     );
-    assert_eq!(completed.outcomes.len(), 1);
+    assert_eq!(completed.outcomes.len(), 2, "land-v1 + the land-v2 shadow");
     assert_eq!(completed.outcomes[0].score.outcome, OutcomeKind::Landed);
     assert_eq!(completed.outcomes[0].score.actual_at, t(700));
     assert_eq!(completed.outcomes[0].outcome_resolution_sec, Some(200));
@@ -405,18 +421,18 @@ fn estimates_emitted_after_the_landing_are_dropped_not_scored_by_a_reopen() {
     assert_eq!(h.estimate(t(0)).len(), 1);
     // A refresh emitted while the PR was already merged (the read is late).
     assert_eq!(h.estimate(t(300)).len(), 1);
-    assert_eq!(h.tracker.pending().len(), 2);
+    assert_eq!(h.tracker.pending().len(), 4, "two estimates x two land heuristics");
     h.tracker.on_listing(REPO, &[], t(600), 300);
     let merged = h
         .tracker
         .on_pr_resolved(&ItemKey::new(REPO, 13), PrState::Merged(t(200)), t(600));
-    assert_eq!(merged.outcomes.len(), 1, "only the estimate made before the landing");
-    assert_eq!(merged.outcomes[0].estimate.as_of, t(0));
+    assert_eq!(merged.outcomes.len(), 2, "only the estimates made before the landing");
+    assert!(merged.outcomes.iter().all(|o| o.estimate.as_of == t(0)));
     assert!(
         h.tracker.pending().is_empty(),
         "the post-landing estimate is dropped, so a reopen cannot score it"
     );
-    assert_eq!(h.tracker.drain_dropped().orphaned, 1);
+    assert_eq!(h.tracker.drain_dropped().orphaned, 2);
 
     // The reopen lands again: nothing stale is waiting for it.
     h.tracker
@@ -426,8 +442,8 @@ fn estimates_emitted_after_the_landing_are_dropped_not_scored_by_a_reopen() {
     let again =
         h.tracker
             .on_pr_resolved(&ItemKey::new(REPO, 13), PrState::Merged(t(1100)), t(1200));
-    assert_eq!(again.outcomes.len(), 1, "a reopen starts a new series");
-    assert_eq!(again.outcomes[0].estimate.as_of, t(900));
+    assert_eq!(again.outcomes.len(), 2, "a reopen starts a new series");
+    assert!(again.outcomes.iter().all(|o| o.estimate.as_of == t(900)));
 }
 
 #[test]
@@ -466,7 +482,7 @@ fn unchanged_items_refresh_on_the_cadence() {
     let refreshed = h.estimate(t(300));
     assert_eq!(refreshed.len(), 1);
     assert_eq!(refreshed[0].trigger, crate::eta::emit::Trigger::Refresh);
-    assert_eq!(h.tracker.pending().len(), 2, "every emitted estimate waits for its outcome");
+    assert_eq!(h.tracker.pending().len(), 4, "every emitted estimate waits for its outcome");
 }
 
 #[test]
@@ -493,7 +509,7 @@ fn pending_survives_a_restart() {
     restarted.on_listing(REPO, &[pr(901, 90, &["loom:pr"], 100)], t(400), 300);
     restarted.on_listing(REPO, &[], t(700), 300);
     let merged = restarted.on_pr_resolved(&ItemKey::new(REPO, 90), PrState::Merged(t(650)), t(700));
-    assert_eq!(merged.outcomes.len(), 1, "the join survived");
+    assert_eq!(merged.outcomes.len(), 2, "the join survived");
     assert_eq!(merged.outcomes[0].estimate.as_of, t(0));
 }
 
@@ -504,7 +520,7 @@ fn expire_drops_old_pending() {
         .on_listing(REPO, &[pr(111, 11, &["loom:pr"], -60)], t(0), 300);
     h.estimate(t(0));
     assert_eq!(h.tracker.expire(t(3600)), 0);
-    assert_eq!(h.tracker.expire(t(0) + Duration::days(31)), 1);
+    assert_eq!(h.tracker.expire(t(0) + Duration::days(31)), 2);
     assert!(h.tracker.pending().is_empty());
 }
 

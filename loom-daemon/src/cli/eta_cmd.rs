@@ -27,8 +27,9 @@ use loom_daemon::cmd_out::Query;
 use loom_daemon::eta::backtest::{self, BacktestReport, Bucket, Comparison, Filter};
 use loom_daemon::eta::explanation::{Explanation, Features};
 use loom_daemon::eta::history::StageSamples;
-use loom_daemon::eta::journal::{self, entries_from_pr_history};
+use loom_daemon::eta::journal::{self, censored_from_pr_history, entries_from_pr_history};
 use loom_daemon::eta::labels as eta_labels;
+use loom_daemon::eta::shadow;
 use loom_daemon::eta::{
     AgeSource, CurrentStage, CurrentState, EstimateInput, Kind, NoEstimateReason, Provenance,
     Registry, Stage, Subject,
@@ -62,6 +63,10 @@ pub(crate) enum EtaCommand {
     /// The landing-next list for a repo, soonest first (#9327):
     /// `loom-daemon eta list --repo owner/repo`.
     List(EtaListArgs),
+    /// Evaluate the two-gate promotion rule for a shadow candidate (#9328),
+    /// and with `--apply`, flip `autonomous.eta.current.<kind>` when — and
+    /// only when — both gates pass.
+    Promote(EtaPromoteArgs),
 }
 
 impl EtaCommand {
@@ -71,8 +76,154 @@ impl EtaCommand {
             EtaCommand::Backtest(args) => args.run(),
             EtaCommand::View(args) => args.run(),
             EtaCommand::List(args) => args.run(),
+            EtaCommand::Promote(args) => args.run(),
         }
     }
+}
+
+/// `loom-daemon eta promote` — the promotion switch's operator surface.
+///
+/// Assembles both gates from what already exists: the phase-2 backtest over
+/// this host's journals (gate 1) and the shadow ledger the ETA tracker has
+/// been accumulating (gate 2). The gates themselves live in
+/// [`shadow::evaluate`] / [`shadow::promote_if_ready`] — this command cannot
+/// relax them, and `--apply` on a failing candidate is a refusal, not an
+/// override.
+#[derive(clap::Args)]
+pub(crate) struct EtaPromoteArgs {
+    /// Candidate heuristic id to promote (e.g. `land-v2`).
+    #[arg(long, value_name = "ID")]
+    pub candidate: String,
+
+    /// Directory whose journals, ledger and config to use. Defaults to the
+    /// current directory.
+    #[arg(long, value_name = "PATH")]
+    pub repo_root: Option<PathBuf>,
+
+    /// Only replay this repo's backtest cases.
+    #[arg(long, value_name = "OWNER/NAME")]
+    pub repo: Option<String>,
+
+    /// Only replay backtest cases at or after this RFC 3339 instant.
+    #[arg(long, value_name = "RFC3339")]
+    pub since: Option<String>,
+
+    /// Write the flip when both gates pass. Without it this is a dry
+    /// evaluation that changes nothing.
+    #[arg(long)]
+    pub apply: bool,
+
+    /// Emit the decision record as JSON instead of the human report.
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl EtaPromoteArgs {
+    pub(crate) fn run(self) -> Result<()> {
+        let root = self
+            .repo_root
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let registry = Registry::builtin();
+        let Some(candidate) = registry.get(&self.candidate) else {
+            bail!(
+                "unknown heuristic id {:?} (known: {})",
+                self.candidate,
+                registry.ids().join(", ")
+            );
+        };
+        let kind = candidate.kind();
+        let config = loom_daemon::eta::config::read(&root);
+        let current = registry.current(kind, config.current(kind));
+        if current.id() == candidate.id() {
+            bail!("{} is already current for {kind}", candidate.id());
+        }
+
+        let since = match &self.since {
+            Some(raw) => Some(
+                DateTime::parse_from_rfc3339(raw)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| anyhow::anyhow!("invalid --since {raw:?}: {e}"))?,
+            ),
+            None => None,
+        };
+        let filter = Filter {
+            since,
+            repo: self.repo.as_deref(),
+        };
+
+        let envelopes = load_outcome_envelopes(&root);
+        let mut history = StageSamples::default();
+        history.push_envelopes(&envelopes);
+        let journal_entries = journal::read(&journal::journal_path(&root));
+        history.push_journal(&journal_entries, "local");
+        let mut cases = backtest::cases_from_envelopes(&envelopes);
+        cases.extend(backtest::cases_from_journal(&journal_entries));
+        let loom = Provenance::current();
+        let comparison =
+            backtest::compare(current, candidate, &history, &cases, filter, &loom).ok();
+
+        let ledger_path = shadow::ledger_path(&root);
+        let mut ledger = shadow::read_ledger(&ledger_path);
+        let now = Utc::now();
+        let config_path = loom_daemon::eta::config::promotion_config_path(&root);
+        let decision = if self.apply {
+            let decision = shadow::promote_if_ready(
+                &mut ledger,
+                kind,
+                current.id(),
+                candidate.id(),
+                comparison.as_ref(),
+                &config_path,
+                now,
+            )?;
+            if decision.promote {
+                shadow::write_ledger(&ledger_path, &ledger)?;
+            }
+            decision
+        } else {
+            let stats = ledger.stats(kind, current.id(), candidate.id());
+            shadow::evaluate(kind, current.id(), candidate.id(), comparison.as_ref(), &stats, now)
+        };
+
+        // Every evaluation is recorded, promoting or not: "why has this not
+        // flipped yet?" is the question an operator actually asks.
+        let log_path = shadow::decision_log_path(&root);
+        if let Err(error) = shadow::append_decision(&log_path, &decision) {
+            eprintln!("[eta promote] WARNING: could not record the decision: {error}");
+        }
+
+        if self.json {
+            println!("{}", serde_json::to_string_pretty(&decision)?);
+        } else {
+            print!("{}", render_decision(&decision, self.apply));
+        }
+        Ok(())
+    }
+}
+
+fn render_decision(d: &shadow::PromotionDecision, applied: bool) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "eta promote {} → {} ({})", d.current, d.candidate, d.kind);
+    let _ =
+        writeln!(out, "  gate 1 backtest: {} — {}", d.backtest.status.as_str(), d.backtest.detail);
+    let _ = writeln!(out, "  gate 2 live:     {} — {}", d.live.status.as_str(), d.live.detail);
+    let _ = writeln!(out, "  decision: {}", d.reason);
+    match (&d.config_path, d.promote, applied) {
+        (Some(path), _, _) => {
+            let _ =
+                writeln!(out, "  PROMOTED: autonomous.eta.current.{} written to {path}", d.kind);
+        }
+        (None, true, false) => {
+            let _ = writeln!(out, "  both gates pass; re-run with --apply to flip the config");
+        }
+        _ => {
+            let _ = writeln!(out, "  current stands: {}", d.current);
+        }
+    }
+    out
 }
 
 #[derive(clap::Args)]
@@ -120,12 +271,22 @@ impl EtaBackfillArgs {
         }
 
         let loom = Provenance::current();
+        let now = Utc::now();
         let mut entries = Vec::new();
+        let mut censored = 0_usize;
         for h in &histories {
             entries.extend(entries_from_pr_history(h, &repo, &loom));
+            // #9328: the open segments — a PR still in review, a rejection not
+            // yet answered, an approval not yet merged — as right-censored
+            // lower bounds. Only `land-v2` reads them; every v1 distribution
+            // is built from the completed rows above, unchanged.
+            let open = censored_from_pr_history(h, &repo, now, &loom);
+            censored += open.len();
+            entries.extend(open);
         }
         println!(
-            "[eta backfill] {} PR(s) examined for {repo}, {} stage sample(s) derived",
+            "[eta backfill] {} PR(s) examined for {repo}, {} stage sample(s) derived \
+             ({censored} of them right-censored)",
             histories.len(),
             entries.len()
         );
