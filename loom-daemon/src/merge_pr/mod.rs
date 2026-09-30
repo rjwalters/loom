@@ -216,6 +216,7 @@
 pub mod check_runs_streak;
 pub mod checks_failure;
 pub mod closed_building;
+pub mod consolidate;
 pub mod dirty_guard;
 pub mod head_sync;
 pub mod hold_state;
