@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-30
+- **Issue #9746** (closed): merge timing: keep LOOM_AUTO_MERGE_TIMEOUT; 52% of PRs pay a second CI cycle to freshness re-dates — attribute and narrow
+- **PR #9751**: feat(merge-pr): attribute #8508 re-dates with commit trailers + redate-report (#9746)
+- **Issue #9669** (closed): feat(telemetry): record candidate queue position and total candidate count on dispatch spans
+- **PR #9680**: feat(telemetry): record queue position, depth and comparator keys on dispatch spans
 - **Issue #9330** (closed): ETA phase 7: docs + eta-queries.sql + CI artifact test
 - **Issue #9328** (closed): ETA phase 5: shadow mode + promotion switch (backtest-gated), land-v2 with censoring
 - **PR #9749**: feat(eta): shadow mode + backtest-then-live promotion switch, land-v2 (#9328)
