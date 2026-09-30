@@ -1,5 +1,7 @@
-//! `loom-daemon forge token | is-fleet | identities` (#9537): the scripts'
-//! entry point to the forge identity broker ([`loom_daemon::forge_identity`]).
+//! `loom-daemon forge token | is-fleet | identities | trusted-comments`
+//! (#9537, #9548): the scripts' entry point to the forge identity broker
+//! ([`loom_daemon::forge_identity`]) and the comment-trust predicate
+//! ([`loom_daemon::comment_trust`]).
 
 use std::path::{Path, PathBuf};
 
@@ -201,4 +203,31 @@ pub(crate) fn identities(as_json: bool) -> Result<()> {
         println!("  reader token {app} for {owner}: expires {exp}");
     }
     Ok(())
+}
+
+/// `forge trusted-comments [--self-login L]` (#9548): stdin is a comment
+/// listing (REST or `gh --json` shape, one array, concatenated pages, or an
+/// object with `comments`/`reviews`); stdout is the same JSON holding only
+/// the comments whose author [`loom_daemon::comment_trust`] trusts. Exits 1
+/// with nothing on stdout when stdin is not such a document, so a caller can
+/// never mistake a failed filter for "no trusted comments".
+pub(crate) fn trusted_comments(self_login: Option<String>) -> Result<()> {
+    use std::io::Read;
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input)?;
+    let policy =
+        loom_daemon::comment_trust::TrustPolicy::for_root(&workspace()).with_self_login(self_login);
+    match loom_daemon::comment_trust::filter_document(&policy, &input) {
+        Some(out) => {
+            println!("{out}");
+            Ok(())
+        }
+        None => {
+            eprintln!(
+                "forge trusted-comments: stdin is not a JSON comment listing (an array of \
+                 comments, or an object with comments/reviews)"
+            );
+            std::process::exit(1)
+        }
+    }
 }

@@ -217,6 +217,23 @@ pub(crate) enum ForgeAction {
         login: String,
     },
 
+    /// `forge trusted-comments [--self-login L]` (#9548) — filter a comment
+    /// listing on stdin (REST `user.login`/`author_association`, or `gh
+    /// --json` `author.login`/`authorAssociation`) down to the comments whose
+    /// author Loom trusts as a control-signal source: a repo insider by
+    /// association, one of THIS fleet's Apps (App-spelled, exact match), this
+    /// daemon's own identity, or `forge.trustedCommenters`. Prints the same
+    /// JSON shape; exits 1 with nothing on stdout on unparseable input. `gh
+    /// --json` spells an App as a bare login, so fleet-authored markers need
+    /// the REST listing. See `.loom/docs/comment-trust.md`.
+    #[command(name = "trusted-comments")]
+    TrustedComments {
+        /// This caller's own login, trusted with the same account kind
+        /// (default: the configured writer App, `<slug>[bot]`).
+        #[arg(long, value_name = "LOGIN")]
+        self_login: Option<String>,
+    },
+
     /// `forge identities [--json]` (#9537) — the resolved roster (writer,
     /// readers, legacy logins) and, per reader, each published token's owner
     /// and expiry.
@@ -241,6 +258,9 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         } => return super::forge_identity_cmd::token(&repo, &access, force),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
+        ForgeAction::TrustedComments { self_login } => {
+            return super::forge_identity_cmd::trusted_comments(self_login)
+        }
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
