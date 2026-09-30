@@ -796,6 +796,54 @@ pub struct SweepRegistry {
     /// the same binary. Scoping the pin to one registry removes the shared
     /// mutable global instead of adding another lock around it.
     activity_window: Option<Duration>,
+    /// Cached `(owner, repo)` slug for this registry's `workspace_root`
+    /// (Issue #9572), populated by [`resolve_owner_repo`](Self::resolve_owner_repo)
+    /// on its first *successful* `gh repo view` resolve. Every one of that
+    /// method's ~10 call sites across a single dispatch previously spawned its
+    /// own `gh repo view` subprocess — the workspace's owner/repo slug never
+    /// changes for the life of the process, so caching it after the first
+    /// success removes that many redundant `gh` round trips per dispatch
+    /// without changing any answer. A `Mutex` rather than a plain field
+    /// because `resolve_owner_repo` is `&self`-only (mirroring
+    /// [`open_pr_memo`](Self::open_pr_memo)'s own `&self` read-through-cache
+    /// rationale) — every guard call site reads it without needing `&mut
+    /// self`. Deliberately never holds `None`: a *failed* resolve must keep
+    /// failing exactly as before (every guard's fail-open contract depends on
+    /// a `gh` outage being retried on the very next call, not remembered),
+    /// so only a confirmed success is ever written here. The `LOOM_REPO`
+    /// env override is checked before this cache on every call — env reads
+    /// are free and tests toggle the var directly, so caching it would only
+    /// add a staleness hazard for zero benefit.
+    owner_repo_cache: Mutex<Option<(String, String)>>,
+    /// In-flight idempotency-key -> sweep-id map (Issue #9572).
+    ///
+    /// [`find_running_by_key`](Self::find_running_by_key) — the step-1 dedup
+    /// `begin_prepared_issue_dispatch` consults first — only matches entries
+    /// already in [`entries`](Self::entries), which is populated by
+    /// `finish_issue_dispatch` AFTER the unlocked account-selection poll
+    /// (Issue #6592). A same-key
+    /// retry landing inside that poll window (bounded by
+    /// `TOKEN_NAME_CAPTURE_TIMEOUT`, up to ~5s) used to miss both dedup
+    /// checks and fall through to the guard chain, which refused it with a
+    /// hard `Err` (`lock collision` or the #4556 live-claim guard) instead of
+    /// the graceful idempotent hand-back a retry gets before or after that
+    /// window.
+    ///
+    /// This map closes that gap: `begin_prepared_issue_dispatch` writes an
+    /// entry here right after claiming the lock (step 3, before the label
+    /// flip / spawn can still fail) and a step-1 hit on this map returns
+    /// `Done(Ok(DispatchOutcome { was_new: false, .. }))` with the SAME
+    /// `sweep_id` instead of falling through. `pid` is genuinely unknown at
+    /// write time — the child has not been spawned yet — so a hit reports
+    /// `pid: 0` and `UNKNOWN_TOKEN_NAME`; callers already treat both as
+    /// legitimate "not yet known" sentinels (mirroring the #4689/#6614
+    /// preflight-death paths). Cleared by `finish_issue_dispatch` on BOTH its
+    /// success and error paths, and by every early `Err` return inside
+    /// `begin_prepared_issue_dispatch` from the point the key is written
+    /// onward — so a failed attempt (collision guard, lost lease-order
+    /// tie-break, spawn failure) never wedges the key against a later,
+    /// legitimate same-key dispatch.
+    inflight_idempotency: HashMap<String, SweepId>,
 }
 
 /// Resolve this host's identity string for collision records (Issue #4085) and
@@ -1133,6 +1181,8 @@ impl SweepRegistry {
             sampled_loc: HashMap::new(),
             pending_group_reaps: HashMap::new(),
             activity_window: None,
+            owner_repo_cache: Mutex::new(None),
+            inflight_idempotency: HashMap::new(),
         }
     }
 
@@ -1513,12 +1563,17 @@ impl SweepRegistry {
     /// AFTER the account-selection poll that #6592 deliberately runs with the
     /// registry mutex released. A same-key retry arriving inside that window
     /// (post-`begin_issue_dispatch`, pre-`finish_issue_dispatch`, up to
-    /// `TOKEN_NAME_CAPTURE_TIMEOUT` ≈ 5s) therefore finds nothing here and
-    /// falls through to the guard chain, which refuses it — via the #4556
-    /// live-claim guard's argv process scan where the platform allows it,
-    /// otherwise via the atomic `acquire_lock` mkdir (`lock collision`). No
-    /// double-spawn occurs; the retry just gets a hard `Err` rather than the
-    /// graceful `was_new: false`.
+    /// `TOKEN_NAME_CAPTURE_TIMEOUT` ≈ 5s) therefore finds nothing here.
+    ///
+    /// Issue #9572 added a second dedup lookup for exactly that window —
+    /// [`inflight_idempotency`](SweepRegistry::inflight_idempotency), consulted
+    /// by `begin_prepared_issue_dispatch`'s step 1b immediately after this
+    /// method's step 1 check — so a same-key retry inside the window now gets
+    /// the graceful `was_new: false` hand-back naming the in-flight sweep's
+    /// id, instead of falling through to the guard chain's hard `Err` (the
+    /// #4556 live-claim guard's argv scan, or the atomic `acquire_lock` mkdir's
+    /// `lock collision`) — both guards remain the backstop for every OTHER
+    /// duplicate-dispatch shape, unchanged.
     /// Full rationale and the pinning test are documented on
     /// [`begin_issue_dispatch`](SweepRegistry::begin_issue_dispatch) —
     /// **do not read this function alone as a complete statement of dedup
