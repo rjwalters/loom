@@ -112,6 +112,16 @@ A missing entry here when a later issue (#9789, #9790, #9791) needs it is a
 [`defaults/docs/credentials.md`](../../defaults/docs/credentials.md) — ask the
 operator for the name and provisioning path only, never the value.
 
+**Resolved 2026-10-01.** The names above all resolve against the fleet's own
+self-managed `gitea-1` (2am#1793): `GITEA_QUAL_ADMIN_LOGIN=loom-bot` (token:
+SSM `/gitea/loom-bot/admin-token`), `GITEA_QUAL_WRITER_LOGIN=forge-ci`
+(SSM `/gitea/forge-ci/token`), `GITEA_QUAL_READONLY_LOGIN=qual-readonly`
+(SSM `/gitea/qual-readonly/token`), `GITEA_QUAL_REVIEWER_LOGIN=qual-reviewer`
+(SSM `/gitea/qual-reviewer/token`), `GITEA_QUAL_ORG=qual-org` with disposable
+repo `qual-org/loomp-test`, and `GITEA_QUAL_INSTANCE_URL=http://127.0.0.1:3000`
+(loopback-only host — run on the host or through an SSH forward). Values live
+only in SSM; the canonical mapping lives in [`/.loom/credentials.md`](../../.loom/credentials.md).
+
 ---
 
 ## Step 2 — idempotent setup (reference commands)

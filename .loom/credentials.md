@@ -23,16 +23,29 @@ value. Safe to commit: every row below is a placeholder name, not a secret.
 | Gitea Cloud qualification untrusted-reviewer identity login (#9788/#9769) | env var `GITEA_QUAL_REVIEWER_LOGIN` | outside-collaborator / fork-review trust-boundary tests |
 | Gitea Cloud qualification untrusted-reviewer identity API token (#9788/#9769) | env var `GITEA_QUAL_REVIEWER_TOKEN` | comments/reviews from this identity must never be treated as a trusted collaborator's |
 
-**None of the above are provisioned yet.** As of this writing (#9788) no
-Gitea Cloud tenant, org, repo, or identity exists — this table names where
-each credential will live once an operator completes the external signup
-documented in
-[`docs/research/gitea-cloud-qualification-runbook.md`](../docs/research/gitea-cloud-qualification-runbook.md)
-Step 0. A builder picking up #9789/#9790/#9791 should check these env vars by
-name before asking the operator anything beyond "is Step 0 done yet" — a
-still-unresolved name here is the missing-credential case
-[`.loom/docs/credentials.md`](docs/credentials.md) describes, not a reason
-to fabricate a tenant.
+**Resolved 2026-10-01** against the fleet's own self-managed instance: the
+hosted trial runs on `gitea-1` (2am#1793 — Gitea 28.0.0, loopback-only; reach
+it on the host or via an SSH forward, not a cloud tenant). Each name resolves
+as follows — values live only in AWS SSM under `/gitea/*`, never in a repo or
+chat:
+
+| Env var | Resolves from |
+|---|---|
+| `GITEA_QUAL_INSTANCE_URL` | `http://127.0.0.1:3000` (non-secret; SSM `/gitea/gitea/api-url` records it) |
+| `GITEA_QUAL_ORG` | `qual-org` (disposable repo: `qual-org/loomp-test`; `forge-ci` is a write collaborator) |
+| `GITEA_QUAL_RUN_NS` | generated per run (`loomp-<unix-seconds>` default) |
+| `GITEA_QUAL_ADMIN_LOGIN` | `loom-bot` |
+| `GITEA_QUAL_ADMIN_TOKEN` | SSM `/gitea/loom-bot/admin-token` (admin-scoped; the plain `/gitea/loom-bot/token` predates it) |
+| `GITEA_QUAL_WRITER_LOGIN` | `forge-ci` |
+| `GITEA_QUAL_WRITER_TOKEN` | SSM `/gitea/forge-ci/token` |
+| `GITEA_QUAL_READONLY_LOGIN` | `qual-readonly` |
+| `GITEA_QUAL_READONLY_TOKEN` | SSM `/gitea/qual-readonly/token` |
+| `GITEA_QUAL_REVIEWER_LOGIN` | `qual-reviewer` |
+| `GITEA_QUAL_REVIEWER_TOKEN` | SSM `/gitea/qual-reviewer/token` |
+
+Boundary evidence (2026-10-01, on-host): writer `POST /repos/qual-org/loomp-test/issues`
+→ 201; read-only `POST` → 403. The writer SSH key row stays optional and
+unprovisioned — git-over-SSH checks belong to a later slice.
 
 If a task needs a credential not listed here, that is a **missing-credential**
 case per `.loom/docs/credentials.md` — ask the operator for the name, shape,
