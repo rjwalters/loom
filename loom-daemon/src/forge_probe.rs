@@ -598,6 +598,7 @@ fn walk_pages(
     max_pages: usize,
 ) -> std::result::Result<Vec<serde_json::Value>, ForgeOutcome> {
     let mut rows = Vec::new();
+    let mut first_page_first_id: Option<serde_json::Value> = None;
     for page in 1..=max_pages {
         // base_path may already carry a query string (state/type filters)
         let sep = if base_path.contains('?') { '&' } else { '?' };
@@ -636,6 +637,18 @@ fn walk_pages(
                 why: format!("list page {page} is not a JSON array: {}", truncate(&body)),
             })?;
         let done = arr.is_empty();
+        // gitea-1 (observed live 2026-10-01) ignores the page parameter on
+        // some endpoints (issue comments): every "next page" repeats page
+        // 1 — ids cannot repeat inside one list, so a repeated first row
+        // means the endpoint is unpaginated and page 1 was already the
+        // complete list.
+        if let Some(first) = arr.first().and_then(|r| r.get("id")).cloned() {
+            if page == 1 {
+                first_page_first_id = Some(first);
+            } else if first_page_first_id.as_ref() == Some(&first) {
+                return Ok(rows);
+            }
+        }
         rows.extend(arr);
         if done {
             return Ok(rows);
