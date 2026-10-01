@@ -86,7 +86,20 @@ ORDER BY heuristic, revision, kind, repo, horizon_bucket;
 -- Q2. Mean pinball loss per heuristic x kind, and per build. The pinball
 --     (quantile) loss over p25/p50/p75 is the proper scoring rule for a
 --     quantile forecast and the metric that decides a promotion.
+--
+--     `rolled_up` is how many of the three dimensions ROLLUP aggregated away
+--     in that row: 0 is a real (heuristic, kind, revision) group, 3 is the
+--     grand total. ROLLUP fills an aggregated column with the type's DEFAULT,
+--     which for these String columns is `''` — the same value
+--     `attributes_string['loom.eta.heuristic']` answers for a record whose
+--     heuristic attribute is missing. Without this column a subtotal row and a
+--     real group of unlabelled records are indistinguishable, and ROLLUP can
+--     emit two rows with the identical key `('', '', '')`: the grand total
+--     (`rolled_up` = 3) and the unlabelled heuristic's own total
+--     (`rolled_up` = 2). Observed, not theorised — see
+--     `loom-daemon/tests/signoz_eta_queries.rs`.
 SELECT heuristic, revision, kind,
+       grouping(heuristic) + grouping(kind) + grouping(revision) AS rolled_up,
        count() AS scored,
        round(avg(pinball_loss_sec)) AS mean_pinball_loss_sec,
        round(avg(abs_error_sec)) AS mae_sec,
@@ -114,13 +127,36 @@ ORDER BY heuristic, kind, revision;
 -- Q3. Feature ranking: which recorded feature tracks the error. Joins each
 --     scored outcome to its estimate on `loom.eta.estimate_id`, expands the
 --     estimate explanation's `features` object, and correlates every numeric
---     feature with the outcome's error. Only features that are numbers in the
---     JSON take part: `JSONExtractKeysAndValuesRaw` + `toFloat64OrNull` skips
---     nulls (unmeasured) and strings instead of reading them as 0, which the
---     typed `JSONExtractKeysAndValues(body, 'features', 'Float64')` would do —
---     an unmeasured feature must never correlate as a zero.
+--     feature with the outcome's error.
+--
+--     Only features that are JSON **numbers** take part.
+--     `JSONExtractKeysAndValuesRaw` hands back each value's raw text, so
+--     `toFloat64OrNull` answers NULL for `null` (unmeasured), for `"refactor"`
+--     (a string) and — the case that matters — for `"42"`, a number recorded
+--     as a string: the quotes are part of the raw text. `WHERE value IS NOT
+--     NULL` then drops the key entirely instead of ranking it.
+--     The typed `JSONExtractKeysAndValues(body, 'features', 'Float64')` does
+--     NOT merely risk reading an unmeasured feature as zero — measured on
+--     ClickHouse 25.12.5 it drops `null` and `"refactor"` outright, and
+--     *coerces* `"42"` to 42 and `true` to 1. That is the real damage: two
+--     features that are not numbers at all enter the ranking as constants.
+--
+--     `distinct_values` exists because a feature that never varied is NOT
+--     scored as uncorrelated. `rankCorr` average-ranks ties, so a
+--     single-valued feature over n observations comes out at exactly **0.5**,
+--     which `ORDER BY abs(rank_corr) DESC` ranks above any genuine
+--     correlation weaker than that; `corr` says `nan` for the same column.
+--     `distinct_values` = 1 is what tells the two apart. Do not read a 0.5
+--     without checking it.
+--
+--     One asymmetry worth knowing: the estimate sub-select carries the SAME
+--     `since` bound as the outcome one, so a scored outcome whose estimate was
+--     made before the window contributes to section 0, Q1 and Q2 but has no
+--     features here. Widen `since` past the longest lead time you care about
+--     before reading this section as complete.
 SELECT heuristic, revision, kind, feature,
        count() AS n,
+       uniqExact(value) AS distinct_values,
        round(rankCorr(value, error_sec), 3) AS rank_corr,
        round(corr(value, error_sec), 3) AS pearson_corr
 FROM (

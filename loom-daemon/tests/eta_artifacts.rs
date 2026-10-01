@@ -225,6 +225,46 @@ fn the_feature_ranking_query_matches_the_explanation_fixture() {
     assert!(QUERIES.contains("ON o.estimate_id = e.estimate_id"));
 }
 
+/// The two columns [`signoz_eta_queries.rs`] added after executing this file
+/// against the pinned ClickHouse (#8528). Each exists because of a
+/// *measured* way the engine answers plausibly rather than correctly, and
+/// neither is something a reader would reinstate from first principles once
+/// removed — so they are pinned here, in ordinary CI, rather than only in the
+/// Docker-gated proof.
+#[test]
+fn the_two_absence_disambiguating_columns_survive() {
+    // ROLLUP fills an aggregated column with the type's default, which for a
+    // String is `''` — the same value `attributes_string[...]` answers for a
+    // missing key. Observed: Q2 can emit TWO rows keyed ('', '', ''), the
+    // grand total and an unlabelled heuristic's own total.
+    assert!(
+        QUERIES.contains("grouping(heuristic) + grouping(kind) + grouping(revision) AS rolled_up"),
+        "Q2 must report how many dimensions ROLLUP aggregated away; without it \
+         a subtotal row and a real group of records with no `loom.eta.heuristic` \
+         are the same row"
+    );
+    // rankCorr average-ranks ties, so a constant feature scores exactly 0.5 —
+    // above any real correlation weaker than that, under the file's own
+    // `ORDER BY abs(rank_corr) DESC`.
+    assert!(
+        QUERIES.contains("uniqExact(value) AS distinct_values"),
+        "Q3 must report each feature's distinct value count: a feature that \
+         never varied is NOT scored as uncorrelated"
+    );
+    assert!(
+        QUERIES.contains("ORDER BY abs(rank_corr) DESC"),
+        "distinct_values is load-bearing precisely because the ranking is by \
+         absolute rank correlation; if that changes, re-derive the caveat"
+    );
+    for claim in ["distinct_values", "rolled_up"] {
+        assert!(
+            ETA_DOC.contains(claim),
+            "eta.md's Queries section must describe `{claim}` — the column is \
+             useless to a reader who does not know what it disambiguates"
+        );
+    }
+}
+
 /// `abandoned` outcomes and refusals are counted and never scored. Both
 /// halves have to hold at once: the mapping must omit the error fields
 /// (absent, not zero) and the queries must filter on their presence.
