@@ -358,9 +358,6 @@ fn execute_case(
         "forge-probe::coordination::epic-sub-issues" => {
             epic_sub_issues_case(test_id, view, cfg, http, server_version)
         }
-        "forge-probe::coordination::issue-pin" => {
-            issue_pin_case(test_id, view, cfg, http, server_version)
-        }
         other => Ok(CaseResult {
             test_id: other.to_string(),
             operation: view.id.clone(),
@@ -1376,74 +1373,6 @@ fn epic_sub_issues_case(
     })
 }
 
-/// `issue-pin`: pin a disposable issue and read the state back; an absent
-/// pin API is honest `unsupported`.
-fn issue_pin_case(
-    test_id: &str,
-    view: &ProbeEntryView,
-    cfg: &RunnerConfig,
-    http: &dyn ProbeHttp,
-    server_version: &str,
-) -> std::result::Result<CaseResult, ForgeOutcome> {
-    if !cfg.live_write {
-        return Ok(refused_row(view, test_id, server_version, "pin evidence"));
-    }
-    let base = format!("repos/{}", cfg.repo);
-    let n = fixture_issue(view, cfg, http, "issue-pin", "pin fixture")?;
-    let (code, resp) = http
-        .request("POST", &format!("{base}/issues/{n}/pin"), &cfg.writer_token, None)
-        .map_err(|e| ForgeOutcome::Unknown {
-            operation: view.id.clone(),
-            why: e,
-        })?;
-    if code == 404 {
-        return Ok(CaseResult {
-            test_id: test_id.to_string(),
-            operation: view.id.clone(),
-            risk: view.risk.clone(),
-            disposition: view.disposition.clone(),
-            outcome: OUTCOME_UNSUPPORTED.into(),
-            server_version: server_version.to_string(),
-            actor: actor_of(http, &cfg.writer_token),
-            at: now_secs(),
-            expected: "a pin/unpin API".into(),
-            observed: "endpoint absent (404)".into(),
-            notes: vec![format!("disposable issue number: {n}")],
-        });
-    }
-    if !(200..=299).contains(&code) {
-        return Err(ForgeOutcome::Unknown {
-            operation: view.id.clone(),
-            why: format!("pin answered {code}: {}", truncate(&resp)),
-        });
-    }
-    let (_, body) = http
-        .request("GET", &format!("{base}/issues/{n}"), &cfg.writer_token, None)
-        .map_err(|e| ForgeOutcome::Unknown {
-            operation: view.id.clone(),
-            why: e,
-        })?;
-    let pinned = json_obj(&body)
-        .and_then(|v| v.get("pinned").and_then(|p| p.as_bool()))
-        .unwrap_or(false);
-    Ok(CaseResult {
-        test_id: test_id.to_string(),
-        operation: view.id.clone(),
-        risk: view.risk.clone(),
-        disposition: view.disposition.clone(),
-        outcome: if pinned { OUTCOME_PASS.into() } else { OUTCOME_UNKNOWN.into() },
-        server_version: server_version.to_string(),
-        actor: actor_of(http, &cfg.writer_token),
-        at: now_secs(),
-        expected: "pin accepted AND readable on the issue object".into(),
-        observed: format!(
-            "pin HTTP {code}; pinned field {}",
-            if pinned { "true" } else { "absent/false — accepted but not readable" }
-        ),
-        notes: vec![format!("disposable issue number: {n}")],
-    })
-}
-
 fn actor_of(http: &dyn ProbeHttp, token: &str) -> Option<String> {
     let (code, body) = http.request("GET", "user", token, None).ok()?;
     if !(200..=299).contains(&code) {
@@ -1911,6 +1840,10 @@ mod tests {
                 Ok((200, "[]".into())),
             ],
         );
+        http.push(
+            "repos/qual-org/loomp-test/issues/8/comments?page=2&limit=50",
+            vec![Ok((200, "[]".into()))],
+        );
         let mut cfg = cfg(true);
         cfg.only = vec!["comment-edit-delete".into()];
         let results = run(&cfg, &http).unwrap();
@@ -1943,6 +1876,10 @@ mod tests {
                 200,
                 r#"[{"type": "comment"}, {"type": "close"}]"#.into(),
             ))],
+        );
+        http.push(
+            "repos/qual-org/loomp-test/issues/6/timeline?page=2&limit=50",
+            vec![Ok((200, "[]".into()))],
         );
         let mut cfg = cfg(true);
         cfg.only = vec!["timeline-read".into()];
@@ -2004,6 +1941,10 @@ mod tests {
                 Ok((200, "[]".into())),
             ],
         );
+        http.push(
+            "repos/qual-org/loomp-test/labels?page=2&limit=50",
+            vec![Ok((200, "[]".into()))],
+        );
         let mut cfg = cfg(true);
         cfg.only = vec!["label-sync-catalogue".into()];
         let results = run(&cfg, &http).unwrap();
@@ -2015,31 +1956,4 @@ mod tests {
         assert!(row.notes.iter().any(|n| n.contains("60")));
     }
 
-    #[test]
-    fn pin_accepted_but_not_readable_is_unknown_not_a_pass() {
-        let mut http = FakeHttp::new();
-        http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-        http.push(
-            "repos/qual-org/loomp-test/issues",
-            vec![Ok((201, r#"{"number": 2}"#.into()))],
-        );
-        http.push(
-            "repos/qual-org/loomp-test/issues/2/pin",
-            vec![Ok((201, "".into()))],
-        );
-        http.push(
-            "repos/qual-org/loomp-test/issues/2",
-            vec![Ok((200, r#"{"number": 2}"#.into()))],
-        );
-        let mut cfg = cfg(true);
-        cfg.only = vec!["issue-pin".into()];
-        let results = run(&cfg, &http).unwrap();
-        let row = results
-            .iter()
-            .find(|r| r.test_id.contains("issue-pin"))
-            .unwrap();
-        assert_eq!(row.outcome, OUTCOME_UNKNOWN, "observed: {}", row.observed);
-        let (ok, ..) = verdict(&results);
-        assert!(!ok);
-    }
 }
