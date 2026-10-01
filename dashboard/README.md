@@ -106,6 +106,37 @@ Every test runs inside the real Workers runtime (Miniflare) against an
 isolated in-memory D1 instance with `migrations/` applied — see
 `vitest.config.ts` / `test/apply-migrations.ts`.
 
+## Dependency security overrides
+
+`package.json` carries an `overrides` block (mirrored by
+`overridesRationale`) that exists only to keep `npm audit
+--audit-level=high` — the gate in `.github/workflows/ci-daily.yml` — clean.
+Nothing in it affects deployed Worker code: every pinned package is reached
+solely through the Miniflare/Wrangler **dev and test** toolchain.
+
+Why the pins are needed rather than a plain version bump
+(#9380): `@cloudflare/vitest-pool-workers` exact-pins its own
+`miniflare` and `wrangler` (`0.22.0` → `miniflare 5.20260815.0-alpha`,
+`wrangler 4.124.0`), and `0.22.0` is the newest release there is. Those
+exact pins drag in vulnerable leaves that upstream has already fixed in
+newer `miniflare` builds, so the override moves just the leaf forward
+instead of forcing a breaking pool-workers/Wrangler major.
+
+| Override | Floor | Clears |
+|---|---|---|
+| `sharp` | `^0.35.4` | GHSA-rgj7-g3m4-5g8c (bundled libheif GHSA-g89c-p67h-r497, GHSA-2jg2-4ch7-h545) |
+| `undici` | `^7.29.1` | GHSA-rfgv-xxqx-mfg5 and the nine other advisories fixed in 7.29.1 |
+
+Both floors match what `miniflare@5.20260930.0-alpha` depends on itself,
+so this is a forward pin to a vendor-blessed pairing, not a fork.
+
+**Re-check trigger**: when `@cloudflare/vitest-pool-workers` publishes a
+release whose transitive `sharp`/`undici` already satisfy these floors
+(check `npm view @cloudflare/vitest-pool-workers@latest dependencies`),
+drop the corresponding entry and confirm `npm audit --audit-level=high`
+still exits 0. Keep the block otherwise — removing an entry early makes
+the daily supply-chain job red, not the toolchain newer.
+
 ## Deploying your own instance
 
 The short version:

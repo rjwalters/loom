@@ -33,5 +33,10 @@
     "typescript": "^7.0.2",
     "vitest": "^4.1.0",
     "wrangler": "4.137.0"
+  },
+  "overridesRationale": "Security pins for transitive deps of the Miniflare/Wrangler dev+test toolchain (#9380). See README.md -> 'Dependency security overrides' before editing or removing an entry.",
+  "overrides": {
+    "sharp": "^0.35.4",
+    "undici": "^7.29.1"
   }
 }
