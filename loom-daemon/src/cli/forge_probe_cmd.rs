@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use loom_daemon::forge_probe::{run, verdict, LiveHttp, RunnerConfig};
 
@@ -61,28 +61,31 @@ pub(crate) struct ForgeProbeArgs {
 
 impl ForgeProbeArgs {
     pub(crate) fn run(self) -> Result<()> {
+        // "Could not run" is exit 2 per the forge-inventory family contract:
+        // config/credential gaps print to stderr and exit directly, never
+        // through main's error path (which is exit 1).
+        let missing = |name: &str| -> ! {
+            eprintln!(
+                "forge-probe: {name} did not resolve — the runbook's step-8 names must resolve first"
+            );
+            std::process::exit(2);
+        };
         let origin = match self.origin {
             Some(o) => o,
             None => match std::env::var("GITEA_QUAL_INSTANCE_URL") {
                 Ok(v) => v,
-                Err(_) => bail!(
-                    "forge-probe: no --origin and no $GITEA_QUAL_INSTANCE_URL — the runbook's step-8 names must resolve first"
-                ),
+                Err(_) => missing("no --origin and no $GITEA_QUAL_INSTANCE_URL"),
             },
         };
         let writer_token = match std::env::var("GITEA_QUAL_WRITER_TOKEN") {
             Ok(v) => v,
-            Err(_) => bail!(
-                "forge-probe: no $GITEA_QUAL_WRITER_TOKEN in the environment — the runbook's step-8 names must resolve first"
-            ),
+            Err(_) => missing("no $GITEA_QUAL_WRITER_TOKEN in the environment"),
         };
         let repo = match self.repo {
             Some(r) => r,
             None => match std::env::var("GITEA_QUAL_ORG") {
                 Ok(org) => format!("{org}/loomp-test"),
-                Err(_) => bail!(
-                    "forge-probe: no --repo and no $GITEA_QUAL_ORG — the runbook's step-8 names must resolve first"
-                ),
+                Err(_) => missing("no --repo and no $GITEA_QUAL_ORG"),
             },
         };
         let run_ns = match self.run_ns {
