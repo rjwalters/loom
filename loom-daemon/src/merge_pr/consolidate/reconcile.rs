@@ -5,9 +5,16 @@
 //! git repository: restart idempotency, "an unverified component stays open",
 //! and a failed label removal that must not claim a release.
 //!
-//! Order per component: verify inclusion → status → release → close PR →
-//! close declared issues; then the candidate branch, last. Every step
-//! re-reads live state before acting, and this verb never merges.
+//! Order per component: verify inclusion and the live head → status →
+//! observe the reservation → close PR → close declared issues; then the
+//! candidate branch, last. Every step re-reads live state before acting,
+//! and this verb never merges.
+//!
+//! It never releases a reservation either. ADR-0023 §4 (revised 2026-10-01)
+//! makes the ordering pass the ONE releaser on landing: predecessor merged at
+//! the recorded head ⇒ `CLEAR` ⇒ `Release`. Step 4 only records whether each
+//! hold label is still on; reconciliation neither removes it nor waits for
+//! it, and a `loom:sequenced` label on a closed PR is inert.
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -16,10 +23,10 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use super::{
-    component_close_body, inclusion_verified, issue_close_body, landing_release_body,
-    parse_mapping, status_comment_body, status_present, SEQUENCE_LABEL,
+    component_close_body, inclusion_verified, issue_close_body, parse_mapping, status_comment_body,
+    status_present, untouched_open_body, untouched_status_marker, SEQUENCE_LABEL,
 };
-use crate::merge_pr::sequence::{fetch_trusted_bodies, parse_live};
+use crate::merge_pr::sequence::fetch_trusted_bodies;
 
 /// What happened to the candidate branch (step 7).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,11 +61,16 @@ pub fn branch_cleanup_outcome(success: bool, stderr: &str) -> BranchCleanup {
 pub struct ReconcileReport {
     pub candidate: u32,
     pub statuses: usize,
-    pub released: usize,
-    /// Components whose `loom:sequenced` label could not be removed. No
-    /// release comment was posted for them (the comment would claim a release
-    /// that did not happen); a re-run retries.
-    pub release_failed: Vec<u32>,
+    /// Components still carrying `loom:sequenced` when this run looked
+    /// (observe-only, ADR-0023 §6 step 4): the ordering pass has not released
+    /// them yet. Not a failure: the pass releases on a later tick.
+    pub holds_pending_release: Vec<u32>,
+    /// Components pushed after the candidate landed: `untouched-open` status,
+    /// left open with their issues (ADR-0023 §6.2). An end state, not a failure.
+    pub untouched_open: Vec<u32>,
+    /// Components whose transcript or live head could not be read: nothing
+    /// was written to them, and a re-run retries.
+    pub unread: Vec<u32>,
     pub closed_prs: usize,
     pub closed_issues: usize,
     /// Components whose pinned head is not an ancestor of the recorded
@@ -71,7 +83,7 @@ impl ReconcileReport {
     /// Every step reached its end state (the verb's exit status).
     #[must_use]
     pub fn complete(&self) -> bool {
-        self.release_failed.is_empty()
+        self.unread.is_empty()
             && self.unverified.is_empty()
             && !matches!(self.branch, BranchCleanup::Failed(_))
     }
@@ -85,9 +97,15 @@ impl ReconcileReport {
             BranchCleanup::Failed(e) => format!("delete FAILED ({e})"),
         };
         format!(
-            "Reconciled candidate #{}: {} status(es) posted, {} reservation(s) released, {} \
-             component PR(s) closed, {} linked issue(s) closed, branch {branch}",
-            self.candidate, self.statuses, self.released, self.closed_prs, self.closed_issues
+            "Reconciled candidate #{}: {} status(es) posted, {} component PR(s) closed, {} \
+             linked issue(s) closed, {} left untouched-open, {} hold(s) awaiting the ordering \
+             pass's release, branch {branch}",
+            self.candidate,
+            self.statuses,
+            self.closed_prs,
+            self.closed_issues,
+            self.untouched_open.len(),
+            self.holds_pending_release.len()
         )
     }
 }
@@ -178,8 +196,9 @@ pub fn reconcile(gh: &Path, git: &str, root: &Path, candidate: u32) -> Result<Re
     let mut report = ReconcileReport {
         candidate,
         statuses: 0,
-        released: 0,
-        release_failed: Vec::new(),
+        holds_pending_release: Vec::new(),
+        untouched_open: Vec::new(),
+        unread: Vec::new(),
         closed_prs: 0,
         closed_issues: 0,
         unverified: Vec::new(),
@@ -194,34 +213,76 @@ pub fn reconcile(gh: &Path, git: &str, root: &Path, candidate: u32) -> Result<Re
         }
         let n = number.to_string();
 
+        // The transcript backs the status ledger. An unreadable one stops this
+        // component (nothing written) rather than re-posting blind.
+        let Some(bodies) = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", *number) else {
+            report.unread.push(*number);
+            continue;
+        };
+
+        // 2. The source's LIVE head against its pin (ADR-0023 §6.2). A push
+        // after landing is past the abort point: the landed pin is on the
+        // default branch, the newer commits are not, so the PR is left open
+        // with an `untouched-open` status and its issues stay open.
+        let Some(live_head) = read(
+            gh,
+            root,
+            &[
+                "pr",
+                "view",
+                &n,
+                "--json",
+                "headRefOid",
+                "--jq",
+                ".headRefOid",
+            ],
+        )?
+        else {
+            report.unread.push(*number);
+            continue;
+        };
+        if live_head != *pinned_head {
+            let marker = untouched_status_marker(candidate, *number);
+            if !bodies.iter().any(|b| b.contains(&marker)) {
+                let body = untouched_open_body(
+                    *number,
+                    candidate,
+                    &merge_sha,
+                    pinned_head,
+                    &mapping.attempt,
+                );
+                write(gh, root, &["pr", "comment", &n, "--body", &body], "status comment")?;
+                report.statuses += 1;
+            }
+            report.untouched_open.push(*number);
+            continue;
+        }
+
         // 3. Status (idempotent by ledger marker).
-        let bodies =
-            fetch_trusted_bodies(&bin, root, "{owner}/{repo}", *number).unwrap_or_default();
         if !status_present(&bodies, candidate, *number) {
             let body = status_comment_body(*number, candidate, &merge_sha, &mapping.attempt);
             write(gh, root, &["pr", "comment", &n, "--body", &body], "status comment")?;
             report.statuses += 1;
         }
 
-        // 4. Release THIS attempt's reservation — only while the history says
-        // it is still in force (a prior run's release tombstone ends it, so a
-        // re-run does not release twice). Label first; the comment only after
-        // the label is actually off, or it would claim a release that did not
-        // happen.
-        if let Some(marker) = parse_live(&bodies).filter(|m| m.plan == mapping.attempt) {
-            let out = run(gh, root, &["pr", "edit", &n, "--remove-label", SEQUENCE_LABEL])?;
-            if out.status.success() {
-                let body = landing_release_body(&marker, &mapping.attempt);
-                write(gh, root, &["pr", "comment", &n, "--body", &body], "release comment")?;
-                report.released += 1;
-            } else {
-                eprintln!(
-                    "consolidate-reconcile: removing {SEQUENCE_LABEL} from #{n} failed — no \
-                     release recorded; re-run to retry: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-                report.release_failed.push(*number);
-            }
+        // 4. Observe the reservation (no write). The ordering pass releases
+        // it on `CLEAR`; whether it has yet only goes in the report.
+        if read(
+            gh,
+            root,
+            &[
+                "pr",
+                "view",
+                &n,
+                "--json",
+                "labels",
+                "--jq",
+                ".labels[].name",
+            ],
+        )?
+        .is_some_and(|labels| labels.lines().any(|l| l.trim() == SEQUENCE_LABEL))
+        {
+            report.holds_pending_release.push(*number);
         }
 
         // 5. Close the component PR (idempotent — only an OPEN PR is closed).

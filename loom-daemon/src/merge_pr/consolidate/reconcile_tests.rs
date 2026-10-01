@@ -19,8 +19,9 @@ const MERGE_SHA: &str = "c0ffee0000000000000000000000000000000001";
 /// A stub `gh` whose forge state lives in `state/`:
 /// `comments-<n>/*.json` (one comment array per file, concatenated on read —
 /// the paginated listing shape), `pr-<n>.state`, `pr-<n>.body`,
-/// `issue-<n>.state`, `cand.json`, `fail-label-<n>` (label edit fails),
-/// `branch-gone`. Every invocation is appended to `state/log`.
+/// `pr-<n>.head` (live head), `pr-<n>.labels` (one per line),
+/// `issue-<n>.state`, `cand.json`, `branch-gone`. Every invocation is
+/// appended to `state/log`.
 const FAKE_GH: &str = r#"#!/usr/bin/env bash
 S="@STATE@"
 printf '%s\n' "$*" >> "$S/log"
@@ -36,12 +37,12 @@ case "$1 $2" in
     case "$5" in
       state) cat "$S/pr-$3.state" ;;
       body) cat "$S/pr-$3.body" ;;
+      headRefOid) cat "$S/pr-$3.head" ;;
+      labels) cat "$S/pr-$3.labels" ;;
     esac
     exit 0 ;;
   "pr comment") record "$3" "$5"; exit 0 ;;
-  "pr edit")
-    if [ -e "$S/fail-label-$3" ]; then echo "HTTP 403: Resource not accessible" >&2; exit 1; fi
-    exit 0 ;;
+  "pr edit") exit 0 ;;
   "pr close") echo CLOSED > "$S/pr-$3.state"; record "$3" "$5"; exit 0 ;;
   "issue view") cat "$S/issue-$3.state"; exit 0 ;;
   "issue close") echo CLOSED > "$S/issue-$3.state"; exit 0 ;;
@@ -166,6 +167,8 @@ impl Fixture {
             }]);
             self.put(&format!("comments-{n}/000.json"), &listing.to_string());
             self.put(&format!("pr-{n}.state"), "OPEN\n");
+            self.put(&format!("pr-{n}.head"), &format!("{head}\n"));
+            self.put(&format!("pr-{n}.labels"), &format!("{SEQUENCE_LABEL}\n"));
             self.put(&format!("pr-{n}.body"), &format!("Closes #{}\n", 500 + n));
             self.put(&format!("issue-{}.state", 500 + n), "OPEN\n");
         }
@@ -217,19 +220,15 @@ fn a_full_run_reconciles_every_step_and_a_restart_writes_nothing() {
     f.seed(&[(10, &f.a), (12, &f.b)]);
 
     let first = f.run();
-    assert_eq!(
-        (first.statuses, first.released, first.closed_prs, first.closed_issues),
-        (2, 2, 2, 2),
-        "{first:?}"
-    );
+    assert_eq!((first.statuses, first.closed_prs, first.closed_issues), (2, 2, 2), "{first:?}");
     assert_eq!(first.branch, BranchCleanup::Deleted);
     assert!(first.complete(), "{first:?}");
+    assert_eq!(first.holds_pending_release, vec![10, 12], "observed, not released");
     for n in [10, 12] {
         assert_eq!(f.state_of(&format!("pr-{n}.state")), "CLOSED");
         assert_eq!(f.state_of(&format!("issue-{}.state", 500 + n)), "CLOSED");
         let c = f.comments(n);
         assert!(c.contains(MERGE_SHA), "closure must carry the merge SHA: {c}");
-        assert!(c.contains(&format!("released plan={ATTEMPT}")), "{c}");
     }
 
     // Restart after a completed run: finishes bookkeeping that is already
@@ -237,8 +236,8 @@ fn a_full_run_reconciles_every_step_and_a_restart_writes_nothing() {
     let writes_before = f.writes().len();
     let second = f.run();
     assert_eq!(
-        (second.statuses, second.released, second.closed_prs, second.closed_issues),
-        (0, 0, 0, 0),
+        (second.statuses, second.closed_prs, second.closed_issues),
+        (0, 0, 0),
         "a restart must not repeat any step: {second:?}"
     );
     assert_eq!(second.branch, BranchCleanup::AlreadyGone, "already-deleted is not a failure");
@@ -273,27 +272,60 @@ fn an_unverified_component_stays_open_and_untouched() {
 }
 
 #[test]
-fn a_failed_label_removal_posts_no_release_and_a_rerun_retries() {
+fn reconciliation_never_releases_a_reservation() {
+    // ADR-0023 §4 (revised 2026-10-01): the ordering pass is the ONE releaser
+    // on landing. Reconciliation removes no label and posts no release
+    // tombstone, whether or not the pass has released yet.
     let f = Fixture::new();
     f.seed(&[(10, &f.a), (12, &f.b)]);
-    f.put("fail-label-10", "");
+    // The pass already released #10; #12 still carries its hold.
+    f.put("pr-10.labels", "");
 
-    let first = f.run();
-    assert_eq!(first.release_failed, vec![10]);
-    assert_eq!(first.released, 1, "#12's release is unaffected");
-    assert!(!first.complete());
+    let report = f.run();
+    assert!(report.complete(), "a pending release is not a failure: {report:?}");
+    assert_eq!(report.holds_pending_release, vec![12]);
     assert!(
-        !f.comments(10).contains("released plan="),
-        "no release may be claimed while the label is still on: {}",
-        f.comments(10)
+        !f.writes().iter().any(|w| w.starts_with("pr edit")),
+        "reconciliation must not touch labels: {:?}",
+        f.writes()
     );
+    for n in [10, 12] {
+        assert!(
+            !f.comments(n).contains("loom:sequence released"),
+            "reconciliation must not post a release: {}",
+            f.comments(n)
+        );
+        // Closed regardless of the label state (the label on a closed PR is
+        // inert; reconciliation does not wait for the pass).
+        assert_eq!(f.state_of(&format!("pr-{n}.state")), "CLOSED");
+    }
+}
 
-    std::fs::remove_file(f.state.join("fail-label-10")).unwrap();
-    let retry = f.run();
-    assert_eq!(retry.released, 1, "the retry releases #10 only: {retry:?}");
-    assert!(retry.release_failed.is_empty());
-    assert!(f.comments(10).contains(&format!("released plan={ATTEMPT}")));
-    assert_eq!(f.comments(12).matches("released plan=").count(), 1, "#12 not released twice");
+#[test]
+fn a_source_pushed_after_landing_is_left_untouched_open() {
+    // ADR-0023 §6.2: the landed pin is on main, the newer commits are not.
+    // Past the abort point, so not an abort: status `untouched-open`, the PR
+    // and its declared issue stay open.
+    let f = Fixture::new();
+    f.seed(&[(10, &f.a), (12, &f.b)]);
+    f.put("pr-12.head", &format!("{}\n", f.late));
+
+    let report = f.run();
+    assert_eq!(report.untouched_open, vec![12], "{report:?}");
+    assert!(report.complete(), "untouched-open is an end state: {report:?}");
+    assert_eq!(f.state_of("pr-12.state"), "OPEN");
+    assert_eq!(f.state_of("issue-512.state"), "OPEN");
+    let c = f.comments(12);
+    assert!(c.contains("status=untouched-open"), "{c}");
+    assert!(c.contains(&f.b), "the status names the pinned head that landed: {c}");
+    assert!(!c.contains("merged-into #"), "never recorded as merged-into: {c}");
+    // The sibling at its pin is reconciled normally.
+    assert_eq!(f.state_of("pr-10.state"), "CLOSED");
+
+    // Idempotent: a re-run posts no second untouched-open status.
+    let again = f.run();
+    assert_eq!(again.statuses, 0, "{again:?}");
+    assert_eq!(f.comments(12).matches("status=untouched-open").count(), 1);
 }
 
 #[test]

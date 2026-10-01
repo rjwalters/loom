@@ -1023,9 +1023,11 @@ pub enum PrepareOutcome {
 //
 // The candidate merges through the canonical merge-pr.sh path — never here.
 // What this section owns is everything AFTER a verified landing: per-component
-// status, reservation release, component closure, linked-issue closure, and
-// branch cleanup, in that order, each step idempotent (re-read before acting)
-// so a crash anywhere leaves a state the next run continues from.
+// status, component closure, linked-issue closure, and branch cleanup, in that
+// order, each step idempotent (re-read before acting) so a crash anywhere
+// leaves a state the next run continues from. Releasing the reservations is
+// NOT here: ADR-0023 §4 makes the ordering pass the one releaser on landing
+// (`CLEAR` ⇒ `Release`); reconciliation only observes it (§6 step 4).
 
 /// The per-component status marker: presence = this component's landing
 /// status is durably recorded (the reconciliation ledger entry).
@@ -1089,19 +1091,41 @@ pub fn inclusion_verified(
     matches!(out, Ok(s) if s.success())
 }
 
-/// The landing-release comment — the reservation's subject landed.
+/// The ledger marker for a source pushed after the candidate landed
+/// (ADR-0023 §6.2): distinct from [`status_marker`], so a source that later
+/// returns to its pin is not mistaken for one already reconciled.
 #[must_use]
-pub fn landing_release_body(marker: &SequenceMarker, attempt: &str) -> String {
+pub fn untouched_status_marker(candidate_pr: u32, component: u32) -> String {
     format!(
-        "{}\n\
-         **Consolidation candidate #{} landed** — this component's diff is contained in the \
-         combined merge, so its reservation is released and the landing reconciliation \
-         (status, closure, linked issues) proceeds. (ADR-0023 §6, attempt `{}`)\n\n\
+        "<!-- {CONSOLIDATION_PREFIX}-status candidate={candidate_pr} component={component} \
+         status=untouched-open -->"
+    )
+}
+
+/// The `untouched-open` status comment: the candidate landed this PR's
+/// PINNED head, but the PR has moved since, so it is not closed and its
+/// linked issues stay open. A push after landing is past the abort point.
+#[must_use]
+pub fn untouched_open_body(
+    component: u32,
+    candidate_pr: u32,
+    merge_sha: &str,
+    pinned_head: &str,
+    attempt: &str,
+) -> String {
+    format!(
+        "{}\n**Left open: pushed after its consolidation landed.** Candidate #{} (attempt \
+         `{}`) landed this PR's pinned head `{}` in the combined merge `{}`. This PR's head has \
+         moved since, so the commits after the pin are NOT on the default branch: the PR stays \
+         open as an ordinary PR, and its linked issues stay open.\n\n\
+         Status: `untouched-open` (ADR-0023 §6.2).\n\n\
          ---\n\
          *Automated by loom-daemon merge-pr consolidate-reconcile (#9689)*",
-        release_marker_text(&marker.plan),
-        marker.after,
-        attempt
+        untouched_status_marker(candidate_pr, component),
+        candidate_pr,
+        attempt,
+        pinned_head,
+        merge_sha
     )
 }
 

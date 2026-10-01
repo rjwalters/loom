@@ -27,7 +27,8 @@
 //!   reconciliation territory). A released reservation no longer counts
 //!   against eligibility (`live_marker`).
 //! - `consolidate-reconcile` (#9689) finishes a MERGED candidate's
-//!   bookkeeping; it never merges.
+//!   bookkeeping; it never merges and never releases a reservation (the
+//!   ordering pass is the one releaser on landing, ADR-0023 §4).
 //! - Every `gh` call honors `--repo`/`LOOM_REPO` and the per-root credential.
 
 use anyhow::{bail, Context, Result};
@@ -232,7 +233,7 @@ impl ConsolidateReconcileArgs {
         let root = std::env::current_dir()?;
         let gh = std::path::PathBuf::from(cons::gh_bin_env());
         // The orchestration lives in the library so it runs under test
-        // end-to-end (restart, unverified component, failed release).
+        // end-to-end (restart, unverified component, pushed source).
         let report = cons::reconcile::reconcile(&gh, "git", &root, self.pr)?;
         println!("{}", report.summary());
         if !report.unverified.is_empty() {
@@ -242,11 +243,18 @@ impl ConsolidateReconcileArgs {
                 report.unverified
             );
         }
-        if !report.release_failed.is_empty() {
+        if !report.unread.is_empty() {
             eprintln!(
-                "Reservation release FAILED (label still on; no release recorded) — re-run to \
-                 retry: {:?}",
-                report.release_failed
+                "Could not read the transcript or live head (nothing written to them) — re-run \
+                 to retry: {:?}",
+                report.unread
+            );
+        }
+        if !report.untouched_open.is_empty() {
+            eprintln!(
+                "Pushed after landing — left open with an untouched-open status (ADR-0023 §6.2): \
+                 {:?}",
+                report.untouched_open
             );
         }
         if !report.complete() {
