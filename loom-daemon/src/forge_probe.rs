@@ -620,7 +620,12 @@ fn walk_pages(
         }
         let arr = json_obj(&body)
             .and_then(|v| {
-                if v.is_array() {
+                // Gitea answers JSON `null` (not []) on out-of-range pages
+                // for some endpoints (timeline, observed live 2026-10-01) —
+                // null is an empty page, not a malformed one.
+                if v.is_null() {
+                    Some(Vec::new())
+                } else if v.is_array() {
                     v.as_array().cloned()
                 } else {
                     v.get("data").and_then(|d| d.as_array().cloned())
@@ -688,7 +693,30 @@ fn comment_list_ordered(
             });
         }
     }
-    let rows = walk_pages(view, http, &cfg.writer_token, &format!("{base}/{n}/comments"), 1, 5)?;
+    // The manifest row is complete-required. gitea-1 (observed live,
+    // 2026-10-01) IGNORES the page parameter on this endpoint and returns
+    // the full list in one response — that satisfies complete-by-
+    // construction, and the probe records the shape rather than pretending
+    // it walked pages.
+    let rows = walk_pages(view, http, &cfg.writer_token, &format!("{base}/{n}/comments"), 50, 3)?;
+    // Page-ignored detection: on a paginated endpoint page 2 starts with a
+    // DIFFERENT row; an endpoint that ignores `page` repeats page 1.
+    let (p2code, p2body) = http
+        .request(
+            "GET",
+            &format!("{base}/{n}/comments?page=2&limit=50"),
+            &cfg.writer_token,
+            None,
+        )
+        .unwrap_or((0, String::new()));
+    let p2_first = json_obj(&p2body)
+        .filter(|v| !v.is_null())
+        .and_then(|v| {
+            v.as_array()
+                .and_then(|a| a.first().and_then(|c| c.get("id").map(|i| i.to_string())))
+        });
+    let page_ignored = p2_first.is_some()
+        && p2_first == rows.first().and_then(|c| c.get("id").map(|i| i.to_string()));
     let bodies: Vec<String> = rows
         .iter()
         .filter_map(|c| c.get("body").and_then(|b| b.as_str()).map(String::from))
@@ -725,14 +753,20 @@ fn comment_list_ordered(
             "comments in creation order [{marker1}, {marker2}] with updated_at on every row, complete pagination"
         ),
         observed: format!(
-            "{} row(s) walked; order {} ; updated_at on {with_updated}/{}",
+            "{} row(s); order {} ; updated_at on {with_updated}/{}; pagination: {}",
             rows.len(),
             if order_ok { "preserved" } else { "BROKEN" },
-            rows.len()
+            rows.len(),
+            if page_ignored {
+                "page param IGNORED — complete list in one response (complete by construction)"
+            } else {
+                "walked to exhaustion"
+            }
         ),
         notes: vec![
             format!("disposable issue number: {n}"),
             format!("comment ids: [{}]", ids.join(", ")),
+            "the truncated-first-page risk from #9777 does not apply while the endpoint is unpaginated; re-probe if Gitea adds paging".into(),
         ],
     })
 }
@@ -752,13 +786,17 @@ fn issue_list_paged(
     }
     let n1 = fixture_issue(view, cfg, http, "issue-list", "issue-list fixture one")?;
     let n2 = fixture_issue(view, cfg, http, "issue-list", "issue-list fixture two")?;
+    // limit=20/25-page cap: the disposable repo accumulates prior runs'
+    // fixtures, so the walk must be able to exhaust hundreds of rows while
+    // still terminating; several pages at this size still demonstrates
+    // multi-page pagination.
     let rows = walk_pages(
         view,
         http,
         &cfg.writer_token,
         &format!("repos/{}/issues?state=all&type=issues", cfg.repo),
-        1,
-        5,
+        20,
+        25,
     )?;
     let numbers: Vec<u64> = rows
         .iter()
@@ -1697,21 +1735,21 @@ mod tests {
             ],
         );
         http.push(
-            "repos/qual-org/loomp-test/issues/9/comments?page=1&limit=1",
+            "repos/qual-org/loomp-test/issues/9/comments?page=1&limit=50",
             vec![Ok((
                 200,
                 r#"[{"id": 101, "body": "probe-c1-loomp-testrun", "updated_at": "2026-10-01T00:00:00Z"}]"#.into(),
             ))],
         );
         http.push(
-            "repos/qual-org/loomp-test/issues/9/comments?page=2&limit=1",
+            "repos/qual-org/loomp-test/issues/9/comments?page=2&limit=50",
             vec![Ok((
                 200,
                 r#"[{"id": 102, "body": "probe-c2-loomp-testrun", "updated_at": "2026-10-01T00:00:01Z"}]"#.into(),
             ))],
         );
         http.push(
-            "repos/qual-org/loomp-test/issues/9/comments?page=3&limit=1",
+            "repos/qual-org/loomp-test/issues/9/comments?page=3&limit=50",
             vec![Ok((200, "[]".into()))],
         );
         let mut cfg = cfg(true);
@@ -1739,11 +1777,11 @@ mod tests {
             ],
         );
         http.push(
-            "repos/qual-org/loomp-test/issues?state=all&type=issues&page=1&limit=1",
+            "repos/qual-org/loomp-test/issues?state=all&type=issues&page=1&limit=20",
             vec![Ok((200, r#"[{"number": 21}]"#.into()))],
         );
         http.push(
-            "repos/qual-org/loomp-test/issues?state=all&type=issues&page=2&limit=1",
+            "repos/qual-org/loomp-test/issues?state=all&type=issues&page=2&limit=20",
             vec![Err("connection reset mid-page".into())],
         );
         let mut cfg = cfg(true);
