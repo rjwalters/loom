@@ -224,8 +224,30 @@ re-transcribing its embedded query. Both it and `queue-dwell.sql` are
 vocabulary-guarded by `signoz_trial_artifacts.rs` exactly like the fixture
 queries above: a `metric_name` or label the emitting code no longer produces,
 or the gateway's DATAPOINT `keep_keys` allowlist no longer forwards, fails
-ordinary CI instead of the saved view quietly going empty. Neither has been
-executed against a live SigNoz; see `evidence.md`'s acceptance ledger.
+ordinary CI instead of the saved view quietly going empty.
+
+All five queries are additionally **executed verbatim** against the pinned
+ClickHouse the telemetry store runs, by
+`loom-daemon/tests/signoz_queue_quota_queries.rs`. That run is what establishes
+the two properties this family is easiest to get wrong, both named in the file's
+own header:
+
+- **`time_series_v4` holds one row per series per hour**, so `USING
+  (fingerprint)` multiplies every data point by that series' hour-row count.
+  Queries 1–3 take `max()` and absorb it; query 4 sums and must join a
+  de-duplicated fingerprint set. The test runs the naive join as a
+  counterfactual and observes it double query 4's wait-seconds total.
+- **A measured zero is not starvation.** A host reporting
+  `loom.queue.starved` = 0 is dropped by `HAVING starved > 0` rather than
+  reported as a starved host with a zero; and a `loom.queue.dispatch_wait`
+  with no `.samples` companion series yields a NULL mean through
+  `nullIf(dispatches, 0)`, never 0 and never a division error.
+
+Query 5's span reads are covered too, including the documented fallback: a
+pre-#9673 halted row has no `loom.queue.halt_cause` key at all, the column
+reads `''` rather than erroring, and joining to the parent
+`loom.dispatch.tick` recovers `halted_main_red`. Not yet executed against a
+live SigNoz over real canary data; see `evidence.md`'s acceptance ledger.
 
 ### Quota utilization queries
 
@@ -242,8 +264,25 @@ and note the same `signoz_trial_artifacts.rs` vocabulary guard applies:
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < quota-utilization.sql
 ```
 
-Verified against a local `clickhouse-local` with a mock `samples_v4` /
-`time_series_v4` shape, not yet against a live SigNoz.
+All three queries are **executed verbatim** against the pinned ClickHouse the
+telemetry store runs, by `loom-daemon/tests/signoz_queue_quota_queries.rs` —
+which replaces an earlier ad-hoc `clickhouse-local` session whose fixture and
+output were never committed, so nothing re-ran it. The run is what establishes
+the file's absent-is-not-zero claims as observations:
+
+- An account with a weekly reading but no 5-hour reading comes back
+  `util_5h = NULL`. The plain `maxIf()` the header warns about answers `0.0`
+  instead — "used none of its 5h window", a measurement never taken.
+- A pre-reset reading above 1.0 clamps to **zero** idle headroom via
+  `least(prev_value, 1)`; without the clamp it reads `-0.05`.
+- A provider whose accounts report only `loom.tokens.exhausted` (no
+  utilization source at all) still appears, with `accounts_measured = 0`,
+  `coverage = 'unknown'` and NULL fractions. The query 3 `pool` LEFT JOIN is
+  load-bearing for this: an inner join drops the provider's row entirely, and
+  a `0`/`1.0` there would read as a completely idle subscription with free
+  capacity to dispatch into — the exact inversion of an exhausted account.
+
+Not yet executed against a live SigNoz over real canary data.
 
 ### Measured usage queries
 
