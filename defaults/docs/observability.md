@@ -150,7 +150,11 @@ Every push is a batch of versioned `TelemetryEnvelope`s
 `sweep.started`, `sweep.phase`, `sweep.completed`, `sweep.outcome`
 (repo-scoped, each carrying a `visibility: public|private` tag derived from
 the forge, private-by-default and private-safe-by-construction),
-`tokens.snapshot`, `host.health` (host-level, no repo/visibility). Full
+`tokens.snapshot`, `host.health` (host-level, no repo/visibility). Per-session
+kinds ride the same envelope: `session.summary`, `session.analysis`,
+`session.output` (#9764 — bounded live output chunks **while a run is still
+active**, gateway-scrubbed, opt-in via
+`autonomous.transcriptIngest.liveOutput.enabled`, default off). Full
 field-by-field reference, the `visibility` anti-leak contract, and the local
 `sweep-outcome-telemetry.jsonl` journal (kept **regardless of whether any
 exporter is configured**):

@@ -269,8 +269,19 @@ falling back to the cwd basename, which had made every row unjoinable.
 Issue #8825 (CI telemetry, phase 2) adds a fourth, `ci.job.log`: one ≤ 8 KiB
 chunk of a completed job's log, with `loom.ci.chunk_index`,
 `loom.ci.chunk_count`, `loom.ci.log_bytes_total`, `loom.ci.truncated` and
-`loom.ci.truncation_note` joining the log allowlist. It is the only kind whose
-**body** is free text, and the reason `transform/ci_log_redaction` exists —
+`loom.ci.truncation_note` joining the log allowlist. It was the first kind
+whose **body** is free text, and the reason `transform/ci_log_redaction`
+exists.
+
+Issue #9764 adds the second free-text kind and the record kinds above gain
+their live counterpart: `session.output` — bounded ≤ 8 KiB chunks of an
+**active** agent session's transcript output, emitted by a fast-tick daemon
+thread while the run is still in flight (default **off**; opt in with
+`autonomous.transcriptIngest.liveOutput.enabled`). The `loom.output.*` chunk
+keys join the log allowlist, `transform/session_output_redaction` scrubs the
+body with the same class list under the kind's own marker, and the daemon
+emitter shares the `session.summary` join keys (`loom.repo`/`loom.issue`/
+`loom.role`/`loom.runtime`/`loom.session_kind`, resolved once per session) —
 see ["Privacy and remote deployment"](#privacy-and-remote-deployment).
 
 Issue #8824 (CI telemetry, phase 1) adds three record kinds — `ci.run`,

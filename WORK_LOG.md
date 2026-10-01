@@ -6,6 +6,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-10-01
+- **Issue #9764**: feat(observability): stream issue-scoped agent output live — the `session.output` telemetry record kind, emitter, config knobs, gateway scrub stage and docs
 ### 2026-09-30
 - **Issue #9045** (closed): Doctor: Priority 1 conflict query doesn't exclude loom:operator-only/-decision, only loom:operator
 - **Issue #9686** (closed): Champion: automatically order overlapping PRs and defer redundant base repairs (9063 first release)

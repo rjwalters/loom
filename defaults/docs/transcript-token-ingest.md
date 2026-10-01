@@ -50,19 +50,25 @@ follows:
 | `autonomous.transcriptIngest.enabled` | `LOOM_TRANSCRIPT_INGEST` | `true` | Master on/off. Env `0`/`false`/`no`/`off` opts this host **out**; `1`/`true`/`yes`/`on` forces it on over a config `false`. An unrecognized value falls through to config/default rather than silently disabling |
 | `autonomous.transcriptIngest.intervalSecs` | `LOOM_TRANSCRIPT_INGEST_INTERVAL` | `900` | Seconds between passes. Zero/invalid → default |
 | `autonomous.transcriptIngest.windowHours` | `LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS` | `24` | How far back each pass looks; `0` = full history (still cheap after the first pass, thanks to the ledger) |
+| `autonomous.transcriptIngest.liveOutput.enabled` | `LOOM_TRANSCRIPT_OUTPUT` | `false` | **Live `session.output` emission (#9764), default off** — the FLAGS-OFF polarity, deliberately the opposite of `enabled` above: this forwards bounded transcript *text* to the observability sink, which is a privacy decision an operator makes on purpose, not a local bookkeeping write. Requires an `observability` exporter to be configured (otherwise nothing is emitted) |
+| `autonomous.transcriptIngest.liveOutput.intervalSecs` | `LOOM_TRANSCRIPT_OUTPUT_INTERVAL` | `30` | Seconds between live-output ticks, floored at `15` (the durable queue re-persists its whole contents per push, so a faster tick would spend the tick re-persisting). A 30 s tick plus the exporter's own flush cadence is the #9764 producer budget for its ≤ 10 s source-to-visible target — tune both together |
+| `autonomous.transcriptIngest.liveOutput.maxBytesPerSession` | `LOOM_TRANSCRIPT_OUTPUT_MAX_BYTES` | `5242880` | Per-session cap on forwarded output **text** (bytes). Once hit, the session's chunks carry `truncated: true` and `output_bytes_total` keeps counting what was dropped, so the gap stays explicit. Mirrors `ciTelemetry.logCaptureMaxBytes` |
 
 ```json
 {
   "autonomous": {
-    "transcriptIngest": { "enabled": false }
+    "transcriptIngest": {
+      "enabled": false,
+      "liveOutput": { "enabled": true, "intervalSecs": 30 }
+    }
   }
 }
 ```
 
-**Restart required** for all three: they are resolved once, during daemon
+**Restart required** for all of them: they are resolved once, during daemon
 bring-up, and frozen for the life of the process (`try_init_transcript_ingest`
-is called before the loop is spawned). Landing the edit on disk changes
-nothing until the daemon restarts — see
+/ `try_init_transcript_output` are called before the loops are spawned).
+Landing the edit on disk changes nothing until the daemon restarts — see
 [`fleet-config-lifecycle.md`](fleet-config-lifecycle.md).
 
 #### Why this one defaults ON, against the FLAGS-OFF convention

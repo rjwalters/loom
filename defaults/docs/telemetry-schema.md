@@ -78,6 +78,7 @@ only on a **breaking** wire change to the record shapes below. A backend should:
 | `10` | Adds `metric.points` (#8860); only those envelopes use `10`. OTLP-only — the native HTTPS exporter never sends it. The `loom.dispatch.tick` span reuses `trace.span` at `3`. | Every earlier kind's version and shape is unchanged — including `ci.job.log` at `9`. |
 | `11` | Adds `queue.snapshot` (#8852 phase 2); only those envelopes use `11`. Native-HTTPS only — the OTLP exporter never sends it (SigNoz gets the queue as `loom.queue.*` gauges in `metric.points`). | Every earlier kind's version and shape is unchanged. Workers older than phase 3 store it as an unknown kind, and `/public/*` shows it as `kind` only. |
 | `12` | **Every record kind added after #8921**, collectively — not one kind. `12` is `NEW_KIND_SCHEMA_VERSION` in `loom-daemon/src/telemetry/kinds.rs`, the value a new kind's registry row declares symbolically instead of claiming the next free integer. | Every earlier kind's version and shape is unchanged, exactly as for `3`–`11`. **A backend that must refuse one specific post-#8921 kind gates on the `kind` tag, not on `12`** — the tag is always unique (enforced by the `kind_registry` tests), while `12` is shared. Only a kind whose *content* is risky enough to deserve a version-level gate of its own (the `ci.job.log` free-text precedent at `9`) pins a fresh number, and then it adds its own row here. |
+| `13` | Adds `session.output` (#9764); only live agent-output chunk envelopes use `13`. The second free-text-body kind (after `ci.job.log` at `9`), and the first kind to pin a fresh literal **above** the symbolic `12`: like `ci.job.log`, its body is text the daemon did not author, so a backend that is not ready to ingest gateway-scrubbed agent output can refuse exactly this kind — on the version, or on the unique `session.output` tag — without losing any other post-#8921 telemetry. | Every earlier kind's version and shape is unchanged. |
 
 **This table no longer grows per kind** (#8921). Versions `1`–`11` were allocated
 one-per-kind by hand, each PR taking "the next number" from a single `match` arm
@@ -1319,6 +1320,106 @@ was raised, `Info` otherwise) with `loom.session_id`,
 `loom.anomalies` (string array) attributes — all covered by the gateway
 collector's `loom.*` privacy allowlist.
 
+### `session.output`
+
+One ≤ 8 KiB chunk of an **active** agent session's transcript output (Issue
+#9764) — the live, incremental counterpart of `session.summary`: emitted by a
+separate fast-tick thread (`activity/transcript_output.rs`, default interval
+30 s) while the agent is still running, never waiting for process exit or the
+900 s summary pass. A session's output is reconstructed by ordering the
+records sharing one `(host_id, session_id)` on `chunk_index`, which is the
+session's stable event sequence — two records at the same `recorded_at` are
+still distinguishable and ordered.
+
+**The second kind whose body is free text the daemon did not author** (after
+`ci.job.log`, #8825 — and the same two invariants apply, must not be
+weakened, and are pinned by contract tests):
+
+- **The gateway is the redaction boundary.** The daemon forwards bounded text
+  as-is; `transform/session_output_redaction` in the collector config scrubs
+  the body with the identical scrub-class list, scoped by
+  `attributes["loom.output.chunk_index"] != nil and IsString(body)` — that
+  kind's own unique marker, deliberately not shared with `ci.job.log`
+  (sharing one marker across two kinds would let a change to either contract
+  silently widen the other's body exception). Enabling the emitter therefore
+  cannot bypass the scrub: redaction happens at the gateway before any sink,
+  and a backend that refuses this kind gates on `schema_version 13` without
+  losing any other telemetry.
+- **No attribute is derived from output text.** The record's attributes are
+  ids, counts and allowlisted names only — `loom.repo`, `loom.issue`,
+  `loom.role`, `loom.runtime`, `loom.session_kind`, the chunk-protocol keys
+  below — never a tag, summary or extract of the body. `loom.issue` is
+  resolved from the session's own attribution (#9445 precedence), never
+  guessed from output text; `repo` is the resolved `owner/name` forge slug,
+  absent — never a directory name — when no remote answers.
+
+**Default off, and it cannot silently enable a managed-cloud sink**: the
+emitter runs only when
+`autonomous.transcriptIngest.liveOutput.enabled` / `LOOM_TRANSCRIPT_OUTPUT`
+is set (the FLAGS-OFF polarity — forwarding transcript text is a privacy
+decision an operator makes on purpose), emission rides whatever exporter(s)
+`observability` already configured (no egress path of its own), and the
+settings freeze at boot — restart required. Bounded by construction: ≤ 8 KiB
+per chunk, `liveOutput.maxBytesPerSession` (default 5 MiB) of text per
+session, and the shared durable queue's own capacity caps; the tail's 16 MiB
+line guard drops pathological single lines.
+
+```json
+{
+  "kind": "session.output",
+  "repo": "rjwalters/loom",
+  "visibility": "private",
+  "session_id": "uuid-a",
+  "parent_session_id": "7d8119a7-250a-48ca-a0ee-b4b2c7f14d92",
+  "runtime": "claude",
+  "role": "builder",
+  "issue": 9764,
+  "session_kind": "sweep",
+  "chunk_index": 3,
+  "chunk_count": 4,
+  "truncated": false,
+  "output_bytes_total": 4096,
+  "recorded_at": "2026-09-18T04:00:03Z",
+  "text": "…bounded transcript text…"
+}
+```
+
+| Field | Type | Always present | Notes |
+|---|---|---|---|
+| `repo` / `visibility` / `session_id` / `parent_session_id` / `role` / `issue` / `session_kind` | — | see `session.summary` | The #9445 join keys, resolved once per transcript via the same `SessionContext::resolve` the summary pass uses — optional ones **omitted** when unresolved, never zeroed or guessed. |
+| `runtime` | string | yes | `claude` — this emitter tails Claude Code transcripts only. **Coverage is explicit, not silently "live"**: Codex, Pi and OpenCode sessions are not covered by this producer (their file-log receivers keep their own body-stripping pipeline). |
+| `chunk_index` | integer | yes | 0-based position in the session's output stream — the stable event sequence, and the attribute (`loom.output.chunk_index`) the gateway's scrub stage is scoped by. |
+| `chunk_count` | integer | yes | Chunks emitted for this session so far, this one included. A live stream has no final count while it runs; consumers order on `chunk_index`, not `chunk_count`. |
+| `truncated` | boolean | yes | True on every chunk from the moment the session hit the per-session byte cap — a single record read in isolation never reads as a complete transcript. |
+| `output_bytes_total` | integer | yes | Total output bytes observed for the session, **including** bytes the cap dropped, so `truncated` records always admit the gap explicitly. |
+| `recorded_at` | timestamp | yes | The chunk's newest line's own `timestamp` — the source-event instant, not the poll instant. The OTLP observed-time carries the poll/envelope time separately, so a quiet run is distinguishable from a stalled export. |
+| `text` | string | yes | The chunk's output text. **Never** promoted to an attribute. |
+
+On the OTLP path this maps to a log record (severity `Info`) whose **body is
+`text`** — not the event name — with `loom.repo`, `loom.repo.visibility`,
+`loom.session_id`, `loom.parent_session_id`, `loom.runtime`, `loom.role`,
+`loom.issue`, `loom.session_kind`, `loom.output.chunk_index`,
+`loom.output.chunk_count`, `loom.output.truncated` and
+`loom.output.bytes_total` attributes; the optional join keys are omitted
+rather than defaulted when unresolved. All are covered by the gateway
+collector's `loom.*` privacy allowlist (contract-tested); the body is the
+gateway-scrubbed text described above.
+
+**Consumer query example** — what an issue's agent is doing right now (all
+chunks of its active sessions, newest first):
+
+```sql
+SELECT Timestamp, host_id, attributes['loom.session_id'] AS session,
+       attributes['loom.output.chunk_index'] AS chunk, Body
+FROM logs
+WHERE attributes['loom.issue'] = 9764
+  AND attributes['loom.output.chunk_index'] != NULL
+ORDER BY attributes['loom.session_id'], attributes['loom.output.chunk_index'] DESC
+```
+
+Filter `loom.repo`/`loom.issue` to separate concurrent issues; `session_id`
+separates retries/attempts of one issue (each attempt is its own session).
+
 ### `daemon.event`
 
 One of the four named event-bus topics that carried no telemetry record kind
@@ -1390,8 +1491,10 @@ One ≤ 8 KiB chunk of one completed job's log text (#8825), emitted only when
 by ordering the `chunk_count` records that share a `(repo, job_id)` on
 `chunk_index`.
 
-**This is the only record kind whose body is free text the daemon did not
-author.** Every other kind's body is a string this codebase wrote; this one's
+**This was, until #9764, the only record kind whose body is free text the
+daemon did not author** — `session.output` now shares that property, behind
+its own marker and its own scrub stage. Every other kind's body is a string
+this codebase wrote; this one's
 is whatever GitHub's job-log endpoint returned, forwarded unfiltered apart
 from the per-job size cap — by operator decision, the neutral OTLP gateway is
 the redaction boundary, not the source. Two invariants follow and must not be
