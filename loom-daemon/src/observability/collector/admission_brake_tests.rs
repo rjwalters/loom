@@ -205,7 +205,7 @@ fn attribution_fixture() -> String {
 /// (Judge finding on PR #8547).
 ///
 /// `halt_reason` is an **unconditional** member of `host.health`'s public
-/// allowlist in `dashboard/src/redaction.ts`, copied verbatim to every
+/// allowlist in `loom-ui:src/redaction.ts`, copied verbatim to every
 /// unauthenticated viewer, while `admission_brake.top_cpu_consumers` is
 /// deliberately dropped by `redactAdmissionBrakeRow`. Interpolating the
 /// attribution into the free-text reason re-emitted the redacted data byte for
@@ -218,7 +218,7 @@ fn attribution_fixture() -> String {
 /// The TypeScript half of the same boundary — that no process name survives
 /// into the public projection of a payload carrying **both** a populated
 /// `halt_reason` and an `admission_brake` — lives in
-/// `dashboard/test/redactionAdmissionBrake.test.ts`.
+/// `loom-ui:test/redactionAdmissionBrake.test.ts`.
 #[test]
 fn the_halt_reason_never_carries_process_attribution_past_the_public_boundary() {
     let now = Utc::now();
@@ -237,7 +237,7 @@ fn the_halt_reason_never_carries_process_attribution_past_the_public_boundary() 
         assert!(
             !reason.contains(token),
             "halt_reason is copied verbatim into every UNAUTHENTICATED fleet response \
-             (RECORD_FIELD_ALLOWLIST, dashboard/src/redaction.ts), so it must carry no \
+             (RECORD_FIELD_ALLOWLIST, loom-ui:src/redaction.ts), so it must carry no \
              process attribution — found {token:?} in: {reason}"
         );
     }

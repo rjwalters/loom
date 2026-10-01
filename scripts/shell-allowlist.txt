@@ -90,8 +90,6 @@
 # @section baseline
 .cargo/macos-test-runner.sh                                                    contract    Invocation contract: named by the `runner =` key in .cargo/config.toml; cargo invokes this path directly.
 clean.sh                                                                       contract    Invocation contract: invoked as `clean.sh` from role prompts, CI, or an operator. The name stays; new logic goes behind it into loom-daemon.
-dashboard/scripts/check-deploy-config.sh                                       contract    Invocation contract: named by a `dashboard/package.json` npm lifecycle script; runs in the dashboard's Node/Wrangler toolchain, not the daemon's.
-dashboard/scripts/ensure-web-dist.sh                                           settled     Settled (#8237): deliberately kept shell — zero fix-commits in the trailing six months and no irreversible operations, both machine-re-checked on every run. Descoped from the port target; may shrink, never grow.
 defaults/hooks/guard-background-subagents.sh                                   hook-entry  Hook entry point: PreToolUse/SessionStart needs a shell-invocable command. The stub stays; the logic behind it is a port candidate (#7758).
 defaults/hooks/guard-codex-bridge.sh                                           hook-entry  Hook entry point: PreToolUse/SessionStart needs a shell-invocable command. The stub stays; the logic behind it is a port candidate (#7758).
 defaults/hooks/guard-destructive-generic.sh                                    vendored    Vendored from rjwalters/repo and re-vendored at release; upstream owns the structure, so a local restructure is reverted. Also a hook entry point.

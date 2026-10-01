@@ -1,6 +1,6 @@
 //! Live proof for the per-issue effort query (Issue #9444): executes
 //! `defaults/observability/issue-effort-queries.sql` **verbatim**, against the
-//! real `records` table `dashboard/migrations/0001_init.sql` defines — the D1
+//! real `records` table `loom-ui:migrations/0001_init.sql` defines — the D1
 //! shape the fleet telemetry store actually has.
 //!
 //! No Docker, no network, no CLI: it runs on the **bundled SQLite** this crate
