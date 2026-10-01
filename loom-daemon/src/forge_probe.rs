@@ -581,9 +581,10 @@ mod tests {
                 return Ok(answer);
             }
             // Repeat the last answer for calls beyond the script.
-            q.last
-                .clone()
-                .ok_or_else(|| format!("fake: scripted queue exhausted for {path}"))
+            match q.last.clone() {
+                Some(a) => Ok(a),
+                None => Err(format!("fake: scripted queue exhausted for {path}")),
+            }
         }
     }
 
