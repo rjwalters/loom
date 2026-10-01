@@ -404,7 +404,7 @@ the PR by hand from that branch." >&2
 # number exists only inside the URL after the create). A daemon that cannot
 # (absent, or pre-#9818) leaves the body unfootered; it never un-opens the PR.
 # requires-daemon: forge optional   absent or pre-#9818 binary → the footer is skipped with a stderr note; the PR itself is already open (#9774)
-self_bin="$(command -v loom-daemon 2>/dev/null)"
+self_bin="$(command -v loom-daemon 2>/dev/null || true)"
 if [[ -n "$self_bin" ]]; then
   if ! "$self_bin" forge comment --patch-created "$PR_URL" >/dev/null 2>&1; then
     echo "create-pr.sh: note: could not append the dashboard footer to the PR body (best-effort; the PR itself is open)" >&2
