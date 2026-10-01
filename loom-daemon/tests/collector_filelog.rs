@@ -356,11 +356,14 @@ fn filelog_retain_lists_and_privacy_allowlist_stay_within_the_reviewed_key_set()
         "transform/privacy's log keep_keys must list the three new #8669 keys"
     );
 
-    // #8825: `ci.job.log` is the ONE reviewed exception to "no record kind's
-    // body reaches this collector as free text". It is named here on purpose
-    // — this test is the place a reviewer looks for the reviewed set, so an
-    // exception that is not listed here is not reviewed.
-    const BODY_EXCEPTION_KINDS: [&str; 1] = ["ci.job.log"];
+    // #8825 / #9764: `ci.job.log` and `session.output` are the TWO reviewed
+    // exceptions to "no record kind's body reaches this collector as free
+    // text", each gated by its own chunk-marker attribute so neither
+    // transform's scope can drift into the other's. This test is the place
+    // a reviewer looks for the reviewed set, so an exception that is not
+    // listed here is not reviewed.
+    const BODY_EXCEPTION_KINDS: [&str; 2] = ["ci.job.log", "session.output"];
+    const BODY_EXCEPTION_MARKERS: [&str; 2] = ["loom.ci.chunk_index", "loom.output.chunk_index"];
     let body_rewrites: Vec<&str> = CONFIG
         .lines()
         .map(str::trim)
@@ -371,9 +374,14 @@ fn filelog_retain_lists_and_privacy_allowlist_stay_within_the_reviewed_key_set()
         "the #8825 ci.job.log scrub stage disappeared from the collector config"
     );
     for line in &body_rewrites {
-        assert!(
-            line.contains("attributes[\"loom.ci.chunk_index\"] != nil"),
-            "a body rewrite is not scoped to {BODY_EXCEPTION_KINDS:?}: {line}"
+        let matching_markers: Vec<&&str> = BODY_EXCEPTION_MARKERS
+            .iter()
+            .filter(|marker| line.contains(&format!("attributes[\"{marker}\"] != nil")))
+            .collect();
+        assert_eq!(
+            matching_markers.len(),
+            1,
+            "a body rewrite is not scoped to exactly one of {BODY_EXCEPTION_KINDS:?}'s markers {BODY_EXCEPTION_MARKERS:?}: {line}"
         );
     }
     // Every filelog receiver must still clear its own body: the scrub stage
