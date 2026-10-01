@@ -72,12 +72,18 @@ fn enable_writeback(ws: &Path) {
 ///     plainer issue-body pattern below.
 ///   - `gh api repos/.../issues/<n> --jq .body` (the complexity AND points
 ///     fetches — same endpoint, same response) — echoes `body`.
-///   - `gh issue comment <n> --body <text>` — logs `issue comment <n>` plus
+///   - `gh api repos/.../issues/<n>/comments --method POST -f body=<text>`
+///     (the post, via the #9772 comment chokepoint — this replaced
+///     `gh issue comment <n> --body <text>`) — logs `issue comment <n>` plus
 ///     whether the `sweep.outcome` telemetry journal was ALREADY non-empty
-///     at post time to `gh_log`, appends the full body (`$5`) to
+///     at post time to `gh_log`, appends the full body to
 ///     `<gh_log>.bodies`, appends its first (marker) line to `posted_marker`
 ///     so a SECOND idempotency check observes a real prior post, then exits
-///     `post_rc` (or hangs when `post_rc` is `-1`).
+///     `post_rc` (or hangs when `post_rc` is `-1`). Discriminated from the
+///     idempotency READ above by `--method POST` — both share the same
+///     endpoint — and matched BEFORE it for the same reason. The `gh_log`
+///     line keeps its pre-#9772 `issue comment <n> <durable>` wording so
+///     every assertion in this file still reads the same.
 fn fake_gh_script_with(
     body: &str,
     gh_log: &Path,
@@ -96,12 +102,14 @@ fn fake_gh_script_with(
     };
     format!(
         "#!/usr/bin/env bash\n\
-         if [[ \"$1\" == \"issue\" && \"$2\" == \"comment\" ]]; then\n\
+         if [[ \"$1\" == \"api\" && \"$2\" == repos/*/issues/*/comments && \"$*\" == *\"--method POST\"* ]]; then\n\
+         n=\"${{2%/comments}}\"; n=\"${{n##*/}}\"\n\
+         b=\"${{@: -1}}\"; b=\"${{b#body=}}\"\n\
          if [[ -s \"{telemetry}\" ]]; then durable=telemetry-durable-before-post; \
          else durable=telemetry-missing-at-post; fi\n\
-         printf 'issue comment %s %s\\n' \"$3\" \"$durable\" >> \"{gh_log}\"\n\
-         printf '%s\\n' \"$5\" >> \"{gh_log}.bodies\"\n\
-         printf '%s\\n' \"${{5%%$'\\n'*}}\" >> \"{posted_marker}\"\n\
+         printf 'issue comment %s %s\\n' \"$n\" \"$durable\" >> \"{gh_log}\"\n\
+         printf '%s\\n' \"$b\" >> \"{gh_log}.bodies\"\n\
+         printf '%s\\n' \"${{b%%$'\\n'*}}\" >> \"{posted_marker}\"\n\
          {post_exit}\n\
          fi\n\
          if [[ \"$1\" == \"api\" && \"$2\" == repos/*/issues/*/comments ]]; then\n\

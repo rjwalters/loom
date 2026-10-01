@@ -6,7 +6,7 @@
 
 use crate::cmd_out::Query;
 use crate::comment_trust::records;
-use crate::script_helpers::{gh_query, run_gh};
+use crate::script_helpers::{gh_query, run_gh, run_gh_comment};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -213,12 +213,8 @@ impl super::apply::Writer for GhWriter<'_> {
     }
 
     fn post_comment(&mut self, body: &str) -> crate::cmd_out::CmdOutcome {
-        let n = self.issue.to_string();
-        run_gh(
-            &["issue", "comment", &n, "--repo", self.repo, "--body", body],
-            self.repo_root,
-            false,
-        )
+        // #9772: the one comment chokepoint (footer + endpoint).
+        run_gh_comment(self.issue, false, body, Some(self.repo), self.repo_root)
     }
 
     fn edit_body(&mut self, body: &str) -> crate::cmd_out::CmdOutcome {

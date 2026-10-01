@@ -244,6 +244,15 @@ pub fn parse_pr_list(stdout: &[u8]) -> Result<Vec<ConflictPr>> {
         .collect())
 }
 
+/// Post a PR comment through the daemon's single comment chokepoint (#9772),
+/// which appends the fleet-dashboard footer and owns the REST endpoint. The
+/// `anyhow` shape matches [`gh_pr`], the transport this replaced.
+fn gh_comment(gh_bin: &Path, root: &Path, number: u32, body: &str) -> Result<()> {
+    crate::forge_comment::post_from(gh_bin, root, number, true, body)
+        .map(|_| ())
+        .map_err(|e| anyhow!("comment on PR #{number} in {}: {e}", root.display()))
+}
+
 /// Run `gh pr <args…>` in `root` with the per-root credential and `LOOM_REPO`
 /// applied, returning stdout on success.
 fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
@@ -293,8 +302,7 @@ fn list_prs(gh_bin: &Path, root: &Path, label: &str) -> Result<Vec<ConflictPr>> 
 /// touched, so the transition never happens without its audit trail.
 fn flag(gh_bin: &Path, root: &Path, number: u32, head_sha: &str) -> Result<()> {
     let n = number.to_string();
-    let body = flag_comment_body(head_sha);
-    gh_pr(gh_bin, root, &["comment", &n, "--body", &body])?;
+    gh_comment(gh_bin, root, number, &flag_comment_body(head_sha))?;
     gh_pr(
         gh_bin,
         root,
@@ -340,8 +348,7 @@ fn clear(gh_bin: &Path, root: &Path, number: u32) -> Result<()> {
          ---\n\
          *Automated by loom-daemon claim reconciliation (#8922)*"
     );
-    gh_pr(gh_bin, root, &["comment", &n, "--body", &body])?;
-    Ok(())
+    gh_comment(gh_bin, root, number, &body)
 }
 
 /// Counters for one workspace.

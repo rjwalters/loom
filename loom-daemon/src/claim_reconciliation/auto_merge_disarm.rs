@@ -93,6 +93,18 @@ mod tests {
     const SHA_A: &str = "1111111111111111111111111111111111111111";
     const SHA_B: &str = "2222222222222222222222222222222222222222";
 
+    /// Is this fake-`gh` log line the comment POST for `pr`?
+    ///
+    /// Since #9772 every daemon comment goes out as
+    /// `gh api repos/<nwo>/issues/<n>/comments --method POST -f body=…`
+    /// (`forge_comment::post_command`), not `gh pr comment <n> --body …`.
+    /// Matched on the endpoint + method rather than a `starts_with` on the
+    /// whole line so the assertion holds whether or not `<nwo>` resolved
+    /// (these fixtures run in a remote-less tempdir, where it does not).
+    fn is_comment_post(line: &str, pr: u32) -> bool {
+        line.contains(&format!("issues/{pr}/comments")) && line.contains("--method POST")
+    }
+
     /// A fake `gh` reproducing #8694's exact shape for
     /// `forge::reconcile_pr_verdicts`: PR #8694 carries `loom:pr`, its only
     /// marker is an `approved` one recorded for `SHA_A`, the reported head is
@@ -204,7 +216,7 @@ exit 0
         // disarmed" can only come from the comment body — the mutation call is
         // logged as a single `api graphql …` line that does not contain it.
         assert!(
-            calls.lines().any(|l| l.starts_with("pr comment 8694")),
+            calls.lines().any(|l| is_comment_post(l, 8694)),
             "no stale-verdict comment recorded in:\n{calls}"
         );
         assert!(
@@ -217,7 +229,7 @@ exit 0
             .lines()
             .filter(|l| {
                 l.contains("disablePullRequestAutoMerge")
-                    || l.starts_with("pr comment 8694")
+                    || is_comment_post(l, 8694)
                     || l.starts_with("pr edit 8694")
             })
             .collect();
@@ -246,7 +258,7 @@ exit 0
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(!calls.contains("graphql"), "an unarmed PR must not trigger a mutation: {calls}");
         assert!(
-            calls.lines().any(|l| l.starts_with("pr comment 8694")),
+            calls.lines().any(|l| is_comment_post(l, 8694)),
             "no stale-verdict comment recorded in:\n{calls}"
         );
         assert!(
@@ -280,7 +292,7 @@ exit 0
 
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
-            calls.lines().any(|l| l.starts_with("pr comment 8694")),
+            calls.lines().any(|l| is_comment_post(l, 8694)),
             "no stale-verdict comment recorded in:\n{calls}"
         );
         assert!(

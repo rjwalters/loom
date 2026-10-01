@@ -214,6 +214,11 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         ("claim_reconciliation/trusted_comments_tests.rs", "test"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
+        // #9772: the comment chokepoint is write-only — it names
+        // `loom:verdict-sha` solely to document that appending the dashboard
+        // footer cannot break the guard's unanchored `test(…)`/`capture(…)`
+        // match. It reads no comments at all, so there is nothing to filter.
+        ("forge_comment.rs", "write-only chokepoint; module docs only"),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();

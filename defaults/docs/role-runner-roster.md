@@ -190,7 +190,11 @@ exactly **one** comment on it, whose literal first line is the marker:
 Everything after the marker is free-form prose for a human reading the issue.
 Machine readers locate the record by `.starts_with("<!-- loom:roster host=")`
 and **must never** parse the prose — the same contract
-[`lease-record.md`](lease-record.md) establishes.
+[`lease-record.md`](lease-record.md) establishes. Since #9772 that prose ends
+with the fleet-dashboard footer every daemon comment carries
+(`[loom dashboard](…)` + `<!-- loom:dashboard-link -->`); it is appended
+idempotently on both the create `POST` and the heartbeat `PATCH`, so
+regenerating the body every cycle never stacks a second one.
 
 **`serves` is load-bearing, not decoration.** A fleet-wide ring that ignored it
 would be *wrong*: host B, registered only for repo X, would be handed a slice

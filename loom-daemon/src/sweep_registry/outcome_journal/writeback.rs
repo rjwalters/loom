@@ -307,18 +307,14 @@ impl SweepRegistry {
             .gh_bin
             .clone()
             .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut cmd = Command::new(&gh);
-        cmd.arg("issue")
-            .arg("comment")
-            .arg(issue.to_string())
-            .arg("--body")
-            .arg(body);
-        cmd.current_dir(&self.config.workspace_root);
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
+        // #9772: the one comment chokepoint (footer, endpoint, credentials).
+        let cmd = crate::forge_comment::post_command_in(
+            &gh,
             &self.config.workspace_root,
+            issue,
+            false,
+            body,
         );
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
         let timeout = reap_gh_timeout();
         match output_with_timeout(cmd, timeout) {
             Ok(Some(o)) if o.status.success() => {

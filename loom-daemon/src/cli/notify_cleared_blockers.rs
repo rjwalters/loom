@@ -47,7 +47,7 @@ use anyhow::Result;
 
 use loom_daemon::cmd_out::CmdOutcome;
 use loom_daemon::dep_recheck::{extract, forge};
-use loom_daemon::script_helpers::run_gh;
+use loom_daemon::script_helpers::{run_gh, run_gh_comment};
 use loom_daemon::stale_blocked::{cited_among, classify, Artifact, Verdict};
 
 use super::stale_blocked::{gather, list_blocked, DEFAULT_LIMIT};
@@ -317,17 +317,11 @@ fn post_comment(
     repo: Option<&str>,
     root: &Path,
 ) -> bool {
-    let entity = match kind {
-        Artifact::Issue => "issue",
-        Artifact::Pr => "pr",
-    };
-    let n = number.to_string();
     let body = comment_body(kind, cited, reasons);
-    let mut args = vec![entity, "comment", n.as_str(), "--body", body.as_str()];
-    if let Some(r) = repo {
-        args.extend(["--repo", r]);
-    }
-    matches!(run_gh(&args, root, false), CmdOutcome::Ran(o) if o.status.success())
+    // #9772: the one comment chokepoint (footer + endpoint). A PR is an issue
+    // for comments, so `kind` only decides which URL the footer links to.
+    let outcome = run_gh_comment(number, matches!(kind, Artifact::Pr), &body, repo, root);
+    matches!(outcome, CmdOutcome::Ran(o) if o.status.success())
 }
 
 /// Stdout: what was notified (or nothing). Stderr: what could not be read or

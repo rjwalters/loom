@@ -617,19 +617,14 @@ pub fn edit_labels(repo_root: &Path, issue: u32, remove: &str, add: &str) -> Res
     Ok(())
 }
 
-/// `gh issue comment <N> --body <body>`.
+/// Post an issue comment through the daemon's single comment chokepoint
+/// (#9772) — which appends the fleet-dashboard footer and owns the REST
+/// endpoint. `gh_command`'s cwd + credential wiring is reproduced by
+/// [`crate::forge_comment::post_command_in`].
 pub fn comment(repo_root: &Path, issue: u32, body: &str) -> Result<()> {
-    let out = gh_command(repo_root)
-        .args(["issue", "comment", &issue.to_string(), "--body", body])
-        .output()
-        .context("failed to invoke gh issue comment")?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "gh issue comment {issue} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(())
+    crate::forge_comment::post_from(gh_bin(), repo_root, issue, false, body)
+        .map(|_| ())
+        .map_err(|e| anyhow!("comment on issue #{issue} failed: {e}"))
 }
 
 #[derive(Debug, Deserialize)]

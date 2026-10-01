@@ -249,10 +249,18 @@ done
 # puts `-X PATCH` BEFORE it — so find it by shape rather than assuming $1.
 PATH_ARG=""
 IS_PATCH=0
+# #9772: the comment POST now goes out as `gh api <path> --method POST -f
+# body=<text>` (the `forge_comment` chokepoint) instead of `--input -` with a
+# JSON payload on stdin. So a comment WRITE is no longer distinguishable by a
+# non-empty $BODY — it is distinguished by `--method POST`.
+IS_POST=0
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "-X" ] && [ "$arg" = "PATCH" ]; then
     IS_PATCH=1
+  fi
+  if [ "$prev" = "--method" ] && [ "$arg" = "POST" ]; then
+    IS_POST=1
   fi
   case "$arg" in
     repos/*) PATH_ARG="$arg" ;;
@@ -271,7 +279,7 @@ case "$PATH_ARG" in
     fi
     ;;
   */issues/*/comments)
-    if [ -n "$BODY" ]; then
+    if [ "$IS_POST" = 1 ]; then
       [ "{fail_at}" = "comment" ] && exit 1
       echo '{{"id":1}}'
     else

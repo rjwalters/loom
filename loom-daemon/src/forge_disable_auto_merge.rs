@@ -285,14 +285,11 @@ fn post_audit_comment(gh_bin: &Path, pr: u32, outcome: &Disarm, hold: Option<&st
     let Some(body) = audit_comment_body(pr, outcome, hold) else {
         return;
     };
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr")
-        .arg("comment")
-        .arg(pr.to_string())
-        .arg("--body")
-        .arg(body);
-    apply_repo_override(&mut cmd);
-    cmd.stdin(Stdio::null());
+    // #9772: the one comment chokepoint (footer + endpoint). `LOOM_REPO` is
+    // honored by `resolve_nwo`, which is where `apply_repo_override` used to
+    // reach for it.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let cmd = crate::forge_comment::post_command_in(gh_bin, &cwd, pr, true, &body);
     let out = run_command(cmd, crate::forge_cmd::FORGE_CMD_TIMEOUT);
     if !out.succeeded() {
         eprintln!("Warning: could not post the auto-merge audit comment on PR #{pr}: {out:?}");

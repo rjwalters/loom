@@ -562,9 +562,12 @@ no-op commit would not help"
     }
 }
 
+/// Post one PR comment through the daemon's single comment chokepoint (#9772),
+/// which owns the endpoint and appends the fleet-dashboard footer.
 fn post_comment(gh: &str, nwo: &str, pr: &str, body: &str) -> Result<String, String> {
-    let payload = serde_json::json!({ "body": body }).to_string();
-    gh_api_body(gh, &[&format!("repos/{nwo}/issues/{pr}/comments")], Some(&payload))
+    let number = crate::forge_comment::issue_number(pr)
+        .ok_or_else(|| format!("{pr:?} is not a PR reference"))?;
+    crate::forge_comment::post(gh, nwo, number, true, body)
 }
 
 /// `gh_api_with` where an empty answer is itself a failure — every read here

@@ -360,8 +360,12 @@ exit 0
             !calls.lines().any(|l| l.starts_with("pr edit 9124")),
             "no label may be touched by a re-anchor: {calls}"
         );
+        // #9772: posted via `forge_comment::post_command` — the REST comment
+        // endpoint with `--method POST`, not `gh pr comment 9124 --body …`.
         assert!(
-            calls.lines().any(|l| l.starts_with("pr comment 9124")),
+            calls
+                .lines()
+                .any(|l| l.contains("issues/9124/comments") && l.contains("--method POST")),
             "the re-anchor marker comment must still be posted: {calls}"
         );
     }

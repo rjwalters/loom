@@ -132,6 +132,40 @@ pub fn run_gh(args: &[&str], repo_root: &Path, use_cache: bool) -> CmdOutcome {
     run_command(cmd, DEFAULT_TIMEOUT)
 }
 
+/// Post an issue/PR comment through the daemon's single comment chokepoint
+/// (#9772), under the same deadline and `CmdOutcome` contract as [`run_gh`].
+///
+/// This replaces `run_gh(&[entity, "comment", …])` at every script-helper call
+/// site: the fleet-dashboard footer, the REST endpoint and the `body` encoding
+/// all live in [`crate::forge_comment`], so no caller can compose a comment
+/// without one. `repo` overrides the slug the footer links to (and the endpoint
+/// it posts to); `None` resolves it from `repo_root`'s `origin` remote.
+pub fn run_gh_comment(
+    number: impl Into<i64>,
+    is_pr: bool,
+    body: &str,
+    repo: Option<&str>,
+    repo_root: &Path,
+) -> CmdOutcome {
+    // `impl Into<i64>` so the `i64`-typed script-helper call sites and the
+    // `u32`-typed daemon ones both pass their number as-is: a conversion at
+    // each call site would be four copies of the same saturating `try_from`.
+    let number = u32::try_from(number.into()).unwrap_or(u32::MAX);
+    let nwo = match repo.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => r.to_string(),
+        None => crate::forge_comment::resolve_nwo(repo_root).unwrap_or_default(),
+    };
+    let cmd = crate::forge_comment::post_command(
+        PathBuf::from("gh"),
+        Some(repo_root),
+        &nwo,
+        number,
+        is_pr,
+        body,
+    );
+    run_command(cmd, DEFAULT_TIMEOUT)
+}
+
 /// Run a `gh` JSON query and decode it in-process (epic #7810 PR 2).
 ///
 /// Callers pass `--json <fields>` and **no `--jq`**. Flattening JSON to a

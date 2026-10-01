@@ -1232,8 +1232,9 @@ fn watchdog_gaveup_posts_forge_comment_exactly_once() {
     assert!(reg.watchdog_gaveup.contains(&5302), "give-up recorded for the issue");
 
     // Issue #6179 (Epic #6165 Phase 1): every successful dispatch above
-    // ALSO posts a lease comment (`issue comment 5302 --body <!--
-    // loom:lease ...`), so "issue comment 5302" alone is no longer a
+    // ALSO posts a lease comment to the same endpoint (`api
+    // repos/.../issues/5302/comments --method POST -f body=<!-- loom:lease
+    // ...`, the #9772 chokepoint), so the endpoint alone is no longer a
     // unique fingerprint for the give-up comment specifically — filter on
     // the give-up marker text too, matching this test's actual intent
     // (the give-up comment posts exactly once and dedups per issue, not
@@ -1241,7 +1242,9 @@ fn watchdog_gaveup_posts_forge_comment_exactly_once() {
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     let comment_lines: Vec<&str> = gh_calls
         .lines()
-        .filter(|l| l.contains("issue comment 5302") && l.contains(WATCHDOG_GAVEUP_COMMENT_MARKER))
+        .filter(|l| {
+            l.contains("issues/5302/comments") && l.contains(WATCHDOG_GAVEUP_COMMENT_MARKER)
+        })
         .collect();
     assert_eq!(
         comment_lines.len(),
@@ -1262,7 +1265,9 @@ fn watchdog_gaveup_posts_forge_comment_exactly_once() {
     let gh_calls_final = std::fs::read_to_string(&gh_log).unwrap_or_default();
     let comment_count_final = gh_calls_final
         .lines()
-        .filter(|l| l.contains("issue comment 5302") && l.contains(WATCHDOG_GAVEUP_COMMENT_MARKER))
+        .filter(|l| {
+            l.contains("issues/5302/comments") && l.contains(WATCHDOG_GAVEUP_COMMENT_MARKER)
+        })
         .count();
     assert_eq!(
         comment_count_final, 1,

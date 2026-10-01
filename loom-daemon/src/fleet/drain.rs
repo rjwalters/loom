@@ -424,22 +424,21 @@ impl ClaimResetter for GhClaimResetter {
 
         // Best-effort comment — never fails the reset itself (mirrors the
         // rest of Loom's "a forge comment is advisory" posture).
-        let mut comment_cmd = Command::new("gh");
+        // #9772: the one comment chokepoint (footer + endpoint).
+        let mut comment_cmd = crate::forge_comment::post_command(
+            "gh",
+            None,
+            repo,
+            issue,
+            false,
+            &format!(
+                "🔧 **fleet drain**: host `{host}` was drained/retired while this issue was \
+                 claimed; `loom:building` reset to `loom:issue` so it is not stranded (see \
+                 epic #4340, #4343)."
+            ),
+        );
         comment_cmd
             .env("PATH", &gh_path)
-            .args([
-                "issue",
-                "comment",
-                &issue.to_string(),
-                "--repo",
-                repo,
-                "--body",
-                &format!(
-                    "🔧 **fleet drain**: host `{host}` was drained/retired while this issue was \
-                     claimed; `loom:building` reset to `loom:issue` so it is not stranded (see \
-                     epic #4340, #4343)."
-                ),
-            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         crate::credential_preflight::apply_gh_config_for_owner_slug(&mut comment_cmd, repo);

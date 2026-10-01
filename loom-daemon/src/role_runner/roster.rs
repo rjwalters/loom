@@ -104,16 +104,16 @@ fn create_roster_comment(
     issue: u32,
     body: &str,
 ) -> bool {
-    let mut cmd = Command::new(gh);
-    cmd.arg("api")
-        .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
-        .arg("--method")
-        .arg("POST")
-        .arg("-f")
-        .arg(format!("body={body}"));
-    cmd.current_dir(cwd);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, cwd);
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    // #9772: the one comment chokepoint (footer + endpoint + credentials).
+    let mut cmd = crate::forge_comment::post_command(
+        gh,
+        Some(cwd),
+        &format!("{owner}/{repo}"),
+        issue,
+        false,
+        body,
+    );
+    cmd.stdout(Stdio::null());
     match cmd.output() {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
@@ -173,6 +173,7 @@ fn patch_roster_comment(
     cwd: &Path,
     owner: &str,
     repo: &str,
+    issue: u32,
     comment_id: u64,
     body: &str,
 ) -> bool {
@@ -182,7 +183,15 @@ fn patch_roster_comment(
         .arg("--method")
         .arg("PATCH")
         .arg("-f")
-        .arg(format!("body={body}"));
+        // #9772: a PATCHed roster record carries the dashboard footer too.
+        // `with_footer` is idempotent on the marker, so regenerating this body
+        // every heartbeat cycle never stacks a second one.
+        .arg(crate::forge_comment::body_field(
+            &format!("{owner}/{repo}"),
+            issue,
+            false,
+            body,
+        ));
     cmd.current_dir(cwd);
     crate::credential_preflight::apply_gh_config_for_root(&mut cmd, cwd);
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
@@ -246,9 +255,15 @@ fn roster_heartbeat_once(
         ttl_secs,
     );
     let ok = match action {
-        crate::role_shard::roster::RosterPublish::Patch { id } => {
-            patch_roster_comment(gh, fallback_root, &issue.owner, &issue.repo, id, &body)
-        }
+        crate::role_shard::roster::RosterPublish::Patch { id } => patch_roster_comment(
+            gh,
+            fallback_root,
+            &issue.owner,
+            &issue.repo,
+            issue.number,
+            id,
+            &body,
+        ),
         crate::role_shard::roster::RosterPublish::Create => {
             create_roster_comment(gh, fallback_root, &issue.owner, &issue.repo, issue.number, &body)
         }

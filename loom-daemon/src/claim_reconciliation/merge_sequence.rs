@@ -700,10 +700,7 @@ pub(crate) fn defer_repair(
     if bodies.iter().any(|b| b.contains(&want)) {
         return Ok(());
     }
-    let n = number.to_string();
-    let body = defer_comment_body(marker);
-    gh_pr(gh_bin, root, &["comment", &n, "--body", &body])?;
-    Ok(())
+    gh_comment(gh_bin, root, number, &defer_comment_body(marker))
 }
 
 // --- Counters -----------------------------------------------------------
@@ -721,6 +718,15 @@ pub struct MergeSequenceStats {
 }
 
 // --- Forge reads --------------------------------------------------------
+
+/// Post a PR comment through the daemon's single comment chokepoint (#9772),
+/// which appends the fleet-dashboard footer and owns the REST endpoint. The
+/// `anyhow` shape matches [`gh_pr`], the transport this replaced.
+fn gh_comment(gh_bin: &Path, root: &Path, number: u32, body: &str) -> Result<()> {
+    crate::forge_comment::post_from(gh_bin, root, number, true, body)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("comment on PR #{number} in {}: {e}", root.display()))
+}
 
 /// Run `gh pr <args…>` in `root` with the per-root credential and `LOOM_REPO`
 /// applied — the same invocation shape as the review-conflict pass.
@@ -874,8 +880,7 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
 fn release_hold(gh_bin: &Path, root: &Path, number: u32, body: &str) -> Result<()> {
     let n = number.to_string();
     gh_pr(gh_bin, root, &["edit", &n, "--remove-label", SEQUENCE_LABEL])?;
-    gh_pr(gh_bin, root, &["comment", &n, "--body", body])?;
-    Ok(())
+    gh_comment(gh_bin, root, number, body)
 }
 
 /// Does the PR carry the sequencing label right now? Live read — the label
@@ -927,7 +932,7 @@ fn apply_edge(
     let n = edge.follower.to_string();
     if !marker_present {
         let body = apply_comment_body(marker, edge.reason);
-        gh_pr(gh_bin, root, &["comment", &n, "--body", &body])?;
+        gh_comment(gh_bin, root, edge.follower, &body)?;
     }
     if !label_present {
         gh_pr(gh_bin, root, &["edit", &n, "--add-label", SEQUENCE_LABEL])?;

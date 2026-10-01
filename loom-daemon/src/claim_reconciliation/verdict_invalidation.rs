@@ -171,18 +171,9 @@ fn reanchor_tree_unchanged_verdict(
          *Automated by loom-daemon claim reconciliation (#9124)*"
     );
 
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr")
-        .arg("comment")
-        .arg(pr.number.to_string())
-        .arg("--body")
-        .arg(&body);
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    // #9772: the one comment chokepoint (footer, endpoint, credentials).
+    let mut cmd = crate::forge_comment::post_command_in(gh_bin, root, pr.number, true, &body);
+    cmd.stdout(Stdio::null());
     let out = cmd
         .output()
         .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
@@ -256,18 +247,9 @@ fn invalidate_verdict(
         );
     } else {
         let body = super::verdict_stale_comment::body(label, marker_sha, head_sha, &disarm_line);
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("comment")
-            .arg(pr.number.to_string())
-            .arg("--body")
-            .arg(&body);
-        cmd.current_dir(root);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        // #9772: the one comment chokepoint (footer, endpoint, credentials).
+        let mut cmd = crate::forge_comment::post_command_in(gh_bin, root, pr.number, true, &body);
+        cmd.stdout(Stdio::null());
         let out = cmd
             .output()
             .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;

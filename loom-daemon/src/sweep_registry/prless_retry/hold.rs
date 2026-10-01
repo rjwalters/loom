@@ -427,23 +427,14 @@ impl SweepRegistry {
             .gh_bin
             .clone()
             .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut comment = Command::new(&gh);
-        comment
-            .arg("issue")
-            .arg("comment")
-            .arg(issue.to_string())
-            .arg("--body")
-            .arg(body);
-        comment.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut comment,
+        // #9772: the one comment chokepoint (footer, endpoint, credentials).
+        let comment = crate::forge_comment::post_command_in(
+            &gh,
             &self.config.workspace_root,
+            issue,
+            false,
+            body,
         );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            comment.arg("--repo").arg(repo);
-        }
         let timeout = reap_gh_timeout();
         match output_with_timeout(comment, timeout) {
             Ok(Some(_)) => {}
@@ -625,6 +616,29 @@ mod tests {
             .collect()
     }
 
+    /// The comment-POST calls in `gh_log`.
+    ///
+    /// #9772 replaced this module's `gh issue comment <n> --body <text>` with
+    /// the one chokepoint's `gh api repos/<nwo>/issues/<n>/comments --method
+    /// POST -f body=<text>`, so the log line to count changed shape.
+    /// `--method POST` is the discriminator: a `--paginate` READ of the very
+    /// same endpoint must not be counted as a post.
+    fn comment_posts(gh_log: &Path) -> Vec<String> {
+        std::fs::read_to_string(gh_log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("/comments") && l.contains("--method POST"))
+            .map(std::string::ToString::to_string)
+            .collect()
+    }
+
+    /// Is `line` a comment POST to `issue` whose body leads with `marker`?
+    fn posts_marked_comment_to(line: &str, issue: u32, marker: &str) -> bool {
+        line.contains(&format!("issues/{issue}/comments"))
+            && line.contains("--method POST")
+            && line.contains(&format!("body={marker}"))
+    }
+
     /// #8728 AC1: at the threshold the hold flips the forge labels — exactly
     /// one `gh issue edit`, naming the RIGHT issue, adding `loom:blocked` and
     /// removing `loom:issue`. The work finder's skip-label filter reads that
@@ -662,11 +676,10 @@ mod tests {
 
         hold_at_threshold(&mut reg, 7893, 2, "scope `safehouse_chatops/` does not exist on main");
 
-        let comments = gh_calls_starting_with(&gh_log, "issue comment ");
+        let comments = comment_posts(&gh_log);
         assert_eq!(comments.len(), 1, "the hold posts exactly one notice, got: {comments:?}");
         assert!(
-            comments[0]
-                .starts_with(&format!("issue comment 7893 --body {PRLESS_RETRY_COMMENT_MARKER}")),
+            posts_marked_comment_to(&comments[0], 7893, PRLESS_RETRY_COMMENT_MARKER),
             "the notice must go to the held issue and lead with the marker: {}",
             comments[0]
         );
@@ -711,7 +724,7 @@ mod tests {
             "a vetoed hold must not flip any label"
         );
         assert!(
-            gh_calls_starting_with(&gh_log, "issue comment ").is_empty(),
+            comment_posts(&gh_log).is_empty(),
             "a vetoed hold must not post a hold notice either"
         );
     }
@@ -734,10 +747,7 @@ mod tests {
             gh_calls_starting_with(&gh_log, "issue edit ").is_empty(),
             "a closed issue must not be labeled `loom:blocked`"
         );
-        assert!(
-            gh_calls_starting_with(&gh_log, "issue comment ").is_empty(),
-            "a closed issue must not get a hold notice"
-        );
+        assert!(comment_posts(&gh_log).is_empty(), "a closed issue must not get a hold notice");
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         assert!(
             calls
@@ -771,18 +781,17 @@ mod tests {
 
         reg.record_prless_release(7893, "first failure");
         assert!(
-            gh_calls_starting_with(&gh_log, "issue comment ").is_empty(),
+            comment_posts(&gh_log).is_empty(),
             "a single PR-less release is plausibly a one-off — no comment yet"
         );
 
         reg.record_prless_release(7893, "second failure: build error the Builder cannot pass");
 
         assert!(!reg.prless_retry_held(7893), "still one short of the threshold");
-        let comments = gh_calls_starting_with(&gh_log, "issue comment ");
+        let comments = comment_posts(&gh_log);
         assert_eq!(comments.len(), 1, "one attempt note, got: {comments:?}");
         assert!(
-            comments[0]
-                .starts_with(&format!("issue comment 7893 --body {PRLESS_RETRY_COMMENT_MARKER}")),
+            posts_marked_comment_to(&comments[0], 7893, PRLESS_RETRY_COMMENT_MARKER),
             "the attempt note must go to the right issue and carry the marker: {}",
             comments[0]
         );

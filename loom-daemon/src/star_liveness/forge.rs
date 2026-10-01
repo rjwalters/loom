@@ -282,8 +282,12 @@ impl StarForge for GhStarForge {
     }
 
     fn post_comment(&mut self, number: u32, body: &str) -> Result<()> {
-        let path = format!("{}/comments", self.issue_path(number));
-        let field = format!("body={body}");
+        // #9772: the endpoint and the dashboard footer come from the one
+        // comment chokepoint; the transport stays `self.api` so this keeps the
+        // rate-limit/credential handling every other call in this impl has.
+        // `is_pr = false`: `list_open` is an issues-only listing.
+        let path = crate::forge_comment::comments_path(&self.slug, number);
+        let field = crate::forge_comment::body_field(&self.slug, number, false, body);
         self.api(&["-X", "POST", &path, "-f", &field], &path)
             .map(|_| ())
     }

@@ -216,7 +216,12 @@ fn end_to_end_conflicting_review_pr_is_relabeled_after_its_comment() {
     );
     let (stats, calls) = run(&rr, "[]", "[]");
     assert_eq!(stats.flagged, 1, "{calls}");
-    let comment = calls.find("pr comment 8909").expect("flag comment");
+    // #9772: the flag comment is a REST POST now, not `gh pr comment 8909`.
+    // `--method POST` is what distinguishes it from the `--paginate` READ of
+    // the same endpoint, which is logged earlier in this same run.
+    let comment = calls
+        .find("issues/8909/comments --method POST")
+        .expect("flag comment");
     let edit = calls.find("pr edit 8909").expect("relabel");
     assert!(comment < edit, "comment must precede the relabel: {calls}");
     assert!(calls.contains(
@@ -236,7 +241,7 @@ fn end_to_end_unknown_writes_nothing() {
     );
     let (stats, calls) = run(&rr, &mc, "[]");
     assert_eq!((stats.flagged, stats.cleared), (0, 0));
-    assert!(!calls.contains("pr edit") && !calls.contains("pr comment"), "{calls}");
+    assert!(!calls.contains("pr edit") && !calls.contains("--method POST"), "{calls}");
 }
 
 #[test]
@@ -270,7 +275,7 @@ fn end_to_end_held_pr_is_untouched() {
     );
     let (stats, calls) = run(&rr, "[]", "[]");
     assert_eq!(stats.flagged, 0);
-    assert!(!calls.contains("pr edit") && !calls.contains("pr comment"), "{calls}");
+    assert!(!calls.contains("pr edit") && !calls.contains("--method POST"), "{calls}");
 }
 
 /// #9548 (H9): the "is this flag ours?" check reads trusted comments only, so

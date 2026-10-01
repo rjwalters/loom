@@ -40,6 +40,40 @@ pub(crate) fn fake_gh_graphql_arm(prs: &str, exit_code: i32) -> String {
     )
 }
 
+/// The comment-POST arm of a fake `gh`: appends the posted body's first line
+/// to a JSONL lease-comment store, as a real forge would.
+///
+/// Matches the shape [`crate::forge_comment::post_command`] builds since #9772
+/// — `gh api repos/<nwo>/issues/<n>/comments --method POST -f body=<text>` —
+/// which replaced the `gh issue comment <n> --body <text>` these fixtures
+/// previously modelled. **Must be spliced in BEFORE any generic
+/// `$1 == "api" && $* == */comments*` READ arm**: a POST matches that glob
+/// too, so without the `--method POST` discrimination and this ordering a post
+/// would be answered as a read and never stored (#9772 — exactly the 25-test
+/// failure the migration's first pass produced).
+///
+/// `body=` is stripped off the trailing `-f body=<text>` argument so the store
+/// records the body itself, not the `gh api` field syntax. Only the first line
+/// is kept, which is all the lease/roster readers match on — and is why the
+/// dashboard footer every posted body now carries is invisible here.
+pub(crate) fn fake_gh_comment_post_arm(store: &Path) -> String {
+    format!(
+        "if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* && \"$*\" == *\"--method POST\"* ]]; then\n\
+         body=\"${{@: -1}}\"\n\
+         body=\"${{body#body=}}\"\n\
+         first_line=$(printf '%s' \"$body\" | head -n1)\n\
+         esc=$(printf '%s' \"$first_line\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n\
+         count=$(wc -l < \"{store}\" 2>/dev/null | tr -d ' ')\n\
+         [[ -z \"$count\" ]] && count=0\n\
+         id=$((count + 1))\n\
+         now=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n\
+         printf '{{\"user\":{{\"login\":\"loom-fleet-dispatch[bot]\",\"type\":\"Bot\"}},\"id\":%d,\"created_at\":\"%s\",\"updated_at\":\"%s\",\"body\":\"%s\"}}\\n' \"$id\" \"$now\" \"$now\" \"$esc\" >> \"{store}\"\n\
+         exit 0\n\
+         fi\n",
+        store = store.display(),
+    )
+}
+
 /// The `api repos/.../issues/<n>/timeline` arm of a fake `gh`, answering the
 /// #5911 REST fallback for the open-linked-PR probe. Must be spliced into a
 /// fixture script BEFORE any generic `$2 == repos/*` arm (e.g. the
@@ -2080,17 +2114,7 @@ pub(crate) fn lease_order_dispatch_registry(
     let script = format!(
         "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
-             if [[ \"$1\" == \"issue\" && \"$2\" == \"comment\" ]]; then\n\
-             body=\"${{@: -1}}\"\n\
-             first_line=$(printf '%s' \"$body\" | head -n1)\n\
-             esc=$(printf '%s' \"$first_line\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n\
-             count=$(wc -l < \"{store}\" 2>/dev/null | tr -d ' ')\n\
-             [[ -z \"$count\" ]] && count=0\n\
-             id=$((count + 1))\n\
-             now=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n\
-             printf '{{\"user\":{{\"login\":\"loom-fleet-dispatch[bot]\",\"type\":\"Bot\"}},\"id\":%d,\"created_at\":\"%s\",\"updated_at\":\"%s\",\"body\":\"%s\"}}\\n' \"$id\" \"$now\" \"$now\" \"$esc\" >> \"{store}\"\n\
-             exit 0\n\
-             fi\n\
+             {post}\
              if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
              if [[ -f \"{store}\" ]]; then\n\
              while IFS= read -r line; do\n\
@@ -2120,6 +2144,7 @@ pub(crate) fn lease_order_dispatch_registry(
              exit 0\n",
         log = gh_log.display(),
         store = comments_store.display(),
+        post = fake_gh_comment_post_arm(&comments_store),
         gql = fake_gh_graphql_arm("", 0),
     );
     std::fs::write(&fake_gh, &script).unwrap();
@@ -2201,17 +2226,7 @@ pub(crate) fn safehouse_down_combined_registry(
     let script = format!(
         "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
-             if [[ \"$1\" == \"issue\" && \"$2\" == \"comment\" ]]; then\n\
-             body=\"${{@: -1}}\"\n\
-             first_line=$(printf '%s' \"$body\" | head -n1)\n\
-             esc=$(printf '%s' \"$first_line\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n\
-             count=$(wc -l < \"{store}\" 2>/dev/null | tr -d ' ')\n\
-             [[ -z \"$count\" ]] && count=0\n\
-             id=$((count + 1))\n\
-             now=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n\
-             printf '{{\"user\":{{\"login\":\"loom-fleet-dispatch[bot]\",\"type\":\"Bot\"}},\"id\":%d,\"created_at\":\"%s\",\"updated_at\":\"%s\",\"body\":\"%s\"}}\\n' \"$id\" \"$now\" \"$now\" \"$esc\" >> \"{store}\"\n\
-             exit 0\n\
-             fi\n\
+             {post}\
              if [[ \"$1\" == \"api\" && \"$*\" == *\"--include\"* ]]; then\n\
              printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'\n\
              printf '[{{\"number\":{issue},\"state\":\"open\",\"labels\":[{{\"name\":\"loom:building\"}}],\"updated_at\":\"{label_ts}\"}}]\\n'\n\
@@ -2246,6 +2261,7 @@ pub(crate) fn safehouse_down_combined_registry(
              exit 0\n",
         log = gh_log.display(),
         store = comments_store.display(),
+        post = fake_gh_comment_post_arm(&comments_store),
         issue = building_issue_number,
         label_ts = building_label_updated_at,
         gql = fake_gh_graphql_arm("", 0),

@@ -22,7 +22,7 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
-use super::{run_gh, run_git};
+use super::{run_gh, run_gh_comment, run_git};
 use crate::cmd_out::{run_command, CmdOutcome, Query, Unavailable, DEFAULT_TIMEOUT};
 
 /// Typed shapes for the `gh --json` queries this module makes (#7810 PR 2).
@@ -384,7 +384,8 @@ fn mark_phase_failed(
         body.push_str("\n\n");
         body.push_str(diagnostics);
     }
-    let _ = run_gh(&["issue", "comment", &issue_s, "--body", &body], repo_root, false);
+    // #9772: the one comment chokepoint (footer + endpoint).
+    let _ = run_gh_comment(issue, false, &body, None, repo_root);
 }
 
 // --------------------------------------------------------------------------

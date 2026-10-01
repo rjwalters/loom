@@ -104,6 +104,13 @@ Machine readers — present and future — must locate the record via
 `.starts_with("<!-- loom:lease host=")` only, and must **never** parse or
 depend on anything in the prose that follows.
 
+Since #9772 that prose ends with the fleet-dashboard footer every daemon
+comment carries — a visible `[loom dashboard](…)` line plus a
+`<!-- loom:dashboard-link -->` marker, appended by
+`loom-daemon/src/forge_comment.rs`, the single comment chokepoint. It is part
+of the free-form tail and changes nothing here: the record is still located by
+its **first line**, and nothing anchors on the body's end.
+
 ### The liveness signal is the comment's `updated_at`, not embedded text
 
 This is the load-bearing design decision, so it is worth stating plainly:

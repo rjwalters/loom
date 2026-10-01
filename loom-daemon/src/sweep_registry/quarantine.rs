@@ -1096,23 +1096,14 @@ impl SweepRegistry {
             ttl = self.effective_quarantine_ttl(issue).as_secs(),
             escalation = self.quarantine_escalation_note(issue),
         );
-        let mut comment = Command::new(&gh);
-        comment
-            .arg("issue")
-            .arg("comment")
-            .arg(issue.to_string())
-            .arg("--body")
-            .arg(body);
-        comment.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut comment,
+        // #9772: the one comment chokepoint (footer, endpoint, credentials).
+        let comment = crate::forge_comment::post_command_in(
+            &gh,
             &self.config.workspace_root,
+            issue,
+            false,
+            &body,
         );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            comment.arg("--repo").arg(repo);
-        }
         match output_with_timeout(comment, timeout) {
             Ok(Some(_)) => {}
             Ok(None) => log::debug!(

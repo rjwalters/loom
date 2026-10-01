@@ -170,6 +170,17 @@ pub fn read_cooldown(state: &std::path::Path) -> Option<Cooldown> {
     })
 }
 
+/// One issue comment, built through the daemon's single comment chokepoint
+/// (#9772) so the fleet-dashboard footer is appended here too. `gh` resolves
+/// the repository from the process working directory exactly as the
+/// `gh issue comment` calls this replaced did; the footer's `owner/repo` comes
+/// from the same place.
+fn comment_command(number: u32, body: &str) -> std::process::Command {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let nwo = crate::forge_comment::resolve_nwo(&cwd).unwrap_or_default();
+    crate::forge_comment::post_command("gh", None, &nwo, number, false, body)
+}
+
 /// The #7664 dedup window: how long after a recovery a repeat degradation is
 /// treated as the SAME episode flapping rather than a new one.
 ///
@@ -407,14 +418,19 @@ pub fn dedup_comment(
     let window = dedup_window_secs();
     let gh = std::time::Duration::from_secs(60);
 
-    let mut comment = std::process::Command::new("gh");
-    comment
-        .args(["issue", "comment", &cooldown.issue_ref, "--body"])
-        .arg(flap_comment(hostname, summary, flap, window));
-    let commented = crate::sweep_registry::output_with_timeout(comment, gh)
-        .ok()
-        .flatten()
-        .is_some_and(|o| o.status.success());
+    // #9772: the one comment chokepoint (footer + endpoint). The sentinel
+    // records whatever `create-issue.sh` printed — in production an issue URL,
+    // not a bare number — so the reference is widened via
+    // `forge_comment::issue_number` rather than parsed directly. A reference
+    // with no number in it at all cannot be commented on, which is the
+    // pre-existing "fall through and file fresh" failure path.
+    let commented = crate::forge_comment::issue_number(&cooldown.issue_ref).is_some_and(|number| {
+        let comment = comment_command(number, &flap_comment(hostname, summary, flap, window));
+        crate::sweep_registry::output_with_timeout(comment, gh)
+            .ok()
+            .flatten()
+            .is_some_and(|o| o.status.success())
+    });
     if !commented {
         return None;
     }
@@ -486,19 +502,25 @@ pub fn recover(sentinel: &Path, cooldown_state: &Path, hostname: &str, summary: 
     };
 
     let gh = std::time::Duration::from_secs(60);
-    let mut comment = std::process::Command::new("gh");
-    comment
-        .args(["issue", "comment", &issue_ref, "--body"])
-        .arg(format!(
-            // Verbatim from the shell (loom-daemon-watchdog.sh:1820). This is
-            // posted to the forge, so a stray run of spaces and a dropped `.sh`
-            // are both visible to an operator reading the issue.
-            "peer-claim coordination has RECOVERED on `{hostname}` ({summary}). Closing \
-         automatically — filed by the loom-daemon-watchdog.sh peer-coordination escalation \
-         (#6222)."
-        ));
-    // The comment is advisory: a failure must not stop the close.
-    let _ = crate::sweep_registry::output_with_timeout(comment, gh);
+    // The comment is advisory: a failure — including a reference with no
+    // number in it — must not stop the close. `issue_number` widens the issue
+    // URL `create-issue.sh` prints (what the sentinel actually records) as well
+    // as a bare number.
+    if let Some(number) = crate::forge_comment::issue_number(&issue_ref) {
+        let comment = comment_command(
+            number,
+            &format!(
+                // Verbatim from the shell (loom-daemon-watchdog.sh:1820). This
+                // is posted to the forge, so a stray run of spaces and a
+                // dropped `.sh` are both visible to an operator reading the
+                // issue.
+                "peer-claim coordination has RECOVERED on `{hostname}` ({summary}). Closing \
+             automatically — filed by the loom-daemon-watchdog.sh peer-coordination escalation \
+             (#6222)."
+            ),
+        );
+        let _ = crate::sweep_registry::output_with_timeout(comment, gh);
+    }
 
     let mut close = std::process::Command::new("gh");
     close.args(["issue", "close", &issue_ref, "--reason", "completed"]);

@@ -1417,26 +1417,16 @@ impl SweepRegistry {
             sweep_id = sweep_id,
             ts = Utc::now().to_rfc3339(),
         );
-        let mut comment = Command::new(&gh);
-        comment
-            .arg("issue")
-            .arg("comment")
-            .arg(issue.to_string())
-            .arg("--body")
-            .arg(body);
-        // Run in the registry's own workspace so the issue number resolves
-        // against *this* repo in a multi-workspace daemon (#3928/#3937),
-        // mirroring every other forge mutation in this file.
-        comment.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut comment,
+        let comment = crate::forge_comment::post_command_in(
+            &gh,
+            // The registry's own workspace, so the issue number resolves against
+            // *this* repo in a multi-workspace daemon (#3928/#3937) and
+            // credentials follow a cross-owner managed repo (#5401).
             &self.config.workspace_root,
+            issue,
+            false,
+            &body,
         );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            comment.arg("--repo").arg(repo);
-        }
         // Bounded so a wedged `gh` can never block the dispatch path (#3973),
         // exactly like the label flip this immediately follows.
         let timeout = reap_gh_timeout();
@@ -1946,23 +1936,14 @@ impl SweepRegistry {
              claim-then-verify-order tie-break). The `loom:building` label is left untouched — it \
              is already correct, protecting the earlier claimant's own winning lease.",
         );
-        let mut comment = Command::new(&gh);
-        comment
-            .arg("issue")
-            .arg("comment")
-            .arg(issue.to_string())
-            .arg("--body")
-            .arg(body);
-        comment.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut comment,
+        // #9772: the one comment chokepoint (footer, endpoint, credentials).
+        let comment = crate::forge_comment::post_command_in(
+            &gh,
             &self.config.workspace_root,
+            issue,
+            false,
+            &body,
         );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            comment.arg("--repo").arg(repo);
-        }
         let timeout = reap_gh_timeout();
         match output_with_timeout(comment, timeout) {
             Ok(Some(output)) if output.status.success() => {}
@@ -2909,9 +2890,11 @@ exit 0
         registry.write_lease_comment(6179, "sweep-test-6179");
 
         let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        // #9772: posted through `forge_comment::post_command`, so the call is
+        // the REST POST rather than `gh issue comment 6179 --body …`.
         assert!(
-            gh_calls.contains("issue comment 6179"),
-            "expected a gh issue comment call for #6179; got: {gh_calls:?}"
+            gh_calls.contains("issues/6179/comments") && gh_calls.contains("--method POST"),
+            "expected a comment POST for #6179; got: {gh_calls:?}"
         );
         let published = registry.published_host_id();
         assert!(

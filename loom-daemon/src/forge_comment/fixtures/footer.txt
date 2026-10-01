@@ -1,0 +1,4 @@
+Hello from loom.
+
+[loom dashboard](https://dashboard.2amlogic.com/github.com/rjwalters/loom/issues/42)
+<!-- loom:dashboard-link -->

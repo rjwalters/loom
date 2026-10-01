@@ -160,7 +160,10 @@ impl Fleet {
         self.relay();
     }
 
-    /// How many of this fleet's `gh issue comment` bodies carry `marker`.
+    /// How many of this fleet's posted comment bodies carry `marker`.
+    ///
+    /// Counts marker occurrences across the whole argv log, so it is immune to
+    /// the #9772 switch from `gh issue comment` to the chokepoint's REST POST.
     fn comments_with(&self, marker: &str) -> usize {
         let Some(log) = &self.gh_log else {
             return 0;
@@ -174,8 +177,10 @@ impl Fleet {
 
 /// One fake `gh` shared by every host in a [`Fleet`]: logs every argv to
 /// `gh_log`, answers "open issue, no open linked PR on either transport" so
-/// neither hold veto fires, and exits 0 for the `issue edit` / `issue comment`
-/// mutations these tests count. Arm order mirrors `hold.rs`'s
+/// neither hold veto fires, and exits 0 for the `issue edit` label flip and
+/// the #9772 comment POST (`api repos/.../comments --method POST`, swallowed by
+/// the generic `repos/*` arm, which is harmless — the argv is already logged)
+/// these tests count. Arm order mirrors `hold.rs`'s
 /// `forge_registry` — the REST timeline arm must precede the generic
 /// `repos/*` state probe, whose glob would otherwise swallow it.
 fn write_fake_gh(path: &Path, gh_log: &Path) {

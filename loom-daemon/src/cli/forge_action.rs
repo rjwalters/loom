@@ -385,6 +385,31 @@ pub(crate) enum ForgeAction {
         gh_shape: bool,
     },
 
+    /// `forge comment <N> (--body TEXT | --body-file PATH) [--repo OWNER/REPO]
+    /// [--pr]` (#9772) — post an issue/PR comment through the daemon's single
+    /// comment chokepoint, which always appends the fleet-dashboard footer.
+    ///
+    /// There is no `--no-footer`: the footer is a property of posting a
+    /// comment, not an option of this verb. `--pr` only makes the link say
+    /// `pull/N` instead of `issues/N` (one REST endpoint serves both).
+    Comment {
+        /// Issue or PR number to comment on.
+        #[arg(value_name = "NUMBER")]
+        number: u32,
+        /// The comment body (markdown).
+        #[arg(long, value_name = "TEXT", conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the comment body from a file (`-` is not special).
+        #[arg(long = "body-file", value_name = "PATH")]
+        body_file: Option<std::path::PathBuf>,
+        /// `owner/name` (default: the cwd's `origin` remote).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// The target is a pull request (link to `pull/N`).
+        #[arg(long)]
+        pr: bool,
+    },
+
     /// `forge identities [--json]` (#9537) — the resolved roster (writer,
     /// readers, legacy logins) and, per reader, each published token's owner
     /// and expiry.
@@ -409,6 +434,13 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         } => return super::forge_identity_cmd::token(&repo, &access, force),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
+        ForgeAction::Comment {
+            number,
+            body,
+            body_file,
+            repo,
+            pr,
+        } => return super::forge_comment_cmd::run(number, body, body_file, repo, pr),
         ForgeAction::TrustedComments {
             self_login,
             fetch,
