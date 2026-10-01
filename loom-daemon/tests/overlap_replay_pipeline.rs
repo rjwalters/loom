@@ -797,7 +797,7 @@ fn chain_validation_and_transplant() {
     let _ = commit_file(&fx.repo, None, "src/shared.rs", &shared5("from G"), "G edits shared");
     let g_head = git(&fx.repo, &["rev-parse", "HEAD"]);
 
-    let cg = own_chain(&fx.repo, 41, &g_head, &[g_head.clone()]).unwrap();
+    let cg = own_chain(&fx.repo, 41, &g_head, std::slice::from_ref(&g_head)).unwrap();
     assert_eq!(cg.status, ChainStatus::Qualified, "{:?}", cg.reason);
     assert!(cg.patch_base.is_some());
     assert_eq!(cg.net_changed_paths, vec!["src/shared.rs"]);
@@ -836,14 +836,14 @@ fn transplanted_replay_detects_designed_conflict() {
     git(&fx.repo, &["checkout", "-q", "-b", "feat-h", "base"]);
     let _ = commit_file(&fx.repo, None, "src/shared.rs", &shared5("from H"), "H");
     let h = git(&fx.repo, &["rev-parse", "HEAD"]);
-    let cg = own_chain(&fx.repo, 41, &g, &[g.clone()]).unwrap();
-    let ch = own_chain(&fx.repo, 42, &h, &[h.clone()]).unwrap();
+    let cg = own_chain(&fx.repo, 41, &g, std::slice::from_ref(&g)).unwrap();
+    let ch = own_chain(&fx.repo, 42, &h, std::slice::from_ref(&h)).unwrap();
     let common = cg.patch_base.clone().unwrap();
     let tg = transplant(&fx.repo, &cg, &common, "a").unwrap();
     let th = transplant(&fx.repo, &ch, &common, "b").unwrap();
     let (a, b) = (tg.commit.unwrap(), th.commit.unwrap());
     let replays = conflict::replay_pair(&fx.repo, &common, &a, &b);
-    assert_eq!(matches!(conflict::any_textual_conflict(&replays), Some(true)), true);
+    assert!(matches!(conflict::any_textual_conflict(&replays), Some(true)));
     for r in &replays {
         match &r.outcome {
             conflict::ConflictOutcome::TextualConflict { conflicted_files } => {
