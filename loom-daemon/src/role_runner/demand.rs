@@ -16,7 +16,11 @@
 //!   added per tick per repo, and reads ([`DemandLedger::host_debt`]) are a
 //!   mutex read with no I/O, safe in the synchronous walk. A failed listing
 //!   records nothing, so its entry ages out (`staleSecs`) rather than reading
-//!   as `0`; an axis with no fresh entry is `None` (**unobserved**).
+//!   as `0`; an axis with no fresh entry is `None` (**unobserved**). An axis
+//!   has **two** readings (#9414): the *fresh* aggregate ([`AxisDebt`]) the
+//!   reservation and the #9410 back-off use, and the *width* reading
+//!   ([`HostDebt::axis_width`]), which sums every root's **last-known** count
+//!   whatever its age — see "Partially stale axes" below.
 //! - **Width.** For a PR role with debt axis `d`,
 //!   `width = clamp(ceil(debt / perRun), 1, min(max, phase1_budget))`, and an
 //!   unobserved axis gives exactly the Phase 1 budget ([`width`]). Judge and
@@ -38,6 +42,47 @@
 //! judge only by champion's unfilled want, and non-PR roles always keep
 //! `nonPrFloor` slots, so no role is shut out and every repo with debt is
 //! still reached within `ceil(roots / admitted-per-tick)` ticks.
+//!
+//! **Partially stale axes (#9414).** A judge/doctor entry refreshes only when
+//! that role *runs* in that root, and how often it runs there is exactly what
+//! width decides — so summing only *fresh* entries makes width its own input:
+//! a few stale roots read as `0`, width drops, fewer roots are visited, more
+//! entries go stale. The fail-open rule covered only a *fully* unobserved
+//! axis, so a partially stale one could hold judge at width 1 while the real
+//! host review debt justified the Phase 1 budget.
+//!
+//! Measured on a 59-root host over 74 h of `daemon.log` (the `#9392`
+//! post-merge measurement this change was gated on): the fresh window is
+//! almost always a *tiny sample of the host*, so width was being sized from
+//! a few percent of it. Reconstructing each root's last listing time from the
+//! `tick completed for <root> in <d>s` lines and sampling every 5 min, the
+//! number of roots with a fresh review entry ran **median 2 of 59** (mean 4.0,
+//! 6.8%; doctor's changes axis median 1, 4.3%) — so 93%+ of roots contributed
+//! `0` to the sum at any instant, not because they were empty but because
+//! nobody had visited them inside `staleSecs`. Judge sat at width 1 for 29% of
+//! the window and doctor for 71%. The refusal line made the loop explicit:
+//! `judge tick stopped admitting — 1 judge run(s) already in flight at its
+//! demand width of 1 for 1 queued PR(s) (Phase 1 budget 3); 59 root(s)
+//! deferred to the next tick`. The rule was also **non-monotone in
+//! observation**: zero fresh entries fails open to budget 3 (36% of samples
+//! for judge, 42% for doctor), while *one or two shallow* fresh entries gave
+//! width 1 (21% / 39%) — so seeing one empty root strictly *narrowed* judge
+//! versus seeing nothing at all, though it is no evidence about the other 57.
+//!
+//! The width reading therefore sums each root's last-known count whatever its
+//! age, and is `None` (fail open) unless the axis has at least one fresh entry
+//! **and** a positive total. Over-counting is safe **here and only here**:
+//! width is clamped at `min(max, phase1_budget)`, so its worst case is exactly
+//! the Phase 1 budget — this module's own fail-open — and judge/doctor are
+//! queue-gated, so a wider budget cannot start a run on a root whose queue is
+//! actually empty (an empty root returns `QueueEmpty` and
+//! `resume_after_queue_empty` gives the budget straight back). Reading a zero
+//! total as unobserved costs nothing for the same reason: `debt 0 → width 1`
+//! only ever narrowed how many *empty* roots could be probed at once, which
+//! the `QueueEmpty` resume already does not charge. The **reservation** keeps
+//! the fresh-only sum, where a stale over-count would hold ceiling slots away
+//! from other roles for work that is not there — and so does the #9410 build
+//! back-off, where an over-count would keep new builds held off.
 //!
 //! `autonomous.roleRunner.demandWidth.enabled: false` restores Phase 1
 //! exactly: no ledger reads, no reservation, no champion listing.
@@ -65,6 +110,9 @@ pub enum DebtAxis {
 }
 
 impl DebtAxis {
+    /// Every axis, in the order the per-axis readings are stored.
+    pub const ALL: [Self; 3] = [Self::Review, Self::Changes, Self::Merge];
+
     /// The label whose open PR rows this axis counts.
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -78,9 +126,16 @@ impl DebtAxis {
     /// The axis a queue label feeds, if any.
     #[must_use]
     pub fn for_label(label: &str) -> Option<Self> {
-        [Self::Review, Self::Changes, Self::Merge]
-            .into_iter()
-            .find(|a| a.label() == label)
+        Self::ALL.into_iter().find(|a| a.label() == label)
+    }
+
+    /// This axis's index in [`Self::ALL`].
+    fn index(self) -> usize {
+        match self {
+            Self::Review => 0,
+            Self::Changes => 1,
+            Self::Merge => 2,
+        }
     }
 
     /// The axis `role`'s width follows. Judge keys on review requests only:
@@ -188,19 +243,59 @@ pub struct AxisDebt {
     pub roots_with_debt: usize,
 }
 
+/// The width reading of each axis (#9414): the sum of every root's
+/// **last-known** count, stale entries included, or `None` to fail open to the
+/// Phase 1 budget. Kept apart from [`AxisDebt`] because the reservation and
+/// the #9410 build back-off must keep the fresh-only sum, where an over-count
+/// has a real cost — see the module doc, "Partially stale axes".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AxisWidths {
+    /// `loom:review-requested`.
+    pub review: Option<usize>,
+    /// `loom:changes-requested`.
+    pub changes: Option<usize>,
+    /// `loom:pr`.
+    pub merge: Option<usize>,
+}
+
+impl AxisWidths {
+    /// The width reading on `axis`.
+    #[must_use]
+    pub fn axis(&self, axis: DebtAxis) -> Option<usize> {
+        match axis {
+            DebtAxis::Review => self.review,
+            DebtAxis::Changes => self.changes,
+            DebtAxis::Merge => self.merge,
+        }
+    }
+
+    fn axis_mut(&mut self, axis: DebtAxis) -> &mut Option<usize> {
+        match axis {
+            DebtAxis::Review => &mut self.review,
+            DebtAxis::Changes => &mut self.changes,
+            DebtAxis::Merge => &mut self.merge,
+        }
+    }
+}
+
 /// The host-wide debt the ledger saw; `None` is an unobserved axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HostDebt {
-    /// `loom:review-requested`.
+    /// `loom:review-requested`, over the **fresh** entries.
     pub review: Option<AxisDebt>,
-    /// `loom:changes-requested`.
+    /// `loom:changes-requested`, over the **fresh** entries.
     pub changes: Option<AxisDebt>,
-    /// `loom:pr`.
+    /// `loom:pr`, over the **fresh** entries.
     pub merge: Option<AxisDebt>,
+    /// What each axis's *width* is sized from (#9414) — the last-known sum, not
+    /// the fresh one. A hand-built `HostDebt` leaves this empty (every axis
+    /// fails open); [`Self::with_fresh_widths`] fills it from the fresh totals.
+    pub widths: AxisWidths,
 }
 
 impl HostDebt {
-    /// The debt on `axis`.
+    /// The **fresh** debt on `axis`: what the reservation ([`want`]) and the
+    /// #9410 build back-off read, where a stale over-count costs real slots.
     #[must_use]
     pub fn axis(&self, axis: DebtAxis) -> Option<AxisDebt> {
         match axis {
@@ -208,6 +303,26 @@ impl HostDebt {
             DebtAxis::Changes => self.changes,
             DebtAxis::Merge => self.merge,
         }
+    }
+
+    /// The debt `axis`'s **width** is sized from (#9414): the sum of every
+    /// root's last-known count, stale entries included. `None` — nothing fresh
+    /// on the axis, or a zero total — fails open to the Phase 1 budget.
+    #[must_use]
+    pub fn axis_width(&self, axis: DebtAxis) -> Option<usize> {
+        self.widths.axis(axis)
+    }
+
+    /// Fill [`Self::widths`] from the fresh totals: the reading a host whose
+    /// every root was observed in this instant has. Only
+    /// [`DemandLedger::host_debt_at`] produces the real reading; synthetic
+    /// hosts (tests, harnesses) use this so they do not silently fail open.
+    #[must_use]
+    pub fn with_fresh_widths(mut self) -> Self {
+        for axis in DebtAxis::ALL {
+            *self.widths.axis_mut(axis) = self.axis(axis).map(|d| d.total).filter(|t| *t > 0);
+        }
+        self
     }
 
     fn axis_mut(&mut self, axis: DebtAxis) -> &mut Option<AxisDebt> {
@@ -245,7 +360,8 @@ impl DemandLedger {
         entries.insert((root.to_path_buf(), axis), (count, at));
     }
 
-    /// The host aggregate over entries no older than `stale`.
+    /// The host aggregate over entries no older than `stale`, plus the width
+    /// reading over every entry ([`HostDebt::axis_width`]).
     #[must_use]
     pub fn host_debt(&self, stale: Duration) -> HostDebt {
         self.host_debt_at(Instant::now(), stale)
@@ -257,13 +373,26 @@ impl DemandLedger {
         self.reads.fetch_add(1, Ordering::Relaxed);
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let mut debt = HostDebt::default();
+        // Per axis, the sum of every root's last-known count — stale entries
+        // included, so a partially stale axis does not under-count the host
+        // debt its width is sized from (#9414).
+        let mut last_known = [0usize; DebtAxis::ALL.len()];
         for ((_, axis), (count, at)) in entries.iter() {
+            last_known[axis.index()] += count;
             if now.saturating_duration_since(*at) > stale {
                 continue;
             }
             let slot = debt.axis_mut(*axis).get_or_insert_with(AxisDebt::default);
             slot.total += count;
             slot.roots_with_debt += usize::from(*count > 0);
+        }
+        for axis in DebtAxis::ALL {
+            // Fail open unless the axis has something fresh (an axis nobody has
+            // observed recently stays **unobserved**, exactly as before) and a
+            // positive total (a zero total is a cold start as readily as a
+            // drained host, and narrowing on it buys nothing).
+            let total = last_known[axis.index()];
+            *debt.widths.axis_mut(axis) = (debt.axis(axis).is_some() && total > 0).then_some(total);
         }
         debt
     }
@@ -514,8 +643,16 @@ pub struct DemandDecision {
     pub role: &'static str,
     /// Its Phase 1 budget (`roleMaxConcurrent` or the default).
     pub phase1_budget: usize,
-    /// The debt on its own axis (`None`: unobserved, or not a PR role).
+    /// The debt its width was sized from ([`HostDebt::axis_width`]) — `None`
+    /// when its axis is unobserved or it is not a PR role.
     pub debt: Option<usize>,
+    /// The **fresh** total on the same axis ([`HostDebt::axis`]) — what
+    /// [`Self::debt`] would have been before #9414. Narration only: the log
+    /// line is the sole telemetry for this mechanism, and without both numbers
+    /// a reader cannot tell a drained host (`debt` unobserved because the fresh
+    /// total is `0`) from an unvisited one (no fresh entry at all), nor see how
+    /// far the fresh sum has fallen behind the last-known one.
+    pub fresh_debt: Option<usize>,
     /// Its width, for a PR role.
     pub width: Option<usize>,
     /// The effective budget: width for judge/doctor, else the Phase 1 budget.
@@ -536,7 +673,10 @@ pub fn decide(
     let budget_of = |r: &str| concurrent_dispatch::resolve_role_max_concurrent(budgets, r, ceiling);
     let phase1_budget = budget_of(role);
     let axis = DebtAxis::for_role(role);
-    let debt = axis.and_then(|a| host.axis(a)).map(|d| d.total);
+    // Width reads the last-known sum, not the fresh one (#9414); the
+    // reservation below keeps the fresh aggregate.
+    let debt = axis.and_then(|a| host.axis_width(a));
+    let fresh_debt = axis.and_then(|a| host.axis(a)).map(|d| d.total);
     let width = axis.map(|_| width(debt, cfg, phase1_budget));
     let budget = match role {
         // Queue-gated, so width only limits how many non-empty repos run.
@@ -553,6 +693,7 @@ pub fn decide(
         role,
         phase1_budget,
         debt,
+        fresh_debt,
         width,
         budget,
         plan,
@@ -566,15 +707,15 @@ pub fn log_if_changed(ledger: &DemandLedger, decision: &DemandDecision, cfg: &De
         return;
     }
     let [champion, judge, doctor] = decision.plan.wants;
+    let shown = |n: Option<usize>| n.map_or_else(|| "unobserved".to_string(), |d| d.to_string());
     log::info!(
-        "role_runner: {} demand admission — debt {} → width {}, effective budget {} (perRun \
-         {}, max {}, phase-1 budget {}); ceiling reservation {} for higher-priority PR roles \
-         (wants champion={champion} judge={judge} doctor={doctor}, cap {} = ceiling − \
-         nonPrFloor {}) (#9392)",
+        "role_runner: {} demand admission — debt {} (fresh {}) → width {}, effective budget {} \
+         (perRun {}, max {}, phase-1 budget {}); ceiling reservation {} for higher-priority PR \
+         roles (wants champion={champion} judge={judge} doctor={doctor}, cap {} = ceiling − \
+         nonPrFloor {}) (#9392, #9414)",
         decision.role,
-        decision
-            .debt
-            .map_or_else(|| "unobserved".to_string(), |d| d.to_string()),
+        shown(decision.debt),
+        shown(decision.fresh_debt),
         decision
             .width
             .map_or_else(|| "n/a".to_string(), |w| w.to_string()),
