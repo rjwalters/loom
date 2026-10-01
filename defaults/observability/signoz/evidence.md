@@ -1495,15 +1495,26 @@ that carry the answers:
 | `{repo}` scopes every section, not just Q1 | `org/alpha` drops the other repo from Q1 (7 → 6 rows) **and** from Q2's inner sub-select (22 → 21 observations, pinball 1280 → 1310) | — |
 | Q2's subtotals are attributable | `rolled_up` 2 (1 observation) vs 3 (31) on otherwise identical keys | removing the column leaves two indistinguishable rows |
 | Q3's nulls are dropped, not zeroed | `unmeasured`, `label`, `numeric_string` and `flaky` are absent from the ranking entirely | the typed extraction admits `numeric_string` and `flaky` at n=21 and `rank_corr` 0.5 each |
-| An unvarying feature is visible as one | `open_prs`: n 21, `distinct_values` **1**, `rank_corr` **0.5**, `pearson_corr` **nan** | — (observed behaviour, not a desired one; the column exists so it is attributable) |
+| An unvarying feature is visible as one | `open_prs`: n 21, `distinct_values` **1**, `rank_corr` **0.5**, `pearson_corr` **NaN** | — (observed behaviour, not a desired one; the column exists so it is attributable) |
 | The sample floor holds | three features ranked; `partial` (n=12, `rank_corr` 1.0) excluded | removing `HAVING n >= 20` surfaces a perfect correlation on 12 observations, revB's five-sample features, and `nan` rows from one-observation groups |
 
-Two caveats a reader should carry out of this. `HAVING n >= 20` means a short
+Three caveats a reader should carry out of this. `HAVING n >= 20` means a short
 window returns **nothing** from Q3, which reads like "no feature tracks the
-error" rather than "not enough data" — section 0's counts are the check. And
+error" rather than "not enough data" — section 0's counts are the check.
 `{since:DateTime}` is interpreted in the **server's** timezone; the trial's
 ClickHouse reports `timezone()` = `UTC`, so the bound means what it says there,
 but that is a property of the deployment, not of the query.
+
+And the **NaN's spelling is architecture-dependent**, which the first CI run of
+this test found rather than its author: ClickHouse 25.12.5 renders the
+zero-variance `corr` as `nan` on arm64 macOS (this trial host) and as `-nan` on
+amd64 Linux (a GitHub runner) — the sign bit the libc `printf` carries out of
+the hardware's quiet NaN, not a different result. Both of the architectures
+[#8696](https://github.com/rjwalters/loom/issues/8696) verified this trial on
+are therefore affected, and so is any consumer that **string-matches** the
+column: a dashboard cell, a CSV export, a downstream parser. The test asserts
+NaN-*ness* rather than either spelling; a literal-string assertion would have
+passed on one architecture and failed on the other.
 
 **What this establishes and what it does not.** The committed file computes the
 documented answers on the engine version the trial deploys, the

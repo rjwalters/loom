@@ -16,8 +16,9 @@
 //!    average-ranks ties, so a feature that never varied over n observations
 //!    comes out at exactly **0.5** — which `ORDER BY abs(rank_corr) DESC`
 //!    ranks above any genuine correlation weaker than that — while `corr`
-//!    answers `nan` for the same column. Q3 now carries `distinct_values` so
-//!    the two are distinguishable.
+//!    answers NaN for the same column (in a spelling that depends on the
+//!    architecture — see [`is_nan`]). Q3 now carries `distinct_values` so the
+//!    two are distinguishable.
 //! 2. **The typed feature extraction's damage is not the one the header
 //!    described.** `JSONExtractKeysAndValues(body, 'features', 'Float64')`
 //!    does not read an unmeasured (`null`) feature as 0 — it drops the key,
@@ -84,11 +85,12 @@ type Row = BTreeMap<String, serde_json::Value>;
 /// stdout. Panics with the engine's own stderr on failure — a query that does
 /// not parse must fail this test, not be silently skipped.
 ///
-/// `output_format_json_quote_denormals=1` is set so a `nan` correlation comes
-/// back as the string `"nan"` rather than JSON `null`: Q3's whole point is
-/// that an unmeasured feature and a constant one must stay distinguishable,
-/// and collapsing both to `null` in the transport would hide the difference
-/// this test exists to observe.
+/// `output_format_json_quote_denormals=1` is set so a NaN correlation comes
+/// back as a quoted denormal rather than JSON `null`: Q3's whole point is that
+/// an unmeasured feature and a constant one must stay distinguishable, and
+/// collapsing both to `null` in the transport would hide the difference this
+/// test exists to observe. The denormal's *spelling* is architecture-dependent
+/// — see [`is_nan`].
 fn clickhouse(script: &str, format: &str, repo: &str) -> String {
     let mut child = Command::new("docker")
         .args([
@@ -211,6 +213,34 @@ fn text<'a>(row: &'a Row, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("column {key} missing from {row:?}"))
         .as_str()
         .unwrap_or_else(|| panic!("column {key} is not a string in {row:?}"))
+}
+
+/// Whether `key` is a NaN, **whichever way the engine spelled it**.
+///
+/// `output_format_json_quote_denormals=1` emits a quoted denormal, and its text
+/// is architecture-dependent: ClickHouse 25.12.5 writes `nan` on arm64 macOS
+/// and `-nan` on amd64 Linux (observed on this trial host and on a CI runner
+/// respectively — the sign bit a libc `printf` happens to carry out of the
+/// hardware's quiet NaN, not a different result). Asserting the literal string
+/// would make this test pass on one of the trial's two verified architectures
+/// and fail on the other, so NaN-ness is what is checked. Worth knowing beyond
+/// this test: any consumer that string-matches this column — a dashboard, a CSV
+/// export, a downstream parser — has to accept both spellings.
+fn is_nan(row: &Row, key: &str) -> bool {
+    let value = row
+        .get(key)
+        .unwrap_or_else(|| panic!("column {key} missing from {row:?}"));
+    match value {
+        serde_json::Value::String(text) => {
+            matches!(
+                text.trim_start_matches(['-', '+'])
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "nan"
+            )
+        }
+        other => other.as_f64().is_some_and(f64::is_nan),
+    }
 }
 
 /// The row whose `(heuristic, revision, kind)` match. Panics rather than
@@ -549,11 +579,10 @@ fn committed_eta_queries_answer_the_accuracy_questions_on_real_clickhouse() {
          a feature that never varied above any real correlation weaker than \
          0.5, which is why distinct_values must be read beside it"
     );
-    assert_eq!(
-        constant.get("pearson_corr").and_then(|v| v.as_str()),
-        Some("nan"),
-        "corr() answers nan for a zero-variance column. A dashboard that \
-         renders nan as a blank — or worse as 0 — says 'no correlation' about \
+    assert!(
+        is_nan(constant, "pearson_corr"),
+        "corr() answers NaN for a zero-variance column. A dashboard that \
+         renders NaN as a blank — or worse as 0 — says 'no correlation' about \
          the same column rankCorr put at 0.5: {constant:?}"
     );
 
@@ -859,7 +888,8 @@ fn the_sample_floor_keeps_undersampled_features_out_of_the_ranking() {
     );
     assert!(
         rows.iter()
-            .any(|row| row.get("rank_corr").and_then(|v| v.as_str()) == Some("nan")),
-        "and a one-observation group correlates as nan: {rows:?}"
+            .any(|row| num(row, "n") == 1 && is_nan(row, "rank_corr")),
+        "and a one-observation group correlates as NaN — which the floor also \
+         keeps out: {rows:?}"
     );
 }

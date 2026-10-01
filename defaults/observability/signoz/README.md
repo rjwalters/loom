@@ -438,8 +438,9 @@ five, in this order:
   average-ranks ties, so a feature that took one value across the window comes
   out at exactly **`rank_corr` = 0.5** — above any genuine correlation weaker
   than that, under this section's own `ORDER BY abs(rank_corr) DESC` — while
-  `pearson_corr` reads `nan`. `distinct_values` = 1 is the tell. Do not read a
-  0.5 without it.
+  `pearson_corr` reads NaN. `distinct_values` = 1 is the tell. Do not read a
+  0.5 without it. The NaN's **spelling** is architecture-dependent (`nan` on
+  arm64, `-nan` on amd64 Linux), so never string-match it.
 - **Q3 cannot see an estimate older than the window.** Its estimate sub-select
   carries the same `since` bound as the outcome one, so an outcome whose
   estimate predates `since` is scored by Q1/Q2 and contributes no features here.
