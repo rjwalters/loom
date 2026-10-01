@@ -56,7 +56,7 @@
 5161 defaults/.claude/commands/loom/sweep-dry-run.md
 1923 defaults/.claude/commands/loom/sweep-examples.md
 18369 defaults/.claude/commands/loom/sweep-execution-model.md
-5127 defaults/.claude/commands/loom/sweep-mode-c-lifecycle.md
+5125 defaults/.claude/commands/loom/sweep-mode-c-lifecycle.md
 7265 defaults/.claude/commands/loom/sweep-reference.md
 5429 defaults/.claude/commands/loom/sweep-run-hygiene.md
 6222 defaults/.claude/commands/loom/sweep-scheduling-signals.md
