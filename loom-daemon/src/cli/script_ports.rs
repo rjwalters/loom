@@ -621,12 +621,14 @@ pub(crate) enum MergePrCommand {
     /// the candidate in a scratch worktree, push, create ONE candidate PR
     /// carrying the trusted component mapping, and reserve every source via
     /// the #9378 sequencing gate (source = sequenced behind the candidate).
-    /// Adopt-first on the deterministic attempt id; hard-abort on conflict
-    /// or a mid-preparation head push.
+    /// Adopt-first on the deterministic attempt id, only while the attempt
+    /// is live; hard-abort on conflict or on any push to the candidate or a
+    /// source (ADR-0023 §3).
     ConsolidatePrepare(super::merge_pr_consolidate::ConsolidatePrepareArgs),
 
     /// Abort a consolidation attempt (#9688): release ONLY the attempt's own
-    /// reservations, close the candidate PR, clean up its branch. Sources
+    /// still-live reservations, close the candidate PR with the abort cause
+    /// recorded, clean up its branch. Sources
     /// are preserved untouched. A merged candidate cannot be aborted —
     /// landing wins and #9689's reconcile owns the aftermath.
     ConsolidateAbort(super::merge_pr_consolidate::ConsolidateAbortArgs),

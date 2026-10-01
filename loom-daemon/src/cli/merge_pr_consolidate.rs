@@ -4,29 +4,37 @@
 //!
 //! # Contract highlights the caller must not need to re-derive
 //!
-//! - Eligibility is checked fresh immediately before any mutation, and the
-//!   head pins are re-read AFTER the candidate exists (a source push during
-//!   preparation aborts the attempt instead of silently re-pinning).
+//! - Eligibility is checked fresh immediately before any mutation.
+//! - **Any push aborts the attempt** (ADR-0023 §3, operator ruling
+//!   2026-10-01). Once the reservations are applied, preparation runs the
+//!   three-part `pin_check`: candidate head equals the ledger, every source
+//!   head equals its pin, every reservation is live. Any failure withdraws
+//!   the candidate (close + release + branch delete) and fails the run.
+//!   Nothing is ever re-pinned or repaired in place; the next attempt
+//!   against the new heads has a fresh id.
 //! - Adopt-first: an open candidate PR for this group's deterministic
-//!   attempt id is adopted, never duplicated; missing reservations are
-//!   backfilled, present ones left alone.
+//!   attempt id is adopted, never duplicated, but only while the attempt is
+//!   live. A candidate whose head moved off its ledger, or a reservation that
+//!   was applied and then lost, aborts instead of being adopted. Only a
+//!   reservation that was never written is backfilled, against the
+//!   ledger's recorded candidate head (never the live one).
 //! - A construction conflict is a hard abort: sources untouched, scratch
 //!   worktree removed, no partial candidate.
-//! - A head move detected after the candidate PR exists withdraws that
-//!   candidate (close + release + branch delete) before failing: its attempt
-//!   id is pinned to the old heads, so no later run could ever adopt it.
-//! - Abort releases ONLY the attempt's own reservations (markers whose
-//!   `plan=` names this attempt), preserves every source, and never touches
-//!   a merged candidate (landing wins; reconciliation territory). A released
-//!   reservation no longer counts against eligibility (`live_marker`).
+//! - Abort releases ONLY the attempt's own still-live reservations (the
+//!   source's live hold names this attempt; holds the ordering pass already
+//!   voided are skipped), preserves every source, records the ADR §7 abort
+//!   cause, and never touches a merged candidate (landing wins;
+//!   reconciliation territory). A released reservation no longer counts
+//!   against eligibility (`live_marker`).
 //! - Every `gh` call honors `--repo`/`LOOM_REPO` and the per-root credential.
 
 use anyhow::{bail, Context, Result};
 use loom_daemon::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
 use loom_daemon::merge_pr::consolidate::{
     self as cons, attempt_id, candidate_branch, check_eligibility, fetch_component,
-    find_open_candidate, live_marker, mapping_body, parse_mapping, push_branch, remove_worktree,
-    reservation_comment_body, reservation_marker, reservation_present, Bounds, PrepareOutcome,
+    find_open_candidate, live_marker, mapping_body, parse_mapping, pin_check, push_branch,
+    remove_worktree, reservation_comment_body, reservation_marker, reservation_present,
+    reservation_state, AbortReason, Bounds, CandidateMapping, PrepareOutcome, ReservationState,
 };
 use loom_daemon::merge_pr::sequence::fetch_trusted_bodies;
 use serde::Deserialize;
@@ -83,7 +91,7 @@ impl ConsolidatePrepareArgs {
         let attempt = attempt_id(&pins);
         let branch = candidate_branch(&attempt);
         if let Some(existing) = find_open_candidate(&gh, &root, &branch)? {
-            let applied = backfill_reservations(&gh, &root, existing, &attempt, &components)?;
+            let applied = adopt(&gh, &root, existing, &attempt, &components)?;
             println!(
                 "AlreadyPrepared: candidate PR #{existing} already exists for attempt {attempt} \
                  — adopted, {applied} reservation(s) backfilled"
@@ -116,7 +124,18 @@ impl ConsolidatePrepareArgs {
         let body =
             mapping_body(&attempt, &default_branch, &candidate_head, &pin_refs, &self.reason);
         let candidate_pr = match find_open_candidate(&gh, &root, &branch)? {
-            Some(existing) => existing,
+            // A racing worker created the PR between our push and here: its
+            // ledger, not ours, is the attempt's record, so adopt it through
+            // the same live-attempt checks as step 3.
+            Some(existing) => {
+                remove_worktree("git", &root, &worktree);
+                let applied = adopt(&gh, &root, existing, &attempt, &components)?;
+                println!(
+                    "AlreadyPrepared: candidate PR #{existing} was created concurrently for \
+                     attempt {attempt} — adopted, {applied} reservation(s) backfilled"
+                );
+                return Ok(());
+            }
             None => {
                 match create_candidate_pr(&gh, &root, &branch, &default_branch, &attempt, &body) {
                     Ok(pr) => pr,
@@ -130,41 +149,23 @@ impl ConsolidatePrepareArgs {
                 }
             }
         };
-
-        // 6. Re-read the source heads: a push during preparation aborts
-        // instead of silently re-pinning (ADR-0023 worked example 5).
-        let mut moved = Vec::new();
-        for c in &components {
-            let fresh = fetch_component(&gh, &root, c.number)?;
-            if fresh.pin() != c.pin() {
-                moved.push(c.number);
-            }
-        }
-        if !moved.is_empty() {
-            remove_worktree("git", &root, &worktree);
-            // The candidate PR already exists (step 5) and its attempt id is
-            // derived from the OLD heads, so a retry against the new heads
-            // lands on a different branch and can never adopt it. Withdraw it
-            // now — close, release anything a racing worker reserved under
-            // this attempt, delete the branch — or it is orphaned for good.
-            if let Err(e) = abort(&gh, &root, candidate_pr, AbortCause::HeadsMoved(&moved)) {
-                eprintln!(
-                    "consolidate-prepare: withdrawing candidate #{candidate_pr} failed ({e:#}); \
-                     run `consolidate-abort --pr {candidate_pr}` to finish the cleanup"
-                );
-            }
-            bail!(
-                "component heads moved during preparation: {:?} — HARD ABORT per ADR-0023; \
-                 candidate #{candidate_pr} withdrawn. Re-run against the new heads (a fresh \
-                 attempt id)",
-                moved
-            );
-        }
-
-        // 7. Reservations.
-        let applied =
-            apply_reservations(&gh, &root, candidate_pr, &candidate_head, &attempt, &components)?;
         remove_worktree("git", &root, &worktree);
+        let mapping = parse_mapping(&body)
+            .context("the candidate body this run wrote does not parse as a mapping")?;
+
+        // 6. Reservations, then (7) the push-abort check. The order matters:
+        // re-reading the heads BEFORE reserving would leave a window where a
+        // source push lands between the read and the reservation, pinning a
+        // hold to a head that is already gone (ADR-0023 worked example 5).
+        let applied = apply_reservations(
+            &gh,
+            &root,
+            candidate_pr,
+            &mapping.candidate_head,
+            &attempt,
+            &components,
+        )?;
+        verify_or_abort(&gh, &root, candidate_pr, &mapping)?;
         println!(
             "Prepared: attempt {attempt}, candidate PR #{candidate_pr} (branch {branch}), \
              {applied} reservation(s) applied, components {:?}",
@@ -186,6 +187,11 @@ pub(crate) struct ConsolidateAbortArgs {
     #[arg(long, value_name = "N")]
     pr: u32,
 
+    /// Why (ADR-0023 §7 abort cause, recorded in the close comment):
+    /// `operator` (a decision) or `ci-failure` (the candidate's CI is red).
+    #[arg(long, value_enum, default_value_t = RequestedCause::Operator)]
+    cause: RequestedCause,
+
     /// OWNER/REPO. Omit to let `gh` resolve from the working directory.
     #[arg(long, value_name = "OWNER/REPO")]
     repo: Option<String>,
@@ -196,8 +202,20 @@ impl ConsolidateAbortArgs {
         scope_repo(self.repo.as_deref());
         let root = std::env::current_dir()?;
         let gh = std::path::PathBuf::from(cons::gh_bin_env());
-        abort(&gh, &root, self.pr, AbortCause::Requested)
+        let reason = match self.cause {
+            RequestedCause::Operator => AbortReason::Operator,
+            RequestedCause::CiFailure => AbortReason::CiFailure,
+        };
+        abort(&gh, &root, self.pr, &reason)
     }
+}
+
+/// The causes a human may name on `consolidate-abort`; the push-abort
+/// causes are detected, never claimed.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum RequestedCause {
+    Operator,
+    CiFailure,
 }
 
 // --- shared helpers (CLI-local I/O glue) --------------------------------
@@ -300,32 +318,170 @@ fn apply_reservations(
     Ok(applied)
 }
 
-fn backfill_reservations(
+/// The candidate PR as the push-abort checks need it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CandidatePr {
+    body: String,
+    state: String,
+    head_ref_name: String,
+    head_ref_oid: String,
+}
+
+fn view_candidate(
     gh: &std::path::Path,
     root: &std::path::Path,
-    candidate_pr: u32,
-    attempt: &str,
-    components: &[loom_daemon::merge_pr::consolidate::ComponentState],
-) -> Result<usize> {
-    // The adopted candidate's head: from the PR itself, not re-derived.
+    candidate: u32,
+) -> Result<CandidatePr> {
     let out = gh_cmd(gh, root)
         .args([
             "pr",
             "view",
-            &candidate_pr.to_string(),
+            &candidate.to_string(),
             "--json",
-            "headRefOid",
-            "--jq",
-            ".headRefOid",
+            "body,state,headRefName,headRefOid",
         ])
         .output()
         .context("gh pr view candidate")?;
     if !out.status.success() {
-        bail!("reading the candidate head: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "reading candidate PR #{candidate}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
-    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let (applied, _) =
-        backfill_reservations_inner(gh, root, candidate_pr, &head, attempt, components)?;
+    serde_json::from_slice(&out.stdout).context("parse candidate JSON")
+}
+
+/// Every mapped source's live state and oldest-first trusted bodies. An
+/// unreadable transcript is an error, not an abort: the check cannot tell a
+/// lost reservation from a failed read, and aborting on a read failure would
+/// destroy a live attempt. The attempt stays as it is; a re-run re-checks.
+fn read_sources(
+    gh: &std::path::Path,
+    root: &std::path::Path,
+    mapping: &CandidateMapping,
+) -> Result<Vec<(cons::ComponentState, Vec<String>)>> {
+    let bin = gh.to_string_lossy().to_string();
+    let mut sources = Vec::new();
+    for (n, _) in &mapping.components {
+        let c = fetch_component(gh, root, *n).context(format!("re-reading PR #{n}"))?;
+        let Some(bodies) = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", *n) else {
+            bail!(
+                "could not read PR #{n}'s comments to verify its reservation; attempt {} is left \
+                 as it is, re-run to re-check it",
+                mapping.attempt
+            );
+        };
+        sources.push((c, bodies));
+    }
+    Ok(sources)
+}
+
+/// ADR-0023 §3: once this run's reservations are in place, the attempt must
+/// still be live, or it is aborted. Nothing is re-pinned.
+fn verify_or_abort(
+    gh: &std::path::Path,
+    root: &std::path::Path,
+    candidate_pr: u32,
+    mapping: &CandidateMapping,
+) -> Result<()> {
+    let live_head = view_candidate(gh, root, candidate_pr)?.head_ref_oid;
+    let sources = read_sources(gh, root, mapping)?;
+    match pin_check(mapping, candidate_pr, &live_head, &sources) {
+        None => Ok(()),
+        Some(reason) => Err(abort_attempt(gh, root, candidate_pr, &reason)),
+    }
+}
+
+/// Abort for `reason` and turn it into the run's error. A failed withdrawal
+/// is reported with the command that finishes it.
+fn abort_attempt(
+    gh: &std::path::Path,
+    root: &std::path::Path,
+    candidate_pr: u32,
+    reason: &AbortReason,
+) -> anyhow::Error {
+    if let Err(e) = abort(gh, root, candidate_pr, reason) {
+        eprintln!(
+            "consolidate-prepare: withdrawing candidate #{candidate_pr} failed ({e:#}); run \
+             `consolidate-abort --pr {candidate_pr}` to finish the cleanup"
+        );
+    }
+    anyhow::anyhow!(
+        "consolidation attempt {} — HARD ABORT per ADR-0023 §3 (cause {}); candidate \
+         #{candidate_pr} withdrawn. Re-run against the current heads for a fresh attempt id",
+        reason.describe(),
+        reason.cause()
+    )
+}
+
+/// Adopt an open candidate for `attempt` — only while the attempt is live.
+///
+/// The ledger (the candidate body) is the record: its attempt and pins must
+/// be this group's, its recorded candidate head must still be the live one,
+/// and no reservation it already wrote may have been lost. Any of those
+/// failing is a push abort, not a repair. Reservations that were never
+/// written are backfilled against the RECORDED candidate head, then the full
+/// check runs again. Returns the number backfilled.
+fn adopt(
+    gh: &std::path::Path,
+    root: &std::path::Path,
+    candidate_pr: u32,
+    attempt: &str,
+    components: &[cons::ComponentState],
+) -> Result<usize> {
+    let cand = view_candidate(gh, root, candidate_pr)?;
+    let Some(mapping) = parse_mapping(&cand.body) else {
+        bail!(
+            "open PR #{candidate_pr} on the {attempt} candidate branch carries no consolidation \
+             mapping — refusing to adopt it; inspect it by hand"
+        );
+    };
+    let ours: std::collections::BTreeSet<(u32, String)> = components
+        .iter()
+        .filter_map(|c| c.pin().map(|(n, h)| (n, h.to_string())))
+        .collect();
+    let recorded: std::collections::BTreeSet<(u32, String)> =
+        mapping.components.iter().cloned().collect();
+    if mapping.attempt != attempt || ours != recorded {
+        bail!(
+            "candidate PR #{candidate_pr}'s ledger (attempt {}) does not record this group's \
+             pins — refusing to adopt it; inspect it by hand",
+            mapping.attempt
+        );
+    }
+    if cand.head_ref_oid != mapping.candidate_head {
+        return Err(abort_attempt(
+            gh,
+            root,
+            candidate_pr,
+            &AbortReason::CandidatePush {
+                recorded: mapping.candidate_head.clone(),
+                live: cand.head_ref_oid,
+            },
+        ));
+    }
+    let sources = read_sources(gh, root, &mapping)?;
+    let lost: Vec<u32> = sources
+        .iter()
+        .filter(|(c, bodies)| {
+            let expected = reservation_marker(candidate_pr, &mapping.candidate_head, c, attempt);
+            reservation_state(c, bodies, &expected) == ReservationState::Lost
+        })
+        .map(|(c, _)| c.number)
+        .collect();
+    if !lost.is_empty() {
+        return Err(abort_attempt(gh, root, candidate_pr, &AbortReason::ReservationLost(lost)));
+    }
+    let (applied, _) = backfill_reservations_inner(
+        gh,
+        root,
+        candidate_pr,
+        &mapping.candidate_head,
+        attempt,
+        components,
+    )?;
+    verify_or_abort(gh, root, candidate_pr, &mapping)?;
     Ok(applied)
 }
 
@@ -416,48 +572,15 @@ fn create_candidate_pr(
     Ok(number)
 }
 
-/// Why an attempt is being withdrawn — only the candidate's close comment
-/// differs; the release/close/delete steps are identical.
-enum AbortCause<'a> {
-    /// `consolidate-abort` (failed candidate CI, operator decision).
-    Requested,
-    /// `consolidate-prepare` step 6: these components' heads moved after the
-    /// candidate PR was created (ADR-0023 worked example 5).
-    HeadsMoved(&'a [u32]),
-}
-
 fn abort(
     gh: &std::path::Path,
     root: &std::path::Path,
     candidate: u32,
-    cause: AbortCause<'_>,
+    reason: &AbortReason,
 ) -> Result<()> {
     let bin = gh.to_string_lossy().to_string();
     // 1. The mapping comes from the candidate's own body (the ledger).
-    let out = gh_cmd(gh, root)
-        .args([
-            "pr",
-            "view",
-            &candidate.to_string(),
-            "--json",
-            "body,state,headRefName",
-        ])
-        .output()
-        .context("gh pr view candidate")?;
-    if !out.status.success() {
-        bail!(
-            "reading candidate PR #{candidate}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct CandidatePr {
-        body: String,
-        state: String,
-        head_ref_name: String,
-    }
-    let c: CandidatePr = serde_json::from_slice(&out.stdout).context("parse candidate JSON")?;
+    let c = view_candidate(gh, root, candidate)?;
     let Some(mapping) = parse_mapping(&c.body) else {
         bail!("PR #{candidate} carries no consolidation mapping — not a candidate PR");
     };
@@ -465,17 +588,29 @@ fn abort(
         bail!("candidate #{candidate} is MERGED — landing wins; run consolidate-reconcile (#9689), never abort");
     }
 
-    // 2. Release ONLY this attempt's reservations: a source's NEWEST marker
-    // must name this attempt, or it is not ours to touch.
+    // 2. Release ONLY this attempt's STILL-LIVE reservations: the source's
+    // live hold (label present, no newer `released`/`replanned` tombstone)
+    // must name this attempt. A hold the ordering pass already voided, or a
+    // newer hold from another plan, is not ours to touch (ADR-0023 §3).
     let mut released = 0;
+    let mut skipped = 0;
     for (number, _head) in &mapping.components {
+        let source = match fetch_component(gh, root, *number) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("consolidate-abort: could not read PR #{number} ({e:#}) — leaving its reservation for a re-run");
+                continue;
+            }
+        };
         let Some(bodies) = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", *number) else {
             eprintln!("consolidate-abort: could not read PR #{number}'s comments — leaving its reservation for a re-run");
             continue;
         };
-        let ours =
-            loom_daemon::merge_pr::sequence::parse(&bodies).filter(|m| m.plan == mapping.attempt);
-        let Some(marker) = ours else { continue };
+        let ours = live_marker(&source, &bodies).filter(|m| m.plan == mapping.attempt);
+        let Some(marker) = ours else {
+            skipped += 1;
+            continue;
+        };
         let n = number.to_string();
         // Label first: the label IS the hold. If it cannot come off, the
         // reservation is still live — say so and post no release marker,
@@ -503,24 +638,9 @@ fn abort(
         released += 1;
     }
 
-    // 3. Close the candidate (idempotent — closing a closed PR is a no-op).
-    let why = match cause {
-        AbortCause::Requested => "aborted".to_string(),
-        AbortCause::HeadsMoved(moved) => {
-            let list: Vec<String> = moved.iter().map(|n| format!("#{n}")).collect();
-            format!(
-                "aborted during preparation because component head(s) moved after pinning ({}) \
-                 — a fresh attempt against the new heads gets a new id (ADR-0023 worked example 5)",
-                list.join(", ")
-            )
-        }
-    };
-    let comment = format!(
-        "Consolidation attempt `{}` {why}: the candidate is withdrawn and every component \
-         reservation is released. The component PRs are untouched and actionable. (ADR-0023 §3, \
-         #9688)",
-        mapping.attempt
-    );
+    // 3. Close the candidate with the cause recorded (ADR-0023 §7).
+    // Idempotent: a closed candidate only gets the comment again on a re-run.
+    let comment = cons::abort_comment(&mapping.attempt, reason);
     let out = gh_cmd(gh, root)
         .args(["pr", "close", &candidate.to_string(), "--comment", &comment])
         .output()
@@ -551,8 +671,10 @@ fn abort(
     }
 
     println!(
-        "Aborted: attempt {}, candidate #{candidate} closed, {released} reservation(s) released",
-        mapping.attempt
+        "Aborted: attempt {} (cause {}), candidate #{candidate} closed, {released} reservation(s) \
+         released, {skipped} already voided or released",
+        mapping.attempt,
+        reason.cause()
     );
     Ok(())
 }
