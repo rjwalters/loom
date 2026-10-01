@@ -987,6 +987,116 @@ README's documented operator step. Its effect over a multi-day soak therefore
 remains unobserved on a live stack. After applying it, the README's
 `part_log` failed-merge query is the check that should return no rows.
 
+### Applied to the live deployment, 2026-10-01 — the 9-day soak and the result
+
+The step left undone above was executed. The deployment had by then been
+running the **unfixed** render continuously since its ClickHouse volume was
+created on 2026-09-22T09:13Z, so the "not yet observed on a live soak" row had
+in the meantime accumulated a 9-day observation of the defect, and the fix's
+own effect could be measured against it on the same host, same volume, same
+pinned image.
+
+**Before (2026-10-01 06:56Z, uptime 268,697 s ≈ 3.1 days on this container).**
+The defect had not stabilised; it had grown monotonically since 2026-09-28:
+
+| | 2026-09-28 (#9298) | 2026-10-01 (this pass) |
+| --- | --- | --- |
+| Failed `metric_log` merges per hour | 7,723–9,318 | 8,991–10,991 (70,249 in 6 h 56 m; 10,135/h mean) |
+| Successful `metric_log` merges per hour | ~22 | 19–25 (159 all day: a **441.8 : 1** failure ratio) |
+| Active `metric_log` parts | 54 | **135** |
+| Cumulative `QueryMemoryLimitExceeded` | 570,199 | **803,096** |
+| Oldest active part, past its 1-day TTL by | 5 days | **9 days** (parts dated 2026-09-22, `modification_time` 2026-09-22 18:08Z) |
+
+Every failure was error **241** (`MEMORY_LIMIT_EXCEEDED`) — 70,249 of 70,249,
+with no second error code — against `max_server_memory_usage` of 1.80 GiB.
+Attribution is unambiguous in the same reading: *every other* `system.*_log`
+table expires normally on this exact server, with 1 to 13 lifetime failures
+each (`part_log` 13/673, `text_log` 3/164, `trace_log` 2/153, `error_log`
+2/889, `zookeeper_log` 1/1,578, `asynchronous_metric_log` 1/1,381). The cost
+was concrete: `system` held **999.08 MiB** against **235 KiB** of Loom signal
+across all four `signoz_*` databases — a 4,300x ratio — and the container sat
+at **109.76 % CPU** of one core doing nothing but retrying one merge.
+
+**Applying it.** The deployment's rendered files live in a machine-private
+state directory outside this checkout, and a full recursive diff against the
+committed render showed it was behind by *exactly* the fix: one
+`schema_type: transposed_with_wide_view` line in
+`pours/deployment/telemetrystore/clickhouse/config-0-0.yaml`, plus the lock's
+patch record. Nothing else had drifted in either direction, so the live
+project was running a byte-identical render otherwise. The old casting, lock
+and config were kept aside first; `docker compose … config --quiet` then
+accepted the synced render, and `up -d --wait --force-recreate --no-deps` on
+the ClickHouse service alone returned **healthy in 9.19 s**. The README's
+remediation was found to be missing this sync step, and to carry an unbounded
+failed-merge check query — both corrected there (see "Two README defects the
+live run exposed" below).
+
+**After.** The rendered override took effect exactly as the off-stack
+reproduction predicted:
+
+| Property | Observation |
+| --- | --- |
+| `system.metric_log` | now a **`SystemMetricLogView`**, still **1,552 columns** — queries are source-compatible |
+| Backing table | `system.transposed_metric_log`, **6 columns**, `TTL event_date + toIntervalDay(1)` |
+| View returns real rows | 30 rows over a 30 s window, `event_time` 06:57:21–06:57:50, `max(ProfileEvent_Query)` = 5 — read back through the wide view, not the narrow table |
+| Storage shape | 46,440 rows covering **1,548 distinct metrics** in **1 part, 28.59 KiB** (the wide table held 135 parts / 264.43 MiB) |
+| Old wide table | renamed to `system.metric_log_0` with its 135 stuck parts intact, then dropped per the README |
+| Disk | `system` **999.08 → 737.35 MiB**; `metric_log` left the top-8 table list entirely |
+| CPU | **109.76 % → 9.01 %** within a minute of the drop |
+| Loom signals across the recreate | **37 trace spans / 46 logs / 213 metric series / 213 samples — identical before and after**, a second independent restart-persistence proof |
+| Failed merges after the recreate boundary (06:57:19Z) | **zero on every table except `metric_log_0`**, which logged 73 and stopped at 06:57:48 — the stuck wide parts retrying under their new name until the `DROP` landed. `transposed_metric_log`: none |
+
+The container's `RestartCount` stayed **0** with `OOMKilled=false`, so the
+single recreate is the only restart in this record.
+
+**The merges now succeed — measured, not inferred.** At `uptime()` 1,989 s
+(07:30:28Z) the new backing table had run **13 background merges with 0
+failures**. That is the mechanism the whole defect turned on, and it is the
+single most load-bearing observation here: the wide table managed **159
+successful merges against 70,249 failures in a day**; the transposed table
+managed 13 against 0 in 33 minutes. It held **3 active parts** (3,068,136 rows,
+5.82 MiB) against the wide table's 135 parts, so there is no longer a
+hundred-part merge for the TTL to fail on. `system` sat at 761.46 MiB — now
+dominated by `trace_log`, which expires normally — and CPU at 9.17 % steady.
+All 37 spans / 46 logs / 213 series were still present at the end of the window.
+
+**Still not claimed.** The pre-fix side of this comparison is a genuine 9-day
+soak; the post-fix side is 33 minutes. Successful merges prove the memory
+mechanism is fixed, but they do not yet prove the *retention outcome* across a
+date boundary — that no `transposed_metric_log` part survives past
+`event_date + 1 day`. That needs a multi-day window and one reading of the
+README's (now time-bounded) check query plus `min(min_date)` on the table.
+Until then this row is "applied and working", not "retention confirmed over
+days". That multi-day reading is [#9868](https://github.com/rjwalters/loom/issues/9868).
+
+One unrelated pre-existing warning is visible in the server log and was **not**
+introduced here: `DNSResolver: Cannot resolve host (71f0a3578d29)`, a stale
+Keeper-cluster hostname from an earlier container generation.
+
+### Two README defects the live run exposed
+
+Executing the documented remediation — rather than only rendering it — surfaced
+two errors in it that no static check could have caught:
+
+1. **The sync step was missing.** The remediation went straight to
+   `--force-recreate`. But the deployment's rendered files are not the ones in
+   this checkout; they live in its own state directory. Recreating against
+   those stale copies produces a container with the *old* config and no change
+   at all, while reporting success. The README now copies the re-rendered
+   `casting.yaml` / `casting.yaml.lock` / `pours/` across first, and diffs
+   before copying so an operator sees exactly what the deployment was running.
+2. **The verification query was unbounded in time.** `part_log` retains the old
+   failure rows until its *own* 1-day TTL expires them, so immediately after a
+   successful fix the documented query still returned `metric_log 70,410` — an
+   operator following the README would read a fixed deployment as still broken.
+   It is now bounded to the running server with
+   `AND event_time > now() - toIntervalSecond(uptime())`, which was run verbatim
+   on the live server and correctly reports only the expected
+   `metric_log_0` rename-window rows.
+
+`signoz_deployment_contract.rs` now asserts both, so a later README edit cannot
+silently restore the unbounded query or drop the sync step.
+
 ## Measured usage: the ClickStack parity gap, and how it was closed
 
 ClickStack's README has carried a **Loom measured usage** saved view since its
@@ -1321,7 +1431,7 @@ The live fire-and-resolve check on the trial deployment is
 | Shared fixture manifest observed in SigNoz | **Passed** — see "Shared fixture manifest, executed live" above: 37/14/3 signals, exact totals, graph, grouping, root-less detection, absence-vs-zero and privacy-sentinel queries all verified |
 | Real Loom canary / real Judge-Doctor repair trace | Open — the instrumentation slices landed (#8577/#8579), but #8525 itself stays open for its own live-run acceptance, and the run needs the trial host; see #8529 |
 | Repeated latency/footprint comparison | Open — shared evaluation #8529. A single **co-resident** point-in-time footprint (CPU, memory, volume and per-database disk for both backends) and a same-day query/insert latency distribution are now recorded (see "Co-resident 2.5-day soak"), but no controlled, repeated, same-workload comparison has been run |
-| ClickHouse self-telemetry expires under the rendered 2 GiB cap | **Fixed in the render, not yet observed on a live soak.** The wide upstream `metric_log` failed tens of thousands of TTL merges a day, and its parts outlived their 1-day TTL. The transposed schema, reproduced at about 19x lower peak merge memory on the pinned image, is CI-enforced. A live re-render plus a multi-day failed-merge check is outstanding |
+| ClickHouse self-telemetry expires under the rendered 2 GiB cap | **Applied live and observed; the post-fix multi-day soak is the remainder.** The defect ran a full **9-day** live soak and worsened monotonically — 10,135 failed `metric_log` TTL merges an hour against 159 successful all day (441.8 : 1), all error 241, 135 active parts, parts 9 days into a 1-day TTL, 999 MiB of `system` against 235 KiB of Loom signal, 109.76 % CPU. The committed render was synced into the deployment's state directory and the ClickHouse service recreated (healthy in 9.19 s): `system.metric_log` became a 1,552-column `SystemMetricLogView` over a 6-column `transposed_metric_log` holding 1,548 metrics in 28.59 KiB / 1 part, `system` fell to 737.35 MiB, CPU to 9.01 %, and all 37/46/213/213 Loom signals survived unchanged. Over the following 33 minutes the new backing table ran **13 merges with 0 failures** in 3 active parts — the wide table managed 159 successes against 70,249 failures in a day. See "Applied to the live deployment, 2026-10-01". **Remaining**: a multi-day window confirming the retention *outcome* (no part past `event_date + 1 day`) across a date boundary, which 33 minutes cannot show — [#9868](https://github.com/rjwalters/loom/issues/9868) |
 | CI retro queries (`ci-queries.sql`, #8826) | **Passed on live capture** — every section non-empty; metric-path counts and conclusion split reconcile exactly to the records (592 runs / 2,131 jobs); see "CI retro queries, executed live". Section 5's chunk join is unobserved on real `ci.job.log` data (none reached the trial) |
 | CI metrics retention ≥ 30 days (#8826) | **Passed in effective DDL** — every metric signal table at 30 days |
 | CI logs/traces at 7 days on the current trial | **Open** — API-owned tables still at the upstream 15 days; needs the org login ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
