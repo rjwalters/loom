@@ -1134,7 +1134,7 @@ fn label_sync_catalogue_case(
                 && l.get("description").and_then(|d| d.as_str()) == Some("probe-edited")
         })
         .unwrap_or(false);
-    let (ccode, _) = http
+    let (_ccode, _) = http
         .request("DELETE", &format!("{base}/labels/{label_id}"), &cfg.writer_token, None)
         .unwrap_or((0, String::new()));
     let rows_after = walk_pages(view, http, &cfg.writer_token, &format!("{base}/labels"), 50, 5)
