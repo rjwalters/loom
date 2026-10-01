@@ -32,6 +32,7 @@
 //! | `replay` | print saved responses from the store (no provider) | 0 ok, 1 absent/corrupt |
 
 pub mod adapter;
+pub mod augment_direct;
 pub mod export;
 pub mod flight;
 pub mod key;
