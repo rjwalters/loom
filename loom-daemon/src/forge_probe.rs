@@ -255,7 +255,11 @@ pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> 
         if entry.profile != "required-coordination" {
             // The runner executes the coordination profile; other profiles
             // stay unexecuted in the receipt so coverage stays honest.
-            results.push(CaseResult::unknown(&view, "profile outside the coordination slice", &server_version));
+            results.push(CaseResult::unknown(
+                &view,
+                "profile outside the coordination slice",
+                &server_version,
+            ));
             continue;
         }
         if !cfg.only.is_empty()
@@ -550,12 +554,7 @@ fn fixture_issue(
     })
     .to_string();
     let (code, resp) = http
-        .request(
-            "POST",
-            &format!("repos/{}/issues", cfg.repo),
-            &cfg.writer_token,
-            Some(&body),
-        )
+        .request("POST", &format!("repos/{}/issues", cfg.repo), &cfg.writer_token, Some(&body))
         .map_err(|e| ForgeOutcome::Unknown {
             operation: view.id.clone(),
             why: e,
@@ -652,7 +651,12 @@ fn comment_list_ordered(
     server_version: &str,
 ) -> std::result::Result<CaseResult, ForgeOutcome> {
     if !cfg.live_write {
-        return Ok(refused_row(view, test_id, server_version, "comment order + updated_at evidence"));
+        return Ok(refused_row(
+            view,
+            test_id,
+            server_version,
+            "comment order + updated_at evidence",
+        ));
     }
     let base = format!("repos/{}/issues", cfg.repo);
     let n = fixture_issue(view, cfg, http, "comment-list", "comment-list fixture")?;
@@ -679,14 +683,7 @@ fn comment_list_ordered(
             });
         }
     }
-    let rows = walk_pages(
-        view,
-        http,
-        &cfg.writer_token,
-        &format!("{base}/{n}/comments"),
-        1,
-        5,
-    )?;
+    let rows = walk_pages(view, http, &cfg.writer_token, &format!("{base}/{n}/comments"), 1, 5)?;
     let bodies: Vec<String> = rows
         .iter()
         .filter_map(|c| c.get("body").and_then(|b| b.as_str()).map(String::from))
@@ -700,7 +697,12 @@ fn comment_list_ordered(
         .filter_map(|c| c.get("id").map(|i| i.to_string()))
         .collect();
     let order_ok = bodies.len() >= 2
-        && bodies.iter().rev().take(2).rev().eq([marker1.as_str(), marker2.as_str()]);
+        && bodies
+            .iter()
+            .rev()
+            .take(2)
+            .rev()
+            .eq([marker1.as_str(), marker2.as_str()]);
     Ok(CaseResult {
         test_id: test_id.to_string(),
         operation: view.id.clone(),
@@ -763,11 +765,16 @@ fn issue_list_paged(
         operation: view.id.clone(),
         risk: view.risk.clone(),
         disposition: view.disposition.clone(),
-        outcome: if found { OUTCOME_PASS.into() } else { OUTCOME_FAIL.into() },
+        outcome: if found {
+            OUTCOME_PASS.into()
+        } else {
+            OUTCOME_FAIL.into()
+        },
         server_version: server_version.to_string(),
         actor: actor_of(http, &cfg.writer_token),
         at: now_secs(),
-        expected: "complete pagination: a walked multi-page list contains every created issue".into(),
+        expected: "complete pagination: a walked multi-page list contains every created issue"
+            .into(),
         observed: format!(
             "{} row(s) walked; fixtures #{n1},#{n2} {}",
             rows.len(),
@@ -896,7 +903,11 @@ fn issue_edit_labels_case(
             why: e,
         })?;
     let readback = json_obj(&body)
-        .and_then(|v| v.get("labels").and_then(|l| l.as_array()).map(|a| a.to_owned()))
+        .and_then(|v| {
+            v.get("labels")
+                .and_then(|l| l.as_array())
+                .map(|a| a.to_owned())
+        })
         .unwrap_or_default();
     let names: Vec<String> = readback
         .iter()
@@ -944,7 +955,8 @@ fn issue_edit_body_case(
     }
     let base = format!("repos/{}", cfg.repo);
     let n = fixture_issue(view, cfg, http, "issue-edit-body", "body fixture")?;
-    let body_text = "<!-- loom:park reason=\"probe\" -->\n\nunicode ✓ 'single \"double' <tags &>".to_string();
+    let body_text =
+        "<!-- loom:park reason=\"probe\" -->\n\nunicode ✓ 'single \"double' <tags &>".to_string();
     let (code, resp) = http
         .request(
             "PATCH",
@@ -977,7 +989,11 @@ fn issue_edit_body_case(
         operation: view.id.clone(),
         risk: view.risk.clone(),
         disposition: view.disposition.clone(),
-        outcome: if equal { OUTCOME_PASS.into() } else { OUTCOME_FAIL.into() },
+        outcome: if equal {
+            OUTCOME_PASS.into()
+        } else {
+            OUTCOME_FAIL.into()
+        },
         server_version: server_version.to_string(),
         actor: actor_of(http, &cfg.writer_token),
         at: now_secs(),
@@ -1011,7 +1027,9 @@ fn issue_close_with_reason_case(
             "PATCH",
             &format!("{base}/issues/{n}"),
             &cfg.writer_token,
-            Some(&serde_json::json!({"state": "closed", "state_reason": "not_planned"}).to_string()),
+            Some(
+                &serde_json::json!({"state": "closed", "state_reason": "not_planned"}).to_string(),
+            ),
         )
         .map_err(|e| ForgeOutcome::Unknown {
             operation: view.id.clone(),
@@ -1030,11 +1048,20 @@ fn issue_close_with_reason_case(
             why: e,
         })?;
     let obj = json_obj(&body);
-    let state = obj.as_ref().and_then(|v| v.get("state").and_then(|s| s.as_str())).unwrap_or("");
+    let state = obj
+        .as_ref()
+        .and_then(|v| v.get("state").and_then(|s| s.as_str()))
+        .unwrap_or("");
     let reason = obj
         .as_ref()
         .and_then(|v| v.get("state_reason"))
-        .and_then(|r| if r.is_null() { None } else { r.as_str().map(String::from) });
+        .and_then(|r| {
+            if r.is_null() {
+                None
+            } else {
+                r.as_str().map(String::from)
+            }
+        });
     let closed = state == "closed";
     let reason_ok = reason.as_deref() == Some("not_planned");
     // reopen to leave the fixture reusable/closable by cleanup
@@ -1088,7 +1115,10 @@ fn label_sync_catalogue_case(
             "POST",
             &format!("{base}/labels"),
             &cfg.writer_token,
-            Some(&serde_json::json!({"name": name, "color": "#00aabb", "description": "probe"}).to_string()),
+            Some(
+                &serde_json::json!({"name": name, "color": "#00aabb", "description": "probe"})
+                    .to_string(),
+            ),
         )
         .map_err(|e| ForgeOutcome::Unknown {
             operation: view.id.clone(),
@@ -1112,7 +1142,9 @@ fn label_sync_catalogue_case(
             "PATCH",
             &format!("{base}/labels/{label_id}"),
             &cfg.writer_token,
-            Some(&serde_json::json!({"color": "#00ccdd", "description": "probe-edited"}).to_string()),
+            Some(
+                &serde_json::json!({"color": "#00ccdd", "description": "probe-edited"}).to_string(),
+            ),
         )
         .map_err(|e| ForgeOutcome::Unknown {
             operation: view.id.clone(),
@@ -1222,15 +1254,18 @@ fn comment_edit_delete_case(
         });
     }
     let rows = walk_pages(view, http, &cfg.writer_token, &format!("{base}/{n}/comments"), 50, 5)?;
-    let hit = rows.iter().find(|c| c.get("id").and_then(|i| i.as_u64()) == Some(cid));
+    let hit = rows
+        .iter()
+        .find(|c| c.get("id").and_then(|i| i.as_u64()) == Some(cid));
     let edited = hit
         .map(|c| c.get("body").and_then(|b| b.as_str()) == Some("edited"))
         .unwrap_or(false);
     let (dcode, _) = http
         .request("DELETE", &format!("{base}/comments/{cid}"), &cfg.writer_token, None)
         .unwrap_or((0, String::new()));
-    let rows_after = walk_pages(view, http, &cfg.writer_token, &format!("{base}/{n}/comments"), 50, 5)
-        .unwrap_or_default();
+    let rows_after =
+        walk_pages(view, http, &cfg.writer_token, &format!("{base}/{n}/comments"), 50, 5)
+            .unwrap_or_default();
     let gone = !rows_after
         .iter()
         .any(|c| c.get("id").and_then(|i| i.as_u64()) == Some(cid));
@@ -1250,7 +1285,11 @@ fn comment_edit_delete_case(
         expected: "comment edits in place and deletes cleanly (id namespace: repo-global)".into(),
         observed: format!(
             "edit visible: {edited}; delete: HTTP {dcode}, {}",
-            if gone { "confirmed gone" } else { "STILL PRESENT" }
+            if gone {
+                "confirmed gone"
+            } else {
+                "STILL PRESENT"
+            }
         ),
         notes: vec![
             format!("disposable issue number: {n}"),
@@ -1469,12 +1508,7 @@ mod tests {
             _body: Option<&str>,
         ) -> Result<(u16, String), String> {
             self.calls.set(self.calls.get() + 1);
-            let Some(q) = self
-                .routes
-                .iter()
-                .find(|(p, _)| p == path)
-                .map(|(_, q)| q)
-            else {
+            let Some(q) = self.routes.iter().find(|(p, _)| p == path).map(|(_, q)| q) else {
                 return Err(format!("fake: no scripted response for {path}"));
             };
             let mut q = q.borrow_mut();
@@ -1594,10 +1628,7 @@ mod tests {
     fn comment_readback_requires_the_marker_on_read() {
         let mut http = FakeHttp::new();
         http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-        http.push(
-            "repos/qual-org/loomp-test/issues",
-            vec![Ok((201, r#"{"number": 7}"#.into()))],
-        );
+        http.push("repos/qual-org/loomp-test/issues", vec![Ok((201, r#"{"number": 7}"#.into()))]);
         // comments POST + GET: marker absent -> FAIL (the fake repeats the
         // last scripted answer once its queue runs dry)
         http.push(
@@ -1627,10 +1658,7 @@ mod tests {
     fn comment_list_preserves_order_updated_at_and_completes_pagination() {
         let mut http = FakeHttp::new();
         http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-        http.push(
-            "repos/qual-org/loomp-test/issues",
-            vec![Ok((201, r#"{"number": 9}"#.into()))],
-        );
+        http.push("repos/qual-org/loomp-test/issues", vec![Ok((201, r#"{"number": 9}"#.into()))]);
         http.push(
             "repos/qual-org/loomp-test/issues/9/comments",
             vec![
@@ -1705,10 +1733,7 @@ mod tests {
     fn a_rewritten_body_is_a_fail_not_a_pass() {
         let mut http = FakeHttp::new();
         http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-        http.push(
-            "repos/qual-org/loomp-test/issues",
-            vec![Ok((201, r#"{"number": 4}"#.into()))],
-        );
+        http.push("repos/qual-org/loomp-test/issues", vec![Ok((201, r#"{"number": 4}"#.into()))]);
         http.push(
             "repos/qual-org/loomp-test/issues/4",
             vec![
@@ -1733,10 +1758,7 @@ mod tests {
     fn a_close_without_a_readable_not_planned_reason_is_a_fail() {
         let mut http = FakeHttp::new();
         http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-        http.push(
-            "repos/qual-org/loomp-test/issues",
-            vec![Ok((201, r#"{"number": 3}"#.into()))],
-        );
+        http.push("repos/qual-org/loomp-test/issues", vec![Ok((201, r#"{"number": 3}"#.into()))]);
         http.push(
             "repos/qual-org/loomp-test/issues/3",
             vec![
@@ -1760,10 +1782,7 @@ mod tests {
     fn a_missing_sub_issues_endpoint_is_unsupported_and_the_verdict_stays_nonzero() {
         let mut http = FakeHttp::new();
         http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-        http.push(
-            "repos/qual-org/loomp-test/issues",
-            vec![Ok((201, r#"{"number": 5}"#.into()))],
-        );
+        http.push("repos/qual-org/loomp-test/issues", vec![Ok((201, r#"{"number": 5}"#.into()))]);
         http.push(
             "repos/qual-org/loomp-test/issues/5/sub_issues",
             vec![Ok((404, r#"{"message":"Not Found"}"#.into()))],
@@ -1784,13 +1803,13 @@ mod tests {
     fn a_colon_and_unicode_label_name_survives_add_and_readback() {
         let mut http = FakeHttp::new();
         http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-        http.push(
-            "repos/qual-org/loomp-test/issues",
-            vec![Ok((201, r#"{"number": 6}"#.into()))],
-        );
+        http.push("repos/qual-org/loomp-test/issues", vec![Ok((201, r#"{"number": 6}"#.into()))]);
         http.push(
             "repos/qual-org/loomp-test/labels",
-            vec![Ok((201, r#"{"id": 55, "name": "loomp-loomp-testrun: labels ✓"}"#.into()))],
+            vec![Ok((
+                201,
+                r#"{"id": 55, "name": "loomp-loomp-testrun: labels ✓"}"#.into(),
+            ))],
         );
         http.push(
             "repos/qual-org/loomp-test/issues/6/labels",
@@ -1800,13 +1819,11 @@ mod tests {
             "repos/qual-org/loomp-test/issues/6",
             vec![Ok((
                 200,
-                r#"{"number": 6, "labels": [{"id": 55, "name": "loomp-loomp-testrun: labels ✓"}]}"#.into(),
+                r#"{"number": 6, "labels": [{"id": 55, "name": "loomp-loomp-testrun: labels ✓"}]}"#
+                    .into(),
             ))],
         );
-        http.push(
-            "repos/qual-org/loomp-test/labels/55",
-            vec![Ok((204, "".into()))],
-        );
+        http.push("repos/qual-org/loomp-test/labels/55", vec![Ok((204, "".into()))]);
         let mut cfg = cfg(true);
         cfg.only = vec!["issue-edit-labels".into()];
         let results = run(&cfg, &http).unwrap();
@@ -1821,10 +1838,7 @@ mod tests {
     fn comment_edit_and_delete_round_trip() {
         let mut http = FakeHttp::new();
         http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-        http.push(
-            "repos/qual-org/loomp-test/issues",
-            vec![Ok((201, r#"{"number": 8}"#.into()))],
-        );
+        http.push("repos/qual-org/loomp-test/issues", vec![Ok((201, r#"{"number": 8}"#.into()))]);
         http.push(
             "repos/qual-org/loomp-test/issues/8/comments",
             vec![Ok((201, r#"{"id": 77}"#.into()))],
@@ -1858,18 +1872,12 @@ mod tests {
     fn timeline_carries_comment_and_close_events() {
         let mut http = FakeHttp::new();
         http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-        http.push(
-            "repos/qual-org/loomp-test/issues",
-            vec![Ok((201, r#"{"number": 6}"#.into()))],
-        );
+        http.push("repos/qual-org/loomp-test/issues", vec![Ok((201, r#"{"number": 6}"#.into()))]);
         http.push(
             "repos/qual-org/loomp-test/issues/6/comments",
             vec![Ok((200, r#"{"id": 90}"#.into()))],
         );
-        http.push(
-            "repos/qual-org/loomp-test/issues/6",
-            vec![Ok((201, r#"{"number": 6}"#.into()))],
-        );
+        http.push("repos/qual-org/loomp-test/issues/6", vec![Ok((201, r#"{"number": 6}"#.into()))]);
         http.push(
             "repos/qual-org/loomp-test/issues/6/timeline?page=1&limit=50",
             vec![Ok((
@@ -1895,10 +1903,7 @@ mod tests {
     fn search_finds_a_marker_fixture() {
         let mut http = FakeHttp::new();
         http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-        http.push(
-            "repos/qual-org/loomp-test/issues",
-            vec![Ok((201, r#"{"number": 11}"#.into()))],
-        );
+        http.push("repos/qual-org/loomp-test/issues", vec![Ok((201, r#"{"number": 11}"#.into()))]);
         http.push(
             "repos/issues/search?q=loomp-search-loomp-testrun&type=issues",
             vec![Ok((
@@ -1927,10 +1932,7 @@ mod tests {
                 Ok((200, "[]".into())),
             ],
         );
-        http.push(
-            "repos/qual-org/loomp-test/labels/60",
-            vec![Ok((200, r#"{"id": 60}"#.into()))],
-        );
+        http.push("repos/qual-org/loomp-test/labels/60", vec![Ok((200, r#"{"id": 60}"#.into()))]);
         http.push(
             "repos/qual-org/loomp-test/labels?page=1&limit=50",
             vec![
@@ -1941,10 +1943,7 @@ mod tests {
                 Ok((200, "[]".into())),
             ],
         );
-        http.push(
-            "repos/qual-org/loomp-test/labels?page=2&limit=50",
-            vec![Ok((200, "[]".into()))],
-        );
+        http.push("repos/qual-org/loomp-test/labels?page=2&limit=50", vec![Ok((200, "[]".into()))]);
         let mut cfg = cfg(true);
         cfg.only = vec!["label-sync-catalogue".into()];
         let results = run(&cfg, &http).unwrap();
@@ -1955,5 +1954,4 @@ mod tests {
         assert_eq!(row.outcome, OUTCOME_PASS, "observed: {}", row.observed);
         assert!(row.notes.iter().any(|n| n.contains("60")));
     }
-
 }
