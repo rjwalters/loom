@@ -83,6 +83,105 @@ fn ledger_entries_older_than_stale_secs_are_unobserved() {
     assert_eq!(at(2801), HostDebt::default(), "every axis stale ⇒ all None");
 }
 
+/// AC2 (#9414): one deep root whose entry has gone stale and three shallow
+/// fresh ones. The fresh sum (3) alone would give judge width 1 while the real
+/// host review debt (12) justifies the whole Phase 1 budget, and fewer judge
+/// runs would refresh fewer entries — the feedback loop. Width reads each
+/// root's last-known count, so it stays at 3; the fresh aggregate the
+/// reservation uses is untouched.
+#[test]
+fn width_counts_a_stale_roots_last_known_debt() {
+    let ledger = DemandLedger::default();
+    let t0 = Instant::now();
+    let stale = cfg().stale();
+    ledger.record_at(&root(1), DebtAxis::Review, 9, t0);
+    for n in 2..=4 {
+        ledger.record_at(&root(n), DebtAxis::Review, 1, t0 + stale);
+    }
+    let debt = ledger.host_debt_at(t0 + stale + Duration::from_secs(1), stale);
+    assert_eq!(
+        debt.review,
+        Some(AxisDebt {
+            total: 3,
+            roots_with_debt: 3
+        }),
+        "the deep root is stale, so the fresh sum under-counts the host debt"
+    );
+    assert_eq!(width(Some(3), &cfg(), 3), 1, "the fresh sum alone would be width 1");
+    assert_eq!(
+        debt.axis_width(DebtAxis::Review),
+        Some(12),
+        "width still sees the stale root's last-known 9"
+    );
+
+    let budgets = BTreeMap::new();
+    let judge = decide("judge", &budgets, 7, &debt, &cfg());
+    assert_eq!(
+        (judge.debt, judge.width, judge.budget),
+        (Some(12), Some(3), 3),
+        "width does not collapse below what the true host debt implies"
+    );
+    // The reservation keeps the fresh sum: a stale over-count there would hold
+    // ceiling slots away from other roles for work that may be gone.
+    assert_eq!(
+        decide("doctor", &budgets, 7, &debt, &cfg()).plan.wants,
+        [0, 1, 0],
+        "judge's want still comes from the fresh 3, not the last-known 12"
+    );
+}
+
+/// Cold start (#9414): the first root judge reaches has an empty queue. That
+/// used to flip the axis from unobserved (the Phase 1 budget) to an observed
+/// `0` (width 1) before any deep root had been seen — the non-monotonicity
+/// measured in the module doc, where seeing one empty root narrowed judge
+/// further than seeing nothing at all. A zero total now reads as unobserved.
+#[test]
+fn a_first_observed_empty_root_keeps_the_phase1_budget() {
+    let ledger = DemandLedger::default();
+    let budgets = BTreeMap::new();
+    let judge_budget = |debt: &HostDebt| decide("judge", &budgets, 7, debt, &cfg()).budget;
+
+    ledger.record(&root(1), DebtAxis::Review, 0);
+    let first = ledger.host_debt(HOUR);
+    assert_eq!(first.review, Some(AxisDebt::default()), "observed and zero, as before");
+    assert_eq!(
+        first.axis_width(DebtAxis::Review),
+        None,
+        "a zero total is a cold start as readily as a drained host"
+    );
+    assert_eq!(judge_budget(&first), 3, "still the Phase 1 budget, not width 1");
+    assert_eq!(want(first.review, &cfg(), 3), 0, "and it still holds nothing back");
+
+    // The deep roots are reached, and width tracks the real debt from there.
+    ledger.record(&root(2), DebtAxis::Review, 5);
+    assert_eq!(judge_budget(&ledger.host_debt(HOUR)), 2);
+    ledger.record(&root(3), DebtAxis::Review, 4);
+    assert_eq!(judge_budget(&ledger.host_debt(HOUR)), 3);
+}
+
+/// Every entry stale is still the *fully* unobserved fail-open (#9392), not a
+/// partial width off last-known counts: the width reading needs at least one
+/// fresh entry on the axis.
+#[test]
+fn every_entry_stale_is_still_the_fully_unobserved_fail_open() {
+    let ledger = DemandLedger::default();
+    let t0 = Instant::now();
+    let stale = cfg().stale();
+    ledger.record_at(&root(1), DebtAxis::Review, 9, t0);
+    ledger.record_at(&root(2), DebtAxis::Review, 2, t0);
+    let debt = ledger.host_debt_at(t0 + stale + Duration::from_secs(1), stale);
+    assert_eq!(debt, HostDebt::default(), "no fresh entry on any axis: every reading None");
+
+    let budgets = BTreeMap::new();
+    let judge = decide("judge", &budgets, 7, &debt, &cfg());
+    assert_eq!(
+        (judge.debt, judge.width, judge.budget),
+        (None, Some(3), 3),
+        "the Phase 1 budget, not a width off the stale sum"
+    );
+    assert_eq!(judge.plan.wants, [0; 3], "and nothing is reserved");
+}
+
 #[test]
 fn a_failed_listing_records_nothing() {
     let ledger = DemandLedger::default();
@@ -331,11 +430,17 @@ fn decide_uses_width_for_judge_and_doctor_but_never_lowers_champion() {
             total: 1,
             roots_with_debt: 1,
         }),
-    };
+        ..HostDebt::default()
+    }
+    .with_fresh_widths();
     let budgets = BTreeMap::new();
     let judge = decide("judge", &budgets, 7, &host, &cfg());
     assert_eq!((judge.phase1_budget, judge.width, judge.budget), (3, Some(1), 1));
-    assert_eq!(decide("doctor", &budgets, 7, &host, &cfg()).budget, 1);
+    assert_eq!(
+        decide("doctor", &budgets, 7, &host, &cfg()).budget,
+        3,
+        "a zero axis narrows nothing: it fails open to the Phase 1 budget (#9414)"
+    );
     let champion = decide("champion", &budgets, 7, &host, &cfg());
     assert_eq!((champion.width, champion.budget), (Some(1), 3), "champion budget unchanged");
     assert_eq!(
@@ -369,6 +474,7 @@ fn spread_merge_debt() -> HostDebt {
         }),
         ..HostDebt::default()
     }
+    .with_fresh_widths()
 }
 
 fn plan_for(role: &str, host: &HostDebt, ceiling: usize) -> ReservationPlan {
@@ -461,7 +567,9 @@ fn reservation_never_exceeds_ceiling_minus_non_pr_floor() {
             total: 100,
             roots_with_debt: 10,
         }),
-    };
+        ..HostDebt::default()
+    }
+    .with_fresh_widths();
     let plan = plan_for("curator", &host, 7);
     assert_eq!(plan.wants, [3, 3, 3]);
     assert_eq!((plan.cap, plan.planned()), (6, 6), "Σ want 9 capped at 7 − 1");
@@ -554,10 +662,14 @@ fn the_width_line_is_logged_once_per_change() {
             let d = decide("curator", &budgets, 7, &host, &cfg());
             log_if_changed(&ledger, &d, &cfg());
         }
-        host.merge = Some(AxisDebt {
-            total: 1,
-            roots_with_debt: 1,
-        });
+        host = HostDebt {
+            merge: Some(AxisDebt {
+                total: 1,
+                roots_with_debt: 1,
+            }),
+            ..HostDebt::default()
+        }
+        .with_fresh_widths();
         let d = decide("curator", &budgets, 7, &host, &cfg());
         log_if_changed(&ledger, &d, &cfg());
     });
@@ -569,4 +681,51 @@ fn the_width_line_is_logged_once_per_change() {
     assert!(lines[0].1.contains("ceiling reservation 3"), "{}", lines[0].1);
     assert!(lines[0].1.contains("phase-1 budget 3"), "{}", lines[0].1);
     assert!(lines[1].1.contains("ceiling reservation 1"), "{}", lines[1].1);
+}
+
+/// The width line is the only telemetry this mechanism has — it is what the
+/// #9414 measurement was made from — so it must carry the last-known sum width
+/// is built on *and* the fresh sum, or a reader cannot tell a drained host from
+/// an unvisited one, nor see how far behind the fresh sum has fallen.
+#[test]
+fn the_width_line_shows_both_the_last_known_and_the_fresh_debt() {
+    let budgets = BTreeMap::new();
+    let line = |host: &HostDebt| {
+        let ledger = DemandLedger::default();
+        let d = decide("judge", &budgets, 7, host, &cfg());
+        let records = crate::test_log_capture::capture_logs(|| log_if_changed(&ledger, &d, &cfg()));
+        records
+            .iter()
+            .find(|(l, m)| *l == log::Level::Info && m.contains("demand admission"))
+            .map(|(_, m)| m.clone())
+            .expect("a width line")
+    };
+
+    // One deep stale root (9) behind three shallow fresh ones (3).
+    let ledger = DemandLedger::default();
+    let t0 = Instant::now();
+    let stale = cfg().stale();
+    ledger.record_at(&root(1), DebtAxis::Review, 9, t0);
+    for n in 2..=4 {
+        ledger.record_at(&root(n), DebtAxis::Review, 1, t0 + stale);
+    }
+    let partial = line(&ledger.host_debt_at(t0 + stale + Duration::from_secs(1), stale));
+    assert!(
+        partial.contains("debt 12 (fresh 3) → width 3"),
+        "the staleness gap is visible: {partial}"
+    );
+
+    // Drained host: every root fresh and empty. Width fails open, but the log
+    // must not read as if nothing had been observed.
+    let drained = DemandLedger::default();
+    drained.record(&root(1), DebtAxis::Review, 0);
+    let drained = line(&drained.host_debt(HOUR));
+    assert!(
+        drained.contains("debt unobserved (fresh 0) → width 3"),
+        "a drained host is distinguishable from an unvisited one: {drained}"
+    );
+
+    // Nothing recorded at all.
+    let cold = line(&HostDebt::default());
+    assert!(cold.contains("debt unobserved (fresh unobserved) → width 3"), "{cold}");
 }
