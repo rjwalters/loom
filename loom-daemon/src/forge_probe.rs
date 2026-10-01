@@ -184,7 +184,12 @@ impl ProbeHttp for LiveHttp {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(body) = body {
+            // Gitea's binder needs the JSON content type — with curl's
+            // default form content type the body parses as an empty form
+            // and every write answers 422 "[Title]: Required" (the first
+            // thing the live probe run caught, 2026-10-01).
             cmd.arg("--data-binary").arg(body);
+            cmd.arg("-H").arg("Content-Type: application/json");
         }
         let mut child = cmd.spawn().map_err(|e| format!("spawn curl: {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
