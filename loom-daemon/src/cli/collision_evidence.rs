@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use loom_daemon::collision_evidence::{
     self, otlp, records, OutcomeKind, OutcomeRecord, PredictionRecord, SchedulingExposure,
 };
+use loom_daemon::observability::endpoint_policy;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum CollisionEvidenceCommand {
@@ -93,6 +94,14 @@ impl CollisionEvidenceCommand {
                 if push && !otlp_bodies {
                     bail!("--push requires the OTLP payload; drop --otlp-bodies=false");
                 }
+                if let Some(endpoint) = otlp_endpoint.as_deref() {
+                    // Mirror the exporter's two endpoint checks
+                    // (observability/mod.rs) BEFORE anything reads the
+                    // ingest key file (#7815: a placeholder is "not
+                    // configured", not a destination — the key is never
+                    // loaded, let alone sent, for one).
+                    validate_otlp_endpoint(endpoint)?;
+                }
                 run_publish(
                     &manifest,
                     &report_dir,
@@ -108,6 +117,29 @@ impl CollisionEvidenceCommand {
             }
         }
     }
+}
+
+/// Validate the `--otlp-endpoint` **value** with the same two checks the
+/// observability exporter applies via [`endpoint_policy`] (#9919 review):
+/// HTTP(S) URL shape without embedded credentials/query/fragment, and no
+/// RFC 2606/6761 reserved placeholder host. Called from `run()` *before*
+/// anything reads the ingest key file, so a malformed or placeholder
+/// endpoint can never trigger a key read — let alone a key send (#7815).
+fn validate_otlp_endpoint(endpoint: &str) -> Result<()> {
+    if !endpoint_policy::valid_otlp_endpoint(endpoint) {
+        bail!(
+            "--otlp-endpoint {endpoint}: invalid OTLP base URL — use HTTP(S) \
+             without embedded credentials, query or fragment"
+        );
+    }
+    if let Some(host) = endpoint_policy::reserved_placeholder_host(endpoint) {
+        bail!(
+            "--otlp-endpoint points at the reserved placeholder domain {host} \
+             (RFC 2606/6761) — a placeholder is \"not configured\", not a \
+             destination; the ingest key is never read or sent to one"
+        );
+    }
+    Ok(())
 }
 
 fn run_publish(
@@ -356,12 +388,18 @@ fn run_publish(
                 &body,
             );
             let log_path = out_dir.join("delivery-log.jsonl");
-            let mut log_body = String::new();
+            // Append-only across invocations sharing the out_dir: the
+            // delivery log is an audit trail — a retry after a failure must
+            // not discard the failed attempt's record.
+            use std::io::Write as _;
+            let mut log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .with_context(|| format!("opening delivery log {}", log_path.display()))?;
             for attempt in &outcome.attempts {
-                log_body.push_str(&serde_json::to_string(attempt)?);
-                log_body.push('\n');
+                writeln!(log_file, "{}", serde_json::to_string(attempt)?)?;
             }
-            std::fs::write(&log_path, log_body)?;
             println!(
                 "otlp push: {} delivered, {} failed → {}",
                 outcome.delivered(),
@@ -387,4 +425,40 @@ fn run_publish(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod endpoint_validation_tests {
+    use super::validate_otlp_endpoint;
+
+    #[test]
+    fn accepts_a_well_formed_https_endpoint() {
+        assert!(
+            validate_otlp_endpoint("https://otel-collector.internal.dev/v1/logs").is_ok(),
+            "a plain https endpoint with no credentials/query/fragment and no \
+             reserved placeholder host must pass"
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_schemes() {
+        let err = validate_otlp_endpoint("ftp://otel-collector.internal.dev/v1/logs").unwrap_err();
+        assert!(err.to_string().contains("invalid OTLP base URL"));
+    }
+
+    #[test]
+    fn rejects_embedded_credentials() {
+        let err = validate_otlp_endpoint("https://user:pass@otel-collector.internal.dev/v1/logs")
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid OTLP base URL"));
+    }
+
+    #[test]
+    fn rejects_reserved_placeholder_host_before_any_key_read() {
+        let err = validate_otlp_endpoint("https://collector.example.com/v1/logs").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("reserved placeholder domain example.com"));
+        assert!(err.to_string().contains("never read or sent"));
+    }
 }

@@ -8,7 +8,9 @@
 //! attempt is recorded — endpoint host (never the full URL, and never any
 //! key material), HTTP status or transport-error kind, latency, body size —
 //! into a `delivery-log.jsonl` next to the published bundle, and the CLI
-//! fails loudly when the push does not deliver. This mirrors the
+//! fails loudly when the push does not deliver. The log is append-only:
+//! invocations sharing an out_dir accumulate, so a retry after a failure
+//! preserves the failed attempt's record. This mirrors the
 //! counted-skips contract of the record builder itself (#9786).
 //!
 //! The HTTP path mirrors [`crate::observability::exporter::HttpsExporter`]:
