@@ -20,12 +20,22 @@
 #         caller supplies evidence citing it
 #     T5  a read failure / incomplete pagination fails CLOSED (never "clean")
 #     T6  a clean, fully-reconciled review state approves normally
+#     T11 (#9548) an UNTRUSTED author's review or thread is read and reported
+#         but decides nothing, cannot mask a trusted finding, and the
+#         pre-#9548 unfiltered read is what a missing filter falls back to
+#
+# Every fixture author carries an `author_association` (and GraphQL
+# `authorAssociation`), because since #9548 the gate's decision counts only
+# reviews whose author may act as a control signal. The incident's reviewers
+# are `COLLABORATOR`, which is what they were; T11 adds outsiders.
 #
 # Black-box: both subjects are full CLI scripts, so `gh` is stubbed on PATH and
 # the real scripts run as subprocesses (same pattern as test-post-verdict.sh).
 # The stub emulates `gh api --paginate --jq` faithfully — it applies the
 # caller's real jq filter to each fixture page in turn — so the pagination
 # assertions exercise the production jq filters, not a paraphrase of them.
+# `loom-daemon` is stubbed too (lib/trust-stub.sh), so the suite's verdict
+# never depends on whether the host happens to have a daemon installed.
 #
 # Usage:
 #   ./.loom/scripts/tests/test-review-feedback-reconciliation.sh
@@ -33,6 +43,8 @@
 set -uo pipefail
 # shellcheck source=lib/write-scope-fixture.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-fixture.sh"
+# shellcheck source=lib/trust-stub.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/trust-stub.sh"
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$TEST_DIR/.." && pwd)"
@@ -221,6 +233,11 @@ chmod +x "$STUB_DIR/gh"
 
 export LOOM_TEST_FIXTURE_DIR="$FIX_DIR"
 export LOOM_FORGE_TYPE="github"
+# #9548: `loom-daemon forge trusted-comments` decides whose review is a
+# control signal. The stub mirrors the real predicate for these fixtures
+# (insider association, or this fleet's App App-spelled) and hands
+# `forge may-write` on to a real daemon when WRITE_SCOPE_DAEMON names one.
+loom_trust_stub "$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
 # #9548: post-verdict.sh vets its write target through the write scope before it
 # writes. It runs from a checkout registered as owner/repo (origin, .loom/, push
@@ -268,13 +285,13 @@ echo "T1: blocking review on page 2 of pagination"
 reset_fixtures
 cat > "$FIX_DIR/reviews-page-1.json" << JSON
 [
-  {"id":1001,"state":"COMMENTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T20:00:00Z","user":{"login":"carol"},"body":"drive-by note"},
-  {"id":1002,"state":"APPROVED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T20:30:00Z","user":{"login":"dave"},"body":"looks fine to me"}
+  {"id":1001,"state":"COMMENTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T20:00:00Z","user":{"login":"carol","type":"User"},"author_association":"COLLABORATOR","body":"drive-by note"},
+  {"id":1002,"state":"APPROVED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T20:30:00Z","user":{"login":"dave","type":"User"},"author_association":"COLLABORATOR","body":"looks fine to me"}
 ]
 JSON
 cat > "$FIX_DIR/reviews-page-2.json" << JSON
 [
-  {"id":5202931719,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T21:10:12Z","user":{"login":"alice"},"body":"DFM-analysis coverage is explicitly required before this is ready."}
+  {"id":5202931719,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T21:10:12Z","user":{"login":"alice","type":"User"},"author_association":"COLLABORATOR","body":"DFM-analysis coverage is explicitly required before this is ready."}
 ]
 JSON
 run_gate --number 5369 --head-sha "$HEAD_SHA"
@@ -318,12 +335,12 @@ echo ""
 echo "T3: unresolved inline review thread"
 reset_fixtures
 cat > "$FIX_DIR/reviews-page-1.json" << JSON
-[{"id":2001,"state":"APPROVED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T20:30:00Z","user":{"login":"dave"},"body":"ok"}]
+[{"id":2001,"state":"APPROVED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T20:30:00Z","user":{"login":"dave","type":"User"},"author_association":"COLLABORATOR","body":"ok"}]
 JSON
 cat > "$FIX_DIR/graphql-threads.json" << 'JSON'
 {"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
-  {"id":"PRRT_res","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"path":"src/a.py","author":{"login":"erin"},"body":"nit: rename"}]}},
-  {"id":"PRRT_open","isResolved":false,"isOutdated":false,"comments":{"nodes":[{"path":"src/dfm.py","author":{"login":"alice"},"body":"this branch is never exercised by a test"}]}}
+  {"id":"PRRT_res","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"path":"src/a.py","author":{"login":"erin","__typename":"User"},"authorAssociation":"COLLABORATOR","body":"nit: rename"}]}},
+  {"id":"PRRT_open","isResolved":false,"isOutdated":false,"comments":{"nodes":[{"path":"src/dfm.py","author":{"login":"alice","__typename":"User"},"authorAssociation":"COLLABORATOR","body":"this branch is never exercised by a test"}]}}
 ]}}}}}
 JSON
 run_gate --number 5369 --head-sha "$HEAD_SHA"
@@ -356,7 +373,7 @@ echo ""
 echo "T4: older-head finding repaired with evidence"
 reset_fixtures
 cat > "$FIX_DIR/reviews-page-1.json" << JSON
-[{"id":3003,"state":"CHANGES_REQUESTED","commit_id":"$OLD_SHA","submitted_at":"2026-09-13T10:00:00Z","user":{"login":"alice"},"body":"missing test for the failure path"}]
+[{"id":3003,"state":"CHANGES_REQUESTED","commit_id":"$OLD_SHA","submitted_at":"2026-09-13T10:00:00Z","user":{"login":"alice","type":"User"},"author_association":"COLLABORATOR","body":"missing test for the failure path"}]
 JSON
 run_gate --number 5369 --head-sha "$HEAD_SHA"
 assert_eq "11" "$GATE_RC" "older-head CHANGES_REQUESTED -> exit 11 (NEEDS_RECONCILIATION), NOT auto-dismissed"
@@ -398,7 +415,7 @@ assert_eq "12" "$GATE_RC" "both thread interfaces failing -> exit 12 (UNKNOWN)"
 reset_fixtures
 touch "$FIX_DIR/fail-graphql"
 cat > "$FIX_DIR/inline-page-1.json" << JSON
-[{"id":4004,"pull_request_review_id":2001,"in_reply_to_id":null,"commit_id":"$HEAD_SHA","original_commit_id":"$HEAD_SHA","path":"src/dfm.py","position":7,"user":{"login":"alice"},"body":"still not covered"}]
+[{"id":4004,"pull_request_review_id":2001,"in_reply_to_id":null,"commit_id":"$HEAD_SHA","original_commit_id":"$HEAD_SHA","path":"src/dfm.py","position":7,"user":{"login":"alice","type":"User"},"author_association":"COLLABORATOR","body":"still not covered"}]
 JSON
 run_gate --number 5369 --head-sha "$HEAD_SHA"
 assert_eq "11" "$GATE_RC" "GraphQL down + an inline comment -> NEEDS_RECONCILIATION, not CLEAR"
@@ -416,13 +433,13 @@ echo "T6: clean, fully reconciled review state"
 reset_fixtures
 cat > "$FIX_DIR/reviews-page-1.json" << JSON
 [
-  {"id":6001,"state":"CHANGES_REQUESTED","commit_id":"$OLD_SHA","submitted_at":"2026-09-13T10:00:00Z","user":{"login":"alice"},"body":"missing test"},
-  {"id":6002,"state":"APPROVED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T22:00:00Z","user":{"login":"alice"},"body":"fixed, thanks"}
+  {"id":6001,"state":"CHANGES_REQUESTED","commit_id":"$OLD_SHA","submitted_at":"2026-09-13T10:00:00Z","user":{"login":"alice","type":"User"},"author_association":"COLLABORATOR","body":"missing test"},
+  {"id":6002,"state":"APPROVED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T22:00:00Z","user":{"login":"alice","type":"User"},"author_association":"COLLABORATOR","body":"fixed, thanks"}
 ]
 JSON
 cat > "$FIX_DIR/graphql-threads.json" << 'JSON'
 {"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
-  {"id":"PRRT_done","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"path":"src/a.py","author":{"login":"alice"},"body":"nit"}]}}
+  {"id":"PRRT_done","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"path":"src/a.py","author":{"login":"alice","__typename":"User"},"authorAssociation":"COLLABORATOR","body":"nit"}]}}
 ]}}}}}
 JSON
 run_gate --number 5369 --head-sha "$HEAD_SHA"
@@ -441,9 +458,9 @@ echo "T7: forge-authoritative states"
 reset_fixtures
 cat > "$FIX_DIR/reviews-page-1.json" << JSON
 [
-  {"id":7001,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"alice"},"body":"nope"},
-  {"id":7002,"state":"DISMISSED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:30:00Z","user":{"login":"alice"},"body":""},
-  {"id":7003,"state":"COMMENTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:40:00Z","user":{"login":"bob"},"body":"just a thought"}
+  {"id":7001,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"alice","type":"User"},"author_association":"COLLABORATOR","body":"nope"},
+  {"id":7002,"state":"DISMISSED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:30:00Z","user":{"login":"alice","type":"User"},"author_association":"COLLABORATOR","body":""},
+  {"id":7003,"state":"COMMENTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:40:00Z","user":{"login":"bob","type":"User"},"author_association":"COLLABORATOR","body":"just a thought"}
 ]
 JSON
 run_gate --number 5369 --head-sha "$HEAD_SHA"
@@ -451,7 +468,7 @@ assert_eq "0" "$GATE_RC" "a review dismissed THROUGH THE FORGE is not re-raised;
 
 reset_fixtures
 cat > "$FIX_DIR/reviews-page-1.json" << JSON
-[{"id":7101,"state":"WEIRD_NEW_STATE","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"alice"},"body":"?"}]
+[{"id":7101,"state":"WEIRD_NEW_STATE","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"alice","type":"User"},"author_association":"COLLABORATOR","body":"?"}]
 JSON
 run_gate --number 5369 --head-sha "$HEAD_SHA"
 assert_eq "11" "$GATE_RC" "an unrecognized review state is NOT treated as benign (fail closed)"
@@ -461,7 +478,7 @@ assert_contains "$GATE_OUT" "REVIEWS_UNKNOWN_STATE=1" "the unrecognized state is
 # post-verdict.sh accepts 7-40 char SHAs, so the gate has to tolerate one.
 reset_fixtures
 cat > "$FIX_DIR/reviews-page-1.json" << JSON
-[{"id":7201,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"alice"},"body":"still open"}]
+[{"id":7201,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"alice","type":"User"},"author_association":"COLLABORATOR","body":"still open"}]
 JSON
 run_gate --number 5369 --head-sha "${HEAD_SHA:0:7}"
 assert_eq "10" "$GATE_RC" "an abbreviated head sha still matches the review's commit (BLOCKING, not older-head)"
@@ -508,7 +525,7 @@ echo ""
 echo "T10: word-boundary-safe id citation"
 reset_fixtures
 cat > "$FIX_DIR/reviews-page-1.json" << JSON
-[{"id":42,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"alice"},"body":"needs a fix"}]
+[{"id":42,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"alice","type":"User"},"author_association":"COLLABORATOR","body":"needs a fix"}]
 JSON
 run_pv 5369 approved "$HEAD_SHA" --body "Approved." \
   --reviews-reconciled "See PR #4242 and issue 4200 for background; this is fully resolved now, I promise."
@@ -517,6 +534,97 @@ assert_eq "3" "$PV_RC" "id '42' embedded only inside longer numbers (4242, 4200)
 run_pv 5369 approved "$HEAD_SHA" --body "Approved." \
   --reviews-reconciled "Review 42 (needs a fix) was addressed in commit 23a0289: the fix landed and is covered by a new test."
 assert_eq "0" "$PV_RC" "id '42' cited as its own token satisfies citation"
+
+# --- T11: whose review is a control signal (#9548) --------------------------
+# On a public repo anyone may submit a formal review. Unfiltered, a drive-by
+# CHANGES_REQUESTED would hold this gate — and therefore every Loom approval
+# on the PR — open indefinitely. The decision counts only trusted authors; an
+# outsider's review is still read and reported, it just decides nothing.
+echo ""
+echo "T11a: an outsider's same-head CHANGES_REQUESTED does not block"
+reset_fixtures
+cat > "$FIX_DIR/reviews-page-1.json" << JSON
+[{"id":8001,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"drifter","type":"User"},"author_association":"CONTRIBUTOR","body":"i do not like this"}]
+JSON
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "0" "$GATE_RC" "an outsider CHANGES_REQUESTED cannot stall the pipeline (exit 0)"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=CLEAR" "state is CLEAR"
+assert_contains "$GATE_OUT" "REVIEWS_TOTAL=1" "the outsider's review was still READ"
+assert_contains "$GATE_OUT" "REVIEWS_UNTRUSTED=1" "and is reported as excluded from the decision"
+assert_contains "$GATE_OUT" "REVIEWS_BLOCKING_CURRENT_HEAD=0" "it is not counted as blocking"
+assert_contains "$GATE_OUT" "REVIEW_BLOCKING_IDS=\"\"" "its id is not cited as blocking"
+assert_contains "$GATE_OUT" "REVIEW_TRUST_FILTER=applied" "the filter ran"
+FINDINGS="$(cat "$(printf '%s\n' "$GATE_OUT" | sed -n 's/^REVIEW_FEEDBACK_FINDINGS_FILE=//p')" 2>/dev/null || true)"
+assert_contains "$FINDINGS" "UNTRUSTED AUTHOR" "the outsider's feedback is not silently discarded"
+assert_contains "$FINDINGS" "8001" "the findings name the excluded review"
+
+echo ""
+echo "T11b: an outsider cannot MASK a trusted insider's blocking review"
+reset_fixtures
+cat > "$FIX_DIR/reviews-page-1.json" << JSON
+[
+  {"id":8101,"state":"APPROVED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"drifter","type":"User"},"author_association":"NONE","body":"ship it"},
+  {"id":8102,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T10:00:00Z","user":{"login":"alice","type":"User"},"author_association":"COLLABORATOR","body":"still missing the test"}
+]
+JSON
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "10" "$GATE_RC" "the insider's finding still blocks (exit 10)"
+assert_contains "$GATE_OUT" "REVIEW_BLOCKING_IDS=\"8102\"" "only the trusted review is cited"
+assert_contains "$GATE_OUT" "REVIEWS_UNTRUSTED=1" "the outsider's approval is excluded"
+
+echo ""
+echo "T11c: this fleet's own App review counts (App-spelled, bare association)"
+reset_fixtures
+cat > "$FIX_DIR/reviews-page-1.json" << JSON
+[{"id":8201,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"loom-fleet-dispatch[bot]","type":"Bot"},"author_association":"NONE","body":"the fleet's own finding"}]
+JSON
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "10" "$GATE_RC" "a fleet-App review is trusted despite author_association NONE"
+assert_contains "$GATE_OUT" "REVIEWS_UNTRUSTED=0" "nothing was excluded"
+
+echo ""
+echo "T11d: an outsider's unresolved inline THREAD does not block"
+reset_fixtures
+cat > "$FIX_DIR/graphql-threads.json" << 'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRRT_out","isResolved":false,"isOutdated":false,"comments":{"nodes":[{"path":"src/a.py","author":{"login":"drifter","__typename":"User"},"authorAssociation":"NONE","body":"change this"}]}}
+]}}}}}
+JSON
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "0" "$GATE_RC" "an outsider's unresolved thread cannot stall the pipeline"
+assert_contains "$GATE_OUT" "INLINE_COMMENTS_TOTAL=1" "the thread was still READ"
+assert_contains "$GATE_OUT" "INLINE_UNTRUSTED=1" "and is reported as excluded"
+assert_contains "$GATE_OUT" "INLINE_THREADS_UNRESOLVED=0" "it is not counted as unresolved"
+
+echo ""
+echo "T11e: no trust filter -> the UNFILTERED pre-#9548 read, stated not silent"
+reset_fixtures
+cat > "$FIX_DIR/reviews-page-1.json" << JSON
+[{"id":8301,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"drifter","type":"User"},"author_association":"CONTRIBUTOR","body":"i do not like this"}]
+JSON
+LOOM_TEST_NO_TRUST_VERB=1 run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "10" "$GATE_RC" "without the verb the gate blocks rather than reporting CLEAR (never re-open #7647)"
+assert_contains "$GATE_OUT" "REVIEW_TRUST_FILTER=unavailable" "the degraded state is reported"
+assert_contains "$GATE_OUT" "REVIEWS_UNTRUSTED=0" "nothing is claimed to have been excluded"
+FINDINGS="$(cat "$(printf '%s\n' "$GATE_OUT" | sed -n 's/^REVIEW_FEEDBACK_FINDINGS_FILE=//p')" 2>/dev/null || true)"
+assert_contains "$FINDINGS" "UNTRUSTED-FILTER UNAVAILABLE" "the findings name the missing filter"
+
+echo ""
+echo "T11f: a forge with no author_association is not filtered at all"
+# Gitea reports no author_association, so filtering there would mark EVERY
+# review untrusted and block nothing — the unsafe direction. It is therefore
+# not attempted, and the reason is reported rather than silent. (This stub
+# models GitHub's endpoints only, so the Gitea READ itself ends UNKNOWN, which
+# is the other fail-closed answer; what is asserted here is the decision not
+# to filter, not the transport.)
+reset_fixtures
+cat > "$FIX_DIR/reviews-page-1.json" << JSON
+[{"id":8401,"state":"CHANGES_REQUESTED","commit_id":"$HEAD_SHA","submitted_at":"2026-09-14T09:00:00Z","user":{"login":"maintainer","type":"User"},"body":"needs a test"}]
+JSON
+LOOM_FORGE_TYPE="gitea" run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_contains "$GATE_OUT" "REVIEW_TRUST_FILTER=unsupported-forge" "the reason is named, not silent"
+assert_contains "$GATE_OUT" "REVIEWS_UNTRUSTED=0" "no review is excluded on an association the forge never reports"
+assert_not_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=CLEAR" "and the answer is never CLEAR by default"
 
 # --- Summary ---
 echo ""

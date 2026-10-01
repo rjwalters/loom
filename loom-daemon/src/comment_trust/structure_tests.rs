@@ -13,6 +13,16 @@
 //!    and each reader function's body contains its trust call. A second,
 //!    unfiltered fetch added to an already-reviewed file fails here (Judge
 //!    #9566 non-blocking note 1), which a file-level list cannot catch.
+//!
+//! A third check covers the OTHER half of the control plane: the shell.
+//! [`shell_authored_text_readers_are_trust_filtered`] is the reader-side
+//! counterpart of `write_scope::tests::shell_write_paths_are_vetted` — a
+//! script under `defaults/scripts` that fetches authored forge text must run
+//! it through `loom-daemon forge trusted-comments`, or be reviewed into
+//! [`SHELL_EXEMPT`] with the reason it needs no filter. Without it the Rust
+//! guards above say nothing about a new `.sh` reader, which is exactly how
+//! `check-review-feedback.sh` read formal reviews unfiltered for two slices
+//! of this epic.
 
 use std::path::Path;
 
@@ -281,6 +291,125 @@ fn every_comment_fetch_in_a_reviewed_file_is_a_filtered_call_site() {
         }
     }
     assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// Scripts that fetch authored forge text and legitimately do not filter it
+/// themselves, with the reason. A stale entry fails too.
+const SHELL_EXEMPT: &[(&str, &str)] = &[(
+    "lib/forge-helpers.sh",
+    "the transport: its readers PROJECT the author (user.login/user.type/\
+     author_association) so each caller can filter; the trust decision belongs \
+     to the caller, which this test checks",
+)];
+
+/// Shell that fetches text somebody wrote on the forge: a comment listing, a
+/// `gh … --json comments/reviews` projection, one of `forge-helpers.sh`'s
+/// review readers, or the filter's own `--fetch`.
+fn shell_authored_text_reads(line: &str) -> bool {
+    const FETCHERS: &[&str] = &[
+        "forge_get_pr_comments",
+        "forge_get_issue_comments",
+        "forge_get_pr_reviews",
+        "forge_get_pr_review_comments",
+        "forge_get_pr_review_threads",
+    ];
+    // `gh api …/issues/<n>/comments`, `…/pulls/<n>/comments`, `…/reviews`.
+    let rest = line.contains("gh api")
+        && (line.contains("/comments") || line.contains("/reviews"))
+        && (line.contains("/issues/") || line.contains("/pulls/"));
+    // A write POSTs a comment; it authors text, it does not read it.
+    let writes = line.contains("--method POST") || line.contains("-X POST");
+    let json_field = line.contains("--json")
+        && (line.contains("comments") || line.contains("reviews"))
+        && !line.contains("trusted-comments");
+    (rest && !writes)
+        || json_field
+        || FETCHERS.iter().any(|f| line.contains(&format!("{f} ")))
+        || line.contains("trusted-comments --fetch")
+}
+
+/// The code lines of a shell script: full-line `#` comments dropped. (A
+/// trailing comment on a code line stays — it cannot hide a call that the
+/// same line also makes.)
+fn shell_code(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect()
+}
+
+/// Every script under `defaults/scripts` that reads authored forge text runs
+/// it through `loom-daemon forge trusted-comments` (#9548 item 2: filter at
+/// fetch), or is reviewed into [`SHELL_EXEMPT`]. Both halves are asserted, so
+/// a stale exemption fails as loudly as a new unfiltered reader.
+#[test]
+fn shell_authored_text_readers_are_trust_filtered() {
+    let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts");
+    let mut offenders = Vec::new();
+    let mut checked = 0usize;
+    for dir in [scripts.clone(), scripts.join("lib")] {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sh") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&scripts)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let code = shell_code(&text);
+            let reads = code.iter().any(|l| shell_authored_text_reads(l));
+            if let Some((f, why)) = SHELL_EXEMPT.iter().find(|(f, _)| *f == rel) {
+                assert!(reads, "stale exemption: {f} ({why}) no longer reads forge text");
+                continue;
+            }
+            if !reads {
+                continue;
+            }
+            checked += 1;
+            if !code.iter().any(|l| l.contains("forge trusted-comments")) {
+                offenders.push(rel);
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "the reader detector matched nothing — it has drifted away from the scripts it guards"
+    );
+    offenders.sort();
+    assert!(
+        offenders.is_empty(),
+        "shell that reads authored forge text must filter it through `loom-daemon forge \
+         trusted-comments` before any marker, phrase or review state changes Loom's behaviour, \
+         or be listed in SHELL_EXEMPT with a reason (#9548): {offenders:?}"
+    );
+}
+
+/// The detector itself, on hand-written lines: a guard nobody can read the
+/// intent of is a guard that silently stops guarding.
+#[test]
+fn the_shell_reader_detector_discriminates() {
+    for line in [
+        r#"gh api "repos/$nwo/issues/$pr/comments" --paginate"#,
+        r#"gh api "repos/$nwo/pulls/$n/reviews?per_page=100" --paginate --jq "$FILTER""#,
+        r#"REVIEWS=$(forge_get_pr_reviews "$NWO" "$NUMBER")"#,
+        r#"gh issue view "$N" --json comments -q '.comments[].body'"#,
+        r#"loom-daemon forge trusted-comments --fetch "$ISSUE""#,
+    ] {
+        assert!(shell_authored_text_reads(line), "should be a read: {line}");
+    }
+    for line in [
+        // Writes author text, it does not read it.
+        r#"gh api --method POST "repos/$nwo/issues/$n/comments" -F body=@-"#,
+        // Labels and heads are forge state, not authored text.
+        r#"gh pr view "$PR" --json headRefOid,labels"#,
+        r#"gh api "repos/$nwo/pulls/$n" --jq .head.sha"#,
+        // Already the filter.
+        r#"| loom-daemon forge trusted-comments"#,
+    ] {
+        assert!(!shell_authored_text_reads(line), "should not be a read: {line}");
+    }
 }
 
 /// The review-conflict pass has no fetch of its own: its "is this flag

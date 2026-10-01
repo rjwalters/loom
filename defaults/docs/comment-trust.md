@@ -69,9 +69,13 @@ The predicate lives once, in `loom-daemon/src/comment_trust.rs`:
   ignored. That fails closed: post the record as a comment instead.
 - **Structural tests** fail when a new Rust file handles a covered marker
   without being reviewed (`verdict_sha_readers_go_through_the_trust_filter`,
-  `structure_tests::every_covered_marker_file_is_reviewed`), and when a
+  `structure_tests::every_covered_marker_file_is_reviewed`), when a
   reviewed file gains a comment fetch outside its filtered call sites
-  (`structure_tests::every_comment_fetch_in_a_reviewed_file_is_a_filtered_call_site`).
+  (`structure_tests::every_comment_fetch_in_a_reviewed_file_is_a_filtered_call_site`),
+  and when a script under `defaults/scripts` fetches authored forge text
+  without running it through `forge trusted-comments`
+  (`structure_tests::shell_authored_text_readers_are_trust_filtered`, whose
+  `SHELL_EXEMPT` list is the only way out and whose stale entries fail too).
 
 When the filter cannot run (no `loom-daemon`, or one that predates the verb),
 the answer degrades toward safety: the verdict guard treats every marker as
@@ -125,6 +129,39 @@ unavailable:
 | Champion epic | epic verdict / escalation markers | skip the epic this pass |
 | Judge fast-track | `loom:conflict-only` | full evaluation |
 | Curator AC-hold check | `champion:ac-hold` | treated as no hold |
+| `check-review-feedback.sh` | formal review state, inline thread resolution | the raw read (it can only report MORE outstanding feedback) |
+
+## Formal reviews are control signals too
+
+A `CHANGES_REQUESTED` review is not a marker, but it decides as much as one:
+`check-review-feedback.sh` turns it into `BLOCKING`, and `post-verdict.sh`
+refuses an approval on that. GitHub lets **anyone** submit a formal review on
+a public PR, so unfiltered that made "stall every Loom approval on this repo,
+indefinitely" a thing a drive-by account could do. The same applies to an
+unresolved inline review thread.
+
+So the review readers in `lib/forge-helpers.sh`
+(`forge_get_pr_reviews`, `forge_get_pr_review_comments`,
+`forge_get_pr_review_threads`) project each record's author
+(`user.login`, `user.type`, `author_association`; GraphQL relays the actor's
+`__typename`, the only thing that tells an App from a user of that name)
+instead of dropping it, and `check-review-feedback.sh` decides on the trusted
+subset. An untrusted review is **read and reported** — it lands in the
+findings file marked `UNTRUSTED AUTHOR` and is counted in
+`REVIEWS_UNTRUSTED` / `INLINE_UNTRUSTED` — it just decides nothing. Outside
+feedback stays visible (as untrusted content, which is what it is); it stops
+being a lever on the pipeline. It also cannot mask a trusted finding: each
+reviewer's position is read per author, so an outsider's `APPROVED` never
+clears a maintainer's `CHANGES_REQUESTED`.
+
+Here the unfiltered direction is the conservative one, so a missing filter
+falls back to it (`REVIEW_TRUST_FILTER=unavailable`, stated in the findings)
+rather than trusting nothing: reporting `CLEAR` over a maintainer's real
+`CHANGES_REQUESTED` would re-open #7647. Gitea reports no
+`author_association` on a review at all, so there the decision has no
+mechanical basis and is not attempted
+(`REVIEW_TRUST_FILTER=unsupported-forge`) — filtering on an association the
+forge never sends would mark every review untrusted and block nothing.
 
 Role prompts that read forge text carry either the full untrusted-content
 block or a one-line pointer to this page; see

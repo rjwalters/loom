@@ -1681,6 +1681,14 @@ forge_gh_create_issue_rl_safe() {
 #     make a finding auditable against the current tree.
 #   - FAIL CLOSED. Any read error returns non-zero with NO output. Callers must
 #     branch on the exit code; empty stdout on its own never means "clean".
+#   - THE AUTHOR SURVIVES THE PROJECTION (#9548). Each record carries the
+#     author in the shape `loom-daemon forge trusted-comments` reads
+#     (`user.login`, `user.type`, `author_association`) alongside the
+#     convenience `author` login string, so a caller can ask *whose* review
+#     this is before letting it change Loom's behaviour. A projection that
+#     dropped those fields made every review equally authoritative — on a
+#     public repo, where anyone may submit a formal review, that is an
+#     outsider-writable control signal.
 #
 # Old bodies-only behaviour is one jq away for any caller that genuinely wants
 # it: `forge_get_pr_reviews "$nwo" "$n" | jq -r 'select(.body != "") | .body'`.
@@ -1699,6 +1707,8 @@ _FORGE_REVIEW_RECORD_JQ='.[] | {
   commit_id: (.commit_id // ""),
   submitted_at: (.submitted_at // ""),
   author: (.user.login // ""),
+  user: {login: (.user.login // ""), type: (.user.type // "")},
+  author_association: (.author_association // ""),
   body: (.body // "")
 } | tojson'
 
@@ -1715,6 +1725,8 @@ _FORGE_REVIEW_COMMENT_RECORD_JQ='.[] | {
   path: (.path // ""),
   outdated: (.position == null),
   author: (.user.login // ""),
+  user: {login: (.user.login // ""), type: (.user.type // "")},
+  author_association: (.author_association // ""),
   body: (.body // "")
 } | tojson'
 
@@ -1723,7 +1735,11 @@ _FORGE_REVIEW_COMMENT_RECORD_JQ='.[] | {
 # Usage: forge_get_pr_reviews NWO PR_NUMBER [GH_CMD]
 # Output: one JSON object per line —
 #   {"id":…,"state":"APPROVED|CHANGES_REQUESTED|COMMENTED|DISMISSED|PENDING|…",
-#    "commit_id":"…","submitted_at":"…","author":"…","body":"…"}
+#    "commit_id":"…","submitted_at":"…","author":"…",
+#    "user":{"login":"…","type":"…"},"author_association":"…","body":"…"}
+# The `user`/`author_association` pair is the #9548 trust shape: pipe the
+# records through `loom-daemon forge trusted-comments` to keep only the
+# reviews whose author may act as a control signal.
 # Exit: 0 on a complete read (including a genuinely empty review list),
 #       non-zero on ANY read/pagination failure (fail closed).
 #
@@ -1786,7 +1802,12 @@ forge_get_pr_review_comments() {
 # Usage: forge_get_pr_review_threads NWO PR_NUMBER [GH_CMD]
 # Output: one JSON object per line —
 #   {"id":"…","is_resolved":true|false,"is_outdated":true|false,
-#    "path":"…","author":"…","body":"…"}
+#    "path":"…","author":"…","user":{"login":"…","type":"…"},
+#    "author_association":"…","body":"…"}
+# The author fields describe the thread's FIRST comment (the one that opened
+# it) and carry the #9548 trust shape. GraphQL spells an App's `login` as the
+# bare slug, so `user.type` relays the actor's `__typename` (`Bot` for an
+# App) — the only thing that distinguishes an App from a user of that name.
 # Exit: 0 on a complete read, 2 when the forge has no supported
 #       thread-resolution interface (caller must fall back and fail closed on
 #       the unknown resolution state — NOT treat it as resolved), 1 on failure.
@@ -1813,7 +1834,7 @@ forge_get_pr_review_threads() {
           pageInfo{hasNextPage endCursor}
           nodes{
             id isResolved isOutdated
-            comments(first:1){nodes{path author{login} body}}
+            comments(first:1){nodes{path author{login __typename} authorAssociation body}}
           }
         }
       }
@@ -1844,6 +1865,9 @@ forge_get_pr_review_threads() {
           is_outdated: (.isOutdated // false),
           path: (.comments.nodes[0].path // ""),
           author: (.comments.nodes[0].author.login // ""),
+          user: {login: (.comments.nodes[0].author.login // ""),
+                 type: (.comments.nodes[0].author.__typename // "")},
+          author_association: (.comments.nodes[0].authorAssociation // ""),
           body: (.comments.nodes[0].body // "")
         }') || return 1
     [[ -n "$threads" ]] && printf '%s\n' "$threads"

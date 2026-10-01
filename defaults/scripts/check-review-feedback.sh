@@ -31,6 +31,26 @@
 #   because the head moved: it is reported as NEEDS_RECONCILIATION, which the
 #   caller clears with evidence of repair or explicit disposition.
 #
+# WHOSE REVIEW IS A CONTROL SIGNAL (#9548)
+#
+#   A formal review is forge text an outsider can write: on a public
+#   repository anyone may submit CHANGES_REQUESTED on any open PR, and this
+#   gate is what `post-verdict.sh` refuses an approval on. Unfiltered, that
+#   makes "stall every Loom approval on this repo, indefinitely" a thing a
+#   drive-by account can do.
+#
+#   So the BLOCKING / NEEDS_RECONCILIATION decision counts only reviews and
+#   threads whose author `loom-daemon forge trusted-comments` trusts (a repo
+#   insider by author_association, one of this fleet's Apps, this daemon's
+#   identity, or `forge.trustedCommenters`; see
+#   `.loom/docs/comment-trust.md`). An untrusted review is still READ and
+#   still REPORTED — it lands in the findings file marked UNTRUSTED and is
+#   counted in REVIEWS_UNTRUSTED / INLINE_UNTRUSTED — it just does not decide
+#   anything. Outside feedback stays visible to the agent (as untrusted
+#   content, which is what it is); it stops being a lever on the pipeline.
+#
+# requires-daemon: forge optional   #9548 — `forge trusted-comments` answers "may this review author act as a control signal". Without the verb (no daemon, or one predating it) the gate falls back to the UNFILTERED read and says so in REVIEW_TRUST_FILTER / the findings: that is the pre-#9548 behaviour, in which every review blocks. It is the conservative direction — the alternative, trusting nothing, would report CLEAR over a maintainer's real CHANGES_REQUESTED and re-open #7647 — but it does leave the stall lever in place, so the state is reported rather than silent.
+#
 # Usage:
 #   check-review-feedback.sh --number N [options]
 #
@@ -57,12 +77,21 @@
 #   REVIEWS_BLOCKING_OLDER_HEAD=<int>
 #   REVIEWS_UNKNOWN_STATE=<int>
 #   REVIEW_BLOCKING_IDS="<ids, space separated>"
+#   REVIEWS_UNTRUSTED=<int>
 #   INLINE_COMMENTS_TOTAL=<int>
 #   INLINE_THREADS_UNRESOLVED=<int>
 #   INLINE_THREADS_UNRESOLVED_OUTDATED=<int>
 #   INLINE_BLOCKING_IDS="<thread/comment ids, space separated>"
 #   INLINE_RESOLUTION_SOURCE=graphql|rest-unknown|none
+#   INLINE_UNTRUSTED=<int>
+#   REVIEW_TRUST_FILTER=applied|unavailable|unsupported-forge
 #   REVIEW_FEEDBACK_FINDINGS_FILE=<path>
+#
+# REVIEWS_TOTAL / INLINE_COMMENTS_TOTAL count what was READ (trusted and not);
+# every other counter and id list describes only the trusted subset that the
+# STATE is decided on. REVIEWS_UNTRUSTED / INLINE_UNTRUSTED are how many
+# records were read but excluded from that decision — `applied` with a
+# non-zero count means outside feedback exists and is in the findings file.
 #
 # STATE semantics:
 #   CLEAR                 Complete read; no outstanding formal request and no
@@ -97,7 +126,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _usage() {
     # Keep this range in sync with the header block above ("Usage:" through
     # the exit-code table).
-    sed -n '34,89p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '54,116p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 _die() {
@@ -168,6 +197,9 @@ INLINE_UNRESOLVED=0
 INLINE_UNRESOLVED_OUTDATED=0
 INLINE_BLOCKING_IDS=""
 INLINE_SOURCE="none"
+REVIEWS_UNTRUSTED=0
+INLINE_UNTRUSTED=0
+TRUST_FILTER="applied"
 FAILURE_REASON=""
 
 _emit_and_exit() {
@@ -193,6 +225,9 @@ _emit_and_exit() {
             --argjson inline_unresolved_outdated "$INLINE_UNRESOLVED_OUTDATED" \
             --arg inline_blocking_ids "$INLINE_BLOCKING_IDS" \
             --arg inline_source "$INLINE_SOURCE" \
+            --argjson reviews_untrusted "$REVIEWS_UNTRUSTED" \
+            --argjson inline_untrusted "$INLINE_UNTRUSTED" \
+            --arg trust_filter "$TRUST_FILTER" \
             --arg findings_file "$FINDINGS_FILE" \
             --arg failure_reason "$FAILURE_REASON" \
             '{state:$state, head_sha:$head, reviews_total:$total,
@@ -200,11 +235,14 @@ _emit_and_exit() {
               reviews_blocking_older_head:$blocking_older,
               reviews_unknown_state:$unknown_state,
               blocking_ids:($blocking_ids | split(" ") | map(select(. != ""))),
+              reviews_untrusted:$reviews_untrusted,
               inline_comments_total:$inline_total,
               inline_threads_unresolved:$inline_unresolved,
               inline_threads_unresolved_outdated:$inline_unresolved_outdated,
               inline_blocking_ids:($inline_blocking_ids | split(" ") | map(select(. != ""))),
               inline_resolution_source:$inline_source,
+              inline_untrusted:$inline_untrusted,
+              review_trust_filter:$trust_filter,
               findings_file:$findings_file,
               failure_reason:$failure_reason}' 2>/dev/null \
             || printf '{"state":"UNKNOWN"}\n'
@@ -216,11 +254,14 @@ _emit_and_exit() {
         echo "REVIEWS_BLOCKING_OLDER_HEAD=$BLOCKING_OLDER"
         echo "REVIEWS_UNKNOWN_STATE=$REVIEWS_UNKNOWN_STATE"
         echo "REVIEW_BLOCKING_IDS=\"$BLOCKING_IDS\""
+        echo "REVIEWS_UNTRUSTED=$REVIEWS_UNTRUSTED"
         echo "INLINE_COMMENTS_TOTAL=$INLINE_COMMENTS_TOTAL"
         echo "INLINE_THREADS_UNRESOLVED=$INLINE_UNRESOLVED"
         echo "INLINE_THREADS_UNRESOLVED_OUTDATED=$INLINE_UNRESOLVED_OUTDATED"
         echo "INLINE_BLOCKING_IDS=\"$INLINE_BLOCKING_IDS\""
         echo "INLINE_RESOLUTION_SOURCE=$INLINE_SOURCE"
+        echo "INLINE_UNTRUSTED=$INLINE_UNTRUSTED"
+        echo "REVIEW_TRUST_FILTER=$TRUST_FILTER"
         echo "REVIEW_FEEDBACK_FINDINGS_FILE=$FINDINGS_FILE"
     fi
 
@@ -278,10 +319,81 @@ if [[ -z "$HEAD_SHA" ]]; then
     fi
 fi
 
+# --- 0. The trust filter (#9548) -------------------------------------------
+# The records lib/forge-helpers.sh projects carry their author in the shape
+# `forge trusted-comments` reads (`user.login`/`user.type`/
+# `author_association`). The verb takes one JSON array, so NDJSON is slurped
+# in and unwrapped again on the way out.
+#
+# TRUSTED_NDJSON holds the surviving records; DROPPED_N / DROPPED_FINDINGS
+# describe what the filter excluded. A filter that cannot run sets
+# TRUST_FILTER=unavailable and leaves the records untouched (see
+# "requires-daemon" in the header: that is the pre-#9548 read, conservative in
+# this script's one direction — it can only report MORE outstanding feedback).
+TRUSTED_NDJSON=""
+DROPPED_N=0
+DROPPED_FINDINGS=""
+
+# Gitea's review API reports no `author_association` at all, so every record
+# would read as untrusted and NOTHING would ever block — the unsafe direction
+# here. There is no mechanical basis for the decision on that forge, so it is
+# not attempted: the raw read stands, and says so. (Write scoping draws the
+# same line, `.loom/docs/comment-trust.md` → "Loom writes only to repos it
+# manages": on Gitea only the rules that can actually be evaluated apply.)
+if [[ "${FORGE_TYPE:-github}" != "github" ]]; then
+    TRUST_FILTER="unsupported-forge"
+    echo "UNTRUSTED-FILTER UNSUPPORTED: ${FORGE_TYPE:-unknown} reports no author_association, so review authors cannot be authenticated; every review counts, as before #9548" \
+        >> "$FINDINGS_FILE"
+fi
+
+# _trust_partition <kind> <ndjson>
+#   <kind> labels the records in the findings file ("review", "inline
+#   thread", "inline comment"); every record shape here is keyed by `.id`.
+_trust_partition() {
+    local kind="$1" all="$2" trusted keep
+    TRUSTED_NDJSON="$all"
+    DROPPED_N=0
+    DROPPED_FINDINGS=""
+    [[ "$TRUST_FILTER" == "applied" ]] || return 0
+
+    trusted="$(printf '%s\n' "$all" \
+        | jq -s -c . 2>/dev/null \
+        | "${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments 2>/dev/null \
+        | jq -c '.[]' 2>/dev/null)" || {
+        TRUST_FILTER="unavailable"
+        echo "UNTRUSTED-FILTER UNAVAILABLE: 'loom-daemon forge trusted-comments' could not authenticate review authors; every review counts, as before #9548" \
+            >> "$FINDINGS_FILE"
+        return 0
+    }
+    TRUSTED_NDJSON="$trusted"
+
+    keep="$(printf '%s\n' "$trusted" | jq -s -c '[.[] | .id]' 2>/dev/null)" || keep="[]"
+    DROPPED_N="$(printf '%s\n' "$all" | jq -s -r --argjson keep "$keep" \
+        '[.[] | select(.id as $i | $keep | index($i) | not)] | length' 2>/dev/null)" || DROPPED_N=0
+    [[ "$DROPPED_N" =~ ^[0-9]+$ ]] || DROPPED_N=0
+    ((DROPPED_N > 0)) || return 0
+
+    # Reported, never silently dropped: outside feedback may be correct, it is
+    # simply not this gate's business to compel its disposition.
+    DROPPED_FINDINGS="$(printf '%s\n' "$all" | jq -s -r --argjson keep "$keep" --arg kind "$kind" '
+        .[] | select(.id as $i | $keep | index($i) | not)
+        | "\($kind) \(.id) by \(.author) [UNTRUSTED AUTHOR — read and reported, but not a control signal (#9548); dispose of it on its merits, not because this gate requires it] :: \((.body | split("\n")[0] // "")[0:200])"
+    ' 2>/dev/null)" || DROPPED_FINDINGS=""
+    [[ -z "$DROPPED_FINDINGS" ]] || printf '%s\n' "$DROPPED_FINDINGS" >> "$FINDINGS_FILE"
+}
+
 # --- 1. Formal reviews (fully paginated, complete records) -----------------
 if ! REVIEWS_NDJSON=$(forge_get_pr_reviews "$NWO" "$NUMBER" 2> /dev/null); then
     _fail_unknown "the formal-review read (pulls/$NUMBER/reviews) failed or paginated incompletely"
 fi
+
+# REVIEWS_TOTAL below counts everything read; the decision uses the trusted
+# subset only.
+REVIEWS_READ_TOTAL="$(printf '%s\n' "$REVIEWS_NDJSON" | jq -s -c 'map(select(. != null)) | length' 2>/dev/null)"
+[[ "$REVIEWS_READ_TOTAL" =~ ^[0-9]+$ ]] || _fail_unknown "the formal-review payload could not be counted — review state is unknown"
+_trust_partition "review" "$REVIEWS_NDJSON"
+REVIEWS_NDJSON="$TRUSTED_NDJSON"
+REVIEWS_UNTRUSTED="$DROPPED_N"
 
 REVIEW_SUMMARY=$(printf '%s\n' "$REVIEWS_NDJSON" | jq -s --arg head "$HEAD_SHA" '
     # Head association tolerates an abbreviated SHA on either side: a verdict
@@ -320,7 +432,7 @@ REVIEW_SUMMARY=$(printf '%s\n' "$REVIEWS_NDJSON" | jq -s --arg head "$HEAD_SHA" 
 ' 2>/dev/null)
 [[ -n "$REVIEW_SUMMARY" ]] || _fail_unknown "the formal-review payload could not be parsed — review state is unknown"
 
-REVIEWS_TOTAL=$(printf '%s' "$REVIEW_SUMMARY" | jq -r '.total')
+REVIEWS_TOTAL="$REVIEWS_READ_TOTAL"
 REVIEWS_UNKNOWN_STATE=$(printf '%s' "$REVIEW_SUMMARY" | jq -r '.unknown_state')
 BLOCKING_CURRENT=$(printf '%s' "$REVIEW_SUMMARY" | jq -r '.blocking_current | length')
 BLOCKING_OLDER=$(printf '%s' "$REVIEW_SUMMARY" | jq -r '.blocking_older | length')
@@ -333,6 +445,11 @@ THREADS_RC=$?
 
 if [[ $THREADS_RC -eq 0 ]]; then
     INLINE_SOURCE="graphql"
+    INLINE_READ_TOTAL="$(printf '%s\n' "$THREADS_NDJSON" | jq -s -c 'map(select(. != null)) | length' 2>/dev/null)"
+    [[ "$INLINE_READ_TOTAL" =~ ^[0-9]+$ ]] || _fail_unknown "the review-thread payload could not be counted — resolution state is unknown"
+    _trust_partition "inline thread" "$THREADS_NDJSON"
+    THREADS_NDJSON="$TRUSTED_NDJSON"
+    INLINE_UNTRUSTED="$DROPPED_N"
     THREAD_SUMMARY=$(printf '%s\n' "$THREADS_NDJSON" | jq -s '
         map(select(. != null))
         | {
@@ -347,7 +464,7 @@ if [[ $THREADS_RC -eq 0 ]]; then
           }
     ' 2>/dev/null)
     [[ -n "$THREAD_SUMMARY" ]] || _fail_unknown "the review-thread payload could not be parsed — resolution state is unknown"
-    INLINE_COMMENTS_TOTAL=$(printf '%s' "$THREAD_SUMMARY" | jq -r '.total')
+    INLINE_COMMENTS_TOTAL="$INLINE_READ_TOTAL"
     INLINE_UNRESOLVED=$(printf '%s' "$THREAD_SUMMARY" | jq -r '.unresolved | length')
     INLINE_UNRESOLVED_OUTDATED=$(printf '%s' "$THREAD_SUMMARY" | jq -r '.unresolved_outdated | length')
     INLINE_BLOCKING_IDS=$(printf '%s' "$THREAD_SUMMARY" | jq -r '.blocking_ids | join(" ")')
@@ -362,6 +479,11 @@ else
         _fail_unknown "both the review-thread (GraphQL) and inline-comment (pulls/$NUMBER/comments) reads failed — inline feedback state is unknown"
     fi
     INLINE_SOURCE="rest-unknown"
+    INLINE_READ_TOTAL="$(printf '%s\n' "$INLINE_NDJSON" | jq -s -c 'map(select(. != null)) | length' 2>/dev/null)"
+    [[ "$INLINE_READ_TOTAL" =~ ^[0-9]+$ ]] || _fail_unknown "the inline-comment payload could not be counted — inline feedback state is unknown"
+    _trust_partition "inline comment" "$INLINE_NDJSON"
+    INLINE_NDJSON="$TRUSTED_NDJSON"
+    INLINE_UNTRUSTED="$DROPPED_N"
     INLINE_SUMMARY=$(printf '%s\n' "$INLINE_NDJSON" | jq -s --arg head "$HEAD_SHA" '
         map(select(. != null))
         | {
@@ -376,7 +498,7 @@ else
           }
     ' 2>/dev/null)
     [[ -n "$INLINE_SUMMARY" ]] || _fail_unknown "the inline-comment payload could not be parsed — inline feedback state is unknown"
-    INLINE_COMMENTS_TOTAL=$(printf '%s' "$INLINE_SUMMARY" | jq -r '.total')
+    INLINE_COMMENTS_TOTAL="$INLINE_READ_TOTAL"
     INLINE_UNRESOLVED=$(printf '%s' "$INLINE_SUMMARY" | jq -r '.current | length')
     INLINE_UNRESOLVED_OUTDATED=$(printf '%s' "$INLINE_SUMMARY" | jq -r '.outdated | length')
     INLINE_BLOCKING_IDS=$(printf '%s' "$INLINE_SUMMARY" | jq -r '.blocking_ids | join(" ")')
