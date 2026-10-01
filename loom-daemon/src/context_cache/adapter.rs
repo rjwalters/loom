@@ -220,7 +220,6 @@ impl RetrievalAdapter for AugmentAdapter {
     }
 
     fn query(&self, spec: &QuerySpec, budget: &Budget) -> AdapterOutcome {
-        use std::io::Read;
         let Some(token) = &self.token else {
             return AdapterOutcome::Unavailable {
                 reason: "AUGMENT_API_TOKEN not set — provider not configured".into(),
@@ -237,50 +236,78 @@ impl RetrievalAdapter for AugmentAdapter {
         };
         let mut attempt = 0u32;
         loop {
-            let req = reqwest::blocking::Client::builder()
-                .timeout(self.timeout)
-                .build()
-                .and_then(|c| {
-                    c.post(&url)
-                        .bearer_auth(token)
-                        .header("content-type", "application/json")
-                        .body(body.clone())
-                        .send()
-                });
-            match req {
+            // reqwest::blocking cannot be created or dropped on a tokio
+            // executor thread (the CLI's `main` is async) — run the whole
+            // exchange on a dedicated OS thread and join it.
+            let exchange = std::thread::spawn({
+                let url = url.clone();
+                let token = token.clone();
+                let body = body.clone();
+                let timeout = self.timeout;
+                move || -> Result<Vec<u8>, String> {
+                    let resp = reqwest::blocking::Client::builder()
+                        .timeout(timeout)
+                        .build()
+                        .and_then(|c| {
+                            c.post(&url)
+                                .bearer_auth(&token)
+                                .header("content-type", "application/json")
+                                .body(body)
+                                .send()
+                        })
+                        .map_err(|e| format!("__TRANSPORT__{e}"))?;
+                    let status = resp.status();
+                    let mut payload = Vec::new();
+                    let mut resp = resp;
+                    use std::io::Read;
+                    resp.read_to_end(&mut payload)
+                        .map_err(|e| format!("__TRANSPORT__body read failed: {e}"))?;
+                    if status.is_success() {
+                        Ok(payload)
+                    } else if status.as_u16() == 429 || status.as_u16() >= 500 {
+                        Err(format!("__RETRY__{status}"))
+                    } else {
+                        Err(format!("__STATUS__{status}"))
+                    }
+                }
+            });
+            let exchanged = match exchange.join() {
+                Ok(r) => r,
                 Err(e) => {
+                    return AdapterOutcome::Unavailable {
+                        reason: format!("adapter thread panicked: {e:?}"),
+                    }
+                }
+            };
+            match exchanged {
+                Err(msg) if msg.starts_with("__RETRY__") => {
                     attempt += 1;
                     if attempt > budget.max_retries {
                         return AdapterOutcome::Unavailable {
-                            reason: format!("transport error after {attempt} attempt(s): {e}"),
+                            reason: format!(
+                                "provider {} after {attempt} attempt(s)",
+                                &msg["__RETRY__".len()..]
+                            ),
                         };
                     }
                     continue;
                 }
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.as_u16() == 429 || status.as_u16() >= 500 {
-                        attempt += 1;
-                        if attempt > budget.max_retries {
-                            return AdapterOutcome::Unavailable {
-                                reason: format!("provider {status} after {attempt} attempt(s)"),
-                            };
-                        }
-                        continue;
-                    }
-                    if !status.is_success() {
+                Err(msg) if msg.starts_with("__STATUS__") => {
+                    return AdapterOutcome::Unavailable {
+                        reason: format!("provider returned {}", &msg["__STATUS__".len()..]),
+                    };
+                }
+                Err(msg) => {
+                    attempt += 1;
+                    if attempt > budget.max_retries {
                         return AdapterOutcome::Unavailable {
-                            reason: format!("provider returned {status}"),
+                            reason: format!("{msg} after {attempt} attempt(s)"),
                         };
                     }
+                    continue;
+                }
+                Ok(payload) => {
                     // Byte cap: truncate-detect before parsing.
-                    let mut payload = Vec::new();
-                    let mut reader = resp;
-                    if reader.read_to_end(&mut payload).is_err() {
-                        return AdapterOutcome::Malformed {
-                            reason: "failed to read response body".into(),
-                        };
-                    }
                     if payload.len() as u64 > budget.max_bytes {
                         return AdapterOutcome::Partial {
                             snippets: vec![],
