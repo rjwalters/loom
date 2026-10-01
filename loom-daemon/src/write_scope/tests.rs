@@ -95,6 +95,10 @@ impl PermissionProbe for FakeProbe {
         self.calls.set(self.calls.get() + 1);
         self.answer.clone()
     }
+
+    fn cache_scope(&self) -> probe::CacheScope {
+        probe::CacheScope::GitHub
+    }
 }
 
 fn target(nwo: &str) -> Option<GhTarget> {
@@ -246,7 +250,6 @@ fn the_cache_answers_repeat_questions_without_a_second_probe() {
     let cached = probe::Cached {
         inner: FakeProbe::new(Permission::Write),
         key_dir: Some(dir.path().join("cred-a")),
-        gitea_id: None,
     };
     assert_eq!(cached.permission("acme/cache-test"), Permission::Write);
     assert_eq!(cached.permission("acme/cache-test"), Permission::Write);
@@ -257,7 +260,6 @@ fn the_cache_answers_repeat_questions_without_a_second_probe() {
     let other = probe::Cached {
         inner: FakeProbe::new(Permission::Insufficient("x".into())),
         key_dir: Some(dir.path().join("cred-b")),
-        gitea_id: None,
     };
     assert!(matches!(other.permission("acme/cache-test"), Permission::Insufficient(_)));
     assert_eq!(other.inner.calls.get(), 1, "a different credential probes again");
@@ -290,13 +292,13 @@ fn a_registered_fixture_is_admitted_only_with_write() {
 /// the on-disk format `probe::Cached` reads; the probe itself has no seeding
 /// hook.
 fn seed_disk(key_dir: Option<&Path>, repo: &str, write: bool, age: std::time::Duration) {
-    seed_disk_for(key_dir, None, repo, write, age);
+    seed_disk_for(key_dir, &probe::CacheScope::GitHub, repo, write, age);
 }
 
-/// [`seed_disk`] with an explicit Gitea cache-id in the key.
+/// [`seed_disk`] under an explicit cache scope.
 fn seed_disk_for(
     key_dir: Option<&Path>,
-    gitea_id: Option<&str>,
+    scope: &probe::CacheScope,
     repo: &str,
     write: bool,
     age: std::time::Duration,
@@ -304,15 +306,17 @@ fn seed_disk_for(
     use std::io::Write as _;
     let dir = probe::cache_dir();
     assert!(crate::forge_etag_store::private_dir(&dir, true));
-    let key = probe::cache_key(key_dir, gitea_id, repo);
+    let key = probe::cache_key(key_dir, scope, repo).expect("a keyed scope");
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
         .saturating_sub(age.as_secs());
     let body = serde_json::json!({"write": write, "detail": "seeded", "at": at}).to_string();
-    let mut f =
-        crate::forge_etag_store::create_private_file(&dir.join(format!("{key}.json"))).unwrap();
+    let path = dir.join(format!("{key}.json"));
+    // Re-seeding replaces the entry (the file is created exclusively).
+    let _ = std::fs::remove_file(&path);
+    let mut f = crate::forge_etag_store::create_private_file(&path).unwrap();
     f.write_all(body.as_bytes()).unwrap();
 }
 
@@ -326,7 +330,6 @@ fn an_unanswerable_reprobe_keeps_a_recent_write_but_not_an_old_one() {
     let down = || probe::Cached {
         inner: FakeProbe::new(Permission::Unknown("HTTP 502".into())),
         key_dir: Some(dir.path().join("cred-g")),
-        gitea_id: None,
     };
     // Verified two hours ago: past the TTL, inside the 24 h grace.
     seed_disk(Some(&dir.path().join("cred-g")), "acme/grace", true, 2 * hour);
@@ -425,7 +428,7 @@ fn a_gitea_push_credential_is_write_through_a_stub_api() {
     std::env::set_var("GITEA_URL", &base);
     std::env::set_var("GITEA_TOKEN", "stub-token");
     let dir = tempfile::tempdir().unwrap();
-    let probe = probe::GiteaProbe::for_root(&dir.path());
+    let probe = probe::GiteaProbe::for_root(dir.path());
     assert_eq!(probe.permission("acme/w"), Permission::Write);
     let request = request.join().unwrap();
     assert!(
@@ -444,7 +447,7 @@ fn a_gitea_pull_only_credential_is_insufficient() {
     std::env::set_var("GITEA_URL", &base);
     std::env::set_var("GITEA_TOKEN", "stub-token");
     let dir = tempfile::tempdir().unwrap();
-    let probe = probe::GiteaProbe::for_root(&dir.path());
+    let probe = probe::GiteaProbe::for_root(dir.path());
     assert_eq!(
         probe.permission("acme/w"),
         Permission::Insufficient("repository role `pull`".into())
@@ -461,7 +464,7 @@ fn a_gitea_api_that_refuses_fails_closed() {
     std::env::set_var("GITEA_URL", &base);
     std::env::set_var("GITEA_TOKEN", "stub-token");
     let dir = tempfile::tempdir().unwrap();
-    let probe = probe::GiteaProbe::for_root(&dir.path());
+    let probe = probe::GiteaProbe::for_root(dir.path());
     let p = probe.permission("acme/w");
     assert!(
         matches!(p, Permission::Unknown(ref why) if why.contains("404")),
@@ -480,7 +483,7 @@ fn gitea_falls_back_to_forge_token_and_to_unknown_without_any() {
     std::env::set_var("GITEA_URL", &base);
     std::env::set_var("FORGE_TOKEN", "generic-token");
     let dir = tempfile::tempdir().unwrap();
-    let probe = probe::GiteaProbe::for_root(&dir.path());
+    let probe = probe::GiteaProbe::for_root(dir.path());
     assert_eq!(probe.permission("acme/w"), Permission::Write);
     assert!(
         request
@@ -493,7 +496,7 @@ fn gitea_falls_back_to_forge_token_and_to_unknown_without_any() {
     // network call — and the caller fails closed.
     clear_gitea_env();
     std::env::set_var("GITEA_URL", "http://127.0.0.1:9");
-    let probe = probe::GiteaProbe::for_root(&dir.path());
+    let probe = probe::GiteaProbe::for_root(dir.path());
     let p = probe.permission("acme/w");
     assert!(
         matches!(p, Permission::Unknown(ref why) if why.contains("token is required")),
@@ -519,7 +522,7 @@ fn gitea_env_overrides_beat_the_config_file() {
     .unwrap();
     std::env::set_var("GITEA_URL", &base);
     std::env::set_var("GITEA_TOKEN", "env-token");
-    let probe = probe::GiteaProbe::for_root(&dir.path());
+    let probe = probe::GiteaProbe::for_root(dir.path());
     assert_eq!(probe.permission("acme/w"), Permission::Write);
     assert!(
         request
@@ -548,14 +551,14 @@ fn gitea_cache_ids_differ_by_connection() {
     };
     let a = mk("https://gitea.one.example.com", "tok-a");
     let b = mk("https://gitea.two.example.com", "tok-b");
-    let pa = probe::GiteaProbe::for_root(&a.path());
-    let pa2 = probe::GiteaProbe::for_root(&a.path());
-    let pb = probe::GiteaProbe::for_root(&b.path());
+    let pa = probe::GiteaProbe::for_root(a.path());
+    let pa2 = probe::GiteaProbe::for_root(a.path());
+    let pb = probe::GiteaProbe::for_root(b.path());
     assert_eq!(pa.cache_id(), pa2.cache_id(), "same connection, same key");
     assert_ne!(pa.cache_id(), pb.cache_id(), "two Gitea workspaces never share a cache entry");
     // An unresolvable connection has no id: it never shares a cache entry.
     let empty = tempfile::tempdir().unwrap();
-    assert_eq!(probe::GiteaProbe::for_root(&empty.path()).cache_id(), "");
+    assert_eq!(probe::GiteaProbe::for_root(empty.path()).cache_id(), "");
     clear_gitea_env();
 }
 
@@ -575,17 +578,145 @@ fn a_seeded_gitea_cache_entry_answers_through_the_same_connection_id() {
     .unwrap();
     std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
     probe::clear_memory();
-    let id = probe::GiteaProbe::for_root(&dir.path())
-        .cache_id()
-        .to_string();
-    seed_disk_for(None, Some(&id), "acme/g", true, std::time::Duration::from_secs(60));
+    let scope = probe::GiteaProbe::for_root(dir.path()).cache_scope();
+    assert!(matches!(scope, probe::CacheScope::Gitea { .. }), "{scope:?}");
+    seed_disk_for(None, &scope, "acme/g", true, std::time::Duration::from_secs(60));
     let cached = probe::Cached {
-        inner: probe::GiteaProbe::for_root(&dir.path()),
+        inner: probe::GiteaProbe::for_root(dir.path()),
         key_dir: None,
-        gitea_id: Some(id),
     };
     assert_eq!(cached.permission("acme/g"), Permission::Write);
     std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
+    clear_gitea_env();
+}
+
+/// The Judge's repro on #9817: a GitHub WRITE for the same `owner/repo`
+/// slug, under the same credential dir, must never answer a Gitea probe —
+/// neither inside the TTL (a direct cache hit) nor inside the 24 h grace (an
+/// `Unknown` upgraded to WRITE).
+#[test]
+#[serial_test::serial(loom_config_env, write_scope_cache)]
+fn a_github_write_never_answers_an_unresolved_gitea_probe() {
+    isolate_gitea_env();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
+    let cred = dir.path().join("cred");
+    let unresolved = || probe::Cached {
+        // No URL, no token: the connection cannot resolve.
+        inner: probe::GiteaProbe::for_root(dir.path()),
+        key_dir: Some(cred.clone()),
+    };
+    assert_eq!(unresolved().cache_scope(), probe::CacheScope::Unresolved);
+    for (what, age) in [("inside the TTL", 60), ("inside the grace", 2 * 3600)] {
+        probe::clear_memory();
+        seed_disk(Some(&cred), "acme/w", true, std::time::Duration::from_secs(age));
+        // Warm the memory side too, as a GitHub probe in this process would.
+        let github = probe::Cached {
+            inner: FakeProbe::new(Permission::Write),
+            key_dir: Some(cred.clone()),
+        };
+        assert_eq!(github.permission("acme/w"), Permission::Write);
+        let p = unresolved().permission("acme/w");
+        assert!(
+            matches!(p, Permission::Unknown(_)),
+            "{what}: an unresolved Gitea connection must refuse, got {p:?}"
+        );
+    }
+    std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
+    clear_gitea_env();
+}
+
+/// A resolved Gitea connection is keyed apart from GitHub as well: a GitHub
+/// WRITE for the same slug and credential dir does not satisfy it, inside the
+/// TTL or the grace (its own probe, a dead port, cannot answer).
+#[test]
+#[serial_test::serial(loom_config_env, write_scope_cache)]
+fn a_github_write_never_answers_a_resolved_gitea_probe() {
+    isolate_gitea_env();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
+    std::env::set_var("GITEA_URL", "http://127.0.0.1:9");
+    std::env::set_var("GITEA_TOKEN", "gitea-token");
+    let cred = dir.path().join("cred");
+    for age in [60, 2 * 3600] {
+        probe::clear_memory();
+        seed_disk(Some(&cred), "acme/w", true, std::time::Duration::from_secs(age));
+        let gitea = probe::Cached {
+            inner: probe::GiteaProbe::for_root(dir.path()),
+            key_dir: Some(cred.clone()),
+        };
+        assert!(matches!(gitea.cache_scope(), probe::CacheScope::Gitea { .. }));
+        let p = gitea.permission("acme/w");
+        assert!(
+            matches!(p, Permission::Unknown(_)),
+            "a GitHub entry {age}s old must not answer Gitea, got {p:?}"
+        );
+    }
+    std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
+    clear_gitea_env();
+}
+
+/// The reverse: a cached Gitea WRITE never satisfies the GitHub probe for the
+/// same slug and credential dir.
+#[test]
+#[serial_test::serial(loom_config_env, write_scope_cache)]
+fn a_gitea_write_never_answers_the_github_probe() {
+    isolate_gitea_env();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
+    std::env::set_var("GITEA_URL", "http://127.0.0.1:9");
+    std::env::set_var("GITEA_TOKEN", "gitea-token");
+    probe::clear_memory();
+    let cred = dir.path().join("cred");
+    let scope = probe::GiteaProbe::for_root(dir.path()).cache_scope();
+    seed_disk_for(Some(&cred), &scope, "acme/w", true, std::time::Duration::from_secs(60));
+    let github = probe::Cached {
+        inner: FakeProbe::new(Permission::Insufficient("repository role `pull`".into())),
+        key_dir: Some(cred.clone()),
+    };
+    assert_eq!(
+        github.permission("acme/w"),
+        Permission::Insufficient("repository role `pull`".into())
+    );
+    assert_eq!(github.inner.calls.get(), 1, "the GitHub probe had to ask");
+    std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
+    clear_gitea_env();
+}
+
+/// The two key spaces are disjoint by construction, and an unresolved
+/// connection (or a resolved one with no id) has no key at all.
+#[test]
+fn cache_keys_are_namespaced_by_forge_and_host() {
+    use probe::CacheScope;
+    let dir = Some(Path::new("/cred"));
+    let gitea = |url: &str| CacheScope::Gitea {
+        base_url: url.into(),
+        id: "abc".into(),
+    };
+    let gh = probe::cache_key(dir, &CacheScope::GitHub, "acme/w").unwrap();
+    let ga = probe::cache_key(dir, &gitea("https://a.example"), "acme/w").unwrap();
+    let gb = probe::cache_key(dir, &gitea("https://b.example"), "acme/w").unwrap();
+    assert_ne!(gh, ga);
+    assert_ne!(ga, gb, "the base URL is part of the key");
+    assert_eq!(probe::cache_key(dir, &CacheScope::Unresolved, "acme/w"), None);
+    let no_id = CacheScope::Gitea {
+        base_url: "https://a.example".into(),
+        id: String::new(),
+    };
+    assert_eq!(probe::cache_key(dir, &no_id, "acme/w"), None);
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn a_gitea_credential_with_a_line_break_does_not_resolve() {
+    isolate_gitea_env();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("GITEA_URL", "http://127.0.0.1:9");
+    std::env::set_var("GITEA_TOKEN", "tok\r\nX-Injected: 1");
+    let gitea = probe::GiteaProbe::for_root(dir.path());
+    assert_eq!(gitea.cache_scope(), probe::CacheScope::Unresolved);
+    let p = gitea.permission("acme/w");
+    assert!(matches!(p, Permission::Unknown(ref why) if why.contains("line break")), "{p:?}");
     clear_gitea_env();
 }
 

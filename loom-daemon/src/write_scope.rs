@@ -243,18 +243,17 @@ pub fn may_write_from(cwd: &Path, repo: Option<&str>) -> Verdict {
 /// answers `Unknown` and the decision refuses — the fail-closed rule.
 fn probe_for(root: &Path, config_dir: Option<PathBuf>, gh: &Path) -> Box<dyn PermissionProbe> {
     if crate::forge_cmd::detect_forge(Some(root)) == crate::forge_cmd::ForgeType::Gitea {
-        let gitea = probe::GiteaProbe::for_root(root);
-        let gitea_id = gitea.cache_id().to_string();
+        // The Gitea probe names its own key space (forge + base URL +
+        // connection digest); an unresolved connection has none and is never
+        // cached or graced.
         return Box::new(probe::Cached {
-            inner: gitea,
+            inner: probe::GiteaProbe::for_root(root),
             key_dir: config_dir,
-            gitea_id: Some(gitea_id).filter(|id| !id.is_empty()),
         });
     }
     Box::new(probe::Cached {
         inner: probe::GhProbe::new(gh.to_path_buf(), config_dir.clone()),
         key_dir: config_dir,
-        gitea_id: None,
     })
 }
 

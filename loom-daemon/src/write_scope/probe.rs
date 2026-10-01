@@ -34,6 +34,12 @@
 //! writes themselves do — `GITEA_TOKEN` / `FORGE_TOKEN` / `GITEA_URL` /
 //! `GITEA_USERNAME`, else `.loom/config.json`'s `forge.gitea.*` — and a
 //! connection that cannot be resolved or reached is `Unknown`, never WRITE.
+//!
+//! **Cache key space.** Every key names its forge and host ([`CacheScope`]),
+//! so a GitHub answer can never stand in for a Gitea probe of the same
+//! `owner/repo` slug, or the reverse. A Gitea connection that cannot resolve
+//! has no key at all: it is never looked up, never stored, and never upgraded
+//! by the stale-WRITE grace, so "no Gitea credential" always refuses.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,6 +61,27 @@ pub(crate) enum Permission {
 /// A permission source, so decisions are testable without a forge.
 pub(crate) trait PermissionProbe {
     fn permission(&self, repo: &str) -> Permission;
+
+    /// The forge, host and credential this probe answers for: the key space
+    /// [`Cached`] files its answers under. Required, with no default, so a new
+    /// probe cannot silently inherit another forge's cache entries.
+    fn cache_scope(&self) -> CacheScope;
+}
+
+/// Which key space a probe's answers live in (#9699). The forge is always
+/// part of the key, so a GitHub entry and a Gitea entry for the same
+/// `owner/repo` never collide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CacheScope {
+    /// `gh` against `GH_HOST` (default `github.com`), under the cache's
+    /// `GH_CONFIG_DIR` and any `GH_TOKEN`/`GITHUB_TOKEN`.
+    GitHub,
+    /// A resolved Gitea connection: its base URL, and [`GiteaProbe::cache_id`]
+    /// (the URL, token and username hashed together).
+    Gitea { base_url: String, id: String },
+    /// No resolved credential: nothing may be cached for it or read on its
+    /// behalf, and the stale-WRITE grace never applies.
+    Unresolved,
 }
 
 /// Seconds a definitive answer is reused. `LOOM_WRITE_SCOPE_TTL_SECS`
@@ -143,6 +170,10 @@ impl PermissionProbe for GhProbe {
             (Err(e), Err(_)) => Permission::Unknown(e),
         }
     }
+
+    fn cache_scope(&self) -> CacheScope {
+        CacheScope::GitHub
+    }
 }
 
 /// Classify Gitea's `permissions` object from a `GET
@@ -219,8 +250,9 @@ impl GiteaProbe {
         Self { resolved, id }
     }
 
-    /// The resolved connection's digest for [`cache_key`]; empty when the
-    /// connection could not resolve.
+    /// The resolved connection's digest; empty when the connection could not
+    /// resolve. Production reads it through [`PermissionProbe::cache_scope`].
+    #[cfg(test)]
     pub(crate) fn cache_id(&self) -> &str {
         &self.id
     }
@@ -258,7 +290,14 @@ impl GiteaProbe {
                 .or_else(|| env("FORGE_TOKEN")),
         );
         set("username", env("GITEA_USERNAME"));
-        crate::forge_cmd::gitea_config_from_forge(&forge).map_err(|e| e.to_string())
+        let cfg = crate::forge_cmd::gitea_config_from_forge(&forge).map_err(|e| e.to_string())?;
+        // The header goes to curl's stdin (`-H @-`), one header per line: a
+        // CR or LF in the credential would smuggle extra header lines in.
+        let has_break = |v: &str| v.contains(['\r', '\n']);
+        if has_break(&cfg.token) || cfg.username.as_deref().is_some_and(has_break) {
+            return Err("the Gitea credential contains a line break".into());
+        }
+        Ok(cfg)
     }
 
     fn probe(&self, cfg: &crate::forge_cmd::GiteaConfig, repo: &str) -> Permission {
@@ -276,7 +315,10 @@ impl GiteaProbe {
             None => format!("Authorization: token {}\n", cfg.token),
         };
         let mut cmd = Command::new("curl");
-        cmd.args(["--silent", "--show-error", "--max-time"])
+        // `-q` must come first: it stops `~/.curlrc` adding `--location`, a
+        // proxy or anything else to a credentialed request. `--globoff`
+        // keeps `{}`/`[]` in the interpolated repo slug literal.
+        cmd.args(["-q", "--globoff", "--silent", "--show-error", "--max-time"])
             .arg(PROBE_TIMEOUT.as_secs_f64().to_string())
             .arg("-o")
             .arg("-")
@@ -339,6 +381,16 @@ impl PermissionProbe for GiteaProbe {
             Err(why) => Permission::Unknown(why.clone()),
         }
     }
+
+    fn cache_scope(&self) -> CacheScope {
+        match &self.resolved {
+            Ok(cfg) => CacheScope::Gitea {
+                base_url: cfg.base_url.clone(),
+                id: self.id.clone(),
+            },
+            Err(_) => CacheScope::Unresolved,
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -374,38 +426,55 @@ fn memory() -> &'static Mutex<HashMap<String, MemEntry>> {
     M.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The cache key: which credential, which repository. A token in the
-/// environment is folded in as a digest, never stored. GitHub material is the
-/// `GH_CONFIG_DIR` and `GH_TOKEN`/`GITHUB_TOKEN`; Gitea's (#9699) arrives
-/// pre-digested as [`GiteaProbe::cache_id`] — the resolved connection hashed
+/// The cache key: which forge and host, which credential, which repository;
+/// `None` for [`CacheScope::Unresolved`], which is never cached. The forge
+/// name leads the key material, so the GitHub and Gitea key spaces cannot
+/// overlap for the same `owner/repo` (#9699).
+///
+/// GitHub material is `GH_HOST`, the `GH_CONFIG_DIR` and `GH_TOKEN` /
+/// `GITHUB_TOKEN` (a token is folded in as a digest, never stored). Gitea's is
+/// the base URL plus [`GiteaProbe::cache_id`] — the resolved connection hashed
 /// once when the probe was built, so the key always matches exactly the
-/// credential a write would carry (a config-file token included) and no
-/// environment is read at cache time.
-pub(crate) fn cache_key(config_dir: Option<&Path>, gitea_id: Option<&str>, repo: &str) -> String {
+/// credential a write would carry (a config-file token included).
+pub(crate) fn cache_key(
+    config_dir: Option<&Path>,
+    scope: &CacheScope,
+    repo: &str,
+) -> Option<String> {
     use sha2::{Digest, Sha256};
-    let token = ["GH_TOKEN", "GITHUB_TOKEN"]
-        .iter()
-        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
-        .unwrap_or_default();
-    let env_dir = std::env::var("GH_CONFIG_DIR").unwrap_or_default();
-    let dir = config_dir.map_or(env_dir, |d| d.display().to_string());
-    let digest = Sha256::digest(format!(
-        "{dir}\0{token}\0{}\0{}",
-        gitea_id.unwrap_or_default(),
-        repo.to_ascii_lowercase()
-    ));
-    hex::encode(&digest[..16])
+    let repo = repo.to_ascii_lowercase();
+    let material = match scope {
+        CacheScope::Unresolved => return None,
+        CacheScope::GitHub => {
+            let token = ["GH_TOKEN", "GITHUB_TOKEN"]
+                .iter()
+                .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+                .unwrap_or_default();
+            let host = std::env::var("GH_HOST")
+                .ok()
+                .filter(|h| !h.trim().is_empty())
+                .unwrap_or_else(|| "github.com".into())
+                .to_ascii_lowercase();
+            let env_dir = std::env::var("GH_CONFIG_DIR").unwrap_or_default();
+            let dir = config_dir.map_or(env_dir, |d| d.display().to_string());
+            format!("github\0{host}\0{dir}\0{token}\0{repo}")
+        }
+        CacheScope::Gitea { base_url, id } => {
+            if id.is_empty() {
+                return None;
+            }
+            format!("gitea\0{base_url}\0{id}\0{repo}")
+        }
+    };
+    Some(hex::encode(&Sha256::digest(material)[..16]))
 }
 
-/// A probe with the memory + disk cache in front of it.
+/// A probe with the memory + disk cache in front of it. The key space comes
+/// from the probe itself ([`PermissionProbe::cache_scope`]), never from the
+/// caller, so a probe cannot be filed under another forge's answers.
 pub(crate) struct Cached<P> {
     pub(crate) inner: P,
     pub(crate) key_dir: Option<PathBuf>,
-    /// The Gitea probe's [`GiteaProbe::cache_id`] (None on the GitHub path,
-    /// or when the Gitea connection could not resolve — that probe answers
-    /// `Unknown` anyway). Folds the forge host + credential into the cache
-    /// key so two Gitea workspaces never share an answer.
-    pub(crate) gitea_id: Option<String>,
 }
 
 /// An `Unknown` becomes WRITE when WRITE was verified recently enough.
@@ -425,8 +494,22 @@ fn with_grace(p: Permission, last_write: Option<SystemTime>, now: SystemTime) ->
 }
 
 impl<P: PermissionProbe> PermissionProbe for Cached<P> {
+    fn cache_scope(&self) -> CacheScope {
+        self.inner.cache_scope()
+    }
+
     fn permission(&self, repo: &str) -> Permission {
-        let key = cache_key(self.key_dir.as_deref(), self.gitea_id.as_deref(), repo);
+        let Some(key) = cache_key(self.key_dir.as_deref(), &self.inner.cache_scope(), repo) else {
+            // No resolved credential: no cache entry may answer for it and no
+            // grace may upgrade it. Even a WRITE from such a probe is a
+            // contradiction, so it refuses too.
+            return match self.inner.permission(repo) {
+                Permission::Write => {
+                    Permission::Unknown("no resolved credential to verify WRITE".into())
+                }
+                other => other,
+            };
+        };
         let now = SystemTime::now();
         let fresh = |at: SystemTime, p: &Permission| {
             let limit = if matches!(p, Permission::Unknown(_)) {

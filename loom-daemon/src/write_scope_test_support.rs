@@ -114,8 +114,12 @@ impl Drop for WritableRoot {
     fn drop(&mut self) {
         let dir = crate::write_scope::probe::cache_dir();
         let key_dir = crate::credential_preflight::gh_config_dir_for_root(&self.root);
-        let key = crate::write_scope::probe::cache_key(key_dir.as_deref(), None, &self.repo);
-        let _ = std::fs::remove_file(dir.join(format!("{key}.json")));
+        let scope = crate::write_scope::probe::CacheScope::GitHub;
+        if let Some(key) =
+            crate::write_scope::probe::cache_key(key_dir.as_deref(), &scope, &self.repo)
+        {
+            let _ = std::fs::remove_file(dir.join(format!("{key}.json")));
+        }
     }
 }
 
