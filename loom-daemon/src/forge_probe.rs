@@ -804,28 +804,44 @@ fn issue_search_case(
     // Deterministic per run_ns: the fake scripts the exact search URL.
     let marker = format!("loomp-search-{}", cfg.run_ns);
     let n = fixture_issue(view, cfg, http, "issue-search", &marker)?;
-    let (code, body) = http
-        .request(
-            "GET",
-            &format!("repos/issues/search?q={marker}&type=issues"),
-            &cfg.writer_token,
-            None,
-        )
-        .map_err(|e| ForgeOutcome::Unknown {
-            operation: view.id.clone(),
-            why: e,
-        })?;
-    let found = json_obj(&body)
-        .map(|v| {
-            let arr = v
-                .as_array()
-                .cloned()
-                .or_else(|| v.get("data").and_then(|d| d.as_array().cloned()))
-                .unwrap_or_default();
-            arr.iter()
-                .any(|i| i.get("number").and_then(|x| x.as_u64()) == Some(n))
-        })
-        .unwrap_or(false);
+    // The manifest row declares issue-search consistency=eventual: a fresh
+    // fixture is not searchable on the next request (content indexing
+    // lags — observed live against gitea-1, title hits are immediate while
+    // body hits wait on the indexer). A bounded wait before declaring a
+    // miss honors the contract; the no-retry rule is about transport
+    // faults, not eventual reads.
+    let mut found = false;
+    let mut attempts = 0usize;
+    let (mut code, mut body) = (0u16, String::new());
+    while attempts < 5 {
+        attempts += 1;
+        (code, body) = http
+            .request(
+                "GET",
+                &format!("repos/issues/search?q={marker}&type=issues"),
+                &cfg.writer_token,
+                None,
+            )
+            .map_err(|e| ForgeOutcome::Unknown {
+                operation: view.id.clone(),
+                why: e,
+            })?;
+        found = json_obj(&body)
+            .map(|v| {
+                let arr = v
+                    .as_array()
+                    .cloned()
+                    .or_else(|| v.get("data").and_then(|d| d.as_array().cloned()))
+                    .unwrap_or_default();
+                arr.iter()
+                    .any(|i| i.get("number").and_then(|x| x.as_u64()) == Some(n))
+            })
+            .unwrap_or(false);
+        if found || !(200..=299).contains(&code) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
     Ok(CaseResult {
         test_id: test_id.to_string(),
         operation: view.id.clone(),
@@ -839,8 +855,10 @@ fn issue_search_case(
         server_version: server_version.to_string(),
         actor: actor_of(http, &cfg.writer_token),
         at: now_secs(),
-        expected: format!("search finds the marker fixture #{n} in the first page"),
-        observed: format!("search answered {code}; hit: {found}"),
+        expected: format!("search finds the marker fixture #{n} in the first page (eventual)"),
+        observed: format!(
+            "search answered {code}; hit: {found} after {attempts} attempt(s) at ~2s spacing"
+        ),
         notes: vec![format!("disposable issue number: {n}")],
     })
 }
@@ -1165,9 +1183,16 @@ fn label_sync_catalogue_case(
     let hit = rows
         .iter()
         .find(|l| l.get("id").and_then(|i| i.as_u64()) == Some(label_id));
+    // Gitea stores label colours WITHOUT the leading '#' ("00ccdd");
+    // normalise both sides before comparing (observed live, run #2).
+    let norm = |c: Option<&str>| -> String {
+        c.unwrap_or_default()
+            .trim_start_matches('#')
+            .to_ascii_lowercase()
+    };
     let listed_ok = hit
         .map(|l| {
-            l.get("color").and_then(|c| c.as_str()) == Some("#00ccdd")
+            norm(l.get("color").and_then(|c| c.as_str())) == "00ccdd"
                 && l.get("description").and_then(|d| d.as_str()) == Some("probe-edited")
         })
         .unwrap_or(false);
