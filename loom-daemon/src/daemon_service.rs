@@ -351,12 +351,14 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `resource_usage` has on a dispatch-driven host — the IPC
     // `GetTerminalOutput` path a `claude -p` sweep never traverses is the
     // other one; (2) since #8758, the scheduled raw-transcript archive pass
-    // (opt-in via `autonomous.transcriptArchive`). For both, `sweep_workspace`
-    // is read only to resolve the `autonomous.*` config block — the passes
-    // themselves are workspace-independent, reading every project's
-    // transcripts under `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`. Handles
-    // dropped, threads run on.
-    let (_ingest_handle, _transcript_archive_handle) =
+    // (opt-in via `autonomous.transcriptArchive`); (3) since #9764, the live
+    // `session.output` emitter (opt-in via
+    // `autonomous.transcriptIngest.liveOutput`). For all three,
+    // `sweep_workspace` is read only to resolve the `autonomous.*` config
+    // block — the passes themselves are workspace-independent, reading every
+    // project's transcripts under `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`.
+    // Handles dropped, threads run on.
+    let (_ingest_handle, _transcript_archive_handle, _transcript_output_handle) =
         activity::start_maintenance_threads(&db_path, &sweep_workspace);
 
     // #6499: a loud, top-of-boot-block diagnosis of the legacy

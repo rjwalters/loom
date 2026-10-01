@@ -121,6 +121,7 @@ pub mod repo_ref;
 pub mod runtime_usage;
 pub mod sender;
 pub mod session_analysis;
+pub mod session_output;
 pub mod session_summary;
 pub mod shutdown;
 pub mod tracing;
@@ -1109,6 +1110,14 @@ pub fn spawn_task(
     session_analysis::register_global_session_analysis_sink(
         session_analysis::SessionAnalysisSink::new(fanout.clone(), host_id.clone()),
     );
+    // `session.output` live emission (Issue #9764): same wiring again. The
+    // emitter thread resolves this global per tick, so a host with
+    // `autonomous.transcriptIngest.liveOutput.enabled=false` (the default)
+    // never consumes it.
+    session_output::register_global_session_output_sink(session_output::SessionOutputSink::new(
+        fanout.clone(),
+        host_id.clone(),
+    ));
     // Generic ops signals (Issue #8860): daemon loops emit `metric.points` and
     // ops spans through `ops::emit_*`. Registered over the OTLP queues only —
     // both kinds are OTLP-only, so an HTTPS queue would just carry and drop

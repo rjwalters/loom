@@ -546,6 +546,26 @@ pub struct TranscriptIngestConfig {
     /// `autonomous.transcriptIngest.windowHours`. `0` is meaningful (no
     /// window — a full backfill each pass) and is kept, not dropped.
     pub window_hours: Option<i64>,
+    /// `autonomous.transcriptIngest.liveOutput` (Issue #9764) — the live
+    /// agent-output emitter's sub-block. `None` when the whole block is
+    /// absent (every knob then falls to env/default resolution).
+    pub live_output: Option<LiveOutputConfig>,
+}
+
+/// The `autonomous.transcriptIngest.liveOutput` sub-block (Issue #9764): the
+/// live `session.output` emitter's knobs. Default **off** — this is the
+/// FLAGS-OFF polarity, unlike the summary pass above (#8477's reason does not
+/// apply: transcript text is already preserved on disk for the fuse's
+/// lifetime, and forwarding it is a privacy decision, not a data-loss one).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LiveOutputConfig {
+    /// `autonomous.transcriptIngest.liveOutput.enabled`.
+    pub enabled: Option<bool>,
+    /// `autonomous.transcriptIngest.liveOutput.intervalSecs` (a zero/invalid
+    /// value is dropped to `None`).
+    pub interval_secs: Option<u64>,
+    /// `autonomous.transcriptIngest.liveOutput.maxBytesPerSession`.
+    pub max_bytes_per_session: Option<usize>,
 }
 
 /// Read `.loom/config.json` -> `autonomous.transcriptIngest`, soft-failing
@@ -569,6 +589,20 @@ pub fn read_transcript_ingest_config(repo_root: &Path) -> TranscriptIngestConfig
         window_hours: node
             .and_then(|n| n.get("windowHours"))
             .and_then(serde_json::Value::as_i64),
+        live_output: node
+            .and_then(|n| n.get("liveOutput"))
+            .map(|live| LiveOutputConfig {
+                enabled: live.get("enabled").and_then(serde_json::Value::as_bool),
+                interval_secs: live
+                    .get("intervalSecs")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|&s| s > 0),
+                max_bytes_per_session: live
+                    .get("maxBytesPerSession")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| usize::try_from(v).ok())
+                    .filter(|&v| v > 0),
+            }),
     }
 }
 
@@ -646,6 +680,104 @@ pub fn resolve_window_hours(config: &TranscriptIngestConfig) -> i64 {
 #[must_use]
 pub fn resolve_settings(config: &TranscriptIngestConfig) -> Option<(u64, i64)> {
     resolve_enabled(config).then(|| (resolve_interval_secs(config), resolve_window_hours(config)))
+}
+
+// ---------------------------------------------------------------------------
+// Live output (session.output, Issue #9764)
+// ---------------------------------------------------------------------------
+
+/// Default `…liveOutput.intervalSecs` — one live-output tick. #9764's
+/// ≤ 10 s source-to-visible target is a producer/export *budget* this poll
+/// interval is sized against (default 30 s keeps the steady-state cost
+/// negligible); it is a config knob, not a guarantee the default meets the
+/// target, and is documented as such.
+pub const DEFAULT_LIVE_OUTPUT_INTERVAL_SECS: u64 = 30;
+
+/// Floor for [`resolve_live_output_interval_secs`]. Every offer persists the
+/// whole queue (`DurableQueue::persist_to` is O(queue) per push, per
+/// `queue.rs`), so a sub-15 s tick on a backlog would spend the tick
+/// re-persisting rather than emitting.
+pub const MIN_LIVE_OUTPUT_INTERVAL_SECS: u64 = 15;
+
+/// Default `…liveOutput.maxBytesPerSession` — the per-session output-text
+/// cap, mirroring `ci_telemetry::logs::DEFAULT_MAX_BYTES`.
+pub const DEFAULT_LIVE_OUTPUT_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+fn env_live_output_enabled() -> Option<bool> {
+    std::env::var("LOOM_TRANSCRIPT_OUTPUT")
+        .ok()
+        .and_then(|v| parse_bool_env(&v))
+}
+
+fn env_live_output_interval_secs() -> Option<u64> {
+    std::env::var("LOOM_TRANSCRIPT_OUTPUT_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn env_live_output_max_bytes() -> Option<usize> {
+    std::env::var("LOOM_TRANSCRIPT_OUTPUT_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
+/// Whether the live-output emitter runs, with precedence **env > config >
+/// default(false)** — the FLAGS-OFF polarity (#9764), deliberately the
+/// opposite of [`resolve_enabled`]: emitting transcript *text* to a remote
+/// sink is a privacy decision an operator makes on purpose, and the default
+/// must not forward it.
+#[must_use]
+pub fn resolve_live_output_enabled(config: &TranscriptIngestConfig) -> bool {
+    if let Some(v) = env_live_output_enabled() {
+        return v;
+    }
+    config
+        .live_output
+        .as_ref()
+        .and_then(|l| l.enabled)
+        .unwrap_or(false)
+}
+
+/// Resolve the live-output tick interval (seconds), clamped to at least
+/// [`MIN_LIVE_OUTPUT_INTERVAL_SECS`], with precedence **env > config >
+/// default(30)**.
+#[must_use]
+pub fn resolve_live_output_interval_secs(config: &TranscriptIngestConfig) -> u64 {
+    env_live_output_interval_secs()
+        .or(config.live_output.as_ref().and_then(|l| l.interval_secs))
+        .unwrap_or(DEFAULT_LIVE_OUTPUT_INTERVAL_SECS)
+        .max(MIN_LIVE_OUTPUT_INTERVAL_SECS)
+}
+
+/// Resolve the per-session output-text cap (bytes), precedence **env >
+/// config > default(5 MiB)**.
+#[must_use]
+pub fn resolve_live_output_max_bytes(config: &TranscriptIngestConfig) -> usize {
+    env_live_output_max_bytes()
+        .or(config
+            .live_output
+            .as_ref()
+            .and_then(|l| l.max_bytes_per_session))
+        .unwrap_or(DEFAULT_LIVE_OUTPUT_MAX_BYTES)
+}
+
+/// The resolved live-output knobs, or `None` when
+/// [`resolve_live_output_enabled`] says the emitter is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveOutputSettings {
+    pub interval_secs: u64,
+    pub max_bytes_per_session: usize,
+}
+
+/// Resolve `(interval, cap)`, or `None` when the emitter is off.
+#[must_use]
+pub fn resolve_live_output_settings(config: &TranscriptIngestConfig) -> Option<LiveOutputSettings> {
+    resolve_live_output_enabled(config).then(|| LiveOutputSettings {
+        interval_secs: resolve_live_output_interval_secs(config),
+        max_bytes_per_session: resolve_live_output_max_bytes(config),
+    })
 }
 
 /// Run one pass against `db_path`, returning what it did.

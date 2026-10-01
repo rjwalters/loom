@@ -56,6 +56,7 @@ pub mod stats;
 pub mod test_parser;
 pub mod transcript_archive;
 pub mod transcript_ingest;
+pub mod transcript_output;
 pub mod transcript_parse;
 pub mod tuning;
 mod usage_report;
@@ -103,7 +104,7 @@ pub use transcript_archive::{
     ScheduledArchiveSettings, TranscriptArchiveConfig, LOCAL_SINK,
 };
 
-/// Start the two background transcript maintenance threads the activity
+/// Start the background transcript maintenance threads the activity
 /// module owns, returning their join handles in start order — the handles
 /// are informational (each thread keeps running when its handle is dropped;
 /// a disabled feature yields `None`).
@@ -115,17 +116,33 @@ pub use transcript_archive::{
 ///    ([`transcript_archive::try_init_transcript_archive`], #8758; opt-in
 ///    via `autonomous.transcriptArchive`) — the daemon-run form of #8494's
 ///    CLI pass, ledgering under the `local` sink.
+/// 3. The live `session.output` emitter
+///    ([`transcript_output::try_init_transcript_output`], #9764; **opt-in**,
+///    `autonomous.transcriptIngest.liveOutput.enabled`) — a fast-tick tail
+///    of active transcripts forwarding bounded, issue-correlated output
+///    chunks while a run is still active.
 ///
 /// `repo_root` is read only to resolve each pass's `autonomous.*` config
-/// block; both passes are workspace-independent, reading every project's
-/// transcripts under `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`.
+/// block; all three passes are workspace-independent, reading every
+/// project's transcripts under `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`.
+/// The join handles [`start_maintenance_threads`] returns, in start order:
+/// token ingestion, the transcript archive pass, the live `session.output`
+/// emitter. Each is informational — the thread keeps running when its handle
+/// is dropped, and a disabled feature yields `None`.
+pub type MaintenanceHandles = (
+    Option<std::thread::JoinHandle<()>>,
+    Option<std::thread::JoinHandle<()>>,
+    Option<std::thread::JoinHandle<()>>,
+);
+
 pub fn start_maintenance_threads(
     db_path: &std::path::Path,
     repo_root: &std::path::Path,
-) -> (Option<std::thread::JoinHandle<()>>, Option<std::thread::JoinHandle<()>>) {
+) -> MaintenanceHandles {
     (
         transcript_ingest::try_init_transcript_ingest(db_path, repo_root),
         transcript_archive::try_init_transcript_archive(db_path, repo_root),
+        transcript_output::try_init_transcript_output(repo_root),
     )
 }
 

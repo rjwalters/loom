@@ -362,9 +362,88 @@ fn clear_ingest_env() {
         "LOOM_TRANSCRIPT_INGEST",
         "LOOM_TRANSCRIPT_INGEST_INTERVAL",
         "LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS",
+        // The #9764 live-output knobs.
+        "LOOM_TRANSCRIPT_OUTPUT",
+        "LOOM_TRANSCRIPT_OUTPUT_INTERVAL",
+        "LOOM_TRANSCRIPT_OUTPUT_MAX_BYTES",
     ] {
         std::env::remove_var(var);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live output (`session.output`, Issue #9764) — knobs
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial_test::serial]
+fn live_output_is_off_by_default() {
+    clear_ingest_env();
+    assert!(
+        !resolve_live_output_enabled(&TranscriptIngestConfig::default()),
+        "FLAGS-OFF: transcript text is not forwarded without an explicit opt-in"
+    );
+    assert_eq!(resolve_live_output_settings(&TranscriptIngestConfig::default()), None);
+}
+
+#[test]
+#[serial_test::serial]
+fn live_output_env_overrides_config_and_the_interval_has_a_floor() {
+    clear_ingest_env();
+    let config = TranscriptIngestConfig {
+        live_output: Some(LiveOutputConfig {
+            enabled: Some(true),
+            interval_secs: Some(120),
+            max_bytes_per_session: Some(4096),
+        }),
+        ..TranscriptIngestConfig::default()
+    };
+    assert_eq!(
+        resolve_live_output_settings(&config),
+        Some(LiveOutputSettings {
+            interval_secs: 120,
+            max_bytes_per_session: 4096,
+        })
+    );
+
+    // Env > config, on every knob.
+    std::env::set_var("LOOM_TRANSCRIPT_OUTPUT", "0");
+    assert!(!resolve_live_output_enabled(&config), "an explicit env off wins over config on");
+    std::env::set_var("LOOM_TRANSCRIPT_OUTPUT", "1");
+    std::env::set_var("LOOM_TRANSCRIPT_OUTPUT_INTERVAL", "5");
+    std::env::set_var("LOOM_TRANSCRIPT_OUTPUT_MAX_BYTES", "2048");
+    assert_eq!(
+        resolve_live_output_settings(&config),
+        Some(LiveOutputSettings {
+            interval_secs: 15,
+            max_bytes_per_session: 2048,
+        }),
+        "env interval wins, and the O(queue)-per-push floor clamps it up"
+    );
+    clear_ingest_env();
+}
+
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn read_transcript_ingest_config_reads_the_live_output_block() {
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+    std::fs::write(
+        dir.path().join(crate::config_resolver::LEGACY_CONFIG_REL),
+        r#"{"autonomous": {"transcriptIngest": {"liveOutput": {"enabled": true, "intervalSecs": 60, "maxBytesPerSession": 1048576}}}}"#,
+    )
+    .unwrap();
+    let config = read_transcript_ingest_config(dir.path());
+    std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+    assert_eq!(
+        config.live_output,
+        Some(LiveOutputConfig {
+            enabled: Some(true),
+            interval_secs: Some(60),
+            max_bytes_per_session: Some(1_048_576),
+        })
+    );
 }
 
 #[test]
@@ -468,6 +547,7 @@ fn read_transcript_ingest_config_reads_the_committed_block() {
             enabled: Some(false),
             interval_secs: Some(120),
             window_hours: Some(0),
+            live_output: None,
         }
     );
 }
