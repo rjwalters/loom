@@ -118,6 +118,25 @@ impl Fixture {
             .replace("@CAND@", &CANDIDATE.to_string());
         std::fs::write(&gh, script).unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // ETXTBSY guard (the same harness race worktree_ops/clean/tests.rs
+        // retries): a concurrent test thread that forked while this script's
+        // write fd was open holds it until its exec, and Linux refuses to
+        // exec the script meanwhile. Wait that out here, so the run under test
+        // never sees "Text file busy". The probe's log line is cleared.
+        for _ in 0..100 {
+            match Command::new(&gh)
+                .arg("--probe")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                _ => break,
+            }
+        }
+        let _ = std::fs::remove_file(state.join("log"));
         Self {
             _tmp: tmp,
             repo,

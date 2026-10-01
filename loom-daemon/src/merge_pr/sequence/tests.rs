@@ -347,12 +347,14 @@ fn tombstone_look_alikes_are_not_tombstones() {
 
 #[test]
 fn every_hold_releasing_writer_emits_a_tombstone_parse_live_reads() {
-    // Drift guard: the pass (#9686) and both consolidation verbs render their
-    // own release bodies; each must end the hold under `parse_live`.
+    // Drift guard: the pass (#9686) and `consolidate-abort` (#9688) render
+    // their own release bodies; each must end the hold under `parse_live`.
+    // (`consolidate-reconcile` writes none: the pass is the one releaser on
+    // landing, ADR-0023 §4.)
     use crate::claim_reconciliation::merge_sequence::{
         release_comment_body, HoldAction, REPLAN_NOTE_BODY,
     };
-    use crate::merge_pr::consolidate::{landing_release_body, reservation_release_body};
+    use crate::merge_pr::consolidate::reservation_release_body;
     let m = SequenceMarker {
         after: 111,
         pred_head: PRED.into(),
@@ -366,7 +368,6 @@ fn every_hold_releasing_writer_emits_a_tombstone_parse_live_reads() {
         release_comment_body(&m, HoldAction::Expire),
         REPLAN_NOTE_BODY.to_string(),
         reservation_release_body(&m, "cons-ab12cd34"),
-        landing_release_body(&m, "cons-ab12cd34"),
     ];
     for release in writers {
         let bodies = vec![marker_text(&m), release.clone()];

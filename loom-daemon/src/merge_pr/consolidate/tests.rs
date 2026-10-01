@@ -299,11 +299,16 @@ fn a_released_reservation_does_not_block_a_later_consolidation() {
         max_components: 4,
         max_diff_lines: 800,
     };
-    // (a) The history ends in the landing release: parse_live drops it, so
-    // the caller never even hands check_eligibility a marker.
+    // (a) The history ends in the landing release (the ordering pass's
+    // `CLEAR` release — the one releaser on landing, ADR-0023 §4):
+    // parse_live drops it, so the caller never even hands check_eligibility a
+    // marker.
     let history = vec![
         reservation_comment_body(&old, "cons-deadbeef"),
-        landing_release_body(&old, "cons-deadbeef"),
+        crate::claim_reconciliation::merge_sequence::release_comment_body(
+            &old,
+            crate::claim_reconciliation::merge_sequence::HoldAction::Release,
+        ),
     ];
     assert_eq!(crate::merge_pr::sequence::parse_live(&history), None);
     let abort_history = vec![
@@ -550,17 +555,18 @@ fn inclusion_verification_uses_real_ancestry() {
 }
 
 #[test]
-fn a_landing_release_says_the_candidate_landed_not_that_the_pr_merged() {
-    let m = SequenceMarker {
-        after: 99,
-        pred_head: H1.to_string(),
-        follower_head: H2.to_string(),
-        plan: "cons-a".into(),
-        source: Some("pass".into()),
-    };
-    let body = landing_release_body(&m, "cons-a");
-    assert!(body.contains("#99 landed"), "{body}");
-    assert!(body.contains("contained in the combined merge"), "{body}");
+fn an_untouched_open_status_names_the_landed_pin_and_keeps_its_own_ledger_marker() {
+    let body = untouched_open_body(12, 99, "c0ffee", H2, "cons-a");
+    assert!(body.contains(H2), "names the pinned head that landed: {body}");
+    assert!(body.contains("c0ffee"), "{body}");
+    assert!(body.contains("`untouched-open`"), "{body}");
+    assert!(!body.contains("merged-into #"), "never recorded as merged-into: {body}");
+    // Distinct from the merged-into ledger entry, in both directions.
+    assert!(!status_present(std::slice::from_ref(&body), 99, 12));
+    assert!(body.contains(&untouched_status_marker(99, 12)));
+    assert!(
+        !status_comment_body(12, 99, "c0ffee", "cons-a").contains(&untouched_status_marker(99, 12))
+    );
 }
 
 // --- Reservations -------------------------------------------------------
