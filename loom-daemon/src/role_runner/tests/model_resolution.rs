@@ -6,6 +6,7 @@
 //! (`.loom/docs/file-size-policy.md`).
 
 use super::*;
+// #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
 
 /// Shared fixture for the #5028 end-to-end mismatch tests: a workspace
 /// admitted onto the `codex` runtime for `judge`, with a real per-repo
@@ -113,8 +114,10 @@ fn test_invoke_admits_an_unpinned_codex_role_with_no_model_pin() {
     let marker = setup_codex_judge_fixture(root, "");
 
     let before = model_runtime_mismatch_skip_count();
-    let mut runner =
-        ScriptRoleInvocationRunner::new(root.to_path_buf()).with_timeout(Duration::from_secs(5));
+    let ws = crate::write_scope_test_support::WritableRoot::register(std::path::Path::new(&root));
+    let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf())
+        .with_gh_bin(ws.gh.clone())
+        .with_timeout(Duration::from_secs(5));
     let outcome = runner.invoke("judge", "/loom:judge");
 
     assert_eq!(
@@ -153,8 +156,10 @@ fn test_invoke_admits_an_explicit_cli_default_sentinel_pin() {
         r#","autonomous":{"roleRunner":{"model":"sonnet","roleModels":{"judge":"default"}}}"#,
     );
 
-    let mut runner =
-        ScriptRoleInvocationRunner::new(root.to_path_buf()).with_timeout(Duration::from_secs(5));
+    let ws = crate::write_scope_test_support::WritableRoot::register(std::path::Path::new(&root));
+    let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf())
+        .with_gh_bin(ws.gh.clone())
+        .with_timeout(Duration::from_secs(5));
     let outcome = runner.invoke("judge", "/loom:judge");
 
     assert_eq!(outcome, RoleTickOutcome::Success);
@@ -181,8 +186,10 @@ fn test_invoke_succeeds_once_role_models_supplies_a_matching_model() {
         r#","autonomous":{"roleRunner":{"roleModels":{"judge":"gpt-5-codex"}}}"#,
     );
 
-    let mut runner =
-        ScriptRoleInvocationRunner::new(root.to_path_buf()).with_timeout(Duration::from_secs(5));
+    let ws = crate::write_scope_test_support::WritableRoot::register(std::path::Path::new(&root));
+    let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf())
+        .with_gh_bin(ws.gh.clone())
+        .with_timeout(Duration::from_secs(5));
     let outcome = runner.invoke("judge", "/loom:judge");
 
     assert_eq!(outcome, RoleTickOutcome::Success);
@@ -529,13 +536,20 @@ fn test_read_role_runner_config_effort_soft_fails() {
 #[test]
 #[serial(loom_config_env)]
 fn test_invoke_omits_effort_entirely_when_nothing_is_configured() {
+    test_invoke_omits_effort_entirely_when_nothing_is_configured_body();
+}
+
+#[serial]
+fn test_invoke_omits_effort_entirely_when_nothing_is_configured_body() {
     std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
 
     let tmp = tempfile::tempdir().unwrap();
     let script =
         write_fake_script(tmp.path(), "fake-spawn.sh", "printf '%s\\n' \"$@\" > argv.txt; exit 0");
-    let mut runner =
-        ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+    let ws = crate::write_scope_test_support::WritableRoot::register(tmp.path());
+    let mut runner = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+        .with_gh_bin(ws.gh.clone())
+        .with_spawn_bin(script);
     assert_eq!(runner.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
     let argv = fs::read_to_string(tmp.path().join("argv.txt")).unwrap();
     let args: Vec<&str> = argv.lines().collect();
@@ -569,6 +583,11 @@ fn test_invoke_omits_effort_entirely_when_nothing_is_configured() {
 #[test]
 #[serial(loom_config_env)]
 fn test_invoke_emits_configured_effort_immediately_after_model() {
+    test_invoke_emits_configured_effort_immediately_after_model_body();
+}
+
+#[serial]
+fn test_invoke_emits_configured_effort_immediately_after_model_body() {
     std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
 
     let tmp = tempfile::tempdir().unwrap();
@@ -578,8 +597,10 @@ fn test_invoke_emits_configured_effort_immediately_after_model() {
     );
     let script =
         write_fake_script(tmp.path(), "fake-spawn.sh", "printf '%s\\n' \"$@\" > argv.txt; exit 0");
-    let mut runner =
-        ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+    let ws = crate::write_scope_test_support::WritableRoot::register(tmp.path());
+    let mut runner = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+        .with_gh_bin(ws.gh.clone())
+        .with_spawn_bin(script);
     assert_eq!(runner.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
     let argv = fs::read_to_string(tmp.path().join("argv.txt")).unwrap();
     let args: Vec<&str> = argv.lines().collect();
@@ -601,6 +622,11 @@ fn test_invoke_emits_configured_effort_immediately_after_model() {
 #[test]
 #[serial(loom_config_env)]
 fn test_invoke_per_role_effort_override_reaches_argv() {
+    test_invoke_per_role_effort_override_reaches_argv_body();
+}
+
+#[serial]
+fn test_invoke_per_role_effort_override_reaches_argv_body() {
     std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
 
     let tmp = tempfile::tempdir().unwrap();
@@ -618,8 +644,10 @@ fn test_invoke_per_role_effort_override_reaches_argv() {
         "printf '%s\\n' \"$@\" > argv-last.txt; exit 0",
     );
 
-    let mut curator =
-        ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script.clone());
+    let ws = crate::write_scope_test_support::WritableRoot::register(tmp.path());
+    let mut curator = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+        .with_gh_bin(ws.gh.clone())
+        .with_spawn_bin(script.clone());
     assert_eq!(curator.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
     let curator_argv = fs::read_to_string(tmp.path().join("argv-last.txt")).unwrap();
     assert!(
@@ -627,8 +655,9 @@ fn test_invoke_per_role_effort_override_reaches_argv() {
         "curator must get its per-role effort; argv: {curator_argv}"
     );
 
-    let mut judge =
-        ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+    let mut judge = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+        .with_gh_bin(ws.gh.clone())
+        .with_spawn_bin(script);
     assert_eq!(judge.invoke("judge", "/loom:judge"), RoleTickOutcome::Success);
     let judge_argv = fs::read_to_string(tmp.path().join("argv-last.txt")).unwrap();
     assert!(
@@ -688,6 +717,11 @@ fn test_role_log_header_reports_model_and_effort_with_sources() {
 #[test]
 #[serial(loom_config_env)]
 fn test_invoke_writes_resolved_effort_into_the_role_log_header() {
+    test_invoke_writes_resolved_effort_into_the_role_log_header_body();
+}
+
+#[serial]
+fn test_invoke_writes_resolved_effort_into_the_role_log_header_body() {
     std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
 
     let tmp = tempfile::tempdir().unwrap();
@@ -696,8 +730,10 @@ fn test_invoke_writes_resolved_effort_into_the_role_log_header() {
         r#"{"autonomous": {"roleRunner": {"enabled": true, "roleEfforts": {"curator": "low"}}}}"#,
     );
     let script = write_fake_script(tmp.path(), "fake-spawn.sh", "exit 0");
-    let mut runner =
-        ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script.clone());
+    let ws = crate::write_scope_test_support::WritableRoot::register(tmp.path());
+    let mut runner = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+        .with_gh_bin(ws.gh.clone())
+        .with_spawn_bin(script.clone());
     assert_eq!(runner.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
     let log = fs::read_to_string(tmp.path().join(".loom/logs/role-curator.log")).unwrap();
     assert!(
@@ -706,8 +742,9 @@ fn test_invoke_writes_resolved_effort_into_the_role_log_header() {
     );
 
     // A role with no entry at any tier records the unset rendering instead.
-    let mut judge =
-        ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+    let mut judge = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+        .with_gh_bin(ws.gh.clone())
+        .with_spawn_bin(script);
     assert_eq!(judge.invoke("judge", "/loom:judge"), RoleTickOutcome::Success);
     let judge_log = fs::read_to_string(tmp.path().join(".loom/logs/role-judge.log")).unwrap();
     assert!(
@@ -721,6 +758,11 @@ fn test_invoke_writes_resolved_effort_into_the_role_log_header() {
 #[test]
 #[serial(loom_config_env)]
 fn autonomous_role_overrides_interactive_parent_origin() {
+    autonomous_role_overrides_interactive_parent_origin_body();
+}
+
+#[serial]
+fn autonomous_role_overrides_interactive_parent_origin_body() {
     let old = std::env::var_os(crate::provenance::origin::ENV);
     std::env::set_var(crate::provenance::origin::ENV, "interactive");
     let tmp = tempfile::tempdir().unwrap();
@@ -729,8 +771,10 @@ fn autonomous_role_overrides_interactive_parent_origin() {
         "origin-spawn.sh",
         "printf '%s' \"$LOOM_WORK_ORIGIN\" > origin.txt",
     );
-    let mut runner =
-        ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+    let ws = crate::write_scope_test_support::WritableRoot::register(tmp.path());
+    let mut runner = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+        .with_gh_bin(ws.gh.clone())
+        .with_spawn_bin(script);
     let result = runner.invoke("doctor", "/loom:doctor");
     if let Some(old) = old {
         std::env::set_var(crate::provenance::origin::ENV, old);

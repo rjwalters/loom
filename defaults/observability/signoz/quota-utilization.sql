@@ -5,6 +5,13 @@
 -- bundled clickhouse-client in the private ClickHouse container. Metric
 -- timestamps are milliseconds.
 --
+-- STATUS: all three queries are executed verbatim against the pinned
+-- `clickhouse/clickhouse-server:25.12.5` the trial's telemetry store runs, by
+-- `loom-daemon/tests/signoz_queue_quota_queries.rs` in CI -- including the
+-- absent-is-not-zero, over-100%-clamp and coverage='unknown' behaviors below.
+-- NOT yet executed against a live SigNoz deployment over real canary data
+-- (#8525/#8529/#9279), the same caveat every other SigNoz artifact carries.
+--
 -- Absent is not zero. A provider with no utilization source (Codex,
 -- OpenCode/Z.ai, Kimi) emits no usage series at all, only `exhausted`, so every
 -- utilization column below is NULL for it, never 0. That is why query 1 uses

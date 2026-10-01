@@ -3,6 +3,8 @@ use std::process::Command;
 #[path = "support/worker_cli.rs"]
 mod worker_cli;
 use worker_cli::fixture;
+#[path = "support/write_scope_root.rs"]
+mod write_scope_root;
 fn worker(root: &std::path::Path, runtime: &str) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
     c.args(["spawn-worker", "--"])
@@ -302,10 +304,13 @@ fn native_role_runner_does_not_require_claude_tokens_or_inherit_sonnet() {
     std::fs::create_dir_all(&roles).unwrap();
     std::fs::write(roles.join("curator.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
     config(d.path(), serde_json::json!({"runtimes":{"default":"pi"}}));
+    // #9548: a role tick launches only on a workspace this installation may
+    // write to, so the probe root is made a managed, writable checkout.
     let out = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "role_runner_probe", "--nocapture"])
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap())
+        .envs(write_scope_root::writable_env(d.path()))
         .env("LOOM_TEST_NATIVE_ROLE_ROOT", d.path())
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
         .env("LOOM_SHARED_TOKENS_DIR", "")

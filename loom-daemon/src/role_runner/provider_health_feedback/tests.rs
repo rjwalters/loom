@@ -129,7 +129,10 @@ category=TOKEN_EXHAUSTED exit_code=1 model=none'\n\
          exit 1\n",
     );
 
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
     assert!(!outcome.is_success(), "{outcome:?}");
 
     let health = tokens_pool::account_health(workspace.path(), &codex_id("alice"))
@@ -146,7 +149,9 @@ category=TOKEN_EXHAUSTED exit_code=1 model=none'\n\
     // — the very next tick must skip pre-spawn via the #8442 gate rather
     // than spawn again.
     let before = pool_exhausted_skip_count();
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
     let RoleTickOutcome::PoolExhausted { pool, .. } = outcome else {
         panic!("expected the #8442 gate to skip pre-spawn, got {outcome:?}");
     };
@@ -188,7 +193,10 @@ category=SUCCESS exit_code=0 model=none'\n\
          exit 0\n",
     );
 
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
 
     let health = tokens_pool::account_health(workspace.path(), &codex_id("alice"))
@@ -346,7 +354,10 @@ category=TOKEN_EXHAUSTED exit_code=1 model=none'\n\
         ),
     );
 
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
     assert!(!outcome.is_success(), "{outcome:?}");
 
     let health = tokens_pool::account_health(workspace.path(), &codex_id("alice"))
@@ -380,7 +391,10 @@ category=TOKEN_EXHAUSTED exit_code=1 model=none'\n\
          exit 1\n",
     );
     let (outcome, captured) = crate::observability::ops::capture::capture(|| {
-        judge_runner(workspace.path()).invoke("judge", "/loom:judge")
+        let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+        judge_runner(workspace.path())
+            .with_gh_bin(ws.gh.clone())
+            .invoke("judge", "/loom:judge")
     });
     assert!(!outcome.is_success(), "{outcome:?}");
     let marks: Vec<_> = captured

@@ -1,5 +1,8 @@
 //! CLI contract: use the real queue policy with forge-shaped offline input.
 use std::process::Command;
+#[cfg(unix)]
+#[path = "support/write_scope_root.rs"]
+mod write_scope_root;
 
 #[test]
 fn interactive_creation_is_explicit_and_unknown_is_the_default() {
@@ -131,6 +134,9 @@ exit 1
     script(&gate, "exit 0");
     let create =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts/create-pr.sh");
+    // create-pr.sh vets its target through `loom-daemon forge may-write`
+    // (#9548); the real verb decides on a managed, writable fixture checkout.
+    let write_scope = write_scope_root::writable_env(root);
     let run = |origin: &str, body: &str| {
         let out = Command::new("bash")
             .arg(&create)
@@ -147,9 +153,13 @@ exit 1
             .env("LOOM_FORGE_TYPE", "github")
             .env("LOOM_VERSION_CHECK_SCRIPT", &gate)
             .env("LOOM_DAEMON_SELF_BIN", env!("CARGO_BIN_EXE_loom-daemon"))
+            .env("LOOM_DAEMON_BIN", env!("CARGO_BIN_EXE_loom-daemon"))
+            .envs(write_scope.iter().cloned())
             .env("LOOM_CONFIG_DEFAULTS_FILE", "")
             .env("LOOM_WORK_ORIGIN", origin)
             .env_remove("GITHUB_ACTIONS")
+            .env_remove("GH_REPO")
+            .env_remove("LOOM_REPO")
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -280,6 +290,10 @@ esac
         cmd.current_dir(root)
             .env("PATH", format!("{}:{}", root.display(), std::env::var("PATH").unwrap()))
             .env("LOOM_GH_BIN", root.join("gh"))
+            // The guard authenticates marker authors through
+            // `loom-daemon forge trusted-comments` (#9548/#9716); without a
+            // reachable daemon it reads every marker as absent.
+            .env("LOOM_DAEMON_BIN", env!("CARGO_BIN_EXE_loom-daemon"))
             .env("FAIL_GUARD", "0");
     };
     // Exercise actual guard outcomes, including an empty queue with an alert.
@@ -300,12 +314,24 @@ esac
             .unwrap(),
         )
         .unwrap();
-        let comments: Vec<_> = (0..count)
+        // Markers in the REST shape the Judge's App actually posts them in:
+        // a fleet-family `[bot]` login of type Bot, association NONE.
+        let mut comments: Vec<_> = (0..count)
             .map(|_| serde_json::json!({
                 "body":format!("<!-- loom:fallback-evaluated sha={} -->", if same_head { &head } else { &old_head }),
-                "created_at":if recent { now.as_str() } else { "2020-01-01T00:00:00Z" }
+                "created_at":if recent { now.as_str() } else { "2020-01-01T00:00:00Z" },
+                "user":{"login":"loom-fleet-dispatch[bot]","type":"Bot"},
+                "author_association":"NONE"
             }))
             .collect();
+        // An outsider's well-formed head-SHA marker is content, not control
+        // (#9548/#9716): it must change neither the decision nor the counts.
+        comments.push(serde_json::json!({
+            "body":format!("<!-- loom:fallback-evaluated sha={head} -->"),
+            "created_at":now,
+            "user":{"login":"outsider","type":"User"},
+            "author_association":"NONE"
+        }));
         std::fs::write(root.join("comments.json"), serde_json::to_vec(&comments).unwrap()).unwrap();
         let mut direct = Command::new(&guard);
         prepare(&mut direct);

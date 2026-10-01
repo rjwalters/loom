@@ -52,9 +52,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
-use crate::merge_pr::sequence::{
-    html_comment_spans, release_marker_text, SequenceMarker, MARKER_PREFIX,
-};
+use crate::merge_pr::sequence::{html_comment_spans, release_marker_text, SequenceMarker};
 
 /// The marker prefix identifying a candidate PR's consolidation mapping.
 pub const CONSOLIDATION_PREFIX: &str = "loom:consolidation";
@@ -201,13 +199,11 @@ pub enum EligibilityFailure {
     NoReason,
 }
 
-/// Check one assembled group. `markers` maps component number → the
-/// sequencing hold its trusted comment history says is still in force
-/// ([`crate::merge_pr::sequence::parse_live`] — released and replanned holds
-/// are already dropped). A marker is consulted only while the component
-/// carries the live `loom:sequenced` label: the label is the gate (#9378), so
-/// a hold whose label is gone — released, voided, or removed by hand — does
-/// not make a PR "reserved" or "sequenced" for eligibility either. Pure: the
+/// Check one assembled group. `markers` maps component number → its newest
+/// trusted `loom:sequence` marker (ordering or reservation) — ideally already
+/// filtered through [`live_marker`]. A marker is honored only while the
+/// component carries `loom:sequenced` (a released hold's marker stays in the
+/// transcript forever and must not reject every later attempt). Pure: the
 /// caller fetched everything.
 #[must_use]
 pub fn check_eligibility(
@@ -277,20 +273,20 @@ pub fn check_eligibility(
                 file: file.clone(),
             });
         }
-        let live_hold = if c.has(SEQUENCE_LABEL) {
-            markers.get(&c.number)
-        } else {
-            None
-        };
+        // A marker only describes a LIVE hold while the `loom:sequenced`
+        // label is on the PR — the rule the #9686 pass itself reads markers
+        // by. Every release path (abort, landing, expiry, dissolve) removes
+        // the label, and the marker it leaves behind is history, not a hold.
+        let live = markers.get(&c.number).filter(|_| c.has(SEQUENCE_LABEL));
         if let Some(attempt) =
-            live_hold.and_then(|m| m.plan.starts_with("cons-").then(|| m.plan.clone()))
+            live.and_then(|m| m.plan.starts_with("cons-").then(|| m.plan.clone()))
         {
             failures.push(EligibilityFailure::AlreadyReserved {
                 number: c.number,
                 attempt,
             });
         }
-        if let Some(m) = live_hold {
+        if let Some(m) = live {
             if m.source.as_deref() == Some("pass") && !numbers.contains(&m.after) {
                 failures.push(EligibilityFailure::SequencedOutsideGroup {
                     number: c.number,
@@ -598,8 +594,6 @@ struct GhComponent {
     #[serde(default)]
     labels: Vec<GhLabel>,
     #[serde(default)]
-    files: Vec<GhFile>,
-    #[serde(default)]
     additions: u64,
     #[serde(default)]
     deletions: u64,
@@ -610,10 +604,41 @@ struct GhLabel {
     name: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct GhFile {
-    #[serde(rename = "path")]
-    _path: String,
+/// Fetch a component PR's changed-file list via the paginated REST endpoint,
+/// never `gh pr view --json files` — that field is GraphQL-backed and
+/// silently truncates at 100 entries (#4613) with no error, the same shape
+/// this repo already fixed twice elsewhere (Champion's critical-file check,
+/// Judge's docs-only fast path). `check_eligibility`'s E4 `WorkflowEdit`
+/// exclusion reads this set, so a truncated answer could let a
+/// workflow-editing component past it undetected on a component with more
+/// than 100 changed files.
+fn fetch_component_files(gh_bin: &Path, root: &Path, number: u32) -> Result<BTreeSet<String>> {
+    let mut cmd = Command::new(gh_bin);
+    cmd.args([
+        "api",
+        &format!("repos/{{owner}}/{{repo}}/pulls/{number}/files"),
+        "--paginate",
+        "--jq",
+        ".[].filename",
+    ]);
+    cmd.current_dir(root);
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd
+        .output()
+        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh api pulls/{number}/files failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// Fetch one component PR's eligibility state.
@@ -630,10 +655,11 @@ pub fn fetch_component(gh_bin: &Path, root: &Path, number: u32) -> Result<Compon
             "view",
             &number.to_string(),
             "--json",
-            "state,isDraft,headRefOid,baseRefName,labels,files,additions,deletions",
+            "state,isDraft,headRefOid,baseRefName,labels,additions,deletions",
         ],
     )?;
     let r: GhComponent = serde_json::from_slice(&stdout).context("parse gh pr view JSON")?;
+    let files = fetch_component_files(gh_bin, root, number)?;
     Ok(ComponentState {
         number,
         state: r.state.to_uppercase(),
@@ -641,7 +667,7 @@ pub fn fetch_component(gh_bin: &Path, root: &Path, number: u32) -> Result<Compon
         head_sha: r.head_ref_oid,
         base_ref: r.base_ref_name.unwrap_or_default(),
         labels: r.labels.into_iter().map(|l| l.name).collect(),
-        files: r.files.into_iter().map(|f| f._path).collect(),
+        files,
         additions: r.additions,
         deletions: r.deletions,
     })
@@ -730,57 +756,6 @@ pub fn reservation_present(bodies: &[String], marker: &SequenceMarker) -> bool {
     bodies.iter().any(|b| b.contains(&marker_text_of(marker)))
 }
 
-/// The source PR's LIVE consolidation reservation, if any (ADR-0023 §4: the
-/// eligibility input for E6).
-///
-/// Two signals retire a reservation, and EITHER suffices — this is the
-/// #9689 review's "released reservations no longer read as live" fix:
-///
-/// 1. **The label is gone** (`loom:sequenced` absent from the live label
-///    set). The label is the gate; a marker beside a missing label is a
-///    transcript fossil, not a hold. This half also makes a caller that
-///    skips this function and hands `check_eligibility` the raw parsed
-///    marker get the same answer, because E6 requires the label too.
-/// 2. **A release comment for the SAME attempt appears after the
-///    reservation** in the transcript (`<!-- loom:sequence released
-///    plan=<attempt> -->`). A release for a *different* attempt retires
-///    only that attempt, and a reservation posted after a release is live
-///    again — the transcript is walked in order, newest event wins per
-///    attempt, and the newest still-live reservation is returned.
-#[must_use]
-pub fn live_marker(source: &ComponentState, bodies: &[String]) -> Option<SequenceMarker> {
-    if !source.has(SEQUENCE_LABEL) {
-        return None;
-    }
-    // Per-attempt state, walked oldest → newest: the newest reservation
-    // marker per attempt, and whether a later release retired it.
-    let mut live: Vec<(String, SequenceMarker)> = Vec::new();
-    for body in bodies {
-        // Release events first: `<!-- loom:sequence released plan=<id> -->`
-        // (the canonical renderer's exact output).
-        for line in body.lines() {
-            for span in html_comment_spans(line) {
-                let text = span.trim();
-                if let Some(rest) = text.strip_prefix(MARKER_PREFIX) {
-                    if let Some(plan) = rest.strip_prefix(" released plan=").map(str::trim) {
-                        live.retain(|(attempt, _)| attempt != plan);
-                    }
-                }
-            }
-        }
-        // Reservation events: the body's newest sequence marker with a
-        // `cons-` plan (the release comment itself never parses as a hold —
-        // pinned by a test).
-        if let Some(m) = crate::merge_pr::sequence::parse(std::slice::from_ref(body)) {
-            if m.plan.starts_with("cons-") {
-                live.retain(|(attempt, _)| attempt != &m.plan);
-                live.push((m.plan.clone(), m));
-            }
-        }
-    }
-    live.last().map(|(_, m)| m.clone())
-}
-
 fn marker_text_of(marker: &SequenceMarker) -> String {
     // sequence::marker_text is the canonical renderer; a local alias keeps
     // the call sites readable.
@@ -807,8 +782,30 @@ pub fn reservation_comment_body(marker: &SequenceMarker, attempt: &str) -> Strin
     )
 }
 
-/// The abort release comment — distinct from the landing release so the
-/// transcript shows which fate the attempt met.
+/// The newest trusted sequencing marker on `component` that still describes
+/// a LIVE hold, or `None`: the `loom:sequenced` label is on (the label IS the
+/// hold, #9378) AND [`crate::merge_pr::sequence::parse_live`] says no later
+/// tombstone ended it.
+///
+/// A thin wrapper on purpose (#9745 review): `parse_live` is the one parser
+/// of the hold history. It retires a marker on a `released plan=<same plan>`
+/// tombstone (the ordering pass, `consolidate-abort`) and on the pass's
+/// `replanned` void note, which is ADR-0023 §3 (iii): a reservation followed
+/// by either tombstone is lost, even if a label is later put back by hand.
+///
+/// Oldest-first `bodies`, as `fetch_trusted_bodies` returns them.
+#[must_use]
+pub fn live_marker(component: &ComponentState, bodies: &[String]) -> Option<SequenceMarker> {
+    if !component.has(SEQUENCE_LABEL) {
+        return None;
+    }
+    crate::merge_pr::sequence::parse_live(bodies)
+}
+
+/// The abort release comment. Its first line is the canonical release
+/// tombstone ([`release_marker_text`]) that [`live_marker`] honors (the label
+/// removal is the primary release; the tombstone keeps the transcript
+/// self-describing).
 #[must_use]
 pub fn reservation_release_body(marker: &SequenceMarker, attempt: &str) -> String {
     format!(
@@ -820,6 +817,182 @@ pub fn reservation_release_body(marker: &SequenceMarker, attempt: &str) -> Strin
         release_marker_text(&marker.plan),
         attempt
     )
+}
+
+// --- Push abort (ADR-0023 §3, operator ruling 2026-10-01) ----------------
+
+/// Where one source's reservation for this attempt stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationState {
+    /// The exact reservation is the source's live hold.
+    Live,
+    /// Never written: a fresh source, or a run that stopped before reaching
+    /// it. Preparation may still apply it.
+    Missing,
+    /// Written once and no longer live: the label is gone, a `released` or
+    /// `replanned` tombstone followed it, or a newer marker superseded it.
+    /// ADR-0023 §3: a lost reservation ends the attempt; it is never
+    /// re-applied, because that would resurrect a hold the ordering pass
+    /// (or a human) deliberately voided.
+    Lost,
+}
+
+/// Classify `expected` on `component` given its oldest-first trusted bodies.
+#[must_use]
+pub fn reservation_state(
+    component: &ComponentState,
+    bodies: &[String],
+    expected: &SequenceMarker,
+) -> ReservationState {
+    if live_marker(component, bodies).as_ref() == Some(expected) {
+        ReservationState::Live
+    } else if reservation_present(bodies, expected) {
+        ReservationState::Lost
+    } else {
+        ReservationState::Missing
+    }
+}
+
+/// Why an attempt ends before landing. [`AbortReason::cause`] is the ADR-0023
+/// §7 abort-cause token, carried in the candidate's close comment so the
+/// measurement can count aborts by cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbortReason {
+    /// `consolidate-abort` on an operator or Champion decision.
+    Operator,
+    /// `consolidate-abort --cause ci-failure`: the candidate's CI is red.
+    CiFailure,
+    /// The candidate's live head is not the head the ledger recorded.
+    CandidatePush { recorded: String, live: String },
+    /// These sources' live heads are not their pins.
+    SourcePush(Vec<u32>),
+    /// These sources' reservations were applied and are no longer live.
+    ReservationLost(Vec<u32>),
+}
+
+impl AbortReason {
+    /// The §7 cause token.
+    #[must_use]
+    pub fn cause(&self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::CiFailure => "ci-failure",
+            Self::CandidatePush { .. } => "candidate-push",
+            Self::SourcePush(_) => "source-push",
+            Self::ReservationLost(_) => "reservation-lost",
+        }
+    }
+
+    /// One human sentence for the close comment and the verb's error.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let list = |ns: &[u32]| {
+            ns.iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match self {
+            Self::Operator => "was aborted on request".to_string(),
+            Self::CiFailure => "was aborted because the candidate's CI failed".to_string(),
+            Self::CandidatePush { recorded, live } => format!(
+                "was aborted because the candidate was pushed to (recorded head `{recorded}`, \
+                 live head `{live}`); a fix, a merge of the base or any other commit on the \
+                 candidate ends the attempt"
+            ),
+            Self::SourcePush(ns) => {
+                format!("was aborted because component head(s) moved after pinning ({})", list(ns))
+            }
+            Self::ReservationLost(ns) => format!(
+                "was aborted because the reservation on {} is no longer live (voided, expired, \
+                 released or removed)",
+                list(ns)
+            ),
+        }
+    }
+}
+
+/// The abort comment's machine marker. A distinct namespace from the mapping
+/// (`parse_mapping` skips `loom:consolidation-abort`: no whitespace after the
+/// prefix and not `-component`).
+pub const ABORT_PREFIX: &str = "loom:consolidation-abort";
+
+/// The candidate's close comment for an aborted attempt.
+#[must_use]
+pub fn abort_comment(attempt: &str, reason: &AbortReason) -> String {
+    format!(
+        "<!-- {ABORT_PREFIX} attempt={attempt} cause={} -->\n\
+         Consolidation attempt `{attempt}` {} (cause `{}`). The candidate is withdrawn and \
+         this attempt's still-live reservations are released; holds the ordering pass already \
+         voided are skipped. The component PRs are untouched and actionable, and the next \
+         ordering pass re-plans them from their current heads. A later consolidation of the \
+         same PRs is a fresh attempt with a new id (ADR-0023 §3, #9688).",
+        reason.cause(),
+        reason.describe(),
+        reason.cause()
+    )
+}
+
+/// ADR-0023 §3's three-part liveness check for an open, unmerged attempt:
+/// (i) the candidate's live head equals the ledger's recorded head; (ii)
+/// every source's live head equals its pin; (iii) every reservation is
+/// still live. `None` means the attempt is live; `Some` is the abort it must
+/// take. Checked in that order, so the reason names the push that started
+/// the cascade (a push makes the ordering pass void the moved hold, so a
+/// source push usually also shows up as a lost reservation).
+///
+/// `sources` pairs each source's live state with its oldest-first trusted
+/// bodies, in any order; a mapped component missing from `sources` counts
+/// as lost. Preparation runs this once its reservations are applied (worked
+/// example 5); #9839's reconciliation touch and pre-merge pin check are the
+/// other callers the ADR names.
+#[must_use]
+pub fn pin_check(
+    mapping: &CandidateMapping,
+    candidate_pr: u32,
+    candidate_live_head: &str,
+    sources: &[(ComponentState, Vec<String>)],
+) -> Option<AbortReason> {
+    if candidate_live_head != mapping.candidate_head {
+        return Some(AbortReason::CandidatePush {
+            recorded: mapping.candidate_head.clone(),
+            live: candidate_live_head.to_string(),
+        });
+    }
+    let find = |n: u32| sources.iter().find(|(c, _)| c.number == n);
+    let moved: Vec<u32> = mapping
+        .components
+        .iter()
+        .filter(|(n, pin)| {
+            find(*n).is_some_and(|(c, _)| c.head_sha.as_deref() != Some(pin.as_str()))
+        })
+        .map(|(n, _)| *n)
+        .collect();
+    if !moved.is_empty() {
+        return Some(AbortReason::SourcePush(moved));
+    }
+    let lost: Vec<u32> = mapping
+        .components
+        .iter()
+        .filter(|(n, pin)| match find(*n) {
+            None => true,
+            Some((c, bodies)) => {
+                let expected = SequenceMarker {
+                    after: candidate_pr,
+                    pred_head: mapping.candidate_head.clone(),
+                    follower_head: pin.clone(),
+                    plan: mapping.attempt.clone(),
+                    source: Some("pass".to_string()),
+                };
+                reservation_state(c, bodies, &expected) != ReservationState::Live
+            }
+        })
+        .map(|(n, _)| *n)
+        .collect();
+    if !lost.is_empty() {
+        return Some(AbortReason::ReservationLost(lost));
+    }
+    None
 }
 
 // --- Prepare decision (pure core the CLI verb drives) ---------------------

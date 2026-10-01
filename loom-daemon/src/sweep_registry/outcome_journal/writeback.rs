@@ -307,6 +307,23 @@ impl SweepRegistry {
             .gh_bin
             .clone()
             .unwrap_or_else(|| PathBuf::from("gh"));
+        // #9772: the write-back comment carries the dashboard footer like
+        // every other daemon comment. The slug prefers the `LOOM_REPO`
+        // override (the same precedence `apply_loom_repo_override` gives the
+        // command below), then the workspace root's origin remote; an
+        // unresolvable slug posts unlinked rather than linking to nowhere.
+        let nwo = std::env::var("LOOM_REPO")
+            .ok()
+            .filter(|value| {
+                value
+                    .split_once('/')
+                    .is_some_and(|(o, r)| !o.is_empty() && !r.is_empty())
+            })
+            .or_else(|| {
+                crate::worktree_ops::gh::resolve_owner_repo(&self.config.workspace_root)
+                    .map(|(o, r)| format!("{o}/{r}"))
+            });
+        let body = crate::forge_comment::footer_or_body(nwo.as_deref(), issue, false, body);
         let mut cmd = Command::new(&gh);
         cmd.arg("issue")
             .arg("comment")

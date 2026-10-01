@@ -737,3 +737,154 @@ fn a_source_still_reserved_by_a_live_attempt_stays_ineligible() {
         "{failures:?}"
     );
 }
+
+// --- Push abort (ADR-0023 §3, operator ruling 2026-10-01) ----------------
+
+const CAND: &str = "c333333333333333333333333333333333333333";
+const MOVED: &str = "d444444444444444444444444444444444444444";
+const ATTEMPT: &str = "cons-ab12cd34";
+
+fn ledger() -> CandidateMapping {
+    CandidateMapping {
+        attempt: ATTEMPT.to_string(),
+        base: "main".to_string(),
+        candidate_head: CAND.to_string(),
+        components: vec![(10, H1.to_string()), (12, H2.to_string())],
+    }
+}
+
+/// A source carrying this attempt's live reservation against candidate #99.
+fn reserved(number: u32, head: &str) -> (ComponentState, Vec<String>) {
+    let c = sequenced(comp(number, head, &["shared.rs"]));
+    let m = reservation_marker(99, CAND, &c, ATTEMPT);
+    (c, vec![reservation_comment_body(&m, ATTEMPT)])
+}
+
+#[test]
+fn the_ordering_pass_void_tombstone_retires_a_reservation() {
+    // The pass's real VoidAndReplan note, not a copy: if its marker text
+    // drifts, this test fails rather than the abort silently missing voids.
+    let (source, mut bodies) = reserved(12, H2);
+    bodies.push(crate::claim_reconciliation::merge_sequence::REPLAN_NOTE_BODY.to_string());
+    assert_eq!(live_marker(&source, &bodies), None, "label re-added by hand does not revive it");
+}
+
+#[test]
+fn the_ordering_pass_landing_release_retires_a_reservation() {
+    use crate::claim_reconciliation::merge_sequence::{release_comment_body, HoldAction};
+    let (source, mut bodies) = reserved(12, H2);
+    let m = reservation_marker(99, CAND, &source, ATTEMPT);
+    bodies.push(release_comment_body(&m, HoldAction::Release));
+    assert_eq!(live_marker(&source, &bodies), None);
+}
+
+#[test]
+fn reservation_state_tells_never_written_from_lost() {
+    let (source, bodies) = reserved(12, H2);
+    let m = reservation_marker(99, CAND, &source, ATTEMPT);
+    assert_eq!(reservation_state(&source, &bodies, &m), ReservationState::Live);
+    // Never written: backfill may apply it.
+    assert_eq!(reservation_state(&source, &[], &m), ReservationState::Missing);
+    // Written, then the label came off (void, expiry or a human): lost.
+    let unlabeled = comp(12, H2, &["shared.rs"]);
+    assert_eq!(reservation_state(&unlabeled, &bodies, &m), ReservationState::Lost);
+    // Written, then superseded by a newer ordering hold: lost, not live.
+    let mut superseded = bodies.clone();
+    let newer = SequenceMarker {
+        after: 10,
+        pred_head: H1.to_string(),
+        follower_head: H2.to_string(),
+        plan: "seq-00000000".to_string(),
+        source: Some("pass".to_string()),
+    };
+    superseded.push(crate::merge_pr::sequence::marker_text(&newer));
+    assert_eq!(reservation_state(&source, &superseded, &m), ReservationState::Lost);
+}
+
+#[test]
+fn a_live_attempt_passes_the_pin_check() {
+    let sources = vec![reserved(10, H1), reserved(12, H2)];
+    assert_eq!(pin_check(&ledger(), 99, CAND, &sources), None);
+}
+
+#[test]
+fn a_push_to_the_candidate_aborts_the_attempt() {
+    // A Doctor fix, a merge of main, a CI fix: all are pushes to the
+    // candidate, and none is repaired in place.
+    let sources = vec![reserved(10, H1), reserved(12, H2)];
+    assert_eq!(
+        pin_check(&ledger(), 99, MOVED, &sources),
+        Some(AbortReason::CandidatePush {
+            recorded: CAND.to_string(),
+            live: MOVED.to_string(),
+        })
+    );
+}
+
+#[test]
+fn a_push_to_any_source_aborts_the_attempt() {
+    // Worked example 5/9: the source moved; its reservation pins the old
+    // head. The reason names the push, not the void it causes.
+    let (mut moved, mut bodies) = reserved(12, H2);
+    moved.head_sha = Some(MOVED.to_string());
+    moved.labels.clear();
+    bodies.push(crate::claim_reconciliation::merge_sequence::REPLAN_NOTE_BODY.to_string());
+    let sources = vec![reserved(10, H1), (moved, bodies)];
+    assert_eq!(
+        pin_check(&ledger(), 99, CAND, &sources),
+        Some(AbortReason::SourcePush(vec![12]))
+    );
+}
+
+#[test]
+fn a_lost_reservation_aborts_the_attempt() {
+    let (mut voided, bodies) = reserved(10, H1);
+    voided.labels.clear();
+    let sources = vec![(voided, bodies), reserved(12, H2)];
+    assert_eq!(
+        pin_check(&ledger(), 99, CAND, &sources),
+        Some(AbortReason::ReservationLost(vec![10]))
+    );
+    // A reservation that never landed counts too once preparation has
+    // applied them all: the check runs after the apply step.
+    let sources = vec![
+        (sequenced(comp(10, H1, &["shared.rs"])), vec![]),
+        reserved(12, H2),
+    ];
+    assert_eq!(
+        pin_check(&ledger(), 99, CAND, &sources),
+        Some(AbortReason::ReservationLost(vec![10]))
+    );
+    // And an unreadable source is not assumed live.
+    assert_eq!(
+        pin_check(&ledger(), 99, CAND, &[reserved(12, H2)]),
+        Some(AbortReason::ReservationLost(vec![10]))
+    );
+}
+
+#[test]
+fn the_abort_comment_records_the_adr_cause() {
+    for (reason, cause) in [
+        (AbortReason::Operator, "operator"),
+        (AbortReason::CiFailure, "ci-failure"),
+        (
+            AbortReason::CandidatePush {
+                recorded: CAND.to_string(),
+                live: MOVED.to_string(),
+            },
+            "candidate-push",
+        ),
+        (AbortReason::SourcePush(vec![12]), "source-push"),
+        (AbortReason::ReservationLost(vec![10]), "reservation-lost"),
+    ] {
+        assert_eq!(reason.cause(), cause);
+        let body = abort_comment(ATTEMPT, &reason);
+        assert!(
+            body.starts_with(&format!("<!-- {ABORT_PREFIX} attempt={ATTEMPT} cause={cause} -->")),
+            "{body}"
+        );
+        // The abort marker must never be read as a mapping or a hold.
+        assert_eq!(parse_mapping(&body), None);
+        assert_eq!(crate::merge_pr::sequence::parse(&[body]), None);
+    }
+}

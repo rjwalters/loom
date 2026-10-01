@@ -621,12 +621,14 @@ pub(crate) enum MergePrCommand {
     /// the candidate in a scratch worktree, push, create ONE candidate PR
     /// carrying the trusted component mapping, and reserve every source via
     /// the #9378 sequencing gate (source = sequenced behind the candidate).
-    /// Adopt-first on the deterministic attempt id; hard-abort on conflict
-    /// or a mid-preparation head push.
+    /// Adopt-first on the deterministic attempt id, only while the attempt
+    /// is live; hard-abort on conflict or on any push to the candidate or a
+    /// source (ADR-0023 §3).
     ConsolidatePrepare(super::merge_pr_consolidate::ConsolidatePrepareArgs),
 
     /// Abort a consolidation attempt (#9688): release ONLY the attempt's own
-    /// reservations, close the candidate PR, clean up its branch. Sources
+    /// still-live reservations, close the candidate PR with the abort cause
+    /// recorded, clean up its branch. Sources
     /// are preserved untouched. A merged candidate cannot be aborted —
     /// landing wins and #9689's reconcile owns the aftermath.
     ConsolidateAbort(super::merge_pr_consolidate::ConsolidateAbortArgs),
@@ -685,6 +687,14 @@ pub(crate) enum MergePrCommand {
     /// with one `LOOM-CHECK-RUNS-STREAK <PROCEED|PENDING> <streak>` line —
     /// see `cli::merge_pr_check_runs_streak`.
     CheckRunsStreak(super::merge_pr_check_runs_streak::CheckRunsStreakArgs),
+
+    /// The per-poll READ of the check-runs rollup in the same wait loop
+    /// (#8191 slice): failing names, pending names and `total_count` out of
+    /// the `forge_get_check_runs` payload on stdin. Exit 0 with four
+    /// NUL-terminated fields ending `LOOM-CHECK-RUNS-ROLLUP`; exit 2 (nothing
+    /// on stdout) for a payload outside the forge contract, which the caller
+    /// treats as still pending — see `cli::merge_pr_check_runs_rollup`.
+    CheckRunsRollup(super::merge_pr_check_runs_rollup::CheckRunsRollupArgs),
 
     /// The OTHER classification in the same wait loop (#8191 slice): once a
     /// poll finds a FAILING check, whether it is a required status-check
@@ -833,6 +843,7 @@ impl MergePrCommand {
             MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
             MergePrCommand::CheckRunsStreak(args) => args.run(),
+            MergePrCommand::CheckRunsRollup(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
             MergePrCommand::StackedChildren(args) => args.run(),
             MergePrCommand::WorktreePrimary(args) => args.run(),

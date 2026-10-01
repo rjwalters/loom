@@ -278,6 +278,22 @@ fn gh_comment(c: &Value) -> Value {
     })
 }
 
+/// `forge may-write [--repo R]` (#9548): exit 0 printing the repository to
+/// name on the write, or exit 1 with the refusal on stderr. Never returns.
+pub(crate) fn may_write(repo: Option<String>) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    match loom_daemon::write_scope::may_write_from(&cwd, repo.as_deref()) {
+        loom_daemon::write_scope::Verdict::Allow(nwo) => {
+            println!("{nwo}");
+            std::process::exit(0)
+        }
+        loom_daemon::write_scope::Verdict::Deny(why) => {
+            eprintln!("{why}");
+            std::process::exit(1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::gh_comment;

@@ -170,7 +170,10 @@ fn an_exit_zero_opencode_tick_with_no_loom_tool_use_is_a_failed_tick() {
     let workspace = tempfile::tempdir().unwrap();
     opencode_judge_workspace(workspace.path(), TOOLLESS_STREAM);
 
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
 
     let RoleTickOutcome::Failure(detail) = &outcome else {
         panic!("a toolless exit-0 native tick must not be Success, got {outcome:?}");
@@ -190,7 +193,10 @@ fn the_same_tick_that_did_use_a_loom_tool_is_still_a_success() {
     let workspace = tempfile::tempdir().unwrap();
     opencode_judge_workspace(workspace.path(), TOOL_USING_STREAM);
 
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
 
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
 }

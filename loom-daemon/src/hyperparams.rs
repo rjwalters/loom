@@ -84,6 +84,10 @@ static RESOLVED: OnceLock<Resolved> = OnceLock::new();
 /// The startup vector's digest, computed once so the per-span stamper never
 /// re-serializes (or, worse, allocates) per span.
 static DIGEST: OnceLock<String> = OnceLock::new();
+/// The workspace root `startup_init` resolved against — the anchor for
+/// hot-applied knob re-reads ([`lease_ttl_minutes_from_layer`]). `None`
+/// before `startup_init` runs.
+static ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 // ============================================================================
 // Typed schema
@@ -121,7 +125,8 @@ pub struct LifecycleParams {
     /// as unproven. Source: `claim_reconciliation::DEFAULT_LEASE_TTL_MINUTES`
     /// (15.0 = 3x the ~5-minute lease-renewal interval). Single-knob env:
     /// `LOOM_LEASE_TTL_MINUTES`. Range `(0, 1440]` — one day maximum.
-    /// Startup-captured: edits need a daemon restart to apply.
+    /// Hot-applied (#9768): re-resolved from the layer on every lease check,
+    /// so a committed-block edit lands without a daemon restart.
     pub lease_ttl_minutes: f64,
     /// Minutes of full idleness before the opt-in idle exit powers a remote
     /// host down. Source: `idle_exit::DEFAULT_IDLE_MINUTES` (60). Legacy:
@@ -686,13 +691,20 @@ pub fn digest_global() -> Option<&'static str> {
 /// config re-read is unnecessary (documented restart-to-apply).
 #[must_use]
 pub fn lease_ttl_minutes_from_layer() -> Option<f64> {
-    let resolved = RESOLVED.get()?;
-    match resolved.sources.get("lifecycle.leaseTtlMinutes") {
-        Some(Source::EnvVector | Source::Config) => {
-            Some(resolved.params.lifecycle.lease_ttl_minutes)
-        }
-        _ => None,
-    }
+    // Hot-applied (#9768): re-resolve the layer against the startup root on
+    // every call, so a committed-block or vector edit lands without a daemon
+    // restart. Returns the layer value only when the layer itself supplies
+    // one — a legacy `autonomous.*` value keeps this `None` (the lease TTL
+    // has no legacy config tier), falling through to the caller's default.
+    // `None` before `startup_init` has run (no root known).
+    let root = ROOT.get()?;
+    let layer = layer(root);
+    layer
+        .get("lifecycle")
+        .and_then(|l| l.get("leaseTtlMinutes"))
+        .filter(|v| !v.is_null())
+        .and_then(Value::as_f64)
+        .filter(|mins| *mins > 0.0)
 }
 
 /// Daemon-startup gate (Issue #9683): resolve the hyperparameters layer,
@@ -733,6 +745,7 @@ pub fn startup_init(root: &Path) -> Result<()> {
     let digest = resolved.digest();
     let _ = RESOLVED.set(resolved);
     let _ = DIGEST.set(digest);
+    let _ = ROOT.set(root.to_path_buf());
     log::info!(
         "hyperparams: digest={} ({fields})",
         DIGEST.get().map(String::as_str).unwrap_or_default()
@@ -746,13 +759,24 @@ pub fn startup_init(root: &Path) -> Result<()> {
 
 /// Print the resolved hyperparameter vector, its provenance and its digest —
 /// the inspection surface optimizer loops (CMA-ES) use to confirm an
-/// injected vector actually took effect.
+/// injected vector actually took effect. With `--validate`, run the same
+/// strict gate daemon startup runs (`startup_init`: unknown keys, types,
+/// ranges, crossed pair, unparseable vector) **without starting a daemon** —
+/// a config lint for a proposed `.loom/config.json` edit or `$LOOM_HYPERPARAMS`
+/// vector (#9768).
 #[derive(Debug, Args)]
 pub struct HyperparamsArgs {
     /// Emit machine-readable JSON (`params`, `sources`, `digest`) instead of
-    /// a human-readable table.
+    /// a human-readable table. With `--validate`, emit the violations as a
+    /// JSON array instead of prose lines.
     #[arg(long)]
     pub json: bool,
+
+    /// Validate the hyperparameters layer the way daemon startup would, and
+    /// exit non-zero naming every violation, without printing the vector.
+    /// Combinable with `--json` for machine-readable violations.
+    #[arg(long)]
+    pub validate: bool,
 
     /// Workspace root whose config tiers to resolve. Defaults to the current
     /// directory.
@@ -761,11 +785,47 @@ pub struct HyperparamsArgs {
 }
 
 impl HyperparamsArgs {
+    /// The `--validate` gate: the same checks `startup_init` enforces at
+    /// daemon startup, runnable against a workspace without booting one.
+    fn run_validate(&self) -> Result<()> {
+        // Same hard-fail on an unparseable vector as startup_init.
+        if let Err(problem) = env_vector() {
+            bail!("hyperparams: {problem}");
+        }
+        let layer = layer(&self.workspace);
+        let violations = validate_layer(&layer);
+        if violations.is_empty() {
+            if self.json {
+                println!("{{\"ok\": true, \"violations\": []}}");
+            } else {
+                println!("hyperparams: OK — layer valid (workspace {})", self.workspace.display());
+            }
+            return Ok(());
+        }
+        let listed: String = violations.iter().map(|v| format!("\n  - {v}")).collect();
+        if self.json {
+            let rows: Vec<String> = violations
+                .iter()
+                .map(|v| serde_json::json!({"path": v.path, "problem": v.problem}).to_string())
+                .collect();
+            println!("[{}]", rows.join(","));
+        }
+        bail!(
+            "hyperparams: {} invalid hyperparameter value(s) in `{}` or ${HYPERPARAMS_ENV}:{listed}",
+            violations.len(),
+            self.workspace.join(".loom/config.json").display(),
+        )
+    }
+
     /// Run the `hyperparams` subcommand.
     ///
     /// # Errors
-    /// Propagates config-resolution I/O failures.
+    /// Propagates config-resolution I/O failures; with `--validate`, returns
+    /// an error naming every violation when the layer is invalid.
     pub fn run(&self) -> Result<()> {
+        if self.validate {
+            return self.run_validate();
+        }
         let resolved = resolve_effective(&self.workspace);
         let digest = resolved.digest();
         if self.json {

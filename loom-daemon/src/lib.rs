@@ -184,6 +184,7 @@ pub mod forge_check_branch;
 pub mod forge_check_claim;
 pub mod forge_check_open_pr;
 pub mod forge_cmd;
+pub mod forge_comment;
 pub mod forge_disable_auto_merge;
 pub(crate) mod forge_etag_store;
 pub mod forge_events;
@@ -354,6 +355,9 @@ pub mod worktree_ops;
 pub mod worktree_reaper;
 pub mod worktree_root;
 pub mod worktree_state;
+pub mod write_scope;
+#[cfg(test)]
+pub(crate) mod write_scope_test_support;
 
 use std::collections::HashSet;
 use std::fs;

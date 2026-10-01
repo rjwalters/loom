@@ -73,6 +73,14 @@ pub(super) fn run_reconciliation_pass_over_roots(
             );
             break;
         }
+        // #9548: every pass below writes (claim labels, verdict anchors and
+        // stale notices, conflict flags). Their `gh` calls resolve the repo
+        // from the checkout, which is an `upstream` remote when there is one;
+        // a root this installation may not write to is skipped whole.
+        if !crate::write_scope::gate_root_with(root, gh_bin, "claim reconciliation") {
+            stats.roots_processed += 1;
+            continue;
+        }
         let (checked, reclaimed) = forge::reconcile_workspace(gh_bin, root, is_startup);
         stats.total_checked += checked;
         stats.total_reclaimed += reclaimed;
