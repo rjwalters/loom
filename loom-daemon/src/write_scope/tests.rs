@@ -226,9 +226,7 @@ fn a_fork_checkout_with_an_upstream_remote_is_refused() {
         ],
     );
     std::fs::create_dir(dir.path().join(".loom")).unwrap();
-    test_override::real(true);
     let v = root_writable(dir.path());
-    test_override::real(false);
     let Verdict::Deny(why) = v else {
         panic!("a write resolved through `upstream` must be refused, got {v:?}")
     };
@@ -264,6 +262,47 @@ fn the_cache_answers_repeat_questions_without_a_second_probe() {
     std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
 }
 
+/// The library-test fixture is admitted by the real decision, and only
+/// because its credential reports WRITE: the same registered checkout with a
+/// `pull` answer is refused. Neither answer is cached across the two, since
+/// each fixture has its own repository.
+#[test]
+#[serial_test::serial]
+fn a_registered_fixture_is_admitted_only_with_write() {
+    use crate::write_scope_test_support::WritableRoot;
+    let dir = tempfile::tempdir().unwrap();
+    let ws = WritableRoot::register(&dir.path().join("writable"));
+    assert_eq!(
+        root_writable_with(&dir.path().join("writable"), &ws.gh),
+        Verdict::Allow(ws.repo.clone())
+    );
+    let ro = WritableRoot::read_only(&dir.path().join("read-only"), None);
+    let v = root_writable_with(&dir.path().join("read-only"), &ro.gh);
+    assert!(
+        matches!(&v, Verdict::Deny(w) if w.contains("cannot write") && w.contains("pull")),
+        "{v:?}"
+    );
+}
+
+/// Write a disk-cache entry as if the probe had recorded it `age` ago. It is
+/// the on-disk format `probe::Cached` reads; the probe itself has no seeding
+/// hook.
+fn seed_disk(key_dir: Option<&Path>, repo: &str, write: bool, age: std::time::Duration) {
+    use std::io::Write as _;
+    let dir = probe::cache_dir();
+    assert!(crate::forge_etag_store::private_dir(&dir, true));
+    let key = probe::cache_key(key_dir, repo);
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(age.as_secs());
+    let body = serde_json::json!({"write": write, "detail": "seeded", "at": at}).to_string();
+    let mut f =
+        crate::forge_etag_store::create_private_file(&dir.join(format!("{key}.json"))).unwrap();
+    f.write_all(body.as_bytes()).unwrap();
+}
+
 #[test]
 #[serial_test::serial(write_scope_cache)]
 fn an_unanswerable_reprobe_keeps_a_recent_write_but_not_an_old_one() {
@@ -276,17 +315,17 @@ fn an_unanswerable_reprobe_keeps_a_recent_write_but_not_an_old_one() {
         key_dir: Some(dir.path().join("cred-g")),
     };
     // Verified two hours ago: past the TTL, inside the 24 h grace.
-    probe::seed_disk(Some(&dir.path().join("cred-g")), "acme/grace", true, 2 * hour);
+    seed_disk(Some(&dir.path().join("cred-g")), "acme/grace", true, 2 * hour);
     let p = down();
     assert_eq!(p.permission("acme/grace"), Permission::Write);
     assert_eq!(p.inner.calls.get(), 1, "it did re-probe");
     // Verified 25 hours ago: the outage now refuses.
     probe::clear_memory();
-    probe::seed_disk(Some(&dir.path().join("cred-g")), "acme/old", true, 25 * hour);
+    seed_disk(Some(&dir.path().join("cred-g")), "acme/old", true, 25 * hour);
     assert!(matches!(down().permission("acme/old"), Permission::Unknown(_)));
     // A definitive "no" is never overridden by an earlier yes.
     probe::clear_memory();
-    probe::seed_disk(Some(&dir.path().join("cred-g")), "acme/revoked", false, 2 * hour);
+    seed_disk(Some(&dir.path().join("cred-g")), "acme/revoked", false, 2 * hour);
     assert!(matches!(down().permission("acme/revoked"), Permission::Unknown(_)));
     std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
 }
@@ -328,6 +367,7 @@ fn daemon_write_paths_are_scoped() {
         ("claim_reconciliation.rs", Via(PASS, "reclaim + anchor passes")),
         ("claim_reconciliation/verdict_invalidation.rs", Via(PASS, "verdict pass")),
         ("claim_reconciliation/review_conflict.rs", Via(PASS, "conflict pass")),
+        ("claim_reconciliation/merge_sequence.rs", Via(PASS, "merge-sequence pass")),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
         (
             "forge_disable_auto_merge.rs",
@@ -335,7 +375,6 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("quarantine_reconciliation.rs", Gated),
         ("worktree_ops/gh.rs", Gated),
-        ("worktree_ops/orphan_recovery.rs", Via("worktree_ops/gh.rs", "writes via gh.rs")),
         ("star_liveness/task.rs", Gated),
         (
             "star_liveness/forge.rs",

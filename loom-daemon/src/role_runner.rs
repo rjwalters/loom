@@ -997,6 +997,9 @@ pub struct ScriptRoleInvocationRunner {
     /// the live host via [`crate::cpu_headroom::load_per_core`] at the
     /// moment the timeout fires — see [`run_role_with_timeout`].
     load_per_core_override: Option<f64>,
+    /// The `gh` the #9548 write-scope gate probes the workspace's permission
+    /// with. Production leaves this `None`: [`crate::write_scope::default_gh`].
+    gh_bin: Option<PathBuf>,
     /// What the most recent [`invoke`] actually resolved (#8056, extended by
     /// #8599 to the preference tier) — recorded rather than re-read so the
     /// `role_tick.outcome` record can never disagree with what was launched
@@ -1019,6 +1022,7 @@ impl ScriptRoleInvocationRunner {
             timeout: DEFAULT_ROLE_TIMEOUT,
             model: None,
             load_per_core_override: None,
+            gh_bin: None,
             resolved_launch: None,
             trace_context: None,
         }
@@ -1053,6 +1057,20 @@ impl ScriptRoleInvocationRunner {
     pub fn with_load_per_core_override(mut self, load_per_core: f64) -> Self {
         self.load_per_core_override = Some(load_per_core);
         self
+    }
+
+    /// Name the `gh` the write-scope gate probes with (a test's fake `gh`
+    /// that answers the permission check for its registered fixture root).
+    #[must_use]
+    pub fn with_gh_bin(mut self, gh: PathBuf) -> Self {
+        self.gh_bin = Some(gh);
+        self
+    }
+
+    fn gh(&self) -> PathBuf {
+        self.gh_bin
+            .clone()
+            .unwrap_or_else(crate::write_scope::default_gh)
     }
 
     fn resolve_spawn_bin(&self) -> Result<PathBuf, String> {

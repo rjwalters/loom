@@ -77,7 +77,7 @@ pub(super) fn run_reconciliation_pass_over_roots(
         // stale notices, conflict flags). Their `gh` calls resolve the repo
         // from the checkout, which is an `upstream` remote when there is one;
         // a root this installation may not write to is skipped whole.
-        if !crate::write_scope::gate_root(root, "claim reconciliation") {
+        if !crate::write_scope::gate_root_with(root, gh_bin, "claim reconciliation") {
             stats.roots_processed += 1;
             continue;
         }

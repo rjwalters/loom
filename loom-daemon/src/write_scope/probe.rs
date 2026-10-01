@@ -150,7 +150,7 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-fn cache_dir() -> PathBuf {
+pub(crate) fn cache_dir() -> PathBuf {
     match std::env::var("LOOM_WRITE_SCOPE_CACHE_DIR") {
         Ok(d) if !d.is_empty() => PathBuf::from(d),
         _ => crate::forge_etag_store::host_tmp_base().join("loom-write-scope"),
@@ -276,20 +276,6 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
         }
         with_grace(p, last_write, now)
     }
-}
-
-/// Seed a disk entry as if it had been written `age` ago (tests).
-#[cfg(test)]
-pub(crate) fn seed_disk(key_dir: Option<&Path>, repo: &str, write: bool, age: Duration) {
-    let key = cache_key(key_dir, repo);
-    write_entry(
-        &cache_dir().join(format!("{key}.json")),
-        &DiskEntry {
-            write,
-            detail: "seeded".into(),
-            at: now_secs().saturating_sub(age.as_secs()),
-        },
-    );
 }
 
 fn write_entry(path: &Path, entry: &DiskEntry) {

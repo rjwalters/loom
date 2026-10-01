@@ -194,7 +194,12 @@ fn checkout_root(dir: &Path) -> PathBuf {
     crate::repo_root::find_repo_root(dir).unwrap_or_else(|| dir.to_path_buf())
 }
 
-fn gh_bin() -> PathBuf {
+/// The `gh` a write runs when its caller names none: `LOOM_GH_BIN`, else
+/// `gh` on `PATH`. Callers that carry their own `gh` (a pass's `gh_bin`, a
+/// sweep config's) use the `_with` gates, so the permission probe runs the
+/// same binary, and so the same credential, as the writes it vets.
+#[must_use]
+pub fn default_gh() -> PathBuf {
     std::env::var_os("LOOM_GH_BIN").map_or_else(|| PathBuf::from("gh"), PathBuf::from)
 }
 
@@ -219,7 +224,7 @@ pub fn may_write_from(cwd: &Path, repo: Option<&str>) -> Verdict {
         None => target::gh_target(&remotes, std::env::var("GH_REPO").ok().as_deref()),
     };
     let managed = |r: &str| is_managed(&root, origin.as_deref(), r);
-    let probe = probe_for(&root, None);
+    let probe = probe_for(&root, None, &default_gh());
     decide(
         &Inputs {
             target,
@@ -244,34 +249,37 @@ impl PermissionProbe for GiteaUnprobed {
 
 /// The production probe for writes made from `root` under `config_dir` (a
 /// per-owner `GH_CONFIG_DIR`; `None` is this process's own credential).
-fn probe_for(root: &Path, config_dir: Option<PathBuf>) -> Box<dyn PermissionProbe> {
+fn probe_for(root: &Path, config_dir: Option<PathBuf>, gh: &Path) -> Box<dyn PermissionProbe> {
     if crate::forge_cmd::detect_forge(Some(root)) == crate::forge_cmd::ForgeType::Gitea {
         return Box::new(GiteaUnprobed);
     }
     Box::new(probe::Cached {
-        inner: probe::GhProbe::new(gh_bin(), config_dir.clone()),
+        inner: probe::GhProbe::new(gh.to_path_buf(), config_dir.clone()),
         key_dir: config_dir,
     })
 }
 
-/// [`probe_for`] under `root`'s own credential.
-fn probe_for_root(root: &Path) -> Box<dyn PermissionProbe> {
-    probe_for(root, crate::credential_preflight::gh_config_dir_for_root(root))
+/// [`probe_for`] under `root`'s own credential, run through `gh`.
+fn probe_for_root(root: &Path, gh: &Path) -> Box<dyn PermissionProbe> {
+    probe_for(root, crate::credential_preflight::gh_config_dir_for_root(root), gh)
 }
 
 /// May the daemon's per-workspace passes write from `root`? The target is
 /// what their `gh` calls resolve (never an explicit repo), under `root`'s own
 /// credential; a machine-wide `LOOM_REPO` override, which their `gh api`
-/// calls honour, must pass on its own too.
+/// calls honour, must pass on its own too. The probe runs [`default_gh`].
 #[must_use]
 pub fn root_writable(root: &Path) -> Verdict {
-    #[cfg(test)]
-    if let Some(v) = test_override::get(root) {
-        return v;
-    }
+    root_writable_with(root, &default_gh())
+}
+
+/// [`root_writable`] with the permission probe run through `gh`, the binary
+/// the caller's own writes use.
+#[must_use]
+pub fn root_writable_with(root: &Path, gh: &Path) -> Verdict {
     let remotes = remotes_cached(root);
     let origin = target::origin_nwo(&remotes);
-    let probe = probe_for_root(root);
+    let probe = probe_for_root(root, gh);
     let managed = |r: &str| is_managed(root, origin.as_deref(), r);
     let gh_repo = std::env::var("GH_REPO").ok();
     let verdict = decide(
@@ -285,7 +293,7 @@ pub fn root_writable(root: &Path) -> Verdict {
     );
     match (&verdict, std::env::var("LOOM_REPO").ok()) {
         (Verdict::Allow(t), Some(o)) if !o.trim().is_empty() && !eq(t, o.trim()) => {
-            repo_writable(root, &o)
+            repo_writable_with(root, &o, gh)
         }
         _ => verdict,
     }
@@ -297,10 +305,12 @@ pub fn root_writable(root: &Path) -> Verdict {
 /// remotes; the repository must still be managed and writable.
 #[must_use]
 pub fn repo_writable(root: &Path, repo: &str) -> Verdict {
-    #[cfg(test)]
-    if let Some(v) = test_override::get(root) {
-        return v;
-    }
+    repo_writable_with(root, repo, &default_gh())
+}
+
+/// [`repo_writable`] with the permission probe run through `gh`.
+#[must_use]
+pub fn repo_writable_with(root: &Path, repo: &str, gh: &Path) -> Verdict {
     let Some(nwo) = target::nwo_from_repo_arg(repo) else {
         return Verdict::Deny(format!("`{repo}` is not an OWNER/REPO"));
     };
@@ -316,7 +326,7 @@ pub fn repo_writable(root: &Path, repo: &str) -> Verdict {
             origin: origin.as_deref(),
             managed: &managed,
         },
-        probe_for_root(root).as_ref(),
+        probe_for_root(root, gh).as_ref(),
     )
 }
 
@@ -351,47 +361,21 @@ fn gate(key: String, verdict: &Verdict, what: &str) -> bool {
 /// [`root_writable`] as a gate: `true` to proceed with `what` (a short pass
 /// name for the log).
 pub fn gate_root(root: &Path, what: &str) -> bool {
-    gate(root.display().to_string(), &root_writable(root), what)
+    gate_root_with(root, &default_gh(), what)
 }
 
-/// [`repo_writable`] as a gate.
-pub fn gate_repo(root: &Path, repo: &str, what: &str) -> bool {
-    gate(format!("{} -> {repo}", root.display()), &repo_writable(root, repo), what)
+/// [`root_writable_with`] as a gate, for a pass that writes through `gh`.
+pub fn gate_root_with(root: &Path, gh: &Path, what: &str) -> bool {
+    gate(root.display().to_string(), &root_writable_with(root, gh), what)
 }
 
-/// Per-thread verdict overrides so other modules' tests, whose temp roots
-/// have no remotes, keep exercising their own logic: unset means "allow".
-#[cfg(test)]
-pub(crate) mod test_override {
-    use super::Verdict;
-    use std::cell::RefCell;
-    use std::path::Path;
-
-    thread_local! {
-        static DENY: RefCell<Option<String>> = const { RefCell::new(None) };
-        static REAL: RefCell<bool> = const { RefCell::new(false) };
-    }
-
-    /// Deny every root on this thread with `reason` (`None` restores allow).
-    pub(crate) fn deny(reason: Option<&str>) {
-        DENY.with(|d| *d.borrow_mut() = reason.map(str::to_string));
-    }
-
-    /// Run the real decision on this thread (write_scope's own tests).
-    pub(crate) fn real(on: bool) {
-        REAL.with(|r| *r.borrow_mut() = on);
-    }
-
-    pub(super) fn get(_root: &Path) -> Option<Verdict> {
-        if REAL.with(|r| *r.borrow()) {
-            return None;
-        }
-        Some(DENY.with(|d| {
-            d.borrow()
-                .clone()
-                .map_or_else(|| Verdict::Allow("test/allow".into()), Verdict::Deny)
-        }))
-    }
+/// [`repo_writable_with`] as a gate, for a pass that writes through `gh`.
+pub fn gate_repo_with(root: &Path, repo: &str, gh: &Path, what: &str) -> bool {
+    gate(
+        format!("{} -> {repo}", root.display()),
+        &repo_writable_with(root, repo, gh),
+        what,
+    )
 }
 
 #[cfg(test)]

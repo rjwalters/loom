@@ -15,6 +15,7 @@ use serial_test::serial;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::AtomicUsize;
+// #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
 
 /// Every env var that can change which runtime a role resolves to, or which
 /// credential source `spawn-codex.sh` (and therefore the gate) would use.
@@ -22,7 +23,8 @@ use std::sync::atomic::AtomicUsize;
 /// assertion panic — so an ambient `LOOM_RUNTIME_JUDGE=codex` or `CODEX_HOME`
 /// in a developer shell (or a dispatched sweep's own environment) can neither
 /// mask nor fake the behaviour under test.
-const GUARDED_ENV: [&str; 8] = [
+const GUARDED_ENV: [&str; 9] = [
+    "LOOM_SHARED_TOKENS_DIR",
     "LOOM_RUNTIME",
     "LOOM_RUNTIME_JUDGE",
     "LOOM_CODEX_HOME",
@@ -77,25 +79,26 @@ const CODEX_MANIFEST: &str =
 /// the issue's live repro had: `runtimes.roles.judge = "codex"`), with a
 /// codex-shaped model pin so #5028's mismatch refusal stays out of scope.
 ///
-/// `claude_pool_exhausted` decides the state of the per-repo Claude pool: one
-/// token, bad-marked (the live repro's "0/N spawnable") or healthy. A per-repo
-/// pool always wins `resolve_tokens_dir`, so `LOOM_SHARED_TOKENS_DIR` never
-/// needs touching here.
+/// `claude_pool_exhausted` decides the state of the Claude pool: one token,
+/// bad-marked (the live repro's "0/N spawnable") or healthy. It is the shared
+/// pool (`LOOM_SHARED_TOKENS_DIR`, restored by the caller's [`EnvGuard`]),
+/// because a registered workspace is a git checkout (#9548), where Loom
+/// refuses an in-checkout pool (#9135).
 ///
-/// Returns the marker path the fake `spawn-worker.sh` touches when it runs.
-fn codex_judge_workspace(root: &Path, manifest: &str, claude_pool_exhausted: bool) -> PathBuf {
-    for sub in [
-        ".loom/roles",
-        ".loom/runtimes",
-        ".loom/scripts",
-        ".loom/tokens",
-    ] {
+/// Returns the marker path the fake `spawn-worker.sh` touches when it runs,
+/// and the pool, which must outlive the tick.
+fn codex_judge_workspace(
+    root: &Path,
+    manifest: &str,
+    claude_pool_exhausted: bool,
+) -> (PathBuf, crate::write_scope_test_support::SharedTokenPool) {
+    for sub in [".loom/roles", ".loom/runtimes", ".loom/scripts"] {
         fs::create_dir_all(root.join(sub)).unwrap();
     }
-    fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
+    let pool = crate::write_scope_test_support::SharedTokenPool::one_account();
     if claude_pool_exhausted {
         fs::write(
-            root.join(".loom/tokens/.bad_tokens"),
+            pool.path().join(".bad_tokens"),
             format!("{} fake auth failure\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")),
         )
         .unwrap();
@@ -113,7 +116,7 @@ fn codex_judge_workspace(root: &Path, manifest: &str, claude_pool_exhausted: boo
         &root.join(".loom/scripts/spawn-worker.sh"),
         &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
     );
-    marker
+    (marker, pool)
 }
 
 fn codex_id(name: &str) -> AccountId {
@@ -142,13 +145,18 @@ fn epoch_now() -> u64 {
 /// tick must reach the spawn — not skip as `PoolExhausted` over a pool the
 /// codex runtime never reads.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn codex_pinned_role_spawns_despite_an_exhausted_claude_pool() {
+    codex_pinned_role_spawns_despite_an_exhausted_claude_pool_body();
+}
+
+#[serial]
+fn codex_pinned_role_spawns_despite_an_exhausted_claude_pool_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
     fs::create_dir(profiles.path().join("alice")).unwrap();
-    let marker = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, true);
+    let (marker, _pool) = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, true);
 
     // Precondition: this really is the exhausted-Claude-pool state that used
     // to gate the tick.
@@ -156,7 +164,10 @@ fn codex_pinned_role_spawns_despite_an_exhausted_claude_pool() {
     assert_eq!((claude.total, claude.usable), (1, 0));
 
     let before = pool_exhausted_skip_count();
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
 
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
     assert!(marker.exists(), "the codex-pinned tick must actually reach the spawn");
@@ -174,12 +185,17 @@ fn codex_pinned_role_spawns_despite_an_exhausted_claude_pool() {
 /// skips pre-spawn, and the diagnostic names the codex account pool — never
 /// `.loom/tokens`, which the codex runtime does not read.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn codex_pinned_role_with_no_codex_account_skips_naming_the_codex_pool() {
+    codex_pinned_role_with_no_codex_account_skips_naming_the_codex_pool_body();
+}
+
+#[serial]
+fn codex_pinned_role_with_no_codex_account_skips_naming_the_codex_pool_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
-    let marker = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
+    let (marker, _pool) = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
 
     let before = pool_exhausted_skip_count();
     let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
@@ -214,15 +230,20 @@ fn codex_pinned_role_with_no_codex_account_skips_naming_the_codex_pool() {
 /// exhaustion cooldown. Same skip, `total` counts the enabled accounts, and
 /// the very next tick proceeds once a hold clears — no cached verdict.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn codex_pinned_role_skips_while_every_account_is_held_then_recovers() {
+    codex_pinned_role_skips_while_every_account_is_held_then_recovers_body();
+}
+
+#[serial]
+fn codex_pinned_role_skips_while_every_account_is_held_then_recovers_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
     for name in ["alice", "bob"] {
         fs::create_dir(profiles.path().join(name)).unwrap();
     }
-    let marker = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
+    let (marker, _pool) = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
     let now = epoch_now();
     record_terminal_at(
         workspace.path(),
@@ -241,7 +262,8 @@ fn codex_pinned_role_skips_while_every_account_is_held_then_recovers() {
     )
     .unwrap();
 
-    let mut runner = judge_runner(workspace.path());
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let mut runner = judge_runner(workspace.path()).with_gh_bin(ws.gh.clone());
     let outcome = runner.invoke("judge", "/loom:judge");
     let RoleTickOutcome::PoolExhausted {
         total,
@@ -367,13 +389,18 @@ fn codex_pool_state_fails_closed_on_an_unreadable_health_state() {
 /// which file to repair, through `invoke()`, not just at the state-reader
 /// level. The pool reads as 0 enabled because nothing could be enumerated.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn codex_pinned_role_fails_closed_on_a_malformed_account_inventory() {
+    codex_pinned_role_fails_closed_on_a_malformed_account_inventory_body();
+}
+
+#[serial]
+fn codex_pinned_role_fails_closed_on_a_malformed_account_inventory_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
     fs::create_dir(profiles.path().join("alice")).unwrap();
-    let marker = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
+    let (marker, _pool) = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
     fs::write(workspace.path().join(".loom/accounts.json"), "{not json").unwrap();
 
     let state = codex_pool_state(workspace.path(), epoch_now());
@@ -403,13 +430,18 @@ fn codex_pinned_role_fails_closed_on_a_malformed_account_inventory() {
 /// The health-state half of the same claim, through `invoke()`: the skip text
 /// names `account-health.json` — never the inventory, which read fine.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn codex_pinned_role_skip_text_names_the_health_state_when_that_is_what_failed() {
+    codex_pinned_role_skip_text_names_the_health_state_when_that_is_what_failed_body();
+}
+
+#[serial]
+fn codex_pinned_role_skip_text_names_the_health_state_when_that_is_what_failed_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
     fs::create_dir(profiles.path().join("alice")).unwrap();
-    let marker = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
+    let (marker, _pool) = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
     fs::write(workspace.path().join(".loom/account-health.json"), "{not json").unwrap();
 
     let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
@@ -570,15 +602,23 @@ fn the_repeat_skip_clause_names_the_gated_pool_and_its_hold() {
 /// An explicit profile pin means `spawn-codex.sh` never reaches the account
 /// selector, so an empty account pool is not the wall — the tick proceeds.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn codex_gate_stands_down_for_an_explicit_profile_pin() {
+    codex_gate_stands_down_for_an_explicit_profile_pin_body();
+}
+
+#[serial]
+fn codex_gate_stands_down_for_an_explicit_profile_pin_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
-    let marker = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
+    let (marker, _pool) = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
     std::env::set_var("LOOM_CODEX_PROFILE", "pinned-elsewhere");
 
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
     assert!(marker.exists());
 }
@@ -587,18 +627,26 @@ fn codex_gate_stands_down_for_an_explicit_profile_pin() {
 /// key) makes `spawn-codex.sh` fall open to the `claude` provider, so the
 /// codex account pool is not what that launch selects from — no codex gate.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn codex_gate_stands_down_when_the_manifest_names_no_codex_account_provider() {
+    codex_gate_stands_down_when_the_manifest_names_no_codex_account_provider_body();
+}
+
+#[serial]
+fn codex_gate_stands_down_when_the_manifest_names_no_codex_account_provider_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
-    let marker = codex_judge_workspace(
+    let (marker, _pool) = codex_judge_workspace(
         workspace.path(),
         r#"{"runtime":"codex","capabilities":{"mcp":"yes"}}"#,
         false,
     );
 
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
     assert!(marker.exists());
 }
@@ -754,23 +802,22 @@ fn a_dry_codex_pool_never_feeds_the_sweep_dispatch_brake() {
 /// touching a marker, so a test can assert **which** tap the tick launched
 /// on — the difference between "a spawn happened" and "the preference list
 /// actually re-pointed the launch".
+///
+/// The Claude pool is the shared pool (returned; keep it alive), because the
+/// workspace is a registered git checkout (#9548), where Loom refuses an
+/// in-checkout pool (#9135). The caller's [`EnvGuard`] restores the variable.
 fn preference_judge_workspace(
     root: &Path,
     config_extra: &serde_json::Value,
     claude_pool_exhausted: bool,
-) -> PathBuf {
-    for sub in [
-        ".loom/roles",
-        ".loom/runtimes",
-        ".loom/scripts",
-        ".loom/tokens",
-    ] {
+) -> (PathBuf, crate::write_scope_test_support::SharedTokenPool) {
+    for sub in [".loom/roles", ".loom/runtimes", ".loom/scripts"] {
         fs::create_dir_all(root.join(sub)).unwrap();
     }
-    fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
+    let pool = crate::write_scope_test_support::SharedTokenPool::one_account();
     if claude_pool_exhausted {
         fs::write(
-            root.join(".loom/tokens/.bad_tokens"),
+            pool.path().join(".bad_tokens"),
             format!("{} fake auth failure\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")),
         )
         .unwrap();
@@ -785,7 +832,7 @@ fn preference_judge_workspace(
         &root.join(".loom/scripts/spawn-worker.sh"),
         &format!("#!/bin/sh\nprintf '%s' \"$LOOM_RUNTIME\" >'{}'\nexit 0\n", marker.display()),
     );
-    marker
+    (marker, pool)
 }
 
 /// The genuine fall-through: `claude` is listed FIRST and admitted, its pool
@@ -793,19 +840,27 @@ fn preference_judge_workspace(
 /// lands on the codex tap below — the shape a fleet with
 /// `preference: ["claude", "codex", …]` actually runs.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn a_dry_first_tap_falls_through_to_the_next_listed_tap() {
+    a_dry_first_tap_falls_through_to_the_next_listed_tap_body();
+}
+
+#[serial]
+fn a_dry_first_tap_falls_through_to_the_next_listed_tap_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
     fs::create_dir(profiles.path().join("alice")).unwrap();
-    let marker = preference_judge_workspace(
+    let (marker, _pool) = preference_judge_workspace(
         workspace.path(),
         &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
         true,
     );
 
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
 
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
     assert_eq!(fs::read_to_string(&marker).unwrap_or_default(), "codex");
@@ -816,19 +871,27 @@ fn a_dry_first_tap_falls_through_to_the_next_listed_tap() {
 /// it (the "never pass over a tap that could have served" half of the
 /// availability contract).
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn a_healthy_first_tap_keeps_the_tick_on_it() {
+    a_healthy_first_tap_keeps_the_tick_on_it_body();
+}
+
+#[serial]
+fn a_healthy_first_tap_keeps_the_tick_on_it_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
     fs::create_dir(profiles.path().join("alice")).unwrap();
-    let marker = preference_judge_workspace(
+    let (marker, _pool) = preference_judge_workspace(
         workspace.path(),
         &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
         false,
     );
 
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
 
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
     assert_eq!(fs::read_to_string(&marker).unwrap_or_default(), "claude");
@@ -842,20 +905,28 @@ fn a_healthy_first_tap_keeps_the_tick_on_it() {
 /// that resolves is the role-scoped one, which outranks (and here exists
 /// without) the fleet-wide `runtimes.preference`.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn an_exhausted_claude_pool_falls_through_via_role_preference_instead_of_skipping() {
+    an_exhausted_claude_pool_falls_through_via_role_preference_instead_of_skipping_body();
+}
+
+#[serial]
+fn an_exhausted_claude_pool_falls_through_via_role_preference_instead_of_skipping_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
     fs::create_dir(profiles.path().join("alice")).unwrap();
-    let marker = preference_judge_workspace(
+    let (marker, _pool) = preference_judge_workspace(
         workspace.path(),
         &serde_json::json!({"runtimes": {"rolePreference": {"judge": ["codex"]}}}),
         true,
     );
 
     let before = pool_exhausted_skip_count();
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
 
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
     assert_eq!(
@@ -875,19 +946,27 @@ fn an_exhausted_claude_pool_falls_through_via_role_preference_instead_of_skippin
 /// exhausted would silently ignore this configuration for as long as the
 /// Claude pool stayed healthy, i.e. almost always.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn role_preference_decides_the_tap_even_when_the_static_pool_is_healthy() {
+    role_preference_decides_the_tap_even_when_the_static_pool_is_healthy_body();
+}
+
+#[serial]
+fn role_preference_decides_the_tap_even_when_the_static_pool_is_healthy_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
     fs::create_dir(profiles.path().join("alice")).unwrap();
-    let marker = preference_judge_workspace(
+    let (marker, _pool) = preference_judge_workspace(
         workspace.path(),
         &serde_json::json!({"runtimes": {"rolePreference": {"judge": ["codex", "claude"]}}}),
         false,
     );
 
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
 
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
     assert_eq!(
@@ -903,15 +982,24 @@ fn role_preference_decides_the_tap_even_when_the_static_pool_is_healthy() {
 /// spawnable codex seat exists. The control for the test above — it is the
 /// preference key that moves the tap, not the fixture.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn no_preference_list_leaves_the_static_runtime_in_charge() {
+    no_preference_list_leaves_the_static_runtime_in_charge_body();
+}
+
+#[serial]
+fn no_preference_list_leaves_the_static_runtime_in_charge_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
     fs::create_dir(profiles.path().join("alice")).unwrap();
-    let marker = preference_judge_workspace(workspace.path(), &serde_json::json!({}), false);
+    let (marker, _pool) =
+        preference_judge_workspace(workspace.path(), &serde_json::json!({}), false);
 
-    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
 
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
     assert_eq!(fs::read_to_string(&marker).unwrap_or_default(), "claude");
@@ -923,14 +1011,19 @@ fn no_preference_list_leaves_the_static_runtime_in_charge() {
 /// pre-#8554 outcome (self-healing, kept out of #7607's stuck-role streak),
 /// not a new failure class.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn a_wholly_unavailable_role_preference_list_still_skips_pre_spawn() {
+    a_wholly_unavailable_role_preference_list_still_skips_pre_spawn_body();
+}
+
+#[serial]
+fn a_wholly_unavailable_role_preference_list_still_skips_pre_spawn_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
     // No codex profile directories created: the codex pool is provisioned
     // (the manifest/adapter exist) but has zero enabled accounts.
-    let marker = preference_judge_workspace(
+    let (marker, _pool) = preference_judge_workspace(
         workspace.path(),
         &serde_json::json!({"runtimes": {"rolePreference": {"judge": ["codex"]}}}),
         true,
@@ -953,14 +1046,19 @@ fn a_wholly_unavailable_role_preference_list_still_skips_pre_spawn() {
 /// the unlisted-but-healthy runtime, which would route around the operator's
 /// configuration.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn an_unavailable_list_refuses_rather_than_launching_an_unlisted_runtime() {
+    an_unavailable_list_refuses_rather_than_launching_an_unlisted_runtime_body();
+}
+
+#[serial]
+fn an_unavailable_list_refuses_rather_than_launching_an_unlisted_runtime_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
     // No codex profile directories: the only listed tap is unavailable. The
     // Claude pool is deliberately HEALTHY (no `.bad_tokens`).
-    let marker = preference_judge_workspace(
+    let (marker, _pool) = preference_judge_workspace(
         workspace.path(),
         &serde_json::json!({"runtimes": {"rolePreference": {"judge": ["codex"]}}}),
         false,
@@ -987,13 +1085,18 @@ fn an_unavailable_list_refuses_rather_than_launching_an_unlisted_runtime() {
 /// operator act, and silently routing around it at the pre-spawn gate would
 /// make it useless for the debugging it exists for.
 #[test]
-#[serial]
+#[serial(loom_shared_tokens_dir_env)]
 fn an_operator_pin_disables_preference_fall_through_at_the_pre_spawn_gate() {
+    an_operator_pin_disables_preference_fall_through_at_the_pre_spawn_gate_body();
+}
+
+#[serial]
+fn an_operator_pin_disables_preference_fall_through_at_the_pre_spawn_gate_body() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
     fs::create_dir(profiles.path().join("alice")).unwrap();
-    let marker = preference_judge_workspace(
+    let (marker, _pool) = preference_judge_workspace(
         workspace.path(),
         &serde_json::json!({"runtimes": {"rolePreference": {"judge": ["codex"]}}}),
         true,

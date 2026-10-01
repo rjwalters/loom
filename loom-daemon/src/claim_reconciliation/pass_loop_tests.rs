@@ -13,9 +13,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::run_reconciliation_pass_over_roots;
+use crate::write_scope_test_support::WritableRoot;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
+// #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
 
 /// Fake `gh` (tests only, Issue #8953) that logs `$(pwd) $*` for every
 /// invocation — the `$(pwd)` prefix is what lets this test tell which of two
@@ -61,6 +63,7 @@ exit 0
 /// inside `forge::reconcile_workspace` et al) by reporting suppressed from
 /// the SECOND check onward — i.e. every check after the one guarding root A.
 #[test]
+#[serial_test::serial]
 fn run_reconciliation_pass_over_roots_stops_after_breaker_trips_mid_pass() {
     let dir = tempdir().unwrap();
     let root_a = dir.path().join("repo-a");
@@ -69,7 +72,13 @@ fn run_reconciliation_pass_over_roots_stops_after_breaker_trips_mid_pass() {
     std::fs::create_dir_all(&root_b).unwrap();
 
     let gh_log = dir.path().join("gh-invocations.log");
-    let fake_gh = write_fake_gh_logging_cwd(dir.path(), &gh_log);
+    let logging_gh = write_fake_gh_logging_cwd(dir.path(), &gh_log);
+    // #9548: both roots are registered, writable checkouts. One `gh` answers
+    // for the pass, so the two fixtures' permission answers are chained in
+    // front of the logging fake.
+    let ws_a = WritableRoot::register_with_gh(&root_a, &logging_gh);
+    let ws_b = WritableRoot::register_with_gh(&root_b, &ws_a.gh);
+    let fake_gh = ws_b.gh.clone();
 
     let roots = vec![root_a.clone(), root_b.clone()];
     let checks = std::sync::atomic::AtomicUsize::new(0);
@@ -97,6 +106,7 @@ fn run_reconciliation_pass_over_roots_stops_after_breaker_trips_mid_pass() {
 /// confirms the new per-iteration check does not change behavior in the
 /// common (not-suppressed) case.
 #[test]
+#[serial_test::serial]
 fn run_reconciliation_pass_over_roots_visits_every_root_when_never_suppressed() {
     let dir = tempdir().unwrap();
     let root_a = dir.path().join("repo-a");
@@ -105,7 +115,13 @@ fn run_reconciliation_pass_over_roots_visits_every_root_when_never_suppressed() 
     std::fs::create_dir_all(&root_b).unwrap();
 
     let gh_log = dir.path().join("gh-invocations.log");
-    let fake_gh = write_fake_gh_logging_cwd(dir.path(), &gh_log);
+    let logging_gh = write_fake_gh_logging_cwd(dir.path(), &gh_log);
+    // #9548: both roots are registered, writable checkouts. One `gh` answers
+    // for the pass, so the two fixtures' permission answers are chained in
+    // front of the logging fake.
+    let ws_a = WritableRoot::register_with_gh(&root_a, &logging_gh);
+    let ws_b = WritableRoot::register_with_gh(&root_b, &ws_a.gh);
+    let fake_gh = ws_b.gh.clone();
 
     let roots = vec![root_a.clone(), root_b.clone()];
     let stats = run_reconciliation_pass_over_roots(&roots, &fake_gh, false, || false);
@@ -116,27 +132,64 @@ fn run_reconciliation_pass_over_roots_visits_every_root_when_never_suppressed() 
     assert!(gh_calls.contains("repo-b"), "root B should have been called; got: {gh_calls:?}");
 }
 
-/// #9548: a root this installation may not write to gets no pass at all —
-/// not the listing reads that feed the writes, and never a write — while the
-/// loop still counts it as visited.
+/// #9548 negative controls, through the real gate: a root this installation
+/// may not write to gets no pass at all (not the listing reads that feed the
+/// writes, and never a write), while the loop still counts it as visited.
+///
+/// - A fork checkout, whose `gh` target is its `upstream` remote, is refused
+///   before any forge call, even the permission probe.
+/// - A registered checkout whose credential only has `pull` is refused on the
+///   probe's answer; the pass itself makes no call.
 #[test]
+#[serial_test::serial]
 fn a_root_outside_the_write_scope_is_skipped_without_a_forge_call() {
     let dir = tempdir().unwrap();
-    let root = dir.path().join("fork-checkout");
-    std::fs::create_dir_all(&root).unwrap();
+    let fork = dir.path().join("fork-checkout");
+    std::fs::create_dir_all(fork.join(".loom")).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/me/widgets.git",
+        ],
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/acme/widgets.git",
+        ],
+    ] {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(&fork)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let read_only = dir.path().join("read-only-checkout");
     let gh_log = dir.path().join("gh-invocations.log");
-    let fake_gh = write_fake_gh_logging_cwd(dir.path(), &gh_log);
+    let logging_gh = write_fake_gh_logging_cwd(dir.path(), &gh_log);
 
-    crate::write_scope::test_override::deny(Some("gh resolves this checkout to upstream"));
-    let stats = run_reconciliation_pass_over_roots(&[root], &fake_gh, false, || false);
-    crate::write_scope::test_override::deny(None);
-
+    let stats = run_reconciliation_pass_over_roots(&[fork], &logging_gh, false, || false);
     assert_eq!(stats.roots_processed, 1);
     assert_eq!(stats.total_checked + stats.total_pr_checked, 0);
     assert!(
         std::fs::read_to_string(&gh_log)
             .unwrap_or_default()
             .is_empty(),
-        "no gh invocation for a refused root"
+        "no gh invocation at all for a checkout gh resolves to upstream"
+    );
+
+    let ws = WritableRoot::read_only(&read_only, Some(&logging_gh));
+    let stats = run_reconciliation_pass_over_roots(&[read_only], &ws.gh, false, || false);
+    assert_eq!(stats.roots_processed, 1);
+    assert_eq!(stats.total_checked + stats.total_pr_checked, 0);
+    assert!(
+        std::fs::read_to_string(&gh_log)
+            .unwrap_or_default()
+            .is_empty(),
+        "no pass runs on a root whose credential has only pull"
     );
 }

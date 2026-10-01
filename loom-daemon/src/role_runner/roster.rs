@@ -248,7 +248,7 @@ fn roster_heartbeat_once(
     // #9548: the roster issue is configured, not resolved; it must still be a
     // repository this installation manages and can write to.
     let roster_repo = format!("{}/{}", issue.owner, issue.repo);
-    if !crate::write_scope::gate_repo(fallback_root, &roster_repo, "roster heartbeat") {
+    if !crate::write_scope::gate_repo_with(fallback_root, &roster_repo, gh, "roster heartbeat") {
         return;
     }
     let ok = match action {

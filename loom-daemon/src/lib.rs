@@ -355,6 +355,8 @@ pub mod worktree_reaper;
 pub mod worktree_root;
 pub mod worktree_state;
 pub mod write_scope;
+#[cfg(test)]
+pub(crate) mod write_scope_test_support;
 
 use std::collections::HashSet;
 use std::fs;
