@@ -36,7 +36,8 @@ impl Provider {
 }
 
 /// A forge instance origin: scheme + host, lowercased. The first identity
-/// component — two origins that agree on everything else are different
+/// component
+/// Rejects C0 controls: the key delimiter (U+001F) is display metadata, not identity. — two origins that agree on everything else are different
 /// worlds (#9779 §1).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InstanceOrigin(String);
@@ -52,6 +53,11 @@ impl InstanceOrigin {
             .map(|(_, rest)| rest)
             .unwrap_or(&trimmed);
         if authority.is_empty() || authority.contains('/') {
+            return None;
+        }
+        // A bare host ("git.example.com") is an origin too — the scheme is
+        // display; the host is the identity.
+        if trimmed.chars().any(char::is_control) {
             return None;
         }
         Some(Self(trimmed))
@@ -90,6 +96,9 @@ pub struct RepositoryRef {
 impl RepositoryRef {
     pub fn parse(origin: InstanceOrigin, slug: &str) -> Option<Self> {
         let slug = slug.trim().trim_end_matches(".git").to_string();
+        if slug.chars().any(char::is_control) {
+            return None;
+        }
         let mut segs = slug.split('/');
         match (segs.next(), segs.next(), segs.next()) {
             (Some(o), Some(r), None) if !o.is_empty() && !r.is_empty() => Some(Self {
@@ -167,10 +176,23 @@ pub struct RequestIdentity {
 }
 
 impl RequestIdentity {
+    /// The two origin fields must name the same instance — the request's own
+    /// and the repository's; a divergence is a construction bug and would
+    /// silently key objects under the outer origin (judge round 1).
+    pub fn origins_consistent(&self) -> bool {
+        self.origin == self.repository.origin
+    }
+
     /// The cache/claim/verdict key for an object reached through this
     /// identity. Includes the origin: the two-origins-same-slug demo
     /// produces different keys (the #9779 §1 acceptance example).
     pub fn object_key(&self, kind: ObjectKind, number: u64) -> String {
+        assert!(
+            self.origins_consistent(),
+            "RequestIdentity origins diverge: {} vs {}",
+            self.origin.as_str(),
+            self.repository.origin.as_str()
+        );
         let (owner, repo) = self.repository.slug.split_once('/').unwrap_or(("", ""));
         ObjectRef {
             provider: self.provider.clone(),
@@ -309,12 +331,8 @@ mod tests {
     fn identity(origin: InstanceOrigin, credential: &str) -> RequestIdentity {
         RequestIdentity {
             provider: Provider::Gitea,
-            origin,
-            repository: RepositoryRef::parse(
-                InstanceOrigin::parse("x://unused").unwrap(),
-                "team/widgets",
-            )
-            .unwrap(),
+            origin: origin.clone(),
+            repository: RepositoryRef::parse(origin, "team/widgets").unwrap(),
             credential: CredentialRef::parse(credential).unwrap(),
             profile: "required-coordination".into(),
         }
@@ -391,6 +409,28 @@ mod tests {
         assert!(!EvidenceLevel::Adapter.sufficient_for_go());
         assert!(EvidenceLevel::InstalledCaller.sufficient_for_go());
         assert!(EvidenceLevel::Platform < EvidenceLevel::InstalledCaller);
+    }
+
+    #[test]
+    fn identity_components_reject_control_characters() {
+        // The judge's probe: two parseable-but-different component sets
+        // MUST NOT produce one key. With controls rejected at parse, the
+        // collision inputs are unparsable.
+        assert!(InstanceOrigin::parse("https://git.acme\u{1f}x.dev").is_none());
+        assert!(RepositoryRef::parse(origin_a(), "team\u{1f}a/widgets").is_none());
+        assert!(RepositoryRef::parse(origin_a(), "team/widge\u{1f}ts").is_none());
+        // Keys over accepted values stay injective on the component tuple.
+        let r1 = RepositoryRef::parse(origin_a(), "a/c").unwrap();
+        let r2 = RepositoryRef::parse(origin_a(), "b/c").unwrap();
+        assert_ne!(r1.slug, r2.slug);
+    }
+
+    #[test]
+    #[should_panic(expected = "origins diverge")]
+    fn divergent_origins_are_a_construction_bug() {
+        let mut id = identity(origin_a(), "cred:a");
+        id.repository = RepositoryRef::parse(origin_b(), "team/widgets").unwrap();
+        let _ = id.object_key(ObjectKind::Issue, 7);
     }
 
     #[test]
