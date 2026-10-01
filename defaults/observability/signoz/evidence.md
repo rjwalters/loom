@@ -1137,6 +1137,78 @@ caveat `signoz_usage_queries.rs` already carries for the measured-usage
 artifact. That gap is the same one #8525 and #9279 name for every other
 not-yet-live-executed SigNoz artifact in this trial.
 
+## The gauge queries executed against the pinned engine (2026-10-01)
+
+`queue-dwell.sql` (#8856) and `quota-utilization.sql` (#9005) were this trial's
+last two scope-item-4 artifacts with no execution proof of any kind.
+`signoz_trial_artifacts.rs` guards their *vocabulary* (see "Closing the drift
+guard's last gap" above) — enough to catch a renamed metric or label, blind to
+whether the SQL computes the right number. The README said so for one of them
+outright ("Neither has been executed against a live SigNoz") and, for the
+other, recorded an ad-hoc `clickhouse-local` session whose fixture and output
+were never committed, so nothing re-ran it and nothing could be inspected.
+
+`loom-daemon/tests/signoz_queue_quota_queries.rs` closes that gap with the
+technique `signoz_usage_queries.rs` and `signoz_cycle_time.rs` already
+established: `clickhouse local` in the pinned
+`clickhouse/clickhouse-server:25.12.5` image, each committed file run verbatim
+as one pass and then query by query. **These are the first artifacts in this
+trial proven against `signoz_metrics.samples_v4` / `time_series_v4` at all** —
+every earlier proof read `signoz_index_v3` or `distributed_logs_v2` — so the
+metric read surface (`unix_milli Int64` milliseconds, `labels` as a JSON
+**string** read with `JSONExtractString`, not a Map) is now exercised rather
+than assumed.
+
+Because both files window on `now()` (24 h / 7 days / 30 days), the fixture
+cannot use fixed timestamps. It anchors every row to one of three computed,
+boundary-aligned points — `toStartOfHour(now() - 2 h)` and
+`toStartOfDay(now() - 3/2 days) + 1 h` — so the committed queries' own
+`toStartOfInterval(..., 5 MINUTE)` / `toStartOfHour` / `toDate` grouping lands
+in a fixed number of buckets no matter what time of day CI runs.
+
+Observed, and each confirmed to change under a deliberate mutation of the
+committed SQL before being asserted:
+
+| Property | Observation | Mutation that breaks it |
+| --- | --- | --- |
+| Duplicate `time_series_v4` hour-rows are harmless to `max()` | Three `loom.queue.starved` points (2, 3, 1) in one 5-minute bucket on a series with **two** hour-rows answer `3` | `max()` → `sum()` answers **12** (the sum, doubled by the join) |
+| …and fatal to `sum()` without the de-duplicating sub-select | Query 4 answers 1800 wait-seconds / 6 dispatches = 5.0 min mean | the naive `INNER JOIN time_series_v4 USING (fingerprint)` answers **3600 / 12** — run as a counterfactual in the test, not just described |
+| A measured zero is not starvation | a host reporting `starved` = 0 is absent from query 1's result, not present with a zero | `HAVING starved > 0` removed |
+| A missing companion metric is NULL, not fast | `dispatch_wait` with no `.samples` series → `dispatches` = 0 and `mean_wait_minutes` = **NULL** | `nullIf(dispatches, 0)` removed (0 reads as "dispatches are instant") |
+| Absent utilization is NULL, not idle | an account with a weekly reading but no 5-hour reading → `util_5h` = **NULL** | `maxOrNullIf` → `maxIf` answers **0** |
+| Over-100% clamps to zero headroom | a 1.05 pre-reset reading → `idle_headroom` = **0** | `least(prev_value, 1)` removed answers **-0.05** |
+| A provider with no utilization source still appears, unmeasured | `zai`/`acct-z` (only `loom.tokens.exhausted`): `accounts` = 1, `accounts_measured` = 0, `coverage` = `unknown`, both fractions NULL | query 3's `LEFT JOIN per_account_weekly` → `INNER JOIN` **drops the provider's row entirely** |
+| One reset per account, not one per hour-row | query 2 returns exactly 2 rows (0.82/0.18 and 1.05/0.0) although both weekly series carry two hour-rows | — (the `max()`-per-`ms` CTE absorbs it) |
+| Query 5 reads spans, and every dispatch attribute is a string | `rank`/`candidate_rank`/`total_candidates`/`priority_score` all resolve from `attributes_string`; the same key read from `attributes_number` returns **0 for every row with no error** | — (negative control, as in `signoz_usage_queries.rs`) |
+| A pre-#9673 halted row's cause is recoverable | `attributes_string['loom.queue.halt_cause']` on a row that omits the key reads `''` rather than erroring, and joining `parentSpanID` to the parent `loom.dispatch.tick` recovers `halted_main_red` | — (the file's own trailing note, now exercised) |
+
+Query 5's three negative controls are also observed to be excluded: a
+different issue in the same repo, the same issue **number** in a different repo
+(issue numbers are not globally unique), and the same issue outside the 24 h
+window.
+
+**One finding that corrects the file's own implied reasoning.** Query 3 ends
+`SETTINGS join_use_nulls = 1`. Removing it on this engine changes **nothing** —
+`zai` still reads `coverage = 'unknown'` with NULL fractions, because
+`per_account_weekly.used_fraction` is already `Nullable(Float64)` (it comes out
+of `argMaxIf`/`lagInFrame(toNullable(...))`), so the LEFT JOIN fills NULL
+regardless. The setting is belt-and-braces, not the mechanism; the mechanism is
+the LEFT JOIN itself, which the mutation above shows is load-bearing. Recorded
+so a future editor does not treat the setting as the thing protecting the NULL.
+
+**What this establishes and what it does not.** The committed gauge SQL
+computes the documented answers on the engine version the trial deploys, and
+the absent-versus-zero distinctions this epic cares about survive the engine
+rather than only the author's intent. It is **not** a live trial observation: no
+metric point went through SigNoz's own ingester, its metric migrator, or
+`time_series_v4` as SigNoz actually creates and fingerprints it — this is
+`clickhouse local` with a hand-written read-surface schema, the same caveat
+`signoz_usage_queries.rs` and `signoz_cycle_time.rs` carry. Nor is it a proof
+of the alert: `alerts/queue-starvation.json` embeds the same query 1 shape with
+`{{.start_timestamp_ms}}` placeholders SigNoz substitutes, and only its
+vocabulary is guarded. The gap is the same one #8525, #8946, #8529 and #9279
+name for every other not-yet-live-executed SigNoz artifact in this trial.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -1163,6 +1235,7 @@ not-yet-live-executed SigNoz artifact in this trial.
 | Six CI saved views in the trial org | **Open** — recreation steps written in the README, not yet executed in the UI ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | Measured usage parity with ClickStack's "Loom measured usage" view | **Passed against the pinned ClickHouse, open against the live trial.** `usage-queries.sql` (sections 0–6) plus four README saved-view rows close the parity gap; `signoz_usage_queries.rs` executes the committed file verbatim on ClickHouse 25.12.5 and observes scope resolution, at-least-once dedupe, NULL-not-zero dollars for an unpriced model, unknown-vs-measured-zero, the repo-by-trace join, and the wrong-container silent zero (see "Measured usage" above). No run over real canary data on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
 | Cycle-time analytics parity with ClickStack (`cycle-time-extract.sql`, #8665) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_cycle_time.rs` executes the extraction, the shared rollup and all eight CT queries verbatim over the SAME seven-envelope fixture as the ClickStack proof, and every CT1–CT8 answer matches exactly (see "Cycle-time analytics executed against the pinned engine" above); the `attributes_number`/`attributes_string` fallback and true-absence behavior are also proven. No run through SigNoz's own ingester on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
+| Host/token gauge queries (`queue-dwell.sql` #8856, `quota-utilization.sql` #9005, scope item 4) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_queue_quota_queries.rs` executes both committed files verbatim on ClickHouse 25.12.5 — the first proof in this trial to read `signoz_metrics.samples_v4` / `time_series_v4` at all — and observes the duplicate-hour-row `max()`/`sum()` split (with the naive join run as a counterfactual), measured-zero-is-not-starvation, NULL-not-zero for a missing companion metric and for an absent utilization source, the over-100% headroom clamp, `coverage = 'unknown'` for an exhausted-only provider, and query 5's span reads including the pre-#9673 cause-less-row fallback (see "The gauge queries executed against the pinned engine"). Every assertion was confirmed to break under a mutation of the committed SQL. No metric point went through SigNoz's own ingester or metric migrator — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525). `alerts/queue-starvation.json` remains vocabulary-guarded only |
 | UI view matrix for Loom's non-HTTP span kinds | **Answered for Service List/APM and Exceptions, via authenticated backend API probes rather than a browser** (see "UI view matrix" above) — Service List/APM populates (`loom-daemon`, correct call/error counts) because RED metrics come from unconditional root-span aggregation, not an HTTP convention; Exceptions stays empty because Loom never emits an OTel `exception` span event. Service Map returned empty and, since 2026-09-30, **is attributable** — see "Resolving the Service Map confound": every Loom span is `SPAN_KIND_INTERNAL` and every resource carries the one `service.name`, both at single unconditional exporter sites and both measured on the real wire payload, so none of the three preconditions for a topology edge can be met; the gateway's allowlist strips every peer key as a second layer. Adding a connector or a multi-service fixture cannot change the answer for Loom's data. Enforced by `signoz_topology_shape.rs` in ordinary CI. No screenshot has been captured on any session |
 
 Synthetic fixture success establishes transport/schema/query behavior, not a

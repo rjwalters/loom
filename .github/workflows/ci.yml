@@ -500,6 +500,15 @@ jobs:
       # by cycle_time_clickhouse.rs above.
       - name: Verify the SigNoz cycle-time extraction against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_cycle_time -- --ignored --nocapture
+      # #8528 / #8856 / #9005: the same technique for the trial's two METRIC-signal
+      # artifacts (queue-dwell.sql, quota-utilization.sql). signoz_trial_artifacts.rs
+      # already guards their metric/label vocabulary in ordinary CI; only this run
+      # shows that `max()` absorbs time_series_v4's duplicate per-hour rows while
+      # `sum()` doubles, that maxOrNullIf() answers NULL instead of a fully-idle 0
+      # for a provider with no utilization source, and that an over-100% reading
+      # clamps to zero headroom rather than negative.
+      - name: Verify the SigNoz queue/quota gauge queries against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_queue_quota_queries -- --ignored --nocapture
 
   backend-otlp-tests:
     name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})
