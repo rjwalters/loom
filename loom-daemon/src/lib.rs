@@ -177,6 +177,7 @@ pub mod fleet_captain;
 pub mod fleet_state;
 pub mod fleet_store;
 pub mod fleet_sync;
+pub mod footprint;
 pub mod foreign_load;
 pub mod forge_cached_list;
 pub mod forge_cached_view;

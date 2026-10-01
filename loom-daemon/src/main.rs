@@ -1072,6 +1072,14 @@ enum Commands {
         action: cli::context::ContextCommand,
     },
 
+    /// Classified issue footprints (#9784): `footprint build | show |
+    /// overlap`. Shadow-only evidence over the #9783 cache. Nested family;
+    /// args live in `cli::footprint`.
+    Footprint {
+        #[command(subcommand)]
+        action: cli::footprint::FootprintCommand,
+    },
+
     /// Lease the liveness of a `loom:building` claim (#8193). The args and
     /// their docs live in `cli::lease_ensure` because this file is frozen by
     /// the file-size ratchet.
@@ -2360,6 +2368,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::ScriptPorts(cmd) => cmd.run(),
         Commands::OverlapReplay { action } => action.run(),
         Commands::Context { action } => action.run(),
+        Commands::Footprint { action } => action.run(),
         Commands::Lease { action } => action.run(),
         Commands::Inflight { action } => action.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
