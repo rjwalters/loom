@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use loom_daemon::collision_evidence::OutcomeRecord;
 use loom_daemon::collision_shadow::{
-    capture, capture_id, write_tick_records, CandidateSnapshot, CandidateSnapshotTick,
+    capture, capture_id, evaluate, write_tick_records, CandidateSnapshot, CandidateSnapshotTick,
     StudyBudgets,
 };
 
@@ -83,7 +83,11 @@ pub(crate) enum CollisionShadowCommand {
 impl CollisionShadowCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
-            Self::Capture { snapshot, out, budgets } => {
+            Self::Capture {
+                snapshot,
+                out,
+                budgets,
+            } => {
                 let raw = std::fs::read_to_string(&snapshot)
                     .with_context(|| format!("reading {}", snapshot.display()))?;
                 let tick: CandidateSnapshotTick = serde_json::from_str(&raw)
@@ -102,19 +106,30 @@ impl CollisionShadowCommand {
                 if body.is_empty() {
                     body.push_str("{\"captured\":0}\n");
                 }
-                std::fs::write(&out, body)
-                    .with_context(|| format!("writing {}", out.display()))?;
+                std::fs::write(&out, body).with_context(|| format!("writing {}", out.display()))?;
                 println!("captured → {} (study_stopped={})", out.display(), budget.study_stopped);
                 Ok(())
             }
-            Self::CaptureLive { repo, out_dir, budgets } => {
-                run_capture_live(repo.as_deref(), &out_dir, budgets.as_deref())
-            }
-            Self::Evaluate { captures, outcomes, policies, budgets, out } => {
+            Self::CaptureLive {
+                repo,
+                out_dir,
+                budgets,
+            } => run_capture_live(repo.as_deref(), &out_dir, budgets.as_deref()),
+            Self::Evaluate {
+                captures,
+                outcomes,
+                policies,
+                budgets,
+                out,
+            } => {
                 let read_jsonl = |p: &PathBuf, what: &str| -> Result<Vec<String>> {
                     let raw = std::fs::read_to_string(p)
                         .with_context(|| format!("reading {} {}", what, p.display()))?;
-                    Ok(raw.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect())
+                    Ok(raw
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .map(str::to_string)
+                        .collect())
                 };
                 let capture_lines = read_jsonl(&captures, "captures")?;
                 let mut capture_records = Vec::new();
@@ -135,21 +150,13 @@ impl CollisionShadowCommand {
                 }
                 let policies: loom_daemon::collision_shadow::PolicyThresholds =
                     serde_json::from_str(&std::fs::read_to_string(&policies)?)?;
-                let budget: StudyBudgets = serde_json::from_str(&std::fs::read_to_string(&budgets)?)?;
+                let budget: StudyBudgets =
+                    serde_json::from_str(&std::fs::read_to_string(&budgets)?)?;
                 if capture_records.is_empty() {
                     bail!("no capture records to evaluate");
                 }
                 let thresholds = policies;
-                let report = evaluate(
-                    &capture_records,
-                    &outcome_records,
-                    &loom_daemon::collision_shadow::StudyBudgets {
-                        min_positives_for_verdict: budget.min_positives_for_verdict,
-                        max_flag_rate: budget.max_flag_rate,
-                        ..Default::default()
-                    },
-                    &thresholds,
-                );
+                let report = evaluate(&capture_records, &outcome_records, &budget, &thresholds);
                 std::fs::write(&out, serde_json::to_vec_pretty(&report)?)
                     .with_context(|| format!("writing {}", out.display()))?;
                 println!(

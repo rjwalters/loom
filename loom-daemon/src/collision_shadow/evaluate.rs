@@ -27,12 +27,9 @@ pub struct FrozenPolicies {
     pub max_flag_rate: f64,
 }
 
-/// Pre-registered budgets the report must be judged against.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct StudyBudgets {
-    pub min_positives_for_verdict: usize,
-    pub max_flag_rate: f64,
-}
+/// Pre-registered budgets the report must be judged against — the canonical
+/// type lives in the parent module (one `StudyBudgets`, not two).
+pub use super::StudyBudgets;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PolicyThresholds {
@@ -344,6 +341,7 @@ mod tests {
         let budgets = StudyBudgets {
             min_positives_for_verdict: 30,
             max_flag_rate: 0.9,
+            ..Default::default()
         };
         let policies = PolicyThresholds {
             curator: 0.3,
@@ -366,6 +364,7 @@ mod tests {
         let budgets = StudyBudgets {
             min_positives_for_verdict: 30,
             max_flag_rate: 0.5,
+            ..Default::default()
         };
         let policies = PolicyThresholds {
             curator: 0.3,
@@ -395,6 +394,7 @@ mod tests {
         let budgets = StudyBudgets {
             min_positives_for_verdict: 30,
             max_flag_rate: 0.1,
+            ..Default::default()
         };
         let policies = PolicyThresholds {
             curator: 0.3,

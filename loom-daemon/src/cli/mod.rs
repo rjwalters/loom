@@ -18,6 +18,7 @@ pub(crate) mod ci_telemetry_cli;
 pub(crate) mod cleanup_ops;
 pub(crate) mod codex_usage_cli;
 pub(crate) mod collision_evidence;
+pub(crate) mod collision_shadow;
 pub(crate) mod common;
 pub(crate) mod concierge;
 mod daemon_start;

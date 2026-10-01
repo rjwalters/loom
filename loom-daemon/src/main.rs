@@ -863,6 +863,12 @@ enum Commands {
         action: cli::collision_evidence::CollisionEvidenceCommand,
     },
 
+    /// `collision-shadow` (#9787) — see `cli::collision_shadow`.
+    CollisionShadow {
+        #[command(subcommand)]
+        action: cli::collision_shadow::CollisionShadowCommand,
+    },
+
     /// Native port of `loom-recover-orphans` (Issue #4272): detects `loom:building`
     /// issues with no live sweep tracking them and spawn-loop tasks with a
     /// stale heartbeat + dead PID, and (with `--recover`) resets them. Also
@@ -2362,6 +2368,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Lease { action } => action.run(),
         Commands::Inflight { action } => action.run(),
         Commands::CollisionEvidence { action } => action.run(),
+        Commands::CollisionShadow { action } => action.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {
             phase,
