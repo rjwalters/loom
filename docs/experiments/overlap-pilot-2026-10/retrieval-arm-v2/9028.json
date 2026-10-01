@@ -1,0 +1,370 @@
+{
+ "artifact_version": 1,
+ "issue": 9028,
+ "issue_content_hash": "118ef493ae326219c7b11768c783766ea2d8ffc8642d8e8b06a04cce093d256e",
+ "source_revision": "64a3258048cc7c72f834bef59866175161f1df5e",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9028-9014"
+ },
+ "retrieved_at": "2026-10-01T08:14:56.052917+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/telemetry/fixture.rs",
+    "intervals": [
+     {
+      "start": 110,
+      "end": 245
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/traces.rs",
+    "intervals": [
+     {
+      "start": 86,
+      "end": 107
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/lifecycle.rs",
+    "intervals": [
+     {
+      "start": 113,
+      "end": 696
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ci_telemetry/story.rs",
+    "intervals": [
+     {
+      "start": 413,
+      "end": 425
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/ops.rs",
+    "intervals": [
+     {
+      "start": 36,
+      "end": 54
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/trace/span.rs",
+    "intervals": [
+     {
+      "start": 105,
+      "end": 136
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/init/templates.rs",
+    "intervals": [
+     {
+      "start": 17,
+      "end": 38
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/mapping.rs",
+    "intervals": [
+     {
+      "start": 142,
+      "end": 159
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/self_update.rs",
+    "intervals": [
+     {
+      "start": 65,
+      "end": 139
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/worker_spawn/prompt.rs",
+    "intervals": [
+     {
+      "start": 21,
+      "end": 117
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/host.rs",
+    "intervals": [
+     {
+      "start": 14,
+      "end": 165
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/envelope.rs",
+    "intervals": [
+     {
+      "start": 4,
+      "end": 16
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/kinds.rs",
+    "intervals": [
+     {
+      "start": 27,
+      "end": 37
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".loom/config.json",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 47
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.loom/CLAUDE.md",
+    "intervals": [
+     {
+      "start": 368,
+      "end": 381
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/config.json",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 36
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/README.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 15
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/fixtures/otlp_transport/envelopes.jsonl",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 6
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/mapping/tests.rs",
+    "intervals": [
+     {
+      "start": 475,
+      "end": 495
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/tests/session_analysis.rs",
+    "intervals": [
+     {
+      "start": 41,
+      "end": 56
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/tests/session_summary.rs",
+    "intervals": [
+     {
+      "start": 50,
+      "end": 66
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/telemetry-overhead.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/tests.rs",
+    "intervals": [
+     {
+      "start": 172,
+      "end": 368
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/tests.rs",
+    "intervals": [
+     {
+      "start": 175,
+      "end": 194
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 101
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/tests/trace_transport.rs",
+    "intervals": [
+     {
+      "start": 139,
+      "end": 152
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/mod.rs",
+    "intervals": [
+     {
+      "start": 572,
+      "end": 583
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/trace/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 16
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/release_resolve/resolve.rs",
+    "intervals": [
+     {
+      "start": 539,
+      "end": 559
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/build.rs",
+    "intervals": [
+     {
+      "start": 163,
+      "end": 177
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/shell_budget.rs",
+    "intervals": [
+     {
+      "start": 478,
+      "end": 499
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/forge_cmd.rs",
+    "intervals": [
+     {
+      "start": 151,
+      "end": 166
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

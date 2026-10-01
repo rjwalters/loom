@@ -1,0 +1,260 @@
+{
+ "artifact_version": 1,
+ "issue": 9443,
+ "issue_content_hash": "f95a305cd5607beedcd6d44820fe9060316155cf7728092382ca0e873528f57b",
+ "source_revision": "c12dd5a604c1fa154fe0bc8363656f462dc6158c",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9318-9443"
+ },
+ "retrieved_at": "2026-10-01T08:03:17.060804+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/docs/telemetry-schema.md",
+    "intervals": [
+     {
+      "start": 447,
+      "end": 1585
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/claude_code_telemetry.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/tracing.md",
+    "intervals": [
+     {
+      "start": 113,
+      "end": 122
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal.rs",
+    "intervals": [
+     {
+      "start": 676,
+      "end": 1028
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/observability.md",
+    "intervals": [
+     {
+      "start": 580,
+      "end": 592
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/cycle_time_clickhouse.rs",
+    "intervals": [
+     {
+      "start": 427,
+      "end": 514
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/types.rs",
+    "intervals": [
+     {
+      "start": 867,
+      "end": 3306
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/runtime_usage/spans.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 111
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/phase_usage_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 285
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_outcome_summary.rs",
+    "intervals": [
+     {
+      "start": 479,
+      "end": 498
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/mapping/ci.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 123
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/sweep-facts/sweep-facts-queries.sql",
+    "intervals": [
+     {
+      "start": 40,
+      "end": 170
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/sweep-facts/issue-effort.sql",
+    "intervals": [
+     {
+      "start": 97,
+      "end": 115
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_outcome_summary/tests.rs",
+    "intervals": [
+     {
+      "start": 722,
+      "end": 739
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/tokens_status_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 75
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_outcomes.rs",
+    "intervals": [
+     {
+      "start": 92,
+      "end": 952
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/role_tick_telemetry/story/tests.rs",
+    "intervals": [
+     {
+      "start": 198,
+      "end": 212
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/role_tick_telemetry/usage_tests.rs",
+    "intervals": [
+     {
+      "start": 60,
+      "end": 76
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-token-cache-affinity.sh",
+    "intervals": [
+     {
+      "start": 183,
+      "end": 203
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/runtime_usage/phase_tests.rs",
+    "intervals": [
+     {
+      "start": 149,
+      "end": 167
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/mod.rs",
+    "intervals": [
+     {
+      "start": 384,
+      "end": 1226
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/runtime_usage.rs",
+    "intervals": [
+     {
+      "start": 38,
+      "end": 198
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

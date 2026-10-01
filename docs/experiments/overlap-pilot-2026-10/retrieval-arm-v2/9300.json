@@ -1,0 +1,227 @@
+{
+ "artifact_version": 1,
+ "issue": 9300,
+ "issue_content_hash": "96daebf7a0c0e48bc6331c5c8150a33753cfcca7280996890424294ee2ddc927",
+ "source_revision": "25f56c5a8e74d9ac979c807b1264bc0c0dcd97e0",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9288-9300"
+ },
+ "retrieved_at": "2026-10-01T08:17:39.180120+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/.claude/agents/loom-builder.md",
+    "intervals": [
+     {
+      "start": 10,
+      "end": 21
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion-pr-merge.md",
+    "intervals": [
+     {
+      "start": 200,
+      "end": 3210
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "docs/design/code-intel-lite.md",
+    "intervals": [
+     {
+      "start": 115,
+      "end": 124
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/agents/loom-doctor.md",
+    "intervals": [
+     {
+      "start": 10,
+      "end": 25
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/agents/loom-curator.md",
+    "intervals": [
+     {
+      "start": 10,
+      "end": 23
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion-held-pr-staleness.md",
+    "intervals": [
+     {
+      "start": 133,
+      "end": 145
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/agents/loom-champion.md",
+    "intervals": [
+     {
+      "start": 24,
+      "end": 31
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.agents/skills/loom-builder-pr/SKILL.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/curator.md",
+    "intervals": [
+     {
+      "start": 78,
+      "end": 2434
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion.md",
+    "intervals": [
+     {
+      "start": 8,
+      "end": 303
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion-issue-promo.md",
+    "intervals": [
+     {
+      "start": 18,
+      "end": 1455
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/judge.md",
+    "intervals": [
+     {
+      "start": 520,
+      "end": 1772
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/doctor.md",
+    "intervals": [
+     {
+      "start": 776,
+      "end": 784
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/builder-worktree.md",
+    "intervals": [
+     {
+      "start": 351,
+      "end": 381
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/generate-agent-skills.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.agents/skills/loom-doctor/SKILL.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.agents/skills/loom-champion/SKILL.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.agents/skills/loom-builder/SKILL.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.agents/skills/loom-curator/SKILL.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

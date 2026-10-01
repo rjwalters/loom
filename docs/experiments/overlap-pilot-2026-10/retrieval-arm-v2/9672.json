@@ -1,0 +1,139 @@
+{
+ "artifact_version": 1,
+ "issue": 9672,
+ "issue_content_hash": "8375d29252c98d6e9d52f5494dadfc1f3a43bcef087b6b417c868c081e64d236",
+ "source_revision": "cf8b6f076876b6f8f7bc13daaeacff94dffca026",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9672-9674"
+ },
+ "retrieved_at": "2026-10-01T08:11:43.666575+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/hard_exclusion.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 151
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/hard-exclusion-labels.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 39
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/builder.md",
+    "intervals": [
+     {
+      "start": 376,
+      "end": 387
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.github/labels.yml",
+    "intervals": [
+     {
+      "start": 313,
+      "end": 326
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".github/labels.yml",
+    "intervals": [
+     {
+      "start": 313,
+      "end": 326
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.agents/skills/loom-builder/SKILL.md",
+    "intervals": [
+     {
+      "start": 391,
+      "end": 402
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/disposition.rs",
+    "intervals": [
+     {
+      "start": 115,
+      "end": 564
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder.rs",
+    "intervals": [
+     {
+      "start": 437,
+      "end": 1915
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/telemetry-schema.md",
+    "intervals": [
+     {
+      "start": 1421,
+      "end": 1716
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-hard-exclusion-labels.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/decline_cooldown.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

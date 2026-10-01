@@ -1,0 +1,106 @@
+{
+ "artifact_version": 1,
+ "issue": 8872,
+ "issue_content_hash": "94342ec8414a697b334da819e874dc43c5e771545518fce9c0adc10cb87d244a",
+ "source_revision": "9addc80dbc4bff396e0686dc6e75befb428b8d80",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8872-8796"
+ },
+ "retrieved_at": "2026-10-01T08:08:37.898492+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-unstable-fallback.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 882
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/merge_pr_stale_checks_plan_gated.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 88
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/merge_pr/stale_checks/fetch.rs",
+    "intervals": [
+     {
+      "start": 14,
+      "end": 192
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/merge-pr.sh",
+    "intervals": [
+     {
+      "start": 527,
+      "end": 2572
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/merge_pr/stale_checks.rs",
+    "intervals": [
+     {
+      "start": 123,
+      "end": 138
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/lib/forge-helpers.sh",
+    "intervals": [
+     {
+      "start": 631,
+      "end": 2090
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-check-runs-404-fallback.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-stale-required-checks.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 132
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

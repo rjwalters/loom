@@ -1,0 +1,172 @@
+{
+ "artifact_version": 1,
+ "issue": 8845,
+ "issue_content_hash": "fd698c901cb1658686f8c68cd6ccebc156ffe702a157d090f1184d03ae91fca2",
+ "source_revision": "316f8f4d308d359f9eba8c6313b50aae93fab45f",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8845-8844"
+ },
+ "retrieved_at": "2026-10-01T08:02:02.617722+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/scripts/lib/forge-merge-method.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 65
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/scripts/merge-pr.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 2240
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/scripts/lib/forge-helpers.sh",
+    "intervals": [
+     {
+      "start": 313,
+      "end": 325
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "scripts/install/forge-detect.sh",
+    "intervals": [
+     {
+      "start": 190,
+      "end": 200
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/forge_cmd.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 1367
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion-pr-merge.md",
+    "intervals": [
+     {
+      "start": 2056,
+      "end": 3284
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".github/workflows/ci.yml",
+    "intervals": [
+     {
+      "start": 74,
+      "end": 1189
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".github/workflows/version-bump-on-merge.yml",
+    "intervals": [
+     {
+      "start": 41,
+      "end": 121
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/sweep-wave-lifecycle.md",
+    "intervals": [
+     {
+      "start": 625,
+      "end": 626
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-head-mismatch.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-forge-helpers.sh",
+    "intervals": [
+     {
+      "start": 501,
+      "end": 554
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/main.rs",
+    "intervals": [
+     {
+      "start": 1873,
+      "end": 1888
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/config_resolver.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 306
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

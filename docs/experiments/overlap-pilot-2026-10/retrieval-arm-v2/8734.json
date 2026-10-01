@@ -1,0 +1,161 @@
+{
+ "artifact_version": 1,
+ "issue": 8734,
+ "issue_content_hash": "49a04f76f0101a46a0ec70ba94f9178b8d27653229acd9a777446d8a3c4628e5",
+ "source_revision": "7a863cec37571ab8bc5061277c2560b38942fdc2",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8734-8656"
+ },
+ "retrieved_at": "2026-10-01T08:15:46.230008+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/init/post_init.rs",
+    "intervals": [
+     {
+      "start": 143,
+      "end": 345
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/land-resync-commit.sh",
+    "intervals": [
+     {
+      "start": 298,
+      "end": 318
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/stash_retirement.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 11
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/auditor.md",
+    "intervals": [
+     {
+      "start": 139,
+      "end": 295
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/init/credential_class_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 120
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "scripts/install-loom.sh",
+    "intervals": [
+     {
+      "start": 19,
+      "end": 1429
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "scripts/uninstall-loom.sh",
+    "intervals": [
+     {
+      "start": 33,
+      "end": 1999
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "install.sh",
+    "intervals": [
+     {
+      "start": 179,
+      "end": 1989
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/tokens_pool/check.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/cargo-test-daemon-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-nextest-daemon-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-cargo-test-daemon-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/credential_preflight.rs",
+    "intervals": [
+     {
+      "start": 1497,
+      "end": 1604
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

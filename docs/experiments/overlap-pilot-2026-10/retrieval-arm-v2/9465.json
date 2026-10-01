@@ -1,0 +1,293 @@
+{
+ "artifact_version": 1,
+ "issue": 9465,
+ "issue_content_hash": "0be26249aae7584b98d166cb8a7f6f59a21707ca06ace01ffcc0e18ae8229dab",
+ "source_revision": "9135761f61eb313dafbf8d3647d133ca0e5cc6e7",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9465-9445"
+ },
+ "retrieved_at": "2026-10-01T08:00:55.389685+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 1200
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/points_signal.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_outcomes.rs",
+    "intervals": [
+     {
+      "start": 430,
+      "end": 610
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/lineage.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/tokens_status_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 17
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/writeback.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/mod.rs",
+    "intervals": [
+     {
+      "start": 241,
+      "end": 251
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/builder-pr.md",
+    "intervals": [
+     {
+      "start": 637,
+      "end": 1007
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/builder.md",
+    "intervals": [
+     {
+      "start": 395,
+      "end": 1314
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/docs/telemetry-schema.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 1721
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/sweep_outcome_summary.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/tests.rs",
+    "intervals": [
+     {
+      "start": 12,
+      "end": 974
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-partial-increment.sh",
+    "intervals": [
+     {
+      "start": 529,
+      "end": 540
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-forge-helpers.sh",
+    "intervals": [
+     {
+      "start": 252,
+      "end": 261
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-dependency-parse.sh",
+    "intervals": [
+     {
+      "start": 246,
+      "end": 257
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/merge_pr/partial_reset/tests.rs",
+    "intervals": [
+     {
+      "start": 141,
+      "end": 171
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/timeline_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 363
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-guide-docs-telemetry.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/complexity_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/tests.rs",
+    "intervals": [
+     {
+      "start": 1034,
+      "end": 1052
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/disposition_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 11
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-label-freshness.sh",
+    "intervals": [
+     {
+      "start": 301,
+      "end": 310
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-notify-cleared-blockers.sh",
+    "intervals": [
+     {
+      "start": 409,
+      "end": 429
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-merge-method.sh",
+    "intervals": [
+     {
+      "start": 50,
+      "end": 69
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-help.sh",
+    "intervals": [
+     {
+      "start": 80,
+      "end": 80
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

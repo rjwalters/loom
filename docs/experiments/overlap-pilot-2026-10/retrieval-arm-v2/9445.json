@@ -1,0 +1,304 @@
+{
+ "artifact_version": 1,
+ "issue": 9445,
+ "issue_content_hash": "984aaaea6068ad9f62cdcb7c6225e52b5016aaf35d1413b18fecd6b3ee3a309a",
+ "source_revision": "9135761f61eb313dafbf8d3647d133ca0e5cc6e7",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9465-9445"
+ },
+ "retrieved_at": "2026-10-01T08:01:07.638857+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/observability/claude_code_telemetry.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "CLAUDE.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 54
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/sweep-summary-output.md",
+    "intervals": [
+     {
+      "start": 69,
+      "end": 81
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".github/workflows/loom-guide.yml",
+    "intervals": [
+     {
+      "start": 23,
+      "end": 46
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota/claude.rs",
+    "intervals": [
+     {
+      "start": 151,
+      "end": 182
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.loom/CLAUDE.md",
+    "intervals": [
+     {
+      "start": 70,
+      "end": 86
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".claude/README.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 229
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/README.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 15
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".loom/runtimes/claude.json",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/guardrail-parity-codex.md",
+    "intervals": [
+     {
+      "start": 876,
+      "end": 886
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/session_summary.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 109
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/mapping.rs",
+    "intervals": [
+     {
+      "start": 238,
+      "end": 328
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/activity/session_summary.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 307
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/mapping/ci.rs",
+    "intervals": [
+     {
+      "start": 82,
+      "end": 101
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "README.md",
+    "intervals": [
+     {
+      "start": 242,
+      "end": 266
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "docs/design/architect-hermit-cadence.md",
+    "intervals": [
+     {
+      "start": 107,
+      "end": 134
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/tracing.rs",
+    "intervals": [
+     {
+      "start": 55,
+      "end": 68
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/trace/context.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 83
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/lifecycle.rs",
+    "intervals": [
+     {
+      "start": 733,
+      "end": 761
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".github/workflows/loom-judge.yml",
+    "intervals": [
+     {
+      "start": 24,
+      "end": 47
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "docs/guides/getting-started.md",
+    "intervals": [
+     {
+      "start": 589,
+      "end": 612
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/mapping/metadata.rs",
+    "intervals": [
+     {
+      "start": 49,
+      "end": 209
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/runtime_usage.rs",
+    "intervals": [
+     {
+      "start": 119,
+      "end": 286
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".loom/hooks/methodology-inject.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/telemetry-schema.md",
+    "intervals": [
+     {
+      "start": 1634,
+      "end": 1644
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/trace/store.rs",
+    "intervals": [
+     {
+      "start": 137,
+      "end": 139
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

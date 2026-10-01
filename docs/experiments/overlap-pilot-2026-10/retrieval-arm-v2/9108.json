@@ -1,0 +1,271 @@
+{
+ "artifact_version": 1,
+ "issue": 9108,
+ "issue_content_hash": "0bf084063ff3f62e47b00b67764beffae850061939248f4a059e654703888500",
+ "source_revision": "7cdbe65bb67c71d3e21d7d4fe66fea37a240687f",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9108-9440"
+ },
+ "retrieved_at": "2026-10-01T07:59:46.488659+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/.loom/AGENTS.md",
+    "intervals": [
+     {
+      "start": 148,
+      "end": 157
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/hooks/guard-loom-workflow.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 1785
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/hooks/guard-destructive.sh",
+    "intervals": [
+     {
+      "start": 69,
+      "end": 80
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/guardrail-parity-native.md",
+    "intervals": [
+     {
+      "start": 223,
+      "end": 232
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/guard-hooks.md",
+    "intervals": [
+     {
+      "start": 1123,
+      "end": 1130
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/scripts/generate-agents-md.sh",
+    "intervals": [
+     {
+      "start": 147,
+      "end": 156
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/native_tools/mcp.rs",
+    "intervals": [
+     {
+      "start": 42,
+      "end": 58
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/guardrail-parity-codex.md",
+    "intervals": [
+     {
+      "start": 83,
+      "end": 94
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/hooks/guard-codex-bridge.sh",
+    "intervals": [
+     {
+      "start": 123,
+      "end": 379
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".loom/hooks/guard-loom-workflow.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".claude/settings.json",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 151
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/hooks/hook-wiring.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 263
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "scripts/check-guard-scan-contracts.sh",
+    "intervals": [
+     {
+      "start": 239,
+      "end": 604
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/hooks/guard-readonly-dirs.sh.template",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 24
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/hooks/guard-background-subagents.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/hooks/tests/test-guard-background-subagents.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/cargo-test-daemon-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-cargo-test-daemon-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/hooks/guard-worktree-paths.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 16
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/settings.json",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 74
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": ".loom/config.json",
+    "intervals": [
+     {
+      "start": 107,
+      "end": 146
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".loom/hooks/guard-destructive.sh",
+    "intervals": [
+     {
+      "start": 69,
+      "end": 80
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/hooks/tests/test-guard-worktree-paths.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 258
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

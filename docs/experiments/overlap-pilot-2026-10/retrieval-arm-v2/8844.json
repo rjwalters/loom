@@ -1,0 +1,117 @@
+{
+ "artifact_version": 1,
+ "issue": 8844,
+ "issue_content_hash": "7a9757e61f8ac79f9d42fbf1ffcc08f476334591d7bcf4448659437cc5da3f6e",
+ "source_revision": "316f8f4d308d359f9eba8c6313b50aae93fab45f",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8845-8844"
+ },
+ "retrieved_at": "2026-10-01T08:02:15.042342+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/tests/merge_pr_stale_checks_plan_gated.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 201
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/merge_pr/stale_checks/fetch.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 192
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/merge_pr_stale_checks.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 164
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/merge_pr/stale_checks.rs",
+    "intervals": [
+     {
+      "start": 24,
+      "end": 209
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/merge-pr.sh",
+    "intervals": [
+     {
+      "start": 116,
+      "end": 2094
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-stale-required-checks.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 268
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-label-freshness.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 289
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh",
+    "intervals": [
+     {
+      "start": 13,
+      "end": 23
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/main.rs",
+    "intervals": [
+     {
+      "start": 326,
+      "end": 2732
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

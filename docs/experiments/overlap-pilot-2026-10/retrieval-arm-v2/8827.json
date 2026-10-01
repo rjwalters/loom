@@ -1,0 +1,106 @@
+{
+ "artifact_version": 1,
+ "issue": 8827,
+ "issue_content_hash": "011748bec8811bc827c8bee112d1b7de2ceae99d3d5dc1cd1bd3f963464becca",
+ "source_revision": "f91fe213ebddf0f167c4264f48d98bb4f265c91c",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8824-8827"
+ },
+ "retrieved_at": "2026-10-01T08:16:43.056538+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/docs/ci-observability.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 172
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/ci-integration.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "docs/philosophy/loom-intelligence.md",
+    "intervals": [
+     {
+      "start": 50,
+      "end": 55
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".github/workflows/hosted-build-gate.yml",
+    "intervals": [
+     {
+      "start": 71,
+      "end": 94
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "CLAUDE.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 189
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/ci-principles.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 91
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/observability.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 543
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".github/workflows/ci.yml",
+    "intervals": [
+     {
+      "start": 180,
+      "end": 216
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

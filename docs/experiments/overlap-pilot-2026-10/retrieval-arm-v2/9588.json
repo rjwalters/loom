@@ -1,0 +1,95 @@
+{
+ "artifact_version": 1,
+ "issue": 9588,
+ "issue_content_hash": "3d336743d2f1d80bd452790742030fac98f0e341533aa45ca6ef15baca06ebb1",
+ "source_revision": "c598c1ace24ae4c489e5635ba7d02adb79f48ddb",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9588-9605"
+ },
+ "retrieved_at": "2026-10-01T08:13:57.301505+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/auto_update/drain_trigger.rs",
+    "intervals": [
+     {
+      "start": 17,
+      "end": 136
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/auto_update/roll_stall.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 112
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ipc/drain_roll.rs",
+    "intervals": [
+     {
+      "start": 24,
+      "end": 258
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ipc.rs",
+    "intervals": [
+     {
+      "start": 264,
+      "end": 1860
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/watchdog/mod.rs",
+    "intervals": [
+     {
+      "start": 83,
+      "end": 999
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/fleet/drain.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 859
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/autonomy_marker.rs",
+    "intervals": [
+     {
+      "start": 39,
+      "end": 261
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

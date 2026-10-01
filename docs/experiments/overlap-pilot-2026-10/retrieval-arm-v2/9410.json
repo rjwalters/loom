@@ -1,0 +1,84 @@
+{
+ "artifact_version": 1,
+ "issue": 9410,
+ "issue_content_hash": "d1b0f6c66bf6948af26e9d9e958de9929c417f7711b555b7aaa305b2c1c99a1a",
+ "source_revision": "4a10f5a1d0e2da63599f3d764bd84cb8ff8b7a7c",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9321-9410"
+ },
+ "retrieved_at": "2026-10-01T08:04:19.657013+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/work_finder/build_backoff.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 291
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/work_finder.rs",
+    "intervals": [
+     {
+      "start": 1422,
+      "end": 3200
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/build_backoff_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 235
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/types/ready_queue.rs",
+    "intervals": [
+     {
+      "start": 14,
+      "end": 343
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/tick_report.rs",
+    "intervals": [
+     {
+      "start": 251,
+      "end": 348
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/tests/build_backoff.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 165
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   }
+  ]
+ }
+}

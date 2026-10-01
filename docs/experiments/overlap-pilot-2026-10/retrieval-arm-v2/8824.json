@@ -1,0 +1,172 @@
+{
+ "artifact_version": 1,
+ "issue": 8824,
+ "issue_content_hash": "502f8951dbf69e98bf10e788bb940da3dacaf0d7348f86bf38c2b1d82f17e897",
+ "source_revision": "f91fe213ebddf0f167c4264f48d98bb4f265c91c",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8824-8827"
+ },
+ "retrieved_at": "2026-10-01T08:16:32.622965+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/docs/ci-observability.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 163
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "docs/philosophy/loom-intelligence.md",
+    "intervals": [
+     {
+      "start": 50,
+      "end": 55
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/ci-integration.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".github/workflows/ci.yml",
+    "intervals": [
+     {
+      "start": 180,
+      "end": 1623
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/main_health_gate.rs",
+    "intervals": [
+     {
+      "start": 1266,
+      "end": 1345
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/config_resolver.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 238
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/forge_cached_list.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 118
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/mapping.rs",
+    "intervals": [
+     {
+      "start": 160,
+      "end": 747
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/main.rs",
+    "intervals": [
+     {
+      "start": 55,
+      "end": 2576
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".github/workflows/hosted-build-gate.yml",
+    "intervals": [
+     {
+      "start": 79,
+      "end": 94
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/telemetry_live.rs",
+    "intervals": [
+     {
+      "start": 119,
+      "end": 144
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/collector/config.yaml",
+    "intervals": [
+     {
+      "start": 132,
+      "end": 190
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/cli/telemetry.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 53
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "CLAUDE.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 17
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

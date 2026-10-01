@@ -1,0 +1,128 @@
+{
+ "artifact_version": 1,
+ "issue": 8656,
+ "issue_content_hash": "a2fbb16e5e063ac1675ac2a119d31fee14e6089407e0f0eff252f01302583a20",
+ "source_revision": "7a863cec37571ab8bc5061277c2560b38942fdc2",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8734-8656"
+ },
+ "retrieved_at": "2026-10-01T08:15:57.823102+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/scripts/verify-proposal-refs.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 274
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/hermit.md",
+    "intervals": [
+     {
+      "start": 352,
+      "end": 358
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-verify-proposal-refs.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 291
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/architect.md",
+    "intervals": [
+     {
+      "start": 246,
+      "end": 254
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/git_blob_lines.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 399
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "scripts/check-docs-defaults-parity.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 54
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion-reference.md",
+    "intervals": [
+     {
+      "start": 104,
+      "end": 114
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion-premise-false-evidence.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 65
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/script_ports.rs",
+    "intervals": [
+     {
+      "start": 143,
+      "end": 153
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/judge-reference.md",
+    "intervals": [
+     {
+      "start": 70,
+      "end": 147
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

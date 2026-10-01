@@ -1,0 +1,139 @@
+{
+ "artifact_version": 1,
+ "issue": 9683,
+ "issue_content_hash": "6a7fa2cb33785ba985eed5d711764973d0b9ab86260bda4d16f1008c8383b4fa",
+ "source_revision": "8f8f746a846ea5f74b38fffc7be7588031149fe5",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9683-9685"
+ },
+ "retrieved_at": "2026-10-01T08:09:41.549085+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/.claude/commands/loom/auditor.md",
+    "intervals": [
+     {
+      "start": 20,
+      "end": 810
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/activity/tuning.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 18
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "docs/design/architect-hermit-cadence.md",
+    "intervals": [
+     {
+      "start": 50,
+      "end": 134
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/agents/loom-auditor.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 18
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/types.rs",
+    "intervals": [
+     {
+      "start": 17,
+      "end": 3213
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/config_resolver.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 245
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/traces.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 59
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/traces/tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 19
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/mapping.rs",
+    "intervals": [
+     {
+      "start": 246,
+      "end": 351
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/worker_spawn.rs",
+    "intervals": [
+     {
+      "start": 225,
+      "end": 973
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/worker_spawn_api_keys.rs",
+    "intervals": [
+     {
+      "start": 361,
+      "end": 378
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

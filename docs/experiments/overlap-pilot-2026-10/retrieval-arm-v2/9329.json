@@ -1,0 +1,194 @@
+{
+ "artifact_version": 1,
+ "issue": 9329,
+ "issue_content_hash": "4e3eaeaa65dbbf9b4727d627e344fe9abdb8e9aaef46b5243d7319ef15709eca",
+ "source_revision": "ee4f416fabb012928e370dabb9e744746ea28d3c",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9329-9301"
+ },
+ "retrieved_at": "2026-10-01T07:55:35.355214+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/docs/eta.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 318
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/agents/loom-curator.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 20
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/eta.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 35
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".loom/docs/survey-orca-2026-07-31.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 10
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/curator.md",
+    "intervals": [
+     {
+      "start": 429,
+      "end": 2145
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "docs/philosophy/loom-intelligence.md",
+    "intervals": [
+     {
+      "start": 50,
+      "end": 55
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/eta/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 16
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/builder.md",
+    "intervals": [
+     {
+      "start": 138,
+      "end": 147
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/kinds.rs",
+    "intervals": [
+     {
+      "start": 132,
+      "end": 297
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/queue_snapshot.rs",
+    "intervals": [
+     {
+      "start": 13,
+      "end": 236
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/collector.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 919
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/telemetry-schema.md",
+    "intervals": [
+     {
+      "start": 1839,
+      "end": 1849
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/kinds/eta.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 105
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-curator-rightsizing.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.agents/skills/loom-curator/SKILL.md",
+    "intervals": [
+     {
+      "start": 591,
+      "end": 606
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/queue_snapshot.rs",
+    "intervals": [
+     {
+      "start": 30,
+      "end": 116
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

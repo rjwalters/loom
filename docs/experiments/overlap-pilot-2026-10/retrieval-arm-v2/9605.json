@@ -1,0 +1,194 @@
+{
+ "artifact_version": 1,
+ "issue": 9605,
+ "issue_content_hash": "e7b123f3034617851bc6e11b57eb8b1a67034000f1a1dbe9fa477b4bebe7a22c",
+ "source_revision": "c598c1ace24ae4c489e5635ba7d02adb79f48ddb",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9588-9605"
+ },
+ "retrieved_at": "2026-10-01T08:14:09.279654+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/sweep_registry/quarantine_escalation.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 160
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/quarantine.rs",
+    "intervals": [
+     {
+      "start": 41,
+      "end": 2105
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/quarantine_release.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/quarantine.rs",
+    "intervals": [
+     {
+      "start": 65,
+      "end": 134
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/reaper.rs",
+    "intervals": [
+     {
+      "start": 966,
+      "end": 1021
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/ready_queue_cmd.rs",
+    "intervals": [
+     {
+      "start": 39,
+      "end": 60
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/quarantine_release_retry_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 11
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/quarantine_escalation_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 180
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/health/tests.rs",
+    "intervals": [
+     {
+      "start": 471,
+      "end": 490
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-check-promotion-landed.sh",
+    "intervals": [
+     {
+      "start": 597,
+      "end": 606
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/worktree_cli/reset/tests.rs",
+    "intervals": [
+     {
+      "start": 171,
+      "end": 187
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/main_health_gate/tests.rs",
+    "intervals": [
+     {
+      "start": 644,
+      "end": 2897
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/worktree_cli/cleanup/tests.rs",
+    "intervals": [
+     {
+      "start": 37,
+      "end": 62
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/tokens_pool/session_lifecycle_tests.rs",
+    "intervals": [
+     {
+      "start": 745,
+      "end": 758
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/worktree_ops/clean/tests.rs",
+    "intervals": [
+     {
+      "start": 1677,
+      "end": 2129
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-loom-daemon-watchdog.sh",
+    "intervals": [
+     {
+      "start": 2087,
+      "end": 2091
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

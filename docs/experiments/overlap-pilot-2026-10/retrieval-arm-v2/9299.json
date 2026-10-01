@@ -1,0 +1,117 @@
+{
+ "artifact_version": 1,
+ "issue": 9299,
+ "issue_content_hash": "4f283ca0c6fa44a2d3b413e9daa29162c0673e2dd7abd915ce8432a5f074638d",
+ "source_revision": "39dbd602fcfab8bd0f05ee374fe62eb0f67d3089",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9289-9299"
+ },
+ "retrieved_at": "2026-10-01T08:12:58.033493+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/work_finder/operator_priority.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 214
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/ordering.rs",
+    "intervals": [
+     {
+      "start": 10,
+      "end": 80
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/forge.rs",
+    "intervals": [
+     {
+      "start": 80,
+      "end": 136
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/tests/operator_priority.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 412
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/pr_latency/mod.rs",
+    "intervals": [
+     {
+      "start": 28,
+      "end": 181
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder.rs",
+    "intervals": [
+     {
+      "start": 262,
+      "end": 1886
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/tests/ordering.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 83
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/ready_queue.rs",
+    "intervals": [
+     {
+      "start": 41,
+      "end": 230
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/stage_dwell.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 15
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

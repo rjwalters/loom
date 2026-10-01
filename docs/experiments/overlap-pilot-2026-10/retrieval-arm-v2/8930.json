@@ -1,0 +1,194 @@
+{
+ "artifact_version": 1,
+ "issue": 8930,
+ "issue_content_hash": "dbfa9b81e3b59a31abdc7f77b40ffc2b4b64501b3ea317587a684feae51a30ba",
+ "source_revision": "65ebb7eadfc7f8e687f0bf94815387728d156613",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8900-8930"
+ },
+ "retrieved_at": "2026-10-01T07:58:55.536320+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/observability/ops/quota/burn.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 227
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/collector/config.yaml",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 35
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota/opencode.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 45
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/signoz/retention.sql",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 11
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota/claude.rs",
+    "intervals": [
+     {
+      "start": 12,
+      "end": 30
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/signoz/evidence.md",
+    "intervals": [
+     {
+      "start": 546,
+      "end": 556
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota/codex.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 118
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota/kimi.rs",
+    "intervals": [
+     {
+      "start": 59,
+      "end": 155
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota/tail.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 115
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota/burn_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 32
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/host.rs",
+    "intervals": [
+     {
+      "start": 166,
+      "end": 176
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota.rs",
+    "intervals": [
+     {
+      "start": 208,
+      "end": 229
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota/codex_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 18
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota/claude_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 17
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota/opencode_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 22
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota/kimi_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 144
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

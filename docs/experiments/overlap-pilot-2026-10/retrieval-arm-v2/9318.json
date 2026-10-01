@@ -1,0 +1,128 @@
+{
+ "artifact_version": 1,
+ "issue": 9318,
+ "issue_content_hash": "a630a41d4513dc8674ebedbfca7585d50962edaea55ae47490ac551aed829727",
+ "source_revision": "c12dd5a604c1fa154fe0bc8363656f462dc6158c",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9318-9443"
+ },
+ "retrieved_at": "2026-10-01T08:03:06.429899+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/work_finder/dispatch_plan.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 194
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/dispatch_plan_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 226
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/dispatch-plan.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 131
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/dispatch_plan_merge.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 28
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/types/dispatch_plan.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 166
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/dispatcher-repo-sharding.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 9
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/src/queueState.ts",
+    "intervals": [
+     {
+      "start": 175,
+      "end": 377
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/queue_snapshot.rs",
+    "intervals": [
+     {
+      "start": 52,
+      "end": 151
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/ready_queue_tests.rs",
+    "intervals": [
+     {
+      "start": 353,
+      "end": 447
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/dispatch_plan_merge_tests.rs",
+    "intervals": [
+     {
+      "start": 115,
+      "end": 144
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

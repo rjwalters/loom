@@ -1,0 +1,227 @@
+{
+ "artifact_version": 1,
+ "issue": 9440,
+ "issue_content_hash": "fefc5804b5d8a870d8ee32f51c9f30d4d1670841229263243c8ce6f9eecc9a84",
+ "source_revision": "7cdbe65bb67c71d3e21d7d4fe66fea37a240687f",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9108-9440"
+ },
+ "retrieved_at": "2026-10-01T07:59:59.667038+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/observability/claude_code_telemetry.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.loom/CLAUDE.md",
+    "intervals": [
+     {
+      "start": 325,
+      "end": 338
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/loom.md",
+    "intervals": [
+     {
+      "start": 253,
+      "end": 263
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/tokens.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/tokens_pool/monitor.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/token-pool.md",
+    "intervals": [
+     {
+      "start": 364,
+      "end": 374
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal.rs",
+    "intervals": [
+     {
+      "start": 409,
+      "end": 942
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/telemetry-schema.md",
+    "intervals": [
+     {
+      "start": 501,
+      "end": 505
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.agents/skills/loom-loom/SKILL.md",
+    "intervals": [
+     {
+      "start": 268,
+      "end": 278
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/sweep-backend-detection.md",
+    "intervals": [
+     {
+      "start": 122,
+      "end": 123
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/tracing.md",
+    "intervals": [
+     {
+      "start": 113,
+      "end": 122
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/sweep-summary-output.md",
+    "intervals": [
+     {
+      "start": 52,
+      "end": 56
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_outcomes.rs",
+    "intervals": [
+     {
+      "start": 13,
+      "end": 1174
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/transcript_tokens.rs",
+    "intervals": [
+     {
+      "start": 262,
+      "end": 505
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/mod.rs",
+    "intervals": [
+     {
+      "start": 16,
+      "end": 1487
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_outcome_summary.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 498
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/types.rs",
+    "intervals": [
+     {
+      "start": 848,
+      "end": 3290
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/tests.rs",
+    "intervals": [
+     {
+      "start": 522,
+      "end": 538
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/usage_source.rs",
+    "intervals": [
+     {
+      "start": 232,
+      "end": 396
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

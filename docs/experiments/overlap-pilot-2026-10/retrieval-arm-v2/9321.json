@@ -1,0 +1,194 @@
+{
+ "artifact_version": 1,
+ "issue": 9321,
+ "issue_content_hash": "f8c1f0ef6ab5f7a0102da77b11af0fbb33910c7811f7ffc7733f5fcf0e33cd82",
+ "source_revision": "4a10f5a1d0e2da63599f3d764bd84cb8ff8b7a7c",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9321-9410"
+ },
+ "retrieved_at": "2026-10-01T08:04:07.327456+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/star_liveness/escalate.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 121
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/operator_priority.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 101
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion-pr-merge.md",
+    "intervals": [
+     {
+      "start": 3200,
+      "end": 3210
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "docs/adr/0020-fleet-metered-spend-ceiling.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 19
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/merge-pr-exit-code-exceptions.md",
+    "intervals": [
+     {
+      "start": 158,
+      "end": 168
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/star_liveness/mod.rs",
+    "intervals": [
+     {
+      "start": 13,
+      "end": 21
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.loom/AGENTS.md",
+    "intervals": [
+     {
+      "start": 80,
+      "end": 95
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/issue-filing-lock.md",
+    "intervals": [
+     {
+      "start": 40,
+      "end": 56
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/event_bus.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 87
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/safehouse.rs",
+    "intervals": [
+     {
+      "start": 1206,
+      "end": 3568
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/star_liveness/task.rs",
+    "intervals": [
+     {
+      "start": 137,
+      "end": 492
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/ordering.rs",
+    "intervals": [
+     {
+      "start": 24,
+      "end": 36
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/types/star_liveness.rs",
+    "intervals": [
+     {
+      "start": 71,
+      "end": 224
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion-epic-guard-invariants.md",
+    "intervals": [
+     {
+      "start": 70,
+      "end": 78
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/watchdog/escalate.rs",
+    "intervals": [
+     {
+      "start": 16,
+      "end": 38
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/safehouse.md",
+    "intervals": [
+     {
+      "start": 192,
+      "end": 484
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   }
+  ]
+ }
+}

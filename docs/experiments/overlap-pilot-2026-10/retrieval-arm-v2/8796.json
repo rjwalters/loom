@@ -1,0 +1,117 @@
+{
+ "artifact_version": 1,
+ "issue": 8796,
+ "issue_content_hash": "676ee53c21c982ff8e8985104c680f94e093c7a815d3700267a0c8f8c104b15f",
+ "source_revision": "9addc80dbc4bff396e0686dc6e75befb428b8d80",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8872-8796"
+ },
+ "retrieved_at": "2026-10-01T08:08:49.285177+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-partial-increment.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 839
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion-pr-merge.md",
+    "intervals": [
+     {
+      "start": 200,
+      "end": 3001
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/verdict-staleness-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 25
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/builder-pr.md",
+    "intervals": [
+     {
+      "start": 288,
+      "end": 995
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/scripts/merge-pr.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 3523
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/judge.md",
+    "intervals": [
+     {
+      "start": 2133,
+      "end": 2142
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-verdict-label-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-verdict-staleness-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-dirty-worktree-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

@@ -1,0 +1,216 @@
+{
+ "artifact_version": 1,
+ "issue": 9432,
+ "issue_content_hash": "7a3506eeafef84016ead2d16d73fbdc46bcc6765f0a9c816e2a73e4914230a91",
+ "source_revision": "3c1062871ff2f2276f99c56dea3876888d44719c",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9433-9432"
+ },
+ "retrieved_at": "2026-10-01T07:57:54.684113+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/story_points.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 274
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/points_signal.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 44
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/mod.rs",
+    "intervals": [
+     {
+      "start": 514,
+      "end": 900
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/dispatch.rs",
+    "intervals": [
+     {
+      "start": 1474,
+      "end": 2848
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/tests/story_points.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 111
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "docs/philosophy/loom-intelligence.md",
+    "intervals": [
+     {
+      "start": 32,
+      "end": 39
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/story-points-queries.sql",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/story-points.md",
+    "intervals": [
+     {
+      "start": 31,
+      "end": 45
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_outcomes.rs",
+    "intervals": [
+     {
+      "start": 925,
+      "end": 952
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal.rs",
+    "intervals": [
+     {
+      "start": 871,
+      "end": 1071
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/sweep-facts/sweep-facts-extract-clickstack.sql",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 50
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/telemetry-schema.md",
+    "intervals": [
+     {
+      "start": 267,
+      "end": 1799
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/outcome_journal/complexity_signal.rs",
+    "intervals": [
+     {
+      "start": 142,
+      "end": 160
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/collector/story_points_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/sweep_md_stage_minus_one_doc_lint.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/mapping/tests.rs",
+    "intervals": [
+     {
+      "start": 836,
+      "end": 855
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/sweep_md_doc_lint.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 15
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/points_marker.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

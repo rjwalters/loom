@@ -1,0 +1,227 @@
+{
+ "artifact_version": 1,
+ "issue": 9301,
+ "issue_content_hash": "2804027050d19f34d61b2c682b24822699f3bfcfc43711fd73b3b6fce5b91f36",
+ "source_revision": "ee4f416fabb012928e370dabb9e744746ea28d3c",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9329-9301"
+ },
+ "retrieved_at": "2026-10-01T07:55:46.460320+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/star_liveness/intents.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 23
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/star_liveness/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 112
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/star_liveness/inherit.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/types/star_liveness.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/operator_priority.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/star_liveness/landing.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 16
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/star_liveness/escalate.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 83
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "docs/workflows.md",
+    "intervals": [
+     {
+      "start": 36,
+      "end": 59
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/exporter.rs",
+    "intervals": [
+     {
+      "start": 101,
+      "end": 799
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/mod.rs",
+    "intervals": [
+     {
+      "start": 445,
+      "end": 988
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/reaper/no_progress.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 90
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/ready_queue_cmd.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 132
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/star_liveness/tests/intents_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 22
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/star_liveness/tests/replay.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/star_liveness/tests/notice_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/star_liveness/tests/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 18
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/health/operator_attention.rs",
+    "intervals": [
+     {
+      "start": 426,
+      "end": 453
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/star_liveness/tests/review_fix_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/star_liveness/progress.rs",
+    "intervals": [
+     {
+      "start": 171,
+      "end": 187
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

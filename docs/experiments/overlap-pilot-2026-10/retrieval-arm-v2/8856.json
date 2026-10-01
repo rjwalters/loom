@@ -1,0 +1,370 @@
+{
+ "artifact_version": 1,
+ "issue": 8856,
+ "issue_content_hash": "b8ce77a4a1f2d843b4861a93f851d5daeeb8e6cc2ae15836e2ad00d0d0d0f5e9",
+ "source_revision": "76584c4b96f19ec5959fca63bc87ac2f38915fd1",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8856-8835"
+ },
+ "retrieved_at": "2026-10-01T08:06:49.796377+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/observability/otlp/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 11
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 145
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/quota.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 437
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/collector.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 607
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/ci-observability.md",
+    "intervals": [
+     {
+      "start": 47,
+      "end": 63
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 1101
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/README.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 10
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/queue.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 11
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/queue.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/role_runner.rs",
+    "intervals": [
+     {
+      "start": 1897,
+      "end": 3219
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder.rs",
+    "intervals": [
+     {
+      "start": 1190,
+      "end": 3068
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/admission_brake.rs",
+    "intervals": [
+     {
+      "start": 39,
+      "end": 454
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/clickstack/cycle-time-extract.sql",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/overhead.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/collector/README.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/dispatch.rs",
+    "intervals": [
+     {
+      "start": 16,
+      "end": 139
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/lifecycle.rs",
+    "intervals": [
+     {
+      "start": 130,
+      "end": 651
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/cycle_time_clickhouse.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/cycle_time_artifacts.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 10
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/collector/admission_brake_tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 229
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 15
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/clickstack/README.md",
+    "intervals": [
+     {
+      "start": 148,
+      "end": 157
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/tests.rs",
+    "intervals": [
+     {
+      "start": 268,
+      "end": 308
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/clickstack_trial_canary.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 33
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/abnormal_terminations.rs",
+    "intervals": [
+     {
+      "start": 14,
+      "end": 33
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/cycle-time-questions.md",
+    "intervals": [
+     {
+      "start": 99,
+      "end": 104
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/idle_exit.rs",
+    "intervals": [
+     {
+      "start": 118,
+      "end": 440
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/runtime_admission.rs",
+    "intervals": [
+     {
+      "start": 96,
+      "end": 488
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/status_budget.rs",
+    "intervals": [
+     {
+      "start": 159,
+      "end": 175
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/mod.rs",
+    "intervals": [
+     {
+      "start": 1003,
+      "end": 1015
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/ops.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 197
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/trace/span.rs",
+    "intervals": [
+     {
+      "start": 7,
+      "end": 119
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

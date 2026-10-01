@@ -1,0 +1,216 @@
+{
+ "artifact_version": 1,
+ "issue": 8697,
+ "issue_content_hash": "10286d5eb147f65d2a218620faa518821e0a26a87d7189b208c7f8089e6f9de3",
+ "source_revision": "9ced32146a07084ba09945fec38312300f0b3e76",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8697-8712"
+ },
+ "retrieved_at": "2026-10-01T08:10:35.853878+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/worker_spawn/egress_proxy/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 310
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/spawn-claude.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 1292
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/containment_signal.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/README.md",
+    "intervals": [
+     {
+      "start": 219,
+      "end": 266
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/guardrail-parity-native.md",
+    "intervals": [
+     {
+      "start": 324,
+      "end": 332
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/worker_spawn/profiles.rs",
+    "intervals": [
+     {
+      "start": 53,
+      "end": 65
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/loom.md",
+    "intervals": [
+     {
+      "start": 253,
+      "end": 263
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".claude/README.md",
+    "intervals": [
+     {
+      "start": 219,
+      "end": 229
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/worker_spawn/mod.rs",
+    "intervals": [
+     {
+      "start": 326,
+      "end": 343
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/main.rs",
+    "intervals": [
+     {
+      "start": 44,
+      "end": 2554
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/scripts/tests/test-spawn-claude.sh",
+    "intervals": [
+     {
+      "start": 1871,
+      "end": 1970
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/worker_spawn/egress_proxy/tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/guardrail-parity-codex.md",
+    "intervals": [
+     {
+      "start": 103,
+      "end": 118
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/worker_spawn/containment.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 430
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 69
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/worker_spawn/egress_proxy/server.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 377
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/dispatch.rs",
+    "intervals": [
+     {
+      "start": 3019,
+      "end": 3031
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/worker_spawn/egress_proxy/registry.rs",
+    "intervals": [
+     {
+      "start": 194,
+      "end": 372
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

@@ -1,0 +1,293 @@
+{
+ "artifact_version": 1,
+ "issue": 8923,
+ "issue_content_hash": "321cb579c7b9243029f0013c36587355abe190be6782c12bd0e3106ce6abc9ec",
+ "source_revision": "2799fdcac24b1d5ab98af07ff6488a3f05daf4a0",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8992-8923"
+ },
+ "retrieved_at": "2026-10-01T08:07:57.413972+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/pr_latency/report.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 181
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/pr_latency/segments.rs",
+    "intervals": [
+     {
+      "start": 33,
+      "end": 336
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/queue.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/role_collision.rs",
+    "intervals": [
+     {
+      "start": 159,
+      "end": 172
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/pr_latency/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 15
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/merge_pr/stale_checks/inputs.rs",
+    "intervals": [
+     {
+      "start": 480,
+      "end": 504
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/merge_pr/loom_pr_guard.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/pr_latency_render.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 274
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/claim_reconciliation.rs",
+    "intervals": [
+     {
+      "start": 195,
+      "end": 3455
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/pr_latency/history.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 279
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.github/labels.yml",
+    "intervals": [
+     {
+      "start": 49,
+      "end": 58
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/verdict-staleness-guard.sh",
+    "intervals": [
+     {
+      "start": 200,
+      "end": 218
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/pr-latency.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 22
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/sweep-run-hygiene.md",
+    "intervals": [
+     {
+      "start": 116,
+      "end": 125
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/auditor.md",
+    "intervals": [
+     {
+      "start": 791,
+      "end": 808
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/pr_latency_cmd.rs",
+    "intervals": [
+     {
+      "start": 13,
+      "end": 205
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/main.rs",
+    "intervals": [
+     {
+      "start": 350,
+      "end": 2193
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/pr_latency_artifacts.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 105
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/merge_pr_mergeable_recheck_differential.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-stale-check-redate.sh",
+    "intervals": [
+     {
+      "start": 12,
+      "end": 24
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/merge_pr_stale_checks_plan_gated.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 16
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/merge_pr_dirty_guard_differential.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 17
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/fixtures/merge-pr-dirty-guard-retired.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/auto_update.rs",
+    "intervals": [
+     {
+      "start": 1327,
+      "end": 1351
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/quarantine.rs",
+    "intervals": [
+     {
+      "start": 847,
+      "end": 862
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

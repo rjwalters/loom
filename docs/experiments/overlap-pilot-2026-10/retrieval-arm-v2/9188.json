@@ -1,0 +1,95 @@
+{
+ "artifact_version": 1,
+ "issue": 9188,
+ "issue_content_hash": "141a58240f7b660de2d14371afc09a96903f8b6d0199b9f13e9d37ddba5ad8d3",
+ "source_revision": "beed0a844eab586e51b0e52be80d910453dac3f9",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9010-9188"
+ },
+ "retrieved_at": "2026-10-01T07:56:45.781028+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/ci_telemetry/owners.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 260
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ci_telemetry/poll.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 520
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/ci_telemetry_cli.rs",
+    "intervals": [
+     {
+      "start": 21,
+      "end": 238
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ci_telemetry/tests/owners.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 343
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ci_telemetry/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 470
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/ci-observability.md",
+    "intervals": [
+     {
+      "start": 49,
+      "end": 276
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/health/ci_telemetry_section.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 63
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

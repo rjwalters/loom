@@ -1,0 +1,62 @@
+{
+ "artifact_version": 1,
+ "issue": 9010,
+ "issue_content_hash": "df367b5d1264da56fd02071f2449c9ebf6ac0b14230c260cc8ace74d2453fb87",
+ "source_revision": "beed0a844eab586e51b0e52be80d910453dac3f9",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9010-9188"
+ },
+ "retrieved_at": "2026-10-01T07:56:34.496001+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/auto_update/roll_stall.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 533
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/auto_update/tests/roll_stall.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 51
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/auto_update/tuning.rs",
+    "intervals": [
+     {
+      "start": 22,
+      "end": 121
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/auto_update.rs",
+    "intervals": [
+     {
+      "start": 162,
+      "end": 2098
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

@@ -1,0 +1,128 @@
+{
+ "artifact_version": 1,
+ "issue": 8712,
+ "issue_content_hash": "1fc02d12bb60f1e821f3fd5e284f7f922d0c9980fe68057694cd24786701c111",
+ "source_revision": "9ced32146a07084ba09945fec38312300f0b3e76",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8697-8712"
+ },
+ "retrieved_at": "2026-10-01T08:10:47.372516+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/auto_update.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 2002
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/cli/loom-daemon-update.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 2941
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/lib/daemon-update-fixtures.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 637
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/lib/locate-daemon-bin.sh",
+    "intervals": [
+     {
+      "start": 14,
+      "end": 324
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-daemon-update-fixture-containment.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 15
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/auto_update/failure_digest.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 47
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/auto_update/stale_repo.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 11
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-loom-daemon-update-fetch.sh",
+    "intervals": [
+     {
+      "start": 123,
+      "end": 1212
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-loom-daemon-update.sh",
+    "intervals": [
+     {
+      "start": 15,
+      "end": 234
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/auto_update/tests/stale_repo.rs",
+    "intervals": [
+     {
+      "start": 125,
+      "end": 141
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

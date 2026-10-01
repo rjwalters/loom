@@ -1,0 +1,304 @@
+{
+ "artifact_version": 1,
+ "issue": 8900,
+ "issue_content_hash": "8c9295e64684936ab90c52154d7adc90f76d28923b891d05a45d552ca97c7a98",
+ "source_revision": "65ebb7eadfc7f8e687f0bf94815387728d156613",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8900-8930"
+ },
+ "retrieved_at": "2026-10-01T07:58:43.079161+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/scripts/verdict-staleness-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 480
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion-pr-merge.md",
+    "intervals": [
+     {
+      "start": 200,
+      "end": 2995
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/merge_pr/stale_checks.rs",
+    "intervals": [
+     {
+      "start": 24,
+      "end": 142
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-verdict-staleness-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 756
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/merge_pr_stale_checks_plan_gated.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 16
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion-held-pr-staleness.md",
+    "intervals": [
+     {
+      "start": 133,
+      "end": 145
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/forge_cmd.rs",
+    "intervals": [
+     {
+      "start": 456,
+      "end": 570
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-auto-merge-disabled-fallback.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 161
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/cli/loom-status.sh",
+    "intervals": [
+     {
+      "start": 294,
+      "end": 309
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "scripts/install/create-pr.sh",
+    "intervals": [
+     {
+      "start": 419,
+      "end": 434
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/check-promotion-landed.sh",
+    "intervals": [
+     {
+      "start": 194,
+      "end": 197
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/merge-pr.sh",
+    "intervals": [
+     {
+      "start": 217,
+      "end": 2386
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/clean-stale-building-labels.sh",
+    "intervals": [
+     {
+      "start": 124,
+      "end": 139
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/urgent-flip-guard.sh",
+    "intervals": [
+     {
+      "start": 312,
+      "end": 344
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/warn-operator-gated.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 231
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/pipeline_snapshot.rs",
+    "intervals": [
+     {
+      "start": 518,
+      "end": 1279
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ipc.rs",
+    "intervals": [
+     {
+      "start": 3746,
+      "end": 3774
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-stale-required-checks.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 132
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-stale-mergeable.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh",
+    "intervals": [
+     {
+      "start": 13,
+      "end": 23
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-stale-check-redate.sh",
+    "intervals": [
+     {
+      "start": 12,
+      "end": 24
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-label-freshness.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-check-runs-404-fallback.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 9
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/merge_pr/loom_pr_guard.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/judge.md",
+    "intervals": [
+     {
+      "start": 941,
+      "end": 2898
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/auto_update/native_probe.rs",
+    "intervals": [
+     {
+      "start": 96,
+      "end": 97
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

@@ -1,0 +1,194 @@
+{
+ "artifact_version": 1,
+ "issue": 8895,
+ "issue_content_hash": "869faaf5401ecb26b6e6dfc93f8d66b85ed7a39472f3d17140e30a82402222ad",
+ "source_revision": "003f7e091f6c1e819449f1f17bbfab3f78baca17",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8895-8914"
+ },
+ "retrieved_at": "2026-10-01T08:05:59.666411+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/scripts/merge-pr.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 2252
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-check-runs-404-fallback.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 24
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-unstable-fallback.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-head-mismatch.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/scripts/judge-fallback-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/lib/forge-helpers.sh",
+    "intervals": [
+     {
+      "start": 523,
+      "end": 696
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/scripts/tests/test-forge-helpers.sh",
+    "intervals": [
+     {
+      "start": 104,
+      "end": 382
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "scripts/install/forge-detect.sh",
+    "intervals": [
+     {
+      "start": 190,
+      "end": 200
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/check-ci-status.sh",
+    "intervals": [
+     {
+      "start": 158,
+      "end": 180
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/urgent-flip-guard.sh",
+    "intervals": [
+     {
+      "start": 172,
+      "end": 186
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-merge-ordering-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh",
+    "intervals": [
+     {
+      "start": 13,
+      "end": 23
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/check-ci-suite-manifest.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-label-freshness.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-merge-pr-stale-required-checks.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

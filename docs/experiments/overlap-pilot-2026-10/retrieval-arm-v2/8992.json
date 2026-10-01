@@ -1,0 +1,117 @@
+{
+ "artifact_version": 1,
+ "issue": 8992,
+ "issue_content_hash": "5a8390f2f9e608126c0780e93052057fc6bc61849c379f6283db2f3827df288d",
+ "source_revision": "2799fdcac24b1d5ab98af07ff6488a3f05daf4a0",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8992-8923"
+ },
+ "retrieved_at": "2026-10-01T08:07:45.996413+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/ci_telemetry/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 448
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/ci-observability.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 500
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/ci_telemetry/ledger.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/ci_telemetry_cli.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 34
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/health/ci_telemetry_section.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ci_telemetry/poll.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 775
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/ci.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ci_telemetry/tests.rs",
+    "intervals": [
+     {
+      "start": 554,
+      "end": 760
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/scripts/tests/ci-wired.txt",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

@@ -1,0 +1,315 @@
+{
+ "artifact_version": 1,
+ "issue": 9288,
+ "issue_content_hash": "b027b7f4562f62b8f85818d6af6389eb81cdbe26c785261bc8e5049d3b77a60a",
+ "source_revision": "25f56c5a8e74d9ac979c807b1264bc0c0dcd97e0",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9288-9300"
+ },
+ "retrieved_at": "2026-10-01T08:17:27.176595+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/work_finder/ordering.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 109
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/types/ready_queue.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/ready_queue.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/dispatcher-repo-sharding.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 132
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder.rs",
+    "intervals": [
+     {
+      "start": 17,
+      "end": 3442
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "WORK_PLAN.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 23
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/repo_cap.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/tick_report.rs",
+    "intervals": [
+     {
+      "start": 17,
+      "end": 306
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/ready_queue_cmd.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 144
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/operator_priority.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/pool_preflight.rs",
+    "intervals": [
+     {
+      "start": 557,
+      "end": 570
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/src/queueState.ts",
+    "intervals": [
+     {
+      "start": 84,
+      "end": 194
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/src/fleetState.ts",
+    "intervals": [
+     {
+      "start": 262,
+      "end": 277
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/src/query.ts",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/sweep_experiment_plan_writes_nothing.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 11
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/ready_queue_tests.rs",
+    "intervals": [
+     {
+      "start": 99,
+      "end": 243
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/tests/merge_pr_stale_checks_plan_gated.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 16
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/tests/ordering.rs",
+    "intervals": [
+     {
+      "start": 65,
+      "end": 83
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/fleet/add_worker/tests.rs",
+    "intervals": [
+     {
+      "start": 257,
+      "end": 294
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/script_helpers/fleet_experiment/tests.rs",
+    "intervals": [
+     {
+      "start": 140,
+      "end": 159
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/script_helpers/fleet_experiment.rs",
+    "intervals": [
+     {
+      "start": 387,
+      "end": 407
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/kinds.rs",
+    "intervals": [
+     {
+      "start": 60,
+      "end": 294
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/model_dispatch.rs",
+    "intervals": [
+     {
+      "start": 116,
+      "end": 134
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/dispatch.rs",
+    "intervals": [
+     {
+      "start": 1574,
+      "end": 2329
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/ops.rs",
+    "intervals": [
+     {
+      "start": 75,
+      "end": 99
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/types.rs",
+    "intervals": [
+     {
+      "start": 848,
+      "end": 854
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/queue_snapshot.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 202
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

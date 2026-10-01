@@ -1,0 +1,249 @@
+{
+ "artifact_version": 1,
+ "issue": 9289,
+ "issue_content_hash": "7a0b55d0d0dac7499464e476e99b2aab15850a6e15cff79d0cdfd316a19ef7b3",
+ "source_revision": "39dbd602fcfab8bd0f05ee374fe62eb0f67d3089",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9289-9299"
+ },
+ "retrieved_at": "2026-10-01T08:12:45.869500+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/eta/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 468
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/eta/heuristics/land_v1.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 40
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/eta/tests/score.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 120
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/eta/score.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 141
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/eta/heuristics/finish_v1.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 16
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/eta/labels.rs",
+    "intervals": [
+     {
+      "start": 54,
+      "end": 74
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/eta/tests/estimate.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 165
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 110
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/dispatch.rs",
+    "intervals": [
+     {
+      "start": 2311,
+      "end": 2329
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/ready_queue_cmd.rs",
+    "intervals": [
+     {
+      "start": 39,
+      "end": 62
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/ci_telemetry_cli.rs",
+    "intervals": [
+     {
+      "start": 67,
+      "end": 181
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/eta/tests/explanation.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 50
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/eta/tests/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 18
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/eta/tests/primitives.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 198
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/fleet_captain_cmd.rs",
+    "intervals": [
+     {
+      "start": 219,
+      "end": 241
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/pr_latency_cmd.rs",
+    "intervals": [
+     {
+      "start": 313,
+      "end": 331
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/lease_ensure/tests.rs",
+    "intervals": [
+     {
+      "start": 79,
+      "end": 113
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/usage_report_cli.rs",
+    "intervals": [
+     {
+      "start": 183,
+      "end": 210
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/eta/heuristics/mod.rs",
+    "intervals": [
+     {
+      "start": 21,
+      "end": 43
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 145
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/otlp/mapping.rs",
+    "intervals": [
+     {
+      "start": 167,
+      "end": 174
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

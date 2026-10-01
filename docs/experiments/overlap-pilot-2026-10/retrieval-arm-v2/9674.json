@@ -1,0 +1,183 @@
+{
+ "artifact_version": 1,
+ "issue": 9674,
+ "issue_content_hash": "ba139ff513d5e798feb2f62b348e5900cfde4115344a1ffa8d6db62ab13ec66b",
+ "source_revision": "cf8b6f076876b6f8f7bc13daaeacff94dffca026",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9672-9674"
+ },
+ "retrieved_at": "2026-10-01T08:11:54.749528+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/observability/ops/lockout.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 193
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/disposition.rs",
+    "intervals": [
+     {
+      "start": 60,
+      "end": 564
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/docs/telemetry-schema.md",
+    "intervals": [
+     {
+      "start": 1606,
+      "end": 1615
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/dispatch.rs",
+    "intervals": [
+     {
+      "start": 206,
+      "end": 226
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/loom.md",
+    "intervals": [
+     {
+      "start": 255,
+      "end": 265
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/dispatcher-repo-sharding.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 9
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/work_finder/repo_cap.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/types/ready_queue.rs",
+    "intervals": [
+     {
+      "start": 14,
+      "end": 382
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/work_finder.rs",
+    "intervals": [
+     {
+      "start": 281,
+      "end": 2011
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/story_points.rs",
+    "intervals": [
+     {
+      "start": 72,
+      "end": 140
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/disk_headroom.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/observability.md",
+    "intervals": [
+     {
+      "start": 488,
+      "end": 489
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-disk-headroom.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/builder-worktree.md",
+    "intervals": [
+     {
+      "start": 351,
+      "end": 381
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/token-pool.md",
+    "intervals": [
+     {
+      "start": 337,
+      "end": 349
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

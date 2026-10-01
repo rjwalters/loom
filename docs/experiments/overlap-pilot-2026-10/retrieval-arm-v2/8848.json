@@ -1,0 +1,95 @@
+{
+ "artifact_version": 1,
+ "issue": 8848,
+ "issue_content_hash": "8a5651f3428d9f3a72443285cf07153a895266b6dd44be663fdf5fade52bb149",
+ "source_revision": "9cf51b8c307f52dff09f1265649a368bd9d42680",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8857-8848"
+ },
+ "retrieved_at": "2026-10-01T08:05:17.821186+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/fleet_captain.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 351
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/config_resolver.rs",
+    "intervals": [
+     {
+      "start": 331,
+      "end": 342
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/fleet_captain_cmd.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 30
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/mod.rs",
+    "intervals": [
+     {
+      "start": 233,
+      "end": 1169
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/observability/collector.rs",
+    "intervals": [
+     {
+      "start": 705,
+      "end": 902
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "dashboard/src/redaction.ts",
+    "intervals": [
+     {
+      "start": 40,
+      "end": 741
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/tests/fleet_captain.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

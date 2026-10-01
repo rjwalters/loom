@@ -1,0 +1,227 @@
+{
+ "artifact_version": 1,
+ "issue": 8835,
+ "issue_content_hash": "d02f837a143e4c884a969f1ac3287e665068a89a2fc43dc3a809a049ddd708ad",
+ "source_revision": "76584c4b96f19ec5959fca63bc87ac2f38915fd1",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8856-8835"
+ },
+ "retrieved_at": "2026-10-01T08:07:00.137663+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "dashboard/web/src/fleet.ts",
+    "intervals": [
+     {
+      "start": 163,
+      "end": 806
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/observability.md",
+    "intervals": [
+     {
+      "start": 545,
+      "end": 557
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/auditor.md",
+    "intervals": [
+     {
+      "start": 139,
+      "end": 265
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/web/src/views/runningCompute.ts",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 26
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/web/test/hostDetail.test.ts",
+    "intervals": [
+     {
+      "start": 393,
+      "end": 416
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/sweep-execution-model.md",
+    "intervals": [
+     {
+      "start": 91,
+      "end": 93
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/web/test/fleetOverview.test.ts",
+    "intervals": [
+     {
+      "start": 789,
+      "end": 810
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/web/src/views/hostDetail.ts",
+    "intervals": [
+     {
+      "start": 336,
+      "end": 355
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/README.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 10
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/builder-worktree.md",
+    "intervals": [
+     {
+      "start": 243,
+      "end": 251
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/sweep_registry/spawn_process.rs",
+    "intervals": [
+     {
+      "start": 18,
+      "end": 287
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/src/fleetState.ts",
+    "intervals": [
+     {
+      "start": 80,
+      "end": 840
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/web/src/parse.ts",
+    "intervals": [
+     {
+      "start": 192,
+      "end": 317
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/docs/query-api.md",
+    "intervals": [
+     {
+      "start": 152,
+      "end": 163
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/web/src/types.ts",
+    "intervals": [
+     {
+      "start": 234,
+      "end": 342
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/test/fleetState.test.ts",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 986
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "dashboard/web/test/fleet.test.ts",
+    "intervals": [
+     {
+      "start": 785,
+      "end": 915
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-nextest-daemon-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/nextest-daemon-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 15
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

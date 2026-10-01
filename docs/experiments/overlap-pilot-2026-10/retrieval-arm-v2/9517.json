@@ -1,0 +1,315 @@
+{
+ "artifact_version": 1,
+ "issue": 9517,
+ "issue_content_hash": "9df86edada7aaf94dd5ab93d80e806fc5ac3d6e765346881f8c8183b1001213a",
+ "source_revision": "65634118b23e4db5f6171c13fdaf857badb39324",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9517-8884"
+ },
+ "retrieved_at": "2026-10-01T07:54:16.467132+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/scripts/fleet-send.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 79
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-fleet-send.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 203
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/fleet-check.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/fleet-comms.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 33
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-fleet-check.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/fleet/roll.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 39
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/fleet/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/lib/filing-lock.sh",
+    "intervals": [
+     {
+      "start": 228,
+      "end": 241
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/safehouse.rs",
+    "intervals": [
+     {
+      "start": 669,
+      "end": 2829
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/main.rs",
+    "intervals": [
+     {
+      "start": 44,
+      "end": 2333
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 95
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/dep-recheck-fingerprint.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "scripts/shell-allowlist.txt",
+    "intervals": [
+     {
+      "start": 181,
+      "end": 182
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.agents/skills/loom-judge/SKILL.md",
+    "intervals": [
+     {
+      "start": 1025,
+      "end": 2981
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/ci-wired.txt",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 102
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/ci-excluded.txt",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 66
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.agents/skills/loom-builder/SKILL.md",
+    "intervals": [
+     {
+      "start": 1329,
+      "end": 1341
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.agents/skills/loom-doctor/SKILL.md",
+    "intervals": [
+     {
+      "start": 1645,
+      "end": 1651
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/cargo-test-daemon-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-cargo-test-daemon-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/tests/test-nextest-daemon-guard.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/status.rs",
+    "intervals": [
+     {
+      "start": 1010,
+      "end": 1026
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/lib/locate-daemon-bin.sh",
+    "intervals": [
+     {
+      "start": 14,
+      "end": 324
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/fleet_captain_cmd.rs",
+    "intervals": [
+     {
+      "start": 181,
+      "end": 208
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/fleet_experiment.rs",
+    "intervals": [
+     {
+      "start": 175,
+      "end": 194
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/workspace_fleet.rs",
+    "intervals": [
+     {
+      "start": 60,
+      "end": 62
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/script_helpers/fleet_experiment.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 29
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

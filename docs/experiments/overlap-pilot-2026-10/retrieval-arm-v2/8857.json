@@ -1,0 +1,282 @@
+{
+ "artifact_version": 1,
+ "issue": 8857,
+ "issue_content_hash": "7519e049abaf3523423931d68cee8030d66801132361fb456083967cd0a18042",
+ "source_revision": "9cf51b8c307f52dff09f1265649a368bd9d42680",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-8857-8848"
+ },
+ "retrieved_at": "2026-10-01T08:05:06.308317+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/.claude/commands/loom/loom.md",
+    "intervals": [
+     {
+      "start": 253,
+      "end": 263
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/token-pool.md",
+    "intervals": [
+     {
+      "start": 335,
+      "end": 347
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "docs/philosophy/loom-intelligence.md",
+    "intervals": [
+     {
+      "start": 50,
+      "end": 55
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/signoz/evidence.md",
+    "intervals": [
+     {
+      "start": 546,
+      "end": 556
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".loom/config.json",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 170
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.loom/CLAUDE.md",
+    "intervals": [
+     {
+      "start": 323,
+      "end": 336
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/clickstack/compose.yaml",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 17
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.agents/skills/loom-loom/SKILL.md",
+    "intervals": [
+     {
+      "start": 268,
+      "end": 278
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/signoz/casting.yaml",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 21
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/collector/config.yaml",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 304
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/signoz/README.md",
+    "intervals": [
+     {
+      "start": 31,
+      "end": 40
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 101
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/collector.rs",
+    "intervals": [
+     {
+      "start": 82,
+      "end": 634
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/script_helpers/usage.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 184
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/signoz/cycle-time-extract.sql",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 13
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/script_helpers/transcript_usage.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 132
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/cycle-time-questions.md",
+    "intervals": [
+     {
+      "start": 59,
+      "end": 65
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/host.rs",
+    "intervals": [
+     {
+      "start": 163,
+      "end": 174
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/collector/identity.rs",
+    "intervals": [
+     {
+      "start": 66,
+      "end": 182
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/tokens_pool/account_registry.rs",
+    "intervals": [
+     {
+      "start": 340,
+      "end": 360
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 15
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/tokens_pool/account_lifecycle.rs",
+    "intervals": [
+     {
+      "start": 323,
+      "end": 470
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/dispatch.rs",
+    "intervals": [
+     {
+      "start": 130,
+      "end": 139
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/observability/ops/queue.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 12
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

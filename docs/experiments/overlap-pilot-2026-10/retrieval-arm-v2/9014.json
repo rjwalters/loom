@@ -1,0 +1,106 @@
+{
+ "artifact_version": 1,
+ "issue": 9014,
+ "issue_content_hash": "bb40bb1a56d4c8f88605b74b16bf66a561631ec742867a589b918e6034c950f1",
+ "source_revision": "64a3258048cc7c72f834bef59866175161f1df5e",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9028-9014"
+ },
+ "retrieved_at": "2026-10-01T08:15:07.162207+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/docs/ci-observability.md",
+    "intervals": [
+     {
+      "start": 254,
+      "end": 431
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ci_telemetry/mod.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 463
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ci_telemetry/state.rs",
+    "intervals": [
+     {
+      "start": 227,
+      "end": 240
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/health/ci_telemetry_section.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 95
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/fleet_captain.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 721
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/cli/fleet_captain_cmd.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 218
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ci_telemetry/tests/captain_gate.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 91
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/ci_telemetry/tests.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 24
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

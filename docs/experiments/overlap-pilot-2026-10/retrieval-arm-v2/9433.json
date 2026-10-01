@@ -1,0 +1,150 @@
+{
+ "artifact_version": 1,
+ "issue": 9433,
+ "issue_content_hash": "44127cce7cc32523b0f719e733c8ee72c81939e39ab09f7251e80351157bfd4b",
+ "source_revision": "3c1062871ff2f2276f99c56dea3876888d44719c",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9433-9432"
+ },
+ "retrieved_at": "2026-10-01T07:57:42.620978+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "defaults/observability/story-points-queries.sql",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 29
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/story-points.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 61
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/story-points-evidence.md",
+    "intervals": [
+     {
+      "start": 19,
+      "end": 38
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/sweep-facts/sweep-facts-extract-clickstack.sql",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "docs/philosophy/loom-intelligence.md",
+    "intervals": [
+     {
+      "start": 32,
+      "end": 55
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/sweep-facts/sweep-facts-questions.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 19
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/sweep-facts/sweep-facts-extract-signoz.sql",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/sweep-facts/sweep-facts-rollup.sql",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 127
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/sweep-facts/sweep-facts-queries.sql",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 236
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/observability/sweep-facts/landed-size.sql",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 199
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/telemetry/tests/story_points.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 14
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/.claude/commands/loom/champion-epic.md",
+    "intervals": [
+     {
+      "start": 22,
+      "end": 32
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}

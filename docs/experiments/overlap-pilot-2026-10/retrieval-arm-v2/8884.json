@@ -1,0 +1,128 @@
+{
+ "artifact_version": 1,
+ "issue": 8884,
+ "issue_content_hash": "64ea8e4b7eec3c50a43175f590a6c7244cf09ec953b4a743ede04df33e19e927",
+ "source_revision": "65634118b23e4db5f6171c13fdaf857badb39324",
+ "query_policy_version": "qp-v1",
+ "provenance": {
+  "provider": "augment",
+  "model": "direct-context",
+  "index_version": "auggie-state:q-9517-8884"
+ },
+ "retrieved_at": "2026-10-01T07:54:27.840788+00:00",
+ "status": {
+  "kind": "present",
+  "files": [
+   {
+    "path": "loom-daemon/src/init/session_mode.rs",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 79
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/docs/session-mode.md",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 109
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": ".loom/hooks/guard-background-subagents.sh",
+    "intervals": [
+     {
+      "start": 215,
+      "end": 428
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/hooks/guard-background-subagents.sh",
+    "intervals": [
+     {
+      "start": 394,
+      "end": 428
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "install.sh",
+    "intervals": [
+     {
+      "start": 22,
+      "end": 2438
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "scripts/install-loom.sh",
+    "intervals": [
+     {
+      "start": 43,
+      "end": 1902
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "loom-daemon/src/main.rs",
+    "intervals": [
+     {
+      "start": 21,
+      "end": 2533
+     }
+    ],
+    "symbols": [],
+    "intent": "edit"
+   },
+   {
+    "path": "defaults/scripts/tests/test-session-mode.sh",
+    "intervals": [
+     {
+      "start": 1,
+      "end": 298
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "loom-daemon/src/init/session_mode_init_tests.rs",
+    "intervals": [
+     {
+      "start": 39,
+      "end": 213
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   },
+   {
+    "path": "defaults/scripts/cli/loom-start.sh",
+    "intervals": [
+     {
+      "start": 122,
+      "end": 217
+     }
+    ],
+    "symbols": [],
+    "intent": "context"
+   }
+  ]
+ }
+}
