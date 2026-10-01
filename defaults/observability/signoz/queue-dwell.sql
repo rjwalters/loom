@@ -1,6 +1,12 @@
 -- Ready-queue dwell and starvation (Issue #8856). Standing queries over the
 -- `loom.queue.*` metric.points names; run with the bundled clickhouse-client in
 -- the private ClickHouse container. Metric timestamps are milliseconds.
+--
+-- STATUS: all five queries are executed verbatim against the pinned
+-- `clickhouse/clickhouse-server:25.12.5` the trial's telemetry store runs, by
+-- `loom-daemon/tests/signoz_queue_quota_queries.rs` in CI. NOT yet executed
+-- against a live SigNoz deployment over real canary data (#8525/#8529/#9279),
+-- the same caveat every other SigNoz artifact in this trial carries.
 -- Queries 1-3 take max(), so duplicate time_series_v4 hour-rows are harmless;
 -- query 4 sums and must de-duplicate. Resource attributes (host.id) are merged
 -- into metric labels by the SigNoz exporter; inspect `time_series_v4.labels` first if a host column is empty.
