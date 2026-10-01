@@ -475,6 +475,18 @@ pub(crate) enum ScriptPortCommand {
     /// bypasses `lib/script-helper.sh`, whose missing-daemon path is a loud
     /// error: silence IS this entry point's interface.)
     FleetSend(super::fleet_send::FleetSendArgs),
+
+    /// The versioned forge **operation inventory** and its accounting (#9777,
+    /// phase 1 of epic #9769): the coverage validator, the unclassified-call
+    /// change gate, the four-axis coverage report and the hosted-probe
+    /// manifest. Not a port: brand-new logic, native from the start per the
+    /// shell-language policy — and native specifically so the gate can be a
+    /// real ratchet rather than a grep in a `contract`-category script. It
+    /// lives in this flattened enum for the same frozen-`main.rs` reason as
+    /// `shell-budget`, which keeps `forge-inventory` a real nested subcommand
+    /// at zero cost to that file. Makes no forge call.
+    #[command(subcommand)]
+    ForgeInventory(super::forge_inventory_cmd::ForgeInventoryCommand),
 }
 
 impl ScriptPortCommand {
@@ -538,6 +550,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::SecretScan(args) => args.run(),
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
             ScriptPortCommand::LabelDuplicates(args) => args.run(),
+            ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
         }
     }
 }
