@@ -193,9 +193,10 @@ impl DirectTransport for HttpDirectTransport {
         let session_id = self.session_id.clone();
         let request_id = request_id.to_string();
         let user_agent = format!("augment.sdk.context/{} (loom-daemon)", env!("CARGO_PKG_VERSION"));
+        let timeout = self.timeout;
         let exchange = std::thread::spawn(move || -> Result<serde_json::Value, DirectError> {
             let client = reqwest::blocking::Client::builder()
-                .timeout(self.timeout)
+                .timeout(timeout)
                 .build()
                 .map_err(|e| DirectError::transport(format!("client build: {e}")))?;
             let resp = client
