@@ -236,26 +236,25 @@ pub fn may_write_from(cwd: &Path, repo: Option<&str>) -> Verdict {
     )
 }
 
-/// Gitea: rules 1 and 2 (origin, managed) still apply, but the permission leg
-/// is a GitHub API probe with no Gitea counterpart yet, so it answers WRITE
-/// rather than refusing every Gitea workspace.
-struct GiteaUnprobed;
-
-impl PermissionProbe for GiteaUnprobed {
-    fn permission(&self, _repo: &str) -> Permission {
-        Permission::Write
-    }
-}
-
 /// The production probe for writes made from `root` under `config_dir` (a
-/// per-owner `GH_CONFIG_DIR`; `None` is this process's own credential).
+/// per-owner `GH_CONFIG_DIR`; `None` is this process's own credential). On
+/// Gitea the same cache wraps a [`probe::GiteaProbe`] (rule 3 against Gitea's
+/// own API, #9699); when its connection cannot even resolve, the probe
+/// answers `Unknown` and the decision refuses — the fail-closed rule.
 fn probe_for(root: &Path, config_dir: Option<PathBuf>, gh: &Path) -> Box<dyn PermissionProbe> {
     if crate::forge_cmd::detect_forge(Some(root)) == crate::forge_cmd::ForgeType::Gitea {
-        return Box::new(GiteaUnprobed);
+        let gitea = probe::GiteaProbe::for_root(root);
+        let gitea_id = gitea.cache_id().to_string();
+        return Box::new(probe::Cached {
+            inner: gitea,
+            key_dir: config_dir,
+            gitea_id: Some(gitea_id).filter(|id| !id.is_empty()),
+        });
     }
     Box::new(probe::Cached {
         inner: probe::GhProbe::new(gh.to_path_buf(), config_dir.clone()),
         key_dir: config_dir,
+        gitea_id: None,
     })
 }
 
