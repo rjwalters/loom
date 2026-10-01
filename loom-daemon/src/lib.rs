@@ -185,6 +185,7 @@ pub mod forge_check_claim;
 pub mod forge_check_open_pr;
 pub mod forge_cmd;
 pub mod forge_comment;
+pub mod forge_contract;
 pub mod forge_disable_auto_merge;
 pub(crate) mod forge_etag_store;
 pub mod forge_events;
