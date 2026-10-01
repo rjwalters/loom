@@ -237,6 +237,7 @@ processors:
           - 'replace_pattern(body, "(?i)aws_secret_access_key[\"'' ]*[:=][\"'' ]*[A-Za-z0-9/+=]{40}", "[REDACTED:aws-secret-access-key]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
           - 'replace_pattern(body, "(?i)(?:password|passwd|secret|token|api[_-]?key)[\"'' ]*[:=][\"'' ]*[^\\s\"''&\\[]{6,}", "[REDACTED:credential]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
           - 'replace_pattern(body, "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[REDACTED:email]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
+          - 'replace_pattern(body, "(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", "[REDACTED:private-key]") where attributes["loom.session.output.event_id"] != nil and IsString(body)'
   # Allow only Loom's structured operational attributes. Source-side privacy
   # enforcement owns free-text bodies, span names and nested values for every
   # record kind EXCEPT TWO:

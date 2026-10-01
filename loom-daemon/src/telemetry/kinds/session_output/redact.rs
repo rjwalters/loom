@@ -43,6 +43,31 @@ struct Class {
     marker: &'static str,
 }
 
+/// Every secret class the gateway's `transform/session_output_redaction`
+/// stage must scrub out of a `session.output` body
+/// (`defaults/observability/collector/config.yaml`), in the order the
+/// collector applies them. Mirrors `classes()` above, with consecutive
+/// repeats (the two `github-token` patterns) collapsed — same convention as
+/// `CI_LOG_SCRUB_CLASSES` (`telemetry::ci`).
+///
+/// **This list is the reviewable source of truth.** A new class is added
+/// here, to `classes()` above, and to the collector config in the same PR —
+/// the contract test
+/// (`collector_fanout::gateway_scrubs_exactly_the_declared_session_output_classes`)
+/// fails if the gateway and this list ever disagree, in either direction.
+pub const SESSION_OUTPUT_SCRUB_CLASSES: &[&str] = &[
+    "authorization",
+    "bearer-token",
+    "github-token",
+    "anthropic-key",
+    "api-key",
+    "aws-access-key-id",
+    "aws-secret-access-key",
+    "credential",
+    "email",
+    "private-key",
+];
+
 fn classes() -> &'static [Class] {
     static CLASSES: OnceLock<Vec<Class>> = OnceLock::new();
     CLASSES.get_or_init(|| {
