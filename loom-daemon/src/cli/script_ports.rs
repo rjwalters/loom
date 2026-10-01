@@ -516,6 +516,15 @@ pub(crate) enum ScriptPortCommand {
     /// error: silence IS this entry point's interface.)
     FleetSend(super::fleet_send::FleetSendArgs),
 
+    /// `loom-daemon forge-probe …` — the hosted-qualification probe runner
+    /// (#9789, phase 1 of epic #9769): executes the #9777 probe manifest
+    /// against a live forge and prints a sanitized receipt. Read-only by
+    /// default; write cases refuse without `--live-write`. Unlike
+    /// `forge-inventory` this one's whole purpose IS forge calls — bounded
+    /// by a per-call timeout, never retried. See
+    /// `super::forge_probe_cmd` for the exit-code and credential contract.
+    ForgeProbe(super::forge_probe_cmd::ForgeProbeArgs),
+
     /// The versioned forge **operation inventory** and its accounting (#9777,
     /// phase 1 of epic #9769): the coverage validator, the unclassified-call
     /// change gate, the four-axis coverage report and the hosted-probe
@@ -607,6 +616,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::LabelDuplicates(args) => args.run(),
             ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
             ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
+            ScriptPortCommand::ForgeProbe(args) => args.run(),
         }
     }
 }

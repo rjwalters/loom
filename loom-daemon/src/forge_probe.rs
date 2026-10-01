@@ -42,7 +42,7 @@ pub const OUTCOME_UNKNOWN: &str = "unknown";
 /// One executed (or explicitly unexecuted) probe case, as the receipt
 /// records it and #9789's acceptance criteria require.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct CaseResult {
+pub(crate) struct CaseResult {
     /// The manifest's `test_id` (`forge-probe::<group>::<name>`).
     pub test_id: String,
     /// The manifest operation this case exercises.
@@ -117,7 +117,7 @@ pub(crate) trait ProbeHttp {
 
 /// The resolved, validated configuration.
 #[derive(Debug, Clone)]
-pub struct RunnerConfig {
+pub(crate) struct RunnerConfig {
     /// e.g. `https://gitea.example.com` (the runbook's
     /// `GITEA_QUAL_INSTANCE_URL`).
     pub origin: String,
@@ -209,21 +209,18 @@ impl ProbeHttp for LiveHttp {
 /// Build the receipt: every required-profile row from the probe manifest,
 /// in the manifest's risk-first order, executed where a handler exists and
 /// `unknown` where it does not.
-pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> {
+pub(crate) fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> {
     let inv = crate::forge_inventory::load_embedded()?;
     let manifest = crate::forge_inventory::probe::build(&inv, &[]);
     let mut results = Vec::new();
-    let mut server_version = String::new();
 
     // The server version stamps every receipt row; a failed version probe
     // marks the whole run Unknown rather than inventing a version.
-    match http.request("GET", "version", &cfg.writer_token, None) {
-        Ok((200, body)) => {
-            server_version = serde_json::from_str::<serde_json::Value>(body.trim())
-                .ok()
-                .and_then(|v| v.get("version").and_then(|s| s.as_str()).map(String::from))
-                .unwrap_or_default();
-        }
+    let server_version = match http.request("GET", "version", &cfg.writer_token, None) {
+        Ok((200, body)) => serde_json::from_str::<serde_json::Value>(body.trim())
+            .ok()
+            .and_then(|v| v.get("version").and_then(|s| s.as_str()).map(String::from))
+            .unwrap_or_default(),
         Ok((code, body)) => {
             let _ = body;
             let why = ForgeOutcome::Unknown {
@@ -239,7 +236,7 @@ pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> 
             };
             return Err(anyhow::anyhow!("{why}"));
         }
-    }
+    };
 
     for entry in &manifest.entries {
         let view = ProbeEntryView {
@@ -500,7 +497,7 @@ fn now_secs() -> u64 {
 /// #9789's "required unknowns/unsupported produce a nonzero qualification
 /// verdict" rule. A successful API response alone is insufficient. Returns
 /// (ok, unknown_required, failed_required, unsupported_required).
-pub fn verdict(results: &[CaseResult]) -> (bool, usize, usize, usize) {
+pub(crate) fn verdict(results: &[CaseResult]) -> (bool, usize, usize, usize) {
     let mut unknown = 0;
     let mut failed = 0;
     let mut unsupported = 0;
