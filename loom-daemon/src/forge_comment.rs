@@ -255,9 +255,9 @@ pub fn cli_entrypoint(args: CommentArgs) -> anyhow::Result<()> {
     if let Some(created_ref) = &args.patch_created {
         return patch_created_entrypoint(created_ref);
     }
-    let number = args
-        .number
-        .ok_or_else(|| anyhow::anyhow!("a NUMBER is required (or --patch-created <URL|owner/repo#N>)"))?;
+    let number = args.number.ok_or_else(|| {
+        anyhow::anyhow!("a NUMBER is required (or --patch-created <URL|owner/repo#N>)")
+    })?;
     let body = match (&args.body, &args.body_file) {
         (Some(text), None) => text.clone(),
         (None, Some(path)) => {
@@ -329,21 +329,19 @@ fn patch_created_entrypoint(created_ref: &str) -> anyhow::Result<()> {
     let trimmed = created_ref.trim();
     // A GitHub URL is the shape `gh`/`forge dashboard-link` emit; a bare
     // `owner/repo#N` is accepted for tests.
-    let (nwo, number, is_pr) =
-        if let Some((Some(nwo), number)) = parse_issue_ref(trimmed) {
-            let is_pr = trimmed.contains("/pull/");
-            (nwo, number, is_pr)
-        } else {
-            anyhow::bail!(
-                "--patch-created expects a GitHub object URL or owner/repo#N, got {trimmed:?}"
-            );
-        };
+    let (nwo, number, is_pr) = if let Some((Some(nwo), number)) = parse_issue_ref(trimmed) {
+        let is_pr = trimmed.contains("/pull/");
+        (nwo, number, is_pr)
+    } else {
+        anyhow::bail!(
+            "--patch-created expects a GitHub object URL or owner/repo#N, got {trimmed:?}"
+        );
+    };
     let gh = crate::forge_cmd::gh_bin();
-    let current =
-        gh_api_get(gh.as_str(), &format!("repos/{nwo}/issues/{number}")).map_err(anyhow::Error::msg)?;
+    let current = gh_api_get(gh.as_str(), &format!("repos/{nwo}/issues/{number}"))
+        .map_err(anyhow::Error::msg)?;
     let body = serde_json::from_str::<serde_json::Value>(current.trim())
-        .map_err(|e| anyhow::anyhow!("could not parse the created object's JSON: {e}"))?
-        ["body"]
+        .map_err(|e| anyhow::anyhow!("could not parse the created object's JSON: {e}"))?["body"]
         .as_str()
         .unwrap_or_default()
         .to_string();
