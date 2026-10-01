@@ -214,8 +214,7 @@ analyze_status() {
     local combined_state
     combined_state=$(echo "$data" | jq -r '.combined_status.state // "unknown"')
 
-    local workflow_runs_state
-    workflow_runs_state=$(echo "$data" | jq -r '.workflow_runs_state // "ok"')
+    local workflow_runs_state; workflow_runs_state=$(echo "$data" | jq -r '.workflow_runs_state // "ok"')
 
     # Count by status
     local completed=0
@@ -286,18 +285,17 @@ analyze_status() {
 
     # Fail closed (#9879): an unreadable workflow-runs feed is PENDING, never
     # resolved. A definitive failure still dominates — "some CI failed" plus
-    # "the rest is unreadable" must not soften to pending.
-    if [[ "$workflow_runs_state" == "unknown" && "$overall_status" != "failure" ]]; then
-        overall_status="pending"
-    fi
+    # "the rest is unreadable" must not soften to pending. (Statement-level
+    # `&&`, not an if: this file has no `set -e`, and the shell-budget
+    # ratchet prices the extra lines of the block form.)
+    [[ "$workflow_runs_state" == "unknown" && "$overall_status" != "failure" ]] && overall_status="pending"
 
     # Output JSON results
     jq -n \
         --arg commit "$COMMIT" \
         --arg short_sha "$SHORT_SHA" \
         --arg status "$overall_status" \
-        --arg combined_state "$combined_state" \
-        --arg wf_state "$workflow_runs_state" \
+        --arg combined_state "$combined_state" --arg wf_state "$workflow_runs_state" \
         --argjson total "$total_count" \
         --argjson completed "$completed" \
         --argjson success "$success" \
@@ -310,8 +308,7 @@ analyze_status() {
             commit: $commit,
             short_sha: $short_sha,
             status: $status,
-            combined_state: $combined_state,
-            workflow_runs_state: $wf_state,
+            combined_state: $combined_state, workflow_runs_state: $wf_state,
             counts: {
                 total: $total,
                 completed: $completed,
