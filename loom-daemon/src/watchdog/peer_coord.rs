@@ -392,6 +392,28 @@ pub fn sentinel_issue_ref(sentinel: &Path) -> Option<String> {
 /// failure is deliberately NOT one of them: the comment is the record, and a
 /// closed-but-commented issue is better than a duplicate.
 ///
+/// #9772: the peer-coordination comments carry the dashboard footer like
+/// every other daemon comment. The `issue_ref` the sentinel stores is a bare
+/// number against the daemon's own repo, `owner/repo#N`, or a full URL —
+/// parse it for the slug, falling back to the daemon's working directory for
+/// a bare number; anything unparseable posts unlinked rather than linking to
+/// nowhere.
+fn footer_body(issue_ref: &str, body: &str) -> String {
+    let resolved = crate::forge_comment::parse_issue_ref(issue_ref).and_then(|(nwo, number)| {
+        let nwo = nwo.or_else(|| {
+            crate::worktree_ops::gh::resolve_owner_repo(Path::new("."))
+                .map(|(o, r)| format!("{o}/{r}"))
+        })?;
+        Some((nwo, number))
+    });
+    match resolved {
+        Some((nwo, number)) => {
+            crate::forge_comment::append_dashboard_footer(&nwo, number, false, body)
+        }
+        None => body.to_string(),
+    }
+}
+
 /// The cooldown row is rewritten with the ORIGINAL `recovered_at`, not now —
 /// the dedup window measures from the last recovery, so refreshing it here
 /// would let an indefinitely flapping host never escape the window.
@@ -410,7 +432,7 @@ pub fn dedup_comment(
     let mut comment = std::process::Command::new("gh");
     comment
         .args(["issue", "comment", &cooldown.issue_ref, "--body"])
-        .arg(flap_comment(hostname, summary, flap, window));
+        .arg(footer_body(&cooldown.issue_ref, &flap_comment(hostname, summary, flap, window)));
     let commented = crate::sweep_registry::output_with_timeout(comment, gh)
         .ok()
         .flatten()
@@ -489,13 +511,16 @@ pub fn recover(sentinel: &Path, cooldown_state: &Path, hostname: &str, summary: 
     let mut comment = std::process::Command::new("gh");
     comment
         .args(["issue", "comment", &issue_ref, "--body"])
-        .arg(format!(
-            // Verbatim from the shell (loom-daemon-watchdog.sh:1820). This is
-            // posted to the forge, so a stray run of spaces and a dropped `.sh`
-            // are both visible to an operator reading the issue.
-            "peer-claim coordination has RECOVERED on `{hostname}` ({summary}). Closing \
+        .arg(footer_body(
+            &issue_ref,
+            &format!(
+                // Verbatim from the shell (loom-daemon-watchdog.sh:1820). This is
+                // posted to the forge, so a stray run of spaces and a dropped `.sh`
+                // are both visible to an operator reading the issue.
+                "peer-claim coordination has RECOVERED on `{hostname}` ({summary}). Closing \
          automatically — filed by the loom-daemon-watchdog.sh peer-coordination escalation \
          (#6222)."
+            ),
         ));
     // The comment is advisory: a failure must not stop the close.
     let _ = crate::sweep_registry::output_with_timeout(comment, gh);
