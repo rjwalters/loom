@@ -146,6 +146,7 @@ YIELD_MARKER_PREFIX="<!-- loom:lease-yield host="
 # a call-site only, not a resolver. The `$LOOM_HYPERPARAMS` vector tier is
 # covered too, since the daemon subcommand resolves it; export
 # `LOOM_LEASE_TTL_MINUTES` to override both from the shell side.
+# requires-daemon: hyperparams optional   a binary predating it (or absent) makes the `jq` read fail; DEFAULT_TTL_MINUTES then falls through to the built-in 15, same as before this script called the daemon at all.
 DEFAULT_TTL_MINUTES="${LOOM_LEASE_TTL_MINUTES:-}"
 if [[ -z "$DEFAULT_TTL_MINUTES" ]]; then
   lease_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
