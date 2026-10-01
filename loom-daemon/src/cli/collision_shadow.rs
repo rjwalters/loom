@@ -9,8 +9,7 @@ use std::path::PathBuf;
 
 use loom_daemon::collision_evidence::OutcomeRecord;
 use loom_daemon::collision_shadow::{
-    capture, capture_id, evaluate, write_tick_records, CandidateSnapshot, CandidateSnapshotTick,
-    StudyBudgets,
+    capture, capture_id, evaluate, write_tick_records, CandidateSnapshotTick, StudyBudgets,
 };
 
 #[derive(clap::Subcommand)]
