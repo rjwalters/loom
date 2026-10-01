@@ -592,6 +592,16 @@ pub(crate) enum MergePrCommand {
     /// overridden (see stdout for which), 1 = absent with no override.
     LoomPrGuard(super::merge_pr_loom_pr_guard::LoomPrGuardArgs),
 
+    /// The `--allow-unapproved` audit-comment BODY (#7419, a later #8191
+    /// slice than `LoomPrGuard` above): byte-frozen from the retired shell's
+    /// `_check_loom_pr_label`, posted on the PR after a REAL (non-dry-run)
+    /// override. Reads labels on stdin (one caller-added trailing newline
+    /// stripped). Always exits 0 with the `LOOM-MERGE-PR-COMMENT` sentinel
+    /// then the body, matching `PartialComment`'s protocol below — except
+    /// exit 2 when stdin itself could not be read at all, which is not the
+    /// same as an empty label set.
+    LoomPrOverrideComment(super::merge_pr_loom_pr_override_comment::LoomPrOverrideCommentArgs),
+
     /// The `champion:hold-state` staleness WARNING (#7419 AC #3): the other
     /// half of `loom-pr-guard`'s story, fired only when `loom:pr` IS present
     /// and Champion's recorded hold head is not the head about to merge.
@@ -806,6 +816,7 @@ impl MergePrCommand {
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
+            MergePrCommand::LoomPrOverrideComment(args) => args.run(),
             MergePrCommand::HoldState(args) => args.run(),
             MergePrCommand::SequenceEval(args) => args.run(),
             MergePrCommand::SequencePlan(args) => args.run(),
