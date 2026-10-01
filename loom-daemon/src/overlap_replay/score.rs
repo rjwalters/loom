@@ -61,16 +61,25 @@ pub struct IssueEvaluation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConflictSummary {
-    /// `Some(true)` when any replay order produced a textual conflict,
-    /// `Some(false)` when all orders were clean, `None` when any order was
-    /// unknown (missing conflict evidence is not a clean outcome).
+    /// Pair-caused conflict label from the **patch-preserving transplanted**
+    /// instrument: `Some(true)` when any replay order conflicted,
+    /// `Some(false)` when both orders were clean, and `None` when
+    /// reconstruction did not succeed or any order was unknown. Raw-head
+    /// labels never fill this field (#9785 repair §A5/A6: inherited upstream
+    /// history cannot enter a pair-caused label).
     pub any_conflict: Option<bool>,
-    /// Orders that conflicted (`b_then_a` / `a_then_b`).
+    /// Raw-head instrument (merges pinned heads as-is, folding in upstream
+    /// commits a head contains). Comparability with earlier runs only —
+    /// never a pair-caused label.
+    pub raw_head_any_conflict: Option<bool>,
+    /// True when the transplanted instrument produced a definite answer.
+    pub instrument_available: bool,
+    /// Orders that conflicted under the instrument backing `any_conflict`.
     pub conflicted_orders: Vec<String>,
     /// Conflicted paths across orders (deduplicated, sorted).
     pub conflicted_files: Vec<String>,
-    /// `counterfactual` for replays; observed production conflicts come from
-    /// the manifest and are reported separately.
+    /// `counterfactual-transplanted` when `instrument_available`, else
+    /// `counterfactual-raw-head-comparability-only`.
     pub provenance: String,
     /// Manifest-recorded observed conflict on either PR.
     pub observed_conflict: bool,
@@ -264,6 +273,17 @@ pub fn evaluate(
                 files: actual_rec.map(|p| p.changed_files.as_slice()),
                 intervals: actual_rec.map(|p| &p.changed_intervals),
                 identifiers: actual_rec.and_then(|p| p.changed_identifiers.as_ref()),
+                // Line coordinates compare only when the actual patch was
+                // derived on the declared common source AND that source is
+                // exactly the revision the prediction indexed; per-commit
+                // derivations and rebased patches are not comparable
+                // (#9785 repair §A7).
+                line_coordinates_comparable: actual_rec
+                    .map(|p| {
+                        p.coordinate_basis == super::patch::CoordinateBasis::CommonSource
+                            && p.merge_base.as_deref() == Some(pair.historical_commit.as_str())
+                    })
+                    .unwrap_or(false),
             };
             let ev = footprint_evaluation(
                 pair,
@@ -381,6 +401,11 @@ struct ActualSide<'a> {
     files: Option<&'a [String]>,
     intervals: Option<&'a std::collections::BTreeMap<String, Vec<Span>>>,
     identifiers: Option<&'a std::collections::BTreeSet<String>>,
+    /// True only when this side's actual patch shares the prediction's line
+    /// coordinate basis (common-source derivation whose merge base equals
+    /// the pair's declared historical commit). Otherwise interval metrics
+    /// are invalid and reported as `None` (#9785 repair §A7).
+    line_coordinates_comparable: bool,
 }
 
 fn footprint_evaluation(
@@ -395,6 +420,7 @@ fn footprint_evaluation(
         files: actual_files,
         intervals: actual_intervals,
         identifiers: actual_identifiers,
+        line_coordinates_comparable,
     } = actual;
     let pred_set: Option<BTreeSet<String>> =
         predicted_files.map(|fs| fs.iter().map(|f| f.path.clone()).collect());
@@ -421,8 +447,12 @@ fn footprint_evaluation(
     // Interval-level precision/recall over files where both sides carry
     // interval evidence.
     let (ip, ir) = {
+        // Coordinate guard: without a shared line basis, interval metrics
+        // are unknown, never computed across revisions (#9785 repair §A7).
         let actual_by_path: Option<&std::collections::BTreeMap<String, Vec<Span>>> =
-            actual_intervals;
+            line_coordinates_comparable
+                .then_some(actual_intervals)
+                .flatten();
         let pred_by_path: Option<std::collections::BTreeMap<String, Vec<Span>>> = predicted_files
             .map(|fs| {
                 fs.iter()
@@ -497,41 +527,63 @@ fn footprint_evaluation(
 
 fn summarize_conflict(pair: &ReplayPair, out: Option<&PairOutcomes>) -> ConflictSummary {
     let observed = pair.prs.iter().any(|p| p.observed_conflict);
+    let instrument =
+        |replays: &[super::conflict::ConflictReplay]| -> (Option<bool>, Vec<String>, Vec<String>) {
+            let mut orders = Vec::new();
+            let mut files: BTreeSet<String> = BTreeSet::new();
+            let mut saw_unknown = false;
+            let mut saw_conflict = false;
+            for r in replays {
+                match &r.outcome {
+                    super::conflict::ConflictOutcome::TextualConflict { conflicted_files } => {
+                        saw_conflict = true;
+                        orders.push(r.order.clone());
+                        files.extend(conflicted_files.iter().cloned());
+                    }
+                    super::conflict::ConflictOutcome::Unknown { .. } => saw_unknown = true,
+                    super::conflict::ConflictOutcome::Clean => {}
+                }
+            }
+            let any = if saw_conflict {
+                Some(true)
+            } else if saw_unknown {
+                None
+            } else {
+                Some(false)
+            };
+            (any, orders, files.into_iter().collect())
+        };
     let Some(out) = out else {
         return ConflictSummary {
             any_conflict: None,
+            raw_head_any_conflict: None,
+            instrument_available: false,
             conflicted_orders: Vec::new(),
             conflicted_files: Vec::new(),
-            provenance: "counterfactual".into(),
+            provenance: "counterfactual-raw-head-comparability-only".into(),
             observed_conflict: observed,
         };
     };
-    let mut conflicted_orders = Vec::new();
-    let mut files: BTreeSet<String> = BTreeSet::new();
-    let mut saw_unknown = false;
-    let mut saw_conflict = false;
-    for r in &out.conflict_replays {
-        match &r.outcome {
-            super::conflict::ConflictOutcome::TextualConflict { conflicted_files } => {
-                saw_conflict = true;
-                conflicted_orders.push(r.order.clone());
-                files.extend(conflicted_files.iter().cloned());
-            }
-            super::conflict::ConflictOutcome::Unknown { .. } => saw_unknown = true,
-            super::conflict::ConflictOutcome::Clean => {}
-        }
+    let (raw_any, _, _) = instrument(&out.conflict_replays);
+    if out.conflict_replays_transplanted.is_empty() {
+        return ConflictSummary {
+            any_conflict: None,
+            raw_head_any_conflict: raw_any,
+            instrument_available: false,
+            conflicted_orders: Vec::new(),
+            conflicted_files: Vec::new(),
+            provenance: "counterfactual-raw-head-comparability-only".into(),
+            observed_conflict: observed,
+        };
     }
+    let (any, orders, files) = instrument(&out.conflict_replays_transplanted);
     ConflictSummary {
-        any_conflict: if saw_conflict {
-            Some(true)
-        } else if saw_unknown {
-            None
-        } else {
-            Some(false)
-        },
-        conflicted_orders,
-        conflicted_files: files.into_iter().collect(),
-        provenance: "counterfactual".into(),
+        any_conflict: any,
+        raw_head_any_conflict: raw_any,
+        instrument_available: any.is_some(),
+        conflicted_orders: orders,
+        conflicted_files: files,
+        provenance: "counterfactual-transplanted".into(),
         observed_conflict: observed,
     }
 }
