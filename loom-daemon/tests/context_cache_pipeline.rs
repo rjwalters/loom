@@ -184,6 +184,61 @@ fn context_augment_adapter_reports_unavailable_cleanly() {
     assert!(stdout.contains("Unavailable"), "{stdout}");
 }
 
+/// #9784 review follow-up / #9848 Judge finding, integration level: the
+/// adapter's reported identity version — not the `--adapter` selection name
+/// — must reach the cache key through the real CLI path, so a provider
+/// schema change re-keys instead of serving stale artifacts.
+#[test]
+fn adapter_version_rekeys_through_cli() {
+    let env = Env::new();
+    let body = env.dir.join("body.md");
+    write_file(&body, "adapter version keying probe");
+    let store = env.store();
+    let run = |version: &str| {
+        let out = daemon()
+            .args(["context", "fetch", "--title", "Version probe"])
+            .arg("--body-file")
+            .arg(&body)
+            .args([
+                "--repo",
+                "o/r",
+                "--source-rev",
+                source_rev(),
+                "--index-id",
+                "i",
+                "--query-policy",
+                "q",
+                "--adapter",
+                "fake",
+                "--store",
+            ])
+            .arg(&store)
+            .env("LOOM_FAKE_ADAPTER_VERSION", version)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let (out1, out2, out3) = (run("fake-schema-1"), run("fake-schema-2"), run("fake-schema-1"));
+    let key = |s: &str| s.split_whitespace().nth(1).unwrap().to_string();
+    let (k1, k2, k3) = (key(&out1), key(&out2), key(&out3));
+    assert_ne!(k1, k2, "adapter schema version change must re-key through the CLI");
+    assert_eq!(k1, k3, "same reported version + same content must reuse");
+    assert!(out2.contains("reused=false"));
+    assert!(out3.contains("reused=true"));
+    // Both artifacts remain addressable (history, not overwrite).
+    for k in [&k1, &k2] {
+        let out = daemon()
+            .args(["context", "status", "--key", k])
+            .arg("--store")
+            .arg(&store)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0));
+    }
+    env.drop();
+}
+
 #[test]
 fn context_export_import_replay_roundtrip() {
     let env = Env::new();

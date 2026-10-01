@@ -119,12 +119,18 @@ fn restrict_owner_only(path: &Path) -> Result<()> {
 
 /// Fetch one context key end-to-end: single-flight → cache hit (byte-stable
 /// reuse) → bounded session → persist. Returns (key, artifact, reused).
+///
+/// The key is computed against the adapter that *actually runs*: `fetch`
+/// overwrites `input.adapter_version` from `adapter.identity().version`
+/// before hashing, so a provider behavior/schema change re-keys the cache
+/// even if a caller supplied a stale or generic value (#9848 review finding).
 pub fn fetch(
-    input: key::InputSnapshot,
+    mut input: key::InputSnapshot,
     store: &store::ArtifactStore,
     adapter: &dyn adapter::RetrievalAdapter,
     budget: adapter::Budget,
 ) -> Result<(String, ContextArtifact, bool)> {
+    input.adapter_version = adapter.identity().version;
     let key = input.content_key();
     // Single-flight: concurrent same-key requests coalesce on one lock.
     let _guard = flight::SingleFlight::acquire(store, &key)?;
@@ -196,9 +202,51 @@ mod tests {
         assert_eq!(a2, expected);
         // Zero provider calls served the reuse.
         assert_eq!(adapter.call_count(), 4); // one 4-query session, once
-                                             // Content change → new key.
+                                             // The recorded provider identity carries the adapter version that
+                                             // actually ran.
+        assert_eq!(a1.session.provider.version, "fake-1");
+        // Content change → new key.
         let (k3, _, _) =
             fetch(snapshot("t2"), &store, &adapter, adapter::Budget::default()).unwrap();
         assert_ne!(k1, k3);
+    }
+
+    /// Integration guard for the #9848 review finding: changing the
+    /// adapter's reported identity version must re-key the cache even when
+    /// every other input is identical, so a provider behavior change can
+    /// never keep serving a stale pre-change artifact. Uses the
+    /// `LOOM_FAKE_ADAPTER_VERSION` seam — the same identity path the CLI's
+    /// `run_fetch` threads into the key via `adapter.identity().version`.
+    #[test]
+    fn adapter_version_change_rekeys_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::ArtifactStore::at(dir.path().join("store"));
+        let make = |version: &str| {
+            adapter::FakeAdapter::seeded(vec![(
+                "q1".into(),
+                adapter::RawSnippet {
+                    path: "src/a.rs".into(),
+                    ranges: vec![(1, 3)],
+                    text: "fn a() {}".into(),
+                    source_ref: "idx:1".into(),
+                },
+            )])
+            .with_version(version)
+        };
+        let (k1, _, reused1) =
+            fetch(snapshot("t"), &store, &make("fake-1"), adapter::Budget::default()).unwrap();
+        assert!(!reused1);
+        // The snapshot's stale/generic adapter_version is irrelevant: fetch
+        // derives the key from the adapter identity that actually ran.
+        let mut stale_input = snapshot("t");
+        stale_input.adapter_version = "fake".into();
+        let (k2, a2, reused2) =
+            fetch(stale_input, &store, &make("fake-2"), adapter::Budget::default()).unwrap();
+        assert_ne!(k1, k2, "adapter schema version is a key dimension");
+        assert!(!reused2);
+        // The new artifact records the new identity, and the old artifact is
+        // still independently loadable (history, not overwrite).
+        assert_eq!(a2.session.provider.version, "fake-2");
+        assert_eq!(store.load(&k1).unwrap().unwrap().session.provider.version, "fake-1");
     }
 }

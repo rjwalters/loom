@@ -117,6 +117,9 @@ pub struct FakeAdapter {
     pub unavailable: bool,
     /// Total query invocations (shared across clones).
     pub calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Overrides the reported identity version (test seam; `None` = the
+    /// constant `fake-1`, or the `LOOM_FAKE_ADAPTER_VERSION` env override).
+    pub version: Option<String>,
 }
 
 impl FakeAdapter {
@@ -130,6 +133,7 @@ impl FakeAdapter {
             seeded,
             unavailable: false,
             calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            version: None,
         }
     }
 
@@ -138,19 +142,41 @@ impl FakeAdapter {
             seeded: Default::default(),
             unavailable: true,
             calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            version: None,
         }
     }
 
     pub fn call_count(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Override the reported identity version (test seam for cache
+    /// re-keying assertions).
+    pub fn with_version(mut self, version: &str) -> Self {
+        self.version = Some(version.into());
+        self
+    }
 }
 
 impl RetrievalAdapter for FakeAdapter {
     fn identity(&self) -> ProviderIdentity {
+        // Test seam (same pattern as LOOM_BRANCH_LANDED_GIT_VERSION): the
+        // struct field, else the `LOOM_FAKE_ADAPTER_VERSION` env override,
+        // lets tests vary the adapter's reported schema version through the
+        // real binary and observe cache re-keying. Production runs never set
+        // either, so the version is the constant `fake-1`.
+        let version = self
+            .version
+            .clone()
+            .or_else(|| {
+                std::env::var("LOOM_FAKE_ADAPTER_VERSION")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+            })
+            .unwrap_or_else(|| "fake-1".into());
         ProviderIdentity {
             name: "fake".into(),
-            version: "fake-1".into(),
+            version,
         }
     }
 

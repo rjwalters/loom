@@ -294,6 +294,15 @@ fn run_fetch(params: FetchParams) -> Result<()> {
         Some(f) => serde_json::from_str(&std::fs::read_to_string(f)?)?,
         None => Vec::new(),
     };
+    // Build the adapter first: the cache key's adapter_version must be the
+    // provider's actual identity version/schema (e.g. `direct-context-v1/
+    // <pkg version>`), not the `--adapter` selection name — a provider
+    // behavior change has to re-key the cache (#9848 review finding).
+    let adapter: Box<dyn adapter::RetrievalAdapter> = match adapter_name.as_str() {
+        "fake" => Box::new(adapter::FakeAdapter::default()),
+        "augment" => Box::new(adapter::AugmentAdapter::from_env()),
+        other => bail!("unknown adapter {other:?} (want `augment` or `fake`)"),
+    };
     let mut input = key::InputSnapshot {
         schema_version: 1,
         repo,
@@ -304,16 +313,11 @@ fn run_fetch(params: FetchParams) -> Result<()> {
         source_revision: source_rev,
         index_identity: index_id,
         query_policy_version: query_policy,
-        adapter_version: adapter_name.clone(),
+        adapter_version: adapter.identity().version,
     };
     input.canonicalize();
 
     let s = open_store(store_dir.as_deref())?;
-    let adapter: Box<dyn adapter::RetrievalAdapter> = match adapter_name.as_str() {
-        "fake" => Box::new(adapter::FakeAdapter::default()),
-        "augment" => Box::new(adapter::AugmentAdapter::from_env()),
-        other => bail!("unknown adapter {other:?} (want `augment` or `fake`)"),
-    };
     let (key, artifact, reused) =
         context_cache::fetch(input, &s, adapter.as_ref(), adapter::Budget::default())?;
     println!(
