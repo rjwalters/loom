@@ -1,0 +1,818 @@
+{
+ "manifest_version": 1,
+ "repo": "rjwalters/loom",
+ "created_at": "2026-10-01T05:47:51.221497+00:00",
+ "query_policy_version": "baseline-only-v1",
+ "pairs": [
+  {
+   "pair_id": "p-8656-8728",
+   "historical_commit": "7a195a992edf997a4da09bd40e98e8bf8496cb21",
+   "cutoff": "2026-09-23T06:37:00Z",
+   "issues": [
+    {
+     "issue": 8656,
+     "title": "verify-proposal-refs.sh reports BAD LINE RANGE for every .loom/docs/*.md citation (reads the symlink, not the document)",
+     "body": "## What happens\n\n`verify-proposal-refs.sh`'s line-range check reads the cited path **through git** (`git show \"origin/main:$path\" | wc -l`). Since #7842 every `.loom/docs/*.md` with a `defaults/docs/` counterpart is a **symlink** (tree mode `120000`), so that read returns the link-target string, `wc -l` measures the link, and every cited range under `.loom/docs/` is reported as a miss:\n\n```\n$ printf 'Cites .loom/docs/troubleshooting.md:100-200\\n' > /tmp/probe.md\n$ ./.loom/scripts/verify-proposal-refs.sh /tmp/probe.md\nverify-proposal-refs.sh: 1 miss(es) in /tmp/probe.md\n  - BAD LINE RANGE: `.loom/docs/troubleshooting.md:100-200` \u2014 origin/main:.loom/docs/troubleshooting.md has only 0 lines\nexit=1\n```\n\nThe real document has 3031 lines. Because the script **blocks filing** (`hermit.md` / `architect.md`: \"Any miss blocks filing\"), this pushes proposers away from citing the installed doc paths, or into \"fixing\" a citation that was correct.\n\nThis is the same root cause as #8593 (Champion's premise-false gate reading `.loom/docs/*.md` symlinks through git and closing sound proposals on a check that cannot match). #8593 fixed the Champion side \u2014 the prompt rules, `champion-premise-false-evidence.md`'s `resolve_main_path()` recipe, and fixture coverage \u2014 and deliberately left this half out: see below.\n\n## Why it was not fixed in #8593's PR\n\nA working shell fix was prototyped in PR #8655 and dropped. It adds ~40 **code** lines to `defaults/scripts/verify-proposal-refs.sh`, which is category `contract` in `scripts/shell-allowlist.txt`, and `loom-daemon shell-budget --check` refuses any growth of the portable pool **with no `Shell-Budget-Growth:` override** (`check_against_rev`: \"Portable growth is NOT overridable, deliberately\"). Per `.loom/docs/shell-language-policy.md` the correct home for new logic behind a `contract` name is `loom-daemon`.\n\n## Suggested shape\n\n1. A `loom-daemon` verb that resolves a path against a rev \u2014 follow a `120000` tree entry to its real blob path (bounded hops; target is relative to the **link's own directory**; normalization must be **lexical**, since the path lives in a commit, not the working tree) and optionally report the resolved blob's line count.\n2. `verify-proposal-refs.sh` calls it in the line-range branch, reports the **resolved** path in any `BAD LINE RANGE` message, and reports a dangling link as *unreadable* (e.g. `BROKEN SYMLINK`) rather than \"has only 0 lines\" \u2014 an unreadable file is an inconclusive check, not a disproof (the same distinction #8593 established for Champion).\n3. Champion's `resolve_main_path()` snippet (`defaults/.claude/commands/loom/champion-premise-false-evidence.md`) can then point at the same verb instead of shipping a shell recipe in a prompt.\n\n## Acceptance criteria\n\n- [ ] A body citing an in-range line span under `.loom/docs/` exits 0 (no miss).\n- [ ] A genuinely out-of-range span under `.loom/docs/` still misses, and the message names the **resolved** path and the real line count.\n- [ ] A dangling symlink is reported as unreadable, not as a 0-line file.\n- [ ] `defaults/scripts/tests/test-verify-proposal-refs.sh` gains a symlink fixture covering all three (a draft of these fixtures exists in PR #8655's history).\n- [ ] `loom-daemon shell-budget --check` stays at +0 portable growth.\n\n<!-- loom:complexity=routine -->\n",
+     "curator_affected_files": [
+      "defaults/.claude/commands/loom/champion-premise-false-evidence.md",
+      "defaults/scripts/tests/test-verify-proposal-refs.sh",
+      "defaults/scripts/verify-proposal-refs.sh",
+      "git show origin/main:<path> | wc -l",
+      "loom-daemon/src",
+      "loom-daemon/src/main.rs",
+      "origin/main",
+      "scripts/shell-allowlist.txt"
+     ],
+     "affected_files_known": true,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; baseline from unedited Curator comment",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-22T17:23:50Z"
+    },
+    {
+     "issue": 8728,
+     "title": "Test the #7972 PR-less hold's forge path (apply_prless_hold_label) with the fake-gh harness",
+     "body": "## Context\n\nPR #8727 (#7972) added `loom-daemon/src/sweep_registry/prless_retry.rs`, whose\nmost consequential action is the **hold** at the threshold:\n`apply_prless_hold_label` adds `loom:blocked`, removes `loom:issue`, and posts a\nhold notice naming the failure and the count.\n\n## Gap\n\nEvery test in that module builds its registry with `config.skip_label_flip = true`\n(`prless_retry.rs`, `fn test_registry`). Under that flag `apply_prless_hold_label`\nreturns `PrlessHoldOutcome::VetoedNoForge` on its first line and never runs \u2014 so\nthe threshold test (`an_always_failing_worker_is_bounded_at_the_threshold`)\nasserts only the *in-memory* `held` flag. Measured: `grep -c install_fake_gh\nloom-daemon/src/sweep_registry/prless_retry.rs` -> `0`.\n\nThe forge-visible half of the mechanism is therefore unverified:\n\n- the `gh issue edit --add-label loom:blocked --remove-label loom:issue` argv,\n- the closed-issue veto (`issue_is_closed_or_pr(issue) == Some(true)`),\n- the open-PR re-verification veto (`probe_open_linked_pr`) and the\n  `VetoedOpenPr` -> `clear_prless_retry` path in `record_prless_release`,\n- the attempt-note comment posted from the second consecutive release.\n\n## Why it is worth closing\n\nThe harness already exists and a sibling mechanism uses it:\n`crate::sweep_registry::test_support::install_fake_gh_env_logger`, driven by\n`apply_quarantine_label_applies_registered_gh_config_dir`\n(`loom-daemon/src/sweep_registry/quarantine.rs:2505`). The same shape should be\ncheap to apply here.\n\n## Suggested acceptance criteria\n\n- [ ] A test with `skip_label_flip = false` and a fake `gh` asserts the hold's\n      argv contains `--add-label loom:blocked` and `--remove-label loom:issue`\n      for the right issue number.\n- [ ] A test asserts the hold notice comment is posted and carries\n      `PRLESS_RETRY_COMMENT_MARKER`.\n- [ ] A test asserts the `VetoedOpenPr` path: re-verification finding an open\n      linked PR does not flip labels and clears the tally.\n- [ ] A test asserts the closed-issue veto does not flip labels.\n\nFiled by Judge during review of PR #8727 (approved; this is follow-up coverage,\nnot a defect found in the diff).",
+     "curator_affected_files": [],
+     "affected_files_known": false,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; no Curator affected-files baseline exists (unknown, not empty)",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-23T06:37:00Z"
+    }
+   ],
+   "association": "independent",
+   "prs": [
+    {
+     "pr": 8741,
+     "issue": 8656,
+     "base_sha": "7a195a992edf997a4da09bd40e98e8bf8496cb21",
+     "head_sha": "8ae1a97b4b5c34c1fb8e46fdab2c32a8f6fbdf99",
+     "own_commits": [
+      "f5c8d75d257f7b0292f5d5fb8deb221fb672a4ce",
+      "fc171ffd3aad9ebd816066e0f5d2f12c085fa691",
+      "0adcf7046db5dc98f53fbdaf103554c9ccafc3b2",
+      "8ae1a97b4b5c34c1fb8e46fdab2c32a8f6fbdf99"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    },
+    {
+     "pr": 8740,
+     "issue": 8728,
+     "base_sha": "7a195a992edf997a4da09bd40e98e8bf8496cb21",
+     "head_sha": "91615e51aca4f1e057ed81ce82ca47a591799136",
+     "own_commits": [
+      "630ac57564471c39dc148017b139722f3efbc1d5",
+      "91615e51aca4f1e057ed81ce82ca47a591799136"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    }
+   ],
+   "selection": "same-repo issues created within 21 days, implemented by distinct merged PRs sharing one base commit; timeline-verified unedited snapshots"
+  },
+  {
+   "pair_id": "p-8758-8757",
+   "historical_commit": "0d0a5e6b71d3a7ffafd6764c4322a6de05e7936a",
+   "cutoff": "2026-09-23T13:33:40Z",
+   "issues": [
+    {
+     "issue": 8758,
+     "title": "observability: scheduled transcript archive + local sink (G2 part 1 of #8714)",
+     "body": "## Context\n\nSub-issue of #8714 (slice 3 of 5, \"G2 scheduled archive + `local` sink\"). Parent issue's own scoping \u2014 see #8714 for the full gap analysis. Explicitly independent of the other slices: no egress, no operator decision needed (unlike the sibling `s3`/R2 sink sub-issue, which is gated on D1/D2).\n\n## Problem\n\nRaw transcript archives stay in `~/.loom/transcript-archives` (`activity/transcript_archive.rs`, landed #8494) \u2014 but nothing schedules the archive pass. It is opt-in CLI only, with no config block and no scheduler. Claude Code deletes the transcript source at 30 days, so an unscheduled archive pass means archives are only created if someone remembers to run the command by hand before that window closes.\n\n## Proposal\n\nA `transcriptArchive` config block: `enabled`, `intervalSecs`, `minAgeHours`, `archiveDir`, `sinks: [...]` \u2014 so the daemon runs the existing archive pass on a schedule. This sub-issue covers the scheduler and the `local` sink only (the archive already lands locally today; this wires it to run unattended and ledgers the result).\n\nLedger the archive per `(archive, sink)` in `transcript_archive` so a re-run is idempotent \u2014 re-running after a partial failure does not re-archive what already succeeded.\n\nThe `s3`/R2 remote sink is deliberately **out of scope** for this sub-issue (sibling sub-issue, gated on operator decisions D1/D2 in the parent issue). This sub-issue's `sinks` list has exactly one member, `local`, at completion.\n\n## Acceptance Criteria\n\n- [ ] A `transcriptArchive` config block exists (`enabled`, `intervalSecs`, `minAgeHours`, `archiveDir`, `sinks`), and when `enabled: true`, the daemon runs the existing archive pass on the configured interval without manual CLI invocation.\n- [ ] `minAgeHours` is honored \u2014 a transcript younger than the threshold is not archived on a given pass.\n- [ ] Archive results are ledgered per `(archive, sink)`; re-running the scheduled pass after a partial failure does not re-archive an already-successfully-archived transcript.\n- [ ] With only `local` configured in `sinks`, behavior matches today's opt-in CLI archive pass (per #8494), just scheduled instead of manual.\n- [ ] No egress occurs from this sub-issue's scope \u2014 confirmed by the absence of any network call in the `local`-only code path.\n\n## Affected Files\n\n- `loom-daemon/src/activity/transcript_archive.rs` \u2014 existing archive pass (landed #8494, opt-in CLI only); add the scheduler and config-driven invocation\n- Config schema (exact location TBD \u2014 wherever other scheduled-task config blocks like `autonomous.*` are declared) \u2014 add `transcriptArchive`\n- `loom-daemon/src/main.rs` or the daemon's task-scheduling loop (exact location TBD \u2014 grep for how other interval-driven background passes, e.g. transcript-ingest's 15-minute cadence, are scheduled) \u2014 wire in the new scheduled pass\n\n## Test Plan\n\n- [ ] Automated tests: with `transcriptArchive.enabled: true` and a short `intervalSecs`, confirm the archive pass runs without manual invocation\n- [ ] Automated tests: `minAgeHours` correctly excludes a transcript younger than the threshold\n- [ ] Automated tests: idempotency \u2014 re-running after a simulated partial failure does not re-archive a transcript already ledgered as archived to `local`\n- [ ] Manual verification: enable the config block on a host with existing transcripts, confirm archives appear in `archiveDir` on schedule with no manual CLI step\n\n<!-- loom:complexity=routine -->\n\n**Why `routine`, not `complex`**: this wires an existing, already-tested archive pass to a scheduler and a config block \u2014 no new egress, no new decision, no new external dependency. The idempotency ledger is the one subtlety, but it is a bounded, testable mechanism, not a judgment call.\n\n## Related\n\n- Parent: #8714 (observability multi-sink export)\n- Sibling sub-issue: G2 `s3`/R2 sink (deliberately out of scope here; gated on operator decisions D1/D2)\n- #8494 (existing archive pass, landed, reused not rebuilt)",
+     "curator_affected_files": [
+      "autonomous.*",
+      "loom-daemon/src/activity/transcript_archive.rs",
+      "loom-daemon/src/main.rs"
+     ],
+     "affected_files_known": true,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; baseline from issue body",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-23T13:33:40Z"
+    },
+    {
+     "issue": 8757,
+     "title": "observability: session.summary record kind from transcript-ingest (G3 part 1 of #8714)",
+     "body": "## Context\n\nSub-issue of #8714 (slice 2 of 5, \"G3 `session.summary`\"). Parent issue's own scoping \u2014 see #8714 for the full gap analysis. Rides on the multi-exporter sink list (the G1 slice, sibling sub-issue) to actually reach more than one backend, but the record kind itself does not require G1 to have merged first to be implemented \u2014 only to be validated end-to-end in both backends per Acceptance below.\n\n## Problem\n\nTranscripts are today read for token counts only (`activity/transcript_ingest.rs`). The only rollups are local SQL views (`cost_by_*`) and the dashboard's token-analytics page. There is no per-session record on the wire at all \u2014 nothing carries session-level shape (role, repo, issue, model, turn/tool-call counts) to any exporter.\n\n## Proposal\n\nA new record kind, `session.summary`, emitted by the existing transcript-ingest pass and shipped through whatever exporters are configured (the G1 sink list): one record per transcript (session or subagent), carrying:\n\n- `session_id`, `parent_session_id`\n- `runtime`, `role`, `repo`, `issue`, `pr_number`\n- `model(s)` used\n- four token counters (matching whatever the existing `activity.db` schema already tracks)\n- `wall_ms`, `turns`, `tool_calls` (histogram by tool name), `tool_errors`\n- `outcome`, if known\n\nAttributes only from the existing `loom.*` allowlist plus the new ids #8664 already proposes. Must obey the epic's wire-safety rule: no prompts, generated code, raw tool arguments/output, keys or emails on the wire \u2014 this is a **summary**, not a transcript excerpt.\n\n`session.analysis` (derived rollups: retry-loop detection, longest tool call, USD cost, anomaly flags) is explicitly a separate, later slice (sibling sub-issue, slice 5) \u2014 do not fold it in here.\n\n## Acceptance Criteria\n\n- [ ] A `session.summary` record kind exists, populated by the existing transcript-ingest pass, containing exactly the fields listed above (no prompt/tool-output/key/email content).\n- [ ] The record is shipped through the exporter(s) configured via the G1 sink list (validate against at least one sink end-to-end; full multi-sink validation depends on the G1 sub-issue landing).\n- [ ] `session.summary` rows for a day of daemon work are queryable (by role, model, repo) in whichever indexed backend is available for testing \u2014 per #8714's parent Acceptance, ClickHouse is the target once #8529's fixture manifest / the G1 sink applies.\n- [ ] Extend the existing redaction tests to cover the new record kind: no prompt, tool output, key, or email ever appears on the wire for a `session.summary` record.\n\n## Affected Files\n\n- `loom-daemon/src/activity/transcript_ingest.rs` \u2014 existing transcript-ingest pass; extend to emit the new record kind alongside its current token-count-only reads\n- `loom-daemon/src/observability/` \u2014 new record-kind definition, wherever `TelemetryEnvelope`'s existing record kinds are declared (exact module TBD \u2014 grep for the existing record-kind enum once scoping starts)\n- Redaction test suite (exact file TBD \u2014 grep for the existing \"no prompt/key/email on the wire\" test, likely alongside `exporter.rs` or `otlp/`) \u2014 extend for `session.summary`\n- `#8664`'s proposed new ids (referenced in this issue's own Proposal) \u2014 confirm exact attribute names before implementing, to avoid a second, incompatible id scheme\n\n## Test Plan\n\n- [ ] Automated tests: a fixture transcript produces exactly one `session.summary` record with the documented fields populated correctly (including a subagent transcript producing a record with `parent_session_id` set)\n- [ ] Automated tests: extend the redaction test suite \u2014 assert no prompt, tool output, key, or email appears in a `session.summary` record for a transcript that contains all four\n- [ ] Manual verification: once at least one exporter is configured, confirm a day's worth of `session.summary` rows are queryable by role/model/repo in the indexed backend available for testing\n\n<!-- loom:complexity=routine -->\n\n**Why `routine`, not `complex`**: this is a new, additive record kind emitted from an existing, already-instrumented ingest pass \u2014 the shape is fully specified by the parent issue and by existing schema (`activity.db`'s token counters), and a mistake (a missing field, a redaction gap) would surface in the redaction test or in a straightforward review of the record shape, not as a silent architectural regression.\n\n## Related\n\n- Parent: #8714 (observability multi-sink export)\n- Sibling sub-issue: G1 multi-exporter (this slice rides its sink list to reach more than one backend)\n- Sibling sub-issue: G3 `session.analysis` (later slice, derived from this record \u2014 do not fold in here)\n- #8664 (interactive-session ids this record's attributes should reuse)\n- #8529 (fixture manifest referenced by the parent's validation approach)",
+     "curator_affected_files": [
+      "exporter.rs",
+      "loom-daemon/src/activity/transcript_ingest.rs",
+      "loom-daemon/src/observability/",
+      "otlp/",
+      "session.summary"
+     ],
+     "affected_files_known": true,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; baseline from issue body",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-23T13:33:20Z"
+    }
+   ],
+   "association": "independent",
+   "prs": [
+    {
+     "pr": 8774,
+     "issue": 8758,
+     "base_sha": "0d0a5e6b71d3a7ffafd6764c4322a6de05e7936a",
+     "head_sha": "9767f3bb0d00557ab3404b825bb8fbfaa3c292f2",
+     "own_commits": [
+      "9767f3bb0d00557ab3404b825bb8fbfaa3c292f2"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    },
+    {
+     "pr": 8772,
+     "issue": 8757,
+     "base_sha": "0d0a5e6b71d3a7ffafd6764c4322a6de05e7936a",
+     "head_sha": "21f190e2e10254eda3f5cd1a78b7b005e1d9b09f",
+     "own_commits": [
+      "b50cfc89b61afa22e22bc7bdcb7f7b8130628cdc",
+      "b94d321b5b4e4ce5e752e7828aef851370b7f94c",
+      "21f190e2e10254eda3f5cd1a78b7b005e1d9b09f"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    }
+   ],
+   "selection": "same-repo issues created within 21 days, implemented by distinct merged PRs sharing one base commit; timeline-verified unedited snapshots"
+  },
+  {
+   "pair_id": "p-8683-8770",
+   "historical_commit": "070b3b5f54ba9eb1b536302301b840dcd7d304c7",
+   "cutoff": "2026-09-23T15:22:57Z",
+   "issues": [
+    {
+     "issue": 8683,
+     "title": "Flaky test: role_runner shrinking_the_ring\u2026 fails on its random-draw precondition (OTLP job only, same commit passes elsewhere)",
+     "body": "## Symptom\n\n`role_runner::tests::shrinking_the_ring_reassigns_the_departed_hosts_slice_to_the_survivor`\nfails non-deterministically on its **precondition** assert, not on the behaviour it\nexists to pin:\n\n```\nthread 'role_runner::tests::shrinking_the_ring_reassigns_the_departed_hosts_slice_to_the_survivor'\npanicked at loom-daemon/src/role_runner/tests.rs:5121:5\n```\n\n`loom-daemon/src/role_runner/tests.rs:5121` is:\n\n```rust\nassert!(!orphaned.is_empty(), \"precondition: host 1 must have owned something to orphan\");\n```\n\n## Evidence it is non-deterministic, not a real regression\n\nObserved on PR #8662 at head `3bcd26eb2`, where **two jobs of the same CI run, on the\nsame commit, disagreed**:\n\n| Job | Result |\n|---|---|\n| Rust Unit Tests (`process-per-test`) | 8123 run, **8123 passed**, 0 failed |\n| Rust OTLP Feature Build & Test | 8190 run, 8189 passed, **1 failed** (this test) |\n\nRun: https://github.com/rjwalters/loom/actions/runs/35776125577\n\nThe same job passed on that branch's base commit (`039725289`) on `main`\n(run `35771235363`). PR #8662 touches only `.github/workflows/release.yml`,\n`defaults/docs/release-cadence.md` and `loom-daemon/src/release_resolve/` \u2014 nothing\nthat can reach `role_runner`.\n\n## Likely cause\n\nThe test is `#[serial]` and mutates global shard state via `ShardEnvGuard`, then builds\na 12-workspace fleet of `tempfile::TempDir`s and asserts that a 2-shard ring leaves at\nleast one of them **not** owned by host 0. Ownership is derived from the workspace path,\nwhich is a randomly-named temp directory \u2014 so the precondition is a statement about a\nrandom draw, and it is also exposed to whatever global env/shard state a neighbouring\nserial test left behind. Both are enough to make the *precondition* (not the assertion\nunder test) fail occasionally.\n\n## Suggested fix direction\n\nMake the precondition deterministic rather than drawn: use fixed, known workspace paths\n(or seed/choose paths until both shards are non-empty) so the test asserts the\nreassignment behaviour it is named for, and never fails on the setup. Failing that,\nassert the ring split up front and skip/retry the draw rather than panicking.\n\n## Impact\n\nA red `Rust OTLP Feature Build & Test` on healthy PRs \u2014 exactly the false red\n`.loom/docs/ci-principles.md` calls out, and it blocks merges until someone\nre-runs the job by hand.\n\n---\n\n## Curator Enhancement\n\nProblem statement, evidence (two CI jobs on the same commit disagreeing), root-cause analysis, and suggested fix direction are already clear and well-argued. Verified the test exists exactly as cited: `loom-daemon/src/role_runner/tests.rs:5110` (`shrinking_the_ring_reassigns_the_departed_hosts_slice_to_the_survivor`), with the precondition assert at line 5121 matching the panic message verbatim. `ShardEnvGuard` (line 4928) and the `#[serial]` attribute are present as described. `gh run view 35776125577` confirms the linked CI run's conclusion is `failure`. Duplicate check surfaced only unrelated cross-references (PR #8662, the same PR this issue's own evidence table cites \u2014 absorbed; and #8681, an unrelated docs-parity issue that only cross-references this one as an example of a different auto-label pattern \u2014 disregarded as out of scope).\n\n### Acceptance Criteria\n\n- [ ] `shrinking_the_ring_reassigns_the_departed_hosts_slice_to_the_survivor`'s precondition (`orphaned` must be non-empty) can no longer fail on an unlucky random draw \u2014 either by using fixed/deterministic workspace paths, or by choosing/seeding paths until the ring split is guaranteed non-trivial before asserting.\n- [ ] The behavior under test (reassignment of the departed host's slice to the survivor) is still exercised and still fails if that behavior regresses \u2014 the fix must not weaken the test into a tautology.\n- [ ] The fix does not depend on evaluation order or leftover state from a neighboring `#[serial]` test (per the issue's own \"Likely cause\" section).\n- [ ] Re-run the affected job (`Rust OTLP Feature Build & Test`) or an equivalent repeated-run harness enough times to gain confidence the flake is gone (a single green run does not prove non-determinism is fixed).\n\n### Affected Files\n\n- `loom-daemon/src/role_runner/tests.rs` \u2014 the test itself (starts at line 5110), and `enabled_workspace()`/`ShardEnvGuard` (line 4928) if the fix changes how workspace paths or shard state are set up.\n\n### Test Plan\n\n- [ ] Automated tests: the fixed test passes deterministically; run it repeatedly (e.g. `cargo test --workspace shrinking_the_ring -- --test-threads=1` in a loop, or via any existing flake-detection harness) to confirm the precondition no longer depends on a random draw.\n- [ ] Automated tests: the full `role_runner::tests` module still passes under both the default and OTLP feature builds.\n- [ ] Manual verification: confirm the fixed assertion still fails if the reassignment behavior itself is deliberately broken (i.e. the test still tests what it's named for).\n\n<!-- loom:complexity=mechanical -->\n\nWhy `mechanical`, not `routine`: this is a self-contained test-only fix (no production code path changes) with an unambiguous verification method \u2014 a mistake is obvious from re-reading the diff, and correctness is directly checkable by running the test repeatedly.",
+     "curator_affected_files": [
+      "loom-daemon/src/role_runner/tests.rs"
+     ],
+     "affected_files_known": true,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; baseline from issue body",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-22T20:17:13Z"
+    },
+    {
+     "issue": 8770,
+     "title": "Auto-update: post-provision codesign check is unbounded and misreports a non-answer as a signature downgrade",
+     "body": "## Bug Description\n\nThe post-provision signature-downgrade check in `defaults/scripts/cli/loom-daemon-update.sh`\n(`verify_destination_artifact()`, around line 1235) has the same\n\"could not verify\" vs \"verified and it's bad\" collapse that #8754 fixed one\nlayer up in `loom-daemon/src/release_fetch/signature.rs::verify_darwin` \u2014\nbut in the shell, and with an additional unbounded-hang gap.\n\n```bash\nif [[ \"$ARTIFACT_SIGNATURE_HAD_AUTHORITY\" == \"true\" ]]; then\n    ...\n    dest_sig_desc=\"$(codesign -dvvv \"$dest\" 2>&1 || true)\"\n    if ! grep -q '^Authority=' <<<\"$dest_sig_desc\"; then\n        err \"Post-provision verification FAILED: ... Provisioning has DOWNGRADED the signature ...\"\n        exit 5\n    fi\n```\n\nTwo distinct problems:\n\n1. **Unbounded.** There is no `timeout` around `codesign -dvvv`. On exactly\n   the contended host that motivated #8754 (where `timeout 20 codesign -dvv\n   /usr/bin/codesign` on a stock Apple system binary was observed to hang),\n   this invocation hangs the update script indefinitely with no deadline and\n   no diagnostic. Every other `codesign` invocation in the update path now\n   runs under a deadline (`VERIFY_TIMEOUT` in `signature.rs`); this one does\n   not.\n\n2. **Misclassified if it does not answer.** `|| true` swallows any non-zero\n   exit (including a `timeout`-induced 124, were one added), leaving\n   `dest_sig_desc` empty. The `grep -q '^Authority='` then fails, and the\n   script reports **\"Provisioning has DOWNGRADED the signature\"** and\n   `exit 5` \u2014 an alarming, specific accusation about what provisioning did,\n   produced by a `codesign` that never reported anything at all. This is the\n   #8754 conflation verbatim: \"we could not check\" rendered as \"we checked\n   and it is bad\".\n\nNote that this check runs only when the pre-provision download demonstrably\ncarried an `Authority=` line (`ARTIFACT_SIGNATURE_HAD_AUTHORITY == \"true\"`),\nwhich is precisely the case PR for #8754 still sets `had_authority:\nSome(true)` for when only the `codesign --verify` call times out \u2014 so a host\nunder enough load to time out the Rust-side verify can reach this unbounded\nshell-side `codesign` on the very next step.\n\n## Reproduction Steps\n\n1. Read `defaults/scripts/cli/loom-daemon-update.sh` around line 1226\u20131243\n   (`verify_destination_artifact()`).\n2. Confirm `codesign -dvvv \"$dest\"` carries no `timeout` wrapper, unlike the\n   `codesign` invocations in `loom-daemon/src/release_fetch/signature.rs`\n   (which run under `cmd_out::run_command(.., VERIFY_TIMEOUT)`).\n3. Confirm that an empty `dest_sig_desc` \u2014 the state produced by any\n   `codesign` that fails to print its report, for any reason \u2014 takes the\n   `exit 5` \"signature DOWNGRADED\" branch rather than an inconclusive one.\n\n## Expected Behavior\n\n- The invocation runs under an explicit deadline (matching the rest of the\n  update path's `codesign` calls).\n- A `codesign` that does not complete produces an **inconclusive** result \u2014\n  a `warn` and a skip of the downgrade check, the same disposition the\n  branch already uses a few lines above when `codesign` is not installed at\n  all (`\"'codesign' not available -- cannot verify the destination binary's\n  signature survived provisioning\"`) \u2014 not `exit 5` with a downgrade\n  accusation.\n- Only a `codesign` that **ran to completion** and reported no `Authority=`\n  line may take the `exit 5` downgrade path.\n\n## Actual Behavior\n\nA `codesign` that hangs blocks the update script forever; a `codesign` that\notherwise produces no output causes the script to report a signature\ndowngrade that was never observed, and abort provisioning with `exit 5`.\n\n## Impact\n\nSame class and same host conditions as #8754 (a busy macOS host makes\n`codesign` slow), one layer further into the update, with a worse failure\nmode: an indefinite hang rather than a bounded abort, and an incorrect\naccusation about what provisioning did to the binary's signature rather than\nabout the release artifact.\n\n## Scope note\n\nOut of scope for #8754, which is bounded to `verify_darwin` in\n`loom-daemon/src/release_fetch/signature.rs` plus its test file. Filed\nseparately per Builder scope discipline while implementing #8754.\n\n<!-- loom:premise-check exists=yes deliberate=no reversal=no verdict=clear -->\npremise-searched: defaults/scripts/cli/loom-daemon-update.sh (verify_destination_artifact, the `codesign -dvvv \"$dest\"` call at ~line 1235 and the `ARTIFACT_SIGNATURE_HAD_AUTHORITY == \"true\"` gate at ~1226); loom-daemon/src/release_fetch/signature.rs (for the bounded-invocation contrast); grep for `codesign` across defaults/scripts confirms this is the only remaining unbounded one in the update path.\n<!-- loom:complexity=routine -->\n",
+     "curator_affected_files": [],
+     "affected_files_known": false,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; no Curator affected-files baseline exists (unknown, not empty)",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-23T15:22:57Z"
+    }
+   ],
+   "association": "independent",
+   "prs": [
+    {
+     "pr": 8815,
+     "issue": 8683,
+     "base_sha": "070b3b5f54ba9eb1b536302301b840dcd7d304c7",
+     "head_sha": "86492198632c89cf739c7c639e62c1192889f07b",
+     "own_commits": [
+      "86492198632c89cf739c7c639e62c1192889f07b"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    },
+    {
+     "pr": 8781,
+     "issue": 8770,
+     "base_sha": "070b3b5f54ba9eb1b536302301b840dcd7d304c7",
+     "head_sha": "bf60b739b48a2eaf321103d9b56bf56f602a09ab",
+     "own_commits": [
+      "8f033bdcb0d1d758b60f6235f51faa2dba1d7100",
+      "d94d066da9d6cc61c53ed580fcc438146061d322",
+      "bf60b739b48a2eaf321103d9b56bf56f602a09ab"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    }
+   ],
+   "selection": "same-repo issues created within 21 days, implemented by distinct merged PRs sharing one base commit; timeline-verified unedited snapshots"
+  },
+  {
+   "pair_id": "p-8785-8795",
+   "historical_commit": "0efd18c7237106b2da1c65ae5150ba3e6bc9a9d1",
+   "cutoff": "2026-09-23T23:31:24Z",
+   "issues": [
+    {
+     "issue": 8785,
+     "title": "Codex private-clone mode: persistent session workspaces and exclusive account leases",
+     "body": "Part of #4489; extends the session-container implementation in #6896. First implementation step of the operator-requested private-clone path to routine daemon Codex.\n\n## Problem and operator direction\n\nA session container currently mounts the host workspace read-write at the same absolute path. That makes host worktrees accessible, but container execution alone does not isolate the host checkout, shared Git metadata, or sibling repositories. The inspected Studio session configuration on 2026-09-23 mounted the whole GitHub directory read-write.\n\nThe operator proposed one isolated repository copy per Docker container and then asked to queue this as the fastest path to Codex integration, deferring improvements. This is that explicit session direction, recorded by Codex; it is not an autonomous request to change all workers.\n\n## Recommended implementation\n\nAdd an opt-in private-clone workspace mode to the existing persistent account session lifecycle. Keep the existing host-mounted mode available. Preserve one persistent account-owned authentication profile outside all repositories.\n\nUse a Docker-managed persistent workspace volume owned by one account container. Prepare an independent clone of the configured forge repository inside it, with private Git metadata and objects; reuse it for subsequent jobs. Start from the resolved remote base revision and use existing issue-branch/worktree helpers entirely inside this private clone. Do not copy a dirty host checkout, use host Git alternates/shared object directories, or mount a writable host repository tree. Use private persistent build caches for this mode initially.\n\nAcquire one exclusive job lease for the entire account session, covering every repository and both standalone roles and sweeps. Interactive repository-writing sessions must participate in this exclusion or cause admission to refuse. Different accounts may run concurrently.\n\nRecord enough secret-free identity to validate and recover the workspace: account, container identity, repository identity, private root, base revision, job owner and issue/branch. Unknown dirty or unpushed work must be retained and reported, never reset or removed just to make a slot reusable. A stale lease is reclaimable only after proving the old worker stopped; missing or ambiguous evidence remains unavailable.\n\n## Acceptance criteria\n\n- [ ] Supported session start/status/stop interfaces expose the workspace mode and private-root identity; mismatched existing containers refuse reuse with an actionable migration instruction.\n- [ ] A private-clone container has no host checkout or sibling-repository mount, no writable Git/object/cache sharing with another account, no container-runtime socket, and no privileged host escape.\n- [ ] Clone/fetch use existing supported forge authentication without credentials in remote URLs, repositories, image layers or logs. The account authentication profile keeps its existing single-owner refresh semantics.\n- [ ] Two simultaneous claims against the same account admit exactly one job, including role-vs-sweep and interactive-vs-daemon collisions. Different-account claims succeed independently.\n- [ ] Restart/reuse, wrong repository identity, stale lease with surviving child, dirty checkout and unpushed commits have deterministic outcomes with no silent work loss. Workspace cleanup never deletes the account credential profile.\n- [ ] Credential-free real-Docker tests prove private Git metadata/objects, successful local branch/worktree operations, persistent workspace reuse, and failed attempts to alter host/sibling/account-peer fixture repositories. Unit tests cover lease races and failure paths.\n- [ ] Update the mount contract and session architecture documentation with this explicitly separate workspace mode, including private-cache placement and safe idle-container migration. Existing host-mounted mode retains its documented behavior.\n- [ ] No daemon routing default or global Codex capability promotion changes in this issue.\n\n## Implementation starting points \u2014 curator must verify\n\nVerified against origin/main at 135183d9b2527cb2cc81d2c5d8e0ba1f2213c645 on 2026-09-23:\n\n- `loom-daemon/src/tokens_pool/session_lifecycle.rs` \u2014 account-owned session creation, path-parity workspace labels, reuse and stop checks.\n- `loom-daemon/src/session_exec.rs` \u2014 existing supervised worker lifetime contract from #8773.\n- `docker/worker/MOUNT-CONTRACT.md` \u2014 current mandatory path-parity and shared-build-cache contract; document the private-clone alternative explicitly.\n- `docker/session/README.md` and `docs/adr/0017-session-container-architecture.md` \u2014 persistent authentication, headless execution, socket-free containment.\n\nNew lifecycle logic belongs in Rust behind the existing commands; keep the shell adapter thin.\n\n## Dependencies and scope\n\nNo open code prerequisite. #8773 is merged via #8775; retain its supervised cancellation guarantees. The separate #8776 registry-lock fix is already being implemented and should not be duplicated.\n\nDispatch integration and capability admission follow in separate issues. Defer shared object caches, cross-account build-cache optimization, extra jobs per account and alternative container engines.\n\n<!-- loom:premise-check exists=yes deliberate=yes reversal=no verdict=clear -->\npremise-evidence: loom-daemon/src/tokens_pool/session_lifecycle.rs:17 \u2014 existing session workspaces deliberately use host path-parity mounts.\npremise-evidence: docs/adr/0017-session-container-architecture.md \u2014 persistent account ownership and socket-free headless execution are intentional.\npremise-extends: add an explicitly selected independent-clone workspace mode under the operator's 2026-09-23 direction; retain the existing host-mounted mode and account ownership contract. Extend the mount contract to describe both modes instead of silently changing its meaning.",
+     "curator_affected_files": [],
+     "affected_files_known": false,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; no Curator affected-files baseline exists (unknown, not empty)",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-23T21:32:25Z"
+    },
+    {
+     "issue": 8795,
+     "title": "champion-epic.md: the idempotency guard reads SKIP_STREAK from any marker-bearing comment, not just a rejection verdict",
+     "body": "## Summary\n\n`champion-epic.md`'s \"Idempotency Guard for Unrevised Epics\" selects the verdict\ncomment it reads `SKIP_STREAK` out of **purely by marker string**:\n\n```bash\nelif printf '%s\\n' \"$EPIC_JSON\" | jq -e --arg m \"$VERDICT_MARKER\" \\\n       '.comments[] | select(.body | contains($m))' >/dev/null; then\n  VERDICT_COMMENT=$(gh api \"repos/{owner}/{repo}/issues/$EPIC_NUMBER/comments\" --paginate \\\n    --jq \".[] | select(.body | contains(\\\"$VERDICT_MARKER\\\"))\" | jq -s 'last')\n```\n\nIt never checks that the matched comment's own body actually says\n`Champion Review: Epic Needs Revision` before deriving `SKIP_STREAK` (and hence\n`UNREVISED_EVALS`) from it.\n\n#7666 closed the *writing* half of this \u2014 `champion-epic-standdown.md` now writes\nits own `champion:epic-tracking-umbrella:body-*` marker, and\n`defaults/scripts/tests/test-champion-epic-verdict-marker-scope.sh` statically pins\nthe single-writer rule. The **reading** half is still marker-only, so a\n**pre-#7666 stray** comment that already carries the reserved marker keeps\ncorrupting the ladder on epics that are still open today.\n\n## Why the existing stray-marker backstop does not catch it\n\nThe guard's stray-marker branch keys on `PRIOR_REJECTIONS -eq 0`, and\n`PRIOR_REJECTIONS` is a **whole-issue-history** count of\n`Champion Review: Epic Needs Revision` comments \u2014 it does not care which body\nrevision they were posted against. So an epic that was rejected on an *old* body,\nlater fixed, and then had its **passing** verdict comment tagged (pre-#7666) with\nthe *new* body's reserved marker reads as:\n\n- marker match (from the passing comment), **plus**\n- `PRIOR_REJECTIONS >= 1` (from the old, superseded rejections), **plus**\n- a `SKIP_STREAK` parsed out of the passing comment's own\n  `champion:epic-unrevised-skips:<hash>:N` tally,\n\nso `UNREVISED_EVALS = PRIOR_REJECTIONS + SKIP_STREAK` climbs past the cap and the\nguard escalates a healthy epic that has never failed its *current* body's\nevaluation.\n\n## Live evidence\n\nObserved on `rjwalters/kicad-tools` during a Champion pass (2026-09-23), filed\nthere as rjwalters/kicad-tools#5712:\n\n- **#4410** \u2014 the comment matching the current body hash (`c01167674ddc243d`, id\n  `5688541921`, posted 2026-09-15) is titled *\"Champion Review: Epic Passes\n  Evaluation \u2014 Already Decomposed, No Action Needed\"*, not a rejection.\n  `UNREVISED_EVALS` = 5 against a cap of 2.\n- **#3438** \u2014 identical shape (`091e57a55577e9de`, id `5678899866`), carrying its\n  own `champion:epic-unrevised-skips:...:3` tally.\n\nBoth epics are healthy and actively worked. Following the guard mechanically\nwould have parked both at `loom:operator-only` with an escalation comment claiming\n\"repeatedly failing structural criteria\" \u2014 false, and it also removes them from\nStep 0's completion-first check so they can no longer auto-close.\n\nThe stray markers themselves cannot be un-written; they are already posted on live\nepics. The reader must be defensive about them.\n\n## Proposed fix\n\nRequire the matched comment's **own body** to contain\n`Champion Review: Epic Needs Revision` before treating it as a rejection verdict:\n\n- filter the REST `VERDICT_COMMENT` selection on the rejection title as well as\n  the marker, and\n- widen the stray-marker branch so that a marker match with **no rejection-bearing\n  comment behind it** takes the existing \"no tally, no escalation, no comment\"\n  path, regardless of `PRIOR_REJECTIONS`.\n\nA failed REST re-read (empty body) then also lands in the no-escalation direction,\nconsistent with #7965's fail-open rule.\n\n## Acceptance Criteria\n\n- [ ] The guard cannot derive `SKIP_STREAK` / `UNREVISED_EVALS` from a comment\n      that carries the reserved marker but is not a\n      `Champion Review: Epic Needs Revision` verdict\n- [ ] A marker match whose only marker-bearing comment is a passing/stand-down\n      verdict takes the stray-marker path (no tally, no escalation, no comment)\n      even when `PRIOR_REJECTIONS >= 1`\n- [ ] `defaults/scripts/tests/test-champion-epic-verdict-marker-scope.sh` gains a\n      fixture pinning exactly that shape, with a negative control so it cannot\n      pass vacuously\n",
+     "curator_affected_files": [],
+     "affected_files_known": false,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; no Curator affected-files baseline exists (unknown, not empty)",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-23T23:31:24Z"
+    }
+   ],
+   "association": "independent",
+   "prs": [
+    {
+     "pr": 8800,
+     "issue": 8785,
+     "base_sha": "0efd18c7237106b2da1c65ae5150ba3e6bc9a9d1",
+     "head_sha": "e688200e4e0d3241345897d239848ecd4be529d4",
+     "own_commits": [
+      "240574162273f9e93eaebeb05199fbdfcecd7236",
+      "e688200e4e0d3241345897d239848ecd4be529d4"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    },
+    {
+     "pr": 8798,
+     "issue": 8795,
+     "base_sha": "0efd18c7237106b2da1c65ae5150ba3e6bc9a9d1",
+     "head_sha": "3367dab01eb2d6af9382683039820457f5c3a17f",
+     "own_commits": [
+      "3367dab01eb2d6af9382683039820457f5c3a17f"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    }
+   ],
+   "selection": "same-repo issues created within 21 days, implemented by distinct merged PRs sharing one base commit; timeline-verified unedited snapshots"
+  },
+  {
+   "pair_id": "p-8824-8796",
+   "historical_commit": "f91fe213ebddf0f167c4264f48d98bb4f265c91c",
+   "cutoff": "2026-09-24T19:15:33Z",
+   "issues": [
+    {
+     "issue": 8824,
+     "title": "observability: capture all GitHub Actions runs/jobs of the 2amlogic org as OTLP telemetry via a loom-daemon ci-telemetry poller (SigNoz build/CI visibility, phase 1 of 3)",
+     "body": "## What\n\nCapture **every GitHub Actions run and job** of the `2amlogic` org as first-class OTLP telemetry from a new `loom-daemon ci-telemetry` poller. This is the foundation for standing build/CI observability in SigNoz: durations, outcomes, and per-run structure become queryable so we can retro on build/CI time regressions (motivation: build and CI times are currently felt but invisible \u2014 regressions only surface as \"everything is slower\").\n\nPart of the SigNoz observability track (epic #8522): the transport (daemon OTLP exporter \u2192 neutral gateway \u2192 SigNoz) already exists; this issue adds the **CI source** that currently does not exist at all. Follow-on phases: full job-log capture with collector-side redaction (filed next), and SigNoz retro surfaces (filed next) \u2014 cross-linked at filing.\n\n## Design (grounded in existing modules)\n\n**New Rust module** `loom-daemon/src/ci_telemetry/` + CLI subcommand `ci-telemetry` (per the shell-language policy: new executable logic is a daemon subcommand, not a `.sh`).\n\n### CLI\n- `loom-daemon ci-telemetry --once` \u2014 one poll cycle across the configured org; non-zero exit with a named reason on failure (a poll that cannot run must not look like a poll that passed \u2014 ci-principles rule 6)\n- `loom-daemon ci-telemetry status` \u2014 ledger size, per-repo watermarks, last successful poll, records emitted/exported\n- Daemon-integrated periodic poller when `autonomous.ciTelemetry.enabled=true` (default **false**, FLAGS-OFF; `LOOM_CI_TELEMETRY_*` env overrides, env > config > default via `config_resolver.rs`)\n\n### Config block (`.loom/config.json` \u2192 `autonomous.ciTelemetry`)\n| Key | Default |\n|---|---|\n| `enabled` | `false` |\n| `org` | `2amlogic` |\n| `intervalSecs` | 120 |\n| `excludedRepos` | `[]` |\n| `logCaptureEnabled` | `false` (phase 2 flips it; must be a config gate, see scope) |\n\n### Polling + dedup (\"never do the same job twice\")\n- Discover repos via `GET /orgs/{org}/repos` (paginated, ETag/304-cached \u2014 the `forge_cached_list.rs` mechanism, never raw re-listing)\n- Per repo: `GET /repos/{o}/{r}/actions/runs` with a `created_after` watermark from the ledger; for each unseen run \u2192 `GET /actions/runs/{id}/jobs`\n- **Durable ledger** at `.loom/state/ci-telemetry/seen.jsonl`: append-only `(repo, run_id, job_id)` entries + per-repo watermark (latest observed `run.created_at`), fsynced before a record is emitted. A job is emitted **exactly once** regardless of restarts, re-polls, or re-runs. A crash between write and emit must never double-emit: the ledger write is the commit.\n- Multi-host posture: polling may run on more than one fleet host, but records carry **stable identities** (`run_id`/`job_id` as the dedup key in attributes + local ledger) so a recipient can dedup; document the single-poller-as-normal-case assumption, per-repo lease coordination is explicitly out of scope unless fleet primitives make it trivial (one mechanism per behaviour \u2014 do not invent a second coordination layer)\n- Rate limits: honour the existing rate-limit breaker; budget = repos \u00d7 2 request families per interval; a 403/secondary-limit backs off the whole org, not per-repo hammering\n\n### Emission (through the existing `observability` OTLP exporter \u2014 no new transport)\n- Record kinds: `ci.run` (repo, workflow, ref, head_sha, event, status, conclusion, triggered_by, started_at, completed_at) and `ci.job` (+ job name, runner label, attempts, timed_out) \u2014 mapped in `observability/otlp/mapping.rs` alongside the existing lifecycle kinds\n- Metrics: `loom.ci.run.duration_ms` and `loom.ci.job.duration_ms` histograms; labels **only** `repo`, `workflow`, `job`, `runner`, `conclusion` (low-cardinality allowlist rule; never sha/ref/issue-number in metric labels)\n- Traces: one trace per run, one span per job (parent/child like the sweep traces in `telemetry/trace/`), so Trace Explorer shows the CI waterfall\n- **Local journal** `.loom/logs/ci-telemetry.jsonl` is written regardless of whether any exporter is configured (the `sweep-outcome-telemetry.jsonl` pattern) \u2014 the poller is useful offline\n\n### Gateway allowlist\nExtend `defaults/observability/collector/config.yaml` `keep_keys` with exactly the `loom.ci.*` attributes this phase emits; the fan-out contract test (`collector_fanout`) must assert each one. Nothing else admitted.\n\n## Acceptance criteria\n\n1. `loom-daemon ci-telemetry --help` documents the subcommand; building without the `otlp` feature still compiles (OTLP-gated paths behind the existing feature, like `exporter.rs`)\n2. With a recorded-fixture GitHub API (wiremock-style or recorded responses, committed under the test dir \u2014 no live-network tests in CI), `--once` over a synthetic org with 2 repos \u00d7 3 runs \u00d7 4 jobs emits 2 `ci.run` + 3\u00d74 `ci.job` records to the local journal with correct durations\n3. **Idempotency (the money AC)**: a second `--once` over the same fixture emits **zero** records; killing the process mid-cycle and re-running emits each job exactly once total (ledger is the commit)\n4. Unit tests cover: pagination continuation, `created_after` watermark advance, ETag 304 no-op on repo discovery, rate-limit backoff, ledger crash-recovery (torn trailing line is detected and repaired, not double-counted)\n5. `status` distinguishes: never-polled / last-ok + age / failing + last error \u2014 silence never reads as healthy (house discipline)\n6. `defaults/docs/ci-observability.md` created (phase-1 section: config reference, dedup contract, local journal schema) with `.loom/docs/` parity copy (Docs/Defaults Parity Check must pass); `observability.md` map-of-docs table gains the row\n7. Emitted metric label set and attribute allowlist match the collector `keep_keys` additions byte-for-byte (contract test)\n\n## Explicit non-goals (this issue)\n\n- **No job log download** \u2014 that is the follow-on phase; `logCaptureEnabled` exists as a gate that this phase must refuse to honour (config-gated off, named stub, no dead code that pretends to work)\n- No re-hosting of GitHub's log UI, no per-step spans (job granularity is the unit)\n- No per-repo lease/coordination protocol\n- No changes to `sweep.*`/`tokens.*` record kinds\n\n## Cross-links\n\n- Epic: #8522 (SigNoz/ClickStack trial)\n- Pipeline/transport docs: `.loom/docs/observability.md`, `.loom/docs/otlp-transport.md`\n- Dedup/journal precedent: `.loom/docs/telemetry-schema.md` (local journal), #8669 (allowlist discipline)\n- Policy home (follow-on issue): `ci-observability.md`\n\n## Affected Files\n\n- `loom-daemon/src/ci_telemetry/` (new module) - poller, dedup ledger, CLI subcommand\n- `loom-daemon/src/observability/otlp/mapping.rs` - add `ci.run`/`ci.job` record mapping\n- `defaults/observability/collector/config.yaml` - extend `keep_keys` with the new `loom.ci.*` attributes\n- `defaults/docs/ci-observability.md` - add the phase-1 section (config reference, dedup contract, local journal schema) to the existing policy doc\n- `defaults/docs/observability.md` - add the map-of-docs row\n- `.loom/config.json` schema - new `autonomous.ciTelemetry` block\n\n## Test Plan\n\n- [ ] Automated tests: fixture-based `--once` run (2 repos \u00d7 3 runs \u00d7 4 jobs) asserts correct `ci.run`/`ci.job` record counts and durations\n- [ ] Idempotency test: second `--once` over the same fixture emits zero records; kill-mid-cycle + re-run emits each job exactly once\n- [ ] Unit tests: pagination continuation, `created_after` watermark advance, ETag 304 no-op, rate-limit backoff, ledger crash-recovery (torn trailing line)\n- [ ] Contract test: emitted metric label/attribute set matches collector `keep_keys` additions byte-for-byte\n- [ ] Manual verification: `loom-daemon ci-telemetry --help` / `status` output reviewed for the never-polled / last-ok+age / failing+last-error states\n\n<!-- loom:complexity=complex -->\n",
+     "curator_affected_files": [
+      ".loom/config.json",
+      "autonomous.ciTelemetry",
+      "ci.job",
+      "ci.run",
+      "defaults/docs/ci-observability.md",
+      "defaults/docs/observability.md",
+      "defaults/observability/collector/config.yaml",
+      "loom-daemon/src/ci_telemetry/",
+      "loom-daemon/src/observability/otlp/mapping.rs",
+      "loom.ci.*"
+     ],
+     "affected_files_known": true,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; baseline from issue body",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-24T19:15:33Z"
+    },
+    {
+     "issue": 8796,
+     "title": "merge-pr.sh: warn when a partial-increment trailer is backticked (the #3667 reset silently no-ops)",
+     "body": "## Summary\n\n`merge-pr.sh`'s partial-increment parser deliberately blanks inline code spans\nbefore matching (#5234 \u2014 a backticked `Part of #N` is a hypothetical mention, not\na declared intent). That exclusion is correct. The gap it leaves is that a Builder\ncan write the convention's **exact** trailer text inside a code span \u2014 it reads as\n\"a literal piece of syntax, so put it in backticks\" \u2014 and the PR then looks\ncompletely right to a human reviewer and to Judge while silently defeating the\nautomation: `_partial_increment_refs` returns nothing, so the #3667\n`loom:building` -> `loom:issue` reset no-ops with **no log line anywhere** and the\nfamily/epic issue is stranded at `loom:building` indefinitely.\n\n## Incident\n\nDownstream on `rjwalters/kicad-tools`: merging PR #5686 into issue #5240, whose\nbody carried `` `Part of #5240` `` on its own line. The reset never fired; the\nlabel swap and an explanatory comment had to be applied by hand. Filed there as\nrjwalters/kicad-tools#5690; fixed there in PR #5692 (merged 2026-09-23) against\nthe **vendored** `.loom/` copies, pinned with a `.loom/resync-ignore` block whose\nown comment says \"unpin once the equivalent fix lands in rjwalters/loom's\ndefaults/ tree\". Tracked there as rjwalters/kicad-tools#5693.\n\nTwo prior partial-increment merges on that same issue (#5649, #5488) used the\nplain-text form and reset correctly \u2014 this is a body-shape trap, not a regression.\n\n## Fix (detection, not a parser change)\n\nPort the downstream fix into `defaults/`, so every consumer gets it and the pin\ncan be retired:\n\n- `defaults/scripts/merge-pr.sh` \u2014 a non-blocking pre-merge warning\n  (`_warn_backticked_partial_increment_trailers` plus two text helpers), in the\n  same advisory style as the #4569/#4595 conflict warnings, called from\n  `_check_partial_increment_close_conflict` **before** its empty-refs early\n  return (the case it exists for is precisely the one where the ref list is\n  empty). Pure text analysis, no extra forge calls.\n- The matched shape is deliberately much narrower than the declaration anchor:\n  the backticked trailer must be the **entire line** (modulo an optional\n  list/blockquote marker, whitespace and one trailing punctuation mark), so the\n  #5234 mid-sentence mention and a docs line listing trailers as examples stay\n  silent, and fenced blocks are stripped first.\n- `defaults/scripts/tests/test-merge-pr-partial-increment.sh` \u2014 regression cases\n  for the incident shape, the plain-text control, the #5234 prose control, docs\n  prose, fenced blocks, the both-shapes case, list/numbered markers, and the\n  `--dry-run` prefix.\n- `defaults/.claude/commands/loom/builder-pr.md` \u2014 a \"write the trailer as plain\n  text, never backticked\" caution next to the existing trailer example.\n\nThe `loom-daemon merge-pr-refs` parser is **not** touched.\n\n## Acceptance Criteria\n\n- [ ] `_partial_increment_refs`' answer for a backticked trailer is unchanged\n      (still not a declaration)\n- [ ] A whole-line backticked trailer emits a non-blocking warning naming the\n      issue and quoting the offending line, and mutates nothing\n- [ ] Plain-text trailers, mid-sentence backticked mentions, docs example lines\n      and fenced blocks do not warn\n- [ ] `defaults/scripts/tests/test-merge-pr-partial-increment.sh` passes\n\n---\n\n## Curator Enhancement\n\n<!-- loom:complexity=routine -->\n\n## Affected Files\n\n- `defaults/scripts/merge-pr.sh` - add `_warn_backticked_partial_increment_trailers` (plus its two text helpers), called from `_check_partial_increment_close_conflict` before the `[[ -n \"$partial_refs\" ]] || return 0` early return (~line 1303)\n- `defaults/scripts/tests/test-merge-pr-partial-increment.sh` - add regression cases: incident shape, plain-text control, #5234 prose control, docs prose, fenced blocks, both-shapes case, list/numbered markers, `--dry-run` prefix\n- `defaults/.claude/commands/loom/builder-pr.md` - add a \"write the trailer as plain text, never backticked\" caution next to the existing `Part of #N` trailer example (~line 646)\n\n## Test Plan\n\n- [ ] Automated tests: `defaults/scripts/tests/test-merge-pr-partial-increment.sh` covers all cases listed in the Fix section and passes\n- [ ] Manual verification: construct a PR body whose only partial-increment trailer is a whole-line backticked `` `Part of #N` `` and confirm `merge-pr.sh` (or its `--dry-run` path) prints the new non-blocking warning naming the issue and quoting the offending line, while `_partial_increment_refs` still returns nothing for it (AC #1 unchanged)\n- [ ] Edge cases: verify no warning fires for (a) plain-text trailers, (b) mid-sentence backticked mentions (#5234 shape), (c) docs example lines, (d) fenced code blocks\n",
+     "curator_affected_files": [
+      "defaults/.claude/commands/loom/builder-pr.md",
+      "defaults/scripts/merge-pr.sh",
+      "defaults/scripts/tests/test-merge-pr-partial-increment.sh"
+     ],
+     "affected_files_known": true,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; baseline from issue body",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-23T23:31:44Z"
+    }
+   ],
+   "association": "independent",
+   "prs": [
+    {
+     "pr": 8847,
+     "issue": 8824,
+     "base_sha": "f91fe213ebddf0f167c4264f48d98bb4f265c91c",
+     "head_sha": "6698c3f37418aa08c145dce9eb87bcd6021b6b88",
+     "own_commits": [
+      "15bf03b430b85572574372da6ea2b4935fd34d51",
+      "9f046fd8bb29a4eeb2932fcf618ffbef03d7c048",
+      "6698c3f37418aa08c145dce9eb87bcd6021b6b88"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    },
+    {
+     "pr": 8808,
+     "issue": 8796,
+     "base_sha": "f91fe213ebddf0f167c4264f48d98bb4f265c91c",
+     "head_sha": "7bd45ee4626a067cea272a6d74bb7f8240d9c80b",
+     "own_commits": [
+      "08f9d01a8067c7a04e1826a1ddc620875f9a4e5d",
+      "fedc28190bb2a1c6575d5466a39f6cbcd0eec3f2",
+      "7bd45ee4626a067cea272a6d74bb7f8240d9c80b"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    }
+   ],
+   "selection": "same-repo issues created within 21 days, implemented by distinct merged PRs sharing one base commit; timeline-verified unedited snapshots"
+  },
+  {
+   "pair_id": "p-8832-8786",
+   "historical_commit": "c2e8af29e991431655fbe6d8a7a0d6be847c3054",
+   "cutoff": "2026-09-24T20:42:15Z",
+   "issues": [
+    {
+     "issue": 8832,
+     "title": "dashboard: host 'Degraded' trips on a single failed role tick or one load sample \u2014 nearly always on",
+     "body": "## Problem\n\nOn dashboard.2amlogic.com, 3 of the 4 dispatching hosts render **Degraded** nearly all the time, while fleet throughput is healthy (2026-09-24: 108% of the 7-day merge average). Because Degraded is always on, the operator has learned to ignore it, so it no longer signals anything.\n\nSnapshot of `GET /public/fleet-state` at 2026-09-24 ~20:05Z:\n\n| host | tripped by | real? |\n|---|---|---|\n| loom-worker-1 | `roles.persistent`: `judge@loom x1` | no: loom commits judge=codex, workers have no codex account (296-tick skip streak) |\n| loom-worker-2 | `dispatch_halted` (host breaker, load/core 3.5\u20133.9) + `judge@loom x1` | the halt is real and the breaker is doing its job |\n| robb-studio | `roles.persistent`: 6 pairs, most from pool exhaustion | partly |\n| robb-pro | nothing | ok |\n\n## Why it is a hair trigger\n\n`distressReason()` in `dashboard/web/src/fleet.ts` (origin/main ~L381; pinned deploy 25bf989f L347-364) returns a reason in any of these cases:\n\n1. **`roles.persistent` is non-empty.** On the daemon side, `sample_role_tick_health` (`observability/collector.rs` ~L869) calls `summarize_role_ticks(records, DateTime::<Utc>::MIN_UTC)`. That means:\n   - **There is no time window.** It scans the whole 2048-tick ring shared across every repo on the host. On a host with ~50 repos \u00d7 8 roles, that ring covers well over an hour.\n   - **One failure is enough.** A (repo, role) pair counts as persistent if its *latest* tick failed. The existing `ROLE_TICK_ESCALATION_THRESHOLD` / `consecutive_identical` streak does not gate it.\n   - A pair that failed once and then stopped ticking stays \"persistent\" until the ring evicts it or the daemon restarts.\n   - With ~400 (repo, role) pairs per host, P(at least one latest-tick failure) is close to 1 at all times.\n2. **`load_per_core >= 2.5` or `cpu_idle_fraction <= 0.02` from a single sample.** The comments call these a fallback for daemons that predate `dispatch_halted`, but they are evaluated unconditionally. One 5-minute spike marks a host Degraded even though the daemon's own breaker requires 3 sustained ticks (`DEFAULT_HOST_BREAKER_SUSTAIN_TICKS`).\n\n## Proposed change\n\nDashboard side (preferred, no daemon change needed):\n\n- **Role failures:** count a pair toward Degraded only if `consecutive_identical >= ROLE_TICK_ESCALATION_THRESHOLD` (or `failures >= N`) **and** `last_at` is within a recency window (e.g. 60 min). Keep showing sub-threshold failures as an informational line on the host card, but don't count them toward Degraded or \"N need attention\".\n  - The `failures` / streak field has to survive `/public/fleet-state` redaction (`dashboard/src/redaction.ts` ~L392-430 keeps `failures` today; confirm it carries the streak and not a ring-total).\n- **Load / idle fallback:** apply it only when the record has no `dispatch_halted` field (i.e. an old daemon). When `dispatch_halted` is present, it is the sustained, authoritative signal.\n- **Optional:** exclude role failures whose cause is config-permanent and already surfaced elsewhere (e.g. a codex-pinned role on a host with no codex accounts). These could be reported as \"misconfigured\" rather than \"degraded\".\n\nDaemon side (optional follow-up): pass a real `since` (e.g. now \u2212 1h) instead of `MIN_UTC` in `sample_role_tick_health`, so `roles.persistent` means what its name says.\n\n## Acceptance criteria\n\n- [ ] A host whose only role failure is a single failed tick (streak 1) renders **ok**, not Degraded.\n- [ ] A host whose role pair has failed \u2265 threshold consecutive times within the recency window renders Degraded, naming that pair.\n- [ ] A host reporting `dispatch_halted: false` with a single-sample `load_per_core >= 2.5` renders ok. The same record without the `dispatch_halted` field still trips the fallback.\n- [ ] `needsAttention` follows the new rule.\n- [ ] Unit tests in the dashboard web suite cover all four cases above.\n\n## Context\n\nFound during a 2AM fleet check (operator: \"the dashboard always seems to say our machines are degraded\"). Deploys reach production only via the 2am `infra/dashboard/loom-ref` pin, which is currently 110 commits behind main.\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n",
+     "curator_affected_files": [],
+     "affected_files_known": false,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; no Curator affected-files baseline exists (unknown, not empty)",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-24T20:42:15Z"
+    },
+    {
+     "issue": 8786,
+     "title": "Route daemon Codex jobs into private clones with recoverable logs and checkpoints",
+     "body": "Part of #4489 and the operator-requested private-clone workstream in #6896. Second implementation step.\n\n## Problem\n\nThe Codex session adapter currently sends the host working directory and host workspace context to the container. Host status, worktree cleanup and sweep checkpoints likewise assume host-visible files. A private clone is not usable by the daemon until execution paths and retained job state are mapped explicitly.\n\n## Recommended implementation\n\nWire the private-clone workspace and exclusive account lease from #8785 through the existing runtime/account selection and spawn-worker \u2192 spawn-codex \u2192 supervised session-exec path. Preserve the logical host repository identity for scheduling and reporting; resolve all child working-directory, project-root, worktree and hook paths to the private container workspace.\n\nPrepare and verify the selected workspace before claiming an issue or starting model work. Hold the lease until worker termination is acknowledged, including descendants. Integrate with the #8773 cancellation protocol rather than inventing another lifetime mechanism.\n\nStream output through the existing host supervisor. Preserve the minimum durable checkpoint, branch/PR and artifact metadata needed for status, resume and cleanup through a narrowly scoped export/control interface. Do not regain file visibility by mounting host repositories or daemon control-state directories read-write into the worker.\n\nExchange code using the forge: fetch the configured base or resumable issue branch, push the issue branch, and create/update its PR through existing helpers. Any worktrees the role needs remain entirely inside the private clone.\n\n## Acceptance criteria\n\n- [ ] Scheduled standalone roles and explicit/scheduled sweep launches use the same selected account, validated workspace and lease. All account paths respect one active job per account; unavailable/busy sessions yield an accurate reason and release temporary reservations.\n- [ ] Child cwd, Loom context, installed helpers, guard bridge locations and runtime instructions resolve within the private clone. No stale host-absolute worktree path is passed as an executable child path.\n- [ ] A credential-free integration fixture exercises the normal adapter chain through prepare, issue branch mutation, push/PR handoff, log capture and cleanup. Existing capability restrictions remain in force until #8787.\n- [ ] Dashboard/status retain runtime, provider, account, logical repository, sweep/role identity and terminal outcome; logs remain accessible after cancellation or container loss without secret material.\n- [ ] Daemon restart and worker interruption preserve checkpoints and branch/PR association. Unpushed work is retained; account failover must explicitly stop for recovery when the remote branch/checkpoint is insufficient to resume.\n- [ ] Cancellation, host-supervisor death, failed startup, container disappearance and hung cleanup do not release a lease while a child can still write. Existing #8773 tests continue passing.\n- [ ] Reapers and cleanup target the owned private workspace and lease, never the host's similarly named worktree. Cleanup/export inputs cannot select arbitrary host paths.\n- [ ] Audit MCP/control and run-job paths reachable from the worker: no helper may turn a private-clone request into arbitrary host-repository writes or mounts. Map supported jobs to the owned workspace; refuse unsupported host-path-dependent jobs explicitly in the first version.\n- [ ] Existing Claude and host-mounted session dispatch retain their behavior. No global runtime capability/default change ships here.\n\n## Implementation starting points \u2014 curator must verify\n\nVerified against origin/main at 135183d9b2527cb2cc81d2c5d8e0ba1f2213c645:\n\n- `defaults/scripts/spawn-codex.sh` \u2014 session invocation currently uses the host cwd and forwards workspace/worktree paths.\n- `loom-daemon/src/worker_spawn/mod.rs`, `loom-daemon/src/sweep_registry/dispatch.rs` and `loom-daemon/src/role_runner/runtime_preflight.rs` \u2014 selection, reservation, preflight and normal launch seam.\n- `loom-daemon/src/session_exec.rs` \u2014 supervised child ownership, cancellation and cleanup acknowledgement.\n- `loom-daemon/src/sweep_registry/log_paths.rs`, `loom-daemon/src/sweep_registry/reaper.rs` and `loom-daemon/src/cli/sweep_checkpoint.rs` \u2014 host observability, recovery and cleanup assumptions.\n\nImplement new executable logic in Rust; limit shell changes to adapter wiring.\n\n## Affected Files\n\nRe-verified present on `origin/main` @ `b9f1359d3594b9c51fbaba966fa3beeda659fee2`, 2026-09-23 (curator pre-flight):\n\n- `defaults/scripts/spawn-codex.sh` - adapter wiring only: stop forwarding host cwd/workspace paths when the private-clone lease from #8785 is active\n- `loom-daemon/src/worker_spawn/mod.rs` - runtime/account selection seam; resolve workspace before claim\n- `loom-daemon/src/sweep_registry/dispatch.rs` - reservation/dispatch seam; route to the private-clone workspace path\n- `loom-daemon/src/role_runner/runtime_preflight.rs` - preflight seam for scheduled standalone role launches\n- `loom-daemon/src/session_exec.rs` - supervised child ownership, cwd resolution, cancellation/cleanup acknowledgement\n- `loom-daemon/src/sweep_registry/log_paths.rs` - log path resolution; must point at exported logs, not host worktree paths\n- `loom-daemon/src/sweep_registry/reaper.rs` - cleanup/reaping must target the owned private workspace, never a similarly-named host worktree\n- `loom-daemon/src/cli/sweep_checkpoint.rs` - checkpoint export/import through the narrowly scoped control interface\n\n## Test Plan\n\n- [ ] Automated tests: the credential-free integration fixture named in Acceptance Criteria #3 \u2014 exercise prepare \u2192 claim \u2192 issue-branch mutation \u2192 push/PR handoff \u2192 log capture \u2192 cleanup entirely against the private-clone workspace, with no host-repository mount.\n- [ ] Automated tests: extend or add coverage in `loom-daemon`'s existing `session_exec`/`sweep_registry` test modules for lease-not-released-while-child-can-write across cancellation, host-supervisor death, failed startup, container disappearance and hung cleanup (AC #6) \u2014 confirm existing #8773 tests still pass.\n- [ ] Automated tests: reaper/cleanup unit test confirming a private-clone job's reaping never touches a host worktree of the same logical name (AC #7).\n- [ ] Manual verification: run a scheduled standalone role and a sweep-dispatched job through the private-clone path back-to-back, confirming both share the same account-selection/lease/workspace machinery and the one-active-job-per-account invariant holds (AC #1).\n- [ ] Manual verification: kill the daemon mid-job and restart it; confirm the checkpoint and branch/PR association survive and unpushed work is retained (AC #4).\n- [ ] Manual verification: confirm existing Claude and host-mounted Codex session dispatch are unaffected \u2014 no global runtime default changes (AC #8).\n\n## Dependencies\n\n- [x] #8785 \u2014 independent-clone workspace lifecycle and exclusive account lease. **Closed** via merged PR #8800 (\"feat: add account-private Codex session workspaces\"), confirmed 2026-09-23.\n\n#8787 follows this change. #4496 remains the live rollout/canary gate; passing fixture tests here does not authorize production mutable Codex work. Coordinate with the existing #8776 lock-lifetime fix without duplicating it.\n\n<!-- loom:premise-check exists=yes deliberate=yes reversal=no verdict=clear -->\npremise-evidence: defaults/scripts/spawn-codex.sh \u2014 session-exec deliberately forwards host cwd under the current mount contract.\npremise-evidence: loom-daemon/src/session_exec.rs \u2014 supervised lifetime is shared by current session workers.\npremise-extends: resolve execution paths and retained state for the new opt-in private-clone mode while preserving the normal adapter seam and existing host-mounted dispatch.\n\n<!-- loom:complexity=complex -->\n",
+     "curator_affected_files": [
+      "defaults/scripts/spawn-codex.sh",
+      "loom-daemon/src/cli/sweep_checkpoint.rs",
+      "loom-daemon/src/role_runner/runtime_preflight.rs",
+      "loom-daemon/src/session_exec.rs",
+      "loom-daemon/src/sweep_registry/dispatch.rs",
+      "loom-daemon/src/sweep_registry/log_paths.rs",
+      "loom-daemon/src/sweep_registry/reaper.rs",
+      "loom-daemon/src/worker_spawn/mod.rs",
+      "origin/main"
+     ],
+     "affected_files_known": true,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; baseline from issue body",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-23T21:32:53Z"
+    }
+   ],
+   "association": "independent",
+   "prs": [
+    {
+     "pr": 8833,
+     "issue": 8832,
+     "base_sha": "c2e8af29e991431655fbe6d8a7a0d6be847c3054",
+     "head_sha": "f199fb3c72ecb12861039f36da4b1ea4fff342d7",
+     "own_commits": [
+      "ed31b902468103776214ce47dbe3b3715a232996",
+      "f199fb3c72ecb12861039f36da4b1ea4fff342d7"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    },
+    {
+     "pr": 8830,
+     "issue": 8786,
+     "base_sha": "c2e8af29e991431655fbe6d8a7a0d6be847c3054",
+     "head_sha": "ec36f99032d73dd4c12a832c1dfcbfeb39c1c68a",
+     "own_commits": [
+      "7bc06a02ef06f9ab7c87de431e1f255a9ff8f20f",
+      "f2093532e79f9e73fffd500a0fae28905961ec8f",
+      "367831e2ddb74adff644c5db684da99d62e5ccf5",
+      "e211cd0d0453b87a9d5b4d50aaa6959d93c3a2f5",
+      "61b41cf435d14953a59d3a488240ca217c9175f7",
+      "a6ee3bf4bb11d805ecde4db2c8e33039492ba346",
+      "018daf7845a306b1f0a5cd111e37887b1d220924",
+      "ec36f99032d73dd4c12a832c1dfcbfeb39c1c68a"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    }
+   ],
+   "selection": "same-repo issues created within 21 days, implemented by distinct merged PRs sharing one base commit; timeline-verified unedited snapshots"
+  },
+  {
+   "pair_id": "p-8896-8895",
+   "historical_commit": "003f7e091f6c1e819449f1f17bbfab3f78baca17",
+   "cutoff": "2026-09-25T12:11:09Z",
+   "issues": [
+    {
+     "issue": 8896,
+     "title": "merge-pr --auto (post-#8410): timeout reported as merge failure by Champion; duplicate --allow-unapproved audit comment; stale messages",
+     "body": "Found while reviewing #8426 (#8410: `--auto` now settles checks and merges in-process). None of these blocked that PR.\n\n## Observed\n\n1. **A timeout is reported as a merge failure.** With #8426, `--auto` exits non-zero when CI outlasts `LOOM_AUTO_MERGE_TIMEOUT` (default 600s). The PR body calls that a retry on the next pass. However, Champion's error handling (`defaults/.claude/commands/loom/champion-pr-merge.md`, the \"Merge Failed\" path) treats any non-zero exit as a failure and posts \"a human will need to investigate\". This repo's `Shell Test Suites (hermetic)` job alone takes about 10 minutes, so this is reachable, especially on the pass right after an exit-4 `--redate-stale-checks` re-run.\n2. **Duplicate audit comment.** With `--allow-unapproved` and no `loom:pr`, `_revalidate_merge_guards` calls `_check_loom_pr_label` a second time after the wait. That posts a second \"Merge Proceeded Without loom:pr\" audit comment.\n3. **Stale or misleading text.** `merge-pr.sh` still says \"while auto-merge is disabled\" in the settle-wait error path (around line 2066 at #8426's head). When the post-wait uncached re-read fails (`{}`), the refusal says the PR \"does not carry loom:pr\" rather than \"could not re-read labels\". It fails closed, which is correct, but the message sends the operator to the wrong fix.\n\n## Suggested fix\n\n(1) Give timeout its own exit code (or reuse exit 3's re-queue semantics) and document it in `champion-pr-merge.md`'s exit-code table. (2) Make the post-wait re-validation skip the audit comment, or de-dupe it. (3) Fix the two messages.\n\n---\n\n## Curator Enhancement\n\nVerified all three observations against `origin/main` (current head, post-#8426 merge):\n\n1. **Timeout-as-failure**: confirmed `merge-pr.sh`'s settle-wait timeout paths (e.g. `defaults/scripts/merge-pr.sh:2054`, `:2104`) call `error(...)`, which is `exit 1` (`merge-pr.sh:131`) \u2014 indistinguishable from a genuine merge failure. This repo already has precedent for a distinguished non-1 exit for a re-queue (not-a-failure) condition: exit 3 (`error_head_moved`, #5579) and exit 4 (stale-check re-date, #8508), both documented in `champion-pr-merge.md`'s \"Exception: exit codes 3 and 4\" section. A timeout fits the same shape and should get its own code in that family, with a matching exception carved into that doc section (do not follow the 5-step \"Merge Failed\" flow for it).\n2. **Duplicate audit comment**: confirmed `_check_loom_pr_label` (`defaults/scripts/merge-pr.sh:911`) posts the \"Merge Proceeded Without `loom:pr` (Override)\" comment whenever `--allow-unapproved` is set and `loom:pr` is absent, and it is called twice on the `--auto` path: once unconditionally at line 947 (pre-wait), and again from `_revalidate_merge_guards` at line 2222 (post-wait) \u2014 so with `--allow-unapproved` and no `loom:pr`, the comment is posted twice per merge.\n3. **Stale/misleading messages**: confirmed `merge-pr.sh:2082` reads \"...refusing to merge PR #$PR_NUMBER with failing check(s) **while auto-merge is disabled**\" from inside the `if [[ \"$AUTO_MERGE\" == \"true\" ]]` block itself \u2014 contradictory now that #8426 made this the live `--auto` path. Also confirmed `_revalidate_merge_guards` (`merge-pr.sh:2200`) re-reads the PR via `forge_get_pr_nocache ... || echo '{}'`; on a failed re-read, `PR_LABELS` becomes empty and `_check_loom_pr_label` reports the loom-daemon guard's genuine-absence message (`loom_pr_guard.rs:110`, \"does not carry the `loom:pr` label\") \u2014 identical wording whether the label is truly absent or the re-read itself failed.\n\nNo duplicates found (`check-duplicate.sh --include-merged-prs --issue 8896`).\n\n<!-- loom:complexity=routine -->\n\n### Acceptance Criteria\n\n- [ ] The settle-wait timeout path (`defaults/scripts/merge-pr.sh` around lines 2054/2104) exits with a distinguished code (not the generic `error()` exit 1) analogous to exit 3/4, and `champion-pr-merge.md`'s \"Exception: exit codes 3 and 4\" section is extended to cover it (or renamed to include it) so Champion's operator-facing docs and behavior agree: do not post the \"Merge Failed\" comment or count it as an error for this exit.\n- [ ] `_check_loom_pr_label`'s override audit comment is posted at most once per `merge-pr.sh --auto --allow-unapproved` invocation \u2014 either by skipping the post-wait re-check of this specific guard when the pre-wait check already posted the comment, or by de-duplicating the comment itself.\n- [ ] The message at `merge-pr.sh:2082` no longer says \"while auto-merge is disabled\" inside the `AUTO_MERGE == true` branch.\n- [ ] When `_revalidate_merge_guards`'s post-wait re-read of the PR fails (falls back to `{}`), the refusal names the re-read failure explicitly (e.g. \"could not re-read PR labels after the settle-wait\") rather than reusing the genuine-absence \"does not carry the `loom:pr` label\" wording \u2014 still failing closed, just with an accurate message.\n- [ ] Existing merge-pr.sh test suites (settle-wait, loom:pr guard, head-moved/exit-3/exit-4 coverage) stay green.\n\n### Affected Files\n\n- `defaults/scripts/merge-pr.sh` \u2014 timeout paths (~2054, ~2104) for the new exit code; `_check_loom_pr_label` (~911) and `_revalidate_merge_guards` (~2200, ~2222) for the duplicate-comment fix; line ~2082's message text; the post-wait re-read failure message in `_revalidate_merge_guards`.\n- `defaults/.claude/commands/loom/champion-pr-merge.md` \u2014 \"Exception: exit codes 3 and 4 \u2014 head moved, re-queue, not a failure\" section (~line 3317): extend to document the new timeout exit code and its own Champion handling exception.\n- Existing merge-pr.sh test files covering settle-wait and the `loom:pr` guard (e.g. `defaults/scripts/tests/test-merge-pr-*.sh`, `defaults/scripts/tests/test-forge-helpers.sh`) \u2014 extend with cases for the new exit code and the deduped audit comment.\n\n### Test Plan\n\n- [ ] Automated tests: new/extended case asserting the settle-wait timeout returns the new distinguished exit code, not generic exit 1.\n- [ ] Automated tests: new/extended case asserting `--allow-unapproved` + no `loom:pr` on the `--auto` path posts the override audit comment exactly once (not twice).\n- [ ] Manual verification: grep the updated `merge-pr.sh` for the corrected message text at both sites (no \"while auto-merge is disabled\" inside the `AUTO_MERGE` block; a distinct message for post-wait re-read failure vs. genuine label absence).\n- [ ] Existing suites: full `defaults/scripts/tests/test-merge-pr-*.sh` and `test-forge-helpers.sh` runs stay green.",
+     "curator_affected_files": [
+      "defaults/.claude/commands/loom/champion-pr-merge.md",
+      "defaults/scripts/merge-pr.sh",
+      "defaults/scripts/tests/test-forge-helpers.sh",
+      "defaults/scripts/tests/test-merge-pr-*.sh"
+     ],
+     "affected_files_known": true,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; baseline from issue body",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-25T12:11:09Z"
+    },
+    {
+     "issue": 8895,
+     "title": "forge_get_check_runs reads only the first 30 check-runs; merge-pr --auto's settle-wait cannot see the rest",
+     "body": "Found while reviewing #8426 (#8410). Once that lands, `merge-pr.sh --auto`'s client-side settle-wait is the **only** check-settling mechanism: the server-side arm is gone.\n\n## Observed\n\n`forge_get_check_runs` (`defaults/scripts/lib/forge-helpers.sh`, the `gh api \"repos/$nwo/commits/$commit/check-runs\"` call) passes no `per_page` and no `--paginate`, so GitHub's default page size of 30 applies:\n\n```\n$ gh api repos/rjwalters/loom/commits/c53dcaa85860fe090be88d6c1d374cd59e5439b5/check-runs --jq '\"\\(.total_count) \\(.check_runs|length)\"'\n39 30\n```\n\nThis repo's CI produces 39 check-runs per head, so 9 are invisible to the settle-wait, both to its pending count and to its failed-required classification.\n\n## Suspected impact (unverified)\n\nThe rows appear to come back newest first, so the long-running test suites are probably visible and the missing rows are early structural gates. The forge's own ruleset should still refuse a synchronous merge whose required checks have not passed, unless the merging identity has a bypass. That needs checking. This is present on `main` today; #8426 makes it load-bearing.\n\n## Suggested fix\n\nAdd `per_page=100` and/or paginate. Also fail closed (treat as pending) when `total_count` exceeds the number of rows returned, so a future growth past any page size cannot silently shrink the checked set. Pin it with a test fixture where `total_count > len(check_runs)`.\n\nMeasuring that the missing rows never include a required check, and closing this with that evidence, is a valid outcome.\n\n---\n\n## Curator Enhancement\n\nConfirmed on `origin/main` @ current head: PR #8426 (\"merge-pr --auto settles checks and re-validates in-process instead of arming a server-side merge\") **merged 2026-09-25T14:34:02Z** \u2014 so the scenario this issue flags as \"once that lands\" is now live, not hypothetical: `merge-pr.sh --auto`'s client-side settle-wait (`_wait_for_checks_then_sync_merge`, `defaults/scripts/merge-pr.sh` ~line 2035) is the only check-settling mechanism today, and it relies entirely on `forge_get_check_runs` (`defaults/scripts/lib/forge-helpers.sh:652`), which still passes no `per_page`/`--paginate` to `gh api repos/$nwo/commits/$commit/check-runs` (line 690). Marking `loom:urgent` \u2014 this is a live gap in the mechanism this repo relies on to avoid merging PRs whose required checks have not actually passed (see CLAUDE.md \u00a7 \"CI is dumb and reliable, on purpose\").\n\nNo duplicates found (`check-duplicate.sh --include-merged-prs --issue 8895`).\n\n<!-- loom:complexity=routine -->\n\n### Acceptance Criteria\n\n- [ ] `forge_get_check_runs` retrieves every check-run for a commit, not just the first page (add `per_page=100` and/or `--paginate` to the `gh api` call at `defaults/scripts/lib/forge-helpers.sh:690`).\n- [ ] When the fetched row count is less than `total_count`, the caller fails closed (treats settlement as not-yet-reached / still pending) rather than silently trusting a truncated set.\n- [ ] A regression test fixture exercises `total_count > len(check_runs)` and confirms the fail-closed behavior (per the issue's own Suggested fix).\n- [ ] Existing `test-forge-helpers.sh` / `test-merge-pr-check-runs-404-fallback.sh` / `test-merge-pr-wait-for-checks-empty-settle.sh` suites stay green.\n- [ ] Alternative closing condition (also acceptance-satisfying per the issue body): if investigation shows the missing rows can never include a required check (e.g. GitHub's check-runs endpoint is confirmed to always return required checks in the first page), document that finding with evidence and close without a code change.\n\n### Affected Files\n\n- `defaults/scripts/lib/forge-helpers.sh` \u2014 `forge_get_check_runs` (GitHub branch, ~line 690): add pagination and/or a fail-closed total-count check.\n- `defaults/scripts/tests/test-forge-helpers.sh` \u2014 existing `forge_get_check_runs` coverage; extend or add a case for `total_count > len(check_runs)`.\n- `defaults/scripts/tests/test-merge-pr-check-runs-404-fallback.sh` \u2014 exercises `forge_get_check_runs`'s distinguished exit codes; verify pagination changes don't disturb the 404/500/network-error paths.\n- `defaults/scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh` \u2014 exercises the settle-wait loop's trust of a `forge_get_check_runs` read; extend for the truncated-page case if the fail-closed behavior needs loop-level coverage.\n- `defaults/scripts/merge-pr.sh` \u2014 `_wait_for_checks_then_sync_merge` (~line 2035), the sole caller now that #8426 removed the server-side arm; reference only unless the fail-closed check needs to live here instead of inside `forge_get_check_runs`.\n\n### Test Plan\n\n- [ ] Automated tests: new fixture in `test-forge-helpers.sh` (or a new dedicated test file) pinning `total_count > len(check_runs)` \u2192 fail-closed/pending, per Acceptance Criteria.\n- [ ] Automated tests: existing forge-helpers and merge-pr check-runs/settle-wait suites stay green.\n- [ ] Manual verification: `gh api repos/rjwalters/loom/commits/<head>/check-runs --jq '\"\\(.total_count) \\(.check_runs|length)\"'` against a commit with >30 check-runs, before and after, confirming the fetch now returns the full set.\n- [ ] Edge cases: a repo/commit with exactly 30, and with >100, check-runs (page-boundary and multi-page cases).",
+     "curator_affected_files": [
+      "defaults/scripts/lib/forge-helpers.sh",
+      "defaults/scripts/merge-pr.sh",
+      "defaults/scripts/tests/test-forge-helpers.sh",
+      "defaults/scripts/tests/test-merge-pr-check-runs-404-fallback.sh",
+      "defaults/scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh"
+     ],
+     "affected_files_known": true,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; baseline from issue body",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-25T12:11:06Z"
+    }
+   ],
+   "association": "independent",
+   "prs": [
+    {
+     "pr": 8988,
+     "issue": 8896,
+     "base_sha": "003f7e091f6c1e819449f1f17bbfab3f78baca17",
+     "head_sha": "7f8aaad55bb7591e24ebd54e00d130cbc9adc6e1",
+     "own_commits": [
+      "7f8aaad55bb7591e24ebd54e00d130cbc9adc6e1"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    },
+    {
+     "pr": 8986,
+     "issue": 8895,
+     "base_sha": "003f7e091f6c1e819449f1f17bbfab3f78baca17",
+     "head_sha": "ddca17a053d6b9fe849460145bf3b62f6b38ce1d",
+     "own_commits": [
+      "13ef203b36d9074ba20477ef922a20f90a003878",
+      "ec612dd25646235e1de58740dbdf098cb516652c",
+      "ddca17a053d6b9fe849460145bf3b62f6b38ce1d"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    }
+   ],
+   "selection": "same-repo issues created within 21 days, implemented by distinct merged PRs sharing one base commit; timeline-verified unedited snapshots"
+  },
+  {
+   "pair_id": "p-8699-8912",
+   "historical_commit": "94d83d62bc6feb953b9646c67b5cda8ebbae4923",
+   "cutoff": "2026-09-25T13:34:01Z",
+   "issues": [
+    {
+     "issue": 8699,
+     "title": "Per-launch usage attribution and 429 bad-marking at the credential egress proxy (follow-up to #8674)",
+     "body": "## Summary\n\nFollow-up to #8674 (credential egress proxy, epic #6896). The proxy shipped in the first\nincrement is, structurally, the **single choke point** every proxied provider request passes\nthrough on its way off the host: it already parses the request head, knows the launch record,\nand streams the whole response back. Two things #8674 listed as bonus effects fall out of that\nposition and are not implemented yet.\n\n## Scope\n\n**1. Per-launch usage attribution.** Record, per launch record, the request and response byte\ncounts and the provider's own rate-limit / usage response headers\n(`anthropic-ratelimit-*`, `x-ratelimit-*`, `retry-after`, and the provider's token-usage\nheaders where it sends them). This is observed at the wire, at the moment it happens, rather\nthan reconstructed after the fact from retained logs \u2014 and it is attributable to one launch by\nconstruction, because the launch record is what authorized the request.\n\nNote: #8674's body cited #8563/#8564 as doing the \"reconstruct from retained logs\" this would\nreplace. Curator checked both and that citation does not hold (#8563 is closed Kimi-pool\nonboarding; #8564 is session-level token/model attribution for the fleet feed). Treat the\nattribution work here as new, not as a replacement for either.\n\n**2. Bad-mark on quota exhaustion at the proxy.** When the upstream answers `429` or a\nprovider-specific quota-exhausted shape, the proxy can mark the pooled account bad\n*immediately* \u2014 it holds the account identity (`credential::Resolved::{provider, account}`\ntravel into the record) \u2014 instead of waiting for the child to exit and for exit-code\ninference to run.\n\nKeep both strictly non-secret: the credential must never enter a counter, a log line or an\nexported metric, and the placeholder is a live bearer token for the launch's lifetime, so it\nmust not be logged either. The existing `Record`/`Placeholder` `Debug` impls redact; anything\nadded here must keep that property.\n\n## Acceptance criteria\n\n- [ ] Per-launch request/response byte counts and captured rate-limit headers are recorded for\n      each proxied launch and surfaced somewhere durable (launch record / telemetry), keyed by\n      `launch_id`.\n- [ ] A `429`/quota-exhausted upstream response on a pooled API-key route bad-marks the\n      selected account at the proxy, and the existing exit-code-driven path does not\n      double-mark it.\n- [ ] Nothing added logs, exports or persists either the real credential or the placeholder \u2014\n      asserted by a test, as the current suite does for `Record`/`Placeholder`.\n- [ ] Unproxied (env-passthrough) dispatch is unaffected.\n\n## Dependencies\n\n- [x] #8674 / its implementing PR #8701: merged 2026-09-24 (PR #8701, `7a04dbbc`) \u2014 the\n      `egress_proxy::{Record, Registry, server}` types this issue's attribution and\n      bad-marking hooks extend now exist on `origin/main`.\n\nDependency cleared \u2014 this issue is ready to build.\n\n## Affected Files\n\n- `loom-daemon/src/worker_spawn/egress_proxy/server.rs` (lands with #8674/PR #8701) \u2014 add\n  byte-count tracking and rate-limit-header capture on the request/response path; add the\n  `429`/quota-exhausted detection hook\n- `loom-daemon/src/worker_spawn/egress_proxy/registry.rs` (lands with #8674/PR #8701) \u2014 extend\n  `Record` to carry per-launch usage counters, keyed by `launch_id`\n- `loom-daemon/src/api_keys_pool` \u2014 bad-marking / account selection; wire the proxy's\n  immediate `429` signal into the existing bad-mark path, guarding against double-marking with\n  the existing exit-code-driven path\n- Whichever test module covers `Record`/`Placeholder`'s existing redacting `Debug` impls\n  (lands with #8674/PR #8701) \u2014 extend for the new usage-counter fields, confirming they\n  don't leak the credential or placeholder either\n\n## Test Plan\n\n- [ ] Automated tests: per-launch byte-count and rate-limit-header capture, asserted against a\n      fixture request/response pair\n- [ ] Automated tests: a `429`/quota-exhausted response triggers exactly one bad-mark at the\n      proxy, and the exit-code-driven path does not double-mark the same account (AC2)\n- [ ] Automated tests: extend the existing `Record`/`Placeholder` redaction test to cover the\n      new usage-counter fields \u2014 confirms neither the real credential nor the placeholder\n      appears in any log, counter, or exported metric (AC3)\n- [ ] Manual verification: unproxied (env-passthrough) dispatch is unaffected (AC4)\n\n<!-- loom:complexity=routine -->\n\n## Related\n\n- Parent: #8674 \u00b7 Epic: #6896\n- `loom-daemon/src/worker_spawn/egress_proxy/{server.rs,registry.rs}`\n- `loom-daemon/src/api_keys_pool` (bad-marking, account selection)\n\n",
+     "curator_affected_files": [
+      "loom-daemon/src/api_keys_pool",
+      "loom-daemon/src/worker_spawn/egress_proxy/registry.rs",
+      "loom-daemon/src/worker_spawn/egress_proxy/server.rs"
+     ],
+     "affected_files_known": true,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; baseline from issue body",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-22T22:20:54Z"
+    },
+    {
+     "issue": 8912,
+     "title": "noopCooldown is host-local (peer host re-dispatches inside the window), and the same release is also counted as a prless failure",
+     "body": "## Problem\n\nTwo distinct defects in the accounting of a single no-op release, both observed\nin one `loom-daemon` log for one issue, and both of which let a `noopCooldown`\nwindow be ignored.\n\n### 1. `noopCooldown` is host-local, so a peer host re-dispatches inside the window\n\n`autonomous.workFinder.noopCooldown.cooldownSecs` defaults to 3600 and is\nrecorded into the recording host's own registry/`activity.db`. On a two-host\nfleet sharing one repo, the peer host has no knowledge of it and re-offers the\ncandidate immediately.\n\nEvidence \u2014 `~/.loom/daemon.log` on `loom-worker-*`, repo `2AMLogic/llm-cim`,\nissue #1, 2026-09-25:\n\n```\n[06:38:29.656] [INFO] sweep_registry: issue #1 no-op release recorded via IPC\n    (RecordNoopRelease, #6670): epic tracking container, no direct buildable work\u2026\n[06:38:29.656] [INFO] sweep_registry: issue #1 no-op-release cooldown armed \u2014\n    1 consecutive no-op release(s), next dispatch allowed in 3600s (#6670)\n```\n\nThe issue's forge timeline then shows it re-claimed (`loom:issue` \u2192\n`loom:building`) at **06:41:45Z** \u2014 196 s into a 3600 s cooldown \u2014 by a sweep on\nthe other host, and again at 10:34:18Z and 11:29:47Z. The recording host itself\nhonoured the window correctly and never re-dispatched; only the peer did.\n\nThis is the same class of problem `record-noop-release.sh`'s `--workspace-root`\ndefault fixed for multi-*workspace* daemons (#6957) \u2014 one hop further out: the\ncooldown is invisible across *hosts*, so on any multi-host fleet the effective\nsuppression is \"one host stops trying\" rather than \"the fleet stops trying\". The\nlease-record mechanism (#6179) already establishes a forge-backed,\ncross-host-readable channel for exactly this kind of shared claim state.\n\n### 2. The same release is also counted as a `prless` **failure**\n\nImmediately after the no-op cooldown was armed, the daemon classified the same\nrelease as a PR-less failure:\n\n```\n[06:39:28.067] [INFO] sweep_registry: issue #1 dispatch backoff armed \u2014 1 consecutive\n    failed dispatch(es), next attempt allowed in 60s (#4485; cause=Generic)\n[06:39:28.067] [INFO] sweep_registry: issue #1 insta-crashed (1/3 consecutive, <60s,\n    no checkpoint) (#3939)\n[06:39:28.067] [WARN] sweep_registry: issue #1 released without a pull request\n    (1/3 consecutive) \u2014 next dispatch allowed in 300s (#7972). Failure: sweep exited 0\n    after 213s without opening a pull request, without a phase checkpoint, and without\n    a `.no-changes-needed` marker\n```\n\nSo one release simultaneously armed a 3600 s no-op cooldown **and** a 300 s\nprless-retry window and an insta-crash strike. The two paths disagree about what\nhappened, and the *shorter* window is the one whose semantics are wrong for this\noutcome.\n\nThe stated discriminator is the `.no-changes-needed` marker, and the daemon\nreports it absent \u2014 yet the orchestrator clearly took the no-op path (it issued\n`RecordNoopRelease`). Either the sweep records the no-op without writing the\nmarker `sweep.md` step 1 reads from, or the daemon looks for the marker somewhere\nthe sweep did not write it (e.g. the wrong worktree root, or after the worktree\nwas reaped). Whichever it is, a self-reported no-op should not also accumulate\ninsta-crash strikes toward quarantine.\n\n## Suggested fix\n\n1. Make a no-op cooldown visible fleet-wide, not just host-locally \u2014 e.g. publish\n   it alongside the lease record (#6179) or via the peer-coordination channel the\n   registry already uses to re-advertise live peer claims (#4431), so a peer host\n   yields the same way it yields to a fresh peer lease.\n2. Make the no-op and prless-failure classifications mutually exclusive for one\n   release: if `RecordNoopRelease` arrived for the issue in this dispatch, suppress\n   the prless-failure/insta-crash accounting instead of arming both. Separately,\n   reconcile the marker check with whatever the sweep actually writes, so the\n   discriminator the code relies on is the one the orchestrator produces.\n\nContext: `2AMLogic/llm-cim#105` (a ~12-session thrash loop on `loom:epic`\ncontainers). Related: #8881 (Mode A/B pre-flight has no `loom:epic` skip rule),\n#8911 (find-work tiers 1/2 bypass the configured skip labels).\n",
+     "curator_affected_files": [],
+     "affected_files_known": false,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; no Curator affected-files baseline exists (unknown, not empty)",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-25T13:34:01Z"
+    }
+   ],
+   "association": "independent",
+   "prs": [
+    {
+     "pr": 9296,
+     "issue": 8699,
+     "base_sha": "94d83d62bc6feb953b9646c67b5cda8ebbae4923",
+     "head_sha": "28c8b630a95f469d9bc7f62a55e91e2d2891d22d",
+     "own_commits": [
+      "9bf2ed6ff13003add90e0bcfb94069613bc23c16",
+      "28c8b630a95f469d9bc7f62a55e91e2d2891d22d"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    },
+    {
+     "pr": 9295,
+     "issue": 8912,
+     "base_sha": "94d83d62bc6feb953b9646c67b5cda8ebbae4923",
+     "head_sha": "104f4a03e3b59895b555168c4a340215cd6d558e",
+     "own_commits": [
+      "104f4a03e3b59895b555168c4a340215cd6d558e"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    }
+   ],
+   "selection": "same-repo issues created within 21 days, implemented by distinct merged PRs sharing one base commit; timeline-verified unedited snapshots"
+  },
+  {
+   "pair_id": "p-8919-8700",
+   "historical_commit": "f786b449918d30a9b1f839dc231d308e62fea835",
+   "cutoff": "2026-09-25T16:15:20Z",
+   "issues": [
+    {
+     "issue": 8919,
+     "title": "#8248 freshness guard: in-place re-runs still lose to a busy main (input-aware staleness or a fast required-checks workflow)",
+     "body": "## Problem\n\nSplit out of #8914, covering the second finding in the comment on that issue. **In-place re-runs of stale required checks can still lose to a busy `main`.**\n\nThe #8248 freshness guard treats **any** base-tip move after a required check started as making that check's green result stale. On 2026-09-25 `main` moved at 14:26, 14:47 and 14:58 UTC, and each move landed before a full CI run (about 8 min) finished. PR #8641 lost the race three times, including twice with operator in-place re-runs.\n\n#8914 reduces the window. It re-runs only the stale **required** jobs, in place, and merges as soon as they are fresh. There is a platform limit, though. Verified 2026-09-25: GitHub allows **one** job re-run per workflow run at a time, and a second `POST /actions/jobs/{id}/rerun` in the same run returns `403 \"The workflow run containing this job is already running\"`. All 19 required contexts on `main` live in the single `ci.yml` run, so they are re-run one after another, at roughly 12\u201320 s each (a few minutes in total). That is much shorter than the full run, but it is not zero.\n\n## Candidate directions (need a design pass, possibly an operator decision)\n\n1. **Input-aware staleness.** A base move whose diff touches no ratchet/baseline file and no input of any required check does not make the checks stale. This narrows #8248's \"any move\" rule, so it needs a precise definition of \"required-check input\" and must fail closed when that input set can't be determined. #8248's incident (a baseline tightened under an in-flight PR) must stay covered.\n2. **Put the required checks in their own fast workflow.** If the required ratchet/lint jobs lived in a separate workflow (for example `required-checks.yml`), a single whole-run re-run (`POST /actions/runs/{id}/rerun`) would refresh all of them in parallel in about 1 minute, instead of one job at a time inside `ci.yml`. This is a CI restructuring, so check it against `ci-principles.md`.\n3. **Merge serialization.** Have Champion hold off merging other PRs while one PR's in-place re-run is in flight.\n\n## Acceptance\n- [ ] A design decision is recorded for which of these (if any) to pursue.\n- [ ] Any change to #8248's staleness predicate keeps the 2026-09-18 incident timeline refused (see `stale_checks/tests.rs`).\n\nRelated: #8914, #8248, #8508, #8641.",
+     "curator_affected_files": [],
+     "affected_files_known": false,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; no Curator affected-files baseline exists (unknown, not empty)",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-25T16:15:20Z"
+    },
+    {
+     "issue": 8700,
+     "title": "bug(runtime): spawn-generic-launch.sh resolves the tier-3 manifest from cwd instead of the REPO_ROOT it already computed",
+     "body": "## Summary\n\n`defaults/scripts/spawn-generic-launch.sh` (added by #8695, closing #8671) resolves `REPO_ROOT` from its own `SCRIPT_DIR` but does not pass it to the `runtime-launch-env` subcommand, so tier-3 launch-shape resolution falls back to the daemon's **current working directory** while runtime *admission* for the same dispatch resolves against the **scripts-derived** root.\n\nSurfaced during Judge review of #8695. Not a regression, and not a reason the PR was held \u2014 filing as a suggestion.\n\n## The divergence\n\n`spawn-generic-launch.sh`:\n\n```bash\nREPO_ROOT=\"$(git -C \"$SCRIPT_DIR\" rev-parse --show-toplevel 2>/dev/null || pwd)\"   # line 72\nBIN=\"$(loom_daemon_self_bin_override || loom_locate_daemon_bin \"$REPO_ROOT\")\"\n...\nLAUNCH_ENV=\"$(\"$BIN\" runtime-launch-env --runtime \"$RUNTIME_NAME\" 2>&1)\"           # line 78 \u2014 no --repo-root\n```\n\n`REPO_ROOT` is used only to locate the binary. With `--repo-root` omitted, `RuntimeLaunchEnvArgs::run` falls to `find_worktree_root_from_cwd().unwrap_or_else(|| PathBuf::from(\".\"))`.\n\nOn the other side, `loom-daemon/src/worker_spawn/mod.rs` resolves `let root = workspace(args.scripts_dir.as_deref())?` and hands *that* to `runtime_admission::resolve_and_admit(root, ...)`, and spawns the adapter with `Command::new(runner)` \u2014 no `.current_dir(...)`, so the child inherits whatever cwd the daemon had. The same `<name>.json` is therefore read against two different roots in a single dispatch.\n\n## Reproduction\n\nWith a custom tier-3 manifest at `.loom/runtimes/<name>.json`:\n\n```\n$ (cd \"$REPO\" && loom-daemon runtime-launch-env --runtime zzprobe)      # rc=0, resolves\n$ (cd \"$REPO/loom-daemon/src\" && loom-daemon runtime-launch-env ...)    # rc=0, resolves\n$ (cd /tmp && loom-daemon runtime-launch-env --runtime zzprobe)         # rc=1\nruntime-launch-env: no runtime manifest found for \"zzprobe\" at ./defaults/runtimes/zzprobe.json (and no bundled fallback)\n```\n\n## Why it is low severity today\n\n- `aider`, the only shipped tier-3 runtime, has a bundled compiled-in manifest, so its resolution is cwd-independent. Verified: a full `spawn-worker.sh` dispatch against a mock `aider` emits `--yes-always --message hello world` identically on #8695's head and on `origin/main`.\n- In the normal sweep dispatch the worker's cwd *is* the worktree, so the two roots coincide.\n- `RuntimeLaunchEnvArgs`' own doc comment shows the cwd default was a deliberate choice for the linked-worktree case, citing `repo_root::find_worktree_root`.\n\n## Why it is still worth closing\n\n1. **Silent wrong value.** A repo that customises `.loom/runtimes/aider.json` (e.g. pinning a different `cliBin`) gets the *compiled-in* manifest instead, with no diagnostic, whenever cwd is outside the repo. Customisation is the stated point of the installed-mirror precedence.\n2. **Misleading diagnostic.** A *custom* tier-3 runtime in the same situation has no bundled fallback, so it takes the exit-78 refusal that names the `requires-daemon: runtime-launch-env >= \u2026` version floor \u2014 blaming a stale binary when the actual cause is cwd. That refusal is otherwise well-built; this is the one input that makes it lie.\n3. **Precedent.** `03bd5d007` / #8540 (\"resolve the registry explicitly instead of from cwd\") landed two commits below #8695's base for exactly this bug class.\n\n## Suggested fix\n\nPass the already-computed root:\n\n```bash\nLAUNCH_ENV=\"$(\"$BIN\" runtime-launch-env --runtime \"$RUNTIME_NAME\" --repo-root \"$REPO_ROOT\" 2>&1)\"\n```\n\nThis is strictly more robust than the cwd default \u2014 inside a linked worktree `SCRIPT_DIR` is `<worktree>/.loom/scripts`, so `git rev-parse --show-toplevel` yields the worktree root, matching what the cwd default produces in the case it was designed for, while also being correct when cwd is elsewhere. If the cwd default is preferred for some case not covered here, the alternative is to make `worker_spawn` set the adapter child's `current_dir` to the `workspace()` root so the two resolutions cannot disagree \u2014 but one of the two should happen.\n\n## Acceptance criteria\n\n- [ ] Launch-shape resolution and runtime admission resolve `<name>.json` against the same root for a given dispatch.\n- [ ] A custom `.loom/runtimes/<name>.json` is honoured regardless of the invoking cwd.\n- [ ] Regression coverage in `defaults/scripts/tests/test-spawn-generic-launch.sh`: a manifest-declared `cliBin` still reaches argv when the script is invoked with cwd outside the repository.\n- [ ] Existing 18/18 and 48/48 suites stay green.\n\n## Secondary note (same file, cheap to fold in)\n\n~~Line 78 captures `2>&1`, merging stderr into the string handed to `eval`.~~ **Already fixed on `main`, unrelated to this issue's own fix**: commit `9e88522ff` (\"fix(runtime): don't eval runtime-launch-env's stderr\", a Doctor pass on #8695's own branch before it merged) switched this to a stdout-only capture with a `# stderr is NOT eval'd` comment. No Builder action needed for this note \u2014 it's listed here only for history.\n\n## Dependencies\n\n- [x] PR #8695: merged \u2014 **verified 2026-09-26** via `git show origin/main:defaults/scripts/spawn-generic-launch.sh` (file exists) and `git log --oneline -- defaults/scripts/spawn-generic-launch.sh` (landed in `7ceec3dc7`, \"merge train C: #8899 #8823 #8939 #8904 #8962 #8949 #8695 (#8996)\", 2026-09-25T22:08:38-07:00). Note: the GitHub API reports PR #8695 as `state: CLOSED`/`mergedAt: null`, not `MERGED` \u2014 this repo batches several PRs' commits into one \"merge train\" PR (#8996) and closes the originals individually, so `CLOSED` here means \"landed via the train,\" not \"rejected.\" Confirmed the actual file content on `origin/main` directly rather than trusting the PR's own merge state.\n\nThis issue is now unblocked \u2014 `defaults/scripts/spawn-generic-launch.sh` exists on `origin/main` and a Builder can proceed.\n\n## Affected Files\n\n- `defaults/scripts/spawn-generic-launch.sh` \u2014 pass `--repo-root \"$REPO_ROOT\"` to the\n  `runtime-launch-env` call. **Re-verified on `origin/main` @ `7ceec3dc7`, 2026-09-26**: the call\n  is still line 78 (`LAUNCH_ENV=\"$(\"$BIN\" runtime-launch-env --runtime \"$RUNTIME_NAME\")\"  #\n  stderr is NOT eval'd`) and still omits `--repo-root` \u2014 the fix described in Suggested Fix above\n  is unchanged and still needed. Do NOT also touch the `2>&1` capture \u2014 that part of the\n  Suggested-fix snippet is now stale; stderr separation already landed (see Secondary Note above).\n- `defaults/scripts/tests/test-spawn-generic-launch.sh` \u2014 add the regression case from Acceptance\n  Criteria: a manifest-declared `cliBin` reaches argv when invoked with cwd outside the repository\n\n## Test Plan\n\n- [ ] Automated tests: new regression case in `test-spawn-generic-launch.sh` \u2014 cwd outside the\n      repo, custom `.loom/runtimes/<name>.json`, confirm the manifest's `cliBin` still reaches\n      argv (AC3)\n- [ ] Automated tests: existing 18/18 and 48/48 suites (per this issue's own AC4) stay green\n      after the fix\n- [ ] Manual verification: reproduce this issue's own repro steps\n      (`cd /tmp && loom-daemon runtime-launch-env --runtime <custom>`) before and after,\n      confirming the failure is resolved\n- [ ] Edge cases: confirm `aider`'s bundled compiled-in manifest resolution is unaffected (it\n      doesn't depend on `--repo-root` today, but the change must not break its\n      cwd-independent fallback)\n\n<!-- loom:complexity=routine -->\n\n",
+     "curator_affected_files": [
+      "defaults/scripts/spawn-generic-launch.sh",
+      "defaults/scripts/tests/test-spawn-generic-launch.sh",
+      "origin/main"
+     ],
+     "affected_files_known": true,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; baseline from issue body",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-22T22:54:45Z"
+    }
+   ],
+   "association": "independent",
+   "prs": [
+    {
+     "pr": 9031,
+     "issue": 8919,
+     "base_sha": "f786b449918d30a9b1f839dc231d308e62fea835",
+     "head_sha": "fbb135e7d85aeebb511f15cf1c16970bc266ad33",
+     "own_commits": [
+      "ce02f8088d96630eb252efd5559addf375ae7d24",
+      "fbb135e7d85aeebb511f15cf1c16970bc266ad33"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    },
+    {
+     "pr": 9024,
+     "issue": 8700,
+     "base_sha": "f786b449918d30a9b1f839dc231d308e62fea835",
+     "head_sha": "2581ae22233ca2678ae3e44744337a713d46dfb7",
+     "own_commits": [
+      "2581ae22233ca2678ae3e44744337a713d46dfb7"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    }
+   ],
+   "selection": "same-repo issues created within 21 days, implemented by distinct merged PRs sharing one base commit; timeline-verified unedited snapshots"
+  },
+  {
+   "pair_id": "p-8944-8787",
+   "historical_commit": "3c1fef8a70f727cf175c7e1dfbed52d181873cc5",
+   "cutoff": "2026-09-25T18:09:30Z",
+   "issues": [
+    {
+     "issue": 8944,
+     "title": "worktree node_modules symlinks the primary clone, so pnpm's purge prompt invites deleting it",
+     "body": "## Summary\n\n`worktree.sh` symlinks a new worktree's `node_modules` at the primary clone's. That makes `pnpm run <script>` unusable inside the worktree: pnpm's pre-run dependency check decides the modules directory needs re-provisioning, tries to purge it, and aborts without a TTY \u2014\n\n```\nERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY\nAborted removal of modules directory due to no TTY\nIf you are running pnpm in CI, set the CI environment variable to \"true\"\n```\n\nThe message names its own workaround, and that workaround is the problem: `CI=true` tells pnpm to proceed with removing a directory that **belongs to the primary clone**, from inside a worktree, for a repo that shares one `node_modules` across every worktree.\n\n## Observed\n\nEvery worktree in the affected repo:\n\n```console\n$ ls -ld .loom/worktrees/*/node_modules\n.loom/worktrees/issue-200/node_modules -> /Users/.../rulehunt/node_modules\n.loom/worktrees/issue-209/node_modules -> /Users/.../rulehunt/node_modules\n.loom/worktrees/issue-215/node_modules -> /Users/.../rulehunt/node_modules\n```\n\nA Builder hit this running the repo's required pre-PR check (`pnpm run ci`) from its worktree and worked around it by invoking `npx tsc` / `npx biome` / `npx vitest` directly. It flagged the reason explicitly: pnpm \"wants to purge it \u2014 which would delete the main repo's `node_modules`\".\n\nI did not verify whether `CI=true` actually deletes through the symlink or merely replaces the link, because that is not a thing to test destructively on a working clone. Either outcome is bad: deleting the target breaks every worktree and the primary checkout at once, and replacing the link silently gives one worktree a private `node_modules` while the others still point at a directory that no longer matches the lockfile they were installed from.\n\n## Why it matters beyond one repo\n\nThe failure lands on the **documented happy path**. Loom's Builder workflow is \"claim issue \u2192 `worktree.sh <N>` \u2192 implement \u2192 run the repo's checks \u2192 open PR\". Any repo whose check script is a `pnpm run` target hits this on every single issue, and the error text actively recommends the dangerous flag. An agent that follows the message's own advice does the destructive thing.\n\nIt is also silent in the other direction: because the worktree shares the primary clone's `node_modules`, a branch that changes dependencies is tested against the *primary clone's* installed tree, not its own. A PR that adds or bumps a dependency can pass locally for reasons unrelated to its own lockfile.\n\n## Suggestions\n\n1. **Make the symlink safe to use, or do not create it.** If the intent is disk sharing, a pnpm-aware arrangement (a shared store with a per-worktree `node_modules`, which is what pnpm's content-addressable store already exists to provide) gets the space saving without the aliasing.\n2. **If the symlink stays, guard the destructive path.** A worktree-local `.npmrc` with `confirmModulesPurge=false` would turn the abort into a refusal-to-purge rather than an invitation to force it.\n3. **Document it in the Builder role.** Until it is fixed, `builder.md` should say plainly: inside a Loom worktree, do not run `pnpm install` or `CI=true pnpm ...`; invoke binaries directly. Right now nothing warns, and the pnpm error steers the reader the wrong way.\n\nRelated: #8927 (stale `loom:blocked`). Both are cases where the tooling's default path produces a wrong outcome quietly.\n\n<!-- loom:complexity=complex -->\n",
+     "curator_affected_files": [],
+     "affected_files_known": false,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; no Curator affected-files baseline exists (unknown, not empty)",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-25T18:09:30Z"
+    },
+    {
+     "issue": 8787,
+     "title": "Admit Codex mutable roles using verified private-clone containment",
+     "body": "Part of #4489; third implementation step in the operator-requested private-clone workstream. #4496 remains the production evidence gate.\n\n## Problem\n\nIndependent repositories prevent a container worker from damaging a shared host checkout, but the daemon currently admits Codex from a static capability manifest where worktreeIsolation is partial. The adapter additionally requires managed native hooks for mutable roles. Merely removing the host mount would therefore still leave Builder, Doctor and full sweeps unusable.\n\nThe operator requested isolated copies as the fastest integration path, with optimization deferred. Implement a distinct, verified execution context; do not globally declare native Codex hook parity complete.\n\n## Recommended implementation\n\nExtend admission so private-clone containment can satisfy the repository-isolation requirement for a launch whose account, container, mounts, private Git root and exclusive job lease are validated. Carry the validated context through account selection and spawn, and recheck its identity at execution. A configuration flag, environment variable or container label alone is insufficient evidence.\n\nFor this mode, the whole private clone is the worker's owned repository sandbox; local disposable base-checkout edits are not host-main edits. Existing issue branches/worktrees remain the workflow. Explicitly document this scope of isolation so it is not mistaken for native per-worktree hook parity.\n\nReconcile the adapter's mutable-role preflight with that context. Replace only the filesystem-isolation obligation covered by independent clones. Inventory the remaining obligations of the existing hook bridge\u2014protected remote branch mutations, destructive actions outside the owned workspace, Loom lifecycle controls and credential boundaries\u2014and retain or provide an enforceable mechanism for each. A Docker boundary does not prevent an authenticated force-push. Where a required policy is unproven, refuse with the precise remaining requirement rather than silently waive all hook checks.\n\nKeep ordinary host/shared-mount Codex admission unchanged. Record execution-specific capability provenance in diagnostics and status. Support the already selected runtime preference order without altering repository-specific preference or scheduled-role settings.\n\n## Acceptance criteria\n\n- [ ] Builder, Doctor and sweep-lifecycle admission can use verified private-clone isolation through the normal runtime path. Read-oriented roles keep their existing requirements; every path still checks remaining role capabilities.\n- [ ] Bare-host, host-repository-mounted, shared-Git, shared-account-lease and unverifiable sessions remain refused for the new containment claim. Missing/stale container identity and a mount/lease change between preflight and launch fail closed.\n- [ ] Global Codex hooks/worktreeIsolation values are not changed to yes based on this feature. Admission records distinguish verified clone containment from native hook parity.\n- [ ] The managed-hook preflight is explicitly reconciled with clone mode; there is no unconditional skip flag, trust bypass, test-only environment variable or prompt-only policy standing in for enforcement.\n- [ ] Tests prove allowed private issue-branch edits/commit/push and denial of host/sibling/peer-repository writes, arbitrary host control/executor access and protected-remote destructive operations using disposable local fixtures.\n- [ ] Preserve workflow/credential protections and test the actual launch path, including attempts via shell, patch, helper and any supported secondary mutation channel. Do not claim container isolation makes credentials or forge operations harmless.\n- [ ] Update the runtime/guardrail documentation with an obligation-to-mechanism table, supported image/CLI/protocol versions, evidence requirements, remaining limitations and rollback to the prior runtime.\n- [ ] Automated tests cover both explicit Codex selection and capability-aware fallback. No change silently makes an unverified Codex account eligible or falls through from an explicit runtime pin.\n- [ ] Prepare the private-clone test matrix for #4496, including an actual daemon-dispatched bounded full lifecycle after disposable-repo success. Mock/CI evidence cannot satisfy the live go/no-go; do not enable fleet defaults here.\n\n## Implementation starting points \u2014 curator must verify\n\nVerified against origin/main at 135183d9b2527cb2cc81d2c5d8e0ba1f2213c645:\n\n- `loom-daemon/src/runtime_admission.rs` \u2014 full sweeps are a single runtime launch checked against Builder requirements.\n- `loom-daemon/src/role_runner/runtime_preflight.rs` and `loom-daemon/src/sweep_registry/dispatch.rs` \u2014 capability-aware selection and dispatch.\n- `defaults/runtimes/codex.json` \u2014 partial native capabilities and their live evidence requirements.\n- `defaults/scripts/spawn-codex.sh` \u2014 mutable-role hook readiness gate.\n- `defaults/docs/guardrail-parity-codex.md` \u2014 current hook bridge covers filesystem, destructive-command and workflow policies.\n\nUse Rust for execution-context verification and admission; keep one shared decision path.\n\n## Dependencies\n\n- [x] #8785 \u2014 private workspace and exclusive lease; merged in #8800.\n- [x] #8786 \u2014 normal daemon launch, recovery and observability inside that workspace; merged in #8830 (`d678331b6`).\n- [ ] #8839 \u2014 protected private-session guard code/policy/hook-registration boundary (Builder-discovered 2026-09-24: mid-session edits to `.loom/config.json` or the bridge disable force-push denial; mutable admission must consume this boundary).\n\nExisting #8256/#8322 cover tool-policy infrastructure and should be reused where applicable; they are not a reason to widen this issue into a policy-engine rewrite. Required missing protection discovered during curation must be named concretely.\n\n<!-- loom:premise-check exists=yes deliberate=yes reversal=no verdict=clear -->\npremise-evidence: defaults/runtimes/codex.json \u2014 native Codex isolation remains partial pending its own evidence gate.\npremise-evidence: loom-daemon/src/runtime_admission.rs:1 \u2014 mutable full sweeps intentionally require Builder capabilities.\npremise-extends: add an evidence-backed containment mechanism for the explicitly selected private-clone execution context; preserve native capability truth, existing host/shared-mount refusals, and the requirement to satisfy every applicable safety obligation.\n\n## Curator implementation handoff \u2014 2026-09-24\n\n<!-- loom:complexity=complex -->\n\nVerified against `origin/main` at `e86b361c1`. The former dependency holds are resolved. This is a security-sensitive admission change, not a capability-manifest promotion. Keep the original acceptance criteria above as the completion contract.\n\n### Verified corrections\n\n- #8786 now provides `tokens_pool::private_workspace::dispatch::Selection`, which owns the selected account and exclusive lease. Preparation validates actual Docker settings/mounts/ownership and runs outside the sweep-registry lock. `transport::run` adopts the inherited open file description, checks the durable job/container identity again, and launches by container ID. Reuse these mechanisms; do not introduce a second account-selection pass.\n- Capability rejection currently occurs **before** that preparation in `sweep_registry/private_dispatch.rs`; preference selection also rejects Codex using the static manifest. The worker independently repeats static admission in `worker_setup::execute`. Updating only `runtime_admission.rs` or only the shell adapter will therefore leave a broken or inconsistent path.\n- `worker_setup::setup` installs the managed hook bridge, but successful installation is **not proof of hook trust or policy readiness**. It currently reports setup ready without a final trusted-hook verification. The mutable adapter preflight remains a separate enforcement obligation.\n- #8256 and #8322 are still OPEN. Their proposed role-tool-policy module is absent from this build base. Existing managed guards are available; do not import assumptions about the unmerged #8314 implementation or make this issue a general role-policy rewrite.\n- The session image pins Codex `0.149.1` (`docker/session/Dockerfile`), while the bridge documentation/schema pin is `0.146.0`. The implementation must document and test the supported combination instead of treating the CLI minimum version as protocol evidence. The current private transport protocol is `loom-private-workspace-v1`.\n\n### Implementation sequence\n\n1. Introduce an execution-specific admission context whose construction requires the validated `Selection`/lease. Keep configuration parsing, inventory checks and status probes unable to manufacture this proof. Override only the repository-isolation requirement covered by the private clone; continue checking every other role requirement and retain the static API's refusals for ordinary host/shared sessions.\n2. Thread context and provenance through explicit selection, the capability-aware preference walk, scheduled roles, unlocked sweep preparation, adapter preflight and worker execution. Explicit pins never fall through. Drop rejected candidates' temporary leases/reservations; keep Docker work outside scheduler/registry locks. Revalidate the bound container, mounts, private Git root and lease immediately before execution.\n3. Reconcile managed hooks narrowly. Retain verified/trusted enforcement for remote-operation and Loom-workflow policy; clone containment cannot replace those guards. No fabricated trust receipts, blanket bypass flags or environment-only containment claim. If the tested CLI/policy combination cannot enforce a required rule, return that precise unmet obligation before claiming work.\n4. Record context/provenance in diagnostics and durable status without credentials or raw operator configuration. Preserve recovery ownership and the existing prohibition on automatic private account/runtime failover. Update the guardrail/private-dispatch docs and the #4496 test matrix; leave production runtime defaults unchanged.\n\n### Obligation \u2192 mechanism to preserve and prove\n\n| Obligation | Existing base / required work |\n| --- | --- |\n| Host, sibling and peer repository isolation | Actual Docker mount/security inspection, private named volume and independent Git root, exclusive account/volume ownership. Bind this evidence to admission and recheck at launch. |\n| Exclusive writer and stale-context refusal | Owned lease descriptor plus durable job/container identity; preserve #8786 cancellation/recovery behavior and test preflight-to-launch changes. |\n| Protected remote operations | Managed destructive-command policy, or another demonstrated enforceable mechanism. Docker/network availability alone is insufficient. Verify protected remote refs remain unchanged after denied force-push/deletion attempts. |\n| Loom lifecycle controls | Retain managed workflow guards for merge/helper and control mutations. Private `run-job` refusal and MCP/plugin/profile audit already restrict host control; preserve them. |\n| Credential boundary | External per-account profile, narrow selected mounts/environment and redacted outputs. The selected profile and forge access remain sensitive; prove peer profiles and exported records cannot expose credentials. |\n| Control/guard integrity | The clone is writable and its current helpers/bridge resolve inside it. Before relying on that bridge for admission, demonstrate how edits to policy/config/guard files cannot silently disable required enforcement; refuse an unproven path. |\n| Secondary mutation channels | Cover shell, patch and helper calls through the actual launch. Preserve denial of unsupported channels such as `write_stdin`; MCP/plugin/control audit is not permission to introduce another unguarded executor. |\n\n### Affected files / test entry points\n\nAll existing on the verified build base; new verifier modules may be added beside these:\n\n- `loom-daemon/src/runtime_admission.rs`\n- `loom-daemon/src/runtime_preference.rs` and `runtime_preference/resolve.rs`\n- `loom-daemon/src/role_runner/runtime_preflight.rs`\n- `loom-daemon/src/sweep_registry/private_dispatch.rs`\n- `loom-daemon/src/tokens_pool/private_workspace/{dispatch,transport,worker_setup,control,docker,lease,export}.rs`\n- `defaults/scripts/spawn-codex.sh` and the existing managed hook/provisioning boundary\n- `loom-daemon/tests/private_workspace_docker.rs` and its `dispatch.rs`/`auth.rs` fixtures\n- `defaults/docs/guardrail-parity-codex.md`, `defaults/docs/private-session-dispatch.md`, `docker/session/Dockerfile` (version contract reference)\n\n### Verification plan\n\n- Shared Rust admission tests: Builder/Doctor/sweep-lifecycle, unchanged read roles, an additional unmet capability, missing proof, explicit Codex refusal without fallback, and Claude \u2192 verified Codex \u2192 Z.ai preference selection. No promotion of global partial capabilities.\n- Disposable Docker tests through production `SweepRegistry::dispatch_unlocked` and `ScriptRoleInvocationRunner`, then the real adapters/supervisor/worker: allowed issue edit/commit/push plus required denied operations above. Do not substitute a synthetic freeform selection for actual mutable-role admission.\n- Negative variants: host/shared Git/mount, peer profile or volume attachment, busy lease, changed/replaced container, stale/missing identity and mutation between preparation and launch. Assert refusal before model/claim where appropriate and inspect filesystem/remote refs afterwards.\n- Reuse the complete Linux daemon and existing UID-1000/public-source CI fixture. Run Docker tests with their normal parallel execution as well as focused failures; preserve profile permissions. All credentials/remotes/accounts must be disposable synthetic fixtures.\n- Check structural/shell/version gates, relevant Rust tests and Clippy, then PR CI and the required post-merge gate. Real authenticated daemon-dispatched lifecycle evidence remains #4496, after disposable success; CI does not establish the production go/no-go.\n\n",
+     "curator_affected_files": [],
+     "affected_files_known": false,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; no Curator affected-files baseline exists (unknown, not empty)",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-23T21:33:07Z"
+    }
+   ],
+   "association": "independent",
+   "prs": [
+    {
+     "pr": 9151,
+     "issue": 8944,
+     "base_sha": "3c1fef8a70f727cf175c7e1dfbed52d181873cc5",
+     "head_sha": "cbd1fc3a5ffc6eacca67a85094f6518efad78733",
+     "own_commits": [
+      "7edd798e8ccf901d447a230c6a65e3ee55b0be69",
+      "62dc1f5105700012c2d2f1997455ecdbfaba5fb1",
+      "9b3ca01f2539d19e66a4bbfbb2e7fa136926eba5",
+      "7b0ae68ea699ccef66442597209a4aa9caae7116",
+      "cbd1fc3a5ffc6eacca67a85094f6518efad78733"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    },
+    {
+     "pr": 9150,
+     "issue": 8787,
+     "base_sha": "3c1fef8a70f727cf175c7e1dfbed52d181873cc5",
+     "head_sha": "7be43b6ecb3013657ca4170b54b3de4da0458aae",
+     "own_commits": [
+      "e5ad71cff54bd9a358878584fb257c713c3896c9",
+      "7be43b6ecb3013657ca4170b54b3de4da0458aae"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    }
+   ],
+   "selection": "same-repo issues created within 21 days, implemented by distinct merged PRs sharing one base commit; timeline-verified unedited snapshots"
+  },
+  {
+   "pair_id": "p-8968-8959",
+   "historical_commit": "17b3556d820c653ad21d3b39246b694f3ebbd674",
+   "cutoff": "2026-09-25T21:00:07Z",
+   "issues": [
+    {
+     "issue": 8968,
+     "title": "cleanup-branches.sh: drop the dead extract-and-eval of merge-pr.sh's _maybe_delete_local_branch helpers; call loom-daemon merge-pr delete-branch directly",
+     "body": "## Problem\n\n`defaults/scripts/cleanup-branches.sh` reuses `merge-pr.sh`'s `_maybe_delete_local_branch` for its `pr-*` review-branch pass. It `awk`-extracts the function body out of `merge-pr.sh` and `eval`s it, alongside:\n\n- a `source \"$SCRIPT_DIR/lib/branch-landed.sh\"`, plus a hand-written fail-closed `branch_landed()` shim for a partially-resynced `.loom/`;\n- the extracted transitive helpers `_primary_worktree_path`, `_is_primary_worktree_path`, and `_find_worktree_by_branch`, plus fallback shims for each.\n\nThe #8191 local-branch-cleanup slice turned `_maybe_delete_local_branch` into a thin call to `loom-daemon merge-pr delete-branch`, which is the same `worktree_cli::branch_delete` rule `worktree.sh remove` uses. After that slice, **none of the sourced/extracted helpers above is called by the extracted body.** They are dead weight in the portable-shell pool. The extract-and-`eval` contraption also exists only to avoid a second implementation. That goal is now met more directly by calling the subcommand itself.\n\nThat slice intentionally left `cleanup-branches.sh` unchanged. Its retained suite `test-cleanup-branches-pr-review-branch.sh` asserts on that wiring's source text in 9 places, and changing it would have widened the slice beyond the `merge-pr.sh` port.\n\n## Suggested fix\n\n- Replace the extract/`eval` block with a direct `loom-daemon merge-pr delete-branch --repo-root \u2026 --branch \u2026 --expected-head-sha \u2026 [--default-branch \u2026]` call. Replay its `LEVEL<TAB>message` stdout through the script's own `info`/`warning`/`success`, as `merge-pr.sh` does. Or, better, add a small shared shell helper both callers use.\n- Drop the `branch-landed.sh` sourcing, the `branch_landed()` shim, and the dep-helper extraction list.\n- Retire the source-text assertions in `test-cleanup-branches-pr-review-branch.sh` under the three-part test in `defaults/docs/verification-recipes.md` \u00a76, with the suite's behavioural cases as successors. Those cases already run against the pinned daemon.\n\n## Acceptance criteria\n\n- [ ] `cleanup-branches.sh` no longer extracts or `eval`s any function from `merge-pr.sh`.\n- [ ] `test-cleanup-branches-pr-review-branch.sh`'s behavioural cases pass unchanged. Any retired source-text assertion is recorded via `retired()` with a named successor.\n- [ ] The portable-shell line count drops, and nothing in the file-size / shell-budget ratchets grows.\n\nFound while building the #8191 local-branch-cleanup slice.\n\n<!-- loom:complexity=routine -->\n",
+     "curator_affected_files": [],
+     "affected_files_known": false,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; no Curator affected-files baseline exists (unknown, not empty)",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-25T21:00:07Z"
+    },
+    {
+     "issue": 8959,
+     "title": "Harden the pi_usage / codex_usage source-scan tests against missed read idioms",
+     "body": "Surfaced while reviewing #8951 (the Pi `usage_source` reader). This is a follow-up suggestion, not a blocker for that PR.\n\n## Observed\n\nThe source-scan tests `pi_usage::tests::the_only_file_open_in_this_module_is_the_guarded_log_reader` (#8951) and `codex_usage::tests::the_only_file_open_in_this_module_is_the_guarded_rollout_reader` (already on `main`) pin \"never read a credential-bearing file\" by counting lexical idioms in the module's comment-stripped source. I ported the Pi scan's exact string logic to Python and ran it against mutated copies of `loom-daemon/src/pi_usage.rs` (this was an emulation, not a cargo run):\n\n| Mutation appended to `pi_usage.rs` | Scan result |\n|---|---|\n| `std::fs::read_to_string(p.join(\"auth.json\"))` | FAIL (caught) |\n| `std::fs::read_dir(p)` | FAIL (caught) |\n| `p.join(\".pi\").join(\"agent\").read_dir()` + `std::fs::File::options().read(true).open(..)` | **PASS (missed)** |\n| `crate::codex_usage::tokens_by_model(p, None)` (delegating to another module's reader) | **PASS (missed)** |\n\nMissed idioms:\n- `Path::read_dir()` in method form. Only `fs::read_dir(` is counted.\n- `File::options()`. Only `OpenOptions` and `File::open(` are counted.\n- `\".pi\"` as a path segment passed to `join`. Only `.pi/` with a slash is forbidden.\n- Crate-internal readers such as `walkdir`, `glob`, or another `*_usage` module's public reader.\n\nThe codex scan is weaker still. It has no `read_dir` entry and no forbidden-name list.\n\n## Suggested hardening (unverified; the scope is for the Builder to decide)\n\n- Add `.read_dir(`, `File::options`, `WalkDir`, and `glob(` to the zero-count idiom lists in both tests.\n- Forbid the quoted segment `\".pi\"` (and `\".codex\"` for the codex reader) in addition to `.pi/`.\n- Optionally forbid `crate::` paths into other reader modules, or accept that delegation is out of a lexical scan's reach and say so in the test's doc comment.\n\nThe behavioral tests (`a_refused_path_is_never_opened_even_when_it_holds_a_valid_stream`, `read_rollout_refuses_an_unauthorized_path_even_when_handed_one_directly`) already cover a gate that stops returning. This issue is only about the lexical scan's coverage.\n\n<!-- loom:complexity=mechanical -->\n",
+     "curator_affected_files": [],
+     "affected_files_known": false,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; no Curator affected-files baseline exists (unknown, not empty)",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-25T19:58:30Z"
+    }
+   ],
+   "association": "independent",
+   "prs": [
+    {
+     "pr": 9164,
+     "issue": 8968,
+     "base_sha": "17b3556d820c653ad21d3b39246b694f3ebbd674",
+     "head_sha": "3953664ba4fb83912681be7541f50fa27ebba7ec",
+     "own_commits": [
+      "cdb289b4154576c55f3cad05db3c69bb3cf1e44a",
+      "3953664ba4fb83912681be7541f50fa27ebba7ec"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    },
+    {
+     "pr": 9163,
+     "issue": 8959,
+     "base_sha": "17b3556d820c653ad21d3b39246b694f3ebbd674",
+     "head_sha": "13528dd355179fed6299893569376d03978319fc",
+     "own_commits": [
+      "7004e06009eac09ed329b41a9adf810e0b5657a7",
+      "13528dd355179fed6299893569376d03978319fc"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    }
+   ],
+   "selection": "same-repo issues created within 21 days, implemented by distinct merged PRs sharing one base commit; timeline-verified unedited snapshots"
+  },
+  {
+   "pair_id": "p-8987-9029",
+   "historical_commit": "0085de7a501a5c968eb935b8776bdecbba9c4dae",
+   "cutoff": "2026-09-26T07:17:23Z",
+   "issues": [
+    {
+     "issue": 8987,
+     "title": "check-runs reads outside forge_get_check_runs can still truncate (Gitea branch, daemon stale-checks guard)",
+     "body": "Found while implementing #8895 (PR #8986), which fixed the GitHub branch of `forge_get_check_runs` (`per_page=100` + `--paginate`, plus a fail-closed rc when the row count is short of `total_count`). Two other reads of the same endpoint class were deliberately left out of that PR's scope.\n\n## 1. `forge_get_check_runs`, Gitea branch\n\n`defaults/scripts/lib/forge-helpers.sh` \u2014 the Gitea branch makes ONE unpaginated request:\n\n```\ngitea_api GET \"repos/$FORGE_OWNER/$FORGE_REPO/commits/$commit/statuses\"\n```\n\nGitea caps a page at `MAX_RESPONSE_ITEMS` (50 by default, `DEFAULT_PAGING_NUM` 30), so the same 30-row truncation class applies. Worse, this branch derives `total_count` from the rows it received (`total_count: (. | length)`), so the fail-closed short-read check the GitHub branch now has is structurally unable to fire here \u2014 a truncated read looks self-consistent.\n\nThe library already has `_forge_gitea_paginate` (used by `forge_get_pr_reviews`), which fails closed on a pagination failure and refuses to report a truncated list. Restructuring this branch to use it (per-row jq filter + `jq -s` to rebuild the `{total_count, check_runs}` rollup) is the fix. Note `defaults/scripts/lib/forge-helpers.sh` is at its file-size baseline (1011 code lines), so the change must be line-neutral or shrinking.\n\nA `KNOWN GAP (Gitea)` comment on the helper's doc block points here.\n\n## 2. `fetch_check_runs` in the daemon's stale-checks guard\n\n`loom-daemon/src/merge_pr/stale_checks/fetch.rs` (~line 226) passes `per_page=100` but does **not** paginate, and its `--jq` drops `total_count` entirely, so there is nothing to compare a row count against:\n\n```rust\n&format!(\"repos/{nwo}/commits/{head_sha}/check-runs\"),\n\"--method\", \"GET\", \"-f\", \"per_page=100\", \"--jq\",\n\"[.check_runs[]? | {name: .name, status: .status, conclusion: .conclusion, started_at: .started_at, app: .app.slug, details_url: .details_url}]\",\n```\n\nLess acute than #8895 (100 is above this repo's 39, and this feeds the stale-checks guard rather than the settle decision), but it is the same silent-subset shape: a repo that grows past 100 check-runs gets a guard evaluated on a subset with no signal that anything was missing. Fix shape: paginate, and keep `total_count` so a short read can fail closed the way the shell helper now does.\n\n## Acceptance criteria\n\n- [ ] The Gitea branch of `forge_get_check_runs` retrieves every commit status for a commit (not one page), and a pagination failure returns nonzero rather than a short list.\n- [ ] The daemon's `fetch_check_runs` paginates and fails closed (error, not a partial `Vec<CheckRun>`) when the retrieved count is short of the endpoint's `total_count`.\n- [ ] Regression coverage for each: a multi-page fixture, and a short-read fixture asserting the fail-closed path.\n- [ ] `defaults/scripts/lib/forge-helpers.sh` does not grow past its file-size baseline.\n\nEither half is independently shippable; splitting into two PRs is fine.\n\n---\n\n## Curator Enhancement\n\n<!-- loom:complexity=routine -->\n\nVerified both gaps against `origin/main` @ `7e0a29b0d` (2026-09-27) \u2014 both match this issue's description exactly, no drift since filing. See curator comment below for the verification detail (file-size baseline, enumeration of other call sites, duplicate check).\n\n### Affected Files\n\n- `defaults/scripts/lib/forge-helpers.sh` - Restructure the Gitea branch of `forge_get_check_runs` (~line 561-590) to page through `commits/{sha}/statuses` via the existing `_forge_gitea_paginate` helper (already used by `forge_get_pr_reviews`) instead of one unpaginated call, and derive a real `total_count`/short-read check the way the GitHub branch already does (line 606-638) \u2014 line-neutral or shrinking overall, since the file is at its 1011-line baseline.\n- `loom-daemon/src/merge_pr/stale_checks/fetch.rs` - Add pagination (mirroring the shell helper's `--paginate` fix from #8895) to `fetch_check_runs` (~line 269), and keep `total_count` through the `--jq` projection so a short read can fail closed instead of silently returning a `Vec<CheckRun>` subset.\n\n### Test Plan\n\n- [ ] Automated tests: add a multi-page Gitea `statuses` fixture (more rows than one page) asserting `forge_get_check_runs` returns the full merged set, not a truncated first page.\n- [ ] Automated tests: add a short-read fixture for the Gitea branch (fewer rows returned than the forge's own count implies) asserting the function fails closed rather than returning a self-consistent-looking partial result.\n- [ ] Automated tests: add equivalent multi-page and short-read fixtures for `fetch_check_runs` in `fetch.rs`, asserting pagination and a fail-closed error (not a partial `Vec<CheckRun>`) on a short read.\n- [ ] Manual verification: run `defaults/scripts/lib/forge-helpers.sh`'s existing test suite (if any) plus `cargo test` in `loom-daemon` for the `merge_pr::stale_checks` module after the change.\n- [ ] Verify `defaults/scripts/lib/forge-helpers.sh` line count has not grown past its `scripts/file-size-baseline.txt` entry (1011 lines).\n",
+     "curator_affected_files": [
+      "commits/{sha}/statuses",
+      "defaults/scripts/lib/forge-helpers.sh",
+      "loom-daemon/src/merge_pr/stale_checks/fetch.rs"
+     ],
+     "affected_files_known": true,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; baseline from issue body",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-26T00:11:48Z"
+    },
+    {
+     "issue": 9029,
+     "title": "feat(dashboard): visual timeline dashboard for Loom lifecycle and token usage over time",
+     "body": "<details>\n<summary>Original issue (preserved)</summary>\n\n### Problem Statement\nOperators currently lack an at-a-glance web view on the Loom dashboard (`https://dashboard.2amlogic.com`) to visualize token throughput (tokens/min), % capacity saturation, and end-to-end issue lifecycle progression.\n\n### Proposed Solution\nAdd interactive time-series plots and lifecycle waterfall views to the web dashboard backed by local OTLP/SigNoz metrics.\n\n---\n**Operator Priority Bump** (comment by @2ambots, 2026-09-26): Promoted to `tier:goal-advancing` and `priority:high` by @turian via Chat-Ops.\n\n</details>\n\n---\n\n<!-- loom:complexity=routine -->\n\n## Curator Enhancement\n\n### Problem Statement (clarified)\n\nThe operator's framing names a concrete target: **`dashboard.2amlogic.com`**. That\nhostname is **not** the embedded `loom-daemon serve` HTML dashboard (the\nloopback-only, port-7420, no-build-toolchain page compiled into the daemon\nbinary \u2014 see `.loom/docs/daemon-reference.md` \u00a7\"Fleet dashboard\"). It is the\n**reference deployment of the `dashboard/` Cloudflare Workers app**\n(`loom-observability-backend` \u2014 ingest + D1 history + a `FleetState` Durable\nObject + the Phase-3 UI in `dashboard/web/`), confirmed by `CHANGELOG.md`\n(\"Reference deployment: dashboard.2amlogic.com\") and `WORK_LOG.md` (\"2AM\nproduction deploy: dashboard.2amlogic.com cutover\", issue #4859). All work\nbelow targets `dashboard/web/src/`, not `loom-daemon/src/serve.rs`.\n\n**Correction to the original \"Proposed Solution\":** it says the dashboard is\n\"backed by local OTLP/SigNoz metrics.\" That's a different, parallel effort \u2014\nSigNoz/ClickStack/HyperDX is a *separate* telemetry trial (epics #8522/#8529,\n`.loom/docs/observability.md`, `ci-observability.md`) with no wiring to\n`dashboard.2amlogic.com`. The dashboard's actual data path is\n`loom-daemon`'s own native `HttpsExporter`\n(`loom-daemon/src/observability/exporter.rs`) pushing to the Workers\n`/ingest` route, not OTLP/SigNoz. This issue's work has no dependency on the\nSigNoz effort.\n\n**This dashboard already has substantially more built than the issue as filed\nimplies.** Before scoping work, here is what already exists (epic #4702,\nissues #4726/#4750/#4751/#4752/#4753/#4847/#4998/#8852):\n\n- **Per-sweep lifecycle timelines** (`web/src/sweepTimelineView.ts` +\n  `timelineBuilder.ts`, issue #4750): phase progression\n  curator \u2192 builder \u2192 judge \u2192 doctor \u2192 merge, per sweep, with durations and\n  PR link.\n- **Historical charts** (`web/src/historicalChartsPanel.ts`, issue #4751):\n  outcomes-over-time, success-rate trend, duration percentiles \u2014 full\n  interactive charts (dated axis, hover tooltip, accessible table fallback)\n  via `web/src/charts/chartChrome.ts`.\n- **Per-host sweep-throughput and health-trend charts**\n  (`web/src/hostHistoryPanel.ts`).\n- **Token/cost analytics** (`web/src/analytics/*`, issue #4752): per-account\n  burn curves (`burn.ts`), exhaustion forecasts including a computed\n  **burn-rate `slopePerHour`** (`forecast.ts`), per-repo attribution\n  (`attribution.ts`), and \u2014 **already rendering today, on both the\n  authenticated and public surface** \u2014 a **\"Fleet token-pool load\" panel**\n  (`web/src/analytics/render.ts`'s `renderPoolBurn`/`renderPoolBurnCard`)\n  that draws a small SVG **sparkline of peak/mean `usage_fraction` (i.e. %\n  pool capacity) over time, per host, 0\u2013100%-pinned**\n  (`renderPoolSparkline`).\n- A CPU/load **saturation badge** per host (`idle`/`elevated`/`critical`,\n  issue #4998, `src/publicPage.ts`) \u2014 a *different* kind of \"saturation\"\n  (CPU load, not token/dispatch capacity).\n\nSo the literal phrase \"% saturation UI panel\" for token usage is **partially\nalready shipped** as a decorative sparkline. What is genuinely missing, and\nwhat this issue should scope to, is narrower than the original title\nsuggests.\n\n### What's actually missing (the real gap)\n\n1. **No rolling *rate* (throughput) visualization exists anywhere.**\n   `forecast.ts` computes `slopePerHour` (usage_fraction consumed per hour,\n   least-squares fit over the live burn segment) purely to project an\n   exhaustion ETA \u2014 it is never plotted as its own time series. There is a\n   ready-made formatter for it (`analytics/format.ts`'s `formatRatePerHour`\n   \u2192 `\"N.N%/h\"`) but no chart.\n2. **The existing pool-load sparkline is decorative, not a first-class\n   chart.** It is a bare inline SVG (`renderPoolSparkline`) with no dated\n   x-axis, no hover tooltip, and no `renderTableView` accessible fallback \u2014\n   unlike the three real charts in `historicalChartsPanel.ts`, which all use\n   `charts/chartChrome.ts` for exactly that chrome.\n3. **\"Tokens/min\" is not a representable unit.** Per\n   `dashboard/docs/token-analytics.md` (\u00a7\"Units are limit-window\n   fractions\"): *\"No absolute token count or price exists anywhere in the\n   telemetry, so none is synthesized.\"* `tokens.snapshot` (see\n   `.loom/docs/telemetry-schema.md`) carries only `usage_fraction` (a\n   fraction of a rolling rate-limit window) per account, never a raw token\n   count. Any \"rolling token throughput\" panel must be honestly labeled as a\n   **burn *rate*** (`%` of pool capacity per hour), not tokens/minute \u2014 the\n   operator's Chat-Ops phrasing (\"tokens/min\") does not match what the data\n   model can support, and the panel must not imply a unit it cannot back.\n4. **No dispatch/concurrency-capacity saturation view.** `queue.snapshot`\n   (schema v11, `.loom/docs/telemetry-schema.md`) already carries\n   `max_concurrent` (the concurrency cap a tick ran under) and\n   `counts.running`, and \u2014 like every ingested record \u2014 is persisted\n   unconditionally to D1 by `handleIngest` in `dashboard/src/index.ts`\n   (regardless of `kind`), so `running / max_concurrent` over time is\n   *already queryable* via `/api/history`/`/public/history` with **zero\n   backend changes**. This is a second, orthogonal \"% capacity saturation\"\n   signal (compute/dispatch capacity, not token-pool capacity) and is\n   explicitly **out of scope** for this issue (see Overlap note below).\n5. **No fleet-wide multi-sweep \"lifecycle waterfall\".** The existing\n   `sweepTimelineView.ts` renders one sweep's phase list at a time. A\n   Gantt/waterfall view of *concurrent* sweeps across the fleet (the\n   original issue's \"Proposed Solution\" language) is a materially larger UI\n   feature than a single chart.\n\n### Overlap with sibling issue #9032 (being curated in parallel)\n\n#9032 (\"expose dedicated org-wide ranked ready dispatch queue view\n`/dashboard/queue`\") targets the **same repo directory** and, notably, a\nroute (`/#/queue`) that **already exists**: `web/src/views/workQueue.ts`'s\n`workQueueView` already renders a live running/ready/blocked queue at that\nhash route (issue #8852, phase 3), backed by `queue.snapshot` \u2014 though\n#9032's proposed backend (`GET /api/v1/queue/ranked`, a fresh org-wide\nGitHub-issue ranking by `work_finder::candidate_cmp`) is not obviously the\nsame data source. Whoever curates/builds #9032 needs to reconcile that\noverlap; it is out of scope for #9029 to resolve. **For this issue:** do not\ntouch `web/src/views/workQueue.ts`, `web/src/workQueue.ts`,\n`web/src/queueTypes.ts`, or the `#/queue` route \u2014 the chart this issue adds\nlives in `web/src/analytics/` and/or `web/src/charts/`, a disjoint file set.\n\n### Acceptance Criteria (single-PR core)\n\nBuild **one** new chart: a **rolling token-pool burn-rate (\"throughput\")\nchart** \u2014 the genuinely net-new piece named in the operator's framing.\n\n- [ ] A new derivation function (e.g. `web/src/analytics/burnRate.ts` or\n      added to `burn.ts`) computes a **bounded rolling-window rate** (%\n      pool-capacity-per-hour) from `PoolBurnCurve`/`PoolBurnPoint` data\n      (`web/src/analytics/burn.ts`), reusing the existing segment\n      boundaries (`buildPoolBurnCurves`' rollover/gap segmentation) so a\n      limit-window reset never reads as a throughput cliff or a fabricated\n      negative rate.\n- [ ] The rolling window is a named, bounded constant/option (no unbounded\n      in-memory accumulation) \u2014 consistent with the existing\n      `DEFAULT_WINDOW_DAYS` / `CHART_PAGE_SIZE` bounding pattern in\n      `web/src/historicalChartsPanel.ts`.\n- [ ] A new chart-view module renders the rate series as a **first-class\n      interactive chart** using `web/src/charts/chartChrome.ts` (dated\n      x-axis, y-axis, hover tooltip, `renderTableView` accessible\n      fallback) \u2014 matching `web/src/charts/successRateChartView.ts`'s\n      pattern, not a bare decorative sparkline like the existing\n      `renderPoolSparkline`.\n- [ ] The panel/axis/labels call the metric a **burn rate** (`%/h`, reusing\n      `analytics/format.ts`'s existing `formatRatePerHour`) \u2014 never\n      \"tokens/min\" or any absolute token count.\n- [ ] Renders on **both** the authenticated (`/api/history`) and public\n      (`/public/history`) surfaces, matching the existing pool-level\n      public-exposure precedent in `docs/token-analytics.md` (\u00a72): pool\n      aggregate fields (`mean_usage_fraction`/`max_usage_fraction`/\n      `exhausted_count`) are already public-safe. The new chart must **not**\n      introduce any per-account or per-repo identity onto the public\n      surface \u2014 no changes to `src/redaction.ts` should be needed; if the\n      implementation finds it needs one, that is a sign the metric chosen\n      is per-account, not pool-level, and the design should be revisited.\n- [ ] No changes to `dashboard/src/index.ts` (ingest), `src/query.ts`, D1\n      migrations, or `src/redaction.ts` \u2014 every input this chart needs is\n      already ingested and queryable today.\n- [ ] New unit tests for both the rate-derivation function and the\n      chart-view render, following the existing pairing convention\n      (`web/test/successRate.test.ts` + `successRateChartView.test.ts`),\n      including a test asserting a limit-window rollover does not produce a\n      spurious large-negative rate point.\n- [ ] `npm --prefix dashboard test` and `npm --prefix dashboard/web test`\n      (or the repo's `npm run check:all` in `dashboard/`) pass. **Do not run\n      `cargo` anywhere for this issue \u2014 it is a TypeScript/Workers-only\n      change.**\n\n### Explicitly out of scope (documented follow-ups, not filed as issues)\n\n1. **Upgrade the existing decorative pool-load sparkline**\n   (`renderPoolBurn`/`renderPoolSparkline` in\n   `web/src/analytics/render.ts`) to the same `chartChrome.ts` chrome as\n   the new rate chart \u2014 arguably the more literal reading of \"% saturation\n   UI panel\", but deliberately deferred so this PR stays to one new chart.\n2. **Dispatch/concurrency capacity saturation** (`queue.snapshot`'s\n   `counts.running / max_concurrent`, per-host and fleet-wide, over time) \u2014\n   a second, legitimate \"% capacity saturation\" signal, already fully\n   queryable historically with zero backend changes. Deferred to avoid\n   `web/src/views/workQueue.ts` file overlap with #9032 until that issue's\n   scope settles.\n3. **Fleet-wide multi-sweep \"lifecycle waterfall\" / Gantt view** \u2014 the\n   original issue's \"lifecycle waterfall\" phrase. Materially larger than a\n   single chart; `sweepTimelineView.ts` only covers one sweep at a time\n   today.\n4. **Live SSE-driven auto-refresh** of the new chart (the existing\n   `HistoricalChartsPanel` pattern re-fetches `/api/history` on filter\n   change, not via the live event tail in `sseFeedClient.ts`) \u2014 nice-to-have,\n   not required for acceptance.\n\n### Affected files (expected)\n\n- `dashboard/web/src/analytics/burn.ts` or a new `analytics/burnRate.ts` \u2014\n  rate derivation\n- `dashboard/web/src/analytics/render.ts` \u2014 mount the new chart alongside\n  the existing pool blocks\n- A new `dashboard/web/src/charts/*ChartView.ts` (or an `analytics/`-local\n  equivalent) reusing `charts/chartChrome.ts`\n- `dashboard/web/test/*` \u2014 new test files per the pairing convention above\n- `dashboard/docs/token-analytics.md` \u2014 document the new rate metric next\n  to the existing burn-curve/forecast documentation (small doc update, same\n  file the existing burn-curve public-exposure decision already lives in)\n\n### Test Plan\n\n- [ ] Automated: unit tests for rate derivation (including the\n      segment-boundary/rollover case) and for the chart-view render\n      (following `successRateChartView.test.ts`'s structure).\n- [ ] Manual: `npm --prefix dashboard run dev`, seed a host with a few\n      `tokens.snapshot` samples spanning a rollover (see the `README.md`\n      \"Local development\" `curl` recipe), confirm the new chart renders on\n      both `/` (authenticated) and the public variant without per-account\n      data leaking into the public response.\n- [ ] Edge cases: fewer than 2 samples in range (no chart / explicit\n      no-data state, not a crash); a rollover mid-window; a multi-host pool.\n",
+     "curator_affected_files": [],
+     "affected_files_known": false,
+     "provenance": {
+      "method": "timeline-verified: zero issue edits after creation; no Curator affected-files baseline exists (unknown, not empty)",
+      "edited_after_cutoff": false,
+      "reconstructed": true
+     },
+     "created_at": "2026-09-26T07:17:23Z"
+    }
+   ],
+   "association": "independent",
+   "prs": [
+    {
+     "pr": 9212,
+     "issue": 8987,
+     "base_sha": "0085de7a501a5c968eb935b8776bdecbba9c4dae",
+     "head_sha": "07af0cb5eaed00b98ab736606cc62d4baf83a0d3",
+     "own_commits": [
+      "a538b4b69154728cbb8140b14a6196f1d90e9623",
+      "07af0cb5eaed00b98ab736606cc62d4baf83a0d3"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    },
+    {
+     "pr": 9211,
+     "issue": 9029,
+     "base_sha": "0085de7a501a5c968eb935b8776bdecbba9c4dae",
+     "head_sha": "27fa3030624fc887da7867179c54e739d21183c4",
+     "own_commits": [
+      "27fa3030624fc887da7867179c54e739d21183c4"
+     ],
+     "provenance": "closing link in PR body; commits from forge API",
+     "observed_conflict": false
+    }
+   ],
+   "selection": "same-repo issues created within 21 days, implemented by distinct merged PRs sharing one base commit; timeline-verified unedited snapshots"
+  }
+ ]
+}
