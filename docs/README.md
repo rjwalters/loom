@@ -18,7 +18,7 @@ as `.loom/docs/`).
 | [`migration/`](migration/) | Completed-migration history: the [v0.10.0 shepherd deprecation](migration/v0.10.0-shepherd-deprecation.md), the [v0.10.0 daemon rebuild](migration/v0.10.0-daemon-rebuild.md), and [daemon-state consumers](migration/daemon-state-consumers.md). |
 | [`notes/`](notes/) | Ad-hoc technical notes. |
 | [`philosophy/`](philosophy/) | Essays on agent archetypes, AI code smell, Loom intelligence, and working with AI. |
-| [`research/`](research/) | Evaluations and measurement runbooks — builder/judge fan-out, codecast, dynamic workflows. |
+| [`research/`](research/) | Evaluations and measurement runbooks — builder/judge fan-out, codecast, dynamic workflows, [Gitea Cloud qualification](research/gitea-cloud-qualification-runbook.md) (#9788/#9769). |
 
 ## Top-level documents
 
