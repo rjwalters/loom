@@ -1,6 +1,6 @@
 # Latency vs. Reliability: What Loom Optimizes For
 
-*Loom's gates are priced in human-attention units. When attention is free, they are a bargain. When attention is abundant, they are a tax.*
+*Loom's gates are priced in human-attention units. When attention is scarce, they are a bargain. When attention is abundant, they are a tax.*
 
 ---
 
