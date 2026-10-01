@@ -2271,6 +2271,37 @@ pub struct ForgeCallsStatus {
     /// or the rate-limit breaker's probe when that is newer.
     #[serde(default)]
     pub budget: Vec<ForgeBudgetReading>,
+    /// Host-wide counts over the window keyed by the #9777 **call identity**
+    /// (operation × provider × origin × repo) rather than by caller. `None`
+    /// for a pre-#9777 wire payload from an older daemon binary that never
+    /// computed one; empty when the sink carries no identity-bearing lines yet.
+    #[serde(default)]
+    pub operations: Option<Vec<ForgeOperationCounts>>,
+}
+
+/// One call-identity row of [`ForgeCallsStatus`] (Issue #9777).
+///
+/// `origin` is a separate field from `repo` on purpose: two forges can carry
+/// the same `owner/repo` slug, and an accounting row that merged them would
+/// attribute one provider's spend to the other on a mixed fleet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeOperationCounts {
+    /// Inventoried operation ID (`issue.create`), or `unknown` for a call site
+    /// not yet mapped to one — visible by design, never dropped.
+    pub operation: String,
+    /// Provider family (`github`, `gitea`), when known.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Origin host (`github.com`, `gitea.example.com`), when known.
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// `owner/repo` slug, when known.
+    #[serde(default)]
+    pub repo: Option<String>,
+    pub ok: u64,
+    pub not_modified: u64,
+    pub rate_limited: u64,
+    pub error: u64,
 }
 
 /// One caller × pool row of [`ForgeCallsStatus`].

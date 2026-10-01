@@ -13,6 +13,32 @@ fn line(t: i64, caller: &str, p: Pool, o: Outcome, rem: Option<u64>) -> String {
         o,
         rem,
         rst: rem.map(|_| t + 600),
+        op: None,
+        pv: None,
+        og: None,
+        rp: None,
+    })
+    .unwrap()
+}
+
+/// [`line`] carrying a #9777 call identity.
+fn id_line(t: i64, caller: &str, o: Outcome, identity: &CallIdentity) -> String {
+    serde_json::to_string(&SinkLine {
+        t,
+        c: caller.to_string(),
+        p: Pool::Core,
+        o,
+        rem: None,
+        rst: None,
+        op: Some(
+            identity
+                .operation
+                .clone()
+                .unwrap_or_else(|| UNKNOWN_OPERATION.to_string()),
+        ),
+        pv: identity.provider.clone(),
+        og: identity.origin.clone(),
+        rp: identity.repo.clone(),
     })
     .unwrap()
 }
@@ -181,4 +207,117 @@ fn a_newer_breaker_probe_overrides_an_older_header_reading() {
     assert_eq!((gql.remaining, gql.source.as_str()), (8, "breaker_probe"));
     let core = report.budget.iter().find(|b| b.pool == "core").unwrap();
     assert_eq!((core.remaining, core.observed_at), (7, probed_at));
+}
+
+// ===== #9777 call identity =====
+//
+// These two tests are the `test_path` evidence the forge operation inventory's
+// `telemetry.call-accounting` and `quota.rate-limit-reading` rows point at
+// (`defaults/forge/operations/fleet-delivery.toml`). The validator checks that
+// this file actually contains a test named after each row's `test_id`, so
+// renaming one of these functions without updating the manifest fails
+// `forge-inventory validate` rather than silently voiding the claim.
+
+/// Covers inventory row `telemetry.call-accounting` — identity-keyed
+/// accounting, including the `cross-origin-identity` high-risk case: two forges
+/// with the same `owner/repo` slug must not aggregate into one row.
+#[test]
+fn telemetry_call_accounting() {
+    let now = 1_800_000_000;
+    let gh = CallIdentity::operation("issue.list")
+        .with_provider("github")
+        .with_origin("github.com")
+        .with_repo("acme/app");
+    let gitea = CallIdentity::operation("issue.list")
+        .with_provider("gitea")
+        .with_origin("gitea.example.com")
+        .with_repo("acme/app");
+    let lines = [
+        id_line(now - 10, "work_finder", Outcome::Ok, &gh),
+        id_line(now - 9, "work_finder", Outcome::NotModified, &gh),
+        id_line(now - 8, "work_finder", Outcome::Ok, &gitea),
+        // An un-migrated caller: visible as `unknown`, never dropped.
+        id_line(now - 7, "legacy", Outcome::Error, &CallIdentity::default()),
+    ];
+    let rows = aggregate_lines(lines.iter().map(String::as_str), now - WINDOW_SECS).identity_rows();
+
+    // Same operation, same slug, two origins => two rows, not one.
+    let gh_row = rows
+        .iter()
+        .find(|r| r.origin.as_deref() == Some("github.com"))
+        .expect("github row");
+    let gitea_row = rows
+        .iter()
+        .find(|r| r.origin.as_deref() == Some("gitea.example.com"))
+        .expect("gitea row");
+    assert_eq!((gh_row.ok, gh_row.not_modified), (1, 1));
+    assert_eq!((gitea_row.ok, gitea_row.not_modified), (1, 0));
+    assert_eq!(gh_row.operation, gitea_row.operation);
+    assert_eq!(gh_row.repo, gitea_row.repo);
+    assert_ne!(gh_row.provider, gitea_row.provider);
+
+    // The unmapped call is accounted for under `unknown`, not discarded.
+    let unknown = rows
+        .iter()
+        .find(|r| r.operation == UNKNOWN_OPERATION)
+        .expect("an unmapped caller stays visible");
+    assert_eq!((unknown.error, unknown.provider.clone()), (1, None));
+
+    // A qualified key keeps two same-numbered artifacts on two forges apart.
+    assert_ne!(gh.qualified_key(Some(12)), gitea.qualified_key(Some(12)));
+    assert_eq!(gh.qualified_key(Some(12)), "github:github.com/acme/app#12");
+}
+
+/// Covers inventory row `quota.rate-limit-reading` — the free per-pool budget
+/// headers reach the status report, and the identity layer never records a
+/// credential-shaped value even when a caller hands it one.
+#[test]
+fn quota_rate_limit_reading() {
+    // The budget reading rides along on an ordinary response, including a 304.
+    let r = parse_http_response(
+        "HTTP/2.0 304 Not Modified\r\nx-ratelimit-resource: core\r\n\
+         x-ratelimit-remaining: 57\r\nx-ratelimit-reset: 1785356436\r\n\r\n",
+    )
+    .unwrap();
+    assert_eq!(r.ratelimit.remaining, Some(57));
+    assert_eq!(r.ratelimit.reset_epoch, Some(1_785_356_436));
+    assert_eq!(classify(Some(&r), false, "").1, Outcome::NotModified);
+
+    // Bounded: an over-long or multi-line value is truncated to one line.
+    let long = sanitize(&format!("gitea.example.com{}", "x".repeat(500))).unwrap();
+    assert!(long.len() <= 96, "identity fields are length-capped");
+    assert_eq!(sanitize("a\nb\tc").as_deref(), Some("a b c"));
+    assert_eq!(sanitize("   ").as_deref(), None);
+
+    // Never a credential: a header or token shape records NOTHING rather than
+    // a secret, and the drop is observable through the public constructor.
+    //
+    // The full-length PAT shape is ASSEMBLED rather than written as a literal.
+    // `loom-daemon secret-scan` (the PreToolUse guard, .githooks/, and CI's
+    // Secret Scan gate all run it) correctly flags a literal one even inside a
+    // test, and the right answer to that is to not commit the literal — not to
+    // add a fingerprint to the allow list, which would spend a real policy
+    // exemption on a string this test can just as well build at runtime.
+    let pat = format!("ghp{}{}", "_", "0123456789abcdefghijklmnopqrstuvwxyz");
+    for secret in [
+        "Authorization: Bearer abc",
+        pat.as_str(),
+        "github_pat_11ABCDE",
+        "https://user:hunter2@gitea.example.com",
+        "access_token=abc123",
+    ] {
+        assert_eq!(sanitize(secret), None, "must not record {secret:?}");
+        assert!(
+            CallIdentity::default().with_origin(secret).is_empty(),
+            "a credential-shaped origin leaves the identity empty"
+        );
+    }
+    // A legitimate host is kept.
+    assert_eq!(
+        CallIdentity::default()
+            .with_origin("gitea.example.com")
+            .origin
+            .as_deref(),
+        Some("gitea.example.com")
+    );
 }
