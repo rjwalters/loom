@@ -35,6 +35,7 @@ pub(crate) mod fleet_experiment;
 pub(crate) mod fleet_send;
 pub(crate) mod forge_action;
 mod forge_identity_cmd;
+pub(crate) mod forge_inventory_cmd;
 mod git_blob_lines;
 mod guard_mcp_tools;
 pub(crate) mod health;
