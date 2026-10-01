@@ -140,19 +140,17 @@ set -euo pipefail
 
 LEASE_MARKER_PREFIX="<!-- loom:lease host="
 YIELD_MARKER_PREFIX="<!-- loom:lease-yield host="
-# Lease-freshness TTL, resolved down the same chain the daemon documents for
-# `lifecycle.leaseTtlMinutes` (defaults/docs/hyperparameters.md), as far as
-# shell can see it: env > committed `hyperparameters` block > 15. The
-# `$LOOM_HYPERPARAMS` vector tier is daemon-only (a shell script cannot see
-# it) — if you tune the TTL by vector for a run, export
-# `LOOM_LEASE_TTL_MINUTES` alongside it so this guard agrees with the daemon.
+# Lease-freshness TTL, resolved via the daemon's own hyperparams layer
+# (`hyperparameters.lifecycle.leaseTtlMinutes`, defaults/docs/hyperparameters.md)
+# instead of re-implementing that precedence chain in jq -- this script is now
+# a call-site only, not a resolver. The `$LOOM_HYPERPARAMS` vector tier is
+# covered too, since the daemon subcommand resolves it; export
+# `LOOM_LEASE_TTL_MINUTES` to override both from the shell side.
 DEFAULT_TTL_MINUTES="${LOOM_LEASE_TTL_MINUTES:-}"
 if [[ -z "$DEFAULT_TTL_MINUTES" ]]; then
   lease_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-  if [[ -n "$lease_repo_root" ]]; then
-    DEFAULT_TTL_MINUTES="$(jq -r '.hyperparameters.lifecycle.leaseTtlMinutes
-      // empty' "$lease_repo_root/.loom/config.json" 2>/dev/null || true)"
-  fi
+  DEFAULT_TTL_MINUTES="$("${LOOM_DAEMON_BIN:-loom-daemon}" hyperparams --json "${lease_repo_root:-.}" 2>/dev/null \
+    | jq -r '.params.lifecycle.lease_ttl_minutes // empty' 2>/dev/null || true)"
 fi
 DEFAULT_TTL_MINUTES="${DEFAULT_TTL_MINUTES:-15}"
 
