@@ -292,7 +292,7 @@ loom_trust_stub "$STUB_DIR"
 # writes. It runs from a checkout registered as acme/widget (origin, .loom/, push
 # reported to the permission probe), so the real decision admits it.
 write_scope_register "$STUB_DIR/checkout" acme/widget
-cd "$STUB_DIR/checkout"
+cd "$STUB_DIR/checkout" || exit 1
 export LOOM_GITHUB_APP_SCRIPT="$STUB_DIR/github-app-token.sh"
 
 reset_state() {

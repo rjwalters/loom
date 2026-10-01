@@ -251,7 +251,7 @@ loom_trust_stub "$STUB_DIR"
 # writes. It runs from a checkout registered as acme/widget (origin, .loom/, push
 # reported to the permission probe), so the real decision admits it.
 write_scope_register "$STUB_DIR/checkout" acme/widget
-cd "$STUB_DIR/checkout"
+cd "$STUB_DIR/checkout" || exit 1
 # Deterministic identity + clock for every case below.
 export LOOM_HOST_ID="studio-host"
 # Issue #6322/#6333: by default (no LOOM_LEASE_PUBLISH_HOSTNAME opt-in), the
