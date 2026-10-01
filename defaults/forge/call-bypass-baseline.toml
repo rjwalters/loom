@@ -9,7 +9,7 @@
 # Eliminating these entries is the caller-migration issue's job, not this
 # ledger's — see `removal_epic` below and each entry's `removal_issue`.
 #
-# 73 file(s), 206 direct call site(s) at baseline.
+# 73 file(s), 213 direct call site(s) at baseline.
 
 removal_epic = 9769
 
@@ -279,7 +279,7 @@ removal_issue = 9799
 
 [[bypass]]
 path = "loom-daemon/src/forge_comment.rs"
-calls = 5
+calls = 12
 owner = "daemon-forge"
 removal_issue = 9799
 
