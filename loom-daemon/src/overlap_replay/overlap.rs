@@ -62,14 +62,56 @@ pub fn span_overlap_len(a: &Span, b: &Span) -> u32 {
     }
 }
 
-/// Total overlap of span sets, pairwise over *deduplicated* inputs so a
-/// duplicated snippet never inflates the shared length.
+/// Merge one side's spans into disjoint evidence intervals: intervals are
+/// merged; anchors become unit intervals (#9785 repair §A7).
+fn evidence_intervals(spans: &[Span]) -> Vec<(u32, u32)> {
+    let mut ivs: Vec<(u32, u32)> = spans
+        .iter()
+        .filter(|s| !s.anchor && s.end >= s.start)
+        .map(|s| (s.start, s.end))
+        .chain(
+            spans
+                .iter()
+                .filter(|s| s.anchor)
+                .map(|s| (s.start, s.start)),
+        )
+        .collect();
+    ivs.sort();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (s, e) in ivs {
+        match merged.last_mut() {
+            Some(last) if s <= last.1.saturating_add(1) => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
+}
+
+/// Total overlap length of two span sets under anchor semantics, computed
+/// as the line intersection of the two sides' **merged evidence**:
+/// overlapping spans within one side never double-count, anchors count once
+/// each, and the result can never exceed either side's union length (the
+/// recall ≤ 1 invariant).
 pub fn spans_overlap_len(a: &[Span], b: &[Span]) -> u32 {
-    let da = dedup_spans(a);
-    let db = dedup_spans(b);
-    da.iter()
-        .map(|x| db.iter().map(|y| span_overlap_len(x, y)).sum::<u32>())
-        .sum()
+    let ia = evidence_intervals(a);
+    let ib = evidence_intervals(b);
+    let mut total = 0u32;
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < ia.len() && j < ib.len() {
+        let (s1, e1) = ia[i];
+        let (s2, e2) = ib[j];
+        let lo = s1.max(s2);
+        let hi = e1.min(e2);
+        if hi >= lo {
+            total += hi - lo + 1;
+        }
+        if e1 < e2 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    total
 }
 
 /// Union length of span sets, merging numerically-intersecting intervals
@@ -96,13 +138,6 @@ pub fn spans_union_len(spans: &[Span]) -> u32 {
     }
     total += anchors.len() as u32;
     total
-}
-
-fn dedup_spans(spans: &[Span]) -> Vec<Span> {
-    let mut v: Vec<Span> = spans.to_vec();
-    v.sort_by_key(|s| (s.start, s.end, s.anchor));
-    v.dedup();
-    v
 }
 
 /// Suffix symbol match: `crate::foo::bar` matches `bar`; a *heuristic*
@@ -240,7 +275,9 @@ pub fn predicted_overlap(
             continue;
         };
         shared_len += spans_overlap_len(xa, xb);
-        union_len += spans_union_len(xa).max(spans_union_len(xb));
+        // True union of both sides' predicted evidence (was max(a, b)).
+        let both: Vec<Span> = xa.iter().chain(xb.iter()).copied().collect();
+        union_len += spans_union_len(&both);
     }
     let has_evidence = shared_len > 0 || union_len > 0;
     let line_overlap_fraction = has_evidence.then(|| {
@@ -387,7 +424,12 @@ pub fn actual_overlap(
                 continue;
             };
             sh += spans_overlap_len(xa, xb);
-            un += spans_union_len(xa).max(spans_union_len(xb));
+            // True set union of both sides' evidence — the previous
+            // max(a, b) undercounted the denominator whenever each side
+            // changed different regions of the shared file (#9785 repair
+            // §A7).
+            let both: Vec<Span> = xa.iter().chain(xb.iter()).copied().collect();
+            un += spans_union_len(&both);
         }
         let frac = Some(if un == 0 { 0.0 } else { sh as f64 / un as f64 });
         (Some(sh), Some(un), frac, Some("common_source".into()))
@@ -466,6 +508,59 @@ mod tests {
         let b = vec![Span::interval(3, 9)];
         assert_eq!(spans_overlap_len(&a, &b), 3);
         assert_eq!(spans_union_len(&a), 5);
+    }
+
+    /// #9785 repair §A7: overlapping spans within ONE side must never
+    /// double-count the intersection (the old pairwise sum reported 12 for
+    /// the union's 10 lines).
+    #[test]
+    fn within_side_overlap_does_not_double_count() {
+        let a = vec![Span::interval(1, 10), Span::interval(5, 6)];
+        let b = vec![Span::interval(1, 10)];
+        assert_eq!(spans_overlap_len(&a, &b), 10);
+        // And the recall ≤ 1 invariant: shared length ≤ each side's union.
+        assert!(spans_overlap_len(&a, &b) <= spans_union_len(&a));
+        assert!(spans_overlap_len(&a, &b) <= spans_union_len(&b));
+    }
+
+    /// Duplicate anchors count once each, never multiply.
+    #[test]
+    fn duplicated_anchors_count_once() {
+        let a = vec![Span::anchor(5), Span::anchor(5)];
+        let b = vec![Span::anchor(5)];
+        assert_eq!(spans_overlap_len(&a, &b), 1);
+        assert_eq!(spans_overlap_len(&a, &b), spans_union_len(&a));
+    }
+
+    /// Two anchors colliding at the same line via each other's intervals is
+    /// one line of overlap, not two.
+    #[test]
+    fn same_line_anchor_collision_is_one_line() {
+        let a = vec![Span::anchor(6), Span::interval(1, 3)];
+        let b = vec![Span::anchor(6), Span::interval(9, 12)];
+        assert_eq!(spans_overlap_len(&a, &b), 1);
+    }
+
+    /// Recall ≤ 1 across a mix of anchors and intervals.
+    #[test]
+    fn recall_invariant_holds() {
+        let a = vec![
+            Span::interval(1, 4),
+            Span::anchor(7),
+            Span::interval(20, 24),
+        ];
+        let b = vec![
+            Span::interval(3, 8),
+            Span::anchor(7),
+            Span::interval(22, 30),
+        ];
+        let shared = spans_overlap_len(&a, &b);
+        let ua = spans_union_len(&a);
+        let ub = spans_union_len(&b);
+        assert!(shared <= ua && shared <= ub, "shared {shared} union {ua}/{ub}");
+        // Shared = 2..4 (2 lines) + 7 (1: a's anchor absorbed into b's
+        // 3..8 evidence — same line, counted once) + 22..24 (3) = 6.
+        assert_eq!(shared, 6);
     }
 
     #[test]

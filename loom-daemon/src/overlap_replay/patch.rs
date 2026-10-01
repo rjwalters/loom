@@ -461,6 +461,297 @@ fn detect_base_update_contamination(repo: &Path, base_sha: &str, head_sha: &str)
         .any(|c| git(repo, &["merge-base", "--is-ancestor", c, upstream.trim()]).is_ok())
 }
 
+/// A PR's own-commit chain validation result (#9785 repair: the strict
+/// precondition for any patch-preserving counterfactual). A chain that is
+/// not contiguous, not single-parent, or not ending at the pinned head
+/// cannot yield a well-defined own patch — `Unknown` with a reason, never a
+/// silently-approximated patch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OwnChain {
+    pub pr: u32,
+    pub status: ChainStatus,
+    /// First own commit's parent — the patch base (Qualified only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_base: Option<String>,
+    pub head: String,
+    /// Per-commit author/committer dates (Qualified only; eligibility
+    /// evidence for historical inputs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_dates: Vec<CommitDate>,
+    /// The PR's net changed paths, base→head (Qualified only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub net_changed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainStatus {
+    Qualified,
+    Unqualified,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitDate {
+    pub commit: String,
+    pub author: String,
+    pub committer: String,
+}
+
+/// Validate the PR's own commits as a contiguous single-parent chain ending
+/// at the pinned head, and derive the net changed paths base→head.
+pub fn own_chain(
+    repo: &Path,
+    pr: u32,
+    head_sha: &str,
+    own_commits: &[String],
+) -> anyhow::Result<OwnChain> {
+    let unqualified = |reason: &str| {
+        Ok(OwnChain {
+            pr,
+            status: ChainStatus::Unqualified,
+            patch_base: None,
+            head: head_sha.into(),
+            commit_dates: Vec::new(),
+            net_changed_paths: Vec::new(),
+            reason: Some(reason.into()),
+        })
+    };
+    if own_commits.is_empty() || own_commits.last().map(String::as_str) != Some(head_sha) {
+        return unqualified("head_not_end_of_own_chain");
+    }
+    let mut patch_base: Option<String> = None;
+    let mut dates: Vec<CommitDate> = Vec::new();
+    for (i, c) in own_commits.iter().enumerate() {
+        let out = git(repo, &["show", "-s", "--format=%P%n%aI%n%cI", c])?;
+        let lines: Vec<&str> = out.lines().collect();
+        if lines.len() != 3 {
+            return unqualified("commit_metadata_unavailable");
+        }
+        let parents: Vec<&str> = lines[0].split_whitespace().collect();
+        if parents.len() != 1 {
+            return unqualified("nonlinear_own_commit");
+        }
+        if i > 0 && parents[0] != own_commits[i - 1] {
+            return unqualified("own_commits_not_contiguous");
+        }
+        if i == 0 {
+            patch_base = Some(parents[0].to_string());
+        }
+        dates.push(CommitDate {
+            commit: c.clone(),
+            author: lines[1].to_string(),
+            committer: lines[2].to_string(),
+        });
+    }
+    let patch_base = patch_base.expect("first commit sets patch_base");
+    let paths = git(
+        repo,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            &patch_base,
+            head_sha,
+        ],
+    )?
+    .split('\0')
+    .filter(|p| !p.is_empty())
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return unqualified("empty_net_patch");
+    }
+    Ok(OwnChain {
+        pr,
+        status: ChainStatus::Qualified,
+        patch_base: Some(patch_base),
+        head: head_sha.into(),
+        commit_dates: dates,
+        net_changed_paths: paths,
+        reason: None,
+    })
+}
+
+/// A patch-preserving transplant outcome (#9785 repair §A5): rebuild one
+/// side's net patch on a declared common base with exact preimage/postimage
+/// verification. `Reconstructed` carries the synthetic commit for a
+/// pair-caused conflict replay; every failure mode is explicit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Transplant {
+    pub pr: u32,
+    pub status: TransplantStatus,
+    /// Synthetic commit with parent = common base (Reconstructed only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_sha256: Option<String>,
+    /// Paths whose preimage/postimage check failed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransplantStatus {
+    Reconstructed,
+    PreimageDiffers,
+    PatchApplicationFailed,
+    PostimageMismatch,
+}
+
+/// `mode oid type size`-style ls-tree entry for one path at one revision;
+/// `None` when the path does not exist there.
+fn tree_entry(repo: &Path, rev: &str, path: &str) -> Option<String> {
+    let out = git(repo, &["ls-tree", rev, "--", path]).ok()?;
+    out.lines()
+        .next()
+        .map(|l| l.split('\t').next().unwrap_or(l).to_string())
+}
+
+/// Rebuild one side's net patch onto `common_base` exactly. The patch is
+/// applied in a private Git index (no working tree, no production
+/// checkout), postimages are verified against the PR's own head, and the
+/// synthetic commit's parent is the common base.
+pub fn transplant(
+    repo: &Path,
+    chain: &OwnChain,
+    common_base: &str,
+    name: &str,
+) -> anyhow::Result<Transplant> {
+    let fail = |status: TransplantStatus, reason: &str, paths: Vec<String>| Transplant {
+        pr: chain.pr,
+        status,
+        commit: None,
+        tree: None,
+        patch_sha256: None,
+        paths,
+        reason: Some(reason.into()),
+    };
+    let Some(patch_base) = chain.patch_base.as_deref() else {
+        return Ok(fail(TransplantStatus::PreimageDiffers, "chain_unqualified", Vec::new()));
+    };
+    let mismatches: Vec<String> = chain
+        .net_changed_paths
+        .iter()
+        .filter(|p| tree_entry(repo, common_base, p) != tree_entry(repo, patch_base, p))
+        .cloned()
+        .collect();
+    if !mismatches.is_empty() {
+        return Ok(fail(
+            TransplantStatus::PreimageDiffers,
+            "changed paths' preimages differ between the PR's patch base and the common base",
+            mismatches,
+        ));
+    }
+    let patch = git(
+        repo,
+        &[
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            patch_base,
+            &chain.head,
+        ],
+    )?;
+    let tmp = tempfile::tempdir()?;
+    let index_file = tmp.path().join("index");
+    let env = |cmd: &mut Command| {
+        cmd.env("GIT_INDEX_FILE", &index_file);
+    };
+    let mut read = Command::new("git");
+    read.arg("-C").arg(repo).args(["read-tree", common_base]);
+    env(&mut read);
+    if !read.output()?.status.success() {
+        return Ok(fail(TransplantStatus::PatchApplicationFailed, "read-tree failed", Vec::new()));
+    }
+    let patch_file = tmp.path().join("patch.diff");
+    std::fs::write(&patch_file, &patch)?;
+    let mut apply = Command::new("git");
+    apply
+        .arg("-C")
+        .arg(repo)
+        .args(["apply", "--cached", "--whitespace=nowarn"])
+        .arg(&patch_file);
+    env(&mut apply);
+    let out = apply.output()?;
+    if !out.status.success() {
+        return Ok(fail(
+            TransplantStatus::PatchApplicationFailed,
+            &format!("apply failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+            Vec::new(),
+        ));
+    }
+    let mut write = Command::new("git");
+    write.arg("-C").arg(repo).arg("write-tree");
+    env(&mut write);
+    let tree = String::from_utf8_lossy(&write.output()?.stdout)
+        .trim()
+        .to_string();
+    if tree.is_empty() {
+        return Ok(fail(
+            TransplantStatus::PatchApplicationFailed,
+            "write-tree produced nothing",
+            Vec::new(),
+        ));
+    }
+    let bad_post: Vec<String> = chain
+        .net_changed_paths
+        .iter()
+        .filter(|p| tree_entry(repo, &tree, p) != tree_entry(repo, &chain.head, p))
+        .cloned()
+        .collect();
+    if !bad_post.is_empty() {
+        return Ok(fail(
+            TransplantStatus::PostimageMismatch,
+            "reconstructed tree's postimages differ from the PR's own head",
+            bad_post,
+        ));
+    }
+    let synthetic = git(
+        repo,
+        &[
+            "-c",
+            "user.name=Loom research reconstruction",
+            "-c",
+            "user.email=fixture@invalid.example",
+            "-c",
+            "commit.gpgSign=false",
+            "commit-tree",
+            &tree,
+            "-p",
+            common_base,
+            "-m",
+            name,
+        ],
+    )?
+    .trim()
+    .to_string();
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(patch.as_bytes());
+    Ok(Transplant {
+        pr: chain.pr,
+        status: TransplantStatus::Reconstructed,
+        commit: Some(synthetic),
+        tree: Some(tree),
+        patch_sha256: Some(hex::encode(h.finalize())),
+        paths: Vec::new(),
+        reason: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -305,8 +305,8 @@ fn overlap_replay_end_to_end() {
             ],
             "independent",
             vec![
-                pr_json(11, 1, &fx.base, &fx.feat_a, None),
-                pr_json(12, 2, &fx.base, &fx.feat_b, None),
+                pr_json(11, 1, &fx.base, &fx.feat_a, Some(branch_commits(&fx, "feat-a"))),
+                pr_json(12, 2, &fx.base, &fx.feat_b, Some(branch_commits(&fx, "feat-b"))),
             ],
         ),
         pair_json(
@@ -318,8 +318,8 @@ fn overlap_replay_end_to_end() {
             ],
             "independent",
             vec![
-                pr_json(13, 3, &fx.base, &fx.feat_c, None),
-                pr_json(14, 4, &fx.base, &fx.feat_d, None),
+                pr_json(13, 3, &fx.base, &fx.feat_c, Some(branch_commits(&fx, "feat-c"))),
+                pr_json(14, 4, &fx.base, &fx.feat_d, Some(branch_commits(&fx, "feat-d"))),
             ],
         ),
         pair_json(
@@ -485,16 +485,22 @@ fn overlap_replay_end_to_end() {
         1,
         "p1 record: {p1}"
     );
-    assert_eq!(p1["actual"]["coordinate_basis"], "common_source");
-    let line_frac = p1["actual"]["line_overlap_fraction"].as_f64().unwrap();
-    assert!(line_frac > 0.0, "both branches edit line 5: overlap must be > 0");
+    // own_commits present → per-commit-parent derivation: file overlap is
+    // exact, line coordinates are honestly unknown (the #9785 repair guard).
+    assert!(p1["actual"]["coordinate_basis"].is_null());
+    assert!(p1["actual"]["line_overlap_fraction"].is_null());
     assert_eq!(p1["conflict"]["any_conflict"], serde_json::json!(true));
     assert_eq!(p1["conflict"]["conflicted_files"], serde_json::json!(["src/shared.rs"]));
-    assert_eq!(p1["conflict"]["provenance"], "counterfactual");
+    // The pair-caused label now comes from the patch-preserving transplanted
+    // instrument (own_commits present); raw-head stays for comparability.
+    assert_eq!(p1["conflict"]["provenance"], "counterfactual-transplanted");
+    assert_eq!(p1["conflict"]["instrument_available"], serde_json::json!(true));
+    assert_eq!(p1["conflict"]["raw_head_any_conflict"], serde_json::json!(true));
     // Leakage-controlled, with both predictions scored.
     assert_eq!(p1["leakage_controlled"], serde_json::json!(true));
 
-    // p2: disjoint — no shared file, clean merge, still common-source.
+    // p2: disjoint — no shared file; the pair-caused instrument ran
+    // (both chains qualify) and found no conflict.
     let p2 = &by_id["p2-disjoint"];
     assert_eq!(
         p2["actual"]["shared_changed_files"]
@@ -504,10 +510,16 @@ fn overlap_replay_end_to_end() {
         0
     );
     assert_eq!(p2["conflict"]["any_conflict"], serde_json::json!(false));
-    assert_eq!(p2["actual"]["coordinate_basis"], "common_source");
+    assert_eq!(p2["conflict"]["provenance"], "counterfactual-transplanted");
+    // own_commits → per-commit-parent: line coordinates honestly unknown.
+    assert!(p2["actual"]["coordinate_basis"].is_null());
 
-    // p4: ambiguous association recorded as such, evaluated separately.
+    // p4: ambiguous association, own_commits None → chains unqualified →
+    // the pair-caused instrument is unavailable (unknown, not clean).
     assert_eq!(p4_assoc(&by_id), "ambiguous");
+    let p4 = &by_id["p4-ambiguous"];
+    assert!(p4["conflict"]["any_conflict"].is_null(), "unknown without reconstruction");
+    assert_eq!(p4["conflict"]["provenance"], "counterfactual-raw-head-comparability-only");
 
     // B1 regression: p3 has NO usable predictions (issue 5's snapshot is
     // excluded, issue 6 has no artifact) — its predicted-overlap record is
@@ -531,11 +543,10 @@ fn overlap_replay_end_to_end() {
     let i1 = &by_issue[&1];
     assert_eq!(i1["prediction_status"], "present");
     assert_eq!(i1["file_recall"], serde_json::json!(0.5)); // 1 of 2 changed files predicted
-    assert!(
-        i1["interval_recall"].as_f64().unwrap_or(-1.0) > 0.0,
-        "issue 1 record: {i1}\noutcomes: {}",
-        std::fs::read_to_string(outcomes_dir.join("p1-conflict.outcomes.json")).unwrap()
-    );
+                                                           // own_commits → per-commit-parent coordinates for the actual patch, so
+                                                           // per-issue interval metrics are honestly null (coordinate guard).
+    assert!(i1["interval_recall"].is_null(), "issue 1 record: {i1}");
+    assert!(i1["symbol_precision"].is_null() || i1["symbol_precision"].is_number());
     assert!(!i1["missed_files"].as_array().unwrap().is_empty());
     // Issue 3: wrong-hash prediction is a mismatch — never scored.
     assert_eq!(by_issue[&3]["prediction_status"], "mismatch:content-hash");
@@ -650,6 +661,15 @@ fn p4_assoc(by_id: &BTreeMap<String, serde_json::Value>) -> String {
         .to_string()
 }
 
+/// Own commits of a fixture branch, oldest first (a contiguous chain that
+/// ends at the branch head), for manifest `own_commits`.
+fn branch_commits(fx: &Fixture, branch: &str) -> Vec<String> {
+    git(&fx.repo, &["rev-list", "--reverse", &format!("base..{branch}")])
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
 #[test]
 fn score_requires_outcomes_coverage() {
     let fx = setup_repo();
@@ -740,4 +760,174 @@ fn baseline_only_score_runs_without_predictions() {
     assert!(per_pair[0]["scores"]["blend"].is_null());
     assert!(per_pair[0]["scores"]["file_jaccard"].is_null());
     assert!(per_pair[0]["predicted"].is_null());
+    // own_commits absent → range mode: a real common-source basis, so the
+    // actual line metrics ARE computed and bounded.
+    let actual = &per_pair[0]["actual"];
+    assert_eq!(actual["coordinate_basis"], "common_source");
+    let frac = actual["line_overlap_fraction"]
+        .as_f64()
+        .expect("line metric computed");
+    assert!((0.0..=1.0).contains(&frac), "recall ≤ 1 invariant: {frac}");
+}
+
+// --- #9785 repair §A: chain validation + patch-preserving transplant -----
+
+fn shared5(value: &str) -> String {
+    (1..=10)
+        .map(|i| {
+            if i == 5 {
+                format!("line5 = {value}\n")
+            } else {
+                format!("line{i} = {i}\n")
+            }
+        })
+        .collect()
+}
+
+/// Chain validation over real git: qualified single-commit chains, and the
+/// explicit unqualified reasons (head not at chain end, no commits).
+#[test]
+fn chain_validation_and_transplant() {
+    let fx = setup_repo();
+    use loom_daemon::overlap_replay::patch::{
+        own_chain, transplant, ChainStatus, TransplantStatus,
+    };
+
+    git(&fx.repo, &["checkout", "-q", "-b", "feat-g", "base"]);
+    let _ = commit_file(&fx.repo, None, "src/shared.rs", &shared5("from G"), "G edits shared");
+    let g_head = git(&fx.repo, &["rev-parse", "HEAD"]);
+
+    let cg = own_chain(&fx.repo, 41, &g_head, &[g_head.clone()]).unwrap();
+    assert_eq!(cg.status, ChainStatus::Qualified, "{:?}", cg.reason);
+    assert!(cg.patch_base.is_some());
+    assert_eq!(cg.net_changed_paths, vec!["src/shared.rs"]);
+
+    let h_alias = g_head.clone();
+    let bogus = own_chain(&fx.repo, 41, &g_head, &[g_head.clone(), h_alias]).unwrap();
+    assert_eq!(bogus.status, ChainStatus::Unqualified);
+    // Two identical commit "chain" entries: head IS the last element, but
+    // the chain is not contiguous — that's the reason reported.
+    assert_eq!(bogus.reason.as_deref(), Some("own_commits_not_contiguous"));
+    let no_commits = own_chain(&fx.repo, 41, &g_head, &[]).unwrap();
+    assert_eq!(no_commits.reason.as_deref(), Some("head_not_end_of_own_chain"));
+
+    // Transplant the same net patch twice onto the common base: both
+    // reconstructions succeed (deterministic, verifiable).
+    let common = cg.patch_base.clone().unwrap();
+    let tg = transplant(&fx.repo, &cg, &common, "g-side").unwrap();
+    let th = transplant(&fx.repo, &cg, &common, "h-side").unwrap();
+    assert_eq!(tg.status, TransplantStatus::Reconstructed, "{:?}", tg.reason);
+    assert_eq!(th.status, TransplantStatus::Reconstructed, "{:?}", th.reason);
+    assert_eq!(tg.patch_sha256, th.patch_sha256);
+}
+
+/// A same-line conflict transplanted from the pair's common base replays
+/// as a pair-caused conflict on the synthetic commits, in both orders.
+#[test]
+fn transplanted_replay_detects_designed_conflict() {
+    let fx = setup_repo();
+    use loom_daemon::overlap_replay::{
+        conflict,
+        patch::{own_chain, transplant},
+    };
+    git(&fx.repo, &["checkout", "-q", "-b", "feat-g", "base"]);
+    let _ = commit_file(&fx.repo, None, "src/shared.rs", &shared5("from G"), "G");
+    let g = git(&fx.repo, &["rev-parse", "HEAD"]);
+    git(&fx.repo, &["checkout", "-q", "-b", "feat-h", "base"]);
+    let _ = commit_file(&fx.repo, None, "src/shared.rs", &shared5("from H"), "H");
+    let h = git(&fx.repo, &["rev-parse", "HEAD"]);
+    let cg = own_chain(&fx.repo, 41, &g, &[g.clone()]).unwrap();
+    let ch = own_chain(&fx.repo, 42, &h, &[h.clone()]).unwrap();
+    let common = cg.patch_base.clone().unwrap();
+    let tg = transplant(&fx.repo, &cg, &common, "a").unwrap();
+    let th = transplant(&fx.repo, &ch, &common, "b").unwrap();
+    let (a, b) = (tg.commit.unwrap(), th.commit.unwrap());
+    let replays = conflict::replay_pair(&fx.repo, &common, &a, &b);
+    assert_eq!(matches!(conflict::any_textual_conflict(&replays), Some(true)), true);
+    for r in &replays {
+        match &r.outcome {
+            conflict::ConflictOutcome::TextualConflict { conflicted_files } => {
+                assert_eq!(conflicted_files, &vec!["src/shared.rs".to_string()]);
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+    }
+}
+
+/// Per-issue line metrics respect the coordinate guard and the recall ≤ 1
+/// invariant across the whole e2e report.
+#[test]
+fn line_metrics_are_guarded_and_bounded() {
+    let fx = setup_repo();
+    let work = tempfile::tempdir().unwrap();
+    let manifest_path = work.path().join("m.json");
+    write_json(
+        &manifest_path,
+        &manifest_json(vec![pair_json(
+            "p1",
+            &fx.base,
+            [
+                snapshot_json(1, true, &["src/shared.rs"]),
+                snapshot_json(2, true, &["src/shared.rs"]),
+            ],
+            "independent",
+            vec![
+                pr_json(11, 1, &fx.base, &fx.feat_a, None),
+                pr_json(12, 2, &fx.base, &fx.feat_b, None),
+            ],
+        )]),
+    );
+    let odir = work.path().join("o");
+    let out = daemon()
+        .args(["overlap-replay", "outcomes"])
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--repo")
+        .arg(&fx.repo)
+        .arg("--out-dir")
+        .arg(&odir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let rec: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(odir.join("p1.outcomes.json")).unwrap())
+            .unwrap();
+    // own_commits were None for this fixture: chains are recorded as
+    // unqualified and no pair-caused instrument is produced. The field is
+    // skipped when empty — absent means empty (unknown, not clean).
+    assert_eq!(rec["chains"].as_array().unwrap().len(), 2);
+    assert!(rec["conflict_replays_transplanted"]
+        .as_array()
+        .map(|a| a.is_empty())
+        .unwrap_or(true));
+
+    let out = daemon()
+        .args(["overlap-replay", "score"])
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--outcomes-dir")
+        .arg(&odir)
+        .arg("--out-dir")
+        .arg(work.path().join("r"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let issues: Vec<serde_json::Value> =
+        String::from_utf8(std::fs::read(work.path().join("r/per_issue.jsonl")).unwrap())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+    for e in &issues {
+        for f in [
+            "interval_precision",
+            "interval_recall",
+            "file_precision",
+            "file_recall",
+        ] {
+            if let Some(v) = e[f].as_f64() {
+                assert!((0.0..=1.0).contains(&v), "issue {} {f} = {v}", e["issue"]);
+            }
+        }
+    }
 }

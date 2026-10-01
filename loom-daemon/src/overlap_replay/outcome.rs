@@ -15,7 +15,10 @@ use std::path::Path;
 use super::conflict::{self, ConflictReplay};
 use super::manifest::{Association, ReplayManifest, ReplayPair};
 use super::overlap::{actual_overlap, extract_identifiers, ActualOverlap};
-use super::patch::{own_patch, CoordinateBasis, OwnPatch};
+use super::patch::{
+    own_chain, own_patch, transplant, CoordinateBasis, OwnChain, OwnPatch, Transplant,
+    TransplantStatus,
+};
 
 /// A PR's derived changes plus the extraction evidence the score stage needs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -55,8 +58,26 @@ pub struct PairOutcomes {
     /// evaluated separately).
     pub overlap: Option<ActualOverlap>,
     /// Counterfactual conflict replays (both orders) on the declared common
-    /// source.
+    /// source. **Raw-head instrument**: merges the pinned head commits as-is
+    /// and folds in any upstream commits a head contains — reported for
+    /// comparability with earlier runs, never as a pair-caused label.
     pub conflict_replays: Vec<ConflictReplay>,
+    /// Patch-preserving reconstruction records per PR (#9785 repair §A):
+    /// chain qualification, exact preimage/postimage checks, and the
+    /// synthetic common-base commits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reconstructions: Vec<super::patch::Transplant>,
+    /// Chain-validation records per PR (the precondition for
+    /// `conflict_replays_transplanted`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chains: Vec<super::patch::OwnChain>,
+    /// **Pair-caused conflict instrument** (both orders): merges the two
+    /// transplanted net patches — each exactly rebuilt on the unique common
+    /// base of the pair's patch bases, with preimage/postimage verified —
+    /// so inherited upstream history cannot enter either side. Empty unless
+    /// both sides reconstructed; a missing entry is `unknown`, not clean.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_replays_transplanted: Vec<ConflictReplay>,
     /// Side which PRs were used for A/B (association disambiguation).
     pub side_a_pr: Option<u32>,
     pub side_b_pr: Option<u32>,
@@ -156,6 +177,95 @@ pub fn compute_pair_outcomes(repo: &Path, pair: &ReplayPair) -> Result<PairOutco
         _ => Vec::new(),
     };
 
+    // Patch-preserving instruments (#9785 repair §A): validate each side's
+    // own-commit chain, transplant each net patch exactly onto the unique
+    // common base of the two patch bases, and replay both orders on the
+    // synthetic commits. Every failure mode is an explicit record — a
+    // missing entry is unknown, never clean.
+    let mut chains: Vec<OwnChain> = Vec::new();
+    let mut reconstructions: Vec<Transplant> = Vec::new();
+    let mut conflict_replays_transplanted: Vec<ConflictReplay> = Vec::new();
+    if let (Some(a), Some(b)) = (&a_pr, &b_pr) {
+        let chain_of = |pr: &super::manifest::PrAssociation| -> OwnChain {
+            match &pr.own_commits {
+                Some(commits) if !commits.is_empty() => {
+                    own_chain(repo, pr.pr, &pr.head_sha, commits).unwrap_or_else(|_| OwnChain {
+                        pr: pr.pr,
+                        status: super::patch::ChainStatus::Unqualified,
+                        patch_base: None,
+                        head: pr.head_sha.clone(),
+                        commit_dates: Vec::new(),
+                        net_changed_paths: Vec::new(),
+                        reason: Some("own_chain_validation_git_failure".into()),
+                    })
+                }
+                _ => OwnChain {
+                    pr: pr.pr,
+                    status: super::patch::ChainStatus::Unqualified,
+                    patch_base: None,
+                    head: pr.head_sha.clone(),
+                    commit_dates: Vec::new(),
+                    net_changed_paths: Vec::new(),
+                    reason: Some("no_own_commits_recorded".into()),
+                },
+            }
+        };
+        let (ca, cb) = (chain_of(a), chain_of(b));
+        chains.push(ca.clone());
+        chains.push(cb.clone());
+        if ca.status == super::patch::ChainStatus::Qualified
+            && cb.status == super::patch::ChainStatus::Qualified
+        {
+            let bases = super::patch::git(
+                repo,
+                &[
+                    "merge-base",
+                    "--all",
+                    ca.patch_base.as_deref().expect("qualified has patch_base"),
+                    cb.patch_base.as_deref().expect("qualified has patch_base"),
+                ],
+            )
+            .ok()
+            .map(|s| {
+                s.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+            if bases.len() == 1 {
+                let common = &bases[0];
+                let ta = transplant(repo, &ca, common, &format!("{} side-a", pair.pair_id))?;
+                let tb = transplant(repo, &cb, common, &format!("{} side-b", pair.pair_id))?;
+                if ta.status == TransplantStatus::Reconstructed
+                    && tb.status == TransplantStatus::Reconstructed
+                {
+                    conflict_replays_transplanted = conflict::replay_pair(
+                        repo,
+                        common,
+                        ta.commit.as_deref().expect("reconstructed has commit"),
+                        tb.commit.as_deref().expect("reconstructed has commit"),
+                    );
+                }
+                reconstructions.push(ta);
+                reconstructions.push(tb);
+            } else {
+                for c in [&ca, &cb] {
+                    reconstructions.push(Transplant {
+                        pr: c.pr,
+                        status: TransplantStatus::PreimageDiffers,
+                        commit: None,
+                        tree: None,
+                        patch_sha256: None,
+                        paths: Vec::new(),
+                        reason: Some("no_unique_common_base_of_patch_bases".into()),
+                    });
+                }
+            }
+        }
+    }
+
     Ok(PairOutcomes {
         pair_id: pair.pair_id.clone(),
         historical_commit: pair.historical_commit.clone(),
@@ -163,6 +273,9 @@ pub fn compute_pair_outcomes(repo: &Path, pair: &ReplayPair) -> Result<PairOutco
         prs,
         overlap,
         conflict_replays,
+        reconstructions,
+        chains,
+        conflict_replays_transplanted,
         side_a_pr: a_pr.map(|p| p.pr),
         side_b_pr: b_pr.map(|p| p.pr),
     })
