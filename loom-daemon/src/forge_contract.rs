@@ -36,9 +36,10 @@ impl Provider {
 }
 
 /// A forge instance origin: scheme + host, lowercased. The first identity
-/// component
-/// Rejects C0 controls: the key delimiter (U+001F) is display metadata, not identity. — two origins that agree on everything else are different
-/// worlds (#9779 §1).
+/// component — two origins that agree on everything else are different
+/// worlds (#9779 §1). Rejects C0 controls: the `ObjectRef::key` delimiter
+/// (U+001F) is key *structure*, and a component carrying it could make two
+/// distinct objects produce one key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InstanceOrigin(String);
 
