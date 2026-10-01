@@ -156,40 +156,6 @@ fn a_source_pass_marker_is_soft_and_its_absence_is_hard() {
     }
 }
 
-// --- Render / round-trip (#9686's source field) -------------------------
-
-#[test]
-fn marker_text_round_trips_through_parse() {
-    let m = SequenceMarker {
-        after: 7,
-        pred_head: PRED.into(),
-        follower_head: FOLLOWER.into(),
-        plan: "seq-ab12cd34".into(),
-        source: Some("pass".into()),
-    };
-    assert_eq!(parse(&[marker_text(&m)]), Some(m.clone()));
-    let hard = SequenceMarker { source: None, ..m };
-    assert_eq!(parse(&[marker_text(&hard)]), Some(hard));
-}
-
-#[test]
-fn a_source_pass_marker_is_soft_and_its_absence_is_hard() {
-    // A marker with no source field parses as source: None — the HARD,
-    // human-authored shape that never auto-expires.
-    let bare = parse(&[marker_line(1, PRED, FOLLOWER, "seq-abc")]);
-    match bare {
-        Some(m) => assert_eq!(m.source, None, "missing source = hard hold"),
-        None => panic!("a plain marker must parse"),
-    }
-    let line = format!(
-        "<!-- loom:sequence after=1 pred_head={PRED} follower_head={FOLLOWER} plan=seq-abc source=pass -->"
-    );
-    match parse(&[line]) {
-        Some(m) => assert_eq!(m.source.as_deref(), Some("pass")),
-        None => panic!("source=pass marker must parse"),
-    }
-}
-
 // --- Evaluation ---------------------------------------------------------
 
 fn marker() -> SequenceMarker {
