@@ -705,6 +705,203 @@ assert_eq "repos/owner/repo/git/refs/heads/feature/issue-9109" "$(sed -n 2p "$GH
     "forge_delete_branch (GitHub) leaves an ordinary ref path byte-identical"
 rm -rf "$GH_DEL_SHIM_DIR"; rm -f "$GH_DEL_ARGS"; unset GH_DEL_ARGS
 
+# --- Test forge_get_workflow_runs Gitea pagination + fail-closed (#9879) ---
+# curl shim that serves scripted /actions/tasks pages: parses the page=N arg,
+# returns full 2-task pages forever unless a page-specific script is set.
+echo ""
+echo "Testing forge_get_workflow_runs Gitea pagination + fail-closed (#9879)..."
+
+WF_SHIM_DIR=$(mktemp -d)
+WF_PAGES_FILE=$(mktemp)
+export WF_PAGES_FILE
+cat > "$WF_SHIM_DIR/curl" <<'SHIM'
+#!/usr/bin/env bash
+# Find the page= argument (gitea_api appends &limit=50&page=N).
+page=1
+for a in "$@"; do
+  case "$a" in
+    *page=*) page="${a##*page=}" ;;
+  esac
+done
+# Page script: semicolon-separated per-page directives, e.g. "ok;fail" or "cap".
+I=1
+for directive in $(tr ';' ' ' < "$WF_PAGES_FILE"); do
+  if [ "$I" -eq "$page" ]; then
+    case "$directive" in
+      fail)
+        printf 'server error\n500\n'
+        exit 0
+        ;;
+      ok1)
+        # FULL page (50): pagination continues to the next page.
+        jq -nc '{workflow_runs: [range(0; 49) | {head_sha: "other", display_title: "filler"}] + [{head_sha: "sha1", display_title: "one"}]}'
+        printf '200\n'
+        ;;
+      ok2)
+        # SHORT page (1): the stop rule fires after this one.
+        jq -nc '{workflow_runs: [{head_sha: "sha1", display_title: "two"}]}'
+        printf '200\n'
+        ;;
+      cap)
+        jq -nc --argjson n 50 '{workflow_runs: [range(0; $n) | {head_sha: "x", status: "queued"}]}'
+        printf '200\n'
+        ;;  # 50 items = FULL page: pagination continues until the cap
+    esac
+    exit 0
+  fi
+  I=$((I + 1))
+done
+# Pages beyond the scripted directives repeat the LAST directive — the cap
+# script needs every page full so the 50-page cap is what trips, not an
+# empty fallback page.
+for directive in $(tr ';' ' ' < "$WF_PAGES_FILE" | tail -1); do :; done
+case "$directive" in
+  cap)
+    jq -nc --argjson n 50 '{workflow_runs: [range(0; $n) | {head_sha: "x", status: "queued"}]}'
+    printf '200\n'
+    ;;
+  *)
+    printf '{}\n200\n'
+    ;;
+esac
+SHIM
+chmod +x "$WF_SHIM_DIR/curl"
+
+wf_run() {  # wf_run <commit>  -> "exit:<rc> out:<stdout>"
+  local out rc
+  FORGE_TYPE=""
+  LOOM_FORGE_TYPE="gitea"
+  forge_detect >/dev/null 2>&1 || true
+  out=$(_GITEA_BASE_URL="https://gitea.example.com" _GITEA_TOKEN="tok" _GITEA_USERNAME="" \
+      PATH="$WF_SHIM_DIR:$PATH" forge_get_workflow_runs "owner/repo" "$1" 2>/dev/null)
+  rc=$?
+  printf 'exit:%s out:%s' "$rc" "$out"
+}
+
+# Subtest 1: multi-page read assembles all matching runs across pages.
+printf 'ok1;ok2;ok2\n' > "$WF_PAGES_FILE"
+RESULT=$(wf_run "sha1" 2>/dev/null) || RESULT="exit:$?"
+# RESULT is "exit:<rc> out:<json>" — strip the prefix before parsing the JSON.
+OUT_JSON="$(printf '%s' "$RESULT" | sed 's/^exit:[0-9]* out://')"
+RUNS="$(printf '%s' "$OUT_JSON" | jq '[.workflow_runs[]] | length' 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if printf '%s' "$RESULT" | grep -q 'exit:0' \
+   && [ "$RUNS" = "2" ] \
+   && printf '%s' "$OUT_JSON" | grep -q '"one"' && printf '%s' "$OUT_JSON" | grep -q '"two"' \
+   && ! printf '%s' "$OUT_JSON" | grep -q '"skip"'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: workflow-runs Gitea reads across pages (2 runs, sha-filtered)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: workflow-runs multi-page read broken: $RESULT"
+fi
+
+# Subtest 2: a failing page is nonzero + no stdout JSON (never empty-success).
+printf 'ok1;fail\n' > "$WF_PAGES_FILE"
+rc=0
+( FORGE_TYPE=""
+  LOOM_FORGE_TYPE="gitea"
+  forge_detect >/dev/null 2>&1 || true
+  _GITEA_BASE_URL="https://gitea.example.com" _GITEA_TOKEN="tok" _GITEA_USERNAME="" \
+  PATH="$WF_SHIM_DIR:$PATH" forge_get_workflow_runs "owner/repo" "sha1" ) >/tmp/wf-fail.out 2>/dev/null || rc=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ "$rc" -ne 0 ] && [ ! -s /tmp/wf-fail.out ]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: workflow-runs failing page -> nonzero exit, no stdout JSON (fail closed)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: workflow-runs failing page did not fail closed (rc=$rc)"
+fi
+
+# Subtest 3: page-cap trip is nonzero, never a truncated-but-successful read.
+printf 'cap\n' > "$WF_PAGES_FILE"
+rc=0
+( FORGE_TYPE=""
+  LOOM_FORGE_TYPE="gitea"
+  forge_detect >/dev/null 2>&1 || true
+  echo "cap debug: FORGE_TYPE=[$FORGE_TYPE]" >&2
+  _GITEA_BASE_URL="https://gitea.example.com" _GITEA_TOKEN="tok" _GITEA_USERNAME="" \
+  PATH="$WF_SHIM_DIR:$PATH" forge_get_workflow_runs "owner/repo" "x" ) >/tmp/wf-cap.out 2>/tmp/wf-cap.err || rc=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ "$rc" -ne 0 ]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: workflow-runs page-cap trip -> nonzero (refuses truncated list)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: workflow-runs page-cap trip exited 0"
+fi
+rm -rf "$WF_SHIM_DIR" "$WF_PAGES_FILE" /tmp/wf-fail.out
+
+# --- Test forge_pr_close_targets Gitea: fences + blockquotes excluded (#9879) ---
+echo ""
+echo "Testing forge_pr_close_targets Gitea fence/blockquote handling (#9879)..."
+
+CT_DIR=$(mktemp -d)
+CT_SHIM_DIR="$CT_DIR/shim"
+mkdir -p "$CT_SHIM_DIR"
+git -C "$CT_DIR" init -q
+git -C "$CT_DIR" remote add origin https://gitea.example.com/owner/repo.git
+git -C "$CT_DIR" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+
+CT_BODY_FILE=$(mktemp)
+export CT_BODY_FILE
+cat > "$CT_SHIM_DIR/curl" <<'SHIM'
+#!/usr/bin/env bash
+# Serve the scripted PR body (a JSON object with a "body" field).
+cat "$CT_BODY_FILE"
+printf '200\n'
+SHIM
+chmod +x "$CT_SHIM_DIR/curl"
+
+ct_run() {  # ct_run <body> -> close-target numbers, one per line
+  printf '{"body": %s}\n' "$(jq -Rn --arg b "$1" '$b')" > "$CT_BODY_FILE"
+  ( cd "$CT_DIR" && FORGE_TYPE="" LOOM_FORGE_TYPE="gitea"
+      forge_detect >/dev/null 2>&1 || true
+      _GITEA_BASE_URL="https://gitea.example.com" _GITEA_TOKEN="tok" _GITEA_USERNAME="" \
+      PATH="$CT_SHIM_DIR:$PATH" forge_pr_close_targets 7 )
+}
+
+RESULT=$(ct_run 'Closes #42
+Fixes #43
+
+```bash
+Closes #99
+```
+
+> Closes #88
+	Resolves #44')
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ "$RESULT" = "42
+43
+44" ]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: close-targets excludes fenced + blockquoted closers, keeps real ones"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: close-targets got: $(printf '%s' "$RESULT" | tr '\n' ' ')"
+fi
+
+# The GitHub branch must be byte-identical to before: still the plain
+# closingIssuesReferences query (no fence handling added there).
+GH_CT_SHIM="$CT_SHIM_DIR/gh"
+cat > "$GH_CT_SHIM" <<'SHIM'
+#!/usr/bin/env bash
+printf '31\n' # the only thing the GitHub branch outputs
+SHIM
+chmod +x "$GH_CT_SHIM"
+RESULT=$( ( cd "$CT_DIR" && FORGE_TYPE="" LOOM_FORGE_TYPE="github"
+      forge_detect >/dev/null 2>&1 || true; PATH="$CT_SHIM_DIR:$PATH" forge_pr_close_targets 7 ) )
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ "$RESULT" = "31" ]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: close-targets GitHub branch unchanged (closingIssuesReferences passthrough)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: close-targets GitHub branch changed: $RESULT"
+fi
+rm -rf "$CT_DIR" "$CT_BODY_FILE"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"
