@@ -721,7 +721,7 @@ export WF_SHIM_DIR
 # body -> paginate failed closed -> a coin-flip suite (judge, round 3 of
 # #9880). cat is load-immune.
 SHA_HEX="96c2b8246403c9c91d37c2c7d6eebf7558f790f4"
-jq -nc '{workflow_runs: [range(0; 49) | {head_sha: "other", display_title: "filler"}] + [{head_sha: $sha, display_title: "one"}]}' --arg sha "$SHA_HEX" > "$WF_SHIM_DIR/page-ok1.json" || exit 1
+jq -nc '{workflow_runs: ([range(0; 49) | {head_sha: "other", display_title: "filler"}] + [{head_sha: $sha, display_title: "one"}])}' --arg sha "$SHA_HEX" > "$WF_SHIM_DIR/page-ok1.json" || exit 1
 jq -nc '{workflow_runs: [{head_sha: $sha, display_title: "two"}]}' --arg sha "$SHA_HEX" > "$WF_SHIM_DIR/page-ok2.json" || exit 1
 jq -nc '{workflow_runs: [range(0; 50) | {head_sha: "x", status: "queued"}]}' > "$WF_SHIM_DIR/page-cap.json" || exit 1
 cat > "$WF_SHIM_DIR/curl" <<'SHIM'
