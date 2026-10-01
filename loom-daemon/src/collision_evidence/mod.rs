@@ -98,6 +98,18 @@ pub fn record_id<T: Serialize>(value: &T) -> Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 
+/// SHA-256 of a file's contents, as lowercase hex.
+pub fn sha256_file(path: &Path) -> Result<String> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading {} for sha256", path.display()))?;
+    Ok(hex::encode(Sha256::digest(&bytes)))
+}
+
+/// SHA-256 of a string's UTF-8 bytes, as lowercase hex.
+pub fn sha256_str(s: &str) -> String {
+    hex::encode(Sha256::digest(s.as_bytes()))
+}
+
 /// A published evidence bundle: every record, sorted by id, with bundle-level
 /// completeness metadata (#9786: bounded chunking must include completeness/
 /// checksum metadata).
@@ -317,14 +329,12 @@ mod tests {
     #[test]
     fn deterministic_ids_and_idempotent_publish() {
         let dir = tempfile::tempdir().unwrap();
-        let mut p1 = prediction(1, 2, 0.5);
-        let mut p1_again = prediction(1, 2, 0.5);
+        let p1 = prediction(1, 2, 0.5);
         // Field order in the constructor is fixed, but the hash must not
         // depend on it — mutate via round-trip through serde_json to prove
         // canonicalization.
-        let round: PredictionRecord =
+        let p1_again: PredictionRecord =
             serde_json::from_value(serde_json::to_value(&p1).unwrap()).unwrap();
-        p1_again = round;
         assert_eq!(record_id(&p1).unwrap(), record_id(&p1_again).unwrap());
         let o = outcome(
             &p1,

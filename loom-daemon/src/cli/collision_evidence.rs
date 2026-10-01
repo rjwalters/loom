@@ -15,8 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use loom_daemon::collision_evidence::{
-    self, otlp, records, EvidenceBundle, OutcomeKind, OutcomeRecord, PredictionRecord,
-    SchedulingExposure,
+    self, otlp, records, OutcomeKind, OutcomeRecord, PredictionRecord, SchedulingExposure,
 };
 
 #[derive(clap::Subcommand)]
@@ -112,9 +111,9 @@ fn run_publish(
             .get("pairs")
             .and_then(|v| v.as_array())
             .and_then(|pairs| {
-                pairs.iter().find(|p| {
-                    p.get("pair_id").and_then(|v| v.as_str()) == Some(pair_id.as_str())
-                })
+                pairs
+                    .iter()
+                    .find(|p| p.get("pair_id").and_then(|v| v.as_str()) == Some(pair_id.as_str()))
             })
             .with_context(|| format!("pair {pair_id} missing from manifest"))?;
         let source_sha = pair
@@ -167,7 +166,7 @@ fn run_publish(
             directed_eval_id: eval_id.clone(),
             issue_content_hashes: issues_seen
                 .iter()
-                .filter(|(n, _)| *n == a || *n == b)
+                .filter(|(n, _)| **n == a || **n == b)
                 .map(|(n, h)| (*n, h.clone()))
                 .collect(),
             retrieval_artifact: None,
@@ -183,7 +182,7 @@ fn run_publish(
             actual_pr_heads: None,
             predicted_at: predicted_at.clone(),
             scorer_version: scorer_version.to_string(),
-            policy_version,
+            policy_version: policy_version.clone(),
             intended_order: vec![a, b],
             exposure: SchedulingExposure::AdvisoryOnly,
             features,
@@ -217,8 +216,7 @@ fn run_publish(
                     .into(),
             },
             _ => OutcomeKind::Unknown {
-                reason: "conflict instrument unavailable (reconstruction or replay failed)"
-                    .into(),
+                reason: "conflict instrument unavailable (reconstruction or replay failed)".into(),
             },
         };
         outcomes.push(OutcomeRecord {
@@ -278,10 +276,7 @@ fn run_publish(
             &chrono::Utc::now().to_rfc3339(),
         );
         let payload = otlp::build_otlp_payload(&log_records);
-        std::fs::write(
-            out_dir.join("otlp-payload.json"),
-            serde_json::to_vec_pretty(&payload)?,
-        )?;
+        std::fs::write(out_dir.join("otlp-payload.json"), serde_json::to_vec_pretty(&payload)?)?;
         println!(
             "otlp: {} record body/bodies ({} skipped, counted) → otlp-payload.json",
             log_records.len(),
