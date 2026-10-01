@@ -343,12 +343,77 @@ pub fn startup_root() -> Option<&'static PathBuf> {
 #[must_use]
 pub fn u64_from_layer_global(group: &str, key: &str) -> Option<u64> {
     let root = STARTUP_ROOT.get()?;
-    let effective = resolve_effective_config(root);
-    effective
+    u64_from_effective(&resolve_effective_config(root), group, key)
+}
+
+/// `$LOOM_HYPERPARAMS` — mirrors `hyperparams::HYPERPARAMS_ENV` (kept local
+/// so this module stays a leaf; a unit test pins the two together).
+const HYPERPARAMS_ENV_VAR: &str = "LOOM_HYPERPARAMS";
+
+/// Read `hyperparameters.<group>.<key>` as a `u64` from an already-resolved
+/// effective config, with the `$LOOM_HYPERPARAMS` vector deep-merged over the
+/// committed block (vector wins per field) — the same layer
+/// `hyperparams::overlay_from_effective` builds. An unset/unparseable vector
+/// contributes nothing; the caller's env/default chain then applies.
+fn u64_from_effective(effective: &Value, group: &str, key: &str) -> Option<u64> {
+    let block = effective
+        .get("hyperparameters")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let vector = std::env::var(HYPERPARAMS_ENV_VAR)
+        .ok()
+        .filter(|raw| !raw.trim().is_empty())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .filter(Value::is_object)
+        .map(|parsed| normalize_dotted(&parsed));
+    let layer = match vector {
+        Some(vector) => deep_merge(&block, &vector),
+        None => block,
+    };
+    layer
         .get(group)
         .and_then(|g| g.get(key))
         .filter(|v| !v.is_null())
         .and_then(serde_json::Value::as_u64)
+}
+
+/// Normalize an object's dotted keys into nested groups: `{"a.b": 1}` becomes
+/// `{"a": {"b": 1}}`, merging (last wins) when a dotted key splits into an
+/// existing group. Non-object values pass through untouched.
+#[must_use]
+pub fn normalize_dotted(value: &Value) -> Value {
+    let Some(obj) = value.as_object() else {
+        return value.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (key, val) in obj {
+        match key.split_once('.') {
+            None => {
+                let normalized = normalize_dotted(val);
+                // A plain key and a dotted key can address the same group
+                // (e.g. `dispatch` and `dispatch.maxConcurrent`); deep-merge
+                // so both survive, the later key winning per field.
+                out.insert(
+                    key.clone(),
+                    match out.get(key) {
+                        Some(existing) => deep_merge(existing, &normalized),
+                        None => normalized,
+                    },
+                );
+            }
+            Some((head, tail)) => {
+                let nested = normalize_dotted(&Value::Object(
+                    [(tail.to_string(), val.clone())].into_iter().collect(),
+                ));
+                let merged = match out.get(head) {
+                    Some(existing) => deep_merge(existing, &nested),
+                    None => nested,
+                };
+                out.insert(head.to_string(), merged);
+            }
+        }
+    }
+    Value::Object(out)
 }
 
 /// Dotted key read by [`daemon_delegated_to`].
@@ -1122,5 +1187,51 @@ mod tests {
             effective, expected,
             "Rust resolver diverged from the cross-language conformance fixture's expected.json"
         );
+    }
+
+    // ===== hyperparameter accessor (u64_from_effective) — #9843 review =====
+
+    #[test]
+    fn hyperparams_env_var_name_matches_the_schema_module() {
+        assert_eq!(HYPERPARAMS_ENV_VAR, crate::hyperparams::HYPERPARAMS_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn consumer_accessor_reads_the_committed_hyperparameters_block() {
+        std::env::remove_var(HYPERPARAMS_ENV_VAR);
+        let effective = serde_json::json!({
+            "hyperparameters": {"supervision": {"sweepInflightStaleSecs": 7200}},
+            // A same-named top-level group must NOT be read (observability collision).
+            "supervision": {"sweepInflightStaleSecs": 1},
+        });
+        assert_eq!(
+            u64_from_effective(&effective, "supervision", "sweepInflightStaleSecs"),
+            Some(7200)
+        );
+        assert_eq!(u64_from_effective(&effective, "supervision", "absent"), None);
+        assert_eq!(
+            u64_from_effective(&serde_json::json!({"supervision": {"k": 5}}), "supervision", "k"),
+            None,
+            "a top-level group outside `hyperparameters` is not a hyperparameter"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn consumer_accessor_merges_the_env_vector_over_the_block() {
+        let effective = serde_json::json!({
+            "hyperparameters": {"supervision": {"sweepInflightStaleSecs": 7200, "other": 9}},
+        });
+        std::env::set_var(HYPERPARAMS_ENV_VAR, r#"{"supervision.sweepInflightStaleSecs": 99}"#);
+        let vector_wins = u64_from_effective(&effective, "supervision", "sweepInflightStaleSecs");
+        let block_survives = u64_from_effective(&effective, "supervision", "other");
+        std::env::set_var(HYPERPARAMS_ENV_VAR, "not json");
+        let bad_vector_ignored =
+            u64_from_effective(&effective, "supervision", "sweepInflightStaleSecs");
+        std::env::remove_var(HYPERPARAMS_ENV_VAR);
+        assert_eq!(vector_wins, Some(99));
+        assert_eq!(block_survives, Some(9));
+        assert_eq!(bad_vector_ignored, Some(7200));
     }
 }

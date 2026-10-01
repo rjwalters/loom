@@ -296,44 +296,7 @@ pub fn env_vector() -> Result<Option<Value>, String> {
     }
 }
 
-/// Normalize an object's dotted keys into nested groups: `{"a.b": 1}` becomes
-/// `{"a": {"b": 1}}`, merging (last wins) when a dotted key splits into an
-/// existing group. Non-object values pass through untouched.
-#[must_use]
-pub fn normalize_dotted(value: &Value) -> Value {
-    let Some(obj) = value.as_object() else {
-        return value.clone();
-    };
-    let mut out = serde_json::Map::new();
-    for (key, val) in obj {
-        match key.split_once('.') {
-            None => {
-                let normalized = normalize_dotted(val);
-                // A plain key and a dotted key can address the same group
-                // (e.g. `dispatch` and `dispatch.maxConcurrent`); deep-merge
-                // so both survive, the later key winning per field.
-                out.insert(
-                    key.clone(),
-                    match out.get(key) {
-                        Some(existing) => config_resolver::deep_merge(existing, &normalized),
-                        None => normalized,
-                    },
-                );
-            }
-            Some((head, tail)) => {
-                let nested = normalize_dotted(&Value::Object(
-                    [(tail.to_string(), val.clone())].into_iter().collect(),
-                ));
-                let merged = match out.get(head) {
-                    Some(existing) => config_resolver::deep_merge(existing, &nested),
-                    None => nested,
-                };
-                out.insert(head.to_string(), merged);
-            }
-        }
-    }
-    Value::Object(out)
-}
+pub use crate::config_resolver::normalize_dotted;
 
 /// The hyperparameters layer for an already-resolved effective config: the
 /// committed `"hyperparameters"` block with the env vector (if any)

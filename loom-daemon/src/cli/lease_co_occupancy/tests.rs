@@ -353,7 +353,12 @@ fn the_forge_read_projects_the_author() {
 /// worktree-layer guard would disagree about the same bound.
 #[test]
 fn lease_guard_timeout_default_stays_in_sync_with_the_hyperparams_literal() {
-    assert_eq!(DEFAULT_TIMEOUT_SECS, 10u64);
+    assert_eq!(
+        DEFAULT_TIMEOUT_SECS,
+        loom_daemon::hyperparams::Hyperparameters::default()
+            .process
+            .lease_guard_timeout_secs
+    );
 }
 
 #[test]

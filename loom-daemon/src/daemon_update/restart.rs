@@ -67,8 +67,10 @@ pub fn poll_interval() -> Duration {
     if let Some(raw) = util::env_non_empty("LOOM_DAEMON_RESTART_POLL_INTERVAL") {
         return Duration::from_secs_f64(raw.parse::<f64>().unwrap_or(1.0).max(0.0));
     }
+    // A configured 0 would busy-poll; ignore it like `restart_verify::resolve_interval` does.
     let layer_ms =
-        crate::config_resolver::u64_from_layer_global("process", "restartPollIntervalMs");
+        crate::config_resolver::u64_from_layer_global("process", "restartPollIntervalMs")
+            .filter(|ms| *ms > 0);
     Duration::from_secs_f64(layer_ms.map_or(1.0, |ms| ms as f64 / 1000.0))
 }
 

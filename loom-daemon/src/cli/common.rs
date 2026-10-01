@@ -161,7 +161,12 @@ mod tests {
     /// CLI would disagree about the same floor.
     #[test]
     fn ipc_timeout_floor_stays_in_sync_with_the_hyperparams_literal() {
-        assert_eq!(DEFAULT_IPC_TIMEOUT_MS_FLOOR, 30_000u64);
+        assert_eq!(
+            DEFAULT_IPC_TIMEOUT_MS_FLOOR,
+            loom_daemon::hyperparams::Hyperparameters::default()
+                .process
+                .ipc_timeout_ms
+        );
         assert_eq!(DISPATCH_ACK_TIMEOUT, Duration::from_millis(DEFAULT_IPC_TIMEOUT_MS_FLOOR));
     }
 
