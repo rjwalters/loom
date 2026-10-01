@@ -433,7 +433,8 @@ echo "$ISSUE_URL"
 # number exists only inside the URL after the create). A daemon that cannot
 # (absent, or pre-#9818) leaves the body unfootered; it never un-files.
 # requires-daemon: forge optional   absent or pre-#9818 binary → the footer is skipped with a stderr note; the filing itself is already done (#9774)
-if self_bin="$(command -v loom-daemon 2>/dev/null)" && [[ -n "$self_bin" ]]; then
+self_bin="$(command -v loom-daemon 2>/dev/null)"
+if [[ -n "$self_bin" ]]; then
   if ! "$self_bin" forge comment --patch-created "$ISSUE_URL" >/dev/null 2>&1; then
     echo "create-issue.sh: note: could not append the dashboard footer to the filed body (best-effort; the issue itself is filed)" >&2
   fi
