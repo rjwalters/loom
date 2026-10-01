@@ -27,7 +27,7 @@ toml = "1.1"
 # `rustls-tls` avoids an OpenSSL system dependency; `default-features = false`
 # drops reqwest's default blocking/cookie/multipart surface this exporter
 # never touches.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "json", "blocking"] }
 libc = "0.2"
 # OTLP wire-format types for the optional `otlp` exporter (#4858, Epic #4702
 # Phase 4) — gated behind the `otlp` feature so a default (`HttpsExporter`-
