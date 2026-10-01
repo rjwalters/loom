@@ -594,8 +594,6 @@ struct GhComponent {
     #[serde(default)]
     labels: Vec<GhLabel>,
     #[serde(default)]
-    files: Vec<GhFile>,
-    #[serde(default)]
     additions: u64,
     #[serde(default)]
     deletions: u64,
@@ -606,10 +604,41 @@ struct GhLabel {
     name: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct GhFile {
-    #[serde(rename = "path")]
-    _path: String,
+/// Fetch a component PR's changed-file list via the paginated REST endpoint,
+/// never `gh pr view --json files` — that field is GraphQL-backed and
+/// silently truncates at 100 entries (#4613) with no error, the same shape
+/// this repo already fixed twice elsewhere (Champion's critical-file check,
+/// Judge's docs-only fast path). `check_eligibility`'s E4 `WorkflowEdit`
+/// exclusion reads this set, so a truncated answer could let a
+/// workflow-editing component past it undetected on a component with more
+/// than 100 changed files.
+fn fetch_component_files(gh_bin: &Path, root: &Path, number: u32) -> Result<BTreeSet<String>> {
+    let mut cmd = Command::new(gh_bin);
+    cmd.args([
+        "api",
+        &format!("repos/{{owner}}/{{repo}}/pulls/{number}/files"),
+        "--paginate",
+        "--jq",
+        ".[].filename",
+    ]);
+    cmd.current_dir(root);
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd
+        .output()
+        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh api pulls/{number}/files failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// Fetch one component PR's eligibility state.
@@ -626,10 +655,11 @@ pub fn fetch_component(gh_bin: &Path, root: &Path, number: u32) -> Result<Compon
             "view",
             &number.to_string(),
             "--json",
-            "state,isDraft,headRefOid,baseRefName,labels,files,additions,deletions",
+            "state,isDraft,headRefOid,baseRefName,labels,additions,deletions",
         ],
     )?;
     let r: GhComponent = serde_json::from_slice(&stdout).context("parse gh pr view JSON")?;
+    let files = fetch_component_files(gh_bin, root, number)?;
     Ok(ComponentState {
         number,
         state: r.state.to_uppercase(),
@@ -637,7 +667,7 @@ pub fn fetch_component(gh_bin: &Path, root: &Path, number: u32) -> Result<Compon
         head_sha: r.head_ref_oid,
         base_ref: r.base_ref_name.unwrap_or_default(),
         labels: r.labels.into_iter().map(|l| l.name).collect(),
-        files: r.files.into_iter().map(|f| f._path).collect(),
+        files,
         additions: r.additions,
         deletions: r.deletions,
     })
