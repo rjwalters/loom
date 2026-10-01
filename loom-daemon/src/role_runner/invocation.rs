@@ -182,6 +182,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 run_role_with_timeout(
                     &script,
                     &self.workspace_root,
+                    &self.gh(),
                     role,
                     prompt,
                     self.logs_dir(),

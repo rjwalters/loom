@@ -487,7 +487,13 @@ else
     GH="gh"
 fi
 
-REPO_NWO="$(forge_get_repo_nwo "$GH")" || error "Could not determine repository. Is 'gh' authenticated?"
+# #9548: the repo is vetted, not merely resolved. forge_get_repo_nwo asked
+# `gh repo view`, which prefers an `upstream` remote over `origin`, and nothing
+# checked that the answer was a repo this installation manages or can write.
+# loom_write_repo (lib/forge-helpers.sh, sourced above) returns origin only
+# when gh resolves there too, the repo is managed here, and the credential has
+# WRITE; otherwise the merge is refused before any read or write.
+REPO_NWO="$(loom_write_repo "${LOOM_REPO:-}")" || error "Merge refused (#9548): this checkout's repository is not one this installation may write to (reason above)."
 # Detect which merge strategy the target repo actually allows (#7754) --
 # previously every call site below hardcoded "squash", which fails outright
 # ("Squash merges are not allowed on this repository") on any repo that has

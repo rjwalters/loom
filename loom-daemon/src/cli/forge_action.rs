@@ -385,6 +385,21 @@ pub(crate) enum ForgeAction {
         gh_shape: bool,
     },
 
+    /// `forge may-write [--repo OWNER/REPO]` (#9548) — may this installation
+    /// write (comment, label, merge, lease) to the repository? Yes only when
+    /// it is managed here (origin of a registered workspace or of this Loom
+    /// checkout) and this process's credential has WRITE (cached probe). With
+    /// no `--repo`, the target is what `gh` resolves from the checkout, which
+    /// must be its `origin` (gh prefers an `upstream` remote). Prints the
+    /// OWNER/REPO to name on the write and exits 0; exits 1 with the reason on
+    /// stderr. See `.loom/docs/comment-trust.md`.
+    #[command(name = "may-write")]
+    MayWrite {
+        /// Repository to vet (default: this checkout's gh target).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
     /// `forge identities [--json]` (#9537) — the resolved roster (writer,
     /// readers, legacy logins) and, per reader, each published token's owner
     /// and expiry.
@@ -401,6 +416,18 @@ pub(crate) enum ForgeAction {
 /// child process cannot be spawned. See `loom-daemon/src/forge_cmd.rs`.
 pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
     use loom_daemon::forge_cmd::{dispatch, ForgeCmd};
+    // #9548: the verbs that write are vetted before they run. `issue`/`pr`
+    // pass straight through to `gh`, which would otherwise pick an `upstream`
+    // remote over `origin`; the arm/disarm verbs mutate a PR.
+    if let Some(repo) = write_target(&action) {
+        let cwd = std::env::current_dir()?;
+        if let loom_daemon::write_scope::Verdict::Deny(why) =
+            loom_daemon::write_scope::may_write_from(&cwd, repo.as_deref())
+        {
+            eprintln!("loom-daemon forge: refusing the write (#9548): {why}");
+            std::process::exit(1);
+        }
+    }
     let cmd = match action {
         ForgeAction::Token {
             repo,
@@ -409,6 +436,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         } => return super::forge_identity_cmd::token(&repo, &access, force),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
+        ForgeAction::MayWrite { repo } => return super::forge_identity_cmd::may_write(repo),
         ForgeAction::TrustedComments {
             self_login,
             fetch,
@@ -470,4 +498,75 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         },
     };
     dispatch(cmd)
+}
+
+/// `gh issue` / `gh pr` operations that change the forge.
+const WRITE_OPS: &[&str] = &[
+    "comment", "edit", "close", "reopen", "create", "delete", "lock", "unlock", "pin", "unpin",
+    "transfer", "merge", "ready", "review", "develop",
+];
+
+/// `Some(repo)` when `action` writes (`repo` is its `--repo`/`-R`, if any).
+fn write_target(action: &ForgeAction) -> Option<Option<String>> {
+    match action {
+        ForgeAction::Issue { args } | ForgeAction::Pr { args } => {
+            let op = args.iter().find(|a| !a.starts_with('-'))?;
+            WRITE_OPS.contains(&op.as_str()).then(|| repo_flag(args))
+        }
+        ForgeAction::AutoMerge { .. } | ForgeAction::DisableAutoMerge { .. } => Some(None),
+        _ => None,
+    }
+}
+
+/// The value of `--repo X`, `--repo=X`, `-R X` or `-RX` in passthrough args.
+fn repo_flag(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--repo" || a == "-R" {
+            return it.next().cloned();
+        }
+        if let Some(v) = a.strip_prefix("--repo=").or_else(|| a.strip_prefix("-R")) {
+            if !v.is_empty() {
+                return Some(v.trim_start_matches('=').to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod write_target_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn passthrough_writes_are_vetted_and_reads_are_not() {
+        let comment = ForgeAction::Issue {
+            args: args(&["comment", "7", "--body", "x", "-R", "acme/w"]),
+        };
+        assert_eq!(write_target(&comment), Some(Some("acme/w".into())));
+        let merge = ForgeAction::Pr {
+            args: args(&["merge", "7", "--repo=acme/w"]),
+        };
+        assert_eq!(write_target(&merge), Some(Some("acme/w".into())));
+        let edit = ForgeAction::Pr {
+            args: args(&["edit", "7", "--add-label", "x"]),
+        };
+        assert_eq!(write_target(&edit), Some(None), "no --repo: vet gh's own target");
+        for read in [&["view", "7"][..], &["list", "--label", "x"], &["status"]] {
+            let a = ForgeAction::Issue { args: args(read) };
+            assert_eq!(write_target(&a), None, "{read:?} is a read");
+        }
+        let disarm = ForgeAction::DisableAutoMerge {
+            pr_number: 7,
+            audit_comment: true,
+            hold: None,
+        };
+        assert_eq!(write_target(&disarm), Some(None));
+        assert_eq!(write_target(&ForgeAction::IsFleet { login: "x".into() }), None);
+    }
 }
