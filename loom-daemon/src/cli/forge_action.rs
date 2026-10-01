@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 use clap::Subcommand;
+use std::path::PathBuf;
 
 /// Sub-actions for `loom-daemon forge`.
 ///
@@ -408,6 +409,38 @@ pub(crate) enum ForgeAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// `forge comment <number> (--body TEXT | --body-file PATH)
+    /// [--repo OWNER/REPO] [--pr]` — the #9772 comment chokepoint as a verb:
+    /// appends the dashboard link (`loom:dashboard-link`, #9772) and POSTs to
+    /// `repos/<owner>/<repo>/issues/<number>/comments`. A PR IS an issue for
+    /// comments; `--pr` only picks `/pull/N` over `/issues/N` in the link.
+    /// `--repo` defaults to the current checkout's `origin` remote. GitHub
+    /// only, like every daemon comment path (`gh` REST).
+    #[command(name = "comment")]
+    Comment {
+        /// Issue or PR number to comment on.
+        #[arg(value_name = "NUMBER")]
+        number: u64,
+
+        /// Target `owner/repo`; omitted resolves from the origin remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+
+        /// Comment body as literal text.
+        #[arg(long, value_name = "TEXT")]
+        body: Option<String>,
+
+        /// Read the body from PATH ("-" = stdin). Mutually exclusive with
+        /// `--body` (`--body @path` does NOT expand — see the
+        /// comment-body-literal-path rule).
+        #[arg(long, value_name = "PATH")]
+        body_file: Option<PathBuf>,
+
+        /// The number names a pull request (link says `/pull/N`).
+        #[arg(long)]
+        pr: bool,
+    },
 }
 
 /// Handle `loom-daemon forge <issue|pr|auth|auto-merge>` (epic #4081 Phase 3,
@@ -437,6 +470,23 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
         ForgeAction::MayWrite { repo } => return super::forge_identity_cmd::may_write(repo),
+        ForgeAction::Comment {
+            number,
+            repo,
+            body,
+            body_file,
+            pr,
+        } => {
+            return loom_daemon::forge_comment::cli_entrypoint(
+                loom_daemon::forge_comment::CommentArgs {
+                    number,
+                    repo,
+                    body,
+                    body_file,
+                    is_pr: pr,
+                },
+            );
+        }
         ForgeAction::TrustedComments {
             self_login,
             fetch,
@@ -514,6 +564,10 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
             WRITE_OPS.contains(&op.as_str()).then(|| repo_flag(args))
         }
         ForgeAction::AutoMerge { .. } | ForgeAction::DisableAutoMerge { .. } => Some(None),
+        // #9772: `forge comment` posts, so it is vetted like the other
+        // write verbs — its `--repo` is exactly the `Option<String>` shape
+        // `may_write_from` wants.
+        ForgeAction::Comment { repo, .. } => Some(repo.clone()),
         _ => None,
     }
 }

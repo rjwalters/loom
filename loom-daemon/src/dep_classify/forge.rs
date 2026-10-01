@@ -214,8 +214,11 @@ impl super::apply::Writer for GhWriter<'_> {
 
     fn post_comment(&mut self, body: &str) -> crate::cmd_out::CmdOutcome {
         let n = self.issue.to_string();
+        // #9772: every daemon comment carries the dashboard footer.
+        let body =
+            crate::forge_comment::append_dashboard_footer(self.repo, self.issue, false, body);
         run_gh(
-            &["issue", "comment", &n, "--repo", self.repo, "--body", body],
+            &["issue", "comment", &n, "--repo", self.repo, "--body", &body],
             self.repo_root,
             false,
         )
