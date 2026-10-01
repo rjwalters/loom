@@ -248,6 +248,27 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
 /// Re-export for CLI convenience.
 pub type FeatureMap = BTreeMap<String, f64>;
 
+/// A capture tick's JSONL output path: `<out_dir>/<tick_id>.jsonl` with the
+/// id-stamped records, one per line.
+pub fn write_tick_records(
+    out_dir: &std::path::Path,
+    tick_id: &str,
+    records: &mut [CaptureRecord],
+) -> anyhow::Result<std::path::PathBuf> {
+    for r in records.iter_mut() {
+        r.id = capture_id(r)?;
+    }
+    std::fs::create_dir_all(out_dir)?;
+    let path = out_dir.join(format!("{tick_id}.jsonl"));
+    let mut body = String::new();
+    for r in records.iter() {
+        body.push_str(&serde_json::to_string(r)?);
+        body.push('\n');
+    }
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
