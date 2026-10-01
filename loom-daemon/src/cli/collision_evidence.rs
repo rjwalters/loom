@@ -63,6 +63,14 @@ pub(crate) enum CollisionEvidenceCommand {
     },
 }
 
+/// OTLP push configuration for the Publish verb, grouped so the verb
+/// runner stays under the clippy argument limit (#9919 CI).
+struct OtlpPushConfig {
+    push: bool,
+    endpoint: Option<String>,
+    key_file: Option<PathBuf>,
+}
+
 impl CollisionEvidenceCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
@@ -91,9 +99,11 @@ impl CollisionEvidenceCommand {
                     &out_dir,
                     &scorer_version,
                     otlp_bodies,
-                    push,
-                    otlp_endpoint.as_deref(),
-                    otlp_key_file.as_deref(),
+                    OtlpPushConfig {
+                        push,
+                        endpoint: otlp_endpoint,
+                        key_file: otlp_key_file,
+                    },
                 )
             }
         }
@@ -106,9 +116,7 @@ fn run_publish(
     out_dir: &Path,
     scorer_version: &str,
     otlp_bodies: bool,
-    push: bool,
-    otlp_endpoint: Option<&str>,
-    otlp_key_file: Option<&Path>,
+    otlp_push: OtlpPushConfig,
 ) -> Result<()> {
     let manifest_raw = std::fs::read_to_string(manifest_path)?;
     let manifest: serde_json::Value = serde_json::from_str(&manifest_raw)?;
@@ -325,11 +333,14 @@ fn run_publish(
             log_records.len(),
             skipped
         );
-        if push {
+        if otlp_push.push {
             // Unwrap-safe by the run() validation: push ⇒ otlp_bodies and
             // endpoint present.
-            let endpoint = otlp_endpoint.expect("validated: push ⇒ endpoint");
-            let bearer_key = match otlp_key_file {
+            let endpoint = otlp_push
+                .endpoint
+                .as_deref()
+                .expect("validated: push ⇒ endpoint");
+            let bearer_key = match &otlp_push.key_file {
                 Some(path) => {
                     let raw = std::fs::read_to_string(path)
                         .with_context(|| format!("reading ingest key {}", path.display()))?;
