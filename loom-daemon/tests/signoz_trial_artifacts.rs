@@ -903,6 +903,47 @@ fn usage_queries_documented_invocation_binds_exactly_the_parameters_used() {
     );
 }
 
+/// The same coupling for `eta-queries.sql` (#9289, executed against the pinned
+/// engine by `signoz_eta_queries.rs` in #8528). Its sections are `0` plus
+/// `Q1`-`Q3`, so the citation is matched on those tokens rather than on bare
+/// digits — and section 0 is cited here, unlike `usage-queries.sql`'s, because
+/// the ETA preflight is the thing that says whether Q1-Q3 rest on anything and
+/// a reader must be sent to it from the table itself.
+#[test]
+fn every_eta_query_section_is_cited_by_a_readme_saved_view() {
+    let citation = Regex::new(r"`eta-queries\.sql`([^)]*)\)").unwrap();
+    let cited: Vec<String> = SIGNOZ_README
+        .lines()
+        .filter(|line| line.starts_with("| "))
+        .flat_map(|line| {
+            citation
+                .captures_iter(line)
+                .map(|capture| capture.get(1).unwrap().as_str().to_string())
+                .collect::<Vec<String>>()
+        })
+        .collect();
+    assert!(
+        !cited.is_empty(),
+        "the SigNoz README's Saved views table cites no `eta-queries.sql` section at all"
+    );
+    let all = cited.join(" ");
+    for section in ["0", "Q1", "Q2", "Q3"] {
+        assert!(
+            Regex::new(&format!(r"(?m)^-- {}\. ", regex::escape(section)))
+                .unwrap()
+                .is_match(ETA_QUERIES),
+            "eta-queries.sql is missing section {section}"
+        );
+        assert!(
+            Regex::new(&format!(r"\b{}\b", regex::escape(section)))
+                .unwrap()
+                .is_match(&all),
+            "the SigNoz README's Saved views table has no row citing `eta-queries.sql` \
+             {section}; its citations are {cited:?}"
+        );
+    }
+}
+
 /// Sections 1-6 are the reproducible views; section 0 is the arrival preflight
 /// the subsection prose describes rather than a saved view of its own.
 #[test]

@@ -398,6 +398,66 @@ the type it names, so a subscript into `attributes_number` there would silently
 return 0 on every row instead of erroring. Policy and pipeline:
 [CI observability](../../docs/ci-observability.md).
 
+### ETA accuracy queries
+
+`eta-queries.sql` (#9289) scores the ETA heuristics against what actually
+happened, from the `eta.estimate` / `eta.outcome` **log** records. Section 0 is
+the preflight; Q1 is MAE / 25–75 coverage / bias; Q2 is the mean pinball loss
+that decides a promotion; Q3 ranks the recorded features by how well each
+tracks the error. The model is [`eta.md`](../../docs/eta.md). Bind both
+parameters:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery --param_since='2026-09-01 00:00:00' --param_repo='' < eta-queries.sql
+```
+
+`loom-daemon/tests/signoz_eta_queries.rs` executes the committed file verbatim
+against the same pinned ClickHouse (25.12.5) the telemetry store runs, and runs
+the mutation of the committed SQL that breaks each claim below as a
+counterfactual rather than describing it. **Read section 0 first**, then these
+five, in this order:
+
+- **Absent is never zero.** An `abandoned` outcome (the issue closed as not
+  planned) and a refusal carry no `loom.eta.error_sec` key at all. Dropping the
+  `mapContains` presence filter does not error — `attributes_number` answers the
+  Float64 default — it scores the abandonment as a *flawless* prediction, which
+  **lowers** the MAE. Measured: 1048 → 1000 on the test fixture. A promotion
+  metric that improves when data goes missing is the worst shape of silent
+  defect, which is why section 0 reports `outcomes` and `scored` separately and
+  they must reconcile to `abandoned`.
+- **`refusals` is a subset of `estimates`**, not a disjoint population — a
+  refusal still carries `loom.eta.trigger`. Adding the two columns double-counts.
+- **Q2's subtotals need `rolled_up`.** `ROLLUP` blanks an aggregated column to
+  the type's default, `''` for these Strings — exactly what
+  `attributes_string['loom.eta.heuristic']` answers for a record that lacks the
+  key. The query therefore can and does emit **two rows with the identical key
+  `('', '', '')`**: the grand total (`rolled_up` = 3) and an unlabelled
+  heuristic's own total (`rolled_up` = 2). Without the column they are one
+  unreadable pair.
+- **Q3: an unvarying feature is not scored as uncorrelated.** `rankCorr`
+  average-ranks ties, so a feature that took one value across the window comes
+  out at exactly **`rank_corr` = 0.5** — above any genuine correlation weaker
+  than that, under this section's own `ORDER BY abs(rank_corr) DESC` — while
+  `pearson_corr` reads NaN. `distinct_values` = 1 is the tell. Do not read a
+  0.5 without it. The NaN's **spelling** is architecture-dependent (`nan` on
+  arm64, `-nan` on amd64 Linux), so never string-match it.
+- **Q3 cannot see an estimate older than the window.** Its estimate sub-select
+  carries the same `since` bound as the outcome one, so an outcome whose
+  estimate predates `since` is scored by Q1/Q2 and contributes no features here.
+  Widen `since` past the longest lead time you care about.
+
+`HAVING n >= 20` means a short window makes Q3 return **nothing**, which reads
+like "no feature tracks the error" rather than "not enough data" — check section
+0's counts before concluding either. `eta_artifacts.rs` additionally fails in
+ordinary CI if any attribute drifts from what the ETA mapping emits and the
+gateway forwards, or if either disambiguating column is dropped.
+
+Executed against the pinned ClickHouse with a synthetic fixture, and executed
+verbatim against the **live trial deployment** (ClickHouse 25.12.5.44,
+2026-10-01) where it returned all four sections' documented columns over zero
+rows — no ETA record has been ingested there yet. Not yet run over real canary
+data.
+
 ### Saved views
 
 | Saved view | Procedure |
@@ -428,6 +488,8 @@ return 0 on every row instead of erroring. Policy and pipeline:
 | CI slowest suites | Trace Explorer: filter `name = 'loom.ci.suite'`, group by `loom.ci.job`, `loom.ci.suite` with **Sum** (and a second query with **P90**), time range 7 days, sorted descending. Add `loom.ci.suite.outcome` / `loom.ci.suite.retried` as filters to separate "slow because it runs twice" from "slow". A suite that did not run in a leg has no span at all, so it never appears here as a fast suite (`ci-queries.sql` 12) |
 | CI suite rebalance | Same filter grouped by `loom.ci.run_id`, `loom.ci.shard.index` with **Sum** — one bar per leg of a run, which is the per-leg suite time a `LOOM_CI_SHARD` split should equalize. `argMax(suite, duration)` per leg (the named suite to move) is SQL-only (`ci-queries.sql` 13). Expect the summed suite time to be **less** than the leg's job wall time (checkout and toolchain setup are steps, not suites) and **more** than the wall time of the step that ran them (suites run concurrently); the comparison that matters is between legs of the same run |
 | CI critical path | Logs Explorer: filter `body = 'ci.job' AND loom.ci.run_id = <id>`, add columns `loom.ci.job`, `loom.ci.dependency_wait_ms`, `loom.ci.queued_ms`, `loom.ci.duration_ms`, and sort by `loom.ci.duration_ms` descending — the leg with the largest dependency + queue + running sum is the run's critical path, and the three columns say which of the three set it. The `unexplained_s` residual (run wall time minus the run's own queue and that leg's total) requires a run↔job join and is SQL-only (`ci-queries.sql` 14) |
+| ETA accuracy | Logs Explorer: filter `body = 'eta.outcome' AND loom.eta.error_sec EXISTS`, add columns `loom.eta.heuristic`, `loom.eta.revision`, `loom.eta.kind`, `loom.eta.horizon_bucket`, `loom.eta.error_sec`, `loom.eta.covered`; group by `loom.eta.heuristic`, `loom.eta.revision` — **both**, never heuristic alone, or a daemon roll mid-window averages two builds into one number. The `EXISTS` clause is not optional: an abandoned sweep has no error field, and without it the panel scores the abandonment as a perfect prediction. Coverage, bias and the pinball loss that decides a promotion need `avg()`/`median()` over these and stay SQL-only (`eta-queries.sql` 0, Q1, Q2) |
+| ETA feature ranking | SQL-only (`eta-queries.sql` Q3): it expands the estimate's explanation body with `JSONExtractKeysAndValuesRaw` and correlates each numeric feature with the error, neither of which is an Explorer operation. Read `distinct_values` beside `rank_corr` — a feature that never varied scores 0.5, not 0 — and `n` beside both: the section's `HAVING n >= 20` makes a short window return nothing at all |
 | CI dependency wait | Logs Explorer: filter `body = 'ci.job' AND loom.ci.dependency_wait_ms EXISTS`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.dependency_wait_ms`, `loom.ci.queued_ms`; group by `loom.ci.job` with **P50**/**P90**, time range 7 days. **Alert when a family's p90 dependency wait exceeds its own p90 queue wait**: it is gated by `needs:`, not capacity-starved, and more runners will not move it. An ungated job measures ~0 by construction — treat sub-2s values as job-creation lag, not a serialized edge (`ci-queries.sql` 15) |
 
 `ci-queries.sql` 7) (#9007's per-issue Builder/CI/Judge/merge breakdown) and 8)
@@ -447,6 +509,13 @@ acceptance surface until someone with the trial org's login creates the saved
 views and records it. The seven #9089 rows are additionally **unexecuted**:
 sections 9–15 read attributes and spans that work introduces, so no run
 predating it can have produced a row for them.
+
+The two **ETA** rows are in the same category and for the same reason: written,
+not created in the trial org, and additionally unexecuted over real data — no
+`eta.estimate` or `eta.outcome` record has reached the trial deployment (a
+verbatim run of `eta-queries.sql` against it on 2026-10-01 returned every
+documented column over zero rows). The verified form is
+`loom-daemon/tests/signoz_eta_queries.rs` against the pinned engine.
 
 Save these searches/dashboards through the installed UI and retain sanitized
 exports where supported. These precise steps avoid asserting that mutable

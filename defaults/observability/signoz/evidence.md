@@ -1412,6 +1412,120 @@ The live fire-and-resolve check on the trial deployment is
 [#9006](https://github.com/rjwalters/loom/issues/9006); the real-canary gap is
 [#8525](https://github.com/rjwalters/loom/issues/8525).
 
+## The ETA accuracy queries executed against the pinned engine (2026-10-01)
+
+`eta-queries.sql` (#9289) was the last query artifact in this trial with no
+execution proof of any kind. Its static guards are good ones —
+`eta_artifacts.rs` ties every attribute it reads to one
+`observability/otlp/mapping/eta.rs` emits and the gateway's `keep_keys`
+forwards, which is what stops a view going quietly empty after a rename — but a
+name check cannot see an answer. The file is also this trial's only artifact
+that decides something: Q2's mean pinball loss is the number an ETA heuristic
+is **promoted** on, and `eta.md`'s promotion gate reads it.
+
+`loom-daemon/tests/signoz_eta_queries.rs` closes that with the technique of the
+four proofs above: `clickhouse local` in the pinned
+`clickhouse/clickhouse-server:25.12.5` image, the committed file run verbatim,
+every assertion's breaking mutation of the committed SQL executed as a
+counterfactual rather than described. Two things make it differ from them.
+
+**The fixture's DDL was read off the live deployment, not invented.** This is
+the trial's first proof to need `attributes_bool` — the ETA mapping has four
+`kv_bool` sites (`loom.eta.primary`, `loom.eta.covered`,
+`loom.eta.provenance_complete`, `loom.eta.outcome_provenance_complete`) — so
+`SHOW CREATE TABLE signoz_logs.distributed_logs_v2` was run against the running
+trial ClickHouse (25.12.5.44) and the column reproduced from it:
+`Map(LowCardinality(String), Bool)`. That type's behaviour for a **missing** key
+is load-bearing, and the fixture's `c-2` exists to exercise it.
+
+**The committed file was also executed against the live deployment.** Verbatim,
+through `clickhouse-client --multiquery --param_since='2026-09-01 00:00:00'
+--param_repo=''` inside `loom-signoz-telemetrystore-clickhouse-0-0`, exit 0, all
+four sections parsing and returning their documented column sets over **zero
+rows** — the trial store holds 46 log records and none of them is an ETA record.
+That is a weaker claim than the engine proof and a different one: it says the
+SQL is compatible with SigNoz's *real* schema (the `Distributed` table over
+`logs_v2`, with its JSON `body_v2`/`resource` columns and `_retention_days`
+defaults), not merely with a hand-written read surface. Every earlier proof in
+this file could only claim the latter.
+
+### Three claims the engine refuted
+
+Each was a statement in the committed artifact or a reasonable reading of it.
+All three were corrected in the same change.
+
+| Claim as written | What the engine does | Correction |
+| --- | --- | --- |
+| Q3 ranks numeric features; a non-numeric one is skipped, so nothing spurious enters | A feature that **never varied** scores `rank_corr` = **exactly 0.5** — `rankCorr` average-ranks ties — which the file's own `ORDER BY abs(rank_corr) DESC` puts above every genuine correlation weaker than 0.5. `corr` answers `nan` for the same column | Q3 now reports `uniqExact(value) AS distinct_values`; `distinct_values` = 1 is the tell. Header and `eta.md` say so |
+| "the typed `JSONExtractKeysAndValues(body, 'features', 'Float64')` would \[read nulls as 0] — an unmeasured feature must never correlate as a zero" | It does **not** zero a null. Measured: it *drops* `null` and `"refactor"` outright, and **coerces** `"42"` to 42 and `true` to 1 | The raw + `toFloat64OrNull` form is still right; the reason was wrong. The header now states the real damage — two non-numeric features entering the ranking as constants, each at the same spurious 0.5 |
+| Q2's `ROLLUP` subtotals are readable as subtotals | `ROLLUP` blanks an aggregated column to the type's default, `''` — exactly what `attributes_string['loom.eta.heuristic']` answers for a record missing the key. On the fixture Q2 emitted **two rows with the identical key `('', '', '')`**: the grand total (31 observations) and an unlabelled heuristic's own total (1) | Q2 now reports `grouping(heuristic) + grouping(kind) + grouping(revision) AS rolled_up`: 0 is a real group, 3 the grand total, and the collision resolves to `rolled_up` 2 vs 3 |
+
+### The fixture, and what each part is for
+
+73 rows over 12 lettered groups
+(`loom-daemon/tests/fixtures/signoz_eta/fixture.sql`). Which map an attribute
+lands in follows the mapping's call sites, not convenience. The populations
+that carry the answers:
+
+| Group | Shape | Why it exists |
+| --- | --- | --- |
+| A, `a-0`…`a-20` | `land-v1` / revA / `land`, 21 scored pairs, p25/p50/p75 = 1000/2000/3000, errors −2000…+2000 step 200 | the honest baseline: MAE **1048**, coverage **0.524** (11 of 21), median and mean error **0** |
+| E | `a-0`'s outcome and `a-1`'s estimate delivered **twice**, byte-identical | delivery is at least once; `LIMIT 1 BY estimate_id` and `any(body) GROUP BY estimate_id` must absorb both |
+| B, `b-0`…`b-4` | revB, five identical **+5000** errors, none covered | a regressed build, so "grouped by revision" has something to separate |
+| J | revB, one second **before** the bound, error 999999 | a leaking lower bound would show as a sixth revB row |
+| K | `boundary-v0`, outcome at **exactly** the bound, estimate an hour before it | the bound is closed below — and Q3's estimate sub-select carries the same bound, so this row is scored by Q1/Q2 and invisible to Q3 |
+| H | `stage-v2`, error **0** | a *measured* zero, which must produce a row reading 0 |
+| D | an `abandoned` outcome with **no** `loom.eta.error_sec` key, plus a refusal | *absent*, which must produce no row at all |
+| C | the three incomplete-provenance shapes: both builds unpinned; the observing build unpinned; the flag **missing from the map entirely** | `= true` must reject all three and section 0's `!= true` count all three |
+| I | `loom.eta.heuristic` absent from both rows | the shape the data takes if the gateway stops forwarding the key — and the half of the ROLLUP collision that is a real group |
+
+### Observed, with the mutation that breaks each one run
+
+| Property | Observation | Mutation that breaks it |
+| --- | --- | --- |
+| Section 0 reconciles counted against scored | 24 outcomes, 23 scored, 1 abandoned — exactly | — (this is what makes section 0 worth reading first) |
+| **Absent is never zero** | the abandonment produces no Q1 row | removing `mapContains(attributes_number, 'loom.eta.error_sec')` scores it as a *flawless* prediction: 21 → 22 observations and MAE **1048 → 1000**. The promotion metric **improves** because data went missing — and the same row's absent `covered` flag reads `false`, dragging coverage 0.524 → 0.5, so one missing record moves two metrics in opposite directions |
+| …and a measured zero still reports | `stage-v2` yields a row reading `mae_sec` 0 | — (its pair is the row above; neither is inferable from the other) |
+| `refusals` ⊂ `estimates` | the refusal is counted in both columns of its group | — (adding the two columns double-counts it; recorded so a reader does not) |
+| Accuracy is grouped by build | revA MAE 1048, revB MAE 5000, reported separately | dropping `revision` from Q1's grouping answers **1808** over 26 pooled observations — neither build's figure is recoverable from it, nothing in the row says two builds are in it, and the unbiased build acquires a **+962 s** fast bias it does not have |
+| Delivery is at least once | 21 observations from 22 delivered rows | removing `LIMIT 1 BY estimate_id` moves MAE to **1091**, the median from 0 to **−100** and the bias to **−91**: one duplicate makes an unbiased heuristic look slow |
+| The `since` bound is closed below | the outcome at exactly `since` is scored (`boundary-v0`, MAE 700) | `>=` → `>` makes the whole population **vanish** — not a changed number, a missing row — while nothing else moves |
+| Unpinned builds are excluded, not flagged | no `revision = 'unknown'` row in Q1, and no `finish` row at all | removing the two `provenance_complete` filters gives a revision literally named `unknown` an accuracy figure (MAE 4242) and attributes `c-1`/`c-2` to revA, which did not necessarily produce them (MAE 4394) |
+| A missing `Bool` key is rejected by `= true` | `c-2`, whose outcome omits `loom.eta.provenance_complete`, is excluded from Q1/Q2/Q3 and counted by section 0 | — (the `Map(…, Bool)` default is `false`; this is why `!= true` and `= true` are both correct as written) |
+| `{repo}` scopes every section, not just Q1 | `org/alpha` drops the other repo from Q1 (7 → 6 rows) **and** from Q2's inner sub-select (22 → 21 observations, pinball 1280 → 1310) | — |
+| Q2's subtotals are attributable | `rolled_up` 2 (1 observation) vs 3 (31) on otherwise identical keys | removing the column leaves two indistinguishable rows |
+| Q3's nulls are dropped, not zeroed | `unmeasured`, `label`, `numeric_string` and `flaky` are absent from the ranking entirely | the typed extraction admits `numeric_string` and `flaky` at n=21 and `rank_corr` 0.5 each |
+| An unvarying feature is visible as one | `open_prs`: n 21, `distinct_values` **1**, `rank_corr` **0.5**, `pearson_corr` **NaN** | — (observed behaviour, not a desired one; the column exists so it is attributable) |
+| The sample floor holds | three features ranked; `partial` (n=12, `rank_corr` 1.0) excluded | removing `HAVING n >= 20` surfaces a perfect correlation on 12 observations, revB's five-sample features, and `nan` rows from one-observation groups |
+
+Three caveats a reader should carry out of this. `HAVING n >= 20` means a short
+window returns **nothing** from Q3, which reads like "no feature tracks the
+error" rather than "not enough data" — section 0's counts are the check.
+`{since:DateTime}` is interpreted in the **server's** timezone; the trial's
+ClickHouse reports `timezone()` = `UTC`, so the bound means what it says there,
+but that is a property of the deployment, not of the query.
+
+And the **NaN's spelling is architecture-dependent**, which the first CI run of
+this test found rather than its author: ClickHouse 25.12.5 renders the
+zero-variance `corr` as `nan` on arm64 macOS (this trial host) and as `-nan` on
+amd64 Linux (a GitHub runner) — the sign bit the libc `printf` carries out of
+the hardware's quiet NaN, not a different result. Both of the architectures
+[#8696](https://github.com/rjwalters/loom/issues/8696) verified this trial on
+are therefore affected, and so is any consumer that **string-matches** the
+column: a dashboard cell, a CSV export, a downstream parser. The test asserts
+NaN-*ness* rather than either spelling; a literal-string assertion would have
+passed on one architecture and failed on the other.
+
+**What this establishes and what it does not.** The committed file computes the
+documented answers on the engine version the trial deploys, the
+absent-versus-zero distinctions this epic cares about survive the engine rather
+than only the author's intent, and the file parses and runs against SigNoz's
+real schema on the live trial deployment. **No ETA record has been ingested
+there**: nothing went through SigNoz's own ingester or its log migrator, and the
+live run's zero rows are an empty-input result, not a scored one. That remaining
+gap is the same one [#8525](https://github.com/rjwalters/loom/issues/8525) owns
+for every other artifact in this trial.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -1440,6 +1554,7 @@ The live fire-and-resolve check on the trial deployment is
 | Cycle-time analytics parity with ClickStack (`cycle-time-extract.sql`, #8665) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_cycle_time.rs` executes the extraction, the shared rollup and all eight CT queries verbatim over the SAME seven-envelope fixture as the ClickStack proof, and every CT1–CT8 answer matches exactly (see "Cycle-time analytics executed against the pinned engine" above); the `attributes_number`/`attributes_string` fallback and true-absence behavior are also proven. No run through SigNoz's own ingester on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
 | Host/token gauge queries (`queue-dwell.sql` #8856, `quota-utilization.sql` #9005, scope item 4) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_queue_quota_queries.rs` executes both committed files verbatim on ClickHouse 25.12.5 — the first proof in this trial to read `signoz_metrics.samples_v4` / `time_series_v4` at all — and observes the duplicate-hour-row `max()`/`sum()` split (with the naive join run as a counterfactual), measured-zero-is-not-starvation, NULL-not-zero for a missing companion metric and for an absent utilization source, the over-100% headroom clamp, `coverage = 'unknown'` for an exhausted-only provider, and query 5's span reads including the pre-#9673 cause-less-row fallback (see "The gauge queries executed against the pinned engine"). Every assertion was confirmed to break under a mutation of the committed SQL. No metric point went through SigNoz's own ingester or metric migrator — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
 | Queue-starvation alert rule (`alerts/queue-starvation.json` #8856, scope items 4 and 5) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_queue_starvation_alert.rs` substitutes SigNoz's `{{.start_timestamp_ms}}` / `{{.end_timestamp_ms}}` the way the rule evaluator does, runs the embedded query verbatim on ClickHouse 25.12.5, and applies the committed `op`/`matchType`/`target` to the engine's own output: a host starved for all 15 minutes fires, a host reporting a measured zero does not, and a host that starves and clears alternately does not either (see "The alert rule's threshold executed against the pinned engine"). The half-open window, the `max()` hour-row absorption, the `state = 'ready'` filter and the `GROUP BY ts, host` host label each have their breaking mutation of the committed JSON run, not described. **No rule evaluator ran and no notification was delivered** — the live fire-and-resolve check is [#9006](https://github.com/rjwalters/loom/issues/9006) |
+| ETA accuracy queries (`eta-queries.sql` #9289, scope items 4 and 5) | **Passed against the pinned ClickHouse and parsed against the live trial; open against live DATA.** `signoz_eta_queries.rs` runs the committed file verbatim on ClickHouse 25.12.5 over a fixture whose `distributed_logs_v2` DDL — including the `attributes_bool Map(…, Bool)` column no earlier proof in this trial needed — was read off the running deployment. Observed: the absent-vs-measured-zero pair (an abandonment produces no row; a zero error produces a row reading 0), the closed `since` bound, the per-revision grouping, at-least-once dedupe, the missing-`Bool`-key rejection, and `{repo}` reaching Q2's inner sub-select. Every assertion's breaking mutation of the committed SQL was run, not described. **Three claims the engine refuted** were corrected in the same change: a constant feature scores `rankCorr` 0.5 rather than 0 or NaN (Q3 now reports `distinct_values`); the typed JSON extraction coerces `"42"`/`true` rather than zeroing nulls (header corrected); and `ROLLUP` emitted **two rows with the identical key `('', '', '')`** (Q2 now reports `rolled_up`). The file was additionally executed verbatim against the live trial ClickHouse (25.12.5.44) — exit 0, all four sections' documented columns, **zero rows**: no `eta.estimate`/`eta.outcome` record has reached the deployment. Nothing went through SigNoz's own ingester — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525). See "The ETA accuracy queries executed against the pinned engine" |
 | UI view matrix for Loom's non-HTTP span kinds | **Answered for Service List/APM and Exceptions, via authenticated backend API probes rather than a browser** (see "UI view matrix" above) — Service List/APM populates (`loom-daemon`, correct call/error counts) because RED metrics come from unconditional root-span aggregation, not an HTTP convention; Exceptions stays empty because Loom never emits an OTel `exception` span event. Service Map returned empty and, since 2026-09-30, **is attributable** — see "Resolving the Service Map confound": every Loom span is `SPAN_KIND_INTERNAL` and every resource carries the one `service.name`, both at single unconditional exporter sites and both measured on the real wire payload, so none of the three preconditions for a topology edge can be met; the gateway's allowlist strips every peer key as a second layer. Adding a connector or a multi-service fixture cannot change the answer for Loom's data. Enforced by `signoz_topology_shape.rs` in ordinary CI. No screenshot has been captured on any session |
 
 Synthetic fixture success establishes transport/schema/query behavior, not a
