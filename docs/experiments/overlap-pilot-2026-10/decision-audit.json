@@ -1,0 +1,87 @@
+{
+  "audit_version": 1,
+  "date": "2026-10-01",
+  "source_commit": "e6d5fe545bca1fa8979958aae533ea748ca33d58",
+  "disposition": "exploratory_only_not_valid_for_enforcement_thresholds",
+  "full_cohort": {
+    "pairs": 121,
+    "issues": 242,
+    "saved_path_classifier_counts": {
+      "substantive": 67,
+      "mechanical-hub": 2,
+      "clean": 52
+    },
+    "raw_conflict_pairs": 69,
+    "conflict_pairs_with_no_shared_own_changed_files": 54,
+    "source_author_and_committer_dates_after_cutoff": 116,
+    "unresolvable_source_commits": 0,
+    "issues_with_last_edit_after_cutoff_before_manifest_creation": 142,
+    "pairs_containing_these_edited_issues": 98,
+    "manifest_created_at": "2026-10-01T07:43:14.553839+00:00"
+  },
+  "retrieval_subsample": {
+    "pairs": 24,
+    "issues": 48,
+    "selection": "outcome_enriched_not_representative",
+    "pairs_with_shared_own_changed_files": 22,
+    "saved_path_classifier_counts": {
+      "substantive": 13,
+      "mechanical-hub": 2,
+      "clean": 9
+    },
+    "source_dates_after_cutoff": 24,
+    "pairs_with_final_pr_head_ancestor_of_indexed_revision": 11,
+    "pr_sides_where_forced_base_is_not_ancestor_of_head": 16,
+    "issues_with_preexisting_postcutoff_edits": 29,
+    "pairs_with_preexisting_postcutoff_edits": 21,
+    "pairs_with_nonempty_hub_weights": 0,
+    "pairs_with_nonnull_edit_edit_score": 1,
+    "interval_recall_over_one": [
+      {"issue": 8796, "value": 1.3364485981308412},
+      {"issue": 8895, "value": 1.0289855072463767},
+      {"issue": 8827, "value": 1.011111111111111}
+    ]
+  },
+  "rule_count_scope": {
+    "sample": "24 outcome-enriched retrieval pairs",
+    "positive_label": "saved path classifier equals substantive",
+    "positive_label_limitation": "non-hub-path forced-base replay; not verified semantic or pair-caused conflict",
+    "thresholds": "explored on this same sample; not an untouched policy holdout",
+    "wilson_interval_limitation": "nominal binomial intervals do not adjust for selection, multiple comparisons, or episode dependence"
+  },
+  "rules": [
+    {"rule": "J > 0", "tp": 8, "fp": 2, "fn": 5, "tn": 9},
+    {"rule": "J >= 0.01", "tp": 8, "fp": 2, "fn": 5, "tn": 9},
+    {"rule": "J >= 0.1", "tp": 4, "fp": 1, "fn": 9, "tn": 10},
+    {"rule": "skew >= 40", "tp": 9, "fp": 5, "fn": 4, "tn": 6},
+    {
+      "rule": "J >= 0.1 OR skew >= 40",
+      "tp": 13, "fp": 5, "fn": 0, "tn": 6,
+      "precision_wilson_95": [0.4913, 0.8750],
+      "recall_wilson_95": [0.7719, 1.0000],
+      "false_positive_pairs": [
+        "q-9321-9410", "q-8992-8923", "q-9588-9605",
+        "q-9028-9014", "q-8824-8827"
+      ]
+    },
+    {"rule": "J >= 0.01 AND skew >= 25", "tp": 5, "fp": 1, "fn": 8, "tn": 10}
+  ],
+  "ancestry_leak_example": {
+    "pair": "q-9517-8884",
+    "pr": 8893,
+    "final_head": "caf052f2dd14463fd5c214df53689552488f1402",
+    "indexed_revision": "65634118b23e4db5f6171c13fdaf857badb39324",
+    "head_is_ancestor_of_indexed_revision": true
+  },
+  "issue_edit_example": {
+    "issue": 9585,
+    "cutoff": "2026-09-30T02:34:25Z",
+    "lastEditedAt": "2026-09-30T03:09:12Z",
+    "source": "GitHub GraphQL Issue.lastEditedAt; queried 2026-10-01"
+  },
+  "input_sha256": {
+    "v2-cohort/v2-pairs-classified.json": "54233141b4cec0fa7d34766bb93b4c2c66557312749c40137607e218c0faac3f",
+    "retrieval-arm-v2/per_pair.jsonl": "f1b225116a751a6f103c588037ad368f59b2baeeba8cd287b44937e1cc587371",
+    "retrieval-arm-v2/manifest-retrieval.json": "73a8083f6b709edb745a24e61d6e9e084775d3798a2e07066908ea803950c24c"
+  }
+}

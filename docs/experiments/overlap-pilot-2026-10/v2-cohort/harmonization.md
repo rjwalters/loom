@@ -1,5 +1,9 @@
 # Harmonization — threshold sweeps (v2 cohort, n=121)
 
+> **Superseded:** [DECISION.md](../DECISION.md) audits the historical-input
+> leakage, conflict attribution, and mixed outcome rows in this sweep.
+> These thresholds are hypotheses only; they do not authorize enforcement.
+
 ## Base-vintage skew → substantive conflict
 
 **Direction: HIGH skew predicts substantive conflict** (mechanical upstream drift).

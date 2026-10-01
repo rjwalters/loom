@@ -1,5 +1,12 @@
 # Harmonization — combined evidence, thresholds, and the recommended rule
 
+> **Superseded by [DECISION.md](DECISION.md).** The audit withdrew this
+> operating point: the source/input chronology and conflict attribution are
+> invalid for deployment tuning. The OR rule flags 18 pairs (13 positives,
+> 5 false positives), not 18 positive conflicts. “54/69 hub-only” was a
+> misinterpretation of “no shared own-changed file.” Retained as experiment
+> history; use the decision memo's corrections and validation plan.
+
 Cohorts: **v2** (121 pairs, all-outcome baseline arm) and the **retrieval
 subsample** (24 pairs enriched for collisions: all 13 substantive∩shared +
 9 other overlap events + 2 controls). Retrieval features scored on the

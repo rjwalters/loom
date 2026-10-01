@@ -1,5 +1,12 @@
 # Overlap pilot — first real run (2026-10-01)
 
+> **Decision and correction (2026-10-01):** read [DECISION.md](DECISION.md)
+> before using these results. The audit found historical-input leakage,
+> invalid conflict attribution and line metrics, outcome-selected evaluation,
+> and incorrect headline counts. The earlier deployment thresholds are
+> withdrawn. These artifacts are exploratory/debugging evidence; the current
+> recommendation is qualified measurement and prospective shadow evaluation.
+
 Baseline-only execution of the #9785 historical replay on real
 `rjwalters/loom` history: 12 leakage-controlled issue pairs, Curator-baseline
 predictions, actual PR outcomes from git at pinned SHAs, counterfactual
