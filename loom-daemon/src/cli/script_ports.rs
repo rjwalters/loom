@@ -581,6 +581,11 @@ pub(crate) enum MergePrCommand {
     /// `loom:operator` hold, 1 = could not produce fresh evidence.
     RedateChecks(super::merge_pr_redate::RedateChecksArgs),
 
+    /// Read-only report of which required checks and paths forced the #8508
+    /// re-dates (#9746), from the trailers on the re-date commits reachable
+    /// from `--ref` (default origin/main) within `--since` (default 24h).
+    RedateReport(super::merge_pr_redate_report::RedateReportArgs),
+
     /// The pre-merge `loom:pr` review-signal guard (#7419): refuse a merge
     /// whose current head does not carry `loom:pr`, unless
     /// `--allow-unapproved` asserts responsibility. Exit 0 = present or
@@ -671,6 +676,14 @@ pub(crate) enum MergePrCommand {
     /// with one `LOOM-CHECK-RUNS-STREAK <PROCEED|PENDING> <streak>` line —
     /// see `cli::merge_pr_check_runs_streak`.
     CheckRunsStreak(super::merge_pr_check_runs_streak::CheckRunsStreakArgs),
+
+    /// The per-poll READ of the check-runs rollup in the same wait loop
+    /// (#8191 slice): failing names, pending names and `total_count` out of
+    /// the `forge_get_check_runs` payload on stdin. Exit 0 with four
+    /// NUL-terminated fields ending `LOOM-CHECK-RUNS-ROLLUP`; exit 2 (nothing
+    /// on stdout) for a payload outside the forge contract, which the caller
+    /// treats as still pending — see `cli::merge_pr_check_runs_rollup`.
+    CheckRunsRollup(super::merge_pr_check_runs_rollup::CheckRunsRollupArgs),
 
     /// The OTHER classification in the same wait loop (#8191 slice): once a
     /// poll finds a FAILING check, whether it is a required status-check
@@ -806,6 +819,7 @@ impl MergePrCommand {
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
+            MergePrCommand::RedateReport(args) => args.run(),
             MergePrCommand::LoomPrGuard(args) => args.run(),
             MergePrCommand::HoldState(args) => args.run(),
             MergePrCommand::SequenceEval(args) => args.run(),
@@ -817,6 +831,7 @@ impl MergePrCommand {
             MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
             MergePrCommand::CheckRunsStreak(args) => args.run(),
+            MergePrCommand::CheckRunsRollup(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
             MergePrCommand::StackedChildren(args) => args.run(),
             MergePrCommand::WorktreePrimary(args) => args.run(),

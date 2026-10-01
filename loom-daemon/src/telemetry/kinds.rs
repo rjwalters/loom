@@ -161,6 +161,9 @@ pub struct TelemetryKindMeta {
 /// `eta.estimate` / `eta.outcome` (#9289).
 pub mod eta;
 
+/// `eta.snapshot` (#9329).
+pub mod eta_snapshot;
+
 // ============================================================================
 // THE REGISTRY
 // ============================================================================
@@ -295,6 +298,14 @@ macro_rules! telemetry_kind_table {
             /// One ETA estimate's scored outcome (Issue #9289). OTLP-only.
             EtaOutcome = "eta.outcome" => $crate::telemetry::kinds::eta::EtaOutcomeRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// This host's live per-issue ETA estimate set (Issue #9329).
+            /// Native-HTTPS only — the dashboard's `eta:<hostId>` state key,
+            /// the mirror of [`QueueSnapshot`](Self::QueueSnapshot). SigNoz
+            /// gets every estimate as [`EtaEstimate`](Self::EtaEstimate)
+            /// instead. See [`eta_snapshot`].
+            EtaSnapshot = "eta.snapshot" => $crate::telemetry::kinds::eta_snapshot::EtaSnapshotRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: NotExported, native: true;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —

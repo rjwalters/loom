@@ -49,17 +49,22 @@ pub enum HaltCause {
     Drain,
     /// The host-distress breaker is suppressing dispatch globally.
     Breaker,
+    /// This installation may not write to the root's repository (#9548):
+    /// `gh` resolves it to an `upstream` rather than origin, it is not
+    /// managed here, or the credential lacks WRITE.
+    WriteScope,
 }
 
 impl HaltCause {
     /// Every halt cause, in [`Self::as_str`] wire-token order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::MainRed,
         Self::GatePending,
         Self::TokenPool,
         Self::PreflightAdvisory,
         Self::Drain,
         Self::Breaker,
+        Self::WriteScope,
     ];
 
     /// The cause whose [`Self::as_str`] is `raw`, or `None` when `raw` is not
@@ -85,6 +90,7 @@ impl HaltCause {
             Self::PreflightAdvisory => "preflight_advisory",
             Self::Drain => "drain",
             Self::Breaker => "breaker",
+            Self::WriteScope => "write_scope",
         }
     }
 }

@@ -1,6 +1,6 @@
 //! `autonomous.eta` resolution.
 
-use crate::eta::config::{resolve, DEFAULT_REFRESH_SECS, MIN_REFRESH_SECS};
+use crate::eta::config::{resolve, HistoryScopeMode, DEFAULT_REFRESH_SECS, MIN_REFRESH_SECS};
 use crate::eta::Kind;
 use serde_json::json;
 
@@ -16,6 +16,23 @@ fn enabled_by_default_at_five_minutes() {
     assert_eq!(config.refresh_secs, DEFAULT_REFRESH_SECS);
     assert_eq!(DEFAULT_REFRESH_SECS, 300);
     assert_eq!(config.current(Kind::Land), None);
+    // #9343: `augment` by default, which is a no-op until a snapshot is
+    // cached — an unconfigured host behaves exactly as it did before.
+    assert_eq!(config.history_scope, HistoryScopeMode::Augment);
+}
+
+#[test]
+fn the_history_scope_follows_env_then_config_then_default() {
+    let file = json!({"autonomous": {"eta": {"historyScope": "fleet"}}});
+    assert_eq!(resolve(&file, no_env).history_scope, HistoryScopeMode::Fleet);
+
+    let env = |key: &str| (key == "LOOM_ETA_HISTORY_SCOPE").then(|| "local".to_string());
+    assert_eq!(resolve(&file, env).history_scope, HistoryScopeMode::Local);
+
+    // An unrecognised value leaves the default in force rather than picking
+    // a scope at random.
+    let typo = json!({"autonomous": {"eta": {"historyScope": "global"}}});
+    assert_eq!(resolve(&typo, no_env).history_scope, HistoryScopeMode::Augment);
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (design record for #9687, first-stage increment of the #9063 epic; candidate preparation #9688 and landing #9689 implement separate portions of this contract)
+Accepted (design record for #9687, first-stage increment of the #9063 epic; candidate preparation #9688 and landing #9689 implement separate portions of this contract). Revised 2026-10-01 per the operator ruling on #9733: any push aborts the attempt, and the ordering pass alone releases reservations on landing.
 
 ## Context
 
@@ -27,9 +27,9 @@ A consolidated attempt **reserves** each source PR by applying the existing `loo
 Consequences, all inherited rather than re-implemented:
 
 - "A source PR cannot land concurrently with the candidate that includes it" is enforced by the existing verdict-contradiction gate on every merge path — zero new shell, zero new gate logic.
-- When the candidate lands, the merge-sequencing pass mechanically releases the reservation (predecessor merged at recorded head ⇒ `CLEAR`).
-- An **abandoned** attempt's reservations self-release via the soft-hold expiry bound (72 h of predecessor quiet on an approved source) — the contract's "bounded retry/staleness" story is the expiry bound, not a new timer.
-- A head push on either side voids the reservation into a replan, exactly as ordering holds behave — the reservation never outlives the trees it pinned.
+- When the candidate lands, the merge-sequencing (ordering) pass mechanically releases the reservation (predecessor merged at recorded head ⇒ `CLEAR`). **The ordering pass is the one owner of release on landing**; consolidation code never removes a reservation because the candidate landed (§4).
+- An **abandoned** attempt's reservations self-release via the soft-hold expiry bound (72 h of predecessor quiet on an approved source) — the contract's "bounded retry/staleness" story is the expiry bound, not a new timer. A lost reservation ends the attempt (§3).
+- **Any push aborts the attempt** (operator ruling, 2026-10-01). A reservation pins both heads, so a push to the candidate (`PredecessorMoved`) or to a source (`FollowerMoved`) makes the ordering pass void that hold. The contract does not re-pin, repair or carry the attempt forward: a push to the candidate PR or to **any** source PR while the candidate is open aborts the whole attempt (§3 "Push abort"), its remaining holds are released, and the next ordering pass re-plans the sources from their current heads.
 
 The attempt id **is** the plan id, in a distinct namespace: `cons-` + 8 hex of SHA-256 over the sorted `number:head` component pins (same derivation as the `seq-` ordering ids, so one id format, two prefixes). `source=pass` marks these as soft, machine-managed holds; a human replacing one with a source-less marker converts it to a hard hold, which is the documented manual-override path.
 
@@ -50,29 +50,46 @@ A group is consolidation-eligible when **every** item holds at preparation time:
 | E9 | Bounded review size | ≤ `LOOM_CONSOLIDATE_MAX_COMPONENTS` components (default 4) and ≤ `LOOM_CONSOLIDATE_MAX_DIFF_LINES` total added+deleted lines (default 800) across the group. A combined review larger than the bound defeats the purpose: one review that nobody completes. |
 | E10 | Clean construction | Merging the pinned heads in landing order succeeds with no conflict. A conflict is a **hard abort** — v1 does no evict/retry/bisect search. |
 
+**In-group ordering markers (E6/E7).** A source may already carry an in-group `seq-` ordering marker from the ordering pass. There is one marker per follower, so applying the `cons-` reservation replaces it: the newest trusted marker wins. The construction order comes from the **recorded plan**, which is read before any reservation is applied and is copied into the ledger (§4). It does not come from the live marker, so once a reservation has replaced the `seq-` marker, nothing reads that marker for ordering again. If the attempt aborts, the ordering pass re-derives a fresh `seq-` plan for the sources from their current heads.
+
 ### 3. Attempt lifecycle and state transitions
 
 ```text
 planned ──prepare──> candidate_open ──canonical merge──> landed ──reconcile──> reconciled
    │                     │                                                        (terminal)
    │                     ├──abort──> aborted (terminal)
-   └──conflict/cancel──> aborted (terminal)
-                         
-candidate_open ──(72 h quiet)──> expired ≡ aborted  [via soft-hold expiry, per-source]
+   │                     ├──push to candidate or any source──> aborted (terminal)
+   │                     └──reservation lost (void / 72 h expiry / removed)──> aborted (terminal)
+   └──conflict/cancel/push during preparation──> aborted (terminal)
 ```
 
 - `planned → preparing`: eligibility E1–E9 verified fresh; attempt id derived.
-- `preparing → candidate_open`: candidate branch pushed, candidate PR created, reservations applied. Each step is independently resumable (see §5).
-- `candidate_open → landed`: the **canonical merge path only** (`merge-pr.sh` on the candidate PR). The preparation machinery never merges; the landing machinery never merges. All existing preconditions (fresh `loom:pr`, green required checks, hold guards, #9161 composites) apply to the candidate exactly as to any PR.
-- `landed → reconciled`: the reconciliation loop walks the mapping and finishes bookkeeping (§6). Safe to re-run from any interruption; a restart after landing finishes bookkeeping rather than merging again.
-- `candidate_open → aborted`: via explicit `consolidate-abort` (failed candidate CI, operator decision) — closes the candidate PR and releases **only this attempt's** reservations. A green component never grants approval or CI success to the combination, and a failed candidate CI run preserves every original PR untouched.
-- `expired`: an attempt whose reservations quietly expired (72 h) with the candidate still open is treated as abandoned; the next reconciliation touch closes the stale candidate PR and releases what remains, or a human aborts it.
+- `preparing → candidate_open`: candidate branch pushed, candidate PR created, reservations applied, then every source head re-read against its pin. A moved head aborts, with no silent re-pin. Each step is independently resumable (see §5).
+- `candidate_open → landed`: the **canonical merge path only** (`merge-pr.sh` on the candidate PR). The preparation machinery never merges; the landing machinery never merges. All existing preconditions (fresh `loom:pr`, green required checks, hold guards, #9161 composites) apply to the candidate exactly as to any PR, plus one candidate-only precondition: the pins are intact (see "Push abort" below).
+- `landed → reconciled`: the reconciliation loop walks the mapping and finishes bookkeeping (§6). Safe to re-run from any interruption; a restart after landing finishes bookkeeping rather than merging again. Landing is the point of no return. A push observed after the candidate merged is **not** an abort; §6 step 2 says what happens to that source.
+- `candidate_open → aborted`: via explicit `consolidate-abort` (failed candidate CI, operator decision), or implicitly through "Push abort" below. The abort closes the candidate PR, deletes its branch and releases **only this attempt's** still-live reservations. A green component never grants approval or CI success to the combination, and a failed candidate CI run preserves every original PR untouched.
+
+**Push abort (operator ruling, 2026-10-01).** An open attempt is live only while all three of these hold: (i) the candidate's live head equals the candidate head recorded in the ledger; (ii) every source's live head equals its pin; (iii) every reservation is still live (label present, no `released`/`replanned` tombstone after it). If any of them fails before landing, the attempt is **aborted**. That covers a Doctor fix, a merge of `main`, or a CI fix pushed to the candidate; an author's push to a source; a reservation voided, expired or removed by hand. Aborted means aborted: no re-pin, no repair of the candidate in place, no carrying the attempt forward. The abort steps are the `consolidate-abort` steps. Holds the ordering pass already voided read as released and are skipped (no-op). Once the sources are released, the next ordering pass re-plans them from their current heads. A later consolidation of the same PRs is a **fresh attempt**: new heads give a new `cons-` id.
+
+- **Who detects it:** the reconciliation touch of an open, unmerged candidate (the same verb and tick hook as landing, §8) runs the three-part check and aborts when it fails. As a second line, the candidate's merge precondition re-runs the check immediately before the canonical merge, so a source push can never land as a stale candidate between two reconciliation ticks.
+- **The window:** a push makes the ordering pass void the moved holds on its next tick. That can happen before the drift check closes the candidate. In that window the sources are unreserved while the candidate is still open. This is safe because the candidate cannot merge (the pre-merge pin check refuses it, and a candidate push also invalidates its head-pinned Judge verdict). A source that merges in the window only confirms the abort. Candidate PRs (`loom/consolidated/` head refs) are excluded from ordering-pass eligibility, so the pass never chains a candidate behind its own sources.
+- **Expiry** is one case of a lost reservation. After 72 h of candidate quiet, the pass expires a soft reservation on an approved source, and the next reconciliation touch aborts the attempt.
 
 ### 4. Identity and ownership
 
 - **Attempt id**: `cons-<8 hex>` as in §1. Deterministic from components+heads: two workers preparing the same group derive the **same** id and converge on one candidate instead of racing two.
-- **Ownership**: the attempt owns exactly its reservations — markers whose `plan=` matches its id. No attempt ever releases another attempt's reservation, and reconciliation releases a source's reservation only after that component's inclusion is verified and its status is durably posted (release-before-status would let an ordering pass re-plan a PR that is about to close).
-- **The ledger is the candidate PR body** (trusted markers, owner/repo-qualified): component number, pinned head, scope rationale, compatibility note, attempt id, candidate head at prepare time. It must be reconstructible from the candidate PR alone — no local-only state, so any daemon or human can resume.
+- **Ownership**: the attempt owns exactly its reservations — markers whose `plan=` matches its id. No attempt ever releases another attempt's reservation.
+- **Who releases a reservation.** Each event has exactly one releaser:
+
+  | Event | Releaser | Mechanism |
+  |---|---|---|
+  | Candidate lands | **The ordering pass, only.** | `CLEAR` (predecessor merged at the recorded head) ⇒ `Release`. Reconciliation never removes the label on landing; its §6 step 4 is observe-only. |
+  | Push to candidate or source | The ordering pass, for each moved hold | `PredecessorMoved`/`FollowerMoved` ⇒ `VoidAndReplan`. The resulting abort then releases the siblings that are still live. |
+  | Abort (explicit or push abort) | The abort step | Releases this attempt's **still-live** reservations. A hold that is already voided or released is skipped. |
+  | 72 h quiet | The ordering pass | Soft-hold `Expire`; the attempt is then aborted (§3). |
+
+  **What landing release implies.** After the candidate lands, the pass releases the sources before reconciliation closes them. Until they are closed they are ordinary open PRs. They still overlap one another, so the pass may re-plan them **among themselves** with `seq-` holds. That is harmless: reconciliation closes a verified source whatever its label state, and a `seq-` hold on a closed PR is inert, because the pass only evaluates open PRs. A released source may also *merge* in that window (see Consequences). Reconciliation never waits for the release. In a repository where the ordering pass is not running Phase 1 (see the follow-up), reconciliation still completes, and the stale label on a closed PR has no effect.
+- **The ledger is the candidate PR body** (trusted markers, owner/repo-qualified): component number, pinned head, scope rationale, compatibility note, attempt id, recorded construction order, candidate head at prepare time. It must be reconstructible from the candidate PR alone — no local-only state, so any daemon or human can resume. The recorded candidate head is the reference for the push-abort check (§3).
 
 ### 5. Destructive-step table (complete — no unspecified destructive step)
 
@@ -82,9 +99,10 @@ candidate_open ──(72 h quiet)──> expired ≡ aborted  [via soft-hold exp
 | Create candidate PR | Branch pushed | Adopt-first: an open PR with that head branch is adopted, never duplicated | Orphan branch without PR (same as above) |
 | Apply reservation to source | Candidate PR exists | Exact-marker idempotency (identical marker ⇒ no comment) | Source PR mergeable and un-reserved ⇒ it may merge normally (safe: candidate not yet ready); next run re-applies |
 | Post candidate mapping | Candidate PR exists | Body is written once at creation; later edits are additive comments | — (body-only, no effect) |
+| Push abort: close candidate, release live reservations, delete branch | Candidate open and unmerged; the §3 three-part check fails (candidate head ≠ recorded head, a source head ≠ its pin, or a reservation lost) | Idempotent: candidate already closed ⇒ no-op; label absent or hold already tombstoned ⇒ skip. The check is re-read every touch, so a lost run is re-detected next tick | Candidate open with some holds released ⇒ the pre-merge pin check still refuses it; the next touch finishes the abort |
 | Post per-component status (landing) | Candidate merged; inclusion verified | Idempotent: status comment presence checked | Missing status ⇒ reconcile again posts it |
-| Remove source reservation (landing) | That component's status durably posted | Idempotent: label absent ⇒ no-op | Source stays gated ⇒ reconcile again releases it |
-| Close component PR | Status posted; verified included | Idempotent: already-closed ⇒ no-op | PR stays open ⇒ reconcile again closes it |
+| Release source reservation (landing) | — **not a reconciliation step**: the ordering pass releases on `CLEAR` (§4) | Pass's own idempotency (label absent ⇒ not a holder) | Label still on ⇒ the pass releases it on a later tick; reconciliation does not wait |
+| Close component PR | Status posted; verified included; source's live head still equals its pin | Idempotent: already-closed ⇒ no-op | PR stays open ⇒ reconcile again closes it |
 | Close linked issue | Component closed; `Closes/Fixes/Resolves` reference extracted via the existing refs analysis; underlying issue acceptance-criteria gate respected | Idempotent: already-closed ⇒ no-op | Issue stays open ⇒ reconcile again; **unincluded or partly satisfied work stays open** |
 | Delete candidate branch | Attempt `reconciled` (or `aborted`) | Idempotent: already-deleted ⇒ no-op | Branch remains ⇒ cleanup next run; never force-cleans stacked children (#9372 guards respected) |
 
@@ -93,10 +111,10 @@ Every idempotency check reads live state before acting (label set, PR state, com
 ### 6. Landing reconciliation order (each step resumable)
 
 1. **Verify the landing**: candidate PR is merged; record the merge SHA. Never re-merge.
-2. **Verify inclusion per component**: each pinned head is an ancestor of the candidate branch head recorded in the mapping (construction merged pinned heads, so ancestry is the containment proof; the recorded head — not a live re-read — is what the candidate's CI tested).
+2. **Verify inclusion per component**: each pinned head is an ancestor of the candidate branch head recorded in the mapping (construction merged pinned heads, so ancestry is the containment proof; the recorded head — not a live re-read — is what the candidate's CI tested). Also compare each source's **live** head with its pin. A source pushed after the candidate merged is past the abort point, since the landing already happened. It is **not** closed: it gets the status `untouched-open` with a note naming the pinned head that landed, its linked issues stay open, and it continues as an ordinary PR.
 3. **Post per-component status** on each source PR: `merged-into <candidate> (#N) at <merge SHA>` with owner/repo-qualified bidirectional links. Status vocabulary, pinned: `merged-into` (diff contained in the verified landing), `superseded-by` (deliberately excluded/replaced), or untouched-open. GitHub marking a PR "closed" is never reported as "merged".
-4. **Release reservations** for verified components.
-5. **Close component PRs** with the exact combined merge SHA in the closure comment.
+4. **Observe reservation release (no write).** The ordering pass releases reservations on `CLEAR` (§4). Reconciliation does not remove the label, does not post a release, and does not wait for the release. It only records in its report whether each label is still on.
+5. **Close component PRs** with the exact combined merge SHA in the closure comment, whatever the reservation's state (step 4).
 6. **Close linked issues** whose component PR carried closing references — extracted with the existing refs analysis, subject to the existing issue-close-gate semantics; the closure comment links the candidate PR and merge SHA. Issues without closing references get the status comment and stay open.
 7. **Delete the candidate branch** (protected/stacked children respected, #9372).
 
@@ -106,32 +124,35 @@ Every idempotency check reads live state before acting (label set, PR state, com
 - **Review/CI attempts**: combined candidate's Judge verdicts + CI runs versus the counterfactual sum of per-component runs — reported as observed counts, with the counterfactual labeled as an estimate.
 - **Queue age**: candidate PR age at merge versus the components' ages; per-event, no aggregation beyond mean/median, sample size stated.
 - **Useful review findings**: Judge findings on candidates that would NOT have existed per-component (e.g. integration conflicts between components) — counted explicitly, because this is the risk side of the trade.
+- **Aborts by cause**: `candidate-push`, `source-push`, `reservation-lost`, `ci-failure`, `operator`, `construction-conflict`. These are counted per attempt from the abort comment. Push-abort makes consolidation fragile when authors are active, so this rate is the data on which to revisit that ruling.
 
 No performance-improvement claim without these numbers; the pilot reports what happened, including nothing.
 
 ### 8. Preparation / landing implementation boundaries
 
 - **Preparation** (#9688): `loom-daemon merge-pr consolidate-prepare --repo O/R --pr N… --reason "…"` and `consolidate-abort --pr <candidate>`. New Rust under `loom-daemon/src/merge_pr/consolidate.rs` (+ tests, incl. the lifecycle fixtures for §5's scenarios); CLI wiring under `cli/`. Reads plan/eligibility state; writes branch, candidate PR, reservations, comments.
-- **Landing** (#9689): the merge itself is `merge-pr.sh` on the candidate — the canonical path, unchanged. Reconciliation is `merge-pr consolidate-reconcile --pr <candidate>` over the same module, plus (later) a reconciliation-tick hook. Stable ids/events for #590: attempt ids (`cons-…`), the event names in §3's transitions, and the marker/comment surfaces already defined here.
+- **Landing** (#9689): the merge itself is `merge-pr.sh` on the candidate — the canonical path, unchanged. Reconciliation is `merge-pr consolidate-reconcile --pr <candidate>` over the same module, plus (later) a reconciliation-tick hook. On an open candidate, the same verb runs the push-abort check (§3) and the abort; on a merged one, it runs §6. Landing also owns the candidate-only pre-merge pin check. Stable ids/events for #590: attempt ids (`cons-…`), the event names in §3's transitions, and the marker/comment surfaces already defined here.
 - The two stages share this module's mapping parser and helpers; neither reaches into the other's write surface.
 
 ### 9. Composability review (against the contracts this must not conflict with)
 
-- **#9378**: reservations *are* sequencing holds (§1) — one label, one gate, one evaluator; no new merge-path machinery, no bypass.
+- **#9378**: reservations *are* sequencing holds (§1) — one label, one gate, one evaluator; no new label, no new marker source, no bypass. The push-abort rule needs no change to the evaluator: it treats the existing `PredecessorMoved`/`FollowerMoved` voids as the end of the attempt.
+- **#9686**: the ordering pass is the sole landing releaser (§4). Its Phase 1 must run whenever there are holders, independent of the open-PR planning trigger, and its eligibility excludes `loom/consolidated/` candidates (§3). Both are follow-ups.
 - **#9416**: no proven-equivalence carryover is used or implied; the combined diff always gets its own fresh Judge verdict and its own CI runs.
 - **#9372**: candidate branches live in the Loom-managed `loom/consolidated/` namespace; cleanup runs last and never force-cleans a stacked child; components with stacked children fail E7 (their children are out-of-group predecessors).
-- **#9161**: the candidate merges through the canonical path, so every existing merge precondition composes unchanged — consolidation grants no exemption, ever.
+- **#9161**: the candidate merges through the canonical path, so every existing merge precondition composes unchanged — consolidation grants no exemption, ever. The one addition is a candidate-only precondition (pins intact, §3). It is a refusal composed into the existing precondition set, not a new gate or a bypass, and it can only make a merge less likely.
 
 ## Worked lifecycle examples (each maps to a fixture in `merge_pr/consolidate` tests)
 
-1. **Overlapping files**: #10 and #12 both edit `daemon/src/run.rs`, neither held. Prepare ⇒ attempt `cons-a1b2c3d4`, candidate PR #99 (body maps both, pins heads, carries the recorded rationale), reservations `after=#99` on both. Judge approves #99's combined diff; CI green; #99 merges via `merge-pr.sh`; reconcile verifies ancestry, posts statuses, releases reservations, closes #10/#12 with the merge SHA, closes their `Closes:` issues, deletes `loom/consolidated/cons-a1b2c3d4`.
+1. **Overlapping files**: #10 and #12 both edit `daemon/src/run.rs`, neither held. Prepare ⇒ attempt `cons-a1b2c3d4`, candidate PR #99 (body maps both, pins heads, carries the recorded rationale), reservations `after=#99` on both. Judge approves #99's combined diff; CI green; the pre-merge pin check passes; #99 merges via `merge-pr.sh`; the ordering pass releases both reservations on `CLEAR`; reconcile verifies ancestry, posts statuses, closes #10/#12 with the merge SHA (whether or not the pass has released them yet), closes their `Closes:` issues, deletes `loom/consolidated/cons-a1b2c3d4`.
 2. **Semantic dependency**: #20 grows a fake-set, #21 dedups it — order matters (#21 after #20). E7 allows in-group ordering; construction merges in the recorded order; the ADR's position: consolidation preserves the ordering pass's landing order inside the candidate; a semantic dependency *across* an eligibility boundary (predecessor outside the group) blocks E7 until it lands.
-3. **Substantive rejection**: during `candidate_open`, Judge rejects the combined diff (`changes-requested`). The candidate is an ordinary PR: Doctor fixes the candidate branch, or the operator aborts. Nothing propagates to the sources — their statuses stay open and untouched.
+3. **Substantive rejection**: during `candidate_open`, Judge rejects the combined diff (`changes-requested`). The candidate is **not** repaired in place, because any push to it aborts the attempt (§3). The Champion or operator runs `consolidate-abort`. If a Doctor fix, a merge of `main`, or any other commit is pushed to `loom/consolidated/cons-…` anyway, the next reconciliation touch sees the candidate head differ from the ledger and aborts on its own. In both cases: #99 is closed, this attempt's live reservations are released (the ones the pass already voided are skipped), and the branch is deleted. The fix belongs on the source PR(s), which are back to ordinary PRs. If consolidating them is still worthwhile after that, it is a fresh attempt with a new id. Nothing is written to the sources beyond their release, and they stay open.
 4. **Held / workflow PRs**: #30 carries `loom:operator-only`, #31 edits `.github/workflows/ci.yml`. Both fail E3/E4 at eligibility, before any mutation; the verb reports each rejection reason and does nothing.
-5. **Head push during preparation**: #40's head moves after pins are read but before the reservation lands. The reservation marker pins the NEW head only if re-read; the pinned-head check fails ⇒ construction/validation aborts the attempt (hard abort, no silent re-pin), sources untouched.
+5. **Head push during preparation**: #40's head moves after pins are read but before the reservations are confirmed. Preparation re-reads every source head after applying reservations, and the mismatch is a hard abort under the same push-abort rule (§3). There is no silent re-pin. The candidate is closed, the reservations are released, and the sources are otherwise untouched.
 6. **Duplicate workers**: two daemons run `consolidate-prepare` for the same group concurrently. Same attempt id ⇒ both converge: one pushes/creates, the other adopts the existing branch/PR and skips re-posting markers (exact-marker idempotency). No duplicate candidate.
-7. **Failed candidate CI**: #99's combined CI is red. The candidate is not mergeable (existing guards). The operator/Champion runs `consolidate-abort`: candidate PR closed, reservations released, sources preserved and actionable exactly as before the attempt. No auto-evict/retry in v1; a bounded retry is a fresh attempt with a new id.
-8. **Interruption during component closure**: reconcile crashes after closing #10 but before #12. Restart: candidate merged (step 1 verify idempotent), #10's status exists (skip), #12's status posted, reservations released, #12 closed, issues closed, branch deleted. Every step's precondition is re-read; nothing double-applies.
+7. **Failed candidate CI**: #99's combined CI is red. The candidate is not mergeable (existing guards). The operator/Champion runs `consolidate-abort`: candidate PR closed, reservations released, sources preserved and actionable exactly as before the attempt. Pushing a CI fix to the candidate is not an alternative, because the push itself aborts (§3). No auto-evict/retry in v1; a bounded retry is a fresh attempt with a new id.
+8. **Interruption during component closure**: reconcile crashes after closing #10 but before #12. Restart: candidate merged (step 1 verify idempotent), #10's status exists (skip), #12's status posted, #12 closed, issues closed, branch deleted. Reconciliation never releases a reservation itself. The ordering pass released both on `CLEAR`, whether before, during or after the crash, and the crash does not affect that. Every step's precondition is re-read; nothing double-applies.
+9. **Source push while the candidate is open**: #12's author pushes while #99 waits for review. On its next tick the ordering pass voids #12's reservation (`FollowerMoved`). The next reconciliation touch of #99 finds #12's live head differs from its pin and aborts: #99 is closed, #10's reservation (still live) is released, #12's is skipped (already voided), and the branch is deleted. If #99 had reached the merge path first, the pre-merge pin check would have refused it. The next ordering pass re-plans #10 and #12 from their current heads.
 
 ## Consequences
 
@@ -144,8 +165,14 @@ No performance-improvement claim without these numbers; the pilot reports what h
 ### Negative
 
 - A combined review bundles risk: a rejection blocks all components until repaired or aborted (accepted; v1 has no eviction, and the abort path keeps sources actionable).
-- Reservation release vs. reconciliation is a small race window (a released source merging before reconciliation closes it); accepted — its diff is already on main, and the closure is a no-op then.
+- Reservation release vs. reconciliation is a small race window. The ordering pass releases on landing, before reconciliation closes the sources. A released source may merge before it is closed, which is accepted: its pinned diff is already on main, and the closure is then a no-op. The pass may also re-plan the released sources among themselves with `seq-` holds, which is accepted as inert because reconciliation closes them whatever their label state.
+- Push-abort makes an attempt fragile: one author push or one fix commit ends it, and a repair means a fresh attempt with a fresh review. This is accepted under the operator ruling (2026-10-01) as the simplest default-deny rule, because it closes the gap where a fix push to the candidate silently lifted every source hold. §7's abort-by-cause counts are the evidence for revisiting it.
+- Between a push and the abort, the sources are briefly unreserved while the candidate is open (§3 "The window"). This is safe only because of the pre-merge pin check, which is not yet implemented (see Follow-ups).
 - Two more verbs and a module in the already-large merge surface; accepted — the alternative (prompt-side convention) is exactly the unenforced-bytes failure mode this contract exists to avoid.
+
+### Follow-ups
+
+- **#9839: implement push-abort after `candidate_open`.** The code was read, not built or run, as of 2026-10-01. The merged ordering pass (#9707) voids each moved hold one at a time and never aborts the attempt. A candidate push lifts every reservation while the candidate stays open. A source push leaves the sibling reservations in place behind a stale candidate that can still merge. The open-PR trigger (`TRIGGER_OPEN_PRS`) also skips Phase 1, including the landing release, in repositories with two or fewer open PRs. The stacked #9744 aborts on a push only *during* preparation. The stacked #9745 still releases reservations from reconciliation, which this revision rules out. #9839 tracks the drift check and abort, the pre-merge pin check, the exclusion of candidates from ordering, running Phase 1 regardless of the trigger, and removing reconciliation's release step.
 
 ## Alternatives Considered
 
@@ -156,6 +183,6 @@ No performance-improvement claim without these numbers; the pilot reports what h
 
 ## References
 
-- Related GitHub Issues: #9063 (epic), #9687 (this record), #9688 (preparation), #9689 (landing/reconciliation), #9378 (the gate), #9686 (ordering pass), #9372 (stacked children), #9416 (equivalence carryover — explicitly not used), #9161 (merge preconditions), 2AMLogic/loom-ui#590 (measurement consumer)
+- Related GitHub Issues: #9063 (epic), #9687 (this record), #9688 (preparation), #9689 (landing/reconciliation), #9378 (the gate), #9686 (ordering pass), #9372 (stacked children), #9416 (equivalence carryover — explicitly not used), #9161 (merge preconditions), #9839 (push-abort implementation follow-up), 2AMLogic/loom-ui#590 (measurement consumer)
 - Related ADRs: ADR-0022 (merge commit default — the landing shape), ADR-0018 (Rust owns behavior, shell reaches it)
 - Fixture home: `loom-daemon/src/merge_pr/consolidate/tests.rs` (#9688/#9689)

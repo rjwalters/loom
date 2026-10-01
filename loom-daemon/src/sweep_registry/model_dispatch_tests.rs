@@ -7,6 +7,7 @@ use crate::types::SweepKind;
 use crate::work_finder::{RegistryDispatcher, WorkDispatcher};
 use crate::worker_spawn::{profiles, Options};
 use serde_json::{json, Value};
+// #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
 use std::{
     fs,
     path::Path,
@@ -77,8 +78,22 @@ fn fallback_config() -> Value {
     }})
 }
 
-fn fixture(root: &Path, config: &Value) -> (SweepRegistry, std::path::PathBuf, std::path::PathBuf) {
-    let (registry, gh_log) = open_pr_guard_registry(root, "", 0, false);
+/// The registry, the launch-args record, the fake `gh`'s call log, and the
+/// #9548 registration that lets the real write-scope check admit `root` (a
+/// managed checkout whose `gh` reports push), which must outlive the dispatch.
+fn fixture(
+    root: &Path,
+    config: &Value,
+) -> (
+    SweepRegistry,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    crate::write_scope_test_support::WritableRoot,
+) {
+    let (mut registry, gh_log) = open_pr_guard_registry(root, "", 0, false);
+    let inner = registry.config.gh_bin.clone().unwrap();
+    let ws = crate::write_scope_test_support::WritableRoot::register_with_gh(root, &inner);
+    registry.config.gh_bin = Some(ws.gh.clone());
     let defaults = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -111,7 +126,7 @@ fn fixture(root: &Path, config: &Value) -> (SweepRegistry, std::path::PathBuf, s
         ),
     )
     .unwrap();
-    (registry, record, gh_log)
+    (registry, record, gh_log, ws)
 }
 
 fn captured_options(record: &Path, runtime: &str) -> Options {
@@ -146,7 +161,7 @@ fn work_finder_fallback_launch_uses_admitted_native_profile() {
     let root = dir.path();
     let _env = Environment::isolated(root);
     let config = fallback_config();
-    let (registry, record, _) = fixture(root, &config);
+    let (registry, record, _, _ws) = fixture(root, &config);
     // A one-slot backstop also catches accidentally admitting/reserving twice.
     let registry = Arc::new(Mutex::new(registry));
     assert!(RegistryDispatcher::new(registry)
@@ -171,7 +186,7 @@ fn request_fallback_and_native_first_ignore_claude_experiment() {
             config["runtimes"]["default"] = json!("opencode");
             config["runtimes"]["preference"] = json!(["opencode", "claude"]);
         }
-        let (mut registry, record, gh_log) = fixture(root, &config);
+        let (mut registry, record, gh_log, _ws) = fixture(root, &config);
         registry
             .dispatch_with_model(
                 &SweepKind::Issue(8715),
@@ -192,8 +207,13 @@ fn request_fallback_and_native_first_ignore_claude_experiment() {
 }
 
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(loom_shared_tokens_dir_env)]
 fn claude_launch_retains_cost_safe_defaults_aliases_and_experiment() {
+    claude_launch_retains_cost_safe_defaults_aliases_and_experiment_body();
+}
+
+#[serial_test::serial]
+fn claude_launch_retains_cost_safe_defaults_aliases_and_experiment_body() {
     for (preference, model, experiment, expected) in [
         (false, None, false, "sonnet"),
         (true, None, false, "sonnet"),
@@ -217,8 +237,10 @@ fn claude_launch_retains_cost_safe_defaults_aliases_and_experiment() {
         if let Some(model) = model {
             config["autonomous"] = json!({"model": model});
         }
-        let (registry, record, _) = fixture(root, &config);
-        fs::write(root.join(".loom/tokens/fixture.token"), "fake-not-a-credential").unwrap();
+        let (registry, record, _, _ws) = fixture(root, &config);
+        // The Claude pool is the shared one: the root is a registered git
+        // checkout (#9548), where an in-checkout pool is refused (#9135).
+        let _pool = crate::write_scope_test_support::SharedTokenPool::one_account();
         let expected = if experiment {
             std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
             std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
@@ -249,7 +271,7 @@ fn native_launch_keeps_config_and_explicit_pins_including_invalid_ones() {
         let _env = Environment::isolated(root);
         let mut config = fallback_config();
         config["autonomous"] = json!({"model": configured});
-        let (mut registry, record, _) = fixture(root, &config);
+        let (mut registry, record, _, _ws) = fixture(root, &config);
         registry
             .dispatch_with_model(
                 &SweepKind::Issue(8715),
@@ -285,7 +307,7 @@ fn refused_preferences_and_explicit_runtime_never_claim_or_spawn() {
         if explicit_runtime.is_none() {
             config["runtimes"]["preference"] = json!(["claude", "codex"]);
         }
-        let (mut registry, record, gh_log) = fixture(root, &config);
+        let (mut registry, record, gh_log, _ws) = fixture(root, &config);
         if let Some(runtime) = explicit_runtime {
             std::env::set_var("LOOM_RUNTIME", runtime);
         }
@@ -308,4 +330,29 @@ fn refused_preferences_and_explicit_runtime_never_claim_or_spawn() {
             assert!(!registry.config().locks_dir().join("issue-8715").exists());
         }
     }
+}
+
+/// #9548 negative control: the dispatch fixture above, but the credential
+/// only has `pull`. The real write-scope check in `private_dispatch::prepare`
+/// refuses the sweep, so nothing is launched.
+#[test]
+#[serial_test::serial]
+fn a_read_only_credential_refuses_the_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let _env = Environment::isolated(root);
+    let config = fallback_config();
+    let (mut registry, record, _, _ws) = fixture(root, &config);
+    let read_only = crate::write_scope_test_support::WritableRoot::read_only(
+        root,
+        Some(&root.join("fake-gh.sh")),
+    );
+    registry.config.gh_bin = Some(read_only.gh.clone());
+    let outcome =
+        RegistryDispatcher::new(Arc::new(Mutex::new(registry))).dispatch(8715, Some("complex"));
+    match outcome {
+        Err(e) => assert!(format!("{e:#}").contains("#9548"), "{e:#}"),
+        Ok(dispatched) => assert!(!dispatched, "a read-only root must not dispatch"),
+    }
+    assert!(!record.exists(), "nothing may launch on a refused root");
 }

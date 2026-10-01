@@ -618,6 +618,15 @@ pub(crate) fn preflight_cause(
 ///
 /// Fail-open: without safehouse coordination `peer_pool_hold` is always
 /// `(false, [])` and every line below collapses to the pre-#8001 behaviour.
+///
+/// # The write-scope hold (Issue #9548)
+///
+/// A root this installation may not write to
+/// ([`crate::write_scope::gate_root`]) is held too, with cause
+/// [`HaltCause::WriteScope`], and yields no probe. Dispatch continues past a
+/// failed claim-label flip, so without this a root whose `gh` target is an
+/// `upstream` it cannot label still got sweeps, and their comments landed
+/// there.
 pub fn preflight_held_causes_per_root(
     workspaces: &WorkspacePool,
     roots: &[PathBuf],
@@ -636,7 +645,11 @@ pub fn preflight_held_causes_per_root(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let pool_held = fold_peer_pool_hold(state, &registry, &observation);
             let gate = registry.preflight_dispatch_gate(now);
-            let (held, cause) = preflight_cause(pool_held, gate);
+            let (held, cause) = if crate::write_scope::gate_root(root, "dispatch") {
+                preflight_cause(pool_held, gate)
+            } else {
+                (true, Some(HaltCause::WriteScope))
+            };
             causes.push(cause);
             if !held && matches!(gate, PreflightDispatchGate::Probe) {
                 probe_roots.push(root.clone());

@@ -95,7 +95,9 @@ fn read_roster_comments(
 
 /// `POST` a brand-new roster comment for this host (its first heartbeat ever
 /// on this issue). `false` on any failure — best-effort, like every other
-/// forge mutation this daemon publishes on its own initiative.
+/// forge mutation this daemon publishes on its own initiative. Goes through
+/// the #9772 chokepoint, so the heartbeat carries the dashboard footer like
+/// every other daemon comment.
 fn create_roster_comment(
     gh: &Path,
     cwd: &Path,
@@ -104,26 +106,15 @@ fn create_roster_comment(
     issue: u32,
     body: &str,
 ) -> bool {
-    let mut cmd = Command::new(gh);
-    cmd.arg("api")
-        .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
-        .arg("--method")
-        .arg("POST")
-        .arg("-f")
-        .arg(format!("body={body}"));
-    cmd.current_dir(cwd);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, cwd);
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    match cmd.output() {
-        Ok(out) if out.status.success() => true,
-        Ok(out) => {
-            log::warn!(
-                "role_runner: roster comment create on {owner}/{repo}#{issue} exited {:?}: {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            false
-        }
+    match crate::forge_comment::post_comment(
+        gh,
+        Some(cwd),
+        &format!("{owner}/{repo}"),
+        issue,
+        false,
+        body,
+    ) {
+        Ok(_) => true,
         Err(e) => {
             log::warn!("role_runner: roster comment create on {owner}/{repo}#{issue} failed: {e}");
             false
@@ -245,6 +236,12 @@ fn roster_heartbeat_once(
         chrono::Utc::now(),
         ttl_secs,
     );
+    // #9548: the roster issue is configured, not resolved; it must still be a
+    // repository this installation manages and can write to.
+    let roster_repo = format!("{}/{}", issue.owner, issue.repo);
+    if !crate::write_scope::gate_repo_with(fallback_root, &roster_repo, gh, "roster heartbeat") {
+        return;
+    }
     let ok = match action {
         crate::role_shard::roster::RosterPublish::Patch { id } => {
             patch_roster_comment(gh, fallback_root, &issue.owner, &issue.repo, id, &body)

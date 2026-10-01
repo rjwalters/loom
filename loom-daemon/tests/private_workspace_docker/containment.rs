@@ -45,7 +45,10 @@ fn establish_hook_trust(profile: &std::path::Path) {
 }
 
 fn environment(f: &Fixture, root: &std::path::Path, name: &str, gh_host: &str) -> Environment {
+    let [gh_bin, write_scope_cache] = f.write_scope_env();
     Environment::set(&[
+        gh_bin,
+        write_scope_cache,
         ("LOOM_WORKSPACE", Some(root.to_owned().into_os_string())),
         ("LOOM_CODEX_PROFILE_ROOT", Some(f.root.path().join("profiles").into_os_string())),
         ("LOOM_CODEX_PROFILE", Some(name.into())),

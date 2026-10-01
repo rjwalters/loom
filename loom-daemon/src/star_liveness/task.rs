@@ -532,6 +532,10 @@ fn resolve_repos(
         .effective_roots(workspace_root)
         .into_iter()
         .filter_map(|root| {
+            // #9548: the pass writes labels and comments on each repo.
+            if !crate::write_scope::gate_root(&root, "star liveness") {
+                return None;
+            }
             let slug = match slugs.get(&root) {
                 Some(s) => s.clone(),
                 None => {

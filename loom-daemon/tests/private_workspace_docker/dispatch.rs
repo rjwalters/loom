@@ -78,7 +78,7 @@ if [[ "$*" == *mutate* ]]; then
   git add mutation.txt
   git commit -m 'fixture issue mutation'
   git push -u origin feature/issue-8786
-  .loom/scripts/create-pr.sh --repo fixture/repo --head feature/issue-8786 --base main --title 'Fixture change' --body 'Part of #8786' --label loom:review-requested
+  .loom/scripts/create-pr.sh --repo github/repo --head feature/issue-8786 --base main --title 'Fixture change' --body 'Part of #8786' --label loom:review-requested
   .loom/scripts/sweep-checkpoint.sh write 8786 builder-done --task-id fixture-sweep --pr-number 17
 fi
 if .loom/scripts/run-job.sh --image alpine -- true >/tmp/run-job.log 2>&1; then exit 91; fi
@@ -100,6 +100,8 @@ if a[:2]==['pr','create']:
     with urllib.request.urlopen(req,context=ssl._create_unverified_context()) as r: print(json.loads(r.read())['url'])
     sys.exit(0)
 if a[:2]==['auth','status']: sys.exit(0)
+# create-pr.sh vets its repo (#9548); the permission probe asks for this one.
+if a[:2]==['api','repos/github/repo']: print('{"push":true}'); sys.exit(0)
 if a and a[0]=='api': print('{}'); sys.exit(0)
 sys.exit(1)
 "#;
@@ -203,7 +205,10 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     ] {
         copy_tree(&defaults.join(src), &root.join(dest));
     }
+    let [gh_bin, write_scope_cache] = f.write_scope_env();
     let _environment = Environment::set(&[
+        gh_bin,
+        write_scope_cache,
         ("LOOM_WORKSPACE", Some(root.clone().into_os_string())),
         ("LOOM_CODEX_PROFILE_ROOT", Some(f.root.path().join("profiles").into_os_string())),
         ("LOOM_CODEX_PROFILE", Some(name.into())),
@@ -506,4 +511,34 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     assert!(std::fs::read_to_string(&lost_log)
         .unwrap()
         .contains("fixture-retained-ready"));
+}
+
+impl Fixture {
+    /// Dispatch vets that this installation may write to the workspace's repo
+    /// (#9548). The disposable forge serves Git, not the REST API, so the
+    /// host's permission probe runs through a `gh` that reports push on the
+    /// fixture's `github/repo` and hands every other call to the real `gh`.
+    pub(super) fn write_scope_env(&self) -> [(&'static str, Option<std::ffi::OsString>); 2] {
+        let real = Command::new("sh")
+            .args(["-c", "command -v gh"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default();
+        let gh = self.root.path().join("write-scope-gh");
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\nif [ \"$1 $2\" = \"api repos/github/repo\" ]; then echo '{{\"push\":true}}'; exit 0; fi\n[ -n '{real}' ] || exit 127\nexec '{real}' \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        [
+            ("LOOM_GH_BIN", Some(gh.into_os_string())),
+            (
+                "LOOM_WRITE_SCOPE_CACHE_DIR",
+                Some(self.root.path().join("write-scope-cache").into_os_string()),
+            ),
+        ]
+    }
 }

@@ -455,6 +455,11 @@ pub mod forge {
             );
             return (0, 0);
         }
+        // #9548: this pass only exists to strip labels and comment; skip a
+        // root this installation may not write to.
+        if !crate::write_scope::gate_root_with(root, gh_bin, "quarantine reconciliation") {
+            return (0, 0);
+        }
         let issues = match list_blocked_issues(gh_bin, root) {
             Ok(v) => v,
             Err(e) => {
@@ -531,6 +536,7 @@ pub mod forge {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::write_scope_test_support::WritableRoot;
     use serial_test::serial;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -796,7 +802,8 @@ exit 0
         );
         let fake_gh = write_fake_gh(dir.path(), &script);
 
-        let (checked, released) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+        let (checked, released) = forge::reconcile_workspace(&ws.gh, &repo_root);
         assert_eq!(checked, 1);
         assert_eq!(released, 1);
 
@@ -833,7 +840,8 @@ exit 0
         );
         let fake_gh = write_fake_gh(dir.path(), &script);
 
-        let (checked, released) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+        let (checked, released) = forge::reconcile_workspace(&ws.gh, &repo_root);
         assert_eq!(checked, 1);
         assert_eq!(released, 0, "no quarantine comment => never released");
 
@@ -871,7 +879,8 @@ exit 0
                 log = gh_log.display(),
             );
             let fake_gh = write_fake_gh(dir.path(), &script);
-            let (checked, released) = forge::reconcile_workspace(&fake_gh, &repo_root);
+            let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+            let (checked, released) = forge::reconcile_workspace(&ws.gh, &repo_root);
             assert_eq!((checked, released), (1, 0), "{rest}");
             let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
             assert!(!gh_calls.contains("issue edit"), "{gh_calls}");
@@ -903,7 +912,8 @@ exit 0
         );
         let fake_gh = write_fake_gh(dir.path(), &script);
 
-        let (checked, released) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+        let (checked, released) = forge::reconcile_workspace(&ws.gh, &repo_root);
         assert_eq!(checked, 0);
         assert_eq!(released, 0);
 
@@ -927,9 +937,41 @@ exit 0
         std::fs::create_dir_all(&repo_root).unwrap();
         let fake_gh = write_fake_gh(dir.path(), "#!/bin/bash\necho 'boom' >&2\nexit 1\n");
 
-        let (checked, released) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+        let (checked, released) = forge::reconcile_workspace(&ws.gh, &repo_root);
         assert_eq!(checked, 0);
         assert_eq!(released, 0);
+    }
+
+    /// #9548 negative control: the same fixture as
+    /// `reconcile_workspace_releases_issue_with_quarantine_comment`, but the
+    /// credential only has `pull`. The real gate refuses the root, so the pass
+    /// makes no forge call at all: no listing, and never the label flip.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_skips_a_root_the_credential_cannot_write() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let script = format!(
+            r#"#!/bin/bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
+  echo '[{{"number":99,"comments":[{{"body":"Auto-quarantined by loom-daemon (#3939)"}}]}}]'
+  exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        let fake_gh = write_fake_gh(dir.path(), &script);
+        let ws = WritableRoot::read_only(&repo_root, Some(&fake_gh));
+
+        let (checked, released) = forge::reconcile_workspace(&ws.gh, &repo_root);
+        assert_eq!((checked, released), (0, 0));
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(gh_calls.is_empty(), "a refused root gets no forge call: {gh_calls:?}");
     }
 
     // Issue #4637: `gh api --paginate --jq` re-invokes the `--jq` filter once

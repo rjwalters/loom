@@ -13,10 +13,13 @@
 //! refuses every sample observed at or after `as_of`, so an estimate never
 //! sees its own future.
 //!
-//! # Limitation: history is host-local (#9343)
+//! # Two scopes: host-local and fleet-wide (#9343)
 //!
-//! Every v1 estimate reads only **this host's** journals
-//! (`explanation.history.scope = "local"`). Consequences:
+//! A [`StageSamples`] value carries the [`super::explanation::HistoryScope`]
+//! it was built at, and there are two producers.
+//!
+//! **Local** ([`StageSamples::load_outcome_journal`] plus
+//! [`StageSamples::push_journal`]) reads only **this host's** journals. It is:
 //!
 //! - **Empty** on most hosts. A host that has not run sweeps for a repo (an
 //!   operator's laptop, a freshly added worker) has no samples for it, and
@@ -26,18 +29,25 @@
 //!   describe its own slots, models and hours, not the repo's.
 //! - **Inconsistent** across hosts. Two hosts estimating the same issue at
 //!   the same instant read different histories and disagree.
-//! - The **human-gated stages** (review waits, approvals, merges by a person)
-//!   happen on the forge, not on any host. A host learns about them only by
-//!   watching listings; the forge's own record (label events, the D32 story
-//!   spans) is where that history actually lives.
+//! - Blind to the **human-gated stages** (review waits, approvals, merges by a
+//!   person): they happen on the forge, not on any host.
 //!
-//! The intended direction (#9343) is a **fleet-wide history snapshot**: built
-//! from forge / D32 story data plus the fleet's `sweep.outcome` records in
-//! SigNoz, fetched **outside** the estimator, and handed to it as a
-//! [`StageSamples`] value exactly like the local one (`scope = "fleet"`).
-//! The estimator stays a pure function of `(history snapshot, input)`, and a
-//! snapshot built only from data observed before `t` keeps a backtest
-//! leak-free. Nothing in this module fetches anything.
+//! **Fleet** ([`super::fleet`]) is the answer to all four: one forge-derived
+//! snapshot per repo, identical on every host that holds it, covering exactly
+//! the human-gated stages the local view cannot see. It is built **outside**
+//! the estimator — `fleet` derives it from PR label timelines that the CLI
+//! fetches, caches it on disk, and hands it here as an ordinary
+//! [`StageSamples`] value with `scope = Fleet`.
+//!
+//! Neither producer lives in the estimator, and nothing in this module fetches
+//! anything: an estimator stays a pure function of `(history snapshot, input)`,
+//! and a snapshot built only from data observed before `t` keeps a backtest
+//! leak-free ([`StageSamples::select`] enforces the second half by refusing
+//! every sample observed at or after `as_of`).
+//!
+//! The remaining half of #9343 — fleet-wide *in-sweep* (`sweep.curator`,
+//! `sweep.builder`) samples from SigNoz — is blocked on fleet workers
+//! exporting at all (harness-ops#249) and is deliberately not attempted here.
 
 use super::{Stage, MAX_SAMPLES, MIN_SAMPLES, WINDOW_DAYS};
 use crate::telemetry::{SweepOutcomeRecord, SweepResult, TelemetryEnvelope, TelemetryRecord};
@@ -52,13 +62,21 @@ use std::path::Path;
 const UNRESOLVED_REPO_BUCKET: &str = "(unresolved)";
 
 /// Where a sample came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SampleSource {
     /// `sweep-outcome-telemetry.jsonl` (in-sweep phases).
     SweepOutcome,
     /// `eta-stage-samples.jsonl` (transitions the ETA tracker observed).
     StageJournal,
+    /// The forge's own PR label timeline, derived fleet-wide (#9343).
+    ///
+    /// The same *kind* of evidence [`SampleSource::StageJournal`] carries —
+    /// a post-dispatch stage boundary read off label events — but derived
+    /// centrally from the forge instead of from what one host happened to
+    /// watch. See [`SampleSource::admits`] for why that distinction is
+    /// recorded without changing which samples a shipped heuristic accepts.
+    ForgeTimeline,
 }
 
 impl SampleSource {
@@ -68,7 +86,31 @@ impl SampleSource {
         match self {
             SampleSource::SweepOutcome => "sweep-outcome-telemetry.jsonl",
             SampleSource::StageJournal => "eta-stage-samples.jsonl",
+            SampleSource::ForgeTimeline => "forge:pr-timeline",
         }
+    }
+
+    /// Whether `self`, used as a **filter** entry
+    /// ([`super::heuristics::PathRules::sources`]), accepts a sample recorded
+    /// with `source`.
+    ///
+    /// Exact equality, plus one documented equivalence: a filter that asks for
+    /// [`Self::StageJournal`] also accepts [`Self::ForgeTimeline`]. Both are
+    /// the same measurement — `loom:review-requested` → verdict,
+    /// `loom:changes-requested` → push, `loom:pr` → merge, read off forge
+    /// label events — and `eta backfill` (#9325) already writes exactly those
+    /// rows *into* the stage journal from the same derivation. Without the
+    /// equivalence a fleet snapshot would be silently filtered out of every
+    /// shipped heuristic and the scope switch would be inert.
+    ///
+    /// This does **not** make `land-v1` a different heuristic: a local history
+    /// never contains a [`Self::ForgeTimeline`] sample, so every local estimate
+    /// is byte-identical to before. What changed is the history handed in, not
+    /// the function — the property `eta` depends on for backtests.
+    #[must_use]
+    pub fn admits(self, source: SampleSource) -> bool {
+        self == source
+            || (self == SampleSource::StageJournal && source == SampleSource::ForgeTimeline)
     }
 }
 
@@ -134,8 +176,10 @@ pub struct StageSamples {
     pub verdicts: Vec<VerdictSample>,
     /// Successful sweep paths.
     pub paths: Vec<SweepPathSample>,
-    /// Whose history this is: `Local` for every snapshot built today
-    /// (#9343).
+    /// Whose history this is (#9343): `Local` when every sample came from
+    /// this host's own journals, `Fleet` as soon as one host-independent
+    /// (forge-derived) sample is in it. [`Self::merge`] is the only thing that
+    /// ever raises it, and it never lowers it.
     pub scope: super::explanation::HistoryScope,
 }
 
@@ -186,7 +230,36 @@ fn same_repo(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+/// Whether any filter entry in `sources` admits a sample recorded with
+/// `source` ([`SampleSource::admits`]).
+fn admitted(sources: &[SampleSource], source: SampleSource) -> bool {
+    sources.iter().any(|filter| filter.admits(source))
+}
+
 impl StageSamples {
+    /// Absorb every sample of `other`.
+    ///
+    /// The result's [`Self::scope`] is [`HistoryScope::Fleet`] when **either**
+    /// side is: a history that contains one host-independent sample is no
+    /// longer a description of this host, and saying otherwise in the
+    /// explanation would be the exact mislabelling #9343 was filed about.
+    /// Scope never goes back down.
+    ///
+    /// Order is `self`'s samples then `other`'s. That is not load-bearing:
+    /// [`Self::select`] sorts by `(observed_at desc, duration asc)`, a total
+    /// order on the values it then reads, so a selection does not depend on
+    /// the order samples were merged in.
+    pub fn merge(&mut self, other: StageSamples) {
+        use super::explanation::HistoryScope;
+        self.stages.extend(other.stages);
+        self.censored.extend(other.censored);
+        self.verdicts.extend(other.verdicts);
+        self.paths.extend(other.paths);
+        if other.scope == HistoryScope::Fleet {
+            self.scope = HistoryScope::Fleet;
+        }
+    }
+
     /// Add every sample one `sweep.outcome` record carries, observed at
     /// `observed_at`.
     ///
@@ -312,7 +385,7 @@ impl StageSamples {
                 .iter()
                 .filter(|s| {
                     s.stage == stage
-                        && sources.contains(&s.source)
+                        && admitted(sources, s.source)
                         && in_window(s.observed_at, as_of)
                         && (level == Level::Host || same_repo(&s.repo, repo))
                 })
@@ -372,7 +445,7 @@ impl StageSamples {
             .iter()
             .filter(|s| {
                 s.stage == stage
-                    && sources.contains(&s.source)
+                    && admitted(sources, s.source)
                     && in_window(s.observed_at, as_of)
                     && (level == Level::Host || same_repo(&s.repo, repo))
             })

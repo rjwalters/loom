@@ -298,18 +298,12 @@ fn sink() -> Option<&'static dyn QueueSink> {
     SINK.get().map(|(queue, _)| queue.as_ref())
 }
 
-/// Fold `outcomes` into the shadow ledger and persist it (#9328).
-///
-/// Every heuristic of a kind estimated the same subject at the same `as_of`,
-/// and `Tracker::resolve` scores all of them against one outcome, so the pairs
-/// are already formed — this only sorts them into `(current, candidate)` runs
-/// and adds them up. Best-effort: a failed persist costs a longer wait for the
-/// 50-pair gate, never a wrong answer.
-fn note_outcomes(state: &mut State, outcomes: &[Resolved]) {
-    if outcomes.is_empty() {
-        return;
-    }
-    let ids: BTreeMap<Kind, String> = [Kind::Start, Kind::Finish, Kind::Land]
+/// The `current` heuristic id of each kind, per `autonomous.eta.current` and
+/// the registry's own default. The one definition of "the subject's answer":
+/// every other heuristic of a kind is a shadow candidate (#9328), which
+/// pairs outcomes in the ledger below but is never shown as *the* ETA.
+fn current_ids(state: &State) -> BTreeMap<Kind, String> {
+    [Kind::Start, Kind::Finish, Kind::Land]
         .into_iter()
         .map(|kind| {
             (
@@ -321,7 +315,35 @@ fn note_outcomes(state: &mut State, outcomes: &[Resolved]) {
                     .to_string(),
             )
         })
-        .collect();
+        .collect()
+}
+
+/// What [`super::eta_snapshot`] needs to build one `eta.snapshot` (#9329):
+/// every estimate still awaiting an outcome, and the `current` heuristic id
+/// per kind. `None` when ETA is disabled — there is then no tracker, and no
+/// snapshot is emitted at all.
+///
+/// Read under the one tracker lock and cloned out, so the snapshot builder
+/// runs no tracker code and holds no lock: it is a reader of state the
+/// tracker already keeps in memory, never a second tick loop.
+pub(super) fn snapshot_input() -> Option<(Vec<EstimateSummary>, BTreeMap<Kind, String>)> {
+    let guard = lock();
+    let state = guard.as_ref()?;
+    Some((state.tracker.pending().to_vec(), current_ids(state)))
+}
+
+/// Fold `outcomes` into the shadow ledger and persist it (#9328).
+///
+/// Every heuristic of a kind estimated the same subject at the same `as_of`,
+/// and `Tracker::resolve` scores all of them against one outcome, so the pairs
+/// are already formed — this only sorts them into `(current, candidate)` runs
+/// and adds them up. Best-effort: a failed persist costs a longer wait for the
+/// 50-pair gate, never a wrong answer.
+fn note_outcomes(state: &mut State, outcomes: &[Resolved]) {
+    if outcomes.is_empty() {
+        return;
+    }
+    let ids = current_ids(state);
     state
         .shadow
         .record(&|kind| ids.get(&kind).cloned().unwrap_or_default(), outcomes);
@@ -604,13 +626,21 @@ async fn estimate_isolated(keys: Option<Vec<ItemKey>>, now: DateTime<Utc>) -> Ve
     .unwrap_or_default()
 }
 
-/// This host's history: the `sweep.outcome` journal of every managed root
-/// plus the ETA stage journal. Host-local (`explanation.history.scope =
-/// "local"`); see `eta::history` for why that is a limitation.
+/// The history one ETA pass estimates from: the `sweep.outcome` journal of
+/// every managed root plus the ETA stage journal, then the configured scope
+/// applied on top (#9343).
+///
+/// The fleet half is a **cached file read** — `eta::fleet::load_all` lists
+/// `<journal_root>/.loom/state/eta/fleet/` and parses what is there. No forge call
+/// happens on a tick: the derivation is paid once by
+/// `loom-daemon eta fleet backfill` and topped up incrementally by
+/// `eta fleet refresh`. With no cached snapshot (the default state of a host
+/// that has not opted in) this is exactly the pre-#9343 host-local history,
+/// `scope = "local"`.
+///
+/// Fetching stays outside the estimator either way: what crosses into
+/// `Heuristic::estimate` is a `StageSamples` value and nothing else.
 fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> StageSamples {
-    // TODO(#9343): replace with a fleet-wide snapshot (forge / D32 story data
-    // plus the fleet's `sweep.outcome` records in SigNoz), fetched here, never
-    // inside the estimator, and filtered to before `as_of` like this one.
     let mut history = StageSamples::default();
     let mut seen = BTreeSet::new();
     for root in roots {
@@ -624,7 +654,8 @@ fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> StageS
         }
     }
     history.push_journal(&journal::read(&journal::journal_path(journal_root)), host_id);
-    history
+    let mode = crate::eta::config::read(journal_root).history_scope;
+    crate::eta::fleet::apply_scope(mode, journal_root, history)
 }
 
 /// One ETA pass: list, resolve, reload history, estimate, deliver. A no-op
