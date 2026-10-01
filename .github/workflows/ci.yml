@@ -42,9 +42,27 @@ concurrency:
 # (PR #9070): rebuild + relink of every test binary 55s -> 37s, cold build
 # 208s -> 187s, target/ 12 GB -> 6.9 GB. The smaller target/ also eases the
 # 10 GB Actions cache. Release builds are unaffected.
+#
+# #9364 (item 4 of #9065): link Linux builds with `lld` instead of the
+# default `ld` (`mold` was tried in #9071 and rejected -- no gain measurable
+# over run-to-run noise). CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_* is scoped to
+# that one target triple, so the macOS job (`aarch64-apple-darwin`) reads
+# neither var, and a local `cargo build` outside CI is unaffected -- this is
+# a workflow env var, not a change to the committed `.cargo/config.toml`
+# (whose own `target.'cfg(all())'.rustflags` keeps applying; Cargo joins
+# matching target.<triple>/<cfg> rustflags sources together rather than one
+# replacing the other). `clang` is the linker driver (not `ld.lld` directly)
+# because that is the only way to invoke lld that doesn't require guessing
+# an unversioned `ld.lld` binary name/PATH entry; `-fuse-ld=lld` has clang
+# resolve the actual `ld.lld` next to itself. Both clang and lld are
+# preinstalled on the `ubuntu-latest` runner image (its `install-clang.sh`
+# installs `lld-<version>` alongside each `clang-<version>`), so no extra
+# `apt-get install` step is needed.
 env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld
 
 jobs:
   # Detect Changes: path groups for the filtered jobs below, plus (first step,
