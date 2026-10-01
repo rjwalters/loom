@@ -1526,6 +1526,110 @@ live run's zero rows are an empty-input result, not a scored one. That remaining
 gap is the same one [#8525](https://github.com/rjwalters/loom/issues/8525) owns
 for every other artifact in this trial.
 
+## The CI failed-run log join executed against the pinned engine (2026-10-01)
+
+Section 5 of `ci-queries.sql` ("Failed run → logs", #8826) was the one standing
+CI view with an *executed* history that still proved nothing about half of it.
+The file ran end to end against the live trial on a real capture — 592 runs /
+2,131 jobs, every section non-empty, reconciling exactly to the records (see
+"CI retro queries, executed live" above). One line of that result was not a
+pass. This file recorded it as: *"Section 5's chunk join is unobserved on real
+`ci.job.log` data (none reached the trial)."* All 60 rows of the live section-5
+result read `0 of 0`, so the half of the query that joins a failed job to its
+captured log chunks had never produced a non-trivial row **anywhere** — not on
+the trial, not in CI, not on a fixture. Everything downstream of that join was
+unexecuted code in a saved view operators are meant to act on.
+
+`loom-daemon/tests/signoz_ci_failed_run_logs.rs` closes that by the technique
+of the five proofs above (#9705/#9775/#9833/#9857/#9892): `clickhouse local` in
+the trial's own pin — `clickhouse/clickhouse-server:25.12.5`, reporting
+`25.12.5.44` — the committed file run **verbatim**, and every assertion's
+breaking mutation of the committed SQL **run** as a counterfactual rather than
+described. Section 5 is located by the `failed_runs` CTE no other section
+declares, so inserting a section above it cannot silently re-point the proof.
+
+### What executing it found: two absences that read identically
+
+A failed run does not always have a failed job. A `startup_failure`, a
+cancelled matrix parent, or a required check that never produced a job all
+leave `failed_jobs` with nothing to offer; the job side of the `LEFT JOIN`
+misses, and **ClickHouse fills an unmatched side with each column's type zero,
+not NULL**. Run 9002 (`startup_failure`) came back from the committed query as:
+
+```json
+{"run_id":9002,"run_conclusion":"startup_failure","job":"","job_id":0,
+ "job_conclusion":"","timed_out":false,"chunks_present":0,"chunk_count":0,
+ "truncated":false,"logs_explorer_filter":"loom.ci.job_id = 0"}
+```
+
+Byte for byte the shape of job 70003 — a job that genuinely failed and whose
+log never arrived — plus a `logs_explorer_filter` that silently returns nothing
+when pasted into Logs Explorer, because no record carries `loom.ci.job_id = 0`.
+`truncated` is the sharpest case: a `Bool` has no zero meaning "unknown", so the
+row asserted that a log nobody holds was **not truncated**.
+
+The committed query now guards every job- and log-sourced column with
+`if(j.job_id = 0, NULL, …)` and empties the filter on that row. Same binding,
+after the fix:
+
+| `run_id` | conclusion | `job_id` | chunks | `truncated` | filter |
+| --- | --- | --- | --- | --- | --- |
+| 9002 | `startup_failure` | **NULL** | **NULL / NULL** | **NULL** | `''` |
+| 9001 | `failure` | 70001 | 3 / 3 | false | `loom.ci.job_id = 70001` |
+| 9001 | `failure` | 70002 | 2 / 3 | **true** | `loom.ci.job_id = 70002` |
+| 9001 | `failure` | 70003 | **0 / 0** | false | `loom.ci.job_id = 70003` |
+| 9001 | `cancelled` | 70006 | 0 / 0 | false | `loom.ci.job_id = 70006` |
+
+A reader can now tell "this run had no job to log" (NULL, empty filter) from
+"this job's log never arrived" (`0 of 0`, filter still usable — which is how an
+operator checks whether capture is even switched on) from "this job's log
+arrived partially" (`2 of 3`). The live capture's 60 all-`0 of 0` rows can no
+longer be assumed to have all meant the same thing.
+
+### Observed, with the mutation run for each
+
+| Property | Observation | Mutation that breaks it |
+| --- | --- | --- |
+| A captured log is reported chunk by chunk | job 70001 `3 of 3`, `truncated` false; job 70002 `2 of 3` with chunk 1 lost in flight, `truncated` **true** | — (the two columns exist precisely so `2 of 3` differs from `3 of 3`; neither had ever been produced) |
+| **The two absences are distinguishable** | run 9002 all-NULL + empty filter; job 70003 `0 of 0` + usable filter | dropping the `if(j.job_id = 0, NULL, …)` guards returns run 9002 as `job_id` 0 / `0 of 0` / `truncated` false / `loom.ci.job_id = 0` — identical in shape to job 70003 |
+| …and the run is still reported at all | run 9002 appears, 5 rows | `LEFT JOIN` → `INNER JOIN` drops it entirely (4 rows): "no failed run had anything wrong with it", the quietest possible failure |
+| Chunk delivery is at-least-once | job 70001 `chunks_present` 3 from 4 delivered rows | `uniqExact(chunk_index)` → `count()` reports **4 of 3** — more log captured than the log has, which reads as corruption rather than the ordinary redelivery it is |
+| A replayed `ci.run` does not fan out its jobs | 5 rows | removing `LIMIT 1 BY repo, run_id, run_attempt` → **9 rows**: run 9001's duplicate record doubles each of its four job rows |
+| Only log-chunk records feed the counts | job 70003 stays `0 of 0` | dropping `mapContains(attributes_number, 'loom.ci.chunk_index')` makes job 70003 read **`1 of 0`** — its own `ci.job` record counted as a chunk; one chunk present out of a zero-chunk log |
+| The attempt join keys are **asymmetric on purpose** | job 70020 (run 9001 attempt 2, which SUCCEEDED) never appears on the failed attempt | "tidying" `failed_jobs`'s `loom.ci.attempts` to `loom.ci.run_attempt` matches nothing, and because it is a LEFT JOIN the result neither shrinks nor errors: **2 rows, every `job_id` NULL** — every failed run now claiming it had no failing job |
+| Another repo's chunks do not count toward this job | ci-alpha job 70001 `3 of 3`; with `repo:''`, ci-beta's own job 70001 reports `2 of 5` | removing `l.repo = j.repo` from the log join attributes ci-beta's private 5-chunk log to ci-alpha's job — a cross-repository leak reporting MORE log than exists |
+| "Non-successful" is wider than "failed" | listed jobs exactly `[70001, 70002, 70003, 70006]`; 70004 succeeded, 70005 was skipped, 70006 was **cancelled** and counts | narrowing `NOT IN ('success','skipped','neutral')` to `= 'failure'` drops the cancelled job — a one-token edit hiding a whole failure class |
+| `since` is a closed lower bound and `repo` scopes the result | run 8000 (failed, failed job, complete 1-chunk log, but before `since`) never appears; `repo:''` is cross-repo, returning 6 rows including ci-beta | — |
+
+### The fixture
+
+359 lines over two synthetic repositories. `synthetic/ci-alpha` run 9001 carries
+the four reportable jobs (complete log, truncated-and-incomplete log, no log at
+all, cancelled), a succeeded and a skipped job that must **not** appear, a
+duplicate `ci.run` record, a replayed log chunk, and an attempt-2 job that
+succeeded. Run 9002 is the `startup_failure` with no non-successful job — the
+whole point of the NULL guard. Run 8000 sits before `since`.
+`synthetic/ci-beta` run 9100 is timed out and stages a deliberate `job_id`
+collision (also 70001) with a 5-chunk log, so the join's repository condition
+has something to keep apart; GitHub job ids are globally unique, so the
+collision is synthetic while the condition it exercises is real — and an
+unexecuted defensive condition is exactly the kind that gets "simplified" away.
+
+### What this does not establish
+
+**No `ci.job.log` record has been ingested into the trial deployment.** Nothing
+went through SigNoz's own ingester or its `logs_v2` as SigNoz actually creates
+it; this is `clickhouse local` over a hand-written read surface, the same caveat
+the five sibling proofs carry, and the same gap
+[#8525](https://github.com/rjwalters/loom/issues/8525) owns. Attribute-container
+placement is not guessed here — `signoz_trial_artifacts.rs` independently pins,
+in ordinary CI, which container the daemon sends each key this section reads.
+The static guard `section_five_null_guards_every_job_sourced_column` runs in
+ordinary CI with no Docker, so a future edit that drops a guard and reintroduces
+the ambiguity fails on every pull request rather than waiting for the gated
+suite; it was confirmed to fail against the pre-fix artifact, together with
+three of the engine tests.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -1546,7 +1650,8 @@ for every other artifact in this trial.
 | Real Loom canary / real Judge-Doctor repair trace | Open — the instrumentation slices landed (#8577/#8579), but #8525 itself stays open for its own live-run acceptance, and the run needs the trial host; see #8529 |
 | Repeated latency/footprint comparison | Open — shared evaluation #8529. A single **co-resident** point-in-time footprint (CPU, memory, volume and per-database disk for both backends) and a same-day query/insert latency distribution are now recorded (see "Co-resident 2.5-day soak"), but no controlled, repeated, same-workload comparison has been run |
 | ClickHouse self-telemetry expires under the rendered 2 GiB cap | **Applied live and observed; the post-fix multi-day soak is the remainder.** The defect ran a full **9-day** live soak and worsened monotonically — 10,135 failed `metric_log` TTL merges an hour against 159 successful all day (441.8 : 1), all error 241, 135 active parts, parts 9 days into a 1-day TTL, 999 MiB of `system` against 235 KiB of Loom signal, 109.76 % CPU. The committed render was synced into the deployment's state directory and the ClickHouse service recreated (healthy in 9.19 s): `system.metric_log` became a 1,552-column `SystemMetricLogView` over a 6-column `transposed_metric_log` holding 1,548 metrics in 28.59 KiB / 1 part, `system` fell to 737.35 MiB, CPU to 9.01 %, and all 37/46/213/213 Loom signals survived unchanged. Over the following 33 minutes the new backing table ran **13 merges with 0 failures** in 3 active parts — the wide table managed 159 successes against 70,249 failures in a day. See "Applied to the live deployment, 2026-10-01". **Remaining**: a multi-day window confirming the retention *outcome* (no part past `event_date + 1 day`) across a date boundary, which 33 minutes cannot show — [#9868](https://github.com/rjwalters/loom/issues/9868) |
-| CI retro queries (`ci-queries.sql`, #8826) | **Passed on live capture** — every section non-empty; metric-path counts and conclusion split reconcile exactly to the records (592 runs / 2,131 jobs); see "CI retro queries, executed live". Section 5's chunk join is unobserved on real `ci.job.log` data (none reached the trial) |
+| CI retro queries (`ci-queries.sql`, #8826) | **Passed on live capture** — every section non-empty; metric-path counts and conclusion split reconcile exactly to the records (592 runs / 2,131 jobs); see "CI retro queries, executed live". Section 5's chunk join is still unobserved on real `ci.job.log` data (none reached the trial), but is no longer unobserved anywhere — see the row below |
+| Section 5's failed-run → log chunk join (`ci-queries.sql` 5, #8826) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_ci_failed_run_logs.rs` executes the committed file verbatim on ClickHouse 25.12.5.44 and is the first run anywhere to produce a non-trivial chunk-join row (`3 of 3`, `2 of 3`): the live capture's 60 section-5 rows all read `0 of 0`. Executing it found the join's **two absences reading identically** — a failed run with no non-successful job came back as `job_id` 0 / `truncated` false / `0 of 0` / `loom.ci.job_id = 0`, indistinguishable from a failed job whose log never arrived, with a Logs Explorer filter that silently matches nothing; the committed query now NULL-guards every job- and log-sourced column and empties that filter. At-least-once chunk delivery, the run-level dedupe, the asymmetric `run_attempt`/`attempts` join keys, the log join's repository condition and the wider-than-`failure` conclusion predicate each have their breaking mutation of the committed SQL run, not described (see "The CI failed-run log join executed against the pinned engine"). No `ci.job.log` record went through SigNoz's own ingester — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
 | CI metrics retention ≥ 30 days (#8826) | **Passed in effective DDL** — every metric signal table at 30 days |
 | CI logs/traces at 7 days on the current trial | **Open** — API-owned tables still at the upstream 15 days; needs the org login ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | Six CI saved views in the trial org | **Open** — recreation steps written in the README, not yet executed in the UI ([#8946](https://github.com/rjwalters/loom/issues/8946)) |

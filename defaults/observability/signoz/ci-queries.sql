@@ -297,6 +297,27 @@ LIMIT {top:UInt32};
 --    `logs_explorer_filter` is the exact Logs Explorer query for that job's log;
 --    order the result by `loom.ci.chunk_index` ascending to reconstruct it.
 --    Logs-backed: 7 days.
+--
+--    TWO DIFFERENT ABSENCES, and the columns keep them apart. A failed run does
+--    not always have a non-successful job: a `startup_failure`, a cancelled
+--    matrix parent, or a required check that never produced a job all leave the
+--    `failed_jobs` side of the LEFT JOIN unmatched. ClickHouse fills an
+--    unmatched side with each column's type ZERO, not NULL, so such a row would
+--    otherwise read `job_id` 0, `timed_out` false, `0 of 0` chunks and a filter
+--    of `loom.ci.job_id = 0` — indistinguishable from "a failed job whose log
+--    never arrived", and a Logs Explorer query that silently returns nothing.
+--    Hence the `if(j.job_id = 0, NULL, ...)` guard on every job- and log-sourced
+--    column. Read the result as:
+--      * `job_id` NULL             -> the run failed with NO non-successful job;
+--                                     there is no job log to look for, and
+--                                     `logs_explorer_filter` is empty.
+--      * `job_id` set, `0 of 0`    -> the job failed and its log never arrived.
+--      * `job_id` set, `2 of 3`    -> partial capture; chunk 1 lost in flight.
+--    `truncated` is the sharpest case: a Bool has no zero meaning "unknown", so
+--    without the guard a run with no job asserts that a log nobody holds was
+--    not truncated. Executed and mutation-tested in
+--    `loom-daemon/tests/signoz_ci_failed_run_logs.rs`; the guard is additionally
+--    pinned in ordinary CI by that file's `section_five_null_guards_*` test.
 WITH failed_runs AS (
     SELECT attributes_string['loom.repo'] AS repo,
            attributes_string['loom.ci.workflow'] AS workflow,
@@ -341,11 +362,14 @@ job_logs AS (
 SELECT r.repo AS repo, r.workflow AS workflow, r.run_id AS run_id,
        r.run_attempt AS run_attempt, r.run_conclusion AS run_conclusion,
        r.event AS event, r.git_ref AS git_ref, r.head_sha AS head_sha,
-       j.job AS job, j.job_id AS job_id, j.job_conclusion AS job_conclusion,
-       j.timed_out AS timed_out,
-       l.chunks_present AS chunks_present, l.chunk_count AS chunk_count,
-       l.truncated AS truncated,
-       concat('loom.ci.job_id = ', toString(j.job_id)) AS logs_explorer_filter
+       if(j.job_id = 0, NULL, j.job) AS job,
+       if(j.job_id = 0, NULL, j.job_id) AS job_id,
+       if(j.job_id = 0, NULL, j.job_conclusion) AS job_conclusion,
+       if(j.job_id = 0, NULL, j.timed_out) AS timed_out,
+       if(j.job_id = 0, NULL, l.chunks_present) AS chunks_present,
+       if(j.job_id = 0, NULL, l.chunk_count) AS chunk_count,
+       if(j.job_id = 0, NULL, l.truncated) AS truncated,
+       if(j.job_id = 0, '', concat('loom.ci.job_id = ', toString(j.job_id))) AS logs_explorer_filter
 FROM failed_runs AS r
 LEFT JOIN failed_jobs AS j
   ON j.repo = r.repo AND j.run_id = r.run_id AND j.run_attempt = r.run_attempt

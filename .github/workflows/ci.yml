@@ -533,6 +533,20 @@ jobs:
       # that a feature which never varied scores rankCorr 0.5 rather than 0.
       - name: Verify the SigNoz ETA accuracy queries against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_eta_queries -- --ignored --nocapture
+      # #8528 / #8826: the same technique for section 5 of ci-queries.sql
+      # ("Failed run -> logs"), the one standing CI view whose chunk join no
+      # deployment has ever exercised -- the live trial capture returned 60 rows
+      # all reading `0 of 0`, so everything downstream of the job->log join was
+      # unexecuted code in a view operators act on. Only this run shows that a
+      # failed run with NO non-successful job (a startup_failure) came back
+      # byte-identical in shape to "a failed job whose log never arrived" --
+      # `job_id` 0, `truncated` false, `0 of 0`, and a Logs Explorer filter of
+      # `loom.ci.job_id = 0` that silently matches nothing -- that a replayed
+      # chunk reports 4 of 3 without uniqExact(), that a replayed ci.run record
+      # doubles every job of that run without the run-level dedupe, and that the
+      # asymmetric run_attempt/attempts join keys are both load-bearing.
+      - name: Verify the SigNoz CI failed-run log join against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_ci_failed_run_logs -- --ignored --nocapture
 
   backend-otlp-tests:
     name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})
