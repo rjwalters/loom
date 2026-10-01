@@ -108,10 +108,7 @@ fn render_budget(b: &ForgeBudgetReading, own: Option<u64>, now: DateTime<Utc>) -
         (Some(used), None) => format!(", used {} (own n/a — sink off)", used),
         (None, _) => String::new(),
     };
-    format!(
-        "{} {} left{attribution}{resets} ({source}, {seen} ago)",
-        b.pool, b.remaining
-    )
+    format!("{} {} left{attribution}{resets} ({source}, {seen} ago)", b.pool, b.remaining)
 }
 
 #[cfg(test)]

@@ -548,7 +548,10 @@ pub fn global_observe_failure(error_text: &str, source: &str) -> Option<Transiti
         let line = |pool: &str, used: Option<u64>| -> String {
             match (used, own.as_ref()) {
                 (Some(u), Some(m)) => {
-                    let o = m.iter().find(|(p, _)| p.as_str() == pool).map_or(0, |(_, v)| *v);
+                    let o = m
+                        .iter()
+                        .find(|(p, _)| p.as_str() == pool)
+                        .map_or(0, |(_, v)| *v);
                     format!("used={u} own≈{o} external≈{}", u.saturating_sub(o))
                 }
                 (Some(u), None) => format!("used={u} own=? (sink off) external=?"),

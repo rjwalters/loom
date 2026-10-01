@@ -246,7 +246,9 @@ impl Aggregate {
                 .get(&line.p)
                 .is_none_or(|r| r.observed_at <= line.t);
             if newer {
-                let used = line.usd.or_else(|| self.latest.get(&line.p).and_then(|r| r.used));
+                let used = line
+                    .usd
+                    .or_else(|| self.latest.get(&line.p).and_then(|r| r.used));
                 let reading = Reading {
                     remaining,
                     used,

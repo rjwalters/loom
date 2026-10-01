@@ -119,18 +119,11 @@ fn a_newer_line_without_used_keeps_the_last_known_used() {
     // A pre-#9855 binary shares the sink: its lines carry no `usd`. The
     // newest reading must not erase the last known `used`.
     let now = 1_800_000_000;
-    let with_used = format!(
-        r#"{{"t":{},"c":"a","p":"core","o":"ok","rem":4000,"usd":1000}}"#,
-        now - 10
-    );
-    let without_used = format!(
-        r#"{{"t":{},"c":"a","p":"core","o":"ok","rem":3900}}"#,
-        now - 5
-    );
-    let agg = aggregate_lines(
-        [with_used, without_used].iter().map(String::as_str),
-        now - WINDOW_SECS,
-    );
+    let with_used =
+        format!(r#"{{"t":{},"c":"a","p":"core","o":"ok","rem":4000,"usd":1000}}"#, now - 10);
+    let without_used = format!(r#"{{"t":{},"c":"a","p":"core","o":"ok","rem":3900}}"#, now - 5);
+    let agg =
+        aggregate_lines([with_used, without_used].iter().map(String::as_str), now - WINDOW_SECS);
     let reading = &agg.latest[&Pool::Core];
     assert_eq!((reading.remaining, reading.used), (3900, Some(1000)));
 }
