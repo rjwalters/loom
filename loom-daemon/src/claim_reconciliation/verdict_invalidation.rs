@@ -172,6 +172,13 @@ fn reanchor_tree_unchanged_verdict(
     );
 
     let mut cmd = Command::new(gh_bin);
+    // #9772: the footer's link needs the slug — `LOOM_REPO` when set, else
+    // the root's origin remote. An unresolvable slug posts unlinked rather
+    // than linking to nowhere.
+    let nwo = std::env::var("LOOM_REPO").ok().or_else(|| {
+        crate::worktree_ops::gh::resolve_owner_repo(root).map(|(o, r)| format!("{o}/{r}"))
+    });
+    let body = crate::forge_comment::footer_or_body(nwo.as_deref(), pr.number, true, &body);
     cmd.arg("pr")
         .arg("comment")
         .arg(pr.number.to_string())

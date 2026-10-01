@@ -563,8 +563,9 @@ no-op commit would not help"
 }
 
 fn post_comment(gh: &str, nwo: &str, pr: &str, body: &str) -> Result<String, String> {
-    let payload = serde_json::json!({ "body": body }).to_string();
-    gh_api_body(gh, &[&format!("repos/{nwo}/issues/{pr}/comments")], Some(&payload))
+    // #9772: the daemon's one comment chokepoint — the dashboard footer is
+    // appended there, structurally impossible to omit.
+    crate::forge_comment::post_comment(gh, None, nwo, pr, /* is_pr */ true, body)
 }
 
 /// `gh_api_with` where an empty answer is itself a failure — every read here
