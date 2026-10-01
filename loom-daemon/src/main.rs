@@ -1059,26 +1059,20 @@ enum Commands {
     /// so the verb names cannot collide with existing top-level commands;
     /// args live in `cli::overlap_replay` because this file is frozen by the
     /// ratchet.
-    OverlapReplay {
-        #[command(subcommand)]
-        action: cli::overlap_replay::OverlapReplayCommand,
-    },
+    #[command(subcommand)]
+    OverlapReplay(cli::overlap_replay::OverlapReplayCommand),
 
     /// Content-addressed retrieval cache (#9783): `context fetch | status |
     /// export | import | replay | recover`. Nested family; args live in
     /// `cli::context` because this file is frozen by the ratchet.
-    Context {
-        #[command(subcommand)]
-        action: cli::context::ContextCommand,
-    },
+    #[command(subcommand)]
+    Context(cli::context::ContextCommand),
 
     /// Classified issue footprints (#9784): `footprint build | show |
     /// overlap`. Shadow-only evidence over the #9783 cache. Nested family;
     /// args live in `cli::footprint`.
-    Footprint {
-        #[command(subcommand)]
-        action: cli::footprint::FootprintCommand,
-    },
+    #[command(subcommand)]
+    Footprint(cli::footprint::FootprintCommand),
 
     /// Lease the liveness of a `loom:building` claim (#8193). The args and
     /// their docs live in `cli::lease_ensure` because this file is frozen by
@@ -2366,9 +2360,9 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
         }
         Commands::ScriptPorts(cmd) => cmd.run(),
-        Commands::OverlapReplay { action } => action.run(),
-        Commands::Context { action } => action.run(),
-        Commands::Footprint { action } => action.run(),
+        Commands::OverlapReplay(action) => action.run(),
+        Commands::Context(action) => action.run(),
+        Commands::Footprint(action) => action.run(),
         Commands::Lease { action } => action.run(),
         Commands::Inflight { action } => action.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
