@@ -40,14 +40,39 @@ pub const PER_WORKTREE_GB_ENV: &str = "LOOM_PER_WORKTREE_GB";
 /// Default per-worktree disk estimate (GB). Matches the bash default of 2.
 pub const DEFAULT_PER_WORKTREE_GB: u64 = 2;
 
-/// Resolve the per-worktree GB estimate from [`PER_WORKTREE_GB_ENV`], flooring to
-/// a minimum of 1 (a zero or unparseable value would make the disk term diverge).
-/// Mirrors the bash `per` resolution and its `per < 1` guard.
+/// Resolve the per-worktree GB estimate with precedence **env
+/// ([`PER_WORKTREE_GB_ENV`], which sits ABOVE the layer) > hyperparameters
+/// layer (`hyperparameters.headroom.perWorktreeGb`, startup-anchored — `None`
+/// outside a running daemon) > [`DEFAULT_PER_WORKTREE_GB`]**, flooring to a
+/// minimum of 1 (a zero or unparseable value at any tier falls through to the
+/// next — a zero would make the disk term diverge). Mirrors the bash `per`
+/// resolution and its `per < 1` guard.
 #[must_use]
 pub fn per_worktree_gb() -> u64 {
-    std::env::var(PER_WORKTREE_GB_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    per_worktree_gb_with_layer(crate::config_resolver::u64_from_layer_global(
+        "headroom",
+        "perWorktreeGb",
+    ))
+}
+
+/// [`per_worktree_gb`] with the layer tier injected — the testable form (no
+/// process-global read). Precedence: env > `layer` > default.
+#[must_use]
+pub fn per_worktree_gb_with_layer(layer: Option<u64>) -> u64 {
+    per_worktree_gb_from(
+        std::env::var(PER_WORKTREE_GB_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok()),
+        layer,
+    )
+}
+
+/// Pure **env > layer > default** precedence over already-parsed tiers —
+/// split out so tests exercise the precedence without touching process-global
+/// env state. A value below 1 at any tier falls through to the next.
+fn per_worktree_gb_from(env: Option<u64>, layer: Option<u64>) -> u64 {
+    env.filter(|&n| n >= 1)
+        .or(layer)
         .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT_PER_WORKTREE_GB)
 }
@@ -396,6 +421,21 @@ mod tests {
         std::env::set_var(PER_WORKTREE_GB_ENV, "garbage");
         assert_eq!(per_worktree_gb(), DEFAULT_PER_WORKTREE_GB);
         std::env::remove_var(PER_WORKTREE_GB_ENV);
+    }
+
+    // ===== hyperparameters layer tier (tranche 2) =====
+    //
+    // Pure-tier tests: `per_worktree_gb_from` takes already-parsed Option
+    // tiers, so these never touch process-global env state.
+
+    #[test]
+    fn per_worktree_gb_tiers_env_beats_layer_beats_default() {
+        assert_eq!(per_worktree_gb_from(Some(5), Some(8)), 5);
+        assert_eq!(per_worktree_gb_from(None, Some(8)), 8);
+        assert_eq!(per_worktree_gb_from(None, None), DEFAULT_PER_WORKTREE_GB);
+        // Zero/invalid at any tier falls through to the next.
+        assert_eq!(per_worktree_gb_from(Some(0), Some(8)), 8);
+        assert_eq!(per_worktree_gb_from(None, Some(0)), DEFAULT_PER_WORKTREE_GB);
     }
 
     // ===================================================================

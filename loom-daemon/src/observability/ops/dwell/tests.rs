@@ -289,6 +289,25 @@ fn starvation_threshold_parsing() {
     assert_eq!(starvation_secs(Some("6h")), DEFAULT_STARVATION_SECS);
 }
 
+// ===== hyperparameters layer tier (tranche 2) =====
+//
+// Pure-tier tests: `starvation_secs_from` takes already-parsed Option tiers,
+// so these never touch process-global env state (no `#[serial]` needed).
+
+#[test]
+fn starvation_secs_tiers_env_beats_layer_beats_default() {
+    assert_eq!(starvation_secs_from(Some(3600), Some(72_000)), 3600);
+    assert_eq!(starvation_secs_from(None, Some(72_000)), 72_000);
+    assert_eq!(starvation_secs_from(None, None), DEFAULT_STARVATION_SECS);
+    // Zero/negative at any tier falls through to the next.
+    assert_eq!(starvation_secs_from(Some(0), Some(72_000)), 72_000);
+    assert_eq!(starvation_secs_from(Some(-5), Some(72_000)), 72_000);
+    assert_eq!(starvation_secs_from(None, Some(0)), DEFAULT_STARVATION_SECS);
+    // A layer value above i64::MAX cannot be represented and collapses to
+    // the default rather than wrapping.
+    assert_eq!(starvation_secs_from(None, Some(i64::MAX as u64 + 1)), DEFAULT_STARVATION_SECS);
+}
+
 #[test]
 fn rows_from_report_carry_repo_and_parsed_updated_at() {
     let mut report = crate::work_finder::TickReport::default();

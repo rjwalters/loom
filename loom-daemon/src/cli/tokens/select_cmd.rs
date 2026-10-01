@@ -116,7 +116,7 @@ pub(crate) fn handle_select(args: SelectArgs) -> Result<()> {
     // aged-out entries — so this only bounds the file. Best-effort:
     // never let a cleanup failure block a spawn, and no lock is taken
     // at all when there is nothing to prune.
-    let _ = bad_tokens::cleanup_bad_tokens(&ws, bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS);
+    let _ = bad_tokens::cleanup_bad_tokens(&ws, bad_tokens::resolve_cleanup_max_age_secs());
     // Two orthogonal narrowings, combined in one call:
     // - `--model` (#8058) narrows the `.bad_tokens` skip to the model class
     //   this spawn will actually run. `None`, or a model the classifier does

@@ -77,7 +77,8 @@ const YIELD_MARKER_PREFIX: &str = "<!-- loom:lease-yield host=";
 /// Set to `1` to proceed despite a detected co-occupancy.
 pub(crate) const OVERRIDE_ENV: &str = "WORKTREE_ALLOW_SHARED_LEASE";
 
-/// Bound, in seconds, on the one `gh api` read this makes.
+/// Bound, in seconds, on the one `gh api` read this makes. The env var sits
+/// above the `hyperparameters.process.leaseGuardTimeoutSecs` layer.
 const TIMEOUT_ENV: &str = "LOOM_WORKTREE_LEASE_GUARD_TIMEOUT";
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
@@ -265,10 +266,37 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
     std::env::var(key).ok()?.trim().parse().ok()
 }
 
+/// Resolve the lease-guard read bound: [`TIMEOUT_ENV`] override, else the
+/// hyperparameters layer (`hyperparameters.process.leaseGuardTimeoutSecs`,
+/// startup-anchored — `None` outside a running daemon, so env > default is
+/// preserved in CLI-only contexts), else [`DEFAULT_TIMEOUT_SECS`].
+fn resolve_timeout_secs() -> u64 {
+    resolve_timeout_secs_with_layer(loom_daemon::config_resolver::u64_from_layer_global(
+        "process",
+        "leaseGuardTimeoutSecs",
+    ))
+}
+
+/// [`resolve_timeout_secs`] with the layer tier injected — the testable form
+/// (no process-global read). Precedence: env > `layer` > default.
+fn resolve_timeout_secs_with_layer(layer: Option<u64>) -> u64 {
+    timeout_secs_from(env_parse(TIMEOUT_ENV), layer)
+}
+
+/// Pure **env > layer > default** precedence over already-parsed tiers —
+/// split out so tests exercise the precedence without touching
+/// process-global env state. The env tier keeps its existing verbatim
+/// semantics (a parsed value, including 0, is honored as-is); a zero layer
+/// value is treated as unset and falls through to the default.
+fn timeout_secs_from(env: Option<u64>, layer: Option<u64>) -> u64 {
+    env.or(layer.filter(|&s| s > 0))
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+}
+
 impl LeaseCoOccupancyArgs {
     pub(crate) fn run(self) -> Result<()> {
         let gh_bin = PathBuf::from(std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".into()));
-        let timeout = Duration::from_secs(env_parse(TIMEOUT_ENV).unwrap_or(DEFAULT_TIMEOUT_SECS));
+        let timeout = Duration::from_secs(resolve_timeout_secs());
         let ttl_minutes: f64 = env_parse(TTL_ENV)
             .filter(|m: &f64| m.is_finite() && *m >= 0.0)
             .unwrap_or(DEFAULT_TTL_MINUTES);

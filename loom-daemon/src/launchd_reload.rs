@@ -70,19 +70,25 @@ use crate::restart_verify::{self, Supervisor};
 // ============================================================================
 
 /// Seconds to wait, after `bootout`, for the job to actually disappear from
-/// `launchctl print` before attempting `bootstrap`.
+/// `launchctl print` before attempting `bootstrap`. The env var sits above
+/// the `hyperparameters.process.bootoutSettleSecs` layer.
 pub const BOOTOUT_SETTLE_SECS_ENV: &str = "LOOM_DAEMON_BOOTOUT_SETTLE_SECS";
-/// Default for [`BOOTOUT_SETTLE_SECS_ENV`].
+/// Default for [`BOOTOUT_SETTLE_SECS_ENV`] (and the
+/// `hyperparameters.process.bootoutSettleSecs` layer default).
 pub const DEFAULT_BOOTOUT_SETTLE_SECS: u64 = 5;
 
-/// Bounded `launchctl bootstrap` retry attempts.
+/// Bounded `launchctl bootstrap` retry attempts. The env var sits above the
+/// `hyperparameters.process.bootstrapRetryAttempts` layer.
 pub const BOOTSTRAP_RETRY_ATTEMPTS_ENV: &str = "LOOM_DAEMON_BOOTSTRAP_RETRY_ATTEMPTS";
-/// Default for [`BOOTSTRAP_RETRY_ATTEMPTS_ENV`].
+/// Default for [`BOOTSTRAP_RETRY_ATTEMPTS_ENV`] (and the
+/// `hyperparameters.process.bootstrapRetryAttempts` layer default).
 pub const DEFAULT_BOOTSTRAP_RETRY_ATTEMPTS: u32 = 4;
 
-/// Seconds to sleep between bootstrap retries.
+/// Seconds to sleep between bootstrap retries. The env var sits above the
+/// `hyperparameters.process.bootstrapRetrySecs` layer.
 pub const BOOTSTRAP_RETRY_SECS_ENV: &str = "LOOM_DAEMON_BOOTSTRAP_RETRY_SECS";
-/// Default for [`BOOTSTRAP_RETRY_SECS_ENV`].
+/// Default for [`BOOTSTRAP_RETRY_SECS_ENV`] (and the
+/// `hyperparameters.process.bootstrapRetrySecs` layer default).
 pub const DEFAULT_BOOTSTRAP_RETRY_SECS: u64 = 2;
 
 /// Bound on each individual `launchctl` probe/mutation — all are local,
@@ -92,6 +98,111 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Interval between settle polls.
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+// ============================================================================
+// Environment resolution — precedence **single-knob env var > hyperparameters
+// layer > built-in default** at every knob, so an existing operator override
+// keeps winning over the `.loom/config.json` → `"hyperparameters"` layer.
+// ============================================================================
+
+/// Resolve the post-bootout settle bound: [`BOOTOUT_SETTLE_SECS_ENV`]
+/// override, else the hyperparameters layer
+/// (`hyperparameters.process.bootoutSettleSecs`, startup-anchored — `None`
+/// outside a running daemon, so env > default is preserved in CLI-only
+/// contexts), else [`DEFAULT_BOOTOUT_SETTLE_SECS`].
+#[must_use]
+pub fn resolve_bootout_settle_secs() -> u64 {
+    resolve_bootout_settle_secs_with_layer(crate::config_resolver::u64_from_layer_global(
+        "process",
+        "bootoutSettleSecs",
+    ))
+}
+
+/// [`resolve_bootout_settle_secs`] with the layer tier injected — the
+/// testable form (no process-global read). Precedence: env > `layer` >
+/// default.
+#[must_use]
+pub fn resolve_bootout_settle_secs_with_layer(layer: Option<u64>) -> u64 {
+    secs_from(
+        std::env::var(BOOTOUT_SETTLE_SECS_ENV)
+            .ok()
+            .as_deref()
+            .and_then(|v| v.trim().parse::<u64>().ok()),
+        layer,
+        DEFAULT_BOOTOUT_SETTLE_SECS,
+    )
+}
+
+/// Resolve the bounded `launchctl bootstrap` retry count:
+/// [`BOOTSTRAP_RETRY_ATTEMPTS_ENV`] override, else the hyperparameters layer
+/// (`hyperparameters.process.bootstrapRetryAttempts`), else
+/// [`DEFAULT_BOOTSTRAP_RETRY_ATTEMPTS`].
+#[must_use]
+pub fn resolve_bootstrap_retry_attempts() -> u32 {
+    resolve_bootstrap_retry_attempts_with_layer(crate::config_resolver::u64_from_layer_global(
+        "process",
+        "bootstrapRetryAttempts",
+    ))
+}
+
+/// [`resolve_bootstrap_retry_attempts`] with the layer tier injected — the
+/// testable form (no process-global read). Precedence: env > `layer` >
+/// default.
+#[must_use]
+pub fn resolve_bootstrap_retry_attempts_with_layer(layer: Option<u64>) -> u32 {
+    retry_attempts_from(
+        std::env::var(BOOTSTRAP_RETRY_ATTEMPTS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok()),
+        layer,
+    )
+}
+
+/// Resolve the sleep between bootstrap retries: [`BOOTSTRAP_RETRY_SECS_ENV`]
+/// override, else the hyperparameters layer
+/// (`hyperparameters.process.bootstrapRetrySecs`), else
+/// [`DEFAULT_BOOTSTRAP_RETRY_SECS`].
+#[must_use]
+pub fn resolve_bootstrap_retry_secs() -> u64 {
+    resolve_bootstrap_retry_secs_with_layer(crate::config_resolver::u64_from_layer_global(
+        "process",
+        "bootstrapRetrySecs",
+    ))
+}
+
+/// [`resolve_bootstrap_retry_secs`] with the layer tier injected — the
+/// testable form (no process-global read). Precedence: env > `layer` >
+/// default.
+#[must_use]
+pub fn resolve_bootstrap_retry_secs_with_layer(layer: Option<u64>) -> u64 {
+    secs_from(
+        std::env::var(BOOTSTRAP_RETRY_SECS_ENV)
+            .ok()
+            .as_deref()
+            .and_then(|v| v.trim().parse::<u64>().ok()),
+        layer,
+        DEFAULT_BOOTSTRAP_RETRY_SECS,
+    )
+}
+
+/// Pure **env > layer > default** precedence over already-parsed tiers — the
+/// shared core of both seconds knobs, split out so tests exercise the
+/// precedence without touching process-global env state. The env tier keeps
+/// its existing verbatim semantics (a parsed value, including 0, is honored
+/// as-is); a zero layer value is treated as unset and falls through to
+/// `default`.
+fn secs_from(env: Option<u64>, layer: Option<u64>, default: u64) -> u64 {
+    env.or(layer.filter(|&s| s > 0)).unwrap_or(default)
+}
+
+/// Pure **env > layer > default** precedence for the retry count. The env
+/// tier keeps its existing verbatim semantics (a parsed value, including 0,
+/// is honored as-is — the orchestration core clamps it to ≥1); a layer value
+/// that is zero or does not fit a `u32` is treated as unset.
+fn retry_attempts_from(env: Option<u32>, layer: Option<u64>) -> u32 {
+    env.or_else(|| layer.and_then(|n| u32::try_from(n).ok()).filter(|&n| n > 0))
+        .unwrap_or(DEFAULT_BOOTSTRAP_RETRY_ATTEMPTS)
+}
 
 // ============================================================================
 // Pure classification
@@ -393,18 +504,9 @@ pub fn reload_launchd_supervisor() -> ReloadOutcome {
     let target = resolution.service;
 
     reload_launchd_core(
-        restart_verify::resolve_secs(
-            std::env::var(BOOTOUT_SETTLE_SECS_ENV).ok().as_deref(),
-            DEFAULT_BOOTOUT_SETTLE_SECS,
-        ),
-        std::env::var(BOOTSTRAP_RETRY_ATTEMPTS_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(DEFAULT_BOOTSTRAP_RETRY_ATTEMPTS),
-        restart_verify::resolve_secs(
-            std::env::var(BOOTSTRAP_RETRY_SECS_ENV).ok().as_deref(),
-            DEFAULT_BOOTSTRAP_RETRY_SECS,
-        ),
+        resolve_bootout_settle_secs(),
+        resolve_bootstrap_retry_attempts(),
+        resolve_bootstrap_retry_secs(),
         &domain,
         &plist_str,
         || real_bootout(&target),
@@ -474,6 +576,50 @@ mod tests {
         assert_eq!(
             split_service("user/501/com.rjwalters.loom-daemon"),
             ("user/501".to_string(), "com.rjwalters.loom-daemon".to_string())
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // hyperparameters layer tier (tranche 2)
+    //
+    // Pure-tier tests: `secs_from` / `retry_attempts_from` take
+    // already-parsed Option tiers, so these never touch process-global env
+    // state (no `#[serial]` needed).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn settle_and_retry_secs_tiers_env_beats_layer_beats_default() {
+        assert_eq!(secs_from(Some(9), Some(7), DEFAULT_BOOTOUT_SETTLE_SECS), 9);
+        assert_eq!(secs_from(None, Some(7), DEFAULT_BOOTOUT_SETTLE_SECS), 7);
+        assert_eq!(secs_from(None, None, DEFAULT_BOOTOUT_SETTLE_SECS), DEFAULT_BOOTOUT_SETTLE_SECS);
+        // The same core serves the retry sleep with its own default.
+        assert_eq!(secs_from(None, Some(9), DEFAULT_BOOTSTRAP_RETRY_SECS), 9);
+        assert_eq!(
+            secs_from(None, None, DEFAULT_BOOTSTRAP_RETRY_SECS),
+            DEFAULT_BOOTSTRAP_RETRY_SECS
+        );
+        // The env tier is honored verbatim (a parsed 0 means "no sleep
+        // between retries", as before).
+        assert_eq!(secs_from(Some(0), Some(7), DEFAULT_BOOTSTRAP_RETRY_SECS), 0);
+        // A zero layer is treated as unset and falls through to the default.
+        assert_eq!(
+            secs_from(None, Some(0), DEFAULT_BOOTOUT_SETTLE_SECS),
+            DEFAULT_BOOTOUT_SETTLE_SECS
+        );
+    }
+
+    #[test]
+    fn retry_attempts_tiers_env_beats_layer_beats_default() {
+        assert_eq!(retry_attempts_from(Some(6), Some(8)), 6);
+        assert_eq!(retry_attempts_from(None, Some(8)), 8);
+        assert_eq!(retry_attempts_from(None, None), DEFAULT_BOOTSTRAP_RETRY_ATTEMPTS);
+        // The env tier is honored verbatim (0 is clamped to ≥1 by the core).
+        assert_eq!(retry_attempts_from(Some(0), Some(8)), 0);
+        // Zero / u32-overflowing layer values are treated as unset.
+        assert_eq!(retry_attempts_from(None, Some(0)), DEFAULT_BOOTSTRAP_RETRY_ATTEMPTS);
+        assert_eq!(
+            retry_attempts_from(None, Some(u64::from(u32::MAX) + 1)),
+            DEFAULT_BOOTSTRAP_RETRY_ATTEMPTS
         );
     }
 

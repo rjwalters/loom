@@ -103,17 +103,46 @@ pub enum ActivityProbe {
     Unknown,
 }
 
-/// Resolve the activity window from [`ACTIVITY_WINDOW_ENV`], else
-/// [`DEFAULT_ACTIVITY_WINDOW_MINUTES`]. [`Duration::ZERO`] means the gate is
-/// disabled and [`probe_worktree_activity`] short-circuits to
-/// [`ActivityProbe::Idle`].
+/// Resolve the activity window with precedence **env
+/// ([`ACTIVITY_WINDOW_ENV`]) > hyperparameters layer
+/// (`hyperparameters.supervision.worktreeActivityWindowMinutes`,
+/// startup-anchored) > default** ([`DEFAULT_ACTIVITY_WINDOW_MINUTES`]). The
+/// env var sits above the layer. [`Duration::ZERO`] (env `0`) means the gate
+/// is disabled and [`probe_worktree_activity`] short-circuits to
+/// [`ActivityProbe::Idle`]; a zero **layer** value is invalid (the schema
+/// range is `[1, 1440]`) and falls through to the default — only the env var
+/// can disable the gate.
 #[must_use]
 pub fn resolve_activity_window() -> Duration {
-    let minutes = std::env::var(ACTIVITY_WINDOW_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_ACTIVITY_WINDOW_MINUTES);
-    Duration::from_secs(minutes.saturating_mul(60))
+    resolve_activity_window_with_layer(crate::config_resolver::u64_from_layer_global(
+        "supervision",
+        "worktreeActivityWindowMinutes",
+    ))
+}
+
+/// [`resolve_activity_window`] with the layer tier injected — the testable
+/// form (no process-global read).
+#[must_use]
+pub fn resolve_activity_window_with_layer(layer: Option<u64>) -> Duration {
+    Duration::from_secs(
+        window_minutes_from(
+            std::env::var(ACTIVITY_WINDOW_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok()),
+            layer,
+        )
+        .saturating_mul(60),
+    )
+}
+
+/// Pure **env > layer > default** precedence over already-parsed tiers —
+/// split out so tests exercise the precedence without touching process-global
+/// env state. Unlike every other tier check here, the env tier keeps `0`
+/// (documented "gate disabled" switch); a zero layer is dropped (see
+/// [`resolve_activity_window`]).
+fn window_minutes_from(env: Option<u64>, layer: Option<u64>) -> u64 {
+    env.or(layer.filter(|&m| m > 0))
+        .unwrap_or(DEFAULT_ACTIVITY_WINDOW_MINUTES)
 }
 
 /// The gitdir backing `worktree_path`.
@@ -1051,5 +1080,28 @@ mod tests {
             window(DEFAULT_ACTIVITY_WINDOW_MINUTES)
         );
         assert!(resolve_activity_window() >= Duration::ZERO);
+    }
+
+    // ===== resolve tier precedence (env > hyperparameters layer > default) =====
+    //
+    // Pure-tier tests: `window_minutes_from` takes already-parsed Option
+    // tiers, so these never touch process-global env state (no `#[serial]`
+    // needed).
+
+    #[test]
+    fn window_tiers_env_beats_layer_beats_default() {
+        assert_eq!(window_minutes_from(Some(5), Some(90)), 5);
+        assert_eq!(window_minutes_from(None, Some(90)), 90);
+        assert_eq!(window_minutes_from(None, None), DEFAULT_ACTIVITY_WINDOW_MINUTES);
+    }
+
+    /// Env `0` is special: it DISABLES the gate, so it wins over the layer
+    /// and never falls through — but a zero layer is invalid (schema range
+    /// `[1, 1440]`) and drops to the default. Only the env var can disable.
+    #[test]
+    fn window_tiers_zero_env_disables_but_zero_layer_falls_through() {
+        assert_eq!(window_minutes_from(Some(0), Some(90)), 0);
+        assert_eq!(window_minutes_from(Some(0), None), 0);
+        assert_eq!(window_minutes_from(None, Some(0)), DEFAULT_ACTIVITY_WINDOW_MINUTES);
     }
 }

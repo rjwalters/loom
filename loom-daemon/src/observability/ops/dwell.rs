@@ -240,12 +240,48 @@ pub fn points(observation: &DwellObservation, starvation_secs: i64) -> Vec<Metri
     points
 }
 
+/// The starvation threshold with precedence **env ([`STARVATION_SECS_ENV`],
+/// which sits ABOVE the layer) > hyperparameters layer
+/// (`hyperparameters.observability.queueStarvationSecs`, startup-anchored —
+/// `None` outside a running daemon) > [`DEFAULT_STARVATION_SECS`]**. A
+/// zero/invalid value at any tier falls through to the next.
+#[must_use]
+pub fn resolve_starvation_secs() -> i64 {
+    resolve_starvation_secs_with_layer(crate::config_resolver::u64_from_layer_global(
+        "observability",
+        "queueStarvationSecs",
+    ))
+}
+
+/// [`resolve_starvation_secs`] with the layer tier injected — the testable
+/// form (no process-global read). Precedence: env > `layer` > default.
+#[must_use]
+pub fn resolve_starvation_secs_with_layer(layer: Option<u64>) -> i64 {
+    starvation_secs_from(
+        std::env::var(STARVATION_SECS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok()),
+        layer,
+    )
+}
+
 /// The starvation threshold: `raw` seconds when it is a positive integer,
 /// otherwise [`DEFAULT_STARVATION_SECS`].
 #[must_use]
 pub fn starvation_secs(raw: Option<&str>) -> i64 {
-    raw.and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|v| *v > 0)
+    starvation_secs_from(raw.and_then(|v| v.trim().parse::<i64>().ok()), None)
+}
+
+/// Pure **env > layer > default** precedence over already-parsed tiers —
+/// split out so tests exercise the precedence without touching process-global
+/// env state. A value ≤ 0 at any tier falls through to the next; a layer
+/// value above [`i64::MAX`] (unrepresentable as `i64`) collapses to the
+/// default.
+fn starvation_secs_from(env: Option<i64>, layer: Option<u64>) -> i64 {
+    let layer = layer.and_then(|s| i64::try_from(s).ok());
+    env.filter(|&s| s > 0)
+        .or(layer)
+        .filter(|&s| s > 0)
         .unwrap_or(DEFAULT_STARVATION_SECS)
 }
 
@@ -292,7 +328,7 @@ pub fn record_tick(report: &TickReport, roots: &[PathBuf], started_at: DateTime<
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .observe(&rows, &incomplete, Utc::now());
-    let threshold = starvation_secs(std::env::var(STARVATION_SECS_ENV).ok().as_deref());
+    let threshold = resolve_starvation_secs();
     sink.emit_metrics_since(points(&observation, threshold), Some(started_at));
 }
 

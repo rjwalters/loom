@@ -15,6 +15,7 @@
 //! follow-up issue migrates call sites one at a time.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde_json::{Map, Value};
 
@@ -300,6 +301,54 @@ pub fn get_path<'a>(config: &'a Value, dotted: &str) -> Option<&'a Value> {
         cur = cur.get(segment)?;
     }
     Some(cur)
+}
+
+// ============================================================================
+// Startup root + the tranche-2 per-knob layer accessor
+// ============================================================================
+
+/// The workspace root the daemon started against, captured once by
+/// [`crate::hyperparams::startup_init`]. The anchor for the hot-applied
+/// per-knob reads ([`u64_from_layer_global`]): the layer re-resolves on
+/// every call, so a committed-block edit lands without a daemon restart
+/// (#9768's contract). `None` before a daemon has started in this process —
+/// CLI-only contexts then see env > default, exactly as before.
+static STARTUP_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Capture the daemon's workspace root. Idempotent: the first capture wins
+/// (a `OnceLock`), matching [`crate::hyperparams::startup_init`]'s
+/// run-once contract.
+pub fn set_startup_root(root: &Path) {
+    let _ = STARTUP_ROOT.set(root.to_path_buf());
+}
+
+/// The captured startup root, when a daemon has started in this process.
+#[must_use]
+pub fn startup_root() -> Option<&'static PathBuf> {
+    STARTUP_ROOT.get()
+}
+
+/// Read one `u64` hyperparameter field (`group.key`, e.g.
+/// `"supervision.sweepInflightStaleSecs"`) from the layer at the startup
+/// root — the accessor every tranche-2 consumer calls between its env tier
+/// and its built-in default. `None` when no daemon has started here, the
+/// field is absent/`null`, or it is not a `u64`; the caller's env/default
+/// chain then applies.
+///
+/// This lives in `config_resolver`, not `hyperparams`, on purpose: a
+/// consumer naming it draws only this small module (std + serde) into its
+/// dependency closure, not the hyperparameter schema's crate-wide import
+/// graph — which is what file-level dependency audits
+/// (`merge_pr::stale_checks`) pin per checker.
+#[must_use]
+pub fn u64_from_layer_global(group: &str, key: &str) -> Option<u64> {
+    let root = STARTUP_ROOT.get()?;
+    let effective = resolve_effective_config(root);
+    effective
+        .get(group)
+        .and_then(|g| g.get(key))
+        .filter(|v| !v.is_null())
+        .and_then(serde_json::Value::as_u64)
 }
 
 /// Dotted key read by [`daemon_delegated_to`].

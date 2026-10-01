@@ -58,12 +58,18 @@ pub fn build_restart_invoke_args(
 
 /// `${LOOM_DAEMON_RESTART_POLL_INTERVAL:-1}` — may be fractional (e.g. `0.5`),
 /// matching `sleep`'s own support. An unparseable value falls back to 1s, as
-/// `sleep` would have errored and the loop would have spun.
+/// `sleep` would have errored and the loop would have spun. With the env var
+/// absent, the `hyperparameters.process.restartPollIntervalMs` layer applies
+/// (milliseconds → seconds) before the 1s default — the same knob the
+/// daemon-side verifier resolves, so both sides of a restart agree.
 #[must_use]
 pub fn poll_interval() -> Duration {
-    let raw =
-        util::env_non_empty("LOOM_DAEMON_RESTART_POLL_INTERVAL").unwrap_or_else(|| "1".to_string());
-    Duration::from_secs_f64(raw.parse::<f64>().unwrap_or(1.0).max(0.0))
+    if let Some(raw) = util::env_non_empty("LOOM_DAEMON_RESTART_POLL_INTERVAL") {
+        return Duration::from_secs_f64(raw.parse::<f64>().unwrap_or(1.0).max(0.0));
+    }
+    let layer_ms =
+        crate::config_resolver::u64_from_layer_global("process", "restartPollIntervalMs");
+    Duration::from_secs_f64(layer_ms.map_or(1.0, |ms| ms as f64 / 1000.0))
 }
 
 /// Parse a poll-window string for timing. The STRING is what the messages

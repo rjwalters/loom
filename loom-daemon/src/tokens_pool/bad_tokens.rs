@@ -181,15 +181,74 @@ pub const DEFAULT_CLEANUP_MAX_AGE_SECS: i64 = 24 * 3600;
 /// the 30d floor is garbage collection, not expiry.
 pub const AUTH_ENTRY_MIN_RETENTION_SECS: i64 = 30 * 24 * 3600;
 
-/// Resolve the exhaustion-entry cooldown: the [`EXHAUSTION_COOLDOWN_ENV`]
-/// override (whole seconds, `> 0`) or [`DEFAULT_EXHAUSTION_COOLDOWN_SECS`].
+/// Resolve the exhaustion-entry cooldown with precedence **env
+/// ([`EXHAUSTION_COOLDOWN_ENV`], whole seconds, `> 0`) > hyperparameters layer
+/// (`hyperparameters.supervision.tokenExhaustionCooldownSecs`,
+/// startup-anchored) > default** ([`DEFAULT_EXHAUSTION_COOLDOWN_SECS`]). The
+/// env var sits above the layer. A zero/unparseable value at any tier falls
+/// through to the next.
 #[must_use]
 pub fn exhaustion_cooldown_secs() -> i64 {
-    std::env::var(EXHAUSTION_COOLDOWN_ENV)
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .filter(|&n| n > 0)
+    exhaustion_cooldown_secs_with_layer(crate::config_resolver::u64_from_layer_global(
+        "supervision",
+        "tokenExhaustionCooldownSecs",
+    ))
+}
+
+/// [`exhaustion_cooldown_secs`] with the layer tier injected — the testable
+/// form (no process-global read).
+#[must_use]
+pub fn exhaustion_cooldown_secs_with_layer(layer: Option<u64>) -> i64 {
+    cooldown_secs_from(
+        std::env::var(EXHAUSTION_COOLDOWN_ENV)
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok()),
+        layer,
+    )
+}
+
+/// Pure **env > layer > default** precedence over already-parsed tiers —
+/// split out so tests exercise the precedence without touching process-global
+/// env state. A zero/unparseable value at any tier falls through to the next;
+/// the `u64` layer value is narrowed with `i64::try_from` (an oversized value
+/// cannot occur through the validated layer, and falls to the default).
+fn cooldown_secs_from(env: Option<i64>, layer: Option<u64>) -> i64 {
+    env.filter(|&n| n > 0)
+        .or_else(|| layer.filter(|&n| n > 0).and_then(|n| i64::try_from(n).ok()))
         .unwrap_or(DEFAULT_EXHAUSTION_COOLDOWN_SECS)
+}
+
+/// Resolve the routine-cleanup retention window: the hyperparameters layer
+/// (`hyperparameters.supervision.badTokenCleanupMaxAgeSecs`,
+/// startup-anchored) or [`DEFAULT_CLEANUP_MAX_AGE_SECS`]. This knob was
+/// promoted from a bare constant and has **no single-knob env var**, so the
+/// layer is the only override tier; it sits above the default. A zero or
+/// non-integer layer value falls through to the default.
+#[must_use]
+pub fn resolve_cleanup_max_age_secs() -> i64 {
+    resolve_cleanup_max_age_secs_with_layer(crate::config_resolver::u64_from_layer_global(
+        "supervision",
+        "badTokenCleanupMaxAgeSecs",
+    ))
+}
+
+/// [`resolve_cleanup_max_age_secs`] with the layer tier injected — the
+/// testable form (no process-global read).
+#[must_use]
+pub fn resolve_cleanup_max_age_secs_with_layer(layer: Option<u64>) -> i64 {
+    cleanup_max_age_secs_from(layer)
+}
+
+/// Pure **layer > default** precedence over the already-parsed tier — split
+/// out so tests exercise it without touching process-global state. The `u64`
+/// layer value is narrowed with `i64::try_from` (an oversized value cannot
+/// occur through the validated layer, and falls to the default).
+fn cleanup_max_age_secs_from(layer: Option<u64>) -> i64 {
+    layer
+        .filter(|&n| n > 0)
+        .map_or(DEFAULT_CLEANUP_MAX_AGE_SECS, |n| {
+            i64::try_from(n).unwrap_or(DEFAULT_CLEANUP_MAX_AGE_SECS)
+        })
 }
 
 fn tokens_dir(workspace: &Path) -> PathBuf {

@@ -140,7 +140,21 @@ set -euo pipefail
 
 LEASE_MARKER_PREFIX="<!-- loom:lease host="
 YIELD_MARKER_PREFIX="<!-- loom:lease-yield host="
-DEFAULT_TTL_MINUTES="${LOOM_LEASE_TTL_MINUTES:-15}"
+# Lease-freshness TTL, resolved down the same chain the daemon documents for
+# `lifecycle.leaseTtlMinutes` (defaults/docs/hyperparameters.md), as far as
+# shell can see it: env > committed `hyperparameters` block > 15. The
+# `$LOOM_HYPERPARAMS` vector tier is daemon-only (a shell script cannot see
+# it) — if you tune the TTL by vector for a run, export
+# `LOOM_LEASE_TTL_MINUTES` alongside it so this guard agrees with the daemon.
+DEFAULT_TTL_MINUTES="${LOOM_LEASE_TTL_MINUTES:-}"
+if [[ -z "$DEFAULT_TTL_MINUTES" ]]; then
+  lease_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$lease_repo_root" ]]; then
+    DEFAULT_TTL_MINUTES="$(jq -r '.hyperparameters.lifecycle.leaseTtlMinutes
+      // empty' "$lease_repo_root/.loom/config.json" 2>/dev/null || true)"
+  fi
+fi
+DEFAULT_TTL_MINUTES="${DEFAULT_TTL_MINUTES:-15}"
 
 # --- Opaque host id (Issue #6322, ported from sweep-lease-fence.sh) --------
 # `write_lease_comment` (`loom-daemon/src/sweep_registry/guards.rs`) publishes

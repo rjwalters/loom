@@ -86,17 +86,6 @@ use crate::workspace_registry::WorkspaceRegistry;
 // Constants
 // ============================================================================
 
-/// Default time-to-live for an in-flight singleton transition before the
-/// supervisor is willing to re-dispatch it. A role dispatch that lands its
-/// mutation advances the derived state (clearing the ledger) well within this
-/// window; the TTL only ever fires when a dispatched role *crashed* without
-/// landing its mutation, so re-dispatch is the correct recovery.
-pub const DEFAULT_INFLIGHT_TTL_SECS: u64 = 900;
-
-/// Environment variable overriding [`DEFAULT_INFLIGHT_TTL_SECS`]. Follows the
-/// `LOOM_*` convention used elsewhere in the daemon.
-pub const INFLIGHT_TTL_ENV: &str = "LOOM_EPIC_INFLIGHT_TTL_SECS";
-
 /// Environment variable enabling the epic supervisor loop (Phase 4, #3872).
 ///
 /// The supervisor is **opt-in** — unset or a false-y value keeps it OFF —
@@ -105,13 +94,17 @@ pub const INFLIGHT_TTL_ENV: &str = "LOOM_EPIC_INFLIGHT_TTL_SECS";
 /// `on` to enable.
 pub const SUPERVISOR_ENABLE_ENV: &str = "LOOM_EPIC_SUPERVISOR";
 
-/// Environment variable overriding the supervisor tick interval (seconds).
-pub const SUPERVISOR_INTERVAL_ENV: &str = "LOOM_EPIC_SUPERVISOR_INTERVAL_SECS";
-
-/// Default supervisor tick interval. Epics advance on the order of minutes
-/// (each transition spawns a role process), so a 5-minute cadence is ample and
-/// keeps forge query volume low.
-pub const DEFAULT_SUPERVISOR_INTERVAL_SECS: u64 = 300;
+// The cadence knobs (tick interval, in-flight TTL) live in a sibling module
+// for the file-size-ratchet reason recorded there (`epic_supervisor.rs` is
+// frozen at its current size; see `.loom/docs/file-size-policy.md`). Pure
+// move plus a hyperparameters layer tier, re-exported here so every existing
+// reference in this file and its siblings is unchanged.
+mod config;
+use config::resolve_inflight_ttl;
+pub use config::{
+    resolve_supervisor_interval, resolve_supervisor_interval_with_layer, DEFAULT_INFLIGHT_TTL_SECS,
+    DEFAULT_SUPERVISOR_INTERVAL_SECS, INFLIGHT_TTL_ENV, SUPERVISOR_INTERVAL_ENV,
+};
 
 // ============================================================================
 // Fetched epic facts
@@ -766,15 +759,6 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
     }
 }
 
-/// Resolve the in-flight TTL from [`INFLIGHT_TTL_ENV`], falling back to
-/// [`DEFAULT_INFLIGHT_TTL_SECS`].
-fn resolve_inflight_ttl() -> Duration {
-    std::env::var(INFLIGHT_TTL_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map_or_else(|| Duration::from_secs(DEFAULT_INFLIGHT_TTL_SECS), Duration::from_secs)
-}
-
 /// Run one **multi-workspace** supervisor tick across N supervisors — one per
 /// registered workspace (#3928) — isolating per-workspace errors.
 ///
@@ -858,18 +842,6 @@ pub fn supervisor_enabled() -> bool {
     std::env::var(SUPERVISOR_ENABLE_ENV).is_ok_and(|v| {
         matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
     })
-}
-
-/// Resolve the supervisor tick interval from [`SUPERVISOR_INTERVAL_ENV`],
-/// falling back to [`DEFAULT_SUPERVISOR_INTERVAL_SECS`]. A zero or unparseable
-/// value falls back to the default (a zero-interval busy loop is never useful).
-#[must_use]
-pub fn resolve_supervisor_interval() -> Duration {
-    std::env::var(SUPERVISOR_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .map_or_else(|| Duration::from_secs(DEFAULT_SUPERVISOR_INTERVAL_SECS), Duration::from_secs)
 }
 
 /// Handle to a running supervisor loop thread.

@@ -303,3 +303,108 @@ fn build_backoff_reader_falls_back_on_a_crossed_final_pair() {
     assert_eq!(parsed.config.low, DEFAULT_LOW);
     assert_eq!(parsed.rejected_pair, Some((60, 100)));
 }
+
+// ---------------------------------------------------------------------------
+// Tranche 2: supervision / headroom / process / observability / update
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tranche2_defaults_resolve_from_builtin_constants() {
+    let tmp = empty_workspace();
+    let resolved = resolve_effective(tmp.path());
+    assert_eq!(resolved.params.supervision.epic_supervisor_interval_secs, 300);
+    assert_eq!(resolved.params.supervision.sweep_inflight_stale_secs, 14_400);
+    assert_eq!(resolved.params.supervision.bad_token_cleanup_max_age_secs, 86_400);
+    assert_eq!(resolved.params.headroom.per_worktree_gb, 2);
+    assert_eq!(resolved.params.headroom.per_worktree_ram_gb, 2);
+    assert_eq!(resolved.params.process.restart_poll_secs, 30);
+    assert_eq!(resolved.params.process.ipc_timeout_ms, 30_000);
+    assert_eq!(resolved.params.observability.queue_starvation_secs, 21_600);
+    assert_eq!(resolved.params.update.stale_warn_commits, 10);
+    assert_eq!(resolved.params.update.stale_warn_hours, 12);
+    // No legacy tier for tranche-2 fields: absent layer ⇒ Default provenance.
+    assert_eq!(resolved.sources["supervision.epicSupervisorIntervalSecs"], Source::Default);
+    assert_eq!(resolved.sources["headroom.perWorktreeGb"], Source::Default);
+}
+
+#[test]
+#[serial]
+fn tranche2_config_block_overrides_and_env_vector_beats_it() {
+    let tmp = empty_workspace();
+    write_config(
+        tmp.path(),
+        r#"{"hyperparameters": {
+            "supervision": {"sweepInflightStaleSecs": 7200, "epicSupervisorIntervalSecs": 120},
+            "headroom": {"perWorktreeGb": 4},
+            "process": {"restartPollSecs": 60},
+            "observability": {"queueStarvationSecs": 3600},
+            "update": {"staleWarnHours": 24}}}"#,
+    );
+    let resolved = resolve_effective(tmp.path());
+    assert_eq!(resolved.params.supervision.sweep_inflight_stale_secs, 7200);
+    assert_eq!(resolved.params.headroom.per_worktree_gb, 4);
+    assert_eq!(resolved.params.process.restart_poll_secs, 60);
+    assert_eq!(resolved.params.observability.queue_starvation_secs, 3600);
+    assert_eq!(resolved.params.update.stale_warn_hours, 24);
+    assert_eq!(resolved.sources["supervision.sweepInflightStaleSecs"], Source::Config);
+
+    // The env vector still wins per field, dotted or nested.
+    std::env::set_var(HYPERPARAMS_ENV, r#"{"headroom.perWorktreeGb": 8}"#);
+    let resolved = resolve_effective(tmp.path());
+    std::env::remove_var(HYPERPARAMS_ENV);
+    assert_eq!(resolved.params.headroom.per_worktree_gb, 8);
+    assert_eq!(resolved.sources["headroom.perWorktreeGb"], Source::EnvVector);
+}
+
+#[test]
+fn tranche2_validation_names_unknown_keys_and_out_of_range_values() {
+    let violations = validate_layer(&serde_json::json!({
+        "supervision": {"bogus": 1, "sweepReaperIntervalSecs": 0},
+        "headroom": {"perWorktreeRamGb": 9999},
+        "process": {"ipcTimeoutMs": "forever"},
+        "observability": {"dispatchDispositionRefreshSecs": 1},
+        "update": {"staleWarnCommits": 0},
+    }));
+    let paths: Vec<_> = violations.iter().map(|v| v.path.as_str()).collect();
+    for path in [
+        "supervision.bogus",
+        "supervision.sweepReaperIntervalSecs",
+        "headroom.perWorktreeRamGb",
+        "process.ipcTimeoutMs",
+        "observability.dispatchDispositionRefreshSecs",
+        "update.staleWarnCommits",
+    ] {
+        assert!(paths.contains(&path), "{violations:?}");
+    }
+}
+
+#[test]
+fn u64_from_layer_reads_nested_fields_and_skips_null_or_wrong_types() {
+    let layer = serde_json::json!({
+        "supervision": {"sweepInflightStaleSecs": 7200, "reapGhTimeoutSecs": null,
+                        "epicInflightTtlSecs": "many"},
+    });
+    assert_eq!(u64_from_layer(&layer, "supervision", "sweepInflightStaleSecs"), Some(7200));
+    assert_eq!(u64_from_layer(&layer, "supervision", "reapGhTimeoutSecs"), None);
+    assert_eq!(u64_from_layer(&layer, "supervision", "epicInflightTtlSecs"), None);
+    assert_eq!(u64_from_layer(&layer, "supervision", "absent"), None);
+    assert_eq!(u64_from_layer(&layer, "absent", "absent"), None);
+}
+
+#[test]
+#[serial]
+fn tranche2_layer_values_reach_consumers_through_the_accessor() {
+    // The consumer-side seam: a committed block (or injected vector) shows up
+    // through `u64_from_layer` with the same value `resolve_effective`
+    // reports, so a consumer's env > layer > default chain sees exactly the
+    // vector the startup log printed.
+    let tmp = empty_workspace();
+    write_config(
+        tmp.path(),
+        r#"{"hyperparameters": {"supervision": {"sweepInflightStaleSecs": 7200}}}"#,
+    );
+    let layer = layer(tmp.path());
+    assert_eq!(u64_from_layer(&layer, "supervision", "sweepInflightStaleSecs"), Some(7200));
+    let resolved = resolve_effective(tmp.path());
+    assert_eq!(resolved.params.supervision.sweep_inflight_stale_secs, 7200);
+}
