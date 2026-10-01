@@ -814,6 +814,14 @@ fn daemon_write_paths_are_scoped() {
             OperatorOnly("`fleet-config propose`: a PR against the configured store"),
         ),
         (
+            "cli/merge_pr_consolidate.rs",
+            OperatorOnly(
+                "`merge-pr consolidate-prepare`/`consolidate-abort` (#9688): an explicit, \
+                 operator-named group; no autonomous caller exists yet (#9689 wires \
+                 reconciliation)",
+            ),
+        ),
+        (
             "watchdog/peer_coord.rs",
             NotAWrite("follow-up on the issue this watchdog filed"),
         ),
