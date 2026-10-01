@@ -5,6 +5,12 @@
 **Status:** final recommendation for the next delivery stage  
 **Audited experiment commit:** `e6d5fe545bca1fa8979958aae533ea748ca33d58`
 
+**Executed follow-up:** [Round 3](round3/README.md) now supplies an independent
+Git diagnostic, strict patch-preservation evidence, and a qualified historical
+file-footprint comparison. It confirms the measurement concerns and finds a
+modest exploratory retrieval increment over a cheap hybrid. The shadow-only
+decision and requirement for prospective action evidence still stand.
+
 ## Decision in brief
 
 **Proceed with the revision-pinned cache, inspectable footprints, and prospective

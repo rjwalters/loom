@@ -1,0 +1,1195 @@
+{
+  "oracle": {
+    "protocol": "round3/PROTOCOL.md",
+    "scope": "measurement_diagnostic_previously_inspected_sample",
+    "started_at": "2026-10-01T09:08:24.017337+00:00",
+    "finished_at": "2026-10-01T09:08:37.369926+00:00",
+    "elapsed_seconds": 13.35,
+    "git_version": "git version 2.43.0",
+    "python_version": "3.12.3",
+    "machine": "aarch64",
+    "manifest_sha256": "a42494035800b2513ee4a5bccbea6b970e78fb8fc04288ea41ad6046de438153",
+    "driver_sha256": "a0a0e0995579e8d002040a24d20ccc3bf35deae40668658da62200fcbcaf25ea",
+    "n": 121,
+    "paired_table": [
+      {
+        "forced": "clean",
+        "native": "clean",
+        "n": 43
+      },
+      {
+        "forced": "clean",
+        "native": "textual_conflict",
+        "n": 9
+      },
+      {
+        "forced": "textual_conflict",
+        "native": "clean",
+        "n": 54
+      },
+      {
+        "forced": "textual_conflict",
+        "native": "textual_conflict",
+        "n": 15
+      }
+    ],
+    "disagreement_pair_ids": [
+      "q-9591-9585",
+      "q-9102-9134",
+      "q-9326-9107",
+      "q-9021-9088",
+      "q-9013-8921",
+      "q-9032-8968",
+      "q-8851-8825",
+      "q-9311-9135",
+      "q-9517-8884",
+      "q-9091-9060",
+      "q-9038-9015",
+      "q-9329-9301",
+      "q-8818-9253",
+      "q-9010-9188",
+      "q-9016-8940",
+      "q-9362-9686",
+      "q-9433-9432",
+      "q-9328-9576",
+      "q-9141-9231",
+      "q-9421-9366",
+      "q-9465-9445",
+      "q-9434-9552",
+      "q-9098-8912",
+      "q-8683-8773",
+      "q-9273-9239",
+      "q-9343-9077",
+      "q-9357-9521",
+      "q-8787-8652",
+      "q-8845-8844",
+      "q-8699-8901",
+      "q-9318-9443",
+      "q-9321-9410",
+      "q-9620-9610",
+      "q-9327-8959",
+      "q-9310-9370",
+      "q-8992-8923",
+      "q-9596-9589",
+      "q-9597-9673",
+      "q-9331-9572",
+      "q-8608-8776",
+      "q-8934-8894",
+      "q-8767-8762",
+      "q-9630-9592",
+      "q-9724-9669",
+      "q-9772-9768",
+      "q-9315-9467",
+      "q-9599-9631",
+      "q-9683-9685",
+      "q-9106-9005",
+      "q-9442-9085",
+      "q-8927-8711",
+      "q-9672-9674",
+      "q-9314-9297",
+      "q-8765-8750",
+      "q-9699-9657",
+      "q-8839-8860",
+      "q-8770-8757",
+      "q-9289-9299",
+      "q-9598-9651",
+      "q-9089-9365",
+      "q-9034-8944",
+      "q-8824-8827",
+      "q-8953-9215"
+    ],
+    "head_containment_pairs": 52,
+    "declared_base_not_ancestor_of_both": 114,
+    "controls": [
+      {
+        "name": "disjoint",
+        "native": "clean",
+        "forced": "clean"
+      },
+      {
+        "name": "same-line",
+        "native": "textual_conflict",
+        "forced": "textual_conflict"
+      },
+      {
+        "name": "upstream-drift",
+        "native": "clean",
+        "forced": "textual_conflict"
+      },
+      {
+        "name": "semantic-disjoint",
+        "native": "clean",
+        "forced": "clean"
+      }
+    ],
+    "limitations": [
+      "Native merges retain inherited history and do not identify independent-patch collision.",
+      "Previously inspected outcome-selected data cannot establish prospective accuracy.",
+      "Fixture semantics are constructed, not prevalence evidence."
+    ]
+  },
+  "patch_isolation": {
+    "endpoint": "textual collision of exactly transplanted final net patches",
+    "n_pairs": 121,
+    "labels": {
+      "clean": 21,
+      "unknown": 100
+    },
+    "unknown_reasons": {
+      "one_or_both_patches_not_exactly_reconstructable": 63,
+      "one_or_both_own_chains_unqualified": 37
+    },
+    "own_chain_status": {
+      "qualified_chain": 200,
+      "unknown": 42
+    },
+    "qualified_title_body_cases": 61,
+    "excluded_title_body_cases": 181,
+    "exclusion_reasons": {
+      "issue_edited": 168,
+      "nonlinear_own_commit": 41,
+      "source_not_ancestor_of_patch_base": 3,
+      "own_commits_not_contiguous": 1
+    },
+    "selected_issue_ids": [
+      9467,
+      8919,
+      9038,
+      9105,
+      9591,
+      9683,
+      9133,
+      9442,
+      8757,
+      9440,
+      8758,
+      9434
+    ],
+    "frozen_inputs_sha256": "5e879fdb46ba6dc302fce30d1ccc01570857b03070b851b519b06dc9fe5f2673",
+    "observed_issue_metadata_at": "2026-10-01T09:12:04.407943+00:00",
+    "source_main_tip": "6eb2b65a4496b7becb84ef1f944493a541fd01cd",
+    "driver_sha256": "634970750ad25283563ca776a75e7e0b1a9094104488c6247b7dd422f07fbfa1",
+    "limitations": [
+      "Final net patches are not original pre-repair patches.",
+      "Exact preimage requirement excludes difficult cases; unknown is not clean.",
+      "Qualified historical input metadata cannot exclude provider pretraining leakage or unobserved work."
+    ]
+  },
+  "footprint": {
+    "strict_primary": {
+      "n_cases": 1,
+      "issue_ids": [
+        9591
+      ],
+      "metrics": {
+        "literal": {
+          "5": {
+            "n": 1,
+            "macro_recall": 0.0,
+            "macro_precision_at_k": 0.0,
+            "macro_precision_returned": null,
+            "empty_rankings": 1,
+            "micro_recall": 0.0
+          },
+          "10": {
+            "n": 1,
+            "macro_recall": 0.0,
+            "macro_precision_at_k": 0.0,
+            "macro_precision_returned": null,
+            "empty_rankings": 1,
+            "micro_recall": 0.0
+          },
+          "20": {
+            "n": 1,
+            "macro_recall": 0.0,
+            "macro_precision_at_k": 0.0,
+            "macro_precision_returned": null,
+            "empty_rankings": 1,
+            "micro_recall": 0.0
+          }
+        },
+        "bm25": {
+          "5": {
+            "n": 1,
+            "macro_recall": 0.0,
+            "macro_precision_at_k": 0.0,
+            "macro_precision_returned": 0.0,
+            "empty_rankings": 0,
+            "micro_recall": 0.0
+          },
+          "10": {
+            "n": 1,
+            "macro_recall": 0.3333333333333333,
+            "macro_precision_at_k": 0.1,
+            "macro_precision_returned": 0.1,
+            "empty_rankings": 0,
+            "micro_recall": 0.3333333333333333
+          },
+          "20": {
+            "n": 1,
+            "macro_recall": 0.3333333333333333,
+            "macro_precision_at_k": 0.05,
+            "macro_precision_returned": 0.05,
+            "empty_rankings": 0,
+            "micro_recall": 0.3333333333333333
+          }
+        },
+        "augment": {
+          "5": {
+            "n": 1,
+            "macro_recall": 0.3333333333333333,
+            "macro_precision_at_k": 0.2,
+            "macro_precision_returned": 0.2,
+            "empty_rankings": 0,
+            "micro_recall": 0.3333333333333333
+          },
+          "10": {
+            "n": 1,
+            "macro_recall": 0.3333333333333333,
+            "macro_precision_at_k": 0.1,
+            "macro_precision_returned": 0.1,
+            "empty_rankings": 0,
+            "micro_recall": 0.3333333333333333
+          },
+          "20": {
+            "n": 1,
+            "macro_recall": 0.3333333333333333,
+            "macro_precision_at_k": 0.05,
+            "macro_precision_returned": 0.06666666666666667,
+            "empty_rankings": 0,
+            "micro_recall": 0.3333333333333333
+          }
+        }
+      },
+      "paired_comparisons": {
+        "bm25": {
+          "n": 1,
+          "source_groups": 1,
+          "mean_delta_recall_at_10": 0.0,
+          "descriptive_bootstrap_95": null,
+          "wins": 0,
+          "ties": 1,
+          "losses": 0
+        },
+        "literal": {
+          "n": 1,
+          "source_groups": 1,
+          "mean_delta_recall_at_10": 0.3333333333333333,
+          "descriptive_bootstrap_95": null,
+          "wins": 1,
+          "ties": 0,
+          "losses": 0
+        }
+      },
+      "per_issue_deltas": [
+        {
+          "issue": 9591,
+          "source_revision": "4acbaecf4c883858cf1a50c2fe13afb6160b340c",
+          "baseline": "bm25",
+          "delta_recall_at_10": 0.0
+        },
+        {
+          "issue": 9591,
+          "source_revision": "4acbaecf4c883858cf1a50c2fe13afb6160b340c",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.3333333333333333
+        }
+      ]
+    },
+    "finite_budget_sensitivity": {
+      "n_cases": 12,
+      "issue_ids": [
+        8757,
+        8758,
+        8919,
+        9038,
+        9105,
+        9133,
+        9434,
+        9440,
+        9442,
+        9467,
+        9591,
+        9683
+      ],
+      "metrics": {
+        "literal": {
+          "5": {
+            "n": 12,
+            "macro_recall": 0.11931216931216931,
+            "macro_precision_at_k": 0.15,
+            "macro_precision_returned": 0.4916666666666667,
+            "empty_rankings": 6,
+            "micro_recall": 0.05389221556886228
+          },
+          "10": {
+            "n": 12,
+            "macro_recall": 0.11931216931216931,
+            "macro_precision_at_k": 0.075,
+            "macro_precision_returned": 0.475,
+            "empty_rankings": 6,
+            "micro_recall": 0.05389221556886228
+          },
+          "20": {
+            "n": 12,
+            "macro_recall": 0.12394179894179894,
+            "macro_precision_at_k": 0.04166666666666667,
+            "macro_precision_returned": 0.48863636363636365,
+            "empty_rankings": 6,
+            "micro_recall": 0.059880239520958084
+          }
+        },
+        "bm25": {
+          "5": {
+            "n": 12,
+            "macro_recall": 0.04330357142857143,
+            "macro_precision_at_k": 0.13333333333333333,
+            "macro_precision_returned": 0.13333333333333333,
+            "empty_rankings": 0,
+            "micro_recall": 0.04790419161676647
+          },
+          "10": {
+            "n": 12,
+            "macro_recall": 0.10032193432928727,
+            "macro_precision_at_k": 0.14166666666666666,
+            "macro_precision_returned": 0.14166666666666666,
+            "empty_rankings": 0,
+            "micro_recall": 0.10179640718562874
+          },
+          "20": {
+            "n": 12,
+            "macro_recall": 0.1364330454403984,
+            "macro_precision_at_k": 0.09583333333333334,
+            "macro_precision_returned": 0.09583333333333334,
+            "empty_rankings": 0,
+            "micro_recall": 0.1377245508982036
+          }
+        },
+        "augment": {
+          "5": {
+            "n": 12,
+            "macro_recall": 0.19156551509492686,
+            "macro_precision_at_k": 0.3,
+            "macro_precision_returned": 0.3,
+            "empty_rankings": 0,
+            "micro_recall": 0.10778443113772455
+          },
+          "10": {
+            "n": 12,
+            "macro_recall": 0.25088215841892314,
+            "macro_precision_at_k": 0.25,
+            "macro_precision_returned": 0.2712962962962963,
+            "empty_rankings": 0,
+            "micro_recall": 0.17964071856287425
+          },
+          "20": {
+            "n": 12,
+            "macro_recall": 0.28656337535014004,
+            "macro_precision_at_k": 0.15833333333333333,
+            "macro_precision_returned": 0.2678334107126677,
+            "empty_rankings": 0,
+            "micro_recall": 0.2275449101796407
+          }
+        }
+      },
+      "paired_comparisons": {
+        "bm25": {
+          "n": 12,
+          "source_groups": 10,
+          "mean_delta_recall_at_10": 0.15056022408963585,
+          "descriptive_bootstrap_95": [
+            0.028327228327228327,
+            0.3493846023257788
+          ],
+          "wins": 7,
+          "ties": 4,
+          "losses": 1
+        },
+        "literal": {
+          "n": 12,
+          "source_groups": 10,
+          "mean_delta_recall_at_10": 0.1315699891067538,
+          "descriptive_bootstrap_95": [
+            0.06384637188208617,
+            0.2026844070961718
+          ],
+          "wins": 9,
+          "ties": 3,
+          "losses": 0
+        }
+      },
+      "per_issue_deltas": [
+        {
+          "issue": 8757,
+          "source_revision": "0c66c5696315ea61d9ea77d634f94849c2ad6ba2",
+          "baseline": "bm25",
+          "delta_recall_at_10": 0.06666666666666667
+        },
+        {
+          "issue": 8757,
+          "source_revision": "0c66c5696315ea61d9ea77d634f94849c2ad6ba2",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.06666666666666667
+        },
+        {
+          "issue": 8758,
+          "source_revision": "0c66c5696315ea61d9ea77d634f94849c2ad6ba2",
+          "baseline": "bm25",
+          "delta_recall_at_10": 0.2857142857142857
+        },
+        {
+          "issue": 8758,
+          "source_revision": "0c66c5696315ea61d9ea77d634f94849c2ad6ba2",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.2857142857142857
+        },
+        {
+          "issue": 8919,
+          "source_revision": "285ce9ad546715140402e09dac756921ea5bfd53",
+          "baseline": "bm25",
+          "delta_recall_at_10": 0.23529411764705882
+        },
+        {
+          "issue": 8919,
+          "source_revision": "285ce9ad546715140402e09dac756921ea5bfd53",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.29411764705882354
+        },
+        {
+          "issue": 9038,
+          "source_revision": "44d2f2a1bfd0123e0fbe72fe2acad9914cf5263c",
+          "baseline": "bm25",
+          "delta_recall_at_10": 0.11111111111111113
+        },
+        {
+          "issue": 9038,
+          "source_revision": "44d2f2a1bfd0123e0fbe72fe2acad9914cf5263c",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.2777777777777778
+        },
+        {
+          "issue": 9105,
+          "source_revision": "e4501965c906d65965c685e5808be8e512a1ecba",
+          "baseline": "bm25",
+          "delta_recall_at_10": 0.1
+        },
+        {
+          "issue": 9105,
+          "source_revision": "e4501965c906d65965c685e5808be8e512a1ecba",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.1
+        },
+        {
+          "issue": 9133,
+          "source_revision": "ec64146b2b759fdc65cc0753cf9b201b7f87a509",
+          "baseline": "bm25",
+          "delta_recall_at_10": 0.05555555555555555
+        },
+        {
+          "issue": 9133,
+          "source_revision": "ec64146b2b759fdc65cc0753cf9b201b7f87a509",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.1111111111111111
+        },
+        {
+          "issue": 9434,
+          "source_revision": "76f888f14e90e156d667dd03fc6de4e49c1d6bef",
+          "baseline": "bm25",
+          "delta_recall_at_10": 0.0
+        },
+        {
+          "issue": 9434,
+          "source_revision": "76f888f14e90e156d667dd03fc6de4e49c1d6bef",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.0
+        },
+        {
+          "issue": 9440,
+          "source_revision": "88b08384d0e827ac03eaa84dee791177a9f9ab11",
+          "baseline": "bm25",
+          "delta_recall_at_10": -0.047619047619047616
+        },
+        {
+          "issue": 9440,
+          "source_revision": "88b08384d0e827ac03eaa84dee791177a9f9ab11",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.047619047619047616
+        },
+        {
+          "issue": 9442,
+          "source_revision": "88b08384d0e827ac03eaa84dee791177a9f9ab11",
+          "baseline": "bm25",
+          "delta_recall_at_10": 0.0
+        },
+        {
+          "issue": 9442,
+          "source_revision": "88b08384d0e827ac03eaa84dee791177a9f9ab11",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.0625
+        },
+        {
+          "issue": 9467,
+          "source_revision": "53a29fd9e938f5bea55740940df709b32aac1008",
+          "baseline": "bm25",
+          "delta_recall_at_10": 1.0
+        },
+        {
+          "issue": 9467,
+          "source_revision": "53a29fd9e938f5bea55740940df709b32aac1008",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.0
+        },
+        {
+          "issue": 9591,
+          "source_revision": "4acbaecf4c883858cf1a50c2fe13afb6160b340c",
+          "baseline": "bm25",
+          "delta_recall_at_10": 0.0
+        },
+        {
+          "issue": 9591,
+          "source_revision": "4acbaecf4c883858cf1a50c2fe13afb6160b340c",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.3333333333333333
+        },
+        {
+          "issue": 9683,
+          "source_revision": "d6dd1941b0fe2f467b35fbc33b7eec4a5bdc3eec",
+          "baseline": "bm25",
+          "delta_recall_at_10": 0.0
+        },
+        {
+          "issue": 9683,
+          "source_revision": "d6dd1941b0fe2f467b35fbc33b7eec4a5bdc3eec",
+          "baseline": "literal",
+          "delta_recall_at_10": 0.0
+        }
+      ]
+    },
+    "uniform_random_macro_expected_recall_at_10": 0.0030663436949206857,
+    "cost_usd": null,
+    "cost_status": "not exposed by SDK; latency and call count retained",
+    "frozen_inputs_sha256": "5e879fdb46ba6dc302fce30d1ccc01570857b03070b851b519b06dc9fe5f2673",
+    "driver_sha256": "9df6755b21f7ee758749afb4ad0abdfe418ad041b2567a63a00aa0d8a69e9826",
+    "limitations": [
+      "Sensitivity inclusion added after observing output-budget flags, before target scoring.",
+      "12 retrospective issue cases are not a scheduling-risk validation cohort.",
+      "Bootstrap grouped by source SHA only; dependence may remain.",
+      "Title/body only; comments and proposed new-file inference are omitted."
+    ]
+  },
+  "hybrid_stress": {
+    "status": "post-hoc exploratory stress check, not a new primary endpoint",
+    "hybrid_policy": "literal source paths first, then BM25 ranking; deduplicate; first 10; no tuned parameter",
+    "n": 12,
+    "source_groups": 10,
+    "hybrid_macro_recall_at_10": 0.1992637332710862,
+    "hybrid_macro_precision_at_10": 0.16666666666666666,
+    "augment_minus_hybrid_mean_recall_at_10": 0.05161842514783691,
+    "descriptive_source_group_bootstrap_95": [
+      0.011233211233211237,
+      0.10261437908496733
+    ],
+    "wins": 5,
+    "ties": 6,
+    "losses": 1,
+    "leave_one_case_out_augment_minus_bm25": [
+      {
+        "omitted_issue": 9467,
+        "mean_delta": 0.07333842627960276
+      },
+      {
+        "omitted_issue": 8919,
+        "mean_delta": 0.14285714285714285
+      },
+      {
+        "omitted_issue": 9038,
+        "mean_delta": 0.15414650708768357
+      },
+      {
+        "omitted_issue": 9105,
+        "mean_delta": 0.15515660809778456
+      },
+      {
+        "omitted_issue": 9591,
+        "mean_delta": 0.16424751718869365
+      },
+      {
+        "omitted_issue": 9683,
+        "mean_delta": 0.16424751718869365
+      },
+      {
+        "omitted_issue": 9133,
+        "mean_delta": 0.1591970121381886
+      },
+      {
+        "omitted_issue": 9442,
+        "mean_delta": 0.16424751718869365
+      },
+      {
+        "omitted_issue": 8757,
+        "mean_delta": 0.1581869111280876
+      },
+      {
+        "omitted_issue": 9440,
+        "mean_delta": 0.16857652151769797
+      },
+      {
+        "omitted_issue": 8758,
+        "mean_delta": 0.1382734912146677
+      },
+      {
+        "omitted_issue": 9434,
+        "mean_delta": 0.16424751718869365
+      }
+    ],
+    "per_issue": [
+      {
+        "issue": 9467,
+        "source_revision": "53a29fd9e938f5bea55740940df709b32aac1008",
+        "hybrid_top_10": [
+          ".gitignore",
+          "defaults/.claude/commands/loom/champion-pr-merge.md",
+          "defaults/.claude/commands/loom/curator.md",
+          "docs/guides/remote-build.md",
+          "CHANGELOG.md",
+          "WORK_LOG.md",
+          "defaults/docs/guard-hooks.md",
+          "defaults/docs/troubleshooting.md",
+          ".github/workflows/ci.yml",
+          "defaults/.agents/skills/loom-builder/SKILL.md"
+        ],
+        "hybrid_hits": 1,
+        "hybrid_recall_at_10": 1.0,
+        "hybrid_precision_at_10": 0.1,
+        "augment_recall_at_10": 1.0,
+        "augment_precision_at_10": 0.1,
+        "augment_minus_hybrid_recall_at_10": 0.0,
+        "augment_minus_bm25_recall_at_10": 1.0
+      },
+      {
+        "issue": 8919,
+        "source_revision": "285ce9ad546715140402e09dac756921ea5bfd53",
+        "hybrid_top_10": [
+          "defaults/.claude/commands/loom/judge.md",
+          "defaults/.agents/skills/loom-judge/SKILL.md",
+          "defaults/docs/daemon-reference.md",
+          "defaults/docs/troubleshooting.md",
+          "defaults/scripts/merge-pr.sh",
+          "defaults/.claude/commands/loom/doctor.md",
+          "defaults/.agents/skills/loom-doctor/SKILL.md",
+          ".loom/docs/file-size-policy.md",
+          "defaults/.claude/commands/loom/champion-pr-merge.md",
+          "defaults/.claude/commands/loom/curator.md"
+        ],
+        "hybrid_hits": 1,
+        "hybrid_recall_at_10": 0.058823529411764705,
+        "hybrid_precision_at_10": 0.1,
+        "augment_recall_at_10": 0.29411764705882354,
+        "augment_precision_at_10": 0.5,
+        "augment_minus_hybrid_recall_at_10": 0.23529411764705882,
+        "augment_minus_bm25_recall_at_10": 0.23529411764705882
+      },
+      {
+        "issue": 9038,
+        "source_revision": "44d2f2a1bfd0123e0fbe72fe2acad9914cf5263c",
+        "hybrid_top_10": [
+          "defaults/docs/telemetry-schema.md",
+          "defaults/docs/daemon-reference.md",
+          "loom-daemon/src/sweep_registry/mod.rs",
+          "CHANGELOG.md",
+          "loom-daemon/src/observability/collector.rs",
+          "defaults/docs/tracing.md",
+          "loom-daemon/src/telemetry/mod.rs",
+          "loom-daemon/src/observability/lifecycle.rs",
+          "defaults/observability/signoz/README.md",
+          "defaults/observability/clickstack/README.md"
+        ],
+        "hybrid_hits": 3,
+        "hybrid_recall_at_10": 0.16666666666666666,
+        "hybrid_precision_at_10": 0.3,
+        "augment_recall_at_10": 0.2777777777777778,
+        "augment_precision_at_10": 0.5,
+        "augment_minus_hybrid_recall_at_10": 0.11111111111111113,
+        "augment_minus_bm25_recall_at_10": 0.11111111111111113
+      },
+      {
+        "issue": 9105,
+        "source_revision": "e4501965c906d65965c685e5808be8e512a1ecba",
+        "hybrid_top_10": [
+          "defaults/scripts/lib/forge-merge-method.sh",
+          "loom-daemon/src/forge_merge_method.rs",
+          "defaults/scripts/lib/forge-helpers.sh",
+          "scripts/install/forge-detect.sh",
+          "scripts/install/setup-repository-settings.sh",
+          "CHANGELOG.md",
+          "defaults/scripts/merge-pr.sh",
+          "WORK_LOG.md",
+          "defaults/docs/troubleshooting.md",
+          "defaults/.agents/skills/loom-judge/SKILL.md"
+        ],
+        "hybrid_hits": 6,
+        "hybrid_recall_at_10": 0.2,
+        "hybrid_precision_at_10": 0.6,
+        "augment_recall_at_10": 0.26666666666666666,
+        "augment_precision_at_10": 0.8,
+        "augment_minus_hybrid_recall_at_10": 0.06666666666666665,
+        "augment_minus_bm25_recall_at_10": 0.1
+      },
+      {
+        "issue": 9591,
+        "source_revision": "4acbaecf4c883858cf1a50c2fe13afb6160b340c",
+        "hybrid_top_10": [
+          "defaults/docs/daemon-reference.md",
+          "defaults/docs/telemetry-schema.md",
+          "loom-daemon/src/cli/status_render.rs",
+          "CHANGELOG.md",
+          "WORK_LOG.md",
+          "loom-daemon/src/work_finder.rs",
+          "defaults/docs/observability.md",
+          "loom-daemon/src/types.rs",
+          "loom-daemon/src/health.rs",
+          "loom-daemon/src/ipc.rs"
+        ],
+        "hybrid_hits": 1,
+        "hybrid_recall_at_10": 0.3333333333333333,
+        "hybrid_precision_at_10": 0.1,
+        "augment_recall_at_10": 0.3333333333333333,
+        "augment_precision_at_10": 0.1,
+        "augment_minus_hybrid_recall_at_10": 0.0,
+        "augment_minus_bm25_recall_at_10": 0.0
+      },
+      {
+        "issue": 9683,
+        "source_revision": "d6dd1941b0fe2f467b35fbc33b7eec4a5bdc3eec",
+        "hybrid_top_10": [
+          "WORK_LOG.md",
+          "CHANGELOG.md",
+          "defaults/docs/telemetry-schema.md",
+          "defaults/docs/daemon-reference.md",
+          "defaults/docs/observability.md",
+          "WORK_PLAN.md",
+          "defaults/.claude/commands/loom/curator.md",
+          "defaults/.agents/skills/loom-curator/SKILL.md",
+          "defaults/docs/safehouse.md",
+          "defaults/.claude/commands/loom/builder-pr.md"
+        ],
+        "hybrid_hits": 0,
+        "hybrid_recall_at_10": 0.0,
+        "hybrid_precision_at_10": 0.0,
+        "augment_recall_at_10": 0.0,
+        "augment_precision_at_10": 0.0,
+        "augment_minus_hybrid_recall_at_10": 0.0,
+        "augment_minus_bm25_recall_at_10": 0.0
+      },
+      {
+        "issue": 9133,
+        "source_revision": "ec64146b2b759fdc65cc0753cf9b201b7f87a509",
+        "hybrid_top_10": [
+          ".githooks/pre-commit",
+          ".gitignore",
+          "loom-daemon/src/init/post_init.rs",
+          "defaults/scripts/tests/test-spawn-claude-credential-proxy.sh",
+          "loom-daemon/src/activity/session_analysis.rs",
+          "loom-daemon/src/activity/session_summary.rs",
+          "loom-daemon/src/credential_preflight.rs",
+          "loom-daemon/src/tokens_pool/check.rs",
+          "loom-daemon/src/worker_spawn/egress_proxy/exec_tests.rs",
+          "loom-daemon/tests/collector_fanout.rs"
+        ],
+        "hybrid_hits": 1,
+        "hybrid_recall_at_10": 0.05555555555555555,
+        "hybrid_precision_at_10": 0.1,
+        "augment_recall_at_10": 0.16666666666666666,
+        "augment_precision_at_10": 0.3,
+        "augment_minus_hybrid_recall_at_10": 0.1111111111111111,
+        "augment_minus_bm25_recall_at_10": 0.05555555555555555
+      },
+      {
+        "issue": 9442,
+        "source_revision": "88b08384d0e827ac03eaa84dee791177a9f9ab11",
+        "hybrid_top_10": [
+          "defaults/docs/telemetry-schema.md",
+          "defaults/docs/observability.md",
+          "defaults/docs/daemon-reference.md",
+          "WORK_LOG.md",
+          "defaults/docs/safehouse.md",
+          "CHANGELOG.md",
+          "defaults/docs/guard-hooks.md",
+          "defaults/docs/ci-observability.md",
+          "dashboard/src/redaction.ts",
+          "dashboard/docs/deploy-runbook.md"
+        ],
+        "hybrid_hits": 1,
+        "hybrid_recall_at_10": 0.0625,
+        "hybrid_precision_at_10": 0.1,
+        "augment_recall_at_10": 0.0625,
+        "augment_precision_at_10": 0.1,
+        "augment_minus_hybrid_recall_at_10": 0.0,
+        "augment_minus_bm25_recall_at_10": 0.0
+      },
+      {
+        "issue": 8757,
+        "source_revision": "0c66c5696315ea61d9ea77d634f94849c2ad6ba2",
+        "hybrid_top_10": [
+          "loom-daemon/src/activity/transcript_ingest.rs",
+          "defaults/observability/collector/README.md",
+          "defaults/docs/telemetry-schema.md",
+          "CHANGELOG.md",
+          "defaults/docs/observability.md",
+          "defaults/.agents/skills/loom-curator/SKILL.md",
+          "defaults/.claude/commands/loom/curator.md",
+          "defaults/docs/daemon-reference.md",
+          "defaults/observability/signoz/evidence.md",
+          "defaults/.agents/skills/loom-builder/SKILL.md"
+        ],
+        "hybrid_hits": 2,
+        "hybrid_recall_at_10": 0.13333333333333333,
+        "hybrid_precision_at_10": 0.2,
+        "augment_recall_at_10": 0.13333333333333333,
+        "augment_precision_at_10": 0.2,
+        "augment_minus_hybrid_recall_at_10": 0.0,
+        "augment_minus_bm25_recall_at_10": 0.06666666666666667
+      },
+      {
+        "issue": 9440,
+        "source_revision": "88b08384d0e827ac03eaa84dee791177a9f9ab11",
+        "hybrid_top_10": [
+          "defaults/docs/telemetry-schema.md",
+          "CHANGELOG.md",
+          "WORK_LOG.md",
+          "defaults/docs/daemon-reference.md",
+          "defaults/docs/ci-observability.md",
+          "defaults/observability/signoz/evidence.md",
+          "defaults/docs/observability.md",
+          "defaults/docs/troubleshooting.md",
+          "loom-daemon/src/telemetry/mod.rs",
+          "defaults/docs/runtime-adapters.md"
+        ],
+        "hybrid_hits": 2,
+        "hybrid_recall_at_10": 0.09523809523809523,
+        "hybrid_precision_at_10": 0.2,
+        "augment_recall_at_10": 0.047619047619047616,
+        "augment_precision_at_10": 0.1,
+        "augment_minus_hybrid_recall_at_10": -0.047619047619047616,
+        "augment_minus_bm25_recall_at_10": -0.047619047619047616
+      },
+      {
+        "issue": 8758,
+        "source_revision": "0c66c5696315ea61d9ea77d634f94849c2ad6ba2",
+        "hybrid_top_10": [
+          "loom-daemon/src/activity/transcript_archive.rs",
+          "loom-daemon/src/main.rs",
+          "defaults/docs/daemon-reference.md",
+          "defaults/.claude/commands/loom/curator.md",
+          "defaults/.agents/skills/loom-curator/SKILL.md",
+          "defaults/docs/troubleshooting.md",
+          "CHANGELOG.md",
+          "defaults/docs/safehouse.md",
+          "defaults/.claude/commands/loom/builder.md",
+          "defaults/.agents/skills/loom-builder/SKILL.md"
+        ],
+        "hybrid_hits": 2,
+        "hybrid_recall_at_10": 0.2857142857142857,
+        "hybrid_precision_at_10": 0.2,
+        "augment_recall_at_10": 0.42857142857142855,
+        "augment_precision_at_10": 0.3,
+        "augment_minus_hybrid_recall_at_10": 0.14285714285714285,
+        "augment_minus_bm25_recall_at_10": 0.2857142857142857
+      },
+      {
+        "issue": 9434,
+        "source_revision": "76f888f14e90e156d667dd03fc6de4e49c1d6bef",
+        "hybrid_top_10": [
+          "defaults/observability/signoz/eta-queries.sql",
+          "defaults/docs/telemetry-schema.md",
+          "defaults/docs/eta.md",
+          "defaults/docs/observability.md",
+          "defaults/.claude/commands/loom/curator.md",
+          "defaults/.agents/skills/loom-curator/SKILL.md",
+          "defaults/observability/signoz/evidence.md",
+          "defaults/docs/daemon-reference.md",
+          "defaults/docs/ci-observability.md",
+          "defaults/docs/telemetry-overhead.md"
+        ],
+        "hybrid_hits": 0,
+        "hybrid_recall_at_10": 0.0,
+        "hybrid_precision_at_10": 0.0,
+        "augment_recall_at_10": 0.0,
+        "augment_precision_at_10": 0.0,
+        "augment_minus_hybrid_recall_at_10": 0.0,
+        "augment_minus_bm25_recall_at_10": 0.0
+      }
+    ],
+    "driver_sha256": "9b1bfc937382bb03a84e59cf1e2e991173a85c38f60d0dcc0d7ab6fe28199be6"
+  },
+  "snippet_validation": {
+    "method": "verify every numbered retrieved line against the pinned index-manifest blob; no interval interpolation",
+    "counts": {
+      "exact": 8622,
+      "mismatch": 14
+    },
+    "per_issue": [
+      {
+        "issue": 8757,
+        "counts": {
+          "exact": 707,
+          "mismatch": 1
+        },
+        "mismatches": [
+          {
+            "response": "response-1.txt",
+            "path": "dashboard/test/redaction.test.ts",
+            "line": 1169,
+            "actual_sha256": "f5b735ebef1fec64dcaea0a77d9c160d61bdc1f54cbbb97139b0cc4fc54c3f8a",
+            "expected_sha256": "7f2a4f635d103ce55ce43101f6a217fb706b1d662297ae883be0250839da54b2",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 115,
+            "expected_chars": 334,
+            "within_last_four_lines": true
+          }
+        ]
+      },
+      {
+        "issue": 8758,
+        "counts": {
+          "exact": 765
+        },
+        "mismatches": []
+      },
+      {
+        "issue": 8919,
+        "counts": {
+          "exact": 657,
+          "mismatch": 1
+        },
+        "mismatches": [
+          {
+            "response": "response-0.txt",
+            "path": "defaults/docs/ci-principles.md",
+            "line": 90,
+            "actual_sha256": "ab11ae1895f62eb89140f6efc4195daac11c685db7e2e96ada72e1725ddb20f3",
+            "expected_sha256": "ba6b2bb2757fc1f81f51af33a67c285c4ae371ee751408328fb89bdc396ae29e",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 55,
+            "expected_chars": 76,
+            "within_last_four_lines": true
+          }
+        ]
+      },
+      {
+        "issue": 9038,
+        "counts": {
+          "exact": 739,
+          "mismatch": 2
+        },
+        "mismatches": [
+          {
+            "response": "response-0.txt",
+            "path": "loom-daemon/src/telemetry/trace/context.rs",
+            "line": 83,
+            "actual_sha256": "4f89e191a866c89d1e0b64140ea66aee598e859a832da89d1afbe8b90a44d085",
+            "expected_sha256": "af88f8f89ecd9c65ecbb23825014dc1f06f014e5427378472642e5921f2cb80f",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 14,
+            "expected_chars": 41,
+            "within_last_four_lines": true
+          },
+          {
+            "response": "response-1.txt",
+            "path": "loom-daemon/src/telemetry/trace/store.rs",
+            "line": 105,
+            "actual_sha256": "bbc60ae4a84e69ec67fb5932506c977285bb89293a5bd9a58856d9cbdf32e77b",
+            "expected_sha256": "2842807699dfbf6003e4c9ab2bd7bae158868505b758c51d55a8fb3907213b11",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 75,
+            "expected_chars": 92,
+            "within_last_four_lines": true
+          }
+        ]
+      },
+      {
+        "issue": 9105,
+        "counts": {
+          "exact": 719,
+          "mismatch": 1
+        },
+        "mismatches": [
+          {
+            "response": "response-1.txt",
+            "path": "scripts/install/setup-repository-settings.sh",
+            "line": 336,
+            "actual_sha256": "6d4c82b2c3b67c45ea06f643b10880ec898a7a612e213210969b2efbfd505270",
+            "expected_sha256": "8259804f08f0ec86bc1fcdb9e6a7713c1bea907513fcb145207ea0da58d00672",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 9,
+            "expected_chars": 41,
+            "within_last_four_lines": true
+          }
+        ]
+      },
+      {
+        "issue": 9133,
+        "counts": {
+          "exact": 686,
+          "mismatch": 2
+        },
+        "mismatches": [
+          {
+            "response": "response-0.txt",
+            "path": "loom-daemon/src/credential_preflight.rs",
+            "line": 941,
+            "actual_sha256": "11413deec4fb2f082dd3a8fea8c83c6539017014fd665b4438407199d276e93d",
+            "expected_sha256": "2e31ed67f071e025d2ab40a900660286da435f414198ddfdbf0163d485ec307d",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 35,
+            "expected_chars": 77,
+            "within_last_four_lines": true
+          },
+          {
+            "response": "response-1.txt",
+            "path": "loom-daemon/src/credential_preflight.rs",
+            "line": 941,
+            "actual_sha256": "11413deec4fb2f082dd3a8fea8c83c6539017014fd665b4438407199d276e93d",
+            "expected_sha256": "2e31ed67f071e025d2ab40a900660286da435f414198ddfdbf0163d485ec307d",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 35,
+            "expected_chars": 77,
+            "within_last_four_lines": true
+          }
+        ]
+      },
+      {
+        "issue": 9434,
+        "counts": {
+          "exact": 723,
+          "mismatch": 1
+        },
+        "mismatches": [
+          {
+            "response": "response-1.txt",
+            "path": "loom-daemon/src/role_tick_telemetry/story.rs",
+            "line": 221,
+            "actual_sha256": "8b6fa01313ce51afc09e610f819250da501778ad363cba4f9e312a6ec823d42a",
+            "expected_sha256": "4a07e8c5f3161012a2c52d4e758067d4c351d9fa3dca4006feaa2fd065a5bdd2",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 8,
+            "expected_chars": 46,
+            "within_last_four_lines": true
+          }
+        ]
+      },
+      {
+        "issue": 9440,
+        "counts": {
+          "exact": 732,
+          "mismatch": 2
+        },
+        "mismatches": [
+          {
+            "response": "response-0.txt",
+            "path": "loom-daemon/src/usage_source.rs",
+            "line": 312,
+            "actual_sha256": "d8604d8816da7c8132b0eef4e294b1178e206373ffadd30ee30611ca78089335",
+            "expected_sha256": "5074d7cb86c2f0e3276d35b6fa37f9e47d414026b3c49487d39c93c1d8eeda22",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 13,
+            "expected_chars": 51,
+            "within_last_four_lines": true
+          },
+          {
+            "response": "response-1.txt",
+            "path": "loom-daemon/src/sweep_registry/outcome_journal/tap_usage_tests.rs",
+            "line": 291,
+            "actual_sha256": "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068",
+            "expected_sha256": "67694c125cca8ca0a62725dfef58e8526eab4d227697d733f055295d901fc772",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 1,
+            "expected_chars": 6,
+            "within_last_four_lines": true
+          }
+        ]
+      },
+      {
+        "issue": 9442,
+        "counts": {
+          "exact": 768,
+          "mismatch": 2
+        },
+        "mismatches": [
+          {
+            "response": "response-0.txt",
+            "path": "loom-daemon/src/sweep_outcomes.rs",
+            "line": 1170,
+            "actual_sha256": "90a512a5b8a107065c11e103aad9c4a9d9bc5f8b92ac4d962c42dcc1010f9ddb",
+            "expected_sha256": "ab38e8d6689d452b1150728fe140e960372d5a87a7688cf51b03f0996608b842",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 7,
+            "expected_chars": 9,
+            "within_last_four_lines": true
+          },
+          {
+            "response": "response-1.txt",
+            "path": "loom-daemon/src/telemetry/tests.rs",
+            "line": 364,
+            "actual_sha256": "9ce2e3b54c1cf9e88f8ba1cee697efcce6f054177b9d6ac5f76d52815de1b068",
+            "expected_sha256": "e4811e349580bb93ee49059a252eee8aeaf12d3dbd242956288099976ef9ab3d",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 17,
+            "expected_chars": 31,
+            "within_last_four_lines": true
+          }
+        ]
+      },
+      {
+        "issue": 9467,
+        "counts": {
+          "exact": 699,
+          "mismatch": 1
+        },
+        "mismatches": [
+          {
+            "response": "response-1.txt",
+            "path": "mcp-loom/src/shared/config-resolver.test.ts",
+            "line": 270,
+            "actual_sha256": "bd5b93bf65e4951454b971dc322602236b55d9361007aec23f722572eda23a23",
+            "expected_sha256": "7c84a92023c3438bfa8ad27be919d2fd228b93c98ef27561bd1ef4e1f0f759a2",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 9,
+            "expected_chars": 97,
+            "within_last_four_lines": true
+          }
+        ]
+      },
+      {
+        "issue": 9591,
+        "counts": {
+          "exact": 659
+        },
+        "mismatches": []
+      },
+      {
+        "issue": 9683,
+        "counts": {
+          "exact": 768,
+          "mismatch": 1
+        },
+        "mismatches": [
+          {
+            "response": "response-0.txt",
+            "path": "loom-daemon/src/observability/otlp/mapping.rs",
+            "line": 253,
+            "actual_sha256": "8d0bcc238be62bab93ed97f0a576a80c89cb12d76eca58b10ab7e056eaa26521",
+            "expected_sha256": "5f87b7d8d1a8ad075df784606ccd2ce71810fcdf55f4bfc8b0ec3f111187d0ec",
+            "classification": "truncated_prefix_at_response_end",
+            "actual_chars": 50,
+            "expected_chars": 63,
+            "within_last_four_lines": true
+          }
+        ]
+      }
+    ],
+    "mismatch_classification": {
+      "truncated_prefix_at_response_end": 14
+    }
+  }
+}

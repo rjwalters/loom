@@ -1,5 +1,10 @@
 # Overlap pilot — first real run (2026-10-01)
 
+> **New research:** [Round 3](round3/README.md) executes the measurement
+> falsification, exact patch reconstruction, and a narrowly qualified
+> Augment-versus-cheap-baselines study. Its raw evidence and reproducible
+> commands are published; conclusions remain shadow-only.
+
 > **Decision and correction (2026-10-01):** read [DECISION.md](DECISION.md)
 > before using these results. The audit found historical-input leakage,
 > invalid conflict attribution and line metrics, outcome-selected evaluation,
