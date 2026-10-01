@@ -43,6 +43,23 @@ pub(crate) enum CollisionEvidenceCommand {
         /// surface) into the out dir.
         #[arg(long, default_value_t = true)]
         otlp_bodies: bool,
+
+        /// Push the OTLP payload body to the collector over HTTPS
+        /// (#9910). Default off: without this flag the verb only writes
+        /// files. Delivery failures fail the verb loudly (after the
+        /// delivery log is written) — never silently dropped.
+        #[arg(long, default_value_t = false)]
+        push: bool,
+
+        /// Collector endpoint accepting the JSON OTLP payload shape
+        /// (required with `--push`).
+        #[arg(long, value_name = "URL")]
+        otlp_endpoint: Option<String>,
+
+        /// File holding the collector ingest key, sent as
+        /// `Authorization: Bearer` (#9910). Read once; never logged.
+        #[arg(long, value_name = "PATH")]
+        otlp_key_file: Option<PathBuf>,
     },
 }
 
@@ -55,7 +72,30 @@ impl CollisionEvidenceCommand {
                 out_dir,
                 scorer_version,
                 otlp_bodies,
-            } => run_publish(&manifest, &report_dir, &out_dir, &scorer_version, otlp_bodies),
+                push,
+                otlp_endpoint,
+                otlp_key_file,
+            } => {
+                if push && otlp_endpoint.is_none() {
+                    bail!("--push requires --otlp-endpoint");
+                }
+                if otlp_endpoint.is_some() && !push {
+                    bail!("--otlp-endpoint without --push would be ignored; pass --push");
+                }
+                if push && !otlp_bodies {
+                    bail!("--push requires the OTLP payload; drop --otlp-bodies=false");
+                }
+                run_publish(
+                    &manifest,
+                    &report_dir,
+                    &out_dir,
+                    &scorer_version,
+                    otlp_bodies,
+                    push,
+                    otlp_endpoint.as_deref(),
+                    otlp_key_file.as_deref(),
+                )
+            }
         }
     }
 }
@@ -66,6 +106,9 @@ fn run_publish(
     out_dir: &Path,
     scorer_version: &str,
     otlp_bodies: bool,
+    push: bool,
+    otlp_endpoint: Option<&str>,
+    otlp_key_file: Option<&Path>,
 ) -> Result<()> {
     let manifest_raw = std::fs::read_to_string(manifest_path)?;
     let manifest: serde_json::Value = serde_json::from_str(&manifest_raw)?;
@@ -282,6 +325,55 @@ fn run_publish(
             log_records.len(),
             skipped
         );
+        if push {
+            // Unwrap-safe by the run() validation: push ⇒ otlp_bodies and
+            // endpoint present.
+            let endpoint = otlp_endpoint.expect("validated: push ⇒ endpoint");
+            let bearer_key = match otlp_key_file {
+                Some(path) => {
+                    let raw = std::fs::read_to_string(path)
+                        .with_context(|| format!("reading ingest key {}", path.display()))?;
+                    Some(raw.trim().to_string())
+                }
+                None => None,
+            };
+            let body = serde_json::to_vec(&payload)?;
+            let outcome = collision_evidence::otlp_push::push_payload(
+                &collision_evidence::otlp_push::HttpSink,
+                endpoint,
+                bearer_key.as_deref(),
+                &body,
+            );
+            let log_path = out_dir.join("delivery-log.jsonl");
+            let mut log_body = String::new();
+            for attempt in &outcome.attempts {
+                log_body.push_str(&serde_json::to_string(attempt)?);
+                log_body.push('\n');
+            }
+            std::fs::write(&log_path, log_body)?;
+            println!(
+                "otlp push: {} delivered, {} failed → {}",
+                outcome.delivered(),
+                outcome.failed(),
+                log_path.display()
+            );
+            for attempt in &outcome.attempts {
+                if let Some(err) = &attempt.error {
+                    println!(
+                        "otlp push failure: host={} status={:?} error={}",
+                        attempt.endpoint_host, attempt.status, err
+                    );
+                }
+            }
+            if outcome.failed() > 0 {
+                bail!(
+                    "otlp push did not deliver ({}/{} failed); delivery log: {}",
+                    outcome.failed(),
+                    outcome.attempts.len(),
+                    log_path.display()
+                );
+            }
+        }
     }
     Ok(())
 }

@@ -35,6 +35,7 @@
 //! metric dimensions.
 
 pub mod otlp;
+pub mod otlp_push;
 pub mod records;
 
 use anyhow::{Context, Result};
