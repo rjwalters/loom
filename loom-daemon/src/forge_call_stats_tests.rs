@@ -30,6 +30,7 @@ fn id_line(t: i64, caller: &str, o: Outcome, identity: &CallIdentity) -> String 
         p: Pool::Core,
         o,
         rem: None,
+        usd: None,
         rst: None,
         op: Some(
             identity
