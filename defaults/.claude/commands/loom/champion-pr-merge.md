@@ -1847,7 +1847,7 @@ human one, and `merge-pr.sh` is shared, identity-agnostic infrastructure that
 posts nothing naming an actor. The one durable signal is this comment. Therefore:
 
 - **Never call `merge-pr.sh` in a pass where this comment did not post
-  successfully.** If `gh pr comment` fails, skip the PR and retry next tick — an
+  successfully.** If `post-comment.sh` fails, skip the PR and retry next tick — an
   un-narrated merge is worse than a late one.
 - **A merged PR with no `*Automated by Champion role*` pre-merge comment was not
   merged by Champion.** That inference is only sound if this step is
