@@ -150,6 +150,7 @@ pub mod credential_preflight;
 pub mod daemon_bin_resolve;
 pub mod daemon_heartbeat;
 pub mod daemon_install_state;
+pub mod daemon_parallel_advisory;
 pub mod daemon_pidfile;
 pub mod daemon_start;
 /// Non-blocking wrapper around the startup claim-reconciliation +

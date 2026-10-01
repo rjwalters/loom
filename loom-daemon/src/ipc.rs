@@ -336,6 +336,9 @@ fn cancel_all_in_flight(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Pat
 /// Returns `true` if a live `loom-daemon` is currently listening on
 /// `socket_path` and actively servicing requests.
 ///
+/// `pub(crate)` since #9815: `daemon_parallel_advisory` reuses the probe to
+/// check the *machine-level default* socket from its startup wrapper.
+///
 /// The probe connects to the socket and performs a `Ping`/`Pong` roundtrip:
 ///
 /// - A connect failure (`ECONNREFUSED`, `ENOENT`, `ENOTSOCK`, permission
@@ -351,7 +354,7 @@ fn cancel_all_in_flight(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Pat
 /// requests, or a non-daemon process squatting the path) is treated as "not a
 /// live, responsive daemon" and returns `false` — refusing to ever reclaim
 /// such a socket would be worse than rebinding it.
-async fn socket_has_live_listener(socket_path: &Path) -> bool {
+pub(crate) async fn socket_has_live_listener(socket_path: &Path) -> bool {
     let stream = match tokio::time::timeout(
         LIVENESS_PROBE_TIMEOUT,
         UnixStream::connect(socket_path),
@@ -482,6 +485,15 @@ impl IpcServer {
                 self.socket_path.display()
             );
         }
+
+        // Sibling advisory (#9815): the guard above only sees same-socket
+        // collisions. A start scoped to a custom `LOOM_SOCKET_PATH` binds a
+        // different socket and would never learn that a machine-level daemon
+        // is already running. Warn — never refuse; a scratch-isolated test
+        // daemon stays silent by design — so a second production daemon shows
+        // up in daemon.log the day it starts, not two incidents later.
+        crate::daemon_parallel_advisory::warn_if_scoped_alongside_machine_daemon(&self.socket_path)
+            .await;
 
         // Remove old socket (best-effort; only reached when no live listener
         // answered the probe above, i.e. the file is stale or absent).

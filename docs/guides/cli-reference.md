@@ -350,9 +350,18 @@ Specify custom Unix socket path for daemon IPC.
 - **Type:** String (absolute path to socket file)
 - **Default:** `~/.loom/loom-daemon.sock`
 - **Use Cases:**
-  - Running multiple daemon instances
-  - Testing and development
-  - Avoiding conflicts
+  - Testing and development (an isolated test daemon)
+  - Avoiding conflicts between a test daemon and the running daemon
+
+> **One daemon per machine.** Loom runs a single `loom-daemon` per host; the
+> token pool (`~/.loom/tokens/`) and the concurrency budget are machine-level,
+> and multi-repo coverage is `loom-daemon workspace add`, not a second daemon
+> (#3926). A custom socket is for **isolated test instances only**: a daemon
+> scoped to a non-scratch directory that starts while another daemon is already
+> listening on `~/.loom/loom-daemon.sock` fragments that shared state and logs
+> a warning at startup (#9815). A daemon under a scratch directory (`$TMPDIR`,
+> `*-checkout`, `.loom/worktrees/`) is recognized as a test instance and stays
+> silent.
 - **Example:**
   ```bash
   export LOOM_SOCKET_PATH=/tmp/loom-test.sock
