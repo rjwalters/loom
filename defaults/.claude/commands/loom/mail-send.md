@@ -15,7 +15,7 @@ Do not use this for routine sweep narration, issue comments, or anything a
 human has not asked to be escalated. It exists for asks that block work: a
 credential, a token, a ruling, a spend approval.
 
-## The shape of a mail (2AMLogic/loom-ui#595)
+## The shape of a mail (example-org/tool-repo#595)
 
 1. **Title** — one line a human groks at a glance. *Optional*: when you send
    only the paste, loom-ui's mail-summary pass (Gemini flash) infers the

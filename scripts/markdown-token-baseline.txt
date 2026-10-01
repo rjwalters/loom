@@ -49,7 +49,7 @@
 316 defaults/.claude/commands/loom/loom-iteration.md
 254 defaults/.claude/commands/loom/loom-parent.md
 9383 defaults/.claude/commands/loom/loom.md
-2091 defaults/.claude/commands/loom/mail-send.md
+2093 defaults/.claude/commands/loom/mail-send.md
 786 defaults/.claude/commands/loom/probe-protocol.md
 19954 defaults/.claude/commands/loom/sweep-arguments.md
 11521 defaults/.claude/commands/loom/sweep-backend-detection.md
