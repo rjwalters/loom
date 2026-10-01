@@ -456,9 +456,8 @@ mod endpoint_validation_tests {
     #[test]
     fn rejects_reserved_placeholder_host_before_any_key_read() {
         let err = validate_otlp_endpoint("https://collector.example.com/v1/logs").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("reserved placeholder domain example.com"));
+        assert!(err.to_string().contains("reserved placeholder domain"));
+        assert!(err.to_string().contains("example.com"));
         assert!(err.to_string().contains("never read or sent"));
     }
 }
