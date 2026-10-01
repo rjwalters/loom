@@ -230,6 +230,7 @@ pub mod observability;
 pub mod opencode_usage;
 pub mod operator_stop;
 pub mod orphan_process_reaper;
+pub mod overlap_replay;
 pub mod park_record;
 pub mod peer_claims;
 pub mod phase_join;
