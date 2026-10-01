@@ -6,6 +6,17 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-10-01
+- **PR #9775**: observability(signoz): execute cycle-time-extract.sql against the pinned ClickHouse
+- **PR #9636**: fix(security): Loom writes only to repos it manages (#9548)
+- **PR #9812**: ci: link Linux builds with lld (item 4 of #9065)
+- **Issue #9364** (closed): CI: item 4 of #9065 — cheaper linking/compilation (mold or lld, CARGO_INCREMENTAL=0), measured before and after
+- **PR #9810**: docs: state what Loom optimizes for — and when it is the wrong tool (hackathon fit note)
+- **Issue #9362** (closed): docs: state what Loom optimizes for — and that it is the wrong tool under time pressure (hackathon fit note)
+- **PR #9813**: docs(gitea-qualification): scaffold Gitea Cloud provisioning runbook + credential manifest
+- **Issue #9768** (closed): chore(config): hyperparameters polish — lease TTL hot-apply, hyperparams validate, docs pointers
+- **PR #9780**: feat(config): hot-apply the lease TTL, add hyperparams --validate, link the docs
+
 ### 2026-09-30
 - **Issue #9045** (closed): Doctor: Priority 1 conflict query doesn't exclude loom:operator-only/-decision, only loom:operator
 - **Issue #9686** (closed): Champion: automatically order overlapping PRs and defer redundant base repairs (9063 first release)
