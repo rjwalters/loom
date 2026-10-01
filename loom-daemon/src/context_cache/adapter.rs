@@ -197,31 +197,100 @@ impl RetrievalAdapter for FakeAdapter {
 
 /// The real Augment provider adapter (env-gated, bounded).
 ///
-/// Configuration (never stored in artifacts): `AUGMENT_API_TOKEN`,
-/// optional `AUGMENT_BASE_URL` (default `https://api.augmentcode.com`),
-/// optional `AUGMENT_TIMEOUT_SECS`. When unconfigured the adapter returns
+/// Configuration (never stored in artifacts — identity carries only name +
+/// version): `AUGMENT_SESSION_FILE`, `AUGMENT_API_TOKEN`, optional
+/// `AUGMENT_BASE_URL` (default `https://api.augmentcode.com`), optional
+/// `AUGMENT_TIMEOUT_SECS`. When unconfigured the adapter returns
 /// [`AdapterOutcome::Unavailable`] — consumers see explicit unavailable
 /// evidence, never fabricated results.
+///
+/// Credential resolution (#9930): `AUGMENT_SESSION_FILE` — a mounted copy
+/// of the auggie CLI session JSON (`accessToken`, usually `tenantURL`) —
+/// takes precedence over `AUGMENT_API_TOKEN`, because the SSM-stored API
+/// token is known to 401 on the context engine while the session
+/// credential is the proven-working path. A session file that fails to
+/// load is a hard unconfigured state: no silent fallback to an API token
+/// that would send a known-broken credential. Failure reasons name the
+/// failure mode but never quote file contents or token material.
 pub struct AugmentAdapter {
     token: Option<String>,
     base_url: String,
     timeout: Duration,
+    /// Why the adapter is unconfigured, when it is — surfaced verbatim as
+    /// the Unavailable reason instead of a generic guess.
+    config_reason: Option<String>,
+}
+
+/// Load an auggie CLI session credential (#9930): `path` points at a
+/// session JSON with `accessToken` and usually `tenantURL`. Returns
+/// `(bearer_token, tenant_url)`. Error reasons name the failure mode but
+/// never quote file contents or token material.
+fn load_session_credentials(path: &str) -> Result<(String, Option<String>), String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read session credential file: {e}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|_| "session credential file is not valid JSON".to_string())?;
+    let token = parsed
+        .get("accessToken")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty())
+        .ok_or("session credential file has no usable accessToken")?
+        .to_string();
+    let tenant = parsed
+        .get("tenantURL")
+        .and_then(|v| v.as_str())
+        .filter(|u| !u.is_empty())
+        .map(|u| u.to_string());
+    Ok((token, tenant))
 }
 
 impl AugmentAdapter {
     pub fn from_env() -> Self {
+        let session_file = std::env::var("AUGMENT_SESSION_FILE")
+            .ok()
+            .filter(|p| !p.is_empty());
+        let api_token = std::env::var("AUGMENT_API_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+        let (token, tenant_url, config_reason) = match session_file {
+            Some(path) => match load_session_credentials(&path) {
+                Ok((tok, tenant)) => (Some(tok), tenant, None),
+                Err(reason) => {
+                    (None, None, Some(format!("AUGMENT_SESSION_FILE ({path}) unusable: {reason}")))
+                }
+            },
+            None => match api_token {
+                Some(tok) => (Some(tok), None, None),
+                None => (
+                    None,
+                    None,
+                    Some(
+                        "neither AUGMENT_SESSION_FILE nor AUGMENT_API_TOKEN set — \
+                         provider not configured"
+                            .into(),
+                    ),
+                ),
+            },
+        };
+        // Explicit operator base wins; otherwise the session's tenant URL
+        // (the credential's own API base); otherwise the generic default.
+        let base_url = match std::env::var("AUGMENT_BASE_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+        {
+            Some(u) => u,
+            None => tenant_url.unwrap_or_else(|| "https://api.augmentcode.com".into()),
+        };
         Self {
-            token: std::env::var("AUGMENT_API_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty()),
-            base_url: std::env::var("AUGMENT_BASE_URL")
-                .unwrap_or_else(|_| "https://api.augmentcode.com".into()),
+            token,
+            base_url,
             timeout: Duration::from_secs(
                 std::env::var("AUGMENT_TIMEOUT_SECS")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(60),
             ),
+            config_reason,
         }
     }
 
@@ -248,7 +317,9 @@ impl RetrievalAdapter for AugmentAdapter {
     fn query(&self, spec: &QuerySpec, budget: &Budget) -> AdapterOutcome {
         let Some(token) = &self.token else {
             return AdapterOutcome::Unavailable {
-                reason: "AUGMENT_API_TOKEN not set — provider not configured".into(),
+                reason: self.config_reason.clone().unwrap_or_else(|| {
+                    "AUGMENT_API_TOKEN not set — provider not configured".into()
+                }),
             };
         };
         let url = format!("{}/context/direct", self.base_url.trim_end_matches('/'));
@@ -509,5 +580,40 @@ mod tests {
             }
             other => panic!("expected results, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_credential_loader_accepts_auggie_session_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("session.json");
+        std::fs::write(
+            &p,
+            r#"{"accessToken":"tok-fixture","tenantURL":"https://tenant.example.invalid/","scopes":[]}"#,
+        )
+        .unwrap();
+        let (tok, tenant) = super::load_session_credentials(p.to_str().unwrap()).unwrap();
+        assert_eq!(tok, "tok-fixture");
+        assert_eq!(tenant.as_deref(), Some("https://tenant.example.invalid/"));
+    }
+
+    #[test]
+    fn session_credential_loader_failures_never_leak_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("session.json");
+        let marker = "tok-secret-marker-please-not-in-errors";
+        // Malformed JSON.
+        std::fs::write(&p, format!("not json {marker}")).unwrap();
+        let err = super::load_session_credentials(p.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("not valid JSON"));
+        assert!(!err.contains(marker), "error text leaked file contents: {err}");
+        // Empty token.
+        std::fs::write(&p, r#"{"accessToken":""}"#).unwrap();
+        let err = super::load_session_credentials(p.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("no usable accessToken"));
+        // Missing file.
+        let err =
+            super::load_session_credentials(dir.path().join("missing.json").to_str().unwrap())
+                .unwrap_err();
+        assert!(err.contains("cannot read session credential file"));
     }
 }
