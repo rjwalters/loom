@@ -714,6 +714,16 @@ echo "Testing forge_get_workflow_runs Gitea pagination + fail-closed (#9879)..."
 WF_SHIM_DIR=$(mktemp -d)
 WF_PAGES_FILE=$(mktemp)
 export WF_PAGES_FILE
+export WF_SHIM_DIR
+# Page bodies are PRE-COMPUTED files (jq runs here, at setup, with its exit
+# codes checked) and the curl shim only cats them: a jq spawn inside the
+# shim under hermetic-CI load (14 concurrent suites) once flaked an empty
+# body -> paginate failed closed -> a coin-flip suite (judge, round 3 of
+# #9880). cat is load-immune.
+SHA_HEX="96c2b8246403c9c91d37c2c7d6eebf7558f790f4"
+jq -nc '{workflow_runs: [range(0; 49) | {head_sha: "other", display_title: "filler"}] + [{head_sha: $sha, display_title: "one"}]}' --arg sha "$SHA_HEX" > "$WF_SHIM_DIR/page-ok1.json" || exit 1
+jq -nc '{workflow_runs: [{head_sha: $sha, display_title: "two"}]}' --arg sha "$SHA_HEX" > "$WF_SHIM_DIR/page-ok2.json" || exit 1
+jq -nc '{workflow_runs: [range(0; 50) | {head_sha: "x", status: "queued"}]}' > "$WF_SHIM_DIR/page-cap.json" || exit 1
 cat > "$WF_SHIM_DIR/curl" <<'SHIM'
 #!/usr/bin/env bash
 # Find the page= argument (gitea_api appends &limit=50&page=N).
@@ -723,41 +733,31 @@ for a in "$@"; do
     *page=*) page="${a##*page=}" ;;
   esac
 done
-# Page script: semicolon-separated per-page directives, e.g. "ok;fail" or "cap".
+# Page script: semicolon-separated per-page directives, e.g. "ok1;ok2" or
+# "cap". Pages beyond the directives repeat the LAST one (a full page), so
+# the cap script trips the 50-page cap rather than ending on a short page.
 I=1
-for directive in $(tr ';' ' ' < "$WF_PAGES_FILE"); do
+directive=""
+for d in $(tr ';' ' ' < "$WF_PAGES_FILE"); do
+  directive="$d"
   if [ "$I" -eq "$page" ]; then
-    case "$directive" in
+    case "$d" in
       fail)
         printf 'server error\n500\n'
         exit 0
         ;;
-      ok1)
-        # FULL page (50): pagination continues to the next page.
-        jq -nc '{workflow_runs: [range(0; 49) | {head_sha: "other", display_title: "filler"}] + [{head_sha: "96c2b8246403c9c91d37c2c7d6eebf7558f790f4", display_title: "one"}]}'
+      ok1|ok2|cap)
+        cat "$WF_SHIM_DIR/page-$d.json"
         printf '200\n'
         ;;
-      ok2)
-        # SHORT page (1): the stop rule fires after this one.
-        jq -nc '{workflow_runs: [{head_sha: "96c2b8246403c9c91d37c2c7d6eebf7558f790f4", display_title: "two"}]}'
-        printf '200\n'
-        ;;
-      cap)
-        jq -nc --argjson n 50 '{workflow_runs: [range(0; $n) | {head_sha: "x", status: "queued"}]}'
-        printf '200\n'
-        ;;  # 50 items = FULL page: pagination continues until the cap
     esac
     exit 0
   fi
   I=$((I + 1))
 done
-# Pages beyond the scripted directives repeat the LAST directive — the cap
-# script needs every page full so the 50-page cap is what trips, not an
-# empty fallback page.
-for directive in $(tr ';' ' ' < "$WF_PAGES_FILE" | tail -1); do :; done
 case "$directive" in
-  cap)
-    jq -nc --argjson n 50 '{workflow_runs: [range(0; $n) | {head_sha: "x", status: "queued"}]}'
+  ok1|ok2|cap)
+    cat "$WF_SHIM_DIR/page-$directive.json"
     printf '200\n'
     ;;
   *)

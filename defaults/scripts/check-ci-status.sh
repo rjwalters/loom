@@ -286,8 +286,9 @@ analyze_status() {
     # Fail closed (#9879): an unreadable workflow-runs feed is PENDING, never
     # resolved. A definitive failure still dominates — "some CI failed" plus
     # "the rest is unreadable" must not soften to pending. (Statement-level
-    # `&&`, not an if: this file has no `set -e`, and the shell-budget
-    # ratchet prices the extra lines of the block form.)
+    # `&&` for the shell-budget ratchet: safe mid-function — a failing LEFT
+    # side of `&&` is exempt from `set -e` (line 68), and the jq -n that
+    # follows consumes the status anyway.)
     [[ "$workflow_runs_state" == "unknown" && "$overall_status" != "failure" ]] && overall_status="pending"
 
     # Output JSON results
