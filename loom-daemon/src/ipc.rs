@@ -355,12 +355,12 @@ fn cancel_all_in_flight(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Pat
 /// live, responsive daemon" and returns `false` — refusing to ever reclaim
 /// such a socket would be worse than rebinding it.
 pub(crate) async fn socket_has_live_listener(socket_path: &Path) -> bool {
-    let stream = match tokio::time::timeout(
-        LIVENESS_PROBE_TIMEOUT,
-        UnixStream::connect(socket_path),
-    )
-    .await
-    {
+    // Bound eagerly (tokio futures are lazy — nothing connects until the
+    // timeout wraps it) so the `match` line fits the width limit; this also
+    // pays the file's line-budget ratchet back for #9815's two-line advisory
+    // call site below.
+    let connect = UnixStream::connect(socket_path);
+    let stream = match tokio::time::timeout(LIVENESS_PROBE_TIMEOUT, connect).await {
         Ok(Ok(stream)) => stream,
         // Connect refused/absent, or the connect itself timed out — not a
         // live listener.

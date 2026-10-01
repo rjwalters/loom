@@ -148,28 +148,56 @@ pub(crate) fn scoped_start_warning(
     ))
 }
 
-/// The startup choke point: probe the machine-level default socket and log a
-/// warning when this scoped start is about to run alongside a live
-/// machine-level daemon. Never fatal, never refuses — every error branch is a
+/// The startup choke point: resolve this process's env and delegate to
+/// [`warn_scoped_start`]. Never fatal, never refuses — every error branch is a
 /// silent return (see [`ScopedStartDecision`]).
 pub(crate) async fn warn_if_scoped_alongside_machine_daemon(own_socket: &Path) {
     let Some(machine_default) = machine_default_socket() else {
         return;
     };
-    let machine_default_live = crate::ipc::socket_has_live_listener(&machine_default).await;
-    // The daemon's own loom dir — the override's parent when `LOOM_SOCKET_PATH`
-    // is set, else `~/.loom`. Same resolution `daemon_pidfile` uses; the
-    // `daemon_service` twin of this fn is binary-target-only, so the lib goes
-    // through `autonomy_marker`.
+    let override_env = std::env::var("LOOM_SOCKET_PATH").ok();
     let loom_dir = crate::autonomy_marker::resolve_loom_dir();
+    warn_scoped_start(own_socket, override_env.as_deref(), loom_dir.as_deref(), &machine_default)
+        .await;
+}
+
+/// The parameterised advisory body: probe the machine-level default socket
+/// only when a real-directory scoped start could plausibly warn, then decide
+/// and log. Parameterised so tests drive every branch without mutating
+/// process-global env vars or depending on the checkout's own directory
+/// character (review fix: the wrapper test used to build its warn fixture
+/// under `CARGO_MANIFEST_DIR`, which classifies scratch in a
+/// `.loom/worktrees/` or `*-checkout` checkout — exactly where builders run
+/// scoped tests).
+async fn warn_scoped_start(
+    own_socket: &Path,
+    override_env: Option<&str>,
+    loom_dir: Option<&Path>,
+    machine_default: &Path,
+) {
+    // Probe lazily: an unscoped start is the #3806 guard's business and a
+    // scratch-isolated daemon stays silent regardless, so neither pays a
+    // connect to the default socket on every startup. `true` asks the
+    // hypothetical "would a live incumbent warn?" — if even that is no, the
+    // probe cannot change the outcome.
+    let could_warn = matches!(
+        decide_scoped_start(override_env, own_socket, loom_dir, Some(machine_default), true,),
+        ScopedStartDecision::LiveIncumbent {
+            scratch_isolated: false
+        }
+    );
+    if !could_warn {
+        return;
+    }
+    let machine_default_live = crate::ipc::socket_has_live_listener(machine_default).await;
     let decision = decide_scoped_start(
-        std::env::var("LOOM_SOCKET_PATH").ok().as_deref(),
+        override_env,
         own_socket,
-        loom_dir.as_deref(),
-        Some(&machine_default),
+        loom_dir,
+        Some(machine_default),
         machine_default_live,
     );
-    if let Some(warning) = scoped_start_warning(&decision, own_socket, &machine_default) {
+    if let Some(warning) = scoped_start_warning(&decision, own_socket, machine_default) {
         log::warn!("daemon_parallel_advisory: {warning}");
     }
 }
@@ -375,9 +403,9 @@ mod tests {
     /// A minimal live daemon on `socket_path`: accepts connections in a loop
     /// and answers every line with the adjacently-tagged `Response::Pong`
     /// wire shape, so `socket_has_live_listener`'s Ping/Pong probe succeeds.
-    /// Runs on the caller's current-thread runtime; the task is intentionally
-    /// left running for the test process's lifetime (the
-    /// `spawn_fake_daemon_socket` tradeoff in `serve.rs`'s tests).
+    /// Runs on the caller's runtime; the task dies with the temporary runtime
+    /// when `block_on` returns (the listener's socket file lives in the
+    /// caller's tempdir, which is dropped right after).
     async fn spawn_fake_pong_daemon(socket_path: &Path) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::UnixListener::bind(socket_path).unwrap();
@@ -398,89 +426,105 @@ mod tests {
         });
     }
 
-    /// The full wrapper path, both halves of the contract in one fixture:
-    /// a live machine-level daemon under a redirected `$HOME`, a scoped start
-    /// rooted at a REAL directory (warns), and one rooted at a scratch-style
-    /// directory (silent). Serialized on BOTH env keys it mutates. A plain
-    /// `#[test]`: the outer runtime must not already be running when the
-    /// capture closure drives its own.
-    #[test]
-    #[serial_test::serial(env_home_path)]
-    #[serial_test::serial(loom_socket_path_env)]
-    fn wrapper_warns_for_a_real_scoped_start_and_stays_silent_for_scratch() {
-        let home_tmp = tempfile::tempdir().unwrap();
-        let machine_socket = home_tmp.path().join(".loom").join("loom-daemon.sock");
-        std::fs::create_dir_all(machine_socket.parent().unwrap()).unwrap();
-
-        // A non-scratch scoped socket: under the crate's (gitignored) target
-        // dir — not $TMPDIR, no `-checkout` suffix, so `is_scratch_style_path`
-        // does not match and the warning branch is reachable in a test.
-        let real_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!("test-parallel-advisory-{}", std::process::id()));
-        std::fs::create_dir_all(&real_dir).unwrap();
-
-        let old_home = std::env::var("HOME").ok();
-        let old_socket = std::env::var("LOOM_SOCKET_PATH").ok();
-        std::env::set_var("HOME", home_tmp.path());
-
-        let scratch_socket = home_tmp.path().join("alt").join("daemon.sock");
-        let real_socket = real_dir.join("daemon.sock");
-
-        // Both halves run under ONE runtime so the fake daemon (spawned
-        // inside) and the probes share it; both halves' records land in one
-        // capture, so the silent half is asserted by *count*: exactly one
-        // advisory warn, for the real-rooted half only.
-        std::env::set_var("LOOM_SOCKET_PATH", &scratch_socket);
-        let records = crate::test_log_capture::capture_logs(|| {
+    /// Drive one `warn_scoped_start` scenario under `capture_logs`, on a
+    /// current-thread runtime built inside the sync closure (a plain `#[test]`
+    /// — the runtime must not already be running). The fake Pong daemon is
+    /// spawned first so the probe (when it runs) sees a live incumbent.
+    fn captured_scenario(own_socket: &Path, loom_dir: Option<&str>) -> Vec<(log::Level, String)> {
+        let machine_dir = tempfile::tempdir().unwrap();
+        let machine_socket = machine_dir.path().join("machine.sock");
+        crate::test_log_capture::capture_logs(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap()
                 .block_on(async {
                     spawn_fake_pong_daemon(&machine_socket).await;
-                    warn_if_scoped_alongside_machine_daemon(&scratch_socket).await;
-                    std::env::set_var("LOOM_SOCKET_PATH", &real_socket);
-                    warn_if_scoped_alongside_machine_daemon(&real_socket).await;
-                });
-        });
+                    warn_scoped_start(
+                        own_socket,
+                        Some(own_socket.to_str().unwrap()),
+                        loom_dir.map(Path::new),
+                        &machine_socket,
+                    )
+                    .await;
+                })
+        })
+    }
 
-        // --- restore -------------------------------------------------------
-        match old_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-        match old_socket {
-            Some(v) => std::env::set_var("LOOM_SOCKET_PATH", v),
-            None => std::env::remove_var("LOOM_SOCKET_PATH"),
-        }
-        let _ = std::fs::remove_dir_all(&real_dir);
-
-        let advisories: Vec<&(log::Level, String)> = records
+    fn advisory_warns(records: &[(log::Level, String)]) -> Vec<&str> {
+        records
             .iter()
             .filter(|(level, msg)| {
                 *level == log::Level::Warn && msg.contains("daemon_parallel_advisory")
             })
-            .collect();
+            .map(|(_, msg)| msg.as_str())
+            .collect()
+    }
+
+    /// The warn half, end to end through the wrapper body: a real-directory
+    /// scoped start alongside a live machine-level daemon produces exactly one
+    /// advisory warn naming both sockets. The loom dir is a plain string, so
+    /// the scenario is independent of the checkout's own directory character —
+    /// under `CARGO_MANIFEST_DIR` the fixture used to classify scratch in a
+    /// `.loom/worktrees/` checkout and fail deterministically (review fix).
+    #[test]
+    fn wrapper_body_warns_for_a_real_scoped_start() {
+        let own = tempfile::tempdir().unwrap().path().join("daemon.sock");
+        let records = captured_scenario(&own, Some("/home/u/.loom-alt"));
+        let warns = advisory_warns(&records);
         assert_eq!(
-            advisories.len(),
+            warns.len(),
             1,
-            "exactly one advisory warn expected (scratch-rooted half silent, real-rooted \
-             half warned); got {advisories:?} — full capture: {records:?}"
+            "exactly one advisory warn expected; got {warns:?} — full capture: {records:?}"
         );
-        let (level, msg) = advisories[0];
-        assert_eq!(*level, log::Level::Warn);
+        assert!(warns[0].contains(own.display().to_string().as_str()), "warn: {}", warns[0]);
         assert!(
-            msg.contains(real_socket.display().to_string().as_str()),
-            "the warning must name this daemon's scoped socket: {msg}"
+            warns[0].contains("machine.sock"),
+            "the warning must name the machine-level socket: {}",
+            warns[0]
         );
+    }
+
+    /// The silent half: the same live incumbent, but the scoped start is
+    /// rooted at a scratch-style directory — the hermetic suites' setup — so
+    /// nothing is logged and the probe is not even paid.
+    #[test]
+    fn wrapper_body_stays_silent_for_a_scratch_rooted_scoped_start() {
+        let scratch_root = std::env::temp_dir().join("loom-parallel-advisory-test");
+        let own = scratch_root.join("daemon.sock");
+        let records = captured_scenario(&own, Some(scratch_root.to_str().unwrap()));
         assert!(
-            msg.contains(machine_socket.display().to_string().as_str()),
-            "the warning must name the machine-level socket: {msg}"
+            advisory_warns(&records).is_empty(),
+            "a scratch-isolated scoped daemon must stay silent; got {records:?}"
         );
+    }
+
+    /// An unscoped start is the #3806 guard's business — the advisory must
+    /// stay silent for it (and, structurally, never even probe: the early
+    /// return in `warn_scoped_start` precedes the connect).
+    #[test]
+    fn wrapper_body_stays_silent_for_an_unscoped_start() {
+        let own = tempfile::tempdir().unwrap().path().join("daemon.sock");
+        let records = crate::test_log_capture::capture_logs(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    // No fake daemon needed: the early return precedes the
+                    // probe, so nothing should ever connect.
+                    warn_scoped_start(
+                        &own,
+                        None,
+                        Some(Path::new("/home/u/.loom")),
+                        Path::new("/nonexistent/.loom/loom-daemon.sock"),
+                    )
+                    .await;
+                });
+        });
         assert!(
-            !msg.contains(scratch_socket.display().to_string().as_str()),
-            "the warning must be the real-rooted half's, not the scratch half's: {msg}"
+            advisory_warns(&records).is_empty(),
+            "an unscoped start must stay silent; got {records:?}"
         );
     }
 }
