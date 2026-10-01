@@ -50,6 +50,15 @@ origins MUST NOT mutate process-global environment variables: switching
 GitHub App installation tokens keep their existing mint/read path
 (`forge_identity.rs`); a Gitea token never mints through it.
 
+**The quota-sharing boundary is the (provider, credential principal)
+pair.** Requests under one principal reference share one rate-limit
+budget and one breaker (`rate_limit_breaker.rs`); two different
+principals to the same provider do NOT share budget. Concurrent
+repositories sharing a credential MUST share its breaker state;
+repositories with their own credentials are isolated. Any design that
+varies the credential per request must scope the breaker key to that
+credential reference.
+
 ## 2. Outcome taxonomy — fail closed
 
 Six outcomes, no success-biased coercions:
@@ -58,9 +67,9 @@ Six outcomes, no success-biased coercions:
 |---|---|---|
 | `Unsupported` | The provider (at its observed version) has no such capability | the operation cannot have run |
 | `Unknown` | The provider could not be asked, or answered unintelligibly | **pending**, never resolved |
-| `InsufficientPermission` | Authenticated, denied | pending + a permission escalation is required |
+| `InsufficientPermission` | Authenticated, denied | definitive about the **attempt**: no partial write happened and this credential cannot succeed — the work it stood for stays pending until the credential is fixed (`ForgeOutcome::is_definitive`) |
 | `ConflictHeadChanged` | Optimistic concurrency lost (head SHA moved) | retry after rebase; not a forge fault |
-| `PartialPagination` | A list read ended before exhaustion | the list is unusable for decisions — treat as `Unknown` |
+| `PartialPagination` | A list read ended before exhaustion | the list is unusable for decisions — same reading as `Unknown`: pending, not resolved; a full re-**read** (not a blind write retry) is the recovery |
 | `Transient` | Rate limit / 429 / 5xx / timeout | retry with backoff; still unresolved until answered |
 
 Examples that fix the semantics:
