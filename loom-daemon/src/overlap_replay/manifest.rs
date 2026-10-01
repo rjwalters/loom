@@ -45,9 +45,9 @@ pub struct ReplayPair {
     pub prs: Vec<PrAssociation>,
     /// How/why this pair entered the cohort (selection-population provenance).
     pub selection: String,
-    /// Optional frozen hub weights: path → weight (>0). Absent = every file
-    /// weighs 1. Frozen at manifest-freeze time so ablations replay the same
-    /// evidence.
+    /// Optional frozen hub weights: path → weight (≥ 0; 0 excludes the file
+    /// from the weighted metric). Absent = every file weighs 1. Frozen at
+    /// manifest-freeze time so ablations replay the same evidence.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hub_weights: BTreeMap<String, f64>,
 }
@@ -71,6 +71,25 @@ pub struct IssueSnapshot {
     pub provenance: SnapshotProvenance,
     /// RFC3339 issue creation time (selection-population evidence).
     pub created_at: String,
+}
+
+impl IssueSnapshot {
+    /// Leakage validity of THIS snapshot, derived locally from its own
+    /// provenance. Deliberately not looked up from any shared map: the same
+    /// issue number in two pairs may have different reconstruction outcomes,
+    /// and each pair must be classified independently.
+    pub fn validity(&self) -> SnapshotValidity {
+        if self.provenance.reconstructed {
+            SnapshotValidity::Usable
+        } else {
+            SnapshotValidity::Excluded(
+                self.provenance
+                    .exclusion_reason
+                    .clone()
+                    .unwrap_or_else(|| "snapshot not reconstructed".to_string()),
+            )
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -146,9 +165,14 @@ pub enum SnapshotValidity {
 }
 
 impl ReplayManifest {
-    /// Structural validation plus the leakage guards. Returns the validity
-    /// of every issue snapshot keyed by issue number.
-    pub fn validate(&self) -> Result<BTreeMap<u32, SnapshotValidity>> {
+    /// Structural validation: schema version, required fields, referential
+    /// integrity. Per-snapshot leakage validity is intentionally NOT built
+    /// here — it is derived per pair by [`IssueSnapshot::validity`], because
+    /// the same issue number may legitimately appear in two pairs with
+    /// different reconstruction outcomes (a global issue-keyed map would let
+    /// one pair's unreconstructable snapshot leak into — or wrongly exclude —
+    /// the other pair's scoring).
+    pub fn validate(&self) -> Result<()> {
         if self.manifest_version != 1 {
             bail!("unsupported manifest_version {} (want 1)", self.manifest_version);
         }
@@ -158,7 +182,6 @@ impl ReplayManifest {
         if self.pairs.is_empty() {
             bail!("manifest has no pairs");
         }
-        let mut validity = BTreeMap::new();
         let mut seen_pairs = BTreeSet::new();
         for pair in &self.pairs {
             if !seen_pairs.insert(pair.pair_id.as_str()) {
@@ -182,21 +205,6 @@ impl ReplayManifest {
                 bail!("pair {} has no PR associations", pair.pair_id);
             }
             let issue_nums: BTreeSet<u32> = pair.issues.iter().map(|i| i.issue).collect();
-            for snap in &pair.issues {
-                if snap.provenance.reconstructed {
-                    validity.insert(snap.issue, SnapshotValidity::Usable);
-                } else {
-                    validity.insert(
-                        snap.issue,
-                        SnapshotValidity::Excluded(
-                            snap.provenance
-                                .exclusion_reason
-                                .clone()
-                                .unwrap_or_else(|| "snapshot not reconstructed".to_string()),
-                        ),
-                    );
-                }
-            }
             for pr in &pair.prs {
                 if !issue_nums.contains(&pr.issue) {
                     bail!(
@@ -211,7 +219,7 @@ impl ReplayManifest {
                 }
             }
         }
-        Ok(validity)
+        Ok(())
     }
 
     /// SHA-256 over the snapshot's title+body — the content hash frozen
@@ -279,9 +287,9 @@ mod tests {
             query_policy_version: "qp-v1".into(),
             pairs: vec![pair("p1", 1, 2)],
         };
-        let v = m.validate().unwrap();
-        assert_eq!(v[&1], SnapshotValidity::Usable);
-        assert_eq!(v[&2], SnapshotValidity::Usable);
+        m.validate().unwrap();
+        assert_eq!(m.pairs[0].issues[0].validity(), SnapshotValidity::Usable);
+        assert_eq!(m.pairs[0].issues[1].validity(), SnapshotValidity::Usable);
     }
 
     #[test]
@@ -295,8 +303,11 @@ mod tests {
         };
         m.pairs[0].issues[1].provenance.reconstructed = false;
         m.pairs[0].issues[1].provenance.exclusion_reason = Some("no earlier content".into());
-        let v = m.validate().unwrap();
-        assert_eq!(v[&2], SnapshotValidity::Excluded("no earlier content".into()));
+        m.validate().unwrap();
+        assert_eq!(
+            m.pairs[0].issues[1].validity(),
+            SnapshotValidity::Excluded("no earlier content".into())
+        );
     }
 
     #[test]

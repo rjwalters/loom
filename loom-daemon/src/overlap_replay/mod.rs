@@ -60,17 +60,18 @@ pub use artifact::FrozenPrediction;
 pub use manifest::{ReplayManifest, SnapshotValidity};
 
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Load and validate a manifest, returning it plus the per-snapshot validity
-/// classification (leakage-controlled vs excluded) the rest of the pipeline
-/// threads through.
-pub fn load_manifest(path: &Path) -> Result<(ReplayManifest, BTreeMap<u32, SnapshotValidity>)> {
+/// Load and validate a manifest (structural checks). Per-snapshot leakage
+/// validity is derived per pair at evaluation time via
+/// [`manifest::IssueSnapshot::validity`] — never from a shared issue-keyed
+/// map, which would collide when two pairs share an issue number with
+/// different reconstruction outcomes.
+pub fn load_manifest(path: &Path) -> Result<ReplayManifest> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading manifest {}", path.display()))?;
     let manifest: ReplayManifest = serde_json::from_str(&raw)
         .with_context(|| format!("parsing manifest {}", path.display()))?;
-    let validity = manifest.validate()?;
-    Ok((manifest, validity))
+    manifest.validate()?;
+    Ok(manifest)
 }

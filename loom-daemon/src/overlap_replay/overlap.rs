@@ -107,13 +107,15 @@ fn dedup_spans(spans: &[Span]) -> Vec<Span> {
 
 /// Suffix symbol match: `crate::foo::bar` matches `bar`; a *heuristic*
 /// because historical qualified names may differ in module path while naming
-/// the same item. The report labels it as such.
+/// the same item. The report labels it as such. Returns the number of
+/// DISTINCT B-side symbols matched, so the Jaccard built on it can never
+/// exceed 1.0 (a many-to-one suffix match counts once).
 pub fn symbol_sets_intersect(a: &BTreeSet<String>, b: &BTreeSet<String>) -> usize {
-    a.iter()
-        .filter(|s| {
-            b.contains(s.as_str())
-                || b.iter()
-                    .any(|t| t.rsplit("::").next() == s.rsplit("::").next() && !t.is_empty())
+    b.iter()
+        .filter(|t| {
+            a.contains(t.as_str())
+                || a.iter()
+                    .any(|s| s.rsplit("::").next() == t.rsplit("::").next() && !s.is_empty())
         })
         .count()
 }

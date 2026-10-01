@@ -96,7 +96,7 @@ impl OverlapReplayCommand {
                 repo,
                 out_dir,
             } => {
-                let (m, _) = overlap_replay::load_manifest(&manifest)?;
+                let m = overlap_replay::load_manifest(&manifest)?;
                 let all = outcome::compute_and_write(&repo, &m, &out_dir)?;
                 println!(
                     "outcomes: wrote {} pair outcome file(s) to {}",
@@ -123,14 +123,17 @@ impl OverlapReplayCommand {
 }
 
 fn run_validate(manifest: &Path, predictions_dir: Option<&Path>, json: bool) -> Result<()> {
-    let (m, validity) = overlap_replay::load_manifest(manifest)?;
+    let m = overlap_replay::load_manifest(manifest)?;
     let mut findings: Vec<String> = Vec::new();
-    let excluded = validity
-        .values()
-        .filter(|v| matches!(v, SnapshotValidity::Excluded(_)))
+    // Per-occurrence: an issue shared by two pairs counts once per pair.
+    let excluded = m
+        .pairs
+        .iter()
+        .flat_map(|p| p.issues.iter())
+        .filter(|s| !matches!(s.validity(), SnapshotValidity::Usable))
         .count();
     findings.push(format!(
-        "manifest: {} pair(s), {excluded} snapshot(s) excluded from leakage-controlled evaluation",
+        "manifest: {} pair(s), {excluded} snapshot occurrence(s) excluded from leakage-controlled evaluation",
         m.pairs.len()
     ));
     let preds: BTreeMap<u32, FrozenPrediction> = match predictions_dir {
@@ -220,7 +223,7 @@ fn run_score(
     predictions_dir: Option<&Path>,
     out_dir: &Path,
 ) -> Result<()> {
-    let (m, validity) = overlap_replay::load_manifest(manifest)?;
+    let m = overlap_replay::load_manifest(manifest)?;
     let predictions: BTreeMap<u32, FrozenPrediction> = match predictions_dir {
         Some(dir) => artifact::load_strict(dir)?,
         None => BTreeMap::new(),
@@ -266,7 +269,7 @@ fn run_score(
         .map(|o| (o.pair_id.clone(), o))
         .collect();
 
-    let eval = score::evaluate(&m, &validity, &predictions, &by_pair);
+    let eval = score::evaluate(&m, &predictions, &by_pair);
     let written = report::write_reports(&eval, out_dir)?;
     println!(
         "score: {} pair(s) evaluated ({} leakage-controlled) — reports:",

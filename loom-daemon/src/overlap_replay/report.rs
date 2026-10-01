@@ -124,7 +124,7 @@ predicted_line_overlap_fraction,conflict_any,conflicted_files,observed_conflict\
             actual
                 .and_then(|a| a.coordinate_basis.clone())
                 .unwrap_or_default(),
-            opt_f64(&p.predicted.line_overlap_fraction),
+            opt_f64(&p.predicted.as_ref().and_then(|o| o.line_overlap_fraction)),
             match p.conflict.any_conflict {
                 Some(true) => "conflict",
                 Some(false) => "clean",

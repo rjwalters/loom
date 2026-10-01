@@ -509,6 +509,17 @@ fn overlap_replay_end_to_end() {
     // p4: ambiguous association recorded as such, evaluated separately.
     assert_eq!(p4_assoc(&by_id), "ambiguous");
 
+    // B1 regression: p3 has NO usable predictions (issue 5's snapshot is
+    // excluded, issue 6 has no artifact) — its predicted-overlap record is
+    // null and every retrieval-based score is null, never a fabricated zero.
+    // The Curator baseline stays scoreable; p1 (both present) scores fully.
+    let p3 = &by_id["p3-excluded"];
+    assert!(p3["predicted"].is_null(), "p3: {}", p3["predicted"]);
+    assert!(p3["scores"]["blend"].is_null());
+    assert!(p3["scores"]["file_jaccard"].is_null());
+    assert!(p1["predicted"].is_object());
+    assert!(p1["scores"]["blend"].as_f64().is_some());
+
     // --- per-issue assertions ---------------------------------------------
     let per_issue = read_jsonl(&out_dir.join("per_issue.jsonl"));
     let by_issue: BTreeMap<u32, serde_json::Value> = per_issue
@@ -538,7 +549,7 @@ fn overlap_replay_end_to_end() {
 
     // --- summary.md contents ----------------------------------------------
     let summary = String::from_utf8(std::fs::read(out_dir.join("summary.md")).unwrap()).unwrap();
-    assert!(summary.contains("1 issue snapshot(s) could not be reconstructed"));
+    assert!(summary.contains("1 issue snapshot occurrence(s) could not be reconstructed"));
     assert!(summary.contains("1 issue(s) had a prediction whose content hash"));
     assert!(summary.contains("unknown")); // the ambiguous pair's conflict row stratum
     assert!(summary.contains("not a probability")); // ranking-not-probability language
@@ -564,7 +575,10 @@ fn overlap_replay_end_to_end() {
     .unwrap();
     let own_files: Vec<&str> = own.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(own_files, vec!["src/e_only.rs"]);
-    assert!(!own.base_update_contamination);
+    // Contamination is now DETECTED in commit mode too (the branch does
+    // contain upstream commits) — the flag documents the detection while the
+    // patch still counts only the PR's own commit.
+    assert!(own.base_update_contamination);
     assert_eq!(own.coordinate_basis, CoordinateBasis::PerCommitParent);
     // The pre-rebase commit is a distinct endpoint that still exists.
     assert_ne!(fx.feat_e_pre_rebase, fx.feat_e_rebased);
@@ -716,10 +730,14 @@ fn baseline_only_score_runs_without_predictions() {
     assert!(per_issue
         .iter()
         .all(|e| e["prediction_status"] == "missing"));
-    // Curator baseline still computed (both sides known).
+    // Curator baseline still computed (both sides known); every
+    // retrieval-based score is null — an unknown, never a fabricated zero.
     let per_pair = read_jsonl(&out_dir.join("per_pair.jsonl"));
     let curator = per_pair[0]["scores"]["curator_baseline"]
         .as_f64()
         .expect("curator baseline scored");
     assert!((curator - 1.0).abs() < 1e-9); // identical affected-files lists
+    assert!(per_pair[0]["scores"]["blend"].is_null());
+    assert!(per_pair[0]["scores"]["file_jaccard"].is_null());
+    assert!(per_pair[0]["predicted"].is_null());
 }

@@ -378,6 +378,12 @@ pub fn own_patch(
 ) -> anyhow::Result<OwnPatch> {
     resolve_commit(repo, base_sha)?;
     resolve_commit(repo, head_sha)?;
+    // Contamination detection runs in BOTH modes: a rebased branch carries
+    // upstream commits in `base..head` regardless of how the patch is then
+    // derived. The flag documents what was detected; in commit mode the
+    // patch still counts only `own_commits`, so the flag is informational
+    // rather than a count correction.
+    let contamination = detect_base_update_contamination(repo, base_sha, head_sha);
     if let Some(commits) = own_commits.filter(|c| !c.is_empty()) {
         let mut merged: BTreeMap<String, FilePatch> = BTreeMap::new();
         for c in commits {
@@ -405,7 +411,7 @@ pub fn own_patch(
             head_sha: head_sha.into(),
             merge_base: None,
             coordinate_basis: CoordinateBasis::PerCommitParent,
-            base_update_contamination: false,
+            base_update_contamination: contamination,
             files,
             raw_diff: commits
                 .iter()
@@ -421,21 +427,6 @@ pub fn own_patch(
     let mb = git(repo, &["merge-base", base_sha, head_sha])?
         .trim()
         .to_string();
-    // Contamination: a commit in base..head that is also an ancestor of the
-    // repo's default branch head landed upstream — inherited, not ours.
-    let upstream = git(repo, &["rev-parse", "--verify", "-q", "origin/HEAD^{commit}"])
-        .or_else(|_| git(repo, &["rev-parse", "--verify", "-q", "main^{commit}"]))
-        .unwrap_or_default();
-    let mut contamination = false;
-    if !upstream.trim().is_empty() {
-        let ours = git(repo, &["log", "--format=%H", &format!("{base_sha}..{head_sha}")])?;
-        for c in ours.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            if git(repo, &["merge-base", "--is-ancestor", c, upstream.trim()]).is_ok() {
-                contamination = true;
-                break;
-            }
-        }
-    }
     let diff = git(repo, &["diff", "--find-renames", "-U0", &mb, head_sha])?;
     let files = parse_unified_diff(&diff);
     Ok(OwnPatch {
@@ -448,6 +439,26 @@ pub fn own_patch(
         files,
         raw_diff: diff,
     })
+}
+
+/// A commit in `base..head` that is also an ancestor of the repo's default
+/// branch head landed upstream — inherited by a base update, not the PR's
+/// own work. Unresolvable upstream refs degrade to `false` (range mode then
+/// measures exactly what the diff says, with `merge_base` recorded).
+fn detect_base_update_contamination(repo: &Path, base_sha: &str, head_sha: &str) -> bool {
+    let upstream = git(repo, &["rev-parse", "--verify", "-q", "origin/HEAD^{commit}"])
+        .or_else(|_| git(repo, &["rev-parse", "--verify", "-q", "main^{commit}"]))
+        .unwrap_or_default();
+    if upstream.trim().is_empty() {
+        return false;
+    }
+    let Ok(ours) = git(repo, &["log", "--format=%H", &format!("{base_sha}..{head_sha}")]) else {
+        return false;
+    };
+    ours.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .any(|c| git(repo, &["merge-base", "--is-ancestor", c, upstream.trim()]).is_ok())
 }
 
 #[cfg(test)]

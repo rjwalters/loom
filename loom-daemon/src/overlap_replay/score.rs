@@ -85,7 +85,9 @@ pub struct PairEvaluation {
     /// True when the manifest's selection text marks this pair as a
     /// fixture/synthetic example (reported separately from the cohort).
     pub hindsight_selected: bool,
-    pub predicted: PredictedOverlap,
+    /// Predicted overlap features — `None` when either side's prediction is
+    /// missing (an unknown, never a zero).
+    pub predicted: Option<PredictedOverlap>,
     /// Serialized actual overlap (full record from the outcomes stage).
     pub actual: Option<super::overlap::ActualOverlap>,
     pub conflict: ConflictSummary,
@@ -171,7 +173,6 @@ pub struct EvaluationReport {
 /// predictions (keyed by issue), and computed outcomes (keyed by pair id).
 pub fn evaluate(
     manifest: &ReplayManifest,
-    validity: &BTreeMap<u32, SnapshotValidity>,
     predictions: &BTreeMap<u32, super::artifact::FrozenPrediction>,
     outcomes: &BTreeMap<String, PairOutcomes>,
 ) -> EvaluationReport {
@@ -194,10 +195,12 @@ pub fn evaluate(
 
     for pair in &manifest.pairs {
         // --- per-issue footprint --------------------------------------
+        // Validity is per snapshot, derived locally — a global issue-keyed
+        // map would collide when two pairs share an issue number.
         let pair_leakage = pair
             .issues
             .iter()
-            .all(|i| matches!(validity.get(&i.issue), Some(SnapshotValidity::Usable)));
+            .all(|i| i.validity() == SnapshotValidity::Usable);
         if pair_leakage {
             counts.pairs_leakage_controlled += 1;
         }
@@ -212,12 +215,12 @@ pub fn evaluate(
         let mut predicted_sides: [Option<Vec<super::artifact::RetrievedFile>>; 2] = [None, None];
         for (side, snap) in pair.issues.iter().enumerate() {
             let (status, files): (String, Option<Vec<super::artifact::RetrievedFile>>) =
-                match validity.get(&snap.issue) {
-                    Some(SnapshotValidity::Excluded(reason)) => {
+                match snap.validity() {
+                    SnapshotValidity::Excluded(reason) => {
                         counts.issues_excluded_unreconstructable += 1;
                         (format!("excluded:{reason}"), None)
                     }
-                    _ => match predictions.get(&snap.issue) {
+                    SnapshotValidity::Usable => match predictions.get(&snap.issue) {
                         None => {
                             counts.issues_missing_prediction += 1;
                             ("missing".into(), None)
@@ -257,15 +260,17 @@ pub fn evaluate(
             // Footprint precision/recall against the PR's own changes.
             let side_pr = pr_for_side(pair, side);
             let actual_rec = out.and_then(|o| o.prs.iter().find(|p| Some(p.pr) == side_pr));
-            let actual_files: Option<Vec<String>> = actual_rec.map(|p| p.changed_files.clone());
-            let actual_intervals = actual_rec.map(|p| &p.changed_intervals);
+            let actual = ActualSide {
+                files: actual_rec.map(|p| p.changed_files.as_slice()),
+                intervals: actual_rec.map(|p| &p.changed_intervals),
+                identifiers: actual_rec.and_then(|p| p.changed_identifiers.as_ref()),
+            };
             let ev = footprint_evaluation(
                 pair,
                 snap.issue,
                 &status,
                 files.as_deref(),
-                actual_files.as_deref(),
-                actual_intervals,
+                actual,
                 pair_leakage,
             );
             per_issue.push(ev);
@@ -281,13 +286,27 @@ pub fn evaluate(
         }
 
         // --- per-pair predicted overlap + scores -----------------------
-        let predicted = match (predicted_sides[0].as_deref(), predicted_sides[1].as_deref()) {
-            (Some(a), Some(b)) => predicted_overlap(a, b, &pair.hub_weights),
-            _ => predicted_overlap(&[], &[], &pair.hub_weights),
+        // B1 guard (#9826 review): a missing prediction is an unknown, never
+        // a zero. `predicted_overlap` over two empty sets would fabricate
+        // Jaccard 0.0 and renormalize the blend onto it, entering every
+        // table with made-up evidence — so predicted overlap is computed
+        // only when BOTH sides' predictions are present, and every
+        // retrieval-based score stays None otherwise. The Curator baseline
+        // is prediction-independent and still scores (that is the
+        // baseline-only mode).
+        let both_present = predicted_sides[0].is_some() && predicted_sides[1].is_some();
+        let predicted = if both_present {
+            Some(predicted_overlap(
+                predicted_sides[0].as_deref().unwrap_or(&[]),
+                predicted_sides[1].as_deref().unwrap_or(&[]),
+                &pair.hub_weights,
+            ))
+        } else {
+            None
         };
         let actual = out.and_then(|o| o.overlap.clone());
         let conflict = summarize_conflict(pair, out);
-        let scores = pair_scores(pair, &predicted);
+        let scores = pair_scores(pair, predicted.as_ref());
         let actual_overlap_event = actual.as_ref().map(|a| !a.shared_changed_files.is_empty());
         per_pair.push(PairEvaluation {
             pair_id: pair.pair_id.clone(),
@@ -307,13 +326,36 @@ pub fn evaluate(
     }
 
     let split = chronological_grouped_split(manifest);
-    let scored: Vec<&PairEvaluation> = per_pair
+    // The scored population for every published table is the PRIMARY cohort
+    // (independently implemented pairs), leakage-controlled, with
+    // hindsight-selected fixture pairs set aside — combined/superseded/
+    // ambiguous associations stay in per_pair output under their own label
+    // and are never folded into the representative numbers (issue #9785
+    // step 3: "Evaluate independently implemented pairs in the primary
+    // cohort; identify combined or materially rescoped work separately").
+    let primary: Vec<&PairEvaluation> = per_pair
         .iter()
-        .filter(|p| p.leakage_controlled && !p.hindsight_selected)
+        .filter(|p| p.leakage_controlled && !p.hindsight_selected && p.association == "independent")
         .collect();
-    let heuristic_tables = build_heuristic_tables(&scored, &split);
-    let recommendation = build_recommendation(&heuristic_tables);
-    let limitations = build_limitations(&counts, &scored);
+    let held: BTreeSet<&str> = split.held_out_pairs.iter().map(String::as_str).collect();
+    let train: BTreeSet<&str> = split.train_pairs.iter().map(String::as_str).collect();
+    // Freeze-before-held-out (#9785 step 4): heuristic SELECTION (the
+    // recommended mapping) is a tuning decision and reads TRAIN pairs only;
+    // every published table reads HELD-OUT pairs only. The two never share
+    // a population.
+    let held_out: Vec<&PairEvaluation> = primary
+        .iter()
+        .copied()
+        .filter(|p| held.contains(p.pair_id.as_str()))
+        .collect();
+    let train_only: Vec<&PairEvaluation> = primary
+        .iter()
+        .copied()
+        .filter(|p| train.contains(p.pair_id.as_str()))
+        .collect();
+    let heuristic_tables = build_heuristic_tables(&held_out);
+    let recommendation = build_recommendation(&train_only, &heuristic_tables);
+    let limitations = build_limitations(&counts, &held_out, primary.len());
 
     EvaluationReport {
         manifest_repo: manifest.repo.clone(),
@@ -333,15 +375,27 @@ fn pr_for_side(pair: &ReplayPair, side: usize) -> Option<u32> {
     pair.prs.iter().find(|p| p.issue == want).map(|p| p.pr)
 }
 
+/// The actual PR side's evaluation inputs, bundled to keep
+/// `footprint_evaluation`'s arity sane.
+struct ActualSide<'a> {
+    files: Option<&'a [String]>,
+    intervals: Option<&'a std::collections::BTreeMap<String, Vec<Span>>>,
+    identifiers: Option<&'a std::collections::BTreeSet<String>>,
+}
+
 fn footprint_evaluation(
     pair: &ReplayPair,
     issue: u32,
     status: &str,
     predicted_files: Option<&[super::artifact::RetrievedFile]>,
-    actual_files: Option<&[String]>,
-    actual_intervals: Option<&std::collections::BTreeMap<String, Vec<Span>>>,
+    actual: ActualSide<'_>,
     leakage_controlled: bool,
 ) -> IssueEvaluation {
+    let ActualSide {
+        files: actual_files,
+        intervals: actual_intervals,
+        identifiers: actual_identifiers,
+    } = actual;
     let pred_set: Option<BTreeSet<String>> =
         predicted_files.map(|fs| fs.iter().map(|f| f.path.clone()).collect());
     let actual_set: Option<BTreeSet<String>> = actual_files.map(|fs| fs.iter().cloned().collect());
@@ -407,9 +461,21 @@ fn footprint_evaluation(
             _ => (None, None),
         }
     };
-    // Symbol-level against actual changed symbols: the actual side's
-    // identifiers live on the outcomes record; the CLI enriches these fields
-    // there. Scored None here when absent.
+    // Symbol-level: predicted symbols vs the actual side's changed
+    // identifiers (a labeled heuristic — see `extract_identifiers`).
+    let (sp, sr) = {
+        let predicted_symbols: Option<std::collections::BTreeSet<String>> =
+            predicted_files.map(|fs| fs.iter().flat_map(|f| f.symbols.iter().cloned()).collect());
+        match (predicted_symbols, actual_identifiers) {
+            (Some(p), Some(a)) if !p.is_empty() && !a.is_empty() => {
+                let inter = super::overlap::symbol_sets_intersect(&p, a) as f64;
+                let prec = Some(inter / p.len() as f64);
+                let rec = Some(inter / a.len() as f64);
+                (prec, rec)
+            }
+            _ => (None, None),
+        }
+    };
     let _ = issue;
     let _ = pair;
     IssueEvaluation {
@@ -423,8 +489,8 @@ fn footprint_evaluation(
         irrelevant_files: irrelevant,
         interval_precision: ip,
         interval_recall: ir,
-        symbol_precision: None,
-        symbol_recall: None,
+        symbol_precision: sp,
+        symbol_recall: sr,
         leakage_controlled,
     }
 }
@@ -473,10 +539,12 @@ fn summarize_conflict(pair: &ReplayPair, out: Option<&PairOutcomes>) -> Conflict
 /// Heuristic scores for one pair, from frozen evidence only.
 pub fn pair_scores(
     pair: &ReplayPair,
-    predicted: &PredictedOverlap,
+    predicted: Option<&PredictedOverlap>,
 ) -> BTreeMap<String, Option<f64>> {
     let mut m: BTreeMap<String, Option<f64>> = BTreeMap::new();
     // Curator baseline: file Jaccard over as-of-cutoff affected-files lists.
+    // Prediction-independent — this is the only heuristic that scores in
+    // baseline-only mode (no frozen predictions yet).
     let ca: Option<BTreeSet<String>> = pair.issues[0].affected_files_known.then(|| {
         pair.issues[0]
             .curator_affected_files
@@ -492,11 +560,29 @@ pub fn pair_scores(
             .collect()
     });
     m.insert("curator_baseline".into(), jaccard(ca.as_ref(), cb.as_ref()));
-    m.insert("file_jaccard".into(), predicted.file_jaccard);
-    m.insert("hub_weighted".into(), predicted.hub_weighted_file_jaccard);
-    m.insert("line_overlap".into(), predicted.line_overlap_fraction);
-    m.insert("symbol_overlap".into(), predicted.symbol_jaccard);
-    m.insert("edit_edit".into(), predicted.edit_edit_file_jaccard);
+    // Retrieval-based heuristics exist only when both predictions are
+    // present; otherwise None (unknown), never a fabricated zero.
+    let p = match predicted {
+        Some(p) => p,
+        None => {
+            for name in [
+                "file_jaccard",
+                "hub_weighted",
+                "line_overlap",
+                "symbol_overlap",
+                "edit_edit",
+            ] {
+                m.insert(name.into(), None);
+            }
+            m.insert("blend".into(), None);
+            return m;
+        }
+    };
+    m.insert("file_jaccard".into(), p.file_jaccard);
+    m.insert("hub_weighted".into(), p.hub_weighted_file_jaccard);
+    m.insert("line_overlap".into(), p.line_overlap_fraction);
+    m.insert("symbol_overlap".into(), p.symbol_jaccard);
+    m.insert("edit_edit".into(), p.edit_edit_file_jaccard);
     // Frozen blend over available components, renormalized.
     let mut num = 0.0;
     let mut den = 0.0;
@@ -546,19 +632,26 @@ pub fn chronological_grouped_split(manifest: &ReplayManifest) -> SplitInfo {
             }
         }
     }
-    // Group members ordered by each group's earliest cutoff.
+    // Group members ordered by each group's earliest cutoff, parsed as
+    // RFC3339 (chrono) so timezone suffixes sort correctly; unparseable
+    // cutoffs sort last and keep their raw string as a tiebreak.
     let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for i in 0..n {
         groups.entry(find(&mut parent, i)).or_default().push(i);
     }
-    let mut ordered: Vec<(String, Vec<usize>)> = groups
+    let cutoff_key = |cutoff: &str| -> (i64, String) {
+        chrono::DateTime::parse_from_rfc3339(cutoff)
+            .map(|dt| (dt.timestamp_millis(), String::new()))
+            .unwrap_or((i64::MAX, cutoff.to_string()))
+    };
+    let mut ordered: Vec<((i64, String), Vec<usize>)> = groups
         .into_values()
         .map(|members| {
             let earliest = members
                 .iter()
-                .map(|&i| manifest.pairs[i].cutoff.clone())
+                .map(|&i| cutoff_key(&manifest.pairs[i].cutoff))
                 .min()
-                .unwrap_or_default();
+                .unwrap_or((i64::MAX, String::new()));
             (earliest, members)
         })
         .collect();
@@ -609,13 +702,13 @@ pub fn wilson(successes: usize, n: usize) -> (f64, f64) {
 
 fn band_table(
     scored: &[&PairEvaluation],
-    held: &BTreeSet<String>,
+    held: &BTreeSet<&str>,
     heuristic: &str,
     event: fn(&PairEvaluation) -> Option<bool>,
 ) -> Vec<BandRow> {
     let mut buckets: BTreeMap<&'static str, Vec<bool>> = BTreeMap::new();
     for p in scored {
-        if !held.contains(&p.pair_id) {
+        if !held.contains(p.pair_id.as_str()) {
             continue;
         }
         let Some(Some(v)) = p.scores.get(heuristic) else {
@@ -697,8 +790,11 @@ fn auc(pos: &[f64], neg: &[f64]) -> f64 {
     }
 }
 
-fn build_heuristic_tables(scored: &[&PairEvaluation], split: &SplitInfo) -> Vec<HeuristicTable> {
-    let held: BTreeSet<String> = split.held_out_pairs.iter().cloned().collect();
+/// Build every published table from HELD-OUT pairs only. Spearman/AUC and
+/// the band tables share this one population, so the numbers under a
+/// heuristic all describe the same set of pairs.
+fn build_heuristic_tables(held_out: &[&PairEvaluation]) -> Vec<HeuristicTable> {
+    let held_out_all: BTreeSet<&str> = held_out.iter().map(|p| p.pair_id.as_str()).collect();
     let heuristics = [
         "curator_baseline",
         "file_jaccard",
@@ -717,7 +813,7 @@ fn build_heuristic_tables(scored: &[&PairEvaluation], split: &SplitInfo) -> Vec<
             let mut ys = Vec::new();
             let mut pos = Vec::new();
             let mut neg = Vec::new();
-            for p in scored {
+            for p in held_out {
                 let Some(Some(v)) = p.scores.get(*h) else {
                     continue;
                 };
@@ -738,8 +834,8 @@ fn build_heuristic_tables(scored: &[&PairEvaluation], split: &SplitInfo) -> Vec<
                 heuristic: (*h).into(),
                 spearman_vs_actual_overlap: rho.map(|r| (r, xs.len())),
                 auc_for_conflict: a,
-                overlap_bands: band_table(scored, &held, h, overlap_event),
-                conflict_bands: band_table(scored, &held, h, conflict_event),
+                overlap_bands: band_table(held_out, &held_out_all, h, overlap_event),
+                conflict_bands: band_table(held_out, &held_out_all, h, conflict_event),
             }
         })
         .collect()
@@ -749,25 +845,48 @@ fn n_nonempty(v: &[f64]) -> bool {
     !v.is_empty()
 }
 
-fn build_recommendation(tables: &[HeuristicTable]) -> Recommendation {
-    let mut ranked: Vec<&HeuristicTable> = tables.iter().collect();
-    ranked.sort_by(|a, b| {
-        let va = a.spearman_vs_actual_overlap.map(|(r, _)| r).unwrap_or(-2.0);
-        let vb = b.spearman_vs_actual_overlap.map(|(r, _)| r).unwrap_or(-2.0);
-        vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
-    });
+/// Select the recommended heuristic by **train-split** Spearman only — the
+/// selection is a tuning decision and must never read the held-out pairs it
+/// will later be scored on. The published tables (built from held-out pairs)
+/// carry the evaluation; `alternatives` reports the train numbers the
+/// selection actually used.
+fn build_recommendation(train: &[&PairEvaluation], tables: &[HeuristicTable]) -> Recommendation {
+    let mut ranked: Vec<(&str, f64, usize)> = tables
+        .iter()
+        .map(|t| {
+            let mut xs = Vec::new();
+            let mut ys = Vec::new();
+            for p in train {
+                let Some(Some(v)) = p.scores.get(t.heuristic.as_str()) else {
+                    continue;
+                };
+                if let Some(j) = p.actual.as_ref().and_then(|a| a.file_jaccard) {
+                    xs.push(*v);
+                    ys.push(j);
+                }
+            }
+            let rho = if xs.is_empty() {
+                -2.0
+            } else {
+                spearman(&xs, &ys)
+            };
+            (t.heuristic.as_str(), rho, xs.len())
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let selected = ranked
         .first()
-        .map(|t| t.heuristic.clone())
+        .map(|(name, _, _)| (*name).to_string())
         .unwrap_or_else(|| "none".into());
-    let rationale = "Selected by held-out Spearman rank correlation against actual file overlap \
-         (sample sizes and uncertainty in the tables). A numeric score is a ranking \
-         estimate for the defined event, not a probability; bands are the published \
-         low/medium/high mapping with Wilson intervals. Small samples make this a \
-         provisional mapping — #9787 validates transfer prospectively.";
-    let alternatives = tables
+    let rationale =
+        "Selected by TRAIN-split Spearman rank correlation against actual file overlap \
+         (selection frozen before held-out scoring; every published table reads held-out pairs \
+         only). A numeric score is a ranking estimate for the defined event, not a probability; \
+         bands are the published low/medium/high mapping with Wilson intervals. Small samples \
+         make this a provisional mapping — #9787 validates transfer prospectively.";
+    let alternatives = ranked
         .iter()
-        .map(|t| (t.heuristic.clone(), t.spearman_vs_actual_overlap))
+        .map(|(n, rho, n_)| ((*n).to_string(), Some((*rho, *n_))))
         .collect();
     Recommendation {
         selected,
@@ -776,7 +895,11 @@ fn build_recommendation(tables: &[HeuristicTable]) -> Recommendation {
     }
 }
 
-fn build_limitations(counts: &CohortCounts, scored: &[&PairEvaluation]) -> Vec<String> {
+fn build_limitations(
+    counts: &CohortCounts,
+    held_out: &[&PairEvaluation],
+    primary_n: usize,
+) -> Vec<String> {
     let mut v = Vec::new();
     if counts.issues_missing_prediction > 0 {
         v.push(format!(
@@ -794,21 +917,32 @@ fn build_limitations(counts: &CohortCounts, scored: &[&PairEvaluation]) -> Vec<S
     }
     if counts.issues_excluded_unreconstructable > 0 {
         v.push(format!(
-            "{} issue snapshot(s) could not be reconstructed as-of the cutoff and are \
-             excluded from leakage-controlled evaluation",
+            "{} issue snapshot occurrence(s) could not be reconstructed as-of the cutoff and \
+             are excluded from leakage-controlled evaluation (counted per pair occurrence; \
+             an issue shared by two pairs counts once per pair)",
             counts.issues_excluded_unreconstructable
         ));
     }
-    let conflictable = scored
+    let non_primary = counts.associations_combined
+        + counts.associations_superseded
+        + counts.associations_ambiguous;
+    if non_primary > 0 {
+        v.push(format!(
+            "{non_primary} pair(s) carry a non-independent association (combined/superseded/\
+             ambiguous) — they remain in per-pair output under their own label and are \
+             excluded from the {primary_n}-pair primary cohort every table describes"
+        ));
+    }
+    let conflictable = held_out
         .iter()
         .filter(|p| p.conflict.any_conflict.is_some())
         .count();
-    if conflictable < scored.len() {
+    if conflictable < held_out.len() {
         v.push(format!(
-            "{}/{} scored pairs have a definite counterfactual conflict label; the rest are \
+            "{}/{} held-out pairs have a definite counterfactual conflict label; the rest are \
              unknown (missing evidence is not a clean outcome)",
             conflictable,
-            scored.len()
+            held_out.len()
         ));
     }
     v.push(
@@ -816,28 +950,148 @@ fn build_limitations(counts: &CohortCounts, scored: &[&PairEvaluation]) -> Vec<S
          derivations keep file/symbol metrics and mark line outcomes unknown"
             .into(),
     );
+    v.push(
+        "Counterfactual replays merge the PRs' pinned head commits as-is: where a head \
+         contains upstream commits (base update), the replay folds them into that side — \
+         original-conflict endpoints are preferred in the manifest precisely to limit this"
+            .into(),
+    );
     v
 }
 
-/// Interval precision/recall helper for CLI-side enrichment when outcome
-/// records carry actual intervals: precision over the predicted union,
-/// recall over the actual union, `None` where a union is empty.
-pub fn interval_metrics(predicted: &[Span], actual: &[Span]) -> (Option<f64>, Option<f64>) {
-    let shared = spans_overlap_len(predicted, actual);
-    let pu = spans_union_len(predicted);
-    let au = spans_union_len(actual);
-    if pu == 0 && au == 0 {
-        return (None, None);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::overlap_replay::manifest::{Association, IssueSnapshot, SnapshotProvenance};
+
+    fn snap(issue: u32, reconstructed: bool) -> IssueSnapshot {
+        IssueSnapshot {
+            issue,
+            title: format!("issue {issue}"),
+            body: "body".into(),
+            curator_affected_files: vec!["src/a.rs".into()],
+            affected_files_known: true,
+            provenance: SnapshotProvenance {
+                method: "test".into(),
+                edited_after_cutoff: false,
+                reconstructed,
+                exclusion_reason: (!reconstructed).then(|| "gone".to_string()),
+            },
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
     }
-    let p = if pu == 0 {
-        None
-    } else {
-        Some(shared as f64 / pu as f64)
-    };
-    let r = if au == 0 {
-        None
-    } else {
-        Some(shared as f64 / au as f64)
-    };
-    (p, r)
+
+    fn pair(id: &str, a: IssueSnapshot, b: IssueSnapshot, association: Association) -> ReplayPair {
+        let (ia, ib) = (a.issue, b.issue);
+        ReplayPair {
+            pair_id: id.into(),
+            historical_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            cutoff: "2026-01-02T00:00:00Z".into(),
+            issues: [a, b],
+            association,
+            association_notes: None,
+            prs: vec![
+                super::super::manifest::PrAssociation {
+                    pr: 10,
+                    issue: ia,
+                    base_sha: "aaaa".into(),
+                    head_sha: "bbbb".into(),
+                    final_head_sha: None,
+                    own_commits: None,
+                    provenance: "closing link".into(),
+                    observed_conflict: false,
+                },
+                super::super::manifest::PrAssociation {
+                    pr: 11,
+                    issue: ib,
+                    base_sha: "aaaa".into(),
+                    head_sha: "cccc".into(),
+                    final_head_sha: None,
+                    own_commits: None,
+                    provenance: "closing link".into(),
+                    observed_conflict: false,
+                },
+            ],
+            selection: "same-week same-label".into(),
+            hub_weights: BTreeMap::new(),
+        }
+    }
+
+    fn manifest(pairs: Vec<ReplayPair>) -> ReplayManifest {
+        ReplayManifest {
+            manifest_version: 1,
+            repo: "o/r".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            query_policy_version: "qp-v1".into(),
+            pairs,
+        }
+    }
+
+    /// B3 regression (PR #9826 review): the SAME issue number appears in two
+    /// pairs with different reconstruction outcomes. Validity must be
+    /// classified per pair — a global issue-keyed map would either score the
+    /// unreconstructable snapshot as leakage-controlled (the leak) or
+    /// wrongly exclude the usable pair.
+    #[test]
+    fn validity_is_per_pair_not_global() {
+        let m = manifest(vec![
+            pair("p-usable", snap(1, true), snap(2, true), Association::Independent),
+            pair("p-excluded", snap(1, false), snap(3, true), Association::Independent),
+        ]);
+        let report = evaluate(&m, &BTreeMap::new(), &BTreeMap::new());
+        let by_id: BTreeMap<String, &PairEvaluation> = report
+            .per_pair
+            .iter()
+            .map(|p| (p.pair_id.clone(), p))
+            .collect();
+        assert!(by_id["p-usable"].leakage_controlled, "usable pair must stay scored");
+        assert!(!by_id["p-excluded"].leakage_controlled, "excluded pair must drop out");
+        // The excluded side's per-issue status records the reason.
+        assert!(report
+            .per_issue
+            .iter()
+            .any(|e| e.issue == 1 && e.prediction_status.starts_with("excluded:")));
+    }
+
+    /// Fixture/hindsight-selected pairs (selection text contains "fixture")
+    /// are flagged and excluded from the representative cohort tables.
+    #[test]
+    fn hindsight_fixture_pairs_are_flagged() {
+        let mut m = manifest(vec![pair(
+            "p1",
+            snap(1, true),
+            snap(2, true),
+            Association::Independent,
+        )]);
+        m.pairs[0].selection = "fixture: hindsight-picked demo pair".into();
+        let report = evaluate(&m, &BTreeMap::new(), &BTreeMap::new());
+        assert!(report.per_pair[0].hindsight_selected);
+        let mut m2 = m.clone();
+        m2.pairs[0].selection = "same-week same-label".into();
+        let report2 = evaluate(&m2, &BTreeMap::new(), &BTreeMap::new());
+        assert!(!report2.per_pair[0].hindsight_selected);
+    }
+
+    /// Non-independent associations never enter the primary cohort the
+    /// tables describe, even when leakage-controlled.
+    #[test]
+    fn ambiguous_pairs_stay_out_of_the_primary_cohort() {
+        let m = manifest(vec![
+            pair("p-ind", snap(1, true), snap(2, true), Association::Independent),
+            pair("p-amb", snap(3, true), snap(4, true), Association::Ambiguous),
+        ]);
+        let report = evaluate(&m, &BTreeMap::new(), &BTreeMap::new());
+        let amb = report
+            .per_pair
+            .iter()
+            .find(|p| p.pair_id == "p-amb")
+            .unwrap();
+        assert!(amb.leakage_controlled);
+        assert_eq!(amb.association, "ambiguous");
+        // The limitation names the exclusion explicitly.
+        assert!(report
+            .limitations
+            .iter()
+            .any(|l| l.contains("1 pair(s) carry a non-independent association")));
+    }
 }
