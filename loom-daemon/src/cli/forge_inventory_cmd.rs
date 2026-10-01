@@ -356,8 +356,11 @@ pub(crate) struct ProbeArgs {
     /// Repeatable. Default: every required profile.
     #[arg(long = "profile", value_name = "PROFILE")]
     profiles: Vec<String>,
-    /// Emit JSON (the default; `--no-json` prints a terse checklist).
-    #[arg(long, default_value_t = true)]
+    /// Emit JSON. Accepted for symmetry and already the default; `--no-json`
+    /// prints a terse checklist instead. (NOT `default_value_t = true`: that
+    /// made `--json` an unconditional no-op whose `--help` still advertised a
+    /// default — PR #9832 review.)
+    #[arg(long)]
     json: bool,
     #[arg(long, conflicts_with = "json")]
     no_json: bool,
@@ -372,7 +375,11 @@ impl ProbeArgs {
             .map(|s| parse_profile(s))
             .collect::<Result<_>>()?;
         let manifest = probe::build(&inv, &profiles);
-        if self.no_json {
+        // The two flags conflict, so at most one is set; JSON when neither is.
+        let as_json = self.json || !self.no_json;
+        if as_json {
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        } else {
             for e in &manifest.entries {
                 println!(
                     "{:<34} {:<9} {:<10} establishes={} test={}",
@@ -383,8 +390,6 @@ impl ProbeArgs {
                     e.test_id.as_deref().unwrap_or("-")
                 );
             }
-        } else {
-            println!("{}", serde_json::to_string_pretty(&manifest)?);
         }
         Ok(())
     }

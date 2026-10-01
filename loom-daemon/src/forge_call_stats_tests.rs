@@ -342,6 +342,22 @@ fn quota_rate_limit_reading() {
             CallIdentity::default().with_origin(secret).is_empty(),
             "a credential-shaped origin leaves the identity empty"
         );
+        // …and the sanitizer's own normalization cannot smuggle it past the
+        // check (PR #9832 review). Folding a control character to a space
+        // SPLITS a marker (`ghp\0_…` -> `ghp _…`); deleting a non-graphic
+        // character JOINS one (`ghpé_…` -> `ghp_…`). Injecting each kind at
+        // every position inside the marker must still be refused.
+        for (i, _) in secret.char_indices().take(12) {
+            for injected in ['\u{0}', '\u{7}', '\u{e9}'] {
+                let mut probe = secret.to_string();
+                probe.insert(i, injected);
+                assert_eq!(
+                    sanitize(&probe),
+                    None,
+                    "{injected:?} at byte {i} must not make {secret:?} recordable"
+                );
+            }
+        }
     }
     // A legitimate host is kept.
     assert_eq!(

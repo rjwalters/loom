@@ -22,17 +22,46 @@
 //!   `test-*.sh`. #9777 classifies fixtures rather than counting them as
 //!   active operations.
 //! - **Prohibitions** — `defaults/hooks/guard-*.sh` match forge command text in
-//!   order to *deny* it. A guard that recognises `gh pr merge` is the opposite
-//!   of a caller, and counting it would make the gate fight its own safety net.
+//!   order to *deny* it. A guard that recognises the forbidden native-merge verb
+//!   is the opposite of a caller, and counting it would make the gate fight its
+//!   own safety net.
 //! - **Role prompts** (`*.md`) — instructions to an LLM, not call sites. They
 //!   are inventoried in each operation's `callers` as `kind = "role-prompt"`,
 //!   which is how a prompt-only operation still gets an owner and a test.
+//! - **Whole-line comments** — a `//` / `///` / `//!` line in Rust, a `#` line
+//!   in shell or a workflow. The gate counts *executable* calls, so prose that
+//!   merely names a forge command is not one; see "Comment awareness" below.
 //!
 //! Scanning is lexical on purpose. A gate that needed to resolve a shell
 //! variable to decide whether a line calls the forge would be unable to answer
 //! for exactly the dynamic construction #9777 asks to be counted; an
 //! over-counting lexical scan costs one baseline entry, an under-counting
 //! clever one costs an invisible bypass.
+//!
+//! # Comment awareness
+//!
+//! A scanner looking for executable calls that counts prose in a comment is
+//! wrong in the one way this gate cannot absorb: it fails a build over text
+//! that runs nothing. This module's own doc comments tripped it that way
+//! (PR #9832 review), so [`scan_text`] now skips any line whose **first
+//! non-whitespace characters** are that file type's line-comment marker.
+//!
+//! Deliberately *not* stripped, in both cases because the safe direction of
+//! error is over-counting (one baseline entry) rather than under-counting (an
+//! invisible bypass):
+//!
+//! - **Trailing comments** — `foo # see gh pr list`. Deciding where a shell
+//!   comment starts needs quote tracking (`gh api "repos/o/r#frag"`), and
+//!   guessing wrong *hides* the real call on that line.
+//! - **Block comments** — `/* … */`. Tracking them across lines means guessing
+//!   whether a `/*` inside a string literal opened one, and guessing wrong
+//!   blinds the scanner to every line until the next `*/`.
+//!
+//! Classification is also per **file**, not per call site: once a path appears
+//! in any operation's `callers`, every `gh` invocation in it is `Classified`.
+//! A new direct call added to an already-declared file is therefore invisible
+//! to the ratchet — acceptable for phase 1 (declared files are few), and the
+//! thing to tighten as #9831 starts declaring call sites in bulk.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -149,13 +178,39 @@ fn is_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'-')
 }
 
+/// Line-comment markers for a scannable file type: a line whose first
+/// non-whitespace characters are one of these contains no executable call.
+/// `//` covers `///` and `//!` as prefixes of itself.
+#[must_use]
+fn line_comment_markers(path: &str) -> &'static [&'static str] {
+    if path.ends_with(".rs") {
+        &["//"]
+    } else {
+        // `.sh` and `workflows/*.yml` — `#` to end of line.
+        &["#"]
+    }
+}
+
+/// Is this whole line a comment in the file type at `path`?
+fn is_comment_line(line: &str, markers: &[&str]) -> bool {
+    let head = line.trim_start();
+    markers.iter().any(|m| head.starts_with(m))
+}
+
 /// Count direct forge call sites in `text`, returning `(count, samples)` with
 /// up to `max_samples` `line:text` strings.
+///
+/// `path` selects the line-comment syntax to skip — see "Comment awareness" in
+/// the module docs for what is and is not stripped.
 #[must_use]
-pub fn scan_text(text: &str, max_samples: usize) -> (usize, Vec<String>) {
+pub fn scan_text(path: &str, text: &str, max_samples: usize) -> (usize, Vec<String>) {
+    let markers = line_comment_markers(path);
     let mut count = 0usize;
     let mut samples = Vec::new();
     for (idx, line) in text.lines().enumerate() {
+        if is_comment_line(line, markers) {
+            continue;
+        }
         let hits = count_line(line);
         if hits == 0 {
             continue;
@@ -169,16 +224,21 @@ pub fn scan_text(text: &str, max_samples: usize) -> (usize, Vec<String>) {
 }
 
 /// How many `gh <forge-noun>` invocations one line contains.
+///
+/// The separator is *any* ASCII whitespace, not just a space: a tab-indented
+/// `gh\tapi` is the same call.
 fn count_line(line: &str) -> usize {
     let bytes = line.as_bytes();
     let mut hits = 0usize;
     let mut i = 0usize;
-    while let Some(rel) = line[i..].find("gh ") {
+    while let Some(rel) = line[i..].find("gh") {
         let start = i + rel;
-        let after = start + 3;
-        // `gh` must start a token: nothing identifier-ish immediately before.
+        let after = start + 2;
+        // `gh` must be a whole token: nothing identifier-ish immediately
+        // before, and ASCII whitespace immediately after.
         let preceded_ok = start == 0 || !is_token_byte(bytes[start - 1]);
-        if preceded_ok {
+        let followed_ok = bytes.get(after).is_some_and(u8::is_ascii_whitespace);
+        if preceded_ok && followed_ok {
             let rest = line[after..].trim_start();
             let noun = rest
                 .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
@@ -210,7 +270,7 @@ pub fn evaluate(
         let Ok(text) = std::fs::read_to_string(root.join(path)) else {
             continue;
         };
-        let (calls, samples) = scan_text(&text, 3);
+        let (calls, samples) = scan_text(path, &text, 3);
         if calls == 0 {
             continue;
         }

@@ -140,17 +140,19 @@ const MAX_FIELD_LEN: usize = 96;
 /// is the belt to that braces, so a future caller that wires a header or a URL
 /// with embedded basic-auth into an identity field records nothing rather than
 /// a secret.
+/// The shape check runs **before** any normalization, on every form the
+/// normalization can produce — see [`is_credential_in_any_form`].
 #[must_use]
 pub fn sanitize(value: &str) -> Option<String> {
+    if is_credential_in_any_form(value) {
+        return None;
+    }
     let one_line: String = value
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let trimmed = one_line.trim();
     if trimmed.is_empty() {
-        return None;
-    }
-    if looks_like_credential(trimmed) {
         return None;
     }
     let kept: String = trimmed
@@ -164,6 +166,41 @@ pub fn sanitize(value: &str) -> Option<String> {
     } else {
         Some(kept.to_string())
     }
+}
+
+/// [`looks_like_credential`], evaluated on the raw value **and** on each form
+/// [`sanitize`]'s own normalization can turn it into.
+///
+/// A check that only ran after normalization was a real bypass (PR #9832
+/// review): the normalization moves a value across the check in both
+/// directions.
+///
+/// - Folding a control character to a space **splits** a marker:
+///   `ghp\u{0}_…` becomes `ghp _…`, which contains no `ghp_`. The
+///   *graphic-only* form rejoins the halves.
+/// - Dropping a non-graphic character **joins** one: `ghp\u{e9}_…` becomes
+///   `ghp_…`. The raw form contains neither, so the *folded* form is what sees
+///   it.
+/// - A marker that itself contains a space (`bearer `, `private key`) needs the
+///   whitespace a graphic-only form deletes, which is why the raw and folded
+///   forms are checked too.
+///
+/// The length cap is deliberately not applied here: checking the untruncated
+/// forms is strictly stronger than checking what gets recorded.
+fn is_credential_in_any_form(value: &str) -> bool {
+    if looks_like_credential(value) {
+        return true;
+    }
+    let folded: String = value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect();
+    if looks_like_credential(&folded) {
+        return true;
+    }
+    let graphic_only: String = value.chars().filter(char::is_ascii_graphic).collect();
+    looks_like_credential(&graphic_only)
 }
 
 /// Credential shapes an identity field must never carry. Deliberately coarse:
