@@ -323,8 +323,9 @@ fn run_fetch(params: FetchParams) -> Result<()> {
     // pinned tree; a resolver failure is recorded as explicitly-unavailable
     // validation (Partial + coverage note), never a silent pass.
     let repo_checkout = std::env::current_dir()?;
-    let provenance = match session::pinned_source_index(&repo_checkout, &input.source_revision) {
-        Ok(index) => session::ProvenanceSource::Index(&index),
+    let pinned_index = session::pinned_source_index(&repo_checkout, &input.source_revision);
+    let provenance = match &pinned_index {
+        Ok(index) => session::ProvenanceSource::Index(index),
         Err(e) => session::ProvenanceSource::Unavailable(e.to_string()),
     };
     let s = open_store(store_dir.as_deref())?;
