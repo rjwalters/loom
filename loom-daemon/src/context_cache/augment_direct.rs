@@ -188,6 +188,7 @@ impl DirectTransport for HttpDirectTransport {
         request_id: &str,
     ) -> Result<serde_json::Value, DirectError> {
         let url = format!("{}/{}", self.api_url.trim_end_matches('/'), endpoint);
+        let endpoint = endpoint.to_string();
         let auth = format!("Bearer {}", self.api_key);
         let session_id = self.session_id.clone();
         let request_id = request_id.to_string();
