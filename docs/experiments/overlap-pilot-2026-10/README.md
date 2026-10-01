@@ -1,5 +1,13 @@
 # Overlap pilot — first real run (2026-10-01)
 
+> **Branch disposition:** this directory is the archival record of the pilot
+> and round-3 research. It lives on `experiment/*` branches
+> (`experiment/overlap-pilot`, `experiment/overlap-round3`) which are
+> **not scheduled for merge**. Cross-references from issues use pinned
+> commit URLs so the evidence remains reachable without merging. Raw inputs
+> and results are also preserved in the checksummed
+> [round3 evidence archive](round3/evidence.tar.gz).
+
 > **New research:** [Round 3](round3/README.md) executes the measurement
 > falsification, exact patch reconstruction, and a narrowly qualified
 > Augment-versus-cheap-baselines study. Its raw evidence and reproducible
