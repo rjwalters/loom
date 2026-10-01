@@ -509,6 +509,18 @@ jobs:
       # clamps to zero headroom rather than negative.
       - name: Verify the SigNoz queue/quota gauge queries against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_queue_quota_queries -- --ignored --nocapture
+      # #8528 / #8856: the same technique for the trial's one saved ALERT RULE
+      # (alerts/queue-starvation.json), the last query artifact in this trial
+      # with only a vocabulary guard. An alert that returns no rows -- or rows
+      # its threshold can never cross -- is silently healthy forever, because
+      # the absence of a page is what a working queue looks like. Only this run
+      # shows that the committed op/matchType/target separate a sustainedly
+      # starved host from a healthy one reporting a measured zero and from a
+      # flapping one, that the half-open window excludes the boundary point two
+      # overlapping evaluations would otherwise double-count, and that the
+      # zero rows survive the SQL so SigNoz can see a series recover.
+      - name: Verify the SigNoz queue-starvation alert rule against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_queue_starvation_alert -- --ignored --nocapture
 
   backend-otlp-tests:
     name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})

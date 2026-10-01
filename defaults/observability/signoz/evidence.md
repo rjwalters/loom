@@ -1203,11 +1203,104 @@ rather than only the author's intent. It is **not** a live trial observation: no
 metric point went through SigNoz's own ingester, its metric migrator, or
 `time_series_v4` as SigNoz actually creates and fingerprints it — this is
 `clickhouse local` with a hand-written read-surface schema, the same caveat
-`signoz_usage_queries.rs` and `signoz_cycle_time.rs` carry. Nor is it a proof
-of the alert: `alerts/queue-starvation.json` embeds the same query 1 shape with
-`{{.start_timestamp_ms}}` placeholders SigNoz substitutes, and only its
-vocabulary is guarded. The gap is the same one #8525, #8946, #8529 and #9279
-name for every other not-yet-live-executed SigNoz artifact in this trial.
+`signoz_usage_queries.rs` and `signoz_cycle_time.rs` carry. Nor was it, at the
+time, a proof of the alert: `alerts/queue-starvation.json` embeds the same
+query 1 shape with `{{.start_timestamp_ms}}` placeholders SigNoz substitutes,
+and only its vocabulary was guarded — closed the next day by the section below.
+The remaining gap is the same one #8525, #8946, #8529 and #9279 name for every
+other not-yet-live-executed SigNoz artifact in this trial.
+
+## The alert rule's threshold executed against the pinned engine (2026-10-01)
+
+`alerts/queue-starvation.json` (#8856) was the last query artifact in this
+trial with no execution proof of any kind. The section above says so in as many
+words, and the reason it was left for last is also the reason it mattered most:
+it is the only saved artifact here that **nobody looks at**. A dashboard that
+returns zero rows is *visibly* empty. An alert whose query returns zero rows,
+or returns rows its threshold can never cross, is **silently** healthy forever
+— the absence of a page is exactly what a working queue looks like. That is
+this epic's scope-item-5 absent-versus-zero hazard applied to the one artifact
+with no reader.
+
+`signoz_trial_artifacts.rs`'s
+`queue_starvation_alert_matches_the_ops_metric_vocabulary` can see only half of
+what has to hold. It proves the embedded query names metrics and labels the
+emitters still produce and the gateway's DATAPOINT allowlist still forwards —
+enough to catch a rename, blind to whether the query plus the rule's threshold
+actually separate a starved host from a healthy one.
+
+`loom-daemon/tests/signoz_queue_starvation_alert.rs` closes that with the same
+technique as the three proofs above: `clickhouse local` in the pinned
+`clickhouse/clickhouse-server:25.12.5` image, the committed query run verbatim.
+It differs from them in one way that matters. The alert is **not** windowed on
+`now()`: it carries SigNoz's own `{{.start_timestamp_ms}}` /
+`{{.end_timestamp_ms}}`, which the rule evaluator substitutes with the
+evaluation window's bounds. So the fixture uses *fixed* timestamps
+(2026-10-01T00:00:00Z … 00:15:00Z) and the test substitutes the same two bounds
+it built the rows around — every bucket count below is exact rather than
+clock-dependent. The fixture's window length is asserted equal to the committed
+`evalWindow`, so shortening that field without reworking the fixture fails by
+name instead of quietly changing which hosts fire.
+
+Five synthetic ready/blocked series over the 15 one-minute buckets of one
+evaluation window:
+
+| Series | Shape | Why it exists |
+| --- | --- | --- |
+| `host-starved` | above zero in all 15 minutes (1, 2 or 3), on a fingerprint with **two** `time_series_v4` hour-rows | the host the alert exists to name, and the duplicate-join case |
+| `host-healthy` | a **measured zero** in all 15 minutes, plus two out-of-window spikes of 99 at `start_ms - 60s` and at exactly `end_ms` | separates "reporting zero starvation" from "starved", and makes either window leak visible as a false page |
+| `host-flapping` | 4 in the 8 even buckets, 0 in the 7 odd ones | separates `matchType` "at least once" from "all the time" |
+| `host-blocked-only` | 7 in every minute, `state = 'blocked'` | blocked work waits on a dependency, not on capacity; the alert's name is "ready queue starved" |
+| (no `host.id`) | 5 in every minute, `state = 'ready'` | the shape the data takes if the gateway's allowlist stops forwarding the label |
+
+Plus `loom.queue.starved.by_reason` at 42 in every minute, parked **on
+host-healthy's own fingerprint** — the `USING (fingerprint)` join carries no
+metric-name predicate, so dropping the `metric_name` filter would attach those
+per-reason subtotals to the healthy host's label set and page on it.
+
+Observed, with the mutation of the **committed JSON** that breaks each one
+actually run rather than described:
+
+| Property | Observation | Mutation that breaks it |
+| --- | --- | --- |
+| The threshold fires on sustained starvation | committed `op` = above, `matchType` = all-the-time, `target` = 0 → `host-starved` fires | — (this is the artifact's whole purpose) |
+| …and not on a reporting-zero host | `host-healthy` never fires, in any minute | `target` 0 → -1 fires on **every** reporting host; nothing in the SQL prevents it |
+| …and not on a flapping queue | `host-flapping`, starved in 8 of 15 minutes, does **not** fire | `matchType` 2 → 1 fires on it: "any starvation" is a different operational contract from "sustained starvation" |
+| The zero rows are returned, not filtered | `host-healthy` yields 15 rows reading exactly `0.0` — SigNoz needs them to see a series recover | borrowing `queue-dwell.sql` query 1's `HAVING starved > 0` hides the recovery (asserted absent) |
+| The window is half-open | each host yields exactly 15 buckets; the spike at `start_ms - 60s` and the one at exactly `end_ms` are both absent | `< {{.end_timestamp_ms}}` → `<=` admits the boundary point, two overlapping evaluations double-count it, and `host-healthy` becomes a firing host |
+| `max()` absorbs the duplicated hour-row | bucket 0 of `host-starved` holds three points (2, 3, 1) on a two-hour-row series and answers **3** | `max()` → `sum()` answers **12** — the bucket's real total of 6, doubled by the join (run as a counterfactual) |
+| `state = 'ready'` excludes blocked work | `host-blocked-only` is absent from the result entirely | removing the filter makes its 7-per-minute blocked queue fire for the whole window |
+| `GROUP BY ts, host` carries the annotation's host label | the starved and the healthy host are reported separately | dropping `host` collapses to **one** 15-row series whose every bucket is the worst ready host's value: still firing, no attribution, and `host-healthy` hidden rather than visibly healthy |
+| A label-less series fires with an empty host | the unlabelled ready series fires with `host` = `''` | — (observed behaviour, not a desired one: `JSONExtractString` answers `''` for a missing key, so the annotation's "see the alert's host label" would point at nothing) |
+
+The rule's own cadence is checked in ordinary CI, without Docker: `frequency`
+(5m) ≤ `evalWindow` (15m), so consecutive evaluations overlap and no minute of
+starvation can fall into a gap between them; and neither the rule nor its query
+ships `disabled`, which would make an imported alert silent by construction.
+Eight of the ten tests need the engine and are `#[ignore]`d for CI's explicit
+`--ignored` invocation; the two that only read the committed JSON run on every
+backend PR.
+
+**Derived, not restated.** The window bounds come from the committed
+`evalWindow`; the firing decision comes from the committed `op`, `target` and
+`matchType`; the mutation counterfactuals are built by editing the committed
+query text and fail loudly if that text no longer contains what they edit. A
+semantic change to the rule therefore fails this test by name instead of
+silently re-tuning a production alert. The one thing the repo cannot derive is
+SigNoz's own integer → semantic mapping for `op` and `matchType`; the test
+records it as upstream's published mapping and evaluates **both** candidate
+match semantics over the same engine output, so the result is attributable
+either way.
+
+**What this establishes and what it does not.** The committed alert, as
+imported, distinguishes a sustainedly starved host from a working one on the
+engine version the trial deploys — and the distinction survives the engine
+rather than only the author's intent. No point went through SigNoz's own
+ingester, metric migrator, or `time_series_v4` as SigNoz actually creates and
+fingerprints it; **no rule evaluator ran and no notification was delivered**.
+The live fire-and-resolve check on the trial deployment is
+[#9006](https://github.com/rjwalters/loom/issues/9006); the real-canary gap is
+[#8525](https://github.com/rjwalters/loom/issues/8525).
 
 ## Acceptance ledger
 
@@ -1235,7 +1328,8 @@ name for every other not-yet-live-executed SigNoz artifact in this trial.
 | Six CI saved views in the trial org | **Open** — recreation steps written in the README, not yet executed in the UI ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | Measured usage parity with ClickStack's "Loom measured usage" view | **Passed against the pinned ClickHouse, open against the live trial.** `usage-queries.sql` (sections 0–6) plus four README saved-view rows close the parity gap; `signoz_usage_queries.rs` executes the committed file verbatim on ClickHouse 25.12.5 and observes scope resolution, at-least-once dedupe, NULL-not-zero dollars for an unpriced model, unknown-vs-measured-zero, the repo-by-trace join, and the wrong-container silent zero (see "Measured usage" above). No run over real canary data on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
 | Cycle-time analytics parity with ClickStack (`cycle-time-extract.sql`, #8665) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_cycle_time.rs` executes the extraction, the shared rollup and all eight CT queries verbatim over the SAME seven-envelope fixture as the ClickStack proof, and every CT1–CT8 answer matches exactly (see "Cycle-time analytics executed against the pinned engine" above); the `attributes_number`/`attributes_string` fallback and true-absence behavior are also proven. No run through SigNoz's own ingester on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
-| Host/token gauge queries (`queue-dwell.sql` #8856, `quota-utilization.sql` #9005, scope item 4) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_queue_quota_queries.rs` executes both committed files verbatim on ClickHouse 25.12.5 — the first proof in this trial to read `signoz_metrics.samples_v4` / `time_series_v4` at all — and observes the duplicate-hour-row `max()`/`sum()` split (with the naive join run as a counterfactual), measured-zero-is-not-starvation, NULL-not-zero for a missing companion metric and for an absent utilization source, the over-100% headroom clamp, `coverage = 'unknown'` for an exhausted-only provider, and query 5's span reads including the pre-#9673 cause-less-row fallback (see "The gauge queries executed against the pinned engine"). Every assertion was confirmed to break under a mutation of the committed SQL. No metric point went through SigNoz's own ingester or metric migrator — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525). `alerts/queue-starvation.json` remains vocabulary-guarded only |
+| Host/token gauge queries (`queue-dwell.sql` #8856, `quota-utilization.sql` #9005, scope item 4) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_queue_quota_queries.rs` executes both committed files verbatim on ClickHouse 25.12.5 — the first proof in this trial to read `signoz_metrics.samples_v4` / `time_series_v4` at all — and observes the duplicate-hour-row `max()`/`sum()` split (with the naive join run as a counterfactual), measured-zero-is-not-starvation, NULL-not-zero for a missing companion metric and for an absent utilization source, the over-100% headroom clamp, `coverage = 'unknown'` for an exhausted-only provider, and query 5's span reads including the pre-#9673 cause-less-row fallback (see "The gauge queries executed against the pinned engine"). Every assertion was confirmed to break under a mutation of the committed SQL. No metric point went through SigNoz's own ingester or metric migrator — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
+| Queue-starvation alert rule (`alerts/queue-starvation.json` #8856, scope items 4 and 5) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_queue_starvation_alert.rs` substitutes SigNoz's `{{.start_timestamp_ms}}` / `{{.end_timestamp_ms}}` the way the rule evaluator does, runs the embedded query verbatim on ClickHouse 25.12.5, and applies the committed `op`/`matchType`/`target` to the engine's own output: a host starved for all 15 minutes fires, a host reporting a measured zero does not, and a host that starves and clears alternately does not either (see "The alert rule's threshold executed against the pinned engine"). The half-open window, the `max()` hour-row absorption, the `state = 'ready'` filter and the `GROUP BY ts, host` host label each have their breaking mutation of the committed JSON run, not described. **No rule evaluator ran and no notification was delivered** — the live fire-and-resolve check is [#9006](https://github.com/rjwalters/loom/issues/9006) |
 | UI view matrix for Loom's non-HTTP span kinds | **Answered for Service List/APM and Exceptions, via authenticated backend API probes rather than a browser** (see "UI view matrix" above) — Service List/APM populates (`loom-daemon`, correct call/error counts) because RED metrics come from unconditional root-span aggregation, not an HTTP convention; Exceptions stays empty because Loom never emits an OTel `exception` span event. Service Map returned empty and, since 2026-09-30, **is attributable** — see "Resolving the Service Map confound": every Loom span is `SPAN_KIND_INTERNAL` and every resource carries the one `service.name`, both at single unconditional exporter sites and both measured on the real wire payload, so none of the three preconditions for a topology edge can be met; the gateway's allowlist strips every peer key as a second layer. Adding a connector or a multi-service fixture cannot change the answer for Loom's data. Enforced by `signoz_topology_shape.rs` in ordinary CI. No screenshot has been captured on any session |
 
 Synthetic fixture success establishes transport/schema/query behavior, not a

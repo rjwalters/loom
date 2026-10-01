@@ -226,6 +226,43 @@ queries above: a `metric_name` or label the emitting code no longer produces,
 or the gateway's DATAPOINT `keep_keys` allowlist no longer forwards, fails
 ordinary CI instead of the saved view quietly going empty.
 
+The alert additionally has its own execution proof,
+`loom-daemon/tests/signoz_queue_starvation_alert.rs`, which substitutes
+SigNoz's `{{.start_timestamp_ms}}` / `{{.end_timestamp_ms}}` the way its rule
+evaluator does and then applies the committed `op` / `matchType` / `target` to
+the engine's own output. A wrong alert fails differently from a wrong
+dashboard: an empty dashboard is *visibly* empty, whereas an alert whose query
+returns nothing — or rows its threshold can never cross — is **silently**
+healthy forever, because no page is exactly what a working queue looks like.
+What the run establishes:
+
+- **The threshold separates sustained starvation from a working queue.** A host
+  above zero in every minute fires; a host reporting a measured zero in every
+  minute does not; and a host that starves and clears alternately does not
+  either, because the committed `matchType` demands the breach hold for the
+  whole 15-minute window. The test evaluates both of SigNoz's point-wise match
+  semantics over the same output, so switching that field is visible as a
+  change of operational contract rather than a tweak.
+- **The zero rows stay in the result.** Unlike `queue-dwell.sql` query 1, the
+  alert has no `HAVING starved > 0` — SigNoz needs the zero-valued points to
+  see a series recover — so a measured zero is dropped by the *threshold*, and
+  nothing in the SQL would stop a loosened `target` from paging on every
+  reporting host.
+- **The window is half-open.** The point at exactly `end_ms` is excluded, so two
+  consecutive overlapping evaluations cannot both count the same boundary
+  point, and a spike one minute before `start_ms` does not re-alert.
+- **`GROUP BY ts, host` is what makes the annotation's "see the alert's host
+  label" true.** Dropping `host` collapses every host into one unattributable
+  series whose per-bucket `max()` is the worst host's — still firing, but with
+  nowhere to point and a healthy host hidden rather than visibly healthy.
+
+Each of those is run with the committed JSON mutated as a counterfactual, and
+the rule's own cadence is checked too (`frequency` ≤ `evalWindow`, so no minute
+of starvation falls in a gap between evaluations; neither the rule nor its
+query ships `disabled`). What it does **not** establish: no rule evaluator ran
+and no notification was delivered — the live fire-and-resolve check is
+[#9006](https://github.com/rjwalters/loom/issues/9006).
+
 All five queries are additionally **executed verbatim** against the pinned
 ClickHouse the telemetry store runs, by
 `loom-daemon/tests/signoz_queue_quota_queries.rs`. That run is what establishes
@@ -372,7 +409,7 @@ return 0 on every row instead of erroring. Policy and pipeline:
 | Host/token gauges | Metrics Explorer: the actual emitted names and units — the shared fixture emits `loom.tokens.usage_fraction` and `loom.tokens.exhausted` only, labelled by `account`. An absent series is not a measured zero: the fixture's `synthetic-unknown` account intentionally has no `usage_fraction` point while `synthetic-zero` has `0.0` (`fixture-queries.sql` 7) |
 | Subscription quota utilization | Dashboards → New dashboard `Loom quota` → Time series panel. Metric `loom.tokens.usage_fraction` (5-hour window) and a second query on `loom.tokens.usage_fraction_weekly` (rolling 7-day window, #9005), aggregation **Max**, group by `provider`, `account`; time range 7 days. Providers with no utilization source (Codex, OpenCode/Z.ai, Kimi) have no series at all — a gap, never a `0`. Last week's used fraction per provider and the idle headroom thrown away at each weekly reset need window functions, so they live in SQL only (`quota-utilization.sql` 1–3) |
 | Ready-queue dwell | Dashboards → New dashboard `Loom queue` → Time series panel. Metric `loom.queue.oldest_wait`, aggregation **Max**, group by `host.id`, `state`; time range 7 days. A second panel on `loom.queue.starved` (Max, group by `host.id`, `state`) is the alert's own signal. Disposition reasons, mean dispatch wait and one issue's admission trail need `JSONExtractString`/span reads and stay SQL-only (`queue-dwell.sql` 1–5) |
-| Queue starvation alert | Alerts → Import `alerts/queue-starvation.json`. Fires when `loom.queue.starved` for `state = 'ready'` stays above threshold for the 15-minute eval window on any one host; the alert's own query is `queue-dwell.sql` 1 narrowed to that state |
+| Queue starvation alert | Alerts → Import `alerts/queue-starvation.json`. Fires when `loom.queue.starved` for `state = 'ready'` stays above threshold for the 15-minute eval window on any one host; the alert's own query is `queue-dwell.sql` 1 narrowed to that state, minus its `HAVING starved > 0` so SigNoz can still see the series recover. The embedded query plus the committed threshold are executed against the pinned ClickHouse by `signoz_queue_starvation_alert.rs` (see "Queue dwell and starvation queries" above); no rule evaluator or notification has run ([#9006](https://github.com/rjwalters/loom/issues/9006)) |
 | Loom measured usage | Trace Explorer: filter `name = 'loom.runtime.usage'`, group by `loom.model` with **Sum** over the token counters, and separately by `loom.role` / `loom.runtime`. The UI reads these attributes as STRINGS (they are exported as strings, like every span attribute), so a numeric aggregation of them belongs in SQL — and the scope resolution a correct total needs cannot be expressed as an Explorer filter at all. Treat the panel as a browsing surface and the SQL as the figures (`usage-queries.sql` 1 and 2) |
 | Usage coverage | Trace Explorer: filter `name = 'loom.role_attempt'` and compare against the usage spans beneath each. An attempt with **no** `loom.runtime.usage` child has usage UNKNOWN; one whose child reports `loom.tokens.total = '0'` is a measured zero. Never impute one from the other — the split is SQL-only (`usage-queries.sql` 3) |
 | Unpriced models and rate-card provenance | Trace Explorer: filter `name = 'loom.runtime.usage'` and add `loom.cost.usd_estimate`, `loom.pricing.source`, `loom.pricing.verified_on` as columns. A blank estimate is a model the rate card does not know, never a $0 model: it must be excluded from spend explicitly, and fixing it is a rate-card change, not a query change. Two `verified_on` values in one window mean the fleet rolled a card mid-window (`usage-queries.sql` 4 and 5) |
