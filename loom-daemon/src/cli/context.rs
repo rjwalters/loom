@@ -317,9 +317,19 @@ fn run_fetch(params: FetchParams) -> Result<()> {
     };
     input.canonicalize();
 
+    // Provenance validation (#9783 AC4/AC5): every returned location is
+    // validated against the pinned revision's actual file tree before it
+    // can enter the artifact. The checkout the CLI runs in supplies the
+    // pinned tree; a resolver failure is recorded as explicitly-unavailable
+    // validation (Partial + coverage note), never a silent pass.
+    let repo_checkout = std::env::current_dir()?;
+    let provenance = match session::pinned_source_index(&repo_checkout, &input.source_revision) {
+        Ok(index) => session::ProvenanceSource::Index(&index),
+        Err(e) => session::ProvenanceSource::Unavailable(e.to_string()),
+    };
     let s = open_store(store_dir.as_deref())?;
     let (key, artifact, reused) =
-        context_cache::fetch(input, &s, adapter.as_ref(), adapter::Budget::default())?;
+        context_cache::fetch(input, &s, adapter.as_ref(), adapter::Budget::default(), provenance)?;
     println!(
         "key {} {} (reused={reused}, status={:?}, results={}, calls={})",
         key,

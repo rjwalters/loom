@@ -129,6 +129,7 @@ pub fn fetch(
     store: &store::ArtifactStore,
     adapter: &dyn adapter::RetrievalAdapter,
     budget: adapter::Budget,
+    provenance: session::ProvenanceSource<'_>,
 ) -> Result<(String, ContextArtifact, bool)> {
     input.adapter_version = adapter.identity().version;
     let key = input.content_key();
@@ -143,7 +144,7 @@ pub fn fetch(
         // Key collision under the same prefix is corruption — never serve.
         anyhow::bail!("cached artifact {} does not match its key (corruption)", key);
     }
-    let session = session::run(&input, adapter, budget);
+    let session = session::run(&input, adapter, budget, provenance);
     let artifact = ContextArtifact {
         schema_version: ContextArtifact::SCHEMA_VERSION,
         key: key.clone(),
@@ -187,10 +188,22 @@ mod tests {
                 source_ref: "idx:1".into(),
             },
         )]);
-        let (k1, a1, reused1) =
-            fetch(snapshot("t"), &store, &adapter, adapter::Budget::default()).unwrap();
-        let (k2, a2, reused2) =
-            fetch(snapshot("t"), &store, &adapter, adapter::Budget::default()).unwrap();
+        let (k1, a1, reused1) = fetch(
+            snapshot("t"),
+            &store,
+            &adapter,
+            adapter::Budget::default(),
+            session::ProvenanceSource::Unavailable("test".into()),
+        )
+        .unwrap();
+        let (k2, a2, reused2) = fetch(
+            snapshot("t"),
+            &store,
+            &adapter,
+            adapter::Budget::default(),
+            session::ProvenanceSource::Unavailable("test".into()),
+        )
+        .unwrap();
         assert_eq!(k1, k2);
         assert!(!reused1);
         assert!(reused2);
@@ -206,8 +219,14 @@ mod tests {
                                              // actually ran.
         assert_eq!(a1.session.provider.version, "fake-1");
         // Content change → new key.
-        let (k3, _, _) =
-            fetch(snapshot("t2"), &store, &adapter, adapter::Budget::default()).unwrap();
+        let (k3, _, _) = fetch(
+            snapshot("t2"),
+            &store,
+            &adapter,
+            adapter::Budget::default(),
+            session::ProvenanceSource::Unavailable("test".into()),
+        )
+        .unwrap();
         assert_ne!(k1, k3);
     }
 
@@ -233,15 +252,27 @@ mod tests {
             )])
             .with_version(version)
         };
-        let (k1, _, reused1) =
-            fetch(snapshot("t"), &store, &make("fake-1"), adapter::Budget::default()).unwrap();
+        let (k1, _, reused1) = fetch(
+            snapshot("t"),
+            &store,
+            &make("fake-1"),
+            adapter::Budget::default(),
+            session::ProvenanceSource::Unavailable("test".into()),
+        )
+        .unwrap();
         assert!(!reused1);
         // The snapshot's stale/generic adapter_version is irrelevant: fetch
         // derives the key from the adapter identity that actually ran.
         let mut stale_input = snapshot("t");
         stale_input.adapter_version = "fake".into();
-        let (k2, a2, reused2) =
-            fetch(stale_input, &store, &make("fake-2"), adapter::Budget::default()).unwrap();
+        let (k2, a2, reused2) = fetch(
+            stale_input,
+            &store,
+            &make("fake-2"),
+            adapter::Budget::default(),
+            session::ProvenanceSource::Unavailable("test".into()),
+        )
+        .unwrap();
         assert_ne!(k1, k2, "adapter schema version is a key dimension");
         assert!(!reused2);
         // The new artifact records the new identity, and the old artifact is
