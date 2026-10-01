@@ -21,6 +21,19 @@ This comprehensive guide walks you through installing and setting up Loom, wheth
 
 Loom transforms your repository into an AI-orchestrated workspace where agents coordinate through GitHub issues, PRs, and labels. Each terminal can embody a specialized role (Worker, Curator, Architect, Reviewer) working autonomously or on-demand.
 
+### Is Loom the Right Fit?
+
+Loom optimizes for **unattended correctness over long horizons**, not
+time-to-first-working-thing. Its gates trade latency for the ability to dispatch work you
+will not be watching.
+
+That trade is a bad one in exactly one regime: a short deadline, a disposable artifact,
+and a human watching continuously. If that is your situation — a hackathon, a demo due
+this afternoon — Loom will slow you down with no compensating benefit, and you should use
+live agent sessions instead. Read
+[Latency vs. Reliability](../philosophy/latency-vs-reliability.md) before installing; it
+spells out both the design intent and the alternative recipe.
+
 ### What Gets Installed
 
 Running `./install.sh /path/to/your/repo` (which invokes `loom-daemon init`)

@@ -514,14 +514,79 @@ two live runs). Against that data:
   correlation (see the ad-hoc probe screenshots, and query 4/6 in the shared
   fixture section above) actually uses. The three status-`Error` root spans
   counted in `numErrors` above are exactly the ones this page cannot show.
-- **Service Map — stays empty, but this trial cannot attribute why.**
-  `POST /api/v1/dependency_graph` returned `[]`. `ingester.yaml` configures no
-  service-graph/topology connector at all (only `signozspanmetrics/delta`), so
-  this is expected independent of span kind — but the shared fixture is also
-  single-service (`loom-daemon` calling itself), so a caller/callee edge would
-  never be produced by *any* connector against this data. This row cannot be
-  called a Loom-specific limitation from this evidence; it needs either a
-  service-graph connector or a multi-service fixture to mean anything.
+- **Service Map — stays empty.** `POST /api/v1/dependency_graph` returned `[]`.
+  `ingester.yaml` configures no service-graph/topology connector at all (only
+  `signozspanmetrics/delta`), so this is expected independent of span kind — but
+  the shared fixture is also single-service (`loom-daemon` calling itself), so a
+  caller/callee edge would never be produced by *any* connector against this
+  data. **This session could not separate the two causes and recorded the row as
+  unattributable.** The next section resolves it: the fixture's single-service
+  shape is not a fixture choice, it is the only shape Loom's exporter can
+  produce, so the row is a permanent Loom-shape limitation and not a trial
+  configuration gap.
+
+### Resolving the Service Map confound: Loom's trace shape, not the trial's render (2026-09-30)
+
+The row above was left unattributable because two candidate causes were present
+at once — a render with no topology connector, and a single-service fixture. That
+confound is decidable **without** the trial host, because one of the two is a
+property of the emitting code rather than of the deployment. A topology view needs
+one of exactly three things to draw an edge:
+
+1. a parent/child span pair carrying two **different** `service.name` values
+   (what SigNoz's own dependency graph is built from),
+2. a CLIENT/SERVER (or PRODUCER/CONSUMER) span-kind pair, or
+3. one span carrying a peer/virtual-node attribute such as `peer.service`, which
+   is how the OTel `servicegraph` connector synthesizes an edge when the remote
+   side never reports.
+
+Loom's exporter can produce none of the three, and both facts are single unconditional
+sites rather than per-call-site conventions:
+
+- `loom-daemon/src/observability/otlp/traces.rs` sets `kind: SpanKind::Internal`
+  for every span it builds. There is no branch: **no** span family — lifecycle,
+  `loom.ci.*`, `loom.dispatch.*`, `loom.runtime.usage`, `loom.pool.hold` — can be
+  any other kind.
+- `resource_for_host` in `.../otlp/mapping.rs` sets `service.name` to the literal
+  `loom-daemon`. The exporter groups `ResourceSpans` per host id, so a multi-host
+  fleet produces many resources and many `service.instance.id` values — but a
+  distinct instance is not a distinct **service**, which is the only axis a
+  dependency graph reads.
+
+Measured, not inferred, on this session's host: the shared fixture manifest
+(#8578, `run-id topologyshape`) was pushed through the real `OtlpExporter` into a
+loopback OTLP/HTTP sink in-process, and the captured wire payload — 37 spans
+across 15 `/v1/traces` requests and 15 `ResourceSpans` — carried
+`kind = 1` (`SPAN_KIND_INTERNAL`) on **every** span, exactly one distinct
+`service.name`, and none of the twelve topology peer keys on any span, span event
+or resource. No Docker, network, backend or credential was involved.
+
+There is also a second, independent enforcement downstream: the neutral gateway's
+`transform/privacy` is an allowlist, and its resource allowlist is exactly
+`service.name` / `service.instance.id` / `service.version` / `host.id` while its
+span and span-event allowlists contain no peer key. So even a future change that
+started emitting `peer.service` would be stripped before either backend saw it.
+
+**Conclusion for the acceptance ledger.** An empty Service Map is attributable,
+and it is attributable to Loom: adding a topology connector to the render, or
+pointing a multi-service fixture at the trial, cannot produce an edge *for Loom's
+data*. This is the same class of answer as the Exceptions page (Loom emits no
+`exception` span event) rather than the Service List/APM page (which populates
+because `signozspanmetrics/delta` aggregates root spans unconditionally).
+
+**What this is not.** It is not a claim that SigNoz's Service Map is broken, and
+not a reason to change Loom: Loom's spans describe one process's own phases, so
+there is no second service to draw. It is also not a browser observation — the
+`[]` above came from the backend route, and no screenshot has been captured on
+any session (that gap stays open, with the rest of #8946).
+
+`loom-daemon/tests/signoz_topology_shape.rs` holds all five assertions, in
+ordinary CI (no `--ignored`, no Docker), so the conclusion fails loudly rather
+than going stale: the day a Loom span becomes CLIENT-kind, a second
+`service.name` appears, a peer key is emitted or admitted by the gateway, or the
+render gains a topology connector, the row above needs rewriting and the test
+says so. Each of the five was confirmed to fail for its own intended reason
+before being accepted.
 
 ### A same-session finding: a saturated, deliberately-absent second backend can mask a healthy one's delivery
 
@@ -709,6 +774,79 @@ hold two stacks at once. Nothing above is presented as an observation of restore
 data: the snapshot, restore, cross-project query diff, account/dashboard login and
 teardown steps are all unrun. [#9279](https://github.com/rjwalters/loom/issues/9279)
 owns that run and flips the ledger row below when it happens.
+
+## Backup-restore rehearsal: found executed, interrupted, and torn down (2026-09-30)
+
+The section above is accurate for the worktree it was written from. It is not
+accurate for the trial host as a whole: this pass found a `loom-signoz-restore`
+Compose project already running, five days old. Its containers' own
+`com.docker.compose.project.config_files` labels point at
+`/tmp/loom8528/deploy/compose.yaml` plus `/tmp/loom8528/restore-override.yaml`
+— a worktree that no longer exists — rendered by Compose **v2.40.3**, a plugin
+this host does not have today (`docker: unknown command: docker compose`; no
+`~/.docker/cli-plugins/docker-compose`, no standalone `docker-compose`). Some
+earlier `#8528` session ran the real rehearsal from a worktree that carried its
+own Compose plugin, then the worktree and session ended without the run being
+written up or torn down. [#9279](https://github.com/rjwalters/loom/issues/9279)
+had no worktree and no running process attached to it at discovery, so this was
+not another sweep's in-progress work.
+
+**What actually restored.** `loom-signoz-restore-metastore-postgres-0` and
+`loom-signoz-restore-telemetrystore-clickhouse-0-0` both came up healthy and had
+been running for 5 days (created/started 2026-09-25T16:28:5{2,8}Z) when found.
+Their data predates that start, which is only possible if it arrived via a
+volume-level restore rather than being seeded fresh in place:
+
+- PostgreSQL's `migration` table records `migrated_at` at **2026-09-25
+  15:52:41** — 36 minutes before this container's own creation. The restored
+  `organizations` table holds exactly one row, named `loom-8528`, created
+  `2026-09-25 15:52:52.896024`, with one matching user
+  (`trial8528@example.invalid`).
+- ClickHouse's `signoz_traces.signoz_index_v3` holds 37 rows spanning
+  `2026-09-25 16:06:43`–`16:07:23`, every one `resource_string_service$$name =
+  loom-daemon`: `loom.phase`×14, `loom.role_attempt`×12, `loom.sweep`×7,
+  `loom.runtime.preflight`×2, `loom.tool`×1, `loom.runtime.run`×1 — a real
+  sweep's own spans, not a synthetic fixture row.
+
+Both tables' data is consistent with the README's documented tar-per-volume
+procedure (the pinned `postgres:16` tarballer, `--numeric-owner`) and with
+nothing else: no in-place seeding explains rows timestamped before the
+container holding them existed.
+
+**What did not finish.** `loom-signoz-restore-signoz-0` and
+`loom-signoz-restore-telemetrystore-migrator` were both still `Created` —
+compose never started them. The README's restore step brings up
+`loom-signoz-signoz-0` specifically to pull in that whole dependency chain
+(metastore, keeper, ClickHouse, migrator, user-scripts); here it stopped after
+the datastore layer and the one-shot user-scripts container came up, and never
+reached the app or the migrator. That means no browser/UI login happened, no
+`fixture-queries.sql` cross-project diff was run or captured, and the
+documented teardown (`down --volumes --dry-run`, then for real) never ran
+either. The rehearsal was interrupted partway, not completed.
+
+**Cost of leaving it running.** `docker stats` at discovery showed
+`loom-signoz-restore-telemetrystore-clickhouse-0-0` at **124.52% CPU**, and
+`system.part_log` showed 127,377 failed `metric_log` background merges against
+477 successful ones — the same unpatched `MEMORY_LIMIT_EXCEEDED`
+self-telemetry failure already characterized in "Co-resident 2.5-day soak"
+below, not a new finding, just that same bug reproducing unattended on a
+second project for five days on a shared 8-vCPU dispatch host.
+
+**Disposition.** The genuinely new information above — that a volume-level
+tarball round-trip preserves both PostgreSQL's org/user metadata and
+ClickHouse's trace data — is now captured here. Nothing else in the abandoned
+project was worth keeping: this pass tore the `loom-signoz-restore-*` project
+down with plain `docker rm -f`/`network rm`/`volume rm` restricted to that
+exact name prefix (the `docker compose` plugin that created it is no longer on
+this host, so the README's own `down --volumes --dry-run` step could not be
+run as documented) and filed a follow-up issue covering the missing `docker
+compose` plugin (it blocks anyone, including a future #9279 session, from
+running the documented procedure on this host at all) and the fact that a
+datastore-layer restore ran to completion outside of any tracked session. The
+acceptance-ledger row below stays **Open**: login verification, the query
+diff and a clean, documented teardown are all still unexecuted, and #9279
+still owns deciding whether this partial run is sufficient evidence for the
+datastore layer or should be repeated end-to-end.
 
 ## Co-resident 2.5-day soak: footprint, and a self-telemetry merge failure (2026-09-28)
 
@@ -906,6 +1044,99 @@ fixture is synthetic and the engine is `clickhouse local`, which establishes the
 SQL's behaviour against the pinned ClickHouse but not the trial deployment's
 ingest path. That needs the trial host, the same gap #8525 and #9279 name.
 
+## Closing the drift guard's last gap: queue-dwell, quota-utilization, the alert (2026-09-30)
+
+`fixture-queries.sql`, `ci-queries.sql` and `usage-queries.sql` all gained a
+static CI contract as they landed — a saved query that subscripts an attribute
+the gateway strips, or names a metric no emitter produces, returns zero rows
+forever rather than failing, which is indistinguishable from "the backend lost
+the data". `queue-dwell.sql` (#8856), `quota-utilization.sql` (#9005) and
+`alerts/queue-starvation.json` (#8856) — all scope-item-4 "host/token gauges"
+artifacts in this same directory — had no such guard at all: a rename of
+`loom.queue.starved`, `loom.tokens.usage_fraction_weekly` or any of their
+`state`/`reason`/`provider`/`account` labels would have gone unnoticed by
+ordinary CI.
+
+Three new tests in `signoz_trial_artifacts.rs` close the gap, each derived
+rather than restated: `queue_dwell_queries_match_the_ops_metric_vocabulary`
+against the public `MetricName` enum (`loom-daemon/src/telemetry/ops.rs`);
+`quota_utilization_queries_match_the_tokens_snapshot_vocabulary` against the
+`TokensSnapshot` OTLP mapping arm's own literal metric names, parsed out of
+`mapping.rs` the same way `sweep_facts_gateway_survival.rs` (#9586) already
+treats that source file as an authority; and
+`queue_starvation_alert_matches_the_ops_metric_vocabulary` against the alert
+JSON's embedded `query` string. `queue-dwell.sql` was also added to the
+existing `saved_queries_only_reference_forwarded_attribute_and_resource_keys`
+file list, covering query 5's span-attribute/resource reads.
+
+Each of the three was confirmed to fail for its own reason before being
+committed: a typo'd `loom.queue.starved` in `queue-dwell.sql`, a typo'd
+`loom.tokens.exhausted` in `quota-utilization.sql`, and a typo'd
+`loom.queue.starved` inside the alert's embedded query each produced the
+intended panic message naming the exact stale/unknown literal. No Docker,
+network, backend or credential is used, so this runs in ordinary CI on any
+host — including this one, which has neither Docker Compose nor a running
+trial to observe.
+
+## Cycle-time analytics executed against the pinned engine (2026-09-30)
+
+`signoz/cycle-time-extract.sql` (#8665, this issue's scope item 4) carried a
+"NOT executed live" status since it landed: the ClickStack half had a real
+proof (`loom-daemon/tests/cycle_time_clickhouse.rs`, on rows the real OTLP
+exporter wrote), and the SigNoz half had only the static column-list contract
+(`cycle_time_artifacts.rs`). This closes that gap the same way
+`signoz_usage_queries.rs` closed the equivalent gap for this issue's
+measured-usage artifact: `clickhouse local` in the pinned
+`clickhouse/clickhouse-server:25.12.5` image the trial's telemetry store
+runs, no full multi-container SigNoz deployment, no persistent volume.
+
+The fixture (`loom-daemon/tests/fixtures/signoz_cycle_time/fixture.sql`) is
+the SAME seven `sweep.outcome` envelopes as the ClickStack proof's own
+fixture (`tests/fixtures/cycle_time/envelopes.jsonl.tmpl`), hand-translated
+into rows shaped like SigNoz's real `distributed_logs_v2` schema: `timestamp`
+as raw `UInt64` nanoseconds (not `DateTime64`, which
+`fromUnixTimestamp64Nano(toInt64(timestamp))` would silently misread — caught
+live: the first draft used `DateTime64(9)` literals and every `finished_at`
+came back as 1970-01-01), and each field split into `attributes_string` /
+`attributes_number` by the REAL mapper's own `kv_int` vs `kv_string` call
+sites in `otlp/mapping.rs` and `otlp/mapping/metadata.rs` (`loom.issue`,
+`loom.total_duration_sec`, `loom.pr_number` and `loom.doctor_cycles` are
+`kv_int`; everything else, including the array-valued `loom.phase_durations`,
+is `kv_string`), not by a convenience choice.
+
+Because the fixture is the identical workload, `loom-daemon/tests/
+signoz_cycle_time.rs` runs `cycle-time-extract.sql`, the shared
+`cycle-time-rollup.sql` and all eight of the shared `cycle-time-queries.sql`
+questions verbatim and compares every answer against the values
+`cycle_time_clickhouse.rs` already asserts for ClickStack over the same
+seven envelopes. All matched exactly on the pinned engine: CT1's five-ship
+headline (`ship-beta-103` 5400s/no breakdown down to `ship-alpha-105`
+265s/builder, `ship-alpha-102`'s repair loop correctly dominated by `judge`
+at 1500s rather than `builder`'s single 900s), CT2's per-phase total of 1910s
+for `judge`, CT3's 50% success rate for `synthetic/beta`, CT4's NULL
+(never-defaulted) runtime bucket, CT5's one repaired ship at 400
+doctor-seconds, CT6's six ships summed across week buckets, CT7's exact
+`[6,1,1,1,1,2,1,2,0]` coverage row and CT8's `[6,6,0,0,0]` rollup-fidelity
+row. A second test proves the two deliberate SigNoz-specific differences the
+extract view's own header documents: an eighth row
+(`ship-fallback-check`, timestamped in the year 2200 so it cannot perturb the
+six-ship comparison above) carries `loom.issue` and `loom.total_duration_sec`
+ONLY in `attributes_string`, and both resolved correctly through the
+`attributes_number`-first-then-fallback read; the same row omits
+`loom.pr_number` and `loom.doctor_cycles` from both maps, and both stayed
+`NULL` rather than becoming `0`.
+
+**What this establishes and what it does not.** This is a same-fixture,
+cross-backend numeric-parity proof against the pinned ClickHouse engine — the
+first such proof for the cycle-time artifact set, and stronger evidence than
+either backend's proof alone, because it rules out the two answers agreeing
+by coincidence on unrelated data. It is **not** a live trial observation: no
+telemetry went through SigNoz's own ingester, migrator or `distributed_logs_v2`
+table as SigNoz actually creates it — this is `clickhouse local`, the same
+caveat `signoz_usage_queries.rs` already carries for the measured-usage
+artifact. That gap is the same one #8525 and #9279 name for every other
+not-yet-live-executed SigNoz artifact in this trial.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -920,7 +1151,7 @@ ingest path. That needs the trial host, the same gap #8525 and #9279 name.
 | Actual Trace Explorer and correlated logs | Passed in authenticated UI; sanitized screenshots linked above |
 | Seven-day effective retention | API, overrides and actual DDL verified; metadata/grace exceptions documented |
 | Restart persistence and shared receiver recovery | Passed for signals, account and effective TTL; fresh three-signal replay indexed |
-| Backup restoration rehearsed into a separate project | **Open** — the isolated `loom-signoz-restore` overlay, its documented procedure and a 13-test static isolation contract all landed and the merged render was verified (see "Backup-restore rehearsal overlay"), but no restore has been executed against real tarballs: that needs the trial host ([#9279](https://github.com/rjwalters/loom/issues/9279)) |
+| Backup restoration rehearsed into a separate project | **Open** — the isolated `loom-signoz-restore` overlay, its documented procedure and a 13-test static isolation contract all landed and the merged render was verified (see "Backup-restore rehearsal overlay"). A real tarball restore *was* found executed on this trial host by an earlier, undocumented session (see "Backup-restore rehearsal: found executed, interrupted, and torn down"): both PostgreSQL's org/user metadata and 37 real ClickHouse trace spans survived the volume round-trip. But the run stopped at the datastore layer — no UI login, no `fixture-queries.sql` diff, no documented teardown — and sat abandoned, burning CPU, for 5 days before this pass found and tore it down (follow-up: [#9762](https://github.com/rjwalters/loom/issues/9762)); [#9279](https://github.com/rjwalters/loom/issues/9279) still owns a complete, documented pass |
 | Saved query artifacts for the shared fixture manifest | **Passed** — executed live above; matches the generated manifest exactly |
 | Shared fixture manifest observed in SigNoz | **Passed** — see "Shared fixture manifest, executed live" above: 37/14/3 signals, exact totals, graph, grouping, root-less detection, absence-vs-zero and privacy-sentinel queries all verified |
 | Real Loom canary / real Judge-Doctor repair trace | Open — the instrumentation slices landed (#8577/#8579), but #8525 itself stays open for its own live-run acceptance, and the run needs the trial host; see #8529 |
@@ -931,7 +1162,8 @@ ingest path. That needs the trial host, the same gap #8525 and #9279 name.
 | CI logs/traces at 7 days on the current trial | **Open** — API-owned tables still at the upstream 15 days; needs the org login ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | Six CI saved views in the trial org | **Open** — recreation steps written in the README, not yet executed in the UI ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | Measured usage parity with ClickStack's "Loom measured usage" view | **Passed against the pinned ClickHouse, open against the live trial.** `usage-queries.sql` (sections 0–6) plus four README saved-view rows close the parity gap; `signoz_usage_queries.rs` executes the committed file verbatim on ClickHouse 25.12.5 and observes scope resolution, at-least-once dedupe, NULL-not-zero dollars for an unpriced model, unknown-vs-measured-zero, the repo-by-trace join, and the wrong-container silent zero (see "Measured usage" above). No run over real canary data on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
-| UI view matrix for Loom's non-HTTP span kinds | **Answered for Service List/APM and Exceptions, via authenticated backend API probes rather than a browser** (see "UI view matrix" above) — Service List/APM populates (`loom-daemon`, correct call/error counts) because RED metrics come from unconditional root-span aggregation, not an HTTP convention; Exceptions stays empty because Loom never emits an OTel `exception` span event. Service Map returned empty but is confounded by the fixture being single-service and no service-graph connector being configured — not attributable to span kind from this evidence. No screenshot has been captured on any session |
+| Cycle-time analytics parity with ClickStack (`cycle-time-extract.sql`, #8665) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_cycle_time.rs` executes the extraction, the shared rollup and all eight CT queries verbatim over the SAME seven-envelope fixture as the ClickStack proof, and every CT1–CT8 answer matches exactly (see "Cycle-time analytics executed against the pinned engine" above); the `attributes_number`/`attributes_string` fallback and true-absence behavior are also proven. No run through SigNoz's own ingester on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
+| UI view matrix for Loom's non-HTTP span kinds | **Answered for Service List/APM and Exceptions, via authenticated backend API probes rather than a browser** (see "UI view matrix" above) — Service List/APM populates (`loom-daemon`, correct call/error counts) because RED metrics come from unconditional root-span aggregation, not an HTTP convention; Exceptions stays empty because Loom never emits an OTel `exception` span event. Service Map returned empty and, since 2026-09-30, **is attributable** — see "Resolving the Service Map confound": every Loom span is `SPAN_KIND_INTERNAL` and every resource carries the one `service.name`, both at single unconditional exporter sites and both measured on the real wire payload, so none of the three preconditions for a topology edge can be met; the gateway's allowlist strips every peer key as a second layer. Adding a connector or a multi-service fixture cannot change the answer for Loom's data. Enforced by `signoz_topology_shape.rs` in ordinary CI. No screenshot has been captured on any session |
 
 Synthetic fixture success establishes transport/schema/query behavior, not a
 real Loom lifecycle. Keep #8528 open until the real-canary and #8529

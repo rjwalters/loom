@@ -98,7 +98,7 @@ ORDER BY timestamp DESC LIMIT 20;
 
 -- A `workspace_halted` row names its cause on `loom.queue.halt_cause` (#9017
 -- token: main_red / gate_pending / token_pool / preflight_advisory / drain /
--- breaker; #9673). The column is empty for a cause-less legacy row — join to
+-- breaker / write_scope; #9673, #9548). The column is empty for a cause-less legacy row — join to
 -- the parent `loom.dispatch.tick` span
 -- (`attributes_string['loom.dispatch.result'] = 'halted_main_red'`) through
 -- `parentSpanID` there.

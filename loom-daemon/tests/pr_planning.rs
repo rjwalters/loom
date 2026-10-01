@@ -1,5 +1,8 @@
 //! CLI contract: use the real queue policy with forge-shaped offline input.
 use std::process::Command;
+#[cfg(unix)]
+#[path = "support/write_scope_root.rs"]
+mod write_scope_root;
 
 #[test]
 fn interactive_creation_is_explicit_and_unknown_is_the_default() {
@@ -131,6 +134,9 @@ exit 1
     script(&gate, "exit 0");
     let create =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts/create-pr.sh");
+    // create-pr.sh vets its target through `loom-daemon forge may-write`
+    // (#9548); the real verb decides on a managed, writable fixture checkout.
+    let write_scope = write_scope_root::writable_env(root);
     let run = |origin: &str, body: &str| {
         let out = Command::new("bash")
             .arg(&create)
@@ -147,9 +153,13 @@ exit 1
             .env("LOOM_FORGE_TYPE", "github")
             .env("LOOM_VERSION_CHECK_SCRIPT", &gate)
             .env("LOOM_DAEMON_SELF_BIN", env!("CARGO_BIN_EXE_loom-daemon"))
+            .env("LOOM_DAEMON_BIN", env!("CARGO_BIN_EXE_loom-daemon"))
+            .envs(write_scope.iter().cloned())
             .env("LOOM_CONFIG_DEFAULTS_FILE", "")
             .env("LOOM_WORK_ORIGIN", origin)
             .env_remove("GITHUB_ACTIONS")
+            .env_remove("GH_REPO")
+            .env_remove("LOOM_REPO")
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));

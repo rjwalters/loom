@@ -68,6 +68,13 @@
 //! which — unlike [`stale_checks`]'s GitHub-only lookup — also covers Gitea)
 //! stay forge reads in the shell.
 //!
+//! [`check_runs_rollup`] is the READ both of those classifications start
+//! from (#8191 slice): the failing/pending check-name sets and `total_count`
+//! out of the payload `forge_get_check_runs` returned, replacing three `jq`
+//! filters whose `|| true` let an unreadable payload read as "nothing failing,
+//! nothing pending". It answers only inside the forge contract and refuses
+//! the rest, which the shell treats as still pending.
+//!
 //! [`check_runs_streak`] is the OTHER classification the same poll loop makes
 //! on a FAILED fetch attempt (#6389, an #8191 slice): whether a confirmed
 //! HTTP 404 — both the attempt and its retry-once agreeing — has now repeated
@@ -229,6 +236,7 @@
 //! caller and passed in; this module owns only the two-input decision and its
 //! byte-frozen message text, consolidating three copies into one.
 
+pub mod check_runs_rollup;
 pub mod check_runs_streak;
 pub mod checks_failure;
 pub mod cleanup_paths;

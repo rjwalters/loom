@@ -42,9 +42,27 @@ concurrency:
 # (PR #9070): rebuild + relink of every test binary 55s -> 37s, cold build
 # 208s -> 187s, target/ 12 GB -> 6.9 GB. The smaller target/ also eases the
 # 10 GB Actions cache. Release builds are unaffected.
+#
+# #9364 (item 4 of #9065): link Linux builds with `lld` instead of the
+# default `ld` (`mold` was tried in #9071 and rejected -- no gain measurable
+# over run-to-run noise). CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_* is scoped to
+# that one target triple, so the macOS job (`aarch64-apple-darwin`) reads
+# neither var, and a local `cargo build` outside CI is unaffected -- this is
+# a workflow env var, not a change to the committed `.cargo/config.toml`
+# (whose own `target.'cfg(all())'.rustflags` keeps applying; Cargo joins
+# matching target.<triple>/<cfg> rustflags sources together rather than one
+# replacing the other). `clang` is the linker driver (not `ld.lld` directly)
+# because that is the only way to invoke lld that doesn't require guessing
+# an unversioned `ld.lld` binary name/PATH entry; `-fuse-ld=lld` has clang
+# resolve the actual `ld.lld` next to itself. Both clang and lld are
+# preinstalled on the `ubuntu-latest` runner image (its `install-clang.sh`
+# installs `lld-<version>` alongside each `clang-<version>`), so no extra
+# `apt-get install` step is needed.
 env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld
 
 jobs:
   # Detect Changes: path groups for the filtered jobs below, plus (first step,
@@ -122,10 +140,13 @@ jobs:
               - 'loom-daemon/**'
               - 'loom-api/**'
               # The observability artifacts are Rust-tested seams, not inert
-              # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs
-              # and cycle_time_artifacts.rs all `include_str!` these files and
-              # fail on drift, and cycle_time_clickhouse.rs / signoz_usage_queries.rs
-              # execute the SQL verbatim against a real ClickHouse. An artifact-only PR must
+              # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs,
+              # signoz_topology_shape.rs (the render + gateway allowlist the
+              # Service Map conclusion rests on) and cycle_time_artifacts.rs all
+              # `include_str!` these files and
+              # fail on drift, and cycle_time_clickhouse.rs / signoz_usage_queries.rs /
+              # signoz_cycle_time.rs execute the SQL verbatim against a real ClickHouse.
+              # An artifact-only PR must
               # re-run those, or the only tests that can catch the regression
               # are skipped on exactly the PRs that cause one (#8665).
               - 'defaults/observability/**'
@@ -470,6 +491,15 @@ jobs:
       # out of the engine the way the artifact's header claims.
       - name: Verify the measured-usage queries against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_usage_queries -- --ignored --nocapture
+      # #8528 / #8665: executes signoz/cycle-time-extract.sql (and the shared
+      # rollup + CT1-CT8 queries) verbatim against the same pinned ClickHouse,
+      # over a fixture seeded to match the SigNoz ingester's own
+      # attributes_string/attributes_number split. Closes the "NOT yet
+      # executed against a live SigNoz deployment" status the extract view
+      # carried since #8665 landed — the ClickStack side was already covered
+      # by cycle_time_clickhouse.rs above.
+      - name: Verify the SigNoz cycle-time extraction against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_cycle_time -- --ignored --nocapture
 
   backend-otlp-tests:
     name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})
@@ -1668,6 +1698,14 @@ jobs:
         run: bash defaults/scripts/tests/test-per-worktree-target-dir.sh
       - name: merge-pr loom:pr review-signal guard (#7419, #8191 slice)
         run: bash defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh
+      # #9657 (#9548 slice): both suites pin the working-tree binary for the
+      # real `forge trusted-comments` filter, so they need this job's shared
+      # build; capacity-defer moved out of shell-suite-tests/ci-wired.txt for
+      # exactly that reason.
+      - name: merge-pr hold-state comment trust (#9657, #9548 slice)
+        run: bash defaults/scripts/tests/test-merge-pr-hold-state-trust.sh
+      - name: classify-capacity-defer comment trust (#9657, #9548 slice)
+        run: bash defaults/scripts/tests/test-classify-capacity-defer.sh
       - name: merge-pr PR-label fetch freshness (#8550)
         run: bash defaults/scripts/tests/test-merge-pr-label-freshness.sh
       - name: merge-pr stale required-checks guard (#8248, #8191 slice 3)
@@ -2037,6 +2075,25 @@ jobs:
       # without a binary.
       - name: mcp__loom__.* PreToolUse argument guard (#9107, #9108)
         run: bash defaults/hooks/tests/test-guard-mcp-tools.sh
+      # Moved out of shell-suite-tests by #8191's check-runs-rollup slice:
+      # merge-pr.sh's _wait_for_checks_then_sync_merge now reads its
+      # failing/pending/total_count via `loom-daemon merge-pr
+      # check-runs-rollup`, so extracting and running the REAL function (as
+      # both suites below do) needs the binary this job downloads. Both pin
+      # it via loom_test_require_daemon_bin --self-only and FAIL rather than
+      # skip without one.
+      - name: merge-pr wait-for-checks empty-settle guard (#6169, #9091, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh
+      # test-forge-check-runs-pagination.sh's Parts 1/2/4/5 (forge-helpers.sh
+      # pagination, no daemon involved) move here with Part 3 rather than
+      # splitting the suite.
+      - name: forge check-runs pagination + truncated-read settle guard (#8895, #8987, #8191)
+        run: bash defaults/scripts/tests/test-forge-check-runs-pagination.sh
+      # Its #3664 pending-vs-failing assertions used to mirror the retired jq
+      # filters (passing against a copy); they now drive the real
+      # `merge-pr check-runs-rollup`, pinned the same way.
+      - name: merge-pr pending-vs-failing check-runs classification (#3664, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-unstable-fallback.sh
 
   native-port-daemon-lifecycle:
     name: Native Port Suites (daemon lifecycle, watchdog)
