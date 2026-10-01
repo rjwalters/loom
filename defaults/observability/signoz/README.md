@@ -567,23 +567,40 @@ times columns. Under the 2 GiB cap, its TTL-applying merge failed thousands of
 times an hour, and parts outlived their TTL. `system.metric_log` stays
 queryable as a view with the same columns.
 
-A deployment first started from an older render keeps its wide table. The
-config is a single-file bind mount, so a plain `up -d` does not pick up a
-re-render: recreate the ClickHouse container (its volume persists). On start
-it renames the old table to `system.metric_log_0`, stuck parts included. That
-table holds ClickHouse's own diagnostics only, no Loom signal, so drop it:
+A deployment first started from an older render keeps its wide table. Its
+rendered files live in the deployment's own state directory, **not** in this
+checkout, so step one is to copy the re-rendered `casting.yaml`,
+`casting.yaml.lock` and `pours/` over that directory's copies — a
+`--force-recreate` against the stale copies recreates the container with the
+*old* config and changes nothing. Keep the originals: that diff is the only
+record of what the deployment was running.
+
+The config is then a single-file bind mount, so a plain `up -d` still does not
+pick up the re-render: recreate the ClickHouse container (its volume persists).
+On start it renames the old table to `system.metric_log_0`, stuck parts
+included. That table holds ClickHouse's own diagnostics only, no Loom signal,
+so drop it:
 
 ```console
+diff -r /absolute/deployment/state/pours pours   # expect only the metric_log schema_type line
+cp -R casting.yaml casting.yaml.lock pours /absolute/deployment/state/
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml up -d --wait --wait-timeout 1800 --force-recreate --no-deps loom-signoz-telemetrystore-clickhouse-0-0
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "DROP TABLE system.metric_log_0"
 ```
 
 Check for merge failures when you check retention. A non-zero count means some
-table has stopped expiring:
+table has stopped expiring. **Bound the window to the running server** — the
+`part_log` rows recording the old failures survive in the volume until their
+own 1-day TTL expires them, so an unbounded count keeps reporting a defect that
+is already fixed:
 
 ```console
-docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT table, countIf(error != 0) failed_merges, countIf(error = 0) ok FROM system.part_log WHERE event_type = 'MergeParts' GROUP BY table HAVING failed_merges > 0"
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT table, countIf(error != 0) failed_merges, countIf(error = 0) ok FROM system.part_log WHERE event_type = 'MergeParts' AND event_time > now() - toIntervalSecond(uptime()) GROUP BY table HAVING failed_merges > 0"
 ```
+
+Drop the `event_time` predicate only to read the pre-restart history
+deliberately; `system.metric_log_0` appearing there is expected for the
+seconds between the rename and the `DROP`.
 
 Use the same `--env-file` and `-f` arguments for every Compose command.
 `docker compose ... stop` preserves all data.

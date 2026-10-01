@@ -739,3 +739,58 @@ fn clickhouse_self_telemetry_stays_expirable_under_the_rendered_memory_cap() {
          in-place re-render"
     );
 }
+
+/// The remediation above was executed against the live trial deployment on
+/// 2026-10-01 (`evidence.md`), and running it rather than only rendering it
+/// exposed two errors in the documented procedure. Both corrections are easy to
+/// lose to a later edit and neither is observable from the rendered config, so
+/// they are pinned here.
+///
+/// 1. A deployment's rendered files live in its own state directory, not in this
+///    checkout. `--force-recreate` without first copying the re-render across
+///    recreates the container on the *old* config and reports success.
+/// 2. `system.part_log` keeps the pre-fix failure rows until its own 1-day TTL
+///    expires them, so a failed-merge check that is unbounded in time reads a
+///    just-fixed deployment as still broken (it returned `metric_log 70,410`
+///    minutes after the fix landed).
+#[test]
+fn the_self_telemetry_remediation_stays_runnable_as_written() {
+    let recreate = README
+        .find("--force-recreate --no-deps loom-signoz-telemetrystore-clickhouse-0-0")
+        .expect("the README must keep the ClickHouse force-recreate command");
+
+    // (1) The sync of the re-rendered files must be documented BEFORE the
+    // recreate, or the recreate is a no-op against stale rendered config.
+    let sync = README
+        .find("cp -R casting.yaml casting.yaml.lock pours ")
+        .expect(
+            "the README must copy the re-rendered casting/lock/pours into the deployment's own \
+             state directory: a --force-recreate against the stale copies recreates the old \
+             config and changes nothing (evidence.md, 2026-10-01)",
+        );
+    assert!(
+        sync < recreate,
+        "the state-directory sync must be documented before the force-recreate, not after it"
+    );
+
+    // (2) Every failed-merge check query in the README must be bounded to the
+    // running server. An unbounded one re-reports the fixed defect for a day.
+    let bound = "AND event_time > now() - toIntervalSecond(uptime())";
+    let checks: Vec<&str> = README
+        .lines()
+        .filter(|line| line.contains("countIf(error != 0) failed_merges"))
+        .collect();
+    assert!(
+        !checks.is_empty(),
+        "the README must keep a failed-merge check query: it is the only documented way to see \
+         that a system table has stopped expiring"
+    );
+    for check in &checks {
+        assert!(
+            check.contains(bound),
+            "a README failed-merge check query is unbounded in time, so it reports the pre-fix \
+             part_log rows (which survive until part_log's own 1-day TTL) as a live defect; it \
+             must carry `{bound}`"
+        );
+    }
+}
