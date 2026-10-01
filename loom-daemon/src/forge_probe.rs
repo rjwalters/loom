@@ -321,7 +321,7 @@ fn execute_case(
         "forge-probe::coordination::issue-create" => {
             issue_create(test_id, view, cfg, http, server_version)
         }
-        "forge-probe::coordination::issue-comment" => {
+        "forge-probe::coordination::comment-create" => {
             issue_comment_readback(test_id, view, cfg, http, server_version)
         }
         other => Ok(CaseResult {
@@ -628,13 +628,11 @@ mod tests {
         let mut http = FakeHttp::new();
         http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
         let results = run(&cfg(false), &http).unwrap();
-        let write_unknown = results.iter().filter(|r| {
-            r.outcome == OUTCOME_UNKNOWN
-                && r.notes
-                    .iter()
-                    .any(|n| n.contains("live-write not opted in"))
-        });
-        assert!(write_unknown.count() > 0, "write rows refuse without opt-in");
+        let write_refused = results
+            .iter()
+            .filter(|r| r.observed.contains("refused: live-write not opted in"))
+            .count();
+        assert!(write_refused > 0, "write rows refuse without opt-in");
         let exec = results.iter().filter(|r| r.outcome == OUTCOME_PASS).count();
         assert_eq!(exec, 0, "nothing executes write paths in read-only mode");
     }
@@ -705,11 +703,11 @@ mod tests {
         // comments GET: marker absent -> FAIL
         http.push("comments", vec![Ok((200, r#"[{"body": "something else"}]"#.into()))]);
         let mut cfg = cfg(true);
-        cfg.only = vec!["issue-comment".into()];
+        cfg.only = vec!["comment-create".into()];
         let results = run(&cfg, &http).unwrap();
         let row = results
             .iter()
-            .find(|r| r.test_id.contains("issue-comment"))
+            .find(|r| r.test_id.contains("comment-create"))
             .unwrap();
         assert_eq!(row.outcome, OUTCOME_FAIL, "absent marker is a fail");
     }
