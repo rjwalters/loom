@@ -6,6 +6,7 @@ mod ci;
 mod eta;
 mod metadata;
 mod ops;
+mod session_output;
 
 use std::collections::BTreeMap;
 
@@ -171,7 +172,7 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
 /// two host-level record kinds (`tokens.snapshot`, `host.health`) — those
 /// become metrics instead (see [`metric_samples_for`]).
 fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
-    let observed_time_unix_nano = nanos(envelope.emitted_at);
+    let mut observed_time_unix_nano = nanos(envelope.emitted_at);
     let mut time_unix_nano = observed_time_unix_nano;
     // Only `ci.job.log` (#8825) and the ETA kinds (#9289) set this; every
     // other kind's body stays the event name, byte-identical on the wire.
@@ -570,6 +571,19 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
+        }
+        TelemetryRecord::SessionOutput(_) => {
+            // Issue #9764: the body is the producer-redacted readable text,
+            // and this is the only kind that overrides BOTH timestamps — the
+            // source event's time and the producer's read time are separate
+            // facts here, and collapsing either into the envelope's
+            // `emitted_at` would make a quiet run indistinguishable from a
+            // stalled export.
+            let parts = session_output::log_parts(&envelope.record)?;
+            time_unix_nano = parts.source_at;
+            observed_time_unix_nano = parts.observed_at;
+            body_override = Some(parts.body);
+            (parts.event_name, parts.severity, String::new(), parts.attributes)
         }
         // Every kind that is not declared `otlp: Logs` in `telemetry/kinds.rs`:
         // `tokens.snapshot` / `host.health` become gauges, `ci.duration` a

@@ -356,11 +356,23 @@ fn filelog_retain_lists_and_privacy_allowlist_stay_within_the_reviewed_key_set()
         "transform/privacy's log keep_keys must list the three new #8669 keys"
     );
 
-    // #8825: `ci.job.log` is the ONE reviewed exception to "no record kind's
-    // body reaches this collector as free text". It is named here on purpose
-    // — this test is the place a reviewer looks for the reviewed set, so an
-    // exception that is not listed here is not reviewed.
-    const BODY_EXCEPTION_KINDS: [&str; 1] = ["ci.job.log"];
+    // The reviewed exceptions to "no record kind's body reaches this collector
+    // as free text". They are named here on purpose — this test is the place a
+    // reviewer looks for the reviewed set, so an exception that is not listed
+    // here is not reviewed. Adding a kind to this list is the review gate, and
+    // is deliberately a code change someone has to justify.
+    //
+    //   - `ci.job.log`      (#8825) a GitHub Actions job log, fetched wholesale
+    //   - `session.output`  (#9764) live, producer-redacted agent output
+    //
+    // Each kind is paired with the attribute its scrub statements must be
+    // guarded by. The guards are deliberately DIFFERENT marker keys: a unique
+    // marker per kind is what stops either body exception from widening the
+    // other, which a shared guard would do silently.
+    const BODY_EXCEPTIONS: [(&str, &str); 2] = [
+        ("ci.job.log", r#"attributes["loom.ci.chunk_index"] != nil"#),
+        ("session.output", r#"attributes["loom.session.output.event_id"] != nil"#),
+    ];
     let body_rewrites: Vec<&str> = CONFIG
         .lines()
         .map(str::trim)
@@ -368,16 +380,33 @@ fn filelog_retain_lists_and_privacy_allowlist_stay_within_the_reviewed_key_set()
         .collect();
     assert!(
         !body_rewrites.is_empty(),
-        "the #8825 ci.job.log scrub stage disappeared from the collector config"
+        "the body scrub stages disappeared from the collector config"
     );
     for line in &body_rewrites {
-        assert!(
-            line.contains("attributes[\"loom.ci.chunk_index\"] != nil"),
-            "a body rewrite is not scoped to {BODY_EXCEPTION_KINDS:?}: {line}"
+        let matched: Vec<&str> = BODY_EXCEPTIONS
+            .iter()
+            .filter(|(_, guard)| line.contains(guard))
+            .map(|(kind, _)| *kind)
+            .collect();
+        assert_eq!(
+            matched.len(),
+            1,
+            "a body rewrite must be scoped to exactly ONE reviewed exception \
+             {:?} — matched {matched:?}: {line}",
+            BODY_EXCEPTIONS.map(|(kind, _)| kind)
         );
     }
-    // Every filelog receiver must still clear its own body: the scrub stage
-    // is scoped to ci.job.log, so it is no substitute for `remove: body`.
+    // Every reviewed exception must actually be present, so deleting a scrub
+    // stage cannot pass by leaving zero statements to check.
+    for (kind, guard) in BODY_EXCEPTIONS {
+        assert!(
+            body_rewrites.iter().any(|line| line.contains(guard)),
+            "{kind} is a reviewed body exception but has no scrub statement"
+        );
+    }
+    // Every filelog receiver must still clear its own body: the scrub stages
+    // are scoped to their own kinds, so they are no substitute for
+    // `remove: body`.
     assert_eq!(
         CONFIG
             .matches("- type: remove\n        field: body")

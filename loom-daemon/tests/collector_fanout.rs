@@ -564,24 +564,46 @@ fn ci_job_log_bodies_are_scrubbed_at_the_gateway_before_both_sinks() {
 fn gateway_scrubs_exactly_the_declared_ci_log_classes() {
     use loom_daemon::telemetry::ci::{CI_LOG_CHUNK_MARKER_KEY, CI_LOG_SCRUB_CLASSES};
 
-    let statements: Vec<&str> = CONFIG
+    let all_statements: Vec<&str> = CONFIG
         .lines()
         .map(str::trim)
         .filter(|line| line.contains("replace_pattern(body,"))
         .collect();
     assert!(
-        statements.len() >= CI_LOG_SCRUB_CLASSES.len(),
+        all_statements.len() >= CI_LOG_SCRUB_CLASSES.len(),
         "the collector has fewer body-rewriting statements than declared scrub classes"
     );
     let guard = format!("attributes[\"{CI_LOG_CHUNK_MARKER_KEY}\"] != nil and IsString(body)");
+    // #9764 added `session.output`, a second kind whose body is foreign text
+    // and which therefore has its own scrub stage with its own class list. The
+    // "cannot quietly lose its scope guard" protection below is what actually
+    // matters, so it is generalised rather than dropped: every body rewrite
+    // must be scoped to exactly one KNOWN kind, and an unguarded statement —
+    // which would rewrite every kind's body — still fails.
+    const SESSION_OUTPUT_GUARD: &str =
+        r#"attributes["loom.session.output.event_id"] != nil and IsString(body)"#;
+    let mut statements: Vec<&str> = Vec::new();
+    for statement in &all_statements {
+        let ci = statement.contains(&guard);
+        let session_output = statement.contains(SESSION_OUTPUT_GUARD);
+        assert!(
+            ci ^ session_output,
+            "a body rewrite must be scoped to exactly one kind's records \
+             (ci.job.log or session.output), not zero and not both: {statement}"
+        );
+        if ci {
+            statements.push(statement);
+        }
+    }
+    assert!(
+        !statements.is_empty(),
+        "no statement carried the ci.job.log guard — the guard text changed, and an \
+         empty scan would make the class comparison below vacuously pass"
+    );
     // A class may need more than one pattern, so consecutive repeats
     // collapse; the class ORDER is load-bearing and compared exactly.
     let mut classes: Vec<String> = Vec::new();
     for statement in &statements {
-        assert!(
-            statement.contains(&guard),
-            "a body rewrite is not scoped to ci.job.log records: {statement}"
-        );
         let start = statement
             .find("[REDACTED:")
             .expect("every body rewrite replaces with a [REDACTED:<class>] marker");
@@ -623,6 +645,79 @@ fn gateway_scrubs_exactly_the_declared_ci_log_classes() {
         CONFIG.contains("`ci.job.log` (#8825) carries a GitHub Actions job"),
         "config.yaml must state the ci.job.log body exception beside the allowlist"
     );
+}
+
+/// Issue #9764, no Docker: the `session.output` analog of
+/// `gateway_scrubs_exactly_the_declared_ci_log_classes` above. The producer's
+/// `redact::classes()` (`telemetry::kinds::session_output::redact`) and the
+/// gateway's `transform/session_output_redaction` stage must each scrub the
+/// same classes, in the same order — this is the parity check the #9844
+/// review flagged as missing: a class added to one side only would
+/// previously go undetected (e.g. `private-key`, present in the producer's
+/// 11 classes but absent from the gateway's statements).
+#[test]
+fn gateway_scrubs_exactly_the_declared_session_output_classes() {
+    use loom_daemon::telemetry::kinds::session_output::redact::SESSION_OUTPUT_SCRUB_CLASSES;
+
+    let all_statements: Vec<&str> = CONFIG
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("replace_pattern(body,"))
+        .collect();
+    assert!(
+        all_statements.len() >= SESSION_OUTPUT_SCRUB_CLASSES.len(),
+        "the collector has fewer body-rewriting statements than declared session.output scrub classes"
+    );
+    const SESSION_OUTPUT_GUARD: &str =
+        r#"attributes["loom.session.output.event_id"] != nil and IsString(body)"#;
+    let statements: Vec<&str> = all_statements
+        .iter()
+        .copied()
+        .filter(|statement| statement.contains(SESSION_OUTPUT_GUARD))
+        .collect();
+    assert!(
+        !statements.is_empty(),
+        "no statement carried the session.output guard — the guard text changed, and an \
+         empty scan would make the class comparison below vacuously pass"
+    );
+    // A class may need more than one pattern, so consecutive repeats
+    // collapse; the class ORDER is load-bearing and compared exactly.
+    let mut classes: Vec<String> = Vec::new();
+    for statement in &statements {
+        let start = statement
+            .find("[REDACTED:")
+            .expect("every body rewrite replaces with a [REDACTED:<class>] marker");
+        let end = statement[start..].find(']').expect("a closed marker") + start;
+        let class = statement[start + "[REDACTED:".len()..end].to_string();
+        if classes.last() != Some(&class) {
+            classes.push(class);
+        }
+    }
+    assert_eq!(
+        classes,
+        SESSION_OUTPUT_SCRUB_CLASSES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect::<Vec<String>>(),
+        "the collector's session.output scrub classes and SESSION_OUTPUT_SCRUB_CLASSES disagree"
+    );
+
+    // The stage must run, and must run before the shared allowlist: a secret
+    // has to be gone before any later stage can copy or export its body.
+    let pipeline = CONFIG
+        .lines()
+        .find(|line| {
+            line.trim()
+                .starts_with("processors: [memory_limiter, transform/")
+        })
+        .expect("logs pipeline processors line");
+    let scrub = pipeline
+        .find("transform/session_output_redaction")
+        .expect("transform/session_output_redaction must be in the logs pipeline");
+    let privacy = pipeline
+        .find("transform/privacy")
+        .expect("transform/privacy must be in the logs pipeline");
+    assert!(scrub < privacy, "the scrub stage must precede transform/privacy: {pipeline}");
 }
 
 /// Issue #8824 fan-out contract, no Docker: the gateway's `transform/privacy`
