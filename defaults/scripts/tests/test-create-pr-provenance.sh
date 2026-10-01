@@ -14,13 +14,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# #9548: this suite's subject vets its write target (`forge may-write`)
-# first; that decision is not what this suite tests (test-write-scope.sh does),
-# and without this the outcome would depend on the host's loom-daemon.
-WS_STUB_DIR="$(mktemp -d)"
-# shellcheck source=lib/write-scope-stub.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-stub.sh"
-write_scope_allow_all "$WS_STUB_DIR"
+# shellcheck source=lib/write-scope-fixture.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-fixture.sh"
 CREATE_PR="$(cd "$SCRIPT_DIR/.." && pwd)/create-pr.sh"
 
 TESTS_RUN=0
@@ -95,6 +90,12 @@ export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
 export LOOM_FORGE_TYPE=github
 export LOOM_VERSION_CHECK_SCRIPT="$STUB_DIR/version-check-ok.sh"
+
+# #9548: create-pr.sh vets its write target through the write scope before it
+# writes. It runs from a checkout registered as owner/repo (origin, .loom/, push
+# reported to the permission probe), so the real decision admits it.
+write_scope_register "$STUB_DIR/checkout" owner/repo
+cd "$STUB_DIR/checkout"
 
 run_create_pr() {
   rm -f "$STUB_DIR/body.txt" "$STUB_DIR/daemon-args.txt" "$STUB_DIR/daemon-forge-args.txt"

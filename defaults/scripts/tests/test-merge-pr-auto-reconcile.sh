@@ -47,13 +47,8 @@ MERGE_PR_SRC="$HELPERS_DIR/merge-pr.sh"
 source "$TEST_DIR/lib/require-daemon-bin.sh"
 loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr reconcile-plan" \
     "merge-pr reconcile-child"
-# #9548: merge-pr.sh vets its repo first (`forge may-write`); that decision is
-# not what this suite tests (test-write-scope.sh does), so the fixture repo is
-# allowed and every other verb still reaches the pinned binary.
-WS_STUB_DIR="$(mktemp -d)"
-# shellcheck source=lib/write-scope-stub.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib/write-scope-stub.sh"
-write_scope_allow_all "$WS_STUB_DIR"
+# shellcheck source=lib/write-scope-fixture.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-fixture.sh"
 
 # Colors
 RED='\033[0;31m'
@@ -242,6 +237,11 @@ STUB
 chmod +x "$STUB_DIR/gh"
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# #9548: merge-pr.sh vets its write target through the write scope before it
+# writes. It runs from a checkout registered as owner/repo (origin, .loom/, push
+# reported to the permission probe), so the real decision admits it.
+write_scope_register "$STUB_DIR/checkout" owner/repo
+cd "$STUB_DIR/checkout"
 
 # --- Shared globals the functions read (see the file-level SC2034 disable). ---
 REPO_NWO="owner/repo"

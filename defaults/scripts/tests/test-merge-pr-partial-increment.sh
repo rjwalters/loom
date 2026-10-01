@@ -63,13 +63,8 @@ source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
 # audit-comment BODIES are `merge-pr partial-comment` (#8191 slices), so the
 # same binary must carry all three verbs too.
 loom_test_require_daemon_bin "$HELPERS_DIR" merge-pr-refs "merge-pr partial-reset" "merge-pr partial-conflict" "merge-pr partial-comment"
-# #9548: merge-pr.sh vets its repo first (`forge may-write`); that decision is
-# not what this suite tests (test-write-scope.sh does), so the fixture repo is
-# allowed and every other verb still reaches the pinned binary.
-WS_STUB_DIR="$(mktemp -d)"
-# shellcheck source=lib/write-scope-stub.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib/write-scope-stub.sh"
-write_scope_allow_all "$WS_STUB_DIR"
+# shellcheck source=lib/write-scope-fixture.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-fixture.sh"
 
 # Colors
 RED='\033[0;31m'
@@ -269,6 +264,11 @@ STUB
 chmod +x "$STUB_DIR/gh"
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# #9548: merge-pr.sh vets its write target through the write scope before it
+# writes. It runs from a checkout registered as owner/repo (origin, .loom/, push
+# reported to the permission probe), so the real decision admits it.
+write_scope_register "$STUB_DIR/checkout" owner/repo
+cd "$STUB_DIR/checkout"
 
 # --- Shared globals the functions read (consumed indirectly by the sourced
 # functions; see the file-level SC2034 disable at the top). ---

@@ -133,10 +133,13 @@ echo ""
 echo "Testing forge_gh_*_rl_safe REST-fallback wrappers..."
 
 STUB_DIR=$(mktemp -d)
-# #9548: every wrapper vets its repo first; that decision is not what this
-# suite tests (test-write-scope.sh does), so the fixture repo is allowed.
-source "$SCRIPT_DIR/lib/write-scope-stub.sh"
-write_scope_allow_all "$STUB_DIR"
+# #9548: every wrapper vets its repo through the write scope first. The suite
+# runs from a checkout registered as owner/repo (origin, .loom/, push reported
+# to the permission probe), so the real decision admits it.
+# shellcheck source=lib/write-scope-fixture.sh
+source "$SCRIPT_DIR/lib/write-scope-fixture.sh"
+write_scope_register "$STUB_DIR/checkout" owner/repo
+cd "$STUB_DIR/checkout"
 ARGV_LOG="$STUB_DIR/argv.log"
 GH_MODE_FILE="$STUB_DIR/mode.txt"
 # Captures the JSON body a `gh api ... --input -` call reads from stdin, so

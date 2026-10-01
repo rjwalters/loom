@@ -24,6 +24,8 @@
 #   ./.loom/scripts/tests/test-post-verdict.sh
 
 set -uo pipefail
+# shellcheck source=lib/write-scope-fixture.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-fixture.sh"
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$TEST_DIR/.." && pwd)"
@@ -136,12 +138,11 @@ chmod +x "$STUB_DIR/gh"
 
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
-# #9548: the write is vetted (`forge may-write`) before it is made; that
-# decision is not what this suite tests (test-write-scope.sh does), and without
-# this the outcome would depend on which loom-daemon the host has installed.
-# shellcheck source=lib/write-scope-stub.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib/write-scope-stub.sh"
-write_scope_allow_all "$STUB_DIR"
+# #9548: post-verdict.sh vets its write target through the write scope before it
+# writes. It runs from a checkout registered as owner/repo (origin, .loom/, push
+# reported to the permission probe), so the real decision admits it.
+write_scope_register "$STUB_DIR/checkout" owner/repo
+cd "$STUB_DIR/checkout"
 
 reset_state() {
   rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR/last-pr.txt" "$STUB_DIR/last-body.txt"

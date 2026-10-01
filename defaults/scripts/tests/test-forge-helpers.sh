@@ -45,8 +45,14 @@ source "$HELPERS_DIR/lib/forge-helpers.sh"
 # #9548: the write wrappers vet their repo first; that decision is not what
 # this suite tests (test-write-scope.sh does), so fixture repos are allowed.
 WS_STUB_DIR=$(mktemp -d)
-source "$SCRIPT_DIR/lib/write-scope-stub.sh"
-write_scope_allow_all "$WS_STUB_DIR"
+# #9548: the write wrappers vet their repo through the write scope first. The
+# suite runs from a checkout registered as owner/repo (origin, .loom/, push
+# reported to the permission probe), so the real decision admits it.
+WS_FIXTURE_DIR="$(mktemp -d)"
+# shellcheck source=lib/write-scope-fixture.sh
+source "$SCRIPT_DIR/lib/write-scope-fixture.sh"
+write_scope_register "$WS_FIXTURE_DIR" owner/repo
+cd "$WS_FIXTURE_DIR"
 
 # Reset state for testing
 FORGE_TYPE=""

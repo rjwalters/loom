@@ -27,19 +27,19 @@
 #   ./.loom/scripts/tests/test-merge-pr-merge-method.sh
 
 set -euo pipefail
+# shellcheck source=lib/write-scope-fixture.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-fixture.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 MERGE_PR="$SCRIPTS_DIR/merge-pr.sh"
-# #9548: merge-pr.sh vets its repo (`forge may-write`) before it validates
-# anything else; that decision is not what this suite tests
-# (test-write-scope.sh does), and without this the outcome would depend on the
-# host's loom-daemon and credential. Later cases that set LOOM_DAEMON_BIN or
-# PATH for one invocation still see their own stubs.
-WS_STUB_DIR="$(mktemp -d)"
-# shellcheck source=lib/write-scope-stub.sh
-source "$SCRIPT_DIR/lib/write-scope-stub.sh"
-write_scope_allow_all "$WS_STUB_DIR"
+# #9548: merge-pr.sh vets its repo before it validates anything else. The
+# suite runs from a checkout registered as owner/repo (origin, .loom/, push
+# reported to the permission probe), so the real decision admits it. Later
+# cases that set LOOM_DAEMON_BIN or PATH for one invocation keep their stubs.
+WS_FIXTURE_DIR="$(mktemp -d)"
+write_scope_register "$WS_FIXTURE_DIR" owner/repo
+cd "$WS_FIXTURE_DIR"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -195,11 +195,12 @@ echo "Test 5: live stubbed-daemon end-to-end (disallowed request hard-blocks)"
 
 STUB_DIR=$(mktemp -d)
 trap 'rm -rf "$STUB_DIR"' EXIT
-cat > "$STUB_DIR/loom-daemon" <<'STUB'
-#!/usr/bin/env bash
-# #9548: merge-pr.sh vets its repo first; allowed here (test-write-scope.sh
-# covers the refusal), since an exit 1 would read as a write-scope refusal.
-if [[ "$1" == "forge" && "$2" == "may-write" ]]; then echo "owner/repo"; exit 0; fi
+echo '#!/usr/bin/env bash' > "$STUB_DIR/loom-daemon"
+# #9548: `forge may-write` goes to a real daemon when WRITE_SCOPE_DAEMON names
+# one (lib/write-scope-fixture.sh), else answers as a pre-verb binary, so the
+# registered fixture is admitted by a real decision either way.
+write_scope_stub_verb_snippet >> "$STUB_DIR/loom-daemon"
+cat >> "$STUB_DIR/loom-daemon" <<'STUB'
 if [[ "$1" == "forge" && "$2" == "merge-method" ]]; then
   echo "requested merge method 'merge' is not allowed by this repository; allowed method(s): squash" >&2
   exit 1

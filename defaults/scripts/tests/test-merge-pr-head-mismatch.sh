@@ -115,10 +115,13 @@ source "$FORGE_HELPERS_SRC"
 
 STUB_DIR="$(mktemp -d)"
 GH_ARGS_FILE="$(mktemp)"
-# #9548: forge_merge_pr vets its repo first; not what this section tests.
-# shellcheck source=lib/write-scope-stub.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib/write-scope-stub.sh"
-write_scope_allow_all "$STUB_DIR"
+# #9548: forge_merge_pr vets its repo through the write scope first. The suite
+# runs from a checkout registered as owner/repo (origin, .loom/, push reported
+# to the permission probe), so the real decision admits it.
+# shellcheck source=lib/write-scope-fixture.sh
+source "$SCRIPT_DIR/lib/write-scope-fixture.sh"
+write_scope_register "$STUB_DIR/checkout" owner/repo
+cd "$STUB_DIR/checkout"
 trap 'rm -rf "$STUB_DIR"; rm -f "$GH_ARGS_FILE"' EXIT
 
 cat > "$STUB_DIR/gh" <<'STUB'
@@ -215,17 +218,7 @@ echo "Testing _classify_merge_response / error_head_moved (extracted)..."
 # green.
 # shellcheck source=lib/require-daemon-bin.sh
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
-# #9548: the early forge_merge_pr section wrapped LOOM_DAEMON_BIN; hand the
-# real resolution back before pinning (the wrapper is re-applied below).
-write_scope_unwrap
 loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr"
-# #9548: merge-pr.sh vets its repo first (`forge may-write`); that decision is
-# not what this suite tests (test-write-scope.sh does), so the fixture repo is
-# allowed and every other verb still reaches the pinned binary.
-WS_STUB_DIR="$(mktemp -d)"
-# shellcheck source=lib/write-scope-stub.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib/write-scope-stub.sh"
-write_scope_allow_all "$WS_STUB_DIR"
 
 CLASSIFIER_FILE="$(mktemp)"
 # `_classify_merge_response` is a single dense line (merge-pr.sh is

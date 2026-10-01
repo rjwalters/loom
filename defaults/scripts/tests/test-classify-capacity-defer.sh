@@ -32,13 +32,8 @@
 set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# #9548: this suite's subject vets its write target (`forge may-write`)
-# first; that decision is not what this suite tests (test-write-scope.sh does),
-# and without this the outcome would depend on the host's loom-daemon.
-WS_STUB_DIR="$(mktemp -d)"
-# shellcheck source=lib/write-scope-stub.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-stub.sh"
-write_scope_allow_all "$WS_STUB_DIR"
+# shellcheck source=lib/write-scope-fixture.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-fixture.sh"
 SCRIPTS_DIR="$(cd "$TEST_DIR/.." && pwd)"
 CCD="$SCRIPTS_DIR/classify-capacity-defer.sh"
 
@@ -291,6 +286,12 @@ STUB
 chmod +x "$STUB_DIR/gh"
 
 export PATH="$STUB_DIR:$PATH"
+
+# #9548: The script (with --apply) vets its write target through the write scope before it
+# writes. It runs from a checkout registered as o/r (origin, .loom/, push
+# reported to the permission probe), so the real decision admits it.
+write_scope_register "$STUB_DIR/checkout" o/r
+cd "$STUB_DIR/checkout"
 
 # issue_fixture_by <login> <type> <association> <owner/repo#N> [comment-body...]
 # Writes the issue's comment listing in the REST shape (`gh api

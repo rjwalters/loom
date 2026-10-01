@@ -2,6 +2,12 @@
 # write-scope-stub.sh — test helper: let a suite's fixture repo pass the #9548
 # write-scope check, so the suite keeps testing what it tests.
 #
+# RETIRING (#9782): this replaces the real decision with an allow-all, which
+# the operator ruled out for tests. New and converted suites use
+# write-scope-fixture.sh, which registers the fixture so the real gate admits
+# it. The six suites still sourcing this file are listed in #9782; it is
+# deleted once they are converted. Do not add a new caller.
+#
 # Every Loom write path now vets its target with `loom_write_repo`
 # (lib/forge-helpers.sh), which asks `loom-daemon forge may-write`. Suites use
 # fixture repositories (`owner/repo`, `test-owner/test-repo`) that no real
