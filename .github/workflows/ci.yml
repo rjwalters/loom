@@ -547,6 +547,25 @@ jobs:
       # asymmetric run_attempt/attempts join keys are both load-bearing.
       - name: Verify the SigNoz CI failed-run log join against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_ci_failed_run_logs -- --ignored --nocapture
+      # #8528 / #9904: the same technique for retention.sql, the trial's last
+      # artifact with no guard of any kind -- and the only one that MUTATES the
+      # operator's deployment. It needs a single-node ClickHouse with an
+      # embedded Keeper rather than `clickhouse local`, because `ON CLUSTER
+      # cluster` requires a real distributed-DDL queue (`clickhouse local`
+      # answers QUERY_IS_PROHIBITED). The live record for this file is "all 16
+      # statements reported status 0" plus an effective TTL per table; neither
+      # can show a retention OUTCOME. Only this run shows that dropping the
+      # `/ 1000` from a millisecond statement deletes every row in the table
+      # rather than nothing (toDateTime saturates at the DateTime maximum and
+      # the interval overflows past it), that `ttl_only_drop_parts` keeps an
+      # over-age row alive indefinitely in a part it shares with an in-window
+      # row, that `MODIFY TTL` silently drops a table-level DELETE WHERE
+      # qualification while keeping column TTLs, that re-widening a shortened
+      # window restores the policy and not the data, and that one failing
+      # statement aborts the file leaving exactly the metric statements -- the
+      # ones that restore 30 days -- unapplied.
+      - name: Verify the SigNoz retention statements against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_retention_ttl -- --ignored --nocapture
 
   backend-otlp-tests:
     name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})
