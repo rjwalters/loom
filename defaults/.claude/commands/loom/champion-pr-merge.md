@@ -1010,22 +1010,17 @@ its critical-file caveat, or its role as sticky-hold release path (a).
 - `loom-api/Cargo.toml` - api dependency changes
 - `package.json` - npm dependency changes
 - `.github/workflows/*` - CI/CD pipeline changes
-- `*.sql` - database schema changes
-- `*migrations/*` - database migration directories (e.g. Django/Alembic/Rails-style `migrations/` folders, including a root-level `migrations/` dir such as Alembic/Flask-Migrate's default `migrations/versions/*.py` layout — the pattern has no leading `/`, so it matches both root-level and nested directories) — **not** a bare `migration` substring, which false-positived on the intentional `docs/migration/` documentation directory (#5723)
+- `*migrations/*` - database migration directories (Django/Alembic/Rails-style `migrations/` folders; the pattern has no leading `/`, so root-level layouts like Alembic/Flask-Migrate's `migrations/versions/*.py` match too) — **not** a bare `migration` substring, which false-positived on the intentional `docs/migration/` documentation directory (#5723)
 - `*_migration.py` - single-file suffix-style migration scripts
+- **Not** a bare `.sql` extension (#9357) — see the `CRITICAL_PATTERNS` comment below
 
 **Verification command**:
 ```bash
 # Get ALL changed files via the paginated REST endpoint, NOT `gh pr view
-# --json files`. The latter silently truncates at 100 files with no error or
-# warning (confirmed empirically: a 117-changed-file PR returns exactly 100
-# entries from `gh pr view --json files`, dropping the rest) — on a PR with
-# more than 100 changed files this can drop a critical file straight out of
-# FILES with no signal that anything was skipped. This was the confirmed
-# false-negative mechanism on PR #4611 (#4613): a removed
-# `.github/workflows/gitea-integration.yml` was skipped in one Champion
-# instance's evaluation over a 117-file PR. `--paginate` walks every page of
-# the REST response regardless of file count.
+# --json files` — the latter silently truncates at 100 files with no error,
+# which is the confirmed false-negative mechanism on PR #4611 (see the #4613
+# regression note below for the full incident). `--paginate` walks every page
+# of the REST response regardless of file count.
 #
 # Plain `gh` — NOT "$GH_READ". #4613's lesson is that this criterion must be
 # asserted from a list fetched in THIS pass; a cached answer is the same class
@@ -1040,7 +1035,11 @@ CRITICAL_PATTERNS=(
   "loom-api/Cargo.toml"
   "package.json"
   ".github/workflows/"
-  ".sql"
+  # Deliberately NO bare ".sql" (#9357) — "why doesn't my .sql file hold?":
+  # schema-bearing SQL already matches "migrations/" below, while reference
+  # query SQL nothing executes (defaults/observability/**/*.sql, test
+  # fixtures) matched the bare extension and re-armed this hold on every head
+  # for nothing. Scope future SQL patterns to a schema path, never bare.
   "migrations/"
   "_migration.py"
 )
