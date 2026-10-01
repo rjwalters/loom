@@ -1999,7 +1999,7 @@ mod tests {
             vec![
                 Ok((
                     200,
-                    r#"[{"id": 60, "name": "loomp-loomp-testrun: catalogue", "color": "#00ccdd", "description": "probe-edited"}]"#.into(),
+                    r##"[{"id": 60, "name": "loomp-loomp-testrun: catalogue", "color": "#00ccdd", "description": "probe-edited"}]"##.into(),
                 )),
                 Ok((200, "[]".into())),
             ],
