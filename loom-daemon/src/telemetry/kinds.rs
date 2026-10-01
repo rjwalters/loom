@@ -164,6 +164,9 @@ pub mod eta;
 /// `eta.snapshot` (#9329).
 pub mod eta_snapshot;
 
+/// `session.output` (#9764) — live agent-output chunks.
+pub mod session_output;
+
 // ============================================================================
 // THE REGISTRY
 // ============================================================================
@@ -306,6 +309,17 @@ macro_rules! telemetry_kind_table {
             /// instead. See [`eta_snapshot`].
             EtaSnapshot = "eta.snapshot" => $crate::telemetry::kinds::eta_snapshot::EtaSnapshotRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: NotExported, native: true;
+
+            /// One ≤ 8 KiB chunk of an active agent session's transcript output
+            /// (Issue #9764) — live agent output during a run, correlated to
+            /// its repo/issue/session, exported as a log whose **body** is the
+            /// chunk's text. The second kind carrying free text the daemon did
+            /// not author (after `ci.job.log`, #8825): see the
+            /// `session_output` payload module for why the gateway, not the
+            /// source, scrubs it, and why it pins its own gate (`13`) instead
+            /// of sharing `NEW_KIND_SCHEMA_VERSION`.
+            SessionOutput = "session.output" => $crate::telemetry::kinds::session_output::SessionOutputRecord,
+                gate: 13, otlp: Logs, native: true;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —

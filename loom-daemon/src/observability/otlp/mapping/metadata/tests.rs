@@ -491,3 +491,114 @@ fn story_points_are_exported_numerically_and_absent_when_unsized() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `session.output` (Issue #9764) — the live agent-output chunk kind
+// ---------------------------------------------------------------------------
+
+fn session_output_record(
+    text: &str,
+) -> crate::telemetry::kinds::session_output::SessionOutputRecord {
+    crate::telemetry::kinds::session_output::SessionOutputRecord {
+        repo: Some("rjwalters/loom".into()),
+        visibility: crate::telemetry::RepoVisibility::Private,
+        session_id: "uuid-a".into(),
+        parent_session_id: Some("uuid-parent".into()),
+        runtime: "claude".into(),
+        role: Some("builder".into()),
+        issue: Some(9764),
+        session_kind: Some(crate::telemetry::SessionKind::Sweep),
+        chunk_index: 3,
+        chunk_count: 4,
+        truncated: false,
+        output_bytes_total: 4096,
+        recorded_at: chrono::DateTime::parse_from_rfc3339("2026-09-18T04:00:03Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        text: text.to_string(),
+    }
+}
+
+/// Issue #9764: the chunk's text rides as the log **body** and nowhere else.
+/// A body studded with secret-shaped markers produces a record whose
+/// *attributes* carry none of them — no attribute may be derived from output
+/// text, because the gateway's scrub stage rewrites bodies only (the same
+/// split as `ci.job.log`, #8825). The chunk-protocol attributes and the
+/// source-event timestamp are pinned at the same time.
+#[test]
+fn session_output_carries_text_in_the_body_and_nothing_text_derived_in_attributes() {
+    let secret_body = "ran gh auth login\ntoken: SECRET_TOKEN_VALUE sk-ant-VERYSECRET1234567890\n";
+    let record = session_output_record(secret_body);
+    let log = map(TelemetryRecord::SessionOutput(record));
+
+    use opentelemetry_proto::tonic::common::v1::any_value;
+    let Some(any_value::Value::StringValue(body)) =
+        log.body.as_ref().and_then(|b| b.value.as_ref())
+    else {
+        panic!("session.output body must be a string carrying the chunk's text")
+    };
+    assert_eq!(body, secret_body);
+
+    // The attribute list is exactly the declared vocabulary — an attribute
+    // derived from the text would have to appear here to leak.
+    let mut keys: Vec<&str> = log.attributes.iter().map(|kv| kv.key.as_str()).collect();
+    keys.sort_unstable();
+    let mut declared: Vec<&str> =
+        crate::telemetry::kinds::session_output::SESSION_OUTPUT_LOG_ATTRIBUTE_KEYS.to_vec();
+    declared.sort_unstable();
+    assert_eq!(keys, declared);
+
+    let rendered = serde_json::to_string(
+        &log.attributes
+            .iter()
+            .map(|kv| kv.value.clone())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    for leaked in ["SECRET_TOKEN_VALUE", "VERYSECRET", "gh auth login"] {
+        assert!(!rendered.contains(leaked), "{leaked} leaked into an attribute: {rendered}");
+    }
+
+    // The chunk protocol rides as attributes, marker included.
+    assert_eq!(attribute(&log, "loom.output.chunk_index"), Some(any_value::Value::IntValue(3)));
+    assert_eq!(attribute(&log, "loom.output.chunk_count"), Some(any_value::Value::IntValue(4)));
+    assert_eq!(
+        attribute(&log, "loom.output.truncated"),
+        Some(any_value::Value::BoolValue(false))
+    );
+    assert_eq!(
+        attribute(&log, "loom.output.bytes_total"),
+        Some(any_value::Value::IntValue(4096))
+    );
+
+    // Source-event time, separate from the pipeline's observed time.
+    assert_eq!(log.time_unix_nano, 1_789_704_003_000_000_000);
+    assert!(log.observed_time_unix_nano > log.time_unix_nano, "observed time is poll time");
+}
+
+/// Issue #9764, the #9445 contract again on the live kind: an unresolved
+/// repo is an absent `loom.repo`, never a directory name; an unattributed
+/// session is an absent `loom.issue`, never a guess from output text — and
+/// `session_kind: interactive` is what makes the absence readable.
+#[test]
+fn session_output_omits_unresolved_join_keys_instead_of_fabricating_them() {
+    let mut record = session_output_record("plain output\n");
+    record.repo = None;
+    record.issue = None;
+    record.role = None;
+    record.parent_session_id = None;
+    record.session_kind = Some(crate::telemetry::SessionKind::Interactive);
+    let log = map(TelemetryRecord::SessionOutput(record));
+    for key in [
+        "loom.repo",
+        "loom.issue",
+        "loom.role",
+        "loom.parent_session_id",
+    ] {
+        assert!(attribute(&log, key).is_none(), "{key} must stay absent when unresolved");
+    }
+    assert_eq!(
+        attribute(&log, "loom.session_kind"),
+        Some(any_value::Value::StringValue("interactive".into()))
+    );
+}

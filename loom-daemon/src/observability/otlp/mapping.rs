@@ -58,6 +58,12 @@ fn kv_int(key: &str, value: i64) -> KeyValue {
     )
 }
 
+/// `i64::MAX` on overflow — the same clamp `telemetry::ci` uses for its
+/// `u64` counters on the OTLP wire.
+fn clamp_u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// UNIX-epoch nanoseconds for `ts`, floored at 0 — `chrono`'s
 /// `timestamp_nanos_opt` only returns `None` far outside any timestamp this
 /// daemon ever produces (year ~1677 or ~2262), so the floor is unreachable in
@@ -529,6 +535,55 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 ),
                 attributes,
             )
+        }
+        TelemetryRecord::SessionOutput(r) => {
+            // Issue #9764: one chunk of a live session's transcript output.
+            // The second kind whose body is NOT its event name — it is the
+            // chunk's raw output text, which the gateway's `session.output`-
+            // scoped scrub stage redacts before either sink (the same split
+            // as `ci.job.log`, #8825). Every attribute is an id, count or
+            // allowlisted name; none is derived from the chunk's text.
+            let mut attributes = vec![
+                kv_string("loom.repo.visibility", visibility_str(r.visibility)),
+                kv_string("loom.session_id", r.session_id.clone()),
+                kv_string("loom.runtime", r.runtime.clone()),
+                kv_int("loom.output.chunk_index", i64::from(r.chunk_index)),
+                kv_int("loom.output.chunk_count", i64::from(r.chunk_count)),
+                kv(
+                    "loom.output.truncated",
+                    AnyValue {
+                        value: Some(any_value::Value::BoolValue(r.truncated)),
+                    },
+                ),
+                kv_int("loom.output.bytes_total", clamp_u64_to_i64(r.output_bytes_total)),
+            ];
+            // Optional fields stay absent when unknown — the same
+            // absent-never-zero contract as the `session.summary` arm
+            // (#9445). `loom.repo` in particular is never the directory
+            // name, and `loom.issue` is never guessed from output text.
+            if let Some(repo) = &r.repo {
+                attributes.push(kv_string("loom.repo", repo.clone()));
+            }
+            if let Some(parent) = &r.parent_session_id {
+                attributes.push(kv_string("loom.parent_session_id", parent.clone()));
+            }
+            if let Some(role) = &r.role {
+                attributes.push(kv_string("loom.role", role.clone()));
+            }
+            if let Some(issue) = r.issue {
+                attributes.push(kv_int("loom.issue", i64::from(issue)));
+            }
+            if let Some(kind) = r.session_kind {
+                attributes.push(kv_string("loom.session_kind", kind.as_str().to_string()));
+            }
+            // The record's own source-event instant, not the envelope's
+            // emission time (that rides as observed_time unchanged) — a quiet
+            // run must be distinguishable from a stalled export.
+            time_unix_nano = nanos(r.recorded_at);
+            // The chunk's text IS the body — the gateway's scrub stage
+            // rewrites it, the event name does not (the `ci.job.log` split).
+            body_override = Some(r.text.clone());
+            ("session.output", SeverityNumber::Info, String::new(), attributes)
         }
         TelemetryRecord::DaemonEvent(r) => {
             // Issue #8760 (G4 of #8714): a generic wrapper for four
