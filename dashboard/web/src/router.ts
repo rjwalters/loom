@@ -25,13 +25,15 @@ export type Route =
   | { name: "spend" }
   | { name: "feed" }
   /** The perpetually-updating status board (issue #9077). */
-  | { name: "live" };
+  | { name: "live" }
+  /** Daily YES/NO questions (#9906) — index or one question's detail. */
+  | { name: "questions"; questionId?: string };
 
 export const OVERVIEW: Route = { name: "overview" };
 
 /** Routes that render a self-contained panel owning its own data fetching,
  * rather than a view over the fleet snapshot the app polls (issue #4895). */
-export type PanelRouteName = "charts" | "tokens" | "spend" | "feed" | "live";
+export type PanelRouteName = "charts" | "tokens" | "spend" | "feed" | "live" | "questions";
 
 const PANEL_ROUTES: Readonly<Record<string, PanelRouteName>> = {
   "/charts": "charts",
@@ -39,6 +41,7 @@ const PANEL_ROUTES: Readonly<Record<string, PanelRouteName>> = {
   "/spend": "spend",
   "/feed": "feed",
   "/live": "live",
+  "/questions": "questions",
 };
 
 export function isPanelRoute(route: Route): route is { name: PanelRouteName } {
@@ -53,6 +56,9 @@ export function parseRoute(hash: string): Route {
 
   const panel = PANEL_ROUTES[path];
   if (panel) return { name: panel };
+  // Question detail: #/questions/<id> (the index itself matched above).
+  const question = /^\/questions\/([a-z0-9-]+)$/.exec(path);
+  if (question) return { name: "questions", questionId: decodeURIComponent(question[1] ?? "") };
   if (path === "/queue") return { name: "queue" };
 
   const match = /^\/hosts\/(.+)$/.exec(path);
@@ -69,6 +75,9 @@ export function parseRoute(hash: string): Route {
 
 export function routeToHash(route: Route): string {
   if (route.name === "host") return `#/hosts/${encodeURIComponent(route.hostId)}`;
+  if (route.name === "questions") {
+    return route.questionId ? `#/questions/${encodeURIComponent(route.questionId)}` : "#/questions";
+  }
   if (isPanelRoute(route) || route.name === "queue") return `#/${route.name}`;
   return "#/";
 }

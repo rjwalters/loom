@@ -30,6 +30,7 @@ import { DEFAULT_WINDOW_DAYS, HistoricalChartsPanel } from "./historicalChartsPa
 import { LiveFeedPanel } from "./liveFeedPanel";
 import { LivePanel } from "./livePanel";
 import { SpendPanel } from "./spendPanel";
+import { mountQuestionsPanel } from "./questionsPanel";
 import { currentSurface } from "./analytics/bootstrap";
 import { mountTokenAnalytics } from "./analytics/render";
 import type { PanelRouteName } from "./router";
@@ -42,6 +43,7 @@ export const PANEL_STATUS: Readonly<Record<PanelRouteName, string>> = {
   spend: "Elastic compute spend",
   feed: "Live event feed",
   live: "Live status board",
+  questions: "Questions",
 };
 
 /** A mounted panel's teardown. Panels with no live resource return a no-op. */
@@ -202,6 +204,7 @@ const MOUNTERS: Readonly<Record<PanelRouteName, (root: HTMLElement) => PanelTear
   spend: mountSpend,
   feed: mountFeed,
   live: mountLive,
+  questions: (root) => mountQuestionsPanel(root),
 };
 
 /** Mount `name` into `root`, replacing its contents. Returns the teardown. */

@@ -138,6 +138,15 @@ import {
 } from "./redaction";
 import { parseRetentionConfig, recordRetentionOutcome, runRetentionSweep } from "./retention";
 import {
+  assessAll,
+  assessQuestion,
+  getQuestion,
+  answerHistory,
+  latestAnswer,
+  QUESTIONS,
+  toApiView,
+} from "./questions";
+import {
   validateEnvelope,
   extractRecordFields,
   isPathShapedRepo,
@@ -175,6 +184,11 @@ export interface Env {
    * env, where `/api/version` and the footer fall back to `"unknown"` rather
    * than throwing. */
   BUILD_COMMIT?: string;
+  /** Gemini API key for the daily Questions evaluator (#9906). Server-side
+   * secret only — never exposed to the SPA. Unset: questions render the
+   * last answer and the daily run reports `unconfigured` instead of
+   * fabricating an answer. */
+  GEMINI_API_KEY?: string;
   /** The operator's expected host roster (issue #8792): host IDs separated
    * by commas and/or whitespace — a plain, non-secret `[vars]` entry (or
    * `wrangler deploy --var EXPECTED_HOSTS:...` from the operator's own
@@ -796,6 +810,18 @@ export default {
     if (request.method === "POST" && url.pathname === "/ingest") {
       return handleIngest(request, env);
     }
+    // Manual per-question refresh (#9906): distinguished from the scheduled
+    // daily run via run_kind='manual' so history never conflates them.
+    if (request.method === "POST" && url.pathname.startsWith("/admin/questions/")) {
+      if (!env.ADMIN_TOKEN || request.headers.get("authorization") !== `Bearer ${env.ADMIN_TOKEN}`) {
+        return jsonError(403, "admin token required");
+      }
+      const id = url.pathname.split("/").pop() ?? "";
+      const q = getQuestion(id);
+      if (!q) return jsonError(404, "unknown question");
+      const outcome = await assessQuestion(env.DB, q, new Date(), "manual", env);
+      return Response.json(outcome);
+    }
     if (url.pathname.startsWith("/admin/")) {
       return handleAdmin(request, env, url);
     }
@@ -838,6 +864,24 @@ export default {
     if (request.method === "GET" && url.pathname === "/public/fleet-state") {
       return handleFleetStateQuery(env, /* isAuthenticated */ false);
     }
+    // Collision questions (#9906): the shared daily YES/NO surface.
+    if (request.method === "GET" && url.pathname === "/api/questions") {
+      const views = [];
+      for (const q of QUESTIONS) {
+        const latest = await latestAnswer(env.DB, q.id);
+        const history = await answerHistory(env.DB, q.id);
+        views.push(toApiView(q, latest, history));
+      }
+      return Response.json({ questions: views });
+    }
+    const questionMatch = /^\/api\/questions\/([a-z0-9-]+)$/.exec(url.pathname);
+    if (request.method === "GET" && questionMatch) {
+      const q = getQuestion(questionMatch[1] ?? "");
+      if (!q) return jsonError(404, "unknown question");
+      const latest = await latestAnswer(env.DB, q.id);
+      const history = await answerHistory(env.DB, q.id);
+      return Response.json(toApiView(q, latest, history));
+    }
     if (request.method === "GET" && url.pathname === "/api/history") {
       return handleHistoryQuery(env, url, /* isAuthenticated */ true);
     }
@@ -878,6 +922,20 @@ export default {
   },
 
   async scheduled(_event, env) {
+    // Daily Questions evaluation (#9906): the hourly cron drives a due-check
+    // (assess once per question/day at/after 06:00 UTC) rather than adding a
+    // second cron. Per-question failure isolation: one question's failure
+    // never blocks the others or the retention sweep below.
+    try {
+      const outcomes = await assessAll(env.DB, new Date(), "scheduled", env);
+      for (const o of outcomes) {
+        if (o.status !== "published") {
+          console.log(`questions: ${o.question_id} ${o.status}${o.error ? `: ${o.error}` : ""}`);
+        }
+      }
+    } catch (error) {
+      console.error(`questions assessment failed: ${(error as Error).message}`);
+    }
     const config = parseRetentionConfig(env);
     const result = await runRetentionSweep(env.DB, config);
     // Per-tier breakdown (2AMLogic/2am#1608): `deletedBySize` alone hid the
