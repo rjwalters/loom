@@ -129,7 +129,7 @@ impl ContextCommand {
                 query_policy,
                 adapter: adapter_name,
                 store: store_dir,
-            } => run_fetch(
+            } => run_fetch(FetchParams {
                 issue,
                 repo,
                 title,
@@ -139,8 +139,8 @@ impl ContextCommand {
                 index_id,
                 query_policy,
                 adapter_name,
-                store_dir.as_deref(),
-            ),
+                store_dir,
+            }),
             Self::Status {
                 key,
                 store: store_dir,
@@ -223,7 +223,9 @@ fn open_store(dir: Option<&Path>) -> Result<store::ArtifactStore> {
     }
 }
 
-fn run_fetch(
+/// Grouped `Fetch` args: `run_fetch` took 10 positional params, which clippy's
+/// `too_many_arguments` (default max 7) rejects.
+struct FetchParams {
     issue: Option<u32>,
     repo: String,
     title: Option<String>,
@@ -233,8 +235,22 @@ fn run_fetch(
     index_id: String,
     query_policy: String,
     adapter_name: String,
-    store_dir: Option<&Path>,
-) -> Result<()> {
+    store_dir: Option<PathBuf>,
+}
+
+fn run_fetch(params: FetchParams) -> Result<()> {
+    let FetchParams {
+        issue,
+        repo,
+        title,
+        body_file,
+        requirements_file,
+        source_rev,
+        index_id,
+        query_policy,
+        adapter_name,
+        store_dir,
+    } = params;
     // Resolve title/body: explicit inputs (offline/testable) win; otherwise
     // gh resolves the issue from the forge.
     let (title, body) = match (title, body_file) {
@@ -292,7 +308,7 @@ fn run_fetch(
     };
     input.canonicalize();
 
-    let s = open_store(store_dir)?;
+    let s = open_store(store_dir.as_deref())?;
     let adapter: Box<dyn adapter::RetrievalAdapter> = match adapter_name.as_str() {
         "fake" => Box::new(adapter::FakeAdapter::default()),
         "augment" => Box::new(adapter::AugmentAdapter::from_env()),

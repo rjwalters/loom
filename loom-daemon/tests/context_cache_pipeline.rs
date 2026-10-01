@@ -165,7 +165,7 @@ fn context_augment_adapter_reports_unavailable_cleanly() {
             "--repo",
             "o/r",
             "--source-rev",
-            &source_rev(),
+            source_rev(),
             "--index-id",
             "i",
             "--query-policy",
@@ -199,7 +199,7 @@ fn context_export_import_replay_roundtrip() {
             "--repo",
             "o/r",
             "--source-rev",
-            &source_rev(),
+            source_rev(),
             "--index-id",
             "i",
             "--query-policy",
@@ -251,13 +251,10 @@ fn context_export_import_replay_roundtrip() {
     let replayed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("replay prints valid JSON");
     assert_eq!(replayed["key"], serde_json::json!(key));
-    assert!(
-        replayed["session"]["raw_responses"]
-            .as_array()
-            .unwrap()
-            .len()
-            >= 1
-    );
+    assert!(!replayed["session"]["raw_responses"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     env.drop();
 }
