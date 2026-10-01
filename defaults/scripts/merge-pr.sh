@@ -891,7 +891,7 @@ The operator running this merge explicitly asserted responsibility for this over
 
 ---
 *Recorded by merge-pr.sh at $(date -u +%Y-%m-%dT%H:%M:%SZ)*"
-      if forge_gh_comment_rl_safe "$REPO_NWO" "$PR_NUMBER" "$override_comment" 2>/dev/null; then _LOOM_PR_OVERRIDE_COMMENTED=true; else warning "Could not post loom:pr override audit comment on PR #$PR_NUMBER (merge proceeds anyway; the warning above is still the log record)"; fi
+      if forge_gh_comment_rl_safe "$REPO_NWO" "$PR_NUMBER" "$override_comment" pull 2>/dev/null; then _LOOM_PR_OVERRIDE_COMMENTED=true; else warning "Could not post loom:pr override audit comment on PR #$PR_NUMBER (merge proceeds anyway; the warning above is still the log record)"; fi
     fi
     return 0
   fi
@@ -1724,7 +1724,7 @@ _reconcile_one_stacked_child() {
       # forge_gh_comment_rl_safe (#4856): the REST comments endpoint is shared
       # by issues and PRs, so the same helper covers this `gh pr comment` call
       # site's GraphQL rate-limit fallback.
-      forge_gh_comment_rl_safe "$REPO_NWO" "$child_pr" "$comment" 2>/dev/null || \
+      forge_gh_comment_rl_safe "$REPO_NWO" "$child_pr" "$comment" pull 2>/dev/null || \
         warning "Could not post deferred-reconciliation comment on PR #$child_pr"
       ;;
     "LOOM-RECONCILE-CHILD reconcile")

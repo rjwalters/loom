@@ -254,6 +254,16 @@ fi
 # refusal leaves this a report-only MISMATCH.
 WRITE_REPO="$(source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}" 2>"$GH_STDERR")" || { emit "MISMATCH" "$REASON; --apply refused: loom-daemon forge may-write: $(tr '\n' ' ' <"$GH_STDERR")"; exit 11; }
 
+# post_issue_comment <body> — both of this script's comment writes go through
+# the ONE shell comment transport (forge_gh_comment_rl_safe, #9774) instead of a
+# bare `gh issue comment` each, so both carry the dashboard footer and the
+# GraphQL-rate-limit REST fallback. Subshell for the same `set -e` reason as the
+# capture above.
+post_issue_comment() {
+  (source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh" \
+    && forge_gh_comment_rl_safe "$WRITE_REPO" "$ISSUE" "$1" issues)
+}
+
 # Recover the tier from the "**Goal Alignment**: [Tier N] ..." line Step 3b's
 # template writes into the verdict comment. Heuristic on purpose — this is
 # reading prose an earlier Champion pass wrote, not a machine-parseable
@@ -284,7 +294,7 @@ if [[ -z "$TIER" ]]; then
     exit 0
   fi
 
-  gh issue comment "$ISSUE" --repo "$WRITE_REPO" --body "<!-- champion:promotion-landed-mismatch -->
+  post_issue_comment "<!-- champion:promotion-landed-mismatch -->
 **Champion: Promotion write did not land — escalating**
 
 This issue carries a \`Champion Review: APPROVED\` verdict comment, but \`loom:issue\` was never applied — the label write that was supposed to accompany that verdict silently did not land (#6862). This reconciliation pass could not recover which tier (\`tier:goal-advancing\` / \`tier:goal-supporting\` / \`tier:maintenance\`) the original verdict assigned from its own comment text, so it is routing to an operator to complete the promotion manually rather than guessing.
@@ -322,7 +332,7 @@ if ! jq -e '.labels[] | select(.name=="loom:issue")' <<<"$VERIFY_JSON" >/dev/nul
   exit 13
 fi
 
-gh issue comment "$ISSUE" --repo "$WRITE_REPO" --body "<!-- champion:promotion-landed-completed -->
+post_issue_comment "<!-- champion:promotion-landed-completed -->
 **Champion: Promotion completed — reconciled a missing label write**
 
 This issue carried a \`Champion Review: APPROVED\` verdict comment, but \`loom:issue\` had never been applied — the label write that was supposed to accompany that verdict silently did not land (#6862). This reconciliation pass recovered \`$TIER\` from the original verdict's \"Goal Alignment\" line, applied \`loom:issue\` + \`$TIER\`, and confirmed both are present via a read-back.

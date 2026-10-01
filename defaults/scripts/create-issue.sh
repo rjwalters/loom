@@ -425,6 +425,17 @@ fi
 # Release on every exit path, including a failed create or an interrupt.
 trap 'loom_filing_lock_release' EXIT INT TERM
 
-if ! forge_gh_create_issue_rl_safe "$REPO_NWO" "$TITLE" "$BODY" "${LABELS[@]+"${LABELS[@]}"}"; then
+if ! _CREATE_OUT="$(forge_gh_create_issue_rl_safe "$REPO_NWO" "$TITLE" "$BODY" "${LABELS[@]+"${LABELS[@]}"}")"; then
+  [[ -z "$_CREATE_OUT" ]] || printf '%s\n' "$_CREATE_OUT"
   exit 1
 fi
+printf '%s\n' "$_CREATE_OUT"
+
+# --- Dashboard footer on the created body (#9774) ----------------------------
+#
+# One extra REST call, AFTER the create: the link needs the issue number, which
+# does not exist until the issue does. Best effort by contract —
+# `loom_dashboard_patch_body` reports a failure on stderr and still returns 0,
+# because a missing footer is cosmetic while a non-zero exit here would tell the
+# caller nothing was filed and invite a duplicate filing.
+loom_dashboard_patch_created "$(printf '%s' "$_CREATE_OUT" | tail -n1)" issues "$BODY"

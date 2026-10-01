@@ -720,9 +720,11 @@ EOF
     comment_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
     # #9548: vet the repo (forge-helpers.sh in a subshell: it sets -e), and
     # name it; a refusal is logged as a failed breadcrumb like any other.
+    # #9774: the POST itself goes through the shared transport, so the
+    # breadcrumb carries the dashboard footer and the rate-limit REST fallback.
     local comment_repo=""
     if comment_repo="$(source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}" 2>&1)"; then
-        comment_err=$(gh issue comment "$issue_num" --repo "$comment_repo" --body "$body" 2>&1) || rc=$?
+        comment_err=$( (source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh" && forge_gh_comment_rl_safe "$comment_repo" "$issue_num" "$body" issues) 2>&1) || rc=$?
     else
         rc=1; comment_err="loom-daemon forge may-write refused the repo (#9548): $comment_repo"
     fi

@@ -94,8 +94,14 @@ trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 #   gh api repos/{owner}/{repo}/issues/<N>/comments --paginate
 #                                           -> cat $STUB_DIR/comments-<N>.json (or "[]")
 #                                              (fails if comments-fail-<N> exists)
-#   gh pr comment <N> --body <b>            -> append to $STUB_DIR/comment-writes.log
+#   gh issue comment <N> --body <b>         -> append to $STUB_DIR/comment-writes.log
 #                                              (fails if comment-fail-<N> exists)
+#                                              `issue`, not `pr`: since #9774 the
+#                                              guard's two comment writes go through
+#                                              forge_gh_comment_rl_safe, the one shell
+#                                              comment transport, whose primary rung is
+#                                              `gh issue comment` (GitHub's comments
+#                                              endpoint is shared by issues and PRs).
 #   gh pr edit <N> ...                      -> append to $STUB_DIR/edit-writes.log
 #                                              (fails if edit-fail-<N> exists)
 #   gh api graphql -f query=... -F ...      -> append to $STUB_DIR/graphql-writes.log
@@ -111,7 +117,7 @@ cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
 case "$1" in
-  pr)
+  issue | pr)
     case "$2" in
       view)
         pr_num="$3"
@@ -148,7 +154,7 @@ case "$1" in
         exit 0
         ;;
     esac
-    echo "stub gh: unhandled pr args: $*" >&2
+    echo "stub gh: unhandled $1 args: $*" >&2
     exit 3
     ;;
   api)

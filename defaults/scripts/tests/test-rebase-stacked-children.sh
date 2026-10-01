@@ -107,6 +107,18 @@ ok()   { echo "OK: $*"; }
 info() { echo "INFO: $*"; }
 warn() { echo "WARN: $*" >&2; }
 
+# The comment transport, stood in by its PRIMARY RUNG only (#9774). The real
+# forge_gh_comment_rl_safe lives in lib/forge-helpers.sh — outside the extracted
+# span below — and begins with the #9548 write-scope vet, which wants a real
+# loom-daemon and a real checkout that this deliberately hermetic suite (stub
+# `gh`, stub `git`, no repo) does not provide. What this suite is about is that a
+# live-claim child gets a deferral comment on its own PR at the right repo, which
+# is exactly what `gh issue comment` records here. The transport's own
+# behaviour — the dashboard footer, the GraphQL-rate-limit REST fallback — is its
+# own subject, pinned in test-dashboard-link.sh and
+# test-forge-helpers-rate-limit-fallback.sh.
+forge_gh_comment_rl_safe() { gh issue comment "$2" --repo "$1" --body "$3"; }
+
 # --- Extract the functions under test from rebase-stacked-children.sh ---
 # From `run() {` up to (not including) the `# ---- main ----` sentinel. This span
 # holds run(), _process_one_stacked_child(), and _rebase_stacked_children().
@@ -143,7 +155,7 @@ source "$HELPERS_DIR/lib/default-branch.sh"
 # --- Stub gh on PATH ---
 #   gh api repos/OWNER/REPO/issues/N   -> cat $STUB_DIR/issue-N.json (or {})
 #   gh pr list --base B ...            -> cat $STUB_DIR/prlist-<sanitized B>.json (or [])
-#   gh pr comment N ...                -> record to $STUB_DIR/gh-calls.log
+#   gh issue|pr comment N ...          -> record to $STUB_DIR/gh-calls.log
 cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
@@ -170,7 +182,10 @@ if [[ "$1" == "pr" && "$2" == "list" ]]; then
   exit 0
 fi
 
-if [[ "$1" == "pr" && "$2" == "comment" ]]; then
+# `issue` as well as `pr`: since #9774 the deferral notice is posted through
+# forge_gh_comment_rl_safe, the one shell comment transport, whose primary rung
+# is `gh issue comment` (GitHub's comments endpoint is shared by both).
+if [[ ("$1" == "pr" || "$1" == "issue") && "$2" == "comment" ]]; then
   echo "$*" >> "$LOG"
   exit 0
 fi
@@ -344,7 +359,7 @@ write_prlist "feature/issue-100" '[{"number":502,"headRefName":"feature/issue-20
 clear_uptodate "feature/issue-202"   # stale
 _rebase_stacked_children "feature/issue-100"
 assert_not_contains "$(read_git)" "rebase" "(d) Unsafe stale child -> rebase NOT attempted"
-assert_contains "$(read_gh)" "pr comment 502 --repo owner/repo" \
+assert_contains "$(read_gh)" "issue comment 502 --repo owner/repo" \
   "(d) Unsafe stale child -> deferred-rebase comment posted on PR #502"
 
 # (e) Non-feature/issue-N parent branch -> script skips entirely (no discovery).

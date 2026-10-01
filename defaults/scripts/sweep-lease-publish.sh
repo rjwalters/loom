@@ -522,6 +522,15 @@ cmd_publish() {
     # gh expands from an `upstream` remote in preference to `origin`.
     local post_out write_repo
     write_repo="$(source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { echo "ERROR: not publishing a lease on issue #${issue}: loom-daemon forge may-write refused the repo (#9548)" >&2; exit 2; }
+    # #9774: the dashboard footer, from the same helper the comment transport and
+    # `loom-daemon forge comment` use. Applied to the body here rather than by
+    # routing this POST through forge_gh_comment_rl_safe, because this call
+    # CONSUMES its response (the comment id below) and the transport returns
+    # none. The lease-record format contract is unaffected: it pins the marker as
+    # the LITERAL FIRST line and declares everything after it free-form prose.
+    # shellcheck source=lib/dashboard-link.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/lib/dashboard-link.sh"
+    lease_body="$(loom_dashboard_footer "$write_repo" "$issue" issues "$lease_body")"
     if ! post_out="$(printf '%s' "$lease_body" \
         | gh api --method POST "repos/${write_repo}/issues/${issue}/comments" -F body=@- 2>&1)"; then
         echo "ERROR: failed to publish lease comment on issue #${issue}: ${post_out}" >&2

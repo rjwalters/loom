@@ -294,6 +294,18 @@ done
 WRITE_REPO="" WRITE_BLOCK=""
 if [[ "$CLEAR" -eq 1 || "$ANCHOR" -eq 1 ]] && ! WRITE_REPO="$(source "$(dirname "${BASH_SOURCE[0]:-$0}")/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}" 2>&1)"; then WRITE_BLOCK="loom-daemon forge may-write: $(printf '%s' "$WRITE_REPO" | tr '\n' ' ')"; WRITE_REPO=""; CLEAR=0; ANCHOR=0; fi
 
+# post_pr_comment <body> — this script's two comment writes (the anchor and the
+# stale-clear announcement) go through the ONE shell comment transport
+# (forge_gh_comment_rl_safe, #9774) rather than a bare `gh pr comment` each, so
+# both get the dashboard footer and the GraphQL-rate-limit REST fallback without
+# either call site remembering to ask. Same subshell containment as the
+# loom_write_repo capture above, for the same `set -e` reason; `pull` is what
+# makes the footer link say `/pull/N`.
+post_pr_comment() {
+  (source "$(dirname "${BASH_SOURCE[0]:-$0}")/lib/forge-helpers.sh" \
+    && forge_gh_comment_rl_safe "$WRITE_REPO" "$PR" "$1" pull)
+}
+
 # The two terminal verdict labels and the marker `verdict=` token each one is
 # recorded under. Kept as parallel lookups rather than one map so this stays
 # POSIX-ish bash 3.2 compatible (macOS ships bash 3.2 — no associative arrays).
@@ -494,7 +506,7 @@ if [[ -z "$MARKER_SHA" ]]; then
       exit 11
     fi
 
-    gh pr comment "$PR" --repo "$WRITE_REPO" --body "<!-- loom:verdict-sha sha=$HEAD_SHA verdict=$VERDICT_TOKEN -->
+    post_pr_comment "<!-- loom:verdict-sha sha=$HEAD_SHA verdict=$VERDICT_TOKEN -->
 **Verdict anchored to the current head — no marker had been recorded**
 
 This PR carries \`$VERDICT_LABEL\`, but no verdict-SHA marker was ever written for that verdict, so it was **unverifiable**: nothing could tell whether it still described the tree in front of it, and it would have survived a force-push undetected — the exact pre-#5686 hazard.
@@ -595,7 +607,7 @@ if [[ "$CLEAR" -eq 1 ]]; then
       <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
 
     if [[ "${ALREADY_ANNOUNCED:-0}" -eq 0 ]]; then
-      gh pr comment "$PR" --repo "$WRITE_REPO" --body "$STALE_MARKER
+      post_pr_comment "$STALE_MARKER
 **Stale review verdict cleared — head SHA moved**
 
 This PR's \`$VERDICT_LABEL\` verdict was rendered against \`$MARKER_SHA\`, but the current head is \`$HEAD_SHA\`. A review verdict is a statement about a specific tree, so it does not survive a rebase, a force-push, or new commits.

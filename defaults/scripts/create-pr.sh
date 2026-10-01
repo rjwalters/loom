@@ -392,9 +392,20 @@ for _label in "${LABELS[@]+"${LABELS[@]}"}"; do
   CREATE_ARGS+=(--label "$_label")
 done
 
-if ! forge_gh_perm_safe "${CREATE_ARGS[@]}"; then
+if ! _CREATE_OUT="$(forge_gh_perm_safe "${CREATE_ARGS[@]}")"; then
+  [[ -z "$_CREATE_OUT" ]] || printf '%s\n' "$_CREATE_OUT"
   echo "create-pr.sh: could not open a PR for $HEAD_BRANCH. If the commits are \
 pushed, do NOT rebuild — re-run this script (it adopts an existing PR) or open \
 the PR by hand from that branch." >&2
   exit 1
 fi
+printf '%s\n' "$_CREATE_OUT"
+
+# --- Dashboard footer on the created body (#9774) ----------------------------
+#
+# One extra REST call, AFTER the create: the link needs the PR number, which
+# does not exist until the PR does — which is also why this cannot move into the
+# body composition above. Best effort by contract: `loom_dashboard_patch_body`
+# reports a failure on stderr and still returns 0, because a missing footer is
+# cosmetic while a non-zero exit here would tell the caller no PR was opened.
+loom_dashboard_patch_created "$(printf '%s' "$_CREATE_OUT" | tail -n1)" pull "$BODY"

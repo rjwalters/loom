@@ -44,6 +44,8 @@ set -euo pipefail
 _LOOM_FORGE_HELPERS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck source=./config-resolver.sh
 source "$_LOOM_FORGE_HELPERS_LIB_DIR/config-resolver.sh"
+# shellcheck source=./dashboard-link.sh
+source "$_LOOM_FORGE_HELPERS_LIB_DIR/dashboard-link.sh"  # #9774 footer bytes
 
 # --- Forge Detection ---
 
@@ -58,13 +60,16 @@ _GITEA_USERNAME=""
 # via `git rev-parse --git-common-dir` (parent of the common .git dir — works
 # identically from the main checkout or any linked worktree) > "." as a last
 # resort when git itself is unavailable (e.g. not inside a git repo).
+#
+# The two env tiers are tested as one expression, and the precedence lives in
+# the `${REPO_ROOT:-$WORKSPACE_ROOT}` expansion rather than in two sequential
+# `if` blocks: this file is frozen in scripts/file-size-baseline.txt, so #9774's
+# footer hook below is paid for by an equal, behaviour-preserving reduction
+# here. An unset OR empty REPO_ROOT falls through to WORKSPACE_ROOT exactly as
+# the two-block form did.
 _forge_config_root() {
-  if [[ -n "${REPO_ROOT:-}" ]]; then
-    echo "$REPO_ROOT"
-    return 0
-  fi
-  if [[ -n "${WORKSPACE_ROOT:-}" ]]; then
-    echo "$WORKSPACE_ROOT"
+  if [[ -n "${REPO_ROOT:-}" || -n "${WORKSPACE_ROOT:-}" ]]; then
+    echo "${REPO_ROOT:-$WORKSPACE_ROOT}"
     return 0
   fi
 
@@ -1443,11 +1448,22 @@ forge_gh_repo_safe() {
 # REST endpoint (`repos/{nwo}/issues/{n}/comments`) is shared by issues and
 # PRs on GitHub (a PR IS an issue for labels/comments/state), so one function
 # safely serves both `gh issue comment` and `gh pr comment` call sites.
-# Usage: forge_gh_comment_rl_safe NWO NUMBER BODY
+# Usage: forge_gh_comment_rl_safe NWO NUMBER BODY [KIND]
+# KIND is `pull` when NUMBER names a pull request and selects `/pull/N` over
+# `/issues/N` in the dashboard footer below; it changes nothing about the POST
+# (one endpoint serves both). Defaults to `issues`.
 # Returns 0 on success (either path), 1 on failure (message on stderr).
+#
+# THE DASHBOARD FOOTER IS APPENDED HERE (#9774), at the transport, not at the
+# ~ten call sites: this is the shell counterpart of loom_daemon::forge_comment's
+# chokepoint, so no script can post a comment WITHOUT the link, and the
+# `$'\n'` restores the single trailing newline `$(...)` strips so the posted
+# bytes match `loom-daemon forge comment`'s exactly. Idempotent on the marker,
+# so a re-posted body is not double-linked.
 forge_gh_comment_rl_safe() {
-  local nwo="$1" number="$2" body="$3"
+  local nwo="$1" number="$2" body="$3" kind="${4:-issues}"
   local out; nwo="$(loom_write_repo "$nwo")" || return 1  # #9548
+  body="$(loom_dashboard_footer "$nwo" "$number" "$kind" "$body")"$'\n'
   if out=$(forge_gh_perm_safe issue comment "$number" --repo "$nwo" --body "$body" 2>&1); then
     return 0
   fi

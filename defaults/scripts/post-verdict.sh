@@ -76,20 +76,20 @@
 #       cite every blocking review id it named. Ignored for
 #       `changes-requested` (the gate only guards approvals).
 #
-# Output: whatever `gh pr comment` prints on success (the comment URL) —
-# unchanged, so a caller parsing that output needs no change.
+# Output: nothing on success. Since #9774 the verdict is posted through the
+# shared shell transport, which captures gh's comment URL rather than echoing it.
 #
 # Exit codes:
 #   0 - comment posted
-#   1 - the `gh pr comment` call failed
+#   1 - the comment POST failed (both transport rungs)
 #   2 - invalid arguments (bad PR number, verdict token, or SHA; missing body)
 #   3 - approval refused by the formal-review reconciliation gate (#7647)
 #   4 - refused: the PR's repo is not one this installation may write to
 #       (loom_write_repo, lib/forge-helpers.sh, #9548); nothing was posted
 #
-# NOTE: GitHub-specific (uses `gh pr comment`), like create-pr.sh /
-# merge-pr.sh. On a Gitea forge, post the equivalent comment via that forge's
-# own CLI and append the identical marker by hand.
+# NOTE: GitHub-specific (the shell comment transport is `gh`-backed), like
+# create-pr.sh / merge-pr.sh. On a Gitea forge, post the equivalent comment via
+# that forge's own CLI and append the identical marker by hand.
 
 set -uo pipefail
 
@@ -350,4 +350,10 @@ FULL_BODY="$FULL_BODY
 # verdict onto another project's PR with the same number. forge-helpers.sh is
 # sourced inside the command substitution because it turns on `set -e`.
 REPO="$(source "$SCRIPT_DIR/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { echo "post-verdict.sh: not posting the verdict on PR #$PR: loom-daemon forge may-write refused the repo (#9548)" >&2; exit 4; }
-gh pr comment "$PR" --repo "$REPO" --body "$FULL_BODY"
+
+# #9774: the POST goes through the shared transport (forge_gh_comment_rl_safe),
+# not a second hand-rolled `gh pr comment` — that is what gets the verdict the
+# dashboard footer, and the GraphQL-rate-limit REST fallback, for free. The
+# subshell is the same `set -e` containment the loom_write_repo call above uses;
+# `pull` makes the footer's link say `/pull/N`.
+(source "$SCRIPT_DIR/lib/forge-helpers.sh" && forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" pull)

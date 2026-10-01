@@ -86,8 +86,13 @@ STUB_DIR="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 
 # --- Stub gh on PATH ---------------------------------------------------
-#   gh pr comment <N> --body <b>  -> append "<N>\t<b>" to comment-writes.log
-#                                    (fails if comment-fail-<N> exists)
+#   gh issue comment <N> --body <b>  -> record <N> and <b>
+#                                       (fails if comment-fail-<N> exists)
+#
+# `issue comment`, not `pr comment`: since #9774 the verdict is posted through
+# forge_gh_comment_rl_safe (lib/forge-helpers.sh), the ONE shell comment
+# transport, whose primary rung is `gh issue comment` -- GitHub's comments
+# endpoint is shared by issues and PRs, so one verb serves both.
 cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
@@ -113,7 +118,7 @@ if [[ "$1" == "repo" && "$2" == "view" ]]; then
   exit 0
 fi
 
-if [[ "$1" == "pr" && "$2" == "comment" ]]; then
+if [[ ("$1" == "pr" || "$1" == "issue") && "$2" == "comment" ]]; then
   pr_num="$3"
   body=""
   args=("$@")

@@ -432,8 +432,27 @@ fi
 # subshell because it sets -e. A refusal is reported, never retried here.
 WRITE_BASE="repos/$(source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh" && loom_write_repo "${REPO_ARG:-${LOOM_REPO:-}}")" || { _emit_evaluation "STANDDOWN_ACTION" "refused-write-scope (loom-daemon forge may-write)"; exit 0; }
 
+# #9774: the dashboard footer, from the same helper
+# `forge_gh_comment_rl_safe`/`loom-daemon forge comment` use, so this comment
+# links to its own fleet view like every other Loom-authored comment. Applied to
+# $BODY rather than inside a transport call because BOTH writes below need it and
+# only one of them is a POST — the bump PATCHes an existing comment's body, which
+# no comment transport covers. Idempotent on the marker, so re-running cannot
+# accumulate links.
+#
+# `issues` for the link's path: this script takes a bare --number and serves
+# issue claims (loom:building) and PR claims (loom:treating) through the one
+# shared comments endpoint, so it genuinely does not know which it has — and
+# loom-ui resolves /issues/N and /pull/N to the same page (they share one number
+# sequence), so the default is correct rather than merely harmless.
+# shellcheck source=lib/dashboard-link.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/dashboard-link.sh"
+BODY="$(loom_dashboard_footer "${WRITE_BASE#repos/}" "$NUMBER" issues "$BODY")"
+
 # `--input -` with a jq-built payload, never `-f body=@...`: `@` prefixes are
-# read as file references by gh (see comment-body-literal-path.md).
+# read as file references by gh (see comment-body-literal-path.md). This is the
+# documented reason these two writes keep their own encoder instead of routing
+# through forge_gh_comment_rl_safe, whose REST rung is `-f body=…`.
 if [[ -n "$STANDDOWN_COMMENT_ID" ]]; then
     if jq -n --arg b "$BODY" '{body: $b}' |
         gh api --method PATCH "$WRITE_BASE/issues/comments/$STANDDOWN_COMMENT_ID" --input - >/dev/null 2>&1; then

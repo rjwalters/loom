@@ -146,10 +146,13 @@ GH_MODE_FILE="$STUB_DIR/mode.txt"
 # the #5047 tests can assert labels ride along in the SAME POST as the title
 # and body (atomic create+label, not create-then-label).
 API_STDIN_LOG="$STUB_DIR/api-stdin.json"
+# The same, for the post-create dashboard-footer body PATCH (#9774) — a second
+# `--input -` call that would otherwise overwrite the create's payload above.
+API_PATCH_LOG="$STUB_DIR/api-patch-stdin.json"
 # The stub script below runs as a separate process, so these must be
 # exported for it to see them (a plain `VAR=x cmd` prefix only exports for
 # the immediate command, not variables set earlier in this shell).
-export ARGV_LOG GH_MODE_FILE API_STDIN_LOG
+export ARGV_LOG GH_MODE_FILE API_STDIN_LOG API_PATCH_LOG
 
 # A `gh` stub whose behavior is driven by $GH_MODE_FILE:
 #   "ok"          - the primary (non-`api`) mutation succeeds immediately.
@@ -168,7 +171,15 @@ if [[ "$1" == "api" ]]; then
   # never unconditionally -- an unconditional `cat` would block on the
   # inherited terminal for the label/comment fallbacks that use -f/-F.
   if [[ "$*" == *"--input -"* ]]; then
-    cat > "$API_STDIN_LOG"
+    # #9774: create-issue.sh makes a SECOND `--input -` call after a successful
+    # create — the best-effort dashboard-footer body PATCH. Recorded separately
+    # so the create's payload assertions keep pointing at the create, and the
+    # footer can be asserted on its own.
+    if [[ "$*" == *"--method PATCH"* ]]; then
+      cat > "$API_PATCH_LOG"
+    else
+      cat > "$API_STDIN_LOG"
+    fi
   fi
   if [[ "$mode" == "ratelimited" ]]; then
     # POST .../issues --jq .html_url returns the new issue's URL (#5047).
@@ -203,6 +214,7 @@ _run_stubbed() {
     echo "$mode" > "$GH_MODE_FILE"
     : > "$ARGV_LOG"
     : > "$API_STDIN_LOG"
+    : > "$API_PATCH_LOG"
     PATH="$STUB_DIR:$PATH" "$@"
 }
 
@@ -402,6 +414,21 @@ if [[ "$(jq -r '.body' "$API_STDIN_LOG")" == *"A body read from a file."* ]]; th
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "  ${RED}FAIL${NC}: create-issue.sh --body-file must send file contents, not the literal path"
+fi
+
+# #9774: the created body ends with the dashboard footer — a SECOND, best-effort
+# REST call made only after the create returned a URL (the link needs the number,
+# which does not exist before then). `issues/1234` from the stub's URL above.
+patched_body="$(jq -r '.body' "$API_PATCH_LOG" 2>/dev/null || true)"
+assert_eq "<!-- loom:dashboard-link -->" "$(printf '%s' "$patched_body" | tail -n1)" \
+    "create-issue.sh: the created body is PATCHed to end with the dashboard marker"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$patched_body" == *"A body read from a file."*"[loom dashboard](https://dashboard.2amlogic.com/github.com/o/r/issues/1234)"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: create-issue.sh footer keeps the original body and links the new issue"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: create-issue.sh footer must append to the created body, linking /issues/N: $patched_body"
 fi
 
 rc=0

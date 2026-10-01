@@ -92,7 +92,16 @@ ALLOWED_HOST_SUFFIXES=(
   percy.io
   ghcr.io clickhouse.com signoz.io opentelemetry.io
   # Package/source origins the fleet bootstrap plan fetches from (#7814).
-  tailscale.com
+  # `2amlogic.com` is the loom-ui dashboard's public origin, added with the
+  # dashboard-link footer (#9772/#9774). It is a PRODUCT DEFAULT, not an
+  # operator-specific value: `loom_daemon::forge_comment` compiles it in as
+  # `DEFAULT_DASHBOARD_BASE_URL` and every comment/body footer links to it, with
+  # `$LOOM_DASHBOARD_URL` as the per-repo override — so a fork pointing at its
+  # own dashboard sets one env var rather than editing vendored files. The
+  # shell twin under defaults/ (lib/dashboard-link.sh) must produce the same
+  # bytes as the Rust original, which is why the string is here and not only in
+  # unscanned daemon code. Folded onto this line to keep the shell budget flat.
+  tailscale.com 2amlogic.com
   sf.net
 )
 

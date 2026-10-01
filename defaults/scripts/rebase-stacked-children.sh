@@ -208,7 +208,11 @@ Parent branch \`$parent_branch\` advanced (amended/pushed) after this child bran
 
 ---
 *Deferred by rebase-stacked-children.sh (#3747) at $ts*"
-        if ! run gh pr comment "$child_pr" --repo "$REPO_NWO" --body "$comment"; then
+        # #9774: through the one shell comment transport (this script already
+        # sources lib/forge-helpers.sh at the top level), so the deferral notice
+        # carries the dashboard footer. `run` forwards a shell function as
+        # happily as a binary, so --dry-run still only prints.
+        if ! run forge_gh_comment_rl_safe "$REPO_NWO" "$child_pr" "$comment" pull; then
             warn "Could not post deferred-rebase comment on PR #$child_pr"
         fi
         return 0
