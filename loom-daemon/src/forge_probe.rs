@@ -586,11 +586,11 @@ mod tests {
             if !q.script.is_empty() {
                 let answer = q.script.remove(0);
                 q.last = Some(answer.clone());
-                return Ok(answer);
+                return answer;
             }
             // Repeat the last answer for calls beyond the script.
             match q.last.clone() {
-                Some(a) => Ok(a),
+                Some(a) => a,
                 None => Err(format!("fake: scripted queue exhausted for {path}")),
             }
         }
