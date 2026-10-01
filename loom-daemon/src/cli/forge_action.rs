@@ -419,9 +419,10 @@ pub(crate) enum ForgeAction {
     /// only, like every daemon comment path (`gh` REST).
     #[command(name = "comment")]
     Comment {
-        /// Issue or PR number to comment on.
+        /// Issue or PR number to comment on (post path; omit when
+        /// `--patch-created` is given).
         #[arg(value_name = "NUMBER")]
-        number: u64,
+        number: Option<u64>,
 
         /// Target `owner/repo`; omitted resolves from the origin remote.
         #[arg(long, value_name = "OWNER/REPO")]
@@ -440,6 +441,14 @@ pub(crate) enum ForgeAction {
         /// The number names a pull request (link says `/pull/N`).
         #[arg(long)]
         pr: bool,
+
+        /// Don't post: append the footer to this CREATED object's existing
+        /// body instead (idempotent) — the post-create step
+        /// create-issue.sh / create-pr.sh run right after a successful
+        /// create, when the number exists only inside the URL. Mutually
+        /// exclusive with NUMBER.
+        #[arg(long, value_name = "URL|OWNER/REPO#N", conflicts_with = "number")]
+        patch_created: Option<String>,
     },
 
     /// `forge dashboard-link <owner/repo> <number> [--pr]` — print the exact
@@ -523,6 +532,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             body,
             body_file,
             pr,
+            patch_created,
         } => {
             return loom_daemon::forge_comment::cli_entrypoint(
                 loom_daemon::forge_comment::CommentArgs {
@@ -531,6 +541,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                     body,
                     body_file,
                     is_pr: pr,
+                    patch_created,
                 },
             );
         }

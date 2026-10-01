@@ -226,7 +226,8 @@ pub fn parse_issue_ref(issue_ref: &str) -> Option<(Option<String>, u64)> {
 
 /// Arguments for the `forge comment` verb ([`cli_entrypoint`]).
 pub struct CommentArgs {
-    pub number: u64,
+    /// Issue/PR number for the post path; `None` when `patch_created` is set.
+    pub number: Option<u64>,
     /// `owner/repo`; `None` resolves from the current checkout's origin remote.
     pub repo: Option<String>,
     pub body: Option<String>,
@@ -234,6 +235,12 @@ pub struct CommentArgs {
     pub body_file: Option<std::path::PathBuf>,
     /// The number names a pull request (link says `/pull/N`).
     pub is_pr: bool,
+    /// `--patch-created <URL|owner/repo#N>`: instead of posting a new comment,
+    /// append the footer to the CREATED object's existing body (idempotent) —
+    /// the post-create step for create-issue.sh / create-pr.sh (#9774), where
+    /// the number exists only after the create. Best-effort by contract: the
+    /// caller warns and moves on when this fails.
+    pub patch_created: Option<String>,
 }
 
 /// The `loom-daemon forge comment` verb (#9772): the same chokepoint the
@@ -245,6 +252,12 @@ pub struct CommentArgs {
 /// When the body is missing or double-specified, the repo cannot be
 /// resolved, or the POST fails.
 pub fn cli_entrypoint(args: CommentArgs) -> anyhow::Result<()> {
+    if let Some(created_ref) = &args.patch_created {
+        return patch_created_entrypoint(created_ref);
+    }
+    let number = args.number.ok_or_else(|| {
+        anyhow::anyhow!("a NUMBER is required (or --patch-created <URL|owner/repo#N>)")
+    })?;
     let body = match (&args.body, &args.body_file) {
         (Some(text), None) => text.clone(),
         (None, Some(path)) => {
@@ -281,7 +294,7 @@ pub fn cli_entrypoint(args: CommentArgs) -> anyhow::Result<()> {
         crate::forge_cmd::gh_bin(),
         Some(Path::new(".")),
         &nwo,
-        args.number,
+        number,
         args.is_pr,
         &body,
     )
@@ -300,6 +313,105 @@ pub fn cli_entrypoint(args: CommentArgs) -> anyhow::Result<()> {
         Err(_) => println!("{response}"),
     }
     Ok(())
+}
+
+/// `forge comment --patch-created <URL|owner/repo#N>` (#9774): fetch the
+/// created object's body, append the dashboard footer (idempotent), PATCH it
+/// back. The create scripts call this right after a successful create — the
+/// number exists only then — and treat failure as a logged note, never as a
+/// reason to un-file.
+///
+/// # Errors
+///
+/// When the reference does not parse as a created GitHub object, or the fetch
+/// or PATCH fails.
+fn patch_created_entrypoint(created_ref: &str) -> anyhow::Result<()> {
+    let trimmed = created_ref.trim();
+    // A GitHub URL is the shape `gh`/`forge dashboard-link` emit; a bare
+    // `owner/repo#N` is accepted for tests.
+    let (nwo, number, is_pr) = if let Some((Some(nwo), number)) = parse_issue_ref(trimmed) {
+        let is_pr = trimmed.contains("/pull/");
+        (nwo, number, is_pr)
+    } else {
+        anyhow::bail!(
+            "--patch-created expects a GitHub object URL or owner/repo#N, got {trimmed:?}"
+        );
+    };
+    let gh = crate::forge_cmd::gh_bin();
+    let current = gh_api_get(gh.as_str(), &format!("repos/{nwo}/issues/{number}"))
+        .map_err(anyhow::Error::msg)?;
+    let body = serde_json::from_str::<serde_json::Value>(current.trim())
+        .map_err(|e| anyhow::anyhow!("could not parse the created object's JSON: {e}"))?["body"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let updated = build_dashboard_footer(&dashboard_base_url(), &nwo, number, is_pr, &body);
+    if updated == body {
+        // Already carries the marker: nothing to do, and re-POSTing an
+        // unchanged body would burn the PATCH for nothing.
+        return Ok(());
+    }
+    gh_api_patch(
+        gh.as_str(),
+        &format!("repos/{nwo}/issues/{number}"),
+        &serde_json::json!({ "body": updated }).to_string(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+/// `gh api <path>` (GET) — the raw response body on success, `gh`'s stderr on
+/// failure. Same no-cache plain-`gh` semantics `forge_get_pr_nocache` uses.
+fn gh_api_get(gh_bin: &str, path: &str) -> Result<String, String> {
+    let out = std::process::Command::new(gh_bin)
+        .arg("api")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("could not exec gh api: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "gh api {path} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| format!("gh api {path} output was not UTF-8: {e}"))
+}
+
+/// `gh api <path> -X PATCH --input -` with a JSON request body — the same
+/// stdin-JSON discipline as [`post_comment`] (multi-line markdown never goes
+/// through `-f`).
+fn gh_api_patch(gh_bin: &str, path: &str, json: &str) -> Result<String, String> {
+    let mut child = std::process::Command::new(gh_bin)
+        .arg("api")
+        .arg(path)
+        .arg("-X")
+        .arg("PATCH")
+        .arg("--input")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not exec gh api: {e}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "gh api stdin was not piped".to_string())?
+        .write_all(json.as_bytes())
+        .map_err(|e| format!("could not write the gh api request body: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("gh api (PATCH {path}) failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "gh api (PATCH {path}) failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| format!("gh api output was not UTF-8: {e}"))
 }
 
 #[cfg(test)]

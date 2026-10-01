@@ -799,6 +799,10 @@ fn daemon_write_paths_are_scoped() {
             "forge_cmd.rs",
             Via("cli/forge_action.rs", "every writing forge verb is vetted first"),
         ),
+        (
+            "forge_comment.rs",
+            Via("cli/forge_action.rs", "the `forge comment` verb is vetted via write_target; the internal `post_comment` sites are pre-vetted by their own callers"),
+        ),
         ("cli/forge_action.rs", Gated),
         ("role_runner/launch.rs", Gated),
         (
