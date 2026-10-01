@@ -641,7 +641,7 @@ loom-gh api
 gh help
 gh config get editor
 ";
-    let (count, samples) = gate::scan_text(text, 3);
+    let (count, samples) = gate::scan_text("x.sh", text, 3);
     assert_eq!(
         count, 5,
         "lines 1+2 one each, line 3 two, line 4 one (the `\"$GH_BIN\"` half is not \
@@ -651,11 +651,48 @@ gh config get editor
     assert!(samples[0].starts_with("1:"), "samples carry line numbers");
 
     // A `gh` subcommand that is not a forge call is not counted.
-    assert_eq!(gate::scan_text("gh help\ngh config get x\n", 3).0, 0);
+    assert_eq!(gate::scan_text("x.sh", "gh help\ngh config get x\n", 3).0, 0);
     // `gh` as part of a longer token is not a call.
-    assert_eq!(gate::scan_text("tough api\nmygh api\nx-gh api\n", 3).0, 0);
+    assert_eq!(gate::scan_text("x.sh", "tough api\nmygh api\nx-gh api\n", 3).0, 0);
     // Dynamic construction IS counted (#9777 asks for it explicitly).
-    assert_eq!(gate::scan_text("cmd=(gh api \"$route\")\n", 3).0, 1);
+    assert_eq!(gate::scan_text("x.sh", "cmd=(gh api \"$route\")\n", 3).0, 1);
+    // A tab is as good a separator as a space (a tab-indented heredoc body).
+    assert_eq!(gate::scan_text("x.sh", "\tgh\tapi repos/o/r\n", 3).0, 1);
+    // `gh` with nothing after it is not a call.
+    assert_eq!(gate::scan_text("x.sh", "gh\n", 3).0, 0);
+}
+
+/// The gate counts *executable* calls, so a whole-line comment naming a forge
+/// command is prose. This module's own doc comments tripped the pre-fix
+/// scanner, failing the repository-wide gate on its own source (PR #9832).
+#[test]
+fn the_scanner_ignores_whole_line_comments_but_not_trailing_ones() {
+    // Rust line/doc comments: `//`, `///`, `//!`, indented or not.
+    let rust = "\
+//! A guard that recognises `gh pr merge` is the opposite of a caller.
+/// Mentioned only as a prohibition (e.g. `gh pr merge`).
+    // TODO: stop shelling out to `gh issue list` here.
+let _ = run(\"gh api repos/o/r\");
+";
+    assert_eq!(
+        gate::scan_text("loom-daemon/src/forge_inventory/gate.rs", rust, 5),
+        (1, vec!["4:let _ = run(\"gh api repos/o/r\");".to_string()]),
+        "only the executable line counts"
+    );
+    // `#` comments in shell and in a workflow.
+    let sh =
+        "#!/usr/bin/env bash\n# gh pr merge is forbidden here\n  # gh api x\ngh issue view 1\n";
+    assert_eq!(gate::scan_text("defaults/scripts/x.sh", sh, 5).0, 1);
+    assert_eq!(gate::scan_text(".github/workflows/ci.yml", sh, 5).0, 1);
+    // Comment syntax is per file type: `#` does not comment out Rust, and `//`
+    // does not comment out shell — so neither hides a call in the other.
+    assert_eq!(gate::scan_text("x.rs", "# gh api x\n", 5).0, 1);
+    assert_eq!(gate::scan_text("x.sh", "// gh api x\n", 5).0, 1);
+    // A TRAILING comment is deliberately not stripped, so this line counts
+    // TWO: over-counting costs one baseline entry, while guessing where a
+    // quoted `#` ends would hide the real call sharing that line. See gate.rs
+    // "Comment awareness".
+    assert_eq!(gate::scan_text("x.sh", "gh issue view 1 # not gh pr merge\n", 5).0, 2);
 }
 
 #[test]

@@ -43,6 +43,19 @@
 //!   (#8248/#8508). Registering it needs that consequence designed, not
 //!   inherited; see the follow-up issue the PR names.
 //!
+//! **The test form does not escape that hazard, it only costs less.** The test
+//! runs over the *merged* tree too, so a base move that adds an undeclared,
+//! unbaselined caller fails this PR's build for a file this PR never touched —
+//! which is exactly how this slice's own first review found six unclassified
+//! entries in CI against two on the branch (PR #9832). The difference is the
+//! remedy, not the exposure: a failing test is fixed by rebasing and re-running
+//! `gate --update`, which is ordinary Doctor work, whereas a stale required
+//! *check* consumes the re-date remedy budget and can terminate in an operator
+//! hold. Regenerating the baseline is therefore a named step of the rebase
+//! recipe, not a surprise; softening a baseline miss on a file outside the PR's
+//! own diff into guidance rather than a hard failure belongs to the
+//! registration follow-up, where the `CheckSpec` decision is made.
+//!
 //! # What this phase deliberately does NOT do
 //!
 //! It does not migrate callers. The change gate lands with a **baseline** of
