@@ -194,8 +194,12 @@ STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
 LOG="$STUB_DIR_FROM_ENV/gh-calls.log"
 
 if [[ "$1" == "api" ]]; then
-  # Last arg is the api path: repos/owner/repo/issues/N
-  path="${!#}"
+  # Find the api path: it is the args/repos… token, NOT necessarily the last
+  # argument (the #9774 POST shape is `… --input -`, which ends in `-`).
+  path=""
+  for _a in "$@"; do
+    case "$_a" in repos/*) path="$_a"; break ;; esac
+  done
   # #9774: a POST to the comments endpoint is the daemon chokepoint's shape
   # (forge comment -> gh api --input -); this suite's subject is the
   # reconcile flow over the recorded gh ladder, so fail that POST and let
