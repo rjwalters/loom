@@ -29,7 +29,7 @@
 2689 defaults/.claude/commands/loom/champion-held-pr-staleness.md
 25056 defaults/.claude/commands/loom/champion-issue-promo.md
 1059 defaults/.claude/commands/loom/champion-merge-risk-shadow.md
-46597 defaults/.claude/commands/loom/champion-pr-merge.md
+46592 defaults/.claude/commands/loom/champion-pr-merge.md
 1072 defaults/.claude/commands/loom/champion-premise-false-evidence.md
 12810 defaults/.claude/commands/loom/champion-reference.md
 3663 defaults/.claude/commands/loom/champion.md
