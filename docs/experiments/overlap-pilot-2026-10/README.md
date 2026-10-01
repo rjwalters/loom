@@ -83,3 +83,36 @@ loom-daemon overlap-replay score  --manifest manifest.json --outcomes-dir OUT --
 4. Provision `AUGMENT_API_TOKEN` (#9783) to switch on the retrieval arm and
    re-run the identical manifest — the frozen-prediction contract is
    already wired.
+
+## Retrieval arm (added same day — token provisioned via SSM → auggie-sdk)
+
+The identical frozen manifest, re-scored with **real Augment DirectContext
+predictions** for all 24 issues (per-pair indexes built from the pinned base
+revisions, ~2,000–2,500 files each, state exported per pair; 4-query plan
+mirroring the frozen query policy). Results in `retrieval-arm/`.
+
+**Per-issue footprint quality (n=24, prediction vs actual PR changes):**
+
+| metric | mean |
+|---|---|
+| file precision | **0.263** |
+| file recall | **0.489** |
+| line-interval precision | **0.084** |
+| line-interval recall | 0.510 |
+
+**Reading:** retrieval finds about half of what a PR changes (recall 0.49),
+but ~74% of retrieved files are never touched by the PR (precision 0.26) —
+i.e. mostly **context-only reads**. Line-level evidence is near-noise for
+collision purposes (0.08). This is direct empirical support for the
+#9781 design premise: naive shared-file dispatch serialization would fire on
+mostly false positives; intent classification (#9784) and hub weighting are
+load-bearing, not optional refinements.
+
+Pair-level (n=3 held-out) stays inconclusive — Spearman 0.0, conflict-band
+rate 0.33 [0.06–0.79]. Scaling (README checklist above) is the next move;
+the pipeline now runs the full labeled-pair loop end to end.
+
+Auth note: the context API accepts the auggie login session
+(`~/.augment/session.json`); the shell-env token (`AUGMENTCODE_API_TOKEN`,
+stored in SSM) 401s on this surface — treat the SSM value as the CLI/other
+surface credential until re-issued for the context engine.

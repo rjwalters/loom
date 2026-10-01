@@ -1,0 +1,13 @@
+pair_id,cutoff,association,leakage_controlled,hindsight_selected,curator_baseline,file_jaccard,hub_weighted,line_overlap,symbol_overlap,edit_edit,blend,actual_file_jaccard,actual_shared_files,actual_line_overlap_fraction,actual_coordinate_basis,predicted_line_overlap_fraction,conflict_any,conflicted_files,observed_conflict
+p-8656-8728,2026-09-23T06:37:00Z,independent,true,false,,0.0000,-0.0000,,,,0.0000,0.0000,0,,,,clean,,false
+p-8758-8757,2026-09-23T13:33:40Z,independent,true,false,0.0000,0.0294,0.0294,0.2938,,0.0000,0.0294,0.0476,1,,,0.2938,clean,,false
+p-8683-8770,2026-09-23T15:22:57Z,independent,true,false,,0.0000,-0.0000,,,,0.0000,0.0909,1,,,,clean,,false
+p-8785-8795,2026-09-23T23:31:24Z,independent,true,false,,0.0000,-0.0000,,,,0.0000,0.0000,0,,,,clean,,false
+p-8824-8796,2026-09-24T19:15:33Z,independent,true,false,0.0000,0.0000,-0.0000,,,0.0000,0.0000,0.0000,0,,,,clean,,false
+p-8832-8786,2026-09-24T20:42:15Z,independent,true,false,,0.0213,0.0213,1.0000,,,0.0213,0.0000,0,,,1.0000,clean,,false
+p-8896-8895,2026-09-25T12:11:09Z,independent,true,false,0.2857,0.0714,0.0714,0.7497,,0.1667,0.0714,0.0833,1,,,0.7497,clean,,false
+p-8699-8912,2026-09-25T13:34:01Z,independent,true,false,,0.0000,-0.0000,,,,0.0000,0.0000,0,,,,clean,,false
+p-8919-8700,2026-09-25T16:15:20Z,independent,true,false,,0.0000,-0.0000,,,,0.0000,0.0000,0,,,,clean,,false
+p-8944-8787,2026-09-25T18:09:30Z,independent,true,false,,0.0000,-0.0000,,,,0.0000,0.0000,0,,,,conflict,.loom/install-metadata.json;Cargo.lock;Cargo.toml;VERSION;mcp-loom/package-lock.json;mcp-loom/package.json;package.json,false
+p-8968-8959,2026-09-25T21:00:07Z,independent,true,false,,0.0000,-0.0000,,,,0.0000,0.0000,0,,,,clean,,false
+p-8987-9029,2026-09-26T07:17:23Z,independent,true,false,,0.0000,-0.0000,,,,0.0000,0.0000,0,,,,clean,,false
