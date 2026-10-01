@@ -495,6 +495,38 @@ fn queue_retry_storage_and_credentials_fail_visibly() {
 /// wrong) outcome, so the marker must be present too. A clean build-log line
 /// in the same batch must survive byte-identical — a scrubber that eats
 /// ordinary log text is useless for the job this exists to do.
+/// A `session.output` OTLP logs payload whose body is `text`. The
+/// `loom.output.chunk_index` attribute is the predicate the gateway's
+/// `session.output` scrub stage is scoped by, so it is what makes this batch
+/// a live-output batch at all (#9764).
+fn session_output_fixture(text: &str) -> String {
+    let body = serde_json_escape(text);
+    let resource = r#"{"attributes":[{"key":"service.name","value":{"stringValue":"loom-daemon"}},{"key":"host.id","value":{"stringValue":"fixture-host"}}]}"#;
+    let attrs = r#"[{"key":"loom.repo","value":{"stringValue":"fixture-org/alpha"}},{"key":"loom.repo.visibility","value":{"stringValue":"private"}},{"key":"loom.session_id","value":{"stringValue":"fixture-session"}},{"key":"loom.runtime","value":{"stringValue":"claude"}},{"key":"loom.issue","value":{"intValue":"9764"}},{"key":"loom.output.chunk_index","value":{"intValue":"0"}},{"key":"loom.output.chunk_count","value":{"intValue":"1"}},{"key":"loom.output.truncated","value":{"boolValue":false}},{"key":"loom.output.bytes_total","value":{"intValue":"4096"}},{"key":"loom.output.unlisted","value":{"stringValue":"MUST-NOT-EXPORT"}}]"#;
+    format!(
+        r#"{{"resourceLogs":[{{"resource":{resource},"scopeLogs":[{{"logRecords":[{{"timeUnixNano":"1790000000000000000","eventName":"session.output","body":{{"stringValue":"{body}"}},"attributes":{attrs}}}]}}]}}]}}"#
+    )
+}
+
+/// A `session.summary` OTLP logs payload — the control. Its body is the
+/// daemon-authored event string every non-free-text kind carries; the
+/// `session.output` scrub stage must leave it byte-identical (its guard is
+/// the `loom.output.chunk_index` marker, which this record deliberately does
+/// not carry).
+fn session_summary_fixture() -> String {
+    let resource = r#"{"attributes":[{"key":"service.name","value":{"stringValue":"loom-daemon"}},{"key":"host.id","value":{"stringValue":"fixture-host"}}]}"#;
+    let attrs = r#"[{"key":"loom.repo","value":{"stringValue":"fixture-org/alpha"}},{"key":"loom.repo.visibility","value":{"stringValue":"private"}},{"key":"loom.session_id","value":{"stringValue":"fixture-session"}},{"key":"loom.runtime","value":{"stringValue":"claude"}}]"#;
+    format!(
+        r#"{{"resourceLogs":[{{"resource":{resource},"scopeLogs":[{{"logRecords":[{{"timeUnixNano":"1790000000000000000","eventName":"session.summary","body":{{"stringValue":"{SUMMARY_CONTROL_BODY}"}},"attributes":{attrs}}}]}}]}}]}}"#
+    )
+}
+
+/// The `session.summary` control body — carries a fixture secret-shaped
+/// string on purpose: the acceptance is that it arrives **intact**, proving
+/// the `session.output` stage's guard did not widen to a second kind.
+const SUMMARY_CONTROL_BODY: &str =
+    "session summary: claude builder on fixture-org/alpha (password=LOOMFIXTUREsummarybody)";
+
 #[test]
 #[ignore = "requires Docker; starts three isolated pinned Collector containers"]
 fn ci_job_log_bodies_are_scrubbed_at_the_gateway_before_both_sinks() {
@@ -552,14 +584,103 @@ fn ci_job_log_bodies_are_scrubbed_at_the_gateway_before_both_sinks() {
     }
 }
 
+/// Issue #9764 acceptance, the half that needs a real Collector: a
+/// synthesized `session.output` batch carrying one sentinel per scrub class
+/// must arrive at **both** sinks with every sentinel replaced by its
+/// `[REDACTED:<class>]` marker and zero raw secret bytes anywhere in the
+/// exported output, while a `session.summary` body in the same run arrives
+/// byte-identical — the `session.output` stage's scope guard must not widen
+/// to a second kind.
+#[test]
+#[ignore = "requires Docker; starts three isolated pinned Collector containers"]
+fn session_output_bodies_are_scrubbed_at_the_gateway_before_both_sinks() {
+    let mut trial = Trial::new();
+    let a = trial.start("clickstack", &sink_config(true), "clickstack-collector");
+    let b = trial.start("signoz", &sink_config(false), "signoz-otel-collector");
+    let config = CONFIG
+        .replace("limit_mib: 384", "limit_mib: 160")
+        .replace("spike_limit_mib: 96", "spike_limit_mib: 32");
+    ready(&trial.endpoint(&a, "4318"));
+    ready(&trial.endpoint(&b, "4318"));
+    let gateway = trial.start("gateway", &config, "gateway");
+    let endpoint = trial.endpoint(&gateway, "4318");
+    ready(&endpoint);
+
+    // One chunk body: a liveness marker, the clean line, then one line per
+    // sentinel — the shape a live transcript tail has.
+    let mut lines = vec![
+        "session-output-redaction-canary".to_string(),
+        CLEAN_LOG_LINE.to_string(),
+    ];
+    for (class, sentinel) in SCRUB_SENTINELS {
+        lines.push(format!("2026-10-01T12:00:01.0000000Z [{class}] {sentinel}"));
+    }
+    let body = lines.join("\n");
+    let response = http(
+        &format!("{endpoint}/v1/logs"),
+        Some(&session_output_fixture(&body)),
+        "fixture-loom-key",
+    );
+    assert!(
+        response.success(),
+        "gateway refused the session.output batch: {}",
+        response.body
+    );
+    // The control batch: a `session.summary` body the stage must not touch.
+    let response = http(
+        &format!("{endpoint}/v1/logs"),
+        Some(&session_summary_fixture()),
+        "fixture-loom-key",
+    );
+    assert!(
+        response.success(),
+        "gateway refused the session.summary batch: {}",
+        response.body
+    );
+
+    for sink in ["clickstack", "signoz"] {
+        trial.wait_for(sink, "session-output-redaction-canary");
+        let data = trial.contents(sink);
+        for (class, sentinel) in SCRUB_SENTINELS {
+            assert!(
+                !data.contains(sentinel),
+                "{sink}: raw {class} secret survived the gateway: {sentinel}"
+            );
+            assert!(
+                data.contains(&format!("[REDACTED:{class}]")),
+                "{sink}: no [REDACTED:{class}] marker — a dropped record is not a redacted one"
+            );
+        }
+        // A clean output line is forwarded untouched.
+        assert!(
+            data.contains(CLEAN_LOG_LINE),
+            "{sink}: a clean output line was mangled by the scrubber"
+        );
+        // The control: the `session.summary` body arrives intact — scrubbing
+        // is scoped to `session.output` chunks, not to the kinds around them.
+        assert!(
+            data.contains(SUMMARY_CONTROL_BODY),
+            "{sink}: the session.summary control body did not arrive intact"
+        );
+        // No regression in the general allowlist: an attribute outside the
+        // reviewed set is still stripped, on this kind too.
+        assert!(!data.contains("MUST-NOT-EXPORT"));
+        assert!(!data.contains("loom.output.unlisted"));
+        // The identity attributes a reconstruction query needs did survive.
+        assert!(data.contains("loom.output.chunk_index"));
+        assert!(data.contains("loom.session_id"));
+        assert!(data.contains("loom.issue"));
+    }
+}
+
 /// Issue #8825, no Docker: the scrub-class list in the collector config and
 /// `CI_LOG_SCRUB_CLASSES` in the daemon must name the same set, in the same
-/// order, and every statement must be scoped to `ci.job.log` alone.
-///
-/// This is the "fail closed on an unlisted pattern" half of the design made
-/// mechanical: a new secret family cannot be added to one side only, and a
-/// statement cannot quietly lose its scope guard and start rewriting another
-/// kind's body.
+/// order, and every `ci.job.log`-scoped statement must be scoped to that kind
+/// alone. Since #9764 the config carries a second body-rewriting stage for
+/// `session.output` under its own marker (`gateway_scrubs_exactly_the_
+/// declared_session_output_classes` below), so this test filters to the
+/// statements scoped by THIS kind's marker — the unique marker is the scope
+/// guard, and a stage may not silently widen or lose it.
 #[test]
 fn gateway_scrubs_exactly_the_declared_ci_log_classes() {
     use loom_daemon::telemetry::ci::{CI_LOG_CHUNK_MARKER_KEY, CI_LOG_SCRUB_CLASSES};
@@ -568,10 +689,11 @@ fn gateway_scrubs_exactly_the_declared_ci_log_classes() {
         .lines()
         .map(str::trim)
         .filter(|line| line.contains("replace_pattern(body,"))
+        .filter(|line| line.contains(&format!("attributes[\"{CI_LOG_CHUNK_MARKER_KEY}\"] != nil")))
         .collect();
     assert!(
         statements.len() >= CI_LOG_SCRUB_CLASSES.len(),
-        "the collector has fewer body-rewriting statements than declared scrub classes"
+        "the collector has fewer ci.job.log body-rewriting statements than declared scrub classes"
     );
     let guard = format!("attributes[\"{CI_LOG_CHUNK_MARKER_KEY}\"] != nil and IsString(body)");
     // A class may need more than one pattern, so consecutive repeats
@@ -622,6 +744,119 @@ fn gateway_scrubs_exactly_the_declared_ci_log_classes() {
     assert!(
         CONFIG.contains("`ci.job.log` (#8825) carries a GitHub Actions job"),
         "config.yaml must state the ci.job.log body exception beside the allowlist"
+    );
+}
+
+/// Issue #9764, no Docker: the `session.output` scrub stage mirrors the
+/// `ci.job.log` one — the same class list, its own unique scope guard, ahead
+/// of the shared allowlist — and every `loom.output`-guarded statement is
+/// scoped to that kind alone. The sibling test above pins the same from the
+/// `ci.job.log` side; together they fail closed on a stage that loses its
+/// guard, drifts from the class list, or shares the other kind's marker.
+#[test]
+fn gateway_scrubs_exactly_the_declared_session_output_classes() {
+    use loom_daemon::telemetry::kinds::session_output::{
+        SESSION_OUTPUT_CHUNK_MARKER_KEY, SESSION_OUTPUT_SCRUB_CLASSES,
+    };
+
+    let statements: Vec<&str> = CONFIG
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("replace_pattern(body,"))
+        .filter(|line| {
+            line.contains(&format!("attributes[\"{SESSION_OUTPUT_CHUNK_MARKER_KEY}\"] != nil"))
+        })
+        .collect();
+    assert!(
+        statements.len() >= SESSION_OUTPUT_SCRUB_CLASSES.len(),
+        "the collector has fewer session.output body-rewriting statements than declared scrub classes"
+    );
+    let guard =
+        format!("attributes[\"{SESSION_OUTPUT_CHUNK_MARKER_KEY}\"] != nil and IsString(body)");
+    let mut classes: Vec<String> = Vec::new();
+    for statement in &statements {
+        assert!(
+            statement.contains(&guard),
+            "a body rewrite is not scoped to session.output records: {statement}"
+        );
+        let start = statement
+            .find("[REDACTED:")
+            .expect("every body rewrite replaces with a [REDACTED:<class>] marker");
+        let end = statement[start..].find(']').expect("a closed marker") + start;
+        let class = statement[start + "[REDACTED:".len()..end].to_string();
+        if classes.last() != Some(&class) {
+            classes.push(class);
+        }
+    }
+    assert_eq!(
+        classes,
+        SESSION_OUTPUT_SCRUB_CLASSES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect::<Vec<String>>(),
+        "the session.output stage's classes and SESSION_OUTPUT_SCRUB_CLASSES disagree"
+    );
+
+    // The two stages must not share a marker (the unique marker IS the scope
+    // guard — see the config comment), and the session.output stage must run
+    // before the shared allowlist.
+    let pipeline = CONFIG
+        .lines()
+        .find(|line| {
+            line.trim()
+                .starts_with("processors: [memory_limiter, transform/")
+        })
+        .expect("logs pipeline processors line");
+    let ci = pipeline
+        .find("transform/ci_log_redaction")
+        .expect("transform/ci_log_redaction must be in the logs pipeline");
+    let session = pipeline
+        .find("transform/session_output_redaction")
+        .expect("transform/session_output_redaction must be in the logs pipeline");
+    let privacy = pipeline
+        .find("transform/privacy")
+        .expect("transform/privacy must be in the logs pipeline");
+    assert!(
+        session < privacy,
+        "the session.output scrub stage must precede transform/privacy: {pipeline}"
+    );
+    assert!(
+        ci < session,
+        "stages run in declared order; keep the ci stage first: {pipeline}"
+    );
+
+    // The chunk-protocol attributes must survive the allowlist, or a
+    // session's output is unreconstructable even when the body arrived.
+    let log_keep = {
+        let mut current = "";
+        let mut keys = Vec::new();
+        for line in CONFIG.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("- context:") {
+                current = rest.trim();
+            }
+            if current == "log" && line.contains("keep_keys(") {
+                keys.extend(line.split('"').skip(1).step_by(2).map(str::to_owned));
+            }
+        }
+        keys
+    };
+    for key in [
+        SESSION_OUTPUT_CHUNK_MARKER_KEY,
+        "loom.output.chunk_count",
+        "loom.output.truncated",
+        "loom.output.bytes_total",
+    ] {
+        assert!(
+            log_keep.iter().any(|k| k == key),
+            "log keep_keys drops {key}; a session's chunks become unordered and unreadable"
+        );
+    }
+
+    // The exception is named where a reviewer reading the allowlist will see
+    // it, not only in a commit message.
+    assert!(
+        CONFIG.contains("`session.output` (#9764)"),
+        "config.yaml must state the session.output body exception beside the allowlist"
     );
 }
 

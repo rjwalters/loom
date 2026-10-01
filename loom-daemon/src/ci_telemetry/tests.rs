@@ -882,7 +882,12 @@ fn collector_allowlist_matches_the_ci_vocabulary_exactly() {
 /// must agree, in order — the daemon-side half of #8825's "the list lives in
 /// the repo, reviewable" rule (the integration test
 /// `collector_fanout::gateway_scrubs_exactly_the_declared_ci_log_classes`
-/// asserts the same from the other side, including the scope guards).
+/// asserts the same from the other side, including the scope guards). Since
+/// #9764 the config carries a second body-rewriting stage
+/// (`transform/session_output_redaction`) with the same class list under its
+/// own marker, so this test — and the sibling in
+/// `activity::transcript_output`'s tests — filters to the statements scoped
+/// by THIS kind's marker; neither stage may drift from the shared list.
 #[test]
 fn collector_scrub_classes_match_the_declared_list() {
     // A class may need more than one pattern (github-token covers both the
@@ -892,6 +897,12 @@ fn collector_scrub_classes_match_the_declared_list() {
     for line in COLLECTOR_CONFIG
         .lines()
         .filter(|line| line.contains("replace_pattern(body,"))
+        .filter(|line| {
+            line.contains(&format!(
+                "attributes[\"{}\"] != nil",
+                crate::telemetry::ci::CI_LOG_CHUNK_MARKER_KEY
+            ))
+        })
     {
         let start = line.find("[REDACTED:").expect("a replacement marker");
         let end = line[start..].find(']').expect("a closed marker") + start;

@@ -11,6 +11,10 @@
 use super::*;
 use crate::activity::transcript_ingest::{LiveOutputConfig, TranscriptIngestConfig};
 use crate::observability::queue::DurableQueue;
+use crate::telemetry::kinds::session_output::{
+    SESSION_OUTPUT_CHUNK_MARKER_KEY, SESSION_OUTPUT_LOG_ATTRIBUTE_KEYS,
+    SESSION_OUTPUT_SCRUB_CLASSES,
+};
 use crate::telemetry::TelemetryRecord;
 
 const WORKSPACE: &str = "/home/ubuntu/GitHub/loom";
@@ -343,4 +347,96 @@ fn whole_line_prefix_is_byte_exact() {
     let multi = "ééé\n"; // 2 bytes each
     assert_eq!(whole_line_prefix(multi, 5), 0, "5 bytes lands inside the second é");
     assert_eq!(whole_line_prefix(multi, 7), 7);
+}
+
+// ---------------------------------------------------------------------------
+// Gateway-collector parity (static; no Docker) — the ci_telemetry contract,
+// mirrored for the second redaction boundary (#9764)
+// ---------------------------------------------------------------------------
+
+const COLLECTOR_CONFIG: &str =
+    include_str!("../../../defaults/observability/collector/config.yaml");
+
+/// The `session.output` scrub stage in the collector config and
+/// `SESSION_OUTPUT_SCRUB_CLASSES` (the ci list, by reference) must agree in
+/// order, every `loom.output`-guarded statement must carry this kind's own
+/// scope guard, the stage must precede `transform/privacy`, and the
+/// chunk-protocol keys must survive the allowlist. The integration-side
+/// mirror is `collector_fanout::gateway_scrubs_exactly_the_declared_session_output_classes`.
+#[test]
+fn collector_scrub_classes_match_the_declared_session_output_list() {
+    let marker = SESSION_OUTPUT_CHUNK_MARKER_KEY;
+    let statements: Vec<String> = COLLECTOR_CONFIG
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("replace_pattern(body,"))
+        .filter(|line| line.contains(&format!("attributes[\"{marker}\"] != nil")))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        statements.len() >= SESSION_OUTPUT_SCRUB_CLASSES.len(),
+        "the collector has fewer session.output body-rewriting statements than declared classes"
+    );
+    let mut markers: Vec<String> = Vec::new();
+    for line in &statements {
+        assert!(
+            line.contains(&format!("attributes[\"{marker}\"] != nil and IsString(body)")),
+            "a body rewrite is not fully scoped to session.output records: {line}"
+        );
+        let start = line.find("[REDACTED:").expect("a replacement marker");
+        let end = line[start..].find(']').expect("a closed marker") + start;
+        let class = line[start + "[REDACTED:".len()..end].to_string();
+        if markers.last() != Some(&class) {
+            markers.push(class);
+        }
+    }
+    assert_eq!(
+        markers,
+        SESSION_OUTPUT_SCRUB_CLASSES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect::<Vec<_>>()
+    );
+    // And the declared list is the ci list, by reference — the whole reason
+    // both stages stay in step.
+    assert_eq!(SESSION_OUTPUT_SCRUB_CLASSES, crate::telemetry::ci::CI_LOG_SCRUB_CLASSES);
+
+    // The stage runs ahead of the shared allowlist.
+    let pipeline = COLLECTOR_CONFIG
+        .lines()
+        .find(|line| {
+            line.trim()
+                .starts_with("processors: [memory_limiter, transform/")
+        })
+        .expect("logs pipeline processors line");
+    let session = pipeline
+        .find("transform/session_output_redaction")
+        .expect("the stage is wired");
+    let privacy = pipeline
+        .find("transform/privacy")
+        .expect("the allowlist stage is wired");
+    assert!(
+        session < privacy,
+        "the session.output scrub stage must precede transform/privacy"
+    );
+
+    // The chunk protocol survives the allowlist byte-for-byte.
+    let keep = COLLECTOR_CONFIG
+        .lines()
+        .map(str::trim)
+        .filter(|trimmed| trimmed.contains("keep_keys("))
+        .flat_map(|trimmed| trimmed.split('"').skip(1).step_by(2))
+        .collect::<Vec<_>>();
+    for key in SESSION_OUTPUT_LOG_ATTRIBUTE_KEYS {
+        let needed = matches!(
+            *key,
+            "loom.output.chunk_index"
+                | "loom.output.chunk_count"
+                | "loom.output.truncated"
+                | "loom.output.bytes_total"
+        );
+        if needed {
+            assert!(keep.contains(key), "the log allowlist drops {key}");
+        }
+    }
 }

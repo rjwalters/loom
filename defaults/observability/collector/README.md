@@ -363,38 +363,52 @@ and again when it exports it (#8857). The #8857 quota metrics
 `provider`, `model` and `state`: per-provider aggregates, never an account
 name or credential.
 
-**The body policy, exactly** (rewritten for #8825; this used to read "does not
-accept raw shell output, prompts or model completions", which is no longer the
-whole truth): this collector is **not** a general arbitrary-log redactor.
-Source-side Loom privacy rules own bodies, span names and nested values for
-every record kind, and it accepts no prompts or model completions from any
-source. **There is exactly one kind whose body is free text the source did not
-author: `ci.job.log` (#8825)**, which carries GitHub Actions job log text.
-That one is accepted deliberately, and scrubbed *here*, because the operator
-decision for #8825 makes this gateway — not the daemon — the redaction
-boundary for build logs. Concretely:
+**The body policy, exactly** (rewritten for #8825, extended for #9764; this
+used to read "does not accept raw shell output, prompts or model
+completions", which is no longer the whole truth): this collector is **not** a
+general arbitrary-log redactor. Source-side Loom privacy rules own bodies,
+span names and nested values for every record kind, and it accepts no prompts
+or model completions from any source. **There are exactly two kinds whose
+body is free text the source did not author: `ci.job.log` (#8825), which
+carries GitHub Actions job log text, and `session.output` (#9764), which
+carries bounded chunks of an active agent session's transcript output.** Both
+are accepted deliberately, and scrubbed *here*, because the operator decision
+for each makes this gateway — not the daemon — the redaction boundary for
+that kind. Concretely:
 
-- `transform/ci_log_redaction` runs **first** in the `logs` pipeline, ahead of
-  `transform/privacy`, and rewrites the body through the ordered scrub-class
-  list in `config.yaml` (`[REDACTED:<class>]` per class: `authorization`,
-  `bearer-token`, `github-token`, `anthropic-key`, `api-key`,
-  `aws-access-key-id`, `aws-secret-access-key`, `credential`).
-- Every statement is scoped by `attributes["loom.ci.chunk_index"] != nil and
-  IsString(body)`. That attribute is emitted by, and only by, `ci.job.log`
-  chunks, so **no other kind's body is touched** — not rewritten, not
-  inspected, not newly admitted.
-- No `ci.job.log` *attribute* is derived from log text (that is why there is
-  no `step` attribute), because this stage rewrites bodies only; an attribute
-  built out of log text would bypass it entirely.
-- The class list lives in the repo in two places that are pinned to each other
-  by contract tests (`config.yaml` and `CI_LOG_SCRUB_CLASSES` in
-  `loom-daemon/src/telemetry/ci.rs`). **A new secret family is added to the
-  list, the config and the test in the same PR** — the list is reviewable, and
-  fails closed against silent drift rather than against unseen patterns.
+- `transform/ci_log_redaction` and `transform/session_output_redaction` run
+  **first** in the `logs` pipeline, ahead of `transform/privacy`, and rewrite
+  the body through the same ordered scrub-class list in `config.yaml`
+  (`[REDACTED:<class>]` per class: `authorization`, `bearer-token`,
+  `github-token`, `anthropic-key`, `api-key`, `aws-access-key-id`,
+  `aws-secret-access-key`, `credential`). The `session.output` stage applies
+  the identical class list on purpose — one reviewed definition of "secret",
+  two kinds it applies to; the daemon's `SESSION_OUTPUT_SCRUB_CLASSES` is a
+  *reference* to the ci list, so the two cannot drift.
+- Every statement of each stage is scoped by that kind's own chunk-marker
+  attribute and `IsString(body)`: `attributes["loom.ci.chunk_index"]` for
+  `ci.job.log`, `attributes["loom.output.chunk_index"]` for `session.output`.
+  Each marker is emitted by, and only by, its own kind's chunks —
+  deliberately not shared, because the unique marker **is** the scope guard;
+  sharing one across two kinds would let a change to either contract silently
+  widen the other's body exception. **No other kind's body is touched** — not
+  rewritten, not inspected, not newly admitted.
+- No attribute of either kind is derived from its body text (that is why
+  `ci.job.log` has no `step` attribute and `session.output` has no
+  output-derived tag), because these stages rewrite bodies only; an attribute
+  built out of body text would bypass them entirely.
+- The class list lives in the repo in the config plus the daemon constants
+  pinned to it by contract tests (`CI_LOG_SCRUB_CLASSES` in
+  `loom-daemon/src/telemetry/ci.rs`, and `SESSION_OUTPUT_SCRUB_CLASSES` in
+  `loom-daemon/src/telemetry/kinds/session_output.rs`, which is the ci list
+  by reference). **A new secret family is added to the list, both config
+  stages, and the tests in the same PR** — the list is reviewable, and fails
+  closed against silent drift rather than against unseen patterns.
 
-Extending this exception to a second record kind is a deliberate policy
+Extending this exception to a third record kind remains a deliberate policy
 change, not a config tweak: it needs its own review, its own scope guard, and
-its own entry in the contract tests above.
+its own entry in the contract tests above. (#9764 is the precedent for how:
+a new marker, the same class list, and same-PR contract tests.)
 
 The other narrow exception — receiver-level, and about *not* forwarding free
 text rather than scrubbing it — is the `file_log/codex`, `file_log/pi` and
