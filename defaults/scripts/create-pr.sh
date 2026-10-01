@@ -398,6 +398,10 @@ pushed, do NOT rebuild — re-run this script (it adopts an existing PR) or open
 the PR by hand from that branch." >&2
   exit 1
 }
+# The URL is the script's stdout contract (identical to `gh pr create`'s, so a
+# caller parsing the URL needs no change) — echoed before the best-effort
+# footer step below, which only ever adds stderr.
+echo "$PR_URL"
 
 # --- #9774: the opened PR's body ends with the dashboard footer -------------
 # Best-effort, via the daemon's --patch-created (fetch, footer, PATCH — the
