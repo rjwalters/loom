@@ -441,6 +441,31 @@ pub(crate) enum ForgeAction {
         #[arg(long)]
         pr: bool,
     },
+
+    /// `forge dashboard-link <owner/repo> <number> [--pr]` — print the exact
+    /// dashboard footer (#9772) for `number` in `owner/repo`, byte-for-byte
+    /// as `forge comment` would append it. The shell twin's format-pinning
+    /// test (#9774) asserts its bash implementation against this output, so
+    /// the two implementations cannot drift.
+    #[command(name = "dashboard-link")]
+    DashboardLink {
+        /// Target `owner/repo`.
+        #[arg(value_name = "OWNER/REPO")]
+        repo: String,
+
+        /// Issue or PR number.
+        #[arg(value_name = "NUMBER")]
+        number: u64,
+
+        /// The number names a pull request (link says `/pull/N`).
+        #[arg(long)]
+        pr: bool,
+
+        /// Optional body to prepend, so the pinning test can compare a full
+        /// `body + footer` document byte-for-byte.
+        #[arg(long, value_name = "TEXT")]
+        body: Option<String>,
+    },
 }
 
 /// Handle `loom-daemon forge <issue|pr|auth|auto-merge>` (epic #4081 Phase 3,
@@ -470,6 +495,28 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
         ForgeAction::MayWrite { repo } => return super::forge_identity_cmd::may_write(repo),
+        ForgeAction::DashboardLink {
+            repo,
+            number,
+            pr,
+            body,
+        } => {
+            let (owner, name) = repo
+                .split_once('/')
+                .ok_or_else(|| anyhow::anyhow!("--repo must be OWNER/REPO, got {repo:?}"))?;
+            let nwo = format!("{owner}/{name}");
+            print!(
+                "{}",
+                loom_daemon::forge_comment::build_dashboard_footer(
+                    &loom_daemon::forge_comment::dashboard_base_url(),
+                    &nwo,
+                    number,
+                    pr,
+                    body.as_deref().unwrap_or(""),
+                )
+            );
+            return Ok(());
+        }
         ForgeAction::Comment {
             number,
             repo,
