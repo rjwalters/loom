@@ -31,9 +31,10 @@
 //! `GET /api/v1/repos/{owner}/{repo}` carries a `permissions` object
 //! (`admin` / `push` / `pull`) computed for the authenticated user, and
 //! `push` or `admin` is WRITE. The credential comes from the same places the
-//! writes themselves do — `GITEA_TOKEN` / `FORGE_TOKEN` / `GITEA_URL` /
-//! `GITEA_USERNAME`, else `.loom/config.json`'s `forge.gitea.*` — and a
-//! connection that cannot be resolved or reached is `Unknown`, never WRITE.
+//! writes themselves do — `GITEA_TOKEN`, then `.loom/config.json`'s
+//! `forge.gitea.token`, then `FORGE_TOKEN`; `GITEA_URL` and `GITEA_USERNAME`
+//! beat their config keys — and a connection that cannot be resolved or
+//! reached is `Unknown`, never WRITE.
 //!
 //! **Cache key space.** Every key names its forge and host ([`CacheScope`]),
 //! so a GitHub answer can never stand in for a Gitea probe of the same

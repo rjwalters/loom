@@ -160,11 +160,11 @@ when all three hold:
    verified in the last 24 hours still counts, and a definitive "no" never
    does. On Gitea the same rule probes `GET /api/v1/repos/{owner}/{repo}`'s
    `permissions` object for the authenticated user: `push` or `admin` is
-   WRITE. The credential is the one the writes carry — `GITEA_TOKEN` (then
-   `FORGE_TOKEN`), `GITEA_URL` and `GITEA_USERNAME`, else
-   `forge.gitea.*` in `.loom/config.json` — and an instance that cannot be
-   reached or authenticated is an unverifiable probe: refused, never
-   guessed.
+   WRITE. The credential is the one the writes carry — `GITEA_TOKEN`, then
+   `forge.gitea.token` in `.loom/config.json`, then `FORGE_TOKEN` (the
+   documented generic fallback); `GITEA_URL` and `GITEA_USERNAME` beat their
+   config keys the same way — and an instance that cannot be reached or
+   authenticated is an unverifiable probe: refused, never guessed.
 
 Anything unverifiable is a refusal. Reads are never gated.
 
