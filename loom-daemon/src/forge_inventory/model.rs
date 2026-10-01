@@ -124,8 +124,8 @@ pub enum Disposition {
     Optional,
     /// Known-unsupported, recorded explicitly rather than left blank.
     Unsupported,
-    /// Mentioned in the tree only as a prohibition (e.g. `gh pr merge`), never
-    /// an active operation.
+    /// Mentioned in the tree only as a prohibition (e.g. the forbidden native
+    /// merge verb), never an active operation.
     Prohibition,
     /// Appears only in test fixtures; classified, not counted as active.
     TestFixture,
