@@ -734,12 +734,12 @@ for directive in $(tr ';' ' ' < "$WF_PAGES_FILE"); do
         ;;
       ok1)
         # FULL page (50): pagination continues to the next page.
-        jq -nc '{workflow_runs: [range(0; 49) | {head_sha: "other", display_title: "filler"}] + [{head_sha: "sha1", display_title: "one"}]}'
+        jq -nc '{workflow_runs: [range(0; 49) | {head_sha: "other", display_title: "filler"}] + [{head_sha: "96c2b8246403c9c91d37c2c7d6eebf7558f790f4", display_title: "one"}]}'
         printf '200\n'
         ;;
       ok2)
         # SHORT page (1): the stop rule fires after this one.
-        jq -nc '{workflow_runs: [{head_sha: "sha1", display_title: "two"}]}'
+        jq -nc '{workflow_runs: [{head_sha: "96c2b8246403c9c91d37c2c7d6eebf7558f790f4", display_title: "two"}]}'
         printf '200\n'
         ;;
       cap)
@@ -780,15 +780,18 @@ wf_run() {  # wf_run <commit>  -> "exit:<rc> out:<stdout>"
 
 # Subtest 1: multi-page read assembles all matching runs across pages.
 printf 'ok1;ok2;ok2\n' > "$WF_PAGES_FILE"
-RESULT=$(wf_run "sha1" 2>/dev/null) || RESULT="exit:$?"
+RESULT=$(wf_run "96c2b8246403c9c91d37c2c7d6eebf7558f790f4" 2>/dev/null) || RESULT="exit:$?"
 # RESULT is "exit:<rc> out:<json>" — strip the prefix before parsing the JSON.
-OUT_JSON="$(printf '%s' "$RESULT" | sed 's/^exit:[0-9]* out://')"
-RUNS="$(printf '%s' "$OUT_JSON" | jq '[.workflow_runs[]] | length' 2>/dev/null)"
+# Membership tests use the no-pipe idiom (grep -q RE <<<"$var"): this file
+# runs pipefail, and the ratchet (scripts/check-pipefail-early-exit.sh,
+# #7790) freezes new `printf | grep -q` occurrences — #7771's false answer.
+OUT_JSON="${RESULT#*out:}"
+RUNS="$(jq '[.workflow_runs[]] | length' <<<"$OUT_JSON" 2>/dev/null)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if printf '%s' "$RESULT" | grep -q 'exit:0' \
+if grep -q 'exit:0' <<<"$RESULT" \
    && [ "$RUNS" = "2" ] \
-   && printf '%s' "$OUT_JSON" | grep -q '"one"' && printf '%s' "$OUT_JSON" | grep -q '"two"' \
-   && ! printf '%s' "$OUT_JSON" | grep -q '"skip"'; then
+   && grep -q '"one"' <<<"$OUT_JSON" && grep -q '"two"' <<<"$OUT_JSON" \
+   && ! grep -q '"skip"' <<<"$OUT_JSON"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "  ${GREEN}PASS${NC}: workflow-runs Gitea reads across pages (2 runs, sha-filtered)"
 else
@@ -803,7 +806,7 @@ rc=0
   LOOM_FORGE_TYPE="gitea"
   forge_detect >/dev/null 2>&1 || true
   _GITEA_BASE_URL="https://gitea.example.com" _GITEA_TOKEN="tok" _GITEA_USERNAME="" \
-  PATH="$WF_SHIM_DIR:$PATH" forge_get_workflow_runs "owner/repo" "sha1" ) >/tmp/wf-fail.out 2>/dev/null || rc=$?
+  PATH="$WF_SHIM_DIR:$PATH" forge_get_workflow_runs "owner/repo" "96c2b8246403c9c91d37c2c7d6eebf7558f790f4" ) >/tmp/wf-fail.out 2>/dev/null || rc=$?
 TESTS_RUN=$((TESTS_RUN + 1))
 if [ "$rc" -ne 0 ] && [ ! -s /tmp/wf-fail.out ]; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
