@@ -672,6 +672,8 @@ pub(crate) fn build_status_json_value(
             "trips_total": r.trips_total,
             "core_remaining": r.core_remaining,
             "graphql_remaining": r.graphql_remaining,
+            "core_used": r.core_used,
+            "graphql_used": r.graphql_used,
             "budget_probed_at": r.budget_probed_at,
         })),
         // Per-caller forge call accounting (#9251); `null` from an older daemon.

@@ -12,6 +12,7 @@ fn line(t: i64, caller: &str, p: Pool, o: Outcome, rem: Option<u64>) -> String {
         p,
         o,
         rem,
+        usd: None,
         rst: rem.map(|_| t + 600),
     })
     .unwrap()
@@ -22,10 +23,12 @@ fn line(t: i64, caller: &str, p: Pool, o: Outcome, rem: Option<u64>) -> String {
 #[test]
 fn rate_limit_headers_parse_on_a_200() {
     let raw = "HTTP/2.0 200 OK\r\nEtag: W/\"a\"\r\nX-Ratelimit-Remaining: 4034\r\n\
-               X-Ratelimit-Reset: 1785356436\r\nX-Ratelimit-Resource: core\r\n\r\n[]";
+               X-Ratelimit-Used: 966\r\nX-Ratelimit-Reset: 1785356436\r\n\
+               X-Ratelimit-Resource: core\r\n\r\n[]";
     let r = parse_http_response(raw).unwrap();
     assert_eq!(r.ratelimit.resource.as_deref(), Some("core"));
     assert_eq!(r.ratelimit.remaining, Some(4034));
+    assert_eq!(r.ratelimit.used, Some(966));
     assert_eq!(r.ratelimit.reset_epoch, Some(1_785_356_436));
     assert_eq!(r.etag.as_deref(), Some("W/\"a\""));
 }
@@ -106,6 +109,30 @@ fn window_counts_only_lines_inside_the_window() {
     assert_eq!((ps.pool.as_str(), ps.rate_limited), ("graphql", 1));
     // The newest header reading wins.
     assert_eq!(agg.latest[&Pool::Core].remaining, 3999);
+    // Own consumption: ok + error per pool (a 304 and a rate-limited call
+    // cost nothing) — the denominator of #9855's external estimate.
+    assert_eq!(agg.consumed_per_pool()[&Pool::Core], 1);
+}
+
+#[test]
+fn a_newer_line_without_used_keeps_the_last_known_used() {
+    // A pre-#9855 binary shares the sink: its lines carry no `usd`. The
+    // newest reading must not erase the last known `used`.
+    let now = 1_800_000_000;
+    let with_used = format!(
+        r#"{{"t":{},"c":"a","p":"core","o":"ok","rem":4000,"usd":1000}}"#,
+        now - 10
+    );
+    let without_used = format!(
+        r#"{{"t":{},"c":"a","p":"core","o":"ok","rem":3900}}"#,
+        now - 5
+    );
+    let agg = aggregate_lines(
+        [with_used, without_used].iter().map(String::as_str),
+        now - WINDOW_SECS,
+    );
+    let reading = &agg.latest[&Pool::Core];
+    assert_eq!((reading.remaining, reading.used), (3900, Some(1000)));
 }
 
 #[test]
@@ -128,6 +155,7 @@ fn sink_round_trips_prunes_old_hours_and_feeds_status() {
     let headers = RateLimitHeaders {
         resource: Some("core".into()),
         remaining: Some(4321),
+        used: Some(679),
         reset_epoch: Some(now + 900),
     };
     record("test_sink_caller", Pool::Core, Outcome::NotModified, Some(&headers));
@@ -148,6 +176,12 @@ fn sink_round_trips_prunes_old_hours_and_feeds_status() {
     assert!(window.iter().all(|r| r.caller != "role_collision"), "2h-old line is outside");
     let core = report.budget.iter().find(|b| b.pool == "core").unwrap();
     assert_eq!(core.source, "headers");
+    // The reading carries the pool-wide spend (#9855) and the status carries
+    // this host's own share, so used − own is the external estimate.
+    assert_eq!(core.used, Some(679));
+    let own = report.own_window.expect("sink enabled on this thread");
+    let own_core = own.iter().find(|r| r.pool == "core").unwrap();
+    assert_eq!(own_core.consumed, 1, "the 304 costs nothing, the Ok costs one");
     // Since-start totals are process-wide; this test's unique caller is there.
     assert!(report
         .since_start
@@ -174,6 +208,8 @@ fn a_newer_breaker_probe_overrides_an_older_header_reading() {
         trips_total: 1,
         core_remaining: Some(7),
         graphql_remaining: Some(8),
+        core_used: Some(4993),
+        graphql_used: Some(4992),
         budget_probed_at: Some(probed_at),
     };
     let report = status_report(Utc::now(), Some(&snap));
@@ -181,4 +217,6 @@ fn a_newer_breaker_probe_overrides_an_older_header_reading() {
     assert_eq!((gql.remaining, gql.source.as_str()), (8, "breaker_probe"));
     let core = report.budget.iter().find(|b| b.pool == "core").unwrap();
     assert_eq!((core.remaining, core.observed_at), (7, probed_at));
+    // The probe's pool-wide spend rides along (#9855).
+    assert_eq!((core.used, gql.used), (Some(4993), Some(4992)));
 }

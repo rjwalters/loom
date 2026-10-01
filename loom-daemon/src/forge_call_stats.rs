@@ -103,6 +103,10 @@ impl Pool {
 pub struct RateLimitHeaders {
     pub resource: Option<String>,
     pub remaining: Option<u64>,
+    /// The pool's total spend this GitHub window by every client of the
+    /// credential (Issue #9855) — with the host ledger this splits into own
+    /// vs external consumption.
+    pub used: Option<u64>,
     pub reset_epoch: Option<i64>,
 }
 
@@ -113,6 +117,7 @@ impl RateLimitHeaders {
         match name.trim().to_ascii_lowercase().as_str() {
             "x-ratelimit-resource" => self.resource = Some(value.to_string()),
             "x-ratelimit-remaining" => self.remaining = value.parse().ok(),
+            "x-ratelimit-used" => self.used = value.parse().ok(),
             "x-ratelimit-reset" => self.reset_epoch = value.parse().ok(),
             _ => {}
         }
@@ -164,6 +169,7 @@ pub fn record(
         p: pool,
         o: outcome,
         rem: headers.and_then(|h| h.remaining),
+        usd: headers.and_then(|h| h.used),
         rst: headers.and_then(|h| h.reset_epoch),
     };
     if let Ok(mut state) = process_state().lock() {
@@ -189,6 +195,10 @@ struct SinkLine {
     o: Outcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rem: Option<u64>,
+    /// `x-ratelimit-used` of that response (Issue #9855). Absent on lines
+    /// written by a pre-#9855 binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usd: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rst: Option<i64>,
 }
@@ -204,6 +214,10 @@ struct Counts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Reading {
     remaining: u64,
+    /// The pool's total spend (`x-ratelimit-used`), when the line carried it.
+    /// A newer line without it (a pre-#9855 binary sharing the sink) keeps
+    /// the last known value — staleness is bounded by the reading's age.
+    used: Option<u64>,
     reset_epoch: Option<i64>,
     observed_at: i64,
 }
@@ -232,14 +246,26 @@ impl Aggregate {
                 .get(&line.p)
                 .is_none_or(|r| r.observed_at <= line.t);
             if newer {
+                let used = line.usd.or_else(|| self.latest.get(&line.p).and_then(|r| r.used));
                 let reading = Reading {
                     remaining,
+                    used,
                     reset_epoch: line.rst,
                     observed_at: line.t,
                 };
                 self.latest.insert(line.p, reading);
             }
         }
+    }
+
+    /// Budget-costing calls per pool over the aggregated lines: `ok` and
+    /// `error` outcomes (a `304` and a rate-limited call cost nothing).
+    fn consumed_per_pool(&self) -> BTreeMap<Pool, u64> {
+        let mut spent: BTreeMap<Pool, u64> = BTreeMap::new();
+        for ((_, pool), c) in &self.counts {
+            *spent.entry(*pool).or_default() += c.ok + c.error;
+        }
+        spent
     }
 
     fn rows(&self) -> Vec<ForgeCallCounts> {
@@ -396,6 +422,15 @@ pub fn status_report(
 ) -> ForgeCallsStatus {
     let now_ts = now.timestamp();
     let window = sink_dir().map(|d| read_window(&d, now_ts));
+    let own_window = window.as_ref().map(|w| {
+        w.consumed_per_pool()
+            .into_iter()
+            .map(|(pool, consumed)| crate::types::ForgePoolSpend {
+                pool: pool.as_str().to_string(),
+                consumed,
+            })
+            .collect()
+    });
     let (since_start, since, process_latest) = match process_state().lock() {
         Ok(s) => (s.rows(), epoch(s.started_at), s.latest.clone()),
         Err(_) => (Vec::new(), None, BTreeMap::new()),
@@ -417,6 +452,7 @@ pub fn status_report(
                 ForgeBudgetReading {
                     pool: pool.as_str().to_string(),
                     remaining: r.remaining,
+                    used: r.used,
                     reset_at: r.reset_epoch.and_then(epoch),
                     observed_at: epoch(r.observed_at)?,
                     source: "headers".to_string(),
@@ -426,15 +462,16 @@ pub fn status_report(
         .collect();
     if let Some(b) = breaker {
         if let Some(probed_at) = b.budget_probed_at {
-            for (pool, remaining) in [
-                (Pool::Core, b.core_remaining),
-                (Pool::Graphql, b.graphql_remaining),
+            for (pool, remaining, used) in [
+                (Pool::Core, b.core_remaining, b.core_used),
+                (Pool::Graphql, b.graphql_remaining, b.graphql_used),
             ] {
                 let Some(remaining) = remaining else { continue };
                 if budget.get(&pool).is_none_or(|r| r.observed_at < probed_at) {
                     let reading = ForgeBudgetReading {
                         pool: pool.as_str().to_string(),
                         remaining,
+                        used,
                         reset_at: None,
                         observed_at: probed_at,
                         source: "breaker_probe".to_string(),
@@ -450,7 +487,19 @@ pub fn status_report(
         since_start,
         since,
         budget: budget.into_values().collect(),
+        own_window,
     }
+}
+
+/// This host's budget-costing forge calls per pool over the last window —
+/// `ok` + `error` outcomes, host-wide from the sink (Issue #9855). The
+/// breaker's trip-time attribution log divides a pool's `used` by this to
+/// estimate the external share. `None` when the sink is disabled — own
+/// consumption is unknown, not zero.
+#[must_use]
+pub fn consumed_in_window(now: DateTime<Utc>) -> Option<BTreeMap<Pool, u64>> {
+    let dir = sink_dir()?;
+    Some(read_window(&dir, now.timestamp()).consumed_per_pool())
 }
 
 #[cfg(test)]

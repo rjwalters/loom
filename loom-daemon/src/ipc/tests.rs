@@ -1578,6 +1578,8 @@ mod rate_limit_dispatch_refusal_tests {
             trips_total: 1,
             core_remaining: None,
             graphql_remaining: None,
+            core_used: None,
+            graphql_used: None,
             budget_probed_at: None,
         }
     }
@@ -1607,6 +1609,8 @@ mod rate_limit_dispatch_refusal_tests {
             trips_total: 0,
             core_remaining: None,
             graphql_remaining: None,
+            core_used: None,
+            graphql_used: None,
             budget_probed_at: None,
         };
         assert!(rate_limit_dispatch_refusal(&kind, Some(&snap), false).is_none());
