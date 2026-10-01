@@ -8,6 +8,17 @@
 
 Loom spawns AI agents that claim issues, implement features, review PRs, and merge code -- all coordinated through labels. Your only job: write issues, review PRs, merge what you like.
 
+> **What Loom optimizes for — and when it's the wrong tool.** Loom is tuned for
+> *unattended correctness over long horizons*: code you can leave running overnight and
+> still trust in the morning. Its gates (Curator, Judge, Doctor, merge-risk holds,
+> `buildGate`) buy that guarantee at the cost of latency.
+>
+> **If you need to ship in hours with a human watching continuously, Loom is the wrong
+> tool.** Work in live agent sessions instead of dispatching sweeps, write fewer tests,
+> merge without a review round-trip, and patch symptoms rather than root causes. See
+> [Latency vs. Reliability](docs/philosophy/latency-vs-reliability.md) for why that
+> recipe is right there and wrong everywhere else.
+
 **Supported Forges**: GitHub | Gitea — Loom auto-detects your forge from the git remote URL. A forge abstraction layer — `defaults/scripts/lib/forge-helpers.sh` for shell scripts, plus the Rust `loom-daemon/src/forge_*.rs` modules for the daemon — makes the workflow identical regardless of forge.
 
 ## Quick Start
