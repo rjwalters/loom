@@ -42,7 +42,7 @@ pub const OUTCOME_UNKNOWN: &str = "unknown";
 /// One executed (or explicitly unexecuted) probe case, as the receipt
 /// records it and #9789's acceptance criteria require.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct CaseResult {
+pub struct CaseResult {
     /// The manifest's `test_id` (`forge-probe::<group>::<name>`).
     pub test_id: String,
     /// The manifest operation this case exercises.
@@ -105,7 +105,9 @@ pub(crate) struct ProbeEntryView {
 
 /// HTTP transport: one request with an explicit token. Bounded by the
 /// config's timeout; no retries (a probe records, it does not fight).
-pub(crate) trait ProbeHttp {
+/// Public because `run` exposes it and the bin's CLI tree (a separate
+/// crate) injects the fake — or the live impl — from outside the lib.
+pub trait ProbeHttp {
     fn request(
         &self,
         method: &str,
@@ -117,7 +119,7 @@ pub(crate) trait ProbeHttp {
 
 /// The resolved, validated configuration.
 #[derive(Debug, Clone)]
-pub(crate) struct RunnerConfig {
+pub struct RunnerConfig {
     /// e.g. `https://gitea.example.com` (the runbook's
     /// `GITEA_QUAL_INSTANCE_URL`).
     pub origin: String,
@@ -137,7 +139,7 @@ pub(crate) struct RunnerConfig {
 
 /// The live transport: `curl` with the Authorization header on stdin
 /// (#5982 — never argv), bounded `--max-time`.
-pub(crate) struct LiveHttp {
+pub struct LiveHttp {
     pub origin: String,
     pub timeout: Duration,
 }
@@ -209,7 +211,7 @@ impl ProbeHttp for LiveHttp {
 /// Build the receipt: every required-profile row from the probe manifest,
 /// in the manifest's risk-first order, executed where a handler exists and
 /// `unknown` where it does not.
-pub(crate) fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> {
+pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> {
     let inv = crate::forge_inventory::load_embedded()?;
     let manifest = crate::forge_inventory::probe::build(&inv, &[]);
     let mut results = Vec::new();
@@ -497,7 +499,7 @@ fn now_secs() -> u64 {
 /// #9789's "required unknowns/unsupported produce a nonzero qualification
 /// verdict" rule. A successful API response alone is insufficient. Returns
 /// (ok, unknown_required, failed_required, unsupported_required).
-pub(crate) fn verdict(results: &[CaseResult]) -> (bool, usize, usize, usize) {
+pub fn verdict(results: &[CaseResult]) -> (bool, usize, usize, usize) {
     let mut unknown = 0;
     let mut failed = 0;
     let mut unsupported = 0;
