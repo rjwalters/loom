@@ -564,24 +564,46 @@ fn ci_job_log_bodies_are_scrubbed_at_the_gateway_before_both_sinks() {
 fn gateway_scrubs_exactly_the_declared_ci_log_classes() {
     use loom_daemon::telemetry::ci::{CI_LOG_CHUNK_MARKER_KEY, CI_LOG_SCRUB_CLASSES};
 
-    let statements: Vec<&str> = CONFIG
+    let all_statements: Vec<&str> = CONFIG
         .lines()
         .map(str::trim)
         .filter(|line| line.contains("replace_pattern(body,"))
         .collect();
     assert!(
-        statements.len() >= CI_LOG_SCRUB_CLASSES.len(),
+        all_statements.len() >= CI_LOG_SCRUB_CLASSES.len(),
         "the collector has fewer body-rewriting statements than declared scrub classes"
     );
     let guard = format!("attributes[\"{CI_LOG_CHUNK_MARKER_KEY}\"] != nil and IsString(body)");
+    // #9764 added `session.output`, a second kind whose body is foreign text
+    // and which therefore has its own scrub stage with its own class list. The
+    // "cannot quietly lose its scope guard" protection below is what actually
+    // matters, so it is generalised rather than dropped: every body rewrite
+    // must be scoped to exactly one KNOWN kind, and an unguarded statement —
+    // which would rewrite every kind's body — still fails.
+    const SESSION_OUTPUT_GUARD: &str =
+        r#"attributes["loom.session.output.event_id"] != nil and IsString(body)"#;
+    let mut statements: Vec<&str> = Vec::new();
+    for statement in &all_statements {
+        let ci = statement.contains(&guard);
+        let session_output = statement.contains(SESSION_OUTPUT_GUARD);
+        assert!(
+            ci ^ session_output,
+            "a body rewrite must be scoped to exactly one kind's records \
+             (ci.job.log or session.output), not zero and not both: {statement}"
+        );
+        if ci {
+            statements.push(statement);
+        }
+    }
+    assert!(
+        !statements.is_empty(),
+        "no statement carried the ci.job.log guard — the guard text changed, and an \
+         empty scan would make the class comparison below vacuously pass"
+    );
     // A class may need more than one pattern, so consecutive repeats
     // collapse; the class ORDER is load-bearing and compared exactly.
     let mut classes: Vec<String> = Vec::new();
     for statement in &statements {
-        assert!(
-            statement.contains(&guard),
-            "a body rewrite is not scoped to ci.job.log records: {statement}"
-        );
         let start = statement
             .find("[REDACTED:")
             .expect("every body rewrite replaces with a [REDACTED:<class>] marker");

@@ -888,11 +888,15 @@ fn collector_scrub_classes_match_the_declared_list() {
     // A class may need more than one pattern (github-token covers both the
     // `gh*_` prefixes and `github_pat_`), so consecutive repeats collapse —
     // but the ORDER of classes is load-bearing and is compared exactly.
+    // Scoped by the CI guard, not `replace_pattern(body,` alone: #9764 added a
+    // second body-scrub stage with its own class list; an unscoped scan mixes
+    // the two. No separate "did anything match" assert is needed — a guard that
+    // stopped matching yields no markers, and the comparison below is against a
+    // non-empty CI_LOG_SCRUB_CLASSES, so a vacuous scan already fails.
+    const CI_GUARD: &str = r#"attributes["loom.ci.chunk_index"] != nil"#;
+    let is_ci = |l: &&str| l.contains("replace_pattern(body,") && l.contains(CI_GUARD);
     let mut markers: Vec<String> = Vec::new();
-    for line in COLLECTOR_CONFIG
-        .lines()
-        .filter(|line| line.contains("replace_pattern(body,"))
-    {
+    for line in COLLECTOR_CONFIG.lines().filter(is_ci) {
         let start = line.find("[REDACTED:").expect("a replacement marker");
         let end = line[start..].find(']').expect("a closed marker") + start;
         let class = line[start + "[REDACTED:".len()..end].to_string();
