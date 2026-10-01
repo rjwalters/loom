@@ -359,13 +359,12 @@ fn issue_create(
         "body": "disposable probe resource — safe to delete (run receipt carries the number)"
     })
     .to_string();
-    let (code, resp) = http.request(
-        "POST",
-        &format!("repos/{}/issues", cfg.repo),
-        &cfg.writer_token,
-        Some(&body),
-    )
-    .map_err(|e| ForgeOutcome::Unknown { operation: view.id.clone(), why: e })?;
+    let (code, resp) = http
+        .request("POST", &format!("repos/{}/issues", cfg.repo), &cfg.writer_token, Some(&body))
+        .map_err(|e| ForgeOutcome::Unknown {
+            operation: view.id.clone(),
+            why: e,
+        })?;
     let created = serde_json::from_str::<serde_json::Value>(resp.trim()).ok();
     let number = created
         .as_ref()
@@ -381,13 +380,14 @@ fn issue_create(
         at: now_secs(),
         expected: format!("HTTP 2xx with issue.number (disposable: {title})"),
         observed,
-        notes: number.map(|n| vec![format!("disposable issue number: {n}")]).unwrap_or_default(),
+        notes: number
+            .map(|n| vec![format!("disposable issue number: {n}")])
+            .unwrap_or_default(),
     };
     match (code, number) {
-        (200..=299, Some(n)) => Ok(base(
-            OUTCOME_PASS,
-            format!("issue #{n} created in {}", cfg.repo),
-        )),
+        (200..=299, Some(n)) => {
+            Ok(base(OUTCOME_PASS, format!("issue #{n} created in {}", cfg.repo)))
+        }
         (403 | 404, _) => Err(ForgeOutcome::InsufficientPermission {
             operation: view.id.clone(),
             principal: crate::forge_contract::CredentialRef("env:GITEA_QUAL_WRITER_TOKEN".into()),
@@ -417,26 +417,34 @@ fn issue_comment_readback(
             why: "issue-create did not yield a number to comment on".into(),
         })?;
     let marker = format!("probe-{}", now_secs());
-    let (code, resp) = http.request(
-        "POST",
-        &format!("repos/{}/issues/{number}/comments", cfg.repo),
-        &cfg.writer_token,
-        Some(&serde_json::json!({"body": marker}).to_string()),
-    )
-    .map_err(|e| ForgeOutcome::Unknown { operation: view.id.clone(), why: e })?;
+    let (code, resp) = http
+        .request(
+            "POST",
+            &format!("repos/{}/issues/{number}/comments", cfg.repo),
+            &cfg.writer_token,
+            Some(&serde_json::json!({"body": marker}).to_string()),
+        )
+        .map_err(|e| ForgeOutcome::Unknown {
+            operation: view.id.clone(),
+            why: e,
+        })?;
     if !(200..=299).contains(&code) {
         return Err(ForgeOutcome::Unknown {
             operation: view.id.clone(),
             why: format!("comment POST answered {code}: {}", truncate(&resp)),
         });
     }
-    let (rcode, rresp) = http.request(
-        "GET",
-        &format!("repos/{}/issues/{number}/comments", cfg.repo),
-        &cfg.writer_token,
-        None,
-    )
-    .map_err(|e| ForgeOutcome::Unknown { operation: view.id.clone(), why: e })?;
+    let (rcode, rresp) = http
+        .request(
+            "GET",
+            &format!("repos/{}/issues/{number}/comments", cfg.repo),
+            &cfg.writer_token,
+            None,
+        )
+        .map_err(|e| ForgeOutcome::Unknown {
+            operation: view.id.clone(),
+            why: e,
+        })?;
     let seen = serde_json::from_str::<serde_json::Value>(rresp.trim())
         .ok()
         .and_then(|v| {
@@ -588,7 +596,6 @@ mod tests {
         }
     }
 
-
     fn cfg(live_write: bool) -> RunnerConfig {
         RunnerConfig {
             origin: "https://gitea.example.com".into(),
@@ -623,7 +630,9 @@ mod tests {
         let results = run(&cfg(false), &http).unwrap();
         let write_unknown = results.iter().filter(|r| {
             r.outcome == OUTCOME_UNKNOWN
-                && r.notes.iter().any(|n| n.contains("live-write not opted in"))
+                && r.notes
+                    .iter()
+                    .any(|n| n.contains("live-write not opted in"))
         });
         assert!(write_unknown.count() > 0, "write rows refuse without opt-in");
         let exec = results.iter().filter(|r| r.outcome == OUTCOME_PASS).count();
@@ -649,14 +658,14 @@ mod tests {
     fn issue_create_passes_on_2xx_with_a_number_and_records_the_disposable_number() {
         let mut http = FakeHttp::new();
         http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-        http.push(
-            "issues",
-            vec![Ok((201, r#"{"number": 12, "title": "x"}"#.into()))],
-        );
+        http.push("issues", vec![Ok((201, r#"{"number": 12, "title": "x"}"#.into()))]);
         let mut cfg = cfg(true);
         cfg.only = vec!["issue-create".into()];
         let results = run(&cfg, &http).unwrap();
-        let row = results.iter().find(|r| r.test_id.contains("issue-create")).unwrap();
+        let row = results
+            .iter()
+            .find(|r| r.test_id.contains("issue-create"))
+            .unwrap();
         assert_eq!(row.outcome, OUTCOME_PASS);
         assert!(row.notes.iter().any(|n| n.contains("12")));
         assert!(row.observed.contains("#12"));
@@ -670,7 +679,10 @@ mod tests {
         let mut cfg = cfg(true);
         cfg.only = vec!["issue-create".into()];
         let results = run(&cfg, &http).unwrap();
-        let row = results.iter().find(|r| r.test_id.contains("issue-create")).unwrap();
+        let row = results
+            .iter()
+            .find(|r| r.test_id.contains("issue-create"))
+            .unwrap();
         // The transport outcome is Unknown in the receipt (the outcome enum
         // carried InsufficientPermission), and the verdict stays nonzero —
         // a permission problem is never a pass.
@@ -691,14 +703,14 @@ mod tests {
             ],
         );
         // comments GET: marker absent -> FAIL
-        http.push(
-            "comments",
-            vec![Ok((200, r#"[{"body": "something else"}]"#.into()))],
-        );
+        http.push("comments", vec![Ok((200, r#"[{"body": "something else"}]"#.into()))]);
         let mut cfg = cfg(true);
         cfg.only = vec!["issue-comment".into()];
         let results = run(&cfg, &http).unwrap();
-        let row = results.iter().find(|r| r.test_id.contains("issue-comment")).unwrap();
+        let row = results
+            .iter()
+            .find(|r| r.test_id.contains("issue-comment"))
+            .unwrap();
         assert_eq!(row.outcome, OUTCOME_FAIL, "absent marker is a fail");
     }
 
