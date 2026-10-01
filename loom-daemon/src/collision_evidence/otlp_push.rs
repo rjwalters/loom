@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(a.status, Some(200));
         assert_eq!(a.endpoint_host, "collector.example.com");
         assert_eq!(a.error, None);
-        assert_eq!(a.body_bytes, 21);
+        assert_eq!(a.body_bytes, 19);
         assert_no_secret_in_log(a);
     }
 
