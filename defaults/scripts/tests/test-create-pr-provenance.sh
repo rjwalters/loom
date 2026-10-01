@@ -51,6 +51,16 @@ if [[ "$1" == "pr" && "$2" == "create" ]]; then
   echo "https://github.com/owner/repo/pull/9999"
   exit 0
 fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/9999" && "$3" == "-X" && "$4" == "PATCH" ]]; then
+  # #9774: create-pr.sh's post-create body PATCH (the dashboard footer).
+  args=("$@")
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    if [[ "${args[i]}" == -f && "${args[i + 1]}" == body=* ]]; then
+      printf '%s' "${args[i + 1]#body=}" > "$LOOM_TEST_STUB_DIR/patch-body.txt"
+    fi
+  done
+  exit 0
+fi
 echo "stub gh: unhandled args: $*" >&2
 exit 3
 STUB
@@ -133,6 +143,23 @@ assert_eq "" "$(cat "$STUB_DIR/daemon-args.txt" 2>/dev/null || true)" "T3: daemo
 LOOM_DAEMON_SELF_BIN="$STUB_DIR/daemon-ok" run_create_pr --body "Closes #42
 Appends a \`<!-- loom:provenance v1 ... -->\` line."
 assert_eq "$MARKER" "$(last_line)" "T4: a quoted marker in prose still gets a record"
+
+# T5 (#9774): the post-create PATCH puts the dashboard footer on the REMOTE
+# body — after the provenance record, exactly once, linking /pull/9999.
+assert_eq "1" "$(grep -c '<!-- loom:dashboard-link -->' "$STUB_DIR/patch-body.txt" || true)" \
+  "T5: the PATCHed body carries the dashboard-link marker once"
+if grep -qF '[loom dashboard](https://dashboard.2amlogic.com/github.com/owner/repo/pull/9999)' "$STUB_DIR/patch-body.txt"; then
+  echo "  PASS: T5: the footer links the PR's dashboard page (/pull/N)"
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  echo "  FAIL: T5: the footer links the PR's dashboard page (/pull/N)"
+fi
+if grep -qF "$MARKER" "$STUB_DIR/patch-body.txt"; then
+  echo "  PASS: T5: the PATCHed body still carries the provenance record (footer appended after it)"
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  echo "  FAIL: T5: the PATCHed body still carries the provenance record (footer appended after it)"
+fi
 
 echo ""
 echo "Tests run: $TESTS_RUN, failed: $TESTS_FAILED"

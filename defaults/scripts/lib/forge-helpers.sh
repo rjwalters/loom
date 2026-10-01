@@ -44,6 +44,8 @@ set -euo pipefail
 _LOOM_FORGE_HELPERS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck source=./config-resolver.sh
 source "$_LOOM_FORGE_HELPERS_LIB_DIR/config-resolver.sh"
+# shellcheck source=./dashboard-link.sh
+source "$_LOOM_FORGE_HELPERS_LIB_DIR/dashboard-link.sh"
 
 # --- Forge Detection ---
 
@@ -1446,7 +1448,13 @@ forge_gh_repo_safe() {
 # Usage: forge_gh_comment_rl_safe NWO NUMBER BODY
 # Returns 0 on success (either path), 1 on failure (message on stderr).
 forge_gh_comment_rl_safe() {
-  local nwo="$1" number="$2" body="$3"
+  local nwo="$1" number="$2" body="$3" is_pr="${4:-0}"
+  # #9774: every comment the shell posts carries the dashboard footer —
+  # appended HERE, never accepted as part of $BODY, so omission is
+  # structurally impossible (the same reasoning as the verdict marker in
+  # post-verdict.sh). IS_PR=1 says the number names a pull request (the
+  # footer's link says /pull/N); the endpoint below is shared.
+  body="$(forge_append_dashboard_footer "$nwo" "$number" "$is_pr" "$body")"
   local out; nwo="$(loom_write_repo "$nwo")" || return 1  # #9548
   if out=$(forge_gh_perm_safe issue comment "$number" --repo "$nwo" --body "$body" 2>&1); then
     return 0

@@ -113,6 +113,28 @@ if [[ "$1" == "repo" && "$2" == "view" ]]; then
   exit 0
 fi
 
+if [[ "$1" == "issue" && "$2" == "comment" ]]; then
+  # #9774: post-verdict.sh posts through forge_gh_comment_rl_safe, which is
+  # `gh issue comment` shaped (a PR IS an issue for comments) — same capture
+  # contract as the `pr comment` case below.
+  pr_num="$3"
+  body=""
+  args=("$@")
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    if [[ "${args[i]}" == "--body" ]]; then
+      body="${args[i + 1]}"
+    fi
+  done
+  if [[ -f "$STUB_DIR_FROM_ENV/comment-fail-$pr_num" ]]; then
+    echo "stub gh: issue comment failed" >&2
+    exit 1
+  fi
+  printf '%s\n' "$pr_num" > "$STUB_DIR_FROM_ENV/last-pr.txt"
+  printf '%s' "$body" > "$STUB_DIR_FROM_ENV/last-body.txt"
+  echo "https://github.com/owner/repo/issues/$pr_num#issuecomment-1"
+  exit 0
+fi
+
 if [[ "$1" == "pr" && "$2" == "comment" ]]; then
   pr_num="$3"
   body=""

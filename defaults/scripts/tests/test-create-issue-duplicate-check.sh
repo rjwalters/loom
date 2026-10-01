@@ -167,6 +167,16 @@ if [[ "${1:-}" == "issue" && "${2:-}" == "create" ]]; then
     echo "https://github.com/example/repo/issues/9999"
     exit 0
 fi
+if [[ "${1:-}" == "api" && "${2:-}" == "repos/example/repo/issues/9999" && "${3:-}" == "-X" && "${4:-}" == "PATCH" ]]; then
+    # #9774: create-issue.sh's post-create body PATCH (the dashboard footer).
+    for ((i = 1; i <= $#; i++)); do
+        if [[ "${!i}" == "-f" ]]; then
+            j=$((i + 1))
+            printf '%s' "${!j#body=}" > "${STUB_GH_PATCH:-/dev/null}"
+        fi
+    done
+    exit 0
+fi
 if [[ "${1:-}" == "issue" && "${2:-}" == "list" ]]; then
     # Only the end-to-end case (11c) reaches this: it runs the REAL
     # check-duplicate.sh, which fetches the open-issue pool from here.
@@ -200,6 +210,7 @@ chmod +x "$FAKE_BIN/loom-daemon"
 
 DUP_CALLS="$WORK/dup-calls.log"
 GH_CREATES="$WORK/gh-creates.log"
+GH_PATCH="$WORK/gh-patch-body.txt"
 
 # run_create [env assignments handled by caller] <args...>
 # Always: github forge forced, filing lock disabled (covered by
@@ -207,6 +218,7 @@ GH_CREATES="$WORK/gh-creates.log"
 run_create() {
     : > "$DUP_CALLS"
     : > "$GH_CREATES"
+    : > "$GH_PATCH"
     OUT="$(
         PATH="$FAKE_BIN:$PATH" \
         LOOM_FORGE_TYPE=github \
@@ -214,6 +226,7 @@ run_create() {
         STUB_DUP_MODE="${STUB_DUP_MODE:-clean}" \
         STUB_DUP_CALLS="$DUP_CALLS" \
         STUB_GH_CREATES="$GH_CREATES" \
+        STUB_GH_PATCH="$GH_PATCH" \
         STUB_GH_MODE="${STUB_GH_MODE:-ok}" \
         STUB_ISSUE_LIST="${STUB_ISSUE_LIST:-}" \
         LOOM_SKIP_DUPLICATE_CHECK="${LOOM_SKIP_DUPLICATE_CHECK:-}" \
@@ -245,6 +258,12 @@ assert_contains "$OUT" "https://github.com/example/repo/issues/9999" "issue URL 
 assert_eq "$(wc -l < "$GH_CREATES" | tr -d ' ')" "1" "exactly one create"
 assert_contains "$(cat "$GH_CREATES")" "loom:triage" "label rode along with the create"
 assert_eq "$(wc -l < "$DUP_CALLS" | tr -d ' ')" "1" "the duplicate check ran"
+# #9774: the filed body is PATCHed to carry the dashboard footer.
+assert_contains "$(cat "$GH_PATCH")" \
+  "[loom dashboard](https://dashboard.2amlogic.com/github.com/example/repo/issues/9999)" \
+  "the post-create PATCH appends the dashboard footer"
+assert_contains "$(cat "$GH_PATCH")" "A brand new thing." \
+  "the PATCHed body still carries the filed text"
 
 echo
 

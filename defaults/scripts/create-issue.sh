@@ -425,6 +425,16 @@ fi
 # Release on every exit path, including a failed create or an interrupt.
 trap 'loom_filing_lock_release' EXIT INT TERM
 
-if ! forge_gh_create_issue_rl_safe "$REPO_NWO" "$TITLE" "$BODY" "${LABELS[@]+"${LABELS[@]}"}"; then
-  exit 1
+ISSUE_URL="$(forge_gh_create_issue_rl_safe "$REPO_NWO" "$TITLE" "$BODY" "${LABELS[@]+"${LABELS[@]}"}")" || exit 1
+echo "$ISSUE_URL"
+
+# --- #9774: the filed body ends with the dashboard footer -------------------
+# The number exists only after the create, so this is a best-effort PATCH of
+# the body we just wrote (idempotent on the marker) — a failure logs and never
+# un-files the issue.
+if [[ "$ISSUE_URL" =~ ^https://github\.com/([^/]+)/([^/]+)/issues/([0-9]+) ]]; then
+  footered="$(forge_append_dashboard_footer "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" 0 "$BODY")"
+  if ! gh api "repos/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/issues/${BASH_REMATCH[3]}" -X PATCH -f body="$footered" >/dev/null 2>&1; then
+    echo "create-issue.sh: note: could not append the dashboard footer to the filed body (best-effort; the issue itself is filed)" >&2
+  fi
 fi
