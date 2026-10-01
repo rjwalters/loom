@@ -20,6 +20,7 @@
 # twin (lib/dashboard-link.sh) and is the binary-absent path.
 
 set -uo pipefail
+# requires-daemon: forge >= 0.19.598   #9818 — the stub is a pure exec of `forge comment`, so an older binary fails right here with clap's unrecognized-subcommand error; rolling to 0.19.598+ is the remedy (there is no degraded path: an unfootered comment is what #9774 exists to prevent).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck source=./lib/locate-daemon-bin.sh
 source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"

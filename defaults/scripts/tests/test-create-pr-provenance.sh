@@ -51,16 +51,6 @@ if [[ "$1" == "pr" && "$2" == "create" ]]; then
   echo "https://github.com/owner/repo/pull/9999"
   exit 0
 fi
-if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/9999" && "$3" == "-X" && "$4" == "PATCH" ]]; then
-  # #9774: create-pr.sh's post-create body PATCH (the dashboard footer).
-  args=("$@")
-  for ((i = 0; i < ${#args[@]}; i++)); do
-    if [[ "${args[i]}" == -f && "${args[i + 1]}" == body=* ]]; then
-      printf '%s' "${args[i + 1]#body=}" > "$LOOM_TEST_STUB_DIR/patch-body.txt"
-    fi
-  done
-  exit 0
-fi
 echo "stub gh: unhandled args: $*" >&2
 exit 3
 STUB
@@ -98,6 +88,20 @@ chmod +x "$STUB_DIR/daemon-ok" "$STUB_DIR/daemon-old" "$STUB_DIR/version-check-o
 
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# #9774: the post-create footer step shells out to `loom-daemon forge comment
+# --patch-created <url>` via `command -v loom-daemon` — this mock (first on
+# PATH) records the call and succeeds, so the best-effort note stays quiet and
+# the wiring is assertable without a real daemon.
+cat > "$STUB_DIR/loom-daemon" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "forge" && "${2:-}" == "comment" && "${3:-}" == "--patch-created" ]]; then
+  printf '%s\n' "$*" > "$LOOM_TEST_STUB_DIR/daemon-footer-args.txt"
+  exit 0
+fi
+echo "stub loom-daemon: unhandled args: $*" >&2
+exit 3
+STUB
+chmod +x "$STUB_DIR/loom-daemon"
 export LOOM_FORGE_TYPE=github
 export LOOM_VERSION_CHECK_SCRIPT="$STUB_DIR/version-check-ok.sh"
 
@@ -144,21 +148,20 @@ LOOM_DAEMON_SELF_BIN="$STUB_DIR/daemon-ok" run_create_pr --body "Closes #42
 Appends a \`<!-- loom:provenance v1 ... -->\` line."
 assert_eq "$MARKER" "$(last_line)" "T4: a quoted marker in prose still gets a record"
 
-# T5 (#9774): the post-create PATCH puts the dashboard footer on the REMOTE
-# body — after the provenance record, exactly once, linking /pull/9999.
-assert_eq "1" "$(grep -c '<!-- loom:dashboard-link -->' "$STUB_DIR/patch-body.txt" || true)" \
-  "T5: the PATCHed body carries the dashboard-link marker once"
-if grep -qF '[loom dashboard](https://dashboard.2amlogic.com/github.com/owner/repo/pull/9999)' "$STUB_DIR/patch-body.txt"; then
-  echo "  PASS: T5: the footer links the PR's dashboard page (/pull/N)"
+# T5 (#9774): right after the create, the script hands the PR URL to the
+# daemon's --patch-created (fetch, footer, PATCH). The stub daemon records
+# the call; the footer's application itself is the Rust verb's tested job.
+if grep -q -- '--patch-created' "$STUB_DIR/daemon-footer-args.txt" 2>/dev/null; then
+  echo "  PASS: T5: the post-create footer step calls forge comment --patch-created"
 else
   TESTS_FAILED=$((TESTS_FAILED + 1))
-  echo "  FAIL: T5: the footer links the PR's dashboard page (/pull/N)"
+  echo "  FAIL: T5: the post-create footer step calls forge comment --patch-created"
 fi
-if grep -qF "$MARKER" "$STUB_DIR/patch-body.txt"; then
-  echo "  PASS: T5: the PATCHed body still carries the provenance record (footer appended after it)"
+if grep -qF 'https://github.com/owner/repo/pull/9999' "$STUB_DIR/daemon-footer-args.txt" 2>/dev/null; then
+  echo "  PASS: T5: the footer step passes the created PR's URL"
 else
   TESTS_FAILED=$((TESTS_FAILED + 1))
-  echo "  FAIL: T5: the PATCHed body still carries the provenance record (footer appended after it)"
+  echo "  FAIL: T5: the footer step passes the created PR's URL"
 fi
 
 echo ""

@@ -160,6 +160,17 @@ chmod +x "$STUB_DIR/gh"
 
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# #9774: the transport tries the daemon chokepoint first. This suite's subject
+# is the verdict semantics over the GH ladder, so pin the SELF daemon to a
+# mock that refuses (the pre-#9818 shape) — the gh stub above stays the path
+# under test, deterministically, whatever binary the host happens to have.
+cat > "$STUB_DIR/loom-daemon" <<'MOCK'
+#!/usr/bin/env bash
+echo "mock loom-daemon: forge comment not under test here" >&2
+exit 127
+MOCK
+chmod +x "$STUB_DIR/loom-daemon"
+export LOOM_DAEMON_SELF_BIN="$STUB_DIR/loom-daemon"
 # #9548: post-verdict.sh vets its write target through the write scope before it
 # writes. It runs from a checkout registered as owner/repo (origin, .loom/, push
 # reported to the permission probe), so the real decision admits it.

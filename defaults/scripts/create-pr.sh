@@ -400,12 +400,12 @@ the PR by hand from that branch." >&2
 }
 
 # --- #9774: the opened PR's body ends with the dashboard footer -------------
-# The number exists only after the create, so this is a best-effort PATCH of
-# the body we just wrote (idempotent on the marker) — a failure logs and never
-# un-opens the PR.
-if [[ "$PR_URL" =~ ^https://github\.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
-  footered="$(forge_append_dashboard_footer "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" 1 "$BODY")"
-  if ! gh api "repos/$REPO_NWO/issues/${BASH_REMATCH[3]}" -X PATCH -f body="$footered" >/dev/null 2>&1; then
+# Best-effort, via the daemon's --patch-created (fetch, footer, PATCH — the
+# number exists only inside the URL after the create). A daemon that cannot
+# (absent, or pre-#9818) leaves the body unfootered; it never un-opens the PR.
+# requires-daemon: forge optional   absent or pre-#9818 binary → the footer is skipped with a stderr note; the PR itself is already open (#9774)
+if self_bin="$(command -v loom-daemon 2>/dev/null)" && [[ -n "$self_bin" ]]; then
+  if ! "$self_bin" forge comment --patch-created "$PR_URL" >/dev/null 2>&1; then
     echo "create-pr.sh: note: could not append the dashboard footer to the PR body (best-effort; the PR itself is open)" >&2
   fi
 fi

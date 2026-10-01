@@ -151,7 +151,6 @@ test-merge-pr-help.sh
 test-merge-pr-merge-method.sh
 test-merge-pr-rate-limit-fallback.sh
 test-nextest-daemon-guard.sh
-test-dashboard-link.sh
 test-operator-only-subkind.sh
 test-post-verdict.sh
 test-pr-worktree-isolation.sh

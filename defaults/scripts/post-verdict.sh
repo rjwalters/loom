@@ -351,6 +351,7 @@ FULL_BODY="$FULL_BODY
 # sourced inside the command substitution because it turns on `set -e`.
 REPO="$(source "$SCRIPT_DIR/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { echo "post-verdict.sh: not posting the verdict on PR #$PR: loom-daemon forge may-write refused the repo (#9548)" >&2; exit 4; }
 # #9774: through the shared transport (never a bare `gh pr comment`), so the
-# verdict carries the dashboard footer the way every other comment does.
+# verdict posts via the daemon chokepoint when a binary resolves — dashboard
+# footer included — and via the gh ladder when it does not.
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
 forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1
