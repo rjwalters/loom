@@ -1,0 +1,10 @@
+{
+  "kind": "sweep.identity",
+  "repo": "example/project",
+  "visibility": "private",
+  "issue": 42,
+  "sweep_id": "sweep-42",
+  "runtime": "opencode",
+  "provider": "zai-coding-plan",
+  "model": "glm-5.3"
+}

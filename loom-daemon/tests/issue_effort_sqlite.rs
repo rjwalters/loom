@@ -87,21 +87,13 @@ const FIXTURE: &[Row] = &[
     },
 ];
 
-/// The `records` DDL, lifted out of `dashboard/migrations/0001_init.sql` so
-/// the query runs against the real column set rather than an invented one. A
-/// renamed or dropped column fails here instead of in production.
+/// The `records` DDL, vendored verbatim from the D1 initial migration that
+/// now lives in `2AMLogic/loom-ui` (`migrations/0001_init.sql`), so the query
+/// runs against the real column set rather than an invented one.
 fn records_ddl() -> String {
-    let migration = std::fs::read_to_string(repo_file("dashboard/migrations/0001_init.sql"))
-        .expect("the D1 initial migration must be readable");
-    let start = migration
-        .find("CREATE TABLE records (")
-        .expect("0001_init.sql must define the `records` table");
-    let end = migration[start..]
-        .find(");")
-        .expect("the `records` DDL must terminate")
-        + start
-        + 2;
-    migration[start..end].to_string()
+    include_str!("fixtures/records-ddl.sql")
+        .trim_end()
+        .to_string()
 }
 
 /// The committed query file split into its individual statements.
