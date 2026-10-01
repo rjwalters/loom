@@ -421,12 +421,19 @@ what makes the two backends comparable under #8529.
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < cycle-time-extract.sql
 ```
 
-**Not yet executed live here.** The ClickStack side is verified end to end in CI
-against a real pinned ClickHouse; this view's column contract is checked by
-`loom-daemon/tests/cycle_time_artifacts.rs`, but no number produced by it has
-been compared against the ClickStack answers on the same fixture yet. Treat it
-as unproven until that comparison is recorded in `evidence.md`, exactly as the
-trial treats every other unexecuted claim.
+**Executed against the pinned engine (2026-09-30), not yet against a live
+trial deployment.** `loom-daemon/tests/signoz_cycle_time.rs` (CI, `--ignored`)
+runs this view, the shared rollup and all eight CT queries verbatim against
+the same pinned ClickHouse `cycle_time_clickhouse.rs` uses for ClickStack, over
+a fixture built from the SAME seven `sweep.outcome` envelopes as that
+ClickStack proof — hand-translated through the real OTLP mapper's own
+`kv_int`/`kv_string` decisions into SigNoz's `attributes_string` /
+`attributes_number` split. CT1–CT8's answers match the ClickStack values
+exactly; see `evidence.md`'s "Cycle-time analytics executed against the pinned
+engine" for the comparison. This is a same-fixture, cross-backend proof against
+the pinned engine — it is **not** a live trial observation: no telemetry has
+gone through SigNoz's own ingester for this view, which is what #8529's
+real-canary comparison still needs.
 
 ## Retention and operation
 

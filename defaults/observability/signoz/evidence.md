@@ -1078,6 +1078,65 @@ network, backend or credential is used, so this runs in ordinary CI on any
 host — including this one, which has neither Docker Compose nor a running
 trial to observe.
 
+## Cycle-time analytics executed against the pinned engine (2026-09-30)
+
+`signoz/cycle-time-extract.sql` (#8665, this issue's scope item 4) carried a
+"NOT executed live" status since it landed: the ClickStack half had a real
+proof (`loom-daemon/tests/cycle_time_clickhouse.rs`, on rows the real OTLP
+exporter wrote), and the SigNoz half had only the static column-list contract
+(`cycle_time_artifacts.rs`). This closes that gap the same way
+`signoz_usage_queries.rs` closed the equivalent gap for this issue's
+measured-usage artifact: `clickhouse local` in the pinned
+`clickhouse/clickhouse-server:25.12.5` image the trial's telemetry store
+runs, no full multi-container SigNoz deployment, no persistent volume.
+
+The fixture (`loom-daemon/tests/fixtures/signoz_cycle_time/fixture.sql`) is
+the SAME seven `sweep.outcome` envelopes as the ClickStack proof's own
+fixture (`tests/fixtures/cycle_time/envelopes.jsonl.tmpl`), hand-translated
+into rows shaped like SigNoz's real `distributed_logs_v2` schema: `timestamp`
+as raw `UInt64` nanoseconds (not `DateTime64`, which
+`fromUnixTimestamp64Nano(toInt64(timestamp))` would silently misread — caught
+live: the first draft used `DateTime64(9)` literals and every `finished_at`
+came back as 1970-01-01), and each field split into `attributes_string` /
+`attributes_number` by the REAL mapper's own `kv_int` vs `kv_string` call
+sites in `otlp/mapping.rs` and `otlp/mapping/metadata.rs` (`loom.issue`,
+`loom.total_duration_sec`, `loom.pr_number` and `loom.doctor_cycles` are
+`kv_int`; everything else, including the array-valued `loom.phase_durations`,
+is `kv_string`), not by a convenience choice.
+
+Because the fixture is the identical workload, `loom-daemon/tests/
+signoz_cycle_time.rs` runs `cycle-time-extract.sql`, the shared
+`cycle-time-rollup.sql` and all eight of the shared `cycle-time-queries.sql`
+questions verbatim and compares every answer against the values
+`cycle_time_clickhouse.rs` already asserts for ClickStack over the same
+seven envelopes. All matched exactly on the pinned engine: CT1's five-ship
+headline (`ship-beta-103` 5400s/no breakdown down to `ship-alpha-105`
+265s/builder, `ship-alpha-102`'s repair loop correctly dominated by `judge`
+at 1500s rather than `builder`'s single 900s), CT2's per-phase total of 1910s
+for `judge`, CT3's 50% success rate for `synthetic/beta`, CT4's NULL
+(never-defaulted) runtime bucket, CT5's one repaired ship at 400
+doctor-seconds, CT6's six ships summed across week buckets, CT7's exact
+`[6,1,1,1,1,2,1,2,0]` coverage row and CT8's `[6,6,0,0,0]` rollup-fidelity
+row. A second test proves the two deliberate SigNoz-specific differences the
+extract view's own header documents: an eighth row
+(`ship-fallback-check`, timestamped in the year 2200 so it cannot perturb the
+six-ship comparison above) carries `loom.issue` and `loom.total_duration_sec`
+ONLY in `attributes_string`, and both resolved correctly through the
+`attributes_number`-first-then-fallback read; the same row omits
+`loom.pr_number` and `loom.doctor_cycles` from both maps, and both stayed
+`NULL` rather than becoming `0`.
+
+**What this establishes and what it does not.** This is a same-fixture,
+cross-backend numeric-parity proof against the pinned ClickHouse engine — the
+first such proof for the cycle-time artifact set, and stronger evidence than
+either backend's proof alone, because it rules out the two answers agreeing
+by coincidence on unrelated data. It is **not** a live trial observation: no
+telemetry went through SigNoz's own ingester, migrator or `distributed_logs_v2`
+table as SigNoz actually creates it — this is `clickhouse local`, the same
+caveat `signoz_usage_queries.rs` already carries for the measured-usage
+artifact. That gap is the same one #8525 and #9279 name for every other
+not-yet-live-executed SigNoz artifact in this trial.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -1103,6 +1162,7 @@ trial to observe.
 | CI logs/traces at 7 days on the current trial | **Open** — API-owned tables still at the upstream 15 days; needs the org login ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | Six CI saved views in the trial org | **Open** — recreation steps written in the README, not yet executed in the UI ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | Measured usage parity with ClickStack's "Loom measured usage" view | **Passed against the pinned ClickHouse, open against the live trial.** `usage-queries.sql` (sections 0–6) plus four README saved-view rows close the parity gap; `signoz_usage_queries.rs` executes the committed file verbatim on ClickHouse 25.12.5 and observes scope resolution, at-least-once dedupe, NULL-not-zero dollars for an unpriced model, unknown-vs-measured-zero, the repo-by-trace join, and the wrong-container silent zero (see "Measured usage" above). No run over real canary data on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
+| Cycle-time analytics parity with ClickStack (`cycle-time-extract.sql`, #8665) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_cycle_time.rs` executes the extraction, the shared rollup and all eight CT queries verbatim over the SAME seven-envelope fixture as the ClickStack proof, and every CT1–CT8 answer matches exactly (see "Cycle-time analytics executed against the pinned engine" above); the `attributes_number`/`attributes_string` fallback and true-absence behavior are also proven. No run through SigNoz's own ingester on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
 | UI view matrix for Loom's non-HTTP span kinds | **Answered for Service List/APM and Exceptions, via authenticated backend API probes rather than a browser** (see "UI view matrix" above) — Service List/APM populates (`loom-daemon`, correct call/error counts) because RED metrics come from unconditional root-span aggregation, not an HTTP convention; Exceptions stays empty because Loom never emits an OTel `exception` span event. Service Map returned empty and, since 2026-09-30, **is attributable** — see "Resolving the Service Map confound": every Loom span is `SPAN_KIND_INTERNAL` and every resource carries the one `service.name`, both at single unconditional exporter sites and both measured on the real wire payload, so none of the three preconditions for a topology edge can be met; the gateway's allowlist strips every peer key as a second layer. Adding a connector or a multi-service fixture cannot change the answer for Loom's data. Enforced by `signoz_topology_shape.rs` in ordinary CI. No screenshot has been captured on any session |
 
 Synthetic fixture success establishes transport/schema/query behavior, not a

@@ -42,9 +42,6 @@ echo "Testing _extract_host..."
 
 # Need to source the library
 source "$HELPERS_DIR/lib/forge-helpers.sh"
-# #9548: the write wrappers vet their repo first; that decision is not what
-# this suite tests (test-write-scope.sh does), so fixture repos are allowed.
-WS_STUB_DIR=$(mktemp -d)
 # #9548: the write wrappers vet their repo through the write scope first. The
 # suite runs from a checkout registered as owner/repo (origin, .loom/, push
 # reported to the permission probe), so the real decision admits it.

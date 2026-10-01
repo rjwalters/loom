@@ -291,7 +291,7 @@ export PATH="$STUB_DIR:$PATH"
 # writes. It runs from a checkout registered as o/r (origin, .loom/, push
 # reported to the permission probe), so the real decision admits it.
 write_scope_register "$STUB_DIR/checkout" o/r
-cd "$STUB_DIR/checkout"
+cd "$STUB_DIR/checkout" || exit 1
 
 # issue_fixture_by <login> <type> <association> <owner/repo#N> [comment-body...]
 # Writes the issue's comment listing in the REST shape (`gh api
