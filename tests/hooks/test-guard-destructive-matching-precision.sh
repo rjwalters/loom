@@ -658,10 +658,52 @@ rm -rf /
 )"'
 
 # An UNQUOTED delimiter lets the outer shell expand the body before `cat` sees
-# it, so the body is not provably inert and is never masked.
-assert_deny "#5216 scoping: an UNQUOTED heredoc delimiter is not masked, still denied" \
+# it, so a body is masked ONLY when it independently proves inert: every one
+# of its lines must carry no LIVE backtick/`$(` of its own (#9860 narrows this
+# from "never masked" to "masked iff substitution-free" — see the
+# mask_flag_cat_heredocs() header comment in guard-destructive-generic.sh for
+# the full safety reasoning). A substitution-free body can still only ever
+# expand an EXISTING shell variable, the same risk class has_live_subst()'s
+# other consumers in this file already accept — it never runs a NEW
+# attacker-supplied command.
+assert_allow "#9860: an UNQUOTED heredoc delimiter with a substitution-free body IS masked, now allowed" \
     'gh pr comment 1 --body "$(cat <<EOF2
 rm -rf /
+EOF2
+)"'
+# The SAME unquoted-delimiter shape, but the body itself carries a live `$(…)`
+# of its own — the outer shell genuinely expands/executes it before `cat` ever
+# sees a byte, so this must keep denying: the #3679/#5216 anti-smuggling floor
+# is not reopened by #9860's narrowing above.
+assert_deny "#9860 regression: an UNQUOTED heredoc delimiter whose body carries a live \$(…) of its own still denied" \
+    'gh pr comment 1 --body "$(cat <<EOF2
+$(rm -rf /)
+EOF2
+)"'
+# Same again, backtick spelling of the same live substitution.
+assert_deny "#9860 regression: an UNQUOTED heredoc delimiter whose body carries a live backtick span of its own still denied" \
+    'gh pr comment 1 --body "$(cat <<EOF2
+`rm -rf /`
+EOF2
+)"'
+# A backslash-escaped `\$(` / backtick inside the unquoted body is literal
+# text to the shell (the one expansion suppressor it honours in an unquoted
+# heredoc body) — has_live_subst() does not flag it, so the body still masks.
+assert_allow "#9860: an UNQUOTED heredoc delimiter whose body has only a backslash-escaped \\\$(…) still masks (allowed)" \
+    'gh pr comment 1 --body "$(cat <<EOF2
+run \$(git push --force origin main) manually if needed
+EOF2
+)"'
+
+# The issue #9860 repro verbatim: a Judge/Doctor-style review comment composed
+# via the unquoted-delimiter `$(cat <<EOF … EOF)` idiom, whose prose advises a
+# human reviewer to force-push — no `$(`/backtick of its own in the body, so
+# it is the exact substitution-free shape above and must now allow.
+assert_allow "#9860: issue repro — unquoted-delimiter --body advising a human to force-push-with-lease allowed" \
+    'gh pr comment 1234 --body "$(cat <<EOF2
+Please rebase and force-push:
+
+git push --force-with-lease origin main
 EOF2
 )"'
 
