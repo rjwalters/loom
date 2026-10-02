@@ -184,6 +184,62 @@ fn check_mode_reports_drift_and_writes_nothing() {
 }
 
 #[test]
+fn write_mode_refuses_a_lossy_reduction_and_surfaces_it() {
+    // 2am#1653's ask, automated-path half: a write pass must apply the same
+    // `lost_top_level_keys` guard the manual `fleet-config render` CLI does
+    // (loom-daemon/src/cli/fleet_config.rs's `cmd_render`) — there is no
+    // operator present on this path to answer an `--allow-reduce` prompt, so
+    // the write is skipped outright and the loss is surfaced via
+    // `ConfigPass.error` / `TierReport.detail` instead.
+    let forge = FakeForge::new(sample_files());
+    let cache = tempfile::tempdir().expect("cache");
+    let out = tempfile::tempdir().expect("out");
+    let (machine, local) = tier_paths(out.path());
+    // `safehouse` is a top-level block the store's render for build-1 never
+    // had (sample_files() only ever renders `autonomous`/`forge` there) — the
+    // store never had it, so this is the exact clobber 2am#1653 hit.
+    std::fs::write(
+        &machine,
+        r#"{"autonomous":{"workFinder":{"maxConcurrent":1}},"safehouse":{"enabled":true}}"#,
+    )
+    .expect("seed a file with a block the store doesn't have");
+
+    let pass = config_pass(
+        &forge,
+        cache.path(),
+        &location(),
+        "build-1",
+        &machine,
+        &local,
+        Mode::Write,
+        Utc::now(),
+    );
+
+    assert!(pass.drifted(), "the seeded file differs from the store's render");
+    assert_eq!(
+        std::fs::read_to_string(&machine).expect("machine tier"),
+        r#"{"autonomous":{"workFinder":{"maxConcurrent":1}},"safehouse":{"enabled":true}}"#,
+        "the on-disk file must be untouched when the write is refused"
+    );
+    let err = pass
+        .error
+        .as_deref()
+        .expect("the loss must be surfaced as an error");
+    assert!(err.contains("safehouse"), "error names the dropped block: {err}");
+    let machine_report = pass
+        .tiers
+        .iter()
+        .find(|t| t.tier == Tier::Machine.name())
+        .expect("machine tier report");
+    assert!(!machine_report.wrote);
+    assert!(machine_report
+        .detail
+        .as_deref()
+        .expect("detail")
+        .contains("safehouse"));
+}
+
+#[test]
 fn a_second_write_pass_is_a_no_op_when_already_in_sync() {
     let forge = FakeForge::new(sample_files());
     let cache = tempfile::tempdir().expect("cache");

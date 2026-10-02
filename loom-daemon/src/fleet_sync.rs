@@ -275,12 +275,30 @@ pub fn config_pass(
         let drift = render::drift(target);
         let drifted = drift != Drift::InSync;
         let mut wrote = false;
+        let mut detail = describe_drift(&drift);
         if mode == Mode::Write && drifted {
-            match render::write(target, &stamp) {
-                Ok((w, _backup)) => wrote = w,
-                Err(e) => {
-                    error = Some(format!("writing {}: {e:#}", target.path.display()));
+            let lost = render::lost_top_level_keys(target);
+            if lost.is_empty() {
+                match render::write(target, &stamp) {
+                    Ok((w, _backup)) => wrote = w,
+                    Err(e) => {
+                        error = Some(format!("writing {}: {e:#}", target.path.display()));
+                    }
                 }
+            } else {
+                // Lossy-reduction guard (2am#1653), automated-path half: no
+                // operator is present on this path to answer an
+                // `--allow-reduce` prompt, so the write is simply skipped and
+                // the loss surfaced via `error`/`detail` instead.
+                let msg = format!(
+                    "{} would DROP top-level block(s) the file on disk carries: {} — \
+                     refusing to write; the store never had them (`fleet-config propose \
+                     adopt` proposes adding them to the store first)",
+                    target.tier.name(),
+                    lost.join(", ")
+                );
+                error = Some(msg.clone());
+                detail = Some(msg);
             }
         }
         tiers.push(TierReport {
@@ -288,7 +306,7 @@ pub fn config_pass(
             path: target.path.clone(),
             drifted,
             wrote,
-            detail: describe_drift(&drift),
+            detail,
         });
     }
     ConfigPass {
