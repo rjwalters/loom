@@ -21,6 +21,11 @@ pub(crate) enum CollisionShadowCommand {
         #[arg(long, value_name = "PATH")]
         snapshot: PathBuf,
 
+        /// `OWNER/REPO` stamped on the records (default: resolved from the
+        /// cwd's git `origin` remote — see `resolve_capture_repo`).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+
         /// Output JSONL path (one capture record per line, id-stamped).
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
@@ -84,6 +89,7 @@ impl CollisionShadowCommand {
         match self {
             Self::Capture {
                 snapshot,
+                repo,
                 out,
                 budgets,
             } => {
@@ -95,7 +101,8 @@ impl CollisionShadowCommand {
                     Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
                     None => StudyBudgets::default(),
                 };
-                let records = capture("rjwalters/loom", &tick, &budget)?;
+                let resolved = resolve_capture_repo(repo.as_deref())?;
+                let records = capture(&resolved, &tick, &budget)?;
                 let mut body = String::new();
                 for mut r in records {
                     r.id = capture_id(&r)?;
@@ -170,6 +177,129 @@ impl CollisionShadowCommand {
         }
     }
 }
+#[cfg(test)]
+mod repo_resolution_tests {
+    use super::{owner_repo_from_url, resolve_capture_repo_in};
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    #[test]
+    fn owner_repo_from_url_handles_both_remote_forms() {
+        assert_eq!(owner_repo_from_url("https://github.com/o/r.git"), Some("o/r".to_string()));
+        assert_eq!(owner_repo_from_url("https://github.com/o/r"), Some("o/r".to_string()));
+        assert_eq!(owner_repo_from_url("git@github.com:o/r.git"), Some("o/r".to_string()));
+        assert_eq!(owner_repo_from_url("https://github.com/o/r/"), Some("o/r".to_string()));
+        assert_eq!(owner_repo_from_url("not-a-url"), None);
+        assert_eq!(owner_repo_from_url("https://github.com/only-owner"), None);
+    }
+
+    #[test]
+    fn explicit_repo_wins_and_is_shape_checked() {
+        assert_eq!(resolve_capture_repo(Some("o/r")).unwrap(), "o/r");
+        assert!(resolve_capture_repo(Some("just-a-name"))
+            .unwrap_err()
+            .to_string()
+            .contains("expected OWNER/REPO"));
+    }
+
+    #[test]
+    fn unresolvable_origin_bails_with_the_remedy() {
+        // A directory with no git repo at all: get-url fails → loud bail
+        // naming --repo, never a guessed default.
+        let dir = TempDir::new().unwrap();
+        let out = Command::new("git")
+            .args([
+                "-C",
+                dir.path().to_str().unwrap(),
+                "remote",
+                "get-url",
+                "origin",
+            ])
+            .output()
+            .expect("git present");
+        assert!(!out.status.success(), "precondition: no origin in a temp dir");
+        let err = resolve_capture_repo_in(None, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("pass --repo explicitly"));
+    }
+
+    #[test]
+    fn cwd_origin_resolves_to_owner_repo() {
+        // The real cwd has an origin (github.com/rjwalters/loom); both
+        // verbs' default resolution must land on OWNER/REPO.
+        let err = resolve_capture_repo_in(None, std::path::Path::new("."));
+        assert!(
+            err.is_ok()
+                || err
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pass --repo explicitly"),
+            "a real checkout resolves to OWNER/REPO or bails loudly"
+        );
+    }
+}
+
+/// Resolve the `OWNER/REPO` stamped on capture records. An explicit
+/// `--repo` wins; otherwise the cwd's git `origin` remote is parsed
+/// (https and scp forms). Failure is a loud bail with the remedy — never a
+/// guessed default (#9903 review: records must name the repo actually
+/// queried).
+fn resolve_capture_repo(explicit: Option<&str>) -> Result<String> {
+    resolve_capture_repo_in(explicit, &std::env::current_dir()?)
+}
+
+fn resolve_capture_repo_in(explicit: Option<&str>, cwd: &std::path::Path) -> Result<String> {
+    if let Some(r) = explicit {
+        if !r.contains('/') {
+            bail!("--repo {r}: expected OWNER/REPO");
+        }
+        return Ok(r.to_string());
+    }
+    let out = std::process::Command::new("git")
+        .args(["-C", &cwd.to_string_lossy(), "remote", "get-url", "origin"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("git remote get-url origin: {e}"))?;
+    if !out.status.success() {
+        bail!(
+            "cannot resolve OWNER/REPO: git remote get-url origin failed ({}) — \
+             pass --repo explicitly",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    owner_repo_from_url(&url).ok_or_else(|| {
+        anyhow::anyhow!("cannot parse OWNER/REPO from origin url {url:?} — pass --repo explicitly")
+    })
+}
+
+/// `https://github.com/OWNER/REPO(.git)` and `git@github.com:OWNER/REPO.git`
+/// both resolve to `OWNER/REPO`.
+fn owner_repo_from_url(url: &str) -> Option<String> {
+    let u = url.trim().trim_end_matches('/');
+    let u = u.strip_suffix(".git").unwrap_or(u);
+    let tail = if let Some(pos) = u.find("://") {
+        let rest = &u[pos + 3..];
+        match rest.find('/') {
+            Some(i) => &rest[i + 1..],
+            None => return None,
+        }
+    } else {
+        match u.rsplit_once(':') {
+            Some((_, t)) => t,
+            None => u,
+        }
+    };
+    let mut parts: Vec<&str> = tail.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let repo = parts.pop()?;
+    let owner = parts.pop()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
 /// `capture-live`: list the ready queue through the ETag-cached forge
 /// listing, snapshot every concurrent candidate pair, write one JSONL file.
 ///
@@ -195,11 +325,15 @@ fn run_capture_live(
     }
     let gh_bin = std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".into());
     let cwd = std::env::current_dir()?;
+    // Resolve ONCE and thread the same value into both the forge listing
+    // and the record stamping — a record's `repo` must name the repo that
+    // was actually queried (#9903 review).
+    let resolved_repo = resolve_capture_repo(repo)?;
     let issues = loom_daemon::forge_listing::list_issues_cached_as(
         "collision-shadow-capture",
         std::path::Path::new(&gh_bin),
         Some(&cwd),
-        repo,
+        Some(&resolved_repo),
         "loom:issue",
         "open",
     )?;
@@ -225,7 +359,7 @@ fn run_capture_live(
     };
     let prior = loom_daemon::collision_shadow::count_captured_records(out_dir)?;
     let records =
-        loom_daemon::collision_shadow::capture_with_prior("rjwalters/loom", &tick, &budget, prior)?;
+        loom_daemon::collision_shadow::capture_with_prior(&resolved_repo, &tick, &budget, prior)?;
     let path = write_tick_records(out_dir, &tick_id, &mut records.clone())?;
     println!(
         "capture-live: {} candidate(s), {} pair record(s) → {}",
