@@ -321,8 +321,20 @@ assert_eq "0" "$RSC_FAILURE" "(c) Safe stale child -> RSC_FAILURE stays 0"
 # rebase rewrites the branch. A pin taken after (or just before the push) would
 # read whatever a sibling had already published and launder the clobber.
 GIT_LOG_C="$(read_git)"
-LS_LINE="$(printf '%s\n' "$GIT_LOG_C" | grep -n 'ls-remote origin refs/heads/feature/issue-201' | head -1 | cut -d: -f1)"
-REBASE_LINE="$(printf '%s\n' "$GIT_LOG_C" | grep -n 'git rebase -- origin/feature/issue-100' | head -1 | cut -d: -f1)"
+# Pure-bash scan for the two call positions: no `grep | head` pipeline, which
+# under `set -o pipefail` can report SIGPIPE from the producer (#7060 class).
+LS_LINE=""
+REBASE_LINE=""
+LOG_LINE_NO=0
+while IFS= read -r log_line; do
+    LOG_LINE_NO=$((LOG_LINE_NO + 1))
+    if [[ -z "$LS_LINE" && "$log_line" == *"ls-remote origin refs/heads/feature/issue-201"* ]]; then
+        LS_LINE="$LOG_LINE_NO"
+    fi
+    if [[ -z "$REBASE_LINE" && "$log_line" == *"git rebase -- origin/feature/issue-100"* ]]; then
+        REBASE_LINE="$LOG_LINE_NO"
+    fi
+done <<< "$GIT_LOG_C"
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ -n "$LS_LINE" && -n "$REBASE_LINE" && "$LS_LINE" -lt "$REBASE_LINE" ]]; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
