@@ -56,8 +56,9 @@ ORDER BY e.lifecycle_tokens_in DESC, e.repo, e.issue;
 -- measured-point columns are the
 -- experiment's alternative until #9434 collapses them into one point value.
 -- `without_token_component` counts landings whose LSI used two components, so
--- a day that mixes definitions is visible. All LSI values are NULL under an
--- unfitted parameter set (`params_version = 'v0-unfitted'`) — fit first.
+-- a day that mixes definitions is visible. LSI values are the v1-2026-10-02
+-- fit's (#9934); the `params_version` column on every row says which fit
+-- produced them, and a refit re-answers the same query unchanged.
 SELECT
     date(v.landed_at)                          AS day,
     count(*)                                   AS landings,
@@ -278,8 +279,8 @@ SELECT
 --
 -- `lsi_landed` is SF2's measured total, re-read through `issue_landed_size` on
 -- the landing sweep rather than recomputed, so forecast and actual for the same
--- bucket sit in one row. It is NULL under an unfitted parameter set
--- (`params_version = 'v0-unfitted'`) — exactly as in SF2.
+-- bucket sit in one row. It carries the v1-2026-10-02 fit's values (#9934) —
+-- exactly as in SF2.
 --
 -- The ISO week key is computed, not `strftime`'d: `%V`/`%G` require SQLite
 -- >= 3.46, so the week is keyed off the THURSDAY of the landing's ISO week
